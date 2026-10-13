@@ -19,7 +19,7 @@ mod temperature;
 #[cfg(feature = "serve")]
 mod template;
 
-pub use causal::{CausalRequest, CausalTask};
+pub use causal::{plan_packs, CausalRequest, CausalTask, Packed, PACK_TOKEN_BUDGET};
 pub use json::OrderedJson;
 pub use omni::{OmniMedia, OmniPreparedQuestion, OmniSpecialTokens};
 pub use omni_readout::OmniReadout;

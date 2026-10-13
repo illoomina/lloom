@@ -142,21 +142,45 @@ impl Decisions {
         body: &OrderedJson,
     ) -> std::result::Result<SystemOneResponse, SystemOneError> {
         match self {
-            // A template binding renders each question's own instructions; a
-            // request-level `instructions` has no slot in it and is ignored,
-            // as llama.cpp ignores it, but said so per answer.
-            Self::Family { .. } => {
-                engine
-                    .systemone(body)
-                    .map(|response| match body.get("instructions") {
-                        None | Some(OrderedJson::Null) => response,
-                        Some(OrderedJson::String(text)) if text.is_empty() => response,
-                        Some(_) => response.with_instructions_ignored(),
-                    })
-            }
+            Self::Family { .. } => engine
+                .systemone(body)
+                .map(|response| instructions_ignored(body, response)),
             Self::Generic(generic) => generic.decide(engine, body),
             Self::Refused(reason) => Err(SystemOneError::Unsupported(reason.clone())),
         }
+    }
+
+    /// [`Self::decide`] for requests that arrived together: a family binding
+    /// answers them through the family's batch, which packs what it can; the
+    /// generic strategy and a refusal answer each alone.
+    pub(crate) fn decide_batch(
+        &self,
+        engine: &dyn Served,
+        bodies: &[&OrderedJson],
+    ) -> Vec<std::result::Result<SystemOneResponse, SystemOneError>> {
+        match self {
+            Self::Family { .. } => engine
+                .systemone_batch(bodies)
+                .into_iter()
+                .zip(bodies)
+                .map(|(answer, body)| answer.map(|response| instructions_ignored(body, response)))
+                .collect(),
+            _ => bodies
+                .iter()
+                .map(|body| self.decide(engine, body))
+                .collect(),
+        }
+    }
+}
+
+/// A template binding renders each question's own instructions; a
+/// request-level `instructions` has no slot in it and is ignored, as llama.cpp
+/// ignores it, but said so per answer.
+fn instructions_ignored(body: &OrderedJson, response: SystemOneResponse) -> SystemOneResponse {
+    match body.get("instructions") {
+        None | Some(OrderedJson::Null) => response,
+        Some(OrderedJson::String(text)) if text.is_empty() => response,
+        Some(_) => response.with_instructions_ignored(),
     }
 }
 

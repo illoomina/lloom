@@ -1991,3 +1991,88 @@ fn lfm2_tiny_serves_decisions_and_chat_on_one_model() {
     drop(server);
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// A decision over its own state (`n` picks the wording).
+fn tiny_decision_over(n: usize) -> Value {
+    let mut body = tiny_decision();
+    body["state"] = json!(format!(
+        "Thread {n}: the loom threads warp and weft, row {n}."
+    ));
+    body
+}
+
+/// `lloom serve` on the tiny LFM2 with eight requests started at once — six
+/// decisions over different states and two chats, three bursts — answers
+/// every one: requests that find the model busy wait their turn rather than
+/// being refused. Each decision equals its answer alone: bit for bit under
+/// `deterministic`, within F32 tolerance under `fast`, where decisions that
+/// waited together are read as one tree.
+#[test]
+fn lfm2_tiny_serve_queues_concurrent_requests_and_answers_each_as_alone() {
+    let dir = scratch("decide-concurrent-lfm2");
+    let model = write::<Lfm2Tiny>(&dir);
+    for profile in ["deterministic", "fast"] {
+        let server = Server::start(
+            &model,
+            &[
+                "--cpu",
+                "--decision-template",
+                "lfm2-d1",
+                "--profile",
+                profile,
+            ],
+        );
+        let alone: Vec<Value> = (0..6)
+            .map(|n| {
+                let (status, body) = server.call("POST", "/v1/systemone", &tiny_decision_over(n));
+                assert_eq!(status, 200, "{body}");
+                body
+            })
+            .collect();
+        for burst in 0..3 {
+            let gate = std::sync::Barrier::new(8);
+            let replies: Vec<(usize, u16, Value)> = std::thread::scope(|scope| {
+                let handles: Vec<_> = (0..8)
+                    .map(|i| {
+                        let (server, gate) = (&server, &gate);
+                        scope.spawn(move || {
+                            gate.wait();
+                            let (status, body) = if i < 6 {
+                                server.call("POST", "/v1/systemone", &tiny_decision_over(i))
+                            } else {
+                                server.chat(json!({"max_tokens": 16}))
+                            };
+                            (i, status, body)
+                        })
+                    })
+                    .collect();
+                handles.into_iter().map(|h| h.join().unwrap()).collect()
+            });
+            for (i, status, body) in replies {
+                assert_eq!(status, 200, "{profile} burst {burst} request {i}: {body}");
+                if i >= 6 {
+                    continue;
+                }
+                let (got, want) = (&body["answers"]["pick"], &alone[i]["answers"]["pick"]);
+                assert_eq!(body["usage"], alone[i]["usage"], "{profile} request {i}");
+                assert_eq!(got["choice"], want["choice"], "{profile} request {i}");
+                if profile == "deterministic" {
+                    assert_eq!(body, alone[i], "{profile} burst {burst} request {i} moved");
+                } else {
+                    for label in ["A", "B"] {
+                        let (g, w) = (
+                            got["probabilities"][label].as_f64().unwrap(),
+                            want["probabilities"][label].as_f64().unwrap(),
+                        );
+                        assert!(
+                            (g - w).abs() < 1e-5,
+                            "{profile} request {i} {label}: {g} != {w}"
+                        );
+                    }
+                }
+            }
+        }
+        drop(server);
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}

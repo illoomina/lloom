@@ -345,10 +345,15 @@ pub fn load_lfm2_gguf_unadmitted(
 struct DecisionDispatch<M: CausalLM> {
     prepared: Option<PreparedDecision<M>>,
     raw: Option<RawDecision<M>>,
+    batch: Option<BatchDecision<M>>,
 }
 type PreparedDecision<M> = fn(&CausalEngine<M>, &CausalRequest) -> Result<SystemOneResponse>;
 type RawDecision<M> =
     fn(&CausalEngine<M>, &OrderedJson) -> std::result::Result<SystemOneResponse, SystemOneError>;
+type BatchDecision<M> = fn(
+    &CausalEngine<M>,
+    &[&OrderedJson],
+) -> Vec<std::result::Result<SystemOneResponse, SystemOneError>>;
 impl<M: CausalLM> DecisionDispatch<M>
 where
     M::Cache: CacheReset + CacheRewind + RetainState,
@@ -357,6 +362,7 @@ where
         Self {
             prepared: Some(CausalEngine::<M>::decide),
             raw: Some(CausalEngine::<M>::systemone),
+            batch: Some(CausalEngine::<M>::systemone_batch),
         }
     }
 }
@@ -709,6 +715,18 @@ where
             })?;
         self.pass(Request::Decisions(body), |engine| Ok(execute(engine, body)))
             .map_err(|e| SystemOneError::Execution(e.to_string()))?
+    }
+    /// Packed only under the default route's load-time admission: an
+    /// admitted owner prices each request's pass, so it answers one by one.
+    fn systemone_batch(
+        &self,
+        bodies: &[&OrderedJson],
+    ) -> Vec<std::result::Result<SystemOneResponse, SystemOneError>> {
+        let batch = self.decisions.as_ref().and_then(|route| route.batch);
+        match (&self.owner, batch) {
+            (Custody::Unadmitted { engine, .. }, Some(execute)) => execute(engine, bodies),
+            _ => bodies.iter().map(|body| self.systemone(body)).collect(),
+        }
     }
     fn decision_binding(&self) -> Option<(Option<crate::decision::binding::DecisionType>, String)> {
         self.binding.clone()

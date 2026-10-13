@@ -31,4 +31,6 @@ pub use loaded::{LoadedOmni, OmniMetadata, OmniPass};
 mod gguf;
 pub use gguf::decision_temperatures;
 
+pub mod attention;
+
 mod weights;

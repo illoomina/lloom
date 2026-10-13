@@ -324,6 +324,24 @@ impl Value {
         }
     }
 
+    /// A count or a dimension: an integer of any width, as converters write
+    /// them (llama.cpp writes `head_count_kv` as `i32`), refused when negative;
+    /// a bool or a float is not a count.
+    pub fn to_count(&self) -> Result<u64> {
+        let signed = match self {
+            Self::U8(v) => return Ok(u64::from(*v)),
+            Self::U16(v) => return Ok(u64::from(*v)),
+            Self::U32(v) => return Ok(u64::from(*v)),
+            Self::U64(v) => return Ok(*v),
+            Self::I8(v) => i64::from(*v),
+            Self::I16(v) => i64::from(*v),
+            Self::I32(v) => i64::from(*v),
+            Self::I64(v) => *v,
+            v => crate::bail!("not a non-negative integer {v:?}"),
+        };
+        u64::try_from(signed).map_err(|_| crate::Error::Msg(format!("negative count {signed}")))
+    }
+
     pub fn to_i64(&self) -> Result<i64> {
         match self {
             Self::I64(v) => Ok(*v),

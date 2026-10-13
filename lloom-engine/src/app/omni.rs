@@ -93,13 +93,61 @@ pub struct Attention<T, H, V, A> {
 pub trait Recovery {
     fn before_reuse(&mut self, metadata: OmniMetadata<'_>) -> Result<()>;
 }
+
+/// The predictor of an owner admitted on the machine at load
+/// (`LoadedOmni::from_*_on_machine`), whose passes reserve nothing.
+pub struct MachineAdmitted;
+impl Predictor for MachineAdmitted {
+    fn predicted_extra(&self, _: Request<'_>) -> Result<usize> {
+        Ok(0)
+    }
+}
+
+/// Recovery for an owner whose every callback queues on its one device's
+/// registered commands (the default attention does): wait for what an
+/// interrupted request left in flight.
+pub struct DeviceRecovery(pub Device);
+impl Recovery for DeviceRecovery {
+    fn before_reuse(&mut self, _: OmniMetadata<'_>) -> Result<()> {
+        #[cfg(feature = "metal")]
+        if let Device::Metal(device) = &self.0 {
+            let marker = device.flush_marker()?;
+            return device.wait_marker_prefix_data(&marker);
+        }
+        self.0.synchronize()
+    }
+}
+
+/// Where the omni tokenizer comes from: a `tokenizer.json`, or a GGUF's own
+/// vocabulary (llama.cpp's source for the same file).
+pub enum TokenizerSource<'a> {
+    File(&'a Path),
+    Gguf(&'a Path),
+}
+impl TokenizerSource<'_> {
+    fn load(&self, facts: OmniMetadata<'_>) -> Result<Text> {
+        match self {
+            Self::File(path) => Text::load(path, facts),
+            Self::Gguf(path) => {
+                use lloom_tensor::quantized::tokenizer::TokenizerFromGguf;
+                let mut file = std::fs::File::open(path)?;
+                let content = lloom_tensor::quantized::gguf_file::Content::read(&mut file)?;
+                let tokenizer = Tokenizer::from_gguf(&content)
+                    .map_err(|e| Error::Msg(format!("the GGUF's tokenizer: {e}")))?;
+                Text::new(tokenizer, facts)
+            }
+        }
+    }
+}
 struct Text {
     tokenizer: Tokenizer,
     marker: u32,
 }
 impl Text {
     fn load(path: &Path, facts: OmniMetadata<'_>) -> Result<Self> {
-        let tokenizer = Tokenizer::from_file(path).map_err(Error::wrap)?;
+        Self::new(Tokenizer::from_file(path).map_err(Error::wrap)?, facts)
+    }
+    fn new(tokenizer: Tokenizer, facts: OmniMetadata<'_>) -> Result<Self> {
         if tokenizer
             .get_vocab(true)
             .values()
@@ -182,6 +230,64 @@ impl<Q: Predictor, R: Recovery> Engine<Q, R> {
             incomplete: false,
         })
     }
+    /// [`Self::load_safetensors`], admitted on the machine at load.
+    ///
+    /// # Safety
+    /// Safetensor mappings must remain unchanged for this owner's lifetime.
+    pub unsafe fn load_safetensors_on_machine<P: AsRef<Path>>(
+        config: OmniConfig,
+        weights: &[P],
+        tokenizer: TokenizerSource<'_>,
+        device: &Device,
+        dtype: DType,
+        machine: lloom_tensor::machine::Admitted,
+        policy: Arc<Policy>,
+        predictor: Q,
+        recovery: R,
+    ) -> Result<Self> {
+        policy.validate()?;
+        let owner = unsafe {
+            LoadedOmni::from_safetensors_on_machine(
+                config,
+                weights,
+                dtype,
+                device,
+                machine,
+                |facts| tokenizer.load(facts),
+            )?
+        };
+        Ok(Self {
+            owner,
+            policy,
+            predictor,
+            recovery,
+            incomplete: false,
+        })
+    }
+    /// [`Self::load_gguf`], admitted on the machine at load.
+    #[allow(clippy::too_many_arguments)]
+    pub fn load_gguf_on_machine(
+        main: &Path,
+        media: &Path,
+        tokenizer: TokenizerSource<'_>,
+        device: &Device,
+        machine: lloom_tensor::machine::Admitted,
+        policy: Arc<Policy>,
+        predictor: Q,
+        recovery: R,
+    ) -> Result<Self> {
+        policy.validate()?;
+        let owner = LoadedOmni::from_gguf_on_machine(main, media, device, machine, |facts| {
+            tokenizer.load(facts)
+        })?;
+        Ok(Self {
+            owner,
+            policy,
+            predictor,
+            recovery,
+            incomplete: false,
+        })
+    }
     /// Ordinary caller templates remain renderable even when their layout does
     /// not support marked decision preparation. Allocation is inside this SAME
     /// owner pass; no tokenizer/model getter or implicit template is introduced.
@@ -237,6 +343,100 @@ impl<Q: Predictor, R: Recovery> Engine<Q, R> {
             })())
         }).map_err(execution)?
     }
+    /// The raw `/v1/systemone` body with its media decoded: PNG/JPEG images
+    /// under `images`, or one WAV/FLAC clip at 16 kHz mono. A request carries
+    /// images or audio, not both, as the reference refuses both.
+    pub fn systemone_media<T, H, V, A>(
+        &mut self,
+        body: &OrderedJson,
+        attention: &mut Attention<T, H, V, A>,
+        images: crate::app::vision::ImageDecodeLimits,
+    ) -> std::result::Result<SystemOneResponse, SystemOneError>
+    where
+        T: FnMut(&Tensor, &Tensor, &Tensor, &TrunkBatch, f64) -> Result<Tensor>,
+        H: FnMut(&Tensor, &Tensor, &Tensor, Option<&Tensor>, f64) -> Result<Tensor>,
+        V: FnMut(&Tensor, &Tensor, &Tensor, Option<&Tensor>, f64) -> Result<Tensor>,
+        A: FnMut(RelativeInputs<'_>) -> Result<Tensor>,
+    {
+        let predicted = self
+            .predictor
+            .predicted_extra(Request::OmniRawDecisions {
+                body,
+                policy: &self.policy,
+            })
+            .map_err(execution)?;
+        let policy = &self.policy;
+        let recovery = &mut self.recovery;
+        let incomplete = &mut self.incomplete;
+        self.owner
+            .with_pass(predicted, |model, text| {
+                Ok((|| {
+                    let state =
+                        parse_systemone_state(body, policy.state_nullability).map_err(invalid)?;
+                    let questions =
+                        parse_systemone_questions(body, policy.max_options, policy.noul_aliases)
+                            .map_err(invalid)?;
+                    let state_json = state.state.as_ref();
+                    match decode_media(&state.media, images)? {
+                        Decoded::Text => execute(
+                            model,
+                            text,
+                            policy,
+                            state_json,
+                            &questions,
+                            Media::Text,
+                            attention,
+                            recovery,
+                            incomplete,
+                        ),
+                        Decoded::Images(decoded) => {
+                            let images: Vec<OmniImage<'_>> = decoded
+                                .iter()
+                                .map(|image| OmniImage {
+                                    rgb: &image.rgb,
+                                    height: image.height,
+                                    width: image.width,
+                                })
+                                .collect();
+                            execute(
+                                model,
+                                text,
+                                policy,
+                                state_json,
+                                &questions,
+                                Media::Images(&images),
+                                attention,
+                                recovery,
+                                incomplete,
+                            )
+                        }
+                        Decoded::Audio(audio_input::Samples::I16(samples)) => execute(
+                            model,
+                            text,
+                            policy,
+                            state_json,
+                            &questions,
+                            Media::AudioI16(&samples),
+                            attention,
+                            recovery,
+                            incomplete,
+                        ),
+                        Decoded::Audio(audio_input::Samples::F32(samples)) => execute(
+                            model,
+                            text,
+                            policy,
+                            state_json,
+                            &questions,
+                            Media::AudioF32(&samples),
+                            attention,
+                            recovery,
+                            incomplete,
+                        ),
+                    }
+                })())
+            })
+            .map_err(execution)?
+    }
     /// Actual shared-media execution. State/questions are already ordered typed
     /// caller inputs, not strings; one encoded prefix feeds independent rows.
     pub fn decide<T, H, V, A>(
@@ -271,6 +471,59 @@ impl<Q: Predictor, R: Recovery> Engine<Q, R> {
                 ))
             })
             .map_err(execution)?
+    }
+}
+/// The bytes a request's audio clip may take: 30 s of 16-bit mono at 16 kHz
+/// as WAV, with room for its header.
+const MAX_AUDIO_BYTES: usize = 1 << 20;
+
+enum Decoded {
+    Text,
+    Images(Vec<super::vision::DecodedImage>),
+    Audio(audio_input::Samples),
+}
+
+/// Each source decoded by what its bytes are: PNG/JPEG images, or one
+/// WAV/FLAC clip; anything else, both kinds, or two clips refused by name.
+fn decode_media(
+    sources: &[crate::decision::MediaSource<'_>],
+    images: crate::app::vision::ImageDecodeLimits,
+) -> std::result::Result<Decoded, SystemOneError> {
+    use super::lfm2::decision_media::{is_image, media_payload};
+    let mut decoded_images = Vec::new();
+    let mut audio = None;
+    for source in sources {
+        let bytes = media_payload(*source, images.max_encoded_bytes.max(MAX_AUDIO_BYTES))?;
+        if is_image(&bytes) {
+            if bytes.len() > images.max_encoded_bytes {
+                return Err(SystemOneError::InvalidRequest(
+                    "encoded image exceeds supplied byte limit".into(),
+                ));
+            }
+            decoded_images.push(
+                super::vision::DecodedImage::decode_bounded(&bytes, images)
+                    .map_err(|e| SystemOneError::InvalidRequest(e.to_string()))?,
+            );
+        } else if audio_input::is_audio(&bytes) {
+            if audio.is_some() {
+                return Err(SystemOneError::InvalidRequest(
+                    "a request carries one audio clip".into(),
+                ));
+            }
+            audio = Some(audio_input::decode(bytes).map_err(SystemOneError::InvalidRequest)?);
+        } else {
+            return Err(SystemOneError::Unsupported(
+                "d1-omni reads PNG/JPEG images and WAV/FLAC audio".into(),
+            ));
+        }
+    }
+    match (decoded_images.is_empty(), audio) {
+        (true, None) => Ok(Decoded::Text),
+        (false, None) => Ok(Decoded::Images(decoded_images)),
+        (true, Some(audio)) => Ok(Decoded::Audio(audio)),
+        (false, Some(_)) => Err(SystemOneError::InvalidRequest(
+            "a request carries images or audio, not both".into(),
+        )),
     }
 }
 fn invalid(error: Error) -> SystemOneError {
@@ -516,5 +769,7 @@ fn begin_work<'a, R: Recovery>(
 #[path = "omni_tests.rs"]
 mod tests;
 
+mod audio_input;
 mod endpoint;
 pub use endpoint::Endpoint;
+pub(crate) mod serving;

@@ -11,6 +11,10 @@ pub trait DecisionEndpoint: Send + Sync {
     /// Caller-supplied provenance label, not a copied checkpoint configuration.
     fn model_name(&self) -> &str;
     fn health_checked(&self) -> Result<Value>;
+    /// What a request may carry, as `/v1/models` lists it.
+    fn input_modalities(&self) -> &'static [&'static str] {
+        &["text"]
+    }
     fn systemone(
         &self,
         body: &OrderedJson,

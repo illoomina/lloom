@@ -238,6 +238,126 @@ impl CausalRequest {
     }
 }
 
+/// The reference's token budget for one packed tree (`runner.py`,
+/// `SystemOne.token_budget`).
+pub const PACK_TOKEN_BUDGET: usize = 65536;
+
+/// Consecutive groups of at most `budget` prompt tokens, every group holding
+/// at least one item: the reference's batch planner (`runner.py` `_plan`).
+pub fn plan_packs(lengths: &[usize], budget: usize) -> Vec<std::ops::Range<usize>> {
+    let mut out = Vec::new();
+    let (mut start, mut used) = (0, 0usize);
+    for (i, &n) in lengths.iter().enumerate() {
+        if i > start && used.saturating_add(n) > budget {
+            out.push(start..i);
+            (start, used) = (i, 0);
+        }
+        used = used.saturating_add(n);
+    }
+    if start < lengths.len() {
+        out.push(start..lengths.len());
+    }
+    out
+}
+
+/// Several single-question requests read as one tree: their common token
+/// prefix is the trunk and each request's remainder a branch, as the
+/// reference packs single-question requests (`runner.py` `run`). Each
+/// request keeps its own question id and its own `usage`.
+pub struct Packed {
+    request: CausalRequest,
+    parts: Vec<(String, u64)>,
+}
+
+impl CausalRequest {
+    pub fn task_count(&self) -> usize {
+        self.tasks.len()
+    }
+
+    /// The token prefix every part's trunk shares.
+    fn common_trunk(parts: &[CausalRequest]) -> &[u32] {
+        let first = parts.first().map_or(&[][..], CausalRequest::trunk_tokens);
+        let common = parts.iter().fold(first.len(), |n, part| {
+            first[..n]
+                .iter()
+                .zip(part.trunk_tokens())
+                .take_while(|(a, b)| a == b)
+                .count()
+        });
+        &first[..common]
+    }
+
+    /// Whether `parts` can be read as one tree: two or more, one question
+    /// each, sharing at least one token (an empty trunk is not a tree).
+    pub fn packable(parts: &[CausalRequest]) -> bool {
+        parts.len() >= 2
+            && parts.iter().all(|part| part.tasks.len() == 1)
+            && !Self::common_trunk(parts).is_empty()
+    }
+
+    /// Pack [`Self::packable`] `parts` into one request.
+    pub fn pack(parts: Vec<CausalRequest>) -> Result<Packed> {
+        if !Self::packable(&parts) {
+            lloom_tensor::bail!("decision requests that share no trunk cannot be packed")
+        }
+        let common = Self::common_trunk(&parts).to_vec();
+        let max_prompt_tokens = parts
+            .iter()
+            .map(CausalRequest::max_prompt_tokens)
+            .max()
+            .unwrap_or(0);
+        let mut tasks = Vec::new();
+        tasks.try_reserve_exact(parts.len()).map_err(Error::wrap)?;
+        let mut ids = Vec::new();
+        ids.try_reserve_exact(parts.len()).map_err(Error::wrap)?;
+        for (i, part) in parts.into_iter().enumerate() {
+            let input_tokens = part.input_tokens;
+            let mut task = part
+                .tasks
+                .into_iter()
+                .next()
+                .expect("packable: one task per part");
+            // Question ids are unique within a request, not across requests.
+            ids.push((std::mem::replace(&mut task.id, i.to_string()), input_tokens));
+            tasks.push(task);
+        }
+        Ok(Packed {
+            request: Self::new(tasks, &common, max_prompt_tokens)?,
+            parts: ids,
+        })
+    }
+}
+
+impl Packed {
+    pub fn request(&self) -> &CausalRequest {
+        &self.request
+    }
+
+    /// The packed tree's answers, one response per packed request, in order.
+    pub fn unpack(self, response: SystemOneResponse) -> Result<Vec<SystemOneResponse>> {
+        let answers = response.answers();
+        if answers.len() != self.parts.len() {
+            lloom_tensor::bail!(
+                "packed decision returned {} answers for {} requests",
+                answers.len(),
+                self.parts.len()
+            )
+        }
+        self.parts
+            .into_iter()
+            .zip(answers)
+            .enumerate()
+            .map(|(i, ((id, input_tokens), (packed_id, answer)))| {
+                if *packed_id != i.to_string() {
+                    lloom_tensor::bail!("packed decision answers are out of order")
+                }
+                SystemOneResponse::new(vec![(id, answer.clone())], input_tokens)
+                    .map_err(Error::wrap)
+            })
+            .collect()
+    }
+}
+
 #[cfg(feature = "serve")]
 impl CausalRequest {
     /// Named-template front end feeding the same loaded-model executor.

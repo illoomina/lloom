@@ -3105,6 +3105,18 @@ impl<P: Lfm2Shape> super::served::Served for Engine<P> {
         };
         self.systemone_images_in_scope(body, &decisions.policy, SERVED_DECISION_IMAGES)
     }
+    fn systemone_batch(
+        &self,
+        bodies: &[&crate::decision::OrderedJson],
+    ) -> Vec<std::result::Result<crate::decision::SystemOneResponse, crate::decision::SystemOneError>>
+    {
+        match &self.decisions {
+            Some(decisions) => {
+                self.systemone_together(bodies, &decisions.policy, SERVED_DECISION_IMAGES)
+            }
+            None => bodies.iter().map(|body| self.systemone(body)).collect(),
+        }
+    }
     fn decision_binding(&self) -> Option<(Option<crate::decision::binding::DecisionType>, String)> {
         self.decisions
             .as_ref()

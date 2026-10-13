@@ -513,19 +513,44 @@ where
     where
         M::Cache: RetainState,
     {
+        let prepared = self.prepare_systemone(body)?;
+        self.decide_prepared(prepared)
+    }
+
+    /// [`Self::systemone`] for requests that arrived together
+    /// (`lfm2::decision_media::decide_together`).
+    fn systemone_batch(
+        &self,
+        bodies: &[&OrderedJson],
+    ) -> Vec<std::result::Result<SystemOneResponse, SystemOneError>>
+    where
+        M::Cache: RetainState,
+    {
+        super::lfm2::decision_media::decide_together(
+            bodies,
+            lloom_tensor::tuning::contract().is_fast(),
+            |body| self.prepare_systemone(body),
+            |request| self.decide(request),
+            |prepared| self.decide_prepared(prepared),
+        )
+    }
+
+    fn prepare_systemone(
+        &self,
+        body: &OrderedJson,
+    ) -> std::result::Result<super::lfm2::decision_media::Prepared, SystemOneError> {
         let policy = self.policy.as_ref().ok_or_else(|| {
             SystemOneError::Unsupported(
                 "no named or explicit causal systemone policy was installed".into(),
             )
         })?;
-        use super::lfm2::decision_media::{decide_images, prepare_images, ImageVision, Prepared};
-        let execution = |error: Error| SystemOneError::Execution(error.to_string());
+        use super::lfm2::decision_media::{prepare_images, ImageVision};
         let vision = self.vision.as_ref().map(|vision| ImageVision {
             processor: &vision.processor,
             config: &vision.config,
             dtype: vision.dtype,
         });
-        let prepared = prepare_images(
+        prepare_images(
             body,
             policy,
             self.capacity,
@@ -538,7 +563,18 @@ where
                     .into()
             },
             |text| Ok(self.encode(text, false)?),
-        )?;
+        )
+    }
+
+    fn decide_prepared(
+        &self,
+        prepared: super::lfm2::decision_media::Prepared,
+    ) -> std::result::Result<SystemOneResponse, SystemOneError>
+    where
+        M::Cache: RetainState,
+    {
+        use super::lfm2::decision_media::{decide_images, ImageVision, Prepared};
+        let execution = |error: Error| SystemOneError::Execution(error.to_string());
         let (request, images, positions) = match prepared {
             Prepared::Text(request) => return self.decide(&request).map_err(execution),
             Prepared::Images {
@@ -548,6 +584,11 @@ where
             } => (request, images, positions),
         };
         let mmproj = self.vision.as_ref().expect("an image request was prepared");
+        let vision = ImageVision {
+            processor: &mmproj.processor,
+            config: &mmproj.config,
+            dtype: mmproj.dtype,
+        };
         let mut lease = self.checkout().map_err(execution)?;
         lease.start_external_work();
         let options = self.decode.options(0, ReadbackArm::Blocking, 0);
@@ -556,7 +597,7 @@ where
             &request,
             &images,
             positions,
-            vision.expect("checked above"),
+            vision,
             &mmproj.encoder,
             &self.device,
             &options,

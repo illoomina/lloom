@@ -1654,6 +1654,9 @@ pub struct SchedulerConfig {
     /// How the rows of a batch hold their state: `auto` (`pool` at a batch), `pool` (one shared paged pool, the batch in one dispatch per kernel), `pool-per-row` (the same pool, the per-row loop) or `private` (a cache per row).
     #[opt(flag = "rows", parser = "parse_rows", variants = ["auto", "pool", "pool-per-row", "private"], path = "scheduler.rows", status = "advanced")]
     pub rows: String,
+    /// Read `/v1/systemone` requests that wait together for the model as one tree, the reference's packing of single-question requests (the `fast` contract only: under `deterministic` each request is read alone).
+    #[opt(bool, flag = "decision-pack", path = "scheduler.decision_pack", status = "advanced", switches = ["no-decision-pack=false"])]
+    pub decision_pack: bool,
 }
 
 impl Default for SchedulerConfig {
@@ -1661,6 +1664,7 @@ impl Default for SchedulerConfig {
         SchedulerConfig {
             max_sequences: 1,
             rows: "auto".into(),
+            decision_pack: true,
         }
     }
 }

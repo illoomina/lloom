@@ -21,27 +21,19 @@ struct Header {
     bos: Option<(u32, String)>,
     eos: u32,
     chat_template: Option<String>,
-    vocab: u64,
     width: u64,
     context: u64,
     /// Attention layers' KV heads (the conv layers carry 0).
     kv_heads: Vec<u64>,
     heads: u64,
     payload: u64,
+    /// The token table's dense copy, 0 when it stays packed.
+    dense_table: u64,
 }
 
-/// A GGUF integer of any width, as llama.cpp writes them (`head_count_kv`
-/// is an `i32` array, the conv layers' entries 0); a negative one refused.
+/// A GGUF count of any integer width (`Value::to_count`).
 fn integer(value: &lloom_tensor::quantized::gguf_file::Value) -> Result<u64> {
-    use lloom_tensor::quantized::gguf_file::Value;
-    let signed = match value {
-        Value::I8(v) => i64::from(*v),
-        Value::I16(v) => i64::from(*v),
-        Value::I32(v) => i64::from(*v),
-        Value::I64(v) => *v,
-        other => return Ok(other.to_u64()?),
-    };
-    u64::try_from(signed).with_context(|| format!("negative GGUF count {signed}"))
+    Ok(value.to_count()?)
 }
 
 impl Header {
@@ -82,18 +74,17 @@ impl Header {
             chat_template: get("tokenizer.chat_template")
                 .map(|v| v.to_string().cloned())
                 .transpose()?,
-            vocab: number("lfm2.vocab_size")
-                .or_else(|_| Ok::<_, anyhow::Error>(tokens.len() as u64))?,
             width: number("lfm2.embedding_length")?,
             context: number("lfm2.context_length")?,
             heads: number("lfm2.attention.head_count")?,
             kv_heads,
             payload: file.saturating_sub(content.tensor_data_offset),
+            dense_table: lloom::models::quantized_lfm2::dense_token_table_bytes(content)?,
         })
     }
 
     /// What the load holds at its peak: the file's tensor payload, the token
-    /// embedding the model dequantizes to f32, the f32 KV a sequence grows to
+    /// table's dense copy if it has one, the f32 KV a sequence grows to
     /// at the checkpoint's context length, and the mmproj's tower dequantized
     /// to `vision_bytes` per element.
     fn peak(&self, mmproj: Option<&Content>, vision_bytes: u64) -> Peak {
@@ -108,10 +99,7 @@ impl Header {
         });
         Peak::new()
             .with("weights (GGUF payload)", self.payload)
-            .with(
-                "token embedding, dequantized f32",
-                self.vocab * self.width * 4,
-            )
+            .with("token table, dense copy", self.dense_table)
             .with("KV at context_length, f32", self.context * kv_per_token)
             .with("vision tower (mmproj, dequantized)", vision)
     }

@@ -6,10 +6,29 @@ use std::io::Cursor;
 // D4/H2/KV1/FF6/V8, attention first then conv, context32, F32 GGUF.
 // No checkpoint, Q8 claim, device, or image. Numeric weight payload <4KiB.
 pub(crate) fn fixture(named_template: Option<&str>) -> Result<Vec<u8>> {
+    build(named_template, GgmlDType::F32, 4)
+}
+
+// The same layout at width `width` (a multiple of 32), its token table stored
+// as `table`, every other weight F32: a block-quantized table at the smallest
+// width that holds one.
+#[allow(dead_code)]
+pub(crate) fn fixture_table(table: GgmlDType, width: usize) -> Result<Vec<u8>> {
+    build(None, table, width)
+}
+
+fn build(named_template: Option<&str>, table: GgmlDType, width: usize) -> Result<Vec<u8>> {
+    let tiny = width == 4;
+    let (w, half) = (width, width / 2);
     let mut tensors = Vec::<(String, QTensor)>::new();
     let mut add = |name: String, shape: Vec<usize>, norm: bool| -> Result<()> {
         let n: usize = shape.iter().product();
-        assert!(n <= 48);
+        assert!(!tiny || n <= 48);
+        let dtype = if name == "token_embd.weight" {
+            table
+        } else {
+            GgmlDType::F32
+        };
         let seed = tensors.len();
         let values = (0..n)
             .map(|i| {
@@ -22,20 +41,17 @@ pub(crate) fn fixture(named_template: Option<&str>) -> Result<Vec<u8>> {
             .collect::<Vec<_>>();
         tensors.push((
             name,
-            QTensor::quantize(
-                &Tensor::from_vec(values, shape, &Device::Cpu)?,
-                GgmlDType::F32,
-            )?,
+            QTensor::quantize(&Tensor::from_vec(values, shape, &Device::Cpu)?, dtype)?,
         ));
         Ok(())
     };
-    add("token_embd.weight".into(), vec![8, 4], false)?;
-    add("output_norm.weight".into(), vec![4], true)?;
+    add("token_embd.weight".into(), vec![8, w], false)?;
+    add("output_norm.weight".into(), vec![w], true)?;
     for layer in 0..2 {
         for norm in ["attn_norm", "ffn_norm"] {
-            add(format!("blk.{layer}.{norm}.weight"), vec![4], true)?;
+            add(format!("blk.{layer}.{norm}.weight"), vec![w], true)?;
         }
-        for (name, out, input) in [("ffn_gate", 6, 4), ("ffn_up", 6, 4), ("ffn_down", 4, 6)] {
+        for (name, out, input) in [("ffn_gate", 6, w), ("ffn_up", 6, w), ("ffn_down", w, 6)] {
             add(
                 format!("blk.{layer}.{name}.weight"),
                 vec![out, input],
@@ -44,17 +60,17 @@ pub(crate) fn fixture(named_template: Option<&str>) -> Result<Vec<u8>> {
         }
     }
     for (name, out, input) in [
-        ("attn_q", 4, 4),
-        ("attn_k", 2, 4),
-        ("attn_v", 2, 4),
-        ("attn_output", 4, 4),
+        ("attn_q", w, w),
+        ("attn_k", half, w),
+        ("attn_v", half, w),
+        ("attn_output", w, w),
     ] {
         add(format!("blk.0.{name}.weight"), vec![out, input], false)?;
     }
     for name in ["attn_q_norm", "attn_k_norm"] {
-        add(format!("blk.0.{name}.weight"), vec![2], true)?;
+        add(format!("blk.0.{name}.weight"), vec![half], true)?;
     }
-    for (name, out, input) in [("in_proj", 12, 4), ("out_proj", 4, 4), ("conv", 4, 3)] {
+    for (name, out, input) in [("in_proj", 3 * w, w), ("out_proj", w, w), ("conv", w, 3)] {
         add(
             format!("blk.1.shortconv.{name}.weight"),
             vec![out, input],
@@ -69,7 +85,7 @@ pub(crate) fn fixture(named_template: Option<&str>) -> Result<Vec<u8>> {
             "lfm2.attention.head_count_kv",
             V::Array(vec![V::U32(1), V::U32(0)]),
         ),
-        ("lfm2.embedding_length", V::U32(4)),
+        ("lfm2.embedding_length", V::U32(width as u32)),
         ("lfm2.context_length", V::U32(32)),
         ("lfm2.block_count", V::U32(2)),
         ("lfm2.attention.layer_norm_rms_epsilon", V::F32(1e-5)),
@@ -93,6 +109,6 @@ pub(crate) fn fixture(named_template: Option<&str>) -> Result<Vec<u8>> {
             .collect::<Vec<_>>(),
     )?;
     assert_eq!(tensors.len(), 21);
-    assert!(bytes.get_ref().len() < 8192);
+    assert!(!tiny || bytes.get_ref().len() < 8192);
     Ok(bytes.into_inner())
 }

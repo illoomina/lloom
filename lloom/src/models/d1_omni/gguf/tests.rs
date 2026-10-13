@@ -130,7 +130,7 @@ fn malformed_headers_refuse_before_any_eager_builder() {
         (
             "lfm2.embedding_length",
             Value::Bool(true),
-            "unsigned integer",
+            "non-negative integer",
         ),
         (
             "lfm2.feed_forward_length",

@@ -28,7 +28,7 @@ impl<Q: Predictor, R: Recovery> Engine<Q, R> {
         self.owner.with_pass(predicted, |model, _| {
             let facts = model.metadata();
             Ok(json!({"model":name,"family":"d1-omni","generation":false,
-                "decisions":true,"raw_encoded_media":false,
+                "decisions":true,"raw_encoded_media":true,
                 "max_length":facts.max_length,"vocab_size":facts.vocab_size}))
         })
     }
@@ -45,6 +45,9 @@ where
     fn model_name(&self) -> &str {
         &self.name
     }
+    fn input_modalities(&self) -> &'static [&'static str] {
+        &["text", "image", "audio"]
+    }
     fn health_checked(&self) -> anyhow::Result<serde_json::Value> {
         let held = self.slot.checkout()?;
         held.0
@@ -60,7 +63,7 @@ where
             .checkout()
             .map_err(|error| SystemOneError::Execution(error.to_string()))?;
         let (engine, attention) = &mut *held;
-        engine.systemone_text(body, attention)
+        engine.systemone_media(body, attention, crate::app::lfm2::SERVED_DECISION_IMAGES)
     }
     fn shutdown(&self) {
         // This adapter creates no workers. The sequential decision listener

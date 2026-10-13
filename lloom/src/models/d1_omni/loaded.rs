@@ -116,11 +116,75 @@ impl OmniPass<'_> {
     }
 }
 
+/// Who scopes the owner's request work. `Domain`: one model domain, and each
+/// pass reserves the caller's prediction in it. `Machine`: admitted on the
+/// machine at load (`lloom serve`'s default route, as the causal families'
+/// is), each pass run directly with no per-pass reservation.
+enum Custody<T> {
+    Domain(Loaded<Owned<T>>),
+    Machine {
+        owned: Owned<T>,
+        /// The machine reservation the load took, held for the model's life.
+        _machine: lloom_tensor::machine::Admitted,
+    },
+}
+
 /// SAME existing Loaded namespace holds the model and once-produced metadata.
 /// T need not be HTTP Sync. No unscoped model/tokenizer getter is exposed.
 pub struct LoadedOmni<T = ()> {
-    loaded: Loaded<Owned<T>>,
+    custody: Custody<T>,
 }
+
+/// The safetensors model; `paths` must stay unchanged while mapped.
+unsafe fn produce_dense<P: AsRef<Path>, T>(
+    config: OmniConfig,
+    paths: &[P],
+    dtype: DType,
+    device: &Device,
+    frontend: MelFrontend,
+    preflight: impl FnOnce(OmniMetadata<'_>) -> Result<T>,
+) -> Result<Owned<T>> {
+    let metadata = preflight(dense_metadata(&config))?;
+    let vb = unsafe { crate::nn::VarBuilder::from_mmaped_safetensors(paths, dtype, device)? };
+    let model = OmniModel::load_components_with_frontend(config, vb, frontend)?;
+    Ok(Owned {
+        model: LoadedModel::Dense(model),
+        metadata,
+    })
+}
+
+/// The main GGUF and its mmproj: every component demand and payload extent is
+/// checked, and `preflight` run, before either file's tensors are read.
+fn produce_gguf<T>(
+    main: &Path,
+    media: &Path,
+    device: &Device,
+    frontend: impl FnOnce(usize) -> Result<MelFrontend>,
+    preflight: impl FnOnce(OmniMetadata<'_>) -> Result<T>,
+) -> Result<Owned<T>> {
+    use crate::quantized_var_builder::VarBuilder;
+    use lloom_tensor::quantized::gguf_file::Content;
+    let mut main_file = std::fs::File::open(main)?;
+    let mut media_file = std::fs::File::open(media)?;
+    let main_header = Content::read(&mut main_file)?;
+    let media_header = Content::read(&mut media_file)?;
+    let config = super::gguf::resolve(&main_header, &media_header)?;
+    super::gguf::validate_demands(&config, &main_header, &media_header)?;
+    main_header.validate_payloads(&mut main_file)?;
+    media_header.validate_payloads(&mut media_file)?;
+    let metadata = preflight(quantized_metadata(&config))?;
+    let main_vb = VarBuilder::from_gguf_content(&main_header, &mut main_file, device)?;
+    let media_vb = VarBuilder::from_gguf_content(&media_header, &mut media_file, device)?;
+    let frontend = frontend(config.audio_config.feat_in)?;
+    let model = super::model::QuantizedOmniModel::load_components_with_frontend(
+        config, main_vb, media_vb, frontend,
+    )?;
+    Ok(Owned {
+        model: LoadedModel::Quantized(model),
+        metadata,
+    })
+}
+
 impl<T> LoadedOmni<T> {
     /// Metadata preflight runs in the supplied load scope BEFORE mapping/weight
     /// lookup. Its allocation charges are not implied by this call's name.
@@ -140,17 +204,12 @@ impl<T> LoadedOmni<T> {
         lloom_tensor::memory_admission::begin_model_load();
         config.validate(dtype)?;
         let loaded = Loaded::new(device, load, |device, context| {
-            let metadata = preflight(dense_metadata(&config))?;
-            let vb =
-                unsafe { crate::nn::VarBuilder::from_mmaped_safetensors(paths, dtype, device)? };
             let frontend = MelFrontend::new_in(config.audio_config.feat_in, context)?;
-            let model = OmniModel::load_components_with_frontend(config, vb, frontend)?;
-            Ok(Owned {
-                model: LoadedModel::Dense(model),
-                metadata,
-            })
+            unsafe { produce_dense(config, paths, dtype, device, frontend, preflight) }
         })?;
-        Ok(Self { loaded })
+        Ok(Self {
+            custody: Custody::Domain(loaded),
+        })
     }
     /// Explicit main+media files; all component demands/payload extents and
     /// metadata preflight precede eager tensor maps on those SAME readers.
@@ -163,46 +222,81 @@ impl<T> LoadedOmni<T> {
     ) -> Result<Self> {
         lloom_tensor::memory_admission::begin_model_load();
         let loaded = Loaded::new(device, load, |device, context| {
-            use crate::quantized_var_builder::VarBuilder;
-            use lloom_tensor::quantized::gguf_file::Content;
-            let mut main_file = std::fs::File::open(main)?;
-            let mut media_file = std::fs::File::open(media)?;
-            let main_header = Content::read(&mut main_file)?;
-            let media_header = Content::read(&mut media_file)?;
-            let config = super::gguf::resolve(&main_header, &media_header)?;
-            super::gguf::validate_demands(&config, &main_header, &media_header)?;
-            main_header.validate_payloads(&mut main_file)?;
-            media_header.validate_payloads(&mut media_file)?;
-            let metadata = preflight(quantized_metadata(&config))?;
-            let main_vb = VarBuilder::from_gguf_content(&main_header, &mut main_file, device)?;
-            let media_vb = VarBuilder::from_gguf_content(&media_header, &mut media_file, device)?;
-            let frontend = MelFrontend::new_in(config.audio_config.feat_in, context)?;
-            let model = super::model::QuantizedOmniModel::load_components_with_frontend(
-                config, main_vb, media_vb, frontend,
-            )?;
-            Ok(Owned {
-                model: LoadedModel::Quantized(model),
-                metadata,
-            })
+            produce_gguf(
+                main,
+                media,
+                device,
+                |features| MelFrontend::new_in(features, context),
+                preflight,
+            )
         })?;
-        Ok(Self { loaded })
+        Ok(Self {
+            custody: Custody::Domain(loaded),
+        })
     }
-    /// Caller aggregate coverage reserves BEFORE invoking request producers.
-    /// Complete charging and returned/asynchronous lifetime enrollment remain
-    /// separate obligations; this is not a new quota or native retirement proof.
+    /// [`Self::from_safetensors_with`], admitted on the machine at load.
+    ///
+    /// # Safety
+    /// As [`Self::from_safetensors_with`]: the files must not change while mapped.
+    pub unsafe fn from_safetensors_on_machine<P: AsRef<Path>>(
+        config: OmniConfig,
+        paths: &[P],
+        dtype: DType,
+        device: &Device,
+        machine: lloom_tensor::machine::Admitted,
+        preflight: impl FnOnce(OmniMetadata<'_>) -> Result<T>,
+    ) -> Result<Self> {
+        lloom_tensor::memory_admission::begin_model_load();
+        config.validate(dtype)?;
+        let frontend = MelFrontend::new(config.audio_config.feat_in)?;
+        let owned = unsafe { produce_dense(config, paths, dtype, device, frontend, preflight)? };
+        Ok(Self {
+            custody: Custody::Machine {
+                owned,
+                _machine: machine,
+            },
+        })
+    }
+    /// [`Self::from_gguf_with`], admitted on the machine at load.
+    pub fn from_gguf_on_machine(
+        main: &Path,
+        media: &Path,
+        device: &Device,
+        machine: lloom_tensor::machine::Admitted,
+        preflight: impl FnOnce(OmniMetadata<'_>) -> Result<T>,
+    ) -> Result<Self> {
+        lloom_tensor::memory_admission::begin_model_load();
+        let owned = produce_gguf(main, media, device, MelFrontend::new, preflight)?;
+        Ok(Self {
+            custody: Custody::Machine {
+                owned,
+                _machine: machine,
+            },
+        })
+    }
+    /// Caller aggregate coverage reserves BEFORE invoking request producers
+    /// (a machine-admitted owner reserves nothing per pass). Complete charging
+    /// and returned/asynchronous lifetime enrollment remain separate
+    /// obligations; this is not a new quota or native retirement proof.
     pub fn with_pass<R>(
         &self,
         predicted_extra: usize,
         execute: impl FnOnce(OmniPass<'_>, &T) -> Result<R>,
     ) -> Result<R> {
-        self.loaded.with_pass(predicted_extra, |owned, _context| {
+        let run = |owned: &Owned<T>| {
             execute(
                 OmniPass {
                     model: &owned.model,
                 },
                 &owned.metadata,
             )
-        })
+        };
+        match &self.custody {
+            Custody::Domain(loaded) => {
+                loaded.with_pass(predicted_extra, |owned, _context| run(owned))
+            }
+            Custody::Machine { owned, .. } => run(owned),
+        }
     }
 }
 impl LoadedOmni<()> {

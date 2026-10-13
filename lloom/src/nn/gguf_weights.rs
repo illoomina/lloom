@@ -30,6 +30,9 @@ pub(crate) struct Weight {
     shape: Shape,
     dtype: WeightDType,
     family: &'static str,
+    /// Also accept `shape` without its leading singleton axis, the form a
+    /// converter that squeezes `[1, N]` to `[N]` writes.
+    squeezed: bool,
 }
 impl Weight {
     pub fn new(name: impl Into<String>, shape: impl Into<Shape>) -> Self {
@@ -38,6 +41,7 @@ impl Weight {
             shape: shape.into(),
             dtype: WeightDType::Any,
             family: "omni",
+            squeezed: false,
         }
     }
     pub fn family(mut self, family: &'static str) -> Self {
@@ -70,7 +74,6 @@ impl Weight {
         self.check(tensor.shape(), tensor.dtype())?;
         Ok(tensor)
     }
-    #[cfg(test)]
     pub fn name(&self) -> &str {
         &self.name
     }
@@ -87,8 +90,18 @@ impl Weight {
         })?;
         self.check(&info.shape, info.ggml_dtype)
     }
+    /// [`Self::squeezed`]: the declared shape or its leading singleton dropped.
+    pub fn squeezed(mut self) -> Self {
+        self.squeezed = true;
+        self
+    }
+    fn shape_accepted(&self, shape: &Shape) -> bool {
+        shape == &self.shape
+            || (self.squeezed
+                && matches!(self.shape.dims(), [1, rest @ ..] if shape.dims() == rest))
+    }
     fn check(&self, shape: &Shape, dtype: GgmlDType) -> Result<()> {
-        if shape != &self.shape {
+        if !self.shape_accepted(shape) {
             lloom_tensor::bail!(
                 "{} GGUF {} shape mismatch: expected {:?}, got {:?}",
                 self.family,
@@ -109,7 +122,11 @@ impl Weight {
         Ok(())
     }
     pub fn get(&self, vb: &VarBuilder) -> Result<Arc<QTensor>> {
-        let tensor = vb.get(self.shape.clone(), &self.name)?;
+        let tensor = if self.squeezed {
+            vb.get_no_shape(&self.name)?
+        } else {
+            vb.get(self.shape.clone(), &self.name)?
+        };
         self.check(tensor.shape(), tensor.dtype())?;
         Ok(tensor)
     }
@@ -150,6 +167,12 @@ impl LinearWeights {
             bias: bias.then(|| Weight::new(format!("{prefix}.bias"), output)),
         }
     }
+    /// A one-output projection whose weight a converter may store squeezed
+    /// (`[N]` for `[1, N]`).
+    pub fn squeezed(mut self) -> Self {
+        self.weight = self.weight.squeezed();
+        self
+    }
     pub fn load(&self, vb: &VarBuilder) -> Result<crate::quantized_nn::Linear> {
         // Match quantized_nn::linear_b: bias dequantization precedes QMatMul.
         let bias = self
@@ -157,7 +180,15 @@ impl LinearWeights {
             .as_ref()
             .map(|weight| weight.dequantize(vb))
             .transpose()?;
-        crate::quantized_nn::Linear::from_arc(self.weight.get(vb)?, bias)
+        let mut weight = self.weight.get(vb)?;
+        if weight.shape() != &self.weight.shape {
+            // A squeezed weight takes its singleton axis back, exactly (F32).
+            let restored = weight
+                .dequantize(vb.device())?
+                .reshape(self.weight.shape.clone())?;
+            weight = Arc::new(QTensor::quantize(&restored, GgmlDType::F32)?);
+        }
+        crate::quantized_nn::Linear::from_arc(weight, bias)
     }
 }
 impl WeightPlan for LinearWeights {
@@ -224,4 +255,45 @@ pub(crate) fn assert_fixture_demands(
     }
     eprintln!("GGUF_DEMAND_CENSUS_COMPLETE={count}");
     Ok(())
+}
+
+#[cfg(test)]
+mod squeezed_tests {
+    //! llama.cpp's converter writes d1-omni's `[1, D]` scorer weight as `[D]`.
+    use super::*;
+    use lloom_tensor::quantized::gguf_file;
+    use lloom_tensor::Module;
+
+    fn file(weight: &Tensor) -> Result<Vec<u8>> {
+        let w = QTensor::quantize(weight, GgmlDType::F32)?;
+        let b = QTensor::quantize(&Tensor::new(&[0.25f32], &Device::Cpu)?, GgmlDType::F32)?;
+        let mut out = std::io::Cursor::new(Vec::new());
+        gguf_file::write(&mut out, &[], &[("p.weight", &w), ("p.bias", &b)])?;
+        Ok(out.into_inner())
+    }
+
+    #[test]
+    fn a_squeezed_weight_loads_as_its_declared_shape() -> Result<()> {
+        let row: Vec<f32> = (0..4).map(|i| i as f32 - 1.5).collect();
+        let x = Tensor::new(&[[2f32, -1., 0.5, 3.]], &Device::Cpu)?;
+        let mut outputs = Vec::new();
+        for weight in [
+            Tensor::new(row.as_slice(), &Device::Cpu)?,
+            Tensor::new(row.as_slice(), &Device::Cpu)?.reshape((1, 4))?,
+        ] {
+            let bytes = file(&weight)?;
+            let content = Content::read(&mut std::io::Cursor::new(&bytes))?;
+            let plan = LinearWeights::new("p", 4, 1, true).squeezed();
+            plan.validate_headers(&content)?;
+            let vb = VarBuilder::from_gguf_buffer(&bytes, &Device::Cpu)?;
+            outputs.push(plan.load(&vb)?.forward(&x)?.to_vec2::<f32>()?);
+        }
+        // 2·-1.5 + -1·-0.5 + 0.5·0.5 + 3·1.5 = 2.25, plus the 0.25 bias.
+        assert_eq!(outputs, vec![vec![vec![2.5f32]]; 2]);
+        let bytes = file(&Tensor::new(row.as_slice(), &Device::Cpu)?)?;
+        let content = Content::read(&mut std::io::Cursor::new(&bytes))?;
+        let strict = LinearWeights::new("p", 4, 1, true).validate_headers(&content);
+        assert!(strict.is_err(), "an unsqueezable demand accepted [N]");
+        Ok(())
+    }
 }

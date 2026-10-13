@@ -78,7 +78,10 @@ impl Contract {
     ///
     /// - `moe-act-f16`: Qwen4-exp's routed experts on f16 activations where
     ///   the matmul-vec runs (`lloom`'s `--moe-act auto`).
-    pub const FAST_ARMS: &'static [&'static str] = &["moe-act-f16"];
+    /// - `decision-pack`: `/v1/systemone` requests that wait together are read
+    ///   as one tree, so an answer's prefill partition depends on what else
+    ///   arrived (`lloom-engine`'s `decide_together`).
+    pub const FAST_ARMS: &'static [&'static str] = &["moe-act-f16", "decision-pack"];
 
     /// `profile=<name> arms=<list>`, for the report lines that say which
     /// contract a run held.
@@ -1241,7 +1244,10 @@ mod tests {
             Contract::Deterministic.report(),
             "profile=deterministic arms=none"
         );
-        assert_eq!(Contract::Fast.report(), "profile=fast arms=moe-act-f16");
+        assert_eq!(
+            Contract::Fast.report(),
+            "profile=fast arms=moe-act-f16,decision-pack"
+        );
     }
 
     #[test]

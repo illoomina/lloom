@@ -1,4 +1,4 @@
-use crate::nn::{Conv1d, Conv1dConfig, Embedding, Module};
+use crate::nn::{Conv1d, Conv1dConfig, Module};
 use crate::quantized_nn::RmsNorm;
 use crate::utils::repeat_kv;
 use lloom_tensor::quantized::gguf_file;
@@ -255,7 +255,11 @@ impl ShortConvLayer {
 }
 
 pub struct Model {
-    tok_embeddings: Embedding,
+    /// The token table as the file stores it: a block-quantized table stays
+    /// packed and its rows are dequantized per lookup (the same values a
+    /// dequantized copy holds, §15.1p); a tied head projects through it.
+    tok_embeddings: QMatMul,
+    device: Device,
     layers: Vec<LayerWeights>,
     norm: RmsNorm,
     output: QMatMul,
@@ -266,19 +270,7 @@ pub struct Model {
 }
 
 fn value_to_usize(v: &gguf_file::Value) -> Result<usize> {
-    // Dimensions are GGUF integers, not lossy float casts. llama.cpp writes
-    // `head_count_kv` as an i32 array (0 on conv layers); a negative one is
-    // refused.
-    use gguf_file::Value;
-    let value = match v {
-        Value::U8(_) | Value::U16(_) | Value::U32(_) | Value::U64(_) => v.to_u64()?,
-        Value::I8(x) => u64::try_from(*x).map_err(lloom_tensor::Error::wrap)?,
-        Value::I16(x) => u64::try_from(*x).map_err(lloom_tensor::Error::wrap)?,
-        Value::I32(x) => u64::try_from(*x).map_err(lloom_tensor::Error::wrap)?,
-        Value::I64(x) => u64::try_from(*x).map_err(lloom_tensor::Error::wrap)?,
-        _ => bail!("quantized lfm2 dimension must be an integer"),
-    };
-    usize::try_from(value).map_err(lloom_tensor::Error::wrap)
+    usize::try_from(v.to_count()?).map_err(lloom_tensor::Error::wrap)
 }
 
 fn read_usize_list(v: &gguf_file::Value, len: usize) -> Result<Vec<usize>> {
@@ -302,6 +294,27 @@ fn read_usize_list(v: &gguf_file::Value, len: usize) -> Result<Vec<usize>> {
         }
         _ => Ok(vec![value_to_usize(v)?; len]),
     }
+}
+
+/// Bytes the loaded model holds for its token table beyond the file's own:
+/// the dense copy `QMatMul::from_arc` makes (f32 for an F32/F16/BF16 table
+/// or under `dequantize_all`, f16 under `dequantize_all_f16`), none for a
+/// block-quantized table kept packed.
+pub fn dense_token_table_bytes(ct: &gguf_file::Content) -> Result<u64> {
+    use lloom_tensor::quantized::GgmlDType;
+    let plan = weights::Lfm2Weights::resolve(ct)?;
+    let info = ct
+        .tensor_infos
+        .get(plan.embedding.name())
+        .ok_or_else(|| lloom_tensor::Error::msg("lfm2 GGUF has no token table"))?;
+    let qmm = &lloom_tensor::tuning::tuning().qmm;
+    let per_element = match info.ggml_dtype {
+        GgmlDType::F32 | GgmlDType::F16 | GgmlDType::BF16 => 4,
+        _ if qmm.dequantize_all => 4,
+        _ if qmm.dequantize_all_f16 => 2,
+        _ => 0,
+    };
+    Ok((plan.vocab as u64) * (plan.width as u64) * per_element)
 }
 
 impl Model {
@@ -369,15 +382,12 @@ impl Model {
         let head_dim = plan.width / plan.heads;
         let (cos, sin) = precomput_freqs_cis(head_dim, plan.rope_base, plan.context, device)?;
         let neg_inf = Tensor::new(f32::NEG_INFINITY, device)?;
-        let embedding_q = plan.embedding.read(ct, reader, device)?;
-        let embeddings = embedding_q.dequantize(device)?;
-        tracing::debug!(tok_embd_shape = ?embeddings.shape().dims(), "loaded lfm2 token embeddings");
+        let tok_embeddings = QMatMul::from_qtensor(plan.embedding.read(ct, reader, device)?)?;
         let norm = RmsNorm::from_qtensor(plan.norm.read(ct, reader, device)?, plan.epsilon)?;
-        let output_q = match &plan.output {
-            Some(output) => output.read(ct, reader, device)?,
-            None => embedding_q,
+        let output = match &plan.output {
+            Some(output) => QMatMul::from_qtensor(output.read(ct, reader, device)?)?,
+            None => tok_embeddings.clone(),
         };
-        tracing::debug!(output_shape = ?output_q.shape().dims(), "loaded lfm2 output weight (using tok_embd if missing)");
         let mut layers = crate::nn::branch::retained_vec(plan.layers.len())?;
         for layer in &plan.layers {
             let operator_norm =
@@ -434,10 +444,11 @@ impl Model {
                 vocab_size: plan.vocab,
             },
             owner: Arc::new(()),
-            tok_embeddings: Embedding::new(embeddings, plan.width),
+            tok_embeddings,
+            device: device.clone(),
             layers,
             norm,
-            output: QMatMul::from_qtensor(output_q)?,
+            output,
             span: tracing::span!(tracing::Level::TRACE, "model"),
             span_output: tracing::span!(tracing::Level::TRACE, "output"),
         })
@@ -601,7 +612,7 @@ impl ModelWeights {
         Ok(Self { model, cache })
     }
     pub fn forward(&mut self, tokens: &Tensor, index_pos: usize) -> Result<Tensor> {
-        let hidden = self.model.tok_embeddings.forward(tokens)?;
+        let hidden = self.model.tok_embeddings.embedding(tokens)?;
         self.model
             .forward_hidden(hidden, index_pos, &mut self.cache)
     }
@@ -619,7 +630,7 @@ impl crate::nn::CausalLM for Model {
         if cfg.context_length != self.config.context_length
             || cfg.hidden_size != self.config.hidden_size
             || cfg.vocab_size != self.config.vocab_size
-            || !device.same_device(self.tok_embeddings.embeddings().device())
+            || !device.same_device(&self.device)
         {
             bail!("quantized lfm2 cache config/device differs from loaded model")
         }
@@ -628,7 +639,7 @@ impl crate::nn::CausalLM for Model {
         Ok(cache)
     }
     fn embed(&self, tokens: &Tensor) -> Result<Tensor> {
-        self.tok_embeddings.forward(tokens)
+        self.tok_embeddings.embedding(tokens)
     }
     fn forward_embeds(&self, embeds: &Tensor, pos: usize, cache: &mut Cache) -> Result<Tensor> {
         self.forward_hidden(embeds.clone(), pos, cache)

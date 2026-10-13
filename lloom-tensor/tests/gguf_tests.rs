@@ -460,3 +460,28 @@ fn eager_payload_preflight_checks_extras_without_reading_or_allocating_tensors()
         .to_string()
         .contains("host allocation limit"));
 }
+
+/// A count reads from any integer width (llama.cpp writes `head_count_kv` as
+/// `i32`), and is refused when negative, a bool or a float.
+#[test]
+fn a_count_is_any_non_negative_integer() {
+    use lloom_tensor::quantized::gguf_file::Value;
+    for (value, want) in [
+        (Value::U8(7), 7),
+        (Value::U32(8), 8),
+        (Value::U64(u64::MAX), u64::MAX),
+        (Value::I8(0), 0),
+        (Value::I32(8), 8),
+        (Value::I64(i64::MAX), i64::MAX as u64),
+    ] {
+        assert_eq!(value.to_count().unwrap(), want, "{value:?}");
+    }
+    for value in [
+        Value::I32(-1),
+        Value::I64(i64::MIN),
+        Value::Bool(true),
+        Value::F32(2.),
+    ] {
+        assert!(value.to_count().is_err(), "{value:?} read as a count");
+    }
+}

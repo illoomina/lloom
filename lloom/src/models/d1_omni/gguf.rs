@@ -67,14 +67,12 @@ impl Header<'_> {
     }
 }
 fn integer(value: &Value) -> Result<usize> {
-    // Shared to_u64 also accepts Bool; booleans are NOT dimension metadata.
-    if !matches!(
-        value,
-        Value::U8(_) | Value::U16(_) | Value::U32(_) | Value::U64(_)
-    ) {
-        lloom_tensor::bail!("omni GGUF dimension must be an unsigned integer")
-    }
-    usize::try_from(value.to_u64()?).map_err(lloom_tensor::Error::wrap)
+    let count = value.to_count().map_err(|e| {
+        lloom_tensor::Error::Msg(format!(
+            "omni GGUF dimension must be a non-negative integer: {e}"
+        ))
+    })?;
+    usize::try_from(count).map_err(lloom_tensor::Error::wrap)
 }
 fn real(value: &Value) -> Result<f64> {
     match value {

@@ -4,7 +4,7 @@ use super::*;
 use crate::app::causal_loaded::CausalPolicy;
 use crate::app::vision::{expand_image_tokens, ImageDecodeLimits};
 use crate::decision::{
-    parse_systemone_state, MediaSource, OrderedJson, SystemOneError, SystemOneMedia,
+    parse_systemone_state, CausalRequest, MediaSource, OrderedJson, SystemOneError, SystemOneMedia,
     SystemOneResponse,
 };
 use lloom::nn::CausalLM;
@@ -15,10 +15,12 @@ fn invalid(error: impl std::fmt::Display) -> SystemOneError {
 fn execution(error: impl std::fmt::Display) -> SystemOneError {
     SystemOneError::Execution(error.to_string())
 }
-fn decode_source(
+/// A media source's bytes: the payload of a `data:` URL (base64 only) or a
+/// bare base64 string, refused past `max_bytes` before and after decoding.
+pub(crate) fn media_payload(
     source: MediaSource<'_>,
-    bounds: ImageDecodeLimits,
-) -> std::result::Result<DecodedImage, SystemOneError> {
+    max_bytes: usize,
+) -> std::result::Result<Vec<u8>, SystemOneError> {
     use base64::Engine as _;
     let text = match source {
         MediaSource::DataUrl(text) | MediaSource::AudioBase64(text) => text,
@@ -37,23 +39,35 @@ fn decode_source(
     // STANDARD's allocation estimate includes at most two padding bytes. Bound
     // it before allocating, then enforce the actual caller byte limit below.
     let estimate = base64::decoded_len_estimate(payload.len());
-    let allocation_limit = bounds
-        .max_encoded_bytes
+    let allocation_limit = max_bytes
         .checked_add(2)
         .ok_or_else(|| invalid("encoded limit overflow"))?;
     if estimate > allocation_limit {
-        return Err(invalid("encoded image exceeds supplied byte limit"));
+        return Err(invalid("encoded media exceeds supplied byte limit"));
     }
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(payload)
         .map_err(invalid)?;
-    if bytes.len() > bounds.max_encoded_bytes {
-        return Err(invalid("encoded image exceeds supplied byte limit"));
+    if bytes.len() > max_bytes {
+        return Err(invalid("encoded media exceeds supplied byte limit"));
     }
-    if !matches!(
-        image::guess_format(&bytes),
+    Ok(bytes)
+}
+
+/// Whether `bytes` are an image this decoder reads.
+pub(crate) fn is_image(bytes: &[u8]) -> bool {
+    matches!(
+        image::guess_format(bytes),
         Ok(image::ImageFormat::Png | image::ImageFormat::Jpeg)
-    ) {
+    )
+}
+
+fn decode_source(
+    source: MediaSource<'_>,
+    bounds: ImageDecodeLimits,
+) -> std::result::Result<DecodedImage, SystemOneError> {
+    let bytes = media_payload(source, bounds.max_encoded_bytes)?;
+    if !is_image(&bytes) {
         return Err(SystemOneError::Unsupported(
             "full LFM raw media currently accepts PNG/JPEG content; no audio encoder installed"
                 .into(),
@@ -221,6 +235,70 @@ where
     Ok(response)
 }
 
+/// Requests that arrived together (`serve`'s decision group). With `pack`
+/// (the `fast` contract), the text-only single-question ones are packed under
+/// the reference's token budget and each pack is read as one tree, its
+/// answers split back per request; a pack of one, every other request, and
+/// every request without `pack` (`deterministic`, whose bits may not depend on
+/// what else arrived) run as they would alone.
+pub(crate) fn decide_together(
+    bodies: &[&OrderedJson],
+    pack: bool,
+    mut prepare: impl FnMut(&OrderedJson) -> std::result::Result<Prepared, SystemOneError>,
+    mut text: impl FnMut(&CausalRequest) -> lloom_tensor::Result<SystemOneResponse>,
+    mut images: impl FnMut(Prepared) -> std::result::Result<SystemOneResponse, SystemOneError>,
+) -> Vec<std::result::Result<SystemOneResponse, SystemOneError>> {
+    let mut out: Vec<Option<std::result::Result<SystemOneResponse, SystemOneError>>> =
+        bodies.iter().map(|_| None).collect();
+    let mut singles = Vec::new();
+    for (i, body) in bodies.iter().enumerate() {
+        out[i] = match prepare(body) {
+            Err(error) => Some(Err(error)),
+            Ok(Prepared::Text(request)) if pack && request.task_count() == 1 => {
+                singles.push((i, request));
+                None
+            }
+            Ok(Prepared::Text(request)) => Some(text(&request).map_err(execution)),
+            Ok(other) => Some(images(other)),
+        };
+    }
+    let lengths: Vec<usize> = singles
+        .iter()
+        .map(|(_, request)| request.max_prompt_tokens())
+        .collect();
+    let mut singles = singles.into_iter();
+    for range in crate::decision::plan_packs(&lengths, crate::decision::PACK_TOKEN_BUDGET) {
+        let (index, parts): (Vec<usize>, Vec<CausalRequest>) =
+            singles.by_ref().take(range.len()).unzip();
+        if !CausalRequest::packable(&parts) {
+            for (i, part) in index.into_iter().zip(&parts) {
+                out[i] = Some(text(part).map_err(execution));
+            }
+            continue;
+        }
+        let answers = CausalRequest::pack(parts).and_then(|packed| {
+            let response = text(packed.request())?;
+            packed.unpack(response)
+        });
+        match answers {
+            Ok(answers) => {
+                for (i, answer) in index.into_iter().zip(answers) {
+                    out[i] = Some(Ok(answer));
+                }
+            }
+            Err(error) => {
+                let message = error.to_string();
+                for i in index {
+                    out[i] = Some(Err(execution(&message)));
+                }
+            }
+        }
+    }
+    out.into_iter()
+        .map(|answer| answer.expect("every request was answered"))
+        .collect()
+}
+
 impl<P: Lfm2Shape> Engine<P> {
     pub(super) fn systemone_images_in_scope(
         &self,
@@ -228,12 +306,39 @@ impl<P: Lfm2Shape> Engine<P> {
         policy: &CausalPolicy,
         bounds: ImageDecodeLimits,
     ) -> std::result::Result<SystemOneResponse, SystemOneError> {
+        let prepared = self.prepare_in_scope(body, policy, bounds)?;
+        self.decide_prepared(prepared)
+    }
+
+    /// [`Self::systemone_images_in_scope`] for requests that arrived
+    /// together ([`decide_together`]).
+    pub(super) fn systemone_together(
+        &self,
+        bodies: &[&OrderedJson],
+        policy: &CausalPolicy,
+        bounds: ImageDecodeLimits,
+    ) -> Vec<std::result::Result<SystemOneResponse, SystemOneError>> {
+        decide_together(
+            bodies,
+            lloom_tensor::tuning::contract().is_fast(),
+            |body| self.prepare_in_scope(body, policy, bounds),
+            |request| self.decide_in_scope(request),
+            |prepared| self.decide_prepared(prepared),
+        )
+    }
+
+    fn prepare_in_scope(
+        &self,
+        body: &OrderedJson,
+        policy: &CausalPolicy,
+        bounds: ImageDecodeLimits,
+    ) -> std::result::Result<Prepared, SystemOneError> {
         let vision = self.vision.as_ref().map(|vision| ImageVision {
             processor: &vision.processor,
             config: &vision.config,
             dtype: vision.dtype,
         });
-        let prepared = prepare_images(
+        prepare_images(
             body,
             policy,
             self.kv_capacity,
@@ -242,7 +347,13 @@ impl<P: Lfm2Shape> Engine<P> {
             bounds,
             || self.no_tower().to_string(),
             |text| self.encode(text, false),
-        )?;
+        )
+    }
+
+    fn decide_prepared(
+        &self,
+        prepared: Prepared,
+    ) -> std::result::Result<SystemOneResponse, SystemOneError> {
         let (request, images, positions) = match prepared {
             Prepared::Text(request) => return self.decide_in_scope(&request).map_err(execution),
             Prepared::Images {
@@ -255,6 +366,11 @@ impl<P: Lfm2Shape> Engine<P> {
             .vision
             .as_ref()
             .expect("an image request was prepared against this tower");
+        let vision = ImageVision {
+            processor: &vision_state.processor,
+            config: &vision_state.config,
+            dtype: vision_state.dtype,
+        };
         let mut lease = self.checkout_single().map_err(execution)?;
         lease.start_external_work();
         let options = lease.extra().decode.options(0, ReadbackArm::Blocking, 0);
@@ -265,7 +381,7 @@ impl<P: Lfm2Shape> Engine<P> {
             &request,
             &images,
             positions,
-            vision.expect("checked above"),
+            vision,
             &encoder,
             device,
             &options,

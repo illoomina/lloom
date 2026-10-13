@@ -328,7 +328,8 @@ impl HeadWeights {
             scorer_norm: NormWeights::new("cls.norm", width),
             scorer: [
                 LinearWeights::new("cls", width, width, true),
-                LinearWeights::new("cls.output", width, 1, true),
+                // llama.cpp's converter writes this [1, D] weight as [D].
+                LinearWeights::new("cls.output", width, 1, true).squeezed(),
             ],
         })
     }

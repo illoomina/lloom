@@ -48,6 +48,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
+mod turns;
+
 /// The seed passage the throughput cells tile into their prompt when no
 /// `--prompt-seed-file` and no seed environment variable is given.
 const DEFAULT_SEED_TEXT: &str = "The loom threads warp and weft into cloth the way a decoder \
@@ -104,6 +106,11 @@ struct Shared {
     engine: Box<dyn Served>,
     /// What `/v1/systemone` answers with, resolved at load.
     decisions: super::decisions::Decisions,
+    /// Request threads queue here for the family's single request slot.
+    turns: turns::Turns,
+    /// Decisions that wait together join one group (`scheduler.decision_pack`,
+    /// and the `fast` contract).
+    decision_pack: bool,
     /// Sample ids an `/eval/abort` asked the running `/eval` to stop early.
     aborts: Mutex<HashSet<String>>,
     /// Bumped after every insert into `aborts`: the decode thread's
@@ -116,6 +123,10 @@ struct Shared {
     /// `sampling` group; `--generation-config`).
     sampling: crate::SamplingConfig,
 }
+
+/// The largest `/v1/systemone` body a decision-only owner reads: eight
+/// images or one clip, base64-encoded, with room for the state.
+const DECISION_BODY_BYTES: usize = 64 << 20;
 
 /// How long a server's in-flight requests get to answer once serving stops,
 /// before their connections are cut.
@@ -181,6 +192,10 @@ fn run_configured(args: ServeArgs, transport: Option<tiny_http::TransportPolicy>
     let load_start = Instant::now();
     let shape = super::Shape::of(&options, false, seed_text);
     let reuse_prefix = shape.reuse_prefix;
+    // A non-generating decision model is served by the decision-only listener.
+    if let Some(endpoint) = super::omni::serving::load(&options.load, &shape)? {
+        return run_decisions_configured(options, endpoint, DECISION_BODY_BYTES, transport);
+    }
     let (engine, model_path) = super::load_engine(&options.load, shape)?;
     run_owner(
         options,
@@ -281,6 +296,9 @@ fn run_owner(
     let shared = Arc::new(Shared {
         engine,
         decisions,
+        turns: turns::Turns::default(),
+        decision_pack: options.scheduler.decision_pack
+            && lloom_tensor::tuning::contract().is_fast(),
         aborts: Mutex::new(HashSet::new()),
         abort_epoch: AtomicU64::new(0),
         server,
@@ -417,7 +435,7 @@ fn run_decisions_configured(
                 // Caller provenance label; outer metadata formatting is not
                 // silently claimed paid by the model's inner request pass.
                 let body = json!({"object":"list","data":[{"id":endpoint.model_name(),"object":"model","generation":false,"decisions":true,
-                    "architecture":{"input_modalities":["text"],"output_modalities":["decisions"]}}]});
+                    "architecture":{"input_modalities":endpoint.input_modalities(),"output_modalities":["decisions"]}}]});
                 let _ = respond_json(request, 200, &body);
             }
             (Method::Post, "/shutdown") => {
@@ -443,9 +461,12 @@ fn run_decisions_configured(
                         );
                     }
                     Ok(_) => {
-                        let result =
-                            dispatch_systemone_with(&path, &body, |body| endpoint.systemone(body))
-                                .expect("SystemOne route selected above");
+                        let result = dispatch_systemone_with(&path, &body, |body| {
+                            endpoint
+                                .systemone(body)
+                                .map(|response| response.with_model(endpoint.model_name()))
+                        })
+                        .expect("SystemOne route selected above");
                         let _ = respond_systemone(request, result);
                     }
                 }
@@ -480,14 +501,23 @@ fn handle_model_request(shared: &Shared, path: &str, mut request: Request) -> Re
         .context("reading the request body")?;
     // This branch consumes the original bytes exactly once. Parsing through
     // Value first would reorder question/options/legend objects.
+    // Decisions that wait together are answered as one group; under `fast`
+    // the family packs them (`turns`).
     if let Some(result) = dispatch_systemone_with(path, body.as_bytes(), |body| {
         shared
-            .decisions
-            .decide(shared.engine.as_ref(), body)
+            .turns
+            .decide(body, shared.decision_pack, |bodies| {
+                shared
+                    .decisions
+                    .decide_batch(shared.engine.as_ref(), bodies)
+            })
             .map(|response| response.with_model(&shared.model_name))
     }) {
         return respond_systemone(request, result);
     }
+    // A single-sequence engine's model requests take the request slot one at
+    // a time; a batched engine schedules its own rows.
+    let _turn = (path != "/tokenize" && shared.engine.batch() <= 1).then(|| shared.turns.take());
     let value: Value = if body.trim().is_empty() {
         json!({})
     } else {
@@ -2593,6 +2623,8 @@ pub fn bench(args: BenchArgs) -> Result<()> {
         decisions: super::decisions::Decisions::Refused(
             "the benchmark cells do not take decisions".into(),
         ),
+        turns: turns::Turns::default(),
+        decision_pack: false,
         aborts: Mutex::new(HashSet::new()),
         abort_epoch: AtomicU64::new(0),
         server,

@@ -90,6 +90,17 @@ pub trait Served: Send + Sync {
         )))
     }
 
+    /// [`Self::systemone`] for requests that arrived together (`serve`'s
+    /// decision group). A family that reads single-question requests as one
+    /// tree packs them; the default answers them one by one.
+    fn systemone_batch(
+        &self,
+        bodies: &[&crate::decision::OrderedJson],
+    ) -> Vec<std::result::Result<crate::decision::SystemOneResponse, crate::decision::SystemOneError>>
+    {
+        bodies.iter().map(|body| self.systemone(body)).collect()
+    }
+
     /// The template binding this family's decision executor was built with:
     /// the native decision type the checkpoint is (`None` for a template
     /// `decision.template` selected) and where the template came from.

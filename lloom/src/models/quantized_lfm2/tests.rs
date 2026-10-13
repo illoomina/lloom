@@ -228,3 +228,60 @@ fn malformed_metadata_and_existing_alias_errors_do_not_fall_back() -> Result<()>
     );
     Ok(())
 }
+
+/// A block-quantized token table stays packed, is the tied head's weight,
+/// and gathers exactly the rows its dequantized copy holds (§15.1p's
+/// `get_rows` identity, through the model). The price follows the format.
+fn packed_table_gathers_dense_rows(device: &Device) -> Result<()> {
+    use lloom_tensor::quantized::GgmlDType;
+    let dense_bytes = fixture()?;
+    let dense = gguf_file::Content::read(&mut Cursor::new(&dense_bytes[..]))?;
+    assert_eq!(dense_token_table_bytes(&dense)?, 8 * 4 * 4);
+
+    let bytes = synthetic::fixture_table(GgmlDType::Q8_0, 32)?;
+    let mut reader = Cursor::new(&bytes[..]);
+    let content = gguf_file::Content::read(&mut reader)?;
+    assert_eq!(dense_token_table_bytes(&content)?, 0);
+    let table = content
+        .tensor(&mut reader, "token_embd.weight", &Device::Cpu)?
+        .dequantize(&Device::Cpu)?;
+    let model = Model::from_gguf(content, &mut reader, device)?;
+    match (&model.tok_embeddings, &model.output) {
+        (QMatMul::QTensor(table), QMatMul::QTensor(head)) => {
+            assert_eq!(table.dtype(), GgmlDType::Q8_0);
+            assert!(
+                Arc::ptr_eq(table, head),
+                "the tied head holds a second table"
+            );
+        }
+        _ => panic!("the Q8_0 token table was not kept packed"),
+    }
+    let ids = [7u32, 0, 3, 7];
+    let got = CausalLM::embed(&model, &Tensor::new(&[ids], device)?)?;
+    assert_eq!(got.dims(), &[1, 4, 32]);
+    assert_eq!(got.dtype(), DType::F32);
+    let got = got.flatten_all()?.to_vec1::<f32>()?;
+    let rows = table.to_vec2::<f32>()?;
+    for (i, &id) in ids.iter().enumerate() {
+        for (j, want) in rows[id as usize].iter().enumerate() {
+            let have = got[i * 32 + j];
+            assert_eq!(
+                have.to_bits(),
+                want.to_bits(),
+                "token {id} column {j}: gathered {have:e}, dequantized table {want:e}"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn a_packed_token_table_gathers_the_rows_its_dense_copy_holds() -> Result<()> {
+    packed_table_gathers_dense_rows(&Device::Cpu)
+}
+
+#[cfg(feature = "metal")]
+#[test]
+fn a_packed_token_table_gathers_the_rows_its_dense_copy_holds_on_metal() -> Result<()> {
+    packed_table_gathers_dense_rows(&Device::new_metal(0)?)
+}

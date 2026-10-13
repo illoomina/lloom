@@ -87,6 +87,10 @@ impl CompletionHook {
 /// stays owned here, the first (empty) one for the life of the hook, so the
 /// pointer a completion loaded is valid however late it reads it.
 /// Registration is setup-time and rare (`Commands::on_command_buffer_complete`).
+// The `Box` is load-bearing (`clippy::vec_box` below): it keeps each
+// snapshot's `Vec` header at an address `current` can point at while
+// `published` itself reallocates.
+#[allow(clippy::vec_box)]
 struct Subscribers {
     current: AtomicPtr<Snapshot>,
     published: parking_lot::Mutex<Vec<Box<Snapshot>>>,
@@ -124,12 +128,14 @@ impl Subscribers {
     }
 }
 
+#[allow(clippy::vec_box)] // as `Subscribers`
 pub(super) struct SubscriberTake<'a> {
     published: parking_lot::MutexGuard<'a, Vec<Box<Snapshot>>>,
     current: &'a AtomicPtr<Snapshot>,
 }
 
 impl SubscriberTake<'_> {
+    #[allow(clippy::vec_box)] // as `Subscribers`
     pub(super) fn take(mut self) -> Vec<Box<Snapshot>> {
         let empty = &*self.published[0] as *const Snapshot as *mut Snapshot;
         self.current.store(empty, Ordering::Release);

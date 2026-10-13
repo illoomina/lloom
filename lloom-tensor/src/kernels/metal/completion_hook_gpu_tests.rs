@@ -120,9 +120,11 @@ fn the_clock_marks_completed_buffers_in_commit_order_and_no_further() {
 /// **A subscriber runs once per completed buffer, and a commit and a
 /// completion both proceed while the subscribers' lock is held elsewhere.**
 /// The test thread holds the lock that guards registration and teardown
-/// while it commits and waits on eight buffers; each completion runs the
-/// subscriber regardless. Killed by a commit or a completion that takes that
-/// lock: the held lock then stalls the clock and the wait times out.
+/// while it commits eight buffers and watches the clock; each completion
+/// runs the subscriber regardless. Killed by a commit or a completion that
+/// takes that lock: the held lock then stalls the clock and the watch times
+/// out. It commits without waiting on a buffer, since a wait that joins
+/// callbacks would deadlock against such a mutant instead of failing.
 #[test]
 fn subscribers_run_per_buffer_without_their_lock() {
     let Some(device) = Device::system_default() else {
@@ -140,8 +142,7 @@ fn subscribers_run_per_buffer_without_their_lock() {
     let reached = cmds.while_subscribers_locked(|| {
         for _ in 0..buffers {
             drop(cmds.command_encoder().unwrap());
-            let m = cmds.flush_marker().unwrap();
-            cmds.wait_marker(&m).unwrap();
+            cmds.flush().unwrap();
         }
         let start = Instant::now();
         while clock.completed_count().0 < buffers {

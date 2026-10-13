@@ -81,7 +81,9 @@ struct Teardown<C: FinalCore> {
 #[derive(Default)]
 pub(super) struct FinalCaptures {
     pub(super) executor: Option<Arc<ExecutorSlot>>,
-    /// Every subscriber snapshot the completion hook published.
+    /// Every subscriber snapshot the completion hook published (boxed as
+    /// published: `completion_hook::Subscribers`).
+    #[allow(clippy::vec_box)]
     pub(super) subscribers: Vec<Box<Vec<super::super::completion_hook::Subscriber>>>,
     pub(super) encoder_executor: Option<Arc<ExecutorSlot>>,
     pub(super) removals: Option<super::super::residency_set::PublishedRemovals>,

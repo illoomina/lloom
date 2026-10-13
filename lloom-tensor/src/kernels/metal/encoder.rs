@@ -1360,6 +1360,10 @@ impl ComputeCommandEncoder {
             wake: std::sync::OnceLock::new(),
         });
         let external = Some(ExternalEncoderHandle::acquire(&state));
+        crate::kernels::metal::hazard_audit::record_pass_open(
+            raw.audit_id(),
+            command_buffer.identity(),
+        );
         ComputeCommandEncoder {
             finalizer: None,
             raw,
@@ -1659,7 +1663,7 @@ impl ComputeCommandEncoder {
         self.raw.memoryBarrierWithScope(MTLBarrierScope::Buffers);
         let kinds = s.pending_kinds.take();
         trace::record_barrier(self.trace.as_deref(), kinds);
-        crate::kernels::metal::hazard_audit::record_barrier(kinds);
+        crate::kernels::metal::hazard_audit::record_barrier_kinds(self.raw.audit_id(), kinds);
         s.needs_barrier = false;
     }
 
@@ -1765,6 +1769,7 @@ impl ComputeCommandEncoder {
             }
         }
         crate::kernels::metal::hazard_audit::record_dispatch(
+            self.raw.audit_id(),
             name.as_deref().unwrap_or("<unnamed>"),
         );
     }
@@ -1829,7 +1834,7 @@ impl ComputeCommandEncoder {
                 // suppressed barrier is not a surviving fence, and whether the
                 // ICB's `setBarrier` and the session seams cover what it would
                 // have ordered is the whole question #144 poses (issue #185).
-                crate::kernels::metal::hazard_audit::record_barrier_suppressed();
+                crate::kernels::metal::hazard_audit::record_barrier_suppressed(self.raw.audit_id());
                 return;
             }
             self.raw.memoryBarrierWithScope(MTLBarrierScope::Buffers);
@@ -1844,7 +1849,7 @@ impl ComputeCommandEncoder {
             // below and the evidence is gone.
             let kinds = s.pending_kinds.take();
             trace::record_barrier(self.trace.as_deref(), kinds);
-            crate::kernels::metal::hazard_audit::record_barrier(kinds);
+            crate::kernels::metal::hazard_audit::record_barrier_kinds(self.raw.audit_id(), kinds);
             s.needs_barrier = false;
             // Replaced, not extended: everything bound before the barrier is
             // now ordered against everything after it.
@@ -1953,7 +1958,7 @@ impl ComputeCommandEncoder {
                 s.pending_kinds.merge(kinds);
             }
             s.next_inputs.insert(key, range);
-            crate::kernels::metal::hazard_audit::record_binding(&range, false);
+            crate::kernels::metal::hazard_audit::record_binding(self.raw.audit_id(), &range, false);
             drop(s);
             if !self.executor.is_classical() {
                 self.executor.will_bind_buffer(index, buf, offset, false);
@@ -2024,7 +2029,7 @@ impl ComputeCommandEncoder {
                 s.pending_kinds.merge(kinds);
             }
             s.next_outputs.insert(key, range);
-            crate::kernels::metal::hazard_audit::record_binding(&range, true);
+            crate::kernels::metal::hazard_audit::record_binding(self.raw.audit_id(), &range, true);
             s.all_outputs.insert(ptr);
             drop(s);
             if !self.executor.is_classical() {
@@ -2117,6 +2122,7 @@ impl ComputeCommandEncoder {
             self.wait_for_buffer(&mut s, ptr);
             let key = s.hazard_key;
             s.next_inputs.insert(key, range);
+            crate::kernels::metal::hazard_audit::record_binding(self.raw.audit_id(), &range, false);
         }
         unsafe {
             self.raw
@@ -2516,6 +2522,10 @@ impl BlitCommandEncoder {
         mut self,
         admission: super::command_buffer::EncoderAdmission,
     ) -> Self {
+        crate::kernels::metal::hazard_audit::record_pass_open(
+            self.raw.audit_id(),
+            admission.command_buffer().identity(),
+        );
         self.recording = Some(admission);
         self
     }

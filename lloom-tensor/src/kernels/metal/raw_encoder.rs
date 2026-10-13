@@ -1,5 +1,9 @@
 //! API-specific encoding primitives; hazard tracking stays in `encoder.rs`.
+//!
+//! Every native barrier, fence operation, blit and `endEncoding` passes
+//! through here, so this is where the hazard audit observes them.
 #![allow(non_snake_case)]
+use super::hazard_audit::{self, StageScope, Stages};
 use super::metal4;
 use objc2::{rc::Retained, runtime::ProtocolObject};
 use objc2_foundation::{NSRange, NSString};
@@ -23,8 +27,23 @@ macro_rules! common {
 impl Compute {
     common!(dispatchThreads_threadsPerThreadgroup(grid: MTLSize, group: MTLSize));
     common!(dispatchThreadgroups_threadsPerThreadgroup(grid: MTLSize, group: MTLSize));
-    common!(endEncoding());
     common!(setLabel(label: Option<&NSString>));
+
+    /// The native encoder's address: the pass identity the hazard audit keys
+    /// on while the encoder is open.
+    pub fn audit_id(&self) -> usize {
+        match self {
+            Self::Metal3(e) => Retained::as_ptr(e) as usize,
+            Self::Metal4(e) => Retained::as_ptr(&e.raw) as usize,
+        }
+    }
+    pub fn endEncoding(&self) {
+        match self {
+            Self::Metal3(e) => e.endEncoding(),
+            Self::Metal4(e) => e.raw.endEncoding(),
+        }
+        hazard_audit::record_pass_end(self.audit_id());
+    }
 
     pub unsafe fn setThreadgroupMemoryLength_atIndex(&self, length: usize, index: usize) {
         match self {
@@ -61,36 +80,58 @@ impl Compute {
         }
     }
     pub fn memoryBarrierWithScope(&self, scope: MTLBarrierScope) {
-        match self {
-            Self::Metal3(e) => e.memoryBarrierWithScope(scope),
-            Self::Metal4(e) => e
-                .raw
-                .barrierAfterEncoderStages_beforeEncoderStages_visibilityOptions(
-                    MTLStages::Dispatch | MTLStages::Blit,
-                    MTLStages::Dispatch | MTLStages::Blit,
-                    MTL4VisibilityOptions::Device,
-                ),
-        }
+        let stages = match self {
+            Self::Metal3(e) => {
+                e.memoryBarrierWithScope(scope);
+                Stages::DISPATCH
+            }
+            Self::Metal4(e) => {
+                e.raw
+                    .barrierAfterEncoderStages_beforeEncoderStages_visibilityOptions(
+                        MTLStages::Dispatch | MTLStages::Blit,
+                        MTLStages::Dispatch | MTLStages::Blit,
+                        MTL4VisibilityOptions::Device,
+                    );
+                Stages::ALL
+            }
+        };
+        hazard_audit::record_pass_barrier(
+            self.audit_id(),
+            StageScope {
+                after: stages,
+                before: stages,
+            },
+        );
     }
     pub fn waitForFence(&self, fence: &ProtocolObject<dyn MTLFence>) {
-        match self {
-            Self::Metal3(e) => e.waitForFence(fence),
+        let stages = match self {
+            Self::Metal3(e) => {
+                e.waitForFence(fence);
+                Stages::DISPATCH
+            }
             Self::Metal4(e) => {
                 e.fence(fence);
                 e.raw
                     .waitForFence_beforeEncoderStages(fence, MTLStages::Dispatch | MTLStages::Blit);
+                Stages::ALL
             }
-        }
+        };
+        hazard_audit::record_fence_wait(self.audit_id(), fence, stages);
     }
     pub fn updateFence(&self, fence: &ProtocolObject<dyn MTLFence>) {
-        match self {
-            Self::Metal3(e) => e.updateFence(fence),
+        let stages = match self {
+            Self::Metal3(e) => {
+                e.updateFence(fence);
+                Stages::DISPATCH
+            }
             Self::Metal4(e) => {
                 e.fence(fence);
                 e.raw
                     .updateFence_afterEncoderStages(fence, MTLStages::Dispatch | MTLStages::Blit);
+                Stages::ALL
             }
-        }
+        };
+        hazard_audit::record_fence_update(self.audit_id(), fence, stages);
     }
     pub unsafe fn useResources_count_usage(
         &self,
@@ -127,8 +168,22 @@ pub(crate) enum Blit {
     Metal4(metal4::Encoder),
 }
 impl Blit {
-    common!(endEncoding());
     common!(setLabel(label: Option<&NSString>));
+
+    /// The native encoder's address; see [`Compute::audit_id`].
+    pub fn audit_id(&self) -> usize {
+        match self {
+            Self::Metal3(e) => Retained::as_ptr(e) as usize,
+            Self::Metal4(e) => Retained::as_ptr(&e.raw) as usize,
+        }
+    }
+    pub fn endEncoding(&self) {
+        match self {
+            Self::Metal3(e) => e.endEncoding(),
+            Self::Metal4(e) => e.raw.endEncoding(),
+        }
+        hazard_audit::record_pass_end(self.audit_id());
+    }
     pub fn waitForFence(&self, fence: &ProtocolObject<dyn MTLFence>) {
         match self {
             Self::Metal3(e) => e.waitForFence(fence),
@@ -138,6 +193,7 @@ impl Blit {
                     .waitForFence_beforeEncoderStages(fence, MTLStages::Blit);
             }
         }
+        hazard_audit::record_fence_wait(self.audit_id(), fence, Stages::BLIT);
     }
     pub fn updateFence(&self, fence: &ProtocolObject<dyn MTLFence>) {
         match self {
@@ -147,6 +203,7 @@ impl Blit {
                 e.raw.updateFence_afterEncoderStages(fence, MTLStages::Blit);
             }
         }
+        hazard_audit::record_fence_update(self.audit_id(), fence, Stages::BLIT);
     }
     pub unsafe fn copyFromBuffer_sourceOffset_toBuffer_destinationOffset_size(
         &self,
@@ -173,6 +230,14 @@ impl Blit {
                 }
             }
         }
+        hazard_audit::record_blit(
+            self.audit_id(),
+            "blit_copy",
+            &[
+                (buffer_id(src), src_offset, size, false),
+                (buffer_id(dst), dst_offset, size, true),
+            ],
+        );
     }
     pub fn fillBuffer_range_value(
         &self,
@@ -187,5 +252,16 @@ impl Blit {
                 unsafe { e.raw.fillBuffer_range_value(buffer, range, value) }
             }
         }
+        hazard_audit::record_blit(
+            self.audit_id(),
+            "blit_fill",
+            &[(buffer_id(buffer), range.location, range.length, true)],
+        );
     }
+}
+
+/// A native buffer's address, the key compute bindings record
+/// (`Buffer::raw_ptr`).
+fn buffer_id(buffer: &ProtocolObject<dyn MTLBuffer>) -> usize {
+    buffer as *const ProtocolObject<dyn MTLBuffer> as usize
 }

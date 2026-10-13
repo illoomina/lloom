@@ -122,6 +122,35 @@ fn the_overwrite_after_a_cross_pass_reader_is_reported() {
     assert_eq!(region.commands_compute_passes, 3);
     assert_eq!(rep.passes, 5, "three compute passes and two blit passes");
     assert_passes_identified(&region.stream);
+    // Which API encoded the stream, read off what was recorded: a compute
+    // pass's fence update names the dispatch stage on Metal 3 and every
+    // stage on Metal 4.
+    let compute: Vec<u64> = region.stream.dispatches.iter().map(|d| d.encoder).collect();
+    let updates: Vec<Stages> = region
+        .stream
+        .syncs
+        .iter()
+        .filter_map(|s| match s.kind {
+            SyncKind::FenceUpdate { encoder, after, .. } if compute.contains(&encoder) => {
+                Some(after)
+            }
+            _ => None,
+        })
+        .collect();
+    let api = crate::tuning::tuning().metal.command_api.clone();
+    eprintln!("API requested={api} compute fence updates after {updates:?}");
+    let want = match api.as_str() {
+        "metal4" => Some(Stages::ALL),
+        "metal3" => Some(Stages::DISPATCH),
+        _ => None,
+    };
+    if let Some(want) = want {
+        assert_eq!(
+            updates,
+            vec![want; 3],
+            "the stream was not encoded by {api}"
+        );
+    }
     // One update at every pass close. Waits: pass 1 on X's writer, pass 2 on
     // X's writer, blit pass 0 on pass 0, blit pass 1 on passes 0 and 1.
     assert_eq!(rep.fence_updates, 5, "{:?}", region.stream.syncs);

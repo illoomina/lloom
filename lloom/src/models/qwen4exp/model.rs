@@ -2664,38 +2664,51 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
                 kv_grow_fits(allocated, working_set, self.memory_fraction, need)
             );
             let gb = |b: usize| b as f64 / 1e9;
-            let line = format!(
-                "pos={} seq={} kv_grow={:.3} GB transient={:.3} GB heap_free={:.3} GB need={:.3} GB committed={:.2} GB reclaimed={:.3} GB budget={:.2} GB ({:.2} x working_set {:.2} GB) fits={fits} pledged={} yield_contended={}",
-                plan.pos,
-                plan.seq,
-                gb(plan.kv_grow),
-                gb(plan.transient),
-                gb(heap_free),
-                gb(need),
-                gb(allocated),
-                gb(a.reclaimed),
-                gb(kv_grow_budget(working_set, self.memory_fraction)),
-                self.memory_fraction,
-                gb(working_set),
-                a.pledged,
-                a.yield_contended,
-            );
-            match self.mem_check {
-                MemCheck::Report => eprintln!("MEMCHECK {line}"),
-                MemCheck::Refuse if !fits && a.machine.is_some() => {
-                    cache.prepared = None;
-                    lloom_tensor::bail!(
-                        "qwen4exp pass refused {line}: {}",
-                        a.machine.as_deref().unwrap_or_default()
+            let budget = kv_grow_budget(working_set, self.memory_fraction);
+            // Formatted only when it is printed: never on an admitted pass.
+            macro_rules! mem_line {
+                () => {
+                    format_args!(
+                        "pos={} seq={} kv_grow={:.3} GB transient={:.3} GB heap_free={:.3} GB \
+                         need={:.3} GB committed={:.2} GB reclaimed={:.3} GB budget={:.2} GB \
+                         ({:.2} x working_set {:.2} GB) fits={fits} pledged={} yield_contended={}",
+                        plan.pos,
+                        plan.seq,
+                        gb(plan.kv_grow),
+                        gb(plan.transient),
+                        gb(heap_free),
+                        gb(need),
+                        gb(allocated),
+                        gb(a.reclaimed),
+                        gb(budget),
+                        self.memory_fraction,
+                        gb(working_set),
+                        a.pledged,
+                        a.yield_contended,
                     )
-                }
+                };
+            }
+            match self.mem_check {
+                MemCheck::Report => eprintln!("MEMCHECK {}", mem_line!()),
                 MemCheck::Refuse if !fits => {
                     cache.prepared = None;
-                    lloom_tensor::bail!(
-                        "qwen4exp pass refused {line}: the pass stops here, before anything is \
-                         written, rather than risk the machine (DESIGN.md 9.5, 3.5): a smaller \
-                         prefill tile, `--memory-fraction`, free memory, or bound the run."
-                    )
+                    let refusal = a.machine.unwrap_or(
+                        lloom_tensor::memory_admission::AllocationError::Refused {
+                            requested: need,
+                            available: budget.saturating_sub(allocated),
+                            domain: lloom_tensor::memory_admission::RefusalDomain::Budget,
+                        },
+                    );
+                    m.report_refusal(
+                        &format_args!(
+                            "qwen4exp pass refused {}: the pass stops here, before anything is \
+                             written, rather than risk the machine (DESIGN.md 9.5, 3.5): a smaller \
+                             prefill tile, `--memory-fraction`, free memory, or bound the run",
+                            mem_line!()
+                        ),
+                        &refusal,
+                    );
+                    return Err(refusal.into());
                 }
                 _ => {}
             }

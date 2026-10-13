@@ -78,11 +78,16 @@ fn a_decoder_state_is_on_the_ledger_and_its_growth_is_admitted() -> Result<()> {
     assert!(grow.total() > 1, "{grow:?}");
     let e = model
         .prepare_pass(&mut fresh, ids.len())
-        .expect_err("a growth past the quota is refused")
-        .to_string();
-    assert!(
-        e.contains("the state's growth at position 0") && e.contains("before anything is"),
-        "{e}"
+        .expect_err("a growth past the quota is refused");
+    eprintln!("REFUSED {:?} grow={}", e.allocation(), grow.total());
+    assert_eq!(
+        e.allocation(),
+        Some(lloom_tensor::memory_admission::AllocationError::Refused {
+            requested: grow.total(),
+            available: 0,
+            domain: lloom_tensor::memory_admission::RefusalDomain::Model,
+        }),
+        "the growth is refused typed, for its own bytes, against a one-byte quota: {e}"
     );
     assert_eq!(
         model.held_bytes(&fresh).total(),

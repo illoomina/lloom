@@ -44,6 +44,21 @@ impl Config {
     }
 }
 
+impl Config {
+    /// The engine's schedule points (`lloom_tensor::schedule_hook`): its site
+    /// ids declared, its schema, so a trace recorded against another point
+    /// list is refused as configuration drift.
+    pub fn engine(tasks: u8, budget: u16) -> Config {
+        use lloom_tensor::schedule_hook::{SCHEMA, SITES};
+        Config {
+            site_schema: SCHEMA,
+            sites: SITES.iter().fold(0, |sites, site| sites | 1 << *site as u8),
+            tasks,
+            budget,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Point {
     pub task: u8,
@@ -322,6 +337,37 @@ mod tests {
         assert_eq!(s.select(2), Ok(1));
         s.observe(point(1, 1, true)).unwrap();
         s.finish().unwrap()
+    }
+    #[test]
+    fn engine_points_declare_a_valid_configuration() {
+        use lloom_tensor::schedule_hook::{SCHEMA, SITES};
+        let engine = Config::engine(2, 16);
+        assert_eq!(engine.validate(), Ok(()));
+        for site in SITES {
+            assert!(engine.allows_site(site as u16), "{site:?}");
+        }
+        assert!(!engine.allows_site(SITES.len() as u16 + 1));
+        assert_eq!(engine.sites.count_ones() as usize, SITES.len());
+        let mut s = Schedule::explore(engine, &[0]).unwrap();
+        assert_eq!(s.select(1), Ok(0));
+        let first = SITES[0] as u16;
+        s.observe(Point {
+            task: 0,
+            site: first,
+            ordinal: 0,
+            terminal: false,
+        })
+        .unwrap();
+        let trace = s.finish().unwrap();
+        let other = Config {
+            site_schema: SCHEMA ^ 1,
+            ..engine
+        };
+        assert_eq!(
+            Schedule::replay(other, &trace).err(),
+            Some(Error::ConfigurationDrift)
+        );
+        assert!(Schedule::replay(engine, &trace).is_ok());
     }
     #[test]
     fn exact_round_trip_preserves_sets_sites_ordinals_and_terminal() {

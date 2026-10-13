@@ -1,3 +1,4 @@
+use crate::schedule_hook::schedule_point;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// A notification sequence, not a mutex shared with the completion thread.
@@ -12,10 +13,18 @@ pub(crate) struct Wake {
 }
 impl Wake {
     pub(crate) fn snapshot(&self) -> usize {
+        let seen = self.epoch();
+        schedule_point!(WakeSnapshot);
+        seen
+    }
+    // Parking-queue validation reads this, never `snapshot`: it runs under the
+    // queue lock, where no schedule point may run.
+    fn epoch(&self) -> usize {
         self.epoch.load(Ordering::SeqCst)
     }
     pub(crate) fn notify(&self) {
         self.epoch.fetch_add(1, Ordering::SeqCst);
+        schedule_point!(WakeNotified);
         if self.waiters.load(Ordering::SeqCst) != 0 {
             // SAFETY: this object's own stable address is its parking key.
             // Every parked caller keeps this object alive at the same address.
@@ -56,12 +65,13 @@ impl Wake {
         deadline: Option<std::time::Instant>,
     ) -> parking_lot_core::ParkResult {
         self.waiters.fetch_add(1, Ordering::SeqCst);
+        schedule_point!(WakeRegistered);
         // SAFETY: same owned key as notify; validation only reads an atomic,
         // cannot panic or reenter parking_lot. The caller keeps self alive.
         let result = unsafe {
             parking_lot_core::park(
                 self as *const Self as usize,
-                || self.snapshot() == seen,
+                || self.epoch() == seen,
                 || {},
                 |_, _| {},
                 parking_lot_core::DEFAULT_PARK_TOKEN,
@@ -69,6 +79,7 @@ impl Wake {
             )
         };
         self.waiters.fetch_sub(1, Ordering::SeqCst);
+        schedule_point!(WakeParkReturned);
         result
     }
 }
@@ -112,6 +123,10 @@ impl<T> WakeMutex<T> {
             wake: &self.wake,
         }
     }
+    #[cfg(all(test, feature = "schedule-hooks"))]
+    pub(crate) fn test_is_locked(&self) -> bool {
+        self.value.is_locked()
+    }
     pub(crate) fn try_lock(&self) -> Option<WakeGuard<'_, T>> {
         self.value.try_lock().map(|guard| WakeGuard {
             value: Some(guard),
@@ -144,6 +159,7 @@ impl<T> Drop for WakeGuard<'_, T> {
     fn drop(&mut self) {
         let wake = self.wake;
         unlock_then_notify(self.value.take(), || {
+            schedule_point!(GuardUnlocked);
             // Resolve installation at release, AFTER lock custody has ended.
             if let Some(wake) = wake.get() {
                 wake.notify();

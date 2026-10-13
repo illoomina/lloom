@@ -39,6 +39,10 @@ metal = ["lloom/metal", "lloom-tensor/metal"]
 # provides them and fills the cmplog map; without it `src/cmp_stubs.rs` provides
 # empty hooks so the regular build links.
 cmplog = ["libafl_targets/sancov_cmplog", "libafl_targets/cmplog"]
+# The engine's schedule points call an installed hook (`lloom_tensor::
+# schedule_hook`). Off by default: no campaign binary carries them unless built
+# with it.
+schedule-hooks = ["lloom-tensor/schedule-hooks"]
 
 # Release codegen, as the engine ships it (`../Cargo.toml` [profile.release]):
 # opt-level 3, one codegen unit, LTO. Two arms because §14.5c measured thin LTO

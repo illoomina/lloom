@@ -186,6 +186,7 @@ mod retirement_service;
 pub mod safetensors;
 pub mod scalar;
 pub mod shape;
+pub mod schedule_hook;
 pub mod shape_probe;
 mod sort;
 mod storage;

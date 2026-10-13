@@ -244,6 +244,7 @@ pub struct CausalEngine<M: CausalLM> {
 struct Ragged<M: CausalLM> {
     text: RaggedText<M>,
     images: RaggedImages<M>,
+    report: fn(&CausalEngine<M>) -> serde_json::Value,
     /// A `TrunkCache` of the model's retained state.
     trunks: Box<dyn std::any::Any + Send + Sync>,
 }
@@ -272,6 +273,11 @@ where
         self.ragged = Some(Ragged {
             text: Self::ragged_text,
             images: Self::ragged_images,
+            report: |engine| {
+                engine
+                    .trunks()
+                    .map_or(serde_json::Value::Null, crate::decision::TrunkCache::report)
+            },
             trunks: Box::new(crate::decision::TrunkCache::<
                 <M::Cache as RetainState>::Retained,
             >::default()),
@@ -295,10 +301,12 @@ where
             options,
             |model, device| model.new_cache(&self.config, device),
             self.trunks(),
+            true,
         )
     }
 
-    /// A trunk with image rows is not kept: its tokens do not name its pixels.
+    /// A trunk with image rows is counted, not kept: its tokens do not name
+    /// its pixels.
     fn ragged_images(
         &self,
         rows: &super::vision::ImageRows<'_, M>,
@@ -312,12 +320,18 @@ where
             readback,
             options,
             |model, device| model.new_cache(&self.config, device),
-            None,
+            self.trunks(),
+            false,
         )
     }
 }
 
 impl<M: CausalLM> CausalEngine<M> {
+    /// The ragged arm's engagement for `/health`; `None` when not installed.
+    pub(crate) fn ragged_report(&self) -> Option<serde_json::Value> {
+        self.ragged.as_ref().map(|ragged| (ragged.report)(self))
+    }
+
     /// The ragged arm when it is installed and the contract is `fast`.
     fn ragged_arm(&self) -> Option<&Ragged<M>> {
         self.ragged

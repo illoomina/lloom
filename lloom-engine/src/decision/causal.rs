@@ -248,10 +248,10 @@ impl CausalRequest {
     /// state is not kept is one plain pass, as there.
     ///
     /// `trunk_model` prefills the trunk (a view that splices image rows into
-    /// it); `model` runs the rows, which carry no media. `trunks` is `None`
-    /// for a trunk that must not be kept (one with image rows: its tokens do
-    /// not name its pixels). The caller holds the same request exclusion and
-    /// admission as for the tree.
+    /// it); `model` runs the rows, which carry no media. `trunks` counts the
+    /// read and, with `keep`, holds the state for the next request; a trunk
+    /// with image rows is not kept (its tokens do not name its pixels). The
+    /// caller holds the same request exclusion and admission as for the tree.
     pub fn execute_ragged<T, M, R>(
         &self,
         trunk_model: &T,
@@ -260,6 +260,7 @@ impl CausalRequest {
         opts: &DecodeOptions,
         mut make_cache: impl FnMut(&M, &lloom_tensor::Device) -> Result<M::Cache>,
         trunks: Option<&TrunkCache<<M::Cache as RetainState>::Retained>>,
+        keep: bool,
     ) -> Result<SystemOneResponse>
     where
         T: CausalLM<Cache = M::Cache>,
@@ -276,7 +277,9 @@ impl CausalRequest {
             .try_reserve_exact(self.tasks.len())
             .map_err(Error::wrap)?;
         let device = readback.device().clone();
-        let kept = trunks.and_then(|t| t.get(self.state_tokens()));
+        let kept = trunks
+            .filter(|_| keep)
+            .and_then(|t| t.get(self.state_tokens()));
         if let ([task], None) = (self.tasks.as_slice(), &kept) {
             let cache = make_cache(model, &device)?;
             let mut session = BranchSession::from_cache(trunk_model, cache);
@@ -295,7 +298,7 @@ impl CausalRequest {
                     self.state_tokens(),
                     opts,
                 )?);
-                if let Some(trunks) = trunks {
+                if let Some(trunks) = trunks.filter(|_| keep) {
                     trunks.put(trunk.clone());
                 }
                 trunk
@@ -314,6 +317,9 @@ impl CausalRequest {
             &suffixes,
             opts,
         )?;
+        if let Some(trunks) = trunks {
+            trunks.note_read(suffixes.len());
+        }
         for (task, logits) in self.tasks.iter().zip(&logits) {
             answers.push(task.answer(logits, vocab, &device)?);
         }
@@ -363,6 +369,8 @@ impl CausalTask {
 pub struct TrunkCache<S> {
     entry: parking_lot::Mutex<Option<std::sync::Arc<RetainedTrunk<S>>>>,
     hits: std::sync::atomic::AtomicU64,
+    reads: std::sync::atomic::AtomicU64,
+    rows: std::sync::atomic::AtomicU64,
 }
 
 impl<S> Default for TrunkCache<S> {
@@ -370,6 +378,8 @@ impl<S> Default for TrunkCache<S> {
         Self {
             entry: parking_lot::Mutex::new(None),
             hits: std::sync::atomic::AtomicU64::new(0),
+            reads: std::sync::atomic::AtomicU64::new(0),
+            rows: std::sync::atomic::AtomicU64::new(0),
         }
     }
 }
@@ -398,6 +408,25 @@ impl<S> TrunkCache<S> {
     /// Requests that started from the kept trunk.
     pub fn hits(&self) -> u64 {
         self.hits.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn note_read(&self, rows: usize) {
+        self.reads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.rows
+            .fetch_add(rows as u64, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The arm's engagement, for a family's `/health`: requests read as
+    /// ragged rows, the rows, the kept-state hits and the kept state's length.
+    pub fn report(&self) -> serde_json::Value {
+        let load = |n: &std::sync::atomic::AtomicU64| n.load(std::sync::atomic::Ordering::Relaxed);
+        serde_json::json!({
+            "ragged_reads": load(&self.reads),
+            "ragged_rows": load(&self.rows),
+            "kept_state_hits": load(&self.hits),
+            "kept_state_tokens": self.kept_tokens(),
+        })
     }
 
     /// The kept trunk's length in tokens, 0 when none is kept.

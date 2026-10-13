@@ -417,13 +417,13 @@ fn load_from_factory<P: Predictor, M: CausalLM>(
         decode,
         mut capabilities,
     } = serving;
-    // This is a one-sequence text adapter, not a replacement for incumbent
-    // batch/speculation/media family owners. Refuse overclaimed embedding facts.
+    // This is a one-sequence adapter, not a replacement for incumbent
+    // batch/speculation family owners. Refuse overclaimed embedding facts;
+    // image input is checked against the tower the producer loads, below.
     if !capabilities.generation
         || capabilities.batch
         || capabilities.prefix_share
         || !capabilities.speculation.is_empty()
-        || capabilities.vision
         || capabilities.model_axes
         || capabilities.executor_arms
         || capabilities.eos_gate
@@ -457,6 +457,7 @@ fn load_from_factory<P: Predictor, M: CausalLM>(
         if engine.capacity != facts.capacity || engine.model.vocab_size() != facts.vocab_size {
             lloom_tensor::bail!("family materialization differs from serving preflight")
         }
+        vision_claim_matches(&facts.capabilities, engine.vision.is_some())?;
         Ok(engine)
     };
     let owner = match admission {
@@ -476,6 +477,21 @@ fn load_from_factory<P: Predictor, M: CausalLM>(
         decisions,
         binding,
     })
+}
+
+/// Image input is claimed exactly when a tower was loaded: a claim without
+/// one would accept image chat it refuses, a tower without one would list
+/// text input only while it reads images.
+fn vision_claim_matches(capabilities: &Capabilities, tower: bool) -> Result<()> {
+    if capabilities.vision != tower {
+        lloom_tensor::bail!(
+            "{} claims image input {} but loaded {} vision tower",
+            capabilities.family,
+            if capabilities.vision { "on" } else { "off" },
+            if tower { "a" } else { "no" }
+        )
+    }
+    Ok(())
 }
 
 fn prepare_metadata(
@@ -611,8 +627,8 @@ where
         })
     }
     pub fn health_checked(&self) -> Result<Value> {
-        self.pass(Request::Metadata(MetadataRequest::Health), |_| {
-            Ok(json!({"capacity": self.metadata.capacity, "capabilities": self.metadata.capabilities.json(), "admission": self.owner.admission()}))
+        self.pass(Request::Metadata(MetadataRequest::Health), |engine| {
+            Ok(json!({"capacity": self.metadata.capacity, "capabilities": self.metadata.capabilities.json(), "admission": self.owner.admission(), "decision_ragged": engine.ragged_report()}))
         })
     }
     pub fn describe_checked(&self) -> Result<String> {
@@ -1041,5 +1057,37 @@ pub(crate) fn lfm2_gguf_capabilities() -> Capabilities {
         vision_missing: NO_MMPROJ,
         eos_gate: false,
         eos_gate_missing: "generic GGUF forward has no gated kernels",
+    }
+}
+
+#[cfg(test)]
+mod vision_claim_tests {
+    use super::*;
+
+    /// The served adapter lists image input exactly when a tower loaded:
+    /// `lfm2-gguf` with its mmproj, and neither without one nor under
+    /// `--text-only`.
+    #[test]
+    fn image_input_is_claimed_exactly_when_a_tower_loaded() {
+        let with = Capabilities {
+            vision: true,
+            vision_missing: "",
+            ..lfm2_gguf_capabilities()
+        };
+        let without = lfm2_gguf_capabilities();
+        assert!(vision_claim_matches(&with, true).is_ok());
+        assert!(vision_claim_matches(&without, false).is_ok());
+        let over = vision_claim_matches(&with, false).unwrap_err().to_string();
+        assert!(
+            over.contains("claims image input on but loaded no"),
+            "{over}"
+        );
+        let under = vision_claim_matches(&without, true)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            under.contains("claims image input off but loaded a"),
+            "{under}"
+        );
     }
 }

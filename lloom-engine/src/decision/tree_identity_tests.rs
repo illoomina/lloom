@@ -266,6 +266,7 @@ fn run_ragged(
         &options,
         |m, _| m.new_cache(),
         trunks,
+        true,
     )
 }
 
@@ -362,5 +363,12 @@ fn a_kept_state_serves_the_requests_over_it_and_no_other() -> Result<()> {
     assert_eq!(trunks.hits(), 3);
     run_ragged(&model, &single_request(0)?, Some(&trunks))?;
     assert_eq!(trunks.hits(), 3, "the replaced state was still served");
+    // The engagement report counts the ragged reads, never a plain pass: the
+    // three-question read, the three kept-state singles, the two-question read.
+    let report = trunks.report();
+    assert_eq!(report["ragged_reads"], 5, "{report}");
+    assert_eq!(report["ragged_rows"], 3 + 3 + 2, "{report}");
+    assert_eq!(report["kept_state_hits"], 3, "{report}");
+    assert_eq!(report["kept_state_tokens"], other.len(), "{report}");
     Ok(())
 }

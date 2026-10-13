@@ -548,12 +548,12 @@ fn each_row_of_a_ragged_pass_is_its_own_forward_on_the_cpu() -> Result<()> {
     Ok(())
 }
 
-/// Rows continuing one retained trunk (`AdoptRetained`, the decision lane's
-/// ragged read, `docs/models/d1.md`): the trunk prefilled once and retained,
-/// three fresh caches adopting it and running ONE ragged pass of their own
-/// tokens, each row's logits those of one pass over its whole prompt (the
-/// conv's left context is the trunk's), and the trunk unchanged for a late
-/// adopter. On the Cat arm only: an in-place slab refuses adoption.
+/// Rows continuing one retained trunk (`AdoptRetained`, the decision
+/// executor's ragged read, `docs/models/d1.md`): the trunk prefilled once and
+/// retained, three fresh caches adopting it and running ONE ragged pass of
+/// their own tokens, each row's logits those of one pass over its whole
+/// prompt (the conv's left context is the trunk's), and the trunk unchanged
+/// for a late adopter. On the Cat arm only: an in-place slab refuses adoption.
 #[test]
 fn rows_adopting_a_retained_trunk_continue_it_on_the_cpu() -> Result<()> {
     knobs();

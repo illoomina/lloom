@@ -384,15 +384,16 @@ impl<P: Lfm2Shape> Engine<P> {
             &encoder,
             device,
             |rows, readback| match self.ragged_config() {
-                // A trunk with image rows is not kept: its tokens do not name
-                // its pixels.
+                // A trunk with image rows is counted, not kept: its tokens
+                // do not name its pixels.
                 Some(config) => request.execute_ragged(
                     rows,
                     model,
                     readback,
                     &options,
                     |_model, device| self.decision_cache(&config, device),
-                    None,
+                    Some(&self.trunks),
+                    false,
                 ),
                 None => {
                     request.execute_with_cache_factory(rows, readback, &options, |_, device| {

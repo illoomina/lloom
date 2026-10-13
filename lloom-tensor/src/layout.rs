@@ -135,22 +135,24 @@ impl Layout {
     pub fn narrow(&self, dim: usize, start: usize, len: usize) -> Result<Self> {
         let dims = self.shape().dims();
         if dim >= dims.len() {
-            Err(Error::DimOutOfRange {
+            Err(Error::DimOutOfRange(Box::new(crate::error::DimOutOfRange {
                 shape: self.shape().clone(),
                 dim: dim as i32,
                 op: "narrow",
-            }
+            }))
             .bt())?
         }
         if start + len > dims[dim] {
-            Err(Error::NarrowInvalidArgs {
-                shape: self.shape.clone(),
-                dim,
-                start,
-                len,
-                msg: "start + len > dim_len",
-            }
-            .bt())?
+            Err(
+                Error::NarrowInvalidArgs(Box::new(crate::error::NarrowInvalidArgs {
+                    shape: self.shape.clone(),
+                    dim,
+                    start,
+                    len,
+                    msg: "start + len > dim_len",
+                }))
+                .bt(),
+            )?
         }
         let mut dims = dims.to_vec();
         dims[dim] = len;
@@ -210,10 +212,12 @@ impl Layout {
     pub fn broadcast_as<S: Into<Shape>>(&self, shape: S) -> Result<Self> {
         let shape = shape.into();
         if shape.rank() < self.shape().rank() {
-            return Err(Error::BroadcastIncompatibleShapes {
-                src_shape: self.shape().clone(),
-                dst_shape: shape,
-            }
+            return Err(Error::BroadcastIncompatibleShapes(Box::new(
+                crate::error::BroadcastIncompatibleShapes {
+                    src_shape: self.shape().clone(),
+                    dst_shape: shape,
+                },
+            ))
             .bt());
         }
         let added_dims = shape.rank() - self.shape().rank();
@@ -225,10 +229,12 @@ impl Layout {
             let s = if dst_dim == src_dim {
                 src_stride
             } else if src_dim != 1 {
-                return Err(Error::BroadcastIncompatibleShapes {
-                    src_shape: self.shape().clone(),
-                    dst_shape: shape,
-                }
+                return Err(Error::BroadcastIncompatibleShapes(Box::new(
+                    crate::error::BroadcastIncompatibleShapes {
+                        src_shape: self.shape().clone(),
+                        dst_shape: shape,
+                    },
+                ))
                 .bt());
             } else {
                 0

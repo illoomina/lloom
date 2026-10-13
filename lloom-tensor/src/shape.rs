@@ -215,12 +215,14 @@ impl Shape {
             } else if r_value == 1 {
                 l_value
             } else {
-                Err(Error::ShapeMismatchBinaryOp {
-                    lhs: lhs.clone(),
-                    rhs: rhs.clone(),
-                    op,
-                }
-                .bt())?
+                Err(
+                    Error::ShapeMismatchBinaryOp(Box::new(crate::error::ShapeMismatchBinaryOp {
+                        lhs: lhs.clone(),
+                        rhs: rhs.clone(),
+                        op,
+                    }))
+                    .bt(),
+                )?
             }
         }
         Ok(Shape::from(bcast_dims))
@@ -259,11 +261,11 @@ impl Dim for usize {
     fn to_index(&self, shape: &Shape, op: &'static str) -> Result<usize> {
         let dim = *self;
         if dim >= shape.dims().len() {
-            Err(Error::DimOutOfRange {
+            Err(Error::DimOutOfRange(Box::new(crate::error::DimOutOfRange {
                 shape: shape.clone(),
                 dim: dim as i32,
                 op,
-            }
+            }))
             .bt())?
         } else {
             Ok(dim)
@@ -273,11 +275,11 @@ impl Dim for usize {
     fn to_index_plus_one(&self, shape: &Shape, op: &'static str) -> Result<usize> {
         let dim = *self;
         if dim > shape.dims().len() {
-            Err(Error::DimOutOfRange {
+            Err(Error::DimOutOfRange(Box::new(crate::error::DimOutOfRange {
                 shape: shape.clone(),
                 dim: dim as i32,
                 op,
-            }
+            }))
             .bt())?
         } else {
             Ok(dim)
@@ -299,11 +301,11 @@ impl D {
             Self::Minus2 => -2,
             Self::Minus(u) => -(*u as i32),
         };
-        Error::DimOutOfRange {
+        Error::DimOutOfRange(Box::new(crate::error::DimOutOfRange {
             shape: shape.clone(),
             dim,
             op,
-        }
+        }))
         .bt()
     }
 }
@@ -337,19 +339,21 @@ pub trait Dims: Sized {
         let dims = self.to_indexes_internal(shape, op)?;
         for (i, &dim) in dims.iter().enumerate() {
             if dims[..i].contains(&dim) {
-                Err(Error::DuplicateDimIndex {
-                    shape: shape.clone(),
-                    dims: dims.clone(),
-                    op,
-                }
-                .bt())?
+                Err(
+                    Error::DuplicateDimIndex(Box::new(crate::error::DuplicateDimIndex {
+                        shape: shape.clone(),
+                        dims: dims.clone(),
+                        op,
+                    }))
+                    .bt(),
+                )?
             }
             if dim >= shape.rank() {
-                Err(Error::DimOutOfRange {
+                Err(Error::DimOutOfRange(Box::new(crate::error::DimOutOfRange {
                     shape: shape.clone(),
                     dim: dim as i32,
                     op,
-                }
+                }))
                 .bt())?
             }
         }

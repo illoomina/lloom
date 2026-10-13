@@ -6860,7 +6860,7 @@ fn sdpa_vector_declares_variants_the_name_table_cannot_reach() {
          -- update it rather than relaxing it",
     );
     assert!(
-        matches!(err, MetalKernelError::SdpaHeadSizeMismatch { got: 72, .. }),
+        matches!(&err, MetalKernelError::SdpaHeadSizeMismatch(m) if m.got == 72),
         "expected the head-size mismatch that records the gap, got {err:?}"
     );
 }

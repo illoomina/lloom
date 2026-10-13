@@ -92,20 +92,24 @@ pub fn sdpa_full_tile(
     itype: SdpaDType,
 ) -> Result<(usize, usize, usize, usize), MetalKernelError> {
     if !SDPA_FULL_HEAD_DIMS.contains(&head_dim) {
-        return Err(MetalKernelError::SdpaHeadSizeMismatch {
-            variation: "full",
-            got: head_dim,
-            expected: SDPA_FULL_HEAD_DIMS.to_vec(),
-        });
+        return Err(MetalKernelError::SdpaHeadSizeMismatch(Box::new(
+            crate::kernels::err::SdpaHeadSizeMismatch {
+                variation: "full",
+                got: head_dim,
+                expected: SDPA_FULL_HEAD_DIMS.to_vec(),
+            },
+        )));
     }
     // BD=512 uses reduced tiles to fit 32KB Metal threadgroup memory (f16/bf16 only).
     if head_dim == 512 {
         if itype == SdpaDType::F32 {
-            return Err(MetalKernelError::SdpaHeadSizeMismatch {
-                variation: "full (f32 unsupported at head_dim=512)",
-                got: head_dim,
-                expected: vec![32, 64, 72, 80, 96, 128, 256],
-            });
+            return Err(MetalKernelError::SdpaHeadSizeMismatch(Box::new(
+                crate::kernels::err::SdpaHeadSizeMismatch {
+                    variation: "full (f32 unsupported at head_dim=512)",
+                    got: head_dim,
+                    expected: vec![32, 64, 72, 80, 96, 128, 256],
+                },
+            )));
         }
         Ok((8, 8, 1, 1))
     } else if head_dim == 256 && itype == SdpaDType::F32 {
@@ -328,11 +332,13 @@ pub unsafe fn call_sdpa_full_with(
         // A key block must sit inside one page: the loader is seated once per
         // block and walks linearly from there.
         if p.page_size == 0 || !p.page_size.is_multiple_of(bk) {
-            return Err(MetalKernelError::SdpaHeadSizeMismatch {
-                variation: "full (paged: page_size must be a multiple of the key block)",
-                got: p.page_size,
-                expected: vec![bk],
-            });
+            return Err(MetalKernelError::SdpaHeadSizeMismatch(Box::new(
+                crate::kernels::err::SdpaHeadSizeMismatch {
+                    variation: "full (paged: page_size must be a multiple of the key block)",
+                    got: p.page_size,
+                    expected: vec![bk],
+                },
+            )));
         }
     }
 
@@ -668,11 +674,13 @@ pub unsafe fn call_sdpa_vector_with(
         (256, SdpaDType::F32) => "sdpa_vector_float_256",
         (512, SdpaDType::F32) => "sdpa_vector_float_512",
         (other, _) => {
-            return Err(MetalKernelError::SdpaHeadSizeMismatch {
-                variation: "vector",
-                got: *other,
-                expected: SDPA_VECTOR_HEAD_DIMS.to_vec(),
-            })
+            return Err(MetalKernelError::SdpaHeadSizeMismatch(Box::new(
+                crate::kernels::err::SdpaHeadSizeMismatch {
+                    variation: "vector",
+                    got: *other,
+                    expected: SDPA_VECTOR_HEAD_DIMS.to_vec(),
+                },
+            )))
         }
     };
 
@@ -807,11 +815,13 @@ pub unsafe fn call_sdpa_vector_paged(
             (256, SdpaDType::F32) => "sdpa_vector_2pass_1_paged_float_256",
             (512, SdpaDType::F32) => "sdpa_vector_2pass_1_paged_float_512",
             (other, _) => {
-                return Err(MetalKernelError::SdpaHeadSizeMismatch {
-                    variation: "vector_2pass_1_paged",
-                    got: other,
-                    expected: SDPA_VECTOR_HEAD_DIMS.to_vec(),
-                })
+                return Err(MetalKernelError::SdpaHeadSizeMismatch(Box::new(
+                    crate::kernels::err::SdpaHeadSizeMismatch {
+                        variation: "vector_2pass_1_paged",
+                        got: other,
+                        expected: SDPA_VECTOR_HEAD_DIMS.to_vec(),
+                    },
+                )))
             }
         };
         let name2 = match (head_dim, itype) {
@@ -922,11 +932,13 @@ pub unsafe fn call_sdpa_vector_paged(
         (256, SdpaDType::F32) => "sdpa_vector_paged_float_256",
         (512, SdpaDType::F32) => "sdpa_vector_paged_float_512",
         (other, _) => {
-            return Err(MetalKernelError::SdpaHeadSizeMismatch {
-                variation: "vector_paged",
-                got: other,
-                expected: SDPA_VECTOR_HEAD_DIMS.to_vec(),
-            })
+            return Err(MetalKernelError::SdpaHeadSizeMismatch(Box::new(
+                crate::kernels::err::SdpaHeadSizeMismatch {
+                    variation: "vector_paged",
+                    got: other,
+                    expected: SDPA_VECTOR_HEAD_DIMS.to_vec(),
+                },
+            )))
         }
     };
     if rows == 0 || nh == 0 || gqa_factor == 0 || page_size == 0 || table_stride == 0 {
@@ -1147,19 +1159,23 @@ pub unsafe fn call_quantize_kv(
         SdpaDType::F16 => "float16_t",
         SdpaDType::F32 => "float",
         SdpaDType::BF16 => {
-            return Err(MetalKernelError::SdpaHeadSizeMismatch {
-                variation: "quantize_kv (bf16 not instantiated)",
-                got: head_dim,
-                expected: KV_QUANT_HEAD_DIMS.to_vec(),
-            })
+            return Err(MetalKernelError::SdpaHeadSizeMismatch(Box::new(
+                crate::kernels::err::SdpaHeadSizeMismatch {
+                    variation: "quantize_kv (bf16 not instantiated)",
+                    got: head_dim,
+                    expected: KV_QUANT_HEAD_DIMS.to_vec(),
+                },
+            )))
         }
     };
     if !KV_QUANT_HEAD_DIMS.contains(&head_dim) {
-        return Err(MetalKernelError::SdpaHeadSizeMismatch {
-            variation: "quantize_kv",
-            got: head_dim,
-            expected: KV_QUANT_HEAD_DIMS.to_vec(),
-        });
+        return Err(MetalKernelError::SdpaHeadSizeMismatch(Box::new(
+            crate::kernels::err::SdpaHeadSizeMismatch {
+                variation: "quantize_kv",
+                got: head_dim,
+                expected: KV_QUANT_HEAD_DIMS.to_vec(),
+            },
+        )));
     }
     let name = format!("quantize_kv_{itype_repr}_{head_dim}_{}", bits.name());
 
@@ -1239,19 +1255,23 @@ pub unsafe fn call_dequantize_kv(
         SdpaDType::F16 => "float16_t",
         SdpaDType::F32 => "float",
         SdpaDType::BF16 => {
-            return Err(MetalKernelError::SdpaHeadSizeMismatch {
-                variation: "dequantize_kv (bf16 not instantiated)",
-                got: head_dim,
-                expected: KV_QUANT_HEAD_DIMS.to_vec(),
-            })
+            return Err(MetalKernelError::SdpaHeadSizeMismatch(Box::new(
+                crate::kernels::err::SdpaHeadSizeMismatch {
+                    variation: "dequantize_kv (bf16 not instantiated)",
+                    got: head_dim,
+                    expected: KV_QUANT_HEAD_DIMS.to_vec(),
+                },
+            )))
         }
     };
     if !KV_QUANT_HEAD_DIMS.contains(&head_dim) {
-        return Err(MetalKernelError::SdpaHeadSizeMismatch {
-            variation: "dequantize_kv",
-            got: head_dim,
-            expected: KV_QUANT_HEAD_DIMS.to_vec(),
-        });
+        return Err(MetalKernelError::SdpaHeadSizeMismatch(Box::new(
+            crate::kernels::err::SdpaHeadSizeMismatch {
+                variation: "dequantize_kv",
+                got: head_dim,
+                expected: KV_QUANT_HEAD_DIMS.to_vec(),
+            },
+        )));
     }
     let name = format!("dequantize_kv_{itype_repr}_{head_dim}_{}", bits.name());
 
@@ -1408,19 +1428,23 @@ unsafe fn encode_sdpa_vector_quant(
         SdpaDType::F16 => "float16_t",
         SdpaDType::F32 => "float",
         SdpaDType::BF16 => {
-            return Err(MetalKernelError::SdpaHeadSizeMismatch {
-                variation: "sdpa_vector_quant (bf16 not instantiated)",
-                got: head_dim,
-                expected: KV_QUANT_HEAD_DIMS.to_vec(),
-            })
+            return Err(MetalKernelError::SdpaHeadSizeMismatch(Box::new(
+                crate::kernels::err::SdpaHeadSizeMismatch {
+                    variation: "sdpa_vector_quant (bf16 not instantiated)",
+                    got: head_dim,
+                    expected: KV_QUANT_HEAD_DIMS.to_vec(),
+                },
+            )))
         }
     };
     if !KV_QUANT_HEAD_DIMS.contains(&head_dim) {
-        return Err(MetalKernelError::SdpaHeadSizeMismatch {
-            variation: "sdpa_vector_quant",
-            got: head_dim,
-            expected: KV_QUANT_HEAD_DIMS.to_vec(),
-        });
+        return Err(MetalKernelError::SdpaHeadSizeMismatch(Box::new(
+            crate::kernels::err::SdpaHeadSizeMismatch {
+                variation: "sdpa_vector_quant",
+                got: head_dim,
+                expected: KV_QUANT_HEAD_DIMS.to_vec(),
+            },
+        )));
     }
     let family = if sel.is_some() {
         "sdpa_vector_quant_sel"
@@ -1592,11 +1616,13 @@ pub unsafe fn call_sdpa_vector_2pass(
             (256, SdpaDType::F32) => "sdpa_vector_2pass_1_float_256",
             (512, SdpaDType::F32) => "sdpa_vector_2pass_1_float_512",
             (other, _) => {
-                return Err(MetalKernelError::SdpaHeadSizeMismatch {
-                    variation: "vector_2pass_1",
-                    got: *other,
-                    expected: SDPA_VECTOR_HEAD_DIMS.to_vec(),
-                })
+                return Err(MetalKernelError::SdpaHeadSizeMismatch(Box::new(
+                    crate::kernels::err::SdpaHeadSizeMismatch {
+                        variation: "vector_2pass_1",
+                        got: *other,
+                        expected: SDPA_VECTOR_HEAD_DIMS.to_vec(),
+                    },
+                )))
             }
         };
 
@@ -1684,11 +1710,13 @@ pub unsafe fn call_sdpa_vector_2pass(
             (256, SdpaDType::F32) => "sdpa_vector_2pass_2_float_256",
             (512, SdpaDType::F32) => "sdpa_vector_2pass_2_float_512",
             (other, _) => {
-                return Err(MetalKernelError::SdpaHeadSizeMismatch {
-                    variation: "vector_2pass_2",
-                    got: *other,
-                    expected: SDPA_VECTOR_HEAD_DIMS.to_vec(),
-                })
+                return Err(MetalKernelError::SdpaHeadSizeMismatch(Box::new(
+                    crate::kernels::err::SdpaHeadSizeMismatch {
+                        variation: "vector_2pass_2",
+                        got: *other,
+                        expected: SDPA_VECTOR_HEAD_DIMS.to_vec(),
+                    },
+                )))
             }
         };
 

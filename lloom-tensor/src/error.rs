@@ -11,6 +11,86 @@ pub struct MatMulUnexpectedStriding {
     pub msg: &'static str,
 }
 
+// Payloads of the cold variants whose inline size would exceed the hot
+// refusals', boxed so they never set `size_of::<Error>()`. Each keeps its
+// variant's name and `Display` text (`docs/invariants.md` §15.2 #15a).
+
+#[derive(Debug, thiserror::Error)]
+#[error("{op}: dimension index {dim} out of range for shape {shape:?}")]
+pub struct DimOutOfRange {
+    pub shape: Shape,
+    pub dim: i32,
+    pub op: &'static str,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("{op}: duplicate dim index {dims:?} for shape {shape:?}")]
+pub struct DuplicateDimIndex {
+    pub shape: Shape,
+    pub dims: Vec<usize>,
+    pub op: &'static str,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("{msg}, expected: {expected:?}, got: {got:?}")]
+pub struct UnexpectedShape {
+    pub msg: String,
+    pub expected: Shape,
+    pub got: Shape,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("shape mismatch in {op}, lhs: {lhs:?}, rhs: {rhs:?}")]
+pub struct ShapeMismatchBinaryOp {
+    pub lhs: Shape,
+    pub rhs: Shape,
+    pub op: &'static str,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("shape mismatch in cat for dim {dim}, shape for arg 1: {first_shape:?} shape for arg {n}: {nth_shape:?}")]
+pub struct ShapeMismatchCat {
+    pub dim: usize,
+    pub first_shape: Shape,
+    pub n: usize,
+    pub nth_shape: Shape,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("device mismatch in {op}, lhs: {lhs:?}, rhs: {rhs:?}")]
+pub struct DeviceMismatchBinaryOp {
+    pub lhs: DeviceLocation,
+    pub rhs: DeviceLocation,
+    pub op: &'static str,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("narrow invalid args {msg}: {shape:?}, dim: {dim}, start: {start}, len:{len}")]
+pub struct NarrowInvalidArgs {
+    pub shape: Shape,
+    pub dim: usize,
+    pub start: usize,
+    pub len: usize,
+    pub msg: &'static str,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("conv1d invalid args {msg}: inp: {inp_shape:?}, k: {k_shape:?}, pad: {padding}, stride: {stride}")]
+pub struct Conv1dInvalidArgs {
+    pub inp_shape: Shape,
+    pub k_shape: Shape,
+    pub padding: usize,
+    pub stride: usize,
+    pub msg: &'static str,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("cannot broadcast {src_shape:?} to {dst_shape:?}")]
+pub struct BroadcastIncompatibleShapes {
+    pub src_shape: Shape,
+    pub dst_shape: Shape,
+}
+
 impl std::fmt::Debug for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{self}")
@@ -18,6 +98,12 @@ impl std::fmt::Debug for Error {
 }
 
 /// Main library error type.
+///
+/// Every `Result<T>` carries this enum by value, so its size is a per-return
+/// cost. The refusals a warm path can meet stay inline and allocation-free:
+/// `Allocation` (`Copy`), and `Metal`, which carries the kernel layer's
+/// allocation and command-buffer recording refusals. A cold variant whose
+/// payload is larger than those holds it behind one `Box`.
 #[derive(thiserror::Error)]
 pub enum Error {
     // === DType Errors ===
@@ -39,19 +125,11 @@ pub enum Error {
     UnsupportedDTypeForOp(DType, &'static str),
 
     // === Dimension Index Errors ===
-    #[error("{op}: dimension index {dim} out of range for shape {shape:?}")]
-    DimOutOfRange {
-        shape: Shape,
-        dim: i32,
-        op: &'static str,
-    },
+    #[error(transparent)]
+    DimOutOfRange(Box<DimOutOfRange>),
 
-    #[error("{op}: duplicate dim index {dims:?} for shape {shape:?}")]
-    DuplicateDimIndex {
-        shape: Shape,
-        dims: Vec<usize>,
-        op: &'static str,
-    },
+    #[error(transparent)]
+    DuplicateDimIndex(Box<DuplicateDimIndex>),
 
     // === Shape Errors ===
     #[error("unexpected rank, expected: {expected}, got: {got} ({shape:?})")]
@@ -61,32 +139,19 @@ pub enum Error {
         shape: Shape,
     },
 
-    #[error("{msg}, expected: {expected:?}, got: {got:?}")]
-    UnexpectedShape {
-        msg: String,
-        expected: Shape,
-        got: Shape,
-    },
+    #[error(transparent)]
+    UnexpectedShape(Box<UnexpectedShape>),
 
     #[error(
         "Shape mismatch, got buffer of size {buffer_size} which is compatible with shape {shape:?}"
     )]
     ShapeMismatch { buffer_size: usize, shape: Shape },
 
-    #[error("shape mismatch in {op}, lhs: {lhs:?}, rhs: {rhs:?}")]
-    ShapeMismatchBinaryOp {
-        lhs: Shape,
-        rhs: Shape,
-        op: &'static str,
-    },
+    #[error(transparent)]
+    ShapeMismatchBinaryOp(Box<ShapeMismatchBinaryOp>),
 
-    #[error("shape mismatch in cat for dim {dim}, shape for arg 1: {first_shape:?} shape for arg {n}: {nth_shape:?}")]
-    ShapeMismatchCat {
-        dim: usize,
-        first_shape: Shape,
-        n: usize,
-        nth_shape: Shape,
-    },
+    #[error(transparent)]
+    ShapeMismatchCat(Box<ShapeMismatchCat>),
 
     #[error("Cannot divide tensor of shape {shape:?} equally along dim {dim} into {n_parts}")]
     ShapeMismatchSplit {
@@ -102,31 +167,15 @@ pub enum Error {
     EmptyTensor { op: &'static str },
 
     // === Device Errors ===
-    #[error("device mismatch in {op}, lhs: {lhs:?}, rhs: {rhs:?}")]
-    DeviceMismatchBinaryOp {
-        lhs: DeviceLocation,
-        rhs: DeviceLocation,
-        op: &'static str,
-    },
+    #[error(transparent)]
+    DeviceMismatchBinaryOp(Box<DeviceMismatchBinaryOp>),
 
     // === Op Specific Errors ===
-    #[error("narrow invalid args {msg}: {shape:?}, dim: {dim}, start: {start}, len:{len}")]
-    NarrowInvalidArgs {
-        shape: Shape,
-        dim: usize,
-        start: usize,
-        len: usize,
-        msg: &'static str,
-    },
+    #[error(transparent)]
+    NarrowInvalidArgs(Box<NarrowInvalidArgs>),
 
-    #[error("conv1d invalid args {msg}: inp: {inp_shape:?}, k: {k_shape:?}, pad: {padding}, stride: {stride}")]
-    Conv1dInvalidArgs {
-        inp_shape: Shape,
-        k_shape: Shape,
-        padding: usize,
-        stride: usize,
-        msg: &'static str,
-    },
+    #[error(transparent)]
+    Conv1dInvalidArgs(Box<Conv1dInvalidArgs>),
 
     #[error("{op} invalid index {index} with dim size {size}")]
     InvalidIndex {
@@ -135,8 +184,8 @@ pub enum Error {
         size: usize,
     },
 
-    #[error("cannot broadcast {src_shape:?} to {dst_shape:?}")]
-    BroadcastIncompatibleShapes { src_shape: Shape, dst_shape: Shape },
+    #[error(transparent)]
+    BroadcastIncompatibleShapes(Box<BroadcastIncompatibleShapes>),
 
     #[error("cannot set variable {msg}")]
     CannotSetVar { msg: &'static str },

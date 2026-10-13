@@ -79,7 +79,14 @@ impl Storage {
             lhs == rhs
         };
         if !same_device {
-            Err(Error::DeviceMismatchBinaryOp { lhs, rhs, op }.bt())
+            Err(
+                Error::DeviceMismatchBinaryOp(Box::new(crate::error::DeviceMismatchBinaryOp {
+                    lhs,
+                    rhs,
+                    op,
+                }))
+                .bt(),
+            )
         } else {
             Ok(())
         }
@@ -179,12 +186,14 @@ impl Storage {
             (lhs, rhs) => {
                 // Should not happen because of the same device check above but we're defensive
                 // anyway.
-                Err(Error::DeviceMismatchBinaryOp {
-                    lhs: lhs.device().location(),
-                    rhs: rhs.device().location(),
-                    op: "cmp",
-                }
-                .bt())
+                Err(
+                    Error::DeviceMismatchBinaryOp(Box::new(crate::error::DeviceMismatchBinaryOp {
+                        lhs: lhs.device().location(),
+                        rhs: rhs.device().location(),
+                        op: "cmp",
+                    }))
+                    .bt(),
+                )
             }
         }
     }
@@ -379,12 +388,14 @@ impl Storage {
             (lhs, rhs) => {
                 // Should not happen because of the same device check above but we're defensive
                 // anyway.
-                Err(Error::DeviceMismatchBinaryOp {
-                    lhs: lhs.device().location(),
-                    rhs: rhs.device().location(),
-                    op: B::NAME,
-                }
-                .bt())
+                Err(
+                    Error::DeviceMismatchBinaryOp(Box::new(crate::error::DeviceMismatchBinaryOp {
+                        lhs: lhs.device().location(),
+                        rhs: rhs.device().location(),
+                        op: B::NAME,
+                    }))
+                    .bt(),
+                )
             }
         }
     }
@@ -411,11 +422,13 @@ impl Storage {
                 let s = inp.conv1d(l, kernel, kernel_l, params)?;
                 Ok(Self::Metal(s))
             }
-            (lhs, rhs) => Err(Error::DeviceMismatchBinaryOp {
-                lhs: lhs.device().location(),
-                rhs: rhs.device().location(),
-                op: "conv1d",
-            }
+            (lhs, rhs) => Err(Error::DeviceMismatchBinaryOp(Box::new(
+                crate::error::DeviceMismatchBinaryOp {
+                    lhs: lhs.device().location(),
+                    rhs: rhs.device().location(),
+                    op: "conv1d",
+                },
+            ))
             .bt()),
         }
     }
@@ -442,11 +455,13 @@ impl Storage {
                 let s = inp.conv1d_depthwise(l, kernel, kernel_l, params)?;
                 Ok(Self::Metal(s))
             }
-            (lhs, rhs) => Err(Error::DeviceMismatchBinaryOp {
-                lhs: lhs.device().location(),
-                rhs: rhs.device().location(),
-                op: "conv1d_depthwise",
-            }
+            (lhs, rhs) => Err(Error::DeviceMismatchBinaryOp(Box::new(
+                crate::error::DeviceMismatchBinaryOp {
+                    lhs: lhs.device().location(),
+                    rhs: rhs.device().location(),
+                    op: "conv1d_depthwise",
+                },
+            ))
             .bt()),
         }
     }
@@ -473,11 +488,13 @@ impl Storage {
                 let s = inp.conv_transpose1d(l, kernel, kernel_l, params)?;
                 Ok(Self::Metal(s))
             }
-            (lhs, rhs) => Err(Error::DeviceMismatchBinaryOp {
-                lhs: lhs.device().location(),
-                rhs: rhs.device().location(),
-                op: "conv-transpose1d",
-            }
+            (lhs, rhs) => Err(Error::DeviceMismatchBinaryOp(Box::new(
+                crate::error::DeviceMismatchBinaryOp {
+                    lhs: lhs.device().location(),
+                    rhs: rhs.device().location(),
+                    op: "conv-transpose1d",
+                },
+            ))
             .bt()),
         }
     }
@@ -504,11 +521,13 @@ impl Storage {
                 let s = inp.conv2d(l, kernel, kernel_l, params)?;
                 Ok(Self::Metal(s))
             }
-            (lhs, rhs) => Err(Error::DeviceMismatchBinaryOp {
-                lhs: lhs.device().location(),
-                rhs: rhs.device().location(),
-                op: "conv2d",
-            }
+            (lhs, rhs) => Err(Error::DeviceMismatchBinaryOp(Box::new(
+                crate::error::DeviceMismatchBinaryOp {
+                    lhs: lhs.device().location(),
+                    rhs: rhs.device().location(),
+                    op: "conv2d",
+                },
+            ))
             .bt()),
         }
     }
@@ -535,11 +554,13 @@ impl Storage {
                 let s = inp.conv_transpose2d(l, kernel, kernel_l, params)?;
                 Ok(Self::Metal(s))
             }
-            (lhs, rhs) => Err(Error::DeviceMismatchBinaryOp {
-                lhs: lhs.device().location(),
-                rhs: rhs.device().location(),
-                op: "conv_transpose2d",
-            }
+            (lhs, rhs) => Err(Error::DeviceMismatchBinaryOp(Box::new(
+                crate::error::DeviceMismatchBinaryOp {
+                    lhs: lhs.device().location(),
+                    rhs: rhs.device().location(),
+                    op: "conv_transpose2d",
+                },
+            ))
             .bt()),
         }
     }
@@ -674,11 +695,13 @@ impl Storage {
                 let storage = cond.where_cond(layout, t, layout_t, f, layout_f)?;
                 Ok(Self::Metal(storage))
             }
-            (_, lhs, rhs) => Err(Error::DeviceMismatchBinaryOp {
-                lhs: lhs.device().location(),
-                rhs: rhs.device().location(),
-                op: "where",
-            }
+            (_, lhs, rhs) => Err(Error::DeviceMismatchBinaryOp(Box::new(
+                crate::error::DeviceMismatchBinaryOp {
+                    lhs: lhs.device().location(),
+                    rhs: rhs.device().location(),
+                    op: "where",
+                },
+            ))
             .bt()),
         }
     }
@@ -809,11 +832,13 @@ impl Storage {
                 let storage = lhs.index_select(rhs, lhs_l, rhs_l, d)?;
                 Ok(Self::Metal(storage))
             }
-            (lhs, rhs) => Err(Error::DeviceMismatchBinaryOp {
-                lhs: lhs.device().location(),
-                rhs: rhs.device().location(),
-                op: "index-select",
-            }
+            (lhs, rhs) => Err(Error::DeviceMismatchBinaryOp(Box::new(
+                crate::error::DeviceMismatchBinaryOp {
+                    lhs: lhs.device().location(),
+                    rhs: rhs.device().location(),
+                    op: "index-select",
+                },
+            ))
             .bt()),
         }
     }
@@ -840,11 +865,13 @@ impl Storage {
                 let storage = lhs.matmul(rhs, bmnk, lhs_layout, rhs_layout)?;
                 Ok(Self::Metal(storage))
             }
-            (lhs, rhs) => Err(Error::DeviceMismatchBinaryOp {
-                lhs: lhs.device().location(),
-                rhs: rhs.device().location(),
-                op: "matmul",
-            }
+            (lhs, rhs) => Err(Error::DeviceMismatchBinaryOp(Box::new(
+                crate::error::DeviceMismatchBinaryOp {
+                    lhs: lhs.device().location(),
+                    rhs: rhs.device().location(),
+                    op: "matmul",
+                },
+            ))
             .bt()),
         }
     }
@@ -862,11 +889,13 @@ impl Storage {
             (Self::Metal(src), Self::Metal(dst)) => {
                 Ok(src.copy_strided_src(dst, dst_offset, src_l)?)
             }
-            (lhs, rhs) => Err(Error::DeviceMismatchBinaryOp {
-                lhs: lhs.device().location(),
-                rhs: rhs.device().location(),
-                op: "copy",
-            }
+            (lhs, rhs) => Err(Error::DeviceMismatchBinaryOp(Box::new(
+                crate::error::DeviceMismatchBinaryOp {
+                    lhs: lhs.device().location(),
+                    rhs: rhs.device().location(),
+                    op: "copy",
+                },
+            ))
             .bt()),
         }
     }
@@ -882,11 +911,13 @@ impl Storage {
             (Self::Cpu(src), Self::Cpu(dst)) => src.copy_strided_to(dst, src_l, dst_l),
             (Self::Cuda(src), Self::Cuda(dst)) => Ok(src.copy_strided_to(dst, src_l, dst_l)?),
             (Self::Metal(src), Self::Metal(dst)) => Ok(src.copy_strided_to(dst, src_l, dst_l)?),
-            (lhs, rhs) => Err(Error::DeviceMismatchBinaryOp {
-                lhs: lhs.device().location(),
-                rhs: rhs.device().location(),
-                op: "copy_strided_to",
-            }
+            (lhs, rhs) => Err(Error::DeviceMismatchBinaryOp(Box::new(
+                crate::error::DeviceMismatchBinaryOp {
+                    lhs: lhs.device().location(),
+                    rhs: rhs.device().location(),
+                    op: "copy_strided_to",
+                },
+            ))
             .bt()),
         }
     }
@@ -906,11 +937,13 @@ impl Storage {
             (Self::Cuda(_), Self::Cuda(_), Self::Cuda(_)) => {
                 crate::bail!("kv_scatter is not implemented for the cuda backend")
             }
-            (lhs, rhs, _) => Err(Error::DeviceMismatchBinaryOp {
-                lhs: lhs.device().location(),
-                rhs: rhs.device().location(),
-                op: "kv_scatter",
-            }
+            (lhs, rhs, _) => Err(Error::DeviceMismatchBinaryOp(Box::new(
+                crate::error::DeviceMismatchBinaryOp {
+                    lhs: lhs.device().location(),
+                    rhs: rhs.device().location(),
+                    op: "kv_scatter",
+                },
+            ))
             .bt()),
         }
     }
@@ -933,11 +966,13 @@ impl Storage {
             (Self::Metal(src), Self::Metal(dst)) => {
                 Ok(src.copy2d(dst, d1, d2, src_s, dst_s, src_o, dst_o)?)
             }
-            (lhs, rhs) => Err(Error::DeviceMismatchBinaryOp {
-                lhs: lhs.device().location(),
-                rhs: rhs.device().location(),
-                op: "copy2d",
-            }
+            (lhs, rhs) => Err(Error::DeviceMismatchBinaryOp(Box::new(
+                crate::error::DeviceMismatchBinaryOp {
+                    lhs: lhs.device().location(),
+                    rhs: rhs.device().location(),
+                    op: "copy2d",
+                },
+            ))
             .bt()),
         }
     }

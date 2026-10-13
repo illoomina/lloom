@@ -179,11 +179,13 @@ impl FlashKernel {
 
     fn name(stem: &str, dtype: FlashDType, head_dim: usize) -> Result<String, MetalKernelError> {
         if !dtype.head_dims().contains(&head_dim) {
-            return Err(MetalKernelError::SdpaHeadSizeMismatch {
-                variation: "flash_decoding",
-                got: head_dim,
-                expected: dtype.head_dims().to_vec(),
-            });
+            return Err(MetalKernelError::SdpaHeadSizeMismatch(Box::new(
+                crate::kernels::err::SdpaHeadSizeMismatch {
+                    variation: "flash_decoding",
+                    got: head_dim,
+                    expected: dtype.head_dims().to_vec(),
+                },
+            )));
         }
         Ok(format!("{stem}_{}_{head_dim}", dtype.suffix()))
     }

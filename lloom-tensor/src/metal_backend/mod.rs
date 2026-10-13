@@ -2811,17 +2811,20 @@ impl MetalStorage {
             .with_label("sample_inverse_cdf")
             .build()?;
         let encoder = device.command_encoder()?;
-        crate::kernels::call_sample_inverse_cdf(
-            &device.device,
-            &encoder,
-            &device.kernels,
-            (self.buffer(), offset),
-            rows,
-            vocab,
-            inv_t,
-            (u.buffer(), u_offset),
-            &buffer,
-        )
+        // SAFETY: storage-owned buffers (binding authority, module head).
+        unsafe {
+            crate::kernels::call_sample_inverse_cdf(
+                &device.device,
+                &encoder,
+                &device.kernels,
+                (self.buffer(), offset),
+                rows,
+                vocab,
+                inv_t,
+                (u.buffer(), u_offset),
+                &buffer,
+            )
+        }
         .map_err(MetalError::from)?;
         Ok(Self::new(buffer, device.clone(), rows, DType::U32))
     }

@@ -203,36 +203,42 @@ fn sites(events: usize) -> BTreeMap<(String, String), (u64, Vec<String>)> {
     out
 }
 
-/// The first frame above libmalloc and the logger, as `dladdr` names it.
-fn caller_of_malloc(frames: &[usize; FRAMES]) -> Option<String> {
+/// The frames above libmalloc and the logger, as `dladdr` names them.
+fn callers_of_malloc(frames: &[usize; FRAMES]) -> Vec<String> {
     frames
         .iter()
         .take_while(|&&pc| pc != 0)
         .filter_map(|&pc| raw_symbol(pc))
-        .find(|s| {
-            !(s.contains("logger")
+        .skip_while(|s| {
+            s.contains("logger")
                 || s.starts_with("backtrace")
                 || s.contains("malloc")
                 || s.contains("calloc")
                 || s.contains("realloc")
                 || s.starts_with("nanov2")
                 || s.starts_with("szone")
-                || s.starts_with("xzm"))
+                || s.starts_with("xzm")
         })
+        .collect()
 }
 
-/// Recorded events whose allocating frame is Rust code: the engine's and its
-/// crates' own allocations, as against Metal's and the runtimes'. Keyed on
-/// the frame above libmalloc because Rust's allocator shims
-/// (`__rust_alloc`, `__rdl_alloc`) tail-call `malloc` and leave no frame.
-fn rust_allocations(events: usize) -> u64 {
+/// Recorded events the engine made: Rust code allocated (its own and its
+/// crates'), or Rust asked the blocks runtime to copy a block to the heap
+/// (`RcBlock::new`) — not Metal's or the runtimes' own allocations. Keyed on
+/// the frames above libmalloc because Rust's allocator shims (`__rust_alloc`,
+/// `__rdl_alloc`) tail-call `malloc` and leave no frame.
+fn our_allocations(events: usize) -> u64 {
     let mut n = 0;
     for i in 0..events.min(RECORDED) {
         // SAFETY: recording is off and this thread wrote every slot read.
         let frames = unsafe { (*TABLE.0.get())[i] };
-        if caller_of_malloc(&frames).is_some_and(|s| is_rust(&s)) {
-            n += 1;
-        }
+        let callers = callers_of_malloc(&frames);
+        let ours = match callers.first() {
+            Some(first) if is_rust(first) => true,
+            Some(first) if first == "_Block_copy" => callers.get(1).is_some_and(|s| is_rust(s)),
+            _ => false,
+        };
+        n += ours as u64;
     }
     n
 }
@@ -270,17 +276,30 @@ fn raw_symbol(pc: usize) -> Option<String> {
     )
 }
 
-/// The classifier's control: a `Vec` allocation is Rust's; `strdup`'s, made
-/// by libc on Rust's behalf, is not. Both must read as such, or `rust=` means
-/// nothing.
+/// The classifier's controls: a `Vec` allocation and an `RcBlock` are ours;
+/// `strdup`'s, made by libc on Rust's behalf, is not. All must read as such,
+/// or `ours=` means nothing.
 fn classifier_control() {
     record_from_zero();
     let ((), n) = counted(|| drop(std::hint::black_box(vec![0u8; 64])));
     RECORD.store(false, Ordering::Relaxed);
     assert_eq!(
-        rust_allocations(n as usize),
+        our_allocations(n as usize),
         n,
-        "a Vec allocation did not read as Rust's"
+        "a Vec allocation did not read as ours"
+    );
+    record_from_zero();
+    let ((), n) = counted(|| {
+        drop(std::hint::black_box(RcBlock::new(
+            |_: NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {},
+        )))
+    });
+    RECORD.store(false, Ordering::Relaxed);
+    assert!(n >= 1, "RcBlock::new allocated nothing");
+    assert_eq!(
+        our_allocations(n as usize),
+        n,
+        "an RcBlock did not read as ours"
     );
     record_from_zero();
     // SAFETY: a NUL-terminated literal; the copy is freed below.
@@ -290,19 +309,19 @@ fn classifier_control() {
     RECORD.store(false, Ordering::Relaxed);
     assert_eq!(n, 1, "strdup made {n} allocations");
     assert_eq!(
-        rust_allocations(n as usize),
+        our_allocations(n as usize),
         0,
-        "libc's allocation read as Rust's"
+        "libc's allocation read as ours"
     );
 }
 
 fn print_sites(label: &str, events: u64, per: u64) -> u64 {
-    let rust = rust_allocations(events as usize);
+    let ours = our_allocations(events as usize);
     let sites = sites(events as usize);
     println!(
-        "SITES {label} events={events} recorded={} rust={rust} rust_per_commit={:.2}",
+        "SITES {label} events={events} recorded={} ours={ours} ours_per_commit={:.2}",
         events.min(RECORDED as u64),
-        rust as f64 / per as f64
+        ours as f64 / per as f64
     );
     for ((site, leaf), (n, chain)) in sites {
         println!(
@@ -311,7 +330,7 @@ fn print_sites(label: &str, events: u64, per: u64) -> u64 {
         );
         println!("           chain: {}", chain.join(" <- "));
     }
-    rust
+    ours
 }
 
 fn api() -> String {
@@ -445,7 +464,7 @@ fn commit_loop(kind: CommandBufferKind, subscriber: bool, commits: u64) -> (u64,
     // Encoding one dispatch, for scale: the same counter around a step.
     let mut encode = 0;
     for _ in 0..64 {
-        let ((), e) = counted(|| step());
+        let ((), e) = counted(&step);
         encode += e;
         cmds.flush_and_wait().unwrap();
     }
@@ -479,19 +498,20 @@ fn allocations_per_commit_on_the_encoding_thread() {
                  encode_per_dispatch={encode}",
                 events as f64 / commits as f64
             );
-            let rust = print_sites(
+            let ours = print_sites(
                 &format!("api={api} kind={kind:?} subscribers={subscribers}"),
                 events,
                 commits,
             );
-            // The default command API's commit makes no Rust allocation, with
-            // or without a subscriber: no callback box, no capture vector, no
-            // subscriber clone (`docs/tuning.md` §13.5x). Metal 4 is reported:
-            // its commit still takes a new `Arc<Submission>`.
+            // The default command API's commit makes no allocation of ours,
+            // with or without a subscriber: no callback box, no capture
+            // vector, no subscriber clone, no per-buffer block
+            // (`docs/tuning.md` §13.5x). Metal 4 is reported: its commit
+            // still takes a new submission, commit options and a block.
             if api == "metal3" {
                 assert_eq!(
-                    rust, 0,
-                    "{rust} Rust allocations over {commits} commits (kind {kind:?}, \
+                    ours, 0,
+                    "{ours} allocations of ours over {commits} commits (kind {kind:?}, \
                      subscribers {subscribers}): see the SITES table above"
                 );
             }

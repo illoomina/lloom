@@ -999,6 +999,7 @@ mod cap_adoption_tests {
             Err(Refusal::Limit {
                 scope: Scope::Process,
                 limit: 9,
+                requested: 10,
                 requested_total: 10,
             })
         );
@@ -1015,6 +1016,7 @@ mod cap_adoption_tests {
             Err(Refusal::Limit {
                 scope: Scope::Process,
                 limit: 10,
+                requested: 1,
                 requested_total: 11
             })
         ));

@@ -954,10 +954,10 @@ mod tests {
         );
         assert!(matches!(
             cell.configure(Some(3)),
-            Err(AdmissionError::Limit {
-                scope: LimitScope::Process,
-                limit: 3,
-                requested_total: 4
+            Err(AllocationError::Refused {
+                requested: 4,
+                available: 3,
+                domain: RefusalDomain::Process,
             })
         ));
         assert_eq!(account.cap(), None);
@@ -973,16 +973,16 @@ mod tests {
         account.core.begin_model_load(); // Same core method used by public hook.
         assert_eq!(
             cell.configure(Some(8)),
-            Err(AdmissionError::ConfigurationConflict {
+            Err(AllocationError::ConfigurationConflict {
                 active: Some(4),
                 requested: Some(8)
             })
         );
         assert!(matches!(
             metadata.reserve(1),
-            Err(AdmissionError::Limit {
-                limit: 4,
-                requested_total: 5,
+            Err(AllocationError::Refused {
+                requested: 1,
+                available: 0,
                 ..
             })
         ));

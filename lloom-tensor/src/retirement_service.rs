@@ -10,6 +10,7 @@ use crate::{
     completion_wake::Wake,
     memory_admission::PhysicalCharge,
     retirement_owners::{Failure, FailureSignal},
+    schedule_hook::schedule_point,
 };
 use parking_lot::Mutex;
 use std::{
@@ -747,6 +748,7 @@ impl HostRetirementService {
             let progressed = objc2::rc::autoreleasepool(|_| self.pass());
             #[cfg(not(feature = "metal"))]
             let progressed = self.pass();
+            schedule_point!(RetirePassed);
             if !progressed && self.polling.load(Ordering::Acquire) {
                 // Existing notifications remain responsive: unlike sleep,
                 // timed park returns on a legacy Wake as well as timeout.
@@ -780,6 +782,7 @@ impl HostRetirementService {
             // registry roots remain, all admissions/waiters observe failure.
             self.failure
                 .publish(Failure::WorkerFailed, || self.wake.notify());
+            schedule_point!(RetireFailed);
             self.fail_inboxes(Failure::WorkerFailed);
         }
         *self.exited.lock() = true;

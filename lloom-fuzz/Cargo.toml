@@ -23,9 +23,11 @@ libafl_bolts = "0.16.1"
 libafl_targets = { version = "0.16.1", features = ["sancov_pcguard_hitcounts"] }
 anyhow = "1"
 libc = "0.2"
+errno = { version = "=0.3.14", default-features = false }
 objc2 = "0.6"
 clap = { version = "4", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
 
 [features]
 default = []
@@ -37,6 +39,10 @@ metal = ["lloom/metal", "lloom-tensor/metal"]
 # provides them and fills the cmplog map; without it `src/cmp_stubs.rs` provides
 # empty hooks so the regular build links.
 cmplog = ["libafl_targets/sancov_cmplog", "libafl_targets/cmplog"]
+# The engine's schedule points call an installed hook (`lloom_tensor::
+# schedule_hook`). Off by default: no campaign binary carries them unless built
+# with it.
+schedule-hooks = ["lloom-tensor/schedule-hooks"]
 
 # Release codegen, as the engine ships it (`../Cargo.toml` [profile.release]):
 # opt-level 3, one codegen unit, LTO. Two arms because §14.5c measured thin LTO
@@ -94,6 +100,8 @@ path = "src/bin/fuzz_kv_slot.rs"
 [[bin]]
 name = "fuzz_kv_pages"
 path = "src/bin/fuzz_kv_pages.rs"
+# Host-only execution still uses the Metal-feature pool and clock types.
+required-features = ["metal"]
 
 [[bin]]
 name = "fuzz_buffer_pool"

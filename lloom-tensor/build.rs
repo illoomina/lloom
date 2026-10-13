@@ -10,6 +10,18 @@ fn output(rustc: &std::ffi::OsStr, args: &[&str]) -> Option<String> {
         .then(|| String::from_utf8(result.stdout).ok())
         .flatten()
 }
+/// The path itself when it exists, else its nearest existing ancestor: what
+/// `rerun-if-changed` may watch without declaring the build permanently stale.
+fn watch_point(path: std::path::PathBuf) -> std::path::PathBuf {
+    let mut p = path;
+    while !p.exists() {
+        match p.parent() {
+            Some(parent) => p = parent.to_path_buf(),
+            None => break,
+        }
+    }
+    p
+}
 fn matches_source(root: &Path, path: &str, length: usize, expected: u64) -> bool {
     let source = root.join(path);
     let Ok(bytes) = fs::read(source) else {
@@ -37,10 +49,17 @@ fn main() {
         let version = output(&rustc, &["-vV"])?;
         let sysroot = output(&rustc, &["--print", "sysroot"])?;
         let source = Path::new(sysroot.trim()).join("lib/rustlib/src/rust/library");
-        // Declare BOTH paths even when absent or the first validation fails.
-        // Later source installation/drift must invalidate Cargo's cached policy.
+        // Watch both sources, present or absent. A present file: its drift
+        // reruns this script. An absent one: Cargo treats a missing
+        // `rerun-if-changed` path as always stale, which made every cargo
+        // invocation on a host without `rust-src` (the CI images, the NAS,
+        // the Pi) rerun this script and recompile lloom-tensor and everything
+        // above it — measured 2026-10-13, `nas-runner-v2-2026-10.md` Run 12.
+        // So an absent file is watched through its nearest existing ancestor
+        // (`lib/rustlib/` in a rust-src-less toolchain): installing the
+        // component creates `src/` under it and reruns the script once.
         for (path, _, _) in SOURCE_CHECKS {
-            println!("cargo:rerun-if-changed={}", source.join(path).display());
+            println!("cargo:rerun-if-changed={}", watch_point(source.join(path)).display());
         }
         let target = env::var("TARGET").ok()?;
         let audited = AUDITED_COMPILERS.iter().any(|(commit, audited_target)| {

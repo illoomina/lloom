@@ -633,7 +633,7 @@ mod load_context_tests {
         };
         assert!(error.to_string().contains("CPU/CUDA enrollment is pending"));
         assert_eq!(calls.get(), 0);
-        assert!(matches!(context.take(1), Err(AdmissionError::Cancelled)));
+        assert!(matches!(context.take(1), Err(AllocationError::Cancelled)));
         assert_eq!(domain.snapshot(), AccountSnapshot::default());
     }
 
@@ -762,7 +762,7 @@ mod load_context_tests {
                     committed: 3
                 }
             );
-            assert!(matches!(context.take(1), Err(AdmissionError::Cancelled)));
+            assert!(matches!(context.take(1), Err(AllocationError::Cancelled)));
             drop(metadata_charge);
             assert_eq!(domain.snapshot(), AccountSnapshot::default());
         }

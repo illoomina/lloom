@@ -875,3 +875,72 @@ fn the_speculative_batched_loop_streams_what_each_row_streams_alone() -> Result<
     }
     Ok(())
 }
+
+/// The drafter's passes are a speculative round's draft window
+/// (`tuning::VerifyWindow::draft`): under `deterministic` (the profile pins
+/// it) the block's and the re-key's half matmuls take the GEMM, counted on
+/// the draft window's counter, while the target's prefill counts nothing on
+/// either window; with the draft window's arm off the drafter counts
+/// nothing. The ids of the two arms are not compared: they are two
+/// arithmetics, each repeatable at its shape.
+#[test]
+fn the_drafters_passes_take_the_draft_windows_gemm() -> Result<()> {
+    use lloom_tensor::tuning::Window;
+    let dev = Device::new_metal(0)?;
+    let dtype = DType::F16;
+    let tcfg = target_cfg();
+    let model = tiny_target(&tcfg, dtype, &dev)?;
+    assert!(!lloom_tensor::tuning::contract().is_fast());
+    let prompt: Vec<u32> = (0..36u32).map(|i| (i * 7 + 3) % 46).collect();
+    let mut counts = Vec::new();
+    for on in [true, false, true] {
+        Window::Draft.set_arm(on);
+        let mut spec = DSparkSpeculator::new_with_ctx(
+            tiny_drafter(dtype, &dev, 153)?,
+            model.draft_embedding().clone(),
+            model.lm_head_linear().clone(),
+            1,
+            ctx_kv_for(false),
+        )?;
+        let (v0, d0) = (Window::Verify.gemms(), Window::Draft.gemms());
+        let mut cache = State::<PoolSpecExact>::new(true, dtype, &tcfg, &dev)?;
+        let input = Tensor::new(prompt.as_slice(), &dev)?.unsqueeze(0)?;
+        let logits = model.forward(&input, 0, &mut cache)?;
+        let taps = cache.take_taps();
+        let anchor = logits
+            .squeeze(0)?
+            .argmax(lloom_tensor::D::Minus1)?
+            .to_scalar::<u32>()?;
+        let prefill = (Window::Verify.gemms() - v0, Window::Draft.gemms() - d0);
+        let d1 = Window::Draft.gemms();
+        spec.begin(SeqId(0), &prompt)?;
+        spec.observe(SeqId(0), &taps, &[anchor])?;
+        let observe = Window::Draft.gemms() - d1;
+        let d2 = Window::Draft.gemms();
+        let draft = spec.draft(&[SeqId(0)])?;
+        let drafted = Window::Draft.gemms() - d2;
+        let ids = match &draft[0].tokens {
+            DraftTokens::Device(t) => t.to_vec1::<u32>()?,
+            DraftTokens::Host(v) => v.clone(),
+        };
+        println!("DRAFT_WINDOW on={on} prefill={prefill:?} observe={observe} draft={drafted} ids={ids:?}");
+        assert_eq!(prefill, (0, 0), "a target prefill is no window");
+        counts.push((on, observe, drafted, ids));
+    }
+    Window::Draft.set_arm(true);
+    let (on, off) = (&counts[0], &counts[1]);
+    assert!(
+        on.1 > 0 && on.2 > 0,
+        "the drafter's re-key and block never reached the GEMM: {on:?}"
+    );
+    assert_eq!(
+        (off.1, off.2),
+        (0, 0),
+        "with the arm off the drafter counts nothing: {off:?}"
+    );
+    assert_eq!(
+        counts[0], counts[2],
+        "the draft window's launches and ids are its shape's"
+    );
+    Ok(())
+}

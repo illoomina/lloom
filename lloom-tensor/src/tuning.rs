@@ -80,19 +80,31 @@ impl Contract {
     ///   the matmul-vec runs (`lloom`'s `--moe-act auto`).
     pub const FAST_ARMS: &'static [&'static str] = &["moe-act-f16"];
 
-    /// The arm `deterministic` takes in a speculative verify window
-    /// ([`VerifyWindow`]), named on the report line while
-    /// `kernels.gemm.verify_window` is on.
+    /// The arms `deterministic` takes in a speculative round's passes
+    /// ([`Window`]), each named on the report line while its switch is on:
+    /// `kernels.gemm.verify_window` and `kernels.gemm.draft_window`.
     pub const VERIFY_WINDOW_ARM: &'static str = "verify-gemm";
+    pub const DRAFT_WINDOW_ARM: &'static str = "draft-gemm";
 
     /// `profile=<name> arms=<list>`, for the report lines that say which
     /// contract a run held.
     pub fn report(self) -> String {
         let arms = match self {
-            Contract::Deterministic if verify_window_arm() => {
-                Contract::VERIFY_WINDOW_ARM.to_string()
+            Contract::Deterministic => {
+                let on: Vec<&str> = [
+                    (Window::Verify, Contract::VERIFY_WINDOW_ARM),
+                    (Window::Draft, Contract::DRAFT_WINDOW_ARM),
+                ]
+                .into_iter()
+                .filter(|(w, _)| w.arm())
+                .map(|(_, name)| name)
+                .collect();
+                if on.is_empty() {
+                    "none".to_string()
+                } else {
+                    on.join(",")
+                }
             }
-            Contract::Deterministic => "none".to_string(),
             Contract::Fast if Contract::FAST_ARMS.is_empty() => "none".to_string(),
             Contract::Fast => Contract::FAST_ARMS.join(","),
         };
@@ -100,34 +112,129 @@ impl Contract {
     }
 }
 
-/// A speculative verify window open on this thread: the target's pass over
-/// `[last, draft…]`, or several rows' windows laid end to end.
+/// A speculative round's pass, open on this thread: the target's verify
+/// window over `[last, draft…]` (or several rows' windows laid end to end),
+/// or the drafter's block and its re-key over the accepted rows.
 ///
 /// Under `deterministic` a half-precision matmul runs the one-row GEMV
 /// reduction at every row count, so a row's bits never depend on how many
 /// rows share the launch — the K=1 decode path's promise. Inside a window it
-/// takes the route `fast` takes instead (the GEMM from two rows), while
-/// `kernels.gemm.verify_window` is on: a k-row window as k + 1 one-row
-/// sweeps is the cost that promise would charge, and the window's rows are
-/// held identical per window shape rather than across row counts
-/// (`architecture.md` §2.3.5b).
+/// takes the route `fast` takes instead (the GEMM from two rows), while the
+/// window's switch is on: a k-row window as k + 1 one-row sweeps is the cost
+/// that promise would charge a pass that is not on the K=1 path, and the
+/// window's rows are held identical per window shape rather than across row
+/// counts (`architecture.md` §2.3.5b).
 ///
 /// Thread-local and nestable: the window is the encoding thread's, and a
 /// pass encoded on another thread keeps the one-row reduction rather than
 /// inheriting another sequence's window.
 #[must_use = "the window holds only while the guard is alive"]
 pub struct VerifyWindow {
+    kind: Window,
     _thread: std::marker::PhantomData<*const ()>,
 }
 
+/// Which pass of a speculative round a [`VerifyWindow`] is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Window {
+    /// The target's verify window: `kernels.gemm.verify_window`.
+    Verify,
+    /// The drafter's block and re-key: `kernels.gemm.draft_window`.
+    Draft,
+}
+
 thread_local! {
-    static VERIFY_WINDOWS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    static WINDOWS: [std::cell::Cell<u32>; 2] = const {
+        [std::cell::Cell::new(0), std::cell::Cell::new(0)]
+    };
+}
+
+/// 0 unread, 1 off, 2 on; per [`Window`].
+static WINDOW_ARMS: [std::sync::atomic::AtomicU8; 2] = [
+    std::sync::atomic::AtomicU8::new(0),
+    std::sync::atomic::AtomicU8::new(0),
+];
+
+/// Launches each window's arm took off the one-row reduction since process
+/// start: the arms' engagement counts.
+static WINDOW_GEMMS: [std::sync::atomic::AtomicU64; 2] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
+impl Window {
+    fn index(self) -> usize {
+        match self {
+            Window::Verify => 0,
+            Window::Draft => 1,
+        }
+    }
+
+    /// Whether a window of this kind is open on this thread.
+    pub fn is_open(self) -> bool {
+        WINDOWS.with(|w| w[self.index()].get() > 0)
+    }
+
+    /// This window's switch, read once; or [`Window::set_arm`].
+    pub fn arm(self) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        let at = &WINDOW_ARMS[self.index()];
+        match at.load(Relaxed) {
+            1 => false,
+            2 => true,
+            _ => {
+                let g = &tuning().gemm;
+                let on = match self {
+                    Window::Verify => g.verify_window,
+                    Window::Draft => g.draft_window,
+                };
+                at.store(if on { 2 } else { 1 }, Relaxed);
+                on
+            }
+        }
+    }
+
+    /// Select this window's arm for the process (a test runs both).
+    pub fn set_arm(self, on: bool) {
+        WINDOW_ARMS[self.index()]
+            .store(if on { 2 } else { 1 }, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The launches this window's arm has taken off the one-row reduction.
+    pub fn gemms(self) -> u64 {
+        WINDOW_GEMMS[self.index()].load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// What this window's half matmuls run under the contract in force:
+    /// `split` under `fast` (the GEMV at one row, the GEMM from two), `gemm`
+    /// or `one-row` under `deterministic`, by the window's arm.
+    pub fn report(self) -> &'static str {
+        match (contract().is_fast(), self.arm()) {
+            (true, _) => "split",
+            (false, true) => "gemm",
+            (false, false) => "one-row",
+        }
+    }
 }
 
 impl VerifyWindow {
+    /// The target's verify window.
     pub fn open() -> Self {
-        VERIFY_WINDOWS.with(|w| w.set(w.get() + 1));
+        Self::of(Window::Verify)
+    }
+
+    /// The drafter's pass over the round's block or its accepted rows.
+    pub fn draft() -> Self {
+        Self::of(Window::Draft)
+    }
+
+    fn of(kind: Window) -> Self {
+        WINDOWS.with(|w| {
+            let c = &w[kind.index()];
+            c.set(c.get() + 1)
+        });
         VerifyWindow {
+            kind,
             _thread: std::marker::PhantomData,
         }
     }
@@ -135,66 +242,56 @@ impl VerifyWindow {
 
 impl Drop for VerifyWindow {
     fn drop(&mut self) {
-        VERIFY_WINDOWS.with(|w| w.set(w.get() - 1));
+        WINDOWS.with(|w| {
+            let c = &w[self.kind.index()];
+            c.set(c.get() - 1)
+        });
     }
 }
 
-/// Whether a [`VerifyWindow`] is open on this thread.
+/// Whether a target's verify window is open on this thread.
 pub fn in_verify_window() -> bool {
-    VERIFY_WINDOWS.with(|w| w.get() > 0)
+    Window::Verify.is_open()
 }
 
-/// `kernels.gemm.verify_window`, read once; or [`set_verify_window_arm`].
+/// `kernels.gemm.verify_window`.
 pub fn verify_window_arm() -> bool {
-    use std::sync::atomic::Ordering::Relaxed;
-    match VERIFY_WINDOW_ARM.load(Relaxed) {
-        1 => false,
-        2 => true,
-        _ => {
-            let on = tuning().gemm.verify_window;
-            VERIFY_WINDOW_ARM.store(if on { 2 } else { 1 }, Relaxed);
-            on
-        }
-    }
+    Window::Verify.arm()
 }
 
-/// 0 unread, 1 off, 2 on.
-static VERIFY_WINDOW_ARM: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
-
-/// Select the window's arm for this process (a test runs both).
+/// Select the verify window's arm for this process.
 pub fn set_verify_window_arm(on: bool) {
-    VERIFY_WINDOW_ARM.store(if on { 2 } else { 1 }, std::sync::atomic::Ordering::Relaxed);
+    Window::Verify.set_arm(on)
 }
 
-/// Whether a `deterministic` half matmul encoded here takes the window's
-/// GEMM rather than the one-row reduction.
-pub fn verify_window_gemm() -> bool {
-    in_verify_window() && verify_window_arm()
+/// The window whose arm a `deterministic` half matmul encoded here takes —
+/// the GEMM rather than the one-row reduction — or `None`.
+pub fn window_gemm() -> Option<Window> {
+    [Window::Verify, Window::Draft]
+        .into_iter()
+        .find(|w| w.is_open() && w.arm())
 }
 
-/// Launches the window's arm took off the one-row reduction since process
-/// start: the arm's engagement count.
-static VERIFY_WINDOW_GEMMS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-/// Count one launch the window's arm routed to the GEMM.
-pub fn note_verify_window_gemm() {
-    VERIFY_WINDOW_GEMMS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+/// Count one launch `w`'s arm routed to the GEMM.
+pub fn note_window_gemm(w: Window) {
+    WINDOW_GEMMS[w.index()].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// [`VERIFY_WINDOW_GEMMS`] now.
+/// The verify window's engagement count now.
 pub fn verify_window_gemms() -> u64 {
-    VERIFY_WINDOW_GEMMS.load(std::sync::atomic::Ordering::Relaxed)
+    Window::Verify.gemms()
 }
 
-/// What a verify window's half matmuls run under the contract in force:
-/// `split` under `fast` (the GEMV at one row, the GEMM from two), `gemm` or
-/// `one-row` under `deterministic`, by the window's arm.
-pub fn verify_window_report() -> &'static str {
-    match (contract().is_fast(), verify_window_arm()) {
-        (true, _) => "split",
-        (false, true) => "gemm",
-        (false, false) => "one-row",
-    }
+/// The receipt a speculative run prints: each window's arm under the
+/// contract in force and its launches so far.
+pub fn window_report() -> String {
+    format!(
+        "arm={} gemm_launches={} draft_arm={} draft_gemm_launches={}",
+        Window::Verify.report(),
+        Window::Verify.gemms(),
+        Window::Draft.report(),
+        Window::Draft.gemms()
+    )
 }
 
 /// The contract in force for this process: [`tuning`]'s `contract.profile`,
@@ -647,6 +744,15 @@ pub struct GemmTuning {
         status = "arm"
     )]
     pub verify_window: bool,
+    /// Under `deterministic`, a speculative drafter's half matmuls over its block and its re-key take the GEMM `fast` takes from two rows; off = the one-row GEMV reduction, the drafter's block as one weight sweep a row. The drafter is not on the K=1 path; `fast` does not read it.
+    #[opt(
+        flag = "gemm-draft-window",
+        env = "LLOOM_GEMM_DRAFT_WINDOW",
+        bool,
+        path = "kernels.gemm.draft_window",
+        status = "arm"
+    )]
+    pub draft_window: bool,
 }
 
 impl Default for GemmTuning {
@@ -658,6 +764,7 @@ impl Default for GemmTuning {
             gemv_bm: None,
             force: None,
             verify_window: true,
+            draft_window: true,
         }
     }
 }
@@ -1355,25 +1462,29 @@ mod tests {
         assert_eq!(Contract::Fast.report(), "profile=fast arms=moe-act-f16");
     }
 
-    /// The report line names the window's arm while it is on, so a receipt
-    /// says whether a `deterministic` verify window ran the GEMM.
+    /// The report line names each window's arm while it is on, so a receipt
+    /// says whether a `deterministic` speculative round ran the GEMM.
     #[test]
-    fn the_report_names_the_verify_window_arm() {
+    fn the_report_names_the_window_arms() {
+        let t = Tuning::default();
         assert!(
-            Tuning::default().gemm.verify_window,
-            "the arm is on by default"
+            t.gemm.verify_window && t.gemm.draft_window,
+            "both arms are on by default"
         );
-        set_verify_window_arm(true);
-        assert_eq!(
-            Contract::Deterministic.report(),
-            "profile=deterministic arms=verify-gemm"
-        );
-        set_verify_window_arm(false);
-        assert_eq!(
-            Contract::Deterministic.report(),
-            "profile=deterministic arms=none"
-        );
-        assert_eq!(Contract::Fast.report(), "profile=fast arms=moe-act-f16");
+        for (verify, draft, arms) in [
+            (true, true, "verify-gemm,draft-gemm"),
+            (true, false, "verify-gemm"),
+            (false, true, "draft-gemm"),
+            (false, false, "none"),
+        ] {
+            Window::Verify.set_arm(verify);
+            Window::Draft.set_arm(draft);
+            assert_eq!(
+                Contract::Deterministic.report(),
+                format!("profile=deterministic arms={arms}")
+            );
+            assert_eq!(Contract::Fast.report(), "profile=fast arms=moe-act-f16");
+        }
     }
 
     /// The window is the opening thread's, nests, and closes with its guard.
@@ -1389,6 +1500,14 @@ mod tests {
         assert!(
             !std::thread::spawn(in_verify_window).join().unwrap(),
             "another thread inherits no window"
+        );
+        {
+            let _draft = VerifyWindow::draft();
+            assert!(Window::Draft.is_open() && Window::Verify.is_open());
+        }
+        assert!(
+            !Window::Draft.is_open(),
+            "the draft window closed with its guard"
         );
         drop(outer);
         assert!(!in_verify_window());

@@ -1513,14 +1513,19 @@ pub fn call_mlx_gemm_out(
     // Under `deterministic` a half row runs the one-row GEMV reduction at
     // every row count, the rows on its batch axis: the storage caller has
     // materialized a transposed activation, and the weight strides and both
-    // offsets are the caller's views'. A speculative verify window takes the
-    // route below instead, its rows identical per window shape rather than
-    // across row counts (`tuning::VerifyWindow`, architecture.md §2.3.5b).
-    let window = row_identity && m > 1 && crate::tuning::verify_window_gemm();
-    if window {
-        crate::tuning::note_verify_window_gemm();
+    // offsets are the caller's views'. A speculative round's window (the
+    // verify, the drafter's block) takes the route below instead, its rows
+    // identical per window shape rather than across row counts
+    // (`tuning::VerifyWindow`, architecture.md §2.3.5b).
+    let window = if row_identity && m > 1 {
+        crate::tuning::window_gemm()
+    } else {
+        None
+    };
+    if let Some(w) = window {
+        crate::tuning::note_window_gemm(w);
     }
-    if row_identity && !window && !a_trans && m > 1 {
+    if row_identity && window.is_none() && !a_trans && m > 1 {
         let a_batch = if lhs_stride.len() > 2 {
             lhs_stride[lhs_stride.len() - 3]
         } else {

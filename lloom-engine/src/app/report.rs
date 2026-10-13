@@ -366,11 +366,7 @@ fn print_speculative(
             );
         }
     }
-    eprintln!(
-        "VERIFY_WINDOW arm={} gemm_launches={}",
-        lloom_tensor::tuning::verify_window_report(),
-        lloom_tensor::tuning::verify_window_gemms()
-    );
+    eprintln!("VERIFY_WINDOW {}", lloom_tensor::tuning::window_report());
     print_rounds(stats, wanted);
 }
 

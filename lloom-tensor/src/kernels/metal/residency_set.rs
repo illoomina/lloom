@@ -47,7 +47,19 @@ pub struct DeviceRetirementReport {
     pub records_pending: usize,
     /// Device roots still alive: not retiring, so not waited for.
     pub devices_live: usize,
+    /// No retirement worker is running: it was stopped after a completed
+    /// join, or never started. False after an incomplete join, whose
+    /// pending records the worker still owns.
+    pub worker_stopped: bool,
+    /// Retains the release witness kept in this process because the set
+    /// still listed their allocation ([`ReleaseWitness`]): ordering defects,
+    /// each a kept allocation rather than a freed one.
+    pub listed_at_release: u64,
 }
+
+/// Every retain any set's witness kept, for the exit report: a set can be
+/// gone by the time the process joins.
+static LISTED_AT_RELEASE: AtomicU64 = AtomicU64::new(0);
 
 /// Retirement bookkeeping beside the membership map. Counters are touched at
 /// record birth and release, never per dispatch; the lock is taken only to
@@ -85,7 +97,9 @@ static DEVICE_SETS: Mutex<Vec<Weak<ResidencySet>>> = Mutex::new(Vec::new());
 /// all gone to finish retiring, so the process does not exit with the host
 /// retirement service still removing allocations from a set. Sets with a live
 /// device are reported, not waited for. Nothing is released or cut here: a
-/// record still pending at the deadline stays owned by the service.
+/// record still pending at the deadline stays owned by the service. After a
+/// completed join the service's worker is stopped, so no pass starts while
+/// the process tears down. For process exit only.
 pub fn join_device_retirement(deadline: Instant) -> DeviceRetirementReport {
     let sets: Vec<Arc<ResidencySet>> = DEVICE_SETS
         .lock()
@@ -106,6 +120,11 @@ pub fn join_device_retirement(deadline: Instant) -> DeviceRetirementReport {
         }
     }
     report.completed = report.sets_retiring == 0;
+    // Only a completed join may stop the worker: an incomplete one leaves it
+    // the owner of what is still pending.
+    report.worker_stopped =
+        report.completed && crate::retirement_service::stop_shared_worker(deadline) != Some(false);
+    report.listed_at_release = LISTED_AT_RELEASE.load(Ordering::Relaxed);
     report
 }
 
@@ -171,6 +190,10 @@ pub struct ResidencyCounters {
     pub insert_batches: u64,
     /// Calls into `remove_batch`, whether or not anything was removed.
     pub remove_batches: u64,
+    /// Retains a membership record released while this set still listed
+    /// the allocation, kept instead of freed ([`ReleaseWitness`]). A defect
+    /// count, not a rate: [`ResidencySet::reset_counters`] leaves it.
+    pub listed_at_release: u64,
 }
 
 /// Keeps Metal buffers resident in GPU memory, removing the need for `useResource` calls.
@@ -380,6 +403,7 @@ impl ResidencySet {
             self.retirement
                 .listed_at_release
                 .fetch_add(1, Ordering::Relaxed);
+            LISTED_AT_RELEASE.fetch_add(1, Ordering::Relaxed);
             std::mem::forget(lease);
         } else {
             drop(lease);
@@ -403,6 +427,7 @@ impl ResidencySet {
             retired: self.retired.load(Ordering::Relaxed),
             insert_batches: self.insert_batches.load(Ordering::Relaxed),
             remove_batches: self.remove_batches.load(Ordering::Relaxed),
+            listed_at_release: self.retirement.listed_at_release.load(Ordering::Relaxed),
         }
     }
 
@@ -970,6 +995,17 @@ mod witness_tests {
         assert_eq!(set.remove(&listed), 1);
         set.release_unlisted(lease_of(&listed));
         assert_eq!(set.release_witness().listed_at_release, 2);
+        assert_eq!(
+            set.counters().listed_at_release,
+            2,
+            "the residency counters carry the witness's defect count"
+        );
+        set.reset_counters();
+        assert_eq!(
+            set.counters().listed_at_release,
+            2,
+            "a window reset does not hide a defect count"
+        );
         set.remove_all();
     }
 }

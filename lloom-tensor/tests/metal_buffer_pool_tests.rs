@@ -759,7 +759,9 @@ const EXIT_CHILD: &str = "LLOOM_DEVICE_EXIT_JOIN_CHILD";
 /// dropped device's allocations from its set (`tuning.md` §6.3m). The child
 /// allocates, drops its last handle, joins, prints what it saw and exits with
 /// `process::exit`, which runs no destructor; the parent reads the child's
-/// status and its line.
+/// status and its line. After a completed join the service's worker is
+/// stopped, so a device the child drops after the join is never retired:
+/// that is the observation that no pass can start during teardown.
 #[test]
 fn exiting_at_once_after_the_exit_join_leaves_the_set_empty() -> Result<()> {
     if std::env::var_os(EXIT_CHILD).is_some() {
@@ -777,14 +779,25 @@ fn exiting_at_once_after_the_exit_join_leaves_the_set_empty() -> Result<()> {
         let joined = lloom_tensor::join_device_retirement(
             std::time::Instant::now() + std::time::Duration::from_secs(10),
         );
+        let set_len = set.len();
+        let late = metal_device().expect("a second device after the join");
+        let Device::Metal(late_metal) = &late else {
+            std::process::exit(0);
+        };
+        let late_set = late_metal.residency_set_handle();
+        drop((Tensor::ones((64, 64), DType::F32, &late)?, late));
+        let late_end = late_set
+            .wait_retired(std::time::Instant::now() + std::time::Duration::from_millis(300));
         println!(
             "EXIT-CHILD listed_before={before} completed={} sets_retiring={} \
-             records_pending={} set_len={} listed_at_release={}",
+             records_pending={} set_len={set_len} listed_at_release={} worker_stopped={} \
+             late_records={}",
             joined.completed,
             joined.sets_retiring,
             joined.records_pending,
-            set.len(),
-            set.release_witness().listed_at_release,
+            joined.listed_at_release,
+            joined.worker_stopped,
+            late_end.records,
         );
         std::process::exit(0);
     }
@@ -839,6 +852,16 @@ fn exiting_at_once_after_the_exit_join_leaves_the_set_empty() -> Result<()> {
         "the set was not empty at exit: {line}"
     );
     assert_eq!(field("listed_at_release"), "0", "{line}");
+    assert_eq!(
+        field("worker_stopped"),
+        "true",
+        "a completed join must stop the retirement worker: {line}"
+    );
+    assert_ne!(
+        field("late_records"),
+        "0",
+        "a device dropped after the join was retired: a pass ran after the worker was stopped: {line}"
+    );
     Ok(())
 }
 

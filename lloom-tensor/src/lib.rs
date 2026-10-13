@@ -153,11 +153,14 @@ pub struct DeviceRetirementReport {
     pub sets_retiring: usize,
     pub records_pending: usize,
     pub devices_live: usize,
+    pub worker_stopped: bool,
+    pub listed_at_release: u64,
 }
 #[cfg(not(feature = "metal"))]
 pub fn join_device_retirement(_deadline: std::time::Instant) -> DeviceRetirementReport {
     DeviceRetirementReport {
         completed: true,
+        worker_stopped: true,
         ..Default::default()
     }
 }

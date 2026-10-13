@@ -139,12 +139,14 @@ impl Var {
         }
         let (src, src_l) = src.storage_and_layout();
         if layout.shape() != src_l.shape() {
-            Err(Error::ShapeMismatchBinaryOp {
-                lhs: layout.shape().clone(),
-                rhs: src_l.shape().clone(),
-                op: "set",
-            }
-            .bt())?
+            Err(
+                Error::ShapeMismatchBinaryOp(Box::new(crate::error::ShapeMismatchBinaryOp {
+                    lhs: layout.shape().clone(),
+                    rhs: src_l.shape().clone(),
+                    op: "set",
+                }))
+                .bt(),
+            )?
         }
         src.copy_strided_src(&mut dst, layout.start_offset(), src_l)?;
         Ok(())

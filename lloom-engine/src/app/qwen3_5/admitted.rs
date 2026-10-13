@@ -14,7 +14,6 @@ struct Metadata {
     readback: ReadbackArm,
     prefill_tile: usize,
     installed: super::super::report::Installed,
-    mtp: bool,
 }
 /// The full model/MTP/cache stays exclusively inside Loaded, not copied into a
 /// one-sequence replacement. Shared Text metadata exposes no tokenizer escape.
@@ -38,7 +37,6 @@ where
         readback: engine.readback,
         prefill_tile: engine.prefill_tile,
         installed: engine.installed.clone(),
-        mtp: engine.mtp.is_some(),
     }
 }
 /// Actual full-family factory: one existing supplied load scope covers header,
@@ -235,15 +233,6 @@ impl<P: Profile, Q: Predictor> Served for Engine<P, Q> {
             .template
             .as_ref()
             .map_or(0, Template::renders)
-    }
-    fn decode_body(&self) -> lloom::nn::Body {
-        if self.metadata.mtp {
-            lloom::nn::Body::Window
-        } else {
-            lloom::nn::Body::Step {
-                ring: matches!(self.metadata.readback, ReadbackArm::Ring(_)),
-            }
-        }
     }
     fn seed_prompt_row(&self, n: usize, row: usize) -> Vec<u32> {
         self.seed_prompt_row_checked(n, row).expect(

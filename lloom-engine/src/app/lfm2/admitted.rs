@@ -20,7 +20,6 @@ struct Metadata {
     readback: ReadbackArm,
     prefill_tile: usize,
     installed: super::super::report::Installed,
-    dspark: bool,
     no_workers: NoWorkerWitness,
 }
 /// The full model/vision/DSpark/cache stays exclusively inside Loaded, not copied into a
@@ -50,7 +49,6 @@ fn metadata<P: Lfm2Shape>(engine: &super::Engine<P>, no_workers: NoWorkerWitness
         readback: engine.readback,
         prefill_tile: engine.prefill_tile,
         installed: engine.installed.clone(),
-        dspark: engine.dspark_k.is_some(),
         no_workers,
     }
 }
@@ -378,11 +376,6 @@ impl<P: Lfm2Shape, Q: Predictor> Served for Engine<P, Q> {
             .template
             .as_ref()
             .map_or(0, Template::renders)
-    }
-    fn thinking_budget_refused(&self) -> Option<&'static str> {
-        self.metadata
-            .dspark
-            .then_some(super::super::budgets::SPECULATIVE)
     }
     fn seed_prompt_row(&self, n: usize, row: usize) -> Vec<u32> {
         self.seed_prompt_row_checked(n, row).expect(

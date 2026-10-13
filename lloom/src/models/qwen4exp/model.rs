@@ -5687,7 +5687,10 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
         let first_pos = cache.pos as u64 + 1;
         let (logits, plans, carries) = self.verify_pass(&h, cache, kind)?;
         let argmax = window_tokens(&logits, tokens, first_pos, draw.as_deref_mut())?; // [T]
-        let run = self.fold_head(&carries, &argmax, t)?;
+        let run = {
+            let _window = lloom_tensor::tuning::VerifyWindow::open();
+            self.fold_head(&carries, &argmax, t)?
+        };
         let extras: Vec<&Tensor> = run.as_ref().map_or_else(Vec::new, |r| r.read_tensors());
         let (mut argmax, records, read) = self.window_read(argmax, plans, t, &extras)?;
         let mut fold = match run {
@@ -6025,13 +6028,15 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
 
     /// The layer stack over the window's `T` positions → logits `[T, vocab]`,
     /// the layers' plan records and the pre-mixer carries `[T, 1, n·d]`; the
-    /// KV lengths after each position recorded in the window.
+    /// KV lengths after each position recorded in the window. A verify window
+    /// ([`lloom_tensor::tuning::VerifyWindow`]), the redo's too.
     fn verify_pass(
         &self,
         h: &Tensor,
         cache: &mut State<P>,
         kind: WindowPlanKind,
     ) -> Result<VerifyPassOut> {
+        let _window = lloom_tensor::tuning::VerifyWindow::open();
         let n = self.cfg.hc_count;
         let d = self.cfg.hidden_size;
         let t = h.dim(0)?;

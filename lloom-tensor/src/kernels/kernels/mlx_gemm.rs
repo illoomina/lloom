@@ -1503,25 +1503,24 @@ pub fn call_mlx_gemm_out(
         .bt())?;
     };
 
-    if dtype == GemmDType::F16
-        && out_dtype == dtype
-        && !crate::tuning::contract().is_fast()
-        && forced_gemm().is_some()
-    {
+    let row_identity =
+        dtype == GemmDType::F16 && out_dtype == dtype && !crate::tuning::contract().is_fast();
+    if row_identity && forced_gemm().is_some() {
         return Err(MetalKernelError::InvalidInput(
             "--force-gemm conflicts with deterministic f16 row identity; use --determinism fast for the forcing experiment, or unset --force-gemm".into()));
     }
 
-    // #942: deterministic half output uses the existing one-row reduction
-    // at every row count. Rows occupy GEMV's batch axis, not a new core.
-    // The storage caller materializes a transposed activation first. Weight
-    // strides and both input offsets remain those of the caller's views.
-    if dtype == GemmDType::F16
-        && out_dtype == dtype
-        && !crate::tuning::contract().is_fast()
-        && !a_trans
-        && m > 1
-    {
+    // Under `deterministic` a half row runs the one-row GEMV reduction at
+    // every row count, the rows on its batch axis: the storage caller has
+    // materialized a transposed activation, and the weight strides and both
+    // offsets are the caller's views'. A speculative verify window takes the
+    // route below instead, its rows identical per window shape rather than
+    // across row counts (`tuning::VerifyWindow`, architecture.md §2.3.5b).
+    let window = row_identity && m > 1 && crate::tuning::verify_window_gemm();
+    if window {
+        crate::tuning::note_verify_window_gemm();
+    }
+    if row_identity && !window && !a_trans && m > 1 {
         let a_batch = if lhs_stride.len() > 2 {
             lhs_stride[lhs_stride.len() - 3]
         } else {

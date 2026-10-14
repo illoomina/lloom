@@ -171,7 +171,11 @@ where
         flat(&want_a)?,
         "{arm}: a step under the standing window computes what a step without one does"
     );
-    assert_eq!(st.rewind_horizon(), 1, "{arm}: a decode step leaves a horizon of one");
+    assert_eq!(
+        st.rewind_horizon(),
+        1,
+        "{arm}: a decode step leaves a horizon of one"
+    );
     assert!(
         !st.window_open(),
         "{arm}: the standing window is not a verify's"
@@ -185,7 +189,10 @@ where
     );
     let pos = st.pos;
     let refused = st.rewind(2).expect_err("past the horizon").to_string();
-    assert!(refused.contains("standing horizon of 1"), "{arm}: {refused}");
+    assert!(
+        refused.contains("standing horizon of 1"),
+        "{arm}: {refused}"
+    );
     assert_eq!(
         (st.pos, st.rewind_horizon()),
         (pos, 1),
@@ -201,7 +208,10 @@ where
         flat(&want_b)?,
         "{arm}: the step after the undone overrun is the never-overrun run's, bit for bit"
     );
-    assert_eq!(st.pos, want.pos, "{arm}: the undone overrun left no position");
+    assert_eq!(
+        st.pos, want.pos,
+        "{arm}: the undone overrun left no position"
+    );
     let (rec, kv) = state_diff(&st, &want)?;
     assert_eq!(
         (rec, kv),
@@ -257,7 +267,11 @@ fn a_prefill_a_verify_step_and_a_windowless_state_leave_no_horizon() -> Result<(
     let pos = st.pos;
     step(&model, &mut st, 5, &dev)?;
     assert!(st.window_open(), "the verify's window stays the verify's");
-    assert_eq!(st.rewind_horizon(), 0, "a step inside a verify leaves no horizon");
+    assert_eq!(
+        st.rewind_horizon(),
+        0,
+        "a step inside a verify leaves no horizon"
+    );
     assert!(st.rewind(1).is_err());
     st.rewind_window()?;
     assert_eq!(st.pos, pos);
@@ -267,7 +281,11 @@ fn a_prefill_a_verify_step_and_a_windowless_state_leave_no_horizon() -> Result<(
     let mut st = prefill(&model, &cfg, &dev, &prompt)?;
     assert!(!st.keeps_standing_window());
     step(&model, &mut st, 5, &dev)?;
-    assert_eq!(st.rewind_horizon(), 0, "a windowless state keeps no horizon");
+    assert_eq!(
+        st.rewind_horizon(),
+        0,
+        "a windowless state keeps no horizon"
+    );
     let refused = st.rewind(1).expect_err("nothing to rewind").to_string();
     assert!(refused.contains("standing horizon of 0"), "{refused}");
     Ok(())
@@ -300,7 +318,10 @@ fn the_standing_window_holds_one_spare_frame_on_the_cpu() -> Result<()> {
         "STANDING held after 1 step: without {without:?} with {with:?}; after 9: without \
          {without_many:?} with {with_many:?}; one recurrent frame {frame} B"
     );
-    assert_eq!(without.recurrent, frame, "without the window: the slabs alone");
+    assert_eq!(
+        without.recurrent, frame,
+        "without the window: the slabs alone"
+    );
     assert_eq!(
         with.recurrent,
         2 * frame,
@@ -468,7 +489,8 @@ fn the_standing_window_on_metal_undoes_a_step_at_no_extra_cost() -> Result<()> {
     undo_case(&model, &cfg, &dev, "moe No metal")?;
 
     let prompt = tokens(12, cfg.vocab_size, 3);
-    let run = |window: usize| -> Result<(lloom::nn::decoder::StateBytes, Option<Vec<(String, u64)>>)> {
+    type Census = Option<Vec<(String, u64)>>;
+    let run = |window: usize| -> Result<(lloom::nn::decoder::StateBytes, Census)> {
         let (model, cfg) = dense::<CrownExact>(&dev, window)?;
         let mut st = prefill(&model, &cfg, &dev, &prompt)?;
         step(&model, &mut st, 5, &dev)?;

@@ -1159,7 +1159,7 @@ mod tests {
         assert!(QWEN3_5_CAPABILITIES
             .rewind
             .starts_with("one decode step (the standing window)"));
-        assert!(!QWEN3_5_CAPABILITIES.eos_gate);
+        assert!(QWEN3_5_CAPABILITIES.line().contains("eos_gate=false"));
     }
 
     /// The gate is clamped off on a family whose kernels carry no gated

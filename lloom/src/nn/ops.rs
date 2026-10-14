@@ -1498,13 +1498,13 @@ impl lloom_tensor::CustomOp2 for RmsNormRope {
 pub fn rms_norm_rope_applies(xs: &Tensor, cos: &Tensor, sin: &Tensor) -> bool {
     #[cfg(feature = "metal")]
     {
-        let Ok((_b, _h, t, d)) = xs.dims4() else {
+        let &[_b, _h, t, d] = xs.dims() else {
             return false;
         };
-        let Ok((cos_t, cos_d)) = cos.dims2() else {
+        let &[cos_t, cos_d] = cos.dims() else {
             return false;
         };
-        let Ok((sin_t, sin_d)) = sin.dims2() else {
+        let &[sin_t, sin_d] = sin.dims() else {
             return false;
         };
         let lloom_tensor::Device::Metal(dev) = xs.device() else {

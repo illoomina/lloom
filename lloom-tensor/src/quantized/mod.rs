@@ -1837,7 +1837,9 @@ impl QMatMul {
             let Self::QTensor(q) = self else {
                 return None;
             };
-            let n = q.shape().dims2().ok()?.0;
+            let &[n, _] = q.shape().dims() else {
+                return None;
+            };
             if !gate.device().is_metal()
                 || gate.dtype() != DType::F32
                 || !gate.is_contiguous()
@@ -1960,7 +1962,7 @@ impl QMatMul {
             let Some(w) = self.mixed_weight(xs) else {
                 return false;
             };
-            let Ok((n_out, k)) = w.dims2() else {
+            let &[n_out, k] = w.dims() else {
                 return false;
             };
             crate::kernels::gemv_mixed_gnorm_serves(n_out, k, groups)

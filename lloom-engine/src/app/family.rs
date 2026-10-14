@@ -213,12 +213,12 @@ pub const QWEN3_5_CAPABILITIES: Capabilities = Capabilities {
     decisions: false, // Transitional until retained-trunk execution is installed.
     profiles: lloom::profile::QWEN3_5,
     lookahead_max: 1,
-    ring: "by-name: the decoder keeps no standing window, so a forward past an unlearned EOS is not undone",
+    ring: "full: the fixed cadence's one forward past an unlearned EOS is undone by the standing window; the adaptive commit queues up to its lead past it, which one step does not reach",
     batch: false,
     prefix_share: false,
     speculation: &["mtp"],
     model_axes: false,
-    rewind: "a verify window over every layer's state (speculative.method = mtp, the Ring shape); no standing window; turn checkpoints (a request re-rendering the previous turn restores where its prefill left one)",
+    rewind: "one decode step (the standing window); a verify window over every layer's state (speculative.method = mtp, the Ring shape); turn checkpoints (a request re-rendering the previous turn restores where its prefill left one)",
     executor_arms: false,
     kv_quant: &[KvQuant::Off],
     kv_dtype: "f32",
@@ -227,7 +227,7 @@ pub const QWEN3_5_CAPABILITIES: Capabilities = Capabilities {
     vision: false,
     vision_missing: "no vision tower is built for Qwen3.5 (the text path only; its tower is #765's lineage)",
     eos_gate: false,
-    eos_gate_missing: "its decode kernels (the GDN and attention kernels, the quantized cores) carry no gated variant",
+    eos_gate_missing: "its decode kernels (the GDN and attention kernels, the quantized cores) carry no gated variant; the standing window undoes the forward instead",
 };
 
 /// Every family, in detection order: the GGUF families read the header's
@@ -1152,6 +1152,14 @@ mod tests {
         // window undoes it (`rewind` above), and its PLE is fed from the host.
         assert!(QWEN4EXP_CAPABILITIES.line().contains("lookahead_max=1"));
         assert!(QWEN4EXP_CAPABILITIES.ring.starts_with("full"));
+        // Qwen3.5 holds the same contract on the generic decoder's state:
+        // the standing window, no gated kernels.
+        assert!(QWEN3_5_CAPABILITIES.line().contains("lookahead_max=1"));
+        assert!(QWEN3_5_CAPABILITIES.ring.starts_with("full"));
+        assert!(QWEN3_5_CAPABILITIES
+            .rewind
+            .starts_with("one decode step (the standing window)"));
+        assert!(QWEN3_5_CAPABILITIES.line().contains("eos_gate=false"));
     }
 
     /// The gate is clamped off on a family whose kernels carry no gated

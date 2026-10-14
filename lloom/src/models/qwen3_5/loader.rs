@@ -48,7 +48,9 @@ pub struct LoadOptions {
     pub mtp: bool,
     /// The longest verify window (positions, `k + 1`) a state built at the
     /// `Ring` profile runs as one pass over phase rings
-    /// (`StateCapacity::window`); 0 runs a window as sequential steps.
+    /// (`StateCapacity::window`); 0 runs a window as sequential steps. At
+    /// least 1, every state keeps the standing window (a decode step undone
+    /// by `CacheRewind::rewind(1)`); the engine loads with it.
     pub window: usize,
     /// The machine gate the load passes before its first tensor
     /// (`memory.md` §9.10); `None` loads unadmitted (a test, a harness).

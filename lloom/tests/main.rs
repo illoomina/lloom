@@ -21,6 +21,7 @@ mod cpu_flash_attn;
 mod cpu_numerics_probe;
 mod decode_driver_tests;
 mod decoder_memory;
+mod decoder_standing_window;
 mod decoder_turn_checkpoint;
 mod dspark_decode_identity;
 mod emulated_bf16_load;
@@ -148,6 +149,7 @@ mod token_ring_fuzz;
 mod token_ring_tests;
 mod turn_checkpoint;
 mod varlen_flash_attention;
+mod verify_window_gemm;
 
 /// Every `tests/*.rs` beside this file is declared above (or is one of the
 /// files that owns its binary), read from the directory at test time.

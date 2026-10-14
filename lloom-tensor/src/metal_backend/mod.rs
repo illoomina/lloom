@@ -2417,9 +2417,11 @@ impl BackendStorage for MetalStorage {
         // GEMV consumes contiguous vectors. Preserve transposed/strided
         // matmul support under the row-invariant contract using the existing
         // pooled allocation and strided-copy path, before taking an encoder.
+        // A speculative window takes the GEMM, which reads the view as it is.
         if self.dtype == DType::F16
             && !crate::tuning::contract().is_fast()
             && !lhs_l.is_contiguous()
+            && crate::tuning::window_gemm().is_none()
         {
             let contiguous = self
                 .device

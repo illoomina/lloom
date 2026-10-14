@@ -39,7 +39,9 @@ pub struct StateCapacity {
     /// The longest verify window (positions) a state built at the `Ring`
     /// profile runs as ONE pass: its recurrent channels get `window + 1`
     /// phases (`GatedDeltaNet::pooled_state`). 0: no rings; a window runs
-    /// as sequential steps inside a snapshot.
+    /// as sequential steps inside a snapshot. At least 1, at any profile,
+    /// the state also keeps the standing window: every decode step stays
+    /// undoable until the next forward (`CacheRewind`, horizon 1).
     pub window: usize,
     /// Turn checkpoints a state keeps (`DecoderState::restore`,
     /// `sequence-reuse-design.md` §2.3b): the last `checkpoints`
@@ -611,6 +613,15 @@ pub struct DecoderState<L: Layer> {
     pub layers: Vec<L::State>,
     pub pos: usize,
     window: Option<DecoderWindow>,
+    /// The open window is the STANDING one: the last decode step's, left
+    /// open after it so the step can be undone (`CacheRewind`, horizon 1 —
+    /// an overrun past an unlearned EOS, a one-token divergence). Settled
+    /// by the next forward or by any `open_window`; invisible to
+    /// [`Self::window_open`], which answers for a verify's window only.
+    standing: bool,
+    /// Whether a decode step leaves a standing window: the state was built
+    /// with `StateCapacity::window >= 1`.
+    keeps_standing: bool,
     /// The final norm's output per position (`h_nextn`), retained for an
     /// MTP drafter while [`Self::set_want_nextn`] is on.
     nextn: RowLog,
@@ -639,6 +650,7 @@ where
     type Retained = DecoderRetained<<L::State as crate::nn::branch::RetainState>::Retained>;
 
     fn retain_state(&mut self) -> Result<Self::Retained> {
+        self.settle_standing()?;
         if self.window.is_some() {
             lloom_tensor::bail!("decoder retention requires a settled window")
         }
@@ -653,6 +665,7 @@ where
     }
 
     fn restore_retained(&mut self, saved: &Self::Retained) -> Result<()> {
+        self.settle_standing()?;
         if self.window.is_some() || saved.pos > self.pos || saved.layers.len() != self.layers.len()
         {
             lloom_tensor::bail!("decoder retention: invalid window, position or layer count")
@@ -786,6 +799,8 @@ impl<L: Layer> DecoderState<L> {
             layers,
             pos: 0,
             window: None,
+            standing: false,
+            keeps_standing: false,
             nextn: RowLog::default(),
             want_nextn: false,
             nextn_drops: 0,
@@ -799,6 +814,17 @@ impl<L: Layer> DecoderState<L> {
     pub fn with_checkpoints(mut self, elems: &[usize], slots: usize) -> Self {
         self.ckpt = CheckpointRing::new(elems, slots);
         self
+    }
+
+    /// Leave every decode step's window open as the standing one (`on`).
+    pub fn with_standing_window(mut self, on: bool) -> Self {
+        self.keeps_standing = on;
+        self
+    }
+
+    /// Whether a decode step leaves a standing window.
+    pub fn keeps_standing_window(&self) -> bool {
+        self.keeps_standing
     }
 
     /// The checkpoint ring's bytes (allocated at the first checkpoint).
@@ -827,14 +853,15 @@ impl<L: Layer> DecoderState<L> {
     }
 
     /// Whether [`Self::restore`] can put the state back at exactly `pos`: a
-    /// checkpoint stands there and no window is open.
+    /// checkpoint stands there and no verify window is open (a standing
+    /// one is settled by the restore).
     pub fn can_restore(&self, pos: usize) -> bool {
-        self.window.is_none() && pos <= self.pos && self.ckpt.index(pos).is_some()
+        !self.window_open() && pos <= self.pos && self.ckpt.index(pos).is_some()
     }
 
     /// The latest checkpoint at or before `pos` (`CacheRewind::restore_point`).
     pub fn restore_point(&self, pos: usize) -> Option<usize> {
-        if self.window.is_some() {
+        if self.window_open() {
             return None;
         }
         self.ckpt
@@ -844,14 +871,18 @@ impl<L: Layer> DecoderState<L> {
 
     /// Put every layer back where the checkpoint at `pos` was taken — a KV
     /// cache to its length, a recurrent state to the frame's copy — and the
-    /// position with them; what the discarded positions retained goes.
+    /// position with them; the standing window settled first, what the
+    /// discarded positions retained gone.
     pub fn restore(&mut self, pos: usize) -> Result<()> {
+        if self.can_restore(pos) {
+            self.settle_standing()?;
+        }
         let Some(idx) = self.ckpt.index(pos).filter(|_| self.can_restore(pos)) else {
             lloom_tensor::bail!(
                 "decoder state: no turn checkpoint stands at {pos} (position {}, checkpoints at {:?}{})",
                 self.pos,
                 self.ckpt.positions(),
-                if self.window.is_some() {
+                if self.window_open() {
                     ", a window is open"
                 } else {
                     ""
@@ -879,8 +910,9 @@ impl<L: Layer> DecoderState<L> {
     }
 
     /// Open a speculative window over every layer's state and the
-    /// position. One at a time.
+    /// position, the standing window settled first. One at a time.
     pub fn open_window(&mut self) -> Result<()> {
+        self.settle_standing()?;
         if self.window.is_some() {
             lloom_tensor::bail!("decoder state: a speculative window is already open")
         }
@@ -903,6 +935,7 @@ impl<L: Layer> DecoderState<L> {
         let Some(w) = self.window.take() else {
             lloom_tensor::bail!("decoder state: no speculative window is open")
         };
+        self.standing = false;
         for (s, m) in self.layers.iter_mut().zip(&w.marks) {
             L::rewind_window(s, *m)?;
         }
@@ -916,14 +949,32 @@ impl<L: Layer> DecoderState<L> {
         let Some(w) = self.window.take() else {
             lloom_tensor::bail!("decoder state: no speculative window is open")
         };
+        self.standing = false;
         for (s, m) in self.layers.iter_mut().zip(&w.marks) {
             L::resolve_window(s, *m)?;
         }
         Ok(())
     }
 
+    /// Whether a verify's window is open (a standing one does not count).
     pub fn window_open(&self) -> bool {
-        self.window.is_some()
+        self.window.is_some() && !self.standing
+    }
+
+    /// Resolve the standing window, if any: the last decode step is final.
+    pub fn settle_standing(&mut self) -> Result<()> {
+        if self.standing {
+            self.resolve_window()?;
+        }
+        Ok(())
+    }
+
+    /// The positions the standing window would undo: 0 without one.
+    pub fn standing_horizon(&self) -> usize {
+        match (&self.window, self.standing) {
+            (Some(w), true) => self.pos.saturating_sub(w.pos),
+            _ => 0,
+        }
     }
 
     /// Whether every layer runs a window of `steps` positions as one pass
@@ -945,6 +996,9 @@ impl<L: Layer> DecoderState<L> {
     /// probe cut to `a` rows of the window. The window's positions past `a`
     /// cost nothing — no replay.
     pub fn accept_window(&mut self, a: usize, after: &[Vec<WindowMark>]) -> Result<()> {
+        if self.standing {
+            lloom_tensor::bail!("decoder state: accepting positions of a standing window")
+        }
         let Some(w) = self.window.take() else {
             lloom_tensor::bail!("decoder state: no speculative window is open")
         };
@@ -977,7 +1031,7 @@ impl<L: Layer> DecoderState<L> {
     /// Cut every layer back to its first `tokens` positions outside a
     /// window (an attention-only lane, `MixerBlock::truncate_state`).
     pub fn truncate(&mut self, tokens: usize) -> Result<()> {
-        if self.window.is_some() {
+        if self.window_open() {
             lloom_tensor::bail!("decoder state: truncating under an open window")
         }
         if tokens > self.pos {
@@ -986,6 +1040,7 @@ impl<L: Layer> DecoderState<L> {
                 self.pos
             )
         }
+        self.settle_standing()?;
         for s in &mut self.layers {
             L::truncate_state(s, tokens)?;
         }
@@ -1035,6 +1090,7 @@ impl<L: Layer> CacheReset for DecoderState<L> {
         }
         self.pos = 0;
         self.window = None;
+        self.standing = false;
         self.nextn.clear();
         // The ring stays (the next sequence writes over it); its contents
         // describe nothing now.
@@ -1042,21 +1098,30 @@ impl<L: Layer> CacheReset for DecoderState<L> {
     }
 }
 
-/// No standing window: the horizon is zero and a driver decodes without
-/// lookahead (`CacheRewind`'s contract for a cache with no rewindable arm).
-/// Past it, a turn checkpoint ([`DecoderState::restore`]) puts the state
-/// back at the position a multi-token pass left one at.
+/// The rewindable arm is the standing window (a state built with
+/// `StateCapacity::window >= 1`): every decode step leaves its window open
+/// until the next forward, so the driver can undo exactly that step — the
+/// ring arm's lookahead overrun, a one-token divergence of a reused prefix
+/// (`Session::prepare`). A prefill leaves no horizon, nor does a step run
+/// inside a verify's window. Past it, a turn checkpoint
+/// ([`DecoderState::restore`]) puts the state back at the position a
+/// multi-token pass left one at.
 impl<L: Layer> CacheRewind for DecoderState<L> {
     fn rewind_horizon(&self) -> usize {
-        0
+        self.standing_horizon()
     }
     fn rewind(&mut self, n: usize) -> Result<()> {
         if n == 0 {
             return Ok(());
         }
-        lloom_tensor::bail!(
-            "a Decoder's state keeps no window to rewind {n} positions through (horizon 0)"
-        )
+        let horizon = self.standing_horizon();
+        if n != horizon {
+            lloom_tensor::bail!(
+                "decoder state: a rewind of {n} positions against a standing horizon of \
+                 {horizon}: only the whole last step can be undone"
+            )
+        }
+        self.rewind_window()
     }
     fn can_restore(&self, pos: usize) -> bool {
         DecoderState::can_restore(self, pos)
@@ -1240,7 +1305,9 @@ where
 
     /// Run `embeds [1, seq, hidden]` from the state's position through the
     /// stack, in chunks of at most [`Self::chunk`] positions, and return the
-    /// last position's logits `[1, vocab]`.
+    /// last position's logits `[1, vocab]`. The last decode step is final
+    /// once this forward begins; a decode step outside a verify's window
+    /// leaves a standing window of its own on a state that keeps one.
     pub fn forward_from(&self, embeds: &Tensor, state: &mut DecoderState<L>) -> Result<Tensor> {
         let (b, seq, _) = embeds.dims3()?;
         if b != 1 || seq == 0 {
@@ -1250,8 +1317,38 @@ where
                 embeds.shape()
             )
         }
+        state.settle_standing()?;
+        let windowed = state.window_open();
+        if seq > 1 || windowed || !state.keeps_standing {
+            return self.run_from(embeds, state, windowed);
+        }
+        state.open_window()?;
+        match self.run_from(embeds, state, windowed) {
+            Ok(logits) => {
+                state.standing = true;
+                Ok(logits)
+            }
+            // A failed step is undone: its writes never reached the base.
+            Err(e) => match state.rewind_window() {
+                Ok(()) => Err(e),
+                Err(r) => lloom_tensor::bail!(
+                    "{}: a decode step failed ({e}) and its window could not be put back ({r})",
+                    self.family
+                ),
+            },
+        }
+    }
+
+    /// [`Self::forward_from`]'s pass, `windowed` when it runs inside a
+    /// verify's window (no turn checkpoint is taken there).
+    fn run_from(
+        &self,
+        embeds: &Tensor,
+        state: &mut DecoderState<L>,
+        windowed: bool,
+    ) -> Result<Tensor> {
+        let seq = embeds.dim(1)?;
         state.ckpt.drop_stale_hint(state.pos);
-        let windowed = state.window.is_some();
         let mut last = None;
         let mut start = 0;
         while start < seq {
@@ -1346,7 +1443,9 @@ where
             .map(|l| l.checkpoint_elems(&self.cap))
             .collect();
         #[cfg_attr(not(feature = "metal"), allow(unused_mut))]
-        let mut state = DecoderState::new(layers).with_checkpoints(&elems, self.cap.checkpoints);
+        let mut state = DecoderState::new(layers)
+            .with_checkpoints(&elems, self.cap.checkpoints)
+            .with_standing_window(self.cap.window >= 1);
         #[cfg(feature = "metal")]
         if let Device::Metal(m) = dev {
             let t = StateTenants::register(m, self.family);

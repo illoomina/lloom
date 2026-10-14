@@ -84,6 +84,8 @@ mod flash_decoding_tests;
 pub mod hazard_audit;
 #[cfg(test)]
 mod hazard_audit_tests;
+#[cfg(test)]
+mod hazard_audit_gpu_tests;
 pub mod heap;
 pub mod icb;
 #[cfg(test)]

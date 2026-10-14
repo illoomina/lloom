@@ -27,11 +27,22 @@
 //! interval test the audit runs at runtime. Both are correct; they answer
 //! different questions, and mixing them would silently change the denominator.
 //!
+//! # The seam rule is the model's assumption, not an observation
+//!
+//! The committed trace records no fence update or wait, and #144's model
+//! counts every cross-session edge as ordered. The audit no longer does: a
+//! pass boundary orders nothing without a dependency the later pass waits on
+//! (`docs/dependency-ordered-reuse-design.md` §2). The six rows are reproduced
+//! under `SeamPolicy::AssumedOrdered`, which states that assumption; the
+//! `OBSERVED` line beside them counts the edges that rest on it alone.
+//!
 //! Usage:
 //!   hazard_audit_crosscheck <all-steps-trace.gz|txt> <packed-trace.gz|txt>
 
 use lloom_tensor::kernels::metal::encoder::{HazardKind, HazardKinds};
-use lloom_tensor::kernels::metal::hazard_audit::{cover, AuditBinding, AuditDispatch};
+use lloom_tensor::kernels::metal::hazard_audit::{
+    cover_stream, AuditBinding, AuditDispatch, SeamPolicy, StageScope, Stages,
+};
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Read};
 use std::process::{Command, Stdio};
@@ -243,9 +254,11 @@ fn to_audit(step: &[Raw], suppress: &dyn Fn(usize) -> bool, runs: &Runs) -> Vec<
                 kernel: d.kernel.clone(),
                 bindings,
                 barrier,
+                barrier_scope: StageScope::ALL,
                 kinds,
                 barrier_suppressed: d.barrier && suppress(i),
                 encoder: d.enc,
+                stage: Stages::DISPATCH,
                 run: runs.run_of.get(&i).copied(),
                 is_run_head: runs.heads.contains(&i),
                 icb_barrier: runs.icb_on && runs.run_of.contains_key(&i),
@@ -360,10 +373,11 @@ fn main() {
     // The four arms `edge-cover.py` runs, as two switches: `icb_on` drops
     // primitive 3, `seam_on` drops primitive 2 by collapsing every position
     // into one encoder session.
-    let run = |label: &str,
-               suppressed: &std::collections::BTreeSet<usize>,
-               icb_on: bool,
-               seam_on: bool| {
+    let run_with = |label: &str,
+                    suppressed: &std::collections::BTreeSet<usize>,
+                    icb_on: bool,
+                    seam_on: bool,
+                    policy: SeamPolicy| {
         let runs = Runs {
             run_of: if icb_on {
                 run_of.clone()
@@ -381,8 +395,27 @@ fn main() {
                 d.encoder = 0;
             }
         }
-        let rep = cover(label, &ds);
-        (rep.edges, rep.uncovered.len())
+        let rep = cover_stream(label, &ds, &[], policy);
+        let count = |k: HazardKind| rep.uncovered.iter().filter(|e| e.kind == k).count();
+        (
+            rep.edges,
+            rep.uncovered.len(),
+            count(HazardKind::Raw),
+            count(HazardKind::War),
+        )
+    };
+    let run = |label: &str,
+               suppressed: &std::collections::BTreeSet<usize>,
+               icb_on: bool,
+               seam_on: bool| {
+        let (edges, uncovered, _, _) = run_with(
+            label,
+            suppressed,
+            icb_on,
+            seam_on,
+            SeamPolicy::AssumedOrdered,
+        );
+        (edges, uncovered)
     };
 
     let none = std::collections::BTreeSet::new();
@@ -449,6 +482,13 @@ fn main() {
     println!(
         "agrees with measurements/issue-144-raw/edge-cover.txt on all six rows: {}",
         if all_ok { "YES" } else { "NO" }
+    );
+    println!("  (rows above: SeamPolicy::AssumedOrdered, #144's seam assumption)");
+    let (_, observed, raw, war) = run_with("o", &a, true, true, SeamPolicy::Observed);
+    println!(
+        "  OBSERVED: {observed:>7}  edges unordered   PROPOSAL with no cross-session \
+         ordering assumed (the trace records no fences): raw {raw}, waw {}, war {war}",
+        observed - raw - war
     );
     assert!(all_ok, "the Rust cover test disagrees with #144's model");
 }

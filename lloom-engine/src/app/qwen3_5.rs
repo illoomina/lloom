@@ -450,10 +450,13 @@ fn load_on<P: Profile>(
     admission: LoadAdmission,
 ) -> Result<Engines<P>> {
     lloom_tensor::memory_admission::begin_model_load();
+    // At least 1: every state keeps the standing window, so a forward the
+    // ring queued past an unlearned EOS is undone (`DecoderState`'s
+    // `CacheRewind`); under MTP, the verify's `k + 1` positions.
     let window = if opts.mtp {
         lloom::nn::speculator::checked_window_width(opts.mtp_k.max(1), 1)?
     } else {
-        0
+        1
     };
     let shards = lloom::hub::gguf_shards(&opts.first_shard);
     let mut f = std::fs::File::open(&opts.first_shard)
@@ -490,7 +493,8 @@ fn load_on<P: Profile>(
         memory_fraction: Some(opts.memory_fraction),
         dense_f32: false,
         mtp: opts.mtp,
-        // The verify window of `k + 1` positions as one pass over the rings.
+        // The standing window; under MTP the verify's `k + 1` positions as
+        // one pass over the rings.
         window,
         machine: match admission {
             LoadAdmission::Legacy => Some(lloom::nn::memory::MachineLoad {

@@ -1083,10 +1083,20 @@ impl<L: Layer> DecoderState<L> {
         Ok(())
     }
 
-    /// The positions the standing window would undo: 0 without one.
+    /// The positions the standing window would undo: 0 without one. A
+    /// standing window opened past the position would be one a take-back
+    /// left unsettled (`rewind_unwritten`): checked in debug builds.
     pub fn standing_horizon(&self) -> usize {
         match (&self.window, self.standing) {
-            (Some(w), true) => self.pos.saturating_sub(w.pos),
+            (Some(w), true) => {
+                debug_assert!(
+                    self.pos >= w.pos,
+                    "decoder state: a standing window opened at {} past the position {}",
+                    w.pos,
+                    self.pos
+                );
+                self.pos.saturating_sub(w.pos)
+            }
             _ => 0,
         }
     }

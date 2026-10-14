@@ -135,7 +135,7 @@ fn the_counter_sees_a_formatted_refusal() {
 /// One value of every `AllocationError` variant. The `match` has no wildcard,
 /// so a variant added to the enum fails to compile here until it is listed.
 fn every_allocation_refusal() -> Vec<AllocationError> {
-    use lloom_tensor::memory_admission::{MachineFailure, PredictionBasis};
+    use lloom_tensor::memory_admission::{MachineFailure, PredictionBasis, ReuseDomains};
     let all = vec![
         AllocationError::Refused {
             requested: 9,
@@ -161,14 +161,13 @@ fn every_allocation_refusal() -> Vec<AllocationError> {
         AllocationError::DifferentAllocationDevice,
         AllocationError::UnboundAllocationDevice,
         AllocationError::ReuseDomainMismatch {
-            expected: "a",
-            actual: "b",
+            domains: &ReuseDomains {
+                expected: "a",
+                actual: "b",
+            },
         },
         AllocationError::Machine(MachineFailure::Unavailable),
-        AllocationError::ConfigurationConflict {
-            active: Some(1),
-            requested: None,
-        },
+        AllocationError::configuration_conflict(Some(1), None),
     ];
     for e in &all {
         match e {

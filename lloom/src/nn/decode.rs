@@ -316,6 +316,14 @@ pub struct DecodeOptions {
     /// Whether the fixed cadence's EOS wait parks on the ring's publish event
     /// for this run; `None` takes `LLOOM_RING_EOS_PARK`.
     pub eos_park: Option<bool>,
+    /// Under `adaptive_commit`: the loop watches the ring itself for a stop
+    /// id (#993, `sequence-reuse-design.md` §2.3e). Before each step it reads
+    /// what the GPU has published since the last (one load of the stamp and
+    /// the new slots, no wait) and stops at a stop id among them, as it
+    /// stops on [`Self::stop`]. The forwards past the EOS are then bounded by
+    /// the pacer, not by the reader: `S − E ≤ adaptive_lead + 1`, however late
+    /// the reader raises the flag. `None` takes `decode.ring.eos_watch`.
+    pub eos_watch: Option<bool>,
     /// The flow's adaptive commit; off is the fixed cadence (module docs, "Two
     /// cadences, both kept"). The loop closes its command buffer only when the
     /// GPU has started every buffer committed before it, on no cadence of its
@@ -541,6 +549,7 @@ impl DecodeOptions {
             stream_via_reader: false,
             host_feed_wait: None,
             eos_park: None,
+            eos_watch: None,
             adaptive_commit: false,
             run_ahead: 0,
             stop: None,
@@ -657,6 +666,9 @@ pub struct DecodeStats {
     pub run_ahead_closes: u64,
     pub max_steps_per_buffer: usize,
     pub stopped_by_flag: bool,
+    /// The loop's own watch saw a stop id published and stopped the run
+    /// ([`DecodeOptions::eos_watch`]).
+    pub stopped_by_eos_watch: bool,
     /// Under `eos_gate`: what the gate did (`Device::eos_gate_end`).
     pub eos_gate: Option<lloom_tensor::EosGateReport>,
     /// The overrun's forwards launched nothing (the gate fired), so the
@@ -2104,6 +2116,23 @@ impl<'m, M: CausalLM> Session<'m, M> {
             }
         }
 
+        // The loop's own EOS watch (`DecodeOptions::eos_watch`): a reader of
+        // its own, taken before this run's first stamp, read before each step.
+        let watch_on = opts.adaptive_commit
+            && opts
+                .eos_watch
+                .unwrap_or(crate::tuning::tuning().ring.eos_watch);
+        let mut watch = if watch_on {
+            readback.reader().map(|mut r| {
+                r.resume_at_published();
+                r
+            })
+        } else {
+            None
+        };
+        let mut watch_ids: Vec<u32> =
+            Vec::with_capacity(if watch.is_some() { opts.adaptive_lead() + 1 } else { 0 });
+
         let mut produced = 0usize;
         let mut since_commit = 0usize;
         let mut eos = false;
@@ -2155,6 +2184,19 @@ impl<'m, M: CausalLM> Session<'m, M> {
             if let Some(stop) = &opts.stop {
                 if stop.load(std::sync::atomic::Ordering::Acquire) {
                     stats.stopped_by_flag = true;
+                    break;
+                }
+            }
+            if let Some(w) = watch.as_mut() {
+                watch_ids.clear();
+                if let Err(lap) = w.read_new(&mut watch_ids) {
+                    // The watch reads every step and the host is at most
+                    // `adaptive_lead` steps ahead of what the GPU publishes,
+                    // so a lap means the bound the watch rests on is broken.
+                    lloom_tensor::bail!("Session::decode: the EOS watch fell behind the ring ({lap})")
+                }
+                if w.ended() {
+                    stats.stopped_by_eos_watch = true;
                     break;
                 }
             }

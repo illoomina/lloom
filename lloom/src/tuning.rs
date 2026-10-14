@@ -773,6 +773,9 @@ pub struct RingTuning {
     /// The EOS gate on Qwen3.5 (#993's arm B): off (the family's gate is clamped off; the standing window undoes the fixed cadence's one forward past an EOS) or on (`decode.readback.eos_gate` then rides the adaptive commit: the GDN's gated decode step carries its state, the overrun taken back by its counters). An arm until its real-model gates are run.
     #[opt(flag = "qwen3-5-eos-gate", env = "LLOOM_QWEN3_5_EOS_GATE", bool, path = "models.qwen3_5.eos_gate", status = "arm", facets = ["lead"], flows = ["token-out", "commands-out"])]
     pub qwen3_5_eos_gate: bool,
+    /// Whether the adaptive commit's loop watches the ring for a stop id itself (#993): off (it stops only when the reader raises the flag, so a late reader lets it run past an EOS without bound) or on (it reads what the GPU published before each step and stops at a stop id, so at most `adaptive_lead + 1` forwards run past an EOS). An arm until it is measured.
+    #[opt(flag = "ring-eos-watch", env = "LLOOM_RING_EOS_WATCH", bool, path = "decode.ring.eos_watch", status = "arm", facets = ["lead"], flows = ["token-out", "commands-out"])]
+    pub eos_watch: bool,
 }
 
 fn parse_spawned_qos(v: &str) -> Result<String, String> {
@@ -796,6 +799,7 @@ impl Default for RingTuning {
             eos_park: false,
             verify_park: true,
             qwen3_5_eos_gate: false,
+            eos_watch: false,
         }
     }
 }

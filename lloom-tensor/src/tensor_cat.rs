@@ -33,11 +33,13 @@ impl Tensor {
         for (arg_idx, arg) in args.iter().enumerate() {
             let arg = arg.as_ref();
             if arg0.rank() != arg.rank() {
-                Err(Error::UnexpectedNumberOfDims {
-                    expected: arg0.rank(),
-                    got: arg.rank(),
-                    shape: arg.shape().clone(),
-                }
+                Err(Error::UnexpectedNumberOfDims(Box::new(
+                    crate::error::UnexpectedNumberOfDims {
+                        expected: arg0.rank(),
+                        got: arg.rank(),
+                        shape: arg.shape().clone(),
+                    },
+                ))
                 .bt())?
             }
             for (dim_idx, (v1, v2)) in arg0
@@ -114,11 +116,13 @@ impl Tensor {
                 .bt())?
             }
             if rank != arg.rank() {
-                Err(Error::UnexpectedNumberOfDims {
-                    expected: rank,
-                    got: arg.rank(),
-                    shape: arg.shape().clone(),
-                }
+                Err(Error::UnexpectedNumberOfDims(Box::new(
+                    crate::error::UnexpectedNumberOfDims {
+                        expected: rank,
+                        got: arg.rank(),
+                        shape: arg.shape().clone(),
+                    },
+                ))
                 .bt())?
             }
             for (dim_idx, (v1, v2)) in arg0
@@ -192,11 +196,13 @@ impl Tensor {
                 .bt())?
             }
             if rank != arg.rank() {
-                Err(Error::UnexpectedNumberOfDims {
-                    expected: rank,
-                    got: arg.rank(),
-                    shape: arg.shape().clone(),
-                }
+                Err(Error::UnexpectedNumberOfDims(Box::new(
+                    crate::error::UnexpectedNumberOfDims {
+                        expected: rank,
+                        got: arg.rank(),
+                        shape: arg.shape().clone(),
+                    },
+                ))
                 .bt())?
             }
             for (dim_idx, (v1, v2)) in arg0
@@ -318,12 +324,14 @@ impl Tensor {
             )?
         }
         if self.rank() != src.rank() {
-            Err(Error::UnexpectedNumberOfDims {
-                expected: self.rank(),
-                got: src.rank(),
-                shape: self.shape().clone(),
-            }
-            .bt())?
+            Err(
+                Error::UnexpectedNumberOfDims(Box::new(crate::error::UnexpectedNumberOfDims {
+                    expected: self.rank(),
+                    got: src.rank(),
+                    shape: self.shape().clone(),
+                }))
+                .bt(),
+            )?
         }
         for (dim_idx, (v1, v2)) in self.dims().iter().zip(src.dims().iter()).enumerate() {
             if dim_idx == dim && *v2 + offset > *v1 {

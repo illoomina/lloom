@@ -126,23 +126,106 @@ pub enum AllocationError {
     #[error("clock-only allocation container has no native device binding")]
     UnboundAllocationDevice,
     #[error(
-        "reusable allocation domain mismatch: container={expected}, active payer={actual}; \
-         accounted domains require identical origin"
+        "reusable allocation domain mismatch: container={}, active payer={}; \
+         accounted domains require identical origin",
+        .domains.expected,
+        .domains.actual
     )]
-    ReuseDomainMismatch {
-        expected: &'static str,
-        actual: &'static str,
-    },
+    ReuseDomainMismatch { domains: &'static ReuseDomains },
     #[error("machine admission: {}", .0.describe())]
     Machine(MachineFailure),
+    /// Built by [`AllocationError::configuration_conflict`] and read by
+    /// [`AllocationError::configured_caps`].
     #[error(
-        "process memory cap already initialized to {active:?}, requested {requested:?}; \
-         configure before the first load"
+        "process memory cap already initialized to {:?}, requested {:?}; \
+         configure before the first load",
+        .caps.active(*.present),
+        .caps.requested(*.present)
     )]
-    ConfigurationConflict {
-        active: Option<usize>,
-        requested: Option<usize>,
-    },
+    ConfigurationConflict { caps: CapPair, present: CapPresence },
+}
+
+/// The two origin categories a reuse was refused between. Held behind one
+/// `&'static` so the refusal stays a word wide.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReuseDomains {
+    /// The reusable container's origin category.
+    pub expected: &'static str,
+    /// The active payer's origin category.
+    pub actual: &'static str,
+}
+
+/// The words of a [`AllocationError::ConfigurationConflict`]'s two caps: the
+/// one configured and the one a later call asked for. A `None` cap is stored
+/// as 0 and [`CapPresence`] says which are `Some`. The presence byte is the
+/// variant's own field rather than this struct's, so it sits beside the enum
+/// tag and the refusal is no wider than [`AllocationError::Refused`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CapPair {
+    active: usize,
+    requested: usize,
+}
+
+/// Which of a [`CapPair`]'s two caps are `Some`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CapPresence(u8);
+
+impl CapPresence {
+    const ACTIVE: u8 = 1;
+    const REQUESTED: u8 = 2;
+}
+
+impl CapPair {
+    pub const fn active(&self, present: CapPresence) -> Option<usize> {
+        if present.0 & CapPresence::ACTIVE != 0 {
+            Some(self.active)
+        } else {
+            None
+        }
+    }
+    pub const fn requested(&self, present: CapPresence) -> Option<usize> {
+        if present.0 & CapPresence::REQUESTED != 0 {
+            Some(self.requested)
+        } else {
+            None
+        }
+    }
+}
+
+impl AllocationError {
+    /// The `ConfigurationConflict` between the cap already configured and
+    /// the one a later call asked for.
+    pub const fn configuration_conflict(active: Option<usize>, requested: Option<usize>) -> Self {
+        let mut present = 0;
+        let active = match active {
+            Some(cap) => {
+                present |= CapPresence::ACTIVE;
+                cap
+            }
+            None => 0,
+        };
+        let requested = match requested {
+            Some(cap) => {
+                present |= CapPresence::REQUESTED;
+                cap
+            }
+            None => 0,
+        };
+        Self::ConfigurationConflict {
+            caps: CapPair { active, requested },
+            present: CapPresence(present),
+        }
+    }
+
+    /// A `ConfigurationConflict`'s `(active, requested)` caps.
+    pub const fn configured_caps(&self) -> Option<(Option<usize>, Option<usize>)> {
+        match self {
+            Self::ConfigurationConflict { caps, present } => {
+                Some((caps.active(*present), caps.requested(*present)))
+            }
+            _ => None,
+        }
+    }
 }
 
 /// How an allocation's byte prediction was derived.
@@ -164,7 +247,7 @@ impl From<core::Refusal> for AllocationError {
             core::Refusal::UnsupportedLayout => Self::UnsupportedLayout,
             core::Refusal::DifferentDomain => Self::DifferentDomain,
             core::Refusal::ConfigurationConflict { active, requested } => {
-                Self::ConfigurationConflict { active, requested }
+                Self::configuration_conflict(active, requested)
             }
             core::Refusal::Machine(m) => m.into(),
             core::Refusal::Limit {
@@ -342,11 +425,44 @@ pub enum AllocationOrigin {
     Legacy,
     Domain(DomainKey),
 }
+const LEGACY_CATEGORY: &str = "legacy/unadmitted";
+const DOMAIN_CATEGORY: &str = "accounted domain";
+/// Every (container, payer) category pair, indexed by `category_index`, so a
+/// reuse refusal points at a static instead of carrying two names.
+static REUSE_DOMAINS: [[ReuseDomains; 2]; 2] = [
+    [
+        ReuseDomains {
+            expected: LEGACY_CATEGORY,
+            actual: LEGACY_CATEGORY,
+        },
+        ReuseDomains {
+            expected: LEGACY_CATEGORY,
+            actual: DOMAIN_CATEGORY,
+        },
+    ],
+    [
+        ReuseDomains {
+            expected: DOMAIN_CATEGORY,
+            actual: LEGACY_CATEGORY,
+        },
+        ReuseDomains {
+            expected: DOMAIN_CATEGORY,
+            actual: DOMAIN_CATEGORY,
+        },
+    ],
+];
+
 impl AllocationOrigin {
+    fn category_index(&self) -> usize {
+        match self {
+            Self::Legacy => 0,
+            Self::Domain(_) => 1,
+        }
+    }
     pub fn category(&self) -> &'static str {
         match self {
-            Self::Legacy => "legacy/unadmitted",
-            Self::Domain(_) => "accounted domain",
+            Self::Legacy => LEGACY_CATEGORY,
+            Self::Domain(_) => DOMAIN_CATEGORY,
         }
     }
     pub fn validate_reuse(&self, active: &Self) -> Result<()> {
@@ -354,8 +470,7 @@ impl AllocationOrigin {
             Ok(())
         } else {
             Err(AllocationError::ReuseDomainMismatch {
-                expected: self.category(),
-                actual: active.category(),
+                domains: &REUSE_DOMAINS[self.category_index()][active.category_index()],
             })
         }
     }
@@ -630,13 +745,16 @@ mod tests {
         assert!(origin.validate_reuse(&same).is_ok());
         assert!(legacy.validate_reuse(&legacy).is_ok());
         for (container, payer) in [(&origin, &foreign), (&origin, &legacy), (&legacy, &origin)] {
-            assert_eq!(
-                container.validate_reuse(payer),
-                Err(AllocationError::ReuseDomainMismatch {
-                    expected: container.category(),
-                    actual: payer.category(),
-                })
-            );
+            match container.validate_reuse(payer) {
+                Err(AllocationError::ReuseDomainMismatch { domains }) => assert_eq!(
+                    *domains,
+                    ReuseDomains {
+                        expected: container.category(),
+                        actual: payer.category(),
+                    }
+                ),
+                other => panic!("expected ReuseDomainMismatch, got {other:?}"),
+            }
         }
         assert_eq!(account.snapshot(), AccountSnapshot::default());
     }
@@ -760,10 +878,7 @@ mod tests {
         default.configure(None).unwrap();
         assert_eq!(
             default.configure(Some(8)),
-            Err(AllocationError::ConfigurationConflict {
-                active: None,
-                requested: Some(8)
-            })
+            Err(AllocationError::configuration_conflict(None, Some(8)))
         );
         let cell = Arc::new(ProcessCell::default());
         let (tx, rx) = std::sync::mpsc::channel();
@@ -973,10 +1088,7 @@ mod tests {
         account.core.begin_model_load(); // Same core method used by public hook.
         assert_eq!(
             cell.configure(Some(8)),
-            Err(AllocationError::ConfigurationConflict {
-                active: Some(4),
-                requested: Some(8)
-            })
+            Err(AllocationError::configuration_conflict(Some(4), Some(8)))
         );
         assert!(matches!(
             metadata.reserve(1),

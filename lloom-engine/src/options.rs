@@ -548,6 +548,7 @@ impl DecodeConfig {
             stream_via_reader: false,
             host_feed_wait: None,
             eos_park: None,
+            eos_watch: None,
             adaptive_commit: false,
             run_ahead: self.readback.run_ahead,
             stop: None,

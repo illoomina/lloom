@@ -104,6 +104,19 @@ impl Drop for RecordingAdmission<'_> {
     }
 }
 impl PreparedCommandCommit<'_> {
+    /// Flag this commit for its queue's completion hook (`completion_hook.rs`).
+    /// Only queue-associated buffers have one; a standalone buffer refuses.
+    pub(super) fn run_completion_hook(&self) -> Result<(), crate::kernels::MetalKernelError> {
+        match &self.native {
+            Some(PreparedNative::Metal3Associated(prepared)) => prepared.run_hook(),
+            Some(PreparedNative::Metal4(prepared)) => prepared.run_hook(),
+            Some(PreparedNative::Metal3(_)) | None => {
+                Err(crate::kernels::MetalKernelError::QueueUnavailable(
+                    "a standalone command buffer has no completion hook",
+                ))
+            }
+        }
+    }
     pub(super) fn stage_binding_epoch(
         &self,
         epoch: crate::retire::Epoch,
@@ -118,15 +131,6 @@ impl PreparedCommandCommit<'_> {
             _ => {} // standalone raw interoperability remains untracked
         }
         Ok(())
-    }
-    pub(super) fn on_completion_of<F>(
-        &self,
-        f: F,
-    ) -> Result<(), crate::kernels::err::CompletionRegistrationError>
-    where
-        F: Fn(Option<String>) + Send + Sync + 'static,
-    {
-        self.on_feedback(move |feedback| f(feedback.error.clone()))
     }
     pub(super) fn record_gpu_time_on_completion(
         &self,
@@ -552,14 +556,18 @@ impl CommandBuffer {
     pub(super) fn associate_metal3(
         self,
         core: Arc<super::metal3_retirement::Completions>,
+        handler: Arc<super::metal3_retirement::NativeHandler>,
         physical: Option<crate::metal_backend::device_retirement::NamespaceOwner>,
     ) -> Result<Self, crate::kernels::MetalKernelError> {
         match self.backend {
             Backend::Metal3(shared) => match Arc::try_unwrap(shared) {
-                Ok(standalone) => {
-                    super::metal3_retirement::AssociatedBuffer::new(standalone.raw, core, physical)
-                        .map(Self::from_metal3_associated)
-                }
+                Ok(standalone) => super::metal3_retirement::AssociatedBuffer::new(
+                    standalone.raw,
+                    core,
+                    handler,
+                    physical,
+                )
+                .map(Self::from_metal3_associated),
                 Err(shared) => Err(crate::kernels::err::CompletionRegistrationError::new(
                     crate::kernels::MetalKernelError::QueueUnavailable(
                         "cannot re-associate shared standalone wrapper",

@@ -238,7 +238,57 @@ struct Args {
     /// exactly the link that was missing.
     #[arg(long)]
     assert_hazard_audit: bool,
+
+    /// Record each decode step with the hazard audit and print its report:
+    /// every dependency edge and the synchronization the engine actually
+    /// encoded for it (`docs/dependency-ordered-reuse-design.md` §10.1).
+    /// Needs `--features metal-hazard-audit`; refuses the ICB executor, whose
+    /// run positions this harness does not hand the audit.
+    #[arg(long)]
+    hazard_audit_live: bool,
 }
+
+/// Start auditing one region.
+#[cfg(feature = "metal-hazard-audit")]
+fn audit_begin(label: &str) {
+    candle::kernels::metal::hazard_audit::begin(label);
+}
+
+#[cfg(not(feature = "metal-hazard-audit"))]
+fn audit_begin(_label: &str) {}
+
+/// Stop auditing and print the region's report and one parseable line.
+#[cfg(feature = "metal-hazard-audit")]
+fn audit_finish() {
+    let rep = candle::kernels::metal::hazard_audit::finish(&[]);
+    print!("{}", rep.render());
+    println!(
+        "HAZARD_AUDIT region={:?} positions={} passes={} edges={} raw={} waw={} war={} \
+         barrier={} fence={} queue_barrier={} event={} icb={} transitive={} \
+         fence_updates={} fence_waits={} unmatched_waits={} same_pass_waits={} uncovered={}",
+        rep.region,
+        rep.positions,
+        rep.passes,
+        rep.edges,
+        rep.edges_raw,
+        rep.edges_waw,
+        rep.edges_war,
+        rep.by_barrier,
+        rep.by_fence,
+        rep.by_queue_barrier,
+        rep.by_event,
+        rep.by_icb,
+        rep.by_transitive,
+        rep.fence_updates,
+        rep.fence_waits,
+        rep.unmatched_fence_waits,
+        rep.same_pass_fence_waits,
+        rep.uncovered.len()
+    );
+}
+
+#[cfg(not(feature = "metal-hazard-audit"))]
+fn audit_finish() {}
 
 /// One decode step's recorded dispatches.
 struct Step {
@@ -378,6 +428,15 @@ fn run<P: Lfm2Shape>(args: Args) -> Result<()> {
             );
         }
         return Ok(());
+    }
+    if args.hazard_audit_live && !cfg!(feature = "metal-hazard-audit") {
+        anyhow::bail!("--hazard-audit-live needs --features metal-hazard-audit");
+    }
+    if args.hazard_audit_live && args.icb {
+        anyhow::bail!(
+            "--hazard-audit-live with --icb: the audit would see replayed positions \
+             without their run mapping and report them uncovered"
+        );
     }
 
     if !trace::trace_requested() {
@@ -703,11 +762,17 @@ fn run<P: Lfm2Shape>(args: Args) -> Result<()> {
         let label = format!("decode[{step}] kv_len={kv_len}");
         trace::set_region(Some(label.clone()));
         trace::set_recording(true);
+        if args.hazard_audit_live {
+            audit_begin(&label);
+        }
         logits = model
             .forward(&input, kv_len, &mut cache)
             .context("decode forward pass")?
             .squeeze(0)?;
         trace_window(&device)?;
+        if args.hazard_audit_live {
+            audit_finish();
+        }
         trace::set_recording(false);
 
         // Close the ICB step here: after the forward pass has drained and

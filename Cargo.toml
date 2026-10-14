@@ -157,24 +157,22 @@ block2 = { version = ">=0.6.1, <0.8.0", features = ["alloc"], default-features =
 once_cell = "1.21"
 parking_lot = "0.12"
 
-# Ambrogio's codegen flags, adopted here so the two trees agree — DESIGN.md
-# §14.5a (#297) recorded their ABSENCE as the finding: candle's workspace
-# declared no `[profile.release]`, so every harness built under cargo's defaults
-# (`codegen-units=16`, no LTO) while the consuming app shipped these three.
+# The shipping tier: one codegen unit and whole-program (fat) LTO. Fat LTO
+# moves no digest and no resolvable decode time against thin, and costs build
+# memory and time (docs/architecture.md §14.5e).
 #
-# Safe to enable because #297 MEASURED them: +0.133 % against a null control of
-# +0.133 %, the same figure — a null on every dimension. They reached the host
-# binary (9 173 920 → 8 066 752 B, −12.07 %) and did not reach the GPU, which is
-# the check that would have caught a kernel-side surprise. The bound is strong
-# on GPU busy and wall (±0.40 %) and weak on non-GPU (±6.0 %), so this does not
-# exclude a small real effect there.
+# `panic` and `strip` stay at cargo's defaults on purpose. Abort turns a
+# panicking request thread into the exit of `lloom serve` and removes the
+# retirement service's panic containment; stripping the symbol table blinds
+# the instruments that name frames from a backtrace (`LLOOM_POOL_TRACE`,
+# `LLOOM_SERVED_REQUEST_TRACE`). Both are measured in §14.5e.
 #
-# Declared in the manifest rather than passed as `--config` (#297's route) so
-# the tier is a property of the tree a reader can see, not of an invocation
-# nobody recorded.
+# `release-with-debug` and `sanitize` inherit this profile; `sanitize` sets
+# its own `lto` and `codegen-units`. Declared here rather than passed as
+# `--config` so the tier is a property of the tree (§14.5a).
 [profile.release]
 opt-level = 3
-lto = "thin"
+lto = "fat"
 codegen-units = 1
 
 [profile.release-with-debug]

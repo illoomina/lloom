@@ -770,6 +770,9 @@ pub struct RingTuning {
     /// How DSpark's verify completion is waited for: `event` (park on an event behind the round's stamp) or `inherit` (poll the stamp, the A/B arm).
     #[opt(flag = "verify-park", env = "LLOOM_VERIFY_PARK", bool, path = "speculative.verify_wait", status = "advanced", facets = ["wait"], flows = ["token-out"], values = ["inherit=false", "event=true"], forms = ["inherit", "event"], schema = "Wait")]
     pub verify_park: bool,
+    /// The EOS gate on Qwen3.5 (#993's arm B): off (the family's gate is clamped off; the standing window undoes the fixed cadence's one forward past an EOS) or on (`decode.readback.eos_gate` then rides the adaptive commit: the GDN's gated decode step carries its state, the overrun taken back by its counters). An arm until its real-model gates are run.
+    #[opt(flag = "qwen3-5-eos-gate", env = "LLOOM_QWEN3_5_EOS_GATE", bool, path = "models.qwen3_5.eos_gate", status = "arm", facets = ["lead"], flows = ["token-out", "commands-out"])]
+    pub qwen3_5_eos_gate: bool,
 }
 
 fn parse_spawned_qos(v: &str) -> Result<String, String> {
@@ -792,6 +795,7 @@ impl Default for RingTuning {
             feed_trace: false,
             eos_park: false,
             verify_park: true,
+            qwen3_5_eos_gate: false,
         }
     }
 }

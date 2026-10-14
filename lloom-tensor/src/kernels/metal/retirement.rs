@@ -19,28 +19,53 @@ pub(super) type Callback = Box<dyn Fn(&metal4::Feedback) + Send + Sync>;
 pub(super) type Registry = OwnerRegistry<Captures, NativeOwners, metal4::Feedback>;
 pub(super) type Record = Registration<Captures, NativeOwners, metal4::Feedback>;
 
-pub(super) struct Captures(
-    pub Vec<Callback>,
-    Option<super::native_generation_bindings::GenerationBindings>,
-);
+pub(super) struct Captures {
+    pub callbacks: Vec<Callback>,
+    /// The queue's completion hook runs for this record, after its callbacks.
+    pub hooked: bool,
+    /// A bound Metal 3 buffer's generation: told after the hook that every
+    /// earlier record and this one's callbacks are done.
+    pub bindings: Option<super::native_generation_bindings::GenerationBindings>,
+}
 impl Captures {
     pub fn new(callbacks: Vec<Callback>) -> Self {
-        Self(callbacks, None)
+        Self {
+            callbacks,
+            hooked: false,
+            bindings: None,
+        }
     }
     pub fn with_binding(head: super::native_generation_bindings::GenerationBindings) -> Self {
-        Self(Vec::new(), Some(head))
+        Self {
+            callbacks: Vec::new(),
+            hooked: false,
+            bindings: Some(head),
+        }
     }
-    pub fn run(&self, queue: usize, feedback: &metal4::Feedback) {
+    pub fn run(
+        &self,
+        queue: usize,
+        feedback: &metal4::Feedback,
+        hook: Option<&super::completion_hook::CompletionHook>,
+    ) {
         crate::completion_scope::with_callback(queue, || {
             // Borrow callback boxes; destruction belongs to the host service.
-            for callback in &self.0 {
+            for callback in &self.callbacks {
                 callback(feedback);
             }
-            if let Some(head) = &self.1 {
+            if self.hooked {
+                // Flagging requires an installed hook (`run_hook`); a hooked
+                // record without one is a broken invariant, and this panic is
+                // caught at the adapter boundary as a callback failure.
+                hook.expect("hooked record on a queue without a completion hook")
+                    .complete(feedback);
+            }
+            if let Some(head) = &self.bindings {
                 // SAFETY: only AssociatedBuffer's original record installs this
                 // head. M3 elected prefix drain calls run after own native ready
-                // and preceding records; every arbitrary callback just returned.
-                // C/record custody spans this genuine HeaderStrong borrow.
+                // and preceding records; every arbitrary callback and the hook
+                // just returned. C/record custody spans this genuine HeaderStrong
+                // borrow.
                 unsafe { head.ordered_callbacks_finished() };
             }
         });
@@ -201,6 +226,7 @@ pub(super) struct Metal4Completions {
     wake: Arc<Wake>,
     failure: Arc<FailureSignal>,
     queue: usize,
+    hook: std::sync::OnceLock<Arc<super::completion_hook::CompletionHook>>,
 }
 #[derive(Debug)]
 pub(super) enum RetirementError {
@@ -214,7 +240,22 @@ impl Metal4Completions {
             wake,
             failure,
             queue,
+            hook: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Once, before the first commit flags a record for it.
+    pub(super) fn install_hook(
+        &self,
+        hook: Arc<super::completion_hook::CompletionHook>,
+    ) -> Result<(), crate::kernels::MetalKernelError> {
+        self.hook.set(hook).map_err(|_| {
+            crate::kernels::MetalKernelError::QueueUnavailable("completion hook already installed")
+        })
+    }
+
+    pub(super) fn has_hook(&self) -> bool {
+        self.hook.get().is_some()
     }
 
     /// An incomplete segmented recording can contain a later event wait whose
@@ -312,7 +353,7 @@ impl Metal4Completions {
             record
                 .run_callbacks(
                     |captures, owners, feedback| {
-                        captures.run(self.queue, feedback);
+                        captures.run(self.queue, feedback, self.hook.get().map(|h| &**h));
                         self.frontier
                             .lock()
                             .finish(sequence)

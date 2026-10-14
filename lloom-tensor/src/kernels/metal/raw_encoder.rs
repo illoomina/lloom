@@ -31,6 +31,7 @@ impl Compute {
 
     /// The native encoder's address: the pass identity the hazard audit keys
     /// on while the encoder is open.
+    #[inline]
     pub fn audit_id(&self) -> usize {
         match self {
             Self::Metal3(e) => Retained::as_ptr(e) as usize,
@@ -171,6 +172,7 @@ impl Blit {
     common!(setLabel(label: Option<&NSString>));
 
     /// The native encoder's address; see [`Compute::audit_id`].
+    #[inline]
     pub fn audit_id(&self) -> usize {
         match self {
             Self::Metal3(e) => Retained::as_ptr(e) as usize,

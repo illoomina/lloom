@@ -453,6 +453,7 @@ pub fn run(args: ChatArgs) -> Result<()> {
                             want,
                             add_bos,
                             expand: (!images.is_empty()).then_some(expand_ref),
+                            history: None,
                         },
                     )
                     .map_err(|e| {
@@ -572,7 +573,14 @@ pub fn run(args: ChatArgs) -> Result<()> {
         let decoded = decoded.context("decoding the turn")?;
         println!();
         if let Some(p) = &built {
-            front.record(engine.as_ref(), p.thinking, &decoded);
+            // The next turn sends `messages` back, which the prompt budget
+            // may have cut: the reply answers that history.
+            let origin = if dropped.messages > 0 {
+                front.origin(&json!(messages), &p.kwargs, p.thinking)
+            } else {
+                p.origin
+            };
+            front.record(engine.as_ref(), origin, &decoded);
         }
         messages.push(json!({ "role": "assistant", "content": decoded.text }));
         let st = &decoded.stats;

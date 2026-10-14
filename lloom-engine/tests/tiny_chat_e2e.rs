@@ -2147,6 +2147,123 @@ fn serve_renders_once_and_the_next_turn_extends_the_sampled_reply() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// A reply of ours is the logged one only in the conversation it answered,
+/// through `lloom serve`, streamed or not: two conversations get the same
+/// text back (the bias), and each continuation matches its own reply; a
+/// history that never got that text from us carries it unverified and
+/// renders as sent.
+#[test]
+fn serve_takes_a_logged_reply_only_in_the_conversation_it_answered() {
+    let (dir, model, base) = qwen_tiny("front-scope");
+    let mut args: Vec<&str> = base.iter().map(String::as_str).collect();
+    args.extend(["--prefix-reuse", "true"]);
+    let server = Server::start(&model, &args);
+    let common = json!({ "enable_thinking": false, "temperature": 0, "max_tokens": 6,
+                         "logit_bias": { "97": 100 } });
+    let with = |messages: Value, stream: bool| {
+        let mut r = common.clone();
+        r["messages"] = messages;
+        r["stream"] = json!(stream);
+        r
+    };
+    let mut replies = Vec::new();
+    for (question, stream) in [(PROMPT, false), ("And the other one?", true)] {
+        let body = with(json!([{ "role": "user", "content": question }]), stream);
+        if stream {
+            let events = sse(&server, &body);
+            let text: String = events
+                .iter()
+                .filter_map(|e| e["choices"][0]["delta"]["content"].as_str())
+                .collect();
+            replies.push((question, text));
+        } else {
+            let (status, one) = server.call("POST", "/v1/chat/completions", &body);
+            assert_eq!(status, 200, "{one}");
+            let text = one["choices"][0]["message"]["content"].as_str().unwrap();
+            replies.push((question, text.to_string()));
+        }
+    }
+    assert_eq!(replies[0].1, "aaaaaa", "the bias holds");
+    assert_eq!(replies[0].1, replies[1].1, "one text, two conversations");
+    for (question, reply) in &replies {
+        let (status, two) = server.call(
+            "POST",
+            "/v1/chat/completions",
+            &with(
+                json!([
+                    { "role": "user", "content": question },
+                    { "role": "assistant", "content": reply },
+                    { "role": "user", "content": "Again?" },
+                ]),
+                false,
+            ),
+        );
+        assert_eq!(status, 200, "{two}");
+        let t = &two["timings"];
+        assert_eq!(
+            (&t["history_matched"], &t["history_unverified"]),
+            (&json!(1), &json!(0)),
+            "{question}: {t}"
+        );
+    }
+    let (status, foreign) = server.call(
+        "POST",
+        "/v1/chat/completions",
+        &with(
+            json!([
+                { "role": "user", "content": "Never asked." },
+                { "role": "assistant", "content": replies[0].1 },
+                { "role": "user", "content": "Again?" },
+            ]),
+            false,
+        ),
+    );
+    assert_eq!(status, 200, "{foreign}");
+    let t = &foreign["timings"];
+    assert_eq!(
+        (
+            &t["history_matched"],
+            &t["history_unverified"],
+            &t["history_spliced_tokens"]
+        ),
+        (&json!(0), &json!(1), &json!(0)),
+        "{t}"
+    );
+    drop(server);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The SSE events of a streamed chat request, `[DONE]` excluded.
+fn sse(server: &Server, body: &Value) -> Vec<Value> {
+    let mut s = std::net::TcpStream::connect(("127.0.0.1", server.port)).unwrap();
+    let body = body.to_string();
+    write!(
+        s,
+        "POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n\
+         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )
+    .unwrap();
+    let mut response = String::new();
+    s.read_to_string(&mut response).unwrap();
+    let (head, mut rest) = response.split_once("\r\n\r\n").unwrap();
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}\n{rest}");
+    let mut text = String::new();
+    while let Some((size, after)) = rest.split_once("\r\n") {
+        let n = usize::from_str_radix(size.trim(), 16).unwrap();
+        if n == 0 {
+            break;
+        }
+        text.push_str(&after[..n]);
+        rest = &after[n + 2..];
+    }
+    text.split("\n\n")
+        .filter_map(|e| e.strip_prefix("data: "))
+        .filter(|e| *e != "[DONE]")
+        .map(|e| serde_json::from_str(e).unwrap_or_else(|err| panic!("{e:?}: {err}")))
+        .collect()
+}
+
 /// The token-level API: ids in (`prompt_token_ids`, on both routes) are the
 /// ids the engine ran, and the ids out (`return_token_ids`) are the run's,
 /// with their log-probabilities (`logprobs`); greedy, each is its row's

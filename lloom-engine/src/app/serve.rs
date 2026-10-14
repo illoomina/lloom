@@ -638,8 +638,8 @@ struct StreamingRun {
     id: String,
     model: String,
     /// A chat prompt the front end built: its reply goes in the session log
-    /// (the prompt's thinking says where the reply starts).
-    record: Option<Option<Thinking>>,
+    /// against the conversation it answers.
+    record: Option<front::Origin>,
 }
 
 /// One decode of `prompt_ids`, through the image path when the request
@@ -961,6 +961,7 @@ fn chat_completions(shared: &Shared, v: &Value) -> Handled<Reply> {
                         want,
                         add_bos: true,
                         expand: (!images.is_empty()).then_some(expand_ref),
+                        history: v.get("messages"),
                     },
                 )
                 .map_err(|e| front_failure("/v1/chat/completions", e))?;
@@ -1200,7 +1201,7 @@ fn chat_completions(shared: &Shared, v: &Value) -> Handled<Reply> {
             params,
             id,
             model,
-            record: prompt.as_ref().map(|p| p.thinking),
+            record: prompt.as_ref().map(|p| p.origin),
         })));
     }
     let started = Instant::now();
@@ -1215,7 +1216,7 @@ fn chat_completions(shared: &Shared, v: &Value) -> Handled<Reply> {
     let recorded = prompt.as_ref().is_some_and(|p| {
         shared
             .front
-            .record(shared.engine.as_ref(), p.thinking, &decoded)
+            .record(shared.engine.as_ref(), p.origin, &decoded)
     });
     report(
         "/v1/chat/completions",
@@ -1628,10 +1629,10 @@ fn stream_response(shared: &Shared, request: Request, run: StreamingRun) -> Resu
     };
     let (w, write_err) = sw.finish()?;
     let decoded = decoded?;
-    if let Some(thinking) = run.record {
+    if let Some(origin) = run.record {
         shared
             .front
-            .record(shared.engine.as_ref(), thinking, &decoded);
+            .record(shared.engine.as_ref(), origin, &decoded);
     }
     if let Some(e) = write_err {
         anyhow::bail!("client went away mid-stream: {e}");
@@ -2071,6 +2072,7 @@ fn eval(shared: &Shared, request: Request, v: &Value) -> Result<()> {
                                     want,
                                     add_bos: true,
                                     expand: None,
+                                    history: None,
                                 },
                             )
 ?;
@@ -2554,6 +2556,12 @@ fn timings(prompt: usize, facts: &PromptFacts, d: &Decoded, elapsed: std::time::
         "history_restored": facts.spliced.restored,
         "history_reply_tokens": facts.spliced.reply_tokens,
         "history_spliced_tokens": facts.spliced.spliced_tokens,
+        // Assistant messages taken as sent: their text names several
+        // replies of this conversation, or a reply of another one only; and
+        // reasoning the log would restore, kept as the message gave it.
+        "history_ambiguous": facts.spliced.ambiguous,
+        "history_unverified": facts.spliced.unverified,
+        "history_declined": facts.spliced.declined,
         "reused": d.reused,
     })
 }
@@ -2572,7 +2580,8 @@ fn report(endpoint: &str, prompt: usize, facts: &PromptFacts, d: &Decoded, total
          {steady:.1} tok/s steady (median step), readback={} reuse={:?} prefilled={} \
          commits={} poll_fallbacks={} overrun={} eos_gate={} host_fill={} prompt_ids_sha256={} \
          reasoning_effort={} think={} think_by={} thinking_budget={} thought={} budget_fired={} \
-         prompt_budget={} prompt_dropped={} reused={} renders={} history={}/{} spliced={}/{}]",
+         prompt_budget={} prompt_dropped={} reused={} renders={} history={}/{} spliced={}/{} \
+         unverified={} ambiguous={} declined={}]",
         d.tokens.len(),
         d.stop,
         d.readback.name(),
@@ -2604,6 +2613,9 @@ fn report(endpoint: &str, prompt: usize, facts: &PromptFacts, d: &Decoded, total
         facts.spliced.replies,
         facts.spliced.spliced_tokens,
         facts.spliced.reply_tokens,
+        facts.spliced.unverified,
+        facts.spliced.ambiguous,
+        facts.spliced.declined,
     );
 }
 

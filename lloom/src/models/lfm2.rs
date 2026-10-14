@@ -10180,6 +10180,7 @@ impl<P: Profile> Model<P> {
         input_ids: &Tensor,
         rows: &mut [RaggedRow<'_, State<P>>],
     ) -> Result<Tensor> {
+        let _window = lloom_tensor::tuning::VerifyWindow::open();
         self.forward_ragged_impl(input_ids, rows, true, true)
     }
 
@@ -10397,6 +10398,20 @@ impl<P: Profile> Model<P> {
         let logits = self.lm_head.forward(&hidden_states)?;
         dump_logits(&logits, index_pos)?;
         logits.to_dtype(DType::F32)
+    }
+
+    /// [`Self::forward_all`] as a speculative verify window
+    /// ([`lloom_tensor::tuning::VerifyWindow`]): under `deterministic` its half
+    /// matmuls take the GEMM, the window's rows identical per window shape;
+    /// the K=1 step keeps the one-row reduction.
+    fn window_forward(
+        &self,
+        input_ids: &Tensor,
+        index_pos: usize,
+        cache: &mut State<P>,
+    ) -> Result<Tensor> {
+        let _window = lloom_tensor::tuning::VerifyWindow::open();
+        self.forward_all(input_ids, index_pos, cache)
     }
 
     /// The **raw** token embedding, for a drafter that ships none of its own
@@ -10796,7 +10811,7 @@ impl<P: Profile> Model<P> {
         // **One pass over the weights for k + 1 positions.** §9.1c: the weight
         // sweep is per step and not per token, so this is where the multiple
         // comes from -- 5.394 GB read once against k + 1 times.
-        let logits = self.forward_all(&input, index_pos, cache)?;
+        let logits = self.window_forward(&input, index_pos, cache)?;
         let argmax = logits.i(0)?.argmax(lloom_tensor::D::Minus1)?;
 
         // The one readback: `[argmax[0..=k], proposed[0..k]]` in a single
@@ -10876,7 +10891,7 @@ impl<P: Profile> Model<P> {
         let anchor = cache.anchor_tensor(last)?;
         let input = Tensor::cat(&[&anchor, proposed], 0)?.reshape((1, k + 1))?;
         // One pass over the weights for k + 1 positions, as the greedy verify.
-        let logits = self.forward_all(&input, index_pos, cache)?;
+        let logits = self.window_forward(&input, index_pos, cache)?;
         // One drawn token per position, each with its own position's noise.
         // Row `i` is the input at `index_pos + i` predicting the token AT
         // `index_pos + i + 1`, and the key is the drawn token's own position
@@ -10981,7 +10996,7 @@ impl<P: Profile> Model<P> {
         let tok = cache.advance(k + 1)?;
         let anchor = cache.anchor_tensor(last)?;
         let input = Tensor::cat(&[&anchor, proposed], 0)?.reshape((1, k + 1))?;
-        let logits = self.forward_all(&input, index_pos, cache)?;
+        let logits = self.window_forward(&input, index_pos, cache)?;
         let argmax = logits.i(0)?.argmax(lloom_tensor::D::Minus1)?;
         let both_t = Tensor::cat(&[&argmax, proposed], 0)?;
         let n = 2 * k + 1;

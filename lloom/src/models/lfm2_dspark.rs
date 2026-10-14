@@ -3384,6 +3384,7 @@ impl<H: SharedHead> DSparkSpeculator<H> {
     /// position — and B `Draft`s, each row's tokens a `[cap]` view of the
     /// `[B, cap]` block on the device.
     fn draft_rows(&mut self, active: &[SeqId]) -> Result<Vec<Draft>> {
+        let _window = lloom_tensor::tuning::VerifyWindow::draft();
         let b = active.len();
         let device = self.blocks.device().clone();
         let mut mapped = true;
@@ -3483,6 +3484,7 @@ impl<H: SharedHead> DSparkSpeculator<H> {
     /// Draft one block for one already-seeded sequence — the verify example's
     /// per-round draft body, factored behind the seam.
     fn draft_one(&self, seq: &PerSeq) -> Result<Draft> {
+        let _window = lloom_tensor::tuning::VerifyWindow::draft();
         let block_tensor = seq.block_ids(&self.drafter, seq.last, self.block_size)?;
         let block_embeds = self.drafter.embed_block(&self.head.embed(&block_tensor)?)?;
         let hidden = self
@@ -3638,7 +3640,10 @@ impl<H: SharedHead> Speculator for DSparkSpeculator<H> {
             .get_mut(seq.0)
             .ok_or_else(|| lloom_tensor::Error::msg(format!("DSpark: no slot {}", seq.0)))?;
         let rows = probe.first().map(|t| t.dim(1)).transpose()?.unwrap_or(0);
-        drafter.update_context(probe, s.ctx_offset, &mut s.ctx)?;
+        {
+            let _window = lloom_tensor::tuning::VerifyWindow::draft();
+            drafter.update_context(probe, s.ctx_offset, &mut s.ctx)?;
+        }
         s.note_keyed(rows, accepted);
         Ok(())
     }
@@ -3684,6 +3689,7 @@ impl<H: SharedHead> Speculator for DSparkSpeculator<H> {
         {
             let mut caches: Vec<&mut [CtxCache]> =
                 picked.iter_mut().map(|s| s.ctx.as_mut_slice()).collect();
+            let _window = lloom_tensor::tuning::VerifyWindow::draft();
             drafter.update_context_rows(&taps, &offsets, &mut caches)?;
         }
         for ((s, (_, _, accepted)), n) in picked.iter_mut().zip(rows).zip(n_rows) {

@@ -1694,6 +1694,7 @@ where
         }
         cache.open_window()?;
         if dev.is_metal() && cache.ring_holds(t) {
+            let _window = lloom_tensor::tuning::VerifyWindow::open();
             let input = Tensor::from_vec(tokens.clone(), (t, 1), &dev)?;
             let mut h = self.embed.embed(&input)?; // [T, 1, hidden]
             let mut after: Vec<Vec<WindowMark>> = Vec::with_capacity(self.layers.len());

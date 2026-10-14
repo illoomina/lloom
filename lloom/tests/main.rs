@@ -148,6 +148,7 @@ mod token_ring_fuzz;
 mod token_ring_tests;
 mod turn_checkpoint;
 mod varlen_flash_attention;
+mod verify_window_gemm;
 
 /// Every `tests/*.rs` beside this file is declared above (or is one of the
 /// files that owns its binary), read from the directory at test time.

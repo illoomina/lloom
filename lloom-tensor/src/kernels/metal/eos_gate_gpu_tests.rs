@@ -210,6 +210,35 @@ fn an_ungated_kernel_keeps_running_through_a_raised_gate() {
     assert!(report.fired);
 }
 
+/// An ungated scope (`kernels::kernel::UngatedScope`) runs a gated source's
+/// kernel past a raised gate, while it lives and only then.
+#[test]
+fn an_ungated_scope_runs_a_gated_kernel_past_a_raised_gate() {
+    let rig = Rig::new();
+    rig.begin();
+    zero(&rig.dst, N * 4);
+    assert_eq!(
+        rig.step_copy2d(Some(EOS[0])),
+        vec![0.0; N],
+        "the gate is up"
+    );
+    {
+        let _ungated = crate::kernels::kernel::UngatedScope::open();
+        assert_eq!(
+            rig.step_copy2d(Some(7)),
+            identity(),
+            "inside the scope the copy runs"
+        );
+    }
+    zero(&rig.dst, N * 4);
+    assert_eq!(
+        rig.step_copy2d(Some(7)),
+        vec![0.0; N],
+        "after it the gate holds again"
+    );
+    assert!(rig.end().fired);
+}
+
 #[test]
 fn the_gated_variant_is_a_separate_pipeline_and_the_plain_one_is_untouched() {
     let rig = Rig::new();

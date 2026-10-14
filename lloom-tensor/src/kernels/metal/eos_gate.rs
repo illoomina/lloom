@@ -33,6 +33,12 @@
 //! `cast`, `is`) read garbage past the EOS and write scratch; none writes a
 //! cache. The host's position bookkeeping is rewound as "unwritten" at the
 //! end of the run (`CacheRewind::rewind_unwritten`).
+//!
+//! The gate suppresses a forward's writes past the EOS, not every write
+//! encoded after it: a write the accepted state still needs (a KV slab's
+//! growth copy, which can fall inside the forwards queued past the EOS)
+//! runs under `kernel::UngatedScope` (`Device::eos_gate_suspended`), whose
+//! thread loads the plain variants.
 
 use crate::kernels::metal::buffer::Buffer;
 use crate::kernels::metal::device::Device;

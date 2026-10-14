@@ -2053,6 +2053,7 @@ impl<P: Lfm2Shape> Engine<P> {
             reuse: done.reuse,
             reused: done.reused,
             prefilled: done.prefilled,
+            turn: done.turn,
             readback: match self.dspark_k {
                 Some(k) => ReadbackArm::Speculative { k },
                 None => ReadbackArm::Batched {
@@ -2835,7 +2836,7 @@ fn static_dspark_body<'a, 'm, P: Profile>(
                 processors: false,
                 budget: false,
                 digest: false,
-                logprobs: false,
+                logprobs: None,
             },
         )
         .map_err(|e| lloom_tensor::Error::Msg(format!("row {i}: {e}")))?;
@@ -3071,6 +3072,9 @@ impl<P: Lfm2Shape> super::served::Served for Engine<P> {
     }
     fn readback(&self) -> ReadbackArm {
         self.readback
+    }
+    fn reuse_prefix(&self) -> Option<bool> {
+        Some(self.reuse_prefix)
     }
     fn prefill_tile(&self) -> usize {
         self.prefill_tile

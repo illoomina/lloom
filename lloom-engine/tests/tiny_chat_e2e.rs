@@ -925,7 +925,8 @@ fn serve_scores_decision_options_from_one_forward() {
 }
 
 /// A `lloom serve` chat request's generated ids and `timings`.
-fn served_ids(server: &Server, fields: Value) -> (Vec<u32>, Value) {
+fn served_ids(server: &Server, mut fields: Value) -> (Vec<u32>, Value) {
+    fields["return_token_ids"] = json!(true);
     let (status, body) = server.chat(fields);
     assert_eq!(status, 200, "{body}");
     let ids = body["timings"]["tokens"]
@@ -1104,10 +1105,11 @@ fn thinking_budget_is_ignored_or_refused_where_no_block_is_open() {
     let args: Vec<&str> = base.iter().map(String::as_str).collect();
     let server = Server::start(&model, &args);
     let off = json!({ "enable_thinking": false });
-    let (status, plain) = server.chat(json!({ "chat_template_kwargs": off }));
+    let (status, plain) =
+        server.chat(json!({ "chat_template_kwargs": off, "return_token_ids": true }));
     assert_eq!(status, 200, "{plain}");
-    let (status, with) =
-        server.chat(json!({ "chat_template_kwargs": off, "thinking_token_budget": 2 }));
+    let (status, with) = server.chat(json!({ "chat_template_kwargs": off,
+        "thinking_token_budget": 2, "return_token_ids": true }));
     assert_eq!(status, 200, "{with}");
     assert_eq!(with["timings"]["tokens"], plain["timings"]["tokens"]);
     assert_eq!(with["timings"]["thinking_budget"], 2);
@@ -1126,10 +1128,11 @@ fn thinking_budget_is_ignored_or_refused_where_no_block_is_open() {
     batched.extend(["--batch", "2"]);
     let server = Server::start(&model, &batched);
     let on = json!({ "enable_thinking": true });
-    let (status, plain) = server.chat(json!({ "chat_template_kwargs": on }));
+    let (status, plain) =
+        server.chat(json!({ "chat_template_kwargs": on, "return_token_ids": true }));
     assert_eq!(status, 200, "{plain}");
-    let (status, with) =
-        server.chat(json!({ "chat_template_kwargs": on, "thinking_token_budget": 0 }));
+    let (status, with) = server.chat(json!({ "chat_template_kwargs": on,
+        "thinking_token_budget": 0, "return_token_ids": true }));
     assert_eq!(status, 200, "{with}");
     assert_eq!(with["timings"]["tokens"], plain["timings"]["tokens"]);
     assert!(
@@ -1345,7 +1348,8 @@ fn prompt_budget_drops_whole_turns_and_the_cache_follows() {
     let (status, cut) = a.call(
         "POST",
         "/v1/chat/completions",
-        &json!({ "messages": conv, "max_tokens": 4, "truncate_prompt_tokens": 60 }),
+        &json!({ "messages": conv, "max_tokens": 4, "truncate_prompt_tokens": 60,
+                 "return_token_ids": true }),
     );
     assert_eq!(status, 200, "{cut}");
     let bos = tok.id("<|startoftext|>").unwrap();
@@ -1377,7 +1381,7 @@ fn prompt_budget_drops_whole_turns_and_the_cache_follows() {
     let (status, alone) = b.call(
         "POST",
         "/v1/chat/completions",
-        &json!({ "messages": kept, "max_tokens": 4 }),
+        &json!({ "messages": kept, "max_tokens": 4, "return_token_ids": true }),
     );
     assert_eq!(status, 200, "{alone}");
     assert_eq!(alone["timings"]["prompt_ids_sha256"], sha(&want));
@@ -2233,6 +2237,190 @@ fn serve_takes_a_logged_reply_only_in_the_conversation_it_answered() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// The external contract (decision 33, #1008): a response is text unless
+/// the request asks for ids (`return_token_ids`) or logprobs (`logprobs`,
+/// bounded at `MAX_TOP_LOGPROBS` candidates). The ids returned are the
+/// session's own: the next turn's prompt carries them where the reply sits.
+/// `/health` says whether logprobs are served, and counts every turn's
+/// reuse by outcome; a batched server refuses per-token logprobs by name.
+#[test]
+fn serve_returns_text_unless_ids_or_logprobs_are_asked() {
+    let (dir, model, base) = qwen_tiny("external-contract");
+    let mut args: Vec<&str> = base.iter().map(String::as_str).collect();
+    args.extend(["--prefix-reuse", "true"]);
+    let server = Server::start(&model, &args);
+    let common = json!({ "enable_thinking": false, "temperature": 0, "max_tokens": 6,
+                         "logit_bias": { "97": 100 } });
+    let with = |messages: Value, extra: Value| {
+        let mut r = common.clone();
+        r["messages"] = messages;
+        for (k, v) in extra.as_object().unwrap() {
+            r[k] = v.clone();
+        }
+        r
+    };
+    let first = json!([{ "role": "user", "content": PROMPT }]);
+    let (status, plain) = server.call(
+        "POST",
+        "/v1/chat/completions",
+        &with(first.clone(), json!({})),
+    );
+    assert_eq!(status, 200, "{plain}");
+    let choice = &plain["choices"][0];
+    assert!(choice["message"]["content"].is_string(), "{plain}");
+    for absent in [
+        &plain["prompt_token_ids"],
+        &plain["prompt_sampled_logprobs"],
+        &choice["token_ids"],
+        &choice["token_logprobs"],
+        &choice["logprobs"],
+        &plain["timings"]["tokens"],
+    ] {
+        assert!(absent.is_null(), "text only, by default: {plain}");
+    }
+
+    let (status, one) = server.call(
+        "POST",
+        "/v1/chat/completions",
+        &with(first, json!({ "return_token_ids": true })),
+    );
+    assert_eq!(status, 200, "{one}");
+    let ids = one["choices"][0]["token_ids"].as_array().unwrap().clone();
+    assert_eq!(one["timings"]["tokens"], json!(ids));
+    assert!(
+        one["choices"][0]["token_logprobs"].is_null(),
+        "logprobs not asked: {one}"
+    );
+    let p1 = one["prompt_token_ids"].as_array().unwrap().len();
+    let reply = one["choices"][0]["message"]["content"].as_str().unwrap();
+    let (status, two) = server.call(
+        "POST",
+        "/v1/chat/completions",
+        &with(
+            json!([
+                { "role": "user", "content": PROMPT },
+                { "role": "assistant", "content": reply },
+                { "role": "user", "content": "Again?" },
+            ]),
+            json!({ "return_token_ids": true }),
+        ),
+    );
+    assert_eq!(status, 200, "{two}");
+    let prompt2 = two["prompt_token_ids"].as_array().unwrap();
+    assert_eq!(
+        &prompt2[p1..p1 + ids.len()],
+        &ids[..],
+        "the session's ids: {two}"
+    );
+    let t = &two["timings"]["turn"];
+    assert_eq!(t["reuse_policy"], "on", "{t}");
+    assert_eq!(t["outcome"], "extend", "{t}");
+    assert_eq!(t["boundary"], json!(p1 + ids.len()), "{t}");
+    assert_eq!(t["reused"], t["boundary"], "{t}");
+
+    let (status, lp) = server.call(
+        "POST",
+        "/v1/chat/completions",
+        &with(
+            json!([{ "role": "user", "content": "Other?" }]),
+            json!({ "logprobs": true, "top_logprobs": 3 }),
+        ),
+    );
+    assert_eq!(status, 200, "{lp}");
+    let content = lp["choices"][0]["logprobs"]["content"].as_array().unwrap();
+    assert_eq!(
+        content.len(),
+        lp["usage"]["completion_tokens"].as_u64().unwrap() as usize
+    );
+    for c in content {
+        assert_eq!(c["top_logprobs"].as_array().unwrap().len(), 3, "{c}");
+    }
+    assert!(
+        lp["choices"][0]["token_ids"].is_null(),
+        "ids not asked: {lp}"
+    );
+    for (extra, says) in [
+        (
+            json!({ "logprobs": true, "top_logprobs": 65 }),
+            "from 0 to 64",
+        ),
+        (json!({ "top_logprobs": 2 }), "set logprobs to true"),
+    ] {
+        let (status, err) = server.call(
+            "POST",
+            "/v1/chat/completions",
+            &with(json!([{ "role": "user", "content": "Other?" }]), extra),
+        );
+        assert_eq!(status, 400, "{err}");
+        assert!(
+            err["error"]["message"].as_str().unwrap().contains(says),
+            "{err}"
+        );
+    }
+
+    let (status, h) = server.call("GET", "/health", &json!({}));
+    assert_eq!(status, 200, "{h}");
+    assert_eq!(h["logprobs"]["served"], true, "{h}");
+    assert_eq!(h["logprobs"]["top_max"], 64, "{h}");
+    let reuse = &h["reuse"];
+    assert_eq!(reuse["reuse_policy"], "on", "{reuse}");
+    assert_eq!(reuse["turns"], 4, "four generating requests: {reuse}");
+    assert_eq!(reuse["outcome"]["extend"], 1, "{reuse}");
+    let counted: u64 = reuse["outcome"]
+        .as_object()
+        .unwrap()
+        .values()
+        .map(|n| n.as_u64().unwrap())
+        .sum();
+    assert_eq!(counted, 4, "{reuse}");
+    assert_eq!(
+        reuse["last"], lp["timings"]["turn"],
+        "the last turn's own report"
+    );
+    drop(server);
+
+    // Reuse off (serve's default): every turn cold by policy.
+    let server = Server::start(&model, &base.iter().map(String::as_str).collect::<Vec<_>>());
+    let (status, cold) = server.call(
+        "POST",
+        "/v1/chat/completions",
+        &with(json!([{ "role": "user", "content": PROMPT }]), json!({})),
+    );
+    assert_eq!(status, 200, "{cold}");
+    let t = &cold["timings"]["turn"];
+    assert_eq!(
+        (&t["reuse_policy"], &t["reason"]),
+        (&json!("off"), &json!("policy-off")),
+        "{t}"
+    );
+    drop(server);
+
+    // A batched server refuses per-token logprobs by name, and says so.
+    let mut batched: Vec<&str> = base.iter().map(String::as_str).collect();
+    batched.extend(["--batch", "2"]);
+    let server = Server::start(&model, &batched);
+    let (status, h) = server.call("GET", "/health", &json!({}));
+    assert_eq!(status, 200, "{h}");
+    assert_eq!(h["logprobs"]["served"], false, "{h}");
+    let why = h["logprobs"]["refused"].as_str().unwrap().to_string();
+    assert!(why.contains("the batch scheduler"), "{why}");
+    let (status, err) = server.call(
+        "POST",
+        "/v1/chat/completions",
+        &with(
+            json!([{ "role": "user", "content": PROMPT }]),
+            json!({ "logprobs": true }),
+        ),
+    );
+    assert_eq!(status, 400, "{err}");
+    assert!(
+        err["error"]["message"].as_str().unwrap().contains(&why),
+        "{err}"
+    );
+    drop(server);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// The SSE events of a streamed chat request, `[DONE]` excluded.
 fn sse(server: &Server, body: &Value) -> Vec<Value> {
     let mut s = std::net::TcpStream::connect(("127.0.0.1", server.port)).unwrap();
@@ -2319,9 +2507,26 @@ fn the_token_api_runs_the_ids_sent_and_returns_the_ids_and_logprobs_run() {
     assert_eq!(chat["timings"]["prompt_ids_sha256"], sha(&ids));
 
     let first = json!([{ "role": "user", "content": PROMPT }]);
+    // The session keeps logprobs, but a request that asks only for ids gets
+    // none of them (decision 33: each is asked for).
+    let (status, ids_only) = server.call(
+        "POST",
+        "/v1/chat/completions",
+        &json!({ "messages": [{ "role": "user", "content": "Just ids?" }],
+                 "enable_thinking": false, "temperature": 0, "max_tokens": 3,
+                 "return_token_ids": true }),
+    );
+    assert_eq!(status, 200, "{ids_only}");
+    assert!(ids_only["choices"][0]["token_ids"].is_array(), "{ids_only}");
+    assert!(
+        ids_only["choices"][0]["token_logprobs"].is_null(),
+        "{ids_only}"
+    );
+    assert!(ids_only["prompt_sampled_logprobs"].is_null(), "{ids_only}");
     let req = |messages: Value| {
         json!({ "messages": messages, "enable_thinking": false, "temperature": 0,
-                "max_tokens": 4, "logit_bias": { "98": 100 }, "return_token_ids": true })
+                "max_tokens": 4, "logit_bias": { "98": 100 }, "return_token_ids": true,
+                "logprobs": true })
     };
     let (status, one) = server.call("POST", "/v1/chat/completions", &req(first));
     assert_eq!(status, 200, "{one}");

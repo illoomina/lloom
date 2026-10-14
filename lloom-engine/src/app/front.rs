@@ -1393,7 +1393,7 @@ pub fn logprobs_refused_on(body: lloom::nn::Body) -> Option<String> {
         processors: false,
         budget: false,
         digest: false,
-        logprobs: true,
+        logprobs: Some(0),
     };
     lloom::nn::refuse(body, &asks)
         .err()

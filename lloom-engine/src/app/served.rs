@@ -29,6 +29,12 @@ pub trait Served: Send + Sync {
     /// ring under `auto`; the blocking arm on Qwen4-exp, whose forward needs
     /// its input ids host-side).
     fn readback(&self) -> ReadbackArm;
+    /// Whether the owner keeps a request's prefix for the next one
+    /// (`context.prefix.reuse` as it resolved at load); `None` where the
+    /// owner does not say (an already-loaded owner whose policy is its own).
+    fn reuse_prefix(&self) -> Option<bool> {
+        None
+    }
     fn prefill_tile(&self) -> usize;
     /// The batch width `N`; `1` is the single-sequence path.
     fn batch(&self) -> usize;

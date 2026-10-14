@@ -130,6 +130,8 @@ struct Shared {
     sampling: crate::SamplingConfig,
     /// The request front end: the template constants, the session log.
     front: Front,
+    /// What every request reused of its session, counted (`/health`).
+    reuse: parking_lot::Mutex<crate::turn::Tally>,
 }
 
 /// The largest `/v1/systemone` body a decision-only owner reads: eight
@@ -258,9 +260,13 @@ fn run_owner(
         .check()
         .map_err(|e| anyhow::anyhow!("the checkpoint's generation_config.json: {e}"))?;
     let description = engine.describe_checked()?;
+    let logprobs = match front::logprobs_refused(engine.as_ref()) {
+        None => format!("served(top<={})", lloom::nn::MAX_TOP_LOGPROBS),
+        Some(why) => format!("refused({why})"),
+    };
     if let Some((load_start, reuse_prefix)) = load_facts {
         eprintln!(
-            "[loaded {} from {} in {:.2}s on {:?}; kv_capacity={} readback={} reuse_prefix={} {}]",
+            "[loaded {} from {} in {:.2}s on {:?}; kv_capacity={} readback={} reuse_prefix={} logprobs={logprobs} {}]",
             model_name,
             model_path.display(),
             load_start.elapsed().as_secs_f64(),
@@ -272,12 +278,13 @@ fn run_owner(
         );
     } else {
         eprintln!(
-            "[serving existing {} from {} on {:?}; kv_capacity={} readback={} {}]",
+            "[serving existing {} from {} on {:?}; kv_capacity={} readback={} reuse_prefix={} logprobs={logprobs} {}]",
             model_name,
             model_path.display(),
             engine.device(),
             engine.kv_capacity(),
             engine.readback().name(),
+            crate::turn::policy_name(engine.reuse_prefix()),
             description,
         );
     }
@@ -328,6 +335,7 @@ fn run_owner(
         model_name,
         sampling,
         front,
+        reuse: parking_lot::Mutex::new(crate::turn::Tally::default()),
     });
 
     // The ready marker the sidecar runner waits for, on stdout and nothing
@@ -345,7 +353,10 @@ fn run_owner(
         let method = request.method().clone();
         match (method, path.as_str()) {
             (Method::Get, "/health") => {
-                let result = health_body(shared.engine.as_ref(), &shared.front);
+                let result = health_body(shared.engine.as_ref(), &shared.front).map(|mut b| {
+                    b["reuse"] = shared.reuse.lock().json(shared.engine.reuse_prefix());
+                    b
+                });
                 let _ = respond_metadata(request, result);
             }
             (Method::Get, "/v1/models") => {
@@ -640,6 +651,8 @@ struct StreamingRun {
     /// A chat prompt the front end built: its reply goes in the session log
     /// against the conversation it answers.
     record: Option<front::Origin>,
+    /// `return_token_ids`: the final event carries the ids.
+    return_ids: bool,
 }
 
 /// One decode of `prompt_ids`, through the image path when the request
@@ -718,9 +731,13 @@ fn completions(shared: &Shared, v: &Value, _headers: &[Header]) -> Handled<Reply
         Some(Value::Bool(true)) => Some(0),
         Some(n) => Some(
             n.as_u64()
-                .filter(|&n| n <= 20)
-                .ok_or_else(|| bad("field 'logprobs' must be an integer from 0 to 20"))?
-                as usize,
+                .filter(|&n| n as usize <= lloom::nn::MAX_TOP_LOGPROBS)
+                .ok_or_else(|| {
+                    bad(format!(
+                        "field 'logprobs' must be an integer from 0 to {}",
+                        lloom::nn::MAX_TOP_LOGPROBS
+                    ))
+                })? as usize,
         ),
     };
     if want_logprobs.is_some() {
@@ -801,12 +818,14 @@ fn completions(shared: &Shared, v: &Value, _headers: &[Header]) -> Handled<Reply
             id,
             model,
             record: None,
+            return_ids,
         })));
     }
     let started = Instant::now();
     let decoded = shared.engine.complete(&prompt_ids, &params, &mut |_| {})?;
     let elapsed = started.elapsed();
     report(
+        shared,
         "/v1/completions",
         prompt_ids.len(),
         &facts,
@@ -828,11 +847,12 @@ fn completions(shared: &Shared, v: &Value, _headers: &[Header]) -> Handled<Reply
             "finish_reason": finish_reason(decoded.stop),
         }],
         "usage": usage(prompt_ids.len(), decoded.tokens.len()),
-        "timings": timings(prompt_ids.len(), &facts, &decoded, elapsed),
+        "timings": timings(shared.engine.as_ref(), prompt_ids.len(), &facts, &decoded, elapsed),
     });
     if return_ids {
         body["prompt_token_ids"] = json!(prompt_ids);
         body["choices"][0]["token_ids"] = json!(decoded.tokens);
+        body["timings"]["tokens"] = json!(decoded.tokens);
     }
     Ok(Reply::Json(body))
 }
@@ -1051,11 +1071,25 @@ fn chat_completions(shared: &Shared, v: &Value) -> Handled<Reply> {
             return Err(bad("logprobs with an image is not supported"));
         }
     }
-    let top_k = v
-        .get("top_logprobs")
-        .and_then(Value::as_u64)
-        .unwrap_or(1)
-        .clamp(1, 64) as usize;
+    // OpenAI's bound: up to 20 candidates beside each drawn id, asked with
+    // `logprobs`.
+    let top_logprobs = match v.get("top_logprobs") {
+        None | Some(Value::Null) => None,
+        Some(n) => Some(
+            n.as_u64()
+                .filter(|&n| n as usize <= lloom::nn::MAX_TOP_LOGPROBS)
+                .ok_or_else(|| {
+                    bad(format!(
+                        "field 'top_logprobs' must be an integer from 0 to {}",
+                        lloom::nn::MAX_TOP_LOGPROBS
+                    ))
+                })? as usize,
+        ),
+    };
+    if top_logprobs.is_some() && !want_logprobs {
+        return Err(bad("top_logprobs asks for logprobs: set logprobs to true"));
+    }
+    let top_k = top_logprobs.unwrap_or(1).max(1);
     // Past one token, each returned id carries its log-probability (and the
     // top `top_logprobs`), from the run's own steps.
     let return_ids = v
@@ -1063,11 +1097,7 @@ fn chat_completions(shared: &Shared, v: &Value) -> Handled<Reply> {
         .and_then(Value::as_bool)
         .unwrap_or(false);
     params.logprobs = logprob_request(
-        want_logprobs.then_some(if v.get("top_logprobs").is_some() {
-            top_k
-        } else {
-            0
-        }),
+        want_logprobs.then_some(top_logprobs.unwrap_or(0)),
         prompt.as_ref().and(shared.front.options().keep.capture()),
     );
     if want_logprobs && params.max_tokens > 1 {
@@ -1202,6 +1232,7 @@ fn chat_completions(shared: &Shared, v: &Value) -> Handled<Reply> {
             id,
             model,
             record: prompt.as_ref().map(|p| p.origin),
+            return_ids,
         })));
     }
     let started = Instant::now();
@@ -1219,6 +1250,7 @@ fn chat_completions(shared: &Shared, v: &Value) -> Handled<Reply> {
             .record(shared.engine.as_ref(), p.origin, &decoded)
     });
     report(
+        shared,
         "/v1/chat/completions",
         prompt_ids.len(),
         &facts,
@@ -1238,19 +1270,25 @@ fn chat_completions(shared: &Shared, v: &Value) -> Handled<Reply> {
             "finish_reason": finish_reason(decoded.stop),
         }],
         "usage": usage(prompt_ids.len(), decoded.tokens.len()),
-        "timings": timings(prompt_ids.len(), &facts, &decoded, elapsed),
+        "timings": timings(shared.engine.as_ref(), prompt_ids.len(), &facts, &decoded, elapsed),
     });
     body["timings"]["logged"] = json!(recorded);
+    // Ids only when asked (`return_token_ids`), and their logprobs only when
+    // logprobs are asked too: the conversation the response returns is its
+    // text (`sequence-reuse-design.md` §2.3d).
     if return_ids {
         body["prompt_token_ids"] = json!(prompt_ids);
         body["choices"][0]["token_ids"] = json!(decoded.tokens);
-        if let Some(lp) = prompt.as_ref().and_then(|p| p.logprobs.as_ref()) {
-            if lp.len() == prompt_ids.len() {
-                body["prompt_sampled_logprobs"] = json!(lp);
+        body["timings"]["tokens"] = json!(decoded.tokens);
+        if want_logprobs {
+            if let Some(lp) = prompt.as_ref().and_then(|p| p.logprobs.as_ref()) {
+                if lp.len() == prompt_ids.len() {
+                    body["prompt_sampled_logprobs"] = json!(lp);
+                }
             }
-        }
-        if let Some(lp) = &decoded.logprobs {
-            body["choices"][0]["token_logprobs"] = json!(lp.sampled);
+            if let Some(lp) = &decoded.logprobs {
+                body["choices"][0]["token_logprobs"] = json!(lp.sampled);
+            }
         }
     }
     attach_vision(shared, &mut body)?;
@@ -1639,6 +1677,7 @@ fn stream_response(shared: &Shared, request: Request, run: StreamingRun) -> Resu
     }
     let elapsed = started.elapsed();
     report(
+        shared,
         endpoint,
         run.prompt_ids.len(),
         &run.facts,
@@ -1652,16 +1691,21 @@ fn stream_response(shared: &Shared, request: Request, run: StreamingRun) -> Resu
             "choices": [{ "index": 0, "text": "", "logprobs": null,
                           "finish_reason": finish_reason(decoded.stop) }],
             "usage": usage,
-            "timings": timings(run.prompt_ids.len(), &run.facts, &decoded, elapsed),
+            "timings": timings(shared.engine.as_ref(), run.prompt_ids.len(), &run.facts, &decoded, elapsed),
         }),
         StreamKind::Chat => json!({
             "id": run.id, "object": "chat.completion.chunk", "created": created, "model": run.model,
             "choices": [{ "index": 0, "delta": {}, "finish_reason": finish_reason(decoded.stop) }],
             "usage": usage,
-            "timings": timings(run.prompt_ids.len(), &run.facts, &decoded, elapsed),
+            "timings": timings(shared.engine.as_ref(), run.prompt_ids.len(), &run.facts, &decoded, elapsed),
         }),
     };
     let mut last = last;
+    if run.return_ids {
+        last["prompt_token_ids"] = json!(run.prompt_ids);
+        last["choices"][0]["token_ids"] = json!(decoded.tokens);
+        last["timings"]["tokens"] = json!(decoded.tokens);
+    }
     write_stream_trailer(w, &mut last, |body| {
         if let StreamKind::Chat = run.kind {
             attach_vision(shared, body)?;
@@ -1903,6 +1947,7 @@ fn end_to_end_latency(shared: &Shared, v: &Value) -> Handled<Value> {
         let decoded = engine.complete(&ids, &params, &mut |_| {})?;
         let total_ms = ms(started.elapsed());
         report(
+            shared,
             "/end_to_end_latency",
             ids.len(),
             &PromptFacts::of(&ids),
@@ -1944,6 +1989,7 @@ fn end_to_end_latency(shared: &Shared, v: &Value) -> Handled<Value> {
     let facts = PromptFacts::of(&ids);
     for (i, d) in decoded.iter().enumerate() {
         report(
+            shared,
             &format!("/end_to_end_latency row {i}/{batch}"),
             ids.len(),
             &facts,
@@ -2137,8 +2183,11 @@ fn eval(shared: &Shared, request: Request, v: &Value) -> Result<()> {
                         if stopped_early {
                             lock(aborts).remove(&sample_id);
                         }
+                        let policy = engine.reuse_prefix();
+                        let turn = decoded.turn.with_policy(policy);
+                        shared.reuse.lock().note(&turn);
                         eprintln!(
-                            "[eval {}/{total} id={sample_id} {} tokens {:.1} ms {} readback={}]",
+                            "[eval {}/{total} id={sample_id} {} tokens {:.1} ms {} readback={} reuse_policy={} reused={} {}]",
                             i + 1,
                             decoded.tokens.len(),
                             ms(started.elapsed()),
@@ -2148,6 +2197,9 @@ fn eval(shared: &Shared, request: Request, v: &Value) -> Result<()> {
                                 "done"
                             },
                             decoded.readback.name(),
+                            crate::turn::policy_name(policy),
+                            turn.reused,
+                            turn.fields(),
                         );
                         sw.event_line(&json!({
                             "kind": "eval_sample_done", "sample_id": sample_id,
@@ -2498,7 +2550,13 @@ fn usage(prompt: usize, completion: usize) -> Value {
 /// The engine's own brackets beside the request's wall clock: the prompt's
 /// submit time, the per-step host clock and the arm that ran. `predicted_ms`
 /// is the sum of the loop's steps — the decode window, prefill excluded.
-fn timings(prompt: usize, facts: &PromptFacts, d: &Decoded, elapsed: std::time::Duration) -> Value {
+fn timings(
+    engine: &dyn Served,
+    prompt: usize,
+    facts: &PromptFacts,
+    d: &Decoded,
+    elapsed: std::time::Duration,
+) -> Value {
     let st = &d.stats;
     // Release builds compile the per-step clock out (`step_ns` is empty, since
     // `6c33cd89`), so the decode's window is the request's wall minus the
@@ -2526,9 +2584,6 @@ fn timings(prompt: usize, facts: &PromptFacts, d: &Decoded, elapsed: std::time::
         "overrun": st.overrun,
         "eos_gate": super::common::eos_gate_name(st.eos_gate),
         "host_fill": super::common::host_fill_name(st.host_feed.as_ref()),
-        // The generated ids, so a gate can compare a run against a recorded
-        // token digest without a second path to the model.
-        "tokens": d.tokens,
         "prompt_ids_sha256": facts.ids_sha256,
         // The template's variable as the prompt reflects it; null for its
         // default (a value the template would not act on is a 400).
@@ -2563,10 +2618,24 @@ fn timings(prompt: usize, facts: &PromptFacts, d: &Decoded, elapsed: std::time::
         "history_unverified": facts.spliced.unverified,
         "history_declined": facts.spliced.declined,
         "reused": d.reused,
+        // What the request reused of the session, and why not more: the
+        // accepted boundary it found, how the state there was made ready,
+        // and the ids kept, replayed and newly prefilled.
+        "turn": d.turn.with_policy(engine.reuse_prefix()).json(engine.reuse_prefix()),
     })
 }
 
-fn report(endpoint: &str, prompt: usize, facts: &PromptFacts, d: &Decoded, total_ms: f64) {
+fn report(
+    shared: &Shared,
+    endpoint: &str,
+    prompt: usize,
+    facts: &PromptFacts,
+    d: &Decoded,
+    total_ms: f64,
+) {
+    let policy = shared.engine.reuse_prefix();
+    let turn = d.turn.with_policy(policy);
+    shared.reuse.lock().note(&turn);
     let st = &d.stats;
     let mut steps: Vec<u64> = st.step_ns.clone();
     steps.sort_unstable();
@@ -2581,7 +2650,7 @@ fn report(endpoint: &str, prompt: usize, facts: &PromptFacts, d: &Decoded, total
          commits={} poll_fallbacks={} overrun={} eos_gate={} host_fill={} prompt_ids_sha256={} \
          reasoning_effort={} think={} think_by={} thinking_budget={} thought={} budget_fired={} \
          prompt_budget={} prompt_dropped={} reused={} renders={} history={}/{} spliced={}/{} \
-         unverified={} ambiguous={} declined={}]",
+         unverified={} ambiguous={} declined={} reuse_policy={} {}]",
         d.tokens.len(),
         d.stop,
         d.readback.name(),
@@ -2616,6 +2685,8 @@ fn report(endpoint: &str, prompt: usize, facts: &PromptFacts, d: &Decoded, total
         facts.spliced.unverified,
         facts.spliced.ambiguous,
         facts.spliced.declined,
+        crate::turn::policy_name(policy),
+        turn.fields(),
     );
 }
 
@@ -2734,6 +2805,12 @@ fn health_body(engine: &dyn Served, front: &Front) -> Result<Value> {
     body["template_renders"] = json!(engine.template_renders());
     body["tokenizations"] = json!(front.tokenizations());
     body["session_log"] = json!(front.logged());
+    // Whether a request's per-token logprobs are served here, and why not.
+    body["logprobs"] = match front::logprobs_refused(engine) {
+        None => json!({ "served": true, "top_max": lloom::nn::MAX_TOP_LOGPROBS }),
+        Some(why) => json!({ "served": false, "top_max": lloom::nn::MAX_TOP_LOGPROBS,
+                             "refused": why }),
+    };
     body["chat_template_reads"] = ENGINE_KWARGS
         .iter()
         .map(|&k| (k.to_string(), json!(engine.template_reads(k))))
@@ -2937,6 +3014,7 @@ pub fn bench(args: BenchArgs) -> Result<()> {
         model_name: model_name.clone(),
         sampling,
         front,
+        reuse: parking_lot::Mutex::new(crate::turn::Tally::default()),
     };
     let batch = options.scheduler.max_sequences.max(1);
     for run in 0..options.bench.runs.max(1) {

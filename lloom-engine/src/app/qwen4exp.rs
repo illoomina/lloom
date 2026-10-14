@@ -1166,6 +1166,7 @@ impl<P: QwenShape, R: ExpertResidency + HasStreamStats + Send + Sync + 'static> 
             reuse: done.reuse,
             reused: done.reused,
             prefilled: done.prefilled,
+            turn: done.turn,
             readback: ReadbackArm::Batched {
                 rows: done.joined_beside,
             },
@@ -1305,6 +1306,9 @@ impl<P: QwenShape, R: ExpertResidency + HasStreamStats + Send + Sync + 'static> 
     }
     fn readback(&self) -> ReadbackArm {
         self.readback
+    }
+    fn reuse_prefix(&self) -> Option<bool> {
+        Some(self.reuse_prefix)
     }
     fn prefill_tile(&self) -> usize {
         self.prefill_tile

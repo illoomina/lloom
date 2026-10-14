@@ -253,6 +253,7 @@ fn decoded(engine: &Stub, ids: Vec<u32>) -> Decoded {
         reuse: ReuseAction::Fresh,
         reused: 0,
         prefilled: 0,
+        turn: Default::default(),
         readback: ReadbackArm::Blocking,
         logits_sha256: None,
         stats: Default::default(),
@@ -609,7 +610,7 @@ fn two_conversations_answering_the_same_text_keep_their_own_reasoning() {
     for reversed in [false, true] {
         let engine = Stub::qwen4exp();
         let front = restoring(&engine);
-        let mut convs = vec![
+        let mut convs = [
             (
                 "Is it raining?",
                 "Clouds",
@@ -666,7 +667,7 @@ fn the_same_text_sampled_as_different_ids_splices_each_conversations_own() {
             canonical,
             "the precondition: two tokenizations"
         );
-        let mut convs = vec![
+        let mut convs = [
             (json!([user("Spell it.")]), bytes(text)),
             (json!([user("Say it.")]), canonical),
         ];
@@ -744,6 +745,10 @@ fn an_edited_earlier_message_makes_the_reply_unverified() {
     );
 }
 
+/// A reasoning case: its name, the reply message, the request's extra
+/// template variables, and whether the log restores.
+type Case<'a> = (&'a str, Value, Vec<(&'a str, Value)>, bool);
+
 /// What a history message says about its reasoning decides, under `log`:
 /// absent is restored; `null`, `""` and an explicit strip are kept as sent
 /// and counted; a reply whose reasoning the template keeps after the last
@@ -753,7 +758,7 @@ fn absent_null_empty_and_stripped_reasoning_are_distinct() {
     let engine = Stub::qwen4exp();
     let q = json!([user("2+2?")]);
     let sampled = reasoned("Add them.\n", "\n\nFour.");
-    let cases: Vec<(&str, Value, Vec<(&str, Value)>, bool)> = vec![
+    let cases: [Case; 4] = [
         ("absent", assistant("Four."), vec![], true),
         (
             "null",

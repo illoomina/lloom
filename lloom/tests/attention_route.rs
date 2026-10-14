@@ -239,6 +239,17 @@ fn a_refused_request_allocates_nothing() -> Result<()> {
         "a mask the route was not prepared for"
     );
 
+    // A route prepared for an additive mask, called without one, is refused:
+    // the tiled kernel would otherwise serve it unmasked.
+    let masked = prepare(&dev, spec(64, DType::F16, MaskKind::Additive))?;
+    let before = requested(&dev)?;
+    assert!(ops::attention(&q, &k, &v, None, 0.125, &masked).is_err());
+    assert_eq!(
+        requested(&dev)?,
+        before,
+        "the mask the route was prepared for, missing"
+    );
+
     // The unrouted op at a head dim no kernel instantiates.
     let g = Inputs::new(48, 1, 33);
     let (q48, k48, v48) = g.tensors(DType::F16, &dev)?;

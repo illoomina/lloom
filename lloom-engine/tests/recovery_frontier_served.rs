@@ -82,6 +82,7 @@ struct Turn {
     stop: Stop,
     overrun: usize,
     stopped_by_flag: bool,
+    stopped_by_eos_watch: bool,
     reuse: ReuseAction,
     prefilled: usize,
     /// The session's token log after the request.
@@ -140,6 +141,7 @@ fn serve(
             stop: decoded.stop,
             overrun: decoded.stats.overrun,
             stopped_by_flag: decoded.stats.stopped_by_flag,
+            stopped_by_eos_watch: decoded.stats.stopped_by_eos_watch,
             reuse: decoded.reuse,
             prefilled: decoded.prefilled,
         });
@@ -316,6 +318,89 @@ fn a_host_stop_keeps_what_the_loop_produced_past_it() -> Result<()> {
                 "{label}: the log holds at least what the client saw"
             );
         }
+    }
+    Ok(())
+}
+
+/// The adaptive commit with the loop's own EOS watch (the `decode.ring.eos_watch`
+/// arm, installed into this test's process before anything reads the
+/// tuning): the consumer slow by 1 s no longer moves the overrun; the watch
+/// stops the loop within `adaptive_lead + 1` forwards of the EOS while the
+/// engine's reader is still in the hook, and the reader then finishes the
+/// reply. Without the gate those forwards still write the state, so the
+/// next request is not `Extend` unless the overrun is the window's one step;
+/// it answers as its reuse says.
+#[test]
+fn the_eos_watch_bounds_the_served_overrun_past_a_slow_consumer() -> Result<()> {
+    lloom::tuning::install(lloom::tuning::Tuning {
+        ring: lloom::tuning::RingTuning {
+            eos_watch: true,
+            ..Default::default()
+        },
+        ..Default::default()
+    })
+    .expect("the tuning is installed before anything reads it");
+    let _ = lloom_tensor::tuning::pin_regime(lloom_tensor::tuning::Contract::Deterministic);
+    let dev = Device::new_metal(0)?;
+    let (model, cfg) = model(&dev)?;
+    let prompt: Vec<u32> = vec![1, 3, 5, 7, 9];
+    let stream = serve(
+        &model,
+        &cfg,
+        &dev,
+        "blocking",
+        u32::MAX,
+        &[req(prompt.clone(), 32)],
+        None,
+        SLOW,
+    )?
+    .remove(0)
+    .ids;
+    let cut = (6..stream.len())
+        .find(|&i| !stream[..i].contains(&stream[i]))
+        .expect("a fresh id to stop on");
+    let eos = stream[cut];
+    let reply = stream[..cut].to_vec();
+    let next: Vec<u32> = [prompt.clone(), reply.clone(), vec![10, 20, 30]].concat();
+    let requests = vec![req(prompt.clone(), 3000), req(next, 8)];
+    let want = serve(&model, &cfg, &dev, "blocking", eos, &requests, None, SLOW)?;
+    let fresh = serve(&model, &cfg, &dev, "blocking", eos, &requests[1..], None, SLOW)?.remove(0);
+    let lead = lloom::nn::DecodeOptions {
+        adaptive_commit: true,
+        run_ahead: 8,
+        ..lloom::nn::DecodeOptions::new(1)
+    }
+    .adaptive_lead();
+    for slow in [None, Some(cut)] {
+        let got = serve(&model, &cfg, &dev, "ring-nonblocking", eos, &requests, slow, SLOW)?;
+        let at = format!("watched ring-nonblocking slow={}", slow.is_some());
+        eprintln!(
+            "FRONTIER-WATCH-SERVED {at}: overrun {} (lead {lead}) stopped_by_eos_watch {} \
+             stopped_by_flag {} | next request {:?} prefilled {}",
+            got[0].overrun,
+            got[0].stopped_by_eos_watch,
+            got[0].stopped_by_flag,
+            got[1].reuse,
+            got[1].prefilled,
+        );
+        assert_eq!(got[0].ids, want[0].ids, "{at}: the reply");
+        assert_eq!(got[0].stop, Stop::Eos, "{at}");
+        assert!(
+            got[0].overrun <= lead + 1,
+            "{at}: the watch bounds the overrun by the lead"
+        );
+        if slow.is_some() {
+            assert!(
+                got[0].stopped_by_eos_watch && !got[0].stopped_by_flag,
+                "{at}: the watch, not the slow consumer's flag, stopped it"
+            );
+        }
+        let continued = if got[1].reuse == ReuseAction::Fresh {
+            &fresh.ids
+        } else {
+            &want[1].ids
+        };
+        assert_eq!(&got[1].ids, continued, "{at}: the continued reply");
     }
     Ok(())
 }

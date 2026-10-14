@@ -12,7 +12,9 @@
 use lloom::generation::{Blocking, LogitsProcessor, Sampling};
 use lloom::models::qwen3_5::testing::{gguf_bytes, gguf_metadata, Qwen3_5MoeTiny, Qwen3_5Tiny};
 use lloom::models::qwen3_5::{Config, LoadOptions, Qwen3_5, Qwen3_5Moe};
-use lloom::nn::decoder::{DecodeRecovery, Layer, StateCapacity};
+#[cfg(feature = "metal")]
+use lloom::nn::decoder::DecodeRecovery;
+use lloom::nn::decoder::{Layer, StateCapacity};
 use lloom::nn::model::CausalLM;
 use lloom::nn::mtp::{NextnDrafter, NextnHead};
 use lloom::nn::speculator::{Draft, KvSource, NextnHidden, Probes, SeqId, Speculator};

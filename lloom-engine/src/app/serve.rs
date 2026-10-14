@@ -2356,7 +2356,7 @@ struct StreamWriter {
     /// wraps what is pending itself so a control event keeps its place.
     wrap: Option<Wrap>,
     /// The producer's spill (`DeltaBuffer::push`); only the producer locks it.
-    spill: Mutex<String>,
+    spill: parking_lot::Mutex<String>,
 }
 
 type Wrap = Arc<dyn Fn(&str) -> String + Send + Sync>;
@@ -2428,7 +2428,7 @@ impl StreamWriter {
             thread: Some(thread),
             deltas,
             wrap,
-            spill: Mutex::new(String::new()),
+            spill: parking_lot::Mutex::new(String::new()),
         }
     }
 
@@ -2436,7 +2436,7 @@ impl StreamWriter {
     /// writer started with deltas): no wait, no syscall, no allocation.
     fn delta(&self, text: &str) {
         if let Some(b) = &self.deltas {
-            b.push(&mut lock(&self.spill), text);
+            b.push(&mut self.spill.lock(), text);
         }
     }
 
@@ -2444,7 +2444,7 @@ impl StreamWriter {
     /// next on the channel. Off the per-token path (a control event).
     fn queue_pending(&self) {
         if let (Some(b), Some(wrap), Some(tx)) = (&self.deltas, &self.wrap, &self.tx) {
-            b.flush(&mut lock(&self.spill));
+            b.flush(&mut self.spill.lock());
             let mut text = String::new();
             if b.take_into(&mut text) {
                 let _ = tx.send(wrap(&text));
@@ -2479,7 +2479,7 @@ impl StreamWriter {
     /// first write error, if any.
     fn finish(mut self) -> Result<(ChunkedWriter, Option<std::io::Error>)> {
         if let Some(b) = &self.deltas {
-            b.flush(&mut lock(&self.spill));
+            b.flush(&mut self.spill.lock());
         }
         drop(self.tx.take());
         let handle = self
@@ -2495,7 +2495,7 @@ impl StreamWriter {
 impl Drop for StreamWriter {
     fn drop(&mut self) {
         if let Some(b) = &self.deltas {
-            b.flush(&mut lock(&self.spill));
+            b.flush(&mut self.spill.lock());
         }
         drop(self.tx.take());
         if let Some(h) = self.thread.take() {
@@ -3551,6 +3551,112 @@ mod stream_writer_tests {
             .map(|(_, s)| s)
             .collect();
         assert_eq!(body, "ctl<ab>mid<c>", "{out:?}");
+    }
+
+    /// A writer whose writes wait on a gate (a client that stops reading),
+    /// or fail (a client that went away).
+    #[derive(Clone, Default)]
+    struct Gate {
+        open: Arc<(parking_lot::Mutex<bool>, parking_lot::Condvar)>,
+        written: Arc<Mutex<Vec<u8>>>,
+        writes: Arc<std::sync::atomic::AtomicUsize>,
+        fail: bool,
+    }
+    impl Write for Gate {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            if self.fail {
+                return Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "gone"));
+            }
+            self.writes
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let (m, c) = &*self.open;
+            let mut open = m.lock();
+            while !*open {
+                c.wait(&mut open);
+            }
+            self.written.lock().unwrap().extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn body(out: &[u8]) -> String {
+        String::from_utf8(out.to_vec())
+            .unwrap()
+            .split("\r\n")
+            .enumerate()
+            .filter(|(i, _)| i % 2 == 1)
+            .map(|(_, s)| s.to_string())
+            .collect()
+    }
+
+    /// A client that stops reading: the decode thread's hand-over never
+    /// waits on it, and what waits is the text handed over since the last
+    /// write — at most what was pushed, each byte once (no cumulative
+    /// snapshots), every byte delivered in order once the client reads.
+    /// The control channel is the other queue, and it is unbounded: what
+    /// this asserts is the text's backlog, not the channel's.
+    #[test]
+    fn a_client_that_stops_reading_holds_back_at_most_what_was_pushed() {
+        let gate = Gate::default();
+        let w = ChunkedWriter {
+            w: Box::new(gate.clone()),
+        };
+        let sw = StreamWriter::start_with_deltas(w, |t: &str| t.to_string());
+        sw.send("start".to_string());
+        while gate.writes.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            std::thread::yield_now();
+        }
+        let mut pushed = String::new();
+        for i in 0..2000 {
+            let frag = format!("{i:04},");
+            pushed.push_str(&frag);
+            sw.delta(&frag);
+        }
+        let backlog = sw.deltas.as_ref().unwrap().pending_bytes() + sw.spill.lock().len();
+        assert_eq!(
+            backlog,
+            pushed.len(),
+            "nothing taken while the writer waits, nothing twice"
+        );
+        {
+            let (m, c) = &*gate.open;
+            *m.lock() = true;
+            c.notify_all();
+        }
+        let (_w, err) = sw.finish().unwrap();
+        assert!(err.is_none());
+        assert_eq!(
+            body(&gate.written.lock().unwrap()),
+            format!("start{pushed}")
+        );
+    }
+
+    /// A client that went away: the failed write is latched, the producer
+    /// reads it (`client_gone`), and `finish` returns the error.
+    #[test]
+    fn a_client_that_went_away_is_reported_to_the_producer() {
+        let gate = Gate {
+            fail: true,
+            ..Gate::default()
+        };
+        let w = ChunkedWriter {
+            w: Box::new(gate.clone()),
+        };
+        let sw = StreamWriter::start_with_deltas(w, |t: &str| t.to_string());
+        sw.delta("a");
+        let t = std::time::Instant::now();
+        while !sw.client_gone() {
+            assert!(
+                t.elapsed() < std::time::Duration::from_secs(10),
+                "never latched"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let (_w, err) = sw.finish().unwrap();
+        assert_eq!(err.map(|e| e.kind()), Some(std::io::ErrorKind::BrokenPipe));
     }
 }
 

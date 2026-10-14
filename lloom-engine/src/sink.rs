@@ -70,6 +70,12 @@ impl DeltaBuffer {
         self.dirty.store(true, Ordering::Release);
     }
 
+    /// Bytes handed over and not yet taken: the backlog a slow consumer
+    /// leaves (a lock; off the per-token path).
+    pub fn pending_bytes(&self) -> usize {
+        self.buf.lock().len()
+    }
+
     /// Swap what accumulated into `out` (cleared first; both strings keep
     /// their capacity). Returns whether anything was taken.
     pub fn take_into(&self, out: &mut String) -> bool {

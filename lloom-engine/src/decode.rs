@@ -727,16 +727,18 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
         let mut cancelled = false;
 
         // The streaming hook, shared by every arm: decode only the
-        // not-yet-emitted tokens, hold a run ending mid-character, and let a
-        // stop string end the run (`TextStream`).
+        // not-yet-emitted tokens, hold a run ending mid-character or on what
+        // may begin a stop string, and let a stop string end the run
+        // (`TextStream::publish`).
         let mut on_tokens = |batch: &[u32]| -> Result<bool> {
-            if let Some(chunk) = stream.push(batch, &mut detokenize)? {
+            let (chunk, stopped) = stream.publish(batch, &mut detokenize, &params.stop_strings)?;
+            if let Some(chunk) = chunk {
                 if !on_fragment(&chunk) {
                     cancelled = true;
                     return Ok(false);
                 }
             }
-            if stream.hit_stop(&params.stop_strings) {
+            if stopped {
                 stopped_on_string = true;
                 return Ok(false);
             }
@@ -935,6 +937,13 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
         } else {
             Stop::Length
         };
+        // A run that ended short of the stop string hands out what was held
+        // as its possible beginning.
+        if !cancelled && !stopped_on_string {
+            if let Some(rest) = stream.held() {
+                on_fragment(&rest);
+            }
+        }
 
         let (text, _) = stream.finish(&params.stop_strings);
         let thinking = params.thinking.as_ref().map(|b| b.report(&out.ids));
@@ -1026,14 +1035,15 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
             if stop.load(std::sync::atomic::Ordering::Acquire) {
                 return Ok(());
             }
-            if let Some(chunk) = stream.push(batch, &mut detokenize)? {
+            let (chunk, stopped) = stream.publish(batch, &mut detokenize, &params.stop_strings)?;
+            if let Some(chunk) = chunk {
                 if !on_fragment(&chunk) {
                     cancelled = true;
                     stop.store(true, std::sync::atomic::Ordering::Release);
                     return Ok(());
                 }
             }
-            if stream.hit_stop(&params.stop_strings) {
+            if stopped {
                 stopped_on_string = true;
                 stop.store(true, std::sync::atomic::Ordering::Release);
             }
@@ -1072,6 +1082,11 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
         } else {
             Stop::Length
         };
+        if !cancelled && !stopped_on_string {
+            if let Some(rest) = stream.held() {
+                on_fragment(&rest);
+            }
+        }
         let (text, _) = stream.finish(&params.stop_strings);
         let thinking = params.thinking.as_ref().map(|b| b.report(&out.ids));
         Ok(Decoded {

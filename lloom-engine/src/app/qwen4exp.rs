@@ -1131,14 +1131,16 @@ impl<P: QwenShape, R: ExpertResidency + HasStreamStats + Send + Sync + 'static> 
                     if cancel.load(Ordering::Acquire) {
                         continue;
                     }
-                    if let Some(chunk) = stream.push(&ids, &mut detok)? {
+                    let (chunk, stopped) =
+                        stream.publish(&ids, &mut detok, &params.stop_strings)?;
+                    if let Some(chunk) = chunk {
                         if !on_fragment(&chunk) {
                             cancelled = true;
                             cancel.store(true, Ordering::Release);
                             continue;
                         }
                     }
-                    if stream.hit_stop(&params.stop_strings) {
+                    if stopped {
                         stopped_on_string = true;
                         cancel.store(true, Ordering::Release);
                     }
@@ -1157,6 +1159,11 @@ impl<P: QwenShape, R: ExpertResidency + HasStreamStats + Send + Sync + 'static> 
         } else {
             Stop::Length
         };
+        if stop != Stop::Cancelled && !stopped_on_string {
+            if let Some(rest) = stream.held() {
+                on_fragment(&rest);
+            }
+        }
         let (text, _) = stream.finish(&params.stop_strings);
         Ok(Decoded {
             text,

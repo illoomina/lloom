@@ -2421,6 +2421,234 @@ fn serve_returns_text_unless_ids_or_logprobs_are_asked() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// A stop string never reaches a streaming client: the streamed deltas,
+/// joined, are the unstreamed reply cut before the stop, and carry no part
+/// of it (`TextStream::publish` holds what may begin one).
+#[test]
+fn a_streamed_reply_never_carries_its_stop_string() {
+    let (dir, model, base) = qwen_tiny("stream-stop");
+    let server = Server::start(&model, &base.iter().map(String::as_str).collect::<Vec<_>>());
+    let req = |stop: Option<&str>, stream: bool| {
+        json!({ "messages": [{ "role": "user", "content": PROMPT }], "temperature": 0,
+                "max_tokens": 16, "ignore_eos": true, "enable_thinking": false,
+                "stop": stop, "stream": stream })
+    };
+    let (status, full) = server.call("POST", "/v1/chat/completions", &req(None, false));
+    assert_eq!(status, 200, "{full}");
+    let text = full["choices"][0]["message"]["content"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let chars: Vec<char> = text.chars().collect();
+    assert!(chars.len() >= 6, "a reply long enough to cut: {text:?}");
+    let stop: String = chars[3..5].iter().collect();
+    let cut = &text[..text.find(&stop).unwrap()];
+    let (status, unstreamed) =
+        server.call("POST", "/v1/chat/completions", &req(Some(&stop), false));
+    assert_eq!(status, 200, "{unstreamed}");
+    assert_eq!(
+        unstreamed["choices"][0]["message"]["content"], cut,
+        "{unstreamed}"
+    );
+    let events = sse(&server, &req(Some(&stop), true));
+    let streamed: String = events
+        .iter()
+        .filter_map(|e| e["choices"][0]["delta"]["content"].as_str())
+        .collect();
+    assert_eq!(streamed, cut, "stop {stop:?} in {text:?}");
+    assert!(!streamed.contains(&stop));
+    let last = events.last().unwrap();
+    assert_eq!(last["choices"][0]["finish_reason"], "stop", "{last}");
+    drop(server);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A streamed request whose client goes away publishes nothing into the
+/// next request: the next reply is a fresh server's, id for id.
+#[test]
+fn a_cancelled_stream_leaves_nothing_in_the_next_reply() {
+    let (dir, model, base) = qwen_tiny("stream-cancel");
+    let args: Vec<&str> = base.iter().map(String::as_str).collect();
+    let next = json!({ "messages": [{ "role": "user", "content": "Something else?" }],
+                       "temperature": 0, "max_tokens": 8, "enable_thinking": false,
+                       "return_token_ids": true });
+    let reference = {
+        let fresh = Server::start(&model, &args);
+        let (status, r) = fresh.call("POST", "/v1/chat/completions", &next);
+        assert_eq!(status, 200, "{r}");
+        r
+    };
+    let server = Server::start(&model, &args);
+    {
+        let mut s = std::net::TcpStream::connect(("127.0.0.1", server.port)).unwrap();
+        let body = json!({ "messages": [{ "role": "user", "content": PROMPT }], "temperature": 0,
+                           "max_tokens": 4000, "ignore_eos": true, "stream": true,
+                           "enable_thinking": false })
+        .to_string();
+        write!(
+            s,
+            "POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .unwrap();
+        let mut first = [0u8; 256];
+        let n = s.read(&mut first).unwrap();
+        assert!(n > 0);
+        // Gone, mid-stream.
+    }
+    let (status, after) = server.call("POST", "/v1/chat/completions", &next);
+    assert_eq!(status, 200, "{after}");
+    assert_eq!(
+        after["choices"][0]["token_ids"], reference["choices"][0]["token_ids"],
+        "{after}"
+    );
+    assert_eq!(
+        after["choices"][0]["message"]["content"],
+        reference["choices"][0]["message"]["content"]
+    );
+    drop(server);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The same session continued after each way a reply stops, through the
+/// front end (`--prefix-reuse true`): the history carries the text the
+/// client got, and the turn report says what the session did with it.
+/// A length stop extends. A stop string leaves in the log every id the
+/// loop produced (the stop's included), so the next turn leaves the log
+/// where the delivered text ends and goes back to there (the window or a
+/// turn checkpoint) — what decision 42 prices.
+#[test]
+fn the_next_turn_continues_what_each_stop_left() {
+    let (dir, model, base) = qwen_tiny("stop-causes");
+    let mut args: Vec<&str> = base.iter().map(String::as_str).collect();
+    args.extend(["--prefix-reuse", "true"]);
+    let server = Server::start(&model, &args);
+    let turn = |messages: Value, extra: Value| {
+        // Letters only (the tiny model's own replies are lone bytes no
+        // whole-character cut can end on): `a`, `b` and `c` biased alike,
+        // the model's logits choosing among them.
+        let mut r = json!({ "messages": messages, "temperature": 0, "enable_thinking": false,
+                            "return_token_ids": true, "ignore_eos": true,
+                            "logit_bias": { "97": 100, "98": 100, "99": 100 } });
+        for (k, v) in extra.as_object().unwrap() {
+            r[k] = v.clone();
+        }
+        let (status, body) = server.call("POST", "/v1/chat/completions", &r);
+        assert_eq!(status, 200, "{body}");
+        body
+    };
+    let probe = turn(
+        json!([{ "role": "user", "content": "Probe." }]),
+        json!({ "max_tokens": 16 }),
+    );
+    let text = probe["choices"][0]["message"]["content"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    // A stop that first occurs a few letters in, so the delivered text is
+    // not empty.
+    let stop = (2..=6)
+        .flat_map(|w| (3..text.len().saturating_sub(w)).map(move |i| (i, w)))
+        .map(|(i, w)| (i, text[i..i + w].to_string()))
+        .find(|(i, s)| text.find(s.as_str()) == Some(*i))
+        .map(|(_, s)| s)
+        .unwrap_or_else(|| panic!("no stop first occurring past the third letter: {text:?}"));
+    for (cause, extra) in [
+        ("length", json!({ "max_tokens": 6 })),
+        ("stop", json!({ "max_tokens": 16, "stop": stop })),
+    ] {
+        let q = json!([{ "role": "user", "content": "Probe." }]);
+        let one = turn(q.clone(), extra);
+        let delivered = one["choices"][0]["message"]["content"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let p1 = one["prompt_token_ids"].as_array().unwrap().len();
+        let produced = one["choices"][0]["token_ids"].as_array().unwrap().len();
+        let two = turn(
+            json!([q[0], { "role": "assistant", "content": delivered },
+                   { "role": "user", "content": "Again." }]),
+            json!({ "max_tokens": 4 }),
+        );
+        let t = &two["timings"]["turn"];
+        eprintln!("STOP-CAUSE {cause}: delivered {delivered:?} produced {produced} turn {t}");
+        assert_eq!(
+            two["timings"]["history_matched"], 1,
+            "{cause}: the delivered reply is ours: {two}"
+        );
+        assert_eq!(
+            t["boundary"],
+            json!(p1 + produced),
+            "{cause}: the log is every id produced: {t}"
+        );
+        match cause {
+            "length" => assert_eq!(t["outcome"], "extend", "{t}"),
+            _ => {
+                assert!(
+                    matches!(t["outcome"].as_str(), Some("rewind" | "restore")),
+                    "{t}"
+                );
+                assert_eq!(t["reason"], "diverged", "{t}");
+                let at = t["diverged_at"].as_u64().unwrap() as usize;
+                assert!(at >= p1 && at < p1 + produced, "inside the reply: {t}");
+            }
+        }
+    }
+    drop(server);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A shutdown asked for while a request decodes: the process exits cleanly
+/// once the request's thread is done with the model, and the streaming
+/// client gets a complete reply or a cut connection, never a panic.
+#[test]
+fn shutdown_waits_for_the_request_that_holds_the_model() {
+    let (dir, model, base) = qwen_tiny("shutdown-busy");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_lloom"))
+        .args(["serve", "--model"])
+        .arg(&model)
+        .args(&base)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("lloom serve runs");
+    let mut line = String::new();
+    std::io::BufReader::new(child.stdout.take().unwrap())
+        .read_line(&mut line)
+        .unwrap();
+    let ready: Value = serde_json::from_str(&line).unwrap();
+    let port = ready["port"].as_u64().unwrap() as u16;
+    let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+    let body = json!({ "messages": [{ "role": "user", "content": PROMPT }], "temperature": 0,
+                       "max_tokens": 3000, "ignore_eos": true, "stream": true,
+                       "enable_thinking": false })
+    .to_string();
+    write!(
+        s,
+        "POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n\
+         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )
+    .unwrap();
+    let mut first = [0u8; 256];
+    assert!(s.read(&mut first).unwrap() > 0, "the stream started");
+    let mut c = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+    write!(
+        c,
+        "POST /shutdown HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}"
+    )
+    .unwrap();
+    let mut rest = Vec::new();
+    let _ = s.read_to_end(&mut rest);
+    let out = child.wait_with_output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    assert!(!stderr.contains("panicked"), "{stderr}");
+    assert!(stderr.contains("[shutdown requested]"), "{stderr}");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// The SSE events of a streamed chat request, `[DONE]` excluded.
 fn sse(server: &Server, body: &Value) -> Vec<Value> {
     let mut s = std::net::TcpStream::connect(("127.0.0.1", server.port)).unwrap();

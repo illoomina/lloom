@@ -1,0 +1,16 @@
+{
+  "source": "/Users/ocean/workspace/lloom-scratch/decision-947/reference/llama.cpp/gguf-audit/conversion/lfm2.py",
+  "source_sha256": "b8a178d22ec6cc510b45674af775bb24740c9cb7207e03b69bd877d7981d9ff7",
+  "helper_source": "/Users/ocean/workspace/lloom-scratch/decision-947/reference/llama.cpp/gguf-audit/conversion/base.py",
+  "helper_source_sha256": "a77abbf9ba0f2e593ab06c9f4f1fa66f96fd71590644662003b74bb9ac0fccf9",
+  "templates": {
+    "d1-systemone.jinja": {
+      "bytes": 1365,
+      "sha256": "b47201d762e02dcc447fe22f76d7375deb341d3f52714f2689b4c70e1de67a7e"
+    },
+    "d1-omni-systemone.jinja": {
+      "bytes": 1631,
+      "sha256": "f935b108a5412e582ce7c2f71d4caa3399a14735edcbf28eaed0735232ebfcb9"
+    }
+  }
+}

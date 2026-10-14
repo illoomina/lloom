@@ -834,14 +834,15 @@ fn a_planned_verify_keeps_the_drafters_taps_and_the_stream() -> Result<()> {
 }
 
 /// A base grow the machine cannot take is REFUSED before it is allocated
-/// (`DESIGN.md` §9.5, the KV grow's gate): the run stops with a message
-/// naming the key, nothing was allocated, and no plan was cached — so the
+/// (`DESIGN.md` §9.5, the KV grow's gate): the run stops with a typed
+/// budget refusal, nothing was allocated, and no plan was cached — so the
 /// pass would have run on the pool as it did before the cache existed.
 ///
 /// Driven by setting the admitted fraction to a value the process is already
 /// over, which is the same shape as a real machine being out of room.
 #[test]
 fn a_base_grow_over_the_budget_is_refused_before_it_allocates() -> Result<()> {
+    use lloom_tensor::memory_admission::{AllocationError, RefusalDomain};
     let _serial = SERIAL.lock();
     let dev = Device::new_metal(0)?;
     let Device::Metal(m) = &dev else {
@@ -857,15 +858,18 @@ fn a_base_grow_over_the_budget_is_refused_before_it_allocates() -> Result<()> {
     m.set_pass_plan_admit_fraction(1e-9);
     let err = run_prompt::<RewindableExact>(&model, &cfg, &dev, &prompt, 0, 3)
         .expect_err("the grow must be refused");
-    let msg = err.to_string();
-    assert!(
-        msg.contains("pass plan base grow refused"),
-        "the refusal must name itself: {msg}"
-    );
-    assert!(
-        msg.contains("Nothing was allocated"),
-        "the refusal must say the run is intact: {msg}"
-    );
+    eprintln!("REFUSED {:?}", err.allocation());
+    match err.allocation() {
+        Some(AllocationError::Refused {
+            requested,
+            available,
+            domain: RefusalDomain::Budget,
+        }) => assert!(
+            requested > 0 && available < requested,
+            "the base grow's refusal names its bytes and less room: {err}"
+        ),
+        _ => panic!("not a typed budget refusal of the base grow: {err}"),
+    }
     let c = m.pass_plan_counters().unwrap();
     assert_eq!(c.plans, 0, "a plan was cached over a refused base: {c:?}");
     assert_eq!(c.base_grows, 0, "the base grew after the refusal: {c:?}");

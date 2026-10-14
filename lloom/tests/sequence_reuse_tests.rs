@@ -783,3 +783,70 @@ fn two_sequences_interleaved_are_byte_identical_to_their_solo_runs() -> Result<(
     }
     Ok(())
 }
+
+/// Retained branching reuses the production paced prefill loop, but keeps its
+/// recurrent snapshot outside the finite turn ring. The fresh reference repeats
+/// the SAME tile split with ordinary context carry explicitly enabled. This is
+/// not a cross-partition bit-identity assertion.
+#[test]
+fn retained_request_survives_long_suffixes_and_preserves_lfm2_carry() -> Result<()> {
+    for (conv, kv) in [
+        (ConvState::Shuffle, KvAppend::Cat),
+        (ConvState::Shuffle, KvAppend::InPlace),
+        (ConvState::RotatingRing { k: 4 }, KvAppend::InPlace),
+        (ConvState::SlidingRing { k: 0, slack: 8 }, KvAppend::InPlace),
+    ] {
+        // Shipping flag remains false: only the private branching cache may
+        // enable context carry. Reuse the incumbent bounded fixture/loader.
+        let cfg = tiny_config(conv, kv, false);
+        let key = cfg.exact_key();
+        lloom::profile::dispatch!(key, lloom::profile::LFM2, P => retained_request_case::<P>(&cfg))?;
+    }
+    Ok(())
+}
+
+fn retained_request_case<P: Lfm2Shape>(cfg: &Config) -> Result<()> {
+    use lloom::nn::branch::BranchSession;
+    let dev = Device::Cpu;
+    let model = build::<P>(cfg, &dev)?;
+    let mut carried_cfg = cfg.clone();
+    carried_cfg.conv_prefill_ctx = true;
+    let reference = build::<P>(&carried_cfg, &dev)?;
+    let opts = DecodeOptions {
+        prefill_tile: 2,
+        ..DecodeOptions::new(1)
+    };
+    for trunk in [vec![], vec![3], vec![3, 9, 14, 21, 5, 30, 2]] {
+        let mut branch = BranchSession::new(&model, cfg, &dev)?;
+        let mut rb = Blocking::new(&[47], &dev)?;
+        branch.begin(&mut rb, &trunk, &opts)?;
+        let mut first = None;
+        for q in 0..12u32 {
+            // Last branch repeats the first after many destructive recurrent
+            // updates and turn-ring evictions; suffix length exceeds K/slack.
+            let arm = if q == 11 { 0 } else { q };
+            let suffix: Vec<u32> = (0..13).map(|i| 1 + (arm * 5 + i * 7) % 46).collect();
+            let got = branch.suffix(&mut rb, &suffix, &opts)?.to_vec1::<f32>()?;
+            let mut fresh = Session::new(&reference, reference.new_cache(&carried_cfg, &dev)?);
+            let mut reference_rb = Blocking::new(&[47], &dev)?;
+            fresh.prefill(&mut reference_rb, &trunk, &opts)?;
+            fresh.prefill(&mut reference_rb, &suffix, &opts)?;
+            let expected = fresh.last_logits().unwrap().to_vec1::<f32>()?;
+            assert_eq!(got.len(), 48);
+            assert_eq!(expected.len(), 48);
+            assert_eq!(got.iter().map(|x|x.to_bits()).collect::<Vec<_>>(),
+                expected.iter().map(|x|x.to_bits()).collect::<Vec<_>>(),
+                "retained state changed phase/history or KV prefix: {:?}/{:?}, trunk={}, branch={q}",cfg.conv_state,cfg.kv_append,trunk.len());
+            if q == 0 {
+                first = Some(got);
+            } else if q == 11 {
+                assert_eq!(got, first.take().unwrap(), "later suffix overwrote trunk");
+            }
+        }
+        branch.reset()?;
+        assert!(branch.suffix(&mut rb, &[2], &opts).is_err());
+    }
+    // Explicit source/config control: construction does not flip the model flag.
+    assert!(!cfg.conv_prefill_ctx);
+    Ok(())
+}

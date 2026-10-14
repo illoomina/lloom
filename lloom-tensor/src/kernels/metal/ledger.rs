@@ -20,7 +20,8 @@
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 
-use crate::machine::Holding;
+use crate::machine::{GrowRefusal, Holding, Verdict};
+use crate::memory_admission::{AllocationError, MachineFailure, RefusalDomain};
 
 pub use crate::memory_arbitration::{
     arbitrate, Arbitration, BulkYield, Claim, Class, Grant, LedgerSnapshot, TenantId, TenantRow,
@@ -297,9 +298,11 @@ impl Ledger {
 
     /// Admit `bytes` on the machine: inside what the process reserved,
     /// nothing is read; past it, the first reservation is widened by the
-    /// excess through the machine gate's arithmetic (`Holding::grow_to`), or
-    /// the refusal's text is returned. No reservation, nothing to check.
-    pub fn admit_machine(&self, bytes: u64) -> std::result::Result<(), String> {
+    /// excess through the machine gate's arithmetic (`Holding::try_grow_to`),
+    /// or refused as `Refused { domain: Machine }` with the growth and the
+    /// room. The arithmetic, which is text, stays with the holding
+    /// ([`Self::last_machine_refusal`]). No reservation, nothing to check.
+    pub fn admit_machine(&self, bytes: u64) -> std::result::Result<(), AllocationError> {
         let live: Vec<Arc<Holding>> = {
             let m = self.machine.lock();
             m.iter().filter_map(Weak::upgrade).collect()
@@ -311,10 +314,26 @@ impl Ledger {
         if bytes <= reserved {
             return Ok(());
         }
-        first
-            .grow_to(first.reserved() + (bytes - reserved))
-            .map(|_| ())
-            .map_err(|e| e.to_string())
+        match first.try_grow_to(first.reserved() + (bytes - reserved)) {
+            Ok(_) => Ok(()),
+            Err(GrowRefusal::Room(v)) => Err(AllocationError::Refused {
+                requested: usize::try_from(v.need).unwrap_or(usize::MAX),
+                available: usize::try_from(v.room().max(0)).unwrap_or(usize::MAX),
+                domain: RefusalDomain::Machine,
+            }),
+            Err(GrowRefusal::Unavailable(_)) => {
+                Err(AllocationError::Machine(MachineFailure::Unavailable))
+            }
+        }
+    }
+
+    /// The machine gate's verdict on the last growth it refused this
+    /// process, for a caller reporting the arithmetic. Cold.
+    pub fn last_machine_refusal(&self) -> Option<Verdict> {
+        let m = self.machine.lock();
+        m.iter()
+            .filter_map(Weak::upgrade)
+            .find_map(|h| h.last_refusal())
     }
 
     /// List `tenant` until its owner drops it.
@@ -716,6 +735,7 @@ mod device_tests {
 mod admit_tests {
     //! A pass-level admission that would refuse gives the pools' free lists
     //! back first and decides on the figure after (`MetalDevice::admit_bytes`).
+    use crate::memory_admission::{AllocationError, RefusalDomain};
     use crate::Device;
 
     #[test]
@@ -985,7 +1005,22 @@ mod admit_tests {
         // Past the room: refused with the gate's arithmetic, unmoved.
         let a = m.admit_bytes(20 * gb, budget);
         assert!(!a.fits, "{a:?}");
-        let why = a.machine.expect("the machine's refusal");
+        let refusal = a.machine.expect("the machine's refusal");
+        assert!(
+            matches!(
+                refusal,
+                AllocationError::Refused {
+                    domain: RefusalDomain::Machine,
+                    ..
+                }
+            ),
+            "{refusal:?}"
+        );
+        let why = m
+            .ledger()
+            .last_machine_refusal()
+            .expect("the holding keeps the refused verdict")
+            .describe();
         assert!(
             why.contains("the machine cannot hold this now") && why.contains("of growth"),
             "{why}"
@@ -1064,13 +1099,27 @@ mod admit_tests {
             reserved as u64,
             "admitted inside it, unwidened"
         );
-        // Past the reservation with nothing to give back: refused.
-        let a = m.admit_bytes(2 * reserved, usize::MAX);
+        // Past the reservation with nothing to give back: refused. The room is
+        // the injected `reserved` less this process's reservation not yet held
+        // (`reserved` minus its footprint), so it is at most `reserved`, and how
+        // much less depends on a footprint the test does not control: a growth
+        // past `2 * reserved` exceeds it whatever the footprint is.
+        let a = m.admit_bytes(3 * reserved, usize::MAX);
         assert!(!a.fits, "{a:?}");
         assert!(
-            a.machine
-                .as_deref()
-                .is_some_and(|w| w.contains("the machine cannot hold this now")),
+            matches!(
+                a.machine,
+                Some(AllocationError::Refused {
+                    domain: RefusalDomain::Machine,
+                    ..
+                })
+            ),
+            "{a:?}"
+        );
+        assert!(
+            m.ledger()
+                .last_machine_refusal()
+                .is_some_and(|v| v.describe().contains("the machine cannot hold this now")),
             "{a:?}"
         );
         assert_eq!(held.reserved(), reserved as u64);

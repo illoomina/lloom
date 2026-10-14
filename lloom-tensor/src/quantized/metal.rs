@@ -1,3 +1,12 @@
+//! Quantized storage on Metal.
+//!
+//! **Binding authority** (cited by every `unsafe` kernel or blit call here): a
+//! call binds this storage's weight buffer, owned for the storage's life; the
+//! operand and output storages of the op (the `metal_backend` module's
+//! authority); a staging buffer the call holds until its wait; or a streamed
+//! tier's staging entry, which its ring reuses only past the epoch stamped on
+//! it before the copy is encoded.
+
 use super::{GgmlDType, QStorage};
 use crate::backend::BackendStorage;
 use crate::kernels::metal::{Buffer, BufferHandle};
@@ -49,7 +58,8 @@ impl QMetalStorage {
         {
             let mut blit = device.blit_command_encoder()?;
             blit.set_label("qstorage_persistent_zero");
-            blit.fill_buffer(&buffer, (0, size), 0);
+            // SAFETY: binding authority (module head).
+            unsafe { blit.fill_buffer(&buffer, (0, size), 0) };
         }
         let device = device.allocated_output_device(&buffer)?;
         Ok(Self {
@@ -83,7 +93,8 @@ impl QMetalStorage {
         {
             let mut blit = self.device.blit_command_encoder()?;
             blit.set_label("blit_to_cpu");
-            blit.copy_from_buffer(&self.buffer, 0, &buffer, 0, self.buffer.length());
+            // SAFETY: binding authority (module head).
+            unsafe { blit.copy_from_buffer(&self.buffer, 0, &buffer, 0, self.buffer.length()) };
         }
         self.device.flush_and_wait_current()?;
         let mut out = vec![0.0; elem_count];
@@ -352,19 +363,22 @@ impl QMetalStorage {
             .with_label("qembedding")
             .build()?;
         let encoder = device.command_encoder()?;
-        crate::kernels::call_quantized_get_rows(
-            device.device(),
-            &encoder,
-            device.kernels(),
-            self.dtype.into(),
-            hidden,
-            hidden * self.dtype.type_size() / self.dtype.block_size(),
-            ids_len,
-            &self.buffer,
-            ids.buffer(),
-            ids_l.start_offset() * DType::U32.size_in_bytes(),
-            &dst,
-        )
+        // SAFETY: binding authority (module head).
+        unsafe {
+            crate::kernels::call_quantized_get_rows(
+                device.device(),
+                &encoder,
+                device.kernels(),
+                self.dtype.into(),
+                hidden,
+                hidden * self.dtype.type_size() / self.dtype.block_size(),
+                ids_len,
+                &self.buffer,
+                ids.buffer(),
+                ids_l.start_offset() * DType::U32.size_in_bytes(),
+                &dst,
+            )
+        }
         .map_err(MetalError::from)?;
         Ok(MetalStorage::new_allocated(
             dst,
@@ -465,19 +479,22 @@ impl QMetalStorage {
         // activation rows on the grid's second axis (`ne11`, stepped by
         // `nb11`), each row its own dot products — what a launch per row
         // computes, without the launch per row (a decode batch's `B` rows).
-        crate::kernels::call_quantized_matmul_mv_t(
-            device.device(),
-            &encoder,
-            device.kernels(),
-            ggml_dtype,
-            triple,
-            (1, m, n, k),
-            storage.buffer(),
-            layout.start_offset() * storage.dtype().size_in_bytes(),
-            &self.buffer,
-            0,
-            &dst,
-        )
+        // SAFETY: binding authority (module head).
+        unsafe {
+            crate::kernels::call_quantized_matmul_mv_t(
+                device.device(),
+                &encoder,
+                device.kernels(),
+                ggml_dtype,
+                triple,
+                (1, m, n, k),
+                storage.buffer(),
+                layout.start_offset() * storage.dtype().size_in_bytes(),
+                &self.buffer,
+                0,
+                &dst,
+            )
+        }
         .map_err(MetalError::from)?;
         let dst_storage = crate::MetalStorage::new_allocated(
             dst,
@@ -522,19 +539,22 @@ impl QMetalStorage {
                     .with_size_for(n, DType::F32)
                     .with_label("qmatmul_store")
                     .build()?;
-                crate::kernels::call_quantized_matmul_mv_store(
-                    device.device(),
-                    &encoder,
-                    device.kernels(),
-                    ggml_dtype,
-                    (n, k),
-                    storage.buffer(),
-                    lhs_offset,
-                    &self.buffer,
-                    0,
-                    &dst,
-                    store,
-                )
+                // SAFETY: binding authority (module head).
+                unsafe {
+                    crate::kernels::call_quantized_matmul_mv_store(
+                        device.device(),
+                        &encoder,
+                        device.kernels(),
+                        ggml_dtype,
+                        (n, k),
+                        storage.buffer(),
+                        lhs_offset,
+                        &self.buffer,
+                        0,
+                        &dst,
+                        store,
+                    )
+                }
                 .map_err(MetalError::from)?;
                 Ok(Some(crate::MetalStorage::new_allocated(
                     dst,
@@ -550,19 +570,22 @@ impl QMetalStorage {
                 {
                     crate::bail!("quantized matvec store block: the destination is not a contiguous f32 [{n}], {dst_layout:?}")
                 }
-                crate::kernels::call_quantized_matmul_mv_store(
-                    device.device(),
-                    &encoder,
-                    device.kernels(),
-                    ggml_dtype,
-                    (n, k),
-                    storage.buffer(),
-                    lhs_offset,
-                    &self.buffer,
-                    dst_layout.start_offset() * DType::F32.size_in_bytes(),
-                    dst.buffer(),
-                    store,
-                )
+                // SAFETY: binding authority (module head).
+                unsafe {
+                    crate::kernels::call_quantized_matmul_mv_store(
+                        device.device(),
+                        &encoder,
+                        device.kernels(),
+                        ggml_dtype,
+                        (n, k),
+                        storage.buffer(),
+                        lhs_offset,
+                        &self.buffer,
+                        dst_layout.start_offset() * DType::F32.size_in_bytes(),
+                        dst.buffer(),
+                        store,
+                    )
+                }
                 .map_err(MetalError::from)?;
                 Ok(None)
             }
@@ -659,15 +682,18 @@ impl QMetalStorage {
         // encoder's hazard chain orders each stem's dequant after the
         // previous stem's GEMM read of it.
         if let Some(scratch) = dequant_scratch_buf {
-            crate::kernels::call_quantized_dequant_rows_f16(
-                device.device(),
-                &encoder,
-                device.kernels(),
-                self.dtype.into(),
-                (n_rows_w, k_w),
-                &self.buffer,
-                &scratch,
-            )
+            // SAFETY: binding authority (module head).
+            unsafe {
+                crate::kernels::call_quantized_dequant_rows_f16(
+                    device.device(),
+                    &encoder,
+                    device.kernels(),
+                    self.dtype.into(),
+                    (n_rows_w, k_w),
+                    &self.buffer,
+                    &scratch,
+                )
+            }
             .map_err(MetalError::from)?;
             // The steel gemm over the scratch (`LLOOM_QMM_DEQUANT_GEMM=steel`,
             // the A/B arm): the activations cast to half once (the quantized
@@ -682,36 +708,42 @@ impl QMetalStorage {
                     .with_size_for(rows_total * k, DType::F16)
                     .with_label("qmatmul_x16")
                     .build()?;
-                crate::kernels::call_cast_contiguous(
-                    device.device(),
-                    &encoder,
-                    device.kernels(),
-                    "cast_f32_f16",
-                    DType::F32.size_in_bytes(),
-                    rows_total * k,
-                    crate::kernels::BufferOffset {
-                        buffer: storage.buffer(),
-                        offset_in_bytes: layout.start_offset() * DType::F32.size_in_bytes(),
-                    },
-                    &x16,
-                )
+                // SAFETY: binding authority (module head).
+                unsafe {
+                    crate::kernels::call_cast_contiguous(
+                        device.device(),
+                        &encoder,
+                        device.kernels(),
+                        "cast_f32_f16",
+                        DType::F32.size_in_bytes(),
+                        rows_total * k,
+                        crate::kernels::BufferOffset {
+                            buffer: storage.buffer(),
+                            offset_in_bytes: layout.start_offset() * DType::F32.size_in_bytes(),
+                        },
+                        &x16,
+                    )
+                }
                 .map_err(MetalError::from)?;
-                crate::kernels::call_mlx_gemm_out(
-                    device.device(),
-                    &encoder,
-                    device.kernels(),
-                    crate::kernels::GemmDType::F16,
-                    crate::kernels::GemmDType::F32,
-                    (1, rows_total, n, k),
-                    &[k, 1],
-                    0,
-                    &x16,
-                    // The weight `[n, k]` read as `[k, n]`: transposed.
-                    &[1, k],
-                    0,
-                    &scratch,
-                    &dst,
-                )
+                // SAFETY: binding authority (module head).
+                unsafe {
+                    crate::kernels::call_mlx_gemm_out(
+                        device.device(),
+                        &encoder,
+                        device.kernels(),
+                        crate::kernels::GemmDType::F16,
+                        crate::kernels::GemmDType::F32,
+                        (1, rows_total, n, k),
+                        &[k, 1],
+                        0,
+                        &x16,
+                        // The weight `[n, k]` read as `[k, n]`: transposed.
+                        &[1, k],
+                        0,
+                        &scratch,
+                        &dst,
+                    )
+                }
                 .map_err(MetalError::from)?;
                 drop(encoder);
                 let dst_storage = MetalStorage::new_allocated(
@@ -731,30 +763,33 @@ impl QMetalStorage {
             let src1_l = crate::Layout::contiguous(
                 [vec![1; 4 - src_shape.rank()], src_shape.dims().to_vec()].concat(),
             );
-            crate::kernels::call_quantized_matmul_mm_t(
-                device.device(),
-                &encoder,
-                device.kernels(),
-                crate::kernels::GgmlDType::F16,
-                src0_l.dims(),
-                &src0_stride,
-                &scratch,
-                0,
-                src1_l.dims(),
-                &src1_l
-                    .stride()
-                    .iter()
-                    .map(|x| x * DType::F32.size_in_bytes())
-                    .collect::<Vec<_>>(),
-                storage.buffer(),
-                // The activation view's own offset: `src1_l` is a fresh contiguous
-                // layout (offset 0) for the strides, and a row view (`narrow`) starts
-                // inside its buffer.
-                layout.start_offset() * storage.dtype().size_in_bytes(),
-                dst_shape.dims(),
-                0,
-                &dst,
-            )
+            // SAFETY: binding authority (module head).
+            unsafe {
+                crate::kernels::call_quantized_matmul_mm_t(
+                    device.device(),
+                    &encoder,
+                    device.kernels(),
+                    crate::kernels::GgmlDType::F16,
+                    src0_l.dims(),
+                    &src0_stride,
+                    &scratch,
+                    0,
+                    src1_l.dims(),
+                    &src1_l
+                        .stride()
+                        .iter()
+                        .map(|x| x * DType::F32.size_in_bytes())
+                        .collect::<Vec<_>>(),
+                    storage.buffer(),
+                    // The activation view's own offset: `src1_l` is a fresh contiguous
+                    // layout (offset 0) for the strides, and a row view (`narrow`) starts
+                    // inside its buffer.
+                    layout.start_offset() * storage.dtype().size_in_bytes(),
+                    dst_shape.dims(),
+                    0,
+                    &dst,
+                )
+            }
             .map_err(MetalError::from)?;
             let dst_storage = MetalStorage::new_allocated(
                 dst,
@@ -783,30 +818,33 @@ impl QMetalStorage {
             [vec![1; 4 - src_shape.rank()], src_shape.dims().to_vec()].concat(),
         );
 
-        crate::kernels::call_quantized_matmul_mm_t(
-            device.device(),
-            &encoder,
-            device.kernels(),
-            self.dtype.into(),
-            src0_l.dims(),
-            &src0_stride,
-            &self.buffer,
-            0,
-            src1_l.dims(),
-            &src1_l
-                .stride()
-                .iter()
-                .map(|x| x * DType::F32.size_in_bytes())
-                .collect::<Vec<_>>(),
-            storage.buffer(),
-            // The activation view's own offset: `src1_l` is a fresh contiguous
-            // layout (offset 0) for the strides, and a row view (`narrow`) starts
-            // inside its buffer.
-            layout.start_offset() * storage.dtype().size_in_bytes(),
-            dst_shape.dims(),
-            0,
-            &dst,
-        )
+        // SAFETY: binding authority (module head).
+        unsafe {
+            crate::kernels::call_quantized_matmul_mm_t(
+                device.device(),
+                &encoder,
+                device.kernels(),
+                self.dtype.into(),
+                src0_l.dims(),
+                &src0_stride,
+                &self.buffer,
+                0,
+                src1_l.dims(),
+                &src1_l
+                    .stride()
+                    .iter()
+                    .map(|x| x * DType::F32.size_in_bytes())
+                    .collect::<Vec<_>>(),
+                storage.buffer(),
+                // The activation view's own offset: `src1_l` is a fresh contiguous
+                // layout (offset 0) for the strides, and a row view (`narrow`) starts
+                // inside its buffer.
+                layout.start_offset() * storage.dtype().size_in_bytes(),
+                dst_shape.dims(),
+                0,
+                &dst,
+            )
+        }
         .map_err(MetalError::from)?;
 
         let dst_storage = crate::MetalStorage::new_allocated(
@@ -895,39 +933,45 @@ impl QMetalStorage {
                 .with_label("moe_rowmap_meta")
                 .build()?;
             let encoder = device.command_encoder()?;
-            crate::kernels::call_moe_rowmap(
-                device.device(),
-                &encoder,
-                device.kernels(),
-                batch,
-                topk,
-                n_experts,
-                ids.buffer(),
-                ids_l.start_offset() * DType::U32.size_in_bytes(),
-                &rowids,
-                &blocks,
-                &meta,
-                bound,
-                bn,
-            )
+            // SAFETY: binding authority (module head).
+            unsafe {
+                crate::kernels::call_moe_rowmap(
+                    device.device(),
+                    &encoder,
+                    device.kernels(),
+                    batch,
+                    topk,
+                    n_experts,
+                    ids.buffer(),
+                    ids_l.start_offset() * DType::U32.size_in_bytes(),
+                    &rowids,
+                    &blocks,
+                    &meta,
+                    bound,
+                    bn,
+                )
+            }
             .map_err(MetalError::from)?;
-            crate::kernels::call_quantized_matmul_mm_id_mapped(
-                device.device(),
-                &encoder,
-                device.kernels(),
-                ggml_dtype,
-                (n_experts, n, k),
-                (batch, topk, in_dim1),
-                &self.buffer,
-                input.buffer(),
-                input_l.start_offset() * input.dtype().size_in_bytes(),
-                &rowids,
-                &blocks,
-                &meta,
-                bound,
-                bn,
-                &dst,
-            )
+            // SAFETY: binding authority (module head).
+            unsafe {
+                crate::kernels::call_quantized_matmul_mm_id_mapped(
+                    device.device(),
+                    &encoder,
+                    device.kernels(),
+                    ggml_dtype,
+                    (n_experts, n, k),
+                    (batch, topk, in_dim1),
+                    &self.buffer,
+                    input.buffer(),
+                    input_l.start_offset() * input.dtype().size_in_bytes(),
+                    &rowids,
+                    &blocks,
+                    &meta,
+                    bound,
+                    bn,
+                    &dst,
+                )
+            }
             .map_err(MetalError::from)?;
             let out = MetalStorage::new_allocated(
                 dst,
@@ -938,21 +982,24 @@ impl QMetalStorage {
             return Ok((out, dst_shape));
         }
         let encoder = device.command_encoder()?;
-        crate::kernels::call_quantized_matmul_mv_id_t(
-            device.device(),
-            &encoder,
-            device.kernels(),
-            ggml_dtype,
-            triple,
-            (n_experts, n, k),
-            (batch, topk, in_dim1),
-            &self.buffer,
-            input.buffer(),
-            input_l.start_offset() * input.dtype().size_in_bytes(),
-            ids.buffer(),
-            ids_l.start_offset() * DType::U32.size_in_bytes(),
-            &dst,
-        )
+        // SAFETY: binding authority (module head).
+        unsafe {
+            crate::kernels::call_quantized_matmul_mv_id_t(
+                device.device(),
+                &encoder,
+                device.kernels(),
+                ggml_dtype,
+                triple,
+                (n_experts, n, k),
+                (batch, topk, in_dim1),
+                &self.buffer,
+                input.buffer(),
+                input_l.start_offset() * input.dtype().size_in_bytes(),
+                ids.buffer(),
+                ids_l.start_offset() * DType::U32.size_in_bytes(),
+                &dst,
+            )
+        }
         .map_err(MetalError::from)?;
         let out =
             MetalStorage::new_allocated(dst, device.clone(), dst_shape.elem_count(), store_dtype)?;
@@ -1028,23 +1075,26 @@ impl QMetalStorage {
                     .with_label("qmatmul_id2")
                     .build()?;
                 let encoder = device.command_encoder()?;
-                crate::kernels::call_quantized_matmul_mv_id2_t(
-                    device.device(),
-                    &encoder,
-                    device.kernels(),
-                    ggml_dtype,
-                    triple,
-                    grid,
-                    (n_experts, n, k),
-                    (batch, topk, in_dim1),
-                    a,
-                    b,
-                    input.buffer(),
-                    input_l.start_offset() * input.dtype().size_in_bytes(),
-                    ids.buffer(),
-                    ids_l.start_offset() * DType::U32.size_in_bytes(),
-                    &dst,
-                )
+                // SAFETY: binding authority (module head).
+                unsafe {
+                    crate::kernels::call_quantized_matmul_mv_id2_t(
+                        device.device(),
+                        &encoder,
+                        device.kernels(),
+                        ggml_dtype,
+                        triple,
+                        grid,
+                        (n_experts, n, k),
+                        (batch, topk, in_dim1),
+                        a,
+                        b,
+                        input.buffer(),
+                        input_l.start_offset() * input.dtype().size_in_bytes(),
+                        ids.buffer(),
+                        ids_l.start_offset() * DType::U32.size_in_bytes(),
+                        &dst,
+                    )
+                }
                 .map_err(MetalError::from)?;
                 Ok(MetalStorage::new_allocated(
                     dst,
@@ -1204,7 +1254,7 @@ impl QMetalStorage {
                 self.buffer.length()
             )
         }
-        let ptr = std::hint::black_box(staging.contents());
+        let ptr = std::hint::black_box(unsafe { staging.contents() });
         if ptr.is_null() {
             crate::bail!("write_with: the staging buffer has no CPU mapping (len={len})")
         }
@@ -1229,20 +1279,23 @@ impl QMetalStorage {
         if let Some((ring, entry)) = ring {
             ring.stamp(entry, &staging, ring.clock().current_epoch());
         }
-        crate::kernels::call_copy2d(
-            self.device.device(),
-            &encoder,
-            self.device.kernels(),
-            kernel,
-            &staging,
-            &self.buffer,
-            1,
-            n,
-            n,
-            n,
-            0,
-            offset,
-        )
+        // SAFETY: binding authority (module head).
+        unsafe {
+            crate::kernels::call_copy2d(
+                self.device.device(),
+                &encoder,
+                self.device.kernels(),
+                kernel,
+                &staging,
+                &self.buffer,
+                1,
+                n,
+                n,
+                n,
+                0,
+                offset,
+            )
+        }
         .map_err(MetalError::from)?;
         Ok(())
     }
@@ -1257,7 +1310,8 @@ impl QMetalStorage {
         {
             let mut blit = self.device.blit_command_encoder()?;
             blit.set_label("blit_to_cpu");
-            blit.copy_from_buffer(&self.buffer, 0, &buffer, 0, self.buffer.length());
+            // SAFETY: binding authority (module head).
+            unsafe { blit.copy_from_buffer(&self.buffer, 0, &buffer, 0, self.buffer.length()) };
         }
         self.device.flush_and_wait_current()?;
         Ok(read_to_vec::<u8>(&buffer, self.storage_size_in_bytes()))
@@ -1324,7 +1378,7 @@ fn read_to_vec<T: Clone>(buffer: &Buffer, n: usize) -> Vec<T> {
     // `black_box` makes the pointer opaque, so the test survives whatever the
     // optimiser can prove about the ObjC getter. Same repair as #445's, and it
     // costs one unfoldable move on a path that then copies `n` elements.
-    let ptr = std::hint::black_box(buffer.contents()) as *const T;
+    let ptr = std::hint::black_box(unsafe { buffer.contents() }) as *const T;
     assert!(
         !ptr.is_null(),
         "quantized read_to_vec: buffer has no CPU mapping (len={}, n={n})",
@@ -1489,27 +1543,30 @@ pub fn matmul_f16_weight_f32(xs: &crate::Tensor, w: &crate::Tensor) -> Result<cr
     let src1_l = crate::Layout::contiguous([vec![1; 4 - x_dims.len()], x_dims.to_vec()].concat());
     let dst_l = crate::Layout::contiguous([vec![1; 4 - out_dims.len()], out_dims.clone()].concat());
     let encoder = device.command_encoder()?;
-    crate::kernels::call_quantized_matmul_mm_t(
-        device.device(),
-        &encoder,
-        device.kernels(),
-        crate::kernels::GgmlDType::F16,
-        src0_l.dims(),
-        &src0_stride,
-        wm.buffer(),
-        wl.start_offset() * DType::F16.size_in_bytes(),
-        src1_l.dims(),
-        &src1_l
-            .stride()
-            .iter()
-            .map(|x| x * DType::F32.size_in_bytes())
-            .collect::<Vec<_>>(),
-        xm.buffer(),
-        xl.start_offset() * DType::F32.size_in_bytes(),
-        dst_l.dims(),
-        0,
-        &dst,
-    )
+    // SAFETY: binding authority (module head).
+    unsafe {
+        crate::kernels::call_quantized_matmul_mm_t(
+            device.device(),
+            &encoder,
+            device.kernels(),
+            crate::kernels::GgmlDType::F16,
+            src0_l.dims(),
+            &src0_stride,
+            wm.buffer(),
+            wl.start_offset() * DType::F16.size_in_bytes(),
+            src1_l.dims(),
+            &src1_l
+                .stride()
+                .iter()
+                .map(|x| x * DType::F32.size_in_bytes())
+                .collect::<Vec<_>>(),
+            xm.buffer(),
+            xl.start_offset() * DType::F32.size_in_bytes(),
+            dst_l.dims(),
+            0,
+            &dst,
+        )
+    }
     .map_err(MetalError::from)?;
     drop(encoder);
     let storage =

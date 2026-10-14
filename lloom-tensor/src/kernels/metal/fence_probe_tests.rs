@@ -57,9 +57,15 @@ fn the_map_is_read_once_per_buffer_per_session_and_a_fence_is_waited_once() {
     {
         let guard = cmds.command_encoder().unwrap();
         let enc = guard.as_ref();
-        enc.set_output_buffer(0, Some(&x), 0);
-        enc.set_output_buffer(1, Some(&z), 0);
-        enc.set_output_buffer(2, Some(&x), 0);
+        // SAFETY: the test owns every buffer bound or mapped here and reads its
+        // results only after waiting for the command buffer that writes them.
+        unsafe { enc.set_output_buffer(0, Some(&x), 0) };
+        // SAFETY: the test owns every buffer bound or mapped here and reads its
+        // results only after waiting for the command buffer that writes them.
+        unsafe { enc.set_output_buffer(1, Some(&z), 0) };
+        // SAFETY: the test owns every buffer bound or mapped here and reads its
+        // results only after waiting for the command buffer that writes them.
+        unsafe { enc.set_output_buffer(2, Some(&x), 0) };
         assert_eq!(
             enc.fence_stats(),
             (2, 0, 0),
@@ -78,12 +84,24 @@ fn the_map_is_read_once_per_buffer_per_session_and_a_fence_is_waited_once() {
     {
         let guard = cmds.command_encoder().unwrap();
         let enc = guard.as_ref();
-        enc.set_input_buffer(0, Some(&x), 0);
-        enc.set_input_buffer(1, Some(&x), 0);
-        enc.set_input_buffer(2, Some(&y), 0);
-        enc.set_input_buffer(3, Some(&z), 0);
-        enc.set_output_buffer(4, Some(&x), 0);
-        enc.set_input_buffer(5, Some(&x), 0);
+        // SAFETY: the test owns every buffer bound or mapped here and reads its
+        // results only after waiting for the command buffer that writes them.
+        unsafe { enc.set_input_buffer(0, Some(&x), 0) };
+        // SAFETY: the test owns every buffer bound or mapped here and reads its
+        // results only after waiting for the command buffer that writes them.
+        unsafe { enc.set_input_buffer(1, Some(&x), 0) };
+        // SAFETY: the test owns every buffer bound or mapped here and reads its
+        // results only after waiting for the command buffer that writes them.
+        unsafe { enc.set_input_buffer(2, Some(&y), 0) };
+        // SAFETY: the test owns every buffer bound or mapped here and reads its
+        // results only after waiting for the command buffer that writes them.
+        unsafe { enc.set_input_buffer(3, Some(&z), 0) };
+        // SAFETY: the test owns every buffer bound or mapped here and reads its
+        // results only after waiting for the command buffer that writes them.
+        unsafe { enc.set_output_buffer(4, Some(&x), 0) };
+        // SAFETY: the test owns every buffer bound or mapped here and reads its
+        // results only after waiting for the command buffer that writes them.
+        unsafe { enc.set_input_buffer(5, Some(&x), 0) };
         let (probes, hits, waits) = enc.fence_stats();
         assert_eq!(
             probes, 3,

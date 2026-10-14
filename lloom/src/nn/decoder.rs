@@ -626,6 +626,106 @@ pub struct DecoderState<L: Layer> {
     ckpt: CheckpointRing,
 }
 
+/// Owned layer snapshots and the logical end of a privately owned sequence.
+pub struct DecoderRetained<S> {
+    layers: Vec<S>,
+    pos: usize,
+}
+
+impl<L: Layer> crate::nn::branch::RetainState for DecoderState<L>
+where
+    L::State: crate::nn::branch::RetainState,
+{
+    type Retained = DecoderRetained<<L::State as crate::nn::branch::RetainState>::Retained>;
+
+    fn retain_state(&mut self) -> Result<Self::Retained> {
+        if self.window.is_some() {
+            lloom_tensor::bail!("decoder retention requires a settled window")
+        }
+        let mut layers = crate::nn::branch::retained_vec(self.layers.len())?;
+        for layer in &mut self.layers {
+            layers.push(layer.retain_state()?);
+        }
+        Ok(DecoderRetained {
+            layers,
+            pos: self.pos,
+        })
+    }
+
+    fn restore_retained(&mut self, saved: &Self::Retained) -> Result<()> {
+        if self.window.is_some() || saved.pos > self.pos || saved.layers.len() != self.layers.len()
+        {
+            lloom_tensor::bail!("decoder retention: invalid window, position or layer count")
+        }
+        for (layer, retained) in self.layers.iter_mut().zip(&saved.layers) {
+            layer.restore_retained(retained)?;
+        }
+        self.pos = saved.pos;
+        self.nextn.clear();
+        self.ckpt.forget_past(saved.pos);
+        Ok(())
+    }
+}
+
+impl<MS: crate::nn::branch::RetainState> crate::nn::branch::RetainState for PreNormState<MS, ()> {
+    type Retained = MS::Retained;
+    fn retain_state(&mut self) -> Result<Self::Retained> {
+        self.mixer.retain_state()
+    }
+    fn restore_retained(&mut self, saved: &Self::Retained) -> Result<()> {
+        self.mixer.restore_retained(saved)
+    }
+}
+
+impl<SA: crate::nn::branch::RetainState, SB: crate::nn::branch::RetainState>
+    crate::nn::branch::RetainState for HybridState<SA, SB>
+{
+    type Retained = HybridState<SA::Retained, SB::Retained>;
+    fn retain_state(&mut self) -> Result<Self::Retained> {
+        Ok(match self {
+            Self::A(a) => HybridState::A(a.retain_state()?),
+            Self::B(b) => HybridState::B(b.retain_state()?),
+        })
+    }
+    fn restore_retained(&mut self, saved: &Self::Retained) -> Result<()> {
+        match (self, saved) {
+            (Self::A(a), HybridState::A(saved)) => a.restore_retained(saved),
+            (Self::B(b), HybridState::B(saved)) => b.restore_retained(saved),
+            _ => lloom_tensor::bail!("retained hybrid state belongs to the other mixer"),
+        }
+    }
+}
+
+impl crate::nn::branch::RetainState for crate::models::qwen4exp::GdnState {
+    type Retained = (
+        crate::nn::recurrent::RecurrentRetained,
+        crate::nn::recurrent::RecurrentRetained,
+    );
+    fn retain_state(&mut self) -> Result<Self::Retained> {
+        Ok((self.s.retain_state()?, self.conv.retain_state()?))
+    }
+    fn restore_retained(&mut self, saved: &Self::Retained) -> Result<()> {
+        self.s.restore_retained(&saved.0)?;
+        self.conv.restore_retained(&saved.1)
+    }
+}
+
+impl crate::nn::branch::RetainState for crate::models::qwen4exp::KvCache {
+    type Retained = WindowMark;
+    fn retain_state(&mut self) -> Result<Self::Retained> {
+        let (tokens, blocks) = self.lens();
+        Ok(WindowMark { tokens, blocks })
+    }
+    fn restore_retained(&mut self, saved: &Self::Retained) -> Result<()> {
+        let (tokens, blocks) = self.lens();
+        if saved.tokens > tokens || saved.blocks > blocks {
+            lloom_tensor::bail!("retained KV prefix was truncated")
+        }
+        self.truncate(saved.tokens, saved.blocks);
+        Ok(())
+    }
+}
+
 /// A decoder state's two ledger rows.
 #[cfg(feature = "metal")]
 #[derive(Debug)]
@@ -1275,51 +1375,55 @@ where
         }
         #[cfg(feature = "metal")]
         if let Device::Metal(m) = &self.device {
+            use lloom_tensor::memory_admission::{AllocationError, RefusalDomain};
             let gb = |b: usize| b as f64 / 1e9;
             if grow.total() > 0 {
                 let quota = m.ledger().quota();
                 let budget = if quota == 0 { usize::MAX } else { quota };
                 let a = m.admit_bytes(grow.total(), budget);
                 if !a.fits {
-                    if let Some(why) = &a.machine {
-                        lloom_tensor::bail!(
-                            "{}: the state's growth at position {} ({:.3} GB: KV {:.3}, recurrent {:.3}) \
-                             is refused before anything is written: {why}",
+                    let refusal = a.machine.unwrap_or(AllocationError::Refused {
+                        requested: grow.total(),
+                        available: budget.saturating_sub(a.committed),
+                        domain: RefusalDomain::Model,
+                    });
+                    m.report_refusal(
+                        &format_args!(
+                            "{}: the state's growth at position {} needs {:.3} GB (KV {:.3}, \
+                             recurrent {:.3}); the ledger holds {:.2} GB of the {:.2} GB quota \
+                             after giving back {:.3} GB of free lists; the pass stops here, before \
+                             anything is written (DESIGN.md 9.5): a shorter context, \
+                             --memory-fraction, or bound the run",
                             self.family,
                             cache.pos,
                             gb(grow.total()),
                             gb(grow.kv),
-                            gb(grow.recurrent)
-                        );
-                    }
-                    lloom_tensor::bail!(
-                        "{}: the state's growth at position {} needs {:.3} GB (KV {:.3}, recurrent \
-                         {:.3}) and the ledger already holds {:.2} GB of the {:.2} GB quota after \
-                         giving back {:.3} GB of free lists; the pass stops here, before anything is \
-                         written (DESIGN.md 9.5): a shorter context, --memory-fraction, or bound the run.",
-                        self.family,
-                        cache.pos,
-                        gb(grow.total()),
-                        gb(grow.kv),
-                        gb(grow.recurrent),
-                        gb(a.committed),
-                        gb(budget),
-                        gb(a.reclaimed),
+                            gb(grow.recurrent),
+                            gb(a.committed),
+                            gb(budget),
+                            gb(a.reclaimed),
+                        ),
+                        &refusal,
                     );
+                    return Err(refusal.into());
                 }
                 if let Some(t) = &cache.ledger {
                     t.note(self.held_bytes(cache) + grow);
                 }
             }
             if pass > 0 {
-                if let Some(why) = m.admit_bytes(pass, usize::MAX).machine {
-                    lloom_tensor::bail!(
-                        "{}: the {seq_len}-position pass at position {} ({:.2} GB of working set) \
-                         is refused before it runs: {why}",
-                        self.family,
-                        cache.pos,
-                        gb(pass)
+                if let Some(refusal) = m.admit_bytes(pass, usize::MAX).machine {
+                    m.report_refusal(
+                        &format_args!(
+                            "{}: the {seq_len}-position pass at position {} ({:.2} GB of working \
+                             set) is refused before it runs",
+                            self.family,
+                            cache.pos,
+                            gb(pass)
+                        ),
+                        &refusal,
                     );
+                    return Err(refusal.into());
                 }
             }
         }

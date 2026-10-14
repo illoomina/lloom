@@ -22,6 +22,7 @@
 pub mod app;
 pub mod batch;
 pub mod couplings;
+pub mod decision;
 pub mod decode;
 pub mod option_grammar;
 pub mod option_schema;

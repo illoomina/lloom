@@ -6,6 +6,7 @@
 //! ModelDomain. Per-origin group nodes also retain managed-layout charges.
 //! Token/control headers, member vectors and registry setup remain
 //! separate uncharged metadata obligations; this is not a malloc/RSS cap.
+use super::residency_set::ListingRecord;
 use super::{Buffer, ResidencySet};
 use crate::allocation_owner::AllocationLease;
 use crate::completion_wake::Wake;
@@ -71,7 +72,36 @@ struct Cleanup {
     residency: Arc<ResidencySet>,
     keys: Members<Raw>,
 }
-struct Anchors(Members<Lease>);
+/// The record's own retains, released after Cleanup has removed every key
+/// from the set. `_record` is last so the set's retirement count drops only
+/// once the retains are gone.
+struct Anchors {
+    residency: Arc<ResidencySet>,
+    leases: Members<Lease>,
+    _record: ListingRecord,
+}
+impl Anchors {
+    fn new(residency: &Arc<ResidencySet>) -> Self {
+        Self {
+            residency: residency.clone(),
+            leases: Members::Empty,
+            _record: ListingRecord::new(residency),
+        }
+    }
+}
+impl Drop for Anchors {
+    fn drop(&mut self) {
+        match std::mem::replace(&mut self.leases, Members::Empty) {
+            Members::Empty => {}
+            Members::One(lease) => self.residency.release_unlisted(lease),
+            Members::Many(leases) => {
+                for lease in leases {
+                    self.residency.release_unlisted(lease);
+                }
+            }
+        }
+    }
+}
 // SAFETY: these are retained, immutable engine-created Metal allocations. The
 // residency mutation itself is serialized by ResidencySet's existing mutex.
 unsafe impl Send for Cleanup {}
@@ -98,6 +128,31 @@ pub(crate) enum MembershipError {
 impl std::fmt::Display for MembershipError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "membership retirement: {self:?}")
+    }
+}
+/// A refusal inside membership registration surfaces as the refusal it was;
+/// a registry/anchor/edit failure is a retirement-registration failure.
+impl From<MembershipError> for crate::memory_admission::AllocationError {
+    fn from(error: MembershipError) -> Self {
+        use crate::memory_admission::AllocationError;
+        match error {
+            MembershipError::Registry(RegistryError::Admission(e))
+            | MembershipError::Anchor(AnchorError::Registry(RegistryError::Admission(e))) => e,
+            MembershipError::Registry(RegistryError::MetadataAllocation)
+            | MembershipError::Anchor(AnchorError::Registry(RegistryError::MetadataAllocation)) => {
+                AllocationError::HostAllocation
+            }
+            MembershipError::Anchor(AnchorError::PermitExhausted) => {
+                AllocationError::CountExhausted
+            }
+            MembershipError::Registry(_) | MembershipError::Anchor(AnchorError::Registry(_)) => {
+                AllocationError::Retirement("membership registry")
+            }
+            MembershipError::Anchor(AnchorError::Pin(_)) => {
+                AllocationError::Retirement("membership anchor pin")
+            }
+            MembershipError::Edit => AllocationError::Retirement("membership edit"),
+        }
     }
 }
 
@@ -182,7 +237,7 @@ impl MembershipDomain {
             residency: self.residency.clone(),
             keys: Members::Empty,
         };
-        let anchors = Anchors(Members::Empty);
+        let anchors = Anchors::new(&self.residency);
         let reserved = match origin {
             AllocationOrigin::Domain(key) => {
                 let domain = key.model_domain();
@@ -220,7 +275,7 @@ impl MembershipDomain {
     pub(crate) fn for_buffer(&self, buffer: &Buffer) -> Result<Membership, MembershipError> {
         // SAFETY: MTLBuffer implements MTLAllocation; protocol upcast only.
         let allocation = unsafe {
-            &*(buffer.as_ref() as *const ProtocolObject<dyn objc2_metal::MTLBuffer>
+            &*(buffer.raw_unchecked() as *const ProtocolObject<dyn objc2_metal::MTLBuffer>
                 as *const ProtocolObject<dyn MTLAllocation>)
         };
         self.for_allocation(allocation, buffer.allocation_owner().cloned())
@@ -241,10 +296,11 @@ impl MembershipDomain {
         let input = (raw.clone(), AllocationLease::new(raw, owner));
         match token.0.permit.edit(input, |cleanup, anchors, input| {
             cleanup.keys.prepare_push()?;
-            anchors.0.prepare_push()?;
+            anchors.leases.prepare_push()?;
             let (key, lease) = input.take().expect("prepared owner input");
             cleanup.keys.push_prepared(key);
-            anchors.0.push_prepared(lease);
+            anchors.leases.push_prepared(lease);
+            anchors.residency.note_enrolled();
             Ok::<_, RegistryError>(())
         }) {
             Ok((Ok(()), None)) => Ok(token),

@@ -67,7 +67,8 @@ impl HostSlot {
         // dispatch's ordinal (§9.2aa).
         let _escape = crate::EscapeGuard::new();
         let buffer = device.new_persistent_shared(bytes)?;
-        if buffer.contents().is_null() {
+        // SAFETY: the pointer is only compared with null.
+        if unsafe { buffer.contents() }.is_null() {
             crate::bail!("HostSlot: a {bytes}-byte Shared allocation is not CPU-mapped")
         }
         let device = device.allocated_output_device(&buffer)?;
@@ -153,7 +154,9 @@ impl HostSlot {
         if n > self.cap {
             crate::bail!("HostSlot::read: {n} elements from a slot of {}", self.cap)
         }
-        let ptr = std::hint::black_box(self.buffer.contents()) as *const T;
+        // SAFETY: the slot is session-owned Shared memory no pool recycles; the
+        // read below follows the caller's wait (this function's precondition).
+        let ptr = std::hint::black_box(unsafe { self.buffer.contents() }) as *const T;
         if ptr.is_null() {
             crate::bail!("HostSlot::read: the slot lost its CPU mapping")
         }
@@ -204,20 +207,25 @@ impl HostSlot {
             dtype => crate::bail!("HostSlot::write_from: {dtype:?} is not wired"),
         };
         let encoder = self.device.command_encoder()?;
-        crate::kernels::call_copy2d(
-            &self.device.device,
-            &encoder,
-            &self.device.kernels,
-            kernel,
-            m.buffer(),
-            &self.buffer,
-            1,
-            n,
-            n,
-            n,
-            layout.start_offset() * elem,
-            0,
-        )
+        // SAFETY: `m` is the caller's storage and the slot is session-owned
+        // (binding authority, `mod.rs` head); the host reads the slot only after
+        // waiting for this command buffer (write, wait, read; module docs).
+        unsafe {
+            crate::kernels::call_copy2d(
+                &self.device.device,
+                &encoder,
+                &self.device.kernels,
+                kernel,
+                m.buffer(),
+                &self.buffer,
+                1,
+                n,
+                n,
+                n,
+                layout.start_offset() * elem,
+                0,
+            )
+        }
         .map_err(crate::MetalError::from)?;
         Ok(())
     }
@@ -246,7 +254,9 @@ impl HostSlot {
     /// so the producer's next write is the one the poller sees.
     pub fn fill_u32(&self, v: u32, n: usize) -> Result<()> {
         self.check_u32(n)?;
-        let ptr = self.buffer.contents() as *mut u32;
+        // SAFETY: session-owned Shared memory; the host writes it only while no
+        // command that writes the slot is pending (this function's precondition).
+        let ptr = unsafe { self.buffer.contents() } as *mut u32;
         for i in 0..n {
             // SAFETY: a CPU-mapped Shared buffer of `cap >= n` u32 (checked).
             unsafe { ptr.add(i).write_volatile(v) }
@@ -260,7 +270,9 @@ impl HostSlot {
     /// store); which words are new is the caller's to decide.
     pub fn peek_u32(&self, n: usize, out: &mut Vec<u32>) -> Result<()> {
         self.check_u32(n)?;
-        let ptr = self.buffer.contents() as *const u32;
+        // SAFETY: session-owned Shared memory, read by aligned volatile loads;
+        // a concurrent GPU store leaves each word old or new.
+        let ptr = unsafe { self.buffer.contents() } as *const u32;
         out.clear();
         // SAFETY: as `fill_u32`; reads only.
         out.extend((0..n).map(|i| unsafe { ptr.add(i).read_volatile() }));
@@ -274,7 +286,8 @@ impl HostSlot {
         if n > self.cap {
             crate::bail!("HostSlot: {n} words of a slot of {}", self.cap)
         }
-        if self.buffer.contents().is_null() {
+        // SAFETY: the pointer is only compared with null.
+        if unsafe { self.buffer.contents() }.is_null() {
             crate::bail!("HostSlot: the slot lost its CPU mapping")
         }
         Ok(())

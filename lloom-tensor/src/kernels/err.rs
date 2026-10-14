@@ -2,8 +2,33 @@ use crate::kernels::kernels::sdpa::SdpaDType;
 
 pub use crate::command_lifecycle::LifecycleError as CommandLifecycleError;
 
+#[derive(Debug, thiserror::Error)]
+#[error("Invalid matmul arguments {lhs_stride:?} {rhs_stride:?} {mnk:?}")]
+pub struct MatMulNonContiguous {
+    pub lhs_stride: Vec<usize>,
+    pub rhs_stride: Vec<usize>,
+    pub mnk: (usize, usize, usize),
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("Sdpa {variation} head size was {got}, expectd {expected:?}")]
+pub struct SdpaHeadSizeMismatch {
+    pub variation: &'static str,
+    pub got: usize,
+    pub expected: Vec<usize>,
+}
+
+/// Kernel-layer failures. Carried inline in [`crate::Error::Metal`], so the
+/// refusals a dispatch can meet (`Allocation`, `RecordingAdmission`) widen
+/// without allocating; payloads larger than [`AllocationError`] are boxed so
+/// they do not set this enum's size (`docs/invariants.md` §15.2 #15a).
+///
+/// [`AllocationError`]: crate::memory_admission::AllocationError
 #[derive(thiserror::Error, Debug)]
 pub enum MetalKernelError {
+    /// An allocation refused inside a kernel-layer path; widened unchanged.
+    #[error(transparent)]
+    Allocation(#[from] crate::memory_admission::AllocationError),
     #[error("command buffer recording admission refused: {0}")]
     RecordingAdmission(#[from] CommandLifecycleError),
     #[error("completion registration refused: {0}")]
@@ -37,18 +62,10 @@ pub enum MetalKernelError {
     FailedToCreateResource(String),
     #[error("Failed to create pipeline")]
     FailedToCreatePipeline(String),
-    #[error("Invalid matmul arguments {lhs_stride:?} {rhs_stride:?} {mnk:?}")]
-    MatMulNonContiguous {
-        lhs_stride: Vec<usize>,
-        rhs_stride: Vec<usize>,
-        mnk: (usize, usize, usize),
-    },
-    #[error("Sdpa {variation} head size was {got}, expectd {expected:?}")]
-    SdpaHeadSizeMismatch {
-        variation: &'static str,
-        got: usize,
-        expected: Vec<usize>,
-    },
+    #[error(transparent)]
+    MatMulNonContiguous(Box<MatMulNonContiguous>),
+    #[error(transparent)]
+    SdpaHeadSizeMismatch(Box<SdpaHeadSizeMismatch>),
     #[error("Sdpa {variation} got dtype {got:?}")]
     SdpaHeadDTypeMismatch {
         variation: &'static str,

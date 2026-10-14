@@ -353,7 +353,7 @@ pub const MTP_SIDECAR_MANIFEST: &str = "qwen4exp-mtp-q8.json";
 
 /// Where [`MTP_SIDECAR_MANIFEST`] is in this source tree.
 pub fn mtp_sidecar_manifest_path() -> std::path::PathBuf {
-    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+    std::path::PathBuf::from(lloom_manifest_dir())
         .join("tests/scale_manifests")
         .join(MTP_SIDECAR_MANIFEST)
 }
@@ -681,7 +681,7 @@ pub const SCALE_MANIFEST: &str = "qwen3.8-flash-next-gsq-rco-iq3xxs.json";
 
 /// Where [`SCALE_MANIFEST`] is in this source tree.
 pub fn scale_manifest_path() -> std::path::PathBuf {
-    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+    std::path::PathBuf::from(lloom_manifest_dir())
         .join("tests/scale_manifests")
         .join(SCALE_MANIFEST)
 }
@@ -868,3 +868,14 @@ mod scaled {
 }
 #[cfg(not(target_arch = "wasm32"))]
 pub use scaled::scale_shards;
+
+/// The crate's manifest directory **at run time** — what cargo and nextest
+/// export to the test process — falling back to the build-time path. A test
+/// binary archived on one host and run on another (`cargo nextest archive` /
+/// `--workspace-remap`) reads its fixtures where the archive was unpacked;
+/// `env!("CARGO_MANIFEST_DIR")` would bake the building host's path in
+/// (measured 2026-10-13: `every_test_file_is_a_module` panicked with NotFound
+/// on silverberry from a Mac-built archive).
+fn lloom_manifest_dir() -> String {
+    std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| env!("CARGO_MANIFEST_DIR").to_string())
+}

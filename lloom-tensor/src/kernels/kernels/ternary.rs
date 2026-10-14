@@ -5,8 +5,12 @@ use crate::kernels::{
 };
 use crate::kernels::{get_tile_size, linear_split};
 
+/// # Safety
+/// Every buffer bound here stays unreused and unwritten by the host until
+/// the command buffer it is encoded into completes, and while an ICB that
+/// captured it can replay ([`crate::kernels::utils::EncoderParam`]).
 #[allow(clippy::too_many_arguments)]
-pub fn call_where_cond(
+pub unsafe fn call_where_cond(
     device: &Device,
     ep: impl EncoderProvider,
     kernels: &Kernels,
@@ -40,21 +44,24 @@ pub fn call_where_cond(
     let rank = shape.len();
     debug_group!(encoder, "where {name} elems={size}");
 
-    set_params!(
-        encoder,
-        (
-            size,
-            rank,
-            shape,
-            cond_stride,
-            left_stride,
-            right_stride,
-            &cond,
-            &left,
-            &right,
-            Output::new(output)
-        )
-    );
+    // SAFETY: this function's contract (# Safety above).
+    unsafe {
+        set_params!(
+            encoder,
+            (
+                size,
+                rank,
+                shape,
+                cond_stride,
+                left_stride,
+                right_stride,
+                &cond,
+                &left,
+                &right,
+                Output::new(output)
+            )
+        );
+    }
 
     let tile_size = get_tile_size(dtype_size);
     let tiles = size.div_ceil(tile_size);

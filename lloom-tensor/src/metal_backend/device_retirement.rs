@@ -7,7 +7,10 @@ use crate::{
     completion_wake::Wake,
     host_anchor::{HostAnchorPermit, HostAnchorRegistry},
     kernels::{
-        metal::{Backings, Buffer, Device, InFlightHold, ResidencySet},
+        metal::{
+            residency_set::{ListingRecord, LiveDevice},
+            Backings, Buffer, Device, InFlightHold, ResidencySet,
+        },
         Kernels, MetalKernelError,
     },
     memory_admission::AllocationContext,
@@ -41,6 +44,8 @@ struct DeviceAnchors {
     _device: Device,
     _residency: Arc<ResidencySet>,
     _ledger: Arc<crate::kernels::metal::ledger::Ledger>,
+    // Last: the set's retirement count drops after every anchor above.
+    _record: ListingRecord,
 }
 // SAFETY: same retained Metal buffer cross-thread release contract as Buffer;
 // all other fields are engine metadata/native owners from the constructor census.
@@ -132,6 +137,7 @@ fn register_root<C: Send + Sync + 'static, A: Send + Sync + 'static>(
 
 pub(crate) struct DeviceTeardown {
     owner: NamespaceOwner,
+    _live: LiveDevice,
 }
 impl DeviceTeardown {
     pub(crate) fn new(
@@ -155,12 +161,16 @@ impl DeviceTeardown {
             MetalKernelError::QueueUnavailable("namespace metadata capacity refused")
         })?;
         // Cold constructor: seed borrow is released before registration/growth.
-        let seed_lease = seed.lock().allocation_lease();
+        let seed_lease = seed.lock().native_baseline_lease().map_err(|_| {
+            MetalKernelError::QueueUnavailable("namespace seed requires native baseline custody")
+        })?;
+        let live = LiveDevice::new(&residency);
         let anchors = DeviceAnchors {
             _backings: namespace.backings.clone(),
             _hold: hold,
             _seed: seed_lease,
             _device: device,
+            _record: ListingRecord::new(&residency),
             _residency: residency,
             _ledger: ledger,
         };
@@ -194,6 +204,7 @@ impl DeviceTeardown {
         })?;
         Ok(Arc::new(Self {
             owner: NamespaceOwner(owner),
+            _live: live,
         }))
     }
     pub(crate) fn namespace_owner(&self) -> Result<NamespaceOwner, MetalKernelError> {

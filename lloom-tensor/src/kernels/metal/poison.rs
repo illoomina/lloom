@@ -385,7 +385,9 @@ mod engagement {
         let raw = dev
             .new_buffer(1024, crate::kernels::RESOURCE_OPTIONS)
             .expect("buffer allocation");
-        let addr = raw.data();
+        // SAFETY: the test owns every buffer bound or mapped here and reads its
+        // results only after waiting for the command buffer that writes them.
+        let addr = unsafe { raw.data() };
         assert!(
             !addr.is_null(),
             "the fixture buffer has no CPU mapping, so this test could not \

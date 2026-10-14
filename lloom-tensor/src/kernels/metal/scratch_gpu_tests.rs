@@ -40,7 +40,9 @@ fn commands(device: &Device) -> Commands {
 }
 
 fn read_f32(buf: &crate::kernels::Buffer, n: usize) -> Vec<f32> {
-    let p = buf.contents() as *const f32;
+    // SAFETY: the test owns every buffer bound or mapped here and reads its
+    // results only after waiting for the command buffer that writes them.
+    let p = unsafe { buf.contents() } as *const f32;
     assert!(!p.is_null(), "buffer has no CPU mapping");
     // SAFETY: shared storage holding at least `n` f32, and the caller has waited
     // for the command buffer.
@@ -48,14 +50,18 @@ fn read_f32(buf: &crate::kernels::Buffer, n: usize) -> Vec<f32> {
 }
 
 fn read_u32(buf: &crate::kernels::Buffer, n: usize) -> Vec<u32> {
-    let p = buf.contents() as *const u32;
+    // SAFETY: the test owns every buffer bound or mapped here and reads its
+    // results only after waiting for the command buffer that writes them.
+    let p = unsafe { buf.contents() } as *const u32;
     assert!(!p.is_null(), "buffer has no CPU mapping");
     // SAFETY: as `read_f32`.
     unsafe { std::slice::from_raw_parts(p, n) }.to_vec()
 }
 
 fn write_params(buf: &crate::kernels::Buffer, p: ScratchParams) {
-    let dst = buf.contents() as *mut ScratchParams;
+    // SAFETY: the test owns every buffer bound or mapped here and reads its
+    // results only after waiting for the command buffer that writes them.
+    let dst = unsafe { buf.contents() } as *mut ScratchParams;
     assert!(!dst.is_null(), "params buffer has no CPU mapping");
     // SAFETY: shared storage sized for one `ScratchParams`.
     unsafe { dst.write(p) };
@@ -135,7 +141,9 @@ fn scratch_reports_its_constants() {
 
     {
         let guard = cmds.command_encoder().unwrap();
-        call_scratch_report(&device, &guard, &kernels, &out, &params).unwrap();
+        // SAFETY: the test owns every buffer bound or mapped here and reads its
+        // results only after waiting for the command buffer that writes them.
+        unsafe { call_scratch_report(&device, &guard, &kernels, &out, &params) }.unwrap();
     }
     cmds.wait_until_completed().unwrap();
 
@@ -261,32 +269,40 @@ fn run_layer(
 
     {
         let guard = cmds.command_encoder().unwrap();
-        call_scratch_partials(
-            &device,
-            &guard,
-            &kernels,
-            sizing,
-            &partials,
-            &params,
-            g.n_heads as u32,
-            live as u32,
-        )
+        // SAFETY: the test owns every buffer bound or mapped here and reads its
+        // results only after waiting for the command buffer that writes them.
+        unsafe {
+            call_scratch_partials(
+                &device,
+                &guard,
+                &kernels,
+                sizing,
+                &partials,
+                &params,
+                g.n_heads as u32,
+                live as u32,
+            )
+        }
         .unwrap();
         // One barrier before the combine, and only one -- §9.4. It falls out of
         // `auto_barrier`: the combine binds `partials` as an input where the
         // stub bound it as an output, which is the read-after-write the hazard
         // tracker is looking for.
-        call_scratch_combine(
-            &device,
-            &guard,
-            &kernels,
-            sizing,
-            &partials,
-            &out,
-            &params,
-            &order,
-            g.n_heads as u32,
-        )
+        // SAFETY: the test owns every buffer bound or mapped here and reads its
+        // results only after waiting for the command buffer that writes them.
+        unsafe {
+            call_scratch_combine(
+                &device,
+                &guard,
+                &kernels,
+                sizing,
+                &partials,
+                &out,
+                &params,
+                &order,
+                g.n_heads as u32,
+            )
+        }
         .unwrap();
     }
     cmds.wait_until_completed().unwrap();
@@ -452,7 +468,9 @@ fn scratch_partials_write_disjoint_regions() {
     // "written zero" -- the ambiguity §13.1 records for the counter API and
     // §3.7a for all-zero output.
     {
-        let p = partials.contents() as *mut f32;
+        // SAFETY: the test owns every buffer bound or mapped here and reads its
+        // results only after waiting for the command buffer that writes them.
+        let p = unsafe { partials.contents() } as *mut f32;
         for i in 0..bytes / 4 {
             // SAFETY: shared storage of `bytes` bytes.
             unsafe { p.add(i).write(f32::from_bits(0xDEAD_BEEF)) };
@@ -476,16 +494,20 @@ fn scratch_partials_write_disjoint_regions() {
 
     {
         let guard = cmds.command_encoder().unwrap();
-        call_scratch_partials(
-            &device,
-            &guard,
-            &kernels,
-            Sizing::Grow,
-            &partials,
-            &params,
-            g.n_heads as u32,
-            live as u32,
-        )
+        // SAFETY: the test owns every buffer bound or mapped here and reads its
+        // results only after waiting for the command buffer that writes them.
+        unsafe {
+            call_scratch_partials(
+                &device,
+                &guard,
+                &kernels,
+                Sizing::Grow,
+                &partials,
+                &params,
+                g.n_heads as u32,
+                live as u32,
+            )
+        }
         .unwrap();
     }
     cmds.wait_until_completed().unwrap();
@@ -636,7 +658,11 @@ fn the_kv_append_is_fenced_before_the_partials_read() {
                 let enc: &ComputeCommandEncoder = enc.as_ref();
                 enc.set_compute_pipeline_state(&pipeline);
                 debug_group!(enc, "kv_append_stub");
-                set_params!(enc, (Output::new(&kv_buf), &params));
+                // SAFETY: the test owns every buffer bound or mapped here and reads its
+                // results only after waiting for the command buffer that writes them.
+                unsafe {
+                    set_params!(enc, (Output::new(&kv_buf), &params));
+                }
                 enc.dispatch_thread_groups(
                     objc2_metal::MTLSize {
                         width: 1,
@@ -665,13 +691,19 @@ fn the_kv_append_is_fenced_before_the_partials_read() {
                 let enc: &ComputeCommandEncoder = enc.as_ref();
                 enc.set_compute_pipeline_state(&pipeline);
                 debug_group!(enc, "partials_reading_kv");
-                set_params!(enc, (Output::new(&partials), &params));
+                // SAFETY: the test owns every buffer bound or mapped here and reads its
+                // results only after waiting for the command buffer that writes them.
+                unsafe {
+                    set_params!(enc, (Output::new(&partials), &params));
+                }
                 if declare_kv_input {
                     // The declaration §9.4 requires. Index past the kernel's
                     // arguments, which Metal permits: the binding exists for its
                     // ordering effect, exactly as `call_arena_reset`'s arena
                     // binding does (#70).
-                    enc.set_input_buffer(4, Some(&kv_buf), 0);
+                    // SAFETY: the test owns every buffer bound or mapped here and reads its
+                    // results only after waiting for the command buffer that writes them.
+                    unsafe { enc.set_input_buffer(4, Some(&kv_buf), 0) };
                 }
                 enc.dispatch_thread_groups(
                     objc2_metal::MTLSize {
@@ -760,28 +792,36 @@ fn the_partials_need_one_barrier_before_the_combine_and_none_between() {
         .expect("a trace window on a fresh queue");
     {
         let guard = cmds.command_encoder().unwrap();
-        call_scratch_partials(
-            &device,
-            &guard,
-            &kernels,
-            Sizing::Grow,
-            &partials,
-            &params,
-            g.n_heads as u32,
-            live as u32,
-        )
+        // SAFETY: the test owns every buffer bound or mapped here and reads its
+        // results only after waiting for the command buffer that writes them.
+        unsafe {
+            call_scratch_partials(
+                &device,
+                &guard,
+                &kernels,
+                Sizing::Grow,
+                &partials,
+                &params,
+                g.n_heads as u32,
+                live as u32,
+            )
+        }
         .unwrap();
-        call_scratch_combine(
-            &device,
-            &guard,
-            &kernels,
-            Sizing::Grow,
-            &partials,
-            &out,
-            &params,
-            &order,
-            g.n_heads as u32,
-        )
+        // SAFETY: the test owns every buffer bound or mapped here and reads its
+        // results only after waiting for the command buffer that writes them.
+        unsafe {
+            call_scratch_combine(
+                &device,
+                &guard,
+                &kernels,
+                Sizing::Grow,
+                &partials,
+                &out,
+                &params,
+                &order,
+                g.n_heads as u32,
+            )
+        }
         .unwrap();
     }
     cmds.wait_until_completed().unwrap();

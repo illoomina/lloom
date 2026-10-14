@@ -257,16 +257,19 @@ impl crate::CustomOp1 for ArgSort {
             // width rather than only above 1024, so one path is exercised by the
             // whole test suite instead of a wide arm nothing reaches.
             Some(dtype) if self.asc => {
-                crate::kernels::call_mlx_arg_sort(
-                    device.metal_device(),
-                    &command_encoder,
-                    kernels,
-                    dtype,
-                    nrows,
-                    ncols,
-                    src,
-                    &dst,
-                )
+                // SAFETY: storage-owned buffers (binding authority, `metal_backend` module head).
+                unsafe {
+                    crate::kernels::call_mlx_arg_sort(
+                        device.metal_device(),
+                        &command_encoder,
+                        kernels,
+                        dtype,
+                        nrows,
+                        ncols,
+                        src,
+                        &dst,
+                    )
+                }
                 .map_err(crate::Error::wrap)?;
             }
             // Descending, or a dtype the multi-block path does not carry.
@@ -287,17 +290,20 @@ impl crate::CustomOp1 for ArgSort {
                         storage.dtype()
                     )
                 }
-                crate::kernels::call_arg_sort(
-                    device.metal_device(),
-                    &command_encoder,
-                    kernels,
-                    name,
-                    nrows,
-                    ncols,
-                    ncols_pad,
-                    src,
-                    &dst,
-                )
+                // SAFETY: storage-owned buffers (binding authority, `metal_backend` module head).
+                unsafe {
+                    crate::kernels::call_arg_sort(
+                        device.metal_device(),
+                        &command_encoder,
+                        kernels,
+                        name,
+                        nrows,
+                        ncols,
+                        ncols_pad,
+                        src,
+                        &dst,
+                    )
+                }
                 .map_err(crate::Error::wrap)?;
             }
         }

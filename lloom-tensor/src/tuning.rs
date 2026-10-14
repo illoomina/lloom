@@ -78,7 +78,15 @@ impl Contract {
     ///
     /// - `moe-act-f16`: Qwen4-exp's routed experts on f16 activations where
     ///   the matmul-vec runs (`lloom`'s `--moe-act auto`).
-    pub const FAST_ARMS: &'static [&'static str] = &["moe-act-f16"];
+    /// - `decision-pack`: `/v1/systemone` requests that wait together are read
+    ///   as one tree, so an answer's prefill partition depends on what else
+    ///   arrived (`lloom-engine`'s `decide_together`).
+    /// - `decision-ragged`: a `/v1/systemone` request's questions are read as
+    ///   one ragged batch over its state, which is kept for the next request
+    ///   over it, so an answer's pass partition depends on the batch and on
+    ///   what came before (`lloom-engine`'s `CausalRequest::execute_ragged`).
+    pub const FAST_ARMS: &'static [&'static str] =
+        &["moe-act-f16", "decision-pack", "decision-ragged"];
 
     /// The arms `deterministic` takes in a speculative round's passes
     /// ([`Window`]), each named on the report line while its switch is on:
@@ -86,8 +94,9 @@ impl Contract {
     pub const VERIFY_WINDOW_ARM: &'static str = "verify-gemm";
     pub const DRAFT_WINDOW_ARM: &'static str = "draft-gemm";
 
-    /// `profile=<name> arms=<list>`, for the report lines that say which
-    /// contract a run held.
+    /// `profile=<name> arms=<list> cpu_f16_accum=<type>/<promote_every>:<instruction>`,
+    /// for the report lines that say which contract a run held and which
+    /// accumulator its CPU f16 matmuls ran (`cpu::f16_matmul`).
     pub fn report(self) -> String {
         let arms = match self {
             Contract::Deterministic => {
@@ -108,7 +117,11 @@ impl Contract {
             Contract::Fast if Contract::FAST_ARMS.is_empty() => "none".to_string(),
             Contract::Fast => Contract::FAST_ARMS.join(","),
         };
-        format!("profile={} arms={arms}", self.name())
+        format!(
+            "profile={} arms={arms} cpu_f16_accum={}",
+            self.name(),
+            crate::cpu::f16_matmul::report()
+        )
     }
 }
 
@@ -620,6 +633,12 @@ fn parse_cpu_disable(v: &str) -> Result<Option<String>, String> {
         crate::cpu::arms::Features::parse_list(s).map_err(|e| e.to_string())?;
         Ok(s.to_string())
     })
+}
+fn parse_accum_type(v: &str) -> Result<String, String> {
+    one_of(v, "f16 matmul accumulator type", &["auto", "f32", "f16"])
+}
+fn parse_promote_every(v: &str) -> Result<String, String> {
+    one_of(v, "f16 matmul promotion interval", &["auto", "1", "16"])
 }
 fn parse_allow_emulated(v: &str) -> Result<Option<String>, String> {
     optional(v, |s| {
@@ -1350,8 +1369,8 @@ pub struct InstrumentTuning {
     pub profile_dump: Option<String>,
 }
 
-/// The CPU side (`utils.rs`, `safetensors.rs`, `backprop.rs`).
-#[derive(Options, Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
+/// The CPU side (`utils.rs`, `safetensors.rs`, `backprop.rs`, `cpu/f16_matmul.rs`).
+#[derive(Options, Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[options(krate = "crate")]
 #[serde(default)]
 pub struct CpuTuning {
@@ -1384,6 +1403,25 @@ pub struct CpuTuning {
         status = "reference"
     )]
     pub disable_features: Option<String>,
+    /// The CPU f16 matmul's accumulator type: `auto` (f32 under both contracts), `f32` (f32 throughout, rounded to f16 once: the test reference), `f16` (f16 chains promoted into f32 every `promote_every` products; aarch64 with fp16 only, refused by name elsewhere).
+    #[opt(flag = "f16-matmul-accumulate", env = "LLOOM_F16_MATMUL_ACCUMULATE", parser = "parse_accum_type", variants = ["auto", "f32", "f16"], path = "kernels.matmul_f16.accumulate.type", status = "arm")]
+    pub f16_matmul_accumulate: String,
+    /// The CPU f16 matmul's promotion interval, in products per chain: `auto` (1 for f32, 16 for f16), `1` (f32 only), `16` (f16 only); another pairing is refused by name.
+    #[opt(flag = "f16-matmul-promote-every", env = "LLOOM_F16_MATMUL_PROMOTE_EVERY", parser = "parse_promote_every", variants = ["auto", "1", "16"], path = "kernels.matmul_f16.accumulate.promote_every", status = "arm")]
+    pub f16_matmul_promote_every: String,
+}
+
+impl Default for CpuTuning {
+    fn default() -> Self {
+        CpuTuning {
+            num_threads: 0,
+            mmap_advice: None,
+            grad_do_not_detach: false,
+            disable_features: None,
+            f16_matmul_accumulate: "auto".into(),
+            f16_matmul_promote_every: "auto".into(),
+        }
+    }
 }
 
 /// Every tuning knob of the tensor crate.
@@ -1443,6 +1481,8 @@ mod tests {
         assert_eq!(t.moe.mm_from, 64);
         assert!(t.qmm.f16_mm);
         assert_eq!(t.contract.profile, "fast");
+        assert_eq!(t.cpu.f16_matmul_accumulate, "auto");
+        assert_eq!(t.cpu.f16_matmul_promote_every, "auto");
     }
 
     #[test]
@@ -1459,7 +1499,17 @@ mod tests {
             Ok(Contract::Deterministic)
         );
         assert!(Contract::Fast.is_fast() && !Contract::Deterministic.is_fast());
-        assert_eq!(Contract::Fast.report(), "profile=fast arms=moe-act-f16");
+        // The line names the CPU f16 matmul's accumulator after the arms:
+        // `f32/1` under both contracts (`auto`), by the instruction this
+        // CPU has. The deterministic arms are `the_report_names_the_window_arms`'.
+        let accum = crate::cpu::f16_matmul::report();
+        assert!(accum.starts_with("f32/1:"), "{accum}");
+        assert_eq!(
+            Contract::Fast.report(),
+            format!(
+                "profile=fast arms=moe-act-f16,decision-pack,decision-ragged cpu_f16_accum={accum}"
+            )
+        );
     }
 
     /// The report line names each window's arm while it is on, so a receipt
@@ -1479,11 +1529,17 @@ mod tests {
         ] {
             Window::Verify.set_arm(verify);
             Window::Draft.set_arm(draft);
+            let accum = crate::cpu::f16_matmul::report();
             assert_eq!(
                 Contract::Deterministic.report(),
-                format!("profile=deterministic arms={arms}")
+                format!("profile=deterministic arms={arms} cpu_f16_accum={accum}")
             );
-            assert_eq!(Contract::Fast.report(), "profile=fast arms=moe-act-f16");
+            assert!(
+                Contract::Fast
+                    .report()
+                    .starts_with("profile=fast arms=moe-act-f16,"),
+                "the window switches do not reach `fast`'s arms"
+            );
         }
     }
 

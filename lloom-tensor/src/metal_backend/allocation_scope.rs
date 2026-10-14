@@ -41,7 +41,7 @@ impl MetalAllocationDomain {
         if metadata.domain_key() != domain.key() {
             crate::bail!("namespace metadata context differs from supplied model domain");
         }
-        metadata.check_open().map_err(crate::Error::wrap)?;
+        metadata.check_open()?;
         let source = active(device)?.map_or_else(|| device.clone(), |scope| scope.view.clone());
         Ok(Self {
             view: source.allocation_view_in(domain, metadata)?,
@@ -86,7 +86,7 @@ impl ExecutionScope {
         if domain.key() != context.domain_key() {
             crate::bail!("execution namespace and allocation context have different domains");
         }
-        context.check_open().map_err(crate::Error::wrap)?;
+        context.check_open()?;
         Ok(Arc::new(Self { view, context }))
     }
 
@@ -97,7 +97,7 @@ impl ExecutionScope {
         self: &Arc<Self>,
         f: impl FnOnce(&MetalDevice) -> crate::Result<R>,
     ) -> crate::Result<R> {
-        self.context.check_open().map_err(crate::Error::wrap)?;
+        self.context.check_open()?;
         ACTIVE.with(|s| s.borrow_mut().push(self.clone()));
         let _guard = ScopeGuard {
             _not_send: PhantomData,
@@ -123,12 +123,39 @@ pub(super) fn active(device: &MetalDevice) -> crate::Result<Option<Arc<Execution
         check_device(device.id(), scope.view.id())?;
         // An operand may originate in ANOTHER domain on the same device. Its
         // owner remains unchanged; new outputs pay the active scope's domain.
-        scope.context.check_open().map_err(crate::Error::wrap)?;
+        scope.context.check_open()?;
     } else if device.allocation_namespace.domain.is_some() {
         crate::bail!("admitted Metal device requires an active execution scope");
     }
     Ok(scope)
 }
+/// Trusted ordinary-operation selection BEFORE native/engine effects. Uses the
+/// same active-scope device/cancellation rules as issuance; another same-device
+/// input domain is legal and is NOT reclassified as the output payer. A default
+/// permit is reachable only when active() proves no supplied scope exists.
+/// No reserve/take/new Arc allocation occurs here. The temporary scope Arc has
+/// its genuine lexical ACTIVE root throughout the callback, so its Drop cannot
+/// become final service/native/account custody. Never call under EntryState.
+/// HRTB prevents the callback from returning/storing the local permission borrow.
+/// This does not certify initialized input or authorize any unsafe selector.
+pub(super) fn with_operation_context<R>(
+    device: &MetalDevice,
+    run: impl for<'a> FnOnce(
+        &'a MetalDevice,
+        &crate::memory_admission::OperationContext<'a>,
+    ) -> crate::Result<R>,
+) -> crate::Result<R> {
+    let scope = active(device)?;
+    if let Some(scope) = &scope {
+        let context = scope.context.operation_context();
+        context.check_open()?;
+        run(&scope.view, &context)
+    } else {
+        let context = device.allocation_namespace.default_operation_context()?;
+        run(device, &context)
+    }
+}
+
 fn check_device(requested: DeviceId, active: DeviceId) -> crate::Result<()> {
     if requested != active {
         crate::bail!("Metal operation targets {requested:?} inside execution scope for {active:?}");
@@ -175,15 +202,13 @@ impl AllocationWorker {
     /// Validate before any producer queue mutation, including warm-hit takes.
     pub fn capture_request(&self) -> crate::Result<Option<AllocationRequest>> {
         let scope = active(&self.view)?;
-        let payer = scope
-            .as_ref()
-            .map_or(crate::memory_admission::AllocationOrigin::Legacy, |s| {
-                crate::memory_admission::AllocationOrigin::Domain(s.context.domain_key())
-            });
+        let payer = scope.as_ref().map_or_else(
+            || self.view.declared_allocation_origin(),
+            |s| crate::memory_admission::AllocationOrigin::Domain(s.context.domain_key()),
+        );
         self.view
             .declared_allocation_origin()
-            .validate_reuse(&payer)
-            .map_err(crate::Error::wrap)?;
+            .validate_reuse(&payer)?;
         if let Some(scope) = &scope {
             if !Arc::ptr_eq(
                 &scope.view.allocation_namespace,

@@ -44,16 +44,20 @@ fn run_bump(plan: &StepPlan) -> ArenaCursor {
 
     {
         let guard = cmds.command_encoder().unwrap();
-        call_arena_bump(
-            &device,
-            &guard,
-            &kernels,
-            cursor.cursor_buffer(),
-            cursor.sizes_buffer(),
-            cursor.offsets_buffer(),
-            cursor.len(),
-            cursor.capacity(),
-        )
+        // SAFETY: the test owns every buffer bound or mapped here and reads its
+        // results only after waiting for the command buffer that writes them.
+        unsafe {
+            call_arena_bump(
+                &device,
+                &guard,
+                &kernels,
+                cursor.cursor_buffer(),
+                cursor.sizes_buffer(),
+                cursor.offsets_buffer(),
+                cursor.len(),
+                cursor.capacity(),
+            )
+        }
         .unwrap();
     }
     cmds.wait_until_completed().unwrap();
@@ -251,16 +255,20 @@ fn concurrent_bump_does_not_fix_an_ordinal_to_an_offset() {
             ArenaCursor::new(&device, &plan.request_sizes(), plan.bump_capacity().max(1)).unwrap();
         {
             let guard = cmds.command_encoder().unwrap();
-            call_arena_bump_concurrent(
-                &device,
-                &guard,
-                &kernels,
-                cursor.cursor_buffer(),
-                cursor.sizes_buffer(),
-                cursor.offsets_buffer(),
-                cursor.len(),
-                cursor.capacity(),
-            )
+            // SAFETY: the test owns every buffer bound or mapped here and reads its
+            // results only after waiting for the command buffer that writes them.
+            unsafe {
+                call_arena_bump_concurrent(
+                    &device,
+                    &guard,
+                    &kernels,
+                    cursor.cursor_buffer(),
+                    cursor.sizes_buffer(),
+                    cursor.offsets_buffer(),
+                    cursor.len(),
+                    cursor.capacity(),
+                )
+            }
             .unwrap();
         }
         cmds.wait_until_completed().unwrap();
@@ -312,16 +320,20 @@ fn an_allocation_past_the_arena_is_declined() {
     let cursor = ArenaCursor::new(&device, &sizes, capacity).unwrap();
     {
         let guard = cmds.command_encoder().unwrap();
-        call_arena_bump(
-            &device,
-            &guard,
-            &kernels,
-            cursor.cursor_buffer(),
-            cursor.sizes_buffer(),
-            cursor.offsets_buffer(),
-            cursor.len(),
-            cursor.capacity(),
-        )
+        // SAFETY: the test owns every buffer bound or mapped here and reads its
+        // results only after waiting for the command buffer that writes them.
+        unsafe {
+            call_arena_bump(
+                &device,
+                &guard,
+                &kernels,
+                cursor.cursor_buffer(),
+                cursor.sizes_buffer(),
+                cursor.offsets_buffer(),
+                cursor.len(),
+                cursor.capacity(),
+            )
+        }
         .unwrap();
     }
     cmds.wait_until_completed().unwrap();
@@ -364,17 +376,24 @@ fn the_reset_makes_every_step_reproduce_the_first() {
         {
             let guard = cmds.command_encoder().unwrap();
             // The reset opens the step, exactly as the decode path would.
-            call_arena_reset(&device, &guard, &kernels, cursor.cursor_buffer(), &arena).unwrap();
-            call_arena_bump(
-                &device,
-                &guard,
-                &kernels,
-                cursor.cursor_buffer(),
-                cursor.sizes_buffer(),
-                cursor.offsets_buffer(),
-                cursor.len(),
-                cursor.capacity(),
-            )
+            // SAFETY: the test owns every buffer bound or mapped here and reads its
+            // results only after waiting for the command buffer that writes them.
+            unsafe { call_arena_reset(&device, &guard, &kernels, cursor.cursor_buffer(), &arena) }
+                .unwrap();
+            // SAFETY: the test owns every buffer bound or mapped here and reads its
+            // results only after waiting for the command buffer that writes them.
+            unsafe {
+                call_arena_bump(
+                    &device,
+                    &guard,
+                    &kernels,
+                    cursor.cursor_buffer(),
+                    cursor.sizes_buffer(),
+                    cursor.offsets_buffer(),
+                    cursor.len(),
+                    cursor.capacity(),
+                )
+            }
             .unwrap();
         }
         cmds.wait_until_completed().unwrap();
@@ -465,11 +484,20 @@ fn reset_orders_against_the_previous_steps_arena_reads() {
                 // runs per dispatch, so a bind with no dispatch after it is
                 // never in the set the next conflict check consults.
                 let enc: &crate::kernels::metal::ComputeCommandEncoder = guard.as_ref();
-                enc.set_input_buffer(5, Some(&arena), 0);
-                call_arena_alloc_report(&device, &guard, &kernels, cursor.offsets_buffer())
-                    .unwrap();
+                // SAFETY: the test owns every buffer bound or mapped here and reads its
+                // results only after waiting for the command buffer that writes them.
+                unsafe { enc.set_input_buffer(5, Some(&arena), 0) };
+                // SAFETY: the test owns every buffer bound or mapped here and reads its
+                // results only after waiting for the command buffer that writes them.
+                unsafe {
+                    call_arena_alloc_report(&device, &guard, &kernels, cursor.offsets_buffer())
+                }
+                .unwrap();
             }
-            call_arena_reset(&device, &guard, &kernels, cursor.cursor_buffer(), &arena).unwrap();
+            // SAFETY: the test owns every buffer bound or mapped here and reads its
+            // results only after waiting for the command buffer that writes them.
+            unsafe { call_arena_reset(&device, &guard, &kernels, cursor.cursor_buffer(), &arena) }
+                .unwrap();
         }
         cmds.wait_until_completed().unwrap();
         window.close().iter().filter(|d| d.barrier).count()
@@ -505,7 +533,9 @@ fn arena_alloc_reports_alignment() {
 
     {
         let guard = cmds.command_encoder().unwrap();
-        call_arena_alloc_report(&device, &guard, &kernels, &out).unwrap();
+        // SAFETY: the test owns every buffer bound or mapped here and reads its
+        // results only after waiting for the command buffer that writes them.
+        unsafe { call_arena_alloc_report(&device, &guard, &kernels, &out) }.unwrap();
     }
     cmds.wait_until_completed().unwrap();
 

@@ -66,19 +66,23 @@ fn main() -> Result<()> {
         .collect::<std::result::Result<_, _>>()?;
 
     let cos = |enc: &ComputeCommandEncoder, len: usize, input: &Buffer, output: &Buffer| {
-        call_unary_contiguous(
-            &dev,
-            enc,
-            &kernels,
-            unary::contiguous::cos::FLOAT,
-            4,
-            len,
-            BufferOffset {
-                buffer: input,
-                offset_in_bytes: 0,
-            },
-            output,
-        )
+        // SAFETY: the example owns every buffer bound or mapped here and reads them
+        // only after waiting for the command buffer that writes them.
+        unsafe {
+            call_unary_contiguous(
+                &dev,
+                enc,
+                &kernels,
+                unary::contiguous::cos::FLOAT,
+                4,
+                len,
+                BufferOffset {
+                    buffer: input,
+                    offset_in_bytes: 0,
+                },
+                output,
+            )
+        }
     };
     // One command buffer of `n` dispatches at `len` elements; its GPU interval in µs.
     let run = |len: usize, n: usize, dependent: bool| -> Result<f64> {

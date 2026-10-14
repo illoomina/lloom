@@ -676,6 +676,67 @@ pub struct State<P: Profile> {
     pub provisional_redos: u64,
 }
 
+/// Request-owned recurrent copies and append-only KV marks.
+pub struct RetainedState {
+    s: crate::nn::recurrent::RecurrentRetained,
+    conv: crate::nn::recurrent::RecurrentRetained,
+    ple: crate::nn::recurrent::RecurrentRetained,
+    kv: Vec<WindowMark>,
+    ngram: Vec<Option<u32>>,
+    pos: usize,
+}
+
+impl<P: Profile> crate::nn::branch::RetainState for State<P> {
+    type Retained = RetainedState;
+    fn retain_state(&mut self) -> Result<Self::Retained> {
+        self.settle_standing()?;
+        if self.window.is_some() || self.held.is_some() || self.host.run.is_some() {
+            lloom_tensor::bail!("qwen retention requires settled windows and no host-fill run")
+        }
+        let mut kv = crate::nn::branch::retained_vec(self.kv.len())?;
+        for layer in &mut self.kv {
+            kv.push(layer.retain_state()?);
+        }
+        Ok(RetainedState {
+            s: self.s_state.retain_state()?,
+            conv: self.conv_state.retain_state()?,
+            ple: self.ple_conv.retain_state()?,
+            ngram: self.ngram.retain_state()?,
+            kv,
+            pos: self.pos,
+        })
+    }
+    fn restore_retained(&mut self, saved: &Self::Retained) -> Result<()> {
+        self.settle_standing()?;
+        if self.window.is_some()
+            || self.held.is_some()
+            || self.host.run.is_some()
+            || saved.pos > self.pos
+            || saved.kv.len() != self.kv.len()
+        {
+            lloom_tensor::bail!("qwen retention: invalid window, host fill, position or layers")
+        }
+        for (layer, mark) in self.kv.iter_mut().zip(&saved.kv) {
+            layer.restore_retained(mark)?;
+        }
+        self.s_state.restore_retained(&saved.s)?;
+        self.conv_state.restore_retained(&saved.conv)?;
+        self.ple_conv.restore_retained(&saved.ple)?;
+        self.ngram.restore_retained(&saved.ngram)?;
+        self.pos = saved.pos;
+        self.nextn.clear();
+        for t in &mut self.taps {
+            t.clear();
+        }
+        self.pending_tokens.clear();
+        self.pending_noted = false;
+        self.prepared = None;
+        self.ckpt_pass = None;
+        self.ckpt.forget_past(saved.pos);
+        Ok(())
+    }
+}
+
 /// A sequence's PLE host fill: the run in progress, if a decode loop armed
 /// one — a single-position forward with no noted id then waits on the GPU for
 /// rows a producer fills, and `State::<P>::ngram` stays at the run's first decode
@@ -2664,38 +2725,51 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
                 kv_grow_fits(allocated, working_set, self.memory_fraction, need)
             );
             let gb = |b: usize| b as f64 / 1e9;
-            let line = format!(
-                "pos={} seq={} kv_grow={:.3} GB transient={:.3} GB heap_free={:.3} GB need={:.3} GB committed={:.2} GB reclaimed={:.3} GB budget={:.2} GB ({:.2} x working_set {:.2} GB) fits={fits} pledged={} yield_contended={}",
-                plan.pos,
-                plan.seq,
-                gb(plan.kv_grow),
-                gb(plan.transient),
-                gb(heap_free),
-                gb(need),
-                gb(allocated),
-                gb(a.reclaimed),
-                gb(kv_grow_budget(working_set, self.memory_fraction)),
-                self.memory_fraction,
-                gb(working_set),
-                a.pledged,
-                a.yield_contended,
-            );
-            match self.mem_check {
-                MemCheck::Report => eprintln!("MEMCHECK {line}"),
-                MemCheck::Refuse if !fits && a.machine.is_some() => {
-                    cache.prepared = None;
-                    lloom_tensor::bail!(
-                        "qwen4exp pass refused {line}: {}",
-                        a.machine.as_deref().unwrap_or_default()
+            let budget = kv_grow_budget(working_set, self.memory_fraction);
+            // Formatted only when it is printed: never on an admitted pass.
+            macro_rules! mem_line {
+                () => {
+                    format_args!(
+                        "pos={} seq={} kv_grow={:.3} GB transient={:.3} GB heap_free={:.3} GB \
+                         need={:.3} GB committed={:.2} GB reclaimed={:.3} GB budget={:.2} GB \
+                         ({:.2} x working_set {:.2} GB) fits={fits} pledged={} yield_contended={}",
+                        plan.pos,
+                        plan.seq,
+                        gb(plan.kv_grow),
+                        gb(plan.transient),
+                        gb(heap_free),
+                        gb(need),
+                        gb(allocated),
+                        gb(a.reclaimed),
+                        gb(budget),
+                        self.memory_fraction,
+                        gb(working_set),
+                        a.pledged,
+                        a.yield_contended,
                     )
-                }
+                };
+            }
+            match self.mem_check {
+                MemCheck::Report => eprintln!("MEMCHECK {}", mem_line!()),
                 MemCheck::Refuse if !fits => {
                     cache.prepared = None;
-                    lloom_tensor::bail!(
-                        "qwen4exp pass refused {line}: the pass stops here, before anything is \
-                         written, rather than risk the machine (DESIGN.md 9.5, 3.5): a smaller \
-                         prefill tile, `--memory-fraction`, free memory, or bound the run."
-                    )
+                    let refusal = a.machine.unwrap_or(
+                        lloom_tensor::memory_admission::AllocationError::Refused {
+                            requested: need,
+                            available: budget.saturating_sub(allocated),
+                            domain: lloom_tensor::memory_admission::RefusalDomain::Budget,
+                        },
+                    );
+                    m.report_refusal(
+                        &format_args!(
+                            "qwen4exp pass refused {}: the pass stops here, before anything is \
+                             written, rather than risk the machine (DESIGN.md 9.5, 3.5): a smaller \
+                             prefill tile, `--memory-fraction`, free memory, or bound the run",
+                            mem_line!()
+                        ),
+                        &refusal,
+                    );
+                    return Err(refusal.into());
                 }
                 _ => {}
             }
@@ -3322,7 +3396,8 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
                 // Outlives every pass: no plan serves it.
                 let _declared = lloom_tensor::EscapeGuard::new();
                 let buf = m.new_persistent_shared(n * std::mem::size_of::<f32>())?;
-                if buf.contents().is_null() {
+                // SAFETY: the pointer is only compared with null.
+                if unsafe { buf.contents() }.is_null() {
                     return Ok(None);
                 }
                 let storage =
@@ -5015,7 +5090,7 @@ impl<G: crate::profile::Regime> Shape for crate::profile::P<G, Ring, One> {
         dev: &lloom_tensor::Device,
         k: usize,
     ) -> Result<State<Self>> {
-        let pools = model.spec_pools(1, k.max(1), dev);
+        let pools = model.try_spec_pools(1, k.max(1), dev)?;
         let mut cache = State::<Self>::in_ring(model.config(), &pools)?;
         model.arm_turn_checkpoints(&mut cache);
         Ok(cache)
@@ -5061,7 +5136,8 @@ impl<G: crate::profile::Regime> Shape for crate::profile::P<G, Ring, Paged> {
         dev: &lloom_tensor::Device,
         k: usize,
     ) -> Result<State<Self>> {
-        let pools = model.row_pools(1, k.max(1) + 2, dev);
+        let phases = crate::nn::speculator::checked_window_width(k.max(1), 2)?;
+        let pools = model.row_pools(1, phases, dev);
         State::<Self>::in_pools(model.config(), &pools)
     }
     fn rows<R: ExpertResidency>(
@@ -5070,7 +5146,8 @@ impl<G: crate::profile::Regime> Shape for crate::profile::P<G, Ring, Paged> {
         rows: usize,
         k: usize,
     ) -> Result<(StatePools, Vec<State<Self>>)> {
-        let pools = model.row_pools(rows, k.max(1) + 2, dev);
+        let phases = crate::nn::speculator::checked_window_width(k.max(1), 2)?;
+        let pools = model.row_pools(rows, phases, dev);
         let states = (0..rows)
             .map(|_| State::<Self>::in_pools(model.config(), &pools))
             .collect::<Result<Vec<_>>>()?;
@@ -5523,6 +5600,21 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
     /// a phase.
     pub fn spec_pools(&self, rows: usize, k: usize, dev: &lloom_tensor::Device) -> StatePools {
         self.state_pools_with(rows, k + 2, dev)
+    }
+
+    /// Fallible speculative-pool construction: reject width overflow before
+    /// creating pool metadata. Like [`Self::spec_pools`], raw `k = 0` means
+    /// two phases; shape/app callers resolve their minimum draft count first.
+    /// Tensor products, allocator failure and model-domain admission are
+    /// separate obligations, not guaranteed by this addition check.
+    pub fn try_spec_pools(
+        &self,
+        rows: usize,
+        k: usize,
+        dev: &lloom_tensor::Device,
+    ) -> Result<StatePools> {
+        let phases = crate::nn::speculator::checked_window_width(k, 2)?;
+        Ok(self.state_pools_with(rows, phases, dev))
     }
 
     /// The pools for `rows` rows of the `Paged` shapes: the recurrent

@@ -29,6 +29,34 @@ pub(crate) fn aligned_nonzero_bytes(size: usize, alignment: usize) -> Result<usi
     })
 }
 
+/// Nonallocating geometry used by counted physical view metadata.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ViewOffsetError {
+    RelativeOverflow,
+    OutsideParent { end: usize, parent_len: usize },
+    AbsoluteOffsetOverflow,
+    AbsoluteEndOverflow,
+}
+pub(crate) fn checked_view_offset_numeric(
+    base: usize,
+    parent_len: usize,
+    offset: usize,
+    length: usize,
+) -> std::result::Result<usize, ViewOffsetError> {
+    let end = offset
+        .checked_add(length)
+        .ok_or(ViewOffsetError::RelativeOverflow)?;
+    if end > parent_len {
+        return Err(ViewOffsetError::OutsideParent { end, parent_len });
+    }
+    let absolute = base
+        .checked_add(offset)
+        .ok_or(ViewOffsetError::AbsoluteOffsetOverflow)?;
+    absolute
+        .checked_add(length)
+        .ok_or(ViewOffsetError::AbsoluteEndOverflow)?;
+    Ok(absolute)
+}
 /// Validate a view before cloning a raw handle or forming a pointer. Zero-size
 /// views at the parent end remain valid. Absolute metadata cannot wrap either.
 pub(crate) fn checked_view_offset(

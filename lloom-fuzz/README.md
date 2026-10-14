@@ -58,8 +58,20 @@ target/aarch64-apple-darwin/fuzz-thin/fuzz_kv_pages --cores 1 --port 1337 --brok
 the cmplog build `--target-dir target-cmplog`. `--client-log FILE` captures the
 clients' stdout/stderr, which the launcher otherwise silences.)
 
-Run campaigns under `lloom-arb share` so they never silently perturb a
-measurement (`CONTRIBUTING.md` §3.2b).
+Campaigns and sanitizer runs are heavy workloads: use an exclusive
+`lloom-arb measure -- timeout <bound> <reviewed-campaign-driver>` lease, with
+explicit worker and memory bounds. A build lease permits concurrent builds and
+is not a memory quota. Do not use `lloom-arb share` for these runs.
+
+The main/secondary examples above remain supported, but run the entire bounded
+process group under **one** lease, not independent terminal jobs outside it.
+Retain a supervisor until its children are stopped and reaped; a timeout of the
+launcher alone does not prove that clients or the broker exited. On the shared
+NAS, acquire the NAS-local shared resource **outside** the container, wrapping
+the complete invocation. See issue #958's shared-machine contract and
+`CONTRIBUTING.md` §3.2b. New campaigns, sanitizer arms and native/checkpoint
+workloads still require the coordinator's bounded execution-plan review;
+these examples are not permission to start them concurrently.
 
 ## The ASan arm
 
@@ -81,17 +93,94 @@ both (`ASAN_OPTIONS=verbosity=1 … --once` prints `AddressSanitizer Init done`,
 so the runtime is live). The Metal harnesses are not built under ASan: the
 engine's own `sanitize` profile covers the device path (§15.1g).
 
+The recorder's library tests run under the same arm:
+
+```sh
+LIBAFL_EDGES_MAP_DEFAULT_SIZE=2097152 LLOOM_FUZZ_ASAN=1 ASAN_OPTIONS=verbosity=1 \
+  cargo +nightly test --profile fuzz-asan --target-dir target-asan \
+  --no-default-features --lib -j1 record:: -- --test-threads=1
+```
+
+`LLOOM_FUZZ_ASAN=1` also sets `--cfg lloom_fuzz_asan`, which compiles
+`record::sanitizer_controls`: a planted heap and stack overflow in this crate
+that ASan must report, so a clean run is read beside two reports from the same
+binary. libmalloc's `malloc_logger`, the capture controls' allocator
+instrument, sees nothing under ASan; those controls pin it at zero there and
+keep every other assertion, and the allocation count is the uninstrumented
+build's.
+
 ## The persistent record
 
-Every client keeps the last `--record N` (default 64) inputs it executed. On an
-oracle failure, a panic or a signal the whole ring is written to
-`--record-dir` as `record-<pid>-<k>/0000.bin … NNNN.bin` (oldest first, the
-dying input last) with `reason.txt`. Replay it in one fresh process:
+Every client keeps the last `--record N` (default 64) inputs it executed.
+Oracle failure, panic and signal paths attempt capture under `--record-dir`.
+Capture is not guaranteed: a busy byte-ring snapshot is refused and
+filesystem errors can prevent a dump. Do not infer successful capture from a
+crash.
+
+The signal path writes through its own fixed-storage writer: descriptor-
+relative syscalls on the record directory opened at install, stack buffers
+and atomics, no allocation and no std filesystem API (the oracle and panic
+exits keep the allocating writer). Its `bt.txt` holds `si_addr=`,
+`image_base=`, `image_path=` and one raw `pc=` per frame, innermost first;
+symbolize offline with `atos -o <image_path> -l <image_base> <pc>...`, since
+symbolizing in the handler would take dyld's lock. `build.rs` links every
+target of this package with `-bind_at_load`, so the handler's libSystem calls
+never reach dyld's lazy binder. `backtrace(3)` itself is not on POSIX's
+async-signal-safe list and is called only after the record is complete.
+
+The signal handler chains to the action it replaced, with that action's
+handler ABI, mask, `SA_NODEFER`, `SA_ONSTACK`, `SA_RESTART` and default/ignore
+disposition — everything a `sigaction` query reports. **Darwin's query does
+not report `SA_RESETHAND`**, so a predecessor registered one-shot stays
+wrapped after its first delivery where the kernel alone would revert it to
+`SIG_DFL` (SIGSEGV, SIGBUS, SIGABRT, SIGFPE; SIGILL ignores the flag). The
+handlers actually replaced — LibAFL's and Rust std's — do not set it. The
+recorder's contract is every policy the query reports, and
+`record::signal_reset_reference` pins it: on a Darwin whose query reports the
+flag, its four reset tests fail and the boundary must be measured again. A
+predecessor without the flag is line-for-line the unwrapped kernel on all five
+signals.
+
+New campaign directories use `lloom-input-record-v3`: numbered `.bin` inputs
+(oldest first), `reason.txt`, `record.format`, required `record.identity`, and a
+final `record.complete` count/length/SHA-256 manifest. The low-level legacy recorder
+still writes v1. Failed writes leave inspectable partial evidence, not a
+successful directory result. The oracle/panic writer allocates; both writers
+may block on filesystem I/O. Replay validates format, completion, numeric order, sizes and all v3 content digests
+before executing any input. Missing/oversized v2/v3 identity is an error, including
+under the diagnostic override. Legacy numbered directories and v1/v2 records remain readable. Unidentified
+records warn about identity; records without content digests separately warn
+about content verification.
+
+Campaign identity is prepared once at startup: streaming SHA-256 of the file at
+`current_exe()`, target, instrumentation arm, input schema, timeout/max input
+length and explicit target options. Comparison is exact serialized bytes, not
+semantic JSON equivalence. Replay requires the matching binary and options.
+`--replay-unchecked-identity` permits diagnostic replay of an incompatible record
+with an explicit warning; it does not bypass format/completion/size checks.
+
+Identity does NOT capture environment tuning, dylibs, hardware, driver or a
+controlled schedule. The executable hash is not an immutable loaded-image
+attestation. V3 records verify every input digest before the first target and recheck the
+actual owned bytes at invocation, detecting same-length input replacements.
+This is not authenticated storage or an atomic multi-file snapshot: jointly
+rewriting the manifest and inputs is outside this integrity contract. Replay bounds directory traversal, input count,
+aggregate metadata and total declared input bytes with configurable limits.
+These are logical work limits, not an RSS or allocator quota. Record-ring
+allocation admission and writer-side archive bounds remain open. Do not modify a record during replay.
+Replay in one fresh process:
 
 ```sh
 fuzz_cb_liveness --cb unretained --replay out/records/record-12345-0
-fuzz_cb_liveness --cb unretained --once  out/solutions/<id>          # the crashing input alone
+fuzz_cb_liveness --cb unretained --once out/solutions/<id>
+# Deliberately different binary/options: diagnostic only, never exact replay.
+fuzz_cb_liveness --cb unretained --replay out/records/record-12345-0 --replay-unchecked-identity
 ```
+
+`--once` and replay share the 64 KiB input-byte limit. Single-input execution
+checks the file size before reading and keeps a streaming limit if the file grows;
+oversized inputs are refused before recording or target execution. This is not a
+process-memory cap or verification of build/schedule identity.
 
 A failure that reproduces from the record and not from the single input is a
 state-carryover failure — the class the record exists for. `record_selftest`
@@ -100,6 +189,13 @@ first byte is `0x43` fails iff the previous input's first byte was `0x42`),
 labelled as such because no engine harness carries state across inputs.
 Measured: the campaign's solution replays clean under `--once`; the record
 (9 inputs, `0006.bin` = `42…`, `0007.bin` = `43…`) fails at input 7.
+
+`record_selftest --planted-fault` adds a real fault for the signal route: an
+input starting with `F` loads from a page mapped without access, inside
+`lloom_fuzz::planted` (instrumented). The kernel delivers SIGBUS at a data
+address the harness prints first (`PLANTED_FAULT pid=… addr=…`), so a record's
+`bt.txt` `si_addr=` can be checked against it. A `raise` cannot produce that
+address. The flag is part of the campaign identity.
 
 ## Poisons
 
@@ -111,3 +207,37 @@ Measured: the campaign's solution replays clean under `--once`; the record
   every copy against what it wrote.
 - The paged pool has no bytes to poison; its partition invariant (every page
   in exactly one of free / allocated / quarantined) is the sentinel.
+
+### Replay work limits
+
+All existing replay formats remain supported. Defaults are 4096 inputs, 8192
+visited directory entries (including ignored non-input files), 8 MiB aggregate
+format/manifest/identity/input-path bytes and 256 MiB total declared input bytes.
+Each input remains limited to 64 KiB. Validation finishes before the first target;
+metadata files are size-checked and streamed within their remaining budget.
+Directory enumeration may consume one refusal lookahead entry.
+
+Larger archives can explicitly raise `--replay-max-inputs`, `--replay-max-entries`,
+`--replay-max-metadata-bytes` and `--replay-max-total-input-bytes`; these flags
+require `--replay`. Programmatic callers use `ReplayLimits` with
+`replay_with_identity_and_limits`. Neither larger budgets nor the identity
+override bypass completion, per-input size or v3 content integrity. Allocation
+overheads are bounded by counts but not included in metadata-byte accounting;
+filesystem latency and concurrent file replacement are not bounded by these quotas.
+
+### Recorder setup allocation budget
+
+The campaign installs the existing recorder ring fallibly, with a default
+64 MiB **requested ring-layout** quota (`--record-max-bytes`). This includes
+`N * MAX_INPUT` slot payload bytes and the slot/length metadata-array layouts.
+Checked layouts and the entire quote are validated before any ring allocation;
+metadata uses fallible reservation, and each zeroed slot returns a refusal on
+allocation failure. `--record-max-bytes <larger>` retains larger history support.
+Push/snapshot ordering and their nonblocking atomic permit are unchanged.
+
+This is not a process RSS cap: allocator rounding, concurrent setup attempts,
+identity/path storage and allocating dump I/O are excluded. Legacy `Record::install`
+remains infallible/first-wins; programmatic identified callers can use
+`Record::install_with_identity_and_limits` for explicit recovery. Default identified
+installation uses the same quota. Complete schedule fuzzing remains
+unresolved; this repair does not diagnose or fix the GPU stall.

@@ -69,20 +69,24 @@ fn run_gemm(f32: bool, n: usize) -> Result<()> {
         let commands = Commands::new(command_queue, residency_set.clone()).unwrap();
         let encoder = commands.command_encoder().unwrap();
         let start_time = std::time::Instant::now();
-        lloom_tensor::kernels::call_mlx_gemm(
-            &device,
-            &encoder,
-            &kernels,
-            dtype,
-            (b, m, n, k),
-            &[m * k, k, 1],
-            0,
-            &lhs,
-            &[n * k, n, 1],
-            0,
-            &rhs,
-            &output,
-        )?;
+        // SAFETY: the example owns every buffer bound or mapped here and reads them
+        // only after waiting for the command buffer that writes them.
+        unsafe {
+            lloom_tensor::kernels::call_mlx_gemm(
+                &device,
+                &encoder,
+                &kernels,
+                dtype,
+                (b, m, n, k),
+                &[m * k, k, 1],
+                0,
+                &lhs,
+                &[n * k, n, 1],
+                0,
+                &rhs,
+                &output,
+            )
+        }?;
         drop(encoder);
         commands.wait_until_completed().unwrap();
         let dt = start_time.elapsed().as_secs_f64();

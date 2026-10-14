@@ -47,6 +47,12 @@
 //! - [candle-transformers](https://docs.rs/candle-transformers/). Candle implementation of many published transformer models.
 //!
 
+#[cfg(test)]
+mod free_observer;
+#[cfg(test)]
+#[global_allocator]
+static OBSERVED_SYSTEM: free_observer::ObservedSystem = free_observer::ObservedSystem;
+
 #[cfg(feature = "accelerate")]
 mod accelerate;
 #[cfg(any(feature = "metal", test))]
@@ -62,12 +68,16 @@ mod allocation_header_root;
 mod allocation_header_storage;
 #[cfg(any(feature = "metal", test))]
 mod allocation_owner;
+#[cfg(any(feature = "metal", test))]
+mod allocation_physical_ready;
 pub mod arms;
 pub mod autorelease;
 pub mod backend;
 pub mod backprop;
 #[doc(hidden)]
 pub mod checkout;
+mod cold_box;
+mod cold_bytes;
 mod command_lifecycle;
 mod command_policy;
 mod command_segments;
@@ -84,6 +94,8 @@ pub mod cpu_backend;
 pub mod cuda_backend;
 mod current_command;
 mod custom_op;
+#[cfg(any(feature = "metal", test))]
+mod deferred_failure_relay;
 mod device;
 pub mod display;
 mod dtype;
@@ -97,6 +109,7 @@ mod indexer;
 pub mod isolation;
 pub mod layout;
 pub mod machine;
+mod managed_layout;
 #[cfg(any(feature = "metal", test))]
 mod membership_groups;
 mod memory_accounting;
@@ -108,6 +121,8 @@ pub mod memory_arbitration;
 #[cfg(all(test, not(feature = "metal")))]
 #[path = "kernels/metal/ledger.rs"]
 mod memory_ledger_cpu_tests;
+#[cfg(any(feature = "metal", test))]
+mod native_binding_preflight;
 #[cfg(any(feature = "metal", test))]
 mod native_reuse;
 pub use autorelease::AutoreleaseScope;
@@ -124,6 +139,29 @@ pub struct EscapeGuard(());
 impl EscapeGuard {
     pub fn new() -> Self {
         Self(())
+    }
+}
+/// Waits, before the process exits, for every dropped Metal device to finish
+/// retiring on the host retirement service (`tuning.md` §6.3m).
+#[cfg(feature = "metal")]
+pub use kernels::metal::{join_device_retirement, DeviceRetirementReport};
+/// No backend but Metal retires a device asynchronously.
+#[cfg(not(feature = "metal"))]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct DeviceRetirementReport {
+    pub completed: bool,
+    pub sets_retiring: usize,
+    pub records_pending: usize,
+    pub devices_live: usize,
+    pub worker_stopped: bool,
+    pub listed_at_release: u64,
+}
+#[cfg(not(feature = "metal"))]
+pub fn join_device_retirement(_deadline: std::time::Instant) -> DeviceRetirementReport {
+    DeviceRetirementReport {
+        completed: true,
+        worker_stopped: true,
+        ..Default::default()
     }
 }
 #[cfg(feature = "metal")]
@@ -171,6 +209,7 @@ mod retirement_service;
 pub mod safetensors;
 pub mod scalar;
 pub mod shape;
+pub mod schedule_hook;
 pub mod shape_probe;
 mod sort;
 mod storage;

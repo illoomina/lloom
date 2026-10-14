@@ -10,9 +10,9 @@
 use anyhow::{Context, Result};
 use lloom::nn::{CausalLM, Model, VarBuilder};
 use lloom_tensor::Tensor;
+use parking_lot::Mutex;
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Mutex;
 
 /// One decoded image: 8-bit interleaved RGB and a digest of it.
 ///
@@ -27,14 +27,83 @@ pub struct DecodedImage {
     pub key: [u8; 32],
 }
 
+/// Explicit caller decoding bounds, separate from model/pass admission.
+/// Decoder max_alloc is best-effort; strict dimensions/pixel checks do not
+/// certify third-party decoder internal peak or host allocation enrollment.
+#[derive(Clone, Copy, Debug)]
+pub struct ImageDecodeLimits {
+    pub max_encoded_bytes: usize,
+    pub max_width: u32,
+    pub max_height: u32,
+    pub max_pixels: usize,
+    pub max_decoder_bytes: u64,
+}
+impl ImageDecodeLimits {
+    pub fn validate(self) -> Result<()> {
+        if self.max_encoded_bytes == 0
+            || self.max_width == 0
+            || self.max_height == 0
+            || self.max_pixels == 0
+            || self.max_decoder_bytes == 0
+        {
+            anyhow::bail!("image decode limits must be finite and nonzero");
+        }
+        Ok(())
+    }
+}
+
 impl DecodedImage {
     /// Decode PNG / JPEG bytes. Alpha is dropped, as `PIL.Image.convert("RGB")`
     /// and torchvision's `ImageReadMode.RGB` drop it; greyscale is replicated.
     pub fn decode(bytes: &[u8]) -> Result<Self> {
         let img = image::load_from_memory(bytes).context("decoding the image")?;
+        Ok(Self::from_dynamic(img))
+    }
+
+    /// PNG/JPEG content with supplied bounds before output-image decoding.
+    /// Existing unbounded legacy decode/from_url APIs retain their contract.
+    pub fn decode_bounded(bytes: &[u8], bounds: ImageDecodeLimits) -> Result<Self> {
+        use image::ImageDecoder;
+        bounds.validate()?;
+        if bytes.len() > bounds.max_encoded_bytes {
+            anyhow::bail!("encoded image exceeds supplied byte limit");
+        }
+        let format = image::guess_format(bytes).context("recognizing image content")?;
+        if !matches!(format, image::ImageFormat::Png | image::ImageFormat::Jpeg) {
+            anyhow::bail!("bounded image decoding accepts PNG/JPEG content");
+        }
+        let mut limits = image::Limits::default();
+        limits.max_image_width = Some(bounds.max_width);
+        limits.max_image_height = Some(bounds.max_height);
+        limits.max_alloc = Some(bounds.max_decoder_bytes);
+        let mut reader = image::ImageReader::with_format(std::io::Cursor::new(bytes), format);
+        reader.limits(limits.clone());
+        let mut decoder = reader
+            .into_decoder()
+            .context("reading bounded image header")?;
+        let (w, h) = decoder.dimensions();
+        let pixels = (w as usize)
+            .checked_mul(h as usize)
+            .context("image pixel count overflow")?;
+        if w == 0
+            || h == 0
+            || pixels > bounds.max_pixels
+            || decoder.total_bytes() > bounds.max_decoder_bytes
+        {
+            anyhow::bail!("image dimensions/output exceed supplied decode limits");
+        }
+        // Same output debit as ImageReader::decode; max_alloc remains the
+        // decoder library's non-strict bound, not an allocator entitlement.
+        limits.reserve(decoder.total_bytes())?;
+        decoder.set_limits(limits)?;
+        let img = image::DynamicImage::from_decoder(decoder).context("decoding bounded image")?;
+        Ok(Self::from_dynamic(img))
+    }
+
+    fn from_dynamic(img: image::DynamicImage) -> Self {
         let rgb = img.to_rgb8();
         let (w, h) = rgb.dimensions();
-        Ok(Self::from_rgb8(h as usize, w as usize, rgb.into_raw()))
+        Self::from_rgb8(h as usize, w as usize, rgb.into_raw())
     }
 
     pub fn from_rgb8(height: usize, width: usize, rgb: Vec<u8>) -> Self {
@@ -172,8 +241,19 @@ pub struct ImageRows<'m, M: CausalLM> {
     /// The ids of the chunk the next forward consumes, when it holds an image
     /// position; checked first, so a text forward takes no lock.
     pending: AtomicBool,
-    chunk: Mutex<Vec<u32>>,
+    chunk: Mutex<Option<Vec<u32>>>,
     spliced: AtomicUsize,
+}
+
+struct ImageChunk<'a> {
+    slot: &'a Mutex<Option<Vec<u32>>>,
+    ids: Vec<u32>,
+}
+impl Drop for ImageChunk<'_> {
+    fn drop(&mut self) {
+        self.ids.clear();
+        *self.slot.lock() = Some(std::mem::take(&mut self.ids));
+    }
 }
 
 impl<'m, M: CausalLM> ImageRows<'m, M> {
@@ -191,9 +271,30 @@ impl<'m, M: CausalLM> ImageRows<'m, M> {
             features,
             first_rank,
             pending: AtomicBool::new(false),
-            chunk: Mutex::new(Vec::new()),
+            chunk: Mutex::new(Some(Vec::new())),
             spliced: AtomicUsize::new(0),
         }
+    }
+
+    /// Reserve the existing adapter's prompt-bounded host chunk before any
+    /// model work. Legacy new remains available with fallible first-note growth.
+    pub fn try_new(
+        model: &'m M,
+        prompt: Vec<u32>,
+        image_token_id: u32,
+        features: Tensor,
+        first_rank: usize,
+    ) -> lloom_tensor::Result<Self> {
+        let rows = Self::new(model, prompt, image_token_id, features, first_rank);
+        {
+            let mut slot = rows.chunk.lock();
+            // The new, not-yet-published slot always holds its empty buffer.
+            slot.as_mut()
+                .expect("fresh image chunk slot")
+                .try_reserve_exact(rows.prompt.len())
+                .map_err(lloom_tensor::Error::wrap)?;
+        }
+        Ok(rows)
     }
 
     /// Image rows placed so far, over every forward.
@@ -277,8 +378,14 @@ impl<M: CausalLM> CausalLM for ImageRows<'_, M> {
         cache: &mut Self::Cache,
     ) -> lloom_tensor::Result<Tensor> {
         if self.pending.swap(false, Ordering::Relaxed) {
-            let chunk = std::mem::take(&mut *self.chunk.lock().unwrap_or_else(|e| e.into_inner()));
-            let merged = self.splice(tokens, pos, &chunk)?;
+            let ids = self.chunk.lock().take().ok_or_else(|| {
+                lloom_tensor::Error::msg("image prefill chunk is already in flight")
+            })?;
+            let chunk = ImageChunk {
+                slot: &self.chunk,
+                ids,
+            };
+            let merged = self.splice(tokens, pos, &chunk.ids)?;
             return self.model.forward_embeds(&merged, pos, cache);
         }
         self.model.forward(tokens, pos, cache)
@@ -290,7 +397,21 @@ impl<M: CausalLM> CausalLM for ImageRows<'_, M> {
 
     fn note_input_ids(&self, cache: &mut Self::Cache, ids: &[u32]) -> lloom_tensor::Result<()> {
         if ids.contains(&self.image_token_id) {
-            *self.chunk.lock().unwrap_or_else(|e| e.into_inner()) = ids.to_vec();
+            if ids.len() > self.prompt.len() {
+                lloom_tensor::bail!("image input chunk exceeds its stored prompt bound");
+            }
+            let mut slot = self.chunk.lock();
+            let chunk = slot.as_mut().ok_or_else(|| {
+                lloom_tensor::Error::msg("image input note while chunk is in flight")
+            })?;
+            self.pending.store(false, Ordering::Relaxed);
+            chunk.clear();
+            if ids.len() > chunk.capacity() {
+                chunk
+                    .try_reserve_exact(ids.len())
+                    .map_err(lloom_tensor::Error::wrap)?;
+            }
+            chunk.extend_from_slice(ids);
             self.pending.store(true, Ordering::Relaxed);
         } else {
             self.pending.store(false, Ordering::Relaxed);
@@ -462,3 +583,6 @@ mod tests {
         assert!(err.contains("must be a data URL"), "{err}");
     }
 }
+
+#[cfg(test)]
+mod image_rows_tests;

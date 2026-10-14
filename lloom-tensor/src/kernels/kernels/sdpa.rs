@@ -92,20 +92,24 @@ pub fn sdpa_full_tile(
     itype: SdpaDType,
 ) -> Result<(usize, usize, usize, usize), MetalKernelError> {
     if !SDPA_FULL_HEAD_DIMS.contains(&head_dim) {
-        return Err(MetalKernelError::SdpaHeadSizeMismatch {
-            variation: "full",
-            got: head_dim,
-            expected: SDPA_FULL_HEAD_DIMS.to_vec(),
-        });
+        return Err(MetalKernelError::SdpaHeadSizeMismatch(Box::new(
+            crate::kernels::err::SdpaHeadSizeMismatch {
+                variation: "full",
+                got: head_dim,
+                expected: SDPA_FULL_HEAD_DIMS.to_vec(),
+            },
+        )));
     }
     // BD=512 uses reduced tiles to fit 32KB Metal threadgroup memory (f16/bf16 only).
     if head_dim == 512 {
         if itype == SdpaDType::F32 {
-            return Err(MetalKernelError::SdpaHeadSizeMismatch {
-                variation: "full (f32 unsupported at head_dim=512)",
-                got: head_dim,
-                expected: vec![32, 64, 72, 80, 96, 128, 256],
-            });
+            return Err(MetalKernelError::SdpaHeadSizeMismatch(Box::new(
+                crate::kernels::err::SdpaHeadSizeMismatch {
+                    variation: "full (f32 unsupported at head_dim=512)",
+                    got: head_dim,
+                    expected: vec![32, 64, 72, 80, 96, 128, 256],
+                },
+            )));
         }
         Ok((8, 8, 1, 1))
     } else if head_dim == 256 && itype == SdpaDType::F32 {
@@ -180,8 +184,13 @@ pub struct SdpaPageTable<'a> {
 /// struct is uploaded rather than a second kernel from one body, which is a
 /// different shape of work from every conversion #38 through #103 — and it buys
 /// nothing until prefill is on a replayed position. Recorded rather than done.
+///
+/// # Safety
+/// Every buffer bound here stays unreused and unwritten by the host until
+/// the command buffer it is encoded into completes, and while an ICB that
+/// captured it can replay ([`crate::kernels::utils::EncoderParam`]).
 #[allow(clippy::too_many_arguments)]
-pub fn call_sdpa_full(
+pub unsafe fn call_sdpa_full(
     device: &Device,
     ep: impl EncoderProvider,
     kernels: &Kernels,
@@ -205,31 +214,34 @@ pub fn call_sdpa_full(
     do_causal: bool,
     itype: SdpaDType,
 ) -> Result<(), MetalKernelError> {
-    call_sdpa_full_with(
-        device,
-        ep,
-        kernels,
-        q_offset,
-        q_shape,
-        q_strides,
-        q_buffer,
-        k_offset,
-        k_shape,
-        k_strides,
-        k_buffer,
-        v_offset,
-        v_buffer,
-        v_strides,
-        mask_type,
-        mask_buffer,
-        m_strides,
-        output,
-        o_strides,
-        scale,
-        do_causal,
-        itype,
-        None,
-    )
+    // SAFETY: this function's contract (# Safety above).
+    unsafe {
+        call_sdpa_full_with(
+            device,
+            ep,
+            kernels,
+            q_offset,
+            q_shape,
+            q_strides,
+            q_buffer,
+            k_offset,
+            k_shape,
+            k_strides,
+            k_buffer,
+            v_offset,
+            v_buffer,
+            v_strides,
+            mask_type,
+            mask_buffer,
+            m_strides,
+            output,
+            o_strides,
+            scale,
+            do_causal,
+            itype,
+            None,
+        )
+    }
 }
 
 /// As [`call_sdpa_full`], with the K/V address selected: contiguous strides
@@ -243,8 +255,13 @@ pub fn call_sdpa_full(
 /// / `v_strides` are the pool's `[_, head, token]` strides; the batch stride is
 /// not read. The table is bound at `buffer(8)` and its params at `buffer(7)`,
 /// above the mask's `5`/`6`, so the two optional arms bind independently.
+///
+/// # Safety
+/// Every buffer bound here stays unreused and unwritten by the host until
+/// the command buffer it is encoded into completes, and while an ICB that
+/// captured it can replay ([`crate::kernels::utils::EncoderParam`]).
 #[allow(clippy::too_many_arguments)]
-pub fn call_sdpa_full_with(
+pub unsafe fn call_sdpa_full_with(
     device: &Device,
     ep: impl EncoderProvider,
     kernels: &Kernels,
@@ -261,6 +278,76 @@ pub fn call_sdpa_full_with(
     v_strides: &[usize],
     mask_type: Option<SdpaDType>,
     mask_buffer: Option<&Buffer>,
+    m_strides: Option<&[usize]>,
+    output: &Buffer,
+    o_strides: &[usize],
+    scale: f32,
+    do_causal: bool,
+    itype: SdpaDType,
+    paged: Option<SdpaPageTable<'_>>,
+) -> Result<(), MetalKernelError> {
+    // SAFETY: this function's contract (# Safety above), passed on unchanged.
+    unsafe {
+        call_sdpa_full_with_mask_offset(
+            device,
+            ep,
+            kernels,
+            q_offset,
+            q_shape,
+            q_strides,
+            q_buffer,
+            k_offset,
+            k_shape,
+            k_strides,
+            k_buffer,
+            v_offset,
+            v_buffer,
+            v_strides,
+            mask_type,
+            mask_buffer,
+            0,
+            m_strides,
+            output,
+            o_strides,
+            scale,
+            do_causal,
+            itype,
+            paged,
+        )
+    }
+}
+
+/// [`call_sdpa_full_with`] with an explicit additive-mask byte offset.
+///
+/// The offset belongs to the mask's tensor view, separately from its backing
+/// buffer and outer strides. The compatibility entry point above retains its
+/// original zero-offset contract; callers holding a layout use this entry.
+/// Four mask strides preserve the key axis, including broadcast stride zero;
+/// a legacy three-stride slice retains its implied unit key stride.
+///
+/// # Safety
+/// As [`call_sdpa_full_with`]: every buffer bound here stays unreused and
+/// unwritten by the host until the command buffer it is encoded into
+/// completes, and while an ICB that captured it can replay.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn call_sdpa_full_with_mask_offset(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    q_offset: usize,
+    q_shape: &[usize],
+    q_strides: &[usize],
+    q_buffer: &Buffer,
+    k_offset: usize,
+    k_shape: &[usize],
+    k_strides: &[usize],
+    k_buffer: &Buffer,
+    v_offset: usize,
+    v_buffer: &Buffer,
+    v_strides: &[usize],
+    mask_type: Option<SdpaDType>,
+    mask_buffer: Option<&Buffer>,
+    mask_offset: usize,
     m_strides: Option<&[usize]>,
     output: &Buffer,
     o_strides: &[usize],
@@ -296,7 +383,7 @@ pub fn call_sdpa_full_with(
     #[derive(Debug)]
     #[repr(C)]
     struct AttnMaskParams {
-        m_strides: [i64; 3],
+        m_strides: [i64; 4],
     }
 
     /// Mirrors `AttnPagedParams` in `scaled_dot_product_attention.metal`.
@@ -315,11 +402,13 @@ pub fn call_sdpa_full_with(
         // A key block must sit inside one page: the loader is seated once per
         // block and walks linearly from there.
         if p.page_size == 0 || !p.page_size.is_multiple_of(bk) {
-            return Err(MetalKernelError::SdpaHeadSizeMismatch {
-                variation: "full (paged: page_size must be a multiple of the key block)",
-                got: p.page_size,
-                expected: vec![bk],
-            });
+            return Err(MetalKernelError::SdpaHeadSizeMismatch(Box::new(
+                crate::kernels::err::SdpaHeadSizeMismatch {
+                    variation: "full (paged: page_size must be a multiple of the key block)",
+                    got: p.page_size,
+                    expected: vec![bk],
+                },
+            )));
         }
     }
 
@@ -337,6 +426,10 @@ pub fn call_sdpa_full_with(
     // the same loads they would under `align_K`.
     let align_k = kl.is_multiple_of(bk) && paged.is_none_or(|p| p.n_keys_stride == 0);
     let has_mask = mask_buffer.is_some();
+    // Legacy direct callers may supply the three outer strides only. Their
+    // original contract implied a contiguous key axis; tensor layouts carry
+    // all four, including nonunit and broadcast-zero key strides.
+    let mask_k_stride = m_strides.and_then(|s| s.get(3)).copied().unwrap_or(1);
 
     // When an explicit additive mask is supplied it already encodes causality.
     // Also enabling the in-kernel `do_causal` path double-applies causality and,
@@ -364,6 +457,7 @@ pub fn call_sdpa_full_with(
         (300, Value::Bool(/* has_mask */ has_mask)),
         (301, Value::Bool(/* do_causal */ do_causal)),
         (302, Value::Bool(/* is_paged */ paged.is_some())),
+        (303, Value::Bool(/* mask_k_contiguous */ mask_k_stride == 1)),
     ]));
 
     #[cfg(feature = "debug-labels")]
@@ -422,19 +516,19 @@ pub fn call_sdpa_full_with(
     };
 
     impl EncoderParam for AttnParams {
-        fn set_param(encoder: &ComputeCommandEncoder, position: usize, data: Self) {
+        unsafe fn set_param(encoder: &ComputeCommandEncoder, position: usize, data: Self) {
             encoder.set_bytes(position, &data);
         }
     }
 
     impl EncoderParam for AttnMaskParams {
-        fn set_param(encoder: &ComputeCommandEncoder, position: usize, data: Self) {
+        unsafe fn set_param(encoder: &ComputeCommandEncoder, position: usize, data: Self) {
             encoder.set_bytes(position, &data);
         }
     }
 
     impl EncoderParam for AttnPagedParams {
-        fn set_param(encoder: &ComputeCommandEncoder, position: usize, data: Self) {
+        unsafe fn set_param(encoder: &ComputeCommandEncoder, position: usize, data: Self) {
             encoder.set_bytes(position, &data);
         }
     }
@@ -446,32 +540,39 @@ pub fn call_sdpa_full_with(
                 mask_strides[0] as i64,
                 mask_strides[1] as i64,
                 mask_strides[2] as i64,
+                mask_k_stride as i64,
             ],
         };
 
-        set_params!(
-            encoder,
-            (
-                (q_buffer, q_offset),
-                (k_buffer, k_offset),
-                (v_buffer, v_offset),
-                Output::new(output),
-                params,
-                mask_params,
-                mask
-            )
-        );
+        // SAFETY: this function's contract (# Safety above).
+        unsafe {
+            set_params!(
+                encoder,
+                (
+                    (q_buffer, q_offset),
+                    (k_buffer, k_offset),
+                    (v_buffer, v_offset),
+                    Output::new(output),
+                    params,
+                    mask_params,
+                    (mask, mask_offset)
+                )
+            );
+        }
     } else {
-        set_params!(
-            encoder,
-            (
-                (q_buffer, q_offset),
-                (k_buffer, k_offset),
-                (v_buffer, v_offset),
-                Output::new(output),
-                params
-            )
-        );
+        // SAFETY: this function's contract (# Safety above).
+        unsafe {
+            set_params!(
+                encoder,
+                (
+                    (q_buffer, q_offset),
+                    (k_buffer, k_offset),
+                    (v_buffer, v_offset),
+                    Output::new(output),
+                    params
+                )
+            );
+        }
     }
 
     // The paged bindings sit at fixed slots above the mask's, so they bind
@@ -510,8 +611,13 @@ pub fn call_sdpa_full_with(
 /// - q head dim == 64, 96, 128
 /// - no mask
 /// - q,k,v are contiguous
+///
+/// # Safety
+/// Every buffer bound here stays unreused and unwritten by the host until
+/// the command buffer it is encoded into completes, and while an ICB that
+/// captured it can replay ([`crate::kernels::utils::EncoderParam`]).
 #[allow(clippy::too_many_arguments)]
-pub fn call_sdpa_vector(
+pub unsafe fn call_sdpa_vector(
     device: &Device,
     ep: impl EncoderProvider,
     kernels: &Kernels,
@@ -530,26 +636,29 @@ pub fn call_sdpa_vector(
     softcapping: f32,
     itype: SdpaDType,
 ) -> Result<(), MetalKernelError> {
-    call_sdpa_vector_with(
-        device,
-        ep,
-        kernels,
-        q_offset,
-        q_shape,
-        q_buffer,
-        k_offset,
-        k_shape,
-        k_stride,
-        k_buffer,
-        v_offset,
-        v_stride,
-        v_buffer,
-        output,
-        alpha,
-        softcapping,
-        itype,
-        ParamStyle::default(),
-    )
+    // SAFETY: this function's contract (# Safety above).
+    unsafe {
+        call_sdpa_vector_with(
+            device,
+            ep,
+            kernels,
+            q_offset,
+            q_shape,
+            q_buffer,
+            k_offset,
+            k_shape,
+            k_stride,
+            k_buffer,
+            v_offset,
+            v_stride,
+            v_buffer,
+            output,
+            alpha,
+            softcapping,
+            itype,
+            ParamStyle::default(),
+        )
+    }
 }
 
 /// As [`call_sdpa_vector`], choosing how the scalars are bound.
@@ -582,8 +691,13 @@ pub fn call_sdpa_vector(
 /// already takes its parameters as a `constant AttnParams*`, which is a
 /// pointer rather than a `setBytes` scalar, so it has no `constant &` to
 /// promote. See the note on that function.
+///
+/// # Safety
+/// Every buffer bound here stays unreused and unwritten by the host until
+/// the command buffer it is encoded into completes, and while an ICB that
+/// captured it can replay ([`crate::kernels::utils::EncoderParam`]).
 #[allow(clippy::too_many_arguments)]
-pub fn call_sdpa_vector_with(
+pub unsafe fn call_sdpa_vector_with(
     device: &Device,
     ep: impl EncoderProvider,
     kernels: &Kernels,
@@ -636,11 +750,13 @@ pub fn call_sdpa_vector_with(
         (256, SdpaDType::F32) => "sdpa_vector_float_256",
         (512, SdpaDType::F32) => "sdpa_vector_float_512",
         (other, _) => {
-            return Err(MetalKernelError::SdpaHeadSizeMismatch {
-                variation: "vector",
-                got: *other,
-                expected: SDPA_VECTOR_HEAD_DIMS.to_vec(),
-            })
+            return Err(MetalKernelError::SdpaHeadSizeMismatch(Box::new(
+                crate::kernels::err::SdpaHeadSizeMismatch {
+                    variation: "vector",
+                    got: *other,
+                    expected: SDPA_VECTOR_HEAD_DIMS.to_vec(),
+                },
+            )))
         }
     };
 
@@ -680,21 +796,24 @@ pub fn call_sdpa_vector_with(
     // 1..4 -- which is what `sdpa_vector_packed`'s explicit `[[buffer(N)]]`
     // attributes declare. The classical entry point keeps 0..3.
     let _capture = begin_packed_params(encoder, style);
-    set_params!(
-        encoder,
-        (
-            (q_buffer, q_offset),
-            (k_buffer, k_offset),
-            (v_buffer, v_offset),
-            Output::new(output),
-            gqa_factor,
-            n,
-            kstride,
-            vstride,
-            alpha,
-            softcapping
-        )
-    );
+    // SAFETY: this function's contract (# Safety above).
+    unsafe {
+        set_params!(
+            encoder,
+            (
+                (q_buffer, q_offset),
+                (k_buffer, k_offset),
+                (v_buffer, v_offset),
+                Output::new(output),
+                gqa_factor,
+                n,
+                kstride,
+                vstride,
+                alpha,
+                softcapping
+            )
+        );
+    }
     let _staged = finish_packed_params(device, encoder, style, SDPA_VECTOR_PARAMS_ALIGN)?;
 
     let grid_dims = MTLSize {
@@ -720,8 +839,13 @@ pub fn call_sdpa_vector_with(
 /// its key `i` is pool token `table[r][i / page_size] · page_size + i %
 /// page_size`. Per row the arithmetic is `sdpa_vector`'s over that row's keys
 /// laid contiguously, bit for bit.
+///
+/// # Safety
+/// Every buffer bound here stays unreused and unwritten by the host until
+/// the command buffer it is encoded into completes, and while an ICB that
+/// captured it can replay ([`crate::kernels::utils::EncoderParam`]).
 #[allow(clippy::too_many_arguments)]
-pub fn call_sdpa_vector_paged(
+pub unsafe fn call_sdpa_vector_paged(
     device: &Device,
     ep: impl EncoderProvider,
     kernels: &Kernels,
@@ -767,11 +891,13 @@ pub fn call_sdpa_vector_paged(
             (256, SdpaDType::F32) => "sdpa_vector_2pass_1_paged_float_256",
             (512, SdpaDType::F32) => "sdpa_vector_2pass_1_paged_float_512",
             (other, _) => {
-                return Err(MetalKernelError::SdpaHeadSizeMismatch {
-                    variation: "vector_2pass_1_paged",
-                    got: other,
-                    expected: SDPA_VECTOR_HEAD_DIMS.to_vec(),
-                })
+                return Err(MetalKernelError::SdpaHeadSizeMismatch(Box::new(
+                    crate::kernels::err::SdpaHeadSizeMismatch {
+                        variation: "vector_2pass_1_paged",
+                        got: other,
+                        expected: SDPA_VECTOR_HEAD_DIMS.to_vec(),
+                    },
+                )))
             }
         };
         let name2 = match (head_dim, itype) {
@@ -803,27 +929,30 @@ pub fn call_sdpa_vector_paged(
                 encoder,
                 "sdpa_vector_2pass_1_paged bk={head_dim} rows={rows} nh={nh}"
             );
-            set_params!(
-                encoder,
-                (
-                    (q_buffer, q_offset),
-                    (k_buffer, k_offset),
-                    (v_buffer, v_offset),
-                    Output::new(partials),
-                    Output::new(sums),
-                    Output::new(maxs),
-                    (table, table_offset),
-                    (n_keys, n_keys_offset),
-                    gqa_factor as i32,
-                    nh as i32,
-                    table_stride as i32,
-                    page_size as i32,
-                    k_stride,
-                    v_stride,
-                    alpha,
-                    1.0f32
-                )
-            );
+            // SAFETY: this function's contract (# Safety above).
+            unsafe {
+                set_params!(
+                    encoder,
+                    (
+                        (q_buffer, q_offset),
+                        (k_buffer, k_offset),
+                        (v_buffer, v_offset),
+                        Output::new(partials),
+                        Output::new(sums),
+                        Output::new(maxs),
+                        (table, table_offset),
+                        (n_keys, n_keys_offset),
+                        gqa_factor as i32,
+                        nh as i32,
+                        table_stride as i32,
+                        page_size as i32,
+                        k_stride,
+                        v_stride,
+                        alpha,
+                        1.0f32
+                    )
+                );
+            }
             encoder.dispatch_thread_groups(
                 MTLSize {
                     width: 1,
@@ -846,7 +975,10 @@ pub fn call_sdpa_vector_paged(
                 encoder,
                 "sdpa_vector_2pass_2 (paged rows) bk={head_dim} rows={rows}"
             );
-            set_params!(encoder, (partials, sums, maxs, Output::new(output)));
+            // SAFETY: this function's contract (# Safety above).
+            unsafe {
+                set_params!(encoder, (partials, sums, maxs, Output::new(output)));
+            }
             encoder.dispatch_thread_groups(
                 MTLSize {
                     width: 1,
@@ -876,11 +1008,13 @@ pub fn call_sdpa_vector_paged(
         (256, SdpaDType::F32) => "sdpa_vector_paged_float_256",
         (512, SdpaDType::F32) => "sdpa_vector_paged_float_512",
         (other, _) => {
-            return Err(MetalKernelError::SdpaHeadSizeMismatch {
-                variation: "vector_paged",
-                got: other,
-                expected: SDPA_VECTOR_HEAD_DIMS.to_vec(),
-            })
+            return Err(MetalKernelError::SdpaHeadSizeMismatch(Box::new(
+                crate::kernels::err::SdpaHeadSizeMismatch {
+                    variation: "vector_paged",
+                    got: other,
+                    expected: SDPA_VECTOR_HEAD_DIMS.to_vec(),
+                },
+            )))
         }
     };
     if rows == 0 || nh == 0 || gqa_factor == 0 || page_size == 0 || table_stride == 0 {
@@ -896,25 +1030,28 @@ pub fn call_sdpa_vector_paged(
         encoder,
         "sdpa_vector_paged bk={head_dim} rows={rows} nh={nh}"
     );
-    set_params!(
-        encoder,
-        (
-            (q_buffer, q_offset),
-            (k_buffer, k_offset),
-            (v_buffer, v_offset),
-            Output::new(output),
-            (table, table_offset),
-            (n_keys, n_keys_offset),
-            gqa_factor as i32,
-            nh as i32,
-            table_stride as i32,
-            page_size as i32,
-            k_stride,
-            v_stride,
-            alpha,
-            1.0f32
-        )
-    );
+    // SAFETY: this function's contract (# Safety above).
+    unsafe {
+        set_params!(
+            encoder,
+            (
+                (q_buffer, q_offset),
+                (k_buffer, k_offset),
+                (v_buffer, v_offset),
+                Output::new(output),
+                (table, table_offset),
+                (n_keys, n_keys_offset),
+                gqa_factor as i32,
+                nh as i32,
+                table_stride as i32,
+                page_size as i32,
+                k_stride,
+                v_stride,
+                alpha,
+                1.0f32
+            )
+        );
+    }
     let grid_dims = MTLSize {
         width: 1,
         height: rows * nh,
@@ -1072,8 +1209,13 @@ impl SdpaQuantParams {
 /// vector (§16 #6), so the min/max is one `simd_min`/`simd_max` — §2.3.3 #3's
 /// fixed simdgroup tree, which #265 records as the rule whose cost is
 /// structurally zero.
+///
+/// # Safety
+/// Every buffer bound here stays unreused and unwritten by the host until
+/// the command buffer it is encoded into completes, and while an ICB that
+/// captured it can replay ([`crate::kernels::utils::EncoderParam`]).
 #[allow(clippy::too_many_arguments)]
-pub fn call_quantize_kv(
+pub unsafe fn call_quantize_kv(
     device: &Device,
     ep: impl EncoderProvider,
     kernels: &Kernels,
@@ -1093,19 +1235,23 @@ pub fn call_quantize_kv(
         SdpaDType::F16 => "float16_t",
         SdpaDType::F32 => "float",
         SdpaDType::BF16 => {
-            return Err(MetalKernelError::SdpaHeadSizeMismatch {
-                variation: "quantize_kv (bf16 not instantiated)",
-                got: head_dim,
-                expected: KV_QUANT_HEAD_DIMS.to_vec(),
-            })
+            return Err(MetalKernelError::SdpaHeadSizeMismatch(Box::new(
+                crate::kernels::err::SdpaHeadSizeMismatch {
+                    variation: "quantize_kv (bf16 not instantiated)",
+                    got: head_dim,
+                    expected: KV_QUANT_HEAD_DIMS.to_vec(),
+                },
+            )))
         }
     };
     if !KV_QUANT_HEAD_DIMS.contains(&head_dim) {
-        return Err(MetalKernelError::SdpaHeadSizeMismatch {
-            variation: "quantize_kv",
-            got: head_dim,
-            expected: KV_QUANT_HEAD_DIMS.to_vec(),
-        });
+        return Err(MetalKernelError::SdpaHeadSizeMismatch(Box::new(
+            crate::kernels::err::SdpaHeadSizeMismatch {
+                variation: "quantize_kv",
+                got: head_dim,
+                expected: KV_QUANT_HEAD_DIMS.to_vec(),
+            },
+        )));
     }
     let name = format!("quantize_kv_{itype_repr}_{head_dim}_{}", bits.name());
 
@@ -1119,16 +1265,19 @@ pub fn call_quantize_kv(
         bits.name()
     );
 
-    set_params!(
-        encoder,
-        (
-            (src_buffer, src_offset),
-            Output::new(codes),
-            Output::new(scales),
-            Output::new(biases),
-            params
-        )
-    );
+    // SAFETY: this function's contract (# Safety above).
+    unsafe {
+        set_params!(
+            encoder,
+            (
+                (src_buffer, src_offset),
+                Output::new(codes),
+                Output::new(scales),
+                Output::new(biases),
+                params
+            )
+        );
+    }
 
     let grid_dims = MTLSize {
         width: n_heads,
@@ -1157,8 +1306,13 @@ pub fn call_quantize_kv(
 ///
 /// `n_tokens` is the LIVE length, so this reads the region that has been
 /// written and not the whole capacity.
+///
+/// # Safety
+/// Every buffer bound here stays unreused and unwritten by the host until
+/// the command buffer it is encoded into completes, and while an ICB that
+/// captured it can replay ([`crate::kernels::utils::EncoderParam`]).
 #[allow(clippy::too_many_arguments)]
-pub fn call_dequantize_kv(
+pub unsafe fn call_dequantize_kv(
     device: &Device,
     ep: impl EncoderProvider,
     kernels: &Kernels,
@@ -1177,19 +1331,23 @@ pub fn call_dequantize_kv(
         SdpaDType::F16 => "float16_t",
         SdpaDType::F32 => "float",
         SdpaDType::BF16 => {
-            return Err(MetalKernelError::SdpaHeadSizeMismatch {
-                variation: "dequantize_kv (bf16 not instantiated)",
-                got: head_dim,
-                expected: KV_QUANT_HEAD_DIMS.to_vec(),
-            })
+            return Err(MetalKernelError::SdpaHeadSizeMismatch(Box::new(
+                crate::kernels::err::SdpaHeadSizeMismatch {
+                    variation: "dequantize_kv (bf16 not instantiated)",
+                    got: head_dim,
+                    expected: KV_QUANT_HEAD_DIMS.to_vec(),
+                },
+            )))
         }
     };
     if !KV_QUANT_HEAD_DIMS.contains(&head_dim) {
-        return Err(MetalKernelError::SdpaHeadSizeMismatch {
-            variation: "dequantize_kv",
-            got: head_dim,
-            expected: KV_QUANT_HEAD_DIMS.to_vec(),
-        });
+        return Err(MetalKernelError::SdpaHeadSizeMismatch(Box::new(
+            crate::kernels::err::SdpaHeadSizeMismatch {
+                variation: "dequantize_kv",
+                got: head_dim,
+                expected: KV_QUANT_HEAD_DIMS.to_vec(),
+            },
+        )));
     }
     let name = format!("dequantize_kv_{itype_repr}_{head_dim}_{}", bits.name());
 
@@ -1203,10 +1361,13 @@ pub fn call_dequantize_kv(
         bits.name()
     );
 
-    set_params!(
-        encoder,
-        (codes, scales, biases, Output::new(output), params)
-    );
+    // SAFETY: this function's contract (# Safety above).
+    unsafe {
+        set_params!(
+            encoder,
+            (codes, scales, biases, Output::new(output), params)
+        );
+    }
 
     let grid_dims = MTLSize {
         width: n_heads,
@@ -1228,8 +1389,13 @@ pub fn call_dequantize_kv(
 /// (batch × q head), 1024 threads — because the kernel body is that kernel's
 /// with the loads replaced. See the note in
 /// `scaled_dot_product_attention.metal` for why the dequant is per element.
+///
+/// # Safety
+/// Every buffer bound here stays unreused and unwritten by the host until
+/// the command buffer it is encoded into completes, and while an ICB that
+/// captured it can replay ([`crate::kernels::utils::EncoderParam`]).
 #[allow(clippy::too_many_arguments)]
-pub fn call_sdpa_vector_quant(
+pub unsafe fn call_sdpa_vector_quant(
     device: &Device,
     ep: impl EncoderProvider,
     kernels: &Kernels,
@@ -1247,18 +1413,26 @@ pub fn call_sdpa_vector_quant(
     bits: KvQuantBits,
     itype: SdpaDType,
 ) -> Result<(), MetalKernelError> {
-    encode_sdpa_vector_quant(
-        device, ep, kernels, q_offset, q_shape, q_buffer, k_codes, k_scales, k_biases, v_codes,
-        v_scales, v_biases, output, params, None, bits, itype,
-    )
+    // SAFETY: this function's contract (# Safety above).
+    unsafe {
+        encode_sdpa_vector_quant(
+            device, ep, kernels, q_offset, q_shape, q_buffer, k_codes, k_scales, k_biases, v_codes,
+            v_scales, v_biases, output, params, None, bits, itype,
+        )
+    }
 }
 
 /// [`call_sdpa_vector_quant`] over a selection of the cache: key `i` is read
 /// at cell `sel[i]` (`u32`, at byte offset `sel_offset`), and the params' `N`
 /// is the selection's length. QSA's indexer cells, read from the planes
 /// without gathering them first (`DESIGN.md` §10.7).
+///
+/// # Safety
+/// Every buffer bound here stays unreused and unwritten by the host until
+/// the command buffer it is encoded into completes, and while an ICB that
+/// captured it can replay ([`crate::kernels::utils::EncoderParam`]).
 #[allow(clippy::too_many_arguments)]
-pub fn call_sdpa_vector_quant_sel(
+pub unsafe fn call_sdpa_vector_quant_sel(
     device: &Device,
     ep: impl EncoderProvider,
     kernels: &Kernels,
@@ -1277,29 +1451,36 @@ pub fn call_sdpa_vector_quant_sel(
     bits: KvQuantBits,
     itype: SdpaDType,
 ) -> Result<(), MetalKernelError> {
-    encode_sdpa_vector_quant(
-        device,
-        ep,
-        kernels,
-        q_offset,
-        q_shape,
-        q_buffer,
-        k_codes,
-        k_scales,
-        k_biases,
-        v_codes,
-        v_scales,
-        v_biases,
-        output,
-        params,
-        Some(sel),
-        bits,
-        itype,
-    )
+    // SAFETY: this function's contract (# Safety above).
+    unsafe {
+        encode_sdpa_vector_quant(
+            device,
+            ep,
+            kernels,
+            q_offset,
+            q_shape,
+            q_buffer,
+            k_codes,
+            k_scales,
+            k_biases,
+            v_codes,
+            v_scales,
+            v_biases,
+            output,
+            params,
+            Some(sel),
+            bits,
+            itype,
+        )
+    }
 }
 
+/// # Safety
+/// Every buffer bound here stays unreused and unwritten by the host until
+/// the command buffer it is encoded into completes, and while an ICB that
+/// captured it can replay ([`crate::kernels::utils::EncoderParam`]).
 #[allow(clippy::too_many_arguments)]
-fn encode_sdpa_vector_quant(
+unsafe fn encode_sdpa_vector_quant(
     device: &Device,
     ep: impl EncoderProvider,
     kernels: &Kernels,
@@ -1323,19 +1504,23 @@ fn encode_sdpa_vector_quant(
         SdpaDType::F16 => "float16_t",
         SdpaDType::F32 => "float",
         SdpaDType::BF16 => {
-            return Err(MetalKernelError::SdpaHeadSizeMismatch {
-                variation: "sdpa_vector_quant (bf16 not instantiated)",
-                got: head_dim,
-                expected: KV_QUANT_HEAD_DIMS.to_vec(),
-            })
+            return Err(MetalKernelError::SdpaHeadSizeMismatch(Box::new(
+                crate::kernels::err::SdpaHeadSizeMismatch {
+                    variation: "sdpa_vector_quant (bf16 not instantiated)",
+                    got: head_dim,
+                    expected: KV_QUANT_HEAD_DIMS.to_vec(),
+                },
+            )))
         }
     };
     if !KV_QUANT_HEAD_DIMS.contains(&head_dim) {
-        return Err(MetalKernelError::SdpaHeadSizeMismatch {
-            variation: "sdpa_vector_quant",
-            got: head_dim,
-            expected: KV_QUANT_HEAD_DIMS.to_vec(),
-        });
+        return Err(MetalKernelError::SdpaHeadSizeMismatch(Box::new(
+            crate::kernels::err::SdpaHeadSizeMismatch {
+                variation: "sdpa_vector_quant",
+                got: head_dim,
+                expected: KV_QUANT_HEAD_DIMS.to_vec(),
+            },
+        )));
     }
     let family = if sel.is_some() {
         "sdpa_vector_quant_sel"
@@ -1353,37 +1538,43 @@ fn encode_sdpa_vector_quant(
 
     match sel {
         None => {
-            set_params!(
-                encoder,
-                (
-                    (q_buffer, q_offset),
-                    k_codes,
-                    k_scales,
-                    k_biases,
-                    v_codes,
-                    v_scales,
-                    v_biases,
-                    Output::new(output),
-                    params
-                )
-            );
+            // SAFETY: this function's contract (# Safety above).
+            unsafe {
+                set_params!(
+                    encoder,
+                    (
+                        (q_buffer, q_offset),
+                        k_codes,
+                        k_scales,
+                        k_biases,
+                        v_codes,
+                        v_scales,
+                        v_biases,
+                        Output::new(output),
+                        params
+                    )
+                );
+            }
         }
         Some(sel) => {
-            set_params!(
-                encoder,
-                (
-                    (q_buffer, q_offset),
-                    k_codes,
-                    k_scales,
-                    k_biases,
-                    v_codes,
-                    v_scales,
-                    v_biases,
-                    Output::new(output),
-                    params,
-                    sel
-                )
-            );
+            // SAFETY: this function's contract (# Safety above).
+            unsafe {
+                set_params!(
+                    encoder,
+                    (
+                        (q_buffer, q_offset),
+                        k_codes,
+                        k_scales,
+                        k_biases,
+                        v_codes,
+                        v_scales,
+                        v_biases,
+                        Output::new(output),
+                        params,
+                        sel
+                    )
+                );
+            }
         }
     }
 
@@ -1449,8 +1640,13 @@ pub const SDPA_2PASS_BLOCKS: usize = 32;
 /// - q head dim == 64, 96, 128
 /// - no mask
 /// - q,k,v are contiguous
+///
+/// # Safety
+/// Every buffer bound here stays unreused and unwritten by the host until
+/// the command buffer it is encoded into completes, and while an ICB that
+/// captured it can replay ([`crate::kernels::utils::EncoderParam`]).
 #[allow(clippy::too_many_arguments)]
-pub fn call_sdpa_vector_2pass(
+pub unsafe fn call_sdpa_vector_2pass(
     device: &Device,
     ep: impl EncoderProvider,
     kernels: &Kernels,
@@ -1496,11 +1692,13 @@ pub fn call_sdpa_vector_2pass(
             (256, SdpaDType::F32) => "sdpa_vector_2pass_1_float_256",
             (512, SdpaDType::F32) => "sdpa_vector_2pass_1_float_512",
             (other, _) => {
-                return Err(MetalKernelError::SdpaHeadSizeMismatch {
-                    variation: "vector_2pass_1",
-                    got: *other,
-                    expected: SDPA_VECTOR_HEAD_DIMS.to_vec(),
-                })
+                return Err(MetalKernelError::SdpaHeadSizeMismatch(Box::new(
+                    crate::kernels::err::SdpaHeadSizeMismatch {
+                        variation: "vector_2pass_1",
+                        got: *other,
+                        expected: SDPA_VECTOR_HEAD_DIMS.to_vec(),
+                    },
+                )))
             }
         };
 
@@ -1531,23 +1729,26 @@ pub fn call_sdpa_vector_2pass(
         // q = (bs, qhead, seq, hidden)
         // k/v = (bs, kv_head, kv_seq, hidden)
 
-        set_params!(
-            encoder,
-            (
-                (q_buffer, q_offset),
-                (k_buffer, k_offset),
-                (v_buffer, v_offset),
-                Output::new(intermediate),
-                Output::new(sums),
-                Output::new(maxs),
-                gqa_factor,
-                n,
-                kstride,
-                vstride,
-                alpha,
-                softcapping
-            )
-        );
+        // SAFETY: this function's contract (# Safety above).
+        unsafe {
+            set_params!(
+                encoder,
+                (
+                    (q_buffer, q_offset),
+                    (k_buffer, k_offset),
+                    (v_buffer, v_offset),
+                    Output::new(intermediate),
+                    Output::new(sums),
+                    Output::new(maxs),
+                    gqa_factor,
+                    n,
+                    kstride,
+                    vstride,
+                    alpha,
+                    softcapping
+                )
+            );
+        }
 
         let grid_dims = MTLSize {
             width: 1,
@@ -1585,11 +1786,13 @@ pub fn call_sdpa_vector_2pass(
             (256, SdpaDType::F32) => "sdpa_vector_2pass_2_float_256",
             (512, SdpaDType::F32) => "sdpa_vector_2pass_2_float_512",
             (other, _) => {
-                return Err(MetalKernelError::SdpaHeadSizeMismatch {
-                    variation: "vector_2pass_2",
-                    got: *other,
-                    expected: SDPA_VECTOR_HEAD_DIMS.to_vec(),
-                })
+                return Err(MetalKernelError::SdpaHeadSizeMismatch(Box::new(
+                    crate::kernels::err::SdpaHeadSizeMismatch {
+                        variation: "vector_2pass_2",
+                        got: *other,
+                        expected: SDPA_VECTOR_HEAD_DIMS.to_vec(),
+                    },
+                )))
             }
         };
 
@@ -1604,7 +1807,10 @@ pub fn call_sdpa_vector_2pass(
         // q = (bs, qhead, seq, hidden)
         // k/v = (bs, kv_head, kv_seq, hidden)
 
-        set_params!(encoder, (intermediate, sums, maxs, Output::new(output)));
+        // SAFETY: this function's contract (# Safety above).
+        unsafe {
+            set_params!(encoder, (intermediate, sums, maxs, Output::new(output)));
+        }
 
         let grid_dims = MTLSize {
             width: 1,

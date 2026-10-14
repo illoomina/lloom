@@ -18,13 +18,20 @@ use std::sync::Arc;
 /// Native generations must retain this anchor through real host retirement.
 /// Arc/container metadata here is host overhead, not a physical-buffer charge.
 pub(crate) struct AllocationNamespace {
+    // Some requires explicit model ExecutionScope; None is the default device.
     pub(super) domain: Option<ModelDomain>,
+    // Same process account, actual native payer even before the first model.
+    // Numerical default enrollment is not machine/model admission.
+    pub(super) native_domain: ModelDomain,
     pub(super) membership: Arc<crate::kernels::metal::membership::MembershipDomain>,
     pub(super) constants: Arc<ConstantsByValue>,
     pub(super) dequant_scratch: Mutex<Option<BufferHandle>>,
     pub(super) buffers: BufferPool,
     pub(super) private_buffers: BufferPool,
     pub(super) backings: Arc<Backings>,
+    // Inactive cold-installed genuine descriptors; no legacy selector fallback.
+    pub(super) output_catalog:
+        std::sync::OnceLock<super::planned_output_catalog::PlannedOutputCatalog>,
     pub(super) arena_reservation: Arc<Mutex<Option<crate::kernels::metal::ledger::Reservation>>>,
     pub(super) arena: Arc<RwLock<Option<Arena>>>,
     pub(super) arena_recorder: Arc<Mutex<Option<Arc<Mutex<ArenaRecorder>>>>>,
@@ -42,14 +49,31 @@ pub(crate) struct AllocationNamespace {
     pub(super) next_pass_variant: Arc<std::sync::atomic::AtomicU32>,
 }
 impl AllocationNamespace {
+    /// Actual default namespace only; a supplied namespace must use its open
+    /// ExecutionScope AllocationContext. Borrow adds no owner/allocation/lock.
+    /// Caller must select the active scope FIRST; this is not an ambient fallback.
+    pub(super) fn default_operation_context(
+        &self,
+    ) -> crate::memory_admission::Result<crate::memory_admission::OperationContext<'_>> {
+        if self.domain.is_some() {
+            return Err(crate::memory_admission::AllocationError::DifferentDomain);
+        }
+        // SAFETY: exact immutable default namespace domain borrowed from self;
+        // no issuer or owner escapes. Caller preserves active-scope selection.
+        Ok(unsafe {
+            crate::memory_admission::OperationContext::default_namespace(&self.native_domain)
+        })
+    }
     pub(super) fn new(
         device: &Device,
         clock: Arc<GpuClock>,
         residency_set: &Arc<ResidencySet>,
         ledger: &Arc<crate::kernels::metal::ledger::Ledger>,
         domain: Option<ModelDomain>,
+        default_native: ModelDomain,
         pool_policy: Option<(&BufferPool, &BufferPool)>,
     ) -> Arc<Self> {
+        let native_domain = domain.clone().unwrap_or(default_native);
         // Both pools decide reuse against the GPU's progress through the command
         // queue, not against CPU refcounts. `Commands` owns that clock and is
         // the only thing that advances it.
@@ -71,7 +95,7 @@ impl AllocationNamespace {
         let membership = crate::kernels::metal::membership::MembershipDomain::new_in(
             residency_set.clone(),
             super::device::retain_evicted_allocations(),
-            domain.clone(),
+            Some(native_domain.clone()),
         );
         let transient = |options: MTLResourceOptions| -> Arc<dyn Backing> {
             if transient_heaps_on() {
@@ -83,7 +107,8 @@ impl AllocationNamespace {
                         heap_chunk_bytes(),
                         Some(Arc::clone(ledger)),
                     )
-                    .with_membership(membership.clone()),
+                    .with_membership(membership.clone())
+                    .with_native_payer(native_domain.clone(), domain.is_some()),
                 )
             } else {
                 Arc::new(
@@ -94,7 +119,8 @@ impl AllocationNamespace {
                         Commit::Deferred,
                         Some(Arc::clone(ledger)),
                     )
-                    .with_membership(membership.clone()),
+                    .with_membership(membership.clone())
+                    .with_native_payer(native_domain.clone(), domain.is_some()),
                 )
             }
         };
@@ -108,7 +134,8 @@ impl AllocationNamespace {
                 Commit::Now,
                 Some(Arc::clone(ledger)),
             )
-            .with_membership(membership.clone()),
+            .with_membership(membership.clone())
+            .with_native_payer(native_domain.clone(), domain.is_some()),
             resident_private: DeviceBuffer::new(
                 device,
                 Arc::clone(residency_set),
@@ -116,7 +143,8 @@ impl AllocationNamespace {
                 Commit::Now,
                 Some(Arc::clone(ledger)),
             )
-            .with_membership(membership.clone()),
+            .with_membership(membership.clone())
+            .with_native_payer(native_domain.clone(), domain.is_some()),
             mapped_shared: Mapped::new(
                 device,
                 Arc::clone(residency_set),
@@ -124,7 +152,8 @@ impl AllocationNamespace {
                 Commit::Now,
                 Some(Arc::clone(ledger)),
             )
-            .with_membership(membership.clone()),
+            .with_membership(membership.clone())
+            .with_native_payer(native_domain.clone(), domain.is_some()),
         });
         // The pools do not subscribe to command-buffer completion. The handler
         // advances the clock, and each pool drains what it made reusable at
@@ -148,12 +177,14 @@ impl AllocationNamespace {
 
         Arc::new(Self {
             domain,
+            native_domain,
             membership,
             constants: Arc::new(ConstantsByValue::new()),
             dequant_scratch: Mutex::new(None),
             buffers,
             private_buffers,
             backings,
+            output_catalog: std::sync::OnceLock::new(),
             arena_reservation: Arc::new(Mutex::new(None)),
             arena: Arc::new(RwLock::new(None)),
             arena_recorder: Arc::new(Mutex::new(None)),

@@ -512,10 +512,20 @@ impl GenerationBindings {
     // Used by direct public CommandBuffer::commit too. Commands staged its
     // exact epoch first; direct same-queue commit reserves only if still OPEN.
     // Existing native prepared order/admission excludes competing staging.
-    pub(super) fn ensure_staged(&self) -> Result<(), MetalKernelError> {
+    // A commit that takes its own epoch runs `before_epoch` first: the
+    // queue's completion hook must count every epoch taken on this clock
+    // (`completion_hook.rs`). A refusal after the epoch quarantines.
+    pub(super) fn ensure_staged(
+        &self,
+        before_epoch: impl FnOnce() -> Result<(), MetalKernelError>,
+    ) -> Result<(), MetalKernelError> {
         let witness = self.head.captures().witness.captures();
         match witness.phase.load(Ordering::Acquire) {
-            OPEN => metadata(witness.stage_epoch(witness.clock.commit_epoch())),
+            OPEN => {
+                before_epoch()?;
+                metadata(witness.stage_epoch(witness.clock.commit_epoch()))
+                    .inspect_err(|_| self.quarantine(Failure::AdapterFailed))
+            }
             STAGED => Ok(()),
             _ => Err(refused("native binding generation not stageable")),
         }
@@ -1354,6 +1364,47 @@ mod inventory_controls {
                 old.queue_failure.clone(),
             ))
         })
+    }
+    /// A commit Commands did not stage takes its own epoch, and runs
+    /// `before_epoch` first and only then: the queue's completion hook counts
+    /// every epoch taken on its clock (`completion_hook.rs`). A refusal there
+    /// takes no epoch; a staged generation takes none and runs nothing.
+    /// Absolute references: the clock's epoch before, inside and after.
+    #[test]
+    fn a_direct_commit_flags_before_it_takes_its_own_epoch_and_only_then() {
+        let (bank, service, domain) = bank(1);
+        let prepared = prepare(&bank, &service).unwrap();
+        let head = prepared.constructor_head().unwrap();
+        let clock = head.head.captures().witness.captures().clock.clone();
+        let refused = head.ensure_staged(|| Err(refused("fixture refusal")));
+        assert!(refused.is_err());
+        assert_eq!(clock.current_epoch().0, 0, "a refused flag took an epoch");
+        let mut flagged_at = None;
+        head.ensure_staged(|| {
+            flagged_at = Some(clock.current_epoch().0);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(flagged_at, Some(0), "the flag must precede the epoch");
+        assert_eq!(clock.current_epoch().0, 1, "one epoch for one direct commit");
+        let mut again = false;
+        head.ensure_staged(|| {
+            again = true;
+            Ok(())
+        })
+        .unwrap();
+        assert!(!again, "a staged generation flagged a second time");
+        assert_eq!(clock.current_epoch().0, 1, "a staged generation took an epoch");
+        drop(prepared); // Cancels the unobserved staged epoch's witness.
+        assert!(matches!(
+            head.head.captures().witness.captures().cutoff(),
+            Some(Cutoff::NeverSubmitted)
+        ));
+        drop(head);
+        drain(&service);
+        drop(bank);
+        drain(&service);
+        assert_eq!(domain.snapshot(), AccountSnapshot::default());
     }
     #[test]
     fn inventory_first_page_unconsumed_cancel_returns_credit() {

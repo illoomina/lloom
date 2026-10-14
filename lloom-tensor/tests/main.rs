@@ -100,6 +100,7 @@ fn every_test_file_is_a_module() {
     let own: &[&str] = &[
         "metal_pool_alloc_free",
         "metal_cb_failure_tests",
+        "metal_commit_alloc_free",
         "allocation_refusal_alloc_free",
     ];
     let dir = format!("{}/tests", lloom_manifest_dir());

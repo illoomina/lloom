@@ -89,12 +89,25 @@ fn commit_a_copy_of_a_released_buffer(
     cmds.flush_marker()
 }
 
+/// The queue's latch reports a failure: set by the failed buffer's
+/// completion, which can trail the error a producer saw first.
+fn latched(cmds: &Commands) -> bool {
+    let start = std::time::Instant::now();
+    while cmds.check_failed().is_ok() {
+        if start.elapsed() > std::time::Duration::from_secs(5) {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    true
+}
+
 /// The latch, after the injected buffer failed: the failure is Metal's, and
 /// the queue reports it at every later commit and wait.
 fn assert_latched(device: &Device, cmds: &Commands, failure: &MetalKernelError, attempt: usize) {
     let msg = failure.to_string();
     assert!(msg.contains("Invalid Resource"), "attempt {attempt}: {msg}");
-    assert!(cmds.check_failed().is_err());
+    assert!(latched(cmds), "attempt {attempt}: the failure never latched");
     assert!(affine_then_wait(device, cmds).is_err());
     assert!(cmds.flush_and_wait().is_err());
 }
@@ -110,7 +123,9 @@ fn assert_latched(device: &Device, cmds: &Commands, failure: &MetalKernelError, 
 /// and that registration reads the queue's latch, so when Metal has failed the
 /// copy before it, `flush_marker` returns the failure instead of a marker.
 /// That is the latch reporting at a later commit, and it is held to the same
-/// assertions.
+/// assertions (`docs/tuning.md` §13.5x). The queue's latch is set when the
+/// failed buffer's completion runs, which can trail the error the commit
+/// returned, so the test waits for it rather than read it once.
 ///
 /// Metal does not fail the released read every time: alone in a process it
 /// failed 4 of 4 copies, beside other GPU tests most completed. So the
@@ -146,6 +161,8 @@ fn a_failed_command_buffer_fails_the_next_wait_whichever_buffer_it_names() {
             if first_failed { "had" } else { "had not" }
         );
         if first_failed {
+            // On this path the latch is set before the wait returns.
+            assert!(cmds.check_failed().is_err(), "attempt {attempt}");
             assert_latched(&device, &cmds, &waited.unwrap_err(), attempt);
             at_wait += 1;
             if at_wait + at_commit == 2 {

@@ -348,3 +348,98 @@ fn the_batched_scheduler_prefills_in_the_window_and_its_decode_rows_do_not() -> 
     );
     Ok(())
 }
+
+/// A prefill that fails leaves no window behind: a prompt past the model's
+/// position ceiling is refused by the session's prefill and by a forward run
+/// inside a prefill window, and afterwards this thread's two-row half matmul
+/// is the one-row reduction's, row for row — the K=1 path's bits.
+#[test]
+fn a_failed_prefill_leaves_no_window_behind() -> Result<()> {
+    let Ok(dev) = Device::new_metal(0) else {
+        eprintln!("no Metal device; skipping");
+        return Ok(());
+    };
+    let Some(fx) = Fixture::<Lfm2Tiny>::new("prefill_window_failed", tiny_geometry())? else {
+        return Ok(());
+    };
+    let cfg = fx.config(arms);
+    let model = fx.model_in::<RewindableExact>(&cfg, Some(DType::F16), &dev)?;
+    Window::Prefill.set_arm(true);
+    let too_long: Vec<u32> = (0..200).map(|i| 1 + i % 60).collect();
+
+    let mut session = Session::new(
+        &model,
+        State::<RewindableExact>::new(true, DType::F16, &cfg, &dev)?,
+    );
+    let mut rb = Blocking::new(&[EOS], &dev)?;
+    let refused = session.prefill(&mut rb, &too_long, &DecodeOptions::new(4));
+    assert!(
+        refused.is_err(),
+        "a prompt past the ceiling was not refused"
+    );
+    assert!(
+        !Window::Prefill.is_open(),
+        "the failed session prefill left its window open"
+    );
+
+    let mut cache = State::<RewindableExact>::new(true, DType::F16, &cfg, &dev)?;
+    let input = lloom_tensor::Tensor::new(too_long.as_slice(), &dev)?.unsqueeze(0)?;
+    let inside = {
+        let _prefill = lloom_tensor::tuning::VerifyWindow::prefill();
+        model.forward(&input, 0, &mut cache)
+    };
+    assert!(
+        inside.is_err(),
+        "the forward past the ceiling was not refused"
+    );
+    assert!(
+        !Window::Prefill.is_open(),
+        "the failed forward left its window open"
+    );
+
+    let w = lloom_tensor::Tensor::from_vec(
+        (0..64 * 128)
+            .map(|i| (i as f32 * 0.61).sin() * 0.05)
+            .collect::<Vec<_>>(),
+        (64, 128),
+        &dev,
+    )?
+    .to_dtype(DType::F16)?;
+    let x = lloom_tensor::Tensor::from_vec(
+        (0..2 * 128)
+            .map(|i| (i as f32 * 0.013).sin())
+            .collect::<Vec<_>>(),
+        (2, 128),
+        &dev,
+    )?
+    .to_dtype(DType::F16)?;
+    let bits = |t: &lloom_tensor::Tensor| -> Result<Vec<u32>> {
+        Ok(t.to_dtype(DType::F32)?
+            .flatten_all()?
+            .to_vec1::<f32>()?
+            .into_iter()
+            .map(f32::to_bits)
+            .collect())
+    };
+    let before = Window::Prefill.gemms();
+    let rows = x.matmul(&w.t()?)?;
+    for r in 0..2 {
+        let one = x.narrow(0, r, 1)?.matmul(&w.t()?)?;
+        assert_eq!(
+            bits(&rows.narrow(0, r, 1)?)?,
+            bits(&one)?,
+            "row {r} after a failed prefill is not the one-row reduction's"
+        );
+    }
+    assert_eq!(
+        Window::Prefill.gemms(),
+        before,
+        "a matmul after the failed prefill counted on its window"
+    );
+    eprintln!(
+        "PREFILL_WINDOW_FAILED session_err={} forward_err={}",
+        refused.is_err(),
+        inside.is_err()
+    );
+    Ok(())
+}

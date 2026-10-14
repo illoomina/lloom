@@ -1147,6 +1147,9 @@ fn run<P: Lfm2Shape>(args: Args, matches: ArgMatches) -> Result<()> {
             // Rust-owned logits/cache survive; temporary Obj-C references do not
             // accumulate for the lifetime of the standalone harness thread.
             let _pool = candle::AutoreleaseScope::new();
+            // A prefill, as the engine's driver opens it (architecture.md
+            // §2.3.5b): its half matmuls take the prefill window's arm.
+            let _prefill = candle::tuning::VerifyWindow::prefill();
             let input = Tensor::new(turn_ids.as_slice(), &device)?.unsqueeze(0)?;
             model
                 .forward(&input, kv_len, &mut cache)

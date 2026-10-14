@@ -28,9 +28,23 @@ pub struct Installed {
     pub pass_plans: bool,
     /// The `--pass-widths` arm, for the pass-plan line.
     pub pass_widths: &'static str,
+    /// An arm the run asked for that the load did not install, and why
+    /// (`ExecutorConfig::under_body`): a load warning.
+    pub declined: Option<String>,
 }
 
 impl Installed {
+    /// The declined arm as a load warning, printed once where it is kept.
+    pub fn declined_warning(&self) -> Option<lloom::load_warning::LoadWarning> {
+        self.declined.as_ref().map(|note| {
+            eprintln!("[executor {note}]");
+            lloom::load_warning::LoadWarning::new(
+                lloom::load_warning::LoadWarningKind::Executor,
+                note.clone(),
+            )
+        })
+    }
+
     fn any(&self) -> bool {
         self.arena || self.packed || self.pass_plans || self.replay_installed()
     }

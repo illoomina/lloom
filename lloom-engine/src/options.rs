@@ -1288,7 +1288,8 @@ fn parse_barrier_scope(v: &str) -> Result<String, String> {
 /// The Metal executor arms (`DESIGN.md` §9.2, §11.1–11.3; `--arena
 /// --arena-layout --packed --replay --replay-barriers --replay-barrier-scope
 /// --pass-plans`): installed on the device at load,
-/// before the model. Instruments and A/B arms — none is the shipping path.
+/// before the model. The pass-plan cache is on by default; the others are
+/// instruments and A/B arms. A load installs [`ExecutorConfig::under_body`].
 #[derive(Options, Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(default)]
 pub struct ExecutorConfig {
@@ -1333,6 +1334,36 @@ impl ExecutorConfig {
     /// cache off).
     pub fn pass_plans_armed(&self) -> bool {
         self.pass_plans && !self.arena && !self.replay
+    }
+
+    /// The arms a load installs for its body, and what changed from the
+    /// request. The single-key arena is served by allocation ordinal, which a
+    /// speculative round does not hold stable (`install_executor`, DESIGN.md
+    /// §11.3x), so under a speculative body `arena` is not installed; the
+    /// pass-plan cache, when asked for, is the planned route that serves.
+    /// Replay under a speculative body is refused by the installer. The
+    /// returned arms are what the load reports and installs, so no line
+    /// names an arm that is not installed.
+    pub fn under_body(&self, speculative: bool) -> (ExecutorConfig, Option<String>) {
+        if !(speculative && self.arena && !self.replay) {
+            return (self.clone(), None);
+        }
+        let installed = ExecutorConfig {
+            arena: false,
+            ..self.clone()
+        };
+        let instead = if installed.pass_plans_armed() {
+            "the pass-plan cache serves instead"
+        } else {
+            "no planned executor serves (`--pass-plans false`)"
+        };
+        (
+            installed,
+            Some(format!(
+                "executor.arena is not installed under a speculative body (it is served by \
+                 allocation ordinal, which a speculative round does not hold stable); {instead}"
+            )),
+        )
     }
 
     /// The arms for a report line, from the group that was installed.
@@ -1566,7 +1597,13 @@ pub struct LoadConfig {
     )]
     pub decision_template: Option<String>,
     /// Load no vision or audio tower (a GGUF's mmproj, a VL checkpoint's tower): for text workloads, at the tower's memory. Image requests are then refused by name, and `/v1/models` lists text input only.
-    #[opt(bool, flag = "text-only", path = "model.text_only", status = "advanced", cli = "text-only")]
+    #[opt(
+        bool,
+        flag = "text-only",
+        path = "model.text_only",
+        status = "advanced",
+        cli = "text-only"
+    )]
     pub text_only: bool,
     /// Compile the prefill pipelines at load (off: the first prompt compiles them inside its own time to first token).
     #[opt(bool, flag = "warmup", path = "model.warmup", status = "advanced", switches = ["no-warmup=false"])]

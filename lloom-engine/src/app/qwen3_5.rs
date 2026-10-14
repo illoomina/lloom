@@ -466,7 +466,11 @@ fn load_on<P: Profile>(
     let arch = arch_of(&content).context("not a qwen35 / qwen35moe GGUF")?;
     drop(f);
     let text = prepare_text(&mut opts, &content, arch)?;
-    let installed = super::common::install_executor(&device, &opts.executor, opts.mtp)?;
+    // What is installed is what the load reports (`ExecutorConfig::under_body`).
+    let (executor, executor_note) = opts.executor.under_body(opts.mtp);
+    opts.executor = executor;
+    let mut installed = super::common::install_executor(&device, &opts.executor, opts.mtp)?;
+    installed.declined = executor_note;
     #[cfg(feature = "metal")]
     if let Some(mb) = opts.memory.free_budget_mb {
         if let Device::Metal(m) = &device {
@@ -513,6 +517,7 @@ fn load_on<P: Profile>(
     };
     let t = Instant::now();
     let mut warnings = Vec::new();
+    warnings.extend(installed.declined_warning());
     match arch {
         lloom::models::qwen3_5::ARCH_DENSE | lloom::models::qwen3_5::ARCH_CLEF => {
             let (model, head): (Qwen3_5<P>, _) = Qwen3_5::from_gguf_shards_with_mtp_preflight(

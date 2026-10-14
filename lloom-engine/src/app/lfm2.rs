@@ -836,7 +836,7 @@ impl<P: Lfm2Shape> Engine<P> {
     }
 
     fn load_on_with_preflight(
-        opts: LoadOptions,
+        mut opts: LoadOptions,
         device: Device,
         admission: LoadAdmission,
         preflight: impl FnOnce(&Config, &Text) -> Result<()>,
@@ -883,8 +883,12 @@ impl<P: Lfm2Shape> Engine<P> {
                 m.set_free_budget(mb * 1024 * 1024);
             }
         }
+        // What is installed is what the load reports (`ExecutorConfig::under_body`).
+        let (executor, executor_note) = opts.executor.under_body(dspark_dir.is_some());
+        opts.executor = executor;
         let mut installed =
             super::common::install_executor(&device, &opts.executor, dspark_dir.is_some())?;
+        installed.declined = executor_note;
         installed.pass_widths = match opts.decode.prefill.pass_widths {
             lloom::nn::PassWidths::Lru => "lru",
             lloom::nn::PassWidths::Ladder => "ladder",
@@ -895,6 +899,7 @@ impl<P: Lfm2Shape> Engine<P> {
         // verify); structured prompts (7.8–8.3 accepted) pay at every B.
         // Said once at load; the flag is honoured either way.
         let mut load_warnings = Vec::new();
+        load_warnings.extend(installed.declined_warning());
         if dspark_dir.is_some() && opts.batch >= 16 && opts.dspark_k.is_none() {
             let note = format!(
                 "at --batch {} the speculative loop measured slower than plain batched decode \

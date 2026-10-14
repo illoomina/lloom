@@ -1608,6 +1608,11 @@ impl MetalDevice {
         Ok(())
     }
 
+    /// Whether the EOS gate is armed on this device's commands.
+    pub fn eos_gate_armed(&self) -> bool {
+        self.commands.eos_gate().is_armed()
+    }
+
     pub fn eos_gate_end(&self) -> crate::EosGateReport {
         self.kernels.set_eos_gated(false);
         self.commands.eos_gate().end()

@@ -820,6 +820,16 @@ impl Device {
         }
     }
 
+    /// Whether the EOS gate is armed: the decode kernels that carry it run
+    /// their gated variants. Never off Metal.
+    pub fn eos_gate_armed(&self) -> bool {
+        match self {
+            #[cfg(feature = "metal")]
+            Self::Metal(d) => d.eos_gate_armed(),
+            _ => false,
+        }
+    }
+
     /// Disarm the gate and report what it did. `None` off Metal. Precondition
     /// as `eos_gate_begin`'s: the run drained, so `fired` is the last gate's.
     pub fn eos_gate_end(&self) -> Option<EosGateReport> {

@@ -129,12 +129,13 @@ impl Drop for UngatedScope {
 }
 
 /// The sources whose kernels carry `EOS_GATE_ARG` (`utils.metal`).
-const EOS_GATED_SOURCES: [Source; 5] = [
+const EOS_GATED_SOURCES: [Source; 6] = [
     Source::Gemv,
     Source::Reduce,
     Source::Binary,
     Source::Unary,
     Source::Conv,
+    Source::Gdn,
 ];
 
 impl Default for Kernels {

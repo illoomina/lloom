@@ -71,7 +71,13 @@ struct Req {
     cancel_after: Option<usize>,
     /// This request's stop id, in place of the run's.
     eos: Option<u32>,
+    /// Sample at this temperature (seed [`SEED`]); greedy if `None`.
+    temperature: Option<f64>,
 }
+
+/// The sampled requests' seed: a draw is a function of the seed and the
+/// absolute position (#943), so every arm draws the same ids.
+const SEED: u64 = 7;
 
 fn req(prompt: Vec<u32>, max_tokens: usize) -> Req {
     Req {
@@ -80,6 +86,7 @@ fn req(prompt: Vec<u32>, max_tokens: usize) -> Req {
         stop: Vec::new(),
         cancel_after: None,
         eos: None,
+        temperature: None,
     }
 }
 
@@ -132,6 +139,8 @@ fn serve(
             eos_ids: vec![r.eos.unwrap_or(eos)],
             readback,
             stop_strings: r.stop.clone(),
+            seed: SEED,
+            temperature: r.temperature,
             ..DecodeParams::default()
         };
         let mut delivered = 0usize;
@@ -762,6 +771,69 @@ fn the_watch_and_the_gate_together_bound_the_overrun_and_keep_the_state() -> Res
         assert!(got[0].gated, "{at}: the gate left it unwritten");
         assert_eq!(got[1].reuse, ReuseAction::Extend, "{at}: the next request extends");
         assert_eq!(got[1].ids, want[1].ids, "{at}: and answers as blocking does");
+    }
+    Ok(())
+}
+
+/// The composed arms with a sampled continuation (the maintainer's review:
+/// "sampled — not only greedy — continuations"): at temperature 0.8 the
+/// draws are keyed by position, so the blocking arm and the watched, gated
+/// adaptive arm draw the same ids. With a consumer slow by 1 s the reply,
+/// the reconcile and the next request's reply are the blocking arm's, and
+/// the next request extends.
+#[test]
+fn the_watch_and_the_gate_together_keep_a_sampled_continuation() -> Result<()> {
+    lloom::tuning::install(lloom::tuning::Tuning {
+        ring: lloom::tuning::RingTuning {
+            eos_watch: true,
+            ..Default::default()
+        },
+        ..Default::default()
+    })
+    .expect("the tuning is installed before anything reads it");
+    let _ = lloom_tensor::tuning::pin_regime(lloom_tensor::tuning::Contract::Deterministic);
+    let dev = Device::new_metal(0)?;
+    let (model, cfg) = model(&dev)?;
+    let prompt: Vec<u32> = vec![1, 3, 5, 7, 9];
+    let sampled = |prompt: Vec<u32>, n: usize| Req {
+        temperature: Some(0.8),
+        ..req(prompt, n)
+    };
+    let stream = serve(&model, &cfg, &dev, "blocking", false, u32::MAX, &[sampled(prompt.clone(), 32)], None, SLOW)?
+        .remove(0)
+        .ids;
+    let cut = (6..stream.len())
+        .find(|&i| !stream[..i].contains(&stream[i]))
+        .expect("a fresh id to stop on");
+    let eos = stream[cut];
+    let reply = stream[..cut].to_vec();
+    let next: Vec<u32> = [prompt.clone(), reply.clone(), vec![10, 20, 30]].concat();
+    let requests = vec![sampled(prompt.clone(), 3000), sampled(next, 8)];
+    let want = serve(&model, &cfg, &dev, "blocking", false, eos, &requests, None, SLOW)?;
+    assert_eq!(want[0].ids, reply, "the blocking arm's sampled reply stops at the EOS");
+    let lead = lloom::nn::DecodeOptions {
+        adaptive_commit: true,
+        run_ahead: 8,
+        ..lloom::nn::DecodeOptions::new(1)
+    }
+    .adaptive_lead();
+    for slow in [None, Some(cut)] {
+        let got = serve(&model, &cfg, &dev, "ring-nonblocking", true, eos, &requests, slow, SLOW)?;
+        let at = format!("sampled, watched and gated slow={}", slow.is_some());
+        eprintln!(
+            "FRONTIER-SAMPLED {at}: overrun {} (lead {lead}) stopped_by_eos_watch {} gated {} | next request {:?} prefilled {} (blocking {})",
+            got[0].overrun,
+            got[0].stopped_by_eos_watch,
+            got[0].gated,
+            got[1].reuse,
+            got[1].prefilled,
+            want[1].prefilled,
+        );
+        assert_eq!(got[0].ids, want[0].ids, "{at}: the sampled reply");
+        assert!(got[0].overrun <= lead + 1, "{at}: the watch bounds the overrun");
+        assert!(got[0].gated, "{at}: the gate left it unwritten");
+        assert_eq!(got[1].reuse, ReuseAction::Extend, "{at}: the next request extends");
+        assert_eq!(got[1].ids, want[1].ids, "{at}: and draws as blocking does");
     }
     Ok(())
 }

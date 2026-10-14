@@ -69,6 +69,8 @@ struct Req {
     max_tokens: usize,
     stop: Vec<String>,
     cancel_after: Option<usize>,
+    /// This request's stop id, in place of the run's.
+    eos: Option<u32>,
 }
 
 fn req(prompt: Vec<u32>, max_tokens: usize) -> Req {
@@ -77,6 +79,7 @@ fn req(prompt: Vec<u32>, max_tokens: usize) -> Req {
         max_tokens,
         stop: Vec::new(),
         cancel_after: None,
+        eos: None,
     }
 }
 
@@ -125,7 +128,7 @@ fn serve(
         .with_config(config.clone());
         let params = DecodeParams {
             max_tokens: r.max_tokens,
-            eos_ids: vec![eos],
+            eos_ids: vec![r.eos.unwrap_or(eos)],
             readback,
             stop_strings: r.stop.clone(),
             ..DecodeParams::default()
@@ -538,5 +541,84 @@ fn under_the_eos_gate_one_live_session_takes_every_stop_kind() -> Result<()> {
     )?;
     assert_eq!(record[0].2, want[0].ids, "the first EOS turn answers as blocking does");
     assert_eq!(record[1].2, want[1].ids, "and so does the request after it");
+    Ok(())
+}
+
+/// The gate on a pooled ring that has wrapped (#993's acceptance: "ring
+/// wrapping"): a first request of more tokens than the ring's history
+/// (`RING_HISTORY_SLOTS`) stops on its length, so the ring's stamp has run
+/// past its slots when the second request, on the same ring and session,
+/// meets its EOS. The second request's stop id is the first fresh id of the
+/// blocking arm's continuation (a length stop leaves no overrun, so both
+/// arms extend to the same stream). The gated adaptive arm's reply, its
+/// reconcile and the third request match the blocking arm's.
+#[test]
+fn under_the_eos_gate_the_overrun_reconciles_on_a_wrapped_pooled_ring() -> Result<()> {
+    let _ = lloom_tensor::tuning::pin_regime(lloom_tensor::tuning::Contract::Deterministic);
+    let dev = Device::new_metal(0)?;
+    let (model, cfg) = model(&dev)?;
+    let slots = lloom::generation::readback::RING_HISTORY_SLOTS;
+    let long = slots + 108;
+    let never = u32::MAX;
+    let prompt: Vec<u32> = vec![1, 3, 5, 7, 9];
+    let first = req(prompt.clone(), long);
+    let reply1 = serve(&model, &cfg, &dev, "blocking", false, never, &[first.clone()], None, SLOW)?
+        .remove(0)
+        .ids;
+    assert_eq!(reply1.len(), long, "the first request runs to its length");
+    let next: Vec<u32> = [prompt.clone(), reply1.clone(), vec![10, 20, 30]].concat();
+    let probe = serve(
+        &model,
+        &cfg,
+        &dev,
+        "blocking",
+        false,
+        never,
+        &[first.clone(), req(next.clone(), 64)],
+        None,
+        SLOW,
+    )?;
+    let reply2 = &probe[1].ids;
+    let k = (2..reply2.len())
+        .find(|&i| !reply2[..i].contains(&reply2[i]))
+        .expect("a fresh id in the continuation to stop on");
+    let eos2 = reply2[k];
+    let third: Vec<u32> = [next.clone(), reply2[..k].to_vec(), vec![40, 50]].concat();
+    let requests = vec![
+        first,
+        Req {
+            eos: Some(eos2),
+            ..req(next, 3000)
+        },
+        Req {
+            eos: Some(eos2),
+            ..req(third, 8)
+        },
+    ];
+    let want = serve(&model, &cfg, &dev, "blocking", false, never, &requests, None, SLOW)?;
+    assert_eq!(want[1].ids, &reply2[..k], "the blocking arm stops at the EOS");
+    assert_eq!(want[2].reuse, ReuseAction::Extend);
+    for slow in [None, Some(k)] {
+        let got = serve(&model, &cfg, &dev, "ring-nonblocking", true, never, &requests, slow, SLOW)?;
+        let at = format!("gated, the ring wrapped, slow={}", slow.is_some());
+        eprintln!(
+            "FRONTIER-WRAP {at}: first {:?} {} ids (ring {slots}) | second {:?} overrun {} gated {} | third {:?} prefilled {} (blocking {})",
+            got[0].stop,
+            got[0].ids.len(),
+            got[1].stop,
+            got[1].overrun,
+            got[1].gated,
+            got[2].reuse,
+            got[2].prefilled,
+            want[2].prefilled,
+        );
+        assert_eq!(got[0].ids, reply1, "{at}: the first reply");
+        assert_eq!(got[1].ids, want[1].ids, "{at}: the second reply, past the wrap");
+        assert_eq!(got[1].stop, Stop::Eos, "{at}");
+        assert!(got[1].gated, "{at}: the gate fired, the overrun unwritten");
+        assert_eq!(got[2].reuse, ReuseAction::Extend, "{at}: the third request extends");
+        assert_eq!(got[2].prefilled, want[2].prefilled, "{at}");
+        assert_eq!(got[2].ids, want[2].ids, "{at}: and answers as blocking does");
+    }
     Ok(())
 }

@@ -785,6 +785,7 @@ fn run<P: QwenShape>(args: Args) -> Result<()> {
             .transpose()
             .map_err(anyhow::Error::msg)?,
         machine: None,
+        serve: true,
     };
     let mem_check = mem_check_arm(&args)?;
     let prefill_mode = match args.prefill.as_str() {

@@ -524,6 +524,15 @@ pub struct Qwen4ExpTuning {
         status = "reference"
     )]
     pub fused_off: bool,
+    /// A full-attention layer whose head dim no fused path serves attends through the composed attention, the reference, instead of the load being refused on Metal: what a tiny fixture's head dim needs to run through the engine. Never a serving default.
+    #[opt(
+        flag = "qwen-reference-attention",
+        env = "QWEN4EXP_REFERENCE_ATTENTION",
+        bool,
+        path = "models.qwen4exp.attention.reference",
+        status = "reference"
+    )]
+    pub reference_attention: bool,
     /// The f16 routed step's SwiGLU as one launch and its combine reading the f16 routed output; off = `silu` + multiply and a cast to f32, two launches more a layer (the A/B arm).
     #[opt(
         flag = "qwen-f16-fuse",
@@ -710,6 +719,7 @@ impl Default for Qwen4ExpTuning {
             fusion: "manual".into(),
             hc_mix: false,
             fused_off: false,
+            reference_attention: false,
             f16_fuse: true,
             shared_store: false,
             mtp_experts: "streamed".into(),

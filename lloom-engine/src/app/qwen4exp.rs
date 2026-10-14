@@ -624,6 +624,9 @@ fn load_on<P: QwenShape>(
             _ => None,
         };
         let mload = ModelLoad {
+            // A layer no fused path serves is refused at load, unless the
+            // reference attention is asked for by name.
+            serve: !lloom::tuning::tuning().qwen4exp.reference_attention,
             ple_shard: None,
             ple: opts.ple,
             moe_act,

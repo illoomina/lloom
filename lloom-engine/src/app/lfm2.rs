@@ -115,6 +115,14 @@ impl Vision {
         let vb = VarBuilder::from_backend(Box::new(backend), self.dtype, device.clone());
         let encoder = VisionEncoder::new(&self.config, self.text_hidden, vb)
             .context("loading the vision tower and projector")?;
+        if device.is_metal() {
+            if let Some(why) = encoder.reference_attention() {
+                anyhow::bail!(
+                    "{why}: no fused kernel covers the vision tower's attention, and the \
+                     composed attention does not serve on Metal"
+                );
+            }
+        }
         device.synchronize()?;
         let pool_delta = MemSnapshot::read(device).pool_live as i64 - before;
         let t = Tower {
@@ -927,6 +935,12 @@ impl<P: Lfm2Shape> Engine<P> {
             .apply_axes(&mut config)
             .map_err(|e| anyhow::anyhow!("model axes: {e}"))?;
         refuse_kv_quant_shape(&config, &device, opts.batch)?;
+        if device.is_metal() && config.attn_impl == AttnImpl::Generic {
+            anyhow::bail!(
+                "--attn generic is the composed reference attention: it materializes the \
+                 scores and does not serve on Metal (serve with sdpa or flash)"
+            );
+        }
         if let Some(k) = opts.flash_k {
             if config.attn_impl != AttnImpl::FlashDecoding {
                 anyhow::bail!(
@@ -1335,6 +1349,12 @@ impl<P: Lfm2Shape> Engine<P> {
             };
             let drafter = DSparkDrafter::new(dcfg.clone(), max_pos, dvb)
                 .context("constructing DSpark drafter")?;
+            if let Some(why) = drafter.reference_attention() {
+                anyhow::bail!(
+                    "{why}: the drafter's block attention does not serve on Metal through the \
+                     eager reference"
+                );
+            }
             // The drafter's context KV: an explicit `tuning.dspark.ctx_kv`
             // (`--dspark-ctx`, the `LLOOM_DSPARK_CTX_KV` alias) wins on every
             // arm; `auto` is one paged pool set shared by every sequence on

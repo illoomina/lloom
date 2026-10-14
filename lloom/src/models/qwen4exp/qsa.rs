@@ -37,7 +37,7 @@ use crate::nn::ops::KvPrecision;
 use crate::nn::{ops, RmsNorm};
 use crate::profile::Profile;
 use lloom_tensor::quantized::QMatMul;
-use lloom_tensor::{DType, Module, Result, Tensor, D};
+use lloom_tensor::{DType, Device, Module, Result, Tensor, D};
 use std::marker::PhantomData;
 
 /// Per-layer growing KV state for one sequence (full-attn layers only). Unlike
@@ -371,21 +371,19 @@ impl KvCache {
     /// the selected kernel); the dense store runs `ops::sdpa` over its views
     /// (the selection gathered first), a 16-bit store's read up to `q`'s
     /// dtype — at most `dense_limit` rows either way.
-    fn attend(&mut self, q: &Tensor, sel: Option<&Tensor>, scale: f32) -> Result<Tensor> {
+    fn attend(
+        &mut self,
+        q: &Tensor,
+        sel: Option<&Tensor>,
+        scale: f32,
+        route: &crate::nn::attention::route::PreparedAttention,
+    ) -> Result<Tensor> {
         if let KvBacking::Quant(s) = &self.kv {
             return s.attend(q, sel, scale);
         }
         let (k, v) = self.dense(sel)?;
         let (k, v) = (k.to_dtype(q.dtype())?, v.to_dtype(q.dtype())?);
-        ops::sdpa(
-            q,
-            &k.unsqueeze(0)?,
-            &v.unsqueeze(0)?,
-            None,
-            false,
-            scale,
-            1.0,
-        )
+        ops::attention(q, &k.unsqueeze(0)?, &v.unsqueeze(0)?, None, scale, route)
     }
     /// Append one token to a pooled row without writing it: the pool token
     /// slot the rows arm scatters it to.
@@ -1416,6 +1414,74 @@ pub struct QsaAttention<P: Profile> {
     /// loader could stack them (the parts above are row views of it): a
     /// decode step runs one gemv and splits the row.
     stem_cat: Option<QMatMul>,
+    /// The fused attention routes on Metal, prepared once: by the loader at
+    /// load, or at the first fused call.
+    routes: std::sync::OnceLock<std::result::Result<QsaRoutes, String>>,
+    /// Set once [`Self::prepare_for_serving`] accepted the layer: from then
+    /// on the composed attention is refused on Metal. A routes preparation at
+    /// a first fused call does not set it.
+    serving: std::sync::OnceLock<()>,
+}
+
+/// The fused attention a gated-attention layer dispatches through on Metal:
+/// one query over the cache or its selected cells, a causal window over the
+/// cache, and a window over the cache under an additive mask of selected
+/// cells. All compute and read at f32 (`nn::attention::route`).
+#[derive(Clone, Copy, Debug)]
+pub struct QsaRoutes {
+    pub decode: crate::nn::attention::route::PreparedAttention,
+    pub window: crate::nn::attention::route::PreparedAttention,
+    pub masked: crate::nn::attention::route::PreparedAttention,
+}
+
+impl QsaRoutes {
+    /// Prepare the three routes for `n_heads` over `n_kv_heads` of
+    /// `head_dim`; a shape no fused kernel covers is refused, named.
+    pub fn prepare(
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        device: &Device,
+    ) -> Result<Self> {
+        use crate::nn::attention::route::{AttentionBounds, AttentionSpec, KvLayout, MaskKind};
+        let spec = |mask: MaskKind, queries: usize| AttentionSpec {
+            q_heads: n_heads,
+            kv_heads: n_kv_heads,
+            head_dim,
+            v_head_dim: head_dim,
+            dtype: DType::F32,
+            kv_dtype: DType::F32,
+            mask,
+            softcap: 1.0,
+            layout: KvLayout::Strided,
+            bounds: AttentionBounds {
+                batch: usize::MAX,
+                min_queries: 1,
+                queries,
+                keys: usize::MAX,
+            },
+        };
+        #[cfg(feature = "metal")]
+        {
+            let set = crate::nn::attention::route::MetalKernelSet {
+                device: device.as_metal_device()?,
+            };
+            let prepare = |s: AttentionSpec| {
+                crate::nn::attention::route::PreparedAttention::prepare(s, &set)
+                    .map_err(|u| lloom_tensor::Error::Msg(format!("qsa: {u}")))
+            };
+            Ok(QsaRoutes {
+                decode: prepare(spec(MaskKind::None, 1))?,
+                window: prepare(spec(MaskKind::Causal, usize::MAX))?,
+                masked: prepare(spec(MaskKind::Additive, usize::MAX))?,
+            })
+        }
+        #[cfg(not(feature = "metal"))]
+        {
+            let _ = (device, spec(MaskKind::None, 1));
+            lloom_tensor::bail!("qsa: the fused attention routes are Metal's")
+        }
+    }
 }
 
 /// What a gated-attention layer's blocks need of a family's config: the
@@ -1489,7 +1555,65 @@ impl<P: Profile> QsaAttention<P> {
             rope_theta: geo.rope_theta,
             indexer: None,
             stem_cat: None,
+            routes: std::sync::OnceLock::new(),
+            serving: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Prepare the fused attention routes for `device` now, so a shape no
+    /// fused kernel covers is refused at load rather than at the first call.
+    pub fn prepare_routes(&self, device: &Device) -> Result<&QsaRoutes> {
+        self.routes
+            .get_or_init(|| {
+                QsaRoutes::prepare(self.n_heads, self.n_kv_heads, self.head_dim, device)
+                    .map_err(|e| e.to_string())
+            })
+            .as_ref()
+            .map_err(|e| lloom_tensor::Error::Msg(e.clone()))
+    }
+
+    /// Prepare this layer to serve on Metal: every phase on a fused path
+    /// (the decode path's prep kernels serve head dims 32, 64, 96, 128 and
+    /// 256 over divisible heads) and its routes prepared. A serving load
+    /// (`LoadOptions::serve`) calls it, so a shape the fused paths do not
+    /// serve is refused there.
+    pub fn prepare_for_serving(&self, device: &Device) -> Result<()> {
+        let hd = self.head_dim;
+        if !lloom_tensor::shape_req!(
+            qsa_fused_head_dim,
+            matches!(hd, 32 | 64 | 96 | 128 | 256) && self.n_heads.is_multiple_of(self.n_kv_heads);
+            hd
+        ) {
+            lloom_tensor::bail!(
+                "qsa: the fused decode path serves head dims 32, 64, 96, 128 and 256 over \
+                 divisible heads, not head dim {hd} over {}/{} heads; the composed attention \
+                 does not serve on Metal",
+                self.n_heads,
+                self.n_kv_heads
+            )
+        }
+        self.prepare_routes(device)?;
+        let _ = self.serving.set(());
+        Ok(())
+    }
+
+    /// A layer prepared for serving (as a loader does at load) never falls
+    /// back to the composed attention on Metal, which is the reference: taken
+    /// by a layer no loader prepared (a test fixture) or under
+    /// `qwen4exp.fused_off`.
+    fn refuse_composed_on_metal(&self, x: &Tensor, phase: &str) -> Result<()> {
+        if x.device().is_metal() && !super::kernels::fused_off() && self.serving.get().is_some() {
+            lloom_tensor::bail!(
+                "qsa {phase}: no fused path serves head dim {} at {:?} over {}/{} heads on \
+                 Metal, and the composed attention does not serve (it is the reference arm, \
+                 qwen4exp.fused_off)",
+                self.head_dim,
+                x.dtype(),
+                self.n_heads,
+                self.n_kv_heads
+            )
+        }
+        Ok(())
     }
 
     /// Attach the stacked input stems (`[n_heads·2·head_dim + 2·n_kv_heads·
@@ -1592,6 +1716,7 @@ impl<P: Profile> QsaAttention<P> {
         if let Some(out) = self.decode_rows_fused(x, kvs)? {
             return Ok(out);
         }
+        self.refuse_composed_on_metal(x, "decode")?;
         let mut outs = Vec::with_capacity(b);
         for (r, kv) in kvs.iter_mut().enumerate() {
             outs.push(self.decode_composed(&x.narrow(0, r, 1)?, kv)?);
@@ -1628,6 +1753,7 @@ impl<P: Profile> QsaAttention<P> {
         if let Some(out) = self.decode_seq_fused(x, kv, &mut lens)? {
             return Ok((out, lens));
         }
+        self.refuse_composed_on_metal(x, "window")?;
         let mut outs = Vec::with_capacity(t);
         for p in 0..t {
             outs.push(self.decode_composed(&x.narrow(0, p, 1)?, kv)?);
@@ -1714,7 +1840,13 @@ impl<P: Profile> QsaAttention<P> {
             if let Some(sel) = &sel {
                 check_sel(sel, pos, kv)?;
             }
-            let ctx = kv.attend(&q.reshape((1, nh, 1, hd))?, sel.as_ref(), scale as f32)?;
+            let route = &self.prepare_routes(x.device())?.decode;
+            let ctx = kv.attend(
+                &q.reshape((1, nh, 1, hd))?,
+                sel.as_ref(),
+                scale as f32,
+                route,
+            )?;
             let ctx = ctx.reshape((1, nh * hd))?;
             let gate = gate.reshape((1, nh * hd))?;
             let gated = match sigmoid_mul(&gate, &ctx) {
@@ -1870,7 +2002,11 @@ impl<P: Profile> QsaAttention<P> {
             let qr = q.narrow(0, r, 1)?.reshape((1, nh, 1, hd))?;
             // Past the dense range the row reads its selection, every cell of
             // which lies at or before it.
-            parts.push(kv.attend(&qr, sel.as_ref(), scale)?.reshape((1, nh * hd))?);
+            let route = &self.prepare_routes(x.device())?.decode;
+            parts.push(
+                kv.attend(&qr, sel.as_ref(), scale, route)?
+                    .reshape((1, nh * hd))?,
+            );
         }
         let ctx = if parts.len() == 1 {
             parts.pop().expect("one part")
@@ -2074,14 +2210,13 @@ impl<P: Profile> QsaAttention<P> {
                 .transpose(0, 1)?
                 .contiguous()?
                 .unsqueeze(0)?; // [1, nh, n, hd]
-            let ctx = ops::sdpa(
+            let ctx = ops::attention(
                 &q_t,
                 &k_all.unsqueeze(0)?,
                 &v_all.unsqueeze(0)?,
                 Some(&mask),
-                false,
                 scale,
-                1.0,
+                &self.prepare_routes(dev)?.masked,
             )?; // [1, nh, n, hd]
             parts.push(
                 ctx.reshape((nh, n, hd))?
@@ -2302,7 +2437,13 @@ impl<P: Profile> QsaAttention<P> {
             if let Some(sel) = &sel {
                 check_sel(sel, pos, kv)?;
             }
-            let ctx = kv.attend(&q.reshape((1, nh, 1, hd))?, sel.as_ref(), scale as f32)?; // [1, nh, 1, hd]
+            let route = &self.prepare_routes(x.device())?.decode;
+            let ctx = kv.attend(
+                &q.reshape((1, nh, 1, hd))?,
+                sel.as_ref(),
+                scale as f32,
+                route,
+            )?; // [1, nh, 1, hd]
             let ctx = ctx.reshape((1, nh * hd))?;
             let gate = gate.reshape((1, nh * hd))?;
             let gated = match sigmoid_mul(&gate, &ctx) {
@@ -2513,6 +2654,7 @@ impl<P: Profile> QsaAttention<P> {
         if let Some(out) = self.prefill_fused(x, kv)? {
             return Ok(out);
         }
+        self.refuse_composed_on_metal(x, "prefill")?;
         let dev = x.device();
         let (hd, nh, nkv) = (self.head_dim, self.n_heads, self.n_kv_heads);
         let x2 = x.reshape((seq, hidden))?;
@@ -2700,14 +2842,13 @@ impl<P: Profile> QsaAttention<P> {
             } else {
                 (k_all, v_all, q_h.clone())
             };
-            let ctx = ops::sdpa(
+            let ctx = ops::attention(
                 &q_d,
                 &k_all.unsqueeze(0)?,
                 &v_all.unsqueeze(0)?,
                 None,
-                true,
                 scale as f32,
-                1.0,
+                &self.prepare_routes(x.device())?.window,
             )?; // [1, nh, d, hd]
             parts.push(
                 ctx.reshape((nh, d, hd))?
@@ -5186,11 +5327,12 @@ mod tests {
             )
             .unwrap();
             let scale = 1.0 / (hd as f32).sqrt();
+            let route = QsaRoutes::prepare(nh, nkv, hd, &gpu).unwrap().decode;
             let cells: Vec<u32> = [8u32, 9, 10, 11, 0, 1, 2, 3, 28, 29, 30, 31, 40].to_vec();
             let sel = Tensor::from_vec(cells.clone(), cells.len(), &gpu).unwrap();
             for s in [None, Some(&sel)] {
                 let got = kv
-                    .attend(&q, s, scale)
+                    .attend(&q, s, scale, &route)
                     .unwrap()
                     .flatten_all()
                     .unwrap()
@@ -5220,14 +5362,14 @@ mod tests {
                 );
             }
             let all = kv
-                .attend(&q, None, scale)
+                .attend(&q, None, scale, &route)
                 .unwrap()
                 .flatten_all()
                 .unwrap()
                 .to_vec1::<f32>()
                 .unwrap();
             let some = kv
-                .attend(&q, Some(&sel), scale)
+                .attend(&q, Some(&sel), scale, &route)
                 .unwrap()
                 .flatten_all()
                 .unwrap()
@@ -5377,5 +5519,74 @@ mod tests {
                 gpu.synchronize().unwrap();
             }
         }
+    }
+
+    /// A serving load prepares each layer: a head dim no fused path serves
+    /// is refused there, and a prepared layer never takes the composed
+    /// attention on Metal — a request every fused path declines (activations
+    /// at f16) is an error naming it. A layer no serving load prepared, as a
+    /// fixture builds it, keeps the composed reference, even after a fused prefill
+    /// prepared its routes (head dim 72: the tiled kernel serves the window,
+    /// no fused path the decode).
+    #[cfg(feature = "metal")]
+    #[test]
+    fn a_layer_prepared_for_serving_never_takes_the_composed_attention_on_metal() -> Result<()> {
+        let gpu = Device::new_metal(0)?;
+        let d = 64;
+        let layer = |hd: usize| {
+            let geo = AttnGeometry {
+                n_heads: 4,
+                n_kv_heads: 2,
+                head_dim: hd,
+                n_rot: hd / 4,
+                rope_theta: 1e7,
+            };
+            QsaAttention::<CrownExact>::with_geometry(
+                lin(4 * hd * 2, d, 1.0, &gpu),
+                lin(2 * hd, d, 2.0, &gpu),
+                lin(2 * hd, d, 3.0, &gpu),
+                lin(d, 4 * hd, 4.0, &gpu),
+                rms(hd, &gpu),
+                rms(hd, &gpu),
+                &geo,
+            )
+        };
+        let tokens = |n: usize| -> Result<Tensor> {
+            Tensor::from_vec(
+                (0..n * d)
+                    .map(|i| (i as f32 * 0.05).sin() * 0.6)
+                    .collect::<Vec<f32>>(),
+                (1, n, d),
+                &gpu,
+            )
+        };
+        const REFUSED: &str = "the composed attention does not serve";
+
+        for hd in [16, 72] {
+            let err = layer(hd).prepare_for_serving(&gpu).unwrap_err().to_string();
+            assert!(err.contains(&format!("head dim {hd}")), "hd {hd}: {err}");
+        }
+
+        let served = layer(64);
+        served.prepare_for_serving(&gpu)?;
+        served.decode(&tokens(1)?, &mut KvCache::default())?;
+        let half = tokens(1)?.to_dtype(DType::F16)?;
+        let err = served
+            .decode(&half, &mut KvCache::default())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(REFUSED), "{err}");
+
+        let fixture = layer(72);
+        let mut kv = KvCache::default();
+        fixture.prefill(&tokens(3)?, &mut kv)?;
+        assert!(fixture.routes.get().is_some_and(|r| r.is_ok()));
+        let out = fixture.decode(&tokens(1)?, &mut kv)?;
+        assert!(out
+            .flatten_all()?
+            .to_vec1::<f32>()?
+            .iter()
+            .all(|v| v.is_finite()));
+        Ok(())
     }
 }

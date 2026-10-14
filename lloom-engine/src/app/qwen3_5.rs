@@ -503,6 +503,9 @@ fn load_on<P: Profile>(
             LoadAdmission::CallerScoped => None,
         },
         checkpoints: lloom::models::qwen3_5::LoadOptions::default().checkpoints,
+        // A layer no fused path serves is refused at load, unless the
+        // reference attention is asked for by name.
+        serve: !lloom::tuning::tuning().qwen4exp.reference_attention,
     };
     let t = Instant::now();
     let mut warnings = Vec::new();

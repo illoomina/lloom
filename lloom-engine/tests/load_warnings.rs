@@ -4,8 +4,10 @@
 //! stderr line it always printed.
 //!
 //! Sources driven here, each against a control that must stay empty:
-//! - `attention_route`: a tiny LFM2 at head_dim 48, which no fused kernel
-//!   instantiates (the template's 64 is the control);
+//! - `attention_route`: a tiny LFM2 at head_dim 72, where the requested
+//!   decode kernel has no entry point and the load takes the nearest fused
+//!   one (the template's 64 is the control); at head_dim 48, which no fused
+//!   kernel instantiates, the load is refused rather than served composed;
 //! - `readback`: `--readback ring` asks for the adaptive commit its EOS read
 //!   cannot carry (`auto` is the control), and Qwen4-exp's `ring-fixed`,
 //!   whose forwards read their fed id back (its `auto` is the control);
@@ -146,24 +148,29 @@ fn served_warnings(model: &Path, extra: &[&str]) -> Value {
     health
 }
 
-/// The attention route's fallback, on Metal: the head dim no fused kernel
-/// covers is named on the loaded line, `/health` and the model card, and
-/// the template's head dim (64, inside every set) names nothing.
+/// The attention route on Metal: at head_dim 72 the requested decode kernel
+/// (`sdpa_vector`) has no entry point and the load takes the nearest fused
+/// kernel, named on the loaded line, `/health` and the model card; the
+/// template's head dim (64, inside every set) names nothing. At head_dim 48
+/// no fused kernel covers the attention and the load is refused, naming the
+/// capability: the composed attention does not serve.
 #[cfg(feature = "metal")]
 #[test]
 fn an_uncovered_head_dim_reaches_every_surface() {
-    let dir = scratch("lfm2-48");
-    let off = write::<Lfm2Tiny>(&dir.join("off"), Some(96));
+    let dir = scratch("lfm2-72");
+    let off = write::<Lfm2Tiny>(&dir.join("off"), Some(144));
     let on = write::<Lfm2Tiny>(&dir.join("on"), None);
+    let uncovered = write::<Lfm2Tiny>(&dir.join("uncovered"), Some(96));
 
     let stderr = chat(&off, &[]);
     let field = loaded_warnings(&stderr);
-    eprintln!("head_dim 48: load_warnings={field}");
+    eprintln!("head_dim 72: load_warnings={field}");
     assert!(
-        field.starts_with("attention_route: lfm2: attention head_dim 48 at F16 under Sdpa: "),
+        field.starts_with("attention_route: lfm2: attention head_dim 72 at F16 under Sdpa: "),
         "{field}"
     );
-    assert!(field.contains("(the composed attention"), "{field}");
+    assert!(field.contains("(the nearest fused kernel)"), "{field}");
+    assert!(!field.contains("composed"), "{field}");
     // The stderr line it always printed is still there, and is the message.
     let message = field.trim_start_matches("attention_route: ");
     assert!(
@@ -177,6 +184,20 @@ fn an_uncovered_head_dim_reaches_every_surface() {
     assert_eq!(list[0]["kind"], "attention_route");
     assert_eq!(list[0]["message"], message);
     assert_eq!(served_warnings(&on, &[]), json!([]));
+
+    let out = Command::new(env!("CARGO_BIN_EXE_lloom"))
+        .args(["chat", "--model"])
+        .arg(&uncovered)
+        .args(["--raw", "-p", PROMPT, "-n", "2"])
+        .output()
+        .expect("lloom runs");
+    let refused = String::from_utf8_lossy(&out.stderr);
+    eprintln!("head_dim 48: {refused}");
+    assert!(!out.status.success(), "head_dim 48 loaded:\n{refused}");
+    assert!(
+        refused.contains("head dim 48") && refused.contains("does not serve on Metal"),
+        "refused without naming the capability:\n{refused}"
+    );
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -216,6 +237,7 @@ fn a_readback_clamp_reaches_every_surface() {
 #[cfg(feature = "metal")]
 #[test]
 fn qwen4exp_readback_that_reads_its_id_back_warns() {
+    reference_attention();
     let dir = scratch("qwen");
     let model = write::<Qwen4ExpTiny>(&dir, None);
     let tok = dir.join("tokenizer.json");
@@ -244,6 +266,7 @@ fn qwen4exp_readback_that_reads_its_id_back_warns() {
 #[cfg(feature = "metal")]
 #[test]
 fn an_admitted_emulated_type_reaches_the_engine() {
+    reference_attention();
     use clap::Parser;
     use lloom_engine::app::{load_engine, resolve_options_uninstalled, CommonArgs, Shape};
     use lloom_tensor::{DType, Device};
@@ -310,4 +333,12 @@ fn an_admitted_emulated_type_reaches_the_engine() {
         engine.shutdown();
     }
     std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The tiny Qwen's head dim (16) has no fused attention path, and a serving
+/// load refuses it on Metal; the test runs it through the composed
+/// reference, asked for by name. Every child the test spawns inherits it.
+#[cfg(feature = "metal")]
+fn reference_attention() {
+    std::env::set_var("QWEN4EXP_REFERENCE_ATTENTION", "1");
 }

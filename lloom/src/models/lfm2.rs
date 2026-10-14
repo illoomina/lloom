@@ -431,17 +431,17 @@ impl ConvState {
 pub enum AttnImpl {
     /// `repeat_kv` + F32 upcast + `matmul` + `softmax_last_dim`.
     ///
-    /// The default, and the correctness bar every other arm is compared
-    /// against. Works on every backend.
+    /// The library default and the CPU's path. On Metal it is the reference
+    /// arm: it materializes the scores, and serving refuses it.
     #[default]
     Generic,
-    /// `crate::nn::ops::sdpa`, which is GQA-native and accumulates in F32
-    /// internally, so neither `repeat_kv` nor the upcast is needed.
+    /// The prepared fused route (`nn::attention::route`), GQA-native with F32
+    /// accumulation inside, so neither `repeat_kv` nor the upcast is needed.
     ///
-    /// Metal only. `seq_len == 1` takes `sdpa_vector`; `seq_len > 1` — prefill,
-    /// a verify window, B>1 — takes the tiled `steel_attention`
-    /// (`Attention::sdpa_full_applies`). Every other case falls back to
-    /// `Generic` rather than failing, so this is safe to set unconditionally.
+    /// Metal only. `seq_len == 1` takes `sdpa_vector`, or the tiled kernel at
+    /// a head dim with no one-query kernel; `seq_len > 1` — prefill, a verify
+    /// window, B>1 — takes the tiled `steel_attention`. A shape no fused
+    /// kernel covers is refused at load.
     Sdpa,
     /// FlashDecoding: attention split over independent contiguous KV chunks,
     /// with an index-ordered combine (`DESIGN.md` §10.4, issue #116).
@@ -458,8 +458,8 @@ pub enum AttnImpl {
     /// not be exercised.
     ///
     /// Metal only, `seq_len == 1` only, f16/f32 only. `seq_len > 1` takes the
-    /// tiled `steel_attention` as `Sdpa` does; any other case falls back to
-    /// `Generic`.
+    /// tiled `steel_attention` as `Sdpa` does, and a decode step FlashDecoding
+    /// does not instantiate takes the prepared route's one-query kernel.
     FlashDecoding,
 }
 
@@ -481,10 +481,14 @@ impl AttnImpl {
 /// The kernel an attention layer's `seq_len == 1` step takes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DecodeAttn {
-    /// The composed attention: `repeat_kv`, f32 `matmul`, softmax.
+    /// The composed attention: `repeat_kv`, f32 `matmul`, softmax. The CPU's
+    /// path, and on Metal the reference arm only.
     Generic,
-    /// `sdpa_vector` (and its two-pass sibling past 1024 keys).
+    /// `sdpa_vector` (and its two-pass sibling past the key threshold).
     SdpaVector,
+    /// The tiled `steel_attention` over one query, at a head dim no one-query
+    /// kernel is instantiated at.
+    Steel,
     /// FlashDecoding, over the contiguous cache or the page pool.
     FlashDecoding,
 }
@@ -504,6 +508,7 @@ impl DecodeAttn {
         match self {
             DecodeAttn::Generic => "generic",
             DecodeAttn::SdpaVector => "sdpa_vector",
+            DecodeAttn::Steel => "steel_attention",
             DecodeAttn::FlashDecoding => "flash_decoding",
         }
     }
@@ -519,16 +524,17 @@ impl PrefillAttn {
 }
 
 /// The attention kernels a model's layers take, decided once at load from
-/// the requested arm, the device, the compute dtype and the head dim.
+/// the requested arm, the device, the compute dtype and the geometry.
 ///
-/// Each fused kernel is instantiated at a fixed set of head dims and dtypes.
-/// A phase whose requested kernel does not cover the shape takes the nearest
-/// fused kernel that does, and the composed attention only when none does;
-/// [`Self::warning`] names what was requested and what is taken. Off Metal,
-/// or on [`AttnImpl::Generic`] (the explicit opt-in to the composed path),
-/// every phase is `Generic` and nothing was refused. The head-dim checks are
-/// shape probes (`docs/porting-models.md` §21.8).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// On Metal a fused arm prepares one route (`nn::attention::route`) that the
+/// forward pass dispatches through. A decode phase whose requested kernel does
+/// not cover the shape takes the nearest fused kernel that does, which
+/// [`Self::warning`] names; a shape no fused kernel covers is refused at load
+/// with the missing capability named. The composed attention is the CPU's
+/// path and, on Metal, only the reference arm [`AttnImpl::Generic`], which
+/// serving refuses. [`Self::line`] is printed at every load. The head-dim
+/// checks are shape probes (`docs/porting-models.md` §21.8).
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct AttnRoute {
     pub requested: AttnImpl,
     pub head_dim: usize,
@@ -539,37 +545,69 @@ pub struct AttnRoute {
     pub decode_refused: Option<DecodeAttn>,
     /// The prefill kernel the arm requested, when the route took another.
     pub prefill_refused: Option<PrefillAttn>,
+    /// The prepared fused route; `None` off Metal and on the reference arm.
+    pub prepared: Option<crate::nn::attention::route::PreparedAttention>,
 }
 
 impl AttnRoute {
-    pub fn resolve(requested: AttnImpl, head_dim: usize, dtype: DType, device: &Device) -> Self {
+    pub fn resolve(
+        requested: AttnImpl,
+        cfg: &Config,
+        dtype: DType,
+        device: &Device,
+    ) -> Result<Self> {
         let route = Self {
             requested,
-            head_dim,
+            head_dim: cfg.head_dim(),
             dtype,
             decode: DecodeAttn::Generic,
             prefill: PrefillAttn::Generic,
             decode_refused: None,
             prefill_refused: None,
+            prepared: None,
         };
         if requested == AttnImpl::Generic || !device.is_metal() {
-            return route;
+            return Ok(route);
         }
         #[cfg(feature = "metal")]
-        return route.against_kernel_sets(device);
+        return route.against_kernel_sets(cfg, device);
         #[cfg(not(feature = "metal"))]
-        route
+        Ok(route)
     }
 
-    /// Whether `kernel` is instantiated at this head dim and dtype, and its
-    /// pipelines on `device` admit the threadgroup widths they are dispatched
-    /// at (a pipeline that does not writes nothing; the admitted width falls
-    /// with the head dim's register demand, per device).
+    /// What the fused route serves: causal attention over a strided cache,
+    /// any batch, windows and keys up to the model's positions.
+    pub fn spec(cfg: &Config, dtype: DType) -> crate::nn::attention::route::AttentionSpec {
+        use crate::nn::attention::route::{AttentionBounds, AttentionSpec, KvLayout, MaskKind};
+        let positions = cfg.max_position_embeddings.max(1);
+        AttentionSpec {
+            q_heads: cfg.num_attention_heads,
+            kv_heads: cfg.num_key_value_heads,
+            head_dim: cfg.head_dim(),
+            v_head_dim: cfg.head_dim(),
+            dtype,
+            kv_dtype: dtype,
+            mask: MaskKind::Causal,
+            softcap: 1.0,
+            layout: KvLayout::Strided,
+            bounds: AttentionBounds {
+                batch: usize::MAX,
+                min_queries: 1,
+                queries: positions,
+                keys: positions,
+            },
+        }
+    }
+
+    /// Whether FlashDecoding is instantiated at this head dim and dtype, and
+    /// its pipelines on `device` admit the threadgroup widths they are
+    /// dispatched at (a pipeline that does not writes nothing; the admitted
+    /// width falls with the head dim's register demand, per device). The
+    /// one-query `sdpa_vector` kernels are the prepared route's question.
     #[cfg(feature = "metal")]
-    fn covers(&self, kernel: DecodeAttn, device: &Device) -> bool {
+    fn flash_covers(&self, device: &Device) -> bool {
         use lloom_tensor::kernels::{
-            flash_admits_its_widths, sdpa_vector_admits_its_widths, FlashDType, SdpaDType,
-            FLASH_F32_HEAD_DIMS, FLASH_HEAD_DIMS, SDPA_VECTOR_HEAD_DIMS,
+            flash_admits_its_widths, FlashDType, FLASH_F32_HEAD_DIMS, FLASH_HEAD_DIMS,
         };
         let Ok(metal) = device.as_metal_device() else {
             return false;
@@ -577,102 +615,82 @@ impl AttnRoute {
         let (raw, kernels) = (metal.device(), metal.kernels());
         let head_dim = self.head_dim;
         let is_f32 = self.dtype == DType::F32;
-        match kernel {
-            DecodeAttn::Generic => true,
-            DecodeAttn::SdpaVector => {
-                let itype = match self.dtype {
-                    DType::F16 => SdpaDType::F16,
-                    DType::BF16 => SdpaDType::BF16,
-                    DType::F32 => SdpaDType::F32,
-                    _ => return false,
-                };
-                lloom_tensor::shape_req!(
-                    sdpa_vector_head_dim,
-                    SDPA_VECTOR_HEAD_DIMS.contains(&head_dim) && !(head_dim == 512 && is_f32);
-                    head_dim,
-                    is_f32
-                ) && sdpa_vector_admits_its_widths(raw, kernels, head_dim, itype).unwrap_or(false)
-            }
-            DecodeAttn::FlashDecoding => {
-                let dims: &[usize] = match self.dtype {
-                    DType::F16 => &FLASH_HEAD_DIMS,
-                    DType::F32 => &FLASH_F32_HEAD_DIMS,
-                    _ => &[],
-                };
-                let dtype = if is_f32 {
-                    FlashDType::F32
-                } else {
-                    FlashDType::F16
-                };
-                lloom_tensor::shape_req!(
-                    flash_decoding_head_dim,
-                    dims.contains(&head_dim);
-                    head_dim,
-                    is_f32
-                ) && flash_admits_its_widths(raw, kernels, head_dim, dtype).unwrap_or(false)
-            }
-        }
+        let dims: &[usize] = match self.dtype {
+            DType::F16 => &FLASH_HEAD_DIMS,
+            DType::F32 => &FLASH_F32_HEAD_DIMS,
+            _ => &[],
+        };
+        let dtype = if is_f32 {
+            FlashDType::F32
+        } else {
+            FlashDType::F16
+        };
+        lloom_tensor::shape_req!(
+            flash_decoding_head_dim,
+            dims.contains(&head_dim);
+            head_dim,
+            is_f32
+        ) && flash_admits_its_widths(raw, kernels, head_dim, dtype).unwrap_or(false)
     }
 
-    /// Each phase's kernel in preference order: the requested fused kernel,
-    /// then the other fused decode kernel (both read a contiguous KV, and a
-    /// paged pool is gathered first), then the composed attention.
+    /// The prepared route serves prefill and windows; decode takes, in
+    /// preference order, the requested fused kernel, the other fused decode
+    /// kernel, then the route's own one-query kernel. An attention no fused
+    /// kernel covers is refused.
     #[cfg(feature = "metal")]
-    fn against_kernel_sets(mut self, device: &Device) -> Self {
-        use lloom_tensor::kernels::SDPA_FULL_HEAD_DIMS;
-        let head_dim = self.head_dim;
-        let is_f32 = self.dtype == DType::F32;
+    fn against_kernel_sets(mut self, cfg: &Config, device: &Device) -> Result<Self> {
+        use crate::nn::attention::route::{AttentionKernel, MetalKernelSet, PreparedAttention};
+        let metal = device.as_metal_device()?;
+        let prepared = PreparedAttention::prepare(
+            Self::spec(cfg, self.dtype),
+            &MetalKernelSet { device: metal },
+        )
+        .map_err(|u| {
+            lloom_tensor::Error::Msg(format!(
+                "lfm2: {u}: no fused kernel covers this attention, and the composed attention \
+                 does not serve on Metal (`--attn generic` is the reference arm)"
+            ))
+        })?;
+        self.prepared = Some(prepared);
+        self.prefill = PrefillAttn::Steel;
+        let one = match prepared.kernel_for(1, 1, 1)? {
+            AttentionKernel::Full => DecodeAttn::Steel,
+            _ => DecodeAttn::SdpaVector,
+        };
         let order = match self.requested {
             AttnImpl::Sdpa => [DecodeAttn::SdpaVector, DecodeAttn::FlashDecoding],
             _ => [DecodeAttn::FlashDecoding, DecodeAttn::SdpaVector],
         };
         self.decode = order
             .into_iter()
-            .find(|&k| self.covers(k, device))
-            .unwrap_or(DecodeAttn::Generic);
+            .find(|&k| match k {
+                DecodeAttn::SdpaVector => one == DecodeAttn::SdpaVector,
+                DecodeAttn::FlashDecoding => self.flash_covers(device),
+                DecodeAttn::Generic | DecodeAttn::Steel => false,
+            })
+            .unwrap_or(one);
         if self.decode != order[0] {
             self.decode_refused = Some(order[0]);
         }
-        if lloom_tensor::shape_req!(
-            sdpa_head_dim,
-            SDPA_FULL_HEAD_DIMS.contains(&head_dim) && !(head_dim == 512 && is_f32);
-            head_dim,
-            is_f32
-        ) && matches!(self.dtype, DType::F16 | DType::BF16 | DType::F32)
-        {
-            self.prefill = PrefillAttn::Steel;
-        } else {
-            self.prefill_refused = Some(PrefillAttn::Steel);
-        }
-        self
+        Ok(self)
     }
 
     /// The one line a load prints when a phase does not take the kernel the
-    /// arm requested; `None` when every phase does. "Composed" appears only
-    /// where no fused kernel covers the shape.
+    /// arm requested; `None` when every phase does.
     pub fn warning(&self) -> Option<String> {
-        fn taken(fused: bool, name: &str) -> String {
-            if fused {
-                format!("{name} (the nearest fused kernel)")
-            } else {
-                format!(
-                    "{name} (the composed attention, slower: no fused kernel covers this shape)"
-                )
-            }
-        }
         let mut phases = Vec::new();
         if let Some(k) = self.decode_refused {
             phases.push(format!(
-                "decode requested {} and takes {}",
+                "decode requested {} and takes {} (the nearest fused kernel)",
                 k.name(),
-                taken(self.decode != DecodeAttn::Generic, self.decode.name())
+                self.decode.name()
             ));
         }
         if let Some(k) = self.prefill_refused {
             phases.push(format!(
                 "prefill requested {} and takes {}",
                 k.name(),
-                taken(self.prefill != PrefillAttn::Generic, self.prefill.name())
+                self.prefill.name()
             ));
         }
         (!phases.is_empty()).then(|| {
@@ -684,6 +702,23 @@ impl AttnRoute {
                 phases.join("; ")
             )
         })
+    }
+
+    /// The route, printed at every load.
+    pub fn line(&self) -> String {
+        match &self.prepared {
+            Some(p) => format!(
+                "lfm2: attention under {:?}: decode {}, prefill {}; {}",
+                self.requested,
+                self.decode.name(),
+                self.prefill.name(),
+                p.describe()
+            ),
+            None => format!(
+                "lfm2: attention under {:?}: the composed attention, head_dim {} at {:?}",
+                self.requested, self.head_dim, self.dtype
+            ),
+        }
     }
 
     /// [`Self::warning`] on the load-warning channel.
@@ -6068,8 +6103,7 @@ impl Mlp {
     /// Metal, `seq_len == 1`, no bias, and a dtype the GEMV carries. **Every
     /// other case takes the eager path rather than failing**, because unlike
     /// `flash_decoding` this arm has a correct eager equivalent right beside
-    /// it and prefill is a GEMM the fusion is not instantiated for. The same
-    /// shape as `sdpa_applies` above.
+    /// it and prefill is a GEMM the fusion is not instantiated for.
     fn gemv_silu_applies(&self, x: &Tensor, p: &Projections<'_>) -> bool {
         self.gemv_silu
             && x.device().is_metal()
@@ -6331,32 +6365,6 @@ impl<P: Profile> Attention<P> {
             span: tracing::span!(tracing::Level::TRACE, "attn"),
             span_rot: tracing::span!(tracing::Level::TRACE, "attn-rot"),
         })
-    }
-
-    /// Whether this call takes the fused `sdpa_vector` kernel: the route chose
-    /// it at load (Metal, `--attn sdpa` at a head dim it instantiates, or
-    /// `--attn flash` at one only it does), the call is one token, and the
-    /// dtype is one the kernel is built for. A false is the composed
-    /// attention, never a failure.
-    fn sdpa_applies(&self, q: &Tensor, seq_len: usize) -> bool {
-        self.route.decode == DecodeAttn::SdpaVector
-            && seq_len == 1
-            && matches!(q.dtype(), DType::F16 | DType::BF16 | DType::F32)
-    }
-
-    /// Whether this call takes the tiled `steel_attention` kernel, the
-    /// `seq_len > 1` sibling of `sdpa_vector` (`DESIGN.md` §10.2v): one
-    /// threadgroup per (query block, head), online softmax over K/V blocks,
-    /// GQA-native, the causal mask in-kernel from the cache offset
-    /// `kv_len - seq_len`. Prefill, verify and B>1 are this shape, and every
-    /// fused arm shares it. The route chose it at load (Metal, a fused arm, an
-    /// instantiated head dim); per call, every query needs a key and the dtype
-    /// must be one the kernel is built for. A false is the composed attention.
-    fn sdpa_full_applies(&self, q: &Tensor, seq_len: usize, kv_len: usize) -> bool {
-        self.route.prefill == PrefillAttn::Steel
-            && seq_len > 1
-            && seq_len <= kv_len
-            && matches!(q.dtype(), DType::F16 | DType::BF16 | DType::F32)
     }
 
     /// Whether this call takes the FlashDecoding kernels (`DESIGN.md` §10.4):
@@ -7395,31 +7403,21 @@ impl<P: Profile> Attention<P> {
                 self.flash_scratch_sizing,
                 reserve_chunks,
             )?
-        } else if self.sdpa_applies(&q, seq_len) {
-            // Scale is applied to `q` inside the kernel before the dot product,
-            // matching `att / sqrt(head_dim)` below. No mask: `seq_len == 1`
-            // attends to the whole cache, which is the same reason the generic
-            // arm skips `masked_fill` in that case.
-            crate::nn::ops::sdpa(
+        } else if let Some(prepared) = &self.route.prepared {
+            // The fused route prepared at load: one query takes the vector
+            // kernel (two passes past its key threshold), or the tiled one at
+            // a head dim no one-query kernel serves; a window takes the tiled
+            // kernel, causal from the cache offset `kv_len - seq_len`. The
+            // scale is applied to `q` inside the kernel, as `att /
+            // sqrt(head_dim)` below. A request the route does not serve is an
+            // error, never the composed attention.
+            crate::nn::ops::attention(
                 &q,
                 &k,
                 &v,
                 None,
-                false,
                 1f32 / (self.head_dim as f32).sqrt(),
-                1.0,
-            )?
-        } else if self.sdpa_full_applies(&q, seq_len, k.dim(2)?) {
-            // The causal mask is the kernel's own, from the cache offset
-            // `kv_len - seq_len`; `Cache::mask` is the generic arm's.
-            crate::nn::ops::sdpa(
-                &q,
-                &k,
-                &v,
-                None,
-                true,
-                1f32 / (self.head_dim as f32).sqrt(),
-                1.0,
+                prepared,
             )?
         } else if self.use_flash_attn {
             let k = repeat_kv(k, self.num_attention_heads / self.num_key_value_heads)?;
@@ -7530,6 +7528,7 @@ impl<P: Profile> crate::optimizer::Visit for Attention<P> {
         ring.extend([k_all, v_all]);
         let kernel = match self.route.decode {
             DecodeAttn::SdpaVector => "sdpa_vector",
+            DecodeAttn::Steel => "steel_attention",
             DecodeAttn::FlashDecoding => "flash_decoding",
             DecodeAttn::Generic => "attention_generic",
         };
@@ -9757,7 +9756,10 @@ impl<P: Profile> Model<P> {
         } else {
             AttnImpl::Generic
         };
-        let attn_route = AttnRoute::resolve(requested, cfg.head_dim(), vb.dtype(), vb.device());
+        let attn_route = AttnRoute::resolve(requested, cfg, vb.dtype(), vb.device())?;
+        if has_attention {
+            eprintln!("{}", attn_route.line());
+        }
         let mut load_warnings = Vec::new();
         if let Some(w) = attn_route.load_warning() {
             eprintln!("{}", w.message);

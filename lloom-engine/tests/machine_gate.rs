@@ -159,6 +159,7 @@ fn lfm2_tiny_is_admitted_on_the_machine_and_refused_without_room() {
 
 #[test]
 fn qwen3_5_tiny_is_admitted_on_the_machine_and_refused_without_room() {
+    reference_attention();
     for (tag, model) in [
         ("qwen3_5", write::<Qwen3_5Tiny> as fn(&Path) -> PathBuf),
         ("qwen3_5_moe", write::<Qwen3_5MoeTiny>),
@@ -176,6 +177,7 @@ fn qwen3_5_tiny_is_admitted_on_the_machine_and_refused_without_room() {
 
 #[test]
 fn qwen4exp_tiny_is_admitted_on_the_machine_and_refused_without_room() {
+    reference_attention();
     let dir = scratch("qwen4exp");
     let model = write::<Qwen4ExpTiny>(&dir);
     let tok = dir.join("tokenizer.json");
@@ -291,4 +293,11 @@ fn serve_refuses_at_startup() {
     );
     std::fs::remove_dir_all(&registry).ok();
     std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The tiny Qwen's head dim (16) has no fused attention path, and a serving
+/// load refuses it on Metal; the test runs it through the composed
+/// reference, asked for by name. Every child the test spawns inherits it.
+fn reference_attention() {
+    std::env::set_var("QWEN4EXP_REFERENCE_ATTENTION", "1");
 }

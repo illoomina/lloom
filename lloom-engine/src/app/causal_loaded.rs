@@ -380,6 +380,14 @@ impl MmprojVision {
             dtype,
             device,
         )?;
+        if device.is_metal() {
+            if let Some(why) = encoder.reference_attention() {
+                return Err(Error::msg(format!(
+                    "{why}: no fused kernel covers the mmproj vision tower's attention, and the \
+                     composed attention does not serve on Metal"
+                )));
+            }
+        }
         Ok(Self {
             encoder,
             config,
@@ -961,6 +969,14 @@ fn produce_lfm2_gguf_with<T>(
     }
     let prepared = preflight(&config, &tokenizer, policy.as_ref())?;
     let model = plan.materialize(&mut file, device)?;
+    if device.is_metal() {
+        if let Some(why) = model.reference_attention() {
+            lloom_tensor::bail!(
+                "{why}: no fused kernel covers this model's attention, and the composed \
+                 attention does not serve on Metal"
+            )
+        }
+    }
     let vision = mmproj
         .map(|path| MmprojVision::load(path, &tokenizer, config.hidden_size, device))
         .transpose()?;

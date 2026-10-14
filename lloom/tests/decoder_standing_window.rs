@@ -376,9 +376,10 @@ fn an_eos_overrun_is_undone_and_the_next_turn_extends() -> Result<()> {
         .ids
     };
     assert_eq!(stream.len(), 24);
-    // The EOS: the first id past the opening one not seen earlier in the
-    // stream, so the run stops exactly there.
-    let cut = (1..stream.len())
+    // The EOS: the first id from the sixth on not seen earlier in the
+    // stream, so the run stops exactly there after several decode steps,
+    // each settling the window the one before it left standing.
+    let cut = (6..stream.len())
         .find(|&i| !stream[..i].contains(&stream[i]))
         .expect("a stream with a fresh id somewhere");
     let eos_ids = vec![stream[cut]];

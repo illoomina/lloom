@@ -12,6 +12,8 @@
 use lloom::generation::{Blocking, LogitsProcessor, Sampling};
 use lloom::models::qwen3_5::testing::{gguf_bytes, gguf_metadata, Qwen3_5MoeTiny, Qwen3_5Tiny};
 use lloom::models::qwen3_5::{Config, LoadOptions, Qwen3_5, Qwen3_5Moe};
+#[cfg(feature = "metal")]
+use lloom::nn::decoder::DecodeRecovery;
 use lloom::nn::decoder::{Layer, StateCapacity};
 use lloom::nn::model::CausalLM;
 use lloom::nn::mtp::{NextnDrafter, NextnHead};
@@ -359,7 +361,7 @@ fn mtp_on_the_decoder_is_byte_identical_to_greedy_on_metal() -> Result<()> {
     Ok(())
 }
 
-/// The window as ONE pass over the phase rings (`StateCapacity::window`,
+/// The window as ONE pass over the phase rings (`StateCapacity::verify`,
 /// the `Ring` profile's state): on Metal the verify of `k + 1` positions
 /// runs the decode kernels' window forms and accepts by phase; the stream is
 /// greedy's and every round keeps what the sequential verify keeps, at
@@ -421,7 +423,12 @@ fn the_window_runs_as_one_pass_on_the_rings_on_metal() -> Result<()> {
                 &dev,
                 &LoadOptions {
                     mtp: true,
-                    window,
+                    verify: window,
+                    recovery: if window >= 1 {
+                        DecodeRecovery::Standing
+                    } else {
+                        DecodeRecovery::None
+                    },
                     ..Default::default()
                 },
             )?;
@@ -487,7 +494,12 @@ fn the_window_runs_as_one_pass_on_the_rings_on_metal() -> Result<()> {
                 &dev,
                 &LoadOptions {
                     mtp: true,
-                    window,
+                    verify: window,
+                    recovery: if window >= 1 {
+                        DecodeRecovery::Standing
+                    } else {
+                        DecodeRecovery::None
+                    },
                     ..Default::default()
                 },
             )?;
@@ -827,7 +839,8 @@ fn sampled_mtp_on_the_rings_is_the_k1_run_on_metal() -> Result<()> {
         &dev,
         &LoadOptions {
             mtp: true,
-            window: 3,
+            verify: 3,
+            recovery: DecodeRecovery::Standing,
             ..Default::default()
         },
     )?;

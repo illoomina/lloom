@@ -145,6 +145,7 @@ fn a_warmed_decode_step_on_the_cpu() -> Result<()> {
         "CENSUS cpu: {per_step:.2} allocations a step ({bytes:.0} bytes); {window:.2} a window \
          opening and closing"
     );
+    assert_eq!(window, 0.0, "a window allocates nothing once warm");
     Ok(())
 }
 
@@ -157,6 +158,7 @@ fn a_warmed_decode_step_on_metal() -> Result<()> {
         "CENSUS metal: {per_step:.2} allocations a step ({bytes:.0} bytes); {window:.2} a window \
          opening and closing"
     );
+    assert_eq!(window, 0.0, "a window allocates nothing once warm");
     // The dispatches, with `CANDLE_METAL_PROFILE=1` (a run of its own: the
     // census is instrumentation).
     let (model, cfg) = model(&dev)?;

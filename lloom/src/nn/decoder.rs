@@ -672,6 +672,12 @@ pub struct DecoderState<L: Layer> {
     /// of every layer's [`Layer::checkpoint_elems`] f32s, the KV layers'
     /// lengths in the marks (`nn::turn_checkpoint`).
     ckpt: CheckpointRing,
+    /// The marks' storage between windows: a window takes it and gives it
+    /// back, so a decode step's window allocates nothing.
+    marks_spare: Vec<WindowMark>,
+    /// Why the state cannot be used until a reset: a window that failed to
+    /// put every layer back left them inconsistent.
+    unusable: Option<String>,
 }
 
 /// Owned layer snapshots and the logical end of a privately owned sequence.
@@ -844,7 +850,23 @@ impl<L: Layer> DecoderState<L> {
             #[cfg(feature = "metal")]
             ledger: None,
             ckpt: CheckpointRing::none(),
+            marks_spare: Vec::new(),
+            unusable: None,
         }
+    }
+
+    /// Refused while the state is unusable (`Self::unusable`).
+    fn usable(&self) -> Result<()> {
+        match &self.unusable {
+            None => Ok(()),
+            Some(why) => lloom_tensor::bail!("decoder state: unusable until a reset ({why})"),
+        }
+    }
+
+    /// Why the state refuses every forward and window until a reset, if it
+    /// does.
+    pub fn unusable(&self) -> Option<&str> {
+        self.unusable.as_deref()
     }
 
     /// Keep `slots` turn checkpoints, each `elems[l]` f32s for layer `l`.
@@ -911,6 +933,7 @@ impl<L: Layer> DecoderState<L> {
     /// position with them; the standing window settled first, what the
     /// discarded positions retained gone.
     pub fn restore(&mut self, pos: usize) -> Result<()> {
+        self.usable()?;
         if self.can_restore(pos) {
             self.settle_standing()?;
         }
@@ -947,15 +970,35 @@ impl<L: Layer> DecoderState<L> {
     }
 
     /// Open a speculative window over every layer's state and the
-    /// position, the standing window settled first. One at a time.
+    /// position, the standing window settled first. One at a time. A layer
+    /// that fails to open closes the ones before it (nothing was written
+    /// inside them), so a failed opening leaves no window anywhere.
     pub fn open_window(&mut self) -> Result<()> {
+        self.usable()?;
         self.settle_standing()?;
         if self.window.is_some() {
             lloom_tensor::bail!("decoder state: a speculative window is already open")
         }
-        let mut marks = Vec::with_capacity(self.layers.len());
-        for s in &mut self.layers {
-            marks.push(L::open_window(s)?);
+        let mut marks = std::mem::take(&mut self.marks_spare);
+        marks.clear();
+        for l in 0..self.layers.len() {
+            match L::open_window(&mut self.layers[l]) {
+                Ok(m) => marks.push(m),
+                Err(e) => {
+                    for (s, m) in self.layers.iter_mut().zip(&marks) {
+                        if let Err(r) = L::resolve_window(s, *m) {
+                            self.unusable = Some(format!(
+                                "layer {l} failed to open a window ({e}) and an earlier one \
+                                 failed to close its own ({r})"
+                            ));
+                            return Err(e);
+                        }
+                    }
+                    marks.clear();
+                    self.marks_spare = marks;
+                    return Err(e);
+                }
+            }
         }
         self.window = Some(DecoderWindow {
             pos: self.pos,
@@ -967,29 +1010,41 @@ impl<L: Layer> DecoderState<L> {
 
     /// Put every layer and the position back where the window opened; what
     /// the window's passes retained goes with them. The caller replays the
-    /// accepted prefix.
+    /// accepted prefix. A layer that fails to rewind leaves the layers
+    /// inconsistent: the state is unusable until a reset.
     pub fn rewind_window(&mut self) -> Result<()> {
+        self.usable()?;
         let Some(w) = self.window.take() else {
             lloom_tensor::bail!("decoder state: no speculative window is open")
         };
         self.standing = false;
-        for (s, m) in self.layers.iter_mut().zip(&w.marks) {
-            L::rewind_window(s, *m)?;
+        for (l, (s, m)) in self.layers.iter_mut().zip(&w.marks).enumerate() {
+            if let Err(e) = L::rewind_window(s, *m) {
+                self.unusable = Some(format!("layer {l} failed to rewind its window ({e})"));
+                return Err(e);
+            }
         }
         self.pos = w.pos;
+        self.marks_spare = w.marks;
         self.ckpt.forget_past(self.pos);
         self.nextn.keep_first(w.retained)
     }
 
-    /// Close the window keeping everything the passes wrote.
+    /// Close the window keeping everything the passes wrote. A layer that
+    /// fails to close leaves the state unusable until a reset.
     pub fn resolve_window(&mut self) -> Result<()> {
+        self.usable()?;
         let Some(w) = self.window.take() else {
             lloom_tensor::bail!("decoder state: no speculative window is open")
         };
         self.standing = false;
-        for (s, m) in self.layers.iter_mut().zip(&w.marks) {
-            L::resolve_window(s, *m)?;
+        for (l, (s, m)) in self.layers.iter_mut().zip(&w.marks).enumerate() {
+            if let Err(e) = L::resolve_window(s, *m) {
+                self.unusable = Some(format!("layer {l} failed to close its window ({e})"));
+                return Err(e);
+            }
         }
+        self.marks_spare = w.marks;
         Ok(())
     }
 
@@ -1034,6 +1089,7 @@ impl<L: Layer> DecoderState<L> {
     /// probe cut to `a` rows of the window. The window's positions past `a`
     /// cost nothing — no replay.
     pub fn accept_window(&mut self, a: usize, after: &[Vec<WindowMark>]) -> Result<()> {
+        self.usable()?;
         if self.standing {
             lloom_tensor::bail!("decoder state: accepting positions of a standing window")
         }
@@ -1059,9 +1115,13 @@ impl<L: Layer> DecoderState<L> {
                     ),
                 }
             };
-            L::accept_window(s, a, at)?;
+            if let Err(e) = L::accept_window(s, a, at) {
+                self.unusable = Some(format!("layer {l} failed to accept its window ({e})"));
+                return Err(e);
+            }
         }
         self.pos = w.pos + a;
+        self.marks_spare = w.marks;
         self.ckpt.forget_past(self.pos);
         self.nextn.keep_first(w.retained + a)
     }
@@ -1069,6 +1129,7 @@ impl<L: Layer> DecoderState<L> {
     /// Cut every layer back to its first `tokens` positions outside a
     /// window (an attention-only lane, `MixerBlock::truncate_state`).
     pub fn truncate(&mut self, tokens: usize) -> Result<()> {
+        self.usable()?;
         if self.window_open() {
             lloom_tensor::bail!("decoder state: truncating under an open window")
         }
@@ -1127,8 +1188,11 @@ impl<L: Layer> CacheReset for DecoderState<L> {
             L::reset_state(s);
         }
         self.pos = 0;
-        self.window = None;
+        if let Some(w) = self.window.take() {
+            self.marks_spare = w.marks;
+        }
         self.standing = false;
+        self.unusable = None;
         self.nextn.clear();
         // The ring stays (the next sequence writes over it); its contents
         // describe nothing now.
@@ -1355,6 +1419,7 @@ where
                 embeds.shape()
             )
         }
+        state.usable()?;
         state.settle_standing()?;
         let windowed = state.window_open();
         if seq > 1 || windowed || !state.keeps_standing {
@@ -2234,5 +2299,190 @@ impl<P: Profile, R: crate::models::qwen4exp::ExpertResidency + Send + Sync> FfnB
             },
         )?;
         Ok(y)
+    }
+}
+
+#[cfg(test)]
+mod window_tests {
+    //! `DecoderState`'s window over layers that fail on cue: a failed opening
+    //! leaves no layer open, a failed rewind or resolve leaves the state
+    //! refusing until a reset, and the marks' storage is reused.
+    use super::*;
+
+    struct Faulty;
+
+    #[derive(Default)]
+    struct FaultyState {
+        open: bool,
+        fail_open: bool,
+        fail_rewind: bool,
+        fail_resolve: bool,
+    }
+
+    impl Layer for Faulty {
+        type State = FaultyState;
+        fn new_state(&self, _: &Device, _: &StateCapacity) -> Result<FaultyState> {
+            Ok(FaultyState::default())
+        }
+        fn reset_state(s: &mut FaultyState) {
+            s.open = false;
+        }
+        fn held_bytes(&self, _: &FaultyState) -> StateBytes {
+            StateBytes::default()
+        }
+        fn grow_bytes(&self, _: &FaultyState, _: usize) -> StateBytes {
+            StateBytes::default()
+        }
+        fn execute(&self, x: &Tensor, _: &mut FaultyState) -> Result<Tensor> {
+            Ok(x.clone())
+        }
+        fn visit_layer(&self, _: &mut Walker, x: NodeId, _: usize, _: &StateCapacity) -> NodeId {
+            x
+        }
+        fn open_window(s: &mut FaultyState) -> Result<WindowMark> {
+            if s.fail_open {
+                lloom_tensor::bail!("refused to open")
+            }
+            if s.open {
+                lloom_tensor::bail!("already open")
+            }
+            s.open = true;
+            Ok(WindowMark::default())
+        }
+        fn rewind_window(s: &mut FaultyState, _: WindowMark) -> Result<()> {
+            if s.fail_rewind {
+                lloom_tensor::bail!("refused to rewind")
+            }
+            if !s.open {
+                lloom_tensor::bail!("not open")
+            }
+            s.open = false;
+            Ok(())
+        }
+        fn resolve_window(s: &mut FaultyState, _: WindowMark) -> Result<()> {
+            if s.fail_resolve {
+                lloom_tensor::bail!("refused to resolve")
+            }
+            if !s.open {
+                lloom_tensor::bail!("not open")
+            }
+            s.open = false;
+            Ok(())
+        }
+        fn truncate_state(_: &mut FaultyState, _: usize) -> Result<()> {
+            Ok(())
+        }
+        fn ring_holds(_: &FaultyState, _: usize) -> bool {
+            false
+        }
+        fn pooled(_: &FaultyState) -> bool {
+            false
+        }
+        fn execute_window(
+            &self,
+            x: &Tensor,
+            _: &mut FaultyState,
+            _: &mut Vec<WindowMark>,
+        ) -> Result<Tensor> {
+            Ok(x.clone())
+        }
+        fn accept_window(s: &mut FaultyState, _: usize, _: WindowMark) -> Result<()> {
+            s.open = false;
+            Ok(())
+        }
+        fn checkpoint_elems(&self, _: &StateCapacity) -> usize {
+            0
+        }
+        fn execute_checkpointing(
+            &self,
+            x: &Tensor,
+            _: &mut FaultyState,
+            _: usize,
+            _: Option<&Tensor>,
+        ) -> Result<(Tensor, WindowMark)> {
+            Ok((x.clone(), WindowMark::default()))
+        }
+        fn restore_checkpoint(
+            _: &mut FaultyState,
+            _: Option<&Tensor>,
+            _: WindowMark,
+        ) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    fn state(n: usize) -> DecoderState<Faulty> {
+        DecoderState::new((0..n).map(|_| FaultyState::default()).collect())
+    }
+
+    #[test]
+    fn a_failed_opening_leaves_no_layer_open() {
+        let mut st = state(4);
+        st.layers[2].fail_open = true;
+        assert!(st.open_window().is_err());
+        assert!(
+            st.layers.iter().all(|l| !l.open),
+            "a layer before the one that failed stayed open"
+        );
+        assert!(!st.window_open() && st.unusable().is_none());
+        st.layers[2].fail_open = false;
+        st.open_window().expect("the next opening");
+        assert!(st.layers.iter().all(|l| l.open));
+        st.resolve_window().expect("and its close");
+    }
+
+    #[test]
+    fn a_failed_rewind_leaves_the_state_unusable_until_a_reset() {
+        let mut st = state(3);
+        st.open_window().unwrap();
+        st.layers[1].fail_rewind = true;
+        assert!(st.rewind_window().is_err());
+        let why = st.unusable().expect("marked unusable").to_string();
+        assert!(why.contains("layer 1"), "{why}");
+        assert!(st.open_window().is_err(), "no window on an unusable state");
+        assert!(st.truncate(0).is_err(), "no truncate on an unusable state");
+        st.layers[1].fail_rewind = false;
+        st.reset();
+        assert!(st.unusable().is_none());
+        st.open_window().expect("usable after the reset");
+    }
+
+    #[test]
+    fn a_failed_resolve_leaves_the_state_unusable_until_a_reset() {
+        let mut st = state(3);
+        st.open_window().unwrap();
+        st.layers[2].fail_resolve = true;
+        assert!(st.resolve_window().is_err());
+        assert!(st.unusable().expect("marked unusable").contains("layer 2"));
+        assert!(st.open_window().is_err());
+        st.layers[2].fail_resolve = false;
+        st.reset();
+        st.open_window().expect("usable after the reset");
+    }
+
+    #[test]
+    fn a_window_keeps_its_marks_storage() {
+        let mut st = state(4);
+        st.open_window().unwrap();
+        st.resolve_window().unwrap();
+        let (ptr, cap) = (st.marks_spare.as_ptr(), st.marks_spare.capacity());
+        assert!(cap >= 4);
+        // Another allocation of the same size alive the whole time, so a new
+        // `Vec` per opening could not land on the freed block by chance.
+        let _decoy: Vec<WindowMark> = Vec::with_capacity(cap);
+        let after = vec![Vec::new(); 4];
+        for _ in 0..8 {
+            st.open_window().unwrap();
+            st.rewind_window().unwrap();
+            st.open_window().unwrap();
+            st.resolve_window().unwrap();
+            st.open_window().unwrap();
+            st.accept_window(0, &after).unwrap();
+            assert_eq!(
+                (st.marks_spare.as_ptr(), st.marks_spare.capacity()),
+                (ptr, cap),
+                "an opening took new storage for its marks"
+            );
+        }
     }
 }

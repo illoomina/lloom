@@ -61,12 +61,14 @@ fn detok(ids: &[u32]) -> Result<String> {
     Ok(ids.iter().map(|t| format!("<{t}>")).collect())
 }
 
-/// One request: the whole conversation, the budget, the stop strings.
+/// One request: the whole conversation, the budget, the stop strings, and
+/// the delivered ids after which the consumer cancels (none if `None`).
 #[derive(Debug, Clone)]
 struct Req {
     prompt: Vec<u32>,
     max_tokens: usize,
     stop: Vec<String>,
+    cancel_after: Option<usize>,
 }
 
 fn req(prompt: Vec<u32>, max_tokens: usize) -> Req {
@@ -74,6 +76,7 @@ fn req(prompt: Vec<u32>, max_tokens: usize) -> Req {
         prompt,
         max_tokens,
         stop: Vec::new(),
+        cancel_after: None,
     }
 }
 
@@ -133,7 +136,7 @@ fn serve(
             if slow_after.is_some_and(|n| delivered >= n) {
                 std::thread::sleep(slow);
             }
-            true
+            !r.cancel_after.is_some_and(|n| delivered >= n)
         })?;
         let log = session.tokens().len();
         let (s, p) = session.into_parts();
@@ -407,5 +410,133 @@ fn under_the_eos_gate_the_next_request_extends_past_any_overrun() -> Result<()> 
             }
         }
     }
+    Ok(())
+}
+
+/// One live session under the gate arm through every stop kind, a request
+/// after each, the client sending back what it saw (#993's acceptance: "continue the same live session
+/// after terminal EOS, length stop, host stop, cancellation"):
+/// EOS → a length stop → a stop string → a cancellation → EOS → a length
+/// stop. Every request completes with the stop it was forced to; the gate
+/// fires on the EOS turns only, and the request after each EOS extends,
+/// prefilling just what it adds. The first EOS turn and the turn after it
+/// answer as the blocking arm's do. Each turn is recorded with its reuse.
+#[test]
+fn under_the_eos_gate_one_live_session_takes_every_stop_kind() -> Result<()> {
+    let _ = lloom_tensor::tuning::pin_regime(lloom_tensor::tuning::Contract::Deterministic);
+    let dev = Device::new_metal(0)?;
+    let (model, cfg) = model(&dev)?;
+    let prompt: Vec<u32> = vec![1, 3, 5, 7, 9];
+    let stream = serve(
+        &model,
+        &cfg,
+        &dev,
+        "blocking",
+        false,
+        u32::MAX,
+        &[req(prompt.clone(), 32)],
+        None,
+        SLOW,
+    )?
+    .remove(0)
+    .ids;
+    let cut = (6..stream.len())
+        .find(|&i| !stream[..i].contains(&stream[i]))
+        .expect("a fresh id to stop on");
+    let eos = stream[cut];
+    // The conversation, turn by turn: each request is everything the client
+    // has seen plus a user turn. A stop-string or cancelled reply is what the
+    // client saw (its text, here its ids); the session's log may hold more.
+    let mut seq = Some(Sequence::new(model.new_cache(&cfg, &dev)?));
+    let mut rings = Some(RingPool::new());
+    let config = config("ring-nonblocking", true);
+    let readback = config.readback.arm();
+    let mut convo = prompt.clone();
+    let mut seen_eos_turns = 0usize;
+    let mut extend_after_eos = 0usize;
+    let mut last_was_eos = false;
+    let kinds: [(&str, usize, Vec<String>, Option<usize>); 6] = [
+        ("eos", 3000, vec![], None),
+        ("length", 4, vec![], None),
+        ("stop-string", 3000, vec!["<".into()], None),
+        ("cancel", 3000, vec![], Some(1)),
+        ("eos", 3000, vec![], None),
+        ("length", 8, vec![], None),
+    ];
+    let mut record = Vec::new();
+    for (i, (kind, max_tokens, stop, cancel_after)) in kinds.iter().enumerate() {
+        if i > 0 {
+            convo.extend_from_slice(&[10 + i as u32, 20 + i as u32]);
+        }
+        let mut session = DecodeSession::from_parts(
+            &model,
+            seq.take().unwrap(),
+            dev.clone(),
+            rings.take().unwrap(),
+        )
+        .with_config(config.clone());
+        let params = DecodeParams {
+            max_tokens: *max_tokens,
+            eos_ids: vec![eos],
+            readback,
+            stop_strings: stop.clone(),
+            ..DecodeParams::default()
+        };
+        let mut delivered = 0usize;
+        let decoded = session.decode_until(&convo, detok, &params, |frag| {
+            delivered += frag.matches('<').count();
+            !cancel_after.is_some_and(|n| delivered >= n)
+        })?;
+        let (s, p) = session.into_parts();
+        seq = Some(s);
+        rings = Some(p);
+        let gated = decoded.stats.eos_gate.is_some_and(|g| g.fired) && decoded.stats.overrun_unwritten;
+        eprintln!(
+            "LIVE turn {i} {kind}: stop {:?} ids {} overrun {} gated {gated} | reuse {:?} prefilled {} of {}",
+            decoded.stop,
+            decoded.tokens.len(),
+            decoded.stats.overrun,
+            decoded.reuse,
+            decoded.prefilled,
+            convo.len(),
+        );
+        if last_was_eos {
+            assert_eq!(decoded.reuse, ReuseAction::Extend, "turn {i}: the request after an EOS extends");
+            assert_eq!(decoded.prefilled, 2, "turn {i}: and prefills only the user turn");
+            extend_after_eos += 1;
+        }
+        let want_stop = match *kind {
+            "eos" => Stop::Eos,
+            "length" => Stop::Length,
+            "stop-string" => Stop::StopString,
+            _ => Stop::Cancelled,
+        };
+        // A forced EOS turn may meet its EOS later than the first turn's
+        // position, or a length turn may meet it first: the kinds below
+        // are what the conversation was driven to, and are asserted.
+        assert_eq!(decoded.stop, want_stop, "turn {i} ({kind})");
+        assert_eq!(gated, want_stop == Stop::Eos, "turn {i} ({kind}): the gate fires on an EOS only");
+        last_was_eos = want_stop == Stop::Eos;
+        seen_eos_turns += last_was_eos as usize;
+        record.push((i, kind.to_string(), decoded.tokens.clone(), decoded.reuse));
+        // What the client saw goes back: the ids of the text it received.
+        convo.extend_from_slice(&decoded.tokens);
+    }
+    assert_eq!((seen_eos_turns, extend_after_eos), (2, 2));
+    // The first EOS turn and the request after it, against the blocking arm.
+    let first: Vec<u32> = [prompt.clone(), record[0].2.clone(), vec![11, 21]].concat();
+    let want = serve(
+        &model,
+        &cfg,
+        &dev,
+        "blocking",
+        false,
+        eos,
+        &[req(prompt.clone(), 3000), req(first, 4)],
+        None,
+        SLOW,
+    )?;
+    assert_eq!(record[0].2, want[0].ids, "the first EOS turn answers as blocking does");
+    assert_eq!(record[1].2, want[1].ids, "and so does the request after it");
     Ok(())
 }

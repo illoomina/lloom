@@ -846,11 +846,9 @@ impl Order {
                     }
                 }
             }
-            if k == n {
+            let Some(d) = dispatches.get(k) else {
                 break;
-            }
-
-            let d = &dispatches[k];
+            };
             let p = o.pass(d.encoder, n);
             if d.barrier {
                 let scope = d.barrier_scope;

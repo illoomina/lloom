@@ -396,19 +396,26 @@ fn main() {
             }
         }
         let rep = cover_stream(label, &ds, &[], policy);
-        (rep.edges, rep.uncovered.len())
+        let count = |k: HazardKind| rep.uncovered.iter().filter(|e| e.kind == k).count();
+        (
+            rep.edges,
+            rep.uncovered.len(),
+            count(HazardKind::Raw),
+            count(HazardKind::War),
+        )
     };
     let run = |label: &str,
                suppressed: &std::collections::BTreeSet<usize>,
                icb_on: bool,
                seam_on: bool| {
-        run_with(
+        let (edges, uncovered, _, _) = run_with(
             label,
             suppressed,
             icb_on,
             seam_on,
             SeamPolicy::AssumedOrdered,
-        )
+        );
+        (edges, uncovered)
     };
 
     let none = std::collections::BTreeSet::new();
@@ -477,10 +484,11 @@ fn main() {
         if all_ok { "YES" } else { "NO" }
     );
     println!("  (rows above: SeamPolicy::AssumedOrdered, #144's seam assumption)");
-    let (_, observed) = run_with("o", &a, true, true, SeamPolicy::Observed);
+    let (_, observed, raw, war) = run_with("o", &a, true, true, SeamPolicy::Observed);
     println!(
         "  OBSERVED: {observed:>7}  edges unordered   PROPOSAL with no cross-session \
-         ordering assumed (the trace records no fences)"
+         ordering assumed (the trace records no fences): raw {raw}, waw {}, war {war}",
+        observed - raw - war
     );
     assert!(all_ok, "the Rust cover test disagrees with #144's model");
 }

@@ -147,6 +147,28 @@ impl CheckpointRing {
         }
     }
 
+    /// Which checkpoint a pass of `seq` positions from `pos` will take, as
+    /// the pass key's variant (`PassKey::variant`): 0 for none, else nonzero
+    /// and a function of where — the hinted position's offset into the pass,
+    /// or its end for a state no caller has hinted. A checkpoint adds a copy
+    /// (at a chunk's end) or a second recurrence over the prefix (inside a
+    /// chunk), so two passes of one shape that leave theirs at different
+    /// places allocate different sequences, and a plan recorded from one
+    /// must not serve the other. Decided as the forward decides it
+    /// ([`Self::rows_for`] after [`Self::drop_stale_hint`]); the chunking
+    /// inside the pass is the model's constant, so the offset fixes it.
+    pub fn pass_variant(&self, pos: usize, seq: usize, windowed: bool) -> u32 {
+        if self.slots == 0 || windowed || seq == 0 {
+            return 0;
+        }
+        let want = self.want.filter(|&w| w >= pos && self.index(w).is_none());
+        match want {
+            Some(w) if w <= pos + seq => 2 | (((w - pos) as u32) << 2),
+            None if self.auto && seq >= 2 => 1,
+            _ => 0,
+        }
+    }
+
     /// Frame `slot`'s view for layer `l`, `[elems]` f32; `None` for a layer
     /// whose checkpoint is its mark alone.
     pub fn frame(&self, slot: usize, l: usize) -> Result<Option<Tensor>> {

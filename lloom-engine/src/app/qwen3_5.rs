@@ -841,6 +841,18 @@ where
     fn template_renders(&self) -> u64 {
         self.text.template.as_ref().map_or(0, |t| t.renders())
     }
+    fn text(&self) -> Option<&super::common::Text> {
+        Some(&self.text)
+    }
+    fn decode_body(&self) -> lloom::nn::Body {
+        if self.mtp.is_some() {
+            lloom::nn::Body::Window
+        } else {
+            lloom::nn::Body::Step {
+                ring: matches!(self.readback, ReadbackArm::Ring(_)),
+            }
+        }
+    }
     fn seed_prompt_row(&self, n: usize, row: usize) -> Vec<u32> {
         let seed = &self.text.seed_tokens;
         (0..n).map(|i| seed[(i + row * 7) % seed.len()]).collect()

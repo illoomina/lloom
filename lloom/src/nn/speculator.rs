@@ -1197,8 +1197,10 @@ impl<'m, M: CausalLM> Session<'m, M> {
     /// fresh request are the same operation at different prefix lengths —
     /// nothing here knows which client sent `full`.
     ///
-    /// An unreconciled overrun is discarded first, or the sequence is reset if
-    /// it cannot be. When `full` is entirely cached, the last id must still be
+    /// An unreconciled overrun is discarded first; one the cache cannot take
+    /// back puts the state back at the latest turn checkpoint inside the log,
+    /// and the sequence is reset only when there is none. When `full` is
+    /// entirely cached, the last id must still be
     /// re-fed to produce a prediction unless the run that cached it left its
     /// logits behind ([`ReuseAction::Resume`]).
     pub fn prepare(&mut self, full: &[u32]) -> Result<Prepared>
@@ -1221,8 +1223,30 @@ impl<'m, M: CausalLM> Session<'m, M> {
         if full.is_empty() {
             lloom_tensor::bail!("Session::prepare: empty sequence");
         }
+        // An overrun the cache cannot take back (a ring arm's forwards past
+        // an EOS on a recurrent state) leaves the state past the log: put it
+        // back at the latest turn checkpoint inside the log, or reset when
+        // there is none. The ids the restore drops are counted as rewound.
+        let mut dropped = 0;
         if self.seq.overrun > 0 && self.reconcile().is_err() {
-            self.reset();
+            let log = self.seq.tokens.len();
+            match self
+                .seq
+                .cache
+                .restore_point(log)
+                .filter(|_| self.seq.tokens_known)
+            {
+                Some(at) => {
+                    self.seq.cache.restore(at)?;
+                    self.seq.pos = at;
+                    self.seq.tokens.truncate(at);
+                    self.seq.overrun = 0;
+                    self.seq.overrun_unwritten = false;
+                    self.seq.last_logits = None;
+                    dropped = log - at;
+                }
+                None => self.reset(),
+            }
         }
         if !self.seq.tokens_known {
             self.reset();
@@ -1268,6 +1292,11 @@ impl<'m, M: CausalLM> Session<'m, M> {
         } else {
             self.reset();
             ReuseAction::Fresh
+        };
+        let action = match action {
+            ReuseAction::Extend if dropped > 0 => ReuseAction::Rewound(dropped),
+            ReuseAction::Rewound(n) => ReuseAction::Rewound(n + dropped),
+            a => a,
         };
         let reused = match action {
             ReuseAction::Fresh => 0,

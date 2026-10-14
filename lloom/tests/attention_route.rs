@@ -1,0 +1,397 @@
+//! The prepared attention route on Metal: the kernel it names is the kernel
+//! that runs, a refused request allocates nothing, the workspace it reports
+//! is what the call asks the pool for, and the shapes it newly routes are the
+//! attention (`docs/dependency-ordered-reuse-design.md` §8).
+//!
+//! The reference is a scalar f64 softmax over inputs exact in both tested
+//! dtypes (|q| <= 5/16, |k| <= 6/16, |v| <= 15/8), so every difference is the
+//! kernel's rounding, bounded before running it. The tiled kernel rounds
+//! `scale * log2(e)` to the input dtype and then each scaled query element:
+//! two relative roundings of u (2^-11 at f16, 2^-24 at f32) on every score,
+//! whose magnitude is at most `scale * hd * 30/256`, about 1.05 at head dim
+//! 80. A score moved by d moves an output by at most `2 * d * max|v|`.
+//! Scores, the softmax and the weighted sum accumulate in f32 over at most
+//! 80 products and 33 keys. At f16 that is `2 * 2u * 1.05 * 15/8` = 0.0039,
+//! plus the stored output's half-ulp below 2 (2^-11): 0.0044, bounded by
+//! 0.005. At f32 the same terms come to about 2.5e-5, bounded by 5e-5.
+#![cfg(feature = "metal")]
+
+use lloom::nn::attention::route::{
+    AttentionBounds, AttentionKernel, AttentionSpec, KvLayout, MaskKind, MetalKernelSet,
+    PreparedAttention,
+};
+use lloom::nn::ops;
+use lloom_tensor::{DType, Device, Result, Tensor};
+
+const HEADS: usize = 4;
+const KV_HEADS: usize = 2;
+
+struct Inputs {
+    hd: usize,
+    queries: usize,
+    keys: usize,
+    q: Vec<f32>,
+    k: Vec<f32>,
+    v: Vec<f32>,
+}
+
+impl Inputs {
+    /// Dyadic values: exact at f16 and f32.
+    fn new(hd: usize, queries: usize, keys: usize) -> Self {
+        let q = (0..HEADS * queries * hd)
+            .map(|i| ((i % 11) as f32 - 5.) / 16.)
+            .collect();
+        let k = (0..KV_HEADS * keys * hd)
+            .map(|i| ((i % 13) as f32 - 6.) / 16.)
+            .collect();
+        let v = (0..KV_HEADS * keys * hd)
+            .map(|i| ((i % 31) as f32 - 15.) / 8.)
+            .collect();
+        Inputs {
+            hd,
+            queries,
+            keys,
+            q,
+            k,
+            v,
+        }
+    }
+
+    /// Unmasked attention, every query over every key.
+    fn reference(&self, scale: f64) -> Vec<f32> {
+        let (hd, nq, nk) = (self.hd, self.queries, self.keys);
+        let mut out = vec![0f32; HEADS * nq * hd];
+        for h in 0..HEADS {
+            let kv = h / (HEADS / KV_HEADS);
+            for qi in 0..nq {
+                let row = h * nq + qi;
+                let scores: Vec<f64> = (0..nk)
+                    .map(|key| {
+                        (0..hd)
+                            .map(|d| {
+                                f64::from(self.q[row * hd + d])
+                                    * f64::from(self.k[(kv * nk + key) * hd + d])
+                            })
+                            .sum::<f64>()
+                            * scale
+                    })
+                    .collect();
+                let max = scores.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+                let w: Vec<f64> = scores.iter().map(|s| (s - max).exp()).collect();
+                let sum: f64 = w.iter().sum();
+                for d in 0..hd {
+                    out[row * hd + d] = (w
+                        .iter()
+                        .enumerate()
+                        .map(|(key, w)| w * f64::from(self.v[(kv * nk + key) * hd + d]))
+                        .sum::<f64>()
+                        / sum) as f32;
+                }
+            }
+        }
+        out
+    }
+
+    fn tensors(&self, dtype: DType, dev: &Device) -> Result<(Tensor, Tensor, Tensor)> {
+        let (hd, nq, nk) = (self.hd, self.queries, self.keys);
+        Ok((
+            Tensor::from_vec(self.q.clone(), (1, HEADS, nq, hd), dev)?.to_dtype(dtype)?,
+            Tensor::from_vec(self.k.clone(), (1, KV_HEADS, nk, hd), dev)?.to_dtype(dtype)?,
+            Tensor::from_vec(self.v.clone(), (1, KV_HEADS, nk, hd), dev)?.to_dtype(dtype)?,
+        ))
+    }
+}
+
+fn spec(hd: usize, dtype: DType, mask: MaskKind) -> AttentionSpec {
+    AttentionSpec {
+        q_heads: HEADS,
+        kv_heads: KV_HEADS,
+        head_dim: hd,
+        v_head_dim: hd,
+        dtype,
+        kv_dtype: dtype,
+        mask,
+        softcap: 1.0,
+        layout: KvLayout::Strided,
+        bounds: AttentionBounds {
+            batch: 1,
+            min_queries: 1,
+            queries: 64,
+            keys: 4096,
+        },
+    }
+}
+
+fn prepare(dev: &Device, s: AttentionSpec) -> Result<PreparedAttention> {
+    let metal = dev.as_metal_device()?;
+    PreparedAttention::prepare(s, &MetalKernelSet { device: metal })
+        .map_err(|e| lloom_tensor::Error::Msg(e.to_string()))
+}
+
+fn bits(t: &Tensor) -> Result<Vec<u32>> {
+    Ok(t.to_dtype(DType::F32)?
+        .flatten_all()?
+        .to_vec1::<f32>()?
+        .iter()
+        .map(|v| v.to_bits())
+        .collect())
+}
+
+fn requested(dev: &Device) -> Result<u64> {
+    let (shared, private) = dev.as_metal_device()?.pool_counters();
+    Ok(shared.requested_bytes + private.requested_bytes)
+}
+
+fn tolerance(dtype: DType) -> f32 {
+    if dtype == DType::F16 {
+        0.005
+    } else {
+        0.00005
+    }
+}
+
+fn metal() -> Option<Device> {
+    Device::new_metal(0).ok()
+}
+
+/// 72 and 80 have tiled kernels and no one-query entry point. The route
+/// sends one query there to the tiled kernel; the result is the attention,
+/// and repeats bit for bit.
+#[test]
+fn one_query_at_a_head_dim_without_a_vector_entry_takes_the_tiled_kernel() -> Result<()> {
+    let Some(dev) = metal() else { return Ok(()) };
+    for hd in [72usize, 80] {
+        for dtype in [DType::F16, DType::F32] {
+            let route = prepare(&dev, spec(hd, dtype, MaskKind::None))?;
+            assert_eq!(route.kernel_for(1, 1, 33)?, AttentionKernel::Full);
+            let f = Inputs::new(hd, 1, 33);
+            let scale = 1.0 / (hd as f64).sqrt();
+            let want = f.reference(scale);
+            let (q, k, v) = f.tensors(dtype, &dev)?;
+            let mut first = None;
+            for _ in 0..3 {
+                let got = ops::attention(&q, &k, &v, None, scale as f32, &route)?;
+                let vals = got.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
+                for (i, (g, w)) in vals.iter().zip(&want).enumerate() {
+                    assert!(
+                        (g - w).abs() <= tolerance(dtype),
+                        "hd {hd} {dtype:?} element {i}: {g} against {w}"
+                    );
+                }
+                let b = bits(&got)?;
+                match &first {
+                    None => first = Some(b),
+                    Some(f) => assert_eq!(&b, f, "hd {hd} {dtype:?} not bit-stable"),
+                }
+            }
+            // The unrouted op now serves the same shape with the same kernel.
+            let unrouted = ops::sdpa(&q, &k, &v, None, false, scale as f32, 1.0)?;
+            assert_eq!(bits(&unrouted)?, first.unwrap(), "hd {hd} {dtype:?}");
+        }
+    }
+    Ok(())
+}
+
+/// Routing changes no arithmetic: wherever the unrouted op already chose a
+/// kernel, the route chooses the same one and the bits are identical.
+#[test]
+fn the_route_takes_the_kernel_the_unrouted_op_took() -> Result<()> {
+    let Some(dev) = metal() else { return Ok(()) };
+    for (queries, keys, kernel) in [
+        (1, 100, AttentionKernel::Vector),
+        (1, 2048, AttentionKernel::VectorTwoPass),
+        (8, 100, AttentionKernel::Full),
+    ] {
+        let route = prepare(&dev, spec(64, DType::F16, MaskKind::Causal))?;
+        assert_eq!(route.kernel_for(1, queries, keys)?, kernel);
+        let f = Inputs::new(64, queries, keys);
+        let (q, k, v) = f.tensors(DType::F16, &dev)?;
+        let routed = ops::attention(&q, &k, &v, None, 0.125, &route)?;
+        let unrouted = ops::sdpa(&q, &k, &v, None, queries > 1, 0.125, 1.0)?;
+        assert_eq!(bits(&routed)?, bits(&unrouted)?, "{kernel:?}");
+    }
+    Ok(())
+}
+
+/// A request the route refuses, and a shape the op refuses, allocate
+/// nothing: every check precedes the first allocation.
+#[test]
+fn a_refused_request_allocates_nothing() -> Result<()> {
+    let Some(dev) = metal() else { return Ok(()) };
+    let route = prepare(&dev, spec(64, DType::F16, MaskKind::Causal))?;
+    let f = Inputs::new(64, 1, 33);
+    let (q, k, v) = f.tensors(DType::F16, &dev)?;
+    dev.synchronize()?;
+
+    let mut narrow = spec(64, DType::F16, MaskKind::Causal);
+    narrow.bounds.keys = 32;
+    let narrow = prepare(&dev, narrow)?;
+    let before = requested(&dev)?;
+    assert!(ops::attention(&q, &k, &v, None, 0.125, &narrow).is_err());
+    assert_eq!(requested(&dev)?, before, "past the key bound");
+
+    let mask = Tensor::zeros((1, HEADS, 1, 33), DType::F16, &dev)?;
+    let before = requested(&dev)?;
+    assert!(ops::attention(&q, &k, &v, Some(&mask), 0.125, &route).is_err());
+    assert_eq!(
+        requested(&dev)?,
+        before,
+        "a mask the route was not prepared for"
+    );
+
+    // The unrouted op at a head dim no kernel instantiates.
+    let g = Inputs::new(48, 1, 33);
+    let (q48, k48, v48) = g.tensors(DType::F16, &dev)?;
+    let before = requested(&dev)?;
+    assert!(ops::sdpa(&q48, &k48, &v48, None, false, 0.125, 1.0).is_err());
+    assert_eq!(
+        requested(&dev)?,
+        before,
+        "the op allocated its output before refusing"
+    );
+
+    // A mask of the wrong shape is refused before the output is allocated.
+    let wrong = Tensor::zeros((1, HEADS, 1, 32), DType::F16, &dev)?;
+    let before = requested(&dev)?;
+    assert!(ops::sdpa(&q, &k, &v, Some(&wrong), false, 0.125, 1.0).is_err());
+    assert_eq!(
+        requested(&dev)?,
+        before,
+        "the op allocated before checking the mask"
+    );
+    Ok(())
+}
+
+/// The workspace the route reports is exactly what one call asks the pool
+/// for: the output, and the two-pass scratch when that kernel runs.
+#[test]
+fn the_workspace_is_what_the_call_requests() -> Result<()> {
+    let Some(dev) = metal() else { return Ok(()) };
+    for dtype in [DType::F16, DType::F32] {
+        let route = prepare(&dev, spec(64, dtype, MaskKind::Causal))?;
+        for (queries, keys) in [(1, 100), (1, 2048), (8, 100)] {
+            let f = Inputs::new(64, queries, keys);
+            let (q, k, v) = f.tensors(dtype, &dev)?;
+            let ws = route.workspace(1, queries, keys)?;
+            dev.synchronize()?;
+            let before = requested(&dev)?;
+            let out = ops::attention(&q, &k, &v, None, 0.125, &route)?;
+            let asked = requested(&dev)? - before;
+            assert_eq!(
+                asked,
+                (ws.output + ws.scratch) as u64,
+                "{dtype:?} {queries}x{keys} via {:?}: {ws:?}",
+                route.kernel_for(1, queries, keys)?
+            );
+            assert_eq!(out.elem_count() * dtype.size_in_bytes(), ws.output);
+        }
+    }
+    Ok(())
+}
+
+/// A masked single query goes to the tiled kernel through the route, and a
+/// mask read through a view at a non-zero offset gives the bits of the same
+/// mask materialized.
+#[test]
+fn a_masked_single_query_and_an_offset_mask_view_through_the_route() -> Result<()> {
+    let Some(dev) = metal() else { return Ok(()) };
+    let route = prepare(&dev, spec(64, DType::F16, MaskKind::Additive))?;
+    assert_eq!(route.kernel_for(1, 1, 33)?, AttentionKernel::Full);
+    let f = Inputs::new(64, 1, 33);
+    let (q, k, v) = f.tensors(DType::F16, &dev)?;
+    let rows: Vec<f32> = (0..2 * HEADS * 33)
+        .map(|i| if i % 33 == (i / 33) % 33 { 0.5 } else { -0.75 })
+        .collect();
+    let wide = Tensor::from_vec(rows, (2, HEADS, 1, 33), &dev)?.to_dtype(DType::F16)?;
+    let view = wide.narrow(0, 1, 1)?;
+    assert_ne!(view.layout().start_offset(), 0);
+    let materialized = view.contiguous()?;
+    let a = ops::attention(&q, &k, &v, Some(&view), 0.125, &route)?;
+    let b = ops::attention(&q, &k, &v, Some(&materialized), 0.125, &route)?;
+    assert_eq!(bits(&a)?, bits(&b)?);
+    let c = ops::sdpa(&q, &k, &v, Some(&materialized), false, 0.125, 1.0)?;
+    assert_eq!(
+        bits(&a)?,
+        bits(&c)?,
+        "the route took another kernel than the op"
+    );
+    Ok(())
+}
+
+/// The Metal kernel set agrees with the compiled entry points: the vector
+/// family at its six head dims, the tiled family at eight.
+#[test]
+fn the_metal_kernel_set_names_what_is_compiled() -> Result<()> {
+    let Some(dev) = metal() else { return Ok(()) };
+    for hd in [32usize, 64, 72, 80, 96, 128, 256] {
+        let route = prepare(&dev, spec(hd, DType::F16, MaskKind::Causal))?;
+        let one = route.kernel_for(1, 1, 10)?;
+        let vector = !matches!(hd, 72 | 80);
+        assert_eq!(
+            one == AttentionKernel::Vector,
+            vector,
+            "hd {hd}: {}",
+            route.describe()
+        );
+    }
+    assert!(prepare(&dev, spec(48, DType::F16, MaskKind::Causal)).is_err());
+    let mut f32_512 = spec(512, DType::F32, MaskKind::Causal);
+    f32_512.kv_dtype = DType::F32;
+    assert!(prepare(&dev, f32_512).is_err());
+    Ok(())
+}
+
+/// The routed page-pool entry reads the pool through its table and gives the
+/// bits of the unrouted paged op, and of the same keys read from a strided
+/// cache; one query over a pool is refused before anything is allocated
+/// (one query over a pool is flash decoding's).
+#[test]
+fn a_page_pool_through_the_route_is_the_unrouted_paged_op() -> Result<()> {
+    let Some(dev) = metal() else { return Ok(()) };
+    let (hd, page, keys, queries) = (64usize, 32usize, 70usize, 9usize);
+    let mut s = spec(hd, DType::F16, MaskKind::Causal);
+    s.layout = KvLayout::Paged { page_size: page };
+    s.bounds.min_queries = 2;
+    let route = prepare(&dev, s)?;
+    let f = Inputs::new(hd, queries, keys);
+    let (q, k, v) = f.tensors(DType::F16, &dev)?;
+    // The live keys laid into a pool one page larger, through a reversed
+    // table, so a read that ignored the table would read another page.
+    let pages = keys.div_ceil(page);
+    let table: Vec<u32> = (0..pages as u32).rev().collect();
+    let slots = (pages + 1) * page;
+    let lay = |live: &[f32]| -> Result<Tensor> {
+        let mut pool = vec![0f32; KV_HEADS * slots * hd];
+        for h in 0..KV_HEADS {
+            for t in 0..keys {
+                let slot = table[t / page] as usize * page + t % page;
+                let (d, s) = ((h * slots + slot) * hd, (h * keys + t) * hd);
+                pool[d..d + hd].copy_from_slice(&live[s..s + hd]);
+            }
+        }
+        Tensor::from_vec(pool, (1, KV_HEADS, slots, hd), &dev)?.to_dtype(DType::F16)
+    };
+    let (pk, pv) = (lay(&f.k)?, lay(&f.v)?);
+    let live = [keys as u32];
+    let routed = ops::attention_paged(&q, &pk, &pv, 0.125, &route, &table, pages, &live)?;
+    let unrouted = ops::sdpa_paged(&q, &pk, &pv, true, 0.125, page, &table, pages, keys)?;
+    assert_eq!(bits(&routed)?, bits(&unrouted)?, "routed against unrouted");
+    let strided = ops::sdpa(&q, &k, &v, None, true, 0.125, 1.0)?;
+    assert_eq!(
+        bits(&routed)?,
+        bits(&strided)?,
+        "the pool read against the cache read"
+    );
+
+    let one = Inputs::new(hd, 1, keys);
+    let (q1, _, _) = one.tensors(DType::F16, &dev)?;
+    dev.synchronize()?;
+    let before = requested(&dev)?;
+    assert!(ops::attention_paged(&q1, &pk, &pv, 0.125, &route, &table, pages, &live).is_err());
+    assert_eq!(
+        requested(&dev)?,
+        before,
+        "one query over a pool allocated before refusing"
+    );
+    Ok(())
+}

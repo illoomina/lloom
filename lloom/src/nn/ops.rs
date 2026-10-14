@@ -1977,6 +1977,9 @@ struct Sdpa<'a> {
     /// kernel, `Some(false)` the single-pass one, `None` the shape's choice
     /// ([`sdpa_vector_two_pass`]).
     two_pass: Option<bool>,
+    /// The kernel a prepared route chose for this request; checked against
+    /// the request rather than re-derived.
+    kernel: Option<crate::nn::attention::route::AttentionKernel>,
 }
 
 impl lloom_tensor::CustomOp3 for Sdpa<'_> {
@@ -2006,43 +2009,39 @@ impl lloom_tensor::CustomOp3 for Sdpa<'_> {
         v: &lloom_tensor::MetalStorage,
         v_l: &Layout,
     ) -> Result<(lloom_tensor::MetalStorage, Shape)> {
+        use crate::nn::attention::route::AttentionKernel;
         use lloom_tensor::backend::BackendStorage;
         use lloom_tensor::kernels::SdpaDType;
 
         let device = q.device();
 
-        let out_dims = vec![q_l.dim(0)?, q_l.dim(1)?, q_l.dim(2)?, v_l.dim(3)?];
-        let elem_count: usize = out_dims.iter().product();
-        let out_shape = Shape::from_dims(&out_dims);
-        let out_layout = Layout::contiguous(out_shape.clone());
-
-        let output = device
-            .new_buffer_builder()
-            .with_size_for(elem_count, q.dtype())
-            .with_label("sdpa_o")
-            .build()?;
+        // Every check below precedes the first allocation: a refused request
+        // allocates nothing.
+        let dims4 = |l: &Layout, what: &str| -> Result<[usize; 4]> {
+            l.dims().try_into().map_err(|_| {
+                lloom_tensor::Error::Msg(format!("sdpa: {what} must be 4-D, got {:?}", l.dims()))
+            })
+        };
+        let [b_sz, q_heads, q_seq, q_head] = dims4(q_l, "q")?;
+        let [_, kv_heads, k_seq, k_head] = dims4(k_l, "k")?;
+        let [_, v_heads, _, v_head] = dims4(v_l, "v")?;
+        let out_dims = [b_sz, q_heads, q_seq, v_head];
 
         // q,k must have matching emb dim
-        if q_l.dim(D::Minus1)? != k_l.dim(D::Minus1)? {
+        if q_head != k_head {
             lloom_tensor::bail!("`q` and `k` last dims must match");
         }
 
         // k,v must have matching n kv heads
-        if v_l.dim(D::Minus(3))? != k_l.dim(D::Minus(3))? {
+        if v_heads != kv_heads {
             lloom_tensor::bail!("`k` and `v` head dims must match");
         }
 
         // n_heads % n_kv_heads == 0; n_heads >= 1, n_kv_heads >= 1.
-        if q_l.dim(D::Minus(3))? % k_l.dim(D::Minus(3))? != 0 {
+        if kv_heads == 0 || q_heads % kv_heads != 0 {
             lloom_tensor::bail!("query `n_heads` must be a multiple of `n_kv_heads`");
         }
 
-        let k_head = k_l.dim(D::Minus1)?;
-        let q_head = q_l.dim(D::Minus1)?;
-        let q_seq = q_l.dim(2)?;
-        let k_seq = k_l.dim(2)?;
-
-        let mut implementation_supports_use_case = q_head == k_head;
         let supported_head_dim = lloom_tensor::shape_req!(
             sdpa_head_dim,
             q_head == 32
@@ -2066,20 +2065,30 @@ impl lloom_tensor::CustomOp3 for Sdpa<'_> {
             q_head,
             is_f32 = q.dtype() == DType::F32
         );
-        // The vector bindings have no additive-mask input. Even one query
-        // must use the full kernel when masked; its partial-query tile handles
-        // q_seq == 1. Keep the unmasked decode fast path (including softcap).
-        let supports_sdpa_full = (q_seq > 1 || (q_seq == 1 && self.mask.is_some()))
-            && supported_head_dim
+        // The vector entry points name fewer head dims than the full kernel
+        // instantiates (`SDPA_VECTOR_HEAD_DIMS`).
+        let vector_head_dim = lloom_tensor::shape_req!(
+            sdpa_vector_head_dim,
+            lloom_tensor::kernels::SDPA_VECTOR_HEAD_DIMS.contains(&q_head);
+            q_head
+        );
+        // The vector bindings have no additive-mask input and read no page
+        // table. Even one query must use the full kernel when masked; its
+        // partial-query tile handles q_seq == 1. Keep the unmasked decode fast
+        // path (including softcap). The full kernel has no softcap.
+        let supports_sdpa_full = supported_head_dim
             && supports_sdpa_full_mask
-            && supports_sdpa_dtype;
+            && supports_sdpa_dtype
+            && self.softcapping == 1.;
         let supports_sdpa_vector = q_seq == 1
             && self.mask.is_none()
-            && supported_head_dim
+            && self.paged.is_none()
+            && vector_head_dim
             && supports_sdpa_dtype
             && q_seq <= k_seq;
 
-        implementation_supports_use_case &= supports_sdpa_full || supports_sdpa_vector;
+        let implementation_supports_use_case =
+            q_head == k_head && (supports_sdpa_full || supports_sdpa_vector);
 
         if !supported_head_dim {
             lloom_tensor::bail!(
@@ -2088,6 +2097,13 @@ impl lloom_tensor::CustomOp3 for Sdpa<'_> {
                 k_l.dims(),
                 v_l.dims()
             );
+        }
+        if !supports_sdpa_vector
+            && supports_sdpa_full_mask
+            && supports_sdpa_dtype
+            && self.softcapping != 1.
+        {
+            lloom_tensor::bail!("SDPA full requires softcapping to be disabled (1.0)");
         }
         if !implementation_supports_use_case {
             lloom_tensor::bail!(
@@ -2110,6 +2126,37 @@ impl lloom_tensor::CustomOp3 for Sdpa<'_> {
             DType::F32 => SdpaDType::F32,
             other => lloom_tensor::bail!("unsupported sdpa type {other:?}"),
         };
+
+        let two_pass = |pinned: Option<bool>| {
+            if pinned.unwrap_or_else(|| sdpa_vector_two_pass(k_seq, q_head, q.dtype())) {
+                AttentionKernel::VectorTwoPass
+            } else {
+                AttentionKernel::Vector
+            }
+        };
+        let kernel = match (self.kernel, self.two_pass) {
+            (Some(k), _) => k,
+            (None, Some(pinned)) => two_pass(Some(pinned)),
+            (None, None) if supports_sdpa_vector => two_pass(None),
+            (None, None) if supports_sdpa_full => AttentionKernel::Full,
+            (None, None) => lloom_tensor::bail!("must be vector or full sdpa kernel"),
+        };
+        let served = match kernel {
+            AttentionKernel::Vector | AttentionKernel::VectorTwoPass => supports_sdpa_vector,
+            AttentionKernel::Full => supports_sdpa_full,
+        };
+        if !served {
+            lloom_tensor::bail!(
+                "sdpa: {} does not serve q {:?}, k {:?}, v {:?}, mask {}, softcap {}{}",
+                kernel.name(),
+                q_l.dims(),
+                k_l.dims(),
+                v_l.dims(),
+                self.mask.is_some(),
+                self.softcapping,
+                if self.paged.is_some() { ", paged" } else { "" }
+            );
+        }
 
         // The paged arm: every condition is one the kernel cannot serve, and
         // each fails loudly rather than reading something plausible — the pool
@@ -2185,32 +2232,83 @@ impl lloom_tensor::CustomOp3 for Sdpa<'_> {
             }
         }
 
+        // The mask's dtype and shape are checked here, with everything else,
+        // before the output is allocated; only the tiled kernel reads it.
+        let mask_s_l = self.mask.as_ref().map(|m| m.storage_and_layout());
+
+        let (mask_type, mask_buffer, mask_offset, mask_strides) = if let Some(mask) = &self.mask {
+            let (mask_s, mask_l) = mask_s_l.as_ref().unwrap();
+
+            let mask_buffer = match &**mask_s {
+                lloom_tensor::Storage::Metal(m) => m.buffer(),
+                _ => lloom_tensor::bail!("Expected metal device for mask"),
+            };
+
+            let mask_type = match mask.dtype() {
+                DType::BF16 => SdpaDType::BF16,
+                DType::F16 => SdpaDType::F16,
+                DType::F32 => SdpaDType::F32,
+                other => lloom_tensor::bail!("unsupported sdpa type {other:?}"),
+            };
+            if mask_type != itype {
+                lloom_tensor::bail!("Mask type {mask_type:?} must match q type {itype:?}");
+            }
+
+            if mask_l.dims() != [q_l.dim(0)?, q_l.dim(1)?, q_l.dim(2)?, k_seq] {
+                lloom_tensor::bail!(
+                    "Mask shape must be {:?} (bs, qheads, qseq, kseq), got {:?}",
+                    [q_l.dim(0)?, q_head, q_l.dim(2)?, k_seq],
+                    mask_l.dims()
+                );
+            }
+
+            let strides: [usize; 4] = mask_l.stride().try_into().map_err(|_| {
+                lloom_tensor::Error::Msg(format!("sdpa: mask must be 4-D, got {:?}", mask_l.dims()))
+            })?;
+            (
+                Some(mask_type),
+                Some(mask_buffer),
+                mask_l.start_offset() * mask.dtype().size_in_bytes(),
+                Some(strides),
+            )
+        } else {
+            (None, None, 0, None)
+        };
+
+        let product = |dims: &[usize]| -> Result<usize> {
+            dims.iter()
+                .try_fold(1usize, |n, &d| n.checked_mul(d))
+                .ok_or_else(|| lloom_tensor::Error::Msg("sdpa: element count overflows".into()))
+        };
+        let elem_count = product(&out_dims)?;
+        let out_shape = Shape::from_dims(&out_dims);
+        let out_strides = [q_heads * q_seq * v_head, q_seq * v_head, v_head, 1];
+        let output = device
+            .new_buffer_builder()
+            .with_size_for(elem_count, q.dtype())
+            .with_label("sdpa_o")
+            .build()?;
+
         let encoder = q.device().command_encoder()?;
-        if supports_sdpa_vector {
-            let two_pass = self
-                .two_pass
-                .unwrap_or_else(|| sdpa_vector_two_pass(k_seq, q_head, q.dtype()));
-            if two_pass {
-                let mut intermediate_shape = [
-                    &out_dims[0..out_dims.len() - 2],
-                    &[lloom_tensor::kernels::SDPA_2PASS_BLOCKS],
-                    &[out_dims[out_dims.len() - 1]],
-                ]
-                .concat();
+        if kernel != AttentionKernel::Full {
+            if kernel == AttentionKernel::VectorTwoPass {
+                // Per query head: the partial outputs of each key block, then
+                // that block's maximum and sum (`DESIGN.md` §8 of the reuse
+                // design: `4 * B * Hq * blocks * (Dv + 2)` bytes).
+                let partials = product(&[b_sz, q_heads, lloom_tensor::kernels::SDPA_2PASS_BLOCKS])?;
                 let intermediate = device
                     .new_buffer_builder()
-                    .with_size_for(intermediate_shape.iter().product::<usize>(), DType::F32)
+                    .with_size_for(product(&[partials, v_head])?, DType::F32)
                     .with_label("sdpa_2pass_intermediate")
                     .build()?;
-                let _ = intermediate_shape.pop().unwrap();
                 let sums = device
                     .new_buffer_builder()
-                    .with_size_for(intermediate_shape.iter().product::<usize>(), DType::F32)
+                    .with_size_for(partials, DType::F32)
                     .with_label("sdpa_2pass_sums")
                     .build()?;
                 let maxs = device
                     .new_buffer_builder()
-                    .with_size_for(intermediate_shape.iter().product::<usize>(), DType::F32)
+                    .with_size_for(partials, DType::F32)
                     .with_label("sdpa_2pass_maxs")
                     .build()?;
 
@@ -2269,50 +2367,8 @@ impl lloom_tensor::CustomOp3 for Sdpa<'_> {
                 }
                 .map_err(lloom_tensor::Error::wrap)?;
             }
-        } else if supports_sdpa_full {
+        } else {
             encoder.set_label("full_attention");
-            if self.softcapping != 1. {
-                lloom_tensor::bail!("SDPA full requires softcapping to be disabled (1.0)");
-            }
-
-            let mask_s_l = self.mask.as_ref().map(|m| m.storage_and_layout());
-
-            let (mask_type, mask_buffer, mask_offset, mask_strides) = if let Some(mask) = &self.mask
-            {
-                let (mask_s, mask_l) = mask_s_l.as_ref().unwrap();
-
-                let mask_buffer = match &**mask_s {
-                    lloom_tensor::Storage::Metal(m) => m.buffer(),
-                    _ => lloom_tensor::bail!("Expected metal device for mask"),
-                };
-
-                let mask_type = match mask.dtype() {
-                    DType::BF16 => SdpaDType::BF16,
-                    DType::F16 => SdpaDType::F16,
-                    DType::F32 => SdpaDType::F32,
-                    other => lloom_tensor::bail!("unsupported sdpa type {other:?}"),
-                };
-                if mask_type != itype {
-                    lloom_tensor::bail!("Mask type {mask_type:?} must match q type {itype:?}");
-                }
-
-                if mask_l.dims() != [q_l.dim(0)?, q_l.dim(1)?, q_l.dim(2)?, k_seq] {
-                    lloom_tensor::bail!(
-                        "Mask shape must be {:?} (bs, qheads, qseq, kseq), got {:?}",
-                        [q_l.dim(0)?, q_head, q_l.dim(2)?, k_seq],
-                        mask_l.dims()
-                    );
-                }
-
-                (
-                    Some(mask_type),
-                    Some(mask_buffer),
-                    mask_l.start_offset() * mask.dtype().size_in_bytes(),
-                    Some(mask_l.stride().to_vec()),
-                )
-            } else {
-                (None, None, 0, None)
-            };
 
             // A pool is one row read by every sequence through its table: the
             // key extent handed to the kernel is the LIVE length and the batch
@@ -2392,9 +2448,9 @@ impl lloom_tensor::CustomOp3 for Sdpa<'_> {
                     mask_type,
                     mask_buffer,
                     mask_offset,
-                    mask_strides.as_deref(),
+                    mask_strides.as_ref().map(|s| &s[..]),
                     &output,
-                    out_layout.stride(),
+                    &out_strides,
                     self.scale,
                     self.do_causal,
                     itype,
@@ -2402,8 +2458,6 @@ impl lloom_tensor::CustomOp3 for Sdpa<'_> {
                 )
             }
             .map_err(lloom_tensor::Error::wrap)?;
-        } else {
-            lloom_tensor::bail!("must be vector or full sdpa kernel");
         }
 
         let newstorage = lloom_tensor::MetalStorage::new_allocated(
@@ -2443,14 +2497,19 @@ pub fn sdpa_vector_two_pass_from(head_dim: usize, dtype: DType) -> usize {
 /// every shape ([`SDPA_TWO_PASS_K_THRESHOLD`] by default), or 0 for
 /// [`sdpa_vector_two_pass_from`]'s measured table.
 pub fn sdpa_vector_two_pass(k_seq: usize, head_dim: usize, dtype: DType) -> bool {
+    k_seq >= sdpa_vector_two_pass_threshold(head_dim, dtype)
+}
+
+/// The key count from which [`sdpa_vector_two_pass`] takes the 2-pass kernel
+/// at `head_dim` and `dtype`.
+pub fn sdpa_vector_two_pass_threshold(head_dim: usize, dtype: DType) -> usize {
     static K: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     let k = *K.get_or_init(|| crate::tuning::tuning().lfm2.sdpa_two_pass_k);
-    let from = if k == 0 {
+    if k == 0 {
         sdpa_vector_two_pass_from(head_dim, dtype)
     } else {
         k
-    };
-    k_seq >= from
+    }
 }
 
 /// Scaled dot product attention with a fused kernel.
@@ -2500,6 +2559,7 @@ pub fn sdpa(
             do_causal,
             paged: None,
             two_pass: None,
+            kernel: None,
         },
     )
 }
@@ -2529,6 +2589,7 @@ pub fn sdpa_vector_pinned(
             do_causal: false,
             paged: None,
             two_pass: Some(two_pass),
+            kernel: None,
         },
     )
 }
@@ -2628,8 +2689,155 @@ pub fn sdpa_paged_ragged(
                 n_keys,
             }),
             two_pass: None,
+            kernel: None,
         },
     )
+}
+
+/// Attention through a prepared route (`nn::attention::route`): the request
+/// is checked against the route and served by the kernel the route names for
+/// it, or refused before anything is allocated. Metal only, and never the
+/// composed scores path.
+///
+/// `q` is `[batch, q_heads, queries, head_dim]`; `k` and `v` are `[batch,
+/// kv_heads, keys, head_dim]` in the route's key dtype, converted to the
+/// compute dtype when it differs. `mask` is the additive mask exactly when the
+/// route was prepared with one.
+pub fn attention(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    mask: Option<&Tensor>,
+    scale: f32,
+    route: &crate::nn::attention::route::PreparedAttention,
+) -> Result<Tensor> {
+    use crate::nn::attention::route::KvLayout;
+    if route.spec().layout != KvLayout::Strided {
+        lloom_tensor::bail!("attention: a paged route takes its tables through attention_paged");
+    }
+    let (b, nq, nk) = check_attention(q, k, v, mask, route, false)?;
+    let kernel = route.kernel_for(b, nq, nk)?;
+    let spec = route.spec();
+    let (k, v) = if spec.kv_dtype == spec.dtype {
+        (k.clone(), v.clone())
+    } else {
+        (k.to_dtype(spec.dtype)?, v.to_dtype(spec.dtype)?)
+    };
+    q.apply_op3_no_bwd(
+        &k,
+        &v,
+        &Sdpa {
+            scale,
+            softcapping: spec.softcap,
+            mask: mask.cloned(),
+            do_causal: spec.mask == crate::nn::attention::route::MaskKind::Causal,
+            paged: None,
+            two_pass: None,
+            kernel: Some(kernel),
+        },
+    )
+}
+
+/// [`attention`] over a page pool, for a route prepared with
+/// `KvLayout::Paged`: the arguments of [`sdpa_paged_ragged`], checked against
+/// the route first.
+#[allow(clippy::too_many_arguments)]
+pub fn attention_paged(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    scale: f32,
+    route: &crate::nn::attention::route::PreparedAttention,
+    table: &[u32],
+    table_stride: usize,
+    n_keys: &[u32],
+) -> Result<Tensor> {
+    use crate::nn::attention::route::KvLayout;
+    let KvLayout::Paged { page_size } = route.spec().layout else {
+        lloom_tensor::bail!("attention_paged: the route is not prepared for a page pool");
+    };
+    let (b, nq, _) = check_attention(q, k, v, None, route, true)?;
+    let longest = n_keys.iter().copied().max().unwrap_or(0) as usize;
+    let kernel = route.kernel_for(b, nq, longest)?;
+    let spec = route.spec();
+    if spec.kv_dtype != spec.dtype {
+        lloom_tensor::bail!("attention_paged: the pool is read at the compute dtype");
+    }
+    q.apply_op3_no_bwd(
+        k,
+        v,
+        &Sdpa {
+            scale,
+            softcapping: spec.softcap,
+            mask: None,
+            do_causal: spec.mask == crate::nn::attention::route::MaskKind::Causal,
+            paged: Some(SdpaPagedTable {
+                entries: table,
+                stride: table_stride,
+                page_size,
+                n_keys,
+            }),
+            two_pass: None,
+            kernel: Some(kernel),
+        },
+    )
+}
+
+/// The request's `(batch, queries, keys)` once its tensors are checked
+/// against the route's geometry, dtypes and mask.
+fn check_attention(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    mask: Option<&Tensor>,
+    route: &crate::nn::attention::route::PreparedAttention,
+    pooled: bool,
+) -> Result<(usize, usize, usize)> {
+    use crate::nn::attention::route::MaskKind;
+    let spec = route.spec();
+    let (b, hq, nq, hd) = q.dims4()?;
+    let (bk, hkv, nk, hdk) = k.dims4()?;
+    let (bv, hv, nv, dv) = v.dims4()?;
+    let rows_match = if pooled {
+        bk == 1 && bv == 1
+    } else {
+        bk == b && bv == b
+    };
+    if hq != spec.q_heads
+        || hkv != spec.kv_heads
+        || hv != hkv
+        || hd != spec.head_dim
+        || hdk != hd
+        || dv != spec.v_head_dim
+        || nv != nk
+        || !rows_match
+    {
+        lloom_tensor::bail!(
+            "attention: q {:?}, k {:?}, v {:?} do not fit the route: {}",
+            q.dims(),
+            k.dims(),
+            v.dims(),
+            route.describe()
+        );
+    }
+    if q.dtype() != spec.dtype || k.dtype() != spec.kv_dtype || v.dtype() != spec.kv_dtype {
+        lloom_tensor::bail!(
+            "attention: q {:?}, k {:?}, v {:?} do not match the route's {:?} over {:?}",
+            q.dtype(),
+            k.dtype(),
+            v.dtype(),
+            spec.dtype,
+            spec.kv_dtype
+        );
+    }
+    match (spec.mask, mask) {
+        (MaskKind::Additive, Some(_)) | (MaskKind::None | MaskKind::Causal, None) => {}
+        (prepared, given) => lloom_tensor::bail!(
+            "attention: a mask tensor {} on a route prepared for {prepared:?}",
+            if given.is_some() { "given" } else { "missing" }
+        ),
+    }
+    Ok((b, nq, nk))
 }
 
 /// Which width a quantized KV cache stores its codes at, or `Off`

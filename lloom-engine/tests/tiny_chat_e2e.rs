@@ -2649,6 +2649,36 @@ fn shutdown_waits_for_the_request_that_holds_the_model() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// A benchmark cell that measures a cold prefill stays cold under prefix
+/// reuse (decision 36: the historical cold cells stay cold whatever the
+/// default): the same cell twice, each a fresh session by the cell's own
+/// reset, while a chat turn between them would have been reused.
+#[test]
+fn a_cold_cell_stays_cold_with_reuse_on() {
+    let (dir, model, base) = qwen_tiny("cold-cell");
+    let mut args: Vec<&str> = base.iter().map(String::as_str).collect();
+    args.extend(["--prefix-reuse", "true"]);
+    let server = Server::start(&model, &args);
+    for i in 0..2 {
+        let (status, cell) = server.call(
+            "POST",
+            "/end_to_end_latency",
+            &json!({ "prompt": PROMPT, "decode_tokens": 4 }),
+        );
+        assert_eq!(status, 200, "{cell}");
+        let (status, h) = server.call("GET", "/health", &json!({}));
+        assert_eq!(status, 200, "{h}");
+        let last = &h["reuse"]["last"];
+        assert_eq!(
+            (&last["outcome"], &last["reason"], &last["reused"]),
+            (&json!("fresh"), &json!("cold"), &json!(0)),
+            "cell {i}: {last}"
+        );
+    }
+    drop(server);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// The SSE events of a streamed chat request, `[DONE]` excluded.
 fn sse(server: &Server, body: &Value) -> Vec<Value> {
     let mut s = std::net::TcpStream::connect(("127.0.0.1", server.port)).unwrap();

@@ -1736,7 +1736,7 @@ impl<P: Lfm2Shape> Engine<P> {
         self.with_single(|s, extra| {
             // A text prompt leaves no image rows in the held cache.
             extra.image_keys.clear();
-            if !reuse {
+            if !reuse || params.cold {
                 s.reset();
             }
             match &mut extra.spec {

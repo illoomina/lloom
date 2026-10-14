@@ -532,7 +532,7 @@ where
             .acquire(&req.prompt_ids)
             .ok_or_else(|| lloom_tensor::Error::msg("batch scheduler: no idle sequence"))?;
         let mut session = Session::from_sequence(self.model, seq);
-        if !self.reuse_prefix {
+        if !self.reuse_prefix || req.params.cold {
             session.reset();
         }
         // The share source, when the routed slot has nothing of its own: the

@@ -268,6 +268,9 @@ pub struct DecodeParams {
     /// logits digest does, and the speculative body and the batch scheduler
     /// refuse it. `None` costs nothing.
     pub logprobs: Option<LogprobRequest>,
+    /// Start this run on an empty session whatever the owner's prefix reuse:
+    /// a benchmark cell that measures a cold prefill stays cold with reuse on.
+    pub cold: bool,
 }
 
 /// What a run keeps of each step's distribution: the drawn id's
@@ -353,6 +356,7 @@ impl Default for DecodeParams {
             thinking: None,
             turn_tail: 0,
             logprobs: None,
+            cold: false,
         }
     }
 }

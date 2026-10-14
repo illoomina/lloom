@@ -1552,6 +1552,7 @@ fn sampling_params(shared: &Shared, v: &Value) -> Handled<DecodeParams> {
         turn_tail: 0,
         thinking: None,
         logprobs: None,
+        cold: false,
     })
 }
 
@@ -1902,6 +1903,7 @@ fn max_memory_usage(shared: &Shared, v: &Value) -> Handled<Value> {
         readback: engine.readback(),
         prefill_tile: engine.prefill_tile(),
         turn_tail: 0,
+        cold: true,
         ..DecodeParams::default()
     };
     let prompts: Vec<Vec<u32>> = (0..batch)
@@ -1941,6 +1943,7 @@ fn end_to_end_latency(shared: &Shared, v: &Value) -> Handled<Value> {
         readback: engine.readback(),
         prefill_tile: engine.prefill_tile(),
         turn_tail: 0,
+        cold: true,
         ..DecodeParams::default()
     };
     if batch == 1 {
@@ -2142,6 +2145,7 @@ fn eval(shared: &Shared, request: Request, v: &Value) -> Result<()> {
                             turn_tail: 0,
                             thinking: None,
                             logprobs: None,
+                            cold: false,
                         };
                         let mut pending = String::new();
                         let started = Instant::now();
@@ -2582,6 +2586,9 @@ fn timings(
         "poll_fallbacks": st.readback.poll_fallbacks,
         "publish_parks": st.readback.publish_parks,
         "overrun": st.overrun,
+        // The prompt's pass shapes: forwards the prefill took, at the tile.
+        "prefill_units": st.prefill_units,
+        "prefill_tile": engine.prefill_tile(),
         "eos_gate": super::common::eos_gate_name(st.eos_gate),
         "host_fill": super::common::host_fill_name(st.host_feed.as_ref()),
         "prompt_ids_sha256": facts.ids_sha256,

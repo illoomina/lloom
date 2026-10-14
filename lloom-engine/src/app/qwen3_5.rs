@@ -870,7 +870,7 @@ where
         let reuse = self.reuse_prefix;
         let detok = self.detok();
         self.with_single(|s, extra| {
-            if !reuse {
+            if !reuse || params.cold {
                 s.reset();
             }
             if self.mtp.is_some() {

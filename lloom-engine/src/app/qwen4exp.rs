@@ -1444,7 +1444,7 @@ impl<P: QwenShape, R: ExpertResidency + HasStreamStats + Send + Sync + 'static> 
         let reuse = self.reuse_prefix;
         let detok = self.detok();
         self.with_single(|s| {
-            if !reuse {
+            if !reuse || params.cold {
                 s.reset();
             }
             if let Some(d) = &self.dflash {

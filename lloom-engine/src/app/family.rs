@@ -213,7 +213,7 @@ pub const QWEN3_5_CAPABILITIES: Capabilities = Capabilities {
     decisions: false, // Transitional until retained-trunk execution is installed.
     profiles: lloom::profile::QWEN3_5,
     lookahead_max: 1,
-    ring: "full: the forward queued past an unlearned EOS is undone by the standing window",
+    ring: "full: the fixed cadence's one forward past an unlearned EOS is undone by the standing window; the adaptive commit queues up to its lead past it, which one step does not reach",
     batch: false,
     prefix_share: false,
     speculation: &["mtp"],

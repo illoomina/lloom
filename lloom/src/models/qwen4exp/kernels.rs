@@ -531,7 +531,9 @@ pub(crate) fn hc_mix_pair(
         Some(_) => return None,
         None => None,
     };
-    let (b, seq, nd) = h.dims3().ok()?;
+    let &[b, seq, nd] = h.dims() else {
+        return None;
+    };
     let rows = b * seq;
     if nd != n * d
         || rows == 0
@@ -542,7 +544,7 @@ pub(crate) fn hc_mix_pair(
     }
     let lr = w_down.dim(0).ok()?;
     if w_down.dim(1).ok()? != nd
-        || w_up.dims2().ok()? != (nd, lr)
+        || w_up.dims() != [nd, lr]
         || !shape_req!(hc_mix_fused, lr <= 1024; lr)
     {
         return None;

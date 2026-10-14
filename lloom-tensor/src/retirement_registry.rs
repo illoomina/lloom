@@ -543,6 +543,22 @@ impl<C, A, F> PinnedRegistration<C, A, F> {
     pub(crate) fn take_successor(&self) -> Option<Self> {
         self.ordered().take_successor()
     }
+    /// # Safety
+    /// As `OrderedMetadata::peek_successor`: the caller holds the lock every
+    /// `take_successor` of this chain runs under.
+    pub(crate) unsafe fn peek_successor(&self) -> Option<&Self>
+    where
+        Self: Sync,
+    {
+        // SAFETY: forwarded caller contract.
+        unsafe { self.ordered().peek_successor() }
+    }
+    pub(crate) fn set_native_key(&self, key: usize) {
+        self.ordered().set_native_key(key);
+    }
+    pub(crate) fn native_key(&self) -> usize {
+        self.ordered().native_key()
+    }
     pub(crate) fn publish_native_ready(&self) {
         self.ordered().publish_native_ready();
     }

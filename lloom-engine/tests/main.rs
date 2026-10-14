@@ -16,6 +16,7 @@
 mod load_warnings;
 mod machine_gate;
 mod qwen4exp_served_auto;
+mod recovery_frontier_served;
 mod tiny_chat_e2e;
 mod tiny_templates;
 

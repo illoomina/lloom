@@ -142,6 +142,7 @@ mod short_conv_block;
 mod short_conv_golden;
 mod shortconv_ring;
 mod shortconv_step;
+mod state_capacity;
 mod tiny_checkpoints;
 mod tiny_fp_kinds;
 mod tiny_manifest_drift;

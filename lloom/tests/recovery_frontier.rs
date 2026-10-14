@@ -27,7 +27,7 @@ use lloom::generation::{Blocking, CommitBudget, EosRead, LogitsProcessor, Ring, 
 use lloom::models::qwen3_5::testing::Qwen3_5Tiny;
 use lloom::models::qwen3_5::{Config, Qwen3_5};
 use lloom::models::qwen4exp::{GdnState, KvCache};
-use lloom::nn::decoder::{DecoderState, HybridState, PreNormState, StateCapacity};
+use lloom::nn::decoder::{DecodeRecovery, DecoderState, HybridState, PreNormState, StateCapacity};
 use lloom::nn::model::{CacheRewind, CausalLM};
 use lloom::nn::{DecodeOptions, IdentityProposer, ReuseAction, Session};
 use lloom::profile::CrownExact;
@@ -60,7 +60,7 @@ fn model(dev: &Device) -> Result<(Model, Config)> {
     let cap = model.capacity();
     // The engine's load: the standing window and two turn checkpoints.
     model.set_capacity(StateCapacity {
-        window: 1,
+        recovery: DecodeRecovery::Standing,
         checkpoints: 2,
         ..cap
     });

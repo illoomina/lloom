@@ -17,7 +17,7 @@
 
 use lloom::models::qwen3_5::testing::Qwen3_5Tiny;
 use lloom::models::qwen3_5::{Config, Qwen3_5};
-use lloom::nn::decoder::StateCapacity;
+use lloom::nn::decoder::{DecodeRecovery, StateCapacity};
 use lloom::nn::model::CausalLM;
 use lloom::nn::{ReuseAction, Sequence};
 use lloom::profile::CrownExact;
@@ -36,7 +36,7 @@ fn model(dev: &Device) -> Result<(Model, Config)> {
     let mut model = ckpt.model::<CrownExact>(dev)?;
     let cap = model.capacity();
     model.set_capacity(StateCapacity {
-        window: 1,
+        recovery: DecodeRecovery::Standing,
         checkpoints: 2,
         ..cap
     });

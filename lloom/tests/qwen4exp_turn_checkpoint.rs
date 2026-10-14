@@ -495,3 +495,53 @@ fn a_chat_re_render_restores_through_prepare() -> Result<()> {
     }
     Ok(())
 }
+
+/// Three rounds of two fresh requests of one length on the tiny resident
+/// model, `a` unhinted (its pass checkpoints its end) and `b` hinted two
+/// before its end, greedy, with the pass-plan cache on or off; the plans
+/// served when on.
+#[cfg(feature = "metal")]
+fn mixed_hint_rounds(plans: bool) -> Result<(Vec<Vec<u32>>, Option<u64>)> {
+    use lloom_tensor::metal_backend::ArenaLayout;
+    let dev = Device::new_metal(0)?;
+    let Device::Metal(m) = &dev else {
+        unreachable!("a Metal device")
+    };
+    if plans {
+        m.enable_pass_plans(ArenaLayout::Packed);
+    }
+    let cfg = Config::tiny();
+    let mut model = resident_model::<CrownExact>(&cfg, &dev);
+    model.set_turn_checkpoints(2);
+    let (a, b) = (tokens(24, cfg.vocab_size, 3), tokens(24, cfg.vocab_size, 5));
+    let mut session = Session::new(&model, model.new_cache(&cfg, &dev)?);
+    let mut out = Vec::new();
+    for _ in 0..3 {
+        session.reset();
+        out.push(greedy_decode(&mut session, &a, 4, &dev)?);
+        session.reset();
+        model.checkpoint_at(session.cache_mut(), b.len() - 2)?;
+        out.push(greedy_decode(&mut session, &b, 4, &dev)?);
+    }
+    Ok((out, m.pass_plan_counters().map(|c| c.served)))
+}
+
+/// Qwen4-exp's passes are keyed by the checkpoint they take as the generic
+/// decoder's are (`CheckpointRing::pass_variant`, bits 8.. of its variant):
+/// every request's tokens with the cache on are the cache-off run's.
+#[cfg(feature = "metal")]
+#[test]
+fn a_hinted_and_an_unhinted_prefill_of_one_shape_are_each_served_their_own_plan() -> Result<()> {
+    pin();
+    let (want, _) = mixed_hint_rounds(false)?;
+    let (got, served) = mixed_hint_rounds(true)?;
+    assert!(
+        served.is_some_and(|s| s > 0),
+        "no plan was served: the comparison is vacuous ({served:?})"
+    );
+    assert_eq!(
+        got, want,
+        "a served pass computed something the pool pass did not"
+    );
+    Ok(())
+}

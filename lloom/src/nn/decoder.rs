@@ -31,33 +31,70 @@ use lloom_tensor::{DType, Device, Module, Result, Tensor, D};
 use std::marker::PhantomData;
 
 /// What a sequence's state is sized by: the KV capacity in tokens and the
-/// KV store's precision (the recurrent channels need neither).
+/// KV store's precision, and the three things it keeps besides the current
+/// state, each its own field because each buys its own storage and work.
+/// How far a producer may run ahead is the driver's
+/// (`DecodeOptions::adaptive_lead`), not the state's: nothing here is
+/// sized from it, and it bounds no recovery (`sequence-reuse-design.md`
+/// §2.3e).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct StateCapacity {
     pub kv_tokens: usize,
     pub kv_precision: KvPrecision,
-    /// The longest verify window (positions) a state built at the `Ring`
-    /// profile runs as ONE pass: its recurrent channels get `window + 1`
-    /// phases (`GatedDeltaNet::pooled_state`). 0: no rings; a window runs
-    /// as sequential steps inside a snapshot. At least 1, at any profile,
-    /// the state also keeps the standing window: every decode step stays
-    /// undoable until the next forward (`CacheRewind`, horizon 1).
-    pub window: usize,
-    /// Turn checkpoints a state keeps (`DecoderState::restore`,
-    /// `sequence-reuse-design.md` §2.3b): the last `checkpoints`
-    /// multi-token passes' states, in a ring. 0: none, every request past
-    /// the horizon is a fresh prefill.
+    /// The longest verify window (positions) a state built at a rewindable
+    /// profile runs as ONE pass over phase rings. 0: a window runs as
+    /// sequential steps inside a snapshot.
+    pub verify: usize,
+    /// How a decode step outside a verify window stays undoable.
+    pub recovery: DecodeRecovery,
+    /// Turn checkpoints a state keeps (`DecoderState::restore`): the last
+    /// `checkpoints` multi-token passes' states, in a ring. 0: none, every
+    /// request past the horizon is a fresh prefill.
     pub checkpoints: usize,
 }
 
+/// What a decode step leaves undoable after it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DecodeRecovery {
+    /// Nothing: the step is final once it runs.
+    #[default]
+    None,
+    /// The standing window: the step stays undoable until the next forward
+    /// (`CacheRewind`, horizon 1).
+    Standing,
+}
+
+impl DecodeRecovery {
+    /// The decode steps it keeps undoable.
+    pub fn depth(self) -> usize {
+        match self {
+            Self::None => 0,
+            Self::Standing => 1,
+        }
+    }
+}
+
 impl StateCapacity {
+    /// No verify window, no recovery, no checkpoints: a state that holds
+    /// its current value and nothing else.
     pub fn new(kv_tokens: usize) -> Self {
         Self {
             kv_tokens,
             kv_precision: KvPrecision::dense(DType::F32),
-            window: 0,
+            verify: 0,
+            recovery: DecodeRecovery::None,
             checkpoints: 0,
         }
+    }
+
+    /// Phases a recurrent channel's ring holds at a rewindable profile:
+    /// the base, and as many past it as the longer of the verify window
+    /// and the decode recovery. The two never hold versions at once (a
+    /// verify settles the standing window before it opens), so they share
+    /// the ring. `None`: the channel is unpooled, a slab and its spare.
+    pub fn recurrent_phases(&self, rewindable: bool) -> Option<usize> {
+        let positions = self.verify.max(self.recovery.depth());
+        (rewindable && positions > 0).then_some(positions + 1)
     }
 }
 
@@ -620,7 +657,7 @@ pub struct DecoderState<L: Layer> {
     /// [`Self::window_open`], which answers for a verify's window only.
     standing: bool,
     /// Whether a decode step leaves a standing window: the state was built
-    /// with `StateCapacity::window >= 1`.
+    /// with `DecodeRecovery::Standing`.
     keeps_standing: bool,
     /// The final norm's output per position (`h_nextn`), retained for an
     /// MTP drafter while [`Self::set_want_nextn`] is on.
@@ -978,14 +1015,15 @@ impl<L: Layer> DecoderState<L> {
     }
 
     /// Whether every layer runs a window of `steps` positions as one pass
-    /// (`Layer::ring_holds`): the `Ring` profile with a `StateCapacity::window`
-    /// of at least `steps`.
+    /// (`Layer::ring_holds`): the `Ring` profile with a
+    /// `StateCapacity::verify` of at least `steps`.
     pub fn ring_holds(&self, steps: usize) -> bool {
         self.layers.iter().all(|s| L::ring_holds(s, steps))
     }
 
     /// Whether any layer's state lives on phase rings (the `Ring` profile
-    /// with a `StateCapacity::window`).
+    /// with a verify window or a decode recovery,
+    /// `StateCapacity::recurrent_phases`).
     pub fn pooled(&self) -> bool {
         self.layers.iter().any(L::pooled)
     }
@@ -1099,7 +1137,7 @@ impl<L: Layer> CacheReset for DecoderState<L> {
 }
 
 /// The rewindable arm is the standing window (a state built with
-/// `StateCapacity::window >= 1`): every decode step leaves its window open
+/// `DecodeRecovery::Standing`): every decode step leaves its window open
 /// until the next forward, so the driver can undo exactly that step — the
 /// ring arm's lookahead overrun, a one-token divergence of a reused prefix
 /// (`Session::prepare`). A prefill leaves no horizon, nor does a step run
@@ -1445,7 +1483,7 @@ where
         #[cfg_attr(not(feature = "metal"), allow(unused_mut))]
         let mut state = DecoderState::new(layers)
             .with_checkpoints(&elems, self.cap.checkpoints)
-            .with_standing_window(self.cap.window >= 1);
+            .with_standing_window(self.cap.recovery == DecodeRecovery::Standing);
         #[cfg(feature = "metal")]
         if let Device::Metal(m) = dev {
             let t = StateTenants::register(m, self.family);
@@ -1463,6 +1501,19 @@ where
     /// — a pass inside the load's reservation asks nothing. A decode step
     /// that grows nothing reads nothing.
     fn prepare_pass(&self, cache: &mut Self::Cache, seq_len: usize) -> Result<()> {
+        // A pass that leaves a turn checkpoint runs another allocation
+        // sequence than one that does not: its own plan.
+        #[cfg(feature = "metal")]
+        if let Device::Metal(m) = &self.device {
+            let m = m.execution_device()?;
+            if m.pass_plans_enabled() {
+                m.set_next_pass_variant(cache.ckpt.pass_variant(
+                    cache.pos,
+                    seq_len,
+                    cache.window.is_some(),
+                ));
+            }
+        }
         let grow = self.grow_bytes(cache, seq_len);
         let pass = if seq_len > 1 {
             seq_len * self.prefill_bytes_per_position
@@ -1588,7 +1639,7 @@ pub struct DecoderPending {
 /// The verify on the generic topology: the window `[anchor, proposed…]`
 /// inside an open window on every layer's state, the per-position argmax
 /// read back once. On Metal with the rings holding it (the `Ring` profile,
-/// `StateCapacity::window`) the window is ONE pass — the stems and
+/// `StateCapacity::verify`) the window is ONE pass — the stems and
 /// projections once over the `k + 1` rows, the recurrences and attentions
 /// position for position through the decode kernels' window forms
 /// (`GatedDeltaNet::decode_seq`, `QsaAttention::decode_seq`), every
@@ -1769,12 +1820,12 @@ where
         let first_pos = anchor.pos as u64 + 1;
         // A state on rings rewinds by phase: a window longer than its rings
         // cannot be stepped through and put back (the rings are sized to
-        // the drafter's `k + 1`, `StateCapacity::window`).
+        // the drafter's `k + 1`, `StateCapacity::verify`).
         if cache.pooled() && !cache.ring_holds(t) {
             cache.set_want_nextn(want_was);
             lloom_tensor::bail!(
                 "{} verify: a window of {t} positions on rings built for a shorter one \
-                 (`StateCapacity::window` must be >= {t})",
+                 (`StateCapacity::verify` must be >= {t})",
                 self.family
             )
         }
@@ -1876,12 +1927,14 @@ where
 // ---- The engine families' blocks as topology blocks ---------------------------
 
 impl<P: Profile> MixerBlock for crate::models::qwen4exp::GatedDeltaNet<P> {
-    /// At the `Ring` profile with a window, the two channels on their own
-    /// phase rings (`cap.window + 1` phases); else an unpooled pair that a
+    /// At the `Ring` profile with a verify window or a decode recovery, the
+    /// two channels on their own phase rings
+    /// (`StateCapacity::recurrent_phases`); else an unpooled pair that a
     /// window snapshots.
     fn new_state(&self, dev: &Device, cap: &StateCapacity) -> Result<Self::State> {
-        if <P::Rewind as crate::profile::Rewind>::REWINDABLE && cap.window > 0 {
-            return self.pooled_state(dev, cap.window + 1);
+        let rewindable = <P::Rewind as crate::profile::Rewind>::REWINDABLE;
+        if let Some(phases) = cap.recurrent_phases(rewindable) {
+            return self.pooled_state(dev, phases);
         }
         Ok(crate::models::qwen4exp::GdnState {
             layer: 0,

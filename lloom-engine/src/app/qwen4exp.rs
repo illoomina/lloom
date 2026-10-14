@@ -1171,6 +1171,7 @@ impl<P: QwenShape, R: ExpertResidency + HasStreamStats + Send + Sync + 'static> 
             },
             stats: done.stats,
             thinking: None,
+            logprobs: None,
         })
     }
 
@@ -1398,8 +1399,22 @@ impl<P: QwenShape, R: ExpertResidency + HasStreamStats + Send + Sync + 'static> 
     fn template_renders(&self) -> u64 {
         self.text.template.as_ref().map_or(0, |t| t.renders())
     }
+    fn text(&self) -> Option<&super::common::Text> {
+        Some(&self.text)
+    }
     fn thinking_budget_refused(&self) -> Option<&'static str> {
         self.sched.is_some().then_some(super::budgets::BATCHED)
+    }
+    fn decode_body(&self) -> lloom::nn::Body {
+        if self.sched.is_some() {
+            lloom::nn::Body::BatchedStep
+        } else if self.mtp || self.dflash.is_some() {
+            lloom::nn::Body::Window
+        } else {
+            lloom::nn::Body::Step {
+                ring: matches!(self.readback, ReadbackArm::Ring(_)),
+            }
+        }
     }
     fn seed_prompt_row(&self, n: usize, row: usize) -> Vec<u32> {
         let seed = &self.text.seed_tokens;

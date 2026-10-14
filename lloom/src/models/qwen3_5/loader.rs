@@ -12,7 +12,9 @@ use super::{
 use crate::models::qwen4exp::loader::{md_f32, md_u32, open_shards, working_set_of, Gguf, Shard};
 use crate::models::qwen4exp::{GatedDeltaNet, LayerKind, MoeLayer, QsaAttention, Resident};
 use crate::nn::blocks::SwiGlu;
-use crate::nn::decoder::{Decoder, Hybrid, NormHead, PreNorm, StateCapacity, TokenEmbed};
+use crate::nn::decoder::{
+    DecodeRecovery, Decoder, Hybrid, NormHead, PreNorm, StateCapacity, TokenEmbed,
+};
 use crate::nn::mtp::NextnHead;
 use crate::nn::RmsNorm;
 use crate::profile::Profile;
@@ -48,10 +50,11 @@ pub struct LoadOptions {
     pub mtp: bool,
     /// The longest verify window (positions, `k + 1`) a state built at the
     /// `Ring` profile runs as one pass over phase rings
-    /// (`StateCapacity::window`); 0 runs a window as sequential steps. At
-    /// least 1, every state keeps the standing window (a decode step undone
-    /// by `CacheRewind::rewind(1)`); the engine loads with it.
-    pub window: usize,
+    /// (`StateCapacity::verify`); 0 runs a window as sequential steps.
+    pub verify: usize,
+    /// What a decode step leaves undoable (`StateCapacity::recovery`); the
+    /// engine loads with the standing window.
+    pub recovery: DecodeRecovery,
     /// The machine gate the load passes before its first tensor
     /// (`memory.md` §9.10); `None` loads unadmitted (a test, a harness).
     pub machine: Option<crate::nn::memory::MachineLoad>,
@@ -72,7 +75,8 @@ impl Default for LoadOptions {
             memory_fraction: None,
             dense_f32: false,
             mtp: false,
-            window: 0,
+            verify: 0,
+            recovery: DecodeRecovery::None,
             machine: None,
             checkpoints: 2,
         }
@@ -378,7 +382,8 @@ fn capacity(cfg: &Config, opts: &LoadOptions) -> StateCapacity {
     StateCapacity {
         kv_tokens: opts.kv_capacity.max(1),
         kv_precision: opts.kv_precision.unwrap_or(cfg.kv_precision),
-        window: opts.window,
+        verify: opts.verify,
+        recovery: opts.recovery,
         checkpoints: opts.checkpoints,
     }
 }
@@ -680,13 +685,16 @@ fn pass_plans_on(device: &Device) -> Result<bool> {
 }
 
 /// Buffers a recurrent channel takes at profile `P`: the ring's phases when
-/// the state is pooled (`Ring` with a window), else the slab and its spare.
+/// the state is pooled (`StateCapacity::recurrent_phases`), else the slab
+/// and its spare.
 fn state_phases<P: Profile>(opts: &LoadOptions) -> usize {
-    if <P::Rewind as crate::profile::Rewind>::REWINDABLE && opts.window > 0 {
-        opts.window + 1
-    } else {
-        2
+    StateCapacity {
+        verify: opts.verify,
+        recovery: opts.recovery,
+        ..StateCapacity::new(1)
     }
+    .recurrent_phases(<P::Rewind as crate::profile::Rewind>::REWINDABLE)
+    .unwrap_or(2)
 }
 
 /// The MTP block's attention layer, `blk.{n_layers}`: the full-attention

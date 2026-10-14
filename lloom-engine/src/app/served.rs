@@ -159,6 +159,13 @@ pub trait Served: Send + Sync {
     fn template_renders(&self) -> u64 {
         0
     }
+    /// The family's text side: the tokenizer and the template the request
+    /// front end (`front.rs`) reads its load-time constants from and encodes
+    /// with. `None` where the family keeps none; the front end then renders
+    /// and encodes through the methods above, with no reply splicing.
+    fn text(&self) -> Option<&super::common::Text> {
+        None
+    }
     /// Why this process's decode path cannot feed a thinking budget's
     /// forced tokens (`budgets::BATCHED`); `None` on the K=1 body, which
     /// carries it on every readback arm, and on the speculative body, whose
@@ -166,6 +173,14 @@ pub trait Served: Send + Sync {
     /// it.
     fn thinking_budget_refused(&self) -> Option<&'static str> {
         None
+    }
+    /// The body this process decodes a request through, for the one table
+    /// of what each body refuses (`lloom::nn::refuse`): the K=1 loop unless
+    /// the family was loaded with a drafter or the batch scheduler.
+    fn decode_body(&self) -> lloom::nn::Body {
+        lloom::nn::Body::Step {
+            ring: matches!(self.readback(), ReadbackArm::Ring(_)),
+        }
     }
     /// The benchmark seed tiled to `n` ids, `row` seed tokens in.
     fn seed_prompt_row(&self, n: usize, row: usize) -> Vec<u32>;

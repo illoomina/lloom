@@ -145,6 +145,8 @@ pub struct Asks<'a> {
     pub budget: bool,
     /// The logits digest.
     pub digest: bool,
+    /// Each drawn id's log-probability (a host read of every step's row).
+    pub logprobs: bool,
 }
 
 impl<'a> Asks<'a> {
@@ -155,6 +157,7 @@ impl<'a> Asks<'a> {
             processors: sampler.processors().is_some(),
             budget,
             digest: sampler.digests(),
+            logprobs: false,
         }
     }
 }
@@ -167,9 +170,10 @@ impl<'a> Asks<'a> {
 ///   sort on the host, and the digest reads every step's logits there.
 /// - The window serves every sampler arm and feature: each row is drawn
 ///   keyed to its position against the history its position has
-///   (`LogitsProcessor::window_draw_device`).
-/// - The batched bodies draw per row without processors and feed no forced
-///   token; the batched windows verify by the argmax.
+///   (`LogitsProcessor::window_draw_device`). It reads back the ids a round
+///   keeps, never a row, so the per-token logprobs are the K=1 body's.
+/// - The batched bodies draw per row without processors, feed no forced
+///   token and keep no logprobs; the batched windows verify by the argmax.
 pub fn refuse(body: Body, asks: &Asks<'_>) -> Result<()> {
     let host_sort = matches!(
         asks.sampling,
@@ -185,6 +189,14 @@ pub fn refuse(body: Body, asks: &Asks<'_>) -> Result<()> {
             "the ring draws on the device and the logits digest reads every step's logits on \
              the host: the digest runs on the blocking arm"
         ),
+        Body::Step { ring: true } if asks.logprobs => lloom_tensor::bail!(
+            "the ring draws on the device and the per-token logprobs read every step's row on \
+             the host: they run on the blocking arm"
+        ),
+        Body::Window if asks.logprobs => lloom_tensor::bail!(
+            "the window reads back the ids a round keeps, never a row of logits: the per-token \
+             logprobs are the non-speculative body's"
+        ),
         Body::Step { .. } | Body::Window => Ok(()),
         Body::BatchedStep | Body::BatchedWindow if asks.processors => lloom_tensor::bail!(
             "a batched body does not run logits processors (logit_bias, repetition/presence/\
@@ -194,6 +206,10 @@ pub fn refuse(body: Body, asks: &Asks<'_>) -> Result<()> {
         Body::BatchedStep | Body::BatchedWindow if asks.budget => lloom_tensor::bail!(
             "a batched body does not carry a thinking budget: its rows feed no forced token \
              (serve it at a batch of 1)"
+        ),
+        Body::BatchedStep | Body::BatchedWindow if asks.logprobs => lloom_tensor::bail!(
+            "a batched body does not keep per-token logprobs: its rows draw on the device and \
+             read the ids back (serve it at a batch of 1)"
         ),
         Body::BatchedWindow if *asks.sampling != Sampling::ArgMax => lloom_tensor::bail!(
             "a batched speculative body verifies by the argmax: {:?} is refused rather than \

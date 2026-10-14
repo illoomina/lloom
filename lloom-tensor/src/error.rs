@@ -11,9 +11,63 @@ pub struct MatMulUnexpectedStriding {
     pub msg: &'static str,
 }
 
-// Payloads of the cold variants whose inline size would exceed the hot
-// refusals', boxed so they never set `size_of::<Error>()`. Each keeps its
-// variant's name and `Display` text (`docs/invariants.md` §15.2 #15a).
+// Payloads of the cold variants larger than the floor (`AllocationError`),
+// boxed so they never set `size_of::<Error>()`. Each keeps its variant's name
+// and `Display` text (`docs/invariants.md` §15.2 #15a).
+
+#[derive(Debug, thiserror::Error)]
+#[error("unexpected rank, expected: {expected}, got: {got} ({shape:?})")]
+pub struct UnexpectedNumberOfDims {
+    pub expected: usize,
+    pub got: usize,
+    pub shape: Shape,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "Shape mismatch, got buffer of size {buffer_size} which is compatible with shape {shape:?}"
+)]
+pub struct ShapeMismatch {
+    pub buffer_size: usize,
+    pub shape: Shape,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("Cannot divide tensor of shape {shape:?} equally along dim {dim} into {n_parts}")]
+pub struct ShapeMismatchSplit {
+    pub shape: Shape,
+    pub dim: usize,
+    pub n_parts: usize,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("{op} can only be performed on a single dimension")]
+pub struct OnlySingleDimension {
+    pub op: &'static str,
+    pub dims: Vec<usize>,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("{op} invalid index {index} with dim size {size}")]
+pub struct InvalidIndex {
+    pub op: &'static str,
+    pub index: usize,
+    pub size: usize,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("{wrapped:?}\n{context:?}")]
+pub struct WrappedContext {
+    pub wrapped: Box<dyn std::error::Error + Send + Sync>,
+    pub context: String,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("path: {path:?} {inner}")]
+pub struct WithPath {
+    pub inner: Error,
+    pub path: std::path::PathBuf,
+}
 
 #[derive(Debug, thiserror::Error)]
 #[error("{op}: dimension index {dim} out of range for shape {shape:?}")]
@@ -102,8 +156,9 @@ impl std::fmt::Debug for Error {
 /// Every `Result<T>` carries this enum by value, so its size is a per-return
 /// cost. The refusals a warm path can meet stay inline and allocation-free:
 /// `Allocation` (`Copy`), and `Metal`, which carries the kernel layer's
-/// allocation and command-buffer recording refusals. A cold variant whose
-/// payload is larger than those holds it behind one `Box`.
+/// allocation and command-buffer recording refusals. Every other payload is
+/// at most `AllocationError`'s size; a cold variant whose payload is larger
+/// holds it behind one `Box`.
 #[derive(thiserror::Error)]
 pub enum Error {
     // === DType Errors ===
@@ -132,20 +187,14 @@ pub enum Error {
     DuplicateDimIndex(Box<DuplicateDimIndex>),
 
     // === Shape Errors ===
-    #[error("unexpected rank, expected: {expected}, got: {got} ({shape:?})")]
-    UnexpectedNumberOfDims {
-        expected: usize,
-        got: usize,
-        shape: Shape,
-    },
+    #[error(transparent)]
+    UnexpectedNumberOfDims(Box<UnexpectedNumberOfDims>),
 
     #[error(transparent)]
     UnexpectedShape(Box<UnexpectedShape>),
 
-    #[error(
-        "Shape mismatch, got buffer of size {buffer_size} which is compatible with shape {shape:?}"
-    )]
-    ShapeMismatch { buffer_size: usize, shape: Shape },
+    #[error(transparent)]
+    ShapeMismatch(Box<ShapeMismatch>),
 
     #[error(transparent)]
     ShapeMismatchBinaryOp(Box<ShapeMismatchBinaryOp>),
@@ -153,15 +202,11 @@ pub enum Error {
     #[error(transparent)]
     ShapeMismatchCat(Box<ShapeMismatchCat>),
 
-    #[error("Cannot divide tensor of shape {shape:?} equally along dim {dim} into {n_parts}")]
-    ShapeMismatchSplit {
-        shape: Shape,
-        dim: usize,
-        n_parts: usize,
-    },
+    #[error(transparent)]
+    ShapeMismatchSplit(Box<ShapeMismatchSplit>),
 
-    #[error("{op} can only be performed on a single dimension")]
-    OnlySingleDimension { op: &'static str, dims: Vec<usize> },
+    #[error(transparent)]
+    OnlySingleDimension(Box<OnlySingleDimension>),
 
     #[error("empty tensor for {op}")]
     EmptyTensor { op: &'static str },
@@ -177,12 +222,8 @@ pub enum Error {
     #[error(transparent)]
     Conv1dInvalidArgs(Box<Conv1dInvalidArgs>),
 
-    #[error("{op} invalid index {index} with dim size {size}")]
-    InvalidIndex {
-        op: &'static str,
-        index: usize,
-        size: usize,
-    },
+    #[error(transparent)]
+    InvalidIndex(Box<InvalidIndex>),
 
     #[error(transparent)]
     BroadcastIncompatibleShapes(Box<BroadcastIncompatibleShapes>),
@@ -248,7 +289,7 @@ pub enum Error {
 
     /// Utf8 parse error.
     #[error(transparent)]
-    FromUtf8(#[from] std::string::FromUtf8Error),
+    FromUtf8(Box<std::string::FromUtf8Error>),
 
     /// I/O error.
     #[error(transparent)]
@@ -256,7 +297,7 @@ pub enum Error {
 
     /// SafeTensor error.
     #[error(transparent)]
-    SafeTensor(#[from] safetensors::SafeTensorError),
+    SafeTensor(Box<safetensors::SafeTensorError>),
 
     #[error("unsupported safetensor dtype {0:?}")]
     UnsupportedSafeTensorDtype(safetensors::Dtype),
@@ -266,11 +307,8 @@ pub enum Error {
     Wrapped(Box<dyn std::fmt::Display + Send + Sync>),
 
     /// Arbitrary errors wrapping with context.
-    #[error("{wrapped:?}\n{context:?}")]
-    WrappedContext {
-        wrapped: Box<dyn std::error::Error + Send + Sync>,
-        context: String,
-    },
+    #[error(transparent)]
+    WrappedContext(Box<WrappedContext>),
 
     #[error("{context}\n{inner}")]
     Context {
@@ -279,11 +317,8 @@ pub enum Error {
     },
 
     /// Adding path information to an error.
-    #[error("path: {path:?} {inner}")]
-    WithPath {
-        inner: Box<Self>,
-        path: std::path::PathBuf,
-    },
+    #[error(transparent)]
+    WithPath(Box<WithPath>),
 
     #[error("{inner}\n{backtrace}")]
     WithBacktrace {
@@ -300,6 +335,18 @@ pub enum Error {
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+impl From<std::string::FromUtf8Error> for Error {
+    fn from(e: std::string::FromUtf8Error) -> Self {
+        Self::FromUtf8(Box::new(e))
+    }
+}
+
+impl From<safetensors::SafeTensorError> for Error {
+    fn from(e: safetensors::SafeTensorError) -> Self {
+        Self::SafeTensor(Box::new(e))
+    }
+}
 
 impl Error {
     pub fn wrap(err: impl std::fmt::Display + Send + Sync + 'static) -> Self {
@@ -327,10 +374,10 @@ impl Error {
     }
 
     pub fn with_path<P: AsRef<std::path::Path>>(self, p: P) -> Self {
-        Self::WithPath {
-            inner: Box::new(self),
+        Self::WithPath(Box::new(WithPath {
+            inner: self,
             path: p.as_ref().to_path_buf(),
-        }
+        }))
     }
 
     pub fn context(self, c: impl std::fmt::Display + Send + Sync + 'static) -> Self {
@@ -345,9 +392,8 @@ impl Error {
     pub fn allocation(&self) -> Option<crate::memory_admission::AllocationError> {
         match self {
             Self::Allocation(refusal) => Some(*refusal),
-            Self::Context { inner, .. }
-            | Self::WithPath { inner, .. }
-            | Self::WithBacktrace { inner, .. } => inner.allocation(),
+            Self::Context { inner, .. } | Self::WithBacktrace { inner, .. } => inner.allocation(),
+            Self::WithPath(with_path) => with_path.inner.allocation(),
             _ => None,
         }
     }
@@ -410,10 +456,10 @@ where
         // in ext_context.
         match self {
             Ok(ok) => Ok(ok),
-            Err(error) => Err(Error::WrappedContext {
+            Err(error) => Err(Error::WrappedContext(Box::new(WrappedContext {
                 wrapped: Box::new(error),
                 context: context.to_string(),
-            }
+            }))
             .bt()),
         }
     }
@@ -425,10 +471,10 @@ where
     {
         match self {
             Ok(ok) => Ok(ok),
-            Err(error) => Err(Error::WrappedContext {
+            Err(error) => Err(Error::WrappedContext(Box::new(WrappedContext {
                 wrapped: Box::new(error),
                 context: context().to_string(),
-            }
+            }))
             .bt()),
         }
     }

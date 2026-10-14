@@ -834,11 +834,13 @@ impl Backend for ShardedSafeTensors {
         let size = shape[dim];
 
         if size % world_size != 0 {
-            return Err(Error::ShapeMismatchSplit {
-                shape: shape.into(),
-                dim,
-                n_parts: world_size,
-            });
+            return Err(Error::ShapeMismatchSplit(Box::new(
+                lloom_tensor::error::ShapeMismatchSplit {
+                    shape: shape.into(),
+                    dim,
+                    n_parts: world_size,
+                },
+            )));
         }
         let block_size = size / world_size;
         let start = rank * block_size;

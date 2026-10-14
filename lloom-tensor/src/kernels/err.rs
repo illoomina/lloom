@@ -11,6 +11,13 @@ pub struct MatMulNonContiguous {
 }
 
 #[derive(Debug, thiserror::Error)]
+#[error("Unsupported dtype {dtype} for operation {op}")]
+pub struct UnsupportedDTypeForOp {
+    pub dtype: &'static str,
+    pub op: &'static str,
+}
+
+#[derive(Debug, thiserror::Error)]
 #[error("Sdpa {variation} head size was {got}, expectd {expected:?}")]
 pub struct SdpaHeadSizeMismatch {
     pub variation: &'static str,
@@ -52,8 +59,8 @@ pub enum MetalKernelError {
     /// until the operator opts in to it (§15.2a).
     #[error("{0}")]
     EmulatedRefused(String),
-    #[error("Unsupported dtype {0} for operation {1}")]
-    UnsupportedDTypeForOp(&'static str, &'static str),
+    #[error(transparent)]
+    UnsupportedDTypeForOp(Box<UnsupportedDTypeForOp>),
     #[error("Failed to create compute function")]
     FailedToCreateComputeFunction,
     #[error("Invalid input: {0}")]
@@ -191,7 +198,12 @@ mod registration_error_tests {
         assert!(format!("{error:?}").contains("has_rejected_callback"));
         let error: crate::metal_backend::MetalError = error.into();
         let error: crate::Error = error.into();
-        assert!(format!("{error}").contains("fixture refusal"));
+        // The text the enums printed before their payloads were boxed, as
+        // `tests/error_display.rs` pins every other variant's.
+        assert_eq!(
+            format!("{error}"),
+            "Metal error completion registration refused: GPU queue unavailable: fixture refusal"
+        );
         // The outer tensor Error intentionally delegates Debug to Display.
         assert_eq!(format!("{error:?}"), format!("{error}"));
         assert_eq!(

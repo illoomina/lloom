@@ -166,12 +166,14 @@ impl Layout {
     pub fn transpose(&self, dim1: usize, dim2: usize) -> Result<Self> {
         let rank = self.shape.rank();
         if rank <= dim1 || rank <= dim2 {
-            Err(Error::UnexpectedNumberOfDims {
-                expected: usize::max(dim1, dim2),
-                got: rank,
-                shape: self.shape().clone(),
-            }
-            .bt())?
+            Err(
+                Error::UnexpectedNumberOfDims(Box::new(crate::error::UnexpectedNumberOfDims {
+                    expected: usize::max(dim1, dim2),
+                    got: rank,
+                    shape: self.shape().clone(),
+                }))
+                .bt(),
+            )?
         }
         let mut stride = self.stride().to_vec();
         let mut dims = self.shape().dims().to_vec();

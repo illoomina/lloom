@@ -479,10 +479,19 @@ fn an_eos_overrun_is_undone_and_the_next_turn_extends() -> Result<()> {
     // the whole conversation), so only its action is asserted.
     let (action, ids) = ring_turns(0)?;
     eprintln!("STANDING control turn 2 {action:?}: {ids:?} (reference {reference:?})");
-    assert_eq!(
+    // Without the window the overrun cannot be taken back; since PR992
+    // `prepare` restores to the latest turn checkpoint and replays the
+    // suffix instead of resetting (`Rewound(n)`, n the count rewound),
+    // and before PR992 it was `Fresh`. Either way it is not `Extend`: the
+    // window is what makes the next turn extend.
+    assert!(
+        matches!(action, ReuseAction::Rewound(_) | ReuseAction::Fresh),
+        "the control: without the window the overrun cannot be taken back, got {action:?}"
+    );
+    assert_ne!(
         action,
-        ReuseAction::Fresh,
-        "the control: without the window the overrun cannot be taken back"
+        ReuseAction::Extend,
+        "the control must not extend: only the window undoes the overrun"
     );
     Ok(())
 }

@@ -227,8 +227,18 @@ pub const QWEN3_5_CAPABILITIES: Capabilities = Capabilities {
     vision: false,
     vision_missing: "no vision tower is built for Qwen3.5 (the text path only; its tower is #765's lineage)",
     eos_gate: false,
-    eos_gate_missing: "its decode kernels (the GDN and attention kernels, the quantized cores) carry no gated variant; the standing window undoes the forward instead",
+    eos_gate_missing: "an arm here until its real-model gates are run (`models.qwen3_5.eos_gate`, #993's arm B); the standing window undoes the fixed cadence's forward instead",
 };
+
+/// Qwen3.5's capabilities with the EOS gate as the `models.qwen3_5.eos_gate`
+/// arm selects: the gated GDN step carries its state and the overrun is
+/// taken back by its counters (`DecoderState::rewind_unwritten`).
+pub fn qwen3_5_capabilities(eos_gate_arm: bool) -> Capabilities {
+    Capabilities {
+        eos_gate: eos_gate_arm,
+        ..QWEN3_5_CAPABILITIES
+    }
+}
 
 /// Every family, in detection order: the GGUF families read the header's
 /// `general.architecture`, so their order does not matter; LFM2 is a
@@ -598,10 +608,10 @@ impl Family for Qwen3_5Family {
             .then_some(first)
     }
     fn capabilities(&self) -> Capabilities {
-        QWEN3_5_CAPABILITIES
+        qwen3_5_capabilities(lloom::tuning::tuning().ring.qwen3_5_eos_gate)
     }
     fn resolve(&self, req: &Requested<'_>) -> Result<()> {
-        resolve_common(&QWEN3_5_CAPABILITIES, req)?;
+        resolve_common(&self.capabilities(), req)?;
         let s = &req.shape;
         if s.speculative.method == "mtp" {
             if let Some(d) = &s.speculative.drafter {
@@ -1172,7 +1182,7 @@ mod tests {
         assert!(QWEN4EXP_CAPABILITIES.line().contains("lookahead_max=1"));
         assert!(QWEN4EXP_CAPABILITIES.ring.starts_with("full"));
         // Qwen3.5 holds the same contract on the generic decoder's state:
-        // the standing window, no gated kernels.
+        // the standing window, the gate an arm (off by default).
         assert!(QWEN3_5_CAPABILITIES.line().contains("lookahead_max=1"));
         assert!(QWEN3_5_CAPABILITIES.ring.starts_with("full"));
         assert!(QWEN3_5_CAPABILITIES
@@ -1219,6 +1229,41 @@ mod tests {
         let mut s = with("ring-nonblocking");
         assert_eq!(clamp_ungated_eos_gate(&LFM2_CAPABILITIES, &mut s), None);
         assert!(s.decode.readback.eos_gate, "LFM2 keeps its gate");
+    }
+
+    /// Qwen3.5's gate is the `models.qwen3_5.eos_gate` arm: off (the
+    /// default) it is clamped like an ungated family's, noted with the arm's
+    /// name; on, the family keeps it. Nothing else in the capabilities moves.
+    #[test]
+    fn qwen3_5s_eos_gate_is_an_arm_off_by_default() {
+        use crate::ReadbackConfig;
+        assert!(
+            !lloom::tuning::Tuning::default().ring.qwen3_5_eos_gate,
+            "the arm is off by default"
+        );
+        assert_eq!(qwen3_5_capabilities(false), QWEN3_5_CAPABILITIES);
+        assert_eq!(
+            qwen3_5_capabilities(true),
+            Capabilities {
+                eos_gate: true,
+                ..QWEN3_5_CAPABILITIES
+            }
+        );
+        let with = |spelling: &str| {
+            let mut s = shape();
+            ReadbackConfig::apply_spelling(&mut s.decode.readback, spelling).unwrap();
+            s
+        };
+        let mut s = with("ring-nonblocking");
+        let note = clamp_ungated_eos_gate(&qwen3_5_capabilities(false), &mut s).expect("noted");
+        assert!(!s.decode.readback.eos_gate, "off: clamped");
+        assert!(
+            note.contains("eos_gate is off on qwen3_5") && note.contains("models.qwen3_5.eos_gate"),
+            "{note}"
+        );
+        let mut s = with("ring-nonblocking");
+        assert_eq!(clamp_ungated_eos_gate(&qwen3_5_capabilities(true), &mut s), None);
+        assert!(s.decode.readback.eos_gate, "on: kept");
     }
 
     /// `--flash-k` is LFM2's FlashDecoding chunk: Qwen4-exp refuses it by

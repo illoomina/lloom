@@ -98,13 +98,44 @@ pub struct Kernels {
     eos_gated: std::sync::atomic::AtomicBool,
 }
 
+thread_local! {
+    /// [`UngatedScope`]s open on this thread.
+    static UNGATED: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// While it lives, the pipelines this thread loads are the plain variants
+/// even with the EOS gate armed, so the work it encodes runs whatever the
+/// gate decided. For a write the accepted state still needs after an EOS
+/// (a persistent slab's growth copy), never for a forward's own writes
+/// (`metal::eos_gate`, `sequence-reuse-design.md` §2.3e).
+#[must_use]
+pub struct UngatedScope {
+    _thread: std::marker::PhantomData<*const ()>,
+}
+
+impl UngatedScope {
+    pub fn open() -> Self {
+        UNGATED.with(|d| d.set(d.get() + 1));
+        Self {
+            _thread: std::marker::PhantomData,
+        }
+    }
+}
+
+impl Drop for UngatedScope {
+    fn drop(&mut self) {
+        UNGATED.with(|d| d.set(d.get() - 1));
+    }
+}
+
 /// The sources whose kernels carry `EOS_GATE_ARG` (`utils.metal`).
-const EOS_GATED_SOURCES: [Source; 5] = [
+const EOS_GATED_SOURCES: [Source; 6] = [
     Source::Gemv,
     Source::Reduce,
     Source::Binary,
     Source::Unary,
     Source::Conv,
+    Source::Gdn,
 ];
 
 impl Default for Kernels {
@@ -133,6 +164,12 @@ impl Kernels {
 
     pub fn eos_gated(&self) -> bool {
         self.eos_gated.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Whether a pipeline this thread loads now is the gated variant: the
+    /// gate armed and no [`UngatedScope`] open here.
+    fn gated_here(&self) -> bool {
+        self.eos_gated() && UNGATED.with(|d| d.get() == 0)
     }
 
     /// Which library a [`Source`] resolves to, and the text to compile for it.
@@ -293,7 +330,7 @@ impl Kernels {
         let constants = if EOS_GATED_SOURCES.contains(&source) {
             Some(ConstantValues::new(vec![(
                 crate::kernels::metal::eos_gate::EOS_GATE_FUNCTION_CONSTANT,
-                crate::kernels::metal::library::Value::Bool(self.eos_gated()),
+                crate::kernels::metal::library::Value::Bool(self.gated_here()),
             )]))
         } else {
             None

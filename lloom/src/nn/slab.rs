@@ -141,12 +141,16 @@ impl Slab {
     /// the first append a number; after it a fresh backing at the new width
     /// with the old copied into its prefix (one `copy2d` per plane). The
     /// buffer identity moves here and only here. At or below the current
-    /// capacity: a no-op, never a shrink.
+    /// capacity: a no-op, never a shrink. The copy carries the rows the
+    /// slab holds, so it runs ungated under an armed EOS gate: a grow can
+    /// fall inside the forwards queued past an EOS
+    /// (`sequence-reuse-design.md` §2.3e).
     pub fn grow_to(&mut self, capacity: usize) -> Result<()> {
         if capacity <= self.capacity {
             return Ok(());
         }
         if let Some(old) = self.data.as_ref() {
+            let _ungated = old.device().eos_gate_suspended();
             let mut shape = old.dims().to_vec();
             shape[self.dim] = capacity;
             let grown = zs::zeros(self.site, shape, old.dtype(), old.device())?;

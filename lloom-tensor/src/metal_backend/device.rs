@@ -1608,6 +1608,11 @@ impl MetalDevice {
         Ok(())
     }
 
+    /// Whether the EOS gate is armed on this device's commands.
+    pub fn eos_gate_armed(&self) -> bool {
+        self.commands.eos_gate().is_armed()
+    }
+
     /// Disarm and report. The run's gated work completes first, under its
     /// own flag: `EosGate::end`'s report and the next `begin`'s clear both
     /// need the run drained, and a run that ended early (an error out of the

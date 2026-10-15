@@ -1,6 +1,6 @@
 //! The standing window on the generic decoder (`DecoderState`'s
 //! `CacheRewind`, `sequence-reuse-design.md` §2.3b): a state built with
-//! `StateCapacity::window >= 1` leaves every decode step's window open until
+//! `DecodeRecovery::Standing` leaves every decode step's window open until
 //! the next forward, so the driver can undo exactly that step — the forward
 //! the ring queued past an EOS it had not yet learned. Qwen4-exp's contract
 //! (`qwen4exp_engine_identity.rs`'s `a_decode_step_is_undone_by_the_standing_window`)
@@ -17,7 +17,9 @@ use lloom::generation::{Blocking, CommitBudget, EosRead, LogitsProcessor, Ring, 
 use lloom::models::qwen3_5::testing::{Qwen3_5MoeTiny, Qwen3_5Tiny};
 use lloom::models::qwen3_5::Config;
 use lloom::models::qwen4exp::{GdnState, KvCache};
-use lloom::nn::decoder::{DecoderState, HybridState, Layer, PreNormState, StateCapacity};
+use lloom::nn::decoder::{
+    DecodeRecovery, DecoderState, HybridState, Layer, PreNormState, StateCapacity,
+};
 use lloom::nn::model::{CacheRewind, CausalLM};
 use lloom::nn::{DecodeOptions, IdentityProposer, ReuseAction, Session};
 use lloom::profile::{CrownExact, Profile, RewindableExact};
@@ -46,7 +48,12 @@ fn dense<P: Profile>(
     let cap = model.capacity();
     model.set_capacity(StateCapacity {
         checkpoints: 2,
-        window,
+        verify: window,
+        recovery: if window >= 1 {
+            DecodeRecovery::Standing
+        } else {
+            DecodeRecovery::None
+        },
         ..cap
     });
     Ok((model, ckpt.cfg.clone()))
@@ -62,7 +69,12 @@ fn moe<P: Profile>(
     let cap = model.capacity();
     model.set_capacity(StateCapacity {
         checkpoints: 2,
-        window,
+        verify: window,
+        recovery: if window >= 1 {
+            DecodeRecovery::Standing
+        } else {
+            DecodeRecovery::None
+        },
         ..cap
     });
     Ok((model, ckpt.cfg.clone()))
@@ -467,10 +479,19 @@ fn an_eos_overrun_is_undone_and_the_next_turn_extends() -> Result<()> {
     // the whole conversation), so only its action is asserted.
     let (action, ids) = ring_turns(0)?;
     eprintln!("STANDING control turn 2 {action:?}: {ids:?} (reference {reference:?})");
-    assert_eq!(
+    // Without the window the overrun cannot be taken back; since PR992
+    // `prepare` restores to the latest turn checkpoint and replays the
+    // suffix instead of resetting (`Rewound(n)`, n the count rewound),
+    // and before PR992 it was `Fresh`. Either way it is not `Extend`: the
+    // window is what makes the next turn extend.
+    assert!(
+        matches!(action, ReuseAction::Rewound(_) | ReuseAction::Fresh),
+        "the control: without the window the overrun cannot be taken back, got {action:?}"
+    );
+    assert_ne!(
         action,
-        ReuseAction::Fresh,
-        "the control: without the window the overrun cannot be taken back"
+        ReuseAction::Extend,
+        "the control must not extend: only the window undoes the overrun"
     );
     Ok(())
 }

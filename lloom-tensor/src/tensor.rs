@@ -457,7 +457,11 @@ impl Tensor {
         let n: usize = shape.elem_count();
         let buffer_size: usize = array.shape()?.elem_count();
         if buffer_size != n {
-            return Err(Error::ShapeMismatch { buffer_size, shape }.bt());
+            return Err(Error::ShapeMismatch(Box::new(crate::error::ShapeMismatch {
+                buffer_size,
+                shape,
+            }))
+            .bt());
         }
         let storage = device.storage(array)?;
         let none = BackpropOp::none();
@@ -706,12 +710,14 @@ impl Tensor {
     /// dimensions, an error is returned instead.
     pub fn to_scalar<S: crate::WithDType>(&self) -> Result<S> {
         if self.rank() != 0 {
-            Err(Error::UnexpectedNumberOfDims {
-                expected: 0,
-                got: self.rank(),
-                shape: self.shape().clone(),
-            }
-            .bt())?
+            Err(
+                Error::UnexpectedNumberOfDims(Box::new(crate::error::UnexpectedNumberOfDims {
+                    expected: 0,
+                    got: self.rank(),
+                    shape: self.shape().clone(),
+                }))
+                .bt(),
+            )?
         }
         let from_cpu_storage = |cpu_storage: &crate::CpuStorage| {
             let data = S::cpu_storage_as_slice(cpu_storage)?;
@@ -1838,12 +1844,14 @@ impl Tensor {
             )?
         }
         if self.rank() != src.rank() {
-            Err(Error::UnexpectedNumberOfDims {
-                expected: self.rank(),
-                got: src.rank(),
-                shape: src.shape().clone(),
-            }
-            .bt())?
+            Err(
+                Error::UnexpectedNumberOfDims(Box::new(crate::error::UnexpectedNumberOfDims {
+                    expected: self.rank(),
+                    got: src.rank(),
+                    shape: src.shape().clone(),
+                }))
+                .bt(),
+            )?
         }
         let shape_ok =
             self.dims()
@@ -2026,12 +2034,14 @@ impl Tensor {
     /// Returns the data contained in a 1D tensor as a vector of scalar values.
     pub fn to_vec1<S: crate::WithDType>(&self) -> Result<Vec<S>> {
         if self.rank() != 1 {
-            Err(Error::UnexpectedNumberOfDims {
-                expected: 1,
-                got: self.rank(),
-                shape: self.shape().clone(),
-            }
-            .bt())?
+            Err(
+                Error::UnexpectedNumberOfDims(Box::new(crate::error::UnexpectedNumberOfDims {
+                    expected: 1,
+                    got: self.rank(),
+                    shape: self.shape().clone(),
+                }))
+                .bt(),
+            )?
         }
         let from_cpu_storage = |cpu_storage: &crate::CpuStorage| {
             let data = S::cpu_storage_as_slice(cpu_storage)?;
@@ -2060,12 +2070,14 @@ impl Tensor {
     /// is a plain `to_vec1` taken at read time.
     pub fn stage_read(&self) -> Result<StagedRead> {
         if self.rank() != 1 {
-            Err(Error::UnexpectedNumberOfDims {
-                expected: 1,
-                got: self.rank(),
-                shape: self.shape().clone(),
-            }
-            .bt())?
+            Err(
+                Error::UnexpectedNumberOfDims(Box::new(crate::error::UnexpectedNumberOfDims {
+                    expected: 1,
+                    got: self.rank(),
+                    shape: self.shape().clone(),
+                }))
+                .bt(),
+            )?
         }
         #[cfg(feature = "metal")]
         if let Storage::Metal(storage) = &*self.storage() {
@@ -2697,12 +2709,14 @@ impl Tensor {
     pub fn t(&self) -> Result<Tensor> {
         let rank = self.rank();
         if rank < 2 {
-            Err(Error::UnexpectedNumberOfDims {
-                expected: 2,
-                got: rank,
-                shape: self.shape().clone(),
-            }
-            .bt())?
+            Err(
+                Error::UnexpectedNumberOfDims(Box::new(crate::error::UnexpectedNumberOfDims {
+                    expected: 2,
+                    got: rank,
+                    shape: self.shape().clone(),
+                }))
+                .bt(),
+            )?
         }
         self.transpose(rank - 2, rank - 1)
     }

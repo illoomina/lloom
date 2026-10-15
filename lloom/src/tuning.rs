@@ -780,6 +780,9 @@ pub struct RingTuning {
     /// How DSpark's verify completion is waited for: `event` (park on an event behind the round's stamp) or `inherit` (poll the stamp, the A/B arm).
     #[opt(flag = "verify-park", env = "LLOOM_VERIFY_PARK", bool, path = "speculative.verify_wait", status = "advanced", facets = ["wait"], flows = ["token-out"], values = ["inherit=false", "event=true"], forms = ["inherit", "event"], schema = "Wait")]
     pub verify_park: bool,
+    /// Whether the adaptive commit's loop watches the ring for a stop id itself (#993): off (it stops only when the reader raises the flag, so a late reader lets it run past an EOS without bound) or on (it reads what the GPU published before each step and stops at a stop id, so at most `adaptive_lead + 1` forwards run past an EOS). An arm until it is measured.
+    #[opt(flag = "ring-eos-watch", env = "LLOOM_RING_EOS_WATCH", bool, path = "decode.ring.eos_watch", status = "arm", facets = ["lead"], flows = ["token-out", "commands-out"])]
+    pub eos_watch: bool,
 }
 
 fn parse_spawned_qos(v: &str) -> Result<String, String> {
@@ -802,6 +805,7 @@ impl Default for RingTuning {
             feed_trace: false,
             eos_park: false,
             verify_park: true,
+            eos_watch: false,
         }
     }
 }

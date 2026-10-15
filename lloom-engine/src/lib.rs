@@ -32,6 +32,7 @@ pub mod seam;
 pub mod sink;
 pub mod slots;
 pub mod stream;
+pub mod turn;
 
 pub use batch::{
     drive_closed_rows, spawn as spawn_batch, BatchConfig, BatchCounters, BatchDone, BatchEvent,
@@ -39,12 +40,14 @@ pub use batch::{
     RowSpec, StaticBody,
 };
 pub use decode::{
-    ring_eos_read, DecodeParams, DecodeSession, Decoded, ReadbackArm, RingArm, RingPool, Stop,
+    ring_eos_read, DecodeParams, DecodeSession, Decoded, LogprobRequest, ReadbackArm, RingArm,
+    RingPool, Stop,
 };
+pub use lloom::generation::Logprobs;
 pub use options::{
     BenchConfig, DecodeConfig, EngineOptions, EosKind, ExecutorConfig, LoadConfig, MemoryConfig,
     ModelConfig, PrefillConfig, PrefixConfig, PromptConfig, ReadbackConfig, ReadbackKind,
-    ReasoningConfig, ReportConfig, SamplingConfig, SchedulerConfig, ServerConfig,
+    ReasoningConfig, ReportConfig, SamplingConfig, SchedulerConfig, ServerConfig, SessionConfig,
     SpeculativeConfig, TuningOptions,
 };
 pub use seam::Completer;

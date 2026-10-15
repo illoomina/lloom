@@ -698,11 +698,11 @@ impl<I: IntDType> Map1 for Gather<'_, I> {
                     } else {
                         let index = index.as_usize();
                         if index >= src_dim_len {
-                            Err(Error::InvalidIndex {
+                            Err(Error::InvalidIndex(Box::new(crate::error::InvalidIndex {
                                 index,
                                 size: src_dim_len,
                                 op: "gather",
-                            }
+                            }))
                             .bt())?
                         }
                         let src_idx = start_src_idx + index * src_right_len + right_i;
@@ -730,11 +730,13 @@ impl<I: IntDType> Map1 for IndexSelect<'_, I> {
         let dim = self.dim;
         let n_ids = match self.ids_l.dims() {
             [n_ids] => *n_ids,
-            d => Err(Error::UnexpectedNumberOfDims {
-                expected: 1,
-                got: d.len(),
-                shape: self.ids_l.shape().clone(),
-            }
+            d => Err(Error::UnexpectedNumberOfDims(Box::new(
+                crate::error::UnexpectedNumberOfDims {
+                    expected: 1,
+                    got: d.len(),
+                    shape: self.ids_l.shape().clone(),
+                },
+            ))
             .bt())?,
         };
         let stride_ids = self.ids_l.stride()[0];
@@ -756,11 +758,11 @@ impl<I: IntDType> Map1 for IndexSelect<'_, I> {
                 } else {
                     let index = index.as_usize();
                     if index >= src_dim {
-                        Err(Error::InvalidIndex {
+                        Err(Error::InvalidIndex(Box::new(crate::error::InvalidIndex {
                             index,
                             size: src_dim,
                             op: "index-select",
-                        }
+                        }))
                         .bt())?
                     }
                     let start_src_idx = start_src_idx + index * right_len;
@@ -856,11 +858,11 @@ impl<I: IntDType, M: ElemUpdate> Map2InPlace for Scatter<'_, I, M> {
                     }
                     let index = index.as_usize();
                     if index >= dst_dim_len {
-                        Err(Error::InvalidIndex {
+                        Err(Error::InvalidIndex(Box::new(crate::error::InvalidIndex {
                             index,
                             size: dst_dim_len,
                             op: "gather",
-                        }
+                        }))
                         .bt())?
                     }
                     let dst_idx = start_dst_idx + index * dst_right_len + right_i;
@@ -902,11 +904,11 @@ impl<I: IntDType> Map2 for IndexAdd<'_, I> {
                 }
                 let dst_idx = dst_idx.as_usize();
                 if dst_idx >= max_idx {
-                    Err(Error::InvalidIndex {
+                    Err(Error::InvalidIndex(Box::new(crate::error::InvalidIndex {
                         index: dst_idx,
                         op: "index-add",
                         size: max_idx,
-                    })?
+                    })))?
                 }
                 let src_idx = src_idx * post_dim;
                 let dst_idx = dst_idx * post_dim;
@@ -923,11 +925,11 @@ impl<I: IntDType> Map2 for IndexAdd<'_, I> {
                 }
                 let dst_idx = dst_idx.as_usize();
                 if dst_idx >= max_idx {
-                    Err(Error::InvalidIndex {
+                    Err(Error::InvalidIndex(Box::new(crate::error::InvalidIndex {
                         index: dst_idx,
                         op: "index-add",
                         size: max_idx,
-                    })?
+                    })))?
                 }
                 for pre_i in 0..pre_dim {
                     let pre_src_i = (pre_i * src_dim_sz + src_idx) * post_dim;
@@ -2505,7 +2507,9 @@ impl BackendStorage for CpuStorage {
                             _ => unreachable!(),
                         };
                         let dims = reduce_dims.to_vec();
-                        Err(Error::OnlySingleDimension { op, dims })?
+                        Err(Error::OnlySingleDimension(Box::new(
+                            crate::error::OnlySingleDimension { op, dims },
+                        )))?
                     }
                 };
                 let (use_min, return_index) = match op {

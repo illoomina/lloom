@@ -37,7 +37,7 @@ pub const REQUEST_FIELDS: [&str; 3] = [REASONING_EFFORT, ENABLE_THINKING, TOOLS]
 /// A value no template recognises: rendering with it in place of a
 /// variable's value shows whether the template's output depends on that
 /// value at all.
-const PROBE_VALUE: &str = "lloom-probe: not a value";
+pub(super) const PROBE_VALUE: &str = "lloom-probe: not a value";
 
 /// The template refused to render the request (`raise_exception`): the
 /// message is the template's own.
@@ -100,17 +100,26 @@ pub struct Template {
     /// parser rejects and the renderer accepts): nothing is then refused as
     /// unread, and the render probe still runs.
     reads: Option<BTreeSet<String>>,
+    /// The source's SHA-256: the template a rendered history belongs to.
+    digest: [u8; 32],
 }
 
 impl Template {
     pub fn compile(source: &str) -> Result<Self> {
+        use sha2::Digest;
         let compiled = ChatTemplate::from_str(source)
             .map_err(|e| anyhow::anyhow!("compiling chat_template.jinja: {e}"))?;
         Ok(Self {
             compiled,
             renders: std::sync::atomic::AtomicU64::new(0),
             reads: undeclared_variables(source),
+            digest: sha2::Sha256::digest(source.as_bytes()).into(),
         })
+    }
+
+    /// The SHA-256 of the source this template was compiled from.
+    pub fn digest(&self) -> [u8; 32] {
+        self.digest
     }
 
     /// Whether the template's source reads `name`; `None` when it could not

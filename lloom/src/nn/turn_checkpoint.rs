@@ -23,7 +23,8 @@ struct Checkpoint {
 
 /// `slots` frames of one [`Ring`], each every layer's `elems` f32s laid end
 /// to end (`layout`: offset and count per layer); allocated at a sequence's
-/// first checkpoint and kept, a slot reused oldest first.
+/// first checkpoint and kept, a forgotten slot reused before a valid one and
+/// the oldest valid one last.
 #[derive(Debug, Clone)]
 pub struct CheckpointRing {
     slots: usize,
@@ -147,6 +148,28 @@ impl CheckpointRing {
         }
     }
 
+    /// Which checkpoint a pass of `seq` positions from `pos` will take, as
+    /// the pass key's variant (`PassKey::variant`): 0 for none, else nonzero
+    /// and a function of where — the hinted position's offset into the pass,
+    /// or its end for a state no caller has hinted. A checkpoint adds a copy
+    /// (at a chunk's end) or a second recurrence over the prefix (inside a
+    /// chunk), so two passes of one shape that leave theirs at different
+    /// places allocate different sequences, and a plan recorded from one
+    /// must not serve the other. Decided as the forward decides it
+    /// ([`Self::rows_for`] after [`Self::drop_stale_hint`]); the chunking
+    /// inside the pass is the model's constant, so the offset fixes it.
+    pub fn pass_variant(&self, pos: usize, seq: usize, windowed: bool) -> u32 {
+        if self.slots == 0 || windowed || seq == 0 {
+            return 0;
+        }
+        let want = self.want.filter(|&w| w >= pos && self.index(w).is_none());
+        match want {
+            Some(w) if w <= pos + seq => 2 | (((w - pos) as u32) << 2),
+            None if self.auto && seq >= 2 => 1,
+            _ => 0,
+        }
+    }
+
     /// Frame `slot`'s view for layer `l`, `[elems]` f32; `None` for a layer
     /// whose checkpoint is its mark alone.
     pub fn frame(&self, slot: usize, l: usize) -> Result<Option<Tensor>> {
@@ -161,10 +184,11 @@ impl CheckpointRing {
         Ok(Some(ring.frame(slot)?.narrow(0, off, n)?))
     }
 
-    /// The slot the next checkpoint, at `pos`, goes in: the oldest, its
-    /// frame rewritten; the ring allocated at the first (one request,
-    /// outside every plan, kept for the sequence). [`Self::close`] makes it
-    /// valid.
+    /// The slot the next checkpoint, at `pos`, goes in: one whose checkpoint
+    /// a rewind or a restore forgot, else the oldest, its frame rewritten —
+    /// so the checkpoint a restore returned to outlives the pass after it.
+    /// The ring is allocated at the first (one request, outside every plan,
+    /// kept for the sequence). [`Self::close`] makes it valid.
     pub fn open(&mut self, pos: usize, dev: &Device) -> Result<usize> {
         if self.slots == 0 {
             lloom_tensor::bail!("turn checkpoints: no slots")
@@ -180,7 +204,15 @@ impl CheckpointRing {
                 "turn-checkpoints",
             )?);
         }
-        let slot = self.next % self.slots;
+        let n = self.slots;
+        let slot = if self.checkpoints.len() < n {
+            self.checkpoints.len()
+        } else {
+            (0..n)
+                .map(|k| (self.next + k) % n)
+                .find(|&s| !self.checkpoints[s].valid)
+                .unwrap_or(self.next % n)
+        };
         let c = Checkpoint {
             pos,
             valid: false,
@@ -191,7 +223,9 @@ impl CheckpointRing {
         } else {
             self.checkpoints.push(c);
         }
-        self.next = (slot + 1) % self.slots;
+        if slot == self.next % n {
+            self.next = (slot + 1) % n;
+        }
         Ok(slot)
     }
 
@@ -244,5 +278,47 @@ impl CheckpointRing {
     /// The marks of slot `slot`.
     pub fn marks(&self, slot: usize) -> &[WindowMark] {
         &self.checkpoints[slot].marks
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn take(r: &mut CheckpointRing, pos: usize) {
+        let slot = r.open(pos, &Device::Cpu).unwrap();
+        r.close(slot, Vec::new());
+    }
+
+    fn standing(r: &CheckpointRing) -> Vec<usize> {
+        let mut p = r.positions();
+        p.sort_unstable();
+        p
+    }
+
+    /// Two slots; a pass leaves 256, the next 258; a restore at 256 forgets
+    /// 258; the pass after the restore takes 258's slot, so a divergence just
+    /// before its own checkpoint (373) still restores to 256. With every
+    /// slot valid, the oldest goes. (The sequence Qwen3.6-27B's persisted
+    /// turns 3–5 ran, `design/measurements/issue-946.md` §16.)
+    #[test]
+    fn a_new_checkpoint_takes_a_forgotten_slot_before_a_valid_one() {
+        let mut r = CheckpointRing::new(&[0], 2);
+        take(&mut r, 256);
+        take(&mut r, 258);
+        r.forget_past(256);
+        take(&mut r, 374);
+        assert_eq!(standing(&r), vec![256, 374]);
+        assert_eq!(r.latest_at_or_before(373).map(|(_, p)| p), Some(256));
+        take(&mut r, 500);
+        assert_eq!(standing(&r), vec![374, 500], "the oldest valid goes");
+        r.forget_all();
+        take(&mut r, 10);
+        take(&mut r, 20);
+        assert_eq!(
+            standing(&r),
+            vec![10, 20],
+            "a reset leaves every slot to reuse"
+        );
     }
 }

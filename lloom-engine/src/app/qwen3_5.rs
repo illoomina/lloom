@@ -450,13 +450,11 @@ fn load_on<P: Profile>(
     admission: LoadAdmission,
 ) -> Result<Engines<P>> {
     lloom_tensor::memory_admission::begin_model_load();
-    // At least 1: every state keeps the standing window, so a forward the
-    // ring queued past an unlearned EOS is undone (`DecoderState`'s
-    // `CacheRewind`); under MTP, the verify's `k + 1` positions.
-    let window = if opts.mtp {
+    // Under MTP, the verify's `k + 1` positions as one pass over the rings.
+    let verify = if opts.mtp {
         lloom::nn::speculator::checked_window_width(opts.mtp_k.max(1), 1)?
     } else {
-        1
+        0
     };
     let shards = lloom::hub::gguf_shards(&opts.first_shard);
     let mut f = std::fs::File::open(&opts.first_shard)
@@ -497,9 +495,11 @@ fn load_on<P: Profile>(
         memory_fraction: Some(opts.memory_fraction),
         dense_f32: false,
         mtp: opts.mtp,
-        // The standing window; under MTP the verify's `k + 1` positions as
-        // one pass over the rings.
-        window,
+        verify,
+        // Every state keeps the standing window, so a forward the ring
+        // queued past an unlearned EOS is undone (`DecoderState`'s
+        // `CacheRewind`).
+        recovery: lloom::nn::decoder::DecodeRecovery::Standing,
         machine: match admission {
             LoadAdmission::Legacy => Some(lloom::nn::memory::MachineLoad {
                 gate: opts.memory.machine_gate(),
@@ -753,6 +753,9 @@ where
     fn readback(&self) -> ReadbackArm {
         self.readback
     }
+    fn reuse_prefix(&self) -> Option<bool> {
+        Some(self.reuse_prefix)
+    }
     fn prefill_tile(&self) -> usize {
         self.prefill_tile
     }
@@ -849,6 +852,18 @@ where
     fn template_renders(&self) -> u64 {
         self.text.template.as_ref().map_or(0, |t| t.renders())
     }
+    fn text(&self) -> Option<&super::common::Text> {
+        Some(&self.text)
+    }
+    fn decode_body(&self) -> lloom::nn::Body {
+        if self.mtp.is_some() {
+            lloom::nn::Body::Window
+        } else {
+            lloom::nn::Body::Step {
+                ring: matches!(self.readback, ReadbackArm::Ring(_)),
+            }
+        }
+    }
     fn seed_prompt_row(&self, n: usize, row: usize) -> Vec<u32> {
         let seed = &self.text.seed_tokens;
         (0..n).map(|i| seed[(i + row * 7) % seed.len()]).collect()
@@ -863,7 +878,7 @@ where
         let reuse = self.reuse_prefix;
         let detok = self.detok();
         self.with_single(|s, extra| {
-            if !reuse {
+            if !reuse || params.cold {
                 s.reset();
             }
             if self.mtp.is_some() {

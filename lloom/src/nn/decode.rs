@@ -145,7 +145,16 @@ pub struct Asks<'a> {
     pub budget: bool,
     /// The logits digest.
     pub digest: bool,
+    /// Per-token logprobs (a host read of every step's row): `Some(k)` is
+    /// each drawn id's log-probability and the `k` most likely ids beside
+    /// it, `k` at most [`MAX_TOP_LOGPROBS`].
+    pub logprobs: Option<usize>,
 }
+
+/// The most candidates a per-token logprobs ask may name beside the drawn
+/// id: the bound of the API's shape. The chat route's one-forward decision
+/// scoring serves up to 64, so the bound is that rather than OpenAI's 20.
+pub const MAX_TOP_LOGPROBS: usize = 64;
 
 impl<'a> Asks<'a> {
     /// What `sampler` asks, with or without a thinking budget.
@@ -155,6 +164,7 @@ impl<'a> Asks<'a> {
             processors: sampler.processors().is_some(),
             budget,
             digest: sampler.digests(),
+            logprobs: None,
         }
     }
 }
@@ -167,14 +177,21 @@ impl<'a> Asks<'a> {
 ///   sort on the host, and the digest reads every step's logits there.
 /// - The window serves every sampler arm and feature: each row is drawn
 ///   keyed to its position against the history its position has
-///   (`LogitsProcessor::window_draw_device`).
-/// - The batched bodies draw per row without processors and feed no forced
-///   token; the batched windows verify by the argmax.
+///   (`LogitsProcessor::window_draw_device`). It reads back the ids a round
+///   keeps, never a row, so the per-token logprobs are the K=1 body's.
+/// - The batched bodies draw per row without processors, feed no forced
+///   token and keep no logprobs; the batched windows verify by the argmax.
 pub fn refuse(body: Body, asks: &Asks<'_>) -> Result<()> {
     let host_sort = matches!(
         asks.sampling,
         Sampling::TopK { .. } | Sampling::TopP { .. } | Sampling::TopKThenTopP { .. }
     );
+    if let Some(k) = asks.logprobs.filter(|&k| k > MAX_TOP_LOGPROBS) {
+        lloom_tensor::bail!(
+            "per-token logprobs name at most {MAX_TOP_LOGPROBS} candidates beside the drawn id, \
+             not {k}"
+        );
+    }
     match body {
         Body::Step { ring: true } if host_sort => lloom_tensor::bail!(
             "the ring needs a device-resident sampler (argmax, multinomial or gumbel-max); \
@@ -185,6 +202,14 @@ pub fn refuse(body: Body, asks: &Asks<'_>) -> Result<()> {
             "the ring draws on the device and the logits digest reads every step's logits on \
              the host: the digest runs on the blocking arm"
         ),
+        Body::Step { ring: true } if asks.logprobs.is_some() => lloom_tensor::bail!(
+            "the ring draws on the device and the per-token logprobs read every step's row on \
+             the host: they run on the blocking arm"
+        ),
+        Body::Window if asks.logprobs.is_some() => lloom_tensor::bail!(
+            "the window reads back the ids a round keeps, never a row of logits: the per-token \
+             logprobs are the non-speculative body's"
+        ),
         Body::Step { .. } | Body::Window => Ok(()),
         Body::BatchedStep | Body::BatchedWindow if asks.processors => lloom_tensor::bail!(
             "a batched body does not run logits processors (logit_bias, repetition/presence/\
@@ -194,6 +219,10 @@ pub fn refuse(body: Body, asks: &Asks<'_>) -> Result<()> {
         Body::BatchedStep | Body::BatchedWindow if asks.budget => lloom_tensor::bail!(
             "a batched body does not carry a thinking budget: its rows feed no forced token \
              (serve it at a batch of 1)"
+        ),
+        Body::BatchedStep | Body::BatchedWindow if asks.logprobs.is_some() => lloom_tensor::bail!(
+            "a batched body does not keep per-token logprobs: its rows draw on the device and \
+             read the ids back (serve it at a batch of 1)"
         ),
         Body::BatchedWindow if *asks.sampling != Sampling::ArgMax => lloom_tensor::bail!(
             "a batched speculative body verifies by the argmax: {:?} is refused rather than \
@@ -316,6 +345,14 @@ pub struct DecodeOptions {
     /// Whether the fixed cadence's EOS wait parks on the ring's publish event
     /// for this run; `None` takes `LLOOM_RING_EOS_PARK`.
     pub eos_park: Option<bool>,
+    /// Under `adaptive_commit`: the loop watches the ring itself for a stop
+    /// id (#993, `sequence-reuse-design.md` §2.3e). Before each step it reads
+    /// what the GPU has published since the last (one load of the stamp and
+    /// the new slots, no wait) and stops at a stop id among them, as it
+    /// stops on [`Self::stop`]. The forwards past the EOS are then bounded by
+    /// the pacer, not by the reader: `S − E ≤ adaptive_lead + 1`, however late
+    /// the reader raises the flag. `None` takes `decode.ring.eos_watch`.
+    pub eos_watch: Option<bool>,
     /// The flow's adaptive commit; off is the fixed cadence (module docs, "Two
     /// cadences, both kept"). The loop closes its command buffer only when the
     /// GPU has started every buffer committed before it, on no cadence of its
@@ -541,6 +578,7 @@ impl DecodeOptions {
             stream_via_reader: false,
             host_feed_wait: None,
             eos_park: None,
+            eos_watch: None,
             adaptive_commit: false,
             run_ahead: 0,
             stop: None,
@@ -657,6 +695,9 @@ pub struct DecodeStats {
     pub run_ahead_closes: u64,
     pub max_steps_per_buffer: usize,
     pub stopped_by_flag: bool,
+    /// The loop's own watch saw a stop id published and stopped the run
+    /// ([`DecodeOptions::eos_watch`]).
+    pub stopped_by_eos_watch: bool,
     /// Under `eos_gate`: what the gate did (`Device::eos_gate_end`).
     pub eos_gate: Option<lloom_tensor::EosGateReport>,
     /// The overrun's forwards launched nothing (the gate fired), so the
@@ -2104,6 +2145,23 @@ impl<'m, M: CausalLM> Session<'m, M> {
             }
         }
 
+        // The loop's own EOS watch (`DecodeOptions::eos_watch`): a reader of
+        // its own, taken before this run's first stamp, read before each step.
+        let watch_on = opts.adaptive_commit
+            && opts
+                .eos_watch
+                .unwrap_or(crate::tuning::tuning().ring.eos_watch);
+        let mut watch = if watch_on {
+            readback.reader().map(|mut r| {
+                r.resume_at_published();
+                r
+            })
+        } else {
+            None
+        };
+        let mut watch_ids: Vec<u32> =
+            Vec::with_capacity(if watch.is_some() { opts.adaptive_lead() + 1 } else { 0 });
+
         let mut produced = 0usize;
         let mut since_commit = 0usize;
         let mut eos = false;
@@ -2155,6 +2213,19 @@ impl<'m, M: CausalLM> Session<'m, M> {
             if let Some(stop) = &opts.stop {
                 if stop.load(std::sync::atomic::Ordering::Acquire) {
                     stats.stopped_by_flag = true;
+                    break;
+                }
+            }
+            if let Some(w) = watch.as_mut() {
+                watch_ids.clear();
+                if let Err(lap) = w.read_new(&mut watch_ids) {
+                    // The watch reads every step and the host is at most
+                    // `adaptive_lead` steps ahead of what the GPU publishes,
+                    // so a lap means the bound the watch rests on is broken.
+                    lloom_tensor::bail!("Session::decode: the EOS watch fell behind the ring ({lap})")
+                }
+                if w.ended() {
+                    stats.stopped_by_eos_watch = true;
                     break;
                 }
             }

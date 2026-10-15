@@ -1761,7 +1761,7 @@ impl<P: Lfm2Shape> Engine<P> {
         self.with_single(|s, extra| {
             // A text prompt leaves no image rows in the held cache.
             extra.image_keys.clear();
-            if !reuse {
+            if !reuse || params.cold {
                 s.reset();
             }
             match &mut extra.spec {
@@ -2043,14 +2043,16 @@ impl<P: Lfm2Shape> Engine<P> {
                     if cancel.load(Ordering::Acquire) {
                         continue;
                     }
-                    if let Some(chunk) = stream.push(&ids, &mut detok)? {
+                    let (chunk, stopped) =
+                        stream.publish(&ids, &mut detok, &params.stop_strings)?;
+                    if let Some(chunk) = chunk {
                         if !on_fragment(&chunk) {
                             cancelled = true;
                             cancel.store(true, Ordering::Release);
                             continue;
                         }
                     }
-                    if stream.hit_stop(&params.stop_strings) {
+                    if stopped {
                         stopped_on_string = true;
                         cancel.store(true, Ordering::Release);
                     }
@@ -2069,6 +2071,11 @@ impl<P: Lfm2Shape> Engine<P> {
         } else {
             Stop::Length
         };
+        if stop != Stop::Cancelled && !stopped_on_string {
+            if let Some(rest) = stream.held() {
+                on_fragment(&rest);
+            }
+        }
         let (text, _) = stream.finish(&params.stop_strings);
         Ok(Decoded {
             text,
@@ -2078,6 +2085,7 @@ impl<P: Lfm2Shape> Engine<P> {
             reuse: done.reuse,
             reused: done.reused,
             prefilled: done.prefilled,
+            turn: done.turn,
             readback: match self.dspark_k {
                 Some(k) => ReadbackArm::Speculative { k },
                 None => ReadbackArm::Batched {
@@ -2086,6 +2094,7 @@ impl<P: Lfm2Shape> Engine<P> {
             },
             stats: done.stats,
             thinking: None,
+            logprobs: None,
         })
     }
 
@@ -2859,6 +2868,7 @@ fn static_dspark_body<'a, 'm, P: Profile>(
                 processors: false,
                 budget: false,
                 digest: false,
+                logprobs: None,
             },
         )
         .map_err(|e| lloom_tensor::Error::Msg(format!("row {i}: {e}")))?;
@@ -3095,6 +3105,9 @@ impl<P: Lfm2Shape> super::served::Served for Engine<P> {
     fn readback(&self) -> ReadbackArm {
         self.readback
     }
+    fn reuse_prefix(&self) -> Option<bool> {
+        Some(self.reuse_prefix)
+    }
     fn prefill_tile(&self) -> usize {
         self.prefill_tile
     }
@@ -3230,8 +3243,22 @@ impl<P: Lfm2Shape> super::served::Served for Engine<P> {
     fn template_renders(&self) -> u64 {
         self.text.template.as_ref().map_or(0, |t| t.renders())
     }
+    fn text(&self) -> Option<&super::common::Text> {
+        Some(&self.text)
+    }
     fn thinking_budget_refused(&self) -> Option<&'static str> {
         self.sched.is_some().then_some(super::budgets::BATCHED)
+    }
+    fn decode_body(&self) -> lloom::nn::Body {
+        if self.sched.is_some() {
+            lloom::nn::Body::BatchedStep
+        } else if self.dspark_k.is_some() {
+            lloom::nn::Body::Window
+        } else {
+            lloom::nn::Body::Step {
+                ring: matches!(self.readback, ReadbackArm::Ring(_)),
+            }
+        }
     }
     fn seed_prompt_row(&self, n: usize, row: usize) -> Vec<u32> {
         Engine::seed_prompt_row(self, n, row)

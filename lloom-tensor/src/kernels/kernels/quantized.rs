@@ -1,3 +1,4 @@
+use crate::kernels::err::UnsupportedDTypeForOp;
 use crate::kernels::metal::arms::{self, Feature, Features};
 use crate::kernels::utils::EncoderProvider;
 use crate::kernels::{
@@ -295,10 +296,12 @@ impl GemvTriple {
     fn check(self, device: &Device, op: &'static str) -> Result<(), MetalKernelError> {
         arms::require_all(device, self.requires(), || format!("{op} {}", self.label()))?;
         if !self.is_implemented() {
-            return Err(MetalKernelError::UnsupportedDTypeForOp(
-                "declared-unimplemented GemvTriple (M5 native-int)",
-                op,
-            ));
+            return Err(MetalKernelError::UnsupportedDTypeForOp(Box::new(
+                UnsupportedDTypeForOp {
+                    dtype: "declared-unimplemented GemvTriple (M5 native-int)",
+                    op,
+                },
+            )));
         }
         Ok(())
     }
@@ -770,10 +773,12 @@ pub unsafe fn call_quantized_matmul_mv_t(
     };
     triple.check(device, "quantized matmul-vec")?;
     if triple == GemvTriple::F32AsF16F32F16 {
-        return Err(MetalKernelError::UnsupportedDTypeForOp(
-            "the f32-as-f16 activation leg (routed launches only)",
-            "quantized matmul-vec",
-        ));
+        return Err(MetalKernelError::UnsupportedDTypeForOp(Box::new(
+            UnsupportedDTypeForOp {
+                dtype: "the f32-as-f16 activation leg (routed launches only)",
+                op: "quantized matmul-vec",
+            },
+        )));
     }
 
     // The kind's plain matmul-vec: the quantized rows are `stem_<triple
@@ -783,24 +788,28 @@ pub unsafe fn call_quantized_matmul_mv_t(
     // selected an arm that does not exist, a dispatch error rather than a
     // silent f32 fallback; a kind with no kernel built (BF16, Q8_1, Q8_K)
     // is refused here by name, not by the pipeline failing to load.
-    let name: String = match dtype.kind().mul_mv {
-        MulMv::Quant(stem) => format!("{stem}_{}", triple.name_suffix()),
-        MulMv::Dense(name) => {
-            if triple != GemvTriple::F32F32F32 {
-                return Err(MetalKernelError::UnsupportedDTypeForOp(
-                    "non-f32 GemvTriple",
-                    "dense quantized matmul-vec",
-                ));
+    let name: String =
+        match dtype.kind().mul_mv {
+            MulMv::Quant(stem) => format!("{stem}_{}", triple.name_suffix()),
+            MulMv::Dense(name) => {
+                if triple != GemvTriple::F32F32F32 {
+                    return Err(MetalKernelError::UnsupportedDTypeForOp(Box::new(
+                        UnsupportedDTypeForOp {
+                            dtype: "non-f32 GemvTriple",
+                            op: "dense quantized matmul-vec",
+                        },
+                    )));
+                }
+                name.to_string()
             }
-            name.to_string()
-        }
-        MulMv::None => {
-            return Err(MetalKernelError::UnsupportedDTypeForOp(
-                "no kernel_mul_mv kernel is built for this weight dtype (BF16, Q8_1, Q8_K)",
-                "quantized matmul-vec",
-            ))
-        }
-    };
+            MulMv::None => return Err(MetalKernelError::UnsupportedDTypeForOp(Box::new(
+                UnsupportedDTypeForOp {
+                    dtype:
+                        "no kernel_mul_mv kernel is built for this weight dtype (BF16, Q8_1, Q8_K)",
+                    op: "quantized matmul-vec",
+                },
+            ))),
+        };
 
     // The row axis: `nr1` activation rows a weight read (`_r<nr1>`, the
     // core at that capacity, at the core's own geometry), the grid's second
@@ -907,10 +916,12 @@ pub unsafe fn call_quantized_matmul_mv_store(
     let stem = match dtype.kind().mul_mv {
         MulMv::Quant(stem) => stem,
         _ => {
-            return Err(MetalKernelError::UnsupportedDTypeForOp(
-                "a store block rides the genericized quantized cores only",
-                "quantized matmul-vec store block",
-            ))
+            return Err(MetalKernelError::UnsupportedDTypeForOp(Box::new(
+                UnsupportedDTypeForOp {
+                    dtype: "a store block rides the genericized quantized cores only",
+                    op: "quantized matmul-vec store block",
+                },
+            )))
         }
     };
     let name = format!("{stem}_f32{}", store.name_suffix());
@@ -999,10 +1010,12 @@ fn triple_leg_bytes(triple: GemvTriple) -> (u64, u64) {
 fn mv_id_stem(dtype: GgmlDType) -> Result<&'static str, MetalKernelError> {
     let k = dtype.kind();
     if !k.mul_mv_id {
-        return Err(MetalKernelError::UnsupportedDTypeForOp(
-            "no kernel_mul_mv_id arm for this weight dtype",
-            "routed quantized matmul-vec",
-        ));
+        return Err(MetalKernelError::UnsupportedDTypeForOp(Box::new(
+            UnsupportedDTypeForOp {
+                dtype: "no kernel_mul_mv_id arm for this weight dtype",
+                op: "routed quantized matmul-vec",
+            },
+        )));
     }
     Ok(k.stem)
 }
@@ -1046,10 +1059,12 @@ pub unsafe fn call_quantized_matmul_mv_id_t(
 ) -> Result<(), MetalKernelError> {
     triple.check(device, "routed quantized matmul-vec")?;
     if triple != GemvTriple::F32F32F32 && !dtype.has_gemv_triple() {
-        return Err(MetalKernelError::UnsupportedDTypeForOp(
-            "non-f32 GemvTriple",
-            "dense/Q8 routed quantized matmul-vec",
-        ));
+        return Err(MetalKernelError::UnsupportedDTypeForOp(Box::new(
+            UnsupportedDTypeForOp {
+                dtype: "non-f32 GemvTriple",
+                op: "dense/Q8 routed quantized matmul-vec",
+            },
+        )));
     }
     let stem = mv_id_stem(dtype)?;
     // The row axis: the planes of a slot the window's rows share, `nr1` a
@@ -1061,10 +1076,12 @@ pub unsafe fn call_quantized_matmul_mv_id_t(
     );
     let (act_size, store_size) = triple_leg_bytes(triple);
     if in_dim1 != 1 && in_dim1 != topk {
-        return Err(MetalKernelError::UnsupportedDTypeForOp(
-            "routed matmul-vec activation dim1 must be 1 or topk",
-            "routed quantized matmul-vec",
-        ));
+        return Err(MetalKernelError::UnsupportedDTypeForOp(Box::new(
+            UnsupportedDTypeForOp {
+                dtype: "routed matmul-vec activation dim1 must be 1 or topk",
+                op: "routed quantized matmul-vec",
+            },
+        )));
     }
 
     // Everything is in reverse (ggml order).
@@ -1268,26 +1285,32 @@ pub unsafe fn call_quantized_matmul_mm_id_mapped(
     dst: &Buffer,
 ) -> Result<(), MetalKernelError> {
     if bn != 16 && bn != MM_ID_BLOCK_ROWS {
-        return Err(MetalKernelError::UnsupportedDTypeForOp(
-            "routed matmul row block must be 16 or 32",
-            "routed quantized matmul (rows grouped by expert)",
-        ));
+        return Err(MetalKernelError::UnsupportedDTypeForOp(Box::new(
+            UnsupportedDTypeForOp {
+                dtype: "routed matmul row block must be 16 or 32",
+                op: "routed quantized matmul (rows grouped by expert)",
+            },
+        )));
     }
     let stem = {
         let k = dtype.kind();
         if !k.mul_mm_id_mapped {
-            return Err(MetalKernelError::UnsupportedDTypeForOp(
-                "no kernel_mul_mm_id_mapped arm for this weight dtype",
-                "routed quantized matmul (rows grouped by expert)",
-            ));
+            return Err(MetalKernelError::UnsupportedDTypeForOp(Box::new(
+                UnsupportedDTypeForOp {
+                    dtype: "no kernel_mul_mm_id_mapped arm for this weight dtype",
+                    op: "routed quantized matmul (rows grouped by expert)",
+                },
+            )));
         }
         k.stem
     };
     if in_dim1 != 1 && in_dim1 != topk {
-        return Err(MetalKernelError::UnsupportedDTypeForOp(
-            "routed matmul activation dim1 must be 1 or topk",
-            "routed quantized matmul (rows grouped by expert)",
-        ));
+        return Err(MetalKernelError::UnsupportedDTypeForOp(Box::new(
+            UnsupportedDTypeForOp {
+                dtype: "routed matmul activation dim1 must be 1 or topk",
+                op: "routed quantized matmul (rows grouped by expert)",
+            },
+        )));
     }
     let name = if bn == 16 {
         format!("kernel_mul_mm_id_mapped16_{stem}_f32")
@@ -1375,18 +1398,22 @@ pub unsafe fn call_quantized_dequant_rows_f16(
     let stem = {
         let kind = dtype.kind();
         if !kind.dequant_rows_f16 {
-            return Err(MetalKernelError::UnsupportedDTypeForOp(
-                "no kernel_dequant_rows_f16 arm for this weight dtype",
-                "dequantise rows to f16",
-            ));
+            return Err(MetalKernelError::UnsupportedDTypeForOp(Box::new(
+                UnsupportedDTypeForOp {
+                    dtype: "no kernel_dequant_rows_f16 arm for this weight dtype",
+                    op: "dequantise rows to f16",
+                },
+            )));
         }
         kind.stem
     };
     if !k.is_multiple_of(16) {
-        return Err(MetalKernelError::UnsupportedDTypeForOp(
-            "k must be a multiple of 16",
-            "dequantise rows to f16",
-        ));
+        return Err(MetalKernelError::UnsupportedDTypeForOp(Box::new(
+            UnsupportedDTypeForOp {
+                dtype: "k must be a multiple of 16",
+                op: "dequantise rows to f16",
+            },
+        )));
     }
     let name = format!("kernel_dequant_rows_f16_{stem}");
     let row_bytes = (k / dtype_block_size(dtype)) * dtype_type_size(dtype);
@@ -1484,13 +1511,12 @@ pub unsafe fn call_quantized_matmul_mm_t(
         height: 1,
         depth: 1,
     };
-    let name = dtype
-        .kind()
-        .mul_mm
-        .ok_or(MetalKernelError::UnsupportedDTypeForOp(
-            "no kernel_mul_mm arm for this weight dtype (Q8_1, Q8_K)",
-            "qmatmul",
-        ))?;
+    let name = dtype.kind().mul_mm.ok_or_else(|| {
+        MetalKernelError::UnsupportedDTypeForOp(Box::new(UnsupportedDTypeForOp {
+            dtype: "no kernel_mul_mm arm for this weight dtype (Q8_1, Q8_K)",
+            op: "qmatmul",
+        }))
+    })?;
 
     let pipeline = kernels.load_pipeline(device, Source::Quantized, name)?;
     let encoder = ep.encoder();
@@ -1549,13 +1575,12 @@ pub unsafe fn call_quantized_get_rows(
     dst: &Buffer,
 ) -> Result<(), MetalKernelError> {
     let dst_row_stride = hidden_size * core::mem::size_of::<f32>();
-    let name = dtype
-        .kind()
-        .get_rows
-        .ok_or(MetalKernelError::UnsupportedDTypeForOp(
-            "no kernel_get_rows arm for this weight dtype (Q8_1, Q8_K)",
-            "get_rows",
-        ))?;
+    let name = dtype.kind().get_rows.ok_or_else(|| {
+        MetalKernelError::UnsupportedDTypeForOp(Box::new(UnsupportedDTypeForOp {
+            dtype: "no kernel_get_rows arm for this weight dtype (Q8_1, Q8_K)",
+            op: "get_rows",
+        }))
+    })?;
 
     let pipeline = kernels.load_pipeline(device, Source::Quantized, name)?;
     let encoder = ep.encoder();
@@ -1670,10 +1695,12 @@ pub unsafe fn call_quantized_matmul_mv_id2_t(
 ) -> Result<(), MetalKernelError> {
     triple.check(device, "routed quantized matmul-vec pair")?;
     if triple != GemvTriple::F32F32F32 && !dtype.has_gemv_triple() {
-        return Err(MetalKernelError::UnsupportedDTypeForOp(
-            "non-f32 GemvTriple",
-            "dense/Q8 routed quantized matmul-vec pair",
-        ));
+        return Err(MetalKernelError::UnsupportedDTypeForOp(Box::new(
+            UnsupportedDTypeForOp {
+                dtype: "non-f32 GemvTriple",
+                op: "dense/Q8 routed quantized matmul-vec pair",
+            },
+        )));
     }
     let stem = mv_id_stem(dtype)?;
     let name = routed_name(
@@ -1683,10 +1710,12 @@ pub unsafe fn call_quantized_matmul_mv_id2_t(
     );
     let (act_size, store_size) = triple_leg_bytes(triple);
     if in_dim1 != 1 && in_dim1 != topk {
-        return Err(MetalKernelError::UnsupportedDTypeForOp(
-            "routed matmul-vec activation dim1 must be 1 or topk",
-            "routed quantized matmul-vec pair",
-        ));
+        return Err(MetalKernelError::UnsupportedDTypeForOp(Box::new(
+            UnsupportedDTypeForOp {
+                dtype: "routed matmul-vec activation dim1 must be 1 or topk",
+                op: "routed quantized matmul-vec pair",
+            },
+        )));
     }
     let nei0 = topk as i64;
     let nei1 = batch as i64;

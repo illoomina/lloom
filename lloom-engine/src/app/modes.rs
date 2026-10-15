@@ -490,6 +490,7 @@ pub fn run<P: Lfm2Shape>(ctx: Ctx<'_, P>) -> Result<()> {
         stream_via_reader: false,
         host_feed_wait: None,
         eos_park: None,
+        eos_watch: None,
         adaptive_commit: false,
         run_ahead: 0,
         stop: None,

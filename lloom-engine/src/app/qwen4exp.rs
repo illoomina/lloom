@@ -1139,14 +1139,16 @@ impl<P: QwenShape, R: ExpertResidency + HasStreamStats + Send + Sync + 'static> 
                     if cancel.load(Ordering::Acquire) {
                         continue;
                     }
-                    if let Some(chunk) = stream.push(&ids, &mut detok)? {
+                    let (chunk, stopped) =
+                        stream.publish(&ids, &mut detok, &params.stop_strings)?;
+                    if let Some(chunk) = chunk {
                         if !on_fragment(&chunk) {
                             cancelled = true;
                             cancel.store(true, Ordering::Release);
                             continue;
                         }
                     }
-                    if stream.hit_stop(&params.stop_strings) {
+                    if stopped {
                         stopped_on_string = true;
                         cancel.store(true, Ordering::Release);
                     }
@@ -1165,6 +1167,11 @@ impl<P: QwenShape, R: ExpertResidency + HasStreamStats + Send + Sync + 'static> 
         } else {
             Stop::Length
         };
+        if stop != Stop::Cancelled && !stopped_on_string {
+            if let Some(rest) = stream.held() {
+                on_fragment(&rest);
+            }
+        }
         let (text, _) = stream.finish(&params.stop_strings);
         Ok(Decoded {
             text,
@@ -1174,11 +1181,13 @@ impl<P: QwenShape, R: ExpertResidency + HasStreamStats + Send + Sync + 'static> 
             reuse: done.reuse,
             reused: done.reused,
             prefilled: done.prefilled,
+            turn: done.turn,
             readback: ReadbackArm::Batched {
                 rows: done.joined_beside,
             },
             stats: done.stats,
             thinking: None,
+            logprobs: None,
         })
     }
 
@@ -1313,6 +1322,9 @@ impl<P: QwenShape, R: ExpertResidency + HasStreamStats + Send + Sync + 'static> 
     fn readback(&self) -> ReadbackArm {
         self.readback
     }
+    fn reuse_prefix(&self) -> Option<bool> {
+        Some(self.reuse_prefix)
+    }
     fn prefill_tile(&self) -> usize {
         self.prefill_tile
     }
@@ -1406,8 +1418,22 @@ impl<P: QwenShape, R: ExpertResidency + HasStreamStats + Send + Sync + 'static> 
     fn template_renders(&self) -> u64 {
         self.text.template.as_ref().map_or(0, |t| t.renders())
     }
+    fn text(&self) -> Option<&super::common::Text> {
+        Some(&self.text)
+    }
     fn thinking_budget_refused(&self) -> Option<&'static str> {
         self.sched.is_some().then_some(super::budgets::BATCHED)
+    }
+    fn decode_body(&self) -> lloom::nn::Body {
+        if self.sched.is_some() {
+            lloom::nn::Body::BatchedStep
+        } else if self.mtp || self.dflash.is_some() {
+            lloom::nn::Body::Window
+        } else {
+            lloom::nn::Body::Step {
+                ring: matches!(self.readback, ReadbackArm::Ring(_)),
+            }
+        }
     }
     fn seed_prompt_row(&self, n: usize, row: usize) -> Vec<u32> {
         let seed = &self.text.seed_tokens;
@@ -1426,7 +1452,7 @@ impl<P: QwenShape, R: ExpertResidency + HasStreamStats + Send + Sync + 'static> 
         let reuse = self.reuse_prefix;
         let detok = self.detok();
         self.with_single(|s| {
-            if !reuse {
+            if !reuse || params.cold {
                 s.reset();
             }
             if let Some(d) = &self.dflash {

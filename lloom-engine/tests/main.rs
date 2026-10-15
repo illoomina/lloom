@@ -16,8 +16,10 @@
 mod load_warnings;
 mod machine_gate;
 mod qwen4exp_served_auto;
+mod recovery_frontier_served;
 mod tiny_chat_e2e;
 mod tiny_templates;
+mod turn_reuse;
 
 /// Every `tests/*.rs` beside this file is declared above (or is one of the
 /// files that owns its binary), read from the directory at test time.

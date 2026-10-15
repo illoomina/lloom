@@ -426,6 +426,7 @@ where
                 processors: false,
                 budget: false,
                 digest: false,
+                logprobs: None,
             },
         )
         .map_err(|e| lloom_tensor::Error::Msg(format!("decode_spec_batched: {e}")))?;

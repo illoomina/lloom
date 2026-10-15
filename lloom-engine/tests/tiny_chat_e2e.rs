@@ -231,9 +231,11 @@ fn three_turns(
 }
 
 /// The reuse of three turns against their `--no-reuse` run, on `model`
-/// with `arms`: turns 2 and 3 reuse what the template keeps — `Rewound`
-/// to the previous turn's checkpoint when its render drops a tail, else
-/// `Extend` — and every turn's tokens are the fresh run's.
+/// with `arms`: turns 2 and 3 reuse what the template keeps — `Extend` when
+/// the previous turn's prompt and reply are all in the next prompt (the
+/// reply's sampled ids), else `Rewound` to no earlier than the previous
+/// turn's checkpoint, which stands where the next render diverges — and
+/// every turn's tokens are the fresh run's.
 fn assert_three_turns_reuse(model: &Path, tok: &str, arms: Vec<Vec<&str>>) {
     for arm in arms {
         let (reused, stderr) = three_turns(model, tok, &arm);
@@ -251,17 +253,17 @@ fn assert_three_turns_reuse(model: &Path, tok: &str, arms: Vec<Vec<&str>>) {
             let reply: usize = reused[t - 1]["completion_tokens"].parse().unwrap();
             let kept: usize = reused[t]["reused"].parse().unwrap();
             let prefilled: usize = reused[t]["prefilled"].parse().unwrap();
-            // The previous prompt up to its generation prompt (the
-            // load-time constant the checkpoint is placed at,
-            // `thinking::checkpoint_tail`), the reply dropped with the
-            // generation prompt's tokens; a template that drops nothing
-            // extends the log.
-            let ok = if kept > prev {
-                reused[t]["reuse"] == "Extend" && kept >= prev + reply
+            // The session log is the previous prompt and its reply. All of
+            // it in the next prompt extends; else the cache goes back to
+            // where they part, never before the previous turn's checkpoint
+            // (`gen_prompt` ids before its prompt's end, the load-time
+            // constant: where the next render diverges).
+            let log = prev + reply;
+            let gen: usize = reused[t - 1]["gen_prompt"].parse().unwrap();
+            let ok = if kept >= log {
+                reused[t]["reuse"] == "Extend"
             } else {
-                let tail = prev - kept;
-                let gen: usize = reused[t - 1]["gen_prompt"].parse().unwrap();
-                reused[t]["reuse"] == format!("Rewound({})", reply + tail) && tail == gen && gen > 0
+                reused[t]["reuse"] == format!("Rewound({})", log - kept) && kept + gen >= prev
             };
             assert!(
                 ok,
@@ -927,7 +929,8 @@ fn serve_scores_decision_options_from_one_forward() {
 }
 
 /// A `lloom serve` chat request's generated ids and `timings`.
-fn served_ids(server: &Server, fields: Value) -> (Vec<u32>, Value) {
+fn served_ids(server: &Server, mut fields: Value) -> (Vec<u32>, Value) {
+    fields["return_token_ids"] = json!(true);
     let (status, body) = server.chat(fields);
     assert_eq!(status, 200, "{body}");
     let ids = body["timings"]["tokens"]
@@ -1107,10 +1110,11 @@ fn thinking_budget_is_ignored_or_refused_where_no_block_is_open() {
     let args: Vec<&str> = base.iter().map(String::as_str).collect();
     let server = Server::start(&model, &args);
     let off = json!({ "enable_thinking": false });
-    let (status, plain) = server.chat(json!({ "chat_template_kwargs": off }));
+    let (status, plain) =
+        server.chat(json!({ "chat_template_kwargs": off, "return_token_ids": true }));
     assert_eq!(status, 200, "{plain}");
-    let (status, with) =
-        server.chat(json!({ "chat_template_kwargs": off, "thinking_token_budget": 2 }));
+    let (status, with) = server.chat(json!({ "chat_template_kwargs": off,
+        "thinking_token_budget": 2, "return_token_ids": true }));
     assert_eq!(status, 200, "{with}");
     assert_eq!(with["timings"]["tokens"], plain["timings"]["tokens"]);
     assert_eq!(with["timings"]["thinking_budget"], 2);
@@ -1129,10 +1133,11 @@ fn thinking_budget_is_ignored_or_refused_where_no_block_is_open() {
     batched.extend(["--batch", "2"]);
     let server = Server::start(&model, &batched);
     let on = json!({ "enable_thinking": true });
-    let (status, plain) = server.chat(json!({ "chat_template_kwargs": on }));
+    let (status, plain) =
+        server.chat(json!({ "chat_template_kwargs": on, "return_token_ids": true }));
     assert_eq!(status, 200, "{plain}");
-    let (status, with) =
-        server.chat(json!({ "chat_template_kwargs": on, "thinking_token_budget": 0 }));
+    let (status, with) = server.chat(json!({ "chat_template_kwargs": on,
+        "thinking_token_budget": 0, "return_token_ids": true }));
     assert_eq!(status, 200, "{with}");
     assert_eq!(with["timings"]["tokens"], plain["timings"]["tokens"]);
     assert!(
@@ -1348,7 +1353,8 @@ fn prompt_budget_drops_whole_turns_and_the_cache_follows() {
     let (status, cut) = a.call(
         "POST",
         "/v1/chat/completions",
-        &json!({ "messages": conv, "max_tokens": 4, "truncate_prompt_tokens": 60 }),
+        &json!({ "messages": conv, "max_tokens": 4, "truncate_prompt_tokens": 60,
+                 "return_token_ids": true }),
     );
     assert_eq!(status, 200, "{cut}");
     let bos = tok.id("<|startoftext|>").unwrap();
@@ -1380,7 +1386,7 @@ fn prompt_budget_drops_whole_turns_and_the_cache_follows() {
     let (status, alone) = b.call(
         "POST",
         "/v1/chat/completions",
-        &json!({ "messages": kept, "max_tokens": 4 }),
+        &json!({ "messages": kept, "max_tokens": 4, "return_token_ids": true }),
     );
     assert_eq!(status, 200, "{alone}");
     assert_eq!(alone["timings"]["prompt_ids_sha256"], sha(&want));
@@ -2083,4 +2089,785 @@ fn lfm2_tiny_serve_queues_concurrent_requests_and_answers_each_as_alone() {
 /// reference, asked for by name. Every child the test spawns inherits it.
 fn reference_attention() {
     std::env::set_var("QWEN4EXP_REFERENCE_ATTENTION", "1");
+}
+
+/// The process's front-end counters (`/health`): template renders and
+/// tokenization passes so far.
+fn passes(server: &Server) -> (u64, u64) {
+    let (status, h) = server.call("GET", "/health", &json!({}));
+    assert_eq!(status, 200, "{h}");
+    (
+        h["template_renders"].as_u64().unwrap(),
+        h["tokenizations"].as_u64().unwrap(),
+    )
+}
+
+/// The request front end through `lloom serve`, on the tiny Qwen4-exp with
+/// thinking off (its template keeps the generation prompt in the history):
+/// each chat request renders the template once and tokenizes the result
+/// once, whatever its history; the second turn carries the first reply's
+/// sampled ids, so the session extends — it reuses the first prompt and the
+/// whole reply.
+#[test]
+fn serve_renders_once_and_the_next_turn_extends_the_sampled_reply() {
+    let (dir, model, base) = qwen_tiny("front-once");
+    let mut args: Vec<&str> = base.iter().map(String::as_str).collect();
+    args.extend(["--prefix-reuse", "true"]);
+    let server = Server::start(&model, &args);
+    // `a` every step: a reply the template renders back verbatim.
+    let common = json!({ "enable_thinking": false, "temperature": 0, "max_tokens": 6,
+                         "logit_bias": { "97": 100 } });
+    let with = |messages: Value| {
+        let mut r = common.clone();
+        r["messages"] = messages;
+        r
+    };
+    let before = passes(&server);
+    let (status, one) = server.chat(with(json!([{ "role": "user", "content": PROMPT }])));
+    assert_eq!(status, 200, "{one}");
+    let after = passes(&server);
+    assert_eq!(
+        (after.0 - before.0, after.1 - before.1),
+        (1, 1),
+        "turn 1: {one}"
+    );
+    let reply = one["choices"][0]["message"]["content"].as_str().unwrap();
+    assert_eq!(reply, "aaaaaa", "the bias holds");
+    let p1 = one["usage"]["prompt_tokens"].as_u64().unwrap();
+    let r1 = one["usage"]["completion_tokens"].as_u64().unwrap();
+
+    let before = passes(&server);
+    let (status, two) = server.chat(with(json!([
+        { "role": "user", "content": PROMPT },
+        { "role": "assistant", "content": reply },
+        { "role": "user", "content": "And Italy?" },
+    ])));
+    assert_eq!(status, 200, "{two}");
+    let after = passes(&server);
+    assert_eq!(
+        (after.0 - before.0, after.1 - before.1),
+        (1, 1),
+        "turn 2: {two}"
+    );
+    let t = &two["timings"];
+    assert_eq!(t["renders"], 1, "{t}");
+    assert_eq!(t["history_matched"], 1, "{t}");
+    assert_eq!(t["history_spliced_tokens"], r1, "{t}");
+    assert_eq!(t["reuse"], "Extend", "{t}");
+    assert_eq!(
+        t["reused"],
+        p1 + r1,
+        "the first prompt and the whole reply: {t}"
+    );
+    drop(server);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A reply of ours is the logged one only in the conversation it answered,
+/// through `lloom serve`, streamed or not: two conversations get the same
+/// text back (the bias), and each continuation matches its own reply; a
+/// history that never got that text from us carries it unverified and
+/// renders as sent.
+#[test]
+fn serve_takes_a_logged_reply_only_in_the_conversation_it_answered() {
+    let (dir, model, base) = qwen_tiny("front-scope");
+    let mut args: Vec<&str> = base.iter().map(String::as_str).collect();
+    args.extend(["--prefix-reuse", "true"]);
+    let server = Server::start(&model, &args);
+    let common = json!({ "enable_thinking": false, "temperature": 0, "max_tokens": 6,
+                         "logit_bias": { "97": 100 } });
+    let with = |messages: Value, stream: bool| {
+        let mut r = common.clone();
+        r["messages"] = messages;
+        r["stream"] = json!(stream);
+        r
+    };
+    let mut replies = Vec::new();
+    for (question, stream) in [(PROMPT, false), ("And the other one?", true)] {
+        let body = with(json!([{ "role": "user", "content": question }]), stream);
+        if stream {
+            let events = sse(&server, &body);
+            let text: String = events
+                .iter()
+                .filter_map(|e| e["choices"][0]["delta"]["content"].as_str())
+                .collect();
+            replies.push((question, text));
+        } else {
+            let (status, one) = server.call("POST", "/v1/chat/completions", &body);
+            assert_eq!(status, 200, "{one}");
+            let text = one["choices"][0]["message"]["content"].as_str().unwrap();
+            replies.push((question, text.to_string()));
+        }
+    }
+    assert_eq!(replies[0].1, "aaaaaa", "the bias holds");
+    assert_eq!(replies[0].1, replies[1].1, "one text, two conversations");
+    for (question, reply) in &replies {
+        let (status, two) = server.call(
+            "POST",
+            "/v1/chat/completions",
+            &with(
+                json!([
+                    { "role": "user", "content": question },
+                    { "role": "assistant", "content": reply },
+                    { "role": "user", "content": "Again?" },
+                ]),
+                false,
+            ),
+        );
+        assert_eq!(status, 200, "{two}");
+        let t = &two["timings"];
+        assert_eq!(
+            (&t["history_matched"], &t["history_unverified"]),
+            (&json!(1), &json!(0)),
+            "{question}: {t}"
+        );
+    }
+    let (status, foreign) = server.call(
+        "POST",
+        "/v1/chat/completions",
+        &with(
+            json!([
+                { "role": "user", "content": "Never asked." },
+                { "role": "assistant", "content": replies[0].1 },
+                { "role": "user", "content": "Again?" },
+            ]),
+            false,
+        ),
+    );
+    assert_eq!(status, 200, "{foreign}");
+    let t = &foreign["timings"];
+    assert_eq!(
+        (
+            &t["history_matched"],
+            &t["history_unverified"],
+            &t["history_spliced_tokens"]
+        ),
+        (&json!(0), &json!(1), &json!(0)),
+        "{t}"
+    );
+    drop(server);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The external contract (decision 33, #1008): a response is text unless
+/// the request asks for ids (`return_token_ids`) or logprobs (`logprobs`,
+/// bounded at `MAX_TOP_LOGPROBS` candidates). The ids returned are the
+/// session's own: the next turn's prompt carries them where the reply sits.
+/// `/health` says whether logprobs are served, and counts every turn's
+/// reuse by outcome; a batched server refuses per-token logprobs by name.
+#[test]
+fn serve_returns_text_unless_ids_or_logprobs_are_asked() {
+    let (dir, model, base) = qwen_tiny("external-contract");
+    let mut args: Vec<&str> = base.iter().map(String::as_str).collect();
+    args.extend(["--prefix-reuse", "true"]);
+    let server = Server::start(&model, &args);
+    let common = json!({ "enable_thinking": false, "temperature": 0, "max_tokens": 6,
+                         "logit_bias": { "97": 100 } });
+    let with = |messages: Value, extra: Value| {
+        let mut r = common.clone();
+        r["messages"] = messages;
+        for (k, v) in extra.as_object().unwrap() {
+            r[k] = v.clone();
+        }
+        r
+    };
+    let first = json!([{ "role": "user", "content": PROMPT }]);
+    let (status, plain) = server.call(
+        "POST",
+        "/v1/chat/completions",
+        &with(first.clone(), json!({})),
+    );
+    assert_eq!(status, 200, "{plain}");
+    let choice = &plain["choices"][0];
+    assert!(choice["message"]["content"].is_string(), "{plain}");
+    for absent in [
+        &plain["prompt_token_ids"],
+        &plain["prompt_sampled_logprobs"],
+        &choice["token_ids"],
+        &choice["token_logprobs"],
+        &choice["logprobs"],
+        &plain["timings"]["tokens"],
+    ] {
+        assert!(absent.is_null(), "text only, by default: {plain}");
+    }
+
+    let (status, one) = server.call(
+        "POST",
+        "/v1/chat/completions",
+        &with(first, json!({ "return_token_ids": true })),
+    );
+    assert_eq!(status, 200, "{one}");
+    let ids = one["choices"][0]["token_ids"].as_array().unwrap().clone();
+    assert_eq!(one["timings"]["tokens"], json!(ids));
+    assert!(
+        one["choices"][0]["token_logprobs"].is_null(),
+        "logprobs not asked: {one}"
+    );
+    let p1 = one["prompt_token_ids"].as_array().unwrap().len();
+    let reply = one["choices"][0]["message"]["content"].as_str().unwrap();
+    let (status, two) = server.call(
+        "POST",
+        "/v1/chat/completions",
+        &with(
+            json!([
+                { "role": "user", "content": PROMPT },
+                { "role": "assistant", "content": reply },
+                { "role": "user", "content": "Again?" },
+            ]),
+            json!({ "return_token_ids": true }),
+        ),
+    );
+    assert_eq!(status, 200, "{two}");
+    let prompt2 = two["prompt_token_ids"].as_array().unwrap();
+    assert_eq!(
+        &prompt2[p1..p1 + ids.len()],
+        &ids[..],
+        "the session's ids: {two}"
+    );
+    let t = &two["timings"]["turn"];
+    assert_eq!(t["reuse_policy"], "on", "{t}");
+    assert_eq!(t["outcome"], "extend", "{t}");
+    assert_eq!(t["boundary"], json!(p1 + ids.len()), "{t}");
+    assert_eq!(t["reused"], t["boundary"], "{t}");
+
+    let (status, lp) = server.call(
+        "POST",
+        "/v1/chat/completions",
+        &with(
+            json!([{ "role": "user", "content": "Other?" }]),
+            json!({ "logprobs": true, "top_logprobs": 3 }),
+        ),
+    );
+    assert_eq!(status, 200, "{lp}");
+    let content = lp["choices"][0]["logprobs"]["content"].as_array().unwrap();
+    assert_eq!(
+        content.len(),
+        lp["usage"]["completion_tokens"].as_u64().unwrap() as usize
+    );
+    for c in content {
+        assert_eq!(c["top_logprobs"].as_array().unwrap().len(), 3, "{c}");
+    }
+    assert!(
+        lp["choices"][0]["token_ids"].is_null(),
+        "ids not asked: {lp}"
+    );
+    for (extra, says) in [
+        (
+            json!({ "logprobs": true, "top_logprobs": 65 }),
+            "from 0 to 64",
+        ),
+        (json!({ "top_logprobs": 2 }), "set logprobs to true"),
+    ] {
+        let (status, err) = server.call(
+            "POST",
+            "/v1/chat/completions",
+            &with(json!([{ "role": "user", "content": "Other?" }]), extra),
+        );
+        assert_eq!(status, 400, "{err}");
+        assert!(
+            err["error"]["message"].as_str().unwrap().contains(says),
+            "{err}"
+        );
+    }
+
+    let (status, h) = server.call("GET", "/health", &json!({}));
+    assert_eq!(status, 200, "{h}");
+    assert_eq!(h["logprobs"]["served"], true, "{h}");
+    assert_eq!(h["logprobs"]["top_max"], 64, "{h}");
+    let reuse = &h["reuse"];
+    assert_eq!(reuse["reuse_policy"], "on", "{reuse}");
+    assert_eq!(reuse["turns"], 4, "four generating requests: {reuse}");
+    assert_eq!(reuse["outcome"]["extend"], 1, "{reuse}");
+    let counted: u64 = reuse["outcome"]
+        .as_object()
+        .unwrap()
+        .values()
+        .map(|n| n.as_u64().unwrap())
+        .sum();
+    assert_eq!(counted, 4, "{reuse}");
+    assert_eq!(
+        reuse["last"], lp["timings"]["turn"],
+        "the last turn's own report"
+    );
+    drop(server);
+
+    // Reuse off (serve's default): every turn cold by policy.
+    let server = Server::start(&model, &base.iter().map(String::as_str).collect::<Vec<_>>());
+    let (status, cold) = server.call(
+        "POST",
+        "/v1/chat/completions",
+        &with(json!([{ "role": "user", "content": PROMPT }]), json!({})),
+    );
+    assert_eq!(status, 200, "{cold}");
+    let t = &cold["timings"]["turn"];
+    assert_eq!(
+        (&t["reuse_policy"], &t["reason"]),
+        (&json!("off"), &json!("policy-off")),
+        "{t}"
+    );
+    drop(server);
+
+    // A batched server refuses per-token logprobs by name, and says so.
+    let mut batched: Vec<&str> = base.iter().map(String::as_str).collect();
+    batched.extend(["--batch", "2"]);
+    let server = Server::start(&model, &batched);
+    let (status, h) = server.call("GET", "/health", &json!({}));
+    assert_eq!(status, 200, "{h}");
+    assert_eq!(h["logprobs"]["served"], false, "{h}");
+    let why = h["logprobs"]["refused"].as_str().unwrap().to_string();
+    assert!(why.contains("the batch scheduler"), "{why}");
+    let (status, err) = server.call(
+        "POST",
+        "/v1/chat/completions",
+        &with(
+            json!([{ "role": "user", "content": PROMPT }]),
+            json!({ "logprobs": true }),
+        ),
+    );
+    assert_eq!(status, 400, "{err}");
+    assert!(
+        err["error"]["message"].as_str().unwrap().contains(&why),
+        "{err}"
+    );
+    drop(server);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A stop string never reaches a streaming client: the streamed deltas,
+/// joined, are the unstreamed reply cut before the stop, and carry no part
+/// of it (`TextStream::publish` holds what may begin one).
+#[test]
+fn a_streamed_reply_never_carries_its_stop_string() {
+    let (dir, model, base) = qwen_tiny("stream-stop");
+    let server = Server::start(&model, &base.iter().map(String::as_str).collect::<Vec<_>>());
+    let req = |stop: Option<&str>, stream: bool| {
+        json!({ "messages": [{ "role": "user", "content": PROMPT }], "temperature": 0,
+                "max_tokens": 16, "ignore_eos": true, "enable_thinking": false,
+                "stop": stop, "stream": stream })
+    };
+    let (status, full) = server.call("POST", "/v1/chat/completions", &req(None, false));
+    assert_eq!(status, 200, "{full}");
+    let text = full["choices"][0]["message"]["content"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let chars: Vec<char> = text.chars().collect();
+    assert!(chars.len() >= 6, "a reply long enough to cut: {text:?}");
+    let stop: String = chars[3..5].iter().collect();
+    let cut = &text[..text.find(&stop).unwrap()];
+    let (status, unstreamed) =
+        server.call("POST", "/v1/chat/completions", &req(Some(&stop), false));
+    assert_eq!(status, 200, "{unstreamed}");
+    assert_eq!(
+        unstreamed["choices"][0]["message"]["content"], cut,
+        "{unstreamed}"
+    );
+    let events = sse(&server, &req(Some(&stop), true));
+    let streamed: String = events
+        .iter()
+        .filter_map(|e| e["choices"][0]["delta"]["content"].as_str())
+        .collect();
+    assert_eq!(streamed, cut, "stop {stop:?} in {text:?}");
+    assert!(!streamed.contains(&stop));
+    let last = events.last().unwrap();
+    assert_eq!(last["choices"][0]["finish_reason"], "stop", "{last}");
+    drop(server);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A streamed reply that ends (on the length) on what could begin a stop
+/// string, though the stop never completes, still reaches the client whole:
+/// the run's end hands out what was held.
+#[test]
+fn a_streamed_reply_ending_on_a_stops_beginning_ends_whole() {
+    let (dir, model, base) = qwen_tiny("stream-held");
+    let server = Server::start(&model, &base.iter().map(String::as_str).collect::<Vec<_>>());
+    let req = |stop: Option<&str>, stream: bool| {
+        json!({ "messages": [{ "role": "user", "content": PROMPT }], "temperature": 0,
+                "max_tokens": 12, "ignore_eos": true, "enable_thinking": false,
+                "stop": stop, "stream": stream })
+    };
+    let (status, full) = server.call("POST", "/v1/chat/completions", &req(None, false));
+    assert_eq!(status, 200, "{full}");
+    let text = full["choices"][0]["message"]["content"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let last = text.chars().last().expect("a reply");
+    // Its last character, then one the reply never writes: a stop that
+    // begins at the reply's end and never completes.
+    let stop = format!("{last}\u{7}");
+    assert!(!text.contains(&stop));
+    let events = sse(&server, &req(Some(&stop), true));
+    let streamed: String = events
+        .iter()
+        .filter_map(|e| e["choices"][0]["delta"]["content"].as_str())
+        .collect();
+    assert_eq!(
+        streamed, text,
+        "the held {last:?} was handed out at the run's end"
+    );
+    drop(server);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A streamed request whose client goes away publishes nothing into the
+/// next request: the next reply is a fresh server's, id for id.
+#[test]
+fn a_cancelled_stream_leaves_nothing_in_the_next_reply() {
+    let (dir, model, base) = qwen_tiny("stream-cancel");
+    let args: Vec<&str> = base.iter().map(String::as_str).collect();
+    let next = json!({ "messages": [{ "role": "user", "content": "Something else?" }],
+                       "temperature": 0, "max_tokens": 8, "enable_thinking": false,
+                       "return_token_ids": true });
+    let reference = {
+        let fresh = Server::start(&model, &args);
+        let (status, r) = fresh.call("POST", "/v1/chat/completions", &next);
+        assert_eq!(status, 200, "{r}");
+        r
+    };
+    let server = Server::start(&model, &args);
+    {
+        let mut s = std::net::TcpStream::connect(("127.0.0.1", server.port)).unwrap();
+        let body = json!({ "messages": [{ "role": "user", "content": PROMPT }], "temperature": 0,
+                           "max_tokens": 4000, "ignore_eos": true, "stream": true,
+                           "enable_thinking": false })
+        .to_string();
+        write!(
+            s,
+            "POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .unwrap();
+        let mut first = [0u8; 256];
+        let n = s.read(&mut first).unwrap();
+        assert!(n > 0);
+        // Gone, mid-stream.
+    }
+    let (status, after) = server.call("POST", "/v1/chat/completions", &next);
+    assert_eq!(status, 200, "{after}");
+    assert_eq!(
+        after["choices"][0]["token_ids"], reference["choices"][0]["token_ids"],
+        "{after}"
+    );
+    assert_eq!(
+        after["choices"][0]["message"]["content"],
+        reference["choices"][0]["message"]["content"]
+    );
+    drop(server);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The same session continued after each way a reply stops, through the
+/// front end (`--prefix-reuse true`): the history carries the text the
+/// client got, and the turn report says what the session did with it.
+/// A length stop extends. A stop string leaves in the log every id the
+/// loop produced (the stop's included), so the next turn leaves the log
+/// where the delivered text ends and goes back to there (the window or a
+/// turn checkpoint) — what decision 42 prices.
+#[test]
+fn the_next_turn_continues_what_each_stop_left() {
+    let (dir, model, base) = qwen_tiny("stop-causes");
+    let mut args: Vec<&str> = base.iter().map(String::as_str).collect();
+    args.extend(["--prefix-reuse", "true"]);
+    let server = Server::start(&model, &args);
+    let turn = |messages: Value, extra: Value| {
+        // Letters only (the tiny model's own replies are lone bytes no
+        // whole-character cut can end on): `a`, `b` and `c` biased alike,
+        // the model's logits choosing among them.
+        let mut r = json!({ "messages": messages, "temperature": 0, "enable_thinking": false,
+                            "return_token_ids": true, "ignore_eos": true,
+                            "logit_bias": { "97": 100, "98": 100, "99": 100 } });
+        for (k, v) in extra.as_object().unwrap() {
+            r[k] = v.clone();
+        }
+        let (status, body) = server.call("POST", "/v1/chat/completions", &r);
+        assert_eq!(status, 200, "{body}");
+        body
+    };
+    let probe = turn(
+        json!([{ "role": "user", "content": "Probe." }]),
+        json!({ "max_tokens": 16 }),
+    );
+    let text = probe["choices"][0]["message"]["content"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    // A stop that first occurs a few letters in, so the delivered text is
+    // not empty.
+    let stop = (2..=6)
+        .flat_map(|w| (3..text.len().saturating_sub(w)).map(move |i| (i, w)))
+        .map(|(i, w)| (i, text[i..i + w].to_string()))
+        .find(|(i, s)| text.find(s.as_str()) == Some(*i))
+        .map(|(_, s)| s)
+        .unwrap_or_else(|| panic!("no stop first occurring past the third letter: {text:?}"));
+    for (cause, extra) in [
+        ("length", json!({ "max_tokens": 6 })),
+        ("stop", json!({ "max_tokens": 16, "stop": stop })),
+    ] {
+        let q = json!([{ "role": "user", "content": "Probe." }]);
+        let one = turn(q.clone(), extra);
+        let delivered = one["choices"][0]["message"]["content"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let p1 = one["prompt_token_ids"].as_array().unwrap().len();
+        let produced = one["choices"][0]["token_ids"].as_array().unwrap().len();
+        let two = turn(
+            json!([q[0], { "role": "assistant", "content": delivered },
+                   { "role": "user", "content": "Again." }]),
+            json!({ "max_tokens": 4 }),
+        );
+        let t = &two["timings"]["turn"];
+        eprintln!("STOP-CAUSE {cause}: delivered {delivered:?} produced {produced} turn {t}");
+        assert_eq!(
+            two["timings"]["history_matched"], 1,
+            "{cause}: the delivered reply is ours: {two}"
+        );
+        assert_eq!(
+            t["boundary"],
+            json!(p1 + produced),
+            "{cause}: the log is every id produced: {t}"
+        );
+        match cause {
+            "length" => assert_eq!(t["outcome"], "extend", "{t}"),
+            _ => {
+                assert!(
+                    matches!(t["outcome"].as_str(), Some("rewind" | "restore")),
+                    "{t}"
+                );
+                assert_eq!(t["reason"], "diverged", "{t}");
+                let at = t["diverged_at"].as_u64().unwrap() as usize;
+                assert!(at >= p1 && at < p1 + produced, "inside the reply: {t}");
+            }
+        }
+    }
+    drop(server);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A shutdown asked for while a request decodes: the process exits cleanly
+/// once the request's thread is done with the model, and the streaming
+/// client gets a complete reply or a cut connection, never a panic.
+#[test]
+fn shutdown_waits_for_the_request_that_holds_the_model() {
+    let (dir, model, base) = qwen_tiny("shutdown-busy");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_lloom"))
+        .args(["serve", "--model"])
+        .arg(&model)
+        .args(&base)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("lloom serve runs");
+    let mut line = String::new();
+    std::io::BufReader::new(child.stdout.take().unwrap())
+        .read_line(&mut line)
+        .unwrap();
+    let ready: Value = serde_json::from_str(&line).unwrap();
+    let port = ready["port"].as_u64().unwrap() as u16;
+    let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+    let body = json!({ "messages": [{ "role": "user", "content": PROMPT }], "temperature": 0,
+                       "max_tokens": 3000, "ignore_eos": true, "stream": true,
+                       "enable_thinking": false })
+    .to_string();
+    write!(
+        s,
+        "POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n\
+         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )
+    .unwrap();
+    let mut first = [0u8; 256];
+    assert!(s.read(&mut first).unwrap() > 0, "the stream started");
+    let mut c = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+    write!(
+        c,
+        "POST /shutdown HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}"
+    )
+    .unwrap();
+    let mut rest = Vec::new();
+    let _ = s.read_to_end(&mut rest);
+    let out = child.wait_with_output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    assert!(!stderr.contains("panicked"), "{stderr}");
+    assert!(stderr.contains("[shutdown requested]"), "{stderr}");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A benchmark cell that measures a cold prefill stays cold under prefix
+/// reuse (decision 36: the historical cold cells stay cold whatever the
+/// default): the same cell twice, each a fresh session by the cell's own
+/// reset, while a chat turn between them would have been reused.
+#[test]
+fn a_cold_cell_stays_cold_with_reuse_on() {
+    let (dir, model, base) = qwen_tiny("cold-cell");
+    let mut args: Vec<&str> = base.iter().map(String::as_str).collect();
+    args.extend(["--prefix-reuse", "true"]);
+    let server = Server::start(&model, &args);
+    for i in 0..2 {
+        let (status, cell) = server.call(
+            "POST",
+            "/end_to_end_latency",
+            &json!({ "prompt": PROMPT, "decode_tokens": 4 }),
+        );
+        assert_eq!(status, 200, "{cell}");
+        let (status, h) = server.call("GET", "/health", &json!({}));
+        assert_eq!(status, 200, "{h}");
+        let last = &h["reuse"]["last"];
+        assert_eq!(
+            (&last["outcome"], &last["reason"], &last["reused"]),
+            (&json!("fresh"), &json!("cold"), &json!(0)),
+            "cell {i}: {last}"
+        );
+    }
+    drop(server);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The SSE events of a streamed chat request, `[DONE]` excluded.
+fn sse(server: &Server, body: &Value) -> Vec<Value> {
+    let mut s = std::net::TcpStream::connect(("127.0.0.1", server.port)).unwrap();
+    let body = body.to_string();
+    write!(
+        s,
+        "POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n\
+         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )
+    .unwrap();
+    let mut response = String::new();
+    s.read_to_string(&mut response).unwrap();
+    let (head, mut rest) = response.split_once("\r\n\r\n").unwrap();
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}\n{rest}");
+    let mut text = String::new();
+    while let Some((size, after)) = rest.split_once("\r\n") {
+        let n = usize::from_str_radix(size.trim(), 16).unwrap();
+        if n == 0 {
+            break;
+        }
+        text.push_str(&after[..n]);
+        rest = &after[n + 2..];
+    }
+    text.split("\n\n")
+        .filter_map(|e| e.strip_prefix("data: "))
+        .filter(|e| *e != "[DONE]")
+        .map(|e| serde_json::from_str(e).unwrap_or_else(|err| panic!("{e:?}: {err}")))
+        .collect()
+}
+
+/// The token-level API: ids in (`prompt_token_ids`, on both routes) are the
+/// ids the engine ran, and the ids out (`return_token_ids`) are the run's,
+/// with their log-probabilities (`logprobs`); greedy, each is its row's
+/// maximum. With `session.keep_logprobs = sampled`, the next turn's prompt
+/// carries the first reply's ids and the logprobs they were sampled at.
+#[test]
+fn the_token_api_runs_the_ids_sent_and_returns_the_ids_and_logprobs_run() {
+    let (dir, model, base) = qwen_tiny("token-api");
+    let mut args: Vec<&str> = base.iter().map(String::as_str).collect();
+    args.extend(["--keep-logprobs", "sampled"]);
+    let server = Server::start(&model, &args);
+    let tok = Qwen4ExpTiny::tokenizer();
+    let ids = encode(&tok, &qwen_not_thinking());
+    let (status, c) = server.call(
+        "POST",
+        "/v1/completions",
+        &json!({ "prompt_token_ids": ids, "max_tokens": 5, "temperature": 0,
+                 "logprobs": 2, "return_token_ids": true, "ignore_eos": true }),
+    );
+    assert_eq!(status, 200, "{c}");
+    assert_eq!(c["timings"]["prompt_ids_sha256"], sha(&ids), "{c}");
+    assert_eq!(c["prompt_token_ids"], json!(ids));
+    let out = &c["choices"][0];
+    assert_eq!(out["token_ids"], c["timings"]["tokens"]);
+    let n = out["token_ids"].as_array().unwrap().len();
+    assert_eq!(n, 5);
+    let lp = &out["logprobs"];
+    let sampled = lp["token_logprobs"].as_array().unwrap();
+    assert_eq!(sampled.len(), n);
+    for (i, top) in lp["top_ids"].as_array().unwrap().iter().enumerate() {
+        let top = top.as_array().unwrap();
+        assert_eq!(top.len(), 2, "{lp}");
+        let (first, second) = (top[0][1].as_f64().unwrap(), top[1][1].as_f64().unwrap());
+        assert!(first >= second, "most likely first: {lp}");
+        let s = sampled[i].as_f64().unwrap();
+        assert!(s <= 0.0, "{lp}");
+        assert_eq!(
+            top[0][0], out["token_ids"][i],
+            "greedy draws the row's maximum: {lp}"
+        );
+        assert!(
+            (s - first).abs() < 1e-6,
+            "position {i}: {s} vs {first}: {lp}"
+        );
+    }
+
+    let (status, chat) = server.call(
+        "POST",
+        "/v1/chat/completions",
+        &json!({ "prompt_token_ids": ids, "max_tokens": 3, "temperature": 0, "ignore_eos": true }),
+    );
+    assert_eq!(status, 200, "{chat}");
+    assert_eq!(chat["timings"]["prompt_ids_sha256"], sha(&ids));
+
+    let first = json!([{ "role": "user", "content": PROMPT }]);
+    // The session keeps logprobs, but a request that asks only for ids gets
+    // none of them (decision 33: each is asked for).
+    let (status, ids_only) = server.call(
+        "POST",
+        "/v1/chat/completions",
+        &json!({ "messages": [{ "role": "user", "content": "Just ids?" }],
+                 "enable_thinking": false, "temperature": 0, "max_tokens": 3,
+                 "return_token_ids": true }),
+    );
+    assert_eq!(status, 200, "{ids_only}");
+    assert!(ids_only["choices"][0]["token_ids"].is_array(), "{ids_only}");
+    assert!(
+        ids_only["choices"][0]["token_logprobs"].is_null(),
+        "{ids_only}"
+    );
+    assert!(ids_only["prompt_sampled_logprobs"].is_null(), "{ids_only}");
+    let req = |messages: Value| {
+        json!({ "messages": messages, "enable_thinking": false, "temperature": 0,
+                "max_tokens": 4, "logit_bias": { "98": 100 }, "return_token_ids": true,
+                "logprobs": true })
+    };
+    let (status, one) = server.call("POST", "/v1/chat/completions", &req(first));
+    assert_eq!(status, 200, "{one}");
+    let reply = one["choices"][0]["message"]["content"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let reply_ids = one["choices"][0]["token_ids"].as_array().unwrap().clone();
+    let reply_lp = one["choices"][0]["token_logprobs"]
+        .as_array()
+        .unwrap()
+        .clone();
+    assert_eq!(
+        reply_lp.len(),
+        reply_ids.len(),
+        "the session's capture: {one}"
+    );
+    let p1 = one["prompt_token_ids"].as_array().unwrap().len();
+    let (status, two) = server.call(
+        "POST",
+        "/v1/chat/completions",
+        &req(json!([
+            { "role": "user", "content": PROMPT },
+            { "role": "assistant", "content": reply },
+            { "role": "user", "content": "And Italy?" },
+        ])),
+    );
+    assert_eq!(status, 200, "{two}");
+    let ids2 = two["prompt_token_ids"].as_array().unwrap();
+    let lp2 = two["prompt_sampled_logprobs"].as_array().unwrap();
+    assert_eq!(lp2.len(), ids2.len());
+    let span = p1..p1 + reply_ids.len();
+    assert_eq!(&ids2[span.clone()], &reply_ids[..], "{two}");
+    assert_eq!(&lp2[span.clone()], &reply_lp[..], "{two}");
+    assert!(lp2[..p1].iter().all(Value::is_null));
+    drop(server);
+    std::fs::remove_dir_all(&dir).ok();
 }

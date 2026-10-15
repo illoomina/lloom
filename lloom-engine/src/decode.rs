@@ -19,7 +19,7 @@
 use lloom::generation::poll::PollMechanism;
 use lloom::generation::readback::RING_HISTORY_SLOTS;
 use lloom::generation::{
-    Blocking, EosRead, LogitsProcessor, Processors, ReadbackStrategy, Ring, Sampling,
+    Blocking, EosRead, LogitsProcessor, Logprobs, Processors, ReadbackStrategy, Ring, Sampling,
     ThinkingBudget, ThinkingReport,
 };
 use lloom::nn::{
@@ -263,6 +263,23 @@ pub struct DecodeParams {
     /// the next request, whose render keeps everything before it, is a
     /// restore there rather than a fresh prefill. 0: no hint.
     pub turn_tail: usize,
+    /// Keep each returned id's log-probability (`Decoded::logprobs`). A host
+    /// read of every step's logits: the run takes the blocking arm, as the
+    /// logits digest does, and the speculative body and the batch scheduler
+    /// refuse it. `None` costs nothing.
+    pub logprobs: Option<LogprobRequest>,
+    /// Start this run on an empty session whatever the owner's prefix reuse:
+    /// a benchmark cell that measures a cold prefill stays cold with reuse on.
+    pub cold: bool,
+}
+
+/// What a run keeps of each step's distribution: the drawn id's
+/// log-probability always, the `top` most likely, and with `rows` the whole
+/// row (a trainer's use, never the inference path's).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LogprobRequest {
+    pub top: usize,
+    pub rows: bool,
 }
 
 impl DecodeParams {
@@ -314,6 +331,7 @@ impl DecodeParams {
                 processors: self.processors.is_active(),
                 budget: self.thinking.is_some(),
                 digest: self.logits_digest,
+                logprobs: self.logprobs.map(|r| r.top),
             },
         )
         .map_err(|e| lloom_tensor::Error::Msg(format!("{path}: {e}")))
@@ -337,6 +355,8 @@ impl Default for DecodeParams {
             prefill_tile: 0,
             thinking: None,
             turn_tail: 0,
+            logprobs: None,
+            cold: false,
         }
     }
 }
@@ -355,6 +375,9 @@ pub struct Decoded {
     /// Prompt tokens actually prefilled — the request's length minus `reused`,
     /// except under [`ReuseAction::Resume`] where nothing is.
     pub prefilled: usize,
+    /// What the request reused of the session, and why not more
+    /// ([`crate::turn`]).
+    pub turn: crate::turn::TurnReuse,
     /// The readback arm that ran: resolved (never [`ReadbackArm::Auto`]), and
     /// on the fixed cadence wherever the adaptive commit did not run.
     pub readback: ReadbackArm,
@@ -367,6 +390,9 @@ pub struct Decoded {
     pub stats: DecodeStats,
     /// What the run did inside the thinking block, when a budget was armed.
     pub thinking: Option<ThinkingReport>,
+    /// Per returned id, its log-probability (and what else
+    /// `DecodeParams::logprobs` asked for).
+    pub logprobs: Option<Logprobs>,
 }
 
 /// A decode session: a borrowed target and the sequence it drives — the cache,
@@ -683,12 +709,12 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
         if params.eos_ids.is_empty() {
             lloom_tensor::bail!("DecodeSession::decode: eos_ids is empty; a run needs an EOS set");
         }
-        let prepared = self.session.prepare(prompt_ids)?;
+        let (prepared, turn) = crate::turn::prepare(&mut self.session, prompt_ids, true)?;
         self.hint_checkpoint(&prepared, params.turn_tail)?;
 
         let mut sampler = params.sampler();
         sampler.observe_prompt(prompt_ids);
-        let arm = if params.logits_digest {
+        let arm = if params.logits_digest || params.logprobs.is_some() {
             ReadbackArm::Blocking
         } else {
             params
@@ -705,25 +731,31 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
         let mut cancelled = false;
 
         // The streaming hook, shared by every arm: decode only the
-        // not-yet-emitted tokens, hold a run ending mid-character, and let a
-        // stop string end the run (`TextStream`).
+        // not-yet-emitted tokens, hold a run ending mid-character or on what
+        // may begin a stop string, and let a stop string end the run
+        // (`TextStream::publish`).
         let mut on_tokens = |batch: &[u32]| -> Result<bool> {
-            if let Some(chunk) = stream.push(batch, &mut detokenize)? {
+            let (chunk, stopped) = stream.publish(batch, &mut detokenize, &params.stop_strings)?;
+            if let Some(chunk) = chunk {
                 if !on_fragment(&chunk) {
                     cancelled = true;
                     return Ok(false);
                 }
             }
-            if stream.hit_stop(&params.stop_strings) {
+            if stopped {
                 stopped_on_string = true;
                 return Ok(false);
             }
             Ok(true)
         };
 
+        let mut logprobs: Option<Logprobs> = None;
         let (out, ran): (DecodeOut, ReadbackArm) = match arm {
             ReadbackArm::Blocking => {
                 let mut readback = Blocking::new(&params.eos_ids, &self.device)?;
+                if let Some(r) = params.logprobs {
+                    readback = readback.with_logprobs(r.top, r.rows);
+                }
                 readback.set_thinking_budget(params.thinking.as_ref())?;
                 let opts = self.config.options(
                     params.max_tokens,
@@ -738,6 +770,7 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
                     &opts,
                     &mut on_tokens,
                 )?;
+                logprobs = readback.take_logprobs();
                 (out, ReadbackArm::Blocking)
             }
             ReadbackArm::Ring(ring) => {
@@ -908,6 +941,13 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
         } else {
             Stop::Length
         };
+        // A run that ended short of the stop string hands out what was held
+        // as its possible beginning.
+        if !cancelled && !stopped_on_string {
+            if let Some(rest) = stream.held() {
+                on_fragment(&rest);
+            }
+        }
 
         let (text, _) = stream.finish(&params.stop_strings);
         let thinking = params.thinking.as_ref().map(|b| b.report(&out.ids));
@@ -919,10 +959,12 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
             reuse: prepared.action,
             reused: prepared.reused,
             prefilled: prepared.suffix.len(),
+            turn,
             readback: ran,
             logits_sha256: sampler.logits_digest(),
             stats: out.stats,
             thinking,
+            logprobs,
         })
     }
 }
@@ -971,6 +1013,10 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
         if params.eos_ids.is_empty() {
             lloom_tensor::bail!("DecodeSession::decode: eos_ids is empty; a run needs an EOS set");
         }
+        params.refuse_on(
+            lloom::nn::Body::Window,
+            "the speculative body (--dspark, --mtp)",
+        )?;
         // The window draws every row with the request's sampler, keyed by
         // the position of the token it draws: any sampler arm, the
         // processors (each row against its own history), the thinking
@@ -983,7 +1029,7 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
         sampler.observe_prompt(prompt_ids);
         // A prompt the cache holds whole re-feeds its last token: the first
         // round needs the target's probe there, which held logits lack.
-        let prepared = self.session.prepare_with(prompt_ids, false)?;
+        let (prepared, turn) = crate::turn::prepare(&mut self.session, prompt_ids, false)?;
         self.hint_checkpoint(&prepared, params.turn_tail)?;
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let mut stream = crate::stream::TextStream::new(params.max_tokens);
@@ -993,14 +1039,15 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
             if stop.load(std::sync::atomic::Ordering::Acquire) {
                 return Ok(());
             }
-            if let Some(chunk) = stream.push(batch, &mut detokenize)? {
+            let (chunk, stopped) = stream.publish(batch, &mut detokenize, &params.stop_strings)?;
+            if let Some(chunk) = chunk {
                 if !on_fragment(&chunk) {
                     cancelled = true;
                     stop.store(true, std::sync::atomic::Ordering::Release);
                     return Ok(());
                 }
             }
-            if stream.hit_stop(&params.stop_strings) {
+            if stopped {
                 stopped_on_string = true;
                 stop.store(true, std::sync::atomic::Ordering::Release);
             }
@@ -1039,6 +1086,11 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
         } else {
             Stop::Length
         };
+        if !cancelled && !stopped_on_string {
+            if let Some(rest) = stream.held() {
+                on_fragment(&rest);
+            }
+        }
         let (text, _) = stream.finish(&params.stop_strings);
         let thinking = params.thinking.as_ref().map(|b| b.report(&out.ids));
         Ok(Decoded {
@@ -1048,10 +1100,12 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
             reuse: prepared.action,
             reused: prepared.reused,
             prefilled: prepared.suffix.len(),
+            turn,
             readback: ReadbackArm::Speculative { k },
             logits_sha256: sampler.logits_digest(),
             stats: out.stats,
             thinking,
+            logprobs: None,
         })
     }
 }
@@ -1757,6 +1811,35 @@ mod tests {
                 Body::BatchedWindow,
             ] {
                 DecodeParams::default().refuse_on(body, "x").unwrap();
+            }
+        }
+
+        /// The per-token logprobs are the blocking K=1 body's alone: the ring,
+        /// the window and the batched bodies read back ids, never a row, and
+        /// each refuses them by name.
+        #[test]
+        fn the_logprobs_are_served_by_the_blocking_step_alone() {
+            use lloom::nn::Body;
+            let lp = DecodeParams {
+                logprobs: Some(LogprobRequest::default()),
+                ..DecodeParams::default()
+            };
+            lp.refuse_on(Body::Step { ring: false }, "blocking")
+                .unwrap();
+            for (body, says) in [
+                (Body::Step { ring: true }, "they run on the blocking arm"),
+                (Body::Window, "the window reads back the ids a round keeps"),
+                (
+                    Body::BatchedStep,
+                    "a batched body does not keep per-token logprobs",
+                ),
+                (
+                    Body::BatchedWindow,
+                    "a batched body does not keep per-token logprobs",
+                ),
+            ] {
+                let e = lp.refuse_on(body, "path").unwrap_err().to_string();
+                assert!(e.starts_with("path: ") && e.contains(says), "{body:?}: {e}");
             }
         }
 

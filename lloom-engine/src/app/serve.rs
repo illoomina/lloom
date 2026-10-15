@@ -3,9 +3,11 @@
 //! One binary, two contracts on one loopback port:
 //!
 //! - the **OpenAI-compatible** surface a generic client speaks —
-//!   `/v1/completions` (with `ignore_eos` and a `usage` block),
-//!   `/v1/chat/completions` (streaming SSE, the checkpoint's own chat
-//!   template, `logprobs`), `/v1/models`, `/tokenize`;
+//!   `/v1/completions` (with `ignore_eos`, a `usage` block and per-token
+//!   `logprobs`), `/v1/chat/completions` (streaming SSE, the checkpoint's own
+//!   chat template through the request front end, `front.rs`, `logprobs`),
+//!   `/v1/models`, `/tokenize`; on both routes the token-level fields
+//!   `prompt_token_ids` (ids in, no template) and `return_token_ids`;
 //! - the **benchmark sidecar** contract LiquidAI's `pipette` runners drive an
 //!   engine through (`Liquid4All/pipette-clients`, the MLX sidecar's shape):
 //!   `/prefill_throughput`, `/decode_throughput`, `/end_to_end_latency`,
@@ -29,10 +31,11 @@
 
 use super::budgets::{self, Dropped, PromptMode};
 use super::common::{ms, MemSnapshot, NEVER_EOS};
+use super::front::{self, Front};
 use super::served::Served;
 use super::template::{
-    request_kwargs, Rejected, Unrenderable, ENABLE_THINKING, ENGINE_KWARGS, NOT_READ,
-    REASONING_EFFORT, REQUEST_FIELDS,
+    request_kwargs, Rejected, Unrenderable, ENABLE_THINKING, ENGINE_KWARGS, REASONING_EFFORT,
+    REQUEST_FIELDS,
 };
 use super::thinking::{self, Thinking};
 use super::vision::{expand_image_tokens, split_image_parts, DecodedImage};
@@ -76,6 +79,8 @@ pub struct ServeArgs {
     #[command(flatten)]
     pub prefix: crate::options::PrefixConfigArgs,
     #[command(flatten)]
+    pub session: crate::options::SessionConfigArgs,
+    #[command(flatten)]
     pub report: crate::options::ReportConfigArgs,
 }
 
@@ -85,6 +90,7 @@ impl ServeArgs {
         self.server.apply(&mut o.server)?;
         self.scheduler.apply(&mut o.scheduler)?;
         self.prefix.apply(&mut o.prefix)?;
+        self.session.apply(&mut o.session)?;
         self.report.apply(&mut o.report)
     }
 }
@@ -122,6 +128,10 @@ struct Shared {
     /// The sampling defaults a request that names none decodes with (the
     /// `sampling` group; `--generation-config`).
     sampling: crate::SamplingConfig,
+    /// The request front end: the template constants, the session log.
+    front: Front,
+    /// What every request reused of its session, counted (`/health`).
+    reuse: parking_lot::Mutex<crate::turn::Tally>,
 }
 
 /// The largest `/v1/systemone` body a decision-only owner reads: eight
@@ -210,8 +220,9 @@ fn run_configured(args: ServeArgs, transport: Option<tiny_http::TransportPolicy>
 /// admission domain. The caller creates its device, configures the same process
 /// account, and completes the genuine load before entering this frontend.
 ///
-/// Only `options.server.host`, `options.server.port` and `options.sampling` are
-/// honored; the remaining options do not reconfigure this owner. Shape, decode,
+/// Only `options.server.host`, `options.server.port`, `options.sampling` and
+/// `options.session` (the request front end's) are honored; the remaining
+/// options do not reconfigure this owner. Shape, decode,
 /// cache, seed, prefix reuse, batch and memory policy are the already-loaded
 /// owner's contract, not inferred from these options. `model_path` is a caller-
 /// supplied provenance label, never opened or used to load another model.
@@ -249,9 +260,13 @@ fn run_owner(
         .check()
         .map_err(|e| anyhow::anyhow!("the checkpoint's generation_config.json: {e}"))?;
     let description = engine.describe_checked()?;
+    let logprobs = match front::logprobs_refused(engine.as_ref()) {
+        None => format!("served(top<={})", lloom::nn::MAX_TOP_LOGPROBS),
+        Some(why) => format!("refused({why})"),
+    };
     if let Some((load_start, reuse_prefix)) = load_facts {
         eprintln!(
-            "[loaded {} from {} in {:.2}s on {:?}; kv_capacity={} readback={} reuse_prefix={} {}]",
+            "[loaded {} from {} in {:.2}s on {:?}; kv_capacity={} readback={} reuse_prefix={} logprobs={logprobs} {}]",
             model_name,
             model_path.display(),
             load_start.elapsed().as_secs_f64(),
@@ -263,12 +278,13 @@ fn run_owner(
         );
     } else {
         eprintln!(
-            "[serving existing {} from {} on {:?}; kv_capacity={} readback={} {}]",
+            "[serving existing {} from {} on {:?}; kv_capacity={} readback={} reuse_prefix={} logprobs={logprobs} {}]",
             model_name,
             model_path.display(),
             engine.device(),
             engine.kv_capacity(),
             engine.readback().name(),
+            crate::turn::policy_name(engine.reuse_prefix()),
             description,
         );
     }
@@ -284,6 +300,20 @@ fn run_owner(
         eprintln!("[{line}]");
     }
     eprintln!("[{}]", MemSnapshot::read(engine.device()).json());
+    let front = Front::new(engine.as_ref(), front::SessionOptions::of(&options.session));
+    eprintln!("[session: {}]", front.line());
+    if let Some(why) = front.persist_unsupported() {
+        anyhow::bail!(
+            "session.persist_thinking: {}: {why}",
+            engine.capabilities().family
+        );
+    }
+    if let (Some(why), true) = (
+        front::logprobs_refused(engine.as_ref()),
+        front.options().keep != front::KeepLogprobs::None,
+    ) {
+        anyhow::bail!("session.keep_logprobs: {why}");
+    }
     let (host, port) = (options.server.host.clone(), options.server.port);
 
     let server = listener((host.as_str(), port), transport)
@@ -304,6 +334,8 @@ fn run_owner(
         server,
         model_name,
         sampling,
+        front,
+        reuse: parking_lot::Mutex::new(crate::turn::Tally::default()),
     });
 
     // The ready marker the sidecar runner waits for, on stdout and nothing
@@ -321,7 +353,10 @@ fn run_owner(
         let method = request.method().clone();
         match (method, path.as_str()) {
             (Method::Get, "/health") => {
-                let result = health_body(shared.engine.as_ref());
+                let result = health_body(shared.engine.as_ref(), &shared.front).map(|mut b| {
+                    b["reuse"] = shared.reuse.lock().json(shared.engine.reuse_prefix());
+                    b
+                });
                 let _ = respond_metadata(request, result);
             }
             (Method::Get, "/v1/models") => {
@@ -613,6 +648,11 @@ struct StreamingRun {
     params: DecodeParams,
     id: String,
     model: String,
+    /// A chat prompt the front end built: its reply goes in the session log
+    /// against the conversation it answers.
+    record: Option<front::Origin>,
+    /// `return_token_ids`: the final event carries the ids.
+    return_ids: bool,
 }
 
 /// One decode of `prompt_ids`, through the image path when the request
@@ -684,25 +724,58 @@ fn completions(shared: &Shared, v: &Value, _headers: &[Header]) -> Handled<Reply
     if v.get("n").and_then(Value::as_u64).unwrap_or(1) != 1 {
         return Err(bad("n > 1 is not supported"));
     }
-    if v.get("logprobs").map(|l| !l.is_null()).unwrap_or(false) {
-        return Err(bad("logprobs is not supported on /v1/completions"));
+    // OpenAI's completions `logprobs`: the number of most likely tokens per
+    // position beside the sampled one's (0 is the sampled one alone).
+    let want_logprobs = match v.get("logprobs") {
+        None | Some(Value::Null) | Some(Value::Bool(false)) => None,
+        Some(Value::Bool(true)) => Some(0),
+        Some(n) => Some(
+            n.as_u64()
+                .filter(|&n| n as usize <= lloom::nn::MAX_TOP_LOGPROBS)
+                .ok_or_else(|| {
+                    bad(format!(
+                        "field 'logprobs' must be an integer from 0 to {}",
+                        lloom::nn::MAX_TOP_LOGPROBS
+                    ))
+                })? as usize,
+        ),
+    };
+    if want_logprobs.is_some() {
+        if stream {
+            return Err(bad("logprobs with stream is not supported"));
+        }
+        if let Some(why) = front::logprobs_refused(shared.engine.as_ref()) {
+            return Err(bad(format!("logprobs: {why}")));
+        }
     }
-    let prompt_ids = {
-        let engine = shared.engine.as_ref();
-        match v.get("prompt") {
-            Some(Value::String(s)) => engine.encode(s, true)?,
-            Some(Value::Array(items)) if items.iter().all(Value::is_u64) => items
-                .iter()
-                .filter_map(Value::as_u64)
-                .map(|t| t as u32)
-                .collect(),
-            Some(Value::Array(items)) if items.len() == 1 && items[0].is_string() => {
-                engine.encode(items[0].as_str().unwrap_or(""), true)?
+    let return_ids = v
+        .get("return_token_ids")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let prompt_ids = match field_token_ids(v)? {
+        Some(ids) => {
+            if v.get("prompt").is_some_and(|p| !p.is_null()) {
+                return Err(bad("prompt and prompt_token_ids are two prompts; send one"));
             }
-            _ => {
-                return Err(bad(
-                    "field 'prompt' must be a string or an array of token ids",
-                ))
+            ids
+        }
+        None => {
+            let engine = shared.engine.as_ref();
+            match v.get("prompt") {
+                Some(Value::String(s)) => engine.encode(s, true)?,
+                Some(Value::Array(items)) if items.iter().all(Value::is_u64) => items
+                    .iter()
+                    .filter_map(Value::as_u64)
+                    .map(|t| t as u32)
+                    .collect(),
+                Some(Value::Array(items)) if items.len() == 1 && items[0].is_string() => {
+                    engine.encode(items[0].as_str().unwrap_or(""), true)?
+                }
+                _ => {
+                    return Err(bad(
+                        "field 'prompt' must be a string or an array of token ids",
+                    ))
+                }
             }
         }
     };
@@ -710,6 +783,7 @@ fn completions(shared: &Shared, v: &Value, _headers: &[Header]) -> Handled<Reply
         return Err(bad("empty prompt"));
     }
     let mut params = params;
+    params.logprobs = logprob_request(want_logprobs, None);
     let wanted = request_budgets(shared, v, params.max_tokens)?;
     let (prompt_ids, dropped) = match wanted.prompt {
         Some((k, mode)) if prompt_ids.len() > k => {
@@ -743,19 +817,22 @@ fn completions(shared: &Shared, v: &Value, _headers: &[Header]) -> Handled<Reply
             params,
             id,
             model,
+            record: None,
+            return_ids,
         })));
     }
     let started = Instant::now();
     let decoded = shared.engine.complete(&prompt_ids, &params, &mut |_| {})?;
     let elapsed = started.elapsed();
     report(
+        shared,
         "/v1/completions",
         prompt_ids.len(),
         &facts,
         &decoded,
         ms(elapsed),
     );
-    Ok(Reply::Json(json!({
+    let mut body = json!({
         "id": id,
         "object": "text_completion",
         "created": now(),
@@ -763,25 +840,92 @@ fn completions(shared: &Shared, v: &Value, _headers: &[Header]) -> Handled<Reply
         "choices": [{
             "index": 0,
             "text": decoded.text,
-            "logprobs": null,
+            "logprobs": match want_logprobs {
+                Some(_) => completion_logprobs(shared.engine.as_ref(), &decoded)?,
+                None => Value::Null,
+            },
             "finish_reason": finish_reason(decoded.stop),
         }],
         "usage": usage(prompt_ids.len(), decoded.tokens.len()),
-        "timings": timings(prompt_ids.len(), &facts, &decoded, elapsed),
-    })))
+        "timings": timings(shared.engine.as_ref(), prompt_ids.len(), &facts, &decoded, elapsed),
+    });
+    if return_ids {
+        body["prompt_token_ids"] = json!(prompt_ids);
+        body["choices"][0]["token_ids"] = json!(decoded.tokens);
+        body["timings"]["tokens"] = json!(decoded.tokens);
+    }
+    Ok(Reply::Json(body))
+}
+
+/// OpenAI's completions `logprobs`: per returned id its token, its
+/// log-probability, the top tokens asked for, and its text's offset.
+fn completion_logprobs(engine: &dyn Served, d: &Decoded) -> Result<Value> {
+    let Some(lp) = &d.logprobs else {
+        return Ok(Value::Null);
+    };
+    let tokens = d
+        .tokens
+        .iter()
+        .map(|&t| engine.token_str_checked(t))
+        .collect::<Result<Vec<String>>>()?;
+    let mut offset = 0usize;
+    let offsets: Vec<usize> = tokens
+        .iter()
+        .map(|t| {
+            let o = offset;
+            offset += t.len();
+            o
+        })
+        .collect();
+    let top = lp
+        .top
+        .iter()
+        .map(|t| {
+            Ok(Value::Object(
+                t.iter()
+                    .map(|&(id, l)| Ok((engine.token_str_checked(id)?, json!(l))))
+                    .collect::<Result<_>>()?,
+            ))
+        })
+        .collect::<Result<Vec<Value>>>()?;
+    // OpenAI's `top_logprobs` keys by the token's text, and two ids can
+    // share one (the halves of a character); `top_ids` keeps the ids.
+    let top_ids: Vec<Value> = lp
+        .top
+        .iter()
+        .map(|t| json!(t.iter().map(|&(id, l)| json!([id, l])).collect::<Vec<_>>()))
+        .collect();
+    Ok(json!({
+        "tokens": tokens,
+        "token_logprobs": lp.sampled,
+        "top_logprobs": top,
+        "top_ids": top_ids,
+        "text_offset": offsets,
+    }))
 }
 
 // ---- /v1/chat/completions ----------------------------------------------------
 
 fn chat_completions(shared: &Shared, v: &Value) -> Handled<Reply> {
     let model = shared.model_name.clone();
-    let messages = v
-        .get("messages")
-        .filter(|m| m.is_array())
-        .ok_or_else(|| bad("field 'messages' must be an array"))?;
-    if messages.as_array().map(Vec::is_empty).unwrap_or(true) {
-        return Err(bad("messages must not be empty"));
-    }
+    let no_messages = json!([]);
+    let messages = match (v.get("messages"), v.get("prompt_token_ids")) {
+        (None | Some(Value::Null), Some(ids)) if !ids.is_null() => &no_messages,
+        (Some(_), Some(ids)) if !ids.is_null() => {
+            return Err(bad(
+                "messages and prompt_token_ids are two prompts; send one",
+            ))
+        }
+        (m, _) => {
+            let m = m
+                .filter(|m| m.is_array())
+                .ok_or_else(|| bad("field 'messages' must be an array"))?;
+            if m.as_array().map(Vec::is_empty).unwrap_or(true) {
+                return Err(bad("messages must not be empty"));
+            }
+            m
+        }
+    };
     if v.get("guided_choice").is_some() || v.get("guided_json").is_some() {
         // Constrained decoding is not built; a 4xx is what a client that can
         // fall back to `logprobs` looks for.
@@ -798,73 +942,124 @@ fn chat_completions(shared: &Shared, v: &Value) -> Handled<Reply> {
     // OpenAI `image_url` parts become the template's `{"type": "image"}`;
     // string content passes through untouched.
     let (messages, images) = split_image_parts(messages).map_err(|e| bad(format!("{e:#}")))?;
-    let (prompt_ids, facts) = {
+    let token_ids = field_token_ids(v)?;
+    let (prompt_ids, facts, prompt) = {
         let engine = shared.engine.as_ref();
-        let (rendered, mut facts) =
-            render_request(engine, "/v1/chat/completions", &messages, &kwargs)?;
-        let rendered = if images.is_empty() {
-            rendered
+        if let Some(ids) = token_ids {
+            // The token-level API: the ids run as sent, no template.
+            if !images.is_empty() {
+                return Err(bad("prompt_token_ids with an image is not supported"));
+            }
+            let mut facts = PromptFacts::of(&ids);
+            facts.apply_budgets(
+                engine,
+                "/v1/chat/completions",
+                &wanted,
+                Dropped::default(),
+                &ids,
+                &mut params,
+            )?;
+            (ids, facts, None)
         } else {
             let expansions = images
                 .iter()
                 .map(|img| engine.image_placeholder(img))
                 .collect::<Result<Vec<_>>>()
                 .map_err(|e| bad(format!("{e:#}")))?;
-            expand_image_tokens(&rendered, &expansions).map_err(|e| bad(format!("{e:#}")))?
-        };
-        let mut ids = engine.encode(&rendered, true)?;
-        if let Some(bos) = engine.bos_id() {
-            if ids.iter().filter(|&&t| t == bos).count() > 1 {
-                eprintln!("[chat: the rendered template carries BOS twice; check bos_token]");
-            }
-        }
-        let tags = engine.think_tags();
-        facts.thinking = Some(apply_thinking(engine, want, tags.as_ref(), &mut ids)?);
-        // A suffix property: dropping the oldest turns below leaves it.
-        params.turn_tail = thinking::checkpoint_tail_checked(engine, &kwargs, want, &ids)?;
-        // The prompt budget, before the engine sees the prompt: the oldest
-        // turns go whole, so what runs is the template's own rendering.
-        let mut dropped = Dropped::default();
-        if let Some((k, mode)) = wanted.prompt.filter(|&(k, _)| ids.len() > k) {
-            if mode == PromptMode::Refuse {
-                return Err(bad(budgets::over_budget(
-                    ids.len(),
-                    k,
-                    "truncate_prompt_tokens drops the oldest turns instead",
-                )));
-            }
-            if !images.is_empty() {
-                return Err(bad(
-                    "truncate_prompt_tokens with an image is not supported: truncating would \
-                     drop turns without their images",
-                ));
-            }
-            let arr = messages.as_array().cloned().unwrap_or_default();
-            let fitted = budgets::fit_messages(&arr, k, ids.len(), |ms| {
-                let mut ids = engine.encode(&engine.render_chat(&json!(ms), &kwargs)?, true)?;
-                let _ = thinking::apply(want, tags.as_ref(), &mut ids);
-                Ok(ids)
-            })
-            .map_err(template_failure)?;
-            let Some(fitted) = fitted else {
-                return Err(bad(budgets::over_budget(
-                    ids.len(),
-                    k,
-                    "the last user turn alone does not fit",
-                )));
+            let expand = |r: &str| -> Result<String> {
+                expand_image_tokens(r, &expansions)
+                    .map_err(|e| anyhow::Error::new(front::Refused(format!("{e:#}"))))
             };
-            (ids, dropped) = (fitted.ids, fitted.dropped);
+            let expand_ref: front::Expand<'_> = &expand;
+            let prompt = shared
+                .front
+                .prompt(
+                    engine,
+                    front::Request {
+                        messages: &messages,
+                        kwargs: kwargs.clone(),
+                        want,
+                        add_bos: true,
+                        expand: (!images.is_empty()).then_some(expand_ref),
+                        history: v.get("messages"),
+                    },
+                )
+                .map_err(|e| front_failure("/v1/chat/completions", e))?;
+            let mut facts = PromptFacts {
+                reasoning_effort: kwargs.get(REASONING_EFFORT).cloned().unwrap_or(Value::Null),
+                thinking: prompt.thinking,
+                renders: prompt.renders,
+                spliced: prompt.spliced,
+                ..PromptFacts::default()
+            };
+            let mut ids = prompt.ids.clone();
+            if let Some(bos) = engine.bos_id() {
+                if ids.iter().filter(|&&t| t == bos).count() > 1 {
+                    eprintln!("[chat: the rendered template carries BOS twice; check bos_token]");
+                }
+            }
+            // A suffix property: dropping the oldest turns below leaves it.
+            params.turn_tail = prompt.turn_tail;
+            // The prompt budget, before the engine sees the prompt: the oldest
+            // turns go whole, as spans of the ids the one render gave.
+            let mut dropped = Dropped::default();
+            if let Some((k, mode)) = wanted.prompt.filter(|&(k, _)| ids.len() > k) {
+                if mode == PromptMode::Refuse {
+                    return Err(bad(budgets::over_budget(
+                        ids.len(),
+                        k,
+                        "truncate_prompt_tokens drops the oldest turns instead",
+                    )));
+                }
+                if !images.is_empty() {
+                    return Err(bad(
+                        "truncate_prompt_tokens with an image is not supported: truncating would \
+                         drop turns without their images",
+                    ));
+                }
+                let arr = messages.as_array().cloned().unwrap_or_default();
+                let fitted = match shared.front.fit(&prompt, &arr, k) {
+                    Some(f) => f,
+                    None => {
+                        // Spans unknown: the shorter conversations rendered,
+                        // counted on the request's `renders`.
+                        let before = engine.template_renders();
+                        let f = budgets::fit_messages(&arr, k, ids.len(), |ms| {
+                            let mut ids = engine
+                                .encode(&engine.render_chat(&json!(ms), &prompt.kwargs)?, true)?;
+                            let _ = thinking::apply(want, engine.think_tags().as_ref(), &mut ids);
+                            Ok(ids)
+                        })
+                        .map_err(template_failure)?
+                        .map(|f| front::Fitted {
+                            messages: f.messages,
+                            ids: f.ids,
+                            dropped: f.dropped,
+                        });
+                        facts.renders += engine.template_renders() - before;
+                        f
+                    }
+                };
+                let Some(fitted) = fitted else {
+                    return Err(bad(budgets::over_budget(
+                        ids.len(),
+                        k,
+                        "the last user turn alone does not fit",
+                    )));
+                };
+                (ids, dropped) = (fitted.ids, fitted.dropped);
+            }
+            facts.ids_sha256 = super::chat::tokens_sha256(&ids);
+            facts.apply_budgets(
+                engine,
+                "/v1/chat/completions",
+                &wanted,
+                dropped,
+                &ids,
+                &mut params,
+            )?;
+            (ids, facts, Some(prompt))
         }
-        facts.ids_sha256 = super::chat::tokens_sha256(&ids);
-        facts.apply_budgets(
-            engine,
-            "/v1/chat/completions",
-            &wanted,
-            dropped,
-            &ids,
-            &mut params,
-        )?;
-        (ids, facts)
     };
     let id = format!("chatcmpl-{}", short_id());
 
@@ -875,14 +1070,42 @@ fn chat_completions(shared: &Shared, v: &Value) -> Handled<Reply> {
         if !images.is_empty() {
             return Err(bad("logprobs with an image is not supported"));
         }
-        let top_k = v
-            .get("top_logprobs")
-            .and_then(Value::as_u64)
-            .unwrap_or(1)
-            .clamp(1, 64) as usize;
-        if params.max_tokens != 1 {
-            return Err(bad("logprobs is supported for max_tokens = 1 only"));
+    }
+    // OpenAI's bound: up to 20 candidates beside each drawn id, asked with
+    // `logprobs`.
+    let top_logprobs = match v.get("top_logprobs") {
+        None | Some(Value::Null) => None,
+        Some(n) => Some(
+            n.as_u64()
+                .filter(|&n| n as usize <= lloom::nn::MAX_TOP_LOGPROBS)
+                .ok_or_else(|| {
+                    bad(format!(
+                        "field 'top_logprobs' must be an integer from 0 to {}",
+                        lloom::nn::MAX_TOP_LOGPROBS
+                    ))
+                })? as usize,
+        ),
+    };
+    if top_logprobs.is_some() && !want_logprobs {
+        return Err(bad("top_logprobs asks for logprobs: set logprobs to true"));
+    }
+    let top_k = top_logprobs.unwrap_or(1).max(1);
+    // Past one token, each returned id carries its log-probability (and the
+    // top `top_logprobs`), from the run's own steps.
+    let return_ids = v
+        .get("return_token_ids")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    params.logprobs = logprob_request(
+        want_logprobs.then_some(top_logprobs.unwrap_or(0)),
+        prompt.as_ref().and(shared.front.options().keep.capture()),
+    );
+    if want_logprobs && params.max_tokens > 1 {
+        if let Some(why) = front::logprobs_refused(shared.engine.as_ref()) {
+            return Err(bad(format!("logprobs: {why}")));
         }
+    }
+    if want_logprobs && params.max_tokens == 1 {
         // The decision scoring: `options` (strings), each scored by the
         // log-probability of its first token under the same forward — a
         // decision model's (JEV, clef) one-forward choice. An option is a
@@ -1008,6 +1231,8 @@ fn chat_completions(shared: &Shared, v: &Value) -> Handled<Reply> {
             params,
             id,
             model,
+            record: prompt.as_ref().map(|p| p.origin),
+            return_ids,
         })));
     }
     let started = Instant::now();
@@ -1019,13 +1244,20 @@ fn chat_completions(shared: &Shared, v: &Value) -> Handled<Reply> {
         &mut |_| true,
     )?;
     let elapsed = started.elapsed();
+    let recorded = prompt.as_ref().is_some_and(|p| {
+        shared
+            .front
+            .record(shared.engine.as_ref(), p.origin, &decoded)
+    });
     report(
+        shared,
         "/v1/chat/completions",
         prompt_ids.len(),
         &facts,
         &decoded,
         ms(elapsed),
     );
+    let engine = shared.engine.as_ref();
     let mut body = json!({
         "id": id,
         "object": "chat.completion",
@@ -1034,14 +1266,100 @@ fn chat_completions(shared: &Shared, v: &Value) -> Handled<Reply> {
         "choices": [{
             "index": 0,
             "message": { "role": "assistant", "content": decoded.text },
-            "logprobs": null,
+            "logprobs": if want_logprobs { chat_logprobs(engine, &decoded)? } else { Value::Null },
             "finish_reason": finish_reason(decoded.stop),
         }],
         "usage": usage(prompt_ids.len(), decoded.tokens.len()),
-        "timings": timings(prompt_ids.len(), &facts, &decoded, elapsed),
+        "timings": timings(shared.engine.as_ref(), prompt_ids.len(), &facts, &decoded, elapsed),
     });
+    body["timings"]["logged"] = json!(recorded);
+    // Ids only when asked (`return_token_ids`), and their logprobs only when
+    // logprobs are asked too: the conversation the response returns is its
+    // text (`sequence-reuse-design.md` §2.3d).
+    if return_ids {
+        body["prompt_token_ids"] = json!(prompt_ids);
+        body["choices"][0]["token_ids"] = json!(decoded.tokens);
+        body["timings"]["tokens"] = json!(decoded.tokens);
+        if want_logprobs {
+            if let Some(lp) = prompt.as_ref().and_then(|p| p.logprobs.as_ref()) {
+                if lp.len() == prompt_ids.len() {
+                    body["prompt_sampled_logprobs"] = json!(lp);
+                }
+            }
+            if let Some(lp) = &decoded.logprobs {
+                body["choices"][0]["token_logprobs"] = json!(lp.sampled);
+            }
+        }
+    }
     attach_vision(shared, &mut body)?;
     Ok(Reply::Json(body))
+}
+
+/// The ids a request sent in place of a prompt (`prompt_token_ids`, the
+/// token-level API): run as sent.
+fn field_token_ids(v: &Value) -> Handled<Option<Vec<u32>>> {
+    match v.get("prompt_token_ids") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Array(a)) if !a.is_empty() => a
+            .iter()
+            .map(|t| {
+                t.as_u64()
+                    .and_then(|t| u32::try_from(t).ok())
+                    .ok_or_else(|| bad("prompt_token_ids: every entry is a token id"))
+            })
+            .collect::<Handled<Vec<u32>>>()
+            .map(Some),
+        Some(_) => Err(bad(
+            "prompt_token_ids must be a non-empty array of token ids",
+        )),
+    }
+}
+
+/// What a run must capture: the request's `top` logprobs (`Some(0)` for the
+/// sampled one alone) and what the session log keeps.
+fn logprob_request(
+    request: Option<usize>,
+    keep: Option<crate::LogprobRequest>,
+) -> Option<crate::LogprobRequest> {
+    match (request, keep) {
+        (None, None) => None,
+        (r, k) => Some(crate::LogprobRequest {
+            top: r.unwrap_or(0),
+            rows: k.is_some_and(|k| k.rows),
+        }),
+    }
+}
+
+/// OpenAI's chat `logprobs.content`: per returned id, its token, its
+/// log-probability and the `top_logprobs` asked for.
+fn chat_logprobs(engine: &dyn Served, d: &Decoded) -> Result<Value> {
+    let Some(lp) = &d.logprobs else {
+        return Ok(Value::Null);
+    };
+    let content = d
+        .tokens
+        .iter()
+        .zip(&lp.sampled)
+        .enumerate()
+        .map(|(i, (&id, &l))| {
+            let top = match lp.top.get(i) {
+                Some(t) => t
+                    .iter()
+                    .map(|&(t, l)| {
+                        Ok(json!({ "token": engine.token_str_checked(t)?, "id": t, "logprob": l }))
+                    })
+                    .collect::<Result<Vec<Value>>>()?,
+                None => Vec::new(),
+            };
+            Ok(json!({
+                "token": engine.token_str_checked(id)?,
+                "id": id,
+                "logprob": l,
+                "top_logprobs": top,
+            }))
+        })
+        .collect::<Result<Vec<Value>>>()?;
+    Ok(json!({ "content": content }))
 }
 
 /// The token budgets a request asks for, over the process's defaults
@@ -1233,6 +1551,8 @@ fn sampling_params(shared: &Shared, v: &Value) -> Handled<DecodeParams> {
         prefill_tile: shared.engine.prefill_tile(),
         turn_tail: 0,
         thinking: None,
+        logprobs: None,
+        cold: false,
     })
 }
 
@@ -1348,11 +1668,17 @@ fn stream_response(shared: &Shared, request: Request, run: StreamingRun) -> Resu
     };
     let (w, write_err) = sw.finish()?;
     let decoded = decoded?;
+    if let Some(origin) = run.record {
+        shared
+            .front
+            .record(shared.engine.as_ref(), origin, &decoded);
+    }
     if let Some(e) = write_err {
         anyhow::bail!("client went away mid-stream: {e}");
     }
     let elapsed = started.elapsed();
     report(
+        shared,
         endpoint,
         run.prompt_ids.len(),
         &run.facts,
@@ -1366,16 +1692,21 @@ fn stream_response(shared: &Shared, request: Request, run: StreamingRun) -> Resu
             "choices": [{ "index": 0, "text": "", "logprobs": null,
                           "finish_reason": finish_reason(decoded.stop) }],
             "usage": usage,
-            "timings": timings(run.prompt_ids.len(), &run.facts, &decoded, elapsed),
+            "timings": timings(shared.engine.as_ref(), run.prompt_ids.len(), &run.facts, &decoded, elapsed),
         }),
         StreamKind::Chat => json!({
             "id": run.id, "object": "chat.completion.chunk", "created": created, "model": run.model,
             "choices": [{ "index": 0, "delta": {}, "finish_reason": finish_reason(decoded.stop) }],
             "usage": usage,
-            "timings": timings(run.prompt_ids.len(), &run.facts, &decoded, elapsed),
+            "timings": timings(shared.engine.as_ref(), run.prompt_ids.len(), &run.facts, &decoded, elapsed),
         }),
     };
     let mut last = last;
+    if run.return_ids {
+        last["prompt_token_ids"] = json!(run.prompt_ids);
+        last["choices"][0]["token_ids"] = json!(decoded.tokens);
+        last["timings"]["tokens"] = json!(decoded.tokens);
+    }
     write_stream_trailer(w, &mut last, |body| {
         if let StreamKind::Chat = run.kind {
             attach_vision(shared, body)?;
@@ -1572,6 +1903,7 @@ fn max_memory_usage(shared: &Shared, v: &Value) -> Handled<Value> {
         readback: engine.readback(),
         prefill_tile: engine.prefill_tile(),
         turn_tail: 0,
+        cold: true,
         ..DecodeParams::default()
     };
     let prompts: Vec<Vec<u32>> = (0..batch)
@@ -1611,12 +1943,14 @@ fn end_to_end_latency(shared: &Shared, v: &Value) -> Handled<Value> {
         readback: engine.readback(),
         prefill_tile: engine.prefill_tile(),
         turn_tail: 0,
+        cold: true,
         ..DecodeParams::default()
     };
     if batch == 1 {
         let decoded = engine.complete(&ids, &params, &mut |_| {})?;
         let total_ms = ms(started.elapsed());
         report(
+            shared,
             "/end_to_end_latency",
             ids.len(),
             &PromptFacts::of(&ids),
@@ -1658,6 +1992,7 @@ fn end_to_end_latency(shared: &Shared, v: &Value) -> Handled<Value> {
     let facts = PromptFacts::of(&ids);
     for (i, d) in decoded.iter().enumerate() {
         report(
+            shared,
             &format!("/end_to_end_latency row {i}/{batch}"),
             ids.len(),
             &facts,
@@ -1744,7 +2079,6 @@ fn eval(shared: &Shared, request: Request, v: &Value) -> Result<()> {
     };
     let mut kwargs = Map::new();
     thinking::set_kwarg(shared.engine.as_ref(), want, &mut kwargs);
-    let tags = shared.engine.think_tags();
 
     let sw = StreamWriter::start(ChunkedWriter::start(request, "application/x-ndjson")?);
     let engine = shared.engine.as_ref();
@@ -1754,8 +2088,7 @@ fn eval(shared: &Shared, request: Request, v: &Value) -> Result<()> {
     let run = std::thread::scope(|scope| -> Result<()> {
         let handles: Vec<_> = (0..workers)
             .map(|_| {
-                let (sw, samples, done, kwargs, next, tags) =
-                    (&sw, &samples, &done, &kwargs, &next, &tags);
+                let (sw, samples, done, kwargs, next) = (&sw, &samples, &done, &kwargs, &next);
                 scope.spawn(move || -> Result<()> {
                     loop {
                         let i = next.fetch_add(1, Ordering::AcqRel);
@@ -1778,20 +2111,23 @@ fn eval(shared: &Shared, request: Request, v: &Value) -> Result<()> {
                         let messages = sample
                             .get("messages")
                             .context("eval sample missing messages")?;
-                        let mut prompt = engine.render_chat(messages, kwargs)?;
-                        let mut ids = engine.encode(&prompt, true)?;
-                        let think =
-                            thinking::apply(want, tags.as_ref(), &mut ids).map_err(|why| {
-                                anyhow::anyhow!(
-                                    "enable_thinking=true: {}: {why}",
-                                    engine.capabilities().family
-                                )
-                            })?;
-                        if think.by == thinking::By::Engine {
-                            prompt.push_str(&engine.token_str_checked(ids[ids.len() - 1])?);
-                        }
+                        let built = shared
+                            .front
+                            .prompt(
+                                engine,
+                                front::Request {
+                                    messages,
+                                    kwargs: kwargs.clone(),
+                                    want,
+                                    add_bos: true,
+                                    expand: None,
+                                    history: None,
+                                },
+                            )
+?;
+                        let ids = built.ids;
                         sw.event_line(&json!({
-                            "kind": "eval_sample_start", "sample_id": sample_id, "prompt": prompt,
+                            "kind": "eval_sample_start", "sample_id": sample_id, "prompt": built.text,
                         }));
                         let params = DecodeParams {
                             seed: rand::random::<u64>(),
@@ -1808,6 +2144,8 @@ fn eval(shared: &Shared, request: Request, v: &Value) -> Result<()> {
                             prefill_tile: engine.prefill_tile(),
                             turn_tail: 0,
                             thinking: None,
+                            logprobs: None,
+                            cold: false,
                         };
                         let mut pending = String::new();
                         let started = Instant::now();
@@ -1849,8 +2187,11 @@ fn eval(shared: &Shared, request: Request, v: &Value) -> Result<()> {
                         if stopped_early {
                             lock(aborts).remove(&sample_id);
                         }
+                        let policy = engine.reuse_prefix();
+                        let turn = decoded.turn.with_policy(policy);
+                        shared.reuse.lock().note(&turn);
                         eprintln!(
-                            "[eval {}/{total} id={sample_id} {} tokens {:.1} ms {} readback={}]",
+                            "[eval {}/{total} id={sample_id} {} tokens {:.1} ms {} readback={} reuse_policy={} reused={} {}]",
                             i + 1,
                             decoded.tokens.len(),
                             ms(started.elapsed()),
@@ -1860,6 +2201,9 @@ fn eval(shared: &Shared, request: Request, v: &Value) -> Result<()> {
                                 "done"
                             },
                             decoded.readback.name(),
+                            crate::turn::policy_name(policy),
+                            turn.reused,
+                            turn.fields(),
                         );
                         sw.event_line(&json!({
                             "kind": "eval_sample_done", "sample_id": sample_id,
@@ -2016,7 +2360,7 @@ struct StreamWriter {
     /// wraps what is pending itself so a control event keeps its place.
     wrap: Option<Wrap>,
     /// The producer's spill (`DeltaBuffer::push`); only the producer locks it.
-    spill: Mutex<String>,
+    spill: parking_lot::Mutex<String>,
 }
 
 type Wrap = Arc<dyn Fn(&str) -> String + Send + Sync>;
@@ -2088,7 +2432,7 @@ impl StreamWriter {
             thread: Some(thread),
             deltas,
             wrap,
-            spill: Mutex::new(String::new()),
+            spill: parking_lot::Mutex::new(String::new()),
         }
     }
 
@@ -2096,7 +2440,7 @@ impl StreamWriter {
     /// writer started with deltas): no wait, no syscall, no allocation.
     fn delta(&self, text: &str) {
         if let Some(b) = &self.deltas {
-            b.push(&mut lock(&self.spill), text);
+            b.push(&mut self.spill.lock(), text);
         }
     }
 
@@ -2104,7 +2448,7 @@ impl StreamWriter {
     /// next on the channel. Off the per-token path (a control event).
     fn queue_pending(&self) {
         if let (Some(b), Some(wrap), Some(tx)) = (&self.deltas, &self.wrap, &self.tx) {
-            b.flush(&mut lock(&self.spill));
+            b.flush(&mut self.spill.lock());
             let mut text = String::new();
             if b.take_into(&mut text) {
                 let _ = tx.send(wrap(&text));
@@ -2139,7 +2483,7 @@ impl StreamWriter {
     /// first write error, if any.
     fn finish(mut self) -> Result<(ChunkedWriter, Option<std::io::Error>)> {
         if let Some(b) = &self.deltas {
-            b.flush(&mut lock(&self.spill));
+            b.flush(&mut self.spill.lock());
         }
         drop(self.tx.take());
         let handle = self
@@ -2155,7 +2499,7 @@ impl StreamWriter {
 impl Drop for StreamWriter {
     fn drop(&mut self) {
         if let Some(b) = &self.deltas {
-            b.flush(&mut lock(&self.spill));
+            b.flush(&mut self.spill.lock());
         }
         drop(self.tx.take());
         if let Some(h) = self.thread.take() {
@@ -2210,7 +2554,13 @@ fn usage(prompt: usize, completion: usize) -> Value {
 /// The engine's own brackets beside the request's wall clock: the prompt's
 /// submit time, the per-step host clock and the arm that ran. `predicted_ms`
 /// is the sum of the loop's steps — the decode window, prefill excluded.
-fn timings(prompt: usize, facts: &PromptFacts, d: &Decoded, elapsed: std::time::Duration) -> Value {
+fn timings(
+    engine: &dyn Served,
+    prompt: usize,
+    facts: &PromptFacts,
+    d: &Decoded,
+    elapsed: std::time::Duration,
+) -> Value {
     let st = &d.stats;
     // Release builds compile the per-step clock out (`step_ns` is empty, since
     // `6c33cd89`), so the decode's window is the request's wall minus the
@@ -2236,11 +2586,11 @@ fn timings(prompt: usize, facts: &PromptFacts, d: &Decoded, elapsed: std::time::
         "poll_fallbacks": st.readback.poll_fallbacks,
         "publish_parks": st.readback.publish_parks,
         "overrun": st.overrun,
+        // The prompt's pass shapes: forwards the prefill took, at the tile.
+        "prefill_units": st.prefill_units,
+        "prefill_tile": engine.prefill_tile(),
         "eos_gate": super::common::eos_gate_name(st.eos_gate),
         "host_fill": super::common::host_fill_name(st.host_feed.as_ref()),
-        // The generated ids, so a gate can compare a run against a recorded
-        // token digest without a second path to the model.
-        "tokens": d.tokens,
         "prompt_ids_sha256": facts.ids_sha256,
         // The template's variable as the prompt reflects it; null for its
         // default (a value the template would not act on is a 400).
@@ -2260,10 +2610,39 @@ fn timings(prompt: usize, facts: &PromptFacts, d: &Decoded, elapsed: std::time::
         "prompt_budget": facts.prompt_budget,
         "prompt_tokens_dropped": facts.dropped.tokens,
         "prompt_messages_dropped": facts.dropped.messages,
+        // The front end: renders, and the replies of ours the history carried
+        // (matched by text) with the ids they ran as sampled.
+        "renders": facts.renders,
+        "history_replies": facts.spliced.replies,
+        "history_matched": facts.spliced.matched,
+        "history_restored": facts.spliced.restored,
+        "history_reply_tokens": facts.spliced.reply_tokens,
+        "history_spliced_tokens": facts.spliced.spliced_tokens,
+        // Assistant messages taken as sent: their text names several
+        // replies of this conversation, or a reply of another one only; and
+        // reasoning the log would restore, kept as the message gave it.
+        "history_ambiguous": facts.spliced.ambiguous,
+        "history_unverified": facts.spliced.unverified,
+        "history_declined": facts.spliced.declined,
+        "reused": d.reused,
+        // What the request reused of the session, and why not more: the
+        // accepted boundary it found, how the state there was made ready,
+        // and the ids kept, replayed and newly prefilled.
+        "turn": d.turn.with_policy(engine.reuse_prefix()).json(engine.reuse_prefix()),
     })
 }
 
-fn report(endpoint: &str, prompt: usize, facts: &PromptFacts, d: &Decoded, total_ms: f64) {
+fn report(
+    shared: &Shared,
+    endpoint: &str,
+    prompt: usize,
+    facts: &PromptFacts,
+    d: &Decoded,
+    total_ms: f64,
+) {
+    let policy = shared.engine.reuse_prefix();
+    let turn = d.turn.with_policy(policy);
+    shared.reuse.lock().note(&turn);
     let st = &d.stats;
     let mut steps: Vec<u64> = st.step_ns.clone();
     steps.sort_unstable();
@@ -2277,7 +2656,8 @@ fn report(endpoint: &str, prompt: usize, facts: &PromptFacts, d: &Decoded, total
          {steady:.1} tok/s steady (median step), readback={} reuse={:?} prefilled={} \
          commits={} poll_fallbacks={} overrun={} eos_gate={} host_fill={} prompt_ids_sha256={} \
          reasoning_effort={} think={} think_by={} thinking_budget={} thought={} budget_fired={} \
-         prompt_budget={} prompt_dropped={}]",
+         prompt_budget={} prompt_dropped={} reused={} renders={} history={}/{} spliced={}/{} \
+         unverified={} ambiguous={} declined={} reuse_policy={} {}]",
         d.tokens.len(),
         d.stop,
         d.readback.name(),
@@ -2303,6 +2683,17 @@ fn report(endpoint: &str, prompt: usize, facts: &PromptFacts, d: &Decoded, total
             .prompt_budget
             .map_or_else(|| "none".into(), |n| n.to_string()),
         facts.dropped.tokens,
+        d.reused,
+        facts.renders,
+        facts.spliced.matched,
+        facts.spliced.replies,
+        facts.spliced.spliced_tokens,
+        facts.spliced.reply_tokens,
+        facts.spliced.unverified,
+        facts.spliced.ambiguous,
+        facts.spliced.declined,
+        crate::turn::policy_name(policy),
+        turn.fields(),
     );
 }
 
@@ -2322,6 +2713,12 @@ struct PromptFacts {
     /// The prompt budget, and what it dropped.
     prompt_budget: Option<usize>,
     dropped: Dropped,
+    /// The template renders the prompt took (1, or more where the budget's
+    /// fit could not cut spans).
+    renders: u64,
+    /// The replies of ours the history carried, and what of them ran as
+    /// sampled.
+    spliced: front::Spliced,
 }
 
 impl PromptFacts {
@@ -2372,44 +2769,6 @@ impl PromptFacts {
     }
 }
 
-/// A chat request's prompt through the checkpoint's template. A value the
-/// template rejects, data it fails on, and a `reasoning_effort` it would not
-/// act on (not read, or no effect under the other variables) are the
-/// client's 400: an effort that is not available is refused, whichever
-/// spelling carried it.
-fn render_request(
-    engine: &dyn Served,
-    endpoint: &str,
-    messages: &Value,
-    kwargs: &Map<String, Value>,
-) -> Handled<(String, PromptFacts)> {
-    let rendered = engine
-        .render_checked(messages, kwargs, &[REASONING_EFFORT])
-        .map_err(template_failure)?;
-    let family = engine.capabilities().family;
-    if let Some(i) = rendered.ignored.first() {
-        let why = if i.reason == NOT_READ {
-            format!("{family}'s chat template does not read {REASONING_EFFORT}")
-        } else {
-            format!(
-                "{family}'s chat template renders the same prompt for any {REASONING_EFFORT} with \
-                 {ENABLE_THINKING}={}",
-                kwargs.get(ENABLE_THINKING).unwrap_or(&Value::Null)
-            )
-        };
-        eprintln!(
-            "[{endpoint}: {REASONING_EFFORT}={} refused: {why}]",
-            i.value
-        );
-        return Err(bad(format!("{REASONING_EFFORT}={}: {why}", i.value)));
-    }
-    let facts = PromptFacts {
-        reasoning_effort: kwargs.get(REASONING_EFFORT).cloned().unwrap_or(Value::Null),
-        ..PromptFacts::default()
-    };
-    Ok((rendered.text, facts))
-}
-
 /// A render failure: the client's 400 when the template refused or failed
 /// on the request's own data, the engine's 500 otherwise.
 fn template_failure(e: anyhow::Error) -> Failure {
@@ -2422,20 +2781,16 @@ fn template_failure(e: anyhow::Error) -> Failure {
     }
 }
 
-/// A request's `enable_thinking` on its encoded prompt (`thinking::apply`);
-/// thinking on where the prompt cannot think is the client's 400.
-fn apply_thinking(
-    engine: &dyn Served,
-    want: Option<bool>,
-    tags: Option<&super::template::ThinkTags>,
-    ids: &mut Vec<u32>,
-) -> Handled<Thinking> {
-    thinking::apply(want, tags, ids).map_err(|why| {
-        bad(format!(
-            "{ENABLE_THINKING}=true: {}: {why}",
-            engine.capabilities().family
-        ))
-    })
+/// A front-end failure: the client's 400 when the front end refused the
+/// request (an effort the template would not act on, thinking on where the
+/// prompt cannot think, an image it cannot expand) or the template refused
+/// or failed on its data; the engine's 500 otherwise.
+fn front_failure(endpoint: &str, e: anyhow::Error) -> Failure {
+    if let Some(r) = e.downcast_ref::<front::Refused>() {
+        eprintln!("[{endpoint}: refused: {r}]");
+        return bad(r.to_string());
+    }
+    template_failure(e)
 }
 
 /// Propagate admitted metadata refusal as an HTTP error, never successful
@@ -2447,11 +2802,22 @@ fn respond_metadata(request: Request, result: Result<Value>) -> Result<()> {
     }
 }
 
-fn health_body(engine: &dyn Served) -> Result<Value> {
+fn health_body(engine: &dyn Served, front: &Front) -> Result<Value> {
     let mut body = engine.health_checked()?;
     body["mem"] = MemSnapshot::read(engine.device()).json();
     body["capabilities"] = engine.capabilities().json();
     body["load_warnings"] = load_warnings_json(engine)?;
+    // The request front end's passes so far: a chat request renders its
+    // template once and tokenizes the result once.
+    body["template_renders"] = json!(engine.template_renders());
+    body["tokenizations"] = json!(front.tokenizations());
+    body["session_log"] = json!(front.logged());
+    // Whether a request's per-token logprobs are served here, and why not.
+    body["logprobs"] = match front::logprobs_refused(engine) {
+        None => json!({ "served": true, "top_max": lloom::nn::MAX_TOP_LOGPROBS }),
+        Some(why) => json!({ "served": false, "top_max": lloom::nn::MAX_TOP_LOGPROBS,
+                             "refused": why }),
+    };
     body["chat_template_reads"] = ENGINE_KWARGS
         .iter()
         .map(|&k| (k.to_string(), json!(engine.template_reads(k))))
@@ -2641,6 +3007,7 @@ pub fn bench(args: BenchArgs) -> Result<()> {
     // The cells are the server's handlers; they read the engine through
     // `Shared`, whose listener is unused here (a free loopback port).
     let server = Server::http("127.0.0.1:0").map_err(|e| anyhow::anyhow!("binding: {e}"))?;
+    let front = Front::new(engine.as_ref(), front::SessionOptions::of(&options.session));
     let shared = Shared {
         engine,
         decisions: super::decisions::Decisions::Refused(
@@ -2653,6 +3020,8 @@ pub fn bench(args: BenchArgs) -> Result<()> {
         server,
         model_name: model_name.clone(),
         sampling,
+        front,
+        reuse: parking_lot::Mutex::new(crate::turn::Tally::default()),
     };
     let batch = options.scheduler.max_sequences.max(1);
     for run in 0..options.bench.runs.max(1) {
@@ -3190,6 +3559,112 @@ mod stream_writer_tests {
             .collect();
         assert_eq!(body, "ctl<ab>mid<c>", "{out:?}");
     }
+
+    /// A writer whose writes wait on a gate (a client that stops reading),
+    /// or fail (a client that went away).
+    #[derive(Clone, Default)]
+    struct Gate {
+        open: Arc<(parking_lot::Mutex<bool>, parking_lot::Condvar)>,
+        written: Arc<Mutex<Vec<u8>>>,
+        writes: Arc<std::sync::atomic::AtomicUsize>,
+        fail: bool,
+    }
+    impl Write for Gate {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            if self.fail {
+                return Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "gone"));
+            }
+            self.writes
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let (m, c) = &*self.open;
+            let mut open = m.lock();
+            while !*open {
+                c.wait(&mut open);
+            }
+            self.written.lock().unwrap().extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn body(out: &[u8]) -> String {
+        String::from_utf8(out.to_vec())
+            .unwrap()
+            .split("\r\n")
+            .enumerate()
+            .filter(|(i, _)| i % 2 == 1)
+            .map(|(_, s)| s.to_string())
+            .collect()
+    }
+
+    /// A client that stops reading: the decode thread's hand-over never
+    /// waits on it, and what waits is the text handed over since the last
+    /// write — at most what was pushed, each byte once (no cumulative
+    /// snapshots), every byte delivered in order once the client reads.
+    /// The control channel is the other queue, and it is unbounded: what
+    /// this asserts is the text's backlog, not the channel's.
+    #[test]
+    fn a_client_that_stops_reading_holds_back_at_most_what_was_pushed() {
+        let gate = Gate::default();
+        let w = ChunkedWriter {
+            w: Box::new(gate.clone()),
+        };
+        let sw = StreamWriter::start_with_deltas(w, |t: &str| t.to_string());
+        sw.send("start".to_string());
+        while gate.writes.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            std::thread::yield_now();
+        }
+        let mut pushed = String::new();
+        for i in 0..2000 {
+            let frag = format!("{i:04},");
+            pushed.push_str(&frag);
+            sw.delta(&frag);
+        }
+        let backlog = sw.deltas.as_ref().unwrap().pending_bytes() + sw.spill.lock().len();
+        assert_eq!(
+            backlog,
+            pushed.len(),
+            "nothing taken while the writer waits, nothing twice"
+        );
+        {
+            let (m, c) = &*gate.open;
+            *m.lock() = true;
+            c.notify_all();
+        }
+        let (_w, err) = sw.finish().unwrap();
+        assert!(err.is_none());
+        assert_eq!(
+            body(&gate.written.lock().unwrap()),
+            format!("start{pushed}")
+        );
+    }
+
+    /// A client that went away: the failed write is latched, the producer
+    /// reads it (`client_gone`), and `finish` returns the error.
+    #[test]
+    fn a_client_that_went_away_is_reported_to_the_producer() {
+        let gate = Gate {
+            fail: true,
+            ..Gate::default()
+        };
+        let w = ChunkedWriter {
+            w: Box::new(gate.clone()),
+        };
+        let sw = StreamWriter::start_with_deltas(w, |t: &str| t.to_string());
+        sw.delta("a");
+        let t = std::time::Instant::now();
+        while !sw.client_gone() {
+            assert!(
+                t.elapsed() < std::time::Duration::from_secs(10),
+                "never latched"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let (_w, err) = sw.finish().unwrap();
+        assert_eq!(err.map(|e| e.kind()), Some(std::io::ErrorKind::BrokenPipe));
+    }
 }
 
 #[cfg(test)]
@@ -3318,7 +3793,7 @@ mod systemone_dispatch_tests {
 
 #[cfg(test)]
 mod metadata_consumer_tests {
-    use super::{health_body, models_body};
+    use super::{health_body, models_body, Front};
     use crate::app::served::tests::NoVision;
     use std::sync::atomic::Ordering;
 
@@ -3326,7 +3801,9 @@ mod metadata_consumer_tests {
     fn actual_metadata_bodies_propagate_refusal_without_legacy_fallback() {
         let engine = NoVision::refusing_metadata();
         assert_eq!(
-            health_body(&engine).unwrap_err().to_string(),
+            health_body(&engine, &Front::new(&engine, Default::default()))
+                .unwrap_err()
+                .to_string(),
             "bounded metadata health refusal",
             "actual health body must propagate refusal, not successful metadata",
         );

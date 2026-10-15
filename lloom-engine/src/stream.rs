@@ -6,6 +6,12 @@
 //! run ending on a `U+FFFD` replacement char is held until the next token
 //! completes it. Decoding only the not-yet-emitted tail keeps the cost linear
 //! in the output (the whole sequence each step would be quadratic).
+//!
+//! What a client is handed ([`TextStream::publish`]) also withholds stop
+//! strings: text that is a stop, or a prefix of one later tokens could
+//! complete, is held until the stop is ruled in (the run ends before it) or
+//! out (published). So the streamed text is the final text, never the stop
+//! string or what follows it.
 
 use lloom_tensor::Result;
 
@@ -22,6 +28,8 @@ pub struct TextStream {
     /// it every token re-scanned the whole reply — O(reply) a token, a cost
     /// that grows with the work done (§15.2 #10's corollary).
     checked: std::cell::Cell<usize>,
+    /// How much of `text` [`Self::publish`] has handed out.
+    published: usize,
 }
 
 impl TextStream {
@@ -31,7 +39,65 @@ impl TextStream {
             text: String::new(),
             pending: 0,
             checked: std::cell::Cell::new(0),
+            published: 0,
         }
+    }
+
+    /// Append `ids` and return the text a client may now be handed, and
+    /// whether a stop string was reached. The text is never a stop string or
+    /// a prefix of one: at a stop it ends where the stop begins; short of
+    /// one it ends before the longest suffix that begins a stop.
+    pub fn publish(
+        &mut self,
+        ids: &[u32],
+        detokenize: &mut impl FnMut(&[u32]) -> Result<String>,
+        stop_strings: &[String],
+    ) -> Result<(Option<String>, bool)> {
+        self.push(ids, detokenize)?;
+        let Some(longest) = stop_strings.iter().map(String::len).max() else {
+            return Ok((self.hand_out(self.text.len()), false));
+        };
+        let mut from = self.published.saturating_sub(longest.saturating_sub(1));
+        while !self.text.is_char_boundary(from) {
+            from -= 1;
+        }
+        let window = &self.text[from..];
+        if let Some(at) = stop_strings
+            .iter()
+            .filter(|s| !s.is_empty())
+            .filter_map(|s| window.find(s.as_str()))
+            .min()
+        {
+            return Ok((self.hand_out((from + at).max(self.published)), true));
+        }
+        let unpublished = &self.text[self.published..];
+        let held = stop_strings
+            .iter()
+            .filter_map(|s| {
+                (1..s.len()).rev().find(|&k| {
+                    k <= unpublished.len()
+                        && s.is_char_boundary(k)
+                        && unpublished.ends_with(&s[..k])
+                })
+            })
+            .max()
+            .unwrap_or(0);
+        Ok((self.hand_out(self.text.len() - held), false))
+    }
+
+    /// What [`Self::publish`] held back as a possible stop's beginning, for a
+    /// run that ended short of the stop.
+    pub fn held(&mut self) -> Option<String> {
+        self.hand_out(self.text.len())
+    }
+
+    fn hand_out(&mut self, to: usize) -> Option<String> {
+        if to <= self.published {
+            return None;
+        }
+        let out = self.text[self.published..to].to_string();
+        self.published = to;
+        Some(out)
     }
 
     /// Append `ids` and return the text they complete, if any; the text is
@@ -164,6 +230,68 @@ mod tests {
                                  // in text an earlier call searched.
         assert!(!st.hit_stop(&["def".to_string()]));
         assert_eq!(st.checked.get(), 9);
+        Ok(())
+    }
+
+    /// Every split of one id sequence into pushes: what is published, and
+    /// what the run's end flushes when no stop was reached, is exactly the
+    /// final text — never a stop string or a prefix of one that was then
+    /// completed.
+    #[test]
+    fn the_published_text_is_the_final_text_whatever_the_split() -> Result<()> {
+        // "hij" then "é" (ids 1, 2) then "kl": stops across tokens, inside a
+        // character, and one that never completes.
+        let ids = [7u32, 8, 9, 1, 2, 10, 11];
+        let cases: [&[&str]; 5] = [&["jé"], &["ék"], &["ijék"], &["jx"], &["éz", "kl"]];
+        for stops in cases {
+            let stops: Vec<String> = stops.iter().map(|s| s.to_string()).collect();
+            for mask in 0u32..(1 << (ids.len() - 1)) {
+                let mut st = TextStream::new(8);
+                let mut d = detok;
+                let (mut out, mut at, mut stopped) = (String::new(), 0, false);
+                for i in 0..ids.len() {
+                    if i + 1 == ids.len() || mask & (1 << i) != 0 {
+                        let (text, hit) = st.publish(&ids[at..=i], &mut d, &stops)?;
+                        out.push_str(text.as_deref().unwrap_or(""));
+                        at = i + 1;
+                        if hit {
+                            stopped = true;
+                            break;
+                        }
+                    }
+                }
+                if !stopped {
+                    out.push_str(st.held().as_deref().unwrap_or(""));
+                }
+                let (fin, _) = st.finish(&stops);
+                assert_eq!(out, fin, "stops {stops:?} split {mask:06b}");
+                for s in &stops {
+                    assert!(!out.contains(s.as_str()), "{s:?} published: {out:?}");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_prefix_of_a_stop_is_held_until_ruled_out() -> Result<()> {
+        let mut st = TextStream::new(8);
+        let mut d = detok;
+        let stops = vec!["jkl".to_string()];
+        assert_eq!(
+            st.publish(&[7, 8, 9], &mut d, &stops)?,
+            (Some("hi".into()), false)
+        );
+        assert_eq!(
+            st.publish(&[10], &mut d, &stops)?,
+            (None, false),
+            "\"jk\" may begin it"
+        );
+        assert_eq!(
+            st.publish(&[3], &mut d, &stops)?,
+            (Some("jkd".into()), false)
+        );
+        assert_eq!(st.held(), None);
         Ok(())
     }
 

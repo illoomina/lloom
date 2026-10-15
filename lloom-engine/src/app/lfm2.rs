@@ -1732,6 +1732,7 @@ impl<P: Lfm2Shape> Engine<P> {
             return self.complete_batched(sched, prompt_ids, params, on_fragment);
         }
         let reuse = self.reuse_prefix;
+        let params = &*params.under_reuse(reuse);
         let detok = self.detok();
         self.with_single(|s, extra| {
             // A text prompt leaves no image rows in the held cache.

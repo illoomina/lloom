@@ -19,7 +19,9 @@ use lloom::generation::{Blocking, LogitsProcessor, Sampling};
 use lloom::models::qwen3_5::testing::{Qwen3_5MoeTiny, Qwen3_5Tiny};
 use lloom::models::qwen3_5::Config;
 use lloom::models::qwen4exp::{GdnState, KvCache};
-use lloom::nn::decoder::{DecoderState, HybridState, Layer, PreNormState, StateCapacity};
+use lloom::nn::decoder::{
+    DecodeRecovery, DecoderState, HybridState, Layer, PreNormState, StateCapacity,
+};
 use lloom::nn::model::{CacheReset, CacheRewind, CausalLM};
 use lloom::nn::{DecodeOptions, IdentityProposer, ReuseAction, Session};
 use lloom::profile::{CrownExact, Profile, RewindableExact};
@@ -272,7 +274,12 @@ fn dense<P: Profile>(
     let cap = model.capacity();
     model.set_capacity(StateCapacity {
         checkpoints: 2,
-        window,
+        verify: window,
+        recovery: if window >= 1 {
+            DecodeRecovery::Standing
+        } else {
+            DecodeRecovery::None
+        },
         ..cap
     });
     Ok((model, ckpt.cfg.clone()))

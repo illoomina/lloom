@@ -26,7 +26,7 @@ use lloom::models::qwen3_5::testing::Qwen3_5Tiny;
 use lloom::models::qwen3_5::Config;
 use lloom::models::qwen4exp::testing::resident_model;
 use lloom::nn::decoder::{DecodeRecovery, StateCapacity};
-use lloom::nn::model::{CacheRewind, CausalLM};
+use lloom::nn::model::{CacheReset, CacheRewind, CausalLM};
 use lloom::nn::{CheckpointPolicy, DecodeOptions, IdentityProposer, ReuseAction, Session};
 use lloom::profile::CrownExact;
 use lloom::testing::tiny::{TinyCheckpoint, Weights};
@@ -76,7 +76,7 @@ fn request<M: CausalLM>(
     dev: &Device,
 ) -> Result<(ReuseAction, Option<usize>)>
 where
-    M::Cache: CacheRewind,
+    M::Cache: CacheRewind + CacheReset,
 {
     let p = s.prepare(full)?;
     let pos = s.pos();
@@ -121,7 +121,7 @@ fn live_session<M: CausalLM>(
     dev: &Device,
 ) -> Result<()>
 where
-    M::Cache: CacheRewind,
+    M::Cache: CacheRewind + CacheReset,
 {
     let mut s = Session::new(model, cache);
     let at = |s: &mut Session<'_, M>| sorted(positions(s.cache_mut()));
@@ -303,7 +303,7 @@ fn policy_rounds<M: CausalLM>(
     dev: &Device,
 ) -> Result<(Vec<Vec<u32>>, Option<(u64, u64)>)>
 where
-    M::Cache: CacheRewind,
+    M::Cache: CacheRewind + CacheReset,
 {
     let Device::Metal(m) = dev else {
         unreachable!("a Metal device")
@@ -348,7 +348,7 @@ fn plans_follow_the_policy<M: CausalLM>(
     build: impl Fn(&Device) -> Result<(M, M::Config)>,
 ) -> Result<()>
 where
-    M::Cache: CacheRewind,
+    M::Cache: CacheRewind + CacheReset,
 {
     use lloom_tensor::metal_backend::ArenaLayout;
     let off = Device::new_metal(0)?;

@@ -261,8 +261,12 @@ pub struct DecodeParams {
     /// (`thinking::checkpoint_tail`, the load-time constant): the prefill
     /// leaves its turn checkpoint before it (`CausalLM::checkpoint_at`), so
     /// the next request, whose render keeps everything before it, is a
-    /// restore there rather than a fresh prefill. 0: no hint.
+    /// restore there rather than a fresh prefill. 0: the checkpoint goes at
+    /// the prompt's end (`turn::CheckpointPolicy::of`).
     pub turn_tail: usize,
+    /// The owner keeps nothing of this request's state for the next one
+    /// (prefix reuse off): its prefill leaves no turn checkpoint.
+    pub no_checkpoint: bool,
     /// Keep each returned id's log-probability (`Decoded::logprobs`). A host
     /// read of every step's logits: the run takes the blocking arm, as the
     /// logits digest does, and the speculative body and the batch scheduler
@@ -304,6 +308,20 @@ impl DecodeParams {
             (Some(k), None) => Sampling::TopK { k, temperature },
             (None, Some(p)) => Sampling::TopP { p, temperature },
             (None, None) => Sampling::All { temperature },
+        }
+    }
+
+    /// These params under an owner whose prefix reuse is `reuse`: with reuse
+    /// off nothing of the request is kept for the next one, so its prefill
+    /// leaves no turn checkpoint.
+    pub fn under_reuse(&self, reuse: bool) -> std::borrow::Cow<'_, Self> {
+        if reuse || self.no_checkpoint {
+            std::borrow::Cow::Borrowed(self)
+        } else {
+            std::borrow::Cow::Owned(Self {
+                no_checkpoint: true,
+                ..self.clone()
+            })
         }
     }
 
@@ -355,6 +373,7 @@ impl Default for DecodeParams {
             prefill_tile: 0,
             thinking: None,
             turn_tail: 0,
+            no_checkpoint: false,
             logprobs: None,
             cold: false,
         }
@@ -378,6 +397,10 @@ pub struct Decoded {
     /// What the request reused of the session, and why not more
     /// ([`crate::turn`]).
     pub turn: crate::turn::TurnReuse,
+    /// The turn checkpoint the request's prefill was asked to leave, and the
+    /// position it resolves to (`None` for none).
+    pub checkpoint: crate::turn::CheckpointPolicy,
+    pub checkpoint_at: Option<usize>,
     /// The readback arm that ran: resolved (never [`ReadbackArm::Auto`]), and
     /// on the fixed cadence wherever the adaptive commit did not run.
     pub readback: ReadbackArm,
@@ -393,6 +416,13 @@ pub struct Decoded {
     /// Per returned id, its log-probability (and what else
     /// `DecodeParams::logprobs` asked for).
     pub logprobs: Option<Logprobs>,
+}
+
+impl Decoded {
+    /// The turn checkpoint the request asked for: `none`, `end@P` or `at@P`.
+    pub fn checkpoint_name(&self) -> String {
+        self.checkpoint.name(self.checkpoint_at.unwrap_or(0))
+    }
 }
 
 /// A decode session: a borrowed target and the sequence it drives — the cache,
@@ -710,7 +740,7 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
             lloom_tensor::bail!("DecodeSession::decode: eos_ids is empty; a run needs an EOS set");
         }
         let (prepared, turn) = crate::turn::prepare(&mut self.session, prompt_ids, true)?;
-        self.hint_checkpoint(&prepared, params.turn_tail)?;
+        let (checkpoint, checkpoint_at) = self.establish_checkpoint(&prepared, params)?;
 
         let mut sampler = params.sampler();
         sampler.observe_prompt(prompt_ids);
@@ -738,6 +768,7 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
             let (chunk, stopped) = stream.publish(batch, &mut detokenize, &params.stop_strings)?;
             if let Some(chunk) = chunk {
                 if !on_fragment(&chunk) {
+                    stream.refuse_last();
                     cancelled = true;
                     return Ok(false);
                 }
@@ -945,7 +976,9 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
         // as its possible beginning.
         if !cancelled && !stopped_on_string {
             if let Some(rest) = stream.held() {
-                on_fragment(&rest);
+                if !on_fragment(&rest) {
+                    stream.refuse_last();
+                }
             }
         }
 
@@ -960,6 +993,8 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
             reused: prepared.reused,
             prefilled: prepared.suffix.len(),
             turn,
+            checkpoint,
+            checkpoint_at,
             readback: ran,
             logits_sha256: sampler.logits_digest(),
             stats: out.stats,
@@ -970,19 +1005,35 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
 }
 
 impl<'m, M: CausalLM> DecodeSession<'m, M> {
-    /// Where the prefill of `prepared.suffix` should leave its turn
-    /// checkpoint: `tail` tokens before the prompt's end, the position the
-    /// next turn's render returns to (`DecodeParams::turn_tail`). A suffix
-    /// no longer than the tail ends where it starts, and the hint is the
-    /// current position (the state as it stands).
-    fn hint_checkpoint(&mut self, prepared: &lloom::nn::Prepared, tail: usize) -> Result<()> {
-        if tail == 0 {
-            return Ok(());
-        }
-        let end = self.session.pos() + prepared.suffix.len();
-        let at = end.saturating_sub(tail).max(self.session.pos());
+    /// The turn checkpoint this request's prefill leaves
+    /// ([`crate::turn::CheckpointPolicy::of`]), established on the cache
+    /// whatever the request before it asked; returned with the position it
+    /// resolves to.
+    ///
+    /// Until the checkpoint ring takes a request's policy itself
+    /// (`sequence-reuse-design.md` §2.3b), it is expressed through the
+    /// cache's one hint (`CausalLM::checkpoint_at`):
+    /// `At` and `End` hint their position, which a pass covering it meets
+    /// and no other tile does; `None` hints a position no pass reaches, which
+    /// the next request's hint replaces. A cache without checkpoints ignores
+    /// every hint.
+    fn establish_checkpoint(
+        &mut self,
+        prepared: &lloom::nn::Prepared,
+        params: &DecodeParams,
+    ) -> Result<(crate::turn::CheckpointPolicy, Option<usize>)> {
+        let pos = self.session.pos();
+        let end = pos + prepared.suffix.len();
+        let policy = crate::turn::CheckpointPolicy::of(
+            pos,
+            prepared.suffix.len(),
+            params.turn_tail,
+            !params.no_checkpoint,
+        );
+        let at = policy.position(end);
         let model = self.session.model();
-        model.checkpoint_at(self.session.cache_mut(), at)
+        model.checkpoint_at(self.session.cache_mut(), at.unwrap_or(usize::MAX))?;
+        Ok((policy, at))
     }
 
     /// [`Self::decode_until`] through the speculative body: `spec` drafts a
@@ -1030,7 +1081,7 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
         // A prompt the cache holds whole re-feeds its last token: the first
         // round needs the target's probe there, which held logits lack.
         let (prepared, turn) = crate::turn::prepare(&mut self.session, prompt_ids, false)?;
-        self.hint_checkpoint(&prepared, params.turn_tail)?;
+        let (checkpoint, checkpoint_at) = self.establish_checkpoint(&prepared, params)?;
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let mut stream = crate::stream::TextStream::new(params.max_tokens);
         let mut stopped_on_string = false;
@@ -1042,6 +1093,7 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
             let (chunk, stopped) = stream.publish(batch, &mut detokenize, &params.stop_strings)?;
             if let Some(chunk) = chunk {
                 if !on_fragment(&chunk) {
+                    stream.refuse_last();
                     cancelled = true;
                     stop.store(true, std::sync::atomic::Ordering::Release);
                     return Ok(());
@@ -1088,7 +1140,9 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
         };
         if !cancelled && !stopped_on_string {
             if let Some(rest) = stream.held() {
-                on_fragment(&rest);
+                if !on_fragment(&rest) {
+                    stream.refuse_last();
+                }
             }
         }
         let (text, _) = stream.finish(&params.stop_strings);
@@ -1101,6 +1155,8 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
             reused: prepared.reused,
             prefilled: prepared.suffix.len(),
             turn,
+            checkpoint,
+            checkpoint_at,
             readback: ReadbackArm::Speculative { k },
             logits_sha256: sampler.logits_digest(),
             stats: out.stats,

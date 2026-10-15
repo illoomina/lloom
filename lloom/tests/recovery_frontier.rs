@@ -454,7 +454,10 @@ fn the_eos_watch_bounds_the_overrun_past_a_late_stop() -> Result<()> {
             o2.produced, o2.overrun
         );
         assert_eq!(seen2, want, "{at}, the ring reused: the stream");
-        assert_eq!(o2.produced, cut, "{at}, the ring reused: the ids end at the EOS");
+        assert_eq!(
+            o2.produced, cut,
+            "{at}, the ring reused: the ids end at the EOS"
+        );
         assert!(o2.overrun <= lead + 1, "{at}, the ring reused: bounded");
     }
     Ok(())

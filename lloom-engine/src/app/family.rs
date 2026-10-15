@@ -1243,7 +1243,10 @@ mod tests {
             "{note}"
         );
         let mut s = with("ring-nonblocking");
-        assert_eq!(clamp_ungated_eos_gate(&qwen3_5_capabilities(true), &mut s), None);
+        assert_eq!(
+            clamp_ungated_eos_gate(&qwen3_5_capabilities(true), &mut s),
+            None
+        );
         assert!(s.decode.readback.eos_gate, "on: kept");
     }
 

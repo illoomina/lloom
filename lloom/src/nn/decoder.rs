@@ -933,6 +933,22 @@ impl<L: Layer> DecoderState<L> {
         self.ckpt.hinted()
     }
 
+    /// Open a request whose prefill ends at `end`
+    /// (`CheckpointRing::open_request`).
+    pub fn open_checkpoint_request(&mut self, policy: crate::nn::CheckpointPolicy, end: usize) {
+        self.ckpt.open_request(policy, end);
+    }
+
+    /// Close the open request (`CheckpointRing::close_request`).
+    pub fn close_checkpoint_request(&mut self) {
+        self.ckpt.close_request();
+    }
+
+    /// The policy of the open request, if one is open.
+    pub fn checkpoint_request(&self) -> Option<crate::nn::CheckpointPolicy> {
+        self.ckpt.request_policy()
+    }
+
     /// Whether [`Self::restore`] can put the state back at exactly `pos`: a
     /// checkpoint stands there and no verify window is open (a standing
     /// one is settled by the restore).
@@ -1719,6 +1735,21 @@ where
 
     fn checkpoint_at(&self, cache: &mut Self::Cache, pos: usize) -> Result<()> {
         cache.checkpoint_at(pos);
+        Ok(())
+    }
+
+    fn open_checkpoint_request(
+        &self,
+        cache: &mut Self::Cache,
+        policy: crate::nn::CheckpointPolicy,
+        end: usize,
+    ) -> Result<()> {
+        cache.open_checkpoint_request(policy, end);
+        Ok(())
+    }
+
+    fn close_checkpoint_request(&self, cache: &mut Self::Cache) -> Result<()> {
+        cache.close_checkpoint_request();
         Ok(())
     }
 

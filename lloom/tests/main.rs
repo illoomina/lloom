@@ -79,6 +79,7 @@ mod optimizer_remarks;
 mod optimizer_walk;
 mod page_cache_probe;
 mod pos_embed_resample_tests;
+mod prefill_window_gemm;
 mod quant_kind_throughput;
 mod qwen3_5_mtp;
 mod qwen3_5_tiny;

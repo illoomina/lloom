@@ -2124,7 +2124,7 @@ impl ReadbackStrategy for Ring {
                 processors: false,
                 budget: false,
                 digest: false,
-                logprobs: false,
+                logprobs: None,
             },
         )
     }

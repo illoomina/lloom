@@ -145,9 +145,16 @@ pub struct Asks<'a> {
     pub budget: bool,
     /// The logits digest.
     pub digest: bool,
-    /// Each drawn id's log-probability (a host read of every step's row).
-    pub logprobs: bool,
+    /// Per-token logprobs (a host read of every step's row): `Some(k)` is
+    /// each drawn id's log-probability and the `k` most likely ids beside
+    /// it, `k` at most [`MAX_TOP_LOGPROBS`].
+    pub logprobs: Option<usize>,
 }
+
+/// The most candidates a per-token logprobs ask may name beside the drawn
+/// id: the bound of the API's shape. The chat route's one-forward decision
+/// scoring serves up to 64, so the bound is that rather than OpenAI's 20.
+pub const MAX_TOP_LOGPROBS: usize = 64;
 
 impl<'a> Asks<'a> {
     /// What `sampler` asks, with or without a thinking budget.
@@ -157,7 +164,7 @@ impl<'a> Asks<'a> {
             processors: sampler.processors().is_some(),
             budget,
             digest: sampler.digests(),
-            logprobs: false,
+            logprobs: None,
         }
     }
 }
@@ -179,6 +186,12 @@ pub fn refuse(body: Body, asks: &Asks<'_>) -> Result<()> {
         asks.sampling,
         Sampling::TopK { .. } | Sampling::TopP { .. } | Sampling::TopKThenTopP { .. }
     );
+    if let Some(k) = asks.logprobs.filter(|&k| k > MAX_TOP_LOGPROBS) {
+        lloom_tensor::bail!(
+            "per-token logprobs name at most {MAX_TOP_LOGPROBS} candidates beside the drawn id, \
+             not {k}"
+        );
+    }
     match body {
         Body::Step { ring: true } if host_sort => lloom_tensor::bail!(
             "the ring needs a device-resident sampler (argmax, multinomial or gumbel-max); \
@@ -189,11 +202,11 @@ pub fn refuse(body: Body, asks: &Asks<'_>) -> Result<()> {
             "the ring draws on the device and the logits digest reads every step's logits on \
              the host: the digest runs on the blocking arm"
         ),
-        Body::Step { ring: true } if asks.logprobs => lloom_tensor::bail!(
+        Body::Step { ring: true } if asks.logprobs.is_some() => lloom_tensor::bail!(
             "the ring draws on the device and the per-token logprobs read every step's row on \
              the host: they run on the blocking arm"
         ),
-        Body::Window if asks.logprobs => lloom_tensor::bail!(
+        Body::Window if asks.logprobs.is_some() => lloom_tensor::bail!(
             "the window reads back the ids a round keeps, never a row of logits: the per-token \
              logprobs are the non-speculative body's"
         ),
@@ -207,7 +220,7 @@ pub fn refuse(body: Body, asks: &Asks<'_>) -> Result<()> {
             "a batched body does not carry a thinking budget: its rows feed no forced token \
              (serve it at a batch of 1)"
         ),
-        Body::BatchedStep | Body::BatchedWindow if asks.logprobs => lloom_tensor::bail!(
+        Body::BatchedStep | Body::BatchedWindow if asks.logprobs.is_some() => lloom_tensor::bail!(
             "a batched body does not keep per-token logprobs: its rows draw on the device and \
              read the ids back (serve it at a batch of 1)"
         ),

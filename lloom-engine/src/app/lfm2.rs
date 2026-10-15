@@ -1736,7 +1736,7 @@ impl<P: Lfm2Shape> Engine<P> {
         self.with_single(|s, extra| {
             // A text prompt leaves no image rows in the held cache.
             extra.image_keys.clear();
-            if !reuse {
+            if !reuse || params.cold {
                 s.reset();
             }
             match &mut extra.spec {
@@ -2018,14 +2018,16 @@ impl<P: Lfm2Shape> Engine<P> {
                     if cancel.load(Ordering::Acquire) {
                         continue;
                     }
-                    if let Some(chunk) = stream.push(&ids, &mut detok)? {
+                    let (chunk, stopped) =
+                        stream.publish(&ids, &mut detok, &params.stop_strings)?;
+                    if let Some(chunk) = chunk {
                         if !on_fragment(&chunk) {
                             cancelled = true;
                             cancel.store(true, Ordering::Release);
                             continue;
                         }
                     }
-                    if stream.hit_stop(&params.stop_strings) {
+                    if stopped {
                         stopped_on_string = true;
                         cancel.store(true, Ordering::Release);
                     }
@@ -2044,6 +2046,11 @@ impl<P: Lfm2Shape> Engine<P> {
         } else {
             Stop::Length
         };
+        if stop != Stop::Cancelled && !stopped_on_string {
+            if let Some(rest) = stream.held() {
+                on_fragment(&rest);
+            }
+        }
         let (text, _) = stream.finish(&params.stop_strings);
         Ok(Decoded {
             text,
@@ -2053,6 +2060,7 @@ impl<P: Lfm2Shape> Engine<P> {
             reuse: done.reuse,
             reused: done.reused,
             prefilled: done.prefilled,
+            turn: done.turn,
             readback: match self.dspark_k {
                 Some(k) => ReadbackArm::Speculative { k },
                 None => ReadbackArm::Batched {
@@ -2835,7 +2843,7 @@ fn static_dspark_body<'a, 'm, P: Profile>(
                 processors: false,
                 budget: false,
                 digest: false,
-                logprobs: false,
+                logprobs: None,
             },
         )
         .map_err(|e| lloom_tensor::Error::Msg(format!("row {i}: {e}")))?;
@@ -3071,6 +3079,9 @@ impl<P: Lfm2Shape> super::served::Served for Engine<P> {
     }
     fn readback(&self) -> ReadbackArm {
         self.readback
+    }
+    fn reuse_prefix(&self) -> Option<bool> {
+        Some(self.reuse_prefix)
     }
     fn prefill_tile(&self) -> usize {
         self.prefill_tile

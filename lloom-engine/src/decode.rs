@@ -268,6 +268,9 @@ pub struct DecodeParams {
     /// logits digest does, and the speculative body and the batch scheduler
     /// refuse it. `None` costs nothing.
     pub logprobs: Option<LogprobRequest>,
+    /// Start this run on an empty session whatever the owner's prefix reuse:
+    /// a benchmark cell that measures a cold prefill stays cold with reuse on.
+    pub cold: bool,
 }
 
 /// What a run keeps of each step's distribution: the drawn id's
@@ -328,7 +331,7 @@ impl DecodeParams {
                 processors: self.processors.is_active(),
                 budget: self.thinking.is_some(),
                 digest: self.logits_digest,
-                logprobs: self.logprobs.is_some(),
+                logprobs: self.logprobs.map(|r| r.top),
             },
         )
         .map_err(|e| lloom_tensor::Error::Msg(format!("{path}: {e}")))
@@ -353,6 +356,7 @@ impl Default for DecodeParams {
             thinking: None,
             turn_tail: 0,
             logprobs: None,
+            cold: false,
         }
     }
 }
@@ -371,6 +375,9 @@ pub struct Decoded {
     /// Prompt tokens actually prefilled — the request's length minus `reused`,
     /// except under [`ReuseAction::Resume`] where nothing is.
     pub prefilled: usize,
+    /// What the request reused of the session, and why not more
+    /// ([`crate::turn`]).
+    pub turn: crate::turn::TurnReuse,
     /// The readback arm that ran: resolved (never [`ReadbackArm::Auto`]), and
     /// on the fixed cadence wherever the adaptive commit did not run.
     pub readback: ReadbackArm,
@@ -702,7 +709,7 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
         if params.eos_ids.is_empty() {
             lloom_tensor::bail!("DecodeSession::decode: eos_ids is empty; a run needs an EOS set");
         }
-        let prepared = self.session.prepare(prompt_ids)?;
+        let (prepared, turn) = crate::turn::prepare(&mut self.session, prompt_ids, true)?;
         self.hint_checkpoint(&prepared, params.turn_tail)?;
 
         let mut sampler = params.sampler();
@@ -724,16 +731,18 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
         let mut cancelled = false;
 
         // The streaming hook, shared by every arm: decode only the
-        // not-yet-emitted tokens, hold a run ending mid-character, and let a
-        // stop string end the run (`TextStream`).
+        // not-yet-emitted tokens, hold a run ending mid-character or on what
+        // may begin a stop string, and let a stop string end the run
+        // (`TextStream::publish`).
         let mut on_tokens = |batch: &[u32]| -> Result<bool> {
-            if let Some(chunk) = stream.push(batch, &mut detokenize)? {
+            let (chunk, stopped) = stream.publish(batch, &mut detokenize, &params.stop_strings)?;
+            if let Some(chunk) = chunk {
                 if !on_fragment(&chunk) {
                     cancelled = true;
                     return Ok(false);
                 }
             }
-            if stream.hit_stop(&params.stop_strings) {
+            if stopped {
                 stopped_on_string = true;
                 return Ok(false);
             }
@@ -932,6 +941,13 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
         } else {
             Stop::Length
         };
+        // A run that ended short of the stop string hands out what was held
+        // as its possible beginning.
+        if !cancelled && !stopped_on_string {
+            if let Some(rest) = stream.held() {
+                on_fragment(&rest);
+            }
+        }
 
         let (text, _) = stream.finish(&params.stop_strings);
         let thinking = params.thinking.as_ref().map(|b| b.report(&out.ids));
@@ -943,6 +959,7 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
             reuse: prepared.action,
             reused: prepared.reused,
             prefilled: prepared.suffix.len(),
+            turn,
             readback: ran,
             logits_sha256: sampler.logits_digest(),
             stats: out.stats,
@@ -1012,7 +1029,7 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
         sampler.observe_prompt(prompt_ids);
         // A prompt the cache holds whole re-feeds its last token: the first
         // round needs the target's probe there, which held logits lack.
-        let prepared = self.session.prepare_with(prompt_ids, false)?;
+        let (prepared, turn) = crate::turn::prepare(&mut self.session, prompt_ids, false)?;
         self.hint_checkpoint(&prepared, params.turn_tail)?;
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let mut stream = crate::stream::TextStream::new(params.max_tokens);
@@ -1022,14 +1039,15 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
             if stop.load(std::sync::atomic::Ordering::Acquire) {
                 return Ok(());
             }
-            if let Some(chunk) = stream.push(batch, &mut detokenize)? {
+            let (chunk, stopped) = stream.publish(batch, &mut detokenize, &params.stop_strings)?;
+            if let Some(chunk) = chunk {
                 if !on_fragment(&chunk) {
                     cancelled = true;
                     stop.store(true, std::sync::atomic::Ordering::Release);
                     return Ok(());
                 }
             }
-            if stream.hit_stop(&params.stop_strings) {
+            if stopped {
                 stopped_on_string = true;
                 stop.store(true, std::sync::atomic::Ordering::Release);
             }
@@ -1068,6 +1086,11 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
         } else {
             Stop::Length
         };
+        if !cancelled && !stopped_on_string {
+            if let Some(rest) = stream.held() {
+                on_fragment(&rest);
+            }
+        }
         let (text, _) = stream.finish(&params.stop_strings);
         let thinking = params.thinking.as_ref().map(|b| b.report(&out.ids));
         Ok(Decoded {
@@ -1077,6 +1100,7 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
             reuse: prepared.action,
             reused: prepared.reused,
             prefilled: prepared.suffix.len(),
+            turn,
             readback: ReadbackArm::Speculative { k },
             logits_sha256: sampler.logits_digest(),
             stats: out.stats,

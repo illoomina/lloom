@@ -745,6 +745,9 @@ where
     fn readback(&self) -> ReadbackArm {
         self.readback
     }
+    fn reuse_prefix(&self) -> Option<bool> {
+        Some(self.reuse_prefix)
+    }
     fn prefill_tile(&self) -> usize {
         self.prefill_tile
     }
@@ -867,7 +870,7 @@ where
         let reuse = self.reuse_prefix;
         let detok = self.detok();
         self.with_single(|s, extra| {
-            if !reuse {
+            if !reuse || params.cold {
                 s.reset();
             }
             if self.mtp.is_some() {

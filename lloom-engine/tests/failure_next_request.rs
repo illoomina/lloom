@@ -7,10 +7,15 @@
 //! What a server does with a failed request is what the driver below does:
 //! the error goes to the client, and the request's lease resets the session
 //! before the next request (`app::request_slot`). The failure is injected
-//! into the model's forward at a chosen decode step, past the reply's EOS,
-//! while the reader is slow (the overrun is long, so gated forwards are
-//! queued behind the one that fails): an error out of the decode loop with
-//! the gate armed and fired.
+//! into the model's forward at a chosen decode step past the reply's EOS,
+//! while the reader is slow: an error out of the decode loop with the gate
+//! armed (whether its flag is already set when the failing forward is
+//! encoded is the device's race; the drain below holds either way).
+//! Without the watch the slow reader leaves the loop running, so the
+//! failure is three forwards past the EOS with gated forwards queued behind
+//! it; the watch stops encoding a forward or two past the EOS, so there it
+//! is the first forward past it, the one the watch cannot have stopped (it
+//! is encoded before the EOS is published).
 //!
 //! Per arm, one session takes: a reply ending on EOS; the next request,
 //! failing in its overrun; the same request again; a cancelled request (a
@@ -231,7 +236,7 @@ fn serve(
             if r.slow_after.is_some_and(|n| delivered >= n) {
                 std::thread::sleep(SLOW);
             }
-            !r.cancel_after.is_some_and(|n| delivered >= n)
+            r.cancel_after.is_none_or(|n| delivered < n)
         });
         model.arm(None);
         let turn = match result {
@@ -297,14 +302,16 @@ fn stream_of(
 
 /// The request sequence, built from the blocking arm's streams so every
 /// stop lands where the scenario says.
-fn requests(model: &Faulty, cfg: &Config, dev: &Device) -> Result<(u32, Vec<Req>)> {
+fn requests(model: &Faulty, cfg: &Config, dev: &Device, watch: bool) -> Result<(u32, Vec<Req>)> {
     let p1: Vec<u32> = vec![1, 3, 5, 7, 9];
     let s1 = stream_of(model, cfg, dev, &p1, 32)?;
     let cut1 = fresh(&s1, 6);
     let eos = s1[cut1];
     let reply1 = s1[..cut1].to_vec();
     // The next request, whose own EOS comes early: its failure is injected
-    // three forwards past it, inside the overrun a slow reader leaves.
+    // past it, inside the overrun (three forwards past it, where a slow
+    // reader leaves the loop running; under the watch the first forward past
+    // it, encoded before the EOS is published).
     let p2: Vec<u32> = [p1.clone(), reply1.clone(), vec![10, 20, 30]].concat();
     let s2 = stream_of(model, cfg, dev, &p2, 32)?;
     let cut2 = fresh(&s2, 3);
@@ -320,7 +327,7 @@ fn requests(model: &Faulty, cfg: &Config, dev: &Device) -> Result<(u32, Vec<Req>
             max_tokens: 3000,
             eos: Some(eos2),
             slow_after: Some(cut2),
-            fail_at: Some(cut2 + 3),
+            fail_at: Some(if watch { cut2 + 1 } else { cut2 + 3 }),
             ..Req::default()
         },
         Req {
@@ -340,7 +347,7 @@ fn matrix(watch: bool) -> Result<()> {
     let api = lloom_tensor::tuning::tuning().metal.command_api.clone();
     let dev = Device::new_metal(0)?;
     let (model, cfg) = model(&dev)?;
-    let (eos, first) = requests(&model, &cfg, &dev)?;
+    let (eos, first) = requests(&model, &cfg, &dev, watch)?;
 
     // The reference, then the arms, over the same requests. The scenario's
     // later requests carry the ids each continuation was given, so they are
@@ -426,25 +433,18 @@ fn matrix(watch: bool) -> Result<()> {
                 t.ids.len(),
             );
         }
-        // The failure: injected three forwards past the reply's EOS. Without
-        // the watch the slow reader leaves the loop running there; with it
-        // the loop stops at the EOS's overrun of two and the forward that
-        // would fail never runs.
-        match got[1].error.as_deref() {
-            Some(e) => {
-                assert!(e.contains("injected"), "{arm}: {e}");
-                if gate {
-                    assert_eq!(
-                        got[1].drained,
-                        Some(true),
-                        "{arm}: a failed gated run leaves no gated work for the next run's cleared flag"
-                    );
-                }
-            }
-            // The watch stops the loop at the EOS's overrun of two, before
-            // the forward that would fail; without it the slow reader leaves
-            // the loop running there.
-            None => assert!(watch, "{arm}: the request did not fail"),
+        // The failure, injected past the reply's EOS, fires on every arm.
+        let e = got[1]
+            .error
+            .as_deref()
+            .unwrap_or_else(|| panic!("{arm}: the request did not fail"));
+        assert!(e.contains("injected"), "{arm}: {e}");
+        if gate {
+            assert_eq!(
+                got[1].drained,
+                Some(true),
+                "{arm}: a failed gated run leaves no gated work for the next run's cleared flag"
+            );
         }
         // The stops the device decides (EOS, length) return the blocking
         // arm's ids; a host stop (a cancellation, a stop string) returns

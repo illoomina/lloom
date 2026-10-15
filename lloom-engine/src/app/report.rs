@@ -79,6 +79,8 @@ pub struct RunProbe {
     pool_contention: Option<lloom_tensor::kernels::metal::contention::PoolContention>,
     faults: (u64, u64),
     mem: Option<MemGauge>,
+    /// The prefill window's launches before the run, for its receipt.
+    prefill_gemms: u64,
     /// The run's start, for the profile's window (Metal only).
     #[cfg_attr(not(feature = "metal"), allow(dead_code))]
     started: std::time::Instant,
@@ -109,6 +111,7 @@ impl RunProbe {
             },
             faults: rusage_faults(),
             mem: mem_sample.then(|| MemGauge::start(device, true)),
+            prefill_gemms: lloom_tensor::tuning::Window::Prefill.gemms(),
             started: std::time::Instant::now(),
         }
     }
@@ -157,6 +160,10 @@ impl RunProbe {
             }
         }
         print_census_and_phases(stats);
+        eprintln!(
+            "PREFILL_WINDOW {}",
+            lloom_tensor::tuning::prefill_window_report(self.prefill_gemms)
+        );
         if let Some(g) = stats.eos_gate {
             eprintln!(
                 "[eos gate: fired={} gate kernels={}; overrun {} forwards{}]",

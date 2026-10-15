@@ -608,7 +608,10 @@ impl<'m, M: BatchedCausalLM, R: BorrowMut<Session<'m, M>>> BatchDecoder<'m, M, R
                         fresh: s.seq.pos == 0,
                     },
                 )?;
-                let out = s.model.forward(&input, s.seq.pos, &mut s.seq.cache);
+                let out = {
+                    let _prefill = lloom_tensor::tuning::VerifyWindow::prefill();
+                    s.model.forward(&input, s.seq.pos, &mut s.seq.cache)
+                };
                 end_pass(&device)?;
                 self.pacer.after_forward(&device)?;
                 last = Some(out?);

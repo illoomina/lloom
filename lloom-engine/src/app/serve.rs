@@ -4068,7 +4068,10 @@ mod logprob_request_tests {
         assert_eq!(logprob_request(None, None), None);
         assert_eq!(
             logprob_request(Some(0), None),
-            Some(LogprobRequest { top: 0, rows: false })
+            Some(LogprobRequest {
+                top: 0,
+                rows: false
+            })
         );
         assert_eq!(
             logprob_request(None, Some(LogprobRequest { top: 0, rows: true })),

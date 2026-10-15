@@ -364,7 +364,17 @@ fn the_eos_watch_bounds_the_served_overrun_past_a_slow_consumer() -> Result<()> 
     let next: Vec<u32> = [prompt.clone(), reply.clone(), vec![10, 20, 30]].concat();
     let requests = vec![req(prompt.clone(), 3000), req(next, 8)];
     let want = serve(&model, &cfg, &dev, "blocking", eos, &requests, None, SLOW)?;
-    let fresh = serve(&model, &cfg, &dev, "blocking", eos, &requests[1..], None, SLOW)?.remove(0);
+    let fresh = serve(
+        &model,
+        &cfg,
+        &dev,
+        "blocking",
+        eos,
+        &requests[1..],
+        None,
+        SLOW,
+    )?
+    .remove(0);
     let lead = lloom::nn::DecodeOptions {
         adaptive_commit: true,
         run_ahead: 8,
@@ -372,7 +382,16 @@ fn the_eos_watch_bounds_the_served_overrun_past_a_slow_consumer() -> Result<()> 
     }
     .adaptive_lead();
     for slow in [None, Some(cut)] {
-        let got = serve(&model, &cfg, &dev, "ring-nonblocking", eos, &requests, slow, SLOW)?;
+        let got = serve(
+            &model,
+            &cfg,
+            &dev,
+            "ring-nonblocking",
+            eos,
+            &requests,
+            slow,
+            SLOW,
+        )?;
         let at = format!("watched ring-nonblocking slow={}", slow.is_some());
         eprintln!(
             "FRONTIER-WATCH-SERVED {at}: overrun {} (lead {lead}) stopped_by_eos_watch {} \

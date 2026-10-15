@@ -42,8 +42,7 @@ fn a_refused_fragment_is_not_in_the_delivered_text() -> Result<()> {
     let _ = lloom_tensor::tuning::pin_regime(lloom_tensor::tuning::Contract::Deterministic);
     let dev = Device::Cpu;
     let (model, cfg) = model(&dev)?;
-    let fresh =
-        |m: &Model| -> Result<_> { Ok(Sequence::new(m.new_cache(&cfg, &dev)?)) };
+    let fresh = |m: &Model| -> Result<_> { Ok(Sequence::new(m.new_cache(&cfg, &dev)?)) };
 
     // The reference: every fragment, in order.
     let mut s = DecodeSession::from_sequence(&model, fresh(&model)?, dev.clone());
@@ -83,6 +82,10 @@ fn a_refused_fragment_is_not_in_the_delivered_text() -> Result<()> {
     let stopped = s.decode_until(&P, detok, &params(6, &[stop.as_str()]), |_| true)?;
     assert_eq!(stopped.stop, Stop::StopString);
     let at = whole.text.find(&stop).unwrap();
-    assert_eq!(stopped.text, whole.text[..at], "cut at the stop's first byte");
+    assert_eq!(
+        stopped.text,
+        whole.text[..at],
+        "cut at the stop's first byte"
+    );
     Ok(())
 }

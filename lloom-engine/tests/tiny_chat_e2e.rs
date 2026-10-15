@@ -2958,7 +2958,11 @@ fn a_reply_cut_inside_its_reasoning_continues_by_the_arm() {
                     );
                 }
                 _ => {
-                    assert_eq!(kept, p1.len(), "{arm} {cause}: diverges at the prompt's end");
+                    assert_eq!(
+                        kept,
+                        p1.len(),
+                        "{arm} {cause}: diverges at the prompt's end"
+                    );
                     assert_eq!(t["outcome"], "restore", "{arm} {cause}: {t}");
                     assert_eq!(t["diverged_at"], json!(p1.len()), "{arm} {cause}: {t}");
                     assert_eq!(t["replayed"], 0, "{arm} {cause}: {t}");
@@ -3005,9 +3009,16 @@ fn logprobs_take_their_bounds_per_route_and_stay_aligned_through_a_stop() {
     for top in [0u64, 1, 64] {
         let (status, body) = chat(json!({ "logprobs": true, "top_logprobs": top }));
         assert_eq!(status, 200, "top {top}: {body}");
-        for c in body["choices"][0]["logprobs"]["content"].as_array().unwrap() {
+        for c in body["choices"][0]["logprobs"]["content"]
+            .as_array()
+            .unwrap()
+        {
             assert!(c["logprob"].as_f64().unwrap() <= 0.0, "{c}");
-            assert_eq!(c["top_logprobs"].as_array().unwrap().len() as u64, top, "{c}");
+            assert_eq!(
+                c["top_logprobs"].as_array().unwrap().len() as u64,
+                top,
+                "{c}"
+            );
         }
     }
     let (status, body) = chat(json!({ "logprobs": true }));
@@ -3025,13 +3036,28 @@ fn logprobs_take_their_bounds_per_route_and_stay_aligned_through_a_stop() {
     assert!(c["logprob"].as_f64().unwrap().is_finite(), "{c}");
     // Out of range or of the wrong type.
     for (extra, says) in [
-        (json!({ "logprobs": true, "top_logprobs": 65 }), "'top_logprobs' must be an integer from 0 to 64"),
-        (json!({ "logprobs": true, "top_logprobs": -1 }), "'top_logprobs' must be an integer from 0 to 64"),
-        (json!({ "logprobs": true, "top_logprobs": 1.5 }), "'top_logprobs' must be an integer from 0 to 64"),
-        (json!({ "logprobs": true, "top_logprobs": "3" }), "'top_logprobs' must be an integer from 0 to 64"),
+        (
+            json!({ "logprobs": true, "top_logprobs": 65 }),
+            "'top_logprobs' must be an integer from 0 to 64",
+        ),
+        (
+            json!({ "logprobs": true, "top_logprobs": -1 }),
+            "'top_logprobs' must be an integer from 0 to 64",
+        ),
+        (
+            json!({ "logprobs": true, "top_logprobs": 1.5 }),
+            "'top_logprobs' must be an integer from 0 to 64",
+        ),
+        (
+            json!({ "logprobs": true, "top_logprobs": "3" }),
+            "'top_logprobs' must be an integer from 0 to 64",
+        ),
         (json!({ "logprobs": 3 }), "'logprobs' must be a boolean"),
         (json!({ "logprobs": "yes" }), "'logprobs' must be a boolean"),
-        (json!({ "logprobs": true, "stream": true }), "logprobs with stream"),
+        (
+            json!({ "logprobs": true, "stream": true }),
+            "logprobs with stream",
+        ),
     ] {
         let (status, err) = chat(extra.clone());
         assert_eq!(status, 400, "{extra}: {err}");
@@ -3047,20 +3073,38 @@ fn logprobs_take_their_bounds_per_route_and_stay_aligned_through_a_stop() {
         }
     }
     for (extra, says) in [
-        (json!({ "logprobs": 65 }), "'logprobs' must be an integer from 0 to 64"),
-        (json!({ "logprobs": -1 }), "'logprobs' must be an integer from 0 to 64"),
-        (json!({ "logprobs": "2" }), "'logprobs' must be an integer from 0 to 64"),
+        (
+            json!({ "logprobs": 65 }),
+            "'logprobs' must be an integer from 0 to 64",
+        ),
+        (
+            json!({ "logprobs": -1 }),
+            "'logprobs' must be an integer from 0 to 64",
+        ),
+        (
+            json!({ "logprobs": "2" }),
+            "'logprobs' must be an integer from 0 to 64",
+        ),
     ] {
         let (status, err) = completion(extra.clone());
         assert_eq!(status, 400, "{extra}: {err}");
-        assert!(err["error"]["message"].as_str().unwrap_or("").contains(says), "{err}");
+        assert!(
+            err["error"]["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains(says),
+            "{err}"
+        );
     }
 
     // Through a stop string: the block describes the delivered ids, whose
     // tokens are the delivered text; `token_logprobs` covers every id run.
     let (status, full) = chat(json!({ "max_tokens": 12, "return_token_ids": true }));
     assert_eq!(status, 200, "{full}");
-    let text = full["choices"][0]["message"]["content"].as_str().unwrap().to_string();
+    let text = full["choices"][0]["message"]["content"]
+        .as_str()
+        .unwrap()
+        .to_string();
     let chars: Vec<char> = text.chars().collect();
     assert!(chars.len() >= 6, "{text:?}");
     let stop: String = chars[3..5].iter().collect();
@@ -3073,7 +3117,10 @@ fn logprobs_take_their_bounds_per_route_and_stay_aligned_through_a_stop() {
     let ids = cut["choices"][0]["token_ids"].as_array().unwrap();
     let lps = cut["choices"][0]["token_logprobs"].as_array().unwrap();
     assert_eq!(lps.len(), ids.len(), "token_logprobs is one per id run");
-    assert!(rows.len() < ids.len(), "the stop's ids are past the block: {cut}");
+    assert!(
+        rows.len() < ids.len(),
+        "the stop's ids are past the block: {cut}"
+    );
     let joined: String = rows.iter().map(|r| r["token"].as_str().unwrap()).collect();
     assert_eq!(joined, content, "the block's tokens are the delivered text");
     for (i, r) in rows.iter().enumerate() {
@@ -3085,7 +3132,11 @@ fn logprobs_take_their_bounds_per_route_and_stay_aligned_through_a_stop() {
     let (status, h) = server.call("GET", "/health", &json!({}));
     assert_eq!(status, 200, "{h}");
     let lp = &h["logprobs"];
-    assert_eq!((&lp["served"], &lp["top_max"]), (&json!(true), &json!(64)), "{lp}");
+    assert_eq!(
+        (&lp["served"], &lp["top_max"]),
+        (&json!(true), &json!(64)),
+        "{lp}"
+    );
     assert_eq!(lp["openai_documented_top_max"], 20, "{lp}");
     let routes = &lp["routes"];
     assert_eq!(routes["/v1/chat/completions"]["top_max"], 64, "{lp}");
@@ -3162,12 +3213,19 @@ fn serve_reuses_by_default_and_its_cold_cells_stay_cold() {
         body
     };
     let one = turn(json!([{ "role": "user", "content": PROMPT }]));
-    let reply = one["choices"][0]["message"]["content"].as_str().unwrap().to_string();
+    let reply = one["choices"][0]["message"]["content"]
+        .as_str()
+        .unwrap()
+        .to_string();
     let two = turn(json!([{ "role": "user", "content": PROMPT },
                           { "role": "assistant", "content": reply },
                           { "role": "user", "content": "Again?" }]));
     let t = &two["timings"]["turn"];
-    assert_eq!((&t["reuse_policy"], &t["outcome"]), (&json!("on"), &json!("extend")), "{t}");
+    assert_eq!(
+        (&t["reuse_policy"], &t["outcome"]),
+        (&json!("on"), &json!("extend")),
+        "{t}"
+    );
     let (status, cell) = server.call(
         "POST",
         "/end_to_end_latency",

@@ -1162,7 +1162,10 @@ fn a_split_character_aligns_and_a_reply_cut_short_logs_its_part() {
     let tr = TinyTokenizer::qwen4exp().id("<tool_response>").unwrap();
     let mut astray = decoded(&engine, [bytes("ab"), vec![tr]].concat());
     astray.text = "ab<x".into();
-    assert!(!front.record(&engine, p1.origin, &astray), "not the run's text");
+    assert!(
+        !front.record(&engine, p1.origin, &astray),
+        "not the run's text"
+    );
 }
 
 /// The log is bounded: the oldest reply goes first, and its text no longer
@@ -1475,7 +1478,12 @@ fn a_reply_stopped_inside_its_reasoning_keeps_it_as_reasoning() {
     let end = q4_end();
     for (case, ids, reasoning, content) in [
         ("before", bytes("Add them"), "Add them", ""),
-        ("at", [bytes("Add them"), vec![end]].concat(), "Add them", ""),
+        (
+            "at",
+            [bytes("Add them"), vec![end]].concat(),
+            "Add them",
+            "",
+        ),
         (
             "after",
             [bytes("Add them"), vec![end], bytes("\n\nFour")].concat(),
@@ -1525,7 +1533,11 @@ fn a_stop_inside_a_token_keeps_the_whole_ids_before_it() {
     );
     let r = front.reply("ab<tool_").unwrap();
     assert_eq!((r.partial, r.generated), ("<tool_".len(), 5));
-    assert_eq!(r.ids, bytes("ab"), "the whole ids before the cut, as sampled");
+    assert_eq!(
+        r.ids,
+        bytes("ab"),
+        "the whole ids before the cut, as sampled"
+    );
     let second = json!([user("Tools?"), assistant("ab<tool_"), user("More?")]);
     let p2 = build(&front, &engine, &second, Some(false));
     assert_eq!(p2.spliced.matched, 1, "{:?}", p2.spliced);
@@ -1653,7 +1665,8 @@ fn an_open_reply_on_the_checkpoints_templates_per_arm() {
                     Incomplete::Text => {
                         let mut kw = kw(&engine, want);
                         kw.insert(PRESERVE_THINKING.into(), json!(persist.unwrap()));
-                        let decode = |ids: &[u32]| engine.text.tokenizer.decode(ids, false).unwrap();
+                        let decode =
+                            |ids: &[u32]| engine.text.tokenizer.decode(ids, false).unwrap();
                         assert_eq!(
                             decode(&p2.ids),
                             decode(&engine.reference(&second, &kw, want)),

@@ -208,7 +208,10 @@ mod tests {
         let mut st = TextStream::new(8);
         let mut d = detok;
         let stops = ["zz".to_string()];
-        assert_eq!(st.publish(&[3, 4], &mut d, &stops)?.0.as_deref(), Some("de"));
+        assert_eq!(
+            st.publish(&[3, 4], &mut d, &stops)?.0.as_deref(),
+            Some("de")
+        );
         assert_eq!(st.publish(&[5], &mut d, &stops)?.0.as_deref(), Some("f"));
         st.refuse_last();
         st.publish(&[6], &mut d, &stops)?;

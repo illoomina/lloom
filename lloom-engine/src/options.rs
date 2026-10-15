@@ -1526,7 +1526,8 @@ fn parse_device(v: &str) -> Result<String, String> {
     }
 }
 fn parse_purpose(v: &str) -> Result<String, String> {
-    lloom::nn::attention::route::ExecutionPurpose::parse(v.trim()).map(|p| p.name().to_string())
+    lloom::nn::attention::route::ExecutionPurpose::parse(&v.trim().to_ascii_lowercase())
+        .map(|p| p.name().to_string())
 }
 fn parse_experts(v: &str) -> Result<String, String> {
     match v.trim().to_ascii_lowercase().as_str() {

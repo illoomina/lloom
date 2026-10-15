@@ -493,8 +493,10 @@ pub fn run<P: Lfm2Shape>(ctx: Ctx<'_, P>) -> Result<()> {
         eos_watch: None,
         adaptive_commit: false,
         run_ahead: 0,
+        queued_steps: 0,
         stop: None,
         eos_gate: false,
+        eos_gate_cores: None,
         fused_publish: true,
         // The tile bounds every prefill forward, a visit's chunk included.
         prefill_tile: ctx.spec.prefill_tile,

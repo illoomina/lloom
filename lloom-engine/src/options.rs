@@ -1686,7 +1686,7 @@ impl Default for SchedulerConfig {
 #[options(v0 = false)]
 #[serde(default)]
 pub struct PrefixConfig {
-    /// Reuse the cached prefix across turns or requests; unset = the front-end's own (`chat` reuses, `serve` and `bench` measure a cold prefill).
+    /// Reuse the cached prefix across turns or requests; unset = the front-end's own (`chat` and `serve` reuse; `bench` measures a cold prefill, and a benchmark cell stays cold whatever this says). `--no-reuse` turns it off.
     #[opt(bool, flag = "reuse-prefix", path = "context.prefix.reuse", status = "stable", cli = "prefix-reuse", switches = ["no-reuse=false"])]
     pub reuse: Option<bool>,
     /// Share a request's prompt prefix from another row's cache, by page (the pool rows only).

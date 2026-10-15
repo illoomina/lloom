@@ -2379,8 +2379,10 @@ fn serve_returns_text_unless_ids_or_logprobs_are_asked() {
     );
     drop(server);
 
-    // Reuse off (serve's default): every turn cold by policy.
-    let server = Server::start(&model, &base.iter().map(String::as_str).collect::<Vec<_>>());
+    // Reuse off (`--no-reuse`): every turn cold by policy.
+    let mut off: Vec<&str> = base.iter().map(String::as_str).collect();
+    off.push("--no-reuse");
+    let server = Server::start(&model, &off);
     let (status, cold) = server.call(
         "POST",
         "/v1/chat/completions",
@@ -3103,6 +3105,92 @@ fn logprobs_take_their_bounds_per_route_and_stay_aligned_through_a_stop() {
     assert_eq!(routes["/v1/chat/completions"]["served"], false, "{h}");
     assert_eq!(routes["/v1/completions"]["served"], false, "{h}");
     assert_eq!(routes["decision"]["served"], true, "{h}");
+    drop(server);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Decision 36(a): `lloom serve` reuses the conversation by default — the
+/// load line and `/health` say so, and a second turn extends the first —
+/// while a benchmark cell stays cold; `--no-reuse` turns it off, and says
+/// that too.
+#[test]
+fn serve_reuses_by_default_and_its_cold_cells_stay_cold() {
+    let (dir, model, base) = qwen_tiny("reuse-default");
+    let args: Vec<&str> = base.iter().map(String::as_str).collect();
+    let loaded = |extra: &[&str]| -> String {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_lloom"))
+            .args(["serve", "--model"])
+            .arg(&model)
+            .args(&args)
+            .args(extra)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("lloom serve runs");
+        let mut line = String::new();
+        std::io::BufReader::new(child.stdout.take().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        let ready: Value = serde_json::from_str(&line).unwrap();
+        let port = ready["port"].as_u64().unwrap() as u16;
+        let mut c = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        write!(
+            c,
+            "POST /shutdown HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}"
+        )
+        .unwrap();
+        let out = child.wait_with_output().unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+        stderr
+            .lines()
+            .find(|l| l.starts_with("[loaded "))
+            .unwrap_or_else(|| panic!("no load line: {stderr}"))
+            .to_string()
+    };
+    assert!(loaded(&[]).contains("reuse_prefix=true"), "{}", loaded(&[]));
+    assert!(loaded(&["--no-reuse"]).contains("reuse_prefix=false"));
+
+    let server = Server::start(&model, &args);
+    let turn = |messages: Value| {
+        let (status, body) = server.call(
+            "POST",
+            "/v1/chat/completions",
+            &json!({ "messages": messages, "temperature": 0, "max_tokens": 4,
+                     "enable_thinking": false, "logit_bias": { "97": 100 } }),
+        );
+        assert_eq!(status, 200, "{body}");
+        body
+    };
+    let one = turn(json!([{ "role": "user", "content": PROMPT }]));
+    let reply = one["choices"][0]["message"]["content"].as_str().unwrap().to_string();
+    let two = turn(json!([{ "role": "user", "content": PROMPT },
+                          { "role": "assistant", "content": reply },
+                          { "role": "user", "content": "Again?" }]));
+    let t = &two["timings"]["turn"];
+    assert_eq!((&t["reuse_policy"], &t["outcome"]), (&json!("on"), &json!("extend")), "{t}");
+    let (status, cell) = server.call(
+        "POST",
+        "/end_to_end_latency",
+        &json!({ "prompt": PROMPT, "decode_tokens": 4 }),
+    );
+    assert_eq!(status, 200, "{cell}");
+    let (status, h) = server.call("GET", "/health", &json!({}));
+    assert_eq!(status, 200, "{h}");
+    assert_eq!(h["reuse"]["reuse_policy"], "on", "{h}");
+    let last = &h["reuse"]["last"];
+    assert_eq!(
+        (&last["outcome"], &last["reason"], &last["reused"]),
+        (&json!("fresh"), &json!("cold"), &json!(0)),
+        "the cell is cold under the default: {last}"
+    );
+    drop(server);
+
+    let mut off = args.clone();
+    off.push("--no-reuse");
+    let server = Server::start(&model, &off);
+    let (status, h) = server.call("GET", "/health", &json!({}));
+    assert_eq!(status, 200, "{h}");
+    assert_eq!(h["reuse"]["reuse_policy"], "off", "{h}");
     drop(server);
     std::fs::remove_dir_all(&dir).ok();
 }

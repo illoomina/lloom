@@ -200,7 +200,10 @@ fn run_configured(args: ServeArgs, transport: Option<tiny_http::TransportPolicy>
         options.decode.prefill.chunk = 512;
     }
     let load_start = Instant::now();
-    let shape = super::Shape::of(&options, false, seed_text);
+    // `serve` reuses the conversation by default (`context.prefix.reuse`
+    // unset); `--no-reuse` opts out, and a benchmark cell stays cold either
+    // way (`DecodeParams::cold`).
+    let shape = super::Shape::of(&options, true, seed_text);
     let reuse_prefix = shape.reuse_prefix;
     // A non-generating decision model is served by the decision-only listener.
     if let Some(endpoint) = super::omni::serving::load(&options.load, &shape)? {

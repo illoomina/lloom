@@ -244,6 +244,76 @@ fn the_default_reserve_names_its_basis_on_each_device() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// The refusal a small CI host met (`memory.md` §9.10b), as arithmetic: a
+/// 9.7 GB host with 8.85 GB available and the 4 GiB floor kept, and two
+/// sibling tiny Qwen4-exp servers' reservations standing (1.54 GB each,
+/// nearly none of it held, as the CI log printed them). The third tiny
+/// server was refused there: `needs 1.54 GB and the room is 1.53 GB`, the
+/// family's 3 MB a position over a 512 tile. Its claim is its own geometry
+/// now, and it loads; the load line names where the transient came from.
+#[test]
+fn qwen4exp_tiny_fits_beside_two_siblings_on_a_small_host() {
+    let dir = scratch("qwen4exp-small-host");
+    let model = write::<Qwen4ExpTiny>(&dir);
+    let tok = dir.join("tokenizer.json");
+    let registry = scratch("qwen4exp-small-host-registry");
+    let reg = Registry::open(&registry).unwrap();
+    let siblings: Vec<_> = (0..2)
+        .map(|i| {
+            reg.reserve_unchecked(
+                &format!("sibling lloom qwen4exp tiny-qwen4exp {i}"),
+                1_540_000_000,
+            )
+            .unwrap()
+        })
+        .collect();
+    let out = Command::new(env!("CARGO_BIN_EXE_lloom"))
+        .args(["chat", "--model"])
+        .arg(&model)
+        .arg("--tokenizer")
+        .arg(&tok)
+        .args([
+            "--raw",
+            "-p",
+            "Hi",
+            "-n",
+            "4",
+            "--experts",
+            "resident",
+            "--cpu",
+        ])
+        .arg("--set")
+        .arg(format!("memory.machine.registry={}", registry.display()))
+        .args([
+            "--set",
+            "memory.machine.available_gb=8.85",
+            "--set",
+            "memory.machine.reserve_gb=4.294967296",
+        ])
+        .output()
+        .expect("lloom runs");
+    let err = String::from_utf8_lossy(&out.stderr);
+    let lines = || err.lines().filter(|l| l.starts_with("[machine:"));
+    for l in lines() {
+        eprintln!("{l}");
+    }
+    assert!(
+        out.status.success(),
+        "the third tiny server was refused beside two siblings:\n{err}"
+    );
+    let peak = lines()
+        .find(|l| l.starts_with("[machine: peak "))
+        .unwrap_or_else(|| panic!("no peak line:\n{err}"));
+    assert!(
+        peak.contains("qwen4exp-transient (1 x 512-position forward")
+            && peak.contains("eager route, from the geometry"),
+        "{peak}"
+    );
+    drop(siblings);
+    std::fs::remove_dir_all(&registry).ok();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// `--force` loads what the machine refuses, and still records the
 /// reservation for the other processes to see.
 #[test]

@@ -465,26 +465,17 @@ pub(crate) fn kv_slab_bytes(cfg: &Config) -> Result<usize> {
         .ok_or_else(|| lloom_tensor::Error::Msg("Qwen KV slab unit exceeds usize".into()))
 }
 
-// Exact multiply before divide: saturating the product before /2 undercounts.
-fn prefill_transient_bytes(tile: usize, tiles: usize) -> Result<(usize, usize)> {
-    let fail = || lloom_tensor::Error::Msg("Qwen prefill transient exceeds usize".into());
-    let tile_bytes = tile
-        .checked_mul(super::model::PREFILL_TRANSIENT_BYTES_PER_TOKEN)
-        .ok_or_else(fail)?;
-    let further = (tile_bytes as u128) * (tiles.saturating_sub(2) as u128) / 2;
-    let total = (tile_bytes as u128).checked_add(further).ok_or_else(fail)?;
-    Ok((tile_bytes, usize::try_from(total).map_err(|_| fail())?))
-}
-
 /// The session's claims beside the expert pool, for the load-time
 /// arbitration (`profiles-and-memory-design.md` §4.2; #892 A5): the KV of
 /// `rows` rows to `kv_tokens` (a capability — the caller chose the
-/// context), the prefill transient of one tile and the further tiles in
-/// flight (scratch), and the loader's staging (a capability of the loader).
-/// What the old session reserve also held — a free-list reserve and a
-/// pass-retention reserve, two constants in place of a policy — is the
-/// expert pool's to yield now: the admission's third rung parks slots when
-/// a pass is short (`Qwen4Exp::apply_expert_grant`).
+/// context), the prefill transient of the forwards in flight at
+/// `prefill_tile` on `route` (scratch; [`super::transient`]: the config's
+/// allocations, kept as long as the route keeps them), and the loader's
+/// staging (a capability of the loader). What the old session reserve also
+/// held — a free-list reserve and a pass-retention reserve, two constants
+/// in place of a policy — is the expert pool's to yield now: the
+/// admission's third rung parks slots when a pass is short
+/// (`Qwen4Exp::apply_expert_grant`).
 pub fn session_claims(
     cfg: &Config,
     rows: usize,
@@ -492,23 +483,16 @@ pub fn session_claims(
     prefill_tile: usize,
     loader: &StreamLoader,
     prefetch: bool,
+    route: super::transient::Route,
 ) -> Result<Vec<SessionClaim>> {
-    let tile = if prefill_tile == 0 {
-        super::model::PREFILL_CHUNK
-    } else {
-        prefill_tile
-    };
-    let tiles = if super::model::prefill_pair_on() {
-        super::model::prefill_tiles()
-    } else {
-        2
-    };
-    let (tile_bytes, transient) = prefill_transient_bytes(tile, tiles)?;
     let per = kv_bytes_per_token(cfg)?;
     let kv = per
         .checked_mul(kv_tokens)
         .and_then(|v| v.checked_mul(rows.max(1)))
         .ok_or_else(|| lloom_tensor::Error::Msg("Qwen session KV exceeds usize".into()))?;
+    let transient = super::transient::PrefillTransient::new(cfg, route);
+    let (claim, one) = transient.claim(prefill_tile, kv_tokens);
+    let fail = || lloom_tensor::Error::Msg("Qwen prefill transient exceeds usize".into());
     Ok(vec![
         SessionClaim {
             name: "qwen4exp-kv",
@@ -518,8 +502,8 @@ pub fn session_claims(
         },
         SessionClaim {
             name: "qwen4exp-transient",
-            bytes: transient,
-            unit: tile_bytes,
+            bytes: usize::try_from(claim).map_err(|_| fail())?,
+            unit: usize::try_from(one.held).map_err(|_| fail())?.max(1),
             capability: false,
         },
         SessionClaim {
@@ -529,6 +513,27 @@ pub fn session_claims(
             capability: true,
         },
     ])
+}
+
+/// The machine gate's row for the prefill transient: the claim, and where
+/// it came from — the forwards in flight, one forward's bytes, the route.
+fn transient_row(
+    cfg: &Config,
+    route: super::transient::Route,
+    tile: usize,
+    kv_tokens: usize,
+) -> String {
+    let t = super::transient::PrefillTransient::new(cfg, route);
+    let (claim, one) = t.claim(tile, kv_tokens);
+    format!(
+        "qwen4exp-transient ({} x {}-position forward at {}: {} B held of {} B allocated, {} route, from the geometry)",
+        if one.held == 0 { 0 } else { claim / one.held },
+        one.seq,
+        one.pos,
+        one.held,
+        one.allocated,
+        route.lifetime.name()
+    )
 }
 
 /// One of the session's fixed claims (`floor == want`): a capability
@@ -1066,6 +1071,14 @@ fn admit_machine<Rd: Read + Seek>(
     if let Some(p) = opts.kv_precision {
         cfg.kv_precision = p;
     }
+    // The streamed tier plans each layer's experts on the host, reading the
+    // routing back; the resident tier reads nothing inside a pass.
+    let route = super::transient::Route {
+        mtp: opts.mtp,
+        ple: opts.ple || opts.ple_shard.is_some(),
+        routed_f16: opts.moe_act == Some(lloom_tensor::DType::F16),
+        ..super::transient::Route::of(&cfg, gg.device.is_metal(), stream.is_some())
+    };
     let claims = match stream {
         Some(st) => session_claims(
             &cfg,
@@ -1074,6 +1087,7 @@ fn admit_machine<Rd: Read + Seek>(
             m.prefill_tile,
             &st.loader,
             st.prefetch,
+            route,
         )?,
         None => session_claims(
             &cfg,
@@ -1082,6 +1096,7 @@ fn admit_machine<Rd: Read + Seek>(
             m.prefill_tile,
             &StreamLoader::Pread,
             false,
+            route,
         )?
         .into_iter()
         .filter(|c| c.name != "qwen4exp-staging")
@@ -1097,7 +1112,11 @@ fn admit_machine<Rd: Read + Seek>(
             experts,
         );
     for c in &claims {
-        peak.push(c.name, c.bytes as u64);
+        let name = match c.name {
+            "qwen4exp-transient" => transient_row(&cfg, route, m.prefill_tile, m.kv_tokens),
+            other => other.to_string(),
+        };
+        peak.push(name, c.bytes as u64);
     }
     if let Some(st) = stream {
         peak.push("drafter", st.drafter_bytes as u64);
@@ -1397,6 +1416,12 @@ impl<P: Profile> Qwen4Exp<P, Streamed> {
                     prefill_tile,
                     &stream.loader,
                     stream.prefetch,
+                    super::transient::Route {
+                        mtp: opts.mtp,
+                        ple: opts.ple || opts.ple_shard.is_some(),
+                        routed_f16: opts.moe_act == Some(lloom_tensor::DType::F16),
+                        ..super::transient::Route::of(&cfg0, device.is_metal(), true)
+                    },
                 )?;
                 if stream.drafter_bytes > 0 {
                     claims.push(SessionClaim {
@@ -1831,12 +1856,20 @@ mod tests {
         cfg.kv_precision = KvPrecision::quantized(KvQuant::Int4).unwrap();
         assert_eq!(kv_bytes_per_token(&cfg).unwrap(), 0);
         assert_eq!(kv_slab_bytes(&cfg).unwrap(), 0);
-        let claims =
-            session_claims(&cfg, usize::MAX, usize::MAX, 1, &StreamLoader::Io, false).unwrap();
+        let claims = session_claims(
+            &cfg,
+            usize::MAX,
+            usize::MAX,
+            1,
+            &StreamLoader::Io,
+            false,
+            route(),
+        )
+        .unwrap();
         assert_eq!(claims[0].bytes, 0);
         let cfg = Config::tiny();
-        assert!(session_claims(&cfg, usize::MAX, 1, 1, &StreamLoader::Io, false).is_err());
-        assert!(session_claims(&cfg, 1, usize::MAX, 1, &StreamLoader::Io, false).is_err());
+        assert!(session_claims(&cfg, usize::MAX, 1, 1, &StreamLoader::Io, false, route()).is_err());
+        assert!(session_claims(&cfg, 1, usize::MAX, 1, &StreamLoader::Io, false, route()).is_err());
         for precision in [
             KvPrecision::dense(DType::F32),
             KvPrecision::quantized(KvQuant::Int8).unwrap(),
@@ -1852,15 +1885,38 @@ mod tests {
         assert_eq!(int4.checked_bytes_per_token(2, 4, DType::F32).unwrap(), 40);
     }
 
+    /// A route for the numeric tests: resident on Metal, the shipping chunk.
+    fn route() -> super::super::transient::Route {
+        super::super::transient::Route {
+            lifetime: super::super::transient::Lifetime::Deferred,
+            chunk: 512,
+            tiles: 2,
+            qsa_fused: false,
+            sparse_paged: false,
+            moe_gemm_from: 64,
+            mtp: false,
+            checkpoint: true,
+            routed_f16: false,
+            ple: false,
+            indexer: true,
+        }
+    }
+
     #[test]
     fn numeric_transient_and_claim_sum_are_exact_or_refused() {
-        let per = super::super::model::PREFILL_TRANSIENT_BYTES_PER_TOKEN;
-        let tile = usize::MAX / 3 / per;
-        let (unit, bytes) = prefill_transient_bytes(tile, 6).unwrap();
-        assert_eq!(bytes as u128, unit as u128 * 3);
-        assert!(unit as u128 * 4 > usize::MAX as u128);
-        assert!(prefill_transient_bytes(usize::MAX, 2).is_err());
-        assert!(prefill_transient_bytes(1, usize::MAX).is_err());
+        // A tile or a context past any the family serves is not sized: its
+        // claim is the whole address space, and the session's sum refuses.
+        let cfg = Config::tiny();
+        for (tile, kv) in [(usize::MAX / 3, 4096), (512, usize::MAX / 1024)] {
+            let claims = session_claims(&cfg, 1, kv, tile, &StreamLoader::Io, false, route());
+            match claims {
+                Ok(claims) => {
+                    assert_eq!(claims[1].bytes, usize::MAX, "tile {tile} kv {kv}");
+                    assert!(session_floor_bytes(&claims).is_err());
+                }
+                Err(e) => assert!(e.to_string().contains("exceeds usize"), "{e}"),
+            }
+        }
         let c = |bytes| SessionClaim {
             name: "numeric",
             bytes,
@@ -2220,7 +2276,7 @@ mod tests {
         );
         let claims = |rows, tile| {
             session_floor_bytes(
-                &session_claims(&cfg, rows, 4096, tile, &StreamLoader::Io, false).unwrap(),
+                &session_claims(&cfg, rows, 4096, tile, &StreamLoader::Io, false, route()).unwrap(),
             )
             .unwrap()
         };
@@ -2230,13 +2286,16 @@ mod tests {
         // The KV, the transient and the loader's staging — and nothing in
         // place of a policy: the free-list and pass-retention reserves the
         // old session reserve carried are the pool's to yield (#892 A5).
+        // The transient is the forwards in flight at the tile's deepest
+        // position, from the geometry (`transient.rs` pins its value).
+        let (transient, one) =
+            super::super::transient::PrefillTransient::new(&cfg, route()).claim(512, 4096);
+        assert_eq!(transient, 2 * one.held);
         assert_eq!(
             r1,
-            4096 * per
-                + 512 * super::super::model::PREFILL_TRANSIENT_BYTES_PER_TOKEN
-                + IO_INFLIGHT_RESERVE_BYTES
+            4096 * per + transient as usize + IO_INFLIGHT_RESERVE_BYTES
         );
-        // A zero tile reserves one PREFILL_CHUNK's worth.
+        // A zero tile reserves one chunk's worth.
         assert_eq!(claims(1, 0), r1);
     }
 

@@ -1935,7 +1935,8 @@ pub enum MemCheck {
     /// No device read, no check (the pre-#749-P18 behaviour).
     Off,
     /// Read and report on stderr (`MEMCHECK` lines), never refuse — the arm
-    /// the transient term is measured under (`PREFILL_TRANSIENT_BYTES_PER_TOKEN`).
+    /// a pass's transient is observed under beside its derivation
+    /// ([`super::transient`]).
     Report,
     /// Refuse the pass with the arithmetic, before any state moves.
     Refuse,
@@ -1943,8 +1944,7 @@ pub enum MemCheck {
 
 impl MemCheck {
     /// `QWEN4EXP_MEM` = `off` | `report` | `refuse`, read once; `refuse`
-    /// by default — flipped from `report` with the transient term measured
-    /// (`PREFILL_TRANSIENT_BYTES_PER_TOKEN`, DESIGN §7.1a).
+    /// by default (`memory.md` §9.5q).
     pub fn from_env() -> Self {
         static ARM: std::sync::OnceLock<MemCheck> = std::sync::OnceLock::new();
         *ARM.get_or_init(
@@ -1958,22 +1958,6 @@ impl MemCheck {
     }
 }
 
-/// Bytes one position of a multi-token pass adds to the process's Metal
-/// allocation while the pass is in flight — the activation class of §9.5n
-/// for this family, per token, over the whole layer stack (the class sums
-/// over layers because a buffer returns only when its command buffer
-/// completes, §6.3b).
-///
-/// **Measured 2026-09-23** (issue #749 P18, `qwen4exp-dispatches-raw/
-/// p18-stream-long1.txt`): a 937-token prompt in 512-token tiles paced at
-/// depth 2, `--experts stream`, the gauge sampling at 10 ms — the pool's
-/// `pending` peaks at **1.34 GB** and `device_allocated` at **+1.51 GB**
-/// over the load, with two tiles in flight: **~2.6 MB a position**. Rounded
-/// up to 3 MB. A pass is admitted against `PREFILL_TRANSIENT_BYTES_PER_TOKEN
-/// × seq` plus its KV grow. Re-measure when the prefill path's allocation
-/// shape moves (a fused chunk kernel, `--moe-act f16`, a wider tile).
-pub const PREFILL_TRANSIENT_BYTES_PER_TOKEN: usize = 3 * 1000 * 1000;
-
 /// What a pass of `seq` positions at `pos` would allocate before it runs:
 /// the KV grow (slab or pool) and the transient term. Sized, not performed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1983,7 +1967,9 @@ pub struct PassPlan {
     /// Bytes the QSA layers' KV grows by for this pass (0 when every
     /// layer's slab or pool already holds `pos + seq`).
     pub kv_grow: usize,
-    /// `PREFILL_TRANSIENT_BYTES_PER_TOKEN × seq` for `seq > 1`, else 0.
+    /// What the pass's route keeps of its allocations at once
+    /// ([`super::transient::PrefillTransient::forward`]) for `seq > 1`,
+    /// else 0.
     pub transient: usize,
 }
 
@@ -2598,23 +2584,11 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
                 kv_grow += cache.kv[l].grow_bytes_for(seq, nkv, hd);
             }
         }
-        // The constant was measured as the peak over a 512-tile WITH a second
-        // tile in flight (P18): two tiles' worth per chunk of positions. A
-        // pipelined pass holds `prefill_tiles` tiles at once — each beyond
-        // the pair another half of the constant per chunk — and past that
-        // the transient does not grow with the pass.
+        // The predecessors still pending are in the device's allocation the
+        // admission reads; this pass owes what its own route keeps.
         let transient = if seq > 1 {
-            let chunk = prefill_chunk();
-            let tiles = if prefill_pair_on() {
-                prefill_tiles()
-            } else {
-                2
-            };
-            let in_flight = chunk.saturating_mul(tiles).max(chunk);
-            let base = PREFILL_TRANSIENT_BYTES_PER_TOKEN.saturating_mul(seq.min(chunk));
-            // Positions past the two tiles the constant already covers.
-            let further = seq.min(in_flight).saturating_sub(2 * chunk);
-            base + PREFILL_TRANSIENT_BYTES_PER_TOKEN.saturating_mul(further) / 2
+            let held = self.prefill_transient().forward(seq, cache.pos).held;
+            usize::try_from(held).unwrap_or(usize::MAX)
         } else {
             0
         };
@@ -2624,6 +2598,28 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
             kv_grow,
             transient,
         }
+    }
+
+    /// This model's prefill transient: its config, on its device, with its
+    /// experts planned where they are (the streamed tier reads every
+    /// layer's routing back on the host, which retires what came before).
+    pub fn prefill_transient(&self) -> super::transient::PrefillTransient {
+        let host_planned = self
+            .layers
+            .first()
+            .is_some_and(|l| l.moe().experts().plans_on_device());
+        let indexer = self.layers.iter().all(|l| match &l.mixer {
+            Mixer::Full(q) => q.indexer().is_some(),
+            Mixer::Linear(_) => true,
+        });
+        let route = super::transient::Route {
+            mtp: self.mtp.is_some(),
+            ple: self.ple.is_some(),
+            indexer,
+            routed_f16: self.routed_act() == lloom_tensor::DType::F16,
+            ..super::transient::Route::of(&self.cfg, self.device().is_metal(), host_planned)
+        };
+        super::transient::PrefillTransient::new(&self.cfg, route)
     }
 
     /// `Model::prepare_pass` for this family (§9.5p's per-pass device
@@ -2741,7 +2737,8 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
                     format_args!(
                         "pos={} seq={} kv_grow={:.3} GB transient={:.3} GB heap_free={:.3} GB \
                          need={:.3} GB committed={:.2} GB reclaimed={:.3} GB budget={:.2} GB \
-                         ({:.2} x working_set {:.2} GB) fits={fits} pledged={} yield_contended={}",
+                         ({:.2} x working_set {:.2} GB) margin={} B fits={fits} pledged={} \
+                         yield_contended={}",
                         plan.pos,
                         plan.seq,
                         gb(plan.kv_grow),
@@ -2753,6 +2750,7 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
                         gb(budget),
                         self.memory_fraction,
                         gb(working_set),
+                        budget as i128 - allocated as i128 - need as i128,
                         a.pledged,
                         a.yield_contended,
                     )

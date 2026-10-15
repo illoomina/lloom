@@ -3069,7 +3069,8 @@ fn logprobs_take_their_bounds_per_route_and_stay_aligned_through_a_stop() {
         assert_eq!(status, 200, "{n}: {body}");
         let lp = &body["choices"][0]["logprobs"];
         for t in lp["top_logprobs"].as_array().unwrap() {
-            assert_eq!(t.as_object().unwrap().len() as u64 <= n, true, "{t}");
+            // Keyed by the token's text, two ids sharing one collapse.
+            assert!(t.as_object().unwrap().len() as u64 <= n, "{t}");
         }
     }
     for (extra, says) in [

@@ -276,7 +276,7 @@ fn an_admitted_emulated_type_reaches_the_engine() {
         let options = resolve_options_uninstalled(&common, &lloom_engine::app::no_front).unwrap();
         let mut shape = Shape::of(
             &options,
-            true,
+            lloom_engine::frontend::Frontend::Chat,
             "The loom threads warp and weft into cloth. ".to_string(),
         );
         shape.batch = 1;

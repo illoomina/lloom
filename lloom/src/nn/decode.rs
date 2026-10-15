@@ -2159,8 +2159,11 @@ impl<'m, M: CausalLM> Session<'m, M> {
         } else {
             None
         };
-        let mut watch_ids: Vec<u32> =
-            Vec::with_capacity(if watch.is_some() { opts.adaptive_lead() + 1 } else { 0 });
+        let mut watch_ids: Vec<u32> = Vec::with_capacity(if watch.is_some() {
+            opts.adaptive_lead() + 1
+        } else {
+            0
+        });
 
         let mut produced = 0usize;
         let mut since_commit = 0usize;
@@ -2222,7 +2225,9 @@ impl<'m, M: CausalLM> Session<'m, M> {
                     // The watch reads every step and the host is at most
                     // `adaptive_lead` steps ahead of what the GPU publishes,
                     // so a lap means the bound the watch rests on is broken.
-                    lloom_tensor::bail!("Session::decode: the EOS watch fell behind the ring ({lap})")
+                    lloom_tensor::bail!(
+                        "Session::decode: the EOS watch fell behind the ring ({lap})"
+                    )
                 }
                 if w.ended() {
                     stats.stopped_by_eos_watch = true;

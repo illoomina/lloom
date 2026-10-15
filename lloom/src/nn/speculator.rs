@@ -995,6 +995,63 @@ pub struct Prepared {
     /// [`ReuseAction::Resume`], which `decode` accepts as "continue from the
     /// held logits".
     pub suffix: Vec<u32>,
+    /// The path [`Session::prepare`] took to get there: what it found on
+    /// entry and how it dealt with it. One authoritative outcome, so a
+    /// report reads it rather than re-deriving `prepare`'s predicates.
+    pub path: PreparePath,
+}
+
+/// What [`Session::prepare`] found and did (`sequence-reuse-design.md`
+/// §2.3f's events: the accepted boundary, the overrun past it, how the state
+/// was made ready, where the request diverged).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PreparePath {
+    /// The log's length on entry: the previous run's boundary as the log
+    /// holds it (every id it produced).
+    pub boundary: usize,
+    /// Positions the state was past the log on entry.
+    pub overrun: usize,
+    /// How that overrun was taken back.
+    pub overrun_by: OverrunBy,
+    /// Where the request left the log, when it did before the log's end.
+    pub diverged_at: Option<usize>,
+    /// How the state was brought back to what the request keeps.
+    pub divergence_by: DivergenceBy,
+}
+
+/// How [`Session::prepare`] took an overrun back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OverrunBy {
+    /// There was none.
+    #[default]
+    None,
+    /// The rewind horizon (the standing window) undid it.
+    Window,
+    /// The gated forwards wrote nothing; their counters were moved back
+    /// (`CacheRewind::rewind_unwritten`).
+    Gate,
+    /// The state was restored to the turn checkpoint at this position.
+    Checkpoint(usize),
+    /// Nothing could; the sequence was reset.
+    Reset,
+}
+
+/// How [`Session::prepare`] brought the state back to the prefix the
+/// request keeps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DivergenceBy {
+    /// Nothing to take back: the request extends (or resumes from) the log.
+    #[default]
+    None,
+    /// The rewind horizon took back these positions.
+    Window(usize),
+    /// The state was restored to the turn checkpoint at this position.
+    Checkpoint(usize),
+    /// The sequence was reset (no overlap, an opaque cache, or no reach).
+    Reset,
+    /// After a reset, another row's pages supplied this many positions
+    /// (`Session::prepare_shared`).
+    Shared(usize),
 }
 
 /// A target holding its own cache, driving speculative rounds. The typed pair
@@ -1184,6 +1241,10 @@ impl<'m, M: CausalLM> Session<'m, M> {
             action: ReuseAction::Shared(shared),
             reused: shared,
             suffix: full[shared..].to_vec(),
+            path: PreparePath {
+                divergence_by: DivergenceBy::Shared(shared),
+                ..prepared.path
+            },
         })
     }
 
@@ -1228,28 +1289,52 @@ impl<'m, M: CausalLM> Session<'m, M> {
         // back at the latest turn checkpoint inside the log, or reset when
         // there is none. The ids the restore drops are counted as rewound.
         let mut dropped = 0;
-        if self.seq.overrun > 0 && self.reconcile().is_err() {
-            let log = self.seq.tokens.len();
-            match self
-                .seq
-                .cache
-                .restore_point(log)
-                .filter(|_| self.seq.tokens_known)
-            {
-                Some(at) => {
-                    self.seq.cache.restore(at)?;
-                    self.seq.pos = at;
-                    self.seq.tokens.truncate(at);
-                    self.seq.overrun = 0;
-                    self.seq.overrun_unwritten = false;
-                    self.seq.last_logits = None;
-                    dropped = log - at;
+        // Where the request leaves the log as it stands on entry, before an
+        // overrun's recovery moves it.
+        let entry_lcp = self.seq.common_prefix(full);
+        let mut path = PreparePath {
+            boundary: self.seq.tokens.len(),
+            overrun: self.seq.overrun,
+            diverged_at: (self.seq.tokens_known && entry_lcp < self.seq.tokens.len())
+                .then_some(entry_lcp),
+            ..PreparePath::default()
+        };
+        if self.seq.overrun > 0 {
+            let unwritten = self.seq.overrun_unwritten;
+            if self.reconcile().is_ok() {
+                path.overrun_by = if unwritten {
+                    OverrunBy::Gate
+                } else {
+                    OverrunBy::Window
+                };
+            } else {
+                let log = self.seq.tokens.len();
+                match self
+                    .seq
+                    .cache
+                    .restore_point(log)
+                    .filter(|_| self.seq.tokens_known)
+                {
+                    Some(at) => {
+                        self.seq.cache.restore(at)?;
+                        self.seq.pos = at;
+                        self.seq.tokens.truncate(at);
+                        self.seq.overrun = 0;
+                        self.seq.overrun_unwritten = false;
+                        self.seq.last_logits = None;
+                        dropped = log - at;
+                        path.overrun_by = OverrunBy::Checkpoint(at);
+                    }
+                    None => {
+                        self.reset();
+                        path.overrun_by = OverrunBy::Reset;
+                    }
                 }
-                None => self.reset(),
             }
         }
         if !self.seq.tokens_known {
             self.reset();
+            path.divergence_by = DivergenceBy::Reset;
         }
         let cached = self.seq.tokens.len();
         if cached == 0 {
@@ -1257,6 +1342,7 @@ impl<'m, M: CausalLM> Session<'m, M> {
                 action: ReuseAction::Fresh,
                 reused: 0,
                 suffix: full.to_vec(),
+                path,
             });
         }
         let lcp = self.seq.common_prefix(full);
@@ -1266,6 +1352,7 @@ impl<'m, M: CausalLM> Session<'m, M> {
                 action: ReuseAction::Resume,
                 reused: lcp,
                 suffix: Vec::new(),
+                path,
             });
         }
         // Everything cached: the last token must be re-fed for its prediction.
@@ -1278,6 +1365,7 @@ impl<'m, M: CausalLM> Session<'m, M> {
             self.seq.pos -= drop;
             self.seq.tokens.truncate(keep);
             self.seq.last_logits = None;
+            path.divergence_by = DivergenceBy::Window(drop);
             ReuseAction::Rewound(drop)
         } else if let Some(at) = self.seq.cache.restore_point(keep) {
             // Past the horizon but within a turn checkpoint's reach: the
@@ -1288,9 +1376,11 @@ impl<'m, M: CausalLM> Session<'m, M> {
             self.seq.pos = keep;
             self.seq.tokens.truncate(keep);
             self.seq.last_logits = None;
+            path.divergence_by = DivergenceBy::Checkpoint(at);
             ReuseAction::Rewound(cached - keep)
         } else {
             self.reset();
+            path.divergence_by = DivergenceBy::Reset;
             ReuseAction::Fresh
         };
         let action = match action {
@@ -1306,6 +1396,7 @@ impl<'m, M: CausalLM> Session<'m, M> {
             action,
             reused,
             suffix: full[reused..].to_vec(),
+            path,
         })
     }
 

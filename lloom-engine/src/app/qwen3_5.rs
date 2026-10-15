@@ -877,6 +877,7 @@ where
     ) -> Result<Decoded> {
         self.check_fits(prompt_ids.len(), params.max_tokens)?;
         let reuse = self.reuse_prefix;
+        let params = &*params.under_reuse(reuse);
         let detok = self.detok();
         self.with_single(|s, extra| {
             if !reuse || params.cold {

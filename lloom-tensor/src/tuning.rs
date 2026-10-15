@@ -88,11 +88,13 @@ impl Contract {
     pub const FAST_ARMS: &'static [&'static str] =
         &["moe-act-f16", "decision-pack", "decision-ragged"];
 
-    /// The arms `deterministic` takes in a speculative round's passes
-    /// ([`Window`]), each named on the report line while its switch is on:
-    /// `kernels.gemm.verify_window` and `kernels.gemm.draft_window`.
+    /// The arms `deterministic` takes in a speculative round's passes and
+    /// in a prompt's prefill ([`Window`]), each named on the report line
+    /// while its switch is on: `kernels.gemm.verify_window`,
+    /// `kernels.gemm.draft_window` and `kernels.gemm.prefill_window`.
     pub const VERIFY_WINDOW_ARM: &'static str = "verify-gemm";
     pub const DRAFT_WINDOW_ARM: &'static str = "draft-gemm";
+    pub const PREFILL_WINDOW_ARM: &'static str = "prefill-gemm";
 
     /// `profile=<name> arms=<list> cpu_f16_accum=<type>/<promote_every>:<instruction>`,
     /// for the report lines that say which contract a run held and which
@@ -103,6 +105,7 @@ impl Contract {
                 let on: Vec<&str> = [
                     (Window::Verify, Contract::VERIFY_WINDOW_ARM),
                     (Window::Draft, Contract::DRAFT_WINDOW_ARM),
+                    (Window::Prefill, Contract::PREFILL_WINDOW_ARM),
                 ]
                 .into_iter()
                 .filter(|(w, _)| w.arm())
@@ -125,21 +128,25 @@ impl Contract {
     }
 }
 
-/// A speculative round's pass, open on this thread: the target's verify
-/// window over `[last, draft…]` (or several rows' windows laid end to end),
-/// or the drafter's block and its re-key over the accepted rows.
+/// A pass that is not on the K=1 decode path, open on this thread: a
+/// speculative round's — the target's verify window over `[last, draft…]`
+/// (or several rows' windows laid end to end), the drafter's block and its
+/// re-key over the accepted rows — or one forward of a prompt's prefill,
+/// a tile of one sequence's prompt tokens.
 ///
 /// Under `deterministic` a half-precision matmul runs the one-row GEMV
 /// reduction at every row count, so a row's bits never depend on how many
 /// rows share the launch — the K=1 decode path's promise. Inside a window it
 /// takes the route `fast` takes instead (the GEMM from two rows), while the
-/// window's switch is on: a k-row window as k + 1 one-row sweeps is the cost
-/// that promise would charge a pass that is not on the K=1 path, and the
-/// window's rows are held identical per window shape rather than across row
-/// counts (`architecture.md` §2.3.5b).
+/// window's switch is on: a P-row pass as P one-row sweeps is the cost that
+/// promise would charge a pass that is not on the K=1 path, and the pass's
+/// rows are held identical per window shape — a verify window's, a prefill
+/// tile's row count — rather than across row counts (`architecture.md`
+/// §2.3.5b).
 ///
-/// Thread-local and nestable: the window is the encoding thread's, and a
-/// pass encoded on another thread keeps the one-row reduction rather than
+/// Thread-local and nestable, closed when the guard drops (an early return
+/// or an unwind included): the window is the encoding thread's, and a pass
+/// encoded on another thread keeps the one-row reduction rather than
 /// inheriting another sequence's window.
 #[must_use = "the window holds only while the guard is alive"]
 pub struct VerifyWindow {
@@ -147,39 +154,50 @@ pub struct VerifyWindow {
     _thread: std::marker::PhantomData<*const ()>,
 }
 
-/// Which pass of a speculative round a [`VerifyWindow`] is.
+/// Which pass a [`VerifyWindow`] is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Window {
     /// The target's verify window: `kernels.gemm.verify_window`.
     Verify,
     /// The drafter's block and re-key: `kernels.gemm.draft_window`.
     Draft,
+    /// One forward of a prompt's prefill: `kernels.gemm.prefill_window`.
+    Prefill,
 }
 
+const WINDOW_KINDS: usize = 3;
+
 thread_local! {
-    static WINDOWS: [std::cell::Cell<u32>; 2] = const {
-        [std::cell::Cell::new(0), std::cell::Cell::new(0)]
+    static WINDOWS: [std::cell::Cell<u32>; WINDOW_KINDS] = const {
+        [std::cell::Cell::new(0), std::cell::Cell::new(0), std::cell::Cell::new(0)]
     };
 }
 
 /// 0 unread, 1 off, 2 on; per [`Window`].
-static WINDOW_ARMS: [std::sync::atomic::AtomicU8; 2] = [
+static WINDOW_ARMS: [std::sync::atomic::AtomicU8; WINDOW_KINDS] = [
+    std::sync::atomic::AtomicU8::new(0),
     std::sync::atomic::AtomicU8::new(0),
     std::sync::atomic::AtomicU8::new(0),
 ];
 
 /// Launches each window's arm took off the one-row reduction since process
 /// start: the arms' engagement counts.
-static WINDOW_GEMMS: [std::sync::atomic::AtomicU64; 2] = [
+static WINDOW_GEMMS: [std::sync::atomic::AtomicU64; WINDOW_KINDS] = [
+    std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
 ];
 
 impl Window {
+    /// Every kind, in the order [`window_gemm`] attributes a launch when
+    /// more than one is open.
+    pub const ALL: [Window; WINDOW_KINDS] = [Window::Verify, Window::Draft, Window::Prefill];
+
     fn index(self) -> usize {
         match self {
             Window::Verify => 0,
             Window::Draft => 1,
+            Window::Prefill => 2,
         }
     }
 
@@ -200,6 +218,7 @@ impl Window {
                 let on = match self {
                     Window::Verify => g.verify_window,
                     Window::Draft => g.draft_window,
+                    Window::Prefill => g.prefill_window,
                 };
                 at.store(if on { 2 } else { 1 }, Relaxed);
                 on
@@ -241,6 +260,13 @@ impl VerifyWindow {
         Self::of(Window::Draft)
     }
 
+    /// One forward of a prompt's prefill: a tile of one sequence's prompt
+    /// tokens, opened by the driver that feeds them. Never a pass that
+    /// carries a decode row (a ragged step's pieces ride its decode rows).
+    pub fn prefill() -> Self {
+        Self::of(Window::Prefill)
+    }
+
     fn of(kind: Window) -> Self {
         WINDOWS.with(|w| {
             let c = &w[kind.index()];
@@ -280,9 +306,7 @@ pub fn set_verify_window_arm(on: bool) {
 /// The window whose arm a `deterministic` half matmul encoded here takes —
 /// the GEMM rather than the one-row reduction — or `None`.
 pub fn window_gemm() -> Option<Window> {
-    [Window::Verify, Window::Draft]
-        .into_iter()
-        .find(|w| w.is_open() && w.arm())
+    Window::ALL.into_iter().find(|w| w.is_open() && w.arm())
 }
 
 /// Count one launch `w`'s arm routed to the GEMM.
@@ -293,6 +317,16 @@ pub fn note_window_gemm(w: Window) {
 /// The verify window's engagement count now.
 pub fn verify_window_gemms() -> u64 {
     Window::Verify.gemms()
+}
+
+/// The prefill window's receipt: its arm under the contract in force and the
+/// launches it took since `since` (a [`Window::gemms`] read).
+pub fn prefill_window_report(since: u64) -> String {
+    format!(
+        "arm={} gemm_launches={}",
+        Window::Prefill.report(),
+        Window::Prefill.gemms().saturating_sub(since)
+    )
 }
 
 /// The receipt a speculative run prints: each window's arm under the
@@ -772,6 +806,15 @@ pub struct GemmTuning {
         status = "arm"
     )]
     pub draft_window: bool,
+    /// Under `deterministic`, a prompt's prefill forward — a tile of one sequence's prompt tokens — takes the GEMM `fast` takes from two rows, its rows identical per tile shape; off = the one-row GEMV reduction, a P-row tile as P weight sweeps. The K=1 decode path (a step, batched rows, a ragged step's pieces) keeps the reduction either way; `fast` does not read it.
+    #[opt(
+        flag = "gemm-prefill-window",
+        env = "LLOOM_GEMM_PREFILL_WINDOW",
+        bool,
+        path = "kernels.gemm.prefill_window",
+        status = "arm"
+    )]
+    pub prefill_window: bool,
 }
 
 impl Default for GemmTuning {
@@ -784,6 +827,7 @@ impl Default for GemmTuning {
             force: None,
             verify_window: true,
             draft_window: true,
+            prefill_window: true,
         }
     }
 }
@@ -1518,17 +1562,22 @@ mod tests {
     fn the_report_names_the_window_arms() {
         let t = Tuning::default();
         assert!(
-            t.gemm.verify_window && t.gemm.draft_window,
-            "both arms are on by default"
+            t.gemm.verify_window && t.gemm.draft_window && t.gemm.prefill_window,
+            "every window's arm is on by default"
         );
-        for (verify, draft, arms) in [
-            (true, true, "verify-gemm,draft-gemm"),
-            (true, false, "verify-gemm"),
-            (false, true, "draft-gemm"),
-            (false, false, "none"),
+        for (verify, draft, prefill, arms) in [
+            (true, true, true, "verify-gemm,draft-gemm,prefill-gemm"),
+            (true, true, false, "verify-gemm,draft-gemm"),
+            (true, false, true, "verify-gemm,prefill-gemm"),
+            (false, true, true, "draft-gemm,prefill-gemm"),
+            (false, false, true, "prefill-gemm"),
+            (true, false, false, "verify-gemm"),
+            (false, true, false, "draft-gemm"),
+            (false, false, false, "none"),
         ] {
             Window::Verify.set_arm(verify);
             Window::Draft.set_arm(draft);
+            Window::Prefill.set_arm(prefill);
             let accum = crate::cpu::f16_matmul::report();
             assert_eq!(
                 Contract::Deterministic.report(),
@@ -1567,6 +1616,63 @@ mod tests {
         );
         drop(outer);
         assert!(!in_verify_window());
+    }
+
+    /// A prefill window is its own kind: it opens nothing else, another
+    /// thread does not see it, and it closes on every way out of the forward
+    /// that opened it — a return, an `Err` propagated by `?`, an unwind.
+    #[test]
+    fn a_prefill_window_closes_on_every_exit() {
+        Window::Prefill.set_arm(true);
+        let none_open = || Window::ALL.iter().all(|w| !w.is_open());
+        assert!(none_open() && window_gemm().is_none());
+        {
+            let _p = VerifyWindow::prefill();
+            assert!(Window::Prefill.is_open());
+            assert!(!Window::Verify.is_open() && !Window::Draft.is_open());
+            assert_eq!(window_gemm(), Some(Window::Prefill));
+            assert!(
+                std::thread::spawn(|| window_gemm().is_none())
+                    .join()
+                    .unwrap(),
+                "a decode encoded on another thread inherits no prefill window"
+            );
+            {
+                let _v = VerifyWindow::open();
+                assert_eq!(
+                    window_gemm(),
+                    Some(Window::Verify),
+                    "a nested verify attributes to itself"
+                );
+            }
+            assert_eq!(window_gemm(), Some(Window::Prefill));
+        }
+        assert!(none_open());
+
+        fn failing_forward() -> Result<(), String> {
+            let _p = VerifyWindow::prefill();
+            let forward: Result<(), String> = Err("the forward failed".to_string());
+            forward?;
+            unreachable!("the forward's error propagates")
+        }
+        assert!(failing_forward().is_err());
+        assert!(none_open(), "a failed prefill leaves no window behind");
+
+        let unwound = std::panic::catch_unwind(|| {
+            let _p = VerifyWindow::prefill();
+            panic!("the forward panicked");
+        });
+        assert!(unwound.is_err());
+        assert!(none_open(), "an unwound prefill leaves no window behind");
+
+        Window::Prefill.set_arm(false);
+        let _p = VerifyWindow::prefill();
+        assert!(Window::Prefill.is_open());
+        assert_eq!(
+            window_gemm(),
+            None,
+            "with its arm off the window routes nothing"
+        );
     }
 
     #[test]

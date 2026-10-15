@@ -46,7 +46,7 @@ use clap::Parser;
 use serde_json::{json, Map, Value};
 use std::collections::HashSet;
 use std::io::{Read, Write};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
@@ -200,7 +200,10 @@ fn run_configured(args: ServeArgs, transport: Option<tiny_http::TransportPolicy>
         options.decode.prefill.chunk = 512;
     }
     let load_start = Instant::now();
-    let shape = super::Shape::of(&options, false, seed_text);
+    // `serve` reuses the conversation by default (`context.prefix.reuse`
+    // unset); `--no-reuse` opts out, and a benchmark cell stays cold either
+    // way (`DecodeParams::cold`).
+    let shape = super::Shape::of(&options, true, seed_text);
     let reuse_prefix = shape.reuse_prefix;
     // A non-generating decision model is served by the decision-only listener.
     if let Some(endpoint) = super::omni::serving::load(&options.load, &shape)? {
@@ -260,10 +263,7 @@ fn run_owner(
         .check()
         .map_err(|e| anyhow::anyhow!("the checkpoint's generation_config.json: {e}"))?;
     let description = engine.describe_checked()?;
-    let logprobs = match front::logprobs_refused(engine.as_ref()) {
-        None => format!("served(top<={})", lloom::nn::MAX_TOP_LOGPROBS),
-        Some(why) => format!("refused({why})"),
-    };
+    let logprobs = logprobs_line(engine.as_ref());
     if let Some((load_start, reuse_prefix)) = load_facts {
         eprintln!(
             "[loaded {} from {} in {:.2}s on {:?}; kv_capacity={} readback={} reuse_prefix={} logprobs={logprobs} {}]",
@@ -857,14 +857,14 @@ fn completions(shared: &Shared, v: &Value, _headers: &[Header]) -> Handled<Reply
     Ok(Reply::Json(body))
 }
 
-/// OpenAI's completions `logprobs`: per returned id its token, its
+/// OpenAI's completions `logprobs`: per delivered id its token, its
 /// log-probability, the top tokens asked for, and its text's offset.
 fn completion_logprobs(engine: &dyn Served, d: &Decoded) -> Result<Value> {
     let Some(lp) = &d.logprobs else {
         return Ok(Value::Null);
     };
-    let tokens = d
-        .tokens
+    let n = delivered_ids(engine, d);
+    let tokens = d.tokens[..n]
         .iter()
         .map(|&t| engine.token_str_checked(t))
         .collect::<Result<Vec<String>>>()?;
@@ -877,8 +877,7 @@ fn completion_logprobs(engine: &dyn Served, d: &Decoded) -> Result<Value> {
             o
         })
         .collect();
-    let top = lp
-        .top
+    let top = lp.top[..n.min(lp.top.len())]
         .iter()
         .map(|t| {
             Ok(Value::Object(
@@ -890,14 +889,13 @@ fn completion_logprobs(engine: &dyn Served, d: &Decoded) -> Result<Value> {
         .collect::<Result<Vec<Value>>>()?;
     // OpenAI's `top_logprobs` keys by the token's text, and two ids can
     // share one (the halves of a character); `top_ids` keeps the ids.
-    let top_ids: Vec<Value> = lp
-        .top
+    let top_ids: Vec<Value> = lp.top[..n.min(lp.top.len())]
         .iter()
         .map(|t| json!(t.iter().map(|&(id, l)| json!([id, l])).collect::<Vec<_>>()))
         .collect();
     Ok(json!({
         "tokens": tokens,
-        "token_logprobs": lp.sampled,
+        "token_logprobs": &lp.sampled[..n.min(lp.sampled.len())],
         "top_logprobs": top,
         "top_ids": top_ids,
         "text_offset": offsets,
@@ -934,7 +932,11 @@ fn chat_completions(shared: &Shared, v: &Value) -> Handled<Reply> {
     let mut params = sampling_params(shared, v)?;
     let wanted = request_budgets(shared, v, params.max_tokens)?;
     let stream = v.get("stream").and_then(Value::as_bool).unwrap_or(false);
-    let want_logprobs = v.get("logprobs").and_then(Value::as_bool).unwrap_or(false);
+    let want_logprobs = match v.get("logprobs") {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(b)) => *b,
+        Some(_) => return Err(bad("field 'logprobs' must be a boolean")),
+    };
     let mut kwargs = request_kwargs(v, &REQUEST_FIELDS).map_err(bad)?;
     let want = kwargs.get(ENABLE_THINKING).and_then(Value::as_bool);
     thinking::set_kwarg(shared.engine.as_ref(), want, &mut kwargs);
@@ -971,6 +973,7 @@ fn chat_completions(shared: &Shared, v: &Value) -> Handled<Reply> {
                     .map_err(|e| anyhow::Error::new(front::Refused(format!("{e:#}"))))
             };
             let expand_ref: front::Expand<'_> = &expand;
+            let front_start = Instant::now();
             let prompt = shared
                 .front
                 .prompt(
@@ -990,6 +993,7 @@ fn chat_completions(shared: &Shared, v: &Value) -> Handled<Reply> {
                 thinking: prompt.thinking,
                 renders: prompt.renders,
                 spliced: prompt.spliced,
+                front_us: Some(front_start.elapsed().as_micros() as u64),
                 ..PromptFacts::default()
             };
             let mut ids = prompt.ids.clone();
@@ -1071,8 +1075,9 @@ fn chat_completions(shared: &Shared, v: &Value) -> Handled<Reply> {
             return Err(bad("logprobs with an image is not supported"));
         }
     }
-    // OpenAI's bound: up to 20 candidates beside each drawn id, asked with
-    // `logprobs`.
+    // Candidates beside each drawn id, asked with `logprobs`: up to lloom's
+    // `MAX_TOP_LOGPROBS`, an extension past the 20 OpenAI's chat API
+    // documents (no strict-compatibility bound is applied here).
     let top_logprobs = match v.get("top_logprobs") {
         None | Some(Value::Null) => None,
         Some(n) => Some(
@@ -1089,7 +1094,7 @@ fn chat_completions(shared: &Shared, v: &Value) -> Handled<Reply> {
     if top_logprobs.is_some() && !want_logprobs {
         return Err(bad("top_logprobs asks for logprobs: set logprobs to true"));
     }
-    let top_k = top_logprobs.unwrap_or(1).max(1);
+    let top_k = top_logprobs.unwrap_or(0);
     // Past one token, each returned id carries its log-probability (and the
     // top `top_logprobs`), from the run's own steps.
     let return_ids = v
@@ -1133,15 +1138,17 @@ fn chat_completions(shared: &Shared, v: &Value) -> Handled<Reply> {
         // token is scored wherever it ranks.
         let engine = shared.engine.as_ref();
         let started = Instant::now();
+        // The drawn id's own log-probability needs its row's head even when
+        // no candidate beside it is asked (`top_logprobs` 0).
         let want = if options.is_empty() {
-            top_k
+            top_k.max(1)
         } else {
             usize::MAX
         };
         let (argmax, all) = engine.next_token_logprobs(&prompt_ids, want)?;
         let top = &all[..top_k.min(all.len())];
         let content = engine.token_str_checked(argmax)?;
-        let token_lp = top
+        let token_lp = all
             .iter()
             .find(|(t, _)| *t == argmax)
             .map(|(_, lp)| *lp)
@@ -1244,11 +1251,14 @@ fn chat_completions(shared: &Shared, v: &Value) -> Handled<Reply> {
         &mut |_| true,
     )?;
     let elapsed = started.elapsed();
-    let recorded = prompt.as_ref().is_some_and(|p| {
+    let record_start = Instant::now();
+    let frontier = prompt.as_ref().map(|p| {
         shared
             .front
-            .record(shared.engine.as_ref(), p.origin, &decoded)
+            .record_frontier(shared.engine.as_ref(), p.origin, &decoded)
     });
+    let record_us = frontier.map(|_| record_start.elapsed().as_micros() as u64);
+    let recorded = frontier.is_some_and(|f| f.logged);
     report(
         shared,
         "/v1/chat/completions",
@@ -1273,6 +1283,10 @@ fn chat_completions(shared: &Shared, v: &Value) -> Handled<Reply> {
         "timings": timings(shared.engine.as_ref(), prompt_ids.len(), &facts, &decoded, elapsed),
     });
     body["timings"]["logged"] = json!(recorded);
+    // What of the reply is the accepted history (decision 42): the whole
+    // ids its delivered text begins with, and the text past them.
+    body["timings"]["frontier"] = frontier.map_or(Value::Null, |f| f.json());
+    body["timings"]["front_record_us"] = json!(record_us);
     // Ids only when asked (`return_token_ids`), and their logprobs only when
     // logprobs are asked too: the conversation the response returns is its
     // text (`sequence-reuse-design.md` §2.3d).
@@ -1330,14 +1344,29 @@ fn logprob_request(
     }
 }
 
-/// OpenAI's chat `logprobs.content`: per returned id, its token, its
+/// The returned ids a logprobs block lists beside the text: every id, unless
+/// the server withheld text from the reply (a stop string, a fragment the
+/// consumer refused); then the ids whose text the delivered text is — the
+/// accepted frontier (`front::accepted`) — so the withheld text does not
+/// reach the client through its tokens. `token_ids` / `token_logprobs`
+/// carry every id either way. Every id on a family with no text side.
+fn delivered_ids(engine: &dyn Served, d: &Decoded) -> usize {
+    match (d.stop, engine.text()) {
+        (Stop::StopString | Stop::Cancelled, Some(t)) => {
+            front::accepted(t, &d.tokens, &d.text).map_or(0, |(n, _)| n)
+        }
+        _ => d.tokens.len(),
+    }
+}
+
+/// OpenAI's chat `logprobs.content`: per delivered id, its token, its
 /// log-probability and the `top_logprobs` asked for.
 fn chat_logprobs(engine: &dyn Served, d: &Decoded) -> Result<Value> {
     let Some(lp) = &d.logprobs else {
         return Ok(Value::Null);
     };
-    let content = d
-        .tokens
+    let n = delivered_ids(engine, d);
+    let content = d.tokens[..n]
         .iter()
         .zip(&lp.sampled)
         .enumerate()
@@ -1550,6 +1579,7 @@ fn sampling_params(shared: &Shared, v: &Value) -> Handled<DecodeParams> {
         logits_digest: false,
         prefill_tile: shared.engine.prefill_tile(),
         turn_tail: 0,
+        no_checkpoint: false,
         thinking: None,
         logprobs: None,
         cold: false,
@@ -1666,15 +1696,26 @@ fn stream_response(shared: &Shared, request: Request, run: StreamingRun) -> Resu
             },
         )
     };
+    let written = sw.written();
     let (w, write_err) = sw.finish()?;
     let decoded = decoded?;
-    if let Some(origin) = run.record {
+    // The accepted history is what the server handed the writer; of that,
+    // what it knows it wrote, and whether a write failed (what the client
+    // received is not known either way).
+    let record_start = Instant::now();
+    let frontier = run.record.map(|origin| {
         shared
             .front
-            .record(shared.engine.as_ref(), origin, &decoded);
+            .record_frontier(shared.engine.as_ref(), origin, &decoded)
+    });
+    let record_us = frontier.map(|_| record_start.elapsed().as_micros() as u64);
+    let mut frontier_json = frontier.map_or(Value::Null, |f| f.json());
+    if frontier_json.is_object() {
+        frontier_json["written_bytes"] = json!(written.load(Ordering::Relaxed));
+        frontier_json["write_failed"] = json!(write_err.is_some());
     }
     if let Some(e) = write_err {
-        anyhow::bail!("client went away mid-stream: {e}");
+        anyhow::bail!("client went away mid-stream: {e}; frontier {frontier_json}");
     }
     let elapsed = started.elapsed();
     report(
@@ -1702,6 +1743,8 @@ fn stream_response(shared: &Shared, request: Request, run: StreamingRun) -> Resu
         }),
     };
     let mut last = last;
+    last["timings"]["frontier"] = frontier_json;
+    last["timings"]["front_record_us"] = json!(record_us);
     if run.return_ids {
         last["prompt_token_ids"] = json!(run.prompt_ids);
         last["choices"][0]["token_ids"] = json!(decoded.tokens);
@@ -1903,6 +1946,7 @@ fn max_memory_usage(shared: &Shared, v: &Value) -> Handled<Value> {
         readback: engine.readback(),
         prefill_tile: engine.prefill_tile(),
         turn_tail: 0,
+        no_checkpoint: false,
         cold: true,
         ..DecodeParams::default()
     };
@@ -1943,6 +1987,7 @@ fn end_to_end_latency(shared: &Shared, v: &Value) -> Handled<Value> {
         readback: engine.readback(),
         prefill_tile: engine.prefill_tile(),
         turn_tail: 0,
+        no_checkpoint: false,
         cold: true,
         ..DecodeParams::default()
     };
@@ -2143,6 +2188,7 @@ fn eval(shared: &Shared, request: Request, v: &Value) -> Result<()> {
                             logits_digest: false,
                             prefill_tile: engine.prefill_tile(),
                             turn_tail: 0,
+                            no_checkpoint: false,
                             thinking: None,
                             logprobs: None,
                             cold: false,
@@ -2352,8 +2398,12 @@ impl ChunkedWriter {
 /// [`DRAIN_PERIOD`] and wraps it in one event — a delta of several tokens,
 /// which the OpenAI stream allows.
 struct StreamWriter {
-    tx: Option<std::sync::mpsc::Sender<String>>,
+    tx: Option<std::sync::mpsc::Sender<(String, usize)>>,
     gone: Arc<AtomicBool>,
+    /// Bytes of handed-over text whose events the writer thread wrote
+    /// without an error (`Self::written`): what the server knows it wrote,
+    /// never what a client received.
+    written: Arc<AtomicUsize>,
     thread: Option<std::thread::JoinHandle<(ChunkedWriter, Option<std::io::Error>)>>,
     deltas: Option<Arc<DeltaBuffer>>,
     /// The deltas' wire wrapping, shared with the thread: [`Self::send`]
@@ -2381,22 +2431,32 @@ impl StreamWriter {
     }
 
     fn spawn(mut w: ChunkedWriter, wrap: Option<Wrap>) -> Self {
-        let (tx, rx) = std::sync::mpsc::channel::<String>();
+        let (tx, rx) = std::sync::mpsc::channel::<(String, usize)>();
         let gone = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&gone);
+        let written = Arc::new(AtomicUsize::new(0));
+        let wrote = Arc::clone(&written);
         let deltas = wrap.as_ref().map(|_| DeltaBuffer::new());
         let buf = deltas.clone();
         let thread_wrap = wrap.clone();
         let thread = std::thread::spawn(move || {
             let mut err: Option<std::io::Error> = None;
             let mut local = String::with_capacity(4096);
-            let write = |w: &mut ChunkedWriter, payload: &str, err: &mut Option<std::io::Error>| {
+            let write = |w: &mut ChunkedWriter,
+                         payload: &str,
+                         text: usize,
+                         err: &mut Option<std::io::Error>| {
                 if err.is_some() {
                     return;
                 }
-                if let Err(e) = w.raw(payload) {
-                    flag.store(true, Ordering::Release);
-                    *err = Some(e);
+                match w.raw(payload) {
+                    Ok(()) => {
+                        wrote.fetch_add(text, Ordering::Relaxed);
+                    }
+                    Err(e) => {
+                        flag.store(true, Ordering::Release);
+                        *err = Some(e);
+                    }
                 }
             };
             // The text that accumulated, as one event. (Text pushed before a
@@ -2404,7 +2464,7 @@ impl StreamWriter {
             let mut drain = |w: &mut ChunkedWriter, err: &mut Option<std::io::Error>| {
                 if let (Some(b), Some(wrap)) = (&buf, &thread_wrap) {
                     if b.take_into(&mut local) {
-                        write(w, &wrap(&local), err);
+                        write(w, &wrap(&local), local.len(), err);
                     }
                 }
             };
@@ -2416,7 +2476,7 @@ impl StreamWriter {
                         .map_err(|_| std::sync::mpsc::RecvTimeoutError::Disconnected)
                 };
                 match next {
-                    Ok(payload) => write(&mut w, &payload, &mut err),
+                    Ok((payload, text)) => write(&mut w, &payload, text, &mut err),
                     Err(std::sync::mpsc::RecvTimeoutError::Timeout) => drain(&mut w, &mut err),
                     Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                         drain(&mut w, &mut err);
@@ -2429,6 +2489,7 @@ impl StreamWriter {
         Self {
             tx: Some(tx),
             gone,
+            written,
             thread: Some(thread),
             deltas,
             wrap,
@@ -2451,7 +2512,7 @@ impl StreamWriter {
             b.flush(&mut self.spill.lock());
             let mut text = String::new();
             if b.take_into(&mut text) {
-                let _ = tx.send(wrap(&text));
+                let _ = tx.send((wrap(&text), text.len()));
             }
         }
     }
@@ -2470,8 +2531,14 @@ impl StreamWriter {
         self.queue_pending();
         if let Some(tx) = &self.tx {
             // A closed receiver means the thread is gone, which `gone` reports.
-            let _ = tx.send(payload);
+            let _ = tx.send((payload, 0));
         }
+    }
+
+    /// The bytes of handed-over text written so far; final once
+    /// [`Self::finish`] has joined the thread.
+    fn written(&self) -> Arc<AtomicUsize> {
+        Arc::clone(&self.written)
     }
 
     /// The client stopped reading: a write failed on the writer thread.
@@ -2571,7 +2638,7 @@ fn timings(
         st.step_ns.iter().sum::<u64>() as f64 / 1e6
     };
     let n = d.tokens.len();
-    json!({
+    let mut t = json!({
         "prompt_n": prompt,
         "prompt_submit_ms": st.prefill_ns as f64 / 1e6,
         "predicted_n": n,
@@ -2629,7 +2696,15 @@ fn timings(
         // accepted boundary it found, how the state there was made ready,
         // and the ids kept, replayed and newly prefilled.
         "turn": d.turn.with_policy(engine.reuse_prefix()).json(engine.reuse_prefix()),
-    })
+    });
+    // Matched replies whose run ended inside their reasoning block, and those
+    // given to the template as that reasoning.
+    t["history_open_reasoning"] = json!(facts.spliced.open);
+    t["history_open_apart"] = json!(facts.spliced.open_apart);
+    // The turn checkpoint this request's prefill was asked to leave.
+    t["checkpoint"] = json!(d.checkpoint_name());
+    t["front_prompt_us"] = json!(facts.front_us);
+    t
 }
 
 fn report(
@@ -2657,7 +2732,7 @@ fn report(
          commits={} poll_fallbacks={} overrun={} eos_gate={} host_fill={} prompt_ids_sha256={} \
          reasoning_effort={} think={} think_by={} thinking_budget={} thought={} budget_fired={} \
          prompt_budget={} prompt_dropped={} reused={} renders={} history={}/{} spliced={}/{} \
-         unverified={} ambiguous={} declined={} reuse_policy={} {}]",
+         unverified={} ambiguous={} declined={} reuse_policy={} {} checkpoint={}]",
         d.tokens.len(),
         d.stop,
         d.readback.name(),
@@ -2694,6 +2769,7 @@ fn report(
         facts.spliced.declined,
         crate::turn::policy_name(policy),
         turn.fields(),
+        d.checkpoint_name(),
     );
 }
 
@@ -2719,6 +2795,10 @@ struct PromptFacts {
     /// The replies of ours the history carried, and what of them ran as
     /// sampled.
     spliced: front::Spliced,
+    /// The front end's own time for the prompt (scopes, the log's lookup,
+    /// the one render, the one tokenization, the alignment): a request's,
+    /// never a token's.
+    front_us: Option<u64>,
 }
 
 impl PromptFacts {
@@ -2802,6 +2882,51 @@ fn respond_metadata(request: Request, result: Result<Value>) -> Result<()> {
     }
 }
 
+/// What this process's logprobs surface accepts (decision 48): per route,
+/// the most candidates beside each id — lloom's `MAX_TOP_LOGPROBS`, an
+/// extension past the 0–20 OpenAI's chat API documents — and where it is
+/// refused. A generating request's per-token logprobs are refused where
+/// the decode body reads no row (`front::logprobs_refused`), and with
+/// `stream`; on the chat route with an image too. The one-forward decision
+/// scoring (`max_tokens: 1`) reads its row whatever the body.
+fn logprobs_capability(engine: &dyn Served) -> Value {
+    let top = lloom::nn::MAX_TOP_LOGPROBS;
+    let refused = front::logprobs_refused(engine);
+    let generating = match &refused {
+        None => json!({ "served": true, "top_max": top, "stream": false }),
+        Some(why) => json!({ "served": false, "refused": why }),
+    };
+    let mut chat = generating.clone();
+    chat["images"] = json!(false);
+    let mut body = json!({
+        "served": refused.is_none(),
+        "top_max": top,
+        "openai_documented_top_max": OPENAI_TOP_LOGPROBS,
+        "routes": {
+            "/v1/chat/completions": chat,
+            "/v1/completions": generating,
+            "decision": { "served": true, "top_max": top, "options": "every candidate" },
+        },
+    });
+    if let Some(why) = refused {
+        body["refused"] = json!(why);
+    }
+    body
+}
+
+/// The `top_logprobs` bound OpenAI's chat API documents: reported beside
+/// lloom's own, never applied (no strict-compatibility adapter is built).
+const OPENAI_TOP_LOGPROBS: usize = 20;
+
+/// [`logprobs_capability`] as the load line's `logprobs=` field.
+fn logprobs_line(engine: &dyn Served) -> String {
+    let top = lloom::nn::MAX_TOP_LOGPROBS;
+    match front::logprobs_refused(engine) {
+        None => format!("served(top<={top},stream=refused) decision_logprobs=top<={top}"),
+        Some(why) => format!("refused({why}) decision_logprobs=top<={top}"),
+    }
+}
+
 fn health_body(engine: &dyn Served, front: &Front) -> Result<Value> {
     let mut body = engine.health_checked()?;
     body["mem"] = MemSnapshot::read(engine.device()).json();
@@ -2812,12 +2937,7 @@ fn health_body(engine: &dyn Served, front: &Front) -> Result<Value> {
     body["template_renders"] = json!(engine.template_renders());
     body["tokenizations"] = json!(front.tokenizations());
     body["session_log"] = json!(front.logged());
-    // Whether a request's per-token logprobs are served here, and why not.
-    body["logprobs"] = match front::logprobs_refused(engine) {
-        None => json!({ "served": true, "top_max": lloom::nn::MAX_TOP_LOGPROBS }),
-        Some(why) => json!({ "served": false, "top_max": lloom::nn::MAX_TOP_LOGPROBS,
-                             "refused": why }),
-    };
+    body["logprobs"] = logprobs_capability(engine);
     body["chat_template_reads"] = ENGINE_KWARGS
         .iter()
         .map(|&k| (k.to_string(), json!(engine.template_reads(k))))
@@ -3931,6 +4051,32 @@ mod checked_trailer_tests {
         assert!(
             text.ends_with("0\r\n\r\n"),
             "success lost chunk termination"
+        );
+    }
+}
+
+#[cfg(test)]
+mod logprob_request_tests {
+    use super::logprob_request;
+    use crate::LogprobRequest;
+
+    /// A request that asks no logprobs, on a session that keeps none,
+    /// captures nothing: the run reads no row and takes no blocking arm for
+    /// them. Asked 0 is the drawn id's log-probability alone.
+    #[test]
+    fn a_text_only_request_captures_no_row() {
+        assert_eq!(logprob_request(None, None), None);
+        assert_eq!(
+            logprob_request(Some(0), None),
+            Some(LogprobRequest {
+                top: 0,
+                rows: false
+            })
+        );
+        assert_eq!(
+            logprob_request(None, Some(LogprobRequest { top: 0, rows: true })),
+            Some(LogprobRequest { top: 0, rows: true }),
+            "the session's own keep, never serialised unless asked"
         );
     }
 }

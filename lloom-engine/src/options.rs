@@ -1184,6 +1184,7 @@ impl SamplingConfig {
             prefill_tile,
             thinking: None,
             turn_tail: 0,
+            no_checkpoint: false,
             logprobs: None,
             cold: false,
         }
@@ -1737,7 +1738,7 @@ impl Default for SchedulerConfig {
 #[options(v0 = false)]
 #[serde(default)]
 pub struct PrefixConfig {
-    /// Reuse the cached prefix across turns or requests; unset = the front-end's own (`chat` reuses, `serve` and `bench` measure a cold prefill).
+    /// Reuse the cached prefix across turns or requests; unset = the front-end's own (`chat` and `serve` reuse; `bench` measures a cold prefill, and a benchmark cell stays cold whatever this says). `--no-reuse` turns it off.
     #[opt(bool, flag = "reuse-prefix", path = "context.prefix.reuse", status = "stable", cli = "prefix-reuse", switches = ["no-reuse=false"])]
     pub reuse: Option<bool>,
     /// Share a request's prompt prefix from another row's cache, by page (the pool rows only).
@@ -1772,6 +1773,10 @@ fn parse_missing_reasoning(v: &str) -> Result<String, String> {
     lloom_tensor::options::parse_arm(v, &["as-sent", "log"]).map(str::to_string)
 }
 
+fn parse_incomplete_reasoning(v: &str) -> Result<String, String> {
+    lloom_tensor::options::parse_arm(v, &["text", "reasoning", "recover"]).map(str::to_string)
+}
+
 fn parse_keep_logprobs(v: &str) -> Result<String, String> {
     lloom_tensor::options::parse_arm(v, &["none", "sampled", "full"]).map(str::to_string)
 }
@@ -1791,6 +1796,9 @@ pub struct SessionConfig {
     /// What the session log keeps beside each reply's sampled ids: `none`; `sampled`, the sampled token's log-probability; `full`, every position's log-probabilities over the vocabulary (for a trainer that embeds the engine).
     #[opt(flag = "keep-logprobs", parser = "parse_keep_logprobs", variants = ["none", "sampled", "full"], path = "session.keep_logprobs", status = "advanced")]
     pub keep_logprobs: String,
+    /// A past reply of ours whose run ended inside its reasoning block (`max_tokens`, a stop string, a cancellation): `text` renders it as the text the client got; `reasoning` gives it to the template as the open reasoning it is, which the template closes or drops; `recover` renders it as text and places the turn checkpoint before the divergence that makes.
+    #[opt(flag = "incomplete-reasoning", parser = "parse_incomplete_reasoning", variants = ["text", "reasoning", "recover"], path = "session.incomplete_reasoning", status = "advanced")]
+    pub incomplete_reasoning: String,
 }
 
 impl Default for SessionConfig {
@@ -1799,6 +1807,7 @@ impl Default for SessionConfig {
             persist_thinking: None,
             missing_reasoning: "as-sent".into(),
             keep_logprobs: "none".into(),
+            incomplete_reasoning: "text".into(),
         }
     }
 }

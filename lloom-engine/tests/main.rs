@@ -13,7 +13,9 @@
 //! `every_test_file_is_a_module` below reads this directory and this file,
 //! so a file that is not a module here fails the suite instead of silently
 //! not running.
+mod accepted_frontier;
 mod attention_purpose;
+mod checkpoint_policy;
 mod load_warnings;
 mod machine_gate;
 mod qwen4exp_served_auto;

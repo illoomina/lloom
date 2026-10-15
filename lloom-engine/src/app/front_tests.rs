@@ -1157,6 +1157,12 @@ fn a_split_character_aligns_and_a_reply_cut_short_logs_its_part() {
     let mut neither = decoded(&engine, bytes("abc"));
     neither.text = "xyz".into();
     assert!(!front.record(&engine, p1.origin, &neither), "not ours");
+    // A delivered text past the whole ids that does not begin the next
+    // unit's text is not the run's either.
+    let tr = TinyTokenizer::qwen4exp().id("<tool_response>").unwrap();
+    let mut astray = decoded(&engine, [bytes("ab"), vec![tr]].concat());
+    astray.text = "ab<x".into();
+    assert!(!front.record(&engine, p1.origin, &astray), "not the run's text");
 }
 
 /// The log is bounded: the oldest reply goes first, and its text no longer
@@ -1506,11 +1512,19 @@ fn a_stop_inside_a_token_keeps_the_whole_ids_before_it() {
     let mut d = decoded(&engine, [bytes("ab"), vec![tr], bytes("cd")].concat());
     d.stop = Stop::StopString;
     d.text = "ab<tool_".into();
-    assert!(
-        front.record(&engine, p1.origin, &d),
+    assert_eq!(
+        front.record_frontier(&engine, p1.origin, &d),
+        Frontier {
+            generated: 5,
+            accepted: 2,
+            partial: "<tool_".len(),
+            delivered: "ab<tool_".len(),
+            logged: true,
+        },
         "a reply whose delivered text ends inside a token is logged"
     );
     let r = front.reply("ab<tool_").unwrap();
+    assert_eq!((r.partial, r.generated), ("<tool_".len(), 5));
     assert_eq!(r.ids, bytes("ab"), "the whole ids before the cut, as sampled");
     let second = json!([user("Tools?"), assistant("ab<tool_"), user("More?")]);
     let p2 = build(&front, &engine, &second, Some(false));

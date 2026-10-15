@@ -46,7 +46,7 @@ use clap::Parser;
 use serde_json::{json, Map, Value};
 use std::collections::HashSet;
 use std::io::{Read, Write};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
@@ -1244,11 +1244,12 @@ fn chat_completions(shared: &Shared, v: &Value) -> Handled<Reply> {
         &mut |_| true,
     )?;
     let elapsed = started.elapsed();
-    let recorded = prompt.as_ref().is_some_and(|p| {
+    let frontier = prompt.as_ref().map(|p| {
         shared
             .front
-            .record(shared.engine.as_ref(), p.origin, &decoded)
+            .record_frontier(shared.engine.as_ref(), p.origin, &decoded)
     });
+    let recorded = frontier.is_some_and(|f| f.logged);
     report(
         shared,
         "/v1/chat/completions",
@@ -1273,6 +1274,9 @@ fn chat_completions(shared: &Shared, v: &Value) -> Handled<Reply> {
         "timings": timings(shared.engine.as_ref(), prompt_ids.len(), &facts, &decoded, elapsed),
     });
     body["timings"]["logged"] = json!(recorded);
+    // What of the reply is the accepted history (decision 42): the whole
+    // ids its delivered text begins with, and the text past them.
+    body["timings"]["frontier"] = frontier.map_or(Value::Null, |f| f.json());
     // Ids only when asked (`return_token_ids`), and their logprobs only when
     // logprobs are asked too: the conversation the response returns is its
     // text (`sequence-reuse-design.md` §2.3d).
@@ -1667,15 +1671,24 @@ fn stream_response(shared: &Shared, request: Request, run: StreamingRun) -> Resu
             },
         )
     };
+    let written = sw.written();
     let (w, write_err) = sw.finish()?;
     let decoded = decoded?;
-    if let Some(origin) = run.record {
+    // The accepted history is what the server handed the writer; of that,
+    // what it knows it wrote, and whether a write failed (what the client
+    // received is not known either way).
+    let frontier = run.record.map(|origin| {
         shared
             .front
-            .record(shared.engine.as_ref(), origin, &decoded);
+            .record_frontier(shared.engine.as_ref(), origin, &decoded)
+    });
+    let mut frontier_json = frontier.map_or(Value::Null, |f| f.json());
+    if frontier_json.is_object() {
+        frontier_json["written_bytes"] = json!(written.load(Ordering::Relaxed));
+        frontier_json["write_failed"] = json!(write_err.is_some());
     }
     if let Some(e) = write_err {
-        anyhow::bail!("client went away mid-stream: {e}");
+        anyhow::bail!("client went away mid-stream: {e}; frontier {frontier_json}");
     }
     let elapsed = started.elapsed();
     report(
@@ -1703,6 +1716,7 @@ fn stream_response(shared: &Shared, request: Request, run: StreamingRun) -> Resu
         }),
     };
     let mut last = last;
+    last["timings"]["frontier"] = frontier_json;
     if run.return_ids {
         last["prompt_token_ids"] = json!(run.prompt_ids);
         last["choices"][0]["token_ids"] = json!(decoded.tokens);
@@ -2356,8 +2370,12 @@ impl ChunkedWriter {
 /// [`DRAIN_PERIOD`] and wraps it in one event — a delta of several tokens,
 /// which the OpenAI stream allows.
 struct StreamWriter {
-    tx: Option<std::sync::mpsc::Sender<String>>,
+    tx: Option<std::sync::mpsc::Sender<(String, usize)>>,
     gone: Arc<AtomicBool>,
+    /// Bytes of handed-over text whose events the writer thread wrote
+    /// without an error (`Self::written`): what the server knows it wrote,
+    /// never what a client received.
+    written: Arc<AtomicUsize>,
     thread: Option<std::thread::JoinHandle<(ChunkedWriter, Option<std::io::Error>)>>,
     deltas: Option<Arc<DeltaBuffer>>,
     /// The deltas' wire wrapping, shared with the thread: [`Self::send`]
@@ -2385,22 +2403,32 @@ impl StreamWriter {
     }
 
     fn spawn(mut w: ChunkedWriter, wrap: Option<Wrap>) -> Self {
-        let (tx, rx) = std::sync::mpsc::channel::<String>();
+        let (tx, rx) = std::sync::mpsc::channel::<(String, usize)>();
         let gone = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&gone);
+        let written = Arc::new(AtomicUsize::new(0));
+        let wrote = Arc::clone(&written);
         let deltas = wrap.as_ref().map(|_| DeltaBuffer::new());
         let buf = deltas.clone();
         let thread_wrap = wrap.clone();
         let thread = std::thread::spawn(move || {
             let mut err: Option<std::io::Error> = None;
             let mut local = String::with_capacity(4096);
-            let write = |w: &mut ChunkedWriter, payload: &str, err: &mut Option<std::io::Error>| {
+            let write = |w: &mut ChunkedWriter,
+                         payload: &str,
+                         text: usize,
+                         err: &mut Option<std::io::Error>| {
                 if err.is_some() {
                     return;
                 }
-                if let Err(e) = w.raw(payload) {
-                    flag.store(true, Ordering::Release);
-                    *err = Some(e);
+                match w.raw(payload) {
+                    Ok(()) => {
+                        wrote.fetch_add(text, Ordering::Relaxed);
+                    }
+                    Err(e) => {
+                        flag.store(true, Ordering::Release);
+                        *err = Some(e);
+                    }
                 }
             };
             // The text that accumulated, as one event. (Text pushed before a
@@ -2408,7 +2436,7 @@ impl StreamWriter {
             let mut drain = |w: &mut ChunkedWriter, err: &mut Option<std::io::Error>| {
                 if let (Some(b), Some(wrap)) = (&buf, &thread_wrap) {
                     if b.take_into(&mut local) {
-                        write(w, &wrap(&local), err);
+                        write(w, &wrap(&local), local.len(), err);
                     }
                 }
             };
@@ -2420,7 +2448,7 @@ impl StreamWriter {
                         .map_err(|_| std::sync::mpsc::RecvTimeoutError::Disconnected)
                 };
                 match next {
-                    Ok(payload) => write(&mut w, &payload, &mut err),
+                    Ok((payload, text)) => write(&mut w, &payload, text, &mut err),
                     Err(std::sync::mpsc::RecvTimeoutError::Timeout) => drain(&mut w, &mut err),
                     Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                         drain(&mut w, &mut err);
@@ -2433,6 +2461,7 @@ impl StreamWriter {
         Self {
             tx: Some(tx),
             gone,
+            written,
             thread: Some(thread),
             deltas,
             wrap,
@@ -2455,7 +2484,7 @@ impl StreamWriter {
             b.flush(&mut self.spill.lock());
             let mut text = String::new();
             if b.take_into(&mut text) {
-                let _ = tx.send(wrap(&text));
+                let _ = tx.send((wrap(&text), text.len()));
             }
         }
     }
@@ -2474,8 +2503,14 @@ impl StreamWriter {
         self.queue_pending();
         if let Some(tx) = &self.tx {
             // A closed receiver means the thread is gone, which `gone` reports.
-            let _ = tx.send(payload);
+            let _ = tx.send((payload, 0));
         }
+    }
+
+    /// The bytes of handed-over text written so far; final once
+    /// [`Self::finish`] has joined the thread.
+    fn written(&self) -> Arc<AtomicUsize> {
+        Arc::clone(&self.written)
     }
 
     /// The client stopped reading: a write failed on the writer thread.

@@ -30,6 +30,11 @@ pub struct TextStream {
     checked: std::cell::Cell<usize>,
     /// How much of `text` [`Self::publish`] has handed out.
     published: usize,
+    /// Where the last fragment handed out began.
+    last_from: usize,
+    /// Where the consumer's text ends, when it refused a fragment
+    /// ([`Self::refuse_last`]): the text past it was never delivered.
+    refused_at: Option<usize>,
 }
 
 impl TextStream {
@@ -40,6 +45,8 @@ impl TextStream {
             pending: 0,
             checked: std::cell::Cell::new(0),
             published: 0,
+            last_from: 0,
+            refused_at: None,
         }
     }
 
@@ -96,8 +103,15 @@ impl TextStream {
             return None;
         }
         let out = self.text[self.published..to].to_string();
+        self.last_from = self.published;
         self.published = to;
         Some(out)
+    }
+
+    /// The consumer refused the fragment last handed out (a client gone):
+    /// the delivered text ends where that fragment began.
+    pub fn refuse_last(&mut self) {
+        self.refused_at.get_or_insert(self.last_from);
     }
 
     /// Append `ids` and return the text they complete, if any; the text is
@@ -143,11 +157,13 @@ impl TextStream {
         &self.generated
     }
 
-    /// The text, cut before the earliest stop string, and the ids.
+    /// The delivered text — cut before the earliest stop string, and before
+    /// a fragment the consumer refused — and every id generated.
     pub fn finish(mut self, stop_strings: &[String]) -> (String, Vec<u32>) {
         if let Some(cut) = stop_strings
             .iter()
             .filter_map(|s| self.text.find(s.as_str()))
+            .chain(self.refused_at)
             .min()
         {
             self.text.truncate(cut);
@@ -182,6 +198,25 @@ mod tests {
             }
         }
         Ok(s)
+    }
+
+    /// A fragment the consumer refused is not delivered: the text ends where
+    /// it began, before the stop string too where both apply; the ids stay
+    /// every id generated.
+    #[test]
+    fn a_refused_fragment_ends_the_delivered_text() -> Result<()> {
+        let mut st = TextStream::new(8);
+        let mut d = detok;
+        let stops = ["zz".to_string()];
+        assert_eq!(st.publish(&[3, 4], &mut d, &stops)?.0.as_deref(), Some("de"));
+        assert_eq!(st.publish(&[5], &mut d, &stops)?.0.as_deref(), Some("f"));
+        st.refuse_last();
+        st.publish(&[6], &mut d, &stops)?;
+        st.refuse_last();
+        let (text, ids) = st.finish(&stops);
+        assert_eq!(text, "de", "the first refusal ends it");
+        assert_eq!(ids, vec![3, 4, 5, 6]);
+        Ok(())
     }
 
     #[test]

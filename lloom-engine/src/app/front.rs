@@ -473,11 +473,49 @@ pub struct Reply {
     pub tail: usize,
     pub reasoning_text: String,
     pub content_text: String,
+    /// The delivered text's bytes past `ids`' text (a stop or a
+    /// cancellation inside a token): text, never ids.
+    pub partial: usize,
+    /// Every id the run generated; `ids` are the accepted ones.
+    pub generated: usize,
     /// `session.keep_logprobs = sampled | full`: the sampled token's
     /// log-probability per id.
     pub logprobs: Option<Vec<f32>>,
     /// `session.keep_logprobs = full`: each position's log-probabilities.
     pub rows: Option<Vec<Vec<f32>>>,
+}
+
+/// A reply's accepted conversational frontier (`sequence-reuse-design.md`
+/// §2.3f): of the ids the run generated, the longest prefix of whole units
+/// whose text the delivered text begins with, and the delivered bytes past
+/// it — where a stop string or a cancellation cut inside a token. The
+/// delivered text is what the server accepted from the run and handed on,
+/// not what a client acknowledged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Frontier {
+    /// Every id the run generated (the session's log keeps them all).
+    pub generated: usize,
+    /// The whole ids the delivered text begins with.
+    pub accepted: usize,
+    /// The delivered text's bytes past those ids' text.
+    pub partial: usize,
+    /// The delivered text's bytes.
+    pub delivered: usize,
+    /// Whether the reply log keeps the reply: the delivered text is those
+    /// ids' text and a beginning of the next unit's.
+    pub logged: bool,
+}
+
+impl Frontier {
+    pub fn json(&self) -> Value {
+        json!({
+            "generated": self.generated,
+            "accepted": self.accepted,
+            "partial_bytes": self.partial,
+            "delivered_bytes": self.delivered,
+            "logged": self.logged,
+        })
+    }
 }
 
 /// How a message's text matched a logged reply.
@@ -1370,46 +1408,71 @@ impl Front {
     }
 
     /// Keep a reply in the session log against `origin`: the ids `decoded`
-    /// sampled, with what the run kept of their logprobs. A reply whose text
-    /// is not a prefix of whole units of its ids' decoding is not kept.
-    /// Returns whether it was.
+    /// sampled, with what the run kept of their logprobs. Returns whether it
+    /// was kept ([`Self::record_frontier`]).
     pub fn record(&self, engine: &dyn Served, origin: Origin, decoded: &Decoded) -> bool {
+        self.record_frontier(engine, origin, decoded).logged
+    }
+
+    /// [`Self::record`], returning the reply's accepted frontier. The ids
+    /// kept are the longest prefix of whole units whose text the delivered
+    /// text begins with, and the rest of the delivered text — a beginning of
+    /// the next unit's — is kept as text. A delivered text that is not that
+    /// (nothing of it whole, or not the run's) is not kept.
+    pub fn record_frontier(
+        &self,
+        engine: &dyn Served,
+        origin: Origin,
+        decoded: &Decoded,
+    ) -> Frontier {
         let thinking = origin.thinking;
+        let mut frontier = Frontier {
+            generated: decoded.tokens.len(),
+            delivered: decoded.text.len(),
+            ..Frontier::default()
+        };
         let Some(text) = engine.text() else {
-            return false;
+            return frontier;
         };
         if decoded.tokens.is_empty() {
-            return false;
+            return frontier;
         }
         let Some(full) = decode(text, &decoded.tokens) else {
-            return false;
+            return frontier;
         };
-        // The ids the client's text is: all of them, or — where the text
-        // stops short (a stop string, a character the run ended inside) —
-        // the longest prefix of whole units that decodes to it.
-        let n = if full == decoded.text {
-            decoded.tokens.len()
+        let (n, partial) = if full == decoded.text {
+            (decoded.tokens.len(), 0)
         } else {
             let Some(u) = units(text, &decoded.tokens, 0) else {
-                return false;
+                return frontier;
             };
-            let mut acc = String::new();
-            let mut kept = None;
+            let delivered = decoded.text.as_str();
+            let mut at = 0;
+            let mut kept = 0;
+            let mut next = None;
             for (r, s) in &u {
-                acc.push_str(s);
-                if !decoded.text.starts_with(acc.as_str()) {
+                if !delivered[at..].starts_with(s.as_str()) {
+                    next = Some(s.as_str());
                     break;
                 }
-                if acc.len() == decoded.text.len() {
-                    kept = Some(r.end);
+                at += s.len();
+                kept = r.end;
+                if at == delivered.len() {
                     break;
                 }
             }
-            match kept {
-                Some(k) => k,
-                None => return false,
+            let rest = &delivered[at..];
+            if !rest.is_empty() && !next.is_some_and(|s| s.starts_with(rest)) {
+                return frontier;
             }
+            (kept, rest.len())
         };
+        frontier.accepted = n;
+        frontier.partial = partial;
+        if n == 0 {
+            return frontier;
+        }
+        let partial_text = &decoded.text[decoded.text.len() - partial..];
         let full = decoded.text.clone();
         let tags = self.constants.as_ref().and_then(|c| c.tags.as_ref());
         let ids = &decoded.tokens[..n];
@@ -1440,7 +1503,7 @@ impl Front {
             }
             None => Block::None,
         };
-        let reasoning_text = match block.interior() {
+        let mut reasoning_text = match block.interior() {
             Some(r) => decode(text, &ids[r.clone()]).unwrap_or_default(),
             None => String::new(),
         };
@@ -1459,7 +1522,13 @@ impl Front {
                 .max(content),
             _ => content,
         };
-        let content_text = decode(text, &ids[content..]).unwrap_or_default();
+        let mut content_text = decode(text, &ids[content..]).unwrap_or_default();
+        // The delivered text past the whole ids is the block's while it is
+        // open, else the content's.
+        match block {
+            Block::Open { .. } => reasoning_text.push_str(partial_text),
+            _ => content_text.push_str(partial_text),
+        }
         let keep = self.options.keep;
         let (logprobs, rows) = match (&decoded.logprobs, keep) {
             (Some(lp), KeepLogprobs::Sampled) if lp.sampled.len() >= n => {
@@ -1482,11 +1551,14 @@ impl Front {
                 tail,
                 reasoning_text,
                 content_text,
+                partial,
+                generated: decoded.tokens.len(),
                 logprobs,
                 rows,
             },
         );
-        true
+        frontier.logged = true;
+        frontier
     }
 
     /// The newest reply the log holds whose text or content is `content`,

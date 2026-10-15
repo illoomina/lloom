@@ -768,6 +768,7 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
             let (chunk, stopped) = stream.publish(batch, &mut detokenize, &params.stop_strings)?;
             if let Some(chunk) = chunk {
                 if !on_fragment(&chunk) {
+                    stream.refuse_last();
                     cancelled = true;
                     return Ok(false);
                 }
@@ -1090,6 +1091,7 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
             let (chunk, stopped) = stream.publish(batch, &mut detokenize, &params.stop_strings)?;
             if let Some(chunk) = chunk {
                 if !on_fragment(&chunk) {
+                    stream.refuse_last();
                     cancelled = true;
                     stop.store(true, std::sync::atomic::Ordering::Release);
                     return Ok(());

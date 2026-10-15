@@ -1135,6 +1135,7 @@ impl<P: QwenShape, R: ExpertResidency + HasStreamStats + Send + Sync + 'static> 
                         stream.publish(&ids, &mut detok, &params.stop_strings)?;
                     if let Some(chunk) = chunk {
                         if !on_fragment(&chunk) {
+                            stream.refuse_last();
                             cancelled = true;
                             cancel.store(true, Ordering::Release);
                             continue;

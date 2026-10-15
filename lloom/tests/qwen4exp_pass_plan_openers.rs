@@ -38,12 +38,15 @@ fn metal(dev: &Device) -> &MetalDevice {
     }
 }
 
-/// `PROMPT`'s prefill, the key both openers take for it.
+/// `PROMPT`'s prefill, the key both openers take for it: a fresh prefill
+/// leaves the cache's automatic turn checkpoint at its end
+/// (`CheckpointRing::pass_variant` 1, in the variant's bits 8..).
 fn prefill_key() -> PassKey {
     PassKey::new(PassKind::Prefill {
         w: PROMPT.len() as u32,
         fresh: true,
     })
+    .with_variant(1 << 8)
 }
 
 /// `STEPS` greedy ids for `PROMPT` through the driver (`Session::decode`).

@@ -13,6 +13,7 @@ pub mod common;
 pub mod decision_endpoint;
 mod decisions;
 pub mod family;
+pub mod front;
 pub mod lfm2;
 pub mod lfm2_gguf;
 pub mod modes;
@@ -210,6 +211,9 @@ pub struct CommonArgs {
     /// The prompt group as JSON.
     #[arg(long, value_name = "JSON", hide = true)]
     pub prompt_config: Option<String>,
+    /// The session group as JSON.
+    #[arg(long, value_name = "JSON", hide = true)]
+    pub session_config: Option<String>,
     /// The kernels group as JSON.
     #[arg(long, value_name = "JSON", hide = true)]
     pub kernels_config: Option<String>,
@@ -259,6 +263,7 @@ impl CommonArgs {
             ("prefill", &self.prefill_config, None),
             ("reasoning", &self.reasoning_config, None),
             ("prompt", &self.prompt_config, None),
+            ("session", &self.session_config, None),
             ("kernels", &self.kernels_config, None),
             ("backend", &self.backend_config, None),
             ("models", &self.models_config, None),
@@ -437,6 +442,8 @@ pub struct FrontArgs {
     #[command(flatten)]
     pub prompt: crate::options::PromptConfigArgs,
     #[command(flatten)]
+    pub session: crate::options::SessionConfigArgs,
+    #[command(flatten)]
     pub report: crate::options::ReportConfigArgs,
     #[command(flatten)]
     pub server: crate::options::ServerConfigArgs,
@@ -450,6 +457,7 @@ impl FrontArgs {
         self.prefix.apply(&mut o.prefix)?;
         self.reasoning.apply(&mut o.reasoning)?;
         self.prompt.apply(&mut o.prompt)?;
+        self.session.apply(&mut o.session)?;
         self.report.apply(&mut o.report)?;
         self.server.apply(&mut o.server)?;
         self.bench.apply(&mut o.bench)

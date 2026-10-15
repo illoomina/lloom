@@ -572,3 +572,114 @@ fn a_restore_is_a_fresh_prefill_of_the_kept_prefix_on_metal() -> Result<()> {
     restore_case(&model, &cfg, &dev, 70, 2)?;
     Ok(())
 }
+
+/// One process's requests on the tiny dense model with the pass-plan cache
+/// on or off: three rounds of two fresh requests of one length — `a` with
+/// no checkpoint hint (the pass checkpoints its end) and `b` hinted two
+/// positions before its end (a chat turn's divergence) — each greedy. With
+/// the cache on, the plans served; else `None`.
+#[cfg(feature = "metal")]
+fn mixed_hint_rounds(plans: bool) -> Result<(Vec<Vec<u32>>, Option<u64>)> {
+    use lloom_tensor::metal_backend::ArenaLayout;
+    let dev = Device::new_metal(0)?;
+    let Device::Metal(m) = &dev else {
+        unreachable!("a Metal device")
+    };
+    if plans {
+        m.enable_pass_plans(ArenaLayout::Packed);
+    }
+    let (model, cfg) = dense::<CrownExact>(&dev, 0)?;
+    let (a, b) = (tokens(24, cfg.vocab_size, 3), tokens(24, cfg.vocab_size, 5));
+    let mut session = Session::new(&model, model.new_cache(&cfg, &dev)?);
+    let mut out = Vec::new();
+    for _ in 0..3 {
+        session.reset();
+        out.push(greedy_decode(&mut session, &a, 4, &dev)?);
+        session.reset();
+        model.checkpoint_at(session.cache_mut(), b.len() - 2)?;
+        out.push(greedy_decode(&mut session, &b, 4, &dev)?);
+    }
+    Ok((out, m.pass_plan_counters().map(|c| c.served)))
+}
+
+/// A pass that leaves a turn checkpoint allocates another sequence than one
+/// of the same shape that does not — the copy at a chunk's end, or the
+/// recurrence a second time over a prefix — so each has its own plan
+/// (`CheckpointRing::pass_variant`, the pass key's variant). Served the
+/// other's, the hinted prefill computed garbage on the real model (Qwen3.6-27B
+/// through `lloom serve`, `issue-946.md`). Every request's tokens with the
+/// cache on are the cache-off run's, and plans were served, or this says
+/// nothing.
+#[cfg(feature = "metal")]
+#[test]
+fn a_hinted_and_an_unhinted_prefill_of_one_shape_are_each_served_their_own_plan() -> Result<()> {
+    pin();
+    let (want, _) = mixed_hint_rounds(false)?;
+    let (got, served) = mixed_hint_rounds(true)?;
+    assert!(
+        served.is_some_and(|s| s > 0),
+        "no plan was served: the comparison is vacuous ({served:?})"
+    );
+    assert_eq!(
+        got, want,
+        "a served pass computed something the pool pass did not"
+    );
+    Ok(())
+}
+
+/// A ring arm's forwards past an EOS on a recurrent state cannot be taken
+/// back (`reconcile` refuses), so before a turn checkpoint was consulted
+/// `prepare` reset the sequence and every next turn prefilled whole — on the
+/// served Qwen3.6 default (the ring, lookahead 1), every turn. Now it puts
+/// the state back at the latest checkpoint inside the log (the prompt's
+/// pass end, which an unhinted pass checkpoints) and prefills the reply and
+/// the new turn from there, and the stream is a fresh session's.
+#[test]
+fn an_overrun_the_state_cannot_take_back_restores_to_the_last_checkpoint() -> Result<()> {
+    use lloom::generation::poll::PollMechanism;
+    use lloom::generation::{EosRead, Ring};
+    pin();
+    let dev = Device::Cpu;
+    let (model, cfg) = dense::<CrownExact>(&dev, 0)?;
+    let prompt = tokens(20, cfg.vocab_size, 3);
+    let stream = {
+        let mut s = Session::new(&model, model.new_cache(&cfg, &dev)?);
+        greedy_decode(&mut s, &prompt, 24, &dev)?
+    };
+    let cut = (1..stream.len())
+        .find(|&i| !stream[..i].contains(&stream[i]))
+        .expect("a stream with a fresh id somewhere");
+    let eos = vec![stream[cut]];
+    let mut s = Session::new(&model, model.new_cache(&cfg, &dev)?);
+    let mut rb = Ring::new(&eos, &dev, 128, EosRead::Poll(PollMechanism::default()))?
+        .with_poll_budget(20_000);
+    let t1 = s.decode(
+        &mut IdentityProposer,
+        &mut rb,
+        &mut LogitsProcessor::from_sampling(0, Sampling::ArgMax),
+        &prompt,
+        &DecodeOptions {
+            lookahead: 1,
+            ..DecodeOptions::new(24)
+        },
+        &mut |_: &[u32]| Ok(()),
+    )?;
+    assert!(t1.eos);
+    assert_eq!(t1.ids, stream[..cut]);
+    assert!(t1.stats.overrun >= 1, "the ring arm overruns the EOS");
+    assert!(
+        s.reconcile().is_err(),
+        "the recurrent state cannot take it back"
+    );
+    let turn2 = [11u32, 12, 13, 14, 2, 21, 22];
+    let full: Vec<u32> = [prompt.clone(), t1.ids.clone(), turn2.to_vec()].concat();
+    let p = s.prepare(&full)?;
+    assert_eq!(p.action, ReuseAction::Rewound(t1.ids.len()), "{p:?}");
+    assert_eq!(p.reused, prompt.len());
+    assert_eq!(s.overrun(), 0);
+    let got = greedy_decode(&mut s, &p.suffix, 8, &dev)?;
+    let mut fresh = Session::new(&model, model.new_cache(&cfg, &dev)?);
+    let want = greedy_decode(&mut fresh, &full, 8, &dev)?;
+    assert_eq!(got, want, "the restored turn's stream is a fresh session's");
+    Ok(())
+}

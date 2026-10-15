@@ -428,8 +428,15 @@ fn under_the_eos_gate_the_next_request_extends_past_any_overrun() -> Result<()> 
 }
 
 /// One live session under the gate arm through every stop kind, a request
-/// after each, the client sending back what it saw (#993's acceptance: "continue the same live session
-/// after terminal EOS, length stop, host stop, cancellation"):
+/// after each, the client sending back what it kept (#993's acceptance:
+/// "continue the same live session after terminal EOS, length stop, host
+/// stop, cancellation"). What it keeps is fixed by the turn, so every
+/// request's prompt is the same on every run: an EOS or length reply whole;
+/// nothing of a stop-string reply (the stop string `<` matches its first
+/// text); the first id of a cancelled one (cancelled after one). How many
+/// ids a stop-string or cancelled run returns past that depends on how the
+/// reader batched them; the log's extra ids are the reuse's to undo. The
+/// length turns stop on an id that never comes:
 /// EOS → a length stop → a stop string → a cancellation → EOS → a length
 /// stop. Every request completes with the stop it was forced to; the gate
 /// fires on the EOS turns only, and the request after each EOS extends,
@@ -479,6 +486,7 @@ fn under_the_eos_gate_one_live_session_takes_every_stop_kind() -> Result<()> {
     ];
     let mut record = Vec::new();
     for (i, (kind, max_tokens, stop, cancel_after)) in kinds.iter().enumerate() {
+        let stop_id = if *kind == "length" { u32::MAX } else { eos };
         if i > 0 {
             convo.extend_from_slice(&[10 + i as u32, 20 + i as u32]);
         }
@@ -491,7 +499,7 @@ fn under_the_eos_gate_one_live_session_takes_every_stop_kind() -> Result<()> {
         .with_config(config.clone());
         let params = DecodeParams {
             max_tokens: *max_tokens,
-            eos_ids: vec![eos],
+            eos_ids: vec![stop_id],
             readback,
             stop_strings: stop.clone(),
             ..DecodeParams::default()
@@ -533,8 +541,13 @@ fn under_the_eos_gate_one_live_session_takes_every_stop_kind() -> Result<()> {
         last_was_eos = want_stop == Stop::Eos;
         seen_eos_turns += last_was_eos as usize;
         record.push((i, kind.to_string(), decoded.tokens.clone(), decoded.reuse));
-        // What the client saw goes back: the ids of the text it received.
-        convo.extend_from_slice(&decoded.tokens);
+        // What the client kept goes back (above: fixed by the turn).
+        let kept = match want_stop {
+            Stop::StopString => &decoded.tokens[..0],
+            Stop::Cancelled => &decoded.tokens[..decoded.tokens.len().min(1)],
+            _ => &decoded.tokens[..],
+        };
+        convo.extend_from_slice(kept);
     }
     assert_eq!((seen_eos_turns, extend_after_eos), (2, 2));
     // The first EOS turn and the request after it, against the blocking arm.
@@ -546,7 +559,13 @@ fn under_the_eos_gate_one_live_session_takes_every_stop_kind() -> Result<()> {
         "blocking",
         false,
         eos,
-        &[req(prompt.clone(), 3000), req(first, 4)],
+        &[
+            req(prompt.clone(), 3000),
+            Req {
+                eos: Some(u32::MAX),
+                ..req(first, 4)
+            },
+        ],
         None,
         SLOW,
     )?;

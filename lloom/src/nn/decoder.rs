@@ -1638,6 +1638,19 @@ where
     /// — a pass inside the load's reservation asks nothing. A decode step
     /// that grows nothing reads nothing.
     fn prepare_pass(&self, cache: &mut Self::Cache, seq_len: usize) -> Result<()> {
+        // A pass that leaves a turn checkpoint runs another allocation
+        // sequence than one that does not: its own plan.
+        #[cfg(feature = "metal")]
+        if let Device::Metal(m) = &self.device {
+            let m = m.execution_device()?;
+            if m.pass_plans_enabled() {
+                m.set_next_pass_variant(cache.ckpt.pass_variant(
+                    cache.pos,
+                    seq_len,
+                    cache.window.is_some(),
+                ));
+            }
+        }
         let grow = self.grow_bytes(cache, seq_len);
         let pass = if seq_len > 1 {
             seq_len * self.prefill_bytes_per_position

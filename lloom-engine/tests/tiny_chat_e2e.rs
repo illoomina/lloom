@@ -3118,10 +3118,12 @@ fn a_reply_cut_inside_its_reasoning_sent_back_apart_is_ours() {
 
 /// Past reasoning is kept by default and stripped on request, through `lloom
 /// serve` on the three tiny families (the maintainer's direction of
-/// 2026-10-15): `/health`'s `session` says what the process resolved, and a
-/// second turn that gives the first reply back as the client got it
-/// extends the session's log when the history is kept, and goes back to the
-/// turn checkpoint when it is stripped (`--strip-thinking`). Thinking on,
+/// 2026-10-15): `/health`'s `session` says what the process resolved; a
+/// second turn that gives the first reply back as the client got it is the
+/// template's own rendering of that history under the resolved
+/// persistence; and it extends the session's log when the history is kept,
+/// and goes back to the turn checkpoint when it is stripped
+/// (`--strip-thinking`). Thinking on,
 /// the reply is reasoning cut by `max_tokens` (the end marker biased out),
 /// which the default gives back as the open reasoning it is (decision
 /// 46(a)); a closed reply in each template's own format is the unit audit's
@@ -3204,6 +3206,39 @@ fn serve_keeps_past_reasoning_by_default_and_strips_it_on_request() {
                 );
                 assert_eq!(two["timings"]["history_matched"], 1, "{at}: {two}");
                 let engine_closed = *name == "lfm2" && !think;
+                // The rendered history: the template's own rendering of the
+                // conversation with the reply as the front end gives it (an
+                // open reply as its reasoning, decision 46(a)), under the
+                // persistence the server resolved, encoded; on LFM2 with
+                // thinking off, the end marker the engine closes the block
+                // with.
+                let template =
+                    lloom_engine::app::template::Template::compile(tok.chat_template).unwrap();
+                let mut kw = serde_json::Map::new();
+                if *name != "lfm2" {
+                    kw.insert("enable_thinking".into(), json!(think));
+                }
+                kw.insert("preserve_thinking".into(), json!(kept));
+                let reply = if think {
+                    json!({ "role": "assistant", "content": "", "reasoning_content": delivered })
+                } else {
+                    json!({ "role": "assistant", "content": delivered })
+                };
+                let history = json!([q[0], reply, { "role": "user", "content": "Again." }]);
+                let bos = if *name == "lfm2" {
+                    "<|startoftext|>"
+                } else {
+                    ""
+                };
+                let mut rendered = encode(tok, &template.render(&history, bos, &kw).unwrap());
+                if engine_closed {
+                    rendered.push(end);
+                }
+                assert_eq!(
+                    p2,
+                    json!(rendered).as_array().unwrap().clone(),
+                    "{at}: the rendered history"
+                );
                 if engine_closed {
                     assert_eq!(left, p1.len() - 2, "{at}: the engine's empty block");
                 } else if kept {

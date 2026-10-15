@@ -945,11 +945,16 @@ impl Front {
             Some(false) => "strip",
             None => "none",
         };
+        // The tail each mode's checkpoint takes under the persistence a
+        // request that sets none renders with.
+        let persist = self.persist(c);
         let gen = |k, w| match c.mode(k, w) {
             Some(Ok(m)) => format!(
                 "{}/{}",
                 m.gen.len(),
-                m.keep[0].map_or("-".into(), |k| (m.gen.len() - k).to_string())
+                m.keep[slot(persist)]
+                    .or(m.keep[0])
+                    .map_or("-".into(), |k| (m.gen.len() - k).to_string())
             ),
             Some(Err(_)) => "refused".into(),
             None => "-".into(),

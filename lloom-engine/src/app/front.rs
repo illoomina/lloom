@@ -102,10 +102,10 @@ impl KeepLogprobs {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Incomplete {
     /// As the text the client got: its reasoning is the message's content.
-    #[default]
     Text,
     /// As the open reasoning it is: given to the template apart, which
     /// closes the block (or drops it, where it strips reasoning).
+    #[default]
     Reasoning,
     /// As `Text`, with the turn checkpoint before the divergence such a
     /// reply's re-render makes.
@@ -115,9 +115,9 @@ pub enum Incomplete {
 impl Incomplete {
     pub fn parse(s: &str) -> Self {
         match s {
-            "reasoning" => Self::Reasoning,
+            "text" => Self::Text,
             "recover" => Self::Recover,
-            _ => Self::Text,
+            _ => Self::Reasoning,
         }
     }
 
@@ -134,7 +134,7 @@ impl Incomplete {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SessionOptions {
     /// `preserve_thinking` for every request that does not set it; `None`
-    /// is the template's own default.
+    /// is `true` where the template has the switch (`Front::persist`).
     pub persist: Option<bool>,
     /// A reply of ours sent back without its reasoning takes it from the log.
     pub restore_reasoning: bool,
@@ -573,6 +573,13 @@ fn given_reasoning(m: &Value) -> Given {
     given
 }
 
+/// Whether nothing of a reply comes before its reasoning block but the start
+/// marker it sampled: a template writes the reasoning first, so only then can
+/// the reply go to it as reasoning and content apart without losing text.
+fn block_leads(block: &Block) -> bool {
+    block.interior().is_some_and(|r| r.start <= 1)
+}
+
 /// The reasoning a message gives apart from its content: the text every
 /// reasoning field set to one carries, `None` where none does or two differ.
 fn reasoning_apart(m: &Value) -> Option<&str> {
@@ -908,6 +915,16 @@ impl Front {
         self.options
     }
 
+    /// The `preserve_thinking` every request that does not set it renders
+    /// with: `session.persist_thinking` where set, else `true` — the history
+    /// keeps what the model generated, stripping is opt-in. `None` where the
+    /// template has no switch that changes a past reply's reasoning: its own
+    /// rendering stands.
+    fn persist(&self, c: &Constants) -> Option<bool> {
+        c.persist_switch
+            .then_some(self.options.persist.unwrap_or(true))
+    }
+
     /// Tokenization passes over a rendered prompt so far (one per prompt).
     pub fn tokenizations(&self) -> u64 {
         self.tokenizations.load(Ordering::Relaxed)
@@ -941,9 +958,11 @@ impl Front {
             "reasoning_default={persists} switch={} persist_thinking={} missing_reasoning={} keep_logprobs={} \
              incomplete_reasoning={} open={:?} groups_tools={} gen/tail[unset,on,off]=[{}, {}, {}]",
             c.persist_switch,
-            self.options
-                .persist
-                .map_or("template".into(), |p| p.to_string()),
+            match (self.options.persist, self.persist(c)) {
+                (Some(p), _) => p.to_string(),
+                (None, Some(p)) => format!("{p}(default)"),
+                (None, None) => "template".into(),
+            },
             if self.options.restore_reasoning {
                 "log"
             } else {
@@ -957,6 +976,19 @@ impl Front {
             gen(None, Some(true)),
             gen(None, Some(false)),
         )
+    }
+
+    /// The session policy this front end applies, resolved: `/health`'s
+    /// `session`.
+    pub fn session_json(&self) -> Value {
+        let persist = self.constants.as_ref().and_then(|c| self.persist(c));
+        json!({
+            "persist_thinking": persist,
+            "persist_thinking_set": self.options.persist,
+            "incomplete_reasoning": self.options.incomplete.name(),
+            "missing_reasoning": if self.options.restore_reasoning { "log" } else { "as-sent" },
+            "keep_logprobs": self.options.keep.name(),
+        })
     }
 
     /// The reason a `reasoning_effort` in `kwargs` is refused: the template
@@ -1006,10 +1038,8 @@ impl Front {
             .unwrap_or(list);
         let scopes = self.scopes(sent, &req.kwargs);
         let mut kwargs = req.kwargs;
-        if let (Some(p), false) = (self.options.persist, kwargs.contains_key(PRESERVE_THINKING)) {
-            if c.persist_switch {
-                kwargs.insert(PRESERVE_THINKING.into(), Value::Bool(p));
-            }
+        if let (Some(p), false) = (self.persist(c), kwargs.contains_key(PRESERVE_THINKING)) {
+            kwargs.insert(PRESERVE_THINKING.into(), Value::Bool(p));
         }
 
         // The replies of ours, found by the conversation before them and
@@ -1099,8 +1129,9 @@ impl Front {
                 // text lets the template split it itself.
                 let kept = persists || last_user.is_some_and(|u| i > u);
                 let open = matches!(reply.block, Block::Open { .. });
-                let open_apart = open && self.options.incomplete == Incomplete::Reasoning;
-                let wanted = (reply.block.closed().is_some() || open_apart)
+                let leads = block_leads(&reply.block);
+                let open_apart = open && leads && self.options.incomplete == Incomplete::Reasoning;
+                let wanted = (reply.block.closed().is_some() && leads || open_apart)
                     && (kept || open_apart && how == Matched::Full)
                     && (how == Matched::Full || self.options.restore_reasoning);
                 let restore = wanted && given == Given::Absent && (how == Matched::Full || !strips);

@@ -2873,12 +2873,13 @@ fn lcp(a: &[Value], b: &[Value]) -> usize {
 /// first turn's reply is reasoning only (letters, biased) and `max_tokens`
 /// or a stop string ends it before any end marker; the client sends it back
 /// as the content it got.
-/// - `text` (the default): the reply goes to the template as the text it is,
-///   after the empty reasoning block the template writes, so the next prompt
-///   leaves the log at the previous prompt's end and the turn restores the
+/// - `text`: the reply goes to the template as the text it is, after the
+///   empty reasoning block the template writes, so the next prompt leaves
+///   the log at the previous prompt's end and the turn restores the
 ///   checkpoint standing there.
-/// - `reasoning`: the reply goes to the template as the open reasoning it
-///   is; the template closes the block after it and the log extends.
+/// - `reasoning` (the default, decision 46(a)): the reply goes to the
+///   template as the open reasoning it is; the template closes the block
+///   after it and the log extends.
 /// - `recover`: rendered as `text`, the checkpoint before the divergence an
 ///   open reply's re-render makes (on the tiny tokenizer, the same place).
 #[test]
@@ -2886,10 +2887,7 @@ fn a_reply_cut_inside_its_reasoning_continues_by_the_arm() {
     for arm in ["text", "reasoning", "recover"] {
         let (dir, model, base) = qwen_tiny(&format!("open-reasoning-{arm}"));
         let mut args: Vec<&str> = base.iter().map(String::as_str).collect();
-        args.extend(["--prefix-reuse", "true"]);
-        if arm != "text" {
-            args.extend(["--incomplete-reasoning", arm]);
-        }
+        args.extend(["--prefix-reuse", "true", "--incomplete-reasoning", arm]);
         let server = Server::start(&model, &args);
         let turn = |messages: Value, extra: Value| {
             let mut r = json!({ "messages": messages, "temperature": 0, "enable_thinking": true,
@@ -3116,6 +3114,114 @@ fn a_reply_cut_inside_its_reasoning_sent_back_apart_is_ours() {
     }
     drop(server);
     std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Past reasoning is kept by default and stripped on request, through `lloom
+/// serve` on the three tiny families (the maintainer's direction of
+/// 2026-10-15): `/health`'s `session` says what the process resolved, and a
+/// second turn that gives the first reply back as the client got it
+/// extends the session's log when the history is kept, and goes back to the
+/// turn checkpoint when it is stripped (`--strip-thinking`). Thinking on,
+/// the reply is reasoning cut by `max_tokens` (the end marker biased out),
+/// which the default gives back as the open reasoning it is (decision
+/// 46(a)); a closed reply in each template's own format is the unit audit's
+/// (`front_tests.rs`). Thinking off is the template's switch (Qwen) or the
+/// engine closing the block (LFM2, whose template never writes an empty
+/// block back, so its next turn goes back two ids under every option).
+#[test]
+fn serve_keeps_past_reasoning_by_default_and_strips_it_on_request() {
+    let l_dir = scratch("persist-lfm2");
+    let q_dir = scratch("persist-qwen3_5");
+    let (x_dir, x_model, x_args) = qwen_tiny("persist-qwen4exp");
+    let q_tok = q_dir.join("tokenizer.json").to_str().unwrap().to_string();
+    let families: Vec<(&str, PathBuf, Vec<String>, TinyTokenizer)> = vec![
+        (
+            "lfm2",
+            write::<Lfm2Tiny>(&l_dir),
+            vec!["--cpu".into()],
+            Lfm2Tiny::tokenizer(),
+        ),
+        (
+            "qwen3_5",
+            write::<Qwen3_5Tiny>(&q_dir),
+            vec!["--tokenizer".into(), q_tok, "--cpu".into()],
+            Qwen3_5Tiny::tokenizer(),
+        ),
+        ("qwen4exp", x_model, x_args, Qwen4ExpTiny::tokenizer()),
+    ];
+    for (name, model, base, tok) in &families {
+        let end = added_id(tok, "</think>");
+        for (option, flag) in [
+            ("unset", None),
+            ("persist", Some("--persist-thinking")),
+            ("strip", Some("--strip-thinking")),
+        ] {
+            let mut args: Vec<&str> = base.iter().map(String::as_str).collect();
+            args.extend(["--prefix-reuse", "true"]);
+            args.extend(flag);
+            let server = Server::start(model, &args);
+            let (_, health) = server.call("GET", "/health", &json!({}));
+            let kept = option != "strip";
+            assert_eq!(
+                health["session"]["persist_thinking"],
+                json!(kept),
+                "{name} {option}: {}",
+                health["session"]
+            );
+            assert_eq!(health["session"]["incomplete_reasoning"], "reasoning");
+            for think in [true, false] {
+                let at = format!("{name} {option} think={think}");
+                let turn = |messages: Value| {
+                    let mut r = json!({ "messages": messages, "temperature": 0, "max_tokens": 10,
+                                        "enable_thinking": think, "return_token_ids": true,
+                                        "ignore_eos": true,
+                                        "logit_bias": { "97": 100, "98": 100, "99": 100,
+                                                        end.to_string(): -100 } });
+                    let (status, body) = server.call("POST", "/v1/chat/completions", &r);
+                    assert_eq!(status, 200, "{at}: {body}");
+                    body
+                };
+                let q = json!([{ "role": "user", "content": format!("Probe {option} {think}.") }]);
+                let one = turn(q.clone());
+                let delivered = one["choices"][0]["message"]["content"]
+                    .as_str()
+                    .unwrap()
+                    .to_string();
+                assert!(!delivered.contains("</think>"), "{at}: {delivered:?}");
+                let p1 = one["prompt_token_ids"].as_array().unwrap().clone();
+                let r1 = one["choices"][0]["token_ids"].as_array().unwrap().clone();
+                let two = turn(json!([q[0], { "role": "assistant", "content": delivered },
+                                      { "role": "user", "content": "Again." }]));
+                let p2 = two["prompt_token_ids"].as_array().unwrap().clone();
+                let log: Vec<Value> = p1.iter().chain(&r1).cloned().collect();
+                let left = lcp(&p2, &log);
+                let t = &two["timings"]["turn"];
+                eprintln!(
+                    "PERSIST-SERVE {at}: p1 {} r1 {} next prompt leaves the log at {:+} turn {t}",
+                    p1.len(),
+                    r1.len(),
+                    left as i64 - p1.len() as i64
+                );
+                assert_eq!(two["timings"]["history_matched"], 1, "{at}: {two}");
+                let engine_closed = *name == "lfm2" && !think;
+                if engine_closed {
+                    assert_eq!(left, p1.len() - 2, "{at}: the engine's empty block");
+                } else if kept {
+                    assert_eq!(left, log.len(), "{at}: the history keeps the reply");
+                    assert_eq!(t["outcome"], "extend", "{at}: {t}");
+                } else {
+                    assert!(left < p1.len(), "{at}: stripped, before the prompt's end");
+                    assert!(
+                        matches!(t["outcome"].as_str(), Some("restore" | "rewind")),
+                        "{at}: {t}"
+                    );
+                }
+            }
+        }
+    }
+    for d in [l_dir, q_dir, x_dir] {
+        std::fs::remove_dir_all(&d).ok();
+    }
 }
 
 /// Decision 48 through `lloom serve`: the logprobs surface's bounds per

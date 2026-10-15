@@ -227,6 +227,17 @@ fn kw(engine: &dyn Served, want: Option<bool>) -> Map<String, Value> {
     kwargs
 }
 
+/// [`kw`], with the `preserve_thinking` the front end sets by default
+/// (`true` where the template has the switch: the history keeps the
+/// reasoning).
+fn kw_front(engine: &dyn Served, front: &Front, want: Option<bool>) -> Map<String, Value> {
+    let mut kwargs = kw(engine, want);
+    if front.constants().is_some_and(|c| c.persist_switch) {
+        kwargs.insert(PRESERVE_THINKING.into(), Value::Bool(true));
+    }
+    kwargs
+}
+
 fn build(front: &Front, engine: &dyn Served, messages: &Value, want: Option<bool>) -> Prompt {
     front
         .prompt(
@@ -323,9 +334,10 @@ fn wants(engine: &dyn Served) -> Vec<Option<bool>> {
 }
 
 /// With no reply of ours in the history, a prompt is exactly what one
-/// render, one encode and the thinking switch gave before the front end, on
-/// every tiny template, every conversation and every think mode; it took one
-/// render and one tokenization pass.
+/// render, one encode and the thinking switch gave before the front end
+/// (with the `preserve_thinking` it sets by default), on every tiny
+/// template, every conversation and every think mode; it took one render
+/// and one tokenization pass.
 #[test]
 fn a_prompt_without_our_replies_is_the_plain_render_in_one_pass() {
     for engine in [Stub::lfm2(), Stub::qwen3_5(), Stub::qwen4exp()] {
@@ -337,7 +349,7 @@ fn a_prompt_without_our_replies_is_the_plain_render_in_one_pass() {
                 assert_eq!(engine.renders() - before.0, 1, "{conv} {want:?}");
                 assert_eq!(p.renders, 1);
                 assert_eq!(front.tokenizations() - before.1, 1);
-                let reference = engine.reference(&conv, &kw(&engine, want), want);
+                let reference = engine.reference(&conv, &kw_front(&engine, &front, want), want);
                 assert_eq!(p.ids, reference, "{} {conv} {want:?}", engine.caps.family);
                 assert_eq!(p.spliced.matched, 0);
             }
@@ -454,13 +466,14 @@ fn the_next_turn_reuses_the_sampled_ids_not_their_canonical_tokenization() {
     );
 }
 
-/// A reply with reasoning, on a template that strips it by default: the
-/// next turn's prompt equals turn 1's up to the checkpoint (the tail the
-/// constants gave), then carries the reply's content as sampled. Persisted
-/// (`preserve_thinking`), the whole log is a prefix.
+/// A reply with reasoning, on a template whose own default strips it.
+/// Stripped (`--strip-thinking`, opt-in): the next turn's prompt equals turn
+/// 1's up to the checkpoint (the tail the constants gave), then carries the
+/// reply's content as sampled. Persisted (the default, or
+/// `preserve_thinking`): the whole log is a prefix.
 #[test]
 fn reasoning_stripped_splices_the_content_and_persisted_extends() {
-    for persist in [None, Some(true)] {
+    for persist in [Some(false), None, Some(true)] {
         let engine = Stub::qwen3_5();
         let opts = SessionOptions {
             persist,
@@ -481,14 +494,14 @@ fn reasoning_stripped_splices_the_content_and_persisted_extends() {
         let kept = p1.ids.len() - p1.turn_tail;
         assert_eq!(p2.ids[..kept], p1.ids[..kept], "{persist:?}");
         match persist {
-            None => {
+            Some(false) => {
                 assert_eq!(p1.turn_tail, 2);
                 assert_ne!(p2.ids[kept], p1.ids[kept], "diverges at the checkpoint");
                 let four = bytes("Four.");
                 assert_eq!(&p2.ids[kept..kept + four.len()], &four[..]);
                 assert_eq!(p2.spliced.spliced_tokens, four.len());
             }
-            Some(_) => {
+            None | Some(true) => {
                 assert_eq!(p1.turn_tail, 0);
                 let mut log = p1.ids.clone();
                 log.extend_from_slice(&sampled);
@@ -1056,7 +1069,7 @@ fn the_budget_cuts_spans_that_equal_the_rerendered_conversation() {
         for want in wants(&engine) {
             let p = build(&front, &engine, &long, want);
             let msgs = long.as_array().unwrap();
-            let kwargs = kw(&engine, want);
+            let kwargs = kw_front(&engine, &front, want);
             let mut cuts = 0;
             for budget in (1..p.ids.len()).rev() {
                 let spans = front.fit(&p, msgs, budget).expect("the spans are known");
@@ -1238,7 +1251,7 @@ fn the_checkpoints_templates_build_the_plain_prompt_and_cut_the_same_spans() {
         for conv in conversations() {
             for want in wants(&engine) {
                 let p = build(&front, &engine, &conv, want);
-                let kwargs = kw(&engine, want);
+                let kwargs = kw_front(&engine, &front, want);
                 assert_eq!(
                     p.ids,
                     engine.reference(&conv, &kwargs, want),
@@ -1256,9 +1269,19 @@ fn the_checkpoints_templates_build_the_plain_prompt_and_cut_the_same_spans() {
             }
         }
         // A reply of ours, sampled as its text's canonical tokenization:
-        // every id of it is spliced, and the prompt's text is the template's.
+        // every id of it is spliced, and the prompt's text is the template's
+        // rendering of the history as sent. Under `text`: with no end marker
+        // this reply is open wherever the prompt opened the block (LFM2.5),
+        // and the default gives it to the template as the reasoning it is
+        // (`an_open_reply_sent_back_on_the_checkpoints_templates`).
         for want in wants(&engine) {
-            let fresh = Front::new(&engine, SessionOptions::default());
+            let fresh = Front::new(
+                &engine,
+                SessionOptions {
+                    incomplete: Incomplete::Text,
+                    ..SessionOptions::default()
+                },
+            );
             let first = json!([user("What is the capital of France?")]);
             let p1 = build(&fresh, &engine, &first, want);
             let sampled = engine.enc("The capital of France is Paris.");
@@ -1270,7 +1293,7 @@ fn the_checkpoints_templates_build_the_plain_prompt_and_cut_the_same_spans() {
                 user("And Germany?")
             ]);
             let p2 = build(&fresh, &engine, &second, want);
-            let kwargs = kw(&engine, want);
+            let kwargs = kw_front(&engine, &fresh, want);
             let decode = |ids: &[u32]| engine.text.tokenizer.decode(ids, false).unwrap();
             assert_eq!(
                 decode(&p2.ids),
@@ -1299,13 +1322,13 @@ fn the_checkpoints_templates_build_the_plain_prompt_and_cut_the_same_spans() {
 }
 
 /// Given back as the model wrote it, a reply's history is the template's own
-/// rendering of the whole text the client got: stripped, LFM2's template
-/// splits the content at the end marker and trims it, and so does the front
-/// end's rewrite; kept (`preserve_thinking`), the rewrite is the model's
-/// sampled text and the log extends.
+/// rendering of the whole text the client got: stripped (opt-in), LFM2's
+/// template splits the content at the end marker and trims it, and so does
+/// the front end's rewrite; kept (the default, or `preserve_thinking`), the
+/// rewrite is the model's sampled text and the log extends.
 #[test]
 fn a_reply_given_back_renders_as_the_templates_own_split() {
-    for persist in [None, Some(true)] {
+    for persist in [Some(false), None, Some(true)] {
         let engine = Stub::lfm2();
         let front = Front::new(
             &engine,
@@ -1328,17 +1351,18 @@ fn a_reply_given_back_renders_as_the_templates_own_split() {
         let second = json!([user("2+2?"), assistant(&reply.text), user("3+3?")]);
         let p2 = build(&front, &engine, &second, None);
         let mut kw = kw(&engine, None);
-        if let Some(p) = persist {
-            kw.insert(PRESERVE_THINKING.into(), Value::Bool(p));
-        }
+        kw.insert(
+            PRESERVE_THINKING.into(),
+            Value::Bool(persist.unwrap_or(true)),
+        );
         let decode = |ids: &[u32]| engine.text.tokenizer.decode(ids, false).unwrap();
         match persist {
-            None => assert_eq!(
+            Some(false) => assert_eq!(
                 decode(&p2.ids),
                 decode(&engine.reference(&second, &kw, None)),
                 "stripped: the template's own split of the whole text"
             ),
-            Some(_) => {
+            None | Some(true) => {
                 let mut log = p1.ids.clone();
                 log.extend_from_slice(&sampled);
                 assert!(p2.ids.starts_with(&log), "kept: the log extends");
@@ -1348,9 +1372,10 @@ fn a_reply_given_back_renders_as_the_templates_own_split() {
 }
 
 /// A reply that closes its block twice (a thinking budget closed it, the
-/// model went on reasoning and wrote the marker itself): a stripping
-/// template keeps only what follows the last marker, and the prompt is that
-/// render with the final content's sampled ids spliced. Kept, the reply goes
+/// model went on reasoning and wrote the marker itself): stripped (opt-in),
+/// a template keeps only what follows the last marker, and the prompt is that
+/// render with the final content's sampled ids spliced. Kept (the default),
+/// the reply goes
 /// to the template as reasoning and content apart: a template that writes
 /// the content whole beside a reasoning field (tiny LFM2, and Qwen3.6's rule
 /// on the tiny Qwen3.5 template) extends the log; the tiny Qwen3.5 template
@@ -1379,7 +1404,7 @@ fn a_reply_that_closes_its_block_twice_is_stripped_past_the_last_marker() {
             true,
         ),
     ] {
-        for persist in [None, Some(true)] {
+        for persist in [Some(false), None, Some(true)] {
             let front = Front::new(
                 &engine,
                 SessionOptions {
@@ -1400,11 +1425,12 @@ fn a_reply_that_closes_its_block_twice_is_stripped_past_the_last_marker() {
             assert_eq!(p2.spliced.matched, 1);
             let decode = |ids: &[u32]| engine.text.tokenizer.decode(ids, false).unwrap();
             let mut kw = kw(&engine, want);
-            if let Some(p) = persist {
-                kw.insert(PRESERVE_THINKING.into(), Value::Bool(p));
-            }
+            kw.insert(
+                PRESERVE_THINKING.into(),
+                Value::Bool(persist.unwrap_or(true)),
+            );
             match persist {
-                None => {
+                Some(false) => {
                     let text = decode(&p2.ids);
                     assert_eq!(
                         text,
@@ -1418,12 +1444,12 @@ fn a_reply_that_closes_its_block_twice_is_stripped_past_the_last_marker() {
                         "the final content's ids, spliced: {text:?}"
                     );
                 }
-                Some(_) if whole => {
+                None | Some(true) if whole => {
                     let mut log = p1.ids.clone();
                     log.extend_from_slice(&sampled);
                     assert!(p2.ids.starts_with(&log), "kept: the log extends");
                 }
-                Some(_) => {
+                None | Some(true) => {
                     let logged = front.reply(&reply.text).unwrap();
                     let mut apart = assistant(&logged.content_text);
                     for f in REASONING_FIELDS {
@@ -2189,6 +2215,408 @@ fn a_stop_inside_a_token_inside_the_reasoning_keeps_the_block_open() {
         );
         if arm == Incomplete::Reasoning {
             assert!(p2.ids.starts_with(&log), "the accepted ids, in the block");
+        }
+    }
+}
+
+/// Decision 46(a): by default (`session.incomplete_reasoning` unset) an open
+/// reply sent back as the content the client got goes to the template as the
+/// open reasoning it is, and the loaded line says so.
+#[test]
+fn by_default_an_open_reply_goes_to_the_template_as_reasoning() {
+    let engine = Stub::qwen4exp();
+    let want = Some(true);
+    let front = Front::new(
+        &engine,
+        SessionOptions::of(&crate::options::SessionConfig::default()),
+    );
+    assert!(
+        front.line().contains("incomplete_reasoning=reasoning"),
+        "{}",
+        front.line()
+    );
+    let p1 = build(&front, &engine, &json!([user("2+2?")]), want);
+    let mut d = decoded(&engine, bytes("Add them"));
+    d.stop = Stop::Length;
+    assert!(front.record(&engine, p1.origin, &d));
+    let echo = json!([user("2+2?"), assistant("Add them"), user("3+3?")]);
+    let apart = json!([user("2+2?"),
+        { "role": "assistant", "content": "", "reasoning_content": "Add them" },
+        user("3+3?")]);
+    let p2 = build(&front, &engine, &echo, want);
+    assert_eq!((p2.spliced.open, p2.spliced.open_apart), (1, 1));
+    let decode = |ids: &[u32]| engine.text.tokenizer.decode(ids, false).unwrap();
+    assert_eq!(
+        decode(&p2.ids),
+        decode(&engine.reference(&apart, &kw(&engine, want), want))
+    );
+}
+
+/// The supported checkpoints' own templates (when cached), as `lloom chat`
+/// and `lloom serve` reach them. The GGUF checkpoints render one of these:
+/// a Qwen GGUF its base model's snapshot's template (`qwen3_5.rs`
+/// `resolve_text`, `qwen4exp.rs`), an LFM2 GGUF its embedded one, which is
+/// the snapshot's byte for byte (`measurements/issue-946.md` §25).
+const AUDITED: [(&str, &str, Capabilities); 7] = [
+    (
+        "models--LiquidAI--LFM2.5-2.6B",
+        "<|startoftext|>",
+        LFM2_CAPABILITIES,
+    ),
+    (
+        "models--LiquidAI--LFM2.5-VL-3B",
+        "<|startoftext|>",
+        LFM2_CAPABILITIES,
+    ),
+    (
+        "models--LiquidAI--d1-3B",
+        "<|startoftext|>",
+        LFM2_CAPABILITIES,
+    ),
+    ("models--Qwen--Qwen3.6-27B", "", QWEN3_5_CAPABILITIES),
+    ("models--Qwen--Qwen3.6-35B-A3B", "", QWEN3_5_CAPABILITIES),
+    ("models--Qwen--Qwen3.8-27B", "", QWEN3_5_CAPABILITIES),
+    (
+        "models--Qwen--Qwen3.8-Flash-Next",
+        "",
+        QWEN4EXP_CAPABILITIES,
+    ),
+];
+
+/// A checkpoint's own template and tokenizer from the Hugging Face cache.
+fn cached(repo: &str, bos: &str, caps: Capabilities) -> Option<Stub> {
+    let hub = std::env::var("HF_HUB_CACHE")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| {
+            std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default())
+                .join(".cache/huggingface/hub")
+        });
+    let dir = std::fs::read_dir(hub.join(repo).join("snapshots"))
+        .ok()?
+        .next()?
+        .ok()?
+        .path();
+    let tok = tokenizers::Tokenizer::from_file(dir.join("tokenizer.json")).ok()?;
+    let src = std::fs::read_to_string(dir.join("chat_template.jinja")).ok()?;
+    Some(Stub::new(tok, &src, bos, caps))
+}
+
+/// The audit of the supported checkpoints' templates against what lloom
+/// sets (#946 run 5, the maintainer's direction of 2026-10-15: past
+/// reasoning persisted by default, stripping opt-in). One `AUDIT` line per
+/// template for what the template reads and does, one per lloom option for
+/// what reaches it, and one per (thinking, persistence, reply) for where
+/// the next turn's prompt leaves the session's log. Asserted:
+/// - unset or `true`, the history keeps what the model generated: a reply in
+///   the template's own format, an answer with thinking off, and a reply cut
+///   inside its reasoning (decision 46(a)) each extend the log;
+/// - `false` (stripping, opt-in) is still served where the template has the
+///   switch;
+/// - under every option the next prompt leaves the log no earlier than the
+///   turn checkpoint.
+#[test]
+fn the_checkpoints_templates_persist_what_the_model_generated() {
+    let user1 = user("What is the capital of France?");
+    let user2 = user("And Germany?");
+    let mut ran = 0;
+    let mut failures: Vec<String> = Vec::new();
+    for (repo, bos, caps) in AUDITED {
+        let Some(engine) = cached(repo, bos, caps) else {
+            eprintln!("skipped: {repo} has no tokenizer.json + chat_template.jinja");
+            continue;
+        };
+        let name = repo.rsplit("--").next().unwrap();
+        let t = engine.text.template.as_ref().unwrap();
+        let reads: Vec<&str> = t
+            .variables()
+            .map(|v| v.iter().map(String::as_str).collect())
+            .unwrap_or_default();
+        let tags = engine.text.think_tags().cloned();
+        let render = |m: &Value, kw: &Map<String, Value>, gen: bool| {
+            t.render_with(m, bos, kw, gen).map_err(|e| format!("{e:#}"))
+        };
+        let with = |k: &str, v: Value| {
+            let mut kw = Map::new();
+            kw.insert(k.into(), v);
+            kw
+        };
+        let one = json!([user1]);
+        let bare = render(&one, &Map::new(), false).unwrap();
+        let gens: Vec<String> = [None, Some(true), Some(false)]
+            .iter()
+            .map(|e| {
+                let kw = e.map_or(Map::new(), |b| with(ENABLE_THINKING, json!(b)));
+                render(&one, &kw, true).map_or_else(
+                    |e| format!("refused ({e})"),
+                    |g| format!("{:?}", g.strip_prefix(&bare).unwrap_or(&g)),
+                )
+            })
+            .collect();
+        let mut reply = json!({ "role": "assistant", "content": "ANSWER" });
+        for f in REASONING_FIELDS {
+            reply[f] = json!("REASONING");
+        }
+        let kept_where = |kw: &Map<String, Value>| {
+            let before = render(&json!([user1, reply, user2]), kw, false).unwrap();
+            let after = render(&json!([user1, reply]), kw, false).unwrap();
+            match (before.contains("REASONING"), after.contains("REASONING")) {
+                (true, _) => "kept",
+                (false, true) => "dropped before the last user turn",
+                (false, false) => "dropped",
+            }
+        };
+        let split = render(
+            &json!([user1, assistant("REASONING</think>\n\nANSWER"), user2]),
+            &with(PRESERVE_THINKING, json!(true)),
+            false,
+        )
+        .map(|s| {
+            let at = s.find("REASONING").unwrap_or(0);
+            if s[..at].ends_with("<think>") || s[..at].ends_with("<think>\n") {
+                "yes: a past reply's content is split at the end marker"
+            } else {
+                "no: the content is rendered as sent"
+            }
+        })
+        .unwrap_or("-");
+        eprintln!(
+            "AUDIT {name} template sha {} reads {reads:?}",
+            t.digest()[..6]
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        );
+        eprintln!(
+            "AUDIT {name} generation prompt: enable_thinking unset {} | true {} | false {}",
+            gens[0], gens[1], gens[2]
+        );
+        eprintln!(
+            "AUDIT {name} past reasoning: unset {} | preserve_thinking=true {} | false {}; \
+             re-splits content: {split}; tags {:?}",
+            kept_where(&Map::new()),
+            kept_where(&with(PRESERVE_THINKING, json!(true))),
+            kept_where(&with(PRESERVE_THINKING, json!(false))),
+            tags.as_ref()
+                .map(|t| (engine.token_str(t.start), engine.token_str(t.end))),
+        );
+
+        // What lloom sets, per option.
+        let base = Front::new(&engine, SessionOptions::default());
+        let c = base.constants().unwrap();
+        for want in [None, Some(true), Some(false)] {
+            let r = base.prompt(
+                &engine,
+                Request {
+                    messages: &one,
+                    kwargs: kw(&engine, want),
+                    want,
+                    add_bos: true,
+                    expand: None,
+                    history: None,
+                },
+            );
+            let effort = c.effort(
+                kw(&engine, want)
+                    .get(ENABLE_THINKING)
+                    .and_then(Value::as_bool),
+            );
+            eprintln!(
+                "AUDIT {name} reasoning.enabled={want:?}: {}; reasoning_effort {effort:?}",
+                match r {
+                    Ok(p) => format!(
+                        "thinking {} by {}, enable_thinking passed {:?}",
+                        p.thinking.unwrap().name(),
+                        p.thinking.unwrap().by.name(),
+                        p.kwargs.get(ENABLE_THINKING)
+                    ),
+                    Err(e) => format!("refused: {e}"),
+                }
+            );
+        }
+        for persist in [None, Some(true), Some(false)] {
+            let f = Front::new(
+                &engine,
+                SessionOptions {
+                    persist,
+                    ..SessionOptions::default()
+                },
+            );
+            let p = build(&f, &engine, &one, None);
+            eprintln!(
+                "AUDIT {name} session.persist_thinking={persist:?}: {}; preserve_thinking passed {:?}",
+                f.persist_unsupported()
+                    .map_or("served".to_string(), |w| format!("refused at load: {w}")),
+                p.kwargs.get(PRESERVE_THINKING)
+            );
+        }
+
+        // Where the next turn leaves the log, per thinking × persistence ×
+        // reply.
+        for want in wants(&engine) {
+            for persist in [None, Some(true), Some(false)] {
+                let front = Front::new(
+                    &engine,
+                    SessionOptions {
+                        persist,
+                        ..SessionOptions::default()
+                    },
+                );
+                if front.persist_unsupported().is_some() {
+                    continue;
+                }
+                let p1 = build(&front, &engine, &one, want);
+                let on = p1.thinking.unwrap().on;
+                // The reply in the template's own format: its rendering of
+                // the reply as the conversation's last message (which every
+                // template keeps whole), past the prompt that ran.
+                let mut own = json!({ "role": "assistant", "content": "Paris." });
+                if on {
+                    for f in REASONING_FIELDS {
+                        own[f] = json!("The capital of France is Paris.");
+                    }
+                }
+                let full = render(&json!([user1, own]), &p1.kwargs, false).unwrap();
+                // Where the engine closed the block the template opened (no
+                // switch), the reply follows that marker, which no rendering
+                // of the history writes: it is the answer alone.
+                let by_engine = p1.thinking.unwrap().by == By::Engine;
+                let formatted = match full.strip_prefix(p1.text.as_str()) {
+                    Some(rest) => {
+                        rest[..rest.rfind("<|im_end|>").unwrap_or(rest.len())].to_string()
+                    }
+                    None => {
+                        assert!(
+                            by_engine,
+                            "{name} want={want:?}: the prompt that ran is not a prefix of the \
+                             template's rendering of its reply"
+                        );
+                        "Paris.".to_string()
+                    }
+                };
+                let mut replies = vec![("own format", formatted.clone(), Stop::Eos)];
+                if on {
+                    let end = engine.token_str(tags.as_ref().unwrap().end);
+                    if let Some(at) = formatted.find(end.as_str()) {
+                        let mut extra = formatted.clone();
+                        extra.insert(at, '\n');
+                        replies.push(("one more newline before the end marker", extra, Stop::Eos));
+                    }
+                    replies.push((
+                        "cut inside its reasoning",
+                        "The capital of France is".into(),
+                        Stop::Length,
+                    ));
+                }
+                for (kind, text, stop) in replies {
+                    let front = Front::new(
+                        &engine,
+                        SessionOptions {
+                            persist,
+                            ..SessionOptions::default()
+                        },
+                    );
+                    let p1 = build(&front, &engine, &one, want);
+                    let sampled = engine.enc(&text);
+                    let mut d = decoded(&engine, sampled.clone());
+                    d.stop = stop;
+                    assert!(front.record(&engine, p1.origin, &d), "{name} {kind}");
+                    let history = json!([user1, assistant(&d.text), user2]);
+                    let p2 = build(&front, &engine, &history, want);
+                    let log: Vec<u32> = p1.ids.iter().chain(&sampled).copied().collect();
+                    let kept = p2.ids.iter().zip(&log).take_while(|(a, b)| a == b).count();
+                    let ckpt = p1.ids.len() - p1.turn_tail;
+                    let extends = kept == log.len();
+                    eprintln!(
+                        "AUDIT {name} want={want:?} thinking={} persist={persist:?} {kind}: preserve_thinking \
+                         {:?}; the next prompt leaves the log at {:+} from the prompt's end, {} \
+                         (checkpoint at {:+})",
+                        p1.thinking.unwrap().name(),
+                        p2.kwargs.get(PRESERVE_THINKING),
+                        kept as i64 - p1.ids.len() as i64,
+                        if extends { "extends" } else { "diverges" },
+                        ckpt as i64 - p1.ids.len() as i64,
+                    );
+                    if kept < ckpt {
+                        failures.push(format!(
+                            "{name} want={want:?} persist={persist:?} {kind}: the next prompt leaves \
+                             the log at {kept}, before the checkpoint at {ckpt}"
+                        ));
+                    }
+                    if persist != Some(false)
+                        && !by_engine
+                        && kind != "one more newline before the end marker"
+                    {
+                        if !extends {
+                            failures.push(format!(
+                                "{name} want={want:?} persist={persist:?} {kind}: the history keeps \
+                                 what the model generated, so the next prompt extends the log; it \
+                                 leaves it at {:+} from the prompt's end",
+                                kept as i64 - p1.ids.len() as i64
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        ran += 1;
+    }
+    eprintln!("{ran} checkpoint templates audited");
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// A reply with text before a reasoning block the model opened itself (it
+/// sampled the start marker mid-reply: thinking off, an answer naming the
+/// tag) cannot be given to the template as reasoning and content apart: a
+/// template writes the reasoning first, and the text before the block is in
+/// neither part. It goes as sent, open or closed, under every arm and
+/// either `missing_reasoning`, so the next prompt carries all of it.
+#[test]
+fn a_reply_with_text_before_the_block_it_opened_goes_as_sent() {
+    let engine = Stub::qwen4exp();
+    let want = Some(false);
+    let start = TinyTokenizer::qwen4exp().id("<think>").unwrap();
+    let end = q4_end();
+    let q = json!([user("Spell it.")]);
+    let decode = |ids: &[u32]| engine.text.tokenizer.decode(ids, false).unwrap();
+    for (case, ids) in [
+        (
+            "open",
+            [bytes("It is "), vec![start], bytes(" in text.")].concat(),
+        ),
+        (
+            "closed",
+            [bytes("Hi "), vec![start], bytes("R"), vec![end], bytes("A")].concat(),
+        ),
+    ] {
+        for arm in [Incomplete::Text, Incomplete::Reasoning, Incomplete::Recover] {
+            for restore_reasoning in [false, true] {
+                let front = Front::new(
+                    &engine,
+                    SessionOptions {
+                        incomplete: arm,
+                        restore_reasoning,
+                        ..SessionOptions::default()
+                    },
+                );
+                let p1 = build(&front, &engine, &q, want);
+                let d = decoded(&engine, ids.clone());
+                assert!(front.record(&engine, p1.origin, &d), "{case}");
+                let r = front.reply(&d.text).unwrap();
+                assert!(
+                    r.block.interior().is_some_and(|i| i.start > 1),
+                    "{case}: the precondition, text before the block: {:?}",
+                    r.block
+                );
+                let history = with(&q, &[assistant(&d.text), user("Again?")]);
+                let p2 = build(&front, &engine, &history, want);
+                let at = format!("{case} {} restore={restore_reasoning}", arm.name());
+                assert_eq!(p2.spliced.matched, 1, "{at}");
+                assert_eq!(
+                    decode(&p2.ids),
+                    decode(&engine.reference(&history, &kw(&engine, want), want)),
+                    "{at}: the history as sent"
+                );
+            }
         }
     }
 }

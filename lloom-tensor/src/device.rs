@@ -2,6 +2,13 @@ use crate::backend::BackendDevice;
 use crate::cpu_backend::CpuDevice;
 use crate::{CpuStorage, DType, Result, Shape, Storage, WithDType};
 
+/// [`Device::eos_gate_suspended`]'s guard.
+#[must_use]
+pub struct EosGateSuspended {
+    #[cfg(feature = "metal")]
+    _scope: Option<crate::kernels::kernel::UngatedScope>,
+}
+
 /// What a run of the EOS gate did (lloom #735 step 4; `Device::eos_gate_end`).
 /// Defined here so a `DecodeStats` compiles off Metal too.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -800,6 +807,26 @@ impl Device {
                 let _ = (logits, token_slot, history_slot, eos_ids, step, generation);
                 crate::bail!("argmax_publish: not a Metal device")
             }
+        }
+    }
+
+    /// While the returned guard lives, the kernels this thread encodes run
+    /// whatever the EOS gate decided (`kernels::kernel::UngatedScope`); a
+    /// no-op off Metal.
+    pub fn eos_gate_suspended(&self) -> EosGateSuspended {
+        EosGateSuspended {
+            #[cfg(feature = "metal")]
+            _scope: matches!(self, Self::Metal(_)).then(crate::kernels::kernel::UngatedScope::open),
+        }
+    }
+
+    /// Whether the EOS gate is armed: the decode kernels that carry it run
+    /// their gated variants. Never off Metal.
+    pub fn eos_gate_armed(&self) -> bool {
+        match self {
+            #[cfg(feature = "metal")]
+            Self::Metal(d) => d.eos_gate_armed(),
+            _ => false,
         }
     }
 

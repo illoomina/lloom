@@ -7,7 +7,8 @@ use crate::kernels::kernels::unary::copy2d;
 use crate::kernels::metal::completion::CompletionWait;
 use crate::kernels::metal::{Commands, ResidencySet};
 use crate::kernels::{
-    call_affine, call_copy2d, call_shortconv_step, BufferOffset, Device, Kernels,
+    call_affine, call_copy2d, call_gdn_prologue, call_gdn_step, call_shortconv_step,
+    BufferOffset, Device, Kernels,
 };
 use objc2_metal::MTLResourceOptions;
 use std::sync::Arc;
@@ -208,6 +209,35 @@ fn an_ungated_kernel_keeps_running_through_a_raised_gate() {
     assert_eq!(rig.step_affine(EOS[0], 2.0, 1.0), expected(2.0, 1.0));
     let report = rig.end();
     assert!(report.fired);
+}
+
+/// An ungated scope (`kernels::kernel::UngatedScope`) runs a gated source's
+/// kernel past a raised gate, while it lives and only then.
+#[test]
+fn an_ungated_scope_runs_a_gated_kernel_past_a_raised_gate() {
+    let rig = Rig::new();
+    rig.begin();
+    zero(&rig.dst, N * 4);
+    assert_eq!(
+        rig.step_copy2d(Some(EOS[0])),
+        vec![0.0; N],
+        "the gate is up"
+    );
+    {
+        let _ungated = crate::kernels::kernel::UngatedScope::open();
+        assert_eq!(
+            rig.step_copy2d(Some(7)),
+            identity(),
+            "inside the scope the copy runs"
+        );
+    }
+    zero(&rig.dst, N * 4);
+    assert_eq!(
+        rig.step_copy2d(Some(7)),
+        vec![0.0; N],
+        "after it the gate holds again"
+    );
+    assert!(rig.end().fired);
 }
 
 #[test]
@@ -453,6 +483,148 @@ fn a_gated_shortconv_step_carries_its_state_through_an_eos() {
         fired_out.iter().all(|x| x.to_bits() == u32::MAX),
         "gate raised: the output is not written"
     );
+}
+
+/// The Gated DeltaNet's decode step under the gate (#993's arm B): the
+/// prologue and the recurrence write the next conv window and `S` out of
+/// place, into the buffers the host swaps in as the state, so their gated
+/// variants carry the state through instead of returning bare. Gate raised:
+/// `win_out` is `win` and `s_out` is `s`, bit for bit, and `heads` / `o`
+/// keep their poison. Gate clear: the plain kernels, bit for bit (the gated
+/// pipeline runs at the plain one's split). Both forms of the step: the loop
+/// form and the register form (`gdn_step_r16_f32` at `d` = 16).
+#[test]
+fn a_gated_gdn_step_carries_its_state_through_an_eos() {
+    const D: usize = 16;
+    const H_K: usize = 2;
+    const H_V: usize = 4;
+    const KK: usize = 4;
+    const CH: usize = (2 * H_K + H_V) * D;
+    let rig = Rig::new();
+    let f = |v: &[f32]| {
+        rig.device
+            .new_buffer_with_data(v.as_ptr() as *const std::ffi::c_void, v.len() * 4, SHARED)
+            .unwrap()
+    };
+    let wave = |n: usize, a: f32, b: f32| -> Vec<f32> {
+        (0..n).map(|i| a * ((i as f32) * b).sin() + 0.01 * i as f32).collect()
+    };
+    let qkv = f(&wave(CH, 0.5, 0.37));
+    let conv_w = f(&wave(CH * KK, 0.25, 0.11));
+    let win: Vec<f32> = wave(CH * KK, 1.0, 0.23);
+    let win_in = f(&win);
+    let heads_in = f(&wave(3 * H_V * D, 0.3, 0.19));
+    let (alpha, beta) = (f(&wave(H_V, 0.4, 1.3)), f(&wave(H_V, 0.6, 0.7)));
+    let (dt_bias, ssm_a) = (f(&wave(H_V, 0.2, 0.9)), f(&vec![-0.5; H_V]));
+    let s: Vec<f32> = wave(D * D * H_V, 0.1, 0.013);
+    let s_in = f(&s);
+    let poisoned = |n: usize| {
+        let b = rig.device.new_buffer(n * 4, SHARED).unwrap();
+        // A poison the kernel must overwrite (or, gated, leave).
+        unsafe { std::ptr::write_bytes(b.contents(), 0xff, n * 4) };
+        b
+    };
+    let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+    // (the state written, the output) for one prologue and one step.
+    let prologue = |gate_token: Option<u32>| -> (Vec<u32>, Vec<u32>) {
+        let (win_out, heads) = (poisoned(CH * KK), poisoned(3 * H_V * D));
+        {
+            let enc = rig.cmds.command_encoder().unwrap();
+            if let Some(t) = gate_token {
+                rig.gate_step(t, &enc);
+            }
+            // SAFETY: the test owns every buffer bound or mapped here and reads its
+            // results only after waiting for the command buffer that writes them.
+            unsafe {
+                call_gdn_prologue(
+                    &rig.device,
+                    &enc,
+                    &rig.kernels,
+                    D,
+                    H_K,
+                    H_V,
+                    KK,
+                    1e-6,
+                    0.25,
+                    BufferOffset::zero_offset(&qkv),
+                    BufferOffset::zero_offset(&conv_w),
+                    BufferOffset::zero_offset(&win_in),
+                    &heads,
+                    BufferOffset::zero_offset(&win_out),
+                )
+            }
+            .unwrap();
+        }
+        rig.cmds.flush_and_wait_current().unwrap();
+        (bits(&read_f32(&win_out, CH * KK)), bits(&read_f32(&heads, 3 * H_V * D)))
+    };
+    let step = |gate_token: Option<u32>, register: bool| -> (Vec<u32>, Vec<u32>) {
+        let (s_out, o) = (poisoned(D * D * H_V), poisoned(H_V * D));
+        {
+            let enc = rig.cmds.command_encoder().unwrap();
+            if let Some(t) = gate_token {
+                rig.gate_step(t, &enc);
+            }
+            // SAFETY: as the prologue's above.
+            unsafe {
+                call_gdn_step(
+                    &rig.device,
+                    &enc,
+                    &rig.kernels,
+                    D,
+                    H_V,
+                    BufferOffset::zero_offset(&heads_in),
+                    BufferOffset::zero_offset(&alpha),
+                    BufferOffset::zero_offset(&beta),
+                    BufferOffset::zero_offset(&dt_bias),
+                    BufferOffset::zero_offset(&ssm_a),
+                    BufferOffset::zero_offset(&s_in),
+                    &o,
+                    BufferOffset::zero_offset(&s_out),
+                    register,
+                )
+            }
+            .unwrap();
+        }
+        rig.cmds.flush_and_wait_current().unwrap();
+        (bits(&read_f32(&s_out, D * D * H_V)), bits(&read_f32(&o, H_V * D)))
+    };
+    let all_poison = |v: &[u32]| v.iter().all(|&x| x == u32::MAX);
+
+    let plain_pro = prologue(None);
+    let plain_loop = step(None, false);
+    let plain_reg = step(None, true);
+    for (what, (state, out)) in [
+        ("prologue", &plain_pro),
+        ("loop step", &plain_loop),
+        ("register step", &plain_reg),
+    ] {
+        assert!(
+            !all_poison(state) && !all_poison(out),
+            "{what}: the plain kernel writes its state and output"
+        );
+    }
+    assert_ne!(plain_pro.0, bits(&win), "the plain prologue moves the window");
+    assert_ne!(plain_loop.0, bits(&s), "the plain step moves S");
+
+    rig.begin();
+    let clear = (prologue(Some(7)), step(Some(7), false), step(Some(7), true));
+    let fired = (
+        prologue(Some(EOS[0])),
+        step(Some(EOS[0]), false),
+        step(Some(EOS[0]), true),
+    );
+    let report = rig.end();
+    assert!(report.fired);
+    assert_eq!(clear.0, plain_pro, "gate clear: the plain prologue");
+    assert_eq!(clear.1, plain_loop, "gate clear: the plain loop step");
+    assert_eq!(clear.2, plain_reg, "gate clear: the plain register step");
+    assert_eq!(fired.0 .0, bits(&win), "gate raised: the window carries through");
+    assert_eq!(fired.1 .0, bits(&s), "gate raised: the loop step carries S through");
+    assert_eq!(fired.2 .0, bits(&s), "gate raised: the register step carries S through");
+    assert!(all_poison(&fired.0 .1), "gate raised: the heads are not written");
+    assert!(all_poison(&fired.1 .1), "gate raised: the loop step's output is not written");
+    assert!(all_poison(&fired.2 .1), "gate raised: the register step's output is not written");
 }
 
 /// The ring's stamp (`call_ring_stamp`) writes the generation at the step's

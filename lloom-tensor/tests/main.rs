@@ -24,6 +24,7 @@ mod cpu_f16_matmul_accum;
 mod custom_op_tests;
 mod depthwise_conv;
 mod display_tests;
+mod eos_gate_drain;
 mod error_display;
 mod error_size;
 mod f16_rows_identity;

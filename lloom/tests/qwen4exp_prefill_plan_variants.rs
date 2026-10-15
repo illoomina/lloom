@@ -131,11 +131,18 @@ fn each_chunk_kind_across_the_dense_range_is_served_its_own_plan() -> Result<()>
         c2.evicted, 0,
         "a prefill plan drifted and was dropped: one key served a chunk of another kind"
     );
-    let kinds: Vec<(bool, u32)> = plans.iter().map(|p| (p.0, p.1)).collect();
+    // The variant's low byte is the chunk kind; bits 8.. the turn checkpoint
+    // the pass leaves (`CheckpointRing::pass_variant`): every chunk here
+    // leaves the cache's automatic one at its end (1).
+    let kinds: Vec<(bool, u32)> = plans.iter().map(|p| (p.0, p.1 & 0xff)).collect();
     assert_eq!(
         kinds,
         vec![(false, 0), (false, 1), (false, 2), (true, 0)],
         "one plan per (fresh, kind): inside, crossing and past the range"
+    );
+    assert!(
+        plans.iter().all(|p| p.1 >> 8 == 1),
+        "every chunk leaves its automatic checkpoint at its end: {plans:?}"
     );
     // The repeat: every chunk whose key had a plan was served from it (the
     // first sight recorded four keys and observed the passes after them).

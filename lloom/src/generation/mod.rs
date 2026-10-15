@@ -21,8 +21,9 @@ pub use budget::{ThinkingBudget, ThinkingReport};
 pub use hot_thread::{HotThread, HotThreadArm, HotThreadReport, QosClass};
 pub use processors::Processors;
 pub use readback::{
-    Blocking, CommitBudget, EosRead, Geometry, ReadbackArms, ReadbackCounters, ReadbackStrategy,
-    Ring, RingLap, RingReader, WAKE_LIVE_EVERY_DEFAULT,
+    log_softmax_row, Blocking, CommitBudget, EosRead, Geometry, LogprobCapture, Logprobs,
+    ReadbackArms, ReadbackCounters, ReadbackStrategy, Ring, RingLap, RingReader,
+    WAKE_LIVE_EVERY_DEFAULT,
 };
 
 /// The draw a sampler makes. Every temperature arm is keyed by the seed and

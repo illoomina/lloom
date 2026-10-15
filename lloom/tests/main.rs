@@ -7,8 +7,8 @@
 //! that installs process-global state fails by name when another test did
 //! (`lloom_tensor::isolation`).
 //!
-//! Its own binary, because a test binary carries at most one
-//! `#[global_allocator]`: `token_ring_nonblocking.rs`.
+//! Their own binaries, because a test binary carries at most one
+//! `#[global_allocator]`: `token_ring_nonblocking.rs`, `decode_step_census.rs`.
 //!
 //! `every_test_file_is_a_module` below reads this directory and this file,
 //! so a file that is not a module here fails the suite instead of silently
@@ -143,6 +143,7 @@ mod short_conv_block;
 mod short_conv_golden;
 mod shortconv_ring;
 mod shortconv_step;
+mod state_capacity;
 mod tiny_checkpoints;
 mod tiny_fp_kinds;
 mod tiny_manifest_drift;
@@ -157,7 +158,7 @@ mod verify_window_gemm;
 /// files that owns its binary), read from the directory at test time.
 #[test]
 fn every_test_file_is_a_module() {
-    let own: &[&str] = &["token_ring_nonblocking"];
+    let own: &[&str] = &["token_ring_nonblocking", "decode_step_census"];
     let dir = format!("{}/tests", lloom_manifest_dir());
     let me = include_str!("main.rs");
     let mut missing = Vec::new();

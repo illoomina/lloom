@@ -27,7 +27,7 @@ use lloom::generation::{Blocking, CommitBudget, EosRead, LogitsProcessor, Ring, 
 use lloom::models::qwen3_5::testing::Qwen3_5Tiny;
 use lloom::models::qwen3_5::{Config, Qwen3_5};
 use lloom::models::qwen4exp::{GdnState, KvCache};
-use lloom::nn::decoder::{DecoderState, HybridState, PreNormState, StateCapacity};
+use lloom::nn::decoder::{DecodeRecovery, DecoderState, HybridState, PreNormState, StateCapacity};
 use lloom::nn::model::{CacheRewind, CausalLM};
 use lloom::nn::{DecodeOptions, IdentityProposer, ReuseAction, Session};
 use lloom::profile::CrownExact;
@@ -60,7 +60,7 @@ fn model(dev: &Device) -> Result<(Model, Config)> {
     let cap = model.capacity();
     // The engine's load: the standing window and two turn checkpoints.
     model.set_capacity(StateCapacity {
-        window: 1,
+        recovery: DecodeRecovery::Standing,
         checkpoints: 2,
         ..cap
     });
@@ -96,6 +96,7 @@ struct Overrun {
     produced: usize,
     overrun: usize,
     stopped_by_flag: bool,
+    stopped_by_eos_watch: bool,
     /// Tokens the GPU had published past the EOS when the reader first saw
     /// it, and when it raised the flag.
     gpu_past_eos_at_seen: usize,
@@ -197,6 +198,7 @@ fn reader_run<'m>(
             produced: out.stats.produced,
             overrun: out.stats.overrun,
             stopped_by_flag: out.stats.stopped_by_flag,
+            stopped_by_eos_watch: out.stats.stopped_by_eos_watch,
             gpu_past_eos_at_seen: at_seen.unwrap_or(0),
             gpu_past_eos_at_stop: at_stop.unwrap_or(0),
             stop_latency: latency,
@@ -376,5 +378,84 @@ fn the_adaptive_lead_does_not_bound_the_overrun_past_a_late_stop() -> Result<()>
         }
     }
     eprintln!("FRONTIER summary (arm, overrun, reconciled, next turn): {table:?}");
+    Ok(())
+}
+
+/// The bound the falsifier above finds missing, built (#993's arm D
+/// prerequisite, `DecodeOptions::eos_watch`): the loop reads the ring before
+/// each step and stops at a stop id the GPU has published. With the same
+/// late readers, the overrun is at most `adaptive_lead + 1` and the watch,
+/// not the flag, stopped the run; the ids and the reader's stream are the
+/// boundary's. Without the gate the forwards past the EOS still write the
+/// state, so this bounds them; it does not undo them.
+#[test]
+fn the_eos_watch_bounds_the_overrun_past_a_late_stop() -> Result<()> {
+    pin();
+    let dev = Device::new_metal(0)?;
+    let (model, cfg) = model(&dev)?;
+    let prompt: Vec<u32> = vec![1, 3, 5, 7, 9];
+    let never = vec![u32::MAX];
+    let stream = Session::new(&model, model.new_cache(&cfg, &dev)?)
+        .decode(
+            &mut IdentityProposer,
+            &mut Blocking::new(&never, &dev)?,
+            &mut greedy(),
+            &prompt,
+            &DecodeOptions::new(32),
+            &mut sink,
+        )?
+        .ids;
+    let cut = (6..stream.len())
+        .find(|&i| !stream[..i].contains(&stream[i]))
+        .expect("a fresh id in the stream to stop on");
+    let eos = vec![stream[cut]];
+    let want = stream[..cut].to_vec();
+    let watched = DecodeOptions {
+        eos_watch: Some(true),
+        ..adaptive(ROOM)
+    };
+    let lead = watched.adaptive_lead();
+    for late in [Late::No, Late::Callback(LONG), Late::Starved(LONG, cut)] {
+        let mut s = Session::new(&model, model.new_cache(&cfg, &dev)?);
+        let mut rb = Ring::new(
+            &eos,
+            &dev,
+            RING_HISTORY_SLOTS,
+            EosRead::Poll(PollMechanism::default()),
+        )?
+        .with_poll_budget(20_000);
+        let (o, seen) = reader_run(&mut s, &mut rb, &prompt, watched.clone(), late)?;
+        let at = format!("watched {late:?}");
+        eprintln!(
+            "FRONTIER-WATCH {at}: produced {} overrun {} (lead {lead}) stopped_by_eos_watch {} \
+             stopped_by_flag {} | pos {} | median step {:?}",
+            o.produced, o.overrun, o.stopped_by_eos_watch, o.stopped_by_flag, o.pos, o.step_median,
+        );
+        assert_eq!(seen, want, "{at}: the reader's stream ends at the EOS");
+        assert_eq!(o.produced, cut, "{at}: the ids end at the EOS");
+        assert!(o.overrun >= 1, "{at}: the EOS's own forward ran");
+        assert!(
+            o.overrun <= lead + 1,
+            "{at}: the watch bounds the overrun by the lead, however late the reader"
+        );
+        assert_eq!(o.pos, prompt.len() + cut + o.overrun, "{at}: the position");
+        if matches!(late, Late::Callback(_) | Late::Starved(..)) {
+            assert!(
+                o.stopped_by_eos_watch && !o.stopped_by_flag,
+                "{at}: the watch, not the late flag, stopped it"
+            );
+        }
+        // The ring again, as serve's pool reuses it: the watch starts at this
+        // run's first token, not at the last run's EOS.
+        let mut again = Session::new(&model, model.new_cache(&cfg, &dev)?);
+        let (o2, seen2) = reader_run(&mut again, &mut rb, &prompt, watched.clone(), Late::No)?;
+        eprintln!(
+            "FRONTIER-WATCH {at}, the ring reused: produced {} overrun {}",
+            o2.produced, o2.overrun
+        );
+        assert_eq!(seen2, want, "{at}, the ring reused: the stream");
+        assert_eq!(o2.produced, cut, "{at}, the ring reused: the ids end at the EOS");
+        assert!(o2.overrun <= lead + 1, "{at}, the ring reused: bounded");
+    }
     Ok(())
 }

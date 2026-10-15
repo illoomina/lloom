@@ -778,6 +778,15 @@ struct CacheWindow {
 
 use crate::nn::row_log::RowLog;
 
+/// The turn checkpoint a pass of `seq` positions from the state's position
+/// takes, as bits 8..32 of the pass key's variant
+/// (`CheckpointRing::pass_variant`): a pass that copies the state out, or
+/// runs the recurrence a second time over its prefix, allocates another
+/// sequence than one that does not.
+fn ckpt_variant<P: Profile>(cache: &State<P>, seq: usize) -> u32 {
+    (cache.ckpt.pass_variant(cache.pos, seq, cache.window_open()) & 0x00ff_ffff) << 8
+}
+
 /// A checkpoint a pass takes inside itself: the tile (of a pipelined pass)
 /// the hinted position falls in, the rows into that tile, the ring slot,
 /// and per layer how many tiles the layer has run (every layer sees the
@@ -2674,7 +2683,7 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
                         w: seq,
                         fresh: cache.pos == 0,
                     };
-                    let variant = self.prefill_variant(cache.pos, seq);
+                    let variant = self.prefill_variant(cache.pos, seq) | ckpt_variant(cache, seq);
                     if Self::pass_key(shape, opener)
                         .is_some_and(|k| m.pass_plan_cached(&k.with_variant(variant)))
                     {
@@ -3566,6 +3575,7 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
                             seq,
                             windowed,
                         );
+                        let ckpt = ckpt_variant(cache, total);
                         self.ckpt_pass_open(cache, &lens, rows, &dev)?;
                         self.prepare_pass_as(cache, total, true)?;
                         let bracket = self.open_pass_variant(
@@ -3573,7 +3583,7 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
                                 w: total,
                                 fresh: cache.pos == 0,
                             },
-                            self.prefill_variant(cache.pos, total),
+                            self.prefill_variant(cache.pos, total) | ckpt,
                         )?;
                         logits = Some(self.prefill_embeds_pipelined(&tiles, cache)?);
                         self.close_pass(bracket)?;
@@ -3600,13 +3610,14 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
                         }
                         l
                     } else {
+                        let ckpt = ckpt_variant(cache, len);
                         self.ckpt_pass_open(cache, &[len], rows, &dev)?;
                         let bracket = self.open_pass_variant(
                             crate::nn::decode::PassShape::Prefill {
                                 w: len,
                                 fresh: cache.pos == 0,
                             },
-                            self.prefill_variant(cache.pos, len),
+                            self.prefill_variant(cache.pos, len) | ckpt,
                         )?;
                         let l = self.prefill_embeds(&h, cache, obs)?;
                         self.close_pass(bracket)?;
@@ -4382,11 +4393,13 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
     }
 
     /// The fetch worker's counters (zeros before the first fetching step,
-    /// or off Metal).
+    /// or off Metal), settled: every job registered so far is done before
+    /// the counters are read (`FetchLane::settled_stats`), so a snapshot
+    /// taken right after a decode counts the decode's last job.
     pub fn fetch_stats(&self) -> crate::nn::expert_stream::FetchStats {
         #[cfg(feature = "metal")]
         if let Some(Some(l)) = self.fetch_lane.get() {
-            return l.stats();
+            return l.settled_stats();
         }
         crate::nn::expert_stream::FetchStats::default()
     }
@@ -4842,7 +4855,7 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
         let mut records: Vec<(usize, WindowPlan)> = Vec::new();
         let bracket = self.open_pass_variant(
             crate::nn::decode::PassShape::Decode { b: 1 },
-            self.decode_variant(cache.pos, device_plan, fetch),
+            self.decode_variant(cache.pos, device_plan, fetch) | ckpt_variant(cache, 1),
         )?;
 
         // broadcast the embedding into the n-stream HC carry `res_hc [1, 1, n*d]`.
@@ -5218,7 +5231,7 @@ impl<P: Profile, R: ExpertResidency> CausalLM for Qwen4Exp<P, R> {
                 } else {
                     self.prefill_variant(cache.pos, seq_len)
                 };
-                m.set_next_pass_variant(variant);
+                m.set_next_pass_variant(variant | ckpt_variant(cache, seq_len));
             }
         }
         self.prepare_pass_inner(cache, seq_len)

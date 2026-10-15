@@ -29,10 +29,14 @@
 //! **What moves it** (`CONTRIBUTING.md` §2.6a): a launch added to, removed
 //! from or resized in the prefill forward; the pool's release rule — reuse
 //! ordered by dependencies (`dependency-ordered-reuse-design.md`) collapses
-//! the sum over layers toward one layer's set, and the figure is then
-//! derived from that schedule; the attention route, whose workspace
-//! descriptor supplies [`Attention`]'s terms where there is one; the host
-//! plan's per-layer wait.
+//! the sum over layers toward one layer's set. The trigger is observable:
+//! once the pool's census reports early-reuse hits on activations in a
+//! production pass, the resident arm's sum over layers is stale and is
+//! re-derived from that schedule; it is one term ([`Lifetime::Deferred`]'s
+//! arm of [`PrefillTransient::forward`]), replaced without touching the
+//! per-block rows. Also: the attention route, whose workspace descriptor
+//! supplies [`Attention`]'s terms where there is one; the host plan's
+//! per-layer wait.
 
 use super::config::{Config, LayerKind};
 use super::deltanet::CHUNK_SIZE;
@@ -726,6 +730,8 @@ impl PrefillTransient {
         };
         allocated = allocated.saturating_add(ckpt_layer.saturating_mul(linear as u64));
         let held = match self.route.lifetime {
+            // Everything the pass allocated, until completion-deferred
+            // release catches up; stale once early reuse engages.
             Lifetime::Deferred => allocated,
             Lifetime::LayerSynced | Lifetime::Eager => {
                 let layers = match self.route.lifetime {

@@ -61,12 +61,6 @@ fn decode<P: Profile, R: ExpertResidency>(
         let input = Tensor::from_vec(vec![next], (1, 1), dev)?;
         logits = model.forward(&input, cache.pos, &mut cache)?;
     }
-    // The last forward's logits are never read, so it may still be running
-    // when the caller reads the fetch worker's counters, and the worker takes
-    // a layer's job only once the layer before it was served: its last jobs
-    // are not counted yet. Every counter the tests read is complete only once
-    // the work it counts has run.
-    dev.synchronize()?;
     Ok((ids, rows, cache))
 }
 

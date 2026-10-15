@@ -303,6 +303,13 @@ pub trait ReadbackStrategy {
         let _ = dropped_in_batch;
     }
 
+    /// A run begins on this strategy: ids an earlier run left undrained are
+    /// no run's to return, and are forgotten. A run that ends in an error
+    /// returns before its final drain, and a pooled strategy outlives it; its
+    /// next run would otherwise hand those ids out as its first tokens. The
+    /// default holds nothing across runs.
+    fn begin_run(&mut self) {}
+
     /// Which EOS-learning arm this strategy is, for the `RESULT` line: `host`
     /// (the id is read back and compared at feed time), `flag` (the ring's
     /// device flag, one blocking readback per step), `poll` (the flag polled
@@ -2589,6 +2596,11 @@ impl ReadbackStrategy for Ring {
             // No dense window view this commit — fall back to the host scan below.
         }
         batch.iter().position(|id| self.eos_ids_host.contains(id))
+    }
+
+    fn begin_run(&mut self) {
+        let undrained = self.history.forget_undrained();
+        self.counters.ring_discarded += undrained as u64;
     }
 
     fn note_eos_truncation(&mut self, dropped_in_batch: usize) {

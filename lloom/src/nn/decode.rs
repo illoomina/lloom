@@ -1977,6 +1977,7 @@ impl<'m, M: CausalLM> Session<'m, M> {
         }
         readback.check_sampler(sampler.sampling())?;
         spec.begin_at(SeqId(0), prompt, &self.seq.tokens)?;
+        readback.begin_run();
 
         let device = readback.device().clone();
         crate::nn::terminal_trace::run_begin(readback.published_count());

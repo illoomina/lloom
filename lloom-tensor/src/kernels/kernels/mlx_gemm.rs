@@ -1607,8 +1607,9 @@ pub unsafe fn call_mlx_gemm_out(
     // Under `deterministic` a half row runs the one-row GEMV reduction at
     // every row count, the rows on its batch axis: the storage caller has
     // materialized a transposed activation, and the weight strides and both
-    // offsets are the caller's views'. A speculative round's window (the
-    // verify, the drafter's block) takes the route below instead, its rows
+    // offsets are the caller's views'. A pass off the K=1 decode path — a
+    // speculative round's window (the verify, the drafter's block), a
+    // prompt's prefill tile — takes the route below instead, its rows
     // identical per window shape rather than across row counts
     // (`tuning::VerifyWindow`, architecture.md §2.3.5b).
     let window = if row_identity && m > 1 {

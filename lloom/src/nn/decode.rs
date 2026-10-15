@@ -2906,6 +2906,11 @@ impl<'m, M: CausalLM> Session<'m, M> {
     /// carry (`Config::conv_prefill_ctx`): a `seq_len > 1` pass onto a warm
     /// cache zero-pads its left without it. The caller turns it on whenever
     /// more than one forward can run; a single unit is identical either way.
+    ///
+    /// Each forward is a prefill window (`tuning::VerifyWindow::prefill`):
+    /// under `deterministic` its half matmuls take the GEMM, so a prompt's
+    /// bits are its tiling's, identical run to run for the same widths
+    /// (`architecture.md` §2.3.5b).
     fn prefill_forwards<R>(
         &mut self,
         readback: &mut R,
@@ -2967,10 +2972,12 @@ impl<'m, M: CausalLM> Session<'m, M> {
                     fresh: self.seq.pos == 0,
                 },
             )?;
-            let out = self
-                .model
-                .forward(&input, self.seq.pos, &mut self.seq.cache)?
-                .squeeze(0)?;
+            let out = {
+                let _prefill = lloom_tensor::tuning::VerifyWindow::prefill();
+                self.model
+                    .forward(&input, self.seq.pos, &mut self.seq.cache)?
+                    .squeeze(0)?
+            };
             end_pass(&device)?;
             if pace {
                 pacer.after_forward(&device)?;
@@ -3061,7 +3068,8 @@ impl<'m, M: CausalLM> Session<'m, M> {
     /// before it waits on any) and observes with it as the accepted tail.
     ///
     /// The units are `decode`'s — `ubatch` first, then the remainder — and
-    /// `0` is the incumbent one-shot. A target that overwrites its probe per
+    /// `0` is the incumbent one-shot; each is a prefill window, as
+    /// [`Self::prefill_forwards`]'s. A target that overwrites its probe per
     /// forward would seed the drafter from the last unit alone if a unit were
     /// skipped; `probe_drops` is checked across the seed so that is a refusal
     /// rather than a lower accept rate nothing else sees (§10.2w). The third
@@ -3096,9 +3104,11 @@ impl<'m, M: CausalLM> Session<'m, M> {
             let w = step.min(prompt.len() - off);
             let chunk = &prompt[off..off + w];
             let input = Tensor::new(chunk, device)?.unsqueeze(0)?;
-            let logits = self
-                .model
-                .forward(&input, self.seq.pos, &mut self.seq.cache)?;
+            let logits = {
+                let _prefill = lloom_tensor::tuning::VerifyWindow::prefill();
+                self.model
+                    .forward(&input, self.seq.pos, &mut self.seq.cache)?
+            };
             self.seq.pos += w;
             self.seq.tokens.extend_from_slice(chunk);
             off += w;
@@ -3987,8 +3997,9 @@ impl<'m, M: CausalLM> Session<'m, M> {
     /// picks by `m` (§13.5o: 16 rows to `m` = 32, 64 rows above; `m == 1` is
     /// the GEMV), each in an aligned (`m % bm == 0`) and an unaligned variant —
     /// four pipelines a prefill can land on, none of which a decode step
-    /// touches. [`WARMUP_PREFILL_LENS`] is one prefill per variant, then the
-    /// decode step is the GEMV: the set every real run actually takes.
+    /// touches. [`WARMUP_PREFILL_LENS`] is one prefill per variant, each a
+    /// prefill window as a real one is, then the decode step is the GEMV:
+    /// the set every real run actually takes.
     ///
     /// Token id `0` is always a valid vocabulary index. The forward's output is
     /// discarded — only its compilation side effect is wanted — and
@@ -4014,6 +4025,7 @@ impl<'m, M: CausalLM> Session<'m, M> {
         for &len in &WARMUP_PREFILL_LENS {
             let tokens = vec![0u32; len];
             let prefill = Tensor::new(tokens.as_slice(), device)?.unsqueeze(0)?;
+            let _prefill = lloom_tensor::tuning::VerifyWindow::prefill();
             let _ = self.model.forward(&prefill, pos, &mut self.seq.cache)?;
             pos += len;
         }

@@ -518,6 +518,15 @@ fn a_session_decoding_beside_another_sessions_prefill_keeps_its_bits() -> Result
         "the session's prefill took no window launch"
     );
 
+    // Tells the prefilling thread to stop on every way out of the decoding
+    // loop, an assertion's unwind included, so a failure fails rather than
+    // leaving the scope waiting on a thread that never stops.
+    struct Release<'a>(&'a AtomicBool);
+    impl Drop for Release<'_> {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
     let done = AtomicBool::new(false);
     let before = Window::Prefill.gemms();
     let (prefills, steps) = std::thread::scope(|s| -> Result<(u64, usize)> {
@@ -529,18 +538,21 @@ fn a_session_decoding_beside_another_sessions_prefill_keeps_its_bits() -> Result
             }
             Ok(n)
         });
-        let mut steps = 0usize;
-        for _ in 0..24 {
-            assert_eq!(
-                decode_step(false)?,
-                reference,
-                "a decode step beside another session's prefill moved"
-            );
-            steps += 1;
-        }
-        done.store(true, Ordering::Release);
+        let decoding = (|| -> Result<usize> {
+            let _release = Release(&done);
+            let mut steps = 0usize;
+            for _ in 0..24 {
+                assert_eq!(
+                    decode_step(false)?,
+                    reference,
+                    "a decode step beside another session's prefill moved"
+                );
+                steps += 1;
+            }
+            Ok(steps)
+        })();
         let n = prefilling.join().expect("the prefilling thread panicked")?;
-        Ok((n, steps))
+        Ok((n, decoding?))
     })?;
     dev.synchronize()?;
     assert_eq!(

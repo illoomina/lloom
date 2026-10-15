@@ -2545,15 +2545,14 @@ fn the_checkpoints_templates_persist_what_the_model_generated() {
                     if persist != Some(false)
                         && !by_engine
                         && kind != "one more newline before the end marker"
+                        && !extends
                     {
-                        if !extends {
-                            failures.push(format!(
-                                "{name} want={want:?} persist={persist:?} {kind}: the history keeps \
-                                 what the model generated, so the next prompt extends the log; it \
-                                 leaves it at {:+} from the prompt's end",
-                                kept as i64 - p1.ids.len() as i64
-                            ));
-                        }
+                        failures.push(format!(
+                            "{name} want={want:?} persist={persist:?} {kind}: the history keeps \
+                             what the model generated, so the next prompt extends the log; it \
+                             leaves it at {:+} from the prompt's end",
+                            kept as i64 - p1.ids.len() as i64
+                        ));
                     }
                 }
             }

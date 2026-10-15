@@ -3172,7 +3172,7 @@ fn serve_keeps_past_reasoning_by_default_and_strips_it_on_request() {
             for think in [true, false] {
                 let at = format!("{name} {option} think={think}");
                 let turn = |messages: Value| {
-                    let mut r = json!({ "messages": messages, "temperature": 0, "max_tokens": 10,
+                    let r = json!({ "messages": messages, "temperature": 0, "max_tokens": 10,
                                         "enable_thinking": think, "return_token_ids": true,
                                         "ignore_eos": true,
                                         "logit_bias": { "97": 100, "98": 100, "99": 100,

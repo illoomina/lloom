@@ -215,9 +215,12 @@ pub(crate) fn own_copy(t: &Tensor) -> Result<Tensor> {
 /// a verify of `T` positions needs `T + 1`. Allocated per layer on first use.
 #[derive(Debug, Clone)]
 pub struct StatePool {
-    inner: std::sync::Arc<parking_lot::Mutex<PoolInner>>,
+    inner: std::sync::Arc<PoolInner>,
 }
 
+/// The pool's geometry is fixed at construction and a layer's slab is set
+/// once, at its first use, and never replaced, so a warm access reads both
+/// without a lock. Only the free list, which leases mutate, is locked.
 #[derive(Debug)]
 struct PoolInner {
     slots: usize,
@@ -226,8 +229,11 @@ struct PoolInner {
     dtype: lloom_tensor::DType,
     device: lloom_tensor::Device,
     /// Per layer, `[phases, slots, ..shape]`.
-    slabs: Vec<Option<Tensor>>,
-    free: Vec<usize>,
+    slabs: Vec<std::sync::OnceLock<Tensor>>,
+    /// Serializes a layer's first allocation, so two first uses do not both
+    /// allocate it.
+    first_use: parking_lot::Mutex<()>,
+    free: parking_lot::Mutex<Vec<usize>>,
 }
 
 impl StatePool {
@@ -252,15 +258,16 @@ impl StatePool {
         device: &lloom_tensor::Device,
     ) -> Self {
         Self {
-            inner: std::sync::Arc::new(parking_lot::Mutex::new(PoolInner {
+            inner: std::sync::Arc::new(PoolInner {
                 slots,
                 phases: phases.max(2),
                 shape: shape.to_vec(),
                 dtype,
                 device: device.clone(),
-                slabs: vec![None; n_layers],
-                free: (0..slots).rev().collect(),
-            })),
+                slabs: (0..n_layers).map(|_| std::sync::OnceLock::new()).collect(),
+                first_use: parking_lot::Mutex::new(()),
+                free: parking_lot::Mutex::new((0..slots).rev().collect()),
+            }),
         }
     }
 
@@ -270,32 +277,32 @@ impl StatePool {
     }
 
     pub fn slots(&self) -> usize {
-        self.inner.lock().slots
+        self.inner.slots
     }
 
     pub fn phases(&self) -> usize {
-        self.inner.lock().phases
+        self.inner.phases
     }
 
     pub fn n_layers(&self) -> usize {
-        self.inner.lock().slabs.len()
+        self.inner.slabs.len()
     }
 
     /// The elements of one row's state.
     pub fn row_elems(&self) -> usize {
-        self.inner.lock().shape.iter().product()
+        self.inner.shape.iter().product()
     }
 
     fn lease(&self) -> Result<usize> {
         self.inner
-            .lock()
             .free
+            .lock()
             .pop()
             .ok_or_else(|| lloom_tensor::Error::msg("StatePool: no free slot"))
     }
 
     fn release(&self, slot: usize) {
-        self.inner.lock().free.push(slot);
+        self.inner.free.lock().push(slot);
     }
 
     /// Layer `l` as the rows and multi-position kernels read it.
@@ -310,10 +317,9 @@ impl StatePool {
     /// Bytes the pool's allocated layers hold on the device.
     pub fn bytes(&self) -> usize {
         self.inner
-            .lock()
             .slabs
             .iter()
-            .flatten()
+            .filter_map(std::sync::OnceLock::get)
             .map(|t| t.elem_count() * t.dtype().size_in_bytes())
             .sum()
     }
@@ -321,17 +327,24 @@ impl StatePool {
     /// Layer `l`'s tensor `[phases, slots, ..shape]`, allocated (zero) on
     /// first use.
     pub fn layer(&self, l: usize) -> Result<Tensor> {
-        let mut g = self.inner.lock();
-        if l >= g.slabs.len() {
+        let g = &*self.inner;
+        let Some(slab) = g.slabs.get(l) else {
             lloom_tensor::bail!("StatePool: layer {l} out of range");
+        };
+        if let Some(t) = slab.get() {
+            return Ok(t.clone());
         }
-        if g.slabs[l].is_none() {
-            let mut dims = vec![g.phases, g.slots];
-            dims.extend_from_slice(&g.shape);
+        let _first = g.first_use.lock();
+        if let Some(t) = slab.get() {
+            return Ok(t.clone());
+        }
+        let mut dims = vec![g.phases, g.slots];
+        dims.extend_from_slice(&g.shape);
+        let t = {
             let _declared = lloom_tensor::EscapeGuard::new();
-            g.slabs[l] = Some(Tensor::zeros(dims.as_slice(), g.dtype, &g.device)?);
-        }
-        Ok(g.slabs[l].as_ref().expect("allocated above").clone())
+            Tensor::zeros(dims.as_slice(), g.dtype, &g.device)?
+        };
+        Ok(slab.get_or_init(|| t).clone())
     }
 }
 
@@ -1236,6 +1249,37 @@ mod tests {
         rs.write(0, t(9.0, &dev)).unwrap();
         rs.accept_window(0).unwrap();
         assert_eq!(rs.get(0).unwrap().to_vec2::<f32>().unwrap()[0][0], 3.0);
+    }
+
+    /// A warmed pooled channel steps without taking the pool's locks: with
+    /// the free list and the first-use lock both held elsewhere, its
+    /// accesses (the spare, the swap, the phase, the read) complete.
+    #[test]
+    fn a_warmed_pooled_channel_takes_no_pool_lock() {
+        let dev = Device::Cpu;
+        let pool = StatePool::with_phases(1, 3, 1, &[2, 2], lloom_tensor::DType::F32, &dev);
+        let mut rs = RecurrentState::in_pool(&pool).unwrap();
+        rs.write(0, t(1.0, &dev)).unwrap();
+        let free = pool.inner.free.lock();
+        let first = pool.inner.first_use.lock();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let dev = Device::Cpu;
+            for step in 0..8 {
+                let sp = rs.take_spare(0).unwrap();
+                sp.slice_set(&t(step as f32, &dev), 0, 0).unwrap();
+                rs.swap_in(0, sp).unwrap();
+                assert_eq!(rs.pool_slot(0).unwrap().0.phases(), 3);
+                assert_eq!(val(&rs), step as f32);
+            }
+            tx.send(rs).unwrap();
+        });
+        let rs = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("a warmed access waited on a pool lock (or failed)");
+        drop((first, free));
+        worker.join().unwrap();
+        drop(rs);
     }
 
     #[test]

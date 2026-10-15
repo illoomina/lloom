@@ -2463,6 +2463,42 @@ fn a_streamed_reply_never_carries_its_stop_string() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// A streamed reply that ends (on the length) on what could begin a stop
+/// string, though the stop never completes, still reaches the client whole:
+/// the run's end hands out what was held.
+#[test]
+fn a_streamed_reply_ending_on_a_stops_beginning_ends_whole() {
+    let (dir, model, base) = qwen_tiny("stream-held");
+    let server = Server::start(&model, &base.iter().map(String::as_str).collect::<Vec<_>>());
+    let req = |stop: Option<&str>, stream: bool| {
+        json!({ "messages": [{ "role": "user", "content": PROMPT }], "temperature": 0,
+                "max_tokens": 12, "ignore_eos": true, "enable_thinking": false,
+                "stop": stop, "stream": stream })
+    };
+    let (status, full) = server.call("POST", "/v1/chat/completions", &req(None, false));
+    assert_eq!(status, 200, "{full}");
+    let text = full["choices"][0]["message"]["content"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let last = text.chars().last().expect("a reply");
+    // Its last character, then one the reply never writes: a stop that
+    // begins at the reply's end and never completes.
+    let stop = format!("{last}\u{7}");
+    assert!(!text.contains(&stop));
+    let events = sse(&server, &req(Some(&stop), true));
+    let streamed: String = events
+        .iter()
+        .filter_map(|e| e["choices"][0]["delta"]["content"].as_str())
+        .collect();
+    assert_eq!(
+        streamed, text,
+        "the held {last:?} was handed out at the run's end"
+    );
+    drop(server);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// A streamed request whose client goes away publishes nothing into the
 /// next request: the next reply is a fresh server's, id for id.
 #[test]

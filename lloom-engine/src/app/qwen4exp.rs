@@ -1135,6 +1135,7 @@ impl<P: QwenShape, R: ExpertResidency + HasStreamStats + Send + Sync + 'static> 
                         stream.publish(&ids, &mut detok, &params.stop_strings)?;
                     if let Some(chunk) = chunk {
                         if !on_fragment(&chunk) {
+                            stream.refuse_last();
                             cancelled = true;
                             cancel.store(true, Ordering::Release);
                             continue;
@@ -1161,7 +1162,9 @@ impl<P: QwenShape, R: ExpertResidency + HasStreamStats + Send + Sync + 'static> 
         };
         if stop != Stop::Cancelled && !stopped_on_string {
             if let Some(rest) = stream.held() {
-                on_fragment(&rest);
+                if !on_fragment(&rest) {
+                    stream.refuse_last();
+                }
             }
         }
         let (text, _) = stream.finish(&params.stop_strings);
@@ -1174,6 +1177,8 @@ impl<P: QwenShape, R: ExpertResidency + HasStreamStats + Send + Sync + 'static> 
             reused: done.reused,
             prefilled: done.prefilled,
             turn: done.turn,
+            checkpoint: Default::default(),
+            checkpoint_at: None,
             readback: ReadbackArm::Batched {
                 rows: done.joined_beside,
             },
@@ -1442,6 +1447,7 @@ impl<P: QwenShape, R: ExpertResidency + HasStreamStats + Send + Sync + 'static> 
             return self.complete_batched(sched, prompt_ids, params, |f| on_fragment(f));
         }
         let reuse = self.reuse_prefix;
+        let params = &*params.under_reuse(reuse);
         let detok = self.detok();
         self.with_single(|s| {
             if !reuse || params.cold {

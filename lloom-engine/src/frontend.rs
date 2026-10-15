@@ -154,7 +154,7 @@ pub const EXCEPTIONS: &[Exception] = &[Exception {
     frontend: Frontend::Serve,
     before: "false",
     after: "true",
-    landed: false,
+    landed: true,
     owner: "#946",
     what:
         "serve reuses the cached prefix by default; --no-reuse opts out; the bench cells stay cold",

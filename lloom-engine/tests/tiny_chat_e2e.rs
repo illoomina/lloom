@@ -2379,8 +2379,10 @@ fn serve_returns_text_unless_ids_or_logprobs_are_asked() {
     );
     drop(server);
 
-    // Reuse off (serve's default): every turn cold by policy.
-    let server = Server::start(&model, &base.iter().map(String::as_str).collect::<Vec<_>>());
+    // Reuse off (`--no-reuse`): every turn cold by policy.
+    let mut off: Vec<&str> = base.iter().map(String::as_str).collect();
+    off.push("--no-reuse");
+    let server = Server::start(&model, &off);
     let (status, cold) = server.call(
         "POST",
         "/v1/chat/completions",
@@ -2858,4 +2860,414 @@ fn the_token_api_runs_the_ids_sent_and_returns_the_ids_and_logprobs_run() {
     assert!(lp2[..p1].iter().all(Value::is_null));
     drop(server);
     std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The common prefix of two id lists.
+fn lcp(a: &[Value], b: &[Value]) -> usize {
+    a.iter().zip(b).take_while(|(x, y)| x == y).count()
+}
+
+/// A reply cut inside its reasoning, continued, per
+/// `session.incomplete_reasoning`, on the tiny Qwen4-exp with thinking on
+/// (its template keeps a past reply's reasoning, as Qwen3.8's does). The
+/// first turn's reply is reasoning only (letters, biased) and `max_tokens`
+/// or a stop string ends it before any end marker; the client sends it back
+/// as the content it got.
+/// - `text` (the default): the reply goes to the template as the text it is,
+///   after the empty reasoning block the template writes, so the next prompt
+///   leaves the log at the previous prompt's end and the turn restores the
+///   checkpoint standing there.
+/// - `reasoning`: the reply goes to the template as the open reasoning it
+///   is; the template closes the block after it and the log extends.
+/// - `recover`: rendered as `text`, the checkpoint before the divergence an
+///   open reply's re-render makes (on the tiny tokenizer, the same place).
+#[test]
+fn a_reply_cut_inside_its_reasoning_continues_by_the_arm() {
+    for arm in ["text", "reasoning", "recover"] {
+        let (dir, model, base) = qwen_tiny(&format!("open-reasoning-{arm}"));
+        let mut args: Vec<&str> = base.iter().map(String::as_str).collect();
+        args.extend(["--prefix-reuse", "true"]);
+        if arm != "text" {
+            args.extend(["--incomplete-reasoning", arm]);
+        }
+        let server = Server::start(&model, &args);
+        let turn = |messages: Value, extra: Value| {
+            let mut r = json!({ "messages": messages, "temperature": 0, "enable_thinking": true,
+                                "return_token_ids": true, "ignore_eos": true,
+                                "logit_bias": { "97": 100, "98": 100, "99": 100 } });
+            for (k, v) in extra.as_object().unwrap() {
+                r[k] = v.clone();
+            }
+            let (status, body) = server.call("POST", "/v1/chat/completions", &r);
+            assert_eq!(status, 200, "{arm}: {body}");
+            body
+        };
+        let q = json!([{ "role": "user", "content": "Probe." }]);
+        let probe = turn(q.clone(), json!({ "max_tokens": 12 }));
+        let text = probe["choices"][0]["message"]["content"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let stop = (2..=4)
+            .flat_map(|w| (3..text.len().saturating_sub(w)).map(move |i| (i, w)))
+            .map(|(i, w)| (i, text[i..i + w].to_string()))
+            .find(|(i, s)| text.find(s.as_str()) == Some(*i))
+            .map(|(_, s)| s)
+            .unwrap_or_else(|| panic!("{arm}: no stop past the third letter: {text:?}"));
+        for (cause, extra) in [
+            ("length", json!({ "max_tokens": 6 })),
+            ("stop", json!({ "max_tokens": 12, "stop": stop })),
+        ] {
+            let one = turn(q.clone(), extra);
+            let delivered = one["choices"][0]["message"]["content"]
+                .as_str()
+                .unwrap()
+                .to_string();
+            assert!(
+                !delivered.is_empty() && !delivered.contains("</think>"),
+                "{arm} {cause}: a reply inside its reasoning: {delivered:?}"
+            );
+            let p1 = one["prompt_token_ids"].as_array().unwrap().clone();
+            let r1 = one["choices"][0]["token_ids"].as_array().unwrap().clone();
+            let two = turn(
+                json!([q[0], { "role": "assistant", "content": delivered },
+                       { "role": "user", "content": "Again." }]),
+                json!({ "max_tokens": 4 }),
+            );
+            let p2 = two["prompt_token_ids"].as_array().unwrap().clone();
+            let log: Vec<Value> = p1.iter().chain(&r1).cloned().collect();
+            let kept = lcp(&p2, &log);
+            let t = &two["timings"]["turn"];
+            eprintln!(
+                "OPEN-REASONING {arm} {cause}: delivered {delivered:?} p1 {} r1 {} kept {kept} turn {t}",
+                p1.len(),
+                r1.len()
+            );
+            assert_eq!(two["timings"]["history_matched"], 1, "{arm} {cause}: {two}");
+            match (arm, cause) {
+                ("reasoning", "length") => {
+                    assert_eq!(kept, log.len(), "{arm}: the log extends");
+                    assert_eq!(t["outcome"], "extend", "{arm}: {t}");
+                }
+                ("reasoning", _) => {
+                    let accepted = delivered.len();
+                    assert_eq!(kept, p1.len() + accepted, "{arm} {cause}: to the stop");
+                    assert!(
+                        matches!(t["outcome"].as_str(), Some("rewind" | "restore")),
+                        "{arm} {cause}: {t}"
+                    );
+                }
+                _ => {
+                    assert_eq!(
+                        kept,
+                        p1.len(),
+                        "{arm} {cause}: diverges at the prompt's end"
+                    );
+                    assert_eq!(t["outcome"], "restore", "{arm} {cause}: {t}");
+                    assert_eq!(t["diverged_at"], json!(p1.len()), "{arm} {cause}: {t}");
+                    assert_eq!(t["replayed"], 0, "{arm} {cause}: {t}");
+                }
+            }
+        }
+        drop(server);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+/// Decision 48 through `lloom serve`: the logprobs surface's bounds per
+/// route — 0 to `MAX_TOP_LOGPROBS` (64, lloom's extension past OpenAI's
+/// documented 20), every other value or type a 400 naming the field —
+/// requested 0 is the drawn id's log-probability alone, a stop string's
+/// ids are not described beside the text (they are in `token_ids` and
+/// `token_logprobs`, aligned one to one), and `/health` says what each
+/// route accepts.
+#[test]
+fn logprobs_take_their_bounds_per_route_and_stay_aligned_through_a_stop() {
+    let (dir, model, base) = qwen_tiny("logprobs-bounds");
+    let server = Server::start(&model, &base.iter().map(String::as_str).collect::<Vec<_>>());
+    let chat = |extra: Value| {
+        // Letters (biased), so the text is whole characters a stop can cut.
+        let mut r = json!({ "messages": [{ "role": "user", "content": PROMPT }],
+                            "temperature": 0, "max_tokens": 6, "enable_thinking": false,
+                            "ignore_eos": true,
+                            "logit_bias": { "97": 100, "98": 100, "99": 100 } });
+        for (k, v) in extra.as_object().unwrap() {
+            r[k] = v.clone();
+        }
+        server.call("POST", "/v1/chat/completions", &r)
+    };
+    let completion = |extra: Value| {
+        let mut r = json!({ "prompt": PROMPT, "temperature": 0, "max_tokens": 4,
+                            "ignore_eos": true });
+        for (k, v) in extra.as_object().unwrap() {
+            r[k] = v.clone();
+        }
+        server.call("POST", "/v1/completions", &r)
+    };
+
+    // In range: 0 is the drawn id alone, 64 the most.
+    for top in [0u64, 1, 64] {
+        let (status, body) = chat(json!({ "logprobs": true, "top_logprobs": top }));
+        assert_eq!(status, 200, "top {top}: {body}");
+        for c in body["choices"][0]["logprobs"]["content"]
+            .as_array()
+            .unwrap()
+        {
+            assert!(c["logprob"].as_f64().unwrap() <= 0.0, "{c}");
+            assert_eq!(
+                c["top_logprobs"].as_array().unwrap().len() as u64,
+                top,
+                "{c}"
+            );
+        }
+    }
+    let (status, body) = chat(json!({ "logprobs": true }));
+    assert_eq!(status, 200, "{body}");
+    assert!(body["choices"][0]["logprobs"]["content"][0]["top_logprobs"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    // The decision scoring's one forward: 0 asked, no candidate beside the
+    // drawn id, whose own log-probability is still there.
+    let (status, body) = chat(json!({ "max_tokens": 1, "logprobs": true }));
+    assert_eq!(status, 200, "{body}");
+    let c = &body["choices"][0]["logprobs"]["content"][0];
+    assert!(c["top_logprobs"].as_array().unwrap().is_empty(), "{c}");
+    assert!(c["logprob"].as_f64().unwrap().is_finite(), "{c}");
+    // Out of range or of the wrong type.
+    for (extra, says) in [
+        (
+            json!({ "logprobs": true, "top_logprobs": 65 }),
+            "'top_logprobs' must be an integer from 0 to 64",
+        ),
+        (
+            json!({ "logprobs": true, "top_logprobs": -1 }),
+            "'top_logprobs' must be an integer from 0 to 64",
+        ),
+        (
+            json!({ "logprobs": true, "top_logprobs": 1.5 }),
+            "'top_logprobs' must be an integer from 0 to 64",
+        ),
+        (
+            json!({ "logprobs": true, "top_logprobs": "3" }),
+            "'top_logprobs' must be an integer from 0 to 64",
+        ),
+        (json!({ "logprobs": 3 }), "'logprobs' must be a boolean"),
+        (json!({ "logprobs": "yes" }), "'logprobs' must be a boolean"),
+        (
+            json!({ "logprobs": true, "stream": true }),
+            "logprobs with stream",
+        ),
+    ] {
+        let (status, err) = chat(extra.clone());
+        assert_eq!(status, 400, "{extra}: {err}");
+        let msg = err["error"]["message"].as_str().unwrap_or("");
+        assert!(msg.contains(says), "{extra}: {msg}");
+    }
+    for n in [0u64, 64] {
+        let (status, body) = completion(json!({ "logprobs": n }));
+        assert_eq!(status, 200, "{n}: {body}");
+        let lp = &body["choices"][0]["logprobs"];
+        for t in lp["top_logprobs"].as_array().unwrap() {
+            // Keyed by the token's text, two ids sharing one collapse.
+            assert!(t.as_object().unwrap().len() as u64 <= n, "{t}");
+        }
+    }
+    for (extra, says) in [
+        (
+            json!({ "logprobs": 65 }),
+            "'logprobs' must be an integer from 0 to 64",
+        ),
+        (
+            json!({ "logprobs": -1 }),
+            "'logprobs' must be an integer from 0 to 64",
+        ),
+        (
+            json!({ "logprobs": "2" }),
+            "'logprobs' must be an integer from 0 to 64",
+        ),
+    ] {
+        let (status, err) = completion(extra.clone());
+        assert_eq!(status, 400, "{extra}: {err}");
+        assert!(
+            err["error"]["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains(says),
+            "{err}"
+        );
+    }
+
+    // Through a stop string: the block describes the delivered ids, whose
+    // tokens are the delivered text; `token_logprobs` covers every id run.
+    let (status, full) = chat(json!({ "max_tokens": 12, "return_token_ids": true }));
+    assert_eq!(status, 200, "{full}");
+    let text = full["choices"][0]["message"]["content"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let chars: Vec<char> = text.chars().collect();
+    assert!(chars.len() >= 6, "{text:?}");
+    let stop: String = chars[3..5].iter().collect();
+    let (status, cut) = chat(json!({ "max_tokens": 12, "stop": stop, "logprobs": true,
+                                     "top_logprobs": 2, "return_token_ids": true }));
+    assert_eq!(status, 200, "{cut}");
+    let content = cut["choices"][0]["message"]["content"].as_str().unwrap();
+    assert!(!content.contains(&stop), "{cut}");
+    let rows = cut["choices"][0]["logprobs"]["content"].as_array().unwrap();
+    let ids = cut["choices"][0]["token_ids"].as_array().unwrap();
+    let lps = cut["choices"][0]["token_logprobs"].as_array().unwrap();
+    assert_eq!(lps.len(), ids.len(), "token_logprobs is one per id run");
+    assert!(
+        rows.len() < ids.len(),
+        "the stop's ids are past the block: {cut}"
+    );
+    let joined: String = rows.iter().map(|r| r["token"].as_str().unwrap()).collect();
+    assert_eq!(joined, content, "the block's tokens are the delivered text");
+    for (i, r) in rows.iter().enumerate() {
+        assert_eq!(r["id"], ids[i], "row {i} describes id {i}");
+        assert_eq!(r["logprob"], lps[i], "row {i}");
+    }
+
+    // What each route accepts, as `/health` says it.
+    let (status, h) = server.call("GET", "/health", &json!({}));
+    assert_eq!(status, 200, "{h}");
+    let lp = &h["logprobs"];
+    assert_eq!(
+        (&lp["served"], &lp["top_max"]),
+        (&json!(true), &json!(64)),
+        "{lp}"
+    );
+    assert_eq!(lp["openai_documented_top_max"], 20, "{lp}");
+    let routes = &lp["routes"];
+    assert_eq!(routes["/v1/chat/completions"]["top_max"], 64, "{lp}");
+    assert_eq!(routes["/v1/chat/completions"]["stream"], false, "{lp}");
+    assert_eq!(routes["/v1/chat/completions"]["images"], false, "{lp}");
+    assert_eq!(routes["/v1/completions"]["top_max"], 64, "{lp}");
+    assert_eq!(routes["decision"]["served"], true, "{lp}");
+    drop(server);
+
+    // A batched server refuses the generating routes and still scores.
+    let mut batched: Vec<&str> = base.iter().map(String::as_str).collect();
+    batched.extend(["--batch", "2"]);
+    let server = Server::start(&model, &batched);
+    let (status, h) = server.call("GET", "/health", &json!({}));
+    assert_eq!(status, 200, "{h}");
+    let routes = &h["logprobs"]["routes"];
+    assert_eq!(routes["/v1/chat/completions"]["served"], false, "{h}");
+    assert_eq!(routes["/v1/completions"]["served"], false, "{h}");
+    assert_eq!(routes["decision"]["served"], true, "{h}");
+    drop(server);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Decision 36(a): `lloom serve` reuses the conversation by default — the
+/// load line and `/health` say so, and a second turn extends the first —
+/// while a benchmark cell stays cold; `--no-reuse` turns it off, and says
+/// that too.
+#[test]
+fn serve_reuses_by_default_and_its_cold_cells_stay_cold() {
+    let (dir, model, base) = qwen_tiny("reuse-default");
+    let args: Vec<&str> = base.iter().map(String::as_str).collect();
+    let loaded = |extra: &[&str]| -> String {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_lloom"))
+            .args(["serve", "--model"])
+            .arg(&model)
+            .args(&args)
+            .args(extra)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("lloom serve runs");
+        let mut line = String::new();
+        std::io::BufReader::new(child.stdout.take().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        let ready: Value = serde_json::from_str(&line).unwrap();
+        let port = ready["port"].as_u64().unwrap() as u16;
+        let mut c = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        write!(
+            c,
+            "POST /shutdown HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}"
+        )
+        .unwrap();
+        let out = child.wait_with_output().unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+        stderr
+            .lines()
+            .find(|l| l.starts_with("[loaded "))
+            .unwrap_or_else(|| panic!("no load line: {stderr}"))
+            .to_string()
+    };
+    assert!(loaded(&[]).contains("reuse_prefix=true"), "{}", loaded(&[]));
+    assert!(loaded(&["--no-reuse"]).contains("reuse_prefix=false"));
+
+    let server = Server::start(&model, &args);
+    let turn = |messages: Value| {
+        let (status, body) = server.call(
+            "POST",
+            "/v1/chat/completions",
+            &json!({ "messages": messages, "temperature": 0, "max_tokens": 4,
+                     "enable_thinking": false, "logit_bias": { "97": 100 } }),
+        );
+        assert_eq!(status, 200, "{body}");
+        body
+    };
+    let one = turn(json!([{ "role": "user", "content": PROMPT }]));
+    let reply = one["choices"][0]["message"]["content"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let two = turn(json!([{ "role": "user", "content": PROMPT },
+                          { "role": "assistant", "content": reply },
+                          { "role": "user", "content": "Again?" }]));
+    let t = &two["timings"]["turn"];
+    assert_eq!(
+        (&t["reuse_policy"], &t["outcome"]),
+        (&json!("on"), &json!("extend")),
+        "{t}"
+    );
+    let (status, cell) = server.call(
+        "POST",
+        "/end_to_end_latency",
+        &json!({ "prompt": PROMPT, "decode_tokens": 4 }),
+    );
+    assert_eq!(status, 200, "{cell}");
+    let (status, h) = server.call("GET", "/health", &json!({}));
+    assert_eq!(status, 200, "{h}");
+    assert_eq!(h["reuse"]["reuse_policy"], "on", "{h}");
+    let last = &h["reuse"]["last"];
+    assert_eq!(
+        (&last["outcome"], &last["reason"], &last["reused"]),
+        (&json!("fresh"), &json!("cold"), &json!(0)),
+        "the cell is cold under the default: {last}"
+    );
+    drop(server);
+
+    let mut off = args.clone();
+    off.push("--no-reuse");
+    let server = Server::start(&model, &off);
+    let (status, h) = server.call("GET", "/health", &json!({}));
+    assert_eq!(status, 200, "{h}");
+    assert_eq!(h["reuse"]["reuse_policy"], "off", "{h}");
+    drop(server);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Not a test: writes the tiny Qwen4-exp checkpoint and its tokenizer to
+/// `LLOOM_TINY_OUT`, for a dry run of a serving driver against `lloom
+/// serve` on no real weights (`cargo nextest run --run-ignored only -E
+/// 'test(=tiny_chat_e2e::write_the_tiny_qwen4exp_checkpoint)'`).
+#[test]
+#[ignore = "a fixture writer, run by hand"]
+fn write_the_tiny_qwen4exp_checkpoint() {
+    let Ok(out) = std::env::var("LLOOM_TINY_OUT") else {
+        eprintln!("LLOOM_TINY_OUT is unset; nothing written");
+        return;
+    };
+    let dir = PathBuf::from(out);
+    std::fs::create_dir_all(&dir).unwrap();
+    let model = write::<Qwen4ExpTiny>(&dir);
+    println!("model {}", model.display());
+    println!("tokenizer {}", dir.join("tokenizer.json").display());
 }

@@ -39,6 +39,56 @@ impl StateReady {
     }
 }
 
+/// The turn checkpoint a request's prefill leaves for the next request
+/// (`sequence-reuse-design.md` §2.3b). Every request establishes one;
+/// nothing an earlier request asked carries over.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CheckpointPolicy {
+    /// Leave none.
+    #[default]
+    None,
+    /// At the end of the request's prefill, in the tile that ends it.
+    End,
+    /// At this absolute position, in whichever tile covers it.
+    At(usize),
+}
+
+impl CheckpointPolicy {
+    /// The policy a request asks for: none where the owner keeps nothing of
+    /// the request (`keep` false) or its prefill is a single id; `tail` ids
+    /// before the prompt's end (the front end's constant, no earlier than
+    /// `pos`); else the prompt's end. `pos` is the prepared session's
+    /// position, `suffix` the ids its prefill runs.
+    pub fn of(pos: usize, suffix: usize, tail: usize, keep: bool) -> Self {
+        let end = pos + suffix;
+        match (keep, tail) {
+            (false, _) => Self::None,
+            (true, t) if t > 0 => Self::At(end.saturating_sub(t).max(pos)),
+            (true, _) if suffix >= 2 => Self::End,
+            _ => Self::None,
+        }
+    }
+
+    /// The absolute position the checkpoint stands at, for a prefill ending
+    /// at `end`.
+    pub fn position(self, end: usize) -> Option<usize> {
+        match self {
+            Self::None => None,
+            Self::End => Some(end),
+            Self::At(p) => Some(p),
+        }
+    }
+
+    /// `none`, `end@P` or `at@P`, for a prefill ending at `end`.
+    pub fn name(self, end: usize) -> String {
+        match self {
+            Self::None => "none".into(),
+            Self::End => format!("end@{end}"),
+            Self::At(p) => format!("at@{p}"),
+        }
+    }
+}
+
 /// What the request did with the session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Outcome {

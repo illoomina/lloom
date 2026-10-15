@@ -1780,3 +1780,280 @@ fn an_open_reply_is_given_apart_only_as_it_came_back() {
         assert!(plain, "{}: ambiguous", arm.name());
     }
 }
+
+/// A reply cut inside its reasoning, given back by a client that sends the
+/// reasoning apart — the field set to the text it got, the content empty,
+/// null or absent: the shape the template reads, and the one
+/// `Incomplete::Reasoning` rewrites a whole reply into. It is the logged
+/// reply, under every arm: its span takes the sampled ids (here not the
+/// text's canonical tokenization: `<tool_response>` is one added token), so
+/// the log is a prefix of the next prompt, and the rendering is the history
+/// as sent. A field the client edited, content of its own beside the field,
+/// another conversation's reply and two distinct replies of one text each
+/// go as sent, with nothing taken.
+#[test]
+fn an_open_reply_sent_back_apart_takes_its_sampled_ids() {
+    let engine = Stub::qwen4exp();
+    let want = Some(true);
+    let q = json!([user("2+2?")]);
+    let next = |a: Value| json!([user("2+2?"), a, user("3+3?")]);
+    let apart = |reasoning: &str, content: Option<Value>| {
+        let mut a = json!({ "role": "assistant", "reasoning_content": reasoning });
+        if let Some(c) = content {
+            a["content"] = c;
+        }
+        a
+    };
+    let decode = |ids: &[u32]| engine.text.tokenizer.decode(ids, false).unwrap();
+    let sampled = bytes("Add <tool_response> them");
+    for arm in [Incomplete::Text, Incomplete::Reasoning, Incomplete::Recover] {
+        let front = Front::new(
+            &engine,
+            SessionOptions {
+                incomplete: arm,
+                ..SessionOptions::default()
+            },
+        );
+        let p1 = build(&front, &engine, &q, want);
+        let mut d = decoded(&engine, sampled.clone());
+        d.stop = Stop::Length;
+        assert_ne!(
+            engine.enc(&d.text),
+            sampled,
+            "the precondition: not canonical"
+        );
+        assert!(front.record(&engine, p1.origin, &d));
+        let log: Vec<u32> = p1.ids.iter().chain(&sampled).copied().collect();
+
+        for (case, content) in [
+            ("empty", Some(json!(""))),
+            ("null", Some(Value::Null)),
+            ("absent", None),
+        ] {
+            let history = next(apart(&d.text, content));
+            let p2 = build(&front, &engine, &history, want);
+            assert_eq!(
+                (p2.spliced.matched, p2.spliced.open),
+                (1, 1),
+                "{} {case}: the reply is ours: {:?}",
+                arm.name(),
+                p2.spliced
+            );
+            assert!(
+                p2.ids.starts_with(&log),
+                "{} {case}: the log is not a prefix of the next prompt:\n log  {log:?}\n next {:?}",
+                arm.name(),
+                &p2.ids[..log.len().min(p2.ids.len())]
+            );
+            assert_eq!(
+                p2.spliced.spliced_tokens,
+                sampled.len(),
+                "{} {case}",
+                arm.name()
+            );
+            assert_eq!(
+                decode(&p2.ids),
+                decode(&engine.reference(&history, &kw(&engine, want), want)),
+                "{} {case}: the history as sent",
+                arm.name()
+            );
+        }
+
+        // Not the reply as we gave it: tokenized as sent.
+        for (case, a) in [
+            ("edited", apart("Add <tool_response> THEM", Some(json!("")))),
+            ("own content", apart(&d.text, Some(json!("Four.")))),
+        ] {
+            let history = next(a);
+            let p2 = build(&front, &engine, &history, want);
+            assert_eq!(p2.spliced.matched, 0, "{} {case}", arm.name());
+            assert_eq!(
+                p2.ids,
+                engine.reference(&history, &kw(&engine, want), want),
+                "{} {case}",
+                arm.name()
+            );
+        }
+        let elsewhere = json!([user("4+4?"), apart(&d.text, Some(json!(""))), user("3+3?")]);
+        let p = build(&front, &engine, &elsewhere, want);
+        assert_eq!(
+            (p.spliced.matched, p.spliced.unverified),
+            (0, 1),
+            "{}: another conversation",
+            arm.name()
+        );
+    }
+
+    // Two distinct replies of one conversation with that text: ambiguous.
+    let front = Front::new(&engine, SessionOptions::default());
+    let p1 = build(&front, &engine, &q, want);
+    let tr = TinyTokenizer::qwen4exp().id("<tool_response>").unwrap();
+    for ids in [
+        sampled.clone(),
+        [bytes("Add "), vec![tr], bytes(" them")].concat(),
+    ] {
+        let mut d = decoded(&engine, ids);
+        d.stop = Stop::Length;
+        assert!(front.record(&engine, p1.origin, &d));
+    }
+    let p = build(
+        &front,
+        &engine,
+        &next(apart("Add <tool_response> them", Some(json!("")))),
+        want,
+    );
+    assert_eq!((p.spliced.matched, p.spliced.ambiguous), (0, 1));
+}
+
+/// Where a reply cut inside its reasoning lands in the next turn's history,
+/// on the checkpoints' own templates and tokenizers (when cached), per
+/// `session.incomplete_reasoning` arm, persisted and stripped, for the two
+/// shapes a client sends it back in: `echo` (the content it got: every
+/// OpenAI client that keeps `content`) and `apart` (`reasoning_content` set
+/// to that text, the content empty). Printed: the assistant message's span
+/// as the next prompt renders it, where the unfinished thought stands in it
+/// (`answer`: where the template puts a final answer; `reasoning`: inside
+/// the reasoning block; `absent`), and where the next prompt leaves the log.
+/// Asserted:
+/// - `echo` under `text` and `recover`: the thought stands as the answer
+///   (the default's history reads the unfinished reasoning as what the
+///   model told the user);
+/// - `echo` under `reasoning`, and `apart` under every arm: inside the
+///   block where reasoning is kept, absent where it is stripped (the
+///   message is then empty);
+/// - `apart` is the logged reply (matched), and kept, the next prompt
+///   leaves the log no earlier than the previous prompt's end.
+#[test]
+fn an_open_reply_sent_back_on_the_checkpoints_templates() {
+    let hub = std::env::var("HF_HUB_CACHE")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| {
+            std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default())
+                .join(".cache/huggingface/hub")
+        });
+    let mut ran = 0;
+    for (repo, bos, caps) in [
+        (
+            "models--LiquidAI--LFM2.5-2.6B",
+            "<|startoftext|>",
+            LFM2_CAPABILITIES,
+        ),
+        ("models--Qwen--Qwen3.6-27B", "", QWEN3_5_CAPABILITIES),
+        ("models--Qwen--Qwen3.6-35B-A3B", "", QWEN3_5_CAPABILITIES),
+        (
+            "models--Qwen--Qwen3.8-Flash-Next",
+            "",
+            QWEN4EXP_CAPABILITIES,
+        ),
+    ] {
+        let Some(dir) = std::fs::read_dir(hub.join(repo).join("snapshots"))
+            .ok()
+            .and_then(|mut d| d.next())
+            .and_then(|e| e.ok())
+            .map(|e| e.path())
+        else {
+            eprintln!("skipped: {repo} is not cached");
+            continue;
+        };
+        let (Ok(tok), Ok(src)) = (
+            tokenizers::Tokenizer::from_file(dir.join("tokenizer.json")),
+            std::fs::read_to_string(dir.join("chat_template.jinja")),
+        ) else {
+            eprintln!("skipped: {repo} has no tokenizer.json + chat_template.jinja");
+            continue;
+        };
+        let engine = Stub::new(tok, &src, bos, caps);
+        let tags = engine.text.think_tags().cloned().unwrap();
+        let end = engine.token_str(tags.end);
+        let want = Some(true);
+        let thought = "The user asks for the capital of France. That is";
+        for persist in [Some(true), Some(false)] {
+            for arm in [Incomplete::Text, Incomplete::Reasoning, Incomplete::Recover] {
+                let front = Front::new(
+                    &engine,
+                    SessionOptions {
+                        persist,
+                        incomplete: arm,
+                        ..SessionOptions::default()
+                    },
+                );
+                if front.persist_unsupported().is_some() {
+                    continue;
+                }
+                let first = json!([user("What is the capital of France?")]);
+                let p1 = build(&front, &engine, &first, want);
+                assert!(p1.thinking.is_some_and(|t| t.on), "{repo}");
+                let sampled = engine.enc(thought);
+                let mut d = decoded(&engine, sampled.clone());
+                d.stop = Stop::Length;
+                assert!(front.record(&engine, p1.origin, &d), "{repo}");
+                let log: Vec<u32> = p1.ids.iter().chain(&sampled).copied().collect();
+                for shape in ["echo", "apart"] {
+                    let reply = match shape {
+                        "echo" => assistant(&d.text),
+                        _ => json!({ "role": "assistant", "content": "",
+                                     "reasoning_content": d.text }),
+                    };
+                    let second = json!([
+                        user("What is the capital of France?"),
+                        reply,
+                        user("And Germany?")
+                    ]);
+                    let p2 = build(&front, &engine, &second, want);
+                    let b = p2.blocks.as_ref().expect("the spans");
+                    let span = engine
+                        .text
+                        .tokenizer
+                        .decode(&p2.ids[b.starts[1].unwrap()..b.starts[2].unwrap()], false)
+                        .unwrap();
+                    let stands = match span.find(thought) {
+                        None => "absent",
+                        Some(at) if span[at..].contains(end.as_str()) => "reasoning",
+                        Some(_) => "answer",
+                    };
+                    let kept = p2.ids.iter().zip(&log).take_while(|(a, b)| a == b).count();
+                    eprintln!(
+                        "OPEN-SENT-BACK {repo} persist={persist:?} arm={} shape={shape}: the \
+                         thought stands as {stands}; matched {} spliced {}; next prompt leaves \
+                         the log at {:+} from the prompt's end; span {span:?}",
+                        arm.name(),
+                        p2.spliced.matched,
+                        p2.spliced.spliced_tokens,
+                        kept as i64 - p1.ids.len() as i64,
+                    );
+                    let kept_reasoning = persist == Some(true);
+                    let want_stands = match (shape, arm) {
+                        ("echo", Incomplete::Text | Incomplete::Recover) => "answer",
+                        _ if kept_reasoning => "reasoning",
+                        _ => "absent",
+                    };
+                    assert_eq!(
+                        stands,
+                        want_stands,
+                        "{repo} persist={persist:?} {} {shape}: {span:?}",
+                        arm.name()
+                    );
+                    if shape == "apart" {
+                        assert_eq!(
+                            p2.spliced.matched,
+                            1,
+                            "{repo} persist={persist:?} {}: sent back apart, the reply is ours",
+                            arm.name()
+                        );
+                        if kept_reasoning {
+                            assert!(
+                                kept >= p1.ids.len(),
+                                "{repo} {}: kept, the next prompt leaves the log at {kept}, \
+                                 before the previous prompt's end {}",
+                                arm.name(),
+                                p1.ids.len()
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        ran += 1;
+    }
+    eprintln!("{ran} checkpoint templates checked");
+}

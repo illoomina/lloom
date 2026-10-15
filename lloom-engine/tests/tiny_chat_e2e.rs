@@ -2974,6 +2974,150 @@ fn a_reply_cut_inside_its_reasoning_continues_by_the_arm() {
     }
 }
 
+/// A reply cut inside its reasoning, through `lloom serve` on the tiny
+/// Qwen4-exp with thinking on (its template keeps a past reply's
+/// reasoning), streamed and not, then given back with its reasoning apart.
+/// - What the client gets: the reasoning as `content`, with no marker (the
+///   prompt opened the block); streamed, the deltas are `content` only and
+///   join to the unstreamed reply, the last event carries no delta and the
+///   finish reason, and `usage` counts every id the run generated — past a
+///   stop string too, where the frontier's `accepted` is fewer.
+/// - Given back as `reasoning_content` with the content empty, the reply is
+///   ours (`history_matched`), its ids are the prompt's, and the next turn
+///   extends (a length stop) or goes back to where the delivered ids end (a
+///   stop string).
+#[test]
+fn a_reply_cut_inside_its_reasoning_sent_back_apart_is_ours() {
+    let (dir, model, base) = qwen_tiny("open-apart");
+    let mut args: Vec<&str> = base.iter().map(String::as_str).collect();
+    args.extend(["--prefix-reuse", "true"]);
+    let server = Server::start(&model, &args);
+    let request = |messages: Value, extra: &Value| {
+        let mut r = json!({ "messages": messages, "temperature": 0, "enable_thinking": true,
+                            "return_token_ids": true, "ignore_eos": true,
+                            "logit_bias": { "97": 100, "98": 100, "99": 100 } });
+        for (k, v) in extra.as_object().unwrap() {
+            r[k] = v.clone();
+        }
+        r
+    };
+    let turn = |messages: Value, extra: Value| {
+        let (status, body) =
+            server.call("POST", "/v1/chat/completions", &request(messages, &extra));
+        assert_eq!(status, 200, "{body}");
+        body
+    };
+    let q = json!([{ "role": "user", "content": "Probe." }]);
+    let probe = turn(q.clone(), json!({ "max_tokens": 12 }));
+    let text = probe["choices"][0]["message"]["content"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let stop = (2..=4)
+        .flat_map(|w| (3..text.len().saturating_sub(w)).map(move |i| (i, w)))
+        .map(|(i, w)| (i, text[i..i + w].to_string()))
+        .find(|(i, s)| text.find(s.as_str()) == Some(*i))
+        .map(|(_, s)| s)
+        .unwrap_or_else(|| panic!("no stop past the third letter: {text:?}"));
+    for (cause, extra, finish) in [
+        ("length", json!({ "max_tokens": 6 }), "length"),
+        ("stop", json!({ "max_tokens": 12, "stop": stop }), "stop"),
+    ] {
+        // Streamed first, then the same request unstreamed: greedy, the same
+        // reply, and the session's log is the second's.
+        let mut streamed = request(q.clone(), &extra);
+        streamed["stream"] = json!(true);
+        let events = sse(&server, &streamed);
+        let one = turn(q.clone(), extra.clone());
+        let delivered = one["choices"][0]["message"]["content"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let r1 = one["choices"][0]["token_ids"].as_array().unwrap().clone();
+        let p1 = one["prompt_token_ids"].as_array().unwrap().clone();
+        assert!(
+            !delivered.is_empty()
+                && !delivered.contains("<think>")
+                && !delivered.contains("</think>"),
+            "{cause}: the reasoning as content, no marker: {delivered:?}"
+        );
+        assert_eq!(one["choices"][0]["finish_reason"], finish, "{cause}: {one}");
+        let deltas: Vec<&Value> = events
+            .iter()
+            .map(|e| &e["choices"][0]["delta"])
+            .filter(|d| d.get("content").is_some())
+            .collect();
+        let joined: String = deltas
+            .iter()
+            .map(|d| d["content"].as_str().unwrap())
+            .collect();
+        assert_eq!(joined, delivered, "{cause}: the deltas join to the reply");
+        assert!(
+            deltas
+                .iter()
+                .all(|d| d.as_object().unwrap().keys().all(|k| k == "content")),
+            "{cause}: content deltas only: {events:?}"
+        );
+        let last = events.last().unwrap();
+        assert_eq!(last["choices"][0]["delta"], json!({}), "{cause}: {last}");
+        assert_eq!(
+            last["choices"][0]["finish_reason"], finish,
+            "{cause}: {last}"
+        );
+        let frontier = &one["timings"]["frontier"];
+        let usage = &one["usage"];
+        eprintln!(
+            "OPEN-SENT-APART {cause}: delivered {delivered:?} generated {} usage {usage} \
+             stream usage {} frontier {frontier}",
+            r1.len(),
+            last["usage"]
+        );
+        assert_eq!(
+            usage["completion_tokens"],
+            json!(r1.len()),
+            "{cause}: {one}"
+        );
+        assert_eq!(last["usage"], *usage, "{cause}: streamed and not");
+
+        let two = turn(
+            json!([q[0], { "role": "assistant", "content": "", "reasoning_content": delivered },
+                   { "role": "user", "content": "Again." }]),
+            json!({ "max_tokens": 4 }),
+        );
+        let p2 = two["prompt_token_ids"].as_array().unwrap().clone();
+        let log: Vec<Value> = p1.iter().chain(&r1).cloned().collect();
+        let kept = lcp(&p2, &log);
+        let t = &two["timings"]["turn"];
+        eprintln!(
+            "OPEN-SENT-APART {cause}: next turn matched {} kept {kept} of log {} (p1 {}) turn {t}",
+            two["timings"]["history_matched"],
+            log.len(),
+            p1.len()
+        );
+        assert_eq!(
+            two["timings"]["history_matched"], 1,
+            "{cause}: sent back apart, the reply is ours: {two}"
+        );
+        match cause {
+            "length" => {
+                assert_eq!(kept, log.len(), "{cause}: the log extends");
+                assert_eq!(t["outcome"], "extend", "{cause}: {t}");
+            }
+            _ => {
+                let accepted = frontier["accepted"].as_u64().unwrap() as usize;
+                assert!(accepted < r1.len(), "{cause}: {frontier}");
+                assert_eq!(kept, p1.len() + accepted, "{cause}: to the delivered ids");
+                assert!(
+                    matches!(t["outcome"].as_str(), Some("rewind" | "restore")),
+                    "{cause}: {t}"
+                );
+            }
+        }
+    }
+    drop(server);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// Decision 48 through `lloom serve`: the logprobs surface's bounds per
 /// route — 0 to `MAX_TOP_LOGPROBS` (64, lloom's extension past OpenAI's
 /// documented 20), every other value or type a 400 naming the field —

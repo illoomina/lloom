@@ -1001,6 +1001,24 @@ pub struct Prepared {
     pub path: PreparePath,
 }
 
+/// What [`Session::accept`] did with the ids past the accepted boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Acceptance {
+    /// The log was the boundary: nothing to take back.
+    Whole,
+    /// The ids past the boundary were taken back exactly (the rewind
+    /// horizon), the run's overrun with them: the state is the boundary's.
+    Exact { dropped: usize },
+    /// The state is `ahead` positions past the boundary and no horizon takes
+    /// them back: the log ends at the boundary, and the next
+    /// [`Session::prepare`] restores the checkpoint at `restore_point` and
+    /// replays from it, or resets where there is none.
+    Obligation {
+        ahead: usize,
+        restore_point: Option<usize>,
+    },
+}
+
 /// What [`Session::prepare`] found and did (`sequence-reuse-design.md`
 /// §2.3f's events: the accepted boundary, the overrun past it, how the state
 /// was made ready, where the request diverged).
@@ -1178,6 +1196,59 @@ impl<'m, M: CausalLM> Session<'m, M> {
         self.seq.overrun = 0;
         self.seq.overrun_unwritten = false;
         Ok(n)
+    }
+
+    /// Reconcile the sequence to an accepted conversational boundary
+    /// (`sequence-reuse-design.md` §2.3f, decision 42): the log keeps its
+    /// first `keep` ids, the ones a front end accepted as history (a stop
+    /// string or a cancellation can leave ids past them). The state is taken
+    /// back exactly where it can be: the run's overrun first (the window, or
+    /// the gate's counters), then the ids past the boundary through the
+    /// rewind horizon. Where it cannot, the state stays ahead and that is
+    /// kept as an explicit obligation: the log ends at the boundary, the
+    /// positions ahead are an overrun no horizon reaches, and the next
+    /// [`Self::prepare`] restores the latest checkpoint at or before the
+    /// boundary and replays, or resets. A host stop is not seen by the
+    /// device: the forwards past the boundary wrote the state, so only a
+    /// window or a checkpoint recovers it; nothing here relabels that
+    /// replay as exact.
+    pub fn accept(&mut self, keep: usize) -> Result<Acceptance>
+    where
+        M::Cache: CacheRewind,
+    {
+        let log = self.seq.tokens.len();
+        if keep > log {
+            lloom_tensor::bail!("Session::accept: a boundary of {keep} past the log's {log} ids");
+        }
+        let past = log - keep;
+        if past == 0 {
+            return Ok(Acceptance::Whole);
+        }
+        let reconciled = self.seq.overrun == 0 || self.reconcile().is_ok();
+        if reconciled && past <= self.seq.cache.rewind_horizon() {
+            self.seq.cache.rewind(past)?;
+            self.seq.pos -= past;
+            self.seq.tokens.truncate(keep);
+            self.seq.last_logits = None;
+            return Ok(Acceptance::Exact { dropped: past });
+        }
+        // The state stays ahead of the boundary, by every position it holds
+        // past it, written: the next `prepare` cannot reconcile that and
+        // restores or resets.
+        let ahead = self.seq.overrun + past;
+        self.seq.tokens.truncate(keep);
+        self.seq.overrun = ahead;
+        self.seq.overrun_unwritten = false;
+        self.seq.last_logits = None;
+        let restore_point = self
+            .seq
+            .tokens_known
+            .then(|| self.seq.cache.restore_point(keep))
+            .flatten();
+        Ok(Acceptance::Obligation {
+            ahead,
+            restore_point,
+        })
     }
 
     /// Whether the pending overrun's forwards launched nothing on the device

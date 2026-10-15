@@ -119,7 +119,7 @@ pub use recurrent::{PoolLayer, RecurrentState, StatePool};
 pub use rnn::{gru, lstm, GRUConfig, LSTMConfig, GRU, LSTM, RNN};
 pub use sequential::{seq, Sequential};
 pub use speculator::{
-    Anchor, DivergenceBy, Draft, DraftTokens, KvSource, LayerTaps, NextnHidden, NoProbe,
+    Acceptance, Anchor, DivergenceBy, Draft, DraftTokens, KvSource, LayerTaps, NextnHidden, NoProbe,
     ObserveRow, OverrunBy, PhaseCensus, PreparePath, Prepared, ProbeHooks, Probes, ReuseAction,
     RoundProbe, RoundTiming, SeqId, Sequence, Session, Speculator, TapSide, TapSpec, TargetProbe,
     VerifyRowRef,

@@ -254,6 +254,8 @@ fn decoded(engine: &Stub, ids: Vec<u32>) -> Decoded {
         reused: 0,
         prefilled: 0,
         turn: Default::default(),
+        checkpoint: Default::default(),
+        checkpoint_at: None,
         readback: ReadbackArm::Blocking,
         logits_sha256: None,
         stats: Default::default(),

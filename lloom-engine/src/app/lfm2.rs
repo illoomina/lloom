@@ -2061,6 +2061,8 @@ impl<P: Lfm2Shape> Engine<P> {
             reused: done.reused,
             prefilled: done.prefilled,
             turn: done.turn,
+            checkpoint: Default::default(),
+            checkpoint_at: None,
             readback: match self.dspark_k {
                 Some(k) => ReadbackArm::Speculative { k },
                 None => ReadbackArm::Batched {

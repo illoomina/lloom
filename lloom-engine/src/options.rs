@@ -1184,6 +1184,7 @@ impl SamplingConfig {
             prefill_tile,
             thinking: None,
             turn_tail: 0,
+            no_checkpoint: false,
             logprobs: None,
             cold: false,
         }

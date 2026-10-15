@@ -1174,6 +1174,8 @@ impl<P: QwenShape, R: ExpertResidency + HasStreamStats + Send + Sync + 'static> 
             reused: done.reused,
             prefilled: done.prefilled,
             turn: done.turn,
+            checkpoint: Default::default(),
+            checkpoint_at: None,
             readback: ReadbackArm::Batched {
                 rows: done.joined_beside,
             },
@@ -1442,6 +1444,7 @@ impl<P: QwenShape, R: ExpertResidency + HasStreamStats + Send + Sync + 'static> 
             return self.complete_batched(sched, prompt_ids, params, |f| on_fragment(f));
         }
         let reuse = self.reuse_prefix;
+        let params = &*params.under_reuse(reuse);
         let detok = self.detok();
         self.with_single(|s| {
             if !reuse || params.cold {

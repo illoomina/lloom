@@ -1550,6 +1550,7 @@ fn sampling_params(shared: &Shared, v: &Value) -> Handled<DecodeParams> {
         logits_digest: false,
         prefill_tile: shared.engine.prefill_tile(),
         turn_tail: 0,
+        no_checkpoint: false,
         thinking: None,
         logprobs: None,
         cold: false,
@@ -1903,6 +1904,7 @@ fn max_memory_usage(shared: &Shared, v: &Value) -> Handled<Value> {
         readback: engine.readback(),
         prefill_tile: engine.prefill_tile(),
         turn_tail: 0,
+        no_checkpoint: false,
         cold: true,
         ..DecodeParams::default()
     };
@@ -1943,6 +1945,7 @@ fn end_to_end_latency(shared: &Shared, v: &Value) -> Handled<Value> {
         readback: engine.readback(),
         prefill_tile: engine.prefill_tile(),
         turn_tail: 0,
+        no_checkpoint: false,
         cold: true,
         ..DecodeParams::default()
     };
@@ -2143,6 +2146,7 @@ fn eval(shared: &Shared, request: Request, v: &Value) -> Result<()> {
                             logits_digest: false,
                             prefill_tile: engine.prefill_tile(),
                             turn_tail: 0,
+                            no_checkpoint: false,
                             thinking: None,
                             logprobs: None,
                             cold: false,
@@ -2629,6 +2633,8 @@ fn timings(
         // accepted boundary it found, how the state there was made ready,
         // and the ids kept, replayed and newly prefilled.
         "turn": d.turn.with_policy(engine.reuse_prefix()).json(engine.reuse_prefix()),
+        // The turn checkpoint this request's prefill was asked to leave.
+        "checkpoint": d.checkpoint_name(),
     })
 }
 
@@ -2657,7 +2663,7 @@ fn report(
          commits={} poll_fallbacks={} overrun={} eos_gate={} host_fill={} prompt_ids_sha256={} \
          reasoning_effort={} think={} think_by={} thinking_budget={} thought={} budget_fired={} \
          prompt_budget={} prompt_dropped={} reused={} renders={} history={}/{} spliced={}/{} \
-         unverified={} ambiguous={} declined={} reuse_policy={} {}]",
+         unverified={} ambiguous={} declined={} reuse_policy={} {} checkpoint={}]",
         d.tokens.len(),
         d.stop,
         d.readback.name(),
@@ -2694,6 +2700,7 @@ fn report(
         facts.spliced.declined,
         crate::turn::policy_name(policy),
         turn.fields(),
+        d.checkpoint_name(),
     );
 }
 

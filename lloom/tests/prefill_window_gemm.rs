@@ -443,3 +443,113 @@ fn a_failed_prefill_leaves_no_window_behind() -> Result<()> {
     );
     Ok(())
 }
+
+/// Two sessions on two threads: one prefills through `Session::prefill`
+/// again and again while the other runs batched K=1 decode steps
+/// (`forward_rows`, two rows, no window). Every decode step's logits are
+/// the ones the same step gives with nothing else running, the prefill
+/// window's count is exactly the prefilling session's, and the same step
+/// inside a window of its own gives other logits — so a window leaking from
+/// the prefilling thread would show.
+#[test]
+fn a_session_decoding_beside_another_sessions_prefill_keeps_its_bits() -> Result<()> {
+    use lloom::nn::Row;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let Ok(dev) = Device::new_metal(0) else {
+        eprintln!("no Metal device; skipping");
+        return Ok(());
+    };
+    let Some(fx) = Fixture::<Lfm2Tiny>::new("prefill_window_two_sessions", tiny_geometry())? else {
+        return Ok(());
+    };
+    let cfg = fx.config(arms);
+    let model = fx.model_in::<RewindableExact>(&cfg, Some(DType::F16), &dev)?;
+    Window::Prefill.set_arm(true);
+    let prompts: [Vec<u32>; 2] = [vec![3, 9, 27, 17], vec![5, 25, 13, 41, 2]];
+    let decode_step = |windowed: bool| -> Result<Vec<u32>> {
+        let mut caches = Vec::new();
+        for p in &prompts {
+            let mut cache = State::<RewindableExact>::new(true, DType::F16, &cfg, &dev)?;
+            let input = lloom_tensor::Tensor::new(p.as_slice(), &dev)?.unsqueeze(0)?;
+            model.forward(&input, 0, &mut cache)?;
+            caches.push(cache);
+        }
+        let next = lloom_tensor::Tensor::new(&[7u32, 11], &dev)?.reshape((2, 1))?;
+        let mut rows: Vec<Row<'_, State<RewindableExact>>> = caches
+            .iter_mut()
+            .zip(&prompts)
+            .map(|(cache, p)| Row {
+                pos: p.len(),
+                cache,
+            })
+            .collect();
+        let logits = {
+            let _w = windowed.then(lloom_tensor::tuning::VerifyWindow::prefill);
+            model.forward_rows(&next, &mut rows)?
+        };
+        Ok(logits
+            .to_dtype(DType::F32)?
+            .flatten_all()?
+            .to_vec1::<f32>()?
+            .into_iter()
+            .map(f32::to_bits)
+            .collect())
+    };
+    let reference = decode_step(false)?;
+    assert_ne!(
+        decode_step(true)?,
+        reference,
+        "a window over the decode step moves nothing: this comparison could not see a leak"
+    );
+    let prefill_prompt: Vec<u32> = (0..37).map(|i| 1 + (i * 7) % 60).collect();
+    let prefill_once = || -> Result<()> {
+        let cache = State::<RewindableExact>::new(true, DType::F16, &cfg, &dev)?;
+        let mut session = Session::new(&model, cache);
+        let mut rb = Blocking::new(&[EOS], &dev)?;
+        session.prefill(&mut rb, &prefill_prompt, &DecodeOptions::new(4))?;
+        Ok(())
+    };
+    let before = Window::Prefill.gemms();
+    prefill_once()?;
+    dev.synchronize()?;
+    let per_prefill = Window::Prefill.gemms() - before;
+    assert!(
+        per_prefill > 0,
+        "the session's prefill took no window launch"
+    );
+
+    let done = AtomicBool::new(false);
+    let before = Window::Prefill.gemms();
+    let (prefills, steps) = std::thread::scope(|s| -> Result<(u64, usize)> {
+        let prefilling = s.spawn(|| -> Result<u64> {
+            let mut n = 0u64;
+            while !done.load(Ordering::Acquire) || n == 0 {
+                prefill_once()?;
+                n += 1;
+            }
+            Ok(n)
+        });
+        let mut steps = 0usize;
+        for _ in 0..24 {
+            assert_eq!(
+                decode_step(false)?,
+                reference,
+                "a decode step beside another session's prefill moved"
+            );
+            steps += 1;
+        }
+        done.store(true, Ordering::Release);
+        let n = prefilling.join().expect("the prefilling thread panicked")?;
+        Ok((n, steps))
+    })?;
+    dev.synchronize()?;
+    assert_eq!(
+        Window::Prefill.gemms() - before,
+        prefills * per_prefill,
+        "the window counted launches other than the prefilling session's"
+    );
+    eprintln!(
+        "PREFILL_WINDOW_TWO_SESSIONS decode_steps={steps} prefills={prefills} launches_per_prefill={per_prefill}"
+    );
+    Ok(())
+}

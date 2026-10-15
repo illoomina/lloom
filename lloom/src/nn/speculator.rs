@@ -1352,6 +1352,18 @@ impl<'m, M: CausalLM> Session<'m, M> {
     where
         M::Cache: CacheRewind + CacheReset,
     {
+        let t0 = crate::nn::terminal_trace::prepare_begin();
+        let prepared = self.prepare_inner(full, resume);
+        if let Ok(p) = &prepared {
+            crate::nn::terminal_trace::prepare_end(t0, &p.action);
+        }
+        prepared
+    }
+
+    fn prepare_inner(&mut self, full: &[u32], resume: bool) -> Result<Prepared>
+    where
+        M::Cache: CacheRewind + CacheReset,
+    {
         if full.is_empty() {
             lloom_tensor::bail!("Session::prepare: empty sequence");
         }

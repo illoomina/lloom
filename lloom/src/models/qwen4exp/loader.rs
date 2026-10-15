@@ -24,6 +24,7 @@ use super::moe::{ExpertResidency, MoeLayer, Resident, Streamed};
 use super::mtp::MtpHead;
 use super::ple::{CachedPleTable, MmapPleTable, NgramHash, PleLayer, PleTable};
 use super::qsa::{Indexer, QsaAttention};
+use crate::nn::attention::route::ExecutionPurpose;
 use crate::nn::expert_stream::{ExpertSource, LoaderArm};
 use crate::nn::RmsNorm;
 use crate::profile::Profile;
@@ -205,9 +206,8 @@ pub(crate) struct Gguf<'a, R: Read + Seek> {
     /// Read no data: every tensor a ghost of its header's kind and shape
     /// ([`Qwen4Exp::ghost_of_manifest`]), a model to walk, never to run.
     pub(crate) ghost: bool,
-    /// Refuse a full-attention layer the fused paths do not serve on Metal
-    /// (`LoadOptions::serve`).
-    pub(crate) serve: bool,
+    /// What the attention is built for (`LoadOptions::purpose`).
+    pub(crate) purpose: ExecutionPurpose,
     /// Every tensor read, for the schema's debug check (`build`).
     #[cfg(debug_assertions)]
     read: std::cell::RefCell<std::collections::BTreeSet<String>>,
@@ -229,7 +229,7 @@ impl<'a, R: Read + Seek> Gguf<'a, R> {
             device: device.clone(),
             dense_f32: false,
             ghost: false,
-            serve: false,
+            purpose: ExecutionPurpose::Reference,
             #[cfg(debug_assertions)]
             read: Default::default(),
         })
@@ -911,11 +911,11 @@ pub struct LoadOptions {
     /// The machine gate the load passes before its first tensor
     /// (`memory.md` §9.10); `None` loads unadmitted (a test, a harness).
     pub machine: Option<crate::nn::memory::MachineLoad>,
-    /// Refuse at load, on Metal, a full-attention layer the fused paths do
-    /// not serve, rather than keep the composed attention: what serving sets.
-    /// Off, such a layer attends composed, the reference a test or a harness
-    /// compares against.
-    pub serve: bool,
+    /// What the attention is built for ([`ExecutionPurpose`]): production
+    /// refuses at load, on Metal, a full-attention layer whose attention
+    /// takes the composed path; the reference (the default) keeps it, for a
+    /// test or a harness to compare against.
+    pub purpose: ExecutionPurpose,
 }
 
 impl LoadOptions {
@@ -1559,7 +1559,7 @@ fn build<P: Profile, R: ExpertResidency, Rd: Read + Seek>(
     opts: &LoadOptions,
     mut experts: impl FnMut(&mut Gguf<'_, Rd>, usize) -> Result<R>,
 ) -> Result<Qwen4Exp<P, R>> {
-    gg.serve = opts.serve;
+    gg.purpose = opts.purpose;
     let mut cfg = Config::from_gguf_metadata(gg.metadata())?;
     let ple_hash = match (opts.ple_shard.is_some() || opts.ple, cfg.ple_layers.first()) {
         (true, Some(_)) => {
@@ -1803,9 +1803,7 @@ fn load_layer<P: Profile, R: ExpertResidency, Rd: Read + Seek>(
                 cfg,
             )
             .with_indexer(indexer);
-            if gg.serve && gg.device.is_metal() {
-                attn.prepare_for_serving(&gg.device)?;
-            }
+            attn.admit(gg.purpose, &gg.device)?;
             Mixer::Full(match cat {
                 Some(cat) => attn.with_stem_cat(cat),
                 None => attn,

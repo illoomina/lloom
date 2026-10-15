@@ -85,6 +85,8 @@ pub struct Vision {
     files: Vec<PathBuf>,
     dtype: DType,
     text_hidden: usize,
+    /// The load's execution purpose, applied to the tower when it loads.
+    purpose: lloom::nn::attention::route::ExecutionPurpose,
     tower: Mutex<Option<Tower>>,
 }
 
@@ -115,14 +117,8 @@ impl Vision {
         let vb = VarBuilder::from_backend(Box::new(backend), self.dtype, device.clone());
         let encoder = VisionEncoder::new(&self.config, self.text_hidden, vb)
             .context("loading the vision tower and projector")?;
-        if device.is_metal() {
-            if let Some(why) = encoder.reference_attention() {
-                anyhow::bail!(
-                    "{why}: no fused kernel covers the vision tower's attention, and the \
-                     composed attention does not serve on Metal"
-                );
-            }
-        }
+        self.purpose
+            .admit("lfm2-vl", device, encoder.reference_attention())?;
         device.synchronize()?;
         let pool_delta = MemSnapshot::read(device).pool_live as i64 - before;
         let t = Tower {
@@ -347,6 +343,9 @@ pub struct Engine<P: Profile> {
 pub struct LoadOptions {
     pub model_dir: PathBuf,
     pub cpu: bool,
+    /// What the run is for (`execution.purpose`): production refuses at load
+    /// an attention that takes the composed scores path on Metal.
+    pub purpose: lloom::nn::attention::route::ExecutionPurpose,
     pub kv_capacity: usize,
     pub readback: ReadbackArm,
     /// The decode loop's options (`DecodeConfig`): what `readback` and the
@@ -940,12 +939,12 @@ impl<P: Lfm2Shape> Engine<P> {
             .apply_axes(&mut config)
             .map_err(|e| anyhow::anyhow!("model axes: {e}"))?;
         refuse_kv_quant_shape(&config, &device, opts.batch)?;
-        if device.is_metal() && config.attn_impl == AttnImpl::Generic {
-            anyhow::bail!(
-                "--attn generic is the composed reference attention: it materializes the \
-                 scores and does not serve on Metal (serve with sdpa or flash)"
-            );
-        }
+        // The route the model resolves at construction, admitted for the
+        // run's purpose before any weight is read.
+        let route =
+            lloom::models::lfm2::AttnRoute::resolve(config.attn_impl, &config, dtype, &device)?;
+        opts.purpose
+            .admit("lfm2", &device, route.composed_reason(&device).as_deref())?;
         if let Some(k) = opts.flash_k {
             if config.attn_impl != AttnImpl::FlashDecoding {
                 anyhow::bail!(
@@ -1237,6 +1236,7 @@ impl<P: Lfm2Shape> Engine<P> {
                 files: files.clone(),
                 dtype,
                 text_hidden: config.hidden_size,
+                purpose: opts.purpose,
                 tower: Mutex::new(None),
             })
         } else {
@@ -1354,12 +1354,11 @@ impl<P: Lfm2Shape> Engine<P> {
             };
             let drafter = DSparkDrafter::new(dcfg.clone(), max_pos, dvb)
                 .context("constructing DSpark drafter")?;
-            if let Some(why) = drafter.reference_attention() {
-                anyhow::bail!(
-                    "{why}: the drafter's block attention does not serve on Metal through the \
-                     eager reference"
-                );
-            }
+            opts.purpose.admit(
+                "dspark drafter",
+                &core.device,
+                drafter.reference_attention(),
+            )?;
             // The drafter's context KV: an explicit `tuning.dspark.ctx_kv`
             // (`--dspark-ctx`, the `LLOOM_DSPARK_CTX_KV` alias) wins on every
             // arm; `auto` is one paged pool set shared by every sequence on

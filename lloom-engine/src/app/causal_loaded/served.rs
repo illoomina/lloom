@@ -263,6 +263,7 @@ pub fn load_lfm2_gguf<P: Predictor>(
                 TokenizerSource::File(files.tokenizer),
                 policy,
                 device,
+                lloom::nn::attention::route::ExecutionPurpose::Production,
                 owner_decode,
                 |resolved, tokenizer, policy| {
                     preflight(
@@ -292,6 +293,7 @@ pub fn load_lfm2_gguf_unadmitted(
     tokenizer: TokenizerSource<'_>,
     binding: Option<BoundPolicy>,
     device: &Device,
+    purpose: lloom::nn::attention::route::ExecutionPurpose,
     machine: lloom_tensor::machine::Admitted,
     decode: DecodeConfig,
     config: Config,
@@ -328,6 +330,7 @@ pub fn load_lfm2_gguf_unadmitted(
                 tokenizer,
                 policy,
                 device,
+                purpose,
                 owner_decode,
                 |resolved, tokenizer, policy| {
                     preflight(

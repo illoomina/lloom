@@ -1525,6 +1525,9 @@ fn parse_device(v: &str) -> Result<String, String> {
         )),
     }
 }
+fn parse_purpose(v: &str) -> Result<String, String> {
+    lloom::nn::attention::route::ExecutionPurpose::parse(v.trim()).map(|p| p.name().to_string())
+}
 fn parse_experts(v: &str) -> Result<String, String> {
     match v.trim().to_ascii_lowercase().as_str() {
         s @ ("stream" | "resident") => Ok(s.into()),
@@ -1614,6 +1617,9 @@ pub struct LoadConfig {
     /// The device: `auto` (the GPU this build has, else the CPU) or `cpu`.
     #[opt(flag = "device", parser = "parse_device", variants = ["auto", "cpu"], path = "backend.device", status = "stable", cli = "device", switches = ["cpu=cpu"])]
     pub device: String,
+    /// What the run is for: `production` (chat and serve — on Metal every attention dispatches through a prepared, bounded-memory route, and a configuration under which any attention takes the composed scores path is refused at load, whatever option selected it) or `reference` (a test or a harness comparing against the composed attention, which materializes the scores; named on the load line and as a load warning). No tuning knob moves it.
+    #[opt(flag = "execution-purpose", parser = "parse_purpose", variants = ["production", "reference"], path = "execution.purpose", status = "reference")]
+    pub purpose: String,
     /// Qwen4-exp: how the routed experts are held — `stream` (a slot pool per layer filled from the checkpoint on demand) or `resident` (every expert in memory). Qwen3.5's MoE loads resident whatever it says, with a load warning.
     #[opt(flag = "experts", parser = "parse_experts", variants = ["stream", "resident"], path = "weights.experts.placement", status = "stable", cli = "experts", facets = ["source"], flows = ["weights-in"])]
     pub experts: String,
@@ -1664,6 +1670,7 @@ impl Default for LoadConfig {
             text_only: false,
             warmup: true,
             device: "auto".into(),
+            purpose: "production".into(),
             experts: "stream".into(),
             loader: "pread".into(),
             ple_cache_rows: 0,
@@ -1683,6 +1690,13 @@ impl LoadConfig {
     /// The CPU device was asked for.
     pub fn cpu(&self) -> bool {
         self.device == "cpu"
+    }
+
+    /// The run's execution purpose (`execution.purpose`).
+    pub fn purpose(
+        &self,
+    ) -> std::result::Result<lloom::nn::attention::route::ExecutionPurpose, String> {
+        lloom::nn::attention::route::ExecutionPurpose::parse(&self.purpose)
     }
 }
 

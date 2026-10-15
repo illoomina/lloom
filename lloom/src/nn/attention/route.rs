@@ -111,6 +111,71 @@ impl std::fmt::Display for Uncovered {
     }
 }
 
+/// What a model's attention is built for. The caller that loads the model
+/// declares it; no tuning knob derives it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ExecutionPurpose {
+    /// Chat and serve: on Metal every attention dispatches through a prepared
+    /// route, validated against the device's kernels, whose memory its
+    /// descriptor bounds. A configuration under which any attention takes
+    /// another route is refused at load ([`ExecutionPurpose::admit`]).
+    Production,
+    /// A test or a harness comparing against the composed attention, the
+    /// reference: an attention no prepared route serves may take it, and it
+    /// materializes the scores. The library's default, as LFM2's
+    /// `AttnImpl::Generic` is; the engine declares production unless its run
+    /// says `execution.purpose = reference`.
+    #[default]
+    Reference,
+}
+
+impl ExecutionPurpose {
+    pub fn name(self) -> &'static str {
+        match self {
+            ExecutionPurpose::Production => "production",
+            ExecutionPurpose::Reference => "reference",
+        }
+    }
+
+    pub fn parse(s: &str) -> std::result::Result<Self, String> {
+        match s {
+            "production" => Ok(ExecutionPurpose::Production),
+            "reference" => Ok(ExecutionPurpose::Reference),
+            other => Err(format!(
+                "execution purpose `{other}`: production | reference"
+            )),
+        }
+    }
+
+    /// The attention policy every family applies at load. `composed` names
+    /// why `what`'s attention takes the composed attention on `device` — a
+    /// shape no fused kernel covers, or an option that turns the fused route
+    /// off — and is `None` when every attention dispatches through a prepared
+    /// route. Production refuses a composed attention on Metal whatever
+    /// selected it: the route is what is incompatible, since it materializes
+    /// the scores and has no bounded workspace. Off Metal the composed
+    /// attention is the backend's own and is admitted.
+    pub fn admit(
+        self,
+        what: &str,
+        device: &lloom_tensor::Device,
+        composed: Option<&str>,
+    ) -> Result<()> {
+        match (self, composed) {
+            (ExecutionPurpose::Production, Some(why)) if device.is_metal() => {
+                lloom_tensor::bail!(
+                    "{what}: {why}: that attention takes the composed scores path, which \
+                     materializes the scores and has no bounded workspace; a production load \
+                     on Metal dispatches only through a prepared, bounded-memory attention \
+                     route (execution purpose `production`; `reference` is for tests and \
+                     harnesses)"
+                )
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
 /// The memory one call takes beyond its inputs, in bytes.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct AttentionWorkspace {

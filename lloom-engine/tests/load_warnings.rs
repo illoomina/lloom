@@ -50,6 +50,27 @@ fn write<F: TinyFamily>(dir: &Path, hidden_size: Option<usize>) -> PathBuf {
         .expect("the tiny checkpoint writes")
 }
 
+/// The tiny Qwen4-exp at head dim 32, which its fused attention route
+/// serves, so it loads as production loads it: the template's head dim (16)
+/// is the composed oracle's fixture, which production refuses on Metal.
+#[cfg(feature = "metal")]
+fn write_production_qwen(dir: &Path) -> PathBuf {
+    let mut cfg = Qwen4ExpTiny::template();
+    TinyConfig::set_axis(
+        &mut cfg,
+        "vocab_size",
+        Qwen4ExpTiny::tokenizer().vocab_size(),
+    );
+    assert!(
+        TinyConfig::set_axis(&mut cfg, "head_dim", 32),
+        "head_dim is an axis"
+    );
+    TinyConfig::derive(&mut cfg);
+    TinyCheckpoint::<Qwen4ExpTiny>::new(cfg, Weights::default())
+        .write(dir)
+        .expect("the tiny checkpoint writes")
+}
+
 /// One `lloom chat --raw` turn: its stderr.
 fn chat(model: &Path, extra: &[&str]) -> String {
     let out = Command::new(env!("CARGO_BIN_EXE_lloom"))
@@ -237,9 +258,8 @@ fn a_readback_clamp_reaches_every_surface() {
 #[cfg(feature = "metal")]
 #[test]
 fn qwen4exp_readback_that_reads_its_id_back_warns() {
-    reference_attention();
     let dir = scratch("qwen");
-    let model = write::<Qwen4ExpTiny>(&dir, None);
+    let model = write_production_qwen(&dir);
     let tok = dir.join("tokenizer.json");
     let tok = tok.to_str().unwrap();
     let base = ["--tokenizer", tok, "--experts", "resident"];
@@ -266,7 +286,6 @@ fn qwen4exp_readback_that_reads_its_id_back_warns() {
 #[cfg(feature = "metal")]
 #[test]
 fn an_admitted_emulated_type_reaches_the_engine() {
-    reference_attention();
     use clap::Parser;
     use lloom_engine::app::{load_engine, resolve_options_uninstalled, CommonArgs, Shape};
     use lloom_tensor::{DType, Device};
@@ -278,7 +297,7 @@ fn an_admitted_emulated_type_reaches_the_engine() {
     }
     let dir = scratch("emulated");
     let lfm2 = write::<Lfm2Tiny>(&dir.join("lfm2"), None);
-    let qwen = write::<Qwen4ExpTiny>(&dir.join("qwen"), None);
+    let qwen = write_production_qwen(&dir.join("qwen"));
     let tok = dir.join("qwen/tokenizer.json");
     let lfm2_args = vec![
         "t".to_string(),
@@ -333,12 +352,4 @@ fn an_admitted_emulated_type_reaches_the_engine() {
         engine.shutdown();
     }
     std::fs::remove_dir_all(&dir).ok();
-}
-
-/// The tiny Qwen's head dim (16) has no fused attention path, and a serving
-/// load refuses it on Metal; the test runs it through the composed
-/// reference, asked for by name. Every child the test spawns inherits it.
-#[cfg(feature = "metal")]
-fn reference_attention() {
-    std::env::set_var("QWEN4EXP_REFERENCE_ATTENTION", "1");
 }

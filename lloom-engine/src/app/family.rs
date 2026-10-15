@@ -454,6 +454,7 @@ impl Family for Lfm2Family {
         lfm2::load(lfm2::LoadOptions {
             model_dir: dir,
             cpu: model.cpu(),
+            purpose: model.purpose().map_err(anyhow::Error::msg)?,
             kv_capacity: shape.memory.kv_capacity,
             readback: shape.decode.readback.arm(),
             decode: shape.decode.clone(),
@@ -548,6 +549,7 @@ impl Family for Qwen4ExpFamily {
             first_shard: first,
             tokenizer: model.tokenizer.clone(),
             cpu: model.cpu(),
+            purpose: model.purpose().map_err(anyhow::Error::msg)?,
             kv_capacity: shape.memory.kv_capacity,
             readback: shape.decode.readback.arm(),
             decode: shape.decode.clone(),
@@ -629,6 +631,7 @@ impl Family for Qwen3_5Family {
             first_shard: first,
             tokenizer: model.tokenizer.clone(),
             cpu: model.cpu(),
+            purpose: model.purpose().map_err(anyhow::Error::msg)?,
             kv_capacity: shape.memory.kv_capacity,
             readback: shape.decode.readback.arm(),
             decode: shape.decode.clone(),
@@ -778,23 +781,39 @@ pub fn load(model: &LoadConfig, shape: Shape) -> Result<(Box<dyn Served>, PathBu
     if let Some(note) = &clamp {
         eprintln!("[readback: {note}]");
     }
+    let purpose = model.purpose().map_err(anyhow::Error::msg)?;
     let req = Requested { model, shape };
     family
         .resolve(&req)
         .map_err(|e| anyhow::anyhow!("{} cannot serve this shape: {e}", family.name()))?;
     let mut engine = family.load(checkpoint.clone(), req)?;
-    engine.note_load_warnings_checked(
-        clamp
-            .into_iter()
-            .map(|n| {
-                lloom::load_warning::LoadWarning::new(
-                    lloom::load_warning::LoadWarningKind::Readback,
-                    n,
-                )
-            })
-            .collect(),
-    )?;
+    let mut warnings: Vec<_> = clamp
+        .into_iter()
+        .map(|n| {
+            lloom::load_warning::LoadWarning::new(lloom::load_warning::LoadWarningKind::Readback, n)
+        })
+        .collect();
+    warnings.extend(reference_purpose_warning(purpose));
+    engine.note_load_warnings_checked(warnings)?;
     Ok((engine, checkpoint))
+}
+
+/// A reference load says so, on stderr and as a load warning: its attention
+/// may take the composed scores path, which a production load refuses.
+fn reference_purpose_warning(
+    purpose: lloom::nn::attention::route::ExecutionPurpose,
+) -> Option<lloom::load_warning::LoadWarning> {
+    (purpose == lloom::nn::attention::route::ExecutionPurpose::Reference).then(|| {
+        let note = "execution purpose `reference`: an attention no prepared route serves takes \
+                    the composed attention, which materializes the scores; this is not a \
+                    production load"
+            .to_string();
+        eprintln!("[{note}]");
+        lloom::load_warning::LoadWarning::new(
+            lloom::load_warning::LoadWarningKind::AttentionRoute,
+            note,
+        )
+    })
 }
 
 #[cfg(test)]

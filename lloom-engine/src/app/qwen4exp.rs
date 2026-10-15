@@ -57,6 +57,9 @@ pub struct LoadOptions {
     pub first_shard: PathBuf,
     pub tokenizer: Option<PathBuf>,
     pub cpu: bool,
+    /// What the run is for (`execution.purpose`): production refuses at load
+    /// an attention that takes the composed scores path on Metal.
+    pub purpose: lloom::nn::attention::route::ExecutionPurpose,
     pub kv_capacity: usize,
     pub readback: ReadbackArm,
     /// The decode loop's options (`DecodeConfig`).
@@ -624,9 +627,7 @@ fn load_on<P: QwenShape>(
             _ => None,
         };
         let mload = ModelLoad {
-            // A layer no fused path serves is refused at load, unless the
-            // reference attention is asked for by name.
-            serve: !lloom::tuning::tuning().qwen4exp.reference_attention,
+            purpose: opts.purpose,
             ple_shard: None,
             ple: opts.ple,
             moe_act,

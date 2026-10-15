@@ -32,6 +32,7 @@
 //! The score is fp32 by construction (§15.2a: precision-mandatory).
 
 use super::config::{Config, DEFAULT_KV_PRECISION};
+use crate::nn::attention::route::ExecutionPurpose;
 use crate::nn::kv_quant::QuantKvSlab;
 use crate::nn::ops::KvPrecision;
 use crate::nn::{ops, RmsNorm};
@@ -1417,7 +1418,7 @@ pub struct QsaAttention<P: Profile> {
     /// The fused attention routes on Metal, prepared once: by the loader at
     /// load, or at the first fused call.
     routes: std::sync::OnceLock<std::result::Result<QsaRoutes, String>>,
-    /// Set once [`Self::prepare_for_serving`] accepted the layer: from then
+    /// Set once [`Self::admit`] admitted the layer for production: from then
     /// on the composed attention is refused on Metal. A routes preparation at
     /// a first fused call does not set it.
     serving: std::sync::OnceLock<()>,
@@ -1572,41 +1573,58 @@ impl<P: Profile> QsaAttention<P> {
             .map_err(|e| lloom_tensor::Error::Msg(e.clone()))
     }
 
-    /// Prepare this layer to serve on Metal: every phase on a fused path
-    /// (the decode path's prep kernels serve head dims 32, 64, 96, 128 and
-    /// 256 over divisible heads) and its routes prepared. A serving load
-    /// (`LoadOptions::serve`) calls it, so a shape the fused paths do not
-    /// serve is refused there.
-    pub fn prepare_for_serving(&self, device: &Device) -> Result<()> {
+    /// Why this layer's attention takes the composed path on Metal, if it
+    /// does: the fused paths turned off, or a geometry they do not serve (the
+    /// decode path's prep kernels serve head dims 32, 64, 96, 128 and 256
+    /// over divisible heads). `None` when every phase is on a fused path.
+    pub fn composed_reason(&self) -> Option<String> {
         let hd = self.head_dim;
+        if super::kernels::fused_off() {
+            return Some(
+                "kernels.fusion.disabled (qwen4exp.fused_off) turns the fused qsa paths off".into(),
+            );
+        }
         if !lloom_tensor::shape_req!(
             qsa_fused_head_dim,
             matches!(hd, 32 | 64 | 96 | 128 | 256) && self.n_heads.is_multiple_of(self.n_kv_heads);
             hd
         ) {
-            lloom_tensor::bail!(
-                "qsa: the fused decode path serves head dims 32, 64, 96, 128 and 256 over \
-                 divisible heads, not head dim {hd} over {}/{} heads; the composed attention \
-                 does not serve on Metal",
-                self.n_heads,
-                self.n_kv_heads
-            )
+            return Some(format!(
+                "the fused decode path serves head dims 32, 64, 96, 128 and 256 over \
+                 divisible heads, not head dim {hd} over {}/{} heads",
+                self.n_heads, self.n_kv_heads
+            ));
         }
-        self.prepare_routes(device)?;
-        let _ = self.serving.set(());
+        None
+    }
+
+    /// Admit this layer for `purpose` on `device`, at load
+    /// ([`ExecutionPurpose::admit`]): production refuses a layer whose
+    /// attention takes the composed path on Metal, prepares its routes now so
+    /// a shape they do not serve is refused here, and from then on the layer
+    /// never takes the composed attention on Metal. A reference layer keeps
+    /// the composed path wherever no fused one serves.
+    pub fn admit(&self, purpose: ExecutionPurpose, device: &Device) -> Result<()> {
+        if !device.is_metal() {
+            return Ok(());
+        }
+        purpose.admit("qsa", device, self.composed_reason().as_deref())?;
+        if purpose == ExecutionPurpose::Production {
+            self.prepare_routes(device)?;
+            let _ = self.serving.set(());
+        }
         Ok(())
     }
 
-    /// A layer prepared for serving (as a loader does at load) never falls
-    /// back to the composed attention on Metal, which is the reference: taken
-    /// by a layer no loader prepared (a test fixture) or under
-    /// `qwen4exp.fused_off`.
+    /// A layer admitted for production never falls back to the composed
+    /// attention on Metal, which is the reference: taken by a reference
+    /// layer (a test fixture, a harness).
     fn refuse_composed_on_metal(&self, x: &Tensor, phase: &str) -> Result<()> {
-        if x.device().is_metal() && !super::kernels::fused_off() && self.serving.get().is_some() {
+        if x.device().is_metal() && self.serving.get().is_some() {
             lloom_tensor::bail!(
                 "qsa {phase}: no fused path serves head dim {} at {:?} over {}/{} heads on \
-                 Metal, and the composed attention does not serve (it is the reference arm, \
-                 qwen4exp.fused_off)",
+                 Metal, and a production layer does not take the composed attention (it \
+                 materializes the scores)",
                 self.head_dim,
                 x.dtype(),
                 self.n_heads,
@@ -5521,16 +5539,16 @@ mod tests {
         }
     }
 
-    /// A serving load prepares each layer: a head dim no fused path serves
-    /// is refused there, and a prepared layer never takes the composed
+    /// A production load admits each layer: a head dim no fused path serves
+    /// is refused there, and an admitted layer never takes the composed
     /// attention on Metal — a request every fused path declines (activations
-    /// at f16) is an error naming it. A layer no serving load prepared, as a
-    /// fixture builds it, keeps the composed reference, even after a fused prefill
-    /// prepared its routes (head dim 72: the tiled kernel serves the window,
-    /// no fused path the decode).
+    /// at f16) is an error naming it. A reference layer, as a fixture or a
+    /// reference load builds it, is admitted at any head dim and keeps the
+    /// composed path, even after a fused prefill prepared its routes (head
+    /// dim 72: the tiled kernel serves the window, no fused path the decode).
     #[cfg(feature = "metal")]
     #[test]
-    fn a_layer_prepared_for_serving_never_takes_the_composed_attention_on_metal() -> Result<()> {
+    fn a_layer_admitted_for_production_never_takes_the_composed_attention_on_metal() -> Result<()> {
         let gpu = Device::new_metal(0)?;
         let d = 64;
         let layer = |hd: usize| {
@@ -5560,15 +5578,23 @@ mod tests {
                 &gpu,
             )
         };
-        const REFUSED: &str = "the composed attention does not serve";
+        const REFUSED: &str = "a production layer does not take the composed attention";
 
         for hd in [16, 72] {
-            let err = layer(hd).prepare_for_serving(&gpu).unwrap_err().to_string();
-            assert!(err.contains(&format!("head dim {hd}")), "hd {hd}: {err}");
+            let err = layer(hd)
+                .admit(ExecutionPurpose::Production, &gpu)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains(&format!("head dim {hd}"))
+                    && err.contains("execution purpose `production`"),
+                "hd {hd}: {err}"
+            );
+            layer(hd).admit(ExecutionPurpose::Reference, &gpu)?;
         }
 
         let served = layer(64);
-        served.prepare_for_serving(&gpu)?;
+        served.admit(ExecutionPurpose::Production, &gpu)?;
         served.decode(&tokens(1)?, &mut KvCache::default())?;
         let half = tokens(1)?.to_dtype(DType::F16)?;
         let err = served
@@ -5578,6 +5604,7 @@ mod tests {
         assert!(err.contains(REFUSED), "{err}");
 
         let fixture = layer(72);
+        fixture.admit(ExecutionPurpose::Reference, &gpu)?;
         let mut kv = KvCache::default();
         fixture.prefill(&tokens(3)?, &mut kv)?;
         assert!(fixture.routes.get().is_some_and(|r| r.is_ok()));

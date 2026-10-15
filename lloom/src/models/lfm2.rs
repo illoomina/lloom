@@ -704,6 +704,19 @@ impl AttnRoute {
         })
     }
 
+    /// Why this route takes the composed attention on `device`, if it does —
+    /// on Metal only the reference arm, `AttnImpl::Generic`, does (a fused arm
+    /// a shape no kernel covers is refused by [`Self::resolve`]) — for
+    /// `nn::attention::route::ExecutionPurpose::admit`.
+    pub fn composed_reason(&self, device: &Device) -> Option<String> {
+        (device.is_metal() && self.prepared.is_none()).then(|| {
+            format!(
+                "attention under {:?} is the composed reference attention",
+                self.requested
+            )
+        })
+    }
+
     /// The route, printed at every load.
     pub fn line(&self) -> String {
         match &self.prepared {

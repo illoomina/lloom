@@ -236,3 +236,44 @@ fn the_route_line_names_both_phases() {
     let line = prepare(spec(80, MaskKind::Causal)).describe();
     assert!(line.contains("one query -> steel_attention"), "{line}");
 }
+
+/// The execution purpose admits by route, not by what selected it: on Metal
+/// production refuses any composed attention, naming the reason it was
+/// given and the purpose; the reference admits it; a prepared route (no
+/// reason) is admitted under both; off Metal the composed attention is the
+/// backend's own and both purposes admit it.
+#[test]
+fn production_refuses_a_composed_attention_on_metal_and_only_there() {
+    use lloom_tensor::Device;
+    let why = "a knob turned the fused route off";
+    let cpu = Device::Cpu;
+    for purpose in [ExecutionPurpose::Production, ExecutionPurpose::Reference] {
+        purpose.admit("fixture", &cpu, Some(why)).unwrap();
+        purpose.admit("fixture", &cpu, None).unwrap();
+    }
+    assert_eq!(ExecutionPurpose::default(), ExecutionPurpose::Reference);
+    for s in ["production", "reference"] {
+        assert_eq!(ExecutionPurpose::parse(s).unwrap().name(), s);
+    }
+    assert!(ExecutionPurpose::parse("serve").is_err());
+    #[cfg(feature = "metal")]
+    {
+        let gpu = Device::new_metal(0).unwrap();
+        ExecutionPurpose::Reference
+            .admit("fixture", &gpu, Some(why))
+            .unwrap();
+        ExecutionPurpose::Production
+            .admit("fixture", &gpu, None)
+            .unwrap();
+        let err = ExecutionPurpose::Production
+            .admit("fixture", &gpu, Some(why))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.starts_with(&format!("fixture: {why}: "))
+                && err.contains("materializes the scores")
+                && err.contains("execution purpose `production`"),
+            "{err}"
+        );
+    }
+}

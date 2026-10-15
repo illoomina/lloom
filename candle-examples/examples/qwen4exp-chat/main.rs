@@ -106,6 +106,12 @@ mod sha256;
 #[derive(Parser, Debug)]
 #[command(about = "Qwen3.8-Flash-Next real-model light gate: digest + text, greedy")]
 struct Args {
+    /// What the attention is built for: `production` (every attention on a
+    /// prepared route, a composed one refused at load) or `reference` (the
+    /// composed attention admitted, to compare against).
+    #[arg(long, default_value = "production")]
+    purpose: String,
+
     /// The first GGUF shard (`-00001-of-0000N`); the siblings are found next
     /// to it. Default: the HF cache's ISTA-DASLab IQ3_XXS snapshot.
     #[arg(long)]
@@ -785,7 +791,8 @@ fn run<P: QwenShape>(args: Args) -> Result<()> {
             .transpose()
             .map_err(anyhow::Error::msg)?,
         machine: None,
-        serve: true,
+        purpose: lloom::nn::attention::route::ExecutionPurpose::parse(&args.purpose)
+            .map_err(anyhow::Error::msg)?,
     };
     let mem_check = mem_check_arm(&args)?;
     let prefill_mode = match args.prefill.as_str() {

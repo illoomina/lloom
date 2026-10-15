@@ -359,6 +359,7 @@ impl MmprojVision {
         tokenizer: &Tokenizer,
         text_hidden: usize,
         device: &Device,
+        purpose: lloom::nn::attention::route::ExecutionPurpose,
     ) -> Result<Self> {
         use lloom_tensor::quantized::gguf_file::Content;
         let image_token_id = tokenizer.token_to_id("<image>").ok_or_else(|| {
@@ -380,14 +381,7 @@ impl MmprojVision {
             dtype,
             device,
         )?;
-        if device.is_metal() {
-            if let Some(why) = encoder.reference_attention() {
-                return Err(Error::msg(format!(
-                    "{why}: no fused kernel covers the mmproj vision tower's attention, and the \
-                     composed attention does not serve on Metal"
-                )));
-            }
-        }
+        purpose.admit("mmproj vision tower", device, encoder.reference_attention())?;
         Ok(Self {
             encoder,
             config,
@@ -893,6 +887,7 @@ fn produce_lfm2_gguf(
         tokenizer_path,
         policy_source,
         device,
+        lloom::nn::attention::route::ExecutionPurpose::Production,
         decode,
         |_, _, _| Ok(()),
     )
@@ -905,6 +900,7 @@ fn produce_lfm2_gguf_with<T>(
     tokenizer_path: TokenizerSource<'_>,
     policy_source: Option<CausalPolicySource>,
     device: &Device,
+    purpose: lloom::nn::attention::route::ExecutionPurpose,
     decode: DecodeConfig,
     preflight: impl FnOnce(
         &lloom::models::quantized_lfm2::Config,
@@ -969,16 +965,9 @@ fn produce_lfm2_gguf_with<T>(
     }
     let prepared = preflight(&config, &tokenizer, policy.as_ref())?;
     let model = plan.materialize(&mut file, device)?;
-    if device.is_metal() {
-        if let Some(why) = model.reference_attention() {
-            lloom_tensor::bail!(
-                "{why}: no fused kernel covers this model's attention, and the composed \
-                 attention does not serve on Metal"
-            )
-        }
-    }
+    purpose.admit("lfm2-gguf", device, model.reference_attention())?;
     let vision = mmproj
-        .map(|path| MmprojVision::load(path, &tokenizer, config.hidden_size, device))
+        .map(|path| MmprojVision::load(path, &tokenizer, config.hidden_size, device, purpose))
         .transpose()?;
     let cache = model.new_cache()?;
     Ok((

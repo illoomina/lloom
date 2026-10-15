@@ -4393,11 +4393,13 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
     }
 
     /// The fetch worker's counters (zeros before the first fetching step,
-    /// or off Metal).
+    /// or off Metal), settled: every job registered so far is done before
+    /// the counters are read (`FetchLane::settled_stats`), so a snapshot
+    /// taken right after a decode counts the decode's last job.
     pub fn fetch_stats(&self) -> crate::nn::expert_stream::FetchStats {
         #[cfg(feature = "metal")]
         if let Some(Some(l)) = self.fetch_lane.get() {
-            return l.stats();
+            return l.settled_stats();
         }
         crate::nn::expert_stream::FetchStats::default()
     }

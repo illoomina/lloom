@@ -1437,35 +1437,8 @@ impl Front {
         if decoded.tokens.is_empty() {
             return frontier;
         }
-        let Some(full) = decode(text, &decoded.tokens) else {
+        let Some((n, partial)) = accepted(text, &decoded.tokens, &decoded.text) else {
             return frontier;
-        };
-        let (n, partial) = if full == decoded.text {
-            (decoded.tokens.len(), 0)
-        } else {
-            let Some(u) = units(text, &decoded.tokens, 0) else {
-                return frontier;
-            };
-            let delivered = decoded.text.as_str();
-            let mut at = 0;
-            let mut kept = 0;
-            let mut next = None;
-            for (r, s) in &u {
-                if !delivered[at..].starts_with(s.as_str()) {
-                    next = Some(s.as_str());
-                    break;
-                }
-                at += s.len();
-                kept = r.end;
-                if at == delivered.len() {
-                    break;
-                }
-            }
-            let rest = &delivered[at..];
-            if !rest.is_empty() && !next.is_some_and(|s| s.starts_with(rest)) {
-                return frontier;
-            }
-            (kept, rest.len())
         };
         frontier.accepted = n;
         frontier.partial = partial;
@@ -1602,6 +1575,37 @@ pub fn logprobs_refused_on(body: lloom::nn::Body) -> Option<String> {
     lloom::nn::refuse(body, &asks)
         .err()
         .map(|e| format!("this process decodes through {name}: {e}"))
+}
+
+/// Of `tokens`, the longest prefix of whole units whose text `delivered`
+/// begins with, and `delivered`'s bytes past it — which must begin the next
+/// unit's text: the accepted frontier ([`Frontier`]). `None` where
+/// `delivered` is not that (not the run's text).
+pub fn accepted(text: &Text, tokens: &[u32], delivered: &str) -> Option<(usize, usize)> {
+    let full = decode(text, tokens)?;
+    if full == delivered {
+        return Some((tokens.len(), 0));
+    }
+    let u = units(text, tokens, 0)?;
+    let mut at = 0;
+    let mut kept = 0;
+    let mut next = None;
+    for (r, s) in &u {
+        if !delivered[at..].starts_with(s.as_str()) {
+            next = Some(s.as_str());
+            break;
+        }
+        at += s.len();
+        kept = r.end;
+        if at == delivered.len() {
+            break;
+        }
+    }
+    let rest = &delivered[at..];
+    if !rest.is_empty() && !next.is_some_and(|s| s.starts_with(rest)) {
+        return None;
+    }
+    Some((kept, rest.len()))
 }
 
 fn decode(text: &Text, ids: &[u32]) -> Option<String> {

@@ -260,10 +260,7 @@ fn run_owner(
         .check()
         .map_err(|e| anyhow::anyhow!("the checkpoint's generation_config.json: {e}"))?;
     let description = engine.describe_checked()?;
-    let logprobs = match front::logprobs_refused(engine.as_ref()) {
-        None => format!("served(top<={})", lloom::nn::MAX_TOP_LOGPROBS),
-        Some(why) => format!("refused({why})"),
-    };
+    let logprobs = logprobs_line(engine.as_ref());
     if let Some((load_start, reuse_prefix)) = load_facts {
         eprintln!(
             "[loaded {} from {} in {:.2}s on {:?}; kv_capacity={} readback={} reuse_prefix={} logprobs={logprobs} {}]",
@@ -857,14 +854,14 @@ fn completions(shared: &Shared, v: &Value, _headers: &[Header]) -> Handled<Reply
     Ok(Reply::Json(body))
 }
 
-/// OpenAI's completions `logprobs`: per returned id its token, its
+/// OpenAI's completions `logprobs`: per delivered id its token, its
 /// log-probability, the top tokens asked for, and its text's offset.
 fn completion_logprobs(engine: &dyn Served, d: &Decoded) -> Result<Value> {
     let Some(lp) = &d.logprobs else {
         return Ok(Value::Null);
     };
-    let tokens = d
-        .tokens
+    let n = delivered_ids(engine, d);
+    let tokens = d.tokens[..n]
         .iter()
         .map(|&t| engine.token_str_checked(t))
         .collect::<Result<Vec<String>>>()?;
@@ -877,8 +874,7 @@ fn completion_logprobs(engine: &dyn Served, d: &Decoded) -> Result<Value> {
             o
         })
         .collect();
-    let top = lp
-        .top
+    let top = lp.top[..n.min(lp.top.len())]
         .iter()
         .map(|t| {
             Ok(Value::Object(
@@ -890,14 +886,13 @@ fn completion_logprobs(engine: &dyn Served, d: &Decoded) -> Result<Value> {
         .collect::<Result<Vec<Value>>>()?;
     // OpenAI's `top_logprobs` keys by the token's text, and two ids can
     // share one (the halves of a character); `top_ids` keeps the ids.
-    let top_ids: Vec<Value> = lp
-        .top
+    let top_ids: Vec<Value> = lp.top[..n.min(lp.top.len())]
         .iter()
         .map(|t| json!(t.iter().map(|&(id, l)| json!([id, l])).collect::<Vec<_>>()))
         .collect();
     Ok(json!({
         "tokens": tokens,
-        "token_logprobs": lp.sampled,
+        "token_logprobs": &lp.sampled[..n.min(lp.sampled.len())],
         "top_logprobs": top,
         "top_ids": top_ids,
         "text_offset": offsets,
@@ -934,7 +929,11 @@ fn chat_completions(shared: &Shared, v: &Value) -> Handled<Reply> {
     let mut params = sampling_params(shared, v)?;
     let wanted = request_budgets(shared, v, params.max_tokens)?;
     let stream = v.get("stream").and_then(Value::as_bool).unwrap_or(false);
-    let want_logprobs = v.get("logprobs").and_then(Value::as_bool).unwrap_or(false);
+    let want_logprobs = match v.get("logprobs") {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(b)) => *b,
+        Some(_) => return Err(bad("field 'logprobs' must be a boolean")),
+    };
     let mut kwargs = request_kwargs(v, &REQUEST_FIELDS).map_err(bad)?;
     let want = kwargs.get(ENABLE_THINKING).and_then(Value::as_bool);
     thinking::set_kwarg(shared.engine.as_ref(), want, &mut kwargs);
@@ -1071,8 +1070,9 @@ fn chat_completions(shared: &Shared, v: &Value) -> Handled<Reply> {
             return Err(bad("logprobs with an image is not supported"));
         }
     }
-    // OpenAI's bound: up to 20 candidates beside each drawn id, asked with
-    // `logprobs`.
+    // Candidates beside each drawn id, asked with `logprobs`: up to lloom's
+    // `MAX_TOP_LOGPROBS`, an extension past the 20 OpenAI's chat API
+    // documents (no strict-compatibility bound is applied here).
     let top_logprobs = match v.get("top_logprobs") {
         None | Some(Value::Null) => None,
         Some(n) => Some(
@@ -1089,7 +1089,7 @@ fn chat_completions(shared: &Shared, v: &Value) -> Handled<Reply> {
     if top_logprobs.is_some() && !want_logprobs {
         return Err(bad("top_logprobs asks for logprobs: set logprobs to true"));
     }
-    let top_k = top_logprobs.unwrap_or(1).max(1);
+    let top_k = top_logprobs.unwrap_or(0);
     // Past one token, each returned id carries its log-probability (and the
     // top `top_logprobs`), from the run's own steps.
     let return_ids = v
@@ -1133,15 +1133,17 @@ fn chat_completions(shared: &Shared, v: &Value) -> Handled<Reply> {
         // token is scored wherever it ranks.
         let engine = shared.engine.as_ref();
         let started = Instant::now();
+        // The drawn id's own log-probability needs its row's head even when
+        // no candidate beside it is asked (`top_logprobs` 0).
         let want = if options.is_empty() {
-            top_k
+            top_k.max(1)
         } else {
             usize::MAX
         };
         let (argmax, all) = engine.next_token_logprobs(&prompt_ids, want)?;
         let top = &all[..top_k.min(all.len())];
         let content = engine.token_str_checked(argmax)?;
-        let token_lp = top
+        let token_lp = all
             .iter()
             .find(|(t, _)| *t == argmax)
             .map(|(_, lp)| *lp)
@@ -1334,14 +1336,29 @@ fn logprob_request(
     }
 }
 
-/// OpenAI's chat `logprobs.content`: per returned id, its token, its
+/// The returned ids a logprobs block lists beside the text: every id, unless
+/// the server withheld text from the reply (a stop string, a fragment the
+/// consumer refused); then the ids whose text the delivered text is — the
+/// accepted frontier (`front::accepted`) — so the withheld text does not
+/// reach the client through its tokens. `token_ids` / `token_logprobs`
+/// carry every id either way. Every id on a family with no text side.
+fn delivered_ids(engine: &dyn Served, d: &Decoded) -> usize {
+    match (d.stop, engine.text()) {
+        (Stop::StopString | Stop::Cancelled, Some(t)) => {
+            front::accepted(t, &d.tokens, &d.text).map_or(0, |(n, _)| n)
+        }
+        _ => d.tokens.len(),
+    }
+}
+
+/// OpenAI's chat `logprobs.content`: per delivered id, its token, its
 /// log-probability and the `top_logprobs` asked for.
 fn chat_logprobs(engine: &dyn Served, d: &Decoded) -> Result<Value> {
     let Some(lp) = &d.logprobs else {
         return Ok(Value::Null);
     };
-    let content = d
-        .tokens
+    let n = delivered_ids(engine, d);
+    let content = d.tokens[..n]
         .iter()
         .zip(&lp.sampled)
         .enumerate()
@@ -2849,6 +2866,51 @@ fn respond_metadata(request: Request, result: Result<Value>) -> Result<()> {
     }
 }
 
+/// What this process's logprobs surface accepts (decision 48): per route,
+/// the most candidates beside each id — lloom's `MAX_TOP_LOGPROBS`, an
+/// extension past the 0–20 OpenAI's chat API documents — and where it is
+/// refused. A generating request's per-token logprobs are refused where
+/// the decode body reads no row (`front::logprobs_refused`), and with
+/// `stream`; on the chat route with an image too. The one-forward decision
+/// scoring (`max_tokens: 1`) reads its row whatever the body.
+fn logprobs_capability(engine: &dyn Served) -> Value {
+    let top = lloom::nn::MAX_TOP_LOGPROBS;
+    let refused = front::logprobs_refused(engine);
+    let generating = match &refused {
+        None => json!({ "served": true, "top_max": top, "stream": false }),
+        Some(why) => json!({ "served": false, "refused": why }),
+    };
+    let mut chat = generating.clone();
+    chat["images"] = json!(false);
+    let mut body = json!({
+        "served": refused.is_none(),
+        "top_max": top,
+        "openai_documented_top_max": OPENAI_TOP_LOGPROBS,
+        "routes": {
+            "/v1/chat/completions": chat,
+            "/v1/completions": generating,
+            "decision": { "served": true, "top_max": top, "options": "every candidate" },
+        },
+    });
+    if let Some(why) = refused {
+        body["refused"] = json!(why);
+    }
+    body
+}
+
+/// The `top_logprobs` bound OpenAI's chat API documents: reported beside
+/// lloom's own, never applied (no strict-compatibility adapter is built).
+const OPENAI_TOP_LOGPROBS: usize = 20;
+
+/// [`logprobs_capability`] as the load line's `logprobs=` field.
+fn logprobs_line(engine: &dyn Served) -> String {
+    let top = lloom::nn::MAX_TOP_LOGPROBS;
+    match front::logprobs_refused(engine) {
+        None => format!("served(top<={top},stream=refused) decision_logprobs=top<={top}"),
+        Some(why) => format!("refused({why}) decision_logprobs=top<={top}"),
+    }
+}
+
 fn health_body(engine: &dyn Served, front: &Front) -> Result<Value> {
     let mut body = engine.health_checked()?;
     body["mem"] = MemSnapshot::read(engine.device()).json();
@@ -2859,12 +2921,7 @@ fn health_body(engine: &dyn Served, front: &Front) -> Result<Value> {
     body["template_renders"] = json!(engine.template_renders());
     body["tokenizations"] = json!(front.tokenizations());
     body["session_log"] = json!(front.logged());
-    // Whether a request's per-token logprobs are served here, and why not.
-    body["logprobs"] = match front::logprobs_refused(engine) {
-        None => json!({ "served": true, "top_max": lloom::nn::MAX_TOP_LOGPROBS }),
-        Some(why) => json!({ "served": false, "top_max": lloom::nn::MAX_TOP_LOGPROBS,
-                             "refused": why }),
-    };
+    body["logprobs"] = logprobs_capability(engine);
     body["chat_template_reads"] = ENGINE_KWARGS
         .iter()
         .map(|&k| (k.to_string(), json!(engine.template_reads(k))))
@@ -3978,6 +4035,29 @@ mod checked_trailer_tests {
         assert!(
             text.ends_with("0\r\n\r\n"),
             "success lost chunk termination"
+        );
+    }
+}
+
+#[cfg(test)]
+mod logprob_request_tests {
+    use super::logprob_request;
+    use crate::LogprobRequest;
+
+    /// A request that asks no logprobs, on a session that keeps none,
+    /// captures nothing: the run reads no row and takes no blocking arm for
+    /// them. Asked 0 is the drawn id's log-probability alone.
+    #[test]
+    fn a_text_only_request_captures_no_row() {
+        assert_eq!(logprob_request(None, None), None);
+        assert_eq!(
+            logprob_request(Some(0), None),
+            Some(LogprobRequest { top: 0, rows: false })
+        );
+        assert_eq!(
+            logprob_request(None, Some(LogprobRequest { top: 0, rows: true })),
+            Some(LogprobRequest { top: 0, rows: true }),
+            "the session's own keep, never serialised unless asked"
         );
     }
 }

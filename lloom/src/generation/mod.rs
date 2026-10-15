@@ -63,7 +63,58 @@ pub enum Sampling {
     },
 }
 
+/// A temperature below this draws greedily (`DecodeParams::sampling_of`'s
+/// threshold): `1/T` would pass 10⁷ and the draw is the argmax but for ties.
+pub const GREEDY_BELOW: f64 = 1e-7;
+
 impl Sampling {
+    /// The arm a request's sampling fields name, every field validated
+    /// whether or not the arm reads it (`docs/dispatch.md` §11.2j's edges).
+    ///
+    /// - `temperature`: unset, or below [`GREEDY_BELOW`], is greedy; a value
+    ///   that is not a finite number `>= 0` is refused.
+    /// - `top_k`: 0 is off; a `k` at least the vocabulary is off where the
+    ///   row is known (the filter's).
+    /// - `top_p`: 1 is off, 0 keeps the top candidate; a value outside
+    ///   [0, 1] is refused.
+    /// - `gumbel` draws over the whole vocabulary, so it refuses an active
+    ///   top-k or top-p rather than ignoring it.
+    pub fn resolve(
+        temperature: Option<f64>,
+        top_k: Option<usize>,
+        top_p: Option<f64>,
+        gumbel: bool,
+    ) -> Result<Sampling> {
+        if let Some(t) = temperature.filter(|t| !(t.is_finite() && *t >= 0.0)) {
+            lloom_tensor::bail!("temperature must be a finite number >= 0, got {t}");
+        }
+        if let Some(p) = top_p.filter(|p| !(0.0..=1.0).contains(p)) {
+            lloom_tensor::bail!("top_p must be a number in [0, 1], got {p}");
+        }
+        let k = top_k.filter(|&k| k > 0);
+        let p = top_p.filter(|&p| p < 1.0);
+        let temperature = match temperature {
+            Some(t) if t >= GREEDY_BELOW => t,
+            _ => return Ok(Sampling::ArgMax),
+        };
+        if gumbel {
+            if k.is_some() || p.is_some() {
+                lloom_tensor::bail!(
+                    "the gumbel method draws over the whole vocabulary and takes no top_k or \
+                     top_p (got top_k {top_k:?}, top_p {top_p:?}); the multinomial method \
+                     filters"
+                );
+            }
+            return Ok(Sampling::GumbelSoftmax { temperature });
+        }
+        Ok(match (k, p) {
+            (Some(k), Some(p)) => Sampling::TopKThenTopP { k, p, temperature },
+            (Some(k), None) => Sampling::TopK { k, temperature },
+            (None, Some(p)) => Sampling::TopP { p, temperature },
+            (None, None) => Sampling::All { temperature },
+        })
+    }
+
     /// The arm as a report line names it: the method and its parameters.
     pub fn name(&self) -> String {
         match self {

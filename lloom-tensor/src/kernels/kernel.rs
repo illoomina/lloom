@@ -503,7 +503,7 @@ pub fn fast_math_enabled() -> bool {
     crate::tuning::tuning().metal.fast_math
 }
 
-fn get_compile_options() -> Retained<MTLCompileOptions> {
+pub(crate) fn get_compile_options() -> Retained<MTLCompileOptions> {
     let compile_options = MTLCompileOptions::new();
     //unsafe { compile_options.setEnableLogging(true) };
 

@@ -11646,6 +11646,393 @@ fn inverse_cdf_row_matches_the_f64_definition() {
     assert!(checked > 150, "only {checked} draws compared");
 }
 
+/// The multinomial kernel CAN draw a masked token, at a rounding edge: its
+/// lanes' intervals come from a Hillis–Steele scan, whose association differs
+/// lane to lane, so a lane holding no mass can still hold a non-empty
+/// interval, and the walk over it falls back to the lane's first token.
+///
+/// The row: ids 0 and 1 weigh `w ≈ 4.2e-8` (in `(2^-25, 2^-24]`), id 2 is the
+/// maximum (weight 1), every other id is `-inf`. One id per lane (V = 1024).
+/// The scan gives lane 2 `(w + w) + 1 = 1` but lane 3 `(0 + 1) + (w + w) =
+/// 1 + 2^-23`, and the total is `1 + 2^-23`; `u` just below 1 targets `1.0`,
+/// which lane 3's interval `[1, 1 + 2^-23)` holds — and so do other empty
+/// lanes', the scan being non-monotone there, so several lanes race to write
+/// the pick. Every draw lands on a masked id.
+///
+/// Pinned rather than fixed (`docs/dispatch.md` §11.2j, open question 1):
+/// the contract's `mass` is monotone and its draw cannot land on a
+/// zero-weight token; this test flips when the multinomial arm adopts it.
+#[test]
+fn sample_inverse_cdf_can_draw_a_masked_token_at_a_rounding_edge() {
+    let vocab = 1024;
+    let mut row = vec![f32::NEG_INFINITY; vocab];
+    row[0] = -16.98;
+    row[1] = -16.98;
+    row[2] = 0.0;
+    let reps = 16;
+    let rows: Vec<f32> = (0..reps).flat_map(|_| row.iter().copied()).collect();
+    let got = run_inverse_cdf(&rows, vocab, 1.0, &vec![0.999_999_94f32; reps]);
+    let masked = got
+        .iter()
+        .filter(|&&g| row[g as usize] == f32::NEG_INFINITY)
+        .count();
+    let mut distinct = got.clone();
+    distinct.sort_unstable();
+    distinct.dedup();
+    println!("INVERSE_CDF_MASKED_EDGE draws={reps} masked={masked} ids={distinct:?}");
+    assert_eq!(
+        masked, reps,
+        "the kernel no longer draws a masked token here: the defect this pins is gone"
+    );
+}
+
+// ---- the top-k / top-p contract's arithmetic on Metal ------------------------
+//
+// The contract (`design/docs/dispatch.md` §11.2j) pins its exponential and its
+// sum, so a Metal kernel and the host compute the same f32 bits. These compile
+// the two definitions under the shipping compile options
+// (`kernel::get_compile_options`: fast math, the fast math-function set) and
+// compare them with the host's bit for bit. They are the premise the
+// contract's numerical policy rests on, checked before a kernel is built on
+// it; the kernels themselves are tested against the contract's reference.
+
+const CONTRACT_ARITH_SRC: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+static float exp32(float x) {
+    if (!(x >= -87.0f)) {
+        return 0.0f;
+    }
+    float n = rint(x * as_type<float>(0x3fb8aa3bu));
+    float r = fma(n, -as_type<float>(0x3f318000u), x);
+    r = fma(n, -as_type<float>(0xb95e8083u), r);
+    float a = fma(as_type<float>(0x39506967u), r, as_type<float>(0x3ab743ceu));
+    a = fma(a, r, as_type<float>(0x3c088908u));
+    a = fma(a, r, as_type<float>(0x3d2aa9c1u));
+    a = fma(a, r, as_type<float>(0x3e2aaaaau));
+    a = fma(a, r, as_type<float>(0x3f000000u));
+    float r2 = r * r;
+    float y = fma(a, r2, r) + 1.0f;
+    return y * as_type<float>(uint(int(n) + 127) << 23);
+}
+
+kernel void contract_exp32(
+    device const uint *x [[buffer(0)]],
+    device uint *out [[buffer(1)]],
+    uint i [[thread_position_in_grid]]
+) {
+    out[i] = as_type<uint>(exp32(as_type<float>(x[i])));
+}
+
+kernel void contract_weight(
+    device const float *z [[buffer(0)]],
+    constant float &m [[buffer(1)]],
+    constant float &inv_t [[buffer(2)]],
+    device uint *out [[buffer(3)]],
+    uint i [[thread_position_in_grid]]
+) {
+    out[i] = as_type<uint>(exp32((z[i] - m) * inv_t));
+}
+
+kernel void contract_mass(
+    device const float *a [[buffer(0)]],
+    constant uint &n [[buffer(1)]],
+    device float *out [[buffer(2)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint l [[thread_position_in_threadgroup]]
+) {
+    threadgroup float lanes[1024];
+    threadgroup float groups[32];
+    device const float *r = a + (ulong)row * n;
+    uint c = (n + 1023) / 1024;
+    uint lo = min(l * c, n);
+    uint hi = min(lo + c, n);
+    float s = 0.0f;
+    for (uint i = lo; i < hi; ++i) {
+        s += r[i];
+    }
+    lanes[l] = s;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (l < 32) {
+        float g = 0.0f;
+        for (uint j = 0; j < 32; ++j) {
+            g += lanes[32 * l + j];
+        }
+        groups[l] = g;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (l == 0) {
+        float t = 0.0f;
+        for (uint j = 0; j < 32; ++j) {
+            t += groups[j];
+        }
+        out[row] = t;
+    }
+}
+"#;
+
+/// The host side of the probe: the contract's exponential and sum, as the
+/// reference (`tests/sampling_contract/oracle.rs`) defines them.
+#[allow(clippy::neg_cmp_op_on_partial_ord)] // -inf must take the branch
+fn contract_exp32_host(x: f32) -> f32 {
+    if !(x >= -87.0) {
+        return 0.0;
+    }
+    let f = f32::from_bits;
+    let n = (x * f(0x3fb8_aa3b)).round_ties_even();
+    let r = n.mul_add(-f(0x3f31_8000), x);
+    let r = n.mul_add(-f(0xb95e_8083), r);
+    let mut a = f(0x3950_6967).mul_add(r, f(0x3ab7_43ce));
+    for c in [0x3c08_8908, 0x3d2a_a9c1, 0x3e2a_aaaa, 0x3f00_0000] {
+        a = a.mul_add(r, f(c));
+    }
+    let y = a.mul_add(r * r, r) + 1.0;
+    y * f((((n as i32) + 127) as u32) << 23)
+}
+
+fn contract_mass_host(a: &[f32]) -> f32 {
+    let c = a.len().div_ceil(1024);
+    let lanes: Vec<f32> = (0..1024)
+        .map(|l| {
+            let lo = (l * c).min(a.len());
+            let hi = (lo + c).min(a.len());
+            a[lo..hi].iter().fold(0f32, |s, &x| s + x)
+        })
+        .collect();
+    lanes
+        .chunks(32)
+        .map(|g| g.iter().fold(0f32, |s, &x| s + x))
+        .fold(0f32, |s, x| s + x)
+}
+
+fn contract_pipeline(name: &str) -> ComputePipeline {
+    let device = device();
+    let options = super::kernel::get_compile_options();
+    let library = device
+        .new_library_with_source(CONTRACT_ARITH_SRC, Some(&options))
+        .unwrap();
+    let function = library.get_function(name, None).unwrap();
+    device
+        .new_compute_pipeline_state_with_function(&function)
+        .unwrap()
+}
+
+/// Run `pipeline` over `n` threads in groups of `group`, binding `inputs`
+/// then one `u32` output of `outputs` words, and read the output.
+fn contract_run(
+    pipeline: &ComputePipeline,
+    inputs: &[Buffer],
+    bytes: &[f32],
+    outputs: usize,
+    grid: (usize, usize),
+) -> Vec<u32> {
+    let device = device();
+    let commands = commands(&device);
+    let encoder = commands.command_encoder().unwrap();
+    let out = new_buffer(&device, &vec![u32::MAX; outputs]);
+    let enc: &ComputeCommandEncoder = encoder.as_ref();
+    enc.set_compute_pipeline_state(pipeline);
+    // SAFETY: the test owns every buffer bound here and reads the output only
+    // after waiting for the command buffer that writes it.
+    unsafe {
+        for (i, b) in inputs.iter().enumerate() {
+            enc.set_input_buffer(i, Some(b), 0);
+        }
+        for (j, x) in bytes.iter().enumerate() {
+            enc.set_bytes(inputs.len() + j, x);
+        }
+        enc.set_output_buffer(inputs.len() + bytes.len(), Some(&out), 0);
+    }
+    enc.dispatch_thread_groups(
+        MTLSize {
+            width: grid.0,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: grid.1,
+            height: 1,
+            depth: 1,
+        },
+    );
+    drop(encoder);
+    commands.wait_until_completed().unwrap();
+    read_to_vec::<u32>(&out, outputs)
+}
+
+/// `exp32` on Metal is the host's, bit for bit, over every `stride`-th f32 of
+/// its domain [-87, 0] and the points either side of its ends.
+fn contract_exp32_sweep(stride: u32) -> usize {
+    let pipeline = contract_pipeline("contract_exp32");
+    let lo = (-87.0f32).to_bits();
+    let ends = [
+        0,
+        lo,
+        (-87.0f32).next_down().to_bits(),
+        (-87.0f32).next_up().to_bits(),
+        f32::NEG_INFINITY.to_bits(),
+        f32::MIN.to_bits(),
+    ];
+    let mut domain = ((-0.0f32).to_bits()..=lo)
+        .step_by(stride as usize)
+        .chain(ends);
+    let mut differ = Vec::new();
+    let mut n = 0;
+    loop {
+        let chunk: Vec<u32> = domain.by_ref().take(1 << 22).collect();
+        if chunk.is_empty() {
+            break;
+        }
+        let got = contract_run(
+            &pipeline,
+            &[new_buffer(&device(), &chunk)],
+            &[],
+            chunk.len(),
+            (chunk.len().div_ceil(256), 256),
+        );
+        for (k, &x) in chunk.iter().enumerate() {
+            let want = contract_exp32_host(f32::from_bits(x)).to_bits();
+            if got[k] != want && differ.len() < 8 {
+                differ.push(format!(
+                    "x={:e} metal={:#010x} host={want:#010x}",
+                    f32::from_bits(x),
+                    got[k]
+                ));
+            }
+        }
+        n += chunk.len();
+    }
+    assert!(differ.is_empty(), "exp32 differs on Metal: {differ:?}");
+    n
+}
+
+/// The contract's exponential under the shipping compile options equals the
+/// host's on every 61st f32 of its domain (18 million inputs).
+#[test]
+fn contract_exp32_on_metal_matches_the_host() {
+    let n = contract_exp32_sweep(61);
+    println!("CONTRACT_EXP32 inputs={n} differ=0");
+    assert!(n > 18_000_000, "{n}");
+}
+
+/// The same over EVERY f32 of the domain (1.1 billion inputs): run by hand.
+#[test]
+#[ignore = "exhaustive: about a minute on the M1 Max; run by hand"]
+fn contract_exp32_on_metal_matches_the_host_exhaustively() {
+    let n = contract_exp32_sweep(1);
+    println!("CONTRACT_EXP32_EXHAUSTIVE inputs={n} differ=0");
+}
+
+/// A weight is `exp32((z - m) · inv_t)`, the subtraction and the product each
+/// rounded: under fast math the two must stay two roundings, on Metal as on
+/// the host.
+#[test]
+fn contract_weight_on_metal_matches_the_host() {
+    let pipeline = contract_pipeline("contract_weight");
+    let mut s = 0x1036_u32;
+    let z: Vec<f32> = (0..1 << 20)
+        .map(|_| {
+            s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            ((s >> 8) as f32 / (1u32 << 24) as f32) * 40.0 - 30.0
+        })
+        .collect();
+    let m = z.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let mut differ = 0;
+    for inv_t in [
+        1.0f32,
+        (1.0 / 0.7) as f32,
+        (1.0 / 1.3) as f32,
+        (1.0 / 0.1) as f32,
+    ] {
+        let got = contract_run(
+            &pipeline,
+            &[new_buffer(&device(), &z)],
+            &[m, inv_t],
+            z.len(),
+            (z.len() / 256, 256),
+        );
+        for (i, &x) in z.iter().enumerate() {
+            if got[i] != contract_exp32_host((x - m) * inv_t).to_bits() {
+                differ += 1;
+            }
+        }
+    }
+    println!("CONTRACT_WEIGHT inputs={} differ={differ}", 4 * z.len());
+    assert_eq!(differ, 0);
+}
+
+/// The contract's sum — 1024 lanes folded in id order, 32 groups of 32
+/// lanes, the groups folded — on Metal under fast math is the host's, bit for
+/// bit, at both production vocabularies and a small one, over magnitudes
+/// spanning the weights' range (where a reassociated sum would differ).
+#[test]
+fn contract_mass_on_metal_matches_the_host() {
+    let pipeline = contract_pipeline("contract_mass");
+    assert!(
+        pipeline.max_total_threads_per_threadgroup() >= 1024,
+        "the probe needs 1024 lanes in one threadgroup"
+    );
+    let mut s = 0xfeed_u32;
+    let (mut rows, mut reassociated) = (0, 0);
+    for &n in &[37usize, 128_000, 248_320] {
+        let r = 8;
+        let a: Vec<f32> = (0..n * r)
+            .map(|_| {
+                s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                let e = ((s >> 24) % 50) as i32 - 45;
+                ((s >> 8) & 0xffff) as f32 / 65_536.0 * 2f32.powi(e)
+            })
+            .collect();
+        let device = device();
+        let commands = commands(&device);
+        let encoder = commands.command_encoder().unwrap();
+        let input = new_buffer(&device, &a);
+        let out = new_buffer(&device, &vec![0f32; r]);
+        let enc: &ComputeCommandEncoder = encoder.as_ref();
+        enc.set_compute_pipeline_state(&pipeline);
+        // SAFETY: as in `contract_run`.
+        unsafe {
+            enc.set_input_buffer(0, Some(&input), 0);
+            enc.set_bytes(1, &(n as u32));
+            enc.set_output_buffer(2, Some(&out), 0);
+        }
+        enc.dispatch_thread_groups(
+            MTLSize {
+                width: r,
+                height: 1,
+                depth: 1,
+            },
+            MTLSize {
+                width: 1024,
+                height: 1,
+                depth: 1,
+            },
+        );
+        drop(encoder);
+        commands.wait_until_completed().unwrap();
+        let got: Vec<f32> = read_to_vec(&out, r);
+        for (row, chunk) in a.chunks(n).enumerate() {
+            let want = contract_mass_host(chunk);
+            let sequential = chunk.iter().fold(0f32, |s, &x| s + x);
+            assert_eq!(
+                got[row].to_bits(),
+                want.to_bits(),
+                "n {n} row {row}: metal {} host {want} (a sequential sum is {sequential})",
+                got[row]
+            );
+            rows += 1;
+            reassociated += usize::from(sequential.to_bits() != want.to_bits());
+        }
+    }
+    println!(
+        "CONTRACT_MASS rows={rows} differ=0 rows_where_a_sequential_sum_differs={reassociated}"
+    );
+    // The fixture can tell the two orders apart: otherwise a kernel summing
+    // in another order would pass it.
+    assert!(reassociated >= rows / 2, "{reassociated} of {rows}");
+}
+
 /// Tensor slices are element-aligned, including odd f16/bf16 and u8 offsets.
 /// Split and packed bindings must preserve the same independent CPU reference.
 #[test]

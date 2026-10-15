@@ -132,6 +132,7 @@ mod ring_publish_binds;
 mod ring_publish_order;
 mod rnn;
 mod sampled_cells;
+mod sampling_resolve;
 mod scale_synthetic;
 mod sdpa;
 mod sdpa_full_variants;

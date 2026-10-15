@@ -87,6 +87,7 @@ mod quant_mv_store;
 mod quant_parity_matrix;
 mod quant_parity_matrix_rows;
 mod quantized_tests;
+mod sampling_contract;
 mod serialization_tests;
 mod slice_set_strided_tests;
 mod staged_readback_plans;

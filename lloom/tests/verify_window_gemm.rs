@@ -1,9 +1,11 @@
 //! A speculative verify window under `deterministic` (`architecture.md`
 //! §2.3.5b): the target's pass over `[last, draft…]` runs its half matmuls on
-//! the GEMM (`tuning::VerifyWindow`), counted by the window's engagement
-//! counter, while the prefill and the K=1 decode step keep the one-row
-//! reduction and count nothing. With the window's arm off the verify counts
-//! nothing either, which is the arm the K=1 reduction would charge a window.
+//! the GEMM (`tuning::VerifyWindow`), counted by the verify window's
+//! engagement counter, while a prefill (the forward this file feeds directly;
+//! the driver's prefill is its own window, `prefill_window_gemm`) and the K=1
+//! decode step count nothing on it. With the window's arm off the verify
+//! counts nothing either, which is the arm the K=1 reduction would charge a
+//! window.
 //!
 //! Reachability is what this file holds: the reduction against the GEMM at
 //! one matmul is `lloom-tensor`'s `f16_rows_identity`.
@@ -126,7 +128,7 @@ fn the_verify_window_takes_the_gemm_and_the_k1_path_does_not() -> Result<()> {
     set_verify_window_arm(true);
     eprintln!("VERIFY_WINDOW_COUNTS on={on:?} off={off:?}");
 
-    assert_eq!(on.prefill, 0, "a prefill is not a window: {on:?}");
+    assert_eq!(on.prefill, 0, "a prefill is not a verify window: {on:?}");
     assert_eq!(
         on.step, 0,
         "the K=1 step keeps the one-row reduction: {on:?}"

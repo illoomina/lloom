@@ -3253,3 +3253,21 @@ fn serve_reuses_by_default_and_its_cold_cells_stay_cold() {
     drop(server);
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// Not a test: writes the tiny Qwen4-exp checkpoint and its tokenizer to
+/// `LLOOM_TINY_OUT`, for a dry run of a serving driver against `lloom
+/// serve` on no real weights (`cargo nextest run --run-ignored only -E
+/// 'test(=tiny_chat_e2e::write_the_tiny_qwen4exp_checkpoint)'`).
+#[test]
+#[ignore = "a fixture writer, run by hand"]
+fn write_the_tiny_qwen4exp_checkpoint() {
+    let Ok(out) = std::env::var("LLOOM_TINY_OUT") else {
+        eprintln!("LLOOM_TINY_OUT is unset; nothing written");
+        return;
+    };
+    let dir = PathBuf::from(out);
+    std::fs::create_dir_all(&dir).unwrap();
+    let model = write::<Qwen4ExpTiny>(&dir);
+    println!("model {}", model.display());
+    println!("tokenizer {}", dir.join("tokenizer.json").display());
+}

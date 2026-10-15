@@ -535,10 +535,15 @@ fn run<P: Lfm2Shape>(args: Args) -> Result<()> {
         anyhow::ensure!(!ids.is_empty(), "turn {} tokenized to nothing", idx + 1);
 
         let input = Tensor::new(ids.as_slice(), &device)?.unsqueeze(0)?;
-        let mut logits = model
-            .forward(&input, kv_len, &mut cache)
-            .with_context(|| format!("turn {} prefill", idx + 1))?
-            .squeeze(0)?;
+        // A prefill, as the engine's driver opens it (architecture.md
+        // §2.3.5b): its half matmuls take the prefill window's arm.
+        let mut logits = {
+            let _prefill = candle::tuning::VerifyWindow::prefill();
+            model
+                .forward(&input, kv_len, &mut cache)
+                .with_context(|| format!("turn {} prefill", idx + 1))?
+                .squeeze(0)?
+        };
         kv_len += ids.len();
 
         let mut generated: Vec<u32> = Vec::with_capacity(args.max_tokens);

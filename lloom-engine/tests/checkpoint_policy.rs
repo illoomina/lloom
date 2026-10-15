@@ -151,6 +151,45 @@ fn a_tiled_first_request_leaves_one_checkpoint(dev: &Device) -> Result<()> {
     Ok(())
 }
 
+/// A request whose owner keeps nothing of it (prefix reuse off): its
+/// prefill leaves no checkpoint, on a fresh state (where the ring's own
+/// default would have checkpointed the prompt's end) and after a hinted
+/// request alike.
+fn a_request_the_owner_discards_leaves_none(dev: &Device) -> Result<()> {
+    let (model, cfg) = model(dev, 2)?;
+    let mut s = DecodeSession::from_sequence(
+        &model,
+        Sequence::new(model.new_cache(&cfg, dev)?),
+        dev.clone(),
+    );
+    let off = |full: &[u32], s: &mut DecodeSession<'_, Model>, tail: usize| -> Result<Decoded> {
+        let params = DecodeParams {
+            max_tokens: 3,
+            eos_ids: vec![u32::MAX],
+            readback: ReadbackArm::Blocking,
+            turn_tail: tail,
+            no_checkpoint: true,
+            ..DecodeParams::default()
+        };
+        s.decode_until(full, detok, &params, |_| true)
+    };
+    let p = new_ids(16, 11);
+    let d = off(&p, &mut s, 0)?;
+    assert_eq!(d.checkpoint, lloom_engine::turn::CheckpointPolicy::None);
+    assert!(positions(&mut s).is_empty(), "fresh: none");
+    s.reset();
+    run(&mut s, &p, 3, 2, 0)?;
+    assert_eq!(positions(&mut s), vec![p.len() - 2], "hinted");
+    let full = [s.tokens().to_vec(), new_ids(9, 12)].concat();
+    off(&full, &mut s, 0)?;
+    assert_eq!(
+        positions(&mut s),
+        vec![p.len() - 2],
+        "after a hinted request: none of its own"
+    );
+    Ok(())
+}
+
 /// No checkpoint slots: every policy is a no-op and every request runs.
 fn no_checkpoint_capacity(dev: &Device) -> Result<()> {
     let (model, cfg) = model(dev, 0)?;
@@ -195,4 +234,5 @@ on_cpu_and_metal! {
     every_request_sets_its_own_checkpoint_policy => the_live_session_alternates_policies,
     a_tiled_prefill_leaves_one_checkpoint_at_its_end => a_tiled_first_request_leaves_one_checkpoint,
     no_checkpoint_slots_keeps_none => no_checkpoint_capacity,
+    a_discarded_request_leaves_no_checkpoint => a_request_the_owner_discards_leaves_none,
 }

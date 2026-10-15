@@ -1534,3 +1534,222 @@ fn a_stop_inside_a_token_keeps_the_whole_ids_before_it() {
         assert_eq!(front.reply(stop_at).unwrap().ids, bytes(kept), "{stop_at}");
     }
 }
+
+/// The checkpoints' own templates and tokenizers (when cached): a reply cut
+/// inside the reasoning block its prompt opened, sent back whole, then the
+/// next turn's prompt per `session.incomplete_reasoning` arm, persisted and
+/// stripped. Printed: where the next prompt leaves the log (the previous
+/// prompt and the reply) against the previous prompt's end, and where the
+/// turn checkpoint stood. Asserted:
+/// - `text` is the plain render of the history as sent (the default's
+///   prompt is unchanged);
+/// - `reasoning` leaves the log at or past the checkpoint, kept never before
+///   the previous prompt's end, and none of the end markers the template
+///   adds after the reasoning is a sampled id;
+/// - `recover`'s checkpoint is at or before the `text` prompt's divergence.
+#[test]
+fn an_open_reply_on_the_checkpoints_templates_per_arm() {
+    let hub = std::env::var("HF_HUB_CACHE")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| {
+            std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default())
+                .join(".cache/huggingface/hub")
+        });
+    let mut ran = 0;
+    for (repo, bos, caps) in [
+        (
+            "models--LiquidAI--LFM2.5-2.6B",
+            "<|startoftext|>",
+            LFM2_CAPABILITIES,
+        ),
+        ("models--Qwen--Qwen3.6-27B", "", QWEN3_5_CAPABILITIES),
+        ("models--Qwen--Qwen3.6-35B-A3B", "", QWEN3_5_CAPABILITIES),
+        (
+            "models--Qwen--Qwen3.8-Flash-Next",
+            "",
+            QWEN4EXP_CAPABILITIES,
+        ),
+    ] {
+        let Some(dir) = std::fs::read_dir(hub.join(repo).join("snapshots"))
+            .ok()
+            .and_then(|mut d| d.next())
+            .and_then(|e| e.ok())
+            .map(|e| e.path())
+        else {
+            eprintln!("skipped: {repo} is not cached");
+            continue;
+        };
+        let (Ok(tok), Ok(src)) = (
+            tokenizers::Tokenizer::from_file(dir.join("tokenizer.json")),
+            std::fs::read_to_string(dir.join("chat_template.jinja")),
+        ) else {
+            eprintln!("skipped: {repo} has no tokenizer.json + chat_template.jinja");
+            continue;
+        };
+        let engine = Stub::new(tok, &src, bos, caps);
+        let want = Some(true);
+        for persist in [Some(true), Some(false)] {
+            let mut text_div = None;
+            for arm in [Incomplete::Text, Incomplete::Reasoning, Incomplete::Recover] {
+                let front = Front::new(
+                    &engine,
+                    SessionOptions {
+                        persist,
+                        incomplete: arm,
+                        ..SessionOptions::default()
+                    },
+                );
+                if front.persist_unsupported().is_some() {
+                    continue;
+                }
+                let first = json!([user("What is the capital of France?")]);
+                let p1 = build(&front, &engine, &first, want);
+                if !p1.thinking.is_some_and(|t| t.on) {
+                    eprintln!("{repo}: thinking does not open a block; skipped");
+                    break;
+                }
+                let sampled = engine.enc("The user asks for the capital of France. That is");
+                let mut d = decoded(&engine, sampled.clone());
+                d.stop = Stop::Length;
+                assert!(front.record(&engine, p1.origin, &d), "{repo}");
+                let second = json!([
+                    user("What is the capital of France?"),
+                    assistant(&d.text),
+                    user("And Germany?")
+                ]);
+                let p2 = build(&front, &engine, &second, want);
+                let log: Vec<u32> = p1.ids.iter().chain(&sampled).copied().collect();
+                let kept = p2.ids.iter().zip(&log).take_while(|(a, b)| a == b).count();
+                let ckpt = p1.ids.len() - p1.turn_tail;
+                eprintln!(
+                    "OPEN-REPLY {repo} persist={persist:?} arm={}: prompt {} reply {} -> next prompt \
+                     leaves the log at {kept} ({:+} from the prompt's end); checkpoint at {ckpt} \
+                     (tail {}); open {} apart {} spliced {}",
+                    arm.name(),
+                    p1.ids.len(),
+                    sampled.len(),
+                    kept as i64 - p1.ids.len() as i64,
+                    p1.turn_tail,
+                    p2.spliced.open,
+                    p2.spliced.open_apart,
+                    p2.spliced.spliced_tokens,
+                );
+                assert_eq!(p2.spliced.open, 1, "{repo} {}", arm.name());
+                match arm {
+                    Incomplete::Text => {
+                        let mut kw = kw(&engine, want);
+                        kw.insert(PRESERVE_THINKING.into(), json!(persist.unwrap()));
+                        let decode = |ids: &[u32]| engine.text.tokenizer.decode(ids, false).unwrap();
+                        assert_eq!(
+                            decode(&p2.ids),
+                            decode(&engine.reference(&second, &kw, want)),
+                            "{repo}: the default's prompt is the history as sent"
+                        );
+                        text_div = Some(kept);
+                    }
+                    Incomplete::Reasoning => {
+                        assert_eq!(p2.spliced.open_apart, 1, "{repo}");
+                        assert!(
+                            ckpt <= kept,
+                            "{repo} persist={persist:?}: the next prompt leaves the log at {kept}, \
+                             before the checkpoint at {ckpt}"
+                        );
+                        if persist == Some(true) {
+                            assert!(
+                                kept >= p1.ids.len(),
+                                "{repo}: kept, the open reply leaves the log before the previous \
+                                 prompt's end ({kept} < {})",
+                                p1.ids.len()
+                            );
+                        }
+                        let in_sampled = |i: usize| p2.sampled.iter().any(|r| r.contains(&i));
+                        assert!(
+                            (kept..p2.ids.len())
+                                .filter(|&i| p2.ids[i] == engine.text.think_tags().unwrap().end)
+                                .all(|i| !in_sampled(i)),
+                            "{repo}: an end marker after the reasoning is the template's"
+                        );
+                    }
+                    Incomplete::Recover => {
+                        let div = text_div.expect("text ran first");
+                        assert!(
+                            ckpt <= div,
+                            "{repo} persist={persist:?}: the checkpoint {ckpt} is past the \
+                             divergence {div}"
+                        );
+                    }
+                }
+            }
+        }
+        ran += 1;
+    }
+    eprintln!("{ran} checkpoint templates checked");
+}
+
+/// An open reply under `Incomplete::Reasoning` is given apart only when the
+/// client sent it back whole with no reasoning field of its own: a field
+/// set to `null`, `""` or text, an edited reply, and a text two distinct
+/// replies of the conversation carry each go as sent; so does every case
+/// under the default `text`.
+#[test]
+fn an_open_reply_is_given_apart_only_as_it_came_back() {
+    let engine = Stub::qwen4exp();
+    let q = || json!([user("2+2?")]);
+    let next = |a: Value| json!([user("2+2?"), a, user("3+3?")]);
+    let want = Some(true);
+    let as_sent = |front: &Front, history: &Value| {
+        let p = build(front, &engine, history, want);
+        let decode = |ids: &[u32]| engine.text.tokenizer.decode(ids, false).unwrap();
+        let reference = engine.reference(history, &kw(&engine, want), want);
+        (p.spliced, decode(&p.ids) == decode(&reference))
+    };
+    for arm in [Incomplete::Text, Incomplete::Reasoning] {
+        let front = Front::new(
+            &engine,
+            SessionOptions {
+                incomplete: arm,
+                ..SessionOptions::default()
+            },
+        );
+        let p1 = build(&front, &engine, &q(), want);
+        let mut d = decoded(&engine, bytes("Add them"));
+        d.stop = Stop::Length;
+        assert!(front.record(&engine, p1.origin, &d));
+
+        // Whole, no field: apart under `reasoning`, as sent under `text`.
+        let (sp, plain) = as_sent(&front, &next(assistant("Add them")));
+        assert_eq!((sp.matched, sp.open), (1, 1), "{}", arm.name());
+        assert_eq!(sp.open_apart, usize::from(arm == Incomplete::Reasoning));
+        assert_eq!(plain, arm == Incomplete::Text, "{}", arm.name());
+
+        for (case, field) in [
+            ("null", Value::Null),
+            ("empty", json!("")),
+            ("text", json!("Add them")),
+        ] {
+            let mut a = assistant("Add them");
+            a["reasoning_content"] = field;
+            let (sp, plain) = as_sent(&front, &next(a));
+            assert_eq!(sp.open_apart, 0, "{} {case}", arm.name());
+            assert!(plain, "{} {case}: as sent", arm.name());
+        }
+        let (sp, plain) = as_sent(&front, &next(assistant("Add them, edited")));
+        assert_eq!(sp.matched, 0, "{}: edited", arm.name());
+        assert!(plain, "{}: edited", arm.name());
+
+        // A regeneration of one text from other ids (an added token's text
+        // sampled as its bytes): ambiguous while both are logged.
+        let tr = TinyTokenizer::qwen4exp().id("<tool_response>").unwrap();
+        for ids in [
+            [bytes("Add "), vec![tr]].concat(),
+            bytes("Add <tool_response>"),
+        ] {
+            let mut d = decoded(&engine, ids);
+            d.stop = Stop::Length;
+            assert!(front.record(&engine, p1.origin, &d));
+        }
+        let (sp, plain) = as_sent(&front, &next(assistant("Add <tool_response>")));
+        assert_eq!(sp.ambiguous, 1, "{}: two replies, one text", arm.name());
+        assert!(plain, "{}: ambiguous", arm.name());
+    }
+}

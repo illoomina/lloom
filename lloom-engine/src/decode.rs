@@ -1007,8 +1007,9 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
     /// whatever the request before it asked; returned with the position it
     /// resolves to.
     ///
-    /// Until the checkpoint ring takes a request's policy itself (#993), it
-    /// is expressed through the cache's one hint (`CausalLM::checkpoint_at`):
+    /// Until the checkpoint ring takes a request's policy itself
+    /// (`sequence-reuse-design.md` §2.3b), it is expressed through the
+    /// cache's one hint (`CausalLM::checkpoint_at`):
     /// `At` and `End` hint their position, which a pass covering it meets
     /// and no other tile does; `None` hints a position no pass reaches, which
     /// the next request's hint replaces. A cache without checkpoints ignores

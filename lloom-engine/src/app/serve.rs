@@ -2575,7 +2575,7 @@ fn timings(
         st.step_ns.iter().sum::<u64>() as f64 / 1e6
     };
     let n = d.tokens.len();
-    json!({
+    let mut t = json!({
         "prompt_n": prompt,
         "prompt_submit_ms": st.prefill_ns as f64 / 1e6,
         "predicted_n": n,
@@ -2633,9 +2633,14 @@ fn timings(
         // accepted boundary it found, how the state there was made ready,
         // and the ids kept, replayed and newly prefilled.
         "turn": d.turn.with_policy(engine.reuse_prefix()).json(engine.reuse_prefix()),
-        // The turn checkpoint this request's prefill was asked to leave.
-        "checkpoint": d.checkpoint_name(),
-    })
+    });
+    // Matched replies whose run ended inside their reasoning block, and those
+    // given to the template as that reasoning.
+    t["history_open_reasoning"] = json!(facts.spliced.open);
+    t["history_open_apart"] = json!(facts.spliced.open_apart);
+    // The turn checkpoint this request's prefill was asked to leave.
+    t["checkpoint"] = json!(d.checkpoint_name());
+    t
 }
 
 fn report(

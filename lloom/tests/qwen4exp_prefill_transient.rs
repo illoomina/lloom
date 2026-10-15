@@ -29,12 +29,11 @@ fn metal(dev: &Device) -> &MetalDevice {
     }
 }
 
-/// The pool's live, pending and free bytes, and the device's allocation.
+/// The pool's live and pending bytes, and the device's allocation.
 #[derive(Debug, Clone, Copy)]
 struct Pool {
     live: i64,
     pending: i64,
-    free: i64,
     device: i64,
 }
 
@@ -43,7 +42,6 @@ fn pool(m: &MetalDevice) -> Pool {
     Pool {
         live: (s.live_bytes + p.live_bytes) as i64,
         pending: (s.pending_bytes + p.pending_bytes) as i64,
-        free: (s.free_bytes + p.free_bytes) as i64,
         device: m.device().current_allocated_size() as i64,
     }
 }

@@ -558,7 +558,13 @@ impl PrefillTransient {
             let bn = moe_mm_bn(r * k, e);
             alloc(r * k, U32) + alloc(3 * ((r * k).div_ceil(bn) + e), U32) + alloc(1, U32)
         };
-        let mapped = |kdim: usize| if gemm && kdim % 32 == 0 { rowmap() } else { 0 };
+        let mapped = |kdim: usize| {
+            if gemm && kdim.is_multiple_of(32) {
+                rowmap()
+            } else {
+                0
+            }
+        };
         let routed = if gemm {
             2 * alloc(r * k * mff, F32) + 2 * mapped(h)
         } else {

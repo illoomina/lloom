@@ -93,6 +93,7 @@ impl ContainerMemory {
 }
 
 /// Where this process's memory controller lives, from `/proc/self/cgroup`.
+#[cfg(any(target_os = "linux", test))]
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum CgroupPath {
     /// The unified hierarchy: `0::<path>`.
@@ -101,6 +102,7 @@ enum CgroupPath {
     V1(String),
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn parse_proc_cgroup(text: &str) -> Option<CgroupPath> {
     let mut v2 = None;
     for line in text.lines() {
@@ -124,6 +126,7 @@ fn parse_proc_cgroup(text: &str) -> Option<CgroupPath> {
 /// when every limit is at or above the host's `total` (it binds nothing the
 /// host bound does not). The walk stops at the mount: inside a container's
 /// cgroup namespace its own group is the mount's root.
+#[cfg(any(target_os = "linux", test))]
 fn container_memory_from(
     proc_cgroup: &str,
     total: u64,

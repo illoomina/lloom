@@ -527,7 +527,7 @@ fn transient_row(
     let (claim, one) = t.claim(tile, kv_tokens);
     format!(
         "qwen4exp-transient ({} x {}-position forward at {}: {} B held of {} B allocated, {} route, from the geometry)",
-        if one.held == 0 { 0 } else { claim / one.held },
+        claim.checked_div(one.held).unwrap_or(0),
         one.seq,
         one.pos,
         one.held,

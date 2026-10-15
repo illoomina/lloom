@@ -174,10 +174,22 @@ parking_lot = "0.12"
 opt-level = 3
 lto = "fat"
 codegen-units = 1
+# Maintainer decision 26 (#990, 2026-10-14): the shipped binary does not
+# unwind and carries no symbols. A panic is a bug and ends the process;
+# recoverability comes from `Result`, not from catching an unwind. Tests and
+# the `ci` profile keep unwinding (nextest needs panics as failures);
+# `release-with-debug` below keeps symbols for the tracing instruments.
+panic = "abort"
+strip = "symbols"
 
 [profile.release-with-debug]
 inherits = "release"
 debug = true
+# The diagnosis build: the release codegen with symbols kept, so
+# `LLOOM_POOL_TRACE` / `LLOOM_SERVED_REQUEST_TRACE` name their frames and a
+# backtrace reads; it unwinds so a panic under investigation can be caught.
+panic = "unwind"
+strip = false
 
 # The CI test tier: the dev profile's checks (debug assertions, overflow
 # checks) at a codegen that links a test binary a runner's disk can hold.

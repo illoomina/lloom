@@ -160,6 +160,15 @@ pub trait MixerBlock: Mixer + Send + Sync {
     /// (an attention-only lane cut to a reused prefix, `Speculator::begin_at`).
     /// A recurrent state has no length to cut to and refuses.
     fn truncate_state(state: &mut Self::State, tokens: usize) -> Result<()>;
+    /// Move the counters back over the last `n` forwards, which ran under
+    /// a fired EOS gate (`CacheRewind::rewind_unwritten`): what they would
+    /// have written is not the state's. A KV cache moves its length back; a
+    /// recurrent state's gated steps carried it through and it has nothing
+    /// to move. Refused by a mixer whose gated forwards are not known to
+    /// leave its state unwritten.
+    fn rewind_unwritten(_state: &mut Self::State, n: usize) -> Result<()> {
+        lloom_tensor::bail!("this mixer cannot take back {n} gated forwards")
+    }
     /// Whether the state runs a window of `steps` positions as one pass
     /// ([`Self::execute_window`]): phase rings with more than `steps` phases
     /// on a recurrent state; always on a KV cache.
@@ -237,6 +246,10 @@ pub trait Layer: Send + Sync {
     fn rewind_window(state: &mut Self::State, mark: WindowMark) -> Result<()>;
     fn resolve_window(state: &mut Self::State, mark: WindowMark) -> Result<()>;
     fn truncate_state(state: &mut Self::State, tokens: usize) -> Result<()>;
+    /// [`MixerBlock::rewind_unwritten`] over the layer's state.
+    fn rewind_unwritten(_state: &mut Self::State, n: usize) -> Result<()> {
+        lloom_tensor::bail!("this layer cannot take back {n} gated forwards")
+    }
     fn ring_holds(state: &Self::State, steps: usize) -> bool;
     fn pooled(state: &Self::State) -> bool;
     fn execute_window(
@@ -437,6 +450,9 @@ where
     fn truncate_state(state: &mut Self::State, tokens: usize) -> Result<()> {
         M::truncate_state(&mut state.mixer, tokens)
     }
+    fn rewind_unwritten(state: &mut Self::State, n: usize) -> Result<()> {
+        M::rewind_unwritten(&mut state.mixer, n)
+    }
     fn ring_holds(state: &Self::State, steps: usize) -> bool {
         M::ring_holds(&state.mixer, steps)
     }
@@ -579,6 +595,12 @@ where
         match state {
             HybridState::A(s) => A::truncate_state(s, tokens),
             HybridState::B(s) => B::truncate_state(s, tokens),
+        }
+    }
+    fn rewind_unwritten(state: &mut Self::State, n: usize) -> Result<()> {
+        match state {
+            HybridState::A(s) => A::rewind_unwritten(s, n),
+            HybridState::B(s) => B::rewind_unwritten(s, n),
         }
     }
     fn ring_holds(state: &Self::State, steps: usize) -> bool {
@@ -1061,10 +1083,20 @@ impl<L: Layer> DecoderState<L> {
         Ok(())
     }
 
-    /// The positions the standing window would undo: 0 without one.
+    /// The positions the standing window would undo: 0 without one. A
+    /// standing window opened past the position would be one a take-back
+    /// left unsettled (`rewind_unwritten`): checked in debug builds.
     pub fn standing_horizon(&self) -> usize {
         match (&self.window, self.standing) {
-            (Some(w), true) => self.pos.saturating_sub(w.pos),
+            (Some(w), true) => {
+                debug_assert!(
+                    self.pos >= w.pos,
+                    "decoder state: a standing window opened at {} past the position {}",
+                    w.pos,
+                    self.pos
+                );
+                self.pos.saturating_sub(w.pos)
+            }
             _ => 0,
         }
     }
@@ -1124,6 +1156,43 @@ impl<L: Layer> DecoderState<L> {
         self.marks_spare = w.marks;
         self.ckpt.forget_past(self.pos);
         self.nextn.keep_first(w.retained + a)
+    }
+
+    /// Take back the last `n` forwards, which ran under a fired EOS gate
+    /// (`CacheRewind::rewind_unwritten`): the counters only. The position,
+    /// every layer's (a KV cache its length; a recurrent state, carried,
+    /// nothing), the standing window (settled: its base and its gated step
+    /// hold the same values) and the checkpoints past the new end. A layer
+    /// that fails to move back leaves the state unusable.
+    pub fn rewind_unwritten(&mut self, n: usize) -> Result<()> {
+        if n == 0 {
+            return Ok(());
+        }
+        self.usable()?;
+        if self.window_open() {
+            lloom_tensor::bail!(
+                "decoder state: taking back {n} gated forwards under a verify's window"
+            )
+        }
+        if n > self.pos {
+            lloom_tensor::bail!(
+                "decoder state: taking back {n} gated forwards at position {}",
+                self.pos
+            )
+        }
+        self.settle_standing()?;
+        for (l, s) in self.layers.iter_mut().enumerate() {
+            if let Err(e) = L::rewind_unwritten(s, n) {
+                self.unusable = Some(format!(
+                    "layer {l} failed to take back {n} gated forwards ({e})"
+                ));
+                return Err(e);
+            }
+        }
+        self.pos -= n;
+        self.ckpt.forget_past(self.pos);
+        self.nextn.clear();
+        Ok(())
     }
 
     /// Cut every layer back to its first `tokens` positions outside a
@@ -1224,6 +1293,9 @@ impl<L: Layer> CacheRewind for DecoderState<L> {
             )
         }
         self.rewind_window()
+    }
+    fn rewind_unwritten(&mut self, n: usize) -> Result<()> {
+        DecoderState::rewind_unwritten(self, n)
     }
     fn can_restore(&self, pos: usize) -> bool {
         DecoderState::can_restore(self, pos)
@@ -2053,6 +2125,12 @@ impl<P: Profile> MixerBlock for crate::models::qwen4exp::GatedDeltaNet<P> {
         }
         lloom_tensor::bail!("a recurrent state has no length to cut to {tokens} positions")
     }
+    /// The gated decode step carries `S` and the window into the buffers it
+    /// swaps in (`gdn.metal`), so the state is the one before the gated
+    /// forwards: nothing to move.
+    fn rewind_unwritten(_state: &mut Self::State, _n: usize) -> Result<()> {
+        Ok(())
+    }
     fn ring_holds(state: &Self::State, steps: usize) -> bool {
         state.s.ring_holds(steps) && state.conv.ring_holds(steps)
     }
@@ -2200,6 +2278,22 @@ impl<P: Profile> MixerBlock for crate::models::qwen4exp::QsaAttention<P> {
             )
         }
         state.truncate(tokens, state.n_blocks().min(tokens));
+        Ok(())
+    }
+    /// The KV's length back over the gated forwards' appends; the rows past
+    /// it are unread. Refused with the indexer's compressed blocks, which a
+    /// length alone does not put back.
+    fn rewind_unwritten(state: &mut Self::State, n: usize) -> Result<()> {
+        if state.n_blocks() > 0 {
+            lloom_tensor::bail!(
+                "a KV cache with the indexer's blocks cannot take back {n} gated forwards"
+            )
+        }
+        let len = state.len();
+        if n > len {
+            lloom_tensor::bail!("a KV cache of {len} positions cannot take back {n}")
+        }
+        state.truncate(len - n, 0);
         Ok(())
     }
     fn ring_holds(_state: &Self::State, _steps: usize) -> bool {

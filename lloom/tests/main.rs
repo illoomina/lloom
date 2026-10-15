@@ -125,6 +125,7 @@ mod qwen4exp_verify_window;
 mod qwen4exp_walk;
 mod qwen4exp_walk_census;
 mod qwen4exp_window_rewind;
+mod qwen_eos_gate;
 mod recovery_frontier;
 mod recurrent_pool_write;
 mod recurrent_state_metal;

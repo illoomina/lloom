@@ -2197,6 +2197,10 @@ fn a_kv_grow_inside_the_gated_overrun_keeps_the_prefix() -> Result<()> {
         let c = gate_growth_case(gate)?;
         eprintln!("GATE-GROWTH gate={gate}: {c:?}");
         assert!(
+            c.boundary_kv < c.slab_before,
+            "gate={gate}: the boundary fits the slab, so the growth is the overrun's: {c:?}"
+        );
+        assert!(
             c.slab_after > c.slab_before,
             "gate={gate}: the overrun grew the slab: {c:?}"
         );

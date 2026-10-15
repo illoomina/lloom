@@ -229,6 +229,13 @@ impl<P: Profile> GatedDeltaNet<P> {
         if let Some(out) = self.decode_rows_fused(x, l, states)? {
             return Ok(out);
         }
+        if x.device().eos_gate_armed() {
+            lloom_tensor::bail!(
+                "deltanet decode: the EOS gate is armed, and the composed step cannot carry \
+                 its state past an EOS (its write under a window lands in a spare a gated \
+                 copy leaves unwritten); the gate needs the fused step (Metal, f32)"
+            )
+        }
         let mut outs = Vec::with_capacity(b);
         for (r, (s_state, conv_state)) in states.iter_mut().enumerate() {
             outs.push(self.decode_composed(&x.narrow(0, r, 1)?, l, s_state, conv_state)?);

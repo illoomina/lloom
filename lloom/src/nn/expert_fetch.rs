@@ -213,6 +213,19 @@ impl FetchLane {
         self.lane.event.encode_wait(value)
     }
 
+    /// The counters once every job registered so far is done. The worker
+    /// counts a job when it takes it (`jobs`), after the step registered it
+    /// and before it signals the job's value; a decode under the ring
+    /// readback returns to the host once its last step is encoded, so a raw
+    /// snapshot taken right after it can miss the last job (CI gate 3,
+    /// 2026-10-15: `jobs = 95` against 96 registered, the test asserting one
+    /// wait a layer). This waits for the lane's own `done == registered`
+    /// handshake first. Diagnostic callers only; the hot path never reads it.
+    pub fn settled_stats(&self) -> FetchStats {
+        self.wait_done(self.registered());
+        self.stats()
+    }
+
     pub fn stats(&self) -> FetchStats {
         let c = &self.lane.counters;
         FetchStats {

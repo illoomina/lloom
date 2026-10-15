@@ -298,7 +298,19 @@ fn the_unset_defaults_are_the_trees_before_it_except_the_named_exceptions() {
     let idx = index();
     let none = BTreeMap::new();
     // 1. The library tree.
-    let before: Value = serde_json::from_str(BEFORE_TREE).unwrap();
+    #[allow(unused_mut)]
+    let mut before: Value = serde_json::from_str(BEFORE_TREE).unwrap();
+    // The dump was taken on aarch64, where the poll's default is `wfe`; the
+    // grammar refuses `wfe` elsewhere (`unknown poll mechanism`), so off
+    // aarch64 the key is left unset and resolves to that platform's own
+    // default — the one platform-specific value the dump carries.
+    #[cfg(not(target_arch = "aarch64"))]
+    if let Some(r) = before
+        .pointer_mut("/decode/readback")
+        .and_then(Value::as_object_mut)
+    {
+        r.remove("poll");
+    }
     let mut o = EngineOptions::default();
     let written = idx.merge_written(&mut o, &before).unwrap();
     assert!(written.len() >= 180, "{} fields read", written.len());

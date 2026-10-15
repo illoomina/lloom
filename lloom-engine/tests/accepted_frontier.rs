@@ -87,5 +87,33 @@ fn a_refused_fragment_is_not_in_the_delivered_text() -> Result<()> {
         whole.text[..at],
         "cut at the stop's first byte"
     );
+
+    // The run ends on what could begin a stop that never completes: the held
+    // text is handed out at the end, and a consumer that refuses that last
+    // hand-out leaves it out of the delivered text too. The first run takes
+    // every call, the second refuses the last.
+    let last = all.last().unwrap().clone();
+    let never = format!("{last}\u{7}");
+    let mut s = DecodeSession::from_sequence(&model, fresh(&model)?, dev.clone());
+    let mut calls: Vec<String> = Vec::new();
+    s.decode_until(&P, detok, &params(6, &[never.as_str()]), |f| {
+        calls.push(f.to_string());
+        true
+    })?;
+    assert!(
+        calls.last().is_some_and(|c| c.ends_with(&last)),
+        "the held text came last: {calls:?}"
+    );
+    let mut s = DecodeSession::from_sequence(&model, fresh(&model)?, dev.clone());
+    let mut n = 0;
+    let held = s.decode_until(&P, detok, &params(6, &[never.as_str()]), |_| {
+        n += 1;
+        n < calls.len()
+    })?;
+    assert_eq!(
+        held.text,
+        calls[..calls.len() - 1].concat(),
+        "the refused held text is not delivered"
+    );
     Ok(())
 }

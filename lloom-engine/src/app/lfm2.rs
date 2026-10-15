@@ -2049,7 +2049,9 @@ impl<P: Lfm2Shape> Engine<P> {
         };
         if stop != Stop::Cancelled && !stopped_on_string {
             if let Some(rest) = stream.held() {
-                on_fragment(&rest);
+                if !on_fragment(&rest) {
+                    stream.refuse_last();
+                }
             }
         }
         let (text, _) = stream.finish(&params.stop_strings);

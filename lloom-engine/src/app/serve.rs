@@ -973,6 +973,7 @@ fn chat_completions(shared: &Shared, v: &Value) -> Handled<Reply> {
                     .map_err(|e| anyhow::Error::new(front::Refused(format!("{e:#}"))))
             };
             let expand_ref: front::Expand<'_> = &expand;
+            let front_start = Instant::now();
             let prompt = shared
                 .front
                 .prompt(
@@ -992,6 +993,7 @@ fn chat_completions(shared: &Shared, v: &Value) -> Handled<Reply> {
                 thinking: prompt.thinking,
                 renders: prompt.renders,
                 spliced: prompt.spliced,
+                front_us: Some(front_start.elapsed().as_micros() as u64),
                 ..PromptFacts::default()
             };
             let mut ids = prompt.ids.clone();
@@ -1249,11 +1251,13 @@ fn chat_completions(shared: &Shared, v: &Value) -> Handled<Reply> {
         &mut |_| true,
     )?;
     let elapsed = started.elapsed();
+    let record_start = Instant::now();
     let frontier = prompt.as_ref().map(|p| {
         shared
             .front
             .record_frontier(shared.engine.as_ref(), p.origin, &decoded)
     });
+    let record_us = frontier.map(|_| record_start.elapsed().as_micros() as u64);
     let recorded = frontier.is_some_and(|f| f.logged);
     report(
         shared,
@@ -1282,6 +1286,7 @@ fn chat_completions(shared: &Shared, v: &Value) -> Handled<Reply> {
     // What of the reply is the accepted history (decision 42): the whole
     // ids its delivered text begins with, and the text past them.
     body["timings"]["frontier"] = frontier.map_or(Value::Null, |f| f.json());
+    body["timings"]["front_record_us"] = json!(record_us);
     // Ids only when asked (`return_token_ids`), and their logprobs only when
     // logprobs are asked too: the conversation the response returns is its
     // text (`sequence-reuse-design.md` §2.3d).
@@ -1697,11 +1702,13 @@ fn stream_response(shared: &Shared, request: Request, run: StreamingRun) -> Resu
     // The accepted history is what the server handed the writer; of that,
     // what it knows it wrote, and whether a write failed (what the client
     // received is not known either way).
+    let record_start = Instant::now();
     let frontier = run.record.map(|origin| {
         shared
             .front
             .record_frontier(shared.engine.as_ref(), origin, &decoded)
     });
+    let record_us = frontier.map(|_| record_start.elapsed().as_micros() as u64);
     let mut frontier_json = frontier.map_or(Value::Null, |f| f.json());
     if frontier_json.is_object() {
         frontier_json["written_bytes"] = json!(written.load(Ordering::Relaxed));
@@ -1737,6 +1744,7 @@ fn stream_response(shared: &Shared, request: Request, run: StreamingRun) -> Resu
     };
     let mut last = last;
     last["timings"]["frontier"] = frontier_json;
+    last["timings"]["front_record_us"] = json!(record_us);
     if run.return_ids {
         last["prompt_token_ids"] = json!(run.prompt_ids);
         last["choices"][0]["token_ids"] = json!(decoded.tokens);
@@ -2695,6 +2703,7 @@ fn timings(
     t["history_open_apart"] = json!(facts.spliced.open_apart);
     // The turn checkpoint this request's prefill was asked to leave.
     t["checkpoint"] = json!(d.checkpoint_name());
+    t["front_prompt_us"] = json!(facts.front_us);
     t
 }
 
@@ -2786,6 +2795,10 @@ struct PromptFacts {
     /// The replies of ours the history carried, and what of them ran as
     /// sampled.
     spliced: front::Spliced,
+    /// The front end's own time for the prompt (scopes, the log's lookup,
+    /// the one render, the one tokenization, the alignment): a request's,
+    /// never a token's.
+    front_us: Option<u64>,
 }
 
 impl PromptFacts {

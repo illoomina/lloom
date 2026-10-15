@@ -2,6 +2,21 @@
 
 using namespace metal;
 
+// The EOS gate (`kernels/metal/eos_gate.rs`): the decode step's prologue and
+// recurrence write the next window and `S` into the buffers the host selects
+// as the state (`RecurrentState::swap_in`), so their gated variants carry the
+// current state through when the flag is up instead of returning bare. The
+// merged translation unit sees the declaration from `utils.metal` first.
+#ifndef LLOOM_EOS_GATE_DECL
+#define LLOOM_EOS_GATE_DECL
+constant bool eos_gated [[function_constant(777)]];
+#define EOS_GATE_ARG device const uint *eos_gate_flag [[buffer(30), function_constant(eos_gated)]]
+#define EOS_GATE_CHECK if (eos_gated && eos_gate_flag[0] != 0) { return; }
+#endif
+#ifndef EOS_GATE_UP
+#define EOS_GATE_UP (eos_gated && eos_gate_flag[0] != 0)
+#endif
+
 // The Gated DeltaNet block's kernels: the decode prologue, the recurrence
 // step, the gated norm, their rows and multi-position forms, and the chunked
 // prefill. The prologue's conv is the short-conv block (`conv/short_conv.metal`,
@@ -137,9 +152,18 @@ kernel void gdn_prologue_f32(
     uint i [[thread_position_in_threadgroup]],
     uint width [[threads_per_threadgroup]],
     uint simd_lane [[thread_index_in_simdgroup]],
-    uint simd_id [[simdgroup_index_in_threadgroup]]) {
+    uint simd_id [[simdgroup_index_in_threadgroup]],
+    EOS_GATE_ARG) {
   threadgroup float partial[32];
   const gdn_group g = gdn_group_of(group, d, h_k);
+  // Past an EOS: the window carried into `win_out`, which becomes the state.
+  if (EOS_GATE_UP) {
+    if (i < d) {
+      const size_t c = (size_t)(g.base + i) * kk;
+      for (uint k = 0; k < kk; k++) win_out[c + k] = win[c + k];
+    }
+    return;
+  }
   float y = 0.0f;
   if (i < d) {
     const uint c = g.base + i;
@@ -174,12 +198,23 @@ kernel void gdn_step_f32(
     device float* s_out [[buffer(9)]],
     uint dv [[threadgroup_position_in_grid]],
     uint t [[thread_position_in_threadgroup]],
-    uint width [[threads_per_threadgroup]]) {
+    uint width [[threads_per_threadgroup]],
+    EOS_GATE_ARG) {
   threadgroup float part[1024];
   const uint split = width / h_v;
   const uint h = t % h_v;
   const uint j = t / h_v;
   const bool live = j < split; // width is h_v · split; a stray thread only idles
+  // Past an EOS: `S` carried into `s_out`, which becomes the state.
+  if (EOS_GATE_UP) {
+    if (live) {
+      for (uint dk = j; dk < d; dk += split) {
+        const size_t idx = ((size_t)dk * d + dv) * h_v + h;
+        s_out[idx] = s[idx];
+      }
+    }
+    return;
+  }
   const device float* q = heads + (size_t)h * d;
   const device float* k = heads + (size_t)(h_v + h) * d;
   const device float* v = heads + (size_t)(2 * h_v + h) * d;
@@ -280,11 +315,20 @@ static inline void gdn_step_column_reg(
       device float* o [[buffer(6)]], constant uint& d [[buffer(7)]],                        \
       constant uint& h_v [[buffer(8)]], device float* s_out [[buffer(9)]],                  \
       uint dv [[threadgroup_position_in_grid]], uint t [[thread_position_in_threadgroup]], \
-      uint width [[threads_per_threadgroup]]) {                                             \
+      uint width [[threads_per_threadgroup]], EOS_GATE_ARG) {                               \
     threadgroup float part[1024];                                                           \
     const uint split = width / h_v;                                                         \
     const uint h = t % h_v;                                                                 \
     const uint j = t / h_v;                                                                 \
+    if (EOS_GATE_UP) {                                                                      \
+      if (j < split) {                                                                      \
+        for (uint dk = j; dk < d; dk += split) {                                            \
+          const size_t idx = ((size_t)dk * d + dv) * h_v + h;                               \
+          s_out[idx] = s[idx];                                                              \
+        }                                                                                   \
+      }                                                                                     \
+      return;                                                                               \
+    }                                                                                       \
     const float a = alpha[h] + dt_bias[h];                                                  \
     const float sp = metal::max(a, 0.0f) + metal::log(1.0f + metal::exp(-metal::fabs(a))); \
     const float eg = metal::exp(ssm_a[h] * sp);                                             \

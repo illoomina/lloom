@@ -1860,9 +1860,12 @@ fn an_open_reply_sent_back_apart_takes_its_sampled_ids() {
         }
 
         // Not the reply as we gave it: tokenized as sent.
+        let mut two_fields = apart(&d.text, Some(json!("")));
+        two_fields["thinking"] = json!("Add them otherwise");
         for (case, a) in [
             ("edited", apart("Add <tool_response> THEM", Some(json!("")))),
             ("own content", apart(&d.text, Some(json!("Four.")))),
+            ("two fields that differ", two_fields),
         ] {
             let history = next(a);
             let p2 = build(&front, &engine, &history, want);
@@ -1883,6 +1886,19 @@ fn an_open_reply_sent_back_apart_takes_its_sampled_ids() {
             arm.name()
         );
     }
+
+    // A reply with no reasoning block (its prompt closed the block) is not
+    // reasoning, whatever field a client puts its text in.
+    let front = Front::new(&engine, SessionOptions::default());
+    let p1 = build(&front, &engine, &q, Some(false));
+    assert!(front.record(&engine, p1.origin, &decoded(&engine, sampled.clone())));
+    let history = next(apart("Add <tool_response> them", Some(json!(""))));
+    let p = build(&front, &engine, &history, want);
+    assert_eq!(
+        p.spliced.matched, 0,
+        "a reply with no block, given as reasoning"
+    );
+    assert_eq!(p.ids, engine.reference(&history, &kw(&engine, want), want));
 
     // Two distinct replies of one conversation with that text: ambiguous.
     let front = Front::new(&engine, SessionOptions::default());
@@ -2056,4 +2072,123 @@ fn an_open_reply_sent_back_on_the_checkpoints_templates() {
         ran += 1;
     }
     eprintln!("{ran} checkpoint templates checked");
+}
+
+/// An open reply the log no longer holds (a restarted process, an evicted
+/// entry) goes as sent, under `Incomplete::Reasoning` too. Echoed back as
+/// the content the client got, the unfinished thought is then the message's
+/// content where, logged, it was its reasoning. Sent back apart, it is
+/// reasoning either way: what a client carries does not depend on what the
+/// server still holds.
+#[test]
+fn an_open_reply_the_log_no_longer_holds_reads_as_the_client_sent_it() {
+    let engine = Stub::qwen4exp();
+    let want = Some(true);
+    let opts = SessionOptions {
+        incomplete: Incomplete::Reasoning,
+        ..SessionOptions::default()
+    };
+    let q = json!([user("2+2?")]);
+    let next = |a: Value| json!([user("2+2?"), a, user("3+3?")]);
+    let echo = next(assistant("Add them"));
+    let apart =
+        next(json!({ "role": "assistant", "content": "", "reasoning_content": "Add them" }));
+    let decode = |ids: &[u32]| engine.text.tokenizer.decode(ids, false).unwrap();
+    let reference = |h: &Value| decode(&engine.reference(h, &kw(&engine, want), want));
+    let rendered = |f: &Front, h: &Value| decode(&build(f, &engine, h, want).ids);
+
+    let front = Front::new(&engine, opts);
+    let p1 = build(&front, &engine, &q, want);
+    let mut d = decoded(&engine, bytes("Add them"));
+    d.stop = Stop::Length;
+    assert!(front.record(&engine, p1.origin, &d));
+    let as_reasoning = reference(&apart);
+    assert_ne!(as_reasoning, reference(&echo), "the two renderings differ");
+    assert_eq!(rendered(&front, &echo), as_reasoning, "logged: reasoning");
+    assert_eq!(rendered(&front, &apart), as_reasoning, "logged, apart");
+
+    let restarted = Front::new(&engine, opts);
+    for i in 0..LOG_REPLIES {
+        assert!(front.record(
+            &engine,
+            p1.origin,
+            &decoded(&engine, bytes(&format!("other {i}")))
+        ));
+    }
+    for (case, f) in [("restarted", &restarted), ("evicted", &front)] {
+        assert_eq!(
+            build(f, &engine, &echo, want).spliced.matched,
+            0,
+            "{case}: not held"
+        );
+        assert_eq!(
+            rendered(f, &echo),
+            reference(&echo),
+            "{case}: echoed, the thought is content"
+        );
+        assert_eq!(
+            rendered(f, &apart),
+            as_reasoning,
+            "{case}: apart, still reasoning"
+        );
+    }
+}
+
+/// A stop string that begins inside a token inside the reasoning
+/// (`<tool_response>` is one id; the stop is `resp`): the block stays open,
+/// the whole ids before the cut are the accepted frontier, and the delivered
+/// bytes past them are reasoning, never content. Under
+/// `Incomplete::Reasoning` the next turn splices those ids inside the block
+/// and encodes the rest; under `text` the delivered text is the content.
+#[test]
+fn a_stop_inside_a_token_inside_the_reasoning_keeps_the_block_open() {
+    let engine = Stub::qwen4exp();
+    let want = Some(true);
+    let q = json!([user("Tools?")]);
+    let tr = TinyTokenizer::qwen4exp().id("<tool_response>").unwrap();
+    for arm in [Incomplete::Text, Incomplete::Reasoning] {
+        let front = Front::new(
+            &engine,
+            SessionOptions {
+                incomplete: arm,
+                ..SessionOptions::default()
+            },
+        );
+        let p1 = build(&front, &engine, &q, want);
+        let mut d = decoded(&engine, [bytes("ab"), vec![tr], bytes("cd")].concat());
+        d.stop = Stop::StopString;
+        d.text = "ab<tool_".into();
+        let f = front.record_frontier(&engine, p1.origin, &d);
+        assert_eq!(
+            (f.generated, f.accepted, f.partial, f.logged),
+            (5, 2, "<tool_".len(), true)
+        );
+        let r = front.reply("ab<tool_").unwrap();
+        assert_eq!(r.block, Block::Open { interior: 0..2 }, "{}", arm.name());
+        assert_eq!(
+            (r.reasoning_text.as_str(), r.content_text.as_str()),
+            ("ab<tool_", "")
+        );
+        let echo = json!([user("Tools?"), assistant("ab<tool_"), user("More?")]);
+        let p2 = build(&front, &engine, &echo, want);
+        let mut log = p1.ids.clone();
+        log.extend(bytes("ab"));
+        assert_eq!(p2.spliced.spliced_tokens, 2, "{}", arm.name());
+        let decode = |ids: &[u32]| engine.text.tokenizer.decode(ids, false).unwrap();
+        let shown = match arm {
+            Incomplete::Reasoning => json!([user("Tools?"),
+                { "role": "assistant", "content": "", "reasoning_content": "ab<tool_" },
+                user("More?")]),
+            _ => echo.clone(),
+        };
+        assert_eq!(
+            decode(&p2.ids),
+            decode(&engine.reference(&shown, &kw(&engine, want), want)),
+            "{}",
+            arm.name()
+        );
+        if arm == Incomplete::Reasoning {
+            assert!(p2.ids.starts_with(&log), "the accepted ids, in the block");
+        }
+    }
 }

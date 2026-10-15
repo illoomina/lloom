@@ -573,6 +573,22 @@ fn given_reasoning(m: &Value) -> Given {
     given
 }
 
+/// The reasoning a message gives apart from its content: the text every
+/// reasoning field set to one carries, `None` where none does or two differ.
+fn reasoning_apart(m: &Value) -> Option<&str> {
+    let mut apart: Option<&str> = None;
+    for f in REASONING_FIELDS {
+        match m.get(f).and_then(Value::as_str) {
+            Some(s) if !s.trim().is_empty() => match apart {
+                Some(a) if a != s => return None,
+                _ => apart = Some(s),
+            },
+            _ => {}
+        }
+    }
+    apart
+}
+
 /// The texts a reply is found by: the whole reply, and its content where it
 /// has a reasoning block apart from it, each without surrounding whitespace.
 fn keys(reply: &Reply) -> impl Iterator<Item = &str> {
@@ -758,8 +774,9 @@ pub struct Spliced {
     /// Matched replies whose run ended inside their reasoning block.
     pub open: usize,
     /// Of those, the ones given to the template as reasoning, apart from
-    /// their content (`Incomplete::Reasoning`): whatever closes the block in
-    /// the prompt is the template's text, not a sampled id.
+    /// their content (by `Incomplete::Reasoning`, or by the client's own
+    /// reasoning field): whatever closes the block in the prompt is the
+    /// template's text, not a sampled id.
     pub open_apart: usize,
 }
 
@@ -1025,9 +1042,31 @@ impl Front {
                     continue;
                 }
                 spliced.replies += 1;
-                let Some(content) = m.get("content").and_then(Value::as_str) else {
+                let content = m.get("content").and_then(Value::as_str).unwrap_or("");
+                if content.trim().is_empty() {
+                    // No content to find it by: a reply cut inside its
+                    // reasoning given back with that reasoning apart, as
+                    // the template reads it, is found by the reasoning.
+                    // It goes as sent; only its ids are the logged ones.
+                    let Some(reasoning) = reasoning_apart(m) else {
+                        continue;
+                    };
+                    match log.find(scopes[i], reasoning) {
+                        Found::One(reply, Matched::Full)
+                            if matches!(reply.block, Block::Open { .. }) =>
+                        {
+                            spliced.matched += 1;
+                            spliced.reply_tokens += reply.ids.len();
+                            spliced.open += 1;
+                            spliced.open_apart += 1;
+                            matched.push((i, reply, true));
+                        }
+                        Found::Ambiguous => spliced.ambiguous += 1,
+                        Found::Elsewhere => spliced.unverified += 1,
+                        Found::One(..) | Found::None => {}
+                    }
                     continue;
-                };
+                }
                 let (reply, how) = match log.find(scopes[i], content) {
                     Found::One(reply, how) => (reply, how),
                     Found::Ambiguous => {

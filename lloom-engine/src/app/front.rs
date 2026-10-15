@@ -97,6 +97,39 @@ impl KeepLogprobs {
     }
 }
 
+/// How a past reply of ours whose run ended inside an open reasoning block
+/// reaches the next turn's template (`session.incomplete_reasoning`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Incomplete {
+    /// As the text the client got: its reasoning is the message's content.
+    #[default]
+    Text,
+    /// As the open reasoning it is: given to the template apart, which
+    /// closes the block (or drops it, where it strips reasoning).
+    Reasoning,
+    /// As `Text`, with the turn checkpoint before the divergence such a
+    /// reply's re-render makes.
+    Recover,
+}
+
+impl Incomplete {
+    pub fn parse(s: &str) -> Self {
+        match s {
+            "reasoning" => Self::Reasoning,
+            "recover" => Self::Recover,
+            _ => Self::Text,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Text => "text",
+            Self::Reasoning => "reasoning",
+            Self::Recover => "recover",
+        }
+    }
+}
+
 /// The `session` group as the front end runs it.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SessionOptions {
@@ -106,6 +139,7 @@ pub struct SessionOptions {
     /// A reply of ours sent back without its reasoning takes it from the log.
     pub restore_reasoning: bool,
     pub keep: KeepLogprobs,
+    pub incomplete: Incomplete,
 }
 
 impl SessionOptions {
@@ -114,6 +148,7 @@ impl SessionOptions {
             persist: c.persist_thinking,
             restore_reasoning: c.missing_reasoning == "log",
             keep: KeepLogprobs::parse(&c.keep_logprobs),
+            incomplete: Incomplete::parse(&c.incomplete_reasoning),
         }
     }
 }
@@ -142,6 +177,9 @@ pub struct Mode {
     /// the next turn's rendering of this turn keeps. The turn checkpoint
     /// goes after them, where the next request diverges.
     pub keep: [Option<usize>; 3],
+    /// As `keep`, for a reply whose run ended inside the block this prompt
+    /// opens, rendered as the text it is (`Incomplete::Recover`).
+    pub keep_open: [Option<usize>; 3],
 }
 
 /// Whether a template's prompt depends on `reasoning_effort`, per
@@ -273,26 +311,30 @@ impl Constants {
                     };
                     let gen = with[bare.len()..].to_vec();
                     let mut keep = [None; 3];
-                    for p in MODES {
-                        let Some(kwp) = with_persist(&kw, p) else {
-                            continue;
-                        };
-                        let two = json!([user, reasoned(thinking.on), next]);
-                        let Some(next_ids) = render(&two, &kwp, true).and_then(|s| enc(&s)) else {
-                            continue;
-                        };
+                    let mut keep_open = [None; 3];
+                    let kept = |reply: &Value, kwp: &Map<String, Value>| -> Option<usize> {
+                        let two = json!([user, reply, next]);
+                        let next_ids = render(&two, kwp, true).and_then(|s| enc(&s))?;
                         let lcp = with
                             .iter()
                             .zip(&next_ids)
                             .take_while(|(a, b)| a == b)
                             .count();
-                        keep[slot(p)] = Some(lcp.saturating_sub(bare.len()).min(gen.len()));
+                        Some(lcp.saturating_sub(bare.len()).min(gen.len()))
+                    };
+                    for p in MODES {
+                        let Some(kwp) = with_persist(&kw, p) else {
+                            continue;
+                        };
+                        keep[slot(p)] = kept(&reasoned(thinking.on), &kwp);
+                        keep_open[slot(p)] = kept(&reasoned(false), &kwp);
                     }
                     Some(Ok(Mode {
                         template,
                         gen,
                         thinking,
                         keep,
+                        keep_open,
                     }))
                 })();
                 modes[slot(kwarg)][slot(want)] = mode;
@@ -383,26 +425,97 @@ impl Constants {
     }
 }
 
+/// Where a reply's reasoning block stands in its ids, as the model produced
+/// them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Block {
+    /// The reply has no reasoning block.
+    None,
+    /// Opened (by the prompt, or a start marker the model sampled) and not
+    /// closed: the run ended inside it. `interior` is the reasoning.
+    Open { interior: Range<usize> },
+    /// Closed by the end marker at `end`, an index into the ids.
+    Closed { interior: Range<usize>, end: usize },
+}
+
+impl Block {
+    /// The interior of a block the reply closed.
+    pub fn closed(&self) -> Option<&Range<usize>> {
+        match self {
+            Self::Closed { interior, .. } => Some(interior),
+            _ => None,
+        }
+    }
+
+    /// The interior, closed or open.
+    pub fn interior(&self) -> Option<&Range<usize>> {
+        match self {
+            Self::None => None,
+            Self::Open { interior } | Self::Closed { interior, .. } => Some(interior),
+        }
+    }
+}
+
 /// One reply the session log keeps: the ids the model sampled (the EOS
 /// excluded), the text they decode to, and where the reasoning sits in them.
 #[derive(Debug, Clone)]
 pub struct Reply {
     pub ids: Vec<u32>,
     pub text: String,
-    /// The reasoning block's interior, as a range of `ids`.
-    pub reasoning: Option<Range<usize>>,
-    /// Where the content starts in `ids` (past the block's end marker).
+    pub block: Block,
+    /// Why the run ended.
+    pub stop: crate::Stop,
+    /// Where the content starts in `ids` (past the block's end marker; the
+    /// end of the ids for an open block).
     pub content: usize,
     /// Past the last end marker in `ids`: `content`, unless the reply wrote
     /// the marker again after its block closed.
     pub tail: usize,
     pub reasoning_text: String,
     pub content_text: String,
+    /// The delivered text's bytes past `ids`' text (a stop or a
+    /// cancellation inside a token): text, never ids.
+    pub partial: usize,
+    /// Every id the run generated; `ids` are the accepted ones.
+    pub generated: usize,
     /// `session.keep_logprobs = sampled | full`: the sampled token's
     /// log-probability per id.
     pub logprobs: Option<Vec<f32>>,
     /// `session.keep_logprobs = full`: each position's log-probabilities.
     pub rows: Option<Vec<Vec<f32>>>,
+}
+
+/// A reply's accepted conversational frontier (`sequence-reuse-design.md`
+/// §2.3f): of the ids the run generated, the longest prefix of whole units
+/// whose text the delivered text begins with, and the delivered bytes past
+/// it — where a stop string or a cancellation cut inside a token. The
+/// delivered text is what the server accepted from the run and handed on,
+/// not what a client acknowledged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Frontier {
+    /// Every id the run generated (the session's log keeps them all).
+    pub generated: usize,
+    /// The whole ids the delivered text begins with.
+    pub accepted: usize,
+    /// The delivered text's bytes past those ids' text.
+    pub partial: usize,
+    /// The delivered text's bytes.
+    pub delivered: usize,
+    /// Whether the reply log keeps the reply: the delivered text is those
+    /// ids' text and a beginning of the next unit's.
+    pub logged: bool,
+}
+
+impl Frontier {
+    pub fn json(&self) -> Value {
+        json!({
+            "generated": self.generated,
+            "accepted": self.accepted,
+            "partial_bytes": self.partial,
+            "delivered_bytes": self.delivered,
+            "logged": self.logged,
+        })
+    }
 }
 
 /// How a message's text matched a logged reply.
@@ -520,7 +633,7 @@ impl ReplyLog {
             match c
                 .replies
                 .iter()
-                .position(|r| r.ids == reply.ids && r.reasoning == reply.reasoning)
+                .position(|r| r.ids == reply.ids && r.block == reply.block)
             {
                 // The same reply again (a regeneration that sampled the same
                 // ids): one provenance.
@@ -642,6 +755,12 @@ pub struct Spliced {
     /// Replies of ours whose reasoning the log would have restored, kept as
     /// sent because the message says null or empty or the request strips.
     pub declined: usize,
+    /// Matched replies whose run ended inside their reasoning block.
+    pub open: usize,
+    /// Of those, the ones given to the template as reasoning, apart from
+    /// their content (`Incomplete::Reasoning`): whatever closes the block in
+    /// the prompt is the template's text, not a sampled id.
+    pub open_apart: usize,
 }
 
 /// Where each message's rendering starts in the prompt's ids.
@@ -670,6 +789,9 @@ pub struct Prompt {
     pub turn_tail: usize,
     pub blocks: Option<Blocks>,
     pub spliced: Spliced,
+    /// The prompt's ids taken from logged replies, as sampled; every other
+    /// id is the template's or the client's text, encoded.
+    pub sampled: Vec<Range<usize>>,
     /// `session.keep_logprobs`: the logged log-probability of each id the
     /// prompt took from a reply, `None` elsewhere.
     pub logprobs: Option<Vec<Option<f32>>>,
@@ -800,7 +922,7 @@ impl Front {
         };
         format!(
             "reasoning_default={persists} switch={} persist_thinking={} missing_reasoning={} keep_logprobs={} \
-             open={:?} groups_tools={} gen/tail[unset,on,off]=[{}, {}, {}]",
+             incomplete_reasoning={} open={:?} groups_tools={} gen/tail[unset,on,off]=[{}, {}, {}]",
             c.persist_switch,
             self.options
                 .persist
@@ -811,6 +933,7 @@ impl Front {
                 "as-sent"
             },
             self.options.keep.name(),
+            self.options.incomplete.name(),
             c.open,
             c.groups_tools,
             gen(None, None),
@@ -876,7 +999,9 @@ impl Front {
         // their text; a matched reply with a reasoning block is given to the
         // template as the model wrote it, reasoning and content apart.
         let mut spliced = Spliced::default();
-        let mut matched: Vec<(usize, Arc<Reply>)> = Vec::new();
+        // Each matched reply, and whether its open block went to the template
+        // apart (its ids are then aligned as reasoning).
+        let mut matched: Vec<(usize, Arc<Reply>, bool)> = Vec::new();
         let mut rewritten: Option<Vec<Value>> = None;
         // Whether the template keeps a past reply's reasoning: its switch as
         // set, else its default; a reply after the last user turn is kept
@@ -928,18 +1053,27 @@ impl Front {
                 // Full, the reasoning is in the text the client sent and is
                 // only given apart; by content, it is restored from the log,
                 // and only for a message that left it absent.
+                //
+                // A reply whose run ended inside its block is text unless
+                // `Incomplete::Reasoning`: then, sent back whole, it is given
+                // apart whatever the template keeps, since no marker in its
+                // text lets the template split it itself.
                 let kept = persists || last_user.is_some_and(|u| i > u);
-                let wanted = kept
-                    && reply.reasoning.is_some()
+                let open = matches!(reply.block, Block::Open { .. });
+                let open_apart = open && self.options.incomplete == Incomplete::Reasoning;
+                let wanted = (reply.block.closed().is_some() || open_apart)
+                    && (kept || open_apart && how == Matched::Full)
                     && (how == Matched::Full || self.options.restore_reasoning);
                 let restore = wanted && given == Given::Absent && (how == Matched::Full || !strips);
                 if wanted && !restore && how == Matched::Content {
                     spliced.declined += 1;
                 }
+                spliced.open += usize::from(open);
                 if restore {
                     if how == Matched::Content {
                         spliced.restored += 1;
                     }
+                    spliced.open_apart += usize::from(open_apart);
                     let msgs = rewritten.get_or_insert_with(|| list.clone());
                     let mut msg = m.clone();
                     msg["content"] = json!(reply.content_text);
@@ -948,7 +1082,7 @@ impl Front {
                     }
                     msgs[i] = msg;
                 }
-                matched.push((i, reply));
+                matched.push((i, reply, restore && open_apart));
             }
         }
         let shown: std::borrow::Cow<'_, [Value]> = match &rewritten {
@@ -972,11 +1106,11 @@ impl Front {
         // The logged replies' ids, aligned within each one's own span.
         let mut runs: Vec<Run> = Vec::new();
         if let Some(tb) = &text_blocks {
-            for (i, reply) in &matched {
+            for (i, reply, apart) in &matched {
                 let Some(region) = tb.region(*i, rendered.len()) else {
                     continue;
                 };
-                align_reply(text, &rendered, region, reply, &mut runs);
+                align_reply(text, &rendered, region, reply, *apart, &mut runs);
             }
         }
         runs.sort_by_key(|r| r.text.start);
@@ -990,6 +1124,7 @@ impl Front {
         let mut logprobs: Vec<Option<f32>> = Vec::new();
         let keep_lp = self.options.keep != KeepLogprobs::None;
         let mut cut_ids: Vec<(usize, usize)> = Vec::with_capacity(cuts.len());
+        let mut sampled: Vec<Range<usize>> = Vec::with_capacity(runs.len());
         let mut pos = 0usize;
         let encode_gap = |from: usize,
                           to: usize,
@@ -1017,6 +1152,7 @@ impl Front {
             if cuts.contains(&run.text.start) {
                 cut_ids.push((run.text.start, ids.len()));
             }
+            sampled.push(ids.len()..ids.len() + run.ids.len());
             ids.extend_from_slice(&run.reply.ids[run.ids.clone()]);
             spliced.spliced_tokens += run.ids.len();
             if keep_lp {
@@ -1040,6 +1176,9 @@ impl Front {
                     head_shift = 1;
                 }
             }
+        }
+        for r in &mut sampled {
+            *r = r.start + head_shift..r.end + head_shift;
         }
 
         // The thinking switch on the generation prompt's span.
@@ -1101,9 +1240,23 @@ impl Front {
         // diverges, from the constant; the last user turn's start else.
         let persist = kwargs.get(PRESERVE_THINKING).and_then(Value::as_bool);
         let turn_tail = match gen_len {
-            Some(m) => m.keep[slot(persist)]
-                .or(m.keep[0])
-                .map_or(m.gen.len(), |k| m.gen.len() - k),
+            Some(m) => {
+                let keep = m.keep[slot(persist)].or(m.keep[0]);
+                // Before whichever divergence comes first: a reply that
+                // closes its block, or one cut inside it and given back as
+                // text.
+                let keep = match self.options.incomplete {
+                    Incomplete::Recover if thinking.on => {
+                        let open = m.keep_open[slot(persist)].or(m.keep_open[0]);
+                        match (keep, open) {
+                            (Some(a), Some(b)) => Some(a.min(b)),
+                            (a, b) => a.or(b),
+                        }
+                    }
+                    _ => keep,
+                };
+                keep.map_or(m.gen.len(), |k| m.gen.len() - k)
+            }
             None => blocks
                 .as_ref()
                 .and_then(|b| {
@@ -1124,6 +1277,7 @@ impl Front {
             turn_tail,
             blocks,
             spliced,
+            sampled,
             logprobs: keep_lp.then_some(logprobs),
             renders,
             origin: Origin {
@@ -1181,6 +1335,7 @@ impl Front {
             turn_tail,
             blocks: None,
             spliced: Spliced::default(),
+            sampled: Vec::new(),
             logprobs: None,
             renders,
             origin: Origin {
@@ -1253,74 +1408,86 @@ impl Front {
     }
 
     /// Keep a reply in the session log against `origin`: the ids `decoded`
-    /// sampled, with what the run kept of their logprobs. A reply whose text
-    /// is not a prefix of whole units of its ids' decoding is not kept.
-    /// Returns whether it was.
+    /// sampled, with what the run kept of their logprobs. Returns whether it
+    /// was kept ([`Self::record_frontier`]).
     pub fn record(&self, engine: &dyn Served, origin: Origin, decoded: &Decoded) -> bool {
+        self.record_frontier(engine, origin, decoded).logged
+    }
+
+    /// [`Self::record`], returning the reply's accepted frontier. The ids
+    /// kept are the longest prefix of whole units whose text the delivered
+    /// text begins with, and the rest of the delivered text — a beginning of
+    /// the next unit's — is kept as text. A delivered text that is not that
+    /// (nothing of it whole, or not the run's) is not kept.
+    pub fn record_frontier(
+        &self,
+        engine: &dyn Served,
+        origin: Origin,
+        decoded: &Decoded,
+    ) -> Frontier {
         let thinking = origin.thinking;
+        let mut frontier = Frontier {
+            generated: decoded.tokens.len(),
+            delivered: decoded.text.len(),
+            ..Frontier::default()
+        };
         let Some(text) = engine.text() else {
-            return false;
+            return frontier;
         };
         if decoded.tokens.is_empty() {
-            return false;
+            return frontier;
         }
-        let Some(full) = decode(text, &decoded.tokens) else {
-            return false;
+        let Some((n, partial)) = accepted(text, &decoded.tokens, &decoded.text) else {
+            return frontier;
         };
-        // The ids the client's text is: all of them, or — where the text
-        // stops short (a stop string, a character the run ended inside) —
-        // the longest prefix of whole units that decodes to it.
-        let n = if full == decoded.text {
-            decoded.tokens.len()
-        } else {
-            let Some(u) = units(text, &decoded.tokens, 0) else {
-                return false;
-            };
-            let mut acc = String::new();
-            let mut kept = None;
-            for (r, s) in &u {
-                acc.push_str(s);
-                if !decoded.text.starts_with(acc.as_str()) {
-                    break;
-                }
-                if acc.len() == decoded.text.len() {
-                    kept = Some(r.end);
-                    break;
-                }
-            }
-            match kept {
-                Some(k) => k,
-                None => return false,
-            }
-        };
+        frontier.accepted = n;
+        frontier.partial = partial;
+        if n == 0 {
+            return frontier;
+        }
+        let partial_text = &decoded.text[decoded.text.len() - partial..];
         let full = decoded.text.clone();
         let tags = self.constants.as_ref().and_then(|c| c.tags.as_ref());
         let ids = &decoded.tokens[..n];
         let open = thinking.is_some_and(|t| t.on);
-        // A reasoning block is the reply's only once it closed: a reply cut
-        // inside it (`max_tokens`) is text, as the template takes it.
-        let (reasoning, content) = match tags {
-            Some(t) if open => match ids.iter().position(|&id| id == t.end) {
-                Some(e) => (Some(0..e), e + 1),
-                None => (None, 0),
-            },
-            Some(t) => match ids.iter().position(|&id| id == t.start) {
-                Some(s) => match ids[s + 1..].iter().position(|&id| id == t.end) {
-                    Some(e) => (Some(s + 1..s + 1 + e), s + 2 + e),
-                    None => (None, 0),
-                },
-                None => (None, 0),
-            },
-            None => (None, 0),
+        // The block as the model produced it: opened by the prompt or by a
+        // start marker it sampled, closed by the first end marker after
+        // that; a run that ended before one leaves it open. No end marker is
+        // assumed that the model did not sample.
+        let block = match tags {
+            Some(t) => {
+                let start = if open {
+                    Some(0)
+                } else {
+                    ids.iter().position(|&id| id == t.start).map(|s| s + 1)
+                };
+                match start {
+                    None => Block::None,
+                    Some(s) => match ids[s..].iter().position(|&id| id == t.end) {
+                        Some(e) => Block::Closed {
+                            interior: s..s + e,
+                            end: s + e,
+                        },
+                        None => Block::Open {
+                            interior: s..ids.len(),
+                        },
+                    },
+                }
+            }
+            None => Block::None,
         };
-        let reasoning_text = match &reasoning {
+        let mut reasoning_text = match block.interior() {
             Some(r) => decode(text, &ids[r.clone()]).unwrap_or_default(),
             None => String::new(),
         };
-        let content = content.min(ids.len());
+        let content = match &block {
+            Block::None => 0,
+            Block::Open { .. } => ids.len(),
+            Block::Closed { end, .. } => end + 1,
+        };
         // Past the last end marker: where a stripping template's split of
         // the whole text starts the content it keeps.
-        let tail = match (tags, &reasoning) {
+        let tail = match (tags, block.closed()) {
             (Some(t), Some(_)) => ids
                 .iter()
                 .rposition(|&id| id == t.end)
@@ -1328,7 +1495,13 @@ impl Front {
                 .max(content),
             _ => content,
         };
-        let content_text = decode(text, &ids[content..]).unwrap_or_default();
+        let mut content_text = decode(text, &ids[content..]).unwrap_or_default();
+        // The delivered text past the whole ids is the block's while it is
+        // open, else the content's.
+        match block {
+            Block::Open { .. } => reasoning_text.push_str(partial_text),
+            _ => content_text.push_str(partial_text),
+        }
         let keep = self.options.keep;
         let (logprobs, rows) = match (&decoded.logprobs, keep) {
             (Some(lp), KeepLogprobs::Sampled) if lp.sampled.len() >= n => {
@@ -1345,16 +1518,20 @@ impl Front {
             Reply {
                 ids: ids.to_vec(),
                 text: full,
-                reasoning,
+                block,
+                stop: decoded.stop,
                 content,
                 tail,
                 reasoning_text,
                 content_text,
+                partial,
+                generated: decoded.tokens.len(),
                 logprobs,
                 rows,
             },
         );
-        true
+        frontier.logged = true;
+        frontier
     }
 
     /// The newest reply the log holds whose text or content is `content`,
@@ -1398,6 +1575,37 @@ pub fn logprobs_refused_on(body: lloom::nn::Body) -> Option<String> {
     lloom::nn::refuse(body, &asks)
         .err()
         .map(|e| format!("this process decodes through {name}: {e}"))
+}
+
+/// Of `tokens`, the longest prefix of whole units whose text `delivered`
+/// begins with, and `delivered`'s bytes past it — which must begin the next
+/// unit's text: the accepted frontier ([`Frontier`]). `None` where
+/// `delivered` is not that (not the run's text).
+pub fn accepted(text: &Text, tokens: &[u32], delivered: &str) -> Option<(usize, usize)> {
+    let full = decode(text, tokens)?;
+    if full == delivered {
+        return Some((tokens.len(), 0));
+    }
+    let u = units(text, tokens, 0)?;
+    let mut at = 0;
+    let mut kept = 0;
+    let mut next = None;
+    for (r, s) in &u {
+        if !delivered[at..].starts_with(s.as_str()) {
+            next = Some(s.as_str());
+            break;
+        }
+        at += s.len();
+        kept = r.end;
+        if at == delivered.len() {
+            break;
+        }
+    }
+    let rest = &delivered[at..];
+    if !rest.is_empty() && !next.is_some_and(|s| s.starts_with(rest)) {
+        return None;
+    }
+    Some((kept, rest.len()))
 }
 
 fn decode(text: &Text, ids: &[u32]) -> Option<String> {
@@ -1531,17 +1739,26 @@ fn units(text: &Text, ids: &[u32], base: usize) -> Option<Vec<(Range<usize>, Str
 /// Align `reply`'s segments — anything before its reasoning block, the
 /// block's interior, its end marker, the content — inside `region` of
 /// `rendered`, pushing a run per stretch whose text lies there contiguously.
+/// An open block is a segment of its own only where it went to the template
+/// as reasoning (`apart`); as text, the reply is one segment.
 fn align_reply(
     text: &Text,
     rendered: &str,
     region: Range<usize>,
     reply: &Arc<Reply>,
+    apart: bool,
     runs: &mut Vec<Run>,
 ) {
     let n = reply.ids.len();
     let mut segments: Vec<Range<usize>> = Vec::new();
-    match &reply.reasoning {
-        Some(r) => {
+    match &reply.block {
+        Block::Open { interior: r } if apart => {
+            if r.start > 0 {
+                segments.push(0..r.start);
+            }
+            segments.push(r.clone());
+        }
+        Block::Closed { interior: r, .. } => {
             if r.start > 0 {
                 segments.push(0..r.start);
             }
@@ -1555,7 +1772,7 @@ fn align_reply(
             }
             segments.push(reply.tail..n);
         }
-        None => segments.push(0..n),
+        Block::None | Block::Open { .. } => segments.push(0..n),
     }
     let mut cursor = region.start;
     for seg in segments {

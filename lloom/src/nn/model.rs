@@ -121,6 +121,15 @@ pub trait CausalLM: Model {
         Ok(())
     }
 
+    /// Whether this model's forwards admit the EOS gate's cores arm: every
+    /// output of a quantized mat-vec in a decode forward is read only by
+    /// that forward's later kernels, its logits and its sampled token, so a
+    /// forward past the stop may skip them (`sequence-reuse-design.md`
+    /// §2.3e, the inventory). The default is `false`.
+    fn eos_gate_cores(&self) -> bool {
+        false
+    }
+
     /// Open a request whose prefill ends at the absolute position `end`:
     /// its passes leave the one turn checkpoint `policy` names, whatever an
     /// earlier request or hint left, until [`Self::close_checkpoint_request`]

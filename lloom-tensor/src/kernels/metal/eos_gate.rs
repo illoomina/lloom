@@ -179,6 +179,7 @@ impl DispatchGate {
         EosGateReport {
             fired,
             steps: self.steps.load(Ordering::Relaxed),
+            cores: false,
         }
     }
 }

@@ -4863,8 +4863,12 @@ impl<P: Profile> State<P> {
 
     /// The second half: widen every plane to the plan's slab. Admission is the
     /// caller's — `prepare_pass` admits one plan, `forward_rows` the sum of its
-    /// rows' — so this allocates and copies and nothing else.
+    /// rows' — so this allocates and copies and nothing else. The copy
+    /// carries the rows the sequence holds, so under an armed EOS gate it
+    /// runs ungated: a grow can fall inside the forwards queued past an EOS
+    /// (`sequence-reuse-design.md` §2.3e).
     pub(crate) fn apply_grow(&mut self, plan: &GrowPlan) -> Result<()> {
+        let _ungated = self.device.eos_gate_suspended();
         let slab = plan.slab;
         match self.kv.arm_mut() {
             ArmMut::One(own) => own.grow_to(slab)?,

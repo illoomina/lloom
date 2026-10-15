@@ -2071,6 +2071,144 @@ fn the_eos_gate_reconciles_to_the_blocking_arms_cache_on_the_unfused_shuffle() -
     Ok(())
 }
 
+/// What the gate's overrun did to a KV slab that grew inside it; see
+/// [`gate_growth_case`].
+#[cfg(feature = "metal")]
+#[derive(Debug)]
+struct GrowthCase {
+    /// The slab's width before the run and after it, and the KV length at
+    /// the boundary (the reference's).
+    slab_before: usize,
+    slab_after: usize,
+    boundary_kv: usize,
+    /// The subject's reconcile, then its next step's logits against the
+    /// reference's next step at the same position (max |diff|).
+    reconciled: std::result::Result<(), String>,
+    next_step_diff: f32,
+}
+
+/// The EOS gate on the real decode kernels when the KV slab grows inside the
+/// gated overrun (`Cache::prepare_pass` widens it by a bucket before the
+/// forward that needs it; the grow copies the old slab into the new one's
+/// prefix, `nn::slab::Slab::grow_to`). The gate is armed for the whole run,
+/// and the copy is a gated kernel (`copy2d`). The bucket is chosen so the
+/// reference (the blocking arm, which never feeds the EOS) never grows and
+/// the subject grows three forwards past the EOS, after the gate fired. The
+/// subject is then reconciled and both take the same next step; the
+/// ungated control grows at the same forward, ungated, and is rewound (a
+/// rotating conv ring rewinds).
+#[cfg(feature = "metal")]
+fn gate_growth_case(gate: bool) -> Result<GrowthCase> {
+    let dev = Device::new_metal(0).expect("metal");
+    let cfg = tiny_lfm2::config(
+        lloom::models::lfm2::ConvState::RotatingRing { k: 32 },
+        false,
+    );
+    let key = cfg.exact_key();
+    lloom::profile::dispatch!(key, lloom::profile::LFM2, P => gate_growth_case_at::<P>(&cfg, &dev, gate))
+}
+
+#[cfg(feature = "metal")]
+fn gate_growth_case_at<P: lloom::models::lfm2::Shape>(
+    cfg: &lloom::models::lfm2::Config,
+    dev: &Device,
+    gate: bool,
+) -> Result<GrowthCase> {
+    use lloom::models::lfm2::State;
+    const EXTRA: usize = 12;
+    let prompt = [1u32, 2, 3, 4, 5];
+    let model = tiny_lfm2::build::<P>(cfg, dev)?;
+    let never = [u32::MAX];
+    let blocking = |s: &mut Session<'_, lloom::models::lfm2::Model<P>>,
+                    eos: &[u32],
+                    p: &[u32],
+                    n: usize|
+     -> Result<Vec<u32>> {
+        Ok(s.decode(
+            &mut IdentityProposer,
+            &mut Blocking::new(eos, dev)?,
+            &mut greedy(),
+            p,
+            &DecodeOptions::new(n),
+            &mut sink,
+        )?
+        .ids)
+    };
+    let fresh = |bucket: usize| State::<P>::new(true, DType::F16, cfg, dev)?.with_kv_bucket(bucket);
+    let stream = blocking(&mut Session::new(&model, fresh(64)?), &never, &prompt, 32)?;
+    let k = (4..stream.len())
+        .find(|&k| !stream[..k].contains(&stream[k]))
+        .unwrap_or_else(|| panic!("no fresh token in the stream to stop on: {stream:?}"));
+    let eos = stream[k];
+    // The boundary holds the prompt and the `k` ids; the EOS's forward is
+    // the overrun's first, so a bucket two past the boundary is crossed by
+    // the overrun's third forward.
+    let boundary_kv = prompt.len() + k;
+    let bucket = boundary_kv + 2;
+
+    let mut reference = Session::new(&model, fresh(bucket)?);
+    assert_eq!(blocking(&mut reference, &[eos], &prompt, 64)?, &stream[..k]);
+    assert_eq!(reference.sequence().cache().kv_len(), boundary_kv);
+    let next = Tensor::new(&[[9u32]], dev)?;
+    let pos = reference.pos();
+    let mut want = reference.cache_mut().clone();
+    let want_logits = CausalLM::forward(&model, &next, pos, &mut want)?;
+
+    let slab_before = fresh(bucket)?.kv_report().slab;
+    let (mut subject, out) = gated_flow(&model, fresh(bucket), eos, dev, gate, k + 1 + EXTRA)?;
+    assert_eq!(out.ids, &stream[..k]);
+    assert_eq!(out.stats.overrun, 1 + EXTRA);
+    assert_eq!(out.stats.overrun_unwritten, gate);
+    let slab_after = subject.sequence().cache().kv_report().slab;
+    let reconciled = subject.reconcile().map(|_| ()).map_err(|e| e.to_string());
+    let next_step_diff = if reconciled.is_ok() {
+        assert_eq!(subject.pos(), pos);
+        let got = CausalLM::forward(&model, &next, pos, subject.cache_mut())?;
+        let (a, b) = (
+            got.flatten_all()?.to_dtype(DType::F32)?.to_vec1::<f32>()?,
+            want_logits
+                .flatten_all()?
+                .to_dtype(DType::F32)?
+                .to_vec1::<f32>()?,
+        );
+        a.iter()
+            .zip(&b)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0f32, f32::max)
+    } else {
+        f32::NAN
+    };
+    Ok(GrowthCase {
+        slab_before,
+        slab_after,
+        boundary_kv,
+        reconciled,
+        next_step_diff,
+    })
+}
+
+/// A KV grow inside the gate's overrun keeps the slab's prefix: after the
+/// reconcile, the next step is the reference's, bit for bit, gated or not.
+#[cfg(feature = "metal")]
+#[test]
+fn a_kv_grow_inside_the_gated_overrun_keeps_the_prefix() -> Result<()> {
+    let _quiet = GPU_QUIET.lock().unwrap_or_else(|e| e.into_inner());
+    for gate in [false, true] {
+        let c = gate_growth_case(gate)?;
+        eprintln!("GATE-GROWTH gate={gate}: {c:?}");
+        assert!(
+            c.slab_after > c.slab_before,
+            "gate={gate}: the overrun grew the slab: {c:?}"
+        );
+        assert_eq!(c.reconciled, Ok(()), "gate={gate}: the reconcile");
+        assert_eq!(
+            c.next_step_diff, 0.0,
+            "gate={gate}: the step after the grown, reconciled overrun is the reference's"
+        );
+    }
+    Ok(())
+}
+
 /// A reader-owned run on an arm that learns EOS late — the drain arms, the
 /// adaptive commit's arms — ends its ids at the EOS whatever stopped it: the
 /// loop does not stream (the reader does), so the EOS and the forwards past it

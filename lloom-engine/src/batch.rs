@@ -109,6 +109,8 @@ pub struct BatchDone {
     pub reuse: ReuseAction,
     pub reused: usize,
     pub prefilled: usize,
+    /// What the row reused of its sequence (`crate::turn`).
+    pub turn: crate::turn::TurnReuse,
     /// Rows live in the batch when this row joined it.
     pub joined_beside: usize,
 }
@@ -327,6 +329,7 @@ type StaticRowMeta = (
     lloom::nn::Prepared,
     Sender<BatchEvent>,
     Arc<AtomicBool>,
+    crate::turn::TurnReuse,
 );
 
 /// Where a request's prefix is shared from: an idle slot of the pool or a
@@ -344,6 +347,7 @@ struct InFlight {
     reuse: ReuseAction,
     reused: usize,
     prefilled: usize,
+    turn: crate::turn::TurnReuse,
     joined_beside: usize,
 }
 
@@ -509,7 +513,12 @@ where
     fn prepare(
         &mut self,
         req: &BatchRequest,
-    ) -> Result<(usize, Session<'m, M>, lloom::nn::Prepared)> {
+    ) -> Result<(
+        usize,
+        Session<'m, M>,
+        lloom::nn::Prepared,
+        crate::turn::TurnReuse,
+    )> {
         if req.params.eos_ids.is_empty() {
             lloom_tensor::bail!("batch scheduler: eos_ids is empty; a run needs an EOS set");
         }
@@ -523,7 +532,7 @@ where
             .acquire(&req.prompt_ids)
             .ok_or_else(|| lloom_tensor::Error::msg("batch scheduler: no idle sequence"))?;
         let mut session = Session::from_sequence(self.model, seq);
-        if !self.reuse_prefix {
+        if !self.reuse_prefix || req.params.cold {
             session.reset();
         }
         // The share source, when the routed slot has nothing of its own: the
@@ -534,26 +543,31 @@ where
         } else {
             None
         };
+        let boundary = session.tokens().len();
         let prepared = match source {
             Some(ShareSource::Idle(slot, lcp)) => {
                 let src = self.pool.sequence(slot).expect("an idle slot");
                 let log = &src.tokens()[..lcp];
-                session.prepare_shared(&req.prompt_ids, src.cache(), log)
+                session
+                    .prepare_shared(&req.prompt_ids, src.cache(), log)
+                    .map(|p| crate::turn::TurnReuse::of_shared(boundary, p))
             }
             Some(ShareSource::Live(id, lcp)) => {
                 let (fed, cache, _) = self.decoder.row_source(id).expect("a held row");
-                session.prepare_shared(&req.prompt_ids, cache, &fed[..lcp])
+                session
+                    .prepare_shared(&req.prompt_ids, cache, &fed[..lcp])
+                    .map(|p| crate::turn::TurnReuse::of_shared(boundary, p))
             }
-            None => session.prepare(&req.prompt_ids),
+            None => crate::turn::prepare(&mut session, &req.prompt_ids, true),
         };
-        let prepared = match prepared {
+        let (prepared, turn) = match prepared {
             Ok(p) => p,
             Err(e) => {
                 self.pool.release(routed.slot, session.into_sequence());
                 return Err(e);
             }
         };
-        Ok((routed.slot, session, prepared))
+        Ok((routed.slot, session, prepared, turn))
     }
 
     /// The share unit, from any sequence's cache (0: sharing is impossible).
@@ -689,6 +703,7 @@ where
                     reuse: ReuseAction::Fresh,
                     reused: 0,
                     prefilled: 0,
+                    turn: Default::default(),
                     joined_beside: 0,
                 })));
                 continue;
@@ -703,7 +718,7 @@ where
                 break;
             }
             let t_prep = std::time::Instant::now();
-            let (slot, session, prepared) = match self.prepare(&req) {
+            let (slot, session, prepared, turn) = match self.prepare(&req) {
                 Ok(p) => p,
                 Err(e) => {
                     let _ = tx.send(BatchEvent::Error(e.to_string()));
@@ -745,6 +760,7 @@ where
                             reuse: prepared.action,
                             reused: prepared.reused,
                             prefilled: prepared.suffix.len(),
+                            turn,
                             joined_beside,
                         },
                     );
@@ -802,6 +818,7 @@ where
                 reuse: f.reuse,
                 reused: f.reused,
                 prefilled: f.prefilled,
+                turn: f.turn,
                 joined_beside: f.joined_beside,
             })));
         }
@@ -829,7 +846,7 @@ where
         let mut specs: Vec<RowSpec> = Vec::with_capacity(rows.len());
         for (req, tx) in rows {
             match self.prepare(&req) {
-                Ok((slot, session, prepared)) => {
+                Ok((slot, session, prepared, turn)) => {
                     // A static body takes the whole prompt as its row: a
                     // resume (empty suffix) has nothing to give it.
                     if prepared.suffix.is_empty() {
@@ -848,7 +865,7 @@ where
                         eos_ids: req.params.eos_ids.clone(),
                         max_tokens: req.params.max_tokens,
                     });
-                    meta.push(Some((slot, prepared, tx, req.cancel)));
+                    meta.push(Some((slot, prepared, tx, req.cancel, turn)));
                 }
                 Err(e) => {
                     let _ = tx.send(BatchEvent::Error(e.to_string()));
@@ -893,7 +910,7 @@ where
             Ok(outs) => outs,
             Err(e) => {
                 for (session, m) in sessions.into_iter().zip(meta) {
-                    let (slot, _, tx, _) = m.expect("a kept row");
+                    let (slot, _, tx, _, _) = m.expect("a kept row");
                     self.pool.release(slot, session.into_sequence());
                     let _ = tx.send(BatchEvent::Error(e.to_string()));
                 }
@@ -901,7 +918,7 @@ where
             }
         };
         for ((session, m), out) in sessions.into_iter().zip(meta).zip(outs) {
-            let (slot, prepared, tx, cancel) = m.expect("a kept row");
+            let (slot, prepared, tx, cancel, turn) = m.expect("a kept row");
             self.counters.admitted += 1;
             self.counters.retired += 1;
             self.pool.release(slot, session.into_sequence());
@@ -913,6 +930,7 @@ where
                 reuse: prepared.action,
                 reused: prepared.reused,
                 prefilled: prepared.suffix.len(),
+                turn,
                 joined_beside: 0,
             })));
         }

@@ -237,6 +237,7 @@ fn build(front: &Front, engine: &dyn Served, messages: &Value, want: Option<bool
                 want,
                 add_bos: true,
                 expand: None,
+                history: None,
             },
         )
         .unwrap()
@@ -252,6 +253,7 @@ fn decoded(engine: &Stub, ids: Vec<u32>) -> Decoded {
         reuse: ReuseAction::Fresh,
         reused: 0,
         prefilled: 0,
+        turn: Default::default(),
         readback: ReadbackArm::Blocking,
         logits_sha256: None,
         stats: Default::default(),
@@ -421,7 +423,7 @@ fn the_next_turn_reuses_the_sampled_ids_not_their_canonical_tokenization() {
         sampled,
         "the precondition: not canonical"
     );
-    assert!(front.record(&engine, p1.thinking, &reply));
+    assert!(front.record(&engine, p1.origin, &reply));
 
     let second = json!([
         user("Spell the tag."),
@@ -470,7 +472,7 @@ fn reasoning_stripped_splices_the_content_and_persisted_extends() {
         sampled.push(end);
         sampled.extend(bytes("\n\nFour."));
         let reply = decoded(&engine, sampled.clone());
-        assert!(front.record(&engine, p1.thinking, &reply));
+        assert!(front.record(&engine, p1.origin, &reply));
         let second = json!([user("2+2?"), assistant(&reply.text), user("3+3?")]);
         let p2 = build(&front, &engine, &second, Some(true));
         assert_eq!(p2.spliced.matched, 1);
@@ -515,7 +517,7 @@ fn a_dropped_reasoning_is_rendered_as_sent_or_restored_from_the_log() {
         let mut sampled = bytes("Add them.\n");
         sampled.push(end);
         sampled.extend(bytes("\n\nFour."));
-        assert!(front.record(&engine, p1.thinking, &decoded(&engine, sampled.clone())));
+        assert!(front.record(&engine, p1.origin, &decoded(&engine, sampled.clone())));
         let second = json!([user("2+2?"), assistant("Four."), user("3+3?")]);
         let p2 = build(&front, &engine, &second, Some(true));
         let mut log = p1.ids.clone();
@@ -534,7 +536,7 @@ fn an_edited_reply_is_tokenized_as_sent() {
     let first = json!([user("Hi")]);
     let p1 = build(&front, &engine, &first, Some(false));
     let sampled = bytes("It is <think> in text.");
-    assert!(front.record(&engine, p1.thinking, &decoded(&engine, sampled)));
+    assert!(front.record(&engine, p1.origin, &decoded(&engine, sampled)));
     let second = json!([user("Hi"), assistant("It is <think> in TEXT."), user("Ok")]);
     let p2 = build(&front, &engine, &second, Some(false));
     assert_eq!(p2.spliced.matched, 0);
@@ -542,6 +544,496 @@ fn an_edited_reply_is_tokenized_as_sent() {
         p2.ids,
         engine.reference(&second, &kw(&engine, Some(false)), Some(false))
     );
+}
+
+/// A front end that restores a dropped reasoning from the log
+/// (`session.missing_reasoning = log`).
+fn restoring(engine: &Stub) -> Front {
+    Front::new(
+        engine,
+        SessionOptions {
+            restore_reasoning: true,
+            ..SessionOptions::default()
+        },
+    )
+}
+
+/// A reply that reasoned `reasoning` and answered `content`, as sampled
+/// (the tiny Qwen4-exp template's end marker between them).
+fn reasoned(reasoning: &str, content: &str) -> Vec<u32> {
+    let end = TinyTokenizer::qwen4exp().id("</think>").unwrap();
+    let mut ids = bytes(reasoning);
+    ids.push(end);
+    ids.extend(bytes(content));
+    ids
+}
+
+fn build_kw(
+    front: &Front,
+    engine: &dyn Served,
+    messages: &Value,
+    want: Option<bool>,
+    extra: &[(&str, Value)],
+) -> Prompt {
+    let mut kwargs = kw(engine, want);
+    for (k, v) in extra {
+        kwargs.insert((*k).into(), v.clone());
+    }
+    front
+        .prompt(
+            engine,
+            Request {
+                messages,
+                kwargs,
+                want,
+                add_bos: true,
+                expand: None,
+                history: None,
+            },
+        )
+        .unwrap()
+}
+
+fn with(history: &Value, more: &[Value]) -> Value {
+    let mut v = history.as_array().unwrap().clone();
+    v.extend_from_slice(more);
+    json!(v)
+}
+
+/// Two conversations answer with the same text after different reasoning,
+/// turn after turn, interleaved, in both orders. Each conversation's next
+/// turn restores its own reply's reasoning and runs its own sampled ids, so
+/// its log is a prefix of the next prompt, whichever conversation logged
+/// last; the other's reasoning never appears in it.
+#[test]
+fn two_conversations_answering_the_same_text_keep_their_own_reasoning() {
+    for reversed in [false, true] {
+        let engine = Stub::qwen4exp();
+        let front = restoring(&engine);
+        let mut convs = [
+            (
+                "Is it raining?",
+                "Clouds",
+                json!([user("Is it raining?")]),
+                Vec::new(),
+            ),
+            (
+                "Is it cold?",
+                "Frost",
+                json!([user("Is it cold?")]),
+                Vec::new(),
+            ),
+        ];
+        if reversed {
+            convs.reverse();
+        }
+        for round in 0..3 {
+            for c in convs.iter_mut() {
+                let (_, why, history, log) = c;
+                let p = build(&front, &engine, history, Some(true));
+                assert!(
+                    p.ids.starts_with(log),
+                    "reversed={reversed} round {round} {why}: its own log is not a prefix:\n log  {log:?}\n next {:?}",
+                    &p.ids[..log.len().min(p.ids.len())]
+                );
+                let text = engine.text.tokenizer.decode(&p.ids, false).unwrap();
+                let other = if *why == "Clouds" { "Frost" } else { "Clouds" };
+                assert!(
+                    !text.contains(other),
+                    "{why}: {other}'s reasoning restored: {text:?}"
+                );
+                assert_eq!(p.spliced.restored, round, "{why} round {round}");
+                let sampled = reasoned(&format!("{why} {round}.\n"), "\n\nYes.");
+                assert!(front.record(&engine, p.origin, &decoded(&engine, sampled.clone())));
+                *log = p.ids.clone();
+                log.extend_from_slice(&sampled);
+                *history = with(history, &[assistant("Yes."), user("Sure?")]);
+            }
+        }
+    }
+}
+
+/// The same text sampled as different ids in two conversations (one as
+/// bytes, one canonically): each next turn runs its own ids.
+#[test]
+fn the_same_text_sampled_as_different_ids_splices_each_conversations_own() {
+    let text = "It is <think> in text.";
+    for reversed in [false, true] {
+        let engine = Stub::qwen4exp();
+        let front = Front::new(&engine, SessionOptions::default());
+        let canonical = engine.enc(text);
+        assert_ne!(
+            bytes(text),
+            canonical,
+            "the precondition: two tokenizations"
+        );
+        let mut convs = [
+            (json!([user("Spell it.")]), bytes(text)),
+            (json!([user("Say it.")]), canonical),
+        ];
+        if reversed {
+            convs.reverse();
+        }
+        let prompts: Vec<Prompt> = convs
+            .iter()
+            .map(|(q, _)| build(&front, &engine, q, Some(false)))
+            .collect();
+        for ((_, ids), p) in convs.iter().zip(&prompts) {
+            assert!(front.record(&engine, p.origin, &decoded(&engine, ids.clone())));
+        }
+        for ((q, ids), p) in convs.iter().zip(&prompts) {
+            let next = build(
+                &front,
+                &engine,
+                &with(q, &[assistant(text), user("Again?")]),
+                Some(false),
+            );
+            let mut log = p.ids.clone();
+            log.extend_from_slice(ids);
+            assert!(
+                next.ids.starts_with(&log),
+                "reversed={reversed} {q}: not its own ids"
+            );
+            assert_eq!(next.spliced.spliced_tokens, ids.len());
+        }
+    }
+}
+
+/// A history that never received a reply of ours, carrying the same text,
+/// takes nothing from the log: no ids, no reasoning. It is the request as
+/// sent, and the miss is counted.
+#[test]
+fn a_history_that_never_received_the_reply_cannot_restore_it() {
+    let engine = Stub::qwen4exp();
+    let front = restoring(&engine);
+    let p = build(
+        &front,
+        &engine,
+        &json!([user("Is it raining?")]),
+        Some(true),
+    );
+    let sampled = reasoned("Clouds.\n", "\n\nYes.");
+    assert!(front.record(&engine, p.origin, &decoded(&engine, sampled)));
+    let foreign = json!([user("Is it cold?"), assistant("Yes."), user("Sure?")]);
+    let q = build(&front, &engine, &foreign, Some(true));
+    assert_eq!((q.spliced.matched, q.spliced.restored), (0, 0));
+    assert_eq!(q.spliced.unverified, 1);
+    assert_eq!(
+        q.ids,
+        engine.reference(&foreign, &kw(&engine, Some(true)), Some(true))
+    );
+    let text = engine.text.tokenizer.decode(&q.ids, false).unwrap();
+    assert!(!text.contains("Clouds"), "{text:?}");
+}
+
+/// An earlier message the client changed makes a new conversation: the
+/// reply after it is not the logged one, and goes as sent.
+#[test]
+fn an_edited_earlier_message_makes_the_reply_unverified() {
+    let engine = Stub::qwen4exp();
+    let front = Front::new(&engine, SessionOptions::default());
+    let p1 = build(&front, &engine, &json!([user("Hi")]), Some(false));
+    let sampled = bytes("It is <think> in text.");
+    let reply = decoded(&engine, sampled);
+    assert!(front.record(&engine, p1.origin, &reply));
+    let edited = json!([user("Hello"), assistant(&reply.text), user("Ok")]);
+    let p2 = build(&front, &engine, &edited, Some(false));
+    assert_eq!((p2.spliced.matched, p2.spliced.unverified), (0, 1));
+    assert_eq!(
+        p2.ids,
+        engine.reference(&edited, &kw(&engine, Some(false)), Some(false))
+    );
+}
+
+/// A reasoning case: its name, the reply message, the request's extra
+/// template variables, and whether the log restores.
+type Case<'a> = (&'a str, Value, Vec<(&'a str, Value)>, bool);
+
+/// What a history message says about its reasoning decides, under `log`:
+/// absent is restored; `null`, `""` and an explicit strip are kept as sent
+/// and counted; a reply whose reasoning the template keeps after the last
+/// user turn (a tool loop) is not restored under an explicit strip either.
+#[test]
+fn absent_null_empty_and_stripped_reasoning_are_distinct() {
+    let engine = Stub::qwen4exp();
+    let q = json!([user("2+2?")]);
+    let sampled = reasoned("Add them.\n", "\n\nFour.");
+    let cases: [Case; 4] = [
+        ("absent", assistant("Four."), vec![], true),
+        (
+            "null",
+            json!({ "role": "assistant", "content": "Four.", "reasoning_content": null }),
+            vec![],
+            false,
+        ),
+        (
+            "empty",
+            json!({ "role": "assistant", "content": "Four.", "reasoning_content": "" }),
+            vec![],
+            false,
+        ),
+        (
+            "stripped",
+            assistant("Four."),
+            vec![(PRESERVE_THINKING, json!(false))],
+            false,
+        ),
+    ];
+    for (name, reply, extra, restored) in cases {
+        let front = restoring(&engine);
+        let p1 = build_kw(&front, &engine, &q, Some(true), &extra);
+        assert!(front.record(&engine, p1.origin, &decoded(&engine, sampled.clone())));
+        let next = with(&q, &[reply, user("3+3?")]);
+        let p2 = build_kw(&front, &engine, &next, Some(true), &extra);
+        assert_eq!(p2.spliced.matched, 1, "{name}");
+        assert_eq!(p2.spliced.restored, usize::from(restored), "{name}");
+        // `null` and `""` decline what the log would restore; the strip
+        // drops the reply's reasoning from the render, so nothing is wanted.
+        let declined = matches!(name, "null" | "empty");
+        assert_eq!(p2.spliced.declined, usize::from(declined), "{name}");
+        let text = engine.text.tokenizer.decode(&p2.ids, false).unwrap();
+        assert_eq!(text.contains("Add them"), restored, "{name}: {text:?}");
+    }
+    // A tool loop: the reply is after the last user turn, where the
+    // template keeps reasoning whatever `preserve_thinking` says. Absent, it
+    // is restored; under an explicit strip, it is declined.
+    for strip in [false, true] {
+        let front = restoring(&engine);
+        let extra: Vec<(&str, Value)> = if strip {
+            vec![(PRESERVE_THINKING, json!(false))]
+        } else {
+            vec![]
+        };
+        let q = json!([user("Weather?")]);
+        let p1 = build_kw(&front, &engine, &q, Some(true), &extra);
+        let sampled = reasoned("Need the tool.\n", "\n\nChecking.");
+        assert!(front.record(&engine, p1.origin, &decoded(&engine, sampled)));
+        let next = with(
+            &q,
+            &[
+                assistant("Checking."),
+                json!({ "role": "tool", "content": "21" }),
+            ],
+        );
+        let p2 = build_kw(&front, &engine, &next, Some(true), &extra);
+        assert_eq!(p2.spliced.matched, 1, "strip={strip}");
+        assert_eq!(p2.spliced.restored, usize::from(!strip), "strip={strip}");
+        assert_eq!(p2.spliced.declined, usize::from(strip), "strip={strip}");
+        let text = engine.text.tokenizer.decode(&p2.ids, false).unwrap();
+        assert_eq!(
+            text.contains("Need the tool"),
+            !strip,
+            "strip={strip}: {text:?}"
+        );
+    }
+}
+
+/// Whitespace the client trimmed off a reply leaves it ours: matched, its
+/// ids spliced where its text lies, its reasoning restored under `log`.
+#[test]
+fn a_trimmed_reply_is_still_ours() {
+    let engine = Stub::qwen4exp();
+    let front = restoring(&engine);
+    let q = json!([user("2+2?")]);
+    let p1 = build(&front, &engine, &q, Some(true));
+    assert!(front.record(
+        &engine,
+        p1.origin,
+        &decoded(&engine, reasoned("Add.\n", "\n\nFour.\n"))
+    ));
+    let p2 = build(
+        &front,
+        &engine,
+        &with(&q, &[assistant("Four."), user("3+3?")]),
+        Some(true),
+    );
+    assert_eq!((p2.spliced.matched, p2.spliced.restored), (1, 1));
+    assert!(p2.spliced.spliced_tokens >= bytes("Four.").len());
+}
+
+/// The tools a conversation was rendered under are part of its scope: two
+/// conversations alike but for their tools each run their own reply.
+#[test]
+fn the_tools_are_part_of_the_conversation() {
+    let engine = Stub::qwen4exp();
+    let front = Front::new(&engine, SessionOptions::default());
+    let text = "It is <think> in text.";
+    let tool = |name: &str| json!([{ "type": "function", "function": { "name": name } }]);
+    let q = json!([user("Spell it.")]);
+    let arms = [(tool("a"), bytes(text)), (tool("b"), engine.enc(text))];
+    let prompts: Vec<Prompt> = arms
+        .iter()
+        .map(|(t, _)| build_kw(&front, &engine, &q, Some(false), &[(TOOLS, t.clone())]))
+        .collect();
+    for ((_, ids), p) in arms.iter().zip(&prompts) {
+        assert!(front.record(&engine, p.origin, &decoded(&engine, ids.clone())));
+    }
+    for ((t, ids), p) in arms.iter().zip(&prompts) {
+        let next = build_kw(
+            &front,
+            &engine,
+            &with(&q, &[assistant(text), user("Again?")]),
+            Some(false),
+            &[(TOOLS, t.clone())],
+        );
+        let mut log = p.ids.clone();
+        log.extend_from_slice(ids);
+        assert!(next.ids.starts_with(&log), "{t}: not its own ids");
+    }
+}
+
+/// A reply's scope is the history as the client sent it: two
+/// conversations whose rendered messages are alike but whose images differ
+/// (the render sees placeholders) each run their own reply.
+#[test]
+fn the_images_a_conversation_sent_are_part_of_it() {
+    let engine = Stub::qwen4exp();
+    let front = Front::new(&engine, SessionOptions::default());
+    let text = "It is <think> in text.";
+    let sent = |url: &str, more: &[Value]| {
+        let mut v = vec![json!({ "role": "user", "content": [
+            { "type": "image_url", "image_url": { "url": url } },
+            { "type": "text", "text": "Look." },
+        ] })];
+        v.extend_from_slice(more);
+        json!(v)
+    };
+    let prompt = |messages: &Value, history: &Value| {
+        front
+            .prompt(
+                &engine,
+                Request {
+                    messages,
+                    kwargs: kw(&engine, Some(false)),
+                    want: Some(false),
+                    add_bos: true,
+                    expand: None,
+                    history: Some(history),
+                },
+            )
+            .unwrap()
+    };
+    let shown = json!([user("Look.")]);
+    let arms = [("data:a", bytes(text)), ("data:b", engine.enc(text))];
+    let firsts: Vec<Prompt> = arms
+        .iter()
+        .map(|(u, _)| prompt(&shown, &sent(u, &[])))
+        .collect();
+    for ((_, ids), p) in arms.iter().zip(&firsts) {
+        assert!(front.record(&engine, p.origin, &decoded(&engine, ids.clone())));
+    }
+    let more = [assistant(text), user("Again?")];
+    for ((u, ids), p) in arms.iter().zip(&firsts) {
+        let next = prompt(&with(&shown, &more), &sent(u, &more));
+        let mut log = p.ids.clone();
+        log.extend_from_slice(ids);
+        assert!(next.ids.starts_with(&log), "{u}: not its own ids");
+    }
+}
+
+/// Two distinct replies of one conversation with the same text (a
+/// regeneration that reasoned otherwise) leave the text ambiguous: it goes
+/// as sent, nothing restored. The same reply logged twice is one.
+#[test]
+fn a_regenerated_reply_with_the_same_text_is_ambiguous() {
+    let engine = Stub::qwen4exp();
+    let q = json!([user("2+2?")]);
+    let next = with(&q, &[assistant("Four."), user("3+3?")]);
+    for distinct in [true, false] {
+        let front = restoring(&engine);
+        let p1 = build(&front, &engine, &q, Some(true));
+        let a = reasoned("Add them.\n", "\n\nFour.");
+        let b = if distinct {
+            reasoned("Count up.\n", "\n\nFour.")
+        } else {
+            a.clone()
+        };
+        assert!(front.record(&engine, p1.origin, &decoded(&engine, a)));
+        assert!(front.record(&engine, p1.origin, &decoded(&engine, b)));
+        let p2 = build(&front, &engine, &next, Some(true));
+        assert_eq!(
+            p2.spliced.ambiguous,
+            usize::from(distinct),
+            "distinct={distinct}"
+        );
+        assert_eq!(
+            p2.spliced.restored,
+            usize::from(!distinct),
+            "distinct={distinct}"
+        );
+        if distinct {
+            assert_eq!(
+                p2.ids,
+                engine.reference(&next, &kw(&engine, Some(true)), Some(true))
+            );
+        }
+    }
+}
+
+/// A reply the log no longer holds — evicted, or logged by a process that
+/// has since restarted — goes as sent.
+#[test]
+fn an_evicted_or_restarted_reply_goes_as_sent() {
+    let engine = Stub::qwen4exp();
+    let q = json!([user("Spell it.")]);
+    let text = "It is <think> in text.";
+    let next = with(&q, &[assistant(text), user("Again?")]);
+    let reference = engine.reference(&next, &kw(&engine, Some(false)), Some(false));
+    let front = Front::new(&engine, SessionOptions::default());
+    let p1 = build(&front, &engine, &q, Some(false));
+    assert!(front.record(&engine, p1.origin, &decoded(&engine, bytes(text))));
+    assert_ne!(
+        build(&front, &engine, &next, Some(false)).ids,
+        reference,
+        "spliced while logged"
+    );
+    let restarted = Front::new(&engine, SessionOptions::default());
+    let p = build(&restarted, &engine, &next, Some(false));
+    assert_eq!(
+        (p.spliced.matched, p.ids == reference),
+        (0, true),
+        "restarted"
+    );
+    for i in 0..LOG_REPLIES {
+        assert!(front.record(
+            &engine,
+            p1.origin,
+            &decoded(&engine, bytes(&format!("other {i}")))
+        ));
+    }
+    let p = build(&front, &engine, &next, Some(false));
+    assert_eq!(
+        (p.spliced.matched, p.ids == reference),
+        (0, true),
+        "evicted"
+    );
+}
+
+/// Conversations served concurrently through one front end each extend
+/// their own log, every turn, though every reply has the same text.
+#[test]
+fn concurrent_conversations_keep_their_own_replies() {
+    let engine = Stub::qwen4exp();
+    let front = restoring(&engine);
+    std::thread::scope(|s| {
+        for c in 0..4 {
+            let (front, engine) = (&front, &engine);
+            s.spawn(move || {
+                let mut history = json!([user(&format!("Question {c}?"))]);
+                let mut log: Vec<u32> = Vec::new();
+                for round in 0..6 {
+                    let p = build(front, engine, &history, Some(true));
+                    assert!(p.ids.starts_with(&log), "conversation {c} round {round}");
+                    let sampled =
+                        reasoned(&format!("Conversation {c} round {round}.\n"), "\n\nYes.");
+                    assert!(front.record(engine, p.origin, &decoded(engine, sampled.clone())));
+                    log = p.ids.clone();
+                    log.extend_from_slice(&sampled);
+                    history = with(&history, &[assistant("Yes."), user("Again?")]);
+                }
+            });
+        }
+    });
 }
 
 /// The prompt budget's cut, as spans of the one render's ids, is the
@@ -616,7 +1108,7 @@ fn kept_logprobs_line_up_with_the_spliced_ids() {
         top: vec![Vec::new(); sampled.len()],
         rows: None,
     });
-    assert!(front.record(&engine, p1.thinking, &d));
+    assert!(front.record(&engine, p1.origin, &d));
     assert_eq!(
         front.reply("Hello there.").unwrap().logprobs.as_deref(),
         Some(&lp[..])
@@ -646,7 +1138,7 @@ fn a_split_character_aligns_and_a_reply_cut_short_logs_its_part() {
     let p1 = build(&front, &engine, &json!([user("Café?")]), Some(false));
     let sampled = bytes("Un café, s'il vous plaît.");
     let d = decoded(&engine, sampled.clone());
-    assert!(front.record(&engine, p1.thinking, &d));
+    assert!(front.record(&engine, p1.origin, &d));
     let second = json!([user("Café?"), assistant(&d.text), user("Merci")]);
     let p2 = build(&front, &engine, &second, Some(false));
     assert_eq!(p2.spliced.spliced_tokens, sampled.len());
@@ -654,15 +1146,15 @@ fn a_split_character_aligns_and_a_reply_cut_short_logs_its_part() {
     // run ended inside a character — is logged as the ids of that part.
     let mut cut = decoded(&engine, bytes("abc STOP def"));
     cut.text = "abc ".into();
-    assert!(front.record(&engine, p1.thinking, &cut));
+    assert!(front.record(&engine, p1.origin, &cut));
     assert_eq!(front.reply("abc ").unwrap().ids, bytes("abc "));
     let mut held = decoded(&engine, [bytes("ok then"), vec![0xE2]].concat());
     held.text = "ok then".into();
-    assert!(front.record(&engine, p1.thinking, &held));
+    assert!(front.record(&engine, p1.origin, &held));
     assert_eq!(front.reply("ok then").unwrap().ids, bytes("ok then"));
     let mut neither = decoded(&engine, bytes("abc"));
     neither.text = "xyz".into();
-    assert!(!front.record(&engine, p1.thinking, &neither), "not ours");
+    assert!(!front.record(&engine, p1.origin, &neither), "not ours");
 }
 
 /// The log is bounded: the oldest reply goes first, and its text no longer
@@ -675,7 +1167,7 @@ fn the_log_forgets_its_oldest_reply() {
     for i in 0..=LOG_REPLIES {
         assert!(front.record(
             &engine,
-            p.thinking,
+            p.origin,
             &decoded(&engine, bytes(&format!("reply {i}")))
         ));
     }
@@ -760,7 +1252,7 @@ fn the_checkpoints_templates_build_the_plain_prompt_and_cut_the_same_spans() {
             let p1 = build(&fresh, &engine, &first, want);
             let sampled = engine.enc("The capital of France is Paris.");
             let reply = decoded(&engine, sampled.clone());
-            assert!(fresh.record(&engine, p1.thinking, &reply), "{repo}");
+            assert!(fresh.record(&engine, p1.origin, &reply), "{repo}");
             let second = json!([
                 user("What is the capital of France?"),
                 assistant(&reply.text),
@@ -821,7 +1313,7 @@ fn a_reply_given_back_renders_as_the_templates_own_split() {
         sampled.push(end);
         sampled.extend(bytes("\n\nFour."));
         let reply = decoded(&engine, sampled.clone());
-        assert!(front.record(&engine, p1.thinking, &reply));
+        assert!(front.record(&engine, p1.origin, &reply));
         let second = json!([user("2+2?"), assistant(&reply.text), user("3+3?")]);
         let p2 = build(&front, &engine, &second, None);
         let mut kw = kw(&engine, None);
@@ -891,7 +1383,7 @@ fn a_reply_that_closes_its_block_twice_is_stripped_past_the_last_marker() {
             sampled.push(end);
             sampled.extend(bytes("\n\nFour."));
             let reply = decoded(&engine, sampled.clone());
-            assert!(front.record(&engine, p1.thinking, &reply));
+            assert!(front.record(&engine, p1.origin, &reply));
             let second = json!([user("2+2?"), assistant(&reply.text), user("3+3?")]);
             let p2 = build(&front, &engine, &second, want);
             assert_eq!(p2.spliced.matched, 1);

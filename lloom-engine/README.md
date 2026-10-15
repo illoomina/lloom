@@ -119,11 +119,11 @@ Two contracts on the one port:
 
 | endpoint | shape | for |
 |---|---|---|
-| `GET /health` | `{}`; `chat_template_reads` says which of the engine's template variables (`enable_thinking`, `reasoning_effort`) the checkpoint's template reads | readiness |
+| `GET /health` | `{}`; `chat_template_reads` says which of the engine's template variables (`enable_thinking`, `reasoning_effort`) the checkpoint's template reads; `logprobs` whether per-token logprobs are served (and why not); `reuse` every request's prefix reuse counted by outcome, reason and state, with the last request's report | readiness |
 | `GET /v1/models` | OpenAI | model id |
 | `POST /tokenize` | `{prompt, add_special_tokens?}` → `{tokens, count}` (also `{content, add_special}`) | exact-count prompt construction; counts what `/v1/completions` will report |
 | `POST /v1/completions` | OpenAI + `ignore_eos`; text or token-id prompt; `stream`; `usage`; `timings` | pipette's `end_to_end_latency` / `max_memory_usage` cells, generic clients |
-| `POST /v1/chat/completions` | OpenAI; the checkpoint's own `chat_template.jinja` (with `chat_template_kwargs`); `reasoning_effort` (OpenAI's field, or `chat_template_kwargs.reasoning_effort`; the values are the template's — Qwen4-exp: `low`, `medium`, `xhigh`); a value the template rejects → 400 with its message; an effort the template does not act on (LFM2, or thinking off) is served without it, with a warning; `timings` carries `reasoning_effort`, `template_kwargs_ignored` and `prompt_ids_sha256`; `stream` SSE; `logprobs`/`top_logprobs` at `max_tokens = 1`; `guided_choice` → 400 | pipette's `eval` cells, chat clients |
+| `POST /v1/chat/completions` | OpenAI; the checkpoint's own `chat_template.jinja` (with `chat_template_kwargs`); `reasoning_effort` (OpenAI's field, or `chat_template_kwargs.reasoning_effort`; the values are the template's — Qwen4-exp: `low`, `medium`, `xhigh`); a value the template rejects → 400 with its message; an effort the template does not act on (LFM2, or thinking off) is served without it, with a warning; `timings` carries `reasoning_effort`, `template_kwargs_ignored` and `prompt_ids_sha256`; `stream` SSE; `logprobs` (`top_logprobs` up to 64, refused by name where the decode body reads no row); `return_token_ids`; `guided_choice` → 400 | pipette's `eval` cells, chat clients |
 | `POST /prefill_throughput` | `{prompt_tokens}` → `{prompt_tps, prompt_tokens, prefill_ms}` | the MLX-sidecar contract pipette's throughput runner speaks |
 | `POST /decode_throughput` | `{prompt_tokens, decode_tokens}` → `{generation_tps, decode_tokens, decode_ms, context_ms, readback}` | " |
 | `POST /end_to_end_latency` | `{prompt, decode_tokens}` → `{total_ms, prompt_tokens, completion_tokens}` | " |
@@ -148,8 +148,14 @@ What the benchmark endpoints bracket, stated so the numbers are readable
 - `/v1/*` responses carry a `timings` block from the loop's own clocks:
   `prompt_submit_ms` (encode, not execution), `predicted_ms` (the sum of the
   loop's steps), the readback arm, commits, poll fallbacks, overrun, and
-  `tokens` — the generated ids, so a gate compares a run against a recorded
-  token digest without a second path to the model.
+  `turn` — what the request reused of the session (the boundary it found,
+  how the state there was made ready, the outcome and its reason, the ids
+  kept, replayed and newly prefilled; `design/docs/sequence-reuse-design.md`
+  §2.3f).
+- A response is text. The session keeps the sampled ids internally (the
+  next turn runs them), and returns ids — `prompt_token_ids`, `token_ids`,
+  and `timings.tokens` for a gate's digest — only under `return_token_ids`,
+  and logprobs only under `logprobs` (§2.3d).
 
 The throughput cells tile a seed passage into their prompts: `--prompt-seed-file`,
 else `PIPETTE_PROMPT_SEED_TEXT` / `PIPETTE_MLX_PROMPT_SEED_TEXT` (what the MLX

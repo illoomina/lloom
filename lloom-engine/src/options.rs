@@ -1185,6 +1185,7 @@ impl SamplingConfig {
             thinking: None,
             turn_tail: 0,
             logprobs: None,
+            cold: false,
         }
     }
 }

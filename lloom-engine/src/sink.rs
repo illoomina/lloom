@@ -70,6 +70,12 @@ impl DeltaBuffer {
         self.dirty.store(true, Ordering::Release);
     }
 
+    /// Bytes handed over and not yet taken: the backlog a slow consumer
+    /// leaves (a lock; off the per-token path).
+    pub fn pending_bytes(&self) -> usize {
+        self.buf.lock().len()
+    }
+
     /// Swap what accumulated into `out` (cleared first; both strings keep
     /// their capacity). Returns whether anything was taken.
     pub fn take_into(&self, out: &mut String) -> bool {
@@ -142,14 +148,20 @@ impl<S: Send + 'static> FragmentSink<S> {
     }
 
     /// Drain everything pushed and return the consumer's state.
+    ///
+    /// A panic in `drain` reaches the caller: under `panic = "unwind"` it is
+    /// re-raised here; under `panic = "abort"` it ended the process inside the
+    /// consumer thread, so `join` cannot observe it.
     pub fn finish(mut self) -> S {
         self.buf.flush(&mut self.spill);
         self.done.store(true, Ordering::Release);
-        self.thread
-            .take()
-            .expect("finished once")
-            .join()
-            .unwrap_or_else(|p| std::panic::resume_unwind(p))
+        match self.thread.take().expect("finished once").join() {
+            Ok(state) => state,
+            #[cfg(panic = "unwind")]
+            Err(payload) => std::panic::resume_unwind(payload),
+            #[cfg(not(panic = "unwind"))]
+            Err(_) => unreachable!("a panic aborts the process before join returns"),
+        }
     }
 }
 
@@ -214,5 +226,15 @@ mod tests {
         }
         sink.push("y");
         assert_eq!(sink.finish(), 1, "nothing is drained after the stop");
+    }
+
+    #[test]
+    #[should_panic(expected = "the consumer's own panic")]
+    fn a_consumer_panic_reaches_the_caller_of_finish() {
+        let mut sink = FragmentSink::start((), |_: &mut (), _s: &str| -> bool {
+            panic!("the consumer's own panic")
+        });
+        sink.push("x");
+        sink.finish();
     }
 }

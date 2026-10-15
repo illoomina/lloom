@@ -1613,7 +1613,16 @@ impl MetalDevice {
         self.commands.eos_gate().is_armed()
     }
 
+    /// Disarm and report. The run's gated work completes first, under its
+    /// own flag: `EosGate::end`'s report and the next `begin`'s clear both
+    /// need the run drained, and a run that ended early (an error out of the
+    /// decode loop, its guard disarming here) has not. Its queued forwards
+    /// would otherwise run after the next run's host store cleared the flag,
+    /// take their plain path and write past the EOS. On the normal path the
+    /// loop has drained and the wait finds nothing in flight. A command
+    /// buffer that failed is recorded for the next wait to report.
     pub fn eos_gate_end(&self) -> crate::EosGateReport {
+        let _ = self.wait_until_completed();
         self.kernels.set_eos_gated(false);
         self.commands.eos_gate().end()
     }

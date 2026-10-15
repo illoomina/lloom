@@ -10,12 +10,13 @@
 use super::budgets::Dropped;
 use super::common::Text;
 use super::served::Served;
-use super::template::{ThinkTags, ENABLE_THINKING, NOT_READ, PROBE_VALUE, REASONING_EFFORT};
+use super::template::{ThinkTags, ENABLE_THINKING, NOT_READ, PROBE_VALUE, REASONING_EFFORT, TOOLS};
 use super::thinking::{self, By, Thinking};
 use crate::Decoded;
 use anyhow::Result;
 use parking_lot::Mutex;
 use serde_json::{json, Map, Value};
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, VecDeque};
 use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -407,55 +408,193 @@ pub struct Reply {
 /// How a message's text matched a logged reply.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Matched {
-    /// The content is the whole reply as we returned it.
+    /// The content is the whole reply as we returned it (surrounding
+    /// whitespace aside).
     Full,
     /// The content is the reply's content: the reasoning was sent apart or
     /// dropped.
     Content,
 }
 
-/// The replies of ours a front end has returned, keyed by the text the
-/// client may send back. Bounded; the oldest go first.
+/// The conversation a reply answers: the messages before it as the client
+/// sent them, the tools and the template it was rendered under, and the
+/// model. A reply of ours in a later history takes the logged ids and
+/// reasoning only where the history before it hashes to the same scope.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Scope([u8; 32]);
+
+/// What a reply is logged against: its scope, and the thinking of the
+/// prompt it followed (where its reasoning block starts).
+#[derive(Debug, Clone, Copy)]
+pub struct Origin {
+    pub scope: Scope,
+    pub thinking: Option<Thinking>,
+}
+
+/// What a history message says about its reasoning, across the fields a
+/// template reads it from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Given {
+    /// No reasoning field: the client sent none.
+    Absent,
+    /// A field set to `null`: the client declares none.
+    Null,
+    /// A field set to `""`: the reply's reasoning, as the client has it, is
+    /// empty.
+    Empty,
+    /// Reasoning text (or any other value): the client's own.
+    Text,
+}
+
+fn given_reasoning(m: &Value) -> Given {
+    let mut given = Given::Absent;
+    for f in REASONING_FIELDS {
+        given = match (m.get(f), given) {
+            (None, g) => g,
+            (Some(Value::Null), Given::Absent) => Given::Null,
+            (Some(Value::Null), g) => g,
+            (Some(Value::String(s)), _) if s.is_empty() => Given::Empty,
+            (Some(_), _) => return Given::Text,
+        };
+    }
+    given
+}
+
+/// The texts a reply is found by: the whole reply, and its content where it
+/// has a reasoning block apart from it, each without surrounding whitespace.
+fn keys(reply: &Reply) -> impl Iterator<Item = &str> {
+    let whole = reply.text.trim();
+    let content = reply.content_text.trim();
+    std::iter::once(whole)
+        .chain((content != whole).then_some(content))
+        .filter(|k| !k.is_empty())
+}
+
+/// The replies one key of one scope names. More than one distinct reply (a
+/// regeneration that sampled other ids or other reasoning) leaves the text
+/// ambiguous for as long as any of them is logged.
+#[derive(Default)]
+struct Candidates {
+    replies: Vec<Arc<Reply>>,
+    ambiguous: bool,
+}
+
+/// What a history message's text found in the log.
+enum Found {
+    /// One reply of this conversation.
+    One(Arc<Reply>, Matched),
+    /// Several distinct replies of this conversation carry the text.
+    Ambiguous,
+    /// Only replies of other conversations carry it.
+    Elsewhere,
+    None,
+}
+
+/// A logged reply and the scope it answers.
+struct Logged {
+    scope: Scope,
+    reply: Arc<Reply>,
+}
+
+/// The replies of ours a front end has returned, found by the conversation
+/// they answer and the text the client may send back. Bounded; the oldest
+/// go first.
 #[derive(Default)]
 struct ReplyLog {
-    entries: VecDeque<Arc<Reply>>,
-    by_text: HashMap<String, Arc<Reply>>,
+    entries: VecDeque<Logged>,
+    by_scope: HashMap<Scope, HashMap<String, Candidates>>,
+    /// Logged replies per text, in any scope: a text known only elsewhere is
+    /// counted as a provenance miss, never used.
+    texts: HashMap<String, usize>,
     tokens: usize,
 }
 
 impl ReplyLog {
-    fn insert(&mut self, reply: Reply) {
+    fn insert(&mut self, scope: Scope, reply: Reply) {
         let reply = Arc::new(reply);
         self.tokens += reply.ids.len();
-        self.by_text.insert(reply.text.clone(), Arc::clone(&reply));
-        let content = reply.content_text.trim();
-        if !content.is_empty() && content != reply.text {
-            self.by_text.insert(content.to_string(), Arc::clone(&reply));
+        let texts = self.by_scope.entry(scope).or_default();
+        for key in keys(&reply) {
+            *self.texts.entry(key.to_string()).or_default() += 1;
+            let c = texts.entry(key.to_string()).or_default();
+            match c
+                .replies
+                .iter()
+                .position(|r| r.ids == reply.ids && r.reasoning == reply.reasoning)
+            {
+                // The same reply again (a regeneration that sampled the same
+                // ids): one provenance.
+                Some(i) => c.replies[i] = Arc::clone(&reply),
+                None => {
+                    c.replies.push(Arc::clone(&reply));
+                    c.ambiguous |= c.replies.len() > 1;
+                }
+            }
         }
-        self.entries.push_back(reply);
+        self.entries.push_back(Logged { scope, reply });
         while self.entries.len() > LOG_REPLIES
             || (self.tokens > LOG_TOKENS && self.entries.len() > 1)
         {
             let Some(old) = self.entries.pop_front() else {
                 break;
             };
-            self.tokens -= old.ids.len();
-            for key in [old.text.as_str(), old.content_text.trim()] {
-                if self.by_text.get(key).is_some_and(|r| Arc::ptr_eq(r, &old)) {
-                    self.by_text.remove(key);
+            self.forget(old);
+        }
+    }
+
+    fn forget(&mut self, old: Logged) {
+        self.tokens -= old.reply.ids.len();
+        for key in keys(&old.reply) {
+            if let Some(n) = self.texts.get_mut(key) {
+                *n -= 1;
+                if *n == 0 {
+                    self.texts.remove(key);
                 }
+            }
+            let Some(texts) = self.by_scope.get_mut(&old.scope) else {
+                continue;
+            };
+            if let Some(c) = texts.get_mut(key) {
+                c.replies.retain(|r| !Arc::ptr_eq(r, &old.reply));
+                if c.replies.is_empty() {
+                    texts.remove(key);
+                }
+            }
+            if texts.is_empty() {
+                self.by_scope.remove(&old.scope);
             }
         }
     }
 
-    fn find(&self, content: &str) -> Option<(Arc<Reply>, Matched)> {
-        if let Some(r) = self.by_text.get(content) {
-            if r.text == content {
-                return Some((Arc::clone(r), Matched::Full));
-            }
+    fn find(&self, scope: Scope, content: &str) -> Found {
+        let key = content.trim();
+        if key.is_empty() {
+            return Found::None;
         }
-        let r = self.by_text.get(content.trim())?;
-        (r.content_text.trim() == content.trim()).then(|| (Arc::clone(r), Matched::Content))
+        match self.by_scope.get(&scope).and_then(|t| t.get(key)) {
+            Some(c) if c.ambiguous => Found::Ambiguous,
+            Some(c) => {
+                let r = &c.replies[0];
+                let how = if r.text.trim() == key {
+                    Matched::Full
+                } else {
+                    Matched::Content
+                };
+                Found::One(Arc::clone(r), how)
+            }
+            None if self.texts.contains_key(key) => Found::Elsewhere,
+            None => Found::None,
+        }
+    }
+
+    /// The newest reply whose whole text or content is `content`, in any
+    /// scope: a test's or a report's lookup, never a prompt's.
+    fn any(&self, content: &str) -> Option<Arc<Reply>> {
+        self.entries
+            .iter()
+            .rev()
+            .find(|l| l.reply.text == content || l.reply.content_text.trim() == content.trim())
+            .map(|l| Arc::clone(&l.reply))
     }
 }
 
@@ -475,6 +614,10 @@ pub struct Request<'a> {
     /// What the rendered text becomes before it is encoded (the images'
     /// expansions).
     pub expand: Option<Expand<'a>>,
+    /// The messages as the client sent them, when `messages` is a rewrite
+    /// of them (an image's pixels replaced by its placeholder): what a
+    /// reply's scope is hashed over. `None` is `messages`.
+    pub history: Option<&'a Value>,
 }
 
 /// The replies of ours a prompt carries, and what of them it ran as sampled.
@@ -490,6 +633,15 @@ pub struct Spliced {
     pub reply_tokens: usize,
     /// The ids the prompt took from the log.
     pub spliced_tokens: usize,
+    /// Assistant messages whose text several distinct replies of this
+    /// conversation carry: tokenized as sent.
+    pub ambiguous: usize,
+    /// Assistant messages whose text only another conversation's reply
+    /// carries: tokenized as sent, nothing restored.
+    pub unverified: usize,
+    /// Replies of ours whose reasoning the log would have restored, kept as
+    /// sent because the message says null or empty or the request strips.
+    pub declined: usize,
 }
 
 /// Where each message's rendering starts in the prompt's ids.
@@ -523,6 +675,8 @@ pub struct Prompt {
     pub logprobs: Option<Vec<Option<f32>>>,
     /// The template renders this prompt took (1 by construction).
     pub renders: u64,
+    /// What the reply to this prompt is logged against.
+    pub origin: Origin,
 }
 
 /// A prompt fitted to a budget by dropping its oldest turns.
@@ -540,17 +694,71 @@ pub struct Front {
     options: SessionOptions,
     log: Mutex<ReplyLog>,
     tokenizations: AtomicU64,
+    /// The model and the template every scope is hashed under.
+    context: [u8; 32],
 }
 
 impl Front {
     /// Read `engine`'s constants (once: this is the load-time read).
     pub fn new(engine: &dyn Served, options: SessionOptions) -> Self {
+        let mut h = Sha256::new();
+        h.update(b"lloom front scope 1\0");
+        h.update(engine.model_name().as_bytes());
+        h.update(b"\0");
+        if let Some(text) = engine.text() {
+            if let Some(t) = &text.template {
+                h.update(t.digest());
+            }
+            h.update(text.bos_token.as_bytes());
+        }
         Self {
             constants: engine.text().map(Constants::read),
             options,
             log: Mutex::new(ReplyLog::default()),
             tokenizations: AtomicU64::new(0),
+            context: h.finalize().into(),
         }
+    }
+
+    /// The scope before each of `messages` and after the last (`n + 1`
+    /// entries): a chain of digests over the context, the request's tools
+    /// and each message as sent.
+    fn scopes(&self, messages: &[Value], kwargs: &Map<String, Value>) -> Vec<Scope> {
+        let mut h = Sha256::new();
+        h.update(self.context);
+        h.update(
+            kwargs
+                .get(TOOLS)
+                .unwrap_or(&Value::Null)
+                .to_string()
+                .as_bytes(),
+        );
+        let mut at = Scope(h.finalize().into());
+        let mut out = Vec::with_capacity(messages.len() + 1);
+        out.push(at);
+        for m in messages {
+            let mut h = Sha256::new();
+            h.update(at.0);
+            h.update(m.to_string().as_bytes());
+            at = Scope(h.finalize().into());
+            out.push(at);
+        }
+        out
+    }
+
+    /// What a reply to `messages` (as the next request will carry them,
+    /// rendered under `kwargs`) is logged against: for a caller that keeps a
+    /// history other than the request's (a prompt budget that dropped turns
+    /// from the conversation itself).
+    pub fn origin(
+        &self,
+        messages: &Value,
+        kwargs: &Map<String, Value>,
+        thinking: Option<Thinking>,
+    ) -> Origin {
+        let list = messages.as_array().map_or(&[][..], Vec::as_slice);
+        let scope = *self.scopes(list, kwargs).last().expect("n + 1 scopes");
+        Origin { scope, thinking }
     }
 
     pub fn constants(&self) -> Option<&Constants> {
@@ -649,18 +857,24 @@ impl Front {
         let Some(template) = text.template.as_ref() else {
             return self.plain(engine, req);
         };
+        let empty = Vec::new();
+        let list = req.messages.as_array().unwrap_or(&empty);
+        let sent = req
+            .history
+            .and_then(Value::as_array)
+            .filter(|h| h.len() == list.len())
+            .unwrap_or(list);
+        let scopes = self.scopes(sent, &req.kwargs);
         let mut kwargs = req.kwargs;
         if let (Some(p), false) = (self.options.persist, kwargs.contains_key(PRESERVE_THINKING)) {
             if c.persist_switch {
                 kwargs.insert(PRESERVE_THINKING.into(), Value::Bool(p));
             }
         }
-        let empty = Vec::new();
-        let list = req.messages.as_array().unwrap_or(&empty);
 
-        // The replies of ours, matched by text; a matched reply with a
-        // reasoning block is given to the template as the model wrote it,
-        // reasoning and content apart.
+        // The replies of ours, found by the conversation before them and
+        // their text; a matched reply with a reasoning block is given to the
+        // template as the model wrote it, reasoning and content apart.
         let mut spliced = Spliced::default();
         let mut matched: Vec<(usize, Arc<Reply>)> = Vec::new();
         let mut rewritten: Option<Vec<Value>> = None;
@@ -676,6 +890,9 @@ impl Front {
         let last_user = list
             .iter()
             .rposition(|m| m.get("role").and_then(Value::as_str) == Some("user"));
+        // An explicit strip (the request's or the option's) restores
+        // nothing, whatever the template keeps.
+        let strips = kwargs.get(PRESERVE_THINKING).and_then(Value::as_bool) == Some(false);
         {
             let log = self.log.lock();
             for (i, m) in list.iter().enumerate() {
@@ -686,16 +903,21 @@ impl Front {
                 let Some(content) = m.get("content").and_then(Value::as_str) else {
                     continue;
                 };
-                let Some((reply, how)) = log.find(content) else {
-                    continue;
+                let (reply, how) = match log.find(scopes[i], content) {
+                    Found::One(reply, how) => (reply, how),
+                    Found::Ambiguous => {
+                        spliced.ambiguous += 1;
+                        continue;
+                    }
+                    Found::Elsewhere => {
+                        spliced.unverified += 1;
+                        continue;
+                    }
+                    Found::None => continue,
                 };
                 spliced.matched += 1;
                 spliced.reply_tokens += reply.ids.len();
-                let has_field = REASONING_FIELDS.iter().any(|f| {
-                    m.get(*f)
-                        .and_then(Value::as_str)
-                        .is_some_and(|s| !s.is_empty())
-                });
+                let given = given_reasoning(m);
                 // Kept, the reply is rendered as the model wrote it,
                 // reasoning and content apart. Stripped, the message goes to
                 // the template as sent: what survives of the whole text is
@@ -703,11 +925,17 @@ impl Front {
                 // keeps what follows the *last* marker, and a reply can write
                 // one again after the engine closed its block), and the
                 // sampled ids are spliced wherever its text is theirs.
+                // Full, the reasoning is in the text the client sent and is
+                // only given apart; by content, it is restored from the log,
+                // and only for a message that left it absent.
                 let kept = persists || last_user.is_some_and(|u| i > u);
-                let restore = kept
+                let wanted = kept
                     && reply.reasoning.is_some()
-                    && !has_field
                     && (how == Matched::Full || self.options.restore_reasoning);
+                let restore = wanted && given == Given::Absent && (how == Matched::Full || !strips);
+                if wanted && !restore && how == Matched::Content {
+                    spliced.declined += 1;
+                }
                 if restore {
                     if how == Matched::Content {
                         spliced.restored += 1;
@@ -898,12 +1126,19 @@ impl Front {
             spliced,
             logprobs: keep_lp.then_some(logprobs),
             renders,
+            origin: Origin {
+                scope: *scopes.last().expect("n + 1 scopes"),
+                thinking: Some(thinking),
+            },
         })
     }
 
     /// A family without a text side: render (with the effort's check),
     /// encode and switch through the seam, as before.
     fn plain(&self, engine: &dyn Served, req: Request<'_>) -> Result<Prompt> {
+        let scope = self
+            .origin(req.history.unwrap_or(req.messages), &req.kwargs, None)
+            .scope;
         let before = engine.template_renders();
         let rendered = engine.render_checked(req.messages, &req.kwargs, &[REASONING_EFFORT])?;
         let renders = engine.template_renders() - before;
@@ -948,6 +1183,10 @@ impl Front {
             spliced: Spliced::default(),
             logprobs: None,
             renders,
+            origin: Origin {
+                scope,
+                thinking: Some(th),
+            },
         })
     }
 
@@ -1013,16 +1252,12 @@ impl Front {
         Some(None)
     }
 
-    /// Keep a reply in the session log: the ids `decoded` sampled after a
-    /// prompt whose thinking was `thinking`, with what `capture` kept of
-    /// their logprobs. A reply whose text is not its ids' decoding (a stop
-    /// string cut it) is not kept. Returns whether it was.
-    pub fn record(
-        &self,
-        engine: &dyn Served,
-        thinking: Option<Thinking>,
-        decoded: &Decoded,
-    ) -> bool {
+    /// Keep a reply in the session log against `origin`: the ids `decoded`
+    /// sampled, with what the run kept of their logprobs. A reply whose text
+    /// is not a prefix of whole units of its ids' decoding is not kept.
+    /// Returns whether it was.
+    pub fn record(&self, engine: &dyn Served, origin: Origin, decoded: &Decoded) -> bool {
+        let thinking = origin.thinking;
         let Some(text) = engine.text() else {
             return false;
         };
@@ -1105,23 +1340,27 @@ impl Front {
             ),
             _ => (None, None),
         };
-        self.log.lock().insert(Reply {
-            ids: ids.to_vec(),
-            text: full,
-            reasoning,
-            content,
-            tail,
-            reasoning_text,
-            content_text,
-            logprobs,
-            rows,
-        });
+        self.log.lock().insert(
+            origin.scope,
+            Reply {
+                ids: ids.to_vec(),
+                text: full,
+                reasoning,
+                content,
+                tail,
+                reasoning_text,
+                content_text,
+                logprobs,
+                rows,
+            },
+        );
         true
     }
 
-    /// The reply the log holds for `content`, for a test or a report.
+    /// The newest reply the log holds whose text or content is `content`,
+    /// in any conversation: for a test or a report, never a prompt.
     pub fn reply(&self, content: &str) -> Option<Arc<Reply>> {
-        self.log.lock().find(content).map(|(r, _)| r)
+        self.log.lock().any(content)
     }
 }
 
@@ -1154,7 +1393,7 @@ pub fn logprobs_refused_on(body: lloom::nn::Body) -> Option<String> {
         processors: false,
         budget: false,
         digest: false,
-        logprobs: true,
+        logprobs: Some(0),
     };
     lloom::nn::refuse(body, &asks)
         .err()

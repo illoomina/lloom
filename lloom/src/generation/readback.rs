@@ -324,6 +324,12 @@ pub trait ReadbackStrategy {
         None
     }
 
+    /// The tokens the GPU has published on this strategy's ring (the
+    /// stamp), for the terminal diagnostic; `None` with no mapped ring.
+    fn published_count(&self) -> Option<usize> {
+        None
+    }
+
     /// Whether every token is stamped as it is published, so a
     /// [`RingReader`] sees token `k` before the command stream runs anything
     /// encoded after it — what a GPU wait on a host-filled slot needs
@@ -828,6 +834,11 @@ pub struct RingReader {
     /// new is woken from it ([`Self::notify_on_publish`]).
     #[cfg(feature = "metal")]
     publish: Option<std::sync::Arc<lloom_tensor::metal_backend::PublishEvent>>,
+    /// The decode loop's own EOS watch, for the terminal diagnostic
+    /// (`nn::terminal_trace`), which times a watch and a streaming reader
+    /// apart.
+    #[cfg(any(debug_assertions, feature = "profile"))]
+    watch: bool,
 }
 
 // SAFETY: the pointers are into Metal buffers the held tensors keep alive; the
@@ -865,6 +876,15 @@ impl RingReader {
         }
         #[cfg(not(feature = "metal"))]
         None
+    }
+
+    /// Mark this reader as the decode loop's own EOS watch, for the
+    /// terminal diagnostic (`nn::terminal_trace`). No effect on reading.
+    pub fn mark_watch(&mut self) {
+        #[cfg(any(debug_assertions, feature = "profile"))]
+        {
+            self.watch = true;
+        }
     }
 
     /// The last stamp consumed, EOS included — the reader's own position.
@@ -1029,6 +1049,10 @@ impl RingReader {
             }
             self.cursor = cursor;
             self.ended = ended;
+            #[cfg(any(debug_assertions, feature = "profile"))]
+            if ended {
+                crate::nn::terminal_trace::reader_eos(self.watch);
+            }
             Ok(out.len() - before)
         }
     }
@@ -2062,6 +2086,8 @@ impl Ring {
                 slot_shift: (total_tiles - behind) % total_tiles,
                 ended: false,
                 publish: self.ring.publish_event(),
+                #[cfg(any(debug_assertions, feature = "profile"))]
+                watch: false,
             })
         }
     }
@@ -2582,6 +2608,10 @@ impl ReadbackStrategy for Ring {
 
     fn reader(&self) -> Option<RingReader> {
         Ring::reader(self)
+    }
+
+    fn published_count(&self) -> Option<usize> {
+        self.ring.published_generation().map(|g| g as usize)
     }
 
     fn arm_publish_event(

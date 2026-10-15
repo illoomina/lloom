@@ -292,6 +292,19 @@ pub struct CommandMarker {
     signalled: Option<u64>,
 }
 
+impl CommandMarker {
+    /// Whether the marker's buffer has completed (successfully or not).
+    pub fn is_complete(&self) -> bool {
+        self.cb.status().0 >= MTLCommandBufferStatus::Completed.0
+    }
+
+    /// The buffer's GPU end time (`CLOCK_UPTIME_RAW` seconds), valid once
+    /// [`Self::is_complete`].
+    pub fn gpu_end_time(&self) -> f64 {
+        self.cb.gpu_end_time()
+    }
+}
+
 #[derive(Clone, Copy)]
 struct CommitReceipt {
     epoch: Epoch,
@@ -1680,6 +1693,21 @@ impl Commands {
 
     pub fn marker_complete(&self, marker: &CommandMarker) -> bool {
         marker.cb.status() == MTLCommandBufferStatus::Completed
+    }
+
+    /// Dispatches encoded into the open buffer and not yet committed.
+    pub fn open_dispatches(&self) -> usize {
+        self.core.compute_count.load(Ordering::Acquire)
+    }
+
+    /// The last buffer committed and not yet pruned, as a marker; `None`
+    /// when every committed buffer has completed and been pruned.
+    pub fn last_committed_marker(&self) -> Result<Option<CommandMarker>, MetalKernelError> {
+        let state = self.lock_state()?;
+        Ok(state.in_flight.last().cloned().map(|cb| CommandMarker {
+            cb,
+            signalled: None,
+        }))
     }
 
     /// Whether the marker's buffer ended in error.

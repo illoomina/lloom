@@ -1569,7 +1569,13 @@ pub struct LoadConfig {
     )]
     pub decision_template: Option<String>,
     /// Load no vision or audio tower (a GGUF's mmproj, a VL checkpoint's tower): for text workloads, at the tower's memory. Image requests are then refused by name, and `/v1/models` lists text input only.
-    #[opt(bool, flag = "text-only", path = "model.text_only", status = "advanced", cli = "text-only")]
+    #[opt(
+        bool,
+        flag = "text-only",
+        path = "model.text_only",
+        status = "advanced",
+        cli = "text-only"
+    )]
     pub text_only: bool,
     /// Compile the prefill pipelines at load (off: the first prompt compiles them inside its own time to first token).
     #[opt(bool, flag = "warmup", path = "model.warmup", status = "advanced", switches = ["no-warmup=false"])]

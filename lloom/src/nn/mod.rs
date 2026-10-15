@@ -69,6 +69,7 @@ pub mod signal;
 pub mod slab;
 pub mod slot_cache;
 pub mod speculator;
+pub mod terminal_trace;
 pub mod turn_checkpoint;
 pub mod var_builder;
 pub mod var_map;

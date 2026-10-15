@@ -89,12 +89,9 @@ pub struct Row {
     pub before: &'static str,
 }
 
-/// Every front-end default. Read at `dba525072` (before the option tree):
-/// `serve`, bench's cells and `chat` passed `--reuse-prefix` (off),
-/// `--reuse-prefix` (off) and `!--no-reuse` (on) to the engine
-/// (`app/serve.rs:169`, `:2279`, `app/chat.rs:286`); `chat` took 1024 new
-/// tokens where none was asked (`chat.rs:270-276`); `serve` and the cells
-/// took a 512-token CHUNK at a batch (`serve.rs:157-159`, `:2267-2269`).
+/// Every front-end default, each `before` the value its front-end resolved
+/// before the option tree (the sites read: `decode-driver-design.md`
+/// Stage 7).
 pub const ROWS: &[Row] = &[
     Row {
         key: "context.prefix.reuse",

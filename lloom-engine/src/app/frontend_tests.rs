@@ -14,8 +14,8 @@ use clap::FromArgMatches;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 
-/// `lloom config` of `dba525072`, the commit before the option tree, under
-/// an empty environment (byte-identical to the dump #938's audit committed).
+/// The tree `lloom config` printed under an empty environment before the
+/// option tree existed.
 const BEFORE_TREE: &str = include_str!("options-v1/inputs/config-dba525072.json");
 const HELP_BEFORE: [(&str, &str); 3] = [
     ("chat", include_str!("options-v1/inputs/chat-help.txt")),
@@ -30,7 +30,7 @@ const MOVED_ELSEWHERE: &[(&str, &str, &str, &str)] = &[(
     "kernels.quant_matvec.batched_rows",
     "false",
     "true",
-    "#942 (8f0ad52bd, tuning.md §13.5w): the row axis on under `fast`; `deterministic` never takes it",
+    "the row axis, on under `fast`; `deterministic` never takes it (tuning.md §13.5w)",
 )];
 
 type Front<'a> = Box<dyn Fn(&mut EngineOptions) -> Result<(), String> + 'a>;
@@ -287,7 +287,7 @@ fn every_spelling_of_a_front_end_key_names_it_and_the_value_holds() {
 }
 
 /// The unset defaults against the tree before the option tree. The library
-/// tree reads back as itself (every value `dba525072` resolved is today's
+/// tree reads back as itself (every value resolved before the tree is today's
 /// default); every flag default the subcommands' help printed then is the
 /// subcommand's default now; and every difference is an approved exception
 /// by number, pending (the old value still resolves) or landed (the new

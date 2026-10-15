@@ -1448,3 +1448,87 @@ fn the_keep_logprobs_refusal_follows_the_decode_body() {
         assert!(why.starts_with(says), "{body:?}: {why}");
     }
 }
+
+/// The tiny Qwen4-exp tokenizer's end marker.
+fn q4_end() -> u32 {
+    TinyTokenizer::qwen4exp().id("</think>").unwrap()
+}
+
+/// A reply whose prompt left the block open, stopped by `max_tokens` before,
+/// at and after its closing marker: the log keeps what of it is reasoning as
+/// reasoning whether or not the block closed, every sampled id, and no
+/// marker the model did not sample.
+#[test]
+fn a_reply_stopped_inside_its_reasoning_keeps_it_as_reasoning() {
+    let engine = Stub::qwen4exp();
+    let front = Front::new(&engine, SessionOptions::default());
+    let p1 = build(&front, &engine, &json!([user("2+2?")]), Some(true));
+    assert!(p1.thinking.unwrap().on, "the prompt leaves the block open");
+    let end = q4_end();
+    for (case, ids, reasoning, content) in [
+        ("before", bytes("Add them"), "Add them", ""),
+        ("at", [bytes("Add them"), vec![end]].concat(), "Add them", ""),
+        (
+            "after",
+            [bytes("Add them"), vec![end], bytes("\n\nFour")].concat(),
+            "Add them",
+            "\n\nFour",
+        ),
+    ] {
+        let mut d = decoded(&engine, ids.clone());
+        d.stop = Stop::Length;
+        assert!(front.record(&engine, p1.origin, &d), "{case}");
+        let r = front.reply(&d.text).unwrap();
+        assert_eq!(r.ids, ids, "{case}: every sampled id");
+        assert_eq!(
+            (r.reasoning_text.as_str(), r.content_text.as_str()),
+            (reasoning, content),
+            "{case}: the reasoning, and the content past the marker"
+        );
+    }
+}
+
+/// A stop string that begins inside a token (`<tool_response>` is one id;
+/// the stop is `resp`, withheld from its first byte): the delivered text
+/// ends inside that token's text. The log keeps the whole ids before it as
+/// sampled and the text past them as text — the accepted frontier — and the
+/// next turn splices those ids and encodes the rest, the render's own.
+/// Stops that end on a character's units, or between ids, keep every unit
+/// before them.
+#[test]
+fn a_stop_inside_a_token_keeps_the_whole_ids_before_it() {
+    let engine = Stub::qwen4exp();
+    let front = Front::new(&engine, SessionOptions::default());
+    let p1 = build(&front, &engine, &json!([user("Tools?")]), Some(false));
+    let tr = TinyTokenizer::qwen4exp().id("<tool_response>").unwrap();
+    let mut d = decoded(&engine, [bytes("ab"), vec![tr], bytes("cd")].concat());
+    d.stop = Stop::StopString;
+    d.text = "ab<tool_".into();
+    assert!(
+        front.record(&engine, p1.origin, &d),
+        "a reply whose delivered text ends inside a token is logged"
+    );
+    let r = front.reply("ab<tool_").unwrap();
+    assert_eq!(r.ids, bytes("ab"), "the whole ids before the cut, as sampled");
+    let second = json!([user("Tools?"), assistant("ab<tool_"), user("More?")]);
+    let p2 = build(&front, &engine, &second, Some(false));
+    assert_eq!(p2.spliced.matched, 1, "{:?}", p2.spliced);
+    assert_eq!(p2.spliced.spliced_tokens, 2, "{:?}", p2.spliced);
+    let kwargs = kw(&engine, Some(false));
+    let decode = |ids: &[u32]| engine.text.tokenizer.decode(ids, false).unwrap();
+    assert_eq!(
+        decode(&p2.ids),
+        decode(&engine.reference(&second, &kwargs, Some(false))),
+        "the template's render of the delivered text"
+    );
+
+    // A character's units stay whole: a stop at `é!` keeps `caf`, one
+    // across ids (`fé`) keeps `ca`.
+    for (stop_at, kept) in [("caf", "caf"), ("ca", "ca")] {
+        let mut d = decoded(&engine, bytes("café!"));
+        d.stop = Stop::StopString;
+        d.text = stop_at.into();
+        assert!(front.record(&engine, p1.origin, &d), "{stop_at}");
+        assert_eq!(front.reply(stop_at).unwrap().ids, bytes(kept), "{stop_at}");
+    }
+}

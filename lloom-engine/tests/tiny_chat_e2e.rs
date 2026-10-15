@@ -2859,3 +2859,111 @@ fn the_token_api_runs_the_ids_sent_and_returns_the_ids_and_logprobs_run() {
     drop(server);
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// The common prefix of two id lists.
+fn lcp(a: &[Value], b: &[Value]) -> usize {
+    a.iter().zip(b).take_while(|(x, y)| x == y).count()
+}
+
+/// A reply cut inside its reasoning, continued, per
+/// `session.incomplete_reasoning`, on the tiny Qwen4-exp with thinking on
+/// (its template keeps a past reply's reasoning, as Qwen3.8's does). The
+/// first turn's reply is reasoning only (letters, biased) and `max_tokens`
+/// or a stop string ends it before any end marker; the client sends it back
+/// as the content it got.
+/// - `text` (the default): the reply goes to the template as the text it is,
+///   after the empty reasoning block the template writes, so the next prompt
+///   leaves the log at the previous prompt's end and the turn restores the
+///   checkpoint standing there.
+/// - `reasoning`: the reply goes to the template as the open reasoning it
+///   is; the template closes the block after it and the log extends.
+/// - `recover`: rendered as `text`, the checkpoint before the divergence an
+///   open reply's re-render makes (on the tiny tokenizer, the same place).
+#[test]
+fn a_reply_cut_inside_its_reasoning_continues_by_the_arm() {
+    for arm in ["text", "reasoning", "recover"] {
+        let (dir, model, base) = qwen_tiny(&format!("open-reasoning-{arm}"));
+        let mut args: Vec<&str> = base.iter().map(String::as_str).collect();
+        args.extend(["--prefix-reuse", "true"]);
+        if arm != "text" {
+            args.extend(["--incomplete-reasoning", arm]);
+        }
+        let server = Server::start(&model, &args);
+        let turn = |messages: Value, extra: Value| {
+            let mut r = json!({ "messages": messages, "temperature": 0, "enable_thinking": true,
+                                "return_token_ids": true, "ignore_eos": true,
+                                "logit_bias": { "97": 100, "98": 100, "99": 100 } });
+            for (k, v) in extra.as_object().unwrap() {
+                r[k] = v.clone();
+            }
+            let (status, body) = server.call("POST", "/v1/chat/completions", &r);
+            assert_eq!(status, 200, "{arm}: {body}");
+            body
+        };
+        let q = json!([{ "role": "user", "content": "Probe." }]);
+        let probe = turn(q.clone(), json!({ "max_tokens": 12 }));
+        let text = probe["choices"][0]["message"]["content"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let stop = (2..=4)
+            .flat_map(|w| (3..text.len().saturating_sub(w)).map(move |i| (i, w)))
+            .map(|(i, w)| (i, text[i..i + w].to_string()))
+            .find(|(i, s)| text.find(s.as_str()) == Some(*i))
+            .map(|(_, s)| s)
+            .unwrap_or_else(|| panic!("{arm}: no stop past the third letter: {text:?}"));
+        for (cause, extra) in [
+            ("length", json!({ "max_tokens": 6 })),
+            ("stop", json!({ "max_tokens": 12, "stop": stop })),
+        ] {
+            let one = turn(q.clone(), extra);
+            let delivered = one["choices"][0]["message"]["content"]
+                .as_str()
+                .unwrap()
+                .to_string();
+            assert!(
+                !delivered.is_empty() && !delivered.contains("</think>"),
+                "{arm} {cause}: a reply inside its reasoning: {delivered:?}"
+            );
+            let p1 = one["prompt_token_ids"].as_array().unwrap().clone();
+            let r1 = one["choices"][0]["token_ids"].as_array().unwrap().clone();
+            let two = turn(
+                json!([q[0], { "role": "assistant", "content": delivered },
+                       { "role": "user", "content": "Again." }]),
+                json!({ "max_tokens": 4 }),
+            );
+            let p2 = two["prompt_token_ids"].as_array().unwrap().clone();
+            let log: Vec<Value> = p1.iter().chain(&r1).cloned().collect();
+            let kept = lcp(&p2, &log);
+            let t = &two["timings"]["turn"];
+            eprintln!(
+                "OPEN-REASONING {arm} {cause}: delivered {delivered:?} p1 {} r1 {} kept {kept} turn {t}",
+                p1.len(),
+                r1.len()
+            );
+            assert_eq!(two["timings"]["history_matched"], 1, "{arm} {cause}: {two}");
+            match (arm, cause) {
+                ("reasoning", "length") => {
+                    assert_eq!(kept, log.len(), "{arm}: the log extends");
+                    assert_eq!(t["outcome"], "extend", "{arm}: {t}");
+                }
+                ("reasoning", _) => {
+                    let accepted = delivered.len();
+                    assert_eq!(kept, p1.len() + accepted, "{arm} {cause}: to the stop");
+                    assert!(
+                        matches!(t["outcome"].as_str(), Some("rewind" | "restore")),
+                        "{arm} {cause}: {t}"
+                    );
+                }
+                _ => {
+                    assert_eq!(kept, p1.len(), "{arm} {cause}: diverges at the prompt's end");
+                    assert_eq!(t["outcome"], "restore", "{arm} {cause}: {t}");
+                    assert_eq!(t["diverged_at"], json!(p1.len()), "{arm} {cause}: {t}");
+                    assert_eq!(t["replayed"], 0, "{arm} {cause}: {t}");
+                }
+            }
+        }
+        drop(server);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}

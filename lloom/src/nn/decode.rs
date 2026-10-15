@@ -1977,8 +1977,10 @@ impl<'m, M: CausalLM> Session<'m, M> {
         }
         readback.check_sampler(sampler.sampling())?;
         spec.begin_at(SeqId(0), prompt, &self.seq.tokens)?;
+        readback.begin_run();
 
         let device = readback.device().clone();
+        crate::nn::terminal_trace::run_begin(readback.published_count());
         // The hot thread's scheduling class, held for the run and restored on
         // return (`generation::hot_thread`): two syscalls a generation, none a
         // step.
@@ -2154,13 +2156,17 @@ impl<'m, M: CausalLM> Session<'m, M> {
         let mut watch = if watch_on {
             readback.reader().map(|mut r| {
                 r.resume_at_published();
+                r.mark_watch();
                 r
             })
         } else {
             None
         };
-        let mut watch_ids: Vec<u32> =
-            Vec::with_capacity(if watch.is_some() { opts.adaptive_lead() + 1 } else { 0 });
+        let mut watch_ids: Vec<u32> = Vec::with_capacity(if watch.is_some() {
+            opts.adaptive_lead() + 1
+        } else {
+            0
+        });
 
         let mut produced = 0usize;
         let mut since_commit = 0usize;
@@ -2202,8 +2208,15 @@ impl<'m, M: CausalLM> Session<'m, M> {
         // The fused publish (lloom #735 step 5) where the strategy can take it.
         readback.set_fused_publish(opts.adaptive_commit && opts.fused_publish);
 
+        // Forwards fed past the prompt so far, for the terminal diagnostic.
+        let fed_now = |s: &Self| s.seq.pos - pos_before - prompt.len();
         loop {
             if opts.reached(produced) {
+                crate::nn::terminal_trace::producer_stop(
+                    crate::nn::terminal_trace::StopBy::Length,
+                    fed_now(self),
+                    readback.published_count(),
+                );
                 break;
             }
             // One autorelease pool per step, dropped last: the step's encoders
@@ -2213,6 +2226,11 @@ impl<'m, M: CausalLM> Session<'m, M> {
             if let Some(stop) = &opts.stop {
                 if stop.load(std::sync::atomic::Ordering::Acquire) {
                     stats.stopped_by_flag = true;
+                    crate::nn::terminal_trace::producer_stop(
+                        crate::nn::terminal_trace::StopBy::Flag,
+                        fed_now(self),
+                        readback.published_count(),
+                    );
                     break;
                 }
             }
@@ -2222,15 +2240,25 @@ impl<'m, M: CausalLM> Session<'m, M> {
                     // The watch reads every step and the host is at most
                     // `adaptive_lead` steps ahead of what the GPU publishes,
                     // so a lap means the bound the watch rests on is broken.
-                    lloom_tensor::bail!("Session::decode: the EOS watch fell behind the ring ({lap})")
+                    lloom_tensor::bail!(
+                        "Session::decode: the EOS watch fell behind the ring ({lap})"
+                    )
                 }
                 if w.ended() {
                     stats.stopped_by_eos_watch = true;
+                    crate::nn::terminal_trace::producer_stop(
+                        crate::nn::terminal_trace::StopBy::Watch,
+                        fed_now(self),
+                        readback.published_count(),
+                    );
                     break;
                 }
             }
             let _pool = lloom_tensor::AutoreleaseScope::new();
             stats.steps += 1;
+            if stats.steps == 1 {
+                crate::nn::terminal_trace::decode_begin();
+            }
             // Under `CANDLE_METAL_PROFILE=1` only: tell the profile recorder
             // which step the command buffers committed from here on belong to,
             // so an idle gap between two buffers can be laid at a step (issue
@@ -2381,6 +2409,11 @@ impl<'m, M: CausalLM> Session<'m, M> {
                 if is_eos {
                     produced -= 1;
                     eos = true;
+                    crate::nn::terminal_trace::producer_stop(
+                        crate::nn::terminal_trace::StopBy::EosOfLast,
+                        fed_now(self),
+                        readback.published_count(),
+                    );
                     break;
                 }
                 if pace {
@@ -2537,6 +2570,11 @@ impl<'m, M: CausalLM> Session<'m, M> {
                 if is_eos {
                     produced -= 1;
                     eos = true;
+                    crate::nn::terminal_trace::producer_stop(
+                        crate::nn::terminal_trace::StopBy::EosOfLast,
+                        fed_now(self),
+                        readback.published_count(),
+                    );
                     break;
                 }
             }
@@ -2636,6 +2674,11 @@ impl<'m, M: CausalLM> Session<'m, M> {
                     let go_on = on_tokens(&batch)?;
                     all_ids.extend_from_slice(&batch);
                     if !go_on {
+                        crate::nn::terminal_trace::producer_stop(
+                            crate::nn::terminal_trace::StopBy::Hook,
+                            fed_now(self),
+                            readback.published_count(),
+                        );
                         #[cfg(any(debug_assertions, feature = "profile"))]
                         stats.step_ns.push(step_start.elapsed().as_nanos() as u64);
                         break;
@@ -2799,6 +2842,7 @@ impl<'m, M: CausalLM> Session<'m, M> {
         }
         stats.produced = produced;
         stats.tail_ns = tail_start.elapsed().as_nanos() as u64;
+        crate::nn::terminal_trace::run_end(produced, overrun, eos, &device);
         stats.step_markers = pacer.taken;
         stats.step_waits = pacer.waited;
         stats.readback = readback.counters();

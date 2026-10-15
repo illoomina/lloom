@@ -303,6 +303,13 @@ pub trait ReadbackStrategy {
         let _ = dropped_in_batch;
     }
 
+    /// A run begins on this strategy: ids an earlier run left undrained are
+    /// no run's to return, and are forgotten. A run that ends in an error
+    /// returns before its final drain, and a pooled strategy outlives it; its
+    /// next run would otherwise hand those ids out as its first tokens. The
+    /// default holds nothing across runs.
+    fn begin_run(&mut self) {}
+
     /// Which EOS-learning arm this strategy is, for the `RESULT` line: `host`
     /// (the id is read back and compared at feed time), `flag` (the ring's
     /// device flag, one blocking readback per step), `poll` (the flag polled
@@ -321,6 +328,12 @@ pub trait ReadbackStrategy {
     /// (`Ring::reader`); `None` on a strategy with no mapped ring. On the
     /// trait so a loop generic over the strategy (`lfm2-release`) can take one.
     fn reader(&self) -> Option<RingReader> {
+        None
+    }
+
+    /// The tokens the GPU has published on this strategy's ring (the
+    /// stamp), for the terminal diagnostic; `None` with no mapped ring.
+    fn published_count(&self) -> Option<usize> {
         None
     }
 
@@ -828,6 +841,11 @@ pub struct RingReader {
     /// new is woken from it ([`Self::notify_on_publish`]).
     #[cfg(feature = "metal")]
     publish: Option<std::sync::Arc<lloom_tensor::metal_backend::PublishEvent>>,
+    /// The decode loop's own EOS watch, for the terminal diagnostic
+    /// (`nn::terminal_trace`), which times a watch and a streaming reader
+    /// apart.
+    #[cfg(any(debug_assertions, feature = "profile"))]
+    watch: bool,
 }
 
 // SAFETY: the pointers are into Metal buffers the held tensors keep alive; the
@@ -865,6 +883,15 @@ impl RingReader {
         }
         #[cfg(not(feature = "metal"))]
         None
+    }
+
+    /// Mark this reader as the decode loop's own EOS watch, for the
+    /// terminal diagnostic (`nn::terminal_trace`). No effect on reading.
+    pub fn mark_watch(&mut self) {
+        #[cfg(any(debug_assertions, feature = "profile"))]
+        {
+            self.watch = true;
+        }
     }
 
     /// The last stamp consumed, EOS included — the reader's own position.
@@ -1029,6 +1056,10 @@ impl RingReader {
             }
             self.cursor = cursor;
             self.ended = ended;
+            #[cfg(any(debug_assertions, feature = "profile"))]
+            if ended {
+                crate::nn::terminal_trace::reader_eos(self.watch);
+            }
             Ok(out.len() - before)
         }
     }
@@ -2062,6 +2093,8 @@ impl Ring {
                 slot_shift: (total_tiles - behind) % total_tiles,
                 ended: false,
                 publish: self.ring.publish_event(),
+                #[cfg(any(debug_assertions, feature = "profile"))]
+                watch: false,
             })
         }
     }
@@ -2565,6 +2598,11 @@ impl ReadbackStrategy for Ring {
         batch.iter().position(|id| self.eos_ids_host.contains(id))
     }
 
+    fn begin_run(&mut self) {
+        let undrained = self.history.forget_undrained();
+        self.counters.ring_discarded += undrained as u64;
+    }
+
     fn note_eos_truncation(&mut self, dropped_in_batch: usize) {
         // Only the host-on-drain arm can hand the loop a batch with an EOS in
         // it; the others retracted theirs per step and never get here.
@@ -2582,6 +2620,10 @@ impl ReadbackStrategy for Ring {
 
     fn reader(&self) -> Option<RingReader> {
         Ring::reader(self)
+    }
+
+    fn published_count(&self) -> Option<usize> {
+        self.ring.published_generation().map(|g| g as usize)
     }
 
     fn arm_publish_event(

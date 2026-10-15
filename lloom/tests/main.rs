@@ -13,6 +13,7 @@
 //! `every_test_file_is_a_module` below reads this directory and this file,
 //! so a file that is not a module here fails the suite instead of silently
 //! not running.
+mod accept_frontier;
 mod axes_registry;
 mod batch_norm;
 mod batched_decode_tests;
@@ -79,6 +80,7 @@ mod optimizer_remarks;
 mod optimizer_walk;
 mod page_cache_probe;
 mod pos_embed_resample_tests;
+mod prepare_path;
 mod quant_kind_throughput;
 mod qwen3_5_mtp;
 mod qwen3_5_tiny;
@@ -144,6 +146,7 @@ mod short_conv_golden;
 mod shortconv_ring;
 mod shortconv_step;
 mod state_capacity;
+mod terminal_trace;
 mod tiny_checkpoints;
 mod tiny_fp_kinds;
 mod tiny_manifest_drift;

@@ -294,7 +294,16 @@ where
     for &k in &cuts {
         for run_ahead in [1usize, 3, 8] {
             let at = format!("{shape} EOS at {k}, run_ahead {run_ahead}");
-            let g = case::<P>(&dev, verify, None, &stream, k, run_ahead, true, k + 1 + EXTRA)?;
+            let g = case::<P>(
+                &dev,
+                verify,
+                None,
+                &stream,
+                k,
+                run_ahead,
+                true,
+                k + 1 + EXTRA,
+            )?;
             eprintln!("QWEN-GATE {at}: gated {g:?}");
             assert_reconciled(&at, &g);
         }

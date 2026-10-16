@@ -20,7 +20,7 @@ use std::borrow::{Borrow, BorrowMut};
 use crate::generation::{HotThread, Sampling};
 use crate::nn::decode::{
     begin_pass, end_executor_step, end_pass, ragged_layout, DecodeOptions, DecodeOut, DecodeStats,
-    PassShape, RoundStats, StepPacer,
+    PassShape, PrefillWork, RoundStats, StepPacer,
 };
 use crate::nn::model::BatchedCausalLM;
 use crate::nn::speculator::{
@@ -111,7 +111,7 @@ where
         if spec.n_seq() == 0 {
             lloom_tensor::bail!("decode_spec_batched: the proposer has no sequence slots");
         }
-        let depth = opts.pacer_depth();
+        let pacer = StepPacer::for_decode(&opts);
         Ok(Self {
             free_seq: (0..spec.n_seq()).rev().collect(),
             spec,
@@ -122,7 +122,7 @@ where
             generation: 0,
             rounds: 0,
             finished: Vec::new(),
-            pacer: StepPacer::new(depth),
+            pacer,
             hot_thread: HotThread::claim(),
             run_start: std::time::Instant::now(),
         })
@@ -153,7 +153,6 @@ where
         on_tokens: &mut dyn FnMut(RowId, &[u32]) -> Result<()>,
     ) -> Result<usize> {
         let mut joined = 0usize;
-        let tile = self.opts.prefill_tile;
         for i in 0..self.slots.len() {
             let Some(slot) = self.slots[i].as_mut() else {
                 continue;
@@ -168,10 +167,21 @@ where
             let t0 = std::time::Instant::now();
             let s: &mut Session<'m, M> = slot.session.borrow_mut();
             s.seq.last_logits = None;
-            self.pacer.before_forward(&self.device)?;
-            let (logits, probe, units) =
-                s.prefill_streamed(&mut self.spec, slot.seq, &slot.prompt, tile, &self.device)?;
-            self.pacer.after_forward(&self.device)?;
+            let work = PrefillWork::resolve(&self.opts, s.seq.pos, slot.prompt.len(), true)?;
+            let before = self.pacer.counters();
+            let seeded = s.prefill_streamed(
+                &mut self.spec,
+                slot.seq,
+                &slot.prompt,
+                &work,
+                &mut self.pacer,
+                &self.device,
+            );
+            // Keep the same marker queue across joins and rounds. Restoring
+            // the round's depth never discards an outstanding seed marker.
+            self.pacer.set_depth(self.opts.pacer_depth());
+            let (logits, probe, units) = seeded?;
+            let after = self.pacer.counters();
             let anchor = logits
                 .squeeze(0)?
                 .argmax(lloom_tensor::D::Minus1)?
@@ -181,6 +191,8 @@ where
             let lane = &mut slot.lane;
             lane.stats.prefill_ns = t0.elapsed().as_nanos() as u64;
             lane.stats.prefill_units = units;
+            lane.stats.step_markers = after.0 - before.0;
+            lane.stats.step_waits = after.1 - before.1;
             lane.anchor_tok = anchor;
             lane.joined = true;
             joined += 1;

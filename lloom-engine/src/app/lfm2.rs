@@ -2404,6 +2404,7 @@ impl<P: Lfm2Shape> Engine<P> {
                     max_tokens: decode_tokens,
                     eos_ids: NEVER_EOS.to_vec(),
                     readback,
+                    prefill_tile,
                     ..DecodeParams::default()
                 };
                 let t = Instant::now();

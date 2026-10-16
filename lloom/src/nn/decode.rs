@@ -79,7 +79,9 @@ use crate::nn::speculator::{
 use lloom_tensor::{Device, Result, Tensor};
 
 mod prefill_work;
-use prefill_work::PrefillWork;
+#[cfg(test)]
+mod speculative_prefill_tests;
+pub(crate) use prefill_work::PrefillWork;
 
 /// The K=1 identity proposer: drafts nothing, so the loop takes the baseline
 /// body. Stage 1's only admitted family.
@@ -1409,7 +1411,7 @@ impl StepPacer {
     }
 
     /// Reserve the largest bound this run can use before encoding starts.
-    fn for_decode(opts: &DecodeOptions) -> Self {
+    pub(crate) fn for_decode(opts: &DecodeOptions) -> Self {
         let capacity =
             opts.pacer_depth()
                 .max(opts.prefill_pacer_depth)
@@ -1443,13 +1445,21 @@ impl StepPacer {
     }
 
     /// Setup-only depth changes reuse the capacity reserved by `for_decode`.
-    fn set_depth(&mut self, depth: usize) {
+    pub(crate) fn set_depth(&mut self, depth: usize) {
         self.depth = depth.max(IN_FLIGHT_FLOOR);
+        #[cfg(test)]
+        speculative_prefill_tests::note(speculative_prefill_tests::Event::Depth(self.depth));
         #[cfg(feature = "metal")]
         debug_assert!(self.depth <= self.pending.entries.capacity());
     }
 
+    pub(crate) fn counters(&self) -> (u64, u64) {
+        (self.taken, self.waited)
+    }
+
     pub(crate) fn before_forward(&mut self, device: &Device) -> Result<()> {
+        #[cfg(test)]
+        speculative_prefill_tests::note(speculative_prefill_tests::Event::Before(self.depth));
         #[cfg(feature = "metal")]
         if let Device::Metal(m) = device {
             while self.pending.entries.len() >= self.depth {
@@ -1465,6 +1475,8 @@ impl StepPacer {
     }
 
     pub(crate) fn after_forward(&mut self, device: &Device) -> Result<()> {
+        #[cfg(test)]
+        speculative_prefill_tests::note(speculative_prefill_tests::Event::After(self.depth));
         #[cfg(feature = "metal")]
         if let Device::Metal(m) = device {
             self.push(m.flush_marker()?, 1);
@@ -2876,7 +2888,7 @@ impl<'m, M: CausalLM> Session<'m, M> {
     where
         R: ReadbackStrategy,
     {
-        let work = PrefillWork::single(opts, self.seq.pos, prompt.len(), pace)?;
+        let work = PrefillWork::resolve(opts, self.seq.pos, prompt.len(), pace)?;
         self.prefill_forwards_prepared(readback, prompt, &work, pacer)
     }
 
@@ -3013,60 +3025,58 @@ impl<'m, M: CausalLM> Session<'m, M> {
         })
     }
 
-    /// Prefill `prompt` in the units `ubatch` names and seed `spec`'s sequence
-    /// `seq` from every one of them: `begin`, then per unit a forward, its
-    /// probe taken and `observe`d with an empty accepted tail — the drafter
-    /// keys the unit's positions into its own context at the offset it
-    /// carries — so the drafter's context covers the whole prompt when the
-    /// last unit's logits come back. Returns those logits and the LAST unit's
-    /// probe, still unobserved: the caller reads the argmax back (the one host
-    /// wait of a seed, kept out of here so a driver can prefill N sequences
-    /// before it waits on any) and observes with it as the accepted tail.
+    /// Seed from the resolved outer forwards, retaining the existing target
+    /// forward's pass ownership (no new driver plan bracket). Each non-final
+    /// probe is observed before the unit's pacing marker, so that marker also
+    /// covers the drafter's queued reads. The last probe is returned unobserved
+    /// with its logits: a pipeline may enqueue other lanes before reading any
+    /// anchor. Producers own probe escapes; pipelined callers hold logits.
     ///
-    /// The units are `decode`'s — `ubatch` first, then the remainder — and
-    /// `0` is the incumbent one-shot. A target that overwrites its probe per
-    /// forward would seed the drafter from the last unit alone if a unit were
-    /// skipped; `probe_drops` is checked across the seed so that is a refusal
-    /// rather than a lower accept rate nothing else sees (§10.2w). The third
-    /// element is the number of forwards taken (`DecodeStats::prefill_units`).
+    /// `begin_at` follows the reused prefix. Stale probes are drained before
+    /// counting drops; a dropped probe within this seed still refuses the run.
+    /// This descriptor is an execution schedule, not an admission capability.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn prefill_streamed<S>(
         &mut self,
         spec: &mut S,
         seq: SeqId,
         prompt: &[u32],
-        ubatch: usize,
+        work: &PrefillWork,
+        pacer: &mut StepPacer,
         device: &Device,
     ) -> Result<(Tensor, <S::Probe as TargetProbe>::Output, usize)>
     where
         S: Speculator,
         M: Probes<S::Probe>,
     {
-        // The drafter follows the target's reuse: what the cache kept is
-        // `self.seq.tokens` (`Session::prepare` left the log at the reused
-        // prefix), and `prompt` is keyed after it.
+        if prompt.is_empty()
+            || work.start() != self.seq.pos
+            || work.end() - work.start() != prompt.len()
+        {
+            lloom_tensor::bail!("speculative prefill work does not match the non-empty suffix")
+        }
+        if let Some(depth) = work.active_depth() {
+            pacer.set_depth(depth);
+        }
         spec.begin_at(seq, prompt, &self.seq.tokens)?;
-        // Whatever an earlier forward left in the probe slots — a warmup's, a
-        // previous request's — predates this seed and is nobody's positions:
-        // drained here, so the count below can move only between two probes
-        // of THIS seed, which is the defect the refusal is for.
         let _stale = self.model.take_probe(&mut self.seq.cache)?;
         let drops_before = self.model.probe_drops(&self.seq.cache);
         let mut off = 0usize;
-        let mut units = 0usize;
-        let mut step = if ubatch == 0 { prompt.len() } else { ubatch };
-        loop {
+        for (unit, span) in work.forwards().enumerate() {
             let _pool = lloom_tensor::AutoreleaseScope::new();
-            let w = step.min(prompt.len() - off);
+            let w = span.width;
             let chunk = &prompt[off..off + w];
             let input = Tensor::new(chunk, device)?.unsqueeze(0)?;
-            let logits = self
-                .model
-                .forward(&input, self.seq.pos, &mut self.seq.cache)?;
+            if work.active_depth().is_some() {
+                pacer.before_forward(device)?;
+            }
+            // Keep the incumbent model-owned/pool pass route. Composing this
+            // through ordinary prefill would newly plan retained probes on
+            // targets whose producer has not declared that escape.
+            let logits = self.model.forward(&input, span.past, &mut self.seq.cache)?;
             self.seq.pos += w;
             self.seq.tokens.extend_from_slice(chunk);
             off += w;
-            units += 1;
-            step = prompt.len();
             let probe = self.model.take_probe(&mut self.seq.cache)?;
             let drops = self.model.probe_drops(&self.seq.cache);
             if drops != drops_before {
@@ -3078,11 +3088,19 @@ impl<'m, M: CausalLM> Session<'m, M> {
                 );
             }
             if off < prompt.len() {
+                drop(logits);
                 spec.observe(seq, &probe, &[])?;
+                if work.active_depth().is_some() {
+                    pacer.after_forward(device)?;
+                }
             } else {
-                return Ok((logits, probe, units));
+                if work.active_depth().is_some() {
+                    pacer.after_forward(device)?;
+                }
+                return Ok((logits, probe, unit + 1));
             }
         }
+        unreachable!("non-empty resolved work covers the suffix")
     }
 
     /// Decode from `prompt` with a real speculative proposer — stage 2 of
@@ -3224,17 +3242,20 @@ impl<'m, M: CausalLM> Session<'m, M> {
             ..DecodeStats::default()
         };
 
-        // Prefill, in `opts.prefill_ubatch()`'s units, each unit's probe keyed
+        // Prefill in the shared resolved units, each unit's probe keyed
         // into the drafter as it lands (`prefill_streamed`); the last unit's
         // argmax is the first anchor — the token whose logits produced the
         // first draft — exactly as the `lfm2-dspark-verify` example takes
         // `logits.argmax` when it does not hold the last prompt token back.
         let pos_before = self.seq.pos;
         let prefill_start = std::time::Instant::now();
+        let work = PrefillWork::resolve(opts, self.seq.pos, prompt.len(), true)?;
+        let mut prefill_pacer = StepPacer::for_decode(opts);
         let (logits, prefill_probe, prefill_units) =
-            self.prefill_streamed(spec, seq, prompt, opts.prefill_ubatch(), &device)?;
+            self.prefill_streamed(spec, seq, prompt, &work, &mut prefill_pacer, &device)?;
         stats.prefill_ns = prefill_start.elapsed().as_nanos() as u64;
         stats.prefill_units = prefill_units;
+        (stats.step_markers, stats.step_waits) = prefill_pacer.counters();
 
         // The prefill's step closes before its token is drawn, as the K=1
         // loop's does: the draw's allocations are not the prefill pass's.
@@ -3264,6 +3285,13 @@ impl<'m, M: CausalLM> Session<'m, M> {
         // after a fully-accepted prompt.
         spec.observe(seq, &prefill_probe, std::slice::from_ref(&anchor_tok))?;
         end_executor_step(&device)?;
+        // As for intermediate units, observe has queued the probe's last
+        // reader. Release these seed-only views before later rounds; native
+        // custody still follows the queued uses, not these logical drops.
+        drop(prefill_probe);
+        drop(logits);
+        // Dropping seed receipts adds no completion wait.
+        drop(prefill_pacer);
 
         // The prefill's own argmax is the first generated token — it is what
         // non-speculative greedy would emit as token 0 (the prefill logits' argmax),
@@ -3535,16 +3563,26 @@ impl<'m, M: CausalLM> Session<'m, M> {
 
         // Prefill every sequence before reading any back, so the GPU has all
         // the prompts queued while the host waits on the first. Each prefill
-        // runs in `opts.prefill_ubatch()`'s units and seeds its drafter slot
+        // runs in the shared resolved units and seeds its drafter slot
         // unit by unit (`prefill_streamed`); only the last unit's probe waits
         // here for its anchor.
         let mut logits = Vec::with_capacity(n);
+        let mut prefill_pacer = StepPacer::for_decode(opts);
         for (i, s) in sessions.iter_mut().enumerate() {
             s.seq.last_logits = None;
             let pos_before = s.seq.pos;
             let prefill_start = std::time::Instant::now();
-            let (l, probe, prefill_units) =
-                s.prefill_streamed(spec, SeqId(i), prompts[i], opts.prefill_ubatch(), device)?;
+            let work = PrefillWork::resolve(opts, s.seq.pos, prompts[i].len(), true)?;
+            let before = prefill_pacer.counters();
+            let (l, probe, prefill_units) = s.prefill_streamed(
+                spec,
+                SeqId(i),
+                prompts[i],
+                &work,
+                &mut prefill_pacer,
+                device,
+            )?;
+            let after = prefill_pacer.counters();
             // Read after the other sequences' prefills: held outside them.
             logits.push((s.hold_logits(l)?, probe));
             lanes.push(Lane {
@@ -3558,6 +3596,8 @@ impl<'m, M: CausalLM> Session<'m, M> {
                     step_ns: Vec::with_capacity(opts.max_tokens),
                     prefill_ns: prefill_start.elapsed().as_nanos() as u64,
                     prefill_units,
+                    step_markers: after.0 - before.0,
+                    step_waits: after.1 - before.1,
                     hot_thread: hot_thread.report(),
                     ..DecodeStats::default()
                 },
@@ -3588,6 +3628,10 @@ impl<'m, M: CausalLM> Session<'m, M> {
             }
             lane.done = lane.eos || opts.reached(lane.produced);
         }
+
+        // All anchors have consumed their seed logits; the round pipeline has
+        // its own pending receipts. No terminal drain is introduced here.
+        drop(prefill_pacer);
 
         // Prime: one verify in flight per live sequence.
         for i in 0..n {

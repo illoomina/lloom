@@ -1,18 +1,18 @@
-//! Immutable outer forwards for the single prefill driver, not a memory quote
-//! or an admission lease. Batch, speculative seed and direct schedules remain
-//! separate and do not consume this descriptor.
+//! Immutable outer forwards for ordinary prefill and speculative seeds, not a
+//! memory quote or an admission lease. Ragged batch pieces and direct family
+//! schedules remain separate.
 
 use super::{prefill_widths, tile_widths, DecodeOptions, IN_FLIGHT_FLOOR};
 use lloom_tensor::Result;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct ForwardSpan {
+pub(crate) struct ForwardSpan {
     pub past: usize,
     pub width: usize,
 }
 
 #[derive(Debug)]
-pub(super) struct PrefillWork {
+pub(crate) struct PrefillWork {
     start: usize,
     end: usize,
     widths: Vec<usize>,
@@ -20,10 +20,10 @@ pub(super) struct PrefillWork {
 }
 
 impl PrefillWork {
-    /// Resolve once at the driver's prologue using the actual readback's
+    /// Resolve once at the driver's prologue using the consumer's
     /// commit behavior. Multiple forwards need pacing even on a blocking arm,
     /// whose per-token readback does not bound prompt forwards.
-    pub(super) fn single(
+    pub(crate) fn resolve(
         options: &DecodeOptions,
         start: usize,
         prompt_len: usize,
@@ -57,19 +57,19 @@ impl PrefillWork {
         })
     }
 
-    pub(super) fn start(&self) -> usize {
+    pub(crate) fn start(&self) -> usize {
         self.start
     }
 
-    pub(super) fn end(&self) -> usize {
+    pub(crate) fn end(&self) -> usize {
         self.end
     }
 
-    pub(super) fn active_depth(&self) -> Option<usize> {
+    pub(crate) fn active_depth(&self) -> Option<usize> {
         self.active_depth
     }
 
-    pub(super) fn forwards(&self) -> impl Iterator<Item = ForwardSpan> + '_ {
+    pub(crate) fn forwards(&self) -> impl Iterator<Item = ForwardSpan> + '_ {
         let mut past = self.start;
         self.widths.iter().map(move |&width| {
             let span = ForwardSpan { past, width };
@@ -89,7 +89,7 @@ mod tests {
         let mut options = DecodeOptions::new(0);
         options.prefill_tile = 4;
         options.in_flight_depth = 65;
-        let work = PrefillWork::single(&options, 17, 9, false).unwrap();
+        let work = PrefillWork::resolve(&options, 17, 9, false).unwrap();
         assert_eq!(work.widths, [4, 4, 1]);
         assert_eq!(work.active_depth(), Some(65));
         assert_eq!(
@@ -107,13 +107,13 @@ mod tests {
     fn tile_zero_preserves_spark_then_whole_remainder() {
         let mut options = DecodeOptions::new(0);
         options.prefill_ubatch = 3;
-        let work = PrefillWork::single(&options, 5, 11, false).unwrap();
+        let work = PrefillWork::resolve(&options, 5, 11, false).unwrap();
         assert_eq!(work.widths, [3, 8]);
         assert_eq!(work.active_depth(), Some(2));
         assert_eq!(work.end(), 16);
         options.prefill_tile = 4;
         assert_eq!(
-            PrefillWork::single(&options, 5, 11, false).unwrap().widths,
+            PrefillWork::resolve(&options, 5, 11, false).unwrap().widths,
             [3, 4, 4]
         );
     }
@@ -124,7 +124,7 @@ mod tests {
         options.prefill_schedule = Some(vec![0, 3]);
         options.prefill_bulk = 4;
         options.prefill_pacer_depth = 1;
-        let work = PrefillWork::single(&options, 17, 9, false).unwrap();
+        let work = PrefillWork::resolve(&options, 17, 9, false).unwrap();
         assert_eq!(work.widths, [3, 4, 1, 1]);
         assert_eq!(work.active_depth(), Some(2));
         assert_eq!(
@@ -143,29 +143,29 @@ mod tests {
     fn one_shot_pacing_empty_and_position_overflow() {
         let mut options = DecodeOptions::new(0);
         options.in_flight_depth = 7;
-        let work = PrefillWork::single(&options, 5, 9, false).unwrap();
+        let work = PrefillWork::resolve(&options, 5, 9, false).unwrap();
         assert_eq!(work.widths, [9]);
         assert_eq!(work.active_depth(), None);
         assert_eq!(
-            PrefillWork::single(&options, 5, 9, true)
+            PrefillWork::resolve(&options, 5, 9, true)
                 .unwrap()
                 .active_depth(),
             Some(7)
         );
         options.prefill_pacer_depth = 8;
         assert_eq!(
-            PrefillWork::single(&options, 5, 9, true)
+            PrefillWork::resolve(&options, 5, 9, true)
                 .unwrap()
                 .active_depth(),
             Some(8)
         );
-        let empty = PrefillWork::single(&options, usize::MAX, 0, true).unwrap();
+        let empty = PrefillWork::resolve(&options, usize::MAX, 0, true).unwrap();
         assert!(empty.widths.is_empty());
         assert_eq!(empty.active_depth(), None);
         assert_eq!(empty.start(), usize::MAX);
         assert_eq!(empty.end(), usize::MAX);
-        assert!(PrefillWork::single(&options, usize::MAX, 1, false).is_err());
-        let boundary = PrefillWork::single(&options, usize::MAX - 1, 1, true).unwrap();
+        assert!(PrefillWork::resolve(&options, usize::MAX, 1, false).is_err());
+        let boundary = PrefillWork::resolve(&options, usize::MAX - 1, 1, true).unwrap();
         assert_eq!(
             boundary.forwards().collect::<Vec<_>>(),
             vec![ForwardSpan {

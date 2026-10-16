@@ -228,8 +228,9 @@ fn readback_trace_on() -> bool {
         1 => false,
         2 => true,
         _ => {
-            let on = crate::tuning::tuning().instrument.readback_trace;
-            set_readback_trace(on);
+            let requested = crate::tuning::tuning().instrument.readback_trace;
+            let on = crate::tuning::effective_instrument("readback_trace", requested);
+            READBACK_TRACE.store(if on { 2 } else { 1 }, std::sync::atomic::Ordering::Relaxed);
             on
         }
     }
@@ -237,9 +238,10 @@ fn readback_trace_on() -> bool {
 
 /// Turn the readback attribution on or off for the process (a test's
 /// switch; the knob sets it for a run).
-pub fn set_readback_trace(on: bool) {
-    crate::tuning::require_profile(on);
+pub fn set_readback_trace(on: bool) -> crate::Result<()> {
+    crate::tuning::check_profile_request("readback_trace", on).map_err(crate::Error::wrap)?;
     READBACK_TRACE.store(if on { 2 } else { 1 }, std::sync::atomic::Ordering::Relaxed);
+    Ok(())
 }
 
 #[cfg(any(debug_assertions, feature = "profile"))]
@@ -3375,6 +3377,7 @@ impl BackendDevice for MetalDevice {
     type Storage = MetalStorage;
 
     fn new(ordinal: usize) -> Result<Self> {
+        crate::tuning::try_tuning().map_err(crate::Error::wrap)?;
         // Cold metadata-only process payer, separate from native allocation custody.
         // Neither payer acquires a machine owner or latches first model load.
         // The process policy remains safely configurable before that load.
@@ -5154,11 +5157,11 @@ fn copy2d_no_blit() -> bool {
 mod attribution_build_tests {
     #[test]
     fn readback_attribution_obeys_its_atomic_switch_without_a_device() {
-        super::set_readback_trace(false);
+        super::set_readback_trace(false).unwrap();
         let _ = super::readback_sites();
         super::note_readback("host-only-disabled");
         assert!(super::readback_sites().is_empty());
-        super::set_readback_trace(true);
+        super::set_readback_trace(true).unwrap();
         super::note_readback("host-only-control");
         super::note_readback("host-only-control");
         let sites = super::readback_sites();
@@ -5167,6 +5170,6 @@ mod attribution_build_tests {
             vec![("host-only-control", "(no lloom frame)".into(), 2)]
         );
         assert!(super::readback_sites().is_empty());
-        super::set_readback_trace(false);
+        super::set_readback_trace(false).unwrap();
     }
 }

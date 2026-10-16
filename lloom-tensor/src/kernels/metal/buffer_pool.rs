@@ -134,12 +134,14 @@ fn trace_on() -> bool {
     static ON: AtomicU8 = AtomicU8::new(0);
     let on = match ON.load(Ordering::Relaxed) {
         0 => {
-            let v = if crate::tuning::tuning().instrument.pool_trace {
+            let v = if crate::tuning::effective_instrument(
+                "pool_trace",
+                crate::tuning::tuning().instrument.pool_trace,
+            ) {
                 2
             } else {
                 1
             };
-            crate::tuning::require_profile(v == 2);
             ON.store(v, Ordering::Relaxed);
             v
         }

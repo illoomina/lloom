@@ -482,8 +482,9 @@ fn served_request_trace_on() -> bool {
         1 => false,
         2 => true,
         _ => {
-            let on = crate::tuning::tuning().instrument.served_request_trace;
-            set_served_request_trace(on);
+            let requested = crate::tuning::tuning().instrument.served_request_trace;
+            let on = crate::tuning::effective_instrument("served_request_trace", requested);
+            SERVED_TRACE.store(if on { 2 } else { 1 }, std::sync::atomic::Ordering::Relaxed);
             on
         }
     }
@@ -491,9 +492,10 @@ fn served_request_trace_on() -> bool {
 
 /// Turn the served-pass request attribution on or off for the process (a
 /// test's switch; the knob sets it for a run).
-pub fn set_served_request_trace(on: bool) {
-    crate::tuning::require_profile(on);
+pub fn set_served_request_trace(on: bool) -> crate::Result<()> {
+    crate::tuning::check_profile_request("served_request_trace", on).map_err(crate::Error::wrap)?;
     SERVED_TRACE.store(if on { 2 } else { 1 }, std::sync::atomic::Ordering::Relaxed);
+    Ok(())
 }
 
 /// The admission's second rung (`admit_bytes`: wait the queue out once and
@@ -4307,9 +4309,9 @@ mod attribution_build_tests {
             "symbolization positive control: {symbol_control}"
         );
         eprintln!("symbolization positive control:\n{symbol_control}");
-        super::set_served_request_trace(false);
+        super::set_served_request_trace(false).unwrap();
         assert!(!super::served_request_trace_on());
-        super::set_served_request_trace(true);
+        super::set_served_request_trace(true).unwrap();
         assert!(super::served_request_trace_on());
         let _ = super::served_pass_request_sites();
         super::note_served_request_site(0);
@@ -4326,6 +4328,6 @@ mod attribution_build_tests {
         assert_eq!(sites[1].0, 1);
         assert_eq!(sites[1].2, 1);
         assert!(super::served_pass_request_sites().is_empty());
-        super::set_served_request_trace(false);
+        super::set_served_request_trace(false).unwrap();
     }
 }

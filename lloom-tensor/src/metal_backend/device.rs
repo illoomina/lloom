@@ -482,8 +482,9 @@ fn served_request_trace_on() -> bool {
         1 => false,
         2 => true,
         _ => {
-            let on = crate::tuning::tuning().instrument.served_request_trace;
-            set_served_request_trace(on);
+            let requested = crate::tuning::tuning().instrument.served_request_trace;
+            let on = crate::tuning::effective_instrument("served_request_trace", requested);
+            SERVED_TRACE.store(if on { 2 } else { 1 }, std::sync::atomic::Ordering::Relaxed);
             on
         }
     }
@@ -491,8 +492,10 @@ fn served_request_trace_on() -> bool {
 
 /// Turn the served-pass request attribution on or off for the process (a
 /// test's switch; the knob sets it for a run).
-pub fn set_served_request_trace(on: bool) {
+pub fn set_served_request_trace(on: bool) -> crate::Result<()> {
+    crate::tuning::check_profile_request("served_request_trace", on).map_err(crate::Error::wrap)?;
     SERVED_TRACE.store(if on { 2 } else { 1 }, std::sync::atomic::Ordering::Relaxed);
+    Ok(())
 }
 
 /// The admission's second rung (`admit_bytes`: wait the queue out once and
@@ -518,8 +521,10 @@ pub fn set_admission_drain(on: bool) {
     ADMISSION_DRAIN.store(if on { 2 } else { 1 }, std::sync::atomic::Ordering::Relaxed);
 }
 
+#[cfg(any(debug_assertions, feature = "profile"))]
 type SiteCounts = HashMap<(usize, String), u64>;
 
+#[cfg(any(debug_assertions, feature = "profile"))]
 fn served_request_sites_map() -> &'static Mutex<SiteCounts> {
     static SITES: std::sync::OnceLock<Mutex<SiteCounts>> = std::sync::OnceLock::new();
     SITES.get_or_init(|| Mutex::new(HashMap::new()))
@@ -528,6 +533,7 @@ fn served_request_sites_map() -> &'static Mutex<SiteCounts> {
 /// The instrument's half of [`MetalDevice::note_pool_request`]: the first two
 /// frames of the `lloom` crate (the model's call site and its caller) of a
 /// backtrace, counted per pool. Process-wide, like the trace recorder.
+#[cfg(any(debug_assertions, feature = "profile"))]
 fn note_served_request_site(which: usize) {
     let site = call_site();
     *served_request_sites_map()
@@ -540,6 +546,7 @@ fn note_served_request_site(which: usize) {
 /// tensor-crate entry the model called, then the model's (`lloom` crate's)
 /// two innermost frames. For attribution instruments only: it takes one
 /// backtrace a call.
+#[cfg(any(debug_assertions, feature = "profile"))]
 pub(crate) fn call_site() -> String {
     let bt = std::backtrace::Backtrace::force_capture().to_string();
     let frames: Vec<&str> = bt
@@ -570,6 +577,7 @@ pub(crate) fn call_site() -> String {
 /// What `LLOOM_SERVED_REQUEST_TRACE` attributed since the last call:
 /// `(pool, site, requests)`, pool 0 shared and 1 private, most requests
 /// first. Taking clears it, so a caller reads one window.
+#[cfg(any(debug_assertions, feature = "profile"))]
 pub fn served_pass_request_sites() -> Vec<(usize, String, u64)> {
     let mut v: Vec<(usize, String, u64)> = std::mem::take(&mut *served_request_sites_map().lock())
         .into_iter()
@@ -577,6 +585,11 @@ pub fn served_pass_request_sites() -> Vec<(usize, String, u64)> {
         .collect();
     v.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.1.cmp(&b.1)));
     v
+}
+
+#[cfg(not(any(debug_assertions, feature = "profile")))]
+pub fn served_pass_request_sites() -> Vec<(usize, String, u64)> {
+    Vec::new()
 }
 
 /// One cached plan as the harness reports it: `(key, ordinals served,
@@ -2427,6 +2440,7 @@ impl MetalDevice {
             self.served_pass_pool_requests[which]
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if served_request_trace_on() {
+                #[cfg(any(debug_assertions, feature = "profile"))]
                 note_served_request_site(which);
             }
         }
@@ -4281,5 +4295,39 @@ impl PreparedAffineInput {
     }
     pub(crate) fn elements(&self) -> usize {
         self.elements
+    }
+}
+
+#[cfg(all(test, any(debug_assertions, feature = "profile")))]
+mod attribution_build_tests {
+    #[test]
+    fn served_attribution_collects_a_real_backtrace_without_a_device() {
+        let symbol_control = std::backtrace::Backtrace::force_capture().to_string();
+        assert!(
+            symbol_control
+                .contains("served_attribution_collects_a_real_backtrace_without_a_device"),
+            "symbolization positive control: {symbol_control}"
+        );
+        eprintln!("symbolization positive control:\n{symbol_control}");
+        super::set_served_request_trace(false).unwrap();
+        assert!(!super::served_request_trace_on());
+        super::set_served_request_trace(true).unwrap();
+        assert!(super::served_request_trace_on());
+        let _ = super::served_pass_request_sites();
+        super::note_served_request_site(0);
+        super::note_served_request_site(0);
+        super::note_served_request_site(1);
+        let sites = super::served_pass_request_sites();
+        assert_eq!(sites.len(), 2, "{sites:?}");
+        assert_eq!(sites[0].0, 0);
+        assert_eq!(sites[0].2, 2);
+        assert_eq!(
+            sites[0].1, "(no lloom frame)",
+            "this host-only caller is in lloom_tensor, not a model"
+        );
+        assert_eq!(sites[1].0, 1);
+        assert_eq!(sites[1].2, 1);
+        assert!(super::served_pass_request_sites().is_empty());
+        super::set_served_request_trace(false).unwrap();
     }
 }

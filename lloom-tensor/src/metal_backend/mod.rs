@@ -228,8 +228,9 @@ fn readback_trace_on() -> bool {
         1 => false,
         2 => true,
         _ => {
-            let on = crate::tuning::tuning().instrument.readback_trace;
-            set_readback_trace(on);
+            let requested = crate::tuning::tuning().instrument.readback_trace;
+            let on = crate::tuning::effective_instrument("readback_trace", requested);
+            READBACK_TRACE.store(if on { 2 } else { 1 }, std::sync::atomic::Ordering::Relaxed);
             on
         }
     }
@@ -237,12 +238,16 @@ fn readback_trace_on() -> bool {
 
 /// Turn the readback attribution on or off for the process (a test's
 /// switch; the knob sets it for a run).
-pub fn set_readback_trace(on: bool) {
+pub fn set_readback_trace(on: bool) -> crate::Result<()> {
+    crate::tuning::check_profile_request("readback_trace", on).map_err(crate::Error::wrap)?;
     READBACK_TRACE.store(if on { 2 } else { 1 }, std::sync::atomic::Ordering::Relaxed);
+    Ok(())
 }
 
+#[cfg(any(debug_assertions, feature = "profile"))]
 type ReadbackSites = std::collections::HashMap<(&'static str, String), u64>;
 
+#[cfg(any(debug_assertions, feature = "profile"))]
 fn readback_sites_map() -> &'static parking_lot::Mutex<ReadbackSites> {
     static SITES: std::sync::OnceLock<parking_lot::Mutex<ReadbackSites>> =
         std::sync::OnceLock::new();
@@ -250,15 +255,19 @@ fn readback_sites_map() -> &'static parking_lot::Mutex<ReadbackSites> {
 }
 
 /// Count one readback of `kind` at its call site, when the trace is on.
-fn note_readback(kind: &'static str) {
+fn note_readback(#[allow(unused_variables)] kind: &'static str) {
     if readback_trace_on() {
-        let site = device::call_site();
-        *readback_sites_map().lock().entry((kind, site)).or_default() += 1;
+        #[cfg(any(debug_assertions, feature = "profile"))]
+        {
+            let site = device::call_site();
+            *readback_sites_map().lock().entry((kind, site)).or_default() += 1;
+        }
     }
 }
 
 /// What `LLOOM_READBACK_TRACE` attributed since the last call: `(kind, site,
 /// readbacks)`, most first. Taking clears it, so a caller reads one window.
+#[cfg(any(debug_assertions, feature = "profile"))]
 pub fn readback_sites() -> Vec<(&'static str, String, u64)> {
     let mut v: Vec<(&'static str, String, u64)> = std::mem::take(&mut *readback_sites_map().lock())
         .into_iter()
@@ -266,6 +275,11 @@ pub fn readback_sites() -> Vec<(&'static str, String, u64)> {
         .collect();
     v.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.1.cmp(&b.1)));
     v
+}
+
+#[cfg(not(any(debug_assertions, feature = "profile")))]
+pub fn readback_sites() -> Vec<(&'static str, String, u64)> {
+    Vec::new()
 }
 
 /// A rank-1 storage's bytes copied to a CPU-mapped staging buffer and fenced by
@@ -3363,6 +3377,7 @@ impl BackendDevice for MetalDevice {
     type Storage = MetalStorage;
 
     fn new(ordinal: usize) -> Result<Self> {
+        crate::tuning::try_tuning().map_err(crate::Error::wrap)?;
         // Cold metadata-only process payer, separate from native allocation custody.
         // Neither payer acquires a machine owner or latches first model load.
         // The process policy remains safely configurable before that load.
@@ -5136,4 +5151,25 @@ mod write_host_slice_tests {
 fn copy2d_no_blit() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| crate::tuning::tuning().metal.copy2d_no_blit)
+}
+
+#[cfg(all(test, any(debug_assertions, feature = "profile")))]
+mod attribution_build_tests {
+    #[test]
+    fn readback_attribution_obeys_its_atomic_switch_without_a_device() {
+        super::set_readback_trace(false).unwrap();
+        let _ = super::readback_sites();
+        super::note_readback("host-only-disabled");
+        assert!(super::readback_sites().is_empty());
+        super::set_readback_trace(true).unwrap();
+        super::note_readback("host-only-control");
+        super::note_readback("host-only-control");
+        let sites = super::readback_sites();
+        assert_eq!(
+            sites,
+            vec![("host-only-control", "(no lloom frame)".into(), 2)]
+        );
+        assert!(super::readback_sites().is_empty());
+        super::set_readback_trace(false).unwrap();
+    }
 }

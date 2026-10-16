@@ -11,6 +11,7 @@ use lloom::models::qwen3_5::testing::{Qwen3_5MoeTiny, Qwen3_5Tiny};
 use lloom::models::qwen4exp::testing::Qwen4ExpTiny;
 use lloom::testing::tiny::{Geometry, TinyFamily, ValueLaw, Weights, Workload, MAX_PROMPT};
 use lloom_fuzz::geometry::{self, Outcome};
+use lloom_tensor::tuning::{self, Contract};
 use lloom_tensor::Device;
 use std::path::PathBuf;
 
@@ -22,8 +23,8 @@ struct Args {
     #[arg(long, default_value = "qwen4exp")]
     family: String,
     /// Numerical contract; recorded in the manifest because it selects routes.
-    #[arg(long, default_value = "deterministic", value_parser = ["fast", "deterministic"])]
-    contract: String,
+    #[arg(long, default_value = "deterministic", value_parser = Contract::parse)]
+    contract: Contract,
     /// The value law of the weights (`hash[:gain]`, `uniform[:half]`,
     /// `ramp-sin`, `ramp-mod17`).
     #[arg(long, default_value = "hash:1")]
@@ -80,11 +81,9 @@ struct Args {
 fn main() -> anyhow::Result<()> {
     // The census and the tuning are read once, on first use.
     std::env::set_var("CANDLE_METAL_PROFILE", "1");
-    let args = Args::parse();
-    geometry::FAST_CONTRACT.store(
-        args.contract == "fast",
-        std::sync::atomic::Ordering::Relaxed,
-    );
+    let mut args = Args::parse();
+    args.contract = setup_contract(args.contract)?;
+    eprintln!("CONTRACT profile={}", args.contract.name());
     let mut t = lloom::tuning::Tuning::default();
     t.from_env().map_err(anyhow::Error::msg)?;
     t.qwen4exp.hc_mix = args.hc_mix;
@@ -98,6 +97,16 @@ fn main() -> anyhow::Result<()> {
         "qwen3_5_moe" => run::<Qwen3_5MoeTiny>(args),
         other => anyhow::bail!("--family {other}: qwen4exp | lfm2 | qwen3_5 | qwen3_5_moe"),
     }
+}
+
+fn setup_contract(requested: Contract) -> anyhow::Result<Contract> {
+    let resolved = tuning::pin_contract(requested).map_err(anyhow::Error::msg)?;
+    anyhow::ensure!(
+        tuning::contract() == resolved,
+        "the process contract was already fixed before campaign setup"
+    );
+    geometry::FAST_CONTRACT.store(resolved.is_fast(), std::sync::atomic::Ordering::Relaxed);
+    Ok(resolved)
 }
 
 fn inputs(dir: &std::path::Path) -> anyhow::Result<Vec<PathBuf>> {
@@ -215,7 +224,7 @@ fn run<F: TinyFamily + 'static>(mut args: Args) -> anyhow::Result<()> {
         &serde_json::json!({
             "family": F::NAME, "law": args.law, "weight_seed": args.weight_seed,
             "tol_bits": args.tol.to_bits(), "hc_mix": args.hc_mix,
-            "metal_reference": args.metal_reference
+            "metal_reference": args.metal_reference, "contract": args.contract.name()
         }),
         move |bytes| {
             let (g, o) = exec(bytes);
@@ -353,6 +362,14 @@ fn manifest<F: TinyFamily>(
     for (p, (_, g)) in &best {
         entries.entry(g.clone()).or_default().push(p.clone());
     }
+    anyhow::ensure!(
+        !entries.is_empty(),
+        "{}: {} inputs, {} agreeing runs, 0 manifest entries; refusing to overwrite {}",
+        F::NAME,
+        files.len(),
+        runs.len(),
+        args.manifest_out.display()
+    );
     let commit = std::process::Command::new("git")
         .args(["rev-parse", "HEAD"])
         .output()
@@ -361,7 +378,7 @@ fn manifest<F: TinyFamily>(
         .unwrap_or_default();
     let json = serde_json::json!({
         "family": F::NAME,
-        "contract": args.contract,
+        "contract": args.contract.name(),
         "commit": commit,
         "law": args.law,
         "weight_seed": args.weight_seed,
@@ -391,4 +408,144 @@ fn manifest<F: TinyFamily>(
         args.manifest_out.display()
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lloom::profile::{Crown, CrownExact};
+    use lloom::testing::tiny::TinyCheckpoint;
+
+    fn schema_at(contract: Contract) {
+        std::env::remove_var("LLOOM_PROFILE");
+        assert_eq!(setup_contract(contract).unwrap(), contract);
+        assert_eq!(tuning::contract(), contract);
+        assert_eq!(
+            geometry::FAST_CONTRACT.load(std::sync::atomic::Ordering::Relaxed),
+            contract.is_fast()
+        );
+        let ckpt = TinyCheckpoint::<Lfm2Tiny>::template();
+        let schema = ckpt.schema().expect("schema must use the process regime");
+        assert!(!schema.tensors.is_empty());
+        assert_eq!(schema, ckpt.schema().unwrap());
+        match contract {
+            Contract::Fast => {
+                assert!(Lfm2Tiny::reference::<CrownExact>(&ckpt, &Device::Cpu).is_err());
+                let model = Lfm2Tiny::reference::<Crown>(&ckpt, &Device::Cpu).unwrap();
+                let logits = lloom::testing::tiny::run(
+                    &model,
+                    &ckpt.cfg,
+                    ckpt.cfg.vocab_size,
+                    &Device::Cpu,
+                    &Workload {
+                        prompt: 1,
+                        decode: 1,
+                    },
+                )
+                .unwrap();
+                assert_eq!(logits.len(), 2);
+                assert!(logits.iter().flatten().all(|v| v.is_finite()));
+            }
+            Contract::Deterministic => {
+                assert!(Lfm2Tiny::reference::<Crown>(&ckpt, &Device::Cpu).is_err());
+                let model = Lfm2Tiny::reference::<CrownExact>(&ckpt, &Device::Cpu).unwrap();
+                let logits = lloom::testing::tiny::run(
+                    &model,
+                    &ckpt.cfg,
+                    ckpt.cfg.vocab_size,
+                    &Device::Cpu,
+                    &Workload {
+                        prompt: 1,
+                        decode: 1,
+                    },
+                )
+                .unwrap();
+                assert_eq!(logits.len(), 2);
+                assert!(logits.iter().flatten().all(|v| v.is_finite()));
+            }
+        }
+        use sha2::Digest;
+        let digest = sha2::Sha256::digest(format!("{schema:?}").as_bytes());
+        println!("schema_sha256={digest:x}");
+        println!(
+            "{}: {} tensors, {} elements; schema and CPU reference built",
+            contract.name(),
+            schema.tensors.len(),
+            schema.elements()
+        );
+    }
+
+    #[test]
+    fn fast_setup_and_schema_match() {
+        schema_at(Contract::Fast);
+    }
+
+    #[test]
+    fn deterministic_setup_and_schema_match() {
+        schema_at(Contract::Deterministic);
+    }
+
+    #[test]
+    fn environment_contract_selects_the_same_arm() {
+        std::env::set_var("LLOOM_PROFILE", " FAST ");
+        assert_eq!(
+            setup_contract(Contract::Deterministic).unwrap(),
+            Contract::Fast
+        );
+        assert!(geometry::FAST_CONTRACT.load(std::sync::atomic::Ordering::Relaxed));
+        assert_eq!(tuning::contract(), Contract::Fast);
+        TinyCheckpoint::<Lfm2Tiny>::template().schema().unwrap();
+    }
+
+    #[test]
+    fn contract_parser_uses_the_engine_grammar() {
+        for word in Contract::SPELLINGS {
+            let args = Args::try_parse_from(["fuzz_geometry", "--contract", &word.to_uppercase()])
+                .unwrap();
+            assert_eq!(args.contract, Contract::parse(word).unwrap());
+        }
+        assert!(Args::try_parse_from(["fuzz_geometry", "--contract", "balanced"]).is_err());
+    }
+
+    #[test]
+    fn refused_skipped_and_empty_corpora_cannot_replace_a_manifest() {
+        let dir = std::env::temp_dir().join(format!("geometry-manifest-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let corpus = dir.join("corpus");
+        std::fs::create_dir_all(&corpus).unwrap();
+        let out = dir.join("manifest.json");
+        std::fs::write(&out, b"retained manifest").unwrap();
+        let mut args = Args::try_parse_from(["fuzz_geometry"]).unwrap();
+        args.manifest_out = out.clone();
+        let g = Geometry::template::<Lfm2Tiny>(Workload {
+            prompt: 1,
+            decode: 1,
+        });
+        for outcome in [
+            Outcome::CpuRefused("regime mismatch".into()),
+            Outcome::MetalRefused("same refusal".into()),
+            Outcome::Skipped,
+            Outcome::Agree {
+                maxdiff: 0.,
+                scale: 1.,
+            },
+        ] {
+            std::fs::write(corpus.join("input"), g.encode()).unwrap();
+            std::fs::write(corpus.join("second"), g.encode()).unwrap();
+            let err = manifest::<Lfm2Tiny>(&corpus, &args, Weights::default(), &mut |_| {
+                (g.clone(), outcome.clone())
+            })
+            .unwrap_err();
+            assert!(err.to_string().contains("0 manifest entries"), "{err}");
+            assert_eq!(std::fs::read(&out).unwrap(), b"retained manifest");
+        }
+        std::fs::remove_file(corpus.join("input")).unwrap();
+        std::fs::remove_file(corpus.join("second")).unwrap();
+        assert!(
+            manifest::<Lfm2Tiny>(&corpus, &args, Weights::default(), &mut |_| unreachable!())
+                .is_err()
+        );
+        assert_eq!(std::fs::read(&out).unwrap(), b"retained manifest");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 }

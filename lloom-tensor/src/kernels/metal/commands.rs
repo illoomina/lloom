@@ -3349,7 +3349,14 @@ mod owner_submission_tests {
         let device = crate::MetalDevice::new(0).unwrap();
         let commands = device.commands();
         let cb = pending(commands);
-        assert!(!cb.is_metal4(), "this fixture requires actual Metal 3");
+        if cb.is_metal4() {
+            eprintln!(
+                "NOT_APPLICABLE unknown-return fixture requires actual Metal 3; actual_api=metal4"
+            );
+            // Ordinary empty owner only: no fault or host wait was armed.
+            commands.ensure_completed(&cb).unwrap();
+            return;
+        }
         let raw = device
             .metal_device()
             .new_buffer(4096, super::super::MTLResourceOptions::StorageModeShared)

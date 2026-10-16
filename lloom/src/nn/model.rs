@@ -121,6 +121,27 @@ pub trait CausalLM: Model {
         Ok(())
     }
 
+    /// Open a request whose prefill ends at the absolute position `end`:
+    /// its passes leave the one turn checkpoint `policy` names, whatever an
+    /// earlier request or hint left, until [`Self::close_checkpoint_request`]
+    /// (`sequence-reuse-design.md` §2.3b). The default keeps no checkpoints
+    /// and ignores it.
+    fn open_checkpoint_request(
+        &self,
+        _cache: &mut Self::Cache,
+        _policy: crate::nn::CheckpointPolicy,
+        _end: usize,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// The request's end: a checkpoint it asked for and no pass took is
+    /// dropped, and the cache's own default resumes. The default does
+    /// nothing.
+    fn close_checkpoint_request(&self, _cache: &mut Self::Cache) -> Result<()> {
+        Ok(())
+    }
+
     /// Arm a host fill for the decode steps that follow on `cache`, for a
     /// loop whose tokens stay on the device: each single-position forward
     /// then waits on the GPU for rows a producer thread fills from the token

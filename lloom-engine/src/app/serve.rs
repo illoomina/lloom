@@ -39,6 +39,7 @@ use super::template::{
 };
 use super::thinking::{self, Thinking};
 use super::vision::{expand_image_tokens, split_image_parts, DecodedImage};
+use crate::frontend::Frontend;
 use crate::sink::{DeltaBuffer, DRAIN_PERIOD};
 use crate::{DecodeParams, Decoded, Stop};
 use anyhow::{Context, Result};
@@ -191,19 +192,10 @@ pub fn run_with_transport_policy(
     run_configured(args, Some(policy))
 }
 fn run_configured(args: ServeArgs, transport: Option<tiny_http::TransportPolicy>) -> Result<()> {
-    let mut options = super::resolve_options(&args.common, &|o| args.front(o))?;
+    let options = super::resolve_options(&args.common, &|o| args.front(o), Frontend::Serve)?;
     let seed_text = seed_text(options.server.pipette.prompt_seed_file.as_deref())?;
-    let batched = options.scheduler.max_sequences > 1;
-    // The CHUNK defaults to 512 at `N > 1` (the interleaved prefill), whole
-    // prompts at `N = 1`.
-    if batched && options.decode.prefill.chunk == 0 {
-        options.decode.prefill.chunk = 512;
-    }
     let load_start = Instant::now();
-    // `serve` reuses the conversation by default (`context.prefix.reuse`
-    // unset); `--no-reuse` opts out, and a benchmark cell stays cold either
-    // way (`DecodeParams::cold`).
-    let shape = super::Shape::of(&options, true, seed_text);
+    let shape = super::Shape::of(&options, Frontend::Serve, seed_text);
     let reuse_prefix = shape.reuse_prefix;
     // A non-generating decision model is served by the decision-only listener.
     if let Some(endpoint) = super::omni::serving::load(&options.load, &shape)? {
@@ -3088,7 +3080,7 @@ impl Cell {
 }
 
 pub fn bench(args: BenchArgs) -> Result<()> {
-    let mut options = super::resolve_options(&args.common, &|o| args.front(o))?;
+    let options = super::resolve_options(&args.common, &|o| args.front(o), Frontend::Bench)?;
     super::report::arm_trace();
     let mode = match options.bench.mode.as_str() {
         "reuse" => Some(super::modes::Mode::Reuse),
@@ -3103,12 +3095,8 @@ pub fn bench(args: BenchArgs) -> Result<()> {
         anyhow::bail!("--cells names no cell");
     }
     let seed_text = seed_text(options.server.pipette.prompt_seed_file.as_deref())?;
-    let batched = options.scheduler.max_sequences > 1;
-    if batched && options.decode.prefill.chunk == 0 {
-        options.decode.prefill.chunk = 512;
-    }
     let load_start = Instant::now();
-    let shape = super::Shape::of(&options, false, seed_text);
+    let shape = super::Shape::of(&options, Frontend::Bench, seed_text);
     let (engine, model_path) = super::load_engine(&options.load, shape)?;
     let model_name = engine.model_name().to_string();
     let mut sampling = options.sampling.clone();
@@ -3224,7 +3212,7 @@ fn bench_mode(
 ) -> Result<()> {
     let spec = resolve_mode(args, mode, &mut options)?;
     let load_start = Instant::now();
-    let mut shape = super::Shape::of(&options, false, DEFAULT_SEED_TEXT.to_string());
+    let mut shape = super::Shape::of(&options, Frontend::Bench, DEFAULT_SEED_TEXT.to_string());
     shape.reuse_prefix = false;
     shape.batch = 1;
     shape.mem_sample = false;
@@ -3396,7 +3384,13 @@ mod bench_mode_tests {
         // Without the env layer: `modes.rs`'s env tests set variables, and a
         // process-wide read here would race them.
         let front = |o: &mut crate::EngineOptions| args.front(o);
-        let (mut o, _) = super::super::resolve_layers(&args.common, &front, &|_| None, false)?;
+        let (mut o, _) = super::super::resolve_layers(
+            &args.common,
+            &front,
+            &|_| None,
+            false,
+            Some(crate::frontend::Frontend::Bench),
+        )?;
         let mode = match o.bench.mode.as_str() {
             "reuse" => Mode::Reuse,
             _ => Mode::Concurrent,

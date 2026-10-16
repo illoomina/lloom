@@ -395,6 +395,23 @@ impl<M: CausalLM> CausalLM for ImageRows<'_, M> {
         self.model.prepare_pass(cache, seq_len)
     }
 
+    fn checkpoint_at(&self, cache: &mut Self::Cache, pos: usize) -> lloom_tensor::Result<()> {
+        self.model.checkpoint_at(cache, pos)
+    }
+
+    fn open_checkpoint_request(
+        &self,
+        cache: &mut Self::Cache,
+        policy: lloom::nn::CheckpointPolicy,
+        end: usize,
+    ) -> lloom_tensor::Result<()> {
+        self.model.open_checkpoint_request(cache, policy, end)
+    }
+
+    fn close_checkpoint_request(&self, cache: &mut Self::Cache) -> lloom_tensor::Result<()> {
+        self.model.close_checkpoint_request(cache)
+    }
+
     fn note_input_ids(&self, cache: &mut Self::Cache, ids: &[u32]) -> lloom_tensor::Result<()> {
         if ids.contains(&self.image_token_id) {
             if ids.len() > self.prompt.len() {

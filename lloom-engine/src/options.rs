@@ -874,6 +874,23 @@ impl ModelConfigArgs {
         }
         Ok(())
     }
+
+    /// The storage paths whose flags were given (the derive's `given`).
+    pub fn given(&self, prefix: &str, out: &mut std::collections::BTreeSet<String>) {
+        let at = |k: &str| {
+            if prefix.is_empty() {
+                k.to_string()
+            } else {
+                format!("{prefix}.{k}")
+            }
+        };
+        if self.cache.is_some() {
+            out.insert(at("cache"));
+        }
+        for (flag, _) in self.axes.overrides() {
+            out.insert(at(&format!("axes.{flag}")));
+        }
+    }
 }
 
 // ---- sampling -------------------------------------------------------------------
@@ -1686,7 +1703,7 @@ impl Default for SchedulerConfig {
 #[options(v0 = false)]
 #[serde(default)]
 pub struct PrefixConfig {
-    /// Reuse the cached prefix across turns or requests; unset = the front-end's own (`chat` and `serve` reuse; `bench` measures a cold prefill, and a benchmark cell stays cold whatever this says). `--no-reuse` turns it off.
+    /// Reuse the cached prefix across turns or requests; unset = the front-end's own.
     #[opt(bool, flag = "reuse-prefix", path = "context.prefix.reuse", status = "stable", cli = "prefix-reuse", switches = ["no-reuse=false"])]
     pub reuse: Option<bool>,
     /// Share a request's prompt prefix from another row's cache, by page (the pool rows only).
@@ -1788,7 +1805,9 @@ pub struct ReportConfig {
         short = 'v',
         path = "diagnostics.verbose",
         status = "stable",
-        cli = "verbose"
+        cli = "verbose",
+        needs = "profile",
+        needs_part = "the first token's split and the step-time percentiles"
     )]
     pub verbose: bool,
     /// Sample the memory gauges every 10 ms around each turn or cell and report their peaks (a gauge run: it perturbs the timing beside it).

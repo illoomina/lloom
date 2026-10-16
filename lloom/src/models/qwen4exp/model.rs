@@ -1083,6 +1083,22 @@ impl<P: Profile> State<P> {
         self.ckpt.hint(pos);
     }
 
+    /// Open a request whose prefill ends at `end`
+    /// (`CheckpointRing::open_request`).
+    pub fn open_checkpoint_request(&mut self, policy: crate::nn::CheckpointPolicy, end: usize) {
+        self.ckpt.open_request(policy, end);
+    }
+
+    /// Close the open request (`CheckpointRing::close_request`).
+    pub fn close_checkpoint_request(&mut self) {
+        self.ckpt.close_request();
+    }
+
+    /// The policy of the open request, if one is open.
+    pub fn checkpoint_request(&self) -> Option<crate::nn::CheckpointPolicy> {
+        self.ckpt.request_policy()
+    }
+
     /// The checkpoint `Layer::prefill_mix` of layer `l` takes in the pass
     /// in flight, when this call is the hinted tile: the rows into the tile
     /// and the layer's frame slice (`None` for a full layer, whose mark is
@@ -5423,6 +5439,21 @@ impl<P: Profile, R: ExpertResidency> CausalLM for Qwen4Exp<P, R> {
 
     fn checkpoint_at(&self, cache: &mut Self::Cache, pos: usize) -> Result<()> {
         cache.checkpoint_at(pos);
+        Ok(())
+    }
+
+    fn open_checkpoint_request(
+        &self,
+        cache: &mut Self::Cache,
+        policy: crate::nn::CheckpointPolicy,
+        end: usize,
+    ) -> Result<()> {
+        cache.open_checkpoint_request(policy, end);
+        Ok(())
+    }
+
+    fn close_checkpoint_request(&self, cache: &mut Self::Cache) -> Result<()> {
+        cache.close_checkpoint_request();
         Ok(())
     }
 }

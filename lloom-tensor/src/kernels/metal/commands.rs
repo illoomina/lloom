@@ -2,6 +2,9 @@
 mod entry_guard;
 #[path = "commands_lifecycle.rs"]
 mod lifecycle;
+#[cfg(test)]
+#[path = "commands_submission_test.rs"]
+pub(super) mod submission_test;
 
 use super::in_flight::{CompletedRelease, Held};
 use super::residency_set::PublishedRemovals;
@@ -371,6 +374,8 @@ pub struct Commands {
 }
 
 struct CommandsCore {
+    #[cfg(test)]
+    submission_control: Arc<submission_test::Control>,
     #[cfg(test)]
     deny_replacement: AtomicBool,
     #[cfg(test)]
@@ -939,6 +944,8 @@ impl Commands {
         let mut state = EntryState::new(cb);
         state.binding_credits = credits;
         let core = Arc::new(CommandsCore {
+            #[cfg(test)]
+            submission_control: Arc::default(),
             binding_bank,
             _retirement_wake: retirement_wake,
             encoder_domain,
@@ -2497,6 +2504,12 @@ impl CommandsCore {
         let prepared = authority
             .buffer
             .prepare_owned_commit(authority, nonblocking)?;
+        #[cfg(test)]
+        let prepared = {
+            let mut prepared = prepared;
+            prepared.test_submission_control(self.submission_control.clone());
+            prepared
+        };
         let (_, removed) = if nonblocking {
             self.residency_set
                 .try_commit_pending_extracted()
@@ -2543,6 +2556,8 @@ impl CommandsCore {
         t_end_enc: Option<std::time::Duration>,
         t_residency: Option<std::time::Duration>,
     ) -> Result<CommitReceipt, MetalKernelError> {
+        #[cfg(test)]
+        self.submission_control.registration()?;
         let signalled = self
             .completion_wait
             .encode_prepared_signal(&prepared, self.completion_event.as_ref())?;
@@ -3153,6 +3168,251 @@ mod owner_submission_tests {
         }
     }
 
+    /// Exceptional handoff tests cannot infer terminality from an error.
+    /// Retain independent fixture pins even if an assertion itself unwinds.
+    struct RetainUnknown<T>(Option<T>);
+    impl<T> RetainUnknown<T> {
+        fn release(mut self) {
+            drop(self.0.take());
+        }
+    }
+    impl<T> Drop for RetainUnknown<T> {
+        fn drop(&mut self) {
+            std::mem::forget(self.0.take());
+        }
+    }
+
+    #[test]
+    fn unused_owner_preparation_cancels_without_epoch_and_can_retry() {
+        let device = crate::MetalDevice::new(0).unwrap();
+        let commands = device.commands();
+        let cb = pending(commands);
+        for _ in 0..2 {
+            let authority = OwnerSubmission {
+                buffer: &cb,
+                clock: &commands.core.clock,
+            };
+            drop(cb.prepare_owned_commit(authority, false).unwrap());
+            assert_eq!(commands.clock().current_epoch().0, 0);
+            assert_eq!(cb.status(), MTLCommandBufferStatus::NotEnqueued);
+        }
+        commands.ensure_completed(&cb).unwrap();
+        assert_eq!(commands.clock().current_epoch().0, 1);
+        assert_eq!(commands.clock().completed_count().0, 1);
+    }
+
+    #[test]
+    fn registration_refusal_before_epoch_preserves_owner_retry() {
+        let device = crate::MetalDevice::new(0).unwrap();
+        let commands = device.commands();
+        let cb = pending(commands);
+        let raw = device
+            .metal_device()
+            .new_buffer(4096, super::super::MTLResourceOptions::StorageModeShared)
+            .unwrap();
+        let pins = RetainUnknown(Some((device.clone(), cb.clone(), raw.clone())));
+        {
+            let mut blit = commands.blit_command_encoder().unwrap();
+            // SAFETY: independent pins survive any refusal/assertion unwind.
+            unsafe { blit.fill_buffer(&raw, (0, 4096), 0x6a) };
+        }
+        let callbacks = Arc::new(AtomicUsize::new(0));
+        let observed = callbacks.clone();
+        cb.on_completion(move || {
+            observed.fetch_add(1, Ordering::Relaxed);
+        })
+        .unwrap();
+        let control = &commands.core.submission_control;
+        control.arm(submission_test::Fault::Registration);
+        assert!(matches!(
+            commands.recover_pending_submission(&cb),
+            Err(MetalKernelError::QueueUnavailable(
+                "injected completion registration refusal"
+            ))
+        ));
+        assert_eq!(commands.clock().current_epoch().0, 0);
+        assert_eq!(commands.completion_counts().0, 0);
+        assert_eq!(control.native_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(callbacks.load(Ordering::Relaxed), 0);
+        assert!(commands.check_failed().is_ok());
+        commands.ensure_completed(&cb).unwrap();
+        assert_eq!(commands.clock().current_epoch().0, 1);
+        assert_eq!(commands.clock().completed_count().0, 1);
+        assert_eq!(control.native_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(callbacks.load(Ordering::Relaxed), 1);
+        // SAFETY: successful exact owner/native join completed this write.
+        let bytes = unsafe { std::slice::from_raw_parts(raw.contents(), 4096) };
+        assert!(bytes.iter().all(|byte| *byte == 0x6a));
+        pins.release();
+    }
+
+    #[test]
+    fn known_before_entry_refusal_fails_epoch_without_native_completion_or_retry() {
+        let device = crate::MetalDevice::new(0).unwrap();
+        let commands = device.commands();
+        let cb = pending(commands);
+        // The failure/cancellation protocol retains custody. This fixture does
+        // not substitute status==Committed for actual native entry/terminality.
+        let _pins = RetainUnknown(Some((device.clone(), cb.clone())));
+        let control = &commands.core.submission_control;
+        control.arm(submission_test::Fault::BeforeEntry);
+        assert!(matches!(
+            commands.recover_pending_submission(&cb),
+            Err(MetalKernelError::QueueUnavailable(
+                "injected known-before-entry refusal"
+            ))
+        ));
+        assert_eq!(control.entry_checks.load(Ordering::Relaxed), 1);
+        assert_eq!(control.native_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(commands.clock().current_epoch().0, 1);
+        assert_eq!(commands.clock().completed_count().0, 0);
+        assert!(commands.check_failed().is_err());
+        assert!(commands.recover_pending_submission(&cb).is_err());
+        assert_eq!(commands.clock().current_epoch().0, 1);
+        assert_eq!(control.native_calls.load(Ordering::Relaxed), 0);
+        eprintln!("KNOWN_PRE_ENTRY epoch=1 native_calls=0 completed=0 retry_refused=true custody_retained=true");
+    }
+
+    #[test]
+    fn callback_reentry_before_return_publication_refuses_to_block() {
+        let device = crate::MetalDevice::new(0).unwrap();
+        let commands = device.commands();
+        let cb = pending(commands);
+        let callback_result = Arc::new(AtomicUsize::new(0));
+        let observed = callback_result.clone();
+        let owner = commands.clone();
+        cb.on_completion(move || {
+            let result = owner.flush_and_wait_current();
+            observed.store(
+                match result {
+                    Err(MetalKernelError::CallbackWouldBlock) => 1,
+                    Err(_) => 2,
+                    Ok(()) => 3,
+                },
+                Ordering::Release,
+            );
+        })
+        .unwrap();
+        let control = commands.core.submission_control.clone();
+        let pins = RetainUnknown(Some((device.clone(), cb.clone())));
+        control.arm(submission_test::Fault::HoldReturn);
+        let join = std::cell::RefCell::new(None::<std::thread::JoinHandle<_>>);
+        let result = std::cell::RefCell::new(None);
+        // Armed before spawn/any barrier wait. Every assertion/error releases
+        // publication before joining the worker; no GPU event wait is encoded.
+        let cleanup = ReleaseBeforeWait {
+            release: || control.release(),
+            wait: || {
+                if let Some(handle) = join.borrow_mut().take() {
+                    *result.borrow_mut() = Some(handle.join());
+                }
+            },
+        };
+        let owner = commands.clone();
+        let target = cb.clone();
+        *join.borrow_mut() = Some(std::thread::spawn(move || owner.ensure_completed(&target)));
+        let paused = control.wait_for_pause();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while callback_result.load(Ordering::Acquire) == 0 && std::time::Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        let before_release = callback_result.load(Ordering::Acquire);
+        drop(cleanup);
+        result.into_inner().unwrap().unwrap().unwrap();
+        assert!(paused, "native return boundary did not engage");
+        assert_eq!(
+            before_release, 1,
+            "callback reentry blocked or bypassed refusal"
+        );
+        assert_eq!(control.native_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(commands.clock().current_epoch().0, 1);
+        assert_eq!(commands.clock().completed_count().0, 1);
+        pins.release();
+    }
+
+    #[test]
+    fn metal4_partial_prefix_observes_native_progress_without_logical_completion() {
+        let device = crate::MetalDevice::new(0).unwrap();
+        let commands = device.commands();
+        let cb = pending(commands);
+        if !cb.is_metal4() {
+            eprintln!("NOT_APPLICABLE partial-prefix fixture requires actual Metal 4");
+            commands.ensure_completed(&cb).unwrap();
+            return;
+        }
+        let first = device
+            .metal_device()
+            .new_buffer(4096, super::super::MTLResourceOptions::StorageModeShared)
+            .unwrap();
+        let second = device
+            .metal_device()
+            .new_buffer(4096, super::super::MTLResourceOptions::StorageModeShared)
+            .unwrap();
+        let boundary = device.metal_device().as_ref().newSharedEvent().unwrap();
+        let observer = device.metal_device().as_ref().newSharedEvent().unwrap();
+        // Armed before encoding too: a failed encoder operation may unwind
+        // into final submission, so raw interop owners cannot disappear first.
+        let _pins = RetainUnknown(Some((
+            device.clone(),
+            cb.clone(),
+            first.clone(),
+            second.clone(),
+            boundary.clone(),
+            observer.clone(),
+        )));
+        // No wait/event/fence dependency can point into an unissued segment:
+        // pristine queue, first raw fill, then signal-only split, second fill.
+        // The independent observer is queued directly after native prefix entry.
+        {
+            let mut blit = commands.blit_command_encoder().unwrap();
+            // SAFETY: independent pins below survive unknown handoff and unwind.
+            unsafe { blit.fill_buffer(&first, (0, 4096), 0x71) };
+        }
+        cb.signal_event(&boundary, 7).unwrap();
+        {
+            let mut blit = commands.blit_command_encoder().unwrap();
+            // SAFETY: same retained independent owners; this segment never enters.
+            unsafe { blit.fill_buffer(&second, (0, 4096), 0x72) };
+        }
+        let control = &commands.core.submission_control;
+        control.install_observer(observer.clone());
+        control.arm(submission_test::Fault::PartialEntry);
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            commands.recover_pending_submission(&cb)
+        }))
+        .expect_err("partial native entry must unwind at the exact seam");
+        assert_eq!(
+            panic.downcast_ref::<&str>(),
+            Some(&"controlled partial native handoff")
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while observer.signaledValue() < 1 && std::time::Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert_eq!(
+            observer.signaledValue(),
+            1,
+            "independent native prefix observer did not fire"
+        );
+        assert_eq!(control.native_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(commands.clock().current_epoch().0, 1);
+        assert_eq!(commands.clock().completed_count().0, 0);
+        assert!(commands
+            .core
+            .modern_queue
+            .as_ref()
+            .unwrap()
+            .check_failure()
+            .is_err());
+        assert!(commands.recover_pending_submission(&cb).is_err());
+        assert_eq!(control.native_calls.load(Ordering::Relaxed), 1);
+        // SAFETY: independent native event AFTER the issued prefix proves its
+        // actual writes done. It does not prove whole-record terminality/reuse.
+        let bytes = unsafe { std::slice::from_raw_parts(first.contents(), 4096) };
+        assert!(bytes.iter().all(|byte| *byte == 0x71));
+        eprintln!("PARTIAL_PREFIX actual_api=metal4 native_calls=1 prefix_event=1 bytes=0x71 completed=0 custody_retained=true");
+    }
+
     #[test]
     fn host_gate_cleanup_releases_before_wait_on_unwind() {
         let released = AtomicBool::new(false);
@@ -3369,6 +3629,16 @@ mod owner_submission_tests {
         let device = crate::MetalDevice::new(0).unwrap();
         let commands = device.commands();
         let cb = pending(commands);
+        let raw = device
+            .metal_device()
+            .new_buffer(4096, super::super::MTLResourceOptions::StorageModeShared)
+            .unwrap();
+        let pins = RetainUnknown(Some((device.clone(), cb.clone(), raw.clone())));
+        {
+            let mut blit = commands.blit_command_encoder().unwrap();
+            // SAFETY: raw has independent owners until actual terminal join.
+            unsafe { blit.fill_buffer(&raw, (0, 4096), 0x69) };
+        }
         let mut captures = lifecycle::FinalCaptures::default();
         assert!(commands.core.poll_final_submission(&mut captures).unwrap());
         assert!(commands.core.poll_final_submission(&mut captures).unwrap());
@@ -3384,6 +3654,10 @@ mod owner_submission_tests {
             .0
             .same_recording(&cb));
         drop(captures);
+        // SAFETY: final owner submit was joined above, not inferred from poll.
+        let bytes = unsafe { std::slice::from_raw_parts(raw.contents(), 4096) };
+        assert!(bytes.iter().all(|byte| *byte == 0x69));
+        pins.release();
     }
 
     #[test]

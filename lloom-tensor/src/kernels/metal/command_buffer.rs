@@ -104,6 +104,17 @@ impl Drop for RecordingAdmission<'_> {
     }
 }
 impl PreparedCommandCommit<'_> {
+    #[cfg(test)]
+    pub(super) fn test_submission_control(
+        &mut self,
+        control: Arc<super::commands::submission_test::Control>,
+    ) {
+        match self.native.as_mut().expect("prepared native") {
+            PreparedNative::Metal3Associated(prepared) => prepared.test_control = Some(control),
+            PreparedNative::Metal4(prepared) => prepared.test_control = Some(control),
+            PreparedNative::Metal3(_) => panic!("owner fixture requires associated native work"),
+        }
+    }
     /// Flag this commit for its queue's completion hook (`completion_hook.rs`).
     /// Only queue-associated buffers have one; a standalone buffer refuses.
     pub(super) fn run_completion_hook(&self) -> Result<(), crate::kernels::MetalKernelError> {

@@ -412,6 +412,8 @@ unsafe impl Sync for NativeHandler {}
 /// CommandBuffer::new retains its explicit native-only compatibility contract.
 /// The actual wrapper constructor/routing remains an integration prerequisite.
 pub(super) struct PreparedCommit<'a> {
+    #[cfg(test)]
+    pub(super) test_control: Option<Arc<super::commands::submission_test::Control>>,
     core: &'a Arc<Completions>,
     raw: &'a objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLCommandBuffer>>,
     marker: &'a Marker,
@@ -448,6 +450,8 @@ impl Completions {
             .try_clone()
             .map_err(|_| unavailable("M3 tail pin refused"))?;
         Ok(PreparedCommit {
+            #[cfg(test)]
+            test_control: None,
             core: self,
             raw,
             marker,
@@ -530,6 +534,10 @@ impl PreparedCommit<'_> {
                 .addCompletedHandler(block2::RcBlock::as_ptr(&self.handler.0));
         }
         self.core.check()?;
+        #[cfg(test)]
+        if let Some(control) = &self.test_control {
+            control.before_entry()?;
+        }
         let link = self.link.take().expect("prepared successor pin");
         let new_tail = self.new_tail.take().expect("prepared tail pin");
         self.core.append(&mut self.order, link, new_tail)?;
@@ -550,6 +558,14 @@ impl PreparedCommit<'_> {
         // may already have reserved native placement; logical prefix remains
         // commit order, not a claim that earlier enqueue never changes order.
         self.raw.commit();
+        #[cfg(test)]
+        if let Some(control) = &self.test_control {
+            assert!(
+                !control.native_call_returned(0),
+                "partial fault is Metal 4 only"
+            );
+            control.before_return();
+        }
         if let Some(head) = self.bindings {
             head.returned().map_err(|error| {
                 self.binding_failure(Failure::UnknownHandoff);

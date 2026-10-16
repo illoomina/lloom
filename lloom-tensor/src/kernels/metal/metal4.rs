@@ -933,6 +933,8 @@ impl Submission {
             CommitOptions::Segments(options)
         };
         Ok(PreparedCommit {
+            #[cfg(test)]
+            test_control: None,
             submission: self,
             order,
             state: std::cell::RefCell::new(Some(state)),
@@ -1144,6 +1146,8 @@ impl CommitOptions {
 }
 
 pub(super) struct PreparedCommit<'a> {
+    #[cfg(test)]
+    pub(super) test_control: Option<Arc<super::commands::submission_test::Control>>,
     submission: &'a Arc<Submission>,
     order: parking_lot::MutexGuard<'a, u64>,
     state: std::cell::RefCell<Option<parking_lot::MutexGuard<'a, State>>>,
@@ -1269,6 +1273,10 @@ impl PreparedCommit<'_> {
         // execution. Any unwind before queue entry cancels via rooted custody.
         residency.commit();
         self.extra.last().unwrap_or(&self.first).endCommandBuffer();
+        #[cfg(test)]
+        if let Some(control) = &self.test_control {
+            control.before_entry()?;
+        }
         submission.retirement.begin_handoff().map_err(|_| {
             submission.binding_failure(crate::retirement_owners::Failure::AdapterFailed);
             MetalKernelError::QueueUnavailable("native handoff refused")
@@ -1315,6 +1323,19 @@ impl PreparedCommit<'_> {
                         self.options.get(index),
                     );
                 }
+                #[cfg(test)]
+                if let Some(control) = &self.test_control {
+                    if control.native_call_returned(index) {
+                        // Independent native prefix observer: it requires no
+                        // logical owner publication or unissued later segment.
+                        let event = control.observer();
+                        submission
+                            .queue
+                            .raw
+                            .signalEvent_value(ProtocolObject::from_ref(&*event), 1);
+                        panic!("controlled partial native handoff");
+                    }
+                }
             },
             |boundary| {
                 let event = ProtocolObject::from_ref(&*boundary.event);
@@ -1331,6 +1352,10 @@ impl PreparedCommit<'_> {
                 }
             },
         );
+        #[cfg(test)]
+        if let Some(control) = &self.test_control {
+            control.before_return();
+        }
         // Publish RETURNED before this side can elect the terminal winner.
         // All native queue entries returned; callbacks may already be complete.
         if let Some(bindings) = &submission.bindings {

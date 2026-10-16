@@ -273,6 +273,85 @@ fn a_refused_request_allocates_nothing() -> Result<()> {
     Ok(())
 }
 
+/// Mask refusals precede mixed-KV conversion, not just attention output allocation.
+/// The valid arm also proves the dispatch census observes conversion and attention.
+#[test]
+fn an_invalid_mask_precedes_mixed_kv_conversion() -> Result<()> {
+    std::env::set_var("CANDLE_METAL_PROFILE", "1");
+    let dev = Device::new_metal(0)?;
+    let mut s = spec(64, DType::F16, MaskKind::Additive);
+    s.kv_dtype = DType::F32;
+    let route = prepare(&dev, s)?;
+    let f = Inputs::new(64, 1, 33);
+    let (q, _, _) = f.tensors(DType::F16, &dev)?;
+    let (_, k, v) = f.tensors(DType::F32, &dev)?;
+    let valid = Tensor::zeros((1, HEADS, 1, 33), DType::F16, &dev)?;
+    let wrong_shape = Tensor::zeros((1, HEADS, 1, 32), DType::F16, &dev)?;
+    let wrong_dtype = Tensor::zeros((1, HEADS, 1, 33), DType::F32, &dev)?;
+    let wrong_device = Tensor::zeros((1, HEADS, 1, 33), DType::F16, &Device::Cpu)?;
+    dev.synchronize()?;
+    for (name, mask, reason) in [
+        ("shape", &wrong_shape, "Mask shape"),
+        ("dtype", &wrong_dtype, "Mask type"),
+        ("device", &wrong_device, "query device"),
+    ] {
+        let before = requested(&dev)?;
+        let window = dev
+            .as_metal_device()?
+            .dispatch_census()
+            .open()
+            .expect("census enabled");
+        let error = ops::attention(&q, &k, &v, Some(mask), 0.125, &route)
+            .expect_err("invalid mask must be refused");
+        let dispatches = window.close();
+        assert!(error.to_string().contains(reason), "{name}: {error}");
+        assert_eq!(
+            requested(&dev)?,
+            before,
+            "{name}: conversion allocated before refusal"
+        );
+        assert!(
+            dispatches.is_empty(),
+            "{name}: dispatched before refusal: {dispatches:?}"
+        );
+    }
+
+    let expected = ops::sdpa(
+        &q,
+        &k.to_dtype(DType::F16)?,
+        &v.to_dtype(DType::F16)?,
+        Some(&valid),
+        false,
+        0.125,
+        1.0,
+    )?;
+    dev.synchronize()?;
+    let before = requested(&dev)?;
+    let window = dev
+        .as_metal_device()?
+        .dispatch_census()
+        .open()
+        .expect("census enabled");
+    let got = ops::attention(&q, &k, &v, Some(&valid), 0.125, &route)?;
+    let dispatches: u64 = window.close().iter().map(|(_, count)| count).sum();
+    assert!(
+        dispatches >= 3,
+        "two conversions and attention must be observed: {dispatches}"
+    );
+    let ws = route.workspace(1, 1, 33)?;
+    assert_eq!(
+        requested(&dev)? - before,
+        (ws.output + ws.conversion) as u64
+    );
+    assert_eq!(
+        bits(&got)?,
+        bits(&expected)?,
+        "valid mixed-KV route changed math"
+    );
+    eprintln!("mixed-KV mask preflight: invalid=3 allocated=0 dispatched=0; valid dispatches={dispatches} bytes={} exact=true", ws.output + ws.conversion);
+    Ok(())
+}
+
 /// The workspace the route reports is exactly what one call asks the pool
 /// for: the output, and the two-pass scratch when that kernel runs.
 #[test]

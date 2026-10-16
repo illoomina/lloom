@@ -2949,6 +2949,9 @@ fn health_body(engine: &dyn Served, front: &Front) -> Result<Value> {
     body["template_renders"] = json!(engine.template_renders());
     body["tokenizations"] = json!(front.tokenizations());
     body["session_log"] = json!(front.logged());
+    // The history policy as resolved for this template: past reasoning kept
+    // unless stripped on request, an unfinished reply's rendering.
+    body["session"] = front.session_json();
     body["logprobs"] = logprobs_capability(engine);
     body["chat_template_reads"] = ENGINE_KWARGS
         .iter()

@@ -1758,7 +1758,7 @@ fn parse_keep_logprobs(v: &str) -> Result<String, String> {
 #[options(v0 = false)]
 #[serde(default)]
 pub struct SessionConfig {
-    /// Keep past replies' reasoning in the history the next turn renders (the chat template's `preserve_thinking`); unset = the template's own default.
+    /// Keep past replies' reasoning in the history the next turn renders (the chat template's `preserve_thinking`): unset keeps it, as `true` does, wherever the template has the switch (its own rendering where it has none); `false` strips it (opt-in).
     #[opt(bool, flag = "persist-thinking", path = "session.persist_thinking", status = "stable", cli = "persist-thinking", switches = ["strip-thinking=false"])]
     pub persist_thinking: Option<bool>,
     /// A past reply of ours sent back without the reasoning the model wrote: `as-sent` renders the message as the client sent it; `log` restores the reasoning from the session log.
@@ -1767,7 +1767,7 @@ pub struct SessionConfig {
     /// What the session log keeps beside each reply's sampled ids: `none`; `sampled`, the sampled token's log-probability; `full`, every position's log-probabilities over the vocabulary (for a trainer that embeds the engine).
     #[opt(flag = "keep-logprobs", parser = "parse_keep_logprobs", variants = ["none", "sampled", "full"], path = "session.keep_logprobs", status = "advanced")]
     pub keep_logprobs: String,
-    /// A past reply of ours whose run ended inside its reasoning block (`max_tokens`, a stop string, a cancellation): `text` renders it as the text the client got; `reasoning` gives it to the template as the open reasoning it is, which the template closes or drops; `recover` renders it as text and places the turn checkpoint before the divergence that makes.
+    /// A past reply of ours whose run ended inside its reasoning block (`max_tokens`, a stop string, a cancellation): `reasoning` (the default) gives it to the template as the open reasoning it is, which the template closes or drops; `text` renders it as the text the client got; `recover` renders it as text and places the turn checkpoint before the divergence that makes.
     #[opt(flag = "incomplete-reasoning", parser = "parse_incomplete_reasoning", variants = ["text", "reasoning", "recover"], path = "session.incomplete_reasoning", status = "advanced")]
     pub incomplete_reasoning: String,
 }
@@ -1778,7 +1778,7 @@ impl Default for SessionConfig {
             persist_thinking: None,
             missing_reasoning: "as-sent".into(),
             keep_logprobs: "none".into(),
-            incomplete_reasoning: "text".into(),
+            incomplete_reasoning: "reasoning".into(),
         }
     }
 }

@@ -427,7 +427,7 @@ fn the_unset_defaults_are_the_trees_before_it_except_the_named_exceptions() {
         let o = resolve(Some(f), sub, &[], &none).unwrap();
         assert_eq!(
             o.session.persist_thinking, None,
-            "{sub}: absent = the template's own"
+            "{sub}: absent stays unset; Front resolves the effective persistence"
         );
         assert_eq!(o.session.missing_reasoning, "as-sent");
         assert_eq!(o.session.keep_logprobs, "none");

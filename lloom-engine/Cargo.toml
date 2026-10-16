@@ -99,6 +99,10 @@ metal = ["lloom/metal"]
 cuda = ["lloom/cuda"]
 accelerate = ["lloom/accelerate"]
 mkl = ["lloom/mkl"]
+# The optimized diagnostic build (`lloom`'s `profile`): the per-step decode
+# instrumentation a plain release compiles out. The keys that need it say
+# so (`lloom options --compiled`).
+profile = ["lloom/profile"]
 # The `lloom-serve` binary: the OpenAI-compatible endpoint and the benchmark
 # sidecar contract over the engine (issue #695). Backend-agnostic on its own;
 # pair with `metal` on Apple silicon.

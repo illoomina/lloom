@@ -51,6 +51,8 @@
 //! #[opt(schema = "Wait", forms = ["spin", "sleep"])]  a shared value type and the forms this site takes
 //! #[opt(legacy_only)]                        an alias of `path` that a write to the key resets
 //! #[opt(legacy_keys = ["model.kv-append"])]  further accepted dotted keys
+//! #[opt(needs = "profile")]                  the compiled capability the key's effect needs
+//! #[opt(needs = "profile", needs_part = "…")]  …for that part of its output only
 //! ```
 //!
 //! Struct tag: `#[options(krate = "crate")]` names the crate that holds
@@ -98,6 +100,8 @@ struct OptAttr {
     forms: Vec<String>,
     legacy_only: bool,
     legacy_keys: Vec<String>,
+    needs: Option<String>,
+    needs_part: Option<String>,
 }
 
 const STATUSES: [&str; 5] = ["stable", "advanced", "arm", "reference", "instrument"];
@@ -169,6 +173,8 @@ impl Parse for OptAttr {
                 "schema" => a.schema = Some(str_value(input)?),
                 "forms" => a.forms = str_list(input)?,
                 "legacy_keys" => a.legacy_keys = str_list(input)?,
+                "needs" => a.needs = Some(str_value(input)?),
+                "needs_part" => a.needs_part = Some(str_value(input)?),
                 other => {
                     return Err(syn::Error::new(
                         key.span(),
@@ -468,6 +474,10 @@ pub(crate) fn derive(input: DeriveInput) -> TokenStream {
             return syn::Error::new_spanned(&f.ty, "#[opt(invert)] needs a bool field")
                 .to_compile_error();
         }
+        if attr.needs_part.is_some() && attr.needs.is_none() {
+            return syn::Error::new_spanned(&f.ty, "#[opt(needs_part)] names the part of `needs`")
+                .to_compile_error();
+        }
         let inner = option_inner(&f.ty);
         items.push(Field {
             ident,
@@ -516,6 +526,12 @@ pub(crate) fn derive(input: DeriveInput) -> TokenStream {
             let mut doc = user_doc(&f.doc);
             if !f.attr.variants.is_empty() {
                 doc.push_str(&format!(" [arms: {}]", f.attr.variants.join(", ")));
+            }
+            if let Some(cap) = &f.attr.needs {
+                doc.push_str(&match &f.attr.needs_part {
+                    Some(part) => format!(" [{part}: the `{cap}` build only]"),
+                    None => format!(" [the `{cap}` build only]"),
+                });
             }
             if let Some(p) = &f.attr.path {
                 doc.push_str(&format!(" [key: {p}]"));
@@ -623,6 +639,41 @@ pub(crate) fn derive(input: DeriveInput) -> TokenStream {
                     quote! { if self.#sw { base.set(#key, #value)?; } }
                 });
                 quote! { #main #(#switches)* }
+            }
+        });
+
+    let given_stmts = items
+        .iter()
+        .filter(|f| !(f.attr.skip || f.attr.nested && f.attr.no_args))
+        .map(|f| {
+            let ident = &f.ident;
+            let key = ident.to_string();
+            let here = quote! {
+                if prefix.is_empty() { #key.to_string() } else { format!("{}.{}", prefix, #key) }
+            };
+            if f.attr.nested {
+                let compound = if f.attr.flag.is_some() && f.attr.parser.is_some() {
+                    let spelling = format_ident!("{}_spelling", ident);
+                    quote! {
+                        if self.#spelling.is_some() {
+                            out.insert(#here);
+                        }
+                    }
+                } else {
+                    quote! {}
+                };
+                quote! {
+                    #compound
+                    self.#ident.given(&#here, out);
+                }
+            } else {
+                let switches =
+                    (0..f.attr.switches.len()).map(|i| format_ident!("{}_switch{}", ident, i));
+                quote! {
+                    if self.#ident.is_some() #(|| self.#switches)* {
+                        out.insert(#here);
+                    }
+                }
             }
         });
 
@@ -850,6 +901,8 @@ pub(crate) fn derive(input: DeriveInput) -> TokenStream {
             flag
         };
         let is_bool = f.attr.is_bool;
+        let needs = f.attr.needs.clone().unwrap_or_default();
+        let needs_part = f.attr.needs_part.clone().unwrap_or_default();
         quote! {
             #krate::options::KnobMeta {
                 key: #key, flag: #flag, env: #env, doc: #doc,
@@ -868,6 +921,8 @@ pub(crate) fn derive(input: DeriveInput) -> TokenStream {
                 v0: #v0,
                 legacy_keys: &[#(#legacy_keys),*],
                 compound: #compound,
+                needs: #needs,
+                needs_part: #needs_part,
             }
         }
     });
@@ -893,6 +948,13 @@ pub(crate) fn derive(input: DeriveInput) -> TokenStream {
             pub fn apply(&self, base: &mut #struct_ident) -> ::std::result::Result<(), ::std::string::String> {
                 #(#apply_stmts)*
                 Ok(())
+            }
+
+            /// Collect into `out` the storage path (under `prefix`) of every
+            /// field whose flag was given, a group's for its shorthand.
+            pub fn given(&self, prefix: &str, out: &mut ::std::collections::BTreeSet<::std::string::String>) {
+                let _ = (prefix, &out);
+                #(#given_stmts)*
             }
         }
 

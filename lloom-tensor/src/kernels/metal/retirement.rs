@@ -84,7 +84,7 @@ pub(super) struct Metal3RawOwners {
     // Original raw retain releases before namespace metadata capabilities.
     pub namespaces: Vec<crate::metal_backend::device_retirement::NamespaceOwner>,
     // LAST: actual raw/native/namespace drops precede counted generation release.
-    pub bindings: Option<super::native_generation_bindings::GenerationBindings>,
+    pub _bindings: Option<super::native_generation_bindings::GenerationBindings>,
 }
 // SAFETY: same cross-thread retain/release contract as CommandBuffer.
 unsafe impl Send for Metal3RawOwners {}
@@ -92,7 +92,7 @@ unsafe impl Sync for Metal3RawOwners {}
 
 pub(super) struct NativeOwners {
     backend: NativeBackend,
-    physical: Option<crate::metal_backend::device_retirement::NamespaceOwner>,
+    _physical: Option<crate::metal_backend::device_retirement::NamespaceOwner>,
 }
 enum NativeBackend {
     Vacant,
@@ -101,7 +101,7 @@ enum NativeBackend {
         slot: Option<metal4::Slot>,
         queue: Arc<metal4::Queue>,
         submission: Option<Arc<metal4::Submission>>,
-        signals: Vec<metal4::EventBoundary>,
+        _signals: Vec<metal4::EventBoundary>,
     },
 }
 // SAFETY: Metal CB wrappers already permit cross-thread retention. The M4 slot
@@ -114,14 +114,14 @@ impl NativeOwners {
     pub fn vacant() -> Self {
         Self {
             backend: NativeBackend::Vacant,
-            physical: None,
+            _physical: None,
         }
     }
 
     pub fn metal3(anchor: Metal3Anchor) -> Self {
         Self {
             backend: NativeBackend::Metal3(anchor),
-            physical: None,
+            _physical: None,
         }
     }
     pub fn metal4(
@@ -135,9 +135,9 @@ impl NativeOwners {
                 slot: None,
                 queue: submission.queue.clone(),
                 submission: Some(submission),
-                signals: Vec::new(),
+                _signals: Vec::new(),
             },
-            physical,
+            _physical: physical,
         }
     }
     /// Abandonment transfers the actual recording owners, not just an empty
@@ -153,9 +153,9 @@ impl NativeOwners {
                 slot: Some(slot),
                 queue,
                 submission: None,
-                signals,
+                _signals: signals,
             },
-            physical,
+            _physical: physical,
         }
     }
 

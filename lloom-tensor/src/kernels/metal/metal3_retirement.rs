@@ -183,6 +183,7 @@ impl Completions {
     /// Holds actual raw-commit exclusion, not merely a sequence counter. A
     /// caller must retain this guard through begin_handoff/append/native entry/
     /// RETURNED. Unused preparations append nothing.
+    #[cfg(test)]
     pub(super) fn prepare_order(
         &self,
     ) -> Result<MutexGuard<'_, Marker>, crate::kernels::MetalKernelError> {
@@ -693,7 +694,7 @@ impl AssociatedBuffer {
                         raw,
                         physical,
                         namespaces: Vec::new(),
-                        bindings: None,
+                        _bindings: None,
                     },
                     prepared,
                 )),
@@ -716,7 +717,7 @@ impl AssociatedBuffer {
                             raw,
                             physical,
                             namespaces: Vec::new(),
-                            bindings: None,
+                            _bindings: None,
                         },
                         prepared,
                     )),
@@ -734,7 +735,7 @@ impl AssociatedBuffer {
                             raw,
                             physical,
                             namespaces: Vec::new(),
-                            bindings: None,
+                            _bindings: None,
                         },
                         prepared,
                         bindings,
@@ -758,7 +759,7 @@ impl AssociatedBuffer {
                     raw,
                     physical,
                     namespaces: Vec::new(),
-                    bindings: native_head,
+                    _bindings: native_head,
                 },
                 |_| Ok(()),
             )
@@ -790,7 +791,7 @@ impl AssociatedBuffer {
                             raw,
                             physical: None,
                             namespaces: Vec::new(),
-                            bindings: None,
+                            _bindings: None,
                         },
                         anchor,
                     )),
@@ -808,7 +809,7 @@ impl AssociatedBuffer {
                             raw,
                             physical: None,
                             namespaces: Vec::new(),
-                            bindings: None,
+                            _bindings: None,
                         },
                         anchor,
                         rejected.rejected,
@@ -826,7 +827,7 @@ impl AssociatedBuffer {
                         raw,
                         physical: None,
                         namespaces: Vec::new(),
-                        bindings: None,
+                        _bindings: None,
                     },
                     anchor,
                 )),

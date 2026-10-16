@@ -657,6 +657,7 @@ impl<C, A, F> Registration<C, A, F> {
     pub(crate) fn handoff_unknown(&self, wake_waiters: impl FnOnce()) -> Result<(), MailboxError> {
         self.slab.cells[self.index].handoff_unknown(self.ticket, wake_waiters)
     }
+    #[cfg(test)]
     pub(crate) fn publish_feedback(
         &self,
         feedback: F,

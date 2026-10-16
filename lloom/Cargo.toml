@@ -103,14 +103,14 @@ criterion = { workspace = true }
 [features]
 default = []
 # Detailed per-step decode instrumentation (per-step `step_ns`/`sample_ns` clock
-# reads + phase timings). ON automatically in debug/test builds (so the tests that
-# assert on `step_ns` keep working and a dev build stays introspectable); OFF in a
+# reads + phase timings) and tensor allocation/readback attribution. ON with
+# debug assertions (including normal tests); OFF in a
 # plain `--release` build so the decode hot path takes NO per-step
 # `mach_absolute_time()` read — release reports coarse tokens ÷ wall-clock instead
 # (llama-bench style), which is measured host-side off the loop. Turn it on in a
 # release-like build with `--features profile` to profile without shipping the
 # reads. Gated as `any(debug_assertions, feature = "profile")`.
-profile = []
+profile = ["lloom-tensor/profile"]
 # The fuzz models (`generation::token_ring_fuzz`, `models::lfm2::kv_slot_fuzz`)
 # outside `#[cfg(test)]`, and the tile poison written in a release build, so the
 # coverage-guided harnesses in `lloom-fuzz/` (lloom #706) drive the same models

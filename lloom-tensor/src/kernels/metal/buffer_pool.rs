@@ -139,6 +139,7 @@ fn trace_on() -> bool {
             } else {
                 1
             };
+            crate::tuning::require_profile(v == 2);
             ON.store(v, Ordering::Relaxed);
             v
         }
@@ -152,6 +153,7 @@ fn trace_on() -> bool {
 /// the pending queue's head epoch against the clock — a miss with the size
 /// PENDING and its epoch incomplete is the deferred-release window, not a
 /// leak), and the `lloom` frames that asked.
+#[cfg(any(debug_assertions, feature = "profile"))]
 fn trace_allocation(size: usize, why: &str) {
     let bt = std::backtrace::Backtrace::force_capture().to_string();
     let frames: Vec<&str> = bt
@@ -2681,7 +2683,8 @@ impl BufferPool {
             buffer.length(),
             buffer.base_offset(),
         );
-        let why = {
+        #[allow(unused_variables)]
+        let why: Option<String> = {
             let mut state = self.inner.state.lock(Side::Host);
             state.counters.allocations += 1;
             state.counters.allocated_bytes += size as u64;
@@ -2701,7 +2704,9 @@ impl BufferPool {
             if pending_reuse {
                 state.counters.pending_twin_allocations += 1;
             }
-            if trace_on() {
+            let _trace = trace_on();
+            #[cfg(any(debug_assertions, feature = "profile"))]
+            if _trace {
                 let pending_same = state.pending.iter().filter(|n| n.size() == size).count();
                 let free_same = state.free.get(&size).map_or(0, |b| b.nodes.len());
                 let head = state.pending.head_epoch();
@@ -2715,7 +2720,12 @@ impl BufferPool {
             } else {
                 None
             }
+            #[cfg(not(any(debug_assertions, feature = "profile")))]
+            {
+                None
+            }
         };
+        #[cfg(any(debug_assertions, feature = "profile"))]
         if let Some(why) = why {
             trace_allocation(size, &why);
         }
@@ -5356,5 +5366,26 @@ mod contention_tests {
         );
         assert_eq!(dev.buffers.occupancy().pending_buffers, 0);
         drop(again);
+    }
+}
+
+#[cfg(test)]
+mod diagnostic_build_tests {
+    #[test]
+    fn retirement_clock_is_functional_without_attribution() {
+        let clock = super::GpuClock::new();
+        let first = clock.commit_epoch();
+        let second = clock.commit_epoch();
+        assert!(!clock.is_complete(first));
+        assert!(!clock.is_complete(second));
+        clock.mark_completed(first);
+        assert!(clock.is_complete(first));
+        assert!(!clock.is_complete(second));
+        clock.mark_completed(second);
+        clock.mark_completed(first);
+        assert!(
+            clock.is_complete(second),
+            "late notification cannot regress retirement"
+        );
     }
 }

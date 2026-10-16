@@ -26,6 +26,18 @@ use lloom_macros::Options;
 use serde::{Deserialize, Serialize};
 use std::sync::OnceLock;
 
+/// Whether optional attribution machinery is compiled into this tensor build.
+pub const PROFILE_INSTRUMENTS: bool = cfg!(any(debug_assertions, feature = "profile"));
+
+/// Direct library callers must not enable an unavailable attribution instrument.
+#[cfg(any(feature = "metal", test))]
+pub(crate) fn require_profile(on: bool) {
+    assert!(
+        !on || PROFILE_INSTRUMENTS,
+        "diagnostic attribution is absent; rebuild with cargo build --profile release-with-debug --features profile"
+    );
+}
+
 static TUNING: OnceLock<Tuning> = OnceLock::new();
 
 /// The determinism contract a run is held to (`--profile`, `LLOOM_PROFILE`;
@@ -1378,7 +1390,8 @@ pub struct InstrumentTuning {
         env = "LLOOM_POOL_TRACE",
         bool,
         path = "diagnostics.trace.pool",
-        status = "instrument"
+        status = "instrument",
+        needs = "profile"
     )]
     pub pool_trace: bool,
     /// Attribute every pool request a served pass makes to the model call site that made it (a backtrace per request; the residue of `served_pass_pool_requests`, §9.2aa).
@@ -1387,11 +1400,12 @@ pub struct InstrumentTuning {
         env = "LLOOM_SERVED_REQUEST_TRACE",
         bool,
         path = "diagnostics.trace.served_requests",
-        status = "instrument"
+        status = "instrument",
+        needs = "profile"
     )]
     pub served_request_trace: bool,
     /// Attribute every host readback (`to_cpu`'s fast and blit paths, a staged read's stage, a host-read slot's read) to the model call site that made it (a backtrace per readback, #814 part 5).
-    #[opt(flag = "readback-trace", env = "LLOOM_READBACK_TRACE", bool, path = "diagnostics.trace.readbacks", status = "instrument", flows = ["token-out"])]
+    #[opt(flag = "readback-trace", env = "LLOOM_READBACK_TRACE", bool, path = "diagnostics.trace.readbacks", status = "instrument", needs = "profile", flows = ["token-out"])]
     pub readback_trace: bool,
     /// Shadow every host upload and check it back (the #748 corruption instrument).
     #[opt(
@@ -1747,5 +1761,15 @@ mod tests {
         sorted.sort_unstable();
         sorted.dedup();
         assert_eq!(sorted.len(), aliases.len(), "no two knobs share a variable");
+    }
+}
+
+#[cfg(test)]
+mod diagnostic_build_tests {
+    #[test]
+    fn an_unavailable_direct_attribution_request_is_loud() {
+        super::require_profile(false);
+        let result = std::panic::catch_unwind(|| super::require_profile(true));
+        assert_eq!(result.is_ok(), super::PROFILE_INSTRUMENTS);
     }
 }

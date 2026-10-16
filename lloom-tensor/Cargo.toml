@@ -108,6 +108,8 @@ rand_distr = { workspace = true }
 
 [features]
 default = []
+# Optional attribution and detailed diagnostics in optimized builds.
+profile = []
 # The stateful fuzz MODELS (`buffer_pool_fuzz`, `commands_fuzz`, `scratch_fuzz`)
 # and the one accessor they read, compiled OUTSIDE `#[cfg(test)]` so the
 # coverage-guided harnesses in `lloom-fuzz/` (lloom #706) can drive them. Off by

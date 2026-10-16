@@ -32,10 +32,10 @@ pub fn this_build() -> Vec<Capability> {
     vec![
         Capability {
             name: "profile",
-            compiled: lloom::PROFILE_INSTRUMENTS,
+            compiled: lloom::PROFILE_INSTRUMENTS && lloom_tensor::tuning::PROFILE_INSTRUMENTS,
             feature: "profile",
             feature_on: cfg!(feature = "profile"),
-            what: "the decode loop's per-step instrumentation (debug builds, or an optimized build with the feature)",
+            what: "per-step instrumentation and allocation/readback attribution (debug builds, or an optimized build with the feature)",
         },
         Capability {
             name: "metal",
@@ -63,8 +63,13 @@ pub fn build_line(caps: &[Capability], needed: &str) -> String {
             features.push(c.feature);
         }
     }
+    let tier = if needed == "profile" {
+        "--profile release-with-debug"
+    } else {
+        "--release"
+    };
     format!(
-        "cargo build --release -p lloom-engine --bin lloom --features {}",
+        "cargo build {tier} -p lloom-engine --bin lloom --features {}",
         features.join(",")
     )
 }
@@ -198,7 +203,7 @@ mod tests {
             n.contains("diagnostics.verbose")
                 && n.contains("the step-time percentiles")
                 && n.contains("`profile` build")
-                && n.contains("cargo build --release -p lloom-engine --bin lloom --features serve")
+                && n.contains("cargo build --profile release-with-debug -p lloom-engine --bin lloom --features serve")
                 && n.ends_with("it prints the rest"),
             "{n}"
         );
@@ -213,9 +218,45 @@ mod tests {
 
     /// A key whose whole effect needs the capability is refused by name on
     /// a build without it, with the build line; set on a build with it, or
-    /// left at its default, it passes. No shipping key is whole-`profile`
-    /// today, so the refusal arm runs over a group of the test's own,
-    /// through the same declaration the derive emits.
+    /// left at its default, it passes. An independent probe also checks
+    /// unknown capability handling through the same derive.
+    #[test]
+    fn attribution_keys_refuse_shipping_and_accept_diagnostics() {
+        let plain = plain(&this_build());
+        let available: Vec<_> = this_build()
+            .into_iter()
+            .map(|c| Capability {
+                compiled: true,
+                ..c
+            })
+            .collect();
+        for path in [
+            "diagnostics.trace.pool",
+            "diagnostics.trace.served_requests",
+            "diagnostics.trace.readbacks",
+        ] {
+            let mut o = EngineOptions::default();
+            index().set(&mut o, path, "true").unwrap();
+            let error = check(&o, &plain).expect_err("whole attribution unavailable");
+            assert!(
+                error.contains(path)
+                    && error.contains("--profile release-with-debug")
+                    && error.ends_with(",profile"),
+                "{error}"
+            );
+            assert_eq!(check(&o, &available), Ok(vec![]));
+            assert_eq!(
+                check(&o, &this_build()).is_ok(),
+                lloom_tensor::tuning::PROFILE_INSTRUMENTS
+            );
+        }
+        assert_eq!(
+            lloom::PROFILE_INSTRUMENTS,
+            lloom_tensor::tuning::PROFILE_INSTRUMENTS,
+            "profile must forward to the tensor implementation"
+        );
+    }
+
     #[test]
     fn a_whole_need_is_refused_naming_the_build() {
         #[derive(
@@ -244,7 +285,7 @@ mod tests {
         let e =
             verdict([("diagnostics.trace.probe", m)], &caps).expect_err("refused on a plain build");
         assert!(
-            e.starts_with("diagnostics.trace.probe needs the `profile` build, which this binary is not: cargo build --release -p lloom-engine --bin lloom --features serve")
+            e.starts_with("diagnostics.trace.probe needs the `profile` build, which this binary is not: cargo build --profile release-with-debug -p lloom-engine --bin lloom --features serve")
                 && e.ends_with(",profile"),
             "{e}"
         );

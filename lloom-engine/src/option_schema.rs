@@ -112,6 +112,55 @@ fn arms(variants: &[&str]) -> Value {
     ]})
 }
 
+/// Decimal strings in 0..=maximum, including arbitrarily many leading zeros.
+/// Prefix branches differ at their first digit below the upper bound.
+fn bounded_decimal(maximum: u64) -> String {
+    let bound = maximum.to_string();
+    let width = bound.len();
+    let mut alts = vec!["0".to_string()];
+    if width > 1 {
+        alts.push(format!(r"[1-9][0-9]{{0,{}}}", width - 2));
+    }
+    for (i, digit) in bound.bytes().enumerate() {
+        let first = if i == 0 { b'1' } else { b'0' };
+        if digit > first {
+            alts.push(format!(
+                "{}[{}-{}][0-9]{{{}}}",
+                &bound[..i],
+                char::from(first),
+                char::from(digit - 1),
+                width - i - 1,
+            ));
+        }
+    }
+    alts.push(bound);
+    format!("0*({})", alts.join("|"))
+}
+
+/// Rust trim's whitespace set, written explicitly for both Rust regex and
+/// ECMA-262 (whose \s includes FEFF and excludes NEL).
+const TRIM_SPACE: &str = "[\u{0009}-\u{000D}\u{0020}\u{0085}\u{00A0}\u{1680}\u{2000}-\u{200A}\u{2028}\u{2029}\u{202F}\u{205F}\u{3000}]";
+
+fn wait_schema(grammar: &lloom_tensor::options::wait::WaitGrammar) -> Value {
+    let literal = |s: &str| escape(s).replace(r"\-", "-");
+    let arm = literal(grammar.parameter_arm);
+    let maximum = grammar.parameter.maximum();
+    let mut parameters = vec![bounded_decimal(maximum)];
+    for unit in grammar.parameter.units() {
+        parameters.push(format!(
+            r"{TRIM_SPACE}*\+?{}{}",
+            bounded_decimal(maximum / unit.scale()),
+            literal(unit.suffix()),
+        ));
+    }
+    let mut alts: Vec<String> = grammar.literals.iter().map(|s| literal(s)).collect();
+    alts.push(arm.clone());
+    alts.push(format!("{arm}:({})", parameters.join("|")));
+    json!({"type": "string", "pattern": format!(
+        "^{TRIM_SPACE}*({}){TRIM_SPACE}*$", case_free(&alts.join("|"))
+    )})
+}
+
 /// The shared value types.
 pub fn defs() -> Value {
     json!({
@@ -166,8 +215,9 @@ fn value_schema(key: &Key, default: &Value) -> Value {
         Some(inner) => (inner, true),
         None => (m.ty, false),
     };
-    let mut s = match m.schema {
-        "Wait" => {
+    let mut s = match (m.grammar, m.schema) {
+        (Some(grammar), _) => wait_schema(grammar),
+        (None, "Wait") => {
             let alt = m
                 .forms
                 .iter()
@@ -176,10 +226,10 @@ fn value_schema(key: &Key, default: &Value) -> Value {
                 .join("|");
             json!({"allOf": [{"$ref": "#/$defs/Wait"}, {"pattern": format!(r"^\s*({})(:{DURATION})?\s*$", case_free(&alt))}]})
         }
-        "ThreadQos" if !m.forms.is_empty() => {
+        (None, "ThreadQos") if !m.forms.is_empty() => {
             json!({"allOf": [{"$ref": "#/$defs/ThreadQos"}, arms(m.forms)]})
         }
-        "" => {
+        (None, "") => {
             let mut b = if m.is_bool {
                 json!({"type": "boolean"})
             } else {
@@ -198,11 +248,11 @@ fn value_schema(key: &Key, default: &Value) -> Value {
             }
             b
         }
-        other => json!({"$ref": format!("#/$defs/{other}")}),
+        (None, other) => json!({"$ref": format!("#/$defs/{other}")}),
     };
     // A key whose vocabulary moved to a shared type still takes the stored
     // spellings it always took (`interactive`, `synchronize`).
-    if m.schema != "" && !m.variants.is_empty() {
+    if m.grammar.is_none() && !m.schema.is_empty() && !m.variants.is_empty() {
         if let Some(p) = variants_pattern(m.variants) {
             s = json!({"anyOf": [s, {"type": "string", "pattern": p}]});
         }
@@ -387,7 +437,7 @@ pub fn schema() -> Value {
         let group = node["properties"][last].take();
         let m = key.meta();
         node["properties"][last] = json!({
-            "anyOf": [group, {"type": "string", "enum": crate::ReadbackConfig::SPELLINGS}],
+            "anyOf": [group, arms(crate::ReadbackConfig::SPELLINGS)],
             "description": format!("{} A string is the shorthand for the group's keys.", m.doc),
             "x-lloom-status": m.status.name(),
             "x-lloom-flag": format!("--{}", m.cli),

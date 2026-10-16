@@ -49,6 +49,7 @@
 //! #[opt(values = ["event=true"])]             key spelling = stored spelling, where they differ
 //! #[opt(from_v1 = "f", to_v1 = "g")]          the same, as functions of the spelling
 //! #[opt(schema = "Wait", forms = ["spin", "sleep"])]  a shared value type and the forms this site takes
+//! #[opt(grammar = "path::GRAMMAR")]           field-attached Wait grammar for schema/conversion
 //! #[opt(legacy_only)]                        an alias of `path` that a write to the key resets
 //! #[opt(legacy_keys = ["model.kv-append"])]  further accepted dotted keys
 //! #[opt(needs = "profile")]                  the compiled capability the key's effect needs
@@ -97,6 +98,7 @@ struct OptAttr {
     from_v1: Option<String>,
     to_v1: Option<String>,
     schema: Option<String>,
+    grammar: Option<syn::Path>,
     forms: Vec<String>,
     legacy_only: bool,
     legacy_keys: Vec<String>,
@@ -171,6 +173,10 @@ impl Parse for OptAttr {
                 "from_v1" => a.from_v1 = Some(str_value(input)?),
                 "to_v1" => a.to_v1 = Some(str_value(input)?),
                 "schema" => a.schema = Some(str_value(input)?),
+                "grammar" => {
+                    let value = str_value(input)?;
+                    a.grammar = Some(syn::parse_str(&value)?);
+                }
                 "forms" => a.forms = str_list(input)?,
                 "legacy_keys" => a.legacy_keys = str_list(input)?,
                 "needs" => a.needs = Some(str_value(input)?),
@@ -885,6 +891,10 @@ pub(crate) fn derive(input: DeriveInput) -> TokenStream {
             None => quote!(::std::option::Option::None),
         };
         let schema = f.attr.schema.clone().unwrap_or_default();
+        let grammar = match &f.attr.grammar {
+            Some(path) => quote!(::std::option::Option::Some(&#path)),
+            None => quote!(::std::option::Option::None),
+        };
         let forms = &f.attr.forms;
         let legacy_only = f.attr.legacy_only;
         let legacy_keys = &f.attr.legacy_keys;
@@ -915,7 +925,7 @@ pub(crate) fn derive(input: DeriveInput) -> TokenStream {
                 invert: #invert,
                 values: &[#((#val_k, #val_s)),*],
                 from_v1: #from_v1, to_v1: #to_v1,
-                schema: #schema, forms: &[#(#forms),*],
+                schema: #schema, forms: &[#(#forms),*], grammar: #grammar,
                 internal: #internal,
                 legacy_only: #legacy_only,
                 v0: #v0,

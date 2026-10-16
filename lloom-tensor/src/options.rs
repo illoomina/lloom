@@ -24,6 +24,8 @@
 
 use serde_json::Value;
 
+pub mod wait;
+
 /// What an option IS, independent of whether it has a flag: `stable` (user
 /// facing, shipping), `advanced` (a shipping tunable with a sensible
 /// default), `arm` (an A/B arm whose supersession is undecided), `reference`
@@ -113,6 +115,8 @@ pub struct KnobMeta {
     pub schema: &'static str,
     /// The forms of the shared type this site implements.
     pub forms: &'static [&'static str],
+    /// A field-attached grammar; absent fields retain their existing rules.
+    pub grammar: Option<&'static wait::WaitGrammar>,
     /// The original doc, with its references (`lloom options --internal`).
     pub internal: &'static str,
     /// The field's spellings are aliases of `path`, but a write to the key
@@ -159,6 +163,7 @@ impl KnobMeta {
         to_v1: None,
         schema: "",
         forms: &[],
+        grammar: None,
         internal: "",
         legacy_only: false,
         v0: true,
@@ -499,21 +504,13 @@ pub mod v1 {
     pub fn duration_us(s: &str) -> Result<u64, String> {
         let lower = s.trim().to_ascii_lowercase();
         let s = lower.as_str();
-        let (digits, scale) = if let Some(d) = s.strip_suffix("us") {
-            (d, 1)
-        } else if let Some(d) = s.strip_suffix("ms") {
-            (d, 1_000)
-        } else if let Some(d) = s.strip_suffix('s') {
-            (d, 1_000_000)
-        } else {
-            return Err(format!(
-                "`{s}` is not a duration (`<n>us`, `<n>ms` or `<n>s`)"
-            ));
-        };
+        let (digits, unit) = super::wait::WaitParameter::Microseconds
+            .split_unit(s)
+            .ok_or_else(|| format!("`{s}` is not a duration (`<n>us`, `<n>ms` or `<n>s`)"))?;
         let n: u64 = digits
             .parse()
             .map_err(|_| format!("`{s}` is not a duration (`<n>us`, `<n>ms` or `<n>s`)"))?;
-        n.checked_mul(scale)
+        n.checked_mul(unit.scale())
             .ok_or_else(|| format!("`{s}` overflows"))
     }
 
@@ -532,7 +529,7 @@ pub mod v1 {
 
     /// `arm` or `arm:<dur>`, the duration in µs; a bare count is the stored
     /// spelling and passes through.
-    fn with_us(arm: &str, rest: Option<&str>) -> Result<String, String> {
+    pub(super) fn with_us(arm: &str, rest: Option<&str>) -> Result<String, String> {
         match rest {
             None => Ok(arm.to_string()),
             Some(d) if is_count(d) => Ok(format!("{arm}:{d}")),
@@ -549,12 +546,7 @@ pub mod v1 {
 
     /// `decode.readback.wait`: `sleep:<dur>` is stored `sleep:<µs>`.
     pub fn poll_from(s: &str) -> Result<String, String> {
-        let lower = s.trim().to_ascii_lowercase();
-        let s = lower.as_str();
-        match split(s) {
-            ("sleep", rest) => with_us("sleep", rest),
-            _ => Ok(s.to_string()),
-        }
+        super::wait::READBACK_WAIT.to_stored(s)
     }
 
     pub fn poll_to(s: &str) -> String {

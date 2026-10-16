@@ -373,3 +373,302 @@ fn the_three_engine_chat_gate_commands_keep_their_resolved_options() {
     std::fs::remove_dir(dir).unwrap();
     assert_eq!(arms.len(), 3);
 }
+
+/// Compound string spellings through final resolution, independently of schema.
+#[test]
+fn compound_readback_forms_reach_the_final_resolver() {
+    // Independent literals, not outputs of apply_spelling or SPELLINGS.
+    let rows = [
+        ("auto", "auto", "poll", 1, true),
+        ("blocking", "blocking", "poll", 1, true),
+        ("ring", "ring", "blocking", 1, true),
+        ("ring-nonblocking", "ring", "poll", 1, true),
+        ("ring-fixed", "ring", "poll", 1, false),
+        ("ring-la0", "ring", "poll", 0, false),
+        ("ring-hostdrain", "ring", "host-drain", 1, true),
+        ("ring-gpubatch", "ring", "gpu-batched", 1, true),
+        (
+            "ring-gpubatch-nonblocking",
+            "ring",
+            "gpu-batched-nonblocking",
+            1,
+            true,
+        ),
+    ];
+    let none = BTreeMap::new();
+    let mut checked = 0;
+    for (spelling, kind, eos, lookahead, adaptive) in rows {
+        for value in [
+            spelling.to_owned(),
+            spelling.to_ascii_uppercase(),
+            format!(" \t{spelling}\n "),
+        ] {
+            let doc = json!({"readback": value}).to_string();
+            let full = json!({"decode": {"readback": value}});
+            // Temp file is per-process and per-test; no model/checkpoint opened.
+            let path = std::env::temp_dir().join(format!(
+                "lloom-933-compound-runtime-{}.json",
+                std::process::id()
+            ));
+            std::fs::write(&path, full.to_string()).unwrap();
+            let routes = [
+                config(&["--set", &format!("decode.readback={value}")], &none),
+                config(&["--readback", &value], &none),
+                config(&["--decode-config", &doc], &none),
+                config(&["--config", path.to_str().unwrap()], &none),
+            ];
+            std::fs::remove_file(&path).unwrap();
+            for result in routes {
+                assert!(result.is_ok(), "{value:?}: {result:?}");
+                let o = result.unwrap();
+                let flat = index().flat(&o);
+                assert_eq!(flat["decode.readback.kind"], json!(kind));
+                assert_eq!(flat["decode.readback.eos"], json!(eos));
+                assert_eq!(flat["decode.readback.lookahead_forwards"], json!(lookahead));
+                assert_eq!(flat["decode.readback.adaptive_commit"], json!(adaptive));
+                checked += 1;
+            }
+        }
+    }
+    for value in ["", " \t ", "ring-x"] {
+        let doc = json!({"readback": value}).to_string();
+        let path = std::env::temp_dir().join(format!(
+            "lloom-933-compound-runtime-invalid-{}.json",
+            std::process::id()
+        ));
+        std::fs::write(&path, json!({"decode": {"readback": value}}).to_string()).unwrap();
+        let routes = [
+            config(&["--set", &format!("decode.readback={value}")], &none),
+            config(&["--readback", value], &none),
+            config(&["--decode-config", &doc], &none),
+            config(&["--config", path.to_str().unwrap()], &none),
+        ];
+        std::fs::remove_file(path).unwrap();
+        for result in routes {
+            let error = result.unwrap_err();
+            assert!(error.contains("readback"), "{value:?}: {error}");
+        }
+    }
+    // A field flag remains the last writer after the compound preset.
+    let o = config(&["--readback", " RING-LA0 ", "--lookahead", "1"], &none).unwrap();
+    assert_eq!(o.decode.readback.lookahead, 1);
+    assert!(!o.decode.readback.adaptive_commit);
+    // Fields outside a preset's assignment set survive a direct production call.
+    let mut seed = crate::ReadbackConfig {
+        run_ahead: 17,
+        wake_cadence: 13,
+        ..Default::default()
+    };
+    let mut expected = seed.clone();
+    expected.kind = crate::ReadbackKind::Ring;
+    expected.eos = crate::EosKind::Poll;
+    expected.lookahead = 1;
+    expected.adaptive_commit = false;
+    crate::ReadbackConfig::apply_spelling(&mut seed, " RING-FIXED ").unwrap();
+    assert_eq!(seed, expected);
+    let before = seed.clone();
+    for value in ["", " \t ", "ring-x"] {
+        let error = crate::ReadbackConfig::apply_spelling(&mut seed, value).unwrap_err();
+        assert!(error.contains("readback"), "{value:?}: {error}");
+        let reason = if value.trim().is_empty() {
+            "an empty value is refused"
+        } else {
+            "is not one of"
+        };
+        assert!(error.contains(reason), "{value:?}: {error}");
+        assert_eq!(seed, before, "{value:?}: refused spelling changed fields");
+    }
+    assert_eq!(checked, 108);
+    eprintln!("[{checked} compound final resolutions]");
+}
+
+/// Pins only the generated shorthand string node, not objects or couplings.
+#[test]
+fn compound_readback_forms_reach_the_generated_schema() {
+    let schema = crate::option_schema::schema();
+    let node = schema_node(&schema, "decode.readback");
+    let shorthand = node["anyOf"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|node| node["type"] == "string" || node.get("anyOf").is_some())
+        .unwrap();
+    let admitted = [
+        "auto",
+        "blocking",
+        "ring",
+        "ring-nonblocking",
+        "ring-fixed",
+        "ring-la0",
+        "ring-hostdrain",
+        "ring-gpubatch",
+        "ring-gpubatch-nonblocking",
+    ];
+    let mut checked = 0;
+    for spelling in admitted {
+        for value in [
+            spelling.to_owned(),
+            spelling.to_ascii_uppercase(),
+            format!(" \t{spelling}\n "),
+        ] {
+            assert!(
+                schema_valid(shorthand, &json!(value), &schema["$defs"]),
+                "{value:?}"
+            );
+            checked += 1;
+        }
+    }
+    for value in ["", " \t ", "ring-x"] {
+        assert!(
+            !schema_valid(shorthand, &json!(value), &schema["$defs"]),
+            "{value:?}"
+        );
+    }
+    assert_eq!(checked, 27);
+    eprintln!("[{checked} admitted compound schema strings; 3 refused]");
+}
+
+fn readback_wait_cases() -> Vec<Value> {
+    serde_json::from_str(include_str!("../../tests/fixtures/readback-wait-s1.json")).unwrap()
+}
+
+fn wait_case_accepts(row: &Value) -> bool {
+    row["accept"] == true && (row["aarch64"] != true || cfg!(target_arch = "aarch64"))
+}
+
+fn wait_case_output<'a>(row: &'a Value, kind: &str) -> &'a Value {
+    row.get(kind).unwrap_or_else(|| {
+        &row[format!(
+            "{kind}_{}",
+            if cfg!(target_arch = "aarch64") {
+                "aarch64"
+            } else {
+                "other"
+            }
+        )]
+    })
+}
+
+/// Literal references pin conversion, storage and rendering separately.
+#[test]
+fn readback_wait_descriptor_preserves_literal_resolutions() {
+    let key = &index().keys["decode.readback.wait"];
+    let none = BTreeMap::new();
+    let cases = readback_wait_cases();
+    assert_eq!(cases.len(), 53);
+    for row in &cases {
+        let input = &row["input"];
+        let doc = json!({"readback": {"wait": input}}).to_string();
+        let path = std::env::temp_dir().join(format!(
+            "lloom-readback-wait-literals-{}.json",
+            std::process::id()
+        ));
+        std::fs::write(
+            &path,
+            json!({"decode": {"readback": {"wait": input}}}).to_string(),
+        )
+        .unwrap();
+        let mut routes = vec![
+            (
+                "group".to_string(),
+                config(&["--decode-config", &doc], &none),
+            ),
+            (
+                "file".to_string(),
+                config(&["--config", path.to_str().unwrap()], &none),
+            ),
+        ];
+        std::fs::remove_file(path).unwrap();
+        if let Some(text) = input.as_str() {
+            routes.extend(layers(key, text));
+            routes.push(("flag".into(), config(&["--poll", text], &none)));
+            routes.push((
+                "storage alias".into(),
+                config(&["--set", &format!("decode.readback.poll={text}")], &none),
+            ));
+            if let Some(converted) = row.get("converted") {
+                assert_eq!(
+                    json!(lloom_tensor::options::v1::poll_from(text).unwrap()),
+                    *converted,
+                    "{}",
+                    row["name"]
+                );
+            }
+        }
+        for (via, result) in routes {
+            if wait_case_accepts(row) {
+                let options =
+                    result.unwrap_or_else(|e| panic!("{} via {via}: {e}", row["name"]));
+                assert_eq!(
+                    serde_json::to_value(&options).unwrap()["decode"]["readback"]["poll"],
+                    *wait_case_output(row, "stored"),
+                    "{} via {via}",
+                    row["name"]
+                );
+                assert_eq!(
+                    index().flat(&options)["decode.readback.wait"],
+                    *wait_case_output(row, "rendered"),
+                    "{} via {via}",
+                    row["name"]
+                );
+            } else {
+                let error = result.unwrap_err();
+                assert!(
+                    error.contains("readback") || error.contains("poll"),
+                    "{} via {via}: {error}",
+                    row["name"]
+                );
+            }
+        }
+    }
+    let mut options = EngineOptions::default();
+    index()
+        .set(&mut options, "decode.readback.wait", "sleep:7")
+        .unwrap();
+    let before = options.clone();
+    for value in ["", "unknown", "sleep:18446744073709551616", "sleep:+7"] {
+        assert!(index()
+            .set(&mut options, "decode.readback.wait", value)
+            .is_err());
+        assert_eq!(options, before, "refused {value:?} changed the field");
+    }
+    index()
+        .merge(&mut options, &json!({"decode": {"readback": {"wait": null}}}))
+        .unwrap();
+    assert_eq!(options, EngineOptions::default());
+}
+
+/// A limited Rust-helper check, not standard JSON Schema or ECMA validation.
+#[test]
+fn readback_wait_descriptor_projects_literal_property_language() {
+    let schema = crate::option_schema::schema();
+    let node = schema_node(&schema, "decode.readback.wait");
+    for row in readback_wait_cases() {
+        assert_eq!(
+            schema_valid(node, &row["input"], &schema["$defs"]),
+            wait_case_accepts(&row),
+            "{}",
+            row["name"]
+        );
+    }
+    let described: Vec<&str> = index()
+        .keys
+        .values()
+        .filter(|key| key.meta().grammar.is_some())
+        .map(|key| key.path.as_str())
+        .collect();
+    assert_eq!(described, ["decode.readback.wait"]);
+    assert_eq!(
+        index().keys["decode.readback.wait"].meta().grammar,
+        Some(&lloom_tensor::options::wait::READBACK_WAIT)
+    );
+    for path in [
+        "decode.host_feed.wait",
+        "backend.metal.completion_wait",
+        "weights.experts.fetch.wait",
+        "decode.ring.eos_wait",
+        "speculative.verify_wait",
+    ] {
+        assert!(index().keys[path].meta().grammar.is_none(), "{path}");
+    }
+}

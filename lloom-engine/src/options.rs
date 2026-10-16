@@ -149,7 +149,7 @@ pub struct ReadbackConfig {
     #[opt(variants = ["blocking", "poll", "host-drain", "gpu-batched", "gpu-batched-nonblocking"], path = "decode.readback.eos", status = "arm", facets = ["signal"], flows = ["token-out"])]
     pub eos: EosKind,
     /// The poll mechanism under `eos = poll` (`wfe` on aarch64 by default).
-    #[opt(variants = ["spin", "spin-hint", "wfe", "sleep", "sleep:<µs>"], path = "decode.readback.wait", status = "arm", facets = ["wait"], flows = ["token-out"], forms = ["spin", "spin-hint", "wfe", "sleep"], from_v1 = "lloom_tensor::options::v1::poll_from", to_v1 = "lloom_tensor::options::v1::poll_to", schema = "Wait")]
+    #[opt(variants = ["spin", "spin-hint", "wfe", "sleep", "sleep:<µs>"], path = "decode.readback.wait", status = "arm", facets = ["wait"], flows = ["token-out"], forms = ["spin", "spin-hint", "wfe", "sleep"], from_v1 = "lloom_tensor::options::v1::poll_from", to_v1 = "lloom_tensor::options::v1::poll_to", schema = "Wait", grammar = "lloom_tensor::options::wait::READBACK_WAIT")]
     pub poll: PollMechanism,
     /// Forward passes the host enqueues before it has learned the previous step's EOS (ring arms): 0 or 1.
     #[opt(variants = ["0", "1"], path = "decode.readback.lookahead_forwards", status = "advanced", facets = ["lead"], flows = ["token-out", "commands-out"])]
@@ -218,6 +218,8 @@ impl ReadbackConfig {
     /// The other fields keep their values, so `--readback ring-hostdrain
     /// --lookahead 0` composes in either order.
     pub fn apply_spelling(cfg: &mut Self, s: &str) -> Result<(), String> {
+        let s = lloom_tensor::options::parse_arm(s, Self::SPELLINGS)
+            .map_err(|reason| format!("readback: {reason}"))?;
         match s {
             "auto" => cfg.kind = ReadbackKind::Auto,
             "blocking" => cfg.kind = ReadbackKind::Blocking,

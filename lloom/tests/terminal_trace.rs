@@ -67,6 +67,48 @@ fn sink(_: &[u32]) -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug)]
+struct ReaderReceipt {
+    cursor: usize,
+    ended: bool,
+    eos_window: Option<(f64, f64)>,
+}
+struct ReaderWorker {
+    done: Arc<AtomicBool>,
+    worker: Option<
+        std::thread::JoinHandle<
+            std::result::Result<ReaderReceipt, lloom::generation::readback::RingLap>,
+        >,
+    >,
+}
+impl ReaderWorker {
+    fn finish(mut self) -> Result<ReaderReceipt> {
+        self.done.store(true, Ordering::Release);
+        self.worker
+            .take()
+            .expect("one reader worker")
+            .join()
+            .map_err(|_| lloom_tensor::Error::msg("trace reader panicked"))?
+            .map_err(|lap| lloom_tensor::Error::msg(format!("trace reader: {lap}")))
+    }
+}
+impl Drop for ReaderWorker {
+    fn drop(&mut self) {
+        // Even producer assertion/unwind releases the host reader BEFORE
+        // joining it or allowing the ring/session native resources to drop.
+        self.done.store(true, Ordering::Release);
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+struct StopReaderOnExit(Arc<AtomicBool>);
+impl Drop for StopReaderOnExit {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
+}
+
 /// One run on a fresh poll ring with a reader thread that raises the stop
 /// flag when it reads the EOS (the engine's reader, on time). Returns the
 /// run's produced count; the session is left as the run left it.
@@ -76,7 +118,7 @@ fn run(
     prompt: &[u32],
     mut opts: DecodeOptions,
     dev: &Device,
-) -> Result<usize> {
+) -> Result<(usize, Option<(f64, f64)>)> {
     let mut rb = Ring::new(
         eos,
         dev,
@@ -92,20 +134,38 @@ fn run(
     let watcher = {
         let (stop, done) = (Arc::clone(&stop), Arc::clone(&done));
         std::thread::spawn(move || {
+            let _stop_on_exit = StopReaderOnExit(Arc::clone(&stop));
             let mut buf = Vec::new();
             loop {
                 let last = done.load(Ordering::Acquire);
                 buf.clear();
-                if reader.read_new(&mut buf).is_err() || reader.ended() {
+                let before_read = profile::now_s();
+                if let Err(lap) = reader.read_new(&mut buf) {
                     stop.store(true, Ordering::Release);
-                    break;
+                    return Err(lap);
+                }
+                if reader.ended() {
+                    stop.store(true, Ordering::Release);
+                    return Ok(ReaderReceipt {
+                        cursor: reader.cursor(),
+                        ended: true,
+                        eos_window: Some((before_read, profile::now_s())),
+                    });
                 }
                 if last {
-                    break;
+                    return Ok(ReaderReceipt {
+                        cursor: reader.cursor(),
+                        ended: false,
+                        eos_window: None,
+                    });
                 }
                 std::thread::sleep(Duration::from_micros(100));
             }
         })
+    };
+    let watcher = ReaderWorker {
+        done: Arc::clone(&done),
+        worker: Some(watcher),
     };
     let out = session.decode(
         &mut IdentityProposer,
@@ -115,9 +175,23 @@ fn run(
         &opts,
         &mut sink,
     );
-    done.store(true, Ordering::Release);
-    watcher.join().expect("reader thread");
-    Ok(out?.stats.produced)
+    let observed = watcher.finish(); // join happens before either Result escapes
+    let out = out?; // preserve original producer error if both sides failed
+    let observed = observed?;
+    if out.eos {
+        assert!(
+            observed.ended,
+            "EOS producer returned but reader never observed EOS: {observed:?}"
+        );
+        assert_eq!(
+            observed.cursor,
+            out.stats.produced + 1,
+            "independent reader EOS ordinal"
+        );
+    } else {
+        assert!(!observed.ended, "length stop unexpectedly observed EOS");
+    }
+    Ok((out.stats.produced, observed.eos_window))
 }
 
 fn adaptive(n: usize) -> DecodeOptions {
@@ -250,11 +324,17 @@ fn each_run_s_terminal_line_is_the_device_s() -> Result<()> {
     ] {
         let mut s = Session::new(&model, model.new_cache(&cfg, &dev)?);
         let since = profile::now_s();
-        let produced = run(&mut s, &eos, &prompt, opts, &dev)?;
+        let (produced, reader_event) = run(&mut s, &eos, &prompt, opts, &dev)?;
         assert_eq!(produced, cut, "{arm}");
         let (v, retired) = line_after(&dev, since)?;
         eprintln!("TRACE-TEST {arm}: {v}");
         check(&v, retired, by, Some(cut as u64 + 1));
+        let (before_read, after_read) = reader_event.expect("actual reader EOS receipt");
+        let seen = num(&v, "reader_eos");
+        assert!(
+            before_read <= seen && seen <= after_read,
+            "trace first sighting is not inside the independent read call: {v}"
+        );
     }
     let mut s = Session::new(&model, model.new_cache(&cfg, &dev)?);
     let since = profile::now_s();
@@ -284,4 +364,63 @@ fn each_run_s_terminal_line_is_the_device_s() -> Result<()> {
     assert!(num(&v, "retired") > num(&v, "return"), "{v}");
     check(&v, retired, "length", None);
     Ok(())
+}
+
+#[test]
+fn reader_fixture_unwind_releases_done_before_join() {
+    let done = Arc::new(AtomicBool::new(false));
+    let (send, receive) = std::sync::mpsc::channel();
+    let worker = {
+        let done = Arc::clone(&done);
+        std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            while !done.load(Ordering::Acquire) && std::time::Instant::now() < deadline {
+                std::thread::yield_now();
+            }
+            let released = done.load(Ordering::Acquire);
+            send.send(released).unwrap();
+            Ok(ReaderReceipt {
+                cursor: 0,
+                ended: false,
+                eos_window: None,
+            })
+        })
+    };
+    let guarded = ReaderWorker {
+        done,
+        worker: Some(worker),
+    };
+    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        let _guarded = guarded;
+        panic!("controlled producer assertion");
+    }));
+    assert!(panic.is_err());
+    assert!(
+        receive.recv_timeout(Duration::from_secs(1)).unwrap(),
+        "join happened before release; worker reached its independent deadline"
+    );
+}
+
+#[test]
+fn reader_fixture_error_is_not_reported_as_eos() {
+    let stop = Arc::new(AtomicBool::new(false));
+    let done = Arc::new(AtomicBool::new(false));
+    let worker = {
+        let stop = Arc::clone(&stop);
+        std::thread::spawn(move || {
+            let _stop_on_exit = StopReaderOnExit(stop);
+            Err(lloom::generation::readback::RingLap {
+                cursor: 1,
+                published: 9,
+                capacity: 4,
+            })
+        })
+    };
+    let guarded = ReaderWorker {
+        done,
+        worker: Some(worker),
+    };
+    let error = guarded.finish().unwrap_err();
+    assert!(error.to_string().contains("ring reader window reused"));
+    assert!(stop.load(Ordering::Acquire));
 }

@@ -895,8 +895,12 @@ mod terminal_trace_tests {
         );
         let before = poll_read_count();
         let submitted_snapshots = std::cell::Cell::new(0);
-        terminal_trace::run_begin(|| ring.published_generation().map(|p| p as usize));
-        terminal_trace::producer_stop(terminal_trace::StopBy::Length, || {
+        let run = terminal_trace::run_begin(
+            || ring.published_generation().map(|p| p as usize),
+            Default::default(),
+            Default::default(),
+        );
+        terminal_trace::producer_stop(&run, terminal_trace::StopBy::Length, || {
             submitted_snapshots.set(submitted_snapshots.get() + 1);
             (3, ring.published_generation().map(|p| p as usize))
         });

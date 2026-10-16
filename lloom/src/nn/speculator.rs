@@ -1082,6 +1082,7 @@ pub enum DivergenceBy {
 /// session pins no weights alive beyond the round it drives. The cache, the
 /// token log and the position travel together as a [`Sequence`].
 pub struct Session<'m, M: CausalLM> {
+    pub(crate) terminal_prepare: crate::nn::terminal_trace::PreparedTrace,
     pub(crate) model: &'m M,
     pub(crate) seq: Sequence<M::Cache>,
     /// The in-flight depth measured at warmup (`0` until `warmup` runs) — the
@@ -1102,6 +1103,7 @@ impl<'m, M: CausalLM> Session<'m, M> {
             seq: Sequence::new(cache),
             warm_in_flight_depth: 0,
             warm_balance_ns: (0, 0),
+            terminal_prepare: Default::default(),
         }
     }
 
@@ -1118,6 +1120,7 @@ impl<'m, M: CausalLM> Session<'m, M> {
             seq,
             warm_in_flight_depth: 0,
             warm_balance_ns: (0, 0),
+            terminal_prepare: Default::default(),
         }
     }
 
@@ -1128,6 +1131,7 @@ impl<'m, M: CausalLM> Session<'m, M> {
             seq,
             warm_in_flight_depth: 0,
             warm_balance_ns: (0, 0),
+            terminal_prepare: Default::default(),
         }
     }
 
@@ -1369,10 +1373,11 @@ impl<'m, M: CausalLM> Session<'m, M> {
     where
         M::Cache: CacheRewind + CacheReset,
     {
+        self.terminal_prepare = Default::default();
         let t0 = crate::nn::terminal_trace::prepare_begin();
         let prepared = self.prepare_inner(full, resume);
         if let Ok(p) = &prepared {
-            crate::nn::terminal_trace::prepare_end(t0, &p.action);
+            self.terminal_prepare = crate::nn::terminal_trace::prepare_end(t0, &p.action);
         }
         prepared
     }

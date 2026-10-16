@@ -298,6 +298,11 @@ impl CommandMarker {
         self.cb.status().0 >= MTLCommandBufferStatus::Completed.0
     }
 
+    /// Nonblocking known-error observation; false also includes pending work.
+    pub fn is_failed(&self) -> bool {
+        self.cb.status() == MTLCommandBufferStatus::Error
+    }
+
     /// The buffer's GPU end time (`CLOCK_UPTIME_RAW` seconds), valid once
     /// [`Self::is_complete`].
     pub fn gpu_end_time(&self) -> f64 {
@@ -537,6 +542,25 @@ pub(super) struct CommandBufferFailure {
 enum CommandFailureMessage {
     Native(String),
     Host(&'static str),
+}
+
+/// A read-only observation of this queue's existing monotone failure latch.
+/// Holds only the existing AtomicBool/OnceLock error-message owner, never a
+/// Commands, native queue, completion adapter, subscriber, buffer or device.
+/// False means no failure has been published here yet, NOT successful work.
+#[derive(Clone)]
+pub struct CommandFailureObserver(Arc<CommandBufferFailure>);
+impl CommandFailureObserver {
+    pub fn has_failed(&self) -> bool {
+        self.0.failed.load(Ordering::Acquire)
+    }
+}
+impl std::fmt::Debug for CommandFailureObserver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CommandFailureObserver")
+            .field("has_failed", &self.has_failed())
+            .finish()
+    }
 }
 
 impl CommandBufferFailure {
@@ -2265,6 +2289,11 @@ impl Commands {
         } else {
             Ok(())
         }
+    }
+
+    /// Cold read-only diagnostic handle; clones only the existing failure Arc.
+    pub fn failure_observer(&self) -> CommandFailureObserver {
+        CommandFailureObserver(Arc::clone(&self.core.failure))
     }
 
     /// The first command buffer of this queue that ended in error, if any.

@@ -337,6 +337,12 @@ pub trait ReadbackStrategy {
         None
     }
 
+    /// Diagnostic-only exact reader ownership for this run. Optimized
+    /// nonprofile builds return a zero-sized no-op value.
+    fn terminal_observers(&self) -> crate::nn::terminal_trace::Observers {
+        Default::default()
+    }
+
     /// Whether every token is stamped as it is published, so a
     /// [`RingReader`] sees token `k` before the command stream runs anything
     /// encoded after it — what a GPU wait on a host-filled slot needs
@@ -816,6 +822,8 @@ impl Geometry {
 /// (no mapped words).
 #[derive(Debug)]
 pub struct RingReader {
+    #[cfg(all(feature = "metal", any(debug_assertions, feature = "profile")))]
+    trace_observer: Option<crate::nn::terminal_trace::ReaderObserver>,
     /// Held for liveness only: the pointers below are into these buffers.
     _segments: Vec<Tensor>,
     _step: Tensor,
@@ -873,6 +881,12 @@ impl std::fmt::Display for RingLap {
 }
 
 impl RingReader {
+    fn trace_read_error(&self) {
+        #[cfg(all(feature = "metal", any(debug_assertions, feature = "profile")))]
+        if let Some(observer) = &self.trace_observer {
+            observer.read_error();
+        }
+    }
     /// The generation the GPU has published so far — one load, no lock, no
     /// wait. `None` off Metal (no mapped word).
     pub fn published(&self) -> Option<u32> {
@@ -891,6 +905,10 @@ impl RingReader {
         #[cfg(any(debug_assertions, feature = "profile"))]
         {
             self.watch = true;
+        }
+        #[cfg(all(feature = "metal", any(debug_assertions, feature = "profile")))]
+        if let Some(observer) = &self.trace_observer {
+            observer.mark_watch();
         }
     }
 
@@ -1017,6 +1035,7 @@ impl RingReader {
             capacity: self.total_tiles,
         };
         if published - start > self.total_tiles || start < self.safe_after.load(Ordering::SeqCst) {
+            self.trace_read_error();
             return Err(lap);
         }
         #[cfg(not(feature = "metal"))]
@@ -1052,16 +1071,29 @@ impl RingReader {
             fence(Ordering::SeqCst);
             if start < self.safe_after.load(Ordering::SeqCst) {
                 out.truncate(before);
+                self.trace_read_error();
                 return Err(lap);
             }
             self.cursor = cursor;
             self.ended = ended;
             #[cfg(any(debug_assertions, feature = "profile"))]
             if ended {
-                crate::nn::terminal_trace::reader_eos(self.watch);
+                if let Some(observer) = &self.trace_observer {
+                    if self.watch {
+                        observer.mark_watch();
+                    }
+                    observer.saw_eos(lloom_tensor::kernels::metal::profile::now_s());
+                }
             }
             Ok(out.len() - before)
         }
+    }
+}
+
+#[cfg(all(feature = "metal", any(debug_assertions, feature = "profile")))]
+impl Drop for RingReader {
+    fn drop(&mut self) {
+        drop(self.trace_observer.take());
     }
 }
 
@@ -1716,6 +1748,8 @@ impl History {
 /// The device-resident arms: the token never comes to the host, the next
 /// forward reads the ring's own slot, and the ids accumulate device-side.
 pub struct Ring {
+    #[cfg(all(feature = "metal", any(debug_assertions, feature = "profile")))]
+    trace_observers: crate::nn::terminal_trace::ObserverSlot,
     ring: TokenRing,
     eos: EosRead,
     /// Poll iterations before the non-blocking read gives up on a step.
@@ -1960,6 +1994,8 @@ impl Ring {
             Vec::new()
         };
         Ok(Self {
+            #[cfg(all(feature = "metal", any(debug_assertions, feature = "profile")))]
+            trace_observers: Default::default(),
             ring,
             eos,
             history,
@@ -2080,6 +2116,10 @@ impl Ring {
             // writes slot `fed`.
             let behind = self.stamps_ahead() % total_tiles;
             Some(RingReader {
+                #[cfg(all(feature = "metal", any(debug_assertions, feature = "profile")))]
+                trace_observer: self
+                    .trace_observers
+                    .reader(crate::nn::terminal_trace::enabled()),
                 _segments: segments,
                 _step: step,
                 safe_after: Arc::clone(&self.safe_after),
@@ -2599,6 +2639,9 @@ impl ReadbackStrategy for Ring {
     }
 
     fn begin_run(&mut self) {
+        #[cfg(all(feature = "metal", any(debug_assertions, feature = "profile")))]
+        self.trace_observers
+            .begin(crate::nn::terminal_trace::enabled());
         let undrained = self.history.forget_undrained();
         self.counters.ring_discarded += undrained as u64;
     }
@@ -2624,6 +2667,12 @@ impl ReadbackStrategy for Ring {
 
     fn published_count(&self) -> Option<usize> {
         self.ring.published_generation().map(|g| g as usize)
+    }
+
+    #[cfg(all(feature = "metal", any(debug_assertions, feature = "profile")))]
+    fn terminal_observers(&self) -> crate::nn::terminal_trace::Observers {
+        self.trace_observers
+            .group(crate::nn::terminal_trace::enabled())
     }
 
     fn arm_publish_event(

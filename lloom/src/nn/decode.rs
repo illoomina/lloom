@@ -1980,7 +1980,11 @@ impl<'m, M: CausalLM> Session<'m, M> {
         readback.begin_run();
 
         let device = readback.device().clone();
-        crate::nn::terminal_trace::run_begin(|| readback.published_count());
+        let terminal_run = crate::nn::terminal_trace::run_begin(
+            || readback.published_count(),
+            std::mem::take(&mut self.terminal_prepare),
+            readback.terminal_observers(),
+        );
         // The hot thread's scheduling class, held for the run and restored on
         // return (`generation::hot_thread`): two syscalls a generation, none a
         // step.
@@ -2213,6 +2217,7 @@ impl<'m, M: CausalLM> Session<'m, M> {
         loop {
             if opts.reached(produced) {
                 crate::nn::terminal_trace::producer_stop(
+                    &terminal_run,
                     crate::nn::terminal_trace::StopBy::Length,
                     || (fed_now(self), readback.published_count()),
                 );
@@ -2226,6 +2231,7 @@ impl<'m, M: CausalLM> Session<'m, M> {
                 if stop.load(std::sync::atomic::Ordering::Acquire) {
                     stats.stopped_by_flag = true;
                     crate::nn::terminal_trace::producer_stop(
+                        &terminal_run,
                         crate::nn::terminal_trace::StopBy::Flag,
                         || (fed_now(self), readback.published_count()),
                     );
@@ -2245,6 +2251,7 @@ impl<'m, M: CausalLM> Session<'m, M> {
                 if w.ended() {
                     stats.stopped_by_eos_watch = true;
                     crate::nn::terminal_trace::producer_stop(
+                        &terminal_run,
                         crate::nn::terminal_trace::StopBy::Watch,
                         || (fed_now(self), readback.published_count()),
                     );
@@ -2254,7 +2261,7 @@ impl<'m, M: CausalLM> Session<'m, M> {
             let _pool = lloom_tensor::AutoreleaseScope::new();
             stats.steps += 1;
             if stats.steps == 1 {
-                crate::nn::terminal_trace::decode_begin();
+                crate::nn::terminal_trace::decode_begin(&terminal_run);
             }
             // Under `CANDLE_METAL_PROFILE=1` only: tell the profile recorder
             // which step the command buffers committed from here on belong to,
@@ -2407,6 +2414,7 @@ impl<'m, M: CausalLM> Session<'m, M> {
                     produced -= 1;
                     eos = true;
                     crate::nn::terminal_trace::producer_stop(
+                        &terminal_run,
                         crate::nn::terminal_trace::StopBy::EosOfLast,
                         || (fed_now(self), readback.published_count()),
                     );
@@ -2567,6 +2575,7 @@ impl<'m, M: CausalLM> Session<'m, M> {
                     produced -= 1;
                     eos = true;
                     crate::nn::terminal_trace::producer_stop(
+                        &terminal_run,
                         crate::nn::terminal_trace::StopBy::EosOfLast,
                         || (fed_now(self), readback.published_count()),
                     );
@@ -2670,6 +2679,7 @@ impl<'m, M: CausalLM> Session<'m, M> {
                     all_ids.extend_from_slice(&batch);
                     if !go_on {
                         crate::nn::terminal_trace::producer_stop(
+                            &terminal_run,
                             crate::nn::terminal_trace::StopBy::Hook,
                             || (fed_now(self), readback.published_count()),
                         );
@@ -2836,7 +2846,7 @@ impl<'m, M: CausalLM> Session<'m, M> {
         }
         stats.produced = produced;
         stats.tail_ns = tail_start.elapsed().as_nanos() as u64;
-        crate::nn::terminal_trace::run_end(produced, overrun, eos, &device);
+        crate::nn::terminal_trace::run_end(terminal_run, produced, overrun, eos, &device);
         stats.step_markers = pacer.taken;
         stats.step_waits = pacer.waited;
         stats.readback = readback.counters();

@@ -922,7 +922,11 @@ mod tests {
         let last = first.try_clone().unwrap();
         assert_eq!(last.ticket(), old);
         drop(first);
-        drop(cell.cancel_prepared(old).unwrap());
+        {
+            let detached = cell.cancel_prepared(old).unwrap();
+            assert_eq!(detached.owner, 1);
+            assert_eq!(detached.feedback, None);
+        }
         std::thread::scope(|scope| {
             let (tx, rx) = sync_channel(0);
             let c = &cell;

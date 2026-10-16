@@ -84,9 +84,13 @@ mod qmatmul_rows_under_fast;
 mod qmm_f16w_tiny_shapes;
 mod qmm_narrow_weights;
 mod quant_mv_store;
+#[cfg(feature = "metal")]
+mod quant_parity;
 mod quant_parity_matrix;
 mod quant_parity_matrix_rows;
 mod quantized_tests;
+#[cfg(feature = "metal")]
+mod rows_identity;
 mod serialization_tests;
 mod slice_set_strided_tests;
 mod staged_readback_plans;

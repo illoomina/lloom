@@ -14,8 +14,7 @@
 //! Its own binary: the contract is read once per process.
 #![cfg(feature = "metal")]
 
-#[path = "rows_identity/mod.rs"]
-mod rows_identity;
+use super::rows_identity;
 
 use lloom_tensor::quantized::{GgmlDType, QMatMul, QStorage, QTensor};
 use lloom_tensor::{Device, Module, Result, Tensor};

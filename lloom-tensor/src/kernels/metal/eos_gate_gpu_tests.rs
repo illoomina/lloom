@@ -515,7 +515,7 @@ fn a_gated_gdn_step_carries_its_state_through_an_eos() {
     let win_in = f(&win);
     let heads_in = f(&wave(3 * H_V * D, 0.3, 0.19));
     let (alpha, beta) = (f(&wave(H_V, 0.4, 1.3)), f(&wave(H_V, 0.6, 0.7)));
-    let (dt_bias, ssm_a) = (f(&wave(H_V, 0.2, 0.9)), f(&vec![-0.5; H_V]));
+    let (dt_bias, ssm_a) = (f(&wave(H_V, 0.2, 0.9)), f(&[-0.5; H_V]));
     let s: Vec<f32> = wave(D * D * H_V, 0.1, 0.013);
     let s_in = f(&s);
     let poisoned = |n: usize| {

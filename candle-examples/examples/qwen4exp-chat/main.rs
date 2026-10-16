@@ -1317,9 +1317,9 @@ fn driver_gate<P: QwenShape, R: ExpertResidency + HasStreamStats>(
                     traced.push((before + 1, trace_take()));
                 }
                 if produced >= TRACE_FROM && produced < TRACE_FROM + TRACE_STEPS {
-                    trace_set(true, Some(format!("decode[{}]", produced + 1)));
+                    trace_set(true, Some(format!("decode[{}]", produced + 1)))?;
                 } else {
-                    trace_set(false, None);
+                    trace_set(false, None)?;
                     let _ = trace_take();
                 }
             }
@@ -2186,16 +2186,17 @@ fn trace_requested() -> bool {
     }
 }
 
-fn trace_set(on: bool, region: Option<String>) {
+fn trace_set(on: bool, region: Option<String>) -> candle::Result<()> {
     #[cfg(feature = "metal")]
     {
         candle::kernels::metal::trace::set_region(region);
-        candle::kernels::metal::trace::set_recording(on);
+        candle::kernels::metal::trace::set_recording(on)?;
     }
     #[cfg(not(feature = "metal"))]
     {
         let _ = (on, region);
     }
+    Ok(())
 }
 
 fn trace_take() -> TraceStep {

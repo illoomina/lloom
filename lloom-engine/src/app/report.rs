@@ -1545,11 +1545,14 @@ impl OutputFlow {
 
 /// Start recording every dispatch for [`print_trace_census`] when
 /// `CANDLE_METAL_TRACE` asks for it; off, a dispatch pays one `OnceLock` read.
-pub fn arm_trace() {
+pub fn arm_trace() -> anyhow::Result<()> {
+    #[cfg(feature = "metal")]
+    lloom_tensor::tuning::try_tuning()?;
     #[cfg(feature = "metal")]
     if lloom_tensor::kernels::metal::trace::trace_requested() {
-        lloom_tensor::kernels::metal::trace::set_recording(true);
+        lloom_tensor::kernels::metal::trace::set_recording(true)?;
     }
+    Ok(())
 }
 
 /// The command-buffer cut policy in force, read back from the device rather

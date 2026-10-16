@@ -3078,7 +3078,7 @@ impl Cell {
 
 pub fn bench(args: BenchArgs) -> Result<()> {
     let options = super::resolve_options(&args.common, &|o| args.front(o), Frontend::Bench)?;
-    super::report::arm_trace();
+    super::report::arm_trace()?;
     let mode = match options.bench.mode.as_str() {
         "reuse" => Some(super::modes::Mode::Reuse),
         "concurrent" => Some(super::modes::Mode::Concurrent),

@@ -35,7 +35,7 @@ pub fn this_build() -> Vec<Capability> {
             compiled: lloom::PROFILE_INSTRUMENTS && lloom_tensor::tuning::PROFILE_INSTRUMENTS,
             feature: "profile",
             feature_on: cfg!(feature = "profile"),
-            what: "per-step instrumentation and allocation/readback attribution (debug builds, or an optimized build with the feature)",
+            what: "per-step instrumentation, dispatch/profile recorders and allocation/readback attribution (debug builds, or an optimized build with the feature)",
         },
         Capability {
             name: "metal",
@@ -232,6 +232,9 @@ mod tests {
             .collect();
         for path in [
             "diagnostics.trace.pool",
+            "diagnostics.trace.dispatch",
+            "diagnostics.gpu_profile.counters",
+            "diagnostics.gpu_profile.encoder_per_dispatch",
             "diagnostics.trace.served_requests",
             "diagnostics.trace.readbacks",
         ] {

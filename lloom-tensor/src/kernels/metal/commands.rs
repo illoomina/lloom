@@ -3142,6 +3142,40 @@ mod owner_submission_tests {
     use crate::backend::BackendDevice;
     use objc2_metal::{MTLDevice, MTLSharedEvent};
 
+    struct ReleaseBeforeWait<R: FnMut(), W: FnMut()> {
+        release: R,
+        wait: W,
+    }
+    impl<R: FnMut(), W: FnMut()> Drop for ReleaseBeforeWait<R, W> {
+        fn drop(&mut self) {
+            (self.release)();
+            (self.wait)();
+        }
+    }
+
+    #[test]
+    fn host_gate_cleanup_releases_before_wait_on_unwind() {
+        let released = AtomicBool::new(false);
+        let observed = AtomicBool::new(false);
+        let calls = AtomicUsize::new(0);
+        let panic = std::panic::catch_unwind(|| {
+            let _guard = ReleaseBeforeWait {
+                release: || released.store(true, Ordering::Relaxed),
+                wait: || {
+                    observed.store(released.load(Ordering::Relaxed), Ordering::Relaxed);
+                    calls.fetch_add(1, Ordering::Relaxed);
+                },
+            };
+            panic!("controlled host-gate fixture unwind");
+        });
+        assert!(panic.is_err());
+        assert!(
+            observed.load(Ordering::Relaxed),
+            "wait preceded host gate release"
+        );
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+    }
+
     fn pending(commands: &Commands) -> CommandBuffer {
         commands
             .lock_state()
@@ -3393,7 +3427,11 @@ mod owner_submission_tests {
         assert_eq!(runs.load(Ordering::Relaxed), 1);
     }
 
-    fn retained_public_drain_after_allocation_refusal(current_only: bool) {
+    fn retained_public_drain_after_allocation_refusal(
+        current_only: bool,
+        force_unwind: bool,
+        cleanup_observation: Option<&AtomicBool>,
+    ) {
         let device = crate::MetalDevice::new(0).unwrap();
         let commands = device.commands();
         let cb = pending(commands);
@@ -3410,12 +3448,35 @@ mod owner_submission_tests {
             callback.fetch_add(1, Ordering::Relaxed);
         })
         .unwrap();
-        let gate = device.metal_device().as_ref().newSharedEvent().unwrap();
-        cb.wait_for_event(&gate, 1).unwrap();
         let raw = device
             .metal_device()
             .new_buffer(4096, super::super::MTLResourceOptions::StorageModeShared)
             .unwrap();
+        let gate = device.metal_device().as_ref().newSharedEvent().unwrap();
+        let release_gate = gate.clone();
+        let mut pins = Some((raw.clone(), gate.clone()));
+        let cleanup_cb = &cb;
+        let cleanup_commands = &**commands;
+        let cleanup_done = Arc::new(AtomicBool::new(false));
+        let cleaned = cleanup_done.clone();
+        let cleanup = ReleaseBeforeWait {
+            release: move || release_gate.setSignaledValue(1),
+            wait: move || {
+                let drained = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    cleanup_commands.ensure_completed(cleanup_cb)
+                }));
+                if matches!(drained, Ok(Ok(()))) {
+                    cleaned.store(true, Ordering::Relaxed);
+                    drop(pins.take());
+                } else {
+                    // Unknown cleanup is not terminality. Keep independent raw
+                    // interoperability and event owners through quarantine.
+                    std::mem::forget(pins.take());
+                    eprintln!("fixture cleanup refused; raw/event owners retained");
+                }
+            },
+        };
+        cb.wait_for_event(&gate, 1).unwrap();
         {
             let mut blit = commands.blit_command_encoder().unwrap();
             // SAFETY: raw remains owned until the exact native wait below,
@@ -3438,6 +3499,9 @@ mod owner_submission_tests {
                     crate::memory_admission::AllocationError::HostAllocation
                 )
             ));
+            if force_unwind {
+                panic!("controlled post-handoff pending-work fixture unwind");
+            }
             let (receipt, unused) = {
                 let mut state = commands.lock_state().unwrap();
                 let (submitted, receipt) = state
@@ -3511,26 +3575,39 @@ mod owner_submission_tests {
             let bytes = unsafe { std::slice::from_raw_parts(raw.contents(), 4096) };
             assert!(bytes.iter().all(|byte| *byte == 0x6b));
         }));
-        gate.setSignaledValue(1);
-        let cleanup = cb.try_wait_until_completed();
-        if cleanup.is_err() {
-            // Unexpected failure is not terminality. Keep the explicit raw
-            // interoperability owner rather than releasing it during unwind.
-            std::mem::forget(raw);
+        drop(cleanup);
+        if let Some(observed) = cleanup_observation {
+            observed.store(cleanup_done.load(Ordering::Relaxed), Ordering::Relaxed);
         }
         if let Err(panic) = exercised {
             std::panic::resume_unwind(panic);
         }
-        cleanup.unwrap();
+        assert!(cleanup_done.load(Ordering::Relaxed));
     }
 
     #[test]
     fn public_flush_and_wait_drains_retained_receipt_without_refill_or_replacement() {
-        retained_public_drain_after_allocation_refusal(false);
+        retained_public_drain_after_allocation_refusal(false, false, None);
     }
 
     #[test]
     fn public_current_wait_drains_retained_receipt_without_refill_or_replacement() {
-        retained_public_drain_after_allocation_refusal(true);
+        retained_public_drain_after_allocation_refusal(true, false, None);
+    }
+    #[test]
+    fn host_gate_fixture_unwind_releases_before_native_cleanup() {
+        let cleaned = AtomicBool::new(false);
+        let panic = std::panic::catch_unwind(|| {
+            retained_public_drain_after_allocation_refusal(false, true, Some(&cleaned));
+        })
+        .expect_err("controlled fixture unwind must propagate");
+        assert_eq!(
+            panic.downcast_ref::<&str>(),
+            Some(&"controlled post-handoff pending-work fixture unwind")
+        );
+        assert!(
+            cleaned.load(Ordering::Relaxed),
+            "released pending native work did not drain"
+        );
     }
 }

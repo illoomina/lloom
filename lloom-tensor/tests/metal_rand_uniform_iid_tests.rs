@@ -45,7 +45,7 @@ fn critical_p001(df: usize) -> f64 {
         15 => 37.6973,
         255 => 330.5197,
         999 => 1142.8480,
-        127_999 => 129_568.2429,
+        127_999 => 129_568.242_9,
         _ => panic!("no tabulated critical value for df={df}; add it deliberately"),
     }
 }

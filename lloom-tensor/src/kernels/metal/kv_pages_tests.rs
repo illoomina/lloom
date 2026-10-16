@@ -10,13 +10,12 @@
 use super::kv_pages::{reserve_pages_for, KvPagePool, PageError, PageIdx, PageQuarantine};
 use crate::retire::{Completed, Epoch};
 
-/// A pool sized so the tests below can exhaust it deliberately.
-
 /// Page indices from their numbers, for the assertions.
 fn pg<const N: usize>(pages: [u32; N]) -> Vec<PageIdx> {
     pages.into_iter().map(PageIdx).collect()
 }
 
+/// A pool sized so the tests below can exhaust it deliberately.
 fn pool(pool_pages: usize) -> KvPagePool {
     KvPagePool::new(4, pool_pages, 4, 64)
 }

@@ -3437,13 +3437,42 @@ mod owner_submission_tests {
     }
 
     fn pending(commands: &Commands) -> CommandBuffer {
-        commands
+        let actual_api = if commands.core.modern_queue.is_some() {
+            "metal4"
+        } else {
+            "metal3"
+        };
+        let tuning = &crate::tuning::tuning().metal;
+        if tuning.command_api != "auto" {
+            assert_eq!(actual_api, tuning.command_api);
+        }
+        if let Ok(requested) = std::env::var("LLOOM_METAL_API") {
+            if requested != "auto" {
+                assert_eq!(actual_api, requested);
+            }
+        }
+        let arm = commands.completion_wait();
+        assert_eq!(
+            arm,
+            CompletionWait::from_str_arm(&tuning.completion_wait).unwrap()
+        );
+        if let Ok(requested) = std::env::var("CANDLE_METAL_COMPLETION_WAIT") {
+            assert_eq!(arm, CompletionWait::from_str_arm(&requested).unwrap());
+        }
+        assert_eq!(commands.completion_event_present(), arm.needs_event());
+        let buffer = commands
             .lock_state()
             .unwrap()
             .current
             .recording()
             .unwrap()
-            .clone()
+            .clone();
+        assert_eq!(buffer.is_metal4(), commands.core.modern_queue.is_some());
+        eprintln!(
+            "OWNER_SUBMISSION_ARM requested_api={} actual_api={actual_api} resolved_wait={} event={}",
+            tuning.command_api, arm.name(), commands.completion_event_present()
+        );
+        buffer
     }
 
     #[test]

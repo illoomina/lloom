@@ -1294,6 +1294,9 @@ impl<L: Layer> CacheReset for DecoderState<L> {
 /// ([`DecoderState::restore`]) puts the state back at the position a
 /// multi-token pass left one at.
 impl<L: Layer> CacheRewind for DecoderState<L> {
+    fn check_acceptance_state(&self) -> Result<()> {
+        self.usable()
+    }
     fn rewind_horizon(&self) -> usize {
         self.standing_horizon()
     }
@@ -2551,6 +2554,201 @@ mod window_tests {
 
     fn state(n: usize) -> DecoderState<Faulty> {
         DecoderState::new((0..n).map(|_| FaultyState::default()).collect())
+    }
+
+    // No forward executes in these acceptance controls. The actual decoder
+    // cache supplies the window/horizon/poisoning behavior under test.
+    impl Model for Faulty {
+        type Config = ();
+        fn from_weights(_: VarBuilder, _: &()) -> Result<Self> {
+            Ok(Self)
+        }
+    }
+
+    impl CausalLM for Faulty {
+        type Cache = DecoderState<Self>;
+        fn vocab_size(&self) -> usize {
+            32
+        }
+        fn new_cache(&self, _: &(), _: &Device) -> Result<Self::Cache> {
+            Ok(state(3))
+        }
+        fn embed(&self, _: &Tensor) -> Result<Tensor> {
+            lloom_tensor::bail!("the acceptance fixture must not embed")
+        }
+        fn forward_embeds(&self, _: &Tensor, _: usize, _: &mut Self::Cache) -> Result<Tensor> {
+            lloom_tensor::bail!("the acceptance fixture must not forward")
+        }
+    }
+
+    fn acceptance_sequence(overrun: usize) -> crate::nn::Sequence<DecoderState<Faulty>> {
+        let mut st = state(3);
+        st.pos = 3 + overrun - 1;
+        st.open_window().unwrap();
+        st.pos += 1;
+        st.standing = true;
+        let mut seq = crate::nn::Sequence::with_tokens(st, vec![10, 20, 30]);
+        seq.pos += overrun;
+        seq.overrun = overrun;
+        seq
+    }
+
+    #[test]
+    fn accept_propagates_a_partial_rewind_failure_without_claiming_an_obligation() {
+        let mut seq = acceptance_sequence(1);
+        seq.cache.layers[1].fail_rewind = true;
+        let mut session = crate::nn::Session::from_sequence(&Faulty, seq);
+        let result = session.accept(2);
+        let seq = session.sequence();
+        let cache = seq.cache();
+        assert!(cache
+            .unusable()
+            .expect("partial rewind poisoned the cache")
+            .contains("layer 1"));
+        assert!(!cache.layers[0].open, "the first layer really rewound");
+        assert!(
+            cache.layers[1].open && cache.layers[2].open,
+            "later layers did not rewind"
+        );
+        eprintln!(
+            "ACCEPT partial rewind: result={result:?} unusable={:?} pos={} overrun={} tokens={:?}",
+            cache.unusable(),
+            seq.pos(),
+            seq.overrun(),
+            seq.tokens()
+        );
+        assert!(
+            result.is_err(),
+            "an operational partial rewind must not become Ok(Obligation): {result:?}"
+        );
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("refused to rewind"));
+        assert_eq!(
+            seq.tokens(),
+            &[10, 20, 30],
+            "an error does not accept a new boundary"
+        );
+        assert_eq!((seq.pos(), seq.overrun()), (4, 1));
+        assert!(
+            cache.usable().is_err(),
+            "no synthetic recovery of the poisoned cache"
+        );
+    }
+
+    #[test]
+    fn accept_retry_after_a_partial_rewind_does_not_claim_recovery() {
+        let mut seq = acceptance_sequence(1);
+        seq.cache.layers[1].fail_rewind = true;
+        let mut session = crate::nn::Session::from_sequence(&Faulty, seq);
+        let first = session.accept(2);
+        assert!(session.sequence().cache().unusable().is_some());
+        assert_eq!(session.sequence().cache().rewind_horizon(), 0);
+        let before = (session.tokens().to_vec(), session.pos(), session.overrun());
+        let retry = session.accept(1);
+        eprintln!("ACCEPT poisoned retry: first={first:?} retry={retry:?} before={before:?}");
+        assert!(
+            retry.is_err(),
+            "an already-poisoned cache must not claim an accepted recovery obligation: {retry:?}"
+        );
+        assert_eq!(
+            (session.tokens(), session.pos(), session.overrun()),
+            (before.0.as_slice(), before.1, before.2)
+        );
+        assert!(
+            session.sequence().cache().unusable().is_some(),
+            "no synthetic recovery"
+        );
+    }
+
+    #[test]
+    fn accept_checks_known_poison_after_construction_move_and_explicit_reset() {
+        let mut seq = acceptance_sequence(1);
+        seq.cache.layers[1].fail_rewind = true;
+        assert!(seq.cache.rewind(1).is_err());
+        assert!(seq.cache.unusable().is_some());
+        // Reconstructing a Sequence cannot clear the cache's actual sentinel.
+        // This has NO overrun: even Whole must check known invalid state.
+        let seq = crate::nn::Sequence::with_tokens(seq.cache, vec![10, 20, 30]);
+        let mut session = crate::nn::Session::from_sequence(&Faulty, seq);
+        for keep in [3, 2] {
+            let error = session.accept(keep).unwrap_err();
+            assert!(error.to_string().contains("unusable until a reset"));
+            assert_eq!(session.tokens(), &[10, 20, 30]);
+        }
+        // The invalidity belongs to the cache, not a particular Session.
+        let mut session = crate::nn::Session::from_sequence(&Faulty, session.into_sequence());
+        assert!(session.accept(1).is_err());
+        assert_eq!(session.tokens(), &[10, 20, 30]);
+        session.reset();
+        assert!(session.sequence().cache().unusable().is_none());
+        assert_eq!((session.pos(), session.overrun()), (0, 0));
+        assert_eq!(session.accept(0).unwrap(), crate::nn::Acceptance::Whole);
+    }
+
+    #[test]
+    fn accept_keeps_healthy_exact_and_reconciled_obligation_paths() {
+        let mut seq = acceptance_sequence(1);
+        seq.tokens.push(40);
+        seq.overrun = 0;
+        let mut session = crate::nn::Session::from_sequence(&Faulty, seq);
+        assert_eq!(
+            session.accept(3).unwrap(),
+            crate::nn::Acceptance::Exact { dropped: 1 }
+        );
+        assert_eq!((session.pos(), session.overrun()), (3, 0));
+        assert_eq!(session.tokens(), &[10, 20, 30]);
+        assert!(session
+            .sequence()
+            .cache()
+            .layers
+            .iter()
+            .all(|layer| !layer.open));
+
+        let mut session = crate::nn::Session::from_sequence(&Faulty, acceptance_sequence(1));
+        assert_eq!(
+            session.accept(2).unwrap(),
+            crate::nn::Acceptance::Obligation {
+                ahead: 1,
+                restore_point: None
+            }
+        );
+        assert_eq!((session.pos(), session.overrun()), (3, 1));
+        assert_eq!(session.tokens(), &[10, 20]);
+        assert!(session.sequence().cache().unusable().is_none());
+        assert!(session
+            .sequence()
+            .cache()
+            .layers
+            .iter()
+            .all(|layer| !layer.open));
+    }
+
+    #[test]
+    fn accept_keeps_the_obligation_when_the_overrun_exceeds_the_horizon() {
+        let seq = acceptance_sequence(2);
+        assert_eq!(seq.cache.rewind_horizon(), 1);
+        let mut session = crate::nn::Session::from_sequence(&Faulty, seq);
+        let result = session.accept(2).unwrap();
+        assert_eq!(
+            result,
+            crate::nn::Acceptance::Obligation {
+                ahead: 3,
+                restore_point: None
+            }
+        );
+        let seq = session.sequence();
+        assert_eq!(seq.tokens(), &[10, 20]);
+        assert_eq!((seq.pos(), seq.overrun()), (5, 3));
+        assert!(
+            seq.cache().unusable().is_none(),
+            "a horizon refusal did not poison the cache"
+        );
+        assert!(
+            seq.cache().layers.iter().all(|layer| layer.open),
+            "no layer rewound past its horizon"
+        );
     }
 
     #[test]

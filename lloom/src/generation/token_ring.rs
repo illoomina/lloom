@@ -822,3 +822,91 @@ impl TokenRing {
         &self.eos
     }
 }
+
+#[cfg(all(test, feature = "metal"))]
+mod terminal_trace_tests {
+    use super::*;
+    use crate::nn::terminal_trace;
+
+    #[test]
+    fn disabled_trace_never_polls_the_mapped_generation() {
+        const CHILD: &str = "LLOOM_TRACE_POLL_GATE_CHILD";
+        let Ok(case) = std::env::var(CHILD) else {
+            // Each arm owns the actual cached tuning/profile state and poll
+            // counter; neither mutates the test process's environment.
+            for enabled in [false, true] {
+                let output = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "generation::token_ring::terminal_trace_tests::disabled_trace_never_polls_the_mapped_generation",
+                        "--nocapture",
+                    ])
+                    .env(CHILD, if enabled { "on" } else { "off" })
+                    .output()
+                    .unwrap();
+                eprint!("{}", String::from_utf8_lossy(&output.stdout));
+                eprint!("{}", String::from_utf8_lossy(&output.stderr));
+                assert!(
+                    output.status.success(),
+                    "isolated trace arm {enabled} failed: {}",
+                    output.status
+                );
+                let compiled = cfg!(any(debug_assertions, feature = "profile"));
+                let expected = u64::from(compiled && enabled);
+                let marker = format!(
+                    "TRACE-POLL compiled={compiled} enabled={enabled} direct=1 diagnostic={} submitted_snapshots={expected}",
+                    2 * expected
+                );
+                assert!(
+                    String::from_utf8_lossy(&output.stderr).contains(&marker),
+                    "isolated child did not execute the expected actual-poll arm: {marker}"
+                );
+            }
+            return;
+        };
+        let enabled = match case.as_str() {
+            "on" => true,
+            "off" => false,
+            _ => panic!("unknown trace fixture arm {case}"),
+        };
+        let mut tuning = lloom_tensor::tuning::Tuning::default();
+        tuning.instrument.profile = enabled;
+        assert!(lloom_tensor::tuning::install(tuning).is_ok());
+        assert_eq!(lloom_tensor::kernels::metal::profile::enabled(), enabled);
+
+        // Host-only storage: no Metal Device, queue, command buffer or native
+        // work. These immutable words stay alive longer than the ring below.
+        // The fixture installs their addresses solely to exercise the ACTUAL
+        // mapped peek_step/POLL_READS path, not a fake polling closure.
+        let step = 7u32;
+        let eos = 0u8;
+        let mut ring = TokenRing::new(1, &[99], &Device::Cpu).unwrap();
+        ring.mapped = Some(Mapped {
+            step: std::ptr::from_ref(&step) as usize,
+            eos: std::ptr::from_ref(&eos) as usize,
+        });
+        assert!(ring.poll_is_mapped());
+        let before = poll_read_count();
+        assert_eq!(ring.published_generation(), Some(7));
+        assert_eq!(
+            poll_read_count() - before,
+            1,
+            "the actual poll counter is engaged"
+        );
+        let before = poll_read_count();
+        let submitted_snapshots = std::cell::Cell::new(0);
+        terminal_trace::run_begin(|| ring.published_generation().map(|p| p as usize));
+        terminal_trace::producer_stop(terminal_trace::StopBy::Length, || {
+            submitted_snapshots.set(submitted_snapshots.get() + 1);
+            (3, ring.published_generation().map(|p| p as usize))
+        });
+        let compiled = cfg!(any(debug_assertions, feature = "profile"));
+        let expected = u64::from(compiled && enabled);
+        assert_eq!(poll_read_count() - before, 2 * expected);
+        assert_eq!(submitted_snapshots.get(), expected);
+        eprintln!(
+            "TRACE-POLL compiled={compiled} enabled={enabled} direct=1 diagnostic={} submitted_snapshots={}",
+            poll_read_count() - before, submitted_snapshots.get()
+        );
+    }
+}

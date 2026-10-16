@@ -82,6 +82,12 @@ impl ContainerMemory {
         self.limit / 10
     }
 
+    /// The signed room left after this group's own reserve. Ancestors must
+    /// be compared on this term: a larger limit also keeps a larger reserve.
+    fn room(&self) -> i128 {
+        self.available() as i128 - self.reserve() as i128
+    }
+
     fn describe(&self) -> String {
         format!(
             "limit {:.2} - (usage {:.2} - inactive file {:.2})",
@@ -121,7 +127,7 @@ fn parse_proc_cgroup(text: &str) -> Option<CgroupPath> {
     v2
 }
 
-/// The tightest memory limit over this process's control group and its
+/// The tightest post-reserve room over this process's control group and its
 /// ancestors, as `read` sees the files: `None` when no level sets one, or
 /// when every limit is at or above the host's `total` (it binds nothing the
 /// host bound does not). The walk stops at the mount: inside a container's
@@ -181,7 +187,7 @@ fn container_memory_from(
                 reclaimable: stat(&d.join("memory.stat"), stat_keys).unwrap_or(0),
             })
         })
-        .min_by_key(|c| c.available())
+        .min_by_key(ContainerMemory::room)
 }
 
 impl HostMemory {
@@ -536,8 +542,7 @@ impl Verdict {
 
     /// The control group's `available − reserve`, signed, when one binds.
     fn container_free(&self) -> Option<i128> {
-        self.container
-            .map(|c| c.available() as i128 - c.reserve() as i128)
+        self.container.map(|c| c.room())
     }
 
     /// Whether the control group, not the host, sets the room.
@@ -1663,6 +1668,125 @@ mod tests {
         ]);
         assert_eq!(container_memory_from("0::/\n", HOST, over), None);
         assert_eq!(container_memory_from("", HOST, files(&[])), None);
+    }
+
+    /// Raw availability orders these groups backwards from the room the
+    /// gate may admit. The ancestor's larger reserve must still bind.
+    #[test]
+    fn ancestor_selection_subtracts_each_groups_reserve_before_comparing() {
+        for (proc, mount, limit_file, usage_file) in [
+            ("0::/a/b\n", "/sys/fs/cgroup", "memory.max", "memory.current"),
+            (
+                "4:memory:/a/b\n",
+                "/sys/fs/cgroup/memory",
+                "memory.limit_in_bytes",
+                "memory.usage_in_bytes",
+            ),
+        ] {
+            let fs = files(&[
+                (&format!("{mount}/a/{limit_file}"), "6000000000"),
+                (&format!("{mount}/a/{usage_file}"), "2900000000"),
+                (&format!("{mount}/a/b/{limit_file}"), "4000000000"),
+                (&format!("{mount}/a/b/{usage_file}"), "1000000000"),
+            ]);
+            let selected = container_memory_from(proc, HOST, fs).unwrap();
+            assert_eq!(selected.limit, 6_000_000_000, "{proc}");
+            assert_eq!(selected.available(), 3_100_000_000);
+            assert_eq!(selected.reserve(), 600_000_000);
+            assert_eq!(selected.room(), 2_500_000_000);
+
+            let gate = Gate::default();
+            for need in [2_500_000_000, 2_500_000_001, 2_550_000_000] {
+                let v = gate
+                    .decide_with(need, None, &[], None, || {
+                        Some(HostMemory {
+                            total: 9_700_000_000,
+                            free: 8_850_000_000,
+                            container: Some(selected),
+                            ..Default::default()
+                        })
+                    })
+                    .unwrap();
+                assert_eq!(v.reserve, RESERVE_FLOOR);
+                assert!(v.container_binds());
+                assert_eq!(v.room(), 2_500_000_000);
+                assert_eq!(v.fits, need <= 2_500_000_000, "{}", v.line());
+                assert_eq!(v.margin(), 2_500_000_000i128 - need as i128);
+
+                let mut reserved = v.clone();
+                reserved.others = vec![Outstanding {
+                    pid: u32::MAX,
+                    reserved: 600_000_000,
+                    footprint: Some(100_000_000),
+                    ..Default::default()
+                }];
+                reserved.mine.reserved = 300_000_000;
+                reserved.mine.footprint = Some(50_000_000);
+                assert_eq!(reserved.room(), 1_750_000_000);
+                assert_eq!(reserved.margin(), 1_750_000_000i128 - need as i128);
+            }
+        }
+    }
+
+    /// Exhausted groups have negative room, not a shared zero. Selection
+    /// must preserve the most restrictive ancestor even after saturation.
+    #[test]
+    fn ancestor_room_selection_is_signed_and_bounds_every_visible_group() {
+        let mut cases = 0;
+        for parent_limit in [10u64, 20, 30] {
+            for child_limit in [10u64, 20, 30] {
+                for child_usage in [0u64, 10, 20, 30, 40] {
+                    for parent_usage in [0u64, 10, 20, 30, 40] {
+                        if parent_usage < child_usage {
+                            continue;
+                        }
+                        for reclaimable in [0u64, 5] {
+                            if reclaimable > child_usage {
+                                continue;
+                            }
+                            let parent = ContainerMemory {
+                                limit: parent_limit,
+                                usage: parent_usage,
+                                reclaimable,
+                            };
+                            let child = ContainerMemory {
+                                limit: child_limit,
+                                usage: child_usage,
+                                reclaimable,
+                            };
+                            let mut entries = Vec::new();
+                            for (path, c) in [("a", parent), ("a/b", child)] {
+                                let dir = format!("/sys/fs/cgroup/{path}");
+                                entries.push((format!("{dir}/memory.max"), c.limit.to_string()));
+                                entries.push((format!("{dir}/memory.current"), c.usage.to_string()));
+                                entries.push((
+                                    format!("{dir}/memory.stat"),
+                                    format!("inactive_file {}\n", c.reclaimable),
+                                ));
+                            }
+                            let refs: Vec<_> = entries
+                                .iter()
+                                .map(|(p, t)| (p.as_str(), t.as_str()))
+                                .collect();
+                            let selected = container_memory_from("0::/a/b\n", HOST, files(&refs))
+                                .expect("both finite limits are visible");
+                            assert_eq!(selected.room(), parent.room().min(child.room()));
+                            if parent_usage >= parent_limit + reclaimable
+                                && child_usage >= child_limit + reclaimable
+                            {
+                                assert_eq!(
+                                    selected.room(),
+                                    -(parent_limit.max(child_limit) as i128 / 10),
+                                    "the larger reserve binds when both groups have no availability"
+                                );
+                            }
+                            cases += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(cases, 225, "the bounded matrix must not silently shrink");
     }
 
     /// cgroup v1's memory controller: its own mount, its own file names,

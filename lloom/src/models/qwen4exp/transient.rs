@@ -842,6 +842,96 @@ mod tests {
         assert_eq!(t.forward(64, 0).allocated, 4_433_536 - 303_104);
     }
 
+    /// Pairing never absorbs a one-position tail. Every group owes one
+    /// head, and deferred lifetime retains all groups, not only the last.
+    #[test]
+    fn deferred_forward_keeps_every_chunk_and_head_across_pair_boundaries() {
+        for cfg in [Config::tiny(), Config::flash_next()] {
+            let t = PrefillTransient::new(&cfg, route(Lifetime::Deferred, cfg.head_dim == 256));
+            for (seq, expected) in [
+                (511, vec![vec![511]]),
+                (512, vec![vec![512]]),
+                (513, vec![vec![512], vec![1]]),
+                (1023, vec![vec![512, 511]]),
+                (1024, vec![vec![512, 512]]),
+                (1025, vec![vec![512, 512], vec![1]]),
+            ] {
+                assert_eq!(t.groups(seq), expected, "seq={seq}");
+                for pos in [0, cfg.indexer_budget + cfg.indexer_compress_ratio - 1] {
+                    let mut allocated = alloc(seq * cfg.hidden_size, F32);
+                    let mut at = pos;
+                    let mut chunks = 0;
+                    for group in &expected {
+                        for &rows in group {
+                            allocated += t.chunk(rows, at);
+                            at += rows;
+                            chunks += 1;
+                        }
+                        allocated += t.head();
+                    }
+                    assert_eq!(
+                        t.forward(seq, pos),
+                        ForwardBytes {
+                            seq,
+                            pos,
+                            chunks,
+                            held: allocated,
+                            allocated,
+                        },
+                        "layers={} seq={seq} pos={pos}",
+                        cfg.n_layers
+                    );
+                }
+            }
+        }
+    }
+
+    /// Checkpoint recurrence is retained once per linear layer in the
+    /// whole forward, rather than once per chunk or once per pipeline group.
+    #[test]
+    fn deferred_checkpoint_adds_one_largest_recurrence_per_linear_layer() {
+        for cfg in [Config::tiny(), Config::flash_next()] {
+            let off = PrefillTransient::new(&cfg, route(Lifetime::Deferred, cfg.head_dim == 256));
+            let on = PrefillTransient::new(
+                &cfg,
+                Route {
+                    checkpoint: true,
+                    ..off.route()
+                },
+            );
+            let linear = cfg
+                .layer_types
+                .iter()
+                .filter(|&&kind| kind == LayerKind::Linear)
+                .count() as u64;
+            assert_eq!(linear, if cfg.n_layers == 4 { 3 } else { 36 });
+            for seq in [63usize, 64, 65, 511, 512, 513, 1024, 1025] {
+                let without = off.forward(seq, 0);
+                let with = on.forward(seq, 0);
+                let extra = off.gdn_checkpoint(seq.min(512)) * linear;
+                assert_eq!(with.chunks, without.chunks);
+                assert_eq!(with.allocated - without.allocated, extra, "seq={seq}");
+                assert_eq!(with.held - without.held, extra, "seq={seq}");
+            }
+        }
+    }
+
+    /// Route selection is numeric: a Metal route can be inspected without
+    /// creating a device. Host-planned experts affect Metal lifetime only.
+    #[test]
+    fn production_route_selects_lifetime_without_creating_a_device() {
+        for cfg in [Config::tiny(), Config::flash_next()] {
+            for (metal, host_planned, lifetime) in [
+                (false, false, Lifetime::Eager),
+                (false, true, Lifetime::Eager),
+                (true, false, Lifetime::Deferred),
+                (true, true, Lifetime::LayerSynced),
+            ] {
+                assert_eq!(Route::of(&cfg, metal, host_planned).lifetime, lifetime);
+            }
+        }
+    }
+
     /// Flash-Next's own geometry at the engine's 512 tile, every route. The
     /// streamed route is held against the one measurement of this family's
     /// prefill at scale (`measurements/qwen4exp-dispatches.md` P18: a

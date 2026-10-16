@@ -1364,10 +1364,13 @@ mod inventory_controls {
         let clock = head.head.captures().witness.captures().clock.clone();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             for _ in 0..2 {
-                assert!(matches!(
-                    head.require_staged(),
-                    Err(MetalKernelError::OwnerSubmissionRequired)
-                ));
+                assert!(
+                    matches!(
+                        head.require_staged(),
+                        Err(MetalKernelError::OwnerSubmissionRequired)
+                    ),
+                    "unstaged native entry minted its own epoch"
+                );
                 assert_eq!(clock.current_epoch().0, 0);
             }
             let epoch = clock.commit_epoch();

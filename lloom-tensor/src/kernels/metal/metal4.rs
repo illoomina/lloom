@@ -806,12 +806,18 @@ impl Submission {
     /// Reserve ordering and native handler allocations before engine epoch and
     /// subscriber registration. Dropping this value consumes no sequence.
     pub(super) fn prepare_commit(self: &Arc<Self>) -> Result<PreparedCommit<'_>, MetalKernelError> {
-        self.prepare_commit_mode(false)
+        self.prepare_commit_mode(false, None)
     }
     pub(super) fn prepare_commit_mode(
         self: &Arc<Self>,
         nonblocking: bool,
+        authority: Option<&super::commands::OwnerSubmission<'_>>,
     ) -> Result<PreparedCommit<'_>, MetalKernelError> {
+        if let Some(generation) = &self.bindings {
+            if !authority.is_some_and(|owner| owner.authorizes_generation(generation)) {
+                return Err(MetalKernelError::OwnerSubmissionRequired);
+            }
+        }
         self.queue.check_failure()?;
         let order = match self.queue.commit_order.try_lock() {
             Some(guard) => guard,
@@ -1175,12 +1181,10 @@ impl PreparedCommit<'_> {
         &self,
         epoch: crate::retire::Epoch,
     ) -> Result<(), MetalKernelError> {
-        self.submission
-            .stage_binding_epoch(epoch)
-            .inspect_err(|_| {
-                self.submission
-                    .binding_failure(crate::retirement_owners::Failure::AdapterFailed)
-            })
+        self.submission.stage_binding_epoch(epoch).inspect_err(|_| {
+            self.submission
+                .binding_failure(crate::retirement_owners::Failure::AdapterFailed)
+        })
     }
     pub(super) fn on_completion(
         &self,
@@ -1219,10 +1223,7 @@ impl PreparedCommit<'_> {
         let submission = self.submission;
         submission.queue.check_failure()?;
         if let Some(bindings) = &submission.bindings {
-            // Direct public commit also supplies a precise staged epoch. The
-            // ordinary Commands path already staged its exact commit_epoch.
-            // A commit taking its own epoch runs the queue's completion hook.
-            bindings.ensure_staged(|| self.run_hook())?;
+            bindings.require_staged()?;
         }
         let mut state = self.state.get_mut().take().expect("prepared recording");
         let slot = state.slot.take().expect("prepared recording slot");
@@ -1243,17 +1244,14 @@ impl PreparedCommit<'_> {
             .store(MTLCommandBufferStatus::Committed.0, Ordering::Release);
         drop(state);
         let owners = super::retirement::NativeOwners::metal4(slot, submission.clone(), physical);
-        match submission
-            .retirement
-            .replace_prepared(
-                super::retirement::Captures {
-                    callbacks,
-                    hooked,
-                    bindings: None,
-                },
-                owners,
-            )
-        {
+        match submission.retirement.replace_prepared(
+            super::retirement::Captures {
+                callbacks,
+                hooked,
+                bindings: None,
+            },
+            owners,
+        ) {
             Ok(displaced) => drop(displaced), // Empty pre-reserved record only.
             Err(rejected) => {
                 // An invariant failure must not drop the only physical owner.

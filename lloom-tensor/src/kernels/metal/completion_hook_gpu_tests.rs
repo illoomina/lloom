@@ -138,9 +138,11 @@ fn subscribers_run_per_buffer_without_their_lock() {
     let r = Arc::clone(&runs);
     cmds.on_command_buffer_complete(move || {
         r.fetch_add(1, Ordering::Relaxed);
-    });
+    })
+    .unwrap();
     let clock = cmds.clock();
     let buffers = 8u64;
+    cmds.seal_completion_subscribers().unwrap();
     let reached = cmds.while_subscribers_locked(|| {
         for _ in 0..buffers {
             drop(cmds.command_encoder().unwrap());

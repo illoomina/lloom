@@ -42,6 +42,12 @@ pub enum MetalKernelError {
     CompletionRegistration(#[from] CompletionRegistrationError),
     #[error("a completion callback cannot block on its own queue")]
     CallbackWouldBlock,
+    #[error("bound command buffer requires its owning Commands submission transaction")]
+    OwnerSubmissionRequired,
+    #[error("queue completion subscribers are sealed; register during device setup")]
+    SubscriberConfigurationSealed,
+    #[error("queue subscriber setup publication is active; finish setup and retry")]
+    SubscriberSetupBusy,
     #[error("GPU queue unavailable: {0}")]
     QueueUnavailable(&'static str),
     #[error("Command buffer had following error: {0}")]

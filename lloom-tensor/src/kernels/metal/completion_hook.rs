@@ -55,8 +55,15 @@ impl CompletionHook {
         self.subscribers.run();
     }
 
-    pub(super) fn subscribe(&self, f: Subscriber) {
-        self.subscribers.subscribe(f);
+    pub(super) fn subscribe(
+        &self,
+        f: Subscriber,
+    ) -> Result<(), crate::kernels::err::CompletionRegistrationError> {
+        self.subscribers.subscribe(f)
+    }
+
+    pub(super) fn seal(&self) -> Result<(), crate::kernels::MetalKernelError> {
+        self.subscribers.setup.seal().map_err(setup_error)
     }
 
     /// Hold the subscribers' lock on the calling thread while `f` runs, so a
@@ -92,6 +99,7 @@ impl CompletionHook {
 // `published` itself reallocates.
 #[allow(clippy::vec_box)]
 struct Subscribers {
+    setup: crate::completion_setup::Setup,
     current: AtomicPtr<Snapshot>,
     published: parking_lot::Mutex<Vec<Box<Snapshot>>>,
 }
@@ -100,14 +108,45 @@ impl Subscribers {
     fn new() -> Self {
         let empty = Box::new(Snapshot::new());
         Self {
+            setup: crate::completion_setup::Setup::new(),
             current: AtomicPtr::new(&*empty as *const Snapshot as *mut Snapshot),
             published: parking_lot::Mutex::new(vec![empty]),
         }
     }
 
-    fn subscribe(&self, f: Subscriber) {
+    fn subscribe(
+        &self,
+        f: Subscriber,
+    ) -> Result<(), crate::kernels::err::CompletionRegistrationError> {
+        let _permit = match self.setup.register() {
+            Ok(permit) => permit,
+            Err(reason) => {
+                return Err(crate::kernels::err::CompletionRegistrationError::new(
+                    setup_error(reason),
+                    Some(f),
+                ))
+            }
+        };
         let mut published = self.published.lock();
-        let mut next = Snapshot::clone(published.last().expect("the empty snapshot"));
+        let previous = published.last().expect("the empty snapshot");
+        let mut next = Snapshot::new();
+        if next.try_reserve_exact(previous.len() + 1).is_err() {
+            return Err(crate::kernels::err::CompletionRegistrationError::new(
+                crate::kernels::MetalKernelError::QueueUnavailable(
+                    "subscriber snapshot allocation refused",
+                ),
+                Some(f),
+            ));
+        }
+        next.extend(previous.iter().cloned());
+        if published.try_reserve(1).is_err() {
+            return Err(crate::kernels::err::CompletionRegistrationError::new(
+                crate::kernels::MetalKernelError::QueueUnavailable(
+                    "subscriber history allocation refused",
+                ),
+                Some(f),
+            ));
+        }
         next.push(f);
         let next = Box::new(next);
         self.current.store(
@@ -115,6 +154,7 @@ impl Subscribers {
             Ordering::Release,
         );
         published.push(next);
+        Ok(())
     }
 
     fn run(&self) {
@@ -124,6 +164,17 @@ impl Subscribers {
         let snapshot = unsafe { &*self.current.load(Ordering::Acquire) };
         for f in snapshot {
             f();
+        }
+    }
+}
+
+fn setup_error(reason: crate::completion_setup::Refusal) -> crate::kernels::MetalKernelError {
+    match reason {
+        crate::completion_setup::Refusal::Busy => {
+            crate::kernels::MetalKernelError::SubscriberSetupBusy
+        }
+        crate::completion_setup::Refusal::Sealed => {
+            crate::kernels::MetalKernelError::SubscriberConfigurationSealed
         }
     }
 }
@@ -201,24 +252,32 @@ mod tests {
         assert!(message.contains("Invalid Resource"), "{message}");
     }
 
-    /// A subscriber runs on every completion after its registration, the
+    /// A setup subscriber runs on every completion after sealing, the
     /// teardown take leaves none to run, and every subscriber is handed over
     /// exactly once.
     #[test]
-    fn subscribers_run_from_registration_and_teardown_takes_them_all() {
+    fn subscribers_run_after_sealing_and_teardown_takes_them_all() {
         let (clock, _, hook) = hook();
         let runs = Arc::new(AtomicUsize::new(0));
         for _ in 0..4 {
             clock.commit_epoch();
         }
-        hook.complete(&clean());
-        assert_eq!(runs.load(Ordering::Relaxed), 0);
         for _ in 0..2 {
             let r = Arc::clone(&runs);
             hook.subscribe(Arc::new(move || {
                 r.fetch_add(1, Ordering::Relaxed);
-            }));
+            }))
+            .unwrap();
         }
+        hook.seal().unwrap();
+        let rejected = hook
+            .subscribe(Arc::new(|| panic!("late subscriber ran")))
+            .unwrap_err();
+        assert!(matches!(
+            rejected.cause(),
+            crate::kernels::MetalKernelError::SubscriberConfigurationSealed
+        ));
+        drop(rejected);
         hook.complete(&clean());
         assert_eq!(
             runs.load(Ordering::Relaxed),

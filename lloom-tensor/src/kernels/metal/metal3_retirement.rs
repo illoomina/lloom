@@ -423,7 +423,7 @@ pub(super) struct PreparedCommit<'a> {
     bindings: Option<&'a super::native_generation_bindings::GenerationBindings>,
 }
 impl Completions {
-    pub(super) fn prepare_commit<'a>(
+    fn prepare_commit<'a>(
         self: &'a Arc<Self>,
         raw: &'a objc2::rc::Retained<
             objc2::runtime::ProtocolObject<dyn objc2_metal::MTLCommandBuffer>,
@@ -514,9 +514,7 @@ impl PreparedCommit<'_> {
     pub(super) fn commit(mut self) -> Result<(), crate::kernels::MetalKernelError> {
         self.core.check()?;
         if let Some(head) = self.bindings {
-            // A commit Commands did not stage takes its own epoch, so it runs
-            // the queue's completion hook too.
-            head.ensure_staged(|| self.run_hook())?;
+            head.require_staged()?;
         }
         // Record phase before entering Objective-C. Handler installation cannot
         // execute GPU work; cancellation can still use host-only destruction.
@@ -899,20 +897,25 @@ impl AssociatedBuffer {
     pub(super) fn prepare_commit(
         &self,
     ) -> Result<PreparedCommit<'_>, crate::kernels::MetalKernelError> {
-        self.prepare_commit_mode(false)
+        self.prepare_commit_mode(false, None)
     }
     pub(super) fn prepare_commit_mode(
         &self,
         nonblocking: bool,
+        authority: Option<&super::commands::OwnerSubmission<'_>>,
     ) -> Result<PreparedCommit<'_>, crate::kernels::MetalKernelError> {
-        self.core
-            .prepare_commit(
-                &self.raw,
-                &self.marker,
-                &self.handler,
-                nonblocking,
-                self.bindings.as_ref(),
-            )
+        if let Some(generation) = &self.bindings {
+            if !authority.is_some_and(|owner| owner.authorizes_generation(generation)) {
+                return Err(crate::kernels::MetalKernelError::OwnerSubmissionRequired);
+            }
+        }
+        self.core.prepare_commit(
+            &self.raw,
+            &self.marker,
+            &self.handler,
+            nonblocking,
+            self.bindings.as_ref(),
+        )
     }
     pub(super) fn try_commit(&self) -> Result<(), crate::kernels::MetalKernelError> {
         self.prepare_commit()?.commit()

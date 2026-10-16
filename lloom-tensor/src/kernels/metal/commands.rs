@@ -298,6 +298,30 @@ struct CommitReceipt {
     signalled: Option<u64>,
 }
 
+/// Borrowed from the owner's exact recording while its submission transaction
+/// excludes replacement. No clone, numeric identity, or native status can mint
+/// this authority. Native preparation consumes it through CommandBuffer.
+pub(super) struct OwnerSubmission<'a> {
+    buffer: &'a CommandBuffer,
+    clock: &'a Arc<GpuClock>,
+}
+
+impl OwnerSubmission<'_> {
+    pub(super) fn authorizes(&self, buffer: &CommandBuffer) -> bool {
+        self.buffer.same_recording(buffer)
+    }
+
+    pub(super) fn authorizes_generation(
+        &self,
+        generation: &super::native_generation_bindings::GenerationBindings,
+    ) -> bool {
+        self.buffer
+            .binding_generation()
+            .is_ok_and(|exact| exact.same(generation))
+            && generation.belongs_to_clock(self.clock)
+    }
+}
+
 struct PendingBlit {
     encoder: BlitCommandEncoder,
     error: Option<MetalKernelError>,
@@ -1157,23 +1181,28 @@ impl Commands {
         &self.core.trace
     }
 
-    /// Registers `f` to run after every command buffer that completes from now
-    /// on, after the clock has marked that buffer's epoch.
+    /// Register a queue-wide observer during device setup, before sealing or
+    /// the first owner submission. Every completion reads the sealed immutable
+    /// snapshot without taking the setup lock.
     ///
-    /// Call during device setup, before any work is encoded: a subscriber
-    /// added later misses the buffers that completed before it, and a buffer
-    /// parked against one of those epochs is swept in only at a later one.
-    /// Registration publishes a new snapshot; a completion reads the current
-    /// one without a lock (`completion_hook.rs`).
-    ///
-    /// Runs on Metal's completion thread. Per CONTRIBUTING §3.3a, a callback
-    /// must not acquire a lock the encoding thread takes or submit work that
-    /// waits for that thread. In particular, native-slot backpressure can hold
-    /// the Commands state lock while feedback is responsible for returning a
-    /// slot. Keep callbacks bounded; advance a flag and drain host-owned work
-    /// on the host, as the buffer pools do.
-    pub fn on_command_buffer_complete<F: Fn() + Send + Sync + 'static>(&self, f: F) {
-        self.core.hook.subscribe(Arc::new(f));
+    /// Monitoring installed after model load must migrate to earlier device
+    /// setup. Model hot-swap never reopens this queue configuration. Model and
+    /// request notifications use per-record/request completion APIs instead.
+    /// Rejected callback ownership is returned in the error; drop it outside
+    /// producer locks. Callbacks must not acquire encoding-thread locks or
+    /// block on their own queue.
+    pub fn on_command_buffer_complete<F: Fn() + Send + Sync + 'static>(
+        &self,
+        f: F,
+    ) -> Result<(), crate::kernels::err::CompletionRegistrationError> {
+        self.core.hook.subscribe(Arc::new(f))
+    }
+
+    /// Finish queue observer setup irreversibly. Active registration returns
+    /// retryable setup-busy, without submitting work or taking an epoch.
+    /// The first owner submission also seals, for constructor compatibility.
+    pub fn seal_completion_subscribers(&self) -> Result<(), MetalKernelError> {
+        self.core.hook.seal()
     }
 
     /// The cut policy in force (`DESIGN.md` §13.5m).
@@ -1540,7 +1569,7 @@ impl Commands {
         // The retained current is newer than every in-flight record. Waiting
         // it needs no allocation and remains possible after replacement fails.
         if let Some(last) = retained_current.as_ref().or_else(|| to_wait.last()) {
-            Self::ensure_completed(last)?;
+            self.ensure_completed(last)?;
         }
         // Check earlier CBs for errors (no need to block — they're already done).
         for cb in &to_wait {
@@ -1598,7 +1627,7 @@ impl Commands {
             // never saw, and surfacing an `Error` status -- are kept on both
             // arms, because a dropped error presents as wrong output rather than
             // as a failure (§3.5).
-            let outcome = Self::ensure_completed_via(
+            let outcome = self.ensure_completed_via(
                 &cb,
                 self.core.completion_wait,
                 self.core.completion_event.as_ref(),
@@ -1692,7 +1721,7 @@ impl Commands {
     /// Same completion seam and counters as [`Self::flush_and_wait_current`];
     /// only the buffer waited on differs.
     pub fn wait_marker(&self, marker: &CommandMarker) -> Result<(), MetalKernelError> {
-        let outcome = Self::ensure_completed_via(
+        let outcome = self.ensure_completed_via(
             &marker.cb,
             self.core.completion_wait,
             self.core.completion_event.as_ref(),
@@ -2074,8 +2103,8 @@ impl Commands {
     /// surfacing an `Error` -- is identical on every arm and only the wait
     /// differs, which is the property that makes this a seam rather than a
     /// fork.
-    fn ensure_completed(cb: &CommandBuffer) -> Result<(), MetalKernelError> {
-        let result = Self::ensure_completed_via(cb, CompletionWait::Synchronize, None, None);
+    fn ensure_completed(&self, cb: &CommandBuffer) -> Result<(), MetalKernelError> {
+        let result = self.ensure_completed_via(cb, CompletionWait::Synchronize, None, None);
         // Full drain joins callbacks, even a native terminal error. Failed
         // admission/unknown handoff is not a quiescence proof.
         if result.is_ok()
@@ -2113,6 +2142,7 @@ impl Commands {
     /// asserted: `SharedEventSleep` was added exactly that way and touches this
     /// function not at all.
     fn ensure_completed_via(
+        &self,
         cb: &CommandBuffer,
         arm: CompletionWait,
         event: Option<&SharedEvent>,
@@ -2121,17 +2151,10 @@ impl Commands {
         let mut outcome = WaitOutcome::default();
         match cb.status() {
             MTLCommandBufferStatus::NotEnqueued | MTLCommandBufferStatus::Enqueued => {
-                // This path commits a buffer that `commit_swap_locked` never saw,
-                // so it needs its own registration or its GPU time goes unrecorded.
-                //
-                // **And it carries no signal**, because the signal is encoded in
-                // `commit_swap_locked` and this buffer bypassed it. Passing
-                // `None` here is what routes it to the blocking wait, which is
-                // the fail-safe direction: a poll for a value nothing will
-                // publish is a hang.
-                let prepared = cb.prepare_commit()?;
-                prepared.record_gpu_time_on_completion()?;
-                prepared.commit()?;
+                // Authenticate under owner state and submit without replacing:
+                // waiting on valid recorded work must not allocate a new slot.
+                let recovered = self.recover_pending_submission(cb)?;
+                outcome = arm.wait_for(cb, event, recovered)?;
                 cb.try_wait_data_ready()?;
             }
             MTLCommandBufferStatus::Committed | MTLCommandBufferStatus::Scheduled => {
@@ -2168,6 +2191,38 @@ impl Commands {
         }
 
         Ok(outcome)
+    }
+
+    fn recover_pending_submission(
+        &self,
+        cb: &CommandBuffer,
+    ) -> Result<Option<u64>, MetalKernelError> {
+        let mut state = self.lock_state()?;
+        if state
+            .current
+            .recording()
+            .is_some_and(|current| current.same_recording(cb))
+        {
+            return self
+                .core
+                .commit_current_locked(&mut state, None)
+                .map(|receipt| receipt.signalled);
+        }
+        if let Some((current, receipt)) = state.current.submitted() {
+            if current.same_recording(cb) {
+                return Ok(receipt.signalled);
+            }
+        }
+        // Current moves a predecessor to in_flight only after submit_once
+        // retained its receipt. It cannot contain unsubmitted owner work.
+        if state
+            .in_flight
+            .iter()
+            .any(|submitted| submitted.same_recording(cb))
+        {
+            return Ok(None);
+        }
+        Err(MetalKernelError::OwnerSubmissionRequired)
     }
 
     fn cb_error(cb: &CommandBuffer) -> MetalKernelError {
@@ -2320,6 +2375,7 @@ impl CommandsCore {
         state: &mut EntryGuard<'_>,
         timed: Option<std::time::Instant>,
     ) -> Result<CommitReceipt, MetalKernelError> {
+        self.hook.seal()?;
         self.close_pending_blit(state)?;
         self.close_compute(state)?;
         let t_end_enc = timed.map(|t| t.elapsed());
@@ -2339,7 +2395,11 @@ impl CommandsCore {
                         .ok_or(MetalKernelError::QueueUnavailable(
                             "published residency custody bound (1) exhausted",
                         ))?;
-                let prepared = cb.prepare_commit()?;
+                let authority = OwnerSubmission {
+                    buffer: cb,
+                    clock: &self.clock,
+                };
+                let prepared = cb.prepare_owned_commit(authority, false)?;
                 let (_, removed) = self.residency_set.commit_pending_extracted();
                 *destination = Some(removed);
                 let t_residency = timed.map(|t| t.elapsed());
@@ -2388,8 +2448,14 @@ impl CommandsCore {
         prepared.run_completion_hook()?;
         prepared.record_gpu_time_on_completion()?;
         let epoch = self.clock.commit_epoch();
-        prepared.stage_binding_epoch(epoch)?;
-        prepared.commit()?;
+        prepared.stage_binding_epoch(epoch).inspect_err(|_| {
+            self.failure
+                .record_static("owner epoch staging refused; queue failed");
+        })?;
+        prepared.commit().inspect_err(|_| {
+            self.failure
+                .record_static("owner native handoff refused; queue failed");
+        })?;
         if let (Some(a), Some(b), Some(c)) = (t_end_enc, t_residency, timed.map(|t| t.elapsed())) {
             crate::kernels::metal::profile::record_commit_parts(a, b - a, c - b);
         }
@@ -2661,6 +2727,11 @@ impl lifecycle::FinalCore for CommandsCore {
         captures: &mut lifecycle::FinalCaptures,
     ) -> Result<bool, MetalKernelError> {
         self.failure.check()?;
+        match self.hook.seal() {
+            Ok(()) => {}
+            Err(MetalKernelError::SubscriberSetupBusy) => return Ok(false),
+            Err(error) => return Err(error),
+        }
         if self.encoder_domain.has_external_handles() {
             return Ok(false);
         }
@@ -2703,7 +2774,11 @@ impl lifecycle::FinalCore for CommandsCore {
                 self.failure.check()?;
                 self.check_recording_status(cb)?;
                 // Busy returns before residency/epoch/event/callback side effects.
-                let prepared = cb.try_prepare_commit()?;
+                let authority = OwnerSubmission {
+                    buffer: cb,
+                    clock: &self.clock,
+                };
+                let prepared = cb.prepare_owned_commit(authority, true)?;
                 if captures.removals.is_some() {
                     return Err(MetalKernelError::QueueUnavailable(
                         "final residency custody already staged",

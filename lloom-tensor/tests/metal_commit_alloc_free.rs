@@ -431,7 +431,8 @@ fn run_commits(device: &Device, cmds: &Commands, subscriber: bool, commits: u64)
         let f = Arc::clone(&fired);
         cmds.on_command_buffer_complete(move || {
             f.fetch_add(1, Ordering::Relaxed);
-        });
+        })
+        .unwrap();
     }
     let kernels = Kernels::new();
     let n = 256usize;

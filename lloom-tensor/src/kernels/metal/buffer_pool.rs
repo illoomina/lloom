@@ -5313,7 +5313,7 @@ mod contention_tests {
         let (done, is_done) = mpsc::channel::<()>();
         dev.commands().on_command_buffer_complete(move || {
             let _ = done.send(());
-        });
+        }).unwrap();
 
         let b = dev.allocate_buffer(4096).expect("allocation");
         {

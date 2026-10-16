@@ -359,6 +359,9 @@ unsafe impl Send for CommandBuffer {}
 unsafe impl Sync for CommandBuffer {}
 
 impl CommandBuffer {
+    pub(super) fn same_recording(&self, other: &Self) -> bool {
+        std::ptr::eq(self.lifecycle(), other.lifecycle())
+    }
     pub(super) fn binding_generation(
         &self,
     ) -> Result<
@@ -452,23 +455,36 @@ impl CommandBuffer {
     pub(super) fn prepare_commit(
         &self,
     ) -> Result<PreparedCommandCommit<'_>, crate::kernels::MetalKernelError> {
-        self.prepare_commit_mode(false)
+        self.prepare_commit_mode(false, None)
     }
 
     /// Sole host-retirement worker: an unused preparation restores recording
     /// without waking itself. Normal producers wait on native-order mutexes;
     /// unsubmitted logical waits refuse rather than parking on PREPARED.
     /// Native return, error unwind and all public admissions retain notification.
-    pub(super) fn try_prepare_commit(
-        &self,
-    ) -> Result<PreparedCommandCommit<'_>, crate::kernels::MetalKernelError> {
-        self.prepare_commit_mode(true)
+    pub(super) fn prepare_owned_commit<'a>(
+        &'a self,
+        authority: super::commands::OwnerSubmission<'a>,
+        nonblocking: bool,
+    ) -> Result<PreparedCommandCommit<'a>, crate::kernels::MetalKernelError> {
+        if !authority.authorizes(self) {
+            return Err(crate::kernels::MetalKernelError::OwnerSubmissionRequired);
+        }
+        self.prepare_commit_mode(nonblocking, Some(&authority))
     }
 
     fn prepare_commit_mode(
         &self,
         nonblocking: bool,
+        authority: Option<&super::commands::OwnerSubmission<'_>>,
     ) -> Result<PreparedCommandCommit<'_>, crate::kernels::MetalKernelError> {
+        if let Ok(generation) = self.binding_generation() {
+            if !authority.is_some_and(|owner| {
+                owner.authorizes(self) && owner.authorizes_generation(generation)
+            }) {
+                return Err(crate::kernels::MetalKernelError::OwnerSubmissionRequired);
+            }
+        }
         self.check_lifecycle_failure()?;
         let admission = RecordingAdmission {
             buffer: self,
@@ -487,11 +503,11 @@ impl CommandBuffer {
                 }
                 PreparedNative::Metal3(raw)
             }
-            Backend::Metal3Associated(buffer) => {
-                PreparedNative::Metal3Associated(buffer.prepare_commit_mode(nonblocking)?)
-            }
+            Backend::Metal3Associated(buffer) => PreparedNative::Metal3Associated(
+                buffer.prepare_commit_mode(nonblocking, authority)?,
+            ),
             Backend::Metal4(submission) => {
-                PreparedNative::Metal4(submission.prepare_commit_mode(nonblocking)?)
+                PreparedNative::Metal4(submission.prepare_commit_mode(nonblocking, authority)?)
             }
         };
         Ok(PreparedCommandCommit {
@@ -750,6 +766,9 @@ impl CommandBuffer {
         )
     }
 
+    /// Submit a standalone interoperability buffer. Bound engine recordings
+    /// refuse before lifecycle, hook, epoch, residency or native effects; use
+    /// the owning Commands flush/marker/wait API for those recordings.
     pub fn commit(&self) -> Result<(), crate::kernels::MetalKernelError> {
         self.prepare_commit()?.commit()
     }

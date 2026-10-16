@@ -3976,9 +3976,14 @@ mod owner_submission_tests {
     fn standalone_raw_interoperability_remains_submittable() {
         let device = Device::system_default().unwrap();
         let queue = device.new_command_queue().unwrap();
-        let cb = CommandBuffer::new(
-            create_command_buffer(&queue, CommandBufferKind::Retaining).unwrap(),
-        );
+        // SAFETY: fresh retaining Apple command buffer, imported once, with
+        // no encoded resources or external raw aliases. This family performs
+        // the immediate explicit commit and completion wait below.
+        let cb = unsafe {
+            CommandBuffer::new(
+                create_command_buffer(&queue, CommandBufferKind::Retaining).unwrap(),
+            )
+        };
         cb.commit().unwrap();
         cb.try_wait_until_completed().unwrap();
         assert_eq!(cb.status(), MTLCommandBufferStatus::Completed);

@@ -15,6 +15,7 @@ pub(crate) enum Fault {
     BeforeEntry = 2,
     PartialEntry = 3,
     HoldReturn = 4,
+    UnknownReturn = 5,
 }
 
 #[derive(Default)]
@@ -84,6 +85,9 @@ impl Control {
         self.observer.lock().unwrap().as_ref().unwrap().clone()
     }
     pub fn before_return(&self) {
+        if self.take(Fault::UnknownReturn) {
+            panic!("controlled unknown return publication");
+        }
         if !self.take(Fault::HoldReturn) {
             return;
         }
@@ -125,6 +129,21 @@ mod tests {
         control.arm(Fault::HoldReturn);
         control.before_return(); // Release-before-arrival must not lose a wake.
         assert!(control.wait_for_pause());
+    }
+
+    #[test]
+    fn unknown_return_fault_is_one_shot_and_preserves_native_counter() {
+        let control = Control::default();
+        assert!(!control.native_call_returned(0));
+        control.arm(Fault::UnknownReturn);
+        let panic = std::panic::catch_unwind(|| control.before_return()).unwrap_err();
+        assert_eq!(
+            panic.downcast_ref::<&str>(),
+            Some(&"controlled unknown return publication")
+        );
+        control.before_return();
+        assert_eq!(control.native_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(control.entry_checks.load(Ordering::Relaxed), 0);
     }
 
     #[test]

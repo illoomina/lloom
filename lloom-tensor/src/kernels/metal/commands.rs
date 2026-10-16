@@ -3342,6 +3342,201 @@ mod owner_submission_tests {
         eprintln!("KNOWN_PRE_ENTRY epoch=1 native_calls=0 completed=0 retry_refused=true custody_retained=true");
     }
 
+    /// The raw call returns, but the owner never publishes returned handoff.
+    /// This is a logical unknown-return fault, not a fabricated driver error.
+    #[test]
+    fn metal3_unknown_return_retains_custody_without_synthetic_completion() {
+        let device = crate::MetalDevice::new(0).unwrap();
+        let commands = device.commands();
+        let cb = pending(commands);
+        assert!(!cb.is_metal4(), "this fixture requires actual Metal 3");
+        let raw = device
+            .metal_device()
+            .new_buffer(4096, super::super::MTLResourceOptions::StorageModeShared)
+            .unwrap();
+        let gate = device.metal_device().as_ref().newSharedEvent().unwrap();
+        let observer = device.metal_device().as_ref().newSharedEvent().unwrap();
+        // Independent owners are rooted before the first possible native wait.
+        // Unknown logical return is never used to release these pins.
+        let _pins = RetainUnknown(Some((
+            device.clone(),
+            cb.clone(),
+            raw.clone(),
+            gate.clone(),
+            observer.clone(),
+        )));
+        let release = ReleaseBeforeWait {
+            release: || gate.setSignaledValue(1),
+            wait: || {}, // No join/drain/native wait while the gate is held.
+        };
+        assert_eq!(gate.signaledValue(), 0);
+        assert_eq!(observer.signaledValue(), 0);
+        let runs = Arc::new(AtomicUsize::new(0));
+        let observed = runs.clone();
+        commands
+            .on_command_buffer_complete(move || {
+                observed.fetch_add(1, Ordering::Relaxed);
+            })
+            .unwrap();
+        commands.encode_wait_for_event(&gate, 1).unwrap();
+        {
+            let mut blit = commands.blit_command_encoder().unwrap();
+            // SAFETY: independent pins survive every refusal/assertion/unwind.
+            unsafe { blit.fill_buffer(&raw, (0, 4096), 0x73) };
+        }
+        cb.signal_event(&observer, 1).unwrap();
+        let control = &commands.core.submission_control;
+        control.arm(submission_test::Fault::UnknownReturn);
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            commands.recover_pending_submission(&cb)
+        }))
+        .expect_err("unknown return fault must unwind at the exact seam");
+        assert_eq!(
+            panic.downcast_ref::<&str>(),
+            Some(&"controlled unknown return publication")
+        );
+        assert_eq!(control.native_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(commands.clock().current_epoch().0, 1);
+        assert_eq!(commands.clock().completed_count().0, 0);
+        assert_eq!(runs.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            observer.signaledValue(),
+            0,
+            "host gate did not hold native work"
+        );
+        let core = commands.core.legacy_completions.as_ref().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while core.check().is_ok() && std::time::Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert!(
+            core.check().is_err(),
+            "unknown M3 handoff did not fail its queue"
+        );
+        assert!(commands.recover_pending_submission(&cb).is_err());
+        assert_eq!(control.native_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(commands.clock().current_epoch().0, 1);
+        // Release BEFORE any observation that waits for native progress. This
+        // guard also releases on every earlier assertion/error/unwind.
+        drop(release);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while observer.signaledValue() < 1 && std::time::Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert_eq!(
+            observer.signaledValue(),
+            1,
+            "independent M3 observer did not fire"
+        );
+        // SAFETY: actual tail signal proves the earlier fill completed. It is
+        // NOT returned-handoff/logical-terminal/reuse/refund/cleanup authority.
+        let bytes = unsafe { std::slice::from_raw_parts(raw.contents(), 4096) };
+        assert!(bytes.iter().all(|byte| *byte == 0x73));
+        assert_eq!(commands.clock().completed_count().0, 0);
+        assert_eq!(runs.load(Ordering::Relaxed), 0);
+        eprintln!("M3_UNKNOWN_RETURN actual_api=metal3 native_calls=1 epoch=1 completed=0 observer=1 bytes=0x73 custody_retained=true");
+        // No full logical wait or owner cleanup; _pins deliberately retains.
+    }
+
+    /// Pin the cached-Current receipt branch itself: Completed-status routing
+    /// in ensure_completed would otherwise skip this defensive owner branch.
+    #[test]
+    fn cached_current_recovery_returns_receipt_without_attempting_resubmission() {
+        let device = crate::MetalDevice::new(0).unwrap();
+        let commands = device.commands();
+        let cb = pending(commands);
+        let raw = device
+            .metal_device()
+            .new_buffer(4096, super::super::MTLResourceOptions::StorageModeShared)
+            .unwrap();
+        let pins = RetainUnknown(Some((device.clone(), cb.clone(), raw.clone())));
+        let runs = Arc::new(AtomicUsize::new(0));
+        let observed = runs.clone();
+        commands
+            .on_command_buffer_complete(move || {
+                observed.fetch_add(1, Ordering::Relaxed);
+            })
+            .unwrap();
+        let callbacks = Arc::new(AtomicUsize::new(0));
+        let observed = callbacks.clone();
+        cb.on_completion(move || {
+            observed.fetch_add(1, Ordering::Relaxed);
+        })
+        .unwrap();
+        let residency_before = commands.core.residency_set.counters().commits;
+        {
+            let mut blit = commands.blit_command_encoder().unwrap();
+            // SAFETY: independent raw pins survive until actual joined work.
+            unsafe { blit.fill_buffer(&raw, (0, 4096), 0x74) };
+        }
+        commands.ensure_completed(&cb).unwrap();
+        // Initial work is genuinely joined before any mutant assertion. No
+        // held host event, background worker or physical second commit exists.
+        let bytes = unsafe { std::slice::from_raw_parts(raw.contents(), 4096) };
+        let correct_bytes = bytes.iter().all(|byte| *byte == 0x74);
+        let (epoch, signalled) = {
+            let state = commands.lock_state().unwrap();
+            let (current, receipt) = state.current.submitted().unwrap();
+            assert!(current.same_recording(&cb));
+            (receipt.epoch, receipt.signalled)
+        };
+        let factories = (
+            commands.core.preflight_attempts.load(Ordering::Relaxed),
+            commands.core.replacement_attempts.load(Ordering::Relaxed),
+        );
+        commands.core.deny_preflight.store(true, Ordering::Relaxed);
+        commands
+            .core
+            .deny_replacement
+            .store(true, Ordering::Relaxed);
+        let first = commands.recover_pending_submission(&cb);
+        let second = commands.recover_pending_submission(&cb);
+        let after = (
+            commands.core.preflight_attempts.load(Ordering::Relaxed),
+            commands.core.replacement_attempts.load(Ordering::Relaxed),
+        );
+        pins.release(); // The original native work/callbacks were joined above.
+        if first.is_err() || second.is_err() {
+            eprintln!(
+                "CACHED_RECOVERY_REFUSAL native_calls={} epoch={} hook={} callback={} first={first:?} second={second:?}",
+                commands.core.submission_control.native_calls.load(Ordering::Relaxed),
+                commands.clock().current_epoch().0,
+                runs.load(Ordering::Relaxed),
+                callbacks.load(Ordering::Relaxed),
+            );
+        }
+        assert!(
+            first.is_ok_and(|value| value == signalled)
+                && second.is_ok_and(|value| value == signalled),
+            "cached owner recovery attempted resubmission instead of returning retained receipt"
+        );
+        assert!(correct_bytes);
+        assert_eq!(commands.clock().current_epoch().0, 1);
+        assert_eq!(commands.clock().completed_count().0, 1);
+        assert_eq!(runs.load(Ordering::Relaxed), 1);
+        assert_eq!(callbacks.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            commands
+                .core
+                .submission_control
+                .native_calls
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            commands.core.residency_set.counters().commits,
+            residency_before + 1
+        );
+        assert_eq!(after, factories, "receipt recovery invoked a slot factory");
+        let state = commands.lock_state().unwrap();
+        let (current, receipt) = state.current.submitted().unwrap();
+        assert!(current.same_recording(&cb));
+        assert_eq!(receipt.epoch, epoch);
+        assert_eq!(receipt.signalled, signalled);
+        assert!(state.in_flight.is_empty());
+        eprintln!("CACHED_RECOVERY actual_api={} native_calls=1 epoch=1 hook=1 callback=1 bytes=0x74 retained_receipt=true new_factory_calls=0", commands.actual_command_api_for_test());
+    }
+
     #[test]
     fn callback_reentry_before_return_publication_refuses_to_block() {
         let device = crate::MetalDevice::new(0).unwrap();

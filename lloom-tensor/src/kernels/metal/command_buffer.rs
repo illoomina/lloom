@@ -362,6 +362,26 @@ impl CommandBuffer {
     pub(super) fn same_recording(&self, other: &Self) -> bool {
         std::ptr::eq(self.lifecycle(), other.lifecycle())
     }
+
+    #[cfg(test)]
+    pub(super) fn test_direct_native_commit(&self) -> Result<(), crate::kernels::MetalKernelError> {
+        match &self.backend {
+            Backend::Metal3Associated(buffer) => buffer.try_commit(),
+            Backend::Metal4(submission) => submission.commit(),
+            Backend::Metal3(_) => self.commit(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn test_direct_native_prepare(
+        &self,
+    ) -> Result<(), crate::kernels::MetalKernelError> {
+        match &self.backend {
+            Backend::Metal3Associated(buffer) => buffer.prepare_commit().map(|_| ()),
+            Backend::Metal4(submission) => submission.prepare_commit().map(|_| ()),
+            Backend::Metal3(_) => self.prepare_commit().map(|_| ()),
+        }
+    }
     pub(super) fn binding_generation(
         &self,
     ) -> Result<
@@ -458,10 +478,9 @@ impl CommandBuffer {
         self.prepare_commit_mode(false, None)
     }
 
-    /// Sole host-retirement worker: an unused preparation restores recording
-    /// without waking itself. Normal producers wait on native-order mutexes;
-    /// unsubmitted logical waits refuse rather than parking on PREPARED.
-    /// Native return, error unwind and all public admissions retain notification.
+    /// Consume the exact owner authority. Nonblocking final retirement restores
+    /// an unused preparation without waking itself; normal producers preserve
+    /// existing native-order and lifecycle admissions.
     pub(super) fn prepare_owned_commit<'a>(
         &'a self,
         authority: super::commands::OwnerSubmission<'a>,

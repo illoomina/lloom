@@ -13,6 +13,11 @@
 //! Metal reports completions in. So the n-th run completes epoch n. A run that
 //! would complete an epoch not yet committed is that argument failing, and it
 //! latches a failure rather than mark it.
+//!
+//! Queue observers are configured before an irreversible setup seal. The seal
+//! excludes the entire snapshot publication interval atomically; submission
+//! refuses setup-busy before native preparation rather than locking against a
+//! publisher. Completions retain their one acquire load of immutable storage.
 
 use super::{commands::CommandBufferFailure, metal4::Feedback, GpuClock};
 use crate::retire::Epoch;
@@ -71,6 +76,12 @@ impl CompletionHook {
     #[cfg(test)]
     pub(super) fn while_subscribers_locked<R>(&self, f: impl FnOnce() -> R) -> R {
         let _published = self.subscribers.published.lock();
+        f()
+    }
+
+    #[cfg(test)]
+    pub(super) fn while_registration_held<R>(&self, f: impl FnOnce() -> R) -> R {
+        let _permit = self.subscribers.setup.register().expect("open setup");
         f()
     }
 
@@ -212,6 +223,71 @@ mod tests {
             start: 0.,
             end: 1.,
         }
+    }
+
+    #[test]
+    fn seal_refuses_while_registration_owns_publication() {
+        let (clock, _, hook) = hook();
+        let permit = hook.subscribers.setup.register().unwrap();
+        assert!(matches!(
+            hook.seal(),
+            Err(crate::kernels::MetalKernelError::SubscriberSetupBusy)
+        ));
+        assert_eq!(clock.current_epoch().0, 0);
+        let pointer = hook.subscribers.current.load(Ordering::Acquire);
+        let rejected = hook
+            .subscribe(Arc::new(|| panic!("busy observer installed")))
+            .unwrap_err();
+        assert!(matches!(
+            rejected.cause(),
+            crate::kernels::MetalKernelError::SubscriberSetupBusy
+        ));
+        assert_eq!(hook.subscribers.current.load(Ordering::Acquire), pointer);
+        drop(permit);
+        drop(rejected);
+        hook.subscribe(Arc::new(|| {})).unwrap();
+        hook.seal().unwrap();
+    }
+
+    #[test]
+    fn late_capture_is_returned_until_the_callers_locks_are_released() {
+        struct Probe {
+            lock: Arc<parking_lot::Mutex<()>>,
+            drops: Arc<AtomicUsize>,
+        }
+        impl Drop for Probe {
+            fn drop(&mut self) {
+                let _guard = self
+                    .lock
+                    .try_lock()
+                    .expect("callback capture dropped under producer lock");
+                self.drops.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        let (_, _, hook) = hook();
+        hook.seal().unwrap();
+        let lock = Arc::new(parking_lot::Mutex::new(()));
+        let drops = Arc::new(AtomicUsize::new(0));
+        let probe = Probe {
+            lock: lock.clone(),
+            drops: drops.clone(),
+        };
+        let guard = lock.lock();
+        let rejected = hook
+            .subscribe(Arc::new(move || {
+                let _ = &probe;
+            }))
+            .unwrap_err();
+        assert_eq!(drops.load(Ordering::Relaxed), 0);
+        drop(guard);
+        drop(rejected);
+        assert_eq!(drops.load(Ordering::Relaxed), 1);
+        assert_eq!(hook.subscribers.published.lock().len(), 1);
+        hook.seal().unwrap();
+        assert!(
+            hook.subscribe(Arc::new(|| {})).is_err(),
+            "model reset must not reopen setup"
+        );
     }
 
     /// The n-th run completes epoch n: the clock reads exactly the runs, and

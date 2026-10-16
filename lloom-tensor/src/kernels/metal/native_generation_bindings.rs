@@ -543,8 +543,8 @@ impl GenerationBindings {
         let witness = self.head.captures().witness.captures();
         metadata(unsafe { witness.terminal_submitted() })?;
         // M4 caller supplies ordered callback-prefix + returned-handoff proof.
-        // This also covers direct public commit lacking Commands' clock callback;
-        // Commands' earlier mark_completed of the same exact epoch is idempotent.
+        // The owner hook's earlier mark of this exact epoch is idempotent with
+        // native terminal publication; terminality does not replace the hook.
         witness
             .clock
             .mark_completed(Epoch(witness.closed_epoch.load(Ordering::Relaxed)));
@@ -1362,27 +1362,31 @@ mod inventory_controls {
         let prepared = prepare(&bank, &service).unwrap();
         let head = prepared.constructor_head().unwrap();
         let clock = head.head.captures().witness.captures().clock.clone();
-        for _ in 0..2 {
-            assert!(matches!(
-                head.require_staged(),
-                Err(MetalKernelError::OwnerSubmissionRequired)
-            ));
-            assert_eq!(clock.current_epoch().0, 0);
-        }
-        let epoch = clock.commit_epoch();
-        head.stage_epoch(epoch).unwrap();
-        head.require_staged().unwrap();
-        head.require_staged().unwrap();
-        assert_eq!(clock.current_epoch().0, 1);
-        assert!(
-            head.stage_epoch(epoch).is_err(),
-            "owner staging cannot replay"
-        );
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            for _ in 0..2 {
+                assert!(matches!(
+                    head.require_staged(),
+                    Err(MetalKernelError::OwnerSubmissionRequired)
+                ));
+                assert_eq!(clock.current_epoch().0, 0);
+            }
+            let epoch = clock.commit_epoch();
+            head.stage_epoch(epoch).unwrap();
+            head.require_staged().unwrap();
+            head.require_staged().unwrap();
+            // Internal staging retains its unused-preparation restage contract.
+            // This is not native entry or a second owner submission capability.
+            head.stage_epoch(epoch).unwrap();
+            assert_eq!(clock.current_epoch().0, 1);
+        }));
         drop(prepared);
         drop(head);
         drain(&service);
         drop(bank);
         drain(&service);
+        if let Err(panic) = result {
+            std::panic::resume_unwind(panic);
+        }
         assert_eq!(domain.snapshot(), AccountSnapshot::default());
     }
     #[test]

@@ -2222,6 +2222,13 @@ impl Commands {
         {
             return Ok(None);
         }
+        // A producer may have submitted, replaced and pruned this target
+        // between the caller's status read and this lock. Waiting submitted
+        // data needs no new authority and uses the blocking fallback if its
+        // original signal receipt has already left owner state.
+        if cb.status().0 >= MTLCommandBufferStatus::Committed.0 {
+            return Ok(None);
+        }
         Err(MetalKernelError::OwnerSubmissionRequired)
     }
 
@@ -2399,13 +2406,50 @@ impl CommandsCore {
                     buffer: cb,
                     clock: &self.clock,
                 };
-                let prepared = cb.prepare_owned_commit(authority, false)?;
-                let (_, removed) = self.residency_set.commit_pending_extracted();
-                *destination = Some(removed);
-                let t_residency = timed.map(|t| t.elapsed());
-                self.submit_prepared(prepared, timed, t_end_enc, t_residency)
+                self.submit_owned_recording(authority, destination, false, timed, t_end_enc)
             })
             .copied()
+    }
+
+    /// Exact owner authority and retained removal custody are the prerequisites
+    /// for every ordinary, final, or defensive owner submission. This body is
+    /// independent of replacement and cannot manufacture an owner from a queue.
+    fn submit_owned_recording(
+        &self,
+        authority: OwnerSubmission<'_>,
+        removals: &mut Option<PublishedRemovals>,
+        nonblocking: bool,
+        timed: Option<std::time::Instant>,
+        t_end_enc: Option<std::time::Duration>,
+    ) -> Result<CommitReceipt, MetalKernelError> {
+        if !Arc::ptr_eq(authority.clock, &self.clock) {
+            return Err(MetalKernelError::OwnerSubmissionRequired);
+        }
+        self.failure.check()?;
+        self.check_recording_status(authority.buffer)?;
+        self.hook.seal()?;
+        if removals.is_some() {
+            return Err(MetalKernelError::QueueUnavailable(
+                "residency custody already staged",
+            ));
+        }
+        let prepared = authority
+            .buffer
+            .prepare_owned_commit(authority, nonblocking)?;
+        let (_, removed) = if nonblocking {
+            self.residency_set
+                .try_commit_pending_extracted()
+                .map_err(|_| {
+                    MetalKernelError::RecordingAdmission(
+                        crate::command_lifecycle::LifecycleError::Busy,
+                    )
+                })?
+        } else {
+            self.residency_set.commit_pending_extracted()
+        };
+        *removals = Some(removed);
+        let t_residency = timed.map(|t| t.elapsed());
+        self.submit_prepared(prepared, timed, t_end_enc, t_residency)
     }
 
     fn check_recording_status(&self, cb: &CommandBuffer) -> Result<(), MetalKernelError> {
@@ -2778,24 +2822,7 @@ impl lifecycle::FinalCore for CommandsCore {
                     buffer: cb,
                     clock: &self.clock,
                 };
-                let prepared = cb.prepare_owned_commit(authority, true)?;
-                if captures.removals.is_some() {
-                    return Err(MetalKernelError::QueueUnavailable(
-                        "final residency custody already staged",
-                    ));
-                }
-                let (_, removals) =
-                    self.residency_set
-                        .try_commit_pending_extracted()
-                        .map_err(|_| {
-                            MetalKernelError::RecordingAdmission(
-                                crate::command_lifecycle::LifecycleError::Busy,
-                            )
-                        })?;
-                // Empty C was staged before entering this method. Even an unwind
-                // after this transfer leaves the opaque raw+charge payload rooted.
-                captures.removals = Some(removals);
-                self.submit_prepared(prepared, None, None, None)
+                self.submit_owned_recording(authority, &mut captures.removals, true, None, None)
             });
         match submitted {
             Ok(_) => Ok(true),
@@ -3045,5 +3072,236 @@ mod entry_release_tests {
         drop(CompletedRelease::new(&held, clock.completed_count()));
         assert_eq!(*drops.borrow(), ["eligible", "later", "last"]);
         assert!(held.lock().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod owner_submission_tests {
+    use super::*;
+    use crate::backend::BackendDevice;
+    use objc2_metal::{MTLDevice, MTLSharedEvent};
+
+    fn pending(commands: &Commands) -> CommandBuffer {
+        commands
+            .lock_state()
+            .unwrap()
+            .current
+            .recording()
+            .unwrap()
+            .clone()
+    }
+
+    #[test]
+    fn bound_public_and_native_refusal_preserve_work_for_owner_recovery() {
+        let device = crate::MetalDevice::new(0).unwrap();
+        let commands = device.commands();
+        let runs = Arc::new(AtomicUsize::new(0));
+        let observer = runs.clone();
+        commands
+            .on_command_buffer_complete(move || {
+                observer.fetch_add(1, Ordering::Relaxed);
+            })
+            .unwrap();
+        let cb = pending(commands);
+        let callbacks = Arc::new(AtomicUsize::new(0));
+        let callback = callbacks.clone();
+        cb.on_completion(move || {
+            callback.fetch_add(1, Ordering::Relaxed);
+        })
+        .unwrap();
+        let raw = device
+            .metal_device()
+            .new_buffer(4096, super::super::MTLResourceOptions::StorageModeShared)
+            .unwrap();
+        assert_eq!(commands.core.residency_set.add(&raw), 1);
+        {
+            let mut blit = commands.blit_command_encoder().unwrap();
+            // SAFETY: the test retains raw storage until its actual owner wait.
+            unsafe {
+                blit.fill_buffer(&raw, (0, 4096), 0x5a);
+            }
+        }
+        let status = cb.status();
+        let epoch = commands.clock().current_epoch();
+        let signals = commands.core.completion_signals.load(Ordering::Relaxed);
+        let residency_commits = commands.core.residency_set.counters().commits;
+        assert!(matches!(
+            cb.commit(),
+            Err(MetalKernelError::OwnerSubmissionRequired)
+        ));
+        assert!(matches!(
+            cb.test_direct_native_commit(),
+            Err(MetalKernelError::OwnerSubmissionRequired)
+        ));
+        assert!(matches!(
+            cb.test_direct_native_prepare(),
+            Err(MetalKernelError::OwnerSubmissionRequired)
+        ));
+        assert!(matches!(
+            cb.prepare_commit(),
+            Err(MetalKernelError::OwnerSubmissionRequired)
+        ));
+        assert_eq!(cb.status(), status);
+        assert_eq!(
+            commands.core.residency_set.counters().commits,
+            residency_commits
+        );
+        assert_eq!(commands.clock().current_epoch(), epoch);
+        assert_eq!(
+            commands.core.completion_signals.load(Ordering::Relaxed),
+            signals
+        );
+        assert_eq!(runs.load(Ordering::Relaxed), 0);
+        assert_eq!(callbacks.load(Ordering::Relaxed), 0);
+        commands.ensure_completed(&cb).unwrap();
+        commands.ensure_completed(&cb).unwrap();
+        assert_eq!(commands.clock().current_epoch().0, epoch.0 + 1);
+        assert_eq!(runs.load(Ordering::Relaxed), 1);
+        assert_eq!(callbacks.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            commands.core.residency_set.counters().commits,
+            residency_commits + 1
+        );
+        let consumed = OwnerSubmission {
+            buffer: &cb,
+            clock: &commands.core.clock,
+        };
+        assert!(
+            cb.prepare_owned_commit(consumed, false).is_err(),
+            "a submitted recording reopened"
+        );
+        assert_eq!(commands.clock().current_epoch().0, epoch.0 + 1);
+        let state = commands.lock_state().unwrap();
+        assert!(state.current.submitted().unwrap().0.same_recording(&cb));
+        assert!(
+            state.in_flight.is_empty(),
+            "recovery allocated a replacement"
+        );
+        drop(state);
+        // SAFETY: owner recovery joined this exact buffer's native work.
+        let data = unsafe { std::slice::from_raw_parts(raw.contents().cast::<u8>(), 4096) };
+        assert!(data.iter().all(|byte| *byte == 0x5a));
+        assert!(matches!(
+            commands
+                .on_command_buffer_complete(|| {})
+                .unwrap_err()
+                .cause(),
+            MetalKernelError::SubscriberConfigurationSealed
+        ));
+    }
+
+    #[test]
+    fn foreign_owner_and_wrong_recording_capabilities_refuse_before_preparation() {
+        let a = crate::MetalDevice::new(0).unwrap();
+        let b = crate::MetalDevice::new(0).unwrap();
+        let cb = pending(a.commands());
+        let other = pending(b.commands());
+        let authority = OwnerSubmission {
+            buffer: &other,
+            clock: &b.commands().core.clock,
+        };
+        assert!(matches!(
+            cb.prepare_owned_commit(authority, false),
+            Err(MetalKernelError::OwnerSubmissionRequired)
+        ));
+        assert!(matches!(
+            b.commands().recover_pending_submission(&cb),
+            Err(MetalKernelError::OwnerSubmissionRequired)
+        ));
+        let wrong_clock = OwnerSubmission {
+            buffer: &cb,
+            clock: &b.commands().core.clock,
+        };
+        assert!(matches!(
+            cb.prepare_owned_commit(wrong_clock, false),
+            Err(MetalKernelError::OwnerSubmissionRequired)
+        ));
+        assert_eq!(cb.status(), MTLCommandBufferStatus::NotEnqueued);
+        assert_eq!(a.commands().clock().current_epoch().0, 0);
+        assert_eq!(b.commands().clock().current_epoch().0, 0);
+        a.commands().ensure_completed(&cb).unwrap();
+    }
+
+    #[test]
+    fn publication_busy_refuses_owner_submission_before_an_epoch_then_recovers() {
+        let device = crate::MetalDevice::new(0).unwrap();
+        let commands = device.commands();
+        let cb = pending(commands);
+        commands.core.hook.while_registration_held(|| {
+            assert!(matches!(
+                commands.recover_pending_submission(&cb),
+                Err(MetalKernelError::SubscriberSetupBusy)
+            ));
+            assert_eq!(commands.clock().current_epoch().0, 0);
+            assert_eq!(cb.status(), MTLCommandBufferStatus::NotEnqueued);
+            assert!(commands.check_failed().is_ok());
+        });
+        commands.on_command_buffer_complete(|| {}).unwrap();
+        commands.ensure_completed(&cb).unwrap();
+        assert_eq!(commands.clock().current_epoch().0, 1);
+    }
+
+    #[test]
+    fn final_worker_uses_the_same_transaction_and_keeps_its_receipt() {
+        use lifecycle::FinalCore;
+        let device = crate::MetalDevice::new(0).unwrap();
+        let commands = device.commands();
+        let cb = pending(commands);
+        let mut captures = lifecycle::FinalCaptures::default();
+        assert!(commands.core.poll_final_submission(&mut captures).unwrap());
+        assert!(commands.core.poll_final_submission(&mut captures).unwrap());
+        commands.ensure_completed(&cb).unwrap();
+        assert_eq!(commands.clock().current_epoch().0, 1);
+        assert!(commands.core.poll_final_terminality().unwrap());
+        assert!(commands
+            .lock_state()
+            .unwrap()
+            .current
+            .submitted()
+            .unwrap()
+            .0
+            .same_recording(&cb));
+        drop(captures);
+    }
+
+    #[test]
+    fn standalone_raw_interoperability_remains_submittable() {
+        let device = Device::system_default().unwrap();
+        let queue = device.new_command_queue().unwrap();
+        let cb = CommandBuffer::new(
+            create_command_buffer(&queue, CommandBufferKind::Retaining).unwrap(),
+        );
+        cb.commit().unwrap();
+        cb.try_wait_until_completed().unwrap();
+        assert_eq!(cb.status(), MTLCommandBufferStatus::Completed);
+        if crate::tuning::tuning().metal.command_api == "metal4" {
+            let queue = super::super::metal4::Queue::new(device).unwrap();
+            let submission = queue.acquire().unwrap();
+            submission.commit().unwrap();
+            submission.try_wait().unwrap();
+            assert_eq!(submission.status(), MTLCommandBufferStatus::Completed);
+        }
+    }
+
+    #[test]
+    fn multiple_event_segments_are_one_owner_epoch_and_one_hook() {
+        let device = crate::MetalDevice::new(0).unwrap();
+        let commands = device.commands();
+        let runs = Arc::new(AtomicUsize::new(0));
+        let observed = runs.clone();
+        commands
+            .on_command_buffer_complete(move || {
+                observed.fetch_add(1, Ordering::Relaxed);
+            })
+            .unwrap();
+        let cb = pending(commands);
+        let event = device.metal_device().as_ref().newSharedEvent().unwrap();
+        cb.signal_event(&event, 1).unwrap();
+        cb.signal_event(&event, 2).unwrap();
+        commands.ensure_completed(&cb).unwrap();
+        assert_eq!(event.signaledValue(), 2);
+        assert_eq!(commands.clock().current_epoch().0, 1);
+        assert_eq!(commands.clock().completed_count().0, 1);
+        assert_eq!(runs.load(Ordering::Relaxed), 1);
     }
 }

@@ -34,6 +34,9 @@ impl Setup {
     }
 
     pub(crate) fn seal(&self) -> Result<(), Refusal> {
+        if self.0.load(Ordering::Acquire) == SEALED {
+            return Ok(());
+        }
         match self
             .0
             .compare_exchange(OPEN, SEALED, Ordering::AcqRel, Ordering::Acquire)

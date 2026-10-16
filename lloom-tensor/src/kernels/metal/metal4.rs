@@ -943,8 +943,9 @@ impl Submission {
         })
     }
 
-    /// Public submissions use the same prepared transaction as Commands. There
-    /// is no second legacy path that can bypass ordered retirement/custody.
+    /// Submit an unbound interoperability recording through ordered retirement.
+    /// Bound recordings refuse before native preparation; submit those through
+    /// their owning Commands transaction instead.
     pub fn commit(self: &Arc<Self>) -> Result<(), MetalKernelError> {
         self.prepare_commit()?.commit()
     }

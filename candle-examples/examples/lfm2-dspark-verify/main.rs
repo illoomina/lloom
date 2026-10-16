@@ -820,6 +820,10 @@ fn degeneracy(ids: &[u32]) -> Degeneracy {
 #[allow(clippy::too_many_arguments)]
 fn main() -> Result<()> {
     let args = Args::parse();
+    // Only --timing consumes close_bracket GPU intervals; accept-rate-only runs stay usable.
+    if args.timing {
+        candle_examples::require_profile_recorder("lfm2-dspark-verify")?;
+    }
     let key = shape_key();
     println!("PROFILE {key}");
     lloom::profile::dispatch!(key, lloom::profile::LFM2, P => run::<P>(args))

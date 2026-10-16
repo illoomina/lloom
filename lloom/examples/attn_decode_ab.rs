@@ -121,7 +121,8 @@ fn step(arm: Arm, q: &Tensor, k: &Tensor, v: &Tensor, n_rep: usize) -> Result<Te
 }
 
 /// One sample of `calls` steps: (host wall, GPU time) in microseconds per
-/// step, the GPU time `None` unless `CANDLE_METAL_PROFILE=1`.
+/// step, GPU time only when the detailed recorder is compiled and active;
+/// requesting cheap scalar profiling alone does not provide GPU intervals.
 #[allow(clippy::too_many_arguments)]
 fn sample(
     arm: Arm,
@@ -145,7 +146,8 @@ fn sample(
     }
     dev.synchronize()?;
     let wall = t.elapsed().as_secs_f64() * 1e6 / calls as f64;
-    let gpu = profile::enabled().then(|| profile::snapshot().gpu_busy_union_s * 1e6 / calls as f64);
+    let gpu = profile::recorder_enabled()
+        .then(|| profile::snapshot().gpu_busy_union_s * 1e6 / calls as f64);
     Ok((wall, gpu))
 }
 
@@ -158,9 +160,11 @@ fn quantile(v: &[f64], p: f64) -> f64 {
 
 fn main() -> Result<()> {
     let a = Args::parse();
+    let requested = lloom_tensor::tuning::try_tuning()?.instrument.profile;
+    let profiled = profile::recorder_enabled();
+    let gpu_status = gpu_status(requested, profiled);
     let dev = Device::new_metal(0)?;
     let n_rep = a.q_heads / a.kv_heads;
-    let profiled = profile::enabled();
     let dtype = match a.dtype.as_str() {
         "f16" => DType::F16,
         "f32" => DType::F32,
@@ -168,7 +172,7 @@ fn main() -> Result<()> {
     };
     println!(
         "attn_decode_ab: q_heads {} kv_heads {} {dtype:?} calls {} rounds {} chain {} gpu_time {} \
-         two_pass_k_override {} commit {}",
+         two_pass_k_override {} commit {} profile_requested={requested} recorder_active={profiled} gpu_status={gpu_status}",
         a.q_heads,
         a.kv_heads,
         a.calls,
@@ -240,15 +244,17 @@ fn main() -> Result<()> {
                     "SAMPLES hd={hd} kv={kv} slot={slot} arm={} wall_us={} gpu_us={}",
                     arm.name(),
                     fmt(&wall[s]),
-                    fmt(&gpu[s])
+                    if profiled {
+                        fmt(&gpu[s])
+                    } else if requested {
+                        "unavailable".to_string()
+                    } else {
+                        fmt(&gpu[s])
+                    }
                 );
             }
             // The verdict reads GPU time when it was taken, the wall otherwise.
-            let (series, by) = if profiled {
-                (&gpu, "gpu")
-            } else {
-                (&wall, "wall")
-            };
+            let (series, by) = selected_series(&wall, &gpu, profiled);
             let base = quantile(&series[0], 0.5);
             let mut line = format!(
                 "RESULT hd={hd} kv={kv} chain={} kv_copies={copies} by={by}",
@@ -273,4 +279,53 @@ fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn gpu_status(requested: bool, recorder_active: bool) -> &'static str {
+    if !requested {
+        "off"
+    } else if recorder_active {
+        "available"
+    } else {
+        "unavailable"
+    }
+}
+
+/// Select only populated, actually available timing series. Scalar-profile
+/// requests in shipping retain useful wall data rather than a 0/0 GPU ratio.
+fn selected_series<'a>(
+    wall: &'a [Vec<f64>],
+    gpu: &'a [Vec<f64>],
+    recorder_active: bool,
+) -> (&'a [Vec<f64>], &'static str) {
+    if recorder_active {
+        (gpu, "gpu")
+    } else {
+        (wall, "wall")
+    }
+}
+
+#[cfg(test)]
+mod profile_series_tests {
+    use super::*;
+    #[test]
+    fn absent_or_disabled_recorder_selects_wall_not_empty_gpu() {
+        let wall = vec![vec![12.0, 14.0]];
+        let gpu = vec![Vec::new()];
+        let (series, by) = selected_series(&wall, &gpu, false);
+        assert_eq!(by, "wall");
+        assert_eq!(quantile(&series[0], 0.5), 14.0);
+        assert_eq!(gpu_status(true, false), "unavailable");
+        assert_eq!(gpu_status(false, false), "off");
+        assert_eq!(gpu_status(false, true), "off");
+    }
+    #[test]
+    fn active_recorder_selects_real_gpu_including_measured_zero() {
+        let wall = vec![vec![12.0, 14.0]];
+        let gpu = vec![vec![0.0, 2.0]];
+        let (series, by) = selected_series(&wall, &gpu, true);
+        assert_eq!(by, "gpu");
+        assert_eq!(series[0], vec![0.0, 2.0]);
+        assert_eq!(gpu_status(true, true), "available");
+    }
 }

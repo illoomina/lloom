@@ -1844,22 +1844,7 @@ fn decode_throughput(shared: &Shared, v: &Value) -> Handled<Value> {
         } else {
             t.row_rounds.iter().copied().max().unwrap_or(1).max(1) as f64
         };
-        eprintln!(
-            "[/decode_throughput profile: gpu_busy {:.2} ms over the bracket ({:.3} ms per step/round of {steps:.0}), span {:.2} ms, {} dispatches ({:.1} per step), {} command buffers, {} encoders; top kernels: {}]",
-            p.gpu_busy_ms,
-            p.gpu_busy_ms / steps,
-            p.gpu_span_ms,
-            p.dispatches,
-            p.dispatches as f64 / steps,
-            p.command_buffers,
-            p.encoders,
-            p.by_label
-                .iter()
-                .take(12)
-                .map(|(k, n)| format!("{k}={n}"))
-                .collect::<Vec<_>>()
-                .join(" ")
-        );
+        eprintln!("[/decode_throughput profile: {}]", p.summary(steps));
     }
     if !t.row_rounds.is_empty() {
         // The round's phases, per round, on the row that ran the most rounds

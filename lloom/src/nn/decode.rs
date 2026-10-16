@@ -3314,14 +3314,19 @@ impl<'m, M: CausalLM> Session<'m, M> {
             // The census is one round's worth of allocation; take it once,
             // past the warm-up rounds, so the breakdown carries which kernels
             // each phase dispatches and not only how many.
-            let probe = RoundProbe {
+            let mut probe = RoundProbe {
                 sync: if opts.sample_split {
                     Some(&device)
                 } else {
                     None
                 },
-                census: opts.sample_split && stats.steps == CENSUS_ROUND,
+                census: false,
             };
+            // This automatic enrichment must not turn host/scalar sample_split
+            // into an unsupported explicit detailed-census request.
+            probe.census = opts.sample_split
+                && stats.steps == CENSUS_ROUND
+                && probe.detailed_recorder_active();
             // The verify is a planned pass of `K + 1` positions
             // (`DESIGN.md` §9.2aa): the drafter's own forwards and the
             // observe are OUTSIDE it — they run on the drafter's model and

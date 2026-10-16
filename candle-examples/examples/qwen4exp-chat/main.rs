@@ -697,8 +697,10 @@ fn main() -> Result<()> {
     // `Ring` under `--mtp` (the verify window's rings), `Paged` when the
     // rows share a pool (`--rows N --rows-pool`, or `--mtp` over rows); the
     // regime from the contract the harness pins below.
-    candle::tuning::pin_contract(candle::tuning::Contract::Deterministic)
-        .map_err(anyhow::Error::msg)?;
+    candle_examples::pin_profiled_contract(
+        "qwen4exp-chat",
+        candle::tuning::Contract::Deterministic,
+    )?;
     use lloom::profile::{NoRewind, One, Paged, Rewind as _, Ring, Rows as _};
     let key = lloom::profile::ProfileKey::at_contract(
         if args.mtp.is_some() || args.dflash.is_some() {

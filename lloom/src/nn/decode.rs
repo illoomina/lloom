@@ -78,6 +78,9 @@ use crate::nn::speculator::{
 };
 use lloom_tensor::{Device, Result, Tensor};
 
+mod prefill_work;
+use prefill_work::PrefillWork;
+
 /// The K=1 identity proposer: drafts nothing, so the loop takes the baseline
 /// body. Stage 1's only admitted family.
 #[derive(Debug, Clone, Copy, Default)]
@@ -2873,33 +2876,37 @@ impl<'m, M: CausalLM> Session<'m, M> {
     where
         R: ReadbackStrategy,
     {
+        let work = PrefillWork::single(opts, self.seq.pos, prompt.len(), pace)?;
+        self.prefill_forwards_prepared(readback, prompt, &work, pacer)
+    }
+
+    /// Execute the resolved outer forwards without rescheduling. This seam
+    /// carries no admission promise; ordinary callers resolve work locally.
+    fn prefill_forwards_prepared<R>(
+        &mut self,
+        readback: &mut R,
+        prompt: &[u32],
+        work: &PrefillWork,
+        pacer: &mut StepPacer,
+    ) -> Result<(Option<Tensor>, usize)>
+    where
+        R: ReadbackStrategy,
+    {
+        if work.start() != self.seq.pos
+            || work.end().checked_sub(work.start()) != Some(prompt.len())
+        {
+            lloom_tensor::bail!("prepared prefill work no longer matches the sequence");
+        }
         let device = readback.device().clone();
-        // The widths of the forwards this prompt is fed through, in order:
-        // the incumbent ramp (one-shot, or spark then remainder), the explicit
-        // schedule with its tail, and the tile bound over either. Computed
-        // once, in the prologue; the steady loop never reads it.
-        let widths = tile_widths(
-            prefill_widths(
-                prompt.len(),
-                opts.prefill_ubatch(),
-                &opts.prefill_schedule,
-                opts.prefill_bulk,
-            ),
-            opts.prefill_tile,
-        );
-        // A prefill of more than one forward is paced whatever the arm: on
-        // the blocking arm nothing else bounds the units in flight (its own
-        // readback comes per decode step, and a prompt unit produces none),
-        // so the host would encode every tile back to back with all of their
-        // activations pending at once — 11.3 GB for an 8192-token prompt in
-        // 512-token tiles against 4.5 GB paced, the tile bounding nothing
-        // (issue #148, `measurements/issue-148-serving-batch.md` §7). A
-        // one-unit prefill keeps the arm's own command stream.
-        let pace = pace || widths.len() > 1;
+        if let Some(depth) = work.active_depth() {
+            pacer.set_depth(depth);
+        }
+        let pace = work.active_depth().is_some();
         let mut last_logits = None;
         let mut units = 0usize;
         let mut off = 0usize;
-        for w in widths {
+        for span in work.forwards() {
+            let w = span.width;
             // Drains this unit's autoreleased encoders and command buffers
             // when the iteration ends (`AutoreleaseScope` docs).
             let _pool = lloom_tensor::AutoreleaseScope::new();
@@ -2920,12 +2927,12 @@ impl<'m, M: CausalLM> Session<'m, M> {
                 &device,
                 PassShape::Prefill {
                     w,
-                    fresh: self.seq.pos == 0,
+                    fresh: span.past == 0,
                 },
             )?;
             let out = self
                 .model
-                .forward(&input, self.seq.pos, &mut self.seq.cache)?
+                .forward(&input, span.past, &mut self.seq.cache)?
                 .squeeze(0)?;
             end_pass(&device)?;
             if pace {

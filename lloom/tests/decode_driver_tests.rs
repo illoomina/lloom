@@ -1121,6 +1121,148 @@ fn a_ring_reader_sees_the_loops_stream_off_the_ring() -> Result<()> {
     Ok(())
 }
 
+/// Reuse the chain's computation while observing actual production forwards.
+struct RecordingChain {
+    chain: Chain,
+    forwards: std::cell::RefCell<Vec<(usize, usize)>>,
+}
+
+impl RecordingChain {
+    fn cpu() -> Result<Self> {
+        Ok(Self {
+            chain: Chain::new(&Device::Cpu)?,
+            forwards: std::cell::RefCell::new(Vec::new()),
+        })
+    }
+}
+
+impl Model for RecordingChain {
+    type Config = ();
+
+    fn from_weights(_vb: lloom::nn::VarBuilder, _cfg: &()) -> Result<Self> {
+        lloom_tensor::bail!("RecordingChain has no weights")
+    }
+}
+
+impl CausalLM for RecordingChain {
+    type Cache = usize;
+
+    fn new_cache(&self, cfg: &(), device: &Device) -> Result<usize> {
+        self.chain.new_cache(cfg, device)
+    }
+
+    fn embed(&self, tokens: &Tensor) -> Result<Tensor> {
+        self.chain.embed(tokens)
+    }
+
+    fn forward_embeds(&self, embeds: &Tensor, pos: usize, cache: &mut usize) -> Result<Tensor> {
+        self.forwards.borrow_mut().push((pos, embeds.dim(1)?));
+        self.chain.forward_embeds(embeds, pos, cache)
+    }
+
+    fn vocab_size(&self) -> usize {
+        self.chain.vocab_size()
+    }
+}
+
+#[test]
+fn actual_prefill_work_session_cpu_records_literal_forwards() -> Result<()> {
+    eprintln!("EXECUTABLE {}", std::env::current_exe().unwrap().display());
+    let model = RecordingChain::cpu()?;
+    let mut session = Session::with_pos(&model, 17, 17);
+    let mut rb = Blocking::new(&[EOS], &Device::Cpu)?;
+    let mut options = DecodeOptions::new(1);
+    options.prefill_ubatch = 3;
+    options.prefill_tile = 4;
+    options.in_flight_depth = 65;
+    let prompt = [9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 0];
+    assert_eq!(session.prefill(&mut rb, &prompt, &options)?.units, 3);
+    assert_eq!(*model.forwards.borrow(), [(17, 3), (20, 4), (24, 4)]);
+    eprintln!(
+        "ACTUAL Session::prefill tiled forwards={:?}",
+        model.forwards.borrow()
+    );
+    assert_eq!(session.pos(), 28);
+    assert_eq!(session.tokens(), prompt);
+    assert_eq!(*session.sequence().cache(), 28);
+    let held = session.last_logits().unwrap().to_vec1::<f32>()?;
+    let mut expected = vec![0.0; VOCAB];
+    expected[3] = 1.0;
+    assert_eq!(held, expected);
+    assert_eq!(
+        session.prefill(&mut rb, &[], &options)?,
+        lloom::nn::PrefillOut::default()
+    );
+    assert_eq!(*model.forwards.borrow(), [(17, 3), (20, 4), (24, 4)]);
+    assert_eq!(session.last_logits().unwrap().to_vec1::<f32>()?, expected);
+
+    model.forwards.borrow_mut().clear();
+    options.prefill_tile = 0;
+    options.prefill_schedule = Some(vec![3]);
+    options.prefill_bulk = 4;
+    options.prefill_pacer_depth = 1;
+    assert_eq!(session.prefill(&mut rb, &[9; 9], &options)?.units, 4);
+    assert_eq!(
+        *model.forwards.borrow(),
+        [(28, 3), (31, 4), (35, 1), (36, 1)]
+    );
+    eprintln!(
+        "ACTUAL Session::prefill scheduled forwards={:?}",
+        model.forwards.borrow()
+    );
+    assert_eq!(session.pos(), 37);
+    assert_eq!(*session.sequence().cache(), 37);
+
+    model.forwards.borrow_mut().clear();
+    options.prefill_schedule = None;
+    assert_eq!(session.prefill(&mut rb, &prompt, &options)?.units, 2);
+    assert_eq!(*model.forwards.borrow(), [(37, 3), (40, 8)]);
+    eprintln!(
+        "ACTUAL Session::prefill tile0 forwards={:?}",
+        model.forwards.borrow()
+    );
+    assert_eq!(session.pos(), 48);
+    Ok(())
+}
+
+#[test]
+fn actual_prefill_work_k1_cpu_records_literal_forwards() -> Result<()> {
+    let model = RecordingChain::cpu()?;
+    let mut session = Session::with_pos(&model, 17, 17);
+    let mut rb = Blocking::new(&[EOS], &Device::Cpu)?;
+    let options = DecodeOptions {
+        prefill_ubatch: 3,
+        prefill_tile: 4,
+        in_flight_depth: 3,
+        prefill_pacer_depth: 8,
+        ..DecodeOptions::new(1)
+    };
+    let prompt = [9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 0];
+    let out = session.decode(
+        &mut IdentityProposer,
+        &mut rb,
+        &mut greedy(),
+        &prompt,
+        &options,
+        &mut sink,
+    )?;
+    assert_eq!(out.stats.prefill_units, 3);
+    assert_eq!(out.ids, [3]);
+    assert!(!out.eos);
+    assert_eq!(
+        *model.forwards.borrow(),
+        [(17, 3), (20, 4), (24, 4), (28, 1)]
+    );
+    eprintln!(
+        "ACTUAL Session::decode K=1 forwards={:?}",
+        model.forwards.borrow()
+    );
+    assert_eq!(session.pos(), 29);
+    assert_eq!(*session.sequence().cache(), 29);
+    assert_eq!(session.tokens(), [9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 0, 3]);
+    Ok(())
+}
+
 /// The TILE (lloom #728): a tiled prefill takes `ceil(prompt / tile)`
 /// forwards — counted off the run, not computed from the option — and the
 /// ids, the position and the token log are one-shot's. On a ring arm under

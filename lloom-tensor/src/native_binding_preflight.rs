@@ -4,6 +4,7 @@
 /// Obtain all fallible custody before consuming a nonrecycled attempt credit.
 /// Error drops P on this caller: production P MUST be counted metadata/pin only;
 /// this generic ordering helper itself establishes no native destructor contract.
+#[cfg(test)]
 pub(crate) fn prepare_before_reserve<P, S, E>(
     prepare: impl FnOnce() -> Result<P, E>,
     reserve: impl FnOnce() -> Result<S, E>,

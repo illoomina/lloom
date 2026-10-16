@@ -116,6 +116,7 @@ pub(crate) struct ProcessAccount {
 }
 
 impl ProcessAccount {
+    #[cfg(test)]
     pub fn new(cap: Option<usize>) -> Arc<Self> {
         Arc::new(Self {
             state: Mutex::new(State {

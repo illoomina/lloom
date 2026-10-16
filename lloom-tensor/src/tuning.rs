@@ -878,7 +878,10 @@ fn parse_oversize_bound(v: &str) -> Result<Option<f64>, String> {
         return Ok(None);
     }
     let f = parse_number(v).map_err(|e| format!("reuse oversize bound: {e}"))?;
-    if !(f >= 1.0) {
+    if !matches!(
+        f.partial_cmp(&1.0),
+        Some(std::cmp::Ordering::Equal | std::cmp::Ordering::Greater)
+    ) {
         return Err(format!("reuse oversize bound {f} must be >= 1.0"));
     }
     Ok(Some(f))
@@ -1829,6 +1832,42 @@ mod tests {
             None,
             "with its arm off the window routes nothing"
         );
+    }
+
+    /// Threshold comparison keeps the finite-number grammar's earlier refusal.
+    /// Pure parser calls only: no process tuning installation or native work.
+    #[test]
+    fn reuse_oversize_bound_keeps_finite_grammar_threshold_and_default() {
+        assert_eq!(PoolTuning::default().reuse_oversize_bound, None);
+        for input in ["none", " NoNe ", "\tnone\n"] {
+            assert_eq!(parse_oversize_bound(input), Ok(None), "{input:?}");
+        }
+        for (input, expected) in [
+            ("1", 1.0_f64),
+            ("1e0", 1.0),
+            (" 1.5 ", 1.5),
+            ("1.0000000000000002", f64::from_bits(1.0_f64.to_bits() + 1)),
+            ("1.7976931348623157e308", f64::MAX),
+        ] {
+            let got = parse_oversize_bound(input).unwrap().unwrap();
+            assert_eq!(got.to_bits(), expected.to_bits(), "{input:?}");
+        }
+        for (input, message) in [
+            ("-1", "reuse oversize bound -1 must be >= 1.0"),
+            ("-0", "reuse oversize bound -0 must be >= 1.0"),
+            ("0", "reuse oversize bound 0 must be >= 1.0"),
+            ("0.9999999999999999", "reuse oversize bound 0.9999999999999999 must be >= 1.0"),
+            ("NaN", "reuse oversize bound: `NaN` is not a finite number"),
+            ("inf", "reuse oversize bound: `inf` is not a finite number"),
+            ("-inf", "reuse oversize bound: `-inf` is not a finite number"),
+            ("1e999", "reuse oversize bound: `1e999` is not a finite number"),
+            ("off", "reuse oversize bound: `off` is not a finite number"),
+            ("not-a-number", "reuse oversize bound: `not-a-number` is not a finite number"),
+            ("", "reuse oversize bound: an empty value is refused (`none` unsets an optional key)"),
+            (" ", "reuse oversize bound: an empty value is refused (`none` unsets an optional key)"),
+        ] {
+            assert_eq!(parse_oversize_bound(input), Err(message.into()), "{input:?}");
+        }
     }
 
     #[test]

@@ -3434,6 +3434,34 @@ mod owner_submission_tests {
     ) {
         let device = crate::MetalDevice::new(0).unwrap();
         let commands = device.commands();
+        let actual_api = if commands.core.modern_queue.is_some() {
+            "metal4"
+        } else {
+            "metal3"
+        };
+        let requested = &crate::tuning::tuning().metal;
+        if requested.command_api != "auto" {
+            assert_eq!(actual_api, requested.command_api);
+        }
+        let arm = commands.completion_wait();
+        assert_eq!(
+            arm,
+            CompletionWait::from_str_arm(&requested.completion_wait).unwrap()
+        );
+        if let Ok(selected) = std::env::var("LLOOM_METAL_API") {
+            if selected != "auto" {
+                assert_eq!(actual_api, selected);
+            }
+        }
+        if let Ok(selected) = std::env::var("CANDLE_METAL_COMPLETION_WAIT") {
+            assert_eq!(arm, CompletionWait::from_str_arm(&selected).unwrap());
+        }
+        assert_eq!(commands.completion_event_present(), arm.needs_event());
+        eprintln!(
+            "OWNER_DRAIN_ARM actual_api={actual_api} resolved_wait={} event={} current_only={current_only} force_unwind={force_unwind}",
+            arm.name(),
+            commands.completion_event_present()
+        );
         let cb = pending(commands);
         let runs = Arc::new(AtomicUsize::new(0));
         let observer = runs.clone();
@@ -3499,6 +3527,17 @@ mod owner_submission_tests {
                     crate::memory_admission::AllocationError::HostAllocation
                 )
             ));
+            let signalled = commands
+                .lock_state()
+                .unwrap()
+                .current
+                .submitted()
+                .expect("handoff retained original receipt")
+                .1
+                .signalled;
+            assert_eq!(signalled.is_some(), arm.needs_event());
+            assert_eq!(commands.completion_counts().0, u64::from(arm.needs_event()));
+            eprintln!("OWNER_DRAIN_HANDOFF encoded_signal={signalled:?} epoch=1");
             if force_unwind {
                 panic!("controlled post-handoff pending-work fixture unwind");
             }
@@ -3553,6 +3592,17 @@ mod owner_submission_tests {
             );
             // Readback waits promise data/error, not arbitrary callback return.
             cb.try_wait_until_completed().unwrap();
+            let (signals, polls) = commands.completion_counts();
+            if current_only && arm.polls() {
+                assert!(polls > 0, "current readback did not engage its polling arm");
+            }
+            if !current_only {
+                assert_eq!(polls, 0, "full public drain must retain blocking route");
+            }
+            eprintln!(
+                "OWNER_DRAIN_READBACK actual_api={actual_api} resolved_wait={} current_only={current_only} signals={signals} polls={polls} already_complete={}",
+                arm.name(), commands.completion_already_complete()
+            );
             assert_eq!(
                 commands.core.replacement_attempts.load(Ordering::Relaxed),
                 replacements

@@ -4,7 +4,7 @@ use super::MetalKernelError;
 use objc2::{rc::Retained, runtime::ProtocolObject};
 use objc2_metal::MTLSharedEvent;
 use std::sync::{
-    atomic::{AtomicU8, AtomicUsize, Ordering},
+    atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering},
     Condvar, Mutex,
 };
 
@@ -22,6 +22,8 @@ pub(crate) struct Control {
     fault: AtomicU8,
     pub native_calls: AtomicUsize,
     pub entry_checks: AtomicUsize,
+    required_residency: AtomicU64,
+    observed_residency: AtomicU64,
     observer: Mutex<Option<Retained<ProtocolObject<dyn MTLSharedEvent>>>>,
     pause: Mutex<(bool, bool)>, // (at return boundary, released)
     changed: Condvar,
@@ -37,6 +39,13 @@ impl Control {
             .is_ok()
     }
     pub fn registration(&self) -> Result<(), MetalKernelError> {
+        if self.observed_residency.load(Ordering::Acquire)
+            < self.required_residency.load(Ordering::Acquire)
+        {
+            return Err(MetalKernelError::QueueUnavailable(
+                "owner residency prerequisite absent before epoch",
+            ));
+        }
         if self.take(Fault::Registration) {
             Err(MetalKernelError::QueueUnavailable(
                 "injected completion registration refusal",
@@ -44,6 +53,15 @@ impl Control {
         } else {
             Ok(())
         }
+    }
+    pub fn require_residency_after(&self, baseline: u64) {
+        self.required_residency.store(
+            baseline.checked_add(1).expect("test counter capacity"),
+            Ordering::Release,
+        );
+    }
+    pub fn observe_residency(&self, calls: u64) {
+        self.observed_residency.store(calls, Ordering::Release);
     }
     pub fn before_entry(&self) -> Result<(), MetalKernelError> {
         self.entry_checks.fetch_add(1, Ordering::Relaxed);
@@ -107,5 +125,27 @@ mod tests {
         control.arm(Fault::HoldReturn);
         control.before_return(); // Release-before-arrival must not lose a wake.
         assert!(control.wait_for_pause());
+    }
+
+    #[test]
+    fn missing_residency_callsite_is_refused_before_any_native_entry() {
+        let absent = crate::kernels::metal::residency_set::PublishedRemovals::empty_for_test();
+        assert!(absent.is_empty());
+        drop(absent); // No allocation/custody/native publication is fabricated.
+        let control = Control::default();
+        control.require_residency_after(7);
+        control.observe_residency(7);
+        assert!(matches!(
+            control.registration(),
+            Err(MetalKernelError::QueueUnavailable(
+                "owner residency prerequisite absent before epoch"
+            ))
+        ));
+        assert_eq!(control.entry_checks.load(Ordering::Relaxed), 0);
+        assert_eq!(control.native_calls.load(Ordering::Relaxed), 0);
+        control.observe_residency(8);
+        control.registration().unwrap();
+        // Counter observation proves a call site, not that a native driver
+        // applied residency. Actual native readback is a distinct control.
     }
 }

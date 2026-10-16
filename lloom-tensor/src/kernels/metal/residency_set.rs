@@ -136,6 +136,12 @@ pub fn join_device_retirement(deadline: Instant) -> DeviceRetirementReport {
 #[must_use = "published custody must leave outer caller locks before destruction"]
 pub(crate) struct PublishedRemovals(Vec<ResidencyLease>);
 impl PublishedRemovals {
+    /// Omission mutants only: no publication or ownership is manufactured.
+    /// Their prerequisite observer must refuse before epoch/native entry.
+    #[cfg(test)]
+    pub(crate) fn empty_for_test() -> Self {
+        Self(Vec::new())
+    }
     pub(crate) fn is_empty(&self) -> bool {
         self.0.is_empty()
     }

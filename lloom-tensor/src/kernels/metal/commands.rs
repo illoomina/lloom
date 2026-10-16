@@ -2522,6 +2522,9 @@ impl CommandsCore {
             self.residency_set.commit_pending_extracted()
         };
         *removals = Some(removed);
+        #[cfg(test)]
+        self.submission_control
+            .observe_residency(self.residency_set.counters().commits);
         let t_residency = timed.map(|t| t.elapsed());
         self.submit_prepared(prepared, timed, t_end_enc, t_residency)
     }
@@ -3243,6 +3246,58 @@ mod owner_submission_tests {
         // SAFETY: successful exact owner/native join completed this write.
         let bytes = unsafe { std::slice::from_raw_parts(raw.contents(), 4096) };
         assert!(bytes.iter().all(|byte| *byte == 0x6a));
+        pins.release();
+    }
+
+    #[test]
+    fn residency_prerequisite_callsite_precedes_epoch_and_native_entry() {
+        let device = crate::MetalDevice::new(0).unwrap();
+        let commands = device.commands();
+        let cb = pending(commands);
+        let raw = device
+            .metal_device()
+            .new_buffer(4096, super::super::MTLResourceOptions::StorageModeShared)
+            .unwrap();
+        let pins = RetainUnknown(Some((device.clone(), cb.clone(), raw.clone())));
+        let baseline = commands.core.residency_set.counters().commits;
+        commands
+            .core
+            .submission_control
+            .require_residency_after(baseline);
+        assert_eq!(commands.core.residency_set.add(&raw), 1);
+        {
+            let mut blit = commands.blit_command_encoder().unwrap();
+            // SAFETY: independent raw owners survive refusal/assertion unwind.
+            unsafe { blit.fill_buffer(&raw, (0, 4096), 0x68) };
+        }
+        let result = commands.ensure_completed(&cb);
+        if matches!(
+            &result,
+            Err(MetalKernelError::QueueUnavailable(
+                "owner residency prerequisite absent before epoch"
+            ))
+        ) {
+            assert_eq!(commands.clock().current_epoch().0, 0);
+            assert_eq!(
+                commands
+                    .core
+                    .submission_control
+                    .native_calls
+                    .load(Ordering::Relaxed),
+                0
+            );
+            eprintln!(
+                "RESIDENCY_PREREQUISITE_REFUSAL epoch=0 native_calls=0 custody_retained=true"
+            );
+        }
+        result.expect("owner residency prerequisite must precede native entry");
+        assert!(commands.core.residency_set.counters().commits > baseline);
+        assert_eq!(commands.clock().current_epoch().0, 1);
+        assert_eq!(commands.clock().completed_count().0, 1);
+        // SAFETY: successful native join proves these actual writes complete.
+        // This is not inferred from the call-site counter above.
+        let bytes = unsafe { std::slice::from_raw_parts(raw.contents(), 4096) };
+        assert!(bytes.iter().all(|byte| *byte == 0x68));
         pins.release();
     }
 

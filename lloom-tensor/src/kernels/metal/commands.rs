@@ -371,6 +371,14 @@ pub struct Commands {
 }
 
 struct CommandsCore {
+    #[cfg(test)]
+    deny_replacement: AtomicBool,
+    #[cfg(test)]
+    deny_preflight: AtomicBool,
+    #[cfg(test)]
+    replacement_attempts: AtomicUsize,
+    #[cfg(test)]
+    preflight_attempts: AtomicUsize,
     // Actual control owner; neither Generation/Page C retains this bank/Core.
     binding_bank: Option<super::native_generation_bindings::BindingBank>,
     // Retain service notification custody independently of installed state and
@@ -935,6 +943,14 @@ impl Commands {
             _retirement_wake: retirement_wake,
             encoder_domain,
             state: CachePadded::new(Censused::new(parking_lot::Mutex::new(state))),
+            #[cfg(test)]
+            deny_replacement: AtomicBool::new(false),
+            #[cfg(test)]
+            deny_preflight: AtomicBool::new(false),
+            #[cfg(test)]
+            replacement_attempts: AtomicUsize::new(0),
+            #[cfg(test)]
+            preflight_attempts: AtomicUsize::new(0),
             compute_count: CachePadded::new(AtomicUsize::new(0)),
             replacement_pending: CachePadded::new(AtomicBool::new(false)),
             command_queue,
@@ -1189,7 +1205,9 @@ impl Commands {
     /// setup. Model hot-swap never reopens this queue configuration. Model and
     /// request notifications use per-record/request completion APIs instead.
     /// Rejected callback ownership is returned in the error; drop it outside
-    /// producer locks. Callbacks must not acquire encoding-thread locks or
+    /// producer locks. Concurrent setup registration returns setup-busy and
+    /// can be retried after the active publication finishes.
+    /// Callbacks must not acquire encoding-thread locks or
     /// block on their own queue.
     pub fn on_command_buffer_complete<F: Fn() + Send + Sync + 'static>(
         &self,
@@ -1317,16 +1335,42 @@ impl Commands {
     }
 
     fn lock_recording_state(&self) -> Result<EntryGuard<'_>, MetalKernelError> {
+        self.lock_preflight_state::<false>()
+    }
+
+    fn lock_drain_state(&self) -> Result<EntryGuard<'_>, MetalKernelError> {
+        self.core.failure.check()?;
+        if let Some(queue) = &self.core.modern_queue {
+            queue.check_failure()?;
+        }
+        if let Some(core) = &self.core.legacy_completions {
+            core.check()?;
+        }
+        self.lock_preflight_state::<true>()
+    }
+
+    fn lock_preflight_state<const DRAIN_RETAINED: bool>(
+        &self,
+    ) -> Result<EntryGuard<'_>, MetalKernelError> {
         let Some(bank) = self.core.binding_bank.as_ref() else {
             return self.lock_state();
         };
         loop {
             let state = self.lock_state()?;
-            if state.binding_credits.iter().all(Option::is_some) {
+            if (DRAIN_RETAINED && state.current.submitted().is_some())
+                || state.binding_credits.iter().all(Option::is_some)
+            {
                 return Ok(state);
             }
             drop(state);
             self.check_failed_atomic()?;
+            #[cfg(test)]
+            {
+                self.core.preflight_attempts.fetch_add(1, Ordering::Relaxed);
+                if self.core.deny_preflight.load(Ordering::Relaxed) {
+                    return Err(crate::memory_admission::AllocationError::HostAllocation.into());
+                }
+            }
             // Typed Full/refill BEFORE EntryState/native acquisition. Any
             // raced unused metadata credit drops only after the guard releases.
             let mut prepared = Some(bank.prepare_before_entry()?);
@@ -1553,9 +1597,11 @@ impl Commands {
         self.flush_and_wait()
     }
 
+    /// Drain a retained successful submission without refilling metadata or
+    /// allocating its replacement. Ordinary recording cuts retain swap policy.
     pub fn flush_and_wait(&self) -> Result<(), MetalKernelError> {
         let (to_wait, retained_current, commit_error) = {
-            let mut state = self.lock_recording_state()?;
+            let mut state = self.lock_drain_state()?;
             let commit_error = if state.current.submitted().is_none()
                 && self.core.compute_count.load(Ordering::Acquire) > 0
             {
@@ -1605,6 +1651,8 @@ impl Commands {
     /// Commit the current command buffer and wait on that specific buffer, for CPU readbacks.
     /// [`Self::wait_until_completed`] waits on the last in-flight buffer, which a concurrent
     /// `flush_and_wait` on another thread may already have taken, returning before our work ran.
+    /// After replacement refusal, retry waits on the retained receipt and its
+    /// original signal; replacement remains the next recording producer's job.
     ///
     /// **This is the per-token serialization point** (`DESIGN.md` §11.5a: 441
     /// µs/token, 2.43 % of a step) and therefore the one call routed through
@@ -1614,9 +1662,13 @@ impl Commands {
     /// path blocks.
     pub fn flush_and_wait_current(&self) -> Result<(), MetalKernelError> {
         let (cb, signalled) = {
-            let mut state = self.lock_recording_state()?;
-            let signalled = self.commit_swap_locked(&mut state, 0)?;
-            (state.in_flight.last().cloned(), signalled)
+            let mut state = self.lock_drain_state()?;
+            if let Some((cb, receipt)) = state.current.submitted() {
+                (Some(cb.clone()), receipt.signalled)
+            } else {
+                let signalled = self.commit_swap_locked(&mut state, 0)?;
+                (state.in_flight.last().cloned(), signalled)
+            }
         };
         if let Some(cb) = cb {
             // The seam. On the default arm this is `waitUntilCompleted` and the
@@ -1981,6 +2033,15 @@ impl Commands {
         &self,
         prepared: Option<super::native_generation_bindings::PreparedGeneration>,
     ) -> Result<CommandBuffer, MetalKernelError> {
+        #[cfg(test)]
+        {
+            self.core
+                .replacement_attempts
+                .fetch_add(1, Ordering::Relaxed);
+            if self.core.deny_replacement.load(Ordering::Relaxed) {
+                return Err(crate::memory_admission::AllocationError::HostAllocation.into());
+            }
+        }
         if self.core.binding_bank.is_some() && prepared.is_none() {
             return Err(MetalKernelError::QueueUnavailable(
                 "bound replacement lacks preflight credit",
@@ -3330,5 +3391,146 @@ mod owner_submission_tests {
         assert_eq!(commands.clock().current_epoch().0, 1);
         assert_eq!(commands.clock().completed_count().0, 1);
         assert_eq!(runs.load(Ordering::Relaxed), 1);
+    }
+
+    fn retained_public_drain_after_allocation_refusal(current_only: bool) {
+        let device = crate::MetalDevice::new(0).unwrap();
+        let commands = device.commands();
+        let cb = pending(commands);
+        let runs = Arc::new(AtomicUsize::new(0));
+        let observer = runs.clone();
+        commands
+            .on_command_buffer_complete(move || {
+                observer.fetch_add(1, Ordering::Relaxed);
+            })
+            .unwrap();
+        let callbacks = Arc::new(AtomicUsize::new(0));
+        let callback = callbacks.clone();
+        cb.on_completion(move || {
+            callback.fetch_add(1, Ordering::Relaxed);
+        })
+        .unwrap();
+        let gate = device.metal_device().as_ref().newSharedEvent().unwrap();
+        cb.wait_for_event(&gate, 1).unwrap();
+        let raw = device
+            .metal_device()
+            .new_buffer(4096, super::super::MTLResourceOptions::StorageModeShared)
+            .unwrap();
+        {
+            let mut blit = commands.blit_command_encoder().unwrap();
+            // SAFETY: raw remains owned until the exact native wait below,
+            // including the assertion-failure cleanup path.
+            unsafe {
+                blit.fill_buffer(&raw, (0, 4096), 0x6b);
+            }
+        }
+        let exercised = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            commands
+                .core
+                .deny_replacement
+                .store(true, Ordering::Relaxed);
+            let error = commands
+                .flush()
+                .expect_err("replacement allocation must be refused after handoff");
+            assert!(matches!(
+                error,
+                MetalKernelError::Allocation(
+                    crate::memory_admission::AllocationError::HostAllocation
+                )
+            ));
+            let (receipt, unused) = {
+                let mut state = commands.lock_state().unwrap();
+                let (submitted, receipt) = state
+                    .current
+                    .submitted()
+                    .expect("successful handoff retained its receipt");
+                assert!(submitted.same_recording(&cb));
+                let receipt = *receipt;
+                let unused: [_; 2] = std::array::from_fn(|i| state.binding_credits[i].take());
+                (receipt, unused)
+            };
+            drop(unused);
+            commands.core.deny_preflight.store(true, Ordering::Relaxed);
+            assert!(matches!(
+                commands.lock_recording_state(),
+                Err(MetalKernelError::Allocation(
+                    crate::memory_admission::AllocationError::HostAllocation
+                ))
+            ));
+            let replacements = commands.core.replacement_attempts.load(Ordering::Relaxed);
+            let preflights = commands.core.preflight_attempts.load(Ordering::Relaxed);
+            assert_eq!(replacements, 1);
+            assert_eq!(preflights, 1);
+            assert_eq!(commands.clock().current_epoch().0, 1);
+            assert!(
+                !cb.data_ready(),
+                "the host gate must hold actual pending work"
+            );
+            assert_eq!(runs.load(Ordering::Relaxed), 0);
+            assert_eq!(callbacks.load(Ordering::Relaxed), 0);
+            let owner = commands.clone();
+            let waiter = std::thread::spawn(move || {
+                if current_only {
+                    owner.flush_and_wait_current()
+                } else {
+                    owner.flush_and_wait()
+                }
+            });
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            let blocked = !waiter.is_finished();
+            gate.setSignaledValue(1);
+            waiter
+                .join()
+                .unwrap()
+                .expect("public retained receipt drain must not allocate or replace");
+            assert!(
+                blocked,
+                "public drain returned before controlled pending work completed"
+            );
+            // Readback waits promise data/error, not arbitrary callback return.
+            cb.try_wait_until_completed().unwrap();
+            assert_eq!(
+                commands.core.replacement_attempts.load(Ordering::Relaxed),
+                replacements
+            );
+            assert_eq!(
+                commands.core.preflight_attempts.load(Ordering::Relaxed),
+                preflights
+            );
+            assert_eq!(commands.clock().current_epoch().0, 1);
+            assert_eq!(runs.load(Ordering::Relaxed), 1);
+            assert_eq!(callbacks.load(Ordering::Relaxed), 1);
+            let state = commands.lock_state().unwrap();
+            let (submitted, retained) = state.current.submitted().unwrap();
+            assert!(submitted.same_recording(&cb));
+            assert_eq!(retained.epoch, receipt.epoch);
+            assert_eq!(retained.signalled, receipt.signalled);
+            assert!(state.in_flight.is_empty());
+            drop(state);
+            // SAFETY: the public drain and exact native join completed writes.
+            let bytes = unsafe { std::slice::from_raw_parts(raw.contents(), 4096) };
+            assert!(bytes.iter().all(|byte| *byte == 0x6b));
+        }));
+        gate.setSignaledValue(1);
+        let cleanup = cb.try_wait_until_completed();
+        if cleanup.is_err() {
+            // Unexpected failure is not terminality. Keep the explicit raw
+            // interoperability owner rather than releasing it during unwind.
+            std::mem::forget(raw);
+        }
+        if let Err(panic) = exercised {
+            std::panic::resume_unwind(panic);
+        }
+        cleanup.unwrap();
+    }
+
+    #[test]
+    fn public_flush_and_wait_drains_retained_receipt_without_refill_or_replacement() {
+        retained_public_drain_after_allocation_refusal(false);
+    }
+
+    #[test]
+    fn public_current_wait_drains_retained_receipt_without_refill_or_replacement() {
+        retained_public_drain_after_allocation_refusal(true);
     }
 }

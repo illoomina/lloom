@@ -753,7 +753,6 @@ impl ModelConfig {
         // Validate on a scratch config so a bad value is refused here, with
         // the axis's own message, rather than at load; keep the spelling the
         // axis parses (a bool as `true`/`false`, an arm in lower case).
-        let value = lloom_tensor::options::non_empty(value).map_err(|e| format!("--{key}: {e}"))?;
         let is_bool = lloom::models::lfm2::Config::AXES_META
             .iter()
             .any(|a| a.key == key && a.is_bool);
@@ -762,7 +761,9 @@ impl ModelConfig {
                 .map_err(|e| format!("--{key}: {e}"))?
                 .to_string()
         } else {
-            value.to_ascii_lowercase()
+            lloom_tensor::options::non_empty(value)
+                .map_err(|e| format!("--{key}: {e}"))?
+                .to_ascii_lowercase()
         };
         let mut probe = lloom::models::lfm2::Config::default();
         probe.set_axis(key, &value)?;

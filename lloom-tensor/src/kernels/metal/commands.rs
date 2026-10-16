@@ -2042,10 +2042,10 @@ impl Commands {
         // candidate declared BEFORE guard: every refusal releases guard before
         // cancellation/Drop of unused prepared native Submission/Slot custody.
         let mut state = self.lock_state()?;
-        if !state
+        if state
             .current
             .submitted()
-            .is_some_and(|(current, _)| current.identity() == old.identity())
+            .is_none_or(|(current, _)| current.identity() != old.identity())
         {
             return Err(MetalKernelError::QueueUnavailable(
                 "bound recovery receipt changed",

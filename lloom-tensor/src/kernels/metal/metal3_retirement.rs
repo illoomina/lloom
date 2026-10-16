@@ -547,9 +547,8 @@ impl PreparedCommit<'_> {
             .begin_handoff()
             .map_err(|_| unavailable("M3 native handoff refused"))?;
         if let Some(head) = self.bindings {
-            head.entered().map_err(|error| {
+            head.entered().inspect_err(|_| {
                 self.binding_failure(Failure::AdapterFailed);
-                error
             })?;
         }
         self.phase = CommitPhase::EnteredNative;
@@ -567,9 +566,8 @@ impl PreparedCommit<'_> {
             control.before_return();
         }
         if let Some(head) = self.bindings {
-            head.returned().map_err(|error| {
+            head.returned().inspect_err(|_| {
                 self.binding_failure(Failure::UnknownHandoff);
-                error
             })?;
         }
         self.marker

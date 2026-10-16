@@ -3,7 +3,7 @@ use super::{
 };
 use objc2::{rc::Retained, runtime::ProtocolObject};
 use objc2_foundation::NSString;
-use objc2_metal::{MTL4CommandQueue, MTLCommandBuffer, MTLCommandBufferStatus, MTLDispatchType};
+use objc2_metal::{MTLCommandBuffer, MTLCommandBufferStatus, MTLDispatchType};
 use std::borrow::Cow;
 use std::sync::Arc;
 

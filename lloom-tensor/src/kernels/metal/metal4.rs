@@ -1288,9 +1288,8 @@ impl PreparedCommit<'_> {
             .checked_add(1)
             .expect("checked during preparation");
         if let Some(bindings) = &submission.bindings {
-            bindings.entered().map_err(|error| {
+            bindings.entered().inspect_err(|_| {
                 submission.binding_failure(crate::retirement_owners::Failure::AdapterFailed);
-                error
             })?;
         }
         self.phase = CommitPhase::EnteredNative;
@@ -1361,9 +1360,8 @@ impl PreparedCommit<'_> {
         // Publish RETURNED before this side can elect the terminal winner.
         // All native queue entries returned; callbacks may already be complete.
         if let Some(bindings) = &submission.bindings {
-            bindings.returned().map_err(|error| {
+            bindings.returned().inspect_err(|_| {
                 submission.binding_failure(crate::retirement_owners::Failure::UnknownHandoff);
-                error
             })?;
         }
         submission.publish_native_reuse(crate::native_reuse::ReuseSide::HandoffReturned);

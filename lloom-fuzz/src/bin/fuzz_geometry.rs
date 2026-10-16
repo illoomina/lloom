@@ -262,7 +262,13 @@ fn run<F: TinyFamily + 'static>(mut args: Args) -> anyhow::Result<()> {
 /// A geometry's size, for "smallest": its weight elements, then its tokens.
 fn size<F: TinyFamily>(g: &Geometry, weights: Weights) -> usize {
     g.checkpoint::<F>(weights)
-        .and_then(|c| c.schema().ok())
+        .and_then(|c| {
+            if geometry::FAST_CONTRACT.load(std::sync::atomic::Ordering::Relaxed) {
+                c.schema_for::<lloom::profile::Crown>().ok()
+            } else {
+                c.schema_for::<lloom::profile::CrownExact>().ok()
+            }
+        })
         .map_or(usize::MAX, |s| s.elements())
         .saturating_add(g.work.prompt + g.work.decode)
 }
@@ -320,6 +326,18 @@ fn manifest<F: TinyFamily>(
     weights: Weights,
     exec: &mut impl FnMut(&[u8]) -> (Geometry, Outcome),
 ) -> anyhow::Result<()> {
+    manifest_reached::<F>(dir, args, weights, &mut |bytes| {
+        let (g, o) = exec(bytes);
+        (g, o, geometry::last_reach())
+    })
+}
+
+fn manifest_reached<F: TinyFamily>(
+    dir: &std::path::Path,
+    args: &Args,
+    weights: Weights,
+    exec: &mut impl FnMut(&[u8]) -> (Geometry, Outcome, geometry::Reach),
+) -> anyhow::Result<()> {
     use std::collections::BTreeMap;
     let files = inputs(dir)?;
     // point -> (size, geometry bytes)
@@ -327,8 +345,7 @@ fn manifest<F: TinyFamily>(
     let mut elsewhere: BTreeMap<String, &'static str> = BTreeMap::new();
     let mut runs: BTreeMap<Vec<u8>, (String, Vec<String>)> = BTreeMap::new();
     for f in &files {
-        let (g, o) = exec(&std::fs::read(f)?);
-        let (ps, ls) = geometry::last_reach();
+        let (g, o, (ps, ls)) = exec(&std::fs::read(f)?);
         let points: Vec<String> = ps
             .iter()
             .map(|(s, c, ok)| format!("probe|{s}|{c}|{ok}"))
@@ -425,9 +442,20 @@ mod tests {
             contract.is_fast()
         );
         let ckpt = TinyCheckpoint::<Lfm2Tiny>::template();
-        let schema = ckpt.schema().expect("schema must use the process regime");
+        let schema = match contract {
+            Contract::Fast => ckpt.schema_for::<Crown>(),
+            Contract::Deterministic => ckpt.schema_for::<CrownExact>(),
+        }
+        .expect("schema must use the requested regime");
         assert!(!schema.tensors.is_empty());
-        assert_eq!(schema, ckpt.schema().unwrap());
+        match contract {
+            Contract::Fast => {
+                assert_eq!(schema, ckpt.schema_for::<Crown>().unwrap());
+                assert!(ckpt.schema_for::<CrownExact>().is_err());
+                assert!(ckpt.schema().is_err());
+            }
+            Contract::Deterministic => assert_eq!(schema, ckpt.schema().unwrap()),
+        }
         match contract {
             Contract::Fast => {
                 assert!(Lfm2Tiny::reference::<CrownExact>(&ckpt, &Device::Cpu).is_err());
@@ -494,7 +522,118 @@ mod tests {
         );
         assert!(geometry::FAST_CONTRACT.load(std::sync::atomic::Ordering::Relaxed));
         assert_eq!(tuning::contract(), Contract::Fast);
-        TinyCheckpoint::<Lfm2Tiny>::template().schema().unwrap();
+        TinyCheckpoint::<Lfm2Tiny>::template()
+            .schema_for::<Crown>()
+            .unwrap();
+    }
+
+    #[test]
+    fn unbound_schema_then_exact_keeps_legacy_ordering() {
+        std::env::remove_var("LLOOM_PROFILE");
+        let ckpt = TinyCheckpoint::<Lfm2Tiny>::template();
+        assert_eq!(ckpt.schema().unwrap().tensors.len(), 29);
+        ckpt.model::<CrownExact>(&Device::Cpu).unwrap();
+        assert!(ckpt.model::<Crown>(&Device::Cpu).is_err());
+    }
+
+    #[test]
+    fn unbound_write_then_exact_load_keeps_legacy_ordering() {
+        std::env::remove_var("LLOOM_PROFILE");
+        let ckpt = TinyCheckpoint::<Lfm2Tiny>::template();
+        let dir =
+            std::env::temp_dir().join(format!("geometry-legacy-write-{}", std::process::id()));
+        ckpt.write(&dir).unwrap();
+        Lfm2Tiny::load::<CrownExact>(&dir, &Device::Cpu).unwrap();
+        assert!(Lfm2Tiny::load::<Crown>(&dir, &Device::Cpu).is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn explicit_fast_pin_before_first_contract_read_records_fast() {
+        std::env::remove_var("LLOOM_PROFILE");
+        tuning::pin_contract(Contract::Fast).unwrap();
+        let ckpt = TinyCheckpoint::<Lfm2Tiny>::template();
+        assert_eq!(ckpt.schema_for::<Crown>().unwrap().tensors.len(), 29);
+        ckpt.model::<Crown>(&Device::Cpu).unwrap();
+        assert!(ckpt.model::<CrownExact>(&Device::Cpu).is_err());
+    }
+
+    #[test]
+    fn explicit_exact_pin_before_first_contract_read_records_exact() {
+        std::env::remove_var("LLOOM_PROFILE");
+        tuning::pin_contract(Contract::Deterministic).unwrap();
+        let ckpt = TinyCheckpoint::<Lfm2Tiny>::template();
+        ckpt.schema_for::<CrownExact>().unwrap();
+        ckpt.model::<CrownExact>(&Device::Cpu).unwrap();
+        assert!(ckpt.model::<Crown>(&Device::Cpu).is_err());
+    }
+
+    #[test]
+    fn initialized_tuning_still_allows_explicit_exact_schema() {
+        std::env::remove_var("LLOOM_PROFILE");
+        let _ = tuning::tuning();
+        let ckpt = TinyCheckpoint::<Lfm2Tiny>::template();
+        ckpt.schema_for::<CrownExact>().unwrap();
+        ckpt.model::<CrownExact>(&Device::Cpu).unwrap();
+        assert!(ckpt.model::<Crown>(&Device::Cpu).is_err());
+    }
+
+    #[test]
+    fn covered_agreeing_input_writes_a_nonempty_manifest() {
+        std::env::remove_var("LLOOM_PROFILE");
+        setup_contract(Contract::Fast).unwrap();
+        let dir = std::env::temp_dir().join(format!("geometry-covered-{}", std::process::id()));
+        let corpus = dir.join("corpus");
+        std::fs::create_dir_all(&corpus).unwrap();
+        let g = Geometry {
+            axes: vec![64, 128, 256, 3, 2, 1, 3],
+            work: Workload {
+                prompt: 1,
+                decode: 1,
+            },
+            dense: 0,
+            experts: 0,
+            arm: 0,
+        };
+        let bytes = g.encode();
+        std::fs::write(corpus.join("input"), &bytes).unwrap();
+        let mut args = Args::try_parse_from(["fuzz_geometry", "--contract", "fast"]).unwrap();
+        args.manifest_out = dir.join("manifest.json");
+        std::fs::write(&args.manifest_out, b"old manifest").unwrap();
+        manifest_reached::<Lfm2Tiny>(&corpus, &args, Weights::default(), &mut |input| {
+            assert_eq!(input, bytes);
+            (
+                g.clone(),
+                Outcome::Agree {
+                    maxdiff: 0.,
+                    scale: 1.,
+                },
+                (
+                    vec![("fixture".into(), "covered".into(), true)],
+                    vec!["fixture-kernel".into()],
+                ),
+            )
+        })
+        .unwrap();
+        let m: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&args.manifest_out).unwrap()).unwrap();
+        assert_eq!(m["contract"], "fast");
+        assert_eq!(m["corpus_inputs"], 1);
+        let entries = m["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0]["geometry"],
+            "40008000000103000200010003000101000000"
+        );
+        assert_eq!(
+            entries[0]["smallest_for"],
+            serde_json::json!(["census|fixture-kernel", "probe|fixture|covered|true"])
+        );
+        assert_eq!(
+            entries[0]["reaches"],
+            serde_json::json!(["probe|fixture|covered|true", "census|fixture-kernel"])
+        );
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

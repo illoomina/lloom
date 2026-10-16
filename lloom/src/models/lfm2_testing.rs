@@ -92,17 +92,14 @@ impl TinyFamily for Lfm2Tiny {
     }
 
     fn schema(ckpt: &TinyCheckpoint<Self>) -> Result<Schema> {
+        Self::schema_for::<crate::profile::CrownExact>(ckpt)
+    }
+
+    fn schema_for<P: Profile>(ckpt: &TinyCheckpoint<Self>) -> Result<Schema> {
         let (be, rec) = backend(ckpt)?;
         let vb = VarBuilder::from_backend(Box::new(be), DType::F32, Device::Cpu);
-        // Recording obeys the process regime; the tensor reads do not vary by profile.
-        match lloom_tensor::tuning::contract() {
-            lloom_tensor::tuning::Contract::Fast => {
-                Model::<crate::profile::Crown>::new(&ckpt.cfg, vb)?;
-            }
-            lloom_tensor::tuning::Contract::Deterministic => {
-                Model::<crate::profile::CrownExact>::new(&ckpt.cfg, vb)?;
-            }
-        }
+        // The tensor reads do not vary by profile; recording still obeys its regime.
+        Model::<P>::new(&ckpt.cfg, vb)?;
         Ok(rec.schema(ckpt.weights.dense))
     }
 

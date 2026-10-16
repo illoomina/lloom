@@ -113,7 +113,7 @@ struct Subscribers {
     setup: crate::completion_setup::Setup,
     current: AtomicPtr<Snapshot>,
     published: parking_lot::Mutex<Vec<Box<Snapshot>>>,
-    /// Force the actual reserve error paths without replacing their handling.
+    /// Force the reserve/header refusal paths without replacing their handling.
     #[cfg(test)]
     refuse_reserve: std::sync::atomic::AtomicU8,
 }
@@ -186,7 +186,32 @@ impl Subscribers {
             ));
         }
         next.push(f);
-        let next = Box::new(next);
+        #[cfg(test)]
+        let refuse_header = self
+            .refuse_reserve
+            .compare_exchange(3, 0, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok();
+        #[cfg(not(test))]
+        let refuse_header = false;
+        let next = match if refuse_header {
+            Err(next)
+        } else {
+            crate::cold_box::try_new(next)
+        } {
+            Ok(next) => next,
+            Err(mut rejected) => {
+                let callback = rejected.pop().expect("new callback is last");
+                // Every earlier clone still has an original in published.
+                // The rejected arbitrary capture itself escapes in the error.
+                drop(rejected);
+                return Err(crate::kernels::err::CompletionRegistrationError::new(
+                    crate::kernels::MetalKernelError::QueueUnavailable(
+                        "subscriber snapshot header allocation refused",
+                    ),
+                    Some(callback),
+                ));
+            }
+        };
         self.current.store(
             &*next as *const Snapshot as *mut Snapshot,
             Ordering::Release,
@@ -267,7 +292,7 @@ mod tests {
                 self.drops.fetch_add(1, Ordering::Relaxed);
             }
         }
-        for stage in [1, 2] {
+        for stage in [1, 2, 3] {
             let (clock, _, hook) = hook();
             let runs = Arc::new(AtomicUsize::new(0));
             let observed = runs.clone();
@@ -294,10 +319,11 @@ mod tests {
                     panic!("refused observer installed");
                 }))
                 .unwrap_err();
-            let expected = if stage == 1 {
-                "subscriber snapshot allocation refused"
-            } else {
-                "subscriber history allocation refused"
+            let expected = match stage {
+                1 => "subscriber snapshot allocation refused",
+                2 => "subscriber history allocation refused",
+                3 => "subscriber snapshot header allocation refused",
+                _ => unreachable!(),
             };
             assert!(matches!(
                 error.cause(),

@@ -697,8 +697,10 @@ fn main() -> Result<()> {
     // `Ring` under `--mtp` (the verify window's rings), `Paged` when the
     // rows share a pool (`--rows N --rows-pool`, or `--mtp` over rows); the
     // regime from the contract the harness pins below.
-    candle::tuning::pin_contract(candle::tuning::Contract::Deterministic)
-        .map_err(anyhow::Error::msg)?;
+    candle_examples::pin_profiled_contract(
+        "qwen4exp-chat",
+        candle::tuning::Contract::Deterministic,
+    )?;
     use lloom::profile::{NoRewind, One, Paged, Rewind as _, Ring, Rows as _};
     let key = lloom::profile::ProfileKey::at_contract(
         if args.mtp.is_some() || args.dflash.is_some() {
@@ -1317,9 +1319,9 @@ fn driver_gate<P: QwenShape, R: ExpertResidency + HasStreamStats>(
                     traced.push((before + 1, trace_take()));
                 }
                 if produced >= TRACE_FROM && produced < TRACE_FROM + TRACE_STEPS {
-                    trace_set(true, Some(format!("decode[{}]", produced + 1)));
+                    trace_set(true, Some(format!("decode[{}]", produced + 1)))?;
                 } else {
-                    trace_set(false, None);
+                    trace_set(false, None)?;
                     let _ = trace_take();
                 }
             }
@@ -2186,16 +2188,17 @@ fn trace_requested() -> bool {
     }
 }
 
-fn trace_set(on: bool, region: Option<String>) {
+fn trace_set(on: bool, region: Option<String>) -> candle::Result<()> {
     #[cfg(feature = "metal")]
     {
         candle::kernels::metal::trace::set_region(region);
-        candle::kernels::metal::trace::set_recording(on);
+        candle::kernels::metal::trace::set_recording(on)?;
     }
     #[cfg(not(feature = "metal"))]
     {
         let _ = (on, region);
     }
+    Ok(())
 }
 
 fn trace_take() -> TraceStep {

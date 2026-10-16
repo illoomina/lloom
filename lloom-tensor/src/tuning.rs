@@ -46,7 +46,7 @@ impl std::fmt::Display for TuningSetupError {
             Self::AlreadyRead => f.write_str("tuning: the tensor crate's knobs were already read before install"),
             Self::InvalidEnvironment(reason) => write!(f, "tuning: {reason}"),
             Self::NotCompiled { key, capability } => write!(f,
-                "{key}: {capability} instrumentation is not compiled; rebuild with cargo build --profile release-with-debug --features metal,profile"),
+                "{key}: {capability} instrumentation is not compiled; rebuild with cargo build --profile release-with-debug -p lloom-tensor --features metal,profile"),
         }
     }
 }
@@ -102,9 +102,28 @@ pub(crate) fn effective_instrument(storage: &str, requested: bool) -> bool {
 }
 
 impl Tuning {
+    /// Cold setup/legacy-cache notice, generated from the same partial-capability
+    /// metadata as the engine. No notice or side effect in diagnostic builds.
+    pub(crate) fn note_partial_instruments(&self) {
+        if PROFILE_INSTRUMENTS || self.instrument == InstrumentTuning::default() {
+            return;
+        }
+        static NOTED: std::sync::Once = std::sync::Once::new();
+        NOTED.call_once(|| {
+            let values = serde_json::to_value(&self.instrument).expect("instrument group serializes");
+            let defaults = serde_json::to_value(InstrumentTuning::default()).expect("instrument defaults serialize");
+            for meta in InstrumentTuning::META {
+                if meta.needs == "profile" && !meta.needs_part.is_empty()
+                    && values.get(meta.key) != defaults.get(meta.key) {
+                    eprintln!("[diagnostics] {}: {} require profile instrumentation absent from this build; remaining scalar output is available; rebuild with cargo build --profile release-with-debug -p lloom-tensor --features metal,profile",meta.path,meta.needs_part);
+                }
+            }
+        });
+    }
+
     /// Reject unavailable whole instruments, preserving partial scalar-counter routes.
     pub fn validate_instruments(&self) -> Result<(), TuningSetupError> {
-        if PROFILE_INSTRUMENTS {
+        if PROFILE_INSTRUMENTS || self.instrument == InstrumentTuning::default() {
             return Ok(());
         }
         let values = serde_json::to_value(&self.instrument).expect("instrument group serializes");
@@ -587,12 +606,14 @@ pub fn tuning() -> &'static Tuning {
 pub fn try_tuning() -> Result<&'static Tuning, TuningSetupError> {
     if let Some(t) = TUNING.get() {
         t.validate_instruments()?;
+        t.note_partial_instruments();
         return Ok(t);
     }
     let t = from_process_env().map_err(TuningSetupError::InvalidEnvironment)?;
     t.validate_instruments()?;
     let installed = TUNING.get_or_init(|| t);
     installed.validate_instruments()?;
+    installed.note_partial_instruments();
     Ok(installed)
 }
 
@@ -614,7 +635,12 @@ pub fn install(t: Tuning) -> Result<(), InstallError> {
     TUNING.set(t).map_err(|t| InstallError {
         reason: TuningSetupError::AlreadyRead,
         tuning: Box::new(t),
-    })
+    })?;
+    TUNING
+        .get()
+        .expect("successful tuning installation")
+        .note_partial_instruments();
+    Ok(())
 }
 
 /// Whether [`install`] (or a first read) has already fixed the group.
@@ -1538,7 +1564,7 @@ pub struct InstrumentTuning {
         path = "diagnostics.gpu_profile.dump",
         status = "instrument",
         needs = "profile",
-        needs_part = "the steps table's host step time column"
+        needs_part = "per-label and interval tables, sampled encoder data, and the steps table's host step time column"
     )]
     pub profile_dump: Option<String>,
 }

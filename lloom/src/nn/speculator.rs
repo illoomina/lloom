@@ -740,32 +740,97 @@ pub struct RoundProbe<'d> {
 pub type PhaseCensus = Vec<(String, u64)>;
 
 impl RoundProbe<'_> {
-    /// Close a phase: synchronize if asked, and take `(gpu_busy_union_s,
-    /// dispatches, census)` from the profiler if it is on, resetting it.
-    fn close(&self) -> Result<(f64, u64, Option<PhaseCensus>)> {
+    /// Actual detailed Metal probe, not merely a requested cheap counter flag.
+    pub(crate) fn detailed_recorder_active(&self) -> bool {
+        #[cfg(feature = "metal")]
+        {
+            matches!(self.sync, Some(Device::Metal(_)))
+                && lloom_tensor::metal_backend::profile::recorder_enabled()
+        }
+        #[cfg(not(feature = "metal"))]
+        {
+            false
+        }
+    }
+
+    /// Validate the supplied probe and process configuration without native work
+    /// or model mutation (this may resolve process tuning). Only explicit census
+    /// requirements are checked; ordinary host/scalar probes remain usable.
+    /// The direct round entry checks again even if this was called earlier.
+    pub fn validate(&self) -> Result<()> {
+        if self.census {
+            lloom_tensor::tuning::try_tuning().map_err(lloom_tensor::Error::wrap)?;
+            let meta = lloom_tensor::options::meta_at(
+                lloom_tensor::tuning::InstrumentTuning::META,
+                "profile",
+            )
+            .expect("profile is declared by the generated instrument schema");
+            if !lloom_tensor::tuning::PROFILE_INSTRUMENTS {
+                return Err(lloom_tensor::Error::wrap(
+                    lloom_tensor::tuning::TuningSetupError::NotCompiled {
+                        key: meta.path,
+                        capability: meta.needs,
+                    },
+                ));
+            }
+            if !self.detailed_recorder_active() {
+                lloom_tensor::bail!("{}: requested phase census requires an active detailed Metal sync probe; enable CANDLE_METAL_PROFILE=1 and supply a Metal sync device", meta.path);
+            }
+        }
+        Ok(())
+    }
+
+    fn with_checked_census<T>(&self, body: impl FnOnce() -> Result<T>) -> Result<T> {
+        self.validate()?;
+        body()
+    }
+
+    /// Close one phase. Only an actual detailed Metal probe yields GPU time;
+    /// host-only/CPU/off/compiled-out probes retain scalar semantics with None.
+    fn close(&self) -> Result<(Option<f64>, u64, Option<PhaseCensus>)> {
         let Some(device) = self.sync else {
-            return Ok((0.0, 0, None));
+            return Ok((None, 0, None));
         };
         device.synchronize()?;
         #[cfg(feature = "metal")]
         {
-            use lloom_tensor::metal_backend::profile;
-            if profile::enabled() {
-                let s = profile::snapshot();
-                profile::reset();
-                let census = if self.census { Some(s.by_label) } else { None };
-                return Ok((s.gpu_busy_union_s, s.dispatches, census));
-            }
+            Ok(phase_snapshot(self.detailed_recorder_active(), self.census))
         }
-        Ok((0.0, 0, None))
+        #[cfg(not(feature = "metal"))]
+        {
+            Ok((None, 0, None))
+        }
     }
+}
+
+/// The production snapshot/reset conversion, separate from synchronization so
+/// host controls can exercise real recorders without creating a native device.
+#[cfg(feature = "metal")]
+fn phase_snapshot(
+    detailed_metal_probe: bool,
+    census: bool,
+) -> (Option<f64>, u64, Option<PhaseCensus>) {
+    use lloom_tensor::metal_backend::profile;
+    if !profile::enabled() {
+        return (None, 0, None);
+    }
+    let s = profile::snapshot();
+    profile::reset();
+    let detailed = detailed_metal_probe && profile::recorder_enabled();
+    (
+        detailed.then_some(s.gpu_busy_union_s),
+        s.dispatches,
+        (detailed && census).then_some(s.by_label),
+    )
 }
 
 /// One speculative round's phase brackets, from [`Session::speculative_round`].
 ///
 /// Wall is the host's clock around each phase. GPU-busy and dispatches are
-/// per phase and only nonzero when the round was probed with `sync` and the
-/// Metal profiler on; the census only when it was asked for.
+/// per phase. GPU time is Some (including measured zero) only for an active
+/// detailed Metal sync probe; None for unsampled/off/CPU/compiled-out phases.
+/// Scalar dispatch counts remain independent; census only when asked for.
+/// Pre-release source migration: the three GPU fields are now Option<f64>.
 #[derive(Debug, Clone, Default)]
 pub struct RoundTiming {
     pub draft_ns: u64,
@@ -783,9 +848,9 @@ pub struct RoundTiming {
     pub draft_readbacks: u64,
     pub verify_readbacks: u64,
     pub observe_readbacks: u64,
-    pub draft_gpu_s: f64,
-    pub verify_gpu_s: f64,
-    pub observe_gpu_s: f64,
+    pub draft_gpu_s: Option<f64>,
+    pub verify_gpu_s: Option<f64>,
+    pub observe_gpu_s: Option<f64>,
     pub draft_disp: u64,
     pub verify_disp: u64,
     pub observe_disp: u64,
@@ -1402,104 +1467,106 @@ impl<'m, M: CausalLM> Session<'m, M> {
         S: Speculator,
         M: Probes<S::Probe>,
     {
-        let mut timing = RoundTiming::default();
-        let alloc_before = allocation_counters(verify_key.map(|(d, _)| d));
-        let t = std::time::Instant::now();
-        let rb = readbacks();
-        // The hint is produced only when this round will read it (§3.4.4: the
-        // driver owns `p_min`; the family only learns whether it is consumed).
-        spec.want_confidence(p_min > 0.0);
-        let mut drafts = spec.draft(active)?;
-        let (gpu, disp, census) = probe.close()?;
-        timing.draft_ns = t.elapsed().as_nanos() as u64;
-        timing.draft_readbacks = readbacks() - rb;
-        timing.draft_gpu_s = gpu;
-        timing.draft_disp = disp;
-        timing.draft_census = census;
+        probe.with_checked_census(|| {
+            let mut timing = RoundTiming::default();
+            let alloc_before = allocation_counters(verify_key.map(|(d, _)| d));
+            let t = std::time::Instant::now();
+            let rb = readbacks();
+            // The hint is produced only when this round will read it (§3.4.4: the
+            // driver owns `p_min`; the family only learns whether it is consumed).
+            spec.want_confidence(p_min > 0.0);
+            let mut drafts = spec.draft(active)?;
+            let (gpu, disp, census) = probe.close()?;
+            timing.draft_ns = t.elapsed().as_nanos() as u64;
+            timing.draft_readbacks = readbacks() - rb;
+            timing.draft_gpu_s = gpu;
+            timing.draft_disp = disp;
+            timing.draft_census = census;
 
-        // Driver-owned `p_min` truncation. `--spec-draft-p-min` is off at 0.0
-        // (`speculative.cpp:796`), and a family with no confidence signal leaves
-        // `confidence` empty, so `position` finds nothing and the whole block
-        // stands — uniform across families (§3.4.4).
-        // A target whose verify cannot run the anchor alone (LFM2) keeps one
-        // draft however unconfident: the cut, like the room's, stops at the
-        // floor (#943: a cut at the first position fed LFM2's verify nothing).
-        let floor = usize::from(!Probes::<S::Probe>::verifies_anchor_alone(self.model));
-        if p_min > 0.0 {
-            for d in drafts.iter_mut() {
-                if let Some(cut) = d.confidence.iter().position(|&p| p < p_min) {
-                    let cut = cut.max(floor);
-                    if cut < d.tokens.len() {
-                        d.tokens.truncate(cut)?;
-                        d.confidence.truncate(cut);
+            // Driver-owned `p_min` truncation. `--spec-draft-p-min` is off at 0.0
+            // (`speculative.cpp:796`), and a family with no confidence signal leaves
+            // `confidence` empty, so `position` finds nothing and the whole block
+            // stands — uniform across families (§3.4.4).
+            // A target whose verify cannot run the anchor alone (LFM2) keeps one
+            // draft however unconfident: the cut, like the room's, stops at the
+            // floor (#943: a cut at the first position fed LFM2's verify nothing).
+            let floor = usize::from(!Probes::<S::Probe>::verifies_anchor_alone(self.model));
+            if p_min > 0.0 {
+                for d in drafts.iter_mut() {
+                    if let Some(cut) = d.confidence.iter().position(|&p| p < p_min) {
+                        let cut = cut.max(floor);
+                        if cut < d.tokens.len() {
+                            d.tokens.truncate(cut)?;
+                            d.confidence.truncate(cut);
+                        }
                     }
                 }
             }
-        }
-        for d in drafts.iter_mut() {
-            fit_to_room(d, room, floor)?;
-        }
-
-        // ONE target forward over `[last, draft…]`, extracting the probe in the
-        // SAME pass (§10.2r amortization). The round's one host readback is in
-        // here: the verify's argmax, with the draft ids beside it.
-        let t = std::time::Instant::now();
-        let rb = readbacks();
-        if let Some((device, shape)) = verify_key {
-            if let (crate::nn::decode::PassShape::Verify { k }, [_]) = (shape, anchors) {
-                self.model.prepare_verify(&mut self.seq.cache, k)?;
+            for d in drafts.iter_mut() {
+                fit_to_room(d, room, floor)?;
             }
-            crate::nn::decode::begin_pass(device, shape)?;
-        }
-        // The sampled verify draws the target's token per row with `sampler`
-        // (#943 §2); the greedy one reads the argmax, as before.
-        let verified = match sampler.as_deref_mut() {
-            Some(s) => self.model.verify_and_probe_sampled(
-                &drafts,
-                anchors,
-                &mut self.seq.cache,
-                eos_ids,
-                s,
-            ),
-            None => self
-                .model
-                .verify_and_probe(&drafts, anchors, &mut self.seq.cache, eos_ids),
-        };
-        if let Some((device, _)) = verify_key {
-            crate::nn::decode::end_pass(device)?;
-        }
-        let (accepted, probe_out) = verified?;
-        // What the round kept is the run's output: the processors' history,
-        // a budget's position and the digest move by it, as a step-by-step
-        // decode's do by its draws — after the planned pass, never inside it.
-        if let Some(s) = sampler {
-            for a in &accepted {
-                s.commit_window(a)?;
-            }
-        }
-        let (gpu, disp, census) = probe.close()?;
-        timing.verify_ns = t.elapsed().as_nanos() as u64;
-        timing.verify_readbacks = readbacks() - rb;
-        timing.verify_gpu_s = gpu;
-        timing.verify_disp = disp;
-        timing.verify_census = census;
 
-        let t = std::time::Instant::now();
-        let rb = readbacks();
-        for (seq, acc) in active.iter().zip(&accepted) {
-            spec.observe(*seq, &probe_out, acc)?;
-        }
-        let (gpu, disp, census) = probe.close()?;
-        timing.observe_ns = t.elapsed().as_nanos() as u64;
-        timing.observe_readbacks = readbacks() - rb;
-        timing.observe_gpu_s = gpu;
-        timing.observe_disp = disp;
-        timing.observe_census = census;
-        let alloc_after = allocation_counters(verify_key.map(|(d, _)| d));
-        timing.pool_allocations = alloc_after.0 - alloc_before.0;
-        timing.residency_adds = alloc_after.1 - alloc_before.1;
-        timing.pool_allocations_pending_twin = alloc_after.2 - alloc_before.2;
-        Ok((accepted, timing))
+            // ONE target forward over `[last, draft…]`, extracting the probe in the
+            // SAME pass (§10.2r amortization). The round's one host readback is in
+            // here: the verify's argmax, with the draft ids beside it.
+            let t = std::time::Instant::now();
+            let rb = readbacks();
+            if let Some((device, shape)) = verify_key {
+                if let (crate::nn::decode::PassShape::Verify { k }, [_]) = (shape, anchors) {
+                    self.model.prepare_verify(&mut self.seq.cache, k)?;
+                }
+                crate::nn::decode::begin_pass(device, shape)?;
+            }
+            // The sampled verify draws the target's token per row with `sampler`
+            // (#943 §2); the greedy one reads the argmax, as before.
+            let verified = match sampler.as_deref_mut() {
+                Some(s) => self.model.verify_and_probe_sampled(
+                    &drafts,
+                    anchors,
+                    &mut self.seq.cache,
+                    eos_ids,
+                    s,
+                ),
+                None => self
+                    .model
+                    .verify_and_probe(&drafts, anchors, &mut self.seq.cache, eos_ids),
+            };
+            if let Some((device, _)) = verify_key {
+                crate::nn::decode::end_pass(device)?;
+            }
+            let (accepted, probe_out) = verified?;
+            // What the round kept is the run's output: the processors' history,
+            // a budget's position and the digest move by it, as a step-by-step
+            // decode's do by its draws — after the planned pass, never inside it.
+            if let Some(s) = sampler {
+                for a in &accepted {
+                    s.commit_window(a)?;
+                }
+            }
+            let (gpu, disp, census) = probe.close()?;
+            timing.verify_ns = t.elapsed().as_nanos() as u64;
+            timing.verify_readbacks = readbacks() - rb;
+            timing.verify_gpu_s = gpu;
+            timing.verify_disp = disp;
+            timing.verify_census = census;
+
+            let t = std::time::Instant::now();
+            let rb = readbacks();
+            for (seq, acc) in active.iter().zip(&accepted) {
+                spec.observe(*seq, &probe_out, acc)?;
+            }
+            let (gpu, disp, census) = probe.close()?;
+            timing.observe_ns = t.elapsed().as_nanos() as u64;
+            timing.observe_readbacks = readbacks() - rb;
+            timing.observe_gpu_s = gpu;
+            timing.observe_disp = disp;
+            timing.observe_census = census;
+            let alloc_after = allocation_counters(verify_key.map(|(d, _)| d));
+            timing.pool_allocations = alloc_after.0 - alloc_before.0;
+            timing.residency_adds = alloc_after.1 - alloc_before.1;
+            timing.pool_allocations_pending_twin = alloc_after.2 - alloc_before.2;
+            Ok((accepted, timing))
+        })
     }
 
     /// The target's cache, for a caller that prefills before the first round.
@@ -1549,5 +1616,85 @@ mod tests {
                 dtype: DType::F32,
             })
         );
+    }
+}
+
+#[cfg(test)]
+mod round_probe_availability_tests {
+    use super::*;
+    use std::cell::Cell;
+    #[test]
+    fn no_sync_and_cpu_probes_have_no_gpu_measurement() {
+        let p = RoundProbe::default();
+        assert_eq!(p.close().unwrap(), (None, 0, None));
+        let p = RoundProbe {
+            sync: Some(&Device::Cpu),
+            census: false,
+        };
+        assert!(p.close().unwrap().0.is_none());
+        let t = RoundTiming::default();
+        assert_eq!(
+            (t.draft_gpu_s, t.verify_gpu_s, t.observe_gpu_s),
+            (None, None, None)
+        );
+    }
+    #[test]
+    fn explicit_unavailable_census_refuses_before_draft_side_effect() {
+        let p = RoundProbe {
+            sync: Some(&Device::Cpu),
+            census: true,
+        };
+        let entered = Cell::new(false);
+        let error = p
+            .with_checked_census(|| {
+                entered.set(true);
+                Ok(())
+            })
+            .unwrap_err();
+        assert!(!entered.get());
+        assert!(error
+            .to_string()
+            .contains("diagnostics.gpu_profile.enabled"));
+        if !lloom_tensor::tuning::PROFILE_INSTRUMENTS {
+            assert!(error
+                .to_string()
+                .contains("profile instrumentation is not compiled"));
+        }
+    }
+    #[test]
+    fn default_probe_keeps_body_and_host_scalar_operation() {
+        let entered = Cell::new(0);
+        RoundProbe::default()
+            .with_checked_census(|| {
+                entered.set(entered.get() + 1);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(entered.get(), 1);
+    }
+    #[cfg(feature = "metal")]
+    #[test]
+    fn production_phase_snapshot_preserves_counts_and_available_zero() {
+        use lloom_tensor::metal_backend::profile;
+        let mut t = lloom_tensor::tuning::Tuning::default();
+        t.instrument.profile = true;
+        lloom_tensor::tuning::install(t).unwrap();
+        profile::reset();
+        let label = std::sync::Arc::<str>::from("host-phase-positive");
+        profile::record_dispatch(Some(&label), 1);
+        let (gpu, dispatches, census) = phase_snapshot(true, true);
+        assert_eq!(dispatches, 1);
+        if lloom_tensor::tuning::PROFILE_INSTRUMENTS {
+            assert_eq!(gpu, Some(0.0));
+            assert_eq!(census, Some(vec![("host-phase-positive".into(), 1)]));
+        } else {
+            assert!(gpu.is_none());
+            assert!(census.is_none());
+        }
+        profile::record_dispatch(Some(&label), 1);
+        let (gpu, dispatches, census) = phase_snapshot(false, true);
+        assert_eq!(dispatches, 1);
+        assert!(gpu.is_none());
+        assert!(census.is_none());
     }
 }

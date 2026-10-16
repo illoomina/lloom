@@ -2799,8 +2799,10 @@ fn main() -> Result<()> {
     let matches = Args::command().get_matches();
     let args = Args::from_arg_matches(&matches)?;
     // A gate states its contract: deterministic, unless LLOOM_PROFILE names one.
-    candle::tuning::pin_contract(candle::tuning::Contract::Deterministic)
-        .map_err(anyhow::Error::msg)?;
+    candle_examples::pin_profiled_contract(
+        "lfm2-decode-profile",
+        candle::tuning::Contract::Deterministic,
+    )?;
     let key = shape_key(&args, &matches)?;
     println!("PROFILE {key}");
     lloom::profile::dispatch!(key, lloom::profile::LFM2, P => run::<P>(args, matches))

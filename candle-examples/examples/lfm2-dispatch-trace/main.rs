@@ -614,7 +614,7 @@ fn run<P: Lfm2Shape>(args: Args) -> Result<()> {
     let input = Tensor::new(prompt_ids.as_slice(), &device)?.unsqueeze(0)?;
     if args.include_prefill {
         trace::set_region(Some("prefill".to_string()));
-        trace::set_recording(true);
+        trace::set_recording(true)?;
     }
     let mut logits = model
         .forward(&input, kv_len, &mut cache)
@@ -622,7 +622,7 @@ fn run<P: Lfm2Shape>(args: Args) -> Result<()> {
         .squeeze(0)?;
     trace_window(&device)?;
     if args.include_prefill {
-        trace::set_recording(false);
+        trace::set_recording(false)?;
         let dispatches = trace::take_dispatches();
         steps.push(Step {
             label: "prefill".to_string(),
@@ -761,7 +761,7 @@ fn run<P: Lfm2Shape>(args: Args) -> Result<()> {
 
         let label = format!("decode[{step}] kv_len={kv_len}");
         trace::set_region(Some(label.clone()));
-        trace::set_recording(true);
+        trace::set_recording(true)?;
         if args.hazard_audit_live {
             audit_begin(&label);
         }
@@ -773,7 +773,7 @@ fn run<P: Lfm2Shape>(args: Args) -> Result<()> {
         if args.hazard_audit_live {
             audit_finish();
         }
-        trace::set_recording(false);
+        trace::set_recording(false)?;
 
         // Close the ICB step here: after the forward pass has drained and
         // *before* the next iteration samples, so an ICB step is exactly the

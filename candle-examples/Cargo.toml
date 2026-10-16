@@ -88,6 +88,8 @@ hf-hub = { workspace = true, features = ["tokio"] }
 
 [features]
 default = []
+# Explicit detailed diagnostic arm; does not enable profiling by default.
+profile = ["candle/profile", "lloom/profile"]
 accelerate = [
     "dep:accelerate-src",
     "candle/accelerate",

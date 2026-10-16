@@ -2126,7 +2126,7 @@ impl ComputeCommandEncoder {
         }
         unsafe {
             self.raw
-                .setBuffer_offset_atIndex(Some(unsafe { buffer.raw_unchecked() }), 0, index)
+                .setBuffer_offset_atIndex(Some(buffer.raw_unchecked()), 0, index)
         }
         // The staging buffer must stay alive until the dispatch it feeds has
         // completed, not merely until it is encoded. It is parked here and
@@ -2757,7 +2757,7 @@ impl BlitCommandEncoder {
         if range.1 == 0 {
             return Ok(());
         }
-        if absolute % 4 != 0 || range.1 % 4 != 0 {
+        if !absolute.is_multiple_of(4) || !range.1.is_multiple_of(4) {
             return Err(Error::QueueUnavailable(
                 "byte fill requires its prepared compute arm",
             ));
@@ -2858,9 +2858,9 @@ impl BlitCommandEncoder {
         unsafe {
             self.raw
                 .copyFromBuffer_sourceOffset_toBuffer_destinationOffset_size(
-                    unsafe { src_buffer.raw_unchecked() },
+                    src_buffer.raw_unchecked(),
                     src_offset,
-                    unsafe { dst_buffer.raw_unchecked() },
+                    dst_buffer.raw_unchecked(),
                     dst_offset,
                     size,
                 )

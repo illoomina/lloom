@@ -28,6 +28,10 @@ impl Compute {
     common!(dispatchThreads_threadsPerThreadgroup(grid: MTLSize, group: MTLSize));
     common!(dispatchThreadgroups_threadsPerThreadgroup(grid: MTLSize, group: MTLSize));
     common!(setLabel(label: Option<&NSString>));
+    #[cfg(feature = "debug-labels")]
+    common!(pushDebugGroup(string: &NSString));
+    #[cfg(feature = "debug-labels")]
+    common!(popDebugGroup());
 
     /// The native encoder's address: the pass identity the hazard audit keys
     /// on while the encoder is open.

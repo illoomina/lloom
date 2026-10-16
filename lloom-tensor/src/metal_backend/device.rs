@@ -2193,7 +2193,7 @@ impl MetalDevice {
 
     /// What an armed recording installed, once it has.
     pub fn arena_auto_report(&self) -> Option<ArenaAutoReport> {
-        self.arena_auto_report.lock().clone()
+        *self.arena_auto_report.lock()
     }
 
     /// [`Self::end_decode_step`], plus the install an armed recording is due
@@ -3564,17 +3564,15 @@ impl MetalDevice {
             capsule.allocate_pool_with(
                 metadata,
                 || {
-                    unsafe {
-                        match profile {
-                            super::planned_output_catalog::OutputProfile::Shared => self
-                                .backings
-                                .transient_shared
-                                .alloc_custodied(bytes, context),
-                            super::planned_output_catalog::OutputProfile::Private => self
-                                .backings
-                                .transient_private
-                                .alloc_custodied(bytes, context),
-                        }
+                    match profile {
+                        super::planned_output_catalog::OutputProfile::Shared => self
+                            .backings
+                            .transient_shared
+                            .alloc_custodied(bytes, context),
+                        super::planned_output_catalog::OutputProfile::Private => self
+                            .backings
+                            .transient_private
+                            .alloc_custodied(bytes, context),
                     }
                     .map_err(crate::Error::from)
                 },
@@ -3644,19 +3642,17 @@ impl MetalDevice {
             .ok_or_else(|| crate::Error::Msg("output catalog requires cold installation".into()))?;
         unsafe {
             catalog.append_cold_with(context, profile, || {
-                let slot =
-                    unsafe { self.new_prepared_buffer_profile_in(bytes, profile, Some(context)) }
-                        .map_err(CatalogError::Creator)?;
-                let operation = unsafe {
-                    PreparedAffineOperation::cold_in(
-                        self,
-                        context,
-                        dtype,
-                        operation,
-                        style,
-                        strided_rank,
-                    )
-                }
+                let slot = self
+                    .new_prepared_buffer_profile_in(bytes, profile, Some(context))
+                    .map_err(CatalogError::Creator)?;
+                let operation = PreparedAffineOperation::cold_in(
+                    self,
+                    context,
+                    dtype,
+                    operation,
+                    style,
+                    strided_rank,
+                )
                 .map_err(CatalogError::Operation)?;
                 Ok((slot, OperationPayload::Affine(operation)))
             })
@@ -3725,12 +3721,10 @@ impl MetalDevice {
             capsule.allocate_staging_with(
                 metadata,
                 || {
-                    unsafe {
-                        self.backings
-                            .resident_shared
-                            .alloc_custodied(bytes, context)
-                    }
-                    .map_err(crate::Error::from)
+                    self.backings
+                        .resident_shared
+                        .alloc_custodied(bytes, context)
+                        .map_err(crate::Error::from)
                 },
                 self.commands.clock(),
                 bytes,
@@ -3789,11 +3783,10 @@ impl MetalDevice {
                         // SAFETY: cold private whole-allocation birth, no raw/view escape;
                         // logical extent remains zero and every later native use must
                         // obey the same counted/closed-use contract as nonempty uploads.
-                        Some(bytes) => unsafe {
-                            self.backings
-                                .resident_shared
-                                .alloc_custodied(bytes, context)
-                        },
+                        Some(bytes) => self
+                            .backings
+                            .resident_shared
+                            .alloc_custodied(bytes, context),
                         None => self
                             .backings
                             .resident_shared

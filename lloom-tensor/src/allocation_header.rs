@@ -288,7 +288,7 @@ impl<const N: usize> HeaderInventory<N> {
         if last {
             cell.transition(ticket.generation, LIVE, DETACHING)?;
         }
-        Ok(last.then(|| HeaderDetachment { ticket }))
+        Ok(last.then_some(HeaderDetachment { ticket }))
     }
     /// Publish last: all cleanup payload/physical custody writes precede this
     /// Release bit. Consuming the non-Clone authority transfers its sole custody

@@ -205,7 +205,9 @@ fn a_slow_consumer_moves_the_adaptive_overrun_and_not_the_fixed_one() -> Result<
     let next: Vec<u32> = [prompt.clone(), reply.clone(), vec![10, 20, 30]].concat();
     let requests = vec![req(prompt.clone(), 3000), req(next, 8)];
 
-    let want = serve(&model, &cfg, &dev, "blocking", false, eos, &requests, None, SLOW)?;
+    let want = serve(
+        &model, &cfg, &dev, "blocking", false, eos, &requests, None, SLOW,
+    )?;
     assert_eq!(want[0].ids, reply);
     assert_eq!(want[0].stop, Stop::Eos);
     assert_eq!(
@@ -238,7 +240,9 @@ fn a_slow_consumer_moves_the_adaptive_overrun_and_not_the_fixed_one() -> Result<
 
     for spelling in ["ring-fixed", "ring-nonblocking"] {
         for slow in [None, Some(cut)] {
-            let got = serve(&model, &cfg, &dev, spelling, false, eos, &requests, slow, SLOW)?;
+            let got = serve(
+                &model, &cfg, &dev, spelling, false, eos, &requests, slow, SLOW,
+            )?;
             let at = format!("{spelling} slow={}", slow.is_some());
             eprintln!(
                 "FRONTIER-SERVED {at}: overrun {} (lead {lead}) stopped_by_flag {} | next request \
@@ -319,7 +323,9 @@ fn a_host_stop_keeps_what_the_loop_produced_past_it() -> Result<()> {
     let requests = vec![first, req(next, 8)];
     for spelling in ["blocking", "ring-fixed", "ring-nonblocking"] {
         for slow in [None, Some(at)] {
-            let got = serve(&model, &cfg, &dev, spelling, false, never, &requests, slow, SLOW)?;
+            let got = serve(
+                &model, &cfg, &dev, spelling, false, never, &requests, slow, SLOW,
+            )?;
             let label = format!("{spelling} slow={}", slow.is_some());
             let text: String = seen.iter().map(|t| format!("<{t}>")).collect();
             eprintln!(
@@ -382,7 +388,9 @@ fn under_the_eos_gate_the_next_request_extends_past_any_overrun() -> Result<()> 
     let reply = stream[..cut].to_vec();
     let next: Vec<u32> = [prompt.clone(), reply.clone(), vec![10, 20, 30]].concat();
     let requests = vec![req(prompt.clone(), 3000), req(next, 8)];
-    let want = serve(&model, &cfg, &dev, "blocking", false, eos, &requests, None, SLOW)?;
+    let want = serve(
+        &model, &cfg, &dev, "blocking", false, eos, &requests, None, SLOW,
+    )?;
     assert_eq!(want[0].ids, reply);
     assert_eq!(want[1].reuse, ReuseAction::Extend);
     let lead = lloom::nn::DecodeOptions {
@@ -394,7 +402,9 @@ fn under_the_eos_gate_the_next_request_extends_past_any_overrun() -> Result<()> 
 
     for spelling in ["ring-fixed", "ring-nonblocking"] {
         for slow in [None, Some(cut)] {
-            let got = serve(&model, &cfg, &dev, spelling, true, eos, &requests, slow, SLOW)?;
+            let got = serve(
+                &model, &cfg, &dev, spelling, true, eos, &requests, slow, SLOW,
+            )?;
             let at = format!("gated {spelling} slow={}", slow.is_some());
             eprintln!(
                 "FRONTIER-GATED {at}: overrun {} (lead {lead}) stopped_by_flag {} gated {} | next \
@@ -408,9 +418,19 @@ fn under_the_eos_gate_the_next_request_extends_past_any_overrun() -> Result<()> 
             );
             assert_eq!(got[0].ids, want[0].ids, "{at}: the reply");
             assert_eq!(got[0].stop, Stop::Eos, "{at}");
-            assert_eq!(got[1].reuse, ReuseAction::Extend, "{at}: the next request extends");
-            assert_eq!(got[1].prefilled, want[1].prefilled, "{at}: and prefills what blocking does");
-            assert_eq!(got[1].ids, want[1].ids, "{at}: and answers as blocking does");
+            assert_eq!(
+                got[1].reuse,
+                ReuseAction::Extend,
+                "{at}: the next request extends"
+            );
+            assert_eq!(
+                got[1].prefilled, want[1].prefilled,
+                "{at}: and prefills what blocking does"
+            );
+            assert_eq!(
+                got[1].ids, want[1].ids,
+                "{at}: and answers as blocking does"
+            );
             let adaptive = spelling == "ring-nonblocking";
             assert_eq!(
                 got[0].gated, adaptive,
@@ -512,7 +532,8 @@ fn under_the_eos_gate_one_live_session_takes_every_stop_kind() -> Result<()> {
         let (s, p) = session.into_parts();
         seq = Some(s);
         rings = Some(p);
-        let gated = decoded.stats.eos_gate.is_some_and(|g| g.fired) && decoded.stats.overrun_unwritten;
+        let gated =
+            decoded.stats.eos_gate.is_some_and(|g| g.fired) && decoded.stats.overrun_unwritten;
         eprintln!(
             "LIVE turn {i} {kind}: stop {:?} ids {} overrun {} gated {gated} | reuse {:?} prefilled {} of {}",
             decoded.stop,
@@ -523,8 +544,15 @@ fn under_the_eos_gate_one_live_session_takes_every_stop_kind() -> Result<()> {
             convo.len(),
         );
         if last_was_eos {
-            assert_eq!(decoded.reuse, ReuseAction::Extend, "turn {i}: the request after an EOS extends");
-            assert_eq!(decoded.prefilled, 2, "turn {i}: and prefills only the user turn");
+            assert_eq!(
+                decoded.reuse,
+                ReuseAction::Extend,
+                "turn {i}: the request after an EOS extends"
+            );
+            assert_eq!(
+                decoded.prefilled, 2,
+                "turn {i}: and prefills only the user turn"
+            );
             extend_after_eos += 1;
         }
         let want_stop = match *kind {
@@ -537,7 +565,11 @@ fn under_the_eos_gate_one_live_session_takes_every_stop_kind() -> Result<()> {
         // position, or a length turn may meet it first: the kinds below
         // are what the conversation was driven to, and are asserted.
         assert_eq!(decoded.stop, want_stop, "turn {i} ({kind})");
-        assert_eq!(gated, want_stop == Stop::Eos, "turn {i} ({kind}): the gate fires on an EOS only");
+        assert_eq!(
+            gated,
+            want_stop == Stop::Eos,
+            "turn {i} ({kind}): the gate fires on an EOS only"
+        );
         last_was_eos = want_stop == Stop::Eos;
         seen_eos_turns += last_was_eos as usize;
         record.push((i, kind.to_string(), decoded.tokens.clone(), decoded.reuse));
@@ -569,7 +601,10 @@ fn under_the_eos_gate_one_live_session_takes_every_stop_kind() -> Result<()> {
         None,
         SLOW,
     )?;
-    assert_eq!(record[0].2, want[0].ids, "the first EOS turn answers as blocking does");
+    assert_eq!(
+        record[0].2, want[0].ids,
+        "the first EOS turn answers as blocking does"
+    );
     assert_eq!(record[1].2, want[1].ids, "and so does the request after it");
     Ok(())
 }
@@ -592,9 +627,19 @@ fn under_the_eos_gate_the_overrun_reconciles_on_a_wrapped_pooled_ring() -> Resul
     let never = u32::MAX;
     let prompt: Vec<u32> = vec![1, 3, 5, 7, 9];
     let first = req(prompt.clone(), long);
-    let reply1 = serve(&model, &cfg, &dev, "blocking", false, never, &[first.clone()], None, SLOW)?
-        .remove(0)
-        .ids;
+    let reply1 = serve(
+        &model,
+        &cfg,
+        &dev,
+        "blocking",
+        false,
+        never,
+        &[first.clone()],
+        None,
+        SLOW,
+    )?
+    .remove(0)
+    .ids;
     assert_eq!(reply1.len(), long, "the first request runs to its length");
     let next: Vec<u32> = [prompt.clone(), reply1.clone(), vec![10, 20, 30]].concat();
     let probe = serve(
@@ -625,11 +670,27 @@ fn under_the_eos_gate_the_overrun_reconciles_on_a_wrapped_pooled_ring() -> Resul
             ..req(third, 8)
         },
     ];
-    let want = serve(&model, &cfg, &dev, "blocking", false, never, &requests, None, SLOW)?;
-    assert_eq!(want[1].ids, &reply2[..k], "the blocking arm stops at the EOS");
+    let want = serve(
+        &model, &cfg, &dev, "blocking", false, never, &requests, None, SLOW,
+    )?;
+    assert_eq!(
+        want[1].ids,
+        &reply2[..k],
+        "the blocking arm stops at the EOS"
+    );
     assert_eq!(want[2].reuse, ReuseAction::Extend);
     for slow in [None, Some(k)] {
-        let got = serve(&model, &cfg, &dev, "ring-nonblocking", true, never, &requests, slow, SLOW)?;
+        let got = serve(
+            &model,
+            &cfg,
+            &dev,
+            "ring-nonblocking",
+            true,
+            never,
+            &requests,
+            slow,
+            SLOW,
+        )?;
         let at = format!("gated, the ring wrapped, slow={}", slow.is_some());
         eprintln!(
             "FRONTIER-WRAP {at}: first {:?} {} ids (ring {slots}) | second {:?} overrun {} gated {} | third {:?} prefilled {} (blocking {})",
@@ -643,12 +704,22 @@ fn under_the_eos_gate_the_overrun_reconciles_on_a_wrapped_pooled_ring() -> Resul
             want[2].prefilled,
         );
         assert_eq!(got[0].ids, reply1, "{at}: the first reply");
-        assert_eq!(got[1].ids, want[1].ids, "{at}: the second reply, past the wrap");
+        assert_eq!(
+            got[1].ids, want[1].ids,
+            "{at}: the second reply, past the wrap"
+        );
         assert_eq!(got[1].stop, Stop::Eos, "{at}");
         assert!(got[1].gated, "{at}: the gate fired, the overrun unwritten");
-        assert_eq!(got[2].reuse, ReuseAction::Extend, "{at}: the third request extends");
+        assert_eq!(
+            got[2].reuse,
+            ReuseAction::Extend,
+            "{at}: the third request extends"
+        );
         assert_eq!(got[2].prefilled, want[2].prefilled, "{at}");
-        assert_eq!(got[2].ids, want[2].ids, "{at}: and answers as blocking does");
+        assert_eq!(
+            got[2].ids, want[2].ids,
+            "{at}: and answers as blocking does"
+        );
     }
     Ok(())
 }
@@ -695,8 +766,21 @@ fn the_eos_watch_bounds_the_served_overrun_past_a_slow_consumer() -> Result<()> 
     let reply = stream[..cut].to_vec();
     let next: Vec<u32> = [prompt.clone(), reply.clone(), vec![10, 20, 30]].concat();
     let requests = vec![req(prompt.clone(), 3000), req(next, 8)];
-    let want = serve(&model, &cfg, &dev, "blocking", false, eos, &requests, None, SLOW)?;
-    let fresh = serve(&model, &cfg, &dev, "blocking", false, eos, &requests[1..], None, SLOW)?.remove(0);
+    let want = serve(
+        &model, &cfg, &dev, "blocking", false, eos, &requests, None, SLOW,
+    )?;
+    let fresh = serve(
+        &model,
+        &cfg,
+        &dev,
+        "blocking",
+        false,
+        eos,
+        &requests[1..],
+        None,
+        SLOW,
+    )?
+    .remove(0);
     let lead = lloom::nn::DecodeOptions {
         adaptive_commit: true,
         run_ahead: 8,
@@ -704,7 +788,17 @@ fn the_eos_watch_bounds_the_served_overrun_past_a_slow_consumer() -> Result<()> 
     }
     .adaptive_lead();
     for slow in [None, Some(cut)] {
-        let got = serve(&model, &cfg, &dev, "ring-nonblocking", false, eos, &requests, slow, SLOW)?;
+        let got = serve(
+            &model,
+            &cfg,
+            &dev,
+            "ring-nonblocking",
+            false,
+            eos,
+            &requests,
+            slow,
+            SLOW,
+        )?;
         let at = format!("watched ring-nonblocking slow={}", slow.is_some());
         eprintln!(
             "FRONTIER-WATCH-SERVED {at}: overrun {} (lead {lead}) stopped_by_eos_watch {} \
@@ -756,9 +850,19 @@ fn the_watch_and_the_gate_together_bound_the_overrun_and_keep_the_state() -> Res
     let dev = Device::new_metal(0)?;
     let (model, cfg) = model(&dev)?;
     let prompt: Vec<u32> = vec![1, 3, 5, 7, 9];
-    let stream = serve(&model, &cfg, &dev, "blocking", false, u32::MAX, &[req(prompt.clone(), 32)], None, SLOW)?
-        .remove(0)
-        .ids;
+    let stream = serve(
+        &model,
+        &cfg,
+        &dev,
+        "blocking",
+        false,
+        u32::MAX,
+        &[req(prompt.clone(), 32)],
+        None,
+        SLOW,
+    )?
+    .remove(0)
+    .ids;
     let cut = (6..stream.len())
         .find(|&i| !stream[..i].contains(&stream[i]))
         .expect("a fresh id to stop on");
@@ -766,7 +870,9 @@ fn the_watch_and_the_gate_together_bound_the_overrun_and_keep_the_state() -> Res
     let reply = stream[..cut].to_vec();
     let next: Vec<u32> = [prompt.clone(), reply.clone(), vec![10, 20, 30]].concat();
     let requests = vec![req(prompt.clone(), 3000), req(next, 8)];
-    let want = serve(&model, &cfg, &dev, "blocking", false, eos, &requests, None, SLOW)?;
+    let want = serve(
+        &model, &cfg, &dev, "blocking", false, eos, &requests, None, SLOW,
+    )?;
     let lead = lloom::nn::DecodeOptions {
         adaptive_commit: true,
         run_ahead: 8,
@@ -774,7 +880,17 @@ fn the_watch_and_the_gate_together_bound_the_overrun_and_keep_the_state() -> Res
     }
     .adaptive_lead();
     for slow in [None, Some(cut)] {
-        let got = serve(&model, &cfg, &dev, "ring-nonblocking", true, eos, &requests, slow, SLOW)?;
+        let got = serve(
+            &model,
+            &cfg,
+            &dev,
+            "ring-nonblocking",
+            true,
+            eos,
+            &requests,
+            slow,
+            SLOW,
+        )?;
         let at = format!("watched and gated slow={}", slow.is_some());
         eprintln!(
             "FRONTIER-BOTH {at}: overrun {} (lead {lead}) stopped_by_eos_watch {} gated {} | next request {:?} prefilled {} (blocking {})",
@@ -786,10 +902,20 @@ fn the_watch_and_the_gate_together_bound_the_overrun_and_keep_the_state() -> Res
             want[1].prefilled,
         );
         assert_eq!(got[0].ids, want[0].ids, "{at}: the reply");
-        assert!(got[0].overrun <= lead + 1, "{at}: the watch bounds the overrun");
+        assert!(
+            got[0].overrun <= lead + 1,
+            "{at}: the watch bounds the overrun"
+        );
         assert!(got[0].gated, "{at}: the gate left it unwritten");
-        assert_eq!(got[1].reuse, ReuseAction::Extend, "{at}: the next request extends");
-        assert_eq!(got[1].ids, want[1].ids, "{at}: and answers as blocking does");
+        assert_eq!(
+            got[1].reuse,
+            ReuseAction::Extend,
+            "{at}: the next request extends"
+        );
+        assert_eq!(
+            got[1].ids, want[1].ids,
+            "{at}: and answers as blocking does"
+        );
     }
     Ok(())
 }
@@ -818,9 +944,19 @@ fn the_watch_and_the_gate_together_keep_a_sampled_continuation() -> Result<()> {
         temperature: Some(0.8),
         ..req(prompt, n)
     };
-    let stream = serve(&model, &cfg, &dev, "blocking", false, u32::MAX, &[sampled(prompt.clone(), 32)], None, SLOW)?
-        .remove(0)
-        .ids;
+    let stream = serve(
+        &model,
+        &cfg,
+        &dev,
+        "blocking",
+        false,
+        u32::MAX,
+        &[sampled(prompt.clone(), 32)],
+        None,
+        SLOW,
+    )?
+    .remove(0)
+    .ids;
     let cut = (6..stream.len())
         .find(|&i| !stream[..i].contains(&stream[i]))
         .expect("a fresh id to stop on");
@@ -828,8 +964,13 @@ fn the_watch_and_the_gate_together_keep_a_sampled_continuation() -> Result<()> {
     let reply = stream[..cut].to_vec();
     let next: Vec<u32> = [prompt.clone(), reply.clone(), vec![10, 20, 30]].concat();
     let requests = vec![sampled(prompt.clone(), 3000), sampled(next, 8)];
-    let want = serve(&model, &cfg, &dev, "blocking", false, eos, &requests, None, SLOW)?;
-    assert_eq!(want[0].ids, reply, "the blocking arm's sampled reply stops at the EOS");
+    let want = serve(
+        &model, &cfg, &dev, "blocking", false, eos, &requests, None, SLOW,
+    )?;
+    assert_eq!(
+        want[0].ids, reply,
+        "the blocking arm's sampled reply stops at the EOS"
+    );
     let lead = lloom::nn::DecodeOptions {
         adaptive_commit: true,
         run_ahead: 8,
@@ -837,7 +978,17 @@ fn the_watch_and_the_gate_together_keep_a_sampled_continuation() -> Result<()> {
     }
     .adaptive_lead();
     for slow in [None, Some(cut)] {
-        let got = serve(&model, &cfg, &dev, "ring-nonblocking", true, eos, &requests, slow, SLOW)?;
+        let got = serve(
+            &model,
+            &cfg,
+            &dev,
+            "ring-nonblocking",
+            true,
+            eos,
+            &requests,
+            slow,
+            SLOW,
+        )?;
         let at = format!("sampled, watched and gated slow={}", slow.is_some());
         eprintln!(
             "FRONTIER-SAMPLED {at}: overrun {} (lead {lead}) stopped_by_eos_watch {} gated {} | next request {:?} prefilled {} (blocking {})",
@@ -849,9 +1000,16 @@ fn the_watch_and_the_gate_together_keep_a_sampled_continuation() -> Result<()> {
             want[1].prefilled,
         );
         assert_eq!(got[0].ids, want[0].ids, "{at}: the sampled reply");
-        assert!(got[0].overrun <= lead + 1, "{at}: the watch bounds the overrun");
+        assert!(
+            got[0].overrun <= lead + 1,
+            "{at}: the watch bounds the overrun"
+        );
         assert!(got[0].gated, "{at}: the gate left it unwritten");
-        assert_eq!(got[1].reuse, ReuseAction::Extend, "{at}: the next request extends");
+        assert_eq!(
+            got[1].reuse,
+            ReuseAction::Extend,
+            "{at}: the next request extends"
+        );
         assert_eq!(got[1].ids, want[1].ids, "{at}: and draws as blocking does");
     }
     Ok(())

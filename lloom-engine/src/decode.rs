@@ -28,6 +28,20 @@ use lloom::nn::{
 };
 use lloom_tensor::{Device, Result};
 
+/// Execute the reader while its producer's stop signal is in scope.
+/// The exit guard also covers a fallible detokenizer and unwinding: error
+/// propagation alone does not wake/cancel the independent producer loop.
+fn stop_on_reader_exit<T>(stop: &std::sync::atomic::AtomicBool, read: impl FnOnce() -> T) -> T {
+    struct StopOnExit<'a>(&'a std::sync::atomic::AtomicBool);
+    impl Drop for StopOnExit<'_> {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::Release);
+        }
+    }
+    let _guard = StopOnExit(stop);
+    read()
+}
+
 /// Why a decode run stopped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Stop {
@@ -880,56 +894,59 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
                             let hook = &mut on_tokens;
                             let stop_flag = &stop_flag;
                             let stream_done = &stream_done;
-                            let worker = s.spawn(move || -> Result<()> {
-                                let mut buf: Vec<u32> = Vec::with_capacity(64);
-                                loop {
-                                    buf.clear();
-                                    if reader.ended() {
-                                        stop_flag.store(true, std::sync::atomic::Ordering::Release);
-                                    }
-                                    match reader.read_new(&mut buf) {
-                                        Ok(0) => {
-                                            if stream_done
-                                                .load(std::sync::atomic::Ordering::Acquire)
-                                            {
-                                                buf.clear();
-                                                let n =
-                                                    reader.read_new(&mut buf).map_err(|lap| {
+                            let worker = s.spawn(move || {
+                                stop_on_reader_exit(stop_flag, || -> Result<()> {
+                                    let mut buf: Vec<u32> = Vec::with_capacity(64);
+                                    loop {
+                                        buf.clear();
+                                        if reader.ended() {
+                                            stop_flag
+                                                .store(true, std::sync::atomic::Ordering::Release);
+                                        }
+                                        match reader.read_new(&mut buf) {
+                                            Ok(0) => {
+                                                if stream_done
+                                                    .load(std::sync::atomic::Ordering::Acquire)
+                                                {
+                                                    buf.clear();
+                                                    let n = reader.read_new(&mut buf).map_err(
+                                                        |lap| {
+                                                            stop_flag.store(
+                                                            true,
+                                                            std::sync::atomic::Ordering::Release,
+                                                        );
+                                                            lloom_tensor::Error::msg(format!(
+                                                                "ring reader final drain: {lap}"
+                                                            ))
+                                                        },
+                                                    )?;
+                                                    if n > 0 && !hook(&buf)? {
                                                         stop_flag.store(
                                                             true,
                                                             std::sync::atomic::Ordering::Release,
                                                         );
-                                                        lloom_tensor::Error::msg(format!(
-                                                            "ring reader final drain: {lap}"
-                                                        ))
-                                                    })?;
-                                                if n > 0 && !hook(&buf)? {
-                                                    stop_flag.store(
-                                                        true,
-                                                        std::sync::atomic::Ordering::Release,
-                                                    );
+                                                    }
+                                                    return Ok(());
                                                 }
-                                                return Ok(());
+                                                std::thread::sleep(
+                                                    std::time::Duration::from_micros(200),
+                                                );
                                             }
-                                            std::thread::sleep(std::time::Duration::from_micros(
-                                                200,
-                                            ));
-                                        }
-                                        Ok(_) => {
-                                            if !hook(&buf)? {
+                                            Ok(_) => {
+                                                if !hook(&buf)? {
+                                                    return Ok(());
+                                                }
+                                            }
+                                            Err(lap) => {
                                                 stop_flag.store(
                                                     true,
                                                     std::sync::atomic::Ordering::Release,
                                                 );
+                                                lloom_tensor::bail!("ring reader: {lap}");
                                             }
                                         }
-                                        Err(lap) => {
-                                            stop_flag
-                                                .store(true, std::sync::atomic::Ordering::Release);
-                                            lloom_tensor::bail!("ring reader: {lap}");
-                                        }
                                     }
-                                }
+                                })
                             });
                             let out = self.session.decode_until(
                                 &mut spec,
@@ -963,6 +980,16 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
             }
         };
 
+        if !cancelled && !stopped_on_string {
+            let (rest, stopped) = stream.flush(&mut detokenize, &params.stop_strings)?;
+            stopped_on_string |= stopped;
+            if let Some(rest) = rest {
+                if !on_fragment(&rest) {
+                    stream.refuse_last();
+                    cancelled = true;
+                }
+            }
+        }
         let stop = if cancelled {
             Stop::Cancelled
         } else if stopped_on_string {
@@ -972,16 +999,6 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
         } else {
             Stop::Length
         };
-        // A run that ended short of the stop string hands out what was held
-        // as its possible beginning.
-        if !cancelled && !stopped_on_string {
-            if let Some(rest) = stream.held() {
-                if !on_fragment(&rest) {
-                    stream.refuse_last();
-                }
-            }
-        }
-
         let (text, _) = stream.finish(&params.stop_strings);
         let thinking = params.thinking.as_ref().map(|b| b.report(&out.ids));
 
@@ -1129,6 +1146,16 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
             &params.eos_ids,
             &mut on_tokens,
         )?;
+        if !cancelled && !stopped_on_string {
+            let (rest, stopped) = stream.flush(&mut detokenize, &params.stop_strings)?;
+            stopped_on_string |= stopped;
+            if let Some(rest) = rest {
+                if !on_fragment(&rest) {
+                    stream.refuse_last();
+                    cancelled = true;
+                }
+            }
+        }
         let stop_reason = if cancelled {
             Stop::Cancelled
         } else if stopped_on_string {
@@ -1138,13 +1165,6 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
         } else {
             Stop::Length
         };
-        if !cancelled && !stopped_on_string {
-            if let Some(rest) = stream.held() {
-                if !on_fragment(&rest) {
-                    stream.refuse_last();
-                }
-            }
-        }
         let (text, _) = stream.finish(&params.stop_strings);
         let thinking = params.thinking.as_ref().map(|b| b.report(&out.ids));
         Ok(Decoded {
@@ -1169,6 +1189,25 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reader_error_and_panic_cancel_the_producer_before_join() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let stop = AtomicBool::new(false);
+        let err: Result<()> =
+            stop_on_reader_exit(&stop, || lloom_tensor::bail!("injected detokenizer error"));
+        assert!(err.unwrap_err().to_string().contains("detokenizer"));
+        assert!(
+            stop.load(Ordering::Acquire),
+            "reader returned but producer is live"
+        );
+        stop.store(false, Ordering::Release);
+        let panicked = std::panic::catch_unwind(|| {
+            stop_on_reader_exit(&stop, || panic!("injected reader panic"))
+        });
+        assert!(panicked.is_err());
+        assert!(stop.load(Ordering::Acquire), "unwinding left producer live");
+    }
 
     /// The pool keys on the EOS *set*: a run that names the ids in another
     /// order, or twice, reuses the ring built for the first.
@@ -1298,6 +1337,7 @@ mod tests {
         struct Chain {
             table: Tensor,
             eye: Tensor,
+            forwards: std::sync::atomic::AtomicUsize,
         }
 
         impl Chain {
@@ -1306,6 +1346,7 @@ mod tests {
                 Ok(Self {
                     table: Tensor::from_vec(table, VOCAB, device)?,
                     eye: Tensor::eye(VOCAB, DType::F32, device)?,
+                    forwards: std::sync::atomic::AtomicUsize::new(0),
                 })
             }
         }
@@ -1337,6 +1378,8 @@ mod tests {
                     cache.0
                 );
                 let (_b, seq) = embeds.dims2()?;
+                self.forwards
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 cache.0 += seq;
                 let last = embeds.narrow(1, seq - 1, 1)?.flatten_all()?;
                 let next = self.table.index_select(&last, 0)?.to_dtype(DType::U32)?;
@@ -1439,6 +1482,124 @@ mod tests {
                 lloom_tensor::bail!("the reader and the loop both streamed one reply");
             }
             Ok((reply, streamed, by, session.into_parts()))
+        }
+
+        /// Production decode integration: a final pending tokenizer run
+        /// is flushed on both blocking and fixed-cadence batch delivery.
+        #[test]
+        fn served_terminal_pending_text_matches_the_full_detokenizer() -> Result<()> {
+            let dev = Device::Cpu;
+            let model = Chain::new(&dev)?;
+            let ids = chain(3, 3).0;
+            assert_eq!(ids.len(), 3);
+            let terminal = *ids.last().unwrap();
+            let detok = |xs: &[u32]| -> Result<String> {
+                Ok(xs
+                    .iter()
+                    .map(|id| {
+                        if *id == terminal {
+                            "\u{FFFD}".to_string()
+                        } else {
+                            format!("<{id}>")
+                        }
+                    })
+                    .collect())
+            };
+            let expected = detok(&ids)?;
+            for spelling in ["blocking", "ring-fixed"] {
+                for stop in [None, Some(expected.clone())] {
+                    let mut config = DecodeConfig::default();
+                    ReadbackConfig::apply_spelling(&mut config.readback, spelling).unwrap();
+                    let mut session = DecodeSession::new(&model, Pos(0), dev.clone(), 0)
+                        .with_config(config.clone());
+                    let params = DecodeParams {
+                        max_tokens: 3,
+                        eos_ids: vec![u32::MAX],
+                        readback: config.readback.arm(),
+                        stop_strings: stop.iter().cloned().collect(),
+                        ..DecodeParams::default()
+                    };
+                    let mut delivered = String::new();
+                    let out = session.decode(&[3], detok, &params, |s| delivered.push_str(s))?;
+                    let want = if stop.is_some() {
+                        ""
+                    } else {
+                        expected.as_str()
+                    };
+                    assert_eq!(out.tokens, ids, "{spelling}: sampled ids unchanged");
+                    assert_eq!(out.text, want, "{spelling}: full tokenizer oracle");
+                    assert_eq!(delivered, want, "{spelling}: delivered frontier");
+                    assert_eq!(
+                        out.stop,
+                        if stop.is_some() {
+                            Stop::StopString
+                        } else {
+                            Stop::Length
+                        }
+                    );
+                }
+            }
+            Ok(())
+        }
+
+        /// A real reader-thread detokenization error cancels the producer,
+        /// rather than letting its finite safety budget be the stop signal.
+        /// Count model forwards at the error, not elapsed time or an Err exit.
+        #[cfg(feature = "metal")]
+        #[test]
+        fn a_reader_detokenizer_error_bounds_extra_forwards_and_next_request() -> Result<()> {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            let dev = Device::new_metal(0)?;
+            let model = Chain::new(&dev)?;
+            let mut config = DecodeConfig::default();
+            ReadbackConfig::apply_spelling(&mut config.readback, "ring-nonblocking").unwrap();
+            config.readback.eos_gate = false;
+            let mut session =
+                DecodeSession::new(&model, Pos(0), dev, 0).with_config(config.clone());
+            let params = DecodeParams {
+                max_tokens: 256,
+                eos_ids: vec![u32::MAX],
+                readback: config.readback.arm(),
+                ..DecodeParams::default()
+            };
+            let at_error = AtomicUsize::new(usize::MAX);
+            let mut calls = 0;
+            let error = session
+                .decode(
+                    &[3],
+                    |ids| {
+                        calls += 1;
+                        if calls == 3 {
+                            at_error
+                                .store(model.forwards.load(Ordering::Acquire), Ordering::Release);
+                            lloom_tensor::bail!("injected reader detokenizer failure");
+                        }
+                        Ok(text_of(ids))
+                    },
+                    &params,
+                    |_| {},
+                )
+                .unwrap_err();
+            assert!(error
+                .to_string()
+                .contains("injected reader detokenizer failure"));
+            let at_error = at_error.load(Ordering::Acquire);
+            assert_ne!(at_error, usize::MAX, "the reader failure fired");
+            let extra = model.forwards.load(Ordering::Acquire) - at_error;
+            assert!(
+                extra <= 64,
+                "reader failure left producer running: {extra} forwards after error"
+            );
+            session.reset();
+            let next = DecodeParams {
+                max_tokens: 6,
+                readback: ReadbackArm::Blocking,
+                ..params
+            };
+            let reply = session.decode(&[5], |ids| Ok(text_of(ids)), &next, |_| {})?;
+            assert_eq!(reply.tokens, chain(5, 6).0, "the next request's stream");
+            eprintln!("READER-ERROR additional-forwards={extra}; next-request=reference");
+            Ok(())
         }
 
         /// Each request on a pooled ring streams its own run, and nothing of

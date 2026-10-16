@@ -61,8 +61,32 @@ impl TextStream {
         stop_strings: &[String],
     ) -> Result<(Option<String>, bool)> {
         self.push(ids, detokenize)?;
+        Ok(self.publish_ready(stop_strings, false))
+    }
+
+    /// Resolve the terminal pending token run, including a final replacement
+    /// character chosen by the detokenizer. No later token can complete it.
+    /// Stop detection and consumer refusal use the same publication frontier
+    /// as incremental text; a partial stop prefix is released only at EOF.
+    pub fn flush(
+        &mut self,
+        detokenize: &mut impl FnMut(&[u32]) -> Result<String>,
+        stop_strings: &[String],
+    ) -> Result<(Option<String>, bool)> {
+        if self.refused_at.is_some() {
+            return Ok((None, false));
+        }
+        if self.pending < self.generated.len() {
+            let chunk = detokenize(&self.generated[self.pending..])?;
+            self.text.push_str(&chunk);
+            self.pending = self.generated.len();
+        }
+        Ok(self.publish_ready(stop_strings, true))
+    }
+
+    fn publish_ready(&mut self, stop_strings: &[String], terminal: bool) -> (Option<String>, bool) {
         let Some(longest) = stop_strings.iter().map(String::len).max() else {
-            return Ok((self.hand_out(self.text.len()), false));
+            return (self.hand_out(self.text.len()), false);
         };
         let mut from = self.published.saturating_sub(longest.saturating_sub(1));
         while !self.text.is_char_boundary(from) {
@@ -75,7 +99,10 @@ impl TextStream {
             .filter_map(|s| window.find(s.as_str()))
             .min()
         {
-            return Ok((self.hand_out((from + at).max(self.published)), true));
+            return (self.hand_out((from + at).max(self.published)), true);
+        }
+        if terminal {
+            return (self.hand_out(self.text.len()), false);
         }
         let unpublished = &self.text[self.published..];
         let held = stop_strings
@@ -89,7 +116,7 @@ impl TextStream {
             })
             .max()
             .unwrap_or(0);
-        Ok((self.hand_out(self.text.len() - held), false))
+        (self.hand_out(self.text.len() - held), false)
     }
 
     /// What [`Self::publish`] held back as a possible stop's beginning, for a
@@ -198,6 +225,82 @@ mod tests {
             }
         }
         Ok(s)
+    }
+
+    /// Independent oracle: terminal text is the complete tokenizer result,
+    /// cut at a stop, not the stream's own accumulated (possibly incomplete)
+    /// text. A final incomplete byte must not hide valid text in its batch.
+    #[test]
+    fn terminal_text_keeps_the_valid_prefix_for_every_batch_split() -> Result<()> {
+        let ids = [7, 8, 1]; // full decode: "hi\u{FFFD}"
+        for mask in 0u32..4 {
+            let mut stream = TextStream::new(8);
+            let mut delivered = String::new();
+            let mut from = 0;
+            for i in 0..ids.len() {
+                if i + 1 == ids.len() || mask & (1 << i) != 0 {
+                    let (chunk, _) = stream.publish(&ids[from..=i], &mut detok, &[])?;
+                    delivered.push_str(chunk.as_deref().unwrap_or(""));
+                    from = i + 1;
+                }
+            }
+            delivered.push_str(stream.flush(&mut detok, &[])?.0.as_deref().unwrap_or(""));
+            let (text, tokens) = stream.finish(&[]);
+            assert_eq!(tokens, ids);
+            assert_eq!(text, detok(&ids)?, "terminal pending text; split {mask}");
+            assert_eq!(delivered, text, "terminal delivery; split {mask}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn terminal_flush_checks_stops_and_preserves_refused_frontiers() -> Result<()> {
+        for stops in [
+            vec!["i\u{FFFD}".to_string()],
+            vec!["ix".to_string()],
+            vec![],
+        ] {
+            let ids = [7, 8, 1];
+            let full = detok(&ids)?;
+            let expected = stops
+                .iter()
+                .filter_map(|stop| full.find(stop))
+                .min()
+                .map_or_else(|| full.clone(), |at| full[..at].to_string());
+            for mask in 0..4 {
+                let mut st = TextStream::new(8);
+                let mut delivered = String::new();
+                let mut from = 0;
+                let mut stopped = false;
+                for i in 0..ids.len() {
+                    if i + 1 == ids.len() || mask & (1 << i) != 0 {
+                        let (chunk, hit) = st.publish(&ids[from..=i], &mut detok, &stops)?;
+                        delivered.push_str(chunk.as_deref().unwrap_or(""));
+                        stopped |= hit;
+                        from = i + 1;
+                    }
+                }
+                let (chunk, hit) = st.flush(&mut detok, &stops)?;
+                delivered.push_str(chunk.as_deref().unwrap_or(""));
+                stopped |= hit;
+                assert_eq!(stopped, expected.len() < full.len());
+                assert_eq!(delivered, expected, "stops {stops:?}, split {mask}");
+                assert_eq!(st.finish(&stops).0, expected);
+            }
+        }
+        // Literal U+FFFD is a completed terminal tokenizer result too. A
+        // refused final fragment must not enter the accepted text frontier.
+        let mut st = TextStream::new(4);
+        st.publish(&[7, 8, 1], &mut detok, &[])?;
+        assert_eq!(st.flush(&mut detok, &[])?.0.as_deref(), Some("hi\u{FFFD}"));
+        st.refuse_last();
+        assert_eq!(st.flush(&mut detok, &[])?, (None, false));
+        assert_eq!(st.finish(&[]).0, "");
+        // An empty tokenizer tail is consumed once, not manufactured text.
+        let mut st = TextStream::new(1);
+        st.publish(&[99], &mut |_| Ok(String::new()), &[])?;
+        assert_eq!(st.flush(&mut |_| Ok(String::new()), &[])?, (None, false));
+        Ok(())
     }
 
     /// A fragment the consumer refused is not delivered: the text ends where

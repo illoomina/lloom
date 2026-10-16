@@ -107,7 +107,10 @@ fn latched(cmds: &Commands) -> bool {
 fn assert_latched(device: &Device, cmds: &Commands, failure: &MetalKernelError, attempt: usize) {
     let msg = failure.to_string();
     assert!(msg.contains("Invalid Resource"), "attempt {attempt}: {msg}");
-    assert!(latched(cmds), "attempt {attempt}: the failure never latched");
+    assert!(
+        latched(cmds),
+        "attempt {attempt}: the failure never latched"
+    );
     assert!(affine_then_wait(device, cmds).is_err());
     assert!(cmds.flush_and_wait().is_err());
 }

@@ -1386,7 +1386,11 @@ mod inventory_controls {
         })
         .unwrap();
         assert_eq!(flagged_at, Some(0), "the flag must precede the epoch");
-        assert_eq!(clock.current_epoch().0, 1, "one epoch for one direct commit");
+        assert_eq!(
+            clock.current_epoch().0,
+            1,
+            "one epoch for one direct commit"
+        );
         let mut again = false;
         head.ensure_staged(|| {
             again = true;
@@ -1394,7 +1398,11 @@ mod inventory_controls {
         })
         .unwrap();
         assert!(!again, "a staged generation flagged a second time");
-        assert_eq!(clock.current_epoch().0, 1, "a staged generation took an epoch");
+        assert_eq!(
+            clock.current_epoch().0,
+            1,
+            "a staged generation took an epoch"
+        );
         drop(prepared); // Cancels the unobserved staged epoch's witness.
         assert!(matches!(
             head.head.captures().witness.captures().cutoff(),

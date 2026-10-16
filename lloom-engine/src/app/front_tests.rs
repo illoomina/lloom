@@ -2621,25 +2621,37 @@ fn a_reply_with_text_before_the_block_it_opened_goes_as_sent() {
 }
 
 /// The load line's `gen/tail` is the checkpoint tail a request that sets no
-/// persistence runs with: 0 on a template whose own default strips, now
-/// that the history keeps the reasoning; the strip's tail under
-/// `--strip-thinking`.
+/// persistence runs with. Thinking off can still need an interior checkpoint:
+/// the engine closes the block, but the template omits that empty block
+/// when rendering the reply again.
 #[test]
 fn the_load_line_reports_the_tail_the_default_runs_with() {
     let engine = Stub::qwen3_5();
     let tails = |persist: Option<bool>| -> Vec<String> {
-        let line = Front::new(
+        let front = Front::new(
             &engine,
             SessionOptions {
                 persist,
                 ..SessionOptions::default()
             },
-        )
-        .line();
+        );
+        let line = front.line();
         let list = line.rsplit_once("=[").unwrap().1.trim_end_matches(']');
-        list.split(", ")
+        let reported: Vec<String> = list
+            .split(", ")
             .map(|g| g.split('/').nth(1).unwrap_or("-").to_string())
-            .collect()
+            .collect();
+        let messages = json!([user("Hello")]);
+        let actual: Vec<String> = MODES
+            .into_iter()
+            .map(|want| {
+                build(&front, &engine, &messages, want)
+                    .turn_tail
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(reported, actual, "persist={persist:?}: {line}");
+        reported
     };
     assert_eq!(tails(None), ["0", "0", "0"], "persisted by default");
     assert_eq!(tails(Some(true)), ["0", "0", "0"]);

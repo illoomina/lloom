@@ -838,6 +838,8 @@ pub struct Fitted {
 pub struct Front {
     constants: Option<Constants>,
     options: SessionOptions,
+    /// Normal request kwargs, resolved once by the frontend thinking policy.
+    thinking_kwargs: [Option<bool>; 3],
     log: Mutex<ReplyLog>,
     tokenizations: AtomicU64,
     /// The model and the template every scope is hashed under.
@@ -860,6 +862,11 @@ impl Front {
         Self {
             constants: engine.text().map(Constants::read),
             options,
+            thinking_kwargs: MODES.map(|want| {
+                let mut kwargs = Map::new();
+                thinking::set_kwarg(engine, want, &mut kwargs);
+                kwargs.get(ENABLE_THINKING).and_then(Value::as_bool)
+            }),
             log: Mutex::new(ReplyLog::default()),
             tokenizations: AtomicU64::new(0),
             context: h.finalize().into(),
@@ -948,7 +955,7 @@ impl Front {
         // The tail each mode's checkpoint takes under the persistence a
         // request that sets none renders with.
         let persist = self.persist(c);
-        let gen = |k, w| match c.mode(k, w) {
+        let gen = |w| match c.mode(self.thinking_kwargs[slot(w)], w) {
             Some(Ok(m)) => format!(
                 "{}/{}",
                 m.gen.len(),
@@ -977,9 +984,9 @@ impl Front {
             self.options.incomplete.name(),
             c.open,
             c.groups_tools,
-            gen(None, None),
-            gen(None, Some(true)),
-            gen(None, Some(false)),
+            gen(None),
+            gen(Some(true)),
+            gen(Some(false)),
         )
     }
 

@@ -1675,7 +1675,12 @@ mod tests {
     #[test]
     fn ancestor_selection_subtracts_each_groups_reserve_before_comparing() {
         for (proc, mount, limit_file, usage_file) in [
-            ("0::/a/b\n", "/sys/fs/cgroup", "memory.max", "memory.current"),
+            (
+                "0::/a/b\n",
+                "/sys/fs/cgroup",
+                "memory.max",
+                "memory.current",
+            ),
             (
                 "4:memory:/a/b\n",
                 "/sys/fs/cgroup/memory",
@@ -1758,7 +1763,8 @@ mod tests {
                             for (path, c) in [("a", parent), ("a/b", child)] {
                                 let dir = format!("/sys/fs/cgroup/{path}");
                                 entries.push((format!("{dir}/memory.max"), c.limit.to_string()));
-                                entries.push((format!("{dir}/memory.current"), c.usage.to_string()));
+                                entries
+                                    .push((format!("{dir}/memory.current"), c.usage.to_string()));
                                 entries.push((
                                     format!("{dir}/memory.stat"),
                                     format!("inactive_file {}\n", c.reclaimable),

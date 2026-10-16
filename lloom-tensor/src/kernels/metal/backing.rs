@@ -228,6 +228,10 @@ pub(crate) struct StagedDeviceBuffer<'a> {
     native: StagedNativeBuffer,
     requested: usize,
 }
+#[expect(
+    clippy::large_enum_variant,
+    reason = "Keep raw-first speculative ticket custody inline; Box storage is absent from the admitted quote."
+)]
 enum StagedNativeBuffer {
     Legacy(Buffer),
     Accounted(allocation_admission::StagedAllocation<RawBuffer>),

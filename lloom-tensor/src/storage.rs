@@ -28,6 +28,13 @@ pub struct KvScatterGeometry {
 }
 
 #[derive(Debug)]
+#[cfg_attr(
+    feature = "metal",
+    expect(
+        clippy::large_enum_variant,
+        reason = "Keep public inline storage payloads and fallible try_clone without adding a Box allocation."
+    )
+)]
 pub enum Storage {
     Cpu(CpuStorage),
     Cuda(CudaStorage),

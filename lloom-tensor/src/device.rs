@@ -31,6 +31,13 @@ pub enum DeviceLocation {
 
 /// Cpu, Cuda, or Metal
 #[derive(Debug, Clone)]
+#[cfg_attr(
+    feature = "metal",
+    expect(
+        clippy::large_enum_variant,
+        reason = "Keep the public MetalDevice payload inline; boxing adds allocation and changes the variant API."
+    )
+)]
 pub enum Device {
     Cpu,
     Cuda(crate::CudaDevice),

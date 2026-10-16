@@ -87,6 +87,13 @@ impl Device {
     }
 }
 
+#[cfg_attr(
+    feature = "metal",
+    expect(
+        clippy::large_enum_variant,
+        reason = "Keep the public inline Metal payload returned by fallible qzeros/from_data without new boxing."
+    )
+)]
 pub enum QStorage {
     Cpu(Box<dyn QuantizedType>),
     Metal(metal::QMetalStorage),

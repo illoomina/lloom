@@ -21,7 +21,7 @@ mod on {
     use lloom_tensor::kernels::metal::profile;
     use lloom_tensor::kernels::metal::CommandMarker;
     use lloom_tensor::Device;
-    use std::sync::Mutex;
+    use parking_lot::Mutex;
 
     /// How the producer learned the run was over.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -80,7 +80,7 @@ mod on {
 
     /// The most recently resolved runs' lines, oldest first, taken.
     pub fn take_lines() -> Vec<String> {
-        std::mem::take(&mut trace().lock().unwrap().lines)
+        std::mem::take(&mut trace().lock().lines)
     }
 
     fn trace() -> &'static Mutex<Trace> {
@@ -100,7 +100,7 @@ mod on {
     pub fn prepare_end<A: std::fmt::Debug>(t0: Option<f64>, action: &A) {
         let Some(t0) = t0 else { return };
         let t1 = profile::now_s();
-        let mut t = trace().lock().unwrap();
+        let mut t = trace().lock();
         t.prepare = Some((t0, t1, format!("{action:?}")));
     }
 
@@ -114,7 +114,7 @@ mod on {
         let published = published();
         let now = profile::now_s();
         profile::set_step(0);
-        let mut t = trace().lock().unwrap();
+        let mut t = trace().lock();
         t.next_id += 1;
         let prepare = t.prepare.take();
         t.current = Some(Run {
@@ -132,7 +132,7 @@ mod on {
             return;
         }
         let now = profile::now_s();
-        if let Some(r) = trace().lock().unwrap().current.as_mut() {
+        if let Some(r) = trace().lock().current.as_mut() {
             r.decode.get_or_insert(now);
         }
     }
@@ -144,7 +144,7 @@ mod on {
             return;
         }
         let now = profile::now_s();
-        if let Some(r) = trace().lock().unwrap().current.as_mut() {
+        if let Some(r) = trace().lock().current.as_mut() {
             let slot = if watch {
                 &mut r.watch_eos
             } else {
@@ -163,7 +163,7 @@ mod on {
         }
         let (submitted, published) = counts();
         let now = profile::now_s();
-        if let Some(r) = trace().lock().unwrap().current.as_mut() {
+        if let Some(r) = trace().lock().current.as_mut() {
             let completed = match (published, r.published0) {
                 (Some(p), Some(p0)) => Some(p.saturating_sub(p0)),
                 _ => None,
@@ -183,7 +183,7 @@ mod on {
         let Device::Metal(m) = device else { return };
         let open_dispatches = m.open_dispatches();
         let last = m.last_committed_marker().ok().flatten();
-        let mut t = trace().lock().unwrap();
+        let mut t = trace().lock();
         if let Some(mut r) = t.current.take() {
             r.ret = Some(now);
             r.produced = produced;
@@ -199,7 +199,7 @@ mod on {
     /// Resolve and print every pending run whose buffers have completed.
     pub fn flush() {
         if on() {
-            resolve(&mut trace().lock().unwrap());
+            resolve(&mut trace().lock());
         }
     }
 

@@ -1211,7 +1211,11 @@ impl<'m, M: CausalLM> Session<'m, M> {
     /// boundary and replays, or resets. A host stop is not seen by the
     /// device: the forwards past the boundary wrote the state, so only a
     /// window or a checkpoint recovers it; nothing here relabels that
-    /// replay as exact.
+    /// replay as exact. Known unusable state and errors from an attempted
+    /// reconciliation/rewind are returned without accepting a new boundary;
+    /// only a proven past-horizon refusal retains the deferred obligation.
+    /// A default validity check is not an all-family retry-safety guarantee:
+    /// operational errors still require the family's explicit recovery.
     pub fn accept(&mut self, keep: usize) -> Result<Acceptance>
     where
         M::Cache: CacheRewind,
@@ -1220,11 +1224,24 @@ impl<'m, M: CausalLM> Session<'m, M> {
         if keep > log {
             lloom_tensor::bail!("Session::accept: a boundary of {keep} past the log's {log} ids");
         }
+        self.seq.cache.check_acceptance_state()?;
         let past = log - keep;
         if past == 0 {
             return Ok(Acceptance::Whole);
         }
-        let reconciled = self.seq.overrun == 0 || self.reconcile().is_ok();
+        let reconciled = if self.seq.overrun == 0 {
+            true
+        } else if !self.seq.overrun_unwritten && self.seq.overrun > self.seq.cache.rewind_horizon()
+        {
+            // The trait certifies this refusal before mutation; retain the
+            // existing deferred obligation without attempting that rewind.
+            false
+        } else {
+            // An attempted rewind can fail after partial state mutation. It
+            // is an operational error, not evidence of a harmless refusal.
+            self.reconcile()?;
+            true
+        };
         if reconciled && past <= self.seq.cache.rewind_horizon() {
             self.seq.cache.rewind(past)?;
             self.seq.pos -= past;

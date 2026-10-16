@@ -6,7 +6,9 @@
 //!
 //! Compiled only in a debug build or with `profile`, and recorded only under
 //! `CANDLE_METAL_PROFILE=1` on Metal: the shipping binary carries none of it,
-//! and an unprofiled run pays one cached-bool check per call site. Times are
+//! and an unprofiled run pays one cached-bool check per call site. Count
+//! snapshots are lazy: neither the cfg-disabled nor runtime-disabled path
+//! invokes the closure that polls the publication counter. Times are
 //! `profile::now_s` seconds (`CLOCK_UPTIME_RAW`), the clock the command
 //! buffers' GPU times are in. A run is resolved against the profile
 //! recorder's command-buffer records once the buffers it needs have
@@ -103,11 +105,13 @@ mod on {
     }
 
     /// A run begins (after its request's `prepare`): earlier runs whose
-    /// buffers have completed are resolved and printed.
-    pub fn run_begin(published: Option<usize>) {
+    /// buffers have completed are resolved and printed. `published` is polled
+    /// only after the diagnostic's runtime gate admits the run.
+    pub fn run_begin(published: impl FnOnce() -> Option<usize>) {
         if !on() {
             return;
         }
+        let published = published();
         let now = profile::now_s();
         profile::set_step(0);
         let mut t = trace().lock().unwrap();
@@ -151,11 +155,13 @@ mod on {
     }
 
     /// The producer broke out of its loop: how, with the forwards it had
-    /// submitted past the prompt and the tokens the GPU had published.
-    pub fn producer_stop(by: StopBy, submitted: usize, published: Option<usize>) {
+    /// submitted past the prompt and the tokens the GPU had published. `counts`
+    /// is evaluated only when the diagnostic is enabled.
+    pub fn producer_stop(by: StopBy, counts: impl FnOnce() -> (usize, Option<usize>)) {
         if !on() {
             return;
         }
+        let (submitted, published) = counts();
         let now = profile::now_s();
         if let Some(r) = trace().lock().unwrap().current.as_mut() {
             let completed = match (published, r.published0) {
@@ -336,13 +342,13 @@ mod off {
     #[inline(always)]
     pub fn prepare_end<A: std::fmt::Debug>(_t0: Option<f64>, _action: &A) {}
     #[inline(always)]
-    pub fn run_begin(_published: Option<usize>) {}
+    pub fn run_begin(_published: impl FnOnce() -> Option<usize>) {}
     #[inline(always)]
     pub fn decode_begin() {}
     #[inline(always)]
     pub fn reader_eos(_watch: bool) {}
     #[inline(always)]
-    pub fn producer_stop(_by: StopBy, _submitted: usize, _published: Option<usize>) {}
+    pub fn producer_stop(_by: StopBy, _counts: impl FnOnce() -> (usize, Option<usize>)) {}
     #[inline(always)]
     pub fn run_end(_produced: usize, _overrun: usize, _eos: bool, _device: &lloom_tensor::Device) {}
     #[inline(always)]
@@ -354,3 +360,15 @@ mod off {
 
 #[cfg(not(all(feature = "metal", any(debug_assertions, feature = "profile"))))]
 pub use off::*;
+
+#[cfg(all(
+    test,
+    not(all(feature = "metal", any(debug_assertions, feature = "profile")))
+))]
+mod disabled_tests {
+    #[test]
+    fn compiled_out_trace_does_not_evaluate_count_snapshots() {
+        super::run_begin(|| panic!("compiled-out run begin polled"));
+        super::producer_stop(super::StopBy::Length, || panic!("compiled-out stop polled"));
+    }
+}

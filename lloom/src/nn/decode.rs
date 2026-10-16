@@ -1980,7 +1980,7 @@ impl<'m, M: CausalLM> Session<'m, M> {
         readback.begin_run();
 
         let device = readback.device().clone();
-        crate::nn::terminal_trace::run_begin(readback.published_count());
+        crate::nn::terminal_trace::run_begin(|| readback.published_count());
         // The hot thread's scheduling class, held for the run and restored on
         // return (`generation::hot_thread`): two syscalls a generation, none a
         // step.
@@ -2214,8 +2214,7 @@ impl<'m, M: CausalLM> Session<'m, M> {
             if opts.reached(produced) {
                 crate::nn::terminal_trace::producer_stop(
                     crate::nn::terminal_trace::StopBy::Length,
-                    fed_now(self),
-                    readback.published_count(),
+                    || (fed_now(self), readback.published_count()),
                 );
                 break;
             }
@@ -2228,8 +2227,7 @@ impl<'m, M: CausalLM> Session<'m, M> {
                     stats.stopped_by_flag = true;
                     crate::nn::terminal_trace::producer_stop(
                         crate::nn::terminal_trace::StopBy::Flag,
-                        fed_now(self),
-                        readback.published_count(),
+                        || (fed_now(self), readback.published_count()),
                     );
                     break;
                 }
@@ -2248,8 +2246,7 @@ impl<'m, M: CausalLM> Session<'m, M> {
                     stats.stopped_by_eos_watch = true;
                     crate::nn::terminal_trace::producer_stop(
                         crate::nn::terminal_trace::StopBy::Watch,
-                        fed_now(self),
-                        readback.published_count(),
+                        || (fed_now(self), readback.published_count()),
                     );
                     break;
                 }
@@ -2411,8 +2408,7 @@ impl<'m, M: CausalLM> Session<'m, M> {
                     eos = true;
                     crate::nn::terminal_trace::producer_stop(
                         crate::nn::terminal_trace::StopBy::EosOfLast,
-                        fed_now(self),
-                        readback.published_count(),
+                        || (fed_now(self), readback.published_count()),
                     );
                     break;
                 }
@@ -2572,8 +2568,7 @@ impl<'m, M: CausalLM> Session<'m, M> {
                     eos = true;
                     crate::nn::terminal_trace::producer_stop(
                         crate::nn::terminal_trace::StopBy::EosOfLast,
-                        fed_now(self),
-                        readback.published_count(),
+                        || (fed_now(self), readback.published_count()),
                     );
                     break;
                 }
@@ -2676,8 +2671,7 @@ impl<'m, M: CausalLM> Session<'m, M> {
                     if !go_on {
                         crate::nn::terminal_trace::producer_stop(
                             crate::nn::terminal_trace::StopBy::Hook,
-                            fed_now(self),
-                            readback.published_count(),
+                            || (fed_now(self), readback.published_count()),
                         );
                         #[cfg(any(debug_assertions, feature = "profile"))]
                         stats.step_ns.push(step_start.elapsed().as_nanos() as u64);

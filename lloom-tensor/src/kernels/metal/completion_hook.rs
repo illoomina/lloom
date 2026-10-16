@@ -71,14 +71,6 @@ impl CompletionHook {
         self.subscribers.setup.seal().map_err(setup_error)
     }
 
-    /// Hold the subscribers' lock on the calling thread while `f` runs, so a
-    /// test can show a commit and a completion never take it.
-    #[cfg(test)]
-    pub(super) fn while_subscribers_locked<R>(&self, f: impl FnOnce() -> R) -> R {
-        let _published = self.subscribers.published.lock();
-        f()
-    }
-
     /// Opaque test guard so a fixture can release before joining a producer
     /// even when the producer is deliberately blocked by a mutex mutant.
     #[cfg(test)]

@@ -1144,13 +1144,6 @@ impl Commands {
         f()
     }
 
-    /// Hold the completion subscribers' lock on the calling thread while `f`
-    /// runs, so a test can show a commit and a completion never take it.
-    #[cfg(test)]
-    pub(crate) fn while_subscribers_locked<R>(&self, f: impl FnOnce() -> R) -> R {
-        self.core.hook.while_subscribers_locked(f)
-    }
-
     #[cfg(test)]
     pub(crate) fn lock_subscribers_for_test(&self) -> impl Drop + '_ {
         self.core.hook.lock_subscribers_for_test()

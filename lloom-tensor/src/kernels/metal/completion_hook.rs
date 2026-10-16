@@ -79,6 +79,13 @@ impl CompletionHook {
         f()
     }
 
+    /// Opaque test guard so a fixture can release before joining a producer
+    /// even when the producer is deliberately blocked by a mutex mutant.
+    #[cfg(test)]
+    pub(super) fn lock_subscribers_for_test(&self) -> impl Drop + '_ {
+        self.subscribers.published.lock()
+    }
+
     #[cfg(test)]
     pub(super) fn while_registration_held<R>(&self, f: impl FnOnce() -> R) -> R {
         let _permit = self.subscribers.setup.register().expect("open setup");

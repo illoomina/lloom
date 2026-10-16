@@ -1138,6 +1138,20 @@ impl Commands {
         self.core.hook.while_subscribers_locked(f)
     }
 
+    #[cfg(test)]
+    pub(crate) fn lock_subscribers_for_test(&self) -> impl Drop + '_ {
+        self.core.hook.lock_subscribers_for_test()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn actual_command_api_for_test(&self) -> &'static str {
+        if self.core.modern_queue.is_some() {
+            "metal4"
+        } else {
+            "metal3"
+        }
+    }
+
     /// Install the executor that subsequent compute encoders will submit
     /// through (`DESIGN.md` §11.1).
     ///

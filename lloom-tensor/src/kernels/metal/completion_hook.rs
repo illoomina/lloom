@@ -113,6 +113,9 @@ struct Subscribers {
     setup: crate::completion_setup::Setup,
     current: AtomicPtr<Snapshot>,
     published: parking_lot::Mutex<Vec<Box<Snapshot>>>,
+    /// Force the actual reserve error paths without replacing their handling.
+    #[cfg(test)]
+    refuse_reserve: std::sync::atomic::AtomicU8,
 }
 
 impl Subscribers {
@@ -122,6 +125,8 @@ impl Subscribers {
             setup: crate::completion_setup::Setup::new(),
             current: AtomicPtr::new(&*empty as *const Snapshot as *mut Snapshot),
             published: parking_lot::Mutex::new(vec![empty]),
+            #[cfg(test)]
+            refuse_reserve: std::sync::atomic::AtomicU8::new(0),
         }
     }
 
@@ -141,7 +146,18 @@ impl Subscribers {
         let mut published = self.published.lock();
         let previous = published.last().expect("the empty snapshot");
         let mut next = Snapshot::new();
-        if next.try_reserve_exact(previous.len() + 1).is_err() {
+        let snapshot_additional = previous.len() + 1;
+        #[cfg(test)]
+        let snapshot_additional = if self
+            .refuse_reserve
+            .compare_exchange(1, 0, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            usize::MAX
+        } else {
+            snapshot_additional
+        };
+        if next.try_reserve_exact(snapshot_additional).is_err() {
             return Err(crate::kernels::err::CompletionRegistrationError::new(
                 crate::kernels::MetalKernelError::QueueUnavailable(
                     "subscriber snapshot allocation refused",
@@ -150,7 +166,18 @@ impl Subscribers {
             ));
         }
         next.extend(previous.iter().cloned());
-        if published.try_reserve(1).is_err() {
+        let history_additional = 1;
+        #[cfg(test)]
+        let history_additional = if self
+            .refuse_reserve
+            .compare_exchange(2, 0, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            usize::MAX
+        } else {
+            history_additional
+        };
+        if published.try_reserve(history_additional).is_err() {
             return Err(crate::kernels::err::CompletionRegistrationError::new(
                 crate::kernels::MetalKernelError::QueueUnavailable(
                     "subscriber history allocation refused",
@@ -223,6 +250,131 @@ mod tests {
             start: 0.,
             end: 1.,
         }
+    }
+
+    #[test]
+    fn reserve_refusal_keeps_publication_captures_and_permit_reusable() {
+        struct Capture {
+            producer: Arc<parking_lot::Mutex<()>>,
+            drops: Arc<AtomicUsize>,
+        }
+        impl Drop for Capture {
+            fn drop(&mut self) {
+                let _guard = self
+                    .producer
+                    .try_lock()
+                    .expect("refused callback dropped under producer lock");
+                self.drops.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        for stage in [1, 2] {
+            let (clock, _, hook) = hook();
+            let runs = Arc::new(AtomicUsize::new(0));
+            let observed = runs.clone();
+            let survivor: Subscriber = Arc::new(move || {
+                observed.fetch_add(1, Ordering::Relaxed);
+            });
+            hook.subscribe(survivor.clone()).unwrap();
+            let pointer = hook.subscribers.current.load(Ordering::Acquire);
+            let history_len = hook.subscribers.published.lock().len();
+            let survivor_refs = Arc::strong_count(&survivor);
+            let producer = Arc::new(parking_lot::Mutex::new(()));
+            let drops = Arc::new(AtomicUsize::new(0));
+            let capture = Capture {
+                producer: producer.clone(),
+                drops: drops.clone(),
+            };
+            hook.subscribers
+                .refuse_reserve
+                .store(stage, Ordering::Relaxed);
+            let guard = producer.lock();
+            let error = hook
+                .subscribe(Arc::new(move || {
+                    let _ = &capture;
+                    panic!("refused observer installed");
+                }))
+                .unwrap_err();
+            let expected = if stage == 1 {
+                "subscriber snapshot allocation refused"
+            } else {
+                "subscriber history allocation refused"
+            };
+            assert!(matches!(
+                error.cause(),
+                crate::kernels::MetalKernelError::QueueUnavailable(message) if *message == expected
+            ));
+            assert_eq!(hook.subscribers.current.load(Ordering::Acquire), pointer);
+            assert_eq!(hook.subscribers.published.lock().len(), history_len);
+            assert_eq!(Arc::strong_count(&survivor), survivor_refs);
+            assert_eq!(drops.load(Ordering::Relaxed), 0);
+            drop(guard);
+            drop(error);
+            assert_eq!(drops.load(Ordering::Relaxed), 1);
+            // Failure released REGISTERING without publishing or sealing.
+            hook.subscribe(Arc::new(|| {})).unwrap();
+            hook.seal().unwrap();
+            clock.commit_epoch();
+            hook.complete(&clean());
+            assert_eq!(runs.load(Ordering::Relaxed), 1);
+            let snapshots = hook.try_take_subscribers().unwrap().take();
+            drop(snapshots);
+            assert_eq!(Arc::strong_count(&survivor), 1);
+        }
+    }
+
+    #[test]
+    fn completion_borrows_snapshot_without_cloning_subscribers() {
+        let (clock, _, hook) = hook();
+        let observed = Arc::new(AtomicUsize::new(0));
+        let weak_slot =
+            Arc::new(std::sync::OnceLock::<std::sync::Weak<dyn Fn() + Send + Sync>>::new());
+        let record = observed.clone();
+        let self_weak = weak_slot.clone();
+        let subscriber: Subscriber = Arc::new(move || {
+            record.store(self_weak.get().unwrap().strong_count(), Ordering::Relaxed);
+        });
+        let weak = Arc::downgrade(&subscriber);
+        weak_slot.set(weak.clone()).unwrap();
+        hook.subscribe(subscriber).unwrap();
+        hook.seal().unwrap();
+        let before = weak.strong_count();
+        clock.commit_epoch();
+        hook.complete(&clean());
+        assert_eq!(
+            observed.load(Ordering::Relaxed),
+            before,
+            "completion cloned subscriber ownership"
+        );
+    }
+
+    #[test]
+    fn snapshot_history_lives_until_take_and_teardown_never_reopens_setup() {
+        let (_, _, hook) = hook();
+        let subscriber: Subscriber = Arc::new(|| {});
+        hook.subscribe(subscriber.clone()).unwrap();
+        hook.subscribe(Arc::new(|| {})).unwrap();
+        hook.seal().unwrap();
+        assert_eq!(
+            hook.subscribers.published.lock().len(),
+            3,
+            "published snapshot retired before teardown"
+        );
+        assert_eq!(Arc::strong_count(&subscriber), 3);
+        let snapshots = hook.try_take_subscribers().unwrap().take();
+        assert_eq!(snapshots.len(), 2);
+        assert_eq!(Arc::strong_count(&subscriber), 3);
+        drop(snapshots);
+        assert_eq!(Arc::strong_count(&subscriber), 1);
+        // Teardown is not a new model/setup phase; no reset operation exists.
+        hook.seal().unwrap();
+        let rejected = hook.subscribe(Arc::new(|| {}));
+        assert!(
+            matches!(
+                rejected,
+                Err(ref error) if matches!(error.cause(), crate::kernels::MetalKernelError::SubscriberConfigurationSealed)
+            ),
+            "teardown or repeated seal reopened setup"
+        );
     }
 
     #[test]

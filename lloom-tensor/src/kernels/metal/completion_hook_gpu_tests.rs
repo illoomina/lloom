@@ -49,6 +49,59 @@ fn fixture_release_precedes_drain_on_assertion_unwind() {
     assert!(observed.get(), "fixture drain preceded release");
 }
 
+/// Device-free: the actual completion hook must not acquire the setup mutex.
+/// A literal blocking-lock mutant is released/joined before the assertion.
+#[test]
+fn actual_hook_completion_proceeds_while_setup_mutex_is_held() {
+    use std::sync::atomic::AtomicBool;
+    let clock = Arc::new(super::GpuClock::new());
+    let hook = Arc::new(super::completion_hook::CompletionHook::new(
+        clock.clone(),
+        Arc::new(super::commands::CommandBufferFailure::default()),
+    ));
+    let runs = Arc::new(AtomicU64::new(0));
+    let observed = runs.clone();
+    hook.subscribe(Arc::new(move || {
+        observed.fetch_add(1, Ordering::Relaxed);
+    }))
+    .unwrap();
+    hook.seal().unwrap();
+    clock.commit_epoch();
+    let finished = Arc::new(AtomicBool::new(false));
+    let join = std::cell::RefCell::new(None::<std::thread::JoinHandle<()>>);
+    let joined = std::cell::RefCell::new(None);
+    let mut lock = Some(hook.lock_subscribers_for_test());
+    let cleanup = ReleaseBeforeDrain {
+        release: || drop(lock.take()),
+        drain: || {
+            *joined.borrow_mut() = join.borrow_mut().take().map(|handle| handle.join());
+        },
+    };
+    let (started, receiver) = std::sync::mpsc::channel();
+    let worker = hook.clone();
+    let done = finished.clone();
+    *join.borrow_mut() = Some(std::thread::spawn(move || {
+        started.send(()).unwrap();
+        worker.complete(&super::metal4::Feedback {
+            error: None,
+            start: 0.,
+            end: 1.,
+        });
+        done.store(true, Ordering::Release);
+    }));
+    receiver.recv_timeout(Duration::from_secs(2)).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while !finished.load(Ordering::Acquire) && Instant::now() < deadline {
+        std::thread::yield_now();
+    }
+    let while_held = finished.load(Ordering::Acquire);
+    drop(cleanup);
+    joined.into_inner().unwrap().unwrap();
+    assert!(while_held, "completion acquired the held setup mutex");
+    assert_eq!(clock.completed_count().0, 1);
+    assert_eq!(runs.load(Ordering::Relaxed), 1);
+}
+
 fn commands(device: &Device) -> Commands {
     let queue = device.new_command_queue().unwrap();
     let residency_set = Arc::new(ResidencySet::new(device));

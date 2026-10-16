@@ -3092,6 +3092,25 @@ mod owner_submission_tests {
     }
 
     #[test]
+    fn low_level_bound_preparation_requires_owner_authority() {
+        let device = crate::MetalDevice::new(0).unwrap();
+        let commands = device.commands();
+        let cb = pending(commands);
+        let result = cb.test_direct_native_prepare();
+        let status = cb.status();
+        let epoch = commands.clock().current_epoch().0;
+        // Drain before asserting so a deliberate capability mutant cannot
+        // leave pending native custody to unwind-only fixture cleanup.
+        commands.ensure_completed(&cb).unwrap();
+        assert!(
+            matches!(result, Err(MetalKernelError::OwnerSubmissionRequired)),
+            "low-level preparation bypassed owner authority"
+        );
+        assert_eq!(status, MTLCommandBufferStatus::NotEnqueued);
+        assert_eq!(epoch, 0);
+    }
+
+    #[test]
     fn bound_public_and_native_refusal_preserve_work_for_owner_recovery() {
         let device = crate::MetalDevice::new(0).unwrap();
         let commands = device.commands();
@@ -3155,8 +3174,16 @@ mod owner_submission_tests {
         assert_eq!(callbacks.load(Ordering::Relaxed), 0);
         commands.ensure_completed(&cb).unwrap();
         commands.ensure_completed(&cb).unwrap();
-        assert_eq!(commands.clock().current_epoch().0, epoch.0 + 1);
-        assert_eq!(runs.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            commands.clock().current_epoch().0,
+            epoch.0 + 1,
+            "owner recovery must take exactly one epoch"
+        );
+        assert_eq!(
+            runs.load(Ordering::Relaxed),
+            1,
+            "owner completion hook must run once"
+        );
         assert_eq!(callbacks.load(Ordering::Relaxed), 1);
         assert_eq!(
             commands.core.residency_set.counters().commits,

@@ -559,14 +559,7 @@ pub mod v1 {
     /// `decode.host_feed.wait`: `adaptive` is stored `on-demand`, durations
     /// in µs.
     pub fn feed_wait_from(s: &str) -> Result<String, String> {
-        let lower = s.trim().to_ascii_lowercase();
-        let s = lower.as_str();
-        match split(s) {
-            ("adaptive", rest) | ("on-demand", rest) => with_us("on-demand", rest),
-            ("event", rest) => with_us("event", rest),
-            ("sleep", rest) => with_us("sleep", rest),
-            _ => Ok(s.to_string()),
-        }
+        super::wait::HOST_FEED_WAIT.to_stored(s)
     }
 
     pub fn feed_wait_to(s: &str) -> String {

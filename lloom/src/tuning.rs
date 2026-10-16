@@ -759,7 +759,7 @@ pub struct RingTuning {
     /// How the host fill producer waits between tokens: `adaptive[:<dur>]` (`WFE` while a forward waits on an unfilled value, else a sleep of that long: measured fastest), `event[:<dur>]` (park, woken by the ring's publish event or a forward's demand; slower where the pool misses), or one arm throughout: `sleep[:<dur>]`, `wfe`, `spin-hint`, `spin`. The older spellings (`on-demand`, durations as bare µs) are the same arms.
     #[opt(flag = "host-feed-poll",
         env = "LLOOM_HOST_FEED_POLL",
-        parser = "parse_poll", path = "decode.host_feed.wait", status = "advanced", facets = ["wait"], flows = ["host-feed-in"], forms = ["adaptive", "event", "sleep", "wfe", "spin-hint", "spin"], from_v1 = "lloom_tensor::options::v1::feed_wait_from", to_v1 = "lloom_tensor::options::v1::feed_wait_to", schema = "Wait")]
+        parser = "parse_poll", path = "decode.host_feed.wait", status = "advanced", facets = ["wait"], flows = ["host-feed-in"], forms = ["adaptive", "event", "sleep", "wfe", "spin-hint", "spin"], from_v1 = "lloom_tensor::options::v1::feed_wait_from", to_v1 = "lloom_tensor::options::v1::feed_wait_to", schema = "Wait", grammar = "lloom_tensor::options::wait::HOST_FEED_WAIT")]
     pub feed_poll: String,
     /// Time every host fill (encoded, observed, signalled) and the producer's loop, and print a `HOSTFEED` line a run — an instrument.
     #[opt(flag = "host-feed-trace", env = "LLOOM_HOST_FEED_TRACE", bool, path = "diagnostics.trace.host_feed", status = "instrument", flows = ["host-feed-in"])]

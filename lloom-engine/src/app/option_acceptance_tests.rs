@@ -657,18 +657,212 @@ fn readback_wait_descriptor_projects_literal_property_language() {
         .filter(|key| key.meta().grammar.is_some())
         .map(|key| key.path.as_str())
         .collect();
-    assert_eq!(described, ["decode.readback.wait"]);
+    assert_eq!(described, ["decode.host_feed.wait", "decode.readback.wait"]);
     assert_eq!(
         index().keys["decode.readback.wait"].meta().grammar,
         Some(&lloom_tensor::options::wait::READBACK_WAIT)
     );
     for path in [
-        "decode.host_feed.wait",
         "backend.metal.completion_wait",
         "weights.experts.fetch.wait",
         "decode.ring.eos_wait",
         "speculative.verify_wait",
     ] {
         assert!(index().keys[path].meta().grammar.is_none(), "{path}");
+    }
+}
+
+fn host_feed_wait_cases() -> Vec<Value> {
+    serde_json::from_str(include_str!("../../tests/fixtures/host-feed-wait-s2.json")).unwrap()
+}
+
+/// References come from FeedWait/PollMechanism's stored contract, not the projection.
+#[test]
+fn host_feed_wait_descriptor_preserves_literal_resolutions() {
+    let key = &index().keys["decode.host_feed.wait"];
+    let none = BTreeMap::new();
+    let cases = host_feed_wait_cases();
+    assert_eq!(cases.len(), 95);
+    for row in &cases {
+        let input = &row["input"];
+        let doc = document("host_feed.wait", input.clone()).to_string();
+        let path = std::env::temp_dir().join(format!(
+            "lloom-host-feed-wait-literals-{}.json",
+            std::process::id()
+        ));
+        std::fs::write(&path, document(&key.path, input.clone()).to_string()).unwrap();
+        let mut routes = vec![
+            ("group".into(), config(&["--decode-config", &doc], &none)),
+            (
+                "file".into(),
+                config(&["--config", path.to_str().unwrap()], &none),
+            ),
+        ];
+        std::fs::remove_file(path).unwrap();
+        if let Some(text) = input.as_str() {
+            routes.extend(layers(key, text));
+            routes.push(("flag".into(), config(&["--host-feed-poll", text], &none)));
+            routes.push((
+                "storage alias".into(),
+                config(&["--set", &format!("tuning.ring.feed_poll={text}")], &none),
+            ));
+            routes.push((
+                "legacy env".into(),
+                config(
+                    &[],
+                    &BTreeMap::from([("LLOOM_HOST_FEED_POLL".into(), text.into())]),
+                ),
+            ));
+            if let Some(converted) = row.get("converted") {
+                assert_eq!(
+                    json!(lloom_tensor::options::v1::feed_wait_from(text).unwrap()),
+                    *converted,
+                    "{}",
+                    row["name"]
+                );
+            }
+        }
+        for (via, result) in routes {
+            if wait_case_accepts(row) {
+                let options = result.unwrap_or_else(|e| panic!("{} via {via}: {e}", row["name"]));
+                assert_eq!(
+                    json!(options.tuning.ring.feed_poll),
+                    row["stored"],
+                    "{} via {via}",
+                    row["name"]
+                );
+                assert_eq!(
+                    index().flat(&options)[&key.path],
+                    row["rendered"],
+                    "{} via {via}",
+                    row["name"]
+                );
+                // The cold handoff copies this exact stored value to the model crate.
+                let tuning = options.tuning.lloom();
+                assert_eq!(json!(tuning.ring.feed_poll), row["stored"]);
+                assert_eq!(
+                    tuning
+                        .ring
+                        .feed_poll
+                        .parse::<lloom::nn::decode::FeedWait>()
+                        .unwrap()
+                        .to_string(),
+                    row["stored"].as_str().unwrap()
+                );
+            } else {
+                let error = result.unwrap_err();
+                assert!(
+                    error.contains("feed_poll")
+                        || error.contains("host_feed")
+                        || error.contains("host-feed"),
+                    "{} via {via}: {error}",
+                    row["name"]
+                );
+            }
+        }
+    }
+    let mut options = EngineOptions::default();
+    index().set(&mut options, &key.path, "event:7us").unwrap();
+    let before = options.clone();
+    for row in cases.iter().filter(|row| !wait_case_accepts(row)) {
+        if let Some(text) = row["input"].as_str() {
+            assert!(index().set(&mut options, &key.path, text).is_err());
+        }
+        assert!(index()
+            .merge(&mut options, &document(&key.path, row["input"].clone()))
+            .is_err());
+        assert_eq!(
+            options, before,
+            "{}: refused input changed state",
+            row["name"]
+        );
+    }
+    index()
+        .merge(&mut options, &document(&key.path, Value::Null))
+        .unwrap();
+    assert_eq!(options, EngineOptions::default());
+    assert_eq!(options.tuning.ring.feed_poll, "on-demand:50");
+}
+
+/// Limited Rust-helper property checks; standard-validator agreement is UNRUN.
+#[test]
+fn host_feed_wait_descriptor_projects_literal_property_language() {
+    let schema = crate::option_schema::schema();
+    let key = &index().keys["decode.host_feed.wait"];
+    assert_eq!(
+        key.meta().grammar,
+        Some(&lloom_tensor::options::wait::HOST_FEED_WAIT)
+    );
+    let node = schema_node(&schema, &key.path);
+    for row in host_feed_wait_cases() {
+        assert_eq!(
+            schema_valid(node, &row["input"], &schema["$defs"]),
+            wait_case_accepts(&row),
+            "{}",
+            row["name"]
+        );
+    }
+}
+
+/// These controls pin existing semantics, not approval of the unresolved schemas.
+#[test]
+fn unapplied_wait_contracts_preserve_existing_resolution_boundaries() {
+    let rows: Vec<Value> = serde_json::from_str(include_str!(
+        "../../tests/fixtures/unapplied-wait-contracts-s2.json"
+    ))
+    .unwrap();
+    assert_eq!(rows.len(), 33);
+    let none = BTreeMap::new();
+    for row in rows {
+        let key = row["key"].as_str().unwrap();
+        assert!(index().keys[key].meta().grammar.is_none());
+        let input = &row["input"];
+        let (group, rest) = key.split_once('.').unwrap();
+        let flag = format!("--{group}-config");
+        let doc = document(rest, input.clone()).to_string();
+        let mut routes = vec![("group".into(), config(&[&flag, &doc], &none))];
+        if let Some(text) = input.as_str() {
+            routes.extend(layers(&index().keys[key], text));
+        }
+        let accepts = row["accept"] == true
+            || (row["accept_without_metal"] == true && !cfg!(feature = "metal"));
+        for (via, result) in routes {
+            if accepts {
+                let options = result.unwrap_or_else(|e| panic!("{} via {via}: {e}", row["name"]));
+                let stored = serde_json::to_value(&options).unwrap();
+                let actual = row["storage"]
+                    .as_str()
+                    .unwrap()
+                    .split('.')
+                    .fold(&stored, |v, s| &v[s]);
+                assert_eq!(*actual, row["stored"], "{} via {via}", row["name"]);
+                assert_eq!(
+                    index().flat(&options)[key],
+                    row["rendered"],
+                    "{} via {via}",
+                    row["name"]
+                );
+            } else {
+                assert!(
+                    result.is_err(),
+                    "{} via {via}: unexpectedly accepted",
+                    row["name"]
+                );
+            }
+        }
+        if !accepts {
+            let seed = match key {
+                "weights.experts.fetch.wait" => "sleep:7us",
+                "backend.metal.completion_wait" => "event:3ms",
+                _ => "inherit",
+            };
+            let mut options = EngineOptions::default();
+            index().set(&mut options, key, seed).unwrap();
+            let before = options.clone();
+            assert!(index()
+                .merge(&mut options, &document(key, input.clone()))
+                .is_err());
+            assert_eq!(options, before, "{}: refusal changed state", row["name"]);
+        }
     }
 }

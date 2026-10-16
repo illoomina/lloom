@@ -1,0 +1,311 @@
+[
+  {
+    "name": "fetch bare sleep",
+    "key": "weights.experts.fetch.wait",
+    "storage": "tuning.stream.fetch_poll_us",
+    "input": "sleep",
+    "accept": true,
+    "projection": "unapplied",
+    "stored": 50,
+    "rendered": "sleep:50us"
+  },
+  {
+    "name": "fetch scaled",
+    "key": "weights.experts.fetch.wait",
+    "storage": "tuning.stream.fetch_poll_us",
+    "input": "sleep:2ms",
+    "accept": true,
+    "projection": "unapplied",
+    "stored": 2000,
+    "rendered": "sleep:2000us"
+  },
+  {
+    "name": "fetch raw plus",
+    "key": "weights.experts.fetch.wait",
+    "storage": "tuning.stream.fetch_poll_us",
+    "input": "+0007",
+    "accept": true,
+    "projection": "unapplied",
+    "stored": 7,
+    "rendered": "sleep:7us"
+  },
+  {
+    "name": "fetch native integer",
+    "key": "weights.experts.fetch.wait",
+    "storage": "tuning.stream.fetch_poll_us",
+    "input": 7,
+    "accept": true,
+    "projection": "unapplied",
+    "stored": 7,
+    "rendered": "sleep:7us"
+  },
+  {
+    "name": "fetch reset",
+    "key": "weights.experts.fetch.wait",
+    "storage": "tuning.stream.fetch_poll_us",
+    "input": null,
+    "accept": true,
+    "projection": "unapplied",
+    "stored": 50,
+    "rendered": "sleep:50us"
+  },
+  {
+    "name": "fetch native integral float",
+    "key": "weights.experts.fetch.wait",
+    "storage": "tuning.stream.fetch_poll_us",
+    "input": 7.0,
+    "accept": false,
+    "projection": "unapplied"
+  },
+  {
+    "name": "fetch zero",
+    "key": "weights.experts.fetch.wait",
+    "storage": "tuning.stream.fetch_poll_us",
+    "input": 0,
+    "accept": false,
+    "projection": "unapplied"
+  },
+  {
+    "name": "fetch sleep zero",
+    "key": "weights.experts.fetch.wait",
+    "storage": "tuning.stream.fetch_poll_us",
+    "input": "sleep:0us",
+    "accept": false,
+    "projection": "unapplied"
+  },
+  {
+    "name": "fetch raw parameter plus",
+    "key": "weights.experts.fetch.wait",
+    "storage": "tuning.stream.fetch_poll_us",
+    "input": "sleep:+7",
+    "accept": false,
+    "projection": "unapplied"
+  },
+  {
+    "name": "fetch native bool",
+    "key": "weights.experts.fetch.wait",
+    "storage": "tuning.stream.fetch_poll_us",
+    "input": true,
+    "accept": false,
+    "projection": "unapplied"
+  },
+  {
+    "name": "completion block",
+    "key": "backend.metal.completion_wait",
+    "storage": "tuning.metal.completion_wait",
+    "input": "block",
+    "accept": true,
+    "projection": "unapplied",
+    "stored": "synchronize",
+    "rendered": "block"
+  },
+  {
+    "name": "completion timed",
+    "key": "backend.metal.completion_wait",
+    "storage": "tuning.metal.completion_wait",
+    "input": "event:2s",
+    "accept": true,
+    "projection": "unapplied",
+    "stored": "shared-event-wait:2000",
+    "rendered": "event:2000ms"
+  },
+  {
+    "name": "completion sleep",
+    "key": "backend.metal.completion_wait",
+    "storage": "tuning.metal.completion_wait",
+    "input": "event-sleep:2ms",
+    "accept": true,
+    "projection": "unapplied",
+    "stored": "shared-event-sleep:2000",
+    "rendered": "event-sleep:2000us"
+  },
+  {
+    "name": "completion listener",
+    "key": "backend.metal.completion_wait",
+    "storage": "tuning.metal.completion_wait",
+    "input": "event-listener:5ms",
+    "accept": true,
+    "projection": "unapplied",
+    "stored": "shared-event-listener:5",
+    "rendered": "event-listener:5ms"
+  },
+  {
+    "name": "completion raw timeout max",
+    "key": "backend.metal.completion_wait",
+    "storage": "tuning.metal.completion_wait",
+    "input": "shared-event-wait:18446744073709551615",
+    "accept": true,
+    "projection": "unapplied",
+    "stored": "shared-event-wait:18446744073709551615",
+    "rendered": "event:18446744073709551615ms"
+  },
+  {
+    "name": "completion reset",
+    "key": "backend.metal.completion_wait",
+    "storage": "tuning.metal.completion_wait",
+    "input": null,
+    "accept": true,
+    "projection": "unapplied",
+    "stored": "synchronize",
+    "rendered": "block"
+  },
+  {
+    "name": "completion legacy parameter whitespace differs by build",
+    "key": "backend.metal.completion_wait",
+    "storage": "tuning.metal.completion_wait",
+    "input": "shared-event-wait: +5",
+    "accept": false,
+    "projection": "unapplied",
+    "accept_without_metal": true,
+    "stored": "shared-event-wait: +5",
+    "rendered": "shared-event-wait: +5"
+  },
+  {
+    "name": "completion fractional ms",
+    "key": "backend.metal.completion_wait",
+    "storage": "tuning.metal.completion_wait",
+    "input": "event:500us",
+    "accept": false,
+    "projection": "unapplied"
+  },
+  {
+    "name": "completion native bool",
+    "key": "backend.metal.completion_wait",
+    "storage": "tuning.metal.completion_wait",
+    "input": true,
+    "accept": false,
+    "projection": "unapplied"
+  },
+  {
+    "name": "decode event",
+    "key": "decode.ring.eos_wait",
+    "storage": "tuning.ring.eos_park",
+    "input": "event",
+    "accept": true,
+    "projection": "unapplied",
+    "stored": true,
+    "rendered": "event"
+  },
+  {
+    "name": "decode inherit",
+    "key": "decode.ring.eos_wait",
+    "storage": "tuning.ring.eos_park",
+    "input": "inherit",
+    "accept": true,
+    "projection": "unapplied",
+    "stored": false,
+    "rendered": "inherit"
+  },
+  {
+    "name": "decode bool case",
+    "key": "decode.ring.eos_wait",
+    "storage": "tuning.ring.eos_park",
+    "input": "ON",
+    "accept": true,
+    "projection": "unapplied",
+    "stored": true,
+    "rendered": "event"
+  },
+  {
+    "name": "decode native bool",
+    "key": "decode.ring.eos_wait",
+    "storage": "tuning.ring.eos_park",
+    "input": false,
+    "accept": true,
+    "projection": "unapplied",
+    "stored": false,
+    "rendered": "inherit"
+  },
+  {
+    "name": "decode reset",
+    "key": "decode.ring.eos_wait",
+    "storage": "tuning.ring.eos_park",
+    "input": null,
+    "accept": true,
+    "projection": "unapplied",
+    "stored": false,
+    "rendered": "inherit"
+  },
+  {
+    "name": "decode event case",
+    "key": "decode.ring.eos_wait",
+    "storage": "tuning.ring.eos_park",
+    "input": "EVENT",
+    "accept": false,
+    "projection": "unapplied"
+  },
+  {
+    "name": "decode event padding",
+    "key": "decode.ring.eos_wait",
+    "storage": "tuning.ring.eos_park",
+    "input": " event ",
+    "accept": false,
+    "projection": "unapplied"
+  },
+  {
+    "name": "speculative event",
+    "key": "speculative.verify_wait",
+    "storage": "tuning.ring.verify_park",
+    "input": "event",
+    "accept": true,
+    "projection": "unapplied",
+    "stored": true,
+    "rendered": "event"
+  },
+  {
+    "name": "speculative inherit",
+    "key": "speculative.verify_wait",
+    "storage": "tuning.ring.verify_park",
+    "input": "inherit",
+    "accept": true,
+    "projection": "unapplied",
+    "stored": false,
+    "rendered": "inherit"
+  },
+  {
+    "name": "speculative bool case",
+    "key": "speculative.verify_wait",
+    "storage": "tuning.ring.verify_park",
+    "input": "ON",
+    "accept": true,
+    "projection": "unapplied",
+    "stored": true,
+    "rendered": "event"
+  },
+  {
+    "name": "speculative native bool",
+    "key": "speculative.verify_wait",
+    "storage": "tuning.ring.verify_park",
+    "input": false,
+    "accept": true,
+    "projection": "unapplied",
+    "stored": false,
+    "rendered": "inherit"
+  },
+  {
+    "name": "speculative reset",
+    "key": "speculative.verify_wait",
+    "storage": "tuning.ring.verify_park",
+    "input": null,
+    "accept": true,
+    "projection": "unapplied",
+    "stored": true,
+    "rendered": "event"
+  },
+  {
+    "name": "speculative event case",
+    "key": "speculative.verify_wait",
+    "storage": "tuning.ring.verify_park",
+    "input": "EVENT",
+    "accept": false,
+    "projection": "unapplied"
+  },
+  {
+    "name": "speculative event padding",
+    "key": "speculative.verify_wait",
+    "storage": "tuning.ring.verify_park",
+    "input": " event ",
+    "accept": false,
+    "projection": "unapplied"
+  }
+]

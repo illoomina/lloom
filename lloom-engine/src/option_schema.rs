@@ -143,19 +143,21 @@ const TRIM_SPACE: &str = "[\u{0009}-\u{000D}\u{0020}\u{0085}\u{00A0}\u{1680}\u{2
 
 fn wait_schema(grammar: &lloom_tensor::options::wait::WaitGrammar) -> Value {
     let literal = |s: &str| escape(s).replace(r"\-", "-");
-    let arm = literal(grammar.parameter_arm);
-    let maximum = grammar.parameter.maximum();
-    let mut parameters = vec![bounded_decimal(maximum)];
-    for unit in grammar.parameter.units() {
-        parameters.push(format!(
-            r"{TRIM_SPACE}*\+?{}{}",
-            bounded_decimal(maximum / unit.scale()),
-            literal(unit.suffix()),
-        ));
-    }
     let mut alts: Vec<String> = grammar.literals.iter().map(|s| literal(s)).collect();
-    alts.push(arm.clone());
-    alts.push(format!("{arm}:({})", parameters.join("|")));
+    for arm in grammar.parameter_arms() {
+        let spelling = literal(arm.spelling);
+        let maximum = arm.parameter.maximum();
+        let mut parameters = vec![bounded_decimal(maximum)];
+        for unit in arm.parameter.units() {
+            parameters.push(format!(
+                r"{TRIM_SPACE}*\+?{}{}",
+                bounded_decimal(maximum / unit.scale()),
+                literal(unit.suffix()),
+            ));
+        }
+        alts.push(spelling.clone());
+        alts.push(format!("{spelling}:({})", parameters.join("|")));
+    }
     json!({"type": "string", "pattern": format!(
         "^{TRIM_SPACE}*({}){TRIM_SPACE}*$", case_free(&alts.join("|"))
     )})

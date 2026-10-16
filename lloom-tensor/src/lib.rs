@@ -208,8 +208,8 @@ mod retirement_registry;
 mod retirement_service;
 pub mod safetensors;
 pub mod scalar;
-pub mod shape;
 pub mod schedule_hook;
+pub mod shape;
 pub mod shape_probe;
 mod sort;
 mod storage;
@@ -222,6 +222,7 @@ pub mod tuning;
 pub mod typed;
 pub mod utils;
 mod variable;
+mod zip_name;
 
 #[cfg(feature = "cudnn")]
 pub use cuda_backend::cudnn;

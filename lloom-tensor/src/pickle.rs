@@ -675,10 +675,12 @@ pub fn read_pth_tensor_info<P: AsRef<std::path::Path>>(
     let file = std::fs::File::open(file)?;
     let zip_reader = std::io::BufReader::new(file);
     let mut zip = zip::ZipArchive::new(zip_reader)?;
-    let zip_file_names = zip
-        .file_names()
-        .map(|f| f.to_string())
-        .collect::<Vec<String>>();
+    let zip_file_names = (0..zip.len())
+        .map(|i| {
+            let entry = zip.by_index_data(i)?;
+            Ok(crate::zip_name::decoded(entry.name_raw(), entry.flags().as_u16()).into_owned())
+        })
+        .collect::<zip::result::ZipResult<Vec<String>>>()?;
 
     let mut tensor_infos = vec![];
     for file_name in zip_file_names.iter() {

@@ -69,3 +69,148 @@ fn safetensors() -> Result<()> {
     assert_eq!(diff, 0f32);
     Ok(())
 }
+
+/// Exercise archive writing and every eager/lazy NPZ reader against fixed
+/// independent values, not just two ZIP implementations agreeing on bytes.
+#[test]
+fn npz_roundtrip_all_readers() -> Result<()> {
+    use lloom_tensor::{npy::NpzTensors, Device};
+    let path = TmpFile::create("npz-roundtrip");
+    let a = Tensor::from_vec(vec![1i64, -2, 3, 4], (2, 2), &Device::Cpu)?;
+    let b = Tensor::from_vec(vec![0.25f32, -1.5, 2.0], 3, &Device::Cpu)?;
+    Tensor::write_npz(&[("a", &a), ("b", &b)], &path)?;
+    let eager = Tensor::read_npz(&path)?;
+    assert_eq!(
+        eager.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(),
+        ["a", "b"]
+    );
+    assert_eq!(eager[0].1.to_vec2::<i64>()?, [[1, -2], [3, 4]]);
+    assert_eq!(eager[1].1.to_vec1::<f32>()?, [0.25, -1.5, 2.0]);
+    let selected = Tensor::read_npz_by_name(&path, &["b", "a"])?;
+    assert_eq!(selected[0].to_vec1::<f32>()?, [0.25, -1.5, 2.0]);
+    assert_eq!(selected[1].to_vec2::<i64>()?, [[1, -2], [3, 4]]);
+    assert!(Tensor::read_npz_by_name(&path, &["missing"]).is_err());
+    let lazy = NpzTensors::new(&path)?;
+    let mut names = lazy
+        .names()
+        .into_iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    names.sort_unstable();
+    assert_eq!(names, ["a", "b"]);
+    let (shape, dtype) = lazy.get_shape_and_dtype("a")?;
+    assert_eq!(shape.dims(), &[2, 2]);
+    assert_eq!(dtype, DType::I64);
+    assert_eq!(lazy.get("a")?.unwrap().to_vec2::<i64>()?, [[1, -2], [3, 4]]);
+    assert_eq!(lazy.get("b")?.unwrap().to_vec1::<f32>()?, [0.25, -1.5, 2.0]);
+    assert!(lazy.get("missing")?.is_none());
+    Ok(())
+}
+
+/// Existing NumPy-produced fixture is independent of lloom's writer.
+#[test]
+fn npz_external_fixture_named_and_lazy() -> Result<()> {
+    use lloom_tensor::npy::NpzTensors;
+    let selected = Tensor::read_npz_by_name("tests/test.npz", &["x_plus_one", "x"])?;
+    assert_eq!(
+        selected[0].to_vec1::<i64>()?,
+        [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+    );
+    assert_eq!(
+        selected[1].to_vec1::<i64>()?,
+        [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+    );
+    let lazy = NpzTensors::new("tests/test.npz")?;
+    assert_eq!(
+        lazy.get("x")?.unwrap().to_vec1::<i64>()?,
+        [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+    );
+    Ok(())
+}
+
+/// A flagged malformed UTF-8 name retains zip8's lossy decoding rather than
+/// adopting zip9's unconditional CP437 fallback.
+#[test]
+fn flagged_invalid_utf8_names_preserve_lossy_decoding() -> Result<()> {
+    let path = TmpFile::create("npz-cp437-name");
+    let mut bytes = std::fs::read("tests/test.npz")?;
+    let mut changed = 0;
+    for i in 0..bytes.len().saturating_sub(46) {
+        let (flags, name) = match &bytes[i..i + 4] {
+            b"PK\x03\x04" => (i + 6, i + 30),
+            b"PK\x01\x02" => (i + 8, i + 46),
+            _ => continue,
+        };
+        bytes[flags + 1] |= 0x08;
+        bytes[name] = 0xff; // CP437 non-breaking space, not UTF-8.
+        changed += 1;
+    }
+    assert_eq!(changed, 4, "two local and two central headers");
+    std::fs::write(&path, bytes)?;
+    let eager = Tensor::read_npz(&path)?;
+    assert_eq!(eager[0].0, "�");
+    assert_eq!(eager[1].0, "�_plus_one");
+    let lazy = lloom_tensor::npy::NpzTensors::new(&path)?;
+    assert_eq!(
+        lazy.get("�")?.unwrap().to_vec1::<i64>()?,
+        [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+    );
+    // The same filename enumeration in PTH ignores non-data.pkl entries.
+    assert!(lloom_tensor::pickle::read_pth_tensor_info(&path, false, None)?.is_empty());
+    Ok(())
+}
+
+/// zip8 honors the language flag; raw CP437 bytes can also be valid UTF-8.
+/// The exposed tensor key must not silently change across the security bump.
+#[test]
+fn archive_language_flag_preserves_legacy_keys() -> Result<()> {
+    use lloom_tensor::{npy::NpzTensors, Device};
+    for (label, raw, utf8, expected, raw_lookup) in [
+        ("cp437-valid-utf8", [0xc3, 0xa9], false, "├⌐", Some("é")),
+        ("utf8-valid", [0xc3, 0xa9], true, "é", Some("é")),
+        ("cp437-invalid-utf8", [0xff, b'x'], false, "\u{a0}x", None),
+        ("utf8-invalid", [0xff, b'x'], true, "�x", None),
+    ] {
+        let path = TmpFile::create(label);
+        let t = Tensor::from_vec(vec![19i64, -7], 2, &Device::Cpu)?;
+        Tensor::write_npz(&[("xx", &t)], &path)?;
+        let mut bytes = std::fs::read(&path)?;
+        let mut changed = 0;
+        for i in 0..bytes.len().saturating_sub(46) {
+            let (flags, name) = match &bytes[i..i + 4] {
+                b"PK\x03\x04" => (i + 6, i + 30),
+                b"PK\x01\x02" => (i + 8, i + 46),
+                _ => continue,
+            };
+            if utf8 {
+                bytes[flags + 1] |= 0x08;
+            } else {
+                bytes[flags + 1] &= !0x08;
+            }
+            bytes[name..name + 2].copy_from_slice(&raw);
+            changed += 1;
+        }
+        assert_eq!(changed, 2, "{label}: one local and one central header");
+        std::fs::write(&path, bytes)?;
+        let eager = Tensor::read_npz(&path)?;
+        assert_eq!(eager[0].0, expected, "{label}");
+        assert_eq!(eager[0].1.to_vec1::<i64>()?, [19, -7]);
+        let lazy = NpzTensors::new(&path)?;
+        assert_eq!(lazy.get(expected)?.unwrap().to_vec1::<i64>()?, [19, -7]);
+        if let Some(raw_lookup) = raw_lookup {
+            assert_eq!(
+                Tensor::read_npz_by_name(&path, &[raw_lookup])?[0].to_vec1::<i64>()?,
+                [19, -7]
+            );
+        }
+        if raw_lookup != Some(expected) {
+            // Pre-existing raw-byte lookup mismatch, separate from decoding:
+            // by_name indexes UTF-8 spelling, while by_index uses the key.
+            assert!(
+                Tensor::read_npz_by_name(&path, &[expected]).is_err(),
+                "{label}"
+            );
+        }
+    }
+    Ok(())
+}

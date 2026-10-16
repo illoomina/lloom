@@ -125,6 +125,7 @@ pub use speculator::{
     ReuseAction, RoundProbe, RoundTiming, SeqId, Sequence, Session, Speculator, TapSide, TapSpec,
     TargetProbe, VerifyRowRef,
 };
+pub use turn_checkpoint::CheckpointPolicy;
 pub use var_builder::VarBuilder;
 pub use var_map::VarMap;
 

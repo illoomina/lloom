@@ -155,6 +155,7 @@ mod tiny_packed_metal;
 mod token_ring_fuzz;
 mod token_ring_tests;
 mod turn_checkpoint;
+mod turn_checkpoint_policy;
 mod varlen_flash_attention;
 mod verify_window_gemm;
 

@@ -180,7 +180,7 @@ fn moved(
     let cli = parse(full).map_err(|e| e.to_string())?;
     let (common, front) = front_of(&cli);
     let get = |name: &str| env.get(name).cloned();
-    let (o, _) = resolve_layers(common, &*front, &get, false).map_err(|e| e.to_string())?;
+    let (o, _) = resolve_layers(common, &*front, &get, false, None).map_err(|e| e.to_string())?;
     let idx = index();
     let before = idx.flat(&EngineOptions::default());
     Ok(idx
@@ -379,7 +379,7 @@ fn resolved(sub: &str, argv: &[&str]) -> Result<EngineOptions, String> {
     let cli = parse(full).map_err(|e| e.to_string())?;
     let (common, front) = front_of(&cli);
     let none = |_: &str| None;
-    resolve_layers(common, &*front, &none, false)
+    resolve_layers(common, &*front, &none, false, None)
         .map(|(o, _)| o)
         .map_err(|e| e.to_string())
 }

@@ -3464,12 +3464,16 @@ mod owner_submission_tests {
         })
         .unwrap();
         let residency_before = commands.core.residency_set.counters().commits;
+        // This counter counts dirty native publications, not owner calls.
+        // Stage genuine residency before expecting one publication.
+        assert_eq!(commands.core.residency_set.add(&raw), 1);
         {
             let mut blit = commands.blit_command_encoder().unwrap();
             // SAFETY: independent raw pins survive until actual joined work.
             unsafe { blit.fill_buffer(&raw, (0, 4096), 0x74) };
         }
         commands.ensure_completed(&cb).unwrap();
+        let residency_submitted = commands.core.residency_set.counters().commits;
         // Initial work is genuinely joined before any mutant assertion. No
         // held host event, background worker or physical second commit exists.
         let bytes = unsafe { std::slice::from_raw_parts(raw.contents(), 4096) };
@@ -3523,9 +3527,11 @@ mod owner_submission_tests {
                 .load(Ordering::Relaxed),
             1
         );
+        assert_eq!(residency_submitted, residency_before + 1);
         assert_eq!(
             commands.core.residency_set.counters().commits,
-            residency_before + 1
+            residency_submitted,
+            "cached receipt recovery republished residency"
         );
         assert_eq!(after, factories, "receipt recovery invoked a slot factory");
         let state = commands.lock_state().unwrap();

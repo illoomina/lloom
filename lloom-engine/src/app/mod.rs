@@ -64,9 +64,13 @@ pub struct Shape {
 }
 
 impl Shape {
-    /// The shape `o` names; `reuse_default` is the front-end's own prefix
-    /// reuse where `context.prefix.reuse` is unset.
-    pub fn of(o: &crate::EngineOptions, reuse_default: bool, seed_text: String) -> Shape {
+    /// The shape `o` names for `frontend`, whose own prefix reuse applies
+    /// where `context.prefix.reuse` is unset (`crate::frontend`).
+    pub fn of(
+        o: &crate::EngineOptions,
+        frontend: crate::frontend::Frontend,
+        seed_text: String,
+    ) -> Shape {
         Shape {
             decode: o.decode.clone(),
             model: o.model.clone(),
@@ -74,7 +78,7 @@ impl Shape {
             executor: o.executor.clone(),
             memory: o.memory.clone(),
             sampling: o.sampling.clone(),
-            reuse_prefix: o.prefix.reuse.unwrap_or(reuse_default),
+            reuse_prefix: o.prefix.reuse.unwrap_or_else(|| frontend.reuse_prefix()),
             seed_text,
             batch: o.scheduler.max_sequences,
             mem_sample: o.report.memory_sample,
@@ -302,25 +306,32 @@ pub fn process_env(name: &str) -> Option<String> {
     std::env::var_os(name).map(|v| v.to_string_lossy().into_owned())
 }
 
-/// Resolve the option tree from `common`: defaults < env (the legacy names,
-/// then `LLOOM_<KEY>`) < `--config` < `--<group>-config` < `--set` < flags;
-/// every refusal checked once at the end. The tuning is installed into
-/// both library crates here — before the device or the model exists, so
-/// every `OnceLock` read site takes it.
-pub fn resolve_options(common: &CommonArgs, front: FrontFlags<'_>) -> Result<crate::EngineOptions> {
-    let o = resolve_options_uninstalled(common, front)?;
+/// Resolve the option tree from `common` for `frontend`: defaults < env
+/// (the legacy names, then `LLOOM_<KEY>`) < `--config` < `--<group>-config`
+/// < `--set` < flags, then the front-end's own default of every key no
+/// layer named; every refusal, and every capability the build lacks,
+/// checked once at the end. The tuning is installed into both library
+/// crates here — before the device or the model exists, so every
+/// `OnceLock` read site takes it.
+pub fn resolve_options(
+    common: &CommonArgs,
+    front: FrontFlags<'_>,
+    frontend: crate::frontend::Frontend,
+) -> Result<crate::EngineOptions> {
+    let o = resolve_layers(common, front, &process_env, false, Some(frontend))?.0;
     o.tuning.install().map_err(|e| anyhow::anyhow!("{e}"))?;
     eprintln!("[contract: {}]", lloom_tensor::tuning::contract().report());
     Ok(o)
 }
 
-/// [`resolve_options`] without installing the tuning (`lloom config`,
-/// `lloom options`, the tests — nothing that goes on to load a model).
+/// The option layers without a front-end's defaults and without installing
+/// the tuning (`lloom config`, `lloom options`, the tests — nothing that
+/// goes on to load a model).
 pub fn resolve_options_uninstalled(
     common: &CommonArgs,
     front: FrontFlags<'_>,
 ) -> Result<crate::EngineOptions> {
-    Ok(resolve_layers(common, front, &process_env, false)?.0)
+    Ok(resolve_layers(common, front, &process_env, false, None)?.0)
 }
 
 /// One layer's effect: its label and the keys it moved, with their values.
@@ -329,15 +340,20 @@ pub type Layer = (
     std::collections::BTreeMap<String, serde_json::Value>,
 );
 
-/// The layers, applied in order; with `trace` each one's moves are kept
-/// (`lloom config --explain`).
+/// The layers, applied in order, then `frontend`'s defaults where no layer
+/// named the key; with `trace` each one's moves are kept (`lloom config
+/// --explain`).
 pub fn resolve_layers(
     common: &CommonArgs,
     front: FrontFlags<'_>,
     env: &dyn Fn(&str) -> Option<String>,
     trace: bool,
+    frontend: Option<crate::frontend::Frontend>,
 ) -> Result<(crate::EngineOptions, Vec<Layer>)> {
     let idx = crate::option_tree::index();
+    // The keys a layer named, by storage path: what a front-end's default
+    // leaves alone, whatever value the layer gave.
+    let mut named: std::collections::BTreeSet<String> = Default::default();
     let mut o = crate::EngineOptions::default();
     let mut layers: Vec<Layer> = Vec::new();
     let mut last = if trace {
@@ -365,21 +381,30 @@ pub fn resolve_layers(
     }
     o.from_env_with(env)
         .map_err(|e| anyhow::anyhow!("env: {e}"))?;
+    for key in idx.keys.values() {
+        if env(&key.env()).is_some() || key.legacy_env().iter().any(|e| env(e).is_some()) {
+            named.extend(key.targets.iter().map(|l| l.storage.clone()));
+        }
+    }
     mark("env", &o);
     if let Some(path) = &common.config {
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("reading --config {}", path.display()))?;
         let v: serde_json::Value = serde_json::from_str(&text)
             .with_context(|| format!("--config {}: not JSON", path.display()))?;
-        idx.merge(&mut o, &v)
-            .map_err(|e| anyhow::anyhow!("--config {}: {e}", path.display()))?;
+        named.extend(
+            idx.merge_written(&mut o, &v)
+                .map_err(|e| anyhow::anyhow!("--config {}: {e}", path.display()))?,
+        );
         mark(&format!("--config {}", path.display()), &o);
     }
     for (group, json, fallback) in common.group_configs() {
         let v: serde_json::Value =
             serde_json::from_str(json).with_context(|| format!("--{group}-config: not JSON"))?;
-        idx.merge_group(&mut o, group, &v, fallback)
-            .map_err(|e| anyhow::anyhow!("--{group}-config: {e}"))?;
+        named.extend(
+            idx.merge_group_written(&mut o, group, &v, fallback)
+                .map_err(|e| anyhow::anyhow!("--{group}-config: {e}"))?,
+        );
         mark(&format!("--{group}-config"), &o);
     }
     for kv in &common.set {
@@ -387,13 +412,35 @@ pub fn resolve_layers(
             .map_err(|e| anyhow::anyhow!("--set {e}"))?;
         idx.set(&mut o, k, v)
             .map_err(|e| anyhow::anyhow!("--set {kv}: {e}"))?;
+        match idx.storage_of(k) {
+            Some(storage) => {
+                named.insert(storage.to_string());
+            }
+            None => named.extend(
+                idx.key_of(k)
+                    .into_iter()
+                    .flat_map(|key| key.targets.iter().map(|l| l.storage.clone())),
+            ),
+        }
         mark(&format!("--set {k}"), &o);
     }
     common
         .options
         .apply(&mut o)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
+    common.options.given("", &mut named);
+    // A subcommand's own flags: the keys they moved (none of them carries
+    // a front-end default other than an optional one, which is unset
+    // until a value is given).
+    let before_front = idx.flat(&o);
     front(&mut o).map_err(|e| anyhow::anyhow!("{e}"))?;
+    for (k, v) in idx.flat(&o) {
+        if before_front.get(&k) != Some(&v) {
+            if let Some(key) = idx.keys.get(&k) {
+                named.extend(key.targets.iter().map(|l| l.storage.clone()));
+            }
+        }
+    }
     // The speculation shorthands (the harnesses' spellings), over the group.
     if common.dspark && common.mtp.is_some() {
         anyhow::bail!(
@@ -408,7 +455,20 @@ pub fn resolve_layers(
         o.speculative.drafter = Some(path.clone());
     }
     mark("flags", &o);
+    if let Some(f) = frontend {
+        let named: std::collections::BTreeSet<String> = named
+            .iter()
+            .filter_map(|storage| idx.key_of_storage(storage).map(|k| k.path.clone()))
+            .collect();
+        crate::frontend::apply(&mut o, f, &named).map_err(|e| anyhow::anyhow!("{e}"))?;
+        mark(&format!("the {} default", f.name()), &o);
+    }
     o.check().map_err(|e| anyhow::anyhow!("{e}"))?;
+    for note in crate::compiled::check(&o, &crate::compiled::this_build())
+        .map_err(|e| anyhow::anyhow!("{e}"))?
+    {
+        eprintln!("{note}");
+    }
     Ok((o, layers))
 }
 
@@ -424,6 +484,11 @@ pub struct ConfigCmdArgs {
     /// Print the storage tree (the groups' own shape) instead of the keys.
     #[arg(long, hide = true)]
     pub storage: bool,
+    /// Resolve as this front-end would — `chat`, `serve` or `bench` — its own
+    /// defaults applied where no layer named the key; without it, the
+    /// library's tree.
+    #[arg(long, value_name = "FRONTEND", value_parser = crate::frontend::Frontend::parse)]
+    pub frontend: Option<crate::frontend::Frontend>,
     #[command(flatten)]
     pub common: CommonArgs,
     #[command(flatten)]
@@ -467,7 +532,13 @@ impl FrontArgs {
 /// `lloom config`.
 pub fn print_config(args: &ConfigCmdArgs) -> Result<()> {
     let front = |o: &mut crate::EngineOptions| args.front.apply(o);
-    let (o, layers) = resolve_layers(&args.common, &front, &process_env, args.explain)?;
+    let (o, layers) = resolve_layers(
+        &args.common,
+        &front,
+        &process_env,
+        args.explain,
+        args.frontend,
+    )?;
     let idx = crate::option_tree::index();
     if args.storage {
         println!("{}", serde_json::to_string_pretty(&o)?);
@@ -518,6 +589,9 @@ pub struct OptionsCmdArgs {
     /// Print the JSON Schema of the tree instead, generated from the same declarations.
     #[arg(long)]
     pub schema: bool,
+    /// Print this binary's compiled capabilities instead (`profile`, the backends), which the keys that need one name.
+    #[arg(long)]
+    pub compiled: bool,
 }
 
 /// `lloom options`.
@@ -527,6 +601,12 @@ pub fn print_options(args: &OptionsCmdArgs) -> Result<()> {
             "{}",
             serde_json::to_string_pretty(&crate::option_schema::schema())?
         );
+        return Ok(());
+    }
+    if args.compiled {
+        for line in crate::compiled::table_lines(&crate::compiled::this_build()) {
+            println!("{line}");
+        }
         return Ok(());
     }
     if let Some(s) = &args.status {
@@ -584,6 +664,15 @@ pub fn print_options(args: &OptionsCmdArgs) -> Result<()> {
             },
         );
         println!("    {}", m.doc);
+        if let Some(d) = crate::frontend::describe(&k.path) {
+            println!("    unset: {d}");
+        }
+        if !m.needs.is_empty() {
+            match m.needs_part {
+                "" => println!("    needs: the `{}` build", m.needs),
+                part => println!("    needs: the `{}` build for {part}", m.needs),
+            }
+        }
         if args.internal {
             if m.internal != m.doc && !m.internal.is_empty() {
                 println!("    internal: {}", m.internal);
@@ -642,12 +731,54 @@ pub enum Command {
 /// process leaves it to the OS.
 const DEVICE_RETIREMENT_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// The command line, each front-end's help naming its own default of every
+/// key it resolves itself (`crate::frontend`), where the flag's help ends.
+pub fn command() -> clap::Command {
+    use clap::CommandFactory;
+    let mut cmd = Cli::command();
+    for f in crate::frontend::Frontend::ALL {
+        cmd = cmd.mut_subcommand(f.name(), |mut sub| {
+            let ids: Vec<(String, String)> = sub
+                .get_arguments()
+                .filter_map(|a| {
+                    let help = a.get_help()?.to_string();
+                    let key = help.split("[key: ").nth(1)?.split(']').next()?.to_string();
+                    let r = crate::frontend::row(&key, f)?;
+                    let when = match r.when.describe() {
+                        "" => String::new(),
+                        w => format!(" when {w}"),
+                    };
+                    let change = match crate::frontend::exception(r) {
+                        Some(e) if !e.landed => {
+                            format!("; decision {}: {} once landed", e.decision, e.after)
+                        }
+                        _ => String::new(),
+                    };
+                    Some((
+                        a.get_id().to_string(),
+                        format!(
+                            "{help} [unset here: {}{when}{change}]",
+                            crate::frontend::value(r)
+                        ),
+                    ))
+                })
+                .collect();
+            for (id, help) in ids {
+                sub = sub.mut_arg(id, |a| a.help(help));
+            }
+            sub
+        });
+    }
+    cmd
+}
+
 /// The `lloom` binary's entry. The HTTP retirement service owns whatever a
 /// dropped server left running, so the process joins it before it exits; a
 /// dropped device retires on the host retirement service, so the process
 /// joins that retirement too, after the HTTP one.
 pub fn main(argv: Vec<String>) -> Result<()> {
-    let cli = Cli::parse_from(argv);
+    use clap::FromArgMatches;
+    let cli = Cli::from_arg_matches(&command().get_matches_from(argv)).unwrap_or_else(|e| e.exit());
     let result = match cli.command {
         Command::Serve(args) => serve::run(args),
         Command::Chat(args) => chat::run(args),
@@ -705,6 +836,8 @@ pub fn main_serve_compat(mut argv: Vec<String>) -> Result<()> {
     argv.insert(1.min(argv.len()), "serve".to_string());
     main(argv)
 }
+#[cfg(test)]
+mod frontend_tests;
 #[cfg(test)]
 mod spellings_tests;
 

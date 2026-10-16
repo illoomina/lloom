@@ -25,6 +25,7 @@ use super::template::{Rejected, Unrenderable, ENABLE_THINKING, NOT_READ, REASONI
 use super::thinking::{self, Thinking};
 use super::vision::{expand_image_tokens, DecodedImage};
 use super::{load_engine, Shape};
+use crate::frontend::Frontend;
 use anyhow::{Context, Result};
 use clap::Parser;
 use serde_json::{json, Map, Value};
@@ -241,7 +242,7 @@ fn decide(
 }
 
 pub fn run(args: ChatArgs) -> Result<()> {
-    let options = super::resolve_options(&args.common, &|o| args.front(o))?;
+    let options = super::resolve_options(&args.common, &|o| args.front(o), Frontend::Chat)?;
     let want = options.reasoning.enabled;
     let reasoning_effort = options.reasoning.effort.clone();
     let add_bos = options.prompt.add_bos;
@@ -260,18 +261,12 @@ pub fn run(args: ChatArgs) -> Result<()> {
     // After the tuning install: the trace switch is a tuning knob, and a knob
     // read before the install cannot be installed.
     report::arm_trace();
-    // The chat's own default is a long turn; the group's 512 is the server's.
+    // The chat's own long turn is its front-end default (`crate::frontend`).
     let mut sampling = options.sampling.clone();
-    if args.common.options.sampling.max_tokens.is_none()
-        && !args.common.sets("generation.max_tokens")
-        && sampling.max_tokens == 512
-    {
-        sampling.max_tokens = 1024;
-    }
     let t = Instant::now();
     let mut shape = Shape::of(
         &options,
-        true,
+        Frontend::Chat,
         "The loom threads warp and weft into cloth. ".to_string(),
     );
     // One sequence; the memory probe is the turn's own (below).

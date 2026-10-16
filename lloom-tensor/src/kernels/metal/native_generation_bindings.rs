@@ -1356,6 +1356,49 @@ mod inventory_controls {
             ))
         })
     }
+    /// Actual counted heads and creator clocks, with no native object/entry.
+    /// Queue equality alone cannot substitute for exact generation identity.
+    #[test]
+    fn generation_identity_distinguishes_clones_same_clock_and_foreign_banks() {
+        let (first_bank, first_service, first_domain) = bank(1);
+        let (other_bank, other_service, other_domain) = bank(1);
+        let first = prepare(&first_bank, &first_service).unwrap();
+        let successor = prepare(&first_bank, &first_service).unwrap();
+        let foreign = prepare(&other_bank, &other_service).unwrap();
+        let a = first.constructor_head().unwrap();
+        let clone = a.try_clone().unwrap();
+        let b = successor.constructor_head().unwrap();
+        let c = foreign.constructor_head().unwrap();
+        let first_clock = a.head.captures().witness.captures().clock.clone();
+        let other_clock = c.head.captures().witness.captures().clock.clone();
+        // Clean up genuine preparations/heads before rethrowing any assertion;
+        // an intended identity mutant must not become a destructor abort.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            assert!(a.same(&clone), "a counted head clone lost its generation");
+            assert!(!a.same(&b), "same clock authorized a different generation");
+            assert!(!a.same(&c), "foreign bank authorized a generation");
+            assert!(a.belongs_to_clock(&first_clock));
+            assert!(b.belongs_to_clock(&first_clock));
+            assert!(!a.belongs_to_clock(&other_clock));
+            assert!(!c.belongs_to_clock(&first_clock));
+            assert!(c.belongs_to_clock(&other_clock));
+            assert_eq!(first_clock.current_epoch().0, 0);
+            assert_eq!(other_clock.current_epoch().0, 0);
+        }));
+        drop((first, successor, foreign)); // Actual never-submitted cancellation.
+        drop((a, clone, b, c));
+        drain(&first_service);
+        drain(&other_service);
+        drop((first_bank, other_bank));
+        drain(&first_service);
+        drain(&other_service);
+        if let Err(panic) = result {
+            std::panic::resume_unwind(panic);
+        }
+        assert_eq!(first_domain.snapshot(), AccountSnapshot::default());
+        assert_eq!(other_domain.snapshot(), AccountSnapshot::default());
+    }
+
     #[test]
     fn native_entry_requires_owner_staging_without_taking_an_epoch() {
         let (bank, service, domain) = bank(1);

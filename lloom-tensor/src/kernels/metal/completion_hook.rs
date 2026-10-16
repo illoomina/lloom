@@ -284,6 +284,43 @@ mod tests {
         }
     }
 
+    /// The native feedback value is plain data; no Device/native work is
+    /// constructed. The actual hook publishes error before any observer runs.
+    #[test]
+    fn native_error_is_latched_before_the_subscriber_observes_completion() {
+        let (clock, failure, hook) = hook();
+        let runs = Arc::new(AtomicUsize::new(0));
+        let observed_runs = runs.clone();
+        let observed_clock = clock.clone();
+        let observed_failure = failure.clone();
+        hook.subscribe(Arc::new(move || {
+            assert!(
+                observed_failure.check().is_err(),
+                "native error was not latched before subscriber completion"
+            );
+            assert_eq!(observed_clock.completed_count().0, 1);
+            observed_runs.fetch_add(1, Ordering::Relaxed);
+        }))
+        .unwrap();
+        hook.seal().unwrap();
+        clock.commit_epoch();
+        hook.complete(&Feedback {
+            error: Some("controlled native error feedback".into()),
+            start: 0.,
+            end: 1.,
+        });
+        assert_eq!(runs.load(Ordering::Relaxed), 1);
+        assert_eq!(clock.current_epoch().0, 1);
+        assert_eq!(clock.completed_count().0, 1);
+        for _ in 0..2 {
+            assert!(failure
+                .check()
+                .unwrap_err()
+                .to_string()
+                .contains("controlled native error feedback"));
+        }
+    }
+
     #[test]
     fn reserve_refusal_keeps_publication_captures_and_permit_reusable() {
         struct Capture {

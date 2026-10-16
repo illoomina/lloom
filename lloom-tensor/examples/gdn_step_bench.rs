@@ -83,7 +83,10 @@ fn main() -> Result<()> {
 
     // One command buffer of `n` steps in form `reg`; its GPU time per step.
     let run = |chain: bool, reg: bool| -> Result<f64> {
-        let cb = CommandBuffer::new(queue.commandBuffer().unwrap());
+        // SAFETY: each invocation gets a fresh Apple queue buffer, not an
+        // independently imported alias. This family ends encoding then commits
+        // and waits below; fixture buffers stay owned through that wait.
+        let cb = unsafe { CommandBuffer::new(queue.commandBuffer().unwrap()) };
         let enc = cb.compute_command_encoder_no_fence()?;
         for k in 0..a.n {
             let (src, dst, o) = if chain {
@@ -125,7 +128,10 @@ fn main() -> Result<()> {
     // Identity first: one independent step in each form from the same state,
     // the read-out and the new state compared byte for byte.
     let one = |reg: bool, out: &Buffer, o: &Buffer| -> Result<(Vec<u8>, Vec<u8>)> {
-        let cb = CommandBuffer::new(queue.commandBuffer().unwrap());
+        // SAFETY: each invocation gets a fresh Apple queue buffer, not an
+        // independently imported alias. This family ends encoding then commits
+        // and waits below; fixture buffers stay owned through that wait.
+        let cb = unsafe { CommandBuffer::new(queue.commandBuffer().unwrap()) };
         let enc = cb.compute_command_encoder_no_fence()?;
         // SAFETY: the bench owns every buffer bound here and reads them only after
         // waiting for the command buffer that writes them.

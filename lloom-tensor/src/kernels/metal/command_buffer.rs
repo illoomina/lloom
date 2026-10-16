@@ -546,7 +546,26 @@ impl CommandBuffer {
         })
     }
 
-    pub fn new(raw: Retained<ProtocolObject<dyn MTLCommandBuffer>>) -> Self {
+    /// Import a native Metal 3 command buffer without engine submission tracking.
+    /// Clones share one wrapper-family lifecycle; independent imports do not.
+    ///
+    /// # Safety
+    ///
+    /// `raw` must be an Apple Metal command buffer, or an implementation whose
+    /// native threading, callback and final-release contracts the caller has
+    /// independently established. Import it into only one authoritative wrapper
+    /// family. External aliases must not concurrently encode, mutate, end or
+    /// submit its recording; coordinate any external submission before import or
+    /// after this family's recording has ended. Only operations permitted by the
+    /// native object's documented thread/phase contract may be performed.
+    ///
+    /// Keep native parents and all resources needed by previously encoded work
+    /// alive through their actual native use, including resources not retained
+    /// by an unretained-reference buffer. An imported active encoder must end
+    /// before creating another encoder or submitting. Neither this import nor
+    /// native terminal status establishes engine teardown/callback quiescence.
+    /// This boundary does not itself prove unrestricted native Send/Sync.
+    pub unsafe fn new(raw: Retained<ProtocolObject<dyn MTLCommandBuffer>>) -> Self {
         Self {
             backend: Backend::Metal3(Arc::new(Standalone {
                 raw,
@@ -790,10 +809,13 @@ impl CommandBuffer {
                 "blit encoder".into(),
             ));
         };
-        Ok(
+        // SAFETY: this exact buffer created the encoder under EncoderAdmission.
+        // No raw alias escaped; with_recording attaches the parent-owning lease
+        // before return, so the encoder ends before another recording can enter.
+        let encoder = unsafe {
             BlitCommandEncoder::new(raw, Arc::clone(fence), Arc::clone(prev_ce_outputs))
-                .with_recording(admission),
-        )
+        };
+        Ok(encoder.with_recording(admission))
     }
 
     /// Submit a standalone interoperability buffer. Bound engine recordings

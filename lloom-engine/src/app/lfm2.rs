@@ -1445,15 +1445,20 @@ impl<P: Lfm2Shape> Engine<P> {
             continuous: dcfg.is_some() && pooled,
             eos_ids: engine.text.eos_ids.clone(),
         };
-        let batch_opts = DecodeOptions {
-            lookahead: 1,
-            prefill_tile: opts.prefill_tile,
-            prefill_chunk: opts.prefill_chunk,
-            ..DecodeOptions::new(0)
+        let static_spec = dcfg.is_some() && !pooled;
+        let batch_opts = if static_spec {
+            static_dspark_scheduler_options(&opts.decode, opts.prefill_tile, opts.prefill_chunk)
+        } else {
+            DecodeOptions {
+                lookahead: 1,
+                prefill_tile: opts.prefill_tile,
+                prefill_chunk: opts.prefill_chunk,
+                ..DecodeOptions::new(0)
+            }
         };
         // `--dspark` on private caches runs the static pipelined driver; on
         // the pool arms the continuous speculative driver (§12.4).
-        let mode: BatchMode<Model<P>, Extra> = if dcfg.is_some() && !pooled {
+        let mode: BatchMode<Model<P>, Extra> = if static_spec {
             BatchMode::Static(Box::new(static_dspark_body))
         } else {
             BatchMode::Continuous
@@ -2797,6 +2802,22 @@ fn run_spec_rows<'m, P: Profile>(
     )?)
 }
 
+/// Resolve the static scheduler's seed options at load, retaining the legacy
+/// tile/chunk overrides and the batch lookahead. Continuous rows have their own
+/// option contract; this does not add schedule support to that driver.
+fn static_dspark_scheduler_options(
+    decode: &crate::DecodeConfig,
+    prefill_tile: usize,
+    prefill_chunk: usize,
+) -> DecodeOptions {
+    let mut opts = decode.options(0, ReadbackArm::Blocking, prefill_tile);
+    opts.lookahead = 1;
+    if prefill_chunk > 0 {
+        opts.prefill_chunk = prefill_chunk;
+    }
+    opts
+}
+
 /// The static body under `--dspark --batch N --rows private`: every row's
 /// round pipelined through the one drafter
 /// (`Session::decode_speculative_pipelined`, §10.2y). Greedy, one EOS set
@@ -2838,7 +2859,10 @@ fn static_dspark_body<'a, 'm, P: Profile>(
         }
     }
     let max_tokens = specs.iter().map(|s| s.max_tokens).max().unwrap_or(0);
-    let opts = DecodeOptions::new(max_tokens);
+    let opts = DecodeOptions {
+        max_tokens,
+        ..idle.opts.clone()
+    };
     let caps: Vec<usize> = specs.iter().map(|s| s.max_tokens).collect();
     let mut outs = Session::decode_speculative_pipelined(
         sessions,
@@ -3479,3 +3503,6 @@ mod tests {
 }
 
 pub(crate) mod decision_media;
+
+#[cfg(test)]
+mod speculative_schedule_tests;

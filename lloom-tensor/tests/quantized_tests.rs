@@ -1817,3 +1817,21 @@ fn cpu_prompt_gemm_is_bit_identical_to_decode_rows() -> Result<()> {
     check::<half::bf16>()?;
     Ok(())
 }
+
+#[test]
+fn cpu_prompt_gemm_checks_destination_before_unsafe_stores() -> Result<()> {
+    use lloom_tensor::quantized::k_quants;
+    let (m, k, n) = (17, 8, 7);
+    let lhs = vec![1f32; m * k];
+    let weights = vec![1f32; n * k];
+    for length in [0, 1, m * n - 1] {
+        let mut dst = vec![0.; length];
+        let error = k_quants::matmul::<f32>((m, k, n), &lhs, &weights, &mut dst).unwrap_err();
+        assert!(error.to_string().contains("destination is too short"));
+    }
+    let mut dst = vec![f32::NAN; m * n + 1];
+    k_quants::matmul::<f32>((m, k, n), &lhs, &weights, &mut dst)?;
+    assert!(dst[..m * n].iter().all(|&v| v == k as f32));
+    assert!(dst[m * n].is_nan(), "extra space is not written");
+    Ok(())
+}

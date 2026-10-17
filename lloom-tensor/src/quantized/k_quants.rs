@@ -2436,6 +2436,12 @@ pub fn matmul<T: GgmlType>(
         let lhs_b: &[T::VecDotType] = lhs_b;
 
         if m > 1 {
+            // This public helper also has direct callers. Establish the bound
+            // required by the disjoint raw-pointer stores, not just their tensor
+            // wrapper's allocation contract. Extra destination space is allowed.
+            if m.checked_mul(n).is_none_or(|length| dst.len() < length) {
+                crate::bail!("quantized matmul destination is too short for {m}x{n}")
+            }
             // Quantized GEMM: keep a column tile hot across prompt rows rather
             // than sweep the whole weight for every token. One pool dispatch
             // covers the entire matrix. Every output uses exactly the same

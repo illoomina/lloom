@@ -706,6 +706,9 @@ impl LogitsProcessor {
             Sampling::GumbelSoftmax { temperature } if logits.device().is_metal() => {
                 self.gumbel_max_host_noise(logits, temperature)
             }
+            Sampling::GumbelSoftmax { temperature } => {
+                self.host_gumbel_rows(logits, temperature)
+            }
             // Multinomial by inverse CDF: one host uniform uploaded, the
             // draw on the device, so the token never comes down here either.
             Sampling::All { temperature } if logits.device().is_metal() => {
@@ -919,6 +922,10 @@ impl LogitsProcessor {
                 let draw = self.gumbel_max_host_noise(logits, temperature)?;
                 return self.read_drawn(&draw);
             }
+            if logits.elem_count() != logits.dim(lloom_tensor::D::Minus1)? {
+                let draw = self.host_gumbel_rows(logits, temperature)?;
+                return self.read_drawn(&draw);
+            }
         }
         let (temperature, k, p) = self.sampling.distribution().expect("distribution arm");
         distribution::validate(temperature, p)?;
@@ -982,5 +989,30 @@ impl LogitsProcessor {
             let u = self.next_uniform();
             self.host.draw(u)
         })
+    }
+
+    /// Device-return Gumbel accepts multiple rows. One call consumes the
+    /// original flattened noise stream, unlike a window's per-position keys.
+    fn host_gumbel_rows(&mut self, logits: &Tensor, temperature: f64) -> Result<Tensor> {
+        distribution::validate(temperature, 1.0)?;
+        let vocab = logits.dim(lloom_tensor::D::Minus1)?;
+        if vocab == 0 { lloom_tensor::bail!("gumbel draw: empty vocabulary"); }
+        let scores = logits.to_dtype(DType::F32)?;
+        self.host.load(&scores)?;
+        let mut values = std::mem::take(&mut self.host.values);
+        let mut keyed = self.position.map(|p| rand::rngs::StdRng::seed_from_u64(Self::stream_key(self.seed, p)));
+        let rng = keyed.as_mut().unwrap_or(&mut self.rng);
+        let mut ids = Vec::with_capacity(values.len() / vocab);
+        let result = (|| -> Result<()> {
+            for row in values.chunks_mut(vocab) {
+                self.host.prepare_row(row, temperature, 0, 1.0, true)?;
+                ids.push(self.host.gumbel_row(row, temperature, rng));
+            }
+            Ok(())
+        })();
+        self.host.values = values;
+        result?;
+        let dims = logits.dims();
+        Tensor::from_vec(ids, &dims[..dims.len() - 1], logits.device())
     }
 }

@@ -485,3 +485,42 @@ fn unfiltered_and_disabled_filter_gumbel_share_centered_f32_scalar_window_and_ru
     for _ in 0..16 { assert_eq!(plain.sample(&row)?, filtered.sample(&row)?); }
     Ok(())
 }
+
+#[test]
+fn unfiltered_gumbel_device_return_preserves_multirow_shape_and_flattened_noise_stream() -> Result<()> {
+    let device = Device::Cpu;
+    let rows = Tensor::new(&[[1e30f32; 3]; 2], &device)?;
+    let row = rows.get(0)?;
+    let arm = Sampling::GumbelSoftmax { temperature: 3.0 };
+    let mut matrix = LogitsProcessor::from_sampling(7, arm.clone());
+    let mut host = LogitsProcessor::from_sampling(7, arm.clone());
+    let mut scalar = LogitsProcessor::from_sampling(7, arm);
+    for _ in 0..8 {
+        let ids = matrix.sample_argmax_on_device(&rows)?;
+        assert_eq!(ids.dims(), &[2]);
+        let ids = ids.to_vec1::<u32>()?;
+        assert_eq!(ids, [scalar.sample(&row)?, scalar.sample(&row)?]);
+        assert_eq!(host.sample(&rows)?, ids[0]);
+    }
+    // A keyed matrix uses one key for all six variates, not a reset per row.
+    // Calibrate against the unchanged original noise mapping independently.
+    use rand::{Rng, SeedableRng};
+    let pos = 11u64;
+    let mut key = 7u64.wrapping_add(pos.wrapping_mul(0x9E37_79B9_7F4A_7C15));
+    key = (key ^ (key >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    key = (key ^ (key >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    key ^= key >> 31;
+    let mut rng = rand::rngs::StdRng::seed_from_u64(key);
+    let expected: Vec<u32> = (0..2).map(|_| {
+        let mut best = (0u32, f32::NEG_INFINITY);
+        for i in 0..3 {
+            let u: f64 = rng.random_range(1e-9..0.9999999);
+            let g = (-(-u.ln()).ln()) as f32;
+            if g > best.1 { best = (i, g); }
+        }
+        best.0
+    }).collect();
+    matrix.at_position(Some(pos));
+    assert_eq!(matrix.sample_argmax_on_device(&rows)?.to_vec1::<u32>()?, expected);
+    Ok(())
+}

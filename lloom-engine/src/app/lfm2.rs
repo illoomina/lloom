@@ -24,6 +24,7 @@ use super::common::{
     DecodeTiming, MemGauge, MemReport, MemSnapshot, PrefillTiming, Text, NEVER_EOS,
 };
 use super::request_slot::{AbortState, Lease as RequestLease, State as RequestState};
+use super::served::Served as _;
 use super::template::{Rendered, Template};
 use super::vision::{take_window, DecodedImage, ImageCensus, ImageRows};
 use crate::{

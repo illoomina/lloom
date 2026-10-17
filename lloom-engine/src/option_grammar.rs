@@ -567,6 +567,24 @@ pub(crate) mod tests {
                     .is_match(s)
             }),
             "minimum" => v.as_f64().is_none_or(|f| f >= rule.as_f64().unwrap()),
+            // Only nonnegative integer upper bounds are emitted here. This
+            // helper is not a general JSON Schema numeric implementation.
+            "maximum" => match v {
+                Value::Number(n) => {
+                    let maximum = rule.as_u64().expect("integer upper bound");
+                    if let Some(n) = n.as_u64() {
+                        n <= maximum
+                    } else {
+                        n.as_f64().is_some_and(|f| {
+                            f < 0.0
+                                || (f.is_finite()
+                                    && f.fract() == 0.0
+                                    && format!("{f:.0}").parse::<u64>().is_ok_and(|n| n <= maximum))
+                        })
+                    }
+                }
+                _ => true,
+            },
             other => panic!("the validator does not know `{other}`"),
         })
     }

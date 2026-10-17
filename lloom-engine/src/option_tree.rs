@@ -645,7 +645,11 @@ fn write_leaf(
         Value::Null => o.merge_json(&fragment(&leaf.storage, leaf.default.clone())),
         Value::Array(_) | Value::Object(_) => o.merge_json(&fragment(&leaf.storage, value.clone())),
         v => {
-            let mut s = scalar(v);
+            let mut s = leaf
+                .meta
+                .native_number(v)
+                .map_err(|e| format!("{}: {e}", leaf.meta.key))?
+                .unwrap_or_else(|| scalar(v));
             if as_key && leaf.meta.invert {
                 s = (!lloom_tensor::options::parse_bool(&s).map_err(|e| {
                     let key = if leaf.meta.path.is_empty() {

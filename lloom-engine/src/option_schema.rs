@@ -115,9 +115,20 @@ fn arms(variants: &[&str]) -> Value {
 /// Decimal strings in 0..=maximum, including arbitrarily many leading zeros.
 /// Prefix branches differ at their first digit below the upper bound.
 fn bounded_decimal(maximum: u64) -> String {
+    count_decimal(maximum, false)
+}
+
+fn count_decimal(maximum: u64, positive: bool) -> String {
+    if positive && maximum == 0 {
+        return r"[^\s\S]".into();
+    }
     let bound = maximum.to_string();
     let width = bound.len();
-    let mut alts = vec!["0".to_string()];
+    let mut alts = if positive {
+        Vec::new()
+    } else {
+        vec!["0".to_string()]
+    };
     if width > 1 {
         alts.push(format!(r"[1-9][0-9]{{0,{}}}", width - 2));
     }
@@ -144,14 +155,44 @@ const TRIM_SPACE: &str = "[\u{0009}-\u{000D}\u{0020}\u{0085}\u{00A0}\u{1680}\u{2
 fn wait_schema(grammar: &lloom_tensor::options::wait::WaitGrammar) -> Value {
     let literal = |s: &str| escape(s).replace(r"\-", "-");
     let mut alts: Vec<String> = grammar.literals.iter().map(|s| literal(s)).collect();
+    alts.extend(grammar.literal_aliases.iter().map(|(s, _)| literal(s)));
+    if let Some(count) = grammar.count {
+        alts.push(format!(
+            r"\+?{}",
+            count_decimal(count.domain.maximum(), true)
+        ));
+    }
     for arm in grammar.parameter_arms() {
         let spelling = literal(arm.spelling);
-        let maximum = arm.parameter.maximum();
-        let mut parameters = vec![bounded_decimal(maximum)];
+        let maximum = grammar.count.map_or(arm.parameter.maximum(), |c| {
+            c.domain.maximum().min(arm.parameter.maximum())
+        });
+        let digits = |maximum| count_decimal(maximum, grammar.count.is_some());
+        let raw = format!(
+            "{}{}{}",
+            if arm.parameter.raw_trim() {
+                format!("{TRIM_SPACE}*")
+            } else {
+                String::new()
+            },
+            if arm.parameter.raw_plus() { r"\+?" } else { "" },
+            digits(maximum),
+        );
+        let mut parameters = vec![raw];
         for unit in arm.parameter.units() {
+            let quantum = arm.parameter.duration_quantum(*unit);
+            let digits = if quantum == 1 {
+                digits(maximum / unit.scale())
+            } else {
+                format!(
+                    "(0+|{}{})",
+                    bounded_decimal(maximum / unit.scale() / quantum),
+                    "0".repeat(quantum.ilog10() as usize),
+                )
+            };
             parameters.push(format!(
                 r"{TRIM_SPACE}*\+?{}{}",
-                bounded_decimal(maximum / unit.scale()),
+                digits,
                 literal(unit.suffix()),
             ));
         }
@@ -217,51 +258,71 @@ fn value_schema(key: &Key, default: &Value) -> Value {
         Some(inner) => (inner, true),
         None => (m.ty, false),
     };
-    let mut s = match (m.grammar, m.schema) {
-        (Some(grammar), _) => wait_schema(grammar),
-        (None, "Wait") => {
-            let alt = m
-                .forms
-                .iter()
-                .map(|f| escape(f))
-                .collect::<Vec<_>>()
-                .join("|");
-            json!({"allOf": [{"$ref": "#/$defs/Wait"}, {"pattern": format!(r"^\s*({})(:{DURATION})?\s*$", case_free(&alt))}]})
-        }
-        (None, "ThreadQos") if !m.forms.is_empty() => {
-            json!({"allOf": [{"$ref": "#/$defs/ThreadQos"}, arms(m.forms)]})
-        }
-        (None, "") => {
-            let mut b = if m.is_bool {
-                json!({"type": "boolean"})
-            } else {
-                base_type(ty)
-            };
-            if b["type"] == "string" && !m.variants.is_empty() {
-                let vs: Vec<&str> = m.variants.to_vec();
-                if vs.iter().all(|v| literal(v)) {
-                    b = arms(&vs);
-                } else {
-                    if let Some(p) = variants_pattern(&vs) {
-                        b["pattern"] = json!(p);
-                    }
-                    b["examples"] = json!(m.variants);
-                }
+    let normalized_bool = m.normalize_values && (m.is_bool || ty == "bool");
+    let mut s = if normalized_bool {
+        let aliases = m
+            .values
+            .iter()
+            .map(|(key, _)| escape(key).replace(r"\-", "-"))
+            .collect::<Vec<_>>();
+        let spellings = lloom_tensor::options::TRUE_SPELLINGS
+            .iter()
+            .chain(lloom_tensor::options::FALSE_SPELLINGS)
+            .map(|s| s.to_string())
+            .chain(aliases)
+            .collect::<Vec<_>>();
+        json!({"type": "string", "pattern": format!("^{TRIM_SPACE}*({}){TRIM_SPACE}*$", case_free(&spellings.join("|")))})
+    } else {
+        match (m.grammar, m.schema) {
+            (Some(grammar), _) => wait_schema(grammar),
+            (None, "Wait") => {
+                let alt = m
+                    .forms
+                    .iter()
+                    .map(|f| escape(f))
+                    .collect::<Vec<_>>()
+                    .join("|");
+                json!({"allOf": [{"$ref": "#/$defs/Wait"}, {"pattern": format!(r"^\s*({})(:{DURATION})?\s*$", case_free(&alt))}]})
             }
-            b
+            (None, "ThreadQos") if !m.forms.is_empty() => {
+                json!({"allOf": [{"$ref": "#/$defs/ThreadQos"}, arms(m.forms)]})
+            }
+            (None, "") => {
+                let mut b = if m.is_bool {
+                    json!({"type": "boolean"})
+                } else {
+                    base_type(ty)
+                };
+                if b["type"] == "string" && !m.variants.is_empty() {
+                    let vs: Vec<&str> = m.variants.to_vec();
+                    if vs.iter().all(|v| literal(v)) {
+                        b = arms(&vs);
+                    } else {
+                        if let Some(p) = variants_pattern(&vs) {
+                            b["pattern"] = json!(p);
+                        }
+                        b["examples"] = json!(m.variants);
+                    }
+                }
+                b
+            }
+            (None, other) => json!({"$ref": format!("#/$defs/{other}")}),
         }
-        (None, other) => json!({"$ref": format!("#/$defs/{other}")}),
     };
     // A key whose vocabulary moved to a shared type still takes the stored
     // spellings it always took (`interactive`, `synchronize`).
-    if m.grammar.is_none() && !m.schema.is_empty() && !m.variants.is_empty() {
+    if !normalized_bool && m.grammar.is_none() && !m.schema.is_empty() && !m.variants.is_empty() {
         if let Some(p) = variants_pattern(m.variants) {
             s = json!({"anyOf": [s, {"type": "string", "pattern": p}]});
         }
     }
     // What the grammar also reads besides the JSON type: a bool's spellings
     // (and 0/1), a count's or a number's digits as a string.
-    if m.is_bool || ty == "bool" {
+    if let Some(count) = m.grammar.and_then(|g| g.count) {
+        s = json!({"anyOf": [s, {"type": "integer", "minimum": count.domain.minimum(), "maximum": count.domain.maximum()}]});
+    } else if normalized_bool {
+        s = json!({"anyOf": [s, {"type": "boolean"}, {"enum": [0, 1]}]});
+    } else if m.is_bool || ty == "bool" {
         s = json!({"anyOf": [s, {"type": "boolean"}, {"enum": [0, 1]}, {"type": "string", "pattern": bool_pattern()}]});
     } else if base_type(ty)["type"] == "integer" {
         s = json!({"anyOf": [s, {"type": "integer", "minimum": 0}, {"type": "string", "pattern": COUNT}]});
@@ -330,7 +391,32 @@ fn annotate(key: &Key, default: &Value, s: &mut Map<String, Value>) {
     if m.schema == "Wait" {
         s.insert("x-lloom-wait-forms".into(), json!(m.forms));
     }
+    if let Some(grammar) = m.grammar {
+        if let Some(count) = grammar.count {
+            s.insert("x-lloom-native-count".into(), json!({"minimum": count.domain.minimum(), "maximum": count.domain.maximum(), "representation": "serde_json::Number; integral represented value"}));
+        }
+        if let Some(parser) = grammar.parser {
+            s.insert("x-lloom-wait-parser".into(), json!(parser));
+            s.insert("x-lloom-wait-parameters".into(), json!(grammar.parameter_arms().map(|arm| {
+                json!({"spelling": arm.spelling, "stored": arm.stored,
+                    "raw-maximum": arm.parameter.maximum(),
+                    "raw-plus": arm.parameter.raw_plus(), "raw-trim": arm.parameter.raw_trim(),
+                    "duration-units": arm.parameter.units().iter().map(|u| u.suffix()).collect::<Vec<_>>(),
+                    "duration-domains": arm.parameter.units().iter().map(|u| json!({
+                        "unit": u.suffix(), "checked-microsecond-scale": u.scale(),
+                        "maximum-count": arm.parameter.maximum() / u.scale(),
+                        "count-multiple": arm.parameter.duration_quantum(*u),
+                    })).collect::<Vec<_>>()})
+            }).collect::<Vec<_>>()));
+        }
+    }
     if !m.values.is_empty() {
+        if m.normalize_values {
+            s.insert(
+                "x-lloom-value-alias-normalization".into(),
+                json!("ASCII case-insensitive; Rust outer trim"),
+            );
+        }
         let aliases: Map<String, Value> = m
             .values
             .iter()

@@ -437,7 +437,7 @@ pub struct StreamTuning {
     /// How the fetch worker waits between looks at a layer's routing: `sleep:<dur>` (it never spins; the older spelling is the bare count of microseconds).
     #[opt(flag = "fetch-poll-us",
         env = "QWEN4EXP_FETCH_POLL_US",
-        parser = "parse_at_least_one", path = "weights.experts.fetch.wait", status = "advanced", facets = ["wait"], flows = ["weights-in"], forms = ["sleep"], from_v1 = "lloom_tensor::options::v1::fetch_wait_from", to_v1 = "lloom_tensor::options::v1::fetch_wait_to", schema = "Wait")]
+        parser = "parse_at_least_one", path = "weights.experts.fetch.wait", status = "advanced", facets = ["wait"], flows = ["weights-in"], forms = ["sleep"], from_v1 = "lloom_tensor::options::v1::fetch_wait_from", to_v1 = "lloom_tensor::options::v1::fetch_wait_to", schema = "Wait", grammar = "lloom_tensor::options::wait::FETCH_WAIT")]
     pub fetch_poll_us: usize,
     /// Fetching steps in a row that load nothing before the waits stop (the pool holds the stream again).
     #[opt(flag = "fetch-exit",
@@ -765,10 +765,10 @@ pub struct RingTuning {
     #[opt(flag = "host-feed-trace", env = "LLOOM_HOST_FEED_TRACE", bool, path = "diagnostics.trace.host_feed", status = "instrument", flows = ["host-feed-in"])]
     pub feed_trace: bool,
     /// How the fixed cadence's EOS wait learns the stamp: `inherit` (poll it, as the readback's own wait does) or `event` (park on the ring's publish event; measured 8 % slower a token on LFM2's `ring-fixed`, the event landing ~1 ms after the stamp).
-    #[opt(flag = "ring-eos-park", env = "LLOOM_RING_EOS_PARK", bool, path = "decode.ring.eos_wait", status = "arm", facets = ["wait"], flows = ["token-out"], values = ["inherit=false", "event=true"], forms = ["inherit", "event"], schema = "Wait")]
+    #[opt(flag = "ring-eos-park", env = "LLOOM_RING_EOS_PARK", bool, path = "decode.ring.eos_wait", status = "arm", facets = ["wait"], flows = ["token-out"], values = ["inherit=false", "event=true"], normalize_values, forms = ["inherit", "event"], schema = "Wait")]
     pub eos_park: bool,
     /// How DSpark's verify completion is waited for: `event` (park on an event behind the round's stamp) or `inherit` (poll the stamp, the A/B arm).
-    #[opt(flag = "verify-park", env = "LLOOM_VERIFY_PARK", bool, path = "speculative.verify_wait", status = "advanced", facets = ["wait"], flows = ["token-out"], values = ["inherit=false", "event=true"], forms = ["inherit", "event"], schema = "Wait")]
+    #[opt(flag = "verify-park", env = "LLOOM_VERIFY_PARK", bool, path = "speculative.verify_wait", status = "advanced", facets = ["wait"], flows = ["token-out"], values = ["inherit=false", "event=true"], normalize_values, forms = ["inherit", "event"], schema = "Wait")]
     pub verify_park: bool,
     /// The EOS gate on Qwen3.5 (#993's arm B): off (the family's gate is clamped off; the standing window undoes the fixed cadence's one forward past an EOS) or on (`decode.readback.eos_gate` then rides the adaptive commit: the GDN's gated decode step carries its state, the overrun taken back by its counters). An arm until its real-model gates are run.
     #[opt(flag = "qwen3-5-eos-gate", env = "LLOOM_QWEN3_5_EOS_GATE", bool, path = "models.qwen3_5.eos_gate", status = "arm", facets = ["lead"], flows = ["token-out", "commands-out"])]

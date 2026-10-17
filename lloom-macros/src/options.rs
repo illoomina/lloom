@@ -47,6 +47,7 @@
 //! #[opt(switches = ["cpu=cpu"])]              valueless flags writing a fixed value
 //! #[opt(invert)]                             the key is the stored bool's negation
 //! #[opt(values = ["event=true"])]             key spelling = stored spelling, where they differ
+//! #[opt(normalize_values)]                   opt-in case/outer-trim normalization for value aliases
 //! #[opt(from_v1 = "f", to_v1 = "g")]          the same, as functions of the spelling
 //! #[opt(schema = "Wait", forms = ["spin", "sleep"])]  a shared value type and the forms this site takes
 //! #[opt(grammar = "path::GRAMMAR")]           field-attached Wait grammar for schema/conversion
@@ -95,6 +96,7 @@ struct OptAttr {
     switches: Vec<(String, String)>,
     invert: bool,
     values: Vec<(String, String)>,
+    normalize_values: bool,
     from_v1: Option<String>,
     to_v1: Option<String>,
     schema: Option<String>,
@@ -143,6 +145,7 @@ impl Parse for OptAttr {
                 "no_args" => a.no_args = true,
                 "skip" => a.skip = true,
                 "invert" => a.invert = true,
+                "normalize_values" => a.normalize_values = true,
                 "legacy_only" => a.legacy_only = true,
                 "flag" => a.flag = Some(str_value(input)?),
                 "short" => {
@@ -581,9 +584,15 @@ pub(crate) fn derive(input: DeriveInput) -> TokenStream {
                 }
             } else {
                 let main = if f.attr.is_bool {
+                    let parser = if f.attr.normalize_values {
+                        let aliases = f.attr.values.iter().map(|(k, s)| quote! { (#k, #s) });
+                        quote! { |raw: &str| #krate::options::parse_bool(&#krate::options::map_value(raw, &[#(#aliases),*], true)) }
+                    } else {
+                        quote! { #krate::options::parse_bool }
+                    };
                     quote! {
                         #[doc = #doc]
-                        #[arg(id = #id, long = #long, #short #alias_attr num_args = 0..=1, default_missing_value = "true", action = ::clap::ArgAction::Set, value_parser = #krate::options::parse_bool, value_name = "BOOL", hide = #hidden, #heading overrides_with = #id)]
+                        #[arg(id = #id, long = #long, #short #alias_attr num_args = 0..=1, default_missing_value = "true", action = ::clap::ArgAction::Set, value_parser = #parser, value_name = "BOOL", hide = #hidden, #heading overrides_with = #id)]
                         pub #ident: Option<bool>,
                     }
                 } else {
@@ -705,7 +714,8 @@ pub(crate) fn derive(input: DeriveInput) -> TokenStream {
             };
         }
         // The key's vocabulary into the stored one, before the field's parser.
-        let value_map = f.attr.values.iter().map(|(k, s)| quote! { #k => #s.to_string(), });
+        let value_map = f.attr.values.iter().map(|(k, s)| quote! { (#k, #s) });
+        let normalize_values = f.attr.normalize_values;
         let from_v1 = match &f.attr.from_v1 {
             Some(p) => {
                 let p = path_tokens(&Some(p.clone()));
@@ -714,10 +724,7 @@ pub(crate) fn derive(input: DeriveInput) -> TokenStream {
             None => quote! {},
         };
         let convert = quote! {
-            let value: ::std::string::String = match value {
-                #(#value_map)*
-                other => other.to_string(),
-            };
+            let value = #krate::options::map_value(value, &[#(#value_map),*], #normalize_values);
             #from_v1
             let value: &str = &value;
         };
@@ -787,8 +794,19 @@ pub(crate) fn derive(input: DeriveInput) -> TokenStream {
             };
             quote! { #key => { #by_string self.#ident.merge_json(v)?; } }
         } else {
+            let native = match &f.attr.grammar {
+                Some(grammar) => quote! {
+                    let meta = #krate::options::KnobMeta { grammar: Some(&#grammar), ..#krate::options::KnobMeta::BASE };
+                    if let Some(value) = meta.native_number(v).map_err(|e| format!("{}: {}", #key, e))? {
+                        self.set(#key, &value)?;
+                        continue;
+                    }
+                },
+                None => quote! {},
+            };
             quote! {
                 #key => {
+                    #native
                     self.#ident = ::serde_json::from_value::<#ty>(v.clone())
                         .map_err(|e| format!("{}: {}", #key, e))?;
                 }
@@ -895,6 +913,7 @@ pub(crate) fn derive(input: DeriveInput) -> TokenStream {
             Some(path) => quote!(::std::option::Option::Some(&#path)),
             None => quote!(::std::option::Option::None),
         };
+        let normalize_values = f.attr.normalize_values;
         let forms = &f.attr.forms;
         let legacy_only = f.attr.legacy_only;
         let legacy_keys = &f.attr.legacy_keys;
@@ -924,6 +943,7 @@ pub(crate) fn derive(input: DeriveInput) -> TokenStream {
                 switches: &[#((#sw_flags, #sw_values)),*],
                 invert: #invert,
                 values: &[#((#val_k, #val_s)),*],
+                normalize_values: #normalize_values,
                 from_v1: #from_v1, to_v1: #to_v1,
                 schema: #schema, forms: &[#(#forms),*], grammar: #grammar,
                 internal: #internal,

@@ -1,0 +1,490 @@
+[
+  {
+    "name": "event mode 0 'event'",
+    "input": "event",
+    "accept": true,
+    "stored": true
+  },
+  {
+    "name": "event mode 1 'EVENT'",
+    "input": "EVENT",
+    "accept": true,
+    "stored": true
+  },
+  {
+    "name": "event mode 2 ' \\tEVENT\\n'",
+    "input": " \tEVENT\n",
+    "accept": true,
+    "stored": true
+  },
+  {
+    "name": "event mode 3 '\\x85event\\u3000'",
+    "input": "\u0085event\u3000",
+    "accept": true,
+    "stored": true
+  },
+  {
+    "name": "true mode 0 'true'",
+    "input": "true",
+    "accept": true,
+    "stored": true
+  },
+  {
+    "name": "true mode 1 'TRUE'",
+    "input": "TRUE",
+    "accept": true,
+    "stored": true
+  },
+  {
+    "name": "true mode 2 ' \\tTRUE\\n'",
+    "input": " \tTRUE\n",
+    "accept": true,
+    "stored": true
+  },
+  {
+    "name": "true mode 3 '\\x85true\\u3000'",
+    "input": "\u0085true\u3000",
+    "accept": true,
+    "stored": true
+  },
+  {
+    "name": "t mode 0 't'",
+    "input": "t",
+    "accept": true,
+    "stored": true
+  },
+  {
+    "name": "t mode 1 'T'",
+    "input": "T",
+    "accept": true,
+    "stored": true
+  },
+  {
+    "name": "t mode 2 ' \\tT\\n'",
+    "input": " \tT\n",
+    "accept": true,
+    "stored": true
+  },
+  {
+    "name": "t mode 3 '\\x85t\\u3000'",
+    "input": "\u0085t\u3000",
+    "accept": true,
+    "stored": true
+  },
+  {
+    "name": "yes mode 0 'yes'",
+    "input": "yes",
+    "accept": true,
+    "stored": true
+  },
+  {
+    "name": "yes mode 1 'YES'",
+    "input": "YES",
+    "accept": true,
+    "stored": true
+  },
+  {
+    "name": "yes mode 2 ' \\tYES\\n'",
+    "input": " \tYES\n",
+    "accept": true,
+    "stored": true
+  },
+  {
+    "name": "yes mode 3 '\\x85yes\\u3000'",
+    "input": "\u0085yes\u3000",
+    "accept": true,
+    "stored": true
+  },
+  {
+    "name": "y mode 0 'y'",
+    "input": "y",
+    "accept": true,
+    "stored": true
+  },
+  {
+    "name": "y mode 1 'Y'",
+    "input": "Y",
+    "accept": true,
+    "stored": true
+  },
+  {
+    "name": "y mode 2 ' \\tY\\n'",
+    "input": " \tY\n",
+    "accept": true,
+    "stored": true
+  },
+  {
+    "name": "y mode 3 '\\x85y\\u3000'",
+    "input": "\u0085y\u3000",
+    "accept": true,
+    "stored": true
+  },
+  {
+    "name": "1 mode 0 '1'",
+    "input": "1",
+    "accept": true,
+    "stored": true
+  },
+  {
+    "name": "1 mode 1 '1'",
+    "input": "1",
+    "accept": true,
+    "stored": true
+  },
+  {
+    "name": "1 mode 2 ' \\t1\\n'",
+    "input": " \t1\n",
+    "accept": true,
+    "stored": true
+  },
+  {
+    "name": "1 mode 3 '\\x851\\u3000'",
+    "input": "\u00851\u3000",
+    "accept": true,
+    "stored": true
+  },
+  {
+    "name": "on mode 0 'on'",
+    "input": "on",
+    "accept": true,
+    "stored": true
+  },
+  {
+    "name": "on mode 1 'ON'",
+    "input": "ON",
+    "accept": true,
+    "stored": true
+  },
+  {
+    "name": "on mode 2 ' \\tON\\n'",
+    "input": " \tON\n",
+    "accept": true,
+    "stored": true
+  },
+  {
+    "name": "on mode 3 '\\x85on\\u3000'",
+    "input": "\u0085on\u3000",
+    "accept": true,
+    "stored": true
+  },
+  {
+    "name": "inherit mode 0 'inherit'",
+    "input": "inherit",
+    "accept": true,
+    "stored": false
+  },
+  {
+    "name": "inherit mode 1 'INHERIT'",
+    "input": "INHERIT",
+    "accept": true,
+    "stored": false
+  },
+  {
+    "name": "inherit mode 2 ' \\tINHERIT\\n'",
+    "input": " \tINHERIT\n",
+    "accept": true,
+    "stored": false
+  },
+  {
+    "name": "inherit mode 3 '\\x85inherit\\u3000'",
+    "input": "\u0085inherit\u3000",
+    "accept": true,
+    "stored": false
+  },
+  {
+    "name": "false mode 0 'false'",
+    "input": "false",
+    "accept": true,
+    "stored": false
+  },
+  {
+    "name": "false mode 1 'FALSE'",
+    "input": "FALSE",
+    "accept": true,
+    "stored": false
+  },
+  {
+    "name": "false mode 2 ' \\tFALSE\\n'",
+    "input": " \tFALSE\n",
+    "accept": true,
+    "stored": false
+  },
+  {
+    "name": "false mode 3 '\\x85false\\u3000'",
+    "input": "\u0085false\u3000",
+    "accept": true,
+    "stored": false
+  },
+  {
+    "name": "f mode 0 'f'",
+    "input": "f",
+    "accept": true,
+    "stored": false
+  },
+  {
+    "name": "f mode 1 'F'",
+    "input": "F",
+    "accept": true,
+    "stored": false
+  },
+  {
+    "name": "f mode 2 ' \\tF\\n'",
+    "input": " \tF\n",
+    "accept": true,
+    "stored": false
+  },
+  {
+    "name": "f mode 3 '\\x85f\\u3000'",
+    "input": "\u0085f\u3000",
+    "accept": true,
+    "stored": false
+  },
+  {
+    "name": "no mode 0 'no'",
+    "input": "no",
+    "accept": true,
+    "stored": false
+  },
+  {
+    "name": "no mode 1 'NO'",
+    "input": "NO",
+    "accept": true,
+    "stored": false
+  },
+  {
+    "name": "no mode 2 ' \\tNO\\n'",
+    "input": " \tNO\n",
+    "accept": true,
+    "stored": false
+  },
+  {
+    "name": "no mode 3 '\\x85no\\u3000'",
+    "input": "\u0085no\u3000",
+    "accept": true,
+    "stored": false
+  },
+  {
+    "name": "n mode 0 'n'",
+    "input": "n",
+    "accept": true,
+    "stored": false
+  },
+  {
+    "name": "n mode 1 'N'",
+    "input": "N",
+    "accept": true,
+    "stored": false
+  },
+  {
+    "name": "n mode 2 ' \\tN\\n'",
+    "input": " \tN\n",
+    "accept": true,
+    "stored": false
+  },
+  {
+    "name": "n mode 3 '\\x85n\\u3000'",
+    "input": "\u0085n\u3000",
+    "accept": true,
+    "stored": false
+  },
+  {
+    "name": "0 mode 0 '0'",
+    "input": "0",
+    "accept": true,
+    "stored": false
+  },
+  {
+    "name": "0 mode 1 '0'",
+    "input": "0",
+    "accept": true,
+    "stored": false
+  },
+  {
+    "name": "0 mode 2 ' \\t0\\n'",
+    "input": " \t0\n",
+    "accept": true,
+    "stored": false
+  },
+  {
+    "name": "0 mode 3 '\\x850\\u3000'",
+    "input": "\u00850\u3000",
+    "accept": true,
+    "stored": false
+  },
+  {
+    "name": "off mode 0 'off'",
+    "input": "off",
+    "accept": true,
+    "stored": false
+  },
+  {
+    "name": "off mode 1 'OFF'",
+    "input": "OFF",
+    "accept": true,
+    "stored": false
+  },
+  {
+    "name": "off mode 2 ' \\tOFF\\n'",
+    "input": " \tOFF\n",
+    "accept": true,
+    "stored": false
+  },
+  {
+    "name": "off mode 3 '\\x85off\\u3000'",
+    "input": "\u0085off\u3000",
+    "accept": true,
+    "stored": false
+  },
+  {
+    "name": "native True",
+    "input": true,
+    "accept": true,
+    "stored": true
+  },
+  {
+    "name": "native False",
+    "input": false,
+    "accept": true,
+    "stored": false
+  },
+  {
+    "name": "native 0",
+    "input": 0,
+    "accept": true,
+    "stored": false
+  },
+  {
+    "name": "native 1",
+    "input": 1,
+    "accept": true,
+    "stored": true
+  },
+  {
+    "name": "refused ''",
+    "input": "",
+    "accept": false
+  },
+  {
+    "name": "refused ' '",
+    "input": " ",
+    "accept": false
+  },
+  {
+    "name": "refused 'event:2ms'",
+    "input": "event:2ms",
+    "accept": false
+  },
+  {
+    "name": "refused 'inherit:7'",
+    "input": "inherit:7",
+    "accept": false
+  },
+  {
+    "name": "refused 'sleep'",
+    "input": "sleep",
+    "accept": false
+  },
+  {
+    "name": "refused 'duration'",
+    "input": "duration",
+    "accept": false
+  },
+  {
+    "name": "refused 'EVENT:2MS'",
+    "input": "EVENT:2MS",
+    "accept": false
+  },
+  {
+    "name": "refused 'event-sleep'",
+    "input": "event-sleep",
+    "accept": false
+  },
+  {
+    "name": "refused 'event-listener'",
+    "input": "event-listener",
+    "accept": false
+  },
+  {
+    "name": "refused 'none'",
+    "input": "none",
+    "accept": false
+  },
+  {
+    "name": "refused '2'",
+    "input": "2",
+    "accept": false
+  },
+  {
+    "name": "refused '-1'",
+    "input": "-1",
+    "accept": false
+  },
+  {
+    "name": "refused '1.0'",
+    "input": "1.0",
+    "accept": false
+  },
+  {
+    "name": "refused '0.0'",
+    "input": "0.0",
+    "accept": false
+  },
+  {
+    "name": "refused 'maybe'",
+    "input": "maybe",
+    "accept": false
+  },
+  {
+    "name": "refused '\\ufeffevent'",
+    "input": "\ufeffevent",
+    "accept": false
+  },
+  {
+    "name": "refused 'event\\ufeff'",
+    "input": "event\ufeff",
+    "accept": false
+  },
+  {
+    "name": "refused 'ev ent'",
+    "input": "ev ent",
+    "accept": false
+  },
+  {
+    "name": "refused 2",
+    "input": 2,
+    "accept": false
+  },
+  {
+    "name": "refused -1",
+    "input": -1,
+    "accept": false
+  },
+  {
+    "name": "refused []",
+    "input": [],
+    "accept": false
+  },
+  {
+    "name": "refused {}",
+    "input": {},
+    "accept": false
+  },
+  {
+    "name": "reset",
+    "input": null,
+    "accept": true,
+    "reset": true
+  },
+  {
+    "name": "native float diagnostic 0.0",
+    "input": 0.0,
+    "accept": false,
+    "standard_accept": true
+  },
+  {
+    "name": "native float diagnostic 1.0",
+    "input": 1.0,
+    "accept": false,
+    "standard_accept": true
+  }
+]

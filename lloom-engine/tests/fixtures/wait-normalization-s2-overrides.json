@@ -1,0 +1,52 @@
+[
+  {
+    "name": "fetch native integral float",
+    "key": "weights.experts.fetch.wait",
+    "input": 7.0,
+    "prior_accept": false,
+    "accept": true,
+    "stored": 7,
+    "rendered": "sleep:7us",
+    "decision": "native integral normalization"
+  },
+  {
+    "name": "decode event case",
+    "key": "decode.ring.eos_wait",
+    "input": "EVENT",
+    "prior_accept": false,
+    "accept": true,
+    "stored": true,
+    "rendered": "event",
+    "decision": "normalized aliases"
+  },
+  {
+    "name": "decode event padding",
+    "key": "decode.ring.eos_wait",
+    "input": " event ",
+    "prior_accept": false,
+    "accept": true,
+    "stored": true,
+    "rendered": "event",
+    "decision": "normalized aliases"
+  },
+  {
+    "name": "speculative event case",
+    "key": "speculative.verify_wait",
+    "input": "EVENT",
+    "prior_accept": false,
+    "accept": true,
+    "stored": true,
+    "rendered": "event",
+    "decision": "normalized aliases"
+  },
+  {
+    "name": "speculative event padding",
+    "key": "speculative.verify_wait",
+    "input": " event ",
+    "prior_accept": false,
+    "accept": true,
+    "stored": true,
+    "rendered": "event",
+    "decision": "normalized aliases"
+  }
+]

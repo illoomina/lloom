@@ -1538,6 +1538,21 @@ fn fetch_wait_normalization_preserves_text_and_non_target_numeric_contracts() {
 /// lexical grammar, alias mapping and inverted/storage semantics stay intact.
 #[test]
 fn native_numeric_bools_share_all_json_ingress_without_widening_text() {
+    // The handwritten model group accepts nested, flat and dotted axes.
+    fn derive_documents(storage: &str, value: &Value) -> Vec<(String, Value)> {
+        let mut documents = vec![(storage.into(), document(storage, value.clone()))];
+        if let Some(axis) = storage.strip_prefix("model.axes.") {
+            let flat = format!("model.{axis}");
+            documents.push((flat.clone(), document(&flat, value.clone())));
+            let mut dotted = serde_json::Map::new();
+            dotted.insert(format!("axes.{axis}"), value.clone());
+            documents.push((
+                format!("model[axes.{axis}]"),
+                document("model", Value::Object(dotted)),
+            ));
+        }
+        documents
+    }
     let accepted = [
         ("0.0", false),
         ("-0.0", false),
@@ -1547,21 +1562,43 @@ fn native_numeric_bools_share_all_json_ingress_without_widening_text() {
         ("1e0", true),
         ("10e-1", true),
     ];
-    let invalid = [
+    let invalid_text = [
         "-1",
         "2",
         "0.5",
         "1.0000000000000002",
-        "0.9999999999999999",
         "5e-324",
         "1e308",
+        "\"0.0\"",
+        "\"1.0\"",
+        "\"1e0\"",
     ];
+    let mut invalid: Vec<(String, Value)> = invalid_text
+        .into_iter()
+        .map(|raw| (raw.into(), serde_json::from_str(raw).unwrap()))
+        .collect();
+    // Pin represented neighbors independently of the decimal-token parser:
+    // without float_roundtrip it can round 0.9999999999999999 to exactly1.
+    let one = 1.0_f64;
+    for (label, bits, below) in [
+        ("represented predecessor of1", one.to_bits() - 1, true),
+        ("represented successor of1", one.to_bits() + 1, false),
+    ] {
+        let number = f64::from_bits(bits);
+        assert!(number.is_finite() && number > 0.0 && number != one);
+        assert_eq!(number < one, below, "{label}");
+        assert_eq!(number > one, !below, "{label}");
+        let value = Value::Number(serde_json::Number::from_f64(number).unwrap());
+        assert_eq!(value.as_f64().unwrap().to_bits(), bits, "{label}");
+        invalid.push((label.into(), value));
+    }
     let idx = index();
     let mut keys = 0;
     let mut inverted = 0;
     let mut mapped = 0;
     let mut optional = 0;
     let mut native_writes = 0;
+    let mut axis_alias_writes = 0;
     for key in idx.keys.values().filter(|key| key.compound.is_none()) {
         let meta = key.meta();
         if !(meta.is_bool || matches!(meta.ty, "bool" | "Option<bool>")) {
@@ -1600,16 +1637,23 @@ fn native_numeric_bools_share_all_json_ingress_without_widening_text() {
                 native_writes += 1;
             }
             for leaf in &key.targets {
-                let mut actual = EngineOptions::default();
-                let mut reference = actual.clone();
-                actual
-                    .merge_json(&document(&leaf.storage, value.clone()))
-                    .unwrap();
-                reference
-                    .merge_json(&document(&leaf.storage, json!(want)))
-                    .unwrap();
-                assert_eq!(actual, reference, "{} derive {raw}", leaf.storage);
-                native_writes += 1;
+                let reference_documents = derive_documents(&leaf.storage, &json!(want));
+                for ((spelling, native), (reference_spelling, boolean)) in
+                    derive_documents(&leaf.storage, &value)
+                        .into_iter()
+                        .zip(reference_documents)
+                {
+                    assert_eq!(spelling, reference_spelling);
+                    let mut actual = EngineOptions::default();
+                    let mut reference = actual.clone();
+                    actual
+                        .merge_json(&native)
+                        .unwrap_or_else(|error| panic!("{spelling} native {raw}: {error}"));
+                    reference.merge_json(&boolean).unwrap();
+                    assert_eq!(actual, reference, "{spelling} derive {raw}");
+                    native_writes += 1;
+                    axis_alias_writes += usize::from(spelling != leaf.storage);
+                }
             }
             let (group, rest) = key.path.split_once('.').unwrap();
             let flag = format!("--{group}-config");
@@ -1623,8 +1667,7 @@ fn native_numeric_bools_share_all_json_ingress_without_widening_text() {
             );
         }
         for spelling in std::iter::once(key.path.clone()).chain(key.legacy_keys()) {
-            for raw in invalid.into_iter().chain(["\"0.0\"", "\"1.0\"", "\"1e0\""]) {
-                let value: Value = serde_json::from_str(raw).unwrap();
+            for (raw, value) in &invalid {
                 let mut actual = EngineOptions::default();
                 idx.set(&mut actual, "generation.max_tokens", "37").unwrap();
                 let prior = actual.clone();
@@ -1637,28 +1680,24 @@ fn native_numeric_bools_share_all_json_ingress_without_widening_text() {
             }
         }
         for leaf in &key.targets {
-            for raw in invalid.into_iter().chain(["\"0.0\"", "\"1.0\"", "\"1e0\""]) {
-                let value: Value = serde_json::from_str(raw).unwrap();
-                let mut actual = EngineOptions::default();
-                let prior = actual.clone();
-                assert!(
-                    actual.merge_json(&document(&leaf.storage, value)).is_err(),
-                    "{} derive refused {raw}",
-                    leaf.storage
-                );
-                assert_eq!(
-                    actual, prior,
-                    "{} derive refusal changed state",
-                    leaf.storage
-                );
+            for (raw, value) in &invalid {
+                for (spelling, native) in derive_documents(&leaf.storage, value) {
+                    let mut actual = EngineOptions::default();
+                    let prior = actual.clone();
+                    assert!(
+                        actual.merge_json(&native).is_err(),
+                        "{spelling} derive accepted invalid {raw}"
+                    );
+                    assert_eq!(actual, prior, "{spelling} derive refusal changed state");
+                }
             }
         }
     }
     for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
         assert!(serde_json::Number::from_f64(value).is_none());
     }
-    assert!(keys > 80 && inverted > 0 && mapped > 0 && optional > 0 && native_writes > 1000, "keys={keys} inverted={inverted} mapped={mapped} optional={optional} writes={native_writes}");
-    eprintln!("NATIVE_BOOL keys={keys} inverted={inverted} mapped={mapped} optional={optional} writes={native_writes}");
+    assert!(keys > 80 && inverted > 0 && mapped > 0 && optional > 0 && native_writes > 1000 && axis_alias_writes > 0, "keys={keys} inverted={inverted} mapped={mapped} optional={optional} writes={native_writes} axis_alias_writes={axis_alias_writes}");
+    eprintln!("NATIVE_BOOL keys={keys} inverted={inverted} mapped={mapped} optional={optional} writes={native_writes} axis_alias_writes={axis_alias_writes}");
 }
 
 fn bool_wait_cases() -> Vec<Value> {

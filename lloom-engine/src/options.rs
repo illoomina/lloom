@@ -839,6 +839,18 @@ impl ModelConfig {
 }
 
 fn json_scalar(key: &str, v: &serde_json::Value) -> Result<String, String> {
+    let axis = key.strip_prefix("axes.").unwrap_or(key);
+    if let Some(meta) = lloom::models::lfm2::Config::AXES_META
+        .iter()
+        .find(|meta| meta.key == axis)
+    {
+        if let Some(value) = meta
+            .native_number(v)
+            .map_err(|error| format!("--{axis}: {error}"))?
+        {
+            return Ok(value);
+        }
+    }
     match v {
         serde_json::Value::String(s) => Ok(s.clone()),
         serde_json::Value::Bool(b) => Ok(b.to_string()),

@@ -3592,3 +3592,68 @@ fn lfm2_moe_tiny_reaches_chat_and_serve_on_the_cpu() {
     drop(server);
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// A Rust embedding consumer resolves the same family/shape and calls the
+/// incumbent served owner directly; there is no programmatic fallback loop.
+#[test]
+fn lfm2_moe_programmatic_engine_uses_the_same_family_owner() {
+    use clap::Parser;
+    use lloom_engine::app::{load_engine, resolve_options, CommonArgs, Shape};
+    use lloom_engine::frontend::Frontend;
+    use lloom_engine::{DecodeParams, ReadbackArm};
+    #[derive(Parser)]
+    struct Args {
+        #[command(flatten)]
+        common: CommonArgs,
+    }
+    let dir = scratch("lfm2-moe-programmatic");
+    let model = dir.clone();
+    // Family resolution needs config, not weights. The fixture's schema
+    // constructs a model and reads OnceLock tuning; install the production
+    // option resolution before that, rather than using an uninstalled path.
+    let mut cfg = Lfm2MoeTiny::template();
+    cfg.set_axis("vocab_size", Lfm2MoeTiny::tokenizer().vocab_size());
+    cfg.derive();
+    std::fs::write(
+        dir.join("config.json"),
+        lloom::models::lfm2_testing::config_json(&cfg, &Lfm2MoeTiny::tokenizer()),
+    )
+    .unwrap();
+    let common = Args::parse_from([
+        "test",
+        "--model",
+        model.to_str().unwrap(),
+        "--cpu",
+        "--profile",
+        "deterministic",
+    ])
+    .common;
+    let mut options =
+        resolve_options(&common, &lloom_engine::app::no_front, Frontend::Chat).unwrap();
+    assert_eq!(write::<Lfm2MoeTiny>(&dir), model);
+    options.load.warmup = false;
+    let shape = Shape::of(&options, Frontend::Chat, String::new());
+    let (engine, loaded_path) = load_engine(&options.load, shape).unwrap();
+    assert_eq!(loaded_path, model);
+    assert_eq!(engine.capabilities().family, "lfm2_moe");
+    assert!(!engine.capabilities().eos_gate);
+    assert_eq!(engine.health()["family"], "lfm2_moe");
+    assert!(engine.describe().contains("family=lfm2_moe"));
+    let ids = engine.encode("Hi!", true).unwrap();
+    assert!(!ids.is_empty());
+    let params = DecodeParams {
+        max_tokens: 4,
+        eos_ids: vec![u32::MAX],
+        readback: ReadbackArm::Blocking,
+        cold: true,
+        ..DecodeParams::default()
+    };
+    let first = engine.complete(&ids, &params, &mut |_| {}).unwrap();
+    let again = engine.complete(&ids, &params, &mut |_| {}).unwrap();
+    assert_eq!(first.tokens.len(), 4);
+    assert_eq!(first.tokens, again.tokens);
+    assert_eq!(engine.vision_report()["family"], "lfm2_moe");
+    engine.shutdown();
+    drop(engine);
+    std::fs::remove_dir_all(&dir).ok();
+}

@@ -94,11 +94,18 @@ fn tiny_config(k: usize) -> Config {
 /// The same fixed-ramp weights the conv-rollback test uses — deterministic, so
 /// the two decode arms agree on the model and any divergence is the paths'.
 fn build(cfg: &Config, dev: &Device) -> Result<Model<RewindableExact>> {
+    build_with_dtype(cfg, dev, DType::F32)
+}
+
+fn build_with_dtype(cfg: &Config, dev: &Device, dtype: DType) -> Result<Model<RewindableExact>> {
     let mut tensors = std::collections::HashMap::new();
     let mut fill = |name: &str, shape: Vec<usize>| -> Result<()> {
         let n: usize = shape.iter().product();
         let v: Vec<f32> = (0..n).map(|i| ((i % 17) as f32 - 8.0) / 32.0).collect();
-        tensors.insert(name.to_string(), Tensor::from_vec(v, shape, dev)?);
+        tensors.insert(
+            name.to_string(),
+            Tensor::from_vec(v, shape, dev)?.to_dtype(dtype)?,
+        );
         Ok(())
     };
     let h = cfg.hidden_size;
@@ -138,7 +145,7 @@ fn build(cfg: &Config, dev: &Device) -> Result<Model<RewindableExact>> {
             }
         }
     }
-    let vb = VarBuilder::from_tensors(tensors, DType::F32, dev);
+    let vb = VarBuilder::from_tensors(tensors, dtype, dev);
     Model::<RewindableExact>::new(cfg, vb)
 }
 
@@ -3316,5 +3323,313 @@ fn continuous_row_cap_wins_before_unpublished_bonus_eos() -> Result<()> {
             "row cap must decide before an unpublished bonus EOS"
         );
     }
+    Ok(())
+}
+
+/// Reuse the streamed seed's RecordingDrafter, but queue a real device use of
+/// each tap without retaining the input Tensor. Only derived outputs survive
+/// observe; the next unit may reuse pool storage before those uses complete.
+#[cfg(feature = "metal")]
+struct NativeSeedRecorder {
+    record: RecordingDrafter,
+    queued: Vec<Vec<Tensor>>,
+    seen: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[cfg(feature = "metal")]
+impl Speculator for NativeSeedRecorder {
+    type Probe = LayerTaps<5>;
+    type Family = lloom::nn::speculator::DSpark;
+    fn n_seq(&self) -> usize {
+        self.record.n_seq()
+    }
+    fn max_draft(&self) -> usize {
+        self.record.max_draft()
+    }
+    fn begin(&mut self, seq: SeqId, prompt: &[u32]) -> Result<()> {
+        self.record.begin(seq, prompt)
+    }
+    fn draft(&mut self, active: &[SeqId]) -> Result<Vec<Draft>> {
+        self.record.draft(active)
+    }
+    fn observe(&mut self, seq: SeqId, probe: &Vec<Tensor>, accepted: &[u32]) -> Result<()> {
+        self.record.observe(seq, probe, accepted)?;
+        assert!(
+            probe.iter().all(|p| !p.track_op()),
+            "an autograd input hold would mask native custody loss"
+        );
+        let tag = self.queued.len() as f64 + 1.0;
+        self.queued.push(
+            probe
+                .iter()
+                .map(|p| p.affine(2.0, tag))
+                .collect::<Result<_>>()?,
+        );
+        self.seen
+            .store(self.queued.len(), std::sync::atomic::Ordering::Release);
+        Ok(())
+    }
+}
+
+/// Release even on an error/panic, and join the watchdog before the test
+/// leaves. The watchdog is a deadlock escape, not a passing outcome.
+#[cfg(feature = "metal")]
+struct NativeSeedHold {
+    gate: std::sync::Arc<lloom_tensor::metal_backend::HostEvent>,
+    done: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    timed_out: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    after_two: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    released_at: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+#[cfg(feature = "metal")]
+impl NativeSeedHold {
+    fn new(dev: &Device, seen: std::sync::Arc<std::sync::atomic::AtomicUsize>) -> Result<Self> {
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        };
+        use std::time::Duration;
+        let Device::Metal(m) = dev else {
+            unreachable!("native control")
+        };
+        let gate = Arc::new(lloom_tensor::metal_backend::HostEvent::new(m)?);
+        gate.encode_wait(1)?;
+        let done = Arc::new(AtomicBool::new(false));
+        let timed_out = Arc::new(AtomicBool::new(false));
+        let after_two = Arc::new(AtomicBool::new(false));
+        let released_at = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let released = released_at.clone();
+        let (g, d, t, a) = (
+            gate.clone(),
+            done.clone(),
+            timed_out.clone(),
+            after_two.clone(),
+        );
+        let thread = std::thread::spawn(move || {
+            for _ in 0..600 {
+                if d.load(Ordering::Acquire) {
+                    return;
+                }
+                if seen.load(Ordering::Acquire) >= 2 {
+                    // before_forward for unit3 must wait on unit1's held marker.
+                    // The actual wait counter below, not this delay, proves it did.
+                    std::thread::sleep(Duration::from_millis(200));
+                    released.store(seen.load(Ordering::Acquire), Ordering::Release);
+                    a.store(true, Ordering::Release);
+                    g.signal(1);
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            t.store(true, Ordering::Release);
+            g.signal(1);
+        });
+        Ok(Self {
+            gate,
+            done,
+            timed_out,
+            after_two,
+            released_at,
+            thread: Some(thread),
+        })
+    }
+}
+
+#[cfg(feature = "metal")]
+impl Drop for NativeSeedHold {
+    fn drop(&mut self) {
+        self.done.store(true, std::sync::atomic::Ordering::Release);
+        self.gate.signal(1);
+        self.thread
+            .take()
+            .unwrap()
+            .join()
+            .expect("native seed watchdog");
+    }
+}
+
+#[cfg(feature = "metal")]
+struct NativeSeedWindowArm(bool);
+#[cfg(feature = "metal")]
+impl NativeSeedWindowArm {
+    fn new() -> Self {
+        let old = lloom_tensor::tuning::Window::Prefill.arm();
+        lloom_tensor::tuning::Window::Prefill.set_arm(true);
+        Self(old)
+    }
+}
+#[cfg(feature = "metal")]
+impl Drop for NativeSeedWindowArm {
+    fn drop(&mut self) {
+        lloom_tensor::tuning::Window::Prefill.set_arm(self.0);
+    }
+}
+
+/// Literal37-token seed, spark3+tile16 => (0,3),(3,16),(19,16),(35,2).
+/// Cap1 isolates seed custody: no draft/verify can mask a missing seed marker.
+/// A same-device synchronous, manually tiled forward is the probe-value oracle;
+/// unlike the subject, it reads every unit before the next can reuse storage.
+#[cfg(feature = "metal")]
+#[test]
+fn decode_speculative_streamed_prefill_keeps_native_unit_markers_and_probes() -> Result<()> {
+    use lloom_tensor::tuning::{VerifyWindow, Window};
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+    assert_eq!(
+        lloom_tensor::tuning::pin_regime(lloom_tensor::tuning::Contract::Deterministic)
+            .map_err(lloom_tensor::Error::Msg)?,
+        lloom_tensor::tuning::Contract::Deterministic
+    );
+    let contract = lloom_tensor::tuning::gate_contract("native speculative seed")
+        .map_err(lloom_tensor::Error::Msg)?;
+    assert_eq!(contract, lloom_tensor::tuning::Contract::Deterministic);
+    let dev = Device::new_metal(0)?;
+    let requested = lloom_tensor::tuning::tuning().metal.command_api.as_str();
+    let actual = dev.as_metal_device()?.commands().actual_command_api();
+    assert!(matches!(actual, "metal3" | "metal4"));
+    if matches!(requested, "metal3" | "metal4") {
+        assert_eq!(actual, requested, "native API must not silently fall back");
+    }
+    let _arm = NativeSeedWindowArm::new();
+    let k = 4;
+    let mut cfg = tiny_config(k);
+    cfg.hidden_size = 512;
+    cfg.intermediate_size = 512;
+    cfg.num_attention_heads = 8;
+    cfg.num_key_value_heads = 4;
+    cfg.conv_prefill_ctx = true;
+    cfg.tap_dtype = DType::F16;
+    let model = build_with_dtype(&cfg, &dev, DType::F16)?;
+    let prompt: Vec<u32> = (0..37).map(|i| 1 + (i * 7) % 46).collect();
+    let spans = [(0usize, 3usize), (3, 16), (19, 16), (35, 2)];
+    let bits = |p: &Tensor| -> Result<Vec<u32>> {
+        Ok(p.to_dtype(DType::F32)?
+            .flatten_all()?
+            .to_vec1::<f32>()?
+            .into_iter()
+            .map(f32::to_bits)
+            .collect())
+    };
+    let mut reference = State::<RewindableExact>::new(true, DType::F16, &cfg, &dev)?;
+    let mut expected = Vec::new();
+    let mut raw = Vec::new();
+    for (unit, (past, width)) in spans.into_iter().enumerate() {
+        let input = Tensor::new(&prompt[past..past + width], &dev)?.unsqueeze(0)?;
+        {
+            let _window = VerifyWindow::prefill();
+            model.forward(&input, past, &mut reference)?;
+        }
+        let taps = reference.take_taps();
+        assert_eq!(taps.len(), 5);
+        raw.push(bits(&taps[0])?);
+        expected.push(
+            taps.iter()
+                .map(|p| bits(&p.affine(2.0, unit as f64 + 1.0)?))
+                .collect::<Result<Vec<_>>>()?,
+        );
+    }
+    assert_ne!(
+        raw[1], raw[2],
+        "equal-width unit probes must differ: stale data would be invisible"
+    );
+    assert!(raw.iter().flatten().all(|&b| f32::from_bits(b).is_finite()));
+    dev.synchronize()?;
+    let seen = Arc::new(AtomicUsize::new(0));
+    let mut recorder = NativeSeedRecorder {
+        record: RecordingDrafter {
+            k,
+            drafts: 0,
+            observed: Vec::new(),
+        },
+        queued: Vec::new(),
+        seen: seen.clone(),
+    };
+    let opts = DecodeOptions {
+        prefill_ubatch: 3,
+        prefill_tile: 16,
+        prefill_pacer_depth: 2,
+        ..DecodeOptions::new(1)
+    };
+    let mut session = Session::new(
+        &model,
+        State::<RewindableExact>::new(true, DType::F16, &cfg, &dev)?,
+    );
+    let mut rb = Blocking::new(&[u32::MAX], &dev)?;
+    let mut sampler = LogitsProcessor::from_sampling(0, Sampling::ArgMax);
+    let before = Window::Prefill.gemms();
+    let held = NativeSeedHold::new(&dev, seen)?;
+    let result = session.decode_speculative(
+        lloom::profile::RewindProof::of(),
+        &mut recorder,
+        &mut rb,
+        &mut sampler,
+        &prompt,
+        &opts,
+        &[u32::MAX],
+        &mut |_| Ok(()),
+    );
+    let timed_out = held.timed_out.load(Ordering::Acquire);
+    let released_after_two = held.after_two.load(Ordering::Acquire);
+    let released_at = held.released_at.load(Ordering::Acquire);
+    drop(held);
+    let out = result?;
+    dev.synchronize()?;
+    assert!(
+        !timed_out,
+        "seed read/retirement blocked before two units were queued"
+    );
+    assert!(
+        released_after_two,
+        "the held native work was never exercised"
+    );
+    assert_eq!(
+        released_at, 2,
+        "native hold did not bound unit3 behind unit1"
+    );
+    assert_eq!(recorder.record.drafts, 0);
+    assert!(out.stats.rounds.is_empty());
+    assert_eq!(out.ids.len(), 1);
+    assert_eq!(out.stats.prefill_units, 4);
+    assert_eq!(
+        out.stats.step_markers, 4,
+        "one real completion marker per unit"
+    );
+    assert!(
+        out.stats.step_waits > 0,
+        "the held marker never bounded the next unit"
+    );
+    assert!(
+        Window::Prefill.gemms() > before,
+        "speculative seed never entered its half-GEMM prefill window"
+    );
+    assert_eq!(
+        recorder
+            .record
+            .observed
+            .iter()
+            .map(|r| r.1)
+            .collect::<Vec<_>>(),
+        vec![3, 16, 16, 2]
+    );
+    assert!(recorder.record.observed[..3]
+        .iter()
+        .all(|r| r.0 == 0 && r.2.is_empty()));
+    assert_eq!(recorder.record.observed[3].2, out.ids);
+    assert_eq!(recorder.queued.len(), 4);
+    for (unit, (actual, expected)) in recorder.queued.iter().zip(expected).enumerate() {
+        for (tap, (actual, expected)) in actual.iter().zip(expected).enumerate() {
+            assert_eq!(
+                bits(actual)?,
+                expected,
+                "retained unit{unit} tap{tap} was overwritten"
+            );
+        }
+    }
+    eprintln!("NATIVE_PREFILL_SEED requested={requested} actual={actual} held_release=after_two watchdog=false units=4 widths=3,16,16,2 markers={} waits={} taps=5 retained=20 window_gemms={}",
+        out.stats.step_markers, out.stats.step_waits, Window::Prefill.gemms() - before);
     Ok(())
 }

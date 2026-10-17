@@ -1771,6 +1771,48 @@ fn cpu_prompt_gemm_is_bit_identical_to_decode_rows() -> Result<()> {
     use lloom_tensor::quantized::k_quants::{
         self, BlockQ4K, BlockQ4_0, BlockQ5_0, BlockQ6K, BlockQ8_0, GgmlType,
     };
+    // Native NEON's raw f16 dot has four eight-lane half accumulators,
+    // flushed every 16 steps (cpu/neon.rs CurrentCpuF16). This is distinct
+    // from the configurable dense-matmul accumulator. Model those half FMAs
+    // and the reduction with scalar arithmetic, not the SIMD implementation.
+    #[cfg(all(target_feature = "neon", target_feature = "fp16"))]
+    fn half_lane_reference(lhs: &[f32], rhs: &[f32]) -> f32 {
+        fn reduce(lanes: &[[half::f16; 8]; 4]) -> f32 {
+            let mut sum = 0f32;
+            for lane in lanes {
+                let pairs: [f32; 4] =
+                    std::array::from_fn(|i| lane[i].to_f32() + lane[i + 4].to_f32());
+                sum += (pairs[0] + pairs[1]) + (pairs[2] + pairs[3]);
+            }
+            sum
+        }
+        let mut lanes = [[half::f16::ZERO; 8]; 4];
+        let mut sum = 0f32;
+        let mut steps = 0;
+        let mut i = 0;
+        while i + 32 <= lhs.len() {
+            for (j, lane) in lanes.iter_mut().enumerate() {
+                for (l, accumulator) in lane.iter_mut().enumerate() {
+                    let at = i + j * 8 + l;
+                    *accumulator = half::f16::from_f64(
+                        (lhs[at] as f64).mul_add(rhs[at] as f64, accumulator.to_f64()),
+                    );
+                }
+            }
+            steps += 1;
+            if steps == 16 {
+                sum += reduce(&lanes);
+                lanes = [[half::f16::ZERO; 8]; 4];
+                steps = 0;
+            }
+            i += 32;
+        }
+        sum += reduce(&lanes);
+        for (&a, &b) in lhs[i..].iter().zip(&rhs[i..]) {
+            sum += a * b;
+        }
+        sum
+    }
     fn check<T: GgmlType>() -> Result<()> {
         for m in [2, 17, 33] {
             for n in [1, 2, 3, 4, 7, 65] {
@@ -1792,6 +1834,32 @@ fn cpu_prompt_gemm_is_bit_identical_to_decode_rows() -> Result<()> {
                             &mut expected[row * n..(row + 1) * n],
                         )?;
                     }
+                    // Independent scalar arithmetic oracle over the actual
+                    // quantized operands. It shares neither matmul traversal
+                    // nor SIMD dot kernels; quantization itself is unchanged.
+                    let mut dense_rhs = vec![0.; n * k];
+                    T::to_float(&rhs, &mut dense_rhs);
+                    let mut scalar = vec![0f64; m * n];
+                    for row in 0..m {
+                        let mut packed = vec![T::VecDotType::zeros(); k / T::VecDotType::BLCK_SIZE];
+                        T::VecDotType::from_float(&lhs[row * k..(row + 1) * k], &mut packed);
+                        let mut dense_lhs = vec![0.; k];
+                        T::VecDotType::to_float(&packed, &mut dense_lhs);
+                        for col in 0..n {
+                            scalar[row * n + col] = dense_lhs
+                                .iter()
+                                .zip(&dense_rhs[col * k..(col + 1) * k])
+                                .map(|(&a, &b)| a as f64 * b as f64)
+                                .sum();
+                            #[cfg(all(target_feature = "neon", target_feature = "fp16"))]
+                            if T::DTYPE == GgmlDType::F16 {
+                                scalar[row * n + col] = half_lane_reference(
+                                    &dense_lhs,
+                                    &dense_rhs[col * k..(col + 1) * k],
+                                ) as f64;
+                            }
+                        }
+                    }
                     for _ in 0..3 {
                         let mut got = vec![f32::NAN; m * n];
                         k_quants::matmul::<T>((m, k, n), &lhs, &rhs, &mut got)?;
@@ -1801,6 +1869,22 @@ fn cpu_prompt_gemm_is_bit_identical_to_decode_rows() -> Result<()> {
                             "{:?} m={m} k={k} n={n}",
                             T::DTYPE
                         );
+                        for (&value, &reference) in got.iter().zip(&scalar) {
+                            #[cfg(all(target_feature = "neon", target_feature = "fp16"))]
+                            if T::DTYPE == GgmlDType::F16 {
+                                assert_eq!(
+                                    value.to_bits(),
+                                    (reference as f32).to_bits(),
+                                    "scalar half-FMA oracle"
+                                );
+                            }
+                            let error = (value as f64 - reference).abs() / reference.abs().max(1.);
+                            assert!(
+                                error <= GGML_MAX_DOT_PRODUCT_ERROR as f64,
+                                "{:?} scalar oracle {value} != {reference}, error={error}",
+                                T::DTYPE
+                            );
+                        }
                     }
                 }
             }

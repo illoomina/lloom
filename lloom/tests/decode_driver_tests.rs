@@ -22,7 +22,7 @@ use lloom::generation::{
 };
 use lloom::nn::decode::IN_FLIGHT_STEPS;
 use lloom::nn::speculator::{Draft, NoProbe, SeqId, TargetProbe};
-use lloom::nn::{CausalLM, DecodeOptions, IdentityProposer, Model, Session, Speculator};
+use lloom::nn::{CausalLM, DecodeOptions, IdentityProposer, Session, Speculator};
 use lloom_tensor::{DType, Device, Result, Tensor};
 
 const VOCAB: usize = 64;

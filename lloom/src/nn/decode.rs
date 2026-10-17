@@ -2189,8 +2189,11 @@ impl<'m, M: CausalLM> Session<'m, M> {
         } else {
             None
         };
-        let mut watch_ids: Vec<u32> =
-            Vec::with_capacity(if watch.is_some() { opts.adaptive_lead() + 1 } else { 0 });
+        let mut watch_ids: Vec<u32> = Vec::with_capacity(if watch.is_some() {
+            opts.adaptive_lead() + 1
+        } else {
+            0
+        });
 
         let mut produced = 0usize;
         let mut since_commit = 0usize;
@@ -2252,7 +2255,9 @@ impl<'m, M: CausalLM> Session<'m, M> {
                     // The watch reads every step and the host is at most
                     // `adaptive_lead` steps ahead of what the GPU publishes,
                     // so a lap means the bound the watch rests on is broken.
-                    lloom_tensor::bail!("Session::decode: the EOS watch fell behind the ring ({lap})")
+                    lloom_tensor::bail!(
+                        "Session::decode: the EOS watch fell behind the ring ({lap})"
+                    )
                 }
                 if w.ended() {
                     stats.stopped_by_eos_watch = true;
@@ -3306,6 +3311,7 @@ impl<'m, M: CausalLM> Session<'m, M> {
         drop(prefill_probe);
         drop(logits);
         // Dropping seed receipts adds no completion wait.
+        #[cfg(feature = "metal")]
         drop(prefill_pacer);
 
         // The prefill's own argmax is the first generated token — it is what
@@ -3722,6 +3728,7 @@ impl<'m, M: CausalLM> Session<'m, M> {
 
         // All anchors have consumed their seed logits; the round pipeline has
         // its own pending receipts. No terminal drain is introduced here.
+        #[cfg(feature = "metal")]
         drop(prefill_pacer);
 
         // Prime: one verify in flight per live sequence.

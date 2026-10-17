@@ -78,10 +78,9 @@ pub(super) fn pair() -> lloom_tensor::Result<(
     Ok((fixture, model, cfg, drafter))
 }
 
-fn run_static(
-    opts: &DecodeOptions,
-    specs: &[RowSpec],
-) -> lloom_tensor::Result<(Vec<DecodeOut>, Vec<(usize, Vec<u32>)>)> {
+type StaticResult = (Vec<DecodeOut>, Vec<(usize, Vec<u32>)>);
+
+fn run_static(opts: &DecodeOptions, specs: &[RowSpec]) -> lloom_tensor::Result<StaticResult> {
     let (_fixture, model, cfg, drafter) = pair()?;
     let device = Device::Cpu;
     let mut extra = Speculators {

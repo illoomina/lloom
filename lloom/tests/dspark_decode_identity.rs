@@ -2930,8 +2930,8 @@ fn serial_length_stop_digest_excludes_unpublished_bonus_prediction() -> Result<(
         );
         let mut spec = LaneOracles::with_k(1, &stream, 2);
         let mut rb = Blocking::new(&[EOS_FIXTURE_EOS], &dev)?;
-        let mut sampler = LogitsProcessor::from_sampling(0, Sampling::ArgMax)
-            .with_logits_digest(true);
+        let mut sampler =
+            LogitsProcessor::from_sampling(0, Sampling::ArgMax).with_logits_digest(true);
         let mut published = Vec::new();
         let out = subject.decode_speculative(
             lloom::profile::RewindProof::of(),
@@ -3239,6 +3239,82 @@ fn serial_sampled_terminal_budget_remains_at_the_publishable_frontier() -> Resul
         assert_eq!(next_out.ids, if cap == 2 { vec![] } else { vec![0] });
         assert_eq!(next_out.eos, cap == 2);
         assert_eq!(sampler.digest_rows(), before + 1);
+    }
+    Ok(())
+}
+
+/// The continuous consumer must not turn an unpublished bonus into EOS.
+#[test]
+fn continuous_row_cap_wins_before_unpublished_bonus_eos() -> Result<()> {
+    use lloom::nn::{RowDriver, SpecBatchDecoder};
+    let dev = Device::Cpu;
+    let (cfg, model, stream) = eos_fixture(&dev)?;
+    assert_eq!(
+        &stream[..14],
+        &[12, 0, 12, 0, 12, 0, 12, 0, 12, 0, 12, 0, 12, 0]
+    );
+    assert_eq!(stream[14], EOS_FIXTURE_EOS);
+    let sessions: Vec<_> = (0..2)
+        .map(|_| {
+            Ok(Session::new(
+                &model,
+                State::<RewindableExact>::new(true, DType::F32, &cfg, &dev)?,
+            ))
+        })
+        .collect::<Result<_>>()?;
+    let spec = LaneOracles::with_k(2, &stream, 2);
+    let mut driver = SpecBatchDecoder::new(
+        lloom::profile::RewindProof::of(),
+        spec,
+        DecodeOptions::new(99),
+        dev.clone(),
+    )?;
+    let mut rows = Vec::new();
+    for (session, cap) in sessions.into_iter().zip([14, 0]) {
+        rows.push(driver.admit_with_eos(
+            session,
+            EOS_FIXTURE_PROMPT.to_vec(),
+            Sampling::ArgMax,
+            0,
+            &[EOS_FIXTURE_EOS],
+            cap,
+        )?);
+    }
+    let mut published = [Vec::new(), Vec::new()];
+    let mut finished = Vec::new();
+    for _ in 0..20 {
+        driver.step(&mut |row, ids| {
+            let lane = rows.iter().position(|r| *r == row).unwrap();
+            published[lane].extend_from_slice(ids);
+            assert!(
+                published[lane].len() <= 14,
+                "finite EOS fixture exceeded its bound"
+            );
+            Ok(())
+        })?;
+        finished.extend(driver.take_finished());
+        if finished.len() == 2 {
+            break;
+        }
+    }
+    assert_eq!(finished.len(), 2, "continuous rows failed to retire");
+    for (row, mut session, out) in finished {
+        let lane = rows.iter().position(|r| *r == row).unwrap();
+        assert_eq!(out.ids, stream[..14]);
+        assert_eq!(published[lane], out.ids);
+        assert_eq!(out.stats.produced, 14);
+        assert_eq!(out.stats.overrun, 0);
+        assert_eq!(session.pos(), 22);
+        assert_eq!(session.cache_mut().kv_len(), 22);
+        assert_eq!(
+            session.tokens(),
+            [&EOS_FIXTURE_PROMPT, &stream[..14]].concat()
+        );
+        assert_eq!(
+            out.eos,
+            lane == 1,
+            "row cap must decide before an unpublished bonus EOS"
+        );
     }
     Ok(())
 }

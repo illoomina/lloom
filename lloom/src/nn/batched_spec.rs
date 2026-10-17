@@ -364,11 +364,11 @@ where
             }
             let mut batch: Vec<u32> = Vec::with_capacity(accepted.len());
             for &tok in &accepted {
-                if lane.eos_ids.contains(&tok) {
-                    lane.eos = true;
+                if lane.reached(lane.produced + batch.len()) {
                     break;
                 }
-                if lane.reached(lane.produced + batch.len()) {
+                if lane.eos_ids.contains(&tok) {
+                    lane.eos = true;
                     break;
                 }
                 batch.push(tok);

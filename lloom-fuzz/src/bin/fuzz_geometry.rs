@@ -1221,6 +1221,44 @@ mod tests {
         assert!(manifest_json::<Lfm2Tiny>(&[empty], &args).is_err());
     }
 
+    // Borrow the child so the caller can verify its reaped status after unwinding.
+    // Only this owned child is signalled; never a process-name or process-group kill.
+    struct ChildCleanup<'a>(&'a mut std::process::Child);
+
+    impl Drop for ChildCleanup<'_> {
+        fn drop(&mut self) {
+            if !matches!(self.0.try_wait(), Ok(Some(_))) {
+                // Best effort during unwinding: do not replace the original failure.
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+    }
+
+    #[test]
+    fn publication_child_cleanup_reaps_on_return_and_unwind() {
+        for unwind in [false, true] {
+            let mut child = std::process::Command::new("/bin/sleep")
+                .arg("60")
+                .spawn()
+                .unwrap();
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _cleanup = ChildCleanup(&mut child);
+                if unwind {
+                    panic!("injected failure before publication readiness");
+                }
+            }));
+            let reaped = child.try_wait();
+            // Keep the regression control safe even if cleanup is broken/mutated.
+            if !matches!(reaped, Ok(Some(_))) {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            assert_eq!(outcome.is_err(), unwind);
+            assert!(matches!(reaped, Ok(Some(_))), "owned child was not reaped");
+        }
+    }
+
     #[test]
     fn publication_sigterm_child() {
         let Some(dir) = std::env::var_os("LLOOM_TEST_PUBLICATION_CHILD") else {
@@ -1253,10 +1291,11 @@ mod tests {
             .env("LLOOM_TEST_PUBLICATION_CHILD", &dir)
             .spawn()
             .unwrap();
+        let cleanup = ChildCleanup(&mut child);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while !dir.join("ready").exists() && std::time::Instant::now() < deadline {
             assert!(
-                child.try_wait().unwrap().is_none(),
+                cleanup.0.try_wait().unwrap().is_none(),
                 "producer exited before readiness"
             );
             std::thread::sleep(std::time::Duration::from_millis(10));
@@ -1266,16 +1305,16 @@ mod tests {
             "producer did not reach synced temporary phase"
         );
         assert!(std::process::Command::new("/bin/kill")
-            .args(["-TERM", &child.id().to_string()])
+            .args(["-TERM", &cleanup.0.id().to_string()])
             .status()
             .unwrap()
             .success());
-        let status = child.wait().unwrap();
+        let status = cleanup.0.wait().unwrap();
         assert_eq!(status.signal(), Some(15));
         assert!(!dir.join("observation.json").exists());
         let pending = dir
             .join("observation.json")
-            .with_extension(format!("pending-{}", child.id()));
+            .with_extension(format!("pending-{}", cleanup.0.id()));
         assert!(
             pending.exists(),
             "signal did not interrupt actual synced temporary state"

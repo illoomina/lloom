@@ -240,7 +240,12 @@
     "storage": "tuning.ring.eos_park",
     "input": " event ",
     "accept": false,
-    "projection": "unapplied"
+    "projection": "unapplied",
+    "set_reference": {
+      "accept": true,
+      "stored": true,
+      "rendered": "event"
+    }
   },
   {
     "name": "speculative event",
@@ -306,6 +311,11 @@
     "storage": "tuning.ring.verify_park",
     "input": " event ",
     "accept": false,
-    "projection": "unapplied"
+    "projection": "unapplied",
+    "set_reference": {
+      "accept": true,
+      "stored": true,
+      "rendered": "event"
+    }
   }
 ]

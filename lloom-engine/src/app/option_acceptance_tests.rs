@@ -827,7 +827,21 @@ fn unapplied_wait_contracts_preserve_existing_resolution_boundaries() {
         let accepts = row["accept"] == true
             || (row["accept_without_metal"] == true && !cfg!(feature = "metal"));
         for (via, result) in routes {
-            if accepts {
+            // --set parses an assignment and trims its value before the leaf
+            // setter; JSON/env hand that setter the original string. Literal
+            // per-route references preserve both existing contracts.
+            let reference = if via == "--set" {
+                row.get("set_reference").unwrap_or(&row)
+            } else {
+                &row
+            };
+            let route_accepts = if reference.get("accept_without_metal").is_some() {
+                reference["accept"] == true
+                    || (reference["accept_without_metal"] == true && !cfg!(feature = "metal"))
+            } else {
+                reference["accept"] == true
+            };
+            if route_accepts {
                 let options = result.unwrap_or_else(|e| panic!("{} via {via}: {e}", row["name"]));
                 let stored = serde_json::to_value(&options).unwrap();
                 let actual = row["storage"]
@@ -835,10 +849,10 @@ fn unapplied_wait_contracts_preserve_existing_resolution_boundaries() {
                     .unwrap()
                     .split('.')
                     .fold(&stored, |v, s| &v[s]);
-                assert_eq!(*actual, row["stored"], "{} via {via}", row["name"]);
+                assert_eq!(*actual, reference["stored"], "{} via {via}", row["name"]);
                 assert_eq!(
                     index().flat(&options)[key],
-                    row["rendered"],
+                    reference["rendered"],
                     "{} via {via}",
                     row["name"]
                 );

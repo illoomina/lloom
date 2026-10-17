@@ -2663,8 +2663,9 @@ fn the_load_line_reports_the_tail_the_default_runs_with() {
 }
 
 #[test]
-fn neutral_effort_is_accepted_without_inventing_a_template_control() {
-    let engine = Stub::lfm2();
+fn neutral_gguf_effort_is_accepted_without_inventing_a_template_control() {
+    let mut engine = Stub::lfm2();
+    engine.caps = crate::app::causal_loaded::served::lfm2_gguf_capabilities();
     let front = Front::new(&engine, SessionOptions::default());
     let messages = json!([user("Hi")]);
     let base = front
@@ -2728,4 +2729,31 @@ fn neutral_effort_is_accepted_without_inventing_a_template_control() {
             }
         )
         .is_err());
+}
+
+#[test]
+fn other_families_keep_their_existing_neutral_effort_validation() {
+    let engine = Stub::lfm2(); // The safetensors/Metal family, not lfm2-gguf.
+    let front = Front::new(&engine, SessionOptions::default());
+    let messages = json!([user("Hi")]);
+    for effort in ["none", "default"] {
+        let request = || Request {
+            messages: &messages,
+            kwargs: Map::from_iter([(REASONING_EFFORT.into(), json!(effort))]),
+            want: None,
+            add_bos: true,
+            expand: None,
+            history: None,
+        };
+        let error = front.prompt(&engine, request()).unwrap_err().to_string();
+        assert!(
+            error.contains("lfm2's chat template does not read reasoning_effort"),
+            "{error}"
+        );
+        let error = front.plain(&engine, request()).unwrap_err().to_string();
+        assert!(
+            error.contains("lfm2's chat template does not read reasoning_effort"),
+            "{error}"
+        );
+    }
 }

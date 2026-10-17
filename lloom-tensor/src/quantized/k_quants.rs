@@ -2435,6 +2435,69 @@ pub fn matmul<T: GgmlType>(
         let quads_per_thread = quads_total.div_ceil(n_total);
         let lhs_b: &[T::VecDotType] = lhs_b;
 
+        if m > 1 {
+            // Quantized GEMM: keep a column tile hot across prompt rows rather
+            // than sweep the whole weight for every token. One pool dispatch
+            // covers the entire matrix. Every output uses exactly the same
+            // vec_dot_4/2/1 and activation quantization as the decode reference:
+            // no new reduction order, rounding or dequantized weight copy.
+            let dst_ptr = dst.as_mut_ptr() as usize;
+            pool.execute(|tid| {
+                let start = tid * quads_per_thread;
+                let end = quads_total.min(start + quads_per_thread);
+                for col_tile in (start..end).step_by(4) {
+                    let col_end = end.min(col_tile + 4);
+                    for row_tile in (0..m).step_by(16) {
+                        for quad_idx in col_tile..col_end {
+                            let col = quad_idx * 4;
+                            let weights = [
+                                &rhs_t[col * k_in_blocks..(col + 1) * k_in_blocks],
+                                &rhs_t[(col + 1) * k_in_blocks..(col + 2) * k_in_blocks],
+                                &rhs_t[(col + 2) * k_in_blocks..(col + 3) * k_in_blocks],
+                                &rhs_t[(col + 3) * k_in_blocks..(col + 4) * k_in_blocks],
+                            ];
+                            for row in row_tile..m.min(row_tile + 16) {
+                                let lhs_row = &lhs_b[row * k_in_blocks..(row + 1) * k_in_blocks];
+                                let (a, b, c, d) = T::vec_dot_4(
+                                    k, weights[0], weights[1], weights[2], weights[3], lhs_row,
+                                );
+                                // SAFETY: each worker owns disjoint columns in
+                                // every row, within the m*n destination. The
+                                // pool joins before dst is used again.
+                                unsafe {
+                                    let out = (dst_ptr as *mut f32).add(row * n + col);
+                                    *out = a;
+                                    *out.add(1) = b;
+                                    *out.add(2) = c;
+                                    *out.add(3) = d;
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+            for row in 0..m {
+                let lhs_row = &lhs_b[row * k_in_blocks..(row + 1) * k_in_blocks];
+                let tail = &mut dst[row * n + n_quad..(row + 1) * n];
+                if n_tail >= 2 {
+                    let col = n_quad;
+                    let (a, b) = T::vec_dot_2(
+                        k,
+                        &rhs_t[col * k_in_blocks..(col + 1) * k_in_blocks],
+                        &rhs_t[(col + 1) * k_in_blocks..(col + 2) * k_in_blocks],
+                        lhs_row,
+                    );
+                    tail[0] = a;
+                    tail[1] = b;
+                }
+                if n_tail & 1 == 1 {
+                    tail[n_tail - 1] =
+                        T::vec_dot(k, &rhs_t[(n - 1) * k_in_blocks..n * k_in_blocks], lhs_row);
+                }
+            }
+            return Ok(());
+        }
+
         for row_idx in 0..m {
             let lhs_row = &lhs_b[row_idx * k_in_blocks..(row_idx + 1) * k_in_blocks];
             let dst_row = &mut dst[row_idx * n..(row_idx + 1) * n];

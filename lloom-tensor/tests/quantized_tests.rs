@@ -1763,3 +1763,57 @@ fn the_cpu_matmul_of_a_read_only_type_is_refused_by_name() -> Result<()> {
     }
     Ok(())
 }
+
+/// CPU prompt GEMM must match the old per-token GEMV bit for bit, including
+/// partial column/row tiles and each quantizer's activation rounding.
+#[test]
+fn cpu_prompt_gemm_is_bit_identical_to_decode_rows() -> Result<()> {
+    use lloom_tensor::quantized::k_quants::{
+        self, BlockQ4K, BlockQ4_0, BlockQ5_0, BlockQ6K, BlockQ8_0, GgmlType,
+    };
+    fn check<T: GgmlType>() -> Result<()> {
+        for m in [2, 17, 33] {
+            for n in [1, 2, 3, 4, 7, 65] {
+                for k in [256, 768] {
+                    let lhs: Vec<_> = (0..m * k)
+                        .map(|i| ((i * 17 % 211) as f32 - 103.) / 73.)
+                        .collect();
+                    let weights: Vec<_> = (0..n * k)
+                        .map(|i| ((i * 31 % 173) as f32 - 87.) / 61.)
+                        .collect();
+                    let mut rhs = vec![T::zeros(); n * k / T::BLCK_SIZE];
+                    T::from_float(&weights, &mut rhs);
+                    let mut expected = vec![0.; m * n];
+                    for row in 0..m {
+                        k_quants::matmul::<T>(
+                            (1, k, n),
+                            &lhs[row * k..(row + 1) * k],
+                            &rhs,
+                            &mut expected[row * n..(row + 1) * n],
+                        )?;
+                    }
+                    for _ in 0..3 {
+                        let mut got = vec![f32::NAN; m * n];
+                        k_quants::matmul::<T>((m, k, n), &lhs, &rhs, &mut got)?;
+                        assert_eq!(
+                            got.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                            expected.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                            "{:?} m={m} k={k} n={n}",
+                            T::DTYPE
+                        );
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+    check::<BlockQ4_0>()?;
+    check::<BlockQ5_0>()?;
+    check::<BlockQ8_0>()?;
+    check::<BlockQ4K>()?;
+    check::<BlockQ6K>()?;
+    check::<f32>()?;
+    check::<half::f16>()?;
+    check::<half::bf16>()?;
+    Ok(())
+}

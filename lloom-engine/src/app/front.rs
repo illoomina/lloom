@@ -1654,9 +1654,12 @@ pub fn logprobs_refused_on(body: lloom::nn::Body) -> Option<String> {
         digest: false,
         logprobs: Some(0),
     };
-    lloom::nn::refuse(body, &asks)
-        .err()
-        .map(|e| format!("this process decodes through {name}: {e}"))
+    lloom::nn::refuse(body, &asks).err().map(|e| {
+        format!(
+            "this process decodes through {name}: {}",
+            e.without_backtrace()
+        )
+    })
 }
 
 /// Of `tokens`, the longest prefix of whole units whose text `delivered`

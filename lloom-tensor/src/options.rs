@@ -141,9 +141,23 @@ pub struct KnobMeta {
 }
 
 impl KnobMeta {
-    /// Preserve JSON number provenance until a field-attached domain has
-    /// checked it. Unattached fields keep their existing scalar path.
+    /// Preserve JSON number provenance until the bool or field-attached
+    /// count domain has checked it. Strings retain their lexical grammar.
     pub fn native_number(&self, value: &Value) -> Result<Option<String>, String> {
+        if let Value::Number(number) = value {
+            if self.is_bool || matches!(self.ty, "bool" | "Option<bool>") {
+                if let Some(n) = number.as_f64().filter(|n| n.is_finite()) {
+                    if n == 0.0 {
+                        return Ok(Some("0".into()));
+                    }
+                    if n == 1.0 {
+                        return Ok(Some("1".into()));
+                    }
+                }
+                return parse_bool(&number.to_string())
+                    .map(|value| Some(if value { "1" } else { "0" }.into()));
+            }
+        }
         match (value, self.grammar.and_then(|g| g.count)) {
             (Value::Number(number), Some(count)) => count.domain.normalize(number).map(Some),
             _ => Ok(None),

@@ -1534,6 +1534,133 @@ fn fetch_wait_normalization_preserves_text_and_non_target_numeric_contracts() {
     );
 }
 
+/// Native numeric JSON bools share one ingress normalization; a string's
+/// lexical grammar, alias mapping and inverted/storage semantics stay intact.
+#[test]
+fn native_numeric_bools_share_all_json_ingress_without_widening_text() {
+    let accepted = [
+        ("0.0", false),
+        ("-0.0", false),
+        ("0e3", false),
+        ("-0e-3", false),
+        ("1.0", true),
+        ("1e0", true),
+        ("10e-1", true),
+    ];
+    let invalid = [
+        "-1",
+        "2",
+        "0.5",
+        "1.0000000000000002",
+        "0.9999999999999999",
+        "5e-324",
+        "1e308",
+    ];
+    let idx = index();
+    let mut keys = 0;
+    let mut inverted = 0;
+    let mut mapped = 0;
+    let mut optional = 0;
+    let mut native_writes = 0;
+    for key in idx.keys.values().filter(|key| key.compound.is_none()) {
+        let meta = key.meta();
+        if !(meta.is_bool || matches!(meta.ty, "bool" | "Option<bool>")) {
+            continue;
+        }
+        keys += 1;
+        inverted += usize::from(key.targets.iter().any(|leaf| leaf.meta.invert));
+        mapped += usize::from(!meta.values.is_empty());
+        optional += usize::from(
+            key.targets
+                .iter()
+                .any(|leaf| leaf.meta.ty == "Option<bool>"),
+        );
+        for (raw, want) in accepted {
+            let value: Value = serde_json::from_str(raw).unwrap();
+            let mut canonical = EngineOptions::default();
+            idx.merge(&mut canonical, &document(&key.path, value.clone()))
+                .unwrap();
+            for leaf in &key.targets {
+                assert_eq!(
+                    stored_bool(&canonical, &leaf.storage),
+                    Some(want ^ leaf.meta.invert),
+                    "{} {raw} {}",
+                    key.path,
+                    leaf.storage
+                );
+            }
+            for spelling in std::iter::once(key.path.clone()).chain(key.legacy_keys()) {
+                let mut actual = EngineOptions::default();
+                let mut reference = actual.clone();
+                idx.merge(&mut actual, &document(&spelling, value.clone()))
+                    .unwrap();
+                idx.merge(&mut reference, &document(&spelling, json!(want)))
+                    .unwrap();
+                assert_eq!(actual, reference, "{spelling} native {raw}");
+                native_writes += 1;
+            }
+            for leaf in &key.targets {
+                let mut actual = EngineOptions::default();
+                let mut reference = actual.clone();
+                actual
+                    .merge_json(&document(&leaf.storage, value.clone()))
+                    .unwrap();
+                reference
+                    .merge_json(&document(&leaf.storage, json!(want)))
+                    .unwrap();
+                assert_eq!(actual, reference, "{} derive {raw}", leaf.storage);
+                native_writes += 1;
+            }
+            let (group, rest) = key.path.split_once('.').unwrap();
+            let flag = format!("--{group}-config");
+            let native = document(rest, value.clone()).to_string();
+            let boolean = document(rest, json!(want)).to_string();
+            assert_eq!(
+                config(&[&flag, &native], &BTreeMap::new()).unwrap(),
+                config(&[&flag, &boolean], &BTreeMap::new()).unwrap(),
+                "{} final group {raw}",
+                key.path
+            );
+        }
+        for spelling in std::iter::once(key.path.clone()).chain(key.legacy_keys()) {
+            for raw in invalid.into_iter().chain(["\"0.0\"", "\"1.0\"", "\"1e0\""]) {
+                let value: Value = serde_json::from_str(raw).unwrap();
+                let mut actual = EngineOptions::default();
+                idx.set(&mut actual, "generation.max_tokens", "37").unwrap();
+                let prior = actual.clone();
+                assert!(
+                    idx.merge(&mut actual, &document(&spelling, value.clone()))
+                        .is_err(),
+                    "{spelling} refused {raw}"
+                );
+                assert_eq!(actual, prior, "{spelling} refusal changed state");
+            }
+        }
+        for leaf in &key.targets {
+            for raw in invalid.into_iter().chain(["\"0.0\"", "\"1.0\"", "\"1e0\""]) {
+                let value: Value = serde_json::from_str(raw).unwrap();
+                let mut actual = EngineOptions::default();
+                let prior = actual.clone();
+                assert!(
+                    actual.merge_json(&document(&leaf.storage, value)).is_err(),
+                    "{} derive refused {raw}",
+                    leaf.storage
+                );
+                assert_eq!(
+                    actual, prior,
+                    "{} derive refusal changed state",
+                    leaf.storage
+                );
+            }
+        }
+    }
+    for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        assert!(serde_json::Number::from_f64(value).is_none());
+    }
+    assert!(keys > 80 && inverted > 0 && mapped > 0 && optional > 0 && native_writes > 1000, "keys={keys} inverted={inverted} mapped={mapped} optional={optional} writes={native_writes}");
+    eprintln!("NATIVE_BOOL keys={keys} inverted={inverted} mapped={mapped} optional={optional} writes={native_writes}");
+}
+
 fn bool_wait_cases() -> Vec<Value> {
     serde_json::from_str(include_str!(
         "../../tests/fixtures/bool-wait-normalization.json"
@@ -1688,10 +1815,10 @@ fn bool_wait_alias_schema_is_finite_and_normalization_is_opt_in() {
         for row in bool_wait_cases() {
             if row.get("standard_accept").is_some() {
                 // serde_json enum equality in the limited helper is not
-                // mathematical JSON Schema equality. Keep this diagnostic
-                // separate for the independent standard validator.
+                // mathematical JSON Schema equality. Native numeric bools
+                // follow standard equality; the independent validator covers it.
                 assert_eq!(row["standard_accept"], true);
-                assert_eq!(row["accept"], false);
+                assert_eq!(row["accept"], true);
                 assert!(row["input"].is_f64());
                 assert!(!schema_valid(node, &row["input"], &schema["$defs"]));
             } else {

@@ -476,15 +476,17 @@
     "reset": true
   },
   {
-    "name": "native float diagnostic 0.0",
+    "name": "native float 0.0",
     "input": 0.0,
-    "accept": false,
-    "standard_accept": true
+    "accept": true,
+    "standard_accept": true,
+    "stored": false
   },
   {
-    "name": "native float diagnostic 1.0",
+    "name": "native float 1.0",
     "input": 1.0,
-    "accept": false,
-    "standard_accept": true
+    "accept": true,
+    "standard_accept": true,
+    "stored": true
   }
 ]

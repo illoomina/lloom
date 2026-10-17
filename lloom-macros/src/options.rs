@@ -794,15 +794,20 @@ pub(crate) fn derive(input: DeriveInput) -> TokenStream {
             };
             quote! { #key => { #by_string self.#ident.merge_json(v)?; } }
         } else {
-            let native = match &f.attr.grammar {
-                Some(grammar) => quote! {
-                    let meta = #krate::options::KnobMeta { grammar: Some(&#grammar), ..#krate::options::KnobMeta::BASE };
+            let native = if f.attr.grammar.is_some()
+                || f.attr.is_bool
+                || matches!(type_name(&f.ty).as_str(), "bool" | "Option<bool>")
+            {
+                quote! {
+                    let meta = Self::META.iter().find(|meta| meta.key == #key)
+                        .expect("the derive declares each field's metadata");
                     if let Some(value) = meta.native_number(v).map_err(|e| format!("{}: {}", #key, e))? {
                         self.set(#key, &value)?;
                         continue;
                     }
-                },
-                None => quote! {},
+                }
+            } else {
+                quote! {}
             };
             quote! {
                 #key => {

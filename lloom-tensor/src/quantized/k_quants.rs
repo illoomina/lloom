@@ -74,7 +74,15 @@ pub trait GgmlType: Sized + Clone + Send + Sync {
     fn vec_dot_unopt(n: usize, xs: &[Self], ys: &[Self::VecDotType]) -> f32;
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    zerocopy::IntoBytes,
+    zerocopy::Immutable,
+    zerocopy::FromBytes,
+    zerocopy::KnownLayout,
+)]
 #[repr(C)]
 pub struct BlockQ4_0 {
     pub(crate) d: f16,
@@ -82,7 +90,15 @@ pub struct BlockQ4_0 {
 }
 const _: () = assert!(std::mem::size_of::<BlockQ4_0>() == 18);
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    zerocopy::IntoBytes,
+    zerocopy::Immutable,
+    zerocopy::FromBytes,
+    zerocopy::KnownLayout,
+)]
 #[repr(C)]
 pub struct BlockQ4_1 {
     pub(crate) d: f16,
@@ -91,7 +107,15 @@ pub struct BlockQ4_1 {
 }
 const _: () = assert!(std::mem::size_of::<BlockQ4_1>() == 20);
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    zerocopy::IntoBytes,
+    zerocopy::Immutable,
+    zerocopy::FromBytes,
+    zerocopy::KnownLayout,
+)]
 #[repr(C)]
 pub struct BlockQ5_0 {
     pub(crate) d: f16,
@@ -100,7 +124,15 @@ pub struct BlockQ5_0 {
 }
 const _: () = assert!(std::mem::size_of::<BlockQ5_0>() == 22);
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    zerocopy::IntoBytes,
+    zerocopy::Immutable,
+    zerocopy::FromBytes,
+    zerocopy::KnownLayout,
+)]
 #[repr(C)]
 pub struct BlockQ5_1 {
     pub(crate) d: f16,
@@ -110,7 +142,15 @@ pub struct BlockQ5_1 {
 }
 const _: () = assert!(std::mem::size_of::<BlockQ5_1>() == 24);
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    zerocopy::IntoBytes,
+    zerocopy::Immutable,
+    zerocopy::FromBytes,
+    zerocopy::KnownLayout,
+)]
 #[repr(C)]
 pub struct BlockQ8_0 {
     pub(crate) d: f16,
@@ -118,7 +158,7 @@ pub struct BlockQ8_0 {
 }
 const _: () = assert!(std::mem::size_of::<BlockQ8_0>() == 34);
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, zerocopy::IntoBytes, zerocopy::Immutable)]
 #[repr(C)]
 pub struct BlockQ8_1 {
     pub(crate) d: f16,
@@ -127,7 +167,15 @@ pub struct BlockQ8_1 {
 }
 const _: () = assert!(std::mem::size_of::<BlockQ8_1>() == 36);
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    zerocopy::IntoBytes,
+    zerocopy::Immutable,
+    zerocopy::FromBytes,
+    zerocopy::KnownLayout,
+)]
 #[repr(C)]
 pub struct BlockQ2K {
     pub(crate) scales: [u8; QK_K / 16],
@@ -137,7 +185,15 @@ pub struct BlockQ2K {
 }
 const _: () = assert!(QK_K / 16 + QK_K / 4 + 2 * 2 == std::mem::size_of::<BlockQ2K>());
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    zerocopy::IntoBytes,
+    zerocopy::Immutable,
+    zerocopy::FromBytes,
+    zerocopy::KnownLayout,
+)]
 #[repr(C)]
 pub struct BlockQ3K {
     pub(crate) hmask: [u8; QK_K / 8],
@@ -147,7 +203,15 @@ pub struct BlockQ3K {
 }
 const _: () = assert!(QK_K / 8 + QK_K / 4 + 12 + 2 == std::mem::size_of::<BlockQ3K>());
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    zerocopy::IntoBytes,
+    zerocopy::Immutable,
+    zerocopy::FromBytes,
+    zerocopy::KnownLayout,
+)]
 // https://github.com/ggerganov/llama.cpp/blob/468ea24fb4633a0d681f7ac84089566c1c6190cb/k_quants.h#L82
 #[repr(C)]
 pub struct BlockQ4K {
@@ -158,7 +222,15 @@ pub struct BlockQ4K {
 }
 const _: () = assert!(QK_K / 2 + K_SCALE_SIZE + 2 * 2 == std::mem::size_of::<BlockQ4K>());
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    zerocopy::IntoBytes,
+    zerocopy::Immutable,
+    zerocopy::FromBytes,
+    zerocopy::KnownLayout,
+)]
 #[repr(C)]
 pub struct BlockQ5K {
     pub(crate) d: f16,
@@ -170,7 +242,15 @@ pub struct BlockQ5K {
 const _: () =
     assert!(QK_K / 8 + QK_K / 2 + 2 * 2 + K_SCALE_SIZE == std::mem::size_of::<BlockQ5K>());
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    zerocopy::IntoBytes,
+    zerocopy::Immutable,
+    zerocopy::FromBytes,
+    zerocopy::KnownLayout,
+)]
 #[repr(C)]
 pub struct BlockQ6K {
     pub(crate) ql: [u8; QK_K / 2],
@@ -180,7 +260,7 @@ pub struct BlockQ6K {
 }
 const _: () = assert!(3 * QK_K / 4 + QK_K / 16 + 2 == std::mem::size_of::<BlockQ6K>());
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, zerocopy::IntoBytes, zerocopy::Immutable)]
 #[repr(C)]
 pub struct BlockQ8K {
     pub(crate) d: f32,

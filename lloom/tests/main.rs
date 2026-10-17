@@ -8,7 +8,8 @@
 //! (`lloom_tensor::isolation`).
 //!
 //! Their own binaries, because a test binary carries at most one
-//! `#[global_allocator]`: `token_ring_nonblocking.rs`, `decode_step_census.rs`.
+//! `#[global_allocator]`: `token_ring_nonblocking.rs`, `decode_step_census.rs`,
+//! `qwen4exp_prefill_transient_cpu.rs`.
 //!
 //! `every_test_file_is_a_module` below reads this directory and this file,
 //! so a file that is not a module here fails the suite instead of silently
@@ -109,6 +110,7 @@ mod qwen4exp_pass_plan_openers;
 mod qwen4exp_pass_plan_requests;
 mod qwen4exp_pass_plans_warmup;
 mod qwen4exp_prefill_plan_variants;
+mod qwen4exp_prefill_transient;
 mod qwen4exp_provisional;
 mod qwen4exp_ring_provisional;
 mod qwen4exp_routed_dense_arm;
@@ -163,7 +165,11 @@ mod verify_window_gemm;
 /// files that owns its binary), read from the directory at test time.
 #[test]
 fn every_test_file_is_a_module() {
-    let own: &[&str] = &["token_ring_nonblocking", "decode_step_census"];
+    let own: &[&str] = &[
+        "token_ring_nonblocking",
+        "decode_step_census",
+        "qwen4exp_prefill_transient_cpu",
+    ];
     let dir = format!("{}/tests", lloom_manifest_dir());
     let me = include_str!("main.rs");
     let mut missing = Vec::new();

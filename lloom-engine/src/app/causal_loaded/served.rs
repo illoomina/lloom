@@ -264,6 +264,7 @@ pub fn load_lfm2_gguf<P: Predictor>(
                 policy,
                 device,
                 owner_decode,
+                None,
                 |resolved, tokenizer, policy| {
                     preflight(
                         FamilyFacts {
@@ -298,10 +299,50 @@ pub fn load_lfm2_gguf_unadmitted(
     ragged: bool,
     vision_missing: Option<&'static str>,
 ) -> Result<Engine<NoPrediction>> {
+    load_lfm2_gguf_unadmitted_with_runtime(
+        checkpoint,
+        mmproj,
+        tokenizer,
+        binding,
+        device,
+        machine,
+        decode,
+        config,
+        ragged,
+        vision_missing,
+        None,
+    )
+}
+
+/// Runtime options selected by a CLI load before model/cache construction.
+#[derive(Clone, Copy)]
+pub struct GgufRuntime {
+    pub context: usize,
+    pub kv_dtype: DType,
+}
+
+/// The same machine-admitted owner with explicit runtime context and storage
+/// precision. The compatibility entry point above retains its native defaults.
+#[allow(clippy::too_many_arguments)]
+pub fn load_lfm2_gguf_unadmitted_with_runtime(
+    checkpoint: &Path,
+    mmproj: Option<&Path>,
+    tokenizer: TokenizerSource<'_>,
+    binding: Option<BoundPolicy>,
+    device: &Device,
+    machine: lloom_tensor::machine::Admitted,
+    decode: DecodeConfig,
+    config: Config,
+    ragged: bool,
+    vision_missing: Option<&'static str>,
+    runtime: Option<GgufRuntime>,
+) -> Result<Engine<NoPrediction>> {
+    let kv_dtype = runtime.map_or(DType::F32, |r| r.kv_dtype);
     let serving = Serving {
         config,
         decode,
         capabilities: Capabilities {
+            kv_dtype: if kv_dtype == DType::F16 { "f16" } else { "f32" },
             vision: vision_missing.is_none(),
             vision_missing: vision_missing.unwrap_or(""),
             ..lfm2_gguf_capabilities()
@@ -329,6 +370,7 @@ pub fn load_lfm2_gguf_unadmitted(
                 policy,
                 device,
                 owner_decode,
+                runtime.map(|r| (r.context, r.kv_dtype)),
                 |resolved, tokenizer, policy| {
                     preflight(
                         FamilyFacts {
@@ -1051,7 +1093,7 @@ pub(crate) fn lfm2_gguf_capabilities() -> Capabilities {
         executor_arms: false,
         kv_quant: &[KvQuant::Off],
         kv_dtype: "f32",
-        kv_dense: &["f32"],
+        kv_dense: &["f32", "f16"],
         kv_quant_missing: "quantized GGUF weights do not install quantized KV stores",
         vision: false,
         vision_missing: NO_MMPROJ,

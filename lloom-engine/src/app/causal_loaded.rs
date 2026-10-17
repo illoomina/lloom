@@ -886,11 +886,13 @@ fn produce_lfm2_gguf(
         policy_source,
         device,
         decode,
+        None,
         |_, _, _| Ok(()),
     )
     .map(|(engine, ())| engine)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn produce_lfm2_gguf_with<T>(
     checkpoint: &Path,
     mmproj: Option<&Path>,
@@ -898,12 +900,18 @@ fn produce_lfm2_gguf_with<T>(
     policy_source: Option<CausalPolicySource>,
     device: &Device,
     decode: DecodeConfig,
+    runtime: Option<(usize, lloom_tensor::DType)>,
     preflight: impl FnOnce(
         &lloom::models::quantized_lfm2::Config,
         &Tokenizer,
         Option<&CausalPolicy>,
     ) -> Result<T>,
 ) -> Result<(CausalEngine<lloom::models::quantized_lfm2::Model>, T)> {
+    if runtime.is_some_and(|(_, dtype)| {
+        !matches!(dtype, lloom_tensor::DType::F32 | lloom_tensor::DType::F16)
+    }) {
+        lloom_tensor::bail!("quantized lfm2 KV storage requires f32 or f16")
+    }
     use lloom_tensor::quantized::gguf_file::Content;
     let mut file = std::fs::File::open(checkpoint)?;
     let content = Content::read(&mut file)?;
@@ -916,6 +924,10 @@ fn produce_lfm2_gguf_with<T>(
         lloom_tensor::bail!("causal LFM2 factory received {architecture}")
     }
     let plan = lloom::models::quantized_lfm2::Model::preflight_gguf_content(&content, &mut file)?;
+    let plan = match runtime {
+        Some((context, _)) => plan.with_context_limit(context)?,
+        None => plan,
+    };
     let config = plan.config();
     let capacity = config.context_length;
     let tokenizer = match tokenizer_path {
@@ -960,7 +972,9 @@ fn produce_lfm2_gguf_with<T>(
         lloom_tensor::bail!("tokenizer id is outside resolved GGUF vocabulary")
     }
     let prepared = preflight(&config, &tokenizer, policy.as_ref())?;
-    let model = plan.materialize(&mut file, device)?;
+    let model = plan
+        .materialize(&mut file, device)?
+        .with_kv_dtype(runtime.map_or(lloom_tensor::DType::F32, |(_, dtype)| dtype))?;
     let vision = mmproj
         .map(|path| MmprojVision::load(path, &tokenizer, config.hidden_size, device))
         .transpose()?;

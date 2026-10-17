@@ -298,6 +298,24 @@ pub struct CommandMarker {
     signalled: Option<u64>,
 }
 
+impl CommandMarker {
+    /// Whether the marker's buffer has completed (successfully or not).
+    pub fn is_complete(&self) -> bool {
+        self.cb.status().0 >= MTLCommandBufferStatus::Completed.0
+    }
+
+    /// Nonblocking known-error observation; false also includes pending work.
+    pub fn is_failed(&self) -> bool {
+        self.cb.status() == MTLCommandBufferStatus::Error
+    }
+
+    /// The buffer's GPU end time (`CLOCK_UPTIME_RAW` seconds), valid once
+    /// [`Self::is_complete`].
+    pub fn gpu_end_time(&self) -> f64 {
+        self.cb.gpu_end_time()
+    }
+}
+
 #[derive(Clone, Copy)]
 struct CommitReceipt {
     epoch: Epoch,
@@ -564,6 +582,25 @@ pub(super) struct CommandBufferFailure {
 enum CommandFailureMessage {
     Native(String),
     Host(&'static str),
+}
+
+/// A read-only observation of this queue's existing monotone failure latch.
+/// Holds only the existing AtomicBool/OnceLock error-message owner, never a
+/// Commands, native queue, completion adapter, subscriber, buffer or device.
+/// False means no failure has been published here yet, NOT successful work.
+#[derive(Clone)]
+pub struct CommandFailureObserver(Arc<CommandBufferFailure>);
+impl CommandFailureObserver {
+    pub fn has_failed(&self) -> bool {
+        self.0.failed.load(Ordering::Acquire)
+    }
+}
+impl std::fmt::Debug for CommandFailureObserver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CommandFailureObserver")
+            .field("has_failed", &self.has_failed())
+            .finish()
+    }
 }
 
 impl CommandBufferFailure {
@@ -1156,6 +1193,21 @@ impl Commands {
         } else {
             "metal3"
         }
+    }
+
+    /// The native command API actually installed on this queue.
+    /// This observes the resolved queue, not the requested tuning string.
+    pub fn actual_command_api(&self) -> &'static str {
+        if self.core.modern_queue.is_some() {
+            "metal4"
+        } else {
+            "metal3"
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn actual_command_api_for_test(&self) -> &'static str {
+        self.actual_command_api()
     }
 
     /// Install the executor that subsequent compute encoders will submit
@@ -1790,6 +1842,21 @@ impl Commands {
         marker.cb.status() == MTLCommandBufferStatus::Completed
     }
 
+    /// Dispatches encoded into the open buffer and not yet committed.
+    pub fn open_dispatches(&self) -> usize {
+        self.core.compute_count.load(Ordering::Acquire)
+    }
+
+    /// The last buffer committed and not yet pruned, as a marker; `None`
+    /// when every committed buffer has completed and been pruned.
+    pub fn last_committed_marker(&self) -> Result<Option<CommandMarker>, MetalKernelError> {
+        let state = self.lock_state()?;
+        Ok(state.in_flight.last().cloned().map(|cb| CommandMarker {
+            cb,
+            signalled: None,
+        }))
+    }
+
     /// Whether the marker's buffer ended in error.
     pub fn marker_failed(&self, marker: &CommandMarker) -> bool {
         marker.cb.status() == MTLCommandBufferStatus::Error
@@ -2387,6 +2454,11 @@ impl Commands {
         } else {
             Ok(())
         }
+    }
+
+    /// Cold read-only diagnostic handle; clones only the existing failure Arc.
+    pub fn failure_observer(&self) -> CommandFailureObserver {
+        CommandFailureObserver(Arc::clone(&self.core.failure))
     }
 
     /// The first command buffer of this queue that ended in error, if any.

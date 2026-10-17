@@ -1690,7 +1690,10 @@ fn stream_response(shared: &Shared, request: Request, run: StreamingRun) -> Resu
     };
     let written = sw.written();
     let (w, write_err) = sw.finish()?;
-    let decoded = decoded?;
+    let decoded = match decoded {
+        Ok(decoded) => decoded,
+        Err(error) => return finish_stream_error(w, error),
+    };
     // The accepted history is what the server handed the writer; of that,
     // what it knows it wrote, and whether a write failed (what the client
     // received is not known either way).
@@ -1758,10 +1761,27 @@ fn write_stream_trailer(
     last: &mut Value,
     prepare: impl FnOnce(&mut Value) -> Result<()>,
 ) -> Result<()> {
-    prepare(last)?;
+    if let Err(error) = prepare(last) {
+        return finish_stream_error(w, error);
+    }
     w.event(last)?;
     w.raw("data: [DONE]\n\n")?;
     w.finish()
+}
+
+/// Headers are already on the wire: report a failed run as an error event,
+/// never a success trailer or [DONE], then terminate the chunked body. Keep
+/// the original failure even if the disconnected transport cannot carry it.
+fn finish_stream_error(mut w: ChunkedWriter, error: anyhow::Error) -> Result<()> {
+    let message = error.to_string();
+    let transport = (|| -> Result<()> {
+        w.event(&json!({"error": {"message": message, "type": "server_error"}}))?;
+        w.finish()
+    })();
+    match transport {
+        Ok(()) => Err(error),
+        Err(transport) => Err(error.context(format!("finishing failed stream: {transport:#}"))),
+    }
 }
 
 // ---- the pipette sidecar contract -------------------------------------------
@@ -2914,6 +2934,9 @@ fn health_body(engine: &dyn Served, front: &Front) -> Result<Value> {
     body["template_renders"] = json!(engine.template_renders());
     body["tokenizations"] = json!(front.tokenizations());
     body["session_log"] = json!(front.logged());
+    // The history policy as resolved for this template: past reasoning kept
+    // unless stripped on request, an unfinished reply's rendering.
+    body["session"] = front.session_json();
     body["logprobs"] = logprobs_capability(engine);
     body["chat_template_reads"] = ENGINE_KWARGS
         .iter()
@@ -4001,15 +4024,153 @@ mod checked_trailer_tests {
         })
         .unwrap_err();
         assert_eq!(error.to_string(), "bounded metadata vision refusal");
-        assert_eq!(
-            *mem.0.lock(),
-            before,
-            "refused metadata wrote a success event or [DONE]"
+        let bytes = mem.0.lock().clone();
+        assert!(bytes.starts_with(&before), "prior fragments changed");
+        let tail = String::from_utf8_lossy(&bytes[before.len()..]);
+        assert!(!tail.contains("[DONE]"), "error masquerades as success");
+        assert!(
+            !tail.contains("finish_reason"),
+            "error wrote success metadata"
         );
+        assert!(tail.contains("error"), "error not delivered to the client");
+        assert!(tail.ends_with("0\r\n\r\n"), "error left chunked body open");
         assert!(
             last.get("vision").is_none(),
             "refusal fabricated vision metadata"
         );
+    }
+
+    #[test]
+    fn post_header_error_has_bounded_socket_eof_and_no_success_done() {
+        use std::io::Read;
+        use std::net::{TcpListener, TcpStream};
+        use std::time::Duration;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let (server, _) = listener.accept().unwrap();
+        let worker = std::thread::spawn(move || {
+            let writer = ChunkedWriter {
+                w: Box::new(server),
+            };
+            let mut success = serde_json::json!({"finish_reason":"stop"});
+            write_stream_trailer(writer, &mut success, |_| {
+                anyhow::bail!("socket test refusal")
+            })
+            .unwrap_err()
+            .to_string()
+        });
+        let mut bytes = Vec::new();
+        client
+            .read_to_end(&mut bytes)
+            .expect("failed stream must reach EOF, not time out");
+        assert_eq!(worker.join().unwrap(), "socket test refusal");
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(
+            text.contains("socket test refusal"),
+            "missing error event: {text}"
+        );
+        assert!(!text.contains("finish_reason") && !text.contains("[DONE]"));
+        assert!(
+            text.ends_with("0\r\n\r\n"),
+            "missing HTTP body terminator: {text}"
+        );
+    }
+
+    /// Exercise the actual post-header decode-error branch, not only the
+    /// trailer helper. Keep the server alive while the client awaits the
+    /// HTTP chunk terminator so dropping the fixture cannot fake completion.
+    #[test]
+    fn failed_decode_after_role_chunk_terminates_the_actual_stream_response() {
+        use super::*;
+        use std::io::{Read, Write};
+        use std::net::TcpStream;
+        use std::time::Duration;
+        let server = Server::http("127.0.0.1:0").unwrap();
+        let tiny_http::ListenAddr::IP(address) = server.server_addr() else {
+            panic!("IP server")
+        };
+        let mut client = TcpStream::connect(address).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        client.write_all(b"POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n").unwrap();
+        let request = server
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+        let engine = Box::new(NoVision::new(None));
+        let front = Front::new(engine.as_ref(), Default::default());
+        let shared = Shared {
+            engine,
+            decisions: super::super::decisions::Decisions::Refused("test".into()),
+            turns: turns::Turns::default(),
+            decision_pack: false,
+            aborts: std::sync::Mutex::new(HashSet::new()),
+            abort_epoch: AtomicU64::new(0),
+            server,
+            model_name: "stub".into(),
+            sampling: Default::default(),
+            front,
+            reuse: parking_lot::Mutex::new(Default::default()),
+        };
+        let run = StreamingRun {
+            kind: StreamKind::Chat,
+            prompt_ids: vec![1],
+            facts: Default::default(),
+            // The fixture refuses image decode at the real Served seam,
+            // after stream_response has written its role/header chunk.
+            images: vec![DecodedImage {
+                height: 1,
+                width: 1,
+                rgb: vec![0; 3],
+                key: [0; 32],
+            }],
+            params: DecodeParams::default(),
+            id: "failure".into(),
+            model: "stub".into(),
+            record: None,
+            return_ids: false,
+        };
+        let (release, hold) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let error = stream_response(&shared, request, run)
+                .unwrap_err()
+                .to_string();
+            let _ = hold.recv_timeout(Duration::from_secs(5));
+            error
+        });
+        let mut wire = Vec::new();
+        let mut byte = [0u8; 1];
+        while !wire.ends_with(b"0\r\n\r\n") && wire.len() < 16 * 1024 {
+            match client.read(&mut byte) {
+                Ok(0) => break,
+                Ok(_) => wire.push(byte[0]),
+                Err(e) => panic!(
+                    "stream did not terminate while server stayed alive: {e}; {:?}",
+                    String::from_utf8_lossy(&wire)
+                ),
+            }
+        }
+        release.send(()).unwrap();
+        let error = worker.join().unwrap();
+        let text = String::from_utf8(wire).unwrap();
+        assert!(error.contains("does not take image input"), "{error}");
+        assert!(
+            text.contains("\"role\":\"assistant\""),
+            "missing initial role: {text}"
+        );
+        assert!(
+            text.contains("does not take image input"),
+            "missing decode error: {text}"
+        );
+        assert!(
+            text.ends_with("0\r\n\r\n"),
+            "missing HTTP terminator: {text}"
+        );
+        assert!(!text.contains("[DONE]") && !text.contains("\"finish_reason\":\"stop\""));
     }
 
     #[test]

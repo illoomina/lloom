@@ -22,6 +22,7 @@ pub mod ple;
 pub mod qsa;
 pub mod schema;
 pub mod testing;
+pub mod transient;
 
 pub use config::{Config, ConfigArgs, LayerKind};
 pub use deltanet::{decode_step, DeltaNetDims};
@@ -35,12 +36,13 @@ pub use loader::{
 pub use model::{
     prefill_chunk, prefill_pair_on, prefill_tiles, set_prefill_chunk, set_prefill_pair,
     set_prefill_tiles, Layer, MemCheck, Mixer, PassPlan, Qwen4Exp, Shape, State, StatePools,
-    DEFAULT_PREFILL_PAIR, DEFAULT_PREFILL_TILES, PREFILL_CHUNK, PREFILL_TRANSIENT_BYTES_PER_TOKEN,
+    DEFAULT_PREFILL_PAIR, DEFAULT_PREFILL_TILES, PREFILL_CHUNK,
 };
 pub use moe::{ExpertResidency, MoeGeometry, MoeLayer, Resident, Streamed};
 pub use mtp::{GenerationProbe, MtpDrafter, MtpHead, MtpLanes};
 pub use ple::{CachedPleTable, MmapPleTable, NgramHash, NgramWindow, PleLayer, PleTable};
 pub use qsa::{AttnGeometry, Indexer, KvCache, KvPool, QsaAttention};
+pub use transient::{Lifetime, PrefillTransient, Route};
 
 /// Sub-block activation trace, for bisecting a non-finite forward on the real
 /// model. Off unless `QWEN4EXP_TRACE` is set (read once); when on, each

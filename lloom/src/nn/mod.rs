@@ -69,6 +69,7 @@ pub mod signal;
 pub mod slab;
 pub mod slot_cache;
 pub mod speculator;
+pub mod terminal_trace;
 pub mod turn_checkpoint;
 pub mod var_builder;
 pub mod var_map;
@@ -119,9 +120,10 @@ pub use recurrent::{PoolLayer, RecurrentState, StatePool};
 pub use rnn::{gru, lstm, GRUConfig, LSTMConfig, GRU, LSTM, RNN};
 pub use sequential::{seq, Sequential};
 pub use speculator::{
-    Anchor, Draft, DraftTokens, KvSource, LayerTaps, NextnHidden, NoProbe, ObserveRow, PhaseCensus,
-    Prepared, ProbeHooks, Probes, ReuseAction, RoundProbe, RoundTiming, SeqId, Sequence, Session,
-    Speculator, TapSide, TapSpec, TargetProbe, VerifyRowRef,
+    Acceptance, Anchor, DivergenceBy, Draft, DraftTokens, KvSource, LayerTaps, NextnHidden,
+    NoProbe, ObserveRow, OverrunBy, PhaseCensus, PreparePath, Prepared, ProbeHooks, Probes,
+    ReuseAction, RoundProbe, RoundTiming, SeqId, Sequence, Session, Speculator, TapSide, TapSpec,
+    TargetProbe, VerifyRowRef,
 };
 pub use turn_checkpoint::CheckpointPolicy;
 pub use var_builder::VarBuilder;

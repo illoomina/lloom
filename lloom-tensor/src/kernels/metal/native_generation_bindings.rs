@@ -1424,8 +1424,12 @@ mod inventory_controls {
             // This is not native entry or a second owner submission capability.
             head.stage_epoch(epoch).unwrap();
             assert_eq!(clock.current_epoch().0, 1);
+            drop(prepared);
+            assert!(matches!(
+                head.head.captures().witness.captures().cutoff(),
+                Some(Cutoff::NeverSubmitted)
+            ));
         }));
-        drop(prepared);
         drop(head);
         drain(&service);
         drop(bank);

@@ -1060,6 +1060,81 @@ pub struct Prepared {
     /// [`ReuseAction::Resume`], which `decode` accepts as "continue from the
     /// held logits".
     pub suffix: Vec<u32>,
+    /// The path [`Session::prepare`] took to get there: what it found on
+    /// entry and how it dealt with it. One authoritative outcome, so a
+    /// report reads it rather than re-deriving `prepare`'s predicates.
+    pub path: PreparePath,
+}
+
+/// What [`Session::accept`] did with the ids past the accepted boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Acceptance {
+    /// The log was the boundary: nothing to take back.
+    Whole,
+    /// The ids past the boundary were taken back exactly (the rewind
+    /// horizon), the run's overrun with them: the state is the boundary's.
+    Exact { dropped: usize },
+    /// The state is `ahead` positions past the boundary and no horizon takes
+    /// them back: the log ends at the boundary, and the next
+    /// [`Session::prepare`] restores the checkpoint at `restore_point` and
+    /// replays from it, or resets where there is none.
+    Obligation {
+        ahead: usize,
+        restore_point: Option<usize>,
+    },
+}
+
+/// What [`Session::prepare`] found and did (`sequence-reuse-design.md`
+/// §2.3f's events: the accepted boundary, the overrun past it, how the state
+/// was made ready, where the request diverged).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PreparePath {
+    /// The log's length on entry: the previous run's boundary as the log
+    /// holds it (every id it produced).
+    pub boundary: usize,
+    /// Positions the state was past the log on entry.
+    pub overrun: usize,
+    /// How that overrun was taken back.
+    pub overrun_by: OverrunBy,
+    /// Where the request left the log, when it did before the log's end.
+    pub diverged_at: Option<usize>,
+    /// How the state was brought back to what the request keeps.
+    pub divergence_by: DivergenceBy,
+}
+
+/// How [`Session::prepare`] took an overrun back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OverrunBy {
+    /// There was none.
+    #[default]
+    None,
+    /// The rewind horizon (the standing window) undid it.
+    Window,
+    /// The gated forwards wrote nothing; their counters were moved back
+    /// (`CacheRewind::rewind_unwritten`).
+    Gate,
+    /// The state was restored to the turn checkpoint at this position.
+    Checkpoint(usize),
+    /// Nothing could; the sequence was reset.
+    Reset,
+}
+
+/// How [`Session::prepare`] brought the state back to the prefix the
+/// request keeps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DivergenceBy {
+    /// Nothing to take back: the request extends (or resumes from) the log.
+    #[default]
+    None,
+    /// The rewind horizon took back these positions.
+    Window(usize),
+    /// The state was restored to the turn checkpoint at this position.
+    Checkpoint(usize),
+    /// The sequence was reset (no overlap, an opaque cache, or no reach).
+    Reset,
+    /// After a reset, another row's pages supplied this many positions
+    /// (`Session::prepare_shared`).
+    Shared(usize),
 }
 
 /// A target holding its own cache, driving speculative rounds. The typed pair
@@ -1072,6 +1147,7 @@ pub struct Prepared {
 /// session pins no weights alive beyond the round it drives. The cache, the
 /// token log and the position travel together as a [`Sequence`].
 pub struct Session<'m, M: CausalLM> {
+    pub(crate) terminal_prepare: crate::nn::terminal_trace::PreparedTrace,
     pub(crate) model: &'m M,
     pub(crate) seq: Sequence<M::Cache>,
     /// The in-flight depth measured at warmup (`0` until `warmup` runs) — the
@@ -1092,6 +1168,7 @@ impl<'m, M: CausalLM> Session<'m, M> {
             seq: Sequence::new(cache),
             warm_in_flight_depth: 0,
             warm_balance_ns: (0, 0),
+            terminal_prepare: Default::default(),
         }
     }
 
@@ -1108,6 +1185,7 @@ impl<'m, M: CausalLM> Session<'m, M> {
             seq,
             warm_in_flight_depth: 0,
             warm_balance_ns: (0, 0),
+            terminal_prepare: Default::default(),
         }
     }
 
@@ -1118,6 +1196,7 @@ impl<'m, M: CausalLM> Session<'m, M> {
             seq,
             warm_in_flight_depth: 0,
             warm_balance_ns: (0, 0),
+            terminal_prepare: Default::default(),
         }
     }
 
@@ -1188,6 +1267,76 @@ impl<'m, M: CausalLM> Session<'m, M> {
         Ok(n)
     }
 
+    /// Reconcile the sequence to an accepted conversational boundary
+    /// (`sequence-reuse-design.md` §2.3f, decision 42): the log keeps its
+    /// first `keep` ids, the ones a front end accepted as history (a stop
+    /// string or a cancellation can leave ids past them). The state is taken
+    /// back exactly where it can be: the run's overrun first (the window, or
+    /// the gate's counters), then the ids past the boundary through the
+    /// rewind horizon. Where it cannot, the state stays ahead and that is
+    /// kept as an explicit obligation: the log ends at the boundary, the
+    /// positions ahead are an overrun no horizon reaches, and the next
+    /// [`Self::prepare`] restores the latest checkpoint at or before the
+    /// boundary and replays, or resets. A host stop is not seen by the
+    /// device: the forwards past the boundary wrote the state, so only a
+    /// window or a checkpoint recovers it; nothing here relabels that
+    /// replay as exact. Known unusable state and errors from an attempted
+    /// reconciliation/rewind are returned without accepting a new boundary;
+    /// only a proven past-horizon refusal retains the deferred obligation.
+    /// A default validity check is not an all-family retry-safety guarantee:
+    /// operational errors still require the family's explicit recovery.
+    pub fn accept(&mut self, keep: usize) -> Result<Acceptance>
+    where
+        M::Cache: CacheRewind,
+    {
+        let log = self.seq.tokens.len();
+        if keep > log {
+            lloom_tensor::bail!("Session::accept: a boundary of {keep} past the log's {log} ids");
+        }
+        self.seq.cache.check_acceptance_state()?;
+        let past = log - keep;
+        if past == 0 {
+            return Ok(Acceptance::Whole);
+        }
+        let reconciled = if self.seq.overrun == 0 {
+            true
+        } else if !self.seq.overrun_unwritten && self.seq.overrun > self.seq.cache.rewind_horizon()
+        {
+            // The trait certifies this refusal before mutation; retain the
+            // existing deferred obligation without attempting that rewind.
+            false
+        } else {
+            // An attempted rewind can fail after partial state mutation. It
+            // is an operational error, not evidence of a harmless refusal.
+            self.reconcile()?;
+            true
+        };
+        if reconciled && past <= self.seq.cache.rewind_horizon() {
+            self.seq.cache.rewind(past)?;
+            self.seq.pos -= past;
+            self.seq.tokens.truncate(keep);
+            self.seq.last_logits = None;
+            return Ok(Acceptance::Exact { dropped: past });
+        }
+        // The state stays ahead of the boundary, by every position it holds
+        // past it, written: the next `prepare` cannot reconcile that and
+        // restores or resets.
+        let ahead = self.seq.overrun + past;
+        self.seq.tokens.truncate(keep);
+        self.seq.overrun = ahead;
+        self.seq.overrun_unwritten = false;
+        self.seq.last_logits = None;
+        let restore_point = self
+            .seq
+            .tokens_known
+            .then(|| self.seq.cache.restore_point(keep))
+            .flatten();
+        Ok(Acceptance::Obligation {
+            ahead,
+            restore_point,
+        })
+    }
+
     /// Whether the pending overrun's forwards launched nothing on the device
     /// (lloom #735's EOS gate), so [`Self::reconcile`] needs no rewind
     /// horizon.
@@ -1249,6 +1398,10 @@ impl<'m, M: CausalLM> Session<'m, M> {
             action: ReuseAction::Shared(shared),
             reused: shared,
             suffix: full[shared..].to_vec(),
+            path: PreparePath {
+                divergence_by: DivergenceBy::Shared(shared),
+                ..prepared.path
+            },
         })
     }
 
@@ -1285,6 +1438,19 @@ impl<'m, M: CausalLM> Session<'m, M> {
     where
         M::Cache: CacheRewind + CacheReset,
     {
+        self.terminal_prepare = Default::default();
+        let t0 = crate::nn::terminal_trace::prepare_begin();
+        let prepared = self.prepare_inner(full, resume);
+        if let Ok(p) = &prepared {
+            self.terminal_prepare = crate::nn::terminal_trace::prepare_end(t0, &p.action);
+        }
+        prepared
+    }
+
+    fn prepare_inner(&mut self, full: &[u32], resume: bool) -> Result<Prepared>
+    where
+        M::Cache: CacheRewind + CacheReset,
+    {
         if full.is_empty() {
             lloom_tensor::bail!("Session::prepare: empty sequence");
         }
@@ -1293,28 +1459,52 @@ impl<'m, M: CausalLM> Session<'m, M> {
         // back at the latest turn checkpoint inside the log, or reset when
         // there is none. The ids the restore drops are counted as rewound.
         let mut dropped = 0;
-        if self.seq.overrun > 0 && self.reconcile().is_err() {
-            let log = self.seq.tokens.len();
-            match self
-                .seq
-                .cache
-                .restore_point(log)
-                .filter(|_| self.seq.tokens_known)
-            {
-                Some(at) => {
-                    self.seq.cache.restore(at)?;
-                    self.seq.pos = at;
-                    self.seq.tokens.truncate(at);
-                    self.seq.overrun = 0;
-                    self.seq.overrun_unwritten = false;
-                    self.seq.last_logits = None;
-                    dropped = log - at;
+        // Where the request leaves the log as it stands on entry, before an
+        // overrun's recovery moves it.
+        let entry_lcp = self.seq.common_prefix(full);
+        let mut path = PreparePath {
+            boundary: self.seq.tokens.len(),
+            overrun: self.seq.overrun,
+            diverged_at: (self.seq.tokens_known && entry_lcp < self.seq.tokens.len())
+                .then_some(entry_lcp),
+            ..PreparePath::default()
+        };
+        if self.seq.overrun > 0 {
+            let unwritten = self.seq.overrun_unwritten;
+            if self.reconcile().is_ok() {
+                path.overrun_by = if unwritten {
+                    OverrunBy::Gate
+                } else {
+                    OverrunBy::Window
+                };
+            } else {
+                let log = self.seq.tokens.len();
+                match self
+                    .seq
+                    .cache
+                    .restore_point(log)
+                    .filter(|_| self.seq.tokens_known)
+                {
+                    Some(at) => {
+                        self.seq.cache.restore(at)?;
+                        self.seq.pos = at;
+                        self.seq.tokens.truncate(at);
+                        self.seq.overrun = 0;
+                        self.seq.overrun_unwritten = false;
+                        self.seq.last_logits = None;
+                        dropped = log - at;
+                        path.overrun_by = OverrunBy::Checkpoint(at);
+                    }
+                    None => {
+                        self.reset();
+                        path.overrun_by = OverrunBy::Reset;
+                    }
                 }
-                None => self.reset(),
             }
         }
         if !self.seq.tokens_known {
             self.reset();
+            path.divergence_by = DivergenceBy::Reset;
         }
         let cached = self.seq.tokens.len();
         if cached == 0 {
@@ -1322,6 +1512,7 @@ impl<'m, M: CausalLM> Session<'m, M> {
                 action: ReuseAction::Fresh,
                 reused: 0,
                 suffix: full.to_vec(),
+                path,
             });
         }
         let lcp = self.seq.common_prefix(full);
@@ -1331,6 +1522,7 @@ impl<'m, M: CausalLM> Session<'m, M> {
                 action: ReuseAction::Resume,
                 reused: lcp,
                 suffix: Vec::new(),
+                path,
             });
         }
         // Everything cached: the last token must be re-fed for its prediction.
@@ -1343,6 +1535,7 @@ impl<'m, M: CausalLM> Session<'m, M> {
             self.seq.pos -= drop;
             self.seq.tokens.truncate(keep);
             self.seq.last_logits = None;
+            path.divergence_by = DivergenceBy::Window(drop);
             ReuseAction::Rewound(drop)
         } else if let Some(at) = self.seq.cache.restore_point(keep) {
             // Past the horizon but within a turn checkpoint's reach: the
@@ -1353,9 +1546,11 @@ impl<'m, M: CausalLM> Session<'m, M> {
             self.seq.pos = keep;
             self.seq.tokens.truncate(keep);
             self.seq.last_logits = None;
+            path.divergence_by = DivergenceBy::Checkpoint(at);
             ReuseAction::Rewound(cached - keep)
         } else {
             self.reset();
+            path.divergence_by = DivergenceBy::Reset;
             ReuseAction::Fresh
         };
         let action = match action {
@@ -1371,6 +1566,7 @@ impl<'m, M: CausalLM> Session<'m, M> {
             action,
             reused,
             suffix: full[reused..].to_vec(),
+            path,
         })
     }
 
@@ -1443,7 +1639,9 @@ impl<'m, M: CausalLM> Session<'m, M> {
     /// [`Self::speculative_round`] with the VERIFY phase bracketed as a
     /// planned pass of `verify_key`'s shape (`DESIGN.md` §9.2aa), and every
     /// draft fitted to `room`, the tokens the run may still publish
-    /// ([`fit_to_room`]; `usize::MAX` for no bound).
+    /// ([`fit_to_room`]; `usize::MAX` for no bound). Sampled auxiliary state
+    /// counts at most `room` predictions; the complete accepted prefix still
+    /// resolves the target, keys the drafter and is returned to the caller.
     ///
     /// Only the verify is bracketed. The draft and the observe run on the
     /// DRAFTER's model and its own caches — a different allocation sequence
@@ -1535,12 +1733,12 @@ impl<'m, M: CausalLM> Session<'m, M> {
                 crate::nn::decode::end_pass(device)?;
             }
             let (accepted, probe_out) = verified?;
-            // What the round kept is the run's output: the processors' history,
-            // a budget's position and the digest move by it, as a step-by-step
-            // decode's do by its draws — after the planned pass, never inside it.
+            // A minimum-width verify can accept a bonus outside the output room.
+            // Auxiliary history counts only publishable predictions (including an
+            // EOS in room); cache resolution and observe still need the full accept.
             if let Some(s) = sampler {
                 for a in &accepted {
-                    s.commit_window(a)?;
+                    s.commit_window(&a[..a.len().min(room)])?;
                 }
             }
             let (gpu, disp, census) = probe.close()?;

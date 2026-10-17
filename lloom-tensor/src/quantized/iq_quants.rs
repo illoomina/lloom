@@ -75,7 +75,15 @@ fn unimpl_vec_dot(dtype: GgmlDType) -> ! {
 // ---------------------------------------------------------------------------
 
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    zerocopy::IntoBytes,
+    zerocopy::Immutable,
+    zerocopy::FromBytes,
+    zerocopy::KnownLayout,
+)]
 pub struct BlockQ2_0 {
     pub d: f16,
     pub qs: [u8; QK2_0 / 4],
@@ -115,7 +123,15 @@ impl GgmlType for BlockQ2_0 {
 // ---------------------------------------------------------------------------
 
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    zerocopy::IntoBytes,
+    zerocopy::Immutable,
+    zerocopy::FromBytes,
+    zerocopy::KnownLayout,
+)]
 pub struct BlockIQ2xxs {
     pub d: f16,
     pub qs: [u16; QK_K / 8],
@@ -164,7 +180,15 @@ impl GgmlType for BlockIQ2xxs {
 // ---------------------------------------------------------------------------
 
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    zerocopy::IntoBytes,
+    zerocopy::Immutable,
+    zerocopy::FromBytes,
+    zerocopy::KnownLayout,
+)]
 pub struct BlockIQ2xs {
     pub d: f16,
     pub qs: [u16; QK_K / 8],
@@ -214,7 +238,15 @@ impl GgmlType for BlockIQ2xs {
 // ---------------------------------------------------------------------------
 
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    zerocopy::IntoBytes,
+    zerocopy::Immutable,
+    zerocopy::FromBytes,
+    zerocopy::KnownLayout,
+)]
 pub struct BlockIQ2s {
     pub d: f16,
     pub qs: [u8; QK_K / 4],
@@ -271,7 +303,15 @@ impl GgmlType for BlockIQ2s {
 // ---------------------------------------------------------------------------
 
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    zerocopy::IntoBytes,
+    zerocopy::Immutable,
+    zerocopy::FromBytes,
+    zerocopy::KnownLayout,
+)]
 pub struct BlockIQ3xxs {
     pub d: f16,
     pub qs: [u8; 3 * QK_K / 8],
@@ -329,7 +369,15 @@ impl GgmlType for BlockIQ3xxs {
 const IQ3S_N_SCALE: usize = QK_K / 64;
 
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    zerocopy::IntoBytes,
+    zerocopy::Immutable,
+    zerocopy::FromBytes,
+    zerocopy::KnownLayout,
+)]
 pub struct BlockIQ3s {
     pub d: f16,
     pub qs: [u8; QK_K / 4],
@@ -411,7 +459,15 @@ impl GgmlType for BlockIQ3s {
 // ---------------------------------------------------------------------------
 
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    zerocopy::IntoBytes,
+    zerocopy::Immutable,
+    zerocopy::FromBytes,
+    zerocopy::KnownLayout,
+)]
 pub struct BlockIQ4nl {
     pub d: f16,
     pub qs: [u8; QK4_NL / 2],
@@ -449,7 +505,15 @@ impl GgmlType for BlockIQ4nl {
 // ---------------------------------------------------------------------------
 
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    zerocopy::IntoBytes,
+    zerocopy::Immutable,
+    zerocopy::FromBytes,
+    zerocopy::KnownLayout,
+)]
 pub struct BlockIQ4xs {
     pub d: f16,
     pub scales_h: u16,

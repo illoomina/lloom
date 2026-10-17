@@ -27,6 +27,17 @@ fn gb(b: u64) -> f64 {
     b as f64 / 1e9
 }
 
+/// Bytes as `1536000000 B (1.54 GB)`: exact for the arithmetic, rounded for
+/// the eye. A boundary refusal is decided on bytes, and two figures that
+/// round alike can still differ by them.
+fn bytes_gb(b: u64) -> String {
+    format!("{b} B ({:.2} GB)", gb(b))
+}
+
+fn signed_bytes_gb(b: i128) -> String {
+    format!("{b} B ({:.2} GB)", b as f64 / 1e9)
+}
+
 /// The host's memory at one instant, in bytes.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct HostMemory {
@@ -35,6 +46,148 @@ pub struct HostMemory {
     pub inactive: u64,
     pub purgeable: u64,
     pub speculative: u64,
+    /// The memory controller's limit on this process's control group, when
+    /// one binds below the host (Linux): a container's `--memory`. The
+    /// host's terms above say nothing about it.
+    pub container: Option<ContainerMemory>,
+}
+
+/// A control group's memory limit and what the group holds against it.
+/// Past the limit the kernel reclaims the group's pages and then kills one
+/// of its processes, whatever the host has free.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ContainerMemory {
+    /// `memory.max` (v2) or `memory.limit_in_bytes` (v1).
+    pub limit: u64,
+    /// `memory.current` (v2) or `memory.usage_in_bytes` (v1): every page the
+    /// group is charged for, its page cache included.
+    pub usage: u64,
+    /// The group's inactive file pages (`memory.stat`): cache the kernel
+    /// reclaims before it fails a charge.
+    pub reclaimable: u64,
+}
+
+impl ContainerMemory {
+    /// What the group can still be charged without reclaiming more than its
+    /// inactive cache: `limit − (usage − reclaimable)`.
+    pub fn available(&self) -> u64 {
+        self.limit
+            .saturating_sub(self.usage.saturating_sub(self.reclaimable))
+    }
+
+    /// The reserve kept inside the group for its other processes' growth:
+    /// a tenth of its limit. The host's 4 GiB floor protects the OS and the
+    /// UI, which live outside the group and are the host bound's concern.
+    pub fn reserve(&self) -> u64 {
+        self.limit / 10
+    }
+
+    /// The signed room left after this group's own reserve. Ancestors must
+    /// be compared on this term: a larger limit also keeps a larger reserve.
+    fn room(&self) -> i128 {
+        self.available() as i128 - self.reserve() as i128
+    }
+
+    fn describe(&self) -> String {
+        format!(
+            "limit {:.2} - (usage {:.2} - inactive file {:.2})",
+            gb(self.limit),
+            gb(self.usage),
+            gb(self.reclaimable)
+        )
+    }
+}
+
+/// Where this process's memory controller lives, from `/proc/self/cgroup`.
+#[cfg(any(target_os = "linux", test))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum CgroupPath {
+    /// The unified hierarchy: `0::<path>`.
+    V2(String),
+    /// The v1 `memory` controller: `<id>:<...,memory,...>:<path>`.
+    V1(String),
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn parse_proc_cgroup(text: &str) -> Option<CgroupPath> {
+    let mut v2 = None;
+    for line in text.lines() {
+        let mut parts = line.splitn(3, ':');
+        let (Some(id), Some(controllers), Some(path)) = (parts.next(), parts.next(), parts.next())
+        else {
+            continue;
+        };
+        if controllers.split(',').any(|c| c == "memory") {
+            return Some(CgroupPath::V1(path.to_string()));
+        }
+        if id == "0" && controllers.is_empty() {
+            v2 = Some(CgroupPath::V2(path.to_string()));
+        }
+    }
+    v2
+}
+
+/// The tightest post-reserve room over this process's control group and its
+/// ancestors, as `read` sees the files: `None` when no level sets one, or
+/// when every limit is at or above the host's `total` (it binds nothing the
+/// host bound does not). The walk stops at the mount: inside a container's
+/// cgroup namespace its own group is the mount's root.
+#[cfg(any(target_os = "linux", test))]
+fn container_memory_from(
+    proc_cgroup: &str,
+    total: u64,
+    read: impl Fn(&Path) -> Option<String>,
+) -> Option<ContainerMemory> {
+    let num = |p: &Path| read(p).and_then(|s| s.trim().parse::<u64>().ok());
+    let stat = |p: &Path, keys: &[&str]| {
+        let text = read(p)?;
+        keys.iter().find_map(|k| {
+            text.lines().find_map(|l| {
+                let (name, v) = l.split_once(' ')?;
+                (name == *k).then(|| v.trim().parse::<u64>().ok()).flatten()
+            })
+        })
+    };
+    let (mount, rel, v2) = match parse_proc_cgroup(proc_cgroup)? {
+        CgroupPath::V2(p) => (PathBuf::from("/sys/fs/cgroup"), p, true),
+        CgroupPath::V1(p) => (PathBuf::from("/sys/fs/cgroup/memory"), p, false),
+    };
+    let (limit_f, usage_f, stat_keys): (&str, &str, &[&str]) = if v2 {
+        ("memory.max", "memory.current", &["inactive_file"])
+    } else {
+        (
+            "memory.limit_in_bytes",
+            "memory.usage_in_bytes",
+            &["total_inactive_file", "inactive_file"],
+        )
+    };
+    let mut dirs = Vec::new();
+    let mut dir = mount.join(rel.trim_start_matches('/'));
+    while dir.starts_with(&mount) {
+        dirs.push(dir.clone());
+        if dir == mount || !dir.pop() {
+            break;
+        }
+    }
+    // A namespaced container sees its own group at the mount, under a path
+    // that names the host's view of it.
+    if !dirs.contains(&mount) {
+        dirs.push(mount.clone());
+    }
+    dirs.iter()
+        .filter_map(|d| {
+            // v2 writes `max` for no limit, which does not parse.
+            let limit = num(&d.join(limit_f))?;
+            if total > 0 && limit >= total {
+                return None;
+            }
+            Some(ContainerMemory {
+                limit,
+                usage: num(&d.join(usage_f))?,
+                reclaimable: stat(&d.join("memory.stat"), stat_keys).unwrap_or(0),
+            })
+        })
+        .min_by_key(ContainerMemory::room)
 }
 
 impl HostMemory {
@@ -118,11 +271,14 @@ fn read_host() -> Option<HostMemory> {
         inactive: (stats.inactive_count as u64).checked_mul(page)?,
         purgeable: (stats.purgeable_count as u64).checked_mul(page)?,
         speculative: (stats.speculative_count as u64).checked_mul(page)?,
+        container: None,
     })
 }
 
 /// Linux's own estimate of what can be allocated without swapping is
-/// `MemAvailable`; it stands in for the four macOS terms.
+/// `MemAvailable`; it stands in for the four macOS terms. It is the host's:
+/// inside a control group with a memory limit (a container's `--memory`)
+/// the group's own room is read beside it.
 #[cfg(target_os = "linux")]
 fn read_host() -> Option<HostMemory> {
     let text = fs::read_to_string("/proc/meminfo").ok()?;
@@ -132,9 +288,14 @@ fn read_host() -> Option<HostMemory> {
             .and_then(|r| r.trim().trim_end_matches("kB").trim().parse::<u64>().ok())
             .and_then(|kb| kb.checked_mul(1024))
     };
+    let total = field("MemTotal:")?;
+    let container = fs::read_to_string("/proc/self/cgroup")
+        .ok()
+        .and_then(|c| container_memory_from(&c, total, |p| fs::read_to_string(p).ok()));
     Some(HostMemory {
-        total: field("MemTotal:")?,
+        total,
         free: field("MemAvailable:")?,
+        container,
         ..Default::default()
     })
 }
@@ -180,39 +341,61 @@ fn footprint_impl(_pid: u32) -> Option<u64> {
     None
 }
 
-/// Where the reserve kept for the OS, the window server and every non-lloom
-/// process came from (`memory.md` §9.10).
+/// The default reserve's floor: what the OS and the UI keep on any machine.
+pub const RESERVE_FLOOR: u64 = 4 * GIB;
+
+/// Which term the reserve kept for the OS, the window server and every
+/// non-lloom process came from (`memory.md` §9.10): the one that was larger.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReserveBasis {
     /// `memory.machine.reserve_gb`.
     Configured,
-    /// `max(4 GiB, hw.memsize − recommendedMaxWorkingSetSize)`: the share of
-    /// the machine the OS keeps back from the GPU's working set.
+    /// `hw.memsize − recommendedMaxWorkingSetSize`: the share of the machine
+    /// the OS keeps back from the GPU's working set, at or over the floor.
     WorkingSet { working_set: u64 },
-    /// `max(4 GiB, 10 %)`, where there is no Metal device to ask.
+    /// 10 % of the machine, where there is no Metal device to ask, at or
+    /// over the floor.
     TenthOfMachine,
+    /// [`RESERVE_FLOOR`], because the default's own term — `term` bytes, the
+    /// working set's difference when `working_set` is known, else 10 % —
+    /// was smaller.
+    Floor { term: u64, working_set: Option<u64> },
 }
 
 impl ReserveBasis {
-    fn tag(self) -> &'static str {
+    fn tag(self) -> String {
         match self {
-            Self::Configured => "memory.machine.reserve_gb",
-            Self::WorkingSet { .. } => "memsize-working_set",
-            Self::TenthOfMachine => "10 %",
+            Self::Configured => "memory.machine.reserve_gb".into(),
+            Self::WorkingSet { .. } => "memsize-working_set".into(),
+            Self::TenthOfMachine => "10 %".into(),
+            Self::Floor { term, working_set } => format!(
+                "4 GiB floor; {} = {:.2} GB",
+                if working_set.is_some() {
+                    "memsize-working_set"
+                } else {
+                    "10 %"
+                },
+                gb(term)
+            ),
         }
     }
 }
 
 /// The default reserve on a machine of `total` bytes: what the OS keeps back
 /// from the device's working set when there is one, else 10 %; never under
-/// 4 GiB.
+/// [`RESERVE_FLOOR`]. The basis names the term that won.
 pub fn default_reserve(total: u64, working_set: Option<u64>) -> (u64, ReserveBasis) {
-    match working_set {
+    let (term, basis) = match working_set {
         Some(ws) => (
-            total.saturating_sub(ws).max(4 * GIB),
+            total.saturating_sub(ws),
             ReserveBasis::WorkingSet { working_set: ws },
         ),
-        None => ((total / 10).max(4 * GIB), ReserveBasis::TenthOfMachine),
+        None => (total / 10, ReserveBasis::TenthOfMachine),
+    };
+    if term >= RESERVE_FLOOR {
+        (term, basis)
+    } else {
+        (RESERVE_FLOOR, ReserveBasis::Floor { term, working_set })
     }
 }
 
@@ -308,6 +491,10 @@ pub struct Verdict {
     pub total: u64,
     pub reserve: u64,
     pub reserve_basis: ReserveBasis,
+    /// The control group's limit and holding when one binds below the host
+    /// (read with the host; `None` when injected): its own room, less its
+    /// own reserve ([`ContainerMemory::reserve`]), is a second bound.
+    pub container: Option<ContainerMemory>,
     /// Every other process's reservations still to be taken, by pid:
     /// `(pid, labels, reserved, footprint)`.
     pub others: Vec<Outstanding>,
@@ -348,9 +535,34 @@ impl Verdict {
         self.other_bytes().saturating_add(self.mine.bytes() as i128)
     }
 
-    /// `available − reserve − outstanding`, signed.
+    /// The host's `available − reserve`, signed.
+    fn host_free(&self) -> i128 {
+        self.available as i128 - self.reserve as i128
+    }
+
+    /// The control group's `available − reserve`, signed, when one binds.
+    fn container_free(&self) -> Option<i128> {
+        self.container.map(|c| c.room())
+    }
+
+    /// Whether the control group, not the host, sets the room.
+    pub fn container_binds(&self) -> bool {
+        self.container_free().is_some_and(|c| c < self.host_free())
+    }
+
+    /// `min(host available − reserve, group available − group reserve) −
+    /// outstanding`, signed.
     pub fn room(&self) -> i128 {
-        (self.available as i128 - self.reserve as i128).saturating_sub(self.outstanding())
+        let free = match self.container_free() {
+            Some(c) => c.min(self.host_free()),
+            None => self.host_free(),
+        };
+        free.saturating_sub(self.outstanding())
+    }
+
+    /// `room − need`, signed: what a fit leaves, or a refusal lacks.
+    pub fn margin(&self) -> i128 {
+        self.room().saturating_sub(self.need as i128)
     }
 
     /// One line for a load's report.
@@ -362,8 +574,18 @@ impl Verdict {
                 if self.forced { "FORCED (safety unchecked)" } else { "REFUSED" },
             );
         }
+        let container = match self.container {
+            Some(c) => format!(
+                " container={:.2} GB of a {:.2} GB limit reserve={:.2} GB (10 % of the limit){}",
+                gb(c.available()),
+                gb(c.limit),
+                gb(c.reserve()),
+                if self.container_binds() { " binds" } else { "" }
+            ),
+            None => String::new(),
+        };
         format!(
-            "[machine: need={:.2} GB available={:.2} GB{} reserve={:.2} GB ({}) other_lloom={:.2} GB in {} process(es) room={:.2} GB {}]",
+            "[machine: need={:.2} GB available={:.2} GB{} reserve={:.2} GB ({}){container} other_lloom={:.2} GB in {} process(es) room={:.2} GB margin={} B {}]",
             gb(self.need),
             gb(self.available),
             if self.injected { " (injected)" } else { "" },
@@ -372,6 +594,7 @@ impl Verdict {
             self.other_bytes() as f64 / 1e9,
             self.others.len(),
             self.room() as f64 / 1e9,
+            self.margin(),
             match (self.fits, self.forced) {
                 (true, _) => "fits",
                 (false, true) => "FORCED",
@@ -380,7 +603,9 @@ impl Verdict {
         )
     }
 
-    /// The arithmetic, for a refusal (or a forced admission).
+    /// The arithmetic, for a refusal (or a forced admission): every term in
+    /// bytes beside its rounded figure, so a refusal at the boundary reads
+    /// as the bytes it was decided on.
     pub fn describe(&self) -> String {
         let unknown = self.host.is_none() && !self.injected;
         let mut s = if unknown {
@@ -389,50 +614,74 @@ impl Verdict {
                 .to_string()
         } else {
             format!(
-                "the machine cannot hold this now: it needs {:.2} GB and the room is {:.2} GB\n",
-                gb(self.need),
-                self.room() as f64 / 1e9
+                "the machine cannot hold this now: it needs {} and the room is {}, {} B {}\n",
+                bytes_gb(self.need),
+                signed_bytes_gb(self.room()),
+                self.margin().unsigned_abs(),
+                if self.margin() < 0 {
+                    "short"
+                } else {
+                    "to spare"
+                }
             )
         };
         if let Some(p) = &self.peak {
             s.push_str(&format!("  needed     {}\n", p.describe()));
         } else {
-            s.push_str(&format!("  needed     {:.2} GB of growth\n", gb(self.need)));
+            s.push_str(&format!("  needed     {} of growth\n", bytes_gb(self.need)));
         }
         match (&self.host, self.injected) {
             (_, true) => s.push_str(&format!(
-                "  available  {:.2} GB (injected, memory.machine.available_gb)\n",
-                gb(self.available)
+                "  available  {} (injected, memory.machine.available_gb)\n",
+                bytes_gb(self.available)
             )),
             (Some(h), false) => s.push_str(&format!(
-                "  available  {:.2} GB = {} (the host, now)\n",
-                gb(self.available),
+                "  available  {} = {} (the host, now)\n",
+                bytes_gb(self.available),
                 h.describe()
             )),
             (None, false) => s.push_str("  available  UNKNOWN (not a zero-byte measurement)\n"),
         }
+        let reserve = bytes_gb(self.reserve);
         match self.reserve_basis {
             ReserveBasis::WorkingSet { working_set } => s.push_str(&format!(
-                "  reserve    {:.2} GB = max(4 GiB, {:.2} GB memory - {:.2} GB GPU working set), \
+                "  reserve    {reserve} = {:.2} GB memory - {:.2} GB GPU working set (over the 4 GiB floor), \
                  for macOS and the UI\n",
-                gb(self.reserve),
                 gb(self.total),
                 gb(working_set)
             )),
             ReserveBasis::TenthOfMachine => s.push_str(&format!(
-                "  reserve    {:.2} GB = max(4 GiB, 10 % of {:.2} GB) (no Metal working set), \
-                 for macOS and the UI\n",
-                gb(self.reserve),
+                "  reserve    {reserve} = 10 % of {:.2} GB (no Metal working set; over the 4 GiB floor), \
+                 for the OS and the UI\n",
                 gb(self.total)
             )),
+            ReserveBasis::Floor { term, working_set } => s.push_str(&format!(
+                "  reserve    {reserve} = the 4 GiB floor, over {} = {:.2} GB, for the OS and the UI\n",
+                match working_set {
+                    Some(ws) => format!(
+                        "{:.2} GB memory - {:.2} GB GPU working set",
+                        gb(self.total),
+                        gb(ws)
+                    ),
+                    None => format!("10 % of {:.2} GB (no Metal working set)", gb(self.total)),
+                },
+                gb(term)
+            )),
             ReserveBasis::Configured => s.push_str(&format!(
-                "  reserve    {:.2} GB (memory.machine.reserve_gb), for macOS and the UI\n",
-                gb(self.reserve)
+                "  reserve    {reserve} (memory.machine.reserve_gb), for the OS and the UI\n"
             )),
         }
+        if let Some(c) = self.container {
+            s.push_str(&format!(
+                "  container  {} = {} (this process's control group, now); reserve {} = 10 % of the limit\n",
+                bytes_gb(c.available()),
+                c.describe(),
+                bytes_gb(c.reserve())
+            ));
+        }
         s.push_str(&format!(
-            "  other lloom processes {:.2} GB reserved and not yet held{}\n",
-            self.other_bytes() as f64 / 1e9,
+            "  other lloom processes {} reserved and not yet held{}\n",
+            signed_bytes_gb(self.other_bytes()),
             match &self.registry {
                 Some(d) => format!(" (registry {})", d.display()),
                 None => String::new(),
@@ -440,7 +689,7 @@ impl Verdict {
         ));
         for o in &self.others {
             s.push_str(&format!(
-                "    pid {} {}: reserved {:.2} GB, holds {}, {:.2} GB to come\n",
+                "    pid {} {}: reserved {:.2} GB, holds {}, {} to come\n",
                 o.pid,
                 o.labels.join(", "),
                 gb(o.reserved),
@@ -448,15 +697,15 @@ impl Verdict {
                     Some(f) => format!("{:.2} GB", gb(f)),
                     None => "? (unreadable; all of it counted)".into(),
                 },
-                gb(o.bytes())
+                bytes_gb(o.bytes())
             ));
         }
         if self.mine.reserved > 0 {
             s.push_str(&format!(
-                "  this process {:.2} GB reserved, holds {:.2} GB, {:.2} GB to come\n",
+                "  this process {:.2} GB reserved, holds {:.2} GB, {} to come\n",
                 gb(self.mine.reserved),
                 gb(self.mine.footprint.unwrap_or(0)),
-                gb(self.mine.bytes())
+                bytes_gb(self.mine.bytes())
             ));
         } else {
             s.push_str(&format!(
@@ -467,10 +716,21 @@ impl Verdict {
         if unknown {
             s.push_str("  room       UNKNOWN; retry on a host with a supported memory reader, \
                         or explicitly use --force (safety unchecked) or memory.machine.gate=false\n");
+        } else if self.container.is_some() {
+            s.push_str(&format!(
+                "  room       {} = min(available - reserve, container - its reserve) - reserved \
+                 and not yet held; the {} binds\n",
+                signed_bytes_gb(self.room()),
+                if self.container_binds() {
+                    "container"
+                } else {
+                    "host"
+                }
+            ));
         } else {
             s.push_str(&format!(
-                "  room       {:.2} GB = available - reserve - reserved and not yet held\n",
-                self.room() as f64 / 1e9
+                "  room       {} = available - reserve - reserved and not yet held\n",
+                signed_bytes_gb(self.room())
             ));
         }
         if self.forced {
@@ -711,6 +971,8 @@ impl Gate {
             total,
             reserve,
             reserve_basis,
+            // An injected availability stands in for the whole reading.
+            container: host.and_then(|h| h.container),
             others,
             mine,
             fits: false,
@@ -1154,6 +1416,10 @@ impl Holding {
 
 /// Why [`Holding::try_grow_to`] could not widen the reservation.
 #[derive(Debug)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "keep refusal arithmetic inline without another allocation on insufficient memory"
+)]
 pub enum GrowRefusal {
     /// The room could not hold the growth; the verdict carries the arithmetic.
     Room(Verdict),
@@ -1225,6 +1491,429 @@ mod tests {
         assert_eq!(default_reserve(0, None).0, 4 * GIB);
     }
 
+    /// A small CI host's figures: 9.70 GB and no Metal device.
+    /// Its tenth is 0.97 GB, so the 4 GiB floor is what the reserve is, and
+    /// the line and the arithmetic say so rather than `(10 %)`.
+    #[test]
+    fn the_reserve_names_the_floor_when_the_floor_is_what_fired() {
+        const SILVERBERRY: u64 = 9_700_000_000;
+        assert_eq!(
+            default_reserve(SILVERBERRY, None),
+            (
+                RESERVE_FLOOR,
+                ReserveBasis::Floor {
+                    term: 970_000_000,
+                    working_set: None
+                }
+            )
+        );
+        // A working set leaving less than the floor names its own term.
+        assert_eq!(
+            default_reserve(16 * GIB, Some(14 * GIB)),
+            (
+                RESERVE_FLOOR,
+                ReserveBasis::Floor {
+                    term: 2 * GIB,
+                    working_set: Some(14 * GIB)
+                }
+            )
+        );
+        // At the floor exactly, the term is what fired.
+        assert_eq!(
+            default_reserve(40 * GIB, None).1,
+            ReserveBasis::TenthOfMachine
+        );
+
+        let dir = tmp_registry("floor");
+        let error = Gate::new(GateConfig {
+            registry: Some(dir.clone()),
+            available: Some(4_000_000_000),
+            total: Some(SILVERBERRY),
+            ..Default::default()
+        })
+        .admit("floor", &Peak::new().with("load", 1))
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains(
+                "reserve    4294967296 B (4.29 GB) = the 4 GiB floor, over 10 % of 9.70 GB \
+                 (no Metal working set) = 0.97 GB"
+            ),
+            "{error}"
+        );
+        let v = Gate::new(GateConfig {
+            registry: Some(dir.clone()),
+            available: Some(8_850_000_000),
+            total: Some(SILVERBERRY),
+            ..Default::default()
+        })
+        .decide(0, None, &[], None)
+        .unwrap();
+        assert!(
+            v.line()
+                .contains("reserve=4.29 GB (4 GiB floor; 10 % = 0.97 GB)"),
+            "{}",
+            v.line()
+        );
+        assert!(!v.line().contains("(10 %)"), "{}", v.line());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A refusal at the boundary: need and room both read 4.56 GB at two
+    /// decimals and differ by one byte. The refusal prints both in bytes
+    /// and the shortfall, so the rounded figures cannot read as equal; one
+    /// byte less is admitted, with nothing to spare.
+    #[test]
+    fn a_boundary_refusal_prints_the_bytes_it_was_decided_on() {
+        let dir = tmp_registry("boundary");
+        let g = gate(&dir, 8_850_000_000, RESERVE_FLOOR);
+        let room = 8_850_000_000 - RESERVE_FLOOR;
+        let error = g
+            .admit("boundary", &Peak::new().with("load", room + 1))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains(
+                "it needs 4555032705 B (4.56 GB) and the room is 4555032704 B (4.56 GB), 1 B short"
+            ),
+            "{error}"
+        );
+        assert!(
+            error.contains("room       4555032704 B (4.56 GB) = available - reserve"),
+            "{error}"
+        );
+        let v = g.decide(room + 1, None, &[], None).unwrap();
+        assert!(!v.fits);
+        assert!(v.line().contains("margin=-1 B REFUSED"), "{}", v.line());
+        let fit = g
+            .admit("boundary", &Peak::new().with("load", room))
+            .unwrap();
+        let v = fit.verdict.as_ref().unwrap();
+        assert!(v.fits && v.margin() == 0, "{}", v.line());
+        assert!(v.line().contains("margin=0 B fits"), "{}", v.line());
+        drop(fit);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn files(entries: &[(&str, &str)]) -> impl Fn(&Path) -> Option<String> {
+        let map: std::collections::HashMap<PathBuf, String> = entries
+            .iter()
+            .map(|(p, t)| (PathBuf::from(p), t.to_string()))
+            .collect();
+        move |p: &Path| map.get(p).cloned()
+    }
+
+    const HOST: u64 = 34_000_000_000;
+
+    /// cgroup v2, as Docker's `--memory 6g` leaves it: the group's limit,
+    /// its charge and its inactive file cache, read at the group's own path
+    /// under a parent with no limit.
+    #[test]
+    fn a_v2_group_limit_is_read_with_its_charge_and_reclaimable_cache() {
+        let g = "/sys/fs/cgroup/system.slice/docker-abc.scope";
+        let fs = files(&[
+            ("/sys/fs/cgroup/system.slice/memory.max", "max\n"),
+            ("/sys/fs/cgroup/system.slice/memory.current", "9000000000\n"),
+            (&format!("{g}/memory.max"), "6442450944\n"),
+            (&format!("{g}/memory.current"), "600000000\n"),
+            (
+                &format!("{g}/memory.stat"),
+                "anon 400000000\nfile 200000000\nactive_file 100000000\ninactive_file 100000000\n",
+            ),
+        ]);
+        let c = container_memory_from("0::/system.slice/docker-abc.scope\n", HOST, fs).unwrap();
+        assert_eq!(
+            c,
+            ContainerMemory {
+                limit: 6_442_450_944,
+                usage: 600_000_000,
+                reclaimable: 100_000_000
+            }
+        );
+        assert_eq!(c.available(), 6_442_450_944 - 500_000_000);
+        assert_eq!(c.reserve(), 644_245_094);
+    }
+
+    /// Inside the container's cgroup namespace the group is the mount's
+    /// root, whether `/proc/self/cgroup` says `/` or still names the host's
+    /// path; a tighter ancestor binds over a looser group; `max`, or a
+    /// limit at or past the host's memory, is no limit.
+    #[test]
+    fn the_tightest_visible_limit_binds_and_no_limit_is_none() {
+        let root = files(&[
+            ("/sys/fs/cgroup/memory.max", "6442450944"),
+            ("/sys/fs/cgroup/memory.current", "1000000000"),
+        ]);
+        for cg in ["0::/\n", "0::/docker/abc\n"] {
+            assert_eq!(
+                container_memory_from(cg, HOST, &root).map(|c| c.limit),
+                Some(6_442_450_944),
+                "{cg:?}"
+            );
+        }
+        let nested = files(&[
+            ("/sys/fs/cgroup/a/memory.max", "4000000000"),
+            ("/sys/fs/cgroup/a/memory.current", "1000000000"),
+            ("/sys/fs/cgroup/a/b/memory.max", "8000000000"),
+            ("/sys/fs/cgroup/a/b/memory.current", "500000000"),
+        ]);
+        assert_eq!(
+            container_memory_from("0::/a/b\n", HOST, nested).map(|c| c.limit),
+            Some(4_000_000_000)
+        );
+        let none = files(&[
+            ("/sys/fs/cgroup/memory.max", "max"),
+            ("/sys/fs/cgroup/memory.current", "1000000000"),
+        ]);
+        assert_eq!(container_memory_from("0::/\n", HOST, none), None);
+        let over = files(&[
+            ("/sys/fs/cgroup/memory.max", "64000000000"),
+            ("/sys/fs/cgroup/memory.current", "1000000000"),
+        ]);
+        assert_eq!(container_memory_from("0::/\n", HOST, over), None);
+        assert_eq!(container_memory_from("", HOST, files(&[])), None);
+    }
+
+    /// Raw availability orders these groups backwards from the room the
+    /// gate may admit. The ancestor's larger reserve must still bind.
+    #[test]
+    fn ancestor_selection_subtracts_each_groups_reserve_before_comparing() {
+        for (proc, mount, limit_file, usage_file) in [
+            (
+                "0::/a/b\n",
+                "/sys/fs/cgroup",
+                "memory.max",
+                "memory.current",
+            ),
+            (
+                "4:memory:/a/b\n",
+                "/sys/fs/cgroup/memory",
+                "memory.limit_in_bytes",
+                "memory.usage_in_bytes",
+            ),
+        ] {
+            let fs = files(&[
+                (&format!("{mount}/a/{limit_file}"), "6000000000"),
+                (&format!("{mount}/a/{usage_file}"), "2900000000"),
+                (&format!("{mount}/a/b/{limit_file}"), "4000000000"),
+                (&format!("{mount}/a/b/{usage_file}"), "1000000000"),
+            ]);
+            let selected = container_memory_from(proc, HOST, fs).unwrap();
+            assert_eq!(selected.limit, 6_000_000_000, "{proc}");
+            assert_eq!(selected.available(), 3_100_000_000);
+            assert_eq!(selected.reserve(), 600_000_000);
+            assert_eq!(selected.room(), 2_500_000_000);
+
+            let gate = Gate::default();
+            for need in [2_500_000_000, 2_500_000_001, 2_550_000_000] {
+                let v = gate
+                    .decide_with(need, None, &[], None, || {
+                        Some(HostMemory {
+                            total: 9_700_000_000,
+                            free: 8_850_000_000,
+                            container: Some(selected),
+                            ..Default::default()
+                        })
+                    })
+                    .unwrap();
+                assert_eq!(v.reserve, RESERVE_FLOOR);
+                assert!(v.container_binds());
+                assert_eq!(v.room(), 2_500_000_000);
+                assert_eq!(v.fits, need <= 2_500_000_000, "{}", v.line());
+                assert_eq!(v.margin(), 2_500_000_000i128 - need as i128);
+
+                let mut reserved = v.clone();
+                reserved.others = vec![Outstanding {
+                    pid: u32::MAX,
+                    reserved: 600_000_000,
+                    footprint: Some(100_000_000),
+                    ..Default::default()
+                }];
+                reserved.mine.reserved = 300_000_000;
+                reserved.mine.footprint = Some(50_000_000);
+                assert_eq!(reserved.room(), 1_750_000_000);
+                assert_eq!(reserved.margin(), 1_750_000_000i128 - need as i128);
+            }
+        }
+    }
+
+    /// Exhausted groups have negative room, not a shared zero. Selection
+    /// must preserve the most restrictive ancestor even after saturation.
+    #[test]
+    fn ancestor_room_selection_is_signed_and_bounds_every_visible_group() {
+        let mut cases = 0;
+        for parent_limit in [10u64, 20, 30] {
+            for child_limit in [10u64, 20, 30] {
+                for child_usage in [0u64, 10, 20, 30, 40] {
+                    for parent_usage in [0u64, 10, 20, 30, 40] {
+                        if parent_usage < child_usage {
+                            continue;
+                        }
+                        for reclaimable in [0u64, 5] {
+                            if reclaimable > child_usage {
+                                continue;
+                            }
+                            let parent = ContainerMemory {
+                                limit: parent_limit,
+                                usage: parent_usage,
+                                reclaimable,
+                            };
+                            let child = ContainerMemory {
+                                limit: child_limit,
+                                usage: child_usage,
+                                reclaimable,
+                            };
+                            let mut entries = Vec::new();
+                            for (path, c) in [("a", parent), ("a/b", child)] {
+                                let dir = format!("/sys/fs/cgroup/{path}");
+                                entries.push((format!("{dir}/memory.max"), c.limit.to_string()));
+                                entries
+                                    .push((format!("{dir}/memory.current"), c.usage.to_string()));
+                                entries.push((
+                                    format!("{dir}/memory.stat"),
+                                    format!("inactive_file {}\n", c.reclaimable),
+                                ));
+                            }
+                            let refs: Vec<_> = entries
+                                .iter()
+                                .map(|(p, t)| (p.as_str(), t.as_str()))
+                                .collect();
+                            let selected = container_memory_from("0::/a/b\n", HOST, files(&refs))
+                                .expect("both finite limits are visible");
+                            assert_eq!(selected.room(), parent.room().min(child.room()));
+                            if parent_usage >= parent_limit + reclaimable
+                                && child_usage >= child_limit + reclaimable
+                            {
+                                assert_eq!(
+                                    selected.room(),
+                                    -(parent_limit.max(child_limit) as i128 / 10),
+                                    "the larger reserve binds when both groups have no availability"
+                                );
+                            }
+                            cases += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(cases, 225, "the bounded matrix must not silently shrink");
+    }
+
+    /// cgroup v1's memory controller: its own mount, its own file names,
+    /// the hierarchical inactive cache.
+    #[test]
+    fn a_v1_memory_controller_limit_is_read() {
+        let fs = files(&[
+            (
+                "/sys/fs/cgroup/memory/docker/abc/memory.limit_in_bytes",
+                "6442450944",
+            ),
+            (
+                "/sys/fs/cgroup/memory/docker/abc/memory.usage_in_bytes",
+                "700000000",
+            ),
+            (
+                "/sys/fs/cgroup/memory/docker/abc/memory.stat",
+                "cache 300000000\ninactive_file 1\ntotal_inactive_file 200000000\n",
+            ),
+            (
+                "/sys/fs/cgroup/memory/memory.limit_in_bytes",
+                "9223372036854771712",
+            ),
+        ]);
+        let c = container_memory_from(
+            "12:pids:/docker/abc\n11:cpu,cpuacct:/docker/abc\n4:memory:/docker/abc\n",
+            HOST,
+            fs,
+        )
+        .unwrap();
+        assert_eq!(
+            c,
+            ContainerMemory {
+                limit: 6_442_450_944,
+                usage: 700_000_000,
+                reclaimable: 200_000_000
+            }
+        );
+    }
+
+    /// A 6 GiB container on a host with 25 GB free:
+    /// the host alone admits a 5 GB load the container cannot hold; with
+    /// the group's limit read, its room binds and the load is refused with
+    /// the group's arithmetic. The host-only arm is the control.
+    #[test]
+    fn a_container_limit_below_the_host_refuses_what_the_host_would_admit() {
+        let dir = tmp_registry("container");
+        let host = |container| HostMemory {
+            total: HOST,
+            free: 25_000_000_000,
+            container,
+            ..Default::default()
+        };
+        let gate = Gate::new(GateConfig {
+            registry: Some(dir.clone()),
+            ..Default::default()
+        });
+        let peak = Peak::new().with("load", 5_000_000_000);
+        let admitted = gate
+            .admit_with("host only", &peak, || Some(host(None)))
+            .unwrap();
+        assert!(admitted.verdict.as_ref().unwrap().fits);
+        drop(admitted);
+
+        let six_gib = ContainerMemory {
+            limit: 6 * GIB,
+            usage: 1_000_000_000,
+            reclaimable: 0,
+        };
+        let error = gate
+            .admit_with("in a container", &peak, || Some(host(Some(six_gib))))
+            .unwrap_err()
+            .to_string();
+        // (6442450944 - 1000000000) - 644245094 = 4798205850 B of room.
+        for want in [
+            "the room is 4798205850 B (4.80 GB), 201794150 B short",
+            "container  5442450944 B (5.44 GB) = limit 6.44 - (usage 1.00 - inactive file 0.00)",
+            "reserve 644245094 B (0.64 GB) = 10 % of the limit",
+            "the container binds",
+        ] {
+            assert!(error.contains(want), "{want:?} missing from:\n{error}");
+        }
+        assert!(Registry::open(&dir).unwrap().entries().unwrap().is_empty());
+        let v = gate
+            .decide_with(5_000_000_000, None, &[], None, || Some(host(Some(six_gib))))
+            .unwrap();
+        assert!(v.container_binds() && !v.fits);
+        assert!(
+            v.line().contains(
+                "container=5.44 GB of a 6.44 GB limit reserve=0.64 GB (10 % of the limit) binds"
+            ),
+            "{}",
+            v.line()
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The reader on the host it runs on: where this process's group has a
+    /// numeric v2 `memory.max` below `MemTotal` (a capped container), the
+    /// gate sees that limit. A plain host reads no limit and asserts nothing
+    /// of it. The reading is printed for the run's record.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_container_limit_is_read_where_one_is_set() {
+        let h = HostMemory::read().expect("meminfo");
+        let own = fs::read_to_string("/sys/fs/cgroup/memory.max")
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .filter(|&l| l < h.total);
+        eprintln!("host {h:?} own memory.max {own:?}");
+        if let Some(limit) = own {
+            let c = h.container.expect("a capped group reads a limit");
+            assert!(c.limit <= limit, "{c:?} against memory.max {limit}");
+            assert!(c.usage > 0 && c.available() <= c.limit, "{c:?}");
+        }
+    }
+
     /// The state that killed the session on 2026-10-08 (`issue-952-raw/
     /// crash-report.txt`): 6.92 GB available. A tenth of the machine leaves
     /// +0.05 GB of room and admits a 0.04 GB load into it; what the OS keeps
@@ -1254,8 +1943,8 @@ mod tests {
             .unwrap_err()
             .to_string();
         for want in [
-            "it needs 0.04 GB and the room is -6.14 GB",
-            "reserve    13.06 GB = max(4 GiB, 68.72 GB memory - 55.66 GB GPU working set)",
+            "it needs 40000000 B (0.04 GB) and the room is -6136688128 B (-6.14 GB), 6176688128 B short",
+            "reserve    13056688128 B (13.06 GB) = 68.72 GB memory - 55.66 GB GPU working set (over the 4 GiB floor)",
             "Nothing was allocated",
         ] {
             assert!(error.contains(want), "{want:?} missing from:\n{error}");
@@ -1478,10 +2167,10 @@ mod tests {
         let big = Peak::new().with("weights", 17 * GIB);
         let e = g.admit("big", &big).unwrap_err().to_string();
         for want in [
-            "it needs 18.25 GB and the room is 17.18 GB",
+            "it needs 18253611008 B (18.25 GB) and the room is 17179869184 B (17.18 GB), 1073741824 B short",
             "needed     18.25 GB = weights 18.25",
-            "available  21.47 GB (injected",
-            "reserve    4.29 GB",
+            "available  21474836480 B (21.47 GB) (injected",
+            "reserve    4294967296 B (4.29 GB) (memory.machine.reserve_gb)",
             "Nothing was allocated",
             "--force",
         ] {
@@ -1718,7 +2407,7 @@ mod tests {
         let on_disk = Registry::open(&dir).unwrap().entries().unwrap();
         assert_eq!(on_disk[0].reserved, 12 * GIB, "the others see the growth");
         let e = h.grow_to(18 * GIB).unwrap_err().to_string();
-        assert!(e.contains("6.44 GB of growth"), "{e}");
+        assert!(e.contains("6442450944 B (6.44 GB) of growth"), "{e}");
         assert_eq!(h.reserved(), 12 * GIB);
         let _ = fs::remove_dir_all(&dir);
     }

@@ -566,6 +566,20 @@ pub struct Snapshot {
     pub counter_unit_s: Option<f64>,
 }
 
+/// Every timed command buffer recorded so far, without the rest of
+/// [`snapshot`]'s work. Detail requires [`recorder_enabled`]; shipping has no
+/// detailed recorder and returns an empty vector, as its snapshot does.
+pub fn command_buffer_records() -> Vec<CommandBufferRecord> {
+    #[cfg(any(debug_assertions, feature = "profile"))]
+    {
+        recording::command_buffer_records()
+    }
+    #[cfg(not(any(debug_assertions, feature = "profile")))]
+    {
+        Vec::new()
+    }
+}
+
 /// Scalar profiling remains usable without the optional detailed recorder.
 fn scalar_snapshot() -> Snapshot {
     Snapshot {

@@ -1432,6 +1432,20 @@ impl MetalDevice {
         self.commands.marker_complete(marker)
     }
 
+    /// Dispatches encoded into the open buffer and not yet committed
+    /// (`Commands::open_dispatches`).
+    pub fn open_dispatches(&self) -> usize {
+        self.commands.open_dispatches()
+    }
+
+    /// The last committed, unpruned buffer (`Commands::last_committed_marker`).
+    pub fn last_committed_marker(&self) -> Result<Option<CommandMarker>> {
+        Ok(self
+            .commands
+            .last_committed_marker()
+            .map_err(MetalError::from)?)
+    }
+
     /// The EOS gate (lloom #735 step 4): see `kernels::metal::DispatchGate`.
     /// Refused with an executor installed — the gate covers directly encoded
     /// dispatches, not an ICB replay.

@@ -157,6 +157,11 @@ pub struct Asks<'a> {
 pub const MAX_TOP_LOGPROBS: usize = 64;
 
 impl<'a> Asks<'a> {
+    /// A sampling-only capability query; no auxiliary features requested.
+    pub fn sampling(sampling: &'a Sampling) -> Self {
+        Self { sampling, processors: false, budget: false, digest: false, logprobs: None }
+    }
+
     /// What `sampler` asks, with or without a thinking budget.
     pub fn of(sampler: &'a LogitsProcessor, budget: bool) -> Self {
         Asks {
@@ -173,19 +178,16 @@ impl<'a> Asks<'a> {
 /// state moves. Every driver asks it; nothing is served under a label it
 /// does not run.
 ///
-/// - The ring step draws on the device: the host-sort arms (top-k, top-p)
-///   sort on the host, and the digest reads every step's logits there.
+/// - The ring step draws on the device: filtered arms require the host,
+///   and the digest reads every step's logits there.
 /// - The window serves every sampler arm and feature: each row is drawn
 ///   keyed to its position against the history its position has
-///   (`LogitsProcessor::window_draw_device`). It reads back the ids a round
-///   keeps, never a row, so the per-token logprobs are the K=1 body's.
+///   (`LogitsProcessor::window_draw_device`). Host-filtered methods also read
+///   processed score rows until the native bridge is admitted. Per-token raw
+///   logprobs remain the K=1 body's separately captured output.
 /// - The batched bodies draw per row without processors, feed no forced
 ///   token and keep no logprobs; the batched windows verify by the argmax.
 pub fn refuse(body: Body, asks: &Asks<'_>) -> Result<()> {
-    let host_sort = matches!(
-        asks.sampling,
-        Sampling::TopK { .. } | Sampling::TopP { .. } | Sampling::TopKThenTopP { .. }
-    );
     if let Some(k) = asks.logprobs.filter(|&k| k > MAX_TOP_LOGPROBS) {
         lloom_tensor::bail!(
             "per-token logprobs name at most {MAX_TOP_LOGPROBS} candidates beside the drawn id, \
@@ -193,10 +195,15 @@ pub fn refuse(body: Body, asks: &Asks<'_>) -> Result<()> {
         );
     }
     match body {
-        Body::Step { ring: true } if host_sort => lloom_tensor::bail!(
+        Body::Step { ring: true } if asks.sampling.requires_host() => lloom_tensor::bail!(
             "the ring needs a device-resident sampler (argmax, multinomial or gumbel-max); \
-             {:?} takes a host sort and cannot ride it (DESIGN.md §11.2c)",
-            asks.sampling
+             {:?} takes {} and cannot ride it (DESIGN.md §11.2c)",
+            asks.sampling,
+            if matches!(asks.sampling, Sampling::FilteredGumbel { .. }) {
+                "an explicit host draw"
+            } else {
+                "a host sort"
+            }
         ),
         Body::Step { ring: true } if asks.digest => lloom_tensor::bail!(
             "the ring draws on the device and the logits digest reads every step's logits on \
@@ -1871,6 +1878,8 @@ impl<'m, M: CausalLM> Session<'m, M> {
         S: Speculator,
         R: ReadbackStrategy,
     {
+        refuse(Body::Step { ring: readback.arms().token_ring }, &Asks::of(sampler, false))?;
+        readback.check_sampler(sampler.sampling())?;
         let out = self.decode_until_run(spec, readback, sampler, prompt, opts, on_tokens);
         if out.is_err() {
             // A run that failed mid-way may leave a provisional step: settled
@@ -1975,7 +1984,6 @@ impl<'m, M: CausalLM> Session<'m, M> {
         if resume && self.seq.last_logits.is_none() {
             lloom_tensor::bail!("Session::decode: empty prompt and no held logits to resume from");
         }
-        readback.check_sampler(sampler.sampling())?;
         spec.begin_at(SeqId(0), prompt, &self.seq.tokens)?;
 
         let device = readback.device().clone();
@@ -3175,6 +3183,7 @@ impl<'m, M: CausalLM> Session<'m, M> {
         M: Probes<S::Probe> + crate::profile::Shaped,
         R: ReadbackStrategy,
     {
+        refuse(Body::Window, &Asks::of(sampler, false))?;
         // The verify draws the target's token per window position with
         // this sampler whenever it does more than read the raw argmax
         // (`Probes::verify_and_probe_sampled`): a temperature on any arm, or
@@ -3869,6 +3878,7 @@ impl<'m, M: CausalLM> Session<'m, M> {
     where
         M: BatchedCausalLM,
     {
+        refuse(Body::BatchedStep, &Asks::of(sampler, false))?;
         let n = sessions.len();
         if n == 0 {
             lloom_tensor::bail!("decode_batched: no sessions");

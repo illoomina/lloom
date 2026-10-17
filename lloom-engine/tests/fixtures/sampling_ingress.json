@@ -1,0 +1,9749 @@
+[
+  {
+    "name": "matrix-0",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        }
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-1",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        }
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-2",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        }
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-3",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "top_p": 0
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-4",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "top_p": 0
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-5",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "top_p": 0
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-6",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "top_p": 1
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-7",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "top_p": 1
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-8",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "top_p": 1
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-9",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "top_p": 0.6
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-10",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "top_p": 0.6
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-11",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "top_p": 0.6
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-12",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "top_k": 0
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-13",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "top_k": 0
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-14",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "top_k": 0
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-15",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "top_k": 0,
+        "top_p": 0
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-16",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "top_k": 0,
+        "top_p": 0
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-17",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "top_k": 0,
+        "top_p": 0
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-18",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "top_k": 0,
+        "top_p": 1
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-19",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "top_k": 0,
+        "top_p": 1
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-20",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "top_k": 0,
+        "top_p": 1
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-21",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "top_k": 0,
+        "top_p": 0.6
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-22",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "top_k": 0,
+        "top_p": 0.6
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-23",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "top_k": 0,
+        "top_p": 0.6
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-24",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "top_k": 1
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-25",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "top_k": 1
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-26",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "top_k": 1
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-27",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "top_k": 1,
+        "top_p": 0
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-28",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "top_k": 1,
+        "top_p": 0
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-29",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "top_k": 1,
+        "top_p": 0
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-30",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "top_k": 1,
+        "top_p": 1
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-31",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "top_k": 1,
+        "top_p": 1
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-32",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "top_k": 1,
+        "top_p": 1
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-33",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "top_k": 1,
+        "top_p": 0.6
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-34",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "top_k": 1,
+        "top_p": 0.6
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-35",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "top_k": 1,
+        "top_p": 0.6
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-36",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "top_k": 8
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-37",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "top_k": 8
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-38",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "top_k": 8
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-39",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "top_k": 8,
+        "top_p": 0
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-40",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "top_k": 8,
+        "top_p": 0
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-41",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "top_k": 8,
+        "top_p": 0
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-42",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "top_k": 8,
+        "top_p": 1
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-43",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "top_k": 8,
+        "top_p": 1
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-44",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "top_k": 8,
+        "top_p": 1
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-45",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "top_k": 8,
+        "top_p": 0.6
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-46",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "top_k": 8,
+        "top_p": 0.6
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-47",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "top_k": 8,
+        "top_p": 0.6
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-48",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 0
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-49",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 0
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-50",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 0
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-51",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 0,
+        "top_p": 0
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-52",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 0,
+        "top_p": 0
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-53",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 0,
+        "top_p": 0
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-54",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 0,
+        "top_p": 1
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-55",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 0,
+        "top_p": 1
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-56",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 0,
+        "top_p": 1
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-57",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 0,
+        "top_p": 0.6
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-58",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 0,
+        "top_p": 0.6
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-59",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 0,
+        "top_p": 0.6
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-60",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 0,
+        "top_k": 0
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-61",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 0,
+        "top_k": 0
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-62",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 0,
+        "top_k": 0
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-63",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 0,
+        "top_k": 0,
+        "top_p": 0
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-64",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 0,
+        "top_k": 0,
+        "top_p": 0
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-65",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 0,
+        "top_k": 0,
+        "top_p": 0
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-66",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 0,
+        "top_k": 0,
+        "top_p": 1
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-67",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 0,
+        "top_k": 0,
+        "top_p": 1
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-68",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 0,
+        "top_k": 0,
+        "top_p": 1
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-69",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 0,
+        "top_k": 0,
+        "top_p": 0.6
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-70",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 0,
+        "top_k": 0,
+        "top_p": 0.6
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-71",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 0,
+        "top_k": 0,
+        "top_p": 0.6
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-72",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 0,
+        "top_k": 1
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-73",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 0,
+        "top_k": 1
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-74",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 0,
+        "top_k": 1
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-75",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 0,
+        "top_k": 1,
+        "top_p": 0
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-76",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 0,
+        "top_k": 1,
+        "top_p": 0
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-77",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 0,
+        "top_k": 1,
+        "top_p": 0
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-78",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 0,
+        "top_k": 1,
+        "top_p": 1
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-79",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 0,
+        "top_k": 1,
+        "top_p": 1
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-80",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 0,
+        "top_k": 1,
+        "top_p": 1
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-81",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 0,
+        "top_k": 1,
+        "top_p": 0.6
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-82",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 0,
+        "top_k": 1,
+        "top_p": 0.6
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-83",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 0,
+        "top_k": 1,
+        "top_p": 0.6
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-84",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 0,
+        "top_k": 8
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-85",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 0,
+        "top_k": 8
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-86",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 0,
+        "top_k": 8
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-87",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 0,
+        "top_k": 8,
+        "top_p": 0
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-88",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 0,
+        "top_k": 8,
+        "top_p": 0
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-89",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 0,
+        "top_k": 8,
+        "top_p": 0
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-90",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 0,
+        "top_k": 8,
+        "top_p": 1
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-91",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 0,
+        "top_k": 8,
+        "top_p": 1
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-92",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 0,
+        "top_k": 8,
+        "top_p": 1
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-93",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 0,
+        "top_k": 8,
+        "top_p": 0.6
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-94",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 0,
+        "top_k": 8,
+        "top_p": 0.6
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-95",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 0,
+        "top_k": 8,
+        "top_p": 0.6
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-96",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 5e-08
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-97",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 5e-08
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-98",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 5e-08
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-99",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 5e-08,
+        "top_p": 0
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-100",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 5e-08,
+        "top_p": 0
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-101",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 5e-08,
+        "top_p": 0
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-102",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 5e-08,
+        "top_p": 1
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-103",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 5e-08,
+        "top_p": 1
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-104",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 5e-08,
+        "top_p": 1
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-105",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 5e-08,
+        "top_p": 0.6
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-106",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 5e-08,
+        "top_p": 0.6
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-107",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 5e-08,
+        "top_p": 0.6
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-108",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 5e-08,
+        "top_k": 0
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-109",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 5e-08,
+        "top_k": 0
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-110",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 5e-08,
+        "top_k": 0
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-111",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 5e-08,
+        "top_k": 0,
+        "top_p": 0
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-112",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 5e-08,
+        "top_k": 0,
+        "top_p": 0
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-113",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 5e-08,
+        "top_k": 0,
+        "top_p": 0
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-114",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 5e-08,
+        "top_k": 0,
+        "top_p": 1
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-115",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 5e-08,
+        "top_k": 0,
+        "top_p": 1
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-116",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 5e-08,
+        "top_k": 0,
+        "top_p": 1
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-117",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 5e-08,
+        "top_k": 0,
+        "top_p": 0.6
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-118",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 5e-08,
+        "top_k": 0,
+        "top_p": 0.6
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-119",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 5e-08,
+        "top_k": 0,
+        "top_p": 0.6
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-120",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 5e-08,
+        "top_k": 1
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-121",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 5e-08,
+        "top_k": 1
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-122",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 5e-08,
+        "top_k": 1
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-123",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 5e-08,
+        "top_k": 1,
+        "top_p": 0
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-124",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 5e-08,
+        "top_k": 1,
+        "top_p": 0
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-125",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 5e-08,
+        "top_k": 1,
+        "top_p": 0
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-126",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 5e-08,
+        "top_k": 1,
+        "top_p": 1
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-127",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 5e-08,
+        "top_k": 1,
+        "top_p": 1
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-128",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 5e-08,
+        "top_k": 1,
+        "top_p": 1
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-129",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 5e-08,
+        "top_k": 1,
+        "top_p": 0.6
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-130",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 5e-08,
+        "top_k": 1,
+        "top_p": 0.6
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-131",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 5e-08,
+        "top_k": 1,
+        "top_p": 0.6
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-132",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 5e-08,
+        "top_k": 8
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-133",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 5e-08,
+        "top_k": 8
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-134",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 5e-08,
+        "top_k": 8
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-135",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 5e-08,
+        "top_k": 8,
+        "top_p": 0
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-136",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 5e-08,
+        "top_k": 8,
+        "top_p": 0
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-137",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 5e-08,
+        "top_k": 8,
+        "top_p": 0
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-138",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 5e-08,
+        "top_k": 8,
+        "top_p": 1
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-139",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 5e-08,
+        "top_k": 8,
+        "top_p": 1
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-140",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 5e-08,
+        "top_k": 8,
+        "top_p": 1
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-141",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 5e-08,
+        "top_k": 8,
+        "top_p": 0.6
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-142",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 5e-08,
+        "top_k": 8,
+        "top_p": 0.6
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-143",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 5e-08,
+        "top_k": 8,
+        "top_p": 0.6
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-144",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 1e-07
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-145",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 1e-07
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-146",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 1e-07
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-147",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 1e-07,
+        "top_p": 0
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-148",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 1e-07,
+        "top_p": 0
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-149",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 1e-07,
+        "top_p": 0
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": false,
+    "schema_accepts": false
+  },
+  {
+    "name": "matrix-150",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 1e-07,
+        "top_p": 1
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-151",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 1e-07,
+        "top_p": 1
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-152",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 1e-07,
+        "top_p": 1
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-153",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 1e-07,
+        "top_p": 0.6
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-154",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 1e-07,
+        "top_p": 0.6
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-155",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 1e-07,
+        "top_p": 0.6
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": false,
+    "schema_accepts": false
+  },
+  {
+    "name": "matrix-156",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 1e-07,
+        "top_k": 0
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-157",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 1e-07,
+        "top_k": 0
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-158",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 1e-07,
+        "top_k": 0
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-159",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 1e-07,
+        "top_k": 0,
+        "top_p": 0
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-160",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 1e-07,
+        "top_k": 0,
+        "top_p": 0
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-161",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 1e-07,
+        "top_k": 0,
+        "top_p": 0
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": false,
+    "schema_accepts": false
+  },
+  {
+    "name": "matrix-162",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 1e-07,
+        "top_k": 0,
+        "top_p": 1
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-163",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 1e-07,
+        "top_k": 0,
+        "top_p": 1
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-164",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 1e-07,
+        "top_k": 0,
+        "top_p": 1
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-165",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 1e-07,
+        "top_k": 0,
+        "top_p": 0.6
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-166",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 1e-07,
+        "top_k": 0,
+        "top_p": 0.6
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-167",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 1e-07,
+        "top_k": 0,
+        "top_p": 0.6
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": false,
+    "schema_accepts": false
+  },
+  {
+    "name": "matrix-168",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 1e-07,
+        "top_k": 1
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-169",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 1e-07,
+        "top_k": 1
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-170",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 1e-07,
+        "top_k": 1
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": false,
+    "schema_accepts": false
+  },
+  {
+    "name": "matrix-171",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 1e-07,
+        "top_k": 1,
+        "top_p": 0
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-172",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 1e-07,
+        "top_k": 1,
+        "top_p": 0
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-173",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 1e-07,
+        "top_k": 1,
+        "top_p": 0
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": false,
+    "schema_accepts": false
+  },
+  {
+    "name": "matrix-174",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 1e-07,
+        "top_k": 1,
+        "top_p": 1
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-175",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 1e-07,
+        "top_k": 1,
+        "top_p": 1
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-176",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 1e-07,
+        "top_k": 1,
+        "top_p": 1
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": false,
+    "schema_accepts": false
+  },
+  {
+    "name": "matrix-177",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 1e-07,
+        "top_k": 1,
+        "top_p": 0.6
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-178",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 1e-07,
+        "top_k": 1,
+        "top_p": 0.6
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-179",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 1e-07,
+        "top_k": 1,
+        "top_p": 0.6
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": false,
+    "schema_accepts": false
+  },
+  {
+    "name": "matrix-180",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 1e-07,
+        "top_k": 8
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-181",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 1e-07,
+        "top_k": 8
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-182",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 1e-07,
+        "top_k": 8
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": false,
+    "schema_accepts": false
+  },
+  {
+    "name": "matrix-183",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 1e-07,
+        "top_k": 8,
+        "top_p": 0
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-184",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 1e-07,
+        "top_k": 8,
+        "top_p": 0
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-185",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 1e-07,
+        "top_k": 8,
+        "top_p": 0
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": false,
+    "schema_accepts": false
+  },
+  {
+    "name": "matrix-186",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 1e-07,
+        "top_k": 8,
+        "top_p": 1
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-187",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 1e-07,
+        "top_k": 8,
+        "top_p": 1
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-188",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 1e-07,
+        "top_k": 8,
+        "top_p": 1
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": false,
+    "schema_accepts": false
+  },
+  {
+    "name": "matrix-189",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 1e-07,
+        "top_k": 8,
+        "top_p": 0.6
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-190",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 1e-07,
+        "top_k": 8,
+        "top_p": 0.6
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-191",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 1e-07,
+        "top_k": 8,
+        "top_p": 0.6
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": false,
+    "schema_accepts": false
+  },
+  {
+    "name": "matrix-192",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 0.7
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-193",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 0.7
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-194",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 0.7
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-195",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 0.7,
+        "top_p": 0
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-196",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 0.7,
+        "top_p": 0
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-197",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 0.7,
+        "top_p": 0
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": false,
+    "schema_accepts": false
+  },
+  {
+    "name": "matrix-198",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 0.7,
+        "top_p": 1
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-199",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 0.7,
+        "top_p": 1
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-200",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 0.7,
+        "top_p": 1
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-201",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 0.7,
+        "top_p": 0.6
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-202",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 0.7,
+        "top_p": 0.6
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-203",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 0.7,
+        "top_p": 0.6
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": false,
+    "schema_accepts": false
+  },
+  {
+    "name": "matrix-204",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 0.7,
+        "top_k": 0
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-205",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 0.7,
+        "top_k": 0
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-206",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 0.7,
+        "top_k": 0
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-207",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 0.7,
+        "top_k": 0,
+        "top_p": 0
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-208",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 0.7,
+        "top_k": 0,
+        "top_p": 0
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-209",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 0.7,
+        "top_k": 0,
+        "top_p": 0
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": false,
+    "schema_accepts": false
+  },
+  {
+    "name": "matrix-210",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 0.7,
+        "top_k": 0,
+        "top_p": 1
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-211",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 0.7,
+        "top_k": 0,
+        "top_p": 1
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-212",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 0.7,
+        "top_k": 0,
+        "top_p": 1
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-213",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 0.7,
+        "top_k": 0,
+        "top_p": 0.6
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-214",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 0.7,
+        "top_k": 0,
+        "top_p": 0.6
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-215",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 0.7,
+        "top_k": 0,
+        "top_p": 0.6
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": false,
+    "schema_accepts": false
+  },
+  {
+    "name": "matrix-216",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 0.7,
+        "top_k": 1
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-217",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 0.7,
+        "top_k": 1
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-218",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 0.7,
+        "top_k": 1
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": false,
+    "schema_accepts": false
+  },
+  {
+    "name": "matrix-219",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 0.7,
+        "top_k": 1,
+        "top_p": 0
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-220",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 0.7,
+        "top_k": 1,
+        "top_p": 0
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-221",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 0.7,
+        "top_k": 1,
+        "top_p": 0
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": false,
+    "schema_accepts": false
+  },
+  {
+    "name": "matrix-222",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 0.7,
+        "top_k": 1,
+        "top_p": 1
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-223",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 0.7,
+        "top_k": 1,
+        "top_p": 1
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-224",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 0.7,
+        "top_k": 1,
+        "top_p": 1
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": false,
+    "schema_accepts": false
+  },
+  {
+    "name": "matrix-225",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 0.7,
+        "top_k": 1,
+        "top_p": 0.6
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-226",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 0.7,
+        "top_k": 1,
+        "top_p": 0.6
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-227",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 0.7,
+        "top_k": 1,
+        "top_p": 0.6
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": false,
+    "schema_accepts": false
+  },
+  {
+    "name": "matrix-228",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 0.7,
+        "top_k": 8
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-229",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 0.7,
+        "top_k": 8
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-230",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 0.7,
+        "top_k": 8
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": false,
+    "schema_accepts": false
+  },
+  {
+    "name": "matrix-231",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 0.7,
+        "top_k": 8,
+        "top_p": 0
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-232",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 0.7,
+        "top_k": 8,
+        "top_p": 0
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-233",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 0.7,
+        "top_k": 8,
+        "top_p": 0
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": false,
+    "schema_accepts": false
+  },
+  {
+    "name": "matrix-234",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 0.7,
+        "top_k": 8,
+        "top_p": 1
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-235",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 0.7,
+        "top_k": 8,
+        "top_p": 1
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-236",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 0.7,
+        "top_k": 8,
+        "top_p": 1
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": false,
+    "schema_accepts": false
+  },
+  {
+    "name": "matrix-237",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 0.7,
+        "top_k": 8,
+        "top_p": 0.6
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-238",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 0.7,
+        "top_k": 8,
+        "top_p": 0.6
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-239",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "multinomial"
+        },
+        "temperature": 0.7,
+        "top_k": 8,
+        "top_p": 0.6
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": false,
+    "schema_accepts": false
+  },
+  {
+    "name": "matrix-240",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        }
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-241",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        }
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-242",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        }
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-243",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "top_p": 0
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-244",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "top_p": 0
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-245",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "top_p": 0
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-246",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "top_p": 1
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-247",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "top_p": 1
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-248",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "top_p": 1
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-249",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "top_p": 0.6
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-250",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "top_p": 0.6
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-251",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "top_p": 0.6
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-252",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "top_k": 0
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-253",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "top_k": 0
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-254",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "top_k": 0
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-255",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "top_k": 0,
+        "top_p": 0
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-256",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "top_k": 0,
+        "top_p": 0
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-257",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "top_k": 0,
+        "top_p": 0
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-258",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "top_k": 0,
+        "top_p": 1
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-259",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "top_k": 0,
+        "top_p": 1
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-260",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "top_k": 0,
+        "top_p": 1
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-261",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "top_k": 0,
+        "top_p": 0.6
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-262",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "top_k": 0,
+        "top_p": 0.6
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-263",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "top_k": 0,
+        "top_p": 0.6
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-264",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "top_k": 1
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-265",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "top_k": 1
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-266",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "top_k": 1
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-267",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "top_k": 1,
+        "top_p": 0
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-268",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "top_k": 1,
+        "top_p": 0
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-269",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "top_k": 1,
+        "top_p": 0
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-270",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "top_k": 1,
+        "top_p": 1
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-271",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "top_k": 1,
+        "top_p": 1
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-272",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "top_k": 1,
+        "top_p": 1
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-273",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "top_k": 1,
+        "top_p": 0.6
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-274",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "top_k": 1,
+        "top_p": 0.6
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-275",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "top_k": 1,
+        "top_p": 0.6
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-276",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "top_k": 8
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-277",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "top_k": 8
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-278",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "top_k": 8
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-279",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "top_k": 8,
+        "top_p": 0
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-280",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "top_k": 8,
+        "top_p": 0
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-281",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "top_k": 8,
+        "top_p": 0
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-282",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "top_k": 8,
+        "top_p": 1
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-283",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "top_k": 8,
+        "top_p": 1
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-284",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "top_k": 8,
+        "top_p": 1
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-285",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "top_k": 8,
+        "top_p": 0.6
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-286",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "top_k": 8,
+        "top_p": 0.6
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-287",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "top_k": 8,
+        "top_p": 0.6
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-288",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 0
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-289",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 0
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-290",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 0
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-291",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 0,
+        "top_p": 0
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-292",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 0,
+        "top_p": 0
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-293",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 0,
+        "top_p": 0
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-294",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 0,
+        "top_p": 1
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-295",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 0,
+        "top_p": 1
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-296",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 0,
+        "top_p": 1
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-297",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 0,
+        "top_p": 0.6
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-298",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 0,
+        "top_p": 0.6
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-299",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 0,
+        "top_p": 0.6
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-300",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 0,
+        "top_k": 0
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-301",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 0,
+        "top_k": 0
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-302",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 0,
+        "top_k": 0
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-303",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 0,
+        "top_k": 0,
+        "top_p": 0
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-304",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 0,
+        "top_k": 0,
+        "top_p": 0
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-305",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 0,
+        "top_k": 0,
+        "top_p": 0
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-306",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 0,
+        "top_k": 0,
+        "top_p": 1
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-307",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 0,
+        "top_k": 0,
+        "top_p": 1
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-308",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 0,
+        "top_k": 0,
+        "top_p": 1
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-309",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 0,
+        "top_k": 0,
+        "top_p": 0.6
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-310",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 0,
+        "top_k": 0,
+        "top_p": 0.6
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-311",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 0,
+        "top_k": 0,
+        "top_p": 0.6
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-312",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 0,
+        "top_k": 1
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-313",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 0,
+        "top_k": 1
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-314",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 0,
+        "top_k": 1
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-315",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 0,
+        "top_k": 1,
+        "top_p": 0
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-316",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 0,
+        "top_k": 1,
+        "top_p": 0
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-317",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 0,
+        "top_k": 1,
+        "top_p": 0
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-318",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 0,
+        "top_k": 1,
+        "top_p": 1
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-319",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 0,
+        "top_k": 1,
+        "top_p": 1
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-320",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 0,
+        "top_k": 1,
+        "top_p": 1
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-321",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 0,
+        "top_k": 1,
+        "top_p": 0.6
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-322",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 0,
+        "top_k": 1,
+        "top_p": 0.6
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-323",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 0,
+        "top_k": 1,
+        "top_p": 0.6
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-324",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 0,
+        "top_k": 8
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-325",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 0,
+        "top_k": 8
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-326",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 0,
+        "top_k": 8
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-327",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 0,
+        "top_k": 8,
+        "top_p": 0
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-328",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 0,
+        "top_k": 8,
+        "top_p": 0
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-329",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 0,
+        "top_k": 8,
+        "top_p": 0
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-330",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 0,
+        "top_k": 8,
+        "top_p": 1
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-331",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 0,
+        "top_k": 8,
+        "top_p": 1
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-332",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 0,
+        "top_k": 8,
+        "top_p": 1
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-333",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 0,
+        "top_k": 8,
+        "top_p": 0.6
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-334",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 0,
+        "top_k": 8,
+        "top_p": 0.6
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-335",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 0,
+        "top_k": 8,
+        "top_p": 0.6
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-336",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 5e-08
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-337",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 5e-08
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-338",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 5e-08
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-339",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 5e-08,
+        "top_p": 0
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-340",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 5e-08,
+        "top_p": 0
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-341",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 5e-08,
+        "top_p": 0
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-342",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 5e-08,
+        "top_p": 1
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-343",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 5e-08,
+        "top_p": 1
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-344",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 5e-08,
+        "top_p": 1
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-345",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 5e-08,
+        "top_p": 0.6
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-346",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 5e-08,
+        "top_p": 0.6
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-347",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 5e-08,
+        "top_p": 0.6
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-348",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 5e-08,
+        "top_k": 0
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-349",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 5e-08,
+        "top_k": 0
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-350",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 5e-08,
+        "top_k": 0
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-351",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 5e-08,
+        "top_k": 0,
+        "top_p": 0
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-352",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 5e-08,
+        "top_k": 0,
+        "top_p": 0
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-353",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 5e-08,
+        "top_k": 0,
+        "top_p": 0
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-354",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 5e-08,
+        "top_k": 0,
+        "top_p": 1
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-355",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 5e-08,
+        "top_k": 0,
+        "top_p": 1
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-356",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 5e-08,
+        "top_k": 0,
+        "top_p": 1
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-357",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 5e-08,
+        "top_k": 0,
+        "top_p": 0.6
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-358",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 5e-08,
+        "top_k": 0,
+        "top_p": 0.6
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-359",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 5e-08,
+        "top_k": 0,
+        "top_p": 0.6
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-360",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 5e-08,
+        "top_k": 1
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-361",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 5e-08,
+        "top_k": 1
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-362",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 5e-08,
+        "top_k": 1
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-363",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 5e-08,
+        "top_k": 1,
+        "top_p": 0
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-364",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 5e-08,
+        "top_k": 1,
+        "top_p": 0
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-365",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 5e-08,
+        "top_k": 1,
+        "top_p": 0
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-366",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 5e-08,
+        "top_k": 1,
+        "top_p": 1
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-367",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 5e-08,
+        "top_k": 1,
+        "top_p": 1
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-368",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 5e-08,
+        "top_k": 1,
+        "top_p": 1
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-369",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 5e-08,
+        "top_k": 1,
+        "top_p": 0.6
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-370",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 5e-08,
+        "top_k": 1,
+        "top_p": 0.6
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-371",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 5e-08,
+        "top_k": 1,
+        "top_p": 0.6
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-372",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 5e-08,
+        "top_k": 8
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-373",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 5e-08,
+        "top_k": 8
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-374",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 5e-08,
+        "top_k": 8
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-375",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 5e-08,
+        "top_k": 8,
+        "top_p": 0
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-376",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 5e-08,
+        "top_k": 8,
+        "top_p": 0
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-377",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 5e-08,
+        "top_k": 8,
+        "top_p": 0
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-378",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 5e-08,
+        "top_k": 8,
+        "top_p": 1
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-379",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 5e-08,
+        "top_k": 8,
+        "top_p": 1
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-380",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 5e-08,
+        "top_k": 8,
+        "top_p": 1
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-381",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 5e-08,
+        "top_k": 8,
+        "top_p": 0.6
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-382",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 5e-08,
+        "top_k": 8,
+        "top_p": 0.6
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-383",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 5e-08,
+        "top_k": 8,
+        "top_p": 0.6
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-384",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 1e-07
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-385",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 1e-07
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-386",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 1e-07
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-387",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 1e-07,
+        "top_p": 0
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-388",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 1e-07,
+        "top_p": 0
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-389",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 1e-07,
+        "top_p": 0
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": false,
+    "schema_accepts": false
+  },
+  {
+    "name": "matrix-390",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 1e-07,
+        "top_p": 1
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-391",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 1e-07,
+        "top_p": 1
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-392",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 1e-07,
+        "top_p": 1
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-393",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 1e-07,
+        "top_p": 0.6
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-394",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 1e-07,
+        "top_p": 0.6
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-395",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 1e-07,
+        "top_p": 0.6
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": false,
+    "schema_accepts": false
+  },
+  {
+    "name": "matrix-396",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 1e-07,
+        "top_k": 0
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-397",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 1e-07,
+        "top_k": 0
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-398",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 1e-07,
+        "top_k": 0
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-399",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 1e-07,
+        "top_k": 0,
+        "top_p": 0
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-400",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 1e-07,
+        "top_k": 0,
+        "top_p": 0
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-401",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 1e-07,
+        "top_k": 0,
+        "top_p": 0
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": false,
+    "schema_accepts": false
+  },
+  {
+    "name": "matrix-402",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 1e-07,
+        "top_k": 0,
+        "top_p": 1
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-403",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 1e-07,
+        "top_k": 0,
+        "top_p": 1
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-404",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 1e-07,
+        "top_k": 0,
+        "top_p": 1
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-405",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 1e-07,
+        "top_k": 0,
+        "top_p": 0.6
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-406",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 1e-07,
+        "top_k": 0,
+        "top_p": 0.6
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-407",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 1e-07,
+        "top_k": 0,
+        "top_p": 0.6
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": false,
+    "schema_accepts": false
+  },
+  {
+    "name": "matrix-408",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 1e-07,
+        "top_k": 1
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-409",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 1e-07,
+        "top_k": 1
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-410",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 1e-07,
+        "top_k": 1
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": false,
+    "schema_accepts": false
+  },
+  {
+    "name": "matrix-411",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 1e-07,
+        "top_k": 1,
+        "top_p": 0
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-412",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 1e-07,
+        "top_k": 1,
+        "top_p": 0
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-413",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 1e-07,
+        "top_k": 1,
+        "top_p": 0
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": false,
+    "schema_accepts": false
+  },
+  {
+    "name": "matrix-414",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 1e-07,
+        "top_k": 1,
+        "top_p": 1
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-415",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 1e-07,
+        "top_k": 1,
+        "top_p": 1
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-416",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 1e-07,
+        "top_k": 1,
+        "top_p": 1
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": false,
+    "schema_accepts": false
+  },
+  {
+    "name": "matrix-417",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 1e-07,
+        "top_k": 1,
+        "top_p": 0.6
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-418",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 1e-07,
+        "top_k": 1,
+        "top_p": 0.6
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-419",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 1e-07,
+        "top_k": 1,
+        "top_p": 0.6
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": false,
+    "schema_accepts": false
+  },
+  {
+    "name": "matrix-420",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 1e-07,
+        "top_k": 8
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-421",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 1e-07,
+        "top_k": 8
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-422",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 1e-07,
+        "top_k": 8
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": false,
+    "schema_accepts": false
+  },
+  {
+    "name": "matrix-423",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 1e-07,
+        "top_k": 8,
+        "top_p": 0
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-424",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 1e-07,
+        "top_k": 8,
+        "top_p": 0
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-425",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 1e-07,
+        "top_k": 8,
+        "top_p": 0
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": false,
+    "schema_accepts": false
+  },
+  {
+    "name": "matrix-426",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 1e-07,
+        "top_k": 8,
+        "top_p": 1
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-427",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 1e-07,
+        "top_k": 8,
+        "top_p": 1
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-428",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 1e-07,
+        "top_k": 8,
+        "top_p": 1
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": false,
+    "schema_accepts": false
+  },
+  {
+    "name": "matrix-429",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 1e-07,
+        "top_k": 8,
+        "top_p": 0.6
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-430",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 1e-07,
+        "top_k": 8,
+        "top_p": 0.6
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-431",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 1e-07,
+        "top_k": 8,
+        "top_p": 0.6
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": false,
+    "schema_accepts": false
+  },
+  {
+    "name": "matrix-432",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 0.7
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-433",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 0.7
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-434",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 0.7
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-435",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 0.7,
+        "top_p": 0
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-436",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 0.7,
+        "top_p": 0
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-437",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 0.7,
+        "top_p": 0
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": false,
+    "schema_accepts": false
+  },
+  {
+    "name": "matrix-438",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 0.7,
+        "top_p": 1
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-439",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 0.7,
+        "top_p": 1
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-440",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 0.7,
+        "top_p": 1
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-441",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 0.7,
+        "top_p": 0.6
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-442",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 0.7,
+        "top_p": 0.6
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-443",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 0.7,
+        "top_p": 0.6
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": false,
+    "schema_accepts": false
+  },
+  {
+    "name": "matrix-444",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 0.7,
+        "top_k": 0
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-445",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 0.7,
+        "top_k": 0
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-446",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 0.7,
+        "top_k": 0
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-447",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 0.7,
+        "top_k": 0,
+        "top_p": 0
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-448",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 0.7,
+        "top_k": 0,
+        "top_p": 0
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-449",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 0.7,
+        "top_k": 0,
+        "top_p": 0
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": false,
+    "schema_accepts": false
+  },
+  {
+    "name": "matrix-450",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 0.7,
+        "top_k": 0,
+        "top_p": 1
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-451",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 0.7,
+        "top_k": 0,
+        "top_p": 1
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-452",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 0.7,
+        "top_k": 0,
+        "top_p": 1
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-453",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 0.7,
+        "top_k": 0,
+        "top_p": 0.6
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-454",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 0.7,
+        "top_k": 0,
+        "top_p": 0.6
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-455",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 0.7,
+        "top_k": 0,
+        "top_p": 0.6
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": false,
+    "schema_accepts": false
+  },
+  {
+    "name": "matrix-456",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 0.7,
+        "top_k": 1
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-457",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 0.7,
+        "top_k": 1
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-458",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 0.7,
+        "top_k": 1
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": false,
+    "schema_accepts": false
+  },
+  {
+    "name": "matrix-459",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 0.7,
+        "top_k": 1,
+        "top_p": 0
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-460",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 0.7,
+        "top_k": 1,
+        "top_p": 0
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-461",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 0.7,
+        "top_k": 1,
+        "top_p": 0
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": false,
+    "schema_accepts": false
+  },
+  {
+    "name": "matrix-462",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 0.7,
+        "top_k": 1,
+        "top_p": 1
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-463",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 0.7,
+        "top_k": 1,
+        "top_p": 1
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-464",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 0.7,
+        "top_k": 1,
+        "top_p": 1
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": false,
+    "schema_accepts": false
+  },
+  {
+    "name": "matrix-465",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 0.7,
+        "top_k": 1,
+        "top_p": 0.6
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-466",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 0.7,
+        "top_k": 1,
+        "top_p": 0.6
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-467",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 0.7,
+        "top_k": 1,
+        "top_p": 0.6
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": false,
+    "schema_accepts": false
+  },
+  {
+    "name": "matrix-468",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 0.7,
+        "top_k": 8
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-469",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 0.7,
+        "top_k": 8
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-470",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 0.7,
+        "top_k": 8
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": false,
+    "schema_accepts": false
+  },
+  {
+    "name": "matrix-471",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 0.7,
+        "top_k": 8,
+        "top_p": 0
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-472",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 0.7,
+        "top_k": 8,
+        "top_p": 0
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-473",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 0.7,
+        "top_k": 8,
+        "top_p": 0
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": false,
+    "schema_accepts": false
+  },
+  {
+    "name": "matrix-474",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 0.7,
+        "top_k": 8,
+        "top_p": 1
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-475",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 0.7,
+        "top_k": 8,
+        "top_p": 1
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-476",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 0.7,
+        "top_k": 8,
+        "top_p": 1
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": false,
+    "schema_accepts": false
+  },
+  {
+    "name": "matrix-477",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 0.7,
+        "top_k": 8,
+        "top_p": 0.6
+      },
+      "decode": {
+        "readback": {
+          "kind": "auto"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-478",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 0.7,
+        "top_k": 8,
+        "top_p": 0.6
+      },
+      "decode": {
+        "readback": {
+          "kind": "blocking"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "matrix-479",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": "gumbel"
+        },
+        "temperature": 0.7,
+        "top_k": 8,
+        "top_p": 0.6
+      },
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      }
+    },
+    "runtime_accepts": false,
+    "schema_accepts": false
+  },
+  {
+    "name": "shorthand-auto-k0",
+    "config": {
+      "decode": {
+        "readback": "auto"
+      },
+      "generation": {
+        "temperature": 0.7,
+        "top_k": 0,
+        "top_p": 1,
+        "sampling": {
+          "method": "gumbel"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "shorthand-auto-k2",
+    "config": {
+      "decode": {
+        "readback": "auto"
+      },
+      "generation": {
+        "temperature": 0.7,
+        "top_k": 2,
+        "top_p": 1,
+        "sampling": {
+          "method": "gumbel"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "shorthand-blocking-k0",
+    "config": {
+      "decode": {
+        "readback": "blocking"
+      },
+      "generation": {
+        "temperature": 0.7,
+        "top_k": 0,
+        "top_p": 1,
+        "sampling": {
+          "method": "gumbel"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "shorthand-blocking-k2",
+    "config": {
+      "decode": {
+        "readback": "blocking"
+      },
+      "generation": {
+        "temperature": 0.7,
+        "top_k": 2,
+        "top_p": 1,
+        "sampling": {
+          "method": "gumbel"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "shorthand-ring-k0",
+    "config": {
+      "decode": {
+        "readback": "ring"
+      },
+      "generation": {
+        "temperature": 0.7,
+        "top_k": 0,
+        "top_p": 1,
+        "sampling": {
+          "method": "gumbel"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "shorthand-ring-k2",
+    "config": {
+      "decode": {
+        "readback": "ring"
+      },
+      "generation": {
+        "temperature": 0.7,
+        "top_k": 2,
+        "top_p": 1,
+        "sampling": {
+          "method": "gumbel"
+        }
+      }
+    },
+    "runtime_accepts": false,
+    "schema_accepts": false
+  },
+  {
+    "name": "shorthand-ring-nonblocking-k0",
+    "config": {
+      "decode": {
+        "readback": "ring-nonblocking"
+      },
+      "generation": {
+        "temperature": 0.7,
+        "top_k": 0,
+        "top_p": 1,
+        "sampling": {
+          "method": "gumbel"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "shorthand-ring-nonblocking-k2",
+    "config": {
+      "decode": {
+        "readback": "ring-nonblocking"
+      },
+      "generation": {
+        "temperature": 0.7,
+        "top_k": 2,
+        "top_p": 1,
+        "sampling": {
+          "method": "gumbel"
+        }
+      }
+    },
+    "runtime_accepts": false,
+    "schema_accepts": false
+  },
+  {
+    "name": "shorthand-ring-fixed-k0",
+    "config": {
+      "decode": {
+        "readback": "ring-fixed"
+      },
+      "generation": {
+        "temperature": 0.7,
+        "top_k": 0,
+        "top_p": 1,
+        "sampling": {
+          "method": "gumbel"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "shorthand-ring-fixed-k2",
+    "config": {
+      "decode": {
+        "readback": "ring-fixed"
+      },
+      "generation": {
+        "temperature": 0.7,
+        "top_k": 2,
+        "top_p": 1,
+        "sampling": {
+          "method": "gumbel"
+        }
+      }
+    },
+    "runtime_accepts": false,
+    "schema_accepts": false
+  },
+  {
+    "name": "shorthand-ring-la0-k0",
+    "config": {
+      "decode": {
+        "readback": "ring-la0"
+      },
+      "generation": {
+        "temperature": 0.7,
+        "top_k": 0,
+        "top_p": 1,
+        "sampling": {
+          "method": "gumbel"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "shorthand-ring-la0-k2",
+    "config": {
+      "decode": {
+        "readback": "ring-la0"
+      },
+      "generation": {
+        "temperature": 0.7,
+        "top_k": 2,
+        "top_p": 1,
+        "sampling": {
+          "method": "gumbel"
+        }
+      }
+    },
+    "runtime_accepts": false,
+    "schema_accepts": false
+  },
+  {
+    "name": "shorthand-ring-hostdrain-k0",
+    "config": {
+      "decode": {
+        "readback": "ring-hostdrain"
+      },
+      "generation": {
+        "temperature": 0.7,
+        "top_k": 0,
+        "top_p": 1,
+        "sampling": {
+          "method": "gumbel"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "shorthand-ring-hostdrain-k2",
+    "config": {
+      "decode": {
+        "readback": "ring-hostdrain"
+      },
+      "generation": {
+        "temperature": 0.7,
+        "top_k": 2,
+        "top_p": 1,
+        "sampling": {
+          "method": "gumbel"
+        }
+      }
+    },
+    "runtime_accepts": false,
+    "schema_accepts": false
+  },
+  {
+    "name": "shorthand-ring-gpubatch-k0",
+    "config": {
+      "decode": {
+        "readback": "ring-gpubatch"
+      },
+      "generation": {
+        "temperature": 0.7,
+        "top_k": 0,
+        "top_p": 1,
+        "sampling": {
+          "method": "gumbel"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "shorthand-ring-gpubatch-k2",
+    "config": {
+      "decode": {
+        "readback": "ring-gpubatch"
+      },
+      "generation": {
+        "temperature": 0.7,
+        "top_k": 2,
+        "top_p": 1,
+        "sampling": {
+          "method": "gumbel"
+        }
+      }
+    },
+    "runtime_accepts": false,
+    "schema_accepts": false
+  },
+  {
+    "name": "shorthand-ring-gpubatch-nonblocking-k0",
+    "config": {
+      "decode": {
+        "readback": "ring-gpubatch-nonblocking"
+      },
+      "generation": {
+        "temperature": 0.7,
+        "top_k": 0,
+        "top_p": 1,
+        "sampling": {
+          "method": "gumbel"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "shorthand-ring-gpubatch-nonblocking-k2",
+    "config": {
+      "decode": {
+        "readback": "ring-gpubatch-nonblocking"
+      },
+      "generation": {
+        "temperature": 0.7,
+        "top_k": 2,
+        "top_p": 1,
+        "sampling": {
+          "method": "gumbel"
+        }
+      }
+    },
+    "runtime_accepts": false,
+    "schema_accepts": false
+  },
+  {
+    "name": "strings-host-blocking",
+    "config": {
+      "decode": {
+        "readback": "blocking"
+      },
+      "generation": {
+        "temperature": " 0.7 ",
+        "top_k": "+2",
+        "top_p": "0.6",
+        "sampling": {
+          "method": "gumbel"
+        }
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "strings-host-ring",
+    "config": {
+      "decode": {
+        "readback": {
+          "kind": "ring"
+        }
+      },
+      "generation": {
+        "temperature": "0.7",
+        "top_k": "2"
+      }
+    },
+    "runtime_accepts": false,
+    "schema_accepts": null
+  },
+  {
+    "name": "numeric-negative-temperature",
+    "config": {
+      "generation": {
+        "temperature": -1
+      }
+    },
+    "runtime_accepts": false,
+    "schema_accepts": null
+  },
+  {
+    "name": "numeric-invalid-p-greedy",
+    "config": {
+      "generation": {
+        "top_p": 1.1
+      }
+    },
+    "runtime_accepts": false,
+    "schema_accepts": null
+  },
+  {
+    "name": "string-invalid-p-greedy",
+    "config": {
+      "generation": {
+        "top_p": "1.1"
+      }
+    },
+    "runtime_accepts": false,
+    "schema_accepts": null
+  },
+  {
+    "name": "negative-k",
+    "config": {
+      "generation": {
+        "top_k": -1
+      }
+    },
+    "runtime_accepts": false,
+    "schema_accepts": false
+  },
+  {
+    "name": "fractional-k",
+    "config": {
+      "generation": {
+        "top_k": 1.5
+      }
+    },
+    "runtime_accepts": false,
+    "schema_accepts": false
+  },
+  {
+    "name": "string-nan-temperature",
+    "config": {
+      "generation": {
+        "temperature": "NaN"
+      }
+    },
+    "runtime_accepts": false,
+    "schema_accepts": false
+  },
+  {
+    "name": "null-off",
+    "config": {
+      "generation": {
+        "temperature": null,
+        "top_k": null,
+        "top_p": null
+      }
+    },
+    "runtime_accepts": true,
+    "schema_accepts": true
+  },
+  {
+    "name": "c10-object-refused",
+    "config": {
+      "decode": {
+        "readback": {
+          "lookahead_forwards": 2
+        }
+      }
+    },
+    "runtime_accepts": false,
+    "schema_accepts": false
+  },
+  {
+    "name": "c11-window-hot-refused",
+    "config": {
+      "speculative": {
+        "method": "mtp"
+      },
+      "scheduler": {
+        "max_sequences": 2
+      },
+      "generation": {
+        "temperature": 0.7
+      }
+    },
+    "runtime_accepts": false,
+    "schema_accepts": false
+  },
+  {
+    "name": "c12-batch-processor-refused",
+    "config": {
+      "scheduler": {
+        "max_sequences": 2
+      },
+      "generation": {
+        "presence_penalty": 0.5
+      }
+    },
+    "runtime_accepts": false,
+    "schema_accepts": false
+  },
+  {
+    "name": "mapped-method-case-contrast",
+    "config": {
+      "generation": {
+        "sampling": {
+          "method": " GUMBEL "
+        }
+      }
+    },
+    "runtime_accepts": false,
+    "schema_accepts": null
+  }
+]

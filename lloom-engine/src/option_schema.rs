@@ -114,6 +114,8 @@ fn arms(variants: &[&str]) -> Value {
 /// The shared value types.
 pub fn defs() -> Value {
     json!({
+        "NonnegativeNumber": {"type": "number", "minimum": 0},
+        "Probability": {"type": "number", "minimum": 0, "maximum": 1},
         "Duration": {
             "type": "string",
             "pattern": format!(r"^\s*{DURATION}\s*$"),
@@ -197,6 +199,7 @@ fn value_schema(key: &Key, default: &Value) -> Value {
             }
             b
         }
+        _ if base_type(ty)["type"] == "number" => base_type(ty),
         other => json!({"$ref": format!("#/$defs/{other}")}),
     };
     // A key whose vocabulary moved to a shared type still takes the stored
@@ -214,6 +217,13 @@ fn value_schema(key: &Key, default: &Value) -> Value {
         s = json!({"anyOf": [s, {"type": "integer", "minimum": 0}, {"type": "string", "pattern": COUNT}]});
     } else if base_type(ty)["type"] == "number" {
         s = json!({"anyOf": [s, {"type": "number"}, {"type": "string", "pattern": NUMBER}]});
+    }
+    // The derive applies these exact named inputs before the stored type's
+    // parser (e.g. named methods stored as bool). An annotation alone does
+    // not admit them; preserve the stored grammar alongside the input names.
+    if !m.values.is_empty() {
+        let names: Vec<&str> = m.values.iter().map(|(input, _)| *input).collect();
+        s = json!({"anyOf": [s, {"type": "string", "enum": names}]});
     }
     // `null` returns any key to its default; `none` unsets an optional one.
     let mut alts = vec![s, json!({"type": "null"})];
@@ -317,6 +327,41 @@ fn put(root: &mut Value, path: &str, leaf: Value) {
         .insert(segs[segs.len() - 1].to_string(), leaf);
 }
 
+/// Numeric domains belong to full-config checking, not the leaf spelling
+/// grammar: parsing a number and accepting a sampling request are separate.
+/// Numeric strings retain their loader grammar here; their domain projection
+/// also needs the loader's represented-f64 rounding, not a decimal sign test.
+fn numeric_domain_rules() -> Vec<Value> {
+    index().keys.values().filter_map(|key| {
+        let m = key.meta();
+        let ty = m.ty.strip_prefix("Option<").and_then(|t| t.strip_suffix('>')).unwrap_or(m.ty);
+        if m.schema.is_empty() || base_type(ty)["type"] != "number" { return None; }
+        let mut node = json!({"if": {"type": "number"}, "then": {"$ref": format!("#/$defs/{}", m.schema)}});
+        for part in key.path.split('.').rev() {
+            node = json!({"properties": {part: node}});
+        }
+        Some(node)
+    }).collect()
+}
+
+/// The readback forms selecting a kind, through the same preset parser as
+/// the option loader. Couplings must not apply object keywords to strings.
+pub(crate) fn readback_kind(kind: crate::ReadbackKind) -> Value {
+    let spellings: Vec<&str> = crate::ReadbackConfig::SPELLINGS
+        .iter()
+        .copied()
+        .filter(|s| {
+            let mut cfg = crate::ReadbackConfig::default();
+            crate::ReadbackConfig::apply_spelling(&mut cfg, s).is_ok() && cfg.kind == kind
+        })
+        .collect();
+    let name = kind.to_string();
+    json!({"anyOf": [
+        {"type": "object", "properties": {"kind": arms(&[name.as_str()])}, "required": ["kind"]},
+        {"type": "string", "enum": spellings}
+    ]})
+}
+
 /// The schema of the whole tree.
 pub fn schema() -> Value {
     let idx = index();
@@ -362,12 +407,95 @@ pub fn schema() -> Value {
     root["$defs"] = defs();
     root["x-lloom-couplings"] = crate::couplings::table();
     root["allOf"] = crate::couplings::static_rules();
+    root["allOf"]
+        .as_array_mut()
+        .expect("static rules are an array")
+        .extend(numeric_domain_rules());
     root
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn numeric_domains_are_field_attached_config_rules_not_a_second_leaf_parser() {
+        let schema = schema();
+        let rules = schema["allOf"].as_array().unwrap();
+        for (path, domain) in [
+            ("generation.temperature", "NonnegativeNumber"),
+            ("generation.top_p", "Probability"),
+        ] {
+            let key = &index().keys[path];
+            assert_eq!(key.meta().schema, domain);
+            let field = path.rsplit('.').next().unwrap();
+            let expected = json!({"properties": {"generation": {"properties": {
+                field: {"if": {"type": "number"},
+                    "then": {"$ref": format!("#/$defs/{domain}")}}
+            }}}});
+            assert!(
+                rules.contains(&expected),
+                "{path}: missing full-config domain"
+            );
+            let default = Value::Null;
+            assert_eq!(
+                value_schema(key, &default)["anyOf"][0]["anyOf"][0],
+                json!({"type": "number"}),
+                "leaf grammar still parses numbers before full-config checking"
+            );
+        }
+        assert_eq!(
+            schema["$defs"]["NonnegativeNumber"],
+            json!({"type": "number", "minimum": 0})
+        );
+        assert_eq!(
+            schema["$defs"]["Probability"],
+            json!({"type": "number", "minimum": 0, "maximum": 1})
+        );
+    }
+
+    #[test]
+    fn declared_value_mappings_add_exact_schema_names() {
+        let schema = schema();
+        let mut mapped = 0;
+        for key in index().keys.values().filter(|key| !key.meta().values.is_empty()) {
+            let node = key.path.split('.').fold(&schema, |node, part| {
+                &node["properties"][part]
+            });
+            let names: Vec<&str> = key.meta().values.iter().map(|(input, _)| *input).collect();
+            assert_eq!(
+                node["anyOf"][0]["anyOf"][1],
+                json!({"type": "string", "enum": names}),
+                "{}: declared input names must be validation, not only annotations",
+                key.path
+            );
+            assert!(node["anyOf"][0]["anyOf"][0].is_object());
+            mapped += 1;
+        }
+        assert!(mapped > 0, "control must reach a real mapped declaration");
+    }
+
+    #[test]
+    fn readback_coupling_forms_follow_the_actual_preset_parser() {
+        let schema = schema();
+        let predicate = &schema["allOf"][0]["if"]["properties"]["decode"]["properties"]["readback"];
+        assert_eq!(predicate["anyOf"][0]["type"], "object");
+        assert_eq!(predicate["anyOf"][1]["type"], "string");
+        let strings = predicate["anyOf"][1]["enum"].as_array().unwrap();
+        for spelling in crate::ReadbackConfig::SPELLINGS {
+            let mut cfg = crate::ReadbackConfig::default();
+            crate::ReadbackConfig::apply_spelling(&mut cfg, spelling).unwrap();
+            assert_eq!(
+                strings.contains(&json!(spelling)),
+                cfg.kind == crate::ReadbackKind::Ring,
+                "{spelling}"
+            );
+        }
+        assert_eq!(
+            schema["allOf"][1]["if"]["properties"]["decode"]["properties"]["readback"]["type"],
+            "object"
+        );
+    }
 
     /// Every key of the index has a node in the schema, at its path, and
     /// nothing else does.

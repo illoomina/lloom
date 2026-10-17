@@ -1212,6 +1212,101 @@ mod sampling_and_speculation_tests {
     }
 
     #[test]
+    fn sampling_fields_cross_real_cli_key_and_json_layers() {
+        let cases = [
+            (
+                vec!["-t", "0.7", "--gumbel", "--top-k", "2", "--top-p", "0.6"],
+                Sampling::FilteredGumbel {
+                    temperature: 0.7,
+                    k: 2,
+                    p: 0.6,
+                },
+            ),
+            (
+                vec![
+                    "--set",
+                    "generation.temperature=0.7",
+                    "--set",
+                    "generation.sampling.method=gumbel",
+                    "--set",
+                    "generation.top_k=2",
+                    "--set",
+                    "generation.top_p=0.6",
+                ],
+                Sampling::FilteredGumbel {
+                    temperature: 0.7,
+                    k: 2,
+                    p: 0.6,
+                },
+            ),
+            (
+                vec![
+                    "--generation-config",
+                    r#"{"temperature":" 0.7 ","top_k":"+2","top_p":"0.6","sampling":{"method":"gumbel"}}"#,
+                ],
+                Sampling::FilteredGumbel {
+                    temperature: 0.7,
+                    k: 2,
+                    p: 0.6,
+                },
+            ),
+            (
+                vec![
+                    "--generation-config",
+                    r#"{"temperature":0.7,"top_k":0,"top_p":1,"sampling":{"method":"multinomial"}}"#,
+                ],
+                Sampling::All { temperature: 0.7 },
+            ),
+            (
+                vec!["-t", "0", "--gumbel", "--top-k", "2", "--top-p", "0.6"],
+                Sampling::ArgMax,
+            ),
+            (
+                vec!["-t", "0.0000001", "--gumbel", "--top-k", "2"],
+                Sampling::FilteredGumbel {
+                    temperature: 1e-7,
+                    k: 2,
+                    p: 1.0,
+                },
+            ),
+        ];
+        for (argv, want) in cases {
+            let o = resolve_options_uninstalled(&common(&argv), &no_front).unwrap();
+            assert_eq!(o.sampling.sampling(), want, "{argv:?}");
+        }
+        for argv in [
+            vec!["--generation-config", r#"{"temperature":-1}"#],
+            vec!["--generation-config", r#"{"top_p":1.1}"#],
+            vec!["--generation-config", r#"{"top_p":"-0.1"}"#],
+            vec!["--generation-config", r#"{"top_k":-1}"#],
+            vec!["--set", "generation.temperature=nan"],
+            vec![
+                "-t",
+                "0.7",
+                "--gumbel",
+                "--top-k",
+                "2",
+                "--readback",
+                "ring",
+            ],
+            vec![
+                "-t",
+                "0.7",
+                "--gumbel",
+                "--top-k",
+                "2",
+                "--set",
+                "decode.readback.kind=ring",
+            ],
+        ] {
+            assert!(
+                resolve_options_uninstalled(&common(&argv), &no_front).is_err(),
+                "{argv:?}"
+            );
+        }
+    }
+
+    #[test]
     fn the_sampler_arms_follow_the_fields() {
         let o = resolve_options_uninstalled(&common(&[]), &no_front).unwrap();
         assert_eq!(o.sampling.sampling(), Sampling::ArgMax, "greedy by default");
@@ -1248,6 +1343,14 @@ mod sampling_and_speculation_tests {
             o.sampling.sampling(),
             Sampling::GumbelSoftmax { temperature: 0.7 }
         );
+        let filtered = resolve_options_uninstalled(
+            &common(&["-t", "0.7", "--gumbel", "--top-k", "2", "--top-p", "0.4"]),
+            &no_front,
+        ).unwrap();
+        assert_eq!(filtered.sampling.sampling(), Sampling::FilteredGumbel {
+            temperature: 0.7, k: 2, p: 0.4,
+        });
+        assert!(filtered.sampling.sampling().requires_host());
         let o = resolve_options_uninstalled(
             &common(&[
                 "--generation-config",

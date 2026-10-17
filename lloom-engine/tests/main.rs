@@ -17,6 +17,7 @@ mod accepted_frontier;
 mod checkpoint_policy;
 mod load_warnings;
 mod machine_gate;
+mod sampling_host_contract;
 mod qwen4exp_served_auto;
 mod recovery_frontier_served;
 mod tiny_chat_e2e;
@@ -66,3 +67,5 @@ fn every_test_file_is_a_module() {
 fn lloom_manifest_dir() -> String {
     std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| env!("CARGO_MANIFEST_DIR").to_string())
 }
+
+mod sampling_admission;

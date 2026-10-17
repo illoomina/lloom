@@ -142,7 +142,7 @@ fn table() -> Vec<((Option<f64>, Option<usize>, Option<f64>, bool), Want)> {
             (Some(T), Some(0), Some(1.0), false),
             arm(All { temperature: T }),
         ),
-        // The gumbel method takes no filter: off is fine, on is refused.
+        // Filtered Gumbel preserves the method and resolves to the explicit host arm.
         (
             (Some(T), None, None, true),
             arm(GumbelSoftmax { temperature: T }),
@@ -151,11 +151,11 @@ fn table() -> Vec<((Option<f64>, Option<usize>, Option<f64>, bool), Want)> {
             (Some(T), Some(0), Some(1.0), true),
             arm(GumbelSoftmax { temperature: T }),
         ),
-        ((Some(T), Some(20), None, true), Want::Refused("gumbel")),
-        ((Some(T), None, Some(0.9), true), Want::Refused("gumbel")),
+        ((Some(T), Some(20), None, true), arm(FilteredGumbel { temperature: T, k: 20, p: 1.0 })),
+        ((Some(T), None, Some(0.9), true), arm(FilteredGumbel { temperature: T, k: 0, p: 0.9 })),
         (
             (Some(T), Some(20), Some(0.95), true),
-            Want::Refused("gumbel"),
+            arm(FilteredGumbel { temperature: T, k: 20, p: 0.95 }),
         ),
     ]
 }
@@ -186,5 +186,5 @@ fn every_row_of_the_truth_table_resolves_as_written() {
         "RESOLVE rows={} arms={arms} refusals={refusals}",
         rows.len()
     );
-    assert_eq!((arms, refusals), (21, 12));
+    assert_eq!((arms, refusals), (24, 9));
 }

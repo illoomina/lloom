@@ -938,7 +938,8 @@ pub struct SamplingConfig {
         short = 't',
         path = "generation.temperature",
         status = "stable",
-        cli = "temperature"
+        cli = "temperature",
+        schema = "NonnegativeNumber"
     )]
     pub temperature: Option<f64>,
     /// Nucleus sampling's p (top-p); needs a temperature.
@@ -946,7 +947,8 @@ pub struct SamplingConfig {
         flag = "top-p",
         path = "generation.top_p",
         status = "stable",
-        cli = "top-p"
+        cli = "top-p",
+        schema = "Probability"
     )]
     pub top_p: Option<f64>,
     /// Top-k sampling's k; with top-p, top-k then top-p. Host-side: the ring arm is refused, the blocking arm runs.
@@ -1137,6 +1139,8 @@ impl SamplingConfig {
     /// layer — flags, `--set`, `--generation-config`, the env — lands here,
     /// since the JSON layer deserializes without the flag parsers.
     pub fn check(&self) -> Result<(), String> {
+        DecodeParams::try_sampling_of(self.temperature, self.top_p, self.top_k, self.gumbel)
+            .map_err(|e| format!("sampling: {e}"))?;
         self.processors()
             .validate()
             .map_err(|e| format!("sampling: {e}"))?;

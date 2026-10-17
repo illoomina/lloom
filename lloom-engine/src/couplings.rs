@@ -209,10 +209,7 @@ pub fn of(key: &str) -> Vec<&'static str> {
 
 /// The sampler is drawn on the host, which the ring cannot carry.
 fn host_side(s: &Sampling) -> bool {
-    !matches!(
-        s,
-        Sampling::ArgMax | Sampling::All { .. } | Sampling::GumbelSoftmax { .. }
-    )
+    !crate::ReadbackArm::ring_admits(s)
 }
 
 const DRAFTERS: [&str; 3] = ["dspark", "mtp", "dflash"];
@@ -229,18 +226,33 @@ pub fn refuse_speculative(
     if !DRAFTERS.contains(&method) || max_sequences <= 1 {
         return Ok(());
     }
+    let arm = sampling.sampling();
+    let processors = sampling.processors().is_active();
+    let refusal = match lloom::nn::refuse(
+        lloom::nn::Body::BatchedWindow,
+        &lloom::nn::Asks {
+            sampling: &arm,
+            processors,
+            budget: sampling.thinking_budget.is_some(),
+            digest: false,
+            logprobs: None,
+        },
+    ) {
+        Ok(()) => return Ok(()),
+        Err(e) => e,
+    };
     let mut why = Vec::new();
-    if sampling.sampling() != Sampling::ArgMax {
+    if arm != Sampling::ArgMax {
         why.push("a temperature (generation.temperature)");
     }
-    if sampling.processors().is_active() {
+    if processors {
         why.push("a logits processor (generation.min_p, the penalties, generation.logit_bias)");
     }
     if sampling.thinking_budget.is_some() {
         why.push("a thinking budget (reasoning.budget)");
     }
     if why.is_empty() {
-        return Ok(());
+        return Err(format!("C11: speculative.method = {method}: {refusal}"));
     }
     Err(format!(
         "C11: speculative.method = {method} at scheduler.max_sequences = {max_sequences} refuses \
@@ -267,7 +279,18 @@ pub fn refuse(o: &EngineOptions) -> Result<(), String> {
         ));
     }
     refuse_speculative(&o.speculative.method, s, o.scheduler.max_sequences)?;
-    if o.scheduler.max_sequences > 1 && (s.processors().is_active() || s.thinking_budget.is_some())
+    if o.scheduler.max_sequences > 1
+        && lloom::nn::refuse(
+            lloom::nn::Body::BatchedStep,
+            &lloom::nn::Asks {
+                sampling: &s.sampling(),
+                processors: s.processors().is_active(),
+                budget: s.thinking_budget.is_some(),
+                digest: false,
+                logprobs: None,
+            },
+        )
+        .is_err()
     {
         return Err(format!(
             "C12: scheduler.max_sequences = {} refuses {}: the batched driver's rows draw without \
@@ -387,9 +410,10 @@ pub fn table() -> Value {
 /// file: what [`refuse`] refuses, checked before load by any validator.
 pub fn static_rules() -> Value {
     let hot = json!({"type": "number", "minimum": 1e-7});
+    let ring = crate::option_schema::readback_kind(crate::ReadbackKind::Ring);
     let host_sampler = json!({"anyOf": [
-        {"properties": {"top_k": {"type": "integer"}}, "required": ["top_k"]},
-        {"properties": {"top_p": {"type": "number"}}, "required": ["top_p"]}
+        {"properties": {"top_k": {"type": "integer", "minimum": 1}}, "required": ["top_k"]},
+        {"properties": {"top_p": {"type": "number", "minimum": 0, "exclusiveMaximum": 1}}, "required": ["top_p"]}
     ]});
     let active = json!({"anyOf": [
         {"properties": {"repetition_penalty": {"type": "number", "not": {"const": 1}}}, "required": ["repetition_penalty"]},
@@ -402,15 +426,14 @@ pub fn static_rules() -> Value {
     json!([
         {"$comment": "C2: an explicit ring with a host-side sampler is refused",
          "if": {"properties": {
-                "decode": {"properties": {"readback": {"properties": {"kind": {"const": "ring"}}, "required": ["kind"]}}, "required": ["readback"]},
+                "decode": {"properties": {"readback": ring}, "required": ["readback"]},
                 "generation": {"allOf": [
                     {"properties": {"temperature": hot}, "required": ["temperature"]},
-                    host_sampler,
-                    {"not": {"properties": {"sampling": {"properties": {"method": {"const": "gumbel"}}, "required": ["method"]}}, "required": ["sampling"]}}]}},
+                    host_sampler]}},
                 "required": ["decode", "generation"]},
          "then": false},
         {"$comment": "C10: at most one forward past an unlearned EOS",
-         "if": {"properties": {"decode": {"properties": {"readback": {"properties": {"lookahead_forwards": {"type": "integer", "minimum": 2}}, "required": ["lookahead_forwards"]}}, "required": ["readback"]}}, "required": ["decode"]},
+         "if": {"properties": {"decode": {"properties": {"readback": {"type": "object", "properties": {"lookahead_forwards": {"type": "integer", "minimum": 2}}, "required": ["lookahead_forwards"]}}, "required": ["readback"]}}, "required": ["decode"]},
          "then": false},
         {"$comment": "C11: a drafter at more than one sequence refuses a temperature, a logits processor and a thinking budget",
          "if": {"properties": {
@@ -505,12 +528,6 @@ mod tests {
                 ("generation.top_p", "0.9"),
             ][..],
             &[
-                ("decode.readback.kind", "ring"),
-                ("generation.temperature", "0.7"),
-                ("generation.top_p", "0.9"),
-                ("generation.sampling.method", "gumbel"),
-            ][..],
-            &[
                 ("speculative.method", "auto"),
                 ("generation.temperature", "0.7"),
             ][..],
@@ -554,9 +571,39 @@ mod tests {
         ] {
             refuse(&with(sets)).unwrap_or_else(|e| panic!("{sets:?}: {e}"));
         }
+        let filtered_gumbel = with(&[
+            ("decode.readback.kind", "ring"),
+            ("generation.temperature", "0.7"),
+            ("generation.top_p", "0.9"),
+            ("generation.sampling.method", "gumbel"),
+        ]);
+        assert!(refuse(&filtered_gumbel).unwrap_err().starts_with("C2:"));
         let mut o = EngineOptions::default();
         o.decode.readback.lookahead = 2;
         assert!(refuse(&o).unwrap_err().starts_with("C10:"));
+    }
+
+    #[test]
+    fn disabled_filters_stay_on_the_ring_but_filtered_gumbel_is_explicit_host() {
+        for method in ["multinomial", "gumbel"] {
+            let off = with(&[
+                ("decode.readback.kind", "ring"),
+                ("generation.temperature", "0.7"),
+                ("generation.top_k", "0"),
+                ("generation.top_p", "1"),
+                ("generation.sampling.method", method),
+            ]);
+            refuse(&off).unwrap();
+        }
+        let host = with(&[
+            ("decode.readback.kind", "auto"),
+            ("generation.temperature", "0.7"),
+            ("generation.top_p", "0"),
+            ("generation.sampling.method", "gumbel"),
+        ]);
+        refuse(&host).unwrap();
+        assert!(host.sampling.sampling().requires_host());
+        assert!(explain(&host).iter().any(|s| s.contains("auto -> blocking")));
     }
 
     #[test]

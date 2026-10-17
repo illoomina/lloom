@@ -719,7 +719,7 @@ fn tokenize(shared: &Shared, v: &Value) -> Handled<Value> {
 
 fn completions(shared: &Shared, v: &Value, _headers: &[Header]) -> Handled<Reply> {
     let model = shared.model_name.clone();
-    let params = sampling_params(shared, v)?;
+    let params = sampling_params(&shared.sampling, shared.engine.as_ref(), v)?;
     let stream = v.get("stream").and_then(Value::as_bool).unwrap_or(false);
     if v.get("n").and_then(Value::as_u64).unwrap_or(1) != 1 {
         return Err(bad("n > 1 is not supported"));
@@ -929,7 +929,7 @@ fn chat_completions(shared: &Shared, v: &Value) -> Handled<Reply> {
         // fall back to `logprobs` looks for.
         return Err(bad("guided decoding is not supported"));
     }
-    let mut params = sampling_params(shared, v)?;
+    let mut params = sampling_params(&shared.sampling, shared.engine.as_ref(), v)?;
     let wanted = request_budgets(shared, v, params.max_tokens)?;
     let stream = v.get("stream").and_then(Value::as_bool).unwrap_or(false);
     let want_logprobs = match v.get("logprobs") {
@@ -1456,25 +1456,25 @@ fn request_budgets(shared: &Shared, v: &Value, max_tokens: usize) -> Handled<Bud
 }
 
 /// The sampling knobs both OpenAI endpoints share.
-fn sampling_params(shared: &Shared, v: &Value) -> Handled<DecodeParams> {
+fn sampling_params(defaults: &crate::SamplingConfig, engine: &dyn Served, v: &Value) -> Handled<DecodeParams> {
     let max_tokens = v
         .get("max_completion_tokens")
         .or_else(|| v.get("max_tokens"))
         .and_then(Value::as_u64)
         .map(|n| n as usize)
-        .unwrap_or(shared.sampling.max_tokens);
+        .unwrap_or(defaults.max_tokens);
     if max_tokens == 0 {
         return Err(bad("max_tokens must be positive"));
     }
     let temperature = match v.get("temperature") {
-        None | Some(Value::Null) => shared.sampling.temperature,
+        None | Some(Value::Null) => defaults.temperature,
         Some(t) => Some(
             t.as_f64()
                 .ok_or_else(|| bad("field 'temperature' must be a number"))?,
         ),
     };
     let top_k = match v.get("top_k") {
-        None | Some(Value::Null) => shared.sampling.top_k,
+        None | Some(Value::Null) => defaults.top_k,
         Some(k) => Some(
             k.as_u64()
                 .ok_or_else(|| bad("field 'top_k' must be a positive integer"))?
@@ -1506,30 +1506,31 @@ fn sampling_params(shared: &Shared, v: &Value) -> Handled<DecodeParams> {
         }
         (Some(m), _) => m,
         (None, Some(g)) => g,
-        (None, None) => shared.sampling.gumbel,
+        (None, None) => defaults.gumbel,
     };
     let top_p = match v.get("top_p") {
-        None | Some(Value::Null) => shared.sampling.top_p,
+        None | Some(Value::Null) => defaults.top_p,
         Some(p) => {
             let p = p
                 .as_f64()
                 .ok_or_else(|| bad("field 'top_p' must be a number"))?;
-            // `1.0` is the OpenAI default and means no nucleus.
-            (p > 0.0 && p < 1.0).then_some(p)
+            Some(p)
         }
     };
+    DecodeParams::try_sampling_of(temperature, top_p, top_k, gumbel)
+        .map_err(|e| bad(e.to_string()))?;
     // A sampled request with no seed draws a fresh one, so repeats are
     // independent; a seeded one reproduces.
     let seed = v
         .get("seed")
         .and_then(Value::as_u64)
-        .unwrap_or_else(|| shared.sampling.seed_or_random());
+        .unwrap_or_else(|| defaults.seed_or_random());
     let ignore_eos = v
         .get("ignore_eos")
         .and_then(Value::as_bool)
-        .unwrap_or(shared.sampling.ignore_eos);
+        .unwrap_or(defaults.ignore_eos);
     let stop_strings: Vec<String> = match v.get("stop") {
-        None | Some(Value::Null) => shared.sampling.stop.clone(),
+        None | Some(Value::Null) => defaults.stop.clone(),
         Some(Value::String(s)) => vec![s.clone()],
         Some(Value::Array(items)) => items
             .iter()
@@ -1555,9 +1556,8 @@ fn sampling_params(shared: &Shared, v: &Value) -> Handled<DecodeParams> {
             return Err(bad(format!("field '{key}' is not supported")));
         }
     }
-    let processors = request_processors(&shared.sampling, v)?;
+    let processors = request_processors(defaults, v)?;
     let (eos_ids, readback) = {
-        let engine = shared.engine.as_ref();
         let eos = if ignore_eos {
             NEVER_EOS.to_vec()
         } else {
@@ -1577,7 +1577,7 @@ fn sampling_params(shared: &Shared, v: &Value) -> Handled<DecodeParams> {
         stop_strings,
         readback,
         logits_digest: false,
-        prefill_tile: shared.engine.prefill_tile(),
+        prefill_tile: engine.prefill_tile(),
         turn_tail: 0,
         no_checkpoint: false,
         thinking: None,
@@ -4078,5 +4078,134 @@ mod logprob_request_tests {
             Some(LogprobRequest { top: 0, rows: true }),
             "the session's own keep, never serialised unless asked"
         );
+    }
+}
+
+
+#[cfg(test)]
+mod sampling_ingress_tests {
+    use super::{sampling_params, Failure};
+    use crate::app::served::tests::NoVision;
+    use lloom::generation::{Sampling, GREEDY_BELOW};
+    use serde_json::json;
+
+    #[test]
+    fn actual_http_sampling_parser_preserves_method_filters_and_defaults() {
+        let engine = NoVision::new(None);
+        let defaults = crate::SamplingConfig {
+            seed: Some(7),
+            ..Default::default()
+        };
+        let mut rows = 0;
+        for gumbel in [false, true] {
+            for t in [
+                None,
+                Some(0.0),
+                Some(GREEDY_BELOW / 2.0),
+                Some(GREEDY_BELOW),
+                Some(0.7),
+            ] {
+                for k in [None, Some(0), Some(1), Some(8)] {
+                    for p in [None, Some(0.0), Some(1.0), Some(0.6)] {
+                        let mut v = json!({"seed": 7, "sampling_method": if gumbel { "gumbel" } else { "multinomial" }});
+                        if let Some(t) = t {
+                            v["temperature"] = json!(t);
+                        }
+                        if let Some(k) = k {
+                            v["top_k"] = json!(k);
+                        }
+                        if let Some(p) = p {
+                            v["top_p"] = json!(p);
+                        }
+                        let params = sampling_params(&defaults, &engine, &v)
+                            .ok()
+                            .expect("valid request");
+                        assert_eq!(
+                            (
+                                params.temperature,
+                                params.top_k,
+                                params.top_p,
+                                params.gumbel
+                            ),
+                            (t, k, p, gumbel)
+                        );
+                        assert_eq!(
+                            params.try_sampling().unwrap(),
+                            Sampling::resolve(t, k, p, gumbel).unwrap()
+                        );
+                        rows += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(rows, 160);
+        let defaults = crate::SamplingConfig {
+            temperature: Some(0.7),
+            top_k: Some(2),
+            top_p: Some(0.6),
+            gumbel: true,
+            seed: Some(7),
+            ..Default::default()
+        };
+        for v in [
+            json!({}),
+            json!({"temperature": null, "top_k": null, "top_p": null, "gumbel": null}),
+        ] {
+            let params = sampling_params(&defaults, &engine, &v).ok().unwrap();
+            assert_eq!(
+                params.try_sampling().unwrap(),
+                Sampling::FilteredGumbel {
+                    temperature: 0.7,
+                    k: 2,
+                    p: 0.6
+                }
+            );
+        }
+        let off = sampling_params(
+            &defaults,
+            &engine,
+            &json!({"top_k": 0, "top_p": 1, "sampling_method": "multinomial"}),
+        )
+        .ok()
+        .unwrap();
+        assert_eq!(
+            off.try_sampling().unwrap(),
+            Sampling::All { temperature: 0.7 }
+        );
+    }
+
+    #[test]
+    fn actual_http_sampling_parser_refuses_ranges_and_types_before_engine_execution() {
+        let engine = NoVision::new(None);
+        let defaults = crate::SamplingConfig {
+            seed: Some(7),
+            ..Default::default()
+        };
+        for (v, field) in [
+            (json!({"temperature": -1}), "temperature"),
+            (json!({"top_p": -0.1}), "top_p"),
+            (json!({"top_p": 1.1}), "top_p"),
+            (json!({"top_k": -1}), "top_k"),
+            (json!({"top_k": 1.5}), "top_k"),
+            (json!({"temperature": "0.7"}), "temperature"),
+            (json!({"top_k": "2"}), "top_k"),
+            (json!({"top_p": "0.6"}), "top_p"),
+            (json!({"gumbel": "true"}), "gumbel"),
+            (json!({"sampling_method": "GUMBEL"}), "sampling_method"),
+            (
+                json!({"sampling_method": "gumbel", "gumbel": false}),
+                "disagree",
+            ),
+        ] {
+            match sampling_params(&defaults, &engine, &v) {
+                Err(Failure::BadRequest(message)) => {
+                    assert!(message.contains(field), "{v}: {message}")
+                }
+                Err(_) => panic!("{v}: not a bad request"),
+                Ok(_) => panic!("{v}: malformed sampling accepted"),
+            }
+        }
+        // JSON has no NaN/Infinity numeric values; invalid finite values
+        // still refuse under greedy, rather than disappearing as unused.
     }
 }

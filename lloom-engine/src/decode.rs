@@ -181,11 +181,11 @@ impl ReadbackArm {
 
     /// Whether the ring arm can serve `sampling` without a host round trip
     /// it would not report (`Ring::check_sampler`).
-    fn ring_admits(sampling: &Sampling) -> bool {
-        matches!(
-            sampling,
-            Sampling::ArgMax | Sampling::All { .. } | Sampling::GumbelSoftmax { .. }
-        )
+    pub(crate) fn ring_admits(sampling: &Sampling) -> bool {
+        lloom::nn::refuse(
+            lloom::nn::Body::Step { ring: true },
+            &lloom::nn::Asks::sampling(sampling),
+        ).is_ok()
     }
 
     /// The arm that runs for `sampling`: `Auto` resolves here — to
@@ -287,15 +287,20 @@ pub struct LogprobRequest {
 }
 
 impl DecodeParams {
-    /// The sampler arm for these fields: argmax below 1e-7 of temperature,
-    /// else gumbel-max, top-k-then-top-p, top-k, top-p, or plain temperature
-    /// (`LogitsProcessor::new`'s rule, extended to the arms the sampler has).
+    /// Infallible compatibility entry. Valid fields share `Sampling::resolve`;
+    /// invalid fields retain their previous mapping. Admission uses
+    /// [`Self::try_sampling_of`] instead of turning invalid fields into a draw.
     pub fn sampling_of(
         temperature: Option<f64>,
         top_p: Option<f64>,
         top_k: Option<usize>,
         gumbel: bool,
     ) -> Sampling {
+        if let Ok(resolved) = Self::try_sampling_of(temperature, top_p, top_k, gumbel) {
+            return resolved;
+        }
+        // Infallible public compatibility entry: retain its old invalid-field
+        // mapping. Production admission uses the fallible entry before mutation.
         let temperature = match temperature {
             Some(t) if t >= 1e-7 => t,
             _ => return Sampling::ArgMax,
@@ -309,6 +314,27 @@ impl DecodeParams {
             (None, Some(p)) => Sampling::TopP { p, temperature },
             (None, None) => Sampling::All { temperature },
         }
+    }
+
+    /// Validated request fields, including fields a greedy draw does not read.
+    pub fn try_sampling_of(
+        temperature: Option<f64>,
+        top_p: Option<f64>,
+        top_k: Option<usize>,
+        gumbel: bool,
+    ) -> Result<Sampling> {
+        Sampling::resolve(temperature, top_k, top_p, gumbel)
+    }
+
+    pub fn try_sampling(&self) -> Result<Sampling> {
+        Self::try_sampling_of(self.temperature, self.top_p, self.top_k, self.gumbel)
+    }
+
+    pub fn try_sampler(&self) -> Result<LogitsProcessor> {
+        self.processors.validate().map_err(lloom_tensor::Error::msg)?;
+        Ok(LogitsProcessor::from_sampling(self.seed, self.try_sampling()?)
+            .with_processors(self.processors.clone())
+            .with_logits_digest(self.logits_digest))
     }
 
     /// These params under an owner whose prefix reuse is `reuse`: with reuse
@@ -330,7 +356,8 @@ impl DecodeParams {
         Self::sampling_of(self.temperature, self.top_p, self.top_k, self.gumbel)
     }
 
-    /// The sampler of this request, seeded, with its processors.
+    /// Infallible compatibility constructor; request admission uses
+    /// [`Self::try_sampler`] before changing sequence state.
     pub fn sampler(&self) -> LogitsProcessor {
         LogitsProcessor::from_sampling(self.seed, self.sampling())
             .with_processors(self.processors.clone())
@@ -341,7 +368,8 @@ impl DecodeParams {
     /// table every body asks (`lloom::nn::decode::refuse`); `path` names the
     /// caller in the message.
     pub fn refuse_on(&self, body: lloom::nn::Body, path: &str) -> Result<()> {
-        let sampling = self.sampling();
+        self.processors.validate().map_err(lloom_tensor::Error::msg)?;
+        let sampling = self.try_sampling()?;
         lloom::nn::refuse(
             body,
             &lloom::nn::Asks {
@@ -739,11 +767,7 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
         if params.eos_ids.is_empty() {
             lloom_tensor::bail!("DecodeSession::decode: eos_ids is empty; a run needs an EOS set");
         }
-        let (prepared, turn) = crate::turn::prepare(&mut self.session, prompt_ids, true)?;
-        let (checkpoint, checkpoint_at) = self.establish_checkpoint(&prepared, params)?;
-
-        let mut sampler = params.sampler();
-        sampler.observe_prompt(prompt_ids);
+        let mut sampler = params.try_sampler()?;
         let arm = if params.logits_digest || params.logprobs.is_some() {
             ReadbackArm::Blocking
         } else {
@@ -754,6 +778,10 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
         if let Err(e) = self.config.check() {
             lloom_tensor::bail!("DecodeSession::decode: {e}");
         }
+        params.refuse_on(lloom::nn::Body::Step { ring: matches!(arm, ReadbackArm::Ring(_)) }, "DecodeSession::decode")?;
+        let (prepared, turn) = crate::turn::prepare(&mut self.session, prompt_ids, true)?;
+        let (checkpoint, checkpoint_at) = self.establish_checkpoint(&prepared, params)?;
+        sampler.observe_prompt(prompt_ids);
         let mut spec = IdentityProposer;
 
         let mut stream = crate::stream::TextStream::new(params.max_tokens);
@@ -1075,7 +1103,7 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
         // before it) and the logits digest (over the rows the round keeps)
         // are the K=1 loop's, row for row (`LogitsProcessor::window_draw_device`).
         let mut sampler = params
-            .sampler()
+            .try_sampler()?
             .with_window_budget(params.thinking.as_ref());
         sampler.observe_prompt(prompt_ids);
         // A prompt the cache holds whole re-feeds its last token: the first
@@ -1868,6 +1896,63 @@ mod tests {
             ] {
                 DecodeParams::default().refuse_on(body, "x").unwrap();
             }
+        }
+
+        #[test]
+        fn filtered_host_refusal_precedes_prepare_and_supported_retry_runs() -> Result<()> {
+            let device = Device::Cpu;
+            let model = Chain::new(&device)?;
+            let mut session = DecodeSession::new(&model, Pos(0), device.clone(), 0);
+            let mut params = DecodeParams {
+                temperature: Some(0.7),
+                top_k: Some(1),
+                top_p: Some(0.6),
+                gumbel: true,
+                eos_ids: vec![EOS],
+                max_tokens: 3,
+                readback: ReadbackArm::CROWN,
+                ..Default::default()
+            };
+            let error = session
+                .decode_until(
+                    &[5, 1],
+                    |_| panic!("refusal reached detokenizer"),
+                    &params,
+                    |_| panic!("refusal reached fragment hook"),
+                )
+                .unwrap_err();
+            assert!(error.to_string().contains("explicit host draw"), "{error}");
+            assert_eq!(session.pos(), 0);
+            assert_eq!(session.session.sequence().cache().0, 0);
+            assert!(session.session.tokens().is_empty());
+            assert!(session.rings.is_empty());
+            params.readback = ReadbackArm::Blocking;
+            params.logits_digest = true;
+            params.logprobs = Some(LogprobRequest::default());
+            let out = session.decode_until(&[5, 1], |ids| Ok(text_of(ids)), &params, |_| true)?;
+            assert_eq!(out.tokens, chain(1, 3).0);
+            assert_eq!(out.readback, ReadbackArm::Blocking);
+            assert_eq!(
+                out.logprobs.as_ref().unwrap().sampled.len(),
+                out.tokens.len()
+            );
+            let pos = session.pos();
+            let tokens = session.session.tokens().to_vec();
+            let cache = session.session.sequence().cache().0;
+            params.top_p = Some(1.1);
+            let error = session
+                .decode_until(
+                    &[0],
+                    |_| panic!("invalid p reached detokenizer"),
+                    &params,
+                    |_| panic!("invalid p reached fragment hook"),
+                )
+                .unwrap_err();
+            assert!(error.to_string().contains("top_p"), "{error}");
+            assert_eq!(session.pos(), pos);
+            assert_eq!(session.session.tokens(), tokens);
+            assert_eq!(session.session.sequence().cache().0, cache);
+            Ok(())
         }
 
         /// The per-token logprobs are the blocking K=1 body's alone: the ring,

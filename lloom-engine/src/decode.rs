@@ -17,7 +17,7 @@
 //! boundary is the [`crate::seam`] trait, one level out, where it is allowed.
 
 use lloom::generation::poll::PollMechanism;
-use lloom::generation::readback::RING_HISTORY_SLOTS;
+use lloom::generation::readback::{RingLap, RING_HISTORY_SLOTS};
 use lloom::generation::{
     Blocking, EosRead, LogitsProcessor, Logprobs, Processors, ReadbackStrategy, Ring, Sampling,
     ThinkingBudget, ThinkingReport,
@@ -40,6 +40,55 @@ fn stop_on_reader_exit<T>(stop: &std::sync::atomic::AtomicBool, read: impl FnOnc
     }
     let _guard = StopOnExit(stop);
     read()
+}
+
+/// Drain published batches, stopping the producer before delivering a batch
+/// whose read found EOS. A hook on an earlier batch can still delay that read.
+fn drain_ring_reader(
+    stop: &std::sync::atomic::AtomicBool,
+    stream_done: &std::sync::atomic::AtomicBool,
+    mut read: impl FnMut(&mut Vec<u32>) -> (std::result::Result<usize, RingLap>, bool),
+    mut hook: impl FnMut(&[u32]) -> Result<bool>,
+) -> Result<()> {
+    use std::sync::atomic::Ordering;
+    stop_on_reader_exit(stop, || {
+        let mut read_and_stop = |buf: &mut Vec<u32>| {
+            let (result, ended) = read(buf);
+            if result.is_ok() && ended {
+                stop.store(true, Ordering::Release);
+            }
+            result
+        };
+        let mut buf = Vec::with_capacity(64);
+        loop {
+            buf.clear();
+            match read_and_stop(&mut buf) {
+                Ok(0) => {
+                    if stream_done.load(Ordering::Acquire) {
+                        buf.clear();
+                        let n = read_and_stop(&mut buf).map_err(|lap| {
+                            stop.store(true, Ordering::Release);
+                            lloom_tensor::Error::msg(format!("ring reader final drain: {lap}"))
+                        })?;
+                        if n > 0 && !hook(&buf)? {
+                            stop.store(true, Ordering::Release);
+                        }
+                        return Ok(());
+                    }
+                    std::thread::sleep(std::time::Duration::from_micros(200));
+                }
+                Ok(_) => {
+                    if !hook(&buf)? {
+                        return Ok(());
+                    }
+                }
+                Err(lap) => {
+                    stop.store(true, Ordering::Release);
+                    lloom_tensor::bail!("ring reader: {lap}");
+                }
+            }
+        }
+    })
 }
 
 /// Why a decode run stopped.
@@ -895,58 +944,19 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
                             let stop_flag = &stop_flag;
                             let stream_done = &stream_done;
                             let worker = s.spawn(move || {
-                                stop_on_reader_exit(stop_flag, || -> Result<()> {
-                                    let mut buf: Vec<u32> = Vec::with_capacity(64);
-                                    loop {
-                                        buf.clear();
+                                drain_ring_reader(
+                                    stop_flag,
+                                    stream_done,
+                                    |buf| {
                                         if reader.ended() {
                                             stop_flag
                                                 .store(true, std::sync::atomic::Ordering::Release);
                                         }
-                                        match reader.read_new(&mut buf) {
-                                            Ok(0) => {
-                                                if stream_done
-                                                    .load(std::sync::atomic::Ordering::Acquire)
-                                                {
-                                                    buf.clear();
-                                                    let n = reader.read_new(&mut buf).map_err(
-                                                        |lap| {
-                                                            stop_flag.store(
-                                                            true,
-                                                            std::sync::atomic::Ordering::Release,
-                                                        );
-                                                            lloom_tensor::Error::msg(format!(
-                                                                "ring reader final drain: {lap}"
-                                                            ))
-                                                        },
-                                                    )?;
-                                                    if n > 0 && !hook(&buf)? {
-                                                        stop_flag.store(
-                                                            true,
-                                                            std::sync::atomic::Ordering::Release,
-                                                        );
-                                                    }
-                                                    return Ok(());
-                                                }
-                                                std::thread::sleep(
-                                                    std::time::Duration::from_micros(200),
-                                                );
-                                            }
-                                            Ok(_) => {
-                                                if !hook(&buf)? {
-                                                    return Ok(());
-                                                }
-                                            }
-                                            Err(lap) => {
-                                                stop_flag.store(
-                                                    true,
-                                                    std::sync::atomic::Ordering::Release,
-                                                );
-                                                lloom_tensor::bail!("ring reader: {lap}");
-                                            }
-                                        }
-                                    }
-                                })
+                                        let result = reader.read_new(buf);
+                                        (result, reader.ended())
+                                    },
+                                    hook,
+                                )
                             });
                             let out = self.session.decode_until(
                                 &mut spec,
@@ -1189,6 +1199,199 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reader_eos_batch_stops_the_producer_before_its_hook() -> Result<()> {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let stop = AtomicBool::new(false);
+        let done = AtomicBool::new(true);
+        let mut reads = 0;
+        let mut hooks = 0;
+        drain_ring_reader(
+            &stop,
+            &done,
+            |buf| {
+                reads += 1;
+                if reads == 1 {
+                    buf.extend_from_slice(&[7, 11]);
+                }
+                (Ok(buf.len()), true)
+            },
+            |buf| {
+                assert_eq!(buf, &[7, 11]);
+                assert!(stop.load(Ordering::Acquire), "EOS hook preceded stop");
+                hooks += 1;
+                Ok(true)
+            },
+        )?;
+        assert_eq!(reads, 3, "normal read, empty read, final drain");
+        assert_eq!(hooks, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn reader_earlier_batch_hook_delays_the_eos_read_not_its_stop() -> Result<()> {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::mpsc::sync_channel;
+        use std::time::Duration;
+        let stop = AtomicBool::new(false);
+        let done = AtomicBool::new(true);
+        let reads = AtomicUsize::new(0);
+        let (entered_tx, entered_rx) = sync_channel(1);
+        let (release_tx, release_rx) = sync_channel(1);
+        std::thread::scope(|scope| -> Result<()> {
+            let (stop, done, reads) = (&stop, &done, &reads);
+            let reader = scope.spawn(move || {
+                let mut hooks = 0;
+                drain_ring_reader(
+                    stop,
+                    done,
+                    |buf| {
+                        let ordinal = reads.fetch_add(1, Ordering::AcqRel);
+                        match ordinal {
+                            0 => {
+                                buf.push(7);
+                                (Ok(1), false)
+                            }
+                            1 => {
+                                buf.push(11);
+                                (Ok(1), true)
+                            }
+                            _ => (Ok(0), true),
+                        }
+                    },
+                    |buf| {
+                        hooks += 1;
+                        if buf == [7] {
+                            assert!(!stop.load(Ordering::Acquire));
+                            entered_tx.send(()).unwrap();
+                            release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                            assert_eq!(reads.load(Ordering::Acquire), 1);
+                            assert!(!stop.load(Ordering::Acquire));
+                        } else {
+                            assert_eq!(buf, &[11]);
+                            assert!(stop.load(Ordering::Acquire), "EOS hook preceded stop");
+                        }
+                        Ok(true)
+                    },
+                )?;
+                assert_eq!(hooks, 2);
+                Ok(())
+            });
+            entered_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            assert_eq!(reads.load(Ordering::Acquire), 1, "EOS remains unread");
+            assert!(!stop.load(Ordering::Acquire), "earlier batch invented EOS");
+            release_tx.send(()).unwrap();
+            reader.join().expect("reader control")
+        })?;
+        assert_eq!(reads.load(Ordering::Acquire), 4);
+        assert!(stop.load(Ordering::Acquire));
+        Ok(())
+    }
+
+    #[test]
+    fn reader_final_drain_retains_delivery_and_error_context() -> Result<()> {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let done = AtomicBool::new(true);
+        for (fail, eos) in [(false, false), (false, true), (true, false)] {
+            let stop = AtomicBool::new(false);
+            let mut reads = 0;
+            let mut hooks = 0;
+            let result = drain_ring_reader(
+                &stop,
+                &done,
+                |buf| {
+                    reads += 1;
+                    if reads == 1 {
+                        return (Ok(0), false);
+                    }
+                    assert_eq!(reads, 2, "final drain is not polled again");
+                    if fail {
+                        (
+                            Err(RingLap {
+                                cursor: 1,
+                                published: 10,
+                                capacity: 4,
+                            }),
+                            false,
+                        )
+                    } else {
+                        buf.push(13);
+                        (Ok(1), eos)
+                    }
+                },
+                |buf| {
+                    hooks += 1;
+                    assert_eq!(buf, &[13]);
+                    assert_eq!(stop.load(Ordering::Acquire), eos);
+                    Ok(false)
+                },
+            );
+            if fail {
+                assert!(result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("ring reader final drain:"));
+            } else {
+                result?;
+            }
+            assert_eq!(hooks, usize::from(!fail));
+            assert_eq!(reads, 2);
+            assert!(stop.load(Ordering::Acquire));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn reader_shared_drain_cancels_on_read_hook_error_and_unwind() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let done = AtomicBool::new(true);
+        for failure in 0..3 {
+            let stop = AtomicBool::new(false);
+            let outcome = std::panic::catch_unwind(|| {
+                drain_ring_reader(
+                    &stop,
+                    &done,
+                    |buf| {
+                        if failure == 0 {
+                            (
+                                Err(RingLap {
+                                    cursor: 1,
+                                    published: 10,
+                                    capacity: 4,
+                                }),
+                                false,
+                            )
+                        } else {
+                            buf.push(7);
+                            (Ok(1), false)
+                        }
+                    },
+                    |_| {
+                        assert_ne!(failure, 0, "a failed read reached the hook");
+                        if failure == 1 {
+                            lloom_tensor::bail!("injected hook error");
+                        }
+                        panic!("injected hook panic");
+                    },
+                )
+            });
+            match failure {
+                0 => assert!(outcome
+                    .unwrap()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("ring reader:")),
+                1 => assert!(outcome
+                    .unwrap()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("hook error")),
+                _ => assert!(outcome.is_err()),
+            }
+            assert!(stop.load(Ordering::Acquire));
+        }
+    }
 
     #[test]
     fn reader_error_and_panic_cancel_the_producer_before_join() {

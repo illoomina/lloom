@@ -178,6 +178,7 @@ impl Lfm2Config {
             vocab_size: self.vocab_size,
             hidden_size: self.hidden_size,
             intermediate_size,
+            moe: None,
             num_hidden_layers: self.num_hidden_layers,
             num_attention_heads: self.num_attention_heads,
             num_key_value_heads: self.num_key_value_heads,
@@ -1109,7 +1110,7 @@ enum MixerWeights<'a> {
 /// fields; a streamed layer takes its views at the layer's entry, once.
 struct LayerWeights<'a> {
     mixer: MixerWeights<'a>,
-    mlp: Projections<'a>,
+    mlp: Option<Projections<'a>>,
 }
 
 /// The part order inside a layer's group: the MLP's `w1`, `w3`, `w2`, then
@@ -1152,6 +1153,8 @@ pub struct Config {
     pub hidden_size: usize,
     #[tiny(axis)]
     pub intermediate_size: usize,
+    #[tiny(fixed)]
+    pub moe: Option<crate::models::lfm2_moe::config::MoeConfig>,
     #[tiny(axis, max = 8)]
     pub num_hidden_layers: usize,
     #[tiny(axis)]
@@ -1615,6 +1618,7 @@ impl Default for Config {
             vocab_size: 0,
             hidden_size: 0,
             intermediate_size: 0,
+            moe: None,
             num_hidden_layers: 0,
             num_attention_heads: 1,
             num_key_value_heads: 1,
@@ -5100,7 +5104,14 @@ impl<P: Profile> State<P> {
             query_heads: config.num_attention_heads,
             head_dim: config.head_dim(),
             hidden: config.hidden_size,
-            intermediate: config.intermediate_size,
+            // Admission sums the f16-width FFN term for every layer. A routed
+            // layer retains F32 planes as well; widen that allowance rather
+            // than borrowing dense LFM's footprint for a different block.
+            intermediate: config.moe.map_or(config.intermediate_size, |m| {
+                config
+                    .intermediate_size
+                    .max(m.activation_bound(config.hidden_size).div_ceil(3 * 2))
+            }),
         };
         // §10.2g: `Shuffle` and `RotatingRing` hold exactly `l_cache` columns
         // (264 KiB); `SlidingRing` holds the slack it slides through as well,
@@ -8909,7 +8920,7 @@ enum LayerKind<P: Profile> {
 struct DecoderLayer<P: Profile> {
     input_layernorm: RmsNorm,
     post_attention_layernorm: RmsNorm,
-    mlp: Mlp,
+    mlp: FeedForward<P>,
     kind: LayerKind<P>,
     /// Whether the layer's two norms may run inside their consumers' GEMVs
     /// (`nn::ops::gemv_norm`): `LLOOM_LFM2_NORM_GEMV` at construction, or a
@@ -8918,6 +8929,34 @@ struct DecoderLayer<P: Profile> {
     /// `Some`: this layer's matrices stream through the tier (§4.8).
     streamed: Option<StreamedLayer>,
     span: tracing::Span,
+}
+
+#[derive(Debug, Clone)]
+enum FeedForward<P: Profile> {
+    Dense(Mlp),
+    Moe(crate::models::qwen4exp::MoeLayer<P, crate::nn::expert_stream::Resident>),
+}
+
+impl<P: Profile> FeedForward<P> {
+    fn resident(&self) -> Option<Projections<'_>> {
+        match self {
+            Self::Dense(m) => Some(m.resident()),
+            Self::Moe(_) => None,
+        }
+    }
+
+    fn forward_add(
+        &self,
+        x: &Tensor,
+        residual: &Tensor,
+        projections: Option<&Projections<'_>>,
+    ) -> Result<Tensor> {
+        match (self, projections) {
+            (Self::Dense(m), Some(p)) => m.forward_add(x, residual, p),
+            (Self::Moe(m), None) => m.forward(x)?.to_dtype(residual.dtype())? + residual,
+            _ => lloom_tensor::bail!("lfm2: FFN weights do not match the layer"),
+        }
+    }
 }
 
 /// A 1x1 stand-in for a matrix that lives in the weight-group tier.
@@ -9063,6 +9102,7 @@ impl<P: Profile> DecoderLayer<P> {
         route: AttnRoute,
         vb: VarBuilder,
         streamed: Option<StreamedLayer>,
+        moe: Option<&crate::models::lfm2_moe::config::MoeConfig>,
     ) -> Result<Self> {
         // LFM2 uses operator_norm and ffn_norm naming
         let input_layernorm = RmsNorm::new(cfg.hidden_size, cfg.norm_eps, vb.pp("operator_norm"))?;
@@ -9070,10 +9110,10 @@ impl<P: Profile> DecoderLayer<P> {
             RmsNorm::new(cfg.hidden_size, cfg.norm_eps, vb.pp("ffn_norm"))?;
         // LFM2 uses feed_forward naming for MLP; on the weight-group tier
         // (§4.8) the layer's three matrices are its group's parts.
-        let mlp = if streamed.is_some() {
-            Mlp::new_placeholder(cfg, &vb)?
-        } else {
-            Mlp::new(cfg, vb.pp("feed_forward"))?
+        let mlp = match moe.filter(|m| !m.is_dense(layer_idx)) {
+            Some(m) => FeedForward::Moe(m.load_ffn(cfg.hidden_size, vb.pp("feed_forward"))?),
+            None if streamed.is_some() => FeedForward::Dense(Mlp::new_placeholder(cfg, &vb)?),
+            None => FeedForward::Dense(Mlp::new(cfg, vb.pp("feed_forward"))?),
         };
 
         let layer_type = cfg
@@ -9165,7 +9205,10 @@ impl<P: Profile> DecoderLayer<P> {
         }
         #[cfg(not(feature = "metal"))]
         let _ = moved;
-        Ok(LayerWeights { mixer, mlp })
+        Ok(LayerWeights {
+            mixer,
+            mlp: Some(mlp),
+        })
     }
 
     fn forward(
@@ -9216,11 +9259,13 @@ impl<P: Profile> DecoderLayer<P> {
 
         let residual = &x;
         let post = &self.post_attention_layernorm;
-        if self.mlp.norm_gemv_applies(self.norm_gemv, &x, post, &w.mlp) {
-            return self.mlp.forward_add_normed(&x, post, residual, &w.mlp);
+        if let (FeedForward::Dense(m), Some(p)) = (&self.mlp, &w.mlp) {
+            if m.norm_gemv_applies(self.norm_gemv, &x, post, p) {
+                return m.forward_add_normed(&x, post, residual, p);
+            }
         }
         let x = self.norm(post, &x)?;
-        self.mlp.forward_add(&x, residual, &w.mlp)
+        self.mlp.forward_add(&x, residual, w.mlp.as_ref())
     }
 
     /// [`Self::forward`] for one step of `rows.len()` independent sequences:
@@ -9247,7 +9292,7 @@ impl<P: Profile> DecoderLayer<P> {
         };
         let residual = &x;
         let x = self.post_attention_layernorm.forward(&x)?;
-        self.mlp.forward_add(&x, residual, &w.mlp)
+        self.mlp.forward_add(&x, residual, w.mlp.as_ref())
     }
 
     /// [`Self::forward`] over a ragged batch: the norms, the MLP and every
@@ -9274,7 +9319,7 @@ impl<P: Profile> DecoderLayer<P> {
         };
         let residual = &x;
         let x = self.post_attention_layernorm.forward(&x)?;
-        self.mlp.forward_add(&x, residual, &w.mlp)
+        self.mlp.forward_add(&x, residual, w.mlp.as_ref())
     }
 }
 
@@ -9287,8 +9332,8 @@ impl<P: Profile> crate::optimizer::Visit for DecoderLayer<P> {
     type Out = crate::optimizer::NodeId;
     fn visit(&self, w: &mut crate::optimizer::Walker, (hidden, l): Self::In) -> Self::Out {
         use crate::optimizer::Shape;
-        let h = self.mlp.dims.0;
-        let dt = self.mlp.down_proj.weight().dtype();
+        let h = self.input_layernorm.weight().elem_count();
+        let dt = self.input_layernorm.weight().dtype();
         let residual = hidden;
         let norm_w = w.weight("operator_norm.weight", Shape::of(&[h]), dt);
         let xn = w.rms_norm(norm_w, residual);
@@ -9300,7 +9345,10 @@ impl<P: Profile> crate::optimizer::Visit for DecoderLayer<P> {
         let residual = hidden;
         let ffn_w = w.weight("ffn_norm.weight", Shape::of(&[h]), dt);
         let xn = w.rms_norm(ffn_w, residual);
-        let down = w.scoped("feed_forward", |w| self.mlp.visit(w, xn));
+        let down = w.scoped("feed_forward", |w| match &self.mlp {
+            FeedForward::Dense(m) => m.visit(w, xn),
+            FeedForward::Moe(m) => m.visit(w, xn),
+        });
         w.add(down, residual)
     }
 }
@@ -9731,6 +9779,13 @@ fn mark_graph_node(_: &Device, _: usize) {}
 
 impl<P: Profile> Model<P> {
     pub fn new(cfg: &Config, vb: VarBuilder) -> Result<Self> {
+        let moe = cfg.moe.as_ref();
+        if let Some(m) = moe {
+            m.validate(cfg)?;
+        }
+        if moe.is_some() && cfg.stream_layers.is_some() {
+            lloom_tensor::bail!("lfm2_moe: layer-weight streaming requires an expert-aware schema; use resident experts")
+        }
         lloom_tensor::memory_admission::begin_model_load();
         crate::profile::hold::<P::Regime>("lfm2")?;
         cfg.check_shape::<P>()?;
@@ -9824,8 +9879,14 @@ impl<P: Profile> Model<P> {
                     source: std::sync::Arc::clone(source),
                     depth: *depth,
                 });
-            let layer =
-                DecoderLayer::new(cfg, layer_idx, attn_route, vb_l.pp(layer_idx), streamed)?;
+            let layer = DecoderLayer::new(
+                cfg,
+                layer_idx,
+                attn_route,
+                vb_l.pp(layer_idx),
+                streamed,
+                moe,
+            )?;
             layers.push(layer);
         }
 
@@ -9883,9 +9944,11 @@ impl<P: Profile> Model<P> {
     fn set_epilogues(&mut self, f: EpilogueFlags) {
         self.set_norm_gemv(f.norm);
         for layer in &mut self.layers {
-            layer.mlp.gemv_silu = f.silu;
-            layer.mlp.gemv_residual = f.residual;
-            layer.mlp.gemv_gate = f.gate;
+            if let FeedForward::Dense(m) = &mut layer.mlp {
+                m.gemv_silu = f.silu;
+                m.gemv_residual = f.residual;
+                m.gemv_gate = f.gate;
+            }
             match &mut layer.kind {
                 LayerKind::Attention(attn) => attn.gemv_residual = f.residual,
                 LayerKind::ShortConv(conv) => conv.gemv_residual = f.residual,

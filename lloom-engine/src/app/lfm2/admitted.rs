@@ -17,6 +17,7 @@ struct Metadata {
     device: Device,
     model_name: String,
     capacity: usize,
+    moe: bool,
     readback: ReadbackArm,
     prefill_tile: usize,
     installed: super::super::report::Installed,
@@ -46,6 +47,7 @@ fn metadata<P: Lfm2Shape>(engine: &super::Engine<P>, no_workers: NoWorkerWitness
         device: engine.core.device.clone(),
         model_name: engine.model_name.clone(),
         capacity: engine.kv_capacity,
+        moe: engine.config.moe.is_some(),
         readback: engine.readback,
         prefill_tile: engine.prefill_tile,
         installed: engine.installed.clone(),
@@ -298,7 +300,12 @@ impl<P: Lfm2Shape, Q: Predictor> Served for Engine<P, Q> {
                 .policy
                 .as_deref()
                 .is_some_and(|policy| policy.template.has_causal_certificate()),
-            ..super::super::family::LFM2_CAPABILITIES
+            // Preserve the dense adapter's existing metadata contract.
+            ..if self.metadata.moe {
+                super::super::family::LFM2_MOE_CAPABILITIES
+            } else {
+                super::super::family::LFM2_CAPABILITIES
+            }
         }
     }
     fn systemone(

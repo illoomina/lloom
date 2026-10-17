@@ -22,6 +22,7 @@
 //! template that fails on the request's data is a 400.
 #![cfg(feature = "serve")]
 
+use lloom::models::lfm2_moe::testing::Lfm2MoeTiny;
 use lloom::models::lfm2_testing::Lfm2Tiny;
 use lloom::models::qwen3_5::testing::{Qwen3_5MoeTiny, Qwen3_5Tiny};
 use lloom::models::qwen4exp::testing::Qwen4ExpTiny;
@@ -3555,4 +3556,39 @@ fn write_the_tiny_qwen4exp_checkpoint() {
     let model = write::<Qwen4ExpTiny>(&dir);
     println!("model {}", model.display());
     println!("tokenizer {}", dir.join("tokenizer.json").display());
+}
+
+/// The mixed FFN checkpoint reaches the registered LFM engine factory, not a
+/// new decoder loop. Raw ids and served capabilities distinguish adapter and
+/// registry reachability from the model's unit tests.
+#[test]
+fn lfm2_moe_tiny_reaches_chat_and_serve_on_the_cpu() {
+    let dir = scratch("lfm2-moe");
+    let model = write::<Lfm2MoeTiny>(&dir);
+    let bos = Lfm2MoeTiny::tokenizer().id("<|startoftext|>").unwrap();
+    let mut want = vec![bos];
+    want.extend(bytes(PROMPT));
+    check(&model, &["--cpu", "--profile", "deterministic"], &want);
+    let (_, stderr) = chat_with_stderr(&model, &["--cpu", "--profile", "deterministic"]);
+    assert!(
+        stderr.contains("[lfm2_moe: optional unvalidated port;"),
+        "{stderr}"
+    );
+    let server = Server::start(&model, &["--cpu", "--profile", "deterministic"]);
+    let (status, health) = server.call("GET", "/health", &json!({}));
+    assert_eq!(status, 200, "{health}");
+    assert_eq!(health["family"], "lfm2_moe");
+    assert_eq!(health["capabilities"]["family"], "lfm2_moe");
+    assert_eq!(health["capabilities"]["eos_gate"], false);
+    assert_eq!(health["capabilities"]["executor_arms"], false);
+    assert_eq!(health["capabilities"]["speculation"], json!([]));
+    assert_eq!(health["capabilities"]["vision"], false);
+    let (status, body) = server.chat(json!({"temperature":0.0}));
+    assert_eq!(status, 200, "{body}");
+    assert!(
+        body["usage"]["completion_tokens"].as_u64().unwrap_or(0) > 0,
+        "{body}"
+    );
+    drop(server);
+    std::fs::remove_dir_all(&dir).ok();
 }

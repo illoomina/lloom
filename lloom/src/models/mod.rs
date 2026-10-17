@@ -56,6 +56,7 @@ pub mod hiera;
 pub mod jina_bert;
 pub mod lfm2;
 pub mod lfm2_dspark;
+pub mod lfm2_moe;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod lfm2_presets;
 pub mod lfm2_testing;

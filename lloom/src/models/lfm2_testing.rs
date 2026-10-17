@@ -210,7 +210,7 @@ pub fn geometry_json(cfg: &Config) -> serde_json::Value {
             LayerType::FullAttention => "full_attention",
         })
         .collect();
-    serde_json::json!({
+    let mut json = serde_json::json!({
         "architectures": ["Lfm2ForCausalLM"],
         "model_type": "lfm2",
         "vocab_size": cfg.vocab_size,
@@ -229,7 +229,21 @@ pub fn geometry_json(cfg: &Config) -> serde_json::Value {
         "tie_embedding": cfg.tie_embedding,
         "bos_token_id": cfg.bos_token_id,
         "eos_token_id": cfg.eos_token_id,
-    })
+    });
+    if let Some(m) = cfg.moe {
+        json["model_type"] = serde_json::json!("lfm2_moe");
+        json["architectures"] = serde_json::json!(["Lfm2MoeForCausalLM"]);
+        json["rope_parameters"] =
+            serde_json::json!({"rope_theta":cfg.rope_theta,"rope_type":"default"});
+        json["num_dense_layers"] = serde_json::json!(m.num_dense_layers);
+        json["num_experts"] = serde_json::json!(m.num_experts);
+        json["num_experts_per_tok"] = serde_json::json!(m.num_experts_per_tok);
+        json["moe_intermediate_size"] = serde_json::json!(m.moe_intermediate_size);
+        json["norm_topk_prob"] = serde_json::json!(m.norm_topk_prob);
+        json["routed_scaling_factor"] = serde_json::json!(m.routed_scaling_factor);
+        json["use_expert_bias"] = serde_json::json!(m.use_expert_bias);
+    }
+    json
 }
 
 /// The committed geometry of the checkpoint `lloom` serves by default
@@ -298,9 +312,9 @@ pub fn load_recorded<P: Profile>(
     dev: &Device,
     dtype: Option<DType>,
 ) -> Result<(Model<P>, crate::nn::var_builder::LoadRecord)> {
-    let cfg: Lfm2Config = serde_json::from_slice(&std::fs::read(dir.join("config.json"))?)
+    let root: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join("config.json"))?)
         .map_err(lloom_tensor::Error::wrap)?;
-    let cfg = cfg.into_config(false);
+    let cfg = super::lfm2_moe::config::parse_lfm_config(root)?;
     // SAFETY: the checkpoint is not modified while mapped; a test writes it
     // before loading and never after.
     let (be, record) =

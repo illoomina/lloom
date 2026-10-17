@@ -2453,3 +2453,868 @@ fn a_fully_cached_prompt_decodes_under_speculation_as_its_k1_resume() -> Result<
     }
     Ok(())
 }
+
+/// Per-slot composition of the existing oracle. The fixture is finite even if a
+/// broken zero-limit loop misses EOS: no lane may draft past its 40-token oracle.
+struct LaneOracles(Vec<StreamOracle>);
+
+impl LaneOracles {
+    fn new(n: usize, stream: &[u32]) -> Self {
+        Self::with_k(n, stream, EOS_FIXTURE_K)
+    }
+
+    fn with_k(n: usize, stream: &[u32], k: usize) -> Self {
+        Self(
+            (0..n)
+                .map(|_| StreamOracle {
+                    k,
+                    stream: stream.to_vec(),
+                    next: 0,
+                    observed: Vec::new(),
+                })
+                .collect(),
+        )
+    }
+}
+
+impl Speculator for LaneOracles {
+    type Probe = LayerTaps<5>;
+    type Family = lloom::nn::speculator::DSpark;
+
+    fn n_seq(&self) -> usize {
+        self.0.len()
+    }
+
+    fn max_draft(&self) -> usize {
+        self.0[0].k
+    }
+
+    fn begin(&mut self, seq: SeqId, prompt: &[u32]) -> Result<()> {
+        self.0[seq.0].begin(seq, prompt)
+    }
+
+    fn context_len(&self, seq: SeqId) -> Option<usize> {
+        Some(self.0[seq.0].observed.iter().map(|(rows, _)| rows).sum())
+    }
+
+    fn draft(&mut self, active: &[SeqId]) -> Result<Vec<Draft>> {
+        let mut drafts = Vec::new();
+        for &seq in active {
+            let oracle = &mut self.0[seq.0];
+            assert!(
+                oracle.next < oracle.stream.len(),
+                "lane {} missed the finite fixture's EOS",
+                seq.0
+            );
+            drafts.extend(oracle.draft(&[seq])?);
+        }
+        Ok(drafts)
+    }
+
+    fn observe(&mut self, seq: SeqId, probe: &Vec<Tensor>, accepted: &[u32]) -> Result<()> {
+        self.0[seq.0].observe(seq, probe, accepted)
+    }
+}
+
+fn pipelined_caps_on(dev: &Device, caps: &[usize], fed: &[usize]) -> Result<()> {
+    use lloom::nn::ReuseAction;
+    let (cfg, model, stream) = eos_fixture(dev)?;
+    let prompt = EOS_FIXTURE_PROMPT.as_slice();
+    let prompts = vec![prompt; caps.len()];
+    let mut sessions: Vec<_> = caps
+        .iter()
+        .map(|_| {
+            Ok(Session::new(
+                &model,
+                State::<RewindableExact>::new(true, DType::F32, &cfg, dev)?,
+            ))
+        })
+        .collect::<Result<_>>()?;
+    let mut spec = LaneOracles::new(caps.len(), &stream);
+    let mut published = vec![Vec::new(); caps.len()];
+    // A distinct shared ceiling makes accidentally ignoring the row caps visible.
+    let opts = DecodeOptions::new(40);
+    let outs = Session::decode_speculative_pipelined_with_caps(
+        &mut sessions,
+        lloom::profile::RewindProof::of(),
+        &mut spec,
+        &prompts,
+        &opts,
+        caps,
+        &[EOS_FIXTURE_EOS],
+        dev,
+        &mut |i, ids| {
+            published[i].extend_from_slice(ids);
+            assert!(published[i].len() <= 40, "fixture publication is bounded");
+            Ok(())
+        },
+    )?;
+    assert_eq!(outs.len(), caps.len());
+    for i in 0..caps.len() {
+        let produced = if caps[i] == 0 {
+            EOS_FIXTURE_CUT
+        } else {
+            caps[i]
+        };
+        assert_eq!(outs[i].ids, stream[..produced], "lane {i}");
+        assert_eq!(published[i], stream[..produced], "published lane {i}");
+        assert_eq!(outs[i].stats.produced, produced);
+        assert_eq!(outs[i].eos, caps[i] == 0);
+        assert_eq!(outs[i].stats.overrun, 0);
+        assert_eq!(sessions[i].overrun(), 0);
+        assert_eq!(sessions[i].reconcile()?, 0);
+        // Literal consumed frontiers pin the LFM2 minimum-one-draft floor.
+        // A final one-token room may consume the last published id; otherwise
+        // the final anchor is unwritten. Neither is an output overrun.
+        assert_eq!(sessions[i].pos(), prompt.len() + fed[i]);
+        assert_eq!(sessions[i].cache_mut().kv_len(), prompt.len() + fed[i]);
+        assert_eq!(sessions[i].tokens(), [prompt, &stream[..fed[i]]].concat());
+        assert!(sessions[i].last_logits().is_none());
+        assert_eq!(
+            outs[i].stats.drafter_ctx,
+            Some((prompt.len() + fed[i], prompt.len() + fed[i]))
+        );
+        let oracle = &spec.0[i];
+        assert_eq!(oracle.observed[0].1, stream[..1]);
+        let keyed: usize = oracle.observed.iter().map(|(rows, _)| rows).sum();
+        assert_eq!(keyed, prompt.len() + fed[i]);
+        assert_eq!(oracle.observed.len(), outs[i].stats.rounds.len() + 1);
+        for ((rows, acc), round) in oracle.observed[1..].iter().zip(&outs[i].stats.rounds) {
+            assert_eq!(*rows, round.accepted);
+            assert_eq!(acc.len(), round.accepted);
+        }
+
+        // The serial speculative path is an independent scheduling entry with
+        // the SAME window shapes. Compare cache phase and the continuation, not
+        // only lengths or text. Different pass splits need no bit-identity claim.
+        let mut reference = Session::new(
+            &model,
+            State::<RewindableExact>::new(true, DType::F32, &cfg, dev)?,
+        );
+        let mut solo = StreamOracle {
+            k: EOS_FIXTURE_K,
+            stream: stream.clone(),
+            next: 0,
+            observed: Vec::new(),
+        };
+        let mut rb = Blocking::new(&[EOS_FIXTURE_EOS], dev)?;
+        let mut sampler = LogitsProcessor::from_sampling(0, Sampling::ArgMax);
+        let solo_out = reference.decode_speculative(
+            lloom::profile::RewindProof::of(),
+            &mut solo,
+            &mut rb,
+            &mut sampler,
+            prompt,
+            &DecodeOptions::new(caps[i]),
+            &[EOS_FIXTURE_EOS],
+            &mut |_| Ok(()),
+        )?;
+        assert_eq!(solo_out.ids, outs[i].ids);
+        assert_eq!(reference.tokens(), sessions[i].tokens());
+        assert_eq!(
+            reference.cache_mut().conv_phase(),
+            sessions[i].cache_mut().conv_phase()
+        );
+        let full = [prompt, &outs[i].ids, &EOS_FIXTURE_TURN2].concat();
+        let prepared = sessions[i].prepare_with(&full, false)?;
+        let ref_prepared = reference.prepare_with(&full, false)?;
+        assert_eq!(prepared.action, ReuseAction::Extend);
+        assert_eq!(prepared.reused, prompt.len() + fed[i]);
+        assert_eq!(
+            prepared.suffix,
+            [&stream[fed[i]..produced], &EOS_FIXTURE_TURN2].concat()
+        );
+        assert_eq!(prepared, ref_prepared);
+        let continuation = |s: &mut Session<'_, Model<RewindableExact>>| -> Result<Vec<u32>> {
+            let mut rb = Blocking::new(&[u32::MAX], dev)?;
+            let mut sampler = LogitsProcessor::from_sampling(0, Sampling::ArgMax);
+            Ok(s.decode(
+                &mut IdentityProposer,
+                &mut rb,
+                &mut sampler,
+                &prepared.suffix,
+                &DecodeOptions::new(8),
+                &mut |_| Ok(()),
+            )?
+            .ids)
+        };
+        assert_eq!(
+            continuation(&mut sessions[i])?,
+            continuation(&mut reference)?
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn pipelined_positive_caps_keep_each_terminal_frontier_and_continue() -> Result<()> {
+    pipelined_caps_on(
+        &Device::Cpu,
+        &[1, 2, 3, 5, 6, 7, 10],
+        &[0, 2, 2, 4, 5, 7, 9],
+    )
+}
+
+#[test]
+fn pipelined_zero_cap_reaches_bounded_eos_beside_a_finite_peer() -> Result<()> {
+    pipelined_caps_on(&Device::Cpu, &[0, 2], &[EOS_FIXTURE_CUT, 2])
+}
+
+#[cfg(feature = "metal")]
+#[test]
+fn pipelined_row_caps_keep_terminal_frontiers_on_metal() -> Result<()> {
+    let dev = Device::new_metal(0)?;
+    pipelined_caps_on(&dev, &[1, 2, 3, 5, 6, 7, 10], &[0, 2, 2, 4, 5, 7, 9])?;
+    pipelined_caps_on(&dev, &[0, 2], &[EOS_FIXTURE_CUT, 2])
+}
+
+#[test]
+fn pipelined_row_cap_shape_is_refused_before_warm_state_moves() -> Result<()> {
+    let dev = Device::Cpu;
+    let (cfg, model, stream) = eos_fixture(&dev)?;
+    let mut sessions: Vec<_> = (0..2)
+        .map(|_| {
+            Ok(Session::new(
+                &model,
+                State::<RewindableExact>::new(true, DType::F32, &cfg, &dev)?,
+            ))
+        })
+        .collect::<Result<_>>()?;
+    let prompts = [EOS_FIXTURE_PROMPT.as_slice(); 2];
+    let mut spec = LaneOracles::new(2, &stream);
+    Session::decode_speculative_pipelined(
+        &mut sessions,
+        lloom::profile::RewindProof::of(),
+        &mut spec,
+        &prompts,
+        &DecodeOptions::new(1),
+        &[EOS_FIXTURE_EOS],
+        &dev,
+        &mut |_, _| Ok(()),
+    )?;
+    let seen: Vec<_> = spec.0.iter().map(|o| o.observed.clone()).collect();
+    for caps in [&[][..], &[1][..], &[1, 2, 3][..]] {
+        let err = Session::decode_speculative_pipelined_with_caps(
+            &mut sessions,
+            lloom::profile::RewindProof::of(),
+            &mut spec,
+            &prompts,
+            &DecodeOptions::new(40),
+            caps,
+            &[EOS_FIXTURE_EOS],
+            &dev,
+            &mut |_, _| panic!("invalid shape published tokens"),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("row caps"), "{err}");
+        for (i, s) in sessions.iter_mut().enumerate() {
+            assert_eq!(s.tokens(), EOS_FIXTURE_PROMPT);
+            assert_eq!(s.pos(), EOS_FIXTURE_PROMPT.len());
+            assert_eq!(s.overrun(), 0);
+            assert_eq!(s.cache_mut().kv_len(), EOS_FIXTURE_PROMPT.len());
+            assert_eq!(spec.0[i].observed, seen[i]);
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn pipelined_unpublished_bonus_eos_does_not_replace_a_length_stop() -> Result<()> {
+    let dev = Device::Cpu;
+    let (cfg, model, stream) = eos_fixture(&dev)?;
+    let mut sessions: Vec<_> = (0..2)
+        .map(|_| {
+            Ok(Session::new(
+                &model,
+                State::<RewindableExact>::new(true, DType::F32, &cfg, &dev)?,
+            ))
+        })
+        .collect::<Result<_>>()?;
+    // K=2 puts the first EOS (index 14) at the bonus of the final
+    // minimum-width verify when the output cap is 14 (one slot left at 13).
+    let mut spec = LaneOracles::with_k(2, &stream, 2);
+    let mut published = [Vec::new(), Vec::new()];
+    let outs = Session::decode_speculative_pipelined_with_caps(
+        &mut sessions,
+        lloom::profile::RewindProof::of(),
+        &mut spec,
+        &[&EOS_FIXTURE_PROMPT, &EOS_FIXTURE_PROMPT],
+        &DecodeOptions::new(40),
+        &[14, 0],
+        &[EOS_FIXTURE_EOS],
+        &dev,
+        &mut |i, ids| {
+            published[i].extend_from_slice(ids);
+            Ok(())
+        },
+    )?;
+    for i in 0..2 {
+        assert_eq!(outs[i].ids, stream[..14]);
+        assert_eq!(published[i], stream[..14]);
+        assert_eq!(outs[i].stats.produced, 14);
+        assert_eq!(outs[i].stats.overrun, 0);
+        assert_eq!(sessions[i].pos(), EOS_FIXTURE_PROMPT.len() + 14);
+        assert_eq!(
+            sessions[i].tokens(),
+            [&EOS_FIXTURE_PROMPT, &stream[..14]].concat()
+        );
+        assert_eq!(spec.context_len(SeqId(i)), Some(sessions[i].pos()));
+        assert_eq!(
+            spec.0[i].observed.last().unwrap().1.last(),
+            Some(&EOS_FIXTURE_EOS)
+        );
+    }
+    assert!(
+        !outs[0].eos,
+        "a prediction outside the cap is not the stop cause"
+    );
+    assert!(outs[1].eos, "an unbounded lane must actually observe EOS");
+    Ok(())
+}
+
+/// A minimum-width terminal verify consumes the last published token, not its
+/// bonus prediction. The output ceiling decides Length before that bonus can
+/// decide EOS; the unbounded run must still stop on it. UNCOMPILED/UNRUN.
+#[test]
+fn serial_unpublished_bonus_eos_preserves_length_and_terminal_reuse() -> Result<()> {
+    use lloom::nn::ReuseAction;
+    let dev = Device::Cpu;
+    let (cfg, model, stream) = eos_fixture(&dev)?;
+    let prompt = EOS_FIXTURE_PROMPT.as_slice();
+    let expected = [12, 0, 12, 0, 12, 0, 12, 0, 12, 0, 12, 0, 12, 0];
+    assert_eq!(&stream[..14], &expected);
+    assert_eq!(stream[14], 10, "the bonus is the first EOS");
+    let expected_observed = vec![
+        (8, vec![12]),
+        (3, vec![0, 12, 0]),
+        (3, vec![12, 0, 12]),
+        (3, vec![0, 12, 0]),
+        (3, vec![12, 0, 12]),
+        (2, vec![0, 10]),
+    ];
+
+    for cap in [14, 0] {
+        // The independent step-by-step reference is finite even for the EOS
+        // case; it reaches the fixture's EOS before its 40-token guard.
+        let mut reference = Session::new(
+            &model,
+            State::<RewindableExact>::new(true, DType::F32, &cfg, &dev)?,
+        );
+        let mut ref_rb = Blocking::new(&[EOS_FIXTURE_EOS], &dev)?;
+        let mut ref_sampler = LogitsProcessor::from_sampling(0, Sampling::ArgMax);
+        let ref_out = reference.decode(
+            &mut IdentityProposer,
+            &mut ref_rb,
+            &mut ref_sampler,
+            prompt,
+            &DecodeOptions::new(if cap == 0 { 40 } else { 14 }),
+            &mut |_| Ok(()),
+        )?;
+        assert_eq!(ref_out.ids, expected);
+        assert_eq!(ref_out.eos, cap == 0);
+        assert_eq!(reference.pos(), 22);
+
+        let mut subject = Session::new(
+            &model,
+            State::<RewindableExact>::new(true, DType::F32, &cfg, &dev)?,
+        );
+        let mut spec = LaneOracles::with_k(1, &stream, 2);
+        let mut rb = Blocking::new(&[EOS_FIXTURE_EOS], &dev)?;
+        let mut sampler = LogitsProcessor::from_sampling(0, Sampling::ArgMax);
+        let mut published = Vec::new();
+        let out = subject.decode_speculative(
+            lloom::profile::RewindProof::of(),
+            &mut spec,
+            &mut rb,
+            &mut sampler,
+            prompt,
+            &DecodeOptions::new(cap),
+            &[EOS_FIXTURE_EOS],
+            &mut |ids| {
+                published.extend_from_slice(ids);
+                assert!(published.len() <= 14, "the finite fixture missed its stop");
+                Ok(())
+            },
+        )?;
+        assert_eq!(out.ids, expected, "cap {cap}: exact returned IDs");
+        assert_eq!(published, expected, "cap {cap}: exact published IDs");
+        assert_eq!(out.stats.produced, 14);
+        assert_eq!(
+            out.eos,
+            cap == 0,
+            "cap {cap}: an unpublished bonus cannot replace Length with EOS"
+        );
+        assert_eq!(out.eos, ref_out.eos);
+        assert_eq!(out.stats.steps, 5);
+        assert_eq!(
+            out.stats
+                .rounds
+                .iter()
+                .map(|r| r.accepted)
+                .collect::<Vec<_>>(),
+            vec![3, 3, 3, 3, 2]
+        );
+        assert_eq!(out.stats.overrun, 0);
+        assert_eq!(subject.overrun(), 0);
+        assert_eq!(subject.reconcile()?, 0);
+        assert_eq!(subject.pos(), 22);
+        assert_eq!(subject.cache_mut().kv_len(), 22);
+        assert_eq!(subject.cache_mut().conv_phase(), 0);
+        assert_eq!(subject.tokens(), [prompt, &expected].concat());
+        assert_eq!(subject.tokens(), reference.tokens());
+        assert!(subject.last_logits().is_none());
+        assert_eq!(out.stats.drafter_ctx, Some((22, 22)));
+        assert_eq!(spec.context_len(SeqId(0)), Some(22));
+        assert_eq!(spec.0[0].next, 15, "the final prediction is not a fed EOS");
+        assert_eq!(spec.0[0].observed, expected_observed);
+
+        // Reuse the consumed prefix, with no reset, rewind or replay. The
+        // existing K=1 continuation independently reads the retained state.
+        let full = [prompt, &expected, &EOS_FIXTURE_TURN2].concat();
+        let prepared = subject.prepare_with(&full, false)?;
+        let ref_prepared = reference.prepare_with(&full, false)?;
+        assert_eq!(prepared, ref_prepared);
+        assert_eq!(prepared.action, ReuseAction::Extend);
+        assert_eq!(prepared.reused, 22);
+        assert_eq!(prepared.suffix, EOS_FIXTURE_TURN2);
+        assert_eq!(subject.pos(), 22);
+        assert_eq!(subject.cache_mut().kv_len(), 22);
+        let continue_run = |s: &mut Session<'_, Model<RewindableExact>>| -> Result<_> {
+            let mut published = Vec::new();
+            let mut rb = Blocking::new(&[u32::MAX], &dev)?;
+            let mut sampler = LogitsProcessor::from_sampling(0, Sampling::ArgMax);
+            let out = s.decode(
+                &mut IdentityProposer,
+                &mut rb,
+                &mut sampler,
+                &prepared.suffix,
+                &DecodeOptions::new(8),
+                &mut |ids| {
+                    published.extend_from_slice(ids);
+                    Ok(())
+                },
+            )?;
+            assert_eq!(published, out.ids);
+            Ok(out)
+        };
+        let ref_next = continue_run(&mut reference)?;
+        let next = continue_run(&mut subject)?;
+        assert_eq!(ref_next.ids.len(), 8);
+        assert_eq!(next.ids, ref_next.ids);
+        assert!(!next.eos);
+        assert_eq!(next.stats.produced, 8);
+        assert_eq!(next.stats.overrun, 0);
+        assert_eq!(subject.pos(), 35);
+        assert_eq!(subject.cache_mut().kv_len(), 35);
+        assert_eq!(subject.tokens(), [full, next.ids].concat());
+        assert_eq!(subject.tokens(), reference.tokens());
+        assert!(subject.last_logits().is_some());
+    }
+    Ok(())
+}
+
+/// Output-bounded auxiliary state is distinct from full input finalization.
+/// Existing digest contract: rows = emitted IDs plus an actually observed EOS.
+#[test]
+fn serial_length_stop_digest_excludes_unpublished_bonus_prediction() -> Result<()> {
+    let dev = Device::Cpu;
+    let (cfg, model, stream) = eos_fixture(&dev)?;
+    let expected = [12, 0, 12, 0, 12, 0, 12, 0, 12, 0, 12, 0, 12, 0];
+    assert_eq!(&stream[..14], &expected);
+    assert_eq!(stream[14], EOS_FIXTURE_EOS);
+    // Unbounded EOS first is a finite positive: the fixture reaches EOS at14.
+    for cap in [0, 14] {
+        let mut subject = Session::new(
+            &model,
+            State::<RewindableExact>::new(true, DType::F32, &cfg, &dev)?,
+        );
+        let mut spec = LaneOracles::with_k(1, &stream, 2);
+        let mut rb = Blocking::new(&[EOS_FIXTURE_EOS], &dev)?;
+        let mut sampler =
+            LogitsProcessor::from_sampling(0, Sampling::ArgMax).with_logits_digest(true);
+        let mut published = Vec::new();
+        let out = subject.decode_speculative(
+            lloom::profile::RewindProof::of(),
+            &mut spec,
+            &mut rb,
+            &mut sampler,
+            &EOS_FIXTURE_PROMPT,
+            &DecodeOptions::new(cap),
+            &[EOS_FIXTURE_EOS],
+            &mut |ids| {
+                published.extend_from_slice(ids);
+                assert!(published.len() <= 14, "finite EOS fixture missed its stop");
+                Ok(())
+            },
+        )?;
+        assert_eq!(out.ids, expected, "cap{cap}: same intended greedy draws");
+        assert_eq!(published, expected);
+        assert_eq!(out.eos, cap == 0);
+        assert_eq!(out.stats.produced, 14);
+        assert_eq!(subject.pos(), 22);
+        assert_eq!(subject.cache_mut().kv_len(), 22);
+        assert_eq!(subject.overrun(), 0);
+        assert!(sampler.logits_digest().is_some());
+        assert_eq!(
+            sampler.digest_rows(),
+            out.ids.len() + usize::from(out.eos),
+            "cap{cap}: only output predictions and an actual EOS enter the digest"
+        );
+    }
+    Ok(())
+}
+
+/// Successful publication owns auxiliary rows; the target still finalizes its
+/// entire accepted input prefix. CPU fixture only, no cross-pass digest claim.
+/// UNCOMPILED/UNRUN.
+#[test]
+fn serial_sampled_caps_include_only_an_in_room_eos_in_auxiliary_rows() -> Result<()> {
+    let dev = Device::Cpu;
+    let (cfg, model, stream) = eos_fixture(&dev)?;
+    let expected = [12, 0, 12, 0, 12, 0, 12, 0, 12, 0, 12, 0, 12, 0];
+    for cap in [0, 1, 2, 3, 13, 14, 15] {
+        let n = if cap == 0 { 14 } else { cap.min(14) };
+        let eos = cap == 0 || cap > 14;
+        let mut subject = Session::new(
+            &model,
+            State::<RewindableExact>::new(true, DType::F32, &cfg, &dev)?,
+        );
+        let mut spec = LaneOracles::with_k(1, &stream, 2);
+        let mut rb = Blocking::new(&[EOS_FIXTURE_EOS], &dev)?;
+        let mut sampler =
+            LogitsProcessor::from_sampling(0, Sampling::ArgMax).with_logits_digest(true);
+        let mut published = Vec::new();
+        let out = subject.decode_speculative(
+            lloom::profile::RewindProof::of(),
+            &mut spec,
+            &mut rb,
+            &mut sampler,
+            &EOS_FIXTURE_PROMPT,
+            &DecodeOptions::new(cap),
+            &[EOS_FIXTURE_EOS],
+            &mut |ids| {
+                published.extend_from_slice(ids);
+                assert!(published.len() <= 14, "finite EOS fixture missed its stop");
+                Ok(())
+            },
+        )?;
+        assert_eq!(out.ids, expected[..n], "cap {cap}");
+        assert_eq!(published, expected[..n], "cap {cap}");
+        assert_eq!(out.eos, eos, "cap {cap}");
+        assert_eq!(sampler.digest_rows(), n + usize::from(eos), "cap {cap}");
+        assert_eq!(out.stats.overrun, 0);
+        assert_eq!(subject.overrun(), 0);
+        assert_eq!(subject.cache_mut().kv_len(), subject.pos());
+        assert_eq!(spec.context_len(SeqId(0)), Some(subject.pos()));
+        assert_eq!(
+            spec.0[0].next,
+            1 + out.stats.rounds.iter().map(|r| r.accepted).sum::<usize>(),
+            "the drafter observes the complete accept, not the auxiliary slice"
+        );
+    }
+    Ok(())
+}
+
+/// A frequency penalty makes an extra committed prediction observable through
+/// the public sampler, not a history accessor. Both real driver consumers reuse
+/// that sampler; the literal threshold is half a count from the expected total.
+/// UNCOMPILED/UNRUN.
+#[test]
+fn serial_sampled_length_caps_preserve_processor_history_for_sampler_reuse() -> Result<()> {
+    let dev = Device::Cpu;
+    let cfg = tiny_config(2);
+    let model = build(&cfg, &dev)?;
+    for sampling in [
+        Sampling::ArgMax,
+        Sampling::TopK {
+            k: 1,
+            temperature: 0.7,
+        },
+    ] {
+        for cap in [1, 2, 3, 4, 5] {
+            let processors = lloom::generation::Processors {
+                frequency_penalty: 1.0,
+                logit_bias: vec![(0, 100.0)],
+                ..Default::default()
+            };
+            let mut sampler = LogitsProcessor::from_sampling(42, sampling.clone())
+                .with_processors(processors)
+                .with_logits_digest(true);
+            sampler.observe_prompt(&EOS_FIXTURE_PROMPT);
+            for (request, limit) in [cap, 2].into_iter().enumerate() {
+                // A new target cache deliberately retains the public sampler's
+                // output history. Engine requests normally construct a new sampler.
+                let mut subject = Session::new(
+                    &model,
+                    State::<RewindableExact>::new(true, DType::F32, &cfg, &dev)?,
+                );
+                let mut spec = LaneOracles::with_k(1, &[0; 40], 2);
+                let mut rb = Blocking::new(&[u32::MAX], &dev)?;
+                let mut published = Vec::new();
+                let out = subject.decode_speculative(
+                    lloom::profile::RewindProof::of(),
+                    &mut spec,
+                    &mut rb,
+                    &mut sampler,
+                    &EOS_FIXTURE_PROMPT,
+                    &DecodeOptions::new(limit),
+                    &[u32::MAX],
+                    &mut |ids| {
+                        published.extend_from_slice(ids);
+                        assert!(published.len() <= limit, "published past a finite cap");
+                        Ok(())
+                    },
+                )?;
+                assert_eq!(out.ids, vec![0; limit], "{sampling:?} cap {cap}");
+                assert_eq!(published, out.ids);
+                assert!(!out.eos);
+                assert_eq!(out.stats.produced, limit);
+                assert_eq!(out.stats.overrun, 0);
+                assert_eq!(spec.context_len(SeqId(0)), Some(subject.pos()));
+                if limit == 2 {
+                    assert_eq!(out.stats.rounds.len(), 1);
+                    assert_eq!(out.stats.rounds[0].accepted, 2);
+                    assert_eq!(spec.0[0].observed.last(), Some(&(2, vec![0, 0])));
+                    assert_eq!(subject.pos(), 10);
+                    assert_eq!(subject.cache_mut().kv_len(), 10);
+                    assert_eq!(
+                        subject.tokens(),
+                        [&EOS_FIXTURE_PROMPT[..], &[0, 0]].concat()
+                    );
+                }
+                // The first probe consumes one additional 0 before request 2.
+                let count = if request == 0 { cap } else { cap + 1 + 2 };
+                assert_eq!(sampler.digest_rows(), count);
+                let mut logits = vec![-1000f32; cfg.vocab_size];
+                logits[0] = count as f32 + 0.5 - 100.0;
+                logits[1] = 0.0;
+                let probe = Tensor::from_vec(logits, cfg.vocab_size, &dev)?;
+                assert_eq!(
+                    sampler.sample(&probe)?,
+                    0,
+                    "{sampling:?} cap {cap} request {request}: an unpublished prediction counted"
+                );
+                assert_eq!(sampler.digest_rows(), count + 1);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// An unpublished forced close must not spend the budget or close the block.
+/// The public window rule and a subsequent actual decode observe that state;
+/// in-room EOS and unbounded EOS must still commit the close. UNCOMPILED/UNRUN.
+#[test]
+fn serial_sampled_terminal_budget_remains_at_the_publishable_frontier() -> Result<()> {
+    use lloom::generation::{ReadbackStrategy, ThinkingBudget, ThinkingReport};
+    let dev = Device::Cpu;
+    let cfg = tiny_config(2);
+    let model = build(&cfg, &dev)?;
+    let budget = ThinkingBudget::new(2, vec![1], vec![1])?;
+    for cap in [0, 1, 2, 3] {
+        let processors = lloom::generation::Processors {
+            frequency_penalty: 1.0,
+            logit_bias: vec![(0, 100.0)],
+            ..Default::default()
+        };
+        let mut sampler = LogitsProcessor::from_sampling(0, Sampling::ArgMax)
+            .with_processors(processors.clone())
+            .with_window_budget(Some(&budget))
+            .with_logits_digest(true);
+        sampler.observe_prompt(&EOS_FIXTURE_PROMPT);
+        let mut subject = Session::new(
+            &model,
+            State::<RewindableExact>::new(true, DType::F32, &cfg, &dev)?,
+        );
+        let mut spec = LaneOracles::with_k(1, &[0, 0, 1, 0, 0, 0, 0, 0], 2);
+        let mut rb = Blocking::new(&[1], &dev)?;
+        let mut published = Vec::new();
+        let out = subject.decode_speculative(
+            lloom::profile::RewindProof::of(),
+            &mut spec,
+            &mut rb,
+            &mut sampler,
+            &EOS_FIXTURE_PROMPT,
+            &DecodeOptions::new(cap),
+            &[1],
+            &mut |ids| {
+                published.extend_from_slice(ids);
+                assert!(
+                    published.len() <= 2,
+                    "finite forced-EOS fixture missed its stop"
+                );
+                Ok(())
+            },
+        )?;
+        let expected = if cap == 1 { vec![0] } else { vec![0, 0] };
+        let eos = cap == 0 || cap == 3;
+        assert_eq!(out.ids, expected);
+        assert_eq!(published, expected);
+        assert_eq!(out.eos, eos);
+        assert_eq!(sampler.digest_rows(), expected.len() + usize::from(eos));
+        assert_eq!(out.stats.overrun, 0);
+        assert_eq!(subject.overrun(), 0);
+        assert_eq!(subject.pos(), if cap == 1 { 8 } else { 10 });
+        assert_eq!(subject.cache_mut().kv_len(), subject.pos());
+        assert_eq!(spec.context_len(SeqId(0)), Some(subject.pos()));
+        if cap != 1 {
+            assert_eq!(out.stats.rounds.len(), 1);
+            assert_eq!(out.stats.rounds[0].accepted, 2);
+            assert_eq!(spec.0[0].observed.last(), Some(&(2, vec![0, 1])));
+        }
+        assert_eq!(
+            budget.report(&out.ids),
+            ThinkingReport {
+                thought: expected.len(),
+                fired: false,
+                closed_by: None,
+            }
+        );
+        let want_fed = match cap {
+            1 => vec![7, 1, 7],
+            2 => vec![1, 7, 7],
+            _ => vec![7, 7, 7],
+        };
+        assert_eq!(sampler.window_fed(&[7, 7, 7]), want_fed, "cap {cap}");
+        assert_eq!(
+            sampler.window_fed(&[7, 7, 7]),
+            want_fed,
+            "a preview must not advance"
+        );
+
+        // Independent K=1 consumer: its own readback owns the forcing rule.
+        // Compare IDs and row counts, not logits bytes across pass partitions.
+        let mut reference = Session::new(
+            &model,
+            State::<RewindableExact>::new(true, DType::F32, &cfg, &dev)?,
+        );
+        let mut ref_rb = Blocking::new(&[1], &dev)?;
+        ref_rb.set_thinking_budget(Some(&budget))?;
+        let mut ref_sampler = LogitsProcessor::from_sampling(0, Sampling::ArgMax)
+            .with_processors(processors)
+            .with_logits_digest(true);
+        ref_sampler.observe_prompt(&EOS_FIXTURE_PROMPT);
+        let ref_out = reference.decode(
+            &mut IdentityProposer,
+            &mut ref_rb,
+            &mut ref_sampler,
+            &EOS_FIXTURE_PROMPT,
+            &DecodeOptions::new(if cap == 0 { 8 } else { cap }),
+            &mut |_| Ok(()),
+        )?;
+        assert_eq!(ref_out.ids, expected);
+        assert_eq!(ref_out.eos, eos);
+        assert_eq!(ref_sampler.digest_rows(), sampler.digest_rows());
+
+        // The close belongs in processor history iff it was in room. This
+        // ordinary public draw probes history without advancing window forcing.
+        let mut logits = vec![-1000f32; cfg.vocab_size];
+        logits[1] = 0.5;
+        logits[2] = 0.0;
+        assert_eq!(
+            sampler.sample(&Tensor::from_vec(logits, cfg.vocab_size, &dev)?)?,
+            if eos { 2 } else { 1 },
+            "cap {cap}: processor history must count only an in-room EOS"
+        );
+
+        // No budget re-arm: reuse the public sampler through another actual
+        // window driver. At cap 2 its next anchor is the still-pending close.
+        let before = sampler.digest_rows();
+        let mut next = Session::new(
+            &model,
+            State::<RewindableExact>::new(true, DType::F32, &cfg, &dev)?,
+        );
+        let mut next_spec = LaneOracles::with_k(1, &[0; 8], 2);
+        let mut next_rb = Blocking::new(&[1], &dev)?;
+        let next_out = next.decode_speculative(
+            lloom::profile::RewindProof::of(),
+            &mut next_spec,
+            &mut next_rb,
+            &mut sampler,
+            &EOS_FIXTURE_PROMPT,
+            &DecodeOptions::new(1),
+            &[1],
+            &mut |_| Ok(()),
+        )?;
+        assert_eq!(next_out.ids, if cap == 2 { vec![] } else { vec![0] });
+        assert_eq!(next_out.eos, cap == 2);
+        assert_eq!(sampler.digest_rows(), before + 1);
+    }
+    Ok(())
+}
+
+/// The continuous consumer must not turn an unpublished bonus into EOS.
+#[test]
+fn continuous_row_cap_wins_before_unpublished_bonus_eos() -> Result<()> {
+    use lloom::nn::{RowDriver, SpecBatchDecoder};
+    let dev = Device::Cpu;
+    let (cfg, model, stream) = eos_fixture(&dev)?;
+    assert_eq!(
+        &stream[..14],
+        &[12, 0, 12, 0, 12, 0, 12, 0, 12, 0, 12, 0, 12, 0]
+    );
+    assert_eq!(stream[14], EOS_FIXTURE_EOS);
+    let sessions: Vec<_> = (0..2)
+        .map(|_| {
+            Ok(Session::new(
+                &model,
+                State::<RewindableExact>::new(true, DType::F32, &cfg, &dev)?,
+            ))
+        })
+        .collect::<Result<_>>()?;
+    let spec = LaneOracles::with_k(2, &stream, 2);
+    let mut driver = SpecBatchDecoder::new(
+        lloom::profile::RewindProof::of(),
+        spec,
+        DecodeOptions::new(99),
+        dev.clone(),
+    )?;
+    let mut rows = Vec::new();
+    for (session, cap) in sessions.into_iter().zip([14, 0]) {
+        rows.push(driver.admit_with_eos(
+            session,
+            EOS_FIXTURE_PROMPT.to_vec(),
+            Sampling::ArgMax,
+            0,
+            &[EOS_FIXTURE_EOS],
+            cap,
+        )?);
+    }
+    let mut published = [Vec::new(), Vec::new()];
+    let mut finished = Vec::new();
+    for _ in 0..20 {
+        driver.step(&mut |row, ids| {
+            let lane = rows.iter().position(|r| *r == row).unwrap();
+            published[lane].extend_from_slice(ids);
+            assert!(
+                published[lane].len() <= 14,
+                "finite EOS fixture exceeded its bound"
+            );
+            Ok(())
+        })?;
+        finished.extend(driver.take_finished());
+        if finished.len() == 2 {
+            break;
+        }
+    }
+    assert_eq!(finished.len(), 2, "continuous rows failed to retire");
+    for (row, mut session, out) in finished {
+        let lane = rows.iter().position(|r| *r == row).unwrap();
+        assert_eq!(out.ids, stream[..14]);
+        assert_eq!(published[lane], out.ids);
+        assert_eq!(out.stats.produced, 14);
+        assert_eq!(out.stats.overrun, 0);
+        assert_eq!(session.pos(), 22);
+        assert_eq!(session.cache_mut().kv_len(), 22);
+        assert_eq!(
+            session.tokens(),
+            [&EOS_FIXTURE_PROMPT, &stream[..14]].concat()
+        );
+        assert_eq!(
+            out.eos,
+            lane == 1,
+            "row cap must decide before an unpublished bonus EOS"
+        );
+    }
+    Ok(())
+}

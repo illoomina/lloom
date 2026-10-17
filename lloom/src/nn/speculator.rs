@@ -1378,7 +1378,9 @@ impl<'m, M: CausalLM> Session<'m, M> {
     /// [`Self::speculative_round`] with the VERIFY phase bracketed as a
     /// planned pass of `verify_key`'s shape (`DESIGN.md` §9.2aa), and every
     /// draft fitted to `room`, the tokens the run may still publish
-    /// ([`fit_to_room`]; `usize::MAX` for no bound).
+    /// ([`fit_to_room`]; `usize::MAX` for no bound). Sampled auxiliary state
+    /// counts at most `room` predictions; the complete accepted prefix still
+    /// resolves the target, keys the drafter and is returned to the caller.
     ///
     /// Only the verify is bracketed. The draft and the observe run on the
     /// DRAFTER's model and its own caches — a different allocation sequence
@@ -1469,12 +1471,12 @@ impl<'m, M: CausalLM> Session<'m, M> {
             crate::nn::decode::end_pass(device)?;
         }
         let (accepted, probe_out) = verified?;
-        // What the round kept is the run's output: the processors' history,
-        // a budget's position and the digest move by it, as a step-by-step
-        // decode's do by its draws — after the planned pass, never inside it.
+        // A minimum-width verify can accept a bonus outside the output room.
+        // Auxiliary history counts only publishable predictions (including an
+        // EOS in room); cache resolution and observe still need the full accept.
         if let Some(s) = sampler {
             for a in &accepted {
-                s.commit_window(a)?;
+                s.commit_window(&a[..a.len().min(room)])?;
             }
         }
         let (gpu, disp, census) = probe.close()?;

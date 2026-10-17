@@ -9,7 +9,7 @@ use lloom::testing::fixture::{Backend, Fixture};
 use lloom::testing::tiny::backend::TinyBackend;
 use lloom::testing::tiny::Weights;
 
-fn pair() -> lloom_tensor::Result<(
+pub(super) fn pair() -> lloom_tensor::Result<(
     Fixture<Lfm2Tiny>,
     Model<RewindableExact>,
     Config,
@@ -219,4 +219,150 @@ fn actual_static_dspark_body_keeps_sampling_and_eos_refusals() {
         err.contains("row 1") && err.contains("one EOS set"),
         "{err}"
     );
+}
+
+#[test]
+fn actual_static_dspark_mixed_caps_bound_each_published_row() {
+    let mut decode = crate::DecodeConfig::default();
+    decode.prefill.tile = 16;
+    let opts = static_dspark_scheduler_options(&decode, 0, 0);
+    let (outs, published) = run_static(&opts, &[row(1), row(4)]).unwrap();
+    assert_eq!(outs.len(), 2);
+    assert_eq!(outs[0].ids.len(), 1);
+    assert_eq!(outs[1].ids.len(), 4);
+    for (i, cap) in [(0, 1), (1, 4)] {
+        let ids: Vec<u32> = published
+            .iter()
+            .filter(|(row, _)| *row == i)
+            .flat_map(|(_, ids)| ids.iter().copied())
+            .collect();
+        assert_eq!(ids.len(), cap, "row {i} streamed past its max_tokens");
+        assert_eq!(ids, outs[i].ids, "stream/final disagreement for row {i}");
+    }
+}
+
+#[test]
+fn actual_static_dspark_heterogeneous_positive_caps_keep_requested_counts() {
+    let opts = DecodeOptions::new(99);
+    let caps = [2, 7, 3];
+    let specs: Vec<_> = caps.iter().copied().map(row).collect();
+    let (outs, published) = run_static(&opts, &specs).unwrap();
+    assert_eq!(outs.len(), caps.len());
+    for (i, cap) in caps.into_iter().enumerate() {
+        let ids: Vec<_> = published
+            .iter()
+            .filter(|(lane, _)| *lane == i)
+            .flat_map(|(_, ids)| ids.iter().copied())
+            .collect();
+        assert_eq!(ids.len(), cap, "lane {i}");
+        assert_eq!(outs[i].ids, ids);
+        assert_eq!(outs[i].stats.produced, cap);
+        assert_eq!(outs[i].stats.overrun, 0);
+        assert!(!outs[i].eos);
+    }
+}
+
+#[test]
+fn actual_static_dspark_short_lane_retains_target_and_drafter_for_reuse() -> lloom_tensor::Result<()>
+{
+    use lloom::nn::{ReuseAction, SeqId, Speculator};
+    let (_fixture, model, cfg, drafter) = pair()?;
+    let device = Device::Cpu;
+    let opts = DecodeOptions::new(99);
+    let cache = || State::<RewindableExact>::new_with(true, DType::F32, &cfg, &device, 128);
+    let mut sessions = vec![
+        Session::new(&model, cache()?),
+        Session::new(&model, cache()?),
+    ];
+    let mut extra = Speculators {
+        spec: Some(DSparkSpeculator::new_with_ctx(
+            drafter,
+            model.draft_embedding().clone(),
+            model.lm_head_linear().clone(),
+            2,
+            CtxKv::Contiguous,
+        )?),
+        continuous: false,
+        eos_ids: vec![u32::MAX],
+    };
+    let mut pool = SlotPool::new(1, || cache().unwrap());
+    let mut rings = RingPool::new();
+    let mut driver: crate::Driver<'_, Model<RewindableExact>> = Box::new(
+        lloom::nn::BatchDecoder::new(opts.clone(), &[u32::MAX], device.clone())?,
+    );
+    let mut idle = Idle {
+        model: &model,
+        device: &device,
+        pool: &mut pool,
+        rings: &mut rings,
+        opts: &opts,
+        extra: &mut extra,
+        driver: &mut driver,
+    };
+    let prompt: Vec<u32> = (0..37).map(|i| (i % 47) as u32).collect();
+    let first = static_dspark_body(
+        &mut idle,
+        &mut sessions,
+        &[&prompt, &prompt],
+        &[row(1), row(7)],
+        &mut |_, _| Ok(()),
+    )?;
+    assert_eq!(first[0].ids.len(), 1);
+    assert_eq!(first[1].ids.len(), 7);
+    // Lane zero retired at the seed; its final anchor is output, not consumed.
+    assert_eq!(sessions[0].pos(), 37);
+    assert_eq!(sessions[0].tokens(), prompt);
+    assert_eq!(sessions[0].cache_mut().kv_len(), 37);
+    assert_eq!(sessions[0].overrun(), 0);
+    assert_eq!(first[0].stats.produced, 1);
+    assert_eq!(first[0].stats.drafter_ctx, Some((37, 37)));
+    let spec = idle.extra.spec.as_ref().unwrap();
+    assert_eq!(spec.context_len(SeqId(0)), Some(37));
+    assert_eq!(spec.ctx_state(SeqId(0)), Some((37, 37)));
+    assert_eq!(spec.ctx_resets(), 0);
+    let mut suffixes = Vec::new();
+    for (i, s) in sessions.iter_mut().enumerate() {
+        let full = [prompt.as_slice(), first[i].ids.as_slice(), &[3, 4, 5]].concat();
+        let prepared = s.prepare_with(&full, false)?;
+        assert_eq!(prepared.action, ReuseAction::Extend);
+        assert_eq!(s.reconcile()?, 0);
+        if i == 0 {
+            assert_eq!(prepared.reused, 37);
+            assert_eq!(prepared.suffix, [&first[0].ids[..], &[3, 4, 5]].concat());
+        }
+        suffixes.push(prepared.suffix);
+    }
+    let refs: Vec<_> = suffixes.iter().map(Vec::as_slice).collect();
+    let mut published = [Vec::new(), Vec::new()];
+    let second = static_dspark_body(
+        &mut idle,
+        &mut sessions,
+        &refs,
+        &[row(3), row(1)],
+        &mut |i, ids| {
+            published[i].extend_from_slice(ids);
+            Ok(())
+        },
+    )?;
+    for (i, cap) in [(0, 3), (1, 1)] {
+        assert_eq!(second[i].ids.len(), cap);
+        assert_eq!(second[i].ids, published[i]);
+        assert_eq!(second[i].stats.produced, cap);
+        assert_eq!(second[i].stats.overrun, 0);
+        assert_eq!(sessions[i].overrun(), 0);
+        assert_eq!(sessions[i].tokens().len(), sessions[i].pos());
+        assert_eq!(sessions[i].cache_mut().kv_len(), sessions[i].pos());
+        let spec = idle.extra.spec.as_ref().unwrap();
+        assert_eq!(spec.context_len(SeqId(i)), Some(sessions[i].pos()));
+        assert_eq!(
+            spec.ctx_state(SeqId(i)),
+            Some((sessions[i].pos(), sessions[i].pos()))
+        );
+        assert_eq!(
+            spec.ctx_resets(),
+            0,
+            "begin_at must follow the retained prefix"
+        );
+    }
+    Ok(())
 }

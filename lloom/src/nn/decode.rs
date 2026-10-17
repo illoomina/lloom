@@ -517,6 +517,24 @@ pub struct RoundStats {
     pub start_ns: u64,
 }
 
+/// A resolved output ceiling; zero leaves EOS as the only token boundary.
+#[derive(Clone, Copy)]
+struct TokenLimit(usize);
+
+impl TokenLimit {
+    fn reached(self, produced: usize) -> bool {
+        self.0 != 0 && produced >= self.0
+    }
+
+    fn remaining(self, produced: usize) -> usize {
+        if self.0 == 0 {
+            usize::MAX
+        } else {
+            self.0.saturating_sub(produced)
+        }
+    }
+}
+
 impl DecodeOptions {
     /// Whether the run has no token ceiling (`max_tokens == 0`) — it stops only
     /// on EOS. See [`Self::max_tokens`].
@@ -528,17 +546,13 @@ impl DecodeOptions {
     /// [`Self::unbounded`] (the `0`-is-unbounded convention), so the loops run
     /// until EOS. Use this instead of `produced >= max_tokens`.
     pub fn reached(&self, produced: usize) -> bool {
-        self.max_tokens != 0 && produced >= self.max_tokens
+        TokenLimit(self.max_tokens).reached(produced)
     }
 
     /// The remaining token budget from `produced`, or `usize::MAX` when
     /// unbounded (for `min`-style clamps that want "no limit").
     pub fn remaining(&self, produced: usize) -> usize {
-        if self.max_tokens == 0 {
-            usize::MAX
-        } else {
-            self.max_tokens.saturating_sub(produced)
-        }
+        TokenLimit(self.max_tokens).remaining(produced)
     }
 
     /// The pacer depth: the explicit override if set, else the floor. (The
@@ -1049,6 +1063,7 @@ pub struct DecodeOut {
 
 /// One sequence's cursor through [`Session::decode_speculative_pipelined`].
 struct Lane<P> {
+    limit: TokenLimit,
     anchor_tok: u32,
     produced: usize,
     eos: bool,
@@ -3407,11 +3422,13 @@ impl<'m, M: CausalLM> Session<'m, M> {
             // baseline loop drops an EOS token.
             let mut batch: Vec<u32> = Vec::with_capacity(accepted.len());
             for &id in &accepted {
-                if eos_ids.contains(&id) {
-                    eos = true;
+                // A minimum-width verify may predict beyond the output
+                // ceiling. Its unpublished bonus cannot change the stop.
+                if opts.reached(produced + batch.len()) {
                     break;
                 }
-                if opts.reached(produced + batch.len()) {
+                if eos_ids.contains(&id) {
+                    eos = true;
                     break;
                 }
                 batch.push(id);
@@ -3499,10 +3516,75 @@ impl<'m, M: CausalLM> Session<'m, M> {
     #[allow(clippy::too_many_arguments)]
     pub fn decode_speculative_pipelined<S>(
         sessions: &mut [Self],
+        rewind: crate::profile::RewindProof<M::Profile>,
+        spec: &mut S,
+        prompts: &[&[u32]],
+        opts: &DecodeOptions,
+        eos_ids: &[u32],
+        device: &Device,
+        on_tokens: &mut dyn FnMut(usize, &[u32]) -> Result<()>,
+    ) -> Result<Vec<DecodeOut>>
+    where
+        S: Speculator,
+        M: Probes<S::Probe> + crate::profile::Shaped,
+    {
+        let n = sessions.len();
+        Self::decode_speculative_pipelined_limits(
+            sessions,
+            rewind,
+            spec,
+            prompts,
+            opts,
+            std::iter::repeat_n(opts.max_tokens, n),
+            eos_ids,
+            device,
+            on_tokens,
+        )
+    }
+
+    /// The pipelined driver with each lane's own output ceiling (`0` is
+    /// unbounded until EOS). `max_tokens[i]` belongs to `sessions[i]` and
+    /// overrides `opts.max_tokens`; the other options remain shared.
+    ///
+    /// Shape errors are refused before any session or drafter state moves.
+    /// The uniform-cap entry point and this one execute the same decode loop.
+    #[allow(clippy::too_many_arguments)]
+    pub fn decode_speculative_pipelined_with_caps<S>(
+        sessions: &mut [Self],
+        rewind: crate::profile::RewindProof<M::Profile>,
+        spec: &mut S,
+        prompts: &[&[u32]],
+        opts: &DecodeOptions,
+        max_tokens: &[usize],
+        eos_ids: &[u32],
+        device: &Device,
+        on_tokens: &mut dyn FnMut(usize, &[u32]) -> Result<()>,
+    ) -> Result<Vec<DecodeOut>>
+    where
+        S: Speculator,
+        M: Probes<S::Probe> + crate::profile::Shaped,
+    {
+        Self::decode_speculative_pipelined_limits(
+            sessions,
+            rewind,
+            spec,
+            prompts,
+            opts,
+            max_tokens.iter().copied(),
+            eos_ids,
+            device,
+            on_tokens,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn decode_speculative_pipelined_limits<S>(
+        sessions: &mut [Self],
         _rewind: crate::profile::RewindProof<M::Profile>,
         spec: &mut S,
         prompts: &[&[u32]],
         opts: &DecodeOptions,
+        max_tokens: impl ExactSizeIterator<Item = usize>,
         eos_ids: &[u32],
         device: &Device,
         on_tokens: &mut dyn FnMut(usize, &[u32]) -> Result<()>,
@@ -3520,6 +3602,13 @@ impl<'m, M: CausalLM> Session<'m, M> {
                 "decode_speculative_pipelined: {} sessions and {} prompts",
                 n,
                 prompts.len()
+            );
+        }
+        if max_tokens.len() != n {
+            lloom_tensor::bail!(
+                "decode_speculative_pipelined: {} sessions and {} row caps",
+                n,
+                max_tokens.len()
             );
         }
         if spec.max_draft() == 0 {
@@ -3568,7 +3657,8 @@ impl<'m, M: CausalLM> Session<'m, M> {
         // here for its anchor.
         let mut logits = Vec::with_capacity(n);
         let mut prefill_pacer = StepPacer::for_decode(opts);
-        for (i, s) in sessions.iter_mut().enumerate() {
+        for (i, (s, cap)) in sessions.iter_mut().zip(max_tokens).enumerate() {
+            let limit = TokenLimit(cap);
             s.seq.last_logits = None;
             let pos_before = s.seq.pos;
             let prefill_start = std::time::Instant::now();
@@ -3586,14 +3676,15 @@ impl<'m, M: CausalLM> Session<'m, M> {
             // Read after the other sequences' prefills: held outside them.
             logits.push((s.hold_logits(l)?, probe));
             lanes.push(Lane {
+                limit,
                 anchor_tok: 0,
                 produced: 0,
                 eos: false,
-                all_ids: Vec::with_capacity(opts.max_tokens),
+                all_ids: Vec::with_capacity(cap),
                 pos_before,
                 prompt_len: prompts[i].len(),
                 stats: DecodeStats {
-                    step_ns: Vec::with_capacity(opts.max_tokens),
+                    step_ns: Vec::with_capacity(cap),
                     prefill_ns: prefill_start.elapsed().as_nanos() as u64,
                     prefill_units,
                     step_markers: after.0 - before.0,
@@ -3621,12 +3712,12 @@ impl<'m, M: CausalLM> Session<'m, M> {
             lane.anchor_tok = anchor_tok;
             if eos_ids.contains(&anchor_tok) {
                 lane.eos = true;
-            } else if !opts.reached(lane.produced) {
+            } else if !lane.limit.reached(lane.produced) {
                 on_tokens(i, std::slice::from_ref(&anchor_tok))?;
                 lane.all_ids.push(anchor_tok);
                 lane.produced += 1;
             }
-            lane.done = lane.eos || opts.reached(lane.produced);
+            lane.done = lane.eos || lane.limit.reached(lane.produced);
         }
 
         // All anchors have consumed their seed logits; the round pipeline has
@@ -3636,7 +3727,7 @@ impl<'m, M: CausalLM> Session<'m, M> {
         // Prime: one verify in flight per live sequence.
         for i in 0..n {
             if !lanes[i].done {
-                let room = opts.remaining(lanes[i].produced);
+                let room = lanes[i].limit.remaining(lanes[i].produced);
                 Self::pipeline_enqueue(
                     &mut sessions[i],
                     &mut lanes[i],
@@ -3697,11 +3788,13 @@ impl<'m, M: CausalLM> Session<'m, M> {
 
                 let mut batch: Vec<u32> = Vec::with_capacity(accepted.len());
                 for &id in &accepted {
-                    if eos_ids.contains(&id) {
-                        lane.eos = true;
+                    // A minimum-width verify may predict beyond the output
+                    // ceiling. Its unpublished bonus cannot change the stop.
+                    if lane.limit.reached(lane.produced + batch.len()) {
                         break;
                     }
-                    if opts.reached(lane.produced + batch.len()) {
+                    if eos_ids.contains(&id) {
+                        lane.eos = true;
                         break;
                     }
                     batch.push(id);
@@ -3714,9 +3807,9 @@ impl<'m, M: CausalLM> Session<'m, M> {
                 lane.stats.step_ns.push(
                     (run_start.elapsed().as_nanos() as u64).saturating_sub(lane.round_start_ns),
                 );
-                lane.done = lane.eos || opts.reached(lane.produced);
+                lane.done = lane.eos || lane.limit.reached(lane.produced);
                 if !lane.done {
-                    let room = opts.remaining(lane.produced);
+                    let room = lane.limit.remaining(lane.produced);
                     Self::pipeline_enqueue(s, lane, spec, i, run_start, device, room)?;
                 }
             }
@@ -3738,6 +3831,7 @@ impl<'m, M: CausalLM> Session<'m, M> {
             let mut stats = lane.stats;
             stats.overrun = overrun;
             stats.produced = lane.produced;
+            stats.drafter_ctx = spec.context_len(SeqId(i)).map(|n| (n, s.seq.pos));
             outs.push(DecodeOut {
                 ids: lane.all_ids,
                 eos: lane.eos,

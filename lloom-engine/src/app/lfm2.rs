@@ -2858,33 +2858,18 @@ fn static_dspark_body<'a, 'm, P: Profile>(
             );
         }
     }
-    let max_tokens = specs.iter().map(|s| s.max_tokens).max().unwrap_or(0);
-    let opts = DecodeOptions {
-        max_tokens,
-        ..idle.opts.clone()
-    };
     let caps: Vec<usize> = specs.iter().map(|s| s.max_tokens).collect();
-    let mut outs = Session::decode_speculative_pipelined(
+    Session::decode_speculative_pipelined_with_caps(
         sessions,
         rewindable::<P>()?,
         spec,
         prompts,
-        &opts,
+        idle.opts,
+        &caps,
         &first.eos_ids,
         idle.device,
-        &mut |i, ids| {
-            // Every row runs to the batch's widest cap; a row past its own
-            // is cut here and below.
-            on_tokens(i, ids)
-        },
-    )?;
-    for (o, cap) in outs.iter_mut().zip(caps) {
-        if cap > 0 && o.ids.len() > cap {
-            o.ids.truncate(cap);
-            o.stats.produced = cap;
-        }
-    }
-    Ok(outs)
+        on_tokens,
+    )
 }
 
 /// The shapes the quantized KV arms have no path on, refused by the flags that
@@ -3506,3 +3491,6 @@ pub(crate) mod decision_media;
 
 #[cfg(test)]
 mod speculative_schedule_tests;
+
+#[cfg(test)]
+mod single_speculative_tests;

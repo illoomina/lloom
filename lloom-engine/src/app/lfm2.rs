@@ -937,13 +937,13 @@ impl<P: Lfm2Shape> Engine<P> {
             }
             config.flash_pages_per_chunk = k.max(1);
         }
-        config.conv_prefill_ctx = config.conv_prefill_ctx
-            || conv_carry_needed(
-                opts.prefill_tile,
-                opts.prefill_chunk,
-                &opts.decode,
-                opts.reuse_prefix,
-            );
+        config.conv_prefill_ctx = conv_carry_needed(
+            &config,
+            opts.prefill_tile,
+            opts.prefill_chunk,
+            &opts.decode,
+            opts.reuse_prefix,
+        );
         let axes_line = config.axes_line();
         // Stop on the checkpoint's declared EOS plus `<|im_end|>` (the chat
         // turn end).
@@ -2400,13 +2400,7 @@ impl<P: Lfm2Shape> Engine<P> {
             if let Some(spec) = &mut extra.spec {
                 // One run of `D` tokens; the prompt's submit time subtracted
                 // (the prefill's GPU tail is inside the bracket).
-                let params = DecodeParams {
-                    max_tokens: decode_tokens,
-                    eos_ids: NEVER_EOS.to_vec(),
-                    readback,
-                    prefill_tile,
-                    ..DecodeParams::default()
-                };
+                let params = throughput_params(decode_tokens, readback, prefill_tile);
                 let t = Instant::now();
                 let run = s.decode_speculative_until(
                     rewindable::<P>()?,
@@ -2445,13 +2439,7 @@ impl<P: Lfm2Shape> Engine<P> {
                 });
             }
             let mut detok = detok;
-            let params = DecodeParams {
-                max_tokens: 1,
-                eos_ids: NEVER_EOS.to_vec(),
-                readback,
-                prefill_tile,
-                ..DecodeParams::default()
-            };
+            let params = throughput_params(1, readback, prefill_tile);
             let t = Instant::now();
             let first = s.decode(&prompt, &mut detok, &params, |_| {})?;
             device.synchronize()?;
@@ -2466,13 +2454,7 @@ impl<P: Lfm2Shape> Engine<P> {
             // logits the context run held rather than re-feeding anything.
             let mut all: Vec<u32> = prompt.clone();
             all.extend_from_slice(&first.tokens);
-            let params = DecodeParams {
-                max_tokens: decode_tokens,
-                eos_ids: NEVER_EOS.to_vec(),
-                readback,
-                prefill_tile,
-                ..DecodeParams::default()
-            };
+            let params = throughput_params(decode_tokens, readback, prefill_tile);
             let t = Instant::now();
             let run = s.decode(&all, &mut detok, &params, |_| {})?;
             let decode_ms = ms(t.elapsed());
@@ -2916,17 +2898,37 @@ fn refuse_kv_quant_shape(config: &Config, device: &Device, batch: usize) -> Resu
 /// held sequence extends zero-pads each piece's left edge without it, and
 /// computes something one pass does not (§13.2f defect 1). One forward onto
 /// a cold cache is identical either way.
+/// This resolves load-known options, not later request/config mutations.
 fn conv_carry_needed(
+    config: &Config,
     prefill_tile: usize,
     prefill_chunk: usize,
     decode: &crate::DecodeConfig,
     reuse_prefix: bool,
 ) -> bool {
-    prefill_tile > 0
+    config.conv_prefill_ctx
+        || prefill_tile > 0
         || prefill_chunk > 0
+        || decode.prefill.tile > 0
+        || decode.prefill.chunk > 0
         || decode.prefill.ubatch > 0
         || decode.prefill.spark.is_some()
         || reuse_prefix
+}
+
+/// The B=1 throughput requests share one constructor on both loop bodies.
+fn throughput_params(
+    max_tokens: usize,
+    readback: ReadbackArm,
+    prefill_tile: usize,
+) -> DecodeParams {
+    DecodeParams {
+        max_tokens,
+        eos_ids: NEVER_EOS.to_vec(),
+        readback,
+        prefill_tile,
+        ..DecodeParams::default()
+    }
 }
 
 /// The drafter's context KV: the arm `tuning.dspark.ctx_kv` names when it
@@ -3297,6 +3299,99 @@ impl<P: Lfm2Shape> super::served::Served for Engine<P> {
 mod tests {
     use super::*;
     use lloom::nn::ops::KvQuant;
+
+    #[test]
+    fn conv_carry_reads_configured_tile_and_chunk_without_legacy_fields() {
+        let config = Config::default();
+        assert!(!config.conv_prefill_ctx);
+        for (tile, chunk) in [(16, 0), (0, 8)] {
+            let mut decode = crate::DecodeConfig::default();
+            decode.prefill.tile = tile;
+            decode.prefill.chunk = chunk;
+            let resolved = decode.options(1, ReadbackArm::Blocking, 0);
+            assert_eq!(resolved.prefill_tile, tile);
+            assert_eq!(resolved.prefill_chunk, chunk);
+            assert!(conv_carry_needed(&config, 0, 0, &decode, false));
+        }
+    }
+
+    #[test]
+    fn conv_carry_keeps_legacy_tile_and_chunk_independently() {
+        let config = Config::default();
+        let mut decode = crate::DecodeConfig::default();
+        decode.prefill.tile = 0;
+        for (tile, chunk) in [(16, 0), (0, 8)] {
+            assert!(conv_carry_needed(&config, tile, chunk, &decode, false));
+        }
+        assert!(!conv_carry_needed(&config, 0, 0, &decode, false));
+    }
+
+    #[test]
+    fn conv_carry_keeps_spark_reuse_and_explicit_axis_but_not_zero_split() {
+        let mut config = Config::default();
+        let mut decode = crate::DecodeConfig::default();
+        decode.prefill.tile = 0;
+        assert!(!conv_carry_needed(&config, 0, 0, &decode, false));
+
+        decode.prefill.ubatch = 3;
+        assert!(conv_carry_needed(&config, 0, 0, &decode, false));
+        decode.prefill.ubatch = 0;
+        decode.prefill.spark = Some("progressive:1,16/tile:16".into());
+        let resolved = decode.options(1, ReadbackArm::Blocking, 0);
+        assert_eq!(resolved.prefill_schedule, Some(vec![1, 16]));
+        assert_eq!(resolved.prefill_bulk, 16);
+        assert!(conv_carry_needed(&config, 0, 0, &decode, false));
+        decode.prefill.spark = None;
+
+        assert!(conv_carry_needed(&config, 0, 0, &decode, true));
+        assert!(!conv_carry_needed(&config, 0, 0, &decode, false));
+        config.conv_prefill_ctx = true;
+        assert!(conv_carry_needed(&config, 0, 0, &decode, false));
+    }
+
+    #[test]
+    fn single_throughput_request_construction_preserves_tile_and_group_fallback() {
+        let mut decode = crate::DecodeConfig::default();
+        decode.prefill.tile = 11;
+        decode.prefill.chunk = 5;
+        for readback in [
+            ReadbackArm::Auto,
+            ReadbackArm::Blocking,
+            ReadbackArm::Ring(crate::RingArm::CROWN),
+        ] {
+            for (tile, effective) in [(4, 4), (0, 11)] {
+                for max_tokens in [1, 7] {
+                    let params = throughput_params(max_tokens, readback, tile);
+                    assert_eq!(params.prefill_tile, tile);
+                    assert_eq!(params.max_tokens, max_tokens);
+                    assert_eq!(params.readback, readback);
+                    assert_eq!(params.eos_ids, NEVER_EOS);
+                    assert_eq!(params.seed, 42);
+                    assert!(params.temperature.is_none());
+                    assert!(params.top_p.is_none());
+                    assert!(params.top_k.is_none());
+                    assert!(!params.gumbel);
+                    assert!(!params.processors.is_active());
+                    assert!(params.stop_strings.is_empty());
+                    assert!(!params.logits_digest);
+                    assert!(params.thinking.is_none());
+                    assert_eq!(params.turn_tail, 0);
+                    assert!(params.logprobs.is_none());
+                    assert!(!params.cold);
+                    // The window body resolves with Blocking even when the
+                    // captured request arm is Auto.
+                    let resolved = decode.options(
+                        params.max_tokens,
+                        ReadbackArm::Blocking,
+                        params.prefill_tile,
+                    );
+                    assert_eq!(resolved.max_tokens, max_tokens);
+                    assert_eq!(resolved.prefill_tile, effective);
+                    assert_eq!(resolved.prefill_chunk, 5);
+                }
+            }
+        }
+    }
 
     /// `--dspark-ctx` (the tuning knob) reaches the drafter on every arm;
     /// `auto` is the pool arms' shared pool at N > 1, else per-sequence

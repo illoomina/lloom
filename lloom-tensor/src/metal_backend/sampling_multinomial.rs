@@ -5,6 +5,7 @@ use crate::{DType, Layout, Result};
 /// Private diagnostics, deliberately not convertible to a sampled Tensor.
 /// A status/sentinel here is not an asynchronous consumer-error protocol.
 #[allow(dead_code, reason = "private source candidate, no public integration")]
+#[derive(Clone)]
 pub(crate) struct PrivateMultinomial {
     ids: MetalStorage,
     support: MetalStorage,
@@ -146,8 +147,8 @@ impl MetalStorage {
     /// contiguous f32 rows in original-id order, using the existing caller's
     /// stream_key(seed, absolute_position) and full-vocabulary consumption.
     /// No RNG/noise preparation or public checked-token bridge is supplied.
-    /// The centered separately-rounded f32 expression is not claimed equal
-    /// to the protected host's centered f64 expression at arithmetic ties.
+    /// The centered separately-rounded f32 expression is shared with host
+    /// generation, not an identity promise with the former f64 expression.
     #[allow(
         dead_code,
         reason = "private arithmetic candidate, no public integration"
@@ -267,6 +268,8 @@ impl MetalStorage {
 
 mod result;
 mod readback;
+mod guard;
+mod prepared;
 
 #[cfg(test)]
 mod tests;

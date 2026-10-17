@@ -16,6 +16,25 @@ pub(super) struct SampleError {
     pub reason: RowError,
 }
 
+/// Request-wide sticky error uses the same reason codes as row status. Code 6
+/// is an incoherent result or invalid forced id, never a publishable token.
+pub(super) fn checked_error(words: &[u32]) -> Result<(), SampleError> {
+    if words == [0; 4] {
+        return Ok(());
+    }
+    let row = words.get(1).copied().unwrap_or(0) as usize;
+    let detail = words.get(2).copied().unwrap_or(u32::MAX);
+    let reason = match words.first().copied() {
+        Some(1) => RowError::Nan(detail),
+        Some(2) => RowError::PositiveInfinity(detail),
+        Some(3) => RowError::Empty,
+        Some(4) => RowError::Variate(detail),
+        Some(5) => RowError::Mass,
+        _ => RowError::InvalidResult,
+    };
+    Err(SampleError { row, reason })
+}
+
 /// Status words precede ids in the completed snapshot. Validate the entire
 /// window before exposing even its first id: a later row may have failed.
 pub(super) fn checked_ids(words: &[u32], rows: usize, vocab: usize) -> Result<&[u32], SampleError> {
@@ -53,6 +72,24 @@ pub(super) fn checked_ids(words: &[u32], rows: usize, vocab: usize) -> Result<&[
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sticky_error_cannot_be_hidden_by_a_later_successful_row() {
+        assert!(checked_error(&[0; 4]).is_ok());
+        assert_eq!(
+            checked_error(&[1, 7, 2, 0]),
+            Err(SampleError {
+                row: 7,
+                reason: RowError::Nan(2)
+            })
+        );
+        assert_eq!(
+            checked_error(&[6, 1, u32::MAX, 0]).unwrap_err().reason,
+            RowError::InvalidResult
+        );
+        assert!(checked_error(&[0, 0, 1, 0]).is_err());
+        assert!(checked_error(&[]).is_err());
+    }
 
     #[test]
     fn complete_window_is_checked_before_any_id_is_exposed() {

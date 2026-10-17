@@ -461,3 +461,27 @@ fn filtered_gumbel_window_keeps_noise_under_large_equal_finite_offsets() -> Resu
     }
     Ok(())
 }
+
+#[test]
+fn unfiltered_and_disabled_filter_gumbel_share_centered_f32_scalar_window_and_running_stream() -> Result<()> {
+    let device = Device::Cpu;
+    let rows = Tensor::new(&[[1e30f32, 1e30, f32::NEG_INFINITY]; 4], &device)?;
+    let row = rows.get(0)?;
+    let mut plain = LogitsProcessor::from_sampling(7, Sampling::GumbelSoftmax { temperature: 3.0 });
+    let mut filtered = LogitsProcessor::from_sampling(7, Sampling::FilteredGumbel { temperature: 3.0, k: 3, p: 1.0 });
+    let mut seen = Vec::new();
+    for pos in 0..32u64 {
+        plain.at_position(Some(pos));
+        filtered.at_position(Some(pos));
+        let id = plain.sample(&row)?;
+        assert_eq!(id, filtered.sample(&row)?);
+        assert_eq!(id, plain.sample_argmax_on_device(&row)?.to_scalar::<u32>()?);
+        seen.push(id);
+    }
+    assert!(seen.contains(&0) && seen.contains(&1));
+    assert_eq!(plain.window_draw(&rows, 10)?, filtered.window_draw(&rows, 10)?);
+    plain.at_position(None);
+    filtered.at_position(None);
+    for _ in 0..16 { assert_eq!(plain.sample(&row)?, filtered.sample(&row)?); }
+    Ok(())
+}

@@ -227,12 +227,16 @@ impl Scratch {
         temperature: f64,
         rng: &mut rand::rngs::StdRng,
     ) -> u32 {
+        self.gumbel_noise(values, temperature, (0..values.len()).map(|_| super::LogitsProcessor::gumbel_variate(rng)))
+    }
+
+    fn gumbel_noise(&self, values: &[f32], temperature: f64, noise: impl Iterator<Item = f32>) -> u32 {
         let mut best = None;
-        let max = self.gumbel_max as f64;
-        for (i, &w) in values.iter().enumerate() {
-            let g = super::LogitsProcessor::gumbel_variate(rng);
+        let max = self.gumbel_max;
+        let inv = (1.0 / temperature) as f32;
+        for (i, (&w, g)) in values.iter().zip(noise).enumerate() {
             if w > 0.0 {
-                let score = (self.order[i].score as f64 - max) / temperature + g as f64;
+                let score = centered_gumbel(self.order[i].score, max, inv, g);
                 if best.is_none_or(|(_, value)| score > value) {
                     best = Some((i as u32, score));
                 }
@@ -240,6 +244,14 @@ impl Scratch {
         }
         best.expect("maximum has weight one").0
     }
+}
+
+/// Separate f32 rounding at subtraction, reciprocal multiplication and noise
+/// addition. Centering keeps noise observable beside large common offsets.
+fn centered_gumbel(z: f32, maximum: f32, inv_t: f32, noise: f32) -> f32 {
+    let delta = z - maximum;
+    let scaled = delta * inv_t;
+    scaled + noise
 }
 
 pub(super) fn validate(temperature: f64, p: f64) -> Result<()> {
@@ -305,6 +317,19 @@ mod oracle;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn centered_f32_gumbel_keeps_the_approved_rounding_discriminator() {
+        let g = f32::from_bits(0x3eaa_aaab);
+        let inv = (1.0f64 / 3.0) as f32;
+        assert!(-1.0f64 / 3.0 + f64::from(g) > 0.0);
+        assert_eq!(centered_gumbel(-1.0, 0.0, inv, g).to_bits(), 0);
+        assert_eq!(centered_gumbel(1e30, 1e30, inv, g), g);
+        assert_eq!(centered_gumbel(0.0, 0.0, 1.0, f32::from_bits(1)).to_bits(), 1);
+        let mut scratch = Scratch { values: vec![0.0, -1.0], ..Default::default() };
+        scratch.prepare(3.0, 0, 1.0, true).unwrap();
+        assert_eq!(scratch.gumbel_noise(&scratch.values, 3.0, [0.0, g].into_iter()), 0);
+    }
 
     #[test]
     fn hand_derived_draws_and_refusals_hold_on_the_production_arithmetic() {

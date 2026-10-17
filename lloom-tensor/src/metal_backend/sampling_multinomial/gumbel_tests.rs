@@ -2,7 +2,7 @@
 //! Reference: the independent contract oracle prepares support/weights; then
 //! ascending original ids compare separately rounded f32 ((z-max)*inv_t)+g,
 //! ignoring zero weights, with lower id winning numeric ties (including ±0).
-//! This candidate is deliberately NOT an assertion of host-f64 equivalence.
+//! The f64 contrast is intentional; centered-f32 is the shared scoring contract.
 use super::PrivateMultinomial;
 use crate::backend::BackendStorage;
 use crate::metal_backend::{readback_counts, CutPolicy, HostSlot};
@@ -271,14 +271,14 @@ fn general_k_endpoints_masks_temperature_and_large_common_offset() -> Result<()>
 }
 
 #[test]
-fn host_f64_arithmetic_is_an_explicit_unmigrated_contrast() -> Result<()> {
+fn centered_f32_discriminator_rejects_f64_and_keeps_low_id_tie() -> Result<()> {
     let d = device()?;
     let noise = [0.0, f32::from_bits(0x3eaa_aaab)];
     // Host centered f64 score for id1 is positive; f32 -inv+g is zero.
     assert!(-1.0f64 / 3.0 + noise[1] as f64 > 0.0);
     let got = check(&[0.0, -1.0], Params::new(3.0, 0, 1.0), &noise, &d)?;
     assert_eq!(got.ids, [0]);
-    println!("PRIVATE_GUMBEL_ARITHMETIC_CONTRAST host_f64_id=1 candidate_f32_id=0; public migration OPEN");
+    println!("GUMBEL_ARITHMETIC_CONTRAST f64_id=1 shared_centered_f32_id=0");
     Ok(())
 }
 

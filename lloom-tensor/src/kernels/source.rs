@@ -158,7 +158,8 @@ pub const RANDOM: &str = concat!(
     "\n",
     include_str!("metal_src/sampling_multinomial.metal"),
     "\n",
-    include_str!("metal_src/sampling_gumbel.metal")
+    include_str!("metal_src/sampling_gumbel.metal"),
+    include_str!("metal_src/sampling_guard.metal")
 );
 pub const REDUCE: &str = with_utils!(
     "#include <metal_stdlib>\n#include <metal_limits>\nusing namespace metal;",
@@ -290,6 +291,7 @@ pub const MERGED_NON_MLX: &str = concat!(
     include_str!("metal_src/sampling_multinomial.metal"),
     "\n",
     include_str!("metal_src/sampling_gumbel.metal"),
+    include_str!("metal_src/sampling_guard.metal"),
     "\n",
     include_str!("metal_src/reduce.metal"),
     "\n",

@@ -1,5 +1,5 @@
-// Private centered-f32 candidate, not the protected host's f64 draw or the
-// existing unfiltered device expression. Noise is already-generated Gumbel
+// Shared centered-f32 scoring. The incumbent public Metal route is not yet
+// switched to this private draw. Noise is already-generated Gumbel
 // f32 data in original-id order, never uniforms or compact/rank-order noise.
 // Scalar stages round separately: ((z - maximum) * inv_t) + g. Positive
 // prepared weight is required, so exp32's zero tail cannot win via noise.

@@ -1416,6 +1416,10 @@ impl Holding {
 
 /// Why [`Holding::try_grow_to`] could not widen the reservation.
 #[derive(Debug)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "keep refusal arithmetic inline without another allocation on insufficient memory"
+)]
 pub enum GrowRefusal {
     /// The room could not hold the growth; the verdict carries the arithmetic.
     Room(Verdict),

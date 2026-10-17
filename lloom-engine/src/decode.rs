@@ -1244,8 +1244,8 @@ mod tests {
             let reader = scope.spawn(move || {
                 let mut hooks = 0;
                 drain_ring_reader(
-                    &stop,
-                    &done,
+                    stop,
+                    done,
                     |buf| {
                         let ordinal = reads.fetch_add(1, Ordering::AcqRel);
                         match ordinal {

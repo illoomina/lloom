@@ -82,6 +82,15 @@ mod command_lifecycle;
 mod command_policy;
 mod command_segments;
 mod completion_frontier;
+#[cfg(all(test, not(feature = "metal")))]
+#[path = "metal_backend/sampling_multinomial/result.rs"]
+mod sampling_result;
+#[cfg(all(test, feature = "metal"))]
+#[path = "../tests/sampling_contract/oracle.rs"]
+mod oracle;
+#[cfg(all(test, feature = "metal"))]
+#[path = "../tests/sampling_contract/fixtures.rs"]
+mod fixtures;
 #[cfg(any(feature = "metal", test))]
 mod completion_scope;
 #[cfg(any(feature = "metal", test))]

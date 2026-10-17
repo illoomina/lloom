@@ -18,6 +18,7 @@ pub mod params;
 pub mod quantized;
 pub mod qwen4exp;
 pub mod random;
+pub(crate) mod sampling_topk;
 pub mod reduce;
 pub mod reduce_names;
 pub mod scratch;

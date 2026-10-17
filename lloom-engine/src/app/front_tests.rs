@@ -2661,3 +2661,71 @@ fn the_load_line_reports_the_tail_the_default_runs_with() {
         tails(Some(false))
     );
 }
+
+#[test]
+fn neutral_effort_is_accepted_without_inventing_a_template_control() {
+    let engine = Stub::lfm2();
+    let front = Front::new(&engine, SessionOptions::default());
+    let messages = json!([user("Hi")]);
+    let base = front
+        .prompt(
+            &engine,
+            Request {
+                messages: &messages,
+                kwargs: Map::new(),
+                want: None,
+                add_bos: true,
+                expand: None,
+                history: None,
+            },
+        )
+        .unwrap();
+    for effort in ["none", "default"] {
+        let prompt = front
+            .prompt(
+                &engine,
+                Request {
+                    messages: &messages,
+                    kwargs: Map::from_iter([(REASONING_EFFORT.into(), json!(effort))]),
+                    want: None,
+                    add_bos: true,
+                    expand: None,
+                    history: None,
+                },
+            )
+            .unwrap();
+        // The GGUF owner exposes rendering through Served without Text. Its
+        // plain path performs a second ignored-variable check of its own.
+        let plain = front
+            .plain(
+                &engine,
+                Request {
+                    messages: &messages,
+                    kwargs: Map::from_iter([(REASONING_EFFORT.into(), json!(effort))]),
+                    want: None,
+                    add_bos: true,
+                    expand: None,
+                    history: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(plain.ids, base.ids);
+        assert_eq!(prompt.ids, base.ids);
+        assert_eq!(prompt.thinking, base.thinking);
+    }
+    // Meaningful unsupported controls still refuse; supported templates keep
+    // their own validation (covered by the existing template tests).
+    assert!(front
+        .prompt(
+            &engine,
+            Request {
+                messages: &messages,
+                kwargs: Map::from_iter([(REASONING_EFFORT.into(), json!("high"))]),
+                want: None,
+                add_bos: true,
+                expand: None,
+                history: None
+            }
+        )
+        .is_err());
+}

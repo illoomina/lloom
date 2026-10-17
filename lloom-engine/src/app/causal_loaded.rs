@@ -539,6 +539,16 @@ where
         params: &DecodeParams,
         on_fragment: &mut (impl FnMut(&str) -> bool + Send),
     ) -> Result<Decoded> {
+        self.complete_observed(prompt, params, on_fragment, &mut |_, _, _, _| Ok(()))
+    }
+
+    fn complete_observed(
+        &self,
+        prompt: &[u32],
+        params: &DecodeParams,
+        on_fragment: &mut (impl FnMut(&str) -> bool + Send),
+        observe: &mut super::served::DecodeObserver<'_>,
+    ) -> Result<Decoded> {
         check_context_capacity(self.capacity, prompt.len(), params.max_tokens, 0)
             .map_err(Error::wrap)?;
         if prompt
@@ -563,13 +573,10 @@ where
         let mut lease = self.checkout()?;
         lease.start_decode(&self.model, &self.device, self.decode.clone());
         let tokenizer = &self.tokenizer;
+        let mut from = 0usize;
         let result = lease.session().decode_until(
             prompt,
-            |ids| {
-                tokenizer
-                    .decode(ids, false)
-                    .map_err(|error| Error::msg(format!("detokenizing causal output: {error}")))
-            },
+            |ids| observed_decode(tokenizer, ids, &mut from, observe),
             params,
             |fragment| on_fragment(fragment),
         );
@@ -604,8 +611,25 @@ where
         params: &DecodeParams,
         on_fragment: &mut (impl FnMut(&str) -> bool + Send),
     ) -> Result<Decoded> {
+        self.complete_images_observed(
+            prompt,
+            images,
+            params,
+            on_fragment,
+            &mut |_, _, _, _| Ok(()),
+        )
+    }
+
+    pub(crate) fn complete_images_observed(
+        &self,
+        prompt: &[u32],
+        images: &[super::vision::DecodedImage],
+        params: &DecodeParams,
+        on_fragment: &mut (impl FnMut(&str) -> bool + Send),
+        observe: &mut super::served::DecodeObserver<'_>,
+    ) -> Result<Decoded> {
         if images.is_empty() {
-            return self.complete(prompt, params, on_fragment);
+            return self.complete_observed(prompt, params, on_fragment, observe);
         }
         let vision = self
             .vision
@@ -658,16 +682,13 @@ where
             0,
         )?;
         let tokenizer = &self.tokenizer;
+        let mut from = 0usize;
         let decoded =
             lease.with_model(&rows, &self.device, self.decode.clone(), |session, _| {
                 session.reset();
                 session.decode_until(
                     prompt,
-                    |ids| {
-                        tokenizer.decode(ids, false).map_err(|error| {
-                            Error::msg(format!("detokenizing causal output: {error}"))
-                        })
-                    },
+                    |ids| observed_decode(tokenizer, ids, &mut from, observe),
                     params,
                     |fragment| on_fragment(fragment),
                 )
@@ -1003,6 +1024,27 @@ fn produce_lfm2_gguf_with<T>(
         },
         prepared,
     ))
+}
+
+/// Observe the exact pending run TextStream decodes. Its nonterminal append
+/// accepts nonempty text not ending in U+FFFD; terminal flush has no successor.
+pub(super) fn observed_decode(
+    tokenizer: &Tokenizer,
+    ids: &[u32],
+    from: &mut usize,
+    observe: &mut super::served::DecodeObserver<'_>,
+) -> Result<String> {
+    let decode = |ids: &[u32]| {
+        tokenizer
+            .decode(ids, false)
+            .map_err(|error| Error::msg(format!("detokenizing causal output: {error}")))
+    };
+    let text = decode(ids)?;
+    observe(ids, &text, *from, &decode)?;
+    if !text.is_empty() && !text.ends_with('\u{FFFD}') {
+        *from += text.len();
+    }
+    Ok(text)
 }
 
 /// Owning adapter for the actual HTTP/REPL Served seam, with caller-supplied

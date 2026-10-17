@@ -52,6 +52,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
+mod reasoning;
 mod turns;
 
 /// The seed passage the throughput cells tile into their prompt when no
@@ -663,6 +664,37 @@ fn run_decode(
     }
 }
 
+fn append_fields(to: &mut serde_json::Map<String, Value>, fields: serde_json::Map<String, Value>) {
+    for (key, value) in fields {
+        let previous = to.get(&key).and_then(Value::as_str).unwrap_or("");
+        to.insert(
+            key,
+            Value::String(format!("{previous}{}", value.as_str().unwrap_or(""))),
+        );
+    }
+}
+
+fn run_decode_observed(
+    engine: &dyn Served,
+    prompt_ids: &[u32],
+    images: &[DecodedImage],
+    params: &DecodeParams,
+    split: Option<&Arc<parking_lot::Mutex<reasoning::Reasoning>>>,
+    on_fragment: &mut (dyn FnMut(&str) -> bool + Send),
+) -> Result<Decoded> {
+    if let Some(split) = split {
+        engine.complete_observed(
+            prompt_ids,
+            images,
+            params,
+            on_fragment,
+            &mut |ids, text, from, decode| split.lock().observe(ids, text, from, decode),
+        )
+    } else {
+        run_decode(engine, prompt_ids, images, params, on_fragment)
+    }
+}
+
 #[derive(Clone, Copy)]
 enum StreamKind {
     Completion,
@@ -1234,14 +1266,26 @@ fn chat_completions(shared: &Shared, v: &Value) -> Handled<Reply> {
             return_ids,
         })));
     }
+    let split = reasoning::Reasoning::for_chat(shared.engine.as_ref(), &prompt_ids)?
+        .map(|p| Arc::new(parking_lot::Mutex::new(p)));
+    let mut routed = serde_json::Map::<String, Value>::new();
     let started = Instant::now();
-    let decoded = run_decode(
+    let decoded = run_decode_observed(
         shared.engine.as_ref(),
         &prompt_ids,
         &images,
         &params,
-        &mut |_| true,
+        split.as_ref(),
+        &mut |text| {
+            if let Some(p) = &split {
+                append_fields(&mut routed, p.lock().push(text));
+            }
+            true
+        },
     )?;
+    if let Some(p) = &split {
+        append_fields(&mut routed, p.lock().finish());
+    }
     let elapsed = started.elapsed();
     let record_start = Instant::now();
     let frontier = prompt.as_ref().map(|p| {
@@ -1260,6 +1304,15 @@ fn chat_completions(shared: &Shared, v: &Value) -> Handled<Reply> {
         ms(elapsed),
     );
     let engine = shared.engine.as_ref();
+    let mut message = json!({"role": "assistant", "content": decoded.text});
+    if split.is_some() {
+        message["content"] = routed
+            .remove("content")
+            .unwrap_or(Value::String(String::new()));
+        if let Some(reasoning) = routed.remove("reasoning_content") {
+            message["reasoning_content"] = reasoning;
+        }
+    }
     let mut body = json!({
         "id": id,
         "object": "chat.completion",
@@ -1267,7 +1320,7 @@ fn chat_completions(shared: &Shared, v: &Value) -> Handled<Reply> {
         "model": model,
         "choices": [{
             "index": 0,
-            "message": { "role": "assistant", "content": decoded.text },
+            "message": message,
             "logprobs": if want_logprobs { chat_logprobs(engine, &decoded)? } else { Value::Null },
             "finish_reason": finish_reason(decoded.stop),
         }],
@@ -1641,10 +1694,18 @@ fn stream_response(shared: &Shared, request: Request, run: StreamingRun) -> Resu
         StreamKind::Chat => "/v1/chat/completions",
     };
     let created = now();
+    let split = match run.kind {
+        StreamKind::Chat => {
+            reasoning::Reasoning::for_chat(shared.engine.as_ref(), &run.prompt_ids)?
+        }
+        StreamKind::Completion => None,
+    }
+    .map(|p| Arc::new(parking_lot::Mutex::new(p)));
     // Each drained batch of text becomes one chunk, wrapped on the writer's
     // thread (`StreamWriter::start_with_deltas`).
     let wrap = {
         let (id, model, kind) = (run.id.clone(), run.model.clone(), run.kind);
+        let split = split.clone();
         move |text: &str| -> String {
             let chunk = match kind {
                 StreamKind::Completion => json!({
@@ -1653,7 +1714,10 @@ fn stream_response(shared: &Shared, request: Request, run: StreamingRun) -> Resu
                 }),
                 StreamKind::Chat => json!({
                     "id": id, "object": "chat.completion.chunk", "created": created, "model": model,
-                    "choices": [{ "index": 0, "delta": { "content": text }, "finish_reason": null }],
+                    "choices": [{ "index": 0, "delta": match &split {
+                        Some(p) => Value::Object(p.lock().push(text)),
+                        None => json!({"content": text}),
+                    }, "finish_reason": null }],
                 }),
             };
             format!("data: {chunk}\n\n")
@@ -1674,11 +1738,12 @@ fn stream_response(shared: &Shared, request: Request, run: StreamingRun) -> Resu
         // The callback runs on the decode thread: it hands the text over;
         // the chunk is built and written on the writer thread. A client that
         // went away stops the run at the next drained batch.
-        run_decode(
+        run_decode_observed(
             engine,
             &run.prompt_ids,
             &run.images,
             &run.params,
+            split.as_ref(),
             &mut |frag| {
                 if sw.client_gone() {
                     return false;
@@ -1689,11 +1754,22 @@ fn stream_response(shared: &Shared, request: Request, run: StreamingRun) -> Resu
         )
     };
     let written = sw.written();
-    let (w, write_err) = sw.finish()?;
+    let (mut w, write_err) = sw.finish()?;
     let decoded = match decoded {
         Ok(decoded) => decoded,
         Err(error) => return finish_stream_error(w, error),
     };
+    if write_err.is_none() {
+        if let Some(p) = split {
+            let delta = p.lock().finish();
+            if !delta.is_empty() {
+                w.event(&json!({
+                    "id": run.id, "object": "chat.completion.chunk", "created": created, "model": run.model,
+                    "choices": [{"index": 0, "delta": delta, "finish_reason": null}],
+                }))?;
+            }
+        }
+    }
     // The accepted history is what the server handed the writer; of that,
     // what it knows it wrote, and whether a write failed (what the client
     // received is not known either way).
@@ -2672,7 +2748,7 @@ fn timings(
         "host_fill": super::common::host_fill_name(st.host_feed.as_ref()),
         "prompt_ids_sha256": facts.ids_sha256,
         // The template's variable as the prompt reflects it; null for its
-        // default (a value the template would not act on is a 400).
+        // default. Neutral values can be ignored when the template has no control.
         "reasoning_effort": facts.reasoning_effort,
         // Whether the prompt leaves a thinking block open, and who decided:
         // the template (its switch or its own behaviour) or the engine,

@@ -921,6 +921,37 @@ where
             |engine| engine.complete_images(prompt, images, params, &mut |t| on_fragment(t)),
         )?)
     }
+    fn complete_observed(
+        &self,
+        prompt: &[u32],
+        images: &[super::super::vision::DecodedImage],
+        params: &DecodeParams,
+        on_fragment: &mut (dyn FnMut(&str) -> bool + Send),
+        observe: &mut crate::app::served::DecodeObserver<'_>,
+    ) -> anyhow::Result<Decoded> {
+        if !images.is_empty() && !self.metadata.capabilities.vision {
+            return Err(self.no_vision());
+        }
+        let request = if images.is_empty() {
+            Request::Generation { prompt, params }
+        } else {
+            Request::Images {
+                prompt,
+                images,
+                params,
+            }
+        };
+        Ok(self.pass(request, |engine| {
+            engine.complete_images_observed(
+                prompt,
+                images,
+                params,
+                &mut |t| on_fragment(t),
+                observe,
+            )
+        })?)
+    }
+
     fn prefill_throughput(&self, n: usize, batch: usize) -> anyhow::Result<PrefillTiming> {
         self.check_batch(batch)?;
         check_context_capacity(self.kv_capacity(), n, 1, 0)?;

@@ -2804,7 +2804,7 @@ pub fn attention_paged(
 }
 
 /// The request's `(batch, queries, keys)` once its tensors are checked
-/// against the route's geometry, dtypes and mask.
+/// against the route's devices, geometry, dtypes and mask.
 fn check_attention(
     q: &Tensor,
     k: &Tensor,
@@ -2814,6 +2814,18 @@ fn check_attention(
     pooled: bool,
 ) -> Result<(usize, usize, usize)> {
     use crate::nn::attention::route::MaskKind;
+    for (input, op) in [(k, "attention: query/key"), (v, "attention: query/value")] {
+        if !q.device().same_device(input.device()) {
+            return Err(lloom_tensor::Error::DeviceMismatchBinaryOp(Box::new(
+                lloom_tensor::error::DeviceMismatchBinaryOp {
+                    lhs: q.device().location(),
+                    rhs: input.device().location(),
+                    op,
+                },
+            ))
+            .bt());
+        }
+    }
     let spec = route.spec();
     let (b, hq, nq, hd) = q.dims4()?;
     let (bk, hkv, nk, hdk) = k.dims4()?;

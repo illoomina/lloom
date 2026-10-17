@@ -529,6 +529,40 @@ fn compound_readback_forms_reach_the_generated_schema() {
     eprintln!("[{checked} admitted compound schema strings; 3 refused]");
 }
 
+#[test]
+fn compound_readback_schema_and_runtime_share_rust_trim() {
+    let schema = crate::option_schema::schema();
+    let node = &schema_node(&schema, "decode.readback")["anyOf"][1];
+    let none = BTreeMap::new();
+    for spelling in [
+        "auto",
+        "blocking",
+        "ring",
+        "ring-nonblocking",
+        "ring-fixed",
+        "ring-la0",
+        "ring-hostdrain",
+        "ring-gpubatch",
+        "ring-gpubatch-nonblocking",
+    ] {
+        for (padding, expected) in [(" \t\n", true), ("\u{0085}", true), ("\u{FEFF}", false)] {
+            let value = format!("{padding}{}{padding}", spelling.to_ascii_uppercase());
+            let doc = json!({"readback": value}).to_string();
+            let actual = config(&["--decode-config", &doc], &none);
+            assert_eq!(actual.is_ok(), expected, "runtime {value:?}: {actual:?}");
+            assert_eq!(
+                schema_valid(node, &json!(value), &schema["$defs"]),
+                expected,
+                "schema {value:?}"
+            );
+            if let Ok(actual) = actual {
+                let canonical = config(&["--readback", spelling], &none).unwrap();
+                assert_eq!(actual, canonical, "{value:?}");
+            }
+        }
+    }
+}
+
 fn readback_wait_cases() -> Vec<Value> {
     serde_json::from_str(include_str!("../../tests/fixtures/readback-wait-s1.json")).unwrap()
 }

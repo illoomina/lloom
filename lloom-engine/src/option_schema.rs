@@ -152,6 +152,18 @@ fn count_decimal(maximum: u64, positive: bool) -> String {
 /// ECMA-262 (whose \s includes FEFF and excludes NEL).
 const TRIM_SPACE: &str = "[\u{0009}-\u{000D}\u{0020}\u{0085}\u{00A0}\u{1680}\u{2000}-\u{200A}\u{2028}\u{2029}\u{202F}\u{205F}\u{3000}]";
 
+fn readback_shorthand_schema() -> Value {
+    let variants = crate::ReadbackConfig::SPELLINGS;
+    let alts: Vec<String> = variants
+        .iter()
+        .map(|s| escape(s).replace(r"\-", "-"))
+        .collect();
+    json!({"anyOf": [
+        {"type": "string", "enum": variants},
+        {"type": "string", "pattern": format!("^{TRIM_SPACE}*({}){TRIM_SPACE}*$", case_free(&alts.join("|")))}
+    ]})
+}
+
 fn wait_schema(grammar: &lloom_tensor::options::wait::WaitGrammar) -> Value {
     let literal = |s: &str| escape(s).replace(r"\-", "-");
     let mut alts: Vec<String> = grammar.literals.iter().map(|s| literal(s)).collect();
@@ -525,7 +537,7 @@ pub fn schema() -> Value {
         let group = node["properties"][last].take();
         let m = key.meta();
         node["properties"][last] = json!({
-            "anyOf": [group, arms(crate::ReadbackConfig::SPELLINGS)],
+            "anyOf": [group, readback_shorthand_schema()],
             "description": format!("{} A string is the shorthand for the group's keys.", m.doc),
             "x-lloom-status": m.status.name(),
             "x-lloom-flag": format!("--{}", m.cli),

@@ -634,7 +634,7 @@ fn under_the_eos_gate_the_overrun_reconciles_on_a_wrapped_pooled_ring() -> Resul
         "blocking",
         false,
         never,
-        &[first.clone()],
+        std::slice::from_ref(&first),
         None,
         SLOW,
     )?

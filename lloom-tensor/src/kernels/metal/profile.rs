@@ -1163,6 +1163,12 @@ pub struct Snapshot {
     pub counter_unit_s: Option<f64>,
 }
 
+/// Every timed command buffer recorded so far, in completion order, without
+/// the rest of [`snapshot`]'s work.
+pub fn command_buffer_records() -> Vec<CommandBufferRecord> {
+    recorder().lock().unwrap().records.clone()
+}
+
 /// Take the current totals without clearing them.
 pub fn snapshot() -> Snapshot {
     let rec = recorder().lock().unwrap();

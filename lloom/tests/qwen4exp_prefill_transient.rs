@@ -51,7 +51,12 @@ fn pool(m: &MetalDevice) -> Pool {
 /// pool and the device. The warm forward leaves its buffers on the free
 /// list, which the held forward may take; `live + pending` counts what it
 /// acquired whichever list served it.
-fn held_forward(cfg: &Config, prompt: usize, free_budget: Option<usize>) -> Result<Held> {
+fn held_forward(
+    cfg: &Config,
+    prompt: usize,
+    free_budget: Option<usize>,
+    witness_reset: bool,
+) -> Result<Held> {
     let dev = Device::new_metal(0)?;
     let m = metal(&dev);
     if let Some(b) = free_budget {
@@ -81,6 +86,33 @@ fn held_forward(cfg: &Config, prompt: usize, free_budget: Option<usize>) -> Resu
     dev.synchronize()?;
     cache.reset();
     dev.synchronize()?;
+    let clock = m.gpu_clock();
+    let reset_epoch = clock.current_epoch();
+    let reset = pool(m);
+    let reset_complete = clock.is_complete(reset_epoch);
+    // Reset releases are stamped on the open epoch even when it has no
+    // dispatches. Close and drain that prior epoch before measuring a pass.
+    let reset_marker = m.flush_marker()?;
+    m.wait_marker(&reset_marker)?;
+    let settled = pool(m);
+    assert!(clock.is_complete(reset_epoch), "reset epoch did not retire");
+    assert_eq!(settled.pending, 0, "prior reset releases remain pending");
+    if witness_reset {
+        assert!(reset.pending > 0, "reset-release witness was vacuous");
+        assert!(!reset_complete, "reset epoch was already complete");
+    }
+    eprintln!(
+        "HELD_BASELINE actual={} prompt={prompt} reset_epoch={} reset_live={} \
+         reset_pending={} reset_complete={reset_complete} settled_live={} \
+         settled_pending={} completed={}",
+        m.commands().actual_command_api(),
+        reset_epoch.0,
+        reset.live,
+        reset.pending,
+        settled.live,
+        settled.pending,
+        clock.completed_count().0
+    );
 
     // One command buffer for the held forward: Metal blocks a queue's
     // `commandBuffer` once 64 are outstanding, and a held queue never
@@ -91,6 +123,7 @@ fn held_forward(cfg: &Config, prompt: usize, free_budget: Option<usize>) -> Resu
     let before = pool(m);
     let gate = HostEvent::new(m)?;
     gate.encode_wait(1)?;
+    let held_epoch = clock.current_epoch();
     let done = Arc::new(AtomicBool::new(false));
     let timed_out = Arc::new(AtomicBool::new(false));
     let (gate, watchdog) = {
@@ -111,12 +144,27 @@ fn held_forward(cfg: &Config, prompt: usize, free_budget: Option<usize>) -> Resu
     model.note_input_ids(&mut cache, &ids)?;
     let logits = model.forward(&input, 0, &mut cache);
     let after = pool(m);
+    let held_complete = clock.is_complete(held_epoch);
     done.store(true, Ordering::Release);
     gate.signal(1);
     watchdog.join().expect("the watchdog");
     assert!(
         !timed_out.load(Ordering::Acquire),
         "the forward waited on the held GPU: a host read inside the pass"
+    );
+    assert!(
+        !held_complete,
+        "held epoch retired before its event was released"
+    );
+    eprintln!(
+        "HELD_EPOCH actual={} prompt={prompt} epoch={} complete={held_complete} \
+         before_live={} before_pending={} after_live={} after_pending={}",
+        m.commands().actual_command_api(),
+        held_epoch.0,
+        before.live,
+        before.pending,
+        after.live,
+        after.pending
     );
     drop(logits?);
     dev.synchronize()?;
@@ -188,7 +236,7 @@ fn a_held_prefill_acquires_what_its_layers_allocate() -> Result<()> {
             // own size, so `live + pending` is what the forward allocated —
             // a free bucket serving a smaller request is memory already held
             // (and admitted as the free list's cap), not the pass's.
-            let h = held_forward(&cfg, prompt, Some(0))?;
+            let h = held_forward(&cfg, prompt, Some(0), g == "tiny" && prompt == 7)?;
             let route = h.derived.route();
             assert_eq!(
                 route.lifetime,

@@ -1507,6 +1507,21 @@ fn bool_wait_cases() -> Vec<Value> {
     .unwrap()
 }
 
+fn bool_wait_config_path(path: &str) -> std::path::PathBuf {
+    std::env::temp_dir().join(format!(
+        "lloom-bool-wait-{}-{path}.json",
+        std::process::id()
+    ))
+}
+
+#[test]
+fn bool_wait_config_files_are_distinct_in_one_process() {
+    assert_ne!(
+        bool_wait_config_path("decode.ring.eos_wait"),
+        bool_wait_config_path("speculative.verify_wait")
+    );
+}
+
 fn assert_bool_wait_normalization(path: &str, storage: &str, reset: bool) {
     let key = &index().keys[path];
     assert!(key.meta().normalize_values);
@@ -1523,8 +1538,7 @@ fn assert_bool_wait_normalization(path: &str, storage: &str, reset: bool) {
         let (group, rest) = path.split_once('.').unwrap();
         let flag = format!("--{group}-config");
         let doc = document(rest, input.clone()).to_string();
-        let file =
-            std::env::temp_dir().join(format!("lloom-bool-wait-{}.json", std::process::id()));
+        let file = bool_wait_config_path(path);
         std::fs::write(&file, document(path, input.clone()).to_string()).unwrap();
         let mut routes = vec![
             ("group".into(), config(&[&flag, &doc], &none)),

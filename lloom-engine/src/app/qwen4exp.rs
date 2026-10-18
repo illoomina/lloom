@@ -1151,6 +1151,16 @@ impl<P: QwenShape, R: ExpertResidency + HasStreamStats + Send + Sync + 'static> 
                 Err(_) => anyhow::bail!("batch: the scheduler dropped the request"),
             }
         };
+        if !cancelled && !done.cancelled && !stopped_on_string {
+            let (rest, stopped) = stream.flush(&mut detok, &params.stop_strings)?;
+            stopped_on_string |= stopped;
+            if let Some(rest) = rest {
+                if !on_fragment(&rest) {
+                    stream.refuse_last();
+                    cancelled = true;
+                }
+            }
+        }
         let stop = if cancelled || (done.cancelled && !stopped_on_string) {
             Stop::Cancelled
         } else if stopped_on_string {
@@ -1160,13 +1170,6 @@ impl<P: QwenShape, R: ExpertResidency + HasStreamStats + Send + Sync + 'static> 
         } else {
             Stop::Length
         };
-        if stop != Stop::Cancelled && !stopped_on_string {
-            if let Some(rest) = stream.held() {
-                if !on_fragment(&rest) {
-                    stream.refuse_last();
-                }
-            }
-        }
         let (text, _) = stream.finish(&params.stop_strings);
         Ok(Decoded {
             text,

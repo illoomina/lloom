@@ -537,6 +537,9 @@ fn report_timing(
     println!("\n=== 6. DOES IT PAY? (§10.2r) ===");
 
     if !profile::enabled() {
+        #[cfg(not(feature = "metal"))]
+        println!("GPU-busy/dispatch metrics are UNAVAILABLE: Metal instrumentation is not compiled.\nWall columns remain valid; profile_enabled=false qualifies legacy numeric placeholders.");
+        #[cfg(feature = "metal")]
         println!(
             "GPU-busy columns are ZERO: CANDLE_METAL_PROFILE is not set.\n\
              Wall columns are still valid. Set CANDLE_METAL_PROFILE=1 for the\n\
@@ -819,7 +822,10 @@ fn degeneracy(ids: &[u32]) -> Degeneracy {
 
 #[allow(clippy::too_many_arguments)]
 fn main() -> Result<()> {
-    let args = Args::parse();
+    execute(Args::parse())
+}
+
+fn execute(args: Args) -> Result<()> {
     // Only --timing consumes close_bracket GPU intervals; accept-rate-only runs stay usable.
     if args.timing {
         candle_examples::require_profile_recorder("lfm2-dspark-verify")?;
@@ -1613,4 +1619,46 @@ fn shape_key() -> lloom::profile::ProfileKey {
         <lloom::profile::NoRewind as lloom::profile::Rewind>::NAME,
         <lloom::profile::One as lloom::profile::Rows>::NAME,
     )
+}
+
+#[cfg(all(test, not(feature = "metal")))]
+mod cpu_capability_tests {
+    use super::*;
+    #[test]
+    fn requested_gpu_timing_diagnostic_refuses_at_actual_entry_before_prompt_access() {
+        candle::isolation::claim("DSpark entry diagnostic refusal");
+        std::env::set_var("CANDLE_METAL_PROFILE", "1");
+        std::env::set_var("LLOOM_PROFILE", "deterministic");
+        let args = Args::try_parse_from([
+            "lfm2-dspark-verify",
+            "--cpu",
+            "--timing",
+            "--prompt-file",
+            "/dev/null/not-a-prompt",
+            "--target-dir",
+            "/dev/null/not-a-target",
+            "--draft-dir",
+            "/dev/null/not-a-drafter",
+        ])
+        .unwrap();
+        let error = execute(args).unwrap_err().to_string();
+        let capability = if candle::tuning::PROFILE_INSTRUMENTS {
+            "metal"
+        } else {
+            "profile"
+        };
+        assert!(
+            error.contains(&format!("{capability} instrumentation is not compiled")),
+            "{error}"
+        );
+        if candle::tuning::PROFILE_INSTRUMENTS {
+            assert!(error.contains("lfm2-dspark-verify"), "{error}");
+        }
+    }
+    #[test]
+    fn help_remains_available_without_gpu_timing_recorder() {
+        let error = Args::try_parse_from(["lfm2-dspark-verify", "--help"]).unwrap_err();
+        assert_eq!(error.kind(), clap::error::ErrorKind::DisplayHelp);
+        assert!(error.to_string().contains("--timing"));
+    }
 }

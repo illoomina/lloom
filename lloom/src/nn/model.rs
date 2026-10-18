@@ -315,6 +315,15 @@ pub trait CacheReset {
 /// [`CacheReset`]'s reason: the locked trait is not widened, and a cache that
 /// cannot rewind reports a horizon of zero rather than being unable to compile.
 pub trait CacheRewind {
+    /// Refuse acceptance while this cache is known to be unusable. Read-only:
+    /// this neither repairs state nor waits for device work. Caches with an
+    /// invalid-state sentinel override the default, which adds no check.
+    /// Success is not a general recovery/completion certificate: after an
+    /// operational error the caller still owes the family's explicit recovery.
+    fn check_acceptance_state(&self) -> Result<()> {
+        Ok(())
+    }
+
     /// How many positions [`Self::rewind`] would currently accept. Zero for a
     /// cache with no rewindable arm, and for a rewindable one while a
     /// speculative window is open or nothing has been written since a

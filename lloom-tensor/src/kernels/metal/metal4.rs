@@ -73,6 +73,8 @@ unsafe impl Sync for Queue {}
 
 impl Queue {
     pub fn new(device: Device) -> Result<Arc<Self>, MetalKernelError> {
+        crate::tuning::try_tuning()
+            .map_err(|error| MetalKernelError::InvalidInput(error.to_string()))?;
         let raw = device
             .as_ref()
             .newMTL4CommandQueue()
@@ -1175,12 +1177,10 @@ impl PreparedCommit<'_> {
         &self,
         epoch: crate::retire::Epoch,
     ) -> Result<(), MetalKernelError> {
-        self.submission
-            .stage_binding_epoch(epoch)
-            .inspect_err(|_| {
-                self.submission
-                    .binding_failure(crate::retirement_owners::Failure::AdapterFailed)
-            })
+        self.submission.stage_binding_epoch(epoch).inspect_err(|_| {
+            self.submission
+                .binding_failure(crate::retirement_owners::Failure::AdapterFailed)
+        })
     }
     pub(super) fn on_completion(
         &self,
@@ -1243,17 +1243,14 @@ impl PreparedCommit<'_> {
             .store(MTLCommandBufferStatus::Committed.0, Ordering::Release);
         drop(state);
         let owners = super::retirement::NativeOwners::metal4(slot, submission.clone(), physical);
-        match submission
-            .retirement
-            .replace_prepared(
-                super::retirement::Captures {
-                    callbacks,
-                    hooked,
-                    bindings: None,
-                },
-                owners,
-            )
-        {
+        match submission.retirement.replace_prepared(
+            super::retirement::Captures {
+                callbacks,
+                hooked,
+                bindings: None,
+            },
+            owners,
+        ) {
             Ok(displaced) => drop(displaced), // Empty pre-reserved record only.
             Err(rejected) => {
                 // An invariant failure must not drop the only physical owner.

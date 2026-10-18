@@ -271,9 +271,9 @@ fn print_census_and_phases(stats: &DecodeStats) {
         ("prefill", &stats.prefill_census),
         ("step 0", &stats.step0_census),
     ] {
-        if census.is_empty() {
+        let Some(census) = census else {
             continue;
-        }
+        };
         let total: u64 = census.iter().map(|(_, n)| n).sum();
         eprintln!(
             "[{name} census: {total} dispatches, {} kernels]",

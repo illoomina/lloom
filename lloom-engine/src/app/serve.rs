@@ -52,6 +52,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
+mod reasoning;
 mod turns;
 
 /// The seed passage the throughput cells tile into their prompt when no
@@ -663,6 +664,37 @@ fn run_decode(
     }
 }
 
+fn append_fields(to: &mut serde_json::Map<String, Value>, fields: serde_json::Map<String, Value>) {
+    for (key, value) in fields {
+        let previous = to.get(&key).and_then(Value::as_str).unwrap_or("");
+        to.insert(
+            key,
+            Value::String(format!("{previous}{}", value.as_str().unwrap_or(""))),
+        );
+    }
+}
+
+fn run_decode_observed(
+    engine: &dyn Served,
+    prompt_ids: &[u32],
+    images: &[DecodedImage],
+    params: &DecodeParams,
+    split: Option<&Arc<parking_lot::Mutex<reasoning::Reasoning>>>,
+    on_fragment: &mut (dyn FnMut(&str) -> bool + Send),
+) -> Result<Decoded> {
+    if let Some(split) = split {
+        engine.complete_observed(
+            prompt_ids,
+            images,
+            params,
+            on_fragment,
+            &mut |ids, text, from, decode| split.lock().observe(ids, text, from, decode),
+        )
+    } else {
+        run_decode(engine, prompt_ids, images, params, on_fragment)
+    }
+}
+
 #[derive(Clone, Copy)]
 enum StreamKind {
     Completion,
@@ -1234,14 +1266,26 @@ fn chat_completions(shared: &Shared, v: &Value) -> Handled<Reply> {
             return_ids,
         })));
     }
+    let split = reasoning::Reasoning::for_chat(shared.engine.as_ref(), &prompt_ids)?
+        .map(|p| Arc::new(parking_lot::Mutex::new(p)));
+    let mut routed = serde_json::Map::<String, Value>::new();
     let started = Instant::now();
-    let decoded = run_decode(
+    let decoded = run_decode_observed(
         shared.engine.as_ref(),
         &prompt_ids,
         &images,
         &params,
-        &mut |_| true,
+        split.as_ref(),
+        &mut |text| {
+            if let Some(p) = &split {
+                append_fields(&mut routed, p.lock().push(text));
+            }
+            true
+        },
     )?;
+    if let Some(p) = &split {
+        append_fields(&mut routed, p.lock().finish());
+    }
     let elapsed = started.elapsed();
     let record_start = Instant::now();
     let frontier = prompt.as_ref().map(|p| {
@@ -1260,6 +1304,15 @@ fn chat_completions(shared: &Shared, v: &Value) -> Handled<Reply> {
         ms(elapsed),
     );
     let engine = shared.engine.as_ref();
+    let mut message = json!({"role": "assistant", "content": decoded.text});
+    if split.is_some() {
+        message["content"] = routed
+            .remove("content")
+            .unwrap_or(Value::String(String::new()));
+        if let Some(reasoning) = routed.remove("reasoning_content") {
+            message["reasoning_content"] = reasoning;
+        }
+    }
     let mut body = json!({
         "id": id,
         "object": "chat.completion",
@@ -1267,7 +1320,7 @@ fn chat_completions(shared: &Shared, v: &Value) -> Handled<Reply> {
         "model": model,
         "choices": [{
             "index": 0,
-            "message": { "role": "assistant", "content": decoded.text },
+            "message": message,
             "logprobs": if want_logprobs { chat_logprobs(engine, &decoded)? } else { Value::Null },
             "finish_reason": finish_reason(decoded.stop),
         }],
@@ -1636,31 +1689,71 @@ fn request_processors(
 /// arrive: chunked transfer through the request's raw writer, so a token is on
 /// the wire when the loop's commit drains it.
 fn stream_response(shared: &Shared, request: Request, run: StreamingRun) -> Result<()> {
+    stream_response_with_writer(shared, run, || {
+        ChunkedWriter::start(request, "text/event-stream")
+    })
+}
+
+// The HTTP caller and deterministic I/O-failure controls use the same decode,
+// parser finalization, frontier recording and trailer path. Delay opening the
+// writer until the fallible reasoning metadata has been checked.
+fn stream_response_with_writer(
+    shared: &Shared,
+    run: StreamingRun,
+    start_writer: impl FnOnce() -> Result<ChunkedWriter>,
+) -> Result<()> {
     let endpoint = match run.kind {
         StreamKind::Completion => "/v1/completions",
         StreamKind::Chat => "/v1/chat/completions",
     };
     let created = now();
+    let split = match run.kind {
+        StreamKind::Chat => {
+            reasoning::Reasoning::for_chat(shared.engine.as_ref(), &run.prompt_ids)?
+        }
+        StreamKind::Completion => None,
+    }
+    .map(|p| Arc::new(parking_lot::Mutex::new(p)));
     // Each drained batch of text becomes one chunk, wrapped on the writer's
-    // thread (`StreamWriter::start_with_deltas`).
+    // thread (the counted adapter defers unresolved reasoning prefixes).
     let wrap = {
         let (id, model, kind) = (run.id.clone(), run.model.clone(), run.kind);
-        move |text: &str| -> String {
-            let chunk = match kind {
-                StreamKind::Completion => json!({
-                    "id": id, "object": "text_completion", "created": created, "model": model,
-                    "choices": [{ "index": 0, "text": text, "logprobs": null, "finish_reason": null }],
-                }),
-                StreamKind::Chat => json!({
-                    "id": id, "object": "chat.completion.chunk", "created": created, "model": model,
-                    "choices": [{ "index": 0, "delta": { "content": text }, "finish_reason": null }],
-                }),
+        let split = split.clone();
+        move |text: &str| -> (String, usize) {
+            let (chunk, resolved) = match kind {
+                StreamKind::Completion => (
+                    json!({
+                        "id": id, "object": "text_completion", "created": created, "model": model,
+                        "choices": [{ "index": 0, "text": text, "logprobs": null, "finish_reason": null }],
+                    }),
+                    text.len(),
+                ),
+                StreamKind::Chat => {
+                    let (delta, resolved) = match &split {
+                        Some(p) => p.lock().push_counted(text),
+                        None => (
+                            serde_json::Map::from_iter([("content".into(), json!(text))]),
+                            text.len(),
+                        ),
+                    };
+                    (
+                        json!({
+                            "id": id, "object": "chat.completion.chunk", "created": created, "model": model,
+                            "choices": [{ "index": 0, "delta": delta, "finish_reason": null }],
+                        }),
+                        resolved,
+                    )
+                }
             };
-            format!("data: {chunk}\n\n")
+            (format!("data: {chunk}\n\n"), resolved)
         }
     };
-    let sw =
-        StreamWriter::start_with_deltas(ChunkedWriter::start(request, "text/event-stream")?, wrap);
+    let writer = start_writer()?;
+    let sw = if split.is_some() {
+        StreamWriter::start_with_counted_deltas(writer, wrap)
+    } else {
+        StreamWriter::start_with_deltas(writer, move |text| wrap(text).0)
+    };
     if let StreamKind::Chat = run.kind {
         sw.event(&json!({
             "id": run.id, "object": "chat.completion.chunk", "created": created,
@@ -1674,11 +1767,12 @@ fn stream_response(shared: &Shared, request: Request, run: StreamingRun) -> Resu
         // The callback runs on the decode thread: it hands the text over;
         // the chunk is built and written on the writer thread. A client that
         // went away stops the run at the next drained batch.
-        run_decode(
+        run_decode_observed(
             engine,
             &run.prompt_ids,
             &run.images,
             &run.params,
+            split.as_ref(),
             &mut |frag| {
                 if sw.client_gone() {
                     return false;
@@ -1689,8 +1783,29 @@ fn stream_response(shared: &Shared, request: Request, run: StreamingRun) -> Resu
         )
     };
     let written = sw.written();
-    let (w, write_err) = sw.finish()?;
-    let decoded = decoded?;
+    let (mut w, mut write_err) = sw.finish()?;
+    let decoded = match decoded {
+        Ok(decoded) => decoded,
+        Err(error) => return finish_stream_error(w, error),
+    };
+    if write_err.is_none() {
+        if let Some(p) = split {
+            let (delta, resolved) = p.lock().finish_counted();
+            if !delta.is_empty() {
+                match w.event(&json!({
+                    "id": run.id, "object": "chat.completion.chunk", "created": created, "model": run.model,
+                    "choices": [{"index": 0, "delta": delta, "finish_reason": null}],
+                })) {
+                    Ok(()) => {
+                        written.fetch_add(resolved, Ordering::Relaxed);
+                    }
+                    Err(error) => {
+                        write_err = Some(error);
+                    }
+                }
+            }
+        }
+    }
     // The accepted history is what the server handed the writer; of that,
     // what it knows it wrote, and whether a write failed (what the client
     // received is not known either way).
@@ -1758,10 +1873,27 @@ fn write_stream_trailer(
     last: &mut Value,
     prepare: impl FnOnce(&mut Value) -> Result<()>,
 ) -> Result<()> {
-    prepare(last)?;
+    if let Err(error) = prepare(last) {
+        return finish_stream_error(w, error);
+    }
     w.event(last)?;
     w.raw("data: [DONE]\n\n")?;
     w.finish()
+}
+
+/// Headers are already on the wire: report a failed run as an error event,
+/// never a success trailer or [DONE], then terminate the chunked body. Keep
+/// the original failure even if the disconnected transport cannot carry it.
+fn finish_stream_error(mut w: ChunkedWriter, error: anyhow::Error) -> Result<()> {
+    let message = error.to_string();
+    let transport = (|| -> Result<()> {
+        w.event(&json!({"error": {"message": message, "type": "server_error"}}))?;
+        w.finish()
+    })();
+    match transport {
+        Ok(()) => Err(error),
+        Err(transport) => Err(error.context(format!("finishing failed stream: {transport:#}"))),
+    }
 }
 
 // ---- the pipette sidecar contract -------------------------------------------
@@ -2377,20 +2509,24 @@ impl ChunkedWriter {
 struct StreamWriter {
     tx: Option<std::sync::mpsc::Sender<(String, usize)>>,
     gone: Arc<AtomicBool>,
-    /// Bytes of handed-over text whose events the writer thread wrote
-    /// without an error (`Self::written`): what the server knows it wrote,
-    /// never what a client received.
+    /// Raw text bytes resolved by successfully written events. A routing
+    /// wrapper can defer credit for held marker prefixes until a later event;
+    /// deliberately consumed complete markers still count as raw text.
+    /// Never a claim about what a client received or JSON/wire byte length.
     written: Arc<AtomicUsize>,
     thread: Option<std::thread::JoinHandle<(ChunkedWriter, Option<std::io::Error>)>>,
     deltas: Option<Arc<DeltaBuffer>>,
     /// The deltas' wire wrapping, shared with the thread: [`Self::send`]
     /// wraps what is pending itself so a control event keeps its place.
     wrap: Option<Wrap>,
+    /// Off-token ordering only: extraction, stateful wrapping and enqueue.
+    /// Never held during socket I/O or acquired by `delta`.
+    order: Arc<parking_lot::Mutex<()>>,
     /// The producer's spill (`DeltaBuffer::push`); only the producer locks it.
     spill: parking_lot::Mutex<String>,
 }
 
-type Wrap = Arc<dyn Fn(&str) -> String + Send + Sync>;
+type Wrap = Arc<dyn Fn(&str) -> (String, usize) + Send + Sync>;
 
 impl StreamWriter {
     fn start(w: ChunkedWriter) -> Self {
@@ -2404,6 +2540,16 @@ impl StreamWriter {
         w: ChunkedWriter,
         wrap: impl Fn(&str) -> String + Send + Sync + 'static,
     ) -> Self {
+        Self::start_with_counted_deltas(w, move |text| (wrap(text), text.len()))
+    }
+
+    /// A routing wrapper reports raw bytes resolved by this event, which can
+    /// include a prefix held from an earlier batch. Credit follows successful
+    /// I/O, not parser mutation; a failed event resolves no written bytes.
+    fn start_with_counted_deltas(
+        w: ChunkedWriter,
+        wrap: impl Fn(&str) -> (String, usize) + Send + Sync + 'static,
+    ) -> Self {
         Self::spawn(w, Some(Arc::new(wrap)))
     }
 
@@ -2416,6 +2562,8 @@ impl StreamWriter {
         let deltas = wrap.as_ref().map(|_| DeltaBuffer::new());
         let buf = deltas.clone();
         let thread_wrap = wrap.clone();
+        let order = Arc::new(parking_lot::Mutex::new(()));
+        let thread_order = Arc::clone(&order);
         let thread = std::thread::spawn(move || {
             let mut err: Option<std::io::Error> = None;
             let mut local = String::with_capacity(4096);
@@ -2436,15 +2584,6 @@ impl StreamWriter {
                     }
                 }
             };
-            // The text that accumulated, as one event. (Text pushed before a
-            // control event reaches the channel ahead of it: `send` takes it.)
-            let mut drain = |w: &mut ChunkedWriter, err: &mut Option<std::io::Error>| {
-                if let (Some(b), Some(wrap)) = (&buf, &thread_wrap) {
-                    if b.take_into(&mut local) {
-                        write(w, &wrap(&local), local.len(), err);
-                    }
-                }
-            };
             loop {
                 let next = if buf.is_some() {
                     rx.recv_timeout(DRAIN_PERIOD)
@@ -2452,13 +2591,23 @@ impl StreamWriter {
                     rx.recv()
                         .map_err(|_| std::sync::mpsc::RecvTimeoutError::Disconnected)
                 };
-                match next {
-                    Ok((payload, text)) => write(&mut w, &payload, text, &mut err),
-                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => drain(&mut w, &mut err),
-                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                        drain(&mut w, &mut err);
-                        break;
-                    }
+                let (work, closed) = match next {
+                    Ok(work) => (Some(work), false),
+                    Err(_) => Self::pending_after_timeout(
+                        &rx,
+                        buf.as_ref(),
+                        thread_wrap.as_ref(),
+                        &thread_order,
+                        &mut local,
+                    ),
+                };
+                // Selection/wrapping is finished. The sole writer performs
+                // network I/O without the off-token ordering guard.
+                if let Some((payload, resolved)) = work {
+                    write(&mut w, &payload, resolved, &mut err);
+                }
+                if closed {
+                    break;
                 }
             }
             (w, err)
@@ -2470,8 +2619,33 @@ impl StreamWriter {
             thread: Some(thread),
             deltas,
             wrap,
+            order,
             spill: parking_lot::Mutex::new(String::new()),
         }
+    }
+
+    /// A timeout is not a claim that the channel is still empty. Under the
+    /// same off-token guard used by send, prefer an already queued event over
+    /// bytes appended after that event; then select/wrap at most one batch.
+    /// The guard is dropped before the caller performs any network I/O.
+    fn pending_after_timeout(
+        rx: &std::sync::mpsc::Receiver<(String, usize)>,
+        buf: Option<&Arc<DeltaBuffer>>,
+        wrap: Option<&Wrap>,
+        order: &parking_lot::Mutex<()>,
+        local: &mut String,
+    ) -> (Option<(String, usize)>, bool) {
+        let _guard = order.lock();
+        let closed = match rx.try_recv() {
+            Ok(work) => return (Some(work), false),
+            Err(std::sync::mpsc::TryRecvError::Empty) => false,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => true,
+        };
+        let work = match (buf, wrap) {
+            (Some(buf), Some(wrap)) if buf.take_into(local) => Some(wrap(local)),
+            _ => None,
+        };
+        (work, closed)
     }
 
     /// Hand text to the writer (the decode thread's per-fragment call on a
@@ -2483,13 +2657,14 @@ impl StreamWriter {
     }
 
     /// Everything handed over so far, wrapped, queued ahead of what comes
-    /// next on the channel. Off the per-token path (a control event).
+    /// next on the channel. Caller `send` holds `order` through both enqueues.
+    /// Off the per-token path (a control event).
     fn queue_pending(&self) {
         if let (Some(b), Some(wrap), Some(tx)) = (&self.deltas, &self.wrap, &self.tx) {
             b.flush(&mut self.spill.lock());
             let mut text = String::new();
             if b.take_into(&mut text) {
-                let _ = tx.send((wrap(&text), text.len()));
+                let _ = tx.send(wrap(&text));
             }
         }
     }
@@ -2505,6 +2680,7 @@ impl StreamWriter {
     }
 
     fn send(&self, payload: String) {
+        let _guard = self.order.lock();
         self.queue_pending();
         if let Some(tx) = &self.tx {
             // A closed receiver means the thread is gone, which `gone` reports.
@@ -2512,8 +2688,9 @@ impl StreamWriter {
         }
     }
 
-    /// The bytes of handed-over text written so far; final once
-    /// [`Self::finish`] has joined the thread.
+    /// Raw resolved bytes written so far. Joining [`Self::finish`] settles
+    /// queued events; a caller's explicit final routing flush credits this
+    /// same counter only after its own successful write.
     fn written(&self) -> Arc<AtomicUsize> {
         Arc::clone(&self.written)
     }
@@ -2637,7 +2814,7 @@ fn timings(
         "host_fill": super::common::host_fill_name(st.host_feed.as_ref()),
         "prompt_ids_sha256": facts.ids_sha256,
         // The template's variable as the prompt reflects it; null for its
-        // default (a value the template would not act on is a 400).
+        // default. Neutral values can be ignored when the template has no control.
         "reasoning_effort": facts.reasoning_effort,
         // Whether the prompt leaves a thinking block open, and who decided:
         // the template (its switch or its own behaviour) or the engine,
@@ -2914,6 +3091,9 @@ fn health_body(engine: &dyn Served, front: &Front) -> Result<Value> {
     body["template_renders"] = json!(engine.template_renders());
     body["tokenizations"] = json!(front.tokenizations());
     body["session_log"] = json!(front.logged());
+    // The history policy as resolved for this template: past reasoning kept
+    // unless stripped on request, an unfinished reply's rendering.
+    body["session"] = front.session_json();
     body["logprobs"] = logprobs_capability(engine);
     body["chat_template_reads"] = ENGINE_KWARGS
         .iter()
@@ -4001,15 +4181,153 @@ mod checked_trailer_tests {
         })
         .unwrap_err();
         assert_eq!(error.to_string(), "bounded metadata vision refusal");
-        assert_eq!(
-            *mem.0.lock(),
-            before,
-            "refused metadata wrote a success event or [DONE]"
+        let bytes = mem.0.lock().clone();
+        assert!(bytes.starts_with(&before), "prior fragments changed");
+        let tail = String::from_utf8_lossy(&bytes[before.len()..]);
+        assert!(!tail.contains("[DONE]"), "error masquerades as success");
+        assert!(
+            !tail.contains("finish_reason"),
+            "error wrote success metadata"
         );
+        assert!(tail.contains("error"), "error not delivered to the client");
+        assert!(tail.ends_with("0\r\n\r\n"), "error left chunked body open");
         assert!(
             last.get("vision").is_none(),
             "refusal fabricated vision metadata"
         );
+    }
+
+    #[test]
+    fn post_header_error_has_bounded_socket_eof_and_no_success_done() {
+        use std::io::Read;
+        use std::net::{TcpListener, TcpStream};
+        use std::time::Duration;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let (server, _) = listener.accept().unwrap();
+        let worker = std::thread::spawn(move || {
+            let writer = ChunkedWriter {
+                w: Box::new(server),
+            };
+            let mut success = serde_json::json!({"finish_reason":"stop"});
+            write_stream_trailer(writer, &mut success, |_| {
+                anyhow::bail!("socket test refusal")
+            })
+            .unwrap_err()
+            .to_string()
+        });
+        let mut bytes = Vec::new();
+        client
+            .read_to_end(&mut bytes)
+            .expect("failed stream must reach EOF, not time out");
+        assert_eq!(worker.join().unwrap(), "socket test refusal");
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(
+            text.contains("socket test refusal"),
+            "missing error event: {text}"
+        );
+        assert!(!text.contains("finish_reason") && !text.contains("[DONE]"));
+        assert!(
+            text.ends_with("0\r\n\r\n"),
+            "missing HTTP body terminator: {text}"
+        );
+    }
+
+    /// Exercise the actual post-header decode-error branch, not only the
+    /// trailer helper. Keep the server alive while the client awaits the
+    /// HTTP chunk terminator so dropping the fixture cannot fake completion.
+    #[test]
+    fn failed_decode_after_role_chunk_terminates_the_actual_stream_response() {
+        use super::*;
+        use std::io::{Read, Write};
+        use std::net::TcpStream;
+        use std::time::Duration;
+        let server = Server::http("127.0.0.1:0").unwrap();
+        let tiny_http::ListenAddr::IP(address) = server.server_addr() else {
+            panic!("IP server")
+        };
+        let mut client = TcpStream::connect(address).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        client.write_all(b"POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n").unwrap();
+        let request = server
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+        let engine = Box::new(NoVision::new(None));
+        let front = Front::new(engine.as_ref(), Default::default());
+        let shared = Shared {
+            engine,
+            decisions: super::super::decisions::Decisions::Refused("test".into()),
+            turns: turns::Turns::default(),
+            decision_pack: false,
+            aborts: std::sync::Mutex::new(HashSet::new()),
+            abort_epoch: AtomicU64::new(0),
+            server,
+            model_name: "stub".into(),
+            sampling: Default::default(),
+            front,
+            reuse: parking_lot::Mutex::new(Default::default()),
+        };
+        let run = StreamingRun {
+            kind: StreamKind::Chat,
+            prompt_ids: vec![1],
+            facts: Default::default(),
+            // The fixture refuses image decode at the real Served seam,
+            // after stream_response has written its role/header chunk.
+            images: vec![DecodedImage {
+                height: 1,
+                width: 1,
+                rgb: vec![0; 3],
+                key: [0; 32],
+            }],
+            params: DecodeParams::default(),
+            id: "failure".into(),
+            model: "stub".into(),
+            record: None,
+            return_ids: false,
+        };
+        let (release, hold) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let error = stream_response(&shared, request, run)
+                .unwrap_err()
+                .to_string();
+            let _ = hold.recv_timeout(Duration::from_secs(5));
+            error
+        });
+        let mut wire = Vec::new();
+        let mut byte = [0u8; 1];
+        while !wire.ends_with(b"0\r\n\r\n") && wire.len() < 16 * 1024 {
+            match client.read(&mut byte) {
+                Ok(0) => break,
+                Ok(_) => wire.push(byte[0]),
+                Err(e) => panic!(
+                    "stream did not terminate while server stayed alive: {e}; {:?}",
+                    String::from_utf8_lossy(&wire)
+                ),
+            }
+        }
+        release.send(()).unwrap();
+        let error = worker.join().unwrap();
+        let text = String::from_utf8(wire).unwrap();
+        assert!(error.contains("does not take image input"), "{error}");
+        assert!(
+            text.contains("\"role\":\"assistant\""),
+            "missing initial role: {text}"
+        );
+        assert!(
+            text.contains("does not take image input"),
+            "missing decode error: {text}"
+        );
+        assert!(
+            text.ends_with("0\r\n\r\n"),
+            "missing HTTP terminator: {text}"
+        );
+        assert!(!text.contains("[DONE]") && !text.contains("\"finish_reason\":\"stop\""));
     }
 
     #[test]
@@ -4059,3 +4377,7 @@ mod logprob_request_tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "serve_stream_tail_tests.rs"]
+mod stream_tail_tests;

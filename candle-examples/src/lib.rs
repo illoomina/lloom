@@ -15,16 +15,10 @@ use candle::{Device, Result, Tensor};
 /// not use this helper. Creates no device and opens no checkpoint.
 pub fn require_profile_recorder(example: &str) -> Result<()> {
     let t = candle::tuning::try_tuning().map_err(candle::Error::wrap)?;
-    if t.instrument.profile && (!cfg!(feature = "metal") || !candle::tuning::PROFILE_INSTRUMENTS) {
-        let meta = candle::options::meta_at(candle::tuning::InstrumentTuning::META, "profile")
-            .expect("profile is declared by the generated instrument schema");
-        let missing = if !cfg!(feature = "metal") {
-            "metal"
-        } else {
-            meta.needs
-        };
-        candle::bail!("{}: {} instrumentation is not compiled for {example}'s requested detailed profiling arm ({}); rebuild/run with cargo run --manifest-path candle/Cargo.toml --profile release-with-debug -p candle-examples --features metal,profile --example {example} -- <original arguments>",
-            meta.path, missing, meta.needs_part);
+    if t.instrument.profile {
+        candle::tuning::require_profile_recorder().map_err(|error| {
+            candle::Error::msg(format!("{error}; {example}'s requested detailed profiling arm requires cargo run --manifest-path candle/Cargo.toml --profile release-with-debug -p candle-examples --features metal,profile --example {example} -- <original arguments>"))
+        })?;
     }
     Ok(())
 }

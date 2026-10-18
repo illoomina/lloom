@@ -35,17 +35,27 @@ extern crate intel_mkl_src;
 #[cfg(feature = "accelerate")]
 extern crate accelerate_src;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
+#[cfg(feature = "metal")]
+use anyhow::Context;
+#[cfg(feature = "metal")]
 use candle::{DType, Device, Tensor};
+#[cfg(feature = "metal")]
 use candle_examples::lfm2_setup::{default_model_dir, parse_config, tensor_names, weight_files};
 use clap::Parser;
+#[cfg(feature = "metal")]
 use lloom::generation::{LogitsProcessor, Sampling};
+#[cfg(feature = "metal")]
 use lloom::models::lfm2::{AttnImpl, ConvState, KvAppend, Model, Shape as Lfm2Shape, State};
+#[cfg(feature = "metal")]
 use lloom::nn::VarBuilder;
+#[cfg(feature = "metal")]
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+#[cfg(feature = "metal")]
 use tokenizers::Tokenizer;
 
+#[cfg(feature = "metal")]
 use candle::metal_backend::{set_hazard_key, trace, ArenaLayout, HazardKey};
 
 #[derive(Parser, Debug)]
@@ -254,7 +264,7 @@ fn audit_begin(label: &str) {
     candle::kernels::metal::hazard_audit::begin(label);
 }
 
-#[cfg(not(feature = "metal-hazard-audit"))]
+#[cfg(all(feature = "metal", not(feature = "metal-hazard-audit")))]
 fn audit_begin(_label: &str) {}
 
 /// Stop auditing and print the region's report and one parseable line.
@@ -287,15 +297,17 @@ fn audit_finish() {
     );
 }
 
-#[cfg(not(feature = "metal-hazard-audit"))]
+#[cfg(all(feature = "metal", not(feature = "metal-hazard-audit")))]
 fn audit_finish() {}
 
 /// One decode step's recorded dispatches.
+#[cfg(feature = "metal")]
 struct Step {
     label: String,
     dispatches: Vec<trace::Dispatch>,
 }
 
+#[cfg(feature = "metal")]
 impl Step {
     fn signature(&self) -> Vec<String> {
         self.dispatches.iter().map(|d| d.signature()).collect()
@@ -325,6 +337,7 @@ impl Step {
 /// dispatch-tier parameter (`DESIGN.md` §7.1) and is replayable if the grid can
 /// be made indirect; reporting it as "structural" would retire the ICB thesis on
 /// a fault that does not warrant it.
+#[cfg(feature = "metal")]
 #[derive(PartialEq, Eq, Debug, Clone, Copy, PartialOrd, Ord)]
 enum Diff {
     /// Byte-for-byte the same commands, including buffers.
@@ -337,6 +350,7 @@ enum Diff {
     KernelSequence,
 }
 
+#[cfg(feature = "metal")]
 fn compare(a: &Step, b: &Step) -> Diff {
     if a.signature() == b.signature() {
         Diff::Identical
@@ -349,6 +363,7 @@ fn compare(a: &Step, b: &Step) -> Diff {
     }
 }
 
+#[cfg(feature = "metal")]
 fn render(step: &Step) -> String {
     let mut out = String::new();
     out.push_str(&format!(
@@ -401,12 +416,27 @@ fn render(step: &Step) -> String {
 }
 
 fn main() -> Result<()> {
-    let args = Args::parse();
+    execute(Args::parse())
+}
+
+// Keep argument discovery available on CPU-only builds. This probe measures
+// Metal dispatches, so a missing backend is an error, never an empty trace.
+#[cfg(not(feature = "metal"))]
+fn execute(_args: Args) -> Result<()> {
+    anyhow::bail!(
+        "lfm2-dispatch-trace requires Metal support. Build with: \
+         cargo build --release --features metal,profile --example lfm2-dispatch-trace"
+    )
+}
+
+#[cfg(feature = "metal")]
+fn execute(args: Args) -> Result<()> {
     let key = shape_key(&args)?;
     println!("PROFILE {key}");
     lloom::profile::dispatch!(key, lloom::profile::LFM2, P => run::<P>(args))
 }
 
+#[cfg(feature = "metal")]
 fn run<P: Lfm2Shape>(args: Args) -> Result<()> {
     // Before anything that needs a model or a GPU: did the feature arrive?
     // Checked first so the answer costs nothing and cannot be confused with a
@@ -1293,6 +1323,7 @@ fn run<P: Lfm2Shape>(args: Args) -> Result<()> {
 /// `--kv-append` and `--conv-state` as `run` resolves them, read off
 /// `Config::profile_key` at the contract in force; a divergence from `run`'s
 /// resolution is refused by `Model::new` (`Config::check_shape`).
+#[cfg(feature = "metal")]
 fn shape_key(args: &Args) -> Result<lloom::profile::ProfileKey> {
     let mut config = lloom::models::lfm2::Config::default();
     config.kv_append = match args.kv_append.as_str() {
@@ -1303,4 +1334,31 @@ fn shape_key(args: &Args) -> Result<lloom::profile::ProfileKey> {
     };
     config.conv_state = ConvState::parse(&args.conv_state).map_err(anyhow::Error::msg)?;
     Ok(config.profile_key())
+}
+
+#[cfg(all(test, not(feature = "metal")))]
+mod cpu_capability_tests {
+    use super::*;
+
+    #[test]
+    fn help_remains_available_without_metal() {
+        let error = Args::try_parse_from(["lfm2-dispatch-trace", "--help"]).unwrap_err();
+        assert_eq!(error.kind(), clap::error::ErrorKind::DisplayHelp);
+        assert!(error.to_string().contains("--dump-all"));
+    }
+
+    #[test]
+    fn missing_metal_is_reported_before_checkpoint_or_output_access() {
+        let args = Args::try_parse_from([
+            "lfm2-dispatch-trace",
+            "--model-dir",
+            "/dev/null/not-a-checkpoint",
+            "--dump-all",
+            "/dev/null/not-an-output",
+        ])
+        .unwrap();
+        let error = execute(args).unwrap_err().to_string();
+        assert!(error.contains("requires Metal support"), "{error}");
+        assert!(error.contains("--features metal,profile"), "{error}");
+    }
 }

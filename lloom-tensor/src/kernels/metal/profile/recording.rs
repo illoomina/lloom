@@ -614,6 +614,11 @@ pub fn gpu_time_by_label_detailed() -> Vec<LabelTiming> {
     v
 }
 
+/// The diagnostic record series, without snapshot aggregation.
+pub(super) fn command_buffer_records() -> Vec<CommandBufferRecord> {
+    recorder().lock().unwrap().records.clone()
+}
+
 /// Take the current totals without clearing them.
 pub fn snapshot() -> Snapshot {
     let rec = recorder().lock().unwrap();

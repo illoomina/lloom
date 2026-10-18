@@ -79,6 +79,10 @@ path = "tests/token_ring_nonblocking.rs"
 name = "decode_step_census"
 path = "tests/decode_step_census.rs"
 
+[[test]]
+name = "qwen4exp_prefill_transient_cpu"
+path = "tests/qwen4exp_prefill_transient_cpu.rs"
+
 [dev-dependencies]
 # The integration tests drive the fuzz models that live behind `fuzzing`, and
 # read the shape probes (`shape-probe`); a self dev-dependency is how cargo

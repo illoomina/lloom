@@ -29,6 +29,25 @@ use std::sync::OnceLock;
 /// Whether optional attribution machinery is compiled into this tensor build.
 pub const PROFILE_INSTRUMENTS: bool = cfg!(any(debug_assertions, feature = "profile"));
 
+/// Require the detailed Metal recorder at a cold consumer boundary.
+/// This does not enable profiling or reject scalar-only profiling requests.
+/// The capability/key come from the existing generated instrument declaration.
+pub fn require_profile_recorder() -> Result<(), TuningSetupError> {
+    let meta = crate::options::meta_at(InstrumentTuning::META, "profile")
+        .expect("profile is declared by the generated instrument schema");
+    if !cfg!(feature = "metal") || !PROFILE_INSTRUMENTS {
+        return Err(TuningSetupError::NotCompiled {
+            key: meta.path,
+            capability: if cfg!(feature = "metal") {
+                meta.needs
+            } else {
+                "metal"
+            },
+        });
+    }
+    Ok(())
+}
+
 /// An ordinary setup refusal, distinct from a backend invariant failure.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TuningSetupError {
@@ -1904,6 +1923,29 @@ mod tests {
 
 #[cfg(test)]
 mod diagnostic_build_tests {
+    #[test]
+    fn an_explicit_detail_requirement_uses_the_generated_capability_without_setup() {
+        let meta = crate::options::meta_at(super::InstrumentTuning::META, "profile").unwrap();
+        let result = super::require_profile_recorder();
+        if cfg!(feature = "metal") && super::PROFILE_INSTRUMENTS {
+            result.unwrap();
+        } else {
+            assert_eq!(
+                result,
+                Err(super::TuningSetupError::NotCompiled {
+                    key: meta.path,
+                    capability: if cfg!(feature = "metal") {
+                        meta.needs
+                    } else {
+                        "metal"
+                    },
+                })
+            );
+        }
+        // A cold requirement must not freeze tuning or turn the recorder on.
+        super::install(super::Tuning::default()).unwrap();
+    }
+
     #[test]
     fn an_unavailable_direct_attribution_request_is_loud() {
         assert!(super::check_profile_request("served_request_trace", false).is_ok());

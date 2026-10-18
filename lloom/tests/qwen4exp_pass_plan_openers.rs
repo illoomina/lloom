@@ -203,10 +203,11 @@ fn a_direct_forward_does_not_plan_the_drivers_prefill() -> Result<()> {
 /// The admission (`prepare_pass`) reads the plan of the pass that will run:
 /// a pass a plan serves owes no transient, and the model's own plan says
 /// nothing about a driver's pass of the same shape, nor the reverse. The
-/// budget admits what is allocated plus a margin that covers the KV slab a
-/// reset cache grows again (a few KB on this model) and not the prefill's
-/// transient (`PREFILL_TRANSIENT_BYTES_PER_TOKEN` × 9 = 27 MB): the model's
-/// served prefill passes, and the driver's unplanned one is refused.
+/// budget admits the ledger's committed bytes plus a margin that covers the
+/// KV slab a reset cache grows again and half the prefill's unbacked transient.
+/// The native allocation gauge is not the ledger's admission input. Settle
+/// and reclaim the fixture before sizing each arm, so reclaimed warm-up
+/// buffers cannot accidentally pay the unplanned pass's transient.
 #[test]
 fn admission_reads_the_plan_of_the_pass_that_runs() -> Result<()> {
     use lloom::models::qwen4exp::{MemCheck, State};
@@ -233,25 +234,65 @@ fn admission_reads_the_plan_of_the_pass_that_runs() -> Result<()> {
     let own = prefill_key().opened_by(PassOpener::Model);
     assert!(m.pass_plan_cached(&own) && !m.pass_plan_cached(&prefill_key()));
 
-    let margin = 8 << 20;
-    assert!(
-        margin < lloom::models::qwen4exp::PREFILL_TRANSIENT_BYTES_PER_TOKEN * PROMPT.len(),
-        "the margin must not admit the transient"
-    );
-    let mtl = m.device();
-    let budget = mtl.current_allocated_size() + margin;
+    cache.reset();
+    let unplanned = model.plan_pass(&cache, PROMPT.len());
+    let transient = model.prefill_transient().forward(PROMPT.len(), 0).held as usize;
+    assert_eq!(unplanned.transient, transient);
     model.set_mem_check(MemCheck::Refuse);
-    model.set_memory_fraction(budget as f64 / mtl.recommended_max_working_set_size() as f64);
+
+    let constrain = |model: &mut Qwen4Exp<CrownExact, Resident>,
+                     cache: &State<CrownExact>,
+                     arm: &str|
+     -> Result<usize> {
+        m.wait_until_completed()?;
+        let reclaimed = m.trim_unused_buffers();
+        let plan = model.plan_pass(cache, PROMPT.len());
+        let heap_free = m.heap_reusable_bytes(None, &mut Default::default())?;
+        let unbacked = plan.transient.saturating_sub(heap_free);
+        assert!(
+            unbacked > 1,
+            "fixture needs an unbacked transient to distinguish its openers: {plan:?}, heap_free={heap_free}"
+        );
+        let margin = plan.kv_grow.checked_add(unbacked / 2).unwrap();
+        let committed = m.ledger().committed();
+        let budget = committed.checked_add(margin).unwrap();
+        let mtl = m.device();
+        model.set_memory_fraction(budget as f64 / mtl.recommended_max_working_set_size() as f64);
+        eprintln!(
+            "OPENER-ADMISSION actual_api={} arm={arm} committed={committed} native_gauge={} \
+             reclaimed={reclaimed} kv_grow={} transient={} heap_free={heap_free} \
+             unbacked={unbacked} budget={budget}",
+            m.commands().actual_command_api(),
+            mtl.current_allocated_size(),
+            plan.kv_grow,
+            plan.transient,
+        );
+        Ok(plan.kv_grow.checked_add(unbacked).unwrap())
+    };
+    constrain(&mut model, &cache, "model")?;
     let served = forward(&model, &mut cache);
     assert!(
         served.is_ok(),
         "the model's served prefill was charged a transient: {served:?}"
     );
     cache.reset();
+    assert!(m.pass_plan_cached(&own) && !m.pass_plan_cached(&prefill_key()));
+    let driver_need = constrain(&mut model, &cache, "driver")?;
     let refused = model.prepare_pass(&mut cache, PROMPT.len());
     assert!(
         refused.is_err(),
         "the driver's unplanned prefill was admitted on the model's plan"
+    );
+    assert!(
+        matches!(
+            refused.as_ref().unwrap_err().allocation(),
+            Some(lloom_tensor::memory_admission::AllocationError::Refused {
+                requested,
+                available,
+                domain: lloom_tensor::memory_admission::RefusalDomain::Budget,
+            }) if requested == driver_need && available < requested
+        ),
+        "expected the driver's actual unbacked demand to exceed its budget: {refused:?}"
     );
     Ok(())
 }

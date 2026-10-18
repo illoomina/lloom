@@ -170,9 +170,12 @@ Flags: `--kv-capacity` (positions per request, default 8704 = the ladder's
 8192 + 256 + slack; a request past it is refused, not reallocated),
 `--readback auto|ring|blocking`, `--prefix-reuse` / `--no-reuse` (on by
 default: a conversation's next turn reuses the session; a benchmark cell
-measures a cold prefill either way), `--persist-thinking` / `--strip-thinking`,
-`--missing-reasoning as-sent|log`, `--incomplete-reasoning text|reasoning|recover`
-(how a past reply cut inside its reasoning reaches the template;
+measures a cold prefill either way), `--persist-thinking` / `--strip-thinking`
+(past replies' reasoning stays in the history by default wherever the template
+has the switch; `--strip-thinking` drops it),
+`--missing-reasoning as-sent|log`, `--incomplete-reasoning reasoning|text|recover`
+(how a past reply cut inside its reasoning reaches the template, default
+`reasoning`;
 `design/docs/sequence-reuse-design.md` §2.3d), `--no-warmup`, `--cpu`,
 `--model-name`, the two below, and the memory guards:
 

@@ -1020,6 +1020,12 @@ impl Front {
         let family = engine.capabilities().family;
         let why = match c.effort(kwarg) {
             Effort::Read => return Ok(()),
+            Effort::NotRead
+                if family == "lfm2-gguf" && matches!(value.as_str(), Some("none" | "default")) =>
+            {
+                eprintln!("[{family}: {REASONING_EFFORT}={value} ignored: the chat template does not read it]");
+                return Ok(());
+            }
             Effort::NotRead => format!("{family}'s chat template does not read {REASONING_EFFORT}"),
             Effort::NoEffect => format!(
                 "{family}'s chat template renders the same prompt for any {REASONING_EFFORT} with \
@@ -1378,7 +1384,19 @@ impl Front {
         let before = engine.template_renders();
         let rendered = engine.render_checked(req.messages, &req.kwargs, &[REASONING_EFFORT])?;
         let renders = engine.template_renders() - before;
-        if let Some(i) = rendered.ignored.first() {
+        for ignored in &rendered.ignored {
+            if engine.capabilities().family == "lfm2-gguf"
+                && ignored.reason == NOT_READ
+                && matches!(ignored.value.as_str(), Some("none" | "default"))
+            {
+                eprintln!(
+                    "[{}: {REASONING_EFFORT}={} ignored: the chat template does not read it]",
+                    engine.capabilities().family,
+                    ignored.value
+                );
+                continue;
+            }
+            let i = ignored;
             let family = engine.capabilities().family;
             let why = if i.reason == NOT_READ {
                 format!("{family}'s chat template does not read {REASONING_EFFORT}")

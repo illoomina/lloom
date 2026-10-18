@@ -1094,6 +1094,18 @@ mod tests {
             .contains("kv_quant=[off,f16,int8,int4] kv_dtype=f32"));
     }
 
+    #[test]
+    fn lfm2_gguf_serves_a_real_f16_dense_store_but_not_integer_kv() {
+        let caps = super::super::causal_loaded::served::lfm2_gguf_capabilities();
+        for value in ["off", "f16"] {
+            resolve_kv_quant(&caps, &with_kv_quant(value).model.axes).unwrap();
+        }
+        for value in ["int8", "int4"] {
+            assert!(resolve_kv_quant(&caps, &with_kv_quant(value).model.axes).is_err());
+        }
+        assert_eq!(caps.kv_quant_names(), ["off", "f16"]);
+    }
+
     /// The EOS gate's arm on Qwen3.5 does not open a reduced KV store: the
     /// gate keeps the state only where every write the accepted state needs
     /// runs ungated, and a reduced store's growth copy (`QuantKvSlab::grow_to`)

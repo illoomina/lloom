@@ -75,7 +75,6 @@ fn bool_pattern() -> String {
 }
 
 /// A count, a number and `none` as the strings the grammar reads.
-const COUNT: &str = r"\+?\d+";
 const NUMBER: &str = r"[+-]?(\d+(\.\d*)?|\.\d+)([eE][+-]?\d+)?";
 
 /// The arms a field declares (`variants`), parameterised ones included
@@ -246,10 +245,28 @@ fn literal(v: &str) -> bool {
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || "-_.x".contains(c))
 }
 
+/// Storage-width bounds, from the same primitive type recorded by the derive.
+/// `usize` follows the schema-producing binary's target, not the reader's host.
+fn unsigned_width(ty: &str) -> Option<(u32, u64)> {
+    Some(match ty {
+        "u8" => (u8::BITS, u64::from(u8::MAX)),
+        "u16" => (u16::BITS, u64::from(u16::MAX)),
+        "u32" => (u32::BITS, u64::from(u32::MAX)),
+        "u64" => (u64::BITS, u64::MAX),
+        "usize" => (
+            usize::BITS,
+            u64::try_from(usize::MAX).expect("supported target width"),
+        ),
+        _ => return None,
+    })
+}
+
 fn base_type(ty: &str) -> Value {
+    if let Some((_, maximum)) = unsigned_width(ty) {
+        return json!({"type": "integer", "minimum": 0, "maximum": maximum});
+    }
     match ty {
         "bool" => json!({"type": "boolean"}),
-        "usize" | "u64" | "u32" | "u16" | "u8" => json!({"type": "integer", "minimum": 0}),
         "f64" | "f32" => json!({"type": "number"}),
         t if t.starts_with("Vec<") => json!({"type": "array", "items": {"type": "string"}}),
         t if t.contains("BTreeMap<") => {
@@ -336,8 +353,8 @@ fn value_schema(key: &Key, default: &Value) -> Value {
         s = json!({"anyOf": [s, {"type": "boolean"}, {"enum": [0, 1]}]});
     } else if m.is_bool || ty == "bool" {
         s = json!({"anyOf": [s, {"type": "boolean"}, {"enum": [0, 1]}, {"type": "string", "pattern": bool_pattern()}]});
-    } else if base_type(ty)["type"] == "integer" {
-        s = json!({"anyOf": [s, {"type": "integer", "minimum": 0}, {"type": "string", "pattern": padded(COUNT)}]});
+    } else if let Some((_, maximum)) = unsigned_width(ty) {
+        s = json!({"anyOf": [s, base_type(ty), {"type": "string", "pattern": padded(&format!(r"\+?{}", bounded_decimal(maximum)))}]});
     } else if base_type(ty)["type"] == "number" {
         s = json!({"anyOf": [s, {"type": "number"}, {"type": "string", "pattern": padded(NUMBER)}]});
     }
@@ -346,7 +363,20 @@ fn value_schema(key: &Key, default: &Value) -> Value {
     if optional || default.is_null() {
         alts.push(json!({"type": "string", "pattern": padded("none")}));
     }
-    json!({"anyOf": alts})
+    let mut node = json!({"anyOf": alts});
+    if let Some((bits, maximum)) = unsigned_width(ty) {
+        node["x-lloom-unsigned-domain"] = json!({
+            "storage-type": ty, "bits": bits, "minimum": 0, "maximum": maximum,
+            "target-dependent": ty == "usize",
+            "scope": "storage width; a field-specific parser may impose further constraints",
+            "native-representation": if m.grammar.and_then(|g| g.count).is_some() {
+                "field-attached count domain checks integral represented values before scalarization"
+            } else {
+                "JSON Schema integer is mathematical; generic unsigned ingress currently requires serde_json integer representation, not floating-point 1.0"
+            }
+        });
+    }
+    node
 }
 
 fn annotate(key: &Key, default: &Value, s: &mut Map<String, Value>) {
@@ -552,6 +582,189 @@ pub fn schema() -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Exercise the real derive/parser for every supported storage width,
+    /// without adding synthetic options to the product registry.
+    #[derive(
+        lloom_macros::Options,
+        serde::Serialize,
+        serde::Deserialize,
+        Default,
+        Debug,
+        Clone,
+        PartialEq,
+    )]
+    struct UnsignedProbe {
+        tiny: u8,
+        short: u16,
+        word: u32,
+        wide: u64,
+        native: usize,
+        optional: Option<u16>,
+    }
+
+    fn probe_key(meta: &'static lloom_tensor::options::KnobMeta) -> Key {
+        Key {
+            path: meta.key.into(),
+            targets: vec![crate::option_tree::Leaf {
+                storage: meta.key.into(),
+                meta,
+                default: json!(0),
+            }],
+            legacy: vec![],
+            compound: None,
+            own: None,
+        }
+    }
+
+    #[test]
+    fn unsigned_widths_bound_native_and_decimal_string_domains() {
+        use crate::option_grammar::tests::schema_valid;
+        let defs = defs();
+        let mut checked = 0;
+        for meta in UnsignedProbe::META.iter().filter(|m| m.key != "optional") {
+            let (bits, maximum) = unsigned_width(meta.ty).expect("unsigned probe");
+            let node = value_schema(&probe_key(meta), &json!(0));
+            assert_eq!(node["x-lloom-unsigned-domain"]["bits"], bits);
+            assert_eq!(node["x-lloom-unsigned-domain"]["maximum"], maximum);
+            for n in [0, 1, maximum - 1, maximum] {
+                let value = json!(n);
+                assert!(schema_valid(&node, &value, &defs), "{}: {value}", meta.ty);
+                let mut probe = UnsignedProbe::default();
+                probe.merge_json(&json!({meta.key: value})).unwrap();
+                assert_eq!(serde_json::to_value(&probe).unwrap()[meta.key], n);
+                for text in [
+                    n.to_string(),
+                    format!("+{n}"),
+                    format!("\u{0085}+000000{n}\u{0085}"),
+                ] {
+                    assert!(
+                        schema_valid(&node, &json!(text), &defs),
+                        "{}: {text:?}",
+                        meta.ty
+                    );
+                    probe.set(meta.key, &text).unwrap();
+                    assert_eq!(serde_json::to_value(&probe).unwrap()[meta.key], n);
+                }
+            }
+            // u128 here is only a fixture constructor; no u128 product type
+            // or floating conversion is used to represent the upper bound.
+            let above = (u128::from(maximum) + 1).to_string();
+            for text in [
+                above.clone(),
+                format!("+000{above}"),
+                "-1".into(),
+                "1.0".into(),
+                "1e0".into(),
+                "\u{feff}1".into(),
+            ] {
+                let before = UnsignedProbe::default();
+                let mut probe = before.clone();
+                assert!(
+                    !schema_valid(&node, &json!(text), &defs),
+                    "{}: {text:?}",
+                    meta.ty
+                );
+                assert!(probe.set(meta.key, &text).is_err(), "{}: {text:?}", meta.ty);
+                assert_eq!(probe, before, "refusal changed {}", meta.key);
+            }
+            let above = if maximum < u64::MAX {
+                json!(maximum + 1)
+            } else {
+                json!(2.0_f64.powi(64))
+            };
+            for value in [json!(-1), above, json!(1.5)] {
+                let before = UnsignedProbe::default();
+                let mut probe = before.clone();
+                assert!(!schema_valid(&node, &value, &defs), "{}: {value}", meta.ty);
+                assert!(probe.merge_json(&json!({meta.key: value})).is_err());
+                assert_eq!(probe, before);
+            }
+            checked += 1;
+        }
+        assert_eq!(checked, 5);
+    }
+
+    #[test]
+    fn optional_unsigned_width_preserves_unset_and_maximum() {
+        use crate::option_grammar::tests::schema_valid;
+        let meta = UnsignedProbe::META
+            .iter()
+            .find(|m| m.key == "optional")
+            .unwrap();
+        let node = value_schema(&probe_key(meta), &Value::Null);
+        for value in [
+            Value::Null,
+            json!("none"),
+            json!(u16::MAX),
+            json!("+00065535"),
+        ] {
+            assert!(schema_valid(&node, &value, &defs()));
+        }
+        for value in [json!(65536), json!("65536")] {
+            assert!(!schema_valid(&node, &value, &defs()));
+        }
+        let mut probe = UnsignedProbe::default();
+        probe.set("optional", "+00065535").unwrap();
+        assert_eq!(probe.optional, Some(u16::MAX));
+        let before = probe.clone();
+        assert!(probe.set("optional", "65536").is_err());
+        assert_eq!(probe, before);
+        probe.set("optional", "none").unwrap();
+        assert_eq!(probe.optional, None);
+    }
+
+    #[test]
+    fn unsigned_schema_preserves_integer_precision_and_documents_native_float_gap() {
+        use crate::option_grammar::tests::schema_valid;
+        let meta = UnsignedProbe::META
+            .iter()
+            .find(|m| m.key == "wide")
+            .unwrap();
+        let node = value_schema(&probe_key(meta), &json!(0));
+        assert!(schema_valid(&node, &json!(u64::MAX), &defs()));
+        // Casting u64::MAX to f64 rounds UP to 2^64. Never round the
+        // schema's maximum to f64 and accidentally admit that value.
+        let rounded = u64::MAX as f64;
+        assert_eq!(rounded, 2.0_f64.powi(64));
+        assert!(!schema_valid(&node, &json!(rounded), &defs()));
+        let below = f64::from_bits(rounded.to_bits() - 1);
+        assert!(schema_valid(&node, &json!(below), &defs()));
+        // Mathematical JSON Schema integer cannot express the current
+        // generic ingress distinction between represented 1 and 1.0.
+        assert!(schema_valid(&node, &json!(1.0), &defs()));
+        let mut probe = UnsignedProbe::default();
+        assert!(probe.merge_json(&json!({"wide": 1.0})).is_err());
+        assert_eq!(probe, UnsignedProbe::default());
+        assert!(node["x-lloom-unsigned-domain"]["native-representation"]
+            .as_str()
+            .unwrap()
+            .contains("1.0"));
+    }
+
+    #[test]
+    fn actual_server_port_schema_and_ingress_keep_u16_boundary() {
+        use crate::option_grammar::tests::{schema_node, schema_valid};
+        let schema = schema();
+        let node = schema_node(&schema, "server.port");
+        let idx = index();
+        for value in [json!(65535), json!("+00065535")] {
+            assert!(schema_valid(node, &value, &schema["$defs"]));
+            let mut options = EngineOptions::default();
+            idx.merge(&mut options, &json!({"server": {"port": value}}))
+                .unwrap();
+            assert_eq!(idx.flat(&options)["server.port"], 65535);
+        }
+        for value in [json!(65536), json!("65536"), json!(-1), json!("1.0")] {
+            assert!(!schema_valid(node, &value, &schema["$defs"]));
+            let before = EngineOptions::default();
+            let mut options = before.clone();
+            assert!(idx
+                .merge(&mut options, &json!({"server": {"port": value}}))
+                .is_err());
+            assert_eq!(options, before);
+        }
+    }
 
     /// The generated ECMA surface uses Rust's exact outer trim set; Rust
     /// regex alone is not an independent ECMA validator. The companion JS

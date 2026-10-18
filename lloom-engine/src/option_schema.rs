@@ -52,10 +52,11 @@ fn padded(body: &str) -> String {
     format!("^{TRIM_SPACE}*({}){TRIM_SPACE}*$", case_free(body))
 }
 
+/// Quote a literal arm outside character classes for both ECMA modes.
 fn escape(arm: &str) -> String {
     arm.chars()
         .flat_map(|c| {
-            if c.is_ascii_alphanumeric() || c == '_' {
+            if c.is_ascii_alphanumeric() || matches!(c, '_' | '-') {
                 vec![c]
             } else {
                 vec!['\\', c]
@@ -225,7 +226,7 @@ pub fn defs() -> Value {
         },
         "Wait": {
             "type": "string",
-            "pattern": format!(r"^{TRIM_SPACE}*({}(:{DURATION})?){TRIM_SPACE}*$", case_free(r"block|spin|spin\-hint|wfe|inherit|(sleep|event|event\-sleep|event\-listener|adaptive)")),
+            "pattern": format!(r"^{TRIM_SPACE}*({}(:{DURATION})?){TRIM_SPACE}*$", case_free(r"block|spin|spin-hint|wfe|inherit|(sleep|event|event-sleep|event-listener|adaptive)")),
             "description": "How a thread learns that something happened: `block` (the API's blocking call), `spin`, `spin-hint` (spin with a CPU hint), `wfe` (wait-for-event), `sleep[:dur]` (poll, sleeping between looks), `event[:timeout]` (park on an event), `event-sleep[:dur]` / `event-listener[:timeout]` (event variants), `adaptive[:dur]` (wfe while a consumer waits, else sleep), `inherit` (the flow's own wait). Each site takes the forms it implements (`x-lloom-wait-forms`)."
         },
         "ThreadQos": {
@@ -595,11 +596,17 @@ mod tests {
         PartialEq,
     )]
     struct UnsignedProbe {
+        #[opt]
         tiny: u8,
+        #[opt]
         short: u16,
+        #[opt]
         word: u32,
+        #[opt]
         wide: u64,
+        #[opt]
         native: usize,
+        #[opt]
         optional: Option<u16>,
     }
 
@@ -614,6 +621,68 @@ mod tests {
             legacy: vec![],
             compound: None,
             own: None,
+        }
+    }
+
+    #[test]
+    fn outside_class_literal_arms_keep_hyphens_and_regex_boundaries() {
+        use crate::option_grammar::tests::{schema_node, schema_valid};
+        for (literal, other) in [
+            ("user-interactive", "userXinteractive"),
+            ("per-token", "perXtoken"),
+            ("tile[1].x", "tile1x"),
+            ("a|b", "a"),
+        ] {
+            let pattern = padded(&escape(literal));
+            assert!(
+                !pattern.contains(r"\-"),
+                "outside-class identity escape: {pattern}"
+            );
+            let regex = regex::Regex::new(&pattern).unwrap();
+            assert!(regex.is_match(literal), "{literal}: {pattern}");
+            assert!(!regex.is_match(other), "{other}: {pattern}");
+        }
+        let schema = schema();
+        let idx = index();
+        for (path, value) in [
+            ("context.kv.layout", "in-place"),
+            ("decode.host_feed.qos", "user-interactive"),
+            ("executor.replay.barriers", "skip-replayed"),
+            ("session.missing_reasoning", "as-sent"),
+        ] {
+            assert!(
+                schema_valid(schema_node(&schema, path), &json!(value), &schema["$defs"]),
+                "{path}: {value}"
+            );
+            let mut options = EngineOptions::default();
+            idx.set(&mut options, path, value).unwrap();
+        }
+    }
+
+    #[test]
+    fn shared_wait_definition_keeps_literal_hyphens_and_parameter_boundaries() {
+        let defs = defs();
+        let pattern = defs["Wait"]["pattern"].as_str().unwrap();
+        assert!(
+            !pattern.contains(r"\-"),
+            "outside-class identity escape: {pattern}"
+        );
+        let regex = regex::Regex::new(pattern).unwrap();
+        for value in [
+            "spin-hint",
+            "event-sleep",
+            "event-listener:50us",
+            " EVENT-LISTENER:50US ",
+        ] {
+            assert!(regex.is_match(value), "{value}: {pattern}");
+        }
+        for value in [
+            "spinXhint",
+            "eventXsleep",
+            "eventXlistener:50us",
+            "event-listener:bad",
+        ] {
+            assert!(!regex.is_match(value), "{value}: {pattern}");
         }
     }
 

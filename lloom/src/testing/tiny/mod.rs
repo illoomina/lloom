@@ -207,6 +207,11 @@ pub trait TinyFamily: Sized {
     /// Every tensor the family's loader reads at `ckpt`'s config, stored as
     /// `ckpt.weights` says.
     fn schema(ckpt: &TinyCheckpoint<Self>) -> Result<Schema>;
+    /// Record constructor-backed schemas at the caller's explicit profile.
+    /// Config-derived schemas have no regime-dependent construction.
+    fn schema_for<P: crate::profile::Profile>(ckpt: &TinyCheckpoint<Self>) -> Result<Schema> {
+        Self::schema(ckpt)
+    }
     /// The workloads that reach the family's arms at `cfg`.
     fn workloads(cfg: &Self::Config) -> Vec<Workload>;
     /// The model in memory.
@@ -299,6 +304,10 @@ impl<F: TinyFamily> TinyCheckpoint<F> {
 
     pub fn schema(&self) -> Result<Schema> {
         F::schema(self)
+    }
+
+    pub fn schema_for<P: crate::profile::Profile>(&self) -> Result<Schema> {
+        F::schema_for::<P>(self)
     }
 
     /// The model in memory (unit tests), at the profile the test names.

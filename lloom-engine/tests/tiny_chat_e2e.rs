@@ -655,10 +655,15 @@ struct Server {
 
 impl Server {
     fn start(model: &Path, extra: &[&str]) -> Self {
+        Self::start_with_env(model, extra, &[])
+    }
+
+    fn start_with_env(model: &Path, extra: &[&str], env: &[(&str, &str)]) -> Self {
         let mut child = Command::new(env!("CARGO_BIN_EXE_lloom"))
             .args(["serve", "--model"])
             .arg(model)
             .args(extra)
+            .envs(env.iter().copied())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
             .spawn()
@@ -2419,6 +2424,49 @@ fn serve_returns_text_unless_ids_or_logprobs_are_asked() {
         err["error"]["message"].as_str().unwrap().contains(&why),
         "{err}"
     );
+    drop(server);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Public capability and request reasons come from one refusal table, not
+/// from the different stack traces captured at the health/request call sites.
+/// Set diagnostics on the child only: no process-global environment mutation.
+#[test]
+fn logprobs_health_and_request_reasons_are_stable_with_backtraces() {
+    let (dir, model, base) = qwen_tiny("logprobs-backtrace");
+    let mut batched: Vec<&str> = base.iter().map(String::as_str).collect();
+    batched.extend(["--batch", "2"]);
+    let server = Server::start_with_env(&model, &batched, &[("RUST_BACKTRACE", "1")]);
+    let (status, health) = server.call("GET", "/health", &json!({}));
+    assert_eq!(status, 200, "{health}");
+    assert_eq!(health["logprobs"]["served"], false, "{health}");
+    let why = health["logprobs"]["refused"].as_str().unwrap();
+    assert!(why.contains("the batch scheduler"), "{why}");
+    assert!(
+        !why.contains('\n'),
+        "a public reason is not a stack trace: {why}"
+    );
+    for (route, request) in [
+        (
+            "/v1/chat/completions",
+            json!({"messages": [{"role": "user", "content": PROMPT}], "max_tokens": 2, "logprobs": true}),
+        ),
+        (
+            "/v1/completions",
+            json!({"prompt": PROMPT, "max_tokens": 2, "logprobs": 0}),
+        ),
+    ] {
+        let (status, error) = server.call("POST", route, &request);
+        assert_eq!(status, 400, "{route}: {error}");
+        assert_eq!(
+            error["error"]["message"].as_str().unwrap(),
+            format!("logprobs: {why}"),
+            "{route}: the whole public reason must match health"
+        );
+    }
+    let (status, again) = server.call("GET", "/health", &json!({}));
+    assert_eq!(status, 200, "{again}");
+    assert_eq!(again["logprobs"]["refused"], why, "{again}");
     drop(server);
     std::fs::remove_dir_all(&dir).ok();
 }

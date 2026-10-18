@@ -35,6 +35,7 @@ struct AttentionLayer {
     n_head: usize,
     n_kv_head: usize,
     head_dim: usize,
+    kv_dtype: DType,
     cos: Tensor,
     sin: Tensor,
     neg_inf: Tensor,
@@ -141,6 +142,9 @@ impl AttentionLayer {
         let q = self.apply_rotary_emb(&q, index_pos)?;
         let k = self.apply_rotary_emb(&k, index_pos)?;
 
+        // Store only KV in the requested precision; attention arithmetic stays f32.
+        let k = k.to_dtype(self.kv_dtype)?;
+        let v = v.to_dtype(self.kv_dtype)?;
         let (k, v) = match &*kv_cache {
             None => (k, v),
             Some((k_cache, v_cache)) => {
@@ -155,8 +159,8 @@ impl AttentionLayer {
         };
         *kv_cache = Some((k.clone(), v.clone()));
 
-        let k = repeat_kv(k, self.n_head / self.n_kv_head)?;
-        let v = repeat_kv(v, self.n_head / self.n_kv_head)?;
+        let k = repeat_kv(k.to_dtype(q.dtype())?, self.n_head / self.n_kv_head)?;
+        let v = repeat_kv(v.to_dtype(q.dtype())?, self.n_head / self.n_kv_head)?;
 
         let att = (q.matmul(&k.t()?)? / (self.head_dim as f64).sqrt())?;
         let att = match mask {
@@ -442,6 +446,7 @@ impl Model {
                     n_head: plan.heads,
                     n_kv_head: a.kv_heads,
                     head_dim,
+                    kv_dtype: DType::F32,
                     cos: cos.clone(),
                     sin: sin.clone(),
                     neg_inf: neg_inf.clone(),
@@ -478,6 +483,24 @@ impl Model {
             span: tracing::span!(tracing::Level::TRACE, "model"),
             span_output: tracing::span!(tracing::Level::TRACE, "output"),
         })
+    }
+
+    /// Select the KV storage precision before creating any sequence. The default
+    /// remains f32. f16 rounds at each append; projections, RoPE and attention
+    /// still compute in f32, including CPU targets without native half matmul.
+    pub fn with_kv_dtype(mut self, dtype: DType) -> Result<Self> {
+        if !matches!(dtype, DType::F32 | DType::F16) {
+            bail!("quantized lfm2 KV storage requires f32 or f16")
+        }
+        // A cache created before this consuming configuration change must not
+        // be accepted with a different store precision.
+        self.owner = Arc::new(());
+        for layer in &mut self.layers {
+            if let LayerKind::Attention(attn) = &mut layer.kind {
+                attn.kv_dtype = dtype;
+            }
+        }
+        Ok(self)
     }
 
     pub fn config(&self) -> &Config {
@@ -731,6 +754,16 @@ pub struct GgufPlan<'a> {
     weights: weights::Lfm2Weights,
 }
 impl GgufPlan<'_> {
+    /// Resolve the requested runtime context before preflight and RoPE allocation.
+    /// A caller may shorten, but not extend, the checkpoint's supported context.
+    pub fn with_context_limit(mut self, max_tokens: usize) -> Result<Self> {
+        if max_tokens == 0 || max_tokens > self.weights.context {
+            bail!("quantized lfm2 requested context {max_tokens} must be in 1..={} (checkpoint context)", self.weights.context)
+        }
+        self.weights.context = max_tokens;
+        Ok(self)
+    }
+
     pub fn config(&self) -> Config {
         Config {
             context_length: self.weights.context,

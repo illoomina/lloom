@@ -15,6 +15,7 @@
 //! not running.
 mod accepted_frontier;
 mod checkpoint_policy;
+mod failure_next_request;
 mod load_warnings;
 mod machine_gate;
 mod qwen4exp_served_auto;

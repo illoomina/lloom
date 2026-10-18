@@ -3,10 +3,11 @@
 //! `DecodeSession::decode_until` as `lloom serve` drives it — one sequence
 //! and one pooled ring across requests.
 //!
-//! The engine's reader runs the streaming hook on the batch it read and
-//! raises the loop's stop flag at its next iteration, so a hook blocked on
-//! the batch the EOS ended holds the flag back. On the adaptive commit the
-//! loop keeps encoding until it reads the flag; on the fixed cadence it has
+//! The engine's reader raises the stop flag before a hook on a batch whose
+//! read found EOS. A hook on an earlier batch still holds the reader back:
+//! completing the reply's text does not mean EOS was already published.
+//! On the adaptive commit the loop keeps encoding until it reads the flag;
+//! on the fixed cadence it has
 //! learnt the EOS itself and stopped. Without the EOS gate (the family's
 //! default, `family::QWEN3_5_CAPABILITIES`) the forwards it runs past the
 //! EOS write the state, and the next request on the session extends only
@@ -634,7 +635,7 @@ fn under_the_eos_gate_the_overrun_reconciles_on_a_wrapped_pooled_ring() -> Resul
         "blocking",
         false,
         never,
-        &[first.clone()],
+        std::slice::from_ref(&first),
         None,
         SLOW,
     )?

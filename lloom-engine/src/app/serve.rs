@@ -200,7 +200,7 @@ fn run_configured(args: ServeArgs, transport: Option<tiny_http::TransportPolicy>
     let reuse_prefix = shape.reuse_prefix;
     // A non-generating decision model is served by the decision-only listener.
     if let Some(endpoint) = super::omni::serving::load(&options.load, &shape)? {
-        return run_decisions_configured(options, endpoint, DECISION_BODY_BYTES, transport);
+        return run_decisions_configured(options, endpoint, DECISION_BODY_BYTES, transport, true);
     }
     let (engine, model_path) = super::load_engine(&options.load, shape)?;
     run_owner(
@@ -240,6 +240,19 @@ pub fn run_loaded_with_transport_policy(
 ) -> Result<()> {
     policy.validate()?;
     run_owner(options, engine, model_path, None, Some(policy))
+}
+
+/// Startup provenance distinguishes configured options from the loaded owner's
+/// actual description. Supplied owners do not install the option tree.
+fn ready_configuration(options: &crate::EngineOptions, installed: bool, owner: Value) -> Value {
+    json!({
+        "schema_version": 1,
+        "frontend": "serve",
+        "options_installed": installed,
+        "configured_options": crate::option_tree::index().flat(options),
+        "owner": owner,
+        "request_resolution": "readback and sampling may resolve per request; read response timings",
+    })
 }
 
 fn run_owner(
@@ -307,6 +320,19 @@ fn run_owner(
     ) {
         anyhow::bail!("session.keep_logprobs: {why}");
     }
+    let configuration = ready_configuration(
+        &options,
+        load_facts.is_some(),
+        json!({
+            "description": description,
+            "readback": engine.readback().name(),
+            "kv_capacity": engine.kv_capacity(),
+            "batch": engine.batch(),
+            "prefill_tile": engine.prefill_tile(),
+            "prefix_reuse": engine.reuse_prefix(),
+            "capabilities": engine.capabilities().json(),
+        }),
+    );
     let (host, port) = (options.server.host.clone(), options.server.port);
 
     let server = listener((host.as_str(), port), transport)
@@ -333,7 +359,10 @@ fn run_owner(
 
     // The ready marker the sidecar runner waits for, on stdout and nothing
     // else on stdout before it. Everything the operator reads goes to stderr.
-    println!("{}", json!({"kind": "ready", "host": host, "port": port}));
+    println!(
+        "{}",
+        json!({"kind": "ready", "host": host, "port": port, "configuration": configuration})
+    );
     std::io::stdout().flush().ok();
     eprintln!("[serving on http://{host}:{port}]");
 
@@ -411,7 +440,7 @@ pub fn run_decisions_loaded(
     endpoint: Box<dyn super::decision_endpoint::DecisionEndpoint>,
     max_body_bytes: usize,
 ) -> Result<()> {
-    run_decisions_configured(options, endpoint, max_body_bytes, None)
+    run_decisions_configured(options, endpoint, max_body_bytes, None, false)
 }
 /// Same narrow endpoint and dispatcher, with explicit dependency disposal/I/O
 /// limits. Header/JSON/queue allocations and thread joining remain separate.
@@ -422,13 +451,14 @@ pub fn run_decisions_loaded_with_transport_policy(
     policy: tiny_http::TransportPolicy,
 ) -> Result<()> {
     policy.validate()?;
-    run_decisions_configured(options, endpoint, max_body_bytes, Some(policy))
+    run_decisions_configured(options, endpoint, max_body_bytes, Some(policy), false)
 }
 fn run_decisions_configured(
     options: crate::EngineOptions,
     endpoint: Box<dyn super::decision_endpoint::DecisionEndpoint>,
     max_body_bytes: usize,
     transport: Option<tiny_http::TransportPolicy>,
+    options_installed: bool,
 ) -> Result<()> {
     let read_bound = max_body_bytes
         .checked_add(1)
@@ -436,6 +466,16 @@ fn run_decisions_configured(
         .ok_or_else(|| {
             anyhow::anyhow!("decision transport body bound must be finite and nonzero")
         })?;
+    let configuration = ready_configuration(
+        &options,
+        options_installed,
+        json!({
+            "generation": false,
+            "decisions": true,
+            "model": endpoint.model_name(),
+            "input_modalities": endpoint.input_modalities(),
+        }),
+    );
     let host = options.server.host;
     let server = listener((host.as_str(), options.server.port), transport)
         .map_err(|error| anyhow::anyhow!("binding decision listener: {error}"))?;
@@ -446,7 +486,7 @@ fn run_decisions_configured(
     };
     println!(
         "{}",
-        json!({"kind":"ready","host":host,"port":port,"generation":false,"decisions":true})
+        json!({"kind":"ready","host":host,"port":port,"generation":false,"decisions":true,"configuration":configuration})
     );
     std::io::stdout().flush()?;
     loop {
@@ -4390,6 +4430,62 @@ mod logprob_request_tests {
             Some(LogprobRequest { top: 0, rows: true }),
             "the session's own keep, never serialised unless asked"
         );
+    }
+}
+
+#[cfg(test)]
+mod ready_configuration_tests {
+    use super::ready_configuration;
+    use serde_json::json;
+
+    #[test]
+    fn pipette_cell_overrides_use_the_same_serve_option_layers() {
+        use clap::Parser;
+        let args = super::ServeArgs::try_parse_from([
+            "lloom serve",
+            "--kernels-config",
+            r#"{"attention":{"flash":{"partial_block":8}}}"#,
+            "--speculative-config",
+            r#"{"method":"auto"}"#,
+            "--set",
+            "kernels.attention.flash.partial_block=32",
+            "--speculate",
+            "none",
+        ])
+        .unwrap();
+        let (options, _) = crate::app::resolve_layers(
+            &args.common,
+            &|options| args.front(options),
+            &|_| None,
+            false,
+            Some(crate::frontend::Frontend::Serve),
+        )
+        .unwrap();
+        let flat = crate::option_tree::index().flat(&options);
+        assert_eq!(flat["kernels.attention.flash.partial_block"], 32);
+        assert_eq!(flat["speculative.method"], "none");
+        assert_eq!(flat["context.prefix.reuse"], true);
+        assert!(!options.executor.arena && !options.executor.replay);
+    }
+
+    #[test]
+    fn configured_options_are_not_claimed_as_owner_resolution() {
+        let mut options = crate::EngineOptions::default();
+        crate::option_tree::index()
+            .set(&mut options, "kernels.attention.flash.partial_block", "8")
+            .unwrap();
+        let report = ready_configuration(&options, true, json!({"readback": "blocking"}));
+        assert_eq!(report["schema_version"], 1);
+        assert_eq!(
+            report["configured_options"]["kernels.attention.flash.partial_block"],
+            8
+        );
+        assert_eq!(report["owner"]["readback"], "blocking");
+        assert_eq!(report["options_installed"], true);
+        let supplied = ready_configuration(&options, false, json!({"generation": false}));
+        assert_eq!(supplied["options_installed"], false);
+        assert_eq!(supplied["owner"]["generation"], false);
+        assert!(supplied["owner"].get("readback").is_none());
     }
 }
 

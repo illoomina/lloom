@@ -1186,15 +1186,6 @@ impl Commands {
         self.core.hook.lock_subscribers_for_test()
     }
 
-    #[cfg(test)]
-    pub(crate) fn actual_command_api_for_test(&self) -> &'static str {
-        if self.core.modern_queue.is_some() {
-            "metal4"
-        } else {
-            "metal3"
-        }
-    }
-
     /// The native command API actually installed on this queue.
     /// This observes the resolved queue, not the requested tuning string.
     pub fn actual_command_api(&self) -> &'static str {
@@ -4052,9 +4043,7 @@ mod owner_submission_tests {
         // no encoded resources or external raw aliases. This family performs
         // the immediate explicit commit and completion wait below.
         let cb = unsafe {
-            CommandBuffer::new(
-                create_command_buffer(&queue, CommandBufferKind::Retaining).unwrap(),
-            )
+            CommandBuffer::new(create_command_buffer(&queue, CommandBufferKind::Retaining).unwrap())
         };
         cb.commit().unwrap();
         cb.try_wait_until_completed().unwrap();

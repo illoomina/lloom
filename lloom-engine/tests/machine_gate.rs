@@ -207,8 +207,8 @@ fn qwen4exp_tiny_is_admitted_on_the_machine_and_refused_without_room() {
 
 /// With no `memory.machine.reserve_gb`, the load line names the default it
 /// took: what the OS keeps from the Metal device's working set where the
-/// load runs on one, a tenth of the machine on the CPU — and the 4 GiB
-/// floor when the floor is larger, as it is on a host under 40 GiB.
+/// load runs on one; on the CPU, macOS keeps max(4 GiB, 10 %) and other
+/// hosts keep max(256 MiB, 5 %). A binding floor names the fraction it beat.
 #[test]
 fn the_default_reserve_names_its_basis_on_each_device() {
     let dir = scratch("reserve-basis");
@@ -217,13 +217,30 @@ fn the_default_reserve_names_its_basis_on_each_device() {
     let total = lloom_tensor::machine::HostMemory::read()
         .expect("the host's memory")
         .total;
-    let tenth = if total / 10 >= lloom_tensor::machine::RESERVE_FLOOR {
-        "(10 %)".to_string()
+    // State the documented policy independently of default_reserve and its
+    // formatter: deriving this oracle from either would hide a policy drift.
+    let (cpu_reserve, cpu_basis) = if cfg!(target_os = "macos") {
+        let fraction = total / 10;
+        let floor = 4 * (1_u64 << 30);
+        let basis = if fraction >= floor {
+            "10 %".to_string()
+        } else {
+            format!("4 GiB floor; 10 % = {:.2} GB", fraction as f64 / 1e9)
+        };
+        (fraction.max(floor), basis)
     } else {
-        format!("(4 GiB floor; 10 % = {:.2} GB)", (total / 10) as f64 / 1e9)
+        let fraction = total / 20;
+        let floor = 256 * (1_u64 << 20);
+        let basis = if fraction >= floor {
+            "host: 5 %".to_string()
+        } else {
+            format!("256 MiB floor; host: 5 % = {:.2} GB", fraction as f64 / 1e9)
+        };
+        (fraction.max(floor), basis)
     };
+    let cpu_want = format!("reserve={:.2} GB ({cpu_basis})", cpu_reserve as f64 / 1e9);
     #[allow(unused_mut)]
-    let mut arms = vec![(&["--cpu"][..], tenth.as_str())];
+    let mut arms = vec![(&["--cpu"][..], cpu_want.as_str())];
     #[cfg(feature = "metal")]
     arms.push((&[][..], "memsize-working_set"));
     for (extra, basis) in arms {

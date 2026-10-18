@@ -68,7 +68,16 @@ impl Reasoning {
         from: usize,
         decode: &dyn Fn(&[u32]) -> lloom_tensor::Result<String>,
     ) -> lloom_tensor::Result<()> {
-        self.events.retain(|event| event.start < from);
+        // observed_decode's pending-run origin never decreases: it advances
+        // only after nonempty complete UTF-8, by that run's decoded length.
+        // A completed run's additive marker starts are strictly before the
+        // next origin; replacements for the same pending run start at/after
+        // `from` and were appended as one suffix. The writer only pops the
+        // front under this same parser mutex, preserving that partition.
+        // Drop the replaceable suffix, not the lagging writer's whole history.
+        while self.events.back().is_some_and(|event| event.start >= from) {
+            self.events.pop_back();
+        }
         for (i, id) in ids.iter().enumerate() {
             let Some(marker) = self.markers.iter().find(|marker| marker.id == *id) else {
                 continue;
@@ -139,6 +148,20 @@ impl Reasoning {
             self.offset = event.end;
         }
         fields(content, reasoning)
+    }
+
+    /// Raw bytes resolved by this event, excluding a held partial marker.
+    /// The writer acknowledges this count only after the event succeeds.
+    pub(super) fn push_counted(&mut self, text: &str) -> (Map<String, Value>, usize) {
+        let before = self.offset;
+        let fields = self.push(text);
+        (fields, self.offset - before)
+    }
+
+    pub(super) fn finish_counted(&mut self) -> (Map<String, Value>, usize) {
+        let before = self.offset;
+        let fields = self.finish();
+        (fields, self.offset - before)
     }
 
     pub(super) fn finish(&mut self) -> Map<String, Value> {
@@ -353,5 +376,151 @@ mod tests {
                 );
             }
         }
+    }
+
+    // Exercise the production byte decoder's from/pending rule, not a fake
+    // monotone counter: a marker plus the first byte of pi must stay pending
+    // through repeated observations until the second UTF-8 byte arrives.
+    fn pending_suffix_with_lagging_history(drained_groups: usize) {
+        use lloom::testing::tiny::{tokenizer::tokenizer_json, TinyTokenizer};
+        use parking_lot::Mutex;
+        let tiny = TinyTokenizer::lfm2();
+        let tokenizer =
+            tokenizers::Tokenizer::from_bytes(tokenizer_json(&tiny.added).as_bytes()).unwrap();
+        let start = tokenizer.token_to_id("<think>").unwrap();
+        let end = tokenizer.token_to_id("</think>").unwrap();
+        let mut p = parser(false);
+        p.markers = vec![
+            Marker {
+                id: start,
+                text: "<think>".into(),
+                kind: Kind::Start,
+            },
+            Marker {
+                id: end,
+                text: "</think>".into(),
+                kind: Kind::End,
+            },
+        ];
+        let p = Mutex::new(p);
+        let mut stream = crate::stream::TextStream::default();
+        let mut from = 0;
+        let mut published = VecDeque::new();
+        let mut parts = Vec::new();
+        let mut raw_credited = 0;
+        let publish = |ids: &[u32], stream: &mut crate::stream::TextStream, from: &mut usize| {
+            let mut observe =
+                |ids: &[u32],
+                 text: &str,
+                 from,
+                 decode: &dyn Fn(&[u32]) -> lloom_tensor::Result<String>| {
+                    p.lock().observe(ids, text, from, decode)
+                };
+            let mut decode = |ids: &[u32]| {
+                crate::app::causal_loaded::observed_decode(&tokenizer, ids, from, &mut observe)
+            };
+            stream.publish(ids, &mut decode, &[]).unwrap()
+        };
+        const GROUPS: usize = 32;
+        for _ in 0..GROUPS {
+            let (text, stopped) = publish(&[start, 97, end, 65], &mut stream, &mut from);
+            assert!(!stopped);
+            published.push_back(text.unwrap());
+        }
+        assert_eq!(
+            p.lock().events.len(),
+            GROUPS * 2,
+            "historical events must really be retained"
+        );
+        for _ in 0..drained_groups {
+            let (fields, resolved) = p.lock().push_counted(&published.pop_front().unwrap());
+            raw_credited += resolved;
+            parts.push(fields);
+        }
+        assert_eq!(p.lock().events.len(), (GROUPS - drained_groups) * 2);
+        // Spell the apparent markers with ordinary byte ids, not added ids.
+        // They must remain literal content despite identical strings.
+        let literal = " literal <think> </think> ";
+        for byte in literal.bytes() {
+            let (text, stopped) = publish(&[u32::from(byte)], &mut stream, &mut from);
+            assert!(!stopped);
+            if let Some(text) = text {
+                published.push_back(text);
+            }
+        }
+        let (text, stopped) = publish(&[start, 98], &mut stream, &mut from);
+        assert!(!stopped);
+        published.push_back(text.unwrap());
+        let pending_from = from;
+        let prefix: Vec<_> = p.lock().events.iter().map(|e| (e.start, e.end)).collect();
+        assert!(prefix.iter().all(|&(start, _)| start < pending_from));
+        // Real first UTF-8 byte: observed text contains an additive genuine
+        // marker but ends in U+FFFD, so TextStream publishes nothing.
+        for ids in [&[end, 0xcf][..], &[][..], &[][..]] {
+            let (text, stopped) = publish(ids, &mut stream, &mut from);
+            assert_eq!(text, None);
+            assert!(!stopped);
+            assert_eq!(
+                from, pending_from,
+                "incomplete run must be replaced at the same origin"
+            );
+            let guard = p.lock();
+            let actual_prefix: Vec<_> = guard
+                .events
+                .iter()
+                .take(prefix.len())
+                .map(|e| (e.start, e.end))
+                .collect();
+            assert_eq!(actual_prefix, prefix, "historical prefix changed");
+            assert_eq!(
+                guard.events.len(),
+                prefix.len() + 1,
+                "pending marker duplicated or history lost"
+            );
+            assert_eq!(guard.events.back().unwrap().start, pending_from);
+        }
+        let (text, stopped) = publish(&[0x80], &mut stream, &mut from);
+        assert!(!stopped);
+        assert_eq!(text.as_deref(), Some("</think>π"));
+        assert_eq!(from, pending_from + "</think>π".len());
+        published.push_back(text.unwrap());
+        assert_eq!(p.lock().events.len(), prefix.len() + 1);
+        let tail = " tail <think>";
+        for byte in tail.bytes() {
+            let (text, stopped) = publish(&[u32::from(byte)], &mut stream, &mut from);
+            assert!(!stopped);
+            if let Some(text) = text {
+                published.push_back(text);
+            }
+        }
+        // No incomplete bytes remain; finish preserves the same raw text.
+        let (raw, _) = stream.finish(&[]);
+        for text in published {
+            let (fields, resolved) = p.lock().push_counted(&text);
+            raw_credited += resolved;
+            parts.push(fields);
+        }
+        let (fields, resolved) = p.lock().finish_counted();
+        raw_credited += resolved;
+        parts.push(fields);
+        assert_eq!(raw_credited, raw.len());
+        assert!(p.lock().events.is_empty());
+        assert_eq!(
+            collect(parts),
+            (
+                format!("{}{literal}π{tail}", "A".repeat(GROUPS)),
+                format!("{}b", "a".repeat(GROUPS))
+            )
+        );
+    }
+
+    #[test]
+    fn lagging_history_keeps_only_one_repeated_incomplete_utf8_marker_suffix() {
+        pending_suffix_with_lagging_history(0);
+    }
+
+    #[test]
+    fn front_consumption_preserves_pending_suffix_and_literal_marker_distinction() {
+        pending_suffix_with_lagging_history(8);
     }
 }

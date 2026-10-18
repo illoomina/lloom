@@ -49,7 +49,7 @@ fn case_free(pattern: &str) -> String {
 /// The value grammar (`lloom_tensor::options`) as patterns: a typed value
 /// may carry surrounding whitespace, an arm and a bool spelling any case.
 fn padded(body: &str) -> String {
-    format!(r"^\s*({})\s*$", case_free(body))
+    format!("^{TRIM_SPACE}*({}){TRIM_SPACE}*$", case_free(body))
 }
 
 fn escape(arm: &str) -> String {
@@ -75,8 +75,8 @@ fn bool_pattern() -> String {
 }
 
 /// A count, a number and `none` as the strings the grammar reads.
-const COUNT: &str = r"^\s*\+?\d+\s*$";
-const NUMBER: &str = r"^\s*[+-]?(\d+(\.\d*)?|\.\d+)([eE][+-]?\d+)?\s*$";
+const COUNT: &str = r"\+?\d+";
+const NUMBER: &str = r"[+-]?(\d+(\.\d*)?|\.\d+)([eE][+-]?\d+)?";
 
 /// The arms a field declares (`variants`), parameterised ones included
 /// (`nodes:<k>`, `ring[:<K>]`, `<count>`), as a pattern; `None` for a list
@@ -221,12 +221,12 @@ pub fn defs() -> Value {
     json!({
         "Duration": {
             "type": "string",
-            "pattern": format!(r"^\s*{DURATION}\s*$"),
+            "pattern": format!(r"^{TRIM_SPACE}*{DURATION}{TRIM_SPACE}*$"),
             "description": "A time with its unit: `50us`, `1ms`, `2s`."
         },
         "Wait": {
             "type": "string",
-            "pattern": format!(r"^\s*({}(:{DURATION})?)\s*$", case_free(r"block|spin|spin\-hint|wfe|inherit|(sleep|event|event\-sleep|event\-listener|adaptive)")),
+            "pattern": format!(r"^{TRIM_SPACE}*({}(:{DURATION})?){TRIM_SPACE}*$", case_free(r"block|spin|spin\-hint|wfe|inherit|(sleep|event|event\-sleep|event\-listener|adaptive)")),
             "description": "How a thread learns that something happened: `block` (the API's blocking call), `spin`, `spin-hint` (spin with a CPU hint), `wfe` (wait-for-event), `sleep[:dur]` (poll, sleeping between looks), `event[:timeout]` (park on an event), `event-sleep[:dur]` / `event-listener[:timeout]` (event variants), `adaptive[:dur]` (wfe while a consumer waits, else sleep), `inherit` (the flow's own wait). Each site takes the forms it implements (`x-lloom-wait-forms`)."
         },
         "ThreadQos": {
@@ -294,7 +294,7 @@ fn value_schema(key: &Key, default: &Value) -> Value {
                     .map(|f| escape(f))
                     .collect::<Vec<_>>()
                     .join("|");
-                json!({"allOf": [{"$ref": "#/$defs/Wait"}, {"pattern": format!(r"^\s*({})(:{DURATION})?\s*$", case_free(&alt))}]})
+                json!({"allOf": [{"$ref": "#/$defs/Wait"}, {"pattern": format!(r"^{TRIM_SPACE}*({})(:{DURATION})?{TRIM_SPACE}*$", case_free(&alt))}]})
             }
             (None, "ThreadQos") if !m.forms.is_empty() => {
                 json!({"allOf": [{"$ref": "#/$defs/ThreadQos"}, arms(m.forms)]})
@@ -337,9 +337,9 @@ fn value_schema(key: &Key, default: &Value) -> Value {
     } else if m.is_bool || ty == "bool" {
         s = json!({"anyOf": [s, {"type": "boolean"}, {"enum": [0, 1]}, {"type": "string", "pattern": bool_pattern()}]});
     } else if base_type(ty)["type"] == "integer" {
-        s = json!({"anyOf": [s, {"type": "integer", "minimum": 0}, {"type": "string", "pattern": COUNT}]});
+        s = json!({"anyOf": [s, {"type": "integer", "minimum": 0}, {"type": "string", "pattern": padded(COUNT)}]});
     } else if base_type(ty)["type"] == "number" {
-        s = json!({"anyOf": [s, {"type": "number"}, {"type": "string", "pattern": NUMBER}]});
+        s = json!({"anyOf": [s, {"type": "number"}, {"type": "string", "pattern": padded(NUMBER)}]});
     }
     // `null` returns any key to its default; `none` unsets an optional one.
     let mut alts = vec![s, json!({"type": "null"})];
@@ -552,6 +552,68 @@ pub fn schema() -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The generated ECMA surface uses Rust's exact outer trim set; Rust
+    /// regex alone is not an independent ECMA validator. The companion JS
+    /// check validates actual exported patterns in both RegExp modes.
+    #[test]
+    fn common_typed_padding_projects_the_runtime_trim_set() {
+        fn patterns<'a>(v: &'a Value, out: &mut Vec<&'a str>) {
+            if let Some(p) = v.get("pattern").and_then(Value::as_str) {
+                out.push(p);
+            }
+            for name in ["anyOf", "allOf", "oneOf"] {
+                if let Some(values) = v.get(name).and_then(Value::as_array) {
+                    for value in values {
+                        patterns(value, out);
+                    }
+                }
+            }
+        }
+        let schema = schema();
+        let idx = index();
+        for (path, value) in [
+            ("context.prefix.reuse", "TRUE"),
+            ("context.prefix.reuse", "none"),
+            ("diagnostics.verbose", "ON"),
+            ("memory.admission.drain", "OFF"),
+            ("determinism", "FAST"),
+            ("generation.top_k", "2"),
+            ("generation.temperature", "0.5"),
+            ("generation.max_tokens", "16"),
+        ] {
+            let mut node = &schema;
+            for part in path.split('.') {
+                node = &node["properties"][part];
+            }
+            let mut found = Vec::new();
+            patterns(node, &mut found);
+            assert!(!found.is_empty(), "{path} has no projected string grammar");
+            for pattern in found {
+                assert!(
+                    pattern.starts_with(&format!("^{TRIM_SPACE}*")),
+                    "{path}: {pattern}"
+                );
+                assert!(
+                    !pattern.contains(r"\s*"),
+                    "{path}: ECMA whitespace differs from Rust trim"
+                );
+            }
+            for (padding, accepted) in [(" \t\n", true), ("\u{0085}", true), ("\u{feff}", false)] {
+                let mut options = EngineOptions::default();
+                let before = options.clone();
+                let input = format!("{padding}{value}{padding}");
+                assert_eq!(
+                    idx.set(&mut options, path, &input).is_ok(),
+                    accepted,
+                    "{path}: {input:?}"
+                );
+                if !accepted {
+                    assert_eq!(options, before, "{path}: refused padding changed state");
+                }
+            }
+        }
+    }
 
     /// Every key of the index has a node in the schema, at its path, and
     /// nothing else does.

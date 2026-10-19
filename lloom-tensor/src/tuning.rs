@@ -1622,7 +1622,9 @@ mod tests {
         assert_eq!(t.metal.completion_wait, "synchronize");
         assert_eq!(t.pool.buffer_alignment, 128);
         assert_eq!(t.gemm.skinny_max, 33);
-        assert!(!t.gemm.f16_rows);
+        // On by default under `fast` (maintainer, 2026-10-19); `deterministic`
+        // never takes it (`the_report_names_the_f16_row_axis_under_fast_only`).
+        assert!(t.gemm.f16_rows);
         assert_eq!(t.gemm.f16_rows_max, 10);
         assert_eq!(t.qmm.dequant_from, 64);
         assert_eq!(t.moe.mm_from, 64);
@@ -1654,7 +1656,7 @@ mod tests {
         assert_eq!(
             Contract::Fast.report(),
             format!(
-                "profile=fast arms=moe-act-f16,decision-pack,decision-ragged cpu_f16_accum={accum}"
+                "profile=fast arms=moe-act-f16,decision-pack,decision-ragged,f16-rows cpu_f16_accum={accum}"
             )
         );
     }

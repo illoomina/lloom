@@ -131,6 +131,7 @@ rows! {
         Always: "decode.readback.kind" = "ring",
         Always: "decode.readback.eos" = "gpu-batched-nonblocking",
         Always: "decode.readback.stream_reader" = "true",
+        Always: "prefill.tile" = "64",
         // LFM2 (safetensors) only: its `Config` axes and LFM2 kernels.
         ModelAxes: "kernels.attention.flash.partial_block" = "8",
         // Shared with Qwen4-exp's HC norm arm, +6.6% ms/token there.

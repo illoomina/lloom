@@ -235,10 +235,10 @@ fn check_at<P: Lfm2Shape>(
             .expect("the census window");
         let tok = Tensor::new(&[(pos % 60) as u32 + 1], dev)?.reshape((1, 1))?;
         let _ = lloom_tensor::kernels::metal::trace::take_dispatches();
-        lloom_tensor::kernels::metal::trace::set_recording(true);
+        lloom_tensor::kernels::metal::trace::set_recording(true)?;
         model.forward(&tok, pos, &mut cache)?;
         dev.synchronize()?;
-        lloom_tensor::kernels::metal::trace::set_recording(false);
+        lloom_tensor::kernels::metal::trace::set_recording(false)?;
         let order: Vec<String> = lloom_tensor::kernels::metal::trace::take_dispatches()
             .iter()
             .map(|d| d.pipeline.clone())

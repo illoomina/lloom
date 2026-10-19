@@ -134,3 +134,64 @@ fn failed_nonempty_prefill_does_not_expose_previous_prediction() -> Result<()> {
     );
     Ok(())
 }
+
+/// Runs the production baseline driver through this crate's normal dependency,
+/// unlike lloom's self-dev graph (which deliberately enables fuzzing/profile).
+#[test]
+fn baseline_instrument_storage_matches_the_actual_shipping_or_diagnostic_graph() -> Result<()> {
+    use lloom::generation::{LogitsProcessor, Sampling};
+    use lloom::nn::IdentityProposer;
+    lloom_tensor::tuning::install(lloom_tensor::tuning::Tuning::default()).unwrap();
+    let expected = std::env::var("LLOOM_TEST_EXPECT_PROFILE_CAPABILITY").ok();
+    if let Some(expected) = expected.as_deref() {
+        assert_eq!(
+            lloom_tensor::tuning::PROFILE_INSTRUMENTS,
+            match expected {
+                "absent" => false,
+                "available" => true,
+                other => panic!("unknown test capability expectation: {other}"),
+            },
+            "unexpected transitive diagnostic feature union"
+        );
+    }
+    let model = Tiny::default();
+    let mut session = Session::new(&model, Tokens::default());
+    let mut readback = Blocking::new(&[2], &Device::Cpu)?;
+    let mut sampler = LogitsProcessor::from_sampling(0, Sampling::ArgMax);
+    let opts = DecodeOptions {
+        prefill_tile: 2,
+        ..DecodeOptions::new(3)
+    };
+    let out = session.decode(
+        &mut IdentityProposer,
+        &mut readback,
+        &mut sampler,
+        &[1, 1],
+        &opts,
+        &mut |_| Ok(()),
+    )?;
+    assert_eq!(out.ids, vec![1, 1, 1]);
+    assert_eq!(out.stats.produced, 3);
+    assert!(out.stats.prefill_census.is_none());
+    assert!(out.stats.step0_census.is_none());
+    match expected.as_deref() {
+        Some("absent") => {
+            assert!(out.stats.step_ns.is_empty());
+            assert_eq!(
+                out.stats.step_ns.capacity(),
+                0,
+                "shipping baseline reserved token-sized diagnostic storage"
+            );
+        }
+        Some("available") => assert_eq!(out.stats.step_ns.len(), 3),
+        _ => assert!(out.stats.step_ns.is_empty() || out.stats.step_ns.len() == 3),
+    }
+    println!(
+        "actual_profile_capability={} step_entries={} step_capacity={} ids={:?}",
+        lloom_tensor::tuning::PROFILE_INSTRUMENTS,
+        out.stats.step_ns.len(),
+        out.stats.step_ns.capacity(),
+        out.ids
+    );
+    Ok(())
+}

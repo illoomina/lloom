@@ -132,6 +132,8 @@ unsafe impl Sync for IoQueue {}
 impl IoQueue {
     /// A concurrent, normal-priority IO queue on `device`.
     pub fn new(device: &Device) -> Result<Self, MetalKernelError> {
+        crate::tuning::try_tuning()
+            .map_err(|error| MetalKernelError::InvalidInput(error.to_string()))?;
         let desc = MTLIOCommandQueueDescriptor::new();
         desc.setType(MTLIOCommandQueueType::Concurrent);
         desc.setPriority(MTLIOPriority::Normal);

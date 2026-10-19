@@ -391,14 +391,22 @@ fn the_machine_gate_refuses_what_the_container_cannot_hold() {
         eprintln!("alone: {l}");
     }
     // The group's room after its tenth, taken by a reservation this test
-    // holds (its own footprint is subtracted from what it reserved).
+    // holds (its own footprint is subtracted from what it reserved) — plus a
+    // slack well past any drift: `charged` is the live container's usage,
+    // which the suite's other `lloom` processes move between this read and
+    // the load below, and the gate's own subtraction rounds the footprint
+    // to pages. Without the slack the second load was admitted by 2.5 MiB on
+    // silverberry (3/3 runs, 2026-10-19; `ci-c5091ad2`, `ci-96c4f30a`,
+    // `ci-7fa67f79`) and once on the NAS. The premise is unchanged: a
+    // container that cannot hold the load refuses it.
+    const SLACK: i64 = 256 << 20;
     let room = (limit - charged) as i64 - (limit / 10) as i64;
     let held = lloom_tensor::machine::footprint_of(std::process::id()).unwrap_or(0) as i64;
     let stand_in = Registry::open(&registry)
         .unwrap()
         .reserve_unchecked(
             "stand-in filling the container",
-            (room + held).max(0) as u64,
+            (room + held + SLACK).max(0) as u64,
         )
         .unwrap();
     eprintln!("limit={limit} charged={charged} room={room} held={held}");

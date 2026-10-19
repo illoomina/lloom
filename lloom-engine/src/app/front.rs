@@ -214,6 +214,12 @@ pub struct Constants {
     pub groups_tools: bool,
     /// The family's reasoning tags (`Text::think_tags`).
     pub tags: Option<ThinkTags>,
+    /// The text the template writes to end an assistant turn, and the single
+    /// id it encodes to: the end-of-turn token. `None` where the template's
+    /// ending is not one token, or does not encode to the id the model would
+    /// have sampled. A matched turn's span runs through it
+    /// ([`emit_turn`]).
+    eot: Option<(u32, String)>,
 }
 
 impl Constants {
@@ -226,7 +232,13 @@ impl Constants {
             open: None,
             groups_tools: false,
             tags: None,
+            eot: None,
         }
+    }
+
+    /// The end-of-turn token: its id and the text the template writes for it.
+    pub fn eot(&self) -> Option<(u32, &str)> {
+        self.eot.as_ref().map(|(id, s)| (*id, s.as_str()))
     }
 
     /// The mode for `kwarg` × `want`: `Err` with the reason thinking on
@@ -413,6 +425,35 @@ impl Constants {
         })()
         .unwrap_or(false);
 
+        // The end-of-turn token: what the template writes after an assistant
+        // turn's body. Read by rendering one assistant turn whose content is
+        // a probe, and taking what follows the probe up to the next message's
+        // opening. It counts only if it encodes to exactly one id, and that
+        // id is one of the checkpoint's EOS ids — then it is the token the
+        // model itself samples to end a turn, so a matched turn's span may run
+        // through it (`emit_turn`).
+        let eot = (|| {
+            let two = json!([
+                user,
+                json!({ "role": "assistant", "content": PROBE_ANSWER })
+            ]);
+            let s = render(&two, &Map::new(), false)?;
+            let at = s.rfind(PROBE_ANSWER)? + PROBE_ANSWER.len();
+            let rest = &s[at..];
+            // The template's own ending for the turn, before any next
+            // message's opening and without the whitespace that follows it.
+            let marker = match open.as_deref().and_then(|o| rest.find(o)) {
+                Some(i) => &rest[..i],
+                None => rest,
+            }
+            .trim_end();
+            let ids = enc(marker)?;
+            match ids.as_slice() {
+                [id] if text.eos_ids.contains(id) => Some((*id, marker.to_string())),
+                _ => None,
+            }
+        })();
+
         Self {
             modes,
             effort,
@@ -421,6 +462,7 @@ impl Constants {
             open,
             groups_tools,
             tags,
+            eot,
         }
     }
 }
@@ -1246,7 +1288,7 @@ impl Front {
                 let Some(region) = tb.region(*i, rendered.len()) else {
                     continue;
                 };
-                if emit_turn(text, &rendered, region.clone(), reply, &mut runs) {
+                if emit_turn(text, &rendered, region.clone(), reply, c.eot(), &mut runs) {
                     spliced.emitted += 1;
                     continue;
                 }
@@ -1894,93 +1936,91 @@ fn units(text: &Text, ids: &[u32], base: usize) -> Option<Vec<(Range<usize>, Str
 /// Render a past assistant turn from the ids the model emitted (decision 51
 /// Q1): the whole turn — anything before its reasoning block, the block's
 /// markers and interior with its own whitespace, the content — in place of
-/// whatever the template rendered for it, with the template's own role header
-/// kept (the model did not write it). The run ends at the turn's end: through
-/// the end-of-turn token for a reply the model ended itself, at the reply's
-/// last id for one a limit, a stop string or a cancellation cut, which fed no
-/// end-of-turn position.
+/// whatever the template rendered for it. The template's own role header and
+/// everything else it writes stay: the model did not write them.
+///
+/// The run ends at the turn's end: **through the end-of-turn token** for a
+/// reply the model ended itself (that position was fed, and the token is the
+/// template's own bytes for it, since the log does not keep the sampled EOS),
+/// and at the reply's last id for one a limit, a stop string or a cancellation
+/// cut, which fed no end-of-turn position.
 ///
 /// So the next prompt's ids are the session's log wherever a reply is matched,
 /// whatever the template would have rewritten — Qwen's `reasoning_content|trim`,
 /// a re-split of an evicted reply, an engine-closed empty block. No restore, no
 /// replay, no tail rewind.
 ///
-/// `false` where the span does not admit it: the turn's end is not in the
-/// span's text, or the reply's text is not what the template put there (a
-/// client's edit, a template that rewrote it past recognition). The caller
-/// then aligns segment by segment, which is the pre-Q1 path and still
-/// splices what it can.
+/// `eot` is the end-of-turn token the template writes after an assistant turn
+/// and the id it encodes to, read at load ([`Constants::eot`]).
+///
+/// `false` — the caller's segment alignment takes the span instead, which is
+/// the pre-Q1 path and still splices what it can — wherever this cannot speak
+/// for the span exactly:
+/// - the reply's text is not in the template's rendering of its message
+///   verbatim (the template trimmed, stripped or re-split it; the client
+///   edited it);
+/// - it is there more than once, so which occurrence the ids belong to would
+///   be a guess;
+/// - the ids do not decode to exactly the text they would replace.
 fn emit_turn(
     text: &Text,
     rendered: &str,
     region: Range<usize>,
     reply: &Arc<Reply>,
+    eot: Option<(u32, &str)>,
     runs: &mut Vec<Run>,
 ) -> bool {
     let span = &rendered[region.clone()];
-    // The turn's end in the span: the end-of-turn text the template wrote
-    // after the body. Taken from the template's own bytes, since the log does
-    // not keep the sampled EOS (`lloom::nn::DecodeOut::ids` excludes it); on
-    // every supported checkpoint it is the same token.
-    let Some(eot) = text.eos_ids.first().and_then(|&id| decode(text, &[id])) else {
-        return false;
-    };
-    if eot.is_empty() {
+    // The turn's text as the model emitted it, and the template's rendering
+    // of this message. The emitted text must be there verbatim: anything else
+    // — a trim, a strip, a re-split, a client's edit — is a span this cannot
+    // speak for, and the caller's segment alignment takes it.
+    let emitted = reply.text.as_str();
+    if emitted.is_empty() {
         return false;
     }
-    let Some(at) = span.rfind(eot.as_str()) else {
+    let Some(off) = span.find(emitted) else {
         return false;
     };
-    // The body the template rendered for this turn: past the role header, up
-    // to the end-of-turn token. The header is the template's and stays.
-    let body = span[..at].trim_end();
-    // The model's own text for the turn, as the log decoded it, and the
-    // template's for the same stretch: they must name the same reply, or this
-    // is not the turn the model emitted.
-    let emitted = reply.text.trim();
-    let start = match body.rfind(emitted) {
-        Some(s) => region.start + s,
-        // The template rewrote the body (a trim, a strip, a re-split). The
-        // span is still this reply's turn: its content must be in there, or
-        // nothing identifies it.
-        None => {
-            let probe = reply.content_text.trim();
-            if probe.is_empty() || !body.contains(probe) {
-                return false;
-            }
-            // The body begins past the role header: the template's first
-            // newline after the span's opening.
-            match span.find('\n') {
-                Some(n) => region.start + n + 1,
-                None => return false,
-            }
+    // Exactly one occurrence, or which one the ids belong to is a guess.
+    if span[off + emitted.len()..].contains(emitted) {
+        return false;
+    }
+    let start = region.start + off;
+    let body_end = start + emitted.len();
+    // Through the end-of-turn token where the model ended the turn itself:
+    // that position was fed, and the token is the template's own bytes for it
+    // (the log does not keep the sampled EOS). Only when the template writes
+    // it immediately after the reply, with nothing of its own between.
+    let through = match eot {
+        Some((id, marker))
+            if reply.stop == crate::Stop::Eos && rendered[body_end..].starts_with(marker) =>
+        {
+            Some((id, marker.len()))
         }
+        _ => None,
     };
-    let end = region.start + at + eot.len();
-    if start >= end {
+    let (text_end, ids) = match through {
+        Some((id, len)) => {
+            let mut ids = reply.ids.clone();
+            ids.push(id);
+            (body_end + len, ids)
+        }
+        None => (body_end, reply.ids.clone()),
+    };
+    if ids.is_empty() {
         return false;
     }
-    // The ids: the reply as sampled, and the end-of-turn id only where the
-    // model ended the turn itself.
-    let mut ids: Vec<u32> = reply.ids.clone();
-    let through_eot = reply.stop == crate::Stop::Eos;
-    if !through_eot {
-        // The turn is the reply's ids alone; the template's end-of-turn text
-        // after them is the template's, encoded as text.
-        runs.push(Run {
-            text: start..region.start + at,
-            ids: 0..reply.ids.len(),
-            reply: Arc::clone(reply),
-        });
-        return !reply.ids.is_empty();
+    // The ids must decode to exactly the text they replace, or the prompt
+    // would carry ids whose text is not what the template rendered.
+    match decode(text, &ids) {
+        Some(d) if d == rendered[start..text_end] => {}
+        _ => return false,
     }
-    let Some(&eot_id) = text.eos_ids.first() else {
-        return false;
-    };
-    ids.push(eot_id);
+    let n = ids.len();
     runs.push(Run {
-        text: start..end,
-        ids: 0..ids.len(),
+        text: start..text_end,
+        ids: 0..n,
         reply: Arc::new(Reply {
             ids,
             ..Reply::clone(reply)

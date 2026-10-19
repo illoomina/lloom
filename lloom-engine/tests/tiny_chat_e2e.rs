@@ -3043,11 +3043,16 @@ fn a_reply_cut_inside_its_reasoning_continues_by_the_arm() {
 /// A reply cut inside its reasoning, through `lloom serve` on the tiny
 /// Qwen4-exp with thinking on (its template keeps a past reply's
 /// reasoning), streamed and not, then given back with its reasoning apart.
-/// - What the client gets: the reasoning as `content`, with no marker (the
-///   prompt opened the block); streamed, the deltas are `content` only and
-///   join to the unstreamed reply, the last event carries no delta and the
-///   finish reason, and `usage` counts every id the run generated — past a
-///   stop string too, where the frontier's `accepted` is fewer.
+/// - What the client gets (decision 51 Q2): the reasoning in
+///   `message.reasoning_content`, with no marker (the prompt opened the block
+///   and no end marker was sampled), and `content` the answer — empty, since
+///   the run never left the block. Streamed, the deltas are
+///   `reasoning_content` only and join to the unstreamed reply, and the last
+///   event carries no delta and the finish reason.
+/// - `usage.completion_tokens` is the completion the client received
+///   (decision 51 Q4): every generated id on the length stop, and the
+///   frontier's `accepted` — fewer — past a stop string, where the generated
+///   count stays in `timings`.
 /// - Given back as `reasoning_content` with the content empty, the reply is
 ///   ours (`history_matched`), its ids are the prompt's, and the next turn
 ///   extends (a length stop) or goes back to where the delivered ids end (a
@@ -3075,10 +3080,7 @@ fn a_reply_cut_inside_its_reasoning_sent_back_apart_is_ours() {
     };
     let q = json!([{ "role": "user", "content": "Probe." }]);
     let probe = turn(q.clone(), json!({ "max_tokens": 12 }));
-    let text = probe["choices"][0]["message"]["content"]
-        .as_str()
-        .unwrap()
-        .to_string();
+    let text = reasoning_of(&probe["choices"][0]["message"]);
     let stop = (2..=4)
         .flat_map(|w| (3..text.len().saturating_sub(w)).map(move |i| (i, w)))
         .map(|(i, w)| (i, text[i..i + w].to_string()))
@@ -3095,34 +3097,42 @@ fn a_reply_cut_inside_its_reasoning_sent_back_apart_is_ours() {
         streamed["stream"] = json!(true);
         let events = sse(&server, &streamed);
         let one = turn(q.clone(), extra.clone());
-        let delivered = one["choices"][0]["message"]["content"]
-            .as_str()
-            .unwrap()
-            .to_string();
+        let message = &one["choices"][0]["message"];
+        let delivered = reasoning_of(message);
         let r1 = one["choices"][0]["token_ids"].as_array().unwrap().clone();
         let p1 = one["prompt_token_ids"].as_array().unwrap().clone();
         assert!(
             !delivered.is_empty()
                 && !delivered.contains("<think>")
                 && !delivered.contains("</think>"),
-            "{cause}: the reasoning as content, no marker: {delivered:?}"
+            "{cause}: the reasoning apart, no marker: {delivered:?}"
+        );
+        // Q2: the answer field is empty — the run never left the block.
+        assert_eq!(
+            message["content"].as_str().unwrap_or(""),
+            "",
+            "{cause}: a reply cut inside its reasoning has no answer: {one}"
         );
         assert_eq!(one["choices"][0]["finish_reason"], finish, "{cause}: {one}");
         let deltas: Vec<&Value> = events
             .iter()
             .map(|e| &e["choices"][0]["delta"])
-            .filter(|d| d.get("content").is_some())
+            .filter(|d| d.get("reasoning_content").is_some() || d.get("content").is_some())
             .collect();
         let joined: String = deltas
             .iter()
-            .map(|d| d["content"].as_str().unwrap())
+            .map(|d| d["reasoning_content"].as_str().unwrap_or(""))
             .collect();
         assert_eq!(joined, delivered, "{cause}: the deltas join to the reply");
+        // Q2: every delta of this reply is reasoning — it never left the
+        // block — and a delta carries only the fields it has text for.
         assert!(
-            deltas
-                .iter()
-                .all(|d| d.as_object().unwrap().keys().all(|k| k == "content")),
-            "{cause}: content deltas only: {events:?}"
+            deltas.iter().all(|d| d
+                .as_object()
+                .unwrap()
+                .keys()
+                .all(|k| k == "reasoning_content")),
+            "{cause}: reasoning deltas only: {events:?}"
         );
         let last = events.last().unwrap();
         assert_eq!(last["choices"][0]["delta"], json!({}), "{cause}: {last}");
@@ -3138,11 +3148,28 @@ fn a_reply_cut_inside_its_reasoning_sent_back_apart_is_ours() {
             r1.len(),
             last["usage"]
         );
+        // Q4: the tokens of the completion the client received. On the
+        // length stop every generated id was delivered; past a stop string
+        // the accepted frontier is fewer, and the generated count stays in
+        // `timings`.
+        let accepted = frontier["accepted"].as_u64().unwrap();
         assert_eq!(
             usage["completion_tokens"],
-            json!(r1.len()),
-            "{cause}: {one}"
+            json!(accepted),
+            "{cause}: completion_tokens is the accepted frontier: {one}"
         );
+        assert_eq!(
+            one["timings"]["tokens"].as_array().map(Vec::len),
+            Some(r1.len()),
+            "{cause}: the generated count stays in timings: {one}"
+        );
+        match cause {
+            "length" => assert_eq!(accepted as usize, r1.len(), "{cause}: all delivered"),
+            _ => assert!(
+                (accepted as usize) < r1.len(),
+                "{cause}: the stop withheld ids: {frontier} {usage}"
+            ),
+        }
         assert_eq!(last["usage"], *usage, "{cause}: streamed and not");
 
         let two = turn(
@@ -3170,8 +3197,7 @@ fn a_reply_cut_inside_its_reasoning_sent_back_apart_is_ours() {
                 assert_eq!(t["outcome"], "extend", "{cause}: {t}");
             }
             _ => {
-                let accepted = frontier["accepted"].as_u64().unwrap() as usize;
-                assert!(accepted < r1.len(), "{cause}: {frontier}");
+                let accepted = accepted as usize;
                 assert_eq!(kept, p1.len() + accepted, "{cause}: to the delivered ids");
                 assert!(
                     matches!(t["outcome"].as_str(), Some("rewind" | "restore")),
@@ -3253,15 +3279,25 @@ fn serve_keeps_past_reasoning_by_default_and_strips_it_on_request() {
                 };
                 let q = json!([{ "role": "user", "content": format!("Probe {option} {think}.") }]);
                 let one = turn(q.clone());
-                let delivered = one["choices"][0]["message"]["content"]
-                    .as_str()
-                    .unwrap()
-                    .to_string();
+                let message = &one["choices"][0]["message"];
+                // The end marker is biased off, so a thinking reply never
+                // leaves its block: its text is `reasoning_content` since
+                // decision 51 Q2, and `content` is the answer (empty).
+                let delivered = if think {
+                    reasoning_of(message)
+                } else {
+                    message["content"].as_str().unwrap().to_string()
+                };
                 assert!(!delivered.contains("</think>"), "{at}: {delivered:?}");
                 let p1 = one["prompt_token_ids"].as_array().unwrap().clone();
                 let r1 = one["choices"][0]["token_ids"].as_array().unwrap().clone();
-                let two = turn(json!([q[0], { "role": "assistant", "content": delivered },
-                                      { "role": "user", "content": "Again." }]));
+                // Sent back in the field it arrived in.
+                let back = if think {
+                    json!({ "role": "assistant", "content": "", "reasoning_content": delivered })
+                } else {
+                    json!({ "role": "assistant", "content": delivered })
+                };
+                let two = turn(json!([q[0], back, { "role": "user", "content": "Again." }]));
                 let p2 = two["prompt_token_ids"].as_array().unwrap().clone();
                 let log: Vec<Value> = p1.iter().chain(&r1).cloned().collect();
                 let left = lcp(&p2, &log);
@@ -3302,22 +3338,43 @@ fn serve_keeps_past_reasoning_by_default_and_strips_it_on_request() {
                 if engine_closed {
                     rendered.push(end);
                 }
-                assert_eq!(
-                    p2,
-                    json!(rendered).as_array().unwrap().clone(),
-                    "{at}: the rendered history"
+                // Decision 51 Q1 inverts what this used to assert. The
+                // rendered history is no longer the template's canonical text
+                // for a matched reply: it is the ids the model emitted, with
+                // the template rendering only what the model did not write.
+                // So `p2` equals the template's render exactly where the
+                // template would have written the reply the same way, and
+                // equals the LOG where it would have rewritten it — which is
+                // the stronger property, and the one asserted here.
+                let canonical = json!(rendered).as_array().unwrap().clone();
+                eprintln!(
+                    "PERSIST-SERVE {at}: p2 == template render: {}; p2 keeps the log to {left} of {}",
+                    p2 == canonical,
+                    log.len()
                 );
                 if engine_closed {
-                    assert_eq!(left, p1.len() - 2, "{at}: the engine's empty block");
+                    // The engine closed the block in the prompt; the template
+                    // writes no block for a reply without reasoning, so the
+                    // emitted turn carries that marker and the log extends.
+                    assert_eq!(left, log.len(), "{at}: the emitted turn carries the marker");
+                    assert_eq!(t["outcome"], "extend", "{at}: {t}");
                 } else if kept {
                     assert_eq!(left, log.len(), "{at}: the history keeps the reply");
                     assert_eq!(t["outcome"], "extend", "{at}: {t}");
+                    assert_eq!(
+                        p2, canonical,
+                        "{at}: kept, the template writes the reply as the model did"
+                    );
                 } else {
+                    // Stripped (opt-in): the template drops the reasoning, so
+                    // the span is not the emitted turn and the request goes
+                    // back before the prompt's end.
                     assert!(left < p1.len(), "{at}: stripped, before the prompt's end");
                     assert!(
                         matches!(t["outcome"].as_str(), Some("restore" | "rewind")),
                         "{at}: {t}"
                     );
+                    assert_eq!(p2, canonical, "{at}: stripped, the template's own render");
                 }
             }
         }

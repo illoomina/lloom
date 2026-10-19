@@ -692,13 +692,18 @@ fn discover_shards(first: &PathBuf) -> Vec<PathBuf> {
 }
 
 fn main() -> Result<()> {
-    let args = Args::parse();
+    execute(Args::parse())
+}
+
+fn execute(args: Args) -> Result<()> {
     // The profile the run's mode names (`profiles-and-memory-design.md` §3):
     // `Ring` under `--mtp` (the verify window's rings), `Paged` when the
     // rows share a pool (`--rows N --rows-pool`, or `--mtp` over rows); the
     // regime from the contract the harness pins below.
-    candle::tuning::pin_contract(candle::tuning::Contract::Deterministic)
-        .map_err(anyhow::Error::msg)?;
+    candle_examples::pin_profiled_contract(
+        "qwen4exp-chat",
+        candle::tuning::Contract::Deterministic,
+    )?;
     use lloom::profile::{NoRewind, One, Paged, Rewind as _, Ring, Rows as _};
     let key = lloom::profile::ProfileKey::at_contract(
         if args.mtp.is_some() || args.dflash.is_some() {
@@ -1037,11 +1042,10 @@ fn rows_gate<P: QwenShape, R: ExpertResidency + HasStreamStats>(
                 s.bytes_loaded,
                 s.hits as f64 / (s.hits + s.misses).max(1) as f64,
             );
+            // Same production formatter; preserve the original snapshot timing.
             println!(
-                "PREFETCH run={run} on={} spec_ahead={} issued={} staged={} used={} wasted={} stale={} bytes={} parked={} stage_read_gb_s={:.2} direct_read_gb_s={:.2}",
-                args.prefetch, model.spec_ahead(), pf.issued, pf.staged, pf.used, pf.wasted, pf.stale, pf.bytes, pf.parked,
-                pf.stage_read_bytes as f64 / pf.stage_read_ns.max(1) as f64,
-                pf.direct_read_bytes as f64 / pf.direct_read_ns.max(1) as f64
+                "{}",
+                render_prefetch_line(run, args.prefetch, model.spec_ahead(), &pf)
             );
         }
         // `--mtp` with `--rows N`: the same prompts through the speculative
@@ -1145,11 +1149,57 @@ fn prefetch_line<P: QwenShape, R: ExpertResidency + HasStreamStats>(
 ) {
     let pf = model.prefetch_stats();
     println!(
-        "PREFETCH run={run} on={} spec_ahead={} issued={} staged={} used={} wasted={} stale={} bytes={} parked={} stage_read_gb_s={:.2} direct_read_gb_s={:.2}",
-        args.prefetch, model.spec_ahead(), pf.issued, pf.staged, pf.used, pf.wasted, pf.stale, pf.bytes, pf.parked,
-        pf.stage_read_bytes as f64 / pf.stage_read_ns.max(1) as f64,
-        pf.direct_read_bytes as f64 / pf.direct_read_ns.max(1) as f64
+        "{}",
+        render_prefetch_line(run, args.prefetch, model.spec_ahead(), &pf)
     );
+}
+
+/// The actual prefetch report, shared by row/single-row paths. No-Metal has
+/// no prefetch timing source; do not report its absence as measured zero GB/s.
+fn render_prefetch_line(
+    run: usize,
+    on: bool,
+    spec_ahead: usize,
+    pf: &lloom::nn::expert_stream::PrefetchStats,
+) -> PrefetchLine<'_> {
+    PrefetchLine {
+        run,
+        on,
+        spec_ahead,
+        pf,
+    }
+}
+
+// Borrowed formatting only: preserve the report's original snapshot and avoid
+// adding a heap allocation to the Metal reporting path.
+struct PrefetchLine<'a> {
+    run: usize,
+    on: bool,
+    spec_ahead: usize,
+    pf: &'a lloom::nn::expert_stream::PrefetchStats,
+}
+impl std::fmt::Display for PrefetchLine<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let pf = self.pf;
+        write!(f, "PREFETCH run={} on={} spec_ahead={} issued={} staged={} used={} wasted={} stale={} bytes={} parked={}",
+            self.run, self.on, self.spec_ahead, pf.issued, pf.staged, pf.used, pf.wasted, pf.stale, pf.bytes, pf.parked)?;
+        #[cfg(feature = "metal")]
+        {
+            write!(
+                f,
+                " stage_read_gb_s={:.2} direct_read_gb_s={:.2}",
+                pf.stage_read_bytes as f64 / pf.stage_read_ns.max(1) as f64,
+                pf.direct_read_bytes as f64 / pf.direct_read_ns.max(1) as f64
+            )
+        }
+        #[cfg(not(feature = "metal"))]
+        {
+            write!(
+                f,
+                " stage_read_gb_s=unavailable direct_read_gb_s=unavailable"
+            )
+        }
+    }
 }
 
 /// The streamed tier's counters (cumulative over the process's runs) and
@@ -1317,9 +1367,9 @@ fn driver_gate<P: QwenShape, R: ExpertResidency + HasStreamStats>(
                     traced.push((before + 1, trace_take()));
                 }
                 if produced >= TRACE_FROM && produced < TRACE_FROM + TRACE_STEPS {
-                    trace_set(true, Some(format!("decode[{}]", produced + 1)));
+                    trace_set(true, Some(format!("decode[{}]", produced + 1)))?;
                 } else {
-                    trace_set(false, None);
+                    trace_set(false, None)?;
                     let _ = trace_take();
                 }
             }
@@ -2186,16 +2236,17 @@ fn trace_requested() -> bool {
     }
 }
 
-fn trace_set(on: bool, region: Option<String>) {
+fn trace_set(on: bool, region: Option<String>) -> candle::Result<()> {
     #[cfg(feature = "metal")]
     {
         candle::kernels::metal::trace::set_region(region);
-        candle::kernels::metal::trace::set_recording(on);
+        candle::kernels::metal::trace::set_recording(on)?;
     }
     #[cfg(not(feature = "metal"))]
     {
         let _ = (on, region);
     }
+    Ok(())
 }
 
 fn trace_take() -> TraceStep {
@@ -2281,3 +2332,75 @@ fn trace_census(run: usize, step: usize, d: &TraceStep) {
 
 #[cfg(not(feature = "metal"))]
 fn trace_census(_run: usize, _step: usize, _d: &TraceStep) {}
+
+#[cfg(all(test, not(feature = "metal")))]
+mod cpu_capability_tests {
+    use super::*;
+    #[test]
+    fn unavailable_prefetch_timing_is_not_a_measured_zero() {
+        let pf = lloom::nn::expert_stream::PrefetchStats {
+            issued: 7,
+            staged: 5,
+            ..Default::default()
+        };
+        let line = render_prefetch_line(2, true, 3, &pf).to_string();
+        assert!(line.contains("issued=7 staged=5"));
+        assert!(line.ends_with("stage_read_gb_s=unavailable direct_read_gb_s=unavailable"));
+        assert!(!line.contains("gb_s=0.00"));
+    }
+    #[test]
+    fn requested_gpu_diagnostic_refuses_at_actual_entry_before_gguf_tokenizer_or_hotlist() {
+        candle::isolation::claim("Qwen entry diagnostic refusal");
+        std::env::set_var("CANDLE_METAL_PROFILE", "1");
+        std::env::set_var("LLOOM_PROFILE", "deterministic");
+        let args = Args::try_parse_from([
+            "qwen4exp-chat",
+            "--cpu",
+            "--gguf",
+            "/dev/null/not-a-gguf",
+            "--tokenizer",
+            "/dev/null/not-a-tokenizer",
+            "--hotlist",
+            "/dev/null/not-a-hotlist",
+        ])
+        .unwrap();
+        let error = execute(args).unwrap_err().to_string();
+        let capability = if candle::tuning::PROFILE_INSTRUMENTS {
+            "metal"
+        } else {
+            "profile"
+        };
+        assert!(
+            error.contains(&format!("{capability} instrumentation is not compiled")),
+            "{error}"
+        );
+        if candle::tuning::PROFILE_INSTRUMENTS {
+            assert!(error.contains("qwen4exp-chat"), "{error}");
+        }
+    }
+    #[test]
+    fn help_remains_available_without_metal() {
+        let error = Args::try_parse_from(["qwen4exp-chat", "--help"]).unwrap_err();
+        assert_eq!(error.kind(), clap::error::ErrorKind::DisplayHelp);
+        assert!(error.to_string().contains("--prefetch"));
+    }
+}
+
+#[cfg(all(test, feature = "metal"))]
+mod metal_prefetch_report_tests {
+    use super::*;
+    #[test]
+    fn metal_prefetch_report_preserves_existing_numeric_format() {
+        let pf = lloom::nn::expert_stream::PrefetchStats {
+            issued: 7,
+            staged: 5,
+            stage_read_bytes: 400,
+            stage_read_ns: 200,
+            direct_read_bytes: 300,
+            direct_read_ns: 100,
+            ..Default::default()
+        };
+        assert_eq!(render_prefetch_line(2, true, 3, &pf).to_string(),
+            "PREFETCH run=2 on=true spec_ahead=3 issued=7 staged=5 used=0 wasted=0 stale=0 bytes=0 parked=0 stage_read_gb_s=2.00 direct_read_gb_s=3.00");
+    }
+}

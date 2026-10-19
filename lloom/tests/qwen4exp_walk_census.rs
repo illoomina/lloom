@@ -208,10 +208,10 @@ fn check(
             .open()
             .expect("the census window");
         let _ = lloom_tensor::kernels::metal::trace::take_dispatches();
-        lloom_tensor::kernels::metal::trace::set_recording(true);
+        lloom_tensor::kernels::metal::trace::set_recording(true)?;
         m.decode(&tok, &mut cache, &mut ())?;
         dev.synchronize()?;
-        lloom_tensor::kernels::metal::trace::set_recording(false);
+        lloom_tensor::kernels::metal::trace::set_recording(false)?;
         let order: Vec<String> = lloom_tensor::kernels::metal::trace::take_dispatches()
             .iter()
             .map(|d| d.pipeline.clone())

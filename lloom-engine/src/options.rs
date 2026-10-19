@@ -670,9 +670,7 @@ impl TuningOptions {
     /// already been read (a knob a `OnceLock` site took is fixed; the report
     /// line would otherwise lie about it).
     pub fn install(&self) -> Result<(), String> {
-        lloom_tensor::tuning::install(self.tensor()).map_err(|_| {
-            "tuning: the tensor crate's knobs were already read before install".to_string()
-        })?;
+        lloom_tensor::tuning::install(self.tensor()).map_err(|error| error.to_string())?;
         lloom::tuning::install(self.lloom()).map_err(|_| {
             "tuning: the model crate's knobs were already read before install".to_string()
         })

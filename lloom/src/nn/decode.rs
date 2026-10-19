@@ -752,11 +752,12 @@ pub struct DecodeStats {
     /// The overrun's forwards launched nothing (the gate fired), so the
     /// session reconciles it without a rewind horizon.
     pub overrun_unwritten: bool,
-    /// The prefill's dispatch census, `(kernel, count)`, under
-    /// `CANDLE_METAL_PROFILE=1`; empty otherwise and off Metal.
-    pub prefill_census: Vec<(String, u64)>,
+    /// The prefill's dispatch census, `(kernel, count)`, when detailed Metal
+    /// recording is active in a debug/profile build. `None` means unavailable;
+    /// `Some([])` means an observed window contained no dispatches.
+    pub prefill_census: Option<Vec<(String, u64)>>,
     /// Step 0's dispatch census, on the same terms.
-    pub step0_census: Vec<(String, u64)>,
+    pub step0_census: Option<Vec<(String, u64)>>,
     /// Under [`Session::decode_batched`], the number of live rows in each
     /// step this sequence took part in — one entry per `step_ns` entry. Empty
     /// on the single-sequence bodies.
@@ -1004,12 +1005,12 @@ impl HostFeedTrace {
 }
 
 /// The per-kernel dispatch counts so far, under `CANDLE_METAL_PROFILE=1`.
-/// `None` when the census is off, which is every timed run.
+/// `None` when detailed recording is unavailable or off.
 fn census_snapshot() -> Option<std::collections::HashMap<String, u64>> {
-    #[cfg(feature = "metal")]
+    #[cfg(all(feature = "metal", any(debug_assertions, feature = "profile")))]
     {
         use lloom_tensor::kernels::metal::profile;
-        if profile::enabled() {
+        if profile::recorder_enabled() {
             return Some(profile::snapshot().by_label.into_iter().collect());
         }
     }
@@ -1020,9 +1021,9 @@ fn census_snapshot() -> Option<std::collections::HashMap<String, u64>> {
 fn census_delta(
     before: &Option<std::collections::HashMap<String, u64>>,
     after: Option<std::collections::HashMap<String, u64>>,
-) -> Vec<(String, u64)> {
+) -> Option<Vec<(String, u64)>> {
     let (Some(before), Some(after)) = (before, after) else {
-        return Vec::new();
+        return None;
     };
     let mut out: Vec<(String, u64)> = after
         .into_iter()
@@ -1032,7 +1033,7 @@ fn census_delta(
         })
         .collect();
     out.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
-    out
+    Some(out)
 }
 
 /// Where one decode step's host time went, for the first few steps of a run.
@@ -2046,6 +2047,7 @@ impl<'m, M: CausalLM> Session<'m, M> {
         // step.
         let hot_thread = HotThread::claim();
         let mut stats = DecodeStats {
+            #[cfg(any(debug_assertions, feature = "profile"))]
             step_ns: Vec::with_capacity(opts.max_tokens),
             sample_ns: Vec::with_capacity(if opts.sample_split {
                 opts.max_tokens
@@ -3446,14 +3448,19 @@ impl<'m, M: CausalLM> Session<'m, M> {
             // The census is one round's worth of allocation; take it once,
             // past the warm-up rounds, so the breakdown carries which kernels
             // each phase dispatches and not only how many.
-            let probe = RoundProbe {
+            let mut probe = RoundProbe {
                 sync: if opts.sample_split {
                     Some(&device)
                 } else {
                     None
                 },
-                census: opts.sample_split && stats.steps == CENSUS_ROUND,
+                census: false,
             };
+            // This automatic enrichment must not turn host/scalar sample_split
+            // into an unsupported explicit detailed-census request.
+            probe.census = opts.sample_split
+                && stats.steps == CENSUS_ROUND
+                && probe.detailed_recorder_active();
             // The verify is a planned pass of `K + 1` positions
             // (`DESIGN.md` §9.2aa): the drafter's own forwards and the
             // observe are OUTSIDE it — they run on the drafter's model and
@@ -4417,6 +4424,83 @@ mod adaptive_lead_tests {
         assert_eq!(lead(4, 0, true), (4, 8, 12), "queued follows the batching");
         assert_eq!(lead(8, 2, true), (8, 2, 10), "a shallower queue, batching kept");
         assert_eq!(lead(4, 2, false).2, 0, "no lead off the adaptive commit");
+    }
+}
+
+#[cfg(test)]
+mod census_tests {
+    use super::{census_delta, census_snapshot, DecodeStats};
+    use std::collections::HashMap;
+
+    #[test]
+    fn a_missing_census_endpoint_is_unavailable_not_an_empty_window() {
+        let empty = Some(HashMap::new());
+        assert_eq!(census_delta(&None, None), None);
+        assert_eq!(census_delta(&None, empty.clone()), None);
+        assert_eq!(census_delta(&empty, None), None);
+        let stats = DecodeStats::default();
+        assert_eq!(stats.prefill_census, None);
+        assert_eq!(stats.step0_census, None);
+    }
+
+    #[test]
+    fn an_observed_window_with_no_dispatches_is_available_and_empty() {
+        let before = Some(HashMap::from([("old".to_owned(), 3)]));
+        assert_eq!(census_delta(&before, before.clone()), Some(Vec::new()));
+        assert_eq!(
+            census_delta(&Some(HashMap::new()), Some(HashMap::new())),
+            Some(Vec::new())
+        );
+    }
+
+    #[test]
+    fn an_observed_window_reports_only_its_dispatches_in_stable_order() {
+        let before = Some(HashMap::from([("old".to_owned(), 3), ("a".to_owned(), 2)]));
+        let after = Some(HashMap::from([
+            ("old".to_owned(), 3),
+            ("a".to_owned(), 4),
+            ("b".to_owned(), 2),
+            ("c".to_owned(), 5),
+        ]));
+        assert_eq!(
+            census_delta(&before, after),
+            Some(vec![("c".into(), 5), ("a".into(), 2), ("b".into(), 2)])
+        );
+    }
+
+    #[test]
+    fn disabled_recording_does_not_publish_an_empty_census() {
+        #[cfg(feature = "metal")]
+        lloom_tensor::tuning::install(lloom_tensor::tuning::Tuning::default()).unwrap();
+        assert_eq!(census_snapshot(), None);
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn scalar_profiling_does_not_claim_an_unavailable_decode_census() {
+        use lloom_tensor::kernels::metal::profile;
+        use std::sync::Arc;
+
+        let mut tuning = lloom_tensor::tuning::Tuning::default();
+        tuning.instrument.profile = true;
+        lloom_tensor::tuning::install(tuning).unwrap();
+        profile::reset();
+        assert!(profile::enabled());
+        let before = census_snapshot();
+        let label: Arc<str> = Arc::from("decode-census-control");
+        profile::record_dispatch(Some(&label), 0);
+        let after = census_snapshot();
+        assert_eq!(profile::snapshot().dispatches, 1);
+        if cfg!(any(debug_assertions, feature = "profile")) {
+            assert_eq!(before, Some(HashMap::new()));
+            assert_eq!(
+                census_delta(&before, after),
+                Some(vec![("decode-census-control".into(), 1)])
+            );
+        } else {
+            assert_eq!(before, None);
+            assert_eq!(after, None);
+        }
     }
 }
 

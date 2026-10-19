@@ -76,8 +76,8 @@ impl ContainerMemory {
     }
 
     /// The reserve kept inside the group for its other processes' growth:
-    /// a tenth of its limit. The host's 4 GiB floor protects the OS and the
-    /// UI, which live outside the group and are the host bound's concern.
+    /// a tenth of its limit, independent of the host reserve. The host's
+    /// reserve protects the OS outside the group and is a separate bound.
     pub fn reserve(&self) -> u64 {
         self.limit / 10
     }
@@ -212,6 +212,9 @@ impl HostMemory {
     }
 
     fn describe(&self) -> String {
+        if cfg!(target_os = "linux") {
+            return format!("MemAvailable {:.2}", gb(self.free));
+        }
         format!(
             "free {:.2} + inactive {:.2} + purgeable {:.2} + speculative {:.2}",
             gb(self.free),
@@ -341,24 +344,23 @@ fn footprint_impl(_pid: u32) -> Option<u64> {
     None
 }
 
-/// The default reserve's floor: what the OS and the UI keep on any machine.
+/// The macOS/explicit-working-set reserve floor; not the headless host floor.
 pub const RESERVE_FLOOR: u64 = 4 * GIB;
 
-/// Which term the reserve kept for the OS, the window server and every
-/// non-lloom process came from (`memory.md` §9.10): the one that was larger.
+/// Which term the reserve kept for the host OS and every non-lloom
+/// process came from (`memory.md` §9.10): the one that was larger.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReserveBasis {
     /// `memory.machine.reserve_gb`.
     Configured,
-    /// `hw.memsize − recommendedMaxWorkingSetSize`: the share of the machine
-    /// the OS keeps back from the GPU's working set, at or over the floor.
+    /// `hw.memsize − recommendedMaxWorkingSetSize`, at or over the floor.
     WorkingSet { working_set: u64 },
-    /// 10 % of the machine, where there is no Metal device to ask, at or
-    /// over the floor.
+    /// 10 % of the machine on macOS without Metal, at or over the floor.
     TenthOfMachine,
-    /// [`RESERVE_FLOOR`], because the default's own term — `term` bytes, the
-    /// working set's difference when `working_set` is known, else 10 % —
-    /// was smaller.
+    /// Non-macOS without an explicit working set: `max(256 MiB, 5 %)`.
+    HostFraction { fraction: u64 },
+    /// [`RESERVE_FLOOR`], because the working-set difference or macOS
+    /// tenth (`term`) was smaller.
     Floor { term: u64, working_set: Option<u64> },
 }
 
@@ -368,6 +370,10 @@ impl ReserveBasis {
             Self::Configured => "memory.machine.reserve_gb".into(),
             Self::WorkingSet { .. } => "memsize-working_set".into(),
             Self::TenthOfMachine => "10 %".into(),
+            Self::HostFraction { fraction } if fraction < GIB / 4 => {
+                format!("256 MiB floor; host: 5 % = {:.2} GB", gb(fraction))
+            }
+            Self::HostFraction { .. } => "host: 5 %".into(),
             Self::Floor { term, working_set } => format!(
                 "4 GiB floor; {} = {:.2} GB",
                 if working_set.is_some() {
@@ -381,10 +387,25 @@ impl ReserveBasis {
     }
 }
 
-/// The default reserve on a machine of `total` bytes: what the OS keeps back
-/// from the device's working set when there is one, else 10 %; never under
-/// [`RESERVE_FLOOR`]. The basis names the term that won.
+/// The host reserve: macOS keeps its working-set difference or 10 %, with
+/// [`RESERVE_FLOOR`]; other hosts without a working set keep 5 %, at least
+/// 256 MiB. A container's independent 10 % bound is not changed by this policy.
 pub fn default_reserve(total: u64, working_set: Option<u64>) -> (u64, ReserveBasis) {
+    default_reserve_for_host(total, working_set, cfg!(target_os = "macos"))
+}
+
+fn default_reserve_for_host(
+    total: u64,
+    working_set: Option<u64>,
+    macos: bool,
+) -> (u64, ReserveBasis) {
+    if !macos && working_set.is_none() {
+        let fraction = total / 20;
+        return (
+            fraction.max(GIB / 4),
+            ReserveBasis::HostFraction { fraction },
+        );
+    }
     let (term, basis) = match working_set {
         Some(ws) => (
             total.saturating_sub(ws),
@@ -643,20 +664,38 @@ impl Verdict {
             (None, false) => s.push_str("  available  UNKNOWN (not a zero-byte measurement)\n"),
         }
         let reserve = bytes_gb(self.reserve);
+        let purpose = if cfg!(target_os = "macos") {
+            "the OS and the UI"
+        } else {
+            "the host OS"
+        };
+        let device_purpose = if cfg!(target_os = "macos") {
+            "macOS and the UI"
+        } else {
+            "the host OS"
+        };
         match self.reserve_basis {
             ReserveBasis::WorkingSet { working_set } => s.push_str(&format!(
                 "  reserve    {reserve} = {:.2} GB memory - {:.2} GB GPU working set (over the 4 GiB floor), \
-                 for macOS and the UI\n",
+                 for {device_purpose}\n",
                 gb(self.total),
                 gb(working_set)
             )),
             ReserveBasis::TenthOfMachine => s.push_str(&format!(
                 "  reserve    {reserve} = 10 % of {:.2} GB (no Metal working set; over the 4 GiB floor), \
-                 for the OS and the UI\n",
+                 for {purpose}\n",
+                gb(self.total)
+            )),
+            ReserveBasis::HostFraction { fraction } if fraction < GIB / 4 => s.push_str(&format!(
+                "  reserve    {reserve} = the 256 MiB floor, over 5 % of {:.2} GB = {:.2} GB, for the host OS\n",
+                gb(self.total), gb(fraction)
+            )),
+            ReserveBasis::HostFraction { .. } => s.push_str(&format!(
+                "  reserve    {reserve} = 5 % of {:.2} GB (at or over the 256 MiB floor), for the host OS\n",
                 gb(self.total)
             )),
             ReserveBasis::Floor { term, working_set } => s.push_str(&format!(
-                "  reserve    {reserve} = the 4 GiB floor, over {} = {:.2} GB, for the OS and the UI\n",
+                "  reserve    {reserve} = the 4 GiB floor, over {} = {:.2} GB, for {purpose}\n",
                 match working_set {
                     Some(ws) => format!(
                         "{:.2} GB memory - {:.2} GB GPU working set",
@@ -668,7 +707,7 @@ impl Verdict {
                 gb(term)
             )),
             ReserveBasis::Configured => s.push_str(&format!(
-                "  reserve    {reserve} (memory.machine.reserve_gb), for the OS and the UI\n"
+                "  reserve    {reserve} (memory.machine.reserve_gb), for {purpose}\n"
             )),
         }
         if let Some(c) = self.container {
@@ -1471,7 +1510,7 @@ mod tests {
     #[test]
     fn the_default_reserve_is_what_the_os_keeps_from_the_working_set_and_never_under_4_gib() {
         assert_eq!(
-            default_reserve(M1MAX_MEMSIZE, Some(M1MAX_WORKING_SET)),
+            default_reserve_for_host(M1MAX_MEMSIZE, Some(M1MAX_WORKING_SET), true),
             (
                 13_056_688_128,
                 ReserveBasis::WorkingSet {
@@ -1480,25 +1519,140 @@ mod tests {
             )
         );
         // A working set at or past the machine's size leaves the floor.
-        assert_eq!(default_reserve(16 * GIB, Some(16 * GIB)).0, 4 * GIB);
-        assert_eq!(default_reserve(16 * GIB, Some(20 * GIB)).0, 4 * GIB);
+        assert_eq!(
+            default_reserve_for_host(16 * GIB, Some(16 * GIB), true).0,
+            4 * GIB
+        );
+        assert_eq!(
+            default_reserve_for_host(16 * GIB, Some(20 * GIB), true).0,
+            4 * GIB
+        );
         // No Metal device: a tenth of the machine, never under 4 GiB.
         assert_eq!(
-            default_reserve(64 * GIB, None),
+            default_reserve_for_host(64 * GIB, None, true),
             (64 * GIB / 10, ReserveBasis::TenthOfMachine)
         );
-        assert_eq!(default_reserve(16 * GIB, None).0, 4 * GIB);
-        assert_eq!(default_reserve(0, None).0, 4 * GIB);
+        assert_eq!(default_reserve_for_host(16 * GIB, None, true).0, 4 * GIB);
+        assert_eq!(default_reserve_for_host(0, None, true).0, 4 * GIB);
     }
 
-    /// A small CI host's figures: 9.70 GB and no Metal device.
+    #[test]
+    fn headless_reserve_is_small_host_aware_and_still_configurable() {
+        for (total, expected) in [
+            (8 * GIB, 8 * GIB / 20),
+            (5 * GIB, GIB / 4),
+            (GIB, GIB / 4),
+            (0, GIB / 4),
+        ] {
+            assert_eq!(
+                default_reserve_for_host(total, None, false),
+                (
+                    expected,
+                    ReserveBasis::HostFraction {
+                        fraction: total / 20
+                    }
+                )
+            );
+            let (reserve, basis) = default_reserve_for_host(total, None, false);
+            let mut v = Gate::new(GateConfig {
+                available: Some(total),
+                total: Some(total),
+                ..Default::default()
+            })
+            .decide(0, None, &[], None)
+            .unwrap();
+            // Render the headless policy on every test host, as the macOS
+            // floor's historical rendering control below does in reverse.
+            v.reserve = reserve;
+            v.reserve_basis = basis;
+            v.fits = v.room() >= 0;
+            if total / 20 < GIB / 4 {
+                assert!(
+                    v.line().contains("256 MiB floor; host: 5 %"),
+                    "{}",
+                    v.line()
+                );
+                assert!(v.describe().contains("the 256 MiB floor, over 5 %"));
+            } else {
+                assert_eq!(basis.tag(), "host: 5 %");
+                assert!(v.describe().contains("at or over the 256 MiB floor"));
+            }
+            assert!(!v.describe().contains("macOS"));
+            // An explicitly supplied device working set retains precedence.
+            assert_eq!(
+                default_reserve_for_host(total, Some(total), false).0,
+                4 * GIB
+            );
+        }
+        let dir = tmp_registry("host-reserve");
+        let admitted = gate(&dir, 8 * GIB, GIB)
+            .admit("configured", &Peak::new().with("weights", GIB))
+            .unwrap();
+        let v = admitted.verdict.as_ref().unwrap();
+        assert_eq!(v.reserve, GIB);
+        assert_eq!(v.reserve_basis, ReserveBasis::Configured);
+        assert!(v.describe().contains(if cfg!(target_os = "macos") {
+            "for the OS and the UI"
+        } else {
+            "for the host OS"
+        }));
+        drop(admitted);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Host defaults and the cgroup ceiling are separate bounds. A smaller
+    /// Linux host reserve must not shrink the container's own 10 % reserve.
+    #[test]
+    fn host_policy_preserves_the_independent_container_bound() {
+        let container = ContainerMemory {
+            limit: GIB,
+            usage: GIB / 2,
+            reclaimable: 0,
+        };
+        let snapshot = HostMemory {
+            total: 8 * GIB,
+            free: 6 * GIB,
+            container: Some(container),
+            ..Default::default()
+        };
+        let room = GIB - GIB / 2 - GIB / 10;
+        for need in [room, room + 1] {
+            let v = Gate::default()
+                .decide_with(need, None, &[], None, || Some(snapshot))
+                .unwrap();
+            assert_eq!(
+                v.reserve,
+                if cfg!(target_os = "macos") {
+                    4 * GIB
+                } else {
+                    8 * GIB / 20
+                }
+            );
+            assert_eq!(container.reserve(), GIB / 10);
+            assert!(v.container_binds());
+            assert_eq!(v.room(), room as i128);
+            assert_eq!(v.margin(), room as i128 - need as i128);
+            assert_eq!(v.fits, need == room);
+            if !cfg!(target_os = "macos") {
+                assert_eq!(
+                    v.reserve_basis,
+                    ReserveBasis::HostFraction {
+                        fraction: 8 * GIB / 20
+                    }
+                );
+                assert!(!v.describe().contains("macOS"));
+            }
+        }
+    }
+
+    /// Historical/macOS policy on a 9.70 GB host with no Metal device.
     /// Its tenth is 0.97 GB, so the 4 GiB floor is what the reserve is, and
     /// the line and the arithmetic say so rather than `(10 %)`.
     #[test]
     fn the_reserve_names_the_floor_when_the_floor_is_what_fired() {
         const SILVERBERRY: u64 = 9_700_000_000;
         assert_eq!(
-            default_reserve(SILVERBERRY, None),
+            default_reserve_for_host(SILVERBERRY, None, true),
             (
                 RESERVE_FLOOR,
                 ReserveBasis::Floor {
@@ -1509,7 +1663,7 @@ mod tests {
         );
         // A working set leaving less than the floor names its own term.
         assert_eq!(
-            default_reserve(16 * GIB, Some(14 * GIB)),
+            default_reserve_for_host(16 * GIB, Some(14 * GIB), true),
             (
                 RESERVE_FLOOR,
                 ReserveBasis::Floor {
@@ -1520,20 +1674,30 @@ mod tests {
         );
         // At the floor exactly, the term is what fired.
         assert_eq!(
-            default_reserve(40 * GIB, None).1,
+            default_reserve_for_host(40 * GIB, None, true).1,
             ReserveBasis::TenthOfMachine
         );
 
         let dir = tmp_registry("floor");
-        let error = Gate::new(GateConfig {
-            registry: Some(dir.clone()),
-            available: Some(4_000_000_000),
-            total: Some(SILVERBERRY),
-            ..Default::default()
-        })
-        .admit("floor", &Peak::new().with("load", 1))
-        .unwrap_err()
-        .to_string();
+        // Test the macOS floor's verdict/rendering on Linux too: the actual
+        // Linux default is now HostFraction, not this historical floor.
+        let macos = |mut v: Verdict| {
+            (v.reserve, v.reserve_basis) = default_reserve_for_host(SILVERBERRY, None, true);
+            v.fits = v.room() >= v.need as i128;
+            v
+        };
+        let v = macos(
+            Gate::new(GateConfig {
+                registry: Some(dir.clone()),
+                available: Some(4_000_000_000),
+                total: Some(SILVERBERRY),
+                ..Default::default()
+            })
+            .decide(1, Some(Peak::new().with("load", 1)), &[], None)
+            .unwrap(),
+        );
+        assert!(!v.fits);
+        let error = v.describe();
         assert!(
             error.contains(
                 "reserve    4294967296 B (4.29 GB) = the 4 GiB floor, over 10 % of 9.70 GB \
@@ -1541,14 +1705,16 @@ mod tests {
             ),
             "{error}"
         );
-        let v = Gate::new(GateConfig {
-            registry: Some(dir.clone()),
-            available: Some(8_850_000_000),
-            total: Some(SILVERBERRY),
-            ..Default::default()
-        })
-        .decide(0, None, &[], None)
-        .unwrap();
+        let v = macos(
+            Gate::new(GateConfig {
+                registry: Some(dir.clone()),
+                available: Some(8_850_000_000),
+                total: Some(SILVERBERRY),
+                ..Default::default()
+            })
+            .decide(0, None, &[], None)
+            .unwrap(),
+        );
         assert!(
             v.line()
                 .contains("reserve=4.29 GB (4 GiB floor; 10 % = 0.97 GB)"),
@@ -1716,7 +1882,14 @@ mod tests {
                         })
                     })
                     .unwrap();
-                assert_eq!(v.reserve, RESERVE_FLOOR);
+                assert_eq!(
+                    v.reserve,
+                    if cfg!(target_os = "macos") {
+                        RESERVE_FLOOR
+                    } else {
+                        485_000_000
+                    }
+                );
                 assert!(v.container_binds());
                 assert_eq!(v.room(), 2_500_000_000);
                 assert_eq!(v.fits, need <= 2_500_000_000, "{}", v.line());
@@ -1927,15 +2100,26 @@ mod tests {
             available: Some(6_920_000_000),
             total: Some(M1MAX_MEMSIZE),
             working_set,
+            // Reproduce the historical macOS no-device policy on other hosts,
+            // whose ordinary default deliberately no longer uses that reserve.
+            reserve: (!cfg!(target_os = "macos") && working_set.is_none())
+                .then_some(default_reserve_for_host(M1MAX_MEMSIZE, None, true).0),
             ..Default::default()
         };
 
         let tenth = Gate::new(config(None)).admit("tenth", &need).unwrap();
         let v = tenth.verdict.as_ref().unwrap();
         assert_eq!(v.reserve, 6_871_947_673);
-        assert_eq!(v.reserve_basis, ReserveBasis::TenthOfMachine);
+        assert_eq!(
+            v.reserve_basis,
+            if cfg!(target_os = "macos") {
+                ReserveBasis::TenthOfMachine
+            } else {
+                ReserveBasis::Configured
+            }
+        );
         assert!(v.fits, "{}", v.line());
-        assert!(v.line().contains("reserve=6.87 GB (10 %)"), "{}", v.line());
+        assert!(v.line().contains("reserve=6.87 GB"), "{}", v.line());
         drop(tenth);
 
         let error = Gate::new(config(Some(M1MAX_WORKING_SET)))

@@ -52,6 +52,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
+mod reasoning;
 mod turns;
 
 /// The seed passage the throughput cells tile into their prompt when no
@@ -199,7 +200,7 @@ fn run_configured(args: ServeArgs, transport: Option<tiny_http::TransportPolicy>
     let reuse_prefix = shape.reuse_prefix;
     // A non-generating decision model is served by the decision-only listener.
     if let Some(endpoint) = super::omni::serving::load(&options.load, &shape)? {
-        return run_decisions_configured(options, endpoint, DECISION_BODY_BYTES, transport);
+        return run_decisions_configured(options, endpoint, DECISION_BODY_BYTES, transport, true);
     }
     let (engine, model_path) = super::load_engine(&options.load, shape)?;
     run_owner(
@@ -239,6 +240,19 @@ pub fn run_loaded_with_transport_policy(
 ) -> Result<()> {
     policy.validate()?;
     run_owner(options, engine, model_path, None, Some(policy))
+}
+
+/// Startup provenance distinguishes configured options from the loaded owner's
+/// actual description. Supplied owners do not install the option tree.
+fn ready_configuration(options: &crate::EngineOptions, installed: bool, owner: Value) -> Value {
+    json!({
+        "schema_version": 1,
+        "frontend": "serve",
+        "options_installed": installed,
+        "configured_options": crate::option_tree::index().flat(options),
+        "owner": owner,
+        "request_resolution": "readback and sampling may resolve per request; read response timings",
+    })
 }
 
 fn run_owner(
@@ -306,6 +320,19 @@ fn run_owner(
     ) {
         anyhow::bail!("session.keep_logprobs: {why}");
     }
+    let configuration = ready_configuration(
+        &options,
+        load_facts.is_some(),
+        json!({
+            "description": description,
+            "readback": engine.readback().name(),
+            "kv_capacity": engine.kv_capacity(),
+            "batch": engine.batch(),
+            "prefill_tile": engine.prefill_tile(),
+            "prefix_reuse": engine.reuse_prefix(),
+            "capabilities": engine.capabilities().json(),
+        }),
+    );
     let (host, port) = (options.server.host.clone(), options.server.port);
 
     let server = listener((host.as_str(), port), transport)
@@ -332,7 +359,10 @@ fn run_owner(
 
     // The ready marker the sidecar runner waits for, on stdout and nothing
     // else on stdout before it. Everything the operator reads goes to stderr.
-    println!("{}", json!({"kind": "ready", "host": host, "port": port}));
+    println!(
+        "{}",
+        json!({"kind": "ready", "host": host, "port": port, "configuration": configuration})
+    );
     std::io::stdout().flush().ok();
     eprintln!("[serving on http://{host}:{port}]");
 
@@ -410,7 +440,7 @@ pub fn run_decisions_loaded(
     endpoint: Box<dyn super::decision_endpoint::DecisionEndpoint>,
     max_body_bytes: usize,
 ) -> Result<()> {
-    run_decisions_configured(options, endpoint, max_body_bytes, None)
+    run_decisions_configured(options, endpoint, max_body_bytes, None, false)
 }
 /// Same narrow endpoint and dispatcher, with explicit dependency disposal/I/O
 /// limits. Header/JSON/queue allocations and thread joining remain separate.
@@ -421,13 +451,14 @@ pub fn run_decisions_loaded_with_transport_policy(
     policy: tiny_http::TransportPolicy,
 ) -> Result<()> {
     policy.validate()?;
-    run_decisions_configured(options, endpoint, max_body_bytes, Some(policy))
+    run_decisions_configured(options, endpoint, max_body_bytes, Some(policy), false)
 }
 fn run_decisions_configured(
     options: crate::EngineOptions,
     endpoint: Box<dyn super::decision_endpoint::DecisionEndpoint>,
     max_body_bytes: usize,
     transport: Option<tiny_http::TransportPolicy>,
+    options_installed: bool,
 ) -> Result<()> {
     let read_bound = max_body_bytes
         .checked_add(1)
@@ -435,6 +466,16 @@ fn run_decisions_configured(
         .ok_or_else(|| {
             anyhow::anyhow!("decision transport body bound must be finite and nonzero")
         })?;
+    let configuration = ready_configuration(
+        &options,
+        options_installed,
+        json!({
+            "generation": false,
+            "decisions": true,
+            "model": endpoint.model_name(),
+            "input_modalities": endpoint.input_modalities(),
+        }),
+    );
     let host = options.server.host;
     let server = listener((host.as_str(), options.server.port), transport)
         .map_err(|error| anyhow::anyhow!("binding decision listener: {error}"))?;
@@ -445,7 +486,7 @@ fn run_decisions_configured(
     };
     println!(
         "{}",
-        json!({"kind":"ready","host":host,"port":port,"generation":false,"decisions":true})
+        json!({"kind":"ready","host":host,"port":port,"generation":false,"decisions":true,"configuration":configuration})
     );
     std::io::stdout().flush()?;
     loop {
@@ -660,6 +701,37 @@ fn run_decode(
         engine.complete_until(prompt_ids, params, on_fragment)
     } else {
         engine.complete_images_until(prompt_ids, images, params, on_fragment)
+    }
+}
+
+fn append_fields(to: &mut serde_json::Map<String, Value>, fields: serde_json::Map<String, Value>) {
+    for (key, value) in fields {
+        let previous = to.get(&key).and_then(Value::as_str).unwrap_or("");
+        to.insert(
+            key,
+            Value::String(format!("{previous}{}", value.as_str().unwrap_or(""))),
+        );
+    }
+}
+
+fn run_decode_observed(
+    engine: &dyn Served,
+    prompt_ids: &[u32],
+    images: &[DecodedImage],
+    params: &DecodeParams,
+    split: Option<&Arc<parking_lot::Mutex<reasoning::Reasoning>>>,
+    on_fragment: &mut (dyn FnMut(&str) -> bool + Send),
+) -> Result<Decoded> {
+    if let Some(split) = split {
+        engine.complete_observed(
+            prompt_ids,
+            images,
+            params,
+            on_fragment,
+            &mut |ids, text, from, decode| split.lock().observe(ids, text, from, decode),
+        )
+    } else {
+        run_decode(engine, prompt_ids, images, params, on_fragment)
     }
 }
 
@@ -1234,14 +1306,26 @@ fn chat_completions(shared: &Shared, v: &Value) -> Handled<Reply> {
             return_ids,
         })));
     }
+    let split = reasoning::Reasoning::for_chat(shared.engine.as_ref(), &prompt_ids)?
+        .map(|p| Arc::new(parking_lot::Mutex::new(p)));
+    let mut routed = serde_json::Map::<String, Value>::new();
     let started = Instant::now();
-    let decoded = run_decode(
+    let decoded = run_decode_observed(
         shared.engine.as_ref(),
         &prompt_ids,
         &images,
         &params,
-        &mut |_| true,
+        split.as_ref(),
+        &mut |text| {
+            if let Some(p) = &split {
+                append_fields(&mut routed, p.lock().push(text));
+            }
+            true
+        },
     )?;
+    if let Some(p) = &split {
+        append_fields(&mut routed, p.lock().finish());
+    }
     let elapsed = started.elapsed();
     let record_start = Instant::now();
     let frontier = prompt.as_ref().map(|p| {
@@ -1260,6 +1344,15 @@ fn chat_completions(shared: &Shared, v: &Value) -> Handled<Reply> {
         ms(elapsed),
     );
     let engine = shared.engine.as_ref();
+    let mut message = json!({"role": "assistant", "content": decoded.text});
+    if split.is_some() {
+        message["content"] = routed
+            .remove("content")
+            .unwrap_or(Value::String(String::new()));
+        if let Some(reasoning) = routed.remove("reasoning_content") {
+            message["reasoning_content"] = reasoning;
+        }
+    }
     let mut body = json!({
         "id": id,
         "object": "chat.completion",
@@ -1267,7 +1360,7 @@ fn chat_completions(shared: &Shared, v: &Value) -> Handled<Reply> {
         "model": model,
         "choices": [{
             "index": 0,
-            "message": { "role": "assistant", "content": decoded.text },
+            "message": message,
             "logprobs": if want_logprobs { chat_logprobs(engine, &decoded)? } else { Value::Null },
             "finish_reason": finish_reason(decoded.stop),
         }],
@@ -1636,31 +1729,71 @@ fn request_processors(
 /// arrive: chunked transfer through the request's raw writer, so a token is on
 /// the wire when the loop's commit drains it.
 fn stream_response(shared: &Shared, request: Request, run: StreamingRun) -> Result<()> {
+    stream_response_with_writer(shared, run, || {
+        ChunkedWriter::start(request, "text/event-stream")
+    })
+}
+
+// The HTTP caller and deterministic I/O-failure controls use the same decode,
+// parser finalization, frontier recording and trailer path. Delay opening the
+// writer until the fallible reasoning metadata has been checked.
+fn stream_response_with_writer(
+    shared: &Shared,
+    run: StreamingRun,
+    start_writer: impl FnOnce() -> Result<ChunkedWriter>,
+) -> Result<()> {
     let endpoint = match run.kind {
         StreamKind::Completion => "/v1/completions",
         StreamKind::Chat => "/v1/chat/completions",
     };
     let created = now();
+    let split = match run.kind {
+        StreamKind::Chat => {
+            reasoning::Reasoning::for_chat(shared.engine.as_ref(), &run.prompt_ids)?
+        }
+        StreamKind::Completion => None,
+    }
+    .map(|p| Arc::new(parking_lot::Mutex::new(p)));
     // Each drained batch of text becomes one chunk, wrapped on the writer's
-    // thread (`StreamWriter::start_with_deltas`).
+    // thread (the counted adapter defers unresolved reasoning prefixes).
     let wrap = {
         let (id, model, kind) = (run.id.clone(), run.model.clone(), run.kind);
-        move |text: &str| -> String {
-            let chunk = match kind {
-                StreamKind::Completion => json!({
-                    "id": id, "object": "text_completion", "created": created, "model": model,
-                    "choices": [{ "index": 0, "text": text, "logprobs": null, "finish_reason": null }],
-                }),
-                StreamKind::Chat => json!({
-                    "id": id, "object": "chat.completion.chunk", "created": created, "model": model,
-                    "choices": [{ "index": 0, "delta": { "content": text }, "finish_reason": null }],
-                }),
+        let split = split.clone();
+        move |text: &str| -> (String, usize) {
+            let (chunk, resolved) = match kind {
+                StreamKind::Completion => (
+                    json!({
+                        "id": id, "object": "text_completion", "created": created, "model": model,
+                        "choices": [{ "index": 0, "text": text, "logprobs": null, "finish_reason": null }],
+                    }),
+                    text.len(),
+                ),
+                StreamKind::Chat => {
+                    let (delta, resolved) = match &split {
+                        Some(p) => p.lock().push_counted(text),
+                        None => (
+                            serde_json::Map::from_iter([("content".into(), json!(text))]),
+                            text.len(),
+                        ),
+                    };
+                    (
+                        json!({
+                            "id": id, "object": "chat.completion.chunk", "created": created, "model": model,
+                            "choices": [{ "index": 0, "delta": delta, "finish_reason": null }],
+                        }),
+                        resolved,
+                    )
+                }
             };
-            format!("data: {chunk}\n\n")
+            (format!("data: {chunk}\n\n"), resolved)
         }
     };
-    let sw =
-        StreamWriter::start_with_deltas(ChunkedWriter::start(request, "text/event-stream")?, wrap);
+    let writer = start_writer()?;
+    let sw = if split.is_some() {
+        StreamWriter::start_with_counted_deltas(writer, wrap)
+    } else {
+        StreamWriter::start_with_deltas(writer, move |text| wrap(text).0)
+    };
     if let StreamKind::Chat = run.kind {
         sw.event(&json!({
             "id": run.id, "object": "chat.completion.chunk", "created": created,
@@ -1674,11 +1807,12 @@ fn stream_response(shared: &Shared, request: Request, run: StreamingRun) -> Resu
         // The callback runs on the decode thread: it hands the text over;
         // the chunk is built and written on the writer thread. A client that
         // went away stops the run at the next drained batch.
-        run_decode(
+        run_decode_observed(
             engine,
             &run.prompt_ids,
             &run.images,
             &run.params,
+            split.as_ref(),
             &mut |frag| {
                 if sw.client_gone() {
                     return false;
@@ -1689,11 +1823,29 @@ fn stream_response(shared: &Shared, request: Request, run: StreamingRun) -> Resu
         )
     };
     let written = sw.written();
-    let (w, write_err) = sw.finish()?;
+    let (mut w, mut write_err) = sw.finish()?;
     let decoded = match decoded {
         Ok(decoded) => decoded,
         Err(error) => return finish_stream_error(w, error),
     };
+    if write_err.is_none() {
+        if let Some(p) = split {
+            let (delta, resolved) = p.lock().finish_counted();
+            if !delta.is_empty() {
+                match w.event(&json!({
+                    "id": run.id, "object": "chat.completion.chunk", "created": created, "model": run.model,
+                    "choices": [{"index": 0, "delta": delta, "finish_reason": null}],
+                })) {
+                    Ok(()) => {
+                        written.fetch_add(resolved, Ordering::Relaxed);
+                    }
+                    Err(error) => {
+                        write_err = Some(error);
+                    }
+                }
+            }
+        }
+    }
     // The accepted history is what the server handed the writer; of that,
     // what it knows it wrote, and whether a write failed (what the client
     // received is not known either way).
@@ -2397,20 +2549,24 @@ impl ChunkedWriter {
 struct StreamWriter {
     tx: Option<std::sync::mpsc::Sender<(String, usize)>>,
     gone: Arc<AtomicBool>,
-    /// Bytes of handed-over text whose events the writer thread wrote
-    /// without an error (`Self::written`): what the server knows it wrote,
-    /// never what a client received.
+    /// Raw text bytes resolved by successfully written events. A routing
+    /// wrapper can defer credit for held marker prefixes until a later event;
+    /// deliberately consumed complete markers still count as raw text.
+    /// Never a claim about what a client received or JSON/wire byte length.
     written: Arc<AtomicUsize>,
     thread: Option<std::thread::JoinHandle<(ChunkedWriter, Option<std::io::Error>)>>,
     deltas: Option<Arc<DeltaBuffer>>,
     /// The deltas' wire wrapping, shared with the thread: [`Self::send`]
     /// wraps what is pending itself so a control event keeps its place.
     wrap: Option<Wrap>,
+    /// Off-token ordering only: extraction, stateful wrapping and enqueue.
+    /// Never held during socket I/O or acquired by `delta`.
+    order: Arc<parking_lot::Mutex<()>>,
     /// The producer's spill (`DeltaBuffer::push`); only the producer locks it.
     spill: parking_lot::Mutex<String>,
 }
 
-type Wrap = Arc<dyn Fn(&str) -> String + Send + Sync>;
+type Wrap = Arc<dyn Fn(&str) -> (String, usize) + Send + Sync>;
 
 impl StreamWriter {
     fn start(w: ChunkedWriter) -> Self {
@@ -2424,6 +2580,16 @@ impl StreamWriter {
         w: ChunkedWriter,
         wrap: impl Fn(&str) -> String + Send + Sync + 'static,
     ) -> Self {
+        Self::start_with_counted_deltas(w, move |text| (wrap(text), text.len()))
+    }
+
+    /// A routing wrapper reports raw bytes resolved by this event, which can
+    /// include a prefix held from an earlier batch. Credit follows successful
+    /// I/O, not parser mutation; a failed event resolves no written bytes.
+    fn start_with_counted_deltas(
+        w: ChunkedWriter,
+        wrap: impl Fn(&str) -> (String, usize) + Send + Sync + 'static,
+    ) -> Self {
         Self::spawn(w, Some(Arc::new(wrap)))
     }
 
@@ -2436,6 +2602,8 @@ impl StreamWriter {
         let deltas = wrap.as_ref().map(|_| DeltaBuffer::new());
         let buf = deltas.clone();
         let thread_wrap = wrap.clone();
+        let order = Arc::new(parking_lot::Mutex::new(()));
+        let thread_order = Arc::clone(&order);
         let thread = std::thread::spawn(move || {
             let mut err: Option<std::io::Error> = None;
             let mut local = String::with_capacity(4096);
@@ -2456,15 +2624,6 @@ impl StreamWriter {
                     }
                 }
             };
-            // The text that accumulated, as one event. (Text pushed before a
-            // control event reaches the channel ahead of it: `send` takes it.)
-            let mut drain = |w: &mut ChunkedWriter, err: &mut Option<std::io::Error>| {
-                if let (Some(b), Some(wrap)) = (&buf, &thread_wrap) {
-                    if b.take_into(&mut local) {
-                        write(w, &wrap(&local), local.len(), err);
-                    }
-                }
-            };
             loop {
                 let next = if buf.is_some() {
                     rx.recv_timeout(DRAIN_PERIOD)
@@ -2472,13 +2631,23 @@ impl StreamWriter {
                     rx.recv()
                         .map_err(|_| std::sync::mpsc::RecvTimeoutError::Disconnected)
                 };
-                match next {
-                    Ok((payload, text)) => write(&mut w, &payload, text, &mut err),
-                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => drain(&mut w, &mut err),
-                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                        drain(&mut w, &mut err);
-                        break;
-                    }
+                let (work, closed) = match next {
+                    Ok(work) => (Some(work), false),
+                    Err(_) => Self::pending_after_timeout(
+                        &rx,
+                        buf.as_ref(),
+                        thread_wrap.as_ref(),
+                        &thread_order,
+                        &mut local,
+                    ),
+                };
+                // Selection/wrapping is finished. The sole writer performs
+                // network I/O without the off-token ordering guard.
+                if let Some((payload, resolved)) = work {
+                    write(&mut w, &payload, resolved, &mut err);
+                }
+                if closed {
+                    break;
                 }
             }
             (w, err)
@@ -2490,8 +2659,33 @@ impl StreamWriter {
             thread: Some(thread),
             deltas,
             wrap,
+            order,
             spill: parking_lot::Mutex::new(String::new()),
         }
+    }
+
+    /// A timeout is not a claim that the channel is still empty. Under the
+    /// same off-token guard used by send, prefer an already queued event over
+    /// bytes appended after that event; then select/wrap at most one batch.
+    /// The guard is dropped before the caller performs any network I/O.
+    fn pending_after_timeout(
+        rx: &std::sync::mpsc::Receiver<(String, usize)>,
+        buf: Option<&Arc<DeltaBuffer>>,
+        wrap: Option<&Wrap>,
+        order: &parking_lot::Mutex<()>,
+        local: &mut String,
+    ) -> (Option<(String, usize)>, bool) {
+        let _guard = order.lock();
+        let closed = match rx.try_recv() {
+            Ok(work) => return (Some(work), false),
+            Err(std::sync::mpsc::TryRecvError::Empty) => false,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => true,
+        };
+        let work = match (buf, wrap) {
+            (Some(buf), Some(wrap)) if buf.take_into(local) => Some(wrap(local)),
+            _ => None,
+        };
+        (work, closed)
     }
 
     /// Hand text to the writer (the decode thread's per-fragment call on a
@@ -2503,13 +2697,14 @@ impl StreamWriter {
     }
 
     /// Everything handed over so far, wrapped, queued ahead of what comes
-    /// next on the channel. Off the per-token path (a control event).
+    /// next on the channel. Caller `send` holds `order` through both enqueues.
+    /// Off the per-token path (a control event).
     fn queue_pending(&self) {
         if let (Some(b), Some(wrap), Some(tx)) = (&self.deltas, &self.wrap, &self.tx) {
             b.flush(&mut self.spill.lock());
             let mut text = String::new();
             if b.take_into(&mut text) {
-                let _ = tx.send((wrap(&text), text.len()));
+                let _ = tx.send(wrap(&text));
             }
         }
     }
@@ -2525,6 +2720,7 @@ impl StreamWriter {
     }
 
     fn send(&self, payload: String) {
+        let _guard = self.order.lock();
         self.queue_pending();
         if let Some(tx) = &self.tx {
             // A closed receiver means the thread is gone, which `gone` reports.
@@ -2532,8 +2728,9 @@ impl StreamWriter {
         }
     }
 
-    /// The bytes of handed-over text written so far; final once
-    /// [`Self::finish`] has joined the thread.
+    /// Raw resolved bytes written so far. Joining [`Self::finish`] settles
+    /// queued events; a caller's explicit final routing flush credits this
+    /// same counter only after its own successful write.
     fn written(&self) -> Arc<AtomicUsize> {
         Arc::clone(&self.written)
     }
@@ -2657,7 +2854,7 @@ fn timings(
         "host_fill": super::common::host_fill_name(st.host_feed.as_ref()),
         "prompt_ids_sha256": facts.ids_sha256,
         // The template's variable as the prompt reflects it; null for its
-        // default (a value the template would not act on is a 400).
+        // default. Neutral values can be ignored when the template has no control.
         "reasoning_effort": facts.reasoning_effort,
         // Whether the prompt leaves a thinking block open, and who decided:
         // the template (its switch or its own behaviour) or the engine,
@@ -4220,3 +4417,63 @@ mod logprob_request_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod ready_configuration_tests {
+    use super::ready_configuration;
+    use serde_json::json;
+
+    #[test]
+    fn pipette_cell_overrides_use_the_same_serve_option_layers() {
+        use clap::Parser;
+        let args = super::ServeArgs::try_parse_from([
+            "lloom serve",
+            "--kernels-config",
+            r#"{"attention":{"flash":{"partial_block":8}}}"#,
+            "--speculative-config",
+            r#"{"method":"auto"}"#,
+            "--set",
+            "kernels.attention.flash.partial_block=32",
+            "--speculate",
+            "none",
+        ])
+        .unwrap();
+        let (options, _) = crate::app::resolve_layers(
+            &args.common,
+            &|options| args.front(options),
+            &|_| None,
+            false,
+            Some(crate::frontend::Frontend::Serve),
+        )
+        .unwrap();
+        let flat = crate::option_tree::index().flat(&options);
+        assert_eq!(flat["kernels.attention.flash.partial_block"], 32);
+        assert_eq!(flat["speculative.method"], "none");
+        assert_eq!(flat["context.prefix.reuse"], true);
+        assert!(!options.executor.arena && !options.executor.replay);
+    }
+
+    #[test]
+    fn configured_options_are_not_claimed_as_owner_resolution() {
+        let mut options = crate::EngineOptions::default();
+        crate::option_tree::index()
+            .set(&mut options, "kernels.attention.flash.partial_block", "8")
+            .unwrap();
+        let report = ready_configuration(&options, true, json!({"readback": "blocking"}));
+        assert_eq!(report["schema_version"], 1);
+        assert_eq!(
+            report["configured_options"]["kernels.attention.flash.partial_block"],
+            8
+        );
+        assert_eq!(report["owner"]["readback"], "blocking");
+        assert_eq!(report["options_installed"], true);
+        let supplied = ready_configuration(&options, false, json!({"generation": false}));
+        assert_eq!(supplied["options_installed"], false);
+        assert_eq!(supplied["owner"]["generation"], false);
+        assert!(supplied["owner"].get("readback").is_none());
+    }
+}
+
+#[cfg(test)]
+#[path = "serve_stream_tail_tests.rs"]
+mod stream_tail_tests;

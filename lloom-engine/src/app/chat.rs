@@ -580,15 +580,22 @@ pub fn run(args: ChatArgs) -> Result<()> {
         messages.push(json!({ "role": "assistant", "content": decoded.text }));
         let st = &decoded.stats;
         let wall = ms(elapsed);
-        let decode_ms = (wall - st.prefill_ns as f64 / 1e6).max(1e-9);
+        // The rate after the first token: `prefill_ns` is the prefill's
+        // SUBMISSION time, and a one-shot prefill's execution lands in the
+        // first step's wait, so `wall - prefill_ns` charged it to decode and
+        // read a 512-token tile 6 % slower than a 16-token one on the same
+        // rounds (2026-10-19, #859). Tokens after the first over the wall
+        // after the first token is what a client measures too.
+        let after_first = decoded.tokens.len().saturating_sub(1) as f64;
+        let decode_ms = (wall - first_at.unwrap_or(wall)).max(1e-9);
         eprintln!(
-            "[turn {turn}: prompt_tokens={} completion_tokens={} stop={:?} ttft={:.0} ms total={:.0} ms {:.1} tok/s (wall minus submit), readback={} reuse={:?} reused={} prefilled={} commits={} overrun={} tokens_sha256={} logits_sha256={} prompt_ids_sha256={} eos_gate={} host_fill={} max_in_flight={} step_markers={} step_waits={} cut={} pipelined_cut={} ring_publishes={} poll_fallbacks={} publish_parks={} eos_index={}/{} prefill_units={} param-style={} sampling={} reasoning_effort={effort} think={} think_by={} thinking_budget={} thought={} budget_fired={} prompt_budget={} prompt_dropped={} gen_prompt={} renders={} history={}/{} spliced={}/{} reuse_policy={} {} checkpoint={}]",
+            "[turn {turn}: prompt_tokens={} completion_tokens={} stop={:?} ttft={:.0} ms total={:.0} ms {:.1} tok/s (after the first token), readback={} reuse={:?} reused={} prefilled={} commits={} overrun={} tokens_sha256={} logits_sha256={} prompt_ids_sha256={} eos_gate={} host_fill={} max_in_flight={} step_markers={} step_waits={} cut={} pipelined_cut={} ring_publishes={} poll_fallbacks={} publish_parks={} eos_index={}/{} prefill_units={} param-style={} sampling={} reasoning_effort={effort} think={} think_by={} thinking_budget={} thought={} budget_fired={} prompt_budget={} prompt_dropped={} gen_prompt={} renders={} history={}/{} spliced={}/{} reuse_policy={} {} checkpoint={}]",
             ids.len(),
             decoded.tokens.len(),
             decoded.stop,
             first_at.unwrap_or(wall),
             wall,
-            decoded.tokens.len() as f64 / (decode_ms / 1e3),
+            after_first / (decode_ms / 1e3),
             decoded.readback.name(),
             decoded.reuse,
             decoded.reused,

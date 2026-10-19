@@ -184,6 +184,31 @@ fn takes_gemv_route(m: usize, n: usize) -> bool {
     (m_is_vec && !suppress_m) || (n_is_vec && !suppress_n)
 }
 
+/// The rows a half matmul takes the GEMV's row axis at, or `None`: under
+/// `fast`, inside a verify window (`tuning::VerifyWindow::open`), with
+/// `kernels.gemm.f16_rows` on, `x · Wᵀ` of 2 to `f16_rows_max` contiguous
+/// rows (a batch folded into them as `check_batch_collapse` folds it)
+/// against one `[n, k]` row-major matrix at a tile the axis is instantiated
+/// at ([`gemv_rows_serves`]). One group holds every row, so the matrix is
+/// read once. Anything else takes the route it took before.
+fn f16_rows_route(
+    (dtype, out_dtype): (GemmDType, GemmDType),
+    (b, m, n, k): (usize, usize, usize, usize),
+    (a_trans, b_trans): (bool, bool),
+    lhs_stride: &[usize],
+    rhs_stride: &[usize],
+) -> Option<usize> {
+    if dtype != GemmDType::F16 || out_dtype != dtype || m < 2 || n == 1 || a_trans || !b_trans {
+        return None;
+    }
+    let max = crate::tuning::f16_rows_max()?;
+    if !crate::tuning::contract().is_fast() || !crate::tuning::in_verify_window() {
+        return None;
+    }
+    let (batch, rows, _) = check_batch_collapse(b, m, k, a_trans, lhs_stride, rhs_stride);
+    (batch == 1 && rows <= max && gemv_rows_serves(n, k)).then_some(rows)
+}
+
 /// Select optimal tile configuration based on matrix dimensions, data type, transpose mode,
 /// and device type.
 ///
@@ -773,6 +798,7 @@ pub unsafe fn call_mlx_gemv_epilogue(
             prologue,
             epilogue,
             epilogue_operand,
+            1,
         )
     }
 }
@@ -826,10 +852,90 @@ pub unsafe fn call_mlx_gemv_norm(
             GemvPrologue::NormInline(norm),
             epilogue,
             epilogue_operand,
+            1,
         )
     }
 }
 
+/// The most rows one threadgroup of the GEMV's row axis carries
+/// (`gemv.metal`'s `instantiate_gemv_rows_tile`: every count from 2).
+pub const GEMV_ROWS_MAX: usize = 16;
+
+/// The `[[host_name]]` suffix of each row count, no allocation per dispatch;
+/// the classical name at 1 (0 is never dispatched).
+const GEMV_ROWS_SUFFIX: [&str; GEMV_ROWS_MAX + 1] = [
+    "", "", "_r2", "_r3", "_r4", "_r5", "_r6", "_r7", "_r8", "_r9", "_r10", "_r11", "_r12", "_r13",
+    "_r14", "_r15", "_r16",
+];
+
+/// Whether the GEMV's row axis serves a non-transposed `[out_vec_size,
+/// in_vec_size]` half matrix: the tile the dispatcher selects is one of the
+/// two decode tiles the `_r<N>` kernels are instantiated at. A caller checks
+/// this and takes another route where it is false.
+pub fn gemv_rows_serves(out_vec_size: usize, in_vec_size: usize) -> bool {
+    gemv_norm_serves(out_vec_size, in_vec_size)
+}
+
+/// `out[r, :] = mat · vec[r, :]` for `b` half rows against ONE matrix, the
+/// rows read `capacity` to a threadgroup: each threadgroup sweeps its block
+/// of the matrix once for `capacity` rows, and each row's bits are the
+/// one-row GEMV's on the same input (`gemv.metal`'s `GEMVKernel`,
+/// `docs/tuning.md` §13.5y). The arguments are [`call_mlx_gemv`]'s at
+/// `m = 1`, the rows on the batch axis; the matrix's batch stride must be 0.
+/// `capacity` 1 is the classical GEMV, `epilogue` included. Refused where
+/// the axis is not instantiated ([`gemv_rows_serves`], f16,
+/// `2..=GEMV_ROWS_MAX`) and for a fused epilogue at more than one row, by
+/// name: the caller takes the plain store.
+///
+/// # Safety
+/// Every buffer bound here stays unreused and unwritten by the host until
+/// the command buffer it is encoded into completes, and while an ICB that
+/// captured it can replay ([`crate::kernels::utils::EncoderParam`]).
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn call_mlx_gemv_rows(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    dtype: GemmDType,
+    mnk: (usize, usize, usize, usize),
+    lhs_stride: &[usize],
+    lhs_offset: usize,
+    lhs_buffer: &Buffer,
+    rhs_stride: &[usize],
+    rhs_offset: usize,
+    rhs_buffer: &Buffer,
+    output: &Buffer,
+    epilogue: GemvEpilogue,
+    epilogue_operand: Option<(&Buffer, usize)>,
+    capacity: usize,
+) -> Result<(), MetalKernelError> {
+    // SAFETY: this function's contract (# Safety above).
+    unsafe {
+        gemv_dispatch(
+            device,
+            ep,
+            kernels,
+            dtype,
+            mnk,
+            lhs_stride,
+            lhs_offset,
+            lhs_buffer,
+            rhs_stride,
+            rhs_offset,
+            rhs_buffer,
+            output,
+            ParamStyle::Split,
+            GemvPrologue::None,
+            epilogue,
+            epilogue_operand,
+            capacity,
+        )
+    }
+}
+
+/// `rows` is the row axis's capacity ([`call_mlx_gemv_rows`]); 1 everywhere
+/// else, the classical GEMV.
+///
 /// # Safety
 /// Every buffer bound here stays unreused and unwritten by the host until
 /// the command buffer it is encoded into completes, and while an ICB that
@@ -852,6 +958,7 @@ unsafe fn gemv_dispatch(
     prologue: GemvPrologue<'_>,
     epilogue: GemvEpilogue,
     epilogue_operand: Option<(&Buffer, usize)>,
+    rows: usize,
 ) -> Result<(), MetalKernelError> {
     debug_assert!(m == 1 || n == 1, "call_mlx_gemv requires M=1 or N=1");
 
@@ -1002,6 +1109,53 @@ unsafe fn gemv_dispatch(
         && tn == 4
         && tm == 4
         && (bm == 4 || bm == 8);
+    // The row axis is instantiated at the decode tiles, half, split params,
+    // with the plain store. A fused prologue or epilogue is REFUSED by name
+    // rather than run without its transform: the caller takes the plain
+    // store and its own transform, or the one-row arm.
+    if rows != 1 {
+        let refused = |why: String| {
+            Err(MetalKernelError::LoadFunctionError(format!(
+                "gemv row axis at {rows} rows: {why} (mnk={m}x{n}x{k}, b={b})"
+            )))
+        };
+        if !(2..=GEMV_ROWS_MAX).contains(&rows) {
+            return refused(format!("instantiated for 2..={GEMV_ROWS_MAX} rows"));
+        }
+        if !decode_tile {
+            return refused(format!(
+                "instantiated at the non-transposed bm4/bm8 decode tiles only, not \
+                 {kernel_prefix} bm{bm}_bn{bn}_sm{sm}_sn{sn}_tm{tm}_tn{tn}"
+            ));
+        }
+        if dtype != GemmDType::F16 {
+            return refused(format!("instantiated for f16 only, not {dtype:?}"));
+        }
+        if style != ParamStyle::Split {
+            return refused(format!("no {style:?} sibling; split params only"));
+        }
+        match &prologue {
+            GemvPrologue::None => {}
+            GemvPrologue::RmsNorm(_) => {
+                return refused("the fused rmsnorm prologue has no row-axis instantiation".into())
+            }
+            GemvPrologue::NormInline(_) => {
+                return refused("the inline norm has no row-axis instantiation".into())
+            }
+        }
+        if epilogue != GemvEpilogue::None {
+            return refused(format!(
+                "the fused {epilogue:?} epilogue has no row-axis instantiation; take the \
+                 plain store"
+            ));
+        }
+        if m != 1 || mat_batch_stride != 0 {
+            return refused(format!(
+                "the rows share one matrix on the batch axis (m=1, matrix batch stride 0), \
+                 got m={m}, stride {mat_batch_stride}"
+            ));
+        }
+    }
     if let GemvPrologue::NormInline(_) = &prologue {
         if !decode_tile || style != ParamStyle::Split {
             return Err(MetalKernelError::LoadFunctionError(format!(
@@ -1106,8 +1260,9 @@ unsafe fn gemv_dispatch(
     // classical name everywhere else, and the replay executor classifies a
     // position by that trailing suffix (`icb.rs` `is_packed`), so a fused
     // packed name is `…_axpby0_silu_packed`, never `…_packed_silu`.
+    let rows_suffix = GEMV_ROWS_SUFFIX[rows];
     let name = format!(
-        "{}_{}_bm{}_bn{}_sm{}_sn{}_tm{}_tn{}_nc0_axpby0{}{}{}",
+        "{}_{}_bm{}_bn{}_sm{}_sn{}_tm{}_tn{}_nc0_axpby0{}{}{}{}",
         kernel_prefix,
         dtype_str,
         bm,
@@ -1118,6 +1273,7 @@ unsafe fn gemv_dispatch(
         tn,
         norm_suffix,
         epilogue_suffix,
+        rows_suffix,
         style.name_suffix()
     );
 
@@ -1218,10 +1374,13 @@ unsafe fn gemv_dispatch(
         bm * sm * tm
     };
     let n_tgp = out_vec_size.div_ceil(n_out_per_tgp);
+    // One threadgroup a block of output rows per group of `rows` batch items
+    // (the kernel reads the batch's size from `batch_shape` for the last
+    // group's count).
     let grid_size = MTLSize {
         width: n_tgp,
         height: 1,
-        depth: b,
+        depth: b.div_ceil(rows),
     };
     let group_size = MTLSize {
         width: 32,
@@ -1651,6 +1810,39 @@ pub unsafe fn call_mlx_gemm_out(
             )?;
         }
         return Ok(());
+    }
+
+    // Under `fast` a verify window's half rows take the GEMV's row axis while
+    // `kernels.gemm.f16_rows` is on: one weight sweep for the window's rows,
+    // each row the one-row GEMV's bits (`docs/tuning.md` §13.5y).
+    if let Some(rows) = f16_rows_route(
+        (dtype, out_dtype),
+        (b, m, n, k),
+        (a_trans, b_trans),
+        lhs_stride,
+        rhs_stride,
+    ) {
+        crate::tuning::note_f16_rows();
+        // SAFETY: this function's contract (# Safety above).
+        return unsafe {
+            call_mlx_gemv_rows(
+                device,
+                ep,
+                kernels,
+                dtype,
+                (rows, 1, n, k),
+                &[k, k, 1],
+                lhs_offset,
+                lhs_buffer,
+                &[0, rhs_m2, rhs_m1],
+                rhs_offset,
+                rhs_buffer,
+                output,
+                GemvEpilogue::None,
+                None,
+                rows,
+            )
+        };
     }
 
     // The routing decision this project has never audited (issue #386): no

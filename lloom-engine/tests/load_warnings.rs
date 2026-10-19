@@ -160,7 +160,9 @@ fn an_uncovered_head_dim_reaches_every_surface() {
     let field = loaded_warnings(&stderr);
     eprintln!("head_dim 48: load_warnings={field}");
     assert!(
-        field.starts_with("attention_route: lfm2: attention head_dim 48 at F16 under Sdpa: "),
+        // `chat`'s default attention is FlashDecoding (the front-end's model
+        // axes); the uncovered head dim falls back to the composed attention.
+        field.starts_with("attention_route: lfm2: attention head_dim 48 at F16 under FlashDecoding: "),
         "{field}"
     );
     assert!(field.contains("(the composed attention"), "{field}");

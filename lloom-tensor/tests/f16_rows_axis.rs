@@ -151,7 +151,8 @@ fn the_row_axis_is_taken_in_a_verify_window_only() -> Result<()> {
     let x = rows(10, k, 0.5, &dev)?;
     let x17 = rows(17, k, 0.75, &dev)?;
     let x1 = rows(1, k, 1.0, &dev)?;
-    let cases: Vec<(&str, Box<dyn Fn() -> Result<Tensor>>)> = vec![
+    type Case<'a> = (&'a str, Box<dyn Fn() -> Result<Tensor> + 'a>);
+    let cases: Vec<Case> = vec![
         ("outside a window", Box::new(|| x.matmul(&rhs))),
         (
             "the drafter's window",

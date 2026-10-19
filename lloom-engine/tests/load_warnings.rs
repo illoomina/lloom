@@ -182,8 +182,12 @@ fn an_uncovered_head_dim_reaches_every_surface() {
     let off = write::<Lfm2Tiny>(&dir.join("off"), Some(144));
     let on = write::<Lfm2Tiny>(&dir.join("on"), None);
     let uncovered = write::<Lfm2Tiny>(&dir.join("uncovered"), Some(96));
+    // `chat`'s Metal default is FlashDecoding over the paged KV layout (the
+    // front-end's model axes), and FlashDecoding is instantiated at 72; the
+    // arm asks for `sdpa_vector`, over the strided layout it reads.
+    let sdpa = ["--attn", "sdpa", "--kv-append", "cat"];
 
-    let stderr = chat(&off, &[]);
+    let stderr = chat(&off, &sdpa);
     let field = loaded_warnings(&stderr);
     eprintln!("head_dim 72: load_warnings={field}");
     assert!(
@@ -198,13 +202,13 @@ fn an_uncovered_head_dim_reaches_every_surface() {
         stderr.lines().any(|l| l == message),
         "the stderr line is not the channel's message:\n{stderr}"
     );
-    assert_eq!(loaded_warnings(&chat(&on, &[])), "none");
+    assert_eq!(loaded_warnings(&chat(&on, &sdpa)), "none");
 
-    let list = served_warnings(&off, &[]);
+    let list = served_warnings(&off, &sdpa);
     assert_eq!(list.as_array().unwrap().len(), 1, "{list}");
     assert_eq!(list[0]["kind"], "attention_route");
     assert_eq!(list[0]["message"], message);
-    assert_eq!(served_warnings(&on, &[]), json!([]));
+    assert_eq!(served_warnings(&on, &sdpa), json!([]));
 
     let out = Command::new(env!("CARGO_BIN_EXE_lloom"))
         .args(["chat", "--model"])
@@ -276,7 +280,18 @@ fn qwen4exp_readback_that_reads_its_id_back_warns() {
         field.contains("each decode forward reads its fed id back"),
         "{field}"
     );
-    assert_eq!(loaded_warnings(&chat(&model, &base)), "none");
+    // `auto` through `chat` is the front-end's ring for every family on
+    // Metal (the `decode.readback.*` rows), which on this tiny reads its
+    // fed id back too: the same warning, from the resolved arm, beside the
+    // EOS-gate one (its kernels carry no gated variant). The library's own
+    // `auto` (no front-end) stays blocking and silent.
+    let auto = loaded_warnings(&chat(&model, &base));
+    assert!(
+        auto.contains("readback: ring-gpubatch-nonblocking lookahead=1 ")
+            && auto.contains("each decode forward reads its fed id back")
+            && auto.contains("eos_gate is off on qwen4exp"),
+        "{auto}"
+    );
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -318,7 +333,7 @@ fn an_admitted_emulated_type_reaches_the_engine() {
         let options = resolve_options_uninstalled(&common, &lloom_engine::app::no_front).unwrap();
         let mut shape = Shape::of(
             &options,
-            true,
+            lloom_engine::frontend::Frontend::Chat,
             "The loom threads warp and weft into cloth. ".to_string(),
         );
         shape.batch = 1;

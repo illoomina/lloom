@@ -223,3 +223,76 @@ fn callback_other_thread_gets_busy_without_waiting_for_original_request() -> Res
     assert!(engine.chat.lock().is_some());
     Ok(())
 }
+
+#[path = "../../../../lloom/src/models/quantized_lfm2/fixture.rs"]
+mod gguf_fixture;
+
+/// The default machine-admitted factory is a CPU path too; do not put this
+/// control behind the native-domain fixture's Metal feature guard.
+#[test]
+fn unadmitted_cpu_gguf_factory_enforces_selected_context_and_f16_store() -> anyhow::Result<()> {
+    use crate::app::served::Served;
+    use lloom_tensor::machine::{Gate, GateConfig, Peak};
+    let dir = std::env::temp_dir().join(format!("lloom1056-gguf-runtime-{}", std::process::id()));
+    std::fs::create_dir(&dir)?;
+    let gguf = dir.join("fixture.gguf");
+    let tokenizer_path = dir.join("tokenizer.json");
+    let result = (|| -> anyhow::Result<()> {
+        std::fs::write(&gguf, gguf_fixture::fixture(None)?)?;
+        let tiny = engine()?;
+        std::fs::write(&tokenizer_path, tiny.tokenizer.to_string(false).unwrap())?;
+        let machine = Gate::new(GateConfig {
+            off: true,
+            ..Default::default()
+        })
+        .admit("tiny CPU GGUF factory", &Peak::new())?;
+        let mut decode = DecodeConfig::default();
+        crate::options::ReadbackConfig::apply_spelling(&mut decode.readback, "blocking")
+            .map_err(anyhow::Error::msg)?;
+        let owner = served::load_lfm2_gguf_unadmitted_with_runtime(
+            &gguf,
+            None,
+            TokenizerSource::File(&tokenizer_path),
+            None,
+            &Device::Cpu,
+            lloom::nn::attention::route::ExecutionPurpose::Production,
+            machine,
+            decode,
+            served::Config {
+                model_name: "tiny-half-context".into(),
+                bos_token: String::new(),
+                bos_id: None,
+                eos_ids: vec![7],
+                seed_text: "a".into(),
+                chat_template: None,
+            },
+            false,
+            Some(served::NO_MMPROJ),
+            Some(served::GgufRuntime {
+                context: 8,
+                kv_dtype: lloom_tensor::DType::F16,
+            }),
+        )?;
+        assert_eq!(owner.kv_capacity(), 8);
+        assert_eq!(owner.capabilities().kv_dtype, "f16");
+        assert_eq!(owner.health_checked()?["capacity"], 8);
+        let params = DecodeParams {
+            max_tokens: 1,
+            eos_ids: vec![u32::MAX],
+            readback: ReadbackArm::Blocking,
+            ..Default::default()
+        };
+        let decoded = owner.complete_admitted(&[2, 3], &params, |_| true)?;
+        assert_eq!(decoded.tokens.len(), 1);
+        assert_eq!(decoded.prefilled, 2);
+        assert!(
+            owner.complete_admitted(&[2; 8], &params, |_| true).is_err(),
+            "context limit must govern prompt plus generation"
+        );
+        Ok(())
+    })();
+    std::fs::remove_file(&gguf)?;
+    std::fs::remove_file(&tokenizer_path)?;
+    std::fs::remove_dir(dir)?;
+    result
+}

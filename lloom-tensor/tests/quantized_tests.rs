@@ -1763,3 +1763,159 @@ fn the_cpu_matmul_of_a_read_only_type_is_refused_by_name() -> Result<()> {
     }
     Ok(())
 }
+
+/// CPU prompt GEMM must match the old per-token GEMV bit for bit, including
+/// partial column/row tiles and each quantizer's activation rounding.
+#[test]
+fn cpu_prompt_gemm_is_bit_identical_to_decode_rows() -> Result<()> {
+    use lloom_tensor::quantized::k_quants::{
+        self, BlockQ4K, BlockQ4_0, BlockQ5_0, BlockQ6K, BlockQ8_0, GgmlType,
+    };
+    // Native NEON's raw f16 dot has four eight-lane half accumulators,
+    // flushed every 16 steps (cpu/neon.rs CurrentCpuF16). This is distinct
+    // from the configurable dense-matmul accumulator. Model those half FMAs
+    // and the reduction with scalar arithmetic, not the SIMD implementation.
+    #[cfg(all(target_feature = "neon", target_feature = "fp16"))]
+    fn half_lane_reference(lhs: &[f32], rhs: &[f32]) -> f32 {
+        fn reduce(lanes: &[[half::f16; 8]; 4]) -> f32 {
+            let mut sum = 0f32;
+            for lane in lanes {
+                let pairs: [f32; 4] =
+                    std::array::from_fn(|i| lane[i].to_f32() + lane[i + 4].to_f32());
+                sum += (pairs[0] + pairs[1]) + (pairs[2] + pairs[3]);
+            }
+            sum
+        }
+        let mut lanes = [[half::f16::ZERO; 8]; 4];
+        let mut sum = 0f32;
+        let mut steps = 0;
+        let mut i = 0;
+        while i + 32 <= lhs.len() {
+            for (j, lane) in lanes.iter_mut().enumerate() {
+                for (l, accumulator) in lane.iter_mut().enumerate() {
+                    let at = i + j * 8 + l;
+                    *accumulator = half::f16::from_f64(
+                        (lhs[at] as f64).mul_add(rhs[at] as f64, accumulator.to_f64()),
+                    );
+                }
+            }
+            steps += 1;
+            if steps == 16 {
+                sum += reduce(&lanes);
+                lanes = [[half::f16::ZERO; 8]; 4];
+                steps = 0;
+            }
+            i += 32;
+        }
+        sum += reduce(&lanes);
+        for (&a, &b) in lhs[i..].iter().zip(&rhs[i..]) {
+            sum += a * b;
+        }
+        sum
+    }
+    fn check<T: GgmlType>() -> Result<()> {
+        for m in [2, 17, 33] {
+            for n in [1, 2, 3, 4, 7, 65] {
+                for k in [256, 768] {
+                    let lhs: Vec<_> = (0..m * k)
+                        .map(|i| ((i * 17 % 211) as f32 - 103.) / 73.)
+                        .collect();
+                    let weights: Vec<_> = (0..n * k)
+                        .map(|i| ((i * 31 % 173) as f32 - 87.) / 61.)
+                        .collect();
+                    let mut rhs = vec![T::zeros(); n * k / T::BLCK_SIZE];
+                    T::from_float(&weights, &mut rhs);
+                    let mut expected = vec![0.; m * n];
+                    for row in 0..m {
+                        k_quants::matmul::<T>(
+                            (1, k, n),
+                            &lhs[row * k..(row + 1) * k],
+                            &rhs,
+                            &mut expected[row * n..(row + 1) * n],
+                        )?;
+                    }
+                    // Independent scalar arithmetic oracle over the actual
+                    // quantized operands. It shares neither matmul traversal
+                    // nor SIMD dot kernels; quantization itself is unchanged.
+                    let mut dense_rhs = vec![0.; n * k];
+                    T::to_float(&rhs, &mut dense_rhs);
+                    let mut scalar = vec![0f64; m * n];
+                    for row in 0..m {
+                        let mut packed = vec![T::VecDotType::zeros(); k / T::VecDotType::BLCK_SIZE];
+                        T::VecDotType::from_float(&lhs[row * k..(row + 1) * k], &mut packed);
+                        let mut dense_lhs = vec![0.; k];
+                        T::VecDotType::to_float(&packed, &mut dense_lhs);
+                        for col in 0..n {
+                            scalar[row * n + col] = dense_lhs
+                                .iter()
+                                .zip(&dense_rhs[col * k..(col + 1) * k])
+                                .map(|(&a, &b)| a as f64 * b as f64)
+                                .sum();
+                            #[cfg(all(target_feature = "neon", target_feature = "fp16"))]
+                            if T::DTYPE == GgmlDType::F16 {
+                                scalar[row * n + col] = half_lane_reference(
+                                    &dense_lhs,
+                                    &dense_rhs[col * k..(col + 1) * k],
+                                ) as f64;
+                            }
+                        }
+                    }
+                    for _ in 0..3 {
+                        let mut got = vec![f32::NAN; m * n];
+                        k_quants::matmul::<T>((m, k, n), &lhs, &rhs, &mut got)?;
+                        assert_eq!(
+                            got.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                            expected.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                            "{:?} m={m} k={k} n={n}",
+                            T::DTYPE
+                        );
+                        for (&value, &reference) in got.iter().zip(&scalar) {
+                            #[cfg(all(target_feature = "neon", target_feature = "fp16"))]
+                            if T::DTYPE == GgmlDType::F16 {
+                                assert_eq!(
+                                    value.to_bits(),
+                                    (reference as f32).to_bits(),
+                                    "scalar half-FMA oracle"
+                                );
+                            }
+                            let error = (value as f64 - reference).abs() / reference.abs().max(1.);
+                            assert!(
+                                error <= GGML_MAX_DOT_PRODUCT_ERROR as f64,
+                                "{:?} scalar oracle {value} != {reference}, error={error}",
+                                T::DTYPE
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+    check::<BlockQ4_0>()?;
+    check::<BlockQ5_0>()?;
+    check::<BlockQ8_0>()?;
+    check::<BlockQ4K>()?;
+    check::<BlockQ6K>()?;
+    check::<f32>()?;
+    check::<half::f16>()?;
+    check::<half::bf16>()?;
+    Ok(())
+}
+
+#[test]
+fn cpu_prompt_gemm_checks_destination_before_unsafe_stores() -> Result<()> {
+    use lloom_tensor::quantized::k_quants;
+    let (m, k, n) = (17, 8, 7);
+    let lhs = vec![1f32; m * k];
+    let weights = vec![1f32; n * k];
+    for length in [0, 1, m * n - 1] {
+        let mut dst = vec![0.; length];
+        let error = k_quants::matmul::<f32>((m, k, n), &lhs, &weights, &mut dst).unwrap_err();
+        assert!(error.to_string().contains("destination is too short"));
+    }
+    let mut dst = vec![f32::NAN; m * n + 1];
+    k_quants::matmul::<f32>((m, k, n), &lhs, &weights, &mut dst)?;
+    assert!(dst[..m * n].iter().all(|&v| v == k as f32));
+    assert!(dst[m * n].is_nan(), "extra space is not written");
+    Ok(())
+}

@@ -905,14 +905,13 @@ impl AssociatedBuffer {
         &self,
         nonblocking: bool,
     ) -> Result<PreparedCommit<'_>, crate::kernels::MetalKernelError> {
-        self.core
-            .prepare_commit(
-                &self.raw,
-                &self.marker,
-                &self.handler,
-                nonblocking,
-                self.bindings.as_ref(),
-            )
+        self.core.prepare_commit(
+            &self.raw,
+            &self.marker,
+            &self.handler,
+            nonblocking,
+            self.bindings.as_ref(),
+        )
     }
     pub(super) fn try_commit(&self) -> Result<(), crate::kernels::MetalKernelError> {
         self.prepare_commit()?.commit()

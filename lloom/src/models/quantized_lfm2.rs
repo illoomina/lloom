@@ -35,6 +35,7 @@ struct AttentionLayer {
     n_head: usize,
     n_kv_head: usize,
     head_dim: usize,
+    kv_dtype: DType,
     cos: Tensor,
     sin: Tensor,
     neg_inf: Tensor,
@@ -49,7 +50,8 @@ struct AttentionLayer {
 }
 
 /// The fused attention route a layer takes on Metal: causal, the queries at
-/// the end of the key range, f32 over an f32 cache, up to `context` positions.
+/// the end of the key range, f32 over a `kv_dtype` cache, up to `context`
+/// positions.
 /// `Err` names the capability no fused kernel provides; the layer then
 /// attends composed, which serving refuses on Metal.
 fn attention_route(
@@ -58,6 +60,7 @@ fn attention_route(
     kv_heads: usize,
     head_dim: usize,
     context: usize,
+    kv_dtype: DType,
 ) -> std::result::Result<Option<crate::nn::attention::route::PreparedAttention>, String> {
     if !device.is_metal() {
         return Ok(None);
@@ -73,7 +76,7 @@ fn attention_route(
             head_dim,
             v_head_dim: head_dim,
             dtype: DType::F32,
-            kv_dtype: DType::F32,
+            kv_dtype,
             mask: MaskKind::Causal,
             softcap: 1.0,
             layout: KvLayout::Strided,
@@ -91,7 +94,7 @@ fn attention_route(
     }
     #[cfg(not(feature = "metal"))]
     {
-        let _ = (heads, kv_heads, head_dim, context);
+        let _ = (heads, kv_heads, head_dim, context, kv_dtype);
         Ok(None)
     }
 }
@@ -195,6 +198,9 @@ impl AttentionLayer {
         let q = self.apply_rotary_emb(&q, index_pos)?;
         let k = self.apply_rotary_emb(&k, index_pos)?;
 
+        // Store only KV in the requested precision; attention arithmetic stays f32.
+        let k = k.to_dtype(self.kv_dtype)?;
+        let v = v.to_dtype(self.kv_dtype)?;
         let (k, v) = match &*kv_cache {
             None => (k, v),
             Some((k_cache, v_cache)) => {
@@ -212,13 +218,14 @@ impl AttentionLayer {
         if let Some(route) = &self.route {
             // The causal window is the kernel's own, from the cache offset
             // `kv_len - seq_len`: the mask the composed path builds below.
+            // The route reads the store's dtype and converts it to f32.
             let scale = 1.0 / (self.head_dim as f32).sqrt();
             let y = crate::nn::ops::attention(&q, &k, &v, None, scale, route)?;
             return y.transpose(1, 2)?.reshape(&[b_sz, seq_len, n_embd]);
         }
 
-        let k = repeat_kv(k, self.n_head / self.n_kv_head)?;
-        let v = repeat_kv(v, self.n_head / self.n_kv_head)?;
+        let k = repeat_kv(k.to_dtype(q.dtype())?, self.n_head / self.n_kv_head)?;
+        let v = repeat_kv(v.to_dtype(q.dtype())?, self.n_head / self.n_kv_head)?;
 
         let att = (q.matmul(&k.t()?)? / (self.head_dim as f64).sqrt())?;
         let att = match mask {
@@ -504,6 +511,7 @@ impl Model {
                         a.kv_heads,
                         head_dim,
                         plan.context,
+                        DType::F32,
                     ) {
                         Ok(route) => (route, None),
                         Err(why) => (None, Some(why)),
@@ -524,6 +532,7 @@ impl Model {
                         n_head: plan.heads,
                         n_kv_head: a.kv_heads,
                         head_dim,
+                        kv_dtype: DType::F32,
                         cos: cos.clone(),
                         sin: sin.clone(),
                         neg_inf: neg_inf.clone(),
@@ -563,6 +572,38 @@ impl Model {
             span: tracing::span!(tracing::Level::TRACE, "model"),
             span_output: tracing::span!(tracing::Level::TRACE, "output"),
         })
+    }
+
+    /// Select the KV storage precision before creating any sequence. The default
+    /// remains f32. f16 rounds at each append; projections, RoPE and attention
+    /// still compute in f32, including CPU targets without native half matmul.
+    pub fn with_kv_dtype(mut self, dtype: DType) -> Result<Self> {
+        if !matches!(dtype, DType::F32 | DType::F16) {
+            bail!("quantized lfm2 KV storage requires f32 or f16")
+        }
+        // A cache created before this consuming configuration change must not
+        // be accepted with a different store precision.
+        self.owner = Arc::new(());
+        for layer in &mut self.layers {
+            if let LayerKind::Attention(attn) = &mut layer.kind {
+                attn.kv_dtype = dtype;
+                // The route reads the store: its key dtype, and the
+                // conversion each call makes, follow the store's precision.
+                if let Some(route) = &attn.route {
+                    let s = *route.spec();
+                    attn.route = attention_route(
+                        &self.device,
+                        s.q_heads,
+                        s.kv_heads,
+                        s.head_dim,
+                        s.bounds.keys,
+                        dtype,
+                    )
+                    .map_err(lloom_tensor::Error::Msg)?;
+                }
+            }
+        }
+        Ok(self)
     }
 
     pub fn config(&self) -> &Config {
@@ -816,6 +857,16 @@ pub struct GgufPlan<'a> {
     weights: weights::Lfm2Weights,
 }
 impl GgufPlan<'_> {
+    /// Resolve the requested runtime context before preflight and RoPE allocation.
+    /// A caller may shorten, but not extend, the checkpoint's supported context.
+    pub fn with_context_limit(mut self, max_tokens: usize) -> Result<Self> {
+        if max_tokens == 0 || max_tokens > self.weights.context {
+            bail!("quantized lfm2 requested context {max_tokens} must be in 1..={} (checkpoint context)", self.weights.context)
+        }
+        self.weights.context = max_tokens;
+        Ok(self)
+    }
+
     pub fn config(&self) -> Config {
         Config {
             context_length: self.weights.context,

@@ -1,5 +1,5 @@
 {
-  "commit": "ed4f5f151f59611de2bcaf972cd8c19df221813a",
+  "commit": "1ce8e10cb3e25ff2602a7716fcc27d1df7dca89b",
   "contract": "deterministic",
   "corpus_inputs": 27,
   "entries": [
@@ -874,6 +874,5 @@
   ],
   "tol": 0.05000000074505806,
   "weight_seed": 28977,
-  "corpus_source": "Retained geometries from candle/lloom/tests/tiny_manifests/lfm2.json; not the full historical campaign corpus.",
-  "source_manifest_sha256": "6fe06ae9f34b0c913443d2a34148a38fc8f0e3ca5837f58835143ef6aff357e4"
+  "source_manifest_sha256": "637649de328b11504e91041614fe4e1a0594e02979db8aebe33aebb23e8f83d8"
 }

@@ -1962,6 +1962,28 @@ impl SdpaPagedTable<'_> {
     }
 }
 
+/// Validate the complete additive mask before any input conversion or output allocation.
+fn check_attention_mask(
+    mask: &Tensor,
+    dtype: DType,
+    dims: [usize; 4],
+    same_device: bool,
+) -> Result<()> {
+    if !same_device {
+        lloom_tensor::bail!("sdpa: mask must be on the query device");
+    }
+    if mask.dtype() != dtype {
+        lloom_tensor::bail!("Mask type {:?} must match q type {dtype:?}", mask.dtype());
+    }
+    if mask.dims() != dims {
+        lloom_tensor::bail!(
+            "Mask shape must be {dims:?} (bs, qheads, qseq, kseq), got {:?}",
+            mask.dims()
+        );
+    }
+    Ok(())
+}
+
 #[allow(dead_code)]
 struct Sdpa<'a> {
     scale: f32,
@@ -2010,7 +2032,7 @@ impl lloom_tensor::CustomOp3 for Sdpa<'_> {
         v_l: &Layout,
     ) -> Result<(lloom_tensor::MetalStorage, Shape)> {
         use crate::nn::attention::route::AttentionKernel;
-        use lloom_tensor::backend::BackendStorage;
+        use lloom_tensor::backend::{BackendDevice, BackendStorage};
         use lloom_tensor::kernels::SdpaDType;
 
         let device = q.device();
@@ -2234,6 +2256,16 @@ impl lloom_tensor::CustomOp3 for Sdpa<'_> {
 
         // The mask's dtype and shape are checked here, with everything else,
         // before the output is allocated; only the tiled kernel reads it.
+        if let Some(mask) = &self.mask {
+            check_attention_mask(
+                mask,
+                q.dtype(),
+                [b_sz, q_heads, q_seq, k_seq],
+                mask.device()
+                    .as_metal_device()
+                    .is_ok_and(|other| other.same_device(device)),
+            )?;
+        }
         let mask_s_l = self.mask.as_ref().map(|m| m.storage_and_layout());
 
         let (mask_type, mask_buffer, mask_offset, mask_strides) = if let Some(mask) = &self.mask {
@@ -2250,18 +2282,6 @@ impl lloom_tensor::CustomOp3 for Sdpa<'_> {
                 DType::F32 => SdpaDType::F32,
                 other => lloom_tensor::bail!("unsupported sdpa type {other:?}"),
             };
-            if mask_type != itype {
-                lloom_tensor::bail!("Mask type {mask_type:?} must match q type {itype:?}");
-            }
-
-            if mask_l.dims() != [q_l.dim(0)?, q_l.dim(1)?, q_l.dim(2)?, k_seq] {
-                lloom_tensor::bail!(
-                    "Mask shape must be {:?} (bs, qheads, qseq, kseq), got {:?}",
-                    [q_l.dim(0)?, q_head, q_l.dim(2)?, k_seq],
-                    mask_l.dims()
-                );
-            }
-
             let strides: [usize; 4] = mask_l.stride().try_into().map_err(|_| {
                 lloom_tensor::Error::Msg(format!("sdpa: mask must be 4-D, got {:?}", mask_l.dims()))
             })?;
@@ -2831,7 +2851,13 @@ fn check_attention(
         );
     }
     match (spec.mask, mask) {
-        (MaskKind::Additive, Some(_)) | (MaskKind::None | MaskKind::Causal, None) => {}
+        (MaskKind::Additive, Some(mask)) => check_attention_mask(
+            mask,
+            spec.dtype,
+            [b, hq, nq, nk],
+            mask.device().same_device(q.device()),
+        )?,
+        (MaskKind::None | MaskKind::Causal, None) => {}
         (prepared, given) => lloom_tensor::bail!(
             "attention: a mask tensor {} on a route prepared for {prepared:?}",
             if given.is_some() { "given" } else { "missing" }

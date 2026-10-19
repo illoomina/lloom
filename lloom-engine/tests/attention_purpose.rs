@@ -139,7 +139,12 @@ fn production_refuses_the_composed_route_whatever_selects_it() {
     let q32 = gguf_args(&dir.join("qwen32"));
     let mut q32_off = q32.clone();
     q32_off.push("--fused-off".into());
-    let generic = vec!["--attn".to_string(), "generic".into()];
+    // chat's Metal default KV layout is paged, which only FlashDecoding
+    // reads; the LFM2 arms below name the attention, so they name the
+    // strided layout with it.
+    let generic: Vec<String> = ["--attn", "generic", "--kv-append", "cat"]
+        .map(String::from)
+        .to_vec();
 
     let cases: [(&str, &Path, &Vec<String>, &str); 3] = [
         ("qwen head dim 16", &qwen16, &q16, "head dim 16"),
@@ -172,7 +177,7 @@ fn production_refuses_the_composed_route_whatever_selects_it() {
         eprintln!("{name}: reference: loaded, {}", tokens(&reference));
     }
 
-    let sdpa = ["--attn", "sdpa"];
+    let sdpa = ["--attn", "sdpa", "--kv-append", "cat"];
     let (ok, served) = chat(&lfm2, &sdpa, None);
     assert!(ok, "lfm2 --attn sdpa under production:\n{served}");
     let q32: Vec<&str> = q32.iter().map(String::as_str).collect();

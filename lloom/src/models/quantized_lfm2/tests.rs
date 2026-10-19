@@ -356,3 +356,200 @@ fn a_packed_token_table_gathers_the_rows_its_dense_copy_holds() -> Result<()> {
 fn a_packed_token_table_gathers_the_rows_its_dense_copy_holds_on_metal() -> Result<()> {
     packed_table_gathers_dense_rows(&Device::new_metal(0)?)
 }
+
+#[test]
+fn f16_kv_is_actually_half_sized_and_survives_tiles_retention_and_reset() -> Result<()> {
+    let bytes = fixture()?;
+    let reference = load(&bytes)?;
+    let model = load(&bytes)?.with_kv_dtype(DType::F16)?;
+    let mut half_first = model.new_cache()?;
+    let mut full_first = reference.new_cache()?;
+    run(&model, &mut half_first, &[1], 1)?;
+    run(&reference, &mut full_first, &[1], 1)?;
+    for (half, full) in half_first.layers.iter().zip(&full_first.layers) {
+        if let (LayerState::Attention(Some((hk, hv))), LayerState::Attention(Some((fk, fv)))) =
+            (half, full)
+        {
+            for (h, f) in [(hk, fk), (hv, fv)] {
+                assert_eq!(
+                    h.flatten_all()?.to_vec1::<half::f16>()?,
+                    f.to_dtype(DType::F16)?
+                        .flatten_all()?
+                        .to_vec1::<half::f16>()?,
+                    "stored values must be exactly f16-rounded projections"
+                );
+            }
+        }
+    }
+    let tokens = [1, 2, 3, 4, 5];
+    let mut cache = model.new_cache()?;
+    let got = run(&model, &mut cache, &tokens, 2)?;
+    let mut full = reference.new_cache()?;
+    let expected = run(&reference, &mut full, &tokens, 2)?;
+    assert!(
+        got.iter()
+            .zip(&expected)
+            .all(|(a, b)| (a - b).abs() < 0.005),
+        "{got:?} != {expected:?}"
+    );
+    let mut stored = 0;
+    for (half, full) in cache.layers.iter().zip(&full.layers) {
+        if let (LayerState::Attention(Some((hk, hv))), LayerState::Attention(Some((fk, fv)))) =
+            (half, full)
+        {
+            for (h, f) in [(hk, fk), (hv, fv)] {
+                assert_eq!(h.dtype(), DType::F16);
+                assert_eq!(h.dims(), f.dims());
+                assert_eq!(
+                    2 * h.elem_count() * h.dtype().size_in_bytes(),
+                    f.elem_count() * f.dtype().size_in_bytes()
+                );
+                stored += h.elem_count();
+            }
+        }
+    }
+    assert!(stored > 0, "fixture must exercise real attention stores");
+    let saved = cache.retain_state()?;
+    let first = run(&model, &mut cache, &[6, 7], 2)?;
+    cache.restore_retained(&saved)?;
+    assert_eq!(first, run(&model, &mut cache, &[6, 7], 2)?);
+    cache.reset();
+    assert_eq!(got, run(&model, &mut cache, &tokens, 2)?);
+    assert!(load(&bytes)?.with_kv_dtype(DType::BF16).is_err());
+    Ok(())
+}
+
+#[test]
+fn context_limit_controls_actual_rope_and_sequence_bounds() -> Result<()> {
+    let bytes = fixture()?;
+    let mut file = Cursor::new(&bytes);
+    let header = gguf_file::Content::read(&mut file)?;
+    let plan = Model::preflight_gguf_content(&header, &mut file)?.with_context_limit(3)?;
+    assert_eq!(plan.config().context_length, 3);
+    let model = plan.materialize(&mut file, &Device::Cpu)?;
+    for layer in &model.layers {
+        if let LayerKind::Attention(attn) = &layer.kind {
+            assert_eq!(attn.cos.dims()[0], 3);
+        }
+    }
+    let mut cache = model.new_cache()?;
+    let actual = run(&model, &mut cache, &[1, 2, 3], 2)?;
+    let native = load(&bytes)?;
+    assert_eq!(
+        actual,
+        run(&native, &mut native.new_cache()?, &[1, 2, 3], 2)?,
+        "shortening the context must preserve prefix logits"
+    );
+    assert!(run(&model, &mut cache, &[4], 1).is_err());
+    assert_eq!(cache.pos, 3);
+    assert!(!cache.failed, "overflow must refuse before writes");
+    assert!(Model::preflight_gguf_content(&header, &mut file)?
+        .with_context_limit(0)
+        .is_err());
+    assert!(Model::preflight_gguf_content(&header, &mut file)?
+        .with_context_limit(usize::MAX)
+        .is_err());
+    Ok(())
+}
+
+/// The optional store changes no projection/attention dtype on Metal either.
+/// Compare both stores to the same CPU reference at a small real GGUF layout.
+#[test]
+#[cfg(feature = "metal")]
+fn metal_dense_kv_stores_match_the_cpu_reference() -> Result<()> {
+    let bytes = synthetic::fixture_table(lloom_tensor::quantized::GgmlDType::F32, 32)?;
+    let gpu = Device::new_metal(0)?;
+    let make = |device: &Device, dtype| -> Result<Model> {
+        let mut file = Cursor::new(&bytes);
+        Model::from_gguf(gguf_file::Content::read(&mut file)?, &mut file, device)?
+            .with_kv_dtype(dtype)
+    };
+    let drive = |model: &Model| -> Result<(Vec<f32>, Cache)> {
+        let mut cache = model.new_cache()?;
+        let mut logits = None;
+        for chunk in [&[1u32, 2][..], &[3, 4][..], &[5][..]] {
+            let input = Tensor::new(chunk, &model.device)?.unsqueeze(0)?;
+            logits = Some(CausalLM::forward(model, &input, cache.pos, &mut cache)?);
+        }
+        model.device.synchronize()?;
+        Ok((logits.unwrap().flatten_all()?.to_vec1()?, cache))
+    };
+    for dtype in [DType::F32, DType::F16] {
+        let cpu = make(&Device::Cpu, dtype)?;
+        let metal = make(&gpu, dtype)?;
+        let (expected, _) = drive(&cpu)?;
+        let (got, cache) = drive(&metal)?;
+        for (a, b) in got.iter().zip(&expected) {
+            assert!(
+                a.is_finite() && b.is_finite() && (a - b).abs() < 1e-3,
+                "{dtype:?}: {got:?} != {expected:?}"
+            );
+        }
+        assert_eq!(got, drive(&metal)?.0, "run-to-run identity {dtype:?}");
+        let mut stores = 0;
+        for layer in &cache.layers {
+            if let LayerState::Attention(Some((k, v))) = layer {
+                assert_eq!(k.dtype(), dtype);
+                assert_eq!(v.dtype(), dtype);
+                stores += 1;
+            }
+        }
+        assert!(stores > 0);
+    }
+    Ok(())
+}
+
+/// On Metal the fused route reads the KV store it is handed: at a head dim
+/// the route serves, its key dtype follows `with_kv_dtype`, the conversion it
+/// quotes is the store's (none for f32), and both stores match the CPU
+/// reference, which attends composed, within the bound the composed Metal
+/// arm above is held to.
+#[test]
+#[cfg(feature = "metal")]
+fn metal_fused_route_reads_the_kv_store_dtype() -> Result<()> {
+    let bytes = synthetic::fixture_table(lloom_tensor::quantized::GgmlDType::F32, 64)?;
+    let gpu = Device::new_metal(0)?;
+    let make = |device: &Device, dtype| -> Result<Model> {
+        let mut file = Cursor::new(&bytes);
+        Model::from_gguf(gguf_file::Content::read(&mut file)?, &mut file, device)?
+            .with_kv_dtype(dtype)
+    };
+    let drive = |model: &Model| -> Result<Vec<f32>> {
+        let mut cache = model.new_cache()?;
+        let mut logits = None;
+        for chunk in [&[1u32, 2][..], &[3, 4][..], &[5][..]] {
+            let input = Tensor::new(chunk, &model.device)?.unsqueeze(0)?;
+            logits = Some(CausalLM::forward(model, &input, cache.pos, &mut cache)?);
+        }
+        model.device.synchronize()?;
+        logits.unwrap().flatten_all()?.to_vec1()
+    };
+    for dtype in [DType::F32, DType::F16] {
+        let metal = make(&gpu, dtype)?;
+        assert_eq!(metal.reference_attention(), None, "{dtype:?}");
+        let routes: Vec<_> = metal
+            .layers
+            .iter()
+            .filter_map(|l| match &l.kind {
+                LayerKind::Attention(a) => a.route,
+                _ => None,
+            })
+            .collect();
+        assert!(!routes.is_empty(), "{dtype:?}: no layer took the route");
+        for route in &routes {
+            assert_eq!(route.spec().kv_dtype, dtype);
+            let quoted = route.workspace(1, 1, 5)?.conversion;
+            assert_eq!(quoted == 0, dtype == DType::F32, "{dtype:?}: {quoted}");
+        }
+        let expected = drive(&make(&Device::Cpu, dtype)?)?;
+        let got = drive(&metal)?;
+        for (a, b) in got.iter().zip(&expected) {
+            assert!(
+                a.is_finite() && b.is_finite() && (a - b).abs() < 1e-3,
+                "{dtype:?}: {got:?} != {expected:?}"
+            );
+        }
+        assert_eq!(got, drive(&metal)?, "run-to-run identity {dtype:?}");
+    }
+    Ok(())
+}

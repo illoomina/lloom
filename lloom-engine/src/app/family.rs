@@ -1113,6 +1113,51 @@ mod tests {
             .contains("kv_quant=[off,f16,int8,int4] kv_dtype=f32"));
     }
 
+    #[test]
+    fn lfm2_gguf_serves_a_real_f16_dense_store_but_not_integer_kv() {
+        let caps = super::super::causal_loaded::served::lfm2_gguf_capabilities();
+        for value in ["off", "f16"] {
+            resolve_kv_quant(&caps, &with_kv_quant(value).model.axes).unwrap();
+        }
+        for value in ["int8", "int4"] {
+            assert!(resolve_kv_quant(&caps, &with_kv_quant(value).model.axes).is_err());
+        }
+        assert_eq!(caps.kv_quant_names(), ["off", "f16"]);
+    }
+
+    /// The EOS gate's arm on Qwen3.5 does not open a reduced KV store: the
+    /// gate keeps the state only where every write the accepted state needs
+    /// runs ungated, and a reduced store's growth copy (`QuantKvSlab::grow_to`)
+    /// is ungated only inside LFM2's `apply_grow`, not on this family's
+    /// `Slab` path (`sequence-reuse-design.md` §2.3e). So with the arm on or
+    /// off the family serves its f32 store alone and refuses the rest by
+    /// name, with its reason.
+    #[test]
+    fn the_qwen3_5_gate_arm_still_refuses_a_reduced_kv_store() {
+        for gate in [false, true] {
+            let caps = qwen3_5_capabilities(gate);
+            assert_eq!(caps.eos_gate, gate);
+            resolve_kv_quant(&caps, &with_kv_quant("off").model.axes)
+                .unwrap_or_else(|e| panic!("gate {gate}: off is served: {e}"));
+            for v in ["int8", "int4"] {
+                let err = resolve_kv_quant(&caps, &with_kv_quant(v).model.axes)
+                    .unwrap_err()
+                    .to_string();
+                assert!(
+                    err.contains("their gates were not run on this family"),
+                    "gate {gate}, kv-quant = {v}: {err}"
+                );
+            }
+            let err = resolve_kv_quant(&caps, &with_kv_quant("f16").model.axes)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("qwen3_5 builds none"),
+                "gate {gate}, kv-quant = f16: {err}"
+            );
+        }
+    }
+
     /// What the load is handed for each spelling: the store the name
     /// describes, never the f32 store under another label.
     #[test]
@@ -1262,7 +1307,10 @@ mod tests {
             "{note}"
         );
         let mut s = with("ring-nonblocking");
-        assert_eq!(clamp_ungated_eos_gate(&qwen3_5_capabilities(true), &mut s), None);
+        assert_eq!(
+            clamp_ungated_eos_gate(&qwen3_5_capabilities(true), &mut s),
+            None
+        );
         assert!(s.decode.readback.eos_gate, "on: kept");
     }
 

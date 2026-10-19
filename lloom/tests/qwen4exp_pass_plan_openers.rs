@@ -204,9 +204,9 @@ fn a_direct_forward_does_not_plan_the_drivers_prefill() -> Result<()> {
 /// a pass a plan serves owes no transient, and the model's own plan says
 /// nothing about a driver's pass of the same shape, nor the reverse. The
 /// budget admits what is allocated plus a margin that covers the KV slab a
-/// reset cache grows again (a few KB on this model) and not the prefill's
-/// transient (`PREFILL_TRANSIENT_BYTES_PER_TOKEN` × 9 = 27 MB): the model's
-/// served prefill passes, and the driver's unplanned one is refused.
+/// reset cache grows again and half the prefill's transient
+/// (`Qwen4Exp::prefill_transient`): the model's served prefill passes, and
+/// the driver's unplanned one is refused.
 #[test]
 fn admission_reads_the_plan_of_the_pass_that_runs() -> Result<()> {
     use lloom::models::qwen4exp::{MemCheck, State};
@@ -233,10 +233,14 @@ fn admission_reads_the_plan_of_the_pass_that_runs() -> Result<()> {
     let own = prefill_key().opened_by(PassOpener::Model);
     assert!(m.pass_plan_cached(&own) && !m.pass_plan_cached(&prefill_key()));
 
-    let margin = 8 << 20;
+    cache.reset();
+    let unplanned = model.plan_pass(&cache, PROMPT.len());
+    let transient = model.prefill_transient().forward(PROMPT.len(), 0).held as usize;
+    assert_eq!(unplanned.transient, transient);
+    let margin = unplanned.kv_grow + transient / 2;
     assert!(
-        margin < lloom::models::qwen4exp::PREFILL_TRANSIENT_BYTES_PER_TOKEN * PROMPT.len(),
-        "the margin must not admit the transient"
+        transient > 0 && margin < unplanned.bytes(),
+        "the margin must not admit the transient: {unplanned:?}"
     );
     let mtl = m.device();
     let budget = mtl.current_allocated_size() + margin;

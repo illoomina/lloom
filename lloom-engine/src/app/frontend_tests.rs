@@ -88,49 +88,49 @@ const PINNED_ROWS: &[(&str, &[Frontend], When, &str, &str)] = &[
     (
         "backend.metal.command_buffer.api",
         CHAT_SERVE,
-        When::Always,
+        When::Metal,
         "metal4",
         TUNED_FLOW,
     ),
     (
         "backend.metal.compiler.merged_unit",
         CHAT_SERVE,
-        When::Always,
+        When::Metal,
         "true",
         TUNED_FLOW,
     ),
     (
         "backend.metal.copy2d_compute",
         CHAT_SERVE,
-        When::Always,
+        When::Metal,
         "true",
         TUNED_FLOW,
     ),
     (
         "backend.metal.heaps.transient",
         CHAT_SERVE,
-        When::Always,
+        When::Metal,
         "true",
         TUNED_FLOW,
     ),
     (
         "decode.readback.kind",
         CHAT_SERVE,
-        When::Always,
+        When::Metal,
         "ring",
         TUNED_FLOW,
     ),
     (
         "decode.readback.eos",
         CHAT_SERVE,
-        When::Always,
+        When::Metal,
         "gpu-batched-nonblocking",
         TUNED_FLOW,
     ),
     (
         "decode.readback.stream_reader",
         CHAT_SERVE,
-        When::Always,
+        When::Metal,
         "true",
         TUNED_FLOW,
     ),
@@ -267,8 +267,8 @@ fn before_tree() -> (EngineOptions, Vec<String>) {
 fn batch_for(r: &frontend::Row) -> Vec<&'static str> {
     match r.when {
         When::Batched => vec!["--batch", "4"],
-        // No `--model`: the LFM2 snapshot, which takes the model axes.
-        When::Always | When::ModelAxes => vec![],
+        // No `--model`: the LFM2 snapshot, whose family takes the model axes.
+        When::Always | When::Metal | When::ModelAxes => vec![],
     }
 }
 
@@ -281,13 +281,25 @@ fn each_front_end_resolves_its_own_defaults_through_the_command_line() {
     for r in ROWS {
         let argv = batch_for(r);
         let o = resolve(Some(r.frontend), r.frontend.name(), &argv, &none).unwrap();
-        assert_eq!(
-            at(&o, r.key),
-            typed(r.key, frontend::value(r)),
-            "{} {}",
-            r.frontend.name(),
-            r.key
-        );
+        if r.when.holds(&o) {
+            assert_eq!(
+                at(&o, r.key),
+                typed(r.key, frontend::value(r)),
+                "{} {}",
+                r.frontend.name(),
+                r.key
+            );
+        } else {
+            // A row whose condition this build cannot meet (the model axes
+            // without Metal) leaves the library's own value.
+            assert_eq!(
+                at(&o, r.key),
+                at(&EngineOptions::default(), r.key),
+                "{} {} (row not held)",
+                r.frontend.name(),
+                r.key
+            );
+        }
         checked += 1;
         if r.key == "context.prefix.reuse" {
             let shape = Shape::of(&o, r.frontend, String::new());
@@ -301,6 +313,25 @@ fn each_front_end_resolves_its_own_defaults_through_the_command_line() {
         assert_eq!(at(&lib, r.key), at(&EngineOptions::default(), r.key));
     }
     assert_eq!(checked, ROWS.len());
+    // `--cpu` keeps the model axes at the library's values on every
+    // front-end: the paged pool, FlashDecoding and the fused conv are Metal
+    // kernels, and a CPU load must not be refused by its own defaults.
+    for f in Frontend::ALL {
+        let o = resolve(Some(f), f.name(), &["--cpu"], &none).unwrap();
+        for r in ROWS
+            .iter()
+            .filter(|r| r.frontend == f && matches!(r.when, When::Metal | When::ModelAxes))
+        {
+            assert!(!r.when.holds(&o), "{} {} holds on --cpu", f.name(), r.key);
+            assert_eq!(
+                at(&o, r.key),
+                at(&EngineOptions::default(), r.key),
+                "{} {} on --cpu",
+                f.name(),
+                r.key
+            );
+        }
+    }
     // The shape a front-end loads with, from options no front-end resolved
     // (a harness's, a test's): the front-end's own reuse still applies.
     for f in Frontend::ALL {
@@ -384,9 +415,15 @@ fn every_spelling_of_a_front_end_key_names_it_and_the_value_holds() {
             Value::Null => {}
             v => values.push(lloom_tensor::options::render(v)),
         }
-        // Beside the two defaults, a value that is neither where the domain
-        // has one: the other bool, another arm of an enum, a count.
-        let arms = key.meta().variants;
+        // An enum key (`metal3 | metal4 | auto`) takes another of its arms
+        // rather than a number it would refuse.
+        let arms: Vec<&str> = key
+            .meta()
+            .variants
+            .iter()
+            .copied()
+            .filter(|a| !a.contains('<'))
+            .collect();
         if key.meta().is_bool || key.meta().ty.contains("bool") {
             values = vec!["true".into(), "false".into()];
         } else if !arms.is_empty() {

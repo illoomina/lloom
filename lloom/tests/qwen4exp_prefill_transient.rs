@@ -122,7 +122,7 @@ fn held_forward(
     m.set_compute_per_buffer(usize::MAX >> 1);
     let before = pool(m);
     let gate = HostEvent::new(m)?;
-    gate.encode_wait(1)?;
+    gate.commit_when_produced(1)?;
     let held_epoch = clock.current_epoch();
     let done = Arc::new(AtomicBool::new(false));
     let timed_out = Arc::new(AtomicBool::new(false));

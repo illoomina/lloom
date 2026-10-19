@@ -21,8 +21,11 @@ pub(super) type Record = Registration<Captures, NativeOwners, metal4::Feedback>;
 
 pub(super) struct Captures {
     pub callbacks: Vec<Callback>,
-    /// The queue's completion hook runs for this record, after its callbacks.
-    pub hooked: bool,
+    /// Epochs this record completes on the queue's completion hook, after its
+    /// callbacks: 0 for an unflagged record, 1 for a commit, more when the
+    /// commit also retires epochs reserved by recordings that were cancelled
+    /// before submission (`commands.rs`, `commit_when_produced`).
+    pub hook_runs: u32,
     /// A bound Metal 3 buffer's generation: told after the hook that every
     /// earlier record and this one's callbacks are done.
     pub bindings: Option<super::native_generation_bindings::GenerationBindings>,
@@ -31,14 +34,14 @@ impl Captures {
     pub fn new(callbacks: Vec<Callback>) -> Self {
         Self {
             callbacks,
-            hooked: false,
+            hook_runs: 0,
             bindings: None,
         }
     }
     pub fn with_binding(head: super::native_generation_bindings::GenerationBindings) -> Self {
         Self {
             callbacks: Vec::new(),
-            hooked: false,
+            hook_runs: 0,
             bindings: Some(head),
         }
     }
@@ -53,12 +56,14 @@ impl Captures {
             for callback in &self.callbacks {
                 callback(feedback);
             }
-            if self.hooked {
+            if self.hook_runs > 0 {
                 // Flagging requires an installed hook (`run_hook`); a hooked
                 // record without one is a broken invariant, and this panic is
                 // caught at the adapter boundary as a callback failure.
-                hook.expect("hooked record on a queue without a completion hook")
-                    .complete(feedback);
+                let hook = hook.expect("hooked record on a queue without a completion hook");
+                for _ in 0..self.hook_runs {
+                    hook.complete(feedback);
+                }
             }
             if let Some(head) = &self.bindings {
                 // SAFETY: only AssociatedBuffer's original record installs this

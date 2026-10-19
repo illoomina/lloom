@@ -466,9 +466,10 @@ impl Completions {
     }
 }
 impl PreparedCommit<'_> {
-    /// Flag this record for the queue's completion hook. No allocation, no
-    /// lock: a phase-exclusive edit of the prepared record.
-    pub(super) fn run_hook(&self) -> Result<(), crate::kernels::MetalKernelError> {
+    /// Flag this record for the queue's completion hook, completing `runs`
+    /// epochs. No allocation, no lock: a phase-exclusive edit of the prepared
+    /// record.
+    pub(super) fn run_hook(&self, runs: u32) -> Result<(), crate::kernels::MetalKernelError> {
         self.core.check()?;
         if self.core.hook.get().is_none() {
             return Err(unavailable("M3 completion hook not installed"));
@@ -476,7 +477,7 @@ impl PreparedCommit<'_> {
         match self
             .marker
             .record()
-            .edit_prepared((), |captures, _, _| captures.hooked = true)
+            .edit_prepared((), |captures, _, _| captures.hook_runs = runs)
         {
             Ok(_) => Ok(()),
             Err(crate::retirement_mailbox::PreparedEditError::Rejected(_)) => {
@@ -931,6 +932,23 @@ impl AssociatedBuffer {
             nonblocking,
             self.bindings.as_ref(),
         )
+    }
+    /// Cancel this recording before submission, whoever else still holds a
+    /// wrapper: no later commit can enter native work, and the raw owners go
+    /// to host retirement as the last wrapper drops. `false` when it was
+    /// already submitted or cancelled.
+    pub(super) fn abandon_unsubmitted(&self) -> bool {
+        if self.marker.record().cancel_before_handoff().is_err() {
+            return false;
+        }
+        if let Some(head) = &self.bindings {
+            // SAFETY: successful Prepared cancellation proves no native
+            // handoff; the original anchor/raw retains SAME head until Drop.
+            if unsafe { head.terminal_cancelled() }.is_err() {
+                head.quarantine(Failure::AdapterFailed);
+            }
+        }
+        true
     }
     pub(super) fn try_commit(&self) -> Result<(), crate::kernels::MetalKernelError> {
         self.prepare_commit()?.commit()

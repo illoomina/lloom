@@ -115,12 +115,16 @@ impl PreparedCommandCommit<'_> {
             PreparedNative::Metal3(_) => panic!("owner fixture requires associated native work"),
         }
     }
-    /// Flag this commit for its queue's completion hook (`completion_hook.rs`).
-    /// Only queue-associated buffers have one; a standalone buffer refuses.
-    pub(super) fn run_completion_hook(&self) -> Result<(), crate::kernels::MetalKernelError> {
+    /// Flag this commit for its queue's completion hook (`completion_hook.rs`),
+    /// completing `runs` epochs. Only queue-associated buffers have one; a
+    /// standalone buffer refuses.
+    pub(super) fn run_completion_hook(
+        &self,
+        runs: u32,
+    ) -> Result<(), crate::kernels::MetalKernelError> {
         match &self.native {
-            Some(PreparedNative::Metal3Associated(prepared)) => prepared.run_hook(),
-            Some(PreparedNative::Metal4(prepared)) => prepared.run_hook(),
+            Some(PreparedNative::Metal3Associated(prepared)) => prepared.run_hook(runs),
+            Some(PreparedNative::Metal4(prepared)) => prepared.run_hook(runs),
             Some(PreparedNative::Metal3(_)) | None => {
                 Err(crate::kernels::MetalKernelError::QueueUnavailable(
                     "a standalone command buffer has no completion hook",
@@ -812,10 +816,49 @@ impl CommandBuffer {
         // SAFETY: this exact buffer created the encoder under EncoderAdmission.
         // No raw alias escaped; with_recording attaches the parent-owning lease
         // before return, so the encoder ends before another recording can enter.
-        let encoder = unsafe {
-            BlitCommandEncoder::new(raw, Arc::clone(fence), Arc::clone(prev_ce_outputs))
-        };
+        let encoder =
+            unsafe { BlitCommandEncoder::new(raw, Arc::clone(fence), Arc::clone(prev_ce_outputs)) };
         Ok(encoder.with_recording(admission))
+    }
+
+    /// Abandon a queue-associated recording before submission, whoever else
+    /// holds a handle to it (`Commands::cancel_produced`). `false` when it was
+    /// already submitted or abandoned; a standalone buffer refuses.
+    pub(super) fn cancel_unsubmitted(&self) -> Result<bool, crate::kernels::MetalKernelError> {
+        if let Backend::Metal3(_) = &self.backend {
+            return Err(crate::kernels::MetalKernelError::QueueUnavailable(
+                "a standalone command buffer has no owner to cancel it",
+            ));
+        }
+        // PREPARED excludes every encoder and edit; ABANDONED then refuses
+        // every later admission, and a waiter reads it as the cancellation.
+        let mut ticket = match self.lifecycle().prepare() {
+            Ok(ticket) => ticket,
+            Err(crate::command_lifecycle::LifecycleError::Abandoned) => return Ok(false),
+            Err(reason) => return Err(lifecycle_error(reason)),
+        };
+        let native = match &self.backend {
+            Backend::Metal4(submission) => submission.abandon_unsubmitted(),
+            Backend::Metal3Associated(buffer) => Ok(buffer.abandon_unsubmitted()),
+            Backend::Metal3(_) => unreachable!("refused above"),
+        };
+        let closed = self
+            .lifecycle()
+            .abandon(&mut ticket)
+            .map_err(lifecycle_error);
+        self.notify_lifecycle();
+        let abandoned = native?;
+        closed?;
+        Ok(abandoned)
+    }
+
+    /// Whether this recording was abandoned before submission
+    /// (`cancel_unsubmitted`): a wait on it can never complete.
+    pub(super) fn abandoned(&self) -> bool {
+        matches!(
+            self.lifecycle().check_wait_submission(),
+            Err(crate::command_lifecycle::LifecycleError::Abandoned)
+        )
     }
 
     /// Submit a standalone interoperability buffer. Bound engine recordings

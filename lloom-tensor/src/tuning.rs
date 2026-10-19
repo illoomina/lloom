@@ -775,6 +775,9 @@ fn parse_cut_policy(v: &str) -> Result<String, String> {
 fn parse_command_api(v: &str) -> Result<String, String> {
     parse_arm(v, &["metal3", "metal4", "auto"]).map(str::to_owned)
 }
+fn parse_host_input(v: &str) -> Result<String, String> {
+    parse_arm(v, &["commit", "gpu-wait"]).map(str::to_owned)
+}
 
 fn parse_completion_wait(v: &str) -> Result<String, String> {
     let v = non_empty(v)?.to_ascii_lowercase();
@@ -1226,6 +1229,9 @@ pub struct MetalTuning {
     /// Command API: metal3 (default), metal4 (experimental reusable native buffers), or auto (Metal 4 when available and compatible with diagnostics, otherwise Metal 3).
     #[opt(flag = "metal-api", env = "LLOOM_METAL_API", parser = "parse_command_api", variants = ["metal3", "metal4", "auto"], path = "backend.metal.command_buffer.api", status = "arm", flows = ["commands-out"])]
     pub command_api: String,
+    /// How the command stream orders work behind an input a host thread or the IO queue produces: `commit` (the producer commits the dependent recording once the input exists; the GPU never waits on a host-produced signal) or `gpu-wait` (the dependent recording is committed at once behind a GPU wait on the producer's event — the A/B control; a timed-out Metal 4 queue wait releases the work).
+    #[opt(flag = "host-input", env = "LLOOM_HOST_INPUT", parser = "parse_host_input", variants = ["commit", "gpu-wait"], path = "backend.metal.command_buffer.host_input", status = "arm", facets = ["wait"], flows = ["commands-out", "weights-in"])]
+    pub host_input: String,
     /// How the host waits for a command buffer: `block` (the blocking wait), `event` (park on the buffer's shared event), `event:<dur>` (the same, timed out after whole milliseconds), `event-sleep[:<dur>]` (poll the event, sleeping between looks), `event-listener[:<dur>]` (an event listener, timed out). The older spellings `synchronize`, `shared-event`, `shared-event-wait[:ms]`, `shared-event-sleep[:µs]`, `shared-event-listener[:ms]` are the same arms.
     #[opt(flag = "completion-wait", env = "CANDLE_METAL_COMPLETION_WAIT", parser = "parse_completion_wait", variants = ["synchronize", "shared-event", "shared-event-sleep[:µs]", "shared-event-wait[:ms]", "shared-event-listener[:ms]"], path = "backend.metal.completion_wait", status = "arm", facets = ["wait"], flows = ["token-out", "prompt-in", "commands-out"], forms = ["block", "event", "event-sleep", "event-listener"], from_v1 = "crate::options::v1::completion_wait_from", to_v1 = "completion_wait_to", schema = "Wait")]
     pub completion_wait: String,
@@ -1377,6 +1383,7 @@ impl Default for MetalTuning {
     fn default() -> Self {
         MetalTuning {
             command_api: "metal3".into(),
+            host_input: "commit".into(),
             completion_wait: "synchronize".into(),
             compute_per_buffer: DEFAULT_CANDLE_METAL_COMPUTE_PER_BUFFER,
             pipelined_compute_per_buffer: DEFAULT_CANDLE_METAL_PIPELINED_COMPUTE_PER_BUFFER,

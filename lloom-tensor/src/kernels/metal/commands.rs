@@ -5,6 +5,11 @@ mod cold_setup_tests;
 mod entry_guard;
 #[path = "commands_lifecycle.rs"]
 mod lifecycle;
+#[path = "commands_produced.rs"]
+mod produced;
+#[cfg(test)]
+#[path = "commands_produced_tests.rs"]
+mod produced_tests;
 #[cfg(test)]
 #[path = "commands_submission_test.rs"]
 pub(super) mod submission_test;
@@ -39,6 +44,7 @@ pub type CommandQueue = Retained<ProtocolObject<dyn MTLCommandQueue>>;
 use crate::tuning::DEFAULT_CANDLE_METAL_COMPUTE_PER_BUFFER;
 
 pub use crate::command_policy::CutPolicy;
+pub use produced::{HostInputArm, ProducedStats};
 
 /// Whether the queue hands out command buffers that do NOT retain the
 /// resources encoded into them (`commandBufferWithUnretainedReferences`).
@@ -360,6 +366,20 @@ struct EntryState {
     // Per-call lookahead bound: recovery + one explicit cut can consume TWO.
     // This is not a global generation/cardinality cap. Untracked Core keeps None.
     binding_credits: [Option<super::native_generation_bindings::PreparedGeneration>; 2],
+    /// The inputs the current recording reads that a host thread or the IO
+    /// queue has not produced yet: it is not committed until they exist.
+    gate: produced::Gate,
+    /// Recordings cut while an input they read, or one ahead of them, was
+    /// not yet produced: closed, their epochs taken, not yet committed. In
+    /// commit order (`produced.rs`).
+    held: std::collections::VecDeque<produced::Held>,
+    /// A signal was encoded into the current recording since its cut.
+    signals_since_cut: bool,
+    /// Epochs taken by held recordings that were cancelled before their
+    /// commit: the next commit's completion completes them too.
+    owed_epochs: u32,
+    /// The current recording was cancelled and no replacement was free.
+    current_abandoned: bool,
 }
 
 // One acquisition can close one compute encoder and construct one replacement.
@@ -369,7 +389,13 @@ struct ClosedEncoders<'a> {
     compute: DeferredSlots<ComputeCommandEncoder, 1>,
     blit: DeferredSlots<PendingBlit, 2>,
     executor: DeferredSlots<Arc<ExecutorSlot>, 1>,
-    removals: DeferredSlots<PublishedRemovals, 1>,
+    // A drain of held recordings publishes residency once, before its first
+    // commit; an ordinary commit in the same acquisition takes the other.
+    removals: DeferredSlots<PublishedRemovals, 2>,
+    // Recordings cancelled under the lock; released after it.
+    cancelled: Vec<CommandBuffer>,
+    // This acquisition published residency for a commit already.
+    residency_published: bool,
     // Last: closed wrappers can hand their fields to this same hold before
     // its existing completed-prefix drain runs. No release occurs under state.
     completed_hold: Option<CompletedRelease<'a, Held>>,
@@ -386,6 +412,11 @@ impl EntryState {
             current_encoder: None,
             namespace: Default::default(),
             binding_credits: std::array::from_fn(|_| None),
+            gate: produced::Gate::default(),
+            held: std::collections::VecDeque::new(),
+            signals_since_cut: false,
+            owed_epochs: 0,
+            current_abandoned: false,
         }
     }
 }
@@ -563,6 +594,10 @@ struct CommandsCore {
     /// The first command buffer that ended in error, latched by its completion
     /// handler so every later commit and wait reports it.
     failure: Arc<CommandBufferFailure>,
+    /// How work behind a host- or IO-produced input is ordered, read once.
+    host_input: produced::HostInputArm,
+    /// Producer-side view of the held recordings (`produced.rs`).
+    produced: produced::ProducedState,
     // LAST: native wrapper fields release before this submit-capability pin.
     physical: crate::retirement_service::PhysicalAnchor<
         crate::metal_backend::device_retirement::NamespaceOwner,
@@ -993,7 +1028,12 @@ impl Commands {
         let encoder_domain = super::encoder::EncoderDomain::new(retirement_wake.clone());
         let mut state = EntryState::new(cb);
         state.binding_credits = credits;
-        let core = Arc::new(CommandsCore {
+        state
+            .held
+            .try_reserve_exact(produced::HELD_CAP)
+            .map_err(|_| MetalKernelError::QueueUnavailable("held recording storage refused"))?;
+        let host_input = produced::HostInputArm::selected()?;
+        let core = Arc::new_cyclic(|me| CommandsCore {
             #[cfg(test)]
             submission_control: Arc::default(),
             binding_bank,
@@ -1036,6 +1076,8 @@ impl Commands {
             kind,
             hold,
             failure,
+            host_input,
+            produced: produced::ProducedState::new(me.clone()),
             physical: crate::retirement_service::PhysicalAnchor::default(),
         });
         let core = lifecycle::register(core)?;
@@ -1388,20 +1430,7 @@ impl Commands {
     /// Native feedback can arrive before commit_swap_locked releases EntryState.
     /// Refuse only actual same-queue blocking; available state remains usable.
     fn lock_state(&self) -> Result<EntryGuard<'_>, MetalKernelError> {
-        self.core
-            .state
-            .lock_checked(Side::Host, || {
-                if let Some(queue) = &self.core.modern_queue {
-                    crate::completion_scope::before_park(Arc::as_ptr(queue) as usize)
-                        .map_err(|_| MetalKernelError::CallbackWouldBlock)?;
-                }
-                if let Some(core) = &self.core.legacy_completions {
-                    crate::completion_scope::before_park(core.identity())
-                        .map_err(|_| MetalKernelError::CallbackWouldBlock)?;
-                }
-                Ok(())
-            })
-            .map(|guard| DeferredGuard::new(guard, ClosedEncoders::default()))
+        self.core.lock_entry()
     }
 
     fn lock_recording_state(&self) -> Result<EntryGuard<'_>, MetalKernelError> {
@@ -1460,7 +1489,7 @@ impl Commands {
         let flush = self.should_cut(count);
 
         if flush {
-            self.commit_swap_locked(&mut state_guard, 1)?;
+            self.cut_locked(&mut state_guard, 1)?;
         }
 
         // The per-kernel timing arm: a counter-sampled encoder per dispatch,
@@ -1583,13 +1612,14 @@ impl Commands {
                 .recording()
                 .expect("recording recovered above")
                 .signal_event(event, value)?;
-            self.commit_swap_locked(&mut state, 0)?;
+            self.cut_locked(&mut state, 0)?;
         } else {
             state
                 .current
                 .recording()
                 .expect("recording recovered above")
                 .signal_event(event, value)?;
+            state.signals_since_cut = true;
         }
         Ok(())
     }
@@ -1597,6 +1627,12 @@ impl Commands {
     /// Make every command encoded after this one on the current command
     /// buffer wait for `event` to reach `value` (the other half of
     /// [`Self::encode_signal_event`]). Ends the open compute encoder.
+    ///
+    /// For a signal the GPU produces only: a wait times out (Metal 4 then
+    /// releases the work behind it, Metal 3 fails its command buffer), and
+    /// nothing bounds a host thread or a disk read by that timeout. Work
+    /// behind a host- or IO-produced input is committed by its producer
+    /// instead ([`Self::commit_when_produced`]).
     pub fn encode_wait_for_event(
         &self,
         event: &ProtocolObject<dyn objc2_metal::MTLSharedEvent>,
@@ -1606,7 +1642,7 @@ impl Commands {
         self.ensure_recording_locked(&mut state)?;
         self.core.close_compute(&mut state)?;
         if self.core.modern_queue.is_some() {
-            self.commit_swap_locked(&mut state, 0)?;
+            self.cut_locked(&mut state, 0)?;
         }
         state
             .current
@@ -1623,7 +1659,7 @@ impl Commands {
         let flush = self.should_cut(count);
 
         if flush {
-            self.commit_swap_locked(&mut state_guard, 1)?;
+            self.cut_locked(&mut state_guard, 1)?;
         }
 
         // End compute encoder before starting blit.
@@ -1670,21 +1706,32 @@ impl Commands {
     /// Drain a retained successful submission without refilling metadata or
     /// allocating its replacement. Ordinary recording cuts retain swap policy.
     pub fn flush_and_wait(&self) -> Result<(), MetalKernelError> {
-        let (to_wait, retained_current, commit_error) = {
+        let (to_wait, retained_current, held_last, commit_error) = {
             let mut state = self.lock_drain_state()?;
             let commit_error = if state.current.submitted().is_none()
-                && self.core.compute_count.load(Ordering::Acquire) > 0
+                && (self.core.compute_count.load(Ordering::Acquire) > 0 || state.signals_since_cut)
             {
-                self.commit_swap_locked(&mut state, 0).err()
+                self.cut_locked(&mut state, 0).err()
             } else {
                 None
             };
             let retained = state.current.submitted().map(|(cb, _)| cb.clone());
-            (std::mem::take(&mut state.in_flight), retained, commit_error)
+            let held_last = state.held.back().map(|held| held.cb.clone());
+            (
+                std::mem::take(&mut state.in_flight),
+                retained,
+                held_last,
+                commit_error,
+            )
         };
-        // The retained current is newer than every in-flight record. Waiting
-        // it needs no allocation and remains possible after replacement fails.
-        if let Some(last) = retained_current.as_ref().or_else(|| to_wait.last()) {
+        // A held recording is newer than everything committed, and the
+        // retained current newer than every in-flight record. Waiting either
+        // needs no allocation and remains possible after replacement fails.
+        if let Some(last) = held_last
+            .as_ref()
+            .or(retained_current.as_ref())
+            .or_else(|| to_wait.last())
+        {
             self.ensure_completed(last)?;
         }
         // Check earlier CBs for errors (no need to block — they're already done).
@@ -1736,8 +1783,8 @@ impl Commands {
             if let Some((cb, receipt)) = state.current.submitted() {
                 (Some(cb.clone()), receipt.signalled)
             } else {
-                let signalled = self.commit_swap_locked(&mut state, 0)?;
-                (state.in_flight.last().cloned(), signalled)
+                let signalled = self.cut_locked(&mut state, 0)?;
+                (Self::last_cut(&state).cloned(), signalled)
             }
         };
         if let Some(cb) = cb {
@@ -1781,10 +1828,10 @@ impl Commands {
     /// sequence's queued work.
     pub fn flush_marker(&self) -> Result<CommandMarker, MetalKernelError> {
         let mut state = self.lock_recording_state()?;
-        let signalled = self.commit_swap_locked(&mut state, 0)?;
-        let cb = state.in_flight.last().cloned().ok_or_else(|| {
+        let signalled = self.cut_locked(&mut state, 0)?;
+        let cb = Self::last_cut(&state).cloned().ok_or_else(|| {
             MetalKernelError::CommandBufferError(
-                "flush_marker: commit_swap_locked left no buffer in flight".to_string(),
+                "flush_marker: the cut left no buffer in flight or held".to_string(),
             )
         })?;
         Ok(CommandMarker { cb, signalled })
@@ -1812,18 +1859,20 @@ impl Commands {
         if !recovering && self.core.compute_count.load(Ordering::Acquire) == 0 {
             return Ok(None);
         }
-        let incomplete = state
-            .in_flight
-            .iter()
-            .filter(|cb| cb.status() != MTLCommandBufferStatus::Completed)
-            .count();
+        // A held recording is queued work the GPU has yet to run.
+        let incomplete = state.held.len()
+            + state
+                .in_flight
+                .iter()
+                .filter(|cb| cb.status() != MTLCommandBufferStatus::Completed)
+                .count();
         if !recovering && incomplete > 1 {
             return Ok(None);
         }
-        let signalled = self.commit_swap_locked(&mut state, 0)?;
-        let cb = state.in_flight.last().cloned().ok_or_else(|| {
+        let signalled = self.cut_locked(&mut state, 0)?;
+        let cb = Self::last_cut(&state).cloned().ok_or_else(|| {
             MetalKernelError::CommandBufferError(
-                "flush_marker_if_started: commit_swap_locked left no buffer in flight".to_string(),
+                "flush_marker_if_started: the cut left no buffer in flight or held".to_string(),
             )
         })?;
         Ok(Some(CommandMarker { cb, signalled }))
@@ -1903,6 +1952,10 @@ impl Commands {
                 "marker belongs to another queue",
             ));
         }
+        // A marker of a held recording: submitted once its producer is.
+        if marker.cb.status().0 < MTLCommandBufferStatus::Committed.0 {
+            self.recover_pending_submission(&marker.cb)?;
+        }
         marker.cb.try_wait_prefix_data_ready()?;
         self.core.failure.check()?;
         let mut state = self.lock_state()?;
@@ -1913,8 +1966,9 @@ impl Commands {
         let mut state = self.lock_recording_state()?;
         if state.current.submitted().is_some()
             || self.core.compute_count.load(Ordering::Acquire) > 0
+            || state.signals_since_cut
         {
-            self.commit_swap_locked(&mut state, 0)?;
+            self.cut_locked(&mut state, 0)?;
         }
         Ok(())
     }
@@ -1950,8 +2004,9 @@ impl Commands {
         let mut state = self.lock_recording_state()?;
         if state.current.submitted().is_some()
             || self.core.compute_count.load(Ordering::Acquire) > 0
+            || state.signals_since_cut
         {
-            self.commit_swap_locked(&mut state, 0)?;
+            self.cut_locked(&mut state, 0)?;
         }
         // Errors are surfaced here rather than swallowed: without a blocking
         // readback on this path, this is the only place a failed command buffer
@@ -1962,7 +2017,7 @@ impl Commands {
         if let Some(t) = timed {
             crate::kernels::metal::profile::record_prune(t.elapsed());
         }
-        Ok(state.in_flight.len())
+        Ok(state.in_flight.len() + state.held.len())
     }
 
     /// How many command buffers are in flight, **without committing, pruning or
@@ -2118,6 +2173,19 @@ impl Commands {
         &self,
         prepared: Option<super::native_generation_bindings::PreparedGeneration>,
     ) -> Result<CommandBuffer, MetalKernelError> {
+        self.create_replacement_parking(prepared, &mut |ready, seen| {
+            ready.wait(seen);
+            Ok(())
+        })
+    }
+
+    /// As [`Self::create_replacement`], running `park` whenever a Metal 4
+    /// queue has no free slot (`metal4::Queue::acquire_with`).
+    fn create_replacement_parking(
+        &self,
+        prepared: Option<super::native_generation_bindings::PreparedGeneration>,
+        park: &mut dyn FnMut(&crate::completion_wake::Wake, usize) -> Result<(), MetalKernelError>,
+    ) -> Result<CommandBuffer, MetalKernelError> {
         #[cfg(test)]
         {
             self.core
@@ -2133,10 +2201,9 @@ impl Commands {
             ));
         }
         match &self.core.modern_queue {
-            Some(queue) => Ok(CommandBuffer::from_metal4(match prepared {
-                Some(prepared) => queue.acquire_bound(prepared)?,
-                None => queue.acquire()?,
-            })),
+            Some(queue) => Ok(CommandBuffer::from_metal4(
+                queue.acquire_with(prepared, park)?,
+            )),
             None => {
                 // Counted owner refusal precedes raw CB creation. Never create
                 // an unregistered native resource and then drop it on EntryState
@@ -2171,8 +2238,14 @@ impl Commands {
     }
 
     /// Recovery precedes every recording operation, not just a policy cut.
-    fn ensure_recording_locked(&self, state: &mut EntryGuard<'_>) -> Result<(), MetalKernelError> {
+    fn ensure_recording_locked<'a>(
+        &'a self,
+        state: &mut EntryGuard<'a>,
+    ) -> Result<(), MetalKernelError> {
         self.core.close_pending_blit(state)?;
+        if state.current_abandoned {
+            self.replace_abandoned_locked(state)?;
+        }
         let state = &mut **state;
         let credit = state.binding_credits.iter_mut().find(|slot| slot.is_some());
         let mut absent = None;
@@ -2339,21 +2412,62 @@ impl Commands {
         Ok(outcome)
     }
 
+    /// Submit `cb` if it is the owner's unsubmitted current recording, or
+    /// wait — submitting whatever producers release meanwhile — while it, or
+    /// a recording ahead of it, is held for an input not yet produced.
     fn recover_pending_submission(
         &self,
         cb: &CommandBuffer,
     ) -> Result<Option<u64>, MetalKernelError> {
+        loop {
+            let seen = self.core.produced.wake.snapshot();
+            if let Some(submitted) = self.try_recover_pending_submission(cb)? {
+                return Ok(submitted);
+            }
+            self.core.failure.check()?;
+            self.core.refuse_park_in_callback()?;
+            self.core.produced.wake.wait(seen);
+        }
+    }
+
+    /// One look of [`Self::recover_pending_submission`]: `None` while `cb`
+    /// is held.
+    fn try_recover_pending_submission(
+        &self,
+        cb: &CommandBuffer,
+    ) -> Result<Option<Option<u64>>, MetalKernelError> {
         let mut state = self.lock_state()?;
+        if !state.held.is_empty() || !state.gate.is_empty() {
+            self.core.release_produced_locked(&mut state)?;
+        }
+        if state.held.iter().any(|held| held.cb.same_recording(cb)) {
+            return Ok(None);
+        }
         if state
             .current
             .recording()
             .is_some_and(|current| current.same_recording(cb))
         {
+            if !(state.held.is_empty() && state.gate.is_open()) {
+                return Ok(None);
+            }
+            if !state.gate.is_empty() {
+                state.gate = produced::Gate::default();
+                self.core.held_live_update(&state);
+            }
             return self
                 .core
                 .commit_current_locked(&mut state, None)
-                .map(|receipt| receipt.signalled);
+                .map(|receipt| Some(receipt.signalled));
         }
+        self.recover_unheld_locked(&mut state, cb).map(Some)
+    }
+
+    fn recover_unheld_locked(
+        &self,
+        state: &mut EntryGuard<'_>,
+        cb: &CommandBuffer,
+    ) -> Result<Option<u64>, MetalKernelError> {
         if let Some((current, receipt)) = state.current.submitted() {
             if current.same_recording(cb) {
                 return Ok(receipt.signalled);
@@ -2374,6 +2488,10 @@ impl Commands {
         // original signal receipt has already left owner state.
         if cb.status().0 >= MTLCommandBufferStatus::Committed.0 {
             return Ok(None);
+        }
+        // Held for an input that was never produced, then cancelled.
+        if cb.abandoned() {
+            return Err(self.core.produced.cancelled_error());
         }
         Err(MetalKernelError::OwnerSubmissionRequired)
     }
@@ -2477,6 +2595,28 @@ impl Drop for CloseUnwind<'_> {
 }
 
 impl CommandsCore {
+    /// The state lock, refused inside one of this queue's own completion
+    /// callbacks (`completion_scope`).
+    fn lock_entry(&self) -> Result<EntryGuard<'_>, MetalKernelError> {
+        self.state
+            .lock_checked(Side::Host, || self.refuse_park_in_callback())
+            .map(|guard| DeferredGuard::new(guard, ClosedEncoders::default()))
+    }
+
+    /// A park on this queue from one of its own completion callbacks would
+    /// wait on itself.
+    fn refuse_park_in_callback(&self) -> Result<(), MetalKernelError> {
+        if let Some(queue) = &self.modern_queue {
+            crate::completion_scope::before_park(Arc::as_ptr(queue) as usize)
+                .map_err(|_| MetalKernelError::CallbackWouldBlock)?;
+        }
+        if let Some(core) = &self.legacy_completions {
+            crate::completion_scope::before_park(core.identity())
+                .map_err(|_| MetalKernelError::CallbackWouldBlock)?;
+        }
+        Ok(())
+    }
+
     fn close_compute(&self, state: &mut EntryGuard<'_>) -> Result<(), MetalKernelError> {
         let (state, custody) = state.parts_mut();
         if let Some(encoder) = state.current_encoder.as_ref() {
@@ -2538,7 +2678,10 @@ impl CommandsCore {
         self.close_compute(state)?;
         let t_end_enc = timed.map(|t| t.elapsed());
         let (state, custody) = state.parts_mut();
-        state
+        let state: &mut EntryState = state;
+        let owed_epochs = &mut state.owed_epochs;
+        let mut published = false;
+        let submitted = state
             .current
             .submit_marked(&self.replacement_pending, |cb| {
                 self.failure.check()?;
@@ -2551,27 +2694,54 @@ impl CommandsCore {
                         .removals
                         .reserve()
                         .ok_or(MetalKernelError::QueueUnavailable(
-                            "published residency custody bound (1) exhausted",
+                            "published residency custody bound (2) exhausted",
                         ))?;
                 let authority = OwnerSubmission {
                     buffer: cb,
                     clock: &self.clock,
                 };
-                self.submit_owned_recording(authority, destination, false, timed, t_end_enc)
+                // Epochs of held recordings cancelled before their commit
+                // complete with this one (`produced.rs`).
+                let owed = std::mem::take(owed_epochs);
+                let receipt = self.submit_owned_recording(
+                    authority,
+                    Some(destination),
+                    false,
+                    timed,
+                    t_end_enc,
+                    None,
+                    1 + owed,
+                );
+                match &receipt {
+                    Ok(_) => published = true,
+                    Err(_) => *owed_epochs += owed,
+                }
+                receipt
             })
-            .copied()
+            .copied();
+        custody.residency_published |= published;
+        submitted
     }
 
     /// Exact owner authority and retained removal custody are the prerequisites
     /// for every ordinary, final, or defensive owner submission. This body is
     /// independent of replacement and cannot manufacture an owner from a queue.
+    ///
+    /// `reserved` is the epoch a held recording took at its cut
+    /// (`produced.rs`); `None` takes the next one now. `hook_runs` is the
+    /// number of epochs the commit's completion completes. `removals` is
+    /// `None` when this acquisition already published residency, after every
+    /// allocation the recording reads.
+    #[allow(clippy::too_many_arguments)]
     fn submit_owned_recording(
         &self,
         authority: OwnerSubmission<'_>,
-        removals: &mut Option<PublishedRemovals>,
+        removals: Option<&mut Option<PublishedRemovals>>,
         nonblocking: bool,
         timed: Option<std::time::Instant>,
         t_end_enc: Option<std::time::Duration>,
+        reserved: Option<Epoch>,
+        hook_runs: u32,
     ) -> Result<CommitReceipt, MetalKernelError> {
         if !Arc::ptr_eq(authority.clock, &self.clock) {
             return Err(MetalKernelError::OwnerSubmissionRequired);
@@ -2579,7 +2749,7 @@ impl CommandsCore {
         self.failure.check()?;
         self.check_recording_status(authority.buffer)?;
         self.hook.seal()?;
-        if removals.is_some() {
+        if removals.as_ref().is_some_and(|slot| slot.is_some()) {
             return Err(MetalKernelError::QueueUnavailable(
                 "residency custody already staged",
             ));
@@ -2593,23 +2763,25 @@ impl CommandsCore {
             prepared.test_submission_control(self.submission_control.clone());
             prepared
         };
-        let (_, removed) = if nonblocking {
-            self.residency_set
-                .try_commit_pending_extracted()
-                .map_err(|_| {
-                    MetalKernelError::RecordingAdmission(
-                        crate::command_lifecycle::LifecycleError::Busy,
-                    )
-                })?
-        } else {
-            self.residency_set.commit_pending_extracted()
-        };
-        *removals = Some(removed);
+        if let Some(removals) = removals {
+            let (_, removed) = if nonblocking {
+                self.residency_set
+                    .try_commit_pending_extracted()
+                    .map_err(|_| {
+                        MetalKernelError::RecordingAdmission(
+                            crate::command_lifecycle::LifecycleError::Busy,
+                        )
+                    })?
+            } else {
+                self.residency_set.commit_pending_extracted()
+            };
+            *removals = Some(removed);
+        }
         #[cfg(test)]
         self.submission_control
             .observe_residency(self.residency_set.counters().commits);
         let t_residency = timed.map(|t| t.elapsed());
-        self.submit_prepared(prepared, timed, t_end_enc, t_residency)
+        self.submit_prepared(prepared, timed, t_end_enc, t_residency, reserved, hook_runs)
     }
 
     fn check_recording_status(&self, cb: &CommandBuffer) -> Result<(), MetalKernelError> {
@@ -2641,6 +2813,8 @@ impl CommandsCore {
         timed: Option<std::time::Instant>,
         t_end_enc: Option<std::time::Duration>,
         t_residency: Option<std::time::Duration>,
+        reserved: Option<Epoch>,
+        hook_runs: u32,
     ) -> Result<CommitReceipt, MetalKernelError> {
         #[cfg(test)]
         self.submission_control.registration()?;
@@ -2651,9 +2825,12 @@ impl CommandsCore {
             self.completion_signals.fetch_add(1, Ordering::Relaxed);
         }
         crate::kernels::metal::trace::note_command_buffer();
-        prepared.run_completion_hook()?;
+        prepared.run_completion_hook(hook_runs)?;
         prepared.record_gpu_time_on_completion()?;
-        let epoch = self.clock.commit_epoch();
+        let epoch = match reserved {
+            Some(epoch) => epoch,
+            None => self.clock.commit_epoch(),
+        };
         prepared.stage_binding_epoch(epoch).inspect_err(|_| {
             self.failure
                 .record_static("owner epoch staging refused; queue failed");
@@ -2974,6 +3151,18 @@ impl lifecycle::FinalCore for CommandsCore {
             }
             // Do NOT take/drop the canonical encoder under EntryState.
         }
+        // Held work whose producer is gone runs as recorded, in order, ahead
+        // of the final submission: nothing is left to observe its input, and
+        // its epochs complete the clock the final prefix waits on.
+        if !self.release_held_for_teardown(&mut state, &mut captures.removals)? {
+            return Ok(false);
+        }
+        let owed = std::mem::take(&mut state.owed_epochs);
+        let removals = if captures.removals.is_none() {
+            Some(&mut captures.removals)
+        } else {
+            None
+        };
         let submitted = state
             .current
             .submit_marked(&self.replacement_pending, |cb| {
@@ -2984,8 +3173,12 @@ impl lifecycle::FinalCore for CommandsCore {
                     buffer: cb,
                     clock: &self.clock,
                 };
-                self.submit_owned_recording(authority, &mut captures.removals, true, None, None)
-            });
+                self.submit_owned_recording(authority, removals, true, None, None, None, 1 + owed)
+            })
+            .map(|_| ());
+        if submitted.is_err() {
+            state.owed_epochs += owed;
+        }
         match submitted {
             Ok(_) => Ok(true),
             Err(MetalKernelError::RecordingAdmission(

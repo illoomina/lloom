@@ -9151,10 +9151,10 @@ impl<P: Profile> DecoderLayer<P> {
         };
         tier.prefetch(st.depth, st.source.as_ref())?;
         // The group's bytes may still be landing (the loader's thread):
-        // every kernel of this layer waits on the device for them — and
-        // nothing is encoded when they have landed (R1).
+        // every kernel of this layer is committed once they have — and
+        // nothing is held when they have landed already (R1).
         if let Some(ticket) = wait {
-            tier.encode_wait(ticket)?;
+            tier.commit_after_load(ticket)?;
         }
         drop(tier);
         #[cfg(feature = "metal")]

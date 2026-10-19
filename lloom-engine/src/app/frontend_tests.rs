@@ -80,7 +80,8 @@ fn typed(key: &str, value: &str) -> Value {
 fn batch_for(r: &frontend::Row) -> Vec<&'static str> {
     match r.when {
         When::Batched => vec!["--batch", "4"],
-        When::Always => vec![],
+        // No `--model`: the LFM2 snapshot, whose family takes the model axes.
+        When::Always | When::ModelAxes => vec![],
     }
 }
 

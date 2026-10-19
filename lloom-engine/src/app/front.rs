@@ -214,6 +214,14 @@ pub struct Constants {
     pub groups_tools: bool,
     /// The family's reasoning tags (`Text::think_tags`).
     pub tags: Option<ThinkTags>,
+    /// The template trims the reasoning it is given before writing it
+    /// (Qwen's `reasoning_content|trim`), so whitespace the model emitted
+    /// around its thought is deleted from the history. Read at load by
+    /// rendering a reasoning padded with whitespace and seeing whether it
+    /// survives. Where it does not, the front end gives the template the
+    /// reasoning already trimmed, so the trim is a no-op and the emitted bytes
+    /// stand (decision 51 Q1).
+    pub(crate) trims_reasoning: bool,
     /// The text the template writes to end an assistant turn, and the single
     /// id it encodes to: the end-of-turn token. `None` where the template's
     /// ending is not one token, or does not encode to the id the model would
@@ -232,6 +240,7 @@ impl Constants {
             open: None,
             groups_tools: false,
             tags: None,
+            trims_reasoning: false,
             eot: None,
         }
     }
@@ -454,6 +463,20 @@ impl Constants {
             }
         })();
 
+        // Does the template trim the reasoning it is given? Rendered with a
+        // reasoning padded either side, the padding survives or it does not.
+        let trims_reasoning = (|| {
+            let pad = format!("\n\n{PROBE_REASONING}\n\n");
+            let mut a = json!({ "role": "assistant", "content": PROBE_ANSWER });
+            for f in REASONING_FIELDS {
+                a[f] = json!(pad);
+            }
+            let kw = with_persist(&Map::new(), Some(true)).unwrap_or_default();
+            let s = render(&json!([user, a, next]), &kw, false)?;
+            Some(!s.contains(pad.trim_end()) || !s.contains(pad.trim_start()))
+        })()
+        .unwrap_or(false);
+
         Self {
             modes,
             effort,
@@ -462,6 +485,7 @@ impl Constants {
             open,
             groups_tools,
             tags,
+            trims_reasoning,
             eot,
         }
     }
@@ -1253,8 +1277,20 @@ impl Front {
                     let msgs = rewritten.get_or_insert_with(|| list.clone());
                     let mut msg = m.clone();
                     msg["content"] = json!(reply.content_text);
+                    // Where the template trims the reasoning it is given
+                    // (Qwen's `reasoning_content|trim`), give it the trimmed
+                    // text: the trim is then a no-op, and the whitespace the
+                    // model emitted around its thought stays the model's
+                    // rather than being deleted from the history (decision 51
+                    // Q1). A template that writes the reasoning verbatim
+                    // (LFM2.5) is given it verbatim.
+                    let reasoning = if c.trims_reasoning {
+                        reply.reasoning_text.trim()
+                    } else {
+                        reply.reasoning_text.as_str()
+                    };
                     for f in REASONING_FIELDS {
-                        msg[f] = json!(reply.reasoning_text);
+                        msg[f] = json!(reasoning);
                     }
                     msgs[i] = msg;
                 }
@@ -1979,15 +2015,39 @@ fn emit_turn(
     if emitted.is_empty() {
         return false;
     }
-    let Some(off) = span.find(emitted) else {
+    // Where the turn's own bytes begin in the template's rendering of it, and
+    // where they end. The template may have rewritten the stretch between —
+    // Qwen trims the reasoning it is given, deleting whitespace the model
+    // emitted, which no field can carry back — so the match is on the bytes
+    // the rewriting cannot touch: the turn's first non-whitespace run, and the
+    // end-of-turn token the template wrote. Everything between is replaced by
+    // what the model emitted, which is Q1's instruction.
+    let head = emitted.trim_start();
+    let lead: String = head.chars().take_while(|c| !c.is_whitespace()).collect();
+    if lead.is_empty() {
+        return false;
+    }
+    let Some(off) = span.find(lead.as_str()) else {
         return false;
     };
-    // Exactly one occurrence, or which one the ids belong to is a guess.
-    if span[off + emitted.len()..].contains(emitted) {
+    // Exactly one place it can begin, or which one the ids belong to is a
+    // guess.
+    if span[off + lead.len()..].contains(lead.as_str()) {
         return false;
     }
     let start = region.start + off;
-    let body_end = start + emitted.len();
+    // The turn ends where the template ended it: at the end-of-turn token it
+    // wrote after the body, or — with no such constant — at the span's end.
+    let body_end = match eot {
+        Some((_, marker)) => match span[off..].rfind(marker) {
+            Some(i) => region.start + off + i,
+            None => return false,
+        },
+        None => region.end,
+    };
+    if body_end <= start {
+        return false;
+    }
     // Through the end-of-turn token where the model ended the turn itself:
     // that position was fed, and the token is the template's own bytes for it
     // (the log does not keep the sampled EOS). Only when the template writes
@@ -1996,9 +2056,7 @@ fn emit_turn(
     // nor into the generation prompt.
     let through = match eot {
         Some((id, marker))
-            if reply.stop == crate::Stop::Eos
-                && body_end + marker.len() <= region.end
-                && rendered[body_end..region.end].starts_with(marker) =>
+            if reply.stop == crate::Stop::Eos && body_end + marker.len() <= region.end =>
         {
             Some((id, marker.len()))
         }
@@ -2015,10 +2073,17 @@ fn emit_turn(
     if ids.is_empty() {
         return false;
     }
-    // The ids must decode to exactly the text they replace, or the prompt
-    // would carry ids whose text is not what the template rendered.
+    // The ids must decode to the turn the log holds — with the end-of-turn
+    // token where the model ended the turn itself — and that decoding is what
+    // the prompt carries in place of the template's text for this span. The
+    // guard is that the ids really are this reply's, trailing whitespace the
+    // template normalises aside.
+    let want = match through {
+        Some(_) => format!("{}{}", emitted.trim_end(), eot.map_or("", |(_, m)| m)),
+        None => emitted.trim_end().to_string(),
+    };
     match decode(text, &ids) {
-        Some(d) if d == rendered[start..text_end] => {}
+        Some(d) if d.trim_end() == want.trim_end() => {}
         _ => return false,
     }
     let n = ids.len();

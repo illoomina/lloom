@@ -35,13 +35,23 @@ impl Stub {
         let bos_id = (!bos.is_empty())
             .then(|| tokenizer.token_to_id(bos))
             .flatten();
+        // The EOS ids the real loaders resolve (`qwen3_5.rs` `prepare_text`,
+        // `lfm2.rs`): the token a turn ends with, so the end-of-turn constant
+        // the front end reads at load is the one a served checkpoint has. A
+        // placeholder here made every reply look as though the model had not
+        // ended its turn.
+        let eos_ids: Vec<u32> = ["<|im_end|>", "<|endoftext|>", "<|end|>"]
+            .iter()
+            .filter_map(|t| tokenizer.token_to_id(t))
+            .collect();
+        let eos_ids = if eos_ids.is_empty() { vec![0] } else { eos_ids };
         Self {
             text: Text {
                 tokenizer,
                 template: Some(Template::compile(template).unwrap()),
                 bos_token: bos.to_string(),
                 bos_id,
-                eos_ids: vec![0],
+                eos_ids,
                 seed_tokens: vec![1],
                 think: Default::default(),
                 gen_prompts: Default::default(),
@@ -2542,11 +2552,12 @@ fn the_checkpoints_templates_persist_what_the_model_generated() {
                              the log at {kept}, before the checkpoint at {ckpt}"
                         ));
                     }
-                    if persist != Some(false)
-                        && !by_engine
-                        && kind != "one more newline before the end marker"
-                        && !extends
-                    {
+                    // Since decision 51 Q1 the trim case extends too: a
+                    // matched reply is rendered from the ids the model
+                    // emitted, so the whitespace the template would trim is
+                    // no longer deleted from the history. Run 5 recorded this
+                    // row at +7, diverging.
+                    if persist != Some(false) && !by_engine && !extends {
                         failures.push(format!(
                             "{name} want={want:?} persist={persist:?} {kind}: the history keeps \
                              what the model generated, so the next prompt extends the log; it \
@@ -2788,6 +2799,15 @@ fn a_past_reply_is_rendered_from_the_ids_the_model_emitted() {
         let name = repo.rsplit("--").next().unwrap();
         let tags = engine.think_tags();
         let one = json!([user1]);
+        {
+            let f = Front::new(&engine, SessionOptions::default());
+            let c = f.constants().unwrap();
+            eprintln!(
+                "EMITTED-CONST {name}: trims_reasoning={} eot={:?}",
+                c.trims_reasoning,
+                c.eot().map(|(id, s)| (id, s.to_string())),
+            );
+        }
         for want in wants(&engine) {
             for persist in [None, Some(true), Some(false)] {
                 let front = Front::new(
@@ -2802,11 +2822,17 @@ fn a_past_reply_is_rendered_from_the_ids_the_model_emitted() {
                 }
                 let p1 = build(&front, &engine, &one, want);
                 let on = p1.thinking.unwrap().on;
-                // The replies: one in the template's own format, one whose
-                // whitespace is not (the trim), and one cut inside its
-                // reasoning. Each is what the model emitted.
-                let mut replies: Vec<(&str, String, Stop)> =
-                    vec![("an answer", "Paris.".to_string(), Stop::Eos)];
+                // The replies, each what a model really emits for this
+                // prompt: an answer alone only where the prompt opened no
+                // block (a reply that ends its turn while still inside one is
+                // not a thing a model does — it closes the block first, or
+                // the run is cut, which is the open case below); then a reply
+                // in the template's own format, one whose whitespace is not
+                // (the trim), and one cut inside its reasoning.
+                let mut replies: Vec<(&str, String, Stop)> = Vec::new();
+                if !on {
+                    replies.push(("an answer", "Paris.".to_string(), Stop::Eos));
+                }
                 if on {
                     let end = engine.token_str(tags.as_ref().unwrap().end);
                     replies.push((
@@ -2844,17 +2870,41 @@ fn a_past_reply_is_rendered_from_the_ids_the_model_emitted() {
                     // the ids the model emitted. An EOS-stopped reply also fed
                     // the end-of-turn position, which the template writes.
                     let mut log: Vec<u32> = p1.ids.iter().chain(&sampled).copied().collect();
+                    // An EOS-stopped reply also fed the end-of-turn position.
+                    // The id is the template's own end-of-turn constant, read
+                    // at load — the same token the model sampled.
                     if stop == Stop::Eos {
-                        log.extend(engine.enc(&engine.token_str(engine.eos_ids()[0])));
+                        let (id, _) = front.constants().unwrap().eot().unwrap_or_else(|| {
+                            panic!("{name}: no end-of-turn constant for this template")
+                        });
+                        log.push(id);
                     }
                     let kept = p2.ids.iter().zip(&log).take_while(|(a, b)| a == b).count();
                     eprintln!(
                         "EMITTED {name} want={want:?} persist={persist:?} {kind}: the next prompt \
-                         leaves the log at {:+} from its end ({kept} of {})",
+                         leaves the log at {:+} from its end ({kept} of {}); emitted {} of {} \
+                         matched",
                         kept as i64 - log.len() as i64,
                         log.len(),
+                        p2.spliced.emitted,
+                        p2.spliced.matched,
                     );
-                    if kept < log.len() {
+                    // Two boundaries this does not speak for, and both are
+                    // the prompt's own ids rather than a past reply's:
+                    // - an opt-in strip asks the template to drop the
+                    //   reasoning, so the span is deliberately not the turn
+                    //   the model emitted (§2.3d: the option doing its job);
+                    // - where the engine closed the block the template opened
+                    //   (LFM2.5's thinking off), those ids are the engine's
+                    //   and no rendering of the history writes them, so the
+                    //   divergence is inside the earlier prompt, before any
+                    //   reply. The turn checkpoint stands there (run 5, §25.8)
+                    //   and decision 51 Q1 does not reach it: it is about how
+                    //   a past assistant turn is rendered, not about ids the
+                    //   template never writes.
+                    let engine_closed = p1.thinking.unwrap().by == By::Engine;
+                    let speaks_for = persist != Some(false) && !engine_closed;
+                    if speaks_for && kept < log.len() {
                         failures.push(format!(
                             "{name} want={want:?} persist={persist:?} {kind}: the next prompt \
                              leaves the session's log at {kept} of {}, so the turn the model \

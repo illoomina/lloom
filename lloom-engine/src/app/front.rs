@@ -1992,9 +1992,13 @@ fn emit_turn(
     // that position was fed, and the token is the template's own bytes for it
     // (the log does not keep the sampled EOS). Only when the template writes
     // it immediately after the reply, with nothing of its own between.
+    // Bounded by the span: a run never reaches into the next message's text,
+    // nor into the generation prompt.
     let through = match eot {
         Some((id, marker))
-            if reply.stop == crate::Stop::Eos && rendered[body_end..].starts_with(marker) =>
+            if reply.stop == crate::Stop::Eos
+                && body_end + marker.len() <= region.end
+                && rendered[body_end..region.end].starts_with(marker) =>
         {
             Some((id, marker.len()))
         }

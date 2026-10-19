@@ -889,7 +889,7 @@ pub struct GemmTuning {
         status = "arm"
     )]
     pub prefill_window: bool,
-    /// Under `fast`, a speculative verify window's f16 matmuls of 2 to `f16_rows_max` rows take the GEMV's row axis: each weight block read once for every row of the window, each row the one-row GEMV's bits; off = the GEMM from two rows. The K=1 path, the prefill, the drafter and `deterministic` do not read it.
+    /// Under `fast`, a speculative verify window's f16 matmuls of 2 to `f16_rows_max` rows take the GEMV's row axis: each weight block read once for every row of the window, each row the one-row GEMV's bits; off = the GEMM from two rows. On by default under `fast` (maintainer, 2026-10-19: DSpark ×1.25 on LFM2.5, the stream parting from K=1 only at an exact tie); `deterministic` never takes it. The K=1 path, the prefill, the drafter and `deterministic` do not read it.
     #[opt(
         flag = "gemm-f16-rows",
         env = "LLOOM_GEMM_F16_ROWS",
@@ -920,7 +920,7 @@ impl Default for GemmTuning {
             verify_window: true,
             draft_window: true,
             prefill_window: true,
-            f16_rows: false,
+            f16_rows: true,
             // Measured (`docs/tuning.md` §13.5y): at LFM2.5's shapes the row
             // axis is no slower than the GEMM at every row count to 10 and
             // slower at 12 on most of them.

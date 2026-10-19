@@ -182,9 +182,10 @@ fn an_uncovered_head_dim_reaches_every_surface() {
     let off = write::<Lfm2Tiny>(&dir.join("off"), Some(144));
     let on = write::<Lfm2Tiny>(&dir.join("on"), None);
     let uncovered = write::<Lfm2Tiny>(&dir.join("uncovered"), Some(96));
-    // `chat`'s default decode kernel is FlashDecoding (the front-end's model
-    // axes), which is instantiated at 72; the arm asks for `sdpa_vector`.
-    let sdpa = ["--attn", "sdpa"];
+    // `chat`'s Metal default is FlashDecoding over the paged KV layout (the
+    // front-end's model axes), and FlashDecoding is instantiated at 72; the
+    // arm asks for `sdpa_vector`, over the strided layout it reads.
+    let sdpa = ["--attn", "sdpa", "--kv-append", "cat"];
 
     let stderr = chat(&off, &sdpa);
     let field = loaded_warnings(&stderr);

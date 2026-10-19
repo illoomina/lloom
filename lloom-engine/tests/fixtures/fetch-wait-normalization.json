@@ -1,0 +1,381 @@
+[
+  {
+    "name": "native integer",
+    "input_json": "7",
+    "accept32": true,
+    "accept64": true,
+    "stored": "7"
+  },
+  {
+    "name": "native integral float",
+    "input_json": "7.0",
+    "accept32": true,
+    "accept64": true,
+    "stored": "7"
+  },
+  {
+    "name": "native positive exponent",
+    "input_json": "7e0",
+    "accept32": true,
+    "accept64": true,
+    "stored": "7"
+  },
+  {
+    "name": "native negative exponent integral",
+    "input_json": "70e-1",
+    "accept32": true,
+    "accept64": true,
+    "stored": "7"
+  },
+  {
+    "name": "native exponent scaled",
+    "input_json": "7e2",
+    "accept32": true,
+    "accept64": true,
+    "stored": "700"
+  },
+  {
+    "name": "native minimum",
+    "input_json": "1.0",
+    "accept32": true,
+    "accept64": true,
+    "stored": "1"
+  },
+  {
+    "name": "native leading fraction integral",
+    "input_json": "0.7e1",
+    "accept32": true,
+    "accept64": true,
+    "stored": "7"
+  },
+  {
+    "name": "refused 0",
+    "input_json": "0",
+    "accept32": false,
+    "accept64": false
+  },
+  {
+    "name": "refused 0.0",
+    "input_json": "0.0",
+    "accept32": false,
+    "accept64": false
+  },
+  {
+    "name": "refused -0",
+    "input_json": "-0",
+    "accept32": false,
+    "accept64": false
+  },
+  {
+    "name": "refused -0.0",
+    "input_json": "-0.0",
+    "accept32": false,
+    "accept64": false
+  },
+  {
+    "name": "refused -7",
+    "input_json": "-7",
+    "accept32": false,
+    "accept64": false
+  },
+  {
+    "name": "refused -7.0",
+    "input_json": "-7.0",
+    "accept32": false,
+    "accept64": false
+  },
+  {
+    "name": "refused 7.25",
+    "input_json": "7.25",
+    "accept32": false,
+    "accept64": false
+  },
+  {
+    "name": "refused 7e-1",
+    "input_json": "7e-1",
+    "accept32": false,
+    "accept64": false
+  },
+  {
+    "name": "refused 1e-300",
+    "input_json": "1e-300",
+    "accept32": false,
+    "accept64": false
+  },
+  {
+    "name": "refused 18446744073709551616",
+    "input_json": "18446744073709551616",
+    "accept32": false,
+    "accept64": false
+  },
+  {
+    "name": "refused 1e100",
+    "input_json": "1e100",
+    "accept32": false,
+    "accept64": false
+  },
+  {
+    "name": "refused true",
+    "input_json": "true",
+    "accept32": false,
+    "accept64": false
+  },
+  {
+    "name": "refused false",
+    "input_json": "false",
+    "accept32": false,
+    "accept64": false
+  },
+  {
+    "name": "refused \"7.0\"",
+    "input_json": "\"7.0\"",
+    "accept32": false,
+    "accept64": false
+  },
+  {
+    "name": "refused \"7e0\"",
+    "input_json": "\"7e0\"",
+    "accept32": false,
+    "accept64": false
+  },
+  {
+    "name": "refused \"sleep:+7\"",
+    "input_json": "\"sleep:+7\"",
+    "accept32": false,
+    "accept64": false
+  },
+  {
+    "name": "refused \"sleep:0us\"",
+    "input_json": "\"sleep:0us\"",
+    "accept32": false,
+    "accept64": false
+  },
+  {
+    "name": "refused \"sleep:1.5ms\"",
+    "input_json": "\"sleep:1.5ms\"",
+    "accept32": false,
+    "accept64": false
+  },
+  {
+    "name": "refused \"sleep:7 ms\"",
+    "input_json": "\"sleep:7 ms\"",
+    "accept32": false,
+    "accept64": false
+  },
+  {
+    "name": "refused \"none\"",
+    "input_json": "\"none\"",
+    "accept32": false,
+    "accept64": false
+  },
+  {
+    "name": "refused \"\"",
+    "input_json": "\"\"",
+    "accept32": false,
+    "accept64": false
+  },
+  {
+    "name": "refused []",
+    "input_json": "[]",
+    "accept32": false,
+    "accept64": false
+  },
+  {
+    "name": "refused {}",
+    "input_json": "{}",
+    "accept32": false,
+    "accept64": false
+  },
+  {
+    "name": "32 max integer",
+    "input_json": "4294967295",
+    "accept32": true,
+    "accept64": true,
+    "stored": "4294967295"
+  },
+  {
+    "name": "32 max float",
+    "input_json": "4294967295.0",
+    "accept32": true,
+    "accept64": true,
+    "stored": "4294967295"
+  },
+  {
+    "name": "32 max text",
+    "input_json": "\"4294967295\"",
+    "accept32": true,
+    "accept64": true,
+    "stored": "4294967295"
+  },
+  {
+    "name": "32 overflow integer",
+    "input_json": "4294967296",
+    "accept32": false,
+    "accept64": true,
+    "stored64": "4294967296"
+  },
+  {
+    "name": "32 overflow float",
+    "input_json": "4294967296.0",
+    "accept32": false,
+    "accept64": true,
+    "stored64": "4294967296"
+  },
+  {
+    "name": "exact integer 2^53-1",
+    "input_json": "9007199254740991",
+    "accept32": false,
+    "accept64": true,
+    "stored64": "9007199254740991"
+  },
+  {
+    "name": "exact integer 2^53",
+    "input_json": "9007199254740992",
+    "accept32": false,
+    "accept64": true,
+    "stored64": "9007199254740992"
+  },
+  {
+    "name": "exact integer 2^53+1",
+    "input_json": "9007199254740993",
+    "accept32": false,
+    "accept64": true,
+    "stored64": "9007199254740993"
+  },
+  {
+    "name": "64 max integer",
+    "input_json": "18446744073709551615",
+    "accept32": false,
+    "accept64": true,
+    "stored64": "18446744073709551615"
+  },
+  {
+    "name": "64 max string",
+    "input_json": "\"18446744073709551615\"",
+    "accept32": false,
+    "accept64": true,
+    "stored64": "18446744073709551615"
+  },
+  {
+    "name": "64 max duration us",
+    "input_json": "\"sleep:18446744073709551615us\"",
+    "accept32": false,
+    "accept64": true,
+    "stored64": "18446744073709551615"
+  },
+  {
+    "name": "64 ms ceiling",
+    "input_json": "\"sleep:18446744073709551ms\"",
+    "accept32": false,
+    "accept64": true,
+    "stored64": "18446744073709551000"
+  },
+  {
+    "name": "64 seconds ceiling",
+    "input_json": "\"sleep:18446744073709s\"",
+    "accept32": false,
+    "accept64": true,
+    "stored64": "18446744073709000000"
+  },
+  {
+    "name": "overflow \"sleep:18446744073709551616us\"",
+    "input_json": "\"sleep:18446744073709551616us\"",
+    "accept32": false,
+    "accept64": false
+  },
+  {
+    "name": "overflow \"sleep:18446744073709552ms\"",
+    "input_json": "\"sleep:18446744073709552ms\"",
+    "accept32": false,
+    "accept64": false
+  },
+  {
+    "name": "overflow \"sleep:18446744073710s\"",
+    "input_json": "\"sleep:18446744073710s\"",
+    "accept32": false,
+    "accept64": false
+  },
+  {
+    "name": "overflow \"18446744073709551616\"",
+    "input_json": "\"18446744073709551616\"",
+    "accept32": false,
+    "accept64": false
+  },
+  {
+    "name": "bare sleep",
+    "input_json": "\"sleep\"",
+    "accept32": true,
+    "accept64": true,
+    "stored": "50"
+  },
+  {
+    "name": "duration",
+    "input_json": "\" SLEEP:2MS \"",
+    "accept32": true,
+    "accept64": true,
+    "stored": "2000"
+  },
+  {
+    "name": "duration plus",
+    "input_json": "\"sleep:+7us\"",
+    "accept32": true,
+    "accept64": true,
+    "stored": "7"
+  },
+  {
+    "name": "raw leading zero",
+    "input_json": "\"sleep:0007\"",
+    "accept32": true,
+    "accept64": true,
+    "stored": "7"
+  },
+  {
+    "name": "plain plus",
+    "input_json": "\" +0007 \"",
+    "accept32": true,
+    "accept64": true,
+    "stored": "7"
+  },
+  {
+    "name": "trimmed duration",
+    "input_json": "\"sleep: \\t+7us\"",
+    "accept32": true,
+    "accept64": true,
+    "stored": "7"
+  },
+  {
+    "name": "32 ms ceiling",
+    "input_json": "\"sleep:4294967ms\"",
+    "accept32": true,
+    "accept64": true,
+    "stored": "4294967000"
+  },
+  {
+    "name": "32 seconds ceiling",
+    "input_json": "\"sleep:4294s\"",
+    "accept32": true,
+    "accept64": true,
+    "stored": "4294000000"
+  },
+  {
+    "name": "32 ms overflow",
+    "input_json": "\"sleep:4294968ms\"",
+    "accept32": false,
+    "accept64": true,
+    "stored64": "4294968000"
+  },
+  {
+    "name": "32 seconds overflow",
+    "input_json": "\"sleep:4295s\"",
+    "accept32": false,
+    "accept64": true,
+    "stored64": "4295000000"
+  },
+  {
+    "name": "reset",
+    "input_json": "null",
+    "accept32": true,
+    "accept64": true,
+    "stored": "50"
+  }
+]

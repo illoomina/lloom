@@ -227,10 +227,19 @@ impl Scratch {
         temperature: f64,
         rng: &mut rand::rngs::StdRng,
     ) -> u32 {
-        self.gumbel_noise(values, temperature, (0..values.len()).map(|_| super::LogitsProcessor::gumbel_variate(rng)))
+        self.gumbel_noise(
+            values,
+            temperature,
+            (0..values.len()).map(|_| super::LogitsProcessor::gumbel_variate(rng)),
+        )
     }
 
-    fn gumbel_noise(&self, values: &[f32], temperature: f64, noise: impl Iterator<Item = f32>) -> u32 {
+    fn gumbel_noise(
+        &self,
+        values: &[f32],
+        temperature: f64,
+        noise: impl Iterator<Item = f32>,
+    ) -> u32 {
         let mut best = None;
         let max = self.gumbel_max;
         let inv = (1.0 / temperature) as f32;
@@ -325,10 +334,19 @@ mod tests {
         assert!(-1.0f64 / 3.0 + f64::from(g) > 0.0);
         assert_eq!(centered_gumbel(-1.0, 0.0, inv, g).to_bits(), 0);
         assert_eq!(centered_gumbel(1e30, 1e30, inv, g), g);
-        assert_eq!(centered_gumbel(0.0, 0.0, 1.0, f32::from_bits(1)).to_bits(), 1);
-        let mut scratch = Scratch { values: vec![0.0, -1.0], ..Default::default() };
+        assert_eq!(
+            centered_gumbel(0.0, 0.0, 1.0, f32::from_bits(1)).to_bits(),
+            1
+        );
+        let mut scratch = Scratch {
+            values: vec![0.0, -1.0],
+            ..Default::default()
+        };
         scratch.prepare(3.0, 0, 1.0, true).unwrap();
-        assert_eq!(scratch.gumbel_noise(&scratch.values, 3.0, [0.0, g].into_iter()), 0);
+        assert_eq!(
+            scratch.gumbel_noise(&scratch.values, 3.0, [0.0, g].into_iter()),
+            0
+        );
     }
 
     #[test]

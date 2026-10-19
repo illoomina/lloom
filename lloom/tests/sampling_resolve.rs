@@ -151,11 +151,29 @@ fn table() -> Vec<((Option<f64>, Option<usize>, Option<f64>, bool), Want)> {
             (Some(T), Some(0), Some(1.0), true),
             arm(GumbelSoftmax { temperature: T }),
         ),
-        ((Some(T), Some(20), None, true), arm(FilteredGumbel { temperature: T, k: 20, p: 1.0 })),
-        ((Some(T), None, Some(0.9), true), arm(FilteredGumbel { temperature: T, k: 0, p: 0.9 })),
+        (
+            (Some(T), Some(20), None, true),
+            arm(FilteredGumbel {
+                temperature: T,
+                k: 20,
+                p: 1.0,
+            }),
+        ),
+        (
+            (Some(T), None, Some(0.9), true),
+            arm(FilteredGumbel {
+                temperature: T,
+                k: 0,
+                p: 0.9,
+            }),
+        ),
         (
             (Some(T), Some(20), Some(0.95), true),
-            arm(FilteredGumbel { temperature: T, k: 20, p: 0.95 }),
+            arm(FilteredGumbel {
+                temperature: T,
+                k: 20,
+                p: 0.95,
+            }),
         ),
     ]
 }

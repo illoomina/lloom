@@ -885,12 +885,7 @@ fn subnormal_uniform_preserves_rounded_product_contract() -> Result<()> {
 #[test]
 fn subnormal_inverse_temperature_preserves_rounded_product_contract() -> Result<()> {
     let d = device()?;
-    let got = batch(
-        &[-f32::MAX, 0.0],
-        Params::new(1e39, 0, 1.0),
-        &[0.45],
-        &d,
-    )?;
+    let got = batch(&[-f32::MAX, 0.0], Params::new(1e39, 0, 1.0), &[0.45], &d)?;
     assert_eq!(got.ids, [1]);
     Ok(())
 }

@@ -51,8 +51,8 @@ pub use device::{
 };
 mod host_fed;
 mod host_slot;
-mod sampling_topk;
 mod sampling_multinomial;
+mod sampling_topk;
 use device::{DeviceTeardown, PRIVATE_RESOURCE_OPTIONS};
 pub use host_fed::{HostEvent, HostFedRing, PublishEvent};
 pub use host_slot::HostSlot;

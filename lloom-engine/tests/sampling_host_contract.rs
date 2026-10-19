@@ -18,8 +18,14 @@ fn public_engine_resolver_keeps_method_filters_and_defaults() {
         ReadbackArm::Auto.resolve(&s, RingArm::CROWN),
         ReadbackArm::Blocking
     );
-    assert_eq!(DecodeParams::default().sampling().unwrap(), Sampling::ArgMax);
-    assert_eq!(SamplingConfig::default().sampling().unwrap(), Sampling::ArgMax);
+    assert_eq!(
+        DecodeParams::default().sampling().unwrap(),
+        Sampling::ArgMax
+    );
+    assert_eq!(
+        SamplingConfig::default().sampling().unwrap(),
+        Sampling::ArgMax
+    );
     assert_eq!(
         DecodeParams::sampling_of(Some(0.7), Some(1.0), Some(0), false).unwrap(),
         Sampling::All { temperature: 0.7 }
@@ -49,8 +55,14 @@ fn public_config_and_request_validation_refuse_invalid_fields_before_a_sampler()
             ..SamplingConfig::default()
         };
         let refused = config.check().unwrap_err();
-        assert!(refused.starts_with("sampling: generation.temperature = "), "{refused}");
-        assert!(!refused.contains('\n'), "a refusal carries no backtrace: {refused}");
+        assert!(
+            refused.starts_with("sampling: generation.temperature = "),
+            "{refused}"
+        );
+        assert!(
+            !refused.contains('\n'),
+            "a refusal carries no backtrace: {refused}"
+        );
     }
     for p in [-0.1, 1.01, f64::NAN] {
         let params = DecodeParams {
@@ -63,7 +75,10 @@ fn public_config_and_request_validation_refuse_invalid_fields_before_a_sampler()
             ..SamplingConfig::default()
         };
         let refused = config.check().unwrap_err();
-        assert!(refused.starts_with("sampling: generation.top_p = "), "{refused}");
+        assert!(
+            refused.starts_with("sampling: generation.top_p = "),
+            "{refused}"
+        );
         assert!(refused.contains("outside [0, 1]"), "{refused}");
         let mut options = lloom_engine::EngineOptions::default();
         options.sampling.top_p = Some(p);

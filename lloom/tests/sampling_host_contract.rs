@@ -411,13 +411,17 @@ fn a_nonfinite_processor_result_is_rejected_before_feed_or_digest_commit() -> Re
     Ok(())
 }
 
-
 // Root additive regressions: the same Gumbel draw is invariant to adding an
 // equal finite offset to every supported score. No previous assertion changed.
 fn root_filtered_gumbel_sampler() -> LogitsProcessor {
-    LogitsProcessor::from_sampling(7, Sampling::FilteredGumbel {
-        temperature: 1.0, k: 2, p: 1.0,
-    })
+    LogitsProcessor::from_sampling(
+        7,
+        Sampling::FilteredGumbel {
+            temperature: 1.0,
+            k: 2,
+            p: 1.0,
+        },
+    )
 }
 
 #[test]
@@ -430,15 +434,20 @@ fn filtered_gumbel_scalar_keeps_noise_under_large_equal_finite_offsets() -> Resu
         reference.at_position(Some(pos));
         expected.push(reference.sample(&zero)?);
     }
-    assert!(expected.contains(&0) && expected.contains(&1),
-        "zero-offset control must observe both equal-score candidates");
+    assert!(
+        expected.contains(&0) && expected.contains(&1),
+        "zero-offset control must observe both equal-score candidates"
+    );
     for offset in [f32::MAX, -f32::MAX] {
         let row = Tensor::new(&[offset, offset, f32::NEG_INFINITY], &dev)?;
         let mut shifted = root_filtered_gumbel_sampler();
         for (pos, &want) in expected.iter().enumerate() {
             shifted.at_position(Some(pos as u64));
-            assert_eq!(shifted.sample(&row)?, want,
-                "common finite offset must not erase Gumbel noise: offset={offset}, pos={pos}");
+            assert_eq!(
+                shifted.sample(&row)?,
+                want,
+                "common finite offset must not erase Gumbel noise: offset={offset}, pos={pos}"
+            );
         }
     }
     Ok(())
@@ -451,25 +460,38 @@ fn filtered_gumbel_window_keeps_noise_under_large_equal_finite_offsets() -> Resu
     let zero_rows = Tensor::new(&[zero; 32], &dev)?;
     let mut reference = root_filtered_gumbel_sampler();
     let expected = reference.window_draw(&zero_rows, 0)?;
-    assert!(expected.contains(&0) && expected.contains(&1),
-        "zero-offset window control must observe both equal-score candidates");
+    assert!(
+        expected.contains(&0) && expected.contains(&1),
+        "zero-offset window control must observe both equal-score candidates"
+    );
     for offset in [f32::MAX, -f32::MAX] {
         let row = [offset, offset, f32::NEG_INFINITY];
         let rows = Tensor::new(&[row; 32], &dev)?;
         let mut shifted = root_filtered_gumbel_sampler();
-        assert_eq!(shifted.window_draw(&rows, 0)?, expected,
-            "window common finite offset must not erase Gumbel noise: offset={offset}");
+        assert_eq!(
+            shifted.window_draw(&rows, 0)?,
+            expected,
+            "window common finite offset must not erase Gumbel noise: offset={offset}"
+        );
     }
     Ok(())
 }
 
 #[test]
-fn unfiltered_and_disabled_filter_gumbel_share_centered_f32_scalar_window_and_running_stream() -> Result<()> {
+fn unfiltered_and_disabled_filter_gumbel_share_centered_f32_scalar_window_and_running_stream(
+) -> Result<()> {
     let device = Device::Cpu;
     let rows = Tensor::new(&[[1e30f32, 1e30, f32::NEG_INFINITY]; 4], &device)?;
     let row = rows.get(0)?;
     let mut plain = LogitsProcessor::from_sampling(7, Sampling::GumbelSoftmax { temperature: 3.0 });
-    let mut filtered = LogitsProcessor::from_sampling(7, Sampling::FilteredGumbel { temperature: 3.0, k: 3, p: 1.0 });
+    let mut filtered = LogitsProcessor::from_sampling(
+        7,
+        Sampling::FilteredGumbel {
+            temperature: 3.0,
+            k: 3,
+            p: 1.0,
+        },
+    );
     let mut seen = Vec::new();
     for pos in 0..32u64 {
         plain.at_position(Some(pos));
@@ -480,15 +502,21 @@ fn unfiltered_and_disabled_filter_gumbel_share_centered_f32_scalar_window_and_ru
         seen.push(id);
     }
     assert!(seen.contains(&0) && seen.contains(&1));
-    assert_eq!(plain.window_draw(&rows, 10)?, filtered.window_draw(&rows, 10)?);
+    assert_eq!(
+        plain.window_draw(&rows, 10)?,
+        filtered.window_draw(&rows, 10)?
+    );
     plain.at_position(None);
     filtered.at_position(None);
-    for _ in 0..16 { assert_eq!(plain.sample(&row)?, filtered.sample(&row)?); }
+    for _ in 0..16 {
+        assert_eq!(plain.sample(&row)?, filtered.sample(&row)?);
+    }
     Ok(())
 }
 
 #[test]
-fn unfiltered_gumbel_device_return_preserves_multirow_shape_and_flattened_noise_stream() -> Result<()> {
+fn unfiltered_gumbel_device_return_preserves_multirow_shape_and_flattened_noise_stream(
+) -> Result<()> {
     let device = Device::Cpu;
     let rows = Tensor::new(&[[1e30f32; 3]; 2], &device)?;
     let row = rows.get(0)?;
@@ -512,17 +540,24 @@ fn unfiltered_gumbel_device_return_preserves_multirow_shape_and_flattened_noise_
     key = (key ^ (key >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
     key ^= key >> 31;
     let mut rng = rand::rngs::StdRng::seed_from_u64(key);
-    let expected: Vec<u32> = (0..2).map(|_| {
-        let mut best = (0u32, f32::NEG_INFINITY);
-        for i in 0..3 {
-            let u: f64 = rng.random_range(1e-9..0.9999999);
-            let g = (-(-u.ln()).ln()) as f32;
-            if g > best.1 { best = (i, g); }
-        }
-        best.0
-    }).collect();
+    let expected: Vec<u32> = (0..2)
+        .map(|_| {
+            let mut best = (0u32, f32::NEG_INFINITY);
+            for i in 0..3 {
+                let u: f64 = rng.random_range(1e-9..0.9999999);
+                let g = (-(-u.ln()).ln()) as f32;
+                if g > best.1 {
+                    best = (i, g);
+                }
+            }
+            best.0
+        })
+        .collect();
     matrix.at_position(Some(pos));
-    assert_eq!(matrix.sample_argmax_on_device(&rows)?.to_vec1::<u32>()?, expected);
+    assert_eq!(
+        matrix.sample_argmax_on_device(&rows)?.to_vec1::<u32>()?,
+        expected
+    );
     Ok(())
 }
 
@@ -564,7 +599,12 @@ fn every_named_edge_keeps_the_hand_derived_set_through_the_public_sampler() -> R
     let tied_tail = [1.0f32, 0.0, 0.0, 0.0, 0.0];
     let mut cases: Vec<(&str, &[f32], Params, Vec<u32>)> = vec![
         ("k = 0 is off", &z, Params::new(1.0, 0, 1.0), all.clone()),
-        ("k = 1 keeps the top token", &z, Params::new(1.0, 1, 1.0), vec![0]),
+        (
+            "k = 1 keeps the top token",
+            &z,
+            Params::new(1.0, 1, 1.0),
+            vec![0],
+        ),
         (
             "k = V - 1 drops the lowest score",
             &z,
@@ -585,7 +625,12 @@ fn every_named_edge_keeps_the_hand_derived_set_through_the_public_sampler() -> R
             Params::new(1.0, 5, 1.0),
             vec![0, 1, 2, 3, 4],
         ),
-        ("p = 0 keeps the top token", &z, Params::new(1.0, 0, 0.0), vec![0]),
+        (
+            "p = 0 keeps the top token",
+            &z,
+            Params::new(1.0, 0, 0.0),
+            vec![0],
+        ),
         ("p = 1 is off", &z, Params::new(1.0, 0, 1.0), all.clone()),
         (
             "a nucleus crossing inside a tie keeps the lower id",
@@ -705,7 +750,11 @@ fn the_public_draws_have_the_reference_distribution() -> Result<()> {
     for (what, z, params) in cells {
         let want = reference_distribution(z, params);
         let df = want.iter().filter(|&&w| w > 0.0).count() - 1;
-        assert!((2..CHI2_999.len()).contains(&df), "{what}: support {}", df + 1);
+        assert!(
+            (2..CHI2_999.len()).contains(&df),
+            "{what}: support {}",
+            df + 1
+        );
         let gumbel = Sampling::FilteredGumbel {
             temperature: params.temperature,
             k: params.k,
@@ -718,13 +767,22 @@ fn the_public_draws_have_the_reference_distribution() -> Result<()> {
                 "CHI2 {method} {what} T={} k={} p={} chi2={chi2:.2} df={df} critical={} outside={outside}",
                 params.temperature, params.k, params.p, CHI2_999[df]
             );
-            assert_eq!(outside, 0, "{method} {what} {params:?}: drew outside the kept set");
-            assert!(chi2 < CHI2_999[df], "{method} {what} {params:?}: chi2 {chi2}");
+            assert_eq!(
+                outside, 0,
+                "{method} {what} {params:?}: drew outside the kept set"
+            );
+            assert!(
+                chi2 < CHI2_999[df],
+                "{method} {what} {params:?}: chi2 {chi2}"
+            );
             // Control: the temperature dropped from the expectation.
             let cold = reference_distribution(z, Params::new(1.0, params.k, params.p));
             let (chi2, _, _) = chi_square(&draws, &cold);
             println!("CHI2-CONTROL {method} {what} T dropped: chi2={chi2:.2}");
-            assert!(chi2 > CHI2_999[df], "{method} {what}: T = 1 passed at {chi2}");
+            assert!(
+                chi2 > CHI2_999[df],
+                "{method} {what}: T = 1 passed at {chi2}"
+            );
         }
         // Control: an unfiltered sampler leaves the filtered support.
         let unfiltered = public_draws(
@@ -737,7 +795,10 @@ fn the_public_draws_have_the_reference_distribution() -> Result<()> {
         )?;
         let (_, _, outside) = chi_square(&unfiltered, &want);
         println!("CHI2-CONTROL unfiltered {what}: outside={outside}");
-        assert!(outside > 100, "{what}: an unfiltered draw stayed inside ({outside})");
+        assert!(
+            outside > 100,
+            "{what}: an unfiltered draw stayed inside ({outside})"
+        );
     }
     Ok(())
 }

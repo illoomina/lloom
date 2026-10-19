@@ -1469,7 +1469,11 @@ mod sampling_and_speculation_tests {
     #[test]
     fn the_sampler_arms_follow_the_fields() {
         let o = resolve_options_uninstalled(&common(&[]), &no_front).unwrap();
-        assert_eq!(o.sampling.sampling().unwrap(), Sampling::ArgMax, "greedy by default");
+        assert_eq!(
+            o.sampling.sampling().unwrap(),
+            Sampling::ArgMax,
+            "greedy by default"
+        );
         let o = resolve_options_uninstalled(
             &common(&["-t", "0.7", "--top-p", "0.9", "-n", "64", "--seed", "7"]),
             &no_front,
@@ -1506,10 +1510,16 @@ mod sampling_and_speculation_tests {
         let filtered = resolve_options_uninstalled(
             &common(&["-t", "0.7", "--gumbel", "--top-k", "2", "--top-p", "0.4"]),
             &no_front,
-        ).unwrap();
-        assert_eq!(filtered.sampling.sampling().unwrap(), Sampling::FilteredGumbel {
-            temperature: 0.7, k: 2, p: 0.4,
-        });
+        )
+        .unwrap();
+        assert_eq!(
+            filtered.sampling.sampling().unwrap(),
+            Sampling::FilteredGumbel {
+                temperature: 0.7,
+                k: 2,
+                p: 0.4,
+            }
+        );
         assert!(filtered.sampling.sampling().unwrap().requires_host());
         let o = resolve_options_uninstalled(
             &common(&[
@@ -1519,7 +1529,10 @@ mod sampling_and_speculation_tests {
             &no_front,
         )
         .unwrap();
-        assert_eq!(o.sampling.sampling().unwrap(), Sampling::All { temperature: 0.3 });
+        assert_eq!(
+            o.sampling.sampling().unwrap(),
+            Sampling::All { temperature: 0.3 }
+        );
         assert_eq!(o.sampling.stop, vec!["<|im_end|>", "\n\n"]);
         let p = o.sampling.params(&[7], crate::ReadbackArm::Blocking, 0);
         assert_eq!(

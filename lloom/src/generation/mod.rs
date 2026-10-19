@@ -6,8 +6,8 @@
 use lloom_tensor::{DType, Result, Tensor};
 use rand::SeedableRng;
 
-mod distribution;
 pub mod budget;
+mod distribution;
 pub mod hot_thread;
 pub mod poll;
 pub mod processors;
@@ -130,8 +130,13 @@ impl Sampling {
 
     /// Arms that require host filtering until the native bridge is accepted.
     pub fn requires_host(&self) -> bool {
-        matches!(self, Self::TopK { .. } | Self::TopP { .. }
-            | Self::TopKThenTopP { .. } | Self::FilteredGumbel { .. })
+        matches!(
+            self,
+            Self::TopK { .. }
+                | Self::TopP { .. }
+                | Self::TopKThenTopP { .. }
+                | Self::FilteredGumbel { .. }
+        )
     }
 
     fn distribution(&self) -> Option<(f64, usize, f64)> {
@@ -630,10 +635,23 @@ impl LogitsProcessor {
                 let mut values = std::mem::take(&mut self.host.values);
                 let result = (|| -> Result<()> {
                     for (i, row) in values.chunks_mut(vocab).enumerate() {
-                        self.host.prepare_row(row, temperature, k, p, matches!(arm, Sampling::FilteredGumbel { .. } | Sampling::GumbelSoftmax { .. }))?;
+                        self.host.prepare_row(
+                            row,
+                            temperature,
+                            k,
+                            p,
+                            matches!(
+                                arm,
+                                Sampling::FilteredGumbel { .. } | Sampling::GumbelSoftmax { .. }
+                            ),
+                        )?;
                         let pos = first_pos + i as u64;
-                        let id = if matches!(arm, Sampling::FilteredGumbel { .. } | Sampling::GumbelSoftmax { .. }) {
-                            let mut rng = rand::rngs::StdRng::seed_from_u64(Self::stream_key(seed, pos));
+                        let id = if matches!(
+                            arm,
+                            Sampling::FilteredGumbel { .. } | Sampling::GumbelSoftmax { .. }
+                        ) {
+                            let mut rng =
+                                rand::rngs::StdRng::seed_from_u64(Self::stream_key(seed, pos));
                             self.host.gumbel_row(row, temperature, &mut rng)
                         } else {
                             self.host.draw_row(row, Self::uniform_at(seed, pos))
@@ -709,9 +727,7 @@ impl LogitsProcessor {
             Sampling::GumbelSoftmax { temperature } if logits.device().is_metal() => {
                 self.gumbel_max_host_noise(logits, temperature)
             }
-            Sampling::GumbelSoftmax { temperature } => {
-                self.host_gumbel_rows(logits, temperature)
-            }
+            Sampling::GumbelSoftmax { temperature } => self.host_gumbel_rows(logits, temperature),
             // Multinomial by inverse CDF: one host uniform uploaded, the
             // draw on the device, so the token never comes down here either.
             Sampling::All { temperature } if logits.device().is_metal() => {
@@ -932,7 +948,12 @@ impl LogitsProcessor {
         }
         let (temperature, k, p) = self.sampling.distribution().expect("distribution arm");
         distribution::validate(temperature, p)?;
-        if let Some(f) = f.filter(|_| !matches!(self.sampling, Sampling::FilteredGumbel { .. } | Sampling::GumbelSoftmax { .. })) {
+        if let Some(f) = f.filter(|_| {
+            !matches!(
+                self.sampling,
+                Sampling::FilteredGumbel { .. } | Sampling::GumbelSoftmax { .. }
+            )
+        }) {
             // Preserve the public probability callback's whole transformation,
             // after processors and before filters. This is explicitly host-side.
             let logits = logits.to_dtype(DType::F32)?;
@@ -944,11 +965,13 @@ impl LogitsProcessor {
                     let _ = crate::nn::ops::softmax_last_dim_into(&scaled, out)?;
                     self.host.values = slot.read_committed::<f32>(scaled.elem_count())?;
                 } else {
-                    self.host.load(&crate::nn::ops::softmax_last_dim(&scaled)?)?;
+                    self.host
+                        .load(&crate::nn::ops::softmax_last_dim(&scaled)?)?;
                 }
             }
             #[cfg(not(feature = "metal"))]
-            self.host.load(&crate::nn::ops::softmax_last_dim(&scaled)?)?;
+            self.host
+                .load(&crate::nn::ops::softmax_last_dim(&scaled)?)?;
             f(&mut self.host.values);
             self.host.filter_probabilities(k, p);
             let u = self.next_uniform();
@@ -965,7 +988,10 @@ impl LogitsProcessor {
         let (temperature, k, p) = self.sampling.distribution().expect("host distribution arm");
         let vocab = logits.dim(lloom_tensor::D::Minus1)?;
         if vocab == 0 || logits.elem_count() != vocab {
-            lloom_tensor::bail!("sampling: expected one nonempty row, got {:?}", logits.dims());
+            lloom_tensor::bail!(
+                "sampling: expected one nonempty row, got {:?}",
+                logits.dims()
+            );
         }
         let logits = logits.to_dtype(DType::F32)?;
         #[cfg(feature = "metal")]
@@ -979,19 +1005,33 @@ impl LogitsProcessor {
         }
         #[cfg(not(feature = "metal"))]
         self.host.load(&logits)?;
-        self.host.prepare(temperature, k, p, matches!(self.sampling, Sampling::FilteredGumbel { .. } | Sampling::GumbelSoftmax { .. }))?;
-        Ok(if matches!(self.sampling, Sampling::FilteredGumbel { .. } | Sampling::GumbelSoftmax { .. }) {
-            match self.position {
-                Some(pos) => {
-                    let mut rng = rand::rngs::StdRng::seed_from_u64(Self::stream_key(self.seed, pos));
-                    self.host.gumbel(temperature, &mut rng)
+        self.host.prepare(
+            temperature,
+            k,
+            p,
+            matches!(
+                self.sampling,
+                Sampling::FilteredGumbel { .. } | Sampling::GumbelSoftmax { .. }
+            ),
+        )?;
+        Ok(
+            if matches!(
+                self.sampling,
+                Sampling::FilteredGumbel { .. } | Sampling::GumbelSoftmax { .. }
+            ) {
+                match self.position {
+                    Some(pos) => {
+                        let mut rng =
+                            rand::rngs::StdRng::seed_from_u64(Self::stream_key(self.seed, pos));
+                        self.host.gumbel(temperature, &mut rng)
+                    }
+                    None => self.host.gumbel(temperature, &mut self.rng),
                 }
-                None => self.host.gumbel(temperature, &mut self.rng),
-            }
-        } else {
-            let u = self.next_uniform();
-            self.host.draw(u)
-        })
+            } else {
+                let u = self.next_uniform();
+                self.host.draw(u)
+            },
+        )
     }
 
     /// Device-return Gumbel accepts multiple rows. One call consumes the
@@ -999,11 +1039,15 @@ impl LogitsProcessor {
     fn host_gumbel_rows(&mut self, logits: &Tensor, temperature: f64) -> Result<Tensor> {
         distribution::validate(temperature, 1.0)?;
         let vocab = logits.dim(lloom_tensor::D::Minus1)?;
-        if vocab == 0 { lloom_tensor::bail!("gumbel draw: empty vocabulary"); }
+        if vocab == 0 {
+            lloom_tensor::bail!("gumbel draw: empty vocabulary");
+        }
         let scores = logits.to_dtype(DType::F32)?;
         self.host.load(&scores)?;
         let mut values = std::mem::take(&mut self.host.values);
-        let mut keyed = self.position.map(|p| rand::rngs::StdRng::seed_from_u64(Self::stream_key(self.seed, p)));
+        let mut keyed = self
+            .position
+            .map(|p| rand::rngs::StdRng::seed_from_u64(Self::stream_key(self.seed, p)));
         let rng = keyed.as_mut().unwrap_or(&mut self.rng);
         let mut ids = Vec::with_capacity(values.len() / vocab);
         let result = (|| -> Result<()> {

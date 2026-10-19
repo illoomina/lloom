@@ -164,7 +164,13 @@ pub const MAX_TOP_LOGPROBS: usize = 64;
 impl<'a> Asks<'a> {
     /// A sampling-only capability query; no auxiliary features requested.
     pub fn sampling(sampling: &'a Sampling) -> Self {
-        Self { sampling, processors: false, budget: false, digest: false, logprobs: None }
+        Self {
+            sampling,
+            processors: false,
+            budget: false,
+            digest: false,
+            logprobs: None,
+        }
     }
 
     /// What `sampler` asks, with or without a thinking budget.
@@ -1908,7 +1914,12 @@ impl<'m, M: CausalLM> Session<'m, M> {
         S: Speculator,
         R: ReadbackStrategy,
     {
-        refuse(Body::Step { ring: readback.arms().token_ring }, &Asks::of(sampler, false))?;
+        refuse(
+            Body::Step {
+                ring: readback.arms().token_ring,
+            },
+            &Asks::of(sampler, false),
+        )?;
         readback.check_sampler(sampler.sampling())?;
         let out = self.decode_until_run(spec, readback, sampler, prompt, opts, on_tokens);
         if out.is_err() {

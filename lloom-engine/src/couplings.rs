@@ -612,7 +612,9 @@ mod tests {
         ]);
         refuse(&host).unwrap();
         assert!(host.sampling.sampling().unwrap().requires_host());
-        assert!(explain(&host).iter().any(|s| s.contains("auto -> blocking")));
+        assert!(explain(&host)
+            .iter()
+            .any(|s| s.contains("auto -> blocking")));
     }
 
     #[test]

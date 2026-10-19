@@ -248,7 +248,8 @@ impl ReadbackArm {
         lloom::nn::refuse(
             lloom::nn::Body::Step { ring: true },
             &lloom::nn::Asks::sampling(sampling),
-        ).is_ok()
+        )
+        .is_ok()
     }
 
     /// The arm that runs for `sampling`: `Auto` resolves here — to
@@ -374,7 +375,9 @@ impl DecodeParams {
     /// The request's sampler: its arm, its processors and the digest, each
     /// validated before any sequence state moves.
     pub fn sampler(&self) -> Result<LogitsProcessor> {
-        self.processors.validate().map_err(lloom_tensor::Error::msg)?;
+        self.processors
+            .validate()
+            .map_err(lloom_tensor::Error::msg)?;
         Ok(LogitsProcessor::from_sampling(self.seed, self.sampling()?)
             .with_processors(self.processors.clone())
             .with_logits_digest(self.logits_digest))
@@ -398,7 +401,9 @@ impl DecodeParams {
     /// table every body asks (`lloom::nn::decode::refuse`); `path` names the
     /// caller in the message.
     pub fn refuse_on(&self, body: lloom::nn::Body, path: &str) -> Result<()> {
-        self.processors.validate().map_err(lloom_tensor::Error::msg)?;
+        self.processors
+            .validate()
+            .map_err(lloom_tensor::Error::msg)?;
         let sampling = self.sampling()?;
         lloom::nn::refuse(
             body,
@@ -812,7 +817,12 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
         if let Err(e) = self.config.check() {
             lloom_tensor::bail!("DecodeSession::decode: {e}");
         }
-        params.refuse_on(lloom::nn::Body::Step { ring: matches!(arm, ReadbackArm::Ring(_)) }, "DecodeSession::decode")?;
+        params.refuse_on(
+            lloom::nn::Body::Step {
+                ring: matches!(arm, ReadbackArm::Ring(_)),
+            },
+            "DecodeSession::decode",
+        )?;
         let (prepared, turn) = crate::turn::prepare(&mut self.session, prompt_ids, true)?;
         let (checkpoint, checkpoint_at) = self.establish_checkpoint(&prepared, params)?;
         sampler.observe_prompt(prompt_ids);
@@ -2560,7 +2570,8 @@ mod tests {
                                 );
                                 if device.is_metal() {
                                     let resolved = config.readback.arm().resolve(
-                                        &DecodeParams::sampling_of(Some(t), p, None, false).unwrap(),
+                                        &DecodeParams::sampling_of(Some(t), p, None, false)
+                                            .unwrap(),
                                         config.readback.ring_arm(),
                                     );
                                     assert_eq!(got.readback, resolved, "{at}: the reply reports another arm than the options resolve to");

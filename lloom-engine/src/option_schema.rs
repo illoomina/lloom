@@ -492,10 +492,15 @@ mod tests {
     fn declared_value_mappings_add_exact_schema_names() {
         let schema = schema();
         let mut mapped = 0;
-        for key in index().keys.values().filter(|key| !key.meta().values.is_empty()) {
-            let node = key.path.split('.').fold(&schema, |node, part| {
-                &node["properties"][part]
-            });
+        for key in index()
+            .keys
+            .values()
+            .filter(|key| !key.meta().values.is_empty())
+        {
+            let node = key
+                .path
+                .split('.')
+                .fold(&schema, |node, part| &node["properties"][part]);
             let names: Vec<&str> = key.meta().values.iter().map(|(input, _)| *input).collect();
             assert_eq!(
                 node["anyOf"][0]["anyOf"][1],

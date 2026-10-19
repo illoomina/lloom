@@ -1542,7 +1542,11 @@ fn request_budgets(shared: &Shared, v: &Value, max_tokens: usize) -> Handled<Bud
 }
 
 /// The sampling knobs both OpenAI endpoints share.
-fn sampling_params(defaults: &crate::SamplingConfig, engine: &dyn Served, v: &Value) -> Handled<DecodeParams> {
+fn sampling_params(
+    defaults: &crate::SamplingConfig,
+    engine: &dyn Served,
+    v: &Value,
+) -> Handled<DecodeParams> {
     let max_tokens = v
         .get("max_completion_tokens")
         .or_else(|| v.get("max_tokens"))
@@ -4452,7 +4456,6 @@ mod logprob_request_tests {
     }
 }
 
-
 #[cfg(test)]
 mod sampling_ingress_tests {
     use super::{sampling_params, Failure};
@@ -4539,10 +4542,7 @@ mod sampling_ingress_tests {
         )
         .ok()
         .unwrap();
-        assert_eq!(
-            off.sampling().unwrap(),
-            Sampling::All { temperature: 0.7 }
-        );
+        assert_eq!(off.sampling().unwrap(), Sampling::All { temperature: 0.7 });
     }
 
     #[test]

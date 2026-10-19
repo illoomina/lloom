@@ -8,6 +8,18 @@
 //!   chat template through the request front end, `front.rs`, `logprobs`),
 //!   `/v1/models`, `/tokenize`; on both routes the token-level fields
 //!   `prompt_token_ids` (ids in, no template) and `return_token_ids`;
+//!
+//! On the chat route a reply's reasoning comes back **apart from its answer**:
+//! `message.reasoning_content` and `message.content` (the answer only), and on
+//! the stream `delta.reasoning_content` and `delta.content` (decision 51 Q2,
+//! `sequence-reuse-design.md` §2.3d). A request that wants the whole reply in
+//! `content`, as before, sends `reasoning_in_content: true` — an opt-out.
+//! `/v1/completions` is unchanged: its text is the reply.
+//!
+//! `usage.completion_tokens` counts the tokens of the completion the client
+//! **received** — the accepted frontier (decision 51 Q4, the standard
+//! semantics). The count the run generated is in `timings.tokens` and
+//! `timings.frontier`, which differ past a stop string on the adaptive commit.
 //! - the **benchmark sidecar** contract LiquidAI's `pipette` runners drive an
 //!   engine through (`Liquid4All/pipette-clients`, the MLX sidecar's shape):
 //!   `/prefill_throughput`, `/decode_throughput`, `/end_to_end_latency`,

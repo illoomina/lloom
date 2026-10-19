@@ -149,7 +149,7 @@ pub struct ReadbackConfig {
     #[opt(variants = ["blocking", "poll", "host-drain", "gpu-batched", "gpu-batched-nonblocking"], path = "decode.readback.eos", status = "arm", facets = ["signal"], flows = ["token-out"])]
     pub eos: EosKind,
     /// The poll mechanism under `eos = poll` (`wfe` on aarch64 by default).
-    #[opt(variants = ["spin", "spin-hint", "wfe", "sleep", "sleep:<µs>"], path = "decode.readback.wait", status = "arm", facets = ["wait"], flows = ["token-out"], forms = ["spin", "spin-hint", "wfe", "sleep"], from_v1 = "lloom_tensor::options::v1::poll_from", to_v1 = "lloom_tensor::options::v1::poll_to", schema = "Wait")]
+    #[opt(variants = ["spin", "spin-hint", "wfe", "sleep", "sleep:<µs>"], path = "decode.readback.wait", status = "arm", facets = ["wait"], flows = ["token-out"], forms = ["spin", "spin-hint", "wfe", "sleep"], from_v1 = "lloom_tensor::options::v1::poll_from", to_v1 = "lloom_tensor::options::v1::poll_to", schema = "Wait", grammar = "lloom_tensor::options::wait::READBACK_WAIT")]
     pub poll: PollMechanism,
     /// Forward passes the host enqueues before it has learned the previous step's EOS (ring arms): 0 or 1.
     #[opt(variants = ["0", "1"], path = "decode.readback.lookahead_forwards", status = "advanced", facets = ["lead"], flows = ["token-out", "commands-out"])]
@@ -218,6 +218,8 @@ impl ReadbackConfig {
     /// The other fields keep their values, so `--readback ring-hostdrain
     /// --lookahead 0` composes in either order.
     pub fn apply_spelling(cfg: &mut Self, s: &str) -> Result<(), String> {
+        let s = lloom_tensor::options::parse_arm(s, Self::SPELLINGS)
+            .map_err(|reason| format!("readback: {reason}"))?;
         match s {
             "auto" => cfg.kind = ReadbackKind::Auto,
             "blocking" => cfg.kind = ReadbackKind::Blocking,
@@ -751,7 +753,6 @@ impl ModelConfig {
         // Validate on a scratch config so a bad value is refused here, with
         // the axis's own message, rather than at load; keep the spelling the
         // axis parses (a bool as `true`/`false`, an arm in lower case).
-        let value = lloom_tensor::options::non_empty(value).map_err(|e| format!("--{key}: {e}"))?;
         let is_bool = lloom::models::lfm2::Config::AXES_META
             .iter()
             .any(|a| a.key == key && a.is_bool);
@@ -760,7 +761,9 @@ impl ModelConfig {
                 .map_err(|e| format!("--{key}: {e}"))?
                 .to_string()
         } else {
-            value.to_ascii_lowercase()
+            lloom_tensor::options::non_empty(value)
+                .map_err(|e| format!("--{key}: {e}"))?
+                .to_ascii_lowercase()
         };
         let mut probe = lloom::models::lfm2::Config::default();
         probe.set_axis(key, &value)?;
@@ -834,6 +837,18 @@ impl ModelConfig {
 }
 
 fn json_scalar(key: &str, v: &serde_json::Value) -> Result<String, String> {
+    let axis = key.strip_prefix("axes.").unwrap_or(key);
+    if let Some(meta) = lloom::models::lfm2::Config::AXES_META
+        .iter()
+        .find(|meta| meta.key == axis)
+    {
+        if let Some(value) = meta
+            .native_number(v)
+            .map_err(|error| format!("--{axis}: {error}"))?
+        {
+            return Ok(value);
+        }
+    }
     match v {
         serde_json::Value::String(s) => Ok(s.clone()),
         serde_json::Value::Bool(b) => Ok(b.to_string()),

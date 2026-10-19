@@ -1,0 +1,1307 @@
+[
+  {
+    "name": "block",
+    "input": "block",
+    "accept": true,
+    "stored": "synchronize",
+    "rendered": "block",
+    "arm": "synchronize",
+    "period": null
+  },
+  {
+    "name": "legacy block",
+    "input": "synchronize",
+    "accept": true,
+    "stored": "synchronize",
+    "rendered": "block",
+    "arm": "synchronize",
+    "period": null
+  },
+  {
+    "name": "event",
+    "input": "event",
+    "accept": true,
+    "stored": "shared-event",
+    "rendered": "event",
+    "arm": "shared-event",
+    "period": null
+  },
+  {
+    "name": "legacy event",
+    "input": "shared-event",
+    "accept": true,
+    "stored": "shared-event",
+    "rendered": "event",
+    "arm": "shared-event",
+    "period": null
+  },
+  {
+    "name": "bare sleep",
+    "input": "event-sleep",
+    "accept": true,
+    "stored": "shared-event-sleep",
+    "rendered": "event-sleep",
+    "arm": "shared-event-sleep",
+    "period": 50
+  },
+  {
+    "name": "legacy bare sleep",
+    "input": "shared-event-sleep",
+    "accept": true,
+    "stored": "shared-event-sleep",
+    "rendered": "event-sleep",
+    "arm": "shared-event-sleep",
+    "period": 50
+  },
+  {
+    "name": "bare timed",
+    "input": "shared-event-wait",
+    "accept": true,
+    "stored": "shared-event-wait",
+    "rendered": "event:2000ms",
+    "arm": "shared-event-wait",
+    "period": 2000
+  },
+  {
+    "name": "bare listener",
+    "input": "event-listener",
+    "accept": true,
+    "stored": "shared-event-listener",
+    "rendered": "event-listener",
+    "arm": "shared-event-listener",
+    "period": 2000
+  },
+  {
+    "name": "legacy bare listener",
+    "input": "shared-event-listener",
+    "accept": true,
+    "stored": "shared-event-listener",
+    "rendered": "event-listener",
+    "arm": "shared-event-listener",
+    "period": 2000
+  },
+  {
+    "name": "outer case",
+    "input": " \tEvEnT:2MS\n ",
+    "accept": true,
+    "stored": "shared-event-wait:2",
+    "rendered": "event:2ms",
+    "arm": "shared-event-wait",
+    "period": 2
+  },
+  {
+    "name": "outer Rust whitespace",
+    "input": "\u0085BLOCK\u3000",
+    "accept": true,
+    "stored": "synchronize",
+    "rendered": "block",
+    "arm": "synchronize",
+    "period": null
+  },
+  {
+    "name": "reset",
+    "input": null,
+    "accept": true,
+    "stored": "synchronize",
+    "rendered": "block",
+    "arm": "synchronize",
+    "period": null
+  },
+  {
+    "name": "event raw 0",
+    "input": "event:0",
+    "accept": true,
+    "stored": "shared-event-wait:0",
+    "rendered": "event:0ms",
+    "arm": "shared-event-wait",
+    "period": 0
+  },
+  {
+    "name": "event raw 0005",
+    "input": "event:0005",
+    "accept": true,
+    "stored": "shared-event-wait:0005",
+    "rendered": "event:0005ms",
+    "arm": "shared-event-wait",
+    "period": 5
+  },
+  {
+    "name": "event raw 18446744073709551615",
+    "input": "event:18446744073709551615",
+    "accept": true,
+    "stored": "shared-event-wait:18446744073709551615",
+    "rendered": "event:18446744073709551615ms",
+    "arm": "shared-event-wait",
+    "period": 18446744073709551615
+  },
+  {
+    "name": "event duration '2ms'",
+    "input": "event:2ms",
+    "accept": true,
+    "stored": "shared-event-wait:2",
+    "rendered": "event:2ms",
+    "arm": "shared-event-wait",
+    "period": 2
+  },
+  {
+    "name": "event duration '2s'",
+    "input": "event:2s",
+    "accept": true,
+    "stored": "shared-event-wait:2000",
+    "rendered": "event:2000ms",
+    "arm": "shared-event-wait",
+    "period": 2000
+  },
+  {
+    "name": "event duration '+0002MS'",
+    "input": "event:+0002MS",
+    "accept": true,
+    "stored": "shared-event-wait:2",
+    "rendered": "event:2ms",
+    "arm": "shared-event-wait",
+    "period": 2
+  },
+  {
+    "name": "event duration ' \\t+2ms'",
+    "input": "event: \t+2ms",
+    "accept": true,
+    "stored": "shared-event-wait:2",
+    "rendered": "event:2ms",
+    "arm": "shared-event-wait",
+    "period": 2
+  },
+  {
+    "name": "event duration '\\x85+2ms'",
+    "input": "event:\u0085+2ms",
+    "accept": true,
+    "stored": "shared-event-wait:2",
+    "rendered": "event:2ms",
+    "arm": "shared-event-wait",
+    "period": 2
+  },
+  {
+    "name": "event duration '0000us'",
+    "input": "event:0000us",
+    "accept": true,
+    "stored": "shared-event-wait:0",
+    "rendered": "event:0ms",
+    "arm": "shared-event-wait",
+    "period": 0
+  },
+  {
+    "name": "event duration '1000us'",
+    "input": "event:1000us",
+    "accept": true,
+    "stored": "shared-event-wait:1",
+    "rendered": "event:1ms",
+    "arm": "shared-event-wait",
+    "period": 1
+  },
+  {
+    "name": "event refuse ''",
+    "input": "event:",
+    "accept": false
+  },
+  {
+    "name": "event refuse '+5'",
+    "input": "event:+5",
+    "accept": false
+  },
+  {
+    "name": "event refuse ' +5'",
+    "input": "event: +5",
+    "accept": false
+  },
+  {
+    "name": "event refuse '5 ms'",
+    "input": "event:5 ms",
+    "accept": false
+  },
+  {
+    "name": "event refuse '1.0ms'",
+    "input": "event:1.0ms",
+    "accept": false
+  },
+  {
+    "name": "event refuse '1e3us'",
+    "input": "event:1e3us",
+    "accept": false
+  },
+  {
+    "name": "event refuse '1m'",
+    "input": "event:1m",
+    "accept": false
+  },
+  {
+    "name": "event refuse '-1'",
+    "input": "event:-1",
+    "accept": false
+  },
+  {
+    "name": "event refuse '-0ms'",
+    "input": "event:-0ms",
+    "accept": false
+  },
+  {
+    "name": "event refuse '++2ms'",
+    "input": "event:++2ms",
+    "accept": false
+  },
+  {
+    "name": "event refuse '18446744073709551616'",
+    "input": "event:18446744073709551616",
+    "accept": false
+  },
+  {
+    "name": "event refuse '18446744073709552ms'",
+    "input": "event:18446744073709552ms",
+    "accept": false
+  },
+  {
+    "name": "event refuse '18446744073710s'",
+    "input": "event:18446744073710s",
+    "accept": false
+  },
+  {
+    "name": "event refuse '18446744073709551616us'",
+    "input": "event:18446744073709551616us",
+    "accept": false
+  },
+  {
+    "name": "event refuse '\\ufeff2ms'",
+    "input": "event:\ufeff2ms",
+    "accept": false
+  },
+  {
+    "name": "event nonwhole 1us",
+    "input": "event:1us",
+    "accept": false
+  },
+  {
+    "name": "event nonwhole 500us",
+    "input": "event:500us",
+    "accept": false
+  },
+  {
+    "name": "event nonwhole 1001us",
+    "input": "event:1001us",
+    "accept": false
+  },
+  {
+    "name": "event nonwhole 18446744073709551615us",
+    "input": "event:18446744073709551615us",
+    "accept": false
+  },
+  {
+    "name": "event checked boundary 18446744073709551000us",
+    "input": "event:18446744073709551000us",
+    "accept": true,
+    "stored": "shared-event-wait:18446744073709551",
+    "rendered": "event:18446744073709551ms",
+    "arm": "shared-event-wait",
+    "period": 18446744073709551
+  },
+  {
+    "name": "event checked boundary 18446744073709551ms",
+    "input": "event:18446744073709551ms",
+    "accept": true,
+    "stored": "shared-event-wait:18446744073709551",
+    "rendered": "event:18446744073709551ms",
+    "arm": "shared-event-wait",
+    "period": 18446744073709551
+  },
+  {
+    "name": "event checked boundary 18446744073709s",
+    "input": "event:18446744073709s",
+    "accept": true,
+    "stored": "shared-event-wait:18446744073709000",
+    "rendered": "event:18446744073709000ms",
+    "arm": "shared-event-wait",
+    "period": 18446744073709000
+  },
+  {
+    "name": "event-listener raw 0",
+    "input": "event-listener:0",
+    "accept": true,
+    "stored": "shared-event-listener:0",
+    "rendered": "event-listener:0ms",
+    "arm": "shared-event-listener",
+    "period": 0
+  },
+  {
+    "name": "event-listener raw 0005",
+    "input": "event-listener:0005",
+    "accept": true,
+    "stored": "shared-event-listener:0005",
+    "rendered": "event-listener:0005ms",
+    "arm": "shared-event-listener",
+    "period": 5
+  },
+  {
+    "name": "event-listener raw 18446744073709551615",
+    "input": "event-listener:18446744073709551615",
+    "accept": true,
+    "stored": "shared-event-listener:18446744073709551615",
+    "rendered": "event-listener:18446744073709551615ms",
+    "arm": "shared-event-listener",
+    "period": 18446744073709551615
+  },
+  {
+    "name": "event-listener duration '2ms'",
+    "input": "event-listener:2ms",
+    "accept": true,
+    "stored": "shared-event-listener:2",
+    "rendered": "event-listener:2ms",
+    "arm": "shared-event-listener",
+    "period": 2
+  },
+  {
+    "name": "event-listener duration '2s'",
+    "input": "event-listener:2s",
+    "accept": true,
+    "stored": "shared-event-listener:2000",
+    "rendered": "event-listener:2000ms",
+    "arm": "shared-event-listener",
+    "period": 2000
+  },
+  {
+    "name": "event-listener duration '+0002MS'",
+    "input": "event-listener:+0002MS",
+    "accept": true,
+    "stored": "shared-event-listener:2",
+    "rendered": "event-listener:2ms",
+    "arm": "shared-event-listener",
+    "period": 2
+  },
+  {
+    "name": "event-listener duration ' \\t+2ms'",
+    "input": "event-listener: \t+2ms",
+    "accept": true,
+    "stored": "shared-event-listener:2",
+    "rendered": "event-listener:2ms",
+    "arm": "shared-event-listener",
+    "period": 2
+  },
+  {
+    "name": "event-listener duration '\\x85+2ms'",
+    "input": "event-listener:\u0085+2ms",
+    "accept": true,
+    "stored": "shared-event-listener:2",
+    "rendered": "event-listener:2ms",
+    "arm": "shared-event-listener",
+    "period": 2
+  },
+  {
+    "name": "event-listener duration '0000us'",
+    "input": "event-listener:0000us",
+    "accept": true,
+    "stored": "shared-event-listener:0",
+    "rendered": "event-listener:0ms",
+    "arm": "shared-event-listener",
+    "period": 0
+  },
+  {
+    "name": "event-listener duration '1000us'",
+    "input": "event-listener:1000us",
+    "accept": true,
+    "stored": "shared-event-listener:1",
+    "rendered": "event-listener:1ms",
+    "arm": "shared-event-listener",
+    "period": 1
+  },
+  {
+    "name": "event-listener refuse ''",
+    "input": "event-listener:",
+    "accept": false
+  },
+  {
+    "name": "event-listener refuse '+5'",
+    "input": "event-listener:+5",
+    "accept": false
+  },
+  {
+    "name": "event-listener refuse ' +5'",
+    "input": "event-listener: +5",
+    "accept": false
+  },
+  {
+    "name": "event-listener refuse '5 ms'",
+    "input": "event-listener:5 ms",
+    "accept": false
+  },
+  {
+    "name": "event-listener refuse '1.0ms'",
+    "input": "event-listener:1.0ms",
+    "accept": false
+  },
+  {
+    "name": "event-listener refuse '1e3us'",
+    "input": "event-listener:1e3us",
+    "accept": false
+  },
+  {
+    "name": "event-listener refuse '1m'",
+    "input": "event-listener:1m",
+    "accept": false
+  },
+  {
+    "name": "event-listener refuse '-1'",
+    "input": "event-listener:-1",
+    "accept": false
+  },
+  {
+    "name": "event-listener refuse '-0ms'",
+    "input": "event-listener:-0ms",
+    "accept": false
+  },
+  {
+    "name": "event-listener refuse '++2ms'",
+    "input": "event-listener:++2ms",
+    "accept": false
+  },
+  {
+    "name": "event-listener refuse '18446744073709551616'",
+    "input": "event-listener:18446744073709551616",
+    "accept": false
+  },
+  {
+    "name": "event-listener refuse '18446744073709552ms'",
+    "input": "event-listener:18446744073709552ms",
+    "accept": false
+  },
+  {
+    "name": "event-listener refuse '18446744073710s'",
+    "input": "event-listener:18446744073710s",
+    "accept": false
+  },
+  {
+    "name": "event-listener refuse '18446744073709551616us'",
+    "input": "event-listener:18446744073709551616us",
+    "accept": false
+  },
+  {
+    "name": "event-listener refuse '\\ufeff2ms'",
+    "input": "event-listener:\ufeff2ms",
+    "accept": false
+  },
+  {
+    "name": "event-listener nonwhole 1us",
+    "input": "event-listener:1us",
+    "accept": false
+  },
+  {
+    "name": "event-listener nonwhole 500us",
+    "input": "event-listener:500us",
+    "accept": false
+  },
+  {
+    "name": "event-listener nonwhole 1001us",
+    "input": "event-listener:1001us",
+    "accept": false
+  },
+  {
+    "name": "event-listener nonwhole 18446744073709551615us",
+    "input": "event-listener:18446744073709551615us",
+    "accept": false
+  },
+  {
+    "name": "event-listener checked boundary 18446744073709551000us",
+    "input": "event-listener:18446744073709551000us",
+    "accept": true,
+    "stored": "shared-event-listener:18446744073709551",
+    "rendered": "event-listener:18446744073709551ms",
+    "arm": "shared-event-listener",
+    "period": 18446744073709551
+  },
+  {
+    "name": "event-listener checked boundary 18446744073709551ms",
+    "input": "event-listener:18446744073709551ms",
+    "accept": true,
+    "stored": "shared-event-listener:18446744073709551",
+    "rendered": "event-listener:18446744073709551ms",
+    "arm": "shared-event-listener",
+    "period": 18446744073709551
+  },
+  {
+    "name": "event-listener checked boundary 18446744073709s",
+    "input": "event-listener:18446744073709s",
+    "accept": true,
+    "stored": "shared-event-listener:18446744073709000",
+    "rendered": "event-listener:18446744073709000ms",
+    "arm": "shared-event-listener",
+    "period": 18446744073709000
+  },
+  {
+    "name": "event-sleep raw 0",
+    "input": "event-sleep:0",
+    "accept": true,
+    "stored": "shared-event-sleep:0",
+    "rendered": "event-sleep:0us",
+    "arm": "shared-event-sleep",
+    "period": 0
+  },
+  {
+    "name": "event-sleep raw 0005",
+    "input": "event-sleep:0005",
+    "accept": true,
+    "stored": "shared-event-sleep:0005",
+    "rendered": "event-sleep:0005us",
+    "arm": "shared-event-sleep",
+    "period": 5
+  },
+  {
+    "name": "event-sleep raw 18446744073709551615",
+    "input": "event-sleep:18446744073709551615",
+    "accept": true,
+    "stored": "shared-event-sleep:18446744073709551615",
+    "rendered": "event-sleep:18446744073709551615us",
+    "arm": "shared-event-sleep",
+    "period": 18446744073709551615
+  },
+  {
+    "name": "event-sleep duration '2ms'",
+    "input": "event-sleep:2ms",
+    "accept": true,
+    "stored": "shared-event-sleep:2000",
+    "rendered": "event-sleep:2000us",
+    "arm": "shared-event-sleep",
+    "period": 2000
+  },
+  {
+    "name": "event-sleep duration '2s'",
+    "input": "event-sleep:2s",
+    "accept": true,
+    "stored": "shared-event-sleep:2000000",
+    "rendered": "event-sleep:2000000us",
+    "arm": "shared-event-sleep",
+    "period": 2000000
+  },
+  {
+    "name": "event-sleep duration '+0002MS'",
+    "input": "event-sleep:+0002MS",
+    "accept": true,
+    "stored": "shared-event-sleep:2000",
+    "rendered": "event-sleep:2000us",
+    "arm": "shared-event-sleep",
+    "period": 2000
+  },
+  {
+    "name": "event-sleep duration ' \\t+2ms'",
+    "input": "event-sleep: \t+2ms",
+    "accept": true,
+    "stored": "shared-event-sleep:2000",
+    "rendered": "event-sleep:2000us",
+    "arm": "shared-event-sleep",
+    "period": 2000
+  },
+  {
+    "name": "event-sleep duration '\\x85+2ms'",
+    "input": "event-sleep:\u0085+2ms",
+    "accept": true,
+    "stored": "shared-event-sleep:2000",
+    "rendered": "event-sleep:2000us",
+    "arm": "shared-event-sleep",
+    "period": 2000
+  },
+  {
+    "name": "event-sleep duration '0000us'",
+    "input": "event-sleep:0000us",
+    "accept": true,
+    "stored": "shared-event-sleep:0",
+    "rendered": "event-sleep:0us",
+    "arm": "shared-event-sleep",
+    "period": 0
+  },
+  {
+    "name": "event-sleep duration '1000us'",
+    "input": "event-sleep:1000us",
+    "accept": true,
+    "stored": "shared-event-sleep:1000",
+    "rendered": "event-sleep:1000us",
+    "arm": "shared-event-sleep",
+    "period": 1000
+  },
+  {
+    "name": "event-sleep refuse ''",
+    "input": "event-sleep:",
+    "accept": false
+  },
+  {
+    "name": "event-sleep refuse '+5'",
+    "input": "event-sleep:+5",
+    "accept": false
+  },
+  {
+    "name": "event-sleep refuse ' +5'",
+    "input": "event-sleep: +5",
+    "accept": false
+  },
+  {
+    "name": "event-sleep refuse '5 ms'",
+    "input": "event-sleep:5 ms",
+    "accept": false
+  },
+  {
+    "name": "event-sleep refuse '1.0ms'",
+    "input": "event-sleep:1.0ms",
+    "accept": false
+  },
+  {
+    "name": "event-sleep refuse '1e3us'",
+    "input": "event-sleep:1e3us",
+    "accept": false
+  },
+  {
+    "name": "event-sleep refuse '1m'",
+    "input": "event-sleep:1m",
+    "accept": false
+  },
+  {
+    "name": "event-sleep refuse '-1'",
+    "input": "event-sleep:-1",
+    "accept": false
+  },
+  {
+    "name": "event-sleep refuse '-0ms'",
+    "input": "event-sleep:-0ms",
+    "accept": false
+  },
+  {
+    "name": "event-sleep refuse '++2ms'",
+    "input": "event-sleep:++2ms",
+    "accept": false
+  },
+  {
+    "name": "event-sleep refuse '18446744073709551616'",
+    "input": "event-sleep:18446744073709551616",
+    "accept": false
+  },
+  {
+    "name": "event-sleep refuse '18446744073709552ms'",
+    "input": "event-sleep:18446744073709552ms",
+    "accept": false
+  },
+  {
+    "name": "event-sleep refuse '18446744073710s'",
+    "input": "event-sleep:18446744073710s",
+    "accept": false
+  },
+  {
+    "name": "event-sleep refuse '18446744073709551616us'",
+    "input": "event-sleep:18446744073709551616us",
+    "accept": false
+  },
+  {
+    "name": "event-sleep refuse '\\ufeff2ms'",
+    "input": "event-sleep:\ufeff2ms",
+    "accept": false
+  },
+  {
+    "name": "event-sleep checked boundary 1us",
+    "input": "event-sleep:1us",
+    "accept": true,
+    "stored": "shared-event-sleep:1",
+    "rendered": "event-sleep:1us",
+    "arm": "shared-event-sleep",
+    "period": 1
+  },
+  {
+    "name": "event-sleep checked boundary 18446744073709551615us",
+    "input": "event-sleep:18446744073709551615us",
+    "accept": true,
+    "stored": "shared-event-sleep:18446744073709551615",
+    "rendered": "event-sleep:18446744073709551615us",
+    "arm": "shared-event-sleep",
+    "period": 18446744073709551615
+  },
+  {
+    "name": "event-sleep checked boundary 18446744073709551ms",
+    "input": "event-sleep:18446744073709551ms",
+    "accept": true,
+    "stored": "shared-event-sleep:18446744073709551000",
+    "rendered": "event-sleep:18446744073709551000us",
+    "arm": "shared-event-sleep",
+    "period": 18446744073709551000
+  },
+  {
+    "name": "event-sleep checked boundary 18446744073709s",
+    "input": "event-sleep:18446744073709s",
+    "accept": true,
+    "stored": "shared-event-sleep:18446744073709000000",
+    "rendered": "event-sleep:18446744073709000000us",
+    "arm": "shared-event-sleep",
+    "period": 18446744073709000000
+  },
+  {
+    "name": "shared-event-wait raw 0",
+    "input": "shared-event-wait:0",
+    "accept": true,
+    "stored": "shared-event-wait:0",
+    "rendered": "event:0ms",
+    "arm": "shared-event-wait",
+    "period": 0
+  },
+  {
+    "name": "shared-event-wait raw 0005",
+    "input": "shared-event-wait:0005",
+    "accept": true,
+    "stored": "shared-event-wait:0005",
+    "rendered": "event:0005ms",
+    "arm": "shared-event-wait",
+    "period": 5
+  },
+  {
+    "name": "shared-event-wait raw +0005",
+    "input": "shared-event-wait:+0005",
+    "accept": true,
+    "stored": "shared-event-wait:+0005",
+    "rendered": "shared-event-wait:+0005",
+    "arm": "shared-event-wait",
+    "period": 5
+  },
+  {
+    "name": "shared-event-wait raw 18446744073709551615",
+    "input": "shared-event-wait:18446744073709551615",
+    "accept": true,
+    "stored": "shared-event-wait:18446744073709551615",
+    "rendered": "event:18446744073709551615ms",
+    "arm": "shared-event-wait",
+    "period": 18446744073709551615
+  },
+  {
+    "name": "shared-event-wait raw +18446744073709551615",
+    "input": "shared-event-wait:+18446744073709551615",
+    "accept": true,
+    "stored": "shared-event-wait:+18446744073709551615",
+    "rendered": "shared-event-wait:+18446744073709551615",
+    "arm": "shared-event-wait",
+    "period": 18446744073709551615
+  },
+  {
+    "name": "shared-event-wait trimmed ' +5'",
+    "input": "shared-event-wait: +5",
+    "accept": false,
+    "accept_without_metal": true,
+    "stored": "shared-event-wait: +5",
+    "rendered": "shared-event-wait: +5",
+    "arm": "shared-event-wait",
+    "period": 5
+  },
+  {
+    "name": "shared-event-wait trimmed '\\t+0005'",
+    "input": "shared-event-wait:\t+0005",
+    "accept": false,
+    "accept_without_metal": true,
+    "stored": "shared-event-wait:\t+0005",
+    "rendered": "shared-event-wait:\t+0005",
+    "arm": "shared-event-wait",
+    "period": 5
+  },
+  {
+    "name": "shared-event-wait trimmed '\\x85+5'",
+    "input": "shared-event-wait:\u0085+5",
+    "accept": false,
+    "accept_without_metal": true,
+    "stored": "shared-event-wait:\u0085+5",
+    "rendered": "shared-event-wait:\u0085+5",
+    "arm": "shared-event-wait",
+    "period": 5
+  },
+  {
+    "name": "shared-event-wait trimmed ' 5'",
+    "input": "shared-event-wait: 5",
+    "accept": false,
+    "accept_without_metal": true,
+    "stored": "shared-event-wait: 5",
+    "rendered": "shared-event-wait: 5",
+    "arm": "shared-event-wait",
+    "period": 5
+  },
+  {
+    "name": "shared-event-wait outer versus parameter whitespace",
+    "input": " \tSHARED-EVENT-WAIT:+5\n ",
+    "accept": true,
+    "stored": "shared-event-wait:+5",
+    "rendered": "shared-event-wait:+5",
+    "arm": "shared-event-wait",
+    "period": 5
+  },
+  {
+    "name": "shared-event-wait refuse ''",
+    "input": "shared-event-wait:",
+    "accept": false
+  },
+  {
+    "name": "shared-event-wait refuse '+'",
+    "input": "shared-event-wait:+",
+    "accept": false
+  },
+  {
+    "name": "shared-event-wait refuse '++5'",
+    "input": "shared-event-wait:++5",
+    "accept": false
+  },
+  {
+    "name": "shared-event-wait refuse '+ 5'",
+    "input": "shared-event-wait:+ 5",
+    "accept": false
+  },
+  {
+    "name": "shared-event-wait refuse '5ms'",
+    "input": "shared-event-wait:5ms",
+    "accept": false
+  },
+  {
+    "name": "shared-event-wait refuse '5us'",
+    "input": "shared-event-wait:5us",
+    "accept": false
+  },
+  {
+    "name": "shared-event-wait refuse '-1'",
+    "input": "shared-event-wait:-1",
+    "accept": false
+  },
+  {
+    "name": "shared-event-wait refuse '-0'",
+    "input": "shared-event-wait:-0",
+    "accept": false
+  },
+  {
+    "name": "shared-event-wait refuse '1.0'",
+    "input": "shared-event-wait:1.0",
+    "accept": false
+  },
+  {
+    "name": "shared-event-wait refuse '1e3'",
+    "input": "shared-event-wait:1e3",
+    "accept": false
+  },
+  {
+    "name": "shared-event-wait refuse '18446744073709551616'",
+    "input": "shared-event-wait:18446744073709551616",
+    "accept": false
+  },
+  {
+    "name": "shared-event-wait refuse '+18446744073709551616'",
+    "input": "shared-event-wait:+18446744073709551616",
+    "accept": false
+  },
+  {
+    "name": "shared-event-wait refuse '\\ufeff5'",
+    "input": "shared-event-wait:\ufeff5",
+    "accept": false
+  },
+  {
+    "name": "shared-event-listener raw 0",
+    "input": "shared-event-listener:0",
+    "accept": true,
+    "stored": "shared-event-listener:0",
+    "rendered": "event-listener:0ms",
+    "arm": "shared-event-listener",
+    "period": 0
+  },
+  {
+    "name": "shared-event-listener raw 0005",
+    "input": "shared-event-listener:0005",
+    "accept": true,
+    "stored": "shared-event-listener:0005",
+    "rendered": "event-listener:0005ms",
+    "arm": "shared-event-listener",
+    "period": 5
+  },
+  {
+    "name": "shared-event-listener raw +0005",
+    "input": "shared-event-listener:+0005",
+    "accept": true,
+    "stored": "shared-event-listener:+0005",
+    "rendered": "shared-event-listener:+0005",
+    "arm": "shared-event-listener",
+    "period": 5
+  },
+  {
+    "name": "shared-event-listener raw 18446744073709551615",
+    "input": "shared-event-listener:18446744073709551615",
+    "accept": true,
+    "stored": "shared-event-listener:18446744073709551615",
+    "rendered": "event-listener:18446744073709551615ms",
+    "arm": "shared-event-listener",
+    "period": 18446744073709551615
+  },
+  {
+    "name": "shared-event-listener raw +18446744073709551615",
+    "input": "shared-event-listener:+18446744073709551615",
+    "accept": true,
+    "stored": "shared-event-listener:+18446744073709551615",
+    "rendered": "shared-event-listener:+18446744073709551615",
+    "arm": "shared-event-listener",
+    "period": 18446744073709551615
+  },
+  {
+    "name": "shared-event-listener trimmed ' +5'",
+    "input": "shared-event-listener: +5",
+    "accept": false,
+    "accept_without_metal": true,
+    "stored": "shared-event-listener: +5",
+    "rendered": "shared-event-listener: +5",
+    "arm": "shared-event-listener",
+    "period": 5
+  },
+  {
+    "name": "shared-event-listener trimmed '\\t+0005'",
+    "input": "shared-event-listener:\t+0005",
+    "accept": false,
+    "accept_without_metal": true,
+    "stored": "shared-event-listener:\t+0005",
+    "rendered": "shared-event-listener:\t+0005",
+    "arm": "shared-event-listener",
+    "period": 5
+  },
+  {
+    "name": "shared-event-listener trimmed '\\x85+5'",
+    "input": "shared-event-listener:\u0085+5",
+    "accept": false,
+    "accept_without_metal": true,
+    "stored": "shared-event-listener:\u0085+5",
+    "rendered": "shared-event-listener:\u0085+5",
+    "arm": "shared-event-listener",
+    "period": 5
+  },
+  {
+    "name": "shared-event-listener trimmed ' 5'",
+    "input": "shared-event-listener: 5",
+    "accept": false,
+    "accept_without_metal": true,
+    "stored": "shared-event-listener: 5",
+    "rendered": "shared-event-listener: 5",
+    "arm": "shared-event-listener",
+    "period": 5
+  },
+  {
+    "name": "shared-event-listener outer versus parameter whitespace",
+    "input": " \tSHARED-EVENT-LISTENER:+5\n ",
+    "accept": true,
+    "stored": "shared-event-listener:+5",
+    "rendered": "shared-event-listener:+5",
+    "arm": "shared-event-listener",
+    "period": 5
+  },
+  {
+    "name": "shared-event-listener refuse ''",
+    "input": "shared-event-listener:",
+    "accept": false
+  },
+  {
+    "name": "shared-event-listener refuse '+'",
+    "input": "shared-event-listener:+",
+    "accept": false
+  },
+  {
+    "name": "shared-event-listener refuse '++5'",
+    "input": "shared-event-listener:++5",
+    "accept": false
+  },
+  {
+    "name": "shared-event-listener refuse '+ 5'",
+    "input": "shared-event-listener:+ 5",
+    "accept": false
+  },
+  {
+    "name": "shared-event-listener refuse '5ms'",
+    "input": "shared-event-listener:5ms",
+    "accept": false
+  },
+  {
+    "name": "shared-event-listener refuse '5us'",
+    "input": "shared-event-listener:5us",
+    "accept": false
+  },
+  {
+    "name": "shared-event-listener refuse '-1'",
+    "input": "shared-event-listener:-1",
+    "accept": false
+  },
+  {
+    "name": "shared-event-listener refuse '-0'",
+    "input": "shared-event-listener:-0",
+    "accept": false
+  },
+  {
+    "name": "shared-event-listener refuse '1.0'",
+    "input": "shared-event-listener:1.0",
+    "accept": false
+  },
+  {
+    "name": "shared-event-listener refuse '1e3'",
+    "input": "shared-event-listener:1e3",
+    "accept": false
+  },
+  {
+    "name": "shared-event-listener refuse '18446744073709551616'",
+    "input": "shared-event-listener:18446744073709551616",
+    "accept": false
+  },
+  {
+    "name": "shared-event-listener refuse '+18446744073709551616'",
+    "input": "shared-event-listener:+18446744073709551616",
+    "accept": false
+  },
+  {
+    "name": "shared-event-listener refuse '\\ufeff5'",
+    "input": "shared-event-listener:\ufeff5",
+    "accept": false
+  },
+  {
+    "name": "shared-event-sleep raw 0",
+    "input": "shared-event-sleep:0",
+    "accept": true,
+    "stored": "shared-event-sleep:0",
+    "rendered": "event-sleep:0us",
+    "arm": "shared-event-sleep",
+    "period": 0
+  },
+  {
+    "name": "shared-event-sleep raw 0005",
+    "input": "shared-event-sleep:0005",
+    "accept": true,
+    "stored": "shared-event-sleep:0005",
+    "rendered": "event-sleep:0005us",
+    "arm": "shared-event-sleep",
+    "period": 5
+  },
+  {
+    "name": "shared-event-sleep raw +0005",
+    "input": "shared-event-sleep:+0005",
+    "accept": true,
+    "stored": "shared-event-sleep:+0005",
+    "rendered": "shared-event-sleep:+0005",
+    "arm": "shared-event-sleep",
+    "period": 5
+  },
+  {
+    "name": "shared-event-sleep raw 18446744073709551615",
+    "input": "shared-event-sleep:18446744073709551615",
+    "accept": true,
+    "stored": "shared-event-sleep:18446744073709551615",
+    "rendered": "event-sleep:18446744073709551615us",
+    "arm": "shared-event-sleep",
+    "period": 18446744073709551615
+  },
+  {
+    "name": "shared-event-sleep raw +18446744073709551615",
+    "input": "shared-event-sleep:+18446744073709551615",
+    "accept": true,
+    "stored": "shared-event-sleep:+18446744073709551615",
+    "rendered": "shared-event-sleep:+18446744073709551615",
+    "arm": "shared-event-sleep",
+    "period": 18446744073709551615
+  },
+  {
+    "name": "shared-event-sleep trimmed ' +5'",
+    "input": "shared-event-sleep: +5",
+    "accept": false,
+    "accept_without_metal": true,
+    "stored": "shared-event-sleep: +5",
+    "rendered": "shared-event-sleep: +5",
+    "arm": "shared-event-sleep",
+    "period": 5
+  },
+  {
+    "name": "shared-event-sleep trimmed '\\t+0005'",
+    "input": "shared-event-sleep:\t+0005",
+    "accept": false,
+    "accept_without_metal": true,
+    "stored": "shared-event-sleep:\t+0005",
+    "rendered": "shared-event-sleep:\t+0005",
+    "arm": "shared-event-sleep",
+    "period": 5
+  },
+  {
+    "name": "shared-event-sleep trimmed '\\x85+5'",
+    "input": "shared-event-sleep:\u0085+5",
+    "accept": false,
+    "accept_without_metal": true,
+    "stored": "shared-event-sleep:\u0085+5",
+    "rendered": "shared-event-sleep:\u0085+5",
+    "arm": "shared-event-sleep",
+    "period": 5
+  },
+  {
+    "name": "shared-event-sleep trimmed ' 5'",
+    "input": "shared-event-sleep: 5",
+    "accept": false,
+    "accept_without_metal": true,
+    "stored": "shared-event-sleep: 5",
+    "rendered": "shared-event-sleep: 5",
+    "arm": "shared-event-sleep",
+    "period": 5
+  },
+  {
+    "name": "shared-event-sleep outer versus parameter whitespace",
+    "input": " \tSHARED-EVENT-SLEEP:+5\n ",
+    "accept": true,
+    "stored": "shared-event-sleep:+5",
+    "rendered": "shared-event-sleep:+5",
+    "arm": "shared-event-sleep",
+    "period": 5
+  },
+  {
+    "name": "shared-event-sleep refuse ''",
+    "input": "shared-event-sleep:",
+    "accept": false
+  },
+  {
+    "name": "shared-event-sleep refuse '+'",
+    "input": "shared-event-sleep:+",
+    "accept": false
+  },
+  {
+    "name": "shared-event-sleep refuse '++5'",
+    "input": "shared-event-sleep:++5",
+    "accept": false
+  },
+  {
+    "name": "shared-event-sleep refuse '+ 5'",
+    "input": "shared-event-sleep:+ 5",
+    "accept": false
+  },
+  {
+    "name": "shared-event-sleep refuse '5ms'",
+    "input": "shared-event-sleep:5ms",
+    "accept": false
+  },
+  {
+    "name": "shared-event-sleep refuse '5us'",
+    "input": "shared-event-sleep:5us",
+    "accept": false
+  },
+  {
+    "name": "shared-event-sleep refuse '-1'",
+    "input": "shared-event-sleep:-1",
+    "accept": false
+  },
+  {
+    "name": "shared-event-sleep refuse '-0'",
+    "input": "shared-event-sleep:-0",
+    "accept": false
+  },
+  {
+    "name": "shared-event-sleep refuse '1.0'",
+    "input": "shared-event-sleep:1.0",
+    "accept": false
+  },
+  {
+    "name": "shared-event-sleep refuse '1e3'",
+    "input": "shared-event-sleep:1e3",
+    "accept": false
+  },
+  {
+    "name": "shared-event-sleep refuse '18446744073709551616'",
+    "input": "shared-event-sleep:18446744073709551616",
+    "accept": false
+  },
+  {
+    "name": "shared-event-sleep refuse '+18446744073709551616'",
+    "input": "shared-event-sleep:+18446744073709551616",
+    "accept": false
+  },
+  {
+    "name": "shared-event-sleep refuse '\\ufeff5'",
+    "input": "shared-event-sleep:\ufeff5",
+    "accept": false
+  },
+  {
+    "name": "refuse native or unknown ''",
+    "input": "",
+    "accept": false
+  },
+  {
+    "name": "refuse native or unknown ' \\t '",
+    "input": " \t ",
+    "accept": false
+  },
+  {
+    "name": "refuse native or unknown 'none'",
+    "input": "none",
+    "accept": false
+  },
+  {
+    "name": "refuse native or unknown 'unknown'",
+    "input": "unknown",
+    "accept": false
+  },
+  {
+    "name": "refuse native or unknown 'spin'",
+    "input": "spin",
+    "accept": false
+  },
+  {
+    "name": "refuse native or unknown 'sleep:5'",
+    "input": "sleep:5",
+    "accept": false
+  },
+  {
+    "name": "refuse native or unknown 'block:5'",
+    "input": "block:5",
+    "accept": false
+  },
+  {
+    "name": "refuse native or unknown 'synchronize:5'",
+    "input": "synchronize:5",
+    "accept": false
+  },
+  {
+    "name": "refuse native or unknown 'shared-event:5'",
+    "input": "shared-event:5",
+    "accept": false
+  },
+  {
+    "name": "refuse native or unknown 'event :2ms'",
+    "input": "event :2ms",
+    "accept": false
+  },
+  {
+    "name": "refuse native or unknown '\\ufeffblock'",
+    "input": "\ufeffblock",
+    "accept": false
+  },
+  {
+    "name": "refuse native or unknown 'block\\ufeff'",
+    "input": "block\ufeff",
+    "accept": false
+  },
+  {
+    "name": "refuse native or unknown True",
+    "input": true,
+    "accept": false
+  },
+  {
+    "name": "refuse native or unknown False",
+    "input": false,
+    "accept": false
+  },
+  {
+    "name": "refuse native or unknown 0",
+    "input": 0,
+    "accept": false
+  },
+  {
+    "name": "refuse native or unknown 7",
+    "input": 7,
+    "accept": false
+  },
+  {
+    "name": "refuse native or unknown 7.0",
+    "input": 7.0,
+    "accept": false
+  },
+  {
+    "name": "refuse native or unknown []",
+    "input": [],
+    "accept": false
+  },
+  {
+    "name": "refuse native or unknown {}",
+    "input": {},
+    "accept": false
+  }
+]

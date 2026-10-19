@@ -1469,6 +1469,13 @@ impl MetalDevice {
         Ok(())
     }
 
+    /// The gate's cores arm for the armed run: the quantized mat-vec cores
+    /// load their gated variant too (`Kernels::set_eos_gate_cores`). Cleared
+    /// by [`Self::eos_gate_end`].
+    pub fn eos_gate_cores(&self, on: bool) {
+        self.kernels.set_eos_gate_cores(on);
+    }
+
     /// See `Device::eos_gate_step`. Offsets in bytes.
     pub fn eos_gate_step(
         &self,
@@ -1650,8 +1657,13 @@ impl MetalDevice {
     /// buffer that failed is recorded for the next wait to report.
     pub fn eos_gate_end(&self) -> crate::EosGateReport {
         let _ = self.wait_until_completed();
+        let cores = self.kernels.eos_gate_cores();
         self.kernels.set_eos_gated(false);
-        self.commands.eos_gate().end()
+        self.kernels.set_eos_gate_cores(false);
+        crate::EosGateReport {
+            cores,
+            ..self.commands.eos_gate().end()
+        }
     }
 
     /// The adaptive commit (lloom #735): see `Commands::flush_marker_if_started`.

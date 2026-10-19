@@ -1355,6 +1355,9 @@ pub struct Decoder<P: Profile, C, E, L, H> {
     /// family's geometry (0: the family says nothing, and a pass's working
     /// set is not admitted).
     prefill_bytes_per_position: usize,
+    /// Whether the family's dependency inventory admits the EOS gate's
+    /// cores arm (`CausalLM::eos_gate_cores`); set by its loader.
+    gate_cores: bool,
 }
 
 /// The chunk a prefill runs through the layers at once.
@@ -1397,7 +1400,14 @@ where
             reservation: None,
             keep: Vec::new(),
             prefill_bytes_per_position: 0,
+            gate_cores: false,
         })
+    }
+
+    /// The family's loader says its forwards admit the EOS gate's cores arm
+    /// (`CausalLM::eos_gate_cores`, `sequence-reuse-design.md` §2.3e).
+    pub fn set_eos_gate_cores(&mut self, admitted: bool) {
+        self.gate_cores = admitted;
     }
 
     /// The bytes a multi-position pass allocates per position: what
@@ -1739,6 +1749,10 @@ where
     fn checkpoint_at(&self, cache: &mut Self::Cache, pos: usize) -> Result<()> {
         cache.checkpoint_at(pos);
         Ok(())
+    }
+
+    fn eos_gate_cores(&self) -> bool {
+        self.gate_cores
     }
 
     fn open_checkpoint_request(

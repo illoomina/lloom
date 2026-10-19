@@ -97,7 +97,7 @@ impl Sampling {
     ) -> Result<Sampling> {
         if let Some(t) = temperature.filter(|t| !(t.is_finite() && *t >= 0.0)) {
             lloom_tensor::bail!(
-                "temperature = {t}: not a finite number >= 0 (unset, 0 or below {GREEDY_BELOW} \
+                "temperature = {t}: not a finite number >= 0 (unset, 0 or below {GREEDY_BELOW:e} \
                  is greedy)"
             );
         }

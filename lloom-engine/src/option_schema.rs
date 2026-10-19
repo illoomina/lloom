@@ -367,7 +367,8 @@ fn value_schema(key: &Key, default: &Value) -> Value {
     // The derive applies these exact named inputs before the stored type's
     // parser (e.g. named methods stored as bool). An annotation alone does
     // not admit them; preserve the stored grammar alongside the input names.
-    if !m.values.is_empty() {
+    // A normalized bool already admits its aliases in its own pattern.
+    if !m.values.is_empty() && !normalized_bool {
         let names: Vec<&str> = m.values.iter().map(|(input, _)| *input).collect();
         s = json!({"anyOf": [s, {"type": "string", "enum": names}]});
     }
@@ -675,10 +676,12 @@ mod tests {
     fn declared_value_mappings_add_exact_schema_names() {
         let schema = schema();
         let mut mapped = 0;
+        // A normalized bool admits its aliases through its normalization
+        // pattern (`option_acceptance_tests` holds that schema).
         for key in index()
             .keys
             .values()
-            .filter(|key| !key.meta().values.is_empty())
+            .filter(|key| !key.meta().values.is_empty() && !key.meta().normalize_values)
         {
             let node = key
                 .path

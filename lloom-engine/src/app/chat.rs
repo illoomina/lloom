@@ -260,7 +260,7 @@ pub fn run(args: ChatArgs) -> Result<()> {
     }
     // After the tuning install: the trace switch is a tuning knob, and a knob
     // read before the install cannot be installed.
-    report::arm_trace();
+    report::arm_trace()?;
     // The chat's own long turn is its front-end default (`crate::frontend`).
     let mut sampling = options.sampling.clone();
     let t = Instant::now();

@@ -73,6 +73,8 @@ unsafe impl Sync for Queue {}
 
 impl Queue {
     pub fn new(device: Device) -> Result<Arc<Self>, MetalKernelError> {
+        crate::tuning::try_tuning()
+            .map_err(|error| MetalKernelError::InvalidInput(error.to_string()))?;
         let raw = device
             .as_ref()
             .newMTL4CommandQueue()

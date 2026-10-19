@@ -122,13 +122,13 @@ fn a_missing_host_planned_decode_is_served_and_asks_the_pools_for_nothing() -> R
     let m: &MetalDevice = m;
     m.enable_pass_plans(ArenaLayout::Packed);
     let model = streamed(&cfg, &dev, &path)?;
-    lloom_tensor::metal_backend::set_served_request_trace(true);
+    lloom_tensor::metal_backend::set_served_request_trace(true).unwrap();
     let _ = lloom_tensor::metal_backend::served_pass_request_sites();
     let before = m.served_pass_pool_requests();
     let got = decode(&model, &dev)?;
     let after = m.served_pass_pool_requests();
     let sites = lloom_tensor::metal_backend::served_pass_request_sites();
-    lloom_tensor::metal_backend::set_served_request_trace(false);
+    lloom_tensor::metal_backend::set_served_request_trace(false).unwrap();
     let _ = std::fs::remove_file(&path);
     assert_eq!(got, want, "a served decode step moved the stream");
     let c = m.pass_plan_counters().expect("the cache is on");

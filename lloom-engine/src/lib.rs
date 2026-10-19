@@ -21,9 +21,11 @@
 #[cfg(feature = "serve")]
 pub mod app;
 pub mod batch;
+pub mod compiled;
 pub mod couplings;
 pub mod decision;
 pub mod decode;
+pub mod frontend;
 pub mod option_grammar;
 pub mod option_schema;
 pub mod option_tree;

@@ -9,6 +9,12 @@ pub mod nn;
 pub mod axes;
 pub mod tuning;
 
+/// Whether this build carries the decode loop's per-step instrumentation
+/// (the step clock, the first steps' phases, the step-0 dispatch census):
+/// debug builds and the `profile` feature, the gate those sites compile
+/// under. The option tree's `profile` capability reads it.
+pub const PROFILE_INSTRUMENTS: bool = cfg!(any(debug_assertions, feature = "profile"));
+
 pub mod fused_moe;
 pub mod generation;
 pub mod load_warning;

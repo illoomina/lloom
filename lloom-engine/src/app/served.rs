@@ -18,6 +18,18 @@ use lloom::load_warning::LoadWarning;
 use lloom_tensor::Device;
 use serde_json::{Map, Value};
 
+/// A detokenizer attempt over its pending token run, before text publication.
+/// `from` is its raw byte offset; repeated attempts replace that pending span.
+/// The decoder is the same one used by generation, not retokenization.
+pub type DecodeObserver<'a> = dyn FnMut(
+        &[u32],
+        &str,
+        usize,
+        &dyn Fn(&[u32]) -> lloom_tensor::Result<String>,
+    ) -> lloom_tensor::Result<()>
+    + Send
+    + 'a;
+
 pub trait Served: Send + Sync {
     /// The device the model decodes on.
     fn device(&self) -> &Device;
@@ -234,6 +246,23 @@ pub trait Served: Send + Sync {
     ) -> Result<Decoded> {
         let _ = (prompt_ids, images, params, on_fragment);
         Err(self.no_vision())
+    }
+
+    /// Generation with typed detokenizer observations. Legacy adapters retain
+    /// their existing fragment seam; the GGUF owner supplies the observations.
+    fn complete_observed(
+        &self,
+        prompt: &[u32],
+        images: &[DecodedImage],
+        params: &DecodeParams,
+        on_fragment: &mut (dyn FnMut(&str) -> bool + Send),
+        _observe: &mut DecodeObserver<'_>,
+    ) -> Result<Decoded> {
+        if images.is_empty() {
+            self.complete_until(prompt, params, on_fragment)
+        } else {
+            self.complete_images_until(prompt, images, params, on_fragment)
+        }
     }
 
     /// What the last request loaded and encoded: the model's tensors, whether

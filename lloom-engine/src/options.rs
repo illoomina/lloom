@@ -874,6 +874,23 @@ impl ModelConfigArgs {
         }
         Ok(())
     }
+
+    /// The storage paths whose flags were given (the derive's `given`).
+    pub fn given(&self, prefix: &str, out: &mut std::collections::BTreeSet<String>) {
+        let at = |k: &str| {
+            if prefix.is_empty() {
+                k.to_string()
+            } else {
+                format!("{prefix}.{k}")
+            }
+        };
+        if self.cache.is_some() {
+            out.insert(at("cache"));
+        }
+        for (flag, _) in self.axes.overrides() {
+            out.insert(at(&format!("axes.{flag}")));
+        }
+    }
 }
 
 // ---- sampling -------------------------------------------------------------------
@@ -1429,7 +1446,7 @@ pub struct MemoryConfig {
     /// Load even when the machine gate refuses; the reservation is still recorded, so other lloom processes see it.
     #[opt(bool, path = "memory.machine.force", status = "stable", cli = "force")]
     pub force: bool,
-    /// GB the machine gate keeps for macOS and the UI; none = max(4 GiB, the machine's memory less the Metal device's recommended working set), or max(4 GiB, 10 % of the machine's memory) with no Metal device.
+    /// GB the machine gate keeps for the host OS; none on macOS = max(4 GiB, memory less the Metal recommended working set), or max(4 GiB, 10 %) without Metal; other hosts = max(256 MiB, 5 %).
     #[opt(path = "memory.machine.reserve_gb", status = "advanced")]
     pub machine_reserve_gb: Option<f64>,
     /// The directory of the machine-wide registry of lloom processes' reservations; none = ~/.cache/lloom/memory.
@@ -1574,7 +1591,13 @@ pub struct LoadConfig {
     )]
     pub decision_template: Option<String>,
     /// Load no vision or audio tower (a GGUF's mmproj, a VL checkpoint's tower): for text workloads, at the tower's memory. Image requests are then refused by name, and `/v1/models` lists text input only.
-    #[opt(bool, flag = "text-only", path = "model.text_only", status = "advanced", cli = "text-only")]
+    #[opt(
+        bool,
+        flag = "text-only",
+        path = "model.text_only",
+        status = "advanced",
+        cli = "text-only"
+    )]
     pub text_only: bool,
     /// Compile the prefill pipelines at load (off: the first prompt compiles them inside its own time to first token).
     #[opt(bool, flag = "warmup", path = "model.warmup", status = "advanced", switches = ["no-warmup=false"])]
@@ -1690,7 +1713,7 @@ impl Default for SchedulerConfig {
 #[options(v0 = false)]
 #[serde(default)]
 pub struct PrefixConfig {
-    /// Reuse the cached prefix across turns or requests; unset = the front-end's own (`chat` and `serve` reuse; `bench` measures a cold prefill, and a benchmark cell stays cold whatever this says). `--no-reuse` turns it off.
+    /// Reuse the cached prefix across turns or requests; unset = the front-end's own.
     #[opt(bool, flag = "reuse-prefix", path = "context.prefix.reuse", status = "stable", cli = "prefix-reuse", switches = ["no-reuse=false"])]
     pub reuse: Option<bool>,
     /// Share a request's prompt prefix from another row's cache, by page (the pool rows only).
@@ -1739,7 +1762,7 @@ fn parse_keep_logprobs(v: &str) -> Result<String, String> {
 #[options(v0 = false)]
 #[serde(default)]
 pub struct SessionConfig {
-    /// Keep past replies' reasoning in the history the next turn renders (the chat template's `preserve_thinking`); unset = the template's own default.
+    /// Keep past replies' reasoning in the history the next turn renders (the chat template's `preserve_thinking`): unset keeps it, as `true` does, wherever the template has the switch (its own rendering where it has none); `false` strips it (opt-in).
     #[opt(bool, flag = "persist-thinking", path = "session.persist_thinking", status = "stable", cli = "persist-thinking", switches = ["strip-thinking=false"])]
     pub persist_thinking: Option<bool>,
     /// A past reply of ours sent back without the reasoning the model wrote: `as-sent` renders the message as the client sent it; `log` restores the reasoning from the session log.
@@ -1748,7 +1771,7 @@ pub struct SessionConfig {
     /// What the session log keeps beside each reply's sampled ids: `none`; `sampled`, the sampled token's log-probability; `full`, every position's log-probabilities over the vocabulary (for a trainer that embeds the engine).
     #[opt(flag = "keep-logprobs", parser = "parse_keep_logprobs", variants = ["none", "sampled", "full"], path = "session.keep_logprobs", status = "advanced")]
     pub keep_logprobs: String,
-    /// A past reply of ours whose run ended inside its reasoning block (`max_tokens`, a stop string, a cancellation): `text` renders it as the text the client got; `reasoning` gives it to the template as the open reasoning it is, which the template closes or drops; `recover` renders it as text and places the turn checkpoint before the divergence that makes.
+    /// A past reply of ours whose run ended inside its reasoning block (`max_tokens`, a stop string, a cancellation): `reasoning` (the default) gives it to the template as the open reasoning it is, which the template closes or drops; `text` renders it as the text the client got; `recover` renders it as text and places the turn checkpoint before the divergence that makes.
     #[opt(flag = "incomplete-reasoning", parser = "parse_incomplete_reasoning", variants = ["text", "reasoning", "recover"], path = "session.incomplete_reasoning", status = "advanced")]
     pub incomplete_reasoning: String,
 }
@@ -1759,7 +1782,7 @@ impl Default for SessionConfig {
             persist_thinking: None,
             missing_reasoning: "as-sent".into(),
             keep_logprobs: "none".into(),
-            incomplete_reasoning: "text".into(),
+            incomplete_reasoning: "reasoning".into(),
         }
     }
 }
@@ -1792,7 +1815,9 @@ pub struct ReportConfig {
         short = 'v',
         path = "diagnostics.verbose",
         status = "stable",
-        cli = "verbose"
+        cli = "verbose",
+        needs = "profile",
+        needs_part = "the first token's split and the step-time percentiles"
     )]
     pub verbose: bool,
     /// Sample the memory gauges every 10 ms around each turn or cell and report their peaks (a gauge run: it perturbs the timing beside it).

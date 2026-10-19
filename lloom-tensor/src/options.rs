@@ -125,6 +125,13 @@ pub struct KnobMeta {
     pub legacy_keys: &'static [&'static str],
     /// A nested group whose shorthand spelling (`--readback ring`) is a key.
     pub compound: bool,
+    /// The compiled capability (`profile`) the key's effect needs; empty =
+    /// every build has it. Which capabilities a binary has is the binary's
+    /// own table (`lloom-engine`'s `compiled`).
+    pub needs: &'static str,
+    /// The part of the key's output that needs [`Self::needs`]; empty = the
+    /// whole key, which a build without the capability refuses at setup.
+    pub needs_part: &'static str,
 }
 
 impl KnobMeta {
@@ -157,6 +164,8 @@ impl KnobMeta {
         v0: true,
         legacy_keys: &[],
         compound: false,
+        needs: "",
+        needs_part: "",
     };
 }
 

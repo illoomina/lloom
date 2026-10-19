@@ -1,0 +1,238 @@
+{
+  "decode": {
+    "readback": {
+      "kind": "auto",
+      "eos": "poll",
+      "poll": "wfe",
+      "lookahead": 1,
+      "commit_budget": "steps:8",
+      "adaptive_commit": true,
+      "run_ahead": 0,
+      "eos_gate": true,
+      "fused_publish": true,
+      "stream_reader": false,
+      "wake_cadence": 4
+    },
+    "in_flight": 0,
+    "phase_sync": false,
+    "prefill": {
+      "tile": 512,
+      "ubatch": 0,
+      "chunk": 0,
+      "spark": null,
+      "pass_widths": "lru",
+      "in_flight": 0
+    }
+  },
+  "tuning": {
+    "contract": {
+      "profile": "fast"
+    },
+    "gemm": {
+      "skinny_max": 33,
+      "tile": null,
+      "gemv_bm": null,
+      "force": null
+    },
+    "qmv": {
+      "iq2xs_nsg": 4,
+      "iq4nl_nsg": 4,
+      "iq2s_nsg": 4,
+      "q4k_nr0": null,
+      "q5k_nr0": null,
+      "q6k_nr0": 2,
+      "rows": false,
+      "mm_from": null,
+      "id_union": false
+    },
+    "qmm": {
+      "dequant_from": 64,
+      "dequant_gemm": "qmm",
+      "f16_mm": true,
+      "dequantize_all": false,
+      "dequantize_all_f16": false
+    },
+    "moe": {
+      "mm_from": 64,
+      "mm_bn": 0,
+      "pair": true,
+      "pair_order": "expert"
+    },
+    "gdn": {
+      "split": 8,
+      "step_reg": true
+    },
+    "metal": {
+      "completion_wait": "synchronize",
+      "compute_per_buffer": 50,
+      "pipelined_compute_per_buffer": 512,
+      "cut_policy": "counter",
+      "nodes_per_cb": 0,
+      "hazard_key": null,
+      "cb_unretained": false,
+      "to_cpu_blit": false,
+      "copy2d_no_blit": false,
+      "wire_weights": false,
+      "heap_chunk_mb": 512,
+      "transient_heaps": false,
+      "io_lanes": 8,
+      "cflags": null,
+      "merged_unit": false,
+      "icb_quarantine_off": false,
+      "icb_residency": "per-run",
+      "allow_emulated": null
+    },
+    "pool": {
+      "reuse_oversize_bound": null,
+      "eviction_order": "age",
+      "no_reuse": false,
+      "no_admission_drain": false,
+      "quarantine": 0,
+      "retain_evicted": false,
+      "unpooled_uploads": false,
+      "stream_pooled_staging": false,
+      "buffer_alignment": 128
+    },
+    "instrument": {
+      "profile": false,
+      "profile_counters": false,
+      "profile_encoder_per_dispatch": false,
+      "trace": false,
+      "pool_trace": false,
+      "served_request_trace": false,
+      "readback_trace": false,
+      "upload_shadow": false,
+      "late_bind": false
+    },
+    "cpu": {
+      "num_threads": 0,
+      "mmap_advice": null,
+      "grad_do_not_detach": false
+    },
+    "lfm2": {
+      "skip_conv_c_fusion": false,
+      "rows_arm": "batched",
+      "flash_partial_bn": 32,
+      "sdpa_two_pass_k": 1024,
+      "norm_gemv": false,
+      "fusion_budget": "rounding",
+      "ablate": "",
+      "share_trace": false,
+      "verify_poll_trace": false,
+      "poison_zeros": "",
+      "poison_value": "nan"
+    },
+    "dspark": {
+      "ctx_kv": "auto",
+      "eager_attn": false
+    },
+    "stream": {
+      "pread_direct": false,
+      "prefetch_threads": 8,
+      "prefetch_qos": "default",
+      "prefetch_split": 1,
+      "prefetch_lead": 2,
+      "plan": "device",
+      "decode_hint": false,
+      "hint_recall": false,
+      "spare_slots": 0,
+      "settle_batch": true,
+      "spike0": "off",
+      "trace_settle": false,
+      "fetch": "off",
+      "fetch_poll_us": 50,
+      "fetch_exit": 8,
+      "fetch_settle": "behind",
+      "provisional": "on",
+      "fetch_qos": "user-interactive"
+    },
+    "qwen4exp": {
+      "fusion": "manual",
+      "hc_mix": false,
+      "fused_off": false,
+      "f16_fuse": true,
+      "shared_store": false,
+      "mtp_experts": "streamed",
+      "f16_fold": false,
+      "chunk_scan": true,
+      "delta_reduce": false,
+      "state_write": "in-place",
+      "prefill_chunk": 0,
+      "prefill_pair": true,
+      "prefill_tiles": 2,
+      "spec_ahead": 0,
+      "mem_check": "refuse",
+      "score_no_matmul": false,
+      "sparse_masked": false,
+      "check_sel": false,
+      "watch_nan": false,
+      "trace": false,
+      "trace_load": false,
+      "mtp_probe": false,
+      "mtp_trace": false,
+      "mtp_draft_loads": "auto",
+      "mtp_observe_plan": "host",
+      "hc_norm_gemv": false,
+      "ablate": "",
+      "mtp_verify_key": "kind",
+      "qsa_window": "rows",
+      "mtp_fold": false
+    },
+    "ring": {
+      "slack_bytes": 33554432,
+      "hot_thread": "interactive",
+      "feed_qos": "user-interactive",
+      "feed_poll": "on-demand:50",
+      "feed_trace": false,
+      "eos_park": false,
+      "verify_park": true
+    }
+  },
+  "model": {
+    "cache": "auto",
+    "axes": {}
+  },
+  "sampling": {
+    "defaults": "greedy",
+    "temperature": null,
+    "top_p": null,
+    "top_k": null,
+    "gumbel": false,
+    "seed": null,
+    "max_tokens": 512,
+    "ignore_eos": false,
+    "stop": [],
+    "repetition_penalty": null,
+    "presence_penalty": null,
+    "frequency_penalty": null,
+    "min_p": null,
+    "logit_bias": {},
+    "thinking_budget": null,
+    "thinking_budget_message": null,
+    "prompt_budget": null,
+    "prompt_budget_mode": "refuse"
+  },
+  "speculative": {
+    "method": "none",
+    "k": null,
+    "drafter": null
+  },
+  "executor": {
+    "arena": false,
+    "arena_layout": "packed",
+    "packed": false,
+    "replay": false,
+    "replay_barriers": "skip-replayed",
+    "replay_barrier_scope": "run-start",
+    "pass_plans": true
+  },
+  "memory": {
+    "memory_fraction": 0.65,
+    "kv_capacity": 8704,
+    "kv_bucket": 4096,
+    "kv_grow_fraction": null,
+    "free_budget_mb": null,
+    "kv_reserve_tokens": null,
+    "slots": "auto"
+  }
+}

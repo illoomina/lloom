@@ -160,7 +160,9 @@ fn an_uncovered_head_dim_reaches_every_surface() {
     let field = loaded_warnings(&stderr);
     eprintln!("head_dim 48: load_warnings={field}");
     assert!(
-        field.starts_with("attention_route: lfm2: attention head_dim 48 at F16 under Sdpa: "),
+        // `chat`'s default attention is FlashDecoding (the front-end's model
+        // axes); the uncovered head dim falls back to the composed attention.
+        field.starts_with("attention_route: lfm2: attention head_dim 48 at F16 under FlashDecoding: "),
         "{field}"
     );
     assert!(field.contains("(the composed attention"), "{field}");
@@ -234,7 +236,18 @@ fn qwen4exp_readback_that_reads_its_id_back_warns() {
         field.contains("each decode forward reads its fed id back"),
         "{field}"
     );
-    assert_eq!(loaded_warnings(&chat(&model, &base)), "none");
+    // `auto` through `chat` is the front-end's ring for every family on
+    // Metal (the `decode.readback.*` rows), which on this tiny reads its
+    // fed id back too: the same warning, from the resolved arm, beside the
+    // EOS-gate one (its kernels carry no gated variant). The library's own
+    // `auto` (no front-end) stays blocking and silent.
+    let auto = loaded_warnings(&chat(&model, &base));
+    assert!(
+        auto.contains("readback: ring-gpubatch-nonblocking lookahead=1 ")
+            && auto.contains("each decode forward reads its fed id back")
+            && auto.contains("eos_gate is off on qwen4exp"),
+        "{auto}"
+    );
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -276,7 +289,7 @@ fn an_admitted_emulated_type_reaches_the_engine() {
         let options = resolve_options_uninstalled(&common, &lloom_engine::app::no_front).unwrap();
         let mut shape = Shape::of(
             &options,
-            true,
+            lloom_engine::frontend::Frontend::Chat,
             "The loom threads warp and weft into cloth. ".to_string(),
         );
         shape.batch = 1;

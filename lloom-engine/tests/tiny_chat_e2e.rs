@@ -655,10 +655,15 @@ struct Server {
 
 impl Server {
     fn start(model: &Path, extra: &[&str]) -> Self {
+        Self::start_with_env(model, extra, &[])
+    }
+
+    fn start_with_env(model: &Path, extra: &[&str], env: &[(&str, &str)]) -> Self {
         let mut child = Command::new(env!("CARGO_BIN_EXE_lloom"))
             .args(["serve", "--model"])
             .arg(model)
             .args(extra)
+            .envs(env.iter().copied())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
             .spawn()
@@ -2423,6 +2428,49 @@ fn serve_returns_text_unless_ids_or_logprobs_are_asked() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// Public capability and request reasons come from one refusal table, not
+/// from the different stack traces captured at the health/request call sites.
+/// Set diagnostics on the child only: no process-global environment mutation.
+#[test]
+fn logprobs_health_and_request_reasons_are_stable_with_backtraces() {
+    let (dir, model, base) = qwen_tiny("logprobs-backtrace");
+    let mut batched: Vec<&str> = base.iter().map(String::as_str).collect();
+    batched.extend(["--batch", "2"]);
+    let server = Server::start_with_env(&model, &batched, &[("RUST_BACKTRACE", "1")]);
+    let (status, health) = server.call("GET", "/health", &json!({}));
+    assert_eq!(status, 200, "{health}");
+    assert_eq!(health["logprobs"]["served"], false, "{health}");
+    let why = health["logprobs"]["refused"].as_str().unwrap();
+    assert!(why.contains("the batch scheduler"), "{why}");
+    assert!(
+        !why.contains('\n'),
+        "a public reason is not a stack trace: {why}"
+    );
+    for (route, request) in [
+        (
+            "/v1/chat/completions",
+            json!({"messages": [{"role": "user", "content": PROMPT}], "max_tokens": 2, "logprobs": true}),
+        ),
+        (
+            "/v1/completions",
+            json!({"prompt": PROMPT, "max_tokens": 2, "logprobs": 0}),
+        ),
+    ] {
+        let (status, error) = server.call("POST", route, &request);
+        assert_eq!(status, 400, "{route}: {error}");
+        assert_eq!(
+            error["error"]["message"].as_str().unwrap(),
+            format!("logprobs: {why}"),
+            "{route}: the whole public reason must match health"
+        );
+    }
+    let (status, again) = server.call("GET", "/health", &json!({}));
+    assert_eq!(status, 200, "{again}");
+    assert_eq!(again["logprobs"]["refused"], why, "{again}");
+    drop(server);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// A stop string never reaches a streaming client: the streamed deltas,
 /// joined, are the unstreamed reply cut before the stop, and carry no part
 /// of it (`TextStream::publish` holds what may begin one).
@@ -2873,12 +2921,13 @@ fn lcp(a: &[Value], b: &[Value]) -> usize {
 /// first turn's reply is reasoning only (letters, biased) and `max_tokens`
 /// or a stop string ends it before any end marker; the client sends it back
 /// as the content it got.
-/// - `text` (the default): the reply goes to the template as the text it is,
-///   after the empty reasoning block the template writes, so the next prompt
-///   leaves the log at the previous prompt's end and the turn restores the
+/// - `text`: the reply goes to the template as the text it is, after the
+///   empty reasoning block the template writes, so the next prompt leaves
+///   the log at the previous prompt's end and the turn restores the
 ///   checkpoint standing there.
-/// - `reasoning`: the reply goes to the template as the open reasoning it
-///   is; the template closes the block after it and the log extends.
+/// - `reasoning` (the default, decision 46(a)): the reply goes to the
+///   template as the open reasoning it is; the template closes the block
+///   after it and the log extends.
 /// - `recover`: rendered as `text`, the checkpoint before the divergence an
 ///   open reply's re-render makes (on the tiny tokenizer, the same place).
 #[test]
@@ -2886,10 +2935,7 @@ fn a_reply_cut_inside_its_reasoning_continues_by_the_arm() {
     for arm in ["text", "reasoning", "recover"] {
         let (dir, model, base) = qwen_tiny(&format!("open-reasoning-{arm}"));
         let mut args: Vec<&str> = base.iter().map(String::as_str).collect();
-        args.extend(["--prefix-reuse", "true"]);
-        if arm != "text" {
-            args.extend(["--incomplete-reasoning", arm]);
-        }
+        args.extend(["--prefix-reuse", "true", "--incomplete-reasoning", arm]);
         let server = Server::start(&model, &args);
         let turn = |messages: Value, extra: Value| {
             let mut r = json!({ "messages": messages, "temperature": 0, "enable_thinking": true,
@@ -2971,6 +3017,293 @@ fn a_reply_cut_inside_its_reasoning_continues_by_the_arm() {
         }
         drop(server);
         std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+/// A reply cut inside its reasoning, through `lloom serve` on the tiny
+/// Qwen4-exp with thinking on (its template keeps a past reply's
+/// reasoning), streamed and not, then given back with its reasoning apart.
+/// - What the client gets: the reasoning as `content`, with no marker (the
+///   prompt opened the block); streamed, the deltas are `content` only and
+///   join to the unstreamed reply, the last event carries no delta and the
+///   finish reason, and `usage` counts every id the run generated — past a
+///   stop string too, where the frontier's `accepted` is fewer.
+/// - Given back as `reasoning_content` with the content empty, the reply is
+///   ours (`history_matched`), its ids are the prompt's, and the next turn
+///   extends (a length stop) or goes back to where the delivered ids end (a
+///   stop string).
+#[test]
+fn a_reply_cut_inside_its_reasoning_sent_back_apart_is_ours() {
+    let (dir, model, base) = qwen_tiny("open-apart");
+    let mut args: Vec<&str> = base.iter().map(String::as_str).collect();
+    args.extend(["--prefix-reuse", "true"]);
+    let server = Server::start(&model, &args);
+    let request = |messages: Value, extra: &Value| {
+        let mut r = json!({ "messages": messages, "temperature": 0, "enable_thinking": true,
+                            "return_token_ids": true, "ignore_eos": true,
+                            "logit_bias": { "97": 100, "98": 100, "99": 100 } });
+        for (k, v) in extra.as_object().unwrap() {
+            r[k] = v.clone();
+        }
+        r
+    };
+    let turn = |messages: Value, extra: Value| {
+        let (status, body) =
+            server.call("POST", "/v1/chat/completions", &request(messages, &extra));
+        assert_eq!(status, 200, "{body}");
+        body
+    };
+    let q = json!([{ "role": "user", "content": "Probe." }]);
+    let probe = turn(q.clone(), json!({ "max_tokens": 12 }));
+    let text = probe["choices"][0]["message"]["content"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let stop = (2..=4)
+        .flat_map(|w| (3..text.len().saturating_sub(w)).map(move |i| (i, w)))
+        .map(|(i, w)| (i, text[i..i + w].to_string()))
+        .find(|(i, s)| text.find(s.as_str()) == Some(*i))
+        .map(|(_, s)| s)
+        .unwrap_or_else(|| panic!("no stop past the third letter: {text:?}"));
+    for (cause, extra, finish) in [
+        ("length", json!({ "max_tokens": 6 }), "length"),
+        ("stop", json!({ "max_tokens": 12, "stop": stop }), "stop"),
+    ] {
+        // Streamed first, then the same request unstreamed: greedy, the same
+        // reply, and the session's log is the second's.
+        let mut streamed = request(q.clone(), &extra);
+        streamed["stream"] = json!(true);
+        let events = sse(&server, &streamed);
+        let one = turn(q.clone(), extra.clone());
+        let delivered = one["choices"][0]["message"]["content"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let r1 = one["choices"][0]["token_ids"].as_array().unwrap().clone();
+        let p1 = one["prompt_token_ids"].as_array().unwrap().clone();
+        assert!(
+            !delivered.is_empty()
+                && !delivered.contains("<think>")
+                && !delivered.contains("</think>"),
+            "{cause}: the reasoning as content, no marker: {delivered:?}"
+        );
+        assert_eq!(one["choices"][0]["finish_reason"], finish, "{cause}: {one}");
+        let deltas: Vec<&Value> = events
+            .iter()
+            .map(|e| &e["choices"][0]["delta"])
+            .filter(|d| d.get("content").is_some())
+            .collect();
+        let joined: String = deltas
+            .iter()
+            .map(|d| d["content"].as_str().unwrap())
+            .collect();
+        assert_eq!(joined, delivered, "{cause}: the deltas join to the reply");
+        assert!(
+            deltas
+                .iter()
+                .all(|d| d.as_object().unwrap().keys().all(|k| k == "content")),
+            "{cause}: content deltas only: {events:?}"
+        );
+        let last = events.last().unwrap();
+        assert_eq!(last["choices"][0]["delta"], json!({}), "{cause}: {last}");
+        assert_eq!(
+            last["choices"][0]["finish_reason"], finish,
+            "{cause}: {last}"
+        );
+        let frontier = &one["timings"]["frontier"];
+        let usage = &one["usage"];
+        eprintln!(
+            "OPEN-SENT-APART {cause}: delivered {delivered:?} generated {} usage {usage} \
+             stream usage {} frontier {frontier}",
+            r1.len(),
+            last["usage"]
+        );
+        assert_eq!(
+            usage["completion_tokens"],
+            json!(r1.len()),
+            "{cause}: {one}"
+        );
+        assert_eq!(last["usage"], *usage, "{cause}: streamed and not");
+
+        let two = turn(
+            json!([q[0], { "role": "assistant", "content": "", "reasoning_content": delivered },
+                   { "role": "user", "content": "Again." }]),
+            json!({ "max_tokens": 4 }),
+        );
+        let p2 = two["prompt_token_ids"].as_array().unwrap().clone();
+        let log: Vec<Value> = p1.iter().chain(&r1).cloned().collect();
+        let kept = lcp(&p2, &log);
+        let t = &two["timings"]["turn"];
+        eprintln!(
+            "OPEN-SENT-APART {cause}: next turn matched {} kept {kept} of log {} (p1 {}) turn {t}",
+            two["timings"]["history_matched"],
+            log.len(),
+            p1.len()
+        );
+        assert_eq!(
+            two["timings"]["history_matched"], 1,
+            "{cause}: sent back apart, the reply is ours: {two}"
+        );
+        match cause {
+            "length" => {
+                assert_eq!(kept, log.len(), "{cause}: the log extends");
+                assert_eq!(t["outcome"], "extend", "{cause}: {t}");
+            }
+            _ => {
+                let accepted = frontier["accepted"].as_u64().unwrap() as usize;
+                assert!(accepted < r1.len(), "{cause}: {frontier}");
+                assert_eq!(kept, p1.len() + accepted, "{cause}: to the delivered ids");
+                assert!(
+                    matches!(t["outcome"].as_str(), Some("rewind" | "restore")),
+                    "{cause}: {t}"
+                );
+            }
+        }
+    }
+    drop(server);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Past reasoning is kept by default and stripped on request, through `lloom
+/// serve` on the three tiny families (the maintainer's direction of
+/// 2026-10-15): `/health`'s `session` says what the process resolved; a
+/// second turn that gives the first reply back as the client got it is the
+/// template's own rendering of that history under the resolved
+/// persistence; and it extends the session's log when the history is kept,
+/// and goes back to the turn checkpoint when it is stripped
+/// (`--strip-thinking`). Thinking on,
+/// the reply is reasoning cut by `max_tokens` (the end marker biased out),
+/// which the default gives back as the open reasoning it is (decision
+/// 46(a)); a closed reply in each template's own format is the unit audit's
+/// (`front_tests.rs`). Thinking off is the template's switch (Qwen) or the
+/// engine closing the block (LFM2, whose template never writes an empty
+/// block back, so its next turn goes back two ids under every option).
+#[test]
+fn serve_keeps_past_reasoning_by_default_and_strips_it_on_request() {
+    let l_dir = scratch("persist-lfm2");
+    let q_dir = scratch("persist-qwen3_5");
+    let (x_dir, x_model, x_args) = qwen_tiny("persist-qwen4exp");
+    let q_tok = q_dir.join("tokenizer.json").to_str().unwrap().to_string();
+    let families: Vec<(&str, PathBuf, Vec<String>, TinyTokenizer)> = vec![
+        (
+            "lfm2",
+            write::<Lfm2Tiny>(&l_dir),
+            vec!["--cpu".into()],
+            Lfm2Tiny::tokenizer(),
+        ),
+        (
+            "qwen3_5",
+            write::<Qwen3_5Tiny>(&q_dir),
+            vec!["--tokenizer".into(), q_tok, "--cpu".into()],
+            Qwen3_5Tiny::tokenizer(),
+        ),
+        ("qwen4exp", x_model, x_args, Qwen4ExpTiny::tokenizer()),
+    ];
+    for (name, model, base, tok) in &families {
+        let end = added_id(tok, "</think>");
+        for (option, flag) in [
+            ("unset", None),
+            ("persist", Some("--persist-thinking")),
+            ("strip", Some("--strip-thinking")),
+        ] {
+            let mut args: Vec<&str> = base.iter().map(String::as_str).collect();
+            args.extend(["--prefix-reuse", "true"]);
+            args.extend(flag);
+            let server = Server::start(model, &args);
+            let (_, health) = server.call("GET", "/health", &json!({}));
+            let kept = option != "strip";
+            assert_eq!(
+                health["session"]["persist_thinking"],
+                json!(kept),
+                "{name} {option}: {}",
+                health["session"]
+            );
+            assert_eq!(health["session"]["incomplete_reasoning"], "reasoning");
+            for think in [true, false] {
+                let at = format!("{name} {option} think={think}");
+                let turn = |messages: Value| {
+                    let r = json!({ "messages": messages, "temperature": 0, "max_tokens": 10,
+                                        "enable_thinking": think, "return_token_ids": true,
+                                        "ignore_eos": true,
+                                        "logit_bias": { "97": 100, "98": 100, "99": 100,
+                                                        end.to_string(): -100 } });
+                    let (status, body) = server.call("POST", "/v1/chat/completions", &r);
+                    assert_eq!(status, 200, "{at}: {body}");
+                    body
+                };
+                let q = json!([{ "role": "user", "content": format!("Probe {option} {think}.") }]);
+                let one = turn(q.clone());
+                let delivered = one["choices"][0]["message"]["content"]
+                    .as_str()
+                    .unwrap()
+                    .to_string();
+                assert!(!delivered.contains("</think>"), "{at}: {delivered:?}");
+                let p1 = one["prompt_token_ids"].as_array().unwrap().clone();
+                let r1 = one["choices"][0]["token_ids"].as_array().unwrap().clone();
+                let two = turn(json!([q[0], { "role": "assistant", "content": delivered },
+                                      { "role": "user", "content": "Again." }]));
+                let p2 = two["prompt_token_ids"].as_array().unwrap().clone();
+                let log: Vec<Value> = p1.iter().chain(&r1).cloned().collect();
+                let left = lcp(&p2, &log);
+                let t = &two["timings"]["turn"];
+                eprintln!(
+                    "PERSIST-SERVE {at}: p1 {} r1 {} next prompt leaves the log at {:+} turn {t}",
+                    p1.len(),
+                    r1.len(),
+                    left as i64 - p1.len() as i64
+                );
+                assert_eq!(two["timings"]["history_matched"], 1, "{at}: {two}");
+                let engine_closed = *name == "lfm2" && !think;
+                // The rendered history: the template's own rendering of the
+                // conversation with the reply as the front end gives it (an
+                // open reply as its reasoning, decision 46(a)), under the
+                // persistence the server resolved, encoded; on LFM2 with
+                // thinking off, the end marker the engine closes the block
+                // with.
+                let template =
+                    lloom_engine::app::template::Template::compile(tok.chat_template).unwrap();
+                let mut kw = serde_json::Map::new();
+                if *name != "lfm2" {
+                    kw.insert("enable_thinking".into(), json!(think));
+                }
+                kw.insert("preserve_thinking".into(), json!(kept));
+                let reply = if think {
+                    json!({ "role": "assistant", "content": "", "reasoning_content": delivered })
+                } else {
+                    json!({ "role": "assistant", "content": delivered })
+                };
+                let history = json!([q[0], reply, { "role": "user", "content": "Again." }]);
+                let bos = if *name == "lfm2" {
+                    "<|startoftext|>"
+                } else {
+                    ""
+                };
+                let mut rendered = encode(tok, &template.render(&history, bos, &kw).unwrap());
+                if engine_closed {
+                    rendered.push(end);
+                }
+                assert_eq!(
+                    p2,
+                    json!(rendered).as_array().unwrap().clone(),
+                    "{at}: the rendered history"
+                );
+                if engine_closed {
+                    assert_eq!(left, p1.len() - 2, "{at}: the engine's empty block");
+                } else if kept {
+                    assert_eq!(left, log.len(), "{at}: the history keeps the reply");
+                    assert_eq!(t["outcome"], "extend", "{at}: {t}");
+                } else {
+                    assert!(left < p1.len(), "{at}: stripped, before the prompt's end");
+                    assert!(
+                        matches!(t["outcome"].as_str(), Some("restore" | "rewind")),
+                        "{at}: {t}"
+                    );
+                }
+            }
+        }
+    }
+    for d in [l_dir, q_dir, x_dir] {
+        std::fs::remove_dir_all(&d).ok();
     }
 }
 

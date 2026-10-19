@@ -457,7 +457,18 @@ impl Index {
     /// spelling, a group recurses. Two spellings of one field in one document
     /// are refused.
     pub fn merge(&self, o: &mut EngineOptions, json: &Value) -> Result<(), String> {
-        self.merge_at(o, "", json, None, &mut BTreeSet::new())
+        self.merge_written(o, json).map(|_| ())
+    }
+
+    /// [`Self::merge`], returning the storage paths the document wrote.
+    pub fn merge_written(
+        &self,
+        o: &mut EngineOptions,
+        json: &Value,
+    ) -> Result<BTreeSet<String>, String> {
+        let mut written = BTreeSet::new();
+        self.merge_at(o, "", json, None, &mut written)?;
+        Ok(written)
     }
 
     /// `--<group>-config '{json}'`: the object is the group's; a member the
@@ -470,6 +481,18 @@ impl Index {
         json: &Value,
         fallback: Option<&str>,
     ) -> Result<(), String> {
+        self.merge_group_written(o, group, json, fallback)
+            .map(|_| ())
+    }
+
+    /// [`Self::merge_group`], returning the storage paths the object wrote.
+    pub fn merge_group_written(
+        &self,
+        o: &mut EngineOptions,
+        group: &str,
+        json: &Value,
+        fallback: Option<&str>,
+    ) -> Result<BTreeSet<String>, String> {
         let Some(map) = json.as_object() else {
             return Err("expected a JSON object".into());
         };
@@ -483,7 +506,7 @@ impl Index {
                 other => other?,
             }
         }
-        Ok(())
+        Ok(written)
     }
 
     fn merge_at(

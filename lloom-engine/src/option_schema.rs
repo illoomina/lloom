@@ -2,7 +2,8 @@
 //! declarations as the flags and the keys (`lloom options --schema`): each
 //! key's type, its default, its description, and the `x-lloom-*`
 //! annotations — status, flag, env, legacy spellings, facets, flows,
-//! couplings — with the static couplings as `if/then` rules.
+//! couplings, the compiled capability it needs, each front-end's own
+//! default — with the static couplings as `if/then` rules.
 
 use crate::option_tree::{index, Key};
 use crate::options::EngineOptions;
@@ -294,6 +295,39 @@ fn annotate(key: &Key, default: &Value, s: &mut Map<String, Value>) {
             .map(|(k, st)| (st.to_string(), json!(k)))
             .collect();
         s.insert("x-lloom-value-aliases".into(), Value::Object(aliases));
+    }
+    if !m.needs.is_empty() {
+        let mut needs = Map::new();
+        needs.insert("capability".into(), json!(m.needs));
+        if !m.needs_part.is_empty() {
+            needs.insert("part".into(), json!(m.needs_part));
+        }
+        s.insert("x-lloom-needs".into(), Value::Object(needs));
+    }
+    let frontends: Vec<Value> = crate::frontend::rows_of(&key.path)
+        .map(|r| {
+            let typed = |v: &str| {
+                let mut o = EngineOptions::default();
+                index().set(&mut o, &key.path, v).expect("a row is a value of its key");
+                index().flat(&o).remove(&key.path).unwrap_or(Value::Null)
+            };
+            let mut e = Map::new();
+            e.insert("frontend".into(), json!(r.frontend.name()));
+            e.insert("value".into(), typed(crate::frontend::value(r)));
+            if r.when != crate::frontend::When::Always {
+                e.insert("when".into(), json!(r.when.describe()));
+            }
+            if let Some(x) = crate::frontend::exception(r) {
+                e.insert(
+                    "change".into(),
+                    json!({"decision": x.decision, "before": typed(x.before), "after": typed(x.after), "landed": x.landed}),
+                );
+            }
+            Value::Object(e)
+        })
+        .collect();
+    if !frontends.is_empty() {
+        s.insert("x-lloom-frontend-defaults".into(), Value::Array(frontends));
     }
     if key.targets.len() > 1 {
         s.insert(

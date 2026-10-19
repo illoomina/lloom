@@ -1339,7 +1339,9 @@ pub struct InstrumentTuning {
         bool,
         path = "diagnostics.gpu_profile.enabled",
         status = "instrument",
-        cli = "gpu-profile"
+        cli = "gpu-profile",
+        needs = "profile",
+        needs_part = "the step-0 dispatch census"
     )]
     pub profile: bool,
     /// Under `profile`: time every compute encoder with stage-boundary counter samples.
@@ -1408,7 +1410,9 @@ pub struct InstrumentTuning {
         flag = "profile-dump",
         env = "CANDLE_METAL_PROFILE_DUMP",
         path = "diagnostics.gpu_profile.dump",
-        status = "instrument"
+        status = "instrument",
+        needs = "profile",
+        needs_part = "the steps table's host step time column"
     )]
     pub profile_dump: Option<String>,
 }

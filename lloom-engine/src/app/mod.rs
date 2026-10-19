@@ -456,9 +456,36 @@ pub fn resolve_layers(
     }
     mark("flags", &o);
     if let Some(f) = frontend {
-        let named: std::collections::BTreeSet<String> = named
-            .iter()
-            .filter_map(|storage| idx.key_of_storage(storage).map(|k| k.path.clone()))
+        // A named key keeps its value — and so does the rest of its compound
+        // group: `--readback ring-fixed` writes `decode.readback`'s members
+        // (kind, eos, lookahead, adaptive_commit) as one spelling, and the
+        // front-end's `decode.readback.eos` row must not re-set the EOS of a
+        // readback the caller named (it did on 2026-10-19: `ring-fixed`
+        // ran as `ring-gpubatch-nonblocking`, `ring` lost its clamp warning).
+        let under = |storage: &str, group: &str| {
+            storage.len() > group.len()
+                && storage.starts_with(group)
+                && storage.as_bytes()[group.len()] == b'.'
+        };
+        // The compound groups (a key with `compound = Some(storage)` is the
+        // group's own shorthand) a layer named — the group itself (a given
+        // `--readback` records the group's storage, which no leaf key owns,
+        // so it used to drop out of `named` here) or any member of it.
+        let groups: Vec<String> = idx
+            .keys
+            .values()
+            .filter_map(|k| k.compound.clone())
+            .filter(|g| named.contains(g) || named.iter().any(|s| under(s, g)))
+            .collect();
+        let named: std::collections::BTreeSet<String> = idx
+            .keys
+            .values()
+            .filter(|k| {
+                k.targets.iter().chain(&k.legacy).any(|l| {
+                    named.contains(&l.storage) || groups.iter().any(|g| under(&l.storage, g))
+                })
+            })
+            .map(|k| k.path.clone())
             .collect();
         crate::frontend::apply(&mut o, f, &named).map_err(|e| anyhow::anyhow!("{e}"))?;
         mark(&format!("the {} default", f.name()), &o);

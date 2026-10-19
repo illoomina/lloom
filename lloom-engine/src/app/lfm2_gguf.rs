@@ -57,7 +57,7 @@ impl Header {
             }
             None => None,
         };
-        let kv_heads = match get("lfm2.attention.head_count_kv")
+        let mut kv_heads = match get("lfm2.attention.head_count_kv")
             .context("the GGUF has no lfm2.attention.head_count_kv")?
         {
             lloom_tensor::quantized::gguf_file::Value::Array(values) => {
@@ -65,6 +65,9 @@ impl Header {
             }
             single => vec![integer(single)?],
         };
+        if kv_heads.len() == 1 {
+            kv_heads.resize(usize::try_from(number("lfm2.block_count")?)?, kv_heads[0]);
+        }
         let file = std::fs::metadata(path)?.len();
         Ok(Self {
             bos,
@@ -84,12 +87,22 @@ impl Header {
     }
 
     /// What the load holds at its peak: the file's tensor payload, the token
-    /// table's dense copy if it has one, the f32 KV a sequence grows to
-    /// at the checkpoint's context length, and the mmproj's tower dequantized
+    /// table's dense copy if it has one, the requested KV store a sequence grows to
+    /// at the effective runtime context length, and the mmproj's tower dequantized
     /// to `vision_bytes` per element.
-    fn peak(&self, mmproj: Option<&Content>, vision_bytes: u64) -> Peak {
+    fn peak(
+        &self,
+        mmproj: Option<&Content>,
+        vision_bytes: u64,
+        context: usize,
+        kv_dtype: lloom_tensor::DType,
+    ) -> Peak {
         let head_dim = self.width / self.heads.max(1);
-        let kv_per_token: u64 = self.kv_heads.iter().map(|&kv| 2 * kv * head_dim * 4).sum();
+        let kv_per_token: u64 = self
+            .kv_heads
+            .iter()
+            .map(|&kv| 2 * kv * head_dim * kv_dtype.size_in_bytes() as u64)
+            .sum();
         let vision: u64 = mmproj.map_or(0, |content| {
             content
                 .tensor_infos
@@ -100,7 +113,10 @@ impl Header {
         Peak::new()
             .with("weights (GGUF payload)", self.payload)
             .with("token table, dense copy", self.dense_table)
-            .with("KV at context_length, f32", self.context * kv_per_token)
+            .with(
+                format!("KV at context.max_tokens={context}, {}", kv_dtype.as_str()),
+                context as u64 * kv_per_token,
+            )
             .with("vision tower (mmproj, dequantized)", vision)
     }
 }
@@ -152,14 +168,24 @@ pub fn load(first: PathBuf, model: &LoadConfig, shape: &Shape) -> Result<Box<dyn
         None => None,
     };
     let vision_bytes = if device.is_cpu() { 4 } else { 2 };
+    let context = shape.memory.kv_capacity;
+    anyhow::ensure!(context > 0 && context as u64 <= header.context, "lfm2-gguf context.max_tokens={context} must be in 1..={} (checkpoint context); set --ctx-size within that range", header.context);
+    let kv_dtype = if shape.model.axes.get("kv-quant").is_some_and(|v| v == "f16") {
+        lloom_tensor::DType::F16
+    } else {
+        lloom_tensor::DType::F32
+    };
     let machine = lloom::nn::memory::MachineLoad {
         gate: shape.memory.machine_gate(),
         label: machine_label("lfm2", &first),
         rows: 1,
-        kv_tokens: header.context as usize,
+        kv_tokens: context,
         prefill_tile: shape.decode.prefill.tile,
     }
-    .admit(&device, header.peak(mmproj.as_ref(), vision_bytes))?;
+    .admit(
+        &device,
+        header.peak(mmproj.as_ref(), vision_bytes, context, kv_dtype),
+    )?;
     drop(mmproj);
     let model_name = model.model_name.clone().unwrap_or_else(|| {
         first
@@ -187,7 +213,7 @@ pub fn load(first: PathBuf, model: &LoadConfig, shape: &Shape) -> Result<Box<dyn
                 .display()
                 .to_string())
     );
-    let engine = served::load_lfm2_gguf_unadmitted(
+    let engine = served::load_lfm2_gguf_unadmitted_with_runtime(
         &first,
         mmproj_path,
         source,
@@ -199,6 +225,7 @@ pub fn load(first: PathBuf, model: &LoadConfig, shape: &Shape) -> Result<Box<dyn
         config,
         shape.decision_ragged,
         vision_missing,
+        Some(served::GgufRuntime { context, kv_dtype }),
     )?;
     Ok(Box::new(engine))
 }
@@ -216,6 +243,35 @@ fn media(mmproj: Option<&Path>, text_only: bool) -> (Option<&Path>, Option<&'sta
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn peak_uses_effective_context_and_selected_store_precision() {
+        let header = Header {
+            bos: None,
+            eos: 0,
+            chat_template: None,
+            width: 2048,
+            context: 65536,
+            kv_heads: vec![0, 8, 0, 8],
+            heads: 32,
+            payload: 2_870_000_000,
+            dense_table: 0,
+        };
+        let f32 = header.peak(None, 4, 4096, lloom_tensor::DType::F32);
+        let f16 = header.peak(None, 4, 4096, lloom_tensor::DType::F16);
+        assert_eq!(
+            f32.rows()[1],
+            (
+                "KV at context.max_tokens=4096, f32".into(),
+                4096 * 2 * 16 * 64 * 4
+            )
+        );
+        assert_eq!(f32.rows()[1].1, 2 * f16.rows()[1].1);
+        assert_eq!(
+            header.peak(None, 4, 8192, lloom_tensor::DType::F32).rows()[1].1,
+            2 * f32.rows()[1].1
+        );
+    }
 
     /// `--text-only` loads no tower even when an mmproj is named, and each
     /// missing tower is refused for its own reason.

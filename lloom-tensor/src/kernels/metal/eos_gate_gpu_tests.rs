@@ -7,8 +7,8 @@ use crate::kernels::kernels::unary::copy2d;
 use crate::kernels::metal::completion::CompletionWait;
 use crate::kernels::metal::{Commands, ResidencySet};
 use crate::kernels::{
-    call_affine, call_copy2d, call_gdn_prologue, call_gdn_step, call_shortconv_step,
-    BufferOffset, Device, Kernels,
+    call_affine, call_copy2d, call_gdn_prologue, call_gdn_step, call_shortconv_step, BufferOffset,
+    Device, Kernels,
 };
 use objc2_metal::MTLResourceOptions;
 use std::sync::Arc;
@@ -507,7 +507,9 @@ fn a_gated_gdn_step_carries_its_state_through_an_eos() {
             .unwrap()
     };
     let wave = |n: usize, a: f32, b: f32| -> Vec<f32> {
-        (0..n).map(|i| a * ((i as f32) * b).sin() + 0.01 * i as f32).collect()
+        (0..n)
+            .map(|i| a * ((i as f32) * b).sin() + 0.01 * i as f32)
+            .collect()
     };
     let qkv = f(&wave(CH, 0.5, 0.37));
     let conv_w = f(&wave(CH * KK, 0.25, 0.11));
@@ -556,7 +558,10 @@ fn a_gated_gdn_step_carries_its_state_through_an_eos() {
             .unwrap();
         }
         rig.cmds.flush_and_wait_current().unwrap();
-        (bits(&read_f32(&win_out, CH * KK)), bits(&read_f32(&heads, 3 * H_V * D)))
+        (
+            bits(&read_f32(&win_out, CH * KK)),
+            bits(&read_f32(&heads, 3 * H_V * D)),
+        )
     };
     let step = |gate_token: Option<u32>, register: bool| -> (Vec<u32>, Vec<u32>) {
         let (s_out, o) = (poisoned(D * D * H_V), poisoned(H_V * D));
@@ -587,7 +592,10 @@ fn a_gated_gdn_step_carries_its_state_through_an_eos() {
             .unwrap();
         }
         rig.cmds.flush_and_wait_current().unwrap();
-        (bits(&read_f32(&s_out, D * D * H_V)), bits(&read_f32(&o, H_V * D)))
+        (
+            bits(&read_f32(&s_out, D * D * H_V)),
+            bits(&read_f32(&o, H_V * D)),
+        )
     };
     let all_poison = |v: &[u32]| v.iter().all(|&x| x == u32::MAX);
 
@@ -604,7 +612,11 @@ fn a_gated_gdn_step_carries_its_state_through_an_eos() {
             "{what}: the plain kernel writes its state and output"
         );
     }
-    assert_ne!(plain_pro.0, bits(&win), "the plain prologue moves the window");
+    assert_ne!(
+        plain_pro.0,
+        bits(&win),
+        "the plain prologue moves the window"
+    );
     assert_ne!(plain_loop.0, bits(&s), "the plain step moves S");
 
     rig.begin();
@@ -619,12 +631,33 @@ fn a_gated_gdn_step_carries_its_state_through_an_eos() {
     assert_eq!(clear.0, plain_pro, "gate clear: the plain prologue");
     assert_eq!(clear.1, plain_loop, "gate clear: the plain loop step");
     assert_eq!(clear.2, plain_reg, "gate clear: the plain register step");
-    assert_eq!(fired.0 .0, bits(&win), "gate raised: the window carries through");
-    assert_eq!(fired.1 .0, bits(&s), "gate raised: the loop step carries S through");
-    assert_eq!(fired.2 .0, bits(&s), "gate raised: the register step carries S through");
-    assert!(all_poison(&fired.0 .1), "gate raised: the heads are not written");
-    assert!(all_poison(&fired.1 .1), "gate raised: the loop step's output is not written");
-    assert!(all_poison(&fired.2 .1), "gate raised: the register step's output is not written");
+    assert_eq!(
+        fired.0 .0,
+        bits(&win),
+        "gate raised: the window carries through"
+    );
+    assert_eq!(
+        fired.1 .0,
+        bits(&s),
+        "gate raised: the loop step carries S through"
+    );
+    assert_eq!(
+        fired.2 .0,
+        bits(&s),
+        "gate raised: the register step carries S through"
+    );
+    assert!(
+        all_poison(&fired.0 .1),
+        "gate raised: the heads are not written"
+    );
+    assert!(
+        all_poison(&fired.1 .1),
+        "gate raised: the loop step's output is not written"
+    );
+    assert!(
+        all_poison(&fired.2 .1),
+        "gate raised: the register step's output is not written"
+    );
 }
 
 /// The ring's stamp (`call_ring_stamp`) writes the generation at the step's

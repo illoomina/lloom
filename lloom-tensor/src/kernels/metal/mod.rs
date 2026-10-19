@@ -88,9 +88,9 @@ mod flash_decoding_tests;
 /// `run_telemetry`'s shape, for its reasons.
 pub mod hazard_audit;
 #[cfg(test)]
-mod hazard_audit_tests;
-#[cfg(test)]
 mod hazard_audit_gpu_tests;
+#[cfg(test)]
+mod hazard_audit_tests;
 pub mod heap;
 pub mod icb;
 #[cfg(test)]

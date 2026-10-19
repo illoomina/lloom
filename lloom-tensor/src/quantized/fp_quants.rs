@@ -90,7 +90,16 @@ pub fn f32_to_e4m3(x: f32) -> u8 {
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    zerocopy::IntoBytes,
+    zerocopy::Immutable,
+    zerocopy::FromBytes,
+    zerocopy::KnownLayout,
+)]
 pub struct BlockMxfp4 {
     /// The E8M0 scale.
     pub e: u8,
@@ -173,7 +182,16 @@ impl GgmlType for BlockMxfp4 {
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    zerocopy::IntoBytes,
+    zerocopy::Immutable,
+    zerocopy::FromBytes,
+    zerocopy::KnownLayout,
+)]
 pub struct BlockFp8E4M3 {
     /// The block's scale.
     pub d: bf16,

@@ -59,7 +59,10 @@ fn main() {
         // (`lib/rustlib/` in a rust-src-less toolchain): installing the
         // component creates `src/` under it and reruns the script once.
         for (path, _, _) in SOURCE_CHECKS {
-            println!("cargo:rerun-if-changed={}", watch_point(source.join(path)).display());
+            println!(
+                "cargo:rerun-if-changed={}",
+                watch_point(source.join(path)).display()
+            );
         }
         let target = env::var("TARGET").ok()?;
         let audited = AUDITED_COMPILERS.iter().any(|(commit, audited_target)| {

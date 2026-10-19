@@ -192,7 +192,7 @@ fn judge<F: TinyFamily, P: lloom::profile::Profile>(
     let Some(ckpt) = g.checkpoint::<F>(weights) else {
         return Outcome::Skipped;
     };
-    match quietly(|| ckpt.schema().map(|s| s.elements())) {
+    match quietly(|| ckpt.schema_for::<P>().map(|s| s.elements())) {
         Ok(Ok(n)) if n <= MAX_ELEMENTS => {}
         Ok(Ok(_)) => return Outcome::Skipped,
         Ok(Err(e)) => return Outcome::CpuRefused(e.to_string()),

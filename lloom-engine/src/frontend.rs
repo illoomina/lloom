@@ -61,6 +61,14 @@ pub enum When {
     Always,
     /// At a batch: `scheduler.max_sequences` above 1.
     Batched,
+    /// On Metal: a build with the backend, not `--cpu`. The ring readback,
+    /// its GPU-batched EOS and the Metal backend arms are Metal mechanisms;
+    /// a CPU run keeps the library's blocking readback (and its silence).
+    Metal,
+    /// The model's family takes the `model` axes (LFM2's `Config`; no
+    /// `--model` = the LFM2 snapshot), so a default axis never refuses a
+    /// family at load.
+    ModelAxes,
 }
 
 impl When {
@@ -68,6 +76,20 @@ impl When {
         match self {
             When::Always => true,
             When::Batched => o.scheduler.max_sequences > 1,
+            // LFM2's detection (`app::family::Lfm2Family`, first in order):
+            // a directory holding `config.json`; the GGUF families take none.
+            // The rows are Metal defaults (the paged KV pool is read by a
+            // Metal kernel, FlashDecoding, the fused conv): on `--cpu`, or a
+            // build without Metal, they would refuse every LFM2 load
+            // (`KvAppend::Paged is Metal-only`, 22 engine tests red on
+            // 2026-10-19), so the library's own values stay.
+            When::Metal => cfg!(feature = "metal") && o.load.device != "cpu",
+            When::ModelAxes => {
+                When::Metal.holds(o)
+                    && o.load.model.as_deref().is_none_or(|p| {
+                        p.is_dir() && p.join("config.json").is_file()
+                    })
+            }
         }
     }
 
@@ -75,6 +97,8 @@ impl When {
         match self {
             When::Always => "",
             When::Batched => "scheduler.max_sequences > 1",
+            When::Metal => "on Metal (a Metal build, not --cpu)",
+            When::ModelAxes => "the model's family takes the model axes (LFM2), on Metal",
         }
     }
 }
@@ -89,10 +113,52 @@ pub struct Row {
     pub before: &'static str,
 }
 
-/// Every front-end default, each `before` the value its front-end resolved
-/// before the option tree (the sites read: `decode-driver-design.md`
-/// Stage 7).
-pub const ROWS: &[Row] = &[
+/// The same `key = value` row for chat and for serve (the LFM2 decode
+/// flow both run by default).
+macro_rules! rows {
+    ([$($when:ident: $key:literal = $value:literal),* $(,)?] $($row:expr),* $(,)?) => {
+        pub const ROWS: &[Row] = &[
+            $(
+                Row { key: $key, frontend: Frontend::Chat, when: When::$when, before: $value },
+                Row { key: $key, frontend: Frontend::Serve, when: When::$when, before: $value },
+            )*
+            $($row),*
+        ];
+    };
+}
+
+// Every front-end default, each `before` the value its front-end resolved
+// before the option tree (the sites read: `decode-driver-design.md`
+// Stage 7).
+rows! {
+    // The tuned decode flow as chat's and serve's default; any layer that
+    // names a key keeps its own value. No speculation by default.
+    // Every family on Metal: the Metal backend arms and the non-blocking
+    // ring (GPU-batched EOS, the adaptive commit, the stream reader) —
+    // Qwen4-exp included, by the maintainer's choice (2026-10-19): the ring
+    // reads each fed id back there without a PLE today (the load warning
+    // says so, #829), and the cadence work planned is to make the
+    // non-blocking ring the best arm for every family.
+    [
+        Metal: "backend.metal.command_buffer.api" = "metal4",
+        Metal: "backend.metal.compiler.merged_unit" = "true",
+        Metal: "backend.metal.copy2d_compute" = "true",
+        Metal: "backend.metal.heaps.transient" = "true",
+        Metal: "decode.readback.kind" = "ring",
+        Metal: "decode.readback.eos" = "gpu-batched-nonblocking",
+        Metal: "decode.readback.stream_reader" = "true",
+        // LFM2 (safetensors) only: its `Config` axes and LFM2 kernels.
+        ModelAxes: "kernels.attention.flash.partial_block" = "8",
+        // Shared with Qwen4-exp's HC norm arm, +6.6% ms/token there.
+        ModelAxes: "kernels.fusion.norm_in_gemv" = "true",
+        ModelAxes: "models.lfm2.rows_kernels" = "per-row",
+        ModelAxes: "speculative.dspark.context_kv" = "paged",
+        ModelAxes: "context.kv.layout" = "paged",
+        ModelAxes: "kernels.attention.impl" = "flash",
+        ModelAxes: "kernels.attention.qkv_layout" = "fused",
+        ModelAxes: "kernels.fusion.conv" = "true",
+        ModelAxes: "models.lfm2.conv_prefill_context" = "true",
+    ]
     Row {
         key: "context.prefix.reuse",
         frontend: Frontend::Chat,
@@ -129,7 +195,7 @@ pub const ROWS: &[Row] = &[
         when: When::Batched,
         before: "512",
     },
-];
+}
 
 /// A default changed on purpose: the maintainer's decision by number, the
 /// key and front-end it moves, the value before and after, and whether the

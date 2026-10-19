@@ -61,6 +61,10 @@ pub enum When {
     Always,
     /// At a batch: `scheduler.max_sequences` above 1.
     Batched,
+    /// On Metal: a build with the backend, not `--cpu`. The ring readback,
+    /// its GPU-batched EOS and the Metal backend arms are Metal mechanisms;
+    /// a CPU run keeps the library's blocking readback (and its silence).
+    Metal,
     /// The model's family takes the `model` axes (LFM2's `Config`; no
     /// `--model` = the LFM2 snapshot), so a default axis never refuses a
     /// family at load.
@@ -74,11 +78,18 @@ impl When {
             When::Batched => o.scheduler.max_sequences > 1,
             // LFM2's detection (`app::family::Lfm2Family`, first in order):
             // a directory holding `config.json`; the GGUF families take none.
-            When::ModelAxes => o
-                .load
-                .model
-                .as_deref()
-                .map_or(true, |p| p.is_dir() && p.join("config.json").is_file()),
+            // The rows are Metal defaults (the paged KV pool is read by a
+            // Metal kernel, FlashDecoding, the fused conv): on `--cpu`, or a
+            // build without Metal, they would refuse every LFM2 load
+            // (`KvAppend::Paged is Metal-only`, 22 engine tests red on
+            // 2026-10-19), so the library's own values stay.
+            When::Metal => cfg!(feature = "metal") && o.load.device != "cpu",
+            When::ModelAxes => {
+                When::Metal.holds(o)
+                    && o.load.model.as_deref().is_none_or(|p| {
+                        p.is_dir() && p.join("config.json").is_file()
+                    })
+            }
         }
     }
 
@@ -86,7 +97,8 @@ impl When {
         match self {
             When::Always => "",
             When::Batched => "scheduler.max_sequences > 1",
-            When::ModelAxes => "the model's family takes the model axes (LFM2)",
+            When::Metal => "on Metal (a Metal build, not --cpu)",
+            When::ModelAxes => "the model's family takes the model axes (LFM2), on Metal",
         }
     }
 }
@@ -121,17 +133,20 @@ macro_rules! rows {
 rows! {
     // The tuned decode flow as chat's and serve's default; any layer that
     // names a key keeps its own value. No speculation by default.
-    // Every family: the Metal backend arms and the non-blocking ring
-    // (GPU-batched EOS, the adaptive commit, the stream reader).
+    // Every family on Metal: the Metal backend arms and the non-blocking
+    // ring (GPU-batched EOS, the adaptive commit, the stream reader) —
+    // Qwen4-exp included, by the maintainer's choice (2026-10-19): the ring
+    // reads each fed id back there without a PLE today (the load warning
+    // says so, #829), and the cadence work planned is to make the
+    // non-blocking ring the best arm for every family.
     [
-        Always: "backend.metal.command_buffer.api" = "metal4",
-        Always: "backend.metal.compiler.merged_unit" = "true",
-        Always: "backend.metal.copy2d_compute" = "true",
-        Always: "backend.metal.heaps.transient" = "true",
-        Always: "decode.readback.kind" = "ring",
-        Always: "decode.readback.eos" = "gpu-batched-nonblocking",
-        Always: "decode.readback.stream_reader" = "true",
-        Always: "prefill.tile" = "64",
+        Metal: "backend.metal.command_buffer.api" = "metal4",
+        Metal: "backend.metal.compiler.merged_unit" = "true",
+        Metal: "backend.metal.copy2d_compute" = "true",
+        Metal: "backend.metal.heaps.transient" = "true",
+        Metal: "decode.readback.kind" = "ring",
+        Metal: "decode.readback.eos" = "gpu-batched-nonblocking",
+        Metal: "decode.readback.stream_reader" = "true",
         // LFM2 (safetensors) only: its `Config` axes and LFM2 kernels.
         ModelAxes: "kernels.attention.flash.partial_block" = "8",
         // Shared with Qwen4-exp's HC norm arm, +6.6% ms/token there.

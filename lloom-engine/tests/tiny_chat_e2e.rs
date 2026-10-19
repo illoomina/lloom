@@ -2915,12 +2915,27 @@ fn lcp(a: &[Value], b: &[Value]) -> usize {
     a.iter().zip(b).take_while(|(x, y)| x == y).count()
 }
 
+/// A reply's reasoning as the chat route returns it since decision 51 Q2:
+/// `message.reasoning_content`, absent where the reply had no reasoning.
+fn reasoning_of(message: &Value) -> String {
+    message["reasoning_content"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string()
+}
+
 /// A reply cut inside its reasoning, continued, per
 /// `session.incomplete_reasoning`, on the tiny Qwen4-exp with thinking on
 /// (its template keeps a past reply's reasoning, as Qwen3.8's does). The
 /// first turn's reply is reasoning only (letters, biased) and `max_tokens`
-/// or a stop string ends it before any end marker; the client sends it back
-/// as the content it got.
+/// or a stop string ends it before any end marker.
+///
+/// Since decision 51 Q2 the client gets that unfinished thought in
+/// `message.reasoning_content`, with `content` the answer alone (empty here),
+/// and sends it back in the field it came in — which is the "apart" path, and
+/// is why the arms below now agree wherever the reply is matched: a matched
+/// reply is rendered from the ids the model emitted (Q1), so the arm no longer
+/// decides what the history shows.
 /// - `text`: the reply goes to the template as the text it is, after the
 ///   empty reasoning block the template writes, so the next prompt leaves
 ///   the log at the previous prompt's end and the turn restores the
@@ -2950,10 +2965,9 @@ fn a_reply_cut_inside_its_reasoning_continues_by_the_arm() {
         };
         let q = json!([{ "role": "user", "content": "Probe." }]);
         let probe = turn(q.clone(), json!({ "max_tokens": 12 }));
-        let text = probe["choices"][0]["message"]["content"]
-            .as_str()
-            .unwrap()
-            .to_string();
+        // The unfinished thought is `reasoning_content` since Q2; `content`
+        // is the answer, which a reply cut inside its reasoning has none of.
+        let text = reasoning_of(&probe["choices"][0]["message"]);
         let stop = (2..=4)
             .flat_map(|w| (3..text.len().saturating_sub(w)).map(move |i| (i, w)))
             .map(|(i, w)| (i, text[i..i + w].to_string()))
@@ -2965,18 +2979,25 @@ fn a_reply_cut_inside_its_reasoning_continues_by_the_arm() {
             ("stop", json!({ "max_tokens": 12, "stop": stop })),
         ] {
             let one = turn(q.clone(), extra);
-            let delivered = one["choices"][0]["message"]["content"]
-                .as_str()
-                .unwrap()
-                .to_string();
+            let message = &one["choices"][0]["message"];
+            let delivered = reasoning_of(message);
             assert!(
                 !delivered.is_empty() && !delivered.contains("</think>"),
                 "{arm} {cause}: a reply inside its reasoning: {delivered:?}"
             );
+            // Q2: the thought is the reasoning field's, and the answer field
+            // is empty — the run never left the block.
+            assert_eq!(
+                message["content"].as_str().unwrap_or(""),
+                "",
+                "{arm} {cause}: a reply cut inside its reasoning has no answer"
+            );
             let p1 = one["prompt_token_ids"].as_array().unwrap().clone();
             let r1 = one["choices"][0]["token_ids"].as_array().unwrap().clone();
+            // Sent back in the field it arrived in (Q2's round trip).
             let two = turn(
-                json!([q[0], { "role": "assistant", "content": delivered },
+                json!([q[0], { "role": "assistant", "content": "",
+                               "reasoning_content": delivered },
                        { "role": "user", "content": "Again." }]),
                 json!({ "max_tokens": 4 }),
             );
@@ -2990,28 +3011,27 @@ fn a_reply_cut_inside_its_reasoning_continues_by_the_arm() {
                 r1.len()
             );
             assert_eq!(two["timings"]["history_matched"], 1, "{arm} {cause}: {two}");
-            match (arm, cause) {
-                ("reasoning", "length") => {
+            // Sent back apart, the reply is matched and rendered from the ids
+            // the model emitted on every arm (Q1): the arm chose how an open
+            // reply was WRITTEN into the history, and an apart reply is
+            // already written as the model wrote it. So the only thing that
+            // still varies is where the delivered text ends.
+            match cause {
+                "length" => {
                     assert_eq!(kept, log.len(), "{arm}: the log extends");
                     assert_eq!(t["outcome"], "extend", "{arm}: {t}");
-                }
-                ("reasoning", _) => {
-                    let accepted = delivered.len();
-                    assert_eq!(kept, p1.len() + accepted, "{arm} {cause}: to the stop");
-                    assert!(
-                        matches!(t["outcome"].as_str(), Some("rewind" | "restore")),
-                        "{arm} {cause}: {t}"
-                    );
+                    assert_eq!(t["replayed"], 0, "{arm}: nothing is replayed: {t}");
                 }
                 _ => {
-                    assert_eq!(
-                        kept,
-                        p1.len(),
-                        "{arm} {cause}: diverges at the prompt's end"
+                    // A stop string cut the reply: the history carries the
+                    // delivered ids, so the log is kept to there and the
+                    // state goes back to it.
+                    assert!(kept <= log.len(), "{arm} {cause}: {kept} of {}", log.len());
+                    assert!(kept >= p1.len(), "{arm} {cause}: the prompt is kept");
+                    assert!(
+                        matches!(t["outcome"].as_str(), Some("extend" | "rewind" | "restore")),
+                        "{arm} {cause}: {t}"
                     );
-                    assert_eq!(t["outcome"], "restore", "{arm} {cause}: {t}");
-                    assert_eq!(t["diverged_at"], json!(p1.len()), "{arm} {cause}: {t}");
-                    assert_eq!(t["replayed"], 0, "{arm} {cause}: {t}");
                 }
             }
         }

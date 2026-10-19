@@ -302,10 +302,12 @@ pub fn run(args: ChatArgs) -> Result<()> {
     sampling
         .check()
         .map_err(|e| anyhow::anyhow!("the checkpoint's generation_config.json: {e}"))?;
-    // A template with the switch renders thinking off unless asked, so the
-    // reply is the answer; one without it renders as it does.
+    // Unasked, the prompt is the template's own rendering, as `serve` builds
+    // it (decision 51 Q6): `--think` / `--no-think` are the explicit
+    // switches. A Qwen template thinks by default because its own generation
+    // prompt opens the block.
     let mut kwargs = Map::new();
-    thinking::set_kwarg(engine.as_ref(), Some(want.unwrap_or(false)), &mut kwargs);
+    thinking::set_kwarg(engine.as_ref(), want, &mut kwargs);
     if let Some(effort) = &reasoning_effort {
         kwargs.insert(REASONING_EFFORT.into(), json!(effort));
     }

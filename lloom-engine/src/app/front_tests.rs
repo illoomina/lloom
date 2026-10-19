@@ -2757,3 +2757,265 @@ fn other_families_keep_their_existing_neutral_effort_validation() {
         );
     }
 }
+
+/// Decision 51 Q1 (maintainer, 2026-10-19): a past assistant turn the front
+/// end matches to its log is rendered from the ids the model emitted — the
+/// whole turn, through its end-of-turn token — in place of whatever the
+/// template would render for it. The template renders what the model did not
+/// write. So the next prompt's ids equal the session's log by construction,
+/// and no rewriting a template does to a past reply can make them diverge.
+///
+/// The two rewritings run 5 recorded (`issue-946.md` §25.8) are the cases
+/// that failed before this: Qwen's `reasoning_content|trim` (a reply whose
+/// whitespace is not the template's own format left the log at +7 against
+/// +12), and a reply cut inside its reasoning. Both must now extend.
+///
+/// The end-of-turn token is the template's own: the log does not keep the
+/// sampled EOS (`lloom::nn::DecodeOut::ids` excludes it), and on every
+/// supported checkpoint `eos_token` is the token that ends an assistant turn,
+/// so the span's last id is the one the model sampled. A reply that did not
+/// stop on EOS fed no end-of-turn position, so its span ends at its own ids.
+#[test]
+fn a_past_reply_is_rendered_from_the_ids_the_model_emitted() {
+    let user1 = user("What is the capital of France?");
+    let user2 = user("And Germany?");
+    let mut ran = 0;
+    let mut failures: Vec<String> = Vec::new();
+    for (repo, bos, caps) in AUDITED {
+        let Some(engine) = cached(repo, bos, caps) else {
+            continue;
+        };
+        let name = repo.rsplit("--").next().unwrap();
+        let tags = engine.think_tags();
+        let one = json!([user1]);
+        for want in wants(&engine) {
+            for persist in [None, Some(true), Some(false)] {
+                let front = Front::new(
+                    &engine,
+                    SessionOptions {
+                        persist,
+                        ..SessionOptions::default()
+                    },
+                );
+                if front.persist_unsupported().is_some() {
+                    continue;
+                }
+                let p1 = build(&front, &engine, &one, want);
+                let on = p1.thinking.unwrap().on;
+                // The replies: one in the template's own format, one whose
+                // whitespace is not (the trim), and one cut inside its
+                // reasoning. Each is what the model emitted.
+                let mut replies: Vec<(&str, String, Stop)> =
+                    vec![("an answer", "Paris.".to_string(), Stop::Eos)];
+                if on {
+                    let end = engine.token_str(tags.as_ref().unwrap().end);
+                    replies.push((
+                        "reasoning in the template's own format",
+                        format!("The capital of France is Paris.\n{end}\n\nParis."),
+                        Stop::Eos,
+                    ));
+                    replies.push((
+                        "reasoning whose whitespace the template would trim",
+                        format!("The capital of France is Paris.\n\n\n{end}\n\nParis."),
+                        Stop::Eos,
+                    ));
+                    replies.push((
+                        "cut inside its reasoning",
+                        "The capital of France is".into(),
+                        Stop::Length,
+                    ));
+                }
+                for (kind, text, stop) in replies {
+                    let front = Front::new(
+                        &engine,
+                        SessionOptions {
+                            persist,
+                            ..SessionOptions::default()
+                        },
+                    );
+                    let p1 = build(&front, &engine, &one, want);
+                    let sampled = engine.enc(&text);
+                    let mut d = decoded(&engine, sampled.clone());
+                    d.stop = stop;
+                    assert!(front.record(&engine, p1.origin, &d), "{name} {kind}");
+                    let history = json!([user1, assistant(&d.text), user2]);
+                    let p2 = build(&front, &engine, &history, want);
+                    // The session's log after the first turn: its prompt and
+                    // the ids the model emitted. An EOS-stopped reply also fed
+                    // the end-of-turn position, which the template writes.
+                    let mut log: Vec<u32> = p1.ids.iter().chain(&sampled).copied().collect();
+                    if stop == Stop::Eos {
+                        log.extend(engine.enc(&engine.token_str(engine.eos_ids()[0])));
+                    }
+                    let kept = p2.ids.iter().zip(&log).take_while(|(a, b)| a == b).count();
+                    eprintln!(
+                        "EMITTED {name} want={want:?} persist={persist:?} {kind}: the next prompt \
+                         leaves the log at {:+} from its end ({kept} of {})",
+                        kept as i64 - log.len() as i64,
+                        log.len(),
+                    );
+                    if kept < log.len() {
+                        failures.push(format!(
+                            "{name} want={want:?} persist={persist:?} {kind}: the next prompt \
+                             leaves the session's log at {kept} of {}, so the turn the model \
+                             emitted was not what the history rendered",
+                            log.len()
+                        ));
+                    }
+                }
+            }
+        }
+        ran += 1;
+    }
+    assert!(ran > 0, "no checkpoint template in the Hugging Face cache");
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// Decision 51 Q3 (maintainer, 2026-10-19): under an opt-in strip
+/// (`--strip-thinking`), a request whose history's last assistant message is a
+/// reply of ours cut inside its reasoning renders with `preserve_thinking`
+/// anyway — for that one request. Stripped, such a history shows the model an
+/// empty assistant message where its own unfinished thought belongs (run 5's
+/// H2, `issue-946.md` §25.2), so a "continue" turn had lost the thought.
+///
+/// No template has a per-message switch, so the suspension keeps every past
+/// reply's reasoning in that request. A closed reply last does not suspend it,
+/// nor does a reply the log does not hold, nor another conversation's.
+#[test]
+fn an_unfinished_thought_last_suspends_an_opt_in_strip() {
+    let engine = Stub::qwen3_6_like();
+    let want = Some(true);
+    let strip = || {
+        Front::new(
+            &engine,
+            SessionOptions {
+                persist: Some(false),
+                ..SessionOptions::default()
+            },
+        )
+    };
+    let q = json!([user("2+2?")]);
+    // A reply cut inside its reasoning, and one that closed its block.
+    let end = engine.token_str(engine.think_tags().unwrap().end);
+    for (case, text, stop, suspends) in [
+        (
+            "cut inside its reasoning",
+            "Add them".to_string(),
+            Stop::Length,
+            true,
+        ),
+        (
+            "closed its block",
+            format!("Add them\n{end}\n\nFour."),
+            Stop::Eos,
+            false,
+        ),
+    ] {
+        let front = strip();
+        let p1 = build(&front, &engine, &q, want);
+        let mut d = decoded(&engine, engine.enc(&text));
+        d.stop = stop;
+        assert!(front.record(&engine, p1.origin, &d), "{case}");
+        let history = json!([user("2+2?"), assistant(&d.text)]);
+        let p2 = build(&front, &engine, &history, want);
+        let kept = p2.kwargs.get(PRESERVE_THINKING).and_then(Value::as_bool);
+        eprintln!("Q3 {case}: preserve_thinking {kept:?} (strip asked)");
+        assert_eq!(
+            kept,
+            Some(suspends),
+            "{case}: an unfinished thought last suspends the strip; a finished one does not"
+        );
+        // The thought itself is in the prompt exactly where it suspends.
+        assert_eq!(
+            p2.text.contains("Add them"),
+            suspends || text.contains(&end),
+            "{case}: the unfinished thought reaches the template iff the strip is suspended"
+        );
+    }
+
+    // A reply the log no longer holds does not suspend it: nothing says the
+    // message is an unfinished thought of ours.
+    let front = strip();
+    let history = json!([user("2+2?"), assistant("Add them")]);
+    let p = build(&front, &engine, &history, want);
+    assert_eq!(
+        p.kwargs.get(PRESERVE_THINKING).and_then(Value::as_bool),
+        Some(false),
+        "a message the log does not hold does not suspend the strip"
+    );
+
+    // Another conversation's reply does not either (the scope chain).
+    let front = strip();
+    let other = build(&front, &engine, &json!([user("9+9?")]), want);
+    let mut d = decoded(&engine, engine.enc("Add them"));
+    d.stop = Stop::Length;
+    assert!(front.record(&engine, other.origin, &d));
+    let p = build(
+        &front,
+        &engine,
+        &json!([user("2+2?"), assistant(&d.text)]),
+        want,
+    );
+    assert_eq!(
+        p.kwargs.get(PRESERVE_THINKING).and_then(Value::as_bool),
+        Some(false),
+        "another conversation's reply does not suspend the strip"
+    );
+}
+
+/// Decision 51 Q5 (maintainer, 2026-10-19): (a), as sent. An open reply of
+/// ours sent back with an empty content and no reasoning field cannot be
+/// found — an empty content is no key, and the message gives no reasoning to
+/// look it up by — so under `missing_reasoning = log` too it goes to the
+/// template as the client sent it: empty. The client's history is the
+/// client's; matching it by its position in the conversation would be
+/// reconstruction by position, which the 2026-10-14 review cautioned against.
+/// `lloom chat` holds its own session and never sends this.
+#[test]
+fn an_open_reply_sent_back_empty_goes_as_sent_under_log_too() {
+    let engine = Stub::qwen4exp();
+    let want = Some(true);
+    let q = json!([user("2+2?")]);
+    for restore in [false, true] {
+        let front = Front::new(
+            &engine,
+            SessionOptions {
+                restore_reasoning: restore,
+                ..SessionOptions::default()
+            },
+        );
+        let p1 = build(&front, &engine, &q, want);
+        let mut d = decoded(&engine, bytes("Add them"));
+        d.stop = Stop::Length;
+        assert!(front.record(&engine, p1.origin, &d));
+        // Empty content, and no reasoning field at all.
+        let history = json!([
+            user("2+2?"),
+            json!({ "role": "assistant", "content": "" }),
+            user("3+3?")
+        ]);
+        let p2 = build(&front, &engine, &history, want);
+        eprintln!(
+            "Q5 missing_reasoning={}: replies {} matched {} restored {} spliced {}",
+            if restore { "log" } else { "as-sent" },
+            p2.spliced.replies,
+            p2.spliced.matched,
+            p2.spliced.restored,
+            p2.spliced.spliced_tokens,
+        );
+        assert_eq!(p2.spliced.replies, 1);
+        assert_eq!(
+            (
+                p2.spliced.matched,
+                p2.spliced.restored,
+                p2.spliced.spliced_tokens
+            ),
+            (0, 0, 0),
+            "as sent, empty: nothing is matched, nothing restored, no id taken"
+        );
+        assert!(
+            !p2.text.contains("Add them"),
+            "the thought the client dropped is not put back"
+        );
+    }
+}

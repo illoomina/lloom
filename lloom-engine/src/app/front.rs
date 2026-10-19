@@ -785,6 +785,9 @@ pub struct Spliced {
     /// reasoning field): whatever closes the block in the prompt is the
     /// template's text, not a sampled id.
     pub open_apart: usize,
+    /// Matched replies rendered from the ids the model emitted — the whole
+    /// turn, in place of the template's rendering of it (decision 51 Q1).
+    pub emitted: usize,
 }
 
 /// Where each message's rendering starts in the prompt's ids.
@@ -1003,6 +1006,41 @@ impl Front {
         })
     }
 
+    /// Whether the history's last message is a reply of ours whose run ended
+    /// inside its reasoning block (decision 51 Q3): then an opt-in strip is
+    /// suspended for that one request, so the model sees the thought it has
+    /// not finished. Looked up as the prompt looks a reply up — in the
+    /// message's own scope, by its text or the reasoning it gives apart — so a
+    /// reply the log does not hold, or another conversation's, does not
+    /// suspend anything.
+    fn last_reply_is_open(&self, c: &Constants, list: &[Value], scopes: &[Scope]) -> bool {
+        if c.tags.is_none() {
+            return false;
+        }
+        let Some((i, m)) = list.iter().enumerate().next_back() else {
+            return false;
+        };
+        if m.get("role").and_then(Value::as_str) != Some("assistant") {
+            return false;
+        }
+        let Some(&scope) = scopes.get(i) else {
+            return false;
+        };
+        let content = m.get("content").and_then(Value::as_str).unwrap_or("");
+        let key = if content.trim().is_empty() {
+            match reasoning_apart(m) {
+                Some(r) => r,
+                None => return false,
+            }
+        } else {
+            content
+        };
+        matches!(
+            self.log.lock().find(scope, key),
+            Found::One(reply, _) if matches!(reply.block, Block::Open { .. })
+        )
+    }
+
     /// The reason a `reasoning_effort` in `kwargs` is refused: the template
     /// does not read it, or renders the same prompt for any value of it.
     fn check_effort(
@@ -1057,6 +1095,14 @@ impl Front {
         let scopes = self.scopes(sent, &req.kwargs);
         let mut kwargs = req.kwargs;
         if let (Some(p), false) = (self.persist(c), kwargs.contains_key(PRESERVE_THINKING)) {
+            // Decision 51 Q3: a request whose history ends in a thought the
+            // model did not finish renders with the reasoning kept, even under
+            // an opt-in strip — a stripped prompt would show the model an
+            // empty reply where its own unfinished thinking should be, and a
+            // "continue" turn would have lost it. No template has a per-message
+            // switch, so this keeps every past reply's reasoning, for this
+            // request alone.
+            let p = p || self.last_reply_is_open(c, list, &scopes);
             kwargs.insert(PRESERVE_THINKING.into(), Value::Bool(p));
         }
 
@@ -1191,13 +1237,19 @@ impl Front {
             .as_deref()
             .and_then(|open| text_blocks(&rendered, open, &shown, c.groups_tools));
 
-        // The logged replies' ids, aligned within each one's own span.
+        // The logged replies' ids in their own spans: the whole turn the model
+        // emitted (decision 51 Q1), or — where that span cannot be identified
+        // — aligned segment by segment inside the template's rendering of it.
         let mut runs: Vec<Run> = Vec::new();
         if let Some(tb) = &text_blocks {
             for (i, reply, apart) in &matched {
                 let Some(region) = tb.region(*i, rendered.len()) else {
                     continue;
                 };
+                if emit_turn(text, &rendered, region.clone(), reply, &mut runs) {
+                    spliced.emitted += 1;
+                    continue;
+                }
                 align_reply(text, &rendered, region, reply, *apart, &mut runs);
             }
         }
@@ -1837,6 +1889,104 @@ fn units(text: &Text, ids: &[u32], base: usize) -> Option<Vec<(Range<usize>, Str
     let whole = decode(text, ids)?;
     let joined: String = out.iter().map(|(_, s)| s.as_str()).collect();
     (joined == whole).then_some(out)
+}
+
+/// Render a past assistant turn from the ids the model emitted (decision 51
+/// Q1): the whole turn — anything before its reasoning block, the block's
+/// markers and interior with its own whitespace, the content — in place of
+/// whatever the template rendered for it, with the template's own role header
+/// kept (the model did not write it). The run ends at the turn's end: through
+/// the end-of-turn token for a reply the model ended itself, at the reply's
+/// last id for one a limit, a stop string or a cancellation cut, which fed no
+/// end-of-turn position.
+///
+/// So the next prompt's ids are the session's log wherever a reply is matched,
+/// whatever the template would have rewritten — Qwen's `reasoning_content|trim`,
+/// a re-split of an evicted reply, an engine-closed empty block. No restore, no
+/// replay, no tail rewind.
+///
+/// `false` where the span does not admit it: the turn's end is not in the
+/// span's text, or the reply's text is not what the template put there (a
+/// client's edit, a template that rewrote it past recognition). The caller
+/// then aligns segment by segment, which is the pre-Q1 path and still
+/// splices what it can.
+fn emit_turn(
+    text: &Text,
+    rendered: &str,
+    region: Range<usize>,
+    reply: &Arc<Reply>,
+    runs: &mut Vec<Run>,
+) -> bool {
+    let span = &rendered[region.clone()];
+    // The turn's end in the span: the end-of-turn text the template wrote
+    // after the body. Taken from the template's own bytes, since the log does
+    // not keep the sampled EOS (`lloom::nn::DecodeOut::ids` excludes it); on
+    // every supported checkpoint it is the same token.
+    let Some(eot) = text.eos_ids.first().and_then(|&id| decode(text, &[id])) else {
+        return false;
+    };
+    if eot.is_empty() {
+        return false;
+    }
+    let Some(at) = span.rfind(eot.as_str()) else {
+        return false;
+    };
+    // The body the template rendered for this turn: past the role header, up
+    // to the end-of-turn token. The header is the template's and stays.
+    let body = span[..at].trim_end();
+    // The model's own text for the turn, as the log decoded it, and the
+    // template's for the same stretch: they must name the same reply, or this
+    // is not the turn the model emitted.
+    let emitted = reply.text.trim();
+    let start = match body.rfind(emitted) {
+        Some(s) => region.start + s,
+        // The template rewrote the body (a trim, a strip, a re-split). The
+        // span is still this reply's turn: its content must be in there, or
+        // nothing identifies it.
+        None => {
+            let probe = reply.content_text.trim();
+            if probe.is_empty() || !body.contains(probe) {
+                return false;
+            }
+            // The body begins past the role header: the template's first
+            // newline after the span's opening.
+            match span.find('\n') {
+                Some(n) => region.start + n + 1,
+                None => return false,
+            }
+        }
+    };
+    let end = region.start + at + eot.len();
+    if start >= end {
+        return false;
+    }
+    // The ids: the reply as sampled, and the end-of-turn id only where the
+    // model ended the turn itself.
+    let mut ids: Vec<u32> = reply.ids.clone();
+    let through_eot = reply.stop == crate::Stop::Eos;
+    if !through_eot {
+        // The turn is the reply's ids alone; the template's end-of-turn text
+        // after them is the template's, encoded as text.
+        runs.push(Run {
+            text: start..region.start + at,
+            ids: 0..reply.ids.len(),
+            reply: Arc::clone(reply),
+        });
+        return !reply.ids.is_empty();
+    }
+    let Some(&eot_id) = text.eos_ids.first() else {
+        return false;
+    };
+    ids.push(eot_id);
+    runs.push(Run {
+        text: start..end,
+        ids: 0..ids.len(),
+        reply: Arc::new(Reply {
+            ids,
+            ..Reply::clone(reply)
+        }),
+    });
+    true
 }
 
 /// Align `reply`'s segments — anything before its reasoning block, the

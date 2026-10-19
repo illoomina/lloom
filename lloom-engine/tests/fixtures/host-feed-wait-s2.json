@@ -1,0 +1,607 @@
+[
+  {
+    "name": "spin",
+    "input": "spin",
+    "accept": true,
+    "converted": "spin",
+    "stored": "spin",
+    "rendered": "spin"
+  },
+  {
+    "name": "hint padded",
+    "input": " \tSPIN-HINT\n",
+    "accept": true,
+    "converted": "spin-hint",
+    "stored": "spin-hint",
+    "rendered": "spin-hint"
+  },
+  {
+    "name": "wfe capability",
+    "input": " WFE ",
+    "accept": true,
+    "converted": "wfe",
+    "stored": "wfe",
+    "rendered": "wfe",
+    "aarch64": true
+  },
+  {
+    "name": "adaptive default",
+    "input": "adaptive",
+    "accept": true,
+    "converted": "on-demand",
+    "stored": "on-demand:50",
+    "rendered": "adaptive:50us"
+  },
+  {
+    "name": "on-demand alias default",
+    "input": "ON-DEMAND",
+    "accept": true,
+    "converted": "on-demand",
+    "stored": "on-demand:50",
+    "rendered": "adaptive:50us"
+  },
+  {
+    "name": "event default",
+    "input": "event",
+    "accept": true,
+    "converted": "event",
+    "stored": "event:50",
+    "rendered": "event:50us"
+  },
+  {
+    "name": "sleep default",
+    "input": " SLEEP ",
+    "accept": true,
+    "converted": "sleep",
+    "stored": "sleep:50",
+    "rendered": "sleep:50us"
+  },
+  {
+    "name": "adaptive zero",
+    "input": "adaptive:0",
+    "accept": true,
+    "converted": "on-demand:0",
+    "stored": "on-demand:0",
+    "rendered": "adaptive:0us"
+  },
+  {
+    "name": "adaptive raw zeros",
+    "input": "adaptive:0007",
+    "accept": true,
+    "converted": "on-demand:0007",
+    "stored": "on-demand:7",
+    "rendered": "adaptive:7us"
+  },
+  {
+    "name": "adaptive duration",
+    "input": "adaptive:2MS",
+    "accept": true,
+    "converted": "on-demand:2000",
+    "stored": "on-demand:2000",
+    "rendered": "adaptive:2000us"
+  },
+  {
+    "name": "adaptive padded plus duration",
+    "input": "adaptive: \t+2MS",
+    "accept": true,
+    "converted": "on-demand:2000",
+    "stored": "on-demand:2000",
+    "rendered": "adaptive:2000us"
+  },
+  {
+    "name": "adaptive max raw",
+    "input": "adaptive:18446744073709551615",
+    "accept": true,
+    "converted": "on-demand:18446744073709551615",
+    "stored": "on-demand:18446744073709551615",
+    "rendered": "adaptive:18446744073709551615us"
+  },
+  {
+    "name": "adaptive max us",
+    "input": "adaptive:+18446744073709551615us",
+    "accept": true,
+    "converted": "on-demand:18446744073709551615",
+    "stored": "on-demand:18446744073709551615",
+    "rendered": "adaptive:18446744073709551615us"
+  },
+  {
+    "name": "adaptive max ms",
+    "input": "adaptive:18446744073709551ms",
+    "accept": true,
+    "converted": "on-demand:18446744073709551000",
+    "stored": "on-demand:18446744073709551000",
+    "rendered": "adaptive:18446744073709551000us"
+  },
+  {
+    "name": "adaptive max s",
+    "input": "adaptive:18446744073709s",
+    "accept": true,
+    "converted": "on-demand:18446744073709000000",
+    "stored": "on-demand:18446744073709000000",
+    "rendered": "adaptive:18446744073709000000us"
+  },
+  {
+    "name": "adaptive raw plus",
+    "input": "adaptive:+7",
+    "accept": false
+  },
+  {
+    "name": "adaptive raw padding",
+    "input": "adaptive: 7",
+    "accept": false
+  },
+  {
+    "name": "adaptive negative",
+    "input": "adaptive:-1us",
+    "accept": false
+  },
+  {
+    "name": "adaptive overflow raw",
+    "input": "adaptive:18446744073709551616",
+    "accept": false,
+    "converted": "on-demand:18446744073709551616"
+  },
+  {
+    "name": "adaptive overflow ms",
+    "input": "adaptive:18446744073709552ms",
+    "accept": false
+  },
+  {
+    "name": "adaptive overflow s",
+    "input": "adaptive:18446744073710s",
+    "accept": false
+  },
+  {
+    "name": "adaptive empty",
+    "input": "adaptive:",
+    "accept": false
+  },
+  {
+    "name": "adaptive bad unit",
+    "input": "adaptive:7ns",
+    "accept": false
+  },
+  {
+    "name": "on-demand zero",
+    "input": "on-demand:0",
+    "accept": true,
+    "converted": "on-demand:0",
+    "stored": "on-demand:0",
+    "rendered": "adaptive:0us"
+  },
+  {
+    "name": "on-demand raw zeros",
+    "input": "on-demand:0007",
+    "accept": true,
+    "converted": "on-demand:0007",
+    "stored": "on-demand:7",
+    "rendered": "adaptive:7us"
+  },
+  {
+    "name": "on-demand duration",
+    "input": "on-demand:2MS",
+    "accept": true,
+    "converted": "on-demand:2000",
+    "stored": "on-demand:2000",
+    "rendered": "adaptive:2000us"
+  },
+  {
+    "name": "on-demand padded plus duration",
+    "input": "on-demand: \t+2MS",
+    "accept": true,
+    "converted": "on-demand:2000",
+    "stored": "on-demand:2000",
+    "rendered": "adaptive:2000us"
+  },
+  {
+    "name": "on-demand max raw",
+    "input": "on-demand:18446744073709551615",
+    "accept": true,
+    "converted": "on-demand:18446744073709551615",
+    "stored": "on-demand:18446744073709551615",
+    "rendered": "adaptive:18446744073709551615us"
+  },
+  {
+    "name": "on-demand max us",
+    "input": "on-demand:+18446744073709551615us",
+    "accept": true,
+    "converted": "on-demand:18446744073709551615",
+    "stored": "on-demand:18446744073709551615",
+    "rendered": "adaptive:18446744073709551615us"
+  },
+  {
+    "name": "on-demand max ms",
+    "input": "on-demand:18446744073709551ms",
+    "accept": true,
+    "converted": "on-demand:18446744073709551000",
+    "stored": "on-demand:18446744073709551000",
+    "rendered": "adaptive:18446744073709551000us"
+  },
+  {
+    "name": "on-demand max s",
+    "input": "on-demand:18446744073709s",
+    "accept": true,
+    "converted": "on-demand:18446744073709000000",
+    "stored": "on-demand:18446744073709000000",
+    "rendered": "adaptive:18446744073709000000us"
+  },
+  {
+    "name": "on-demand raw plus",
+    "input": "on-demand:+7",
+    "accept": false
+  },
+  {
+    "name": "on-demand raw padding",
+    "input": "on-demand: 7",
+    "accept": false
+  },
+  {
+    "name": "on-demand negative",
+    "input": "on-demand:-1us",
+    "accept": false
+  },
+  {
+    "name": "on-demand overflow raw",
+    "input": "on-demand:18446744073709551616",
+    "accept": false,
+    "converted": "on-demand:18446744073709551616"
+  },
+  {
+    "name": "on-demand overflow ms",
+    "input": "on-demand:18446744073709552ms",
+    "accept": false
+  },
+  {
+    "name": "on-demand overflow s",
+    "input": "on-demand:18446744073710s",
+    "accept": false
+  },
+  {
+    "name": "on-demand empty",
+    "input": "on-demand:",
+    "accept": false
+  },
+  {
+    "name": "on-demand bad unit",
+    "input": "on-demand:7ns",
+    "accept": false
+  },
+  {
+    "name": "event zero",
+    "input": "event:0",
+    "accept": true,
+    "converted": "event:0",
+    "stored": "event:0",
+    "rendered": "event:0us"
+  },
+  {
+    "name": "event raw zeros",
+    "input": "event:0007",
+    "accept": true,
+    "converted": "event:0007",
+    "stored": "event:7",
+    "rendered": "event:7us"
+  },
+  {
+    "name": "event duration",
+    "input": "event:2MS",
+    "accept": true,
+    "converted": "event:2000",
+    "stored": "event:2000",
+    "rendered": "event:2000us"
+  },
+  {
+    "name": "event padded plus duration",
+    "input": "event: \t+2MS",
+    "accept": true,
+    "converted": "event:2000",
+    "stored": "event:2000",
+    "rendered": "event:2000us"
+  },
+  {
+    "name": "event max raw",
+    "input": "event:18446744073709551615",
+    "accept": true,
+    "converted": "event:18446744073709551615",
+    "stored": "event:18446744073709551615",
+    "rendered": "event:18446744073709551615us"
+  },
+  {
+    "name": "event max us",
+    "input": "event:+18446744073709551615us",
+    "accept": true,
+    "converted": "event:18446744073709551615",
+    "stored": "event:18446744073709551615",
+    "rendered": "event:18446744073709551615us"
+  },
+  {
+    "name": "event max ms",
+    "input": "event:18446744073709551ms",
+    "accept": true,
+    "converted": "event:18446744073709551000",
+    "stored": "event:18446744073709551000",
+    "rendered": "event:18446744073709551000us"
+  },
+  {
+    "name": "event max s",
+    "input": "event:18446744073709s",
+    "accept": true,
+    "converted": "event:18446744073709000000",
+    "stored": "event:18446744073709000000",
+    "rendered": "event:18446744073709000000us"
+  },
+  {
+    "name": "event raw plus",
+    "input": "event:+7",
+    "accept": false
+  },
+  {
+    "name": "event raw padding",
+    "input": "event: 7",
+    "accept": false
+  },
+  {
+    "name": "event negative",
+    "input": "event:-1us",
+    "accept": false
+  },
+  {
+    "name": "event overflow raw",
+    "input": "event:18446744073709551616",
+    "accept": false,
+    "converted": "event:18446744073709551616"
+  },
+  {
+    "name": "event overflow ms",
+    "input": "event:18446744073709552ms",
+    "accept": false
+  },
+  {
+    "name": "event overflow s",
+    "input": "event:18446744073710s",
+    "accept": false
+  },
+  {
+    "name": "event empty",
+    "input": "event:",
+    "accept": false
+  },
+  {
+    "name": "event bad unit",
+    "input": "event:7ns",
+    "accept": false
+  },
+  {
+    "name": "sleep zero",
+    "input": "sleep:0",
+    "accept": true,
+    "converted": "sleep:0",
+    "stored": "sleep:0",
+    "rendered": "sleep:0us"
+  },
+  {
+    "name": "sleep raw zeros",
+    "input": "sleep:0007",
+    "accept": true,
+    "converted": "sleep:0007",
+    "stored": "sleep:7",
+    "rendered": "sleep:7us"
+  },
+  {
+    "name": "sleep duration",
+    "input": "sleep:2MS",
+    "accept": true,
+    "converted": "sleep:2000",
+    "stored": "sleep:2000",
+    "rendered": "sleep:2000us"
+  },
+  {
+    "name": "sleep padded plus duration",
+    "input": "sleep: \t+2MS",
+    "accept": true,
+    "converted": "sleep:2000",
+    "stored": "sleep:2000",
+    "rendered": "sleep:2000us"
+  },
+  {
+    "name": "sleep max raw",
+    "input": "sleep:18446744073709551615",
+    "accept": true,
+    "converted": "sleep:18446744073709551615",
+    "stored": "sleep:18446744073709551615",
+    "rendered": "sleep:18446744073709551615us"
+  },
+  {
+    "name": "sleep max us",
+    "input": "sleep:+18446744073709551615us",
+    "accept": true,
+    "converted": "sleep:18446744073709551615",
+    "stored": "sleep:18446744073709551615",
+    "rendered": "sleep:18446744073709551615us"
+  },
+  {
+    "name": "sleep max ms",
+    "input": "sleep:18446744073709551ms",
+    "accept": true,
+    "converted": "sleep:18446744073709551000",
+    "stored": "sleep:18446744073709551000",
+    "rendered": "sleep:18446744073709551000us"
+  },
+  {
+    "name": "sleep max s",
+    "input": "sleep:18446744073709s",
+    "accept": true,
+    "converted": "sleep:18446744073709000000",
+    "stored": "sleep:18446744073709000000",
+    "rendered": "sleep:18446744073709000000us"
+  },
+  {
+    "name": "sleep raw plus",
+    "input": "sleep:+7",
+    "accept": false
+  },
+  {
+    "name": "sleep raw padding",
+    "input": "sleep: 7",
+    "accept": false
+  },
+  {
+    "name": "sleep negative",
+    "input": "sleep:-1us",
+    "accept": false
+  },
+  {
+    "name": "sleep overflow raw",
+    "input": "sleep:18446744073709551616",
+    "accept": false,
+    "converted": "sleep:18446744073709551616"
+  },
+  {
+    "name": "sleep overflow ms",
+    "input": "sleep:18446744073709552ms",
+    "accept": false
+  },
+  {
+    "name": "sleep overflow s",
+    "input": "sleep:18446744073710s",
+    "accept": false
+  },
+  {
+    "name": "sleep empty",
+    "input": "sleep:",
+    "accept": false
+  },
+  {
+    "name": "sleep bad unit",
+    "input": "sleep:7ns",
+    "accept": false
+  },
+  {
+    "name": "NEL padding",
+    "input": "\u0085ADAPTIVE:\u0085+2ms\u0085",
+    "accept": true,
+    "converted": "on-demand:2000",
+    "stored": "on-demand:2000",
+    "rendered": "adaptive:2000us"
+  },
+  {
+    "name": "Unicode padding",
+    "input": "\u1680EVENT:\u20077us\u2028",
+    "accept": true,
+    "converted": "event:7",
+    "stored": "event:7",
+    "rendered": "event:7us"
+  },
+  {
+    "name": "empty",
+    "input": "",
+    "accept": false
+  },
+  {
+    "name": "blank",
+    "input": " \t\r\n ",
+    "accept": false
+  },
+  {
+    "name": "unknown",
+    "input": "block",
+    "accept": false
+  },
+  {
+    "name": "none is not reset",
+    "input": "none",
+    "accept": false
+  },
+  {
+    "name": "arm space",
+    "input": "event :7us",
+    "accept": false
+  },
+  {
+    "name": "decimal",
+    "input": "event:1.5ms",
+    "accept": false
+  },
+  {
+    "name": "exponent",
+    "input": "adaptive:1e3us",
+    "accept": false
+  },
+  {
+    "name": "space before unit",
+    "input": "sleep:7 ms",
+    "accept": false
+  },
+  {
+    "name": "FEFF",
+    "input": "\ufeffevent:7us",
+    "accept": false
+  },
+  {
+    "name": "zero width",
+    "input": "adaptive:\u200b7us",
+    "accept": false
+  },
+  {
+    "name": "Arabic digits",
+    "input": "sleep:\u0667us",
+    "accept": false
+  },
+  {
+    "name": "newline suffix",
+    "input": "event:7us\nx",
+    "accept": false
+  },
+  {
+    "name": "repeated colon",
+    "input": "adaptive:7us:2",
+    "accept": false
+  },
+  {
+    "name": "null reset",
+    "input": null,
+    "accept": true,
+    "stored": "on-demand:50",
+    "rendered": "adaptive:50us"
+  },
+  {
+    "name": "native true",
+    "input": true,
+    "accept": false
+  },
+  {
+    "name": "native false",
+    "input": false,
+    "accept": false
+  },
+  {
+    "name": "native zero",
+    "input": 0,
+    "accept": false
+  },
+  {
+    "name": "native count",
+    "input": 7,
+    "accept": false
+  },
+  {
+    "name": "native float",
+    "input": 1.0,
+    "accept": false
+  },
+  {
+    "name": "native u64 max",
+    "input": 18446744073709551615,
+    "accept": false
+  },
+  {
+    "name": "object",
+    "input": {},
+    "accept": false
+  },
+  {
+    "name": "array",
+    "input": [],
+    "accept": false
+  }
+]

@@ -645,9 +645,21 @@ fn write_leaf(
         Value::Null => o.merge_json(&fragment(&leaf.storage, leaf.default.clone())),
         Value::Array(_) | Value::Object(_) => o.merge_json(&fragment(&leaf.storage, value.clone())),
         v => {
-            let mut s = scalar(v);
+            let mut s = leaf
+                .meta
+                .native_number(v)
+                .map_err(|e| format!("{}: {e}", leaf.meta.key))?
+                .unwrap_or_else(|| scalar(v));
             if as_key && leaf.meta.invert {
-                s = (!lloom_tensor::options::parse_bool(&s)?).to_string();
+                s = (!lloom_tensor::options::parse_bool(&s).map_err(|e| {
+                    let key = if leaf.meta.path.is_empty() {
+                        leaf.storage.as_str()
+                    } else {
+                        leaf.meta.path
+                    };
+                    format!("`{key}`: {e}")
+                })?)
+                .to_string();
             }
             o.set(&leaf.storage, &s)
         }
@@ -657,6 +669,107 @@ fn write_leaf(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inverted_invalid_index_writes_name_the_key_and_leave_options_unchanged() {
+        let idx = index();
+        let mut checked = 0;
+        for key in idx
+            .keys
+            .values()
+            .filter(|key| key.targets.iter().any(|l| l.meta.invert))
+        {
+            for seed in ["true", "false"] {
+                let mut o = EngineOptions::default();
+                idx.set(&mut o, &key.path, seed).unwrap();
+                let before = o.clone();
+                for value in ["", " \t\r\n ", "maybe", "2"] {
+                    let error = idx.set(&mut o, &key.path, value).unwrap_err();
+                    assert_eq!(
+                        error,
+                        format!(
+                            "`{}`: {}",
+                            key.path,
+                            lloom_tensor::options::parse_bool(value).unwrap_err()
+                        )
+                    );
+                    assert_eq!(o, before, "{}: {value:?}", key.path);
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked > 0, "no inverted keys checked");
+        eprintln!("[{checked} inverted Index::set refusals preserve options]");
+    }
+
+    #[test]
+    fn inverted_invalid_group_json_names_the_key_and_leaves_options_unchanged() {
+        let idx = index();
+        let mut checked = 0;
+        for key in idx
+            .keys
+            .values()
+            .filter(|key| key.targets.iter().any(|l| l.meta.invert))
+        {
+            let (group, rest) = key.path.split_once('.').unwrap();
+            for seed in ["true", "false"] {
+                let mut o = EngineOptions::default();
+                idx.set(&mut o, &key.path, seed).unwrap();
+                let before = o.clone();
+                for value in ["", " \t\r\n ", "maybe", "2"] {
+                    let error = idx
+                        .merge_group(
+                            &mut o,
+                            group,
+                            &fragment(rest, Value::String(value.into())),
+                            None,
+                        )
+                        .unwrap_err();
+                    assert_eq!(
+                        error,
+                        format!(
+                            "`{}`: {}",
+                            key.path,
+                            lloom_tensor::options::parse_bool(value).unwrap_err()
+                        )
+                    );
+                    assert_eq!(o, before, "{}: {value:?}", key.path);
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked > 0, "no inverted keys checked");
+        eprintln!("[{checked} inverted group JSON refusals preserve options]");
+    }
+
+    #[test]
+    fn an_inverted_leaf_without_a_remap_names_its_full_storage_path() {
+        static META: KnobMeta = KnobMeta {
+            key: "skip_conv_c_fusion",
+            invert: true,
+            ..KnobMeta::BASE
+        };
+        let leaf = Leaf {
+            storage: "tuning.lfm2.skip_conv_c_fusion".into(),
+            meta: &META,
+            default: Value::Bool(false),
+        };
+        let mut o = EngineOptions::default();
+        let before = o.clone();
+        for value in ["", " \t\r\n ", "maybe", "2"] {
+            let error = write_leaf(&mut o, &leaf, &Value::String(value.into()), true).unwrap_err();
+            assert_eq!(
+                error,
+                format!(
+                    "`{}`: {}",
+                    leaf.storage,
+                    lloom_tensor::options::parse_bool(value).unwrap_err()
+                )
+            );
+            assert_eq!(o, before);
+        }
+        eprintln!("[4 unmapped inverted leaf refusals preserve options]");
+    }
 
     #[test]
     fn the_index_builds_and_every_key_has_a_status_and_a_description() {

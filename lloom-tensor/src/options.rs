@@ -24,6 +24,8 @@
 
 use serde_json::Value;
 
+pub mod wait;
+
 /// What an option IS, independent of whether it has a flag: `stable` (user
 /// facing, shipping), `advanced` (a shipping tunable with a sensible
 /// default), `arm` (an A/B arm whose supersession is undecided), `reference`
@@ -104,6 +106,8 @@ pub struct KnobMeta {
     /// `(key spelling, stored spelling)` pairs where the two vocabularies
     /// differ (`event` = `true`).
     pub values: &'static [(&'static str, &'static str)],
+    /// Match value aliases with the shared typed-value case/trim rules.
+    pub normalize_values: bool,
     /// A key spelling into the stored spelling; stored spellings pass through.
     pub from_v1: Option<FromKey>,
     /// A stored spelling into the key's.
@@ -113,6 +117,8 @@ pub struct KnobMeta {
     pub schema: &'static str,
     /// The forms of the shared type this site implements.
     pub forms: &'static [&'static str],
+    /// A field-attached grammar; absent fields retain their existing rules.
+    pub grammar: Option<&'static wait::WaitGrammar>,
     /// The original doc, with its references (`lloom options --internal`).
     pub internal: &'static str,
     /// The field's spellings are aliases of `path`, but a write to the key
@@ -135,6 +141,29 @@ pub struct KnobMeta {
 }
 
 impl KnobMeta {
+    /// Preserve JSON number provenance until the bool or field-attached
+    /// count domain has checked it. Strings retain their lexical grammar.
+    pub fn native_number(&self, value: &Value) -> Result<Option<String>, String> {
+        if let Value::Number(number) = value {
+            if self.is_bool || matches!(self.ty, "bool" | "Option<bool>") {
+                if let Some(n) = number.as_f64().filter(|n| n.is_finite()) {
+                    if n == 0.0 {
+                        return Ok(Some("0".into()));
+                    }
+                    if n == 1.0 {
+                        return Ok(Some("1".into()));
+                    }
+                }
+                return parse_bool(&number.to_string())
+                    .map(|value| Some(if value { "1" } else { "0" }.into()));
+            }
+        }
+        match (value, self.grammar.and_then(|g| g.count)) {
+            (Value::Number(number), Some(count)) => count.domain.normalize(number).map(Some),
+            _ => Ok(None),
+        }
+    }
+
     /// The fields every literal starts from.
     pub const BASE: KnobMeta = KnobMeta {
         key: "",
@@ -155,10 +184,12 @@ impl KnobMeta {
         switches: &[],
         invert: false,
         values: &[],
+        normalize_values: false,
         from_v1: None,
         to_v1: None,
         schema: "",
         forms: &[],
+        grammar: None,
         internal: "",
         legacy_only: false,
         v0: true,
@@ -220,6 +251,22 @@ pub fn heading(path: &str) -> &'static str {
 pub const TRUE_SPELLINGS: &[&str] = &["true", "t", "yes", "y", "1", "on"];
 /// The spellings that mean `false`, any ASCII case.
 pub const FALSE_SPELLINGS: &[&str] = &["false", "f", "no", "n", "0", "off"];
+
+/// Map declared aliases before the field parser. Normalization is opt-in:
+/// other value maps retain their exact lexical contract.
+pub fn map_value(value: &str, aliases: &[(&str, &str)], normalize: bool) -> String {
+    aliases
+        .iter()
+        .find(|(key, _)| {
+            if normalize {
+                key.eq_ignore_ascii_case(value.trim())
+            } else {
+                *key == value
+            }
+        })
+        .map(|(_, stored)| (*stored).to_string())
+        .unwrap_or_else(|| value.to_string())
+}
 
 /// A bool: one of [`TRUE_SPELLINGS`] or [`FALSE_SPELLINGS`], any case.
 /// Anything else, the empty value included, is refused.
@@ -499,21 +546,13 @@ pub mod v1 {
     pub fn duration_us(s: &str) -> Result<u64, String> {
         let lower = s.trim().to_ascii_lowercase();
         let s = lower.as_str();
-        let (digits, scale) = if let Some(d) = s.strip_suffix("us") {
-            (d, 1)
-        } else if let Some(d) = s.strip_suffix("ms") {
-            (d, 1_000)
-        } else if let Some(d) = s.strip_suffix('s') {
-            (d, 1_000_000)
-        } else {
-            return Err(format!(
-                "`{s}` is not a duration (`<n>us`, `<n>ms` or `<n>s`)"
-            ));
-        };
+        let (digits, unit) = super::wait::WaitParameter::Microseconds
+            .split_unit(s)
+            .ok_or_else(|| format!("`{s}` is not a duration (`<n>us`, `<n>ms` or `<n>s`)"))?;
         let n: u64 = digits
             .parse()
             .map_err(|_| format!("`{s}` is not a duration (`<n>us`, `<n>ms` or `<n>s`)"))?;
-        n.checked_mul(scale)
+        n.checked_mul(unit.scale())
             .ok_or_else(|| format!("`{s}` overflows"))
     }
 
@@ -532,11 +571,19 @@ pub mod v1 {
 
     /// `arm` or `arm:<dur>`, the duration in µs; a bare count is the stored
     /// spelling and passes through.
-    fn with_us(arm: &str, rest: Option<&str>) -> Result<String, String> {
+    pub(super) fn with_us(arm: &str, rest: Option<&str>) -> Result<String, String> {
         match rest {
             None => Ok(arm.to_string()),
             Some(d) if is_count(d) => Ok(format!("{arm}:{d}")),
             Some(d) => Ok(format!("{arm}:{}", duration_us(d)?)),
+        }
+    }
+
+    pub(super) fn with_ms(arm: &str, rest: Option<&str>) -> Result<String, String> {
+        match rest {
+            None => Ok(arm.to_string()),
+            Some(d) if is_count(d) => Ok(format!("{arm}:{d}")),
+            Some(d) => Ok(format!("{arm}:{}", duration_ms(d)?)),
         }
     }
 
@@ -549,12 +596,7 @@ pub mod v1 {
 
     /// `decode.readback.wait`: `sleep:<dur>` is stored `sleep:<µs>`.
     pub fn poll_from(s: &str) -> Result<String, String> {
-        let lower = s.trim().to_ascii_lowercase();
-        let s = lower.as_str();
-        match split(s) {
-            ("sleep", rest) => with_us("sleep", rest),
-            _ => Ok(s.to_string()),
-        }
+        super::wait::READBACK_WAIT.to_stored(s)
     }
 
     pub fn poll_to(s: &str) -> String {
@@ -567,14 +609,7 @@ pub mod v1 {
     /// `decode.host_feed.wait`: `adaptive` is stored `on-demand`, durations
     /// in µs.
     pub fn feed_wait_from(s: &str) -> Result<String, String> {
-        let lower = s.trim().to_ascii_lowercase();
-        let s = lower.as_str();
-        match split(s) {
-            ("adaptive", rest) | ("on-demand", rest) => with_us("on-demand", rest),
-            ("event", rest) => with_us("event", rest),
-            ("sleep", rest) => with_us("sleep", rest),
-            _ => Ok(s.to_string()),
-        }
+        super::wait::HOST_FEED_WAIT.to_stored(s)
     }
 
     pub fn feed_wait_to(s: &str) -> String {
@@ -591,24 +626,7 @@ pub mod v1 {
     /// and `event-listener` their shared-event arms. `bare_wait_ms` is the
     /// timed wait's default, which a bare `shared-event-wait` renders as.
     pub fn completion_wait_from(s: &str) -> Result<String, String> {
-        let lower = s.trim().to_ascii_lowercase();
-        let s = lower.as_str();
-        let ms = |arm: &str, d: &str| -> Result<String, String> {
-            if is_count(d) {
-                Ok(format!("{arm}:{d}"))
-            } else {
-                Ok(format!("{arm}:{}", duration_ms(d)?))
-            }
-        };
-        match split(s) {
-            ("block", None) => Ok("synchronize".into()),
-            ("event", None) => Ok("shared-event".into()),
-            ("event", Some(d)) => ms("shared-event-wait", d),
-            ("event-sleep", rest) => with_us("shared-event-sleep", rest),
-            ("event-listener", None) => Ok("shared-event-listener".into()),
-            ("event-listener", Some(d)) => ms("shared-event-listener", d),
-            _ => Ok(s.to_string()),
-        }
+        super::wait::COMPLETION_WAIT.to_stored(s)
     }
 
     pub fn completion_wait_to(s: &str, bare_wait_ms: u64) -> String {
@@ -627,14 +645,7 @@ pub mod v1 {
 
     /// `weights.experts.fetch.wait`: `sleep:<dur>` is stored as the µs count.
     pub fn fetch_wait_from(s: &str) -> Result<String, String> {
-        let lower = s.trim().to_ascii_lowercase();
-        let s = lower.as_str();
-        match split(s) {
-            ("sleep", None) => Ok("50".into()),
-            ("sleep", Some(d)) if is_count(d) => Ok(d.to_string()),
-            ("sleep", Some(d)) => Ok(duration_us(d)?.to_string()),
-            _ => Ok(s.to_string()),
-        }
+        super::wait::FETCH_WAIT.to_stored(s)
     }
 
     pub fn fetch_wait_to(s: &str) -> String {

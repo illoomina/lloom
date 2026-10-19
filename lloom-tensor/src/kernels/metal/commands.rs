@@ -683,7 +683,9 @@ impl Commands {
             &crate::memory_admission::AllocationContext,
         )>,
     ) -> Result<Self, MetalKernelError> {
-        let tuning = &crate::tuning::tuning().metal;
+        let tuning = crate::tuning::try_tuning()
+            .map_err(|error| MetalKernelError::InvalidInput(error.to_string()))?;
+        let tuning = &tuning.metal;
         let compute_per_buffer = tuning.compute_per_buffer;
 
         // `DESIGN.md` §13.5m. Absent -- which is every run that does not opt in
@@ -758,6 +760,9 @@ impl Commands {
         residency_set: Arc<ResidencySet>,
         completion_wait: CompletionWait,
     ) -> Result<Self, MetalKernelError> {
+        // Validate before selected() can initialize its legacy tuning cache.
+        crate::tuning::try_tuning()
+            .map_err(|error| MetalKernelError::InvalidInput(error.to_string()))?;
         Self::new_with(
             command_queue,
             residency_set,
@@ -775,6 +780,8 @@ impl Commands {
         completion_wait: CompletionWait,
         kind: CommandBufferKind,
     ) -> Result<Self, MetalKernelError> {
+        crate::tuning::try_tuning()
+            .map_err(|error| MetalKernelError::InvalidInput(error.to_string()))?;
         // SAFETY: queue installation borrows only. This constructor transfers
         // the SAME Arc into Core; no allAllocations extraction or out-of-band
         // residency mutation occurs here. This is not an alias terminality proof.

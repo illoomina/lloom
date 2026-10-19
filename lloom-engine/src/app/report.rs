@@ -285,9 +285,9 @@ fn print_census_and_phases(stats: &DecodeStats) {
         ("prefill", &stats.prefill_census),
         ("step 0", &stats.step0_census),
     ] {
-        if census.is_empty() {
+        let Some(census) = census else {
             continue;
-        }
+        };
         let total: u64 = census.iter().map(|(_, n)| n).sum();
         eprintln!(
             "[{name} census: {total} dispatches, {} kernels]",
@@ -454,13 +454,26 @@ pub fn print_rounds(stats: &DecodeStats, wanted: Wanted) {
     let rb_draft: u64 = timed.iter().map(|r| r.timing.draft_readbacks).sum();
     let rb_verify: u64 = timed.iter().map(|r| r.timing.verify_readbacks).sum();
     let rb_observe: u64 = timed.iter().map(|r| r.timing.observe_readbacks).sum();
-    let gpu_draft: f64 = timed.iter().map(|r| r.timing.draft_gpu_s * 1e3).sum();
-    let gpu_verify: f64 = timed.iter().map(|r| r.timing.verify_gpu_s * 1e3).sum();
-    let gpu_observe: f64 = timed.iter().map(|r| r.timing.observe_gpu_s * 1e3).sum();
+    let [gpu_draft, gpu_verify, gpu_observe] = round_gpu_sums_ms(timed);
     let disp_draft: u64 = timed.iter().map(|r| r.timing.draft_disp).sum();
     let disp_verify: u64 = timed.iter().map(|r| r.timing.verify_disp).sum();
     let disp_observe: u64 = timed.iter().map(|r| r.timing.observe_disp).sum();
     let profiled = disp_draft + disp_verify + disp_observe > 0;
+    let censuses = [
+        (
+            "draft",
+            timed.iter().find_map(|r| r.timing.draft_census.as_ref()),
+        ),
+        (
+            "verify",
+            timed.iter().find_map(|r| r.timing.verify_census.as_ref()),
+        ),
+        (
+            "observe",
+            timed.iter().find_map(|r| r.timing.observe_census.as_ref()),
+        ),
+    ];
+    let census_available = censuses.iter().all(|(_, c)| c.is_some());
     if wanted.verbose {
         eprintln!(
             "[dspark rounds: {} timed ({WARMUP_ROUNDS} warm-up dropped), {accepted} tokens accepted, \
@@ -524,10 +537,16 @@ pub fn print_rounds(stats: &DecodeStats, wanted: Wanted) {
             quantile(&walls, 0.99),
             quantile(&walls, 1.0)
         );
-        if profiled {
+        if let (Some(gpu_draft), Some(gpu_verify), Some(gpu_observe)) =
+            (gpu_draft, gpu_verify, gpu_observe)
+        {
             eprintln!("[dspark GPU-busy per round, ms (mean of union):  draft {:.3}   verify {:.3}   observe {:.3}   round {:.3}  — idle (wall−busy) {:.3}]",
                 gpu_draft / n, gpu_verify / n, gpu_observe / n, (gpu_draft + gpu_verify + gpu_observe) / n,
                 (sum_round - gpu_draft - gpu_verify - gpu_observe) / n);
+        } else if profiled {
+            eprintln!("[dspark GPU-busy per round and census unavailable; scalar dispatch counts retained]");
+        }
+        if profiled {
             eprintln!(
                 "[dspark dispatches per round (mean):  draft {:.1}   verify {:.1}   observe {:.1}]",
                 disp_draft as f64 / n,
@@ -536,52 +555,39 @@ pub fn print_rounds(stats: &DecodeStats, wanted: Wanted) {
             );
         }
     }
-    if profiled {
-        for (name, census) in [
-            (
-                "draft",
-                timed.iter().find_map(|r| r.timing.draft_census.as_ref()),
-            ),
-            (
-                "verify",
-                timed.iter().find_map(|r| r.timing.verify_census.as_ref()),
-            ),
-            (
-                "observe",
-                timed.iter().find_map(|r| r.timing.observe_census.as_ref()),
-            ),
-        ] {
-            if let Some(c) = census {
-                let total: u64 = c.iter().map(|(_, n)| n).sum();
-                eprintln!(
-                    "[dspark census {name} (one round, {total} dispatches, {} labels):",
-                    c.len()
-                );
-                for (label, count) in c {
-                    eprintln!("    {count:>6}  {label}");
-                }
-                eprintln!("]");
+    for (name, census) in censuses {
+        if let Some(c) = census {
+            let total: u64 = c.iter().map(|(_, n)| n).sum();
+            eprintln!(
+                "[dspark census {name} (one round, {total} dispatches, {} labels):",
+                c.len()
+            );
+            for (label, count) in c {
+                eprintln!("    {count:>6}  {label}");
             }
+            eprintln!("]");
         }
     }
+    let gpu_fields = round_gpu_machine_fields([
+        gpu_draft.map(|v| v / n),
+        gpu_verify.map(|v| v / n),
+        gpu_observe.map(|v| v / n),
+    ]);
     eprintln!(
         "DSPARK_ROUNDS rounds={} tokens={accepted} tokens_per_round={tokens_per_round:.4} \
          round_ms_median={med_round:.4} round_ms_mean={:.4} \
          draft_ms_median={med_draft:.4} verify_ms_median={med_verify:.4} observe_ms_median={med_observe:.4} \
          draft_ms_per_token={:.4} verify_ms_per_token={:.4} observe_ms_per_token={:.4} total_ms_per_token={:.4} \
-         draft_gpu_ms={:.4} verify_gpu_ms={:.4} observe_gpu_ms={:.4} \
+         {gpu_fields} \
          draft_disp={:.1} verify_disp={:.1} observe_disp={:.1} \
          draft_readbacks={:.3} verify_readbacks={:.3} observe_readbacks={:.3} \
-         phase_sync={phase_sync} profiled={profiled}",
+         phase_sync={phase_sync} profiled={profiled} census_available={census_available}",
         timed.len(),
         sum_round / n,
         sum_draft / e,
         sum_verify / e,
         sum_observe / e,
         sum_round / e,
-        gpu_draft / n,
-        gpu_verify / n,
-        gpu_observe / n,
         disp_draft as f64 / n,
         disp_verify as f64 / n,
         disp_observe as f64 / n,
@@ -589,6 +595,63 @@ pub fn print_rounds(stats: &DecodeStats, wanted: Wanted) {
         rb_verify as f64 / n,
         rb_observe as f64 / n,
     );
+}
+
+/// Cold machine-report fields. Availability is separate from scalar profiling;
+/// unavailable GPU intervals must not be emitted as measured numeric zeros.
+fn round_gpu_machine_fields(gpu_ms: [Option<f64>; 3]) -> String {
+    let recorder_available = gpu_ms.iter().all(Option::is_some);
+    format!("recorder_available={recorder_available} draft_gpu_ms={} verify_gpu_ms={} observe_gpu_ms={}",
+        super::common::profile_metric(gpu_ms[0]), super::common::profile_metric(gpu_ms[1]), super::common::profile_metric(gpu_ms[2]))
+}
+
+/// Any unsampled round makes that phase's aggregate unavailable. Do not infer
+/// measurement from global recorder capability or from scalar dispatch counts.
+fn round_gpu_sums_ms(rounds: &[lloom::nn::RoundStats]) -> [Option<f64>; 3] {
+    [
+        rounds
+            .iter()
+            .map(|r| r.timing.draft_gpu_s.map(|v| v * 1e3))
+            .sum(),
+        rounds
+            .iter()
+            .map(|r| r.timing.verify_gpu_s.map(|v| v * 1e3))
+            .sum(),
+        rounds
+            .iter()
+            .map(|r| r.timing.observe_gpu_s.map(|v| v * 1e3))
+            .sum(),
+    ]
+}
+
+#[cfg(test)]
+mod round_profile_render_tests {
+    use super::*;
+    #[test]
+    fn missing_gpu_intervals_render_unavailable_not_numeric_zero() {
+        assert_eq!(round_gpu_machine_fields([None,None,None]),"recorder_available=false draft_gpu_ms=unavailable verify_gpu_ms=unavailable observe_gpu_ms=unavailable");
+    }
+    #[test]
+    fn available_gpu_zero_and_nonzero_remain_observations() {
+        assert_eq!(round_gpu_machine_fields([Some(0.0),Some(1.25),Some(2.5)]),"recorder_available=true draft_gpu_ms=0.0000 verify_gpu_ms=1.2500 observe_gpu_ms=2.5000");
+    }
+    #[test]
+    fn one_unsampled_round_is_not_silently_summed_as_measured_zero() {
+        let mut a = lloom::nn::RoundStats::default();
+        a.timing.draft_gpu_s = Some(0.0);
+        a.timing.verify_gpu_s = Some(1.0);
+        a.timing.observe_gpu_s = Some(1.0);
+        a.timing.verify_disp = 5;
+        let mut b = a.clone();
+        b.timing.verify_gpu_s = None;
+        b.timing.observe_gpu_s = Some(2.0);
+        let sums = round_gpu_sums_ms(&[a, b]);
+        assert_eq!(sums, [Some(0.0), None, Some(3000.0)]);
+        let fields = round_gpu_machine_fields(sums);
+        assert!(fields.contains("recorder_available=false"));
+        assert!(fields.contains("verify_gpu_ms=unavailable"));
+        assert!(fields.contains("draft_gpu_ms=0.0000"));
+    }
 }
 
 /// The memory gauge's peaks over a run, in the `MEMPEAK` spelling: exact,
@@ -957,13 +1020,15 @@ fn print_churn(m: &lloom_tensor::MetalDevice, before: &ChurnSnapshot) {
 fn print_profile(stats: &DecodeStats, wall: std::time::Duration, call: std::time::Duration) {
     let s = lloom_tensor::kernels::metal::profile::snapshot();
     let steps = stats.steps.max(1) as f64;
-    // Exact only at `CANDLE_METAL_COMPUTE_PER_BUFFER=1` (one dispatch per
-    // buffer); at the default period a buffer is charged to its last kernel,
-    // and the `buffers` column says so.
-    {
-        let by = lloom_tensor::kernels::metal::profile::gpu_time_by_label_detailed();
-        let total: f64 = by.iter().map(|k| k.total_s).sum();
-        eprintln!(
+    let detailed = lloom_tensor::kernels::metal::profile::recorder_enabled();
+    if detailed {
+        // Exact only at `CANDLE_METAL_COMPUTE_PER_BUFFER=1` (one dispatch per
+        // buffer); at the default period a buffer is charged to its last kernel,
+        // and the `buffers` column says so.
+        {
+            let by = lloom_tensor::kernels::metal::profile::gpu_time_by_label_detailed();
+            let total: f64 = by.iter().map(|k| k.total_s).sum();
+            eprintln!(
             "[profile: gpu time by kernel ({} labels, {:.3} ms/step summed over {:.0} buffers/step; \
              exact iff one dispatch per buffer. **p50 is the honest per-buffer figure**: a buffer's \
              interval bounds its RESIDENCY, so max >> p50 means that buffer absorbed a host wait and \
@@ -972,21 +1037,21 @@ fn print_profile(stats: &DecodeStats, wall: std::time::Duration, call: std::time
             1e3 * total / steps,
             by.iter().map(|k| k.buffers as f64).sum::<f64>() / steps
         );
-        for k in by.iter().take(24) {
-            // Two shapes: a buffer resident for milliseconds on EVERY step
-            // (tight distribution, high p50) holds something open across the
-            // step — a host round-trip, a sync — and its total is that hold;
-            // a single buffer absorbing one wait shows as max >> p50.
-            let held = k.p50_s > 1e-3;
-            let spiky = k.max_s > 8.0 * k.p50_s.max(1e-9) && k.max_s > 1e-3;
-            let flag = if held {
-                "  <-- HELD OPEN every step: residency, not compute"
-            } else if spiky {
-                "  <-- one buffer absorbed a wait"
-            } else {
-                ""
-            };
-            eprintln!(
+            for k in by.iter().take(24) {
+                // Two shapes: a buffer resident for milliseconds on EVERY step
+                // (tight distribution, high p50) holds something open across the
+                // step — a host round-trip, a sync — and its total is that hold;
+                // a single buffer absorbing one wait shows as max >> p50.
+                let held = k.p50_s > 1e-3;
+                let spiky = k.max_s > 8.0 * k.p50_s.max(1e-9) && k.max_s > 1e-3;
+                let flag = if held {
+                    "  <-- HELD OPEN every step: residency, not compute"
+                } else if spiky {
+                    "  <-- one buffer absorbed a wait"
+                } else {
+                    ""
+                };
+                eprintln!(
                 "    {:>8.3} ms/step  {:>6.1} buf/step  p50 {:>7.1} / p99 {:>8.1} / max {:>8.1} µs/buf  {}{}",
                 1e3 * k.total_s / steps,
                 k.buffers as f64 / steps,
@@ -996,34 +1061,38 @@ fn print_profile(stats: &DecodeStats, wall: std::time::Duration, call: std::time
                 k.label,
                 flag
             );
+            }
+            eprintln!("]");
         }
-        eprintln!("]");
-    }
-    eprintln!(
-        "[profile: gpu_busy {:.3} ms/step (union over {} command buffers, {} timed), \
+        eprintln!(
+            "[profile: gpu_busy {:.3} ms/step (union over {} command buffers, {} timed), \
          {:.1} dispatches/step, {} steps]",
-        1e3 * s.gpu_busy_union_s / steps,
-        s.command_buffers,
-        s.timed_command_buffers,
-        s.dispatches as f64 / steps,
-        stats.steps,
-    );
-    // `1 − busy/wall` bounds the time no command buffer was executing from
-    // above: a buffer stalled on a fence inside its interval counts as busy.
-    let wall = wall.as_secs_f64();
-    eprintln!(
-        "[profile: gpu_busy_union {:.4} s / decode_wall {:.4} s = {:.4} busy/wall; \
+            1e3 * s.gpu_busy_union_s / steps,
+            s.command_buffers,
+            s.timed_command_buffers,
+            s.dispatches as f64 / steps,
+            stats.steps,
+        );
+        // `1 − busy/wall` bounds the time no command buffer was executing from
+        // above: a buffer stalled on a fence inside its interval counts as busy.
+        let wall = wall.as_secs_f64();
+        eprintln!(
+            "[profile: gpu_busy_union {:.4} s / decode_wall {:.4} s = {:.4} busy/wall; \
          gpu_span {:.4} s; gpu_busy_sum {:.4} s; decode_wall runs to the device's drain, the \
          call returned at {:.4} s]",
-        s.gpu_busy_union_s,
-        wall,
-        s.gpu_busy_union_s / wall.max(1e-9),
-        s.gpu_span_s,
-        s.gpu_busy_sum_s,
-        call.as_secs_f64(),
-    );
-    if lloom_tensor::kernels::metal::profile::counters_enabled() {
-        print_encoder_counters(&s);
+            s.gpu_busy_union_s,
+            wall,
+            s.gpu_busy_union_s / wall.max(1e-9),
+            s.gpu_span_s,
+            s.gpu_busy_sum_s,
+            call.as_secs_f64(),
+        );
+        if lloom_tensor::kernels::metal::profile::counters_enabled() {
+            print_encoder_counters(&s);
+        }
+    } else {
+        eprintln!("[profile: GPU timing, per-label census and idle gaps unavailable; {} dispatches ({:.1}/step), {} command buffers, {} encoders; {} steps]",
+            s.dispatches, s.dispatches as f64 / steps, s.command_buffers, s.encoders, stats.steps);
     }
     eprintln!(
         "[profile: cb lifecycle on the hot thread: {:.1} commits/step at {:.1} µs each = \
@@ -1037,7 +1106,9 @@ fn print_profile(stats: &DecodeStats, wall: std::time::Duration, call: std::time
         s.prune_ns as f64 / 1e3 / s.prunes.max(1) as f64,
         s.prune_ns as f64 / 1e6 / steps,
     );
-    print_idle_gaps(&s, stats, wall);
+    if detailed {
+        print_idle_gaps(&s, stats, wall.as_secs_f64());
+    }
 }
 
 /// Per-kernel GPU time from the counter-sampled encoders
@@ -1559,11 +1630,14 @@ impl OutputFlow {
 
 /// Start recording every dispatch for [`print_trace_census`] when
 /// `CANDLE_METAL_TRACE` asks for it; off, a dispatch pays one `OnceLock` read.
-pub fn arm_trace() {
+pub fn arm_trace() -> anyhow::Result<()> {
+    #[cfg(feature = "metal")]
+    lloom_tensor::tuning::try_tuning()?;
     #[cfg(feature = "metal")]
     if lloom_tensor::kernels::metal::trace::trace_requested() {
-        lloom_tensor::kernels::metal::trace::set_recording(true);
+        lloom_tensor::kernels::metal::trace::set_recording(true)?;
     }
+    Ok(())
 }
 
 /// The command-buffer cut policy in force, read back from the device rather

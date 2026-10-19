@@ -1,0 +1,100 @@
+[
+  {
+    "name": "below one",
+    "bits": "3fefffffffffffff",
+    "accept32": false,
+    "accept64": false,
+    "stored64": null
+  },
+  {
+    "name": "one",
+    "bits": "3ff0000000000000",
+    "accept32": true,
+    "accept64": true,
+    "stored64": "1"
+  },
+  {
+    "name": "above one fractional",
+    "bits": "3ff0000000000001",
+    "accept32": false,
+    "accept64": false,
+    "stored64": null
+  },
+  {
+    "name": "below 2^32",
+    "bits": "41efffffffffffff",
+    "accept32": false,
+    "accept64": false,
+    "stored64": null
+  },
+  {
+    "name": "2^32",
+    "bits": "41f0000000000000",
+    "accept32": false,
+    "accept64": true,
+    "stored64": "4294967296"
+  },
+  {
+    "name": "2^53 previous",
+    "bits": "433fffffffffffff",
+    "accept32": false,
+    "accept64": true,
+    "stored64": "9007199254740991"
+  },
+  {
+    "name": "2^53",
+    "bits": "4340000000000000",
+    "accept32": false,
+    "accept64": true,
+    "stored64": "9007199254740992"
+  },
+  {
+    "name": "2^53 next",
+    "bits": "4340000000000001",
+    "accept32": false,
+    "accept64": true,
+    "stored64": "9007199254740994"
+  },
+  {
+    "name": "below 2^64",
+    "bits": "43efffffffffffff",
+    "accept32": false,
+    "accept64": true,
+    "stored64": "18446744073709549568"
+  },
+  {
+    "name": "2^64",
+    "bits": "43f0000000000000",
+    "accept32": false,
+    "accept64": false,
+    "stored64": null
+  },
+  {
+    "name": "above 2^64",
+    "bits": "43f0000000000001",
+    "accept32": false,
+    "accept64": false,
+    "stored64": null
+  },
+  {
+    "name": "negative one",
+    "bits": "bff0000000000000",
+    "accept32": false,
+    "accept64": false,
+    "stored64": null
+  },
+  {
+    "name": "negative zero",
+    "bits": "8000000000000000",
+    "accept32": false,
+    "accept64": false,
+    "stored64": null
+  },
+  {
+    "name": "positive zero",
+    "bits": "0000000000000000",
+    "accept32": false,
+    "accept64": false,
+    "stored64": null
+  }
+]

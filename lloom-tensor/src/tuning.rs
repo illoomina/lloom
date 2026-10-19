@@ -26,6 +26,137 @@ use lloom_macros::Options;
 use serde::{Deserialize, Serialize};
 use std::sync::OnceLock;
 
+/// Whether optional attribution machinery is compiled into this tensor build.
+pub const PROFILE_INSTRUMENTS: bool = cfg!(any(debug_assertions, feature = "profile"));
+
+/// Require the detailed Metal recorder at a cold consumer boundary.
+/// This does not enable profiling or reject scalar-only profiling requests.
+/// The capability/key come from the existing generated instrument declaration.
+pub fn require_profile_recorder() -> Result<(), TuningSetupError> {
+    let meta = crate::options::meta_at(InstrumentTuning::META, "profile")
+        .expect("profile is declared by the generated instrument schema");
+    if !cfg!(feature = "metal") || !PROFILE_INSTRUMENTS {
+        return Err(TuningSetupError::NotCompiled {
+            key: meta.path,
+            capability: if cfg!(feature = "metal") {
+                meta.needs
+            } else {
+                "metal"
+            },
+        });
+    }
+    Ok(())
+}
+
+/// An ordinary setup refusal, distinct from a backend invariant failure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TuningSetupError {
+    AlreadyRead,
+    InvalidEnvironment(String),
+    NotCompiled {
+        key: &'static str,
+        capability: &'static str,
+    },
+}
+
+impl std::fmt::Display for TuningSetupError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::AlreadyRead => f.write_str("tuning: the tensor crate's knobs were already read before install"),
+            Self::InvalidEnvironment(reason) => write!(f, "tuning: {reason}"),
+            Self::NotCompiled { key, capability } => write!(f,
+                "{key}: {capability} instrumentation is not compiled; rebuild with cargo build --profile release-with-debug -p lloom-tensor --features metal,profile"),
+        }
+    }
+}
+impl std::error::Error for TuningSetupError {}
+
+/// A failed install retains the incoming configuration, unchanged.
+#[derive(Debug)]
+pub struct InstallError {
+    pub reason: TuningSetupError,
+    tuning: Box<Tuning>,
+}
+impl InstallError {
+    pub fn into_tuning(self) -> Tuning {
+        *self.tuning
+    }
+}
+impl std::fmt::Display for InstallError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.reason.fmt(f)
+    }
+}
+impl std::error::Error for InstallError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.reason)
+    }
+}
+
+/// Validate one direct instrumentation request against its generated declaration.
+pub(crate) fn check_profile_request(storage: &str, on: bool) -> Result<(), TuningSetupError> {
+    let meta = crate::options::meta_at(InstrumentTuning::META, storage)
+        .expect("instrument control must name its generated option");
+    if on && !PROFILE_INSTRUMENTS && meta.needs == "profile" && meta.needs_part.is_empty() {
+        return Err(TuningSetupError::NotCompiled {
+            key: meta.path,
+            capability: meta.needs,
+        });
+    }
+    Ok(())
+}
+
+/// Legacy cached status means effectively active, not merely requested.
+/// An unavailable request is reported once by each caller's status cache;
+/// primary control/setup APIs return the typed error instead.
+#[cfg(feature = "metal")]
+pub(crate) fn effective_instrument(storage: &str, requested: bool) -> bool {
+    match check_profile_request(storage, requested) {
+        Ok(()) => requested,
+        Err(error) => {
+            eprintln!("{error}");
+            false
+        }
+    }
+}
+
+impl Tuning {
+    /// Cold setup/legacy-cache notice, generated from the same partial-capability
+    /// metadata as the engine. No notice or side effect in diagnostic builds.
+    pub(crate) fn note_partial_instruments(&self) {
+        if PROFILE_INSTRUMENTS || self.instrument == InstrumentTuning::default() {
+            return;
+        }
+        static NOTED: std::sync::Once = std::sync::Once::new();
+        NOTED.call_once(|| {
+            let values = serde_json::to_value(&self.instrument).expect("instrument group serializes");
+            let defaults = serde_json::to_value(InstrumentTuning::default()).expect("instrument defaults serialize");
+            for meta in InstrumentTuning::META {
+                if meta.needs == "profile" && !meta.needs_part.is_empty()
+                    && values.get(meta.key) != defaults.get(meta.key) {
+                    eprintln!("[diagnostics] {}: {} require profile instrumentation absent from this build; remaining scalar output is available; rebuild with cargo build --profile release-with-debug -p lloom-tensor --features metal,profile",meta.path,meta.needs_part);
+                }
+            }
+        });
+    }
+
+    /// Reject unavailable whole instruments, preserving partial scalar-counter routes.
+    pub fn validate_instruments(&self) -> Result<(), TuningSetupError> {
+        if PROFILE_INSTRUMENTS || self.instrument == InstrumentTuning::default() {
+            return Ok(());
+        }
+        let values = serde_json::to_value(&self.instrument).expect("instrument group serializes");
+        let defaults = serde_json::to_value(InstrumentTuning::default())
+            .expect("instrument defaults serialize");
+        for meta in InstrumentTuning::META {
+            if values.get(meta.key) != defaults.get(meta.key) {
+                check_profile_request(meta.key, true)?;
+            }
+        }
+        Ok(())
+    }
+}
+
 static TUNING: OnceLock<Tuning> = OnceLock::new();
 
 /// The determinism contract a run is held to (`--profile`, `LLOOM_PROFILE`;
@@ -390,7 +521,7 @@ pub fn pin_contract(c: Contract) -> Result<Contract, String> {
         t.contract.profile = c.name().to_string();
     }
     let pinned = Contract::parse(&t.contract.profile)?;
-    install(t).map_err(|_| "pin_contract: the tuning was read before the pin".to_string())?;
+    install(t).map_err(|e| e.to_string())?;
     CONTRACT_PINNED.store(true, std::sync::atomic::Ordering::Relaxed);
     Ok(pinned)
 }
@@ -488,12 +619,47 @@ pub fn tuning() -> &'static Tuning {
     TUNING.get_or_init(|| from_process_env().unwrap_or_else(|e| panic!("tuning: {e}")))
 }
 
-/// Install the group for the process, before anything reads it. `Err` hands
-/// the group back if a read already happened (the knobs a `OnceLock` site
-/// took are fixed; installing after would make the report line lie).
-pub fn install(t: Tuning) -> Result<(), Tuning> {
+/// Resolve and validate library setup before creating backend resources.
+/// Failures do not install a group or claim test isolation. An earlier legacy
+/// `tuning()` read is also checked, never silently replaced.
+pub fn try_tuning() -> Result<&'static Tuning, TuningSetupError> {
+    if let Some(t) = TUNING.get() {
+        t.validate_instruments()?;
+        t.note_partial_instruments();
+        return Ok(t);
+    }
+    let t = from_process_env().map_err(TuningSetupError::InvalidEnvironment)?;
+    t.validate_instruments()?;
+    let installed = TUNING.get_or_init(|| t);
+    installed.validate_instruments()?;
+    installed.note_partial_instruments();
+    Ok(installed)
+}
+
+/// Install before first use. Refusal returns the original configuration and
+/// a typed reason; an unsupported request has no global/isolation side effects.
+pub fn install(t: Tuning) -> Result<(), InstallError> {
+    let reason = if TUNING.get().is_some() {
+        Some(TuningSetupError::AlreadyRead)
+    } else {
+        t.validate_instruments().err()
+    };
+    if let Some(reason) = reason {
+        return Err(InstallError {
+            reason,
+            tuning: Box::new(t),
+        });
+    }
     crate::isolation::claim("lloom_tensor::tuning");
-    TUNING.set(t)
+    TUNING.set(t).map_err(|t| InstallError {
+        reason: TuningSetupError::AlreadyRead,
+        tuning: Box::new(t),
+    })?;
+    TUNING
+        .get()
+        .expect("successful tuning installation")
+        .note_partial_instruments();
+    Ok(())
 }
 
 /// Whether [`install`] (or a first read) has already fixed the group.
@@ -1077,7 +1243,7 @@ pub struct MetalTuning {
     #[opt(flag = "metal-api", env = "LLOOM_METAL_API", parser = "parse_command_api", variants = ["metal3", "metal4", "auto"], path = "backend.metal.command_buffer.api", status = "arm", flows = ["commands-out"])]
     pub command_api: String,
     /// How the host waits for a command buffer: `block` (the blocking wait), `event` (park on the buffer's shared event), `event:<dur>` (the same, timed out after whole milliseconds), `event-sleep[:<dur>]` (poll the event, sleeping between looks), `event-listener[:<dur>]` (an event listener, timed out). The older spellings `synchronize`, `shared-event`, `shared-event-wait[:ms]`, `shared-event-sleep[:µs]`, `shared-event-listener[:ms]` are the same arms.
-    #[opt(flag = "completion-wait", env = "CANDLE_METAL_COMPLETION_WAIT", parser = "parse_completion_wait", variants = ["synchronize", "shared-event", "shared-event-sleep[:µs]", "shared-event-wait[:ms]", "shared-event-listener[:ms]"], path = "backend.metal.completion_wait", status = "arm", facets = ["wait"], flows = ["token-out", "prompt-in", "commands-out"], forms = ["block", "event", "event-sleep", "event-listener"], from_v1 = "crate::options::v1::completion_wait_from", to_v1 = "completion_wait_to", schema = "Wait")]
+    #[opt(flag = "completion-wait", env = "CANDLE_METAL_COMPLETION_WAIT", parser = "parse_completion_wait", variants = ["synchronize", "shared-event", "shared-event-sleep[:µs]", "shared-event-wait[:ms]", "shared-event-listener[:ms]"], path = "backend.metal.completion_wait", status = "arm", facets = ["wait"], flows = ["token-out", "prompt-in", "commands-out"], forms = ["block", "event", "event-sleep", "event-listener"], from_v1 = "crate::options::v1::completion_wait_from", to_v1 = "completion_wait_to", schema = "Wait", grammar = "crate::options::wait::COMPLETION_WAIT")]
     pub completion_wait: String,
     /// Dispatches per command buffer on the blocking loop and the prefill (the cut period).
     #[opt(flag = "compute-per-buffer",
@@ -1341,7 +1507,7 @@ pub struct InstrumentTuning {
         status = "instrument",
         cli = "gpu-profile",
         needs = "profile",
-        needs_part = "the step-0 dispatch census"
+        needs_part = "per-label census, command-buffer intervals and sampled encoder data"
     )]
     pub profile: bool,
     /// Under `profile`: time every compute encoder with stage-boundary counter samples.
@@ -1350,7 +1516,8 @@ pub struct InstrumentTuning {
         env = "CANDLE_METAL_PROFILE_COUNTERS",
         bool,
         path = "diagnostics.gpu_profile.counters",
-        status = "instrument"
+        status = "instrument",
+        needs = "profile"
     )]
     pub profile_counters: bool,
     /// Under `profile`: end the compute encoder after every dispatch, so each counter-sampled encoder is one kernel (an arm: a seam per dispatch).
@@ -1359,7 +1526,8 @@ pub struct InstrumentTuning {
         env = "CANDLE_METAL_PROFILE_ENCODER_PER_DISPATCH",
         bool,
         path = "diagnostics.gpu_profile.encoder_per_dispatch",
-        status = "instrument"
+        status = "instrument",
+        needs = "profile"
     )]
     pub profile_encoder_per_dispatch: bool,
     /// The dispatch trace recorder (kernel, grid, threadgroup, barrier, encoder per dispatch).
@@ -1369,6 +1537,7 @@ pub struct InstrumentTuning {
         bool,
         path = "diagnostics.trace.dispatch",
         status = "instrument",
+        needs = "profile",
         cli = "trace"
     )]
     pub trace: bool,
@@ -1378,7 +1547,8 @@ pub struct InstrumentTuning {
         env = "LLOOM_POOL_TRACE",
         bool,
         path = "diagnostics.trace.pool",
-        status = "instrument"
+        status = "instrument",
+        needs = "profile"
     )]
     pub pool_trace: bool,
     /// Attribute every pool request a served pass makes to the model call site that made it (a backtrace per request; the residue of `served_pass_pool_requests`, §9.2aa).
@@ -1387,11 +1557,12 @@ pub struct InstrumentTuning {
         env = "LLOOM_SERVED_REQUEST_TRACE",
         bool,
         path = "diagnostics.trace.served_requests",
-        status = "instrument"
+        status = "instrument",
+        needs = "profile"
     )]
     pub served_request_trace: bool,
     /// Attribute every host readback (`to_cpu`'s fast and blit paths, a staged read's stage, a host-read slot's read) to the model call site that made it (a backtrace per readback, #814 part 5).
-    #[opt(flag = "readback-trace", env = "LLOOM_READBACK_TRACE", bool, path = "diagnostics.trace.readbacks", status = "instrument", flows = ["token-out"])]
+    #[opt(flag = "readback-trace", env = "LLOOM_READBACK_TRACE", bool, path = "diagnostics.trace.readbacks", status = "instrument", needs = "profile", flows = ["token-out"])]
     pub readback_trace: bool,
     /// Shadow every host upload and check it back (the #748 corruption instrument).
     #[opt(
@@ -1412,7 +1583,7 @@ pub struct InstrumentTuning {
         path = "diagnostics.gpu_profile.dump",
         status = "instrument",
         needs = "profile",
-        needs_part = "the steps table's host step time column"
+        needs_part = "per-label and interval tables, sampled encoder data, and the steps table's host step time column"
     )]
     pub profile_dump: Option<String>,
 }
@@ -1747,5 +1918,61 @@ mod tests {
         sorted.sort_unstable();
         sorted.dedup();
         assert_eq!(sorted.len(), aliases.len(), "no two knobs share a variable");
+    }
+}
+
+#[cfg(test)]
+mod diagnostic_build_tests {
+    #[test]
+    fn an_explicit_detail_requirement_uses_the_generated_capability_without_setup() {
+        let meta = crate::options::meta_at(super::InstrumentTuning::META, "profile").unwrap();
+        let result = super::require_profile_recorder();
+        if cfg!(feature = "metal") && super::PROFILE_INSTRUMENTS {
+            result.unwrap();
+        } else {
+            assert_eq!(
+                result,
+                Err(super::TuningSetupError::NotCompiled {
+                    key: meta.path,
+                    capability: if cfg!(feature = "metal") {
+                        meta.needs
+                    } else {
+                        "metal"
+                    },
+                })
+            );
+        }
+        // A cold requirement must not freeze tuning or turn the recorder on.
+        super::install(super::Tuning::default()).unwrap();
+    }
+
+    #[test]
+    fn an_unavailable_direct_attribution_request_is_loud() {
+        assert!(super::check_profile_request("served_request_trace", false).is_ok());
+        assert_eq!(
+            super::check_profile_request("served_request_trace", true).is_ok(),
+            super::PROFILE_INSTRUMENTS
+        );
+    }
+
+    #[test]
+    fn whole_instruments_refuse_but_partial_counts_remain_usable() {
+        let mut t = super::Tuning::default();
+        assert!(t.validate_instruments().is_ok());
+        t.instrument.profile = true;
+        assert!(t.validate_instruments().is_ok());
+        t.instrument.trace = true;
+        assert_eq!(t.validate_instruments().is_ok(), super::PROFILE_INSTRUMENTS);
+    }
+
+    #[test]
+    fn install_returns_incoming_payload_and_preserves_already_read() {
+        let t = super::Tuning::default();
+        super::install(t.clone()).unwrap();
+        let mut incoming = t;
+        incoming.instrument.trace = true;
+        let error = super::install(incoming.clone()).unwrap_err();
+        assert_eq!(error.reason, super::TuningSetupError::AlreadyRead);
+        assert_eq!(error.into_tuning(), incoming);
     }
 }

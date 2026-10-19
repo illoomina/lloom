@@ -283,13 +283,16 @@ impl ReadbackArm {
 #[derive(Debug, Clone)]
 pub struct DecodeParams {
     pub seed: u64,
-    /// `None` (or `< 1e-7`) is greedy argmax; `Some(t)` samples at temperature
-    /// `t`, with `top_p` when set. Matches [`LogitsProcessor::new`].
+    /// `None` (or `< 1e-7`) is greedy argmax; `Some(t)` samples at
+    /// temperature `t`. The four sampling fields resolve together through
+    /// [`Self::sampling`].
     pub temperature: Option<f64>,
+    /// Nucleus mass in [0, 1]: 1 is off, 0 keeps the top token.
     pub top_p: Option<f64>,
-    /// Top-k, with `top_p` top-k-then-top-p (`Sampling::TopK` / `TopKThenTopP`).
+    /// Exactly k candidates; 0 (or at least the vocabulary) is off.
     pub top_k: Option<usize>,
-    /// Device gumbel-max at the temperature (`Sampling::GumbelSoftmax`).
+    /// Gumbel-max at the temperature, over the filtered support when a
+    /// filter is set (`Sampling::GumbelSoftmax`, `Sampling::FilteredGumbel`).
     pub gumbel: bool,
     /// Logit bias, the repetition / presence / frequency penalties and
     /// min-p, run before the draw (`lloom::generation::processors`); the
@@ -350,37 +353,11 @@ pub struct LogprobRequest {
 }
 
 impl DecodeParams {
-    /// Infallible compatibility entry. Valid fields share `Sampling::resolve`;
-    /// invalid fields retain their previous mapping. Admission uses
-    /// [`Self::try_sampling_of`] instead of turning invalid fields into a draw.
+    /// The sampler arm these request fields name: [`Sampling::resolve`], the
+    /// one entry point (`docs/dispatch.md` §11.2j). Every field is validated
+    /// whether or not the arm reads it, so a bad field is refused by name
+    /// rather than resolved to some other draw.
     pub fn sampling_of(
-        temperature: Option<f64>,
-        top_p: Option<f64>,
-        top_k: Option<usize>,
-        gumbel: bool,
-    ) -> Sampling {
-        if let Ok(resolved) = Self::try_sampling_of(temperature, top_p, top_k, gumbel) {
-            return resolved;
-        }
-        // Infallible public compatibility entry: retain its old invalid-field
-        // mapping. Production admission uses the fallible entry before mutation.
-        let temperature = match temperature {
-            Some(t) if t >= 1e-7 => t,
-            _ => return Sampling::ArgMax,
-        };
-        if gumbel {
-            return Sampling::GumbelSoftmax { temperature };
-        }
-        match (top_k, top_p) {
-            (Some(k), Some(p)) => Sampling::TopKThenTopP { k, p, temperature },
-            (Some(k), None) => Sampling::TopK { k, temperature },
-            (None, Some(p)) => Sampling::TopP { p, temperature },
-            (None, None) => Sampling::All { temperature },
-        }
-    }
-
-    /// Validated request fields, including fields a greedy draw does not read.
-    pub fn try_sampling_of(
         temperature: Option<f64>,
         top_p: Option<f64>,
         top_k: Option<usize>,
@@ -389,13 +366,16 @@ impl DecodeParams {
         Sampling::resolve(temperature, top_k, top_p, gumbel)
     }
 
-    pub fn try_sampling(&self) -> Result<Sampling> {
-        Self::try_sampling_of(self.temperature, self.top_p, self.top_k, self.gumbel)
+    /// The sampler arm of this request ([`Self::sampling_of`]).
+    pub fn sampling(&self) -> Result<Sampling> {
+        Self::sampling_of(self.temperature, self.top_p, self.top_k, self.gumbel)
     }
 
-    pub fn try_sampler(&self) -> Result<LogitsProcessor> {
+    /// The request's sampler: its arm, its processors and the digest, each
+    /// validated before any sequence state moves.
+    pub fn sampler(&self) -> Result<LogitsProcessor> {
         self.processors.validate().map_err(lloom_tensor::Error::msg)?;
-        Ok(LogitsProcessor::from_sampling(self.seed, self.try_sampling()?)
+        Ok(LogitsProcessor::from_sampling(self.seed, self.sampling()?)
             .with_processors(self.processors.clone())
             .with_logits_digest(self.logits_digest))
     }
@@ -414,25 +394,12 @@ impl DecodeParams {
         }
     }
 
-    /// The sampler arm of this request.
-    pub fn sampling(&self) -> Sampling {
-        Self::sampling_of(self.temperature, self.top_p, self.top_k, self.gumbel)
-    }
-
-    /// Infallible compatibility constructor; request admission uses
-    /// [`Self::try_sampler`] before changing sequence state.
-    pub fn sampler(&self) -> LogitsProcessor {
-        LogitsProcessor::from_sampling(self.seed, self.sampling())
-            .with_processors(self.processors.clone())
-            .with_logits_digest(self.logits_digest)
-    }
-
     /// Refuse what `body` cannot serve of this request, by name — the one
     /// table every body asks (`lloom::nn::decode::refuse`); `path` names the
     /// caller in the message.
     pub fn refuse_on(&self, body: lloom::nn::Body, path: &str) -> Result<()> {
         self.processors.validate().map_err(lloom_tensor::Error::msg)?;
-        let sampling = self.try_sampling()?;
+        let sampling = self.sampling()?;
         lloom::nn::refuse(
             body,
             &lloom::nn::Asks {
@@ -495,6 +462,9 @@ pub struct Decoded {
     /// The readback arm that ran: resolved (never [`ReadbackArm::Auto`]), and
     /// on the fixed cadence wherever the adaptive commit did not run.
     pub readback: ReadbackArm,
+    /// The sampler arm that drew the tokens, as the request's fields resolved
+    /// ([`DecodeParams::sampling`]).
+    pub sampling: Sampling,
     /// The run's logits digest, when `DecodeParams::logits_digest` asked for
     /// one.
     pub logits_sha256: Option<String>,
@@ -830,7 +800,8 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
         if params.eos_ids.is_empty() {
             lloom_tensor::bail!("DecodeSession::decode: eos_ids is empty; a run needs an EOS set");
         }
-        let mut sampler = params.try_sampler()?;
+        let mut sampler = params.sampler()?;
+        let sampling = sampler.sampling().clone();
         let arm = if params.logits_digest || params.logprobs.is_some() {
             ReadbackArm::Blocking
         } else {
@@ -1051,6 +1022,7 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
             checkpoint,
             checkpoint_at,
             readback: ran,
+            sampling,
             logits_sha256: sampler.logits_digest(),
             stats: out.stats,
             thinking,
@@ -1130,8 +1102,9 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
         // before it) and the logits digest (over the rows the round keeps)
         // are the K=1 loop's, row for row (`LogitsProcessor::window_draw_device`).
         let mut sampler = params
-            .try_sampler()?
+            .sampler()?
             .with_window_budget(params.thinking.as_ref());
+        let sampling = sampler.sampling().clone();
         sampler.observe_prompt(prompt_ids);
         // A prompt the cache holds whole re-feeds its last token: the first
         // round needs the target's probe there, which held logits lack.
@@ -1216,6 +1189,7 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
             checkpoint,
             checkpoint_at,
             readback: ReadbackArm::Speculative { k },
+            sampling,
             logits_sha256: sampler.logits_digest(),
             stats: out.stats,
             thinking,
@@ -2586,7 +2560,7 @@ mod tests {
                                 );
                                 if device.is_metal() {
                                     let resolved = config.readback.arm().resolve(
-                                        &DecodeParams::sampling_of(Some(t), p, None, false),
+                                        &DecodeParams::sampling_of(Some(t), p, None, false).unwrap(),
                                         config.readback.ring_arm(),
                                     );
                                     assert_eq!(got.readback, resolved, "{at}: the reply reports another arm than the options resolve to");

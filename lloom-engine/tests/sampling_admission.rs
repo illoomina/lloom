@@ -60,9 +60,8 @@ fn method_temperature_filter_matrix_reaches_one_body_table() -> Result<()> {
                         ..Default::default()
                     };
                     assert_eq!(Sampling::resolve(t, k, p, gumbel)?, expected);
-                    assert_eq!(params.try_sampling()?, expected);
-                    assert_eq!(params.sampling(), expected);
-                    assert_eq!(params.try_sampler()?.sampling(), &expected);
+                    assert_eq!(params.sampling()?, expected);
+                    assert_eq!(params.sampler()?.sampling(), &expected);
                     assert_eq!(
                         LogitsProcessor::from_sampling(7, expected.clone()).sampling(),
                         &expected
@@ -73,7 +72,7 @@ fn method_temperature_filter_matrix_reaches_one_body_table() -> Result<()> {
                     options.sampling.top_p = p;
                     options.sampling.gumbel = gumbel;
                     options.check().unwrap();
-                    assert_eq!(options.sampling.sampling(), expected);
+                    assert_eq!(options.sampling.sampling().unwrap(), expected);
                     let host = hot && (active_k || active_p);
                     let asks = Asks::sampling(&expected);
                     assert_eq!(refuse(Body::Step { ring: true }, &asks).is_err(), host);
@@ -254,7 +253,7 @@ fn actual_config_merge_preserves_numeric_string_and_readback_shorthand_grammar()
         assert_eq!(result.is_ok(), allowed, "{value}: {result:?}");
         if allowed {
             assert!(matches!(
-                options.sampling.sampling(),
+                options.sampling.sampling().unwrap(),
                 Sampling::FilteredGumbel { .. }
             ));
         }

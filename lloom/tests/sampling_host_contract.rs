@@ -1,5 +1,6 @@
-//! Finite CPU controls through the public scalar/window/processor consumers.
-//! Source-only increment: these tests have not been compiled or run.
+//! The host sampler held to the §11.2j contract through its public scalar,
+//! window and processor consumers, against the f32 reference
+//! (`lloom-tensor/tests/sampling_contract/oracle.rs`).
 use lloom::generation::{
     Blocking, LogitsProcessor, Processors, ReadbackStrategy, Sampling, ThinkingBudget, GREEDY_BELOW,
 };
@@ -522,5 +523,221 @@ fn unfiltered_gumbel_device_return_preserves_multirow_shape_and_flattened_noise_
     }).collect();
     matrix.at_position(Some(pos));
     assert_eq!(matrix.sample_argmax_on_device(&rows)?.to_vec1::<u32>()?, expected);
+    Ok(())
+}
+
+/// The draws of the public sampler at positions `0..n`, each with the
+/// position's keyed uniform, alongside the reference's draw for the same
+/// uniform.
+fn public_draws(arm: Sampling, z: &[f32], seed: u64, n: u64) -> Result<Vec<u32>> {
+    let row = Tensor::new(z, &Device::Cpu)?;
+    let mut s = LogitsProcessor::from_sampling(seed, arm);
+    (0..n)
+        .map(|pos| {
+            s.at_position(Some(pos));
+            s.sample(&row)
+        })
+        .collect()
+}
+
+fn arm(params: oracle::Params) -> Sampling {
+    Sampling::TopKThenTopP {
+        temperature: params.temperature,
+        k: params.k,
+        p: params.p,
+    }
+}
+
+/// Every edge the contract names, one row each, through the public scalar
+/// sampler: the kept set is written out by hand from §11.2j (and the
+/// reference must agree), the set the public draws visit is exactly that
+/// set, and every draw is the reference's draw for its uniform.
+#[test]
+fn every_named_edge_keeps_the_hand_derived_set_through_the_public_sampler() -> Result<()> {
+    use oracle::{kept_ids, Params};
+    // Scores in ≺ order: 0 (2.0), 1 and 2 tied (1.5), 3 (1.0), 4 and 5 tied
+    // (0.5), 6 (0.0), 7 (-1.0). V = 8.
+    let z = [2.0f32, 1.5, 1.5, 1.0, 0.5, 0.5, 0.0, -1.0];
+    let all: Vec<u32> = (0..8).collect();
+    // Weights 1, e^-1 four times: mass 2.47, the first id 0.405 of it, the
+    // first two 0.553. p = 0.5 crosses inside the tie {1, 2, 3, 4}.
+    let tied_tail = [1.0f32, 0.0, 0.0, 0.0, 0.0];
+    let mut cases: Vec<(&str, &[f32], Params, Vec<u32>)> = vec![
+        ("k = 0 is off", &z, Params::new(1.0, 0, 1.0), all.clone()),
+        ("k = 1 keeps the top token", &z, Params::new(1.0, 1, 1.0), vec![0]),
+        (
+            "k = V - 1 drops the lowest score",
+            &z,
+            Params::new(1.0, 7, 1.0),
+            (0..7).collect(),
+        ),
+        ("k = V is off", &z, Params::new(1.0, 8, 1.0), all.clone()),
+        ("k > V is off", &z, Params::new(1.0, 9, 1.0), all.clone()),
+        (
+            "a tie at the k-th place keeps the lower id (k = 2)",
+            &z,
+            Params::new(1.0, 2, 1.0),
+            vec![0, 1],
+        ),
+        (
+            "a tie at the k-th place keeps the lower id (k = 5)",
+            &z,
+            Params::new(1.0, 5, 1.0),
+            vec![0, 1, 2, 3, 4],
+        ),
+        ("p = 0 keeps the top token", &z, Params::new(1.0, 0, 0.0), vec![0]),
+        ("p = 1 is off", &z, Params::new(1.0, 0, 1.0), all.clone()),
+        (
+            "a nucleus crossing inside a tie keeps the lower id",
+            &tied_tail,
+            Params::new(1.0, 0, 0.5),
+            vec![0, 1],
+        ),
+        (
+            "the nucleus is conditional on the top-k set",
+            &z,
+            Params::new(1.0, 2, 0.6),
+            vec![0],
+        ),
+    ];
+    // p one f32 step either side of the top token's share of the mass:
+    // `target = f32(p) * W` against the top token's weight, exactly 1.
+    let inv = oracle::inv_t(1.0).unwrap();
+    let w = oracle::CONTRACT.weights(&z, &(0..8).collect::<Vec<_>>(), z[0], inv);
+    let total = oracle::mass(&w);
+    let mut p = 1.0f32 / total;
+    while p * total > 1.0 {
+        p = f32::from_bits(p.to_bits() - 1);
+    }
+    while p * total <= 1.0 {
+        p = f32::from_bits(p.to_bits() + 1);
+    }
+    let below = f32::from_bits(p.to_bits() - 1);
+    assert!(below * total <= 1.0 && p * total > 1.0);
+    cases.push((
+        "p one step above the top token's mass takes the next token",
+        &z,
+        Params::new(1.0, 0, p as f64),
+        vec![0, 1],
+    ));
+    cases.push((
+        "p at the top token's mass keeps it alone",
+        &z,
+        Params::new(1.0, 0, below as f64),
+        vec![0],
+    ));
+    for (what, z, params, want) in cases {
+        assert_eq!(kept_ids(z, params).unwrap(), want, "{what}: the reference");
+        let n = 512;
+        let got = public_draws(arm(params), z, 1036, n)?;
+        let mut visited: Vec<u32> = got.clone();
+        visited.sort_unstable();
+        visited.dedup();
+        assert_eq!(visited, want, "{what}: the ids the public draws visit");
+        for (pos, &id) in got.iter().enumerate() {
+            let u = LogitsProcessor::uniform_at(1036, pos as u64);
+            assert_eq!(Ok(id), oracle::draw(z, params, u), "{what}: pos {pos}");
+        }
+    }
+    Ok(())
+}
+
+/// χ² critical values at p = 0.001, by degrees of freedom.
+const CHI2_999: [f64; 21] = [
+    0.0, 10.828, 13.816, 16.266, 18.467, 20.515, 22.458, 24.322, 26.124, 27.877, 29.588, 31.264,
+    32.909, 34.528, 36.123, 37.697, 39.252, 40.790, 42.312, 43.820, 45.315,
+];
+
+/// The reference's distribution: its f32 weights over its kept set,
+/// normalised in f64. Zero off the kept set.
+fn reference_distribution(z: &[f32], params: oracle::Params) -> Vec<f64> {
+    let kept = oracle::CONTRACT.nucleus(z, params).unwrap();
+    let inv = oracle::inv_t(params.temperature).unwrap();
+    let w = oracle::CONTRACT.weights(z, &kept, z[kept[0]], inv);
+    let total: f64 = w.iter().map(|&x| x as f64).sum();
+    w.iter().map(|&x| x as f64 / total).collect()
+}
+
+/// (χ², degrees of freedom, draws where the distribution is zero).
+fn chi_square(draws: &[u32], want: &[f64]) -> (f64, usize, usize) {
+    let mut counts = vec![0usize; want.len()];
+    for &id in draws {
+        counts[id as usize] += 1;
+    }
+    let n = draws.len() as f64;
+    let support: Vec<usize> = (0..want.len()).filter(|&i| want[i] > 0.0).collect();
+    let outside = draws.len() - support.iter().map(|&i| counts[i]).sum::<usize>();
+    let chi2 = support
+        .iter()
+        .map(|&i| (counts[i] as f64 - n * want[i]).powi(2) / (n * want[i]))
+        .sum();
+    (chi2, support.len() - 1, outside)
+}
+
+/// The public sampler's draws, over 16 000 positions of one seed, have the
+/// reference's distribution: top-k, top-p and both, at two temperatures, for
+/// the multinomial draw and for Gumbel over the same support. Controls: the
+/// same draws judged against the distribution with the temperature dropped,
+/// and an unfiltered sampler judged against the filtered support, both fail.
+#[test]
+fn the_public_draws_have_the_reference_distribution() -> Result<()> {
+    use oracle::Params;
+    let n = 16_000;
+    let peaked: Vec<f32> = (0..64).map(|i| 2.0 - 0.25 * i as f32).collect();
+    let mut s = 0xc415u64;
+    let spread: Vec<f32> = (0..48)
+        .map(|_| {
+            s = s.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut x = s;
+            x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            x ^= x >> 31;
+            (x >> 40) as f32 / (1u64 << 24) as f32 * 12.0 - 6.0
+        })
+        .collect();
+    let cells = [
+        ("top-k", &peaked, Params::new(0.7, 6, 1.0)),
+        ("top-k", &peaked, Params::new(1.3, 6, 1.0)),
+        ("top-p", &spread, Params::new(0.7, 0, 0.8)),
+        ("top-p", &spread, Params::new(1.3, 0, 0.8)),
+        ("top-k-top-p", &spread, Params::new(1.3, 6, 0.9)),
+    ];
+    for (what, z, params) in cells {
+        let want = reference_distribution(z, params);
+        let df = want.iter().filter(|&&w| w > 0.0).count() - 1;
+        assert!((2..CHI2_999.len()).contains(&df), "{what}: support {}", df + 1);
+        let gumbel = Sampling::FilteredGumbel {
+            temperature: params.temperature,
+            k: params.k,
+            p: params.p,
+        };
+        for (method, sampling) in [("multinomial", arm(params)), ("gumbel", gumbel)] {
+            let draws = public_draws(sampling, z, 77, n)?;
+            let (chi2, df, outside) = chi_square(&draws, &want);
+            println!(
+                "CHI2 {method} {what} T={} k={} p={} chi2={chi2:.2} df={df} critical={} outside={outside}",
+                params.temperature, params.k, params.p, CHI2_999[df]
+            );
+            assert_eq!(outside, 0, "{method} {what} {params:?}: drew outside the kept set");
+            assert!(chi2 < CHI2_999[df], "{method} {what} {params:?}: chi2 {chi2}");
+            // Control: the temperature dropped from the expectation.
+            let cold = reference_distribution(z, Params::new(1.0, params.k, params.p));
+            let (chi2, _, _) = chi_square(&draws, &cold);
+            println!("CHI2-CONTROL {method} {what} T dropped: chi2={chi2:.2}");
+            assert!(chi2 > CHI2_999[df], "{method} {what}: T = 1 passed at {chi2}");
+        }
+        // Control: an unfiltered sampler leaves the filtered support.
+        let unfiltered = public_draws(
+            Sampling::All {
+                temperature: params.temperature,
+            },
+            z,
+            77,
+            n,
+        )?;
+        let (_, _, outside) = chi_square(&unfiltered, &want);
+        println!("CHI2-CONTROL unfiltered {what}: outside={outside}");
+        assert!(outside > 100, "{what}: an unfiltered draw stayed inside ({outside})");
+    }
     Ok(())
 }

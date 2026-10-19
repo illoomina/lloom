@@ -377,6 +377,7 @@ fn run_owner(
             (Method::Get, "/health") => {
                 let result = health_body(shared.engine.as_ref(), &shared.front).map(|mut b| {
                     b["reuse"] = shared.reuse.lock().json(shared.engine.reuse_prefix());
+                    b["sampling"] = sampling_json(&shared.sampling);
                     b
                 });
                 let _ = respond_metadata(request, result);
@@ -1562,7 +1563,7 @@ fn sampling_params(defaults: &crate::SamplingConfig, engine: &dyn Served, v: &Va
         None | Some(Value::Null) => defaults.top_k,
         Some(k) => Some(
             k.as_u64()
-                .ok_or_else(|| bad("field 'top_k' must be a positive integer"))?
+                .ok_or_else(|| bad("field 'top_k' must be a non-negative integer (0 is off)"))?
                 as usize,
         ),
     };
@@ -1602,14 +1603,17 @@ fn sampling_params(defaults: &crate::SamplingConfig, engine: &dyn Served, v: &Va
             Some(p)
         }
     };
-    DecodeParams::try_sampling_of(temperature, top_p, top_k, gumbel)
-        .map_err(|e| bad(e.to_string()))?;
+    DecodeParams::sampling_of(temperature, top_p, top_k, gumbel)
+        .map_err(|e| bad(e.without_backtrace().to_string()))?;
     // A sampled request with no seed draws a fresh one, so repeats are
-    // independent; a seeded one reproduces.
-    let seed = v
-        .get("seed")
-        .and_then(Value::as_u64)
-        .unwrap_or_else(|| defaults.seed_or_random());
+    // independent; a seeded one reproduces, and a seed that is not one is
+    // refused rather than replaced by a fresh draw.
+    let seed = match v.get("seed") {
+        None | Some(Value::Null) => defaults.seed_or_random(),
+        Some(s) => s
+            .as_u64()
+            .ok_or_else(|| bad("field 'seed' must be a non-negative integer"))?,
+    };
     let ignore_eos = v
         .get("ignore_eos")
         .and_then(Value::as_bool)
@@ -2855,6 +2859,7 @@ fn timings(
         "predicted_per_second": if predicted_ms > 0.0 { n as f64 / (predicted_ms / 1e3) } else { 0.0 },
         "total_ms": ms(elapsed),
         "readback": d.readback.name(),
+        "sampling": d.sampling.name(),
         "reuse": format!("{:?}", d.reuse),
         "prefilled": d.prefilled,
         "commits": st.commits,
@@ -2937,7 +2942,7 @@ fn report(
     };
     eprintln!(
         "[{endpoint}: prompt_tokens={prompt} completion_tokens={} stop={:?} total {total_ms:.1} ms, \
-         {steady:.1} tok/s steady (median step), readback={} reuse={:?} prefilled={} \
+         {steady:.1} tok/s steady (median step), readback={} sampling={} reuse={:?} prefilled={} \
          commits={} poll_fallbacks={} overrun={} eos_gate={} host_fill={} prompt_ids_sha256={} \
          reasoning_effort={} think={} think_by={} thinking_budget={} thought={} budget_fired={} \
          prompt_budget={} prompt_dropped={} reused={} renders={} history={}/{} spliced={}/{} \
@@ -2945,6 +2950,7 @@ fn report(
         d.tokens.len(),
         d.stop,
         d.readback.name(),
+        d.sampling.name(),
         d.reuse,
         d.prefilled,
         st.commits,
@@ -3134,6 +3140,19 @@ fn logprobs_line(engine: &dyn Served) -> String {
         None => format!("served(top<={top},stream=refused) decision_logprobs=top<={top}"),
         Some(why) => format!("refused({why}) decision_logprobs=top<={top}"),
     }
+}
+
+/// The server's default sampling as resolved: what a request naming no
+/// sampling field draws with, and where its unset fields came from.
+fn sampling_json(defaults: &crate::SamplingConfig) -> Value {
+    json!({
+        "defaults_from": defaults.defaults,
+        "resolved": defaults.sampling().map(|s| s.name()).unwrap_or_else(|e| e),
+        "temperature": defaults.temperature,
+        "top_k": defaults.top_k,
+        "top_p": defaults.top_p,
+        "method": if defaults.gumbel { "gumbel" } else { "multinomial" },
+    })
 }
 
 fn health_body(engine: &dyn Served, front: &Front) -> Result<Value> {
@@ -4482,7 +4501,7 @@ mod sampling_ingress_tests {
                             (t, k, p, gumbel)
                         );
                         assert_eq!(
-                            params.try_sampling().unwrap(),
+                            params.sampling().unwrap(),
                             Sampling::resolve(t, k, p, gumbel).unwrap()
                         );
                         rows += 1;
@@ -4505,7 +4524,7 @@ mod sampling_ingress_tests {
         ] {
             let params = sampling_params(&defaults, &engine, &v).ok().unwrap();
             assert_eq!(
-                params.try_sampling().unwrap(),
+                params.sampling().unwrap(),
                 Sampling::FilteredGumbel {
                     temperature: 0.7,
                     k: 2,
@@ -4521,7 +4540,7 @@ mod sampling_ingress_tests {
         .ok()
         .unwrap();
         assert_eq!(
-            off.try_sampling().unwrap(),
+            off.sampling().unwrap(),
             Sampling::All { temperature: 0.7 }
         );
     }
@@ -4543,6 +4562,9 @@ mod sampling_ingress_tests {
             (json!({"top_k": "2"}), "top_k"),
             (json!({"top_p": "0.6"}), "top_p"),
             (json!({"gumbel": "true"}), "gumbel"),
+            (json!({"seed": -1}), "seed"),
+            (json!({"seed": "7"}), "seed"),
+            (json!({"seed": 1.5}), "seed"),
             (json!({"sampling_method": "GUMBEL"}), "sampling_method"),
             (
                 json!({"sampling_method": "gumbel", "gumbel": false}),

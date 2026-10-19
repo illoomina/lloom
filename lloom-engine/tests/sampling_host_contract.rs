@@ -1,10 +1,11 @@
-//! Source-only public resolver/config controls; uncompiled and unrun.
+//! The engine's sampling resolution: one fallible entry point, and the
+//! config and request layers refuse a bad field by name.
 use lloom::generation::{Sampling, GREEDY_BELOW};
 use lloom_engine::{DecodeParams, ReadbackArm, RingArm, SamplingConfig};
 
 #[test]
 fn public_engine_resolver_keeps_method_filters_and_defaults() {
-    let s = DecodeParams::try_sampling_of(Some(0.7), Some(0.9), Some(20), true).unwrap();
+    let s = DecodeParams::sampling_of(Some(0.7), Some(0.9), Some(20), true).unwrap();
     assert_eq!(
         s,
         Sampling::FilteredGumbel {
@@ -17,22 +18,18 @@ fn public_engine_resolver_keeps_method_filters_and_defaults() {
         ReadbackArm::Auto.resolve(&s, RingArm::CROWN),
         ReadbackArm::Blocking
     );
+    assert_eq!(DecodeParams::default().sampling().unwrap(), Sampling::ArgMax);
+    assert_eq!(SamplingConfig::default().sampling().unwrap(), Sampling::ArgMax);
     assert_eq!(
-        DecodeParams::sampling_of(Some(0.7), Some(0.9), Some(20), true),
-        s
-    );
-    assert_eq!(DecodeParams::default().sampling(), Sampling::ArgMax);
-    assert_eq!(SamplingConfig::default().sampling(), Sampling::ArgMax);
-    assert_eq!(
-        DecodeParams::try_sampling_of(Some(0.7), Some(1.0), Some(0), false).unwrap(),
+        DecodeParams::sampling_of(Some(0.7), Some(1.0), Some(0), false).unwrap(),
         Sampling::All { temperature: 0.7 }
     );
     assert_eq!(
-        DecodeParams::try_sampling_of(Some(GREEDY_BELOW / 2.0), Some(0.9), Some(20), true).unwrap(),
+        DecodeParams::sampling_of(Some(GREEDY_BELOW / 2.0), Some(0.9), Some(20), true).unwrap(),
         Sampling::ArgMax
     );
     assert_eq!(
-        DecodeParams::try_sampling_of(Some(GREEDY_BELOW), None, None, false).unwrap(),
+        DecodeParams::sampling_of(Some(GREEDY_BELOW), None, None, false).unwrap(),
         Sampling::All {
             temperature: GREEDY_BELOW
         }
@@ -46,24 +43,31 @@ fn public_config_and_request_validation_refuse_invalid_fields_before_a_sampler()
             temperature,
             ..DecodeParams::default()
         };
-        assert!(params.try_sampler().is_err());
+        assert!(params.sampler().is_err());
         let config = SamplingConfig {
             temperature,
             ..SamplingConfig::default()
         };
-        assert!(config.check().unwrap_err().contains("temperature"));
+        let refused = config.check().unwrap_err();
+        assert!(refused.starts_with("sampling: generation.temperature = "), "{refused}");
+        assert!(!refused.contains('\n'), "a refusal carries no backtrace: {refused}");
     }
     for p in [-0.1, 1.01, f64::NAN] {
         let params = DecodeParams {
             top_p: Some(p),
             ..DecodeParams::default()
         };
-        assert!(params.try_sampler().is_err()); // greedy validates unused p too
+        assert!(params.sampler().is_err()); // greedy validates unused p too
         let config = SamplingConfig {
             top_p: Some(p),
             ..SamplingConfig::default()
         };
-        assert!(config.check().unwrap_err().contains("top_p"));
+        let refused = config.check().unwrap_err();
+        assert!(refused.starts_with("sampling: generation.top_p = "), "{refused}");
+        assert!(refused.contains("outside [0, 1]"), "{refused}");
+        let mut options = lloom_engine::EngineOptions::default();
+        options.sampling.top_p = Some(p);
+        assert_eq!(options.check().unwrap_err(), refused);
     }
     let filtered = DecodeParams {
         temperature: Some(0.7),

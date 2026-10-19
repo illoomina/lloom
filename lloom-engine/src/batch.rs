@@ -684,8 +684,12 @@ where
         false
     }
 
-    fn sampling_of(params: &DecodeParams) -> Sampling {
-        params.sampling()
+    /// The row's sampler arm, resolved before the row takes a slot: a
+    /// refused field is the request's error, and nothing is prepared for it.
+    fn sampling_of(params: &DecodeParams) -> std::result::Result<Sampling, String> {
+        params
+            .sampling()
+            .map_err(|e| e.without_backtrace().to_string())
     }
 
     /// Admit waiting rows into the continuous decoder while the width allows.
@@ -717,6 +721,13 @@ where
                 self.waiting.push_front((req, tx));
                 break;
             }
+            let sampling = match Self::sampling_of(&req.params) {
+                Ok(s) => s,
+                Err(e) => {
+                    let _ = tx.send(BatchEvent::Error(e));
+                    continue;
+                }
+            };
             let t_prep = std::time::Instant::now();
             let (slot, session, prepared, turn) = match self.prepare(&req) {
                 Ok(p) => p,
@@ -736,7 +747,6 @@ where
                     self.waiting.len()
                 );
             }
-            let sampling = Self::sampling_of(&req.params);
             let joined_beside = self.decoder.live_rows();
             // The row's own EOS set: the decoder stops a row on its own
             // `eos_ids`, so a row with the never-EOS set runs to its cap.
@@ -845,6 +855,13 @@ where
         let mut prompts: Vec<Vec<u32>> = Vec::with_capacity(rows.len());
         let mut specs: Vec<RowSpec> = Vec::with_capacity(rows.len());
         for (req, tx) in rows {
+            let sampling = match Self::sampling_of(&req.params) {
+                Ok(s) => s,
+                Err(e) => {
+                    let _ = tx.send(BatchEvent::Error(e));
+                    continue;
+                }
+            };
             match self.prepare(&req) {
                 Ok((slot, session, prepared, turn)) => {
                     // A static body takes the whole prompt as its row: a
@@ -860,7 +877,7 @@ where
                     sessions.push(session);
                     prompts.push(prepared.suffix.clone());
                     specs.push(RowSpec {
-                        sampling: Self::sampling_of(&req.params),
+                        sampling,
                         seed: req.params.seed,
                         eos_ids: req.params.eos_ids.clone(),
                         max_tokens: req.params.max_tokens,

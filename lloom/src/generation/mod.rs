@@ -96,10 +96,13 @@ impl Sampling {
         gumbel: bool,
     ) -> Result<Sampling> {
         if let Some(t) = temperature.filter(|t| !(t.is_finite() && *t >= 0.0)) {
-            lloom_tensor::bail!("temperature must be a finite number >= 0, got {t}");
+            lloom_tensor::bail!(
+                "temperature = {t}: not a finite number >= 0 (unset, 0 or below {GREEDY_BELOW} \
+                 is greedy)"
+            );
         }
         if let Some(p) = top_p.filter(|p| !(0.0..=1.0).contains(p)) {
-            lloom_tensor::bail!("top_p must be a number in [0, 1], got {p}");
+            lloom_tensor::bail!("top_p = {p}: outside [0, 1] (1 is off, 0 keeps the top token)");
         }
         let k = top_k.filter(|&k| k > 0);
         let p = top_p.filter(|&p| p < 1.0);

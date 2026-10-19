@@ -226,7 +226,7 @@ pub fn refuse_speculative(
     if !DRAFTERS.contains(&method) || max_sequences <= 1 {
         return Ok(());
     }
-    let arm = sampling.sampling();
+    let arm = sampling.sampling()?;
     let processors = sampling.processors().is_active();
     let refusal = match lloom::nn::refuse(
         lloom::nn::Body::BatchedWindow,
@@ -265,11 +265,12 @@ pub fn refuse_speculative(
 /// options resolve rather than at the first request.
 pub fn refuse(o: &EngineOptions) -> Result<(), String> {
     let s = &o.sampling;
-    if o.decode.readback.kind == crate::ReadbackKind::Ring && host_side(&s.sampling()) {
+    let sampling = s.sampling()?;
+    if o.decode.readback.kind == crate::ReadbackKind::Ring && host_side(&sampling) {
         return Err(format!(
-            "C2: decode.readback.kind = ring with a host-side sampler ({:?}): the ring cannot draw it; \
+            "C2: decode.readback.kind = ring with a host-side sampler ({}): the ring cannot draw it; \
              `auto` takes the blocking arm for it",
-            s.sampling()
+            sampling.name()
         ));
     }
     if o.decode.readback.lookahead > 1 {
@@ -283,7 +284,7 @@ pub fn refuse(o: &EngineOptions) -> Result<(), String> {
         && lloom::nn::refuse(
             lloom::nn::Body::BatchedStep,
             &lloom::nn::Asks {
-                sampling: &s.sampling(),
+                sampling: &sampling,
                 processors: s.processors().is_active(),
                 budget: s.thinking_budget.is_some(),
                 digest: false,
@@ -312,9 +313,17 @@ pub fn explain(o: &EngineOptions) -> Vec<String> {
     let mut out = Vec::new();
     let r = &o.decode.readback;
     let s = &o.sampling;
-    let sampling = s.sampling();
+    let sampling = match s.sampling() {
+        Ok(sampling) => sampling,
+        Err(e) => {
+            out.push(e);
+            return out;
+        }
+    };
     if r.kind == crate::ReadbackKind::Auto && host_side(&sampling) {
-        let by = match (s.top_k.is_some(), s.top_p.is_some()) {
+        let k = s.top_k.is_some_and(|k| k > 0);
+        let p = s.top_p.is_some_and(|p| p < 1.0);
+        let by = match (k, p) {
             (true, true) => "generation.top_k, generation.top_p",
             (true, false) => "generation.top_k",
             _ => "generation.top_p",
@@ -602,7 +611,7 @@ mod tests {
             ("generation.sampling.method", "gumbel"),
         ]);
         refuse(&host).unwrap();
-        assert!(host.sampling.sampling().requires_host());
+        assert!(host.sampling.sampling().unwrap().requires_host());
         assert!(explain(&host).iter().any(|s| s.contains("auto -> blocking")));
     }
 

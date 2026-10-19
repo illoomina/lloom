@@ -2081,6 +2081,7 @@ impl<P: Lfm2Shape> Engine<P> {
                     rows: done.joined_beside,
                 },
             },
+            sampling: params.sampling()?,
             stats: done.stats,
             thinking: None,
             logprobs: None,

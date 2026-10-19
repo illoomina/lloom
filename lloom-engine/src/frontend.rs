@@ -61,6 +61,10 @@ pub enum When {
     Always,
     /// At a batch: `scheduler.max_sequences` above 1.
     Batched,
+    /// The model's family takes the `model` axes (LFM2's `Config`; no
+    /// `--model` = the LFM2 snapshot), so a default axis never refuses a
+    /// family at load.
+    ModelAxes,
 }
 
 impl When {
@@ -68,6 +72,13 @@ impl When {
         match self {
             When::Always => true,
             When::Batched => o.scheduler.max_sequences > 1,
+            // LFM2's detection (`app::family::Lfm2Family`, first in order):
+            // a directory holding `config.json`; the GGUF families take none.
+            When::ModelAxes => o
+                .load
+                .model
+                .as_deref()
+                .map_or(true, |p| p.is_dir() && p.join("config.json").is_file()),
         }
     }
 
@@ -75,6 +86,7 @@ impl When {
         match self {
             When::Always => "",
             When::Batched => "scheduler.max_sequences > 1",
+            When::ModelAxes => "the model's family takes the model axes (LFM2)",
         }
     }
 }
@@ -89,10 +101,48 @@ pub struct Row {
     pub before: &'static str,
 }
 
-/// Every front-end default, each `before` the value its front-end resolved
-/// before the option tree (the sites read: `decode-driver-design.md`
-/// Stage 7).
-pub const ROWS: &[Row] = &[
+/// The same `key = value` row for chat and for serve (the LFM2 decode
+/// flow both run by default).
+macro_rules! rows {
+    ([$($when:ident: $key:literal = $value:literal),* $(,)?] $($row:expr),* $(,)?) => {
+        pub const ROWS: &[Row] = &[
+            $(
+                Row { key: $key, frontend: Frontend::Chat, when: When::$when, before: $value },
+                Row { key: $key, frontend: Frontend::Serve, when: When::$when, before: $value },
+            )*
+            $($row),*
+        ];
+    };
+}
+
+// Every front-end default, each `before` the value its front-end resolved
+// before the option tree (the sites read: `decode-driver-design.md`
+// Stage 7).
+rows! {
+    // The tuned decode flow as chat's and serve's default; any layer that
+    // names a key keeps its own value. No speculation by default.
+    // Every family: the Metal backend arms and the non-blocking ring
+    // (GPU-batched EOS, the adaptive commit, the stream reader).
+    [
+        Always: "backend.metal.command_buffer.api" = "metal4",
+        Always: "backend.metal.compiler.merged_unit" = "true",
+        Always: "backend.metal.copy2d_compute" = "true",
+        Always: "backend.metal.heaps.transient" = "true",
+        Always: "decode.readback.kind" = "ring",
+        Always: "decode.readback.eos" = "gpu-batched-nonblocking",
+        Always: "decode.readback.stream_reader" = "true",
+        // LFM2 (safetensors) only: its `Config` axes and LFM2 kernels.
+        ModelAxes: "kernels.attention.flash.partial_block" = "8",
+        // Shared with Qwen4-exp's HC norm arm, +6.6% ms/token there.
+        ModelAxes: "kernels.fusion.norm_in_gemv" = "true",
+        ModelAxes: "models.lfm2.rows_kernels" = "per-row",
+        ModelAxes: "speculative.dspark.context_kv" = "paged",
+        ModelAxes: "context.kv.layout" = "paged",
+        ModelAxes: "kernels.attention.impl" = "flash",
+        ModelAxes: "kernels.attention.qkv_layout" = "fused",
+        ModelAxes: "kernels.fusion.conv" = "true",
+        ModelAxes: "models.lfm2.conv_prefill_context" = "true",
+    ]
     Row {
         key: "context.prefix.reuse",
         frontend: Frontend::Chat,
@@ -129,7 +179,7 @@ pub const ROWS: &[Row] = &[
         when: When::Batched,
         before: "512",
     },
-];
+}
 
 /// A default changed on purpose: the maintainer's decision by number, the
 /// key and front-end it moves, the value before and after, and whether the

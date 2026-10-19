@@ -236,7 +236,18 @@ fn qwen4exp_readback_that_reads_its_id_back_warns() {
         field.contains("each decode forward reads its fed id back"),
         "{field}"
     );
-    assert_eq!(loaded_warnings(&chat(&model, &base)), "none");
+    // `auto` through `chat` is the front-end's ring for every family on
+    // Metal (the `decode.readback.*` rows), which on this tiny reads its
+    // fed id back too: the same warning, from the resolved arm, beside the
+    // EOS-gate one (its kernels carry no gated variant). The library's own
+    // `auto` (no front-end) stays blocking and silent.
+    let auto = loaded_warnings(&chat(&model, &base));
+    assert!(
+        auto.contains("readback: ring-gpubatch-nonblocking lookahead=1 ")
+            && auto.contains("each decode forward reads its fed id back")
+            && auto.contains("eos_gate is off on qwen4exp"),
+        "{auto}"
+    );
     std::fs::remove_dir_all(&dir).ok();
 }
 

@@ -133,20 +133,20 @@ macro_rules! rows {
 rows! {
     // The tuned decode flow as chat's and serve's default; any layer that
     // names a key keeps its own value. No speculation by default.
-    // Every family on Metal: the Metal backend arms. LFM2 (safetensors) on
-    // Metal: the non-blocking ring (GPU-batched EOS, the adaptive commit,
-    // the stream reader) — Qwen4-exp keeps its own `auto` (blocking; the
-    // ring reads each fed id back without a PLE and the adaptive commit is
-    // the wrong cadence there, #829), the GGUF families their resolution.
+    // Every family on Metal: the Metal backend arms and the non-blocking
+    // ring (GPU-batched EOS, the adaptive commit, the stream reader) —
+    // Qwen4-exp included, by the maintainer's choice (2026-10-19): the ring
+    // reads each fed id back there without a PLE today (the load warning
+    // says so, #829), and the cadence work planned is to make the
+    // non-blocking ring the best arm for every family.
     [
         Metal: "backend.metal.command_buffer.api" = "metal4",
         Metal: "backend.metal.compiler.merged_unit" = "true",
         Metal: "backend.metal.copy2d_compute" = "true",
         Metal: "backend.metal.heaps.transient" = "true",
-        ModelAxes: "decode.readback.kind" = "ring",
-        ModelAxes: "decode.readback.eos" = "gpu-batched-nonblocking",
-        ModelAxes: "decode.readback.stream_reader" = "true",
-        Always: "prefill.tile" = "64",
+        Metal: "decode.readback.kind" = "ring",
+        Metal: "decode.readback.eos" = "gpu-batched-nonblocking",
+        Metal: "decode.readback.stream_reader" = "true",
         // LFM2 (safetensors) only: its `Config` axes and LFM2 kernels.
         ModelAxes: "kernels.attention.flash.partial_block" = "8",
         // Shared with Qwen4-exp's HC norm arm, +6.6% ms/token there.

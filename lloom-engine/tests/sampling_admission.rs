@@ -267,7 +267,12 @@ fn actual_config_merge_preserves_numeric_string_and_readback_shorthand_grammar()
             ring,
             false,
         ),
-        (json!({"generation": {"temperature": -1}}), false, None, false),
+        (
+            json!({"generation": {"temperature": -1}}),
+            false,
+            None,
+            false,
+        ),
         (json!({"generation": {"top_p": "1.1"}}), false, None, false),
         (json!({"generation": {"top_k": -1}}), false, None, false),
     ];

@@ -1452,7 +1452,15 @@ mod sampling_and_speculation_tests {
         // (C2): the options keep the ring and the sampler, and each request
         // runs on the blocking arm with a note.
         for argv in [
-            vec!["-t", "0.7", "--gumbel", "--top-k", "2", "--readback", "ring"],
+            vec![
+                "-t",
+                "0.7",
+                "--gumbel",
+                "--top-k",
+                "2",
+                "--readback",
+                "ring",
+            ],
             vec![
                 "-t",
                 "0.7",
@@ -1473,7 +1481,11 @@ mod sampling_and_speculation_tests {
                 },
                 "{argv:?}"
             );
-            assert_eq!(o.decode.readback.kind, crate::ReadbackKind::Ring, "{argv:?}");
+            assert_eq!(
+                o.decode.readback.kind,
+                crate::ReadbackKind::Ring,
+                "{argv:?}"
+            );
             assert!(
                 crate::couplings::explain(&o)
                     .iter()

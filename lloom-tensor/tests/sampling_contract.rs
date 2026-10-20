@@ -403,10 +403,7 @@ const FOLD_FOIL: Arith = Arith {
     exp: exp32,
     mass: sequential,
 };
-const CR_EXP_FOIL: Arith = Arith {
-    exp: cr_exp,
-    mass,
-};
+const CR_EXP_FOIL: Arith = Arith { exp: cr_exp, mass };
 const EXP_FOIL: Arith = Arith {
     exp: platform_exp,
     mass,
@@ -636,11 +633,7 @@ fn the_pins_tell_the_contract_from_its_foils() {
     for p in PINS.iter() {
         assert_eq!(pin_value(CONTRACT, p), p.want, "{p:?}: the contract");
         match p.foil {
-            Some(foil) => assert_ne!(
-                pin_value(foil.arith(), p),
-                p.want,
-                "{p:?}: the foil agrees"
-            ),
+            Some(foil) => assert_ne!(pin_value(foil.arith(), p), p.want, "{p:?}: the foil agrees"),
             None => println!(
                 "PIN contract only {:?}: the platform's exp gives {} (contract {})",
                 p.row,
@@ -664,7 +657,10 @@ fn the_pins_tell_the_contract_from_its_foils() {
                 };
                 let (e, r) = ((x as f64).exp(), cr_exp(x));
                 let d = (e - r as f64).abs() / ulp32(r);
-                assert!(d <= TWO_SCORE_D, "{p:?}: exp(x) is {d} ulp from its rounding");
+                assert!(
+                    d <= TWO_SCORE_D,
+                    "{p:?}: exp(x) is {d} ulp from its rounding"
+                );
                 assert_ne!(exp32(x), r, "{p:?}: exp32 is correctly rounded at x");
                 assert_eq!(
                     platform_exp(x),

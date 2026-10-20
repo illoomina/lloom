@@ -2904,6 +2904,8 @@ fn timings(
     // given to the template as that reasoning.
     t["history_open_reasoning"] = json!(facts.spliced.open);
     t["history_open_apart"] = json!(facts.spliced.open_apart);
+    // Why the blocking arm ran where a ring was asked by name (C2).
+    t["readback_note"] = json!(d.readback_note);
     // The turn checkpoint this request's prefill was asked to leave.
     t["checkpoint"] = json!(d.checkpoint_name());
     t["front_prompt_us"] = json!(facts.front_us);
@@ -2981,6 +2983,9 @@ fn report(
         turn.fields(),
         d.checkpoint_name(),
     );
+    if let Some(note) = &d.readback_note {
+        eprintln!("[{endpoint}: warning: {note}]");
+    }
 }
 
 /// What a request's prompt was: the digest of its ids (`lloom chat`'s

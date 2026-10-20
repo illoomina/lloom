@@ -14,6 +14,7 @@
 //! so a file that is not a module here fails the suite instead of silently
 //! not running.
 mod accepted_frontier;
+mod attention_purpose;
 mod checkpoint_policy;
 mod failure_next_request;
 mod load_warnings;

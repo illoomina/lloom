@@ -269,6 +269,7 @@ fn decoded(engine: &Stub, ids: Vec<u32>) -> Decoded {
         checkpoint_at: None,
         readback: ReadbackArm::Blocking,
         sampling: lloom::generation::Sampling::ArgMax,
+        readback_note: None,
         logits_sha256: None,
         stats: Default::default(),
         thinking: None,

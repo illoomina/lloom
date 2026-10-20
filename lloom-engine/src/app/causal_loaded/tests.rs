@@ -255,6 +255,7 @@ fn unadmitted_cpu_gguf_factory_enforces_selected_context_and_f16_store() -> anyh
             TokenizerSource::File(&tokenizer_path),
             None,
             &Device::Cpu,
+            lloom::nn::attention::route::ExecutionPurpose::Production,
             machine,
             decode,
             served::Config {

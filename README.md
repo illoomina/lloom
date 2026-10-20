@@ -1,10 +1,8 @@
 <div align="center">
 
-<img src="assets/lloom-logo.jpg" alt="lloom" width="240" />
+<img src="assets/lloom-logo.jpg" alt="lloom" width="360" />
 
-# lloom
-
-**Local LLM inference, specialized for Apple silicon**
+**Local LLM inference, blazing fast.**
 
 </div>
 
@@ -22,7 +20,6 @@ chat, serves requests, and exposes its resolved configuration.
 
 ## Build
 
-Run these commands from this directory (`candle/` in the full repository).
 Use a current Rust toolchain and a working native linker. Metal builds require
 Apple silicon, macOS, and the Xcode command-line/Metal development tools.
 
@@ -200,6 +197,20 @@ record the binary, backend, checkpoint, cells and resolved configuration. This
 is not a claim that a three-run example establishes a new release benchmark.
 External Pipette clients can instead use the existing HTTP benchmark endpoints.
 
+## Benchmarks
+
+Measured, with the harness, prompts and limitations, in
+[docs/benchmark.md](docs/benchmark.md). The cross-engine comparison there
+(LFM2.5-2.6B on one M1 Max, 2026-10-19: lloom vs llama.cpp vs MLX, one client
+driving each engine's own server) reads, in short: one stream without
+speculation lloom decodes fastest (62–65 tok/s against 47–52) and prefills
+slowest at long prompts (~2370 tokens: TTFT 2.0 s against 1.5 s and 1.3 s);
+batched without speculation it leads at B=16/32 on short prompts (512 vs
+337 tok/s at B=32) and is level at ~2370 tokens; with DSpark its batched
+decode holds up where llama.cpp's does not, while at B=1 on prose llama.cpp's
+draft is ahead. The known gaps — long-prompt prefill, heat under sustained
+load, long-context batched decode — are listed there with what is being done.
+
 ## Optional optimized diagnostic build
 
 Keep diagnostic runs separate from the shipping binary and check the
@@ -233,17 +244,19 @@ causal mutation checks, repeatability and real text/model gates together.
 Historical LFM2.5-2.6B/M1 Max measurements are documented with their exact
 source, prompts and configuration in the full repository's `design/measurements/`.
 They are not current throughput promises for CPU, GGUF, other models or hardware.
-The preview's cross-engine benchmark table is not complete; no new performance
-measurements accompany this README snapshot.
+The cross-engine tables in [docs/benchmark.md](docs/benchmark.md) cover
+LFM2.5-2.6B on one M1 Max only.
 
 ## Branches and public history
 
-`dev` is the development line; open pull requests against `dev`, not the
-stable/default `main` line. The public Candle subtree is published from a larger
-development repository containing the design notes and measurements. Historical
-`#NNN` commit references may name that private tracker rather than this public
-repository's issues. The preserved history includes upstream Candle followed by
-the fork's commits; this snapshot does not redefine that publication process.
+This public tree is the `candle/` subtree of a larger development repository
+that also holds the design notes, the issue tracker and the measurements. It is
+published with `git subtree split` onto the fork's own history, so the history
+here is upstream Candle followed by the fork's commits, unrewritten. `#NNN`
+references in commit messages name issues of that development tracker, not
+this repository's. Pre-release snapshots are published from the development
+line (`dev`) as they pass its gates; this one is the snapshot tagged `pre-release-20261020` in the development
+repository.
 
 ## Project and provenance
 
@@ -255,3 +268,8 @@ the fork's commits; this snapshot does not redefine that publication process.
 
 Forked from Candle; licensed under [MIT](LICENSE-MIT) or
 [Apache-2.0](LICENSE-APACHE). Model weights/tokenizers have their own licenses.
+
+For contributors: the design index (`DESIGN.md`), the development protocol
+(`CONTRIBUTING.md`), the evidence tree (`measurements/`) and the architecture
+documentation live in the development repository's `design/`; none is an
+installation prerequisite for this tree.

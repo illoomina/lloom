@@ -1,5 +1,6 @@
 pub mod bounded;
 pub mod cpu_flash;
+pub mod route;
 pub mod varlen;
 
 use lloom_tensor::Tensor;

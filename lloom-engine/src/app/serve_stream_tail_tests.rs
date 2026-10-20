@@ -288,6 +288,7 @@ impl Served for Scripted {
             checkpoint_at: None,
             readback: ReadbackArm::Blocking,
             sampling: lloom::generation::Sampling::ArgMax,
+            readback_note: None,
             logits_sha256: None,
             stats: Default::default(),
             thinking: None,

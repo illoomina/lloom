@@ -562,24 +562,6 @@ fn numeric_domain_rules() -> Vec<Value> {
     }).collect()
 }
 
-/// The readback forms selecting a kind, through the same preset parser as
-/// the option loader. Couplings must not apply object keywords to strings.
-pub(crate) fn readback_kind(kind: crate::ReadbackKind) -> Value {
-    let spellings: Vec<&str> = crate::ReadbackConfig::SPELLINGS
-        .iter()
-        .copied()
-        .filter(|s| {
-            let mut cfg = crate::ReadbackConfig::default();
-            crate::ReadbackConfig::apply_spelling(&mut cfg, s).is_ok() && cfg.kind == kind
-        })
-        .collect();
-    let name = kind.to_string();
-    json!({"anyOf": [
-        {"type": "object", "properties": {"kind": arms(&[name.as_str()])}, "required": ["kind"]},
-        {"type": "string", "enum": spellings}
-    ]})
-}
-
 /// The schema of the whole tree.
 pub fn schema() -> Value {
     let idx = index();

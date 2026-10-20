@@ -220,42 +220,62 @@ fn every_feature_combination_matches_canonical_diagnostics() -> Result<()> {
 fn actual_config_merge_preserves_numeric_string_and_readback_shorthand_grammar() {
     use lloom_engine::option_tree::index;
     use serde_json::json;
+    // (config, accepted, the readback kind it names, gumbel). A ring named
+    // with a host-side sampler is accepted: the request runs on the blocking
+    // arm with a note (coupling C2 resolves).
+    let ring = Some(lloom_engine::ReadbackKind::Ring);
     let cases = [
         (
             json!({"generation": {"temperature": 0.7, "top_k": 2, "top_p": 0.6, "sampling": {"method": "gumbel"}}}),
+            true,
+            None,
             true,
         ),
         (
             json!({"generation": {"temperature": " 0.7 ", "top_k": "+2", "top_p": "0.6", "sampling": {"method": "gumbel"}}}),
             true,
+            None,
+            true,
         ),
         (
             json!({"decode": {"readback": "blocking"}, "generation": {"temperature": 0.7, "top_k": 2, "sampling": {"method": "gumbel"}}}),
             true,
+            Some(lloom_engine::ReadbackKind::Blocking),
+            true,
         ),
         (
             json!({"decode": {"readback": "ring"}, "generation": {"temperature": 0.7, "top_k": 2, "sampling": {"method": "gumbel"}}}),
-            false,
+            true,
+            ring,
+            true,
         ),
         (
             json!({"decode": {"readback": {"kind": "ring"}}, "generation": {"temperature": "0.7", "top_k": "2"}}),
+            true,
+            ring,
             false,
         ),
-        (json!({"generation": {"temperature": -1}}), false),
-        (json!({"generation": {"top_p": "1.1"}}), false),
-        (json!({"generation": {"top_k": -1}}), false),
+        (json!({"generation": {"temperature": -1}}), false, None, false),
+        (json!({"generation": {"top_p": "1.1"}}), false, None, false),
+        (json!({"generation": {"top_k": -1}}), false, None, false),
     ];
-    for (value, allowed) in cases {
+    for (value, allowed, kind, gumbel) in cases {
         let mut options = EngineOptions::default();
         let result = index()
             .merge(&mut options, &value)
             .and_then(|()| options.check());
         assert_eq!(result.is_ok(), allowed, "{value}: {result:?}");
         if allowed {
-            assert!(matches!(
-                options.sampling.sampling().unwrap(),
-                Sampling::FilteredGumbel { .. }
-            ));
+            let sampling = options.sampling.sampling().unwrap();
+            assert!(sampling.requires_host(), "{value}: {sampling:?}");
+            assert_eq!(
+                matches!(sampling, Sampling::FilteredGumbel { .. }),
+                gumbel,
+                "{value}: {sampling:?}"
+            );
+            if let Some(kind) = kind {
+                assert_eq!(options.decode.readback.kind, kind, "{value}");
+            }
         }
     }
 }

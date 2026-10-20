@@ -36,12 +36,12 @@ pub const COUPLINGS: &[Coupling] = &[
     },
     Coupling {
         id: "C2",
-        kind: "refuses",
+        kind: "resolves",
         when: "decode.readback.kind = ring with the host-side sampler of C1",
-        effect: "refused: the ring has no host round trip for the draw; `auto` makes the choice instead",
+        effect: "the request runs on the blocking arm — the ring has no host round trip for the draw — and the turn line and `timings.readback_note` say so (a warning, not a refusal, since 2026-10-20)",
         keys: &["decode.readback.kind", "generation.top_k", "generation.top_p", "generation.temperature", "generation.sampling.method"],
-        site: "lloom/src/generation/readback.rs Ring::check_sampler; at resolve: couplings::refuse",
-        is_static: true,
+        site: "lloom-engine/src/decode.rs ReadbackArm::{resolve, demotion}; the ring itself still refuses the pair (lloom/src/generation/readback.rs Ring::check_sampler)",
+        is_static: false,
     },
     Coupling {
         id: "C3",
@@ -266,13 +266,6 @@ pub fn refuse_speculative(
 pub fn refuse(o: &EngineOptions) -> Result<(), String> {
     let s = &o.sampling;
     let sampling = s.sampling()?;
-    if o.decode.readback.kind == crate::ReadbackKind::Ring && host_side(&sampling) {
-        return Err(format!(
-            "C2: decode.readback.kind = ring with a host-side sampler ({}): the ring cannot draw it; \
-             `auto` takes the blocking arm for it",
-            sampling.name()
-        ));
-    }
     if o.decode.readback.lookahead > 1 {
         return Err(format!(
             "C10: decode.readback.lookahead_forwards = {} is not 0 or 1",
@@ -320,7 +313,7 @@ pub fn explain(o: &EngineOptions) -> Vec<String> {
             return out;
         }
     };
-    if r.kind == crate::ReadbackKind::Auto && host_side(&sampling) {
+    if host_side(&sampling) {
         let k = s.top_k.is_some_and(|k| k > 0);
         let p = s.top_p.is_some_and(|p| p < 1.0);
         let by = match (k, p) {
@@ -328,9 +321,16 @@ pub fn explain(o: &EngineOptions) -> Vec<String> {
             (true, false) => "generation.top_k",
             _ => "generation.top_p",
         };
-        out.push(format!(
-            "decode.readback.kind = auto -> blocking <- {by} (C1)"
-        ));
+        match r.kind {
+            crate::ReadbackKind::Auto => out.push(format!(
+                "decode.readback.kind = auto -> blocking <- {by} (C1)"
+            )),
+            crate::ReadbackKind::Ring => out.push(format!(
+                "decode.readback.kind = ring -> blocking for this sampler <- {by}: the ring cannot \
+                 draw a host sort; each request says so on its turn line (C2)"
+            )),
+            crate::ReadbackKind::Blocking => {}
+        }
     }
     if sampling == Sampling::ArgMax && (s.top_k.is_some() || s.top_p.is_some() || s.gumbel) {
         out.push("generation.top_k / top_p / sampling.method ignored <- generation.temperature unset (C3)".into());
@@ -349,8 +349,7 @@ pub fn explain(o: &EngineOptions) -> Vec<String> {
         );
     }
     // The arm that runs: the blocking one where C1 resolves `auto` to it.
-    let blocking = r.kind == crate::ReadbackKind::Blocking
-        || (r.kind == crate::ReadbackKind::Auto && host_side(&sampling));
+    let blocking = r.kind == crate::ReadbackKind::Blocking || host_side(&sampling);
     let adaptive = !blocking && r.ring_arm().adaptive;
     if adaptive && !r.stream_reader {
         out.push(
@@ -419,11 +418,6 @@ pub fn table() -> Value {
 /// file: what [`refuse`] refuses, checked before load by any validator.
 pub fn static_rules() -> Value {
     let hot = json!({"type": "number", "minimum": 1e-7});
-    let ring = crate::option_schema::readback_kind(crate::ReadbackKind::Ring);
-    let host_sampler = json!({"anyOf": [
-        {"properties": {"top_k": {"type": "integer", "minimum": 1}}, "required": ["top_k"]},
-        {"properties": {"top_p": {"type": "number", "minimum": 0, "exclusiveMaximum": 1}}, "required": ["top_p"]}
-    ]});
     let active = json!({"anyOf": [
         {"properties": {"repetition_penalty": {"type": "number", "not": {"const": 1}}}, "required": ["repetition_penalty"]},
         {"properties": {"presence_penalty": {"type": "number", "not": {"const": 0}}}, "required": ["presence_penalty"]},
@@ -433,14 +427,6 @@ pub fn static_rules() -> Value {
     ]});
     let budget = json!({"properties": {"reasoning": {"properties": {"budget": {"type": "integer"}}, "required": ["budget"]}}, "required": ["reasoning"]});
     json!([
-        {"$comment": "C2: an explicit ring with a host-side sampler is refused",
-         "if": {"properties": {
-                "decode": {"properties": {"readback": ring}, "required": ["readback"]},
-                "generation": {"allOf": [
-                    {"properties": {"temperature": hot}, "required": ["temperature"]},
-                    host_sampler]}},
-                "required": ["decode", "generation"]},
-         "then": false},
         {"$comment": "C10: at most one forward past an unlearned EOS",
          "if": {"properties": {"decode": {"properties": {"readback": {"type": "object", "properties": {"lookahead_forwards": {"type": "integer", "minimum": 2}}, "required": ["lookahead_forwards"]}}, "required": ["readback"]}}, "required": ["decode"]},
          "then": false},
@@ -479,14 +465,6 @@ mod tests {
     #[test]
     fn each_static_coupling_refuses_by_name() {
         for (sets, id) in [
-            (
-                &[
-                    ("decode.readback.kind", "ring"),
-                    ("generation.temperature", "0.7"),
-                    ("generation.top_p", "0.9"),
-                ][..],
-                "C2",
-            ),
             (
                 &[
                     ("speculative.method", "mtp"),
@@ -533,6 +511,12 @@ mod tests {
             ][..],
             &[
                 ("decode.readback.kind", "auto"),
+                ("generation.temperature", "0.7"),
+                ("generation.top_p", "0.9"),
+            ][..],
+            // C2 resolves (the blocking arm with a note) instead of refusing.
+            &[
+                ("decode.readback.kind", "ring"),
                 ("generation.temperature", "0.7"),
                 ("generation.top_p", "0.9"),
             ][..],
@@ -586,7 +570,16 @@ mod tests {
             ("generation.top_p", "0.9"),
             ("generation.sampling.method", "gumbel"),
         ]);
-        assert!(refuse(&filtered_gumbel).unwrap_err().starts_with("C2:"));
+        // A ring asked by name with filtered gumbel resolves to the blocking
+        // arm (C2), as top-k / top-p does.
+        refuse(&filtered_gumbel).unwrap();
+        assert!(
+            explain(&filtered_gumbel).iter().any(|l| l.starts_with(
+                "decode.readback.kind = ring -> blocking for this sampler <- generation.top_p"
+            ) && l.ends_with("(C2)")),
+            "{:?}",
+            explain(&filtered_gumbel)
+        );
         let mut o = EngineOptions::default();
         o.decode.readback.lookahead = 2;
         assert!(refuse(&o).unwrap_err().starts_with("C10:"));
@@ -639,6 +632,21 @@ mod tests {
                 .any(|l| l == "decode.readback.kind = auto -> blocking <- generation.top_k (C1)"),
             "{lines:?}"
         );
+        // A ring asked by name with a host-side sampler is explained (C2),
+        // not refused, and the stream-reader line (C9) is not added for it:
+        // the blocking arm runs.
+        let lines = explain(&with(&[
+            ("decode.readback.kind", "ring"),
+            ("generation.temperature", "0.7"),
+            ("generation.top_p", "0.9"),
+        ]));
+        assert!(
+            lines.iter().any(|l| l.starts_with(
+                "decode.readback.kind = ring -> blocking for this sampler <- generation.top_p"
+            ) && l.ends_with("(C2)")),
+            "{lines:?}"
+        );
+        assert!(!lines.iter().any(|l| l.contains("(C9)")), "{lines:?}");
         assert_eq!(
             explain(&EngineOptions::default()),
             vec!["decode.readback.stream_reader -> on <- decode.readback.adaptive_commit (C9)"],

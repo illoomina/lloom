@@ -254,13 +254,34 @@ impl ReadbackArm {
 
     /// The arm that runs for `sampling`: `Auto` resolves here — to
     /// `auto_ring` (the engine's configured ring, `DecodeConfig`) where the
-    /// sampler admits a ring, the blocking arm otherwise; the explicit arms
-    /// pass through.
+    /// sampler admits a ring, the blocking arm otherwise. A ring asked by
+    /// name (the explicit arm or a front-end row) runs for every sampler it
+    /// admits and, for one that needs a host sort, is demoted to the
+    /// blocking arm for that request with a note ([`Self::demotion`]) rather
+    /// than refused (coupling C2, 2026-10-20); the other explicit arms pass
+    /// through.
     pub fn resolve(self, sampling: &Sampling, auto_ring: RingArm) -> ReadbackArm {
         match self {
             ReadbackArm::Auto if Self::ring_admits(sampling) => ReadbackArm::Ring(auto_ring),
             ReadbackArm::Auto => ReadbackArm::Blocking,
+            ReadbackArm::Ring(_) if !Self::ring_admits(sampling) => ReadbackArm::Blocking,
             other => other,
+        }
+    }
+
+    /// The note a run carries when a ring was asked by name and `sampling`
+    /// needs a host sort the ring has no round trip for: the blocking arm
+    /// runs that request, and the turn line and `timings.readback_note` say
+    /// so (coupling C2). `None` for every other pair — `auto`'s choice of the
+    /// blocking arm is not a demotion (C1).
+    pub fn demotion(self, sampling: &Sampling) -> Option<String> {
+        match self {
+            ReadbackArm::Ring(_) if !Self::ring_admits(sampling) => Some(format!(
+                "readback: the ring was asked but {} needs a host sort the ring cannot draw; \
+                 the blocking arm ran this request (C2)",
+                sampling.name()
+            )),
+            _ => None,
         }
     }
 
@@ -470,6 +491,9 @@ pub struct Decoded {
     /// The sampler arm that drew the tokens, as the request's fields resolved
     /// ([`DecodeParams::sampling`]).
     pub sampling: Sampling,
+    /// Why `readback` is the blocking arm when a ring was asked by name
+    /// ([`ReadbackArm::demotion`]); `None` otherwise.
+    pub readback_note: Option<String>,
     /// The run's logits digest, when `DecodeParams::logits_digest` asked for
     /// one.
     pub logits_sha256: Option<String>,
@@ -807,12 +831,15 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
         }
         let mut sampler = params.sampler()?;
         let sampling = sampler.sampling().clone();
-        let arm = if params.logits_digest || params.logprobs.is_some() {
-            ReadbackArm::Blocking
+        let (arm, readback_note) = if params.logits_digest || params.logprobs.is_some() {
+            (ReadbackArm::Blocking, None)
         } else {
-            params
-                .readback
-                .resolve(sampler.sampling(), self.config.readback.ring_arm())
+            (
+                params
+                    .readback
+                    .resolve(sampler.sampling(), self.config.readback.ring_arm()),
+                params.readback.demotion(sampler.sampling()),
+            )
         };
         if let Err(e) = self.config.check() {
             lloom_tensor::bail!("DecodeSession::decode: {e}");
@@ -1033,6 +1060,7 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
             checkpoint_at,
             readback: ran,
             sampling,
+            readback_note,
             logits_sha256: sampler.logits_digest(),
             stats: out.stats,
             thinking,
@@ -1200,6 +1228,7 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
             checkpoint_at,
             readback: ReadbackArm::Speculative { k },
             sampling,
+            readback_note: None,
             logits_sha256: sampler.logits_digest(),
             stats: out.stats,
             thinking,
@@ -1482,7 +1511,18 @@ mod tests {
             adaptive: false,
             ..RingArm::CROWN
         });
-        assert_eq!(ring.resolve(&top_p, crown), ring);
+        // A ring asked by name runs what it admits and is demoted, with the
+        // note, for a sampler that needs a host sort (C2); `auto`'s own
+        // choice of the blocking arm carries no note (C1).
+        assert_eq!(ring.resolve(&argmax, crown), ring);
+        assert_eq!(ring.resolve(&temp, crown), ring);
+        assert_eq!(ring.resolve(&top_p, crown), ReadbackArm::Blocking);
+        assert!(ring.demotion(&argmax).is_none());
+        assert!(ring.demotion(&temp).is_none());
+        let note = ring.demotion(&top_p).unwrap();
+        assert!(note.contains("top-p:p=0.9:t=0.6") && note.contains("(C2)"), "{note}");
+        assert!(ReadbackArm::Auto.demotion(&top_p).is_none());
+        assert!(ReadbackArm::Blocking.demotion(&top_p).is_none());
         assert_ne!(ReadbackArm::CROWN.name(), ReadbackArm::Blocking.name());
         assert!(ReadbackArm::CROWN.name().contains("lookahead=1"));
     }

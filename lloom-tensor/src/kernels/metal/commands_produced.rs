@@ -224,9 +224,12 @@ pub struct ProducedStats {
     pub producer_lock_us: u64,
 }
 
+/// The block an event's notification runs: the event and the value reached.
+type NotifyBlock = block2::RcBlock<dyn Fn(NonNull<ProtocolObject<dyn MTLSharedEvent>>, u64)>;
+
 struct Listener {
     listener: Retained<objc2_metal::MTLSharedEventListener>,
-    block: block2::RcBlock<dyn Fn(NonNull<ProtocolObject<dyn MTLSharedEvent>>, u64)>,
+    block: NotifyBlock,
 }
 
 /// The producer-side half of the held queue, beside the state lock.

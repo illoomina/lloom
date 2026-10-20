@@ -68,7 +68,7 @@
 use super::cache_pad::CachePadded;
 use super::contention::{Access, Censused, Contention, Side};
 use super::Buffer;
-use crate::retire::{Completed, Epoch, Retire};
+use crate::retire::{Completed, Epoch, FutureUse, RetireIndex};
 use std::collections::BTreeMap;
 use std::mem::ManuallyDrop;
 use std::ptr::NonNull;
@@ -1460,12 +1460,20 @@ struct PoolState {
     /// Buffers the CPU has released but the GPU may still be using, with the
     /// epoch each must outlive.
     ///
-    /// Ordered by epoch, because that is the order they become reusable in:
-    /// draining is a prefix walk that stops at the first epoch still
-    /// outstanding, never a scan of the whole list. Epochs are assigned from a
-    /// monotone counter at push time, so the list is sorted by construction and
-    /// nothing has to sort it.
-    pending: Retire<FreeNode>,
+    /// Each parked node is owned by one stable record; the epoch queue holds
+    /// versioned notices into the records, ordered by epoch because that is
+    /// the order they become reusable in: draining is a prefix walk that stops
+    /// at the first epoch still outstanding, never a scan. A node taken from
+    /// its record before its epoch completes leaves a notice that later finds
+    /// the record moved on and does nothing, so a late completion never
+    /// poisons or frees what replaced it (`RetireIndex`,
+    /// `dependency-ordered-reuse-design.md` §5).
+    pending: RetireIndex<FreeNode>,
+
+    /// The most bytes this pool has held at once — live, free and pending —
+    /// sampled where backing is added (a miss's adoption), the only place the
+    /// sum grows.
+    held_high_water: usize,
 
     /// Bytes currently sitting in `free`, maintained incrementally so the
     /// budget check never has to walk the buckets.
@@ -1721,7 +1729,8 @@ impl PoolInner {
                 free_buffers: 0,
                 live_buffers: 0,
                 live_bytes: 0,
-                pending: Retire::new(),
+                pending: RetireIndex::new(),
+                held_high_water: 0,
                 free_bytes: 0,
                 free_order: std::collections::VecDeque::new(),
                 free_budget: DEFAULT_FREE_BUDGET_BYTES,
@@ -1791,7 +1800,7 @@ impl PoolInner {
         // branch would not have bought anything measurable either.
         state.counters.deferred += 1;
         super::late_bind::on_release(node.buffer(), epoch);
-        state.pending.retire(epoch, node);
+        state.pending.retire(epoch, node, FutureUse::Closed);
         // No gauge to update: how many buffers are parked is `state.pending`
         // itself, which `occupancy()` reports (issue #507). Mirroring it into
         // `PoolCounters` is what let `reset_counters` zero it.
@@ -2692,6 +2701,12 @@ impl BufferPool {
             state.counters.allocated_bytes += size as u64;
             state.live_buffers += 1;
             state.live_bytes += size;
+            // Backing only grows here, so the high water is exact when taken
+            // here. The pending walk is on a miss, never on a hit.
+            let pending_bytes: usize = state.pending.iter().map(|n| n.size()).sum();
+            state.held_high_water = state
+                .held_high_water
+                .max(state.live_bytes + state.free_bytes + pending_bytes);
             // Production captured eligibility at lookup, before Metal could
             // finish and another host could drain the pending candidates.
             // Direct adoption (probes/fuzzers) has no lookup observation.
@@ -2938,6 +2953,53 @@ impl BufferPool {
             pending_bytes: state.pending.iter().map(|n| n.buffer().length()).sum(),
         }
     }
+
+    /// The pool's census ([`PoolCensus`]). Walks the pending records, so a
+    /// diagnostic, not a per-token read.
+    pub fn census(&self) -> PoolCensus {
+        let state = self.inner.state.lock(Side::Host);
+        let pending_bytes: usize = state.pending.iter().map(|n| n.size()).sum();
+        PoolCensus {
+            held_bytes: state.live_bytes + state.free_bytes + pending_bytes,
+            held_high_water: state.held_high_water,
+            cached_bytes: state.free_bytes,
+            pending_bytes,
+            pending_records: state.pending.records(),
+            pending_notices: state.pending.notices(),
+            stale_notices: state.pending.stale_notices(),
+            reuse_hits: state.counters.hits,
+            reuse_served_bytes: state.counters.served_bytes,
+            allocations: state.counters.allocations,
+        }
+    }
+}
+
+/// What the pool holds and what holding it costs, at one instant
+/// (`BufferPool::census`, `dependency-ordered-reuse-design.md` §13.7): the
+/// unique backing the pool has ever held at once, the bytes cached for reuse,
+/// the metadata the pending index keeps, and the reuse actually engaged.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct PoolCensus {
+    /// Live, free and pending bytes now.
+    pub held_bytes: usize,
+    /// The most `held_bytes` has been, sampled where backing is added.
+    pub held_high_water: usize,
+    /// Free bytes: backing cached for the next request.
+    pub cached_bytes: usize,
+    /// Released bytes still waiting on their epoch.
+    pub pending_bytes: usize,
+    /// Pending records allocated (held or vacant) and notices queued (stale
+    /// ones included): the index's metadata.
+    pub pending_records: usize,
+    pub pending_notices: usize,
+    /// Notices dropped because their record had moved on, since construction.
+    pub stale_notices: u64,
+    /// Requests served by reuse, and the bytes they were served (counters
+    /// since the last reset).
+    pub reuse_hits: u64,
+    pub reuse_served_bytes: u64,
+    /// Requests that allocated backing (counters since the last reset).
+    pub allocations: u64,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -5065,6 +5127,106 @@ mod tests {
             (1 << 20) - 2048,
             "the whole over-service is attributed to the asking band"
         );
+    }
+
+    impl PoolState {
+        /// Take the newest pending node of `size` before its epoch completes,
+        /// as a device-ordered acquisition takes one; test-only until such an
+        /// acquisition exists.
+        fn withdraw_pending(&mut self, size: usize) -> Option<FreeNode> {
+            let ticket = self
+                .pending
+                .tickets()
+                .filter(|(_, n)| n.size() == size)
+                .map(|(t, _)| t)
+                .last()?;
+            let node = self.pending.withdraw(ticket)?;
+            super::super::late_bind::on_leave(node.buffer());
+            self.live_buffers += 1;
+            self.live_bytes += size;
+            Some(node)
+        }
+    }
+
+    /// A buffer taken from pending before its epoch completes and released
+    /// again in a later epoch: the first epoch's completion finds its record
+    /// moved on and does nothing — the buffer stays pending under its second
+    /// release, out of the free list — and only the second epoch's completion
+    /// frees it (`dependency-ordered-reuse-design.md` §5: a late completion
+    /// never frees or poisons a successor's storage).
+    #[test]
+    fn a_late_completion_never_frees_a_buffer_released_again_after_it() {
+        let dev = device();
+        let (pool, clock) = pool_with_clock();
+        let a = alloc(&pool, &dev, 4096);
+        let addr = a.raw_addr();
+        drop(a);
+        let node = pool
+            .inner
+            .state
+            .lock(Side::Host)
+            .withdraw_pending(4096)
+            .expect("the released buffer is pending");
+        let reused = node.into_handle();
+        assert_eq!(reused.raw_addr(), addr);
+        let first = clock.commit_epoch();
+        drop(reused);
+        clock.mark_completed(first);
+        pool.drain_completed();
+        let occ = pool.occupancy();
+        assert_eq!(
+            (occ.free_buffers, occ.pending_buffers),
+            (0, 1),
+            "the first release's completion freed the second release's buffer"
+        );
+        assert_eq!(pool.census().stale_notices, 1);
+        gpu_completes(&pool, &clock);
+        let occ = pool.occupancy();
+        assert_eq!((occ.free_buffers, occ.pending_buffers), (1, 0));
+        let again = pool
+            .acquire(4096)
+            .expect("reused once its own epoch completed");
+        assert_eq!(again.raw_addr(), addr);
+    }
+
+    /// The census: two buffers live at once set the high water; released,
+    /// they are pending with a record and a notice each; completed, they are
+    /// cached and the notices are gone while the records keep their
+    /// capacity; served again, the hit adds no backing.
+    #[test]
+    fn the_census_counts_backing_cache_metadata_and_engaged_reuse() {
+        let dev = device();
+        let (pool, clock) = pool_with_clock();
+        let a = alloc(&pool, &dev, 4096);
+        let b = alloc(&pool, &dev, 4096);
+        let c = pool.census();
+        assert_eq!((c.held_bytes, c.held_high_water), (8192, 8192));
+        assert_eq!(c.allocations, 2);
+        drop(a);
+        drop(b);
+        let c = pool.census();
+        assert_eq!(
+            (c.pending_bytes, c.pending_records, c.pending_notices),
+            (8192, 2, 2)
+        );
+        gpu_completes(&pool, &clock);
+        let c = pool.census();
+        assert_eq!(
+            (
+                c.cached_bytes,
+                c.pending_bytes,
+                c.pending_notices,
+                c.pending_records
+            ),
+            (8192, 0, 0, 2)
+        );
+        let hits = c.reuse_hits;
+        let again = alloc(&pool, &dev, 4096);
+        let c = pool.census();
+        assert_eq!(c.reuse_hits, hits + 1);
+        assert_eq!(c.allocations, 2, "a hit allocated backing");
+        assert_eq!((c.held_bytes, c.held_high_water), (8192, 8192));
+        drop(again);
     }
 }
 

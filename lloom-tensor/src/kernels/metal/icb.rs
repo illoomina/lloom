@@ -1336,6 +1336,44 @@ fn is_packed(name: &str) -> bool {
     name.ends_with(crate::kernels::kernels::params::PACKED_SUFFIX)
 }
 
+/// Which covered commands carry a `setBarrier`, in command order: those with
+/// a conflict against an earlier command of their run, scanned as far back as
+/// `scope` says (see `BarrierScope`; the scan's reasoning is at its one
+/// caller, `encode_plan`). A run is a stretch of consecutive positions, each
+/// executed by its own `executeCommandsInBuffer`, so a barrier in an earlier
+/// run says nothing about ordering inside this one.
+pub(crate) fn plan_barriers(
+    step: &[StepDispatch],
+    covered: &[usize],
+    scope: BarrierScope,
+) -> Vec<bool> {
+    let mut planned = Vec::with_capacity(covered.len());
+    let mut run_first_cmd = 0usize;
+    let mut last_barrier_cmd: Option<usize> = None;
+    for (cmd_index, &pos) in covered.iter().enumerate() {
+        if cmd_index == 0 || covered[cmd_index - 1] + 1 != pos {
+            run_first_cmd = cmd_index;
+            last_barrier_cmd = None;
+        }
+        let scan_from = match scope {
+            BarrierScope::RunStart => run_first_cmd,
+            // Everything at or before the last barrier is taken as already
+            // ordered against this command, as candle's `prev_outputs`
+            // replacement expresses -- which a command-property barrier does
+            // not deliver.
+            BarrierScope::SinceBarrier => last_barrier_cmd.map_or(run_first_cmd, |b| b + 1),
+        };
+        let needs = covered[scan_from..cmd_index]
+            .iter()
+            .any(|&earlier| step[pos].conflicts_with(&step[earlier]));
+        if needs {
+            last_barrier_cmd = Some(cmd_index);
+        }
+        planned.push(needs);
+    }
+    planned
+}
+
 /// Build the ICB and encode one command per covered position.
 fn encode_plan(
     device: &crate::kernels::metal::Device,
@@ -1374,15 +1412,7 @@ fn encode_plan(
     // Barriers encoded on commands, reported so the count is observed rather
     // than inferred -- §9.2f's rule, applied to the quantity this file adds.
     let mut barriers = 0usize;
-    // First command index of the run being encoded, so a barrier scan stays
-    // inside it. Positions are ascending, so a run continues while the position
-    // is one past the previous.
-    let mut run_first_cmd = 0usize;
-    // The last command in this run that carried a barrier, for
-    // `BarrierScope::SinceBarrier`. Per run, not per buffer: a run is executed
-    // by its own `executeCommandsInBuffer`, so a barrier in an earlier run says
-    // nothing about ordering inside this one.
-    let mut last_barrier_cmd: Option<usize> = None;
+    let planned = plan_barriers(step, covered, barrier_scope);
 
     for (cmd_index, &pos) in covered.iter().enumerate() {
         // `covered` is ascending and `cmd_index` walks it, so a run's commands
@@ -1390,8 +1420,6 @@ fn encode_plan(
         // in the step -- which is what lets one `executeCommandsInBuffer` serve
         // a whole run.
         if cmd_index == 0 || covered[cmd_index - 1] + 1 != pos {
-            run_first_cmd = cmd_index;
-            last_barrier_cmd = None;
             run_at[pos] = Some(runs.len());
             runs.push(RunBuild::open(pos, cmd_index));
         }
@@ -1468,19 +1496,9 @@ fn encode_plan(
         //
         // O(run length squared) at plan time, once -- not on the per-token path,
         // so §15.2 #10 is not engaged. Runs are 12 to 17 commands.
-        let scan_from = match barrier_scope {
-            BarrierScope::RunStart => run_first_cmd,
-            // Everything at or before the last barrier is already ordered
-            // against this command by that barrier, exactly as candle's
-            // `prev_outputs` replacement expresses.
-            BarrierScope::SinceBarrier => last_barrier_cmd.map_or(run_first_cmd, |b| b + 1),
-        };
-        let needs_barrier = covered[scan_from..cmd_index]
-            .iter()
-            .any(|&earlier| d.conflicts_with(&step[earlier]));
+        let needs_barrier = planned[cmd_index];
         if needs_barrier {
             barriers += 1;
-            last_barrier_cmd = Some(cmd_index);
         }
         barrier.push(needs_barrier);
         encode_command(&cmd, d, needs_barrier);

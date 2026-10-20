@@ -5,8 +5,9 @@
 //! - the reference's two bisections against the linear definitions they
 //!   shortcut, and the monotone mass both rest on;
 //! - the exponential against f64, and its bits pinned;
-//! - pins that tell the contract's arithmetic from a sequential sum and from
-//!   the platform's `exp`, so neither can stand in for it unnoticed;
+//! - pins that tell the contract's arithmetic from a sequential sum, from a
+//!   correctly rounded `exp` and from the platform's `exp`, on every host, so
+//!   none can stand in for it unnoticed;
 //! - the draw against the distribution it defines (χ², with controls).
 //!
 //! Each implementation of the contract (the host arm, the Metal arms) is
@@ -377,8 +378,8 @@ const EXP32_PINS: [(f32, u32); 13] = [
     (-0.510_175_17, 0x3f19_b330),
 ];
 
-/// The foils: the contract's pipeline with a plain left-to-right sum, and
-/// with the platform's `exp`.
+/// The foils: the contract's pipeline with a plain left-to-right sum, with a
+/// correctly rounded exponential, and with the platform's `exp`.
 fn sequential(a: &[f32]) -> f32 {
     let mut s = 0f32;
     for &x in a {
@@ -391,18 +392,30 @@ fn platform_exp(x: f32) -> f32 {
     x.exp()
 }
 
+/// `exp` correctly rounded to f32: f64's `exp`, rounded once. The same on
+/// every host wherever the f64 value is far from an f32 rounding boundary
+/// ([`CR_MARGIN`]), which the pins check on every weight they compute.
+fn cr_exp(x: f32) -> f32 {
+    (x as f64).exp() as f32
+}
+
 const FOLD_FOIL: Arith = Arith {
     exp: exp32,
     mass: sequential,
+};
+const CR_EXP_FOIL: Arith = Arith {
+    exp: cr_exp,
+    mass,
 };
 const EXP_FOIL: Arith = Arith {
     exp: platform_exp,
     mass,
 };
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum Foil {
     Fold,
+    CrExp,
     Exp,
 }
 
@@ -410,7 +423,25 @@ impl Foil {
     fn arith(self) -> Arith {
         match self {
             Foil::Fold => FOLD_FOIL,
+            Foil::CrExp => CR_EXP_FOIL,
             Foil::Exp => EXP_FOIL,
+        }
+    }
+}
+
+/// A pin's scores: a noise row, or the two scores `[x, 0]`, whose one weight
+/// other than the top score's 1 is `exp(x)` (at `T = 1`).
+#[derive(Clone, Copy, Debug)]
+enum Row {
+    Noise { seed: u64, vocab: usize },
+    Two(f32),
+}
+
+impl Row {
+    fn scores(self) -> Vec<f32> {
+        match self {
+            Row::Noise { seed, vocab } => noise_row(seed, vocab, 0.0),
+            Row::Two(x) => vec![x, 0.0],
         }
     }
 }
@@ -419,94 +450,171 @@ impl Foil {
 /// length (the set is that prefix of the ranked candidates), or a draw.
 #[derive(Clone, Copy, Debug)]
 struct Pin {
-    seed: u64,
-    vocab: usize,
+    row: Row,
     params: Params,
     /// `Some(u)`: a draw at `u`, pinned to `want`; `None`: the kept length.
     u: Option<f32>,
     want: usize,
-    foil: Foil,
+    /// The foil the pin parts from on every host; `None` for a pin that
+    /// holds the contract's value only.
+    foil: Option<Foil>,
 }
 
-/// Found by `search_pins` below (`measurements/issue-1036-raw/step1/run2/
-/// search-pins.out`), then fixed here.
-const PINS: [Pin; 9] = [
+const fn noise(seed: u64, vocab: usize) -> Row {
+    Row::Noise { seed, vocab }
+}
+
+/// The noise rows were found by `search_pins` (`measurements/issue-1036-raw/
+/// step1/run2/search-pins.out`, the `exp` rows against the platform's `exp`
+/// on the Mac; `measurements/issue-1036-raw/pins-x86-20261020/` for why
+/// they are held to a correctly rounded one), the two-score rows by
+/// `search_two_score_pins`.
+const PINS: [Pin; 15] = [
     Pin {
-        seed: 7166411029125059793,
-        vocab: 3000,
+        row: noise(7166411029125059793, 3000),
         params: Params::new(2.0, 1181, 0.9696083068847656),
         u: None,
         want: 1056,
-        foil: Foil::Fold,
+        foil: Some(Foil::Fold),
     },
     Pin {
-        seed: 14993398499489279759,
-        vocab: 3000,
+        row: noise(14993398499489279759, 3000),
         params: Params::new(1.0, 455, 0.5804826617240906),
         u: None,
         want: 168,
-        foil: Foil::Fold,
+        foil: Some(Foil::Fold),
     },
     Pin {
-        seed: 10752749459413695495,
-        vocab: 3000,
+        row: noise(10752749459413695495, 3000),
         params: Params::new(0.5, 0, 1.0),
         u: Some(0.16891079),
         want: 490,
-        foil: Foil::Fold,
+        foil: Some(Foil::Fold),
     },
     Pin {
-        seed: 8518066908502861862,
-        vocab: 3000,
+        row: noise(8518066908502861862, 3000),
         params: Params::new(0.5, 480, 1.0),
         u: Some(0.46938762),
         want: 1505,
-        foil: Foil::Fold,
+        foil: Some(Foil::Fold),
     },
+    // Parts from the platform's `exp` on macOS only: a correctly rounded
+    // `exp` (and glibc's) keeps 2548 too, so no foil is asserted here.
     Pin {
-        seed: 5445465867046481102,
-        vocab: 5000,
+        row: noise(5445465867046481102, 5000),
         params: Params::new(0.5, 0, 0.9999961853027344),
         u: None,
         want: 2548,
-        foil: Foil::Exp,
+        foil: None,
     },
     Pin {
-        seed: 9388319547254842595,
-        vocab: 5000,
+        row: noise(9388319547254842595, 5000),
         params: Params::new(2.0, 1896, 0.298232764005661),
         u: None,
         want: 265,
-        foil: Foil::Exp,
+        foil: Some(Foil::CrExp),
     },
     Pin {
-        seed: 11469413305603673856,
-        vocab: 5000,
+        row: noise(11469413305603673856, 5000),
         params: Params::new(1.0, 245, 1.0),
         u: Some(0.44293648),
         want: 2153,
-        foil: Foil::Exp,
+        foil: Some(Foil::CrExp),
     },
     Pin {
-        seed: 5445465867046481102,
-        vocab: 5000,
+        row: noise(5445465867046481102, 5000),
         params: Params::new(0.5, 0, 1.0),
         u: Some(0.2516549),
         want: 1339,
-        foil: Foil::Exp,
+        foil: Some(Foil::CrExp),
     },
     Pin {
-        seed: 3232577526175246933,
-        vocab: 5000,
+        row: noise(3232577526175246933, 5000),
         params: Params::new(1.0, 1306, 1.0),
         u: Some(0.009029534),
         want: 32,
-        foil: Foil::Exp,
+        foil: Some(Foil::CrExp),
     },
+    TWO_SCORE_PINS[0],
+    TWO_SCORE_PINS[1],
+    TWO_SCORE_PINS[2],
+    TWO_SCORE_PINS[3],
+    TWO_SCORE_PINS[4],
+    TWO_SCORE_PINS[5],
 ];
 
+/// Two-score rows where `exp32(x)` is not the correctly rounded `exp(x)`
+/// and the exact value lies within [`TWO_SCORE_D`] of an ulp of that
+/// rounded value: an `exp` within `1 - TWO_SCORE_D` ulp of exact returns
+/// it, so the platform's `exp` parts from the contract on every such host.
+const TWO_SCORE_PINS: [Pin; 6] = [
+    two(-3.8519363, None, Some(0.020796875), 0),
+    two(-3.0653982, None, Some(0.04455732), 0),
+    two(-0.3266518, Some(0.5809445381164551), None, 1),
+    two(-2.4245012, None, Some(0.08132333), 0),
+    two(-3.7553349, Some(0.9771420955657959), None, 2),
+    two(-0.34614348, Some(0.5856820940971375), None, 1),
+];
+
+const fn two(x: f32, p: Option<f64>, u: Option<f32>, want: usize) -> Pin {
+    Pin {
+        row: Row::Two(x),
+        params: Params::new(
+            1.0,
+            0,
+            match p {
+                Some(p) => p,
+                None => 1.0,
+            },
+        ),
+        u,
+        want,
+        foil: Some(Foil::Exp),
+    }
+}
+
+/// The largest distance, in ulps of the correctly rounded value, of the
+/// exact `exp(x)` from it at a two-score pin.
+const TWO_SCORE_D: f64 = 0.25;
+
+/// The least distance, in f32 ulps, of a correctly-rounded-foil weight's f64
+/// value from an f32 rounding boundary: 2^-20 ulp is 2^9 ulps of f64, far
+/// beyond any f64 `exp`'s error, so the rounding is the same everywhere.
+const CR_MARGIN: f64 = 1.0 / (1u64 << 20) as f64;
+
+/// The f32 ulp at `y` (positive, finite).
+fn ulp32(y: f32) -> f64 {
+    y.next_up() as f64 - y as f64
+}
+
+/// The weights' inputs `(z - m) · 1/T` of a pin's kept candidates.
+fn exp_inputs(p: &Pin) -> Vec<f32> {
+    let z = p.row.scores();
+    let inv = oracle::inv_t(p.params.temperature).unwrap();
+    let kept = oracle::top_k(&z, p.params.k).unwrap();
+    let m = z[kept[0]];
+    kept.iter().map(|&i| (z[i] - m) * inv).collect()
+}
+
+/// The least distance, in f32 ulps, of `exp(x)` in f64 from a midpoint
+/// between two f32 values, over `xs`.
+fn cr_margin(xs: &[f32]) -> f64 {
+    xs.iter()
+        .map(|&x| {
+            let e = (x as f64).exp();
+            let r = e as f32;
+            let mid = if e >= r as f64 {
+                r as f64 + ulp32(r) / 2.0
+            } else {
+                r as f64 - ulp32(r.next_down()) / 2.0
+            };
+            (mid - e).abs() / ulp32(r)
+        })
+        .fold(f64::INFINITY, f64::min)
+}
+
 fn pin_value(a: Arith, p: &Pin) -> usize {
-    let z = noise_row(p.seed, p.vocab, 0.0);
+    let z = p.row.scores();
     match p.u {
         None => a.nucleus(&z, p.params).unwrap().len(),
         Some(u) => a.draw(&z, p.params, u).unwrap() as usize,
@@ -514,29 +622,68 @@ fn pin_value(a: Arith, p: &Pin) -> usize {
 }
 
 /// The contract's arithmetic decides each pin as pinned, and the foil the
-/// pin names decides it otherwise: a sum taken in another order, or the
-/// platform's `exp`, cannot stand in for the contract's unseen.
+/// pin names decides it otherwise, on every host: a sum taken in another
+/// order, a correctly rounded `exp`, or the platform's `exp` cannot stand in
+/// for the contract's unseen. Each foil's verdict is host-independent by
+/// construction: the fold foil is IEEE arithmetic and `exp32` (whose fused
+/// multiply-adds are correctly rounded everywhere); the correctly rounded
+/// foil's weights sit [`CR_MARGIN`] from a rounding boundary; the platform's
+/// `exp` is met on two-score rows where any `exp` within `1 - TWO_SCORE_D`
+/// ulp returns the correctly rounded weight.
 #[test]
 fn the_pins_tell_the_contract_from_its_foils() {
-    let (mut fold, mut exp) = (0, 0);
+    let (mut fold, mut cr, mut exp, mut held) = (0, 0, 0, 0);
     for p in PINS.iter() {
         assert_eq!(pin_value(CONTRACT, p), p.want, "{p:?}: the contract");
-        assert_ne!(
-            pin_value(p.foil.arith(), p),
-            p.want,
-            "{p:?}: the foil agrees"
-        );
         match p.foil {
-            Foil::Fold => fold += 1,
-            Foil::Exp => exp += 1,
+            Some(foil) => assert_ne!(
+                pin_value(foil.arith(), p),
+                p.want,
+                "{p:?}: the foil agrees"
+            ),
+            None => println!(
+                "PIN contract only {:?}: the platform's exp gives {} (contract {})",
+                p.row,
+                pin_value(EXP_FOIL, p),
+                p.want
+            ),
+        }
+        match p.foil {
+            Some(Foil::Fold) => fold += 1,
+            Some(Foil::CrExp) => {
+                let margin = cr_margin(&exp_inputs(p));
+                assert!(
+                    margin > CR_MARGIN,
+                    "{p:?}: a correctly rounded weight is {margin} ulp from a boundary"
+                );
+                cr += 1;
+            }
+            Some(Foil::Exp) => {
+                let Row::Two(x) = p.row else {
+                    panic!("{p:?}: the platform's exp is pinned on two-score rows")
+                };
+                let (e, r) = ((x as f64).exp(), cr_exp(x));
+                let d = (e - r as f64).abs() / ulp32(r);
+                assert!(d <= TWO_SCORE_D, "{p:?}: exp(x) is {d} ulp from its rounding");
+                assert_ne!(exp32(x), r, "{p:?}: exp32 is correctly rounded at x");
+                assert_eq!(
+                    platform_exp(x),
+                    r,
+                    "{p:?}: this host's exp is more than {} ulp off at x",
+                    1.0 - TWO_SCORE_D
+                );
+                exp += 1;
+            }
+            None => held += 1,
         }
     }
-    assert_eq!((fold, exp), (4, 5));
+    assert_eq!((fold, cr, exp, held), (4, 4, 6, 1));
 }
 
-/// Finds rows the contract and a foil decide differently: `cargo test -p
-/// lloom-tensor --test main sampling_contract::search_pins -- --ignored
-/// --nocapture`.
+/// Finds noise rows the contract and a foil decide differently: `cargo test
+/// -p lloom-tensor --test main sampling_contract::search_pins -- --ignored
+/// --nocapture`. The `exp` rows are searched against the correctly rounded
+/// `exp`, whose verdict does not move with the host's libm.
 #[test]
 #[ignore = "a search, run by hand to make PINS"]
 fn search_pins() {
@@ -550,7 +697,7 @@ fn search_pins() {
         let foil = if attempt % 2 == 0 {
             Foil::Fold
         } else {
-            Foil::Exp
+            Foil::CrExp
         };
         let k = if attempt % 5 == 0 {
             0
@@ -561,6 +708,7 @@ fn search_pins() {
         let kept = oracle::top_k(&z, k).unwrap();
         let m = z[kept[0]];
         let total = mass(&CONTRACT.weights(&z, &kept, m, inv));
+        let decided = |pin: &Pin| foil != Foil::CrExp || cr_margin(&exp_inputs(pin)) > CR_MARGIN;
         // A nucleus pin: p at the ratio of a random prefix's mass, and the
         // f32 steps either side of it.
         let j = 1 + splitmix(&mut s) as usize % (kept.len() - 1);
@@ -573,19 +721,18 @@ fn search_pins() {
         ] {
             let params = Params::new(t, k, p32 as f64);
             let pin = Pin {
-                seed,
-                vocab,
+                row: noise(seed, vocab),
                 params,
                 u: None,
                 want: 0,
-                foil,
+                foil: Some(foil),
             };
             let (a, b) = (pin_value(CONTRACT, &pin), pin_value(foil.arith(), &pin));
-            if a != b {
+            if a != b && decided(&pin) {
                 println!("NUCLEUS {:?}", Pin { want: a, ..pin });
                 match foil {
                     Foil::Fold => found.0 += 1,
-                    Foil::Exp => found.1 += 1,
+                    _ => found.1 += 1,
                 }
                 break;
             }
@@ -600,19 +747,18 @@ fn search_pins() {
                 continue;
             }
             let pin = Pin {
-                seed,
-                vocab,
+                row: noise(seed, vocab),
                 params,
                 u: Some(u),
                 want: 0,
-                foil,
+                foil: Some(foil),
             };
             let (a, b) = (pin_value(CONTRACT, &pin), pin_value(foil.arith(), &pin));
-            if a != b {
+            if a != b && decided(&pin) {
                 println!("DRAW {:?}", Pin { want: a, ..pin });
                 match foil {
                     Foil::Fold => found.2 += 1,
-                    Foil::Exp => found.3 += 1,
+                    _ => found.3 += 1,
                 }
                 break;
             }
@@ -622,9 +768,72 @@ fn search_pins() {
         }
     }
     println!(
-        "FOUND nucleus fold={} exp={} draw fold={} exp={}",
+        "FOUND nucleus fold={} cr_exp={} draw fold={} cr_exp={}",
         found.0, found.1, found.2, found.3
     );
+}
+
+/// Finds two-score rows `[x, 0]` on which `exp32(x)` and the correctly
+/// rounded `exp(x)` part, with the exact value within [`TWO_SCORE_D`] of the
+/// rounded one: `cargo test -p lloom-tensor --test main
+/// sampling_contract::search_two_score_pins -- --ignored --nocapture`.
+#[test]
+#[ignore = "a search, run by hand to make TWO_SCORE_PINS"]
+fn search_two_score_pins() {
+    let mut s = 0x1036_e4u64;
+    let (mut nucleus, mut draws) = (0, 0);
+    let mut tried = 0u64;
+    while nucleus < 3 || draws < 3 {
+        tried += 1;
+        let x = -uniform(&mut s) * 4.0;
+        if x == 0.0 {
+            continue;
+        }
+        let (c, r) = (exp32(x), cr_exp(x));
+        let d = ((x as f64).exp() - r as f64).abs() / ulp32(r);
+        if c == r || d > TWO_SCORE_D {
+            continue;
+        }
+        if nucleus < 3 {
+            // p at the top score's share of the mass, and the f32 steps
+            // either side of it.
+            let p0 = 1.0 / mass(&[c, 1.0]);
+            for p32 in [
+                p0.next_down().next_down(),
+                p0.next_down(),
+                p0,
+                p0.next_up(),
+                p0.next_up().next_up(),
+            ] {
+                let pin = two(x, Some(p32 as f64), None, 0);
+                let (a, b) = (pin_value(CONTRACT, &pin), pin_value(CR_EXP_FOIL, &pin));
+                if a != b {
+                    println!("NUCLEUS x={x:?} p={:?} want={a}", p32 as f64);
+                    nucleus += 1;
+                    break;
+                }
+            }
+        }
+        if draws < 3 {
+            // u at the low score's share of the mass, and the f32 steps
+            // either side of it.
+            let mut u = c / mass(&[c, 1.0]);
+            for _ in 0..3 {
+                u = u.next_down();
+            }
+            for _ in 0..7 {
+                let pin = two(x, None, Some(u), 0);
+                let (a, b) = (pin_value(CONTRACT, &pin), pin_value(CR_EXP_FOIL, &pin));
+                if a != b {
+                    println!("DRAW x={x:?} u={u:?} want={a}");
+                    draws += 1;
+                    break;
+                }
+                u = u.next_up();
+            }
+        }
+    }
+    println!("FOUND tried={tried} nucleus={nucleus} draw={draws}");
 }
 
 /// Critical values of χ² at p = 0.001, by degrees of freedom.

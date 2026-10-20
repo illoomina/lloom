@@ -138,6 +138,7 @@ fn lfm2_tiny_chats_on_the_cpu_and_metal() {
 /// Qwen4-exp: no BOS; the tokenizer sits beside the GGUF.
 #[test]
 fn qwen4exp_tiny_chats_on_the_cpu_and_metal() {
+    reference_purpose();
     let dir = scratch("qwen4exp");
     let model = write::<Qwen4ExpTiny>(&dir);
     let tok = dir.join("tokenizer.json");
@@ -157,6 +158,7 @@ fn qwen4exp_tiny_chats_on_the_cpu_and_metal() {
 /// the tokenizer sits beside it.
 #[test]
 fn qwen3_5_tiny_chats_on_the_cpu_and_metal() {
+    reference_purpose();
     let dir = scratch("qwen3_5");
     let model = write::<Qwen3_5Tiny>(&dir);
     let tok = dir.join("tokenizer.json");
@@ -315,6 +317,7 @@ fn assert_three_turns_reuse(model: &Path, tok: &str, arms: Vec<Vec<&str>>) {
 /// same conversation). The load reports the ring.
 #[test]
 fn qwen3_5_tiny_reuses_the_conversation_across_turns() {
+    reference_purpose();
     let dir = scratch("qwen3_5_turns");
     let model = write::<Qwen3_5Tiny>(&dir);
     let tok = dir.join("tokenizer.json");
@@ -357,6 +360,7 @@ fn qwen4exp_tiny_reuses_the_conversation_across_turns() {
 /// refuses the method by name.
 #[test]
 fn qwen3_5_tiny_mtp_is_byte_identical_to_greedy_through_chat() {
+    reference_purpose();
     let dir = scratch("qwen3_5_mtp");
     let mut cfg = Qwen3_5Tiny::template();
     TinyConfig::set_axis(
@@ -959,6 +963,7 @@ fn served_ids(server: &Server, mut fields: Value) -> (Vec<u32>, Value) {
 /// block at the first token.
 #[test]
 fn thinking_budget_forces_the_end_marker_through_serve() {
+    reference_purpose();
     struct Family {
         name: &'static str,
         tok: TinyTokenizer,
@@ -2082,6 +2087,14 @@ fn lfm2_tiny_serve_queues_concurrent_requests_and_answers_each_as_alone() {
         drop(server);
     }
     std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The tiny Qwen's head dim (16) has no fused attention path, so a
+/// production load refuses it on Metal; the test declares the reference
+/// purpose, under which it attends through the composed oracle. Every child
+/// the test spawns inherits it.
+fn reference_purpose() {
+    std::env::set_var("LLOOM_EXECUTION__PURPOSE", "reference");
 }
 
 /// The process's front-end counters (`/health`): template renders and

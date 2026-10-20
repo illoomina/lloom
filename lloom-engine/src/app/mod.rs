@@ -1576,4 +1576,36 @@ mod executor_and_memory_tests {
         );
         assert_eq!(o.memory.kv_capacity, 8704, "the serving default");
     }
+
+    /// A speculative body does not install the single-key arena, so the load
+    /// installs and reports the pass-plan cache instead and names the change;
+    /// with the cache off nothing planned serves, and says so. A plain body
+    /// keeps the arena, and replay is the installer's refusal, not this.
+    #[test]
+    fn an_arena_under_a_speculative_body_is_not_reported_as_installed() {
+        let o = resolve_options_uninstalled(&common(&["--arena"]), &no_front).unwrap();
+        assert_eq!(o.executor.under_body(false), (o.executor.clone(), None));
+        let (spec, note) = o.executor.under_body(true);
+        assert_eq!(
+            spec.line(),
+            "arena=off packed=false replay=off pass_plans=true"
+        );
+        let note = note.expect("the declined arena is named");
+        assert!(
+            note.starts_with("executor.arena is not installed under a speculative body")
+                && note.ends_with("the pass-plan cache serves instead"),
+            "{note}"
+        );
+        let o =
+            resolve_options_uninstalled(&common(&["--arena", "--pass-plans", "false"]), &no_front)
+                .unwrap();
+        let (spec, note) = o.executor.under_body(true);
+        assert_eq!(
+            spec.line(),
+            "arena=off packed=false replay=off pass_plans=false"
+        );
+        assert!(note.unwrap().contains("no planned executor serves"));
+        let o = resolve_options_uninstalled(&common(&["--replay"]), &no_front).unwrap();
+        assert_eq!(o.executor.under_body(true), (o.executor.clone(), None));
+    }
 }

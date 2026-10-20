@@ -219,6 +219,7 @@ pub fn load(first: PathBuf, model: &LoadConfig, shape: &Shape) -> Result<Box<dyn
         source,
         binding,
         &device,
+        model.purpose().map_err(anyhow::Error::msg)?,
         machine,
         shape.decode.clone(),
         config,

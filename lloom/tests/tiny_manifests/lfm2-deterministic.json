@@ -36,6 +36,7 @@
       "smallest_for": [
         "census|gemm_nn_f32_f32_64_32_32_2_2",
         "census|gemm_nt_f32_f32_32_64_16_1_2",
+        "census|gemv_float16_bm1_bn8_sm1_sn32_tm4_tn4_nc0_axpby0",
         "census|gemv_t_float32_bm1_bn2_sm8_sn4_tm4_tn4_nc0_axpby0"
       ]
     },
@@ -366,77 +367,6 @@
       ]
     },
     {
-      "describe": "vocab_size=64 hidden_size=4 intermediate_size=256 num_hidden_layers=3 num_attention_heads=2 num_key_value_heads=1 conv_l_cache=3 prompt=1 decode=1 dense=F32 arm=sdpa",
-      "geometry": "40000400000103000200010003000101000001",
-      "reaches": [
-        "probe|flash_decoding_head_dim|dims.contains(&head_dim)|false",
-        "probe|sdpa_head_dim|SDPA_FULL_HEAD_DIMS.contains(&head_dim) && !(head_dim == 512 && is_f32)|false",
-        "probe|sdpa_vector_head_dim|SDPA_VECTOR_HEAD_DIMS.contains(&head_dim) && !(head_dim == 512 && is_f32)|false",
-        "census|gemv_float16_bm1_bn1_sm8_sn4_tm4_tn4_nc0_axpby0",
-        "census|copy2d_f16",
-        "census|bmul_f16",
-        "census|rmsnorm_f16",
-        "census|badd_f16",
-        "census|cast_f16_f32",
-        "census|gemv_float16_bm1_bn8_sm1_sn32_tm4_tn4_nc0_axpby0",
-        "census|silu_f16",
-        "census|cast_f32_f16",
-        "census|copy_f16_strided",
-        "census|fast_sum_f16",
-        "census|gemv_float16_bm1_bn1_sm8_sn4_tm1_tn4_nc0_axpby0",
-        "census|rope_f16",
-        "census|affine_f32",
-        "census|gemv_float32_bm1_bn1_sm8_sn4_tm1_tn4_nc0_axpby0",
-        "census|gemv_t_float32_bm1_bn2_sm8_sn4_tm4_tn1_nc0_axpby0",
-        "census|is_u32_f16",
-        "census|softmax_f32",
-        "census|cast_u32_f32",
-        "census|cos_f32",
-        "census|gemv_float32_bm1_bn1_sm8_sn4_tm4_tn4_nc0_axpby0",
-        "census|sin_f32"
-      ],
-      "smallest_for": [
-        "census|gemv_float16_bm1_bn8_sm1_sn32_tm4_tn4_nc0_axpby0",
-        "census|gemv_float32_bm1_bn1_sm8_sn4_tm1_tn4_nc0_axpby0",
-        "probe|flash_decoding_head_dim|dims.contains(&head_dim)|false",
-        "probe|sdpa_head_dim|SDPA_FULL_HEAD_DIMS.contains(&head_dim) && !(head_dim == 512 && is_f32)|false",
-        "probe|sdpa_vector_head_dim|SDPA_VECTOR_HEAD_DIMS.contains(&head_dim) && !(head_dim == 512 && is_f32)|false"
-      ]
-    },
-    {
-      "describe": "vocab_size=64 hidden_size=32 intermediate_size=256 num_hidden_layers=3 num_attention_heads=2 num_key_value_heads=1 conv_l_cache=3 prompt=1 decode=1 dense=F32 arm=flash",
-      "geometry": "40002000000103000200010003000101000002",
-      "reaches": [
-        "probe|flash_decoding_head_dim|dims.contains(&head_dim)|false",
-        "probe|sdpa_head_dim|SDPA_FULL_HEAD_DIMS.contains(&head_dim) && !(head_dim == 512 && is_f32)|false",
-        "probe|sdpa_vector_head_dim|SDPA_VECTOR_HEAD_DIMS.contains(&head_dim) && !(head_dim == 512 && is_f32)|false",
-        "census|gemv_float16_bm1_bn1_sm8_sn4_tm4_tn4_nc0_axpby0",
-        "census|copy2d_f16",
-        "census|bmul_f16",
-        "census|rmsnorm_f16",
-        "census|badd_f16",
-        "census|cast_f16_f32",
-        "census|gemv_float16_bm4_bn1_sm1_sn32_tm4_tn4_nc0_axpby0",
-        "census|silu_f16",
-        "census|cast_f32_f16",
-        "census|copy_f16_strided",
-        "census|fast_sum_f16",
-        "census|rope_f16",
-        "census|affine_f32",
-        "census|gemv_float32_bm1_bn1_sm8_sn4_tm1_tn4_nc0_axpby0",
-        "census|gemv_t_float32_bm1_bn2_sm8_sn4_tm4_tn4_nc0_axpby0",
-        "census|is_u32_f16",
-        "census|softmax_f32",
-        "census|cast_u32_f32",
-        "census|cos_f32",
-        "census|gemm_nn_f32_f32_64_32_32_2_2",
-        "census|sin_f32"
-      ],
-      "smallest_for": [
-        "census|gemv_float16_bm4_bn1_sm1_sn32_tm4_tn4_nc0_axpby0"
-      ]
-    },
-    {
       "describe": "vocab_size=64 hidden_size=64 intermediate_size=256 num_hidden_layers=3 num_attention_heads=2 num_key_value_heads=1 conv_l_cache=3 prompt=1 decode=1 dense=F32 arm=sdpa",
       "geometry": "40004000000103000200010003000101000001",
       "reaches": [
@@ -464,6 +394,7 @@
         "census|sin_f32"
       ],
       "smallest_for": [
+        "census|gemv_float16_bm4_bn1_sm1_sn32_tm4_tn4_nc0_axpby0",
         "census|sdpa_vector_float16_t_32",
         "probe|sdpa_vector_head_dim|SDPA_VECTOR_HEAD_DIMS.contains(&head_dim) && !(head_dim == 512 && is_f32)|true"
       ]
@@ -534,6 +465,7 @@
       ],
       "smallest_for": [
         "census|bmul_f16_scalar",
+        "census|gemv_float32_bm1_bn1_sm8_sn4_tm1_tn4_nc0_axpby0",
         "census|gemv_t_float16_bm1_bn2_sm8_sn4_tm4_tn4_nc0_axpby0"
       ]
     },
@@ -830,7 +762,8 @@
         "census|sin_f32"
       ],
       "smallest_for": [
-        "census|flash_decoding_single_half_72"
+        "census|flash_decoding_single_half_72",
+        "probe|sdpa_vector_head_dim|SDPA_VECTOR_HEAD_DIMS.contains(&head_dim) && !(head_dim == 512 && is_f32)|false"
       ]
     },
     {
@@ -935,7 +868,11 @@
   "gdn_step_reg": true,
   "hc_mix": true,
   "law": "hash:1",
-  "reached_only_by_non_agreeing": [],
+  "reached_only_by_non_agreeing": [
+    "probe|flash_decoding_head_dim|dims.contains(&head_dim)|false (metal-refused at load: vocab_size=64 hidden_size=4 intermediate_size=256 num_hidden_layers=3 num_attention_heads=2 num_key_value_heads=1 conv_l_cache=3 prompt=1 decode=1 dense=F32 arm=sdpa)",
+    "probe|sdpa_head_dim|SDPA_FULL_HEAD_DIMS.contains(&head_dim) && !(head_dim == 512 && is_f32)|false (metal-refused at load: vocab_size=64 hidden_size=4 intermediate_size=256 num_hidden_layers=3 num_attention_heads=2 num_key_value_heads=1 conv_l_cache=3 prompt=1 decode=1 dense=F32 arm=sdpa)"
+  ],
   "tol": 0.05000000074505806,
-  "weight_seed": 28977
+  "weight_seed": 28977,
+  "source_manifest_sha256": "637649de328b11504e91041614fe4e1a0594e02979db8aebe33aebb23e8f83d8"
 }

@@ -359,6 +359,7 @@ impl MmprojVision {
         tokenizer: &Tokenizer,
         text_hidden: usize,
         device: &Device,
+        purpose: lloom::nn::attention::route::ExecutionPurpose,
     ) -> Result<Self> {
         use lloom_tensor::quantized::gguf_file::Content;
         let image_token_id = tokenizer.token_to_id("<image>").ok_or_else(|| {
@@ -380,6 +381,7 @@ impl MmprojVision {
             dtype,
             device,
         )?;
+        purpose.admit("mmproj vision tower", device, encoder.reference_attention())?;
         Ok(Self {
             encoder,
             config,
@@ -906,6 +908,7 @@ fn produce_lfm2_gguf(
         tokenizer_path,
         policy_source,
         device,
+        lloom::nn::attention::route::ExecutionPurpose::Production,
         decode,
         None,
         |_, _, _| Ok(()),
@@ -920,6 +923,7 @@ fn produce_lfm2_gguf_with<T>(
     tokenizer_path: TokenizerSource<'_>,
     policy_source: Option<CausalPolicySource>,
     device: &Device,
+    purpose: lloom::nn::attention::route::ExecutionPurpose,
     decode: DecodeConfig,
     runtime: Option<(usize, lloom_tensor::DType)>,
     preflight: impl FnOnce(
@@ -996,8 +1000,9 @@ fn produce_lfm2_gguf_with<T>(
     let model = plan
         .materialize(&mut file, device)?
         .with_kv_dtype(runtime.map_or(lloom_tensor::DType::F32, |(_, dtype)| dtype))?;
+    purpose.admit("lfm2-gguf", device, model.reference_attention())?;
     let vision = mmproj
-        .map(|path| MmprojVision::load(path, &tokenizer, config.hidden_size, device))
+        .map(|path| MmprojVision::load(path, &tokenizer, config.hidden_size, device, purpose))
         .transpose()?;
     let cache = model.new_cache()?;
     Ok((

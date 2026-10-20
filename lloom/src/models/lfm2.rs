@@ -5102,6 +5102,25 @@ impl<P: Profile> State<P> {
         Ok(())
     }
 
+    /// What a prefill pass's attention allocates, by the arms `config`
+    /// selects: the composed attention on the reference arm; on every other
+    /// arm the fused kernel, which reads an in-place cache where it lies and
+    /// every other store through a copy of its keys (the page pool's gather,
+    /// `Cat`'s concatenation, the quantized store's dequantization).
+    #[cfg(feature = "metal")]
+    fn prefill_attention(
+        config: &Config,
+    ) -> lloom_tensor::metal_backend::admission::PrefillAttention {
+        use lloom_tensor::metal_backend::admission::PrefillAttention;
+        match config.attn_impl {
+            AttnImpl::Generic => PrefillAttention::Composed,
+            _ if config.kv_append == KvAppend::InPlace && !config.kv_quant.is_on() => {
+                PrefillAttention::Fused
+            }
+            _ => PrefillAttention::FusedGathered,
+        }
+    }
+
     /// §9.5d's admission arithmetic for this configuration, as a pure
     /// function of `config`, `budget` and the KV ceiling — the figure
     /// `admit_memory_budget` refuses on, exposed so a caller deciding
@@ -5149,6 +5168,10 @@ impl<P: Profile> State<P> {
             head_dim: config.head_dim(),
             hidden: config.hidden_size,
             intermediate: config.intermediate_size,
+            kv_heads: config.num_key_value_heads,
+            vocab: config.vocab_size,
+            conv_l_cache: config.conv_l_cache,
+            attention: Self::prefill_attention(config),
         };
         // §10.2g: `Shuffle` and `RotatingRing` hold exactly `l_cache` columns
         // (264 KiB); `SlidingRing` holds the slack it slides through as well,

@@ -167,6 +167,39 @@ pub struct PrefillGeometry {
     pub hidden: usize,
     /// §5.2's stated 10752, **not** candle's recomputed 8192 (§5.2's trap).
     pub intermediate: usize,
+    /// KV heads: the width of the K and V projections and of any copy of
+    /// the cache a pass makes. Read by the fused arm only.
+    pub kv_heads: usize,
+    /// The vocabulary: a forward's last-position logits. Read by the fused
+    /// arm only.
+    pub vocab: usize,
+    /// The conv taps (`conv_L_cache`): the columns a conv layer carries
+    /// between passes. Read by the fused arm only.
+    pub conv_l_cache: usize,
+    /// The attention a prefill pass takes, which decides whether the score
+    /// matrices exist at all.
+    pub attention: PrefillAttention,
+}
+
+/// The attention a prefill pass takes, as far as what it allocates.
+///
+/// The caller resolves it from the route its model takes (`AttnRoute`):
+/// the composed attention on the reference arm, the fused kernel on every
+/// serving arm, gathering the cache when its KV store is not one the kernel
+/// reads where it lies.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum PrefillAttention {
+    /// `repeat_kv`, the f32 upcast, `matmul`, the mask and `softmax`: three
+    /// `[B, Hq, P, P]` f32 score matrices per layer.
+    #[default]
+    Composed,
+    /// `steel_attention` over the cache where it lies: the kernel allocates
+    /// its output and nothing else (`PreparedAttention::workspace`, §10.2v).
+    Fused,
+    /// The same kernel over a gathered copy: a pass onto a warm page pool
+    /// gathers the earlier keys and values and concatenates its own onto
+    /// them before the kernel reads them.
+    FusedGathered,
 }
 
 impl Default for PrefillGeometry {
@@ -179,6 +212,10 @@ impl Default for PrefillGeometry {
             head_dim: 64,
             hidden: 2048,
             intermediate: 10752,
+            kv_heads: 8,
+            vocab: 128_000,
+            conv_l_cache: 3,
+            attention: PrefillAttention::Composed,
         }
     }
 }
@@ -189,15 +226,55 @@ impl PrefillGeometry {
     }
 }
 
-/// The activation class at `seq_len > 1`, which is the term that overruns.
+/// The activation class of a first pass of `seq_len` tokens (the keys are
+/// the pass's own): [`prefill_activation_bytes_at`] at `keys == seq_len`.
+pub fn prefill_activation_bytes(seq_len: usize, batch: usize, geom: PrefillGeometry) -> usize {
+    prefill_activation_bytes_at(seq_len, seq_len, batch, geom)
+}
+
+/// The activation class of one forward of `seq_len` tokens per row over
+/// `keys` keys (the pass's own and the cache's before it), which is the term
+/// that overruns.
+///
+/// At `seq_len == 1` it is the measured decode arena. Above it, the arm in
+/// `geom.attention` decides the arithmetic: the composed attention's is
+/// quadratic in `seq_len` (its score matrices), the fused kernel's is linear
+/// (see [`fused_prefill_bytes`]). `keys` is read only by
+/// [`PrefillAttention::FusedGathered`], whose copy of the cache grows with it.
+pub fn prefill_activation_bytes_at(
+    seq_len: usize,
+    keys: usize,
+    batch: usize,
+    geom: PrefillGeometry,
+) -> usize {
+    if seq_len <= 1 {
+        // The decode case is #68's measured arena, not this arithmetic. At
+        // `seq_len == 1` the score matrix is `[B, 32, 1, 1]` and every term
+        // below collapses; returning the measured figure keeps the two regimes
+        // from disagreeing at their shared point.
+        return batch * ACTIVATION_ARENA_BYTES;
+    }
+    match geom.attention {
+        PrefillAttention::Composed => composed_prefill_bytes(seq_len, batch, geom),
+        PrefillAttention::Fused => fused_prefill_bytes(seq_len, seq_len, batch, geom, false),
+        PrefillAttention::FusedGathered => {
+            fused_prefill_bytes(seq_len, keys.max(seq_len), batch, geom, true)
+        }
+    }
+}
+
+/// The composed attention's activation class: the reference arm
+/// (`--attn generic`), the CPU's, and every prefill's before the fused kernel
+/// served `seq_len > 1` (§13.2h).
 ///
 /// # What this counts, and it is read from source rather than estimated
 ///
-/// **Every prefill takes the generic attention arm.** `sdpa_applies`
-/// (`lfm2.rs:1383`) and `flash_decoding_applies` (`:1399`) both require
-/// `seq_len == 1`, and §13.4c verified the consequence by a **byte-identical
-/// kernel census across all three `--attn` arms** rather than inferring it from
-/// the predicates. So this arithmetic is over one arm, not three.
+/// §13.4c verified that its prefills all took this arm by a **byte-identical
+/// kernel census across all three `--attn` arms**; since §10.2v a serving arm's
+/// prefill takes `steel_attention` and this arithmetic is the reference arm's
+/// alone. Its linear part counts named tensors only and is below what the
+/// conv and MLP blocks allocate (compare [`fused_prefill_bytes`]); the
+/// reconciliation below absorbs that into the quadratic term's margin.
 ///
 /// Per attention layer, from `Attention::forward`'s final `else`:
 ///
@@ -250,15 +327,7 @@ impl PrefillGeometry {
 /// see a temporary candle allocates inside an op — which is why the reconciled
 /// ratios above are below 1.0 rather than above, and why the margin is stated
 /// rather than tuned away.
-pub fn prefill_activation_bytes(seq_len: usize, batch: usize, geom: PrefillGeometry) -> usize {
-    if seq_len <= 1 {
-        // The decode case is #68's measured arena, not this arithmetic. At
-        // `seq_len == 1` the score matrix is `[B, 32, 1, 1]` and every term
-        // below collapses; returning the measured figure keeps the two regimes
-        // from disagreeing at their shared point.
-        return batch * ACTIVATION_ARENA_BYTES;
-    }
-
+fn composed_prefill_bytes(seq_len: usize, batch: usize, geom: PrefillGeometry) -> usize {
     const F16: usize = 2;
     const F32: usize = 4;
 
@@ -283,6 +352,74 @@ pub fn prefill_activation_bytes(seq_len: usize, batch: usize, geom: PrefillGeome
     let mlp = 3 * batch * p * geom.intermediate * F16 + batch * p * geom.hidden * F16;
 
     geom.attention_layers * attn + geom.conv_layers * conv + geom.layers() * mlp
+}
+
+/// The fused attention's activation class: every buffer one prefill forward
+/// allocates, per row, with nothing in it reused — the pool defers a
+/// buffer's return until the command buffer holding its last use completes
+/// (§6.3b), so the bound is the forward's sum, not one layer's.
+///
+/// Per position, at the 2-byte compute dtype, from the forward's ops
+/// (`lfm2::Model::forward` and the blocks it calls at `seq_len > 1`):
+///
+/// | block | tensors | elements |
+/// |---|---|---|
+/// | model | the embedding, the final norm | `2 H` |
+/// | every layer | the two RMSNorms | `2 H` |
+/// | every MLP | `w1`, its SiLU, `w3`, the product; `w2`, the residual add | `4 I + 2 H` |
+/// | attention | `q`, `k`, `v`; `q` and `k` normed and rotated; the kernel's output; its `[B, P, Hq·D]` copy; `o_proj`; the residual add | `4 Hq·D + 3 KV + 2 H` |
+/// | conv | `in_proj`; `b·x`; the left context's concatenation; the depthwise conv; `c·`; its transpose copy; `out_proj`; the residual add | `10 H` |
+///
+/// with `KV = kv_heads · D`. The kernel's output is the whole of what
+/// `steel_attention` allocates (`PreparedAttention::workspace`: no scores,
+/// no mask, the cache read where it lies); there is no `P²` term.
+///
+/// Per forward, beside the positions: each conv layer's carried window
+/// (`L` columns), the previous window's tail (`L − 1`) and the
+/// concatenation's extra `L − 1` columns, `(3L − 2) H`; and the last
+/// position's logits, `V` at the compute dtype and again at f32.
+///
+/// `gathered` adds what a pass onto a warm page pool copies before the
+/// kernel reads it: `v` made contiguous (`KV` a position), and per row the
+/// earlier `keys − P` positions of K and V gathered out of the pool and the
+/// whole `keys` concatenated (`2 KV` a key each). The bound is a
+/// continuation pass's — the left-context concatenation is one too — so a
+/// first pass is below it by those terms.
+fn fused_prefill_bytes(
+    seq_len: usize,
+    keys: usize,
+    batch: usize,
+    geom: PrefillGeometry,
+    gathered: bool,
+) -> usize {
+    const ELEM: usize = 2;
+
+    let (h, i) = (geom.hidden, geom.intermediate);
+    let q = geom.query_heads * geom.head_dim;
+    let kv = geom.kv_heads * geom.head_dim;
+    let v_copy = if gathered { kv } else { 0 };
+
+    let model = 2 * h;
+    let norms = 2 * h;
+    let mlp = 4 * i + 2 * h;
+    let attn = 4 * q + 3 * kv + 2 * h + v_copy;
+    let conv = 10 * h;
+    let per_position = model
+        + geom.layers() * (norms + mlp)
+        + geom.attention_layers * attn
+        + geom.conv_layers * conv;
+
+    let gather = if gathered && keys > seq_len {
+        geom.attention_layers * 2 * kv * ((keys - seq_len) + keys)
+    } else {
+        0
+    };
+    let carry = geom.conv_layers * (3 * geom.conv_l_cache).saturating_sub(2) * h;
+    const LOGITS_F32: usize = 4;
+
+    batch
+        * (ELEM * (seq_len * per_position + gather + carry + geom.vocab)
+            + LOGITS_F32 * geom.vocab)
 }
 
 /// What one configuration is predicted to need, class by class.
@@ -449,13 +586,20 @@ impl Budget {
             // == 1` this is exactly #68's measured 68 KB × B, so no decode
             // configuration's verdict moves; above it the class is the
             // quadratic term §13.2b identifies and §13.4c measured.
-            activations: prefill_activation_bytes(
+            activations: prefill_activation_bytes_at(
                 self.max_seq_len,
+                self.prefill_keys(),
                 self.activation_rows.unwrap_or(self.batch),
                 self.prefill_geometry,
             ),
             scratch,
         }
+    }
+
+    /// The keys the longest forward reads at its worst: a tile ending at the
+    /// KV ceiling.
+    fn prefill_keys(&self) -> usize {
+        self.kv_capacity.max(self.max_seq_len)
     }
 
     /// Evaluate this configuration against `working_set` bytes.
@@ -477,6 +621,7 @@ impl Budget {
             residual: budget.saturating_sub(predicted),
             fits: predicted <= budget,
             max_seq_len: self.max_seq_len,
+            prefill_keys: self.prefill_keys(),
             prefill_geometry: self.prefill_geometry,
             batch: self.batch,
         }
@@ -508,6 +653,8 @@ pub struct Admission {
     /// refusal can solve for the chunk size that would fit, and so a caller
     /// cannot read a decode verdict as a prefill one.
     pub max_seq_len: usize,
+    /// The keys that forward reads at its worst, for the same solve.
+    pub prefill_keys: usize,
     /// Carried for the same reason: the chunk-size solve needs the geometry.
     pub prefill_geometry: PrefillGeometry,
     /// Batch, for the same solve.
@@ -613,7 +760,12 @@ impl Admission {
             let mut hi = self.max_seq_len;
             while lo < hi {
                 let mid = lo + (hi - lo).div_ceil(2);
-                let need = prefill_activation_bytes(mid, self.batch, self.prefill_geometry);
+                let need = prefill_activation_bytes_at(
+                    mid,
+                    self.prefill_keys,
+                    self.batch,
+                    self.prefill_geometry,
+                );
                 if need <= headroom {
                     lo = mid;
                 } else {
@@ -623,7 +775,13 @@ impl Admission {
             s.push_str(&format!(
                 "    chunk the prefill at {lo} tokens   frees {:>6.2} GB   \
                  (§13.2b; kv_len grows by chunk, §4.1)\n",
-                gb(f.activations - prefill_activation_bytes(lo, self.batch, self.prefill_geometry)),
+                gb(f.activations
+                    - prefill_activation_bytes_at(
+                        lo,
+                        self.prefill_keys,
+                        self.batch,
+                        self.prefill_geometry
+                    )),
             ));
         }
         // Refuse rather than silently reduce (§9.5g): these are reported for the
@@ -1622,5 +1780,105 @@ mod tests {
             4,
             "the score matrix is 4x on the query-head count"
         );
+    }
+
+    // ---- the fused arm: `steel_attention`, no score matrices ----
+
+    fn fused(attention: PrefillAttention) -> PrefillGeometry {
+        PrefillGeometry {
+            attention,
+            ..PrefillGeometry::default()
+        }
+    }
+
+    /// The fused forward at LFM2-2.6B's geometry: 4 202 496 B a position,
+    /// 1 398 784 B a forward (22 conv windows of 7 × 2048 columns, the
+    /// 128 000 logits at f16 and f32), nothing quadratic. The figures are
+    /// the forward's allocations, enumerated in `fused_prefill_bytes`'s table
+    /// and held to the pool by `lloom/tests/lfm2_prefill_activation.rs` on
+    /// the tiny LFM2.
+    #[test]
+    fn the_fused_forward_is_its_positions_and_a_constant() {
+        let g = fused(PrefillAttention::Fused);
+        for p in [2, 7, 512, 1024, 2048, 4096] {
+            assert_eq!(
+                prefill_activation_bytes(p, 1, g),
+                p * 4_202_496 + 1_398_784,
+                "P={p}: 4 202 496 B a position and 1 398 784 a forward, no P² term"
+            );
+        }
+        // Rows multiply it; the keys do not reach an in-place read.
+        assert_eq!(
+            prefill_activation_bytes_at(512, 8704, 3, g),
+            3 * (512 * 4_202_496 + 1_398_784)
+        );
+        // And decode is the measured arena on every arm.
+        assert_eq!(prefill_activation_bytes(1, 4, g), 4 * ACTIVATION_ARENA_BYTES);
+    }
+
+    /// A pass onto a warm page pool reads a copy of the cache: `v` made
+    /// contiguous (1 KiB a position over 8 layers) and the earlier
+    /// `keys − P` positions gathered and the whole `keys` concatenated, 2 KiB
+    /// a key a layer. A first pass (`keys == P`) gathers nothing.
+    #[test]
+    fn a_gathered_pass_adds_its_copy_of_the_cache() {
+        let g = fused(PrefillAttention::FusedGathered);
+        assert_eq!(
+            prefill_activation_bytes(512, 1, g),
+            512 * 4_210_688 + 1_398_784
+        );
+        let gather = 8 * 2 * (8 * 64) * 2 * ((8704 - 512) + 8704);
+        assert_eq!(gather, 276_824_064, "0.28 GB at the 8704 ceiling");
+        assert_eq!(
+            prefill_activation_bytes_at(512, 8704, 1, g),
+            512 * 4_210_688 + 1_398_784 + gather
+        );
+        // Keys below the pass's own length are the pass's own.
+        assert_eq!(
+            prefill_activation_bytes_at(512, 100, 1, g),
+            prefill_activation_bytes(512, 1, g)
+        );
+    }
+
+    /// **Before and after, at the tile the composed arithmetic refused.**
+    ///
+    /// The composed arm's 18.66 GB a forward at `P` = 2048 — three
+    /// `[32, P, P]` f32 matrices over 8 layers — is what the machine gate
+    /// charged a fused prefill, twice for the pacer's two forwards in flight:
+    /// 37.32 GB, and tile 2048 was refused on a machine with 23.89 GB of room
+    /// (`measurements/issue-1068-prefill-length.md`). The fused forward is
+    /// 8.61 GB; at tile 512 the two arms are within 5 % of each other, so the
+    /// default tile's verdict does not move.
+    #[test]
+    fn the_fused_arm_replaces_the_composed_scores_at_tile_2048() {
+        let composed = prefill_activation_bytes(2048, 1, PrefillGeometry::default());
+        assert_eq!(composed, 18_660_458_496, "before: the composed arithmetic");
+        let g = fused(PrefillAttention::Fused);
+        let after = prefill_activation_bytes(2048, 1, g);
+        assert_eq!(after, 8_608_110_592, "after: the fused forward");
+        assert_eq!(2 * composed, 37_320_916_992, "the refusal's two forwards");
+
+        let (c512, f512) = (
+            prefill_activation_bytes(512, 1, PrefillGeometry::default()) as f64,
+            prefill_activation_bytes(512, 1, g) as f64,
+        );
+        assert!(
+            (f512 / c512 - 1.0).abs() < 0.05,
+            "tile 512: composed {c512} B, fused {f512} B"
+        );
+    }
+
+    /// The budget reads the fused arm's keys from the KV ceiling, so a
+    /// gathered prefill is charged the copy its last tile makes.
+    #[test]
+    fn the_budget_charges_the_last_tiles_gather() {
+        let mut b = b1(8704, 8704).with_prefill(512);
+        b.prefill_geometry = fused(PrefillAttention::FusedGathered);
+        assert_eq!(
+            b.footprint().activations,
+            prefill_activation_bytes_at(512, 8704, 1, b.prefill_geometry)
+        );
+        b.prefill_geometry = fused(PrefillAttention::Fused);
+        assert_eq!(b.footprint().activations, 512 * 4_202_496 + 1_398_784);
     }
 }

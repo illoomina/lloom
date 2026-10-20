@@ -637,6 +637,9 @@ pub fn run(args: ChatArgs) -> Result<()> {
             decoded.turn.with_policy(engine.reuse_prefix()).fields(),
             decoded.checkpoint_name(),
         );
+        if let Some(note) = &decoded.readback_note {
+            eprintln!("[turn {turn}: warning: {note}]");
+        }
         if st.readback.poll_fallbacks > 0 {
             eprintln!(
                 "[{}: the ring's words were not CPU-mapped; the EOS read took the blocking \

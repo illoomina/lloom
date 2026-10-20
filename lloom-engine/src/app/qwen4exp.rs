@@ -1194,6 +1194,7 @@ impl<P: QwenShape, R: ExpertResidency + HasStreamStats + Send + Sync + 'static> 
             readback: ReadbackArm::Batched {
                 rows: done.joined_beside,
             },
+            readback_note: None,
             stats: done.stats,
             thinking: None,
             logprobs: None,

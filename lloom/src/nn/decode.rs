@@ -358,6 +358,10 @@ pub struct DecodeOptions {
     /// the pacer, not by the reader: `S − E ≤ adaptive_lead + 1`, however late
     /// the reader raises the flag. `None` takes `decode.ring.eos_watch`.
     pub eos_watch: Option<bool>,
+    /// Under the EOS gate: whether the quantized mat-vec cores are gated
+    /// too, for a model that admits it (`CausalLM::eos_gate_cores`). `None`
+    /// takes `models.qwen3_5.eos_gate_cores`.
+    pub eos_gate_cores: Option<bool>,
     /// The flow's adaptive commit; off is the fixed cadence (module docs, "Two
     /// cadences, both kept"). The loop closes its command buffer only when the
     /// GPU has started every buffer committed before it, on no cadence of its
@@ -371,6 +375,13 @@ pub struct DecodeOptions {
     /// The cut period is held at `usize::MAX` for the run, so the only cuts
     /// are the loop's.
     pub adaptive_commit: bool,
+    /// Under `adaptive_commit`: the most steps queued in committed buffers the
+    /// GPU has not completed before the host waits to encode the next — the
+    /// lead's queued part, apart from the batching [`Self::run_ahead`] sets
+    /// (`0` = two run-ahead windows, the incumbent). The host is at most
+    /// `queued_steps + run_ahead` steps ahead of the oldest incomplete buffer
+    /// ([`Self::adaptive_lead`]).
+    pub queued_steps: usize,
     /// Under `adaptive_commit`: the most steps the host may encode into one
     /// buffer before closing it regardless (0 = 8). Not a cadence — a buffer
     /// closes earlier whenever the GPU has caught up — but the bound on how
@@ -559,17 +570,34 @@ impl DecodeOptions {
     /// AUTO path sets `in_flight_depth` from warmup; this reads it back with the
     /// `0 = auto -> floor` convention applied.)
     /// Under `adaptive_commit`: how many steps the host may be ahead of the
-    /// oldest incomplete buffer — two run-ahead windows queued plus the open
-    /// one; 0 otherwise. What the ring's staged-through tiles are sized for.
+    /// oldest incomplete buffer — [`Self::queued`] queued plus the open
+    /// buffer's [`Self::run_ahead_steps`]; 0 otherwise. What the ring's
+    /// staged-through tiles are sized for.
     pub fn adaptive_lead(&self) -> usize {
         if self.adaptive_commit {
-            3 * if self.run_ahead == 0 {
-                8
-            } else {
-                self.run_ahead
-            }
+            self.queued() + self.run_ahead_steps()
         } else {
             0
+        }
+    }
+
+    /// The most steps one open buffer holds under `adaptive_commit`
+    /// (`run_ahead`, `0` = 8).
+    pub fn run_ahead_steps(&self) -> usize {
+        if self.run_ahead == 0 {
+            8
+        } else {
+            self.run_ahead
+        }
+    }
+
+    /// The most steps queued in committed, incomplete buffers before the
+    /// host waits (`queued_steps`, `0` = two run-ahead windows).
+    pub fn queued(&self) -> usize {
+        if self.queued_steps == 0 {
+            2 * self.run_ahead_steps()
+        } else {
+            self.queued_steps
         }
     }
 
@@ -598,8 +626,10 @@ impl DecodeOptions {
             host_feed_wait: None,
             eos_park: None,
             eos_watch: None,
+            eos_gate_cores: None,
             adaptive_commit: false,
             run_ahead: 0,
+            queued_steps: 0,
             stop: None,
             eos_gate: false,
             fused_publish: true,
@@ -722,11 +752,12 @@ pub struct DecodeStats {
     /// The overrun's forwards launched nothing (the gate fired), so the
     /// session reconciles it without a rewind horizon.
     pub overrun_unwritten: bool,
-    /// The prefill's dispatch census, `(kernel, count)`, under
-    /// `CANDLE_METAL_PROFILE=1`; empty otherwise and off Metal.
-    pub prefill_census: Vec<(String, u64)>,
+    /// The prefill's dispatch census, `(kernel, count)`, when detailed Metal
+    /// recording is active in a debug/profile build. `None` means unavailable;
+    /// `Some([])` means an observed window contained no dispatches.
+    pub prefill_census: Option<Vec<(String, u64)>>,
     /// Step 0's dispatch census, on the same terms.
-    pub step0_census: Vec<(String, u64)>,
+    pub step0_census: Option<Vec<(String, u64)>>,
     /// Under [`Session::decode_batched`], the number of live rows in each
     /// step this sequence took part in — one entry per `step_ns` entry. Empty
     /// on the single-sequence bodies.
@@ -974,12 +1005,12 @@ impl HostFeedTrace {
 }
 
 /// The per-kernel dispatch counts so far, under `CANDLE_METAL_PROFILE=1`.
-/// `None` when the census is off, which is every timed run.
+/// `None` when detailed recording is unavailable or off.
 fn census_snapshot() -> Option<std::collections::HashMap<String, u64>> {
-    #[cfg(feature = "metal")]
+    #[cfg(all(feature = "metal", any(debug_assertions, feature = "profile")))]
     {
         use lloom_tensor::kernels::metal::profile;
-        if profile::enabled() {
+        if profile::recorder_enabled() {
             return Some(profile::snapshot().by_label.into_iter().collect());
         }
     }
@@ -990,9 +1021,9 @@ fn census_snapshot() -> Option<std::collections::HashMap<String, u64>> {
 fn census_delta(
     before: &Option<std::collections::HashMap<String, u64>>,
     after: Option<std::collections::HashMap<String, u64>>,
-) -> Vec<(String, u64)> {
+) -> Option<Vec<(String, u64)>> {
     let (Some(before), Some(after)) = (before, after) else {
-        return Vec::new();
+        return None;
     };
     let mut out: Vec<(String, u64)> = after
         .into_iter()
@@ -1002,7 +1033,7 @@ fn census_delta(
         })
         .collect();
     out.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
-    out
+    Some(out)
 }
 
 /// Where one decode step's host time went, for the first few steps of a run.
@@ -1431,11 +1462,7 @@ impl StepPacer {
             opts.pacer_depth()
                 .max(opts.prefill_pacer_depth)
                 .max(if opts.adaptive_commit {
-                    2 * if opts.run_ahead == 0 {
-                        8
-                    } else {
-                        opts.run_ahead
-                    }
+                    opts.queued()
                 } else {
                     0
                 });
@@ -2020,6 +2047,7 @@ impl<'m, M: CausalLM> Session<'m, M> {
         // step.
         let hot_thread = HotThread::claim();
         let mut stats = DecodeStats {
+            #[cfg(any(debug_assertions, feature = "profile"))]
             step_ns: Vec::with_capacity(opts.max_tokens),
             sample_ns: Vec::with_capacity(if opts.sample_split {
                 opts.max_tokens
@@ -2224,17 +2252,21 @@ impl<'m, M: CausalLM> Session<'m, M> {
         } else {
             (opts.lookahead >= 1).then(|| device.pipelined_cut_period())
         };
-        let run_ahead = if opts.run_ahead == 0 {
-            8
-        } else {
-            opts.run_ahead
-        };
+        let run_ahead = opts.run_ahead_steps();
+        let queued = opts.queued();
         let mut steps_open = 0usize;
         // Armed here, disarmed on every exit path (the guard's `Drop`): an
         // armed gate outliving the run would route the next prefill through
         // a stale table.
         let eos_gate = if opts.eos_gate {
             device.eos_gate_begin()?;
+            // The cores arm: the quantized mat-vecs gated too, for a model
+            // whose inventory admits it (`CausalLM::eos_gate_cores`).
+            let cores = opts
+                .eos_gate_cores
+                .unwrap_or(crate::tuning::tuning().ring.qwen3_5_eos_gate_cores)
+                && self.model.eos_gate_cores();
+            device.eos_gate_cores(cores);
             Some(EosGateGuard(&device))
         } else {
             None
@@ -2485,10 +2517,11 @@ impl<'m, M: CausalLM> Session<'m, M> {
                 // NONE; the one clock read it still needs is `step_ns` (the median).
                 let t_sample = sample_start.map_or(0, |s| s.elapsed().as_nanos() as u64);
                 if opts.adaptive_commit {
-                    // Steps queued in incomplete buffers, not buffers: two
-                    // run-ahead windows deep, so one is running while the
-                    // other waits and the host is never the one being waited on.
-                    pacer.before_forward_bounded(&device, 2 * run_ahead)?;
+                    // Steps queued in incomplete buffers, not buffers: by
+                    // default two run-ahead windows deep, so one is running
+                    // while the other waits and the host is never the one
+                    // being waited on (`DecodeOptions::queued_steps`).
+                    pacer.before_forward_bounded(&device, queued)?;
                 } else if pace {
                     pacer.before_forward(&device)?;
                 }
@@ -4367,6 +4400,108 @@ pub(crate) fn tile_widths(widths: Vec<usize>, tile: usize) -> Vec<usize> {
         }
     }
     tiled
+}
+
+#[cfg(test)]
+mod adaptive_lead_tests {
+    use super::DecodeOptions;
+
+    /// The lead is its queued part plus one open buffer, the two set apart
+    /// (`queued_steps`, `run_ahead`); the defaults are the incumbent's 16 + 8;
+    /// off the adaptive commit there is none.
+    #[test]
+    fn the_lead_is_its_queued_part_plus_one_buffer() {
+        let lead = |run_ahead, queued_steps, adaptive_commit| {
+            let o = DecodeOptions {
+                adaptive_commit,
+                run_ahead,
+                queued_steps,
+                ..DecodeOptions::new(1)
+            };
+            (o.run_ahead_steps(), o.queued(), o.adaptive_lead())
+        };
+        assert_eq!(lead(0, 0, true), (8, 16, 24), "the incumbent");
+        assert_eq!(lead(4, 0, true), (4, 8, 12), "queued follows the batching");
+        assert_eq!(lead(8, 2, true), (8, 2, 10), "a shallower queue, batching kept");
+        assert_eq!(lead(4, 2, false).2, 0, "no lead off the adaptive commit");
+    }
+}
+
+#[cfg(test)]
+mod census_tests {
+    use super::{census_delta, census_snapshot, DecodeStats};
+    use std::collections::HashMap;
+
+    #[test]
+    fn a_missing_census_endpoint_is_unavailable_not_an_empty_window() {
+        let empty = Some(HashMap::new());
+        assert_eq!(census_delta(&None, None), None);
+        assert_eq!(census_delta(&None, empty.clone()), None);
+        assert_eq!(census_delta(&empty, None), None);
+        let stats = DecodeStats::default();
+        assert_eq!(stats.prefill_census, None);
+        assert_eq!(stats.step0_census, None);
+    }
+
+    #[test]
+    fn an_observed_window_with_no_dispatches_is_available_and_empty() {
+        let before = Some(HashMap::from([("old".to_owned(), 3)]));
+        assert_eq!(census_delta(&before, before.clone()), Some(Vec::new()));
+        assert_eq!(
+            census_delta(&Some(HashMap::new()), Some(HashMap::new())),
+            Some(Vec::new())
+        );
+    }
+
+    #[test]
+    fn an_observed_window_reports_only_its_dispatches_in_stable_order() {
+        let before = Some(HashMap::from([("old".to_owned(), 3), ("a".to_owned(), 2)]));
+        let after = Some(HashMap::from([
+            ("old".to_owned(), 3),
+            ("a".to_owned(), 4),
+            ("b".to_owned(), 2),
+            ("c".to_owned(), 5),
+        ]));
+        assert_eq!(
+            census_delta(&before, after),
+            Some(vec![("c".into(), 5), ("a".into(), 2), ("b".into(), 2)])
+        );
+    }
+
+    #[test]
+    fn disabled_recording_does_not_publish_an_empty_census() {
+        #[cfg(feature = "metal")]
+        lloom_tensor::tuning::install(lloom_tensor::tuning::Tuning::default()).unwrap();
+        assert_eq!(census_snapshot(), None);
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn scalar_profiling_does_not_claim_an_unavailable_decode_census() {
+        use lloom_tensor::kernels::metal::profile;
+        use std::sync::Arc;
+
+        let mut tuning = lloom_tensor::tuning::Tuning::default();
+        tuning.instrument.profile = true;
+        lloom_tensor::tuning::install(tuning).unwrap();
+        profile::reset();
+        assert!(profile::enabled());
+        let before = census_snapshot();
+        let label: Arc<str> = Arc::from("decode-census-control");
+        profile::record_dispatch(Some(&label), 0);
+        let after = census_snapshot();
+        assert_eq!(profile::snapshot().dispatches, 1);
+        if cfg!(any(debug_assertions, feature = "profile")) {
+            assert_eq!(before, Some(HashMap::new()));
+            assert_eq!(
+                census_delta(&before, after),
+                Some(vec![("decode-census-control".into(), 1)])
+            );
+        } else {
+            assert_eq!(before, None);
+            assert_eq!(after, None);
+        }
+    }
 }
 
 #[cfg(test)]

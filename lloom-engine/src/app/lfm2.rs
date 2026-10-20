@@ -85,6 +85,8 @@ pub struct Vision {
     files: Vec<PathBuf>,
     dtype: DType,
     text_hidden: usize,
+    /// The load's execution purpose, applied to the tower when it loads.
+    purpose: lloom::nn::attention::route::ExecutionPurpose,
     tower: Mutex<Option<Tower>>,
 }
 
@@ -115,6 +117,8 @@ impl Vision {
         let vb = VarBuilder::from_backend(Box::new(backend), self.dtype, device.clone());
         let encoder = VisionEncoder::new(&self.config, self.text_hidden, vb)
             .context("loading the vision tower and projector")?;
+        self.purpose
+            .admit("lfm2-vl", device, encoder.reference_attention())?;
         device.synchronize()?;
         let pool_delta = MemSnapshot::read(device).pool_live as i64 - before;
         let t = Tower {
@@ -339,6 +343,9 @@ pub struct Engine<P: Profile> {
 pub struct LoadOptions {
     pub model_dir: PathBuf,
     pub cpu: bool,
+    /// What the run is for (`execution.purpose`): production refuses at load
+    /// an attention that takes the composed scores path on Metal.
+    pub purpose: lloom::nn::attention::route::ExecutionPurpose,
     pub kv_capacity: usize,
     pub readback: ReadbackArm,
     /// The decode loop's options (`DecodeConfig`): what `readback` and the
@@ -828,7 +835,7 @@ impl<P: Lfm2Shape> Engine<P> {
     }
 
     fn load_on_with_preflight(
-        opts: LoadOptions,
+        mut opts: LoadOptions,
         device: Device,
         admission: LoadAdmission,
         preflight: impl FnOnce(&Config, &Text) -> Result<()>,
@@ -875,8 +882,12 @@ impl<P: Lfm2Shape> Engine<P> {
                 m.set_free_budget(mb * 1024 * 1024);
             }
         }
+        // What is installed is what the load reports (`ExecutorConfig::under_body`).
+        let (executor, executor_note) = opts.executor.under_body(dspark_dir.is_some());
+        opts.executor = executor;
         let mut installed =
             super::common::install_executor(&device, &opts.executor, dspark_dir.is_some())?;
+        installed.declined = executor_note;
         installed.pass_widths = match opts.decode.prefill.pass_widths {
             lloom::nn::PassWidths::Lru => "lru",
             lloom::nn::PassWidths::Ladder => "ladder",
@@ -887,6 +898,7 @@ impl<P: Lfm2Shape> Engine<P> {
         // verify); structured prompts (7.8–8.3 accepted) pay at every B.
         // Said once at load; the flag is honoured either way.
         let mut load_warnings = Vec::new();
+        load_warnings.extend(installed.declined_warning());
         if dspark_dir.is_some() && opts.batch >= 16 && opts.dspark_k.is_none() {
             let note = format!(
                 "at --batch {} the speculative loop measured slower than plain batched decode \
@@ -927,6 +939,12 @@ impl<P: Lfm2Shape> Engine<P> {
             .apply_axes(&mut config)
             .map_err(|e| anyhow::anyhow!("model axes: {e}"))?;
         refuse_kv_quant_shape(&config, &device, opts.batch)?;
+        // The route the model resolves at construction, admitted for the
+        // run's purpose before any weight is read.
+        let route =
+            lloom::models::lfm2::AttnRoute::resolve(config.attn_impl, &config, dtype, &device)?;
+        opts.purpose
+            .admit("lfm2", &device, route.composed_reason(&device).as_deref())?;
         if let Some(k) = opts.flash_k {
             if config.attn_impl != AttnImpl::FlashDecoding {
                 anyhow::bail!(
@@ -1218,6 +1236,7 @@ impl<P: Lfm2Shape> Engine<P> {
                 files: files.clone(),
                 dtype,
                 text_hidden: config.hidden_size,
+                purpose: opts.purpose,
                 tower: Mutex::new(None),
             })
         } else {
@@ -1335,6 +1354,11 @@ impl<P: Lfm2Shape> Engine<P> {
             };
             let drafter = DSparkDrafter::new(dcfg.clone(), max_pos, dvb)
                 .context("constructing DSpark drafter")?;
+            opts.purpose.admit(
+                "dspark drafter",
+                &core.device,
+                drafter.reference_attention(),
+            )?;
             // The drafter's context KV: an explicit `tuning.dspark.ctx_kv`
             // (`--dspark-ctx`, the `LLOOM_DSPARK_CTX_KV` alias) wins on every
             // arm; `auto` is one paged pool set shared by every sequence on
@@ -2081,6 +2105,7 @@ impl<P: Lfm2Shape> Engine<P> {
                     rows: done.joined_beside,
                 },
             },
+            readback_note: None,
             stats: done.stats,
             thinking: None,
             logprobs: None,

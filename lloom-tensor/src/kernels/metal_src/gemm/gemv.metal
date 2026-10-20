@@ -427,6 +427,16 @@ struct PrologueGroupNorm {
 /// (mat rows = output dimension, mat cols = K)
 ///////////////////////////////////////////////////////////////////////////////
 
+// `NR` is the row axis (`docs/tuning.md` §13.5y): `NR` activation rows,
+// `vec_row_stride` elements apart, against one sweep of the threadgroup's
+// weight block. Each row has its own accumulators and sees, lane for lane,
+// the coefficients and the order of operations the one-row kernel gives it.
+// That a row's result is then the one-row kernel's bits is a property of how
+// this loop nest compiles under fast math, not of the source order alone (a
+// nest holding the weight block in registers instead does not keep them):
+// `gemv_rows_keep_the_one_row_bits_at_every_capacity` asserts it. `NR = 1`
+// is the one-row kernel. A group holding fewer than `NR` rows (`n_rows`)
+// re-reads its last row for the missing ones and stores only its own.
 template <
     typename T,
     const int BM,       // Threadgroup rows (in simdgroups)
@@ -443,7 +453,8 @@ template <
     // every classical arm; `float` against `half` weights on the mixed arms
     // (`gemv_mixed_*`), which read an f32 activation and store an f32 result
     // with no cast launch on either side. The matrix stays `T`.
-    typename VT = T>
+    typename VT = T,
+    const int NR = 1>
 struct GEMVKernel {
   using acc_type = AccT;
   using prologue_type = Prologue;
@@ -467,6 +478,12 @@ struct GEMVKernel {
   // simdgroup spans K by itself.
   static_assert(!Prologue::kInlineNorm || (BN == 1 && SN == 32),
                 "the inline norm needs a tile whose simdgroup walks all of K");
+  // The row axis keeps each row's sum in its simdgroup (no threadgroup
+  // reduction to widen) and stores no bias.
+  static_assert(NR >= 1, "at least one row");
+  static_assert(NR == 1 || (BN == 1 && !kDoAxpby && !Prologue::kGroupNorm),
+                "the row axis is instantiated at the tiles whose simdgroup walks all of K, "
+                "without axpby or the grouped norm");
 
   template <typename U = T>
   static METAL_FUNC void load_unsafe(
@@ -547,7 +564,9 @@ struct GEMVKernel {
       uint3 tid,
       uint3 lid,
       uint simd_gid,
-      uint simd_lid) {
+      uint simd_lid,
+      const int64_t vec_row_stride = 0,
+      const int n_rows = 1) {
     (void)lid;
 
     // The grouped norm's first phase: every thread of the threadgroup takes
@@ -557,10 +576,16 @@ struct GEMVKernel {
       prologue.prepare(in_vec, simd_gid, simd_lid, tid, BM * BN * 32);
     }
 
-    thread AccT result[TM] = {0};
+    thread AccT result[NR][TM] = {};
     thread T inter[TN];
-    thread AccT v_coeff[TN];
-    AccT ssq = 0;
+    thread AccT v_coeff[NR][TN];
+    AccT ssq[NR] = {};
+
+    const device VT* in_row[NR];
+    MLX_MTL_PRAGMA_UNROLL
+    for (int r = 0; r < NR; r++) {
+      in_row[r] = in_vec + (NR == 1 ? 0 : (r < n_rows ? r : n_rows - 1) * vec_row_stride);
+    }
 
     const int thrM = SN != 32 ? (int)(simd_lid / SN) : 0;
     const int thrN = SN != 32 ? (int)(simd_lid % SN) : (int)simd_lid;
@@ -588,22 +613,25 @@ struct GEMVKernel {
     const int leftover = in_size - last_iter;
 
     for (int i = 0; i < n_iter; ++i) {
-      load_vec_unsafe<VT, AccT>(in_vec, v_coeff, bn);
+      MLX_MTL_PRAGMA_UNROLL
+      for (int r = 0; r < NR; r++) {
+        load_vec_unsafe<VT, AccT>(in_row[r], v_coeff[r], bn);
 
-      if (Prologue::kInlineNorm) {
+        if (Prologue::kInlineNorm) {
+          MLX_MTL_PRAGMA_UNROLL
+          for (int tn = 0; tn < TN; tn++) {
+            ssq[r] += v_coeff[r][tn] * v_coeff[r][tn];
+          }
+        }
+
+        // The prologue transforms the input vector in registers, so a fused
+        // producer's output is never written to memory (issue #266). Under
+        // `PrologueNone` this is the identity and inlines away, which is what
+        // makes the unfused arm byte-for-byte what shipped.
         MLX_MTL_PRAGMA_UNROLL
         for (int tn = 0; tn < TN; tn++) {
-          ssq += v_coeff[tn] * v_coeff[tn];
+          v_coeff[r][tn] = prologue(v_coeff[r][tn], bn + tn);
         }
-      }
-
-      // The prologue transforms the input vector in registers, so a fused
-      // producer's output is never written to memory (issue #266). Under
-      // `PrologueNone` this is the identity and inlines away, which is what
-      // makes the unfused arm byte-for-byte what shipped.
-      MLX_MTL_PRAGMA_UNROLL
-      for (int tn = 0; tn < TN; tn++) {
-        v_coeff[tn] = prologue(v_coeff[tn], bn + tn);
       }
 
       int mat_offset = 0;
@@ -611,8 +639,11 @@ struct GEMVKernel {
       for (int tm = 0; tm < TM; tm++) {
         load_unsafe(mat, inter, mat_offset + bn);
         MLX_MTL_PRAGMA_UNROLL
-        for (int tn = 0; tn < TN; tn++) {
-          result[tm] += inter[tn] * v_coeff[tn];
+        for (int r = 0; r < NR; r++) {
+          MLX_MTL_PRAGMA_UNROLL
+          for (int tn = 0; tn < TN; tn++) {
+            result[r][tm] += inter[tn] * v_coeff[r][tn];
+          }
         }
         mat_offset += matrix_ld;
       }
@@ -620,53 +651,66 @@ struct GEMVKernel {
     }
 
     if (leftover > 0) {
-      load_vec_safe<VT, AccT>(in_vec, v_coeff, bn, in_size);
-      if (Prologue::kInlineNorm) {
+      MLX_MTL_PRAGMA_UNROLL
+      for (int r = 0; r < NR; r++) {
+        load_vec_safe<VT, AccT>(in_row[r], v_coeff[r], bn, in_size);
+        if (Prologue::kInlineNorm) {
+          MLX_MTL_PRAGMA_UNROLL
+          for (int tn = 0; tn < TN; tn++) {
+            ssq[r] += v_coeff[r][tn] * v_coeff[r][tn];
+          }
+        }
+        // Guarded by `bn + tn < in_size`: `load_safe` zero-fills past the end,
+        // and the prologue must not index its weight out of bounds there. A
+        // zero times anything is zero, so skipping the transform on the padding
+        // lanes is also arithmetically the same.
         MLX_MTL_PRAGMA_UNROLL
         for (int tn = 0; tn < TN; tn++) {
-          ssq += v_coeff[tn] * v_coeff[tn];
-        }
-      }
-      // Guarded by `bn + tn < in_size`: `load_safe` zero-fills past the end,
-      // and the prologue must not index its weight out of bounds there. A
-      // zero times anything is zero, so skipping the transform on the padding
-      // lanes is also arithmetically the same.
-      MLX_MTL_PRAGMA_UNROLL
-      for (int tn = 0; tn < TN; tn++) {
-        if (bn + tn < in_size) {
-          v_coeff[tn] = prologue(v_coeff[tn], bn + tn);
+          if (bn + tn < in_size) {
+            v_coeff[r][tn] = prologue(v_coeff[r][tn], bn + tn);
+          }
         }
       }
       MLX_MTL_PRAGMA_UNROLL
       for (int tm = 0; tm < TM; tm++) {
         load_safe(&mat[tm * matrix_ld], inter, bn, in_size);
         MLX_MTL_PRAGMA_UNROLL
-        for (int tn = 0; tn < TN; tn++) {
-          result[tm] += inter[tn] * v_coeff[tn];
+        for (int r = 0; r < NR; r++) {
+          MLX_MTL_PRAGMA_UNROLL
+          for (int tn = 0; tn < TN; tn++) {
+            result[r][tm] += inter[tn] * v_coeff[r][tn];
+          }
         }
       }
     }
 
     MLX_MTL_PRAGMA_UNROLL
-    for (int tm = 0; tm < TM; tm++) {
+    for (int r = 0; r < NR; r++) {
       MLX_MTL_PRAGMA_UNROLL
-      for (ushort sn = (SN / 2); sn >= 1; sn >>= 1) {
-        result[tm] += simd_shuffle_down(result[tm], sn);
+      for (int tm = 0; tm < TM; tm++) {
+        MLX_MTL_PRAGMA_UNROLL
+        for (ushort sn = (SN / 2); sn >= 1; sn >>= 1) {
+          result[r][tm] += simd_shuffle_down(result[r][tm], sn);
+        }
       }
     }
     if (Prologue::kInlineNorm) {
       MLX_MTL_PRAGMA_UNROLL
-      for (ushort sn = (SN / 2); sn >= 1; sn >>= 1) {
-        ssq += simd_shuffle_down(ssq, sn);
+      for (int r = 0; r < NR; r++) {
+        MLX_MTL_PRAGMA_UNROLL
+        for (ushort sn = (SN / 2); sn >= 1; sn >>= 1) {
+          ssq[r] += simd_shuffle_down(ssq[r], sn);
+        }
       }
     }
 
+    // `NR == 1` wherever a threadgroup reduction exists (asserted above).
     if (needs_tgp_reduction) {
       threadgroup AccT* tgp_results = tgp_memory + sgN * (blockM + TM) + bm;
       if (thrN == 0) {
         MLX_MTL_PRAGMA_UNROLL
         for (int tm = 0; tm < TM; tm++) {
-          tgp_results[tm] = result[tm];
+          tgp_results[tm] = result[0][tm];
         }
         threadgroup_barrier(mem_flags::mem_none);
         if (sgN == 0) {
@@ -674,7 +718,7 @@ struct GEMVKernel {
           for (int sgn = 1; sgn < BN; sgn++) {
             MLX_MTL_PRAGMA_UNROLL
             for (int tm = 0; tm < TM; tm++) {
-              result[tm] += tgp_results[sgn * (blockM + TM) + tm];
+              result[0][tm] += tgp_results[sgn * (blockM + TM) + tm];
             }
           }
         }
@@ -697,23 +741,32 @@ struct GEMVKernel {
     // at `axpby1`, so this composition is unreachable today; it is written the
     // one way that is arithmetically defensible rather than left to whichever
     // order fell out.
+    //
+    // A row's output, and the index its epilogue reads at, sit `out_vec_size`
+    // past the previous row's.
     if (simdN == 0 && thrN == 0) {
-      if (Prologue::kInlineNorm) {
-        const AccT inv_rms = prologue.scale(ssq, in_vec_size);
-        MLX_MTL_PRAGMA_UNROLL
-        for (int tm = 0; tm < TM; tm++) {
-          result[tm] *= inv_rms;
-        }
-      }
       MLX_MTL_PRAGMA_UNROLL
-      for (int tm = 0; tm < TM; tm++) {
-        const AccT y = epilogue(result[tm], out_row + tm);
-        if (kDoAxpby) {
-          out_vec[out_row + tm] =
-              static_cast<VT>(alpha) * static_cast<VT>(y) +
-              static_cast<VT>(beta) * bias[(out_row + tm) * bias_stride];
-        } else {
-          out_vec[out_row + tm] = static_cast<VT>(y);
+      for (int r = 0; r < NR; r++) {
+        if (NR == 1 || r < n_rows) {
+          if (Prologue::kInlineNorm) {
+            const AccT inv_rms = prologue.scale(ssq[r], in_vec_size);
+            MLX_MTL_PRAGMA_UNROLL
+            for (int tm = 0; tm < TM; tm++) {
+              result[r][tm] *= inv_rms;
+            }
+          }
+          const int row_out = r * out_vec_size + out_row;
+          MLX_MTL_PRAGMA_UNROLL
+          for (int tm = 0; tm < TM; tm++) {
+            const AccT y = epilogue(result[r][tm], row_out + tm);
+            if (kDoAxpby) {
+              out_vec[row_out + tm] =
+                  static_cast<VT>(alpha) * static_cast<VT>(y) +
+                  static_cast<VT>(beta) * bias[(out_row + tm) * bias_stride];
+            } else {
+              out_vec[row_out + tm] = static_cast<VT>(y);
+            }
+          }
         }
       }
     }
@@ -943,6 +996,7 @@ template <
     const bool kDoAxpby,
     typename Prologue,
     typename Epilogue,
+    const int NR = 1,
     typename VT,
     typename ShapeP, typename StrideP>
 METAL_FUNC void gemv_body(
@@ -970,26 +1024,33 @@ METAL_FUNC void gemv_body(
     uint simd_lid) {
   using kernel_t = GEMVKernel<T, BM, BN, SM, SN, TM, TN, kDoAxpby,
                               typename GemvDefaultAccT<T>::type, Prologue,
-                              Epilogue, VT>;
+                              Epilogue, VT, NR>;
 
+  // Under the row axis `tid.z` is a group of `NR` batch items (the rows),
+  // every one against the batch's one matrix: the host binds a zero matrix
+  // batch stride.
+  static_assert(NR == 1 || !kDoNCBatch, "the row axis takes the contiguous batch");
+  const uint row0 = tid.z * NR;
   if (kDoNCBatch) {
     in_vec += gemv_elem_to_loc<int64_t>(tid.z, batch_shape, vector_batch_stride, batch_ndim);
     mat    += gemv_elem_to_loc<int64_t>(tid.z, batch_shape, matrix_batch_stride, batch_ndim);
     if (kDoAxpby)
       bias += gemv_elem_to_loc<int64_t>(tid.z, batch_shape, bias_batch_stride, batch_ndim);
   } else {
-    in_vec += tid.z * vector_batch_stride[0];
-    mat    += tid.z * matrix_batch_stride[0];
+    in_vec += row0 * vector_batch_stride[0];
+    mat    += row0 * matrix_batch_stride[0];
     if (kDoAxpby)
       bias += tid.z * bias_batch_stride[0];
   }
-  out_vec += tid.z * out_vec_size;
+  out_vec += row0 * out_vec_size;
+  const int n_rows = NR == 1 ? 1 : min(NR, int(batch_shape[0]) - int(row0));
 
   kernel_t::run(mat, in_vec, bias, out_vec,
                 in_vec_size, out_vec_size, matrix_ld,
                 alpha, beta, bias_stride,
                 tgp_memory, prologue, epilogue,
-                tid, lid, simd_gid, simd_lid);
+                tid, lid, simd_gid, simd_lid,
+                vector_batch_stride[0], n_rows);
 }
 
 // The threadgroup array cannot move into `gemv_body`: MSL permits a
@@ -1000,13 +1061,17 @@ METAL_FUNC void gemv_body(
 #define gemv_tgp_memory(KT) \
   threadgroup typename KT::acc_type tgp_memory[KT::tgp_mem_size == 0 ? 1 : KT::tgp_mem_size]
 
+// `NR` is the row axis (`GEMVKernel`): `NR` batch items against the one
+// matrix per threadgroup, the classical names its `NR = 1` instance and the
+// `_r<NR>` names its others (`instantiate_gemv_rows_blocks`).
 template <
     typename T,
     const int BM, const int BN,
     const int SM, const int SN,
     const int TM, const int TN,
     const bool kDoNCBatch,
-    const bool kDoAxpby>
+    const bool kDoAxpby,
+    const int NR = 1>
 [[kernel, max_total_threads_per_threadgroup(BM * BN * 32)]]
 void gemv(
     const device T* mat [[buffer(0)]],
@@ -1036,7 +1101,7 @@ void gemv(
   gemv_tgp_memory(kernel_t);
   const prologue_t prologue(nullptr, nullptr);
   gemv_body<T, BM, BN, SM, SN, TM, TN, kDoNCBatch, kDoAxpby, prologue_t,
-                 epilogue_t>(
+                 epilogue_t, NR>(
       mat, in_vec, bias, out_vec,
       in_vec_size, out_vec_size, matrix_ld, alpha, beta,
       batch_ndim, batch_shape, vector_batch_stride, matrix_batch_stride,
@@ -2510,6 +2575,37 @@ instantiate_gemv_mixed_blocks(f16w_f32, half, float)
 instantiate_gemv_blocks(float32, float)
 instantiate_gemv_blocks(float16, half)
 instantiate_gemv_blocks(bfloat16, bfloat)
+
+// The row axis (`GEMVKernel`'s `NR`, `docs/tuning.md` §13.5y): `_r<NR>`
+// after the classical name, at the two decode tiles (the only ones whose
+// simdgroup walks all of K), `nc0_axpby0`, split params, half only — the
+// dense f16 matmul is its one caller (`call_mlx_gemv_rows`). Every count
+// from 2 to 16, so a window of `m` rows is one group of exactly `m`.
+#define instantiate_gemv_rows_helper(nm, itype, bm, nr)                        \
+  template [[host_name("gemv_" #nm "_bm" #bm                                   \
+      "_bn1_sm1_sn32_tm4_tn4_nc0_axpby0_r" #nr)]]                              \
+  [[kernel]] decltype(gemv<itype, bm, 1, 1, 32, 4, 4, false, false, nr>)       \
+             gemv<itype, bm, 1, 1, 32, 4, 4, false, false, nr>;
+
+#define instantiate_gemv_rows_tile(nm, itype, bm)  \
+  instantiate_gemv_rows_helper(nm, itype, bm, 2)   \
+  instantiate_gemv_rows_helper(nm, itype, bm, 3)   \
+  instantiate_gemv_rows_helper(nm, itype, bm, 4)   \
+  instantiate_gemv_rows_helper(nm, itype, bm, 5)   \
+  instantiate_gemv_rows_helper(nm, itype, bm, 6)   \
+  instantiate_gemv_rows_helper(nm, itype, bm, 7)   \
+  instantiate_gemv_rows_helper(nm, itype, bm, 8)   \
+  instantiate_gemv_rows_helper(nm, itype, bm, 9)   \
+  instantiate_gemv_rows_helper(nm, itype, bm, 10)  \
+  instantiate_gemv_rows_helper(nm, itype, bm, 11)  \
+  instantiate_gemv_rows_helper(nm, itype, bm, 12)  \
+  instantiate_gemv_rows_helper(nm, itype, bm, 13)  \
+  instantiate_gemv_rows_helper(nm, itype, bm, 14)  \
+  instantiate_gemv_rows_helper(nm, itype, bm, 15)  \
+  instantiate_gemv_rows_helper(nm, itype, bm, 16)
+
+instantiate_gemv_rows_tile(float16, half, 4)
+instantiate_gemv_rows_tile(float16, half, 8)
 
 // The two decode-path tiles, per dtype. `bm8` serves w1/w3 (N=10752) and
 // conv.in_proj (N=6144); `bm4` serves q_proj (N=2048) and k/v_proj (N=512).

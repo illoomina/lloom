@@ -159,6 +159,7 @@ fn lfm2_tiny_is_admitted_on_the_machine_and_refused_without_room() {
 
 #[test]
 fn qwen3_5_tiny_is_admitted_on_the_machine_and_refused_without_room() {
+    reference_purpose();
     for (tag, model) in [
         ("qwen3_5", write::<Qwen3_5Tiny> as fn(&Path) -> PathBuf),
         ("qwen3_5_moe", write::<Qwen3_5MoeTiny>),
@@ -176,6 +177,7 @@ fn qwen3_5_tiny_is_admitted_on_the_machine_and_refused_without_room() {
 
 #[test]
 fn qwen4exp_tiny_is_admitted_on_the_machine_and_refused_without_room() {
+    reference_purpose();
     let dir = scratch("qwen4exp");
     let model = write::<Qwen4ExpTiny>(&dir);
     let tok = dir.join("tokenizer.json");
@@ -391,14 +393,22 @@ fn the_machine_gate_refuses_what_the_container_cannot_hold() {
         eprintln!("alone: {l}");
     }
     // The group's room after its tenth, taken by a reservation this test
-    // holds (its own footprint is subtracted from what it reserved).
+    // holds (its own footprint is subtracted from what it reserved) — plus a
+    // slack well past any drift: `charged` is the live container's usage,
+    // which the suite's other `lloom` processes move between this read and
+    // the load below, and the gate's own subtraction rounds the footprint
+    // to pages. Without the slack the second load was admitted by 2.5 MiB on
+    // silverberry (3/3 runs, 2026-10-19; `ci-c5091ad2`, `ci-96c4f30a`,
+    // `ci-7fa67f79`) and once on the NAS. The premise is unchanged: a
+    // container that cannot hold the load refuses it.
+    const SLACK: i64 = 256 << 20;
     let room = (limit - charged) as i64 - (limit / 10) as i64;
     let held = lloom_tensor::machine::footprint_of(std::process::id()).unwrap_or(0) as i64;
     let stand_in = Registry::open(&registry)
         .unwrap()
         .reserve_unchecked(
             "stand-in filling the container",
-            (room + held).max(0) as u64,
+            (room + held + SLACK).max(0) as u64,
         )
         .unwrap();
     eprintln!("limit={limit} charged={charged} room={room} held={held}");
@@ -474,4 +484,12 @@ fn serve_refuses_at_startup() {
     );
     std::fs::remove_dir_all(&registry).ok();
     std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The tiny Qwen's head dim (16) has no fused attention path, so a
+/// production load refuses it on Metal; the test declares the reference
+/// purpose, under which it attends through the composed oracle. Every child
+/// the test spawns inherits it.
+fn reference_purpose() {
+    std::env::set_var("LLOOM_EXECUTION__PURPOSE", "reference");
 }

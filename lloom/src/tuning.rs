@@ -437,7 +437,7 @@ pub struct StreamTuning {
     /// How the fetch worker waits between looks at a layer's routing: `sleep:<dur>` (it never spins; the older spelling is the bare count of microseconds).
     #[opt(flag = "fetch-poll-us",
         env = "QWEN4EXP_FETCH_POLL_US",
-        parser = "parse_at_least_one", path = "weights.experts.fetch.wait", status = "advanced", facets = ["wait"], flows = ["weights-in"], forms = ["sleep"], from_v1 = "lloom_tensor::options::v1::fetch_wait_from", to_v1 = "lloom_tensor::options::v1::fetch_wait_to", schema = "Wait")]
+        parser = "parse_at_least_one", path = "weights.experts.fetch.wait", status = "advanced", facets = ["wait"], flows = ["weights-in"], forms = ["sleep"], from_v1 = "lloom_tensor::options::v1::fetch_wait_from", to_v1 = "lloom_tensor::options::v1::fetch_wait_to", schema = "Wait", grammar = "lloom_tensor::options::wait::FETCH_WAIT")]
     pub fetch_poll_us: usize,
     /// Fetching steps in a row that load nothing before the waits stop (the pool holds the stream again).
     #[opt(flag = "fetch-exit",
@@ -759,20 +759,23 @@ pub struct RingTuning {
     /// How the host fill producer waits between tokens: `adaptive[:<dur>]` (`WFE` while a forward waits on an unfilled value, else a sleep of that long: measured fastest), `event[:<dur>]` (park, woken by the ring's publish event or a forward's demand; slower where the pool misses), or one arm throughout: `sleep[:<dur>]`, `wfe`, `spin-hint`, `spin`. The older spellings (`on-demand`, durations as bare µs) are the same arms.
     #[opt(flag = "host-feed-poll",
         env = "LLOOM_HOST_FEED_POLL",
-        parser = "parse_poll", path = "decode.host_feed.wait", status = "advanced", facets = ["wait"], flows = ["host-feed-in"], forms = ["adaptive", "event", "sleep", "wfe", "spin-hint", "spin"], from_v1 = "lloom_tensor::options::v1::feed_wait_from", to_v1 = "lloom_tensor::options::v1::feed_wait_to", schema = "Wait")]
+        parser = "parse_poll", path = "decode.host_feed.wait", status = "advanced", facets = ["wait"], flows = ["host-feed-in"], forms = ["adaptive", "event", "sleep", "wfe", "spin-hint", "spin"], from_v1 = "lloom_tensor::options::v1::feed_wait_from", to_v1 = "lloom_tensor::options::v1::feed_wait_to", schema = "Wait", grammar = "lloom_tensor::options::wait::HOST_FEED_WAIT")]
     pub feed_poll: String,
     /// Time every host fill (encoded, observed, signalled) and the producer's loop, and print a `HOSTFEED` line a run — an instrument.
     #[opt(flag = "host-feed-trace", env = "LLOOM_HOST_FEED_TRACE", bool, path = "diagnostics.trace.host_feed", status = "instrument", flows = ["host-feed-in"])]
     pub feed_trace: bool,
     /// How the fixed cadence's EOS wait learns the stamp: `inherit` (poll it, as the readback's own wait does) or `event` (park on the ring's publish event; measured 8 % slower a token on LFM2's `ring-fixed`, the event landing ~1 ms after the stamp).
-    #[opt(flag = "ring-eos-park", env = "LLOOM_RING_EOS_PARK", bool, path = "decode.ring.eos_wait", status = "arm", facets = ["wait"], flows = ["token-out"], values = ["inherit=false", "event=true"], forms = ["inherit", "event"], schema = "Wait")]
+    #[opt(flag = "ring-eos-park", env = "LLOOM_RING_EOS_PARK", bool, path = "decode.ring.eos_wait", status = "arm", facets = ["wait"], flows = ["token-out"], values = ["inherit=false", "event=true"], normalize_values, forms = ["inherit", "event"], schema = "Wait")]
     pub eos_park: bool,
     /// How DSpark's verify completion is waited for: `event` (park on an event behind the round's stamp) or `inherit` (poll the stamp, the A/B arm).
-    #[opt(flag = "verify-park", env = "LLOOM_VERIFY_PARK", bool, path = "speculative.verify_wait", status = "advanced", facets = ["wait"], flows = ["token-out"], values = ["inherit=false", "event=true"], forms = ["inherit", "event"], schema = "Wait")]
+    #[opt(flag = "verify-park", env = "LLOOM_VERIFY_PARK", bool, path = "speculative.verify_wait", status = "advanced", facets = ["wait"], flows = ["token-out"], values = ["inherit=false", "event=true"], normalize_values, forms = ["inherit", "event"], schema = "Wait")]
     pub verify_park: bool,
     /// The EOS gate on Qwen3.5 (#993's arm B): off (the family's gate is clamped off; the standing window undoes the fixed cadence's one forward past an EOS) or on (`decode.readback.eos_gate` then rides the adaptive commit: the GDN's gated decode step carries its state, the overrun taken back by its counters). An arm until its real-model gates are run.
     #[opt(flag = "qwen3-5-eos-gate", env = "LLOOM_QWEN3_5_EOS_GATE", bool, path = "models.qwen3_5.eos_gate", status = "arm", facets = ["lead"], flows = ["token-out", "commands-out"])]
     pub qwen3_5_eos_gate: bool,
+    /// The gate's cores arm on Qwen3.5 (#993 run 3): off (the gate stops the state; the quantized mat-vec cores of a forward queued past the EOS still run) or on (they return at once too, so a forward past the EOS costs its ungated kernels and the GDN's identity carry). Rides `models.qwen3_5.eos_gate`; taken only by a model whose dependency inventory admits it (`CausalLM::eos_gate_cores`). An arm until it is measured.
+    #[opt(flag = "qwen3-5-eos-gate-cores", env = "LLOOM_QWEN3_5_EOS_GATE_CORES", bool, path = "models.qwen3_5.eos_gate_cores", status = "arm", facets = ["lead"], flows = ["token-out", "commands-out"])]
+    pub qwen3_5_eos_gate_cores: bool,
     /// Whether the adaptive commit's loop watches the ring for a stop id itself (#993): off (it stops only when the reader raises the flag, so a late reader lets it run past an EOS without bound) or on (it reads what the GPU published before each step and stops at a stop id, so at most `adaptive_lead + 1` forwards run past an EOS). An arm until it is measured.
     #[opt(flag = "ring-eos-watch", env = "LLOOM_RING_EOS_WATCH", bool, path = "decode.ring.eos_watch", status = "arm", facets = ["lead"], flows = ["token-out", "commands-out"])]
     pub eos_watch: bool,
@@ -799,6 +802,7 @@ impl Default for RingTuning {
             eos_park: false,
             verify_park: true,
             qwen3_5_eos_gate: false,
+            qwen3_5_eos_gate_cores: false,
             eos_watch: false,
         }
     }

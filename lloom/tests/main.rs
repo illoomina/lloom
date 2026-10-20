@@ -15,6 +15,7 @@
 //! so a file that is not a module here fails the suite instead of silently
 //! not running.
 mod accept_frontier;
+mod attention_route;
 mod axes_registry;
 mod batch_norm;
 mod batched_decode_tests;

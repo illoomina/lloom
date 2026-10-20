@@ -2840,6 +2840,7 @@ fn timings(
         "predicted_per_second": if predicted_ms > 0.0 { n as f64 / (predicted_ms / 1e3) } else { 0.0 },
         "total_ms": ms(elapsed),
         "readback": d.readback.name(),
+        "readback_note": d.readback_note,
         "reuse": format!("{:?}", d.reuse),
         "prefilled": d.prefilled,
         "commits": st.commits,
@@ -2901,6 +2902,18 @@ fn timings(
     t
 }
 
+/// The request line's steady rate: one over the median step. The per-step
+/// clock is the `profile` build's (`nn::decode`), so a build without it has no
+/// steps to take a median of and says so rather than printing a measured zero.
+fn steady_rate_field(step_ns: &[u64]) -> String {
+    let mut steps = step_ns.to_vec();
+    steps.sort_unstable();
+    match steps.get(steps.len() / 2) {
+        Some(&median) => format!("{:.1} tok/s steady (median step)", 1e9 / median as f64),
+        None => "steady rate unavailable (per-step clock not in this build)".to_string(),
+    }
+}
+
 fn report(
     shared: &Shared,
     endpoint: &str,
@@ -2913,16 +2926,10 @@ fn report(
     let turn = d.turn.with_policy(policy);
     shared.reuse.lock().note(&turn);
     let st = &d.stats;
-    let mut steps: Vec<u64> = st.step_ns.clone();
-    steps.sort_unstable();
-    let steady = if steps.is_empty() {
-        0.0
-    } else {
-        1e9 / steps[steps.len() / 2] as f64
-    };
+    let steady = steady_rate_field(&st.step_ns);
     eprintln!(
         "[{endpoint}: prompt_tokens={prompt} completion_tokens={} stop={:?} total {total_ms:.1} ms, \
-         {steady:.1} tok/s steady (median step), readback={} reuse={:?} prefilled={} \
+         {steady}, readback={} reuse={:?} prefilled={} \
          commits={} poll_fallbacks={} overrun={} eos_gate={} host_fill={} prompt_ids_sha256={} \
          reasoning_effort={} think={} think_by={} thinking_budget={} thought={} budget_fired={} \
          prompt_budget={} prompt_dropped={} reused={} renders={} history={}/{} spliced={}/{} \
@@ -2965,6 +2972,9 @@ fn report(
         turn.fields(),
         d.checkpoint_name(),
     );
+    if let Some(note) = &d.readback_note {
+        eprintln!("[{endpoint}: warning: {note}]");
+    }
 }
 
 /// What a request's prompt was: the digest of its ids (`lloom chat`'s
@@ -3773,6 +3783,31 @@ mod bench_cells_tests {
         assert!(Cell::parse("decode:512").is_err(), "a decode cell needs D");
         assert!(Cell::parse("ttft:8").is_err());
         assert!(Cell::parse("prefill:many").is_err());
+    }
+}
+
+#[cfg(test)]
+mod steady_rate_tests {
+    use super::steady_rate_field;
+
+    #[test]
+    fn no_recorded_step_is_unavailable_not_a_zero_rate() {
+        assert_eq!(
+            steady_rate_field(&[]),
+            "steady rate unavailable (per-step clock not in this build)"
+        );
+    }
+
+    #[test]
+    fn recorded_steps_give_one_over_the_median_step() {
+        assert_eq!(
+            steady_rate_field(&[4_000_000, 1_000_000, 2_000_000]),
+            "500.0 tok/s steady (median step)"
+        );
+        assert_eq!(
+            steady_rate_field(&[1_000_000, 3_000_000]),
+            "333.3 tok/s steady (median step)"
+        );
     }
 }
 

@@ -462,3 +462,86 @@ fn the_eos_watch_bounds_the_overrun_past_a_late_stop() -> Result<()> {
     }
     Ok(())
 }
+
+/// The lead's queued part (`DecodeOptions::queued_steps`) is the pacer's
+/// bound, apart from the batching (`run_ahead`, one step a buffer here):
+/// before each forward the host waits until fewer than `queued` steps are
+/// committed and incomplete. At `queued` 1 that is the buffer it committed
+/// a moment before, which the GPU has not finished, so it waits at (nearly)
+/// every step (`step_waits`); at 8 the oldest of eight has long completed and
+/// it never waits. The batching is the same in both.
+#[test]
+fn the_queued_steps_are_the_pacer_s_bound_apart_from_the_batching() -> Result<()> {
+    pin();
+    let dev = Device::new_metal(0)?;
+    let (model, cfg) = model(&dev)?;
+    let prompt: Vec<u32> = vec![1, 3, 5, 7, 9];
+    let never = vec![u32::MAX];
+    const STEPS: usize = 32;
+    let mut waits = Vec::new();
+    for queued_steps in [1usize, 8] {
+        let opts = DecodeOptions {
+            run_ahead: 1,
+            queued_steps,
+            ..adaptive(STEPS)
+        };
+        let mut s = Session::new(&model, model.new_cache(&cfg, &dev)?);
+        let mut rb = Ring::new(
+            &never,
+            &dev,
+            RING_HISTORY_SLOTS,
+            EosRead::Poll(PollMechanism::default()),
+        )?
+        .with_poll_budget(20_000);
+        let mut reader = rb.reader().expect("a mapped ring");
+        reader.resume_at_published();
+        let stop = Arc::new(AtomicBool::new(false));
+        let done = Arc::new(AtomicBool::new(false));
+        let drain = {
+            let done = Arc::clone(&done);
+            std::thread::spawn(move || {
+                let mut buf = Vec::new();
+                while !done.load(Ordering::Acquire) {
+                    buf.clear();
+                    let _ = reader.read_new(&mut buf);
+                    std::thread::sleep(Duration::from_micros(100));
+                }
+            })
+        };
+        let out = s.decode(
+            &mut IdentityProposer,
+            &mut rb,
+            &mut greedy(),
+            &prompt,
+            &DecodeOptions {
+                stop: Some(Arc::clone(&stop)),
+                ..opts
+            },
+            &mut sink,
+        );
+        done.store(true, Ordering::Release);
+        drain.join().expect("reader thread");
+        let out = out?;
+        eprintln!(
+            "QUEUED queued_steps {queued_steps}: produced {} buffers closed {} markers retired {} \
+             of which waited {} | most steps a buffer {}",
+            out.stats.produced,
+            out.stats.adaptive_commits + out.stats.run_ahead_closes,
+            out.stats.step_markers,
+            out.stats.step_waits,
+            out.stats.max_steps_per_buffer,
+        );
+        assert_eq!(out.stats.produced, STEPS);
+        assert_eq!(
+            out.stats.max_steps_per_buffer, 1,
+            "the batching is run_ahead's, one step a buffer"
+        );
+        waits.push(out.stats.step_waits);
+    }
+    assert!(
+        waits[0] as usize >= STEPS - 2,
+        "queued 1: the host waits on the buffer it just committed, every step: {waits:?}"
+    );
+    assert_eq!(waits[1], 0, "queued 8: it never waits: {waits:?}");
+    Ok(())
+}

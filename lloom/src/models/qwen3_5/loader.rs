@@ -11,6 +11,7 @@ use super::{
 };
 use crate::models::qwen4exp::loader::{md_f32, md_u32, open_shards, working_set_of, Gguf, Shard};
 use crate::models::qwen4exp::{GatedDeltaNet, LayerKind, MoeLayer, QsaAttention, Resident};
+use crate::nn::attention::route::ExecutionPurpose;
 use crate::nn::blocks::SwiGlu;
 use crate::nn::decoder::{
     DecodeRecovery, Decoder, Hybrid, NormHead, PreNorm, StateCapacity, TokenEmbed,
@@ -65,6 +66,11 @@ pub struct LoadOptions {
     /// (`sequence-reuse-design.md` §2.3b). Admitted beside the weights:
     /// as many as the budget fits, at most this.
     pub checkpoints: usize,
+    /// What the attention is built for ([`ExecutionPurpose`]): production
+    /// refuses at load, on Metal, a full-attention layer whose attention
+    /// takes the composed path; the reference (the default) keeps it, for a
+    /// test or a harness to compare against.
+    pub purpose: ExecutionPurpose,
 }
 
 impl Default for LoadOptions {
@@ -79,6 +85,7 @@ impl Default for LoadOptions {
             recovery: DecodeRecovery::None,
             machine: None,
             checkpoints: 2,
+            purpose: ExecutionPurpose::Reference,
         }
     }
 }
@@ -476,6 +483,7 @@ fn load_mixer<P: Profile, R: Read + Seek>(
                 RmsNorm::new(gg.f32(&format!("{p}.attn_k_norm.weight"))?, cfg.norm_eps),
                 &cfg.attn(),
             );
+            attn.admit(gg.purpose, &gg.device)?;
             Hybrid::B(match cat {
                 Some(cat) => attn.with_stem_cat(cat),
                 None => attn,
@@ -772,6 +780,9 @@ fn build_dense<P: Profile, R: Read + Seek>(
     let per_position = prefill_bytes_per_position(&cfg);
     let mut model = Decoder::new(ARCH_DENSE, cfg, embed, layers, head, cap, hidden, &device)?;
     model.set_prefill_bytes_per_position(per_position);
+    // Every quantized mat-vec output is a forward's own activation: the
+    // gate's cores arm may skip them past a stop (§2.3e's inventory).
+    model.set_eos_gate_cores(true);
     model.hold_reservation(holds.reservation);
     for k in holds.keep {
         model.keep_alive(k);
@@ -820,6 +831,9 @@ fn build_moe<P: Profile, R: Read + Seek>(
     let per_position = prefill_bytes_per_position(&cfg);
     let mut model = Decoder::new(ARCH_MOE, cfg, embed, layers, head, cap, hidden, &device)?;
     model.set_prefill_bytes_per_position(per_position);
+    // The experts are resident: as for the dense build, plus the router and
+    // the routed experts' mat-vecs, read only by the forward itself.
+    model.set_eos_gate_cores(true);
     model.hold_reservation(holds.reservation);
     for k in holds.keep {
         model.keep_alive(k);
@@ -918,6 +932,7 @@ impl<P: Profile> Qwen3_5<P> {
             device,
         )?;
         gg.dense_f32 = opts.dense_f32;
+        gg.purpose = opts.purpose;
         build_dense::<P, R>(&mut gg, opts, |_| Ok(()))
     }
 
@@ -965,6 +980,7 @@ impl<P: Profile> Qwen3_5<P> {
             .collect();
         let mut gg = Gguf::new(shards, device)?;
         gg.dense_f32 = opts.dense_f32;
+        gg.purpose = opts.purpose;
         build_dense::<P, _>(&mut gg, opts, preflight)
     }
 }
@@ -1019,6 +1035,7 @@ impl<P: Profile> Qwen3_5Moe<P> {
             device,
         )?;
         gg.dense_f32 = opts.dense_f32;
+        gg.purpose = opts.purpose;
         build_moe::<P, R>(&mut gg, opts, |_| Ok(()))
     }
 
@@ -1067,6 +1084,7 @@ impl<P: Profile> Qwen3_5Moe<P> {
             .collect();
         let mut gg = Gguf::new(shards, device)?;
         gg.dense_f32 = opts.dense_f32;
+        gg.purpose = opts.purpose;
         build_moe::<P, _>(&mut gg, opts, preflight)
     }
 }

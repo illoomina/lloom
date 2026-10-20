@@ -133,6 +133,7 @@ use candle_examples::lfm2_setup::proc_footprint;
 ///
 /// `rt_written` carries the last byte count purely so the final report can say
 /// whether anything reached disk, without re-reading the file.
+#[cfg(feature = "metal")]
 fn flush_run_telemetry(args: &Args, rt_written: &mut usize) -> Result<()> {
     let Some(path) = args.run_telemetry_jsonl.as_ref() else {
         return Ok(());
@@ -143,6 +144,43 @@ fn flush_run_telemetry(args: &Args, rt_written: &mut usize) -> Result<()> {
     *rt_written = body.len();
     std::fs::write(path, body)
         .with_context(|| format!("writing run telemetry to {}", path.display()))?;
+    Ok(())
+}
+
+#[cfg(not(feature = "metal"))]
+fn flush_run_telemetry(args: &Args, _rt_written: &mut usize) -> Result<()> {
+    validate_run_telemetry_request(args)
+}
+
+fn run_telemetry_compiled() -> bool {
+    #[cfg(feature = "metal")]
+    {
+        candle::kernels::metal::run_telemetry::compiled()
+    }
+    #[cfg(not(feature = "metal"))]
+    {
+        false
+    }
+}
+
+/// Cold request validation shared by the actual entry and no-Metal writer.
+/// It must precede shape_key, which reads checkpoint config.
+fn validate_run_telemetry_request(args: &Args) -> Result<()> {
+    if args.run_telemetry_jsonl.is_some() {
+        if !run_telemetry_compiled() {
+            anyhow::bail!(
+                "--run-telemetry-jsonl needs the `metal-run-telemetry` feature, and this \
+                 binary was built without it.\n  \
+                 rebuild: cargo build --release --features metal-run-telemetry \
+                 --example lfm2-decode-profile\n  \
+                 (candle-examples gained that feature in lloom #205; before it, \
+                 candle-core declared `metal-run-telemetry` and nothing above it did, \
+                 so no harness could enable it at all.)"
+            );
+        }
+        anyhow::ensure!(!args.cpu,
+            "--run-telemetry-jsonl records Metal memory classes; select a Metal device (omit --cpu)");
+    }
     Ok(())
 }
 
@@ -515,6 +553,9 @@ mod profile {
     pub struct Snapshot {
         pub dispatches: u64,
         pub encoders: u64,
+        pub fence_probes: u64,
+        pub fence_hits: u64,
+        pub fence_waits: u64,
         pub command_buffers: u64,
         pub timed_command_buffers: u64,
         pub gpu_busy_sum_s: f64,
@@ -2798,6 +2839,11 @@ fn run_speculative_decode<P: Lfm2Shape>(r: SpecRun<'_, P>) -> Result<()> {
 fn main() -> Result<()> {
     let matches = Args::command().get_matches();
     let args = Args::from_arg_matches(&matches)?;
+    execute(args, matches)
+}
+
+fn execute(args: Args, matches: ArgMatches) -> Result<()> {
+    validate_run_telemetry_request(&args)?;
     // A gate states its contract: deterministic, unless LLOOM_PROFILE names one.
     candle_examples::pin_profiled_contract(
         "lfm2-decode-profile",
@@ -3085,18 +3131,8 @@ fn run<P: Lfm2Shape>(args: Args, matches: ArgMatches) -> Result<()> {
     // capability rather than a flag read back to itself; `engaged()` at the end
     // of the run is the other half, and it is checked before the file is
     // written.
+    #[cfg(feature = "metal")]
     if args.run_telemetry_jsonl.is_some() {
-        if !candle::kernels::metal::run_telemetry::compiled() {
-            anyhow::bail!(
-                "--run-telemetry-jsonl needs the `metal-run-telemetry` feature, and this \
-                 binary was built without it.\n  \
-                 rebuild: cargo build --release --features metal-run-telemetry \
-                 --example lfm2-decode-profile\n  \
-                 (candle-examples gained that feature in lloom #205; before it, \
-                 candle-core declared `metal-run-telemetry` and nothing above it did, \
-                 so no harness could enable it at all.)"
-            );
-        }
         candle::kernels::metal::run_telemetry::set_enabled(true);
     }
 
@@ -4405,6 +4441,7 @@ fn run<P: Lfm2Shape>(args: Args, matches: ArgMatches) -> Result<()> {
     // record, from one that could and was not asked to, from one that recorded
     // -- the discrimination §2.4 requires after #69's determinism arm consumed
     // its own `OnceLock` and reported a passing digest for the unchanged path.
+    #[cfg(feature = "metal")]
     if args.run_telemetry_jsonl.is_some() {
         use candle::kernels::metal::run_telemetry as rt;
         let accepted = rt::accepted();
@@ -4709,8 +4746,10 @@ fn run<P: Lfm2Shape>(args: Args, matches: ArgMatches) -> Result<()> {
         "profiling             {}",
         if profiling {
             "on (CANDLE_METAL_PROFILE=1)"
-        } else {
+        } else if cfg!(feature = "metal") {
             "OFF -- rerun with CANDLE_METAL_PROFILE=1 for the CPU/GPU split"
+        } else {
+            "unavailable (Metal profiling is not compiled); CPU wall-time remains measured"
         }
     );
     println!();
@@ -5261,7 +5300,10 @@ fn run<P: Lfm2Shape>(args: Args, matches: ArgMatches) -> Result<()> {
     // harness computes is a prediction that agrees, not an observation**
     // (§5.5a's own caution), and it is labelled `asks` for that reason.
     let scratch_asks_bytes = flash_scratch_ask_bytes(&axes, &config, kv_len, args.kv_capacity);
+    #[cfg(feature = "metal")]
     let (to_cpu_fast, to_cpu_blit) = candle::metal_backend::to_cpu_counts();
+    #[cfg(not(feature = "metal"))]
+    let (to_cpu_fast, to_cpu_blit) = (0u64, 0u64);
 
     // ---- #567's engagement counters --------------------------------------
     //
@@ -5432,7 +5474,10 @@ fn run<P: Lfm2Shape>(args: Args, matches: ArgMatches) -> Result<()> {
     // #366: readbacks that found the buffer unmapped *after* the GPU wait and
     // fell back to the blit. This is the window that used to segfault; printing
     // it is what makes its frequency a number rather than a crash report.
+    #[cfg(feature = "metal")]
     let to_cpu_null_after_wait = candle::metal_backend::to_cpu_null_after_wait();
+    #[cfg(not(feature = "metal"))]
+    let to_cpu_null_after_wait = 0u64;
     // #477's engagement quantity, read from the kernel cache after the run so
     // it counts what the decode actually compiled rather than what a plan says
     // it would (§2.4: verify an arm from a quantity the flag should have
@@ -5907,4 +5952,65 @@ fn shape_key(args: &Args, matches: &ArgMatches) -> Result<lloom::profile::Profil
         config.conv_state = ConvState::parse(&args.conv_state).map_err(anyhow::Error::msg)?;
     }
     Ok(config.profile_key())
+}
+
+#[cfg(all(test, not(feature = "metal")))]
+mod cpu_telemetry_tests {
+    use super::*;
+
+    #[test]
+    fn telemetry_entry_refuses_before_checkpoint_shape_or_output_access() {
+        let matches = Args::command()
+            .try_get_matches_from([
+                "lfm2-decode-profile",
+                "--cpu",
+                "--model-dir",
+                "/dev/null/not-a-checkpoint",
+                "--run-telemetry-jsonl",
+                "/dev/null/not-an-output",
+            ])
+            .unwrap();
+        let args = Args::from_arg_matches(&matches).unwrap();
+        let error = execute(args, matches).unwrap_err().to_string();
+        assert!(
+            error.contains("needs the `metal-run-telemetry` feature"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn help_remains_available_before_cpu_telemetry_setup() {
+        let error = Args::command()
+            .try_get_matches_from(["lfm2-decode-profile", "--help"])
+            .unwrap_err();
+        assert_eq!(error.kind(), clap::error::ErrorKind::DisplayHelp);
+        assert!(error.to_string().contains("--run-telemetry-jsonl"));
+    }
+
+    #[test]
+    fn absent_metal_telemetry_is_not_reported_as_an_empty_recording() {
+        assert!(!run_telemetry_compiled());
+        let mut args = Args::try_parse_from(["lfm2-decode-profile", "--cpu"]).unwrap();
+        let mut written = 17;
+        flush_run_telemetry(&args, &mut written).unwrap();
+        assert_eq!(written, 17);
+        args.run_telemetry_jsonl = Some(PathBuf::from("unavailable-telemetry.jsonl"));
+        let error = flush_run_telemetry(&args, &mut written).unwrap_err();
+        assert!(error.to_string().contains("metal-run-telemetry"));
+        assert_eq!(written, 17);
+    }
+
+    #[test]
+    fn cpu_profile_shim_keeps_gpu_profiling_disabled() {
+        assert!(!profile::enabled());
+        let snapshot = profile::snapshot();
+        assert_eq!(
+            (
+                snapshot.fence_probes,
+                snapshot.fence_hits,
+                snapshot.fence_waits
+            ),
+            (0, 0, 0)
+        );
+    }
 }

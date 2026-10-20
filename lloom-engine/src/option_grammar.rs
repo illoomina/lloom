@@ -38,7 +38,7 @@ pub fn legacy_notes(env: &dyn Fn(&str) -> Option<String>) -> Vec<String> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::option_tree::{index, Key, Leaf};
     use lloom_tensor::options::{canonical_env, KnobMeta, FALSE_SPELLINGS, TRUE_SPELLINGS};
@@ -527,7 +527,7 @@ mod tests {
     /// A JSON Schema validator for the keywords the option schema's value
     /// nodes use; any other keyword fails the test rather than passing
     /// silently.
-    fn schema_valid(node: &Value, v: &Value, defs: &Value) -> bool {
+    pub(crate) fn schema_valid(node: &Value, v: &Value, defs: &Value) -> bool {
         let Some(obj) = node.as_object() else {
             return node.as_bool().unwrap_or(false);
         };
@@ -567,13 +567,31 @@ mod tests {
                     .is_match(s)
             }),
             "minimum" => v.as_f64().is_none_or(|f| f >= rule.as_f64().unwrap()),
+            // Only nonnegative integer upper bounds are emitted here. This
+            // helper is not a general JSON Schema numeric implementation.
+            "maximum" => match v {
+                Value::Number(n) => {
+                    let maximum = rule.as_u64().expect("integer upper bound");
+                    if let Some(n) = n.as_u64() {
+                        n <= maximum
+                    } else {
+                        n.as_f64().is_some_and(|f| {
+                            f < 0.0
+                                || (f.is_finite()
+                                    && f.fract() == 0.0
+                                    && format!("{f:.0}").parse::<u64>().is_ok_and(|n| n <= maximum))
+                        })
+                    }
+                }
+                _ => true,
+            },
             other => panic!("the validator does not know `{other}`"),
         })
     }
 
     /// The schema node of a key, through the groups (a group that also takes
     /// a shorthand string is the `anyOf` member with properties).
-    fn schema_node<'a>(schema: &'a Value, path: &str) -> &'a Value {
+    pub(crate) fn schema_node<'a>(schema: &'a Value, path: &str) -> &'a Value {
         let mut node = schema;
         for seg in path.split('.') {
             let group = node

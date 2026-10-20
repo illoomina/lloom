@@ -33,6 +33,193 @@ const MOVED_ELSEWHERE: &[(&str, &str, &str, &str)] = &[(
     "the row axis, on under `fast`; `deterministic` never takes it (tuning.md §13.5w)",
 )];
 
+const PRE_TREE: &str = "the front-end's own value before the option tree";
+const TUNED_FLOW: &str = "the tuned decode flow as chat's and serve's default (a08b86f5d, #859)";
+const CHAT_SERVE: &[Frontend] = &[Frontend::Chat, Frontend::Serve];
+
+/// Every row of the front-end table by value: key, front-ends, condition,
+/// `before` and where the value comes from. The table is otherwise its own
+/// reference, so a row added, removed or moved fails here by name. The rows
+/// not `PRE_TREE` were moved by another change on `dev`, recorded so the
+/// audit names each; none of them is an exception this tree approved.
+const PINNED_ROWS: &[(&str, &[Frontend], When, &str, &str)] = &[
+    (
+        "context.prefix.reuse",
+        &[Frontend::Chat],
+        When::Always,
+        "true",
+        PRE_TREE,
+    ),
+    (
+        "context.prefix.reuse",
+        &[Frontend::Serve],
+        When::Always,
+        "false",
+        PRE_TREE,
+    ),
+    (
+        "context.prefix.reuse",
+        &[Frontend::Bench],
+        When::Always,
+        "false",
+        PRE_TREE,
+    ),
+    (
+        "generation.max_tokens",
+        &[Frontend::Chat],
+        When::Always,
+        "1024",
+        PRE_TREE,
+    ),
+    (
+        "scheduler.prefill_chunk",
+        &[Frontend::Serve],
+        When::Batched,
+        "512",
+        PRE_TREE,
+    ),
+    (
+        "scheduler.prefill_chunk",
+        &[Frontend::Bench],
+        When::Batched,
+        "512",
+        PRE_TREE,
+    ),
+    (
+        "backend.metal.command_buffer.api",
+        CHAT_SERVE,
+        When::Metal,
+        "metal4",
+        TUNED_FLOW,
+    ),
+    (
+        "backend.metal.compiler.merged_unit",
+        CHAT_SERVE,
+        When::Metal,
+        "true",
+        TUNED_FLOW,
+    ),
+    (
+        "backend.metal.copy2d_compute",
+        CHAT_SERVE,
+        When::Metal,
+        "true",
+        TUNED_FLOW,
+    ),
+    (
+        "backend.metal.heaps.transient",
+        CHAT_SERVE,
+        When::Metal,
+        "true",
+        TUNED_FLOW,
+    ),
+    (
+        "decode.readback.kind",
+        CHAT_SERVE,
+        When::Metal,
+        "ring",
+        TUNED_FLOW,
+    ),
+    (
+        "decode.readback.eos",
+        CHAT_SERVE,
+        When::Metal,
+        "gpu-batched-nonblocking",
+        TUNED_FLOW,
+    ),
+    (
+        "decode.readback.stream_reader",
+        CHAT_SERVE,
+        When::Metal,
+        "true",
+        TUNED_FLOW,
+    ),
+    (
+        "models.qwen3_5.eos_gate",
+        CHAT_SERVE,
+        When::Metal,
+        "false",
+        PRE_TREE,
+    ),
+    (
+        "models.qwen3_5.eos_gate_cores",
+        CHAT_SERVE,
+        When::Metal,
+        "false",
+        PRE_TREE,
+    ),
+    (
+        "decode.readback.queued_steps",
+        CHAT_SERVE,
+        When::Metal,
+        "0",
+        PRE_TREE,
+    ),
+    (
+        "kernels.attention.flash.partial_block",
+        CHAT_SERVE,
+        When::ModelAxes,
+        "8",
+        TUNED_FLOW,
+    ),
+    (
+        "kernels.fusion.norm_in_gemv",
+        CHAT_SERVE,
+        When::ModelAxes,
+        "true",
+        TUNED_FLOW,
+    ),
+    (
+        "models.lfm2.rows_kernels",
+        CHAT_SERVE,
+        When::ModelAxes,
+        "per-row",
+        TUNED_FLOW,
+    ),
+    (
+        "speculative.dspark.context_kv",
+        CHAT_SERVE,
+        When::ModelAxes,
+        "paged",
+        TUNED_FLOW,
+    ),
+    (
+        "context.kv.layout",
+        CHAT_SERVE,
+        When::ModelAxes,
+        "paged",
+        TUNED_FLOW,
+    ),
+    (
+        "kernels.attention.impl",
+        CHAT_SERVE,
+        When::ModelAxes,
+        "flash",
+        TUNED_FLOW,
+    ),
+    (
+        "kernels.attention.qkv_layout",
+        CHAT_SERVE,
+        When::ModelAxes,
+        "fused",
+        TUNED_FLOW,
+    ),
+    (
+        "kernels.fusion.conv",
+        CHAT_SERVE,
+        When::ModelAxes,
+        "true",
+        TUNED_FLOW,
+    ),
+    (
+        "models.lfm2.conv_prefill_context",
+        CHAT_SERVE,
+        When::ModelAxes,
+        "true",
+        TUNED_FLOW,
+    ),
+];
+
 type Front<'a> = Box<dyn Fn(&mut EngineOptions) -> Result<(), String> + 'a>;
 
 fn front_of(cli: &Cli) -> (&CommonArgs, Front<'_>) {
@@ -74,6 +261,27 @@ fn typed(key: &str, value: &str) -> Value {
     let mut o = EngineOptions::default();
     index().set(&mut o, key, value).unwrap();
     at(&o, key)
+}
+
+/// The library tree before the option tree, read back into today's, and
+/// the fields the dump wrote.
+fn before_tree() -> (EngineOptions, Vec<String>) {
+    #[allow(unused_mut)]
+    let mut before: Value = serde_json::from_str(BEFORE_TREE).unwrap();
+    // The dump was taken on aarch64, where the poll's default is `wfe`; the
+    // grammar refuses `wfe` elsewhere (`unknown poll mechanism`), so off
+    // aarch64 the key is left unset and resolves to that platform's own
+    // default — the one platform-specific value the dump carries.
+    #[cfg(not(target_arch = "aarch64"))]
+    if let Some(r) = before
+        .pointer_mut("/decode/readback")
+        .and_then(Value::as_object_mut)
+    {
+        r.remove("poll");
+    }
+    let mut o = EngineOptions::default();
+    let written = index().merge_written(&mut o, &before).unwrap();
+    (o, written.into_iter().collect())
 }
 
 /// The arguments that put a front-end at a batch where a row needs one.
@@ -168,6 +376,43 @@ fn each_front_end_resolves_its_own_defaults_through_the_command_line() {
         panic!("config")
     };
     assert_eq!(c.frontend, Some(Frontend::Serve));
+}
+
+/// The front-end table is the pinned one, row for row; each row another
+/// change moved is reported beside the library's value before the option
+/// tree, and none of them is an exception.
+#[test]
+fn every_front_end_row_is_pinned_by_value() {
+    let pinned: Vec<(&str, Frontend, When, &str)> = PINNED_ROWS
+        .iter()
+        .flat_map(|&(k, fs, w, v, _)| fs.iter().map(move |&f| (k, f, w, v)))
+        .collect();
+    let table: Vec<(&str, Frontend, When, &str)> = ROWS
+        .iter()
+        .map(|r| (r.key, r.frontend, r.when, r.before))
+        .collect();
+    let unpinned: Vec<_> = table.iter().filter(|t| !pinned.contains(t)).collect();
+    let gone: Vec<_> = pinned.iter().filter(|p| !table.contains(p)).collect();
+    assert!(
+        unpinned.is_empty() && gone.is_empty(),
+        "the front-end table moved; pin each row with where its value comes from\n\
+         in the table, not pinned: {unpinned:?}\npinned, not in the table: {gone:?}"
+    );
+    assert_eq!(table.len(), pinned.len(), "a row appears twice");
+    let (before, _) = before_tree();
+    for &(k, fs, _, v, why) in PINNED_ROWS.iter().filter(|p| p.4 != PRE_TREE) {
+        assert!(
+            EXCEPTIONS.iter().all(|e| e.key != k),
+            "{k} is an approved exception, not a move recorded here"
+        );
+        let names: Vec<&str> = fs.iter().map(|f| f.name()).collect();
+        eprintln!(
+            "[{k}: the library's {} before the option tree; {} now {}: {why}]",
+            at(&before, k),
+            names.join(", "),
+            typed(k, v)
+        );
+    }
 }
 
 /// Every way to name a key a front-end resolves itself is explicit: the
@@ -344,21 +589,7 @@ fn the_unset_defaults_are_the_trees_before_it_except_the_named_exceptions() {
     let idx = index();
     let none = BTreeMap::new();
     // 1. The library tree.
-    #[allow(unused_mut)]
-    let mut before: Value = serde_json::from_str(BEFORE_TREE).unwrap();
-    // The dump was taken on aarch64, where the poll's default is `wfe`; the
-    // grammar refuses `wfe` elsewhere (`unknown poll mechanism`), so off
-    // aarch64 the key is left unset and resolves to that platform's own
-    // default — the one platform-specific value the dump carries.
-    #[cfg(not(target_arch = "aarch64"))]
-    if let Some(r) = before
-        .pointer_mut("/decode/readback")
-        .and_then(Value::as_object_mut)
-    {
-        r.remove("poll");
-    }
-    let mut o = EngineOptions::default();
-    let written = idx.merge_written(&mut o, &before).unwrap();
+    let (o, written) = before_tree();
     assert!(written.len() >= 180, "{} fields read", written.len());
     let now = idx.flat(&EngineOptions::default());
     let mut diff: Vec<String> = Vec::new();
@@ -440,7 +671,10 @@ fn the_unset_defaults_are_the_trees_before_it_except_the_named_exceptions() {
     for e in EXCEPTIONS {
         let r = frontend::row(e.key, e.frontend).unwrap();
         let o = resolve(Some(e.frontend), e.frontend.name(), &batch_for(r), &none).unwrap();
-        let want = if e.landed { e.after } else { e.before };
+        // A landed exception resolves to its `after` where its row holds; a
+        // row a build cannot hold (the Metal rows on the CPU-only x86 gate)
+        // leaves the library's value, which is the row's `before`.
+        let want = if e.landed && r.when.holds(&o) { e.after } else { e.before };
         assert_eq!(
             at(&o, e.key),
             typed(e.key, want),
@@ -453,18 +687,27 @@ fn the_unset_defaults_are_the_trees_before_it_except_the_named_exceptions() {
     let decided: Vec<u32> = EXCEPTIONS.iter().map(|e| e.decision).collect();
     assert_eq!(
         decided,
-        [36],
-        "the approved default changes are decision 36 alone"
+        [36, 43, 43, 43, 43, 35, 35],
+        "the approved default changes: decision 36 (serve reuse), 43 (the gate and its cores arm, chat and serve), 35 (the lead, chat and serve)"
     );
-
-    // 4. Decisions 43/44: the EOS watch (and the Qwen gate, when it lands)
-    // stay opt-in on every front-end.
+    // 4. Decision 44: the EOS watch stays opt-in on every front-end.
+    // Decisions 43/35 (2026-10-19): the gate, its cores arm and the lead of 4
+    // are chat's and serve's defaults where the Metal rows hold — a Metal
+    // build, not `--cpu` — and the library's values on bench and on the CPU.
     for f in Frontend::ALL {
         let o = resolve(Some(f), f.name(), &[], &none).unwrap();
         assert_eq!(at(&o, "decode.ring.eos_watch"), false, "{}", f.name());
-        if idx.keys.contains_key("models.qwen3_5.eos_gate") {
-            assert_eq!(at(&o, "models.qwen3_5.eos_gate"), false, "{}", f.name());
-        }
+        let on = matches!(f, Frontend::Chat | Frontend::Serve) && When::Metal.holds(&o);
+        assert_eq!(at(&o, "models.qwen3_5.eos_gate"), on, "{} gate", f.name());
+        assert_eq!(at(&o, "models.qwen3_5.eos_gate_cores"), on, "{} cores", f.name());
+        assert_eq!(
+            at(&o, "decode.readback.queued_steps"),
+            typed("decode.readback.queued_steps", if on { "4" } else { "0" }),
+            "{} lead",
+            f.name()
+        );
+        let cpu = resolve(Some(f), f.name(), &["--cpu"], &none).unwrap();
+        assert_eq!(at(&cpu, "models.qwen3_5.eos_gate"), false, "{} gate on --cpu", f.name());
     }
 
     // 5. Decisions 32/47: the session's absent, null and explicit values.

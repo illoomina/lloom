@@ -137,7 +137,7 @@ struct Args {
 /// stay unconditional.
 #[cfg(feature = "metal")]
 mod profile {
-    pub use candle::metal_backend::profile::{enabled, reset, snapshot};
+    pub use candle::metal_backend::profile::{recorder_enabled, reset, snapshot};
 }
 
 #[cfg(not(feature = "metal"))]
@@ -147,7 +147,7 @@ mod profile {
         pub dispatches: u64,
         pub by_label: Vec<(String, u64)>,
     }
-    pub fn enabled() -> bool {
+    pub fn recorder_enabled() -> bool {
         false
     }
     pub fn reset() {}
@@ -1030,7 +1030,7 @@ fn generate_with_image<P: Lfm2Shape>(
 
     // The dispatch census's first window starts here: everything recorded
     // before it (weight loads, the previous request) is discarded.
-    let census = profile::enabled();
+    let census = profile::recorder_enabled();
     if census {
         take_window(device)?;
     }
@@ -1200,7 +1200,16 @@ fn extract_svg(text: &str) -> Option<String> {
 }
 
 fn main() -> Result<()> {
-    let args = Args::parse();
+    execute(Args::parse())
+}
+
+fn execute(args: Args) -> Result<()> {
+    // --census already requires Metal below; refuse its impossible backend
+    // before device construction or any checkpoint/image/output access.
+    anyhow::ensure!(
+        !args.census || (cfg!(feature = "metal") && !args.cpu),
+        "--census reads the Metal recorder and the Metal pool; run it on Metal"
+    );
     let key = shape_key();
     println!("PROFILE {key}");
     lloom::profile::dispatch!(key, lloom::profile::LFM2, P => run::<P>(args))
@@ -1211,6 +1220,7 @@ fn run<P: Lfm2Shape>(args: Args) -> Result<()> {
     // the device exists.
     if args.census {
         std::env::set_var("CANDLE_METAL_PROFILE", "1");
+        candle_examples::require_profile_recorder("lfm2-vl")?;
     }
 
     let device = if args.cpu {
@@ -1457,4 +1467,35 @@ fn shape_key() -> lloom::profile::ProfileKey {
         <lloom::profile::NoRewind as lloom::profile::Rewind>::NAME,
         <lloom::profile::One as lloom::profile::Rows>::NAME,
     )
+}
+
+#[cfg(all(test, not(feature = "metal")))]
+mod cpu_capability_tests {
+    use super::*;
+    #[test]
+    fn census_entry_refuses_before_checkpoint_image_or_output_access() {
+        let args = Args::try_parse_from([
+            "lfm2-vl",
+            "--cpu",
+            "--census",
+            "--model-dir",
+            "/dev/null/not-a-checkpoint",
+            "--image",
+            "/dev/null/not-an-image",
+            "--out-dir",
+            "/dev/null/not-an-output",
+        ])
+        .unwrap();
+        let error = execute(args).unwrap_err().to_string();
+        assert!(
+            error.contains("--census reads the Metal recorder and the Metal pool"),
+            "{error}"
+        );
+    }
+    #[test]
+    fn help_remains_available_before_census_setup() {
+        let error = Args::try_parse_from(["lfm2-vl", "--help"]).unwrap_err();
+        assert_eq!(error.kind(), clap::error::ErrorKind::DisplayHelp);
+        assert!(error.to_string().contains("--census"));
+    }
 }

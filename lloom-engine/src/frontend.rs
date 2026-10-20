@@ -147,6 +147,22 @@ rows! {
         Metal: "decode.readback.kind" = "ring",
         Metal: "decode.readback.eos" = "gpu-batched-nonblocking",
         Metal: "decode.readback.stream_reader" = "true",
+        // The turn-reuse default — LGD (decisions 35/43/44, maintainer
+        // 2026-10-19, from #993 run 3's comparison, PR1064): the EOS gate
+        // turns a warm turn's restore into an extend (Qwen3.6-27B warm TTFT
+        // 1.14 s → 0.44 s, 35B-A3B 336 → 175 ms), the shallower lead and the
+        // gate's cores arm cut the reply-end latency (27B 1160 → 150–280 ms);
+        // the per-token rate was unresolved on every arm. The gate keys are
+        // Qwen3.5's (no other family reads them); the lead is the ring's, so
+        // every family on Metal takes it — one default authority, to be
+        // confirmed on LFM2 by #859's screen. Each is an explicit switch for
+        // an A/B: `--qwen3-5-eos-gate=false`, `--qwen3-5-eos-gate-cores=false`,
+        // `--set decode.readback.queued_steps=0` (the batching's lead).
+        // `before` is the library's value; decisions 43/35 (`EXCEPTIONS`)
+        // land the new one, as decision 36 did for serve's reuse.
+        Metal: "models.qwen3_5.eos_gate" = "false",
+        Metal: "models.qwen3_5.eos_gate_cores" = "false",
+        Metal: "decode.readback.queued_steps" = "0",
         // LFM2 (safetensors) only: its `Config` axes and LFM2 kernels.
         ModelAxes: "kernels.attention.flash.partial_block" = "8",
         // Shared with Qwen4-exp's HC norm arm, +6.6% ms/token there.
@@ -224,6 +240,60 @@ pub const EXCEPTIONS: &[Exception] = &[Exception {
     owner: "#946",
     what:
         "serve reuses the cached prefix by default; --no-reuse opts out; the bench cells stay cold",
+}, Exception {
+    decision: 43,
+    key: "models.qwen3_5.eos_gate",
+    frontend: Frontend::Chat,
+    before: "false",
+    after: "true",
+    landed: true,
+    owner: "#993",
+    what: "the EOS gate on by default on Metal (LGD): a warm turn extends instead of restoring; --qwen3-5-eos-gate=false opts out",
+}, Exception {
+    decision: 43,
+    key: "models.qwen3_5.eos_gate",
+    frontend: Frontend::Serve,
+    before: "false",
+    after: "true",
+    landed: true,
+    owner: "#993",
+    what: "the EOS gate on by default on Metal (LGD): a warm turn extends instead of restoring; --qwen3-5-eos-gate=false opts out",
+}, Exception {
+    decision: 43,
+    key: "models.qwen3_5.eos_gate_cores",
+    frontend: Frontend::Chat,
+    before: "false",
+    after: "true",
+    landed: true,
+    owner: "#993",
+    what: "the gate's cores arm on by default on Metal (LGD's D): dead post-terminal compute skipped; --qwen3-5-eos-gate-cores=false opts out",
+}, Exception {
+    decision: 43,
+    key: "models.qwen3_5.eos_gate_cores",
+    frontend: Frontend::Serve,
+    before: "false",
+    after: "true",
+    landed: true,
+    owner: "#993",
+    what: "the gate's cores arm on by default on Metal (LGD's D): dead post-terminal compute skipped; --qwen3-5-eos-gate-cores=false opts out",
+}, Exception {
+    decision: 35,
+    key: "decode.readback.queued_steps",
+    frontend: Frontend::Chat,
+    before: "0",
+    after: "4",
+    landed: true,
+    owner: "#993",
+    what: "the lead's queued part is 4 steps on Metal (LGD's L): reply-end latency 1160 -> 280 ms on the 27B; 0 = the batching's lead",
+}, Exception {
+    decision: 35,
+    key: "decode.readback.queued_steps",
+    frontend: Frontend::Serve,
+    before: "0",
+    after: "4",
+    landed: true,
+    owner: "#993",
+    what: "the lead's queued part is 4 steps on Metal (LGD's L): reply-end latency 1160 -> 280 ms on the 27B; 0 = the batching's lead",
 }];
 
 /// The row of `key` for `frontend`, if the front-end resolves it.

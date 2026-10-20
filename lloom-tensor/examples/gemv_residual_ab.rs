@@ -519,6 +519,13 @@ fn kernels_line(tag: &str, labels: &[(String, u64)]) -> String {
 
 fn main() -> Result<()> {
     let args = Args::parse();
+    lloom_tensor::tuning::require_profile_recorder().context(
+        "this interval benchmark requires cargo run --profile release-with-debug -p lloom-tensor --features metal,profile --example gemv_residual_ab -- <original arguments>",
+    )?;
+    anyhow::ensure!(
+        lloom_tensor::tuning::try_tuning()?.instrument.profile,
+        "set CANDLE_METAL_PROFILE=1: this benchmark requires command-buffer intervals and per-label census"
+    );
 
     let device = Device::system_default().context("no Metal device")?;
     let kernels = Kernels::new();

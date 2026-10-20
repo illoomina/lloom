@@ -296,6 +296,15 @@ fn assert_step_clock(stats: &lloom::nn::DecodeStats, tokens: usize, what: &str) 
             "compiled out"
         }
     );
+    if !STEP_CLOCK {
+        assert_eq!(
+            stats.step_ns.capacity(),
+            0,
+            "{what}: an unavailable step clock must not reserve token-sized storage"
+        );
+        assert!(stats.prefill_census.is_none(), "{what}: prefill census");
+        assert!(stats.step0_census.is_none(), "{what}: step-0 census");
+    }
 }
 
 fn run(

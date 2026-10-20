@@ -2840,6 +2840,7 @@ fn timings(
         "predicted_per_second": if predicted_ms > 0.0 { n as f64 / (predicted_ms / 1e3) } else { 0.0 },
         "total_ms": ms(elapsed),
         "readback": d.readback.name(),
+        "readback_note": d.readback_note,
         "reuse": format!("{:?}", d.reuse),
         "prefilled": d.prefilled,
         "commits": st.commits,
@@ -2971,6 +2972,9 @@ fn report(
         turn.fields(),
         d.checkpoint_name(),
     );
+    if let Some(note) = &d.readback_note {
+        eprintln!("[{endpoint}: warning: {note}]");
+    }
 }
 
 /// What a request's prompt was: the digest of its ids (`lloom chat`'s

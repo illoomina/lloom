@@ -142,7 +142,10 @@ lloom_tensor::serde_via_str!(EosKind);
 #[derive(Options, Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(default)]
 pub struct ReadbackConfig {
-    /// The strategy: `auto` (the ring where the sampler admits it), `blocking`, `ring`.
+    /// The strategy: `auto` (the ring where the sampler admits it), `blocking`, `ring` (the
+    /// ring for every sampler it admits; a request whose sampler needs a host sort — top-k,
+    /// top-p — runs on the blocking arm with a warning on its turn line and in
+    /// `timings.readback_note`, coupling C2).
     #[opt(variants = ["auto", "blocking", "ring"], path = "decode.readback.kind", status = "advanced", facets = ["buffer", "locality"], flows = ["token-out"])]
     pub kind: ReadbackKind,
     /// How a ring learns EOS.
@@ -985,7 +988,7 @@ pub struct SamplingConfig {
         cli = "top-p"
     )]
     pub top_p: Option<f64>,
-    /// Top-k sampling's k; with top-p, top-k then top-p. Host-side: the ring arm is refused, the blocking arm runs.
+    /// Top-k sampling's k; with top-p, top-k then top-p. Host-side: a ring asked by name is demoted with a warning and the blocking arm runs this request (C2).
     #[opt(
         flag = "top-k",
         path = "generation.top_k",

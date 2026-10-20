@@ -2105,6 +2105,7 @@ impl<P: Lfm2Shape> Engine<P> {
                     rows: done.joined_beside,
                 },
             },
+            readback_note: None,
             stats: done.stats,
             thinking: None,
             logprobs: None,

@@ -35,13 +35,23 @@ impl Stub {
         let bos_id = (!bos.is_empty())
             .then(|| tokenizer.token_to_id(bos))
             .flatten();
+        // The EOS ids the real loaders resolve (`qwen3_5.rs` `prepare_text`,
+        // `lfm2.rs`): the token a turn ends with, so the end-of-turn constant
+        // the front end reads at load is the one a served checkpoint has. A
+        // placeholder here made every reply look as though the model had not
+        // ended its turn.
+        let eos_ids: Vec<u32> = ["<|im_end|>", "<|endoftext|>", "<|end|>"]
+            .iter()
+            .filter_map(|t| tokenizer.token_to_id(t))
+            .collect();
+        let eos_ids = if eos_ids.is_empty() { vec![0] } else { eos_ids };
         Self {
             text: Text {
                 tokenizer,
                 template: Some(Template::compile(template).unwrap()),
                 bos_token: bos.to_string(),
                 bos_id,
-                eos_ids: vec![0],
+                eos_ids,
                 seed_tokens: vec![1],
                 think: Default::default(),
                 gen_prompts: Default::default(),
@@ -276,6 +286,15 @@ fn decoded(engine: &Stub, ids: Vec<u32>) -> Decoded {
     }
 }
 
+/// The ids a matched turn splices: the reply's own, and the end-of-turn token
+/// where the model ended its turn (decision 51 Q1 — the log does not keep the
+/// sampled EOS, so the id is the template's own bytes for the position the
+/// session fed).
+fn turn_tokens(front: &Front, reply: &[u32], stop: Stop) -> usize {
+    let through = stop == Stop::Eos && front.constants().and_then(|c| c.eot()).is_some();
+    reply.len() + usize::from(through)
+}
+
 fn bytes(s: &str) -> Vec<u32> {
     s.bytes().map(u32::from).collect()
 }
@@ -454,7 +473,10 @@ fn the_next_turn_reuses_the_sampled_ids_not_their_canonical_tokenization() {
         &p2.ids[..log.len().min(p2.ids.len())]
     );
     assert_eq!(p2.spliced.matched, 1);
-    assert_eq!(p2.spliced.spliced_tokens, sampled.len());
+    assert_eq!(
+        p2.spliced.spliced_tokens,
+        turn_tokens(&front, &sampled, Stop::Eos)
+    );
     assert_eq!(p2.renders, 1);
     // The text is the template's own rendering, whatever the ids.
     assert_eq!(
@@ -710,7 +732,10 @@ fn the_same_text_sampled_as_different_ids_splices_each_conversations_own() {
                 next.ids.starts_with(&log),
                 "reversed={reversed} {q}: not its own ids"
             );
-            assert_eq!(next.spliced.spliced_tokens, ids.len());
+            assert_eq!(
+                next.spliced.spliced_tokens,
+                turn_tokens(&front, ids, Stop::Eos)
+            );
         }
     }
 }
@@ -1157,7 +1182,16 @@ fn a_split_character_aligns_and_a_reply_cut_short_logs_its_part() {
     assert!(front.record(&engine, p1.origin, &d));
     let second = json!([user("Café?"), assistant(&d.text), user("Merci")]);
     let p2 = build(&front, &engine, &second, Some(false));
-    assert_eq!(p2.spliced.spliced_tokens, sampled.len());
+    // The reply's own ids, and the end-of-turn token it ended its turn with:
+    // a matched turn is rendered through it (decision 51 Q1), and the log does
+    // not keep the sampled EOS, so the id comes from the template's own bytes.
+    let eot = front
+        .constants()
+        .unwrap()
+        .eot()
+        .expect("an end-of-turn token");
+    assert_eq!(p2.spliced.spliced_tokens, sampled.len() + 1);
+    assert_eq!(p2.ids[p1.ids.len() + sampled.len()], eot.0);
     // A reply the client got only part of — a stop string cut it, or the
     // run ended inside a character — is logged as the ids of that part.
     let mut cut = decoded(&engine, bytes("abc STOP def"));
@@ -1303,7 +1337,7 @@ fn the_checkpoints_templates_build_the_plain_prompt_and_cut_the_same_spans() {
             );
             assert_eq!(
                 p2.spliced.spliced_tokens,
-                sampled.len(),
+                turn_tokens(&fresh, &sampled, Stop::Eos),
                 "{repo} {want:?}: {:?}",
                 p2.spliced
             );
@@ -2543,11 +2577,12 @@ fn the_checkpoints_templates_persist_what_the_model_generated() {
                              the log at {kept}, before the checkpoint at {ckpt}"
                         ));
                     }
-                    if persist != Some(false)
-                        && !by_engine
-                        && kind != "one more newline before the end marker"
-                        && !extends
-                    {
+                    // Since decision 51 Q1 the trim case extends too: a
+                    // matched reply is rendered from the ids the model
+                    // emitted, so the whitespace the template would trim is
+                    // no longer deleted from the history. Run 5 recorded this
+                    // row at +7, diverging.
+                    if persist != Some(false) && !by_engine && !extends {
                         failures.push(format!(
                             "{name} want={want:?} persist={persist:?} {kind}: the history keeps \
                              what the model generated, so the next prompt extends the log; it \
@@ -2755,6 +2790,328 @@ fn other_families_keep_their_existing_neutral_effort_validation() {
         assert!(
             error.contains("lfm2's chat template does not read reasoning_effort"),
             "{error}"
+        );
+    }
+}
+
+/// Decision 51 Q1 (maintainer, 2026-10-19): a past assistant turn the front
+/// end matches to its log is rendered from the ids the model emitted — the
+/// whole turn, through its end-of-turn token — in place of whatever the
+/// template would render for it. The template renders what the model did not
+/// write. So the next prompt's ids equal the session's log by construction,
+/// and no rewriting a template does to a past reply can make them diverge.
+///
+/// The two rewritings run 5 recorded (`issue-946.md` §25.8) are the cases
+/// that failed before this: Qwen's `reasoning_content|trim` (a reply whose
+/// whitespace is not the template's own format left the log at +7 against
+/// +12), and a reply cut inside its reasoning. Both must now extend.
+///
+/// The end-of-turn token is the template's own: the log does not keep the
+/// sampled EOS (`lloom::nn::DecodeOut::ids` excludes it), and on every
+/// supported checkpoint `eos_token` is the token that ends an assistant turn,
+/// so the span's last id is the one the model sampled. A reply that did not
+/// stop on EOS fed no end-of-turn position, so its span ends at its own ids.
+#[test]
+fn a_past_reply_is_rendered_from_the_ids_the_model_emitted() {
+    let user1 = user("What is the capital of France?");
+    let user2 = user("And Germany?");
+    let mut ran = 0;
+    let mut failures: Vec<String> = Vec::new();
+    for (repo, bos, caps) in AUDITED {
+        let Some(engine) = cached(repo, bos, caps) else {
+            continue;
+        };
+        let name = repo.rsplit("--").next().unwrap();
+        let tags = engine.think_tags();
+        let one = json!([user1]);
+        {
+            let f = Front::new(&engine, SessionOptions::default());
+            let c = f.constants().unwrap();
+            eprintln!(
+                "EMITTED-CONST {name}: eot={:?}",
+                c.eot().map(|(id, s)| (id, s.to_string())),
+            );
+        }
+        for want in wants(&engine) {
+            for persist in [None, Some(true), Some(false)] {
+                let front = Front::new(
+                    &engine,
+                    SessionOptions {
+                        persist,
+                        ..SessionOptions::default()
+                    },
+                );
+                if front.persist_unsupported().is_some() {
+                    continue;
+                }
+                let p1 = build(&front, &engine, &one, want);
+                let on = p1.thinking.unwrap().on;
+                // The replies, each what a model really emits for this
+                // prompt: an answer alone only where the prompt opened no
+                // block (a reply that ends its turn while still inside one is
+                // not a thing a model does — it closes the block first, or
+                // the run is cut, which is the open case below); then a reply
+                // in the template's own format, one whose whitespace is not
+                // (the trim), and one cut inside its reasoning.
+                let mut replies: Vec<(&str, String, Stop)> = Vec::new();
+                if !on {
+                    replies.push(("an answer", "Paris.".to_string(), Stop::Eos));
+                }
+                if on {
+                    let end = engine.token_str(tags.as_ref().unwrap().end);
+                    replies.push((
+                        "reasoning in the template's own format",
+                        format!("The capital of France is Paris.\n{end}\n\nParis."),
+                        Stop::Eos,
+                    ));
+                    replies.push((
+                        "reasoning whose whitespace the template would trim",
+                        format!("The capital of France is Paris.\n\n\n{end}\n\nParis."),
+                        Stop::Eos,
+                    ));
+                    replies.push((
+                        "cut inside its reasoning",
+                        "The capital of France is".into(),
+                        Stop::Length,
+                    ));
+                }
+                for (kind, text, stop) in replies {
+                    let front = Front::new(
+                        &engine,
+                        SessionOptions {
+                            persist,
+                            ..SessionOptions::default()
+                        },
+                    );
+                    let p1 = build(&front, &engine, &one, want);
+                    let sampled = engine.enc(&text);
+                    let mut d = decoded(&engine, sampled.clone());
+                    d.stop = stop;
+                    assert!(front.record(&engine, p1.origin, &d), "{name} {kind}");
+                    let history = json!([user1, assistant(&d.text), user2]);
+                    let p2 = build(&front, &engine, &history, want);
+                    // The session's log after the first turn: its prompt and
+                    // the ids the model emitted. An EOS-stopped reply also fed
+                    // the end-of-turn position, which the template writes.
+                    let mut log: Vec<u32> = p1.ids.iter().chain(&sampled).copied().collect();
+                    // An EOS-stopped reply also fed the end-of-turn position.
+                    // The id is the template's own end-of-turn constant, read
+                    // at load — the same token the model sampled.
+                    if stop == Stop::Eos {
+                        let (id, _) = front.constants().unwrap().eot().unwrap_or_else(|| {
+                            panic!("{name}: no end-of-turn constant for this template")
+                        });
+                        log.push(id);
+                    }
+                    let kept = p2.ids.iter().zip(&log).take_while(|(a, b)| a == b).count();
+                    eprintln!(
+                        "EMITTED {name} want={want:?} persist={persist:?} {kind}: the next prompt \
+                         leaves the log at {:+} from its end ({kept} of {}); emitted {} of {} \
+                         matched",
+                        kept as i64 - log.len() as i64,
+                        log.len(),
+                        p2.spliced.emitted,
+                        p2.spliced.matched,
+                    );
+                    // Two boundaries this does not speak for, and both are
+                    // the prompt's own ids rather than a past reply's:
+                    // - an opt-in strip asks the template to drop the
+                    //   reasoning, so the span is deliberately not the turn
+                    //   the model emitted (§2.3d: the option doing its job);
+                    // - where the engine closed the block the template opened
+                    //   (LFM2.5's thinking off), those ids are the engine's
+                    //   and no rendering of the history writes them, so the
+                    //   divergence is inside the earlier prompt, before any
+                    //   reply. The turn checkpoint stands there (run 5, §25.8)
+                    //   and decision 51 Q1 does not reach it: it is about how
+                    //   a past assistant turn is rendered, not about ids the
+                    //   template never writes.
+                    let engine_closed = p1.thinking.unwrap().by == By::Engine;
+                    let speaks_for = persist != Some(false) && !engine_closed;
+                    // Where the turn is rendered from the emitted ids, the
+                    // span carries the end-of-turn id only if the model ended
+                    // the turn itself: a reply a limit or a stop cut fed no
+                    // such position, and putting that id in the prompt would
+                    // condition the model on a token the session never ran.
+                    // (This is what kills the harness's `m1`.) Under an
+                    // opt-in strip the span is deliberately not the emitted
+                    // turn, so fewer ids are spliced and the count is the
+                    // segment alignment's.
+                    if speaks_for {
+                        assert_eq!(
+                            p2.spliced.spliced_tokens,
+                            turn_tokens(&front, &sampled, stop),
+                            "{name} want={want:?} persist={persist:?} {kind}: the turn's ids"
+                        );
+                    }
+                    if speaks_for && kept < log.len() {
+                        failures.push(format!(
+                            "{name} want={want:?} persist={persist:?} {kind}: the next prompt \
+                             leaves the session's log at {kept} of {}, so the turn the model \
+                             emitted was not what the history rendered",
+                            log.len()
+                        ));
+                    }
+                }
+            }
+        }
+        ran += 1;
+    }
+    if ran == 0 {
+        // As the sibling checkpoint-template tests do: a host without the
+        // cache (the x86 CI container) skips; the Mac arm runs every cached
+        // template.
+        eprintln!("skipped: no checkpoint template in the Hugging Face cache");
+        return;
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// Decision 51 Q3 (maintainer, 2026-10-19): under an opt-in strip
+/// (`--strip-thinking`), a request whose history's last assistant message is a
+/// reply of ours cut inside its reasoning renders with `preserve_thinking`
+/// anyway — for that one request. Stripped, such a history shows the model an
+/// empty assistant message where its own unfinished thought belongs (run 5's
+/// H2, `issue-946.md` §25.2), so a "continue" turn had lost the thought.
+///
+/// No template has a per-message switch, so the suspension keeps every past
+/// reply's reasoning in that request. A closed reply last does not suspend it,
+/// nor does a reply the log does not hold, nor another conversation's.
+#[test]
+fn an_unfinished_thought_last_suspends_an_opt_in_strip() {
+    let engine = Stub::qwen3_6_like();
+    let want = Some(true);
+    let strip = || {
+        Front::new(
+            &engine,
+            SessionOptions {
+                persist: Some(false),
+                ..SessionOptions::default()
+            },
+        )
+    };
+    let q = json!([user("2+2?")]);
+    // A reply cut inside its reasoning, and one that closed its block.
+    let end = engine.token_str(engine.think_tags().unwrap().end);
+    for (case, text, stop, suspends) in [
+        (
+            "cut inside its reasoning",
+            "Add them".to_string(),
+            Stop::Length,
+            true,
+        ),
+        (
+            "closed its block",
+            format!("Add them\n{end}\n\nFour."),
+            Stop::Eos,
+            false,
+        ),
+    ] {
+        let front = strip();
+        let p1 = build(&front, &engine, &q, want);
+        let mut d = decoded(&engine, engine.enc(&text));
+        d.stop = stop;
+        assert!(front.record(&engine, p1.origin, &d), "{case}");
+        let history = json!([user("2+2?"), assistant(&d.text)]);
+        let p2 = build(&front, &engine, &history, want);
+        let kept = p2.kwargs.get(PRESERVE_THINKING).and_then(Value::as_bool);
+        eprintln!("Q3 {case}: preserve_thinking {kept:?} (strip asked)");
+        assert_eq!(
+            kept,
+            Some(suspends),
+            "{case}: an unfinished thought last suspends the strip; a finished one does not"
+        );
+        // The thought itself is in the prompt exactly where it suspends.
+        assert_eq!(
+            p2.text.contains("Add them"),
+            suspends || text.contains(&end),
+            "{case}: the unfinished thought reaches the template iff the strip is suspended"
+        );
+    }
+
+    // A reply the log no longer holds does not suspend it: nothing says the
+    // message is an unfinished thought of ours.
+    let front = strip();
+    let history = json!([user("2+2?"), assistant("Add them")]);
+    let p = build(&front, &engine, &history, want);
+    assert_eq!(
+        p.kwargs.get(PRESERVE_THINKING).and_then(Value::as_bool),
+        Some(false),
+        "a message the log does not hold does not suspend the strip"
+    );
+
+    // Another conversation's reply does not either (the scope chain).
+    let front = strip();
+    let other = build(&front, &engine, &json!([user("9+9?")]), want);
+    let mut d = decoded(&engine, engine.enc("Add them"));
+    d.stop = Stop::Length;
+    assert!(front.record(&engine, other.origin, &d));
+    let p = build(
+        &front,
+        &engine,
+        &json!([user("2+2?"), assistant(&d.text)]),
+        want,
+    );
+    assert_eq!(
+        p.kwargs.get(PRESERVE_THINKING).and_then(Value::as_bool),
+        Some(false),
+        "another conversation's reply does not suspend the strip"
+    );
+}
+
+/// Decision 51 Q5 (maintainer, 2026-10-19): (a), as sent. An open reply of
+/// ours sent back with an empty content and no reasoning field cannot be
+/// found — an empty content is no key, and the message gives no reasoning to
+/// look it up by — so under `missing_reasoning = log` too it goes to the
+/// template as the client sent it: empty. The client's history is the
+/// client's; matching it by its position in the conversation would be
+/// reconstruction by position, which the 2026-10-14 review cautioned against.
+/// `lloom chat` holds its own session and never sends this.
+#[test]
+fn an_open_reply_sent_back_empty_goes_as_sent_under_log_too() {
+    let engine = Stub::qwen4exp();
+    let want = Some(true);
+    let q = json!([user("2+2?")]);
+    for restore in [false, true] {
+        let front = Front::new(
+            &engine,
+            SessionOptions {
+                restore_reasoning: restore,
+                ..SessionOptions::default()
+            },
+        );
+        let p1 = build(&front, &engine, &q, want);
+        let mut d = decoded(&engine, bytes("Add them"));
+        d.stop = Stop::Length;
+        assert!(front.record(&engine, p1.origin, &d));
+        // Empty content, and no reasoning field at all.
+        let history = json!([
+            user("2+2?"),
+            json!({ "role": "assistant", "content": "" }),
+            user("3+3?")
+        ]);
+        let p2 = build(&front, &engine, &history, want);
+        eprintln!(
+            "Q5 missing_reasoning={}: replies {} matched {} restored {} spliced {}",
+            if restore { "log" } else { "as-sent" },
+            p2.spliced.replies,
+            p2.spliced.matched,
+            p2.spliced.restored,
+            p2.spliced.spliced_tokens,
+        );
+        assert_eq!(p2.spliced.replies, 1);
+        assert_eq!(
+            (
+                p2.spliced.matched,
+                p2.spliced.restored,
+                p2.spliced.spliced_tokens
+            ),
+            (0, 0, 0),
+            "as sent, empty: nothing is matched, nothing restored, no id taken"
+        );
+        assert!(
+            !p2.text.contains("Add them"),
+            "the thought the client dropped is not put back"
         );
     }
 }

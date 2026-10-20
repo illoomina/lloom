@@ -8,6 +8,18 @@
 //!   chat template through the request front end, `front.rs`, `logprobs`),
 //!   `/v1/models`, `/tokenize`; on both routes the token-level fields
 //!   `prompt_token_ids` (ids in, no template) and `return_token_ids`;
+//!
+//! On the chat route a reply's reasoning comes back **apart from its answer**:
+//! `message.reasoning_content` and `message.content` (the answer only), and on
+//! the stream `delta.reasoning_content` and `delta.content` (decision 51 Q2,
+//! `sequence-reuse-design.md` §2.3d). A request that wants the whole reply in
+//! `content`, as before, sends `reasoning_in_content: true` — an opt-out.
+//! `/v1/completions` is unchanged: its text is the reply.
+//!
+//! `usage.completion_tokens` counts the tokens of the completion the client
+//! **received** — the accepted frontier (decision 51 Q4, the standard
+//! semantics). The count the run generated is in `timings.tokens` and
+//! `timings.frontier`, which differ past a stop string on the adaptive commit.
 //! - the **benchmark sidecar** contract LiquidAI's `pipette` runners drive an
 //!   engine through (`Liquid4All/pipette-clients`, the MLX sidecar's shape):
 //!   `/prefill_throughput`, `/decode_throughput`, `/end_to_end_latency`,
@@ -686,6 +698,9 @@ struct StreamingRun {
     record: Option<front::Origin>,
     /// `return_token_ids`: the final event carries the ids.
     return_ids: bool,
+    /// `reasoning_in_content`: the deltas carry the whole reply in `content`,
+    /// as before decision 51 Q2, rather than splitting the reasoning out.
+    reasoning_in_content: bool,
 }
 
 /// One decode of `prompt_ids`, through the image path when the request
@@ -883,6 +898,8 @@ fn completions(shared: &Shared, v: &Value, _headers: &[Header]) -> Handled<Reply
             model,
             record: None,
             return_ids,
+            // `/v1/completions` is not a chat route: its text is the reply.
+            reasoning_in_content: true,
         })));
     }
     let started = Instant::now();
@@ -910,7 +927,7 @@ fn completions(shared: &Shared, v: &Value, _headers: &[Header]) -> Handled<Reply
             },
             "finish_reason": finish_reason(decoded.stop),
         }],
-        "usage": usage(prompt_ids.len(), decoded.tokens.len()),
+        "usage": run_usage(shared.engine.as_ref(), prompt_ids.len(), &decoded),
         "timings": timings(shared.engine.as_ref(), prompt_ids.len(), &facts, &decoded, elapsed),
     });
     if return_ids {
@@ -1165,6 +1182,13 @@ fn chat_completions(shared: &Shared, v: &Value) -> Handled<Reply> {
         .get("return_token_ids")
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    // Decision 51 Q2: a reply's reasoning comes back in `reasoning_content`
+    // and `content` is the answer alone. A client that wants the whole reply
+    // in `content`, as before, asks for it per request — opt-out, not opt-in.
+    let reasoning_in_content = v
+        .get("reasoning_in_content")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     params.logprobs = logprob_request(
         want_logprobs.then_some(top_logprobs.unwrap_or(0)),
         prompt.as_ref().and(shared.front.options().keep.capture()),
@@ -1304,10 +1328,12 @@ fn chat_completions(shared: &Shared, v: &Value) -> Handled<Reply> {
             model,
             record: prompt.as_ref().map(|p| p.origin),
             return_ids,
+            reasoning_in_content,
         })));
     }
-    let split = reasoning::Reasoning::for_chat(shared.engine.as_ref(), &prompt_ids)?
-        .map(|p| Arc::new(parking_lot::Mutex::new(p)));
+    let split =
+        reasoning::Reasoning::for_chat(shared.engine.as_ref(), &prompt_ids, reasoning_in_content)?
+            .map(|p| Arc::new(parking_lot::Mutex::new(p)));
     let mut routed = serde_json::Map::<String, Value>::new();
     let started = Instant::now();
     let decoded = run_decode_observed(
@@ -1364,7 +1390,7 @@ fn chat_completions(shared: &Shared, v: &Value) -> Handled<Reply> {
             "logprobs": if want_logprobs { chat_logprobs(engine, &decoded)? } else { Value::Null },
             "finish_reason": finish_reason(decoded.stop),
         }],
-        "usage": usage(prompt_ids.len(), decoded.tokens.len()),
+        "usage": run_usage(shared.engine.as_ref(), prompt_ids.len(), &decoded),
         "timings": timings(shared.engine.as_ref(), prompt_ids.len(), &facts, &decoded, elapsed),
     });
     body["timings"]["logged"] = json!(recorded);
@@ -1748,9 +1774,11 @@ fn stream_response_with_writer(
     };
     let created = now();
     let split = match run.kind {
-        StreamKind::Chat => {
-            reasoning::Reasoning::for_chat(shared.engine.as_ref(), &run.prompt_ids)?
-        }
+        StreamKind::Chat => reasoning::Reasoning::for_chat(
+            shared.engine.as_ref(),
+            &run.prompt_ids,
+            run.reasoning_in_content,
+        )?,
         StreamKind::Completion => None,
     }
     .map(|p| Arc::new(parking_lot::Mutex::new(p)));
@@ -1873,7 +1901,7 @@ fn stream_response_with_writer(
         &decoded,
         ms(elapsed),
     );
-    let usage = usage(run.prompt_ids.len(), decoded.tokens.len());
+    let usage = run_usage(shared.engine.as_ref(), run.prompt_ids.len(), &decoded);
     let last = match run.kind {
         StreamKind::Completion => json!({
             "id": run.id, "object": "text_completion", "created": created, "model": run.model,
@@ -2810,6 +2838,17 @@ fn usage(prompt: usize, completion: usize) -> Value {
         "completion_tokens": completion,
         "total_tokens": prompt + completion,
     })
+}
+
+/// `usage` for a run: `completion_tokens` is the tokens of the completion the
+/// client received — the accepted frontier (decision 51 Q4, the standard
+/// semantics), which is what [`delivered_ids`] already computes for the
+/// logprobs block. The count the run generated stays in `timings`
+/// (`timings.tokens`, `timings.frontier.generated`): past a stop string on the
+/// adaptive commit with a slow consumer the two differ by up to the backlog,
+/// and those ids are text the client never received.
+fn run_usage(engine: &dyn Served, prompt: usize, d: &Decoded) -> Value {
+    usage(prompt, delivered_ids(engine, d))
 }
 
 /// The engine's own brackets beside the request's wall clock: the prompt's
@@ -4365,6 +4404,7 @@ mod checked_trailer_tests {
             model: "stub".into(),
             record: None,
             return_ids: false,
+            reasoning_in_content: false,
         };
         let (release, hold) = std::sync::mpsc::channel();
         let worker = std::thread::spawn(move || {

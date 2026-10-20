@@ -227,6 +227,11 @@ impl Contract {
     pub const DRAFT_WINDOW_ARM: &'static str = "draft-gemm";
     pub const PREFILL_WINDOW_ARM: &'static str = "prefill-gemm";
 
+    /// The arm `fast` takes in a speculative verify window while
+    /// `kernels.gemm.f16_rows` is on ([`f16_rows_max`]): the window's f16
+    /// rows on the GEMV's row axis, named on the report line then.
+    pub const F16_ROWS_ARM: &'static str = "f16-rows";
+
     /// `profile=<name> arms=<list> cpu_f16_accum=<type>/<promote_every>:<instruction>`,
     /// for the report lines that say which contract a run held and which
     /// accumulator its CPU f16 matmuls ran (`cpu::f16_matmul`).
@@ -248,8 +253,17 @@ impl Contract {
                     on.join(",")
                 }
             }
-            Contract::Fast if Contract::FAST_ARMS.is_empty() => "none".to_string(),
-            Contract::Fast => Contract::FAST_ARMS.join(","),
+            Contract::Fast => {
+                let mut on: Vec<&str> = Contract::FAST_ARMS.to_vec();
+                if f16_rows_max().is_some() {
+                    on.push(Contract::F16_ROWS_ARM);
+                }
+                if on.is_empty() {
+                    "none".to_string()
+                } else {
+                    on.join(",")
+                }
+            }
         };
         format!(
             "profile={} arms={arms} cpu_f16_accum={}",
@@ -463,13 +477,70 @@ pub fn prefill_window_report(since: u64) -> String {
 /// The receipt a speculative run prints: each window's arm under the
 /// contract in force and its launches so far.
 pub fn window_report() -> String {
+    // The f16 row axis is a `fast` arm; under `deterministic` nothing takes it.
+    let rows = match f16_rows_max() {
+        Some(max) if contract().is_fast() => format!("rows-{max}"),
+        _ => "off".to_string(),
+    };
     format!(
-        "arm={} gemm_launches={} draft_arm={} draft_gemm_launches={}",
+        "arm={} gemm_launches={} draft_arm={} draft_gemm_launches={} f16_rows={rows} \
+         f16_rows_launches={}",
         Window::Verify.report(),
         Window::Verify.gemms(),
         Window::Draft.report(),
-        Window::Draft.gemms()
+        Window::Draft.gemms(),
+        f16_rows_launches()
     )
+}
+
+/// `kernels.gemm.f16_rows` and its ceiling, read once; or [`set_f16_rows`].
+/// 0 unread, else the ceiling when on and 1 when off.
+static F16_ROWS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Launches a verify window's f16 matmuls took on the GEMV's row axis since
+/// process start: the arm's engagement count.
+static F16_ROWS_LAUNCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The most rows the f16 row axis takes in a verify window under `fast`, or
+/// `None` while `kernels.gemm.f16_rows` is off.
+pub fn f16_rows_max() -> Option<usize> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let v = match F16_ROWS.load(Relaxed) {
+        0 => {
+            let g = &tuning().gemm;
+            let v = if g.f16_rows { g.f16_rows_max } else { 1 };
+            F16_ROWS.store(v, Relaxed);
+            v
+        }
+        v => v,
+    };
+    (v > 1).then_some(v)
+}
+
+/// Select the f16 row axis for this process: `Some(ceiling)` on, `None` off
+/// (a test runs both).
+pub fn set_f16_rows(max: Option<usize>) {
+    let v = match max {
+        Some(m) => {
+            assert!(
+                (2..=16).contains(&m),
+                "f16 rows a weight read: {m} is not in 2..=16"
+            );
+            m
+        }
+        None => 1,
+    };
+    F16_ROWS.store(v, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Count one launch the f16 row axis took.
+pub fn note_f16_rows() {
+    F16_ROWS_LAUNCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The f16 row axis's engagement count now.
+pub fn f16_rows_launches() -> u64 {
+    F16_ROWS_LAUNCHES.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// The contract in force for this process: [`tuning`]'s `contract.profile`,
@@ -744,6 +815,9 @@ fn parse_tile(v: &str) -> Result<Option<String>, String> {
         )
     })
 }
+fn parse_f16_rows_max(v: &str) -> Result<usize, String> {
+    ranged(v, "f16 rows a weight read", 2, 16)
+}
 fn parse_gemv_bm(v: &str) -> Result<Option<usize>, String> {
     if is_none(v) {
         return Ok(None);
@@ -981,6 +1055,24 @@ pub struct GemmTuning {
         status = "arm"
     )]
     pub prefill_window: bool,
+    /// Under `fast`, a speculative verify window's f16 matmuls of 2 to `f16_rows_max` rows take the GEMV's row axis: each weight block read once for every row of the window, each row the one-row GEMV's bits; off = the GEMM from two rows. On by default under `fast` (maintainer, 2026-10-19: DSpark ×1.25 on LFM2.5, the stream parting from K=1 only at an exact tie); `deterministic` never takes it. The K=1 path, the prefill, the drafter and `deterministic` do not read it.
+    #[opt(
+        flag = "gemm-f16-rows",
+        env = "LLOOM_GEMM_F16_ROWS",
+        bool,
+        path = "kernels.gemm.f16_rows",
+        status = "arm"
+    )]
+    pub f16_rows: bool,
+    /// The most rows `kernels.gemm.f16_rows` takes (2..16); a window of more rows takes the GEMM.
+    #[opt(
+        flag = "gemm-f16-rows-max",
+        env = "LLOOM_GEMM_F16_ROWS_MAX",
+        parser = "parse_f16_rows_max",
+        path = "kernels.gemm.f16_rows_max",
+        status = "arm"
+    )]
+    pub f16_rows_max: usize,
 }
 
 impl Default for GemmTuning {
@@ -994,6 +1086,11 @@ impl Default for GemmTuning {
             verify_window: true,
             draft_window: true,
             prefill_window: true,
+            f16_rows: true,
+            // Measured (`docs/tuning.md` §13.5y): at LFM2.5's shapes the row
+            // axis is no slower than the GEMM at every row count to 10 and
+            // slower at 12 on most of them.
+            f16_rows_max: 10,
         }
     }
 }
@@ -1696,6 +1793,10 @@ mod tests {
         assert_eq!(t.metal.completion_wait, "synchronize");
         assert_eq!(t.pool.buffer_alignment, 128);
         assert_eq!(t.gemm.skinny_max, 33);
+        // On by default under `fast` (maintainer, 2026-10-19); `deterministic`
+        // never takes it (`the_report_names_the_f16_row_axis_under_fast_only`).
+        assert!(t.gemm.f16_rows);
+        assert_eq!(t.gemm.f16_rows_max, 10);
         assert_eq!(t.qmm.dequant_from, 64);
         assert_eq!(t.moe.mm_from, 64);
         assert!(t.qmm.f16_mm);
@@ -1726,7 +1827,7 @@ mod tests {
         assert_eq!(
             Contract::Fast.report(),
             format!(
-                "profile=fast arms=moe-act-f16,decision-pack,decision-ragged cpu_f16_accum={accum}"
+                "profile=fast arms=moe-act-f16,decision-pack,decision-ragged,f16-rows cpu_f16_accum={accum}"
             )
         );
     }
@@ -1765,6 +1866,28 @@ mod tests {
                 "the window switches do not reach `fast`'s arms"
             );
         }
+    }
+
+    /// `fast`'s report line names the f16 row axis while it is on, after the
+    /// static arms, and `deterministic`'s never does (nothing there takes it).
+    #[test]
+    fn the_report_names_the_f16_row_axis_under_fast_only() {
+        let accum = crate::cpu::f16_matmul::report();
+        let fast = Contract::FAST_ARMS.join(",");
+        set_f16_rows(None);
+        assert_eq!(f16_rows_max(), None);
+        assert_eq!(
+            Contract::Fast.report(),
+            format!("profile=fast arms={fast} cpu_f16_accum={accum}")
+        );
+        let deterministic = Contract::Deterministic.report();
+        set_f16_rows(Some(10));
+        assert_eq!(f16_rows_max(), Some(10));
+        assert_eq!(
+            Contract::Fast.report(),
+            format!("profile=fast arms={fast},f16-rows cpu_f16_accum={accum}")
+        );
+        assert_eq!(Contract::Deterministic.report(), deterministic);
     }
 
     /// The window is the opening thread's, nests, and closes with its guard.

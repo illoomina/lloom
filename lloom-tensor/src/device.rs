@@ -18,6 +18,8 @@ pub struct EosGateReport {
     pub fired: bool,
     /// Gate kernels dispatched (`step` calls).
     pub steps: u64,
+    /// The cores arm was on: the quantized mat-vec cores were gated too.
+    pub cores: bool,
 }
 
 /// A `DeviceLocation` represents a physical device whereas multiple `Device`
@@ -827,6 +829,18 @@ impl Device {
             #[cfg(feature = "metal")]
             Self::Metal(d) => d.eos_gate_armed(),
             _ => false,
+        }
+    }
+
+    /// The gate's cores arm for the armed run (`MetalDevice::eos_gate_cores`):
+    /// the quantized mat-vec cores are gated too. No-op off Metal.
+    pub fn eos_gate_cores(&self, on: bool) {
+        match self {
+            #[cfg(feature = "metal")]
+            Self::Metal(d) => d.eos_gate_cores(on),
+            _ => {
+                let _ = on;
+            }
         }
     }
 

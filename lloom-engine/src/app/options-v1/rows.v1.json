@@ -112,6 +112,22 @@
   "couplings": "C15"
  },
  {
+  "new": "decode.readback.queued_steps",
+  "status": "arm",
+  "flag": "",
+  "old_key": "",
+  "old_flag": "",
+  "old_env": "",
+  "ty": "usize",
+  "default": "0",
+  "consumer": "lloom_engine DecodeConfig -> DecodeOptions (per session)",
+  "note": "run 3 (#993): the adaptive lead's queued part, apart from the buffer's batching",
+  "src": "knob",
+  "facets": "lead",
+  "flows": "token-out",
+  "couplings": "C15"
+ },
+ {
   "new": "decode.readback.eos_gate",
   "status": "advanced",
   "flag": "",

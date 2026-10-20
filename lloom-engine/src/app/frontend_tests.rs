@@ -135,6 +135,27 @@ const PINNED_ROWS: &[(&str, &[Frontend], When, &str, &str)] = &[
         TUNED_FLOW,
     ),
     (
+        "models.qwen3_5.eos_gate",
+        CHAT_SERVE,
+        When::Metal,
+        "false",
+        PRE_TREE,
+    ),
+    (
+        "models.qwen3_5.eos_gate_cores",
+        CHAT_SERVE,
+        When::Metal,
+        "false",
+        PRE_TREE,
+    ),
+    (
+        "decode.readback.queued_steps",
+        CHAT_SERVE,
+        When::Metal,
+        "0",
+        PRE_TREE,
+    ),
+    (
         "kernels.attention.flash.partial_block",
         CHAT_SERVE,
         When::ModelAxes,
@@ -663,18 +684,27 @@ fn the_unset_defaults_are_the_trees_before_it_except_the_named_exceptions() {
     let decided: Vec<u32> = EXCEPTIONS.iter().map(|e| e.decision).collect();
     assert_eq!(
         decided,
-        [36],
-        "the approved default changes are decision 36 alone"
+        [36, 43, 43, 43, 43, 35, 35],
+        "the approved default changes: decision 36 (serve reuse), 43 (the gate and its cores arm, chat and serve), 35 (the lead, chat and serve)"
     );
-
-    // 4. Decisions 43/44: the EOS watch (and the Qwen gate, when it lands)
-    // stay opt-in on every front-end.
+    // 4. Decision 44: the EOS watch stays opt-in on every front-end.
+    // Decisions 43/35 (2026-10-19): the gate, its cores arm and the lead of 4
+    // are chat's and serve's defaults where the Metal rows hold — a Metal
+    // build, not `--cpu` — and the library's values on bench and on the CPU.
     for f in Frontend::ALL {
         let o = resolve(Some(f), f.name(), &[], &none).unwrap();
         assert_eq!(at(&o, "decode.ring.eos_watch"), false, "{}", f.name());
-        if idx.keys.contains_key("models.qwen3_5.eos_gate") {
-            assert_eq!(at(&o, "models.qwen3_5.eos_gate"), false, "{}", f.name());
-        }
+        let on = matches!(f, Frontend::Chat | Frontend::Serve) && When::Metal.holds(&o);
+        assert_eq!(at(&o, "models.qwen3_5.eos_gate"), on, "{} gate", f.name());
+        assert_eq!(at(&o, "models.qwen3_5.eos_gate_cores"), on, "{} cores", f.name());
+        assert_eq!(
+            at(&o, "decode.readback.queued_steps"),
+            typed("decode.readback.queued_steps", if on { "4" } else { "0" }),
+            "{} lead",
+            f.name()
+        );
+        let cpu = resolve(Some(f), f.name(), &["--cpu"], &none).unwrap();
+        assert_eq!(at(&cpu, "models.qwen3_5.eos_gate"), false, "{} gate on --cpu", f.name());
     }
 
     // 5. Decisions 32/47: the session's absent, null and explicit values.

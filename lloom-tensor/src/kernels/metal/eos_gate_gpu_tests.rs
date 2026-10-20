@@ -789,3 +789,131 @@ fn the_words_publish_copies_n_words_and_stamps_only_off_generation_0() {
         }
     }
 }
+
+/// The gate's cores arm on the quantized mat-vec (`kernel_mul_mv_*`,
+/// `quantized.metal`): the cores the Qwen3.6 checkpoints decode through
+/// (Q4_K, Q6_K) and the simplest block (Q8_0), each against its own plain
+/// output on one weight and one activation.
+/// - gate armed, the token not a stop: the gated variant is the plain one,
+///   bit for bit (the gated pipeline at the plain one's split);
+/// - gate fired, cores arm off: the core runs (only the gated sources stop);
+/// - gate fired, cores arm on: nothing written, the destination's poison
+///   kept bit for bit.
+#[test]
+fn under_the_cores_arm_a_quantized_matvec_returns_at_once_past_an_eos() {
+    use crate::kernels::kernels::quantized::{call_quantized_matmul_mv_t, GemvTriple, GgmlDType};
+    use crate::quantized::k_quants::{BlockQ4K, BlockQ6K, BlockQ8_0, GgmlType};
+    const K: usize = 256;
+    const NOUT: usize = 32;
+    fn blocks<T: GgmlType>(w: &[f32]) -> Vec<u8> {
+        let mut ys = vec![T::zeros(); w.len() / T::BLCK_SIZE];
+        T::from_float(w, &mut ys);
+        let bytes = std::mem::size_of_val(ys.as_slice());
+        // SAFETY: the blocks are plain bytes (`repr(C)` structs of ints and
+        // halves); this views them as such for the upload.
+        unsafe { std::slice::from_raw_parts(ys.as_ptr() as *const u8, bytes) }.to_vec()
+    }
+    let rig = Rig::new();
+    let w: Vec<f32> = (0..NOUT * K)
+        .map(|i| ((i as f32) * 0.37).sin() * 0.5)
+        .collect();
+    let x: Vec<f32> = (0..K).map(|i| ((i as f32) * 0.11).cos()).collect();
+    let lhs = rig
+        .device
+        .new_buffer_with_data(x.as_ptr() as *const std::ffi::c_void, K * 4, SHARED)
+        .unwrap();
+    let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+    for (dtype, bytes) in [
+        (GgmlDType::Q8_0, blocks::<BlockQ8_0>(&w)),
+        (GgmlDType::Q4K, blocks::<BlockQ4K>(&w)),
+        (GgmlDType::Q6K, blocks::<BlockQ6K>(&w)),
+    ] {
+        let rhs = rig
+            .device
+            .new_buffer_with_data(
+                bytes.as_ptr() as *const std::ffi::c_void,
+                bytes.len(),
+                SHARED,
+            )
+            .unwrap();
+        // One mat-vec into a poisoned destination, after the gate's kernel
+        // on `token` when the gate is armed.
+        let matvec = |token: Option<u32>| -> Vec<f32> {
+            let dst = rig.device.new_buffer(NOUT * 4, SHARED).unwrap();
+            // A poison the core must overwrite (or, gated, leave).
+            unsafe { std::ptr::write_bytes(dst.contents(), 0xff, NOUT * 4) };
+            {
+                let enc = rig.cmds.command_encoder().unwrap();
+                if let Some(t) = token {
+                    rig.gate_step(t, &enc);
+                }
+                // SAFETY: the test owns every buffer bound here and reads the
+                // destination only after the command buffer completes.
+                unsafe {
+                    call_quantized_matmul_mv_t(
+                        &rig.device,
+                        &enc,
+                        &rig.kernels,
+                        dtype,
+                        GemvTriple::F32F32F32,
+                        (1, 1, NOUT, K),
+                        &lhs,
+                        0,
+                        &rhs,
+                        0,
+                        &dst,
+                    )
+                }
+                .unwrap();
+            }
+            rig.cmds.flush_and_wait_current().unwrap();
+            read_f32(&dst, NOUT)
+        };
+        let plain = matvec(None);
+        assert!(
+            plain.iter().all(|v| v.is_finite()),
+            "{dtype:?}: the plain core wrote its output"
+        );
+        rig.begin();
+        let clear = matvec(Some(7));
+        assert_eq!(
+            rig.end(),
+            crate::EosGateReport {
+                fired: false,
+                steps: 1,
+                cores: false
+            }
+        );
+        assert_eq!(
+            bits(&clear),
+            bits(&plain),
+            "{dtype:?}: armed, no stop: the plain output"
+        );
+        rig.begin();
+        let cores_off = matvec(Some(EOS[0]));
+        assert!(rig.end().fired);
+        assert_eq!(
+            bits(&cores_off),
+            bits(&plain),
+            "{dtype:?}: fired, cores arm off: the core still runs"
+        );
+        rig.begin();
+        rig.kernels.set_eos_gate_cores(true);
+        let gated_clear = matvec(Some(7));
+        assert!(!rig.end().fired);
+        rig.begin();
+        let gated_fired = matvec(Some(EOS[1]));
+        assert!(rig.end().fired);
+        rig.kernels.set_eos_gate_cores(false);
+        assert_eq!(
+            bits(&gated_clear),
+            bits(&plain),
+            "{dtype:?}: cores arm on, no stop: the gated core is the plain one bit for bit"
+        );
+        assert!(
+            gated_fired.iter().all(|v| v.to_bits() == u32::MAX),
+            "{dtype:?}: cores arm on, fired: the core wrote {:?}",
+            &gated_fired[..4]
+        );
+    }
+}

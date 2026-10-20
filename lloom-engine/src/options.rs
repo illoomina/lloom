@@ -163,6 +163,9 @@ pub struct ReadbackConfig {
     /// Under the adaptive commit: the most steps one buffer holds before it closes regardless (0 = 8).
     #[opt(path = "decode.readback.run_ahead_steps", status = "arm", facets = ["lead", "cadence"], flows = ["token-out"])]
     pub run_ahead: usize,
+    /// Under the adaptive commit: the most steps queued in committed buffers the GPU has not completed before the host waits (the lead's queued part, apart from the buffer's batching; 0 = two run-ahead windows).
+    #[opt(path = "decode.readback.queued_steps", status = "arm", facets = ["lead"], flows = ["token-out"])]
+    pub queued_steps: usize,
     /// The EOS gate: the kernels queued past an EOS return at once, so the cache ends at the EOS. Rides the adaptive commit; off where the adaptive commit does not run, or under the ICB replay executor.
     #[opt(bool, path = "decode.readback.eos_gate", status = "advanced", facets = ["lead"], flows = ["token-out", "commands-out"])]
     pub eos_gate: bool,
@@ -190,6 +193,7 @@ impl Default for ReadbackConfig {
             commit_budget: CommitBudget::steps(8).expect("8 > 0"),
             adaptive_commit: true,
             run_ahead: 0,
+            queued_steps: 0,
             eos_gate: true,
             fused_publish: true,
             stream_reader: false,
@@ -551,8 +555,10 @@ impl DecodeConfig {
             host_feed_wait: None,
             eos_park: None,
             eos_watch: None,
+            eos_gate_cores: None,
             adaptive_commit: false,
             run_ahead: self.readback.run_ahead,
+            queued_steps: self.readback.queued_steps,
             stop: None,
             eos_gate: false,
             fused_publish: self.readback.fused_publish,
@@ -664,9 +670,7 @@ impl TuningOptions {
     /// already been read (a knob a `OnceLock` site took is fixed; the report
     /// line would otherwise lie about it).
     pub fn install(&self) -> Result<(), String> {
-        lloom_tensor::tuning::install(self.tensor()).map_err(|_| {
-            "tuning: the tensor crate's knobs were already read before install".to_string()
-        })?;
+        lloom_tensor::tuning::install(self.tensor()).map_err(|error| error.to_string())?;
         lloom::tuning::install(self.lloom()).map_err(|_| {
             "tuning: the model crate's knobs were already read before install".to_string()
         })

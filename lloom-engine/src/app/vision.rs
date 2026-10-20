@@ -456,7 +456,7 @@ pub fn take_window(device: &lloom_tensor::Device) -> Result<Option<DispatchWindo
     #[cfg(feature = "metal")]
     {
         use lloom_tensor::kernels::metal::profile;
-        if profile::enabled() {
+        if profile::recorder_enabled() {
             device.synchronize()?;
             let s = profile::snapshot();
             profile::reset();
@@ -535,6 +535,40 @@ impl ImageCensus {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn image_census_preserves_scalar_counts_without_inventing_labels() -> Result<()> {
+        use lloom_tensor::kernels::metal::profile;
+        let mut tuning = lloom_tensor::tuning::Tuning::default();
+        tuning.instrument.profile = true;
+        lloom_tensor::tuning::install(tuning).unwrap();
+        profile::reset();
+        let label = std::sync::Arc::<str>::from("image-census-control");
+        profile::record_dispatch(Some(&label), 0);
+        assert_eq!(profile::snapshot().dispatches, 1);
+        let window = take_window(&lloom_tensor::Device::Cpu)?;
+        if lloom_tensor::tuning::PROFILE_INSTRUMENTS {
+            let window = window.expect("the active recorder observed a window");
+            assert_eq!(window.dispatches, 1);
+            assert_eq!(window.labels.get("image-census-control"), Some(&1));
+        } else {
+            assert!(window.is_none(), "scalar-only data is not a label census");
+            assert_eq!(
+                profile::snapshot().dispatches,
+                1,
+                "absence must not reset scalar counters"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn disabled_image_recording_is_unavailable_without_device_work() -> Result<()> {
+        lloom_tensor::tuning::install(lloom_tensor::tuning::Tuning::default()).unwrap();
+        assert!(take_window(&lloom_tensor::Device::Cpu)?.is_none());
+        Ok(())
+    }
 
     #[test]
     fn the_nth_image_token_takes_the_nth_expansion() {

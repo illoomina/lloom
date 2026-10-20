@@ -1,10 +1,8 @@
 <div align="center">
 
-<img src="assets/lloom-logo.jpg" alt="lloom" width="240" />
+<img src="assets/lloom-logo.jpg" alt="lloom" width="360" />
 
-# lloom
-
-**Local LLM inference, specialized for Apple silicon**
+**Local LLM inference, blazing fast.**
 
 </div>
 

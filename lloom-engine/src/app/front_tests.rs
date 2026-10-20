@@ -2827,8 +2827,7 @@ fn a_past_reply_is_rendered_from_the_ids_the_model_emitted() {
             let f = Front::new(&engine, SessionOptions::default());
             let c = f.constants().unwrap();
             eprintln!(
-                "EMITTED-CONST {name}: trims_reasoning={} eot={:?}",
-                c.trims_reasoning,
+                "EMITTED-CONST {name}: eot={:?}",
                 c.eot().map(|(id, s)| (id, s.to_string())),
             );
         }
@@ -2928,6 +2927,22 @@ fn a_past_reply_is_rendered_from_the_ids_the_model_emitted() {
                     //   template never writes.
                     let engine_closed = p1.thinking.unwrap().by == By::Engine;
                     let speaks_for = persist != Some(false) && !engine_closed;
+                    // Where the turn is rendered from the emitted ids, the
+                    // span carries the end-of-turn id only if the model ended
+                    // the turn itself: a reply a limit or a stop cut fed no
+                    // such position, and putting that id in the prompt would
+                    // condition the model on a token the session never ran.
+                    // (This is what kills the harness's `m1`.) Under an
+                    // opt-in strip the span is deliberately not the emitted
+                    // turn, so fewer ids are spliced and the count is the
+                    // segment alignment's.
+                    if speaks_for {
+                        assert_eq!(
+                            p2.spliced.spliced_tokens,
+                            turn_tokens(&front, &sampled, stop),
+                            "{name} want={want:?} persist={persist:?} {kind}: the turn's ids"
+                        );
+                    }
                     if speaks_for && kept < log.len() {
                         failures.push(format!(
                             "{name} want={want:?} persist={persist:?} {kind}: the next prompt \

@@ -214,14 +214,6 @@ pub struct Constants {
     pub groups_tools: bool,
     /// The family's reasoning tags (`Text::think_tags`).
     pub tags: Option<ThinkTags>,
-    /// The template trims the reasoning it is given before writing it
-    /// (Qwen's `reasoning_content|trim`), so whitespace the model emitted
-    /// around its thought is deleted from the history. Read at load by
-    /// rendering a reasoning padded with whitespace and seeing whether it
-    /// survives. Where it does not, the front end gives the template the
-    /// reasoning already trimmed, so the trim is a no-op and the emitted bytes
-    /// stand (decision 51 Q1).
-    pub(crate) trims_reasoning: bool,
     /// The text the template writes to end an assistant turn, and the single
     /// id it encodes to: the end-of-turn token. `None` where the template's
     /// ending is not one token, or does not encode to the id the model would
@@ -240,7 +232,6 @@ impl Constants {
             open: None,
             groups_tools: false,
             tags: None,
-            trims_reasoning: false,
             eot: None,
         }
     }
@@ -463,20 +454,6 @@ impl Constants {
             }
         })();
 
-        // Does the template trim the reasoning it is given? Rendered with a
-        // reasoning padded either side, the padding survives or it does not.
-        let trims_reasoning = (|| {
-            let pad = format!("\n\n{PROBE_REASONING}\n\n");
-            let mut a = json!({ "role": "assistant", "content": PROBE_ANSWER });
-            for f in REASONING_FIELDS {
-                a[f] = json!(pad);
-            }
-            let kw = with_persist(&Map::new(), Some(true)).unwrap_or_default();
-            let s = render(&json!([user, a, next]), &kw, false)?;
-            Some(!s.contains(pad.trim_end()) || !s.contains(pad.trim_start()))
-        })()
-        .unwrap_or(false);
-
         Self {
             modes,
             effort,
@@ -485,7 +462,6 @@ impl Constants {
             open,
             groups_tools,
             tags,
-            trims_reasoning,
             eot,
         }
     }
@@ -1277,20 +1253,8 @@ impl Front {
                     let msgs = rewritten.get_or_insert_with(|| list.clone());
                     let mut msg = m.clone();
                     msg["content"] = json!(reply.content_text);
-                    // Where the template trims the reasoning it is given
-                    // (Qwen's `reasoning_content|trim`), give it the trimmed
-                    // text: the trim is then a no-op, and the whitespace the
-                    // model emitted around its thought stays the model's
-                    // rather than being deleted from the history (decision 51
-                    // Q1). A template that writes the reasoning verbatim
-                    // (LFM2.5) is given it verbatim.
-                    let reasoning = if c.trims_reasoning {
-                        reply.reasoning_text.trim()
-                    } else {
-                        reply.reasoning_text.as_str()
-                    };
                     for f in REASONING_FIELDS {
-                        msg[f] = json!(reasoning);
+                        msg[f] = json!(reply.reasoning_text);
                     }
                     msgs[i] = msg;
                 }

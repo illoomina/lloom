@@ -696,7 +696,12 @@ fn the_unset_defaults_are_the_trees_before_it_except_the_named_exceptions() {
         assert_eq!(at(&o, "decode.ring.eos_watch"), false, "{}", f.name());
         let on = matches!(f, Frontend::Chat | Frontend::Serve) && When::Metal.holds(&o);
         assert_eq!(at(&o, "models.qwen3_5.eos_gate"), on, "{} gate", f.name());
-        assert_eq!(at(&o, "models.qwen3_5.eos_gate_cores"), on, "{} cores", f.name());
+        assert_eq!(
+            at(&o, "models.qwen3_5.eos_gate_cores"),
+            on,
+            "{} cores",
+            f.name()
+        );
         assert_eq!(
             at(&o, "decode.readback.queued_steps"),
             typed("decode.readback.queued_steps", if on { "4" } else { "0" }),
@@ -704,7 +709,12 @@ fn the_unset_defaults_are_the_trees_before_it_except_the_named_exceptions() {
             f.name()
         );
         let cpu = resolve(Some(f), f.name(), &["--cpu"], &none).unwrap();
-        assert_eq!(at(&cpu, "models.qwen3_5.eos_gate"), false, "{} gate on --cpu", f.name());
+        assert_eq!(
+            at(&cpu, "models.qwen3_5.eos_gate"),
+            false,
+            "{} gate on --cpu",
+            f.name()
+        );
     }
 
     // 5. Decisions 32/47: the session's absent, null and explicit values.

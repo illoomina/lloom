@@ -191,6 +191,8 @@ pub(super) struct Held {
     /// The epoch its cut took: the one an eager commit would have.
     pub(super) epoch: Epoch,
     pub(super) after: Vec<AfterCommit>,
+    /// When the cut held it (the held time, `ProducedStats::held_us`).
+    pub(super) at: std::time::Instant,
 }
 
 /// Counts of what the held queue did, since the queue was built.
@@ -209,6 +211,17 @@ pub struct ProducedStats {
     /// Times a held cut parked the encoding thread (a full held queue, or no
     /// free Metal 4 slot behind held work) until producers released some.
     pub parks: u64,
+    /// Of `released`, the ones a producer's own call committed (a host
+    /// producer's `produced`, or an IO event's notification); the rest the
+    /// owner committed at a cut, a park or a wait.
+    pub released_by_producer: u64,
+    /// Summed time from a recording's hold to its commit, µs.
+    pub held_us: u64,
+    /// IO command buffers committed after a held recording instead of at
+    /// their issue (the recording carrying their compute signal was held).
+    pub io_deferred: u64,
+    /// Summed time producers waited for the state lock, µs.
+    pub producer_lock_us: u64,
 }
 
 struct Listener {
@@ -230,6 +243,10 @@ pub(super) struct ProducedState {
     cancelled: AtomicU64,
     late_after_cancel: AtomicU64,
     parks: AtomicU64,
+    released_by_producer: AtomicU64,
+    held_us: AtomicU64,
+    io_deferred: AtomicU64,
+    producer_lock_us: AtomicU64,
     late_logged: AtomicBool,
     /// The event and highest value of the last cancellation.
     cancelled_event: AtomicUsize,
@@ -252,6 +269,10 @@ impl ProducedState {
             cancelled: AtomicU64::new(0),
             late_after_cancel: AtomicU64::new(0),
             parks: AtomicU64::new(0),
+            released_by_producer: AtomicU64::new(0),
+            held_us: AtomicU64::new(0),
+            io_deferred: AtomicU64::new(0),
+            producer_lock_us: AtomicU64::new(0),
             late_logged: AtomicBool::new(false),
             cancelled_event: AtomicUsize::new(0),
             cancelled_upto: AtomicU64::new(0),
@@ -355,6 +376,10 @@ impl CommandsCore {
                 Ok(_) => {
                     custody.residency_published |= publish;
                     let held = entry.held.pop_front().expect("checked above");
+                    self.produced.held_us.fetch_add(
+                        held.at.elapsed().as_micros().min(u64::MAX as u128) as u64,
+                        Ordering::Relaxed,
+                    );
                     entry.in_flight.push(held.cb);
                     released += 1;
                     if let Err(error) = self.run_after_commit(held.after) {
@@ -439,9 +464,19 @@ impl CommandsCore {
         if let Some(queue) = &self.modern_queue {
             queue.notify_ready();
         }
-        let released = self
-            .lock_entry()
-            .and_then(|mut state| self.release_produced_locked(&mut state));
+        let asked = std::time::Instant::now();
+        let released = self.lock_entry().and_then(|mut state| {
+            self.produced.producer_lock_us.fetch_add(
+                asked.elapsed().as_micros().min(u64::MAX as u128) as u64,
+                Ordering::Relaxed,
+            );
+            self.release_produced_locked(&mut state)
+        });
+        if let Ok(n) = released {
+            self.produced
+                .released_by_producer
+                .fetch_add(n as u64, Ordering::Relaxed);
+        }
         if let Err(error) = &released {
             // Held work no thread will release again: a visible failure, not
             // a stall.
@@ -542,6 +577,10 @@ impl Commands {
             cancelled: p.cancelled.load(Ordering::Relaxed),
             late_after_cancel: p.late_after_cancel.load(Ordering::Relaxed),
             parks: p.parks.load(Ordering::Relaxed),
+            released_by_producer: p.released_by_producer.load(Ordering::Relaxed),
+            held_us: p.held_us.load(Ordering::Relaxed),
+            io_deferred: p.io_deferred.load(Ordering::Relaxed),
+            producer_lock_us: p.producer_lock_us.load(Ordering::Relaxed),
         }
     }
 
@@ -675,6 +714,10 @@ impl Commands {
                     signal: Input::new(signal_event, signal_value)?,
                     rehomed: false,
                 });
+                self.core
+                    .produced
+                    .io_deferred
+                    .fetch_add(1, Ordering::Relaxed);
             }
             None => io.commit(),
         }
@@ -887,6 +930,7 @@ impl Commands {
             gate,
             epoch,
             after: Vec::new(),
+            at: std::time::Instant::now(),
         });
         self.core.compute_count.store(reset_to, Ordering::Release);
         self.core

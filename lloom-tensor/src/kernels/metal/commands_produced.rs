@@ -185,6 +185,30 @@ pub(super) enum AfterCommit {
 
 /// A recording closed at a cut while an input it reads, or one a recording
 /// ahead of it reads, was not yet produced.
+/// Fill `spare` with an emptied after-commit list for every recording the
+/// held queue can hold and the current one, each with room for a
+/// point-of-use batch's IO buffers: built once, with the queue.
+pub(super) fn spare_after(spare: &mut Vec<Vec<AfterCommit>>) -> Result<(), MetalKernelError> {
+    let refused = |_| MetalKernelError::QueueUnavailable("held IO storage refused");
+    spare.try_reserve_exact(HELD_CAP + 1).map_err(refused)?;
+    let lanes = crate::kernels::metal::io_queue::io_lanes() + 1;
+    for _ in 0..HELD_CAP + 1 {
+        let mut list = Vec::new();
+        list.try_reserve_exact(lanes).map_err(refused)?;
+        spare.push(list);
+    }
+    Ok(())
+}
+
+/// Give an emptied after-commit list back for the next held recording,
+/// keeping its storage; one beyond what was built is dropped.
+fn recycle_after(spare: &mut Vec<Vec<AfterCommit>>, mut list: Vec<AfterCommit>) {
+    list.clear();
+    if list.capacity() > 0 && spare.len() < spare.capacity() {
+        spare.push(list);
+    }
+}
+
 pub(super) struct Held {
     pub(super) cb: CommandBuffer,
     pub(super) gate: Gate,
@@ -385,7 +409,10 @@ impl CommandsCore {
                     );
                     entry.in_flight.push(held.cb);
                     released += 1;
-                    if let Err(error) = self.run_after_commit(held.after) {
+                    let mut after = held.after;
+                    let ran = self.run_after_commit(&mut after);
+                    recycle_after(&mut entry.spare_after, after);
+                    if let Err(error) = ran {
                         break Err(error);
                     }
                 }
@@ -411,8 +438,9 @@ impl CommandsCore {
         result.map(|()| released)
     }
 
-    fn run_after_commit(&self, after: Vec<AfterCommit>) -> Result<(), MetalKernelError> {
-        for action in after {
+    /// Run, in order, what a commit left to run after it, emptying `after`.
+    fn run_after_commit(&self, after: &mut Vec<AfterCommit>) -> Result<(), MetalKernelError> {
+        for action in after.drain(..) {
             match action {
                 AfterCommit::Io {
                     io,
@@ -540,7 +568,10 @@ impl CommandsCore {
                 Ok(_) => {
                     let held = state.held.pop_front().expect("checked above");
                     state.in_flight.push(held.cb);
-                    self.run_after_commit(held.after)?;
+                    let mut after = held.after;
+                    let ran = self.run_after_commit(&mut after);
+                    recycle_after(&mut state.spare_after, after);
+                    ran?;
                 }
                 Err(MetalKernelError::RecordingAdmission(
                     crate::command_lifecycle::LifecycleError::Busy,
@@ -753,13 +784,17 @@ impl Commands {
         {
             let (entry, custody) = state.parts_mut();
             let entry: &mut EntryState = entry;
-            for held in entry.held.drain(from..) {
+            // Cancellation is not on the token's path: the drained
+            // recordings are collected so their after-lists can go back.
+            let drained: Vec<Held> = entry.held.drain(from..).collect();
+            for held in drained {
                 upto = upto.max(held.gate.highest_on(event));
                 if let Err(error) = held.cb.cancel_unsubmitted() {
                     refused.get_or_insert(error);
                 }
                 entry.owed_epochs += 1;
-                for action in held.after {
+                let mut after = held.after;
+                for action in after.drain(..) {
                     let AfterCommit::Io { io, signal, .. } = action;
                     rehome.push(AfterCommit::Io {
                         io,
@@ -767,6 +802,7 @@ impl Commands {
                         rehomed: true,
                     });
                 }
+                recycle_after(&mut entry.spare_after, after);
                 custody.cancelled.push(held.cb);
                 cancelled += 1;
             }
@@ -793,7 +829,7 @@ impl Commands {
         match state.held.back_mut() {
             Some(held) => held.after.extend(rehome),
             None => {
-                if let Err(error) = self.core.run_after_commit(rehome) {
+                if let Err(error) = self.core.run_after_commit(&mut rehome) {
                     refused.get_or_insert(error);
                 }
             }
@@ -928,11 +964,12 @@ impl Commands {
             Ok(old) => old,
             Err(_) => unreachable!("checked recording above"),
         };
+        let after = state.spare_after.pop().unwrap_or_default();
         state.held.push_back(Held {
             cb: old,
             gate,
             epoch,
-            after: Vec::new(),
+            after,
             at: std::time::Instant::now(),
         });
         self.core.compute_count.store(reset_to, Ordering::Release);

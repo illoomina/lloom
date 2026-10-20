@@ -392,6 +392,13 @@ fn a_hold_deeper_than_the_slots_drains_from_the_parked_owner() {
     // The park this test exists for engaged: a slot (Metal 4) or the cap.
     assert!(stats.parks > 0, "{stats:?}");
     assert_eq!(stats.held_now, 0);
+    // Every held recording took its after-list from the spares and gave it
+    // back, storage kept: the next held IO attach allocates nothing.
+    let lanes = crate::kernels::metal::io_queue::io_lanes() + 1;
+    let state = f.commands.lock_state().unwrap();
+    assert_eq!(state.spare_after.len(), produced::HELD_CAP + 1);
+    assert!(state.spare_after.iter().all(|list| list.is_empty() && list.capacity() >= lanes));
+    drop(state);
     assert_eq!(
         f.commands.clock().completed_count().0,
         f.commands.clock().current_epoch().0

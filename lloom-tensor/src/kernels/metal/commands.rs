@@ -380,6 +380,10 @@ struct EntryState {
     owed_epochs: u32,
     /// The current recording was cancelled and no replacement was free.
     current_abandoned: bool,
+    /// Emptied after-commit lists, their storage kept: a held recording
+    /// takes one at its cut and gives it back at its commit, so attaching an
+    /// IO buffer to held work allocates nothing (`produced::spare_after`).
+    spare_after: Vec<Vec<produced::AfterCommit>>,
 }
 
 // One acquisition can close one compute encoder and construct one replacement.
@@ -417,6 +421,7 @@ impl EntryState {
             signals_since_cut: false,
             owed_epochs: 0,
             current_abandoned: false,
+            spare_after: Vec::new(),
         }
     }
 }
@@ -1032,6 +1037,7 @@ impl Commands {
             .held
             .try_reserve_exact(produced::HELD_CAP)
             .map_err(|_| MetalKernelError::QueueUnavailable("held recording storage refused"))?;
+        produced::spare_after(&mut state.spare_after)?;
         let host_input = produced::HostInputArm::selected()?;
         let core = Arc::new_cyclic(|me| CommandsCore {
             #[cfg(test)]

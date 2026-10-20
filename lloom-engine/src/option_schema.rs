@@ -682,26 +682,26 @@ mod tests {
         assert!(mapped > 0, "control must reach a real mapped declaration");
     }
 
+    /// C2 resolves, so no static rule names it; a rule that reads
+    /// `decode.readback` types it as an object, so a string spelling
+    /// (`"ring"`) never meets an object keyword.
     #[test]
-    fn readback_coupling_forms_follow_the_actual_preset_parser() {
+    fn readback_coupling_rules_type_the_readback_they_read() {
         let schema = schema();
-        let predicate = &schema["allOf"][0]["if"]["properties"]["decode"]["properties"]["readback"];
-        assert_eq!(predicate["anyOf"][0]["type"], "object");
-        assert_eq!(predicate["anyOf"][1]["type"], "string");
-        let strings = predicate["anyOf"][1]["enum"].as_array().unwrap();
-        for spelling in crate::ReadbackConfig::SPELLINGS {
-            let mut cfg = crate::ReadbackConfig::default();
-            crate::ReadbackConfig::apply_spelling(&mut cfg, spelling).unwrap();
-            assert_eq!(
-                strings.contains(&json!(spelling)),
-                cfg.kind == crate::ReadbackKind::Ring,
-                "{spelling}"
-            );
+        let rules = schema["allOf"].as_array().unwrap();
+        assert!(!rules
+            .iter()
+            .any(|r| r["$comment"].as_str().is_some_and(|c| c.starts_with("C2"))));
+        let mut read = 0;
+        for r in rules {
+            let readback = &r["if"]["properties"]["decode"]["properties"]["readback"];
+            if readback.is_null() {
+                continue;
+            }
+            assert_eq!(readback["type"], "object", "{}", r["$comment"]);
+            read += 1;
         }
-        assert_eq!(
-            schema["allOf"][1]["if"]["properties"]["decode"]["properties"]["readback"]["type"],
-            "object"
-        );
+        assert!(read >= 1, "C10 reads decode.readback");
     }
 
     /// Exercise the real derive/parser for every supported storage width,

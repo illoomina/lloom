@@ -2286,11 +2286,15 @@ mod tests {
             }
         }
 
+        /// A ring asked by name with a filtered host draw runs that request
+        /// on the blocking arm with the note (C2), never building a ring; a
+        /// supported request runs; a refused parameter is refused before the
+        /// turn is prepared.
         #[test]
-        fn filtered_host_refusal_precedes_prepare_and_supported_retry_runs() -> Result<()> {
+        fn a_named_ring_demotes_a_filtered_host_draw_and_a_refusal_precedes_prepare() -> Result<()>
+        {
             let device = Device::Cpu;
             let model = Chain::new(&device)?;
-            let mut session = DecodeSession::new(&model, Pos(0), device.clone(), 0);
             let mut params = DecodeParams {
                 temperature: Some(0.7),
                 top_k: Some(1),
@@ -2301,19 +2305,18 @@ mod tests {
                 readback: ReadbackArm::CROWN,
                 ..Default::default()
             };
-            let error = session
-                .decode_until(
-                    &[5, 1],
-                    |_| panic!("refusal reached detokenizer"),
-                    &params,
-                    |_| panic!("refusal reached fragment hook"),
-                )
-                .unwrap_err();
-            assert!(error.to_string().contains("explicit host draw"), "{error}");
-            assert_eq!(session.pos(), 0);
-            assert_eq!(session.session.sequence().cache().0, 0);
-            assert!(session.session.tokens().is_empty());
-            assert!(session.rings.is_empty());
+            let mut demoted = DecodeSession::new(&model, Pos(0), device.clone(), 0);
+            let out = demoted.decode_until(&[5, 1], |ids| Ok(text_of(ids)), &params, |_| true)?;
+            assert_eq!(out.readback, ReadbackArm::Blocking);
+            let note = out.readback_note.as_deref().unwrap_or_default();
+            assert!(
+                note.contains("host-filtered-gumbel") && note.contains("(C2)"),
+                "{note:?}"
+            );
+            assert_eq!(out.tokens, chain(1, 3).0);
+            assert!(demoted.rings.is_empty());
+
+            let mut session = DecodeSession::new(&model, Pos(0), device.clone(), 0);
             params.readback = ReadbackArm::Blocking;
             params.logits_digest = true;
             params.logprobs = Some(LogprobRequest::default());

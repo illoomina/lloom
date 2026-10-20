@@ -86,8 +86,20 @@ fn method_temperature_filter_matrix_reaches_one_body_table() -> Result<()> {
                             ReadbackArm::CROWN
                         }
                     );
+                    // A ring named in the options is accepted for every
+                    // sampler and demoted, with its note, for a host-side
+                    // one (C2).
                     options.decode.readback.kind = lloom_engine::ReadbackKind::Ring;
-                    assert_eq!(options.check().is_err(), host);
+                    options.check().unwrap();
+                    assert_eq!(
+                        ReadbackArm::CROWN.resolve(&expected, RingArm::CROWN),
+                        if host {
+                            ReadbackArm::Blocking
+                        } else {
+                            ReadbackArm::CROWN
+                        }
+                    );
+                    assert_eq!(ReadbackArm::CROWN.demotion(&expected).is_some(), host);
                     for body in [
                         Body::Step { ring: false },
                         Body::Window,

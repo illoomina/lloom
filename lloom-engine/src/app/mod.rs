@@ -1442,15 +1442,17 @@ mod sampling_and_speculation_tests {
             vec!["--generation-config", r#"{"top_p":"-0.1"}"#],
             vec!["--generation-config", r#"{"top_k":-1}"#],
             vec!["--set", "generation.temperature=nan"],
-            vec![
-                "-t",
-                "0.7",
-                "--gumbel",
-                "--top-k",
-                "2",
-                "--readback",
-                "ring",
-            ],
+        ] {
+            assert!(
+                resolve_options_uninstalled(&common(&argv), &no_front).is_err(),
+                "{argv:?}"
+            );
+        }
+        // A ring named by flag or by key with a host-side sampler resolves
+        // (C2): the options keep the ring and the sampler, and each request
+        // runs on the blocking arm with a note.
+        for argv in [
+            vec!["-t", "0.7", "--gumbel", "--top-k", "2", "--readback", "ring"],
             vec![
                 "-t",
                 "0.7",
@@ -1461,8 +1463,21 @@ mod sampling_and_speculation_tests {
                 "decode.readback.kind=ring",
             ],
         ] {
+            let o = resolve_options_uninstalled(&common(&argv), &no_front).unwrap();
+            assert_eq!(
+                o.sampling.sampling().unwrap(),
+                Sampling::FilteredGumbel {
+                    temperature: 0.7,
+                    k: 2,
+                    p: 1.0,
+                },
+                "{argv:?}"
+            );
+            assert_eq!(o.decode.readback.kind, crate::ReadbackKind::Ring, "{argv:?}");
             assert!(
-                resolve_options_uninstalled(&common(&argv), &no_front).is_err(),
+                crate::couplings::explain(&o)
+                    .iter()
+                    .any(|l| l.starts_with("decode.readback.kind = ring -> blocking")),
                 "{argv:?}"
             );
         }

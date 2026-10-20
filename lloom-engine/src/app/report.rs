@@ -1000,6 +1000,25 @@ fn print_churn(m: &lloom_tensor::MetalDevice, before: &ChurnSnapshot) {
         m.ledger().snapshot().line(),
         m.device().current_allocated_size() as f64 / 1e9
     );
+    // Work held for a host- or IO-produced input (invariants.md §15.1q),
+    // since load: recordings held, committed by their producer, cancelled,
+    // and the encoding thread's parks behind them.
+    let held = m.commands().produced_stats();
+    eprintln!(
+        "[host input since load: arm={} held={} released={} (by producer {}) \
+         held_time={:.3} ms producer_lock_wait={:.3} ms cancelled={} late_after_cancel={} parks={} io_deferred={} held_now={}]",
+        m.commands().host_input_arm().as_str(),
+        held.held,
+        held.released,
+        held.released_by_producer,
+        held.held_us as f64 / 1e3,
+        held.producer_lock_us as f64 / 1e3,
+        held.cancelled,
+        held.late_after_cancel,
+        held.parks,
+        held.io_deferred,
+        held.held_now,
+    );
     // The unretained arm's engagement: what the host held for command buffers
     // that hold nothing themselves (`in_flight.rs`).
     match m.in_flight_hold_counts() {

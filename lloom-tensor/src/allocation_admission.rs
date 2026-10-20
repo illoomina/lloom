@@ -99,6 +99,7 @@ impl<R> StagedAllocation<R> {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn stage<R>(
     context: &AllocationContext,
     prediction: Prediction,
@@ -156,6 +157,7 @@ fn stage_with_control<R>(
 
 /// A single ticket is issued before native creation. Return raw before owner in
 /// tuple drop order until the caller installs its persistent AllocationLease.
+#[cfg(test)]
 pub(crate) fn allocate<R>(
     context: &AllocationContext,
     prediction: Prediction,

@@ -3395,7 +3395,7 @@ impl NativeSeedHold {
             unreachable!("native control")
         };
         let gate = Arc::new(lloom_tensor::metal_backend::HostEvent::new(m)?);
-        gate.encode_wait(1)?;
+        gate.commit_when_produced(1)?;
         let done = Arc::new(AtomicBool::new(false));
         let timed_out = Arc::new(AtomicBool::new(false));
         let after_two = Arc::new(AtomicBool::new(false));

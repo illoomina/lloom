@@ -183,6 +183,7 @@ impl Completions {
     /// Holds actual raw-commit exclusion, not merely a sequence counter. A
     /// caller must retain this guard through begin_handoff/append/native entry/
     /// RETURNED. Unused preparations append nothing.
+    #[cfg(test)]
     pub(super) fn prepare_order(
         &self,
     ) -> Result<MutexGuard<'_, Marker>, crate::kernels::MetalKernelError> {
@@ -412,6 +413,8 @@ unsafe impl Sync for NativeHandler {}
 /// CommandBuffer::new retains its explicit native-only compatibility contract.
 /// The actual wrapper constructor/routing remains an integration prerequisite.
 pub(super) struct PreparedCommit<'a> {
+    #[cfg(test)]
+    pub(super) test_control: Option<Arc<super::commands::submission_test::Control>>,
     core: &'a Arc<Completions>,
     raw: &'a objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLCommandBuffer>>,
     marker: &'a Marker,
@@ -423,7 +426,7 @@ pub(super) struct PreparedCommit<'a> {
     bindings: Option<&'a super::native_generation_bindings::GenerationBindings>,
 }
 impl Completions {
-    pub(super) fn prepare_commit<'a>(
+    fn prepare_commit<'a>(
         self: &'a Arc<Self>,
         raw: &'a objc2::rc::Retained<
             objc2::runtime::ProtocolObject<dyn objc2_metal::MTLCommandBuffer>,
@@ -448,6 +451,8 @@ impl Completions {
             .try_clone()
             .map_err(|_| unavailable("M3 tail pin refused"))?;
         Ok(PreparedCommit {
+            #[cfg(test)]
+            test_control: None,
             core: self,
             raw,
             marker,
@@ -461,9 +466,10 @@ impl Completions {
     }
 }
 impl PreparedCommit<'_> {
-    /// Flag this record for the queue's completion hook. No allocation, no
-    /// lock: a phase-exclusive edit of the prepared record.
-    pub(super) fn run_hook(&self) -> Result<(), crate::kernels::MetalKernelError> {
+    /// Flag this record for the queue's completion hook, completing `runs`
+    /// epochs. No allocation, no lock: a phase-exclusive edit of the prepared
+    /// record.
+    pub(super) fn run_hook(&self, runs: u32) -> Result<(), crate::kernels::MetalKernelError> {
         self.core.check()?;
         if self.core.hook.get().is_none() {
             return Err(unavailable("M3 completion hook not installed"));
@@ -471,7 +477,7 @@ impl PreparedCommit<'_> {
         match self
             .marker
             .record()
-            .edit_prepared((), |captures, _, _| captures.hooked = true)
+            .edit_prepared((), |captures, _, _| captures.hook_runs = runs)
         {
             Ok(_) => Ok(()),
             Err(crate::retirement_mailbox::PreparedEditError::Rejected(_)) => {
@@ -514,9 +520,7 @@ impl PreparedCommit<'_> {
     pub(super) fn commit(mut self) -> Result<(), crate::kernels::MetalKernelError> {
         self.core.check()?;
         if let Some(head) = self.bindings {
-            // A commit Commands did not stage takes its own epoch, so it runs
-            // the queue's completion hook too.
-            head.ensure_staged(|| self.run_hook())?;
+            head.require_staged()?;
         }
         // Record phase before entering Objective-C. Handler installation cannot
         // execute GPU work; cancellation can still use host-only destruction.
@@ -532,6 +536,10 @@ impl PreparedCommit<'_> {
                 .addCompletedHandler(block2::RcBlock::as_ptr(&self.handler.0));
         }
         self.core.check()?;
+        #[cfg(test)]
+        if let Some(control) = &self.test_control {
+            control.before_entry()?;
+        }
         let link = self.link.take().expect("prepared successor pin");
         let new_tail = self.new_tail.take().expect("prepared tail pin");
         self.core.append(&mut self.order, link, new_tail)?;
@@ -541,9 +549,8 @@ impl PreparedCommit<'_> {
             .begin_handoff()
             .map_err(|_| unavailable("M3 native handoff refused"))?;
         if let Some(head) = self.bindings {
-            head.entered().map_err(|error| {
+            head.entered().inspect_err(|_| {
                 self.binding_failure(Failure::AdapterFailed);
-                error
             })?;
         }
         self.phase = CommitPhase::EnteredNative;
@@ -552,10 +559,17 @@ impl PreparedCommit<'_> {
         // may already have reserved native placement; logical prefix remains
         // commit order, not a claim that earlier enqueue never changes order.
         self.raw.commit();
+        #[cfg(test)]
+        if let Some(control) = &self.test_control {
+            assert!(
+                !control.native_call_returned(0),
+                "partial fault is Metal 4 only"
+            );
+            control.before_return();
+        }
         if let Some(head) = self.bindings {
-            head.returned().map_err(|error| {
+            head.returned().inspect_err(|_| {
                 self.binding_failure(Failure::UnknownHandoff);
-                error
             })?;
         }
         self.marker
@@ -681,7 +695,7 @@ impl AssociatedBuffer {
                         raw,
                         physical,
                         namespaces: Vec::new(),
-                        bindings: None,
+                        _bindings: None,
                     },
                     prepared,
                 )),
@@ -704,7 +718,7 @@ impl AssociatedBuffer {
                             raw,
                             physical,
                             namespaces: Vec::new(),
-                            bindings: None,
+                            _bindings: None,
                         },
                         prepared,
                     )),
@@ -722,7 +736,7 @@ impl AssociatedBuffer {
                             raw,
                             physical,
                             namespaces: Vec::new(),
-                            bindings: None,
+                            _bindings: None,
                         },
                         prepared,
                         bindings,
@@ -746,7 +760,7 @@ impl AssociatedBuffer {
                     raw,
                     physical,
                     namespaces: Vec::new(),
-                    bindings: native_head,
+                    _bindings: native_head,
                 },
                 |_| Ok(()),
             )
@@ -778,7 +792,7 @@ impl AssociatedBuffer {
                             raw,
                             physical: None,
                             namespaces: Vec::new(),
-                            bindings: None,
+                            _bindings: None,
                         },
                         anchor,
                     )),
@@ -796,7 +810,7 @@ impl AssociatedBuffer {
                             raw,
                             physical: None,
                             namespaces: Vec::new(),
-                            bindings: None,
+                            _bindings: None,
                         },
                         anchor,
                         rejected.rejected,
@@ -814,7 +828,7 @@ impl AssociatedBuffer {
                         raw,
                         physical: None,
                         namespaces: Vec::new(),
-                        bindings: None,
+                        _bindings: None,
                     },
                     anchor,
                 )),
@@ -899,12 +913,18 @@ impl AssociatedBuffer {
     pub(super) fn prepare_commit(
         &self,
     ) -> Result<PreparedCommit<'_>, crate::kernels::MetalKernelError> {
-        self.prepare_commit_mode(false)
+        self.prepare_commit_mode(false, None)
     }
     pub(super) fn prepare_commit_mode(
         &self,
         nonblocking: bool,
+        authority: Option<&super::commands::OwnerSubmission<'_>>,
     ) -> Result<PreparedCommit<'_>, crate::kernels::MetalKernelError> {
+        if let Some(generation) = &self.bindings {
+            if !authority.is_some_and(|owner| owner.authorizes_generation(generation)) {
+                return Err(crate::kernels::MetalKernelError::OwnerSubmissionRequired);
+            }
+        }
         self.core.prepare_commit(
             &self.raw,
             &self.marker,
@@ -912,6 +932,23 @@ impl AssociatedBuffer {
             nonblocking,
             self.bindings.as_ref(),
         )
+    }
+    /// Cancel this recording before submission, whoever else still holds a
+    /// wrapper: no later commit can enter native work, and the raw owners go
+    /// to host retirement as the last wrapper drops. `false` when it was
+    /// already submitted or cancelled.
+    pub(super) fn abandon_unsubmitted(&self) -> bool {
+        if self.marker.record().cancel_before_handoff().is_err() {
+            return false;
+        }
+        if let Some(head) = &self.bindings {
+            // SAFETY: successful Prepared cancellation proves no native
+            // handoff; the original anchor/raw retains SAME head until Drop.
+            if unsafe { head.terminal_cancelled() }.is_err() {
+                head.quarantine(Failure::AdapterFailed);
+            }
+        }
+        true
     }
     pub(super) fn try_commit(&self) -> Result<(), crate::kernels::MetalKernelError> {
         self.prepare_commit()?.commit()

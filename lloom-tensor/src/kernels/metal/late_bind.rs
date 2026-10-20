@@ -475,7 +475,10 @@ mod tests {
         drop(handle);
 
         let queue = dev.new_command_queue().expect("queue");
-        let cb = CommandBuffer::new(queue.commandBuffer().unwrap());
+        // SAFETY: fresh Apple queue buffer, one importing family, host-only
+        // binding fixture. Bound resources stay owned through end_encoding;
+        // this test never submits GPU work or uses a native completion shortcut.
+        let cb = unsafe { CommandBuffer::new(queue.commandBuffer().unwrap()) };
         let enc = cb.compute_command_encoder_no_fence().unwrap();
         let before_stale = report().late;
         // SAFETY: the test owns every buffer bound or mapped here and reads its

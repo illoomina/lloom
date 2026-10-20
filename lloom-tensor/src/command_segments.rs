@@ -122,6 +122,20 @@ mod tests {
         }
     }
     #[test]
+    fn feedback_reserve_refusal_precedes_publication_and_next_join_still_works() {
+        assert!(matches!(
+            FeedbackJoin::<usize>::try_new(usize::MAX),
+            Err("segment feedback allocation refused")
+        ));
+        let next = FeedbackJoin::try_new(1).unwrap();
+        assert_eq!(next.remaining.load(Ordering::Acquire), 1);
+        let values = next.publish(0, 17).unwrap().unwrap();
+        assert_eq!(*values[0].get().unwrap(), 17);
+        assert!(next.publish(0, 19).is_err(), "duplicate completed twice");
+        assert_eq!(next.remaining.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
     fn missing_invalid_and_empty_feedback_never_complete() {
         assert!(FeedbackJoin::<usize>::try_new(0).is_err());
         let join = FeedbackJoin::try_new(2).unwrap();

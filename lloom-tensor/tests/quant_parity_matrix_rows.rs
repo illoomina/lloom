@@ -5,8 +5,7 @@
 //! have this binary.
 #![cfg(feature = "metal")]
 
-#[path = "quant_parity/mod.rs"]
-mod quant_parity;
+use super::quant_parity;
 
 use lloom_tensor::{Device, Result};
 use quant_parity::{Entry, Matrix};

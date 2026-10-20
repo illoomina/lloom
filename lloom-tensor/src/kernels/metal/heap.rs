@@ -83,6 +83,10 @@ struct HeapAnchor {
 unsafe impl Send for HeapAnchor {}
 unsafe impl Sync for HeapAnchor {}
 
+#[expect(
+    clippy::large_enum_variant,
+    reason = "Keep the speculative heap raw-before-ticket custody inline; Box storage needs separate admission."
+)]
 enum NewHeap {
     Admitted(allocation_admission::StagedAllocation<Retained<ProtocolObject<dyn MTLHeap>>>),
     Legacy(Retained<ProtocolObject<dyn MTLHeap>>),

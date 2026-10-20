@@ -60,6 +60,16 @@ impl<C, R> Current<C, R> {
         Ok(Some(receipt))
     }
 
+    /// Swap `next` in for a recording that leaves unsubmitted (held back
+    /// until its input is produced, `Commands::commit_when_produced`). A
+    /// submitted buffer keeps its receipt: `next` comes back unused.
+    pub fn replace_recording(&mut self, next: C) -> Result<C, C> {
+        if self.receipt.is_some() {
+            return Err(next);
+        }
+        Ok(std::mem::replace(&mut self.buffer, next))
+    }
+
     pub fn replace_submitted<E>(
         &mut self,
         create: impl FnOnce() -> Result<C, E>,

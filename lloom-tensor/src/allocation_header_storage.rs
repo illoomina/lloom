@@ -284,15 +284,16 @@ mod tests {
         storage.inventory().publish_cleanup(authority).unwrap();
         let authority = storage.inventory().claim_cleanup().unwrap().unwrap();
         assert_eq!(authority.index(), index);
-        // SAFETY: sole service-claimed DETACHING authority, no strong references.
-        let payload = unsafe { storage.take(index) }.unwrap();
-        assert_eq!(payload, Wide([17; 8]));
-        // SAFETY: same exclusive authority still held; cell is already empty.
-        assert_eq!(
-            unsafe { storage.take(index) },
-            Err(HeaderStorageError::Empty)
-        );
-        drop(payload);
+        {
+            // SAFETY: sole service-claimed DETACHING authority, no strong references.
+            let payload = unsafe { storage.take(index) }.unwrap();
+            assert_eq!(payload, Wide([17; 8]));
+            // SAFETY: same exclusive authority still held; cell is already empty.
+            assert_eq!(
+                unsafe { storage.take(index) },
+                Err(HeaderStorageError::Empty)
+            );
+        }
         storage.inventory().detached(authority).unwrap();
         assert_eq!(storage.inventory().available(), 3);
         drop(storage);

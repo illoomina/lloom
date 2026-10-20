@@ -1,16 +1,20 @@
 //! `MTLIOCommandQueue` loads — file bytes straight into a device buffer as
-//! GPU-queued commands, ordered against the compute stream by shared events
+//! queued commands, ordered against the compute stream by shared events
 //! (`design/docs/expert-streaming.md` §20.4a, candidate B).
 //!
 //! A load is issued on the IO queue and never waited for on the host. The
-//! compute command buffer signals `ev_compute` after everything it has encoded
-//! so far (the slot's earlier readers), the IO command buffer waits for that,
-//! loads, and signals `ev_io`; the compute buffer then waits for `ev_io` before
-//! its next dispatch. Both queues are in-order, so one monotone value per
-//! `load_ordered` call serialises the whole exchange. No `waitUntilCompleted`
-//! anywhere on this path — the GPU does the waiting.
+//! compute stream signals `ev_compute` after everything it has encoded so far
+//! (the slot's earlier readers), and the IO command buffer waits for that — a
+//! signal the GPU produces, committed before the IO buffer is
+//! (`Commands::commit_io_after`) — then loads and signals `ev_io`. The compute
+//! work that reads the loaded bytes does not wait for `ev_io` on the GPU: it
+//! is recorded as before and committed once the event has reached the load's
+//! value (`Commands::commit_when_produced`), by the event's own notification
+//! (`docs/invariants.md` §15.1q). Both queues are in-order, so one monotone
+//! value per `load_ordered` call serialises the whole exchange. No
+//! `waitUntilCompleted` on this path.
 
-use super::{Buffer, Commands, Device};
+use super::{Buffer, Commands, Device, HostInputArm};
 use crate::kernels::MetalKernelError;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
@@ -179,10 +183,13 @@ impl IoQueue {
 
     /// One IO command buffer over `loads`: waits for the compute signal
     /// `compute_value`, loads, signals lane `lane` with its next value
-    /// (returned), commits. Caller has validated the ENTIRE batch before any
-    /// lane is submitted; this method performs no fallible range discovery.
+    /// (returned), committed once that signal is (`Commands::commit_io_after`).
+    /// Caller has validated the ENTIRE batch before any lane is submitted; this
+    /// method performs no fallible range discovery.
     fn commit_lane(
         &self,
+        commands: &Commands,
+        gpu_wait: bool,
         lane: usize,
         compute_value: u64,
         loads: &[IoLoad<'_>],
@@ -206,7 +213,13 @@ impl IoQueue {
             total += l.len as u64;
         }
         cb.signalEvent_value(ev, value);
-        cb.commit();
+        if gpu_wait {
+            // The control arm: the signal's buffer was committed by the
+            // caller's flush, before the first lane.
+            cb.commit();
+        } else {
+            commands.commit_io_after(&cb, &self.ev_compute, compute_value)?;
+        }
         self.loads.fetch_add(loads.len() as u64, Ordering::Relaxed);
         self.bytes.fetch_add(total, Ordering::Relaxed);
         Ok(value)
@@ -261,19 +274,23 @@ impl IoQueue {
         validate_loads(loads)?;
         // The compute signal, committed before any IO buffer waits on it
         // (see `issue`); then one IO buffer per lane, the loads dealt round
-        // robin; then a compute wait per lane.
+        // robin; then the compute work behind every lane's load.
         let compute_value = self.next_compute();
         commands.encode_signal_event(&self.ev_compute, compute_value)?;
-        commands.flush_marker()?;
+        let gpu_wait = commands.host_input_arm() == HostInputArm::GpuWait;
+        if gpu_wait {
+            commands.flush_marker()?;
+        }
         let per_lane = loads.len().div_ceil(n_lanes);
         let mut waits = Vec::with_capacity(n_lanes);
         for (lane, chunk) in loads.chunks(per_lane).enumerate() {
-            let value = self.commit_lane(lane, compute_value, chunk)?;
+            let value = self.commit_lane(commands, gpu_wait, lane, compute_value, chunk)?;
             waits.push((lane, value));
         }
         for (lane, value) in waits {
             let (ev, _) = self.lane(lane);
-            commands.encode_wait_for_event(ev, value)?;
+            commands.commit_when_produced(ev, value)?;
+            commands.notify_produced_at(ev, value)?;
         }
         Ok(())
     }
@@ -303,13 +320,12 @@ impl IoQueue {
         let value = self.next.fetch_add(1, Ordering::AcqRel) + 1;
         let compute_value = self.next_compute();
         commands.encode_signal_event(&self.ev_compute, compute_value)?;
-        // Commit the compute buffer carrying the signal BEFORE the IO buffer
-        // is committed: the IO buffer waits for a signal that runs only once
-        // its buffer is committed, and the loads sit pending until then —
-        // with their bytes, which the IO queue holds on the device while
-        // they wait (measured: a 16 624-expert warm left 35 GB allocated at
-        // load beside the 33.75 GB of the pools, #749 P26).
-        commands.flush_marker()?;
+        // The compute buffer carrying the signal is committed BEFORE the IO
+        // buffer (`commit_io_after` below): the IO buffer waits for a signal
+        // that runs only once its buffer is committed, and the loads sit
+        // pending until then — with their bytes, which the IO queue holds on
+        // the device while they wait (measured: a 16 624-expert warm left
+        // 35 GB allocated at load beside the 33.75 GB of the pools, #749 P26).
         let cb = self.queue.commandBuffer();
         cb.waitForEvent_value(&self.ev_compute, compute_value);
         let mut total = 0u64;
@@ -331,7 +347,7 @@ impl IoQueue {
             total += l.len as u64;
         }
         cb.signalEvent_value(&self.ev_io, value);
-        cb.commit();
+        commands.commit_io_after(&cb, &self.ev_compute, compute_value)?;
         self.loads.fetch_add(loads.len() as u64, Ordering::Relaxed);
         self.bytes.fetch_add(total, Ordering::Relaxed);
         Ok(value)
@@ -351,11 +367,13 @@ impl IoQueue {
         while !self.ev_io.waitUntilSignaledValue_timeoutMS(value, 1_000) {}
     }
 
-    /// The second half: every command `commands` encodes from here on waits
-    /// for the loads [`Self::issue`] returned `value` for. The IO queue is
-    /// in order, so waiting for the largest value of a set covers the set.
+    /// The second half: every command `commands` encodes from here on is
+    /// committed once the loads [`Self::issue`] returned `value` for have
+    /// landed — by `ev_io`'s notification at that value, not by a GPU wait.
+    /// The IO queue is in order, so the largest value of a set covers the set.
     pub fn await_value(&self, commands: &Commands, value: u64) -> Result<(), MetalKernelError> {
-        commands.encode_wait_for_event(&self.ev_io, value)
+        commands.commit_when_produced(&self.ev_io, value)?;
+        commands.notify_produced_at(&self.ev_io, value)
     }
 
     /// The largest `ev_io` value landed so far (a host read of the shared

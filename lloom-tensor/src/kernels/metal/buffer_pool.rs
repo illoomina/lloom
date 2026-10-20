@@ -1631,7 +1631,6 @@ impl std::error::Error for ResidualExceeded {}
 
 /// A buffer waiting for the GPU to finish with it, in the node its handles
 /// shared (the node's `size` is the bucket it returns to).
-
 /// The free buffers of one size, newest last.
 #[derive(Default)]
 struct Bucket {
@@ -2908,7 +2907,7 @@ impl BufferPool {
             .iter()
             .map(|(&size, bucket)| (size, bucket.nodes.len()))
             .collect();
-        classes.sort_by(|a, b| (b.0 * b.1).cmp(&(a.0 * a.1)));
+        classes.sort_by_key(|&(size, count)| std::cmp::Reverse(size * count));
         FreeSummary {
             bytes: state.free_bytes,
             buffers: classes.iter().map(|c| c.1).sum(),
@@ -5487,7 +5486,7 @@ mod contention_tests {
         let (done, is_done) = mpsc::channel::<()>();
         dev.commands().on_command_buffer_complete(move || {
             let _ = done.send(());
-        });
+        }).unwrap();
 
         let b = dev.allocate_buffer(4096).expect("allocation");
         {

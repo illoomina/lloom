@@ -854,6 +854,10 @@ mod tests {
         let pass = a.reserve(8).unwrap();
         let context = pass.context();
         let ticket = context.take(4).unwrap();
+        #[expect(
+            clippy::mutable_key_type,
+            reason = "DomainKey hashes and compares only retained immutable allocation identity, not mutable account state"
+        )]
         let mut keys = std::collections::HashSet::new();
         keys.insert(key.clone());
         keys.insert(context.domain_key());

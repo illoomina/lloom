@@ -3,7 +3,7 @@ use super::{
 };
 use objc2::{rc::Retained, runtime::ProtocolObject};
 use objc2_foundation::NSString;
-use objc2_metal::{MTL4CommandQueue, MTLCommandBuffer, MTLCommandBufferStatus, MTLDispatchType};
+use objc2_metal::{MTLCommandBuffer, MTLCommandBufferStatus, MTLDispatchType};
 use std::borrow::Cow;
 use std::sync::Arc;
 
@@ -104,12 +104,27 @@ impl Drop for RecordingAdmission<'_> {
     }
 }
 impl PreparedCommandCommit<'_> {
-    /// Flag this commit for its queue's completion hook (`completion_hook.rs`).
-    /// Only queue-associated buffers have one; a standalone buffer refuses.
-    pub(super) fn run_completion_hook(&self) -> Result<(), crate::kernels::MetalKernelError> {
+    #[cfg(test)]
+    pub(super) fn test_submission_control(
+        &mut self,
+        control: Arc<super::commands::submission_test::Control>,
+    ) {
+        match self.native.as_mut().expect("prepared native") {
+            PreparedNative::Metal3Associated(prepared) => prepared.test_control = Some(control),
+            PreparedNative::Metal4(prepared) => prepared.test_control = Some(control),
+            PreparedNative::Metal3(_) => panic!("owner fixture requires associated native work"),
+        }
+    }
+    /// Flag this commit for its queue's completion hook (`completion_hook.rs`),
+    /// completing `runs` epochs. Only queue-associated buffers have one; a
+    /// standalone buffer refuses.
+    pub(super) fn run_completion_hook(
+        &self,
+        runs: u32,
+    ) -> Result<(), crate::kernels::MetalKernelError> {
         match &self.native {
-            Some(PreparedNative::Metal3Associated(prepared)) => prepared.run_hook(),
-            Some(PreparedNative::Metal4(prepared)) => prepared.run_hook(),
+            Some(PreparedNative::Metal3Associated(prepared)) => prepared.run_hook(runs),
+            Some(PreparedNative::Metal4(prepared)) => prepared.run_hook(runs),
             Some(PreparedNative::Metal3(_)) | None => {
                 Err(crate::kernels::MetalKernelError::QueueUnavailable(
                     "a standalone command buffer has no completion hook",
@@ -359,6 +374,29 @@ unsafe impl Send for CommandBuffer {}
 unsafe impl Sync for CommandBuffer {}
 
 impl CommandBuffer {
+    pub(super) fn same_recording(&self, other: &Self) -> bool {
+        std::ptr::eq(self.lifecycle(), other.lifecycle())
+    }
+
+    #[cfg(test)]
+    pub(super) fn test_direct_native_commit(&self) -> Result<(), crate::kernels::MetalKernelError> {
+        match &self.backend {
+            Backend::Metal3Associated(buffer) => buffer.try_commit(),
+            Backend::Metal4(submission) => submission.commit(),
+            Backend::Metal3(_) => self.commit(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn test_direct_native_prepare(
+        &self,
+    ) -> Result<(), crate::kernels::MetalKernelError> {
+        match &self.backend {
+            Backend::Metal3Associated(buffer) => buffer.prepare_commit().map(|_| ()),
+            Backend::Metal4(submission) => submission.prepare_commit().map(|_| ()),
+            Backend::Metal3(_) => self.prepare_commit().map(|_| ()),
+        }
+    }
     pub(super) fn binding_generation(
         &self,
     ) -> Result<
@@ -452,23 +490,35 @@ impl CommandBuffer {
     pub(super) fn prepare_commit(
         &self,
     ) -> Result<PreparedCommandCommit<'_>, crate::kernels::MetalKernelError> {
-        self.prepare_commit_mode(false)
+        self.prepare_commit_mode(false, None)
     }
 
-    /// Sole host-retirement worker: an unused preparation restores recording
-    /// without waking itself. Normal producers wait on native-order mutexes;
-    /// unsubmitted logical waits refuse rather than parking on PREPARED.
-    /// Native return, error unwind and all public admissions retain notification.
-    pub(super) fn try_prepare_commit(
-        &self,
-    ) -> Result<PreparedCommandCommit<'_>, crate::kernels::MetalKernelError> {
-        self.prepare_commit_mode(true)
+    /// Consume the exact owner authority. Nonblocking final retirement restores
+    /// an unused preparation without waking itself; normal producers preserve
+    /// existing native-order and lifecycle admissions.
+    pub(super) fn prepare_owned_commit<'a>(
+        &'a self,
+        authority: super::commands::OwnerSubmission<'a>,
+        nonblocking: bool,
+    ) -> Result<PreparedCommandCommit<'a>, crate::kernels::MetalKernelError> {
+        if !authority.authorizes(self) {
+            return Err(crate::kernels::MetalKernelError::OwnerSubmissionRequired);
+        }
+        self.prepare_commit_mode(nonblocking, Some(&authority))
     }
 
     fn prepare_commit_mode(
         &self,
         nonblocking: bool,
+        authority: Option<&super::commands::OwnerSubmission<'_>>,
     ) -> Result<PreparedCommandCommit<'_>, crate::kernels::MetalKernelError> {
+        if let Ok(generation) = self.binding_generation() {
+            if !authority.is_some_and(|owner| {
+                owner.authorizes(self) && owner.authorizes_generation(generation)
+            }) {
+                return Err(crate::kernels::MetalKernelError::OwnerSubmissionRequired);
+            }
+        }
         self.check_lifecycle_failure()?;
         let admission = RecordingAdmission {
             buffer: self,
@@ -487,11 +537,11 @@ impl CommandBuffer {
                 }
                 PreparedNative::Metal3(raw)
             }
-            Backend::Metal3Associated(buffer) => {
-                PreparedNative::Metal3Associated(buffer.prepare_commit_mode(nonblocking)?)
-            }
+            Backend::Metal3Associated(buffer) => PreparedNative::Metal3Associated(
+                buffer.prepare_commit_mode(nonblocking, authority)?,
+            ),
             Backend::Metal4(submission) => {
-                PreparedNative::Metal4(submission.prepare_commit_mode(nonblocking)?)
+                PreparedNative::Metal4(submission.prepare_commit_mode(nonblocking, authority)?)
             }
         };
         Ok(PreparedCommandCommit {
@@ -500,7 +550,26 @@ impl CommandBuffer {
         })
     }
 
-    pub fn new(raw: Retained<ProtocolObject<dyn MTLCommandBuffer>>) -> Self {
+    /// Import a native Metal 3 command buffer without engine submission tracking.
+    /// Clones share one wrapper-family lifecycle; independent imports do not.
+    ///
+    /// # Safety
+    ///
+    /// `raw` must be an Apple Metal command buffer, or an implementation whose
+    /// native threading, callback and final-release contracts the caller has
+    /// independently established. Import it into only one authoritative wrapper
+    /// family. External aliases must not concurrently encode, mutate, end or
+    /// submit its recording; coordinate any external submission before import or
+    /// after this family's recording has ended. Only operations permitted by the
+    /// native object's documented thread/phase contract may be performed.
+    ///
+    /// Keep native parents and all resources needed by previously encoded work
+    /// alive through their actual native use, including resources not retained
+    /// by an unretained-reference buffer. An imported active encoder must end
+    /// before creating another encoder or submitting. Neither this import nor
+    /// native terminal status establishes engine teardown/callback quiescence.
+    /// This boundary does not itself prove unrestricted native Send/Sync.
+    pub unsafe fn new(raw: Retained<ProtocolObject<dyn MTLCommandBuffer>>) -> Self {
         Self {
             backend: Backend::Metal3(Arc::new(Standalone {
                 raw,
@@ -744,12 +813,57 @@ impl CommandBuffer {
                 "blit encoder".into(),
             ));
         };
-        Ok(
-            BlitCommandEncoder::new(raw, Arc::clone(fence), Arc::clone(prev_ce_outputs))
-                .with_recording(admission),
+        // SAFETY: this exact buffer created the encoder under EncoderAdmission.
+        // No raw alias escaped; with_recording attaches the parent-owning lease
+        // before return, so the encoder ends before another recording can enter.
+        let encoder =
+            unsafe { BlitCommandEncoder::new(raw, Arc::clone(fence), Arc::clone(prev_ce_outputs)) };
+        Ok(encoder.with_recording(admission))
+    }
+
+    /// Abandon a queue-associated recording before submission, whoever else
+    /// holds a handle to it (`Commands::cancel_produced`). `false` when it was
+    /// already submitted or abandoned; a standalone buffer refuses.
+    pub(super) fn cancel_unsubmitted(&self) -> Result<bool, crate::kernels::MetalKernelError> {
+        if let Backend::Metal3(_) = &self.backend {
+            return Err(crate::kernels::MetalKernelError::QueueUnavailable(
+                "a standalone command buffer has no owner to cancel it",
+            ));
+        }
+        // PREPARED excludes every encoder and edit; ABANDONED then refuses
+        // every later admission, and a waiter reads it as the cancellation.
+        let mut ticket = match self.lifecycle().prepare() {
+            Ok(ticket) => ticket,
+            Err(crate::command_lifecycle::LifecycleError::Abandoned) => return Ok(false),
+            Err(reason) => return Err(lifecycle_error(reason)),
+        };
+        let native = match &self.backend {
+            Backend::Metal4(submission) => submission.abandon_unsubmitted(),
+            Backend::Metal3Associated(buffer) => Ok(buffer.abandon_unsubmitted()),
+            Backend::Metal3(_) => unreachable!("refused above"),
+        };
+        let closed = self
+            .lifecycle()
+            .abandon(&mut ticket)
+            .map_err(lifecycle_error);
+        self.notify_lifecycle();
+        let abandoned = native?;
+        closed?;
+        Ok(abandoned)
+    }
+
+    /// Whether this recording was abandoned before submission
+    /// (`cancel_unsubmitted`): a wait on it can never complete.
+    pub(super) fn abandoned(&self) -> bool {
+        matches!(
+            self.lifecycle().check_wait_submission(),
+            Err(crate::command_lifecycle::LifecycleError::Abandoned)
         )
     }
 
+    /// Submit a standalone interoperability buffer. Bound engine recordings
+    /// refuse before lifecycle, hook, epoch, residency or native effects; use
+    /// the owning Commands flush/marker/wait API for those recordings.
     pub fn commit(&self) -> Result<(), crate::kernels::MetalKernelError> {
         self.prepare_commit()?.commit()
     }

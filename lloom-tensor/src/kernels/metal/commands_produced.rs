@@ -183,8 +183,6 @@ pub(super) enum AfterCommit {
     },
 }
 
-/// A recording closed at a cut while an input it reads, or one a recording
-/// ahead of it reads, was not yet produced.
 /// Fill `spare` with an emptied after-commit list for every recording the
 /// held queue can hold and the current one, each with room for a
 /// point-of-use batch's IO buffers: built once, with the queue.
@@ -209,6 +207,8 @@ fn recycle_after(spare: &mut Vec<Vec<AfterCommit>>, mut list: Vec<AfterCommit>) 
     }
 }
 
+/// A recording closed at a cut while an input it reads, or one a recording
+/// ahead of it reads, was not yet produced.
 pub(super) struct Held {
     pub(super) cb: CommandBuffer,
     pub(super) gate: Gate,

@@ -114,13 +114,25 @@ fn run_prefill_gemm(m: usize, n: usize, k: usize, reps: usize) -> Result<f64> {
     let kernels = lloom_tensor::kernels::Kernels::new();
     let residency_set = std::sync::Arc::new(ResidencySet::new(&device));
     let options = RESOURCE_OPTIONS;
-    let lhs: Vec<f16> = (0..m * k).map(|i| f16::from_f32(((i % 97) as f32 - 48.0) / 512.0)).collect();
-    let rhs: Vec<f16> = (0..n * k).map(|i| f16::from_f32(((i % 89) as f32 - 44.0) / 512.0)).collect();
+    let lhs: Vec<f16> = (0..m * k)
+        .map(|i| f16::from_f32(((i % 97) as f32 - 48.0) / 512.0))
+        .collect();
+    let rhs: Vec<f16> = (0..n * k)
+        .map(|i| f16::from_f32(((i % 89) as f32 - 44.0) / 512.0))
+        .collect();
     let lhs = device
-        .new_buffer_with_data(lhs.as_ptr() as *const core::ffi::c_void, std::mem::size_of_val(&lhs[..]), options)
+        .new_buffer_with_data(
+            lhs.as_ptr() as *const core::ffi::c_void,
+            std::mem::size_of_val(&lhs[..]),
+            options,
+        )
         .unwrap();
     let rhs = device
-        .new_buffer_with_data(rhs.as_ptr() as *const core::ffi::c_void, std::mem::size_of_val(&rhs[..]), options)
+        .new_buffer_with_data(
+            rhs.as_ptr() as *const core::ffi::c_void,
+            std::mem::size_of_val(&rhs[..]),
+            options,
+        )
         .unwrap();
     let output = device.new_buffer(m * n * 2, options).unwrap();
     let mut best = f64::MAX;
@@ -134,8 +146,18 @@ fn run_prefill_gemm(m: usize, n: usize, k: usize, reps: usize) -> Result<f64> {
             // of them before the command buffer that writes them completes.
             unsafe {
                 lloom_tensor::kernels::call_mlx_gemm(
-                    &device, &encoder, &kernels, GemmDType::F16, (1, m, n, k),
-                    &[m * k, k, 1], 0, &lhs, &[n * k, 1, k], 0, &rhs, &output,
+                    &device,
+                    &encoder,
+                    &kernels,
+                    GemmDType::F16,
+                    (1, m, n, k),
+                    &[m * k, k, 1],
+                    0,
+                    &lhs,
+                    &[n * k, 1, k],
+                    0,
+                    &rhs,
+                    &output,
                 )
             }?;
         }

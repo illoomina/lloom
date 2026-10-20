@@ -19,7 +19,9 @@ use crate::{
 use objc2::{rc::Retained, runtime::ProtocolObject};
 use objc2_metal::MTLBuffer;
 use parking_lot::Mutex;
-use std::sync::{Arc, Weak};
+use std::sync::Arc;
+#[cfg(test)]
+use std::sync::Weak;
 
 // C contains namespace cache/recorder containers and arbitrary destruction. A remains
 // independently rooted if any C destructor unwinds; never put these containers
@@ -68,12 +70,15 @@ pub(crate) struct NamespaceOwner(MetadataStrong);
 /// Weak identity memo only. It cannot keep a namespace payload alive and cannot
 /// confuse reused addresses: its Weak keeps the old Arc allocation distinct.
 /// EntryState resets it only after successful replacement, not receipt or Err.
+#[cfg(test)]
 pub(crate) struct GenerationMemo<T>(Option<Weak<T>>);
+#[cfg(test)]
 impl<T> Default for GenerationMemo<T> {
     fn default() -> Self {
         Self(None)
     }
 }
+#[cfg(test)]
 impl<T> GenerationMemo<T> {
     fn contains(&self, owner: &Arc<T>) -> bool {
         self.0
@@ -124,7 +129,8 @@ impl NamespaceOwner {
     }
 }
 
-// Production and scalar controls share the actual C/A registration boundary.
+// Scalar fake-registry helper; production DeviceTeardown uses reserve_in below.
+#[cfg(test)]
 fn register_root<C: Send + Sync + 'static, A: Send + Sync + 'static>(
     registry: &HostAnchorRegistry<C, A>,
     captures: C,

@@ -3538,10 +3538,10 @@ mod tests {
 
         // Reading one entry many times must also agree -- the lookup is a read
         // of immutable state, so it cannot consume anything.
-        for i in 0..n {
+        for (i, expected) in forward.iter().enumerate() {
             assert_eq!(
                 plan.slot_of(i),
-                forward[i],
+                *expected,
                 "ordinal {i} resolves differently on a second read"
             );
         }

@@ -134,10 +134,18 @@ pub fn join_device_retirement(deadline: Instant) -> DeviceRetirementReport {
 /// their accounting owners; dropping it can release a final machine Holding.
 /// This type does not schedule cleanup and does not delay native commit.
 #[must_use = "published custody must leave outer caller locks before destruction"]
-pub(crate) struct PublishedRemovals(Vec<ResidencyLease>);
+pub(crate) struct PublishedRemovals {
+    _leases: Vec<ResidencyLease>,
+}
 impl PublishedRemovals {
+    /// Omission mutants only: no publication or ownership is manufactured.
+    /// Their prerequisite observer must refuse before epoch/native entry.
+    #[cfg(test)]
+    pub(crate) fn empty_for_test() -> Self {
+        Self { _leases: Vec::new() }
+    }
     pub(crate) fn is_empty(&self) -> bool {
-        self.0.is_empty()
+        self._leases.is_empty()
     }
 }
 // SAFETY: leases contain only engine-created thread-safe Metal Buffer/Heap
@@ -571,11 +579,11 @@ impl ResidencySet {
     /// nothing. The returned wrapper must follow host cleanup custody.
     pub(crate) fn commit_pending_extracted(&self) -> (bool, PublishedRemovals) {
         let Some(set) = &self.raw else {
-            return (false, PublishedRemovals(Vec::new()));
+            return (false, PublishedRemovals { _leases: Vec::new() });
         };
         // The steady state — nothing staged — never takes the lock.
         if !self.dirty.load(Ordering::Acquire) {
-            return (false, PublishedRemovals(Vec::new()));
+            return (false, PublishedRemovals { _leases: Vec::new() });
         }
         // Under `members`, as every other `commit` here is: a commit applies
         // the set's pending adds AND removes, and two threads applying the same
@@ -597,7 +605,7 @@ impl ResidencySet {
             Vec::new()
         };
         drop(members);
-        (committed, PublishedRemovals(released))
+        (committed, PublishedRemovals { _leases: released })
     }
 
     /// Nonblocking HOST membership acquisition for final lifecycle polling.
@@ -612,10 +620,10 @@ impl ResidencySet {
         &self,
     ) -> Result<(bool, PublishedRemovals), ResidencyBusy> {
         let Some(set) = &self.raw else {
-            return Ok((false, PublishedRemovals(Vec::new())));
+            return Ok((false, PublishedRemovals { _leases: Vec::new() }));
         };
         if !self.dirty.load(Ordering::Acquire) {
-            return Ok((false, PublishedRemovals(Vec::new())));
+            return Ok((false, PublishedRemovals { _leases: Vec::new() }));
         }
         let mut members = self.members.try_lock().ok_or(ResidencyBusy)?;
         let committed = self.dirty.load(Ordering::Relaxed);
@@ -625,7 +633,7 @@ impl ResidencySet {
             Vec::new()
         };
         drop(members);
-        Ok((committed, PublishedRemovals(released)))
+        Ok((committed, PublishedRemovals { _leases: released }))
     }
 
     /// Adds multiple buffers in a single commit.
@@ -835,7 +843,7 @@ impl ResidencySet {
         allocations: impl IntoIterator<Item = &'a ProtocolObject<dyn MTLAllocation>>,
     ) -> PublishedRemovals {
         let Some(set) = &self.raw else {
-            return PublishedRemovals(Vec::new());
+            return PublishedRemovals { _leases: Vec::new() };
         };
         let mut members = self.members.lock();
         let mut removed = 0usize;
@@ -853,7 +861,7 @@ impl ResidencySet {
             Vec::new()
         };
         drop(members);
-        PublishedRemovals(released)
+        PublishedRemovals { _leases: released }
     }
 
     /// Empties the set, in one commit.

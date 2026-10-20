@@ -315,7 +315,7 @@ mod tests {
         let mib = 1usize << 20;
         let kv = row(1, Class::Capability, 64 * mib, 136 * mib, 4 * mib);
         let experts = row(2, Class::Cache, 80 * mib, 400 * mib, 8 * mib);
-        let scratch = row(3, Class::Scratch, 0, 32 * mib, 1 * mib);
+        let scratch = row(3, Class::Scratch, 0, 32 * mib, mib);
         // 1. The floors alone exceed the quota: refused with the arithmetic.
         assert_eq!(
             arbitrate(100 * mib, &[kv.clone(), experts.clone()]),

@@ -1173,7 +1173,7 @@ impl FeedLink {
         #[cfg(feature = "metal")]
         {
             let v = self.base + k;
-            self.ring.encode_wait(v)?;
+            self.ring.commit_when_produced(v)?;
             // The producer may be parked: a forward now waits on value `k`, so
             // its token is imminent.
             self.wake_for_demand();

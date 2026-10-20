@@ -2,9 +2,10 @@
 //! allowed to complete, against the activation class admission charges it
 //! (`admission::prefill_activation_bytes_at`, `memory.md` §9.5d).
 //!
-//! The GPU waits on a shared event encoded before the forward, so every
-//! buffer the forward releases stays pending and none is reused: `live +
-//! pending` grows by what the forward acquired. What stays live once it
+//! The forward's commands are committed only once a host-raised event
+//! reaches its value (`HostEvent::commit_when_produced`), so nothing it
+//! encodes completes, every buffer it releases stays pending and none is
+//! reused: `live + pending` grows by what the forward acquired. What stays live once it
 //! completes (the KV slab, the conv state) is the sequence's state, not the
 //! pass's, and is taken off. The fused arm's class is linear in the pass's
 //! positions, so two pass lengths difference the per-forward constants away
@@ -117,7 +118,7 @@ fn held_pass<Q: Profile>(cfg: &Config, prefix: usize, positions: usize) -> Resul
     let before = held_bytes(m);
     let before_live = live_bytes(m);
     let gate = Arc::new(HostEvent::new(m)?);
-    gate.encode_wait(1)?;
+    gate.commit_when_produced(1)?;
     let held_epoch = clock.current_epoch();
     let done = Arc::new(AtomicBool::new(false));
     let timed_out = Arc::new(AtomicBool::new(false));

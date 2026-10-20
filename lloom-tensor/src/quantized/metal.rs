@@ -218,12 +218,12 @@ impl QMetalStorage {
             .with_data(&out)
             .with_label("qstorage_dequantized")
             .build()?;
-        Ok(MetalStorage::new_allocated(
+        MetalStorage::new_allocated(
             buffer,
             self.device.clone(),
             elem_count,
             DType::F32,
-        )?)
+        )
     }
 
     pub fn quantize(&mut self, src: &MetalStorage) -> Result<()> {
@@ -380,12 +380,12 @@ impl QMetalStorage {
             )
         }
         .map_err(MetalError::from)?;
-        Ok(MetalStorage::new_allocated(
+        MetalStorage::new_allocated(
             dst,
             device.clone(),
             ids_len * hidden,
             DType::F32,
-        )?)
+        )
     }
 
     /// Rows up to which a quantized matmul runs the matmul-vec kernel over
@@ -1096,12 +1096,12 @@ impl QMetalStorage {
                     )
                 }
                 .map_err(MetalError::from)?;
-                Ok(MetalStorage::new_allocated(
+                MetalStorage::new_allocated(
                     dst,
                     device.clone(),
                     shape.elem_count(),
                     store_dtype,
-                )?)
+                )
             };
         let Some(grid) = order.grid() else {
             let shape = Shape::from((batch, topk, n));

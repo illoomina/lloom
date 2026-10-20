@@ -493,6 +493,9 @@ impl Drop for Generation {
     }
 }
 impl GenerationBindings {
+    pub(super) fn belongs_to_clock(&self, clock: &Arc<GpuClock>) -> bool {
+        Arc::ptr_eq(&self.head.captures().witness.captures().clock, clock)
+    }
     pub(super) fn try_clone(&self) -> Result<Self, MetalKernelError> {
         metadata(self.head.try_clone()).map(|head| Self { head })
     }
@@ -509,25 +512,13 @@ impl GenerationBindings {
     pub(super) fn stage_epoch(&self, epoch: Epoch) -> Result<(), MetalKernelError> {
         metadata(self.head.captures().witness.captures().stage_epoch(epoch))
     }
-    // Used by direct public CommandBuffer::commit too. Commands staged its
-    // exact epoch first; direct same-queue commit reserves only if still OPEN.
-    // Existing native prepared order/admission excludes competing staging.
-    // A commit that takes its own epoch runs `before_epoch` first: the
-    // queue's completion hook must count every epoch taken on this clock
-    // (`completion_hook.rs`). A refusal after the epoch quarantines.
-    pub(super) fn ensure_staged(
-        &self,
-        before_epoch: impl FnOnce() -> Result<(), MetalKernelError>,
-    ) -> Result<(), MetalKernelError> {
+    /// Native entry may only consume the exact epoch staged by its owner.
+    /// Missing owner preparation cannot be recovered by taking another epoch.
+    pub(super) fn require_staged(&self) -> Result<(), MetalKernelError> {
         let witness = self.head.captures().witness.captures();
         match witness.phase.load(Ordering::Acquire) {
-            OPEN => {
-                before_epoch()?;
-                metadata(witness.stage_epoch(witness.clock.commit_epoch()))
-                    .inspect_err(|_| self.quarantine(Failure::AdapterFailed))
-            }
             STAGED => Ok(()),
-            _ => Err(refused("native binding generation not stageable")),
+            _ => Err(MetalKernelError::OwnerSubmissionRequired),
         }
     }
     /// M3 ordered record drain only, after ALL arbitrary callbacks returned.
@@ -552,8 +543,8 @@ impl GenerationBindings {
         let witness = self.head.captures().witness.captures();
         metadata(unsafe { witness.terminal_submitted() })?;
         // M4 caller supplies ordered callback-prefix + returned-handoff proof.
-        // This also covers direct public commit lacking Commands' clock callback;
-        // Commands' earlier mark_completed of the same exact epoch is idempotent.
+        // The owner hook's earlier mark of this exact epoch is idempotent with
+        // native terminal publication; terminality does not replace the hook.
         witness
             .clock
             .mark_completed(Epoch(witness.closed_epoch.load(Ordering::Relaxed)));
@@ -1365,53 +1356,87 @@ mod inventory_controls {
             ))
         })
     }
-    /// A commit Commands did not stage takes its own epoch, and runs
-    /// `before_epoch` first and only then: the queue's completion hook counts
-    /// every epoch taken on its clock (`completion_hook.rs`). A refusal there
-    /// takes no epoch; a staged generation takes none and runs nothing.
-    /// Absolute references: the clock's epoch before, inside and after.
+    /// Actual counted heads and creator clocks, with no native object/entry.
+    /// Queue equality alone cannot substitute for exact generation identity.
     #[test]
-    fn a_direct_commit_flags_before_it_takes_its_own_epoch_and_only_then() {
+    fn generation_identity_distinguishes_clones_same_clock_and_foreign_banks() {
+        let (first_bank, first_service, first_domain) = bank(1);
+        let (other_bank, other_service, other_domain) = bank(1);
+        let first = prepare(&first_bank, &first_service).unwrap();
+        let successor = prepare(&first_bank, &first_service).unwrap();
+        let foreign = prepare(&other_bank, &other_service).unwrap();
+        let a = first.constructor_head().unwrap();
+        let clone = a.try_clone().unwrap();
+        let b = successor.constructor_head().unwrap();
+        let c = foreign.constructor_head().unwrap();
+        let first_clock = a.head.captures().witness.captures().clock.clone();
+        let other_clock = c.head.captures().witness.captures().clock.clone();
+        // Clean up genuine preparations/heads before rethrowing any assertion;
+        // an intended identity mutant must not become a destructor abort.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            assert!(a.same(&clone), "a counted head clone lost its generation");
+            assert!(!a.same(&b), "same clock authorized a different generation");
+            assert!(!a.same(&c), "foreign bank authorized a generation");
+            assert!(a.belongs_to_clock(&first_clock));
+            assert!(b.belongs_to_clock(&first_clock));
+            assert!(!a.belongs_to_clock(&other_clock));
+            assert!(!c.belongs_to_clock(&first_clock));
+            assert!(c.belongs_to_clock(&other_clock));
+            assert_eq!(first_clock.current_epoch().0, 0);
+            assert_eq!(other_clock.current_epoch().0, 0);
+        }));
+        drop((first, successor, foreign)); // Actual never-submitted cancellation.
+        drop((a, clone, b, c));
+        drain(&first_service);
+        drain(&other_service);
+        drop((first_bank, other_bank));
+        drain(&first_service);
+        drain(&other_service);
+        if let Err(panic) = result {
+            std::panic::resume_unwind(panic);
+        }
+        assert_eq!(first_domain.snapshot(), AccountSnapshot::default());
+        assert_eq!(other_domain.snapshot(), AccountSnapshot::default());
+    }
+
+    #[test]
+    fn native_entry_requires_owner_staging_without_taking_an_epoch() {
         let (bank, service, domain) = bank(1);
         let prepared = prepare(&bank, &service).unwrap();
         let head = prepared.constructor_head().unwrap();
         let clock = head.head.captures().witness.captures().clock.clone();
-        let refused = head.ensure_staged(|| Err(refused("fixture refusal")));
-        assert!(refused.is_err());
-        assert_eq!(clock.current_epoch().0, 0, "a refused flag took an epoch");
-        let mut flagged_at = None;
-        head.ensure_staged(|| {
-            flagged_at = Some(clock.current_epoch().0);
-            Ok(())
-        })
-        .unwrap();
-        assert_eq!(flagged_at, Some(0), "the flag must precede the epoch");
-        assert_eq!(
-            clock.current_epoch().0,
-            1,
-            "one epoch for one direct commit"
-        );
-        let mut again = false;
-        head.ensure_staged(|| {
-            again = true;
-            Ok(())
-        })
-        .unwrap();
-        assert!(!again, "a staged generation flagged a second time");
-        assert_eq!(
-            clock.current_epoch().0,
-            1,
-            "a staged generation took an epoch"
-        );
-        drop(prepared); // Cancels the unobserved staged epoch's witness.
-        assert!(matches!(
-            head.head.captures().witness.captures().cutoff(),
-            Some(Cutoff::NeverSubmitted)
-        ));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            for _ in 0..2 {
+                assert!(
+                    matches!(
+                        head.require_staged(),
+                        Err(MetalKernelError::OwnerSubmissionRequired)
+                    ),
+                    "unstaged native entry minted its own epoch"
+                );
+                assert_eq!(clock.current_epoch().0, 0);
+            }
+            let epoch = clock.commit_epoch();
+            head.stage_epoch(epoch).unwrap();
+            head.require_staged().unwrap();
+            head.require_staged().unwrap();
+            // Internal staging retains its unused-preparation restage contract.
+            // This is not native entry or a second owner submission capability.
+            head.stage_epoch(epoch).unwrap();
+            assert_eq!(clock.current_epoch().0, 1);
+            drop(prepared);
+            assert!(matches!(
+                head.head.captures().witness.captures().cutoff(),
+                Some(Cutoff::NeverSubmitted)
+            ));
+        }));
         drop(head);
         drain(&service);
         drop(bank);
         drain(&service);
+        if let Err(panic) = result {
+            std::panic::resume_unwind(panic);
+        }
         assert_eq!(domain.snapshot(), AccountSnapshot::default());
     }
     #[test]

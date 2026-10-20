@@ -1314,23 +1314,47 @@ impl ComputeCommandEncoder {
         }
     }
 
-    pub fn new(
+    /// Import an already active native compute encoder and its exact parent.
+    ///
+    /// # Safety
+    ///
+    /// `raw` must be the unique active encoder of `command_buffer`, from Apple
+    /// Metal or a separately audited equivalent native implementation. The
+    /// caller must satisfy [`super::CommandBuffer::new`]'s import obligations.
+    /// Do not independently import or externally encode/end this same encoder
+    /// while this wrapper owns it. Keep its parent and bound resources alive
+    /// through actual native use, including unretained resources through GPU use.
+    /// End encoding successfully before external parent submission; coordinate
+    /// that submission without concurrent wrapper/native access. All operations
+    /// must obey documented native thread/phase rules, including callbacks and
+    /// final release. Importing does not establish engine-tracked ownership.
+    pub unsafe fn new(
         raw: Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>,
         command_buffer: Retained<ProtocolObject<dyn MTLCommandBuffer>>,
         fence: Arc<Fence>,
         prev_ce_outputs: PrevCeOutputs,
     ) -> ComputeCommandEncoder {
-        Self::with_executor(
-            raw,
-            command_buffer,
-            fence,
-            prev_ce_outputs,
-            Arc::new(ExecutorSlot::Classical),
-        )
+        // SAFETY: the caller supplies the same exact-parent, native lifetime
+        // and exclusive raw-import obligations; only the executor is selected.
+        unsafe {
+            Self::with_executor(
+                raw,
+                command_buffer,
+                fence,
+                prev_ce_outputs,
+                Arc::new(ExecutorSlot::Classical),
+            )
+        }
     }
 
     /// As [`Self::new`], but submitting dispatches through `executor`.
-    pub fn with_executor(
+    ///
+    /// # Safety
+    ///
+    /// All native-origin, matching-parent, exclusivity, resource-lifetime and
+    /// thread/phase obligations of [`Self::new`] apply. The executor does not
+    /// establish native lifetime, tracked ownership or thread safety.
+    pub unsafe fn with_executor(
         raw: Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>,
         command_buffer: Retained<ProtocolObject<dyn MTLCommandBuffer>>,
         fence: Arc<Fence>,
@@ -1339,7 +1363,9 @@ impl ComputeCommandEncoder {
     ) -> ComputeCommandEncoder {
         Self::with_backend(
             super::raw_encoder::Compute::Metal3(raw),
-            super::CommandBuffer::new(command_buffer),
+            // SAFETY: the raw importer promises this is the encoder's exact
+            // parent, with one authoritative family and native lifetimes held.
+            unsafe { super::CommandBuffer::new(command_buffer) },
             fence,
             prev_ce_outputs,
             executor,
@@ -2126,7 +2152,7 @@ impl ComputeCommandEncoder {
         }
         unsafe {
             self.raw
-                .setBuffer_offset_atIndex(Some(unsafe { buffer.raw_unchecked() }), 0, index)
+                .setBuffer_offset_atIndex(Some(buffer.raw_unchecked()), 0, index)
         }
         // The staging buffer must stay alive until the dispatch it feeds has
         // completed, not merely until it is encoded. It is parked here and
@@ -2481,7 +2507,18 @@ impl AsRef<BlitCommandEncoder> for BlitCommandEncoder {
 }
 
 impl BlitCommandEncoder {
-    pub fn new(
+    /// Import an already active native blit encoder without a tracked parent.
+    ///
+    /// # Safety
+    ///
+    /// `raw` must come from Apple Metal or a separately audited equivalent and
+    /// be its parent's unique active encoder. No independent wrapper or external
+    /// alias may encode/end it while this wrapper owns it. The caller retains
+    /// the exact parent and all bound resources through their native use (also
+    /// unretained resources), ends this encoder before parent submission, and
+    /// obeys documented native thread/phase, callback and final-release rules.
+    /// This import does not acquire engine ownership or a parent lifetime pin.
+    pub unsafe fn new(
         raw: Retained<ProtocolObject<dyn MTLBlitCommandEncoder>>,
         fence: Arc<Fence>,
         prev_ce_outputs: PrevCeOutputs,
@@ -2757,7 +2794,7 @@ impl BlitCommandEncoder {
         if range.1 == 0 {
             return Ok(());
         }
-        if absolute % 4 != 0 || range.1 % 4 != 0 {
+        if !absolute.is_multiple_of(4) || !range.1.is_multiple_of(4) {
             return Err(Error::QueueUnavailable(
                 "byte fill requires its prepared compute arm",
             ));
@@ -2858,9 +2895,9 @@ impl BlitCommandEncoder {
         unsafe {
             self.raw
                 .copyFromBuffer_sourceOffset_toBuffer_destinationOffset_size(
-                    unsafe { src_buffer.raw_unchecked() },
+                    src_buffer.raw_unchecked(),
                     src_offset,
-                    unsafe { dst_buffer.raw_unchecked() },
+                    dst_buffer.raw_unchecked(),
                     dst_offset,
                     size,
                 )

@@ -169,7 +169,42 @@ impl Queue {
     }
 
     pub fn acquire(self: &Arc<Self>) -> Result<Arc<Submission>, MetalKernelError> {
-        self.acquire_impl(None)
+        self.acquire_impl(None, &mut Self::park)
+    }
+
+    /// The default park of an acquisition that found no free slot.
+    fn park(ready: &Wake, seen: usize) -> Result<(), MetalKernelError> {
+        ready.wait(seen);
+        Ok(())
+    }
+
+    /// `(allocated, available)` native slots: a test's leak observation.
+    #[cfg(test)]
+    pub(super) fn slots_for_test(&self) -> (usize, usize) {
+        (self.allocated.load(Ordering::Acquire), self.available.len())
+    }
+
+    /// Wake an acquisition parked for a slot, so it re-runs its park hook: a
+    /// producer that released held recordings the parked owner must submit
+    /// before any slot can come back (`Commands::produced`).
+    pub(super) fn notify_ready(&self) {
+        self.ready.notify();
+    }
+
+    /// Signal `event` to `value` on the queue itself, after every submission
+    /// committed so far: a signal that belonged to a recording cancelled
+    /// before submission, re-homed so the work ordered behind it still runs
+    /// after everything it was ordered after.
+    pub(super) fn signal_after_committed(
+        &self,
+        event: &ProtocolObject<dyn MTLSharedEvent>,
+        value: u64,
+    ) -> Result<(), MetalKernelError> {
+        let _order = self.commit_order.lock();
+        self.check_failure()?;
+        self.raw
+            .signalEvent_value(ProtocolObject::from_ref(event), value);
+        Ok(())
     }
 
     /// Cold/preflight constructor. Actual Queue failure/Wake identities are
@@ -199,17 +234,33 @@ impl Queue {
         self: &Arc<Self>,
         prepared: super::native_generation_bindings::PreparedGeneration,
     ) -> Result<Arc<Submission>, MetalKernelError> {
-        if !prepared.matches_queue(&self.failure) {
+        self.acquire_with(Some(prepared), &mut Self::park)
+    }
+
+    /// Acquire a recording, running `park` instead of the plain wait whenever
+    /// no slot is free. An owner that holds recordings back from submission
+    /// (`Commands::commit_when_produced`) submits the released ones there:
+    /// their slots come back only once they have run.
+    pub(super) fn acquire_with(
+        self: &Arc<Self>,
+        prepared: Option<super::native_generation_bindings::PreparedGeneration>,
+        park: &mut dyn FnMut(&Wake, usize) -> Result<(), MetalKernelError>,
+    ) -> Result<Arc<Submission>, MetalKernelError> {
+        if prepared
+            .as_ref()
+            .is_some_and(|prepared| !prepared.matches_queue(&self.failure))
+        {
             return Err(MetalKernelError::QueueUnavailable(
                 "binding inventory belongs to another native queue",
             ));
         }
-        self.acquire_impl(Some(prepared))
+        self.acquire_impl(prepared, park)
     }
 
     fn acquire_impl(
         self: &Arc<Self>,
         prepared: Option<super::native_generation_bindings::PreparedGeneration>,
+        park: &mut dyn FnMut(&Wake, usize) -> Result<(), MetalKernelError>,
     ) -> Result<Arc<Submission>, MetalKernelError> {
         // Obtain the real default pin before removing any reusable/native slot.
         // Counted-clone refusal leaves queue state/capacity unchanged. Initial
@@ -247,7 +298,7 @@ impl Queue {
             crate::completion_scope::before_park(Arc::as_ptr(self) as usize)
                 .map_err(|_| MetalKernelError::CallbackWouldBlock)?;
             self.acquire_parks.fetch_add(1, Ordering::Relaxed);
-            self.ready.wait(seen);
+            park(&self.ready, seen)?;
         };
         // Only completed submissions return slots; abandoned uncommitted ones
         // are destroyed instead. No reset races outstanding GPU commands.
@@ -291,7 +342,7 @@ impl Queue {
             state: Mutex::new(State {
                 slot: Some(slot),
                 callbacks: Vec::new(),
-                hooked: false,
+                hook_runs: 0,
                 events: Vec::new(),
                 physical,
             }),
@@ -476,8 +527,8 @@ pub(super) struct EventBoundary {
 struct State {
     slot: Option<Slot>,
     callbacks: Vec<Callback>,
-    /// The queue's completion hook runs for this submission (`run_hook`).
-    hooked: bool,
+    /// Epochs this submission completes on the queue's hook (`run_hook`).
+    hook_runs: u32,
     events: Vec<EventBoundary>,
     // Prepared once before exposure. Commit/abandonment move this actual pin;
     // final Submission Drop never needs a fallible owner acquisition.
@@ -808,12 +859,18 @@ impl Submission {
     /// Reserve ordering and native handler allocations before engine epoch and
     /// subscriber registration. Dropping this value consumes no sequence.
     pub(super) fn prepare_commit(self: &Arc<Self>) -> Result<PreparedCommit<'_>, MetalKernelError> {
-        self.prepare_commit_mode(false)
+        self.prepare_commit_mode(false, None)
     }
     pub(super) fn prepare_commit_mode(
         self: &Arc<Self>,
         nonblocking: bool,
+        authority: Option<&super::commands::OwnerSubmission<'_>>,
     ) -> Result<PreparedCommit<'_>, MetalKernelError> {
+        if let Some(generation) = &self.bindings {
+            if !authority.is_some_and(|owner| owner.authorizes_generation(generation)) {
+                return Err(MetalKernelError::OwnerSubmissionRequired);
+            }
+        }
         self.queue.check_failure()?;
         let order = match self.queue.commit_order.try_lock() {
             Some(guard) => guard,
@@ -929,6 +986,8 @@ impl Submission {
             CommitOptions::Segments(options)
         };
         Ok(PreparedCommit {
+            #[cfg(test)]
+            test_control: None,
             submission: self,
             order,
             state: std::cell::RefCell::new(Some(state)),
@@ -939,8 +998,59 @@ impl Submission {
         })
     }
 
-    /// Public submissions use the same prepared transaction as Commands. There
-    /// is no second legacy path that can bypass ordered retirement/custody.
+    /// Abandon this recording before submission, whoever else still holds a
+    /// handle to it: its native slot and owners go to host retirement now,
+    /// and no later commit can enter native work. For a recording held back
+    /// for an input that will never be produced (`Commands::cancel_produced`).
+    /// `false` when it was already submitted or abandoned.
+    pub(super) fn abandon_unsubmitted(&self) -> Result<bool, MetalKernelError> {
+        let (slot, callbacks, events, physical) = {
+            let mut state = self.state.lock();
+            if self.status().0 >= MTLCommandBufferStatus::Committed.0 {
+                return Ok(false);
+            }
+            let Some(slot) = state.slot.take() else {
+                return Ok(false);
+            };
+            (
+                slot,
+                std::mem::take(&mut state.callbacks),
+                std::mem::take(&mut state.events),
+                state.physical.take(),
+            )
+        };
+        let owners = super::retirement::NativeOwners::metal4_abandoned(
+            slot,
+            self.queue.clone(),
+            events,
+            physical,
+        );
+        match self
+            .retirement
+            .replace_prepared(super::retirement::Captures::new(callbacks), owners)
+        {
+            Ok(displaced) => drop(displaced),
+            Err(rejected) => {
+                std::mem::forget(rejected.value);
+                self.binding_failure(crate::retirement_owners::Failure::AdapterFailed);
+                return Err(MetalKernelError::QueueUnavailable(
+                    "abandoned recording owner installation failed",
+                ));
+            }
+        }
+        if self.retirement.cancel_before_handoff().is_err() {
+            self.binding_failure(crate::retirement_owners::Failure::AdapterFailed);
+            return Err(MetalKernelError::QueueUnavailable(
+                "abandoned recording cancellation refused",
+            ));
+        }
+        self.binding_cancelled();
+        Ok(true)
+    }
+
+    /// Submit an unbound interoperability recording through ordered retirement.
+    /// Bound recordings refuse before native preparation; submit those through
+    /// their owning Commands transaction instead.
     pub fn commit(self: &Arc<Self>) -> Result<(), MetalKernelError> {
         self.prepare_commit()?.commit()
     }
@@ -1139,6 +1249,8 @@ impl CommitOptions {
 }
 
 pub(super) struct PreparedCommit<'a> {
+    #[cfg(test)]
+    pub(super) test_control: Option<Arc<super::commands::submission_test::Control>>,
     submission: &'a Arc<Submission>,
     order: parking_lot::MutexGuard<'a, u64>,
     state: std::cell::RefCell<Option<parking_lot::MutexGuard<'a, State>>>,
@@ -1148,9 +1260,10 @@ pub(super) struct PreparedCommit<'a> {
     phase: CommitPhase,
 }
 impl PreparedCommit<'_> {
-    /// Flag this submission for the queue's completion hook: one field of the
-    /// recording state this preparation already holds. No allocation, no lock.
-    pub(super) fn run_hook(&self) -> Result<(), MetalKernelError> {
+    /// Flag this submission for the queue's completion hook, completing `runs`
+    /// epochs: one field of the recording state this preparation already
+    /// holds. No allocation, no lock.
+    pub(super) fn run_hook(&self, runs: u32) -> Result<(), MetalKernelError> {
         self.submission.queue.check_failure()?;
         if !self
             .submission
@@ -1168,7 +1281,7 @@ impl PreparedCommit<'_> {
             .borrow_mut()
             .as_mut()
             .expect("prepared recording")
-            .hooked = true;
+            .hook_runs = runs;
         Ok(())
     }
     /// After the epoch is taken (`Commands::submit_prepared`): a refusal fails
@@ -1219,17 +1332,14 @@ impl PreparedCommit<'_> {
         let submission = self.submission;
         submission.queue.check_failure()?;
         if let Some(bindings) = &submission.bindings {
-            // Direct public commit also supplies a precise staged epoch. The
-            // ordinary Commands path already staged its exact commit_epoch.
-            // A commit taking its own epoch runs the queue's completion hook.
-            bindings.ensure_staged(|| self.run_hook())?;
+            bindings.require_staged()?;
         }
         let mut state = self.state.get_mut().take().expect("prepared recording");
         let slot = state.slot.take().expect("prepared recording slot");
         let physical = state.physical.take();
         let residency = slot.residency.clone();
         let callbacks = std::mem::take(&mut state.callbacks);
-        let hooked = state.hooked;
+        let hook_runs = state.hook_runs;
         let events = std::mem::take(&mut state.events);
         assert!(
             submission.committed_events.set(events).is_ok(),
@@ -1246,7 +1356,7 @@ impl PreparedCommit<'_> {
         match submission.retirement.replace_prepared(
             super::retirement::Captures {
                 callbacks,
-                hooked,
+                hook_runs,
                 bindings: None,
             },
             owners,
@@ -1267,6 +1377,10 @@ impl PreparedCommit<'_> {
         // execution. Any unwind before queue entry cancels via rooted custody.
         residency.commit();
         self.extra.last().unwrap_or(&self.first).endCommandBuffer();
+        #[cfg(test)]
+        if let Some(control) = &self.test_control {
+            control.before_entry()?;
+        }
         submission.retirement.begin_handoff().map_err(|_| {
             submission.binding_failure(crate::retirement_owners::Failure::AdapterFailed);
             MetalKernelError::QueueUnavailable("native handoff refused")
@@ -1276,9 +1390,8 @@ impl PreparedCommit<'_> {
             .checked_add(1)
             .expect("checked during preparation");
         if let Some(bindings) = &submission.bindings {
-            bindings.entered().map_err(|error| {
+            bindings.entered().inspect_err(|_| {
                 submission.binding_failure(crate::retirement_owners::Failure::AdapterFailed);
-                error
             })?;
         }
         self.phase = CommitPhase::EnteredNative;
@@ -1313,6 +1426,19 @@ impl PreparedCommit<'_> {
                         self.options.get(index),
                     );
                 }
+                #[cfg(test)]
+                if let Some(control) = &self.test_control {
+                    if control.native_call_returned(index) {
+                        // Independent native prefix observer: it requires no
+                        // logical owner publication or unissued later segment.
+                        let event = control.observer();
+                        submission
+                            .queue
+                            .raw
+                            .signalEvent_value(ProtocolObject::from_ref(&*event), 1);
+                        panic!("controlled partial native handoff");
+                    }
+                }
             },
             |boundary| {
                 let event = ProtocolObject::from_ref(&*boundary.event);
@@ -1329,12 +1455,15 @@ impl PreparedCommit<'_> {
                 }
             },
         );
+        #[cfg(test)]
+        if let Some(control) = &self.test_control {
+            control.before_return();
+        }
         // Publish RETURNED before this side can elect the terminal winner.
         // All native queue entries returned; callbacks may already be complete.
         if let Some(bindings) = &submission.bindings {
-            bindings.returned().map_err(|error| {
+            bindings.returned().inspect_err(|_| {
                 submission.binding_failure(crate::retirement_owners::Failure::UnknownHandoff);
-                error
             })?;
         }
         submission.publish_native_reuse(crate::native_reuse::ReuseSide::HandoffReturned);

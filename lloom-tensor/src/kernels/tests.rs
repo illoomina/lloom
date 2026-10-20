@@ -10,7 +10,7 @@ use std::thread;
 
 fn commands(device: &Device) -> Commands {
     let queue = device.new_command_queue().unwrap();
-    let residency_set = Arc::new(ResidencySet::new(&device));
+    let residency_set = Arc::new(ResidencySet::new(device));
     Commands::new(queue, residency_set).unwrap()
 }
 
@@ -9043,8 +9043,8 @@ fn quant_attention_reference_cells(
             let ks = k_scales[kv_h * capacity + t];
             let kb = k_biases[kv_h * capacity + t];
             let mut score = 0f32;
-            for j in 0..head_dim {
-                score += qv[j] * (code_at(k_codes, kv_h, t, j) * ks + kb);
+            for (j, q) in qv.iter().enumerate() {
+                score += *q * (code_at(k_codes, kv_h, t, j) * ks + kb);
             }
 
             let new_max = max_score.max(score);
@@ -9055,8 +9055,8 @@ fn quant_attention_reference_cells(
 
             let vs = v_scales[kv_h * capacity + t];
             let vb = v_biases[kv_h * capacity + t];
-            for j in 0..head_dim {
-                acc[j] = acc[j] * factor + exp_score * (code_at(v_codes, kv_h, t, j) * vs + vb);
+            for (j, value) in acc.iter_mut().enumerate() {
+                *value = *value * factor + exp_score * (code_at(v_codes, kv_h, t, j) * vs + vb);
             }
         }
 
@@ -9065,6 +9065,16 @@ fn quant_attention_reference_cells(
         }
     }
     out
+}
+
+/// Geometry and code width of one quantizer test fixture.
+struct QuantizeKvCase {
+    n_heads: usize,
+    seq_len: usize,
+    head_dim: usize,
+    capacity: usize,
+    dst_offset: usize,
+    bits: KvQuantBits,
 }
 
 /// Quantize on the GPU, read the planes back, and check them against the
@@ -9077,13 +9087,16 @@ fn run_quantize_kv(
     device: &Device,
     kernels: &Kernels,
     src: &[f16],
-    n_heads: usize,
-    seq_len: usize,
-    head_dim: usize,
-    capacity: usize,
-    dst_offset: usize,
-    bits: KvQuantBits,
+    case: QuantizeKvCase,
 ) -> (Vec<u8>, Vec<f16>, Vec<f16>) {
+    let QuantizeKvCase {
+        n_heads,
+        seq_len,
+        head_dim,
+        capacity,
+        dst_offset,
+        bits,
+    } = case;
     let code_bytes = bits.code_bytes(n_heads * capacity * head_dim);
     let scale_els = n_heads * capacity;
 
@@ -9161,7 +9174,17 @@ fn quantize_kv_matches_the_scalar_reference_at_both_widths() {
 
     for bits in KvQuantBits::ALL {
         let (codes, scales, biases) = run_quantize_kv(
-            &device, &kernels, &src, n_heads, seq_len, head_dim, capacity, dst_offset, bits,
+            &device,
+            &kernels,
+            &src,
+            QuantizeKvCase {
+                n_heads,
+                seq_len,
+                head_dim,
+                capacity,
+                dst_offset,
+                bits,
+            },
         );
 
         let mut checked = 0usize;
@@ -9187,7 +9210,7 @@ fn quantize_kv_matches_the_scalar_reference_at_both_widths() {
                     bits.bits()
                 );
 
-                for j in 0..head_dim {
+                for (j, want) in want_codes.iter().enumerate() {
                     let idx = dst_tok * head_dim + j;
                     let base = bits.code_bytes(h * capacity * head_dim);
                     let got = match bits {
@@ -9203,7 +9226,7 @@ fn quantize_kv_matches_the_scalar_reference_at_both_widths() {
                     };
                     assert_eq!(
                         got,
-                        want_codes[j],
+                        *want,
                         "code disagrees at head {h} token {dst_tok} element {j} at int{}",
                         bits.bits()
                     );
@@ -9249,7 +9272,17 @@ fn quantize_kv_leaves_the_rest_of_the_plane_untouched() {
 
     for bits in KvQuantBits::ALL {
         let (codes, scales, _biases) = run_quantize_kv(
-            &device, &kernels, &src, n_heads, seq_len, head_dim, capacity, dst_offset, bits,
+            &device,
+            &kernels,
+            &src,
+            QuantizeKvCase {
+                n_heads,
+                seq_len,
+                head_dim,
+                capacity,
+                dst_offset,
+                bits,
+            },
         );
 
         for h in 0..n_heads {
@@ -9374,10 +9407,30 @@ fn sdpa_vector_quant_matches_the_scalar_reference_at_both_widths() {
 
     for bits in KvQuantBits::ALL {
         let (k_codes, k_scales, k_biases) = run_quantize_kv(
-            &device, &kernels, &k_src, n_kv_heads, kv_len, head_dim, capacity, 0, bits,
+            &device,
+            &kernels,
+            &k_src,
+            QuantizeKvCase {
+                n_heads: n_kv_heads,
+                seq_len: kv_len,
+                head_dim,
+                capacity,
+                dst_offset: 0,
+                bits,
+            },
         );
         let (v_codes, v_scales, v_biases) = run_quantize_kv(
-            &device, &kernels, &v_src, n_kv_heads, kv_len, head_dim, capacity, 0, bits,
+            &device,
+            &kernels,
+            &v_src,
+            QuantizeKvCase {
+                n_heads: n_kv_heads,
+                seq_len: kv_len,
+                head_dim,
+                capacity,
+                dst_offset: 0,
+                bits,
+            },
         );
 
         let commands = commands(&device);
@@ -9592,10 +9645,30 @@ fn the_two_widths_differ_and_int8_is_closer_to_f16() {
     let mut outs = Vec::new();
     for bits in KvQuantBits::ALL {
         let (k_codes, k_scales, k_biases) = run_quantize_kv(
-            &device, &kernels, &k_src, n_kv_heads, kv_len, head_dim, capacity, 0, bits,
+            &device,
+            &kernels,
+            &k_src,
+            QuantizeKvCase {
+                n_heads: n_kv_heads,
+                seq_len: kv_len,
+                head_dim,
+                capacity,
+                dst_offset: 0,
+                bits,
+            },
         );
         let (v_codes, v_scales, v_biases) = run_quantize_kv(
-            &device, &kernels, &v_src, n_kv_heads, kv_len, head_dim, capacity, 0, bits,
+            &device,
+            &kernels,
+            &v_src,
+            QuantizeKvCase {
+                n_heads: n_kv_heads,
+                seq_len: kv_len,
+                head_dim,
+                capacity,
+                dst_offset: 0,
+                bits,
+            },
         );
 
         let commands = commands(&device);
@@ -10060,7 +10133,7 @@ fn sdpa_vector_quant_sel_reads_the_selected_cells() {
 }
 
 ///////////////////////////////////////////////////////////////////////////////
-/// The SiLU variant axis (issue #599, `DESIGN.md` §12.2l)
+// The SiLU variant axis (issue #599, `DESIGN.md` §12.2l)
 ///////////////////////////////////////////////////////////////////////////////
 
 /// Every `SiluImpl` arm resolves, at every dtype, in both binding forms.
@@ -10155,7 +10228,7 @@ fn silu_arm_names_round_trip() {
 }
 
 ///////////////////////////////////////////////////////////////////////////////
-/// The SiLU consolidation (issue #599, `DESIGN.md` §15.2 #15 / §3.6)
+// The SiLU consolidation (issue #599, `DESIGN.md` §15.2 #15 / §3.6)
 ///////////////////////////////////////////////////////////////////////////////
 
 /// The shipping SiLU expression has exactly ONE definition, and the live

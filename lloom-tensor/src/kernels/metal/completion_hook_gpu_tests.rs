@@ -21,10 +21,106 @@ const SHARED: MTLResourceOptions = MTLResourceOptions(
 /// How long a held buffer is watched for a clock that runs ahead of it.
 const WATCH: Duration = Duration::from_millis(100);
 
+/// Arm before encoding a host wait or starting a possibly blocked producer.
+/// Drop never joins/drains while its event/lock is still held.
+struct ReleaseBeforeDrain<R: FnMut(), D: FnMut()> {
+    release: R,
+    drain: D,
+}
+impl<R: FnMut(), D: FnMut()> Drop for ReleaseBeforeDrain<R, D> {
+    fn drop(&mut self) {
+        (self.release)();
+        (self.drain)();
+    }
+}
+
+#[test]
+fn fixture_release_precedes_drain_on_assertion_unwind() {
+    let released = std::cell::Cell::new(false);
+    let observed = std::cell::Cell::new(false);
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _guard = ReleaseBeforeDrain {
+            release: || released.set(true),
+            drain: || observed.set(released.get()),
+        };
+        panic!("controlled completion fixture unwind");
+    }));
+    assert!(result.is_err());
+    assert!(observed.get(), "fixture drain preceded release");
+}
+
+/// Device-free: the actual completion hook must not acquire the setup mutex.
+/// A literal blocking-lock mutant is released/joined before the assertion.
+#[test]
+fn actual_hook_completion_proceeds_while_setup_mutex_is_held() {
+    use std::sync::atomic::AtomicBool;
+    let clock = Arc::new(super::GpuClock::new());
+    let hook = Arc::new(super::completion_hook::CompletionHook::new(
+        clock.clone(),
+        Arc::new(super::commands::CommandBufferFailure::default()),
+    ));
+    let runs = Arc::new(AtomicU64::new(0));
+    let observed = runs.clone();
+    hook.subscribe(Arc::new(move || {
+        observed.fetch_add(1, Ordering::Relaxed);
+    }))
+    .unwrap();
+    hook.seal().unwrap();
+    clock.commit_epoch();
+    let finished = Arc::new(AtomicBool::new(false));
+    let join = std::cell::RefCell::new(None::<std::thread::JoinHandle<()>>);
+    let joined = std::cell::RefCell::new(None);
+    let mut lock = Some(hook.lock_subscribers_for_test());
+    let cleanup = ReleaseBeforeDrain {
+        release: || drop(lock.take()),
+        drain: || {
+            *joined.borrow_mut() = join.borrow_mut().take().map(|handle| handle.join());
+        },
+    };
+    let (started, receiver) = std::sync::mpsc::channel();
+    let worker = hook.clone();
+    let done = finished.clone();
+    *join.borrow_mut() = Some(std::thread::spawn(move || {
+        started.send(()).unwrap();
+        worker.complete(&super::metal4::Feedback {
+            error: None,
+            start: 0.,
+            end: 1.,
+        });
+        done.store(true, Ordering::Release);
+    }));
+    receiver.recv_timeout(Duration::from_secs(2)).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while !finished.load(Ordering::Acquire) && Instant::now() < deadline {
+        std::thread::yield_now();
+    }
+    let while_held = finished.load(Ordering::Acquire);
+    drop(cleanup);
+    joined.into_inner().unwrap().unwrap();
+    assert!(while_held, "completion acquired the held setup mutex");
+    assert_eq!(clock.completed_count().0, 1);
+    assert_eq!(runs.load(Ordering::Relaxed), 1);
+}
+
 fn commands(device: &Device) -> Commands {
     let queue = device.new_command_queue().unwrap();
     let residency_set = Arc::new(ResidencySet::new(device));
-    Commands::new(queue, residency_set).unwrap()
+    let commands = Commands::new(queue, residency_set).unwrap();
+    let actual = commands.actual_command_api_for_test();
+    let requested = &crate::tuning::tuning().metal.command_api;
+    if requested != "auto" {
+        assert_eq!(actual, requested);
+    }
+    if let Ok(requested) = std::env::var("LLOOM_METAL_API") {
+        if requested != "auto" {
+            assert_eq!(actual, requested);
+        }
+    }
+    eprintln!(
+        "HOOK_FIXTURE_ARM actual_api={actual} resolved_wait={}",
+        commands.completion_wait().name()
+    );
+    commands
 }
 
 /// Spin until `done` holds, or fail after ten seconds naming `what`.
@@ -57,10 +153,26 @@ fn the_clock_marks_completed_buffers_in_commit_order_and_no_further() {
         eprintln!("no Metal device; skipping");
         return;
     };
-    let cmds = commands(&device);
+    let cmds = Arc::new(commands(&device));
     let clock = cmds.clock();
     let x = device.new_buffer(4096, SHARED).unwrap();
     let event = device.as_ref().newSharedEvent().expect("a shared event");
+    // Independent owners survive a refusal/unwind whose terminality cannot
+    // be proved. Arm before even the first marker or host wait is encoded.
+    let mut pins = Some((device.clone(), cmds.clone(), x.clone(), event.clone()));
+    let cleanup = ReleaseBeforeDrain {
+        release: || event.setSignaledValue(1),
+        drain: || {
+            let result =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cmds.flush_and_wait()));
+            if matches!(result, Ok(Ok(()))) {
+                drop(pins.take());
+            } else {
+                std::mem::forget(pins.take());
+                eprintln!("clock fixture cleanup unknown; independent owners retained");
+            }
+        },
+    };
 
     for _ in 0..2 {
         drop(cmds.command_encoder().unwrap());
@@ -117,44 +229,68 @@ fn the_clock_marks_completed_buffers_in_commit_order_and_no_further() {
         "the clock ran past its commits"
     );
     assert!(cmds.check_failed().is_ok());
+    drop(cleanup);
 }
 
 /// **A subscriber runs once per completed buffer, and a commit and a
 /// completion both proceed while the subscribers' lock is held elsewhere.**
 /// The test thread holds the lock that guards registration and teardown
-/// while it commits eight buffers and watches the clock; each completion
-/// runs the subscriber regardless. Killed by a commit or a completion that
-/// takes that lock: the held lock then stalls the clock and the watch times
-/// out. It commits without waiting on a buffer, since a wait that joins
-/// callbacks would deadlock against such a mutant instead of failing.
+/// while a producer commits eight buffers and it watches the clock; each
+/// completion runs the subscriber regardless. A lock mutant stalls progress
+/// during this bounded observation. The fixture releases the lock before
+/// joining/draining, then fails the intended assertion instead of hanging.
 #[test]
 fn subscribers_run_per_buffer_without_their_lock() {
     let Some(device) = Device::system_default() else {
         eprintln!("no Metal device; skipping");
         return;
     };
-    let cmds = commands(&device);
+    let cmds = Arc::new(commands(&device));
     let runs = Arc::new(AtomicU64::new(0));
     let r = Arc::clone(&runs);
     cmds.on_command_buffer_complete(move || {
         r.fetch_add(1, Ordering::Relaxed);
-    });
+    })
+    .unwrap();
     let clock = cmds.clock();
     let buffers = 8u64;
-    let reached = cmds.while_subscribers_locked(|| {
-        for _ in 0..buffers {
-            drop(cmds.command_encoder().unwrap());
-            cmds.flush().unwrap();
-        }
-        let start = Instant::now();
-        while clock.completed_count().0 < buffers {
-            if start.elapsed() > Duration::from_secs(10) {
-                return false;
+    cmds.seal_completion_subscribers().unwrap();
+    let join = std::cell::RefCell::new(None::<std::thread::JoinHandle<_>>);
+    let joined = std::cell::RefCell::new(None);
+    let mut lock = Some(cmds.lock_subscribers_for_test());
+    let mut pins = Some((device.clone(), cmds.clone()));
+    let cleanup = ReleaseBeforeDrain {
+        release: || drop(lock.take()),
+        drain: || {
+            let outcome = join.borrow_mut().take().map(|handle| handle.join());
+            let drained =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cmds.flush_and_wait()));
+            if matches!(&outcome, Some(Ok(Ok(())))) && matches!(drained, Ok(Ok(()))) {
+                drop(pins.take());
+            } else {
+                std::mem::forget(pins.take());
+                eprintln!("subscriber fixture cleanup unknown; independent owners retained");
             }
-            std::thread::sleep(Duration::from_millis(1));
+            *joined.borrow_mut() = outcome;
+        },
+    };
+    let owner = cmds.clone();
+    *join.borrow_mut() = Some(std::thread::spawn(move || {
+        for _ in 0..buffers {
+            drop(owner.command_encoder()?);
+            owner.flush()?;
         }
-        true
-    });
+        Ok::<(), crate::kernels::MetalKernelError>(())
+    }));
+    let start = Instant::now();
+    while clock.completed_count().0 < buffers && start.elapsed() < Duration::from_secs(10) {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let reached = clock.completed_count().0 == buffers;
+    // A commit-lock mutant may still be blocked. Unlock BEFORE join/drain;
+    // only then report the intended progress assertion, never a timeout kill.
+    drop(cleanup);
+    joined.into_inner().unwrap().unwrap().unwrap();
     assert!(
         reached,
         "completions stalled while the test held the subscribers' lock"

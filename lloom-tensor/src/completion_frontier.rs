@@ -108,6 +108,7 @@ impl<T, const N: usize> CompletionFrontier<T, N> {
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn retired_prefix(&self) -> u64 {
         self.retired
     }

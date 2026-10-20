@@ -354,6 +354,7 @@ fn run(
         model: "scripted-tail".into(),
         record: Some(origin),
         return_ids: false,
+        reasoning_in_content: false,
     };
     let failed = fail.is_some();
     let result = stream_response_with_writer(&shared, run, || {
@@ -469,7 +470,7 @@ fn ordered_control_flush_preserves_held_prefix_credit_on_later_failure() {
     let progress = Progress::default();
     let engine = Scripted::new(Case::CompleteMarker, progress.clone());
     let tags = engine.think_tags().unwrap();
-    let mut parser = reasoning::Reasoning::for_chat(&engine, &[tags.start])
+    let mut parser = reasoning::Reasoning::for_chat(&engine, &[tags.start], false)
         .unwrap()
         .unwrap();
     let ids = [97, tags.end, 88];

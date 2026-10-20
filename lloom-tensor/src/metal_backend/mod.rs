@@ -19,17 +19,13 @@ use crate::{CpuStorage, CpuStorageRef, DType, Error, Layout, Result, Shape};
 // never used here — the contiguous const-set path uses a function-local
 // `use crate::kernels::unary::contiguous` instead. RESTRUCTURING §7.1.)
 use crate::kernels::{
-    metal::{
-        Backing, Buffer, BufferHandle, Commands, Commit, Device, DeviceBuffer, HeapChunks,
-        MTLResourceOptions, Mapped, ResidencySet,
-    },
-    BufferOffset, CallConvTranspose2dCfg, ConvKernel, IndexingKernel, Kernels, RESOURCE_OPTIONS,
+    metal::{Buffer, BufferHandle, Commands, Device, ResidencySet},
+    BufferOffset, CallConvTranspose2dCfg, ConvKernel, IndexingKernel, Kernels,
 };
 #[cfg(feature = "metal-debug-labels")]
 use objc2_foundation::NSString;
 #[cfg(feature = "metal-debug-labels")]
 use objc2_metal::MTLCommandQueue;
-use std::ffi::c_void;
 use std::sync::{Arc, PoisonError, TryLockError};
 
 mod allocation_namespace;
@@ -53,7 +49,9 @@ mod host_fed;
 mod host_slot;
 mod sampling_multinomial;
 mod sampling_topk;
-use device::{DeviceTeardown, PRIVATE_RESOURCE_OPTIONS};
+use device::DeviceTeardown;
+#[cfg(test)]
+use device::PRIVATE_RESOURCE_OPTIONS;
 pub use host_fed::{HostEvent, HostFedRing, PublishEvent};
 pub use host_slot::HostSlot;
 
@@ -729,7 +727,7 @@ impl BackendStorage for MetalStorage {
             }
             .map_err(MetalError::from)?;
         }
-        Ok(Self::new_allocated(buffer, device.clone(), el, dtype)?)
+        Self::new_allocated(buffer, device.clone(), el, dtype)
     }
 
     fn powf(&self, layout: &Layout, pow: f64) -> Result<Self> {
@@ -791,7 +789,7 @@ impl BackendStorage for MetalStorage {
             }
             .map_err(MetalError::from)?;
         }
-        Ok(Self::new_allocated(buffer, device.clone(), el, dtype)?)
+        Self::new_allocated(buffer, device.clone(), el, dtype)
     }
 
     fn elu(&self, layout: &Layout, alpha: f64) -> Result<Self> {
@@ -853,7 +851,7 @@ impl BackendStorage for MetalStorage {
             }
             .map_err(MetalError::from)?;
         }
-        Ok(Self::new_allocated(buffer, device.clone(), el, dtype)?)
+        Self::new_allocated(buffer, device.clone(), el, dtype)
     }
 
     fn reduce_op(&self, op: ReduceOp, layout: &Layout, sum_dims: &[usize]) -> Result<Self> {
@@ -942,7 +940,7 @@ impl BackendStorage for MetalStorage {
             }
             .map_err(MetalError::from)?;
 
-            return Ok(Self::new_allocated(buffer, device, dst_el, dtype)?);
+            return Self::new_allocated(buffer, device, dst_el, dtype);
         }
 
         let (name, check_empty, return_index) = match (op, self.dtype) {
@@ -1005,7 +1003,7 @@ impl BackendStorage for MetalStorage {
         }
         .map_err(MetalError::from)?;
 
-        Ok(Self::new_allocated(buffer, device, dst_el, dtype)?)
+        Self::new_allocated(buffer, device, dst_el, dtype)
     }
 
     fn cmp(&self, op: CmpOp, rhs: &Self, lhs_l: &Layout, rhs_l: &Layout) -> Result<Self> {
@@ -1241,12 +1239,12 @@ impl BackendStorage for MetalStorage {
             }
             .map_err(MetalError::from)?;
         }
-        Ok(Self::new_allocated(
+        Self::new_allocated(
             buffer,
             device.clone(),
             el_count,
             dtype,
-        )?)
+        )
     }
 
     fn unary_impl<B: UnaryOpT>(&self, layout: &Layout) -> Result<Self> {
@@ -1438,12 +1436,12 @@ impl BackendStorage for MetalStorage {
             .map_err(MetalError::from)?;
         }
 
-        Ok(Self::new_allocated(
+        Self::new_allocated(
             buffer,
             device.clone(),
             el_count,
             dtype,
-        )?)
+        )
     }
 
     fn binary_impl<B: BinaryOpT>(
@@ -1517,7 +1515,7 @@ impl BackendStorage for MetalStorage {
             )
         }
         .map_err(MetalError::from)?;
-        Ok(Self::new_allocated(buffer, device, el, dtype)?)
+        Self::new_allocated(buffer, device, el, dtype)
     }
 
     fn conv1d(
@@ -1693,12 +1691,12 @@ impl BackendStorage for MetalStorage {
             .map_err(MetalError::from)?,
         }
 
-        Ok(Self::new_allocated(
+        Self::new_allocated(
             dst,
             self.device.clone(),
             dst_el,
             self.dtype,
-        )?)
+        )
     }
 
     fn conv_transpose1d(
@@ -1810,12 +1808,12 @@ impl BackendStorage for MetalStorage {
             .map_err(MetalError::from)?;
             buffer
         };
-        Ok(Self::new_allocated(
+        Self::new_allocated(
             buffer,
             self.device.clone(),
             dst_el,
             self.dtype,
-        )?)
+        )
     }
 
     fn conv2d(
@@ -1958,12 +1956,12 @@ impl BackendStorage for MetalStorage {
             )
         }
         .map_err(MetalError::from)?;
-        Ok(Self::new_allocated(
+        Self::new_allocated(
             buffer,
             self.device.clone(),
             dst_el,
             self.dtype,
-        )?)
+        )
     }
 
     fn avg_pool2d(
@@ -2006,12 +2004,12 @@ impl BackendStorage for MetalStorage {
             )
         }
         .map_err(MetalError::from)?;
-        Ok(Self::new_allocated(
+        Self::new_allocated(
             buffer,
             self.device.clone(),
             dst_el,
             self.dtype,
-        )?)
+        )
     }
 
     fn max_pool2d(
@@ -2054,12 +2052,12 @@ impl BackendStorage for MetalStorage {
             )
         }
         .map_err(MetalError::from)?;
-        Ok(Self::new_allocated(
+        Self::new_allocated(
             buffer,
             self.device.clone(),
             dst_el,
             self.dtype,
-        )?)
+        )
     }
 
     fn upsample_nearest1d(&self, _: &Layout, _: usize) -> Result<Self> {
@@ -2105,12 +2103,12 @@ impl BackendStorage for MetalStorage {
             )
         }
         .map_err(MetalError::from)?;
-        Ok(Self::new_allocated(
+        Self::new_allocated(
             buffer,
             self.device.clone(),
             dst_el,
             self.dtype,
-        )?)
+        )
     }
 
     fn upsample_bilinear2d(
@@ -2167,12 +2165,12 @@ impl BackendStorage for MetalStorage {
         }
         .map_err(MetalError::from)?;
 
-        Ok(Self::new_allocated(
+        Self::new_allocated(
             buffer,
             self.device.clone(),
             dst_el,
             self.dtype,
-        )?)
+        )
     }
 
     fn gather(&self, src_l: &Layout, ids: &Self, ids_l: &Layout, dim: usize) -> Result<Self> {
@@ -2234,7 +2232,7 @@ impl BackendStorage for MetalStorage {
             )
         }
         .map_err(MetalError::from)?;
-        Ok(Self::new_allocated(buffer, device.clone(), dst_el, dtype)?)
+        Self::new_allocated(buffer, device.clone(), dst_el, dtype)
     }
 
     fn scatter_set(
@@ -2375,7 +2373,7 @@ impl BackendStorage for MetalStorage {
             )
         }
         .map_err(MetalError::from)?;
-        Ok(Self::new_allocated(buffer, device.clone(), dst_el, dtype)?)
+        Self::new_allocated(buffer, device.clone(), dst_el, dtype)
     }
 
     fn index_add(
@@ -2496,12 +2494,12 @@ impl BackendStorage for MetalStorage {
         }
         .map_err(MetalError::from)?;
 
-        Ok(Self::new_allocated(
+        Self::new_allocated(
             buffer,
             self.device.clone(),
             b * m * n,
             self.dtype(),
-        )?)
+        )
     }
 
     fn copy2d(
@@ -2798,7 +2796,7 @@ impl MetalStorage {
             )
         }
         .map_err(MetalError::from)?;
-        Ok(Self::new_allocated(buffer, device.clone(), 1, DType::U32)?)
+        Self::new_allocated(buffer, device.clone(), 1, DType::U32)
     }
 
     /// The multinomial draw by inverse CDF (`sample_inverse_cdf_f32`): over
@@ -2945,12 +2943,12 @@ impl MetalStorage {
             .map_err(MetalError::from)?;
             buffer
         };
-        Ok(Self::new_allocated(
+        Self::new_allocated(
             buffer,
             device.clone(),
             el_count,
             dtype,
-        )?)
+        )
     }
 
     /// Stage `count` elements starting at element `offset` for a later host
@@ -3519,12 +3517,12 @@ impl BackendDevice for MetalDevice {
             .with_size_for(shape.elem_count(), dtype)
             .with_label("alloc-uninit")
             .build()?;
-        Ok(MetalStorage::new_allocated(
+        MetalStorage::new_allocated(
             buffer,
             self.clone(),
             shape.elem_count(),
             dtype,
-        )?)
+        )
     }
 
     fn zeros_impl(&self, shape: &Shape, dtype: DType) -> Result<MetalStorage> {
@@ -3534,12 +3532,12 @@ impl BackendDevice for MetalDevice {
             .with_zeros(size)
             .with_label("zeros")
             .build()?;
-        Ok(MetalStorage::new_allocated(
+        MetalStorage::new_allocated(
             buffer,
             self.clone(),
             shape.elem_count(),
             dtype,
-        )?)
+        )
     }
 
     fn storage_from_slice<T: crate::WithDType>(&self, s: &[T]) -> Result<Self::Storage> {
@@ -3622,12 +3620,12 @@ impl BackendDevice for MetalDevice {
                 return Err(Error::UnsupportedDTypeForOp(T::DTYPE, "to_dtype").bt())
             }
         };
-        Ok(Self::Storage::new_allocated(
+        Self::Storage::new_allocated(
             buffer?,
             self.clone(),
             count,
             T::DTYPE,
-        )?)
+        )
     }
 
     fn storage_from_cpu_storage(&self, storage: &CpuStorage) -> Result<Self::Storage> {
@@ -3710,12 +3708,12 @@ impl BackendDevice for MetalDevice {
                 return Err(Error::UnsupportedDTypeForOp(storage.dtype(), "to_dtype").bt())
             }
         };
-        Ok(Self::Storage::new_allocated(
+        Self::Storage::new_allocated(
             buffer?,
             self.clone(),
             count,
             storage.dtype(),
-        )?)
+        )
     }
 
     fn storage_from_cpu_storage_owned(&self, storage: CpuStorage) -> Result<Self::Storage> {
@@ -3757,12 +3755,12 @@ impl BackendDevice for MetalDevice {
         }
         .map_err(MetalError::from)?;
 
-        Ok(Self::Storage::new_allocated(
+        Self::Storage::new_allocated(
             buffer,
             self.clone(),
             shape.elem_count(),
             dtype,
-        )?)
+        )
     }
 
     fn rand_normal(
@@ -3800,12 +3798,12 @@ impl BackendDevice for MetalDevice {
         }
         .map_err(MetalError::from)?;
 
-        Ok(Self::Storage::new_allocated(
+        Self::Storage::new_allocated(
             buffer,
             self.clone(),
             shape.elem_count(),
             dtype,
-        )?)
+        )
     }
 
     fn set_seed(&self, seed: u64) -> Result<()> {

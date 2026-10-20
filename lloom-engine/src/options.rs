@@ -1833,7 +1833,7 @@ fn parse_keep_logprobs(v: &str) -> Result<String, String> {
 #[options(v0 = false)]
 #[serde(default)]
 pub struct SessionConfig {
-    /// Keep past replies' reasoning in the history the next turn renders (the chat template's `preserve_thinking`): unset keeps it, as `true` does, wherever the template has the switch (its own rendering where it has none); `false` strips it (opt-in).
+    /// Keep past replies' reasoning in the history the next turn renders (the chat template's `preserve_thinking`): unset keeps it, as `true` does, wherever the template has the switch (its own rendering where it has none); `false` strips it (opt-in) — except for one request whose history ends in a reply of ours cut inside its reasoning, which renders with every past reply's reasoning kept, so the model is not shown an empty reply where its own unfinished thought belongs.
     #[opt(bool, flag = "persist-thinking", path = "session.persist_thinking", status = "stable", cli = "persist-thinking", switches = ["strip-thinking=false"])]
     pub persist_thinking: Option<bool>,
     /// A past reply of ours sent back without the reasoning the model wrote: `as-sent` renders the message as the client sent it; `log` restores the reasoning from the session log.

@@ -6280,7 +6280,7 @@ impl super::moe::PlanHook for JoinHook {
             JoinHook::Wait { ring, next } => {
                 *next += 1;
                 ring.signal(*next);
-                ring.encode_wait(*next)
+                ring.encode_satisfied_wait(*next)
             }
             #[cfg(feature = "metal")]
             JoinHook::Fetch(_) => Ok(()),

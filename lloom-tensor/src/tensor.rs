@@ -71,6 +71,13 @@ pub struct Tensor(Arc<Tensor_>);
 /// A rank-1 tensor staged for a host read that waits only on its producer
 /// ([`Tensor::stage_read`]).
 #[derive(Debug)]
+#[cfg_attr(
+    feature = "metal",
+    expect(
+        clippy::large_enum_variant,
+        reason = "Keep the public receipt inline; boxing would change its API and allocate after producer flush."
+    )
+)]
 pub enum StagedRead {
     /// The bytes and the command buffer that wrote them, on Metal.
     #[cfg(feature = "metal")]

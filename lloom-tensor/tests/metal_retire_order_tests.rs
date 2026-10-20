@@ -57,8 +57,12 @@ fn command_buffers_retire_in_commit_order_when_the_gpu_finishes_them_out_of_orde
 
     let (trials, mut gpu_inverted) = (8, 0u32);
     for trial in 0..trials {
-        let heavy = CommandBuffer::new(queue.commandBuffer().unwrap());
-        let tiny = CommandBuffer::new(queue.commandBuffer().unwrap());
+        // SAFETY: two distinct fresh Apple queue buffers, each imported once.
+        // Each family ends encoding before commit; all bound fixture buffers
+        // stay owned through the explicit waits. Handler captures use clones
+        // of these families, not independently imported raw aliases.
+        let heavy = unsafe { CommandBuffer::new(queue.commandBuffer().unwrap()) };
+        let tiny = unsafe { CommandBuffer::new(queue.commandBuffer().unwrap()) };
         {
             let enc = heavy.compute_command_encoder_no_fence().unwrap();
             for k in 0..4000 {

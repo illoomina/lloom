@@ -210,7 +210,7 @@ impl FetchLane {
             value
         };
         self.lane.cv.notify_all();
-        self.lane.event.encode_wait(value)
+        self.lane.event.commit_when_produced(value)
     }
 
     /// The counters once every job registered so far is done. The worker

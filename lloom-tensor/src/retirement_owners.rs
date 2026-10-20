@@ -5,11 +5,11 @@
 //! distinct from CompletionFrontier (ordering) and does not implement a worker,
 //! lock-free publication, native terminality detection, or a teardown policy.
 
-use std::sync::{
-    atomic::{AtomicU64, AtomicU8, Ordering},
-    Arc,
-};
+use std::sync::atomic::{AtomicU8, Ordering};
+#[cfg(test)]
+use std::sync::{atomic::AtomicU64, Arc};
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Ticket {
     registry: u64,
@@ -52,6 +52,7 @@ impl FailureSignal {
     }
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum OwnerError {
     ZeroCapacity,
@@ -63,12 +64,14 @@ pub(crate) enum OwnerError {
     Failed(Failure),
 }
 
+#[cfg(test)]
 #[derive(Debug)]
 pub(crate) struct Rejected<T> {
     pub error: OwnerError,
     pub owner: T,
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Handoff {
     Prepared,
@@ -77,6 +80,7 @@ enum Handoff {
     Unknown,
 }
 
+#[cfg(test)]
 struct Record<T> {
     owner: T,
     handoff: Handoff,
@@ -87,18 +91,21 @@ struct Record<T> {
     cleanup_ready: bool,
 }
 
+#[cfg(test)]
 struct Cell<T> {
     generation: u64,
     occupied: bool,
     record: Option<Record<T>>,
 }
 
+#[cfg(test)]
 pub(crate) struct OwnerCells<T, const N: usize> {
     registry: u64,
     cells: [Cell<T>; N],
     failure: Arc<FailureSignal>,
 }
 
+#[cfg(test)]
 impl<T, const N: usize> OwnerCells<T, N> {
     pub fn new(failure: Arc<FailureSignal>) -> Result<Self, OwnerError> {
         if N == 0 {

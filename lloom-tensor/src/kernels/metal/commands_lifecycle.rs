@@ -51,7 +51,7 @@ struct TeardownRequest(Arc<Control>);
 pub(super) struct OwnedCore<C: FinalCore> {
     core: Arc<C>,
     // LAST: request follows release of the public owner's Core custody.
-    request: TeardownRequest,
+    _request: TeardownRequest,
 }
 impl<C: FinalCore> std::ops::Deref for OwnedCore<C> {
     type Target = C;
@@ -124,7 +124,7 @@ fn register_in<C: FinalCore>(
     drop(inbox);
     Ok(OwnedCore {
         core,
-        request: TeardownRequest(control),
+        _request: TeardownRequest(control),
     })
 }
 impl<C: FinalCore> Teardown<C> {

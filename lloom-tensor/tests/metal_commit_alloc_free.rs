@@ -431,8 +431,34 @@ fn run_commits(device: &Device, cmds: &Commands, subscriber: bool, commits: u64)
         let f = Arc::clone(&fired);
         cmds.on_command_buffer_complete(move || {
             f.fetch_add(1, Ordering::Relaxed);
-        });
+        })
+        .unwrap();
     }
+    // Cold positive control, after observer registration but before every
+    // existing warm/count window. CommandMarker's Debug delegates to the
+    // actual CommandBuffer backend; do not merely echo requested tuning.
+    // Drain before asserting, so a failed diagnostic cannot abandon this
+    // probe's native work. No host-held event is encoded by the probe.
+    let marker = cmds.flush_marker().unwrap();
+    cmds.wait_marker(&marker).unwrap();
+    let marker = format!("{marker:?}");
+    let actual = if marker.contains("CommandBuffer { metal4: true,") {
+        "metal4"
+    } else {
+        assert!(
+            marker.contains("CommandBuffer { metal4: false,"),
+            "{marker}"
+        );
+        "metal3"
+    };
+    let requested = api();
+    if requested != "auto" {
+        assert_eq!(actual, requested);
+    }
+    println!(
+        "ALLOC_FIXTURE_ARM requested_api={requested} actual_api={actual} resolved_wait={} kind={:?} subscribers={subscriber}",
+        cmds.completion_wait().name(), cmds.kind()
+    );
     let kernels = Kernels::new();
     let n = 256usize;
     let len = n * std::mem::size_of::<f32>();

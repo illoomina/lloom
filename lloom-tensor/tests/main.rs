@@ -41,6 +41,7 @@ mod grad_tests;
 mod heap_transients;
 mod host_fed_ring;
 mod indexing_tests;
+mod io_queue_held;
 mod iq3xxs_gguf_read;
 mod iq_metal;
 mod kv_pages_cpu;
@@ -86,9 +87,13 @@ mod qmatmul_rows_under_fast;
 mod qmm_f16w_tiny_shapes;
 mod qmm_narrow_weights;
 mod quant_mv_store;
+#[cfg(feature = "metal")]
+mod quant_parity;
 mod quant_parity_matrix;
 mod quant_parity_matrix_rows;
 mod quantized_tests;
+#[cfg(feature = "metal")]
+mod rows_identity;
 mod sampling_contract;
 mod serialization_tests;
 mod slice_set_strided_tests;

@@ -1,6 +1,10 @@
-//! LFM2 GGUF chat wire fields. Control markers are identified by token id,
-//! never by a text search: ordinary tokens can spell the same literal text.
-//! Raw engine output/history and non-chat completions remain unchanged.
+//! Chat wire fields: a reply's reasoning in `message.reasoning_content` /
+//! `delta.reasoning_content`, its answer in `content` (decision 51 Q2, the
+//! default on every family whose template has reasoning markers; a request
+//! opts out with `reasoning_in_content`). Control markers are identified by
+//! token id, never by a text search: ordinary tokens can spell the same
+//! literal text. Raw engine output/history and non-chat completions remain
+//! unchanged.
 use crate::app::served::Served;
 use anyhow::Result;
 use serde_json::{Map, Value};
@@ -33,8 +37,15 @@ pub(super) struct Reasoning {
 }
 
 impl Reasoning {
-    pub(super) fn for_chat(engine: &dyn Served, prompt: &[u32]) -> Result<Option<Self>> {
-        if engine.capabilities().family != "lfm2-gguf" {
+    /// The splitter a chat request runs with: `None` where the request asked
+    /// for today's rendering (`reasoning_in_content`) or the template has no
+    /// reasoning markers to split on.
+    pub(super) fn for_chat(
+        engine: &dyn Served,
+        prompt: &[u32],
+        in_content: bool,
+    ) -> Result<Option<Self>> {
+        if in_content {
             return Ok(None);
         }
         let Some(tags) = engine.think_tags() else {

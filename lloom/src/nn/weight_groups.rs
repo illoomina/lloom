@@ -599,9 +599,9 @@ impl WeightGroups {
     /// recorded plan bound that one).
     ///
     /// The third field: with the loader on, the load's event value when the
-    /// bytes had not landed when this returned — the caller encodes the
-    /// device wait (`encode_wait`) before the stage's first reader; `None`
-    /// when the group was resident and landed (R1: nothing encoded).
+    /// bytes had not landed when this returned — the caller orders the
+    /// stage's first reader after the load (`commit_after_load`); `None`
+    /// when the group was resident and landed (R1: nothing to order).
     pub fn ensure(
         &mut self,
         g: WeightGroupId,
@@ -823,16 +823,17 @@ impl WeightGroups {
         Ok(())
     }
 
-    /// Encode the device wait for a load (`ensure`'s third field): every
-    /// command after it on the device's stream waits for the bytes. Not
-    /// encoded when the host has raised the event since — R1's conditional
-    /// wait.
-    pub fn encode_wait(&self, ticket: u64) -> Result<()> {
+    /// Order every command encoded after this on the device's stream after a
+    /// load (`ensure`'s third field): they are committed once the loader has
+    /// raised the load's value, never by a GPU wait on it. Nothing when the
+    /// host has raised it since — R1's conditional order. `device_waits`
+    /// counts the stages that were held.
+    pub fn commit_after_load(&self, ticket: u64) -> Result<()> {
         #[cfg(feature = "metal")]
         if let Some(l) = &self.loader {
             if trace() {
                 eprintln!(
-                    "[wg] encode_wait ticket={ticket} signaled={} epoch={:?}",
+                    "[wg] commit_after_load ticket={ticket} signaled={} epoch={:?}",
                     l.shared.event.signaled(),
                     self.epoch()
                 );
@@ -841,7 +842,7 @@ impl WeightGroups {
                 self.counters
                     .device_waits
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                l.shared.event.encode_wait(ticket)?;
+                l.shared.event.commit_when_produced(ticket)?;
             }
             return Ok(());
         }
@@ -1187,10 +1188,11 @@ fn trace() -> bool {
 /// names a slot, a group, a value and the slot's last reader; the thread
 /// waits for that reader on the clock, then
 /// writes the group's parts into the slot through `GroupSource::write`
-/// (bf16 → f16 on the way) and raises the event to the value. The encoding
-/// thread never waits: a stage whose group has not landed carries a device
-/// wait for its value (`WeightGroups::encode_wait`), and a stage whose
-/// group has encodes nothing (R1). Requests are served in order, so the
+/// (bf16 → f16 on the way) and raises the event to the value, which commits
+/// the work held for it. The encoding thread never waits: a stage whose group
+/// has not landed is committed once the value is raised
+/// (`WeightGroups::commit_after_load`), and a stage whose group has is
+/// committed as usual (R1). Requests are served in order, so the
 /// values the thread raises are monotone, which a shared event requires.
 #[cfg(feature = "metal")]
 mod loader {

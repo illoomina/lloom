@@ -105,9 +105,51 @@ fn run_gemm(f32: bool, n: usize) -> Result<()> {
     Ok(())
 }
 
+/// LFM2-2.6B's prefill projections, `x[m, k] · W[n, k]ᵀ` at f16 with `W`
+/// row-major as the model stores it (the `nt` layout), `reps` launches in one
+/// command buffer so its overhead is amortised: TFLOP/s per shape, through the
+/// shipping tile selection (`LLOOM_383_TILE` overrides it).
+fn run_prefill_gemm(m: usize, n: usize, k: usize, reps: usize) -> Result<f64> {
+    let device = Device::system_default().unwrap();
+    let kernels = lloom_tensor::kernels::Kernels::new();
+    let residency_set = std::sync::Arc::new(ResidencySet::new(&device));
+    let options = RESOURCE_OPTIONS;
+    let lhs: Vec<f16> = (0..m * k).map(|i| f16::from_f32(((i % 97) as f32 - 48.0) / 512.0)).collect();
+    let rhs: Vec<f16> = (0..n * k).map(|i| f16::from_f32(((i % 89) as f32 - 44.0) / 512.0)).collect();
+    let lhs = device
+        .new_buffer_with_data(lhs.as_ptr() as *const core::ffi::c_void, std::mem::size_of_val(&lhs[..]), options)
+        .unwrap();
+    let rhs = device
+        .new_buffer_with_data(rhs.as_ptr() as *const core::ffi::c_void, std::mem::size_of_val(&rhs[..]), options)
+        .unwrap();
+    let output = device.new_buffer(m * n * 2, options).unwrap();
+    let mut best = f64::MAX;
+    for _ in 0..5 {
+        let command_queue = device.new_command_queue().unwrap();
+        let commands = Commands::new(command_queue, residency_set.clone()).unwrap();
+        let start = std::time::Instant::now();
+        for _ in 0..reps {
+            let encoder = commands.command_encoder().unwrap();
+            // SAFETY: the example owns every buffer bound here and reads none
+            // of them before the command buffer that writes them completes.
+            unsafe {
+                lloom_tensor::kernels::call_mlx_gemm(
+                    &device, &encoder, &kernels, GemmDType::F16, (1, m, n, k),
+                    &[m * k, k, 1], 0, &lhs, &[n * k, 1, k], 0, &rhs, &output,
+                )
+            }?;
+        }
+        commands.wait_until_completed().unwrap();
+        best = best.min(start.elapsed().as_secs_f64() / reps as f64);
+    }
+    Ok(2.0 * (m * n * k) as f64 / best / 1e12)
+}
+
 #[derive(Subcommand, Debug, Clone)]
 enum Task {
     Gemm,
+    /// The prefill projections' shapes at m = 512, 2048, 2392.
+    PrefillGemm,
 }
 
 #[derive(Parser, Debug)]
@@ -121,6 +163,21 @@ pub struct Args {
 fn main() -> Result<()> {
     let args = Args::parse();
     match args.task {
+        Task::PrefillGemm => {
+            let shapes = [
+                ("w1/w3 (MLP up)", 10752, 2048),
+                ("w2 (MLP down)", 2048, 10752),
+                ("conv in_proj", 6144, 2048),
+                ("q / o / conv out_proj", 2048, 2048),
+                ("k / v", 512, 2048),
+            ];
+            for m in [512, 2048, 2392] {
+                for (name, n, k) in shapes {
+                    let tflops = run_prefill_gemm(m, n, k, 20)?;
+                    println!("PREFILL_GEMM m={m} n={n} k={k} {name}: {tflops:.2} TFLOP/s");
+                }
+            }
+        }
         Task::Gemm => {
             for f32 in [false, true] {
                 for n in [512, 1024, 2048, 4096] {

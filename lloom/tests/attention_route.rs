@@ -1,5 +1,5 @@
 //! The prepared attention route on Metal: the kernel it names is the kernel
-//! that runs, a refused request allocates nothing, the workspace it reports
+//! that runs, a refused request asks the Metal pool for nothing, the workspace it reports
 //! is what the call asks the pool for, and the shapes it newly routes are the
 //! attention (`docs/dependency-ordered-reuse-design.md` §8).
 //!
@@ -349,6 +349,277 @@ fn an_invalid_mask_precedes_mixed_kv_conversion() -> Result<()> {
         "valid mixed-KV route changed math"
     );
     eprintln!("mixed-KV mask preflight: invalid=3 allocated=0 dispatched=0; valid dispatches={dispatches} bytes={} exact=true", ws.output + ws.conversion);
+    Ok(())
+}
+
+fn without_backtrace(error: &lloom_tensor::Error) -> &lloom_tensor::Error {
+    match error {
+        lloom_tensor::Error::WithBacktrace { inner, .. } => without_backtrace(inner),
+        _ => error,
+    }
+}
+
+fn assert_attention_device_error(
+    error: &lloom_tensor::Error,
+    q: &Device,
+    other: &Device,
+    op: &str,
+) {
+    match without_backtrace(error) {
+        lloom_tensor::Error::DeviceMismatchBinaryOp(mismatch) => {
+            assert_eq!(mismatch.op, op);
+            assert_eq!(mismatch.lhs, q.location());
+            assert_eq!(mismatch.rhs, other.location());
+        }
+        other => panic!("expected attention device mismatch, got {other:?}"),
+    }
+}
+
+fn assert_conversion_is_observable(device: &Device) -> Result<()> {
+    let (_, k, _) = Inputs::new(64, 1, 33).tensors(DType::F32, device)?;
+    device.synchronize()?;
+    let before = requested(device)?;
+    let window = device
+        .as_metal_device()?
+        .dispatch_census()
+        .open()
+        .expect("census enabled");
+    let converted = k.to_dtype(DType::F16)?;
+    let dispatches: u64 = window.close().iter().map(|(_, n)| n).sum();
+    assert_eq!(requested(device)? - before, (k.elem_count() * 2) as u64);
+    assert_eq!(dispatches, 1, "conversion positive control");
+    assert_eq!(converted.dtype(), DType::F16);
+    device.synchronize()
+}
+
+/// Offset views with a padded row stride exercise the conversion's strided arm.
+fn offset_strided_kv(f: &Inputs, dtype: DType, dev: &Device) -> Result<(Tensor, Tensor)> {
+    let lay = |values: &[f32]| -> Result<Tensor> {
+        let mut padded = Vec::with_capacity(4 * values.len());
+        for _ in 0..2 {
+            for row in values.chunks_exact(f.hd) {
+                padded.extend_from_slice(row);
+                padded.extend(std::iter::repeat_n(0., f.hd));
+            }
+        }
+        Tensor::from_vec(padded, (2, KV_HEADS, f.keys, 2 * f.hd), dev)?
+            .to_dtype(dtype)?
+            .narrow(0, 1, 1)?
+            .narrow(3, 0, f.hd)
+    };
+    Ok((lay(&f.k)?, lay(&f.v)?))
+}
+
+/// Drive the production wrapper, not its private validator. Both device windows
+/// observe foreign Metal conversions; CPU conversion allocations are not counted.
+#[test]
+fn foreign_kv_devices_are_refused_before_routed_conversion() -> Result<()> {
+    std::env::set_var("CANDLE_METAL_PROFILE", "1");
+    let dev = Device::new_metal(0)?;
+    let foreign = Device::new_metal(0)?;
+    assert!(!dev.same_device(&foreign));
+    assert_eq!(
+        dev.location(),
+        foreign.location(),
+        "same GPU, distinct devices"
+    );
+
+    // Pin each device's instrument level with a real conversion before refusals.
+    for device in [&dev, &foreign] {
+        assert_conversion_is_observable(device)?;
+    }
+
+    for (queries, keys, mask_kind, kernel) in [
+        (1, 33, MaskKind::None, AttentionKernel::Vector),
+        (1, 2048, MaskKind::Causal, AttentionKernel::VectorTwoPass),
+        (3, 33, MaskKind::Causal, AttentionKernel::Full),
+        (1, 33, MaskKind::Additive, AttentionKernel::Full),
+    ] {
+        let f = Inputs::new(64, queries, keys);
+        for kv_dtype in [DType::F16, DType::F32] {
+            let mut s = spec(64, DType::F16, mask_kind);
+            s.kv_dtype = kv_dtype;
+            let route = prepare(&dev, s)?;
+            assert_eq!(route.kernel_for(1, queries, keys)?, kernel);
+            let (q, _, _) = f.tensors(DType::F16, &dev)?;
+            let mask = if mask_kind == MaskKind::Additive {
+                Some(Tensor::zeros((2, HEADS, queries, keys), DType::F16, &dev)?.narrow(0, 1, 1)?)
+            } else {
+                None
+            };
+            for strided in [false, true] {
+                let kv = |device: &Device| -> Result<(Tensor, Tensor)> {
+                    if strided {
+                        offset_strided_kv(&f, kv_dtype, device)
+                    } else {
+                        let (_, k, v) = f.tensors(kv_dtype, device)?;
+                        Ok((k, v))
+                    }
+                };
+                let (k, v) = kv(&dev)?;
+                if strided {
+                    assert!(!k.is_contiguous());
+                    assert_ne!(k.layout().start_offset(), 0);
+                }
+                for other in [&Device::Cpu, &foreign] {
+                    let (foreign_k, foreign_v) = kv(other)?;
+                    for (bad_k, bad_v, op) in [
+                        (&foreign_k, &v, "attention: query/key"),
+                        (&k, &foreign_v, "attention: query/value"),
+                        (&foreign_k, &foreign_v, "attention: query/key"),
+                    ] {
+                        dev.synchronize()?;
+                        foreign.synchronize()?;
+                        let before = (requested(&dev)?, requested(&foreign)?);
+                        let local_window = dev
+                            .as_metal_device()?
+                            .dispatch_census()
+                            .open()
+                            .expect("local census");
+                        let foreign_window = foreign
+                            .as_metal_device()?
+                            .dispatch_census()
+                            .open()
+                            .expect("foreign census");
+                        let error = ops::attention(&q, bad_k, bad_v, mask.as_ref(), 0.125, &route)
+                            .expect_err("foreign K/V must be refused");
+                        let local_dispatches = local_window.close();
+                        let foreign_dispatches = foreign_window.close();
+                        assert_attention_device_error(&error, &dev, other, op);
+                        assert_eq!(
+                            (requested(&dev)?, requested(&foreign)?),
+                            before,
+                            "Metal conversion requested storage before device refusal"
+                        );
+                        assert!(
+                            local_dispatches.is_empty(),
+                            "local dispatch before refusal: {local_dispatches:?}"
+                        );
+                        assert!(
+                            foreign_dispatches.is_empty(),
+                            "foreign dispatch before refusal: {foreign_dispatches:?}"
+                        );
+                    }
+                }
+
+                // Same route/math with explicit conversion; no peer-algorithm oracle.
+                let expected = ops::attention(
+                    &q,
+                    &k.to_dtype(DType::F16)?,
+                    &v.to_dtype(DType::F16)?,
+                    mask.as_ref(),
+                    0.125,
+                    &prepare(&dev, spec(64, DType::F16, mask_kind))?,
+                )?;
+                dev.synchronize()?;
+                let before = requested(&dev)?;
+                let window = dev
+                    .as_metal_device()?
+                    .dispatch_census()
+                    .open()
+                    .expect("census enabled");
+                let got = ops::attention(&q, &k, &v, mask.as_ref(), 0.125, &route)?;
+                let dispatches: u64 = window.close().iter().map(|(_, n)| n).sum();
+                let kernel_dispatches = if kernel == AttentionKernel::VectorTwoPass {
+                    2
+                } else {
+                    1
+                };
+                assert_eq!(
+                    dispatches,
+                    kernel_dispatches + if kv_dtype == DType::F32 { 2 } else { 0 }
+                );
+                let ws = route.workspace(1, queries, keys)?;
+                assert_eq!(
+                    requested(&dev)? - before,
+                    (ws.output + ws.scratch + ws.conversion) as u64
+                );
+                assert_eq!(
+                    bits(&got)?,
+                    bits(&expected)?,
+                    "same-route conversion changed math"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Paged requests reach the same validator; mixed-dtype page pools remain
+/// unsupported rather than silently converting or changing the page semantics.
+#[test]
+fn foreign_paged_kv_devices_are_refused_at_route_preflight() -> Result<()> {
+    std::env::set_var("CANDLE_METAL_PROFILE", "1");
+    let dev = Device::new_metal(0)?;
+    let foreign = Device::new_metal(0)?;
+    assert!(!dev.same_device(&foreign));
+    for device in [&dev, &foreign] {
+        assert_conversion_is_observable(device)?;
+    }
+    let (page, queries, keys, slots) = (32usize, 9usize, 70usize, 128usize);
+    let table = [2u32, 1, 0];
+    let live = [keys as u32];
+    let (q, _, _) = Inputs::new(64, queries, keys).tensors(DType::F16, &dev)?;
+    for kv_dtype in [DType::F16, DType::F32] {
+        let mut s = spec(64, DType::F16, MaskKind::Causal);
+        s.layout = KvLayout::Paged { page_size: page };
+        s.bounds.min_queries = 2;
+        s.kv_dtype = kv_dtype;
+        let route = prepare(&dev, s)?;
+        let pool = Inputs::new(64, queries, slots);
+        let (_, k, v) = pool.tensors(kv_dtype, &dev)?;
+        for other in [&Device::Cpu, &foreign] {
+            let (_, foreign_k, foreign_v) = pool.tensors(kv_dtype, other)?;
+            for (bad_k, bad_v, op) in [
+                (&foreign_k, &v, "attention: query/key"),
+                (&k, &foreign_v, "attention: query/value"),
+                (&foreign_k, &foreign_v, "attention: query/key"),
+            ] {
+                dev.synchronize()?;
+                foreign.synchronize()?;
+                let before = (requested(&dev)?, requested(&foreign)?);
+                let local_window = dev
+                    .as_metal_device()?
+                    .dispatch_census()
+                    .open()
+                    .expect("local census");
+                let foreign_window = foreign
+                    .as_metal_device()?
+                    .dispatch_census()
+                    .open()
+                    .expect("foreign census");
+                let error = ops::attention_paged(&q, bad_k, bad_v, 0.125, &route, &table, 3, &live)
+                    .expect_err("foreign page pools must be refused");
+                let local_dispatches = local_window.close();
+                let foreign_dispatches = foreign_window.close();
+                assert_attention_device_error(&error, &dev, other, op);
+                assert_eq!((requested(&dev)?, requested(&foreign)?), before);
+                assert!(local_dispatches.is_empty());
+                assert!(foreign_dispatches.is_empty());
+            }
+        }
+        if kv_dtype == DType::F16 {
+            let expected = ops::sdpa_paged(&q, &k, &v, true, 0.125, page, &table, 3, keys)?;
+            let got = ops::attention_paged(&q, &k, &v, 0.125, &route, &table, 3, &live)?;
+            assert_eq!(bits(&got)?, bits(&expected)?, "same paged kernel/table");
+        } else {
+            dev.synchronize()?;
+            let before = requested(&dev)?;
+            let window = dev
+                .as_metal_device()?
+                .dispatch_census()
+                .open()
+                .expect("census enabled");
+            let error = ops::attention_paged(&q, &k, &v, 0.125, &route, &table, 3, &live)
+                .expect_err("mixed page pools remain unsupported");
+            assert_eq!(
+                without_backtrace(&error).to_string(),
+                "attention_paged: the pool is read at the compute dtype"
+            );
+            assert_eq!(requested(&dev)?, before);
+            assert!(window.close().is_empty());
+        }
+    }
     Ok(())
 }
 

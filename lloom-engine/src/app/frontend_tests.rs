@@ -671,7 +671,10 @@ fn the_unset_defaults_are_the_trees_before_it_except_the_named_exceptions() {
     for e in EXCEPTIONS {
         let r = frontend::row(e.key, e.frontend).unwrap();
         let o = resolve(Some(e.frontend), e.frontend.name(), &batch_for(r), &none).unwrap();
-        let want = if e.landed { e.after } else { e.before };
+        // A landed exception resolves to its `after` where its row holds; a
+        // row a build cannot hold (the Metal rows on the CPU-only x86 gate)
+        // leaves the library's value, which is the row's `before`.
+        let want = if e.landed && r.when.holds(&o) { e.after } else { e.before };
         assert_eq!(
             at(&o, e.key),
             typed(e.key, want),

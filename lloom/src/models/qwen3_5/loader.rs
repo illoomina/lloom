@@ -772,6 +772,9 @@ fn build_dense<P: Profile, R: Read + Seek>(
     let per_position = prefill_bytes_per_position(&cfg);
     let mut model = Decoder::new(ARCH_DENSE, cfg, embed, layers, head, cap, hidden, &device)?;
     model.set_prefill_bytes_per_position(per_position);
+    // Every quantized mat-vec output is a forward's own activation: the
+    // gate's cores arm may skip them past a stop (§2.3e's inventory).
+    model.set_eos_gate_cores(true);
     model.hold_reservation(holds.reservation);
     for k in holds.keep {
         model.keep_alive(k);
@@ -820,6 +823,9 @@ fn build_moe<P: Profile, R: Read + Seek>(
     let per_position = prefill_bytes_per_position(&cfg);
     let mut model = Decoder::new(ARCH_MOE, cfg, embed, layers, head, cap, hidden, &device)?;
     model.set_prefill_bytes_per_position(per_position);
+    // The experts are resident: as for the dense build, plus the router and
+    // the routed experts' mat-vecs, read only by the forward itself.
+    model.set_eos_gate_cores(true);
     model.hold_reservation(holds.reservation);
     for k in holds.keep {
         model.keep_alive(k);

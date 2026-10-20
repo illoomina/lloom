@@ -123,13 +123,14 @@ fn ring(eos: &[u32], dev: &Device) -> Result<Ring> {
     )
 }
 
-fn flow(n: usize, run_ahead: usize, gate: bool) -> DecodeOptions {
+fn flow(n: usize, run_ahead: usize, gate: bool, cores: bool) -> DecodeOptions {
     DecodeOptions {
         lookahead: 1,
         stream_via_reader: true,
         adaptive_commit: true,
         run_ahead,
         eos_gate: gate,
+        eos_gate_cores: Some(cores),
         ..DecodeOptions::new(n)
     }
 }
@@ -139,6 +140,8 @@ fn flow(n: usize, run_ahead: usize, gate: bool) -> DecodeOptions {
 struct Case {
     overrun: usize,
     fired: bool,
+    /// The gate's cores arm was on for the run (the report's).
+    cores: bool,
     unwritten: bool,
     state_matches: bool,
     /// The steps the reconciled state can still undo: none (its standing
@@ -158,6 +161,7 @@ fn case<P: Profile>(
     k: usize,
     run_ahead: usize,
     gate: bool,
+    cores: bool,
     max_tokens: usize,
 ) -> Result<Case>
 where
@@ -203,12 +207,13 @@ where
         &mut rb,
         &mut greedy(),
         &prompt,
-        &flow(max_tokens, run_ahead, gate),
+        &flow(max_tokens, run_ahead, gate, cores),
         &mut sink,
     )?;
     let mut c = Case {
         overrun: out.stats.overrun,
         fired: out.stats.eos_gate.is_some_and(|r| r.fired),
+        cores: out.stats.eos_gate.is_some_and(|r| r.cores),
         unwritten: out.stats.overrun_unwritten,
         ..Case::default()
     };
@@ -302,19 +307,20 @@ where
                 k,
                 run_ahead,
                 true,
+                false,
                 k + 1 + EXTRA,
             )?;
             eprintln!("QWEN-GATE {at}: gated {g:?}");
             assert_reconciled(&at, &g);
         }
         let at = format!("{shape} EOS at {k}");
-        let u = case::<P>(&dev, verify, None, &stream, k, 8, false, k + 1 + EXTRA)?;
+        let u = case::<P>(&dev, verify, None, &stream, k, 8, false, false, k + 1 + EXTRA)?;
         eprintln!("QWEN-GATE {at}: ungated {u:?}");
         assert!(
             !u.unwritten && u.reuse.is_none(),
             "{at}: ungated, the window cannot take it back"
         );
-        let a = case::<P>(&dev, verify, None, &stream, k, 8, true, k)?;
+        let a = case::<P>(&dev, verify, None, &stream, k, 8, true, false, k)?;
         eprintln!("QWEN-GATE {at}: armed, unfired {a:?}");
         assert!(!a.fired && a.overrun == 0, "{at}: the EOS never sampled");
         assert!(a.state_matches, "{at}: armed but unfired is the reference");
@@ -347,9 +353,56 @@ fn a_kv_grow_inside_the_gated_overrun_keeps_the_prefix() -> Result<()> {
     for &k in &cuts[..3] {
         let kv = Some((PROMPT.len() + k + 2, precision));
         let at = format!("KV of {} at EOS {k}", PROMPT.len() + k + 2);
-        let g = case::<CrownExact>(&dev, 0, kv, &stream, k, 8, true, k + 1 + EXTRA)?;
+        let g = case::<CrownExact>(&dev, 0, kv, &stream, k, 8, true, false, k + 1 + EXTRA)?;
         eprintln!("QWEN-GATE grow {at}: gated {g:?}");
         assert_reconciled(&at, &g);
+    }
+    Ok(())
+}
+
+/// The gate's cores arm (`DecodeOptions::eos_gate_cores`): the quantized
+/// mat-vecs of every forward past the EOS return at once too. The state is
+/// still the reference's once reconciled, with and without a KV growth
+/// inside the overrun, at three `run_ahead`s: what the cores skip was read
+/// by nothing the accepted state keeps. Armed but unfired, the run is the
+/// reference's (the gated cores are the plain ones while the flag is clear).
+#[test]
+fn under_the_cores_arm_the_gated_overrun_still_reconciles() -> Result<()> {
+    pin();
+    let dev = Device::new_metal(0)?;
+    let stream = stream(&dev)?;
+    let cuts = cuts(&stream);
+    assert!(cuts.len() >= 3, "too few EOS positions in {stream:?}");
+    let precision = KvPrecision::dense(lloom_tensor::DType::F32);
+    for &k in &cuts[..3] {
+        for run_ahead in [1usize, 3, 8] {
+            let at = format!("cores, EOS at {k}, run_ahead {run_ahead}");
+            let g = case::<CrownExact>(
+                &dev,
+                0,
+                None,
+                &stream,
+                k,
+                run_ahead,
+                true,
+                true,
+                k + 1 + EXTRA,
+            )?;
+            eprintln!("QWEN-GATE {at}: gated {g:?}");
+            assert!(g.cores, "{at}: the cores arm ran (the tiny Qwen3.5 admits it)");
+            assert_reconciled(&at, &g);
+        }
+        let kv = Some((PROMPT.len() + k + 2, precision));
+        let at = format!("cores, KV of {} at EOS {k}", PROMPT.len() + k + 2);
+        let g = case::<CrownExact>(&dev, 0, kv, &stream, k, 8, true, true, k + 1 + EXTRA)?;
+        eprintln!("QWEN-GATE {at}: gated {g:?}");
+        assert!(g.cores, "{at}");
+        assert_reconciled(&at, &g);
+        let at = format!("cores, EOS at {k}");
+        let a = case::<CrownExact>(&dev, 0, None, &stream, k, 8, true, true, k)?;
+        eprintln!("QWEN-GATE {at}: armed, unfired {a:?}");
+        assert!(!a.fired && a.overrun == 0, "{at}: the EOS never sampled");
+        assert!(a.state_matches, "{at}: armed but unfired is the reference");
     }
     Ok(())
 }

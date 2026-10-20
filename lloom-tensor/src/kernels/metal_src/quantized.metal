@@ -8,6 +8,18 @@ using namespace metal;
 
 #define N_SIMDWIDTH 32 // assuming SIMD group size is 32
 
+// The EOS gate (`kernels/metal/eos_gate.rs`): under function constant 777 a
+// mat-vec takes the gate's flag at buffer 30 and returns before reading or
+// writing anything when it is set. The plain instantiation (777 = false) has
+// no such argument and no such read. Guarded: the merged translation unit
+// sees `utils.metal`'s copy of this block too.
+#ifndef LLOOM_EOS_GATE_DECL
+#define LLOOM_EOS_GATE_DECL
+constant bool eos_gated [[function_constant(777)]];
+#define EOS_GATE_ARG device const uint *eos_gate_flag [[buffer(30), function_constant(eos_gated)]]
+#define EOS_GATE_CHECK if (eos_gated && eos_gate_flag[0] != 0) { return; }
+#endif
+
 #if defined(__HAVE_BFLOAT__)
 typedef matrix<bfloat, 4, 4> bfloat4x4;
 #endif
@@ -2739,7 +2751,9 @@ kernel void kernel_mul_mv_q2_0_f32(
         constant   uint    & r3,
         uint3 tgpig[[threadgroup_position_in_grid]],
         uint  tiisg[[thread_index_in_simdgroup]],
-        uint  sgitg[[simdgroup_index_in_threadgroup]]) {
+        uint  sgitg[[simdgroup_index_in_threadgroup]],
+        EOS_GATE_ARG) {
+    EOS_GATE_CHECK
     kernel_mul_mv_q2_0_f32_impl(src0,src1,dst,ne00,ne01,ne02,ne10,ne12,ne0,ne1,r2,r3,nullptr,tgpig,tiisg,sgitg);
 }
 
@@ -2765,7 +2779,9 @@ kernel void kernel_mul_mv_q4_0_f32(
         constant   uint    & r3,
         uint3 tgpig[[threadgroup_position_in_grid]],
         uint  tiisg[[thread_index_in_simdgroup]],
-        uint  sgitg[[simdgroup_index_in_threadgroup]]) {
+        uint  sgitg[[simdgroup_index_in_threadgroup]],
+        EOS_GATE_ARG) {
+    EOS_GATE_CHECK
     mul_vec_q_n_f32_impl<block_q4_0, N_DST, N_SIMDGROUP, N_SIMDWIDTH>(src0,src1,dst,ne00,ne01,ne02,ne10,ne12,ne0,ne1,r2,r3,nullptr,tgpig,tiisg,sgitg);
 }
 
@@ -2791,7 +2807,9 @@ kernel void kernel_mul_mv_q4_1_f32(
         constant   uint    & r3,
         uint3 tgpig[[threadgroup_position_in_grid]],
         uint tiisg[[thread_index_in_simdgroup]],
-        uint sgitg[[simdgroup_index_in_threadgroup]]) {
+        uint sgitg[[simdgroup_index_in_threadgroup]],
+        EOS_GATE_ARG) {
+    EOS_GATE_CHECK
      mul_vec_q_n_f32_impl<block_q4_1, N_DST, N_SIMDGROUP, N_SIMDWIDTH>(src0,src1,dst,ne00,ne01,ne02,ne10,ne12,ne0,ne1,r2,r3,nullptr,tgpig,tiisg,sgitg);
 }
 
@@ -2817,7 +2835,9 @@ kernel void kernel_mul_mv_q5_0_f32(
         constant   uint    & r3,
         uint3 tgpig[[threadgroup_position_in_grid]],
         uint  tiisg[[thread_index_in_simdgroup]],
-        uint  sgitg[[simdgroup_index_in_threadgroup]]) {
+        uint  sgitg[[simdgroup_index_in_threadgroup]],
+        EOS_GATE_ARG) {
+    EOS_GATE_CHECK
     mul_vec_q_n_f32_impl<block_q5_0, N_DST, N_SIMDGROUP, N_SIMDWIDTH>(src0,src1,dst,ne00,ne01,ne02,ne10,ne12,ne0,ne1,r2,r3,nullptr,tgpig,tiisg,sgitg);
 }
 
@@ -2843,7 +2863,9 @@ kernel void kernel_mul_mv_q5_1_f32(
         constant   uint    & r3,
         uint3 tgpig[[threadgroup_position_in_grid]],
         uint  tiisg[[thread_index_in_simdgroup]],
-        uint  sgitg[[simdgroup_index_in_threadgroup]]) {
+        uint  sgitg[[simdgroup_index_in_threadgroup]],
+        EOS_GATE_ARG) {
+    EOS_GATE_CHECK
     mul_vec_q_n_f32_impl<block_q5_1, N_DST, N_SIMDGROUP, N_SIMDWIDTH>(src0,src1,dst,ne00,ne01,ne02,ne10,ne12,ne0,ne1,r2,r3,nullptr,tgpig,tiisg,sgitg);
 }
 
@@ -3009,7 +3031,9 @@ kernel void kernel_mul_mv_q8_0_f32(
         constant   uint    & r3,
         uint3 tgpig[[threadgroup_position_in_grid]],
         uint  tiisg[[thread_index_in_simdgroup]],
-        uint  sgitg[[simdgroup_index_in_threadgroup]]) {
+        uint  sgitg[[simdgroup_index_in_threadgroup]],
+        EOS_GATE_ARG) {
+    EOS_GATE_CHECK
     kernel_mul_mv_q8_0_f32_impl(src0,src1,dst,ne00,ne01,ne02,ne10,ne12,ne0,ne1,r2,r3,nullptr,tgpig,tiisg,sgitg);
 }
 
@@ -3115,7 +3139,9 @@ kernel void kernel_mul_mv(
         constant   uint    & r2,
         constant   uint    & r3,
         uint3 tgpig[[threadgroup_position_in_grid]],
-        uint  tiisg[[thread_index_in_simdgroup]]) {
+        uint  tiisg[[thread_index_in_simdgroup]],
+        EOS_GATE_ARG) {
+    EOS_GATE_CHECK
     kernel_mul_mv_impl<T0, T04, T1, T14>(
         src0,
         src1,
@@ -5037,7 +5063,9 @@ kernel void kernel_mul_mv_q2_K_f32(
         constant   uint    & r3,
         uint3 tgpig[[threadgroup_position_in_grid]],
         uint  tiisg[[thread_index_in_simdgroup]],
-        uint  sgitg[[simdgroup_index_in_threadgroup]]) {
+        uint  sgitg[[simdgroup_index_in_threadgroup]],
+        EOS_GATE_ARG) {
+    EOS_GATE_CHECK
 
     kernel_mul_mv_q2_K_f32_impl(src0, src1, dst, ne00, ne01, ne02, ne10, ne12, ne0, ne1, r2, r3, nullptr, tgpig, tiisg, sgitg);
 }
@@ -5263,7 +5291,9 @@ kernel void kernel_mul_mv_q3_K_f32(
         constant   uint    & r3,
         uint3 tgpig[[threadgroup_position_in_grid]],
         uint  tiisg[[thread_index_in_simdgroup]],
-        uint  sgitg[[simdgroup_index_in_threadgroup]]) {
+        uint  sgitg[[simdgroup_index_in_threadgroup]],
+        EOS_GATE_ARG) {
+    EOS_GATE_CHECK
 
     kernel_mul_mv_q3_K_f32_impl(src0, src1, dst, ne00, ne01, ne02, ne10, ne12, ne0, ne1, r2, r3, nullptr, tgpig, tiisg, sgitg);
 }
@@ -5443,7 +5473,9 @@ kernel void kernel_mul_mv_q4_K_f32(
         constant   uint    & r3,
         uint3 tgpig[[threadgroup_position_in_grid]],
         uint tiisg[[thread_index_in_simdgroup]],
-        uint sgitg[[simdgroup_index_in_threadgroup]]) {
+        uint sgitg[[simdgroup_index_in_threadgroup]],
+        EOS_GATE_ARG) {
+    EOS_GATE_CHECK
 
     kernel_mul_mv_q4_K_f32_impl(src0, src1, dst, ne00, ne01, ne02, ne10, ne12, ne0, ne1, r2, r3, nullptr, tgpig, tiisg, sgitg);
 }
@@ -5637,7 +5669,9 @@ kernel void kernel_mul_mv_q5_K_f32(
         constant   uint    & r3,
         uint3 tgpig[[threadgroup_position_in_grid]],
         uint  tiisg[[thread_index_in_simdgroup]],
-        uint  sgitg[[simdgroup_index_in_threadgroup]]) {
+        uint  sgitg[[simdgroup_index_in_threadgroup]],
+        EOS_GATE_ARG) {
+    EOS_GATE_CHECK
 
     kernel_mul_mv_q5_K_f32_impl(src0, src1, dst, ne00, ne01, ne02, ne10, ne12, ne0, ne1, r2, r3, nullptr, tgpig, tiisg, sgitg);
 }
@@ -5792,7 +5826,9 @@ kernel void kernel_mul_mv_q6_K_f32(
         constant   uint    & r3,
         uint3 tgpig[[threadgroup_position_in_grid]],
         uint  tiisg[[thread_index_in_simdgroup]],
-        uint  sgitg[[simdgroup_index_in_threadgroup]]) {
+        uint  sgitg[[simdgroup_index_in_threadgroup]],
+        EOS_GATE_ARG) {
+    EOS_GATE_CHECK
 
     kernel_mul_mv_q6_K_f32_impl(src0, src1, dst, ne00, ne01, ne02, ne10, ne12, ne0, ne1, r2, r3, nullptr, tgpig, tiisg, sgitg);
 }
@@ -5957,7 +5993,9 @@ kernel void kernel_mul_mv_iq2_xxs_f32(
         threadgroup int8_t * shared_values [[threadgroup(0)]],
         uint3 tgpig[[threadgroup_position_in_grid]],
         uint  tiisg[[thread_index_in_simdgroup]],
-        uint  sgitg[[simdgroup_index_in_threadgroup]]) {
+        uint  sgitg[[simdgroup_index_in_threadgroup]],
+        EOS_GATE_ARG) {
+    EOS_GATE_CHECK
 
     kernel_mul_mv_iq2_xxs_f32_impl(src0, src1, dst, ne00, ne01, ne02, ne10, ne12, ne0, ne1, r2, r3, shared_values, tgpig, tiisg, sgitg);
 }
@@ -6135,7 +6173,9 @@ kernel void kernel_mul_mv_iq2_xs_f32(
         threadgroup int8_t * shared_values [[threadgroup(0)]],
         uint3 tgpig[[threadgroup_position_in_grid]],
         uint  tiisg[[thread_index_in_simdgroup]],
-        uint  sgitg[[simdgroup_index_in_threadgroup]]) {
+        uint  sgitg[[simdgroup_index_in_threadgroup]],
+        EOS_GATE_ARG) {
+    EOS_GATE_CHECK
 
     kernel_mul_mv_iq2_xs_f32_impl(src0, src1, dst, ne00, ne01, ne02, ne10, ne12, ne0, ne1, r2, r3, shared_values, tgpig, tiisg, sgitg);
 }
@@ -6302,7 +6342,9 @@ kernel void kernel_mul_mv_iq3_xxs_f32(
         threadgroup int8_t * shared_values [[threadgroup(0)]],
         uint3 tgpig[[threadgroup_position_in_grid]],
         uint  tiisg[[thread_index_in_simdgroup]],
-        uint  sgitg[[simdgroup_index_in_threadgroup]]) {
+        uint  sgitg[[simdgroup_index_in_threadgroup]],
+        EOS_GATE_ARG) {
+    EOS_GATE_CHECK
 
     kernel_mul_mv_iq3_xxs_f32_impl(src0, src1, dst, ne00, ne01, ne02, ne10, ne12, ne0, ne1, r2, r3, shared_values, tgpig, tiisg, sgitg);
 }
@@ -6471,7 +6513,9 @@ kernel void kernel_mul_mv_iq3_s_f32(
         threadgroup int8_t * shared_values [[threadgroup(0)]],
         uint3 tgpig[[threadgroup_position_in_grid]],
         uint  tiisg[[thread_index_in_simdgroup]],
-        uint  sgitg[[simdgroup_index_in_threadgroup]]) {
+        uint  sgitg[[simdgroup_index_in_threadgroup]],
+        EOS_GATE_ARG) {
+    EOS_GATE_CHECK
 
     kernel_mul_mv_iq3_s_f32_impl(src0, src1, dst, ne00, ne01, ne02, ne10, ne12, ne0, ne1, r2, r3, shared_values, tgpig, tiisg, sgitg);
 }
@@ -6643,7 +6687,9 @@ kernel void kernel_mul_mv_iq2_s_f32(
         threadgroup int8_t * shared_values [[threadgroup(0)]],
         uint3 tgpig[[threadgroup_position_in_grid]],
         uint  tiisg[[thread_index_in_simdgroup]],
-        uint  sgitg[[simdgroup_index_in_threadgroup]]) {
+        uint  sgitg[[simdgroup_index_in_threadgroup]],
+        EOS_GATE_ARG) {
+    EOS_GATE_CHECK
 
     kernel_mul_mv_iq2_s_f32_impl(src0, src1, dst, ne00, ne01, ne02, ne10, ne12, ne0, ne1, r2, r3, shared_values, tgpig, tiisg, sgitg);
 }
@@ -6965,7 +7011,9 @@ kernel void kernel_mul_mv_iq4_nl_f32(
         threadgroup int8_t * shared_values [[threadgroup(0)]],
         uint3 tgpig[[threadgroup_position_in_grid]],
         uint tiisg[[thread_index_in_simdgroup]],
-        uint sgitg[[simdgroup_index_in_threadgroup]]) {
+        uint sgitg[[simdgroup_index_in_threadgroup]],
+        EOS_GATE_ARG) {
+    EOS_GATE_CHECK
 
     kernel_mul_mv_iq4_nl_f32_impl(src0, src1, dst, ne00, ne01, ne02, ne10, ne12, ne0, ne1, r2, r3, shared_values, tgpig, tiisg, sgitg);
 }
@@ -6994,7 +7042,9 @@ kernel void kernel_mul_mv_iq4_xs_f32(
         threadgroup int8_t * shared_values [[threadgroup(0)]],
         uint3 tgpig[[threadgroup_position_in_grid]],
         uint tiisg[[thread_index_in_simdgroup]],
-        uint sgitg[[simdgroup_index_in_threadgroup]]) {
+        uint sgitg[[simdgroup_index_in_threadgroup]],
+        EOS_GATE_ARG) {
+    EOS_GATE_CHECK
 
     kernel_mul_mv_iq4_xs_f32_impl(src0, src1, dst, ne00, ne01, ne02, ne10, ne12, ne0, ne1, r2, r3, shared_values, tgpig, tiisg, sgitg);
 }
@@ -8307,7 +8357,9 @@ kernel void kernel_mul_mv_id(
         uint3                  tgpig[[threadgroup_position_in_grid]],
         uint                   tiitg[[thread_index_in_threadgroup]],
         uint                   tiisg[[thread_index_in_simdgroup]],
-        uint                   sgitg[[simdgroup_index_in_threadgroup]]) {
+        uint                   sgitg[[simdgroup_index_in_threadgroup]],
+        EOS_GATE_ARG) {
+    EOS_GATE_CHECK
     const int iid1 = tgpig.z/nei0;
     const int idx = tgpig.z%nei0;
 
@@ -8450,7 +8502,9 @@ kernel void kernel_mul_mv_id_f16(
         uint3                  tgpig[[threadgroup_position_in_grid]],
         uint                   tiitg[[thread_index_in_threadgroup]],
         uint                   tiisg[[thread_index_in_simdgroup]],
-        uint                   sgitg[[simdgroup_index_in_threadgroup]]) {
+        uint                   sgitg[[simdgroup_index_in_threadgroup]],
+        EOS_GATE_ARG) {
+    EOS_GATE_CHECK
     const int iid1 = tgpig.z/nei0;
     const int idx = tgpig.z%nei0;
 
@@ -8559,7 +8613,9 @@ kernel void kernel_mul_mv_id2(
         uint3                  tgpig[[threadgroup_position_in_grid]],
         uint                   tiitg[[thread_index_in_threadgroup]],
         uint                   tiisg[[thread_index_in_simdgroup]],
-        uint                   sgitg[[simdgroup_index_in_threadgroup]]) {
+        uint                   sgitg[[simdgroup_index_in_threadgroup]],
+        EOS_GATE_ARG) {
+    EOS_GATE_CHECK
     const int planes = nei0 * nei1;
     int hf;                                   // 0: src0a -> dst[0]; 1: src0b -> dst[1]
     int z;                                    // the plane, (row, slot)
@@ -8663,7 +8719,9 @@ kernel void kernel_mul_mv_rows(
         threadgroup int8_t * shared_values [[threadgroup(0)]],
         uint3 tgpig[[threadgroup_position_in_grid]],
         uint  tiisg[[thread_index_in_simdgroup]],
-        uint  sgitg[[simdgroup_index_in_threadgroup]]) {
+        uint  sgitg[[simdgroup_index_in_threadgroup]],
+        EOS_GATE_ARG) {
+    EOS_GATE_CHECK
     core(src0, src1, dst, ne00, ne01, ne02, ne10, ne12, ne0, ne1, r2, r3, shared_values, tgpig, tiisg, sgitg,
          mv_rows_plain<NR1>(tgpig, ne10, ne0, ne1));
 }
@@ -8754,7 +8812,9 @@ kernel void kernel_mul_mv_id_rows(
         uint3                  tgpig[[threadgroup_position_in_grid]],
         uint                   tiitg[[thread_index_in_threadgroup]],
         uint                   tiisg[[thread_index_in_simdgroup]],
-        uint                   sgitg[[simdgroup_index_in_threadgroup]]) {
+        uint                   sgitg[[simdgroup_index_in_threadgroup]],
+        EOS_GATE_ARG) {
+    EOS_GATE_CHECK
     mv_id_rows<ACT, STORE, NR1, core>(src0s, src1, dst, ids, nei0, nei1, nbi1, ne00, ne01, nb02,
                                       ne10, ne11, nb11, nb12, ne0, ne1, tgpig.z, 0,
                                       shared_values, tgpig, tiisg, sgitg);
@@ -8792,7 +8852,9 @@ kernel void kernel_mul_mv_id2_rows(
         uint3                  tgpig[[threadgroup_position_in_grid]],
         uint                   tiitg[[thread_index_in_threadgroup]],
         uint                   tiisg[[thread_index_in_simdgroup]],
-        uint                   sgitg[[simdgroup_index_in_threadgroup]]) {
+        uint                   sgitg[[simdgroup_index_in_threadgroup]],
+        EOS_GATE_ARG) {
+    EOS_GATE_CHECK
     const int planes = nei0 * nei1;
     int hf;
     int z;
@@ -8950,7 +9012,9 @@ kernel void kernel_mul_mv_q4_0_generic(
         constant   uint    & r3,
         uint3 tgpig[[threadgroup_position_in_grid]],
         uint  tiisg[[thread_index_in_simdgroup]],
-        uint  sgitg[[simdgroup_index_in_threadgroup]]) {
+        uint  sgitg[[simdgroup_index_in_threadgroup]],
+        EOS_GATE_ARG) {
+    EOS_GATE_CHECK
     mul_vec_q_n_impl<block_q4_0, N_DST, N_SIMDGROUP, N_SIMDWIDTH, ACT, STORE, 1>(src0,src1,dst,ne00,ne01,ne02,ne10,ne12,ne0,ne1,r2,r3,nullptr,tgpig,tiisg,sgitg, mv_rows_plain<1>(tgpig, ne10, ne0, ne1));
 }
 
@@ -8977,7 +9041,9 @@ kernel void kernel_mul_mv_q4_1_generic(
         constant   uint    & r3,
         uint3 tgpig[[threadgroup_position_in_grid]],
         uint  tiisg[[thread_index_in_simdgroup]],
-        uint  sgitg[[simdgroup_index_in_threadgroup]]) {
+        uint  sgitg[[simdgroup_index_in_threadgroup]],
+        EOS_GATE_ARG) {
+    EOS_GATE_CHECK
     mul_vec_q_n_impl<block_q4_1, N_DST, N_SIMDGROUP, N_SIMDWIDTH, ACT, STORE, 1>(src0,src1,dst,ne00,ne01,ne02,ne10,ne12,ne0,ne1,r2,r3,nullptr,tgpig,tiisg,sgitg, mv_rows_plain<1>(tgpig, ne10, ne0, ne1));
 }
 
@@ -9004,7 +9070,9 @@ kernel void kernel_mul_mv_q5_0_generic(
         constant   uint    & r3,
         uint3 tgpig[[threadgroup_position_in_grid]],
         uint  tiisg[[thread_index_in_simdgroup]],
-        uint  sgitg[[simdgroup_index_in_threadgroup]]) {
+        uint  sgitg[[simdgroup_index_in_threadgroup]],
+        EOS_GATE_ARG) {
+    EOS_GATE_CHECK
     mul_vec_q_n_impl<block_q5_0, N_DST, N_SIMDGROUP, N_SIMDWIDTH, ACT, STORE, 1>(src0,src1,dst,ne00,ne01,ne02,ne10,ne12,ne0,ne1,r2,r3,nullptr,tgpig,tiisg,sgitg, mv_rows_plain<1>(tgpig, ne10, ne0, ne1));
 }
 
@@ -9031,7 +9099,9 @@ kernel void kernel_mul_mv_q5_1_generic(
         constant   uint    & r3,
         uint3 tgpig[[threadgroup_position_in_grid]],
         uint  tiisg[[thread_index_in_simdgroup]],
-        uint  sgitg[[simdgroup_index_in_threadgroup]]) {
+        uint  sgitg[[simdgroup_index_in_threadgroup]],
+        EOS_GATE_ARG) {
+    EOS_GATE_CHECK
     mul_vec_q_n_impl<block_q5_1, N_DST, N_SIMDGROUP, N_SIMDWIDTH, ACT, STORE, 1>(src0,src1,dst,ne00,ne01,ne02,ne10,ne12,ne0,ne1,r2,r3,nullptr,tgpig,tiisg,sgitg, mv_rows_plain<1>(tgpig, ne10, ne0, ne1));
 }
 
@@ -9058,7 +9128,9 @@ kernel void kernel_mul_mv_q8_0_generic(
         constant   uint    & r3,
         uint3 tgpig[[threadgroup_position_in_grid]],
         uint  tiisg[[thread_index_in_simdgroup]],
-        uint  sgitg[[simdgroup_index_in_threadgroup]]) {
+        uint  sgitg[[simdgroup_index_in_threadgroup]],
+        EOS_GATE_ARG) {
+    EOS_GATE_CHECK
     kernel_mul_mv_q8_0_impl<ACT, STORE, 1>(src0,src1,dst,ne00,ne01,ne02,ne10,ne12,ne0,ne1,r2,r3,nullptr,tgpig,tiisg,sgitg, mv_rows_plain<1>(tgpig, ne10, ne0, ne1));
 }
 
@@ -9085,7 +9157,9 @@ kernel void kernel_mul_mv_q2_K_generic(
         constant   uint    & r3,
         uint3 tgpig[[threadgroup_position_in_grid]],
         uint  tiisg[[thread_index_in_simdgroup]],
-        uint  sgitg[[simdgroup_index_in_threadgroup]]) {
+        uint  sgitg[[simdgroup_index_in_threadgroup]],
+        EOS_GATE_ARG) {
+    EOS_GATE_CHECK
     kernel_mul_mv_q2_K_impl<ACT, STORE, 1>(src0, src1, dst, ne00, ne01, ne02, ne10, ne12, ne0, ne1, r2, r3, nullptr, tgpig, tiisg, sgitg, mv_rows_plain<1>(tgpig, ne10, ne0, ne1));
 }
 
@@ -9112,7 +9186,9 @@ kernel void kernel_mul_mv_q3_K_generic(
         constant   uint    & r3,
         uint3 tgpig[[threadgroup_position_in_grid]],
         uint  tiisg[[thread_index_in_simdgroup]],
-        uint  sgitg[[simdgroup_index_in_threadgroup]]) {
+        uint  sgitg[[simdgroup_index_in_threadgroup]],
+        EOS_GATE_ARG) {
+    EOS_GATE_CHECK
     kernel_mul_mv_q3_K_impl<ACT, STORE, 1>(src0, src1, dst, ne00, ne01, ne02, ne10, ne12, ne0, ne1, r2, r3, nullptr, tgpig, tiisg, sgitg, mv_rows_plain<1>(tgpig, ne10, ne0, ne1));
 }
 
@@ -9139,7 +9215,9 @@ kernel void kernel_mul_mv_q4_K_generic(
         constant   uint    & r3,
         uint3 tgpig[[threadgroup_position_in_grid]],
         uint  tiisg[[thread_index_in_simdgroup]],
-        uint  sgitg[[simdgroup_index_in_threadgroup]]) {
+        uint  sgitg[[simdgroup_index_in_threadgroup]],
+        EOS_GATE_ARG) {
+    EOS_GATE_CHECK
     kernel_mul_mv_q4_K_impl<ACT, STORE, 1>(src0, src1, dst, ne00, ne01, ne02, ne10, ne12, ne0, ne1, r2, r3, nullptr, tgpig, tiisg, sgitg, mv_rows_plain<1>(tgpig, ne10, ne0, ne1));
 }
 
@@ -9166,7 +9244,9 @@ kernel void kernel_mul_mv_q5_K_generic(
         constant   uint    & r3,
         uint3 tgpig[[threadgroup_position_in_grid]],
         uint  tiisg[[thread_index_in_simdgroup]],
-        uint  sgitg[[simdgroup_index_in_threadgroup]]) {
+        uint  sgitg[[simdgroup_index_in_threadgroup]],
+        EOS_GATE_ARG) {
+    EOS_GATE_CHECK
     kernel_mul_mv_q5_K_impl<ACT, STORE, 1>(src0, src1, dst, ne00, ne01, ne02, ne10, ne12, ne0, ne1, r2, r3, nullptr, tgpig, tiisg, sgitg, mv_rows_plain<1>(tgpig, ne10, ne0, ne1));
 }
 
@@ -9193,7 +9273,9 @@ kernel void kernel_mul_mv_q6_K_generic(
         constant   uint    & r3,
         uint3 tgpig[[threadgroup_position_in_grid]],
         uint  tiisg[[thread_index_in_simdgroup]],
-        uint  sgitg[[simdgroup_index_in_threadgroup]]) {
+        uint  sgitg[[simdgroup_index_in_threadgroup]],
+        EOS_GATE_ARG) {
+    EOS_GATE_CHECK
     kernel_mul_mv_q6_K_impl<ACT, STORE, 1>(src0, src1, dst, ne00, ne01, ne02, ne10, ne12, ne0, ne1, r2, r3, nullptr, tgpig, tiisg, sgitg, mv_rows_plain<1>(tgpig, ne10, ne0, ne1));
 }
 
@@ -9221,7 +9303,9 @@ kernel void kernel_mul_mv_iq2_xxs_generic(
         threadgroup int8_t * shared_values [[threadgroup(0)]],
         uint3 tgpig[[threadgroup_position_in_grid]],
         uint  tiisg[[thread_index_in_simdgroup]],
-        uint  sgitg[[simdgroup_index_in_threadgroup]]) {
+        uint  sgitg[[simdgroup_index_in_threadgroup]],
+        EOS_GATE_ARG) {
+    EOS_GATE_CHECK
     kernel_mul_mv_iq2_xxs_impl<ACT, STORE, 1>(src0, src1, dst, ne00, ne01, ne02, ne10, ne12, ne0, ne1, r2, r3, shared_values, tgpig, tiisg, sgitg, mv_rows_plain<1>(tgpig, ne10, ne0, ne1));
 }
 
@@ -9249,7 +9333,9 @@ kernel void kernel_mul_mv_iq2_xs_generic(
         threadgroup int8_t * shared_values [[threadgroup(0)]],
         uint3 tgpig[[threadgroup_position_in_grid]],
         uint  tiisg[[thread_index_in_simdgroup]],
-        uint  sgitg[[simdgroup_index_in_threadgroup]]) {
+        uint  sgitg[[simdgroup_index_in_threadgroup]],
+        EOS_GATE_ARG) {
+    EOS_GATE_CHECK
     kernel_mul_mv_iq2_xs_impl<ACT, STORE, 1>(src0, src1, dst, ne00, ne01, ne02, ne10, ne12, ne0, ne1, r2, r3, shared_values, tgpig, tiisg, sgitg, mv_rows_plain<1>(tgpig, ne10, ne0, ne1));
 }
 
@@ -9277,7 +9363,9 @@ kernel void kernel_mul_mv_iq3_xxs_generic(
         threadgroup int8_t * shared_values [[threadgroup(0)]],
         uint3 tgpig[[threadgroup_position_in_grid]],
         uint  tiisg[[thread_index_in_simdgroup]],
-        uint  sgitg[[simdgroup_index_in_threadgroup]]) {
+        uint  sgitg[[simdgroup_index_in_threadgroup]],
+        EOS_GATE_ARG) {
+    EOS_GATE_CHECK
     kernel_mul_mv_iq3_xxs_impl<ACT, STORE, 1>(src0, src1, dst, ne00, ne01, ne02, ne10, ne12, ne0, ne1, r2, r3, shared_values, tgpig, tiisg, sgitg, mv_rows_plain<1>(tgpig, ne10, ne0, ne1));
 }
 
@@ -9305,7 +9393,9 @@ kernel void kernel_mul_mv_iq3_s_generic(
         threadgroup int8_t * shared_values [[threadgroup(0)]],
         uint3 tgpig[[threadgroup_position_in_grid]],
         uint  tiisg[[thread_index_in_simdgroup]],
-        uint  sgitg[[simdgroup_index_in_threadgroup]]) {
+        uint  sgitg[[simdgroup_index_in_threadgroup]],
+        EOS_GATE_ARG) {
+    EOS_GATE_CHECK
     kernel_mul_mv_iq3_s_impl<ACT, STORE, 1>(src0, src1, dst, ne00, ne01, ne02, ne10, ne12, ne0, ne1, r2, r3, shared_values, tgpig, tiisg, sgitg, mv_rows_plain<1>(tgpig, ne10, ne0, ne1));
 }
 
@@ -9333,7 +9423,9 @@ kernel void kernel_mul_mv_iq2_s_generic(
         threadgroup int8_t * shared_values [[threadgroup(0)]],
         uint3 tgpig[[threadgroup_position_in_grid]],
         uint  tiisg[[thread_index_in_simdgroup]],
-        uint  sgitg[[simdgroup_index_in_threadgroup]]) {
+        uint  sgitg[[simdgroup_index_in_threadgroup]],
+        EOS_GATE_ARG) {
+    EOS_GATE_CHECK
     kernel_mul_mv_iq2_s_impl<ACT, STORE, 1>(src0, src1, dst, ne00, ne01, ne02, ne10, ne12, ne0, ne1, r2, r3, shared_values, tgpig, tiisg, sgitg, mv_rows_plain<1>(tgpig, ne10, ne0, ne1));
 }
 
@@ -9361,7 +9453,9 @@ kernel void kernel_mul_mv_iq4_nl_generic(
         threadgroup int8_t * shared_values [[threadgroup(0)]],
         uint3 tgpig[[threadgroup_position_in_grid]],
         uint  tiisg[[thread_index_in_simdgroup]],
-        uint  sgitg[[simdgroup_index_in_threadgroup]]) {
+        uint  sgitg[[simdgroup_index_in_threadgroup]],
+        EOS_GATE_ARG) {
+    EOS_GATE_CHECK
     kernel_mul_mv_iq4_nl_impl<ACT, STORE, 1>(src0, src1, dst, ne00, ne01, ne02, ne10, ne12, ne0, ne1, r2, r3, shared_values, tgpig, tiisg, sgitg, mv_rows_plain<1>(tgpig, ne10, ne0, ne1));
 }
 
@@ -9389,7 +9483,9 @@ kernel void kernel_mul_mv_iq4_xs_generic(
         threadgroup int8_t * shared_values [[threadgroup(0)]],
         uint3 tgpig[[threadgroup_position_in_grid]],
         uint  tiisg[[thread_index_in_simdgroup]],
-        uint  sgitg[[simdgroup_index_in_threadgroup]]) {
+        uint  sgitg[[simdgroup_index_in_threadgroup]],
+        EOS_GATE_ARG) {
+    EOS_GATE_CHECK
     kernel_mul_mv_iq4_xs_impl<ACT, STORE, 1>(src0, src1, dst, ne00, ne01, ne02, ne10, ne12, ne0, ne1, r2, r3, shared_values, tgpig, tiisg, sgitg, mv_rows_plain<1>(tgpig, ne10, ne0, ne1));
 }
 
@@ -9416,7 +9512,9 @@ kernel void kernel_mul_mv_q2_0_generic(
         constant   uint    & r3,
         uint3 tgpig[[threadgroup_position_in_grid]],
         uint  tiisg[[thread_index_in_simdgroup]],
-        uint  sgitg[[simdgroup_index_in_threadgroup]]) {
+        uint  sgitg[[simdgroup_index_in_threadgroup]],
+        EOS_GATE_ARG) {
+    EOS_GATE_CHECK
     kernel_mul_mv_q2_0_impl<ACT, STORE, 1>(src0,src1,dst,ne00,ne01,ne02,ne10,ne12,ne0,ne1,r2,r3,nullptr,tgpig,tiisg,sgitg, mv_rows_plain<1>(tgpig, ne10, ne0, ne1));
 }
 
@@ -9433,7 +9531,8 @@ void kernel_mul_mv_##STEM##_f32_impl(device const void * src0, device const floa
     kernel_mul_mv_lut4_impl<BLOCK, float, float, 1>(src0, src1, dst, ne00, ne01, ne02, ne10, ne12, ne0, ne1, r2, r3, shared_values, tgpig, tiisg, sgitg, mv_rows_plain<1>(tgpig, ne10, ne0, ne1)); \
 } \
 template<typename ACT, typename STORE> \
-kernel void kernel_mul_mv_##STEM##_generic(device const void * src0, device const ACT * src1, device STORE * dst, constant int64_t & ne00, constant int64_t & ne01, constant int64_t & ne02, constant uint64_t & nb00, constant uint64_t & nb01, constant uint64_t & nb02, constant int64_t & ne10, constant int64_t & ne11, constant int64_t & ne12, constant uint64_t & nb10, constant uint64_t & nb11, constant uint64_t & nb12, constant int64_t & ne0, constant int64_t & ne1, constant uint & r2, constant uint & r3, threadgroup int8_t * shared_values [[threadgroup(0)]], uint3 tgpig[[threadgroup_position_in_grid]], uint tiisg[[thread_index_in_simdgroup]], uint sgitg[[simdgroup_index_in_threadgroup]]) { \
+kernel void kernel_mul_mv_##STEM##_generic(device const void * src0, device const ACT * src1, device STORE * dst, constant int64_t & ne00, constant int64_t & ne01, constant int64_t & ne02, constant uint64_t & nb00, constant uint64_t & nb01, constant uint64_t & nb02, constant int64_t & ne10, constant int64_t & ne11, constant int64_t & ne12, constant uint64_t & nb10, constant uint64_t & nb11, constant uint64_t & nb12, constant int64_t & ne0, constant int64_t & ne1, constant uint & r2, constant uint & r3, threadgroup int8_t * shared_values [[threadgroup(0)]], uint3 tgpig[[threadgroup_position_in_grid]], uint tiisg[[thread_index_in_simdgroup]], uint sgitg[[simdgroup_index_in_threadgroup]], EOS_GATE_ARG) { \
+    EOS_GATE_CHECK \
     kernel_mul_mv_lut4_impl<BLOCK, ACT, STORE, 1>(src0, src1, dst, ne00, ne01, ne02, ne10, ne12, ne0, ne1, r2, r3, shared_values, tgpig, tiisg, sgitg, mv_rows_plain<1>(tgpig, ne10, ne0, ne1)); \
 }
 
@@ -9447,7 +9546,8 @@ void kernel_mul_mv_##STEM##_f32_impl(device const void * src0, device const floa
     kernel_mul_mv_b8_impl<BLOCK, float, float, 1>(src0, src1, dst, ne00, ne01, ne02, ne10, ne12, ne0, ne1, r2, r3, shared_values, tgpig, tiisg, sgitg, mv_rows_plain<1>(tgpig, ne10, ne0, ne1)); \
 } \
 template<typename ACT, typename STORE> \
-kernel void kernel_mul_mv_##STEM##_generic(device const void * src0, device const ACT * src1, device STORE * dst, constant int64_t & ne00, constant int64_t & ne01, constant int64_t & ne02, constant uint64_t & nb00, constant uint64_t & nb01, constant uint64_t & nb02, constant int64_t & ne10, constant int64_t & ne11, constant int64_t & ne12, constant uint64_t & nb10, constant uint64_t & nb11, constant uint64_t & nb12, constant int64_t & ne0, constant int64_t & ne1, constant uint & r2, constant uint & r3, uint3 tgpig[[threadgroup_position_in_grid]], uint tiisg[[thread_index_in_simdgroup]], uint sgitg[[simdgroup_index_in_threadgroup]]) { \
+kernel void kernel_mul_mv_##STEM##_generic(device const void * src0, device const ACT * src1, device STORE * dst, constant int64_t & ne00, constant int64_t & ne01, constant int64_t & ne02, constant uint64_t & nb00, constant uint64_t & nb01, constant uint64_t & nb02, constant int64_t & ne10, constant int64_t & ne11, constant int64_t & ne12, constant uint64_t & nb10, constant uint64_t & nb11, constant uint64_t & nb12, constant int64_t & ne0, constant int64_t & ne1, constant uint & r2, constant uint & r3, uint3 tgpig[[threadgroup_position_in_grid]], uint tiisg[[thread_index_in_simdgroup]], uint sgitg[[simdgroup_index_in_threadgroup]], EOS_GATE_ARG) { \
+    EOS_GATE_CHECK \
     kernel_mul_mv_b8_impl<BLOCK, ACT, STORE, 1>(src0, src1, dst, ne00, ne01, ne02, ne10, ne12, ne0, ne1, r2, r3, nullptr, tgpig, tiisg, sgitg, mv_rows_plain<1>(tgpig, ne10, ne0, ne1)); \
 }
 

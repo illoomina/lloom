@@ -155,8 +155,8 @@ pub const COUPLINGS: &[Coupling] = &[
         id: "C15",
         kind: "ignored",
         when: "the adaptive commit does not run; for the fused publish also a sampler that is not argmax without processors",
-        effect: "decode.readback.run_ahead_steps and decode.readback.fused_publish have no effect",
-        keys: &["decode.readback.run_ahead_steps", "decode.readback.fused_publish", "decode.readback.adaptive_commit"],
+        effect: "decode.readback.run_ahead_steps, decode.readback.queued_steps and decode.readback.fused_publish have no effect",
+        keys: &["decode.readback.run_ahead_steps", "decode.readback.queued_steps", "decode.readback.fused_publish", "decode.readback.adaptive_commit"],
         site: "lloom/src/nn/decode.rs (set_fused_publish(adaptive && fused); the run-ahead bound under adaptive_commit); lloom-engine/src/decode.rs (fused = argmax, no processors)",
         is_static: false,
     },
@@ -376,8 +376,8 @@ pub fn explain(o: &EngineOptions) -> Vec<String> {
             r.eos
         ));
     }
-    if !adaptive && (r.run_ahead != 0 || !r.fused_publish) {
-        out.push("decode.readback.run_ahead_steps / fused_publish ignored <- the adaptive commit does not run (C15)".into());
+    if !adaptive && (r.run_ahead != 0 || r.queued_steps != 0 || !r.fused_publish) {
+        out.push("decode.readback.run_ahead_steps / queued_steps / fused_publish ignored <- the adaptive commit does not run (C15)".into());
     }
     if DRAFTERS.contains(&o.speculative.method.as_str()) && o.model.cache == "auto" {
         out.push(format!(

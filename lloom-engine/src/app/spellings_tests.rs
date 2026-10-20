@@ -243,7 +243,9 @@ fn reaches_by_flag(key: &str, flag: &str) -> Result<String, String> {
 #[test]
 fn every_legacy_spelling_in_the_map_reaches_its_key() {
     let rows: Vec<Value> = serde_json::from_str(ROWS).unwrap();
-    assert_eq!(rows.len(), 275, "the map's rows");
+    // 276: dev's 275 plus `--qwen3-5-eos-gate-cores` (#993 run 3, the
+    // gate's cores arm, `models.qwen3_5.eos_gate_cores`).
+    assert_eq!(rows.len(), 276, "the map's rows");
     let idx = index();
     let no_env = BTreeMap::new();
     let mut failures = Vec::new();

@@ -371,6 +371,10 @@ pub struct DecodeOptions {
     /// the pacer, not by the reader: `S − E ≤ adaptive_lead + 1`, however late
     /// the reader raises the flag. `None` takes `decode.ring.eos_watch`.
     pub eos_watch: Option<bool>,
+    /// Under the EOS gate: whether the quantized mat-vec cores are gated
+    /// too, for a model that admits it (`CausalLM::eos_gate_cores`). `None`
+    /// takes `models.qwen3_5.eos_gate_cores`.
+    pub eos_gate_cores: Option<bool>,
     /// The flow's adaptive commit; off is the fixed cadence (module docs, "Two
     /// cadences, both kept"). The loop closes its command buffer only when the
     /// GPU has started every buffer committed before it, on no cadence of its
@@ -384,6 +388,13 @@ pub struct DecodeOptions {
     /// The cut period is held at `usize::MAX` for the run, so the only cuts
     /// are the loop's.
     pub adaptive_commit: bool,
+    /// Under `adaptive_commit`: the most steps queued in committed buffers the
+    /// GPU has not completed before the host waits to encode the next — the
+    /// lead's queued part, apart from the batching [`Self::run_ahead`] sets
+    /// (`0` = two run-ahead windows, the incumbent). The host is at most
+    /// `queued_steps + run_ahead` steps ahead of the oldest incomplete buffer
+    /// ([`Self::adaptive_lead`]).
+    pub queued_steps: usize,
     /// Under `adaptive_commit`: the most steps the host may encode into one
     /// buffer before closing it regardless (0 = 8). Not a cadence — a buffer
     /// closes earlier whenever the GPU has caught up — but the bound on how
@@ -572,17 +583,34 @@ impl DecodeOptions {
     /// AUTO path sets `in_flight_depth` from warmup; this reads it back with the
     /// `0 = auto -> floor` convention applied.)
     /// Under `adaptive_commit`: how many steps the host may be ahead of the
-    /// oldest incomplete buffer — two run-ahead windows queued plus the open
-    /// one; 0 otherwise. What the ring's staged-through tiles are sized for.
+    /// oldest incomplete buffer — [`Self::queued`] queued plus the open
+    /// buffer's [`Self::run_ahead_steps`]; 0 otherwise. What the ring's
+    /// staged-through tiles are sized for.
     pub fn adaptive_lead(&self) -> usize {
         if self.adaptive_commit {
-            3 * if self.run_ahead == 0 {
-                8
-            } else {
-                self.run_ahead
-            }
+            self.queued() + self.run_ahead_steps()
         } else {
             0
+        }
+    }
+
+    /// The most steps one open buffer holds under `adaptive_commit`
+    /// (`run_ahead`, `0` = 8).
+    pub fn run_ahead_steps(&self) -> usize {
+        if self.run_ahead == 0 {
+            8
+        } else {
+            self.run_ahead
+        }
+    }
+
+    /// The most steps queued in committed, incomplete buffers before the
+    /// host waits (`queued_steps`, `0` = two run-ahead windows).
+    pub fn queued(&self) -> usize {
+        if self.queued_steps == 0 {
+            2 * self.run_ahead_steps()
+        } else {
+            self.queued_steps
         }
     }
 
@@ -611,8 +639,10 @@ impl DecodeOptions {
             host_feed_wait: None,
             eos_park: None,
             eos_watch: None,
+            eos_gate_cores: None,
             adaptive_commit: false,
             run_ahead: 0,
+            queued_steps: 0,
             stop: None,
             eos_gate: false,
             fused_publish: true,
@@ -1445,11 +1475,7 @@ impl StepPacer {
             opts.pacer_depth()
                 .max(opts.prefill_pacer_depth)
                 .max(if opts.adaptive_commit {
-                    2 * if opts.run_ahead == 0 {
-                        8
-                    } else {
-                        opts.run_ahead
-                    }
+                    opts.queued()
                 } else {
                     0
                 });
@@ -2245,17 +2271,21 @@ impl<'m, M: CausalLM> Session<'m, M> {
         } else {
             (opts.lookahead >= 1).then(|| device.pipelined_cut_period())
         };
-        let run_ahead = if opts.run_ahead == 0 {
-            8
-        } else {
-            opts.run_ahead
-        };
+        let run_ahead = opts.run_ahead_steps();
+        let queued = opts.queued();
         let mut steps_open = 0usize;
         // Armed here, disarmed on every exit path (the guard's `Drop`): an
         // armed gate outliving the run would route the next prefill through
         // a stale table.
         let eos_gate = if opts.eos_gate {
             device.eos_gate_begin()?;
+            // The cores arm: the quantized mat-vecs gated too, for a model
+            // whose inventory admits it (`CausalLM::eos_gate_cores`).
+            let cores = opts
+                .eos_gate_cores
+                .unwrap_or(crate::tuning::tuning().ring.qwen3_5_eos_gate_cores)
+                && self.model.eos_gate_cores();
+            device.eos_gate_cores(cores);
             Some(EosGateGuard(&device))
         } else {
             None
@@ -2506,10 +2536,11 @@ impl<'m, M: CausalLM> Session<'m, M> {
                 // NONE; the one clock read it still needs is `step_ns` (the median).
                 let t_sample = sample_start.map_or(0, |s| s.elapsed().as_nanos() as u64);
                 if opts.adaptive_commit {
-                    // Steps queued in incomplete buffers, not buffers: two
-                    // run-ahead windows deep, so one is running while the
-                    // other waits and the host is never the one being waited on.
-                    pacer.before_forward_bounded(&device, 2 * run_ahead)?;
+                    // Steps queued in incomplete buffers, not buffers: by
+                    // default two run-ahead windows deep, so one is running
+                    // while the other waits and the host is never the one
+                    // being waited on (`DecodeOptions::queued_steps`).
+                    pacer.before_forward_bounded(&device, queued)?;
                 } else if pace {
                     pacer.before_forward(&device)?;
                 }
@@ -4390,6 +4421,31 @@ pub(crate) fn tile_widths(widths: Vec<usize>, tile: usize) -> Vec<usize> {
         }
     }
     tiled
+}
+
+#[cfg(test)]
+mod adaptive_lead_tests {
+    use super::DecodeOptions;
+
+    /// The lead is its queued part plus one open buffer, the two set apart
+    /// (`queued_steps`, `run_ahead`); the defaults are the incumbent's 16 + 8;
+    /// off the adaptive commit there is none.
+    #[test]
+    fn the_lead_is_its_queued_part_plus_one_buffer() {
+        let lead = |run_ahead, queued_steps, adaptive_commit| {
+            let o = DecodeOptions {
+                adaptive_commit,
+                run_ahead,
+                queued_steps,
+                ..DecodeOptions::new(1)
+            };
+            (o.run_ahead_steps(), o.queued(), o.adaptive_lead())
+        };
+        assert_eq!(lead(0, 0, true), (8, 16, 24), "the incumbent");
+        assert_eq!(lead(4, 0, true), (4, 8, 12), "queued follows the batching");
+        assert_eq!(lead(8, 2, true), (8, 2, 10), "a shallower queue, batching kept");
+        assert_eq!(lead(4, 2, false).2, 0, "no lead off the adaptive commit");
+    }
 }
 
 #[cfg(test)]

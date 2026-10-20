@@ -285,6 +285,15 @@ fn decoded(engine: &Stub, ids: Vec<u32>) -> Decoded {
     }
 }
 
+/// The ids a matched turn splices: the reply's own, and the end-of-turn token
+/// where the model ended its turn (decision 51 Q1 — the log does not keep the
+/// sampled EOS, so the id is the template's own bytes for the position the
+/// session fed).
+fn turn_tokens(front: &Front, reply: &[u32], stop: Stop) -> usize {
+    let through = stop == Stop::Eos && front.constants().and_then(|c| c.eot()).is_some();
+    reply.len() + usize::from(through)
+}
+
 fn bytes(s: &str) -> Vec<u32> {
     s.bytes().map(u32::from).collect()
 }
@@ -463,7 +472,10 @@ fn the_next_turn_reuses_the_sampled_ids_not_their_canonical_tokenization() {
         &p2.ids[..log.len().min(p2.ids.len())]
     );
     assert_eq!(p2.spliced.matched, 1);
-    assert_eq!(p2.spliced.spliced_tokens, sampled.len());
+    assert_eq!(
+        p2.spliced.spliced_tokens,
+        turn_tokens(&front, &sampled, Stop::Eos)
+    );
     assert_eq!(p2.renders, 1);
     // The text is the template's own rendering, whatever the ids.
     assert_eq!(
@@ -719,7 +731,10 @@ fn the_same_text_sampled_as_different_ids_splices_each_conversations_own() {
                 next.ids.starts_with(&log),
                 "reversed={reversed} {q}: not its own ids"
             );
-            assert_eq!(next.spliced.spliced_tokens, ids.len());
+            assert_eq!(
+                next.spliced.spliced_tokens,
+                turn_tokens(&front, ids, Stop::Eos)
+            );
         }
     }
 }
@@ -1166,7 +1181,16 @@ fn a_split_character_aligns_and_a_reply_cut_short_logs_its_part() {
     assert!(front.record(&engine, p1.origin, &d));
     let second = json!([user("Café?"), assistant(&d.text), user("Merci")]);
     let p2 = build(&front, &engine, &second, Some(false));
-    assert_eq!(p2.spliced.spliced_tokens, sampled.len());
+    // The reply's own ids, and the end-of-turn token it ended its turn with:
+    // a matched turn is rendered through it (decision 51 Q1), and the log does
+    // not keep the sampled EOS, so the id comes from the template's own bytes.
+    let eot = front
+        .constants()
+        .unwrap()
+        .eot()
+        .expect("an end-of-turn token");
+    assert_eq!(p2.spliced.spliced_tokens, sampled.len() + 1);
+    assert_eq!(p2.ids[p1.ids.len() + sampled.len()], eot.0);
     // A reply the client got only part of — a stop string cut it, or the
     // run ended inside a character — is logged as the ids of that part.
     let mut cut = decoded(&engine, bytes("abc STOP def"));
@@ -1312,7 +1336,7 @@ fn the_checkpoints_templates_build_the_plain_prompt_and_cut_the_same_spans() {
             );
             assert_eq!(
                 p2.spliced.spliced_tokens,
-                sampled.len(),
+                turn_tokens(&fresh, &sampled, Stop::Eos),
                 "{repo} {want:?}: {:?}",
                 p2.spliced
             );

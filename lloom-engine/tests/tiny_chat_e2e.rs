@@ -625,7 +625,14 @@ fn chat_refuses_an_effort_the_template_rejects_or_does_not_act_on() {
         )),
         "{stderr}"
     );
-    let (ok, stderr, f) = with(&["--reasoning-effort", "low"]);
+    // Unset thinking is the template's own rendering since decision 51 Q6(b),
+    // and this template reads the effort under it — so the effort is acted on
+    // without `--think`, where it used to be refused with a hint to add it.
+    // `--no-think` is the value the template ignores it under, and that is
+    // still refused by name.
+    let (ok, stderr, _) = with(&["--reasoning-effort", "low"]);
+    assert!(ok, "{stderr}");
+    let (ok, stderr, f) = with(&["--no-think", "--reasoning-effort", "low"]);
     assert!(!ok && f.is_empty(), "{stderr}");
     assert!(stderr.contains(
         "--reasoning-effort low: qwen4exp's chat template renders the same prompt for any reasoning_effort \
@@ -1154,11 +1161,18 @@ fn thinking_budget_is_ignored_or_refused_where_no_block_is_open() {
         a.extend(extra);
         chat_templated(&model, &a)
     };
+    // Unset thinking is the template's own rendering since decision 51 Q6(b),
+    // and Qwen4-exp's generation prompt opens the block — so the budget
+    // applies without `--think`, where it used to be refused with a hint to
+    // add it. `--no-think` is the case that is still refused, below.
     let (ok, stderr, f) = with_args(&["--thinking-budget", "4"]);
+    assert!(ok, "{stderr}");
+    assert_eq!(f["thinking_budget"], "4");
+    let (ok, stderr, f) = with_args(&["--no-think", "--thinking-budget", "4"]);
     assert!(!ok && f.is_empty(), "{stderr}");
     assert!(
         stderr.contains(
-            "--thinking-budget 4: qwen4exp: the prompt leaves no thinking block open (add --think)"
+            "--thinking-budget 4: qwen4exp: the prompt leaves no thinking block open (drop --no-think)"
         ),
         "{stderr}"
     );
@@ -1517,8 +1531,12 @@ fn chat_switches_thinking_by_the_template_or_by_closing_the_block() {
 
     let (dir, model, base) = qwen_tiny("think-chat-qwen");
     let tok = Qwen4ExpTiny::tokenizer();
+    // Unset is the template's own rendering since decision 51 Q6(b) — as
+    // `serve` has always rendered it — so the Qwen REPL thinks by default,
+    // because its own generation prompt opens the block. `--no-think` and
+    // `--think` are the explicit switches and are unchanged.
     for (flags, text, think) in [
-        (&[][..], qwen_not_thinking(), "off"),
+        (&[][..], qwen_thinking(Some(XHIGH)), "on"),
         (&["--no-think"][..], qwen_not_thinking(), "off"),
         (&["--think"][..], qwen_thinking(Some(XHIGH)), "on"),
     ] {
@@ -3353,11 +3371,19 @@ fn serve_keeps_past_reasoning_by_default_and_strips_it_on_request() {
                     log.len()
                 );
                 if engine_closed {
-                    // The engine closed the block in the prompt; the template
-                    // writes no block for a reply without reasoning, so the
-                    // emitted turn carries that marker and the log extends.
-                    assert_eq!(left, log.len(), "{at}: the emitted turn carries the marker");
-                    assert_eq!(t["outcome"], "extend", "{at}: {t}");
+                    // The engine closed the block the template opened, and no
+                    // rendering of the history writes that marker — so the
+                    // divergence is inside the earlier PROMPT, before any
+                    // reply, and the turn checkpoint stands there. Decision 51
+                    // Q1 does not reach it: it is about how a past assistant
+                    // turn is rendered, not about ids the template never
+                    // writes (run 5, §25.8; pinned in `front_tests.rs`
+                    // `a_past_reply_is_rendered_from_the_ids_the_model_emitted`).
+                    assert!(left < p1.len(), "{at}: the engine's empty block");
+                    assert!(
+                        matches!(t["outcome"].as_str(), Some("restore" | "rewind")),
+                        "{at}: {t}"
+                    );
                 } else if kept {
                     assert_eq!(left, log.len(), "{at}: the history keeps the reply");
                     assert_eq!(t["outcome"], "extend", "{at}: {t}");

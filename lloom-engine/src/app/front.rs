@@ -1374,8 +1374,17 @@ impl Front {
             ids.extend_from_slice(&run.reply.ids[run.ids.clone()]);
             spliced.spliced_tokens += run.ids.len();
             if keep_lp {
+                // A run can carry one id the model did not sample — the
+                // end-of-turn token, which is the template's bytes for a
+                // position the session fed (`emit_turn`) — and that id has no
+                // logprob of its own. Take what the reply kept and leave the
+                // rest `None`, as every id the prompt encoded carries.
                 match &run.reply.logprobs {
-                    Some(lp) => logprobs.extend(lp[run.ids.clone()].iter().map(|&v| Some(v))),
+                    Some(lp) => {
+                        let have = run.ids.start.min(lp.len())..run.ids.end.min(lp.len());
+                        logprobs.extend(lp[have].iter().map(|&v| Some(v)));
+                        logprobs.resize(ids.len(), None);
+                    }
                     None => logprobs.resize(ids.len(), None),
                 }
             }
@@ -2073,11 +2082,12 @@ fn emit_turn(
     if ids.is_empty() {
         return false;
     }
-    // The ids must decode to the turn the log holds — with the end-of-turn
-    // token where the model ended the turn itself — and that decoding is what
-    // the prompt carries in place of the template's text for this span. The
-    // guard is that the ids really are this reply's, trailing whitespace the
-    // template normalises aside.
+    // Two guards, and both are needed.
+    //
+    // The ids must be this reply's turn: what the log holds, with the
+    // end-of-turn token where the model ended the turn itself. Trailing
+    // whitespace aside, because a template normalises the whitespace after
+    // the body.
     let want = match through {
         Some(_) => format!("{}{}", emitted.trim_end(), eot.map_or("", |(_, m)| m)),
         None => emitted.trim_end().to_string(),
@@ -2085,6 +2095,20 @@ fn emit_turn(
     match decode(text, &ids) {
         Some(d) if d.trim_end() == want.trim_end() => {}
         _ => return false,
+    }
+    // And nothing the template wrote of its own may be inside the run. The
+    // stretch being replaced is allowed to differ from the model's bytes only
+    // in whitespace the template normalised: a closing it wrote for a block
+    // the model left open (`\n</think>\n\n`), a wrapper, a re-split, are all
+    // text of the template's, and a run that swallowed them would put the
+    // model's ids where the template's text stands.
+    let replaced = &rendered[start..text_end];
+    let same = |a: &str, b: &str| -> bool {
+        let f = |s: &str| -> Vec<String> { s.split_whitespace().map(str::to_string).collect() };
+        f(a) == f(b)
+    };
+    if !same(replaced, &want) {
+        return false;
     }
     let n = ids.len();
     runs.push(Run {

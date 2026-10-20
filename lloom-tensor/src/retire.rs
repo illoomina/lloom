@@ -190,6 +190,197 @@ impl<I> Retire<I> {
     }
 }
 
+/// A future use a retired item still owes, which keeps it from reuse past
+/// its epoch (`docs/dependency-ordered-reuse-design.md` §3, §14.4).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FutureUse {
+    /// No owner, view, export or replay can issue another use: the item is
+    /// reusable once its epoch completes.
+    Closed,
+    /// A use declared ahead of its encoding (a cross-pass carry a later pass
+    /// reads): the item is reusable only after [`RetireIndex::discharge`],
+    /// stamped with the epoch open at the declared use.
+    Declared,
+}
+
+/// One retired item's place in a [`RetireIndex`]: the record and the
+/// generation the item was retired under. A ticket whose generation the
+/// record no longer has names an item that was withdrawn or reused, and
+/// every operation on it is a no-op.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Ticket {
+    slot: u32,
+    generation: u64,
+}
+
+struct Record<I> {
+    item: Option<I>,
+    generation: u64,
+}
+
+/// Items given up and not yet safe to reuse, as [`Retire`] holds them, with
+/// one owner per item: a stable record. The epoch queue holds versioned
+/// notices into the records rather than the items, so an item can leave
+/// before its epoch completes ([`Self::withdraw`]) and its notice then
+/// finds a newer generation and does nothing: a late completion never moves,
+/// poisons or frees what took the record's place.
+///
+/// Metadata stays bounded: a notice is pushed once per retirement and
+/// dropped when its epoch completes, stale or not, so the queue never holds
+/// more than the retirements since the oldest incomplete epoch — what a
+/// [`Retire`] holds for the same releases. Records and vacancies keep their
+/// capacity, so a steady state allocates nothing.
+pub struct RetireIndex<I> {
+    records: Vec<Record<I>>,
+    vacant: Vec<u32>,
+    notices: Retire<Ticket>,
+    parked: usize,
+    stale: u64,
+}
+
+impl<I> Default for RetireIndex<I> {
+    fn default() -> Self {
+        Self {
+            records: Vec::new(),
+            vacant: Vec::new(),
+            notices: Retire::new(),
+            parked: 0,
+            stale: 0,
+        }
+    }
+}
+
+impl<I> RetireIndex<I> {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Hold `item` until `epoch` — the one open at the call — completes, and,
+    /// under [`FutureUse::Declared`], until it is discharged as well.
+    pub fn retire(&mut self, epoch: Epoch, item: I, future: FutureUse) -> Ticket {
+        let slot = match self.vacant.pop() {
+            Some(slot) => slot,
+            None => {
+                self.records.push(Record {
+                    item: None,
+                    generation: 0,
+                });
+                u32::try_from(self.records.len() - 1).expect("fewer than 2^32 parked records")
+            }
+        };
+        let record = &mut self.records[slot as usize];
+        debug_assert!(record.item.is_none(), "a vacant record holds an item");
+        record.item = Some(item);
+        self.parked += 1;
+        let ticket = Ticket {
+            slot,
+            generation: record.generation,
+        };
+        if future == FutureUse::Closed {
+            self.notices.retire(epoch, ticket);
+        }
+        ticket
+    }
+
+    /// The declared future use of `ticket` was encoded in `epoch`: the item is
+    /// reusable once that epoch completes. Nothing for a stale ticket.
+    pub fn discharge(&mut self, ticket: Ticket, epoch: Epoch) {
+        if self.current(ticket) {
+            self.notices.retire(epoch, ticket);
+        }
+    }
+
+    /// The oldest item whose notice `ready` accepts, removed; `None` when the
+    /// oldest notice is not ready (then no later one is). A ready notice whose
+    /// record moved on is dropped and counted ([`Self::stale_notices`]).
+    pub fn pop_ready(&mut self, mut ready: impl FnMut(Epoch) -> bool) -> Option<I> {
+        loop {
+            let ticket = self.notices.pop_ready(&mut ready)?;
+            if let Some(item) = self.take(ticket) {
+                return Some(item);
+            }
+            self.stale += 1;
+        }
+    }
+
+    /// Take the item `ticket` names before its epoch completes, for a caller
+    /// whose reuse is ordered by other means. `None` when the ticket is stale
+    /// or its item was already taken. Its notice stays queued and finds the
+    /// record moved on.
+    pub fn withdraw(&mut self, ticket: Ticket) -> Option<I> {
+        self.take(ticket)
+    }
+
+    fn current(&self, ticket: Ticket) -> bool {
+        self.records
+            .get(ticket.slot as usize)
+            .is_some_and(|r| r.generation == ticket.generation && r.item.is_some())
+    }
+
+    fn take(&mut self, ticket: Ticket) -> Option<I> {
+        if !self.current(ticket) {
+            return None;
+        }
+        let record = &mut self.records[ticket.slot as usize];
+        let item = record.item.take();
+        record.generation += 1;
+        self.vacant.push(ticket.slot);
+        self.parked -= 1;
+        item
+    }
+
+    /// Items held and not yet taken.
+    pub fn held(&self) -> usize {
+        self.parked
+    }
+
+    /// Notices queued, stale ones included: the metadata the epoch queue
+    /// holds.
+    pub fn notices(&self) -> usize {
+        self.notices.held()
+    }
+
+    /// Records allocated, held or vacant: the metadata the slab holds.
+    pub fn records(&self) -> usize {
+        self.records.len()
+    }
+
+    /// Ready notices dropped because their record had moved on, since
+    /// construction.
+    pub fn stale_notices(&self) -> u64 {
+        self.stale
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.parked == 0
+    }
+
+    /// The epoch the oldest notice waits for, if any.
+    pub fn head_epoch(&self) -> Option<Epoch> {
+        self.notices.head_epoch()
+    }
+
+    /// The held items, in record order.
+    pub fn iter(&self) -> impl Iterator<Item = &I> {
+        self.records.iter().filter_map(|r| r.item.as_ref())
+    }
+
+    /// The held items with their tickets, in record order.
+    pub fn tickets(&self) -> impl Iterator<Item = (Ticket, &I)> {
+        self.records.iter().enumerate().filter_map(|(slot, r)| {
+            r.item.as_ref().map(|item| {
+                (
+                    Ticket {
+                        slot: slot as u32,
+                        generation: r.generation,
+                    },
+                    item,
+                )
+            })
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -221,6 +412,92 @@ mod tests {
         assert_eq!(r.pop_ready(|e| e <= Epoch(1)), Some(1));
         assert_eq!(r.pop_ready(|e| e <= Epoch(1)), None);
         assert_eq!(r.held(), 1);
+    }
+
+    /// A withdrawn item's notice finds its record moved on: the later
+    /// completion takes nothing, and in particular not the item retired
+    /// into the record after it, which waits for its own epoch. The record is
+    /// reused, so the notice's generation is the only thing between the two.
+    #[test]
+    fn a_stale_notice_never_releases_the_records_next_item() {
+        let mut r = RetireIndex::new();
+        let old = r.retire(Epoch(5), "old", FutureUse::Closed);
+        assert_eq!(r.withdraw(old), Some("old"));
+        assert_eq!(r.withdraw(old), None, "a ticket withdraws once");
+        let new = r.retire(Epoch(9), "new", FutureUse::Closed);
+        assert_eq!(r.records(), 1, "the vacated record was not reused");
+        assert_eq!(r.notices(), 2);
+        assert_eq!(
+            r.pop_ready(|e| Completed(6).covers(e)),
+            None,
+            "epoch 5's notice released the item retired after it"
+        );
+        assert_eq!(r.stale_notices(), 1);
+        assert_eq!(r.held(), 1);
+        assert_eq!(r.pop_ready(|e| Completed(10).covers(e)), Some("new"));
+        assert!(r.is_empty());
+        assert_eq!(r.withdraw(new), None, "a drained ticket is stale");
+    }
+
+    /// Closed items come back in epoch order once their epoch completes, as
+    /// `Retire` gives them; a drain stops at the first incomplete notice.
+    #[test]
+    fn closed_items_come_back_once_their_epoch_is_covered() {
+        let mut r = RetireIndex::new();
+        r.retire(Epoch(3), 'a', FutureUse::Closed);
+        r.retire(Epoch(5), 'b', FutureUse::Closed);
+        assert_eq!(r.pop_ready(|e| Completed(3).covers(e)), None);
+        assert_eq!(r.pop_ready(|e| Completed(4).covers(e)), Some('a'));
+        assert_eq!(r.pop_ready(|e| Completed(4).covers(e)), None);
+        assert_eq!(r.head_epoch(), Some(Epoch(5)));
+        assert_eq!(r.pop_ready(|e| Completed::ALL.covers(e)), Some('b'));
+    }
+
+    /// A declared future use holds its item past its epoch: no notice until
+    /// it is discharged, and then the discharge's epoch decides. A stale
+    /// ticket's discharge is ignored.
+    #[test]
+    fn a_declared_future_use_holds_its_item_until_discharged() {
+        let mut r = RetireIndex::new();
+        let carry = r.retire(Epoch(2), "carry", FutureUse::Declared);
+        assert_eq!(r.notices(), 0);
+        assert_eq!(r.pop_ready(|e| Completed::ALL.covers(e)), None);
+        assert_eq!(r.held(), 1);
+        r.discharge(carry, Epoch(7));
+        assert_eq!(r.pop_ready(|e| Completed(7).covers(e)), None);
+        assert_eq!(r.pop_ready(|e| Completed(8).covers(e)), Some("carry"));
+        r.discharge(carry, Epoch(9));
+        assert_eq!(r.notices(), 0, "a stale ticket's discharge queued a notice");
+    }
+
+    /// The metadata stays bounded under withdraw-and-retire churn: records
+    /// at the most items held at once, notices at the retirements since the
+    /// oldest incomplete epoch, each dropped when its epoch completes.
+    #[test]
+    fn churn_keeps_the_records_and_notices_bounded() {
+        let mut r = RetireIndex::new();
+        let in_flight = 3u64;
+        for epoch in 0..2000u64 {
+            for i in 0..4 {
+                let t = r.retire(Epoch(epoch), (epoch, i), FutureUse::Closed);
+                if i % 2 == 0 {
+                    assert!(r.withdraw(t).is_some());
+                }
+            }
+            let done = Completed(epoch.saturating_sub(in_flight));
+            while r.pop_ready(|e| done.covers(e)).is_some() {}
+            assert!(
+                r.records() <= 4 * (in_flight as usize + 1) + 2,
+                "{}",
+                r.records()
+            );
+            assert!(
+                r.notices() <= 4 * (in_flight as usize + 1),
+                "{}",
+                r.notices()
+            );
+        }
+        assert_eq!(r.stale_notices(), 2 * (2000 - (in_flight + 1)));
     }
 
     #[test]

@@ -380,11 +380,12 @@ fn composed_prefill_bytes(seq_len: usize, batch: usize, geom: PrefillGeometry) -
 /// position's logits, `V` at the compute dtype and again at f32.
 ///
 /// `gathered` adds what a pass onto a warm page pool copies before the
-/// kernel reads it: `v` made contiguous (`KV` a position), and per row the
-/// earlier `keys − P` positions of K and V gathered out of the pool and the
-/// whole `keys` concatenated (`2 KV` a key each). The bound is a
-/// continuation pass's — the left-context concatenation is one too — so a
-/// first pass is below it by those terms.
+/// kernel reads it: `v` made contiguous (`KV` a position) and the pass's
+/// slot table (a `u32` a position); per attention layer the earlier
+/// `keys − P` positions of K and V gathered out of the pool through a `u32`
+/// index, and the whole `keys` concatenated (`2 KV` a key each). The bound
+/// is a continuation pass's — the left-context concatenation is one too —
+/// so a first pass is below it by those terms.
 fn fused_prefill_bytes(
     seq_len: usize,
     keys: usize,
@@ -409,8 +410,13 @@ fn fused_prefill_bytes(
         + geom.attention_layers * attn
         + geom.conv_layers * conv;
 
+    // The page pool's slot table and its gather index: one `u32` a position,
+    // and one a gathered key.
+    const SLOT: usize = 4;
+    let slots = if gathered { SLOT } else { 0 };
     let gather = if gathered && keys > seq_len {
-        geom.attention_layers * 2 * kv * ((keys - seq_len) + keys)
+        let earlier = keys - seq_len;
+        geom.attention_layers * (ELEM * 2 * kv * (earlier + keys) + SLOT * earlier)
     } else {
         0
     };
@@ -418,7 +424,9 @@ fn fused_prefill_bytes(
     const LOGITS_F32: usize = 4;
 
     batch
-        * (ELEM * (seq_len * per_position + gather + carry + geom.vocab)
+        * (seq_len * (ELEM * per_position + slots)
+            + gather
+            + ELEM * (carry + geom.vocab)
             + LOGITS_F32 * geom.vocab)
 }
 
@@ -1817,21 +1825,22 @@ mod tests {
     }
 
     /// A pass onto a warm page pool reads a copy of the cache: `v` made
-    /// contiguous (1 KiB a position over 8 layers) and the earlier
-    /// `keys − P` positions gathered and the whole `keys` concatenated, 2 KiB
-    /// a key a layer. A first pass (`keys == P`) gathers nothing.
+    /// contiguous (1 KiB a position over 8 layers) and the slot table (4 B a
+    /// position); the earlier `keys − P` positions gathered (2 KiB and a
+    /// 4-byte index a key a layer) and the whole `keys` concatenated (2 KiB a
+    /// key a layer). A first pass (`keys == P`) gathers nothing.
     #[test]
     fn a_gathered_pass_adds_its_copy_of_the_cache() {
         let g = fused(PrefillAttention::FusedGathered);
         assert_eq!(
             prefill_activation_bytes(512, 1, g),
-            512 * 4_210_688 + 1_398_784
+            512 * 4_210_692 + 1_398_784
         );
-        let gather = 8 * 2 * (8 * 64) * 2 * ((8704 - 512) + 8704);
-        assert_eq!(gather, 276_824_064, "0.28 GB at the 8704 ceiling");
+        let gather = 8 * (2 * 2 * (8 * 64) * ((8704 - 512) + 8704) + 4 * (8704 - 512));
+        assert_eq!(gather, 277_086_208, "0.28 GB at the 8704 ceiling");
         assert_eq!(
             prefill_activation_bytes_at(512, 8704, 1, g),
-            512 * 4_210_688 + 1_398_784 + gather
+            512 * 4_210_692 + 1_398_784 + gather
         );
         // Keys below the pass's own length are the pass's own.
         assert_eq!(

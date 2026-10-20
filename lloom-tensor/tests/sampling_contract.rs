@@ -780,7 +780,7 @@ fn search_pins() {
 #[test]
 #[ignore = "a search, run by hand to make TWO_SCORE_PINS"]
 fn search_two_score_pins() {
-    let mut s = 0x1036_e4u64;
+    let mut s = 0x0010_36e4u64;
     let (mut nucleus, mut draws) = (0, 0);
     let mut tried = 0u64;
     while nucleus < 3 || draws < 3 {

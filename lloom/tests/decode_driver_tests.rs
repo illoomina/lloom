@@ -3150,3 +3150,57 @@ fn a_draw_taken_back_on_the_ring_is_read_as_the_one_drawn_again() -> Result<()> 
     // A later reader of this ring maps the same stamps to the same slots.
     Ok(())
 }
+
+#[test]
+fn filtered_gumbel_ring_refuses_before_session_sampler_or_feed_moves() -> Result<()> {
+    let device = Device::Cpu;
+    let model = Chain::new(&device)?;
+    let mut session = Session::new(&model, 0usize);
+    let mut rb = Ring::new(&[EOS], &device, 8, EosRead::Blocking)?;
+    let mut sampler = LogitsProcessor::from_sampling(
+        7,
+        Sampling::FilteredGumbel {
+            temperature: 0.7,
+            k: 1,
+            p: 0.6,
+        },
+    )
+    .with_processors(lloom::generation::Processors {
+        presence_penalty: 0.5,
+        ..Default::default()
+    })
+    .with_logits_digest(true);
+    sampler.observe_prompt(&[5, 1]);
+    let digest = sampler.logits_digest();
+    let counters = rb.counters();
+    let error = session
+        .decode_until(
+            &mut IdentityProposer,
+            &mut rb,
+            &mut sampler,
+            &[5, 1],
+            &DecodeOptions::new(3),
+            &mut |_| panic!("refused request reached token callback"),
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("explicit host draw"), "{error}");
+    assert_eq!(session.pos(), 0);
+    assert_eq!(*session.sequence().cache(), 0);
+    assert!(session.tokens().is_empty());
+    assert_eq!(sampler.digest_rows(), 0);
+    assert_eq!(sampler.logits_digest(), digest);
+    assert_eq!(rb.counters(), counters);
+    // A successful supported draw after refusal is the control that also
+    // observes processor history/RNG; a refusal must not have advanced either.
+    let mut fresh = LogitsProcessor::from_sampling(7, sampler.sampling().clone())
+        .with_processors(lloom::generation::Processors {
+            presence_penalty: 0.5,
+            ..Default::default()
+        })
+        .with_logits_digest(true);
+    fresh.observe_prompt(&[5, 1]);
+    let logits = Tensor::new(&[0f32; VOCAB], &device)?;
+    assert_eq!(sampler.sample(&logits)?, fresh.sample(&logits)?);
+    assert_eq!(sampler.logits_digest(), fresh.logits_digest());
+    Ok(())
+}

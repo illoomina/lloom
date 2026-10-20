@@ -820,3 +820,61 @@ fn a_temperature_row_draws_from_its_own_seed_beside_any_neighbours() -> Result<(
     }
     Ok(())
 }
+
+#[test]
+fn filtered_gumbel_runs_the_existing_per_row_host_batch() -> Result<()> {
+    let device = Device::Cpu;
+    let model = Chain::new(&device)?;
+    let mut decoder: BatchDecoder<'_, Chain, Session<'_, Chain>> =
+        BatchDecoder::new(DecodeOptions::new(4), &[EOS], device.clone())?;
+    let arm = Sampling::FilteredGumbel {
+        temperature: 0.7,
+        k: 1,
+        p: 0.6,
+    };
+    let row = decoder.admit(Session::new(&model, 0usize), vec![1], arm.clone(), 7)?;
+    let neighbour = decoder.admit(Session::new(&model, 0usize), vec![0], Sampling::ArgMax, 9)?;
+    let mut streamed = std::collections::BTreeMap::<usize, Vec<u32>>::new();
+    while !decoder.is_idle() {
+        decoder.step(&mut |id, ids| {
+            streamed
+                .entry(id.slot())
+                .or_default()
+                .extend_from_slice(ids);
+            Ok(())
+        })?;
+    }
+    let finished = decoder.take_finished();
+    assert_eq!(finished.len(), 2);
+    for (id, session, out) in finished {
+        let start = if id == row {
+            1
+        } else {
+            assert_eq!(id, neighbour);
+            0
+        };
+        let want = chain(start, 4).0;
+        assert_eq!(out.ids, want);
+        assert_eq!(streamed.get(&id.slot()).unwrap(), &want);
+        assert_eq!(session.overrun(), 0);
+        assert_eq!(*session.sequence().cache(), session.pos());
+    }
+    // Closed legacy batches still promise one device argmax, not per-row
+    // sampling: the public capability must not promote that wrapper.
+    let mut sessions = [Session::new(&model, 0usize)];
+    let mut sampler = LogitsProcessor::from_sampling(7, arm);
+    let error = Session::decode_batched(
+        &mut sessions,
+        &mut sampler,
+        &[&[1]],
+        &DecodeOptions::new(4),
+        &[EOS],
+        &device,
+        &mut |_, _| panic!("closed-batch refusal reached callback"),
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("per-row host sample"), "{error}");
+    assert_eq!(sessions[0].pos(), 0);
+    assert_eq!(*sessions[0].sequence().cache(), 0);
+    Ok(())
+}

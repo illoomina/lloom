@@ -977,7 +977,8 @@ pub struct SamplingConfig {
         short = 't',
         path = "generation.temperature",
         status = "stable",
-        cli = "temperature"
+        cli = "temperature",
+        schema = "NonnegativeNumber"
     )]
     pub temperature: Option<f64>,
     /// Nucleus sampling's p (top-p); needs a temperature.
@@ -985,7 +986,8 @@ pub struct SamplingConfig {
         flag = "top-p",
         path = "generation.top_p",
         status = "stable",
-        cli = "top-p"
+        cli = "top-p",
+        schema = "Probability"
     )]
     pub top_p: Option<f64>,
     /// Top-k sampling's k; with top-p, top-k then top-p. Host-side: a ring asked by name is demoted with a warning and the blocking arm runs this request (C2).
@@ -1172,10 +1174,13 @@ impl SamplingConfig {
         }
     }
 
-    /// Refuse an out-of-range processor value, by its field's name. Every
-    /// layer — flags, `--set`, `--generation-config`, the env — lands here,
-    /// since the JSON layer deserializes without the flag parsers.
+    /// Refuse an out-of-range sampling or processor value, by its key and
+    /// the edge it failed. Every layer — flags, `--set`,
+    /// `--generation-config`, the env, a checkpoint's `generation_config.json`
+    /// — lands here, since the JSON layer deserializes without the flag
+    /// parsers.
     pub fn check(&self) -> Result<(), String> {
+        self.sampling()?;
         self.processors()
             .validate()
             .map_err(|e| format!("sampling: {e}"))?;
@@ -1192,9 +1197,11 @@ impl SamplingConfig {
         self.seed.unwrap_or_else(rand::random::<u64>)
     }
 
-    /// The sampler arm these fields name (`LogitsProcessor`'s vocabulary).
-    pub fn sampling(&self) -> lloom::generation::Sampling {
+    /// The sampler arm these fields name ([`DecodeParams::sampling_of`]); a
+    /// refused field is named by its key (`generation.top_p = 1.5: …`).
+    pub fn sampling(&self) -> Result<lloom::generation::Sampling, String> {
         DecodeParams::sampling_of(self.temperature, self.top_p, self.top_k, self.gumbel)
+            .map_err(|e| format!("sampling: generation.{}", e.without_backtrace()))
     }
 
     /// The per-run parameters for `eos_ids` on `readback`, the prefill tile.

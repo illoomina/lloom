@@ -47,6 +47,8 @@ pub use device::{
 };
 mod host_fed;
 mod host_slot;
+mod sampling_multinomial;
+mod sampling_topk;
 use device::DeviceTeardown;
 #[cfg(test)]
 use device::PRIVATE_RESOURCE_OPTIONS;

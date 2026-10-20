@@ -20,6 +20,8 @@ pub mod qwen4exp;
 pub mod random;
 pub mod reduce;
 pub mod reduce_names;
+pub(crate) mod sampling_guard;
+pub(crate) mod sampling_topk;
 pub mod scratch;
 pub mod sdpa;
 pub mod sort;

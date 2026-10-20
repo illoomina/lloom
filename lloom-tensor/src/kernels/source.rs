@@ -151,7 +151,16 @@ pub fn quantized_store() -> &'static str {
         s
     })
 }
-pub const RANDOM: &str = include_str!("metal_src/random.metal");
+pub const RANDOM: &str = concat!(
+    include_str!("metal_src/random.metal"),
+    "\n",
+    include_str!("metal_src/sampling_topk.metal"),
+    "\n",
+    include_str!("metal_src/sampling_multinomial.metal"),
+    "\n",
+    include_str!("metal_src/sampling_gumbel.metal"),
+    include_str!("metal_src/sampling_guard.metal")
+);
 pub const REDUCE: &str = with_utils!(
     "#include <metal_stdlib>\n#include <metal_limits>\nusing namespace metal;",
     include_str!("metal_src/reduce.metal")
@@ -276,6 +285,13 @@ pub const MERGED_NON_MLX: &str = concat!(
     include_str!("metal_src/qwen4exp.metal"),
     "\n",
     include_str!("metal_src/random.metal"),
+    "\n",
+    include_str!("metal_src/sampling_topk.metal"),
+    "\n",
+    include_str!("metal_src/sampling_multinomial.metal"),
+    "\n",
+    include_str!("metal_src/sampling_gumbel.metal"),
+    include_str!("metal_src/sampling_guard.metal"),
     "\n",
     include_str!("metal_src/reduce.metal"),
     "\n",

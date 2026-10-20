@@ -1374,16 +1374,142 @@ mod sampling_and_speculation_tests {
     }
 
     #[test]
+    fn sampling_fields_cross_real_cli_key_and_json_layers() {
+        let cases = [
+            (
+                vec!["-t", "0.7", "--gumbel", "--top-k", "2", "--top-p", "0.6"],
+                Sampling::FilteredGumbel {
+                    temperature: 0.7,
+                    k: 2,
+                    p: 0.6,
+                },
+            ),
+            (
+                vec![
+                    "--set",
+                    "generation.temperature=0.7",
+                    "--set",
+                    "generation.sampling.method=gumbel",
+                    "--set",
+                    "generation.top_k=2",
+                    "--set",
+                    "generation.top_p=0.6",
+                ],
+                Sampling::FilteredGumbel {
+                    temperature: 0.7,
+                    k: 2,
+                    p: 0.6,
+                },
+            ),
+            (
+                vec![
+                    "--generation-config",
+                    r#"{"temperature":" 0.7 ","top_k":"+2","top_p":"0.6","sampling":{"method":"gumbel"}}"#,
+                ],
+                Sampling::FilteredGumbel {
+                    temperature: 0.7,
+                    k: 2,
+                    p: 0.6,
+                },
+            ),
+            (
+                vec![
+                    "--generation-config",
+                    r#"{"temperature":0.7,"top_k":0,"top_p":1,"sampling":{"method":"multinomial"}}"#,
+                ],
+                Sampling::All { temperature: 0.7 },
+            ),
+            (
+                vec!["-t", "0", "--gumbel", "--top-k", "2", "--top-p", "0.6"],
+                Sampling::ArgMax,
+            ),
+            (
+                vec!["-t", "0.0000001", "--gumbel", "--top-k", "2"],
+                Sampling::FilteredGumbel {
+                    temperature: 1e-7,
+                    k: 2,
+                    p: 1.0,
+                },
+            ),
+        ];
+        for (argv, want) in cases {
+            let o = resolve_options_uninstalled(&common(&argv), &no_front).unwrap();
+            assert_eq!(o.sampling.sampling().unwrap(), want, "{argv:?}");
+        }
+        for argv in [
+            vec!["--generation-config", r#"{"temperature":-1}"#],
+            vec!["--generation-config", r#"{"top_p":1.1}"#],
+            vec!["--generation-config", r#"{"top_p":"-0.1"}"#],
+            vec!["--generation-config", r#"{"top_k":-1}"#],
+            vec!["--set", "generation.temperature=nan"],
+        ] {
+            assert!(
+                resolve_options_uninstalled(&common(&argv), &no_front).is_err(),
+                "{argv:?}"
+            );
+        }
+        // A ring named by flag or by key with a host-side sampler resolves
+        // (C2): the options keep the ring and the sampler, and each request
+        // runs on the blocking arm with a note.
+        for argv in [
+            vec![
+                "-t",
+                "0.7",
+                "--gumbel",
+                "--top-k",
+                "2",
+                "--readback",
+                "ring",
+            ],
+            vec![
+                "-t",
+                "0.7",
+                "--gumbel",
+                "--top-k",
+                "2",
+                "--set",
+                "decode.readback.kind=ring",
+            ],
+        ] {
+            let o = resolve_options_uninstalled(&common(&argv), &no_front).unwrap();
+            assert_eq!(
+                o.sampling.sampling().unwrap(),
+                Sampling::FilteredGumbel {
+                    temperature: 0.7,
+                    k: 2,
+                    p: 1.0,
+                },
+                "{argv:?}"
+            );
+            assert_eq!(
+                o.decode.readback.kind,
+                crate::ReadbackKind::Ring,
+                "{argv:?}"
+            );
+            assert!(
+                crate::couplings::explain(&o)
+                    .iter()
+                    .any(|l| l.starts_with("decode.readback.kind = ring -> blocking")),
+                "{argv:?}"
+            );
+        }
+    }
+
+    #[test]
     fn the_sampler_arms_follow_the_fields() {
         let o = resolve_options_uninstalled(&common(&[]), &no_front).unwrap();
-        assert_eq!(o.sampling.sampling(), Sampling::ArgMax, "greedy by default");
+        assert_eq!(
+            o.sampling.sampling().unwrap(),
+            Sampling::ArgMax,
+            "greedy by default"
+        );
         let o = resolve_options_uninstalled(
             &common(&["-t", "0.7", "--top-p", "0.9", "-n", "64", "--seed", "7"]),
             &no_front,
         )
         .unwrap();
         assert_eq!(
-            o.sampling.sampling(),
+            o.sampling.sampling().unwrap(),
             Sampling::TopP {
                 p: 0.9,
                 temperature: 0.7
@@ -1397,7 +1523,7 @@ mod sampling_and_speculation_tests {
         )
         .unwrap();
         assert_eq!(
-            o.sampling.sampling(),
+            o.sampling.sampling().unwrap(),
             Sampling::TopKThenTopP {
                 k: 40,
                 p: 0.9,
@@ -1407,9 +1533,23 @@ mod sampling_and_speculation_tests {
         let o =
             resolve_options_uninstalled(&common(&["-t", "0.7", "--gumbel"]), &no_front).unwrap();
         assert_eq!(
-            o.sampling.sampling(),
+            o.sampling.sampling().unwrap(),
             Sampling::GumbelSoftmax { temperature: 0.7 }
         );
+        let filtered = resolve_options_uninstalled(
+            &common(&["-t", "0.7", "--gumbel", "--top-k", "2", "--top-p", "0.4"]),
+            &no_front,
+        )
+        .unwrap();
+        assert_eq!(
+            filtered.sampling.sampling().unwrap(),
+            Sampling::FilteredGumbel {
+                temperature: 0.7,
+                k: 2,
+                p: 0.4,
+            }
+        );
+        assert!(filtered.sampling.sampling().unwrap().requires_host());
         let o = resolve_options_uninstalled(
             &common(&[
                 "--generation-config",
@@ -1418,7 +1558,10 @@ mod sampling_and_speculation_tests {
             &no_front,
         )
         .unwrap();
-        assert_eq!(o.sampling.sampling(), Sampling::All { temperature: 0.3 });
+        assert_eq!(
+            o.sampling.sampling().unwrap(),
+            Sampling::All { temperature: 0.3 }
+        );
         assert_eq!(o.sampling.stop, vec!["<|im_end|>", "\n\n"]);
         let p = o.sampling.params(&[7], crate::ReadbackArm::Blocking, 0);
         assert_eq!(

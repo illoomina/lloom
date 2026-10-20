@@ -621,7 +621,7 @@ pub fn run(args: ChatArgs) -> Result<()> {
             st.readback.eos_index_late,
             st.prefill_units,
             report::param_style_arm(),
-            params.sampling().name(),
+            decoded.sampling.name(),
             think.map_or("none", Thinking::name),
             think.map_or("none", |t| t.by.name()),
             opt(sampling.thinking_budget),

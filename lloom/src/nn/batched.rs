@@ -407,6 +407,10 @@ impl<'m, M: BatchedCausalLM, R: BorrowMut<Session<'m, M>>> BatchDecoder<'m, M, R
         eos_ids: Vec<u32>,
         max_tokens: usize,
     ) -> Result<RowId> {
+        crate::nn::decode::refuse(
+            crate::nn::decode::Body::BatchedStep,
+            &crate::nn::decode::Asks::sampling(&sampling),
+        )?;
         {
             let s: &mut Session<'m, M> = session.borrow_mut();
             if s.seq.overrun > 0 {

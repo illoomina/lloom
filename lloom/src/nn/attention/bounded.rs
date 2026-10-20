@@ -46,6 +46,8 @@ pub struct MaskedAttentionPlan<'a> {
     keys: usize,
     tile: usize,
     scratch: AttentionScratch,
+    /// The fused route on Metal, checked against every tile at preparation.
+    route: Option<super::route::PreparedAttention>,
 }
 
 fn mul(values: &[usize]) -> Result<usize> {
@@ -147,6 +149,7 @@ impl<'a> MaskedAttentionPlan<'a> {
         let output_f32 = mul(&[b, h, t, d, 4])?;
         let concat = mul(&[2, output])?;
         let half_cast = if q.dtype() == DType::F32 { 0 } else { output };
+        let mut route = None;
         let scratch = match q.device() {
             Device::Cpu => {
                 if q.stride()[3] != 1 || k.stride()[3] != 1 {
@@ -164,13 +167,7 @@ impl<'a> MaskedAttentionPlan<'a> {
                 }
             }
             Device::Metal(_) => {
-                if !matches!(d, 32 | 64 | 72 | 80 | 96 | 128 | 256 | 512)
-                    || (d == 512 && q.dtype() == DType::F32)
-                {
-                    lloom_tensor::bail!(
-                        "masked Metal full SDPA does not support this head dimension/dtype"
-                    )
-                }
+                route = Some(metal_route(q, h, kh, d, tile, k_len)?);
                 if [q, k, v].iter().any(|x| x.stride()[3] != 1) {
                     lloom_tensor::bail!(
                         "masked Metal full SDPA requires unit Q/K/V channel strides"
@@ -234,6 +231,7 @@ impl<'a> MaskedAttentionPlan<'a> {
             keys: k_len,
             tile,
             scratch,
+            route,
         })
     }
 
@@ -290,14 +288,15 @@ impl<'a> MaskedAttentionPlan<'a> {
                         };
                         out.to_dtype(self.q.dtype())?
                     }
-                    Device::Metal(_) => crate::nn::ops::sdpa(
+                    Device::Metal(_) => crate::nn::ops::attention(
                         &q,
                         &k,
                         &v,
                         Some(&mask.broadcast_as((1, self.heads, n, self.keys))?),
-                        false,
                         self.scale,
-                        1.,
+                        self.route
+                            .as_ref()
+                            .expect("a Metal plan prepares its route"),
                     )?,
                     Device::Cuda(_) => {
                         let q = q.to_dtype(DType::F32)?.contiguous()?;
@@ -313,6 +312,54 @@ impl<'a> MaskedAttentionPlan<'a> {
             rows.push(Tensor::cat(&chunks, 2)?);
         }
         Tensor::cat(&rows, 0)
+    }
+}
+
+/// The tiled kernel under an additive mask, one sequence a dispatch, up to
+/// `tile` queries over `keys`: a head dim or dtype it does not instantiate is
+/// refused here, before anything is allocated.
+fn metal_route(
+    q: &Tensor,
+    heads: usize,
+    kv_heads: usize,
+    head_dim: usize,
+    tile: usize,
+    keys: usize,
+) -> Result<super::route::PreparedAttention> {
+    #[cfg(feature = "metal")]
+    {
+        use super::route::{
+            AttentionBounds, AttentionSpec, KvLayout, MaskKind, MetalKernelSet, PreparedAttention,
+        };
+        let spec = AttentionSpec {
+            q_heads: heads,
+            kv_heads,
+            head_dim,
+            v_head_dim: head_dim,
+            dtype: q.dtype(),
+            kv_dtype: q.dtype(),
+            mask: MaskKind::Additive,
+            softcap: 1.0,
+            layout: KvLayout::Strided,
+            bounds: AttentionBounds {
+                batch: 1,
+                min_queries: 1,
+                queries: tile,
+                keys,
+            },
+        };
+        PreparedAttention::prepare(
+            spec,
+            &MetalKernelSet {
+                device: q.device().as_metal_device()?,
+            },
+        )
+        .map_err(|u| lloom_tensor::Error::Msg(format!("masked Metal attention: {u}")))
+    }
+    #[cfg(not(feature = "metal"))]
+    {
+        let _ = (q, heads, kv_heads, head_dim, tile, keys);
+        lloom_tensor::bail!("masked Metal attention without the metal feature")
     }
 }
 

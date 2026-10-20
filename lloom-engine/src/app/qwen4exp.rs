@@ -57,6 +57,9 @@ pub struct LoadOptions {
     pub first_shard: PathBuf,
     pub tokenizer: Option<PathBuf>,
     pub cpu: bool,
+    /// What the run is for (`execution.purpose`): production refuses at load
+    /// an attention that takes the composed scores path on Metal.
+    pub purpose: lloom::nn::attention::route::ExecutionPurpose,
     pub kv_capacity: usize,
     pub readback: ReadbackArm,
     /// The decode loop's options (`DecodeConfig`).
@@ -624,6 +627,7 @@ fn load_on<P: QwenShape>(
             _ => None,
         };
         let mload = ModelLoad {
+            purpose: opts.purpose,
             ple_shard: None,
             ple: opts.ple,
             moe_act,
@@ -655,8 +659,12 @@ fn load_on<P: QwenShape>(
             "replay" => PrefillMode::Replay,
             other => anyhow::bail!("--prefill-mode {other}: chunk | replay"),
         };
-        let installed =
+        // What is installed is what the load reports (`ExecutorConfig::under_body`).
+        let (executor, executor_note) = opts.executor.under_body(opts.mtp.is_some());
+        opts.executor = executor;
+        let mut installed =
             super::common::install_executor(&device, &opts.executor, opts.mtp.is_some())?;
+        installed.declined = executor_note;
         #[cfg(feature = "metal")]
         if let Some(mb) = opts.memory.free_budget_mb {
             if let Device::Metal(m) = &device {
@@ -790,6 +798,7 @@ impl<P: QwenShape, R: ExpertResidency + HasStreamStats + Send + Sync + 'static> 
         let no_fill = host_fill_absent(&model, &device);
         let (readback, note) = resolve_readback(opts.readback, no_fill);
         let mut load_warnings = Vec::new();
+        load_warnings.extend(installed.declined_warning());
         if let Some(note) = note {
             eprintln!("[readback {note}]");
             // Only the arm that reads its fed id back is slower than asked;
@@ -1185,6 +1194,7 @@ impl<P: QwenShape, R: ExpertResidency + HasStreamStats + Send + Sync + 'static> 
             readback: ReadbackArm::Batched {
                 rows: done.joined_beside,
             },
+            readback_note: None,
             stats: done.stats,
             thinking: None,
             logprobs: None,

@@ -13,8 +13,8 @@ use std::fmt;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum LoadWarningKind {
     /// An attention phase takes another kernel than the arm requested: the
-    /// nearest fused one, or the composed attention when none covers the
-    /// shape (`lfm2::AttnRoute`).
+    /// nearest fused one (`lfm2::AttnRoute`). A shape no fused kernel covers
+    /// is refused at load on Metal, not warned about.
     AttentionRoute,
     /// A dtype this GPU executes only through software emulation, admitted
     /// by the operator's opt-in (`kernels::metal::arms::EmulatedArms`).
@@ -23,14 +23,18 @@ pub enum LoadWarningKind {
     Readback,
     /// A speculative configuration measured slower than decoding without it.
     Speculation,
+    /// An executor arm the run asked for is not installed as asked
+    /// (`ExecutorConfig::under_body`).
+    Executor,
 }
 
 impl LoadWarningKind {
-    pub const ALL: [LoadWarningKind; 4] = [
+    pub const ALL: [LoadWarningKind; 5] = [
         LoadWarningKind::AttentionRoute,
         LoadWarningKind::EmulatedType,
         LoadWarningKind::Readback,
         LoadWarningKind::Speculation,
+        LoadWarningKind::Executor,
     ];
 
     /// The `kind` a structured reader keys on.
@@ -40,6 +44,7 @@ impl LoadWarningKind {
             LoadWarningKind::EmulatedType => "emulated_type",
             LoadWarningKind::Readback => "readback",
             LoadWarningKind::Speculation => "speculation",
+            LoadWarningKind::Executor => "executor",
         }
     }
 }

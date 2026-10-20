@@ -498,3 +498,58 @@ fn metal_dense_kv_stores_match_the_cpu_reference() -> Result<()> {
     }
     Ok(())
 }
+
+/// On Metal the fused route reads the KV store it is handed: at a head dim
+/// the route serves, its key dtype follows `with_kv_dtype`, the conversion it
+/// quotes is the store's (none for f32), and both stores match the CPU
+/// reference, which attends composed, within the bound the composed Metal
+/// arm above is held to.
+#[test]
+#[cfg(feature = "metal")]
+fn metal_fused_route_reads_the_kv_store_dtype() -> Result<()> {
+    let bytes = synthetic::fixture_table(lloom_tensor::quantized::GgmlDType::F32, 64)?;
+    let gpu = Device::new_metal(0)?;
+    let make = |device: &Device, dtype| -> Result<Model> {
+        let mut file = Cursor::new(&bytes);
+        Model::from_gguf(gguf_file::Content::read(&mut file)?, &mut file, device)?
+            .with_kv_dtype(dtype)
+    };
+    let drive = |model: &Model| -> Result<Vec<f32>> {
+        let mut cache = model.new_cache()?;
+        let mut logits = None;
+        for chunk in [&[1u32, 2][..], &[3, 4][..], &[5][..]] {
+            let input = Tensor::new(chunk, &model.device)?.unsqueeze(0)?;
+            logits = Some(CausalLM::forward(model, &input, cache.pos, &mut cache)?);
+        }
+        model.device.synchronize()?;
+        logits.unwrap().flatten_all()?.to_vec1()
+    };
+    for dtype in [DType::F32, DType::F16] {
+        let metal = make(&gpu, dtype)?;
+        assert_eq!(metal.reference_attention(), None, "{dtype:?}");
+        let routes: Vec<_> = metal
+            .layers
+            .iter()
+            .filter_map(|l| match &l.kind {
+                LayerKind::Attention(a) => a.route,
+                _ => None,
+            })
+            .collect();
+        assert!(!routes.is_empty(), "{dtype:?}: no layer took the route");
+        for route in &routes {
+            assert_eq!(route.spec().kv_dtype, dtype);
+            let quoted = route.workspace(1, 1, 5)?.conversion;
+            assert_eq!(quoted == 0, dtype == DType::F32, "{dtype:?}: {quoted}");
+        }
+        let expected = drive(&make(&Device::Cpu, dtype)?)?;
+        let got = drive(&metal)?;
+        for (a, b) in got.iter().zip(&expected) {
+            assert!(
+                a.is_finite() && b.is_finite() && (a - b).abs() < 1e-3,
+                "{dtype:?}: {got:?} != {expected:?}"
+            );
+        }
+        assert_eq!(got, drive(&metal)?, "run-to-run identity {dtype:?}");
+    }
+    Ok(())
+}

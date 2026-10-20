@@ -373,6 +373,13 @@ pub(crate) struct VisionTowerCore<P> {
     embeddings: VisionEmbeddings,
     encoder: super::siglip::Encoder<P>,
     post_layernorm: LayerNorm,
+    /// The fused bidirectional attention [`Self::forward`] takes on Metal,
+    /// prepared at load; `None` on the CPU, which attends composed, and
+    /// wherever `reference` says why.
+    route: Option<crate::nn::attention::route::PreparedAttention>,
+    /// Why the tower attends composed on Metal: no fused kernel covers its
+    /// shape. Serving refuses such a tower.
+    reference: Option<String>,
 }
 
 impl VisionTower {
@@ -385,17 +392,28 @@ impl VisionTower {
             cfg.layer_norm_eps,
             vb_m.pp("post_layernorm"),
         )?;
+        let (route, reference) = match vision_route(cfg, vb.dtype(), vb.device()) {
+            Ok(route) => (route, None),
+            Err(why) => (None, Some(why)),
+        };
         Ok(Self {
             inner: VisionTowerCore {
                 embeddings,
                 encoder,
                 post_layernorm,
+                route,
+                reference,
             },
         })
     }
 
     pub(crate) fn into_inner(self) -> VisionTowerCore<Linear> {
         self.inner
+    }
+    /// Why the tower attends composed on Metal, if it does: serving refuses
+    /// such a tower.
+    pub fn reference_attention(&self) -> Option<&str> {
+        self.inner.reference.as_deref()
     }
     /// The patch projection alone, for a staged parity gate.
     pub fn patch_embed_only(&self, patches: &Tensor) -> Result<Tensor> {
@@ -500,6 +518,8 @@ impl<P: Projection> VisionTowerCore<P> {
             },
             encoder,
             post_layernorm,
+            route: None,
+            reference: None,
         })
     }
     /// The patch projection alone, for a staged parity gate.
@@ -560,8 +580,70 @@ impl<P: Projection> VisionTowerCore<P> {
     /// module docs on why the single-tile path is exact without one.
     pub(crate) fn forward(&self, patches: &Tensor, rows: usize, cols: usize) -> Result<Tensor> {
         let xs = self.embeddings.forward(patches, rows, cols)?;
-        let xs = self.encoder.forward(&xs, None)?;
+        let xs = match &self.route {
+            Some(route) => {
+                self.encoder
+                    .forward_with_attention(&xs, None, &mut |q, k, v, mask, scale| {
+                        crate::nn::ops::attention(q, k, v, mask, scale as f32, route)
+                    })?
+            }
+            None => self.encoder.forward(&xs, None)?,
+        };
         xs.apply(&self.post_layernorm)
+    }
+}
+
+/// The fused attention the tower's encoder takes on Metal: bidirectional
+/// over a tile's patches, every head its own key head. `Err` names the
+/// capability no fused kernel provides; the tower then attends composed,
+/// which serving refuses on Metal.
+fn vision_route(
+    cfg: &VisionConfig,
+    dtype: DType,
+    device: &lloom_tensor::Device,
+) -> std::result::Result<Option<crate::nn::attention::route::PreparedAttention>, String> {
+    if !device.is_metal() {
+        return Ok(None);
+    }
+    #[cfg(feature = "metal")]
+    {
+        use crate::nn::attention::route::{
+            AttentionBounds, AttentionSpec, KvLayout, MaskKind, MetalKernelSet, PreparedAttention,
+        };
+        let heads = cfg.num_attention_heads;
+        if heads == 0 || !cfg.hidden_size.is_multiple_of(heads) {
+            return Err(format!(
+                "vision tower: {} wide over {heads} heads",
+                cfg.hidden_size
+            ));
+        }
+        let head_dim = cfg.hidden_size / heads;
+        let spec = AttentionSpec {
+            q_heads: heads,
+            kv_heads: heads,
+            head_dim,
+            v_head_dim: head_dim,
+            dtype,
+            kv_dtype: dtype,
+            mask: MaskKind::None,
+            softcap: 1.0,
+            layout: KvLayout::Strided,
+            bounds: AttentionBounds {
+                batch: usize::MAX,
+                min_queries: 1,
+                queries: usize::MAX,
+                keys: usize::MAX,
+            },
+        };
+        let metal = device.as_metal_device().map_err(|e| e.to_string())?;
+        PreparedAttention::prepare(spec, &MetalKernelSet { device: metal })
+            .map(Some)
+            .map_err(|u| format!("vision tower: {u}"))
+    }
+    #[cfg(not(feature = "metal"))]
+    {
+        let _ = (cfg, dtype);
+        Ok(None)
     }
 }
 
@@ -773,6 +855,12 @@ impl VisionEncoder {
         // Back to the 2-D patch layout the projector's unshuffle expects.
         let feats = feats.reshape((1, rows, cols, hidden))?;
         self.projector.forward(&feats)
+    }
+
+    /// Why the tower attends composed on Metal, if it does: serving refuses
+    /// such an encoder.
+    pub fn reference_attention(&self) -> Option<&str> {
+        self.tower.reference_attention()
     }
 
     /// Encode a prepared image: every tile, in order, concatenated to

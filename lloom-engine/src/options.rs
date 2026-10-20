@@ -142,7 +142,10 @@ lloom_tensor::serde_via_str!(EosKind);
 #[derive(Options, Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(default)]
 pub struct ReadbackConfig {
-    /// The strategy: `auto` (the ring where the sampler admits it), `blocking`, `ring`.
+    /// The strategy: `auto` (the ring where the sampler admits it), `blocking`, `ring` (the
+    /// ring for every sampler it admits; a request whose sampler needs a host sort — top-k,
+    /// top-p — runs on the blocking arm with a warning on its turn line and in
+    /// `timings.readback_note`, coupling C2).
     #[opt(variants = ["auto", "blocking", "ring"], path = "decode.readback.kind", status = "advanced", facets = ["buffer", "locality"], flows = ["token-out"])]
     pub kind: ReadbackKind,
     /// How a ring learns EOS.
@@ -985,7 +988,7 @@ pub struct SamplingConfig {
         cli = "top-p"
     )]
     pub top_p: Option<f64>,
-    /// Top-k sampling's k; with top-p, top-k then top-p. Host-side: the ring arm is refused, the blocking arm runs.
+    /// Top-k sampling's k; with top-p, top-k then top-p. Host-side: a ring asked by name is demoted with a warning and the blocking arm runs this request (C2).
     #[opt(
         flag = "top-k",
         path = "generation.top_k",
@@ -1328,7 +1331,8 @@ fn parse_barrier_scope(v: &str) -> Result<String, String> {
 /// The Metal executor arms (`DESIGN.md` §9.2, §11.1–11.3; `--arena
 /// --arena-layout --packed --replay --replay-barriers --replay-barrier-scope
 /// --pass-plans`): installed on the device at load,
-/// before the model. Instruments and A/B arms — none is the shipping path.
+/// before the model. The pass-plan cache is on by default; the others are
+/// instruments and A/B arms. A load installs [`ExecutorConfig::under_body`].
 #[derive(Options, Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(default)]
 pub struct ExecutorConfig {
@@ -1373,6 +1377,36 @@ impl ExecutorConfig {
     /// cache off).
     pub fn pass_plans_armed(&self) -> bool {
         self.pass_plans && !self.arena && !self.replay
+    }
+
+    /// The arms a load installs for its body, and what changed from the
+    /// request. The single-key arena is served by allocation ordinal, which a
+    /// speculative round does not hold stable (`install_executor`, DESIGN.md
+    /// §11.3x), so under a speculative body `arena` is not installed; the
+    /// pass-plan cache, when asked for, is the planned route that serves.
+    /// Replay under a speculative body is refused by the installer. The
+    /// returned arms are what the load reports and installs, so no line
+    /// names an arm that is not installed.
+    pub fn under_body(&self, speculative: bool) -> (ExecutorConfig, Option<String>) {
+        if !(speculative && self.arena && !self.replay) {
+            return (self.clone(), None);
+        }
+        let installed = ExecutorConfig {
+            arena: false,
+            ..self.clone()
+        };
+        let instead = if installed.pass_plans_armed() {
+            "the pass-plan cache serves instead"
+        } else {
+            "no planned executor serves (`--pass-plans false`)"
+        };
+        (
+            installed,
+            Some(format!(
+                "executor.arena is not installed under a speculative body (it is served by \
+                 allocation ordinal, which a speculative round does not hold stable); {instead}"
+            )),
+        )
     }
 
     /// The arms for a report line, from the group that was installed.
@@ -1531,6 +1565,10 @@ fn parse_device(v: &str) -> Result<String, String> {
         )),
     }
 }
+fn parse_purpose(v: &str) -> Result<String, String> {
+    lloom::nn::attention::route::ExecutionPurpose::parse(&v.trim().to_ascii_lowercase())
+        .map(|p| p.name().to_string())
+}
 fn parse_experts(v: &str) -> Result<String, String> {
     match v.trim().to_ascii_lowercase().as_str() {
         s @ ("stream" | "resident") => Ok(s.into()),
@@ -1620,6 +1658,9 @@ pub struct LoadConfig {
     /// The device: `auto` (the GPU this build has, else the CPU) or `cpu`.
     #[opt(flag = "device", parser = "parse_device", variants = ["auto", "cpu"], path = "backend.device", status = "stable", cli = "device", switches = ["cpu=cpu"])]
     pub device: String,
+    /// What the run is for: `production` (chat and serve — on Metal every attention dispatches through a prepared, bounded-memory route, and a configuration under which any attention takes the composed scores path is refused at load, whatever option selected it) or `reference` (a test or a harness comparing against the composed attention, which materializes the scores; named on the load line and as a load warning). No tuning knob moves it.
+    #[opt(flag = "execution-purpose", parser = "parse_purpose", variants = ["production", "reference"], path = "execution.purpose", status = "reference")]
+    pub purpose: String,
     /// Qwen4-exp: how the routed experts are held — `stream` (a slot pool per layer filled from the checkpoint on demand) or `resident` (every expert in memory). Qwen3.5's MoE loads resident whatever it says, with a load warning.
     #[opt(flag = "experts", parser = "parse_experts", variants = ["stream", "resident"], path = "weights.experts.placement", status = "stable", cli = "experts", facets = ["source"], flows = ["weights-in"])]
     pub experts: String,
@@ -1670,6 +1711,7 @@ impl Default for LoadConfig {
             text_only: false,
             warmup: true,
             device: "auto".into(),
+            purpose: "production".into(),
             experts: "stream".into(),
             loader: "pread".into(),
             ple_cache_rows: 0,
@@ -1689,6 +1731,13 @@ impl LoadConfig {
     /// The CPU device was asked for.
     pub fn cpu(&self) -> bool {
         self.device == "cpu"
+    }
+
+    /// The run's execution purpose (`execution.purpose`).
+    pub fn purpose(
+        &self,
+    ) -> std::result::Result<lloom::nn::attention::route::ExecutionPurpose, String> {
+        lloom::nn::attention::route::ExecutionPurpose::parse(&self.purpose)
     }
 }
 

@@ -264,6 +264,7 @@ fn main() -> Result<()> {
         memory_fraction: Some(args.memory_fraction),
         kv_precision: None,
         machine: None,
+        purpose: lloom::nn::attention::route::ExecutionPurpose::Production,
     };
     let slots = match args.slots.as_str() {
         "auto" => SlotBudget::Auto {

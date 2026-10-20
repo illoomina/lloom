@@ -206,6 +206,17 @@ fn aliases_and_overflow_refuse_before_consumer_encoding() -> Result<()> {
 fn embedding_preserves_f16_bf16_bytes_and_nonzero_element_offsets() -> Result<()> {
     let d = device()?;
     for dtype in [DType::F16, DType::BF16] {
+        // Apple7 executes `bf16` only emulated, which §15.2a refuses without
+        // the operator's opt-in; the f16 arm covers the byte path there.
+        if dtype == DType::BF16
+            && !d
+                .as_metal_device()?
+                .emulated_arms()
+                .native()
+                .has(crate::kernels::metal::arms::Feature::Bf16)
+        {
+            continue;
+        }
         let guard = SampleGuard::new(d.as_metal_device()?)?;
         let table = Tensor::new(&[99f32, 1., 2., 3., 4., 5., 6., 99.], &d)?.to_dtype(dtype)?;
         let out = Tensor::new(&[-99f32; 4], &d)?.to_dtype(dtype)?;

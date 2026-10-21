@@ -17,7 +17,7 @@
 use crate::decode::{DecodeParams, ReadbackArm, RingArm};
 use lloom::generation::poll::PollMechanism;
 use lloom::generation::{CommitBudget, EosRead, WAKE_LIVE_EVERY_DEFAULT};
-use lloom::nn::{DecodeOptions, PassWidths};
+use lloom::nn::{DecodeOptions, PassWidths, PrefillDecode};
 use lloom_macros::Options;
 use serde::{Deserialize, Serialize};
 
@@ -464,6 +464,12 @@ pub struct PrefillConfig {
     /// An aligned-bucket schedule for the prefill forwards: `N` or `progressive:START,STOP`, optionally `/tile:BULK`.
     #[opt(parser = "parse_spark_field", variants = ["1", "16", "32", "64", "progressive:START,STOP", "…/tile:BULK"], path = "prefill.schedule", status = "arm", facets = ["cadence"], flows = ["prompt-in"])]
     pub spark: Option<String>,
+    /// The pending prompts' chunks one batched step carries under `--batch N`: up to this many rows' chunks, prefilled together in one pass (1 = one chunk a step; 0 = as many as the batch width and the load's admission room allow).
+    #[opt(flag = "prefill-batch", path = "scheduler.prefill_batch", status = "advanced", cli = "prefill-batch", facets = ["cadence"], flows = ["prompt-in"])]
+    pub batch: usize,
+    /// What the live rows do in a batched step that feeds prompt pieces: `ride` (their next token rides the pieces' forward) or `pause` (a row that has streamed a token waits for the pieces).
+    #[opt(flag = "prefill-decode", variants = ["ride", "pause"], path = "scheduler.prefill_decode", status = "arm", facets = ["cadence"], flows = ["prompt-in", "token-out"])]
+    pub decode: PrefillDecode,
     /// How a batched step's prompt pieces are sized: `lru` or `ladder` (DESIGN §9.2aa I4).
     #[opt(flag = "pass-widths", variants = ["lru", "ladder"], path = "scheduler.pass_widths", status = "arm")]
     pub pass_widths: PassWidths,
@@ -479,6 +485,8 @@ impl Default for PrefillConfig {
             ubatch: 0,
             chunk: 0,
             spark: None,
+            batch: 1,
+            decode: PrefillDecode::Ride,
             pass_widths: PassWidths::Lru,
             in_flight: 0,
         }

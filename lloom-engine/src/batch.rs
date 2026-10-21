@@ -40,7 +40,7 @@ use std::sync::Arc;
 use lloom::generation::Sampling;
 use lloom::nn::{
     BatchDecoder, BatchedCausalLM, CacheReset, CacheRewind, CacheShare, DecodeOptions, DecodeOut,
-    DecodeStats, ReuseAction, RowDriver, RowId, Session,
+    DecodeStats, PrefillDecode, ReuseAction, RowDriver, RowId, Session,
 };
 use lloom_tensor::{Device, Result};
 
@@ -362,6 +362,11 @@ pub struct BatchCounters {
     pub static_batches: u64,
     /// Admissions deferred for a live row's prefix still being fed (§12.3).
     pub share_waits: u64,
+    /// The most prompt pieces one step carried (`prefill_batch`, §11.8).
+    pub max_pieces: usize,
+    /// Steps that held a streaming row back while pieces were fed
+    /// (`PrefillDecode::Pause`).
+    pub held_steps: u64,
 }
 
 /// The scheduler: built and run on one thread ([`spawn`]).
@@ -386,6 +391,20 @@ pub struct BatchScheduler<'m, M: BatchedCausalLM, E> {
     counters: BatchCounters,
     /// Under the static mode, the rows the current batch used, by pool slot.
     on_counters: Option<CountersHook>,
+    /// The open profile window, under the profile build's recorder.
+    #[cfg(feature = "metal")]
+    window: Option<ProfileWindow>,
+    #[cfg(feature = "metal")]
+    windows: u64,
+}
+
+/// One batch window under the profile build's recorder (`CANDLE_METAL_PROFILE=1`):
+/// from an admission onto an idle engine until nothing is live, every step's
+/// composition with its host interval in the GPU's clock.
+#[cfg(feature = "metal")]
+struct ProfileWindow {
+    started: std::time::Instant,
+    steps: Vec<(u64, f64, f64, lloom::nn::StepReport)>,
 }
 
 /// What [`spawn`] needs to build the scheduler on its thread.
@@ -401,6 +420,12 @@ pub struct BatchConfig<M: BatchedCausalLM, E> {
     pub reuse_prefix: bool,
     /// Share a request's prefix from another row's cache, by page (§12.3).
     pub share_prefix: bool,
+    /// How many pending rows' chunks one step of the K=1 loop carries
+    /// (`BatchDecoder::with_prefill_batch`); a driver from `extra` prefills
+    /// its own way and does not read it.
+    pub prefill_batch: usize,
+    /// What the K=1 loop's live rows do in a step that feeds prompt pieces.
+    pub prefill_decode: PrefillDecode,
     pub mode: BatchMode<M, E>,
     pub extra: E,
     /// Called after every step with the counters (a log line).
@@ -429,11 +454,11 @@ where
         // decoder is built with a placeholder no id matches.
         let decoder: Driver<'m, M> = match cfg.extra.make_driver(model, &cfg.opts, &cfg.device)? {
             Some(d) => d,
-            None => Box::new(BatchDecoder::new(
-                cfg.opts.clone(),
-                &[u32::MAX],
-                cfg.device.clone(),
-            )?),
+            None => Box::new(
+                BatchDecoder::new(cfg.opts.clone(), &[u32::MAX], cfg.device.clone())?
+                    .with_prefill_batch(cfg.prefill_batch)
+                    .with_prefill_decode(cfg.prefill_decode),
+            ),
         };
         Ok(Self {
             model,
@@ -453,6 +478,10 @@ where
             rx,
             counters: BatchCounters::default(),
             on_counters: cfg.on_counters,
+            #[cfg(feature = "metal")]
+            window: None,
+            #[cfg(feature = "metal")]
+            windows: 0,
         })
     }
 
@@ -789,6 +818,11 @@ where
                 self.decoder.cancel(*id);
             }
         }
+        #[cfg(feature = "metal")]
+        let t0 = self.window.as_ref().map(|_| {
+            lloom_tensor::kernels::metal::profile::set_step(self.counters.steps);
+            lloom_tensor::kernels::metal::profile::now_s()
+        });
         let inflight = &self.inflight;
         let report = self.decoder.step(&mut |row, ids| {
             if let Some(f) = inflight.get(&row) {
@@ -799,13 +833,23 @@ where
             }
             Ok(())
         })?;
+        #[cfg(feature = "metal")]
+        if let (Some(w), Some(t0)) = (self.window.as_mut(), t0) {
+            let t1 = lloom_tensor::kernels::metal::profile::now_s();
+            w.steps.push((self.counters.steps, t0, t1, report));
+        }
         self.counters.steps += 1;
         self.counters.max_live = self.counters.max_live.max(report.live);
+        self.counters.max_pieces = self.counters.max_pieces.max(report.pieces);
+        if report.held > 0 {
+            self.counters.held_steps += 1;
+        }
         if lloom::tuning::tuning().lfm2.share_trace {
             eprintln!(
-                "[share: step {}: live {} pieces {} ({} tokens) retired {} pending {}]",
+                "[share: step {}: live {} held {} pieces {} ({} tokens) retired {} pending {}]",
                 self.counters.steps,
                 report.live,
+                report.held,
                 report.pieces,
                 report.piece_tokens,
                 report.retired,
@@ -957,6 +1001,109 @@ where
         Ok(())
     }
 
+    /// Open a profile window when requests arrive on an idle engine and the
+    /// profile build's recorder is on: the counters start from zero.
+    #[cfg(feature = "metal")]
+    fn open_window(&mut self) {
+        use lloom_tensor::kernels::metal::profile;
+        if self.window.is_some()
+            || self.waiting.is_empty()
+            || !self.nothing_live()
+            || !profile::recorder_enabled()
+        {
+            return;
+        }
+        if self.device.synchronize().is_err() {
+            return;
+        }
+        profile::reset();
+        self.window = Some(ProfileWindow {
+            started: std::time::Instant::now(),
+            steps: Vec::new(),
+        });
+    }
+
+    /// Close the window once nothing is live and nothing waits: the GPU's
+    /// busy union against the window's wall on stderr, and under
+    /// `diagnostics.gpu_profile.dump` the command buffers
+    /// (`<dump>.batch<n>.csv`), the steps (`<dump>.batch<n>.steps.csv`) and,
+    /// with the encoder counters on, every sampled encoder
+    /// (`<dump>.batch<n>.encoders.csv`).
+    #[cfg(feature = "metal")]
+    fn close_window(&mut self) {
+        use lloom_tensor::kernels::metal::profile;
+        if self.window.is_none() || !self.nothing_live() || !self.waiting.is_empty() {
+            return;
+        }
+        let w = self.window.take().expect("checked");
+        let _ = self.device.synchronize();
+        let wall = w.started.elapsed().as_secs_f64();
+        let s = profile::snapshot();
+        let idle: f64 = s.idle_gaps.iter().map(|g| g.idle).sum();
+        let starved: f64 = s.idle_gaps.iter().map(|g| g.starved).sum();
+        let n = self.windows;
+        self.windows += 1;
+        eprintln!(
+            "[profile: batch window {n}: {} steps, {} with pieces, {} holding rows; gpu_busy_union {:.4} s /              wall {:.4} s = {:.4} busy/wall; {} command buffers, idle between them {:.4} s (starved {:.4} s)]",
+            w.steps.len(),
+            w.steps.iter().filter(|x| x.3.pieces > 0).count(),
+            w.steps.iter().filter(|x| x.3.held > 0).count(),
+            s.gpu_busy_union_s,
+            wall,
+            s.gpu_busy_union_s / wall.max(1e-9),
+            s.timed_command_buffers,
+            idle,
+            starved,
+        );
+        let Some(path) = lloom_tensor::tuning::tuning()
+            .instrument
+            .profile_dump
+            .clone()
+        else {
+            return;
+        };
+        let mut cb = String::from("step,committed_s,start_s,end_s\n");
+        for r in &s.command_buffer_records {
+            cb.push_str(&format!(
+                "{},{:.6},{:.6},{:.6}\n",
+                r.step, r.committed, r.interval.start, r.interval.end
+            ));
+        }
+        let mut st = String::from(
+            "step,host_start_s,host_end_s,live,held,pieces,piece_tokens,retired,pending\n",
+        );
+        for (step, t0, t1, r) in &w.steps {
+            st.push_str(&format!(
+                "{step},{t0:.6},{t1:.6},{},{},{},{},{},{}\n",
+                r.live, r.held, r.pieces, r.piece_tokens, r.retired, r.pending
+            ));
+        }
+        let mut files = vec![
+            (format!("{path}.batch{n}.csv"), cb),
+            (format!("{path}.batch{n}.steps.csv"), st),
+        ];
+        if !s.encoder_records.is_empty() {
+            let mut enc = String::from("step,label,start_s,end_s,dispatches\n");
+            for e in &s.encoder_records {
+                enc.push_str(&format!(
+                    "{},{},{:.6},{:.6},{}\n",
+                    e.step,
+                    e.label.as_deref().unwrap_or("-"),
+                    e.start,
+                    e.end,
+                    e.dispatches
+                ));
+            }
+            files.push((format!("{path}.batch{n}.encoders.csv"), enc));
+        }
+        for (p, body) in files {
+            match std::fs::write(&p, body) {
+                Ok(()) => eprintln!("[profile: wrote {p}]"),
+                Err(e) => eprintln!("[profile: writing {p} failed: {e}]"),
+            }
+        }
+    }
+
     /// The loop, until shutdown or every sender is dropped.
     fn run(mut self) {
         loop {
@@ -976,6 +1123,8 @@ where
             match self.mode {
                 BatchMode::Continuous => {
                     if self.closed.is_empty() {
+                        #[cfg(feature = "metal")]
+                        self.open_window();
                         self.admit_waiting();
                     }
                     if !self.decoder.is_idle() {
@@ -997,6 +1146,8 @@ where
                             }
                         }
                     }
+                    #[cfg(feature = "metal")]
+                    self.close_window();
                 }
                 BatchMode::Static(_) => {
                     if self.closed.is_empty() && !self.waiting.is_empty() {
@@ -1208,6 +1359,17 @@ mod tests {
         chunk: usize,
         mode: BatchMode<Chain, ()>,
     ) -> (BatchHandle<Chain, ()>, std::thread::JoinHandle<()>) {
+        start_with(max_rows, chunk, 1, PrefillDecode::Ride, mode, None)
+    }
+
+    fn start_with(
+        max_rows: usize,
+        chunk: usize,
+        prefill_batch: usize,
+        prefill_decode: PrefillDecode,
+        mode: BatchMode<Chain, ()>,
+        on_counters: Option<CountersHook>,
+    ) -> (BatchHandle<Chain, ()>, std::thread::JoinHandle<()>) {
         let device = Device::Cpu;
         let core = Arc::new(Chain::new(&device).unwrap());
         let pool = SlotPool::new(max_rows, || Pos(0));
@@ -1223,9 +1385,11 @@ mod tests {
             max_rows,
             reuse_prefix: false,
             share_prefix: false,
+            prefill_batch,
+            prefill_decode,
             mode,
             extra: (),
-            on_counters: None,
+            on_counters,
         };
         spawn(core, |c: &Chain| c, cfg).unwrap()
     }
@@ -1321,6 +1485,61 @@ mod tests {
         );
         handle.shutdown();
         thread.join().unwrap();
+    }
+
+    /// The scheduler hands its prefill policy to the K=1 loop: four requests
+    /// queued at once at `prefill_batch` 4 are fed together (a step carries
+    /// all four rows' pieces), and under the pause arm a row streaming while
+    /// another prompt is fed is held; every stream is its chain.
+    ///
+    /// At one chunk a step and the pause arm, steps 1–2 feed row 0, 3–4 row
+    /// 1, 5–6 row 2, 7–8 row 3; a row rides the step after it joins (its
+    /// first token) and is held from the next, so steps 4–8 hold a row.
+    #[test]
+    fn queued_prompts_are_prefilled_together_and_each_decodes_its_own_chain() {
+        for (k, arm, held_steps) in [
+            (1, PrefillDecode::Ride, 0),
+            (4, PrefillDecode::Ride, 0),
+            (1, PrefillDecode::Pause, 5),
+            (4, PrefillDecode::Pause, 0),
+        ] {
+            let seen = Arc::new(parking_lot::Mutex::new(BatchCounters::default()));
+            let sink = Arc::clone(&seen);
+            let hook: CountersHook = Box::new(move |c| *sink.lock() = *c);
+            let (handle, thread) = start_with(4, 2, k, arm, BatchMode::Continuous, Some(hook));
+            let prompts: Vec<Vec<u32>> = vec![
+                vec![9, 9, 9, 1],
+                vec![9, 9, 9, 0],
+                vec![9, 9, 9, 5],
+                vec![9, 9, 9, 7],
+            ];
+            let gate = hold(&handle);
+            let rxs: Vec<Receiver<BatchEvent>> = prompts
+                .iter()
+                .map(|p| {
+                    handle.submit(BatchRequest {
+                        prompt_ids: p.clone(),
+                        params: params(12),
+                        cancel: Arc::new(AtomicBool::new(false)),
+                    })
+                })
+                .collect();
+            gate.send(()).unwrap();
+            for (p, rx) in prompts.iter().zip(&rxs) {
+                let (streamed, done) = collect(rx);
+                let (want, eos) = chain(*p.last().unwrap(), 12);
+                assert_eq!(done.tokens, want, "k {k} {arm}: prompt {p:?}");
+                assert_eq!(streamed, want, "k {k} {arm}: prompt {p:?}");
+                assert_eq!(done.eos, eos);
+            }
+            handle.shutdown();
+            thread.join().unwrap();
+            let c = *seen.lock();
+            // At a chunk of two, one row's piece a step at k = 1, all four
+            // rows' at k = 4 (they were queued before the first step).
+            assert_eq!(c.max_pieces, k, "k {k} {arm}: {c:?}");
+            assert_eq!(c.held_steps, held_steps, "k {k} {arm}: {c:?}");
+        }
     }
 
     /// A row draws through the batched driver, never through the request's

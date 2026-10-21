@@ -82,7 +82,7 @@ pub mod varlen_attention {
 
 pub use activation::{prelu, Activation, PReLU};
 pub use batch_norm::{batch_norm, BatchNorm, BatchNormConfig};
-pub use batched::{BatchDecoder, RowDriver, RowId, StepReport};
+pub use batched::{BatchDecoder, PrefillDecode, RowDriver, RowId, StepReport};
 pub use batched_spec::SpecBatchDecoder;
 pub use channel_affine::ChannelAffine;
 pub use conv::{

@@ -546,6 +546,7 @@ where
             piece_tokens: 0,
             retired,
             pending: self.pending_rows(),
+            held: 0,
         })
     }
 

@@ -40,7 +40,7 @@ use std::sync::Arc;
 use lloom::generation::Sampling;
 use lloom::nn::{
     BatchDecoder, BatchedCausalLM, CacheReset, CacheRewind, CacheShare, DecodeOptions, DecodeOut,
-    DecodeStats, ReuseAction, RowDriver, RowId, Session,
+    DecodeStats, PrefillDecode, ReuseAction, RowDriver, RowId, Session,
 };
 use lloom_tensor::{Device, Result};
 
@@ -362,6 +362,11 @@ pub struct BatchCounters {
     pub static_batches: u64,
     /// Admissions deferred for a live row's prefix still being fed (§12.3).
     pub share_waits: u64,
+    /// The most prompt pieces one step carried (`prefill_batch`, §11.8).
+    pub max_pieces: usize,
+    /// Steps that held a streaming row back while pieces were fed
+    /// (`PrefillDecode::Pause`).
+    pub held_steps: u64,
 }
 
 /// The scheduler: built and run on one thread ([`spawn`]).
@@ -401,6 +406,12 @@ pub struct BatchConfig<M: BatchedCausalLM, E> {
     pub reuse_prefix: bool,
     /// Share a request's prefix from another row's cache, by page (§12.3).
     pub share_prefix: bool,
+    /// How many pending rows' chunks one step of the K=1 loop carries
+    /// (`BatchDecoder::with_prefill_batch`); a driver from `extra` prefills
+    /// its own way and does not read it.
+    pub prefill_batch: usize,
+    /// What the K=1 loop's live rows do in a step that feeds prompt pieces.
+    pub prefill_decode: PrefillDecode,
     pub mode: BatchMode<M, E>,
     pub extra: E,
     /// Called after every step with the counters (a log line).
@@ -429,11 +440,11 @@ where
         // decoder is built with a placeholder no id matches.
         let decoder: Driver<'m, M> = match cfg.extra.make_driver(model, &cfg.opts, &cfg.device)? {
             Some(d) => d,
-            None => Box::new(BatchDecoder::new(
-                cfg.opts.clone(),
-                &[u32::MAX],
-                cfg.device.clone(),
-            )?),
+            None => Box::new(
+                BatchDecoder::new(cfg.opts.clone(), &[u32::MAX], cfg.device.clone())?
+                    .with_prefill_batch(cfg.prefill_batch)
+                    .with_prefill_decode(cfg.prefill_decode),
+            ),
         };
         Ok(Self {
             model,
@@ -801,11 +812,16 @@ where
         })?;
         self.counters.steps += 1;
         self.counters.max_live = self.counters.max_live.max(report.live);
+        self.counters.max_pieces = self.counters.max_pieces.max(report.pieces);
+        if report.held > 0 {
+            self.counters.held_steps += 1;
+        }
         if lloom::tuning::tuning().lfm2.share_trace {
             eprintln!(
-                "[share: step {}: live {} pieces {} ({} tokens) retired {} pending {}]",
+                "[share: step {}: live {} held {} pieces {} ({} tokens) retired {} pending {}]",
                 self.counters.steps,
                 report.live,
+                report.held,
                 report.pieces,
                 report.piece_tokens,
                 report.retired,
@@ -1208,6 +1224,17 @@ mod tests {
         chunk: usize,
         mode: BatchMode<Chain, ()>,
     ) -> (BatchHandle<Chain, ()>, std::thread::JoinHandle<()>) {
+        start_with(max_rows, chunk, 1, PrefillDecode::Ride, mode, None)
+    }
+
+    fn start_with(
+        max_rows: usize,
+        chunk: usize,
+        prefill_batch: usize,
+        prefill_decode: PrefillDecode,
+        mode: BatchMode<Chain, ()>,
+        on_counters: Option<CountersHook>,
+    ) -> (BatchHandle<Chain, ()>, std::thread::JoinHandle<()>) {
         let device = Device::Cpu;
         let core = Arc::new(Chain::new(&device).unwrap());
         let pool = SlotPool::new(max_rows, || Pos(0));
@@ -1223,9 +1250,11 @@ mod tests {
             max_rows,
             reuse_prefix: false,
             share_prefix: false,
+            prefill_batch,
+            prefill_decode,
             mode,
             extra: (),
-            on_counters: None,
+            on_counters,
         };
         spawn(core, |c: &Chain| c, cfg).unwrap()
     }
@@ -1321,6 +1350,61 @@ mod tests {
         );
         handle.shutdown();
         thread.join().unwrap();
+    }
+
+    /// The scheduler hands its prefill policy to the K=1 loop: four requests
+    /// queued at once at `prefill_batch` 4 are fed together (a step carries
+    /// all four rows' pieces), and under the pause arm a row streaming while
+    /// another prompt is fed is held; every stream is its chain.
+    ///
+    /// At one chunk a step and the pause arm, steps 1–2 feed row 0, 3–4 row
+    /// 1, 5–6 row 2, 7–8 row 3; a row rides the step after it joins (its
+    /// first token) and is held from the next, so steps 4–8 hold a row.
+    #[test]
+    fn queued_prompts_are_prefilled_together_and_each_decodes_its_own_chain() {
+        for (k, arm, held_steps) in [
+            (1, PrefillDecode::Ride, 0),
+            (4, PrefillDecode::Ride, 0),
+            (1, PrefillDecode::Pause, 5),
+            (4, PrefillDecode::Pause, 0),
+        ] {
+            let seen = Arc::new(parking_lot::Mutex::new(BatchCounters::default()));
+            let sink = Arc::clone(&seen);
+            let hook: CountersHook = Box::new(move |c| *sink.lock() = *c);
+            let (handle, thread) = start_with(4, 2, k, arm, BatchMode::Continuous, Some(hook));
+            let prompts: Vec<Vec<u32>> = vec![
+                vec![9, 9, 9, 1],
+                vec![9, 9, 9, 0],
+                vec![9, 9, 9, 5],
+                vec![9, 9, 9, 7],
+            ];
+            let gate = hold(&handle);
+            let rxs: Vec<Receiver<BatchEvent>> = prompts
+                .iter()
+                .map(|p| {
+                    handle.submit(BatchRequest {
+                        prompt_ids: p.clone(),
+                        params: params(12),
+                        cancel: Arc::new(AtomicBool::new(false)),
+                    })
+                })
+                .collect();
+            gate.send(()).unwrap();
+            for (p, rx) in prompts.iter().zip(&rxs) {
+                let (streamed, done) = collect(rx);
+                let (want, eos) = chain(*p.last().unwrap(), 12);
+                assert_eq!(done.tokens, want, "k {k} {arm}: prompt {p:?}");
+                assert_eq!(streamed, want, "k {k} {arm}: prompt {p:?}");
+                assert_eq!(done.eos, eos);
+            }
+            handle.shutdown();
+            thread.join().unwrap();
+            let c = *seen.lock();
+            // At a chunk of two, one row's piece a step at k = 1, all four
+            // rows' at k = 4 (they were queued before the first step).
+            assert_eq!(c.max_pieces, k, "k {k} {arm}: {c:?}");
+            assert_eq!(c.held_steps, held_steps, "k {k} {arm}: {c:?}");
+        }
     }
 
     /// A row draws through the batched driver, never through the request's

@@ -927,6 +927,9 @@ impl<P: QwenShape, R: ExpertResidency + HasStreamStats + Send + Sync + 'static> 
                 max_rows: opts.batch,
                 reuse_prefix: opts.reuse_prefix,
                 share_prefix: false,
+                // Whole prompts at arrival (no chunk budget): nothing to batch.
+                prefill_batch: 1,
+                prefill_decode: lloom::nn::PrefillDecode::Ride,
                 mode: BatchMode::Continuous,
                 extra: (),
                 on_counters: None,

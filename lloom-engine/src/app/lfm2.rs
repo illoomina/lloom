@@ -297,6 +297,11 @@ pub struct Engine<P: Profile> {
     pub dspark_k: Option<usize>,
     pub prefill_tile: usize,
     pub prefill_chunk: usize,
+    /// The pending rows' chunks one batched step carries, as resolved at
+    /// load (`scheduler.prefill_batch`, bounded by the admission's room).
+    pub prefill_batch: PrefillBatch,
+    /// What the live rows do in a step that feeds prompt pieces.
+    pub prefill_decode: lloom::nn::PrefillDecode,
     pub memory_fraction: f64,
     pub mem_sample: bool,
     /// How the rows of a batched step hold their state (`--rows`).
@@ -1029,11 +1034,12 @@ impl<P: Lfm2Shape> Engine<P> {
             // when the batched steps feed more prompt tokens than one tile per
             // step (`--prefill-chunk` above the tile fuses several rows' pieces
             // into one forward, whose working set is the chunk's).
-            budget = budget.with_prefill(if opts.prefill_tile > 0 {
-                opts.prefill_tile.max(opts.prefill_chunk)
-            } else {
-                opts.kv_capacity
-            });
+            budget = budget.with_prefill(step_prompt_tokens(
+                opts.prefill_tile,
+                opts.prefill_chunk,
+                1,
+                opts.kv_capacity,
+            ));
             if opts.batch > 1 {
                 // The scheduler's step is ONE ragged forward: the chunk's
                 // prompt tokens plus one token per live row, whatever `N` —
@@ -1183,11 +1189,6 @@ impl<P: Lfm2Shape> Engine<P> {
         // KV grows past its first bucket, admitted against the host and the
         // other lloom processes before a weight is read.
         let kv_floor = opts.memory.kv_bucket.min(opts.kv_capacity).max(1);
-        let longest = match config.memory_budget {
-            Some(b) => b.max_seq_len,
-            None if opts.prefill_tile > 0 => opts.prefill_tile.max(opts.prefill_chunk),
-            None => opts.kv_capacity,
-        };
         // A prefill of several forwards keeps the pacer's depth of them in
         // flight, each holding its activations until its command buffer
         // completes; the prefill's own bound, else decode's, else the floor.
@@ -1195,6 +1196,38 @@ impl<P: Lfm2Shape> Engine<P> {
             .into_iter()
             .find(|&d| d > 0)
             .unwrap_or(lloom::nn::decode::IN_FLIGHT_FLOOR);
+        // How many pending rows' chunks one batched step carries: the budget
+        // and the gauge above were taken at one; a wider step is charged here
+        // for its activations and kept only where this load still fits.
+        let prefill_batch = resolve_prefill_batch::<P>(
+            &opts,
+            &config,
+            dcfg.is_some(),
+            dtype,
+            machine_weights,
+            kv_floor,
+            in_flight,
+            &device,
+        );
+        if prefill_batch.k > 1 {
+            if let Some(b) = config.memory_budget.as_mut() {
+                b.max_seq_len = step_prompt_tokens(
+                    opts.prefill_tile,
+                    opts.prefill_chunk,
+                    prefill_batch.k,
+                    opts.kv_capacity,
+                ) + opts.batch;
+            }
+        }
+        let longest = match config.memory_budget {
+            Some(b) => b.max_seq_len,
+            None => step_prompt_tokens(
+                opts.prefill_tile,
+                opts.prefill_chunk,
+                prefill_batch.k,
+                opts.kv_capacity,
+            ),
+        };
         let mut peak = machine_peak::<P>(
             &config,
             dtype,
@@ -1282,6 +1315,8 @@ impl<P: Lfm2Shape> Engine<P> {
             }),
             prefill_tile: opts.prefill_tile,
             prefill_chunk: opts.prefill_chunk,
+            prefill_batch,
+            prefill_decode: opts.decode.prefill.decode,
             memory_fraction: opts.memory_fraction,
             mem_sample: opts.mem_sample,
             rows: if opts.batch > 1 {
@@ -1499,6 +1534,8 @@ impl<P: Lfm2Shape> Engine<P> {
             max_rows: opts.batch,
             reuse_prefix: opts.reuse_prefix,
             share_prefix: opts.share_prefix,
+            prefill_batch: engine.prefill_batch.k,
+            prefill_decode: engine.prefill_decode,
             mode,
             extra,
             on_counters: None,
@@ -1506,11 +1543,12 @@ impl<P: Lfm2Shape> Engine<P> {
         let (handle, thread) = spawn_batch(Arc::clone(&core), |c: &Core<P>| &c.model, cfg)
             .map_err(|e| anyhow::anyhow!("starting the batch scheduler: {e}"))?;
         eprintln!(
-            "[batch: scheduler up, {} sequences, {} rows per step, tile {} chunk {}, {}]",
+            "[batch: scheduler up, {} sequences, {} rows per step, tile {} chunk {}, prefill {}, {}]",
             opts.batch,
             opts.batch,
             opts.prefill_tile,
             opts.prefill_chunk,
+            engine.prefill_batch.describe(engine.prefill_decode),
             match (dcfg.is_some(), pooled) {
                 (true, true) => "continuous speculative batching (one drafter, batched drafts)",
                 (true, false) => "static batches through the pipelined speculative driver",
@@ -3030,6 +3068,150 @@ fn pipeline_cache_sizes(device: &Device) -> (usize, usize) {
     (0, 0)
 }
 
+/// The prompt tokens one batched step's forward carries at most: the tile,
+/// or `k` rows' chunks when that is wider; the whole KV ceiling without a
+/// tile. At `k = 1` the chunk, which is what a step fed before
+/// `scheduler.prefill_batch`.
+fn step_prompt_tokens(
+    prefill_tile: usize,
+    prefill_chunk: usize,
+    k: usize,
+    kv_capacity: usize,
+) -> usize {
+    if prefill_tile > 0 {
+        prefill_tile.max(prefill_chunk.saturating_mul(k.max(1)))
+    } else {
+        kv_capacity
+    }
+}
+
+/// `scheduler.prefill_batch` as a load resolved it: the pending rows' chunks
+/// one batched step carries (`k`), what was asked (`0` = up to the batch
+/// width), and what bounded `k` below the ask.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PrefillBatch {
+    pub k: usize,
+    pub asked: usize,
+    pub bound: Option<&'static str>,
+}
+
+impl PrefillBatch {
+    fn one() -> Self {
+        Self {
+            k: 1,
+            asked: 1,
+            bound: None,
+        }
+    }
+
+    /// `2 chunks a step (asked 4; the room admits 2), ride` for the load line.
+    pub fn describe(&self, decode: lloom::nn::PrefillDecode) -> String {
+        let asked = match self.asked {
+            0 => "up to the batch".to_string(),
+            n => n.to_string(),
+        };
+        match self.bound {
+            None if self.asked == self.k => format!("{} chunk(s) a step, {decode}", self.k),
+            None => format!("{} chunk(s) a step (asked {asked}), {decode}", self.k),
+            Some(why) => format!(
+                "{} chunk(s) a step (asked {asked}; {why}), {decode}",
+                self.k
+            ),
+        }
+    }
+}
+
+/// How many pending rows' chunks one batched step carries
+/// (`scheduler.prefill_batch`, `batched-decode-design.md` §11.8): the ask
+/// (`0` = the batch width), at most the batch width, and at most what this
+/// load's admission still admits — the most `k` whose step (`k` chunks plus
+/// one token per live row) fits both the process budget at this load's
+/// weights and the machine's room for the peak, `in_flight` such steps'
+/// activations at once. 1 where the K=1 batched loop does not run: at one
+/// sequence, without a chunk budget, under `--dspark` (its driver prefills
+/// each row alone).
+#[allow(clippy::too_many_arguments, unused_variables)]
+fn resolve_prefill_batch<P: Lfm2Shape>(
+    opts: &LoadOptions,
+    config: &Config,
+    dspark: bool,
+    dtype: DType,
+    machine_weights: usize,
+    kv_floor: usize,
+    in_flight: usize,
+    device: &Device,
+) -> PrefillBatch {
+    let asked = opts.decode.prefill.batch;
+    if opts.batch <= 1 || opts.prefill_chunk == 0 {
+        return PrefillBatch::one();
+    }
+    if dspark {
+        return PrefillBatch {
+            k: 1,
+            asked,
+            bound: (asked != 1).then_some("the speculative driver prefills each row alone"),
+        };
+    }
+    let cap = if asked == 0 {
+        opts.batch
+    } else {
+        asked.min(opts.batch)
+    };
+    let mut bound = (asked > opts.batch).then_some("at most the batch width");
+    #[cfg(feature = "metal")]
+    if let Device::Metal(m) = device {
+        let gate = lloom::nn::memory::MachineLoad {
+            gate: opts.memory.machine_gate(),
+            label: String::new(),
+            rows: opts.batch,
+            kv_tokens: kv_floor,
+            prefill_tile: opts.prefill_tile,
+        }
+        .gate_for(device);
+        let room = gate.room();
+        let pools = lloom::nn::memory::pool_bound_bytes(device) as i128;
+        let ws = m.device().recommended_max_working_set_size();
+        let rope = State::<P>::rope_table_bytes(config);
+        let fits = |k: usize| -> bool {
+            let longest =
+                step_prompt_tokens(opts.prefill_tile, opts.prefill_chunk, k, opts.kv_capacity)
+                    + opts.batch;
+            let budget_ok = config.memory_budget.is_none_or(|mut b| {
+                b.max_seq_len = longest;
+                let a = State::<P>::admission_budget(config, &b, opts.kv_capacity).admit(ws);
+                a.fits && a.residual >= rope
+            });
+            let machine_ok = room.is_none_or(|room| {
+                let peak = machine_peak::<P>(
+                    config,
+                    dtype,
+                    machine_weights,
+                    opts.batch,
+                    kv_floor,
+                    longest,
+                    in_flight,
+                    config.memory_budget.and_then(|b| b.activation_rows),
+                );
+                peak.total() as i128 + pools <= room
+            });
+            budget_ok && machine_ok
+        };
+        let mut k = cap;
+        while k > 1 && !fits(k) {
+            k -= 1;
+        }
+        if k < cap {
+            bound = Some("the room admits no wider step");
+        }
+        return PrefillBatch { k, asked, bound };
+    }
+    PrefillBatch {
+        k: cap,
+        asked,
+        bound,
+    }
+}
+
 /// What an LFM2 load holds at its peak before its KV grows past
 /// `kv_floor` positions (`memory.md` §9.10): the weights it will hold, each
 /// row's state floor (`lfm2::state_floor_bytes`), and — on Metal — the
@@ -3171,6 +3353,8 @@ impl<P: Lfm2Shape> super::served::Served for Engine<P> {
             "batch": self.batch,
             "prefill_tile": self.prefill_tile,
             "prefill_chunk": self.prefill_chunk,
+            "prefill_batch": self.prefill_batch.k,
+            "prefill_decode": self.prefill_decode.name(),
             "memory_fraction": self.memory_fraction,
             "kv_capacity": self.kv_capacity,
             "rows": self.rows.name(),
@@ -3194,13 +3378,15 @@ impl<P: Lfm2Shape> super::served::Served for Engine<P> {
     }
     fn describe(&self) -> String {
         format!(
-            "family=lfm2 batch={} dspark={} prefill_tile={} prefill_chunk={} memory_fraction={} mem_sample={} rows={} cache={} {} {}",
+            "family=lfm2 batch={} dspark={} prefill_tile={} prefill_chunk={} prefill_batch={} prefill_decode={} memory_fraction={} mem_sample={} rows={} cache={} {} {}",
             self.batch,
             self.dspark_k
                 .map(|k| format!("k={k}"))
                 .unwrap_or_else(|| "off".to_string()),
             self.prefill_tile,
             self.prefill_chunk,
+            self.prefill_batch.k,
+            self.prefill_decode,
             self.memory_fraction,
             self.mem_sample,
             self.rows.name(),

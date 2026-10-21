@@ -878,3 +878,199 @@ fn filtered_gumbel_runs_the_existing_per_row_host_batch() -> Result<()> {
     assert_eq!(*sessions[0].sequence().cache(), 0);
     Ok(())
 }
+
+// ---- prefilling the pending prompts together (`batched-decode-design.md` §11.8)
+
+use lloom::nn::{PrefillDecode, StepReport};
+
+/// One step, streaming into `streams` keyed by slot.
+fn step_streaming<'m>(
+    dec: &mut BatchDecoder<'m, Chain, Session<'m, Chain>>,
+    streams: &mut [Vec<u32>],
+) -> Result<StepReport> {
+    dec.step(&mut |row, ids| {
+        streams[row.slot()].extend_from_slice(ids);
+        Ok(())
+    })
+}
+
+/// Step until no row is pending, recording each step's report.
+fn steps_until_joined<'m>(
+    dec: &mut BatchDecoder<'m, Chain, Session<'m, Chain>>,
+    streams: &mut [Vec<u32>],
+) -> Result<Vec<StepReport>> {
+    let mut reports = Vec::new();
+    while dec.pending_rows() > 0 {
+        reports.push(step_streaming(dec, streams)?);
+    }
+    Ok(reports)
+}
+
+/// `with_prefill_batch(k)`: a step's prompt budget is `k` chunks over the
+/// pending rows in slot order, each row's piece at most one chunk, so the
+/// pending prompts are fed together — four six-token prompts at a chunk of
+/// two are in after 3 steps at k = 4 against 12 at k = 1 — and every row's
+/// stream is its solo chain at every k. The budget is tokens, not rows: a
+/// row that needs less than a chunk leaves the rest to the next row.
+#[test]
+fn a_step_carries_up_to_prefill_batch_rows_chunks() -> Result<()> {
+    let prompts: Vec<Vec<u32>> = vec![
+        vec![9, 9, 9, 9, 9, 1],
+        vec![9, 9, 9, 9, 9, 0],
+        vec![9, 9, 9, 9, 9, 5],
+        vec![9, 9, 9, 9, 9, 7],
+    ];
+    let max = 10;
+    // (k, the (pieces, tokens) of every step until no row is pending),
+    // hand-derived: a group of up to k rows takes a two-token piece each
+    // per step, three steps a group.
+    let schedules: [(usize, Vec<(usize, usize)>); 5] = [
+        (1, vec![(1, 2); 12]),
+        (2, vec![(2, 4); 6]),
+        (3, [vec![(3, 6); 3], vec![(1, 2); 3]].concat()),
+        (4, vec![(4, 8); 3]),
+        (8, vec![(4, 8); 3]),
+    ];
+    for device in devices() {
+        let model = Chain::new(&device)?;
+        for lookahead in [0usize, 1] {
+            for (k, want_steps) in &schedules {
+                let tag = format!("{device:?} lookahead {lookahead} prefill_batch {k}");
+                let opts = DecodeOptions {
+                    lookahead,
+                    prefill_chunk: 2,
+                    ..DecodeOptions::new(max)
+                };
+                let mut dec: BatchDecoder<'_, Chain, Session<'_, Chain>> =
+                    BatchDecoder::new(opts, &[EOS], device.clone())?.with_prefill_batch(*k);
+                assert_eq!(dec.prefill_batch(), *k, "{tag}");
+                let ids: Vec<RowId> = prompts
+                    .iter()
+                    .map(|p| {
+                        dec.admit(Session::new(&model, 0usize), p.clone(), Sampling::ArgMax, 0)
+                    })
+                    .collect::<Result<_>>()?;
+                let mut streams: Vec<Vec<u32>> = vec![Vec::new(); 8];
+                let reports = steps_until_joined(&mut dec, &mut streams)?;
+                let got: Vec<(usize, usize)> =
+                    reports.iter().map(|r| (r.pieces, r.piece_tokens)).collect();
+                assert_eq!(&got, want_steps, "{tag}: the steps' pieces and tokens");
+                let finished = drain(&mut dec, &mut streams)?;
+                assert_eq!(finished.len(), prompts.len(), "{tag}: every row retires");
+                for (id, _, out) in &finished {
+                    let r = ids.iter().position(|x| x == id).expect("an admitted row");
+                    let (want, want_eos) = chain(*prompts[r].last().unwrap(), max);
+                    assert_eq!(out.ids, want, "{tag}: row {r} ids");
+                    assert_eq!(out.eos, want_eos, "{tag}: row {r} eos");
+                    assert_eq!(streams[id.slot()], want, "{tag}: row {r} streamed");
+                    assert_eq!(out.stats.prefill_units, 3, "{tag}: row {r} pieces");
+                }
+            }
+        }
+        // The budget is tokens: at k = 2 (four tokens a step) a one-token
+        // prompt leaves three, so a third row is fed in the same step.
+        let opts = DecodeOptions {
+            prefill_chunk: 2,
+            ..DecodeOptions::new(4)
+        };
+        let mut dec: BatchDecoder<'_, Chain, Session<'_, Chain>> =
+            BatchDecoder::new(opts, &[EOS], device.clone())?.with_prefill_batch(2);
+        for p in [vec![9u32, 9, 1], vec![0u32], vec![9u32, 5]] {
+            dec.admit(Session::new(&model, 0usize), p, Sampling::ArgMax, 0)?;
+        }
+        let mut streams: Vec<Vec<u32>> = vec![Vec::new(); 8];
+        let first = step_streaming(&mut dec, &mut streams)?;
+        assert_eq!(
+            (first.pieces, first.piece_tokens),
+            (3, 4),
+            "{device:?}: 2 + 1 + 1 tokens in the first step"
+        );
+    }
+    Ok(())
+}
+
+/// Under `PrefillDecode::Pause` a row that has streamed waits while pending
+/// prompts' pieces are fed — held, neither sampled nor fed, its logits kept
+/// — and a row still owing its first token takes it beside the pieces;
+/// every row ends on its solo chain. Under `Ride` the streaming row takes a
+/// token every step. Steps 3–7 are hand-derived: `b`'s one piece, then
+/// `c`'s three, at a chunk of two and one chunk a step.
+#[test]
+fn the_pause_arm_holds_streaming_rows_while_pieces_are_fed() -> Result<()> {
+    let max = 12;
+    for device in devices() {
+        let model = Chain::new(&device)?;
+        for lookahead in [0usize, 1] {
+            for arm in [PrefillDecode::Ride, PrefillDecode::Pause] {
+                let tag = format!("{device:?} lookahead {lookahead} {arm}");
+                let opts = DecodeOptions {
+                    lookahead,
+                    prefill_chunk: 2,
+                    ..DecodeOptions::new(max)
+                };
+                let mut dec: BatchDecoder<'_, Chain, Session<'_, Chain>> =
+                    BatchDecoder::new(opts, &[EOS], device.clone())?.with_prefill_decode(arm);
+                let mut streams: Vec<Vec<u32>> = vec![Vec::new(); 8];
+                let a = dec.admit(Session::new(&model, 0usize), vec![0], Sampling::ArgMax, 0)?;
+                // Step 0 feeds a's prompt; steps 1 and 2 stream its first two.
+                for _ in 0..3 {
+                    step_streaming(&mut dec, &mut streams)?;
+                }
+                assert_eq!(streams[a.slot()].len(), 2, "{tag}: a before the arrivals");
+                let b = dec.admit(
+                    Session::new(&model, 0usize),
+                    vec![3, 1],
+                    Sampling::ArgMax,
+                    0,
+                )?;
+                let c = dec.admit(
+                    Session::new(&model, 0usize),
+                    vec![9, 9, 9, 9, 9, 5],
+                    Sampling::ArgMax,
+                    0,
+                )?;
+                let mut reports = Vec::new();
+                let mut a_len = Vec::new();
+                let mut b_len = Vec::new();
+                for _ in 3..8 {
+                    reports.push(step_streaming(&mut dec, &mut streams)?);
+                    a_len.push(streams[a.slot()].len());
+                    b_len.push(streams[b.slot()].len());
+                }
+                let got: Vec<(usize, usize, usize)> =
+                    reports.iter().map(|r| (r.live, r.held, r.pieces)).collect();
+                match arm {
+                    PrefillDecode::Pause => {
+                        assert_eq!(
+                            got,
+                            vec![(0, 1, 1), (1, 1, 1), (0, 2, 1), (0, 2, 1), (3, 0, 0)],
+                            "{tag}: (live, held, pieces) at steps 3-7"
+                        );
+                        assert_eq!(a_len, vec![2, 2, 2, 2, 3], "{tag}: a waits for the pieces");
+                        assert_eq!(
+                            b_len,
+                            vec![0, 1, 1, 1, 2],
+                            "{tag}: b's first token is not held"
+                        );
+                    }
+                    PrefillDecode::Ride => {
+                        assert_eq!(
+                            got,
+                            vec![(1, 0, 1), (2, 0, 1), (2, 0, 1), (2, 0, 1), (3, 0, 0)],
+                            "{tag}: (live, held, pieces) at steps 3-7"
+                        );
+                        assert_eq!(a_len, vec![3, 4, 5, 6, 7], "{tag}: a rides every step");
+                        assert_eq!(b_len, vec![0, 1, 2, 3, 4], "{tag}: b rides from its join");
+                    }
+                }
+                let finished = drain(&mut dec, &mut streams)?;
+                assert_eq!(finished.len(), 3, "{tag}: every row retires");
+                for (id, start) in [(a, 0u32), (b, 1), (c, 5)] {
+                    let (want, _) = chain(start, max);
+                    assert_eq!(streams[id.slot()], want, "{tag}: row {} stream", id.slot());
+                }
+            }
+        }
+    }
+    Ok(())
+}

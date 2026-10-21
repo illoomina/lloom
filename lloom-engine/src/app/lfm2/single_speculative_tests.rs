@@ -64,6 +64,8 @@ fn engine_fixture() -> Result<(Fixture<Lfm2Tiny>, TinyEngine)> {
             dspark_k: Some(2),
             prefill_tile: 16,
             prefill_chunk: 0,
+            prefill_batch: PrefillBatch::one(),
+            prefill_decode: lloom::nn::PrefillDecode::Ride,
             memory_fraction: 0.0,
             mem_sample: false,
             rows: RowsArm::Private,

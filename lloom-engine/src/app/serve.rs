@@ -1246,9 +1246,6 @@ fn chat_completions(shared: &Shared, v: &Value, auth: Option<[u8; 32]>) -> Handl
             (ids, facts, Some(prompt))
         }
     };
-    if let (Some(r), Some(_)) = (&resolved, ask.reset) {
-        shared.sessions.lock().reset(r.key);
-    }
     params.cold |= ask.reset == Some(Reset::All);
     let random_id = format!("chatcmpl-{}", short_id());
 
@@ -1438,7 +1435,11 @@ fn chat_completions(shared: &Shared, v: &Value, auth: Option<[u8; 32]>) -> Handl
                     .take_while(|(a, b)| a == b)
                     .count()
             });
-            let reservation = shared.sessions.lock().reserve(
+            let mut sessions = shared.sessions.lock();
+            if let (Some(r), Some(_)) = (&resolved, ask.reset) {
+                sessions.reset(r.key);
+            }
+            let reservation = sessions.reserve(
                 super::sessions::Plan {
                     continued: resolved.as_ref().map(|r| (r.key, r.turn)),
                     store: ask.store,
@@ -1448,12 +1449,12 @@ fn chat_completions(shared: &Shared, v: &Value, auth: Option<[u8; 32]>) -> Handl
                 },
                 at,
             );
+            drop(sessions);
             Box::new(SessionCtx {
                 reservation,
                 continued: resolved.as_ref().map(|r| Continued {
                     resident: r.resident,
                     carried: carried.unwrap_or(0),
-                    switches: r.switches,
                 }),
                 miss,
                 asked: ask.previous.is_some(),
@@ -1735,7 +1736,6 @@ struct Continued {
     resident: Option<bool>,
     /// Of the session's ids, those the request's prompt starts with.
     carried: usize,
-    switches: u64,
 }
 
 /// What a chat request's session report, and its turn's record, need after
@@ -1813,6 +1813,13 @@ fn finish_session(
             None => "evicted",
         },
     };
+    let switches = match ctx.continued {
+        Some(_) => shared
+            .sessions
+            .lock()
+            .note_continued(id.key, state == "resident"),
+        None => 0,
+    };
     let prefix = if ctx.head <= 1 {
         "-"
     } else if reused >= ctx.head {
@@ -1836,7 +1843,7 @@ fn finish_session(
         "state": state,
         "stored": ctx.reservation.stored,
         "turn": id.turn,
-        "switches": ctx.continued.as_ref().map_or(0, |c| c.switches),
+        "switches": switches,
         "reprefilled_tokens": reprefilled,
         "prefix": prefix,
         "history": history,

@@ -129,8 +129,8 @@ pub struct Resolved {
     pub messages: Option<Vec<Value>>,
     /// The session's ids through the continued turn.
     pub ids: Vec<u32>,
-    /// Times the session found the engine serving another since it was
-    /// created.
+    /// Times the session found the engine serving another, before this
+    /// request.
     pub switches: u64,
 }
 
@@ -371,19 +371,7 @@ impl Table {
             }
         };
         let resident = self.cfg.one_sequence.then(|| self.occupant == Some(key));
-        self.counters.continued += 1;
-        match resident {
-            Some(true) => self.counters.resident += 1,
-            Some(false) => {
-                self.counters.evicted += 1;
-                self.counters.switches += 1;
-            }
-            None => {}
-        }
         let s = self.get_mut(key).expect("found above");
-        if resident == Some(false) {
-            s.switches += 1;
-        }
         s.last_used = now;
         let turn = &s.turns[t];
         let bound = s.turns[..=t]
@@ -410,6 +398,26 @@ impl Table {
             ids: s.ids[..turn.ids_end.min(s.ids.len())].to_vec(),
             switches: s.switches,
         })
+    }
+
+    /// A continuation of the session at `key` ran: count it, and the switch
+    /// where the engine had served another session since its last turn.
+    /// Returns the session's switches so far.
+    pub fn note_continued(&mut self, key: Key, resident: bool) -> u64 {
+        self.counters.continued += 1;
+        if resident {
+            self.counters.resident += 1;
+        } else {
+            self.counters.evicted += 1;
+            self.counters.switches += 1;
+        }
+        match self.get_mut(key) {
+            Some(s) => {
+                s.switches += u64::from(!resident);
+                s.switches
+            }
+            None => 0,
+        }
     }
 
     /// Forget a session's turns (`reset`): the next turn starts its lineage

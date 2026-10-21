@@ -123,14 +123,20 @@ fn a_stored_session_is_resident_until_the_engine_serves_another() {
     assert_eq!(r.ids, vec![1, 2, 3, 4, 5], "the prompt, then the reply");
     assert_eq!(r.bound.len(), 1);
     assert_eq!(r.switches, 0);
+    assert_eq!(t.json()["switches"], 0, "a lookup counts nothing by itself");
     // Another route ran on the engine's one sequence.
     t.note_other();
     let r = t
         .resolve(&id.encode(), None, false, now)
         .expect("still held");
     assert_eq!(r.resident, Some(false), "evicted, not expired");
-    assert_eq!(r.switches, 1, "one switch counted");
+    assert_eq!(
+        t.note_continued(r.key, false),
+        1,
+        "one switch, once the turn ran"
+    );
     assert_eq!(t.json()["switches"], 1);
+    assert_eq!(t.json()["evicted"], 1);
 }
 
 #[test]

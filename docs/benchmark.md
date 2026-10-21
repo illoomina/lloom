@@ -4,6 +4,24 @@ What has been measured, how, and what it does not show. Numbers here are
 reproducible measurements with their exact source and configuration; they are
 not throughput promises for other models, hardware, backends or file formats.
 
+**Correction pending (2026-10-21, evening).** Two findings since the tables
+below were published, both being re-measured: (1) the per-request tag does
+*not* defeat llama.cpp's prompt cache for these prompts — the three prompt
+lengths are nested (the 2372-token prompt contains the 872-token one), and
+llama.cpp's chunked cache reuse matched the shared text, so its TTFT rows are
+too low; measured with its cache disabled, llama.cpp prefills the 2372-token
+prompt in ~1.48 s (its own prompt-eval time 1.47 s), not 0.96 s, and MLX in
+~1.75 s, against lloom's 1.68 s. (2) The "narrow-projection GEMM deficit" named
+under *Known gaps* was an artifact of the isolated benchmark (a new command
+queue per timed batch); in a bare harness lloom's GEMM kernel runs at
+llama.cpp's `mul_mm` rate on every prefill shape. The remaining single-stream
+prefill difference (~190 ms at 2372 tokens) is ~110 ms between the in-process
+first token and the first streamed chunk on the serve path, plus ~85 ms of
+non-GEMM forward time. The matrix is being re-run with every engine's prompt
+cache disabled and a per-cell nonce; this page will be rewritten from that
+run. Until then read the TTFT rows below as upper bounds for lloom and MLX and
+as understated for llama.cpp.
+
 **Status (2026-10-21, pre-release).** The cross-engine tables below are the
 re-run of 2026-10-21 on the release's defaults (`dev` `3f6375fe2`), replacing
 the 2026-10-19 matrix. Everything the pre-release landed is in them: the

@@ -18,6 +18,8 @@ use crate::kernels::{
     call_unary_contiguous, set_constants_pool_enabled, set_default_param_style,
     set_pipelines_support_icb, unary, BufferOffset, Device, Kernels, ParamStyle,
 };
+use objc2::{rc::Retained, runtime::ProtocolObject};
+use objc2_metal::MTLSharedEvent;
 use std::sync::Arc;
 
 fn device() -> Device {
@@ -1241,7 +1243,7 @@ fn run_mlp_steps(
     let (k, n_out, reps, steps) = (2048usize, 10752usize, 30usize, MLP_STEPS);
     let device = device();
     let kernels = Kernels::new();
-    let cmds = commands(&device);
+    let cmds = Arc::new(commands(&device));
     if let Some(e) = executor {
         cmds.set_executor(Arc::new(ExecutorSlot::Custom(e.clone())));
     }
@@ -1327,26 +1329,9 @@ fn run_mlp_steps(
             }
             .unwrap();
         };
-    // Make the cap arm deterministic rather than relying on GPU/host speed.
-    // The host releases this event as soon as the executor falls back. Drop
-    // also releases it during unwinding, before Commands drains its queue.
-    struct HoldGpu(
-        objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLSharedEvent>>,
-    );
-    impl Drop for HoldGpu {
-        fn drop(&mut self) {
-            use objc2_metal::MTLSharedEvent as _;
-            self.0.setSignaledValue(1);
-        }
-    }
-    let mut held = if executor.is_some() && matches!(pacing, Pacing::Unbounded) {
-        use objc2_metal::MTLDevice as _;
-        let event = device.as_ref().newSharedEvent().expect("shared event");
-        cmds.encode_wait_for_event(&event, 1).unwrap();
-        Some(HoldGpu(event))
-    } else {
-        None
-    };
+    let mut hold = (executor.is_some() && matches!(pacing, Pacing::Unbounded))
+        .then(|| RunAheadHold::begin(&device, &cmds));
+    let mut ran_early = None;
     for step in 0..steps {
         let residual = match consumer {
             Consumer::PackedMoving => &residuals[step % 2],
@@ -1421,17 +1406,150 @@ fn run_mlp_steps(
         if let Some(e) = executor {
             e.end_step(&device, &cmds).unwrap();
             if e.skipped_steps() > 0 {
-                drop(held.take());
+                if let Some(mut h) = hold.take() {
+                    ran_early = h.past_the_queue_timeout();
+                    h.release();
+                }
             }
         }
     }
-    drop(held);
+    if let Some(mut h) = hold.take() {
+        h.release();
+    }
+    assert_eq!(
+        ran_early, None,
+        "the held run-ahead ran before its release: a generation the cap counted as in \
+         flight completed"
+    );
     cmds.flush_and_wait().unwrap();
     // SAFETY: completed, shared storage; `steps * k` f16 values.
     unsafe { std::slice::from_raw_parts(results.contents() as *const f16, steps * k) }
         .iter()
         .map(|v| v.to_f32())
         .collect()
+}
+
+/// Generations the unbounded arm's executor holds. The held run-ahead keeps
+/// back `cap + 2` recordings (two recorded steps, one step per generation
+/// built, the step that falls back) and records the next one: seven of a
+/// Metal 4 queue's eight native buffers at a cap of 4, and well under the
+/// sixteen recordings the held queue keeps back. At the production cap the
+/// run-ahead parks for a buffer before the cap is reached, on either API.
+const RUN_AHEAD_CAP: usize = 4;
+
+/// How long the hold lasts once the cap is reached: past a queue wait's
+/// timeout, so the eager form of this hold (a GPU wait on the test's signal,
+/// committed at once) shows here as work run early or a failed buffer.
+const HOLD_PAST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(6);
+
+/// How long the hold may last before a watchdog releases it: a run-ahead
+/// that parks short of the cap fails the test instead of hanging it.
+const HOLD_WATCHDOG: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// An event the test raises and a watchdog thread may raise.
+struct SharedEvent(Retained<ProtocolObject<dyn MTLSharedEvent>>);
+// SAFETY: an `MTLSharedEvent` is usable from any thread; that is its purpose.
+unsafe impl Send for SharedEvent {}
+// SAFETY: as above.
+unsafe impl Sync for SharedEvent {}
+
+/// Raise `event` and commit what was held behind it. A refusal is a failed
+/// queue, which the run's next wait reports.
+fn produce(event: &ProtocolObject<dyn MTLSharedEvent>, commands: &Commands) {
+    event.setSignaledValue(1);
+    let _ = commands.produced(event, 1);
+}
+
+/// The unbounded arm's hold: the run-ahead is committed only once the test
+/// produces an input, after the executor has fallen back (`docs/invariants.md`
+/// §15.1q). Every generation stays in flight however long the host takes to
+/// reach the cap, rather than until a queue wait times out.
+struct RunAheadHold {
+    event: Arc<SharedEvent>,
+    commands: Arc<Commands>,
+    /// The epoch of the first held recording.
+    first: crate::retire::Epoch,
+    release: Option<std::sync::mpsc::Sender<()>>,
+    watchdog: Option<std::thread::JoinHandle<bool>>,
+}
+
+impl RunAheadHold {
+    /// Gate the current recording on a fresh event, one recording a step.
+    fn begin(device: &Device, commands: &Arc<Commands>) -> Self {
+        use objc2_metal::MTLDevice as _;
+        commands.set_compute_per_buffer(usize::MAX);
+        let event = Arc::new(SharedEvent(
+            device.as_ref().newSharedEvent().expect("shared event"),
+        ));
+        commands.commit_when_produced(&event.0, 1).unwrap();
+        let first = commands.clock().current_epoch();
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let watchdog = {
+            let event = Arc::clone(&event);
+            let commands = Arc::clone(commands);
+            std::thread::spawn(move || {
+                let fired = matches!(
+                    released.recv_timeout(HOLD_WATCHDOG),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                );
+                produce(&event.0, &commands);
+                fired
+            })
+        };
+        Self {
+            event,
+            commands: Arc::clone(commands),
+            first,
+            release: Some(release),
+            watchdog: Some(watchdog),
+        }
+    }
+
+    /// Keep holding for [`HOLD_PAST_TIMEOUT`]; when the first held recording
+    /// completed meanwhile, how far into the hold.
+    fn past_the_queue_timeout(&self) -> Option<std::time::Duration> {
+        let clock = self.commands.clock();
+        let started = std::time::Instant::now();
+        let ran = loop {
+            if clock.is_complete(self.first) {
+                break Some(started.elapsed());
+            }
+            if started.elapsed() >= HOLD_PAST_TIMEOUT {
+                break None;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        };
+        eprintln!(
+            "RUN_AHEAD_HOLD api={} host_input={} cap={RUN_AHEAD_CAP} held_ms={} ran_early_ms={:?} \
+             stats={:?}",
+            self.commands.actual_command_api(),
+            self.commands.host_input_arm().as_str(),
+            started.elapsed().as_millis(),
+            ran.map(|d| d.as_millis()),
+            self.commands.produced_stats(),
+        );
+        ran
+    }
+
+    /// Produce the input; fail when the watchdog had to.
+    fn release(&mut self) {
+        produce(&self.event.0, &self.commands);
+        drop(self.release.take());
+        let fired = self.watchdog.take().is_some_and(|w| w.join().unwrap());
+        assert!(
+            !fired,
+            "the run-ahead parked short of the generation cap for {HOLD_WATCHDOG:?}: it keeps \
+             back more recordings than the queue can"
+        );
+    }
+}
+
+impl Drop for RunAheadHold {
+    /// Unwinding: release the held work before the queue is drained.
+    fn drop(&mut self) {
+        produce(&self.event.0, &self.commands);
+        drop(self.release.take());
+    }
 }
 
 /// When the host waits for the GPU between steps.
@@ -1444,8 +1562,9 @@ enum Pacing {
     /// flight: the executor encodes new generations while earlier ones run and
     /// reuses them once they complete.
     Bounded(usize),
-    /// No host wait; a test event holds GPU progress until the generation cap
-    /// is reached, then releases it so all classical and replayed work finishes.
+    /// No host wait; the run-ahead is held back until the generation cap is
+    /// reached ([`RunAheadHold`]), then released so all classical and
+    /// replayed work finishes.
     Unbounded,
 }
 
@@ -1491,6 +1610,9 @@ fn assert_mlp_replays_like_classical(consumer: Consumer, pacing: Pacing, what: &
     set_default_param_style(ParamStyle::Packed);
     set_constants_pool_enabled(true);
     let executor = IcbExecutor::new(2);
+    if let Pacing::Unbounded = pacing {
+        executor.set_generation_cap(RUN_AHEAD_CAP);
+    }
     let replayed = run_mlp_steps(Some(&executor), consumer, pacing);
     set_default_param_style(ParamStyle::Split);
     set_constants_pool_enabled(false);
@@ -1599,7 +1721,9 @@ fn a_command_replayed_every_step_matches_classical_on_every_step() {
 
 /// No host wait at all: the generations reach their cap while every one is
 /// still in flight, and the steps after run classically rather than execute a
-/// command a second time without its pipeline set again.
+/// command a second time without its pipeline set again. Run on each API
+/// (`LLOOM_METAL_API=metal3|metal4`); the GPU-wait arm
+/// (`LLOOM_HOST_INPUT=gpu-wait`) is the eager hold it must fail on.
 #[test]
 fn a_run_ahead_past_the_generation_cap_falls_back_to_classical() {
     require_icb_support!("a_run_ahead_past_the_generation_cap_falls_back_to_classical");

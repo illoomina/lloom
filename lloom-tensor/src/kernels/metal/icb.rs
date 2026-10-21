@@ -423,6 +423,8 @@ struct Inner {
     generations_built: usize,
     pipeline_refreshes: usize,
     skipped_steps: usize,
+    /// Generations a plan may hold: [`GENERATION_CAP`] outside tests.
+    generation_cap: usize,
 }
 
 /// Stale positions, attributed rather than counted.
@@ -719,6 +721,7 @@ impl IcbExecutor {
                 generations_built: 0,
                 pipeline_refreshes: 0,
                 skipped_steps: 0,
+                generation_cap: GENERATION_CAP,
             }),
         })
     }
@@ -750,6 +753,15 @@ impl IcbExecutor {
     /// runs no such allocator passes 0.
     pub fn set_rerecord_warm_in(&self, windows: usize) {
         self.inner.lock().rerecord_warm_in = windows;
+    }
+
+    /// Hold at most `cap` generations instead of [`GENERATION_CAP`], so a
+    /// test reaches the cap within the command buffers a held run-ahead can
+    /// keep back. Only meaningful before the plan is built.
+    #[cfg(test)]
+    pub(crate) fn set_generation_cap(&self, cap: usize) {
+        assert!(cap >= 1, "a plan holds at least its first generation");
+        self.inner.lock().generation_cap = cap;
     }
 
     /// Windows the warm-in dropped.
@@ -864,6 +876,7 @@ impl IcbExecutor {
     fn choose_generation(inner: &mut Inner, clock: &crate::kernels::metal::GpuClock) -> Rotation {
         let executed = std::mem::take(&mut inner.executed_this_step);
         inner.skip_step = false;
+        let cap = inner.generation_cap;
         let Some(plan) = inner.plan.as_mut() else {
             return Rotation::Keep;
         };
@@ -889,7 +902,7 @@ impl IcbExecutor {
                 layout: Arc::clone(&plan.layout),
             };
         }
-        if plan.generations.len() < GENERATION_CAP {
+        if plan.generations.len() < cap {
             return Rotation::Build(Arc::clone(&plan.layout));
         }
         inner.skip_step = true;

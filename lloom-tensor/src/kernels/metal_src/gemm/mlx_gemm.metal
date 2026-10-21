@@ -188,22 +188,6 @@ struct BlockLoader {
     }
   }
 
-  /* Device read into registers, without bound checking: one tile ahead */
-  METAL_FUNC void read_unsafe(thread ReadVector* regs) const {
-    STEEL_PRAGMA_UNROLL
-    for (short i = 0, r = 0; i < BROWS; i += TROWS, r++) {
-      regs[r] = *((const device ReadVector*)(&src[i * src_ld]));
-    }
-  }
-
-  /* Registers read by read_unsafe into threadgroup memory */
-  METAL_FUNC void write_regs(thread const ReadVector* regs) const {
-    STEEL_PRAGMA_UNROLL
-    for (short i = 0, r = 0; i < BROWS; i += TROWS, r++) {
-      *((threadgroup ReadVector*)(&dst[i * dst_ld])) = regs[r];
-    }
-  }
-
   /* Iteration helper */
   METAL_FUNC void next() {
     src += tile_stride;
@@ -271,25 +255,6 @@ struct BlockSwizzle {
   }
 };
 
-// An 8x8 operand fragment from threadgroup memory in one simdgroup_load, where
-// the fragment type is the tile's; a fragment of another type is never loaded
-// this way (BlockMMA only selects it when FragType == T).
-template <typename T>
-METAL_FUNC void frag_load(
-    thread simdgroup_matrix<T, 8, 8>& m,
-    const threadgroup T* p,
-    ulong ld,
-    bool transpose) {
-  simdgroup_load(m, p, ld, ulong2(0, 0), transpose);
-}
-
-template <typename U, typename T>
-METAL_FUNC void frag_load(
-    thread simdgroup_matrix<U, 8, 8>&,
-    const threadgroup T*,
-    ulong,
-    bool) {}
-
 // https://github.com/ml-explore/mlx/blob/02efb310cac667bc547d1b96f21596c221f84fe7/mlx/backend/metal/kernels/steel/gemm/mma.h#L1
 ///////////////////////////////////////////////////////////////////////////////
 // MMA helper
@@ -308,9 +273,7 @@ template <
     short lda_tgp,
     short ldb_tgp,
     typename AccumType = float,
-    typename Epilogue = TransformNone<U, AccumType>,
-    typename FragType = AccumType,
-    bool SimdLoad = false>
+    typename Epilogue = TransformNone<U, AccumType>>
 struct BlockMMA {
   // Warp tile simdgroup matrix strides along M
   STEEL_CONST short TM_stride = 8 * WM;
@@ -335,9 +298,9 @@ struct BlockMMA {
   STEEL_CONST short tile_stride_a = {transpose_a ? 8 * lda_tgp : 8};
   STEEL_CONST short tile_stride_b = {transpose_b ? 8 : 8 * ldb_tgp};
 
-  // Simdgroup matrices: operands in FragType, results in AccumType
-  simdgroup_matrix<FragType, 8, 8> Asimd[TM];
-  simdgroup_matrix<FragType, 8, 8> Bsimd[TN];
+  // Simdgroup matrices
+  simdgroup_matrix<AccumType, 8, 8> Asimd[TM];
+  simdgroup_matrix<AccumType, 8, 8> Bsimd[TN];
   simdgroup_matrix<AccumType, 8, 8> results[TM * TN] = {
       simdgroup_matrix<AccumType, 8, 8>(0)};
 
@@ -370,10 +333,6 @@ struct BlockMMA {
 
   /* (BM, BK) X (BK, BN) multiply accumulate function */
   METAL_FUNC void mma(const threadgroup T* As, const threadgroup T* Bs) {
-    if (SimdLoad) {
-      mma_simd_load(As, Bs);
-      return;
-    }
     // Adjust for simdgroup and thread location
     As += As_offset;
     Bs += Bs_offset;
@@ -387,9 +346,9 @@ struct BlockMMA {
       STEEL_PRAGMA_UNROLL
       for (short i = 0; i < TM; i++) {
         Asimd[i].thread_elements()[0] =
-            static_cast<FragType>(As[i * simd_stride_a + 0]);
+            static_cast<AccumType>(As[i * simd_stride_a + 0]);
         Asimd[i].thread_elements()[1] =
-            static_cast<FragType>(As[i * simd_stride_a + jump_a]);
+            static_cast<AccumType>(As[i * simd_stride_a + jump_a]);
       }
 
       simdgroup_barrier(mem_flags::mem_none);
@@ -398,9 +357,9 @@ struct BlockMMA {
       STEEL_PRAGMA_UNROLL
       for (short j = 0; j < TN; j++) {
         Bsimd[j].thread_elements()[0] =
-            static_cast<FragType>(Bs[j * simd_stride_b + 0]);
+            static_cast<AccumType>(Bs[j * simd_stride_b + 0]);
         Bsimd[j].thread_elements()[1] =
-            static_cast<FragType>(Bs[j * simd_stride_b + jump_b]);
+            static_cast<AccumType>(Bs[j * simd_stride_b + jump_b]);
       }
 
       simdgroup_barrier(mem_flags::mem_none);
@@ -423,54 +382,6 @@ struct BlockMMA {
       // Progress to next simdgroup tile
       As += tile_stride_a;
       Bs += tile_stride_b;
-    }
-  }
-
-  /* mma with each operand fragment one simdgroup_load from the tile: A as an
-   * (m, k) block, B as the (k, n) block a transposed load gives. The same
-   * multiplies in the same order as mma. */
-  METAL_FUNC void mma_simd_load(const threadgroup T* As, const threadgroup T* Bs) {
-    STEEL_PRAGMA_UNROLL
-    for (short kk = 0; kk < BK; kk += 8) {
-      simdgroup_barrier(mem_flags::mem_none);
-
-      STEEL_PRAGMA_UNROLL
-      for (short i = 0; i < TM; i++) {
-        const short row = tm + i * TM_stride;
-        frag_load(
-            Asimd[i],
-            transpose_a ? As + kk * lda_tgp + row : As + row * lda_tgp + kk,
-            lda_tgp,
-            transpose_a);
-      }
-
-      simdgroup_barrier(mem_flags::mem_none);
-
-      STEEL_PRAGMA_UNROLL
-      for (short j = 0; j < TN; j++) {
-        const short col = tn + j * TN_stride;
-        frag_load(
-            Bsimd[j],
-            transpose_b ? Bs + col * ldb_tgp + kk : Bs + kk * ldb_tgp + col,
-            ldb_tgp,
-            transpose_b);
-      }
-
-      simdgroup_barrier(mem_flags::mem_none);
-
-      STEEL_PRAGMA_UNROLL
-      for (short i = 0; i < TM; i++) {
-        STEEL_PRAGMA_UNROLL
-        for (short j = 0; j < TN; j++) {
-          short j_serp = (i % 2) ? (TN - 1 - j) : j;
-
-          simdgroup_multiply_accumulate(
-              results[i * TN + j_serp],
-              Asimd[i],
-              Bsimd[j_serp],
-              results[i * TN + j_serp]);
-        }
-      }
     }
   }
 
@@ -709,9 +620,7 @@ template <
     bool MN_aligned,
     bool K_aligned,
     typename AccumType = typename AccumHelper<T>::accum_type,
-    typename Epilogue = TransformNone<U, AccumType>,
-    typename FragType = AccumType,
-    bool SimdLoad = false>
+    typename Epilogue = TransformNone<U, AccumType>>
 struct GEMMKernel {
   STEEL_CONST short tgp_padding_a = 16 / sizeof(T);
   STEEL_CONST short tgp_padding_b = 16 / sizeof(T);
@@ -750,39 +659,7 @@ struct GEMMKernel {
       transpose_a ? BM + tgp_padding_a : BK + tgp_padding_a,
       transpose_b ? BK + tgp_padding_b : BN + tgp_padding_b,
       AccumType,
-      Epilogue,
-      FragType,
-      SimdLoad>;
-
-  /* Aligned K loop that reads the next tile from device memory while the
-   * current one is multiplied. The k order is unchanged. */
-  static METAL_FUNC void gemm_loop_prefetch(
-      threadgroup T* As,
-      threadgroup T* Bs,
-      const int gemm_k_iterations,
-      thread loader_a_t& loader_a,
-      thread loader_b_t& loader_b,
-      thread mma_t& mma_op) {
-    typename loader_a_t::ReadVector ra[loader_a_t::n_rows];
-    typename loader_b_t::ReadVector rb[loader_b_t::n_rows];
-    if (gemm_k_iterations > 0) {
-      loader_a.read_unsafe(ra);
-      loader_b.read_unsafe(rb);
-    }
-    for (int k = 0; k < gemm_k_iterations; k++) {
-      threadgroup_barrier(mem_flags::mem_threadgroup);
-      loader_a.write_regs(ra);
-      loader_b.write_regs(rb);
-      threadgroup_barrier(mem_flags::mem_threadgroup);
-      loader_a.next();
-      loader_b.next();
-      if (k + 1 < gemm_k_iterations) {
-        loader_a.read_unsafe(ra);
-        loader_b.read_unsafe(rb);
-      }
-      mma_op.mma(As, Bs);
-    }
-  }
+      Epilogue>;
 
   /* Main kernel function */
   template <bool M_aligned, bool N_aligned, bool K_aligned_>
@@ -1144,10 +1021,7 @@ template <
     bool transpose_a,
     bool transpose_b,
     typename AccumType = float,
-    typename OutT = T,
-    typename FragType = AccumType,
-    bool Prefetch = false,
-    bool SimdLoad = false>
+    typename OutT = T>
 [[kernel, max_total_threads_per_threadgroup(WM* WN * 32)]] void gemm(
     const device T* A [[buffer(0)]],
     const device T* B [[buffer(1)]],
@@ -1182,10 +1056,7 @@ template <
       transpose_b,
       true,
       true,
-      AccumType,
-      TransformNone<OutT, AccumType>,
-      FragType,
-      SimdLoad>;
+      AccumType>;
 
   using loader_a_t = typename gemm_kernel::loader_a_t;
   using loader_b_t = typename gemm_kernel::loader_b_t;
@@ -1361,25 +1232,20 @@ template <
   // MNK aligned loop
   if (align_M && align_N) {
     // Do gemm
-    if (Prefetch) {
-      gemm_kernel::gemm_loop_prefetch(
-          As, Bs, gemm_k_iterations, loader_a, loader_b, mma_op);
-    } else {
-      for (int k = 0; k < gemm_k_iterations; k++) {
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        // Load elements into threadgroup
-        loader_a.load_unsafe();
-        loader_b.load_unsafe();
+    for (int k = 0; k < gemm_k_iterations; k++) {
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      // Load elements into threadgroup
+      loader_a.load_unsafe();
+      loader_b.load_unsafe();
 
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+      threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        // Multiply and accumulate threadgroup elements
-        mma_op.mma(As, Bs);
+      // Multiply and accumulate threadgroup elements
+      mma_op.mma(As, Bs);
 
-        // Prepare for next iteration
-        loader_a.next();
-        loader_b.next();
-      }
+      // Prepare for next iteration
+      loader_a.next();
+      loader_b.next();
     }
 
     threadgroup_barrier(mem_flags::mem_none);
@@ -1406,22 +1272,17 @@ template <
 
     if ((align_M || tgp_bm == BM) && (align_N || tgp_bn == BN)) {
       // Do gemm
-      if (Prefetch) {
-        gemm_kernel::gemm_loop_prefetch(
-            As, Bs, gemm_k_iterations, loader_a, loader_b, mma_op);
-      } else {
-        gemm_kernel::gemm_loop(
-            As,
-            Bs,
-            gemm_k_iterations,
-            loader_a,
-            loader_b,
-            mma_op,
-            tgp_bm,
-            tgp_bn,
-            leftover_bk,
-            LoopAlignment<true, true, true>{});
-      }
+      gemm_kernel::gemm_loop(
+          As,
+          Bs,
+          gemm_k_iterations,
+          loader_a,
+          loader_b,
+          mma_op,
+          tgp_bm,
+          tgp_bn,
+          leftover_bk,
+          LoopAlignment<true, true, true>{});
 
       // Do epilogue
       if (use_out_source) {
@@ -1566,40 +1427,6 @@ template <
       uint simd_group_id [[simdgroup_index_in_threadgroup]], \
       uint3 tid [[threadgroup_position_in_grid]], \
       uint3 lid [[thread_position_in_threadgroup]]);
-
-// Variants of one tile: `_hf` half operand fragments (float accumulators),
-// `_pf` the next tile read from device memory during the current multiply,
-// `_sl` half fragments each loaded by one simdgroup_load, `_slpf` both.
-#define instantiate_gemm_variant(tname, trans_a, trans_b, iname, itype, oname, otype, bm, bn, bk, wm, wn, suffix, ftype, prefetch, simdload) \
-  template [[host_name("gemm_" #tname "_"  #iname "_" #oname "_" #bm "_" #bn "_" #bk "_" #wm "_" #wn suffix)]] \
-  [[kernel]] void gemm<itype, bm, bn, bk, wm, wn, trans_a, trans_b, float, otype, ftype, prefetch, simdload>( \
-      const device itype *A [[buffer(0)]], \
-      const device itype *B [[buffer(1)]], \
-      const device otype *C [[buffer(2), function_constant(use_out_source)]], \
-      device otype *D [[buffer(3)]], \
-      const constant GEMMParams* params [[buffer(4)]], \
-      const constant GEMMAddMMParams* addmm_params [[buffer(5), function_constant(use_out_source)]], \
-      const constant int* batch_shape [[buffer(6)]], \
-      const constant size_t* batch_strides [[buffer(7)]], \
-      const constant uint32_t* lhs_indices [[buffer(10), function_constant(do_gather)]], \
-      const constant uint32_t* rhs_indices [[buffer(11), function_constant(do_gather)]], \
-      const constant uint32_t* C_indices [[buffer(12), function_constant(gather_bias)]], \
-      const constant int* operand_shape [[buffer(13), function_constant(do_gather)]], \
-      const constant size_t* operand_strides [[buffer(14), function_constant(do_gather)]], \
-      const constant packed_int3& operand_batch_ndim [[buffer(15), function_constant(do_gather)]], \
-      uint simd_lane_id [[thread_index_in_simdgroup]], \
-      uint simd_group_id [[simdgroup_index_in_threadgroup]], \
-      uint3 tid [[threadgroup_position_in_grid]], \
-      uint3 lid [[thread_position_in_threadgroup]]);
-
-instantiate_gemm_variant(nt, false, true, f16, half, f16, half, 64, 32, 32, 2, 2, "_hf", half, false, false)
-instantiate_gemm_variant(nt, false, true, f16, half, f16, half, 64, 64, 16, 1, 2, "_hf", half, false, false)
-instantiate_gemm_variant(nt, false, true, f16, half, f16, half, 64, 32, 32, 2, 2, "_pf", float, true, false)
-instantiate_gemm_variant(nt, false, true, f16, half, f16, half, 64, 64, 16, 1, 2, "_pf", float, true, false)
-instantiate_gemm_variant(nt, false, true, f16, half, f16, half, 64, 32, 32, 2, 2, "_sl", half, false, true)
-instantiate_gemm_variant(nt, false, true, f16, half, f16, half, 64, 64, 16, 1, 2, "_sl", half, false, true)
-instantiate_gemm_variant(nt, false, true, f16, half, f16, half, 64, 32, 32, 2, 2, "_slpf", half, true, true)
-instantiate_gemm_variant(nt, false, true, f16, half, f16, half, 64, 64, 16, 1, 2, "_slpf", half, true, true)
 
 #define instantiate_gemm_transpose_helper(iname, itype, oname, otype, bm, bn, bk, wm, wn) \
     instantiate_gemm(nn, false, false, iname, itype, oname, otype, bm, bn, bk, wm, wn) \

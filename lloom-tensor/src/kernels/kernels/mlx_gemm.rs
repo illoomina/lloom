@@ -38,51 +38,11 @@ struct TileConfig {
     bk: usize, // Block size K
     wm: usize, // Warp tiles M
     wn: usize, // Warp tiles N
-    variant: TileVariant,
-}
-
-/// A kernel variant of one tile, instantiated for f16 `nt` only.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-enum TileVariant {
-    /// The steel kernel as MLX ships it.
-    Steel,
-    /// Half operand fragments, float accumulators (`_hf`).
-    HalfFrags,
-    /// The next K tile read from device memory while the current one is
-    /// multiplied (`_pf`).
-    Prefetch,
-    /// Half operand fragments, each one `simdgroup_load` from the tile (`_sl`).
-    SimdLoad,
-    /// `SimdLoad` and `Prefetch` (`_slpf`).
-    SimdLoadPrefetch,
-}
-
-impl TileVariant {
-    const fn suffix(self) -> &'static str {
-        match self {
-            TileVariant::Steel => "",
-            TileVariant::HalfFrags => "_hf",
-            TileVariant::Prefetch => "_pf",
-            TileVariant::SimdLoad => "_sl",
-            TileVariant::SimdLoadPrefetch => "_slpf",
-        }
-    }
 }
 
 impl TileConfig {
     const fn new(bm: usize, bn: usize, bk: usize, wm: usize, wn: usize) -> Self {
-        Self {
-            bm,
-            bn,
-            bk,
-            wm,
-            wn,
-            variant: TileVariant::Steel,
-        }
-    }
-
-    const fn with(self, variant: TileVariant) -> Self {
-        Self { variant, ..self }
+        Self { bm, bn, bk, wm, wn }
     }
 }
 
@@ -136,18 +96,9 @@ fn forced_tile() -> Option<TileConfig> {
                 "16x16" => TILE_16_16_16_2_2,
                 "64x32" => TILE_64_32_32_2_2,
                 "64x64" => TILE_64_64_16_2_2,
-                "64x64x1x2" => TILE_64_64_16_1_2,
-                "64x32-hf" => TILE_64_32_32_2_2.with(TileVariant::HalfFrags),
-                "64x64x1x2-hf" => TILE_64_64_16_1_2.with(TileVariant::HalfFrags),
-                "64x32-pf" => TILE_64_32_32_2_2.with(TileVariant::Prefetch),
-                "64x64x1x2-pf" => TILE_64_64_16_1_2.with(TileVariant::Prefetch),
-                "64x32-sl" => TILE_64_32_32_2_2.with(TileVariant::SimdLoad),
-                "64x64x1x2-sl" => TILE_64_64_16_1_2.with(TileVariant::SimdLoad),
-                "64x32-slpf" => TILE_64_32_32_2_2.with(TileVariant::SimdLoadPrefetch),
-                "64x64x1x2-slpf" => TILE_64_64_16_1_2.with(TileVariant::SimdLoadPrefetch),
                 other => panic!(
-                    "LLOOM_383_TILE must be one of 32x32|32x16|16x32|16x16|64x32|64x64|\
-                     64x64x1x2, or 64x32|64x64x1x2 with -hf|-pf|-sl|-slpf, got {other:?}"
+                    "LLOOM_383_TILE must be one of \
+                 32x32|32x16|16x32|16x16|64x32|64x64, got {other:?}"
                 ),
             })
     })
@@ -2055,17 +2006,9 @@ pub unsafe fn call_mlx_gemm_out(
         (false, true) => "nt",
         (true, true) => "tt",
     };
-    let frag_str = if dtype == GemmDType::F16
-        && out_dtype == GemmDType::F16
-        && (a_trans, b_trans) == (false, true)
-    {
-        tile.variant.suffix()
-    } else {
-        ""
-    };
     let name = format!(
-        "gemm_{}_{}_{}_{}_{}_{}_{}_{}{}",
-        trans_str, dtype_str, out_str, bm, bn, bk, wm, wn, frag_str
+        "gemm_{}_{}_{}_{}_{}_{}_{}_{}",
+        trans_str, dtype_str, out_str, bm, bn, bk, wm, wn
     );
 
     let pipeline =

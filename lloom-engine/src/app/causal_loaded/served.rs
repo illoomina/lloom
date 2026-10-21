@@ -926,6 +926,9 @@ where
             |engine| engine.complete_images(prompt, images, params, &mut |t| on_fragment(t)),
         )?)
     }
+    fn observes_decode(&self) -> bool {
+        true
+    }
     fn complete_observed(
         &self,
         prompt: &[u32],

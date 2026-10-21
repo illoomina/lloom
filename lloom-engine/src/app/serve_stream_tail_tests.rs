@@ -100,6 +100,9 @@ struct Scripted {
     text: Text,
     case: Case,
     progress: Progress,
+    /// Whether this stub reports typed decode observations (it supplies
+    /// them; a family on the default seam reports `false`).
+    observes: bool,
 }
 impl Scripted {
     fn new(case: Case, progress: Progress) -> Self {
@@ -120,10 +123,14 @@ impl Scripted {
             },
             case,
             progress,
+            observes: true,
         }
     }
 }
 impl Served for Scripted {
+    fn observes_decode(&self) -> bool {
+        self.observes
+    }
     fn device(&self) -> &Device {
         &self.device
     }
@@ -721,4 +728,44 @@ fn blocked_network_flush_holds_no_order_guard_or_delta_control_path() {
     let (_, error) = sw.finish().unwrap();
     assert!(error.is_none());
     assert_eq!(ordered_payloads(&wire), "<A><B>C");
+}
+
+/// A family whose `Served` seam keeps the default `complete_observed` (no
+/// typed observations) splits by the markers' text instead, with a partial
+/// marker held across pushes: the answer reaches `content` rather than
+/// stranding in `reasoning_content` (#946, 2026-10-21).
+#[test]
+fn a_family_without_decode_observations_splits_by_marker_text() {
+    let progress = Progress::default();
+    let mut engine = Scripted::new(Case::CompleteMarker, progress.clone());
+    engine.observes = false;
+    let tags = engine.think_tags().unwrap();
+    // The prompt opened the block: reasoning until the end marker's text.
+    let mut p = reasoning::Reasoning::for_chat(&engine, &[tags.start], false)
+        .unwrap()
+        .unwrap();
+    let a = p.push("The user asks a simple thing.</thi");
+    assert_eq!(a.get("reasoning_content").and_then(|v| v.as_str()), Some("The user asks a simple thing."));
+    assert!(a.get("content").is_none(), "{a:?}");
+    let b = p.push("nk>Paris");
+    assert_eq!(b.get("content").and_then(|v| v.as_str()), Some("Paris"), "{b:?}");
+    assert!(b.get("reasoning_content").is_none(), "{b:?}");
+    let c = p.finish();
+    assert!(c.is_empty(), "{c:?}");
+    // A stop string that cuts the marker short: the partial bytes are emitted
+    // at finish, in the block they were in.
+    let mut p = reasoning::Reasoning::for_chat(&engine, &[tags.start], false)
+        .unwrap()
+        .unwrap();
+    let a = p.push("thought</th");
+    assert_eq!(a.get("reasoning_content").and_then(|v| v.as_str()), Some("thought"));
+    let c = p.finish();
+    assert_eq!(c.get("reasoning_content").and_then(|v| v.as_str()), Some("</th"), "{c:?}");
+    // With observations the splitter is exact by id and ignores literals.
+    engine.observes = true;
+    let mut p = reasoning::Reasoning::for_chat(&engine, &[tags.start], false)
+        .unwrap()
+        .unwrap();
+    let a = p.push("literal </think> stays reasoning");
+    assert_eq!(a.get("reasoning_content").and_then(|v| v.as_str()), Some("literal </think> stays reasoning"));
 }

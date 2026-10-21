@@ -265,6 +265,18 @@ pub trait Served: Send + Sync {
         }
     }
 
+    /// Whether [`Self::complete_observed`] supplies the typed detokenizer
+    /// observations the chat reasoning splitter places its markers from. The
+    /// default seam above ignores the observer, so on a family that keeps it
+    /// the splitter would start inside the block its prompt opened and never
+    /// see the end marker — the answer came back in `reasoning_content` and
+    /// `content` was empty (#946, 2026-10-21). Such a family returns the whole
+    /// reply in `content` until its decode paths are wired to
+    /// `observed_decode`; the GGUF owner, which supplies them, says so.
+    fn observes_decode(&self) -> bool {
+        false
+    }
+
     /// What the last request loaded and encoded: the model's tensors, whether
     /// the vision tower is resident, the image census. `Null` for a family
     /// without vision.

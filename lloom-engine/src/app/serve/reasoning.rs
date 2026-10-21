@@ -34,6 +34,12 @@ pub(super) struct Reasoning {
     inside: bool,
     pending: String,
     offset: usize,
+    /// Markers placed from the text itself (each marker's literal, with a
+    /// partial suffix held back across pushes) because the family supplies no
+    /// decode observations (`Served::observes_decode`): the fallback that keeps
+    /// decision 51 Q2 on every family (#946, 2026-10-21). Observation-placed
+    /// markers are exact by id; text-placed ones match the marker's literal.
+    by_text: bool,
 }
 
 impl Reasoning {
@@ -66,7 +72,50 @@ impl Reasoning {
             inside: tags.open_at_end(prompt).is_some(),
             pending: String::new(),
             offset: 0,
+            // Without decode observations the markers cannot be placed by id,
+            // and a prompt that opened the block would never close it (the
+            // answer came back in `reasoning_content`): place them from the
+            // text instead.
+            by_text: !engine.observes_decode(),
         }))
+    }
+
+    /// Text mode: events for every complete marker literal in `pending` past
+    /// the last placed one, and the length of a trailing partial literal to
+    /// hold back until the next push (a stop string may cut it short; finish
+    /// emits it as it is). Idempotent across pushes: `push` consumes every
+    /// event it places, so a region is scanned once.
+    fn place_from_text(&mut self) -> usize {
+        let base = self.offset;
+        let mut pos = 0;
+        loop {
+            let mut best: Option<(usize, usize, Kind)> = None;
+            for marker in &self.markers {
+                if let Some(at) = self.pending[pos..].find(marker.text.as_str()) {
+                    let at = pos + at;
+                    if best.map_or(true, |b: (usize, usize, Kind)| at < b.0) {
+                        best = Some((at, marker.text.len(), marker.kind));
+                    }
+                }
+            }
+            let Some((at, len, kind)) = best else { break };
+            self.events.push_back(Event {
+                start: base + at,
+                end: base + at + len,
+                kind,
+            });
+            pos = at + len;
+        }
+        let tail = &self.pending[pos..];
+        let mut hold = 0;
+        for marker in &self.markers {
+            for k in 1..marker.text.len().min(tail.len() + 1) {
+                if marker.text.is_char_boundary(k) && tail.ends_with(&marker.text[..k]) {
+                    hold = hold.max(k);
+                }
+            }
+        }
+        hold
     }
 
     /// A pending UTF-8 run can be decoded repeatedly before publication.
@@ -115,9 +164,14 @@ impl Reasoning {
     /// may cut a marker short; finish then emits those bytes without a transition.
     pub(super) fn push(&mut self, text: &str) -> Map<String, Value> {
         self.pending.push_str(text);
+        let hold = if self.by_text {
+            self.place_from_text()
+        } else {
+            0
+        };
         let (mut content, mut reasoning) = (String::new(), String::new());
         loop {
-            let end = self.offset + self.pending.len();
+            let end = self.offset + self.pending.len() - hold;
             let until = self
                 .events
                 .front()
@@ -218,6 +272,7 @@ mod tests {
             inside,
             pending: String::new(),
             offset: 0,
+            by_text: false,
         }
     }
     fn decode(ids: &[u32]) -> lloom_tensor::Result<String> {

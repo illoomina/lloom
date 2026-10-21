@@ -7840,6 +7840,70 @@ fn mlx_gemm_383_tile_parity() {
     }
 }
 
+/// The narrow-projection tile (`DESIGN.md` §13.5z) against a host reference
+/// at LFM2's prefill projection shapes, through the shipping selection on
+/// this device: `x · Wᵀ` at f16, `W` row-major `[n, k]` as the model stores
+/// it (the `nt` layout). The kernel accumulates in f32 and rounds to f16 once
+/// at the store, so the reference is rounded the same way and the bound left
+/// is one f16 ulp of the result plus the f32 accumulation's own error,
+/// `k · 2⁻²⁴ · Σ|x·w|` (CONTRIBUTING §3.1b rule 6). A lattice of outputs
+/// covers every row and column tile and the last row and column; the shapes
+/// sit on both sides of the class: 512 and 344 rows of q/o/out_proj and conv
+/// in_proj on the 64×32 tile, 513 rows and the 10752-wide w1 on 64×64.
+#[test]
+fn mlx_gemm_narrow_projection_parity() {
+    for &(m, n, k) in &[
+        (512usize, 2048usize, 2048usize),
+        (512, 6144, 2048),
+        (344, 6144, 2048),
+        (513, 2048, 2048),
+        (512, 10752, 2048),
+    ] {
+        let lhs: Vec<f16> = (0..m * k)
+            .map(|i| f16::from_f32(((i % 97) as f32 - 48.0) / 256.0))
+            .collect();
+        let rhs: Vec<f16> = (0..n * k)
+            .map(|i| f16::from_f32(((i % 89) as f32 - 44.0) / 256.0))
+            .collect();
+        let got = run_mlx_gemm(
+            GemmDType::F16,
+            (1, m, n, k),
+            &lhs,
+            &[m * k, k, 1],
+            0,
+            &rhs,
+            &[n * k, 1, k],
+            0,
+        );
+        assert_eq!(got.len(), m * n, "({m},{n},{k}): length");
+        let mut checked = 0usize;
+        let mut worst = 0f64;
+        for i in (0..m).step_by(7).chain([m - 1]) {
+            for j in (0..n).step_by(61).chain([n - 1]) {
+                let (mut acc, mut mag) = (0f64, 0f64);
+                for l in 0..k {
+                    let p = lhs[i * k + l].to_f64() * rhs[j * k + l].to_f64();
+                    acc += p;
+                    mag += p.abs();
+                }
+                let want = f16::from_f64(acc);
+                let a = f16::from_f64(want.to_f64().abs());
+                let ulp = f16::from_bits(a.to_bits() + 1).to_f64() - a.to_f64();
+                let bound = ulp + k as f64 * 2f64.powi(-24) * mag;
+                let err = (got[i * n + j].to_f64() - acc).abs();
+                worst = worst.max(err / bound);
+                assert!(
+                    err <= bound,
+                    "({m},{n},{k}) at [{i},{j}]: {} against {acc} (bound {bound})",
+                    got[i * n + j]
+                );
+                checked += 1;
+            }
+        }
+        eprintln!("({m},{n},{k}): {checked} outputs within bound, worst {worst:.3} of it");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Fused SiLU epilogue on the decode-path GEMV (issue #484, `DESIGN.md`
 // §12.2 #3).

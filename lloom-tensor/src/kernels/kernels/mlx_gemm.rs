@@ -126,6 +126,37 @@ fn skinny_max() -> usize {
     crate::tuning::tuning().gemm.skinny_max
 }
 
+/// The largest `m` at which a narrow projection takes the 64×32 tile
+/// ([`narrow_projection`]), inclusive: the prefill tile (`prefill.tile`,
+/// 512 by default), the largest `m` the shape was measured at.
+pub const NARROW_PROJECTION_MAX_M: usize = 512;
+
+/// The widest narrow projection's output, in multiples of its depth `k`.
+const NARROW_PROJECTION_N_PER_K: usize = 3;
+
+/// Whether a GEMM is a narrow projection at a prefill tile's rows: `x · Wᵀ`
+/// at f16 on a Max device, one batch, `m ≤ 512` rows, an output no wider
+/// than three times its depth. On the large-matmul, reasonable-K branch
+/// MLX's medium-device table gives it the 64×64 tile with a 16-deep K step;
+/// measured, the 64×32 tile with a 32-deep step is faster there (LFM2's
+/// q/o/out_proj and conv in_proj at `m` = 512) and the 64×64 tile keeps the
+/// wider outputs it ties or wins on (`docs/tuning.md` §13.5z).
+fn narrow_projection(
+    dtype: GemmDType,
+    (m, n, k): (usize, usize, usize),
+    batch_size: usize,
+    (a_trans, b_trans): (bool, bool),
+    device_type: MetalDeviceType,
+) -> bool {
+    device_type == MetalDeviceType::Max
+        && dtype == GemmDType::F16
+        && batch_size == 1
+        && !a_trans
+        && b_trans
+        && m <= NARROW_PROJECTION_MAX_M
+        && n <= NARROW_PROJECTION_N_PER_K * k
+}
+
 /// Which side of the `m == 1 || n == 1` GEMV route to suppress, so the routing
 /// decision itself becomes an arm (issue #386).
 ///
@@ -329,7 +360,17 @@ fn select_tile_config(
                 GemmDType::F16 | GemmDType::BF16 => {
                     if is_large_matmul {
                         if 2 * m.max(n) > k {
-                            TILE_64_64_16_1_2
+                            if narrow_projection(
+                                dtype,
+                                (m, n, k),
+                                batch_size,
+                                (a_trans, b_trans),
+                                device_type,
+                            ) {
+                                TILE_64_32_32_2_2
+                            } else {
+                                TILE_64_64_16_1_2
+                            }
                         } else if !a_trans && b_trans {
                             TILE_64_32_32_2_2
                         } else {
@@ -344,6 +385,19 @@ fn select_tile_config(
             }
         }
     }
+}
+
+/// The tile `call_mlx_gemm` takes for a one-batch `x · Wᵀ` (`x [m, k]`, `W`
+/// row-major `[n, k]`, the `nt` layout) at `dtype` on `device`, as
+/// `(bm, bn, bk, wm, wn)`: what a benchmark prints beside its rate, so the
+/// tile a shape ran on is read from the selection rather than assumed.
+pub fn nt_gemm_tile(
+    device: &Device,
+    dtype: GemmDType,
+    (m, n, k): (usize, usize, usize),
+) -> (usize, usize, usize, usize, usize) {
+    let t = select_tile_config(dtype, m, n, k, 1, false, true, device.device_type());
+    (t.bm, t.bn, t.bk, t.wm, t.wn)
 }
 
 /// Check if batch can be collapsed into M dimension.
@@ -2155,6 +2209,80 @@ mod tile_config_gate {
             "the boundary must be a boundary: if these agree, every §13.5c/§13.5o \
              figure is a comparison of a tile against itself"
         );
+    }
+
+    /// **The claim: at a prefill tile's rows, LFM2's narrow projections take
+    /// the 64×32 tile and its wide ones keep MLX's 64×64.**
+    ///
+    /// `DESIGN.md` §13.5z: at `m` = 512 the 64×32 tile runs q/o/out_proj
+    /// (2048×2048) at 6.6 TFLOP/s against 5.4 and conv in_proj (6144×2048) at
+    /// 8.35 against 7.8–7.9; w1/w3 (10752×2048) tie and keep 64×64, as does the
+    /// lm_head. w2 (a deep `k`) and k/v (an output under a million elements)
+    /// were on the 64×32 tile already. Each `m` here is in the 64-row band and
+    /// puts w1/w3 on the large-matmul branch (`m` ≥ 98): 171 is where conv
+    /// in_proj becomes a large matmul, 344 and 374 the last tiles of the 2392
+    /// and 886-token prompts, 512 the prefill tile.
+    #[test]
+    fn at_a_prefill_tile_the_narrow_projections_take_the_64_32_tile() {
+        let shape = |t: TileConfig| (t.bm, t.bn, t.bk, t.wm, t.wn);
+        let narrow = (64, 32, 32, 2, 2);
+        let wide = (64, 64, 16, 1, 2);
+        for m in [171, 344, 374, NARROW_PROJECTION_MAX_M] {
+            for (label, _, n, k) in SITES {
+                let want = match *label {
+                    "w1 (gate)" | "w3 (up)" | "lm_head" => wide,
+                    _ => narrow,
+                };
+                assert_eq!(
+                    shape(tile_at(m, *n, *k)),
+                    want,
+                    "§13.5z: at m={m} the {label} matmul ({n}x{k})"
+                );
+            }
+        }
+    }
+
+    /// **The claim: the narrow-projection class ends where it was measured,
+    /// on both of its edges, and nowhere else does the table move.**
+    ///
+    /// Past `m` = 512 (unmeasured per shape; the shipping prefill tile is
+    /// 512) and past an output three times the depth, MLX's 64×64 tile
+    /// stands; so do bf16, a batch, the `nn` layout, another device class
+    /// and f32, none of which was measured. Both sides of each edge are
+    /// asserted (§8.1g), so a class that swallowed everything or nothing
+    /// fails here.
+    #[test]
+    fn the_narrow_projection_class_ends_where_it_was_measured() {
+        let shape = |t: TileConfig| (t.bm, t.bn, t.bk, t.wm, t.wn);
+        let narrow = (64, 32, 32, 2, 2);
+        let wide = (64, 64, 16, 1, 2);
+        let max_m = NARROW_PROJECTION_MAX_M;
+        for (n, k) in [(2048, 2048), (6144, 2048)] {
+            assert_eq!(shape(tile_at(max_m, n, k)), narrow, "{n}x{k} at m={max_m}");
+            assert_eq!(
+                shape(tile_at(max_m + 1, n, k)),
+                wide,
+                "{n}x{k} past the tile"
+            );
+            assert_eq!(shape(tile_at(2048, n, k)), wide, "{n}x{k} at m=2048");
+        }
+        assert_eq!(shape(tile_at(max_m, 3 * 2048, 2048)), narrow, "n = 3k");
+        assert_eq!(shape(tile_at(max_m, 3 * 2048 + 32, 2048)), wide, "n > 3k");
+        let sel = |dtype, batch, b_trans, dev| {
+            shape(select_tile_config(
+                dtype, max_m, 2048, 2048, batch, false, b_trans, dev,
+            ))
+        };
+        assert_eq!(sel(GemmDType::F16, 1, true, DEV), narrow, "the control");
+        assert_eq!(sel(GemmDType::BF16, 1, true, DEV), wide, "bf16");
+        assert_eq!(sel(GemmDType::F16, 2, true, DEV), wide, "a batch");
+        assert_eq!(sel(GemmDType::F16, 1, false, DEV), wide, "nn");
+        assert_eq!(
+            sel(GemmDType::F16, 1, true, MetalDeviceType::Medium),
+            wide,
+            "another device class"
+        );
+        assert_eq!(sel(GemmDType::F32, 1, true, DEV), (64, 64, 16, 2, 2), "f32");
     }
 
     /// **The claim: `align_M` is false and `align_N` is true at all 167 sites.**

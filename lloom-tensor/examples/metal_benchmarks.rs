@@ -170,7 +170,9 @@ fn run_prefill_gemm(m: usize, n: usize, k: usize, reps: usize) -> Result<f64> {
 #[derive(Subcommand, Debug, Clone)]
 enum Task {
     Gemm,
-    /// The prefill projections' shapes at m = 512, 2048, 2392.
+    /// The prefill projections' shapes at m = 110, 344, 374, 512, 2048, 2392
+    /// (the three prompts' last tiles, the prefill tile, two whole prompts),
+    /// each beside the tile it ran on.
     PrefillGemm,
 }
 
@@ -193,10 +195,18 @@ fn main() -> Result<()> {
                 ("q / o / conv out_proj", 2048, 2048),
                 ("k / v", 512, 2048),
             ];
-            for m in [512, 2048, 2392] {
+            let device = Device::system_default().unwrap();
+            for m in [110, 344, 374, 512, 2048, 2392] {
                 for (name, n, k) in shapes {
                     let tflops = run_prefill_gemm(m, n, k, 20)?;
-                    println!("PREFILL_GEMM m={m} n={n} k={k} {name}: {tflops:.2} TFLOP/s");
+                    let (bm, bn, bk, wm, wn) = lloom_tensor::kernels::nt_gemm_tile(
+                        &device,
+                        lloom_tensor::kernels::GemmDType::F16,
+                        (m, n, k),
+                    );
+                    println!(
+                        "PREFILL_GEMM m={m} n={n} k={k} {name}: {tflops:.2} TFLOP/s tile={bm}_{bn}_{bk}_{wm}_{wn}"
+                    );
                 }
             }
         }

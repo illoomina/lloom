@@ -40,10 +40,11 @@ pub use kernels::{
     call_qsa_prep_batch, call_qsa_prep_rows, call_ring_stamp, call_sigmoid_mul, call_silu_mul,
     call_unit_lower_inverse, call_words_publish, cast::*, convolution::*, fill::*,
     flash_decoding::*, gemv_mixed_gnorm_serves, gemv_norm_serves, gemv_rows_serves, indexing::*,
-    quantized::*, random::*, reduce::*, scratch::*, sdpa::*, sort::*, ternary::*, unary, unary::*,
-    ConvKernel, GemmDType, GemvEpilogue, GemvGroupNorm, GemvNormInline, GemvRmsNorm, GgmlDType,
-    IndexingKernel, MixedEpilogue, ParamStyle, ReduceKernel, SdpaQuantParams, SdpaQuantWriteParams,
-    GEMV_ROWS_MAX, SKINNY_TILE_MAX_M,
+    nt_gemm_tile, quantized::*, random::*, reduce::*, scratch::*, sdpa::*, sort::*, ternary::*,
+    unary, unary::*, ConvKernel, GemmDType, GemvEpilogue, GemvGroupNorm, GemvNormInline,
+    GemvRmsNorm, GgmlDType, IndexingKernel, MixedEpilogue, ParamStyle, ReduceKernel,
+    SdpaQuantParams, SdpaQuantWriteParams, GEMV_ROWS_MAX, NARROW_PROJECTION_MAX_M,
+    SKINNY_TILE_MAX_M,
 };
 // The binding-style default, so a harness can reach the packed entry points
 // without every `call_*` growing an argument (issue #115). Named rather than

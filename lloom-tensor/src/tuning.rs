@@ -811,7 +811,23 @@ fn parse_tile(v: &str) -> Result<Option<String>, String> {
         one_of(
             s,
             "gemm tile",
-            &["32x32", "32x16", "16x32", "16x16", "64x32", "64x64"],
+            &[
+                "32x32",
+                "32x16",
+                "16x32",
+                "16x16",
+                "64x32",
+                "64x64",
+                "64x64x1x2",
+                "64x32-hf",
+                "64x64x1x2-hf",
+                "64x32-pf",
+                "64x64x1x2-pf",
+                "64x32-sl",
+                "64x64x1x2-sl",
+                "64x32-slpf",
+                "64x64x1x2-slpf",
+            ],
         )
     })
 }
@@ -1025,8 +1041,8 @@ pub struct GemmTuning {
         status = "advanced"
     )]
     pub skinny_max: usize,
-    /// Pin the GEMM tile (an A/B arm): `32x32 | 32x16 | 16x32 | 16x16 | 64x32 | 64x64`; none = the derived tile.
-    #[opt(flag = "gemm-tile", env = "LLOOM_383_TILE", parser = "parse_tile", variants = ["none", "32x32", "32x16", "16x32", "16x16", "64x32", "64x64"], path = "kernels.gemm.tile", status = "arm")]
+    /// Pin the GEMM tile (an A/B arm): `32x32 | 32x16 | 16x32 | 16x16 | 64x32 | 64x64 | 64x64x1x2`, or a kernel variant of 64x32 / 64x64x1x2 on f16 `x · Wᵀ`: `-hf` (half operand fragments), `-pf` (the next K tile read during the current multiply), `-sl` (half fragments each one simdgroup_load), `-slpf` (both); none = the derived tile.
+    #[opt(flag = "gemm-tile", env = "LLOOM_383_TILE", parser = "parse_tile", variants = ["none", "32x32", "32x16", "16x32", "16x16", "64x32", "64x64", "64x64x1x2", "64x32-hf", "64x64x1x2-hf", "64x32-pf", "64x64x1x2-pf", "64x32-sl", "64x64x1x2-sl", "64x32-slpf", "64x64x1x2-slpf"], path = "kernels.gemm.tile", status = "arm")]
     pub tile: Option<String>,
     /// Pin the decode GEMV's `bm` (an A/B arm): 4 or 8; none = the derived tile.
     #[opt(flag = "gemv-bm", env = "LLOOM_492_GEMV_BM", parser = "parse_gemv_bm", variants = ["none", "4", "8"], path = "kernels.gemm.gemv_bm", status = "arm")]

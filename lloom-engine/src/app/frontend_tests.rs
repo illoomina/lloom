@@ -35,7 +35,7 @@ const MOVED_ELSEWHERE: &[(&str, &str, &str, &str)] = &[(
 
 const PRE_TREE: &str = "the front-end's own value before the option tree";
 const TUNED_FLOW: &str = "the tuned decode flow as chat's and serve's default (a08b86f5d, #859)";
-const DSPARK_SINGLE: &str = "the maintainer's decision of 2026-10-20 on #1068: the speculative body at one sequence keeps its preset's in-place KV, the paged one gathering the cache every verify round (PR1073 §4e)";
+const DSPARK_SINGLE: &str = "the tuned flow's paged KV for the speculative body at one sequence (a08b86f5d, #859), which decision 52 (#1068) moves back to its preset's in-place KV";
 const CHAT_SERVE: &[Frontend] = &[Frontend::Chat, Frontend::Serve];
 
 /// Every row of the front-end table by value: key, front-ends, condition,
@@ -195,7 +195,7 @@ const PINNED_ROWS: &[(&str, &[Frontend], When, &str, &str)] = &[
         "context.kv.layout",
         CHAT_SERVE,
         When::DsparkSingle,
-        "in-place",
+        "paged",
         DSPARK_SINGLE,
     ),
     (
@@ -479,11 +479,15 @@ fn every_front_end_row_is_pinned_by_value() {
     );
     assert_eq!(table.len(), pinned.len(), "a row appears twice");
     let (before, _) = before_tree();
-    for &(k, fs, _, v, why) in PINNED_ROWS.iter().filter(|p| p.4 != PRE_TREE) {
-        assert!(
-            EXCEPTIONS.iter().all(|e| e.key != k),
-            "{k} is an approved exception, not a move recorded here"
-        );
+    for &(k, fs, w, v, why) in PINNED_ROWS.iter().filter(|p| p.4 != PRE_TREE) {
+        // A moved row carries an exception only where its source names it.
+        for e in EXCEPTIONS.iter().filter(|e| e.key == k && e.when == w) {
+            assert!(
+                why.contains(&format!("decision {}", e.decision)),
+                "{k} is decision {}'s, which its pin does not name",
+                e.decision
+            );
+        }
         let names: Vec<&str> = fs.iter().map(|f| f.name()).collect();
         eprintln!(
             "[{k}: the library's {} before the option tree; {} now {}: {why}]",
@@ -748,15 +752,23 @@ fn the_unset_defaults_are_the_trees_before_it_except_the_named_exceptions() {
 
     // 3. The approved exceptions, by number.
     for e in EXCEPTIONS {
-        let r = frontend::row(e.key, e.frontend).unwrap();
+        let r = frontend::rows_for(e.key, e.frontend)
+            .find(|r| r.when == e.when)
+            .unwrap();
         let o = resolve(Some(e.frontend), e.frontend.name(), &batch_for(r), &none).unwrap();
         // A landed exception resolves to its `after` where its row holds; a
         // row a build cannot hold (the Metal rows on the CPU-only x86 gate)
-        // leaves the library's value, which is the row's `before`.
-        let want = if e.landed && r.when.holds(&o) { e.after } else { e.before };
+        // leaves the library's value.
+        let want = if !r.when.holds(&o) {
+            at(&EngineOptions::default(), e.key)
+        } else if e.landed {
+            typed(e.key, e.after)
+        } else {
+            typed(e.key, e.before)
+        };
         assert_eq!(
             at(&o, e.key),
-            typed(e.key, want),
+            want,
             "decision {} ({}, landed = {})",
             e.decision,
             e.owner,
@@ -766,8 +778,8 @@ fn the_unset_defaults_are_the_trees_before_it_except_the_named_exceptions() {
     let decided: Vec<u32> = EXCEPTIONS.iter().map(|e| e.decision).collect();
     assert_eq!(
         decided,
-        [36, 43, 43, 43, 43, 35, 35],
-        "the approved default changes: decision 36 (serve reuse), 43 (the gate and its cores arm, chat and serve), 35 (the lead, chat and serve)"
+        [36, 43, 43, 43, 43, 35, 35, 52, 52],
+        "the approved default changes: decision 36 (serve reuse), 43 (the gate and its cores arm, chat and serve), 35 (the lead, chat and serve), 52 (B = 1 DSpark's in-place KV, chat and serve)"
     );
     // 4. Decision 44: the EOS watch stays opt-in on every front-end.
     // Decisions 43/35 (2026-10-19): the gate, its cores arm and the lead of 4

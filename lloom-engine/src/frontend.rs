@@ -187,12 +187,13 @@ rows! {
         ModelAxes: "models.lfm2.rows_kernels" = "per-row",
         ModelAxes: "speculative.dspark.context_kv" = "paged",
         ModelAxes: "context.kv.layout" = "paged",
-        // LFM2's speculative body at one sequence keeps its preset's
-        // in-place KV: a verify window is a multi-row pass, which on the
-        // page pool attends over a copy of the cache gathered every round
-        // (`speculation.md` §10.2z-x). After the paged row, which it
-        // overrides where both hold.
-        DsparkSingle: "context.kv.layout" = "in-place",
+        // LFM2's speculative body at one sequence: `before` is the paged
+        // KV the row above gave it; decision 52 (`EXCEPTIONS`) keeps its
+        // preset's in-place KV, because a verify window is a multi-row
+        // pass, which on the page pool attends over a copy of the cache
+        // gathered every round (`speculation.md` §10.2z-x). After the
+        // paged row, which it overrides where both hold.
+        DsparkSingle: "context.kv.layout" = "paged",
         ModelAxes: "kernels.attention.impl" = "flash",
         ModelAxes: "kernels.attention.qkv_layout" = "fused",
         ModelAxes: "kernels.fusion.conv" = "true",
@@ -237,13 +238,16 @@ rows! {
 }
 
 /// A default changed on purpose: the maintainer's decision by number, the
-/// key and front-end it moves, the value before and after, and whether the
-/// change has landed (until then the front-end resolves `before`).
+/// row it moves (key, front-end and condition), the value before and after,
+/// and whether the change has landed (until then the front-end resolves
+/// `before`).
 #[derive(Debug, Clone, Copy)]
 pub struct Exception {
     pub decision: u32,
     pub key: &'static str,
     pub frontend: Frontend,
+    /// The row's condition: a key may carry a row per condition.
+    pub when: When,
     pub before: &'static str,
     pub after: &'static str,
     pub landed: bool,
@@ -257,6 +261,7 @@ pub const EXCEPTIONS: &[Exception] = &[Exception {
     decision: 36,
     key: "context.prefix.reuse",
     frontend: Frontend::Serve,
+    when: When::Always,
     before: "false",
     after: "true",
     landed: true,
@@ -267,6 +272,7 @@ pub const EXCEPTIONS: &[Exception] = &[Exception {
     decision: 43,
     key: "models.qwen3_5.eos_gate",
     frontend: Frontend::Chat,
+    when: When::Metal,
     before: "false",
     after: "true",
     landed: true,
@@ -276,6 +282,7 @@ pub const EXCEPTIONS: &[Exception] = &[Exception {
     decision: 43,
     key: "models.qwen3_5.eos_gate",
     frontend: Frontend::Serve,
+    when: When::Metal,
     before: "false",
     after: "true",
     landed: true,
@@ -285,6 +292,7 @@ pub const EXCEPTIONS: &[Exception] = &[Exception {
     decision: 43,
     key: "models.qwen3_5.eos_gate_cores",
     frontend: Frontend::Chat,
+    when: When::Metal,
     before: "false",
     after: "true",
     landed: true,
@@ -294,6 +302,7 @@ pub const EXCEPTIONS: &[Exception] = &[Exception {
     decision: 43,
     key: "models.qwen3_5.eos_gate_cores",
     frontend: Frontend::Serve,
+    when: When::Metal,
     before: "false",
     after: "true",
     landed: true,
@@ -303,6 +312,7 @@ pub const EXCEPTIONS: &[Exception] = &[Exception {
     decision: 35,
     key: "decode.readback.queued_steps",
     frontend: Frontend::Chat,
+    when: When::Metal,
     before: "0",
     after: "4",
     landed: true,
@@ -312,11 +322,32 @@ pub const EXCEPTIONS: &[Exception] = &[Exception {
     decision: 35,
     key: "decode.readback.queued_steps",
     frontend: Frontend::Serve,
+    when: When::Metal,
     before: "0",
     after: "4",
     landed: true,
     owner: "#993",
     what: "the lead's queued part is 4 steps on Metal (LGD's L): reply-end latency 1160 -> 280 ms on the 27B; 0 = the batching's lead",
+}, Exception {
+    decision: 52,
+    key: "context.kv.layout",
+    frontend: Frontend::Chat,
+    when: When::DsparkSingle,
+    before: "paged",
+    after: "in-place",
+    landed: true,
+    owner: "#1068",
+    what: "the speculative body at one sequence keeps its preset's in-place KV on Metal: the verify window reads the slab instead of a copy gathered out of the page pool every round; --kv-append paged opts out",
+}, Exception {
+    decision: 52,
+    key: "context.kv.layout",
+    frontend: Frontend::Serve,
+    when: When::DsparkSingle,
+    before: "paged",
+    after: "in-place",
+    landed: true,
+    owner: "#1068",
+    what: "the speculative body at one sequence keeps its preset's in-place KV on Metal: the verify window reads the slab instead of a copy gathered out of the page pool every round; --kv-append paged opts out",
 }];
 
 /// The first row of `key` for `frontend`, if the front-end resolves it.
@@ -344,7 +375,7 @@ pub fn resolved(key: &str, frontend: Frontend, o: &EngineOptions) -> Option<&'st
 pub fn exception(r: &Row) -> Option<&'static Exception> {
     EXCEPTIONS
         .iter()
-        .find(|e| e.key == r.key && e.frontend == r.frontend)
+        .find(|e| e.key == r.key && e.frontend == r.frontend && e.when == r.when)
 }
 
 /// The value a row resolves to now: its landed exception's, else `before`.
@@ -421,16 +452,16 @@ mod tests {
                 .unwrap_or_else(|e| panic!("{} = {}: {e}", r.key, r.before));
         }
         for e in EXCEPTIONS {
-            let r = row(e.key, e.frontend)
-                .unwrap_or_else(|| panic!("decision {} names no row", e.decision));
-            assert_eq!(r.before, e.before, "decision {}", e.decision);
+            let named: Vec<&Row> = rows_for(e.key, e.frontend)
+                .filter(|r| r.when == e.when)
+                .collect();
+            assert_eq!(named.len(), 1, "decision {} names one row", e.decision);
+            assert_eq!(named[0].before, e.before, "decision {}", e.decision);
             assert_ne!(e.before, e.after, "decision {}", e.decision);
-            // An exception names its row by key and front-end, so a key it
-            // moves has one row there.
             assert_eq!(
-                rows_for(e.key, e.frontend).count(),
-                1,
-                "decision {} names a key with two rows",
+                exception(named[0]).map(|x| (x.decision, x.frontend, x.when)),
+                Some((e.decision, e.frontend, e.when)),
+                "decision {} is its row's exception",
                 e.decision
             );
         }

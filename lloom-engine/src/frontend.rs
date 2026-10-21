@@ -69,6 +69,14 @@ pub enum When {
     /// `--model` = the LFM2 snapshot), so a default axis never refuses a
     /// family at load.
     ModelAxes,
+    /// LFM2's speculative body at one sequence: [`When::ModelAxes`],
+    /// `speculative.method = dspark`, `scheduler.max_sequences = 1`, on a
+    /// preset whose own KV under a drafter is the in-place one (`auto`,
+    /// `rewindable`; `pool-spec` keeps its page pool). Every verify window
+    /// is a multi-row pass, and on the page pool such a pass attends over a
+    /// copy of the cache gathered out of the pool (`speculation.md`
+    /// §10.2z-x).
+    DsparkSingle,
 }
 
 impl When {
@@ -90,6 +98,12 @@ impl When {
                         p.is_dir() && p.join("config.json").is_file()
                     })
             }
+            When::DsparkSingle => {
+                When::ModelAxes.holds(o)
+                    && o.speculative.method == "dspark"
+                    && o.scheduler.max_sequences == 1
+                    && matches!(o.model.cache.as_str(), "auto" | "rewindable")
+            }
         }
     }
 
@@ -99,6 +113,9 @@ impl When {
             When::Batched => "scheduler.max_sequences > 1",
             When::Metal => "on Metal (a Metal build, not --cpu)",
             When::ModelAxes => "the model's family takes the model axes (LFM2), on Metal",
+            When::DsparkSingle => {
+                "speculative.method = dspark at scheduler.max_sequences = 1 on the auto or rewindable preset (LFM2, on Metal)"
+            }
         }
     }
 }
@@ -170,6 +187,13 @@ rows! {
         ModelAxes: "models.lfm2.rows_kernels" = "per-row",
         ModelAxes: "speculative.dspark.context_kv" = "paged",
         ModelAxes: "context.kv.layout" = "paged",
+        // LFM2's speculative body at one sequence: `before` is the paged
+        // KV the row above gave it; decision 52 (`EXCEPTIONS`) keeps its
+        // preset's in-place KV, because a verify window is a multi-row
+        // pass, which on the page pool attends over a copy of the cache
+        // gathered every round (`speculation.md` §10.2z-x). After the
+        // paged row, which it overrides where both hold.
+        DsparkSingle: "context.kv.layout" = "paged",
         ModelAxes: "kernels.attention.impl" = "flash",
         ModelAxes: "kernels.attention.qkv_layout" = "fused",
         ModelAxes: "kernels.fusion.conv" = "true",
@@ -214,13 +238,16 @@ rows! {
 }
 
 /// A default changed on purpose: the maintainer's decision by number, the
-/// key and front-end it moves, the value before and after, and whether the
-/// change has landed (until then the front-end resolves `before`).
+/// row it moves (key, front-end and condition), the value before and after,
+/// and whether the change has landed (until then the front-end resolves
+/// `before`).
 #[derive(Debug, Clone, Copy)]
 pub struct Exception {
     pub decision: u32,
     pub key: &'static str,
     pub frontend: Frontend,
+    /// The row's condition: a key may carry a row per condition.
+    pub when: When,
     pub before: &'static str,
     pub after: &'static str,
     pub landed: bool,
@@ -234,6 +261,7 @@ pub const EXCEPTIONS: &[Exception] = &[Exception {
     decision: 36,
     key: "context.prefix.reuse",
     frontend: Frontend::Serve,
+    when: When::Always,
     before: "false",
     after: "true",
     landed: true,
@@ -244,6 +272,7 @@ pub const EXCEPTIONS: &[Exception] = &[Exception {
     decision: 43,
     key: "models.qwen3_5.eos_gate",
     frontend: Frontend::Chat,
+    when: When::Metal,
     before: "false",
     after: "true",
     landed: true,
@@ -253,6 +282,7 @@ pub const EXCEPTIONS: &[Exception] = &[Exception {
     decision: 43,
     key: "models.qwen3_5.eos_gate",
     frontend: Frontend::Serve,
+    when: When::Metal,
     before: "false",
     after: "true",
     landed: true,
@@ -262,6 +292,7 @@ pub const EXCEPTIONS: &[Exception] = &[Exception {
     decision: 43,
     key: "models.qwen3_5.eos_gate_cores",
     frontend: Frontend::Chat,
+    when: When::Metal,
     before: "false",
     after: "true",
     landed: true,
@@ -271,6 +302,7 @@ pub const EXCEPTIONS: &[Exception] = &[Exception {
     decision: 43,
     key: "models.qwen3_5.eos_gate_cores",
     frontend: Frontend::Serve,
+    when: When::Metal,
     before: "false",
     after: "true",
     landed: true,
@@ -280,6 +312,7 @@ pub const EXCEPTIONS: &[Exception] = &[Exception {
     decision: 35,
     key: "decode.readback.queued_steps",
     frontend: Frontend::Chat,
+    when: When::Metal,
     before: "0",
     after: "4",
     landed: true,
@@ -289,23 +322,60 @@ pub const EXCEPTIONS: &[Exception] = &[Exception {
     decision: 35,
     key: "decode.readback.queued_steps",
     frontend: Frontend::Serve,
+    when: When::Metal,
     before: "0",
     after: "4",
     landed: true,
     owner: "#993",
     what: "the lead's queued part is 4 steps on Metal (LGD's L): reply-end latency 1160 -> 280 ms on the 27B; 0 = the batching's lead",
+}, Exception {
+    decision: 52,
+    key: "context.kv.layout",
+    frontend: Frontend::Chat,
+    when: When::DsparkSingle,
+    before: "paged",
+    after: "in-place",
+    landed: true,
+    owner: "#1068",
+    what: "the speculative body at one sequence keeps its preset's in-place KV on Metal: the verify window reads the slab instead of a copy gathered out of the page pool every round; --kv-append paged opts out",
+}, Exception {
+    decision: 52,
+    key: "context.kv.layout",
+    frontend: Frontend::Serve,
+    when: When::DsparkSingle,
+    before: "paged",
+    after: "in-place",
+    landed: true,
+    owner: "#1068",
+    what: "the speculative body at one sequence keeps its preset's in-place KV on Metal: the verify window reads the slab instead of a copy gathered out of the page pool every round; --kv-append paged opts out",
 }];
 
-/// The row of `key` for `frontend`, if the front-end resolves it.
+/// The first row of `key` for `frontend`, if the front-end resolves it.
 pub fn row(key: &str, frontend: Frontend) -> Option<&'static Row> {
-    ROWS.iter().find(|r| r.key == key && r.frontend == frontend)
+    rows_for(key, frontend).next()
+}
+
+/// The rows of `key` for `frontend`, in the order [`apply`] takes them: a
+/// later row whose condition holds overrides an earlier one.
+pub fn rows_for(key: &str, frontend: Frontend) -> impl Iterator<Item = &'static Row> + '_ {
+    ROWS.iter()
+        .filter(move |r| r.key == key && r.frontend == frontend)
+}
+
+/// The value `frontend`'s rows give `key` on `o`, where no layer named it:
+/// the last row whose condition holds, `None` where none holds.
+pub fn resolved(key: &str, frontend: Frontend, o: &EngineOptions) -> Option<&'static str> {
+    rows_for(key, frontend)
+        .filter(|r| r.when.holds(o))
+        .last()
+        .map(value)
 }
 
 /// The exception on a row, if one names it.
 pub fn exception(r: &Row) -> Option<&'static Exception> {
     EXCEPTIONS
         .iter()
-        .find(|e| e.key == r.key && e.frontend == r.frontend)
+        .find(|e| e.key == r.key && e.frontend == r.frontend && e.when == r.when)
 }
 
 /// The value a row resolves to now: its landed exception's, else `before`.
@@ -382,45 +452,105 @@ mod tests {
                 .unwrap_or_else(|e| panic!("{} = {}: {e}", r.key, r.before));
         }
         for e in EXCEPTIONS {
-            let r = row(e.key, e.frontend)
-                .unwrap_or_else(|| panic!("decision {} names no row", e.decision));
-            assert_eq!(r.before, e.before, "decision {}", e.decision);
+            let named: Vec<&Row> = rows_for(e.key, e.frontend)
+                .filter(|r| r.when == e.when)
+                .collect();
+            assert_eq!(named.len(), 1, "decision {} names one row", e.decision);
+            assert_eq!(named[0].before, e.before, "decision {}", e.decision);
             assert_ne!(e.before, e.after, "decision {}", e.decision);
+            assert_eq!(
+                exception(named[0]).map(|x| (x.decision, x.frontend, x.when)),
+                Some((e.decision, e.frontend, e.when)),
+                "decision {} is its row's exception",
+                e.decision
+            );
         }
     }
 
     /// The unset defaults, per front-end: what each front-end resolved
     /// before the option tree, except where a landed exception says
-    /// otherwise; a pending exception changes nothing yet.
+    /// otherwise; a pending exception changes nothing yet. A key with two
+    /// rows takes the last whose condition holds.
     #[test]
     fn each_front_end_resolves_its_defaults_and_only_the_named_exceptions_moved() {
         let idx = index();
         for f in Frontend::ALL {
-            for batch in [1usize, 4] {
-                let mut o = EngineOptions::default();
-                o.scheduler.max_sequences = batch;
+            for (batch, method) in [(1usize, "none"), (4, "none"), (1, "dspark"), (4, "dspark")] {
+                let base = || {
+                    let mut o = EngineOptions::default();
+                    o.scheduler.max_sequences = batch;
+                    o.speculative.method = method.into();
+                    o
+                };
+                let mut o = base();
                 apply(&mut o, f, &BTreeSet::new()).unwrap();
                 let flat = idx.flat(&o);
                 for r in ROWS.iter().filter(|r| r.frontend == f) {
-                    let mut want = EngineOptions::default();
-                    want.scheduler.max_sequences = batch;
-                    if r.when.holds(&want) {
-                        let expect = match exception(r) {
+                    let mut want = base();
+                    let held: Vec<&Row> =
+                        rows_for(r.key, f).filter(|r| r.when.holds(&want)).collect();
+                    if let Some(last) = held.last() {
+                        let expect = match exception(last) {
                             Some(e) if e.landed => e.after,
-                            _ => r.before,
+                            _ => last.before,
                         };
+                        assert_eq!(resolved(r.key, f, &want), Some(expect));
                         idx.set(&mut want, r.key, expect).unwrap();
+                    } else {
+                        assert_eq!(resolved(r.key, f, &want), None);
                     }
                     assert_eq!(
                         flat[r.key],
                         idx.flat(&want)[r.key],
-                        "{} {} at batch {batch}",
+                        "{} {} at batch {batch}, speculative.method {method}",
                         f.name(),
                         r.key
                     );
                 }
             }
         }
+        // The speculative body at one sequence keeps the in-place KV on
+        // chat and serve; at a batch, without a drafter, on the pool preset
+        // and on bench, the paged row (or none) holds.
+        let kv = |f, batch: usize, method: &str, cache: &str| -> Value {
+            let mut o = EngineOptions::default();
+            o.scheduler.max_sequences = batch;
+            o.speculative.method = method.into();
+            o.model.cache = cache.into();
+            apply(&mut o, f, &BTreeSet::new()).unwrap();
+            idx.flat(&o)["context.kv.layout"].clone()
+        };
+        let library = idx.flat(&EngineOptions::default())["context.kv.layout"].clone();
+        let metal = When::ModelAxes.holds(&EngineOptions::default());
+        let typed = |v: &str| {
+            let mut o = EngineOptions::default();
+            idx.set(&mut o, "context.kv.layout", v).unwrap();
+            idx.flat(&o)["context.kv.layout"].clone()
+        };
+        let (in_place, paged) = if metal {
+            (typed("in-place"), typed("paged"))
+        } else {
+            (library.clone(), library.clone())
+        };
+        for f in [Frontend::Chat, Frontend::Serve] {
+            assert_eq!(kv(f, 1, "dspark", "auto"), in_place, "{}", f.name());
+            assert_eq!(kv(f, 4, "dspark", "auto"), paged, "{} at a batch", f.name());
+            assert_eq!(kv(f, 1, "none", "auto"), paged, "{} plain", f.name());
+            assert_eq!(kv(f, 1, "auto", "auto"), paged, "{} method auto", f.name());
+            assert_eq!(
+                kv(f, 1, "dspark", "rewindable"),
+                in_place,
+                "{} rewindable",
+                f.name()
+            );
+            assert_eq!(
+                kv(f, 1, "dspark", "pool-spec"),
+                paged,
+                "{} pool-spec",
+                f.name()
+            );
+        }
+        assert_eq!(kv(Frontend::Bench, 1, "dspark", "auto"), library);
         // The rows by value, so a moved row fails here with its name.
         let at = |f, key: &str, batch: usize| -> Value {
             let mut o = EngineOptions::default();

@@ -35,6 +35,7 @@ const MOVED_ELSEWHERE: &[(&str, &str, &str, &str)] = &[(
 
 const PRE_TREE: &str = "the front-end's own value before the option tree";
 const TUNED_FLOW: &str = "the tuned decode flow as chat's and serve's default (a08b86f5d, #859)";
+const DSPARK_SINGLE: &str = "the tuned flow's paged KV for the speculative body at one sequence (a08b86f5d, #859), which decision 52 (#1068) moves back to its preset's in-place KV";
 const CHAT_SERVE: &[Frontend] = &[Frontend::Chat, Frontend::Serve];
 
 /// Every row of the front-end table by value: key, front-ends, condition,
@@ -191,6 +192,13 @@ const PINNED_ROWS: &[(&str, &[Frontend], When, &str, &str)] = &[
         TUNED_FLOW,
     ),
     (
+        "context.kv.layout",
+        CHAT_SERVE,
+        When::DsparkSingle,
+        "paged",
+        DSPARK_SINGLE,
+    ),
+    (
         "kernels.attention.impl",
         CHAT_SERVE,
         When::ModelAxes,
@@ -290,6 +298,7 @@ fn batch_for(r: &frontend::Row) -> Vec<&'static str> {
         When::Batched => vec!["--batch", "4"],
         // No `--model`: the LFM2 snapshot, whose family takes the model axes.
         When::Always | When::Metal | When::ModelAxes => vec![],
+        When::DsparkSingle => vec!["--dspark"],
     }
 }
 
@@ -338,19 +347,26 @@ fn each_front_end_resolves_its_own_defaults_through_the_command_line() {
     // front-end: the paged pool, FlashDecoding and the fused conv are Metal
     // kernels, and a CPU load must not be refused by its own defaults.
     for f in Frontend::ALL {
-        let o = resolve(Some(f), f.name(), &["--cpu"], &none).unwrap();
-        for r in ROWS
-            .iter()
-            .filter(|r| r.frontend == f && matches!(r.when, When::Metal | When::ModelAxes))
-        {
-            assert!(!r.when.holds(&o), "{} {} holds on --cpu", f.name(), r.key);
-            assert_eq!(
-                at(&o, r.key),
-                at(&EngineOptions::default(), r.key),
-                "{} {} on --cpu",
-                f.name(),
-                r.key
-            );
+        for argv in [&["--cpu"][..], &["--cpu", "--dspark"]] {
+            let o = resolve(Some(f), f.name(), argv, &none).unwrap();
+            for r in ROWS.iter().filter(|r| {
+                r.frontend == f
+                    && matches!(r.when, When::Metal | When::ModelAxes | When::DsparkSingle)
+            }) {
+                assert!(
+                    !r.when.holds(&o),
+                    "{} {} holds on {argv:?}",
+                    f.name(),
+                    r.key
+                );
+                assert_eq!(
+                    at(&o, r.key),
+                    at(&EngineOptions::default(), r.key),
+                    "{} {} on {argv:?}",
+                    f.name(),
+                    r.key
+                );
+            }
         }
     }
     // The shape a front-end loads with, from options no front-end resolved
@@ -378,6 +394,69 @@ fn each_front_end_resolves_its_own_defaults_through_the_command_line() {
     assert_eq!(c.frontend, Some(Frontend::Serve));
 }
 
+/// The speculative body at one sequence takes the in-place KV through the
+/// command line on chat and serve, after the paged row; the KV given by any
+/// spelling holds; at a batch, on the pool preset, without a drafter, with
+/// `auto` (resolved at load, after the rows) and on bench, the row does not
+/// hold.
+#[test]
+fn the_speculative_body_at_one_sequence_keeps_the_in_place_kv() {
+    let none = BTreeMap::new();
+    let key = "context.kv.layout";
+    let kv =
+        |f: Frontend, argv: &[&str]| at(&resolve(Some(f), f.name(), argv, &none).unwrap(), key);
+    let library = at(&EngineOptions::default(), key);
+    let metal = When::ModelAxes.holds(&resolve(Some(Frontend::Chat), "chat", &[], &none).unwrap());
+    let (in_place, paged) = if metal {
+        (typed(key, "in-place"), typed(key, "paged"))
+    } else {
+        (library.clone(), library.clone())
+    };
+    for f in [Frontend::Chat, Frontend::Serve] {
+        let n = f.name();
+        assert_eq!(kv(f, &["--dspark"]), in_place, "{n} --dspark");
+        assert_eq!(
+            kv(f, &["--speculate", "dspark"]),
+            in_place,
+            "{n} --speculate dspark"
+        );
+        assert_eq!(
+            kv(f, &["--dspark", "--kv-append", "paged"]),
+            typed(key, "paged"),
+            "{n} named"
+        );
+        assert_eq!(
+            kv(f, &["--dspark", "--set", "context.kv.layout=cat"]),
+            typed(key, "cat"),
+            "{n} named by key"
+        );
+        let env = BTreeMap::from([("LLOOM_CONTEXT__KV__LAYOUT".to_string(), "paged".to_string())]);
+        assert_eq!(
+            at(&resolve(Some(f), n, &["--dspark"], &env).unwrap(), key),
+            typed(key, "paged"),
+            "{n} named by env"
+        );
+        assert_eq!(
+            kv(f, &["--dspark", "--set", "scheduler.max_sequences=2"]),
+            paged,
+            "{n} at a batch"
+        );
+        assert_eq!(
+            kv(f, &["--dspark", "--set", "models.lfm2.preset=rewindable"]),
+            in_place,
+            "{n} on the rewindable preset"
+        );
+        assert_eq!(
+            kv(f, &["--dspark", "--set", "models.lfm2.preset=pool-spec"]),
+            paged,
+            "{n} on the pool preset"
+        );
+        assert_eq!(kv(f, &["--speculate", "auto"]), paged, "{n} auto");
+        assert_eq!(kv(f, &[]), paged, "{n} plain");
+    }
+    assert_eq!(kv(Frontend::Bench, &["--dspark"]), library, "bench");
+}
+
 /// The front-end table is the pinned one, row for row; each row another
 /// change moved is reported beside the library's value before the option
 /// tree, and none of them is an exception.
@@ -400,11 +479,15 @@ fn every_front_end_row_is_pinned_by_value() {
     );
     assert_eq!(table.len(), pinned.len(), "a row appears twice");
     let (before, _) = before_tree();
-    for &(k, fs, _, v, why) in PINNED_ROWS.iter().filter(|p| p.4 != PRE_TREE) {
-        assert!(
-            EXCEPTIONS.iter().all(|e| e.key != k),
-            "{k} is an approved exception, not a move recorded here"
-        );
+    for &(k, fs, w, v, why) in PINNED_ROWS.iter().filter(|p| p.4 != PRE_TREE) {
+        // A moved row carries an exception only where its source names it.
+        for e in EXCEPTIONS.iter().filter(|e| e.key == k && e.when == w) {
+            assert!(
+                why.contains(&format!("decision {}", e.decision)),
+                "{k} is decision {}'s, which its pin does not name",
+                e.decision
+            );
+        }
         let names: Vec<&str> = fs.iter().map(|f| f.name()).collect();
         eprintln!(
             "[{k}: the library's {} before the option tree; {} now {}: {why}]",
@@ -669,15 +752,23 @@ fn the_unset_defaults_are_the_trees_before_it_except_the_named_exceptions() {
 
     // 3. The approved exceptions, by number.
     for e in EXCEPTIONS {
-        let r = frontend::row(e.key, e.frontend).unwrap();
+        let r = frontend::rows_for(e.key, e.frontend)
+            .find(|r| r.when == e.when)
+            .unwrap();
         let o = resolve(Some(e.frontend), e.frontend.name(), &batch_for(r), &none).unwrap();
         // A landed exception resolves to its `after` where its row holds; a
         // row a build cannot hold (the Metal rows on the CPU-only x86 gate)
-        // leaves the library's value, which is the row's `before`.
-        let want = if e.landed && r.when.holds(&o) { e.after } else { e.before };
+        // leaves the library's value.
+        let want = if !r.when.holds(&o) {
+            at(&EngineOptions::default(), e.key)
+        } else if e.landed {
+            typed(e.key, e.after)
+        } else {
+            typed(e.key, e.before)
+        };
         assert_eq!(
             at(&o, e.key),
-            typed(e.key, want),
+            want,
             "decision {} ({}, landed = {})",
             e.decision,
             e.owner,
@@ -687,8 +778,8 @@ fn the_unset_defaults_are_the_trees_before_it_except_the_named_exceptions() {
     let decided: Vec<u32> = EXCEPTIONS.iter().map(|e| e.decision).collect();
     assert_eq!(
         decided,
-        [36, 43, 43, 43, 43, 35, 35],
-        "the approved default changes: decision 36 (serve reuse), 43 (the gate and its cores arm, chat and serve), 35 (the lead, chat and serve)"
+        [36, 43, 43, 43, 43, 35, 35, 52, 52],
+        "the approved default changes: decision 36 (serve reuse), 43 (the gate and its cores arm, chat and serve), 35 (the lead, chat and serve), 52 (B = 1 DSpark's in-place KV, chat and serve)"
     );
     // 4. Decision 44: the EOS watch stays opt-in on every front-end.
     // Decisions 43/35 (2026-10-19): the gate, its cores arm and the lead of 4

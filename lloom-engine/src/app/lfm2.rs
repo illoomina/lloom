@@ -939,6 +939,10 @@ impl<P: Lfm2Shape> Engine<P> {
             .apply_axes(&mut config)
             .map_err(|e| anyhow::anyhow!("model axes: {e}"))?;
         refuse_kv_quant_shape(&config, &device, opts.batch)?;
+        if let Some(w) = paged_verify_warning(&config, dcfg.is_some(), opts.batch) {
+            eprintln!("[dspark: {}]", w.message);
+            load_warnings.push(w);
+        }
         // The route the model resolves at construction, admitted for the
         // run's purpose before any weight is read.
         let route =
@@ -2937,6 +2941,25 @@ fn refuse_kv_quant_shape(config: &Config, device: &Device, batch: usize) -> Resu
     Ok(())
 }
 
+/// The load warning of a speculative body at one sequence on the paged KV:
+/// every verify window is a multi-row pass, which on the pool attends over a
+/// copy of the cache gathered out of it, a per-round cost that grows with
+/// the context and that the in-place KV does not pay (`speculation.md`
+/// §10.2z-x). `None` on every other shape.
+fn paged_verify_warning(config: &Config, speculative: bool, batch: usize) -> Option<LoadWarning> {
+    (speculative && batch == 1 && config.kv_append == KvAppend::Paged).then(|| {
+        LoadWarning::new(
+            LoadWarningKind::Speculation,
+            "at --batch 1 the speculative body runs on the paged KV (`context.kv.layout = paged`), \
+             whose verify window attends over a copy of the cache gathered out of the pool every \
+             round, ~3 ms a round per 1000 tokens of context; the in-place KV \
+             (`--kv-append in-place`, chat's and serve's default here) reads it where it lies. \
+             Serving it as asked."
+                .to_string(),
+        )
+    })
+}
+
 /// Whether the conv's left-context carry must be on: a prefill fed in more
 /// than one forward — a tile, a chunk, the spark's ramp — or onto a cache a
 /// held sequence extends zero-pads each piece's left edge without it, and
@@ -3492,6 +3515,34 @@ mod tests {
         c.kv_quant = quant;
         c.kv_append = append;
         c
+    }
+
+    /// The speculative body at one sequence on the paged KV is named on the
+    /// load-warning channel; the in-place and cat KVs, no drafter and a
+    /// batch stay silent.
+    #[test]
+    fn a_paged_speculative_body_at_one_sequence_warns() {
+        let w = paged_verify_warning(&config(KvQuant::Off, KvAppend::Paged), true, 1)
+            .expect("the paged KV under a drafter at one sequence warns");
+        assert_eq!(w.kind, LoadWarningKind::Speculation);
+        assert!(
+            w.message.contains("context.kv.layout = paged")
+                && w.message.contains("--kv-append in-place"),
+            "{}",
+            w.message
+        );
+        for (append, speculative, batch) in [
+            (KvAppend::InPlace, true, 1),
+            (KvAppend::Cat, true, 1),
+            (KvAppend::Paged, false, 1),
+            (KvAppend::Paged, true, 4),
+        ] {
+            assert_eq!(
+                paged_verify_warning(&config(KvQuant::Off, append), speculative, batch),
+                None,
+                "{append:?} speculative={speculative} batch={batch}"
+            );
+        }
     }
 
     #[test]

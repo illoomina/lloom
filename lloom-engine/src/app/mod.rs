@@ -770,23 +770,27 @@ pub fn command() -> clap::Command {
                 .filter_map(|a| {
                     let help = a.get_help()?.to_string();
                     let key = help.split("[key: ").nth(1)?.split(']').next()?.to_string();
-                    let r = crate::frontend::row(&key, f)?;
-                    let when = match r.when.describe() {
-                        "" => String::new(),
-                        w => format!(" when {w}"),
-                    };
-                    let change = match crate::frontend::exception(r) {
-                        Some(e) if !e.landed => {
-                            format!("; decision {}: {} once landed", e.decision, e.after)
-                        }
-                        _ => String::new(),
-                    };
+                    let parts: Vec<String> = crate::frontend::rows_for(&key, f)
+                        .map(|r| {
+                            let when = match r.when.describe() {
+                                "" => String::new(),
+                                w => format!(" when {w}"),
+                            };
+                            let change = match crate::frontend::exception(r) {
+                                Some(e) if !e.landed => {
+                                    format!("; decision {}: {} once landed", e.decision, e.after)
+                                }
+                                _ => String::new(),
+                            };
+                            format!("{}{when}{change}", crate::frontend::value(r))
+                        })
+                        .collect();
+                    if parts.is_empty() {
+                        return None;
+                    }
                     Some((
                         a.get_id().to_string(),
-                        format!(
-                            "{help} [unset here: {}{when}{change}]",
-                            crate::frontend::value(r)
-                        ),
+                        format!("{help} [unset here: {}]", parts.join("; ")),
                     ))
                 })
                 .collect();

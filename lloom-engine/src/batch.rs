@@ -391,6 +391,20 @@ pub struct BatchScheduler<'m, M: BatchedCausalLM, E> {
     counters: BatchCounters,
     /// Under the static mode, the rows the current batch used, by pool slot.
     on_counters: Option<CountersHook>,
+    /// The open profile window, under the profile build's recorder.
+    #[cfg(feature = "metal")]
+    window: Option<ProfileWindow>,
+    #[cfg(feature = "metal")]
+    windows: u64,
+}
+
+/// One batch window under the profile build's recorder (`CANDLE_METAL_PROFILE=1`):
+/// from an admission onto an idle engine until nothing is live, every step's
+/// composition with its host interval in the GPU's clock.
+#[cfg(feature = "metal")]
+struct ProfileWindow {
+    started: std::time::Instant,
+    steps: Vec<(u64, f64, f64, lloom::nn::StepReport)>,
 }
 
 /// What [`spawn`] needs to build the scheduler on its thread.
@@ -464,6 +478,10 @@ where
             rx,
             counters: BatchCounters::default(),
             on_counters: cfg.on_counters,
+            #[cfg(feature = "metal")]
+            window: None,
+            #[cfg(feature = "metal")]
+            windows: 0,
         })
     }
 
@@ -800,6 +818,11 @@ where
                 self.decoder.cancel(*id);
             }
         }
+        #[cfg(feature = "metal")]
+        let t0 = self.window.as_ref().map(|_| {
+            lloom_tensor::kernels::metal::profile::set_step(self.counters.steps);
+            lloom_tensor::kernels::metal::profile::now_s()
+        });
         let inflight = &self.inflight;
         let report = self.decoder.step(&mut |row, ids| {
             if let Some(f) = inflight.get(&row) {
@@ -810,6 +833,11 @@ where
             }
             Ok(())
         })?;
+        #[cfg(feature = "metal")]
+        if let (Some(w), Some(t0)) = (self.window.as_mut(), t0) {
+            let t1 = lloom_tensor::kernels::metal::profile::now_s();
+            w.steps.push((self.counters.steps, t0, t1, report));
+        }
         self.counters.steps += 1;
         self.counters.max_live = self.counters.max_live.max(report.live);
         self.counters.max_pieces = self.counters.max_pieces.max(report.pieces);
@@ -973,6 +1001,92 @@ where
         Ok(())
     }
 
+    /// Open a profile window when requests arrive on an idle engine and the
+    /// profile build's recorder is on: the counters start from zero.
+    #[cfg(feature = "metal")]
+    fn open_window(&mut self) {
+        use lloom_tensor::kernels::metal::profile;
+        if self.window.is_some()
+            || self.waiting.is_empty()
+            || !self.nothing_live()
+            || !profile::recorder_enabled()
+        {
+            return;
+        }
+        if self.device.synchronize().is_err() {
+            return;
+        }
+        profile::reset();
+        self.window = Some(ProfileWindow {
+            started: std::time::Instant::now(),
+            steps: Vec::new(),
+        });
+    }
+
+    /// Close the window once nothing is live and nothing waits: the GPU's
+    /// busy union against the window's wall on stderr, and under
+    /// `diagnostics.gpu_profile.dump` the command buffers
+    /// (`<dump>.batch<n>.csv`) and the steps (`<dump>.batch<n>.steps.csv`).
+    #[cfg(feature = "metal")]
+    fn close_window(&mut self) {
+        use lloom_tensor::kernels::metal::profile;
+        if self.window.is_none() || !self.nothing_live() || !self.waiting.is_empty() {
+            return;
+        }
+        let w = self.window.take().expect("checked");
+        let _ = self.device.synchronize();
+        let wall = w.started.elapsed().as_secs_f64();
+        let s = profile::snapshot();
+        let idle: f64 = s.idle_gaps.iter().map(|g| g.idle).sum();
+        let starved: f64 = s.idle_gaps.iter().map(|g| g.starved).sum();
+        let n = self.windows;
+        self.windows += 1;
+        eprintln!(
+            "[profile: batch window {n}: {} steps, {} with pieces, {} holding rows; gpu_busy_union {:.4} s /              wall {:.4} s = {:.4} busy/wall; {} command buffers, idle between them {:.4} s (starved {:.4} s)]",
+            w.steps.len(),
+            w.steps.iter().filter(|x| x.3.pieces > 0).count(),
+            w.steps.iter().filter(|x| x.3.held > 0).count(),
+            s.gpu_busy_union_s,
+            wall,
+            s.gpu_busy_union_s / wall.max(1e-9),
+            s.timed_command_buffers,
+            idle,
+            starved,
+        );
+        let Some(path) = lloom_tensor::tuning::tuning()
+            .instrument
+            .profile_dump
+            .clone()
+        else {
+            return;
+        };
+        let mut cb = String::from("step,committed_s,start_s,end_s\n");
+        for r in &s.command_buffer_records {
+            cb.push_str(&format!(
+                "{},{:.6},{:.6},{:.6}\n",
+                r.step, r.committed, r.interval.start, r.interval.end
+            ));
+        }
+        let mut st = String::from(
+            "step,host_start_s,host_end_s,live,held,pieces,piece_tokens,retired,pending\n",
+        );
+        for (step, t0, t1, r) in &w.steps {
+            st.push_str(&format!(
+                "{step},{t0:.6},{t1:.6},{},{},{},{},{},{}\n",
+                r.live, r.held, r.pieces, r.piece_tokens, r.retired, r.pending
+            ));
+        }
+        for (p, body) in [
+            (format!("{path}.batch{n}.csv"), cb),
+            (format!("{path}.batch{n}.steps.csv"), st),
+        ] {
+            match std::fs::write(&p, body) {
+                Ok(()) => eprintln!("[profile: wrote {p}]"),
+                Err(e) => eprintln!("[profile: writing {p} failed: {e}]"),
+            }
+        }
+    }
+
     /// The loop, until shutdown or every sender is dropped.
     fn run(mut self) {
         loop {
@@ -992,6 +1106,8 @@ where
             match self.mode {
                 BatchMode::Continuous => {
                     if self.closed.is_empty() {
+                        #[cfg(feature = "metal")]
+                        self.open_window();
                         self.admit_waiting();
                     }
                     if !self.decoder.is_idle() {
@@ -1013,6 +1129,8 @@ where
                             }
                         }
                     }
+                    #[cfg(feature = "metal")]
+                    self.close_window();
                 }
                 BatchMode::Static(_) => {
                     if self.closed.is_empty() && !self.waiting.is_empty() {

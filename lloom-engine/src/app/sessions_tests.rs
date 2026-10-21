@@ -554,3 +554,42 @@ fn a_concurrent_turn_on_one_session_keeps_only_the_first() {
     );
     assert!(t.resolve(&y.id.encode(), None, false, now).is_err());
 }
+
+/// The end-of-turn id after a reply the model ended is in the session's ids —
+/// the next prompt carries it — but the engine never ran it: what a
+/// continuation reports as carried is the prompt and the reply.
+#[test]
+fn the_end_of_turn_id_is_the_sessions_but_not_the_engines() {
+    let mut t = Table::new(cfg(4, true));
+    let now = Instant::now();
+    let s1 = scopes(1);
+    let r = t.reserve(
+        Plan {
+            continued: None,
+            store: Some(true),
+            auth: None,
+            prompt_ids: &[1, 2],
+            scopes: &s1,
+        },
+        now,
+    );
+    assert!(t.commit(
+        r,
+        Record {
+            messages: vec![json!({ "role": "user", "content": 0 })],
+            reply_msg: json!({ "role": "assistant", "content": "r" }),
+            prompt_ids: vec![1, 2],
+            reply: reply(&[3]),
+            eot: Some(9),
+            scope: Scope::test(1),
+            prefix: None,
+        },
+        now,
+    ));
+    let x = t.resolve(&r.id.encode(), None, false, now).unwrap();
+    assert_eq!(
+        x.ids,
+        vec![1, 2, 3],
+        "the engine held the prompt and the reply"
+    );
+}

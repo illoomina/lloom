@@ -89,6 +89,9 @@ struct Turn {
     prefix: Option<PrefixRecord>,
     /// The session's ids through this turn's reply.
     ids_end: usize,
+    /// The last of them is the end-of-turn id the template writes for the
+    /// position the model's EOS took: the engine never ran it.
+    eot: bool,
 }
 
 struct Session {
@@ -127,7 +130,8 @@ pub struct Resolved {
     /// The conversation through the continued turn, its reply message last
     /// (asked for by the `input` form).
     pub messages: Option<Vec<Value>>,
-    /// The session's ids through the continued turn.
+    /// The session's ids the engine held after the continued turn: its
+    /// prompt and its reply, not the end-of-turn id after them.
     pub ids: Vec<u32>,
     /// Times the session found the engine serving another, before this
     /// request.
@@ -395,7 +399,7 @@ impl Table {
             bound,
             prefix,
             messages: msgs,
-            ids: s.ids[..turn.ids_end.min(s.ids.len())].to_vec(),
+            ids: s.ids[..(turn.ids_end - usize::from(turn.eot)).min(s.ids.len())].to_vec(),
             switches: s.switches,
         })
     }
@@ -512,7 +516,10 @@ impl Table {
             .count();
         s.turns.truncate(kept);
         for t in &mut s.turns {
-            t.ids_end = t.ids_end.min(lcp);
+            if t.ids_end > lcp {
+                t.ids_end = lcp;
+                t.eot = false;
+            }
             if t.prefix.as_ref().is_some_and(|p| p.ids_len > lcp) {
                 t.prefix = None;
             }
@@ -552,6 +559,7 @@ impl Table {
             reply: rec.reply,
             prefix: rec.prefix,
             ids_end: ids.len(),
+            eot: rec.eot.is_some(),
         });
         let bytes = ids.len() * 4 + json_bytes(&messages);
         s.ids = ids;

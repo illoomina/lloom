@@ -3787,9 +3787,13 @@ fn session_id(body: &Value) -> String {
 /// and the engine extends the session's log, replaying nothing; the
 /// `messages` form with the same history builds the same prompt, by
 /// reference.
+/// A tiny family: its name, its checkpoint writer, whether it is a GGUF (its
+/// tokenizer beside it).
+type Family = (&'static str, fn(&Path) -> PathBuf, bool);
+
 #[test]
 fn serve_continues_a_conversation_by_its_completion_id() {
-    let families: [(&str, fn(&Path) -> PathBuf, bool); 3] = [
+    let families: [Family; 3] = [
         ("qwen4exp", write::<Qwen4ExpTiny>, true),
         ("qwen3_5", write::<Qwen3_5Tiny>, true),
         ("lfm2", write::<Lfm2Tiny>, false),

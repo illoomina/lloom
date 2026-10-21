@@ -3157,6 +3157,7 @@ fn resolve_prefill_batch<P: Lfm2Shape>(
     } else {
         asked.min(opts.batch)
     };
+    #[cfg_attr(not(feature = "metal"), allow(unused_mut))]
     let mut bound = (asked > opts.batch).then_some("at most the batch width");
     #[cfg(feature = "metal")]
     if let Device::Metal(m) = device {

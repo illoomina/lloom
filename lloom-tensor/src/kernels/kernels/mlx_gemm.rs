@@ -2227,7 +2227,7 @@ mod tile_config_gate {
         let shape = |t: TileConfig| (t.bm, t.bn, t.bk, t.wm, t.wn);
         let narrow = (64, 32, 32, 2, 2);
         let wide = (64, 64, 16, 1, 2);
-        for m in [171, 344, 374, NARROW_PROJECTION_MAX_M] {
+        for m in [171, 344, 374, 512] {
             for (label, _, n, k) in SITES {
                 let want = match *label {
                     "w1 (gate)" | "w3 (up)" | "lm_head" => wide,
@@ -2256,7 +2256,13 @@ mod tile_config_gate {
         let shape = |t: TileConfig| (t.bm, t.bn, t.bk, t.wm, t.wn);
         let narrow = (64, 32, 32, 2, 2);
         let wide = (64, 64, 16, 1, 2);
-        let max_m = NARROW_PROJECTION_MAX_M;
+        // The prefill tile, the largest m measured per shape: the literal,
+        // so a moved constant fails here rather than moving the test.
+        let max_m = 512;
+        assert_eq!(
+            NARROW_PROJECTION_MAX_M, max_m,
+            "the class ends at the prefill tile"
+        );
         for (n, k) in [(2048, 2048), (6144, 2048)] {
             assert_eq!(shape(tile_at(max_m, n, k)), narrow, "{n}x{k} at m={max_m}");
             assert_eq!(

@@ -3116,3 +3116,459 @@ fn an_open_reply_sent_back_empty_goes_as_sent_under_log_too() {
         );
     }
 }
+
+/// [`build`], continuing a session by its reference ([`ByRef`]).
+fn build_by(
+    front: &Front,
+    engine: &dyn Served,
+    messages: &Value,
+    want: Option<bool>,
+    by: &ByRef<'_>,
+) -> Prompt {
+    front
+        .prompt_by(
+            engine,
+            Request {
+                messages,
+                kwargs: kw(engine, want),
+                want,
+                add_bos: true,
+                expand: None,
+                history: None,
+            },
+            by,
+        )
+        .unwrap()
+}
+
+/// A reply as the chat route returns it (decision 51 Q2): its reasoning in
+/// `reasoning_content`, `content` the answer alone.
+fn returned(reply: &Reply) -> Value {
+    match reply.block {
+        Block::None => assistant(&reply.text),
+        _ => json!({
+            "role": "assistant",
+            "content": reply.content_text,
+            "reasoning_content": reply.reasoning_text,
+        }),
+    }
+}
+
+/// The log a turn leaves: its prompt, the ids the model emitted, and the
+/// end-of-turn id where it ended the turn itself (decision 51 Q1).
+fn log_after(front: &Front, prompt: &[u32], sampled: &[u32], stop: Stop) -> Vec<u32> {
+    let mut log: Vec<u32> = prompt.iter().chain(sampled).copied().collect();
+    if stop == Stop::Eos {
+        if let Some((id, _)) = front.constants().and_then(|c| c.eot()) {
+            log.push(id);
+        }
+    }
+    log
+}
+
+/// A turn continued by its session's reference (`docs/sessions.md` §5.1), on
+/// every cached checkpoint's template, every think mode, persisted and
+/// stripped: the prompt is the one the full path builds — the same ids — and
+/// the history before the reply is the turn's recorded ids, none of them
+/// tokenized again. Where decision 51 says the next prompt extends the log, it
+/// does.
+#[test]
+fn a_turn_continued_by_reference_builds_the_full_paths_prompt_from_the_recorded_ids() {
+    let system = json!({ "role": "system", "content": "You answer in one word." });
+    let user1 = user("What is the capital of France?");
+    let user2 = user("And Germany?");
+    let mut ran = 0;
+    for (repo, bos, caps) in AUDITED {
+        let Some(engine) = cached(repo, bos, caps) else {
+            continue;
+        };
+        let name = repo.rsplit("--").next().unwrap();
+        for want in wants(&engine) {
+            for persist in [None, Some(false)] {
+                let front = Front::new(
+                    &engine,
+                    SessionOptions {
+                        persist,
+                        ..SessionOptions::default()
+                    },
+                );
+                if front.persist_unsupported().is_some() {
+                    continue;
+                }
+                let one = json!([system, user1]);
+                let record = ByRef {
+                    record: true,
+                    ..ByRef::default()
+                };
+                let p1 = build_by(&front, &engine, &one, want, &record);
+                let rec = p1.record.clone().unwrap_or_else(|| {
+                    panic!("{name} want={want:?} persist={persist:?}: no prefix recorded")
+                });
+                assert!(
+                    rec.ids_len > 0 && rec.ids_len < p1.ids.len(),
+                    "{name}: the prefix ends before the generation prompt"
+                );
+                let th = p1.thinking.unwrap();
+                let text = if th.on {
+                    let end = engine.token_str(engine.think_tags().unwrap().end);
+                    format!("Paris is the capital.\n{end}\n\nParis.")
+                } else {
+                    "Paris.".to_string()
+                };
+                let sampled = engine.enc(&text);
+                let d = decoded(&engine, sampled.clone());
+                let (_, reply) = front.record_reply(&engine, p1.origin, &d);
+                let reply = reply.expect("the reply is logged");
+                let history = json!([system, user1, returned(&reply), user2]);
+                let full = build_by(&front, &engine, &history, want, &ByRef::default());
+                let bound = [Bound {
+                    scope: p1.origin.scope,
+                    reply: Arc::clone(&reply),
+                }];
+                let by_id = build_by(
+                    &front,
+                    &engine,
+                    &history,
+                    want,
+                    &ByRef {
+                        bound: &bound,
+                        prefix: Some((&rec, &p1.ids)),
+                        record: true,
+                    },
+                );
+                let tag = format!("{name} want={want:?} persist={persist:?}");
+                eprintln!(
+                    "BY-ID {tag}: prompt {} ids, recorded {}, tokenized {} (full path {}), bound {}",
+                    by_id.ids.len(),
+                    by_id.recorded,
+                    by_id.encoded,
+                    full.encoded,
+                    by_id.spliced.bound
+                );
+                assert_eq!(by_id.ids, full.ids, "{tag}: the prompt is the full path's");
+                assert_eq!(
+                    by_id.recorded, rec.ids_len,
+                    "{tag}: the history taken as recorded"
+                );
+                assert_eq!(
+                    by_id.spliced.bound, 1,
+                    "{tag}: the reply bound by reference"
+                );
+                assert_eq!(full.spliced.bound, 0, "{tag}");
+                // Every id before the reply was the record's: what was
+                // tokenized is what the full path tokenized past it (the BOS
+                // an encode does not write is the record's too).
+                let bos = usize::from(engine.text.bos_id.is_some_and(|b| {
+                    p1.ids.first() == Some(&b) && !p1.text.starts_with(&engine.text.bos_token)
+                }));
+                assert_eq!(
+                    by_id.encoded + rec.ids_len - bos,
+                    full.encoded,
+                    "{tag}: no id of the history tokenized again"
+                );
+                assert_eq!(
+                    by_id.record.as_ref().map(|r| r.ids_len),
+                    full.record_len(&front, &engine, &history, want),
+                    "{tag}: the next turn's record is the full path's"
+                );
+                let engine_closed = th.by == By::Engine;
+                if persist != Some(false) && !engine_closed {
+                    let log = log_after(&front, &p1.ids, &sampled, Stop::Eos);
+                    assert!(
+                        by_id.ids.starts_with(&log),
+                        "{tag}: the next prompt extends the session's log"
+                    );
+                }
+            }
+        }
+        ran += 1;
+    }
+    if ran == 0 {
+        eprintln!("skipped: no checkpoint template in the Hugging Face cache");
+    }
+}
+
+impl Prompt {
+    /// The record this prompt's full-path twin would leave, for comparing.
+    fn record_len(
+        &self,
+        front: &Front,
+        engine: &dyn Served,
+        messages: &Value,
+        want: Option<bool>,
+    ) -> Option<usize> {
+        let record = ByRef {
+            record: true,
+            ..ByRef::default()
+        };
+        build_by(front, engine, messages, want, &record)
+            .record
+            .map(|r| r.ids_len)
+    }
+}
+
+/// A reply the client restructured (`docs/sessions.md` §5.1): the reference
+/// client's shim parses a tool call out of our text into `tool_calls` and
+/// sends the message back with an empty `content`. By text it is no reply of
+/// ours (§2.3d: "tokenized as sent"); by reference it is, and where the
+/// template renders the call back to the model's bytes the turn takes the
+/// sampled ids — here deliberately not the text's canonical tokenization, so
+/// re-tokenizing would leave the log inside the reply.
+#[test]
+fn a_reply_the_client_restructured_is_ours_by_reference() {
+    let user1 = user("Weather in Paris?");
+    let user2 = user("And tomorrow?");
+    let call = json!({
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [{ "type": "function",
+            "function": { "name": "get_weather", "arguments": { "city": "Paris" } } }],
+    });
+    let mut ran = 0;
+    let mut checked = 0;
+    for (repo, bos, caps) in AUDITED {
+        let Some(engine) = cached(repo, bos, caps) else {
+            continue;
+        };
+        let name = repo.rsplit("--").next().unwrap();
+        let template = engine.text.template.as_ref().unwrap();
+        for want in wants(&engine) {
+            let front = Front::new(&engine, SessionOptions::default());
+            let one = json!([user1]);
+            let record = ByRef {
+                record: true,
+                ..ByRef::default()
+            };
+            let p1 = build_by(&front, &engine, &one, want, &record);
+            // What the model emits for the call: the template's own rendering
+            // of it after the generation prompt, up to the turn's end.
+            let render = |m: &Value, gen: bool| {
+                template
+                    .render_with(m, &engine.text.bos_token, &p1.kwargs, gen)
+                    .unwrap()
+            };
+            let gen = render(&one, true);
+            let with = render(&json!([user1, call]), false);
+            let Some((_, marker)) = front.constants().and_then(|c| c.eot()) else {
+                continue;
+            };
+            let Some(text) = with
+                .strip_prefix(gen.as_str())
+                .and_then(|rest| rest.rfind(marker).map(|i| rest[..i].to_string()))
+                .filter(|t| t.contains("get_weather") && t.contains("Paris"))
+            else {
+                eprintln!("RESTRUCTURED {name} want={want:?}: the template does not render the call after its generation prompt; skipped");
+                continue;
+            };
+            // Sampled as two runs split inside a word: decodes to the same
+            // text, is not its canonical tokenization.
+            let cut = text.find("weather").unwrap() + 3;
+            let mut sampled = engine.enc(&text[..cut]);
+            sampled.extend(engine.enc(&text[cut..]));
+            let canonical = engine.enc(&text);
+            assert_ne!(sampled, canonical, "{name}: the split is not canonical");
+            let d = decoded(&engine, sampled.clone());
+            assert_eq!(d.text, text, "{name}: the split decodes to the text");
+            let (_, reply) = front.record_reply(&engine, p1.origin, &d);
+            let reply = reply.unwrap();
+            let history = json!([user1, call, user2]);
+            let full = build_by(&front, &engine, &history, want, &ByRef::default());
+            let bound = [Bound {
+                scope: p1.origin.scope,
+                reply: Arc::clone(&reply),
+            }];
+            let rec = p1.record.clone().unwrap();
+            let by_id = build_by(
+                &front,
+                &engine,
+                &history,
+                want,
+                &ByRef {
+                    bound: &bound,
+                    prefix: Some((&rec, &p1.ids)),
+                    record: true,
+                },
+            );
+            let log = log_after(&front, &p1.ids, &sampled, Stop::Eos);
+            let kept = |ids: &[u32]| ids.iter().zip(&log).take_while(|(a, b)| a == b).count();
+            eprintln!(
+                "RESTRUCTURED {name} want={want:?}: by text matched {} and leaves the log at {:+}; \
+                 by reference bound {} emitted {} and leaves it at {:+}",
+                full.spliced.matched,
+                kept(&full.ids) as i64 - log.len() as i64,
+                by_id.spliced.bound,
+                by_id.spliced.emitted,
+                kept(&by_id.ids) as i64 - log.len() as i64,
+            );
+            assert_eq!(
+                full.spliced.matched, 0,
+                "{name} want={want:?}: by text, not ours"
+            );
+            assert!(
+                kept(&full.ids) < log.len(),
+                "{name} want={want:?}: re-tokenized, it leaves the log"
+            );
+            assert_eq!(by_id.spliced.bound, 1, "{name} want={want:?}");
+            assert_eq!(
+                by_id.spliced.emitted, 1,
+                "{name} want={want:?}: rendered from the emitted ids"
+            );
+            assert!(
+                by_id.ids.starts_with(&log),
+                "{name} want={want:?}: by reference the next prompt extends the log"
+            );
+            checked += 1;
+        }
+        ran += 1;
+    }
+    if ran == 0 {
+        eprintln!("skipped: no checkpoint template in the Hugging Face cache");
+        return;
+    }
+    assert!(checked > 0, "no cached template rendered the call");
+}
+
+/// A reply that begins with whitespace the template also writes before it —
+/// the newline after an empty reasoning block opened by the generation
+/// prompt, `<think>\n` + `\n</think>…` — is rendered from the emitted ids
+/// where its own bytes begin, so the template's whitespace and the reply's
+/// are not both in the prompt.
+#[test]
+fn a_reply_that_begins_with_whitespace_is_emitted_where_its_bytes_begin() {
+    let user1 = user("Hi");
+    let user2 = user("And again?");
+    let mut ran = 0;
+    for (repo, bos, caps) in AUDITED {
+        let Some(engine) = cached(repo, bos, caps) else {
+            continue;
+        };
+        let name = repo.rsplit("--").next().unwrap();
+        for want in wants(&engine) {
+            let end = match engine.think_tags() {
+                Some(t) => engine.token_str(t.end),
+                None => continue,
+            };
+            for text in [
+                format!("\n{end}\n\nHello."),
+                format!("\nOk.\n{end}\n\nHello."),
+            ] {
+                // A front of its own per reply: two replies of one
+                // conversation with one content would be ambiguous.
+                let front = Front::new(&engine, SessionOptions::default());
+                let one = json!([user1]);
+                let p1 = build(&front, &engine, &one, want);
+                let th = p1.thinking.unwrap();
+                if !th.on || th.by == By::Engine {
+                    continue;
+                }
+                let sampled = engine.enc(&text);
+                let d = decoded(&engine, sampled.clone());
+                assert!(front.record(&engine, p1.origin, &d));
+                let reply = front.reply(&d.text).unwrap();
+                let history = json!([user1, returned(&reply), user2]);
+                let p2 = build(&front, &engine, &history, want);
+                let log = log_after(&front, &p1.ids, &sampled, Stop::Eos);
+                let kept = p2.ids.iter().zip(&log).take_while(|(a, b)| a == b).count();
+                let shown = engine.text.tokenizer.decode(&p2.ids, false).unwrap();
+                eprintln!(
+                    "LEADING-WS {name} want={want:?} {text:?}: leaves the log at {:+}, emitted {}",
+                    kept as i64 - log.len() as i64,
+                    p2.spliced.emitted
+                );
+                assert!(
+                    p2.ids.starts_with(&log),
+                    "{name} want={want:?} {text:?}: the next prompt extends the log; it \
+                     reads {shown:?}"
+                );
+                assert_eq!(p2.spliced.matched, 1, "{name} want={want:?} {text:?}");
+                ran += 1;
+            }
+        }
+    }
+    if ran == 0 {
+        eprintln!("skipped: no cached template opens a block in its generation prompt");
+    }
+}
+
+/// A recorded prefix stands only for the text it was recorded over: a history
+/// whose earlier text changed — a harness's updated system prompt, here of the
+/// same length, so every opening falls where it fell — takes none of it, and
+/// is the full path's prompt. On every tiny template, every think mode.
+#[test]
+fn a_prefix_the_history_no_longer_renders_is_not_taken() {
+    let sys = |s: &str| json!({ "role": "system", "content": s });
+    let user1 = user("What is the capital of France?");
+    let user2 = user("And Germany?");
+    for engine in [Stub::lfm2(), Stub::qwen3_5(), Stub::qwen4exp()] {
+        for want in wants(&engine) {
+            let front = Front::new(&engine, SessionOptions::default());
+            let record = ByRef {
+                record: true,
+                ..ByRef::default()
+            };
+            let p1 = build_by(
+                &front,
+                &engine,
+                &json!([sys("Terse. AAAA"), user1]),
+                want,
+                &record,
+            );
+            let rec = p1.record.clone().expect("a prefix recorded");
+            let d = decoded(&engine, engine.enc("Paris."));
+            let (_, reply) = front.record_reply(&engine, p1.origin, &d);
+            let reply = reply.unwrap();
+            let history = json!([sys("Terse. BBBB"), user1, returned(&reply), user2]);
+            let full = build_by(&front, &engine, &history, want, &ByRef::default());
+            let bound = [Bound {
+                scope: p1.origin.scope,
+                reply,
+            }];
+            let by_id = build_by(
+                &front,
+                &engine,
+                &history,
+                want,
+                &ByRef {
+                    bound: &bound,
+                    prefix: Some((&rec, &p1.ids)),
+                    record: true,
+                },
+            );
+            assert_eq!(
+                by_id.recorded, 0,
+                "want={want:?}: the old prefix is not this text"
+            );
+            assert_eq!(
+                by_id.spliced.bound, 0,
+                "want={want:?}: nor is the reply's scope"
+            );
+            assert_eq!(by_id.ids, full.ids, "want={want:?}");
+            // The same history, unchanged, takes it.
+            let same = json!([
+                sys("Terse. AAAA"),
+                user1,
+                returned(&front.reply("Paris.").unwrap()),
+                user2
+            ]);
+            let again = build_by(
+                &front,
+                &engine,
+                &same,
+                want,
+                &ByRef {
+                    bound: &bound,
+                    prefix: Some((&rec, &p1.ids)),
+                    record: true,
+                },
+            );
+            assert_eq!(
+                again.recorded, rec.ids_len,
+                "want={want:?}: the control takes it"
+            );
+            assert_eq!(
+                again.ids,
+                build_by(&front, &engine, &same, want, &ByRef::default()).ids
+            );
+        }
+    }
+}

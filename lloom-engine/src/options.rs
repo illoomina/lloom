@@ -1845,6 +1845,23 @@ pub struct SessionConfig {
     /// A past reply of ours whose run ended inside its reasoning block (`max_tokens`, a stop string, a cancellation): `reasoning` (the default) gives it to the template as the open reasoning it is, which the template closes or drops; `text` renders it as the text the client got; `recover` renders it as text and places the turn checkpoint before the divergence that makes.
     #[opt(flag = "incomplete-reasoning", parser = "parse_incomplete_reasoning", variants = ["text", "reasoning", "recover"], path = "session.incomplete_reasoning", status = "advanced")]
     pub incomplete_reasoning: String,
+    /// Seconds a session a chat completion's `id` names is kept after its last use (`store: true`; `docs/sessions.md` §4).
+    #[opt(flag = "session-ttl", path = "session.ttl_s", status = "advanced")]
+    pub ttl_s: usize,
+    /// Stored sessions kept at once; past it the least recently used goes.
+    #[opt(
+        flag = "session-capacity",
+        path = "session.capacity",
+        status = "advanced"
+    )]
+    pub capacity: usize,
+    /// MiB of host memory the stored sessions' ids and messages may hold; past it the least recently used go.
+    #[opt(
+        flag = "session-max-mib",
+        path = "session.max_mib",
+        status = "advanced"
+    )]
+    pub max_mib: usize,
 }
 
 impl Default for SessionConfig {
@@ -1854,6 +1871,9 @@ impl Default for SessionConfig {
             missing_reasoning: "as-sent".into(),
             keep_logprobs: "none".into(),
             incomplete_reasoning: "reasoning".into(),
+            ttl_s: 3600,
+            capacity: 64,
+            max_mib: 64,
         }
     }
 }

@@ -4,21 +4,17 @@ What has been measured, how, and what it does not show. Numbers here are
 reproducible measurements with their exact source and configuration; they are
 not throughput promises for other models, hardware, backends or file formats.
 
-**Status (2026-10-20, pre-release snapshot).** The cross-engine tables below are
-the measurement of 2026-10-19 on `dev` `9bc89074a`. Several changes landed on
-the engine after it and are **not** reflected in these numbers; the matrix is
-scheduled to be re-run on the release's defaults, and this page will be updated
-with the re-run, not retouched:
-
-- the f16 verify-window rows (speculative decode draws its window through a
-  multi-row f16 GEMV instead of the 16-row GEMM; DSpark on a prose prompt
-  measured 77 → 96 tok/s in `lloom chat`, single runs, not cross-engine);
-- the turn-reuse defaults on Metal (the EOS gate and a queued readback lead,
-  so multi-turn requests reuse the cached conversation instead of
-  re-prefilling it);
-- history rendered from the model's own emitted ids, `reasoning_content` on
-  the API, and a request whose sampler cannot ride the device readback ring
-  taking the blocking arm with a warning instead of an error.
+**Status (2026-10-21, pre-release).** The cross-engine tables below are the
+re-run of 2026-10-21 on the release's defaults (`dev` `3f6375fe2`), replacing
+the 2026-10-19 matrix. Everything the pre-release landed is in them: the
+one-attention-route and buffer-ownership checkpoints (#985), history rendered
+from the model's emitted ids (decision 51), the host sampling contract, the
+producer-driven commit for host/IO inputs (#944), the f16 verify-window rows
+(#942), the turn-reuse defaults, the prefill activation estimate, the 64×32
+GEMM tile for narrow prefill projections and the in-place KV for single-stream
+DSpark (#1068). The 2026-10-19 numbers are kept in the full repository
+(`design/measurements/xbench-20261019/`) for the record; the differences that
+matter are listed under *What changed* below.
 
 ## A small local benchmark
 
@@ -39,21 +35,36 @@ record the binary, backend, checkpoint, cells and resolved configuration. This
 is not a claim that a three-run example establishes a new release benchmark.
 External Pipette clients can instead use the existing HTTP benchmark endpoints.
 
-## Cross-engine comparison (LFM2.5-2.6B, M1 Max)
+## Cross-engine comparison (LFM2.5-2.6B, M1 Max, 2026-10-21)
 
 One client drives each engine's own OpenAI-compatible server with the same
 raw prompts over streaming `/v1/completions`: 128 generated tokens with EOS
 ignored, temperature 0, prompts cut to exact token counts with the LFM2
 tokenizer, and a unique leading tag on every request so no engine can reuse a
-cached prefix. Each cell is one warmup plus three reps, timed on the client.
-`prose` is Pipette's seed passage; `code` is the Python stdlib `json` source.
+cached prefix. `prose` is Pipette's seed passage; `code` is the Python stdlib
+`json` source.
 
-Engines: lloom `dev` 9bc89074a with the chat/serve defaults (F16 weights);
+**Method: one timed request per cell** after one untimed warmup, with a 20 s
+cool-down before every timed request so the chip is back near its idle
+baseline (fans on; the GPU cooled to ≤ 60 °C before the matrix). This is a
+release-potential number, not a sustained-load one: back-to-back requests heat
+the M1 Max within two or three cells and cost 5–8 % of decode and up to 30 % of
+long-prompt TTFT. Note what the cool-down also means for the TTFT rows: every
+timed request arrives at a GPU that has been idle for 20 s, and on this
+machine an idle GPU takes ~70 ms to come back up to speed (`lloom serve`,
+100-token prompt, max_tokens 1: 137–147 ms after ≤ 2 s idle, 201–225 ms after
+≥ 5 s idle; measured 2026-10-21, `xbench-20261021/ab-lead/idle-gap.sh`). Every
+engine pays it in these tables; a warm first token is ~70 ms lower across the
+board.
+
+Engines: lloom `dev` 3f6375fe2 with the chat/serve defaults (F16 weights);
 llama.cpp b11721 `llama-server` with `-fa on`, `-np B` and the F16 GGUF;
-MLX via mainline `mlx_lm.server` with the bf16 MLX build. DSpark uses
-LiquidAI's `LFM2.5-2.6B-DSpark` drafter: lloom natively, llama.cpp with the
-F16 GGUF sidecar (`--spec-type draft-dspark --spec-draft-n-max 10`), MLX
-through the third-party `mlx-dspark` server (default settings, not tuned).
+MLX via `uvx --from mlx-lm` (mlx-lm 0.32) `mlx_lm.server` with the bf16 MLX
+build. DSpark uses LiquidAI's `LFM2.5-2.6B-DSpark` drafter: lloom natively,
+llama.cpp with the F16 GGUF sidecar (`--spec-type draft-dspark
+--spec-draft-n-max 10`), MLX through the third-party `mlx-dspark` server
+(default settings, not tuned; the build `uvx` resolved on 2026-10-21 batches
+at B=4, the 2026-10-19 one did not).
 
 B is the number of concurrent requests (llama.cpp `-np B`, lloom
 `--batch B`). MLX ran at B=1 only; `mlx-dspark` also ran at B=4.
@@ -64,48 +75,42 @@ Mean TTFT over the B requests, by prompt length in tokens.
 
 **Without DSpark** (mean of the `prose` and `code` prompts):
 
-| Engine | ~100 | ~870 | ~2370 |
-|---|---|---|---|
-| lloom | 124 ms | 765 ms | 2.00 s |
-| llama.cpp | 165 ms | 816 ms | 1.55 s |
-| MLX | 171 ms | 681 ms | 1.33 s |
-
-
-
-| B | Engine | ~100 | ~870 | ~2370 |
-| 4 | lloom | 451 ms | 2.71 s | 5.82 s |
-| 4 | llama.cpp | 441 ms | 2.52 s | 5.03 s |
-| 16 | lloom | 1.44 s | 7.47 s | 18.60 s |
-| 16 | llama.cpp | 1.41 s | 7.65 s | 13.40 s |
-| 32 | lloom | 2.21 s | 13.70 s | 35.80 s |
-| 32 | llama.cpp | 2.86 s | 13.30 s | 23.60 s |
+| B | Engine | ~100 | ~872 | ~2372 |
+|---|---|---|---|---|
+| 1 | lloom | 205 ms | 695 ms | 1.68 s |
+| 1 | llama.cpp | 143 ms | 530 ms | 957 ms |
+| 1 | MLX | 243 ms | 699 ms | 1.17 s |
+| 4 | lloom | 440 ms | 2.10 s | 4.74 s |
+| 4 | llama.cpp | 313 ms | 1.84 s | 3.58 s |
+| 16 | lloom | 1.27 s | 7.18 s | 20.51 s |
+| 16 | llama.cpp | 1.06 s | 6.73 s | 11.98 s |
+| 32 | lloom | 1.99 s | 12.55 s | 35.45 s |
+| 32 | llama.cpp | 2.31 s | 11.59 s | 21.93 s |
 
 **With DSpark:**
 
-| Engine | Prompt | ~100 | ~870 | ~2370 |
-|---|---|---|---|---|
-| lloom | prose | 117 ms | 764 ms | 2.05 s |
-| lloom | code | 136 ms | 775 ms | 2.02 s |
-| llama.cpp | prose | 127 ms | 812 ms | 1.45 s |
-| llama.cpp | code | 162 ms | 819 ms | 1.44 s |
-| MLX (mlx-dspark) | prose | 105 ms | 600 ms | 1.77 s |
-| MLX (mlx-dspark) | code | 105 ms | 619 ms | 1.82 s |
-
-| B | Engine | Prompt | ~100 | ~870 | ~2370 |
-| 4 | lloom | prose | 313 ms | 1.78 s | 4.89 s |
-| 4 | lloom | code | 333 ms | 1.83 s | 4.88 s |
-| 4 | llama.cpp | prose | 495 ms | 2.75 s | 5.23 s |
-| 4 | llama.cpp | code | 416 ms | 2.71 s | 4.99 s |
-| 4 | MLX (mlx-dspark) | prose | 6.08 s | 7.90 s | 12.10 s |
-| 4 | MLX (mlx-dspark) | code | 5.02 s | 4.97 s | 8.55 s |
-| 16 | lloom | prose | 993 ms | 6.00 s | 16.20 s |
-| 16 | lloom | code | 990 ms | 5.93 s | 16.20 s |
-| 16 | llama.cpp | prose | 1.59 s | 8.60 s | 15.20 s |
-| 16 | llama.cpp | code | 1.60 s | 8.63 s | 15.10 s |
-| 32 | lloom | prose | 1.90 s | 11.50 s | 31.70 s |
-| 32 | lloom | code | 1.87 s | 11.50 s | 31.70 s |
-| 32 | llama.cpp | prose | 3.42 s | 16.50 s | 29.90 s |
-| 32 | llama.cpp | code | 3.42 s | 16.40 s | 29.90 s |
+| B | Engine | Prompt | ~100 | ~872 | ~2372 |
+|---|---|---|---|---|---|
+| 1 | lloom | prose | 225 ms | 708 ms | 1.70 s |
+| 1 | lloom | code | 221 ms | 699 ms | 1.67 s |
+| 1 | llama.cpp | prose | 147 ms | 560 ms | 1.01 s |
+| 1 | llama.cpp | code | 148 ms | 566 ms | 1.00 s |
+| 1 | MLX (mlx-dspark) | prose | 178 ms | 677 ms | 1.64 s |
+| 1 | MLX (mlx-dspark) | code | 158 ms | 652 ms | 1.64 s |
+| 4 | lloom | prose | 426 ms | 1.60 s | 4.10 s |
+| 4 | lloom | code | 408 ms | 1.60 s | 4.09 s |
+| 4 | llama.cpp | prose | 331 ms | 1.92 s | 3.80 s |
+| 4 | llama.cpp | code | 344 ms | 1.94 s | 3.77 s |
+| 4 | MLX (mlx-dspark) | prose | 5.60 s | 7.73 s | 12.27 s |
+| 4 | MLX (mlx-dspark) | code | 5.80 s | 5.22 s | 8.77 s |
+| 16 | lloom | prose | 1.12 s | 6.01 s | 16.41 s |
+| 16 | lloom | code | 1.09 s | 5.79 s | 15.86 s |
+| 16 | llama.cpp | prose | 1.21 s | 9.89 s | 15.75 s |
+| 16 | llama.cpp | code | 1.22 s | 7.87 s | 13.96 s |
+| 32 | lloom | prose | 2.02 s | 10.51 s | 30.58 s |
+| 32 | lloom | code | 2.02 s | 10.51 s | 30.57 s |
+| 32 | llama.cpp | prose | 2.65 s | 14.61 s | 27.87 s |
+| 32 | llama.cpp | code | 2.63 s | 14.57 s | 28.04 s |
 
 ### Throughput
 
@@ -114,100 +119,105 @@ its last generated token (prefill excluded; it shows in the TTFT tables).
 
 **Without DSpark** (mean of the `prose` and `code` prompts):
 
-| B | Engine | ~100 | ~870 | ~2370 |
+| B | Engine | ~100 | ~872 | ~2372 |
 |---|---|---|---|---|
-| 1 | lloom | 65 | 64 | 62 |
-| 1 | llama.cpp | 47 | 50 | 51 |
+| 1 | lloom | 64 | 63 | 62 |
+| 1 | llama.cpp | 60 | 60 | 60 |
 | 1 | MLX | 52 | 52 | 51 |
-| 4 | lloom | 128 | 120 | 89 |
-| 4 | llama.cpp | 155 | 156 | 141 |
-| 16 | lloom | 466 | 272 | 155 |
-| 16 | llama.cpp | 299 | 230 | 178 |
-| 32 | lloom | 512 | 283 | 175 |
-| 32 | llama.cpp | 337 | 235 | 173 |
+| 4 | lloom | 152 | 137 | 98 |
+| 4 | llama.cpp | 188 | 187 | 172 |
+| 16 | lloom | 470 | 268 | 143 |
+| 16 | llama.cpp | 301 | 242 | 182 |
+| 32 | lloom | 616 | 290 | 175 |
+| 32 | llama.cpp | 363 | 238 | 174 |
 
 **With DSpark** (the drafter's acceptance depends on the text, so the prompts
 are kept apart):
 
-| B | Engine | Prompt | ~100 | ~870 | ~2370 |
+| B | Engine | Prompt | ~100 | ~872 | ~2372 |
 |---|---|---|---|---|---|
-| 1 | lloom | prose | 63 | 62 | 44 |
-| 1 | lloom | code | 98 | 80 | 66 |
-| 1 | llama.cpp | prose | 71 | 77 | 56 |
-| 1 | llama.cpp | code | 103 | 99 | 88 |
-| 1 | MLX (mlx-dspark) | prose | 33 | 31 | 24 |
-| 1 | MLX (mlx-dspark) | code | 40 | 57 | 48 |
-| 4 | lloom | prose | 183 | 143 | 100 |
-| 4 | lloom | code | 223 | 166 | 114 |
-| 4 | llama.cpp | prose | 78 | 77 | 61 |
-| 4 | llama.cpp | code | 90 | 90 | 72 |
-| 16 | lloom | prose | 320 | 200 | 118 |
-| 16 | lloom | code | 385 | 222 | 128 |
-| 16 | llama.cpp | prose | 62 | 57 | 44 |
-| 16 | llama.cpp | code | 69 | 59 | 47 |
-| 32 | lloom | prose | 352 | 209 | 118 |
-| 32 | lloom | code | 411 | 228 | 129 |
-| 32 | llama.cpp | prose | 54 | 54 | 41 |
-| 32 | llama.cpp | code | 59 | 50 | 42 |
+| 1 | lloom | prose | 87 | 97 | 64 |
+| 1 | lloom | code | 145 | 138 | 82 |
+| 1 | llama.cpp | prose | 88 | 100 | 67 |
+| 1 | llama.cpp | code | 126 | 142 | 87 |
+| 1 | MLX (mlx-dspark) | prose | 36 | 30 | 24 |
+| 1 | MLX (mlx-dspark) | code | 40 | 57 | 52 |
+| 4 | lloom | prose | 186 | 147 | 106 |
+| 4 | lloom | code | 246 | 189 | 113 |
+| 4 | llama.cpp | prose | 79 | 80 | 63 |
+| 4 | llama.cpp | code | 106 | 122 | 67 |
+| 4 | MLX (mlx-dspark) | prose | 133 | 123 | 95 |
+| 4 | MLX (mlx-dspark) | code | 163 | 213 | 178 |
+| 16 | lloom | prose | 326 | 186 | 115 |
+| 16 | lloom | code | 391 | 233 | 125 |
+| 16 | llama.cpp | prose | 57 | 47 | 45 |
+| 16 | llama.cpp | code | 80 | 70 | 44 |
+| 32 | lloom | prose | 364 | 210 | 117 |
+| 32 | lloom | code | 411 | 241 | 128 |
+| 32 | llama.cpp | prose | 57 | 45 | 42 |
+| 32 | llama.cpp | code | 66 | 56 | 40 |
 
 What this shows, and what it does not:
 
-- One stream without speculation: lloom decodes fastest (62–65 tok/s
-  against 47–52), but prefills more slowly at long prompts (~2370 tokens:
-  TTFT 2.0 s against 1.5 s for llama.cpp and 1.3 s for MLX).
-- Batched without speculation: lloom decodes fastest at B=16 and B=32 on
-  short prompts (512 vs 337 tok/s at B=32), trails llama.cpp at B=4 (128 vs
-  155), and is level with it at ~2370 tokens. Its slower prefill shows as
-  higher TTFT under load (~2370 tokens, B=32: 35.8 s vs 23.6 s).
-- DSpark depends on the text and the context length. These raw
-  continuations of mid-document text draft worse than chat answers do (a chat
-  answer reached 191 tok/s at B=1, 7.7 tokens per round). At B=1 llama.cpp's
-  DSpark is ahead of lloom's and holds up better with length; lloom's is slower
-  than plain decoding on prose at ~2370 tokens.
-- Batched DSpark: lloom's pays at B=4 (183–223 vs 128 tok/s) and costs
-  decode throughput at B=16 and B=32 on short prompts (385–411 vs 466–512);
-  llama.cpp's serves batched requests far slower than its plain decode.
-- `mlx-dspark` did not batch (at B=4 the requests ran one after another, so
-  its B=4 row appears in the TTFT table only); its rows are not a verdict on
-  speculation under MLX.
+- One stream without speculation: lloom decodes fastest (62–64 tok/s against
+  llama.cpp's 60 and MLX's 52) and prefills slowest at long prompts: at ~2370
+  tokens its TTFT is 1.68 s against 0.96 s (llama.cpp) and 1.17 s (MLX). At
+  ~100 tokens the three engines are within the idle-GPU ramp described above
+  (lloom 205 ms, llama.cpp 143 ms, MLX 243 ms).
+- Batched without speculation: lloom leads at B=16 and B=32 on short prompts
+  (616 vs 363 tok/s at B=32) and is level with llama.cpp at ~2370 tokens; it
+  trails at B=4 (152 vs 188). Its slower batched prefill shows as higher TTFT
+  under load (~2370 tokens, B=32: 35.5 s vs 21.9 s; B=16: 20.5 s vs 12.0 s).
+- Single-stream DSpark: lloom and llama.cpp are now level (prose 87/97/64 vs
+  88/100/67; code 145/138/82 vs 126/142/87); lloom's decay with context is
+  gone with the in-place KV for the verify window (its ~2370-token prose cell
+  went from 44 to 64 tok/s). Raw mid-document continuations draft worse than
+  chat answers do (a chat answer reaches ~190 tok/s at B=1).
+- Batched DSpark: lloom's scales (B=16: 326–391 tok/s; B=32: 364–411) where
+  llama.cpp's collapses (45–80); `mlx-dspark` batches at B=4 in this build
+  (123–213 tok/s) and its B=1 is far behind both.
 
-Harness, prompts and raw results: `design/measurements/xbench-20261019/` in the
-full development repository (`xbench.py`, `matrix.sh`, `results.jsonl`, `tables.md`).
+## What changed since the 2026-10-19 matrix
 
+- **The comparators were throttled on 2026-10-19** (three reps back to back):
+  cooled, llama.cpp's single-stream decode went 47 → 60 tok/s and its
+  ~2370-token prefill 1.55 → 0.96 s; MLX's prefill 1.33 → 1.17 s. lloom gained
+  less from the cool-down (decode flat at 62–65; prefill 2.00 → 1.68 s), so
+  the single-stream decode lead narrowed and the long-prompt prefill gap is
+  wider than the old table showed.
+- lloom's ~100-token TTFT reads 205 ms against 124 ms before: the old run's
+  requests arrived at a warm GPU (no cool-down); the new one's at an idle GPU
+  (the ~70 ms ramp above). Warm, `lloom serve`'s first token on that prompt is
+  ~140 ms and `lloom chat`'s 103 ms.
+- Single-stream DSpark at long context: +45 % (prose) / +24 % (code) at ~2370
+  tokens from the in-place KV (decision 52); prefill −20 ms at ~2370 from the
+  64×32 tile.
 
 ## Known gaps and limitations
 
 Stated so the tables are read correctly; each is tracked in the development
 repository and none is hidden by the numbers above.
 
-- **Long-prompt prefill.** At ~2370 prompt tokens lloom's time to first token
-  is 2.0 s against 1.55 s (llama.cpp) and 1.33 s (MLX), and the gap widens
-  under batch (B=32: 35.8 s vs 23.6 s). Two causes are identified and in
-  progress: on the paged KV layout every prefill tile after the first
-  re-gathers and concatenates the accumulated K/V per attention layer (the
-  same copy runs for the speculative verify window every round, which is why
-  DSpark decays faster with context than plain decoding), and the admission
-  estimate for prefill activations models buffers the fused attention kernel
-  never allocates, so prefill tiles above 1024 tokens are refused. Both are
-  pre-release work; the re-run will show what they moved.
-- **Heat.** The 2026-10-19 matrix ran its three reps back to back. On the
-  M1 Max the chip heats within two or three cells: the 2372-token TTFT is
-  1.7 s from idle and 2.0–2.3 s sustained, decode 5–8 % lower. The harness now
-  defaults to one timed request per cell after a cool-down (`--cooldown`,
-  `--reps 1`); the re-run uses that shape. Treat the long-prompt TTFT rows as
-  sustained-load numbers, not idle ones.
-- **Long-context batched decode.** At ~2370 tokens and B=32, plain decode is
-  level with llama.cpp (175 vs 173 tok/s) after leading by 50 % on short
-  prompts; attention over long contexts under batch is where the lead goes.
-  Not a pre-release item.
-- **DSpark at B=1 on prose** trails llama.cpp's draft (63 vs 71 tok/s at
-  ~100 tokens; 44 vs 56 at ~2370) and is slower than plain decoding at ~2370
-  on prose. The drafter's acceptance depends on the text; chat answers draft
-  far better than these raw mid-document continuations (191 tok/s at B=1 on a
-  chat answer, 7.7 tokens per round — a single `lloom chat` run, not a matrix
-  cell).
-- **`mlx-dspark` did not batch** in this harness; its B=4 rows are not a
-  verdict on speculation under MLX.
+- **Long-prompt prefill.** 1.68 s at ~2370 tokens against llama.cpp's 0.96 s
+  and MLX's 1.17 s. The prefill is ~81 % GEMM at ~98 % GPU busy; the measured
+  gap against MLX is in the narrow projections (`q`/`o`/`k`/`v` at m = 512:
+  5.4–6.6 vs 8.8 TFLOP/s), and llama.cpp's own f16 GEMM path is faster still
+  at this shape. A 32-wide tile or split-K kernel for those shapes is the
+  post-release item (#1076 in the development tracker); the tile loop, the
+  page-pool gather and the host are not where the time goes (profiled
+  2026-10-20).
+- **Batched prefill.** Prompts are prefilled in arrival order in 512-token
+  pieces that ride the live rows' decode steps, so a later stream's TTFT grows
+  by ~2 s per earlier prompt at ~2370 tokens; the mean TTFT is about half the
+  last stream's. llama.cpp's batched prefill is ~1.6× faster. A scheduler
+  policy item, post-release.
+- **Long-context batched decode.** At ~2370 tokens and B=16/32, plain decode is
+  level with llama.cpp (143–175 vs 174–182 tok/s) after leading by 1.5–1.7× on
+  short prompts; attention over long contexts under batch is where the lead
+  goes. Post-release.
+- **The idle-GPU ramp** (~70 ms before the first token after ≥ 5 s idle)
+  applies to every engine on this machine; a keep-warm option for `serve` is
+  a possible follow-up, not a shipped feature.
 - **One model, one machine.** LFM2.5-2.6B (F16 safetensors) on one M1 Max,
   Metal. Qwen3.6 (dense), Qwen4-exp (MoE, resident and streamed experts) and
   the GGUF loaders run on the same engine, but have no cross-engine numbers
@@ -215,6 +225,10 @@ repository and none is hidden by the numbers above.
   and are not reproduced on this page until they are run the same way. CPU
   execution and CUDA are not measured here at all.
 - **Sampling.** Measurements are greedy (temperature 0). Filtered samplers
-  (top-k, top-p) run on the host today and take the blocking readback arm; a
-  device-side sampler is designed and not shipped. Their throughput is lower
-  than the ring arm's and is not in these tables.
+  (top-k, top-p) run on the host today and take the blocking readback arm
+  with a warning; a device-side sampler is designed and not shipped. Their
+  throughput is lower than the ring arm's and is not in these tables.
+
+Harness, prompts and raw results: `design/measurements/xbench-20261021/` in the
+full development repository (`xbench.py`, `matrix.sh`, `results.jsonl`,
+`tables.py`, `provenance.txt`, `ab-lead/` for the first-token experiments).

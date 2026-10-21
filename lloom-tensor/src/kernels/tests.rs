@@ -7849,7 +7849,9 @@ fn mlx_gemm_383_tile_parity() {
 /// `k · 2⁻²⁴ · Σ|x·w|` (CONTRIBUTING §3.1b rule 6). A lattice of outputs
 /// covers every row and column tile and the last row and column; the shapes
 /// sit on both sides of the class: 512 and 344 rows of q/o/out_proj and conv
-/// in_proj on the 64×32 tile, 513 rows and the 10752-wide w1 on 64×64.
+/// in_proj on the 64×32 tile, 513 rows and the 10752-wide w1 on 64×64. The
+/// weight pattern is not symmetric in `(n, k)` at any of these depths, so a
+/// kernel that loads the weight operand transposed is seen.
 #[test]
 fn mlx_gemm_narrow_projection_parity() {
     for &(m, n, k) in &[
@@ -7863,7 +7865,7 @@ fn mlx_gemm_narrow_projection_parity() {
             .map(|i| f16::from_f32(((i % 97) as f32 - 48.0) / 256.0))
             .collect();
         let rhs: Vec<f16> = (0..n * k)
-            .map(|i| f16::from_f32(((i % 89) as f32 - 44.0) / 256.0))
+            .map(|i| f16::from_f32((((31 * i + 7 * (i / k)) % 89) as f32 - 44.0) / 256.0))
             .collect();
         let got = run_mlx_gemm(
             GemmDType::F16,

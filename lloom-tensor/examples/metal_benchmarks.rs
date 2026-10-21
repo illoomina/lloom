@@ -108,8 +108,26 @@ fn run_gemm(f32: bool, n: usize) -> Result<()> {
 /// LFM2-2.6B's prefill projections, `x[m, k] · W[n, k]ᵀ` at f16 with `W`
 /// row-major as the model stores it (the `nt` layout), `reps` launches in one
 /// command buffer so its overhead is amortised: TFLOP/s per shape, through the
-/// shipping tile selection (`LLOOM_383_TILE` overrides it).
-fn run_prefill_gemm(m: usize, n: usize, k: usize, reps: usize) -> Result<f64> {
+/// shipping tile selection (`LLOOM_383_TILE` overrides it). The launches write
+/// `outputs` buffers in turn: one serializes them on the shared output's
+/// hazard, more lets independent launches overlap. `warm_ms` of untimed
+/// launches of the same shape run first, so a short shape is not timed while
+/// the GPU clock is still ramping. Returns the rate, an FNV-1a hash of the
+/// output's bits (two kernels' results compare without a reference), and the
+/// host's encode time per launch in the fastest batch: the batch is committed
+/// at the wait, so the rate's interval holds the encode and then the GPU work.
+/// One command queue serves the shape, as the engine keeps one; with
+/// `queue_per_batch` every timed batch builds its own, which adds ~3 ms a
+/// batch and is how the rates in `docs/tuning.md` §13.5z were taken (§13.5za).
+fn run_prefill_gemm(
+    m: usize,
+    n: usize,
+    k: usize,
+    reps: usize,
+    outputs: usize,
+    warm_ms: u64,
+    queue_per_batch: bool,
+) -> Result<(f64, u64, f64)> {
     let device = Device::system_default().unwrap();
     let kernels = lloom_tensor::kernels::Kernels::new();
     let residency_set = std::sync::Arc::new(ResidencySet::new(&device));
@@ -134,13 +152,27 @@ fn run_prefill_gemm(m: usize, n: usize, k: usize, reps: usize) -> Result<f64> {
             options,
         )
         .unwrap();
-    let output = device.new_buffer(m * n * 2, options).unwrap();
+    let outputs: Vec<_> = (0..outputs.max(1))
+        .map(|_| device.new_buffer(m * n * 2, options).unwrap())
+        .collect();
     let mut best = f64::MAX;
-    for _ in 0..5 {
-        let command_queue = device.new_command_queue().unwrap();
-        let commands = Commands::new(command_queue, residency_set.clone()).unwrap();
+    let mut best_encode = 0f64;
+    let warm_until = std::time::Instant::now() + std::time::Duration::from_millis(warm_ms);
+    let mut timed = 0;
+    let shared = (!queue_per_batch).then(|| {
+        Commands::new(device.new_command_queue().unwrap(), residency_set.clone()).unwrap()
+    });
+    while timed < 5 {
+        let warming = std::time::Instant::now() < warm_until;
+        let fresh = if shared.is_none() {
+            Some(Commands::new(device.new_command_queue().unwrap(), residency_set.clone()).unwrap())
+        } else {
+            None
+        };
+        let commands = shared.as_ref().or(fresh.as_ref()).unwrap();
         let start = std::time::Instant::now();
-        for _ in 0..reps {
+        for rep in 0..reps {
+            let output = &outputs[rep % outputs.len()];
             let encoder = commands.command_encoder().unwrap();
             // SAFETY: the example owns every buffer bound here and reads none
             // of them before the command buffer that writes them completes.
@@ -157,14 +189,27 @@ fn run_prefill_gemm(m: usize, n: usize, k: usize, reps: usize) -> Result<f64> {
                     &[n * k, 1, k],
                     0,
                     &rhs,
-                    &output,
+                    output,
                 )
             }?;
         }
+        let encoded = start.elapsed().as_secs_f64() / reps as f64;
         commands.wait_until_completed().unwrap();
-        best = best.min(start.elapsed().as_secs_f64() / reps as f64);
+        if !warming {
+            let t = start.elapsed().as_secs_f64() / reps as f64;
+            if t < best {
+                best = t;
+                best_encode = encoded;
+            }
+            timed += 1;
+        }
     }
-    Ok(2.0 * (m * n * k) as f64 / best / 1e12)
+    // SAFETY: every command buffer writing the output has completed above.
+    let bits = unsafe { std::slice::from_raw_parts(outputs[0].contents() as *const u16, m * n) };
+    let hash = bits.iter().fold(0xcbf29ce484222325u64, |h, &b| {
+        (h ^ b as u64).wrapping_mul(0x100000001b3)
+    });
+    Ok((2.0 * (m * n * k) as f64 / best / 1e12, hash, best_encode))
 }
 
 #[derive(Subcommand, Debug, Clone)]
@@ -173,7 +218,18 @@ enum Task {
     /// The prefill projections' shapes at m = 110, 344, 374, 512, 2048, 2392
     /// (the three prompts' last tiles, the prefill tile, two whole prompts),
     /// each beside the tile it ran on.
-    PrefillGemm,
+    PrefillGemm {
+        /// Output buffers the 20 launches write in turn (1: serialized).
+        #[arg(long, default_value_t = 1)]
+        outputs: usize,
+        /// Untimed launches of each shape, in ms, before its five timed batches.
+        #[arg(long, default_value_t = 0)]
+        warm_ms: u64,
+        /// A new command queue for every timed batch (the rates published
+        /// before `docs/tuning.md` §13.5za) instead of one for the shape.
+        #[arg(long)]
+        queue_per_batch: bool,
+    },
 }
 
 #[derive(Parser, Debug)]
@@ -187,7 +243,11 @@ pub struct Args {
 fn main() -> Result<()> {
     let args = Args::parse();
     match args.task {
-        Task::PrefillGemm => {
+        Task::PrefillGemm {
+            outputs,
+            warm_ms,
+            queue_per_batch,
+        } => {
             let shapes = [
                 ("w1/w3 (MLP up)", 10752, 2048),
                 ("w2 (MLP down)", 2048, 10752),
@@ -198,14 +258,16 @@ fn main() -> Result<()> {
             let device = Device::system_default().unwrap();
             for m in [110, 344, 374, 512, 2048, 2392] {
                 for (name, n, k) in shapes {
-                    let tflops = run_prefill_gemm(m, n, k, 20)?;
+                    let (tflops, hash, encode) =
+                        run_prefill_gemm(m, n, k, 20, outputs, warm_ms, queue_per_batch)?;
                     let (bm, bn, bk, wm, wn) = lloom_tensor::kernels::nt_gemm_tile(
                         &device,
                         lloom_tensor::kernels::GemmDType::F16,
                         (m, n, k),
                     );
                     println!(
-                        "PREFILL_GEMM m={m} n={n} k={k} {name}: {tflops:.2} TFLOP/s tile={bm}_{bn}_{bk}_{wm}_{wn}"
+                        "PREFILL_GEMM m={m} n={n} k={k} {name}: {tflops:.2} TFLOP/s tile={bm}_{bn}_{bk}_{wm}_{wn} out_fnv={hash:016x} encode_us={:.1}",
+                        encode * 1e6
                     );
                 }
             }

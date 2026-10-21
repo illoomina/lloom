@@ -1026,7 +1026,9 @@ where
     /// Close the window once nothing is live and nothing waits: the GPU's
     /// busy union against the window's wall on stderr, and under
     /// `diagnostics.gpu_profile.dump` the command buffers
-    /// (`<dump>.batch<n>.csv`) and the steps (`<dump>.batch<n>.steps.csv`).
+    /// (`<dump>.batch<n>.csv`), the steps (`<dump>.batch<n>.steps.csv`) and,
+    /// with the encoder counters on, every sampled encoder
+    /// (`<dump>.batch<n>.encoders.csv`).
     #[cfg(feature = "metal")]
     fn close_window(&mut self) {
         use lloom_tensor::kernels::metal::profile;
@@ -1076,10 +1078,25 @@ where
                 r.live, r.held, r.pieces, r.piece_tokens, r.retired, r.pending
             ));
         }
-        for (p, body) in [
+        let mut files = vec![
             (format!("{path}.batch{n}.csv"), cb),
             (format!("{path}.batch{n}.steps.csv"), st),
-        ] {
+        ];
+        if !s.encoder_records.is_empty() {
+            let mut enc = String::from("step,label,start_s,end_s,dispatches\n");
+            for e in &s.encoder_records {
+                enc.push_str(&format!(
+                    "{},{},{:.6},{:.6},{}\n",
+                    e.step,
+                    e.label.as_deref().unwrap_or("-"),
+                    e.start,
+                    e.end,
+                    e.dispatches
+                ));
+            }
+            files.push((format!("{path}.batch{n}.encoders.csv"), enc));
+        }
+        for (p, body) in files {
             match std::fs::write(&p, body) {
                 Ok(()) => eprintln!("[profile: wrote {p}]"),
                 Err(e) => eprintln!("[profile: writing {p} failed: {e}]"),

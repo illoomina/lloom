@@ -201,15 +201,15 @@ External Pipette clients can instead use the existing HTTP benchmark endpoints.
 
 Measured, with the harness, prompts and limitations, in
 [docs/benchmark.md](docs/benchmark.md). The cross-engine comparison there
-(LFM2.5-2.6B on one M1 Max, 2026-10-21, cooled one-shot cells: lloom vs
-llama.cpp vs MLX, one client driving each engine's own server) reads, in
-short: one stream without speculation lloom decodes fastest (62–64 tok/s
-against 60 and 52) and prefills slowest at long prompts (~2370 tokens: 1.68 s
-against 0.96 s and 1.17 s); batched without speculation it leads at B=16/32 on
-short prompts (616 vs 363 tok/s at B=32) and is level at ~2370 tokens; with
-DSpark it is level with llama.cpp single-stream and its batched decode holds
-up where llama.cpp's does not. The known gaps — long-prompt and batched
-prefill, long-context batched decode, the idle-GPU ramp every engine pays —
+(LFM2.5-2.6B on one M1 Max, 2026-10-22, cooled one-shot cells, every engine's
+prompt cache off: lloom vs llama.cpp vs MLX, one client driving each engine's
+own server) reads, in short: one stream without speculation lloom decodes
+fastest (62–64 tok/s against 60 and 51) and its first token comes later
+(~2370 tokens: 1.69 s against 1.45 s and 1.75 s); batched without
+speculation it leads at B=16/32 (587 vs 358 tok/s at B=32) and trails at B=4;
+with DSpark it is level with llama.cpp single-stream, and its batched decode
+and batched first token are far ahead. The known gaps — the serve path's first
+streamed token, ~85 ms of non-GEMM prefill, B=4 decode, B=16 at long context —
 are listed there with what is being done.
 
 ## Optional optimized diagnostic build

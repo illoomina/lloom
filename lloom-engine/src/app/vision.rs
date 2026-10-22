@@ -412,6 +412,22 @@ impl<M: CausalLM> CausalLM for ImageRows<'_, M> {
         self.model.close_checkpoint_request(cache)
     }
 
+    fn pin_checkpoint(
+        &self,
+        cache: &mut Self::Cache,
+        pos: Option<usize>,
+    ) -> lloom_tensor::Result<Option<usize>> {
+        self.model.pin_checkpoint(cache, pos)
+    }
+
+    fn pins_checkpoints(&self, cache: &Self::Cache) -> bool {
+        self.model.pins_checkpoints(cache)
+    }
+
+    fn pinned_checkpoint(&self, cache: &Self::Cache) -> Option<usize> {
+        self.model.pinned_checkpoint(cache)
+    }
+
     fn note_input_ids(&self, cache: &mut Self::Cache, ids: &[u32]) -> lloom_tensor::Result<()> {
         if ids.contains(&self.image_token_id) {
             if ids.len() > self.prompt.len() {

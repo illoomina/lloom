@@ -470,6 +470,7 @@ impl Family for Lfm2Family {
             decode: shape.decode.clone(),
             model: shape.model.clone(),
             reuse_prefix: shape.reuse_prefix,
+            pin_prefix: shape.pin_prefix,
             warmup: model.warmup,
             seed_text: shape.seed_text.clone(),
             model_name: model.model_name.clone(),
@@ -646,6 +647,7 @@ impl Family for Qwen3_5Family {
             readback: shape.decode.readback.arm(),
             decode: shape.decode.clone(),
             reuse_prefix: shape.reuse_prefix,
+            pin_prefix: shape.pin_prefix,
             warmup: model.warmup,
             seed_text: shape.seed_text.clone(),
             model_name: model.model_name.clone(),
@@ -859,6 +861,7 @@ mod tests {
             rows: "auto".into(),
             share_prefix: false,
             decision_ragged: true,
+            pin_prefix: false,
         }
     }
 

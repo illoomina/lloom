@@ -3404,6 +3404,22 @@ pub struct State<P: Profile> {
     turn_ckpt_cur: Option<usize>,
     /// The slot the next checkpointing pass takes.
     turn_ckpt_next: usize,
+    /// The ring holds one frame past its slots, [`TURN_CHECKPOINTS`], for a
+    /// pinned checkpoint, which the slots' rotation never takes
+    /// (`sessions.md` §8).
+    turn_pin_frame: bool,
+    /// The pinned checkpoint, in the pin's frame.
+    turn_pinned: Option<TurnCheckpoint>,
+    /// The open request's second target: a checkpoint at this position,
+    /// taken into the pin's frame by the pass that covers it.
+    turn_pin_want: Option<usize>,
+    /// A request is open (`CausalLM::open_checkpoint_request`): a second
+    /// target is scheduled only inside one.
+    turn_request: bool,
+    /// The pass in flight's start and length, and the second target it
+    /// takes, if any.
+    turn_pass: (usize, usize),
+    turn_pin_cur: Option<usize>,
     /// The ring's rotating write index, in slots.
     ///
     /// **Deliberately here and not in a params struct** (`DESIGN.md` §10.2c,
@@ -3647,6 +3663,7 @@ impl<P: Profile> State<P> {
         self.conv_compact = saved.compact;
         self.paged_pass_pending = false;
         self.turn_ckpt_cur = None;
+        self.turn_pin_cur = None;
         for t in &mut self.taps {
             *t = None;
         }
@@ -3923,6 +3940,7 @@ pub fn state_floor_bytes(
     config: &Config,
     dtype: DType,
     kv_floor: usize,
+    pin_frame: bool,
 ) -> [(&'static str, usize); 3] {
     let conv_layers = config
         .layer_types
@@ -3932,7 +3950,7 @@ pub fn state_floor_bytes(
     let elem = dtype.size_in_bytes();
     let conv =
         conv_layers * config.hidden_size * config.conv_state.width(config.conv_l_cache) * elem;
-    let ring = TURN_CHECKPOINTS
+    let ring = (TURN_CHECKPOINTS + usize::from(pin_frame))
         * conv_layers
         * config.hidden_size
         * (config.conv_l_cache + TURN_CHECKPOINT_SLACK)
@@ -4288,6 +4306,12 @@ impl<P: Profile> State<P> {
             layer_tier: None,
             turn_ckpt_cur: None,
             turn_ckpt_next: 0,
+            turn_pin_frame: false,
+            turn_pinned: None,
+            turn_pin_want: None,
+            turn_request: false,
+            turn_pass: (0, 0),
+            turn_pin_cur: None,
             conv_phase: 0,
             conv_phase_prev: 0,
             conv_history: 0,
@@ -5360,6 +5384,10 @@ impl<P: Profile> State<P> {
             .iter_mut()
             .for_each(|c| c.valid = false);
         self.turn_ckpt_cur = None;
+        self.turn_pinned = None;
+        self.turn_pin_want = None;
+        self.turn_pin_cur = None;
+        self.turn_request = false;
     }
 
     /// The page pool's live tokens, pages in use and pages held in quarantine,
@@ -5458,11 +5486,19 @@ impl<P: Profile> State<P> {
     /// (`resolve` owns its rollback), a `Cat` KV (no length to move back).
     fn turn_checkpoint_begin(&mut self, seq_len: usize) {
         self.turn_ckpt_cur = None;
+        self.turn_pin_cur = None;
         if !self.use_kv_cache || seq_len < 2 || self.speculative || self.kv_append == KvAppend::Cat
         {
             return;
         }
-        let pos = self.kv_len() + seq_len;
+        let start = self.kv_len();
+        self.turn_pass = (start, seq_len);
+        // The second target, inside the pass: its tail is the input columns
+        // before it, so a position at the pass's start is not one.
+        self.turn_pin_cur = self
+            .turn_pin_want
+            .filter(|&w| self.turn_pin_frame && w > start && w <= start + seq_len);
+        let pos = start + seq_len;
         let slot = self.turn_ckpt_next % TURN_CHECKPOINTS;
         if slot < self.turn_checkpoints.len() {
             let c = &mut self.turn_checkpoints[slot];
@@ -5502,13 +5538,14 @@ impl<P: Profile> State<P> {
         // The whole ring at a sequence's first checkpointing pass — one
         // request, session state, outside every plan — and kept for the next
         // sequence of the same geometry.
+        let frames = self.turn_frames();
         let fresh = match &self.turn_ring {
-            Some(r) => !r.fits(TURN_CHECKPOINTS, frame, conv_in.dtype()),
+            Some(r) => !r.fits(frames, frame, conv_in.dtype()),
             None => true,
         };
         if fresh {
             self.turn_ring = Some(crate::nn::ring::Ring::allocate(
-                TURN_CHECKPOINTS,
+                frames,
                 frame,
                 conv_in.dtype(),
                 conv_in.device(),
@@ -5522,7 +5559,111 @@ impl<P: Profile> State<P> {
         let c = &mut self.turn_checkpoints[slot];
         c.tail_len = keep;
         c.valid = true;
+        // The second target: the columns before it, from the same input.
+        if let Some(w) = self.turn_pin_cur {
+            let (start, seq) = self.turn_pass;
+            let before = src_len - seq + (w - start);
+            let keep = before.min(want);
+            if keep >= l_cache {
+                let src = conv_in.narrow(2, before - keep, keep)?;
+                self.turn_tail_view(TURN_CHECKPOINTS, layer)?
+                    .slice_set(&src, 2, 0)?;
+                self.turn_pinned = Some(TurnCheckpoint {
+                    pos: w,
+                    tail_len: keep,
+                    valid: true,
+                });
+                self.turn_pin_want = None;
+            }
+        }
         Ok(())
+    }
+
+    /// The frames the turn ring holds: the slots, and the pin's.
+    fn turn_frames(&self) -> usize {
+        TURN_CHECKPOINTS + usize::from(self.turn_pin_frame)
+    }
+
+    /// One frame more in the turn ring, for a pinned checkpoint
+    /// ([`Self::pin_checkpoint`]). Set before the first checkpointing pass.
+    pub fn with_pin_frame(mut self, on: bool) -> Self {
+        self.turn_pin_frame = on;
+        self
+    }
+
+    /// Whether the turn ring holds a frame for a pin, on an arm that keeps
+    /// turn checkpoints at all.
+    pub fn has_pin_frame(&self) -> bool {
+        self.turn_pin_frame && self.use_kv_cache && self.kv_append != KvAppend::Cat
+    }
+
+    /// Where the pinned checkpoint stands.
+    pub fn pinned_checkpoint(&self) -> Option<usize> {
+        self.turn_pinned.filter(|c| c.valid).map(|c| c.pos)
+    }
+
+    /// Pin the turn checkpoint at `pos` (`CausalLM::pin_checkpoint`): one
+    /// reaching it is copied into the pin's frame, else — while a request
+    /// is open — the pass that covers it leaves it there beside its own.
+    /// `None` releases the pin. Returns where the pinned checkpoint stands.
+    pub fn pin_checkpoint(&mut self, pos: Option<usize>) -> Result<Option<usize>> {
+        let Some(p) = pos else {
+            self.turn_pinned = None;
+            self.turn_pin_want = None;
+            return Ok(None);
+        };
+        if !self.has_pin_frame() || self.pinned_checkpoint() == Some(p) {
+            return Ok(self.pinned_checkpoint());
+        }
+        match self.slot_reaching(p) {
+            Some(idx) if p <= self.kv_len() => {
+                let c = self.turn_checkpoints[idx];
+                let back = c.pos - p;
+                let keep = (c.tail_len - back).min(self.l_cache + TURN_CHECKPOINT_SLACK);
+                // Two frames of one ring share its storage: the source goes
+                // through a copy of its own.
+                for layer in 0..self.conv_states.len() {
+                    let src = self
+                        .turn_tail_view(idx, layer)?
+                        .narrow(2, c.tail_len - back - keep, keep)?
+                        .copy()?;
+                    self.turn_tail_view(TURN_CHECKPOINTS, layer)?
+                        .slice_set(&src, 2, 0)?;
+                }
+                self.turn_pinned = Some(TurnCheckpoint {
+                    pos: p,
+                    tail_len: keep,
+                    valid: true,
+                });
+                self.turn_pin_want = None;
+            }
+            _ if self.turn_request => self.turn_pin_want = Some(p),
+            _ => {}
+        }
+        Ok(self.pinned_checkpoint())
+    }
+
+    /// A request opens (`CausalLM::open_checkpoint_request`): the turn
+    /// checkpoints are every multi-token pass's, whatever it asks; only a
+    /// second target is scheduled inside it.
+    pub fn open_checkpoint_request(&mut self) {
+        self.turn_request = true;
+        self.turn_pin_want = None;
+    }
+
+    /// The request's end: a second target no pass took is dropped.
+    pub fn close_checkpoint_request(&mut self) {
+        self.turn_request = false;
+        self.turn_pin_want = None;
+    }
+
+    /// The checkpoint record of slot `idx`, the pin's at [`TURN_CHECKPOINTS`].
+    fn turn_checkpoint(&self, idx: usize) -> Option<TurnCheckpoint> {
+        if idx == TURN_CHECKPOINTS {
+            self.turn_pinned
+        } else {
+            self.turn_checkpoints.get(idx).copied()
+        }
     }
 
     /// Slot `slot`'s tail for conv layer `layer`: a contiguous
@@ -5532,28 +5673,59 @@ impl<P: Profile> State<P> {
             .turn_ring
             .as_ref()
             .ok_or_else(|| lloom_tensor::Error::msg("lfm2 turn ring: no ring allocated"))?;
+        if slot >= ring.frames() {
+            lloom_tensor::bail!("lfm2 turn ring: no frame {slot} of {}", ring.frames())
+        }
         ring.frame(slot)?.narrow(0, layer, 1)?.squeeze(0)
     }
 
     /// The checkpoint [`Cache::restore`] would take `pos` from: a valid one
     /// whose pass ended at or after `pos`, within its tail's reach.
     fn checkpoint_for(&self, pos: usize) -> Option<usize> {
-        self.turn_checkpoints
-            .iter()
-            .enumerate()
-            .filter(|(_, c)| c.valid && c.tail_len >= self.l_cache)
-            .filter(|(_, c)| pos <= c.pos && c.pos - pos <= c.tail_len - self.l_cache)
-            .map(|(i, _)| i)
-            .next()
+        self.slot_reaching(pos).or_else(|| {
+            self.turn_pinned
+                .filter(|c| self.reaches(c, pos))
+                .map(|_| TURN_CHECKPOINTS)
+        })
     }
 
-    /// Checkpoints past `pos` describe positions the cache no longer holds.
+    /// The turn slot (never the pin's) whose checkpoint reaches `pos`.
+    fn slot_reaching(&self, pos: usize) -> Option<usize> {
+        self.turn_checkpoints
+            .iter()
+            .position(|c| self.reaches(c, pos))
+    }
+
+    fn reaches(&self, c: &TurnCheckpoint, pos: usize) -> bool {
+        c.valid
+            && c.tail_len >= self.l_cache
+            && pos <= c.pos
+            && c.pos - pos <= c.tail_len - self.l_cache
+    }
+
+    /// Checkpoints past `pos` describe positions the cache no longer holds;
+    /// a pin past it is released.
     fn forget_checkpoints_past(&mut self, pos: usize) {
         for c in self.turn_checkpoints.iter_mut() {
             if c.pos > pos {
                 c.valid = false;
             }
         }
+        if self.turn_pinned.is_some_and(|c| c.pos > pos) {
+            self.turn_pinned = None;
+        }
+    }
+
+    /// Where a request diverging at `pos` is put back
+    /// (`CacheRewind::restore_point`): `pos` itself where a checkpoint
+    /// reaches it, else the pinned checkpoint's own position at or before
+    /// it, from which the request prefills the rest.
+    pub fn restore_point(&self, pos: usize) -> Option<usize> {
+        if self.can_restore(pos) {
+            return Some(pos);
+        }
+        self.pinned_checkpoint()
+            .filter(|&p| p <= pos && self.can_restore(p))
     }
 
     /// Whether [`Cache::restore`] can put the cache back at `pos`: the KV has
@@ -5580,16 +5752,20 @@ impl<P: Profile> State<P> {
                 self.kv_len(),
                 self.turn_checkpoints
                     .iter()
+                    .chain(self.turn_pinned.iter())
                     .filter(|c| c.valid)
                     .map(|c| (c.pos, c.tail_len.saturating_sub(self.l_cache)))
                     .collect::<Vec<_>>()
             )
         }
         let idx = self.checkpoint_for(pos).expect("checked by can_restore");
+        let c = self
+            .turn_checkpoint(idx)
+            .expect("checkpoint_for names a held checkpoint");
         let n = self.kv_len() - pos;
         self.rewind_kv(n)?;
-        let back = self.turn_checkpoints[idx].pos - pos;
-        let tail_len = self.turn_checkpoints[idx].tail_len;
+        let back = c.pos - pos;
+        let tail_len = c.tail_len;
         let l_cache = self.l_cache;
         let width = self.conv_state.width(l_cache);
         let layers = self.conv_states.len();
@@ -11335,6 +11511,36 @@ impl<P: Profile> CausalLM for Model<P> {
         Model::forward(self, tokens, pos, cache)
     }
 
+    /// Every multi-token pass leaves its own turn checkpoint
+    /// (`sequence-reuse-design.md` §2.3a), whatever the request asks; the
+    /// request scopes only the pin's second target.
+    fn open_checkpoint_request(
+        &self,
+        cache: &mut Self::Cache,
+        _policy: crate::nn::CheckpointPolicy,
+        _end: usize,
+    ) -> Result<()> {
+        cache.open_checkpoint_request();
+        Ok(())
+    }
+
+    fn close_checkpoint_request(&self, cache: &mut Self::Cache) -> Result<()> {
+        cache.close_checkpoint_request();
+        Ok(())
+    }
+
+    fn pin_checkpoint(&self, cache: &mut Self::Cache, pos: Option<usize>) -> Result<Option<usize>> {
+        cache.pin_checkpoint(pos)
+    }
+
+    fn pins_checkpoints(&self, cache: &Self::Cache) -> bool {
+        cache.has_pin_frame()
+    }
+
+    fn pinned_checkpoint(&self, cache: &Self::Cache) -> Option<usize> {
+        cache.pinned_checkpoint()
+    }
+
     fn vocab_size(&self) -> usize {
         // `lm_head` is `[vocab, hidden]` (`Model::new`: `linear(hidden, vocab)`
         // or the tied `[vocab, hidden]` embedding), so its leading dim is the
@@ -11372,6 +11578,10 @@ impl<P: Profile> crate::nn::model::CacheRewind for State<P> {
 
     fn can_restore(&self, pos: usize) -> bool {
         State::<P>::can_restore(self, pos)
+    }
+
+    fn restore_point(&self, pos: usize) -> Option<usize> {
+        State::<P>::restore_point(self, pos)
     }
 
     fn restore(&mut self, pos: usize) -> Result<()> {

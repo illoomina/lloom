@@ -66,6 +66,10 @@ pub struct LoadOptions {
     /// (`sequence-reuse-design.md` §2.3b). Admitted beside the weights:
     /// as many as the budget fits, at most this.
     pub checkpoints: usize,
+    /// One frame more beside them for a checkpoint a session pins
+    /// (`StateCapacity::pin`), admitted after them against the same budget:
+    /// the pin gets a frame only once every turn checkpoint has one.
+    pub pin: bool,
     /// What the attention is built for ([`ExecutionPurpose`]): production
     /// refuses at load, on Metal, a full-attention layer whose attention
     /// takes the composed path; the reference (the default) keeps it, for a
@@ -85,6 +89,7 @@ impl Default for LoadOptions {
             recovery: DecodeRecovery::None,
             machine: None,
             checkpoints: 2,
+            pin: false,
             purpose: ExecutionPurpose::Reference,
         }
     }
@@ -392,6 +397,7 @@ fn capacity(cfg: &Config, opts: &LoadOptions) -> StateCapacity {
         verify: opts.verify,
         recovery: opts.recovery,
         checkpoints: opts.checkpoints,
+        pin: opts.pin,
     }
 }
 
@@ -409,7 +415,9 @@ fn capacity_admitted<R: Read + Seek, L: crate::nn::decoder::Layer>(
         .map(|l| l.checkpoint_elems(&cap))
         .sum::<usize>()
         * lloom_tensor::DType::F32.size_in_bytes();
-    cap.checkpoints = admit_checkpoints(gg, opts.fraction(), frame, cap.checkpoints);
+    let frames = admit_checkpoints(gg, opts.fraction(), frame, cap.checkpoint_frames());
+    cap.checkpoints = frames.min(cap.checkpoints);
+    cap.pin = cap.pin && frames > cap.checkpoints;
     cap
 }
 

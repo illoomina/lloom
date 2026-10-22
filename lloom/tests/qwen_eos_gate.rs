@@ -66,6 +66,7 @@ fn model<P: Profile>(dev: &Device, verify: usize, kv: Kv) -> Result<(Qwen3_5<P>,
         verify,
         recovery: DecodeRecovery::Standing,
         checkpoints: 2,
+        pin: false,
     });
     Ok((model, ckpt.cfg.clone()))
 }

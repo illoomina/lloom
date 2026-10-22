@@ -151,6 +151,32 @@ pub trait CausalLM: Model {
         Ok(())
     }
 
+    /// Pin the turn checkpoint at `pos` so that no later checkpoint takes
+    /// its place until a rewind or a restore goes below it, or a reset
+    /// (`sessions.md` §8): the one standing there, else — while a request
+    /// is open — one its passes leave there beside the request's own, in
+    /// the same pass. `None` releases the pin. Returns where the pinned
+    /// checkpoint stands after the call. The default (a family without
+    /// checkpoints) pins nothing.
+    fn pin_checkpoint(
+        &self,
+        _cache: &mut Self::Cache,
+        _pos: Option<usize>,
+    ) -> Result<Option<usize>> {
+        Ok(None)
+    }
+
+    /// Whether `cache` keeps a frame for a pinned checkpoint
+    /// ([`Self::pin_checkpoint`]). The default keeps none.
+    fn pins_checkpoints(&self, _cache: &Self::Cache) -> bool {
+        false
+    }
+
+    /// Where `cache`'s pinned checkpoint stands. The default has none.
+    fn pinned_checkpoint(&self, _cache: &Self::Cache) -> Option<usize> {
+        None
+    }
+
     /// Arm a host fill for the decode steps that follow on `cache`, for a
     /// loop whose tokens stay on the device: each single-position forward
     /// then waits on the GPU for rows a producer thread fills from the token

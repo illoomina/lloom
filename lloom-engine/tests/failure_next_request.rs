@@ -104,6 +104,26 @@ impl CausalLM for Faulty {
     fn checkpoint_at(&self, cache: &mut Self::Cache, pos: usize) -> Result<()> {
         self.inner.checkpoint_at(cache, pos)
     }
+    fn open_checkpoint_request(
+        &self,
+        cache: &mut Self::Cache,
+        policy: lloom::nn::CheckpointPolicy,
+        end: usize,
+    ) -> Result<()> {
+        self.inner.open_checkpoint_request(cache, policy, end)
+    }
+    fn close_checkpoint_request(&self, cache: &mut Self::Cache) -> Result<()> {
+        self.inner.close_checkpoint_request(cache)
+    }
+    fn pin_checkpoint(&self, cache: &mut Self::Cache, pos: Option<usize>) -> Result<Option<usize>> {
+        self.inner.pin_checkpoint(cache, pos)
+    }
+    fn pins_checkpoints(&self, cache: &Self::Cache) -> bool {
+        self.inner.pins_checkpoints(cache)
+    }
+    fn pinned_checkpoint(&self, cache: &Self::Cache) -> Option<usize> {
+        self.inner.pinned_checkpoint(cache)
+    }
     fn settle_pending(&self, cache: &mut Self::Cache) -> Result<()> {
         self.inner.settle_pending(cache)
     }

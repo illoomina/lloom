@@ -284,6 +284,7 @@ fn decoded(engine: &Stub, ids: Vec<u32>) -> Decoded {
         stats: Default::default(),
         thinking: None,
         logprobs: None,
+        pin: Default::default(),
     }
 }
 

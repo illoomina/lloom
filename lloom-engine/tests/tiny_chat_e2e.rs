@@ -4117,7 +4117,7 @@ fn serve_rebuilds_an_updated_prefix_and_takes_keep_and_reset() {
         ),
         (
             json!({ "previous_response_id": id3, "input": [user2], "keep": "all" }),
-            "pin",
+            "swapped tier",
         ),
         (json!({ "messages": [user1], "keep": "bogus" }), "keep"),
         (
@@ -4152,6 +4152,175 @@ fn serve_rebuilds_an_updated_prefix_and_takes_keep_and_reset() {
     assert_eq!(status, 400, "{body}");
     drop(server);
     std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The pinned prefix through `lloom serve` (`docs/sessions.md` §5.4, §5.5,
+/// §8) on the families whose checkpoints take a pin, thinking off. `keep`
+/// resolves to `prefix` by default; the first turn takes the head's
+/// checkpoint in its own pass and pins it; it stands through the turns that
+/// follow; a compaction — the system prompt kept, a summary and a new turn —
+/// sent with `reset: cache` restores the head and prefills only what follows
+/// it (`prefix: reused`). `reset: prefix` with a changed system prompt
+/// rebuilds the head and pins the new one. The control: the same
+/// conversation on a server loaded with `--session-keep none` rebuilds the
+/// head, and refuses `keep: prefix` by name.
+#[test]
+fn serve_pins_the_head_and_a_compaction_restores_it() {
+    let families: [Family; 2] = [
+        ("qwen3_5", write::<Qwen3_5Tiny>, true),
+        ("lfm2", write::<Lfm2Tiny>, false),
+    ];
+    let sys = json!({ "role": "system", "content": "You are a terse assistant. Answer in one word, always." });
+    let sys2 =
+        json!({ "role": "system", "content": "You are a verbose assistant now, and you explain." });
+    let summary = json!({ "role": "user", "content": "Summary: we spoke about capitals." });
+    let user = |k: usize| json!({ "role": "user", "content": format!("And country number {k}?") });
+    for (name, write_it, gguf) in families {
+        let dir = scratch(&format!("session-pin-{name}"));
+        let model = write_it(&dir);
+        let tok = dir.join("tokenizer.json").to_str().unwrap().to_string();
+        let mut base: Vec<String> = vec!["--cpu".into(), "--prefix-reuse".into(), "true".into()];
+        if gguf {
+            base.extend(["--tokenizer".into(), tok]);
+        }
+        // The conversation: three turns, then the compaction. Returns the
+        // compaction's response and the head the first turn reported.
+        let run = |server: &Server, pinned: bool| -> (Value, Option<u64>) {
+            let one = ok(server, json!({ "messages": [sys, user(1)], "store": true }));
+            let s = &one["timings"]["session"];
+            eprintln!("SESSION-PIN {name} turn 1: {s}");
+            let head = s["pinned"].as_u64();
+            if pinned {
+                assert_eq!(s["keep"], "prefix", "{name}: {s}");
+                assert_eq!(
+                    s["pin"], "taken",
+                    "{name}: the first turn takes the head: {s}"
+                );
+                assert!(head.is_some_and(|h| h > 1), "{name}: {s}");
+            } else {
+                assert_eq!(s["keep"], "none", "{name}: {s}");
+                assert_eq!(s["pin"], "off", "{name}: {s}");
+                assert_eq!(s["pinned"], Value::Null, "{name}: {s}");
+            }
+            let mut id = session_id(&one);
+            for k in 2..=3 {
+                let r = ok(
+                    server,
+                    json!({ "previous_response_id": id, "input": [user(k)] }),
+                );
+                let s = &r["timings"]["session"];
+                eprintln!(
+                    "SESSION-PIN {name} turn {k}: {s} turn={}",
+                    r["timings"]["turn"]
+                );
+                if pinned {
+                    assert_eq!(s["pin"], "kept", "{name} turn {k}: {s}");
+                    assert_eq!(s["pinned"].as_u64(), head, "{name} turn {k}: {s}");
+                }
+                id = session_id(&r);
+            }
+            let c = ok(
+                server,
+                json!({ "previous_response_id": id, "messages": [sys, summary, user(4)],
+                        "reset": "cache", "return_token_ids": true }),
+            );
+            let (s, t) = (&c["timings"]["session"], &c["timings"]["turn"]);
+            eprintln!("SESSION-PIN {name} compaction (pinned {pinned}): {s} turn={t}");
+            assert_eq!(s["reset"], "cache", "{name}: {s}");
+            (c, head)
+        };
+
+        let server = Server::start(&model, &base.iter().map(String::as_str).collect::<Vec<_>>());
+        let (status, f) = server.call("GET", "/v1l/features", &json!({}));
+        assert_eq!(status, 200, "{f}");
+        assert_eq!(f["sessions"]["keep"]["default"], "prefix", "{name}: {f}");
+        assert_eq!(f["sessions"]["keep"]["prefix"], true, "{name}: {f}");
+        let (c, head) = run(&server, true);
+        let head = head.unwrap();
+        let (s, t) = (&c["timings"]["session"], &c["timings"]["turn"]);
+        assert_eq!(
+            s["pin"], "kept",
+            "{name}: `reset: cache` keeps the pin: {s}"
+        );
+        assert_eq!(s["prefix"], "reused", "{name}: {s}");
+        assert_eq!(t["outcome"], "restore", "{name}: {t}");
+        assert_eq!(
+            t["reused"].as_u64(),
+            Some(head),
+            "{name}: the head restored: {t}"
+        );
+        let prompt = c["usage"]["prompt_tokens"].as_u64().unwrap();
+        let (replayed, prefilled) = (
+            t["replayed"].as_u64().unwrap(),
+            t["prefilled"].as_u64().unwrap(),
+        );
+        assert_eq!(
+            head + replayed + prefilled,
+            prompt,
+            "{name}: only what follows the head is prefilled: {t}"
+        );
+        // `reset: prefix` over the same head: the pin is released before the
+        // request is prepared, so the head is rebuilt, then pinned again.
+        let id = session_id(&c);
+        let r = ok(
+            &server,
+            json!({ "previous_response_id": id, "messages": [sys, summary, user(5)],
+                    "reset": "prefix" }),
+        );
+        let s = &r["timings"]["session"];
+        eprintln!(
+            "SESSION-PIN {name} reset prefix, same head: {s} turn={}",
+            r["timings"]["turn"]
+        );
+        assert_eq!(
+            s["prefix"], "rebuilt",
+            "{name}: the released head is rebuilt: {s}"
+        );
+        assert_eq!(s["pin"], "taken", "{name}: {s}");
+        assert_eq!(s["pinned"].as_u64(), Some(head), "{name}: {s}");
+        // With a changed system prompt: the new head rebuilt and pinned.
+        let id = session_id(&r);
+        let p = ok(
+            &server,
+            json!({ "previous_response_id": id, "messages": [sys2, user(5)], "reset": "prefix" }),
+        );
+        let s = &p["timings"]["session"];
+        eprintln!(
+            "SESSION-PIN {name} reset prefix: {s} turn={}",
+            p["timings"]["turn"]
+        );
+        assert_eq!(s["prefix"], "rebuilt", "{name}: {s}");
+        assert_eq!(s["pin"], "taken", "{name}: the new head pinned: {s}");
+        assert!(s["pinned"].as_u64().is_some_and(|h| h > 1), "{name}: {s}");
+        drop(server);
+
+        // The control: no frame for the pin.
+        let mut args: Vec<&str> = base.iter().map(String::as_str).collect();
+        args.extend(["--session-keep", "none"]);
+        let server = Server::start(&model, &args);
+        let (_, f) = server.call("GET", "/v1l/features", &json!({}));
+        assert_eq!(f["sessions"]["keep"]["default"], "none", "{name}: {f}");
+        assert!(f["sessions"]["keep"]["prefix"].is_string(), "{name}: {f}");
+        let (c, _) = run(&server, false);
+        let (s, t) = (&c["timings"]["session"], &c["timings"]["turn"]);
+        assert_eq!(
+            s["prefix"], "rebuilt",
+            "{name}: the control rebuilds the head: {s}"
+        );
+        assert!(
+            t["reused"].as_u64().unwrap() < head,
+            "{name}: the control keeps less than the head: {t}"
+        );
+        let (status, body) = server.call(
+            "POST",
+            "/v1/chat/completions",
+            &session_req(json!({ "messages": [sys, user(1)], "keep": "prefix" })),
+        );
+        assert_eq!(status, 400, "{name}: {body}");
+        assert!(body.to_string().contains("pinned head"), "{name}: {body}");
+        drop(server);
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }
 
 /// `GET /v1l/features` says what the sessions serve; a streamed completion's

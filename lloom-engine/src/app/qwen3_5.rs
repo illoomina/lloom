@@ -46,6 +46,9 @@ pub struct LoadOptions {
     pub readback: ReadbackArm,
     pub decode: crate::DecodeConfig,
     pub reuse_prefix: bool,
+    /// One frame more in the checkpoint ring for a session's pinned head
+    /// (`Shape::pin_prefix`).
+    pub pin_prefix: bool,
     pub warmup: bool,
     pub seed_text: String,
     pub model_name: Option<String>,
@@ -146,6 +149,9 @@ pub struct Engine<M: Qwen3_5Model, X: Layer> {
     executor: crate::ExecutorConfig,
     installed: super::report::Installed,
     reuse_prefix: bool,
+    /// Why a session's head is not pinned here, `None` where it is
+    /// (`Served::prefix_pin_refused`).
+    pin_refused: Option<String>,
     prefill_tile: usize,
     mem_sample: bool,
     arch: &'static str,
@@ -514,6 +520,7 @@ fn load_on<P: Profile>(
             LoadAdmission::CallerScoped => None,
         },
         checkpoints: lloom::models::qwen3_5::LoadOptions::default().checkpoints,
+        pin: opts.pin_prefix,
         purpose: opts.purpose,
     };
     let t = Instant::now();
@@ -605,14 +612,34 @@ where
         // The turn checkpoints (`sequence-reuse-design.md` §2.3b): the ring
         // a request re-rendering the previous turn restores from, sized
         // from the recurrent layers' state and admitted beside the weights.
-        let (slots, frame) = (model.capacity().checkpoints, model.checkpoint_frame_bytes());
+        let cap = model.capacity();
+        let (slots, frame) = (cap.checkpoints, model.checkpoint_frame_bytes());
+        let frames = cap.checkpoint_frames();
         eprintln!(
-            "[checkpoint ring: {slots} × {:.1} MiB ({:.1} MiB; 0 = every re-rendered turn prefills whole)]",
+            "[checkpoint ring: {slots} × {:.1} MiB{} ({:.1} MiB; 0 = every re-rendered turn prefills whole)]",
             frame as f64 / (1024.0 * 1024.0),
-            (slots * frame) as f64 / (1024.0 * 1024.0)
+            if cap.pin { " + 1 for the pinned head" } else { "" },
+            (frames * frame) as f64 / (1024.0 * 1024.0)
         );
-        tier["turn_checkpoints"] =
-            json!({ "slots": slots, "frame_bytes": frame, "bytes": slots * frame });
+        tier["turn_checkpoints"] = json!({
+            "slots": slots,
+            "pin": cap.pin,
+            "frame_bytes": frame,
+            "bytes": frames * frame,
+        });
+        let pin_refused = match (opts.pin_prefix, cap.pin) {
+            (_, true) => None,
+            (false, false) => Some(
+                "the load keeps no frame for a pinned head: session.keep is none, prefix reuse \
+                 is off, or the engine runs more than one sequence (docs/sessions.md §8)"
+                    .to_string(),
+            ),
+            (true, false) => Some(format!(
+                "the memory budget admitted no frame for a pinned head beside the {slots} turn \
+                 checkpoints ({:.1} MiB a frame; docs/sessions.md §8)",
+                frame as f64 / (1024.0 * 1024.0)
+            )),
+        };
         let engine = Engine {
             model: Arc::new(model),
             mtp,
@@ -625,6 +652,7 @@ where
             readback: opts.readback,
             executor: opts.executor.clone(),
             reuse_prefix: opts.reuse_prefix,
+            pin_refused,
             prefill_tile: opts.prefill_tile,
             mem_sample: opts.mem_sample,
             arch,
@@ -756,6 +784,9 @@ where
     }
     fn reuse_prefix(&self) -> Option<bool> {
         Some(self.reuse_prefix)
+    }
+    fn prefix_pin_refused(&self) -> Option<String> {
+        self.pin_refused.clone()
     }
     fn prefill_tile(&self) -> usize {
         self.prefill_tile

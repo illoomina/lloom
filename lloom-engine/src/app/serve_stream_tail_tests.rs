@@ -300,6 +300,7 @@ impl Served for Scripted {
             stats: Default::default(),
             thinking: None,
             logprobs: None,
+            pin: Default::default(),
         })
     }
     fn prefill_throughput(&self, _: usize, _: usize) -> Result<PrefillTiming> {

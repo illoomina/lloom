@@ -16,6 +16,25 @@ use std::time::{Duration, Instant};
 
 const PREFIX: &str = "chatcmpl-";
 
+/// What a session keeps of the engine's state when the engine's state must
+/// give way (`docs/sessions.md` §5.4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Keep {
+    /// The session's ids and messages.
+    None,
+    /// And its head's state, pinned in the engine.
+    Prefix,
+}
+
+impl Keep {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Prefix => "prefix",
+        }
+    }
+}
+
 /// How many sessions a server keeps, and for how long.
 #[derive(Debug, Clone, Copy)]
 pub struct Config {
@@ -30,6 +49,8 @@ pub struct Config {
     /// Whether the engine runs one sequence (`--batch 1`), so that which
     /// session it holds is the last one served.
     pub one_sequence: bool,
+    /// What a session keeps when no request of it says (`session.keep`).
+    pub keep: Keep,
 }
 
 /// A slot and its generation: one session's place in the table.
@@ -97,6 +118,8 @@ struct Turn {
 struct Session {
     stored: bool,
     auth: Option<[u8; 32]>,
+    /// The latest `keep` a request of the session asked.
+    keep: Option<Keep>,
     turns: Vec<Turn>,
     /// The latest turn's conversation, its reply message last.
     messages: Vec<Value>,
@@ -136,6 +159,8 @@ pub struct Resolved {
     /// Times the session found the engine serving another, before this
     /// request.
     pub switches: u64,
+    /// The latest `keep` a request of the session asked.
+    pub keep: Option<Keep>,
 }
 
 /// A turn reserved before its run: the id the response carries.
@@ -151,6 +176,8 @@ pub struct Plan<'a> {
     pub continued: Option<(Key, usize)>,
     /// `store` as the request said it.
     pub store: Option<bool>,
+    /// `keep` as the request said it: the session's from now on.
+    pub keep: Option<Keep>,
     pub auth: Option<[u8; 32]>,
     pub prompt_ids: &'a [u32],
     /// The scope before each of the request's messages and after the last.
@@ -401,6 +428,7 @@ impl Table {
             messages: msgs,
             ids: s.ids[..(turn.ids_end - usize::from(turn.eot)).min(s.ids.len())].to_vec(),
             switches: s.switches,
+            keep: s.keep,
         })
     }
 
@@ -481,6 +509,7 @@ impl Table {
                 self.slots[i].session = Some(Session {
                     stored,
                     auth: plan.auth,
+                    keep: None,
                     turns: Vec::new(),
                     messages: Vec::new(),
                     ids: Vec::new(),
@@ -497,6 +526,9 @@ impl Table {
             }
         };
         let s = self.get_mut(key).expect("reserved above");
+        if plan.keep.is_some() {
+            s.keep = plan.keep;
+        }
         // A turn stays in the lineage while the request's conversation
         // carries its reply: the messages before it are the ones it answered
         // and a message stands where its reply did. Of its ids, only those
@@ -617,6 +649,7 @@ impl Table {
             "messages": s.messages.len(),
             "bytes": s.bytes.max(s.ids.len() * 4),
             "switches": s.switches,
+            "keep": s.keep.unwrap_or(self.cfg.keep).name(),
             "age_s": now.saturating_duration_since(s.created).as_secs(),
             "idle_s": now.saturating_duration_since(s.last_used).as_secs(),
             "expires_in_s": ttl.saturating_sub(now.saturating_duration_since(s.last_used)).as_secs(),
@@ -644,6 +677,7 @@ impl Table {
             "ephemeral": held(self.ephemeral_slots()),
             "capacity": self.cfg.capacity,
             "ttl_s": self.cfg.ttl.as_secs(),
+            "keep": self.cfg.keep.name(),
             "bytes": self.bytes,
             "max_bytes": self.cfg.max_bytes,
             "created": self.counters.created,

@@ -1202,6 +1202,11 @@ impl<P: QwenShape, R: ExpertResidency + HasStreamStats + Send + Sync + 'static> 
             stats: done.stats,
             thinking: None,
             logprobs: None,
+            // The scheduler's rows keep no pin.
+            pin: crate::PinReport {
+                asked: params.pin_prefix,
+                ..Default::default()
+            },
         })
     }
 

@@ -1066,6 +1066,12 @@ fn chat_completions(shared: &Shared, v: &Value, auth: Option<[u8; 32]>) -> Handl
                 .into(),
         ));
     }
+    let keep = resolve_keep(
+        shared.engine.as_ref(),
+        shared.sessions.lock().config().keep,
+        ask.keep,
+        resolved.as_ref().and_then(|r| r.keep),
+    )?;
     // The `input` form's conversation: the session's through the continued
     // turn, its reply as the response returned it, then the new messages.
     let joined: Option<Value> = match (&ask.input, &resolved) {
@@ -1443,6 +1449,7 @@ fn chat_completions(shared: &Shared, v: &Value, auth: Option<[u8; 32]>) -> Handl
                 super::sessions::Plan {
                     continued: resolved.as_ref().map(|r| (r.key, r.turn)),
                     store: ask.store,
+                    keep: ask.keep,
                     auth,
                     prompt_ids: &prompt_ids,
                     scopes: &p.scopes,
@@ -1460,6 +1467,7 @@ fn chat_completions(shared: &Shared, v: &Value, auth: Option<[u8; 32]>) -> Handl
                 asked: ask.previous.is_some(),
                 input: ask.input.is_some(),
                 reset: ask.reset,
+                keep,
                 conversation: sent.and_then(Value::as_array).cloned().unwrap_or_default(),
                 scope: p.origin.scope,
                 record: p.record.clone(),
@@ -1473,6 +1481,14 @@ fn chat_completions(shared: &Shared, v: &Value, auth: Option<[u8; 32]>) -> Handl
     if session.is_none() {
         shared.sessions.lock().note_other();
     }
+    // The session's head, pinned in the engine (`docs/sessions.md` §8): a
+    // conversation's turn whose head holds more than a BOS. `reset: prefix`
+    // releases the pin first, so the head is rebuilt and pinned again.
+    params.pin_prefix = session
+        .as_ref()
+        .filter(|s| s.keep == super::sessions::Keep::Prefix && s.head > 1)
+        .map(|s| s.head);
+    params.unpin_prefix = ask.reset == Some(Reset::Prefix);
     let id = session
         .as_ref()
         .map_or(random_id, |s| s.reservation.id.encode());
@@ -1603,10 +1619,12 @@ fn chat_completions(shared: &Shared, v: &Value, auth: Option<[u8; 32]>) -> Handl
 /// The routes a session is inspected and expired by.
 const SESSIONS_ROUTE: &str = "/v1l/sessions/";
 
-/// What a session's `keep` asks that this build cannot serve, and why: the
-/// engine has no checkpoint it never gives back (`docs/sessions.md` §8).
-const KEEP_REFUSED: &str = "not served by this build: the engine's checkpoint ring has no pin \
-     (docs/sessions.md §8); `keep: none` is";
+/// Why a session's `keep: all` is refused: the whole state kept across
+/// another conversation's requests is the swapped tier (`docs/sessions.md`
+/// §5.4, §12).
+const KEEP_ALL_REFUSED: &str = "not served by this build: the whole state kept across another \
+     conversation's requests is the swapped tier (docs/sessions.md §5.4, §12); `keep: prefix` \
+     and `keep: none` are";
 
 /// The harness's intent after a compaction (`docs/sessions.md` §5.5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1632,6 +1650,7 @@ struct SessionAsk {
     /// The Responses API's delta: messages appended to the continued turn.
     input: Option<Vec<Value>>,
     store: Option<bool>,
+    keep: Option<super::sessions::Keep>,
     reset: Option<Reset>,
 }
 
@@ -1657,14 +1676,15 @@ fn session_ask(v: &Value) -> Handled<SessionAsk> {
         Some(Value::Bool(b)) => Some(*b),
         Some(_) => return Err(bad("field 'store' must be a boolean")),
     };
-    match given("keep") {
-        None => {}
-        Some(Value::String(k)) if k == "none" => {}
-        Some(Value::String(k)) if k == "prefix" || k == "all" => {
-            return Err(bad(format!("keep: {k}: {KEEP_REFUSED}")))
+    let keep = match given("keep") {
+        None => None,
+        Some(Value::String(k)) if k == "none" => Some(super::sessions::Keep::None),
+        Some(Value::String(k)) if k == "prefix" => Some(super::sessions::Keep::Prefix),
+        Some(Value::String(k)) if k == "all" => {
+            return Err(bad(format!("keep: all: {KEEP_ALL_REFUSED}")))
         }
         Some(_) => return Err(bad("field 'keep' must be one of prefix, all, none")),
-    }
+    };
     let reset = match given("reset") {
         None => None,
         Some(Value::String(r)) if r == "cache" => Some(Reset::Cache),
@@ -1697,7 +1717,30 @@ fn session_ask(v: &Value) -> Handled<SessionAsk> {
         previous,
         input,
         store,
+        keep,
         reset,
+    })
+}
+
+/// The `keep` a request runs under (`docs/sessions.md` §5.4): its own, else
+/// its session's latest, else the server's (`session.keep`). `prefix` where
+/// this process pins no head is a 400 when the request asked it, and
+/// resolves to `none` otherwise.
+fn resolve_keep(
+    engine: &dyn Served,
+    default: super::sessions::Keep,
+    asked: Option<super::sessions::Keep>,
+    session: Option<super::sessions::Keep>,
+) -> Handled<super::sessions::Keep> {
+    use super::sessions::Keep;
+    let refused = engine.prefix_pin_refused();
+    if let (Some(Keep::Prefix), Some(why)) = (asked, &refused) {
+        return Err(bad(format!("keep: prefix: {why}")));
+    }
+    let keep = asked.or(session).unwrap_or(default);
+    Ok(match (keep, refused) {
+        (Keep::Prefix, Some(_)) => Keep::None,
+        (k, _) => k,
     })
 }
 
@@ -1719,6 +1762,10 @@ fn session_config(c: &crate::options::SessionConfig, batch: usize) -> super::ses
         ephemeral: batch.max(1),
         max_bytes: c.max_mib.saturating_mul(1 << 20),
         one_sequence: batch <= 1,
+        keep: match c.keep.as_str() {
+            "none" => super::sessions::Keep::None,
+            _ => super::sessions::Keep::Prefix,
+        },
     }
 }
 
@@ -1749,6 +1796,8 @@ struct SessionCtx {
     asked: bool,
     input: bool,
     reset: Option<Reset>,
+    /// The `keep` the request ran under ([`resolve_keep`]).
+    keep: super::sessions::Keep,
     /// The conversation as the request ran it (as sent).
     conversation: Vec<Value>,
     scope: front::Scope,
@@ -1850,14 +1899,23 @@ fn finish_session(
         "bound": ctx.bound,
         "recorded_tokens": ctx.recorded,
         "tokenized": ctx.encoded,
-        "keep": "none",
+        "keep": ctx.keep.name(),
+        "pin": decoded.pin.name(),
+        "pinned": decoded.pin.after,
         "reset": ctx.reset.map(Reset::name),
         "miss": ctx.miss.map(super::sessions::Miss::name),
     });
     let line = format!(
         "session={state} session_id={} session_kept={kept} session_history={history} \
-         session_prefix={prefix} reprefilled={reprefilled} recorded={} tokenized={}",
+         session_prefix={prefix} session_keep={} session_pin={} pinned={} \
+         reprefilled={reprefilled} recorded={} tokenized={}",
         id.short(),
+        ctx.keep.name(),
+        decoded.pin.name(),
+        decoded
+            .pin
+            .after
+            .map_or_else(|| "-".to_string(), |p| p.to_string()),
         ctx.recorded,
         ctx.encoded,
     );
@@ -1881,7 +1939,15 @@ fn features_body(shared: &Shared) -> Value {
                 "input": "the new messages, appended to the referenced turn's conversation; 404 when no session holds the id",
             },
             "store": { "default": false, "true": "kept until the TTL, the capacity or DELETE", "false": "kept while the engine holds its state" },
-            "keep": { "none": true, "prefix": KEEP_REFUSED, "all": KEEP_REFUSED },
+            "keep": {
+                "default": match (cfg.keep, engine.prefix_pin_refused()) {
+                    (super::sessions::Keep::Prefix, None) => "prefix",
+                    _ => "none",
+                },
+                "none": true,
+                "prefix": engine.prefix_pin_refused().map_or(json!(true), |why| json!(why)),
+                "all": KEEP_ALL_REFUSED,
+            },
             "reset": ["cache", "prefix", "all"],
             "ttl_s": cfg.ttl.as_secs(),
             "capacity": cfg.capacity,
@@ -2180,6 +2246,8 @@ fn sampling_params(
         prefill_tile: engine.prefill_tile(),
         turn_tail: 0,
         no_checkpoint: false,
+        pin_prefix: None,
+        unpin_prefix: false,
         thinking: None,
         logprobs: None,
         cold: false,
@@ -2892,6 +2960,8 @@ fn eval(shared: &Shared, request: Request, v: &Value) -> Result<()> {
                             prefill_tile: engine.prefill_tile(),
                             turn_tail: 0,
                             no_checkpoint: false,
+                            pin_prefix: None,
+                            unpin_prefix: false,
                             thinking: None,
                             logprobs: None,
                             cold: false,

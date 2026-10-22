@@ -1239,6 +1239,8 @@ impl SamplingConfig {
             thinking: None,
             turn_tail: 0,
             no_checkpoint: false,
+            pin_prefix: None,
+            unpin_prefix: false,
             logprobs: None,
             cold: false,
         }
@@ -1835,6 +1837,10 @@ fn parse_keep_logprobs(v: &str) -> Result<String, String> {
     lloom_tensor::options::parse_arm(v, &["none", "sampled", "full"]).map(str::to_string)
 }
 
+fn parse_session_keep(v: &str) -> Result<String, String> {
+    lloom_tensor::options::parse_arm(v, &["prefix", "none"]).map(str::to_string)
+}
+
 /// The conversation's history as the front end keeps it: the sampled ids of
 /// each reply, and what is kept beside them.
 #[derive(Options, Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -1870,6 +1876,9 @@ pub struct SessionConfig {
         status = "advanced"
     )]
     pub max_mib: usize,
+    /// What a session keeps of the engine's state when a request does not say (`keep`, `docs/sessions.md` §5.4): `prefix` pins the system prompt's checkpoint — one more frame of the checkpoint ring, admitted at load where the engine serves one sequence with prefix reuse on — so a compacted conversation that keeps the system prompt restores there; `none` keeps the session's ids alone and loads no frame for the pin.
+    #[opt(flag = "session-keep", parser = "parse_session_keep", variants = ["prefix", "none"], path = "session.keep", status = "advanced")]
+    pub keep: String,
 }
 
 impl Default for SessionConfig {
@@ -1882,6 +1891,7 @@ impl Default for SessionConfig {
             ttl_s: 3600,
             capacity: 64,
             max_mib: 64,
+            keep: "prefix".into(),
         }
     }
 }

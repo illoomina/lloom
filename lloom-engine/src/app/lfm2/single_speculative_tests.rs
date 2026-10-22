@@ -86,6 +86,7 @@ fn engine_fixture() -> Result<(Fixture<Lfm2Tiny>, TinyEngine)> {
                 bucket: 128,
                 grow_fraction: None,
             },
+            pin_refused: None,
             decisions: None,
             decision_ragged: false,
             trunks: Default::default(),

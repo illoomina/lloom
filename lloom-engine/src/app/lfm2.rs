@@ -334,6 +334,9 @@ pub struct Engine<P: Profile> {
     /// What the load reserved on the machine, released with the engine.
     pub machine: Option<Arc<lloom_tensor::machine::Holding>>,
     private_cache: PrivateCachePolicy,
+    /// Why a session's head is not pinned here, `None` where it is
+    /// (`Served::prefix_pin_refused`).
+    pin_refused: Option<String>,
     /// `/v1/systemone`'s executor binding: a native d1 checkpoint's own, or
     /// the template `decision.template` selected; `None` refuses by name.
     decisions: Option<ServedDecisions>,
@@ -359,6 +362,9 @@ pub struct LoadOptions {
     /// The model's axes: the cache preset and the per-axis overrides.
     pub model: crate::ModelConfig,
     pub reuse_prefix: bool,
+    /// One frame more in the turn ring for a session's pinned head
+    /// (`Shape::pin_prefix`).
+    pub pin_prefix: bool,
     pub warmup: bool,
     pub seed_text: String,
     pub model_name: Option<String>,
@@ -1237,6 +1243,7 @@ impl<P: Lfm2Shape> Engine<P> {
             longest,
             in_flight,
             config.memory_budget.and_then(|b| b.activation_rows),
+            opts.pin_prefix,
         );
         if let Some(dir) = &dspark_dir {
             let drafter = std::fs::metadata(dir.join("model.safetensors")).map_or(0, |m| m.len());
@@ -1285,7 +1292,20 @@ impl<P: Lfm2Shape> Engine<P> {
             grow_fraction: opts.memory.kv_grow_fraction,
         };
         let make_cache = |device: &Device| private_cache.create::<P>(&config, dtype, device);
-        let cache = make_cache(&device)?;
+        // The served sequence's ring keeps a frame for a session's pinned
+        // head; a decision's private cache keeps none.
+        let cache = make_cache(&device)?.with_pin_frame(opts.pin_prefix);
+        let pin_refused = (!cache.has_pin_frame()).then(|| {
+            if opts.pin_prefix {
+                "this KV arm keeps no turn checkpoints (`KvAppend::Cat`): nothing to pin \
+                 (docs/sessions.md §8)"
+                    .to_string()
+            } else {
+                "the load keeps no frame for a pinned head: session.keep is none, prefix reuse \
+                 is off, or the engine runs more than one sequence (docs/sessions.md §8)"
+                    .to_string()
+            }
+        });
 
         let model_name = opts
             .model_name
@@ -1337,6 +1357,7 @@ impl<P: Lfm2Shape> Engine<P> {
             load_warnings,
             machine,
             private_cache,
+            pin_refused,
             decisions,
             decision_ragged: opts.decision_ragged,
             trunks: Default::default(),
@@ -2152,6 +2173,11 @@ impl<P: Lfm2Shape> Engine<P> {
             stats: done.stats,
             thinking: None,
             logprobs: None,
+            // The scheduler's rows keep no pin.
+            pin: crate::PinReport {
+                asked: params.pin_prefix,
+                ..Default::default()
+            },
         })
     }
 
@@ -3192,6 +3218,7 @@ fn resolve_prefill_batch<P: Lfm2Shape>(
                     longest,
                     in_flight,
                     config.memory_budget.and_then(|b| b.activation_rows),
+                    opts.pin_prefix,
                 );
                 peak.total() as i128 + pools <= room
             });
@@ -3229,10 +3256,12 @@ fn machine_peak<P: Profile>(
     longest_forward: usize,
     in_flight: usize,
     activation_rows: Option<usize>,
+    pin_frame: bool,
 ) -> lloom_tensor::machine::Peak {
     let rows = batch.max(1);
     let mut peak = lloom_tensor::machine::Peak::new().with("weights", weights as u64);
-    for (name, bytes) in lloom::models::lfm2::state_floor_bytes(config, dtype, kv_floor) {
+    for (name, bytes) in lloom::models::lfm2::state_floor_bytes(config, dtype, kv_floor, pin_frame)
+    {
         let name = if rows > 1 {
             format!("{name} x {rows} rows")
         } else {
@@ -3335,6 +3364,9 @@ impl<P: Lfm2Shape> super::served::Served for Engine<P> {
     }
     fn reuse_prefix(&self) -> Option<bool> {
         Some(self.reuse_prefix)
+    }
+    fn prefix_pin_refused(&self) -> Option<String> {
+        self.pin_refused.clone()
     }
     fn prefill_tile(&self) -> usize {
         self.prefill_tile

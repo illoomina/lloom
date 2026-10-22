@@ -355,6 +355,16 @@ pub struct DecodeParams {
     /// The owner keeps nothing of this request's state for the next one
     /// (prefix reuse off): its prefill leaves no turn checkpoint.
     pub no_checkpoint: bool,
+    /// The session's head to keep pinned (`sessions.md` §8): its length in
+    /// ids, the front end's spans' (`Blocks::head`). The prefill leaves the
+    /// turn checkpoint there beside its own, in the same pass, and the cache
+    /// keeps it while the state holds it (`CausalLM::pin_checkpoint`).
+    /// `None` asks nothing; a pin standing stays.
+    pub pin_prefix: Option<usize>,
+    /// Release a standing pin before the request is prepared (a session's
+    /// `reset: prefix`): the head is rebuilt, then pinned again where
+    /// `pin_prefix` asks.
+    pub unpin_prefix: bool,
     /// Keep each returned id's log-probability (`Decoded::logprobs`). A host
     /// read of every step's logits: the run takes the blocking arm, as the
     /// logits digest does, and the speculative body and the batch scheduler
@@ -458,6 +468,8 @@ impl Default for DecodeParams {
             thinking: None,
             turn_tail: 0,
             no_checkpoint: false,
+            pin_prefix: None,
+            unpin_prefix: false,
             logprobs: None,
             cold: false,
         }
@@ -506,6 +518,41 @@ pub struct Decoded {
     /// Per returned id, its log-probability (and what else
     /// `DecodeParams::logprobs` asked for).
     pub logprobs: Option<Logprobs>,
+    /// What the request did with the session's pinned head.
+    pub pin: PinReport,
+}
+
+/// What a request did with the pinned head (`sessions.md` §8): what it
+/// asked ([`DecodeParams::pin_prefix`]) and where the pinned checkpoint
+/// stood when the run began and after it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PinReport {
+    pub asked: Option<usize>,
+    /// After the release the request asked for and its preparation: a
+    /// restore or a reset below the pin releases it.
+    pub before: Option<usize>,
+    pub after: Option<usize>,
+    /// The cache keeps a frame for a pin.
+    pub available: bool,
+    /// A pin stood and the request released it ([`DecodeParams::unpin_prefix`]).
+    pub released: bool,
+}
+
+impl PinReport {
+    /// `taken` (this run pinned the head), `kept` (it stood throughout),
+    /// `missed` (asked, and not standing after the run: the head was behind
+    /// the prepared position with nothing standing there, or past the
+    /// pass's reach), `unavailable` (asked, no frame for it), `off` (not
+    /// asked).
+    pub fn name(&self) -> &'static str {
+        match self.asked {
+            None => "off",
+            Some(_) if !self.available => "unavailable",
+            Some(h) if self.after != Some(h) => "missed",
+            Some(h) if self.before == Some(h) => "kept",
+            Some(_) => "taken",
+        }
+    }
 }
 
 impl Decoded {
@@ -819,6 +866,23 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
     pub fn decode_until(
         &mut self,
         prompt_ids: &[u32],
+        detokenize: impl FnMut(&[u32]) -> Result<String> + Send,
+        params: &DecodeParams,
+        on_fragment: impl FnMut(&str) -> bool + Send,
+    ) -> Result<Decoded>
+    where
+        M::Cache: CacheRewind + CacheReset,
+    {
+        let released = self.release_pin(params)?;
+        let out = self.decode_until_open(prompt_ids, detokenize, params, on_fragment);
+        self.close_request(out, released)
+    }
+
+    /// [`Self::decode_until`]'s run, its checkpoint request opened after the
+    /// preparation and closed by the caller.
+    fn decode_until_open(
+        &mut self,
+        prompt_ids: &[u32],
         mut detokenize: impl FnMut(&[u32]) -> Result<String> + Send,
         params: &DecodeParams,
         mut on_fragment: impl FnMut(&str) -> bool + Send,
@@ -851,7 +915,7 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
             "DecodeSession::decode",
         )?;
         let (prepared, turn) = crate::turn::prepare(&mut self.session, prompt_ids, true)?;
-        let (checkpoint, checkpoint_at) = self.establish_checkpoint(&prepared, params)?;
+        let (checkpoint, checkpoint_at, pin) = self.establish_checkpoint(&prepared, params)?;
         sampler.observe_prompt(prompt_ids);
         let mut spec = IdentityProposer;
 
@@ -1065,28 +1129,26 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
             stats: out.stats,
             thinking,
             logprobs,
+            pin,
         })
     }
 }
 
 impl<'m, M: CausalLM> DecodeSession<'m, M> {
     /// The turn checkpoint this request's prefill leaves
-    /// ([`crate::turn::CheckpointPolicy::of`]), established on the cache
-    /// whatever the request before it asked; returned with the position it
-    /// resolves to.
-    ///
-    /// Until the checkpoint ring takes a request's policy itself
-    /// (`sequence-reuse-design.md` §2.3b), it is expressed through the
-    /// cache's one hint (`CausalLM::checkpoint_at`):
-    /// `At` and `End` hint their position, which a pass covering it meets
-    /// and no other tile does; `None` hints a position no pass reaches, which
-    /// the next request's hint replaces. A cache without checkpoints ignores
-    /// every hint.
+    /// ([`crate::turn::CheckpointPolicy::of`]), opened on the cache as the
+    /// request's own whatever the request before it asked
+    /// (`CausalLM::open_checkpoint_request`), and the head to pin beside it
+    /// where the request asks one (`CausalLM::pin_checkpoint`: the head's
+    /// checkpoint standing, else taken in the same pass). Returned with the
+    /// position the request's own resolves to and the pin as it stood. The
+    /// caller closes the request when the run ends, failed or not
+    /// ([`Self::close_request`]).
     fn establish_checkpoint(
         &mut self,
         prepared: &lloom::nn::Prepared,
         params: &DecodeParams,
-    ) -> Result<(crate::turn::CheckpointPolicy, Option<usize>)> {
+    ) -> Result<(crate::turn::CheckpointPolicy, Option<usize>, PinReport)> {
         let pos = self.session.pos();
         let end = pos + prepared.suffix.len();
         let policy = crate::turn::CheckpointPolicy::of(
@@ -1097,8 +1159,43 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
         );
         let at = policy.position(end);
         let model = self.session.model();
-        model.checkpoint_at(self.session.cache_mut(), at.unwrap_or(usize::MAX))?;
-        Ok((policy, at))
+        let cache = self.session.cache_mut();
+        let pin = PinReport {
+            asked: params.pin_prefix,
+            before: model.pinned_checkpoint(cache),
+            available: model.pins_checkpoints(cache),
+            ..PinReport::default()
+        };
+        model.open_checkpoint_request(cache, policy.into(), end)?;
+        if let Some(head) = params.pin_prefix.filter(|_| !params.no_checkpoint) {
+            model.pin_checkpoint(cache, Some(head))?;
+        }
+        Ok((policy, at, pin))
+    }
+
+    /// Release the pin before the request is prepared, where it asks
+    /// ([`DecodeParams::unpin_prefix`]). Whether one stood.
+    fn release_pin(&mut self, params: &DecodeParams) -> Result<bool> {
+        if !params.unpin_prefix {
+            return Ok(false);
+        }
+        let model = self.session.model();
+        let cache = self.session.cache_mut();
+        let stood = model.pinned_checkpoint(cache).is_some();
+        model.pin_checkpoint(cache, None)?;
+        Ok(stood)
+    }
+
+    /// Close the run's checkpoint request, whatever the run returned, and
+    /// report where the pinned checkpoint stands after it.
+    fn close_request(&mut self, out: Result<Decoded>, released: bool) -> Result<Decoded> {
+        let model = self.session.model();
+        let closed = model.close_checkpoint_request(self.session.cache_mut());
+        let mut decoded = out?;
+        closed?;
+        decoded.pin.after = model.pinned_checkpoint(self.session.sequence().cache());
+        decoded.pin.released = released;
+        Ok(decoded)
     }
 
     /// [`Self::decode_until`] through the speculative body: `spec` drafts a
@@ -1113,6 +1210,28 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
     /// prompt the cache holds whole re-feeds its last token
     /// (`Session::prepare_with`).
     pub fn decode_speculative_until<S>(
+        &mut self,
+        rewind: lloom::profile::RewindProof<M::Profile>,
+        spec: &mut S,
+        prompt_ids: &[u32],
+        detokenize: impl FnMut(&[u32]) -> Result<String> + Send,
+        params: &DecodeParams,
+        on_fragment: impl FnMut(&str) -> bool + Send,
+    ) -> Result<Decoded>
+    where
+        S: lloom::nn::Speculator,
+        M: lloom::nn::Probes<S::Probe> + lloom::profile::Shaped,
+        M::Cache: CacheRewind + CacheReset,
+    {
+        let released = self.release_pin(params)?;
+        let out =
+            self.decode_speculative_open(rewind, spec, prompt_ids, detokenize, params, on_fragment);
+        self.close_request(out, released)
+    }
+
+    /// [`Self::decode_speculative_until`]'s run, its checkpoint request
+    /// opened after the preparation and closed by the caller.
+    fn decode_speculative_open<S>(
         &mut self,
         rewind: lloom::profile::RewindProof<M::Profile>,
         spec: &mut S,
@@ -1147,7 +1266,7 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
         // A prompt the cache holds whole re-feeds its last token: the first
         // round needs the target's probe there, which held logits lack.
         let (prepared, turn) = crate::turn::prepare(&mut self.session, prompt_ids, false)?;
-        let (checkpoint, checkpoint_at) = self.establish_checkpoint(&prepared, params)?;
+        let (checkpoint, checkpoint_at, pin) = self.establish_checkpoint(&prepared, params)?;
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let mut stream = crate::stream::TextStream::new(params.max_tokens);
         let mut stopped_on_string = false;
@@ -1233,6 +1352,7 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
             stats: out.stats,
             thinking,
             logprobs: None,
+            pin,
         })
     }
 }

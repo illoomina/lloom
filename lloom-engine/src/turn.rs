@@ -89,6 +89,16 @@ impl CheckpointPolicy {
     }
 }
 
+impl From<CheckpointPolicy> for lloom::nn::CheckpointPolicy {
+    fn from(p: CheckpointPolicy) -> Self {
+        match p {
+            CheckpointPolicy::None => Self::None,
+            CheckpointPolicy::End => Self::End,
+            CheckpointPolicy::At(p) => Self::At(p),
+        }
+    }
+}
+
 /// What the request did with the session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Outcome {

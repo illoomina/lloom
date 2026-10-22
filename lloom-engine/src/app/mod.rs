@@ -62,6 +62,10 @@ pub struct Shape {
     pub share_prefix: bool,
     /// `scheduler.decision_ragged`; taken only under the `fast` contract.
     pub decision_ragged: bool,
+    /// The load keeps a frame of the checkpoint ring for a session's pinned
+    /// head (`session.keep = prefix`, `docs/sessions.md` §8): `serve`, one
+    /// sequence, prefix reuse on.
+    pub pin_prefix: bool,
 }
 
 impl Shape {
@@ -86,6 +90,10 @@ impl Shape {
             rows: o.scheduler.rows.clone(),
             share_prefix: o.prefix.share,
             decision_ragged: o.scheduler.decision_ragged,
+            pin_prefix: frontend == crate::frontend::Frontend::Serve
+                && o.session.keep == "prefix"
+                && o.prefix.reuse.unwrap_or_else(|| frontend.reuse_prefix())
+                && o.scheduler.max_sequences <= 1,
         }
     }
 }
@@ -1080,6 +1088,7 @@ mod option_layer_tests {
                 rows: "auto".into(),
                 share_prefix: false,
                 decision_ragged: true,
+                pin_prefix: false,
             }
         };
         let mut s = shape(&["--replay"]);

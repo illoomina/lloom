@@ -51,6 +51,10 @@ pub struct StateCapacity {
     /// `checkpoints` multi-token passes' states, in a ring. 0: none, every
     /// request past the horizon is a fresh prefill.
     pub checkpoints: usize,
+    /// One frame more in the ring, for a checkpoint a session pins
+    /// (`CheckpointRing::pin`): its head's, which the turn checkpoints never
+    /// take (`sessions.md` §8).
+    pub pin: bool,
 }
 
 /// What a decode step leaves undoable after it.
@@ -84,7 +88,14 @@ impl StateCapacity {
             verify: 0,
             recovery: DecodeRecovery::None,
             checkpoints: 0,
+            pin: false,
         }
+    }
+
+    /// The frames a state's checkpoint ring holds: the turn checkpoints'
+    /// and the pin's.
+    pub fn checkpoint_frames(&self) -> usize {
+        self.checkpoints + usize::from(self.pin)
     }
 
     /// Phases a recurrent channel's ring holds at a rewindable profile:
@@ -107,6 +118,18 @@ pub struct WindowMark {
     pub tokens: usize,
     pub blocks: usize,
 }
+
+/// The turn checkpoints one chunk of a pass leaves
+/// (`CheckpointRing::takes_for`), in row order: per take, the rows into the
+/// chunk and the ring frame it is copied into (`None` for a mixer whose
+/// checkpoint is its mark alone). At most [`MAX_TAKES`].
+pub type ChunkTakes<'a> = [(usize, Option<&'a Tensor>)];
+
+/// The most turn checkpoints a chunk leaves: a request's own and the pin's.
+pub const MAX_TAKES: usize = 2;
+
+/// The marks a chunk's takes leave, one per take, in the takes' order.
+pub type TakeMarks = [WindowMark; MAX_TAKES];
 
 /// Bytes a sequence's state holds, or a pass would add to it, by kind: the
 /// attention layers' KV and the recurrent layers' state.
@@ -197,19 +220,19 @@ pub trait MixerBlock: Mixer + Send + Sync {
     /// frame: a recurrent state's `S` and conv window; 0 for a KV cache,
     /// whose checkpoint is a length (the mark).
     fn checkpoint_elems(&self, cap: &StateCapacity) -> usize;
-    /// [`Mixer::execute`] over `x`, leaving a turn checkpoint of the state
-    /// after the chunk's first `rows` positions in `into` (`[checkpoint_elems]`
-    /// f32; `None` for a mixer that keeps none) and returning the mark a
-    /// restore needs. `rows == seq` is the state the pass leaves, `rows ==
-    /// 0` the one before it; in between, a recurrent state runs its
-    /// recurrence a second time over the prefix (the pass is unchanged).
+    /// [`Mixer::execute`] over `x`, leaving for each take a turn checkpoint
+    /// of the state after the chunk's first `rows` positions in its frame
+    /// (`[checkpoint_elems]` f32; `None` for a mixer that keeps none) and
+    /// returning, per take, the mark a restore needs. `rows == seq` is the
+    /// state the pass leaves, `rows == 0` the one before it; in between, a
+    /// recurrent state runs its recurrence a second time over the prefix,
+    /// once per such take (the pass is unchanged).
     fn execute_checkpointing(
         &self,
         x: &Tensor,
         state: &mut Self::State,
-        rows: usize,
-        into: Option<&Tensor>,
-    ) -> Result<(Tensor, WindowMark)>;
+        takes: &ChunkTakes<'_>,
+    ) -> Result<(Tensor, TakeMarks)>;
     /// Put the state back where a checkpoint was taken, outside a window.
     fn restore_checkpoint(
         state: &mut Self::State,
@@ -264,9 +287,8 @@ pub trait Layer: Send + Sync {
         &self,
         x: &Tensor,
         state: &mut Self::State,
-        rows: usize,
-        into: Option<&Tensor>,
-    ) -> Result<(Tensor, WindowMark)>;
+        takes: &ChunkTakes<'_>,
+    ) -> Result<(Tensor, TakeMarks)>;
     fn restore_checkpoint(
         state: &mut Self::State,
         from: Option<&Tensor>,
@@ -482,17 +504,16 @@ where
         &self,
         x: &Tensor,
         state: &mut Self::State,
-        rows: usize,
-        into: Option<&Tensor>,
-    ) -> Result<(Tensor, WindowMark)> {
+        takes: &ChunkTakes<'_>,
+    ) -> Result<(Tensor, TakeMarks)> {
         let h = self.norm_in.execute(x)?;
-        let (m, mark) = self
+        let (m, marks) = self
             .mixer
-            .execute_checkpointing(&h, &mut state.mixer, rows, into)?;
+            .execute_checkpointing(&h, &mut state.mixer, takes)?;
         let x = (x + m)?;
         let h = self.norm_mid.execute(&x)?;
         let f = self.ffn.execute(&h, &mut state.ffn)?;
-        Ok(((x + f)?, mark))
+        Ok(((x + f)?, marks))
     }
     fn restore_checkpoint(
         state: &mut Self::State,
@@ -643,12 +664,11 @@ where
         &self,
         x: &Tensor,
         state: &mut Self::State,
-        rows: usize,
-        into: Option<&Tensor>,
-    ) -> Result<(Tensor, WindowMark)> {
+        takes: &ChunkTakes<'_>,
+    ) -> Result<(Tensor, TakeMarks)> {
         match (self, state) {
-            (Hybrid::A(m), HybridState::A(s)) => m.execute_checkpointing(x, s, rows, into),
-            (Hybrid::B(m), HybridState::B(s)) => m.execute_checkpointing(x, s, rows, into),
+            (Hybrid::A(m), HybridState::A(s)) => m.execute_checkpointing(x, s, takes),
+            (Hybrid::B(m), HybridState::B(s)) => m.execute_checkpointing(x, s, takes),
             _ => lloom_tensor::bail!("a hybrid layer's state is the other mixer's"),
         }
     }
@@ -897,6 +917,13 @@ impl<L: Layer> DecoderState<L> {
         self
     }
 
+    /// One frame more in the checkpoint ring, for a pinned checkpoint
+    /// (`StateCapacity::pin`).
+    pub fn with_pin_frame(mut self, on: bool) -> Self {
+        self.ckpt = std::mem::replace(&mut self.ckpt, CheckpointRing::none()).with_pin_frame(on);
+        self
+    }
+
     /// Leave every decode step's window open as the standing one (`on`).
     pub fn with_standing_window(mut self, on: bool) -> Self {
         self.keeps_standing = on;
@@ -947,6 +974,30 @@ impl<L: Layer> DecoderState<L> {
     /// The policy of the open request, if one is open.
     pub fn checkpoint_request(&self) -> Option<crate::nn::CheckpointPolicy> {
         self.ckpt.request_policy()
+    }
+
+    /// Pin the checkpoint at `pos` (`CheckpointRing::pin_at`: the one
+    /// standing there, else the open request's second target), or with
+    /// `None` release the pin. Returns where the pinned checkpoint stands
+    /// after the call.
+    pub fn pin_checkpoint(&mut self, pos: Option<usize>) -> Option<usize> {
+        match pos {
+            Some(p) => {
+                self.ckpt.pin_at(p);
+            }
+            None => self.ckpt.unpin(),
+        }
+        self.ckpt.pinned()
+    }
+
+    /// Where the pinned checkpoint stands.
+    pub fn pinned_checkpoint(&self) -> Option<usize> {
+        self.ckpt.pinned()
+    }
+
+    /// Whether the checkpoint ring holds a frame for a pin.
+    pub fn has_pin_frame(&self) -> bool {
+        self.ckpt.has_pin_frame()
     }
 
     /// Whether [`Self::restore`] can put the state back at exactly `pos`: a
@@ -1491,10 +1542,10 @@ where
     }
 
     /// The bytes a state's turn-checkpoint ring takes at this capacity
-    /// (`StateCapacity::checkpoints` frames of every layer's
+    /// (`StateCapacity::checkpoint_frames` frames of every layer's
     /// [`Layer::checkpoint_elems`] f32s).
     pub fn checkpoint_bytes(&self) -> usize {
-        self.cap.checkpoints * self.checkpoint_frame_bytes()
+        self.cap.checkpoint_frames() * self.checkpoint_frame_bytes()
     }
 
     /// The bytes one turn checkpoint takes.
@@ -1552,37 +1603,60 @@ where
         windowed: bool,
     ) -> Result<Tensor> {
         let seq = embeds.dim(1)?;
-        state.ckpt.drop_stale_hint(state.pos);
+        let pass = state.pos;
+        state.ckpt.drop_stale_hint(pass);
+        state.ckpt.settle_pass(pass, seq, windowed);
         let mut last = None;
         let mut start = 0;
         while start < seq {
             let len = (seq - start).min(self.chunk);
             let at = state.pos;
-            let rows = state
+            let takes = state
                 .ckpt
-                .rows_for(at, len, start + len == seq, seq, windowed);
+                .takes_for(at, len, start + len == seq, pass, seq, windowed);
             let mut h = embeds.narrow(1, start, len)?;
-            match rows {
-                Some(rows) => {
-                    let slot = state.ckpt.open(at + rows, embeds.device())?;
-                    let mut marks = Vec::with_capacity(self.layers.len());
-                    for (l, layer) in self.layers.iter().enumerate() {
-                        let frame = state.ckpt.frame(slot, l)?;
-                        let (out, mark) = layer.execute_checkpointing(
-                            &h,
-                            &mut state.layers[l],
-                            rows,
-                            frame.as_ref(),
-                        )?;
-                        h = out;
-                        marks.push(mark);
-                    }
-                    state.ckpt.close(slot, marks);
+            if takes.is_empty() {
+                for (l, layer) in self.layers.iter().enumerate() {
+                    h = layer.execute(&h, &mut state.layers[l])?;
                 }
-                None => {
-                    for (l, layer) in self.layers.iter().enumerate() {
-                        h = layer.execute(&h, &mut state.layers[l])?;
+            } else {
+                // Each take's slot: the pin's frame for the second target,
+                // else a turn slot.
+                let mut slots = [(0, 0); MAX_TAKES];
+                let n = takes.len();
+                for (k, t) in takes.iter().enumerate() {
+                    let slot = if t.pin {
+                        state.ckpt.open_pin(at + t.rows, embeds.device())?
+                    } else {
+                        state.ckpt.open(at + t.rows, embeds.device())?
+                    };
+                    slots[k] = (t.rows, slot);
+                }
+                let mut marks: [Vec<WindowMark>; MAX_TAKES] = std::array::from_fn(|k| {
+                    Vec::with_capacity(if k < n { self.layers.len() } else { 0 })
+                });
+                for (l, layer) in self.layers.iter().enumerate() {
+                    let frames = [
+                        state.ckpt.frame(slots[0].1, l)?,
+                        if n > 1 {
+                            state.ckpt.frame(slots[1].1, l)?
+                        } else {
+                            None
+                        },
+                    ];
+                    let chunk_takes = [
+                        (slots[0].0, frames[0].as_ref()),
+                        (slots[1].0, frames[1].as_ref()),
+                    ];
+                    let (out, took) =
+                        layer.execute_checkpointing(&h, &mut state.layers[l], &chunk_takes[..n])?;
+                    h = out;
+                    for (m, mark) in marks.iter_mut().zip(took).take(n) {
+                        m.push(mark);
                     }
+                }
+                for ((_, slot), m) in slots.into_iter().zip(marks).take(n) {
+                    state.ckpt.close(slot, m);
                 }
             }
             state.pos += len;
@@ -1649,6 +1723,7 @@ where
         #[cfg_attr(not(feature = "metal"), allow(unused_mut))]
         let mut state = DecoderState::new(layers)
             .with_checkpoints(&elems, self.cap.checkpoints)
+            .with_pin_frame(self.cap.pin)
             .with_standing_window(self.cap.recovery == DecodeRecovery::Standing);
         #[cfg(feature = "metal")]
         if let Device::Metal(m) = dev {
@@ -1768,6 +1843,18 @@ where
     fn close_checkpoint_request(&self, cache: &mut Self::Cache) -> Result<()> {
         cache.close_checkpoint_request();
         Ok(())
+    }
+
+    fn pin_checkpoint(&self, cache: &mut Self::Cache, pos: Option<usize>) -> Result<Option<usize>> {
+        Ok(cache.pin_checkpoint(pos))
+    }
+
+    fn pins_checkpoints(&self, cache: &Self::Cache) -> bool {
+        cache.has_pin_frame()
+    }
+
+    fn pinned_checkpoint(&self, cache: &Self::Cache) -> Option<usize> {
+        cache.pinned_checkpoint()
     }
 
     fn embed(&self, tokens: &Tensor) -> Result<Tensor> {
@@ -2204,43 +2291,51 @@ impl<P: Profile> MixerBlock for crate::models::qwen4exp::GatedDeltaNet<P> {
         let (s, conv) = self.checkpoint_parts();
         s + conv
     }
-    /// `S` and the conv window into the frame: a decode step's (`rows` 0 or
-    /// 1: before or after it), a prefill's at `rows`
-    /// (`GatedDeltaNet::prefill_checkpointing`).
+    /// `S` and the conv window into each take's frame: a decode step's
+    /// (`rows` 0 or 1: before or after it), a prefill's at `rows`
+    /// (`GatedDeltaNet::prefill_checkpointing_at`).
     fn execute_checkpointing(
         &self,
         x: &Tensor,
         st: &mut Self::State,
-        rows: usize,
-        into: Option<&Tensor>,
-    ) -> Result<(Tensor, WindowMark)> {
-        let Some(frame) = into else {
-            lloom_tensor::bail!("a recurrent state's checkpoint needs a ring frame")
-        };
-        let (ns, nc) = self.checkpoint_parts();
-        let s_view = frame.narrow(0, 0, ns)?;
-        let c_view = frame.narrow(0, ns, nc)?;
-        let ck = crate::models::qwen4exp::GdnCheckpoint {
-            s: &s_view,
-            conv: &c_view,
-        };
-        let seq = x.dim(1)?;
-        if rows > seq {
-            lloom_tensor::bail!("deltanet checkpoint: {rows} rows of a {seq}-position chunk")
+        takes: &ChunkTakes<'_>,
+    ) -> Result<(Tensor, TakeMarks)> {
+        if takes.len() > MAX_TAKES {
+            lloom_tensor::bail!("deltanet checkpoint: {} takes in one chunk", takes.len())
         }
+        let (ns, nc) = self.checkpoint_parts();
+        let seq = x.dim(1)?;
+        let views = takes
+            .iter()
+            .map(|&(rows, into)| {
+                let Some(frame) = into else {
+                    lloom_tensor::bail!("a recurrent state's checkpoint needs a ring frame")
+                };
+                if rows > seq {
+                    lloom_tensor::bail!(
+                        "deltanet checkpoint: {rows} rows of a {seq}-position chunk"
+                    )
+                }
+                Ok((rows, frame.narrow(0, 0, ns)?, frame.narrow(0, ns, nc)?))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let at: Vec<(usize, crate::models::qwen4exp::GdnCheckpoint<'_>)> = views
+            .iter()
+            .map(|(rows, s, conv)| (*rows, crate::models::qwen4exp::GdnCheckpoint { s, conv }))
+            .collect();
         let out = if seq == 1 {
-            if rows == 0 {
-                self.store_checkpoint(st.layer, &st.s, &st.conv, x.device(), &ck)?;
+            for (_, ck) in at.iter().filter(|(rows, _)| *rows == 0) {
+                self.store_checkpoint(st.layer, &st.s, &st.conv, x.device(), ck)?;
             }
             let out = self.decode(x, st.layer, &mut st.s, &mut st.conv)?;
-            if rows == 1 {
-                self.store_checkpoint(st.layer, &st.s, &st.conv, x.device(), &ck)?;
+            for (_, ck) in at.iter().filter(|(rows, _)| *rows == 1) {
+                self.store_checkpoint(st.layer, &st.s, &st.conv, x.device(), ck)?;
             }
             out
         } else {
-            self.prefill_checkpointing(x, st.layer, &mut st.s, &mut st.conv, rows, &ck)?
+            self.prefill_checkpointing_at(x, st.layer, &mut st.s, &mut st.conv, &at)?
         };
-        Ok((out, WindowMark::default()))
+        Ok((out, [WindowMark::default(); MAX_TAKES]))
     }
     /// The frame's `S` and window written into the channels (in place, or
     /// the pool's next phase), at the slabs' shape and dtype.
@@ -2375,30 +2470,37 @@ impl<P: Profile> MixerBlock for crate::models::qwen4exp::QsaAttention<P> {
         &self,
         x: &Tensor,
         kv: &mut Self::State,
-        rows: usize,
-        _into: Option<&Tensor>,
-    ) -> Result<(Tensor, WindowMark)> {
+        takes: &ChunkTakes<'_>,
+    ) -> Result<(Tensor, TakeMarks)> {
         let seq = x.dim(1)?;
-        if rows > seq {
-            lloom_tensor::bail!("qsa checkpoint: {rows} rows of a {seq}-position chunk")
+        if takes.len() > MAX_TAKES {
+            lloom_tensor::bail!("qsa checkpoint: {} takes in one chunk", takes.len())
+        }
+        for &(rows, _) in takes {
+            if rows > seq {
+                lloom_tensor::bail!("qsa checkpoint: {rows} rows of a {seq}-position chunk")
+            }
         }
         let (tokens, blocks) = kv.lens();
         let out = Mixer::execute(self, x, kv)?;
-        let mark = if rows == seq {
-            let (tokens, blocks) = kv.lens();
-            WindowMark { tokens, blocks }
-        } else if self.indexer().is_some() {
-            lloom_tensor::bail!(
-                "qsa checkpoint: a position inside a pass is not kept with an indexer (its \
-                 compressed blocks are the pass's)"
-            )
-        } else {
-            WindowMark {
-                tokens: tokens + rows,
-                blocks,
-            }
-        };
-        Ok((out, mark))
+        let mut marks = [WindowMark::default(); MAX_TAKES];
+        for (mark, &(rows, _)) in marks.iter_mut().zip(takes) {
+            *mark = if rows == seq {
+                let (tokens, blocks) = kv.lens();
+                WindowMark { tokens, blocks }
+            } else if self.indexer().is_some() {
+                lloom_tensor::bail!(
+                    "qsa checkpoint: a position inside a pass is not kept with an indexer (its \
+                     compressed blocks are the pass's)"
+                )
+            } else {
+                WindowMark {
+                    tokens: tokens + rows,
+                    blocks,
+                }
+            };
+        }
+        Ok((out, marks))
     }
     fn restore_checkpoint(
         kv: &mut Self::State,
@@ -2552,10 +2654,9 @@ mod window_tests {
             &self,
             x: &Tensor,
             _: &mut FaultyState,
-            _: usize,
-            _: Option<&Tensor>,
-        ) -> Result<(Tensor, WindowMark)> {
-            Ok((x.clone(), WindowMark::default()))
+            _: &ChunkTakes<'_>,
+        ) -> Result<(Tensor, TakeMarks)> {
+            Ok((x.clone(), [WindowMark::default(); MAX_TAKES]))
         }
         fn restore_checkpoint(
             _: &mut FaultyState,

@@ -679,10 +679,10 @@ impl<P: Profile> GatedDeltaNet<P> {
         s_state: &mut RecurrentState,
         conv_state: &mut RecurrentState,
     ) -> Result<Tensor> {
-        if let Some(out) = self.prefill_fused_at(x, l, s_state, conv_state, None)? {
+        if let Some(out) = self.prefill_fused_at(x, l, s_state, conv_state, &[])? {
             return Ok(out);
         }
-        self.prefill_composed_at(x, l, s_state, conv_state, None)
+        self.prefill_composed_at(x, l, s_state, conv_state, &[])
     }
 
     /// f32 elements a turn checkpoint of one layer's recurrent state holds:
@@ -733,36 +733,58 @@ impl<P: Profile> GatedDeltaNet<P> {
         rows: usize,
         into: &GdnCheckpoint<'_>,
     ) -> Result<Tensor> {
-        let seq = x.dim(1)?;
-        if rows > seq {
-            lloom_tensor::bail!("deltanet checkpoint: {rows} rows of a {seq}-position chunk")
-        }
-        if rows == 0 {
-            self.store_checkpoint(l, s_state, conv_state, x.device(), into)?;
-            return self.prefill(x, l, s_state, conv_state);
-        }
-        if rows == seq {
-            let out = self.prefill(x, l, s_state, conv_state)?;
-            self.store_checkpoint(l, s_state, conv_state, x.device(), into)?;
-            return Ok(out);
-        }
-        let at = Some((rows, into));
-        if let Some(out) = self.prefill_fused_at(x, l, s_state, conv_state, at)? {
-            return Ok(out);
-        }
-        self.prefill_composed_at(x, l, s_state, conv_state, at)
+        self.prefill_checkpointing_at(x, l, s_state, conv_state, &[(rows, *into)])
     }
 
-    /// The composed prefill (the reference on every backend), with the
-    /// checkpoint `at` (rows, where) computed from the pre-pass state before
-    /// the pass writes it.
+    /// [`Self::prefill_checkpointing`] for each of `at` (rows, where), in
+    /// row order: the ones before the pass, then one recurrence over its
+    /// own prefix per take inside it, each from the same `S` and window,
+    /// then the ones at its end. The pass itself is unchanged.
+    pub fn prefill_checkpointing_at(
+        &self,
+        x: &Tensor,
+        l: usize,
+        s_state: &mut RecurrentState,
+        conv_state: &mut RecurrentState,
+        at: &[(usize, GdnCheckpoint<'_>)],
+    ) -> Result<Tensor> {
+        let seq = x.dim(1)?;
+        if let Some((rows, _)) = at.iter().find(|(rows, _)| *rows > seq) {
+            lloom_tensor::bail!("deltanet checkpoint: {rows} rows of a {seq}-position chunk")
+        }
+        if !at.is_sorted_by_key(|(rows, _)| *rows) {
+            lloom_tensor::bail!("deltanet checkpoint: takes out of row order")
+        }
+        let before = at.iter().take_while(|(rows, _)| *rows == 0).count();
+        let after = at[before..]
+            .iter()
+            .rev()
+            .take_while(|(rows, _)| *rows == seq)
+            .count();
+        for (_, into) in &at[..before] {
+            self.store_checkpoint(l, s_state, conv_state, x.device(), into)?;
+        }
+        let inside = &at[before..at.len() - after];
+        let out = match self.prefill_fused_at(x, l, s_state, conv_state, inside)? {
+            Some(out) => out,
+            None => self.prefill_composed_at(x, l, s_state, conv_state, inside)?,
+        };
+        for (_, into) in &at[at.len() - after..] {
+            self.store_checkpoint(l, s_state, conv_state, x.device(), into)?;
+        }
+        Ok(out)
+    }
+
+    /// The composed prefill (the reference on every backend), with each
+    /// checkpoint of `at` (rows, where) computed from the pre-pass state
+    /// before the pass writes it.
     fn prefill_composed_at(
         &self,
         x: &Tensor,
         l: usize,
         s_state: &mut RecurrentState,
         conv_state: &mut RecurrentState,
-        at: Option<(usize, &GdnCheckpoint<'_>)>,
+        at: &[(usize, GdnCheckpoint<'_>)],
     ) -> Result<Tensor> {
         let dims = self.dims;
         let (d_k, h_k, h_v) = (dims.d_k, dims.h_k, dims.h_v);
@@ -807,7 +829,7 @@ impl<P: Profile> GatedDeltaNet<P> {
         let k = gqa_expand_seq::<false>(&k, h_k, h_v)?;
         let q = q_scale(&q, d_k)?;
 
-        if let Some((rows, into)) = at {
+        for &(rows, into) in at {
             // The prefix's own recurrence from the same `S`: what a pass of
             // `rows` positions computes, the rows being per-position
             // functions of the same inputs.
@@ -852,17 +874,17 @@ impl<P: Profile> GatedDeltaNet<P> {
     /// on transposed VIEWS (the gemm takes the stride); the fused inverse;
     /// the chunk loop as `chunk_forward`'s; `kernels::GdnChunkEpilogue` (the
     /// gated RMS norm read straight from the head-first output). `None` where
-    /// the composed path applies — which stays the reference. The checkpoint
-    /// `at` (rows, where) runs the prologue and the recurrence a second time
-    /// over the prefix, from the same window and `S`, before the pass writes
-    /// them.
+    /// the composed path applies — which stays the reference. Each
+    /// checkpoint of `at` (rows, where) runs the prologue and the recurrence
+    /// a second time over its prefix, from the same window and `S`, before
+    /// the pass writes them.
     fn prefill_fused_at(
         &self,
         x: &Tensor,
         l: usize,
         s_state: &mut RecurrentState,
         conv_state: &mut RecurrentState,
-        at: Option<(usize, &GdnCheckpoint<'_>)>,
+        at: &[(usize, GdnCheckpoint<'_>)],
     ) -> Result<Option<Tensor>> {
         use super::kernels::{fused_off, GdnChunkEpilogue, GdnConvWindow};
         let dims = self.dims;
@@ -912,7 +934,7 @@ impl<P: Profile> GatedDeltaNet<P> {
             .to_dtype(f32)?
             .reshape((seq, h_v))?;
 
-        if let Some((rows, into)) = at {
+        for &(rows, into) in at {
             let qkv_r = qkv.narrow(0, 0, rows)?.contiguous()?;
             let win_r = win.apply_op1_no_bwd(&GdnConvWindow {
                 seq: rows,

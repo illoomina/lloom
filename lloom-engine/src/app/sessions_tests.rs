@@ -12,6 +12,7 @@ fn cfg(capacity: usize, one_sequence: bool) -> Config {
         ephemeral: 1,
         max_bytes: 1 << 20,
         one_sequence,
+        keep: Keep::Prefix,
     }
 }
 
@@ -49,6 +50,7 @@ fn turn(
         Plan {
             continued,
             store,
+            keep: None,
             auth,
             prompt_ids: prompt,
             scopes,
@@ -518,6 +520,7 @@ fn a_concurrent_turn_on_one_session_keeps_only_the_first() {
     let plan = |p: &'static [u32]| Plan {
         continued: Some((r.key, r.turn)),
         store: None,
+        keep: None,
         auth: None,
         prompt_ids: p,
         scopes: &[],
@@ -567,6 +570,7 @@ fn the_end_of_turn_id_is_the_sessions_but_not_the_engines() {
         Plan {
             continued: None,
             store: Some(true),
+            keep: None,
             auth: None,
             prompt_ids: &[1, 2],
             scopes: &s1,

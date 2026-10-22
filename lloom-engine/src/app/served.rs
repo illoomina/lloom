@@ -41,6 +41,11 @@ pub trait Served: Send + Sync {
     /// ring under `auto`; the blocking arm on Qwen4-exp, whose forward needs
     /// its input ids host-side).
     fn readback(&self) -> ReadbackArm;
+    /// Why a session's `keep: prefix` is not served by this process, `None`
+    /// where it pins a session's head (`docs/sessions.md` §8).
+    fn prefix_pin_refused(&self) -> Option<String> {
+        Some("this family's turn checkpoints take no pin (docs/sessions.md §8)".into())
+    }
     /// Whether the owner keeps a request's prefix for the next one
     /// (`context.prefix.reuse` as it resolved at load); `None` where the
     /// owner does not say (an already-loaded owner whose policy is its own).

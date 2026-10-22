@@ -6175,7 +6175,13 @@ impl Mlp {
             if gemv_residual_applies(true, &gated, &p.down, residual) {
                 return crate::nn::ops::gemv_residual(&gated, p.down.weight(), residual);
             }
+            if prefill_ablated(PrefillAblation::Add, residual) {
+                return p.down.forward(&gated);
+            }
             return p.down.forward(&gated)? + residual;
+        }
+        if prefill_ablated(PrefillAblation::Add, residual) {
+            return self.forward(x, p);
         }
         self.forward(x, p)? + residual
     }
@@ -6250,6 +6256,8 @@ impl Mlp {
         // store — so it MOVES THE DIGESTS by construction (§12.2d, §2.3.5a).
         let gate = if self.gemv_silu_applies(x, p) {
             crate::nn::ops::gemv_silu(x, p.gate.weight())?
+        } else if prefill_ablated(PrefillAblation::Silu, x) {
+            p.gate.forward(x)?
         } else {
             crate::nn::ops::silu(&p.gate.forward(x)?)?
         };
@@ -6262,6 +6270,10 @@ impl Mlp {
             return crate::nn::ops::gemv_mul(x, p.up.weight(), &gate);
         }
         let up = p.up.forward(x)?;
+        if prefill_ablated(PrefillAblation::Mul, x) {
+            drop(up);
+            return Ok(gate);
+        }
         gate * up
     }
 
@@ -6470,7 +6482,13 @@ impl<P: Profile> Attention<P> {
             if gemv_residual_applies(true, &y, &w.o, residual) {
                 return crate::nn::ops::gemv_residual(&y, w.o.weight(), residual);
             }
+            if prefill_ablated(PrefillAblation::Add, residual) {
+                return w.o.forward(&y);
+            }
             return w.o.forward(&y)? + residual;
+        }
+        if prefill_ablated(PrefillAblation::Add, residual) {
+            return self.forward(w, x, index_pos, block_idx, cache);
         }
         self.forward(w, x, index_pos, block_idx, cache)? + residual
     }
@@ -8048,7 +8066,13 @@ impl<P: Profile> ShortConv<P> {
             if gemv_residual_applies(true, &conv_out, &w.out_proj, residual) {
                 return crate::nn::ops::gemv_residual(&conv_out, w.out_proj.weight(), residual);
             }
+            if prefill_ablated(PrefillAblation::Add, residual) {
+                return w.out_proj.forward(&conv_out);
+            }
             return w.out_proj.forward(&conv_out)? + residual;
+        }
+        if prefill_ablated(PrefillAblation::Add, residual) {
+            return self.forward(w, x, block_idx, cache);
         }
         self.forward(w, x, block_idx, cache)? + residual
     }
@@ -9082,11 +9106,42 @@ fn ablate_norms() -> bool {
     })
 }
 
+/// A class of prefill dispatch `diagnostics.ablate` can skip: `prefill-norm`
+/// (the layers' two RMSNorms), `prefill-silu` (the MLP's SiLU),
+/// `prefill-mul` (the SwiGLU product), `prefill-add` (the two residual adds).
+#[derive(Clone, Copy)]
+enum PrefillAblation {
+    Norm,
+    Silu,
+    Mul,
+    Add,
+}
+
+/// Whether `x`, a pass over more than one position, skips `class` — an
+/// instrument pricing on the GPU timeline what removing that class from a
+/// prefill would buy; the output is WRONG. Read once.
+fn prefill_ablated(class: PrefillAblation, x: &Tensor) -> bool {
+    static ON: std::sync::OnceLock<[bool; 4]> = std::sync::OnceLock::new();
+    let on = ON.get_or_init(|| {
+        let names = &crate::tuning::tuning().lfm2.ablate;
+        let has = |n: &str| names.split(',').any(|s| s.trim() == n);
+        [
+            has("prefill-norm"),
+            has("prefill-silu"),
+            has("prefill-mul"),
+            has("prefill-add"),
+        ]
+    });
+    on[class as usize] && x.rank() >= 2 && x.dims()[x.rank() - 2] > 1
+}
+
 impl<P: Profile> DecoderLayer<P> {
     /// The layer's RMSNorm, or `x` itself under the `norm` ablation at a
-    /// one-token step.
+    /// one-token step or the `prefill-norm` one at a prefill.
     fn norm(&self, n: &RmsNorm, x: &Tensor) -> Result<Tensor> {
-        if ablate_norms() && x.dim(x.rank() - 2)? == 1 {
+        if (ablate_norms() && x.dim(x.rank() - 2)? == 1)
+            || prefill_ablated(PrefillAblation::Norm, x)
+        {
             return Ok(x.clone());
         }
         n.forward(x)

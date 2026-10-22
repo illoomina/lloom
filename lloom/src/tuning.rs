@@ -264,7 +264,7 @@ pub struct Lfm2Tuning {
     /// The weakest numerical class `kernels.fusion.policy = derived` may land in: `rounding` (the epilogues) or `reorder` (also the norm inside its consumers' GEMVs, whose sum of squares takes another tree). An arm.
     #[opt(flag = "lfm2-fusion-budget", env = "LLOOM_LFM2_FUSION_BUDGET", parser = "parse_fusion_budget", variants = ["rounding", "reorder"], path = "kernels.fusion.budget", status = "arm")]
     pub fusion_budget: String,
-    /// Skip these decode-step dispatches — `norm` (the layers' two RMSNorms) — to price what removing them would buy: a timing bound, the output is WRONG. An instrument.
+    /// Skip these dispatches — `norm` (the layers' two RMSNorms at a decode step); at a prefill pass `prefill-norm`, `prefill-silu` (the MLP's SiLU), `prefill-mul` (the SwiGLU product), `prefill-add` (the two residual adds) — to price what removing them would buy: a timing bound, the output is WRONG. An instrument.
     #[opt(
         flag = "lfm2-ablate",
         env = "LLOOM_LFM2_ABLATE",

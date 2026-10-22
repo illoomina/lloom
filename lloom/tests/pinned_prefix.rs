@@ -821,8 +821,11 @@ fn lfm2_the_pass_that_takes_the_heads_tail_computes_what_it_computed() -> Result
 
 /// More extending turns than LFM2's ring has slots, then a compaction: the
 /// pinned head restores (`restore_point` falls back to it past every turn
-/// checkpoint's reach) and the continuation is a fresh head's. The control:
-/// without the pin frame the compaction is a fresh prefill.
+/// checkpoint's reach) and the continuation is the first turn's own. Each
+/// turn's pass is 16 ids, so a pass whose tail were written into the pin's
+/// frame would cover the columns a restore at the head reads (a 5-id pass
+/// writes 7 columns and leaves them standing). The control: without the pin
+/// frame the compaction is a fresh prefill.
 #[test]
 fn lfm2_a_pin_survives_more_turns_than_the_ring_has_slots() -> Result<()> {
     pin_regime();
@@ -837,7 +840,7 @@ fn lfm2_a_pin_survives_more_turns_than_the_ring_has_slots() -> Result<()> {
             let mut session = Session::new(&model, lfm2_state::<CrownExact>(&cfg, &dev, pin)?);
             let mut full = sys.clone();
             for k in 0..turns {
-                full.extend((0..5u32).map(|i| (i * 3 + 11 + k as u32) % 46));
+                full.extend((0..16u32).map(|i| (i * 3 + 11 + k as u32) % 46));
                 let (p, reply) = request(&mut session, &full, pin.then_some(head), 3, &dev)?;
                 if k > 0 {
                     assert_eq!(p.action, ReuseAction::Extend, "turn {k} extends");
@@ -867,7 +870,7 @@ fn lfm2_a_pin_survives_more_turns_than_the_ring_has_slots() -> Result<()> {
     // The reference: the first turn's pass (the same split), restored to
     // the head through its own tail's reach.
     let mut turn1 = compact[..head].to_vec();
-    turn1.extend((0..5u32).map(|i| (i * 3 + 11) % 46));
+    turn1.extend((0..16u32).map(|i| (i * 3 + 11) % 46));
     let mut rs = Session::new(&model, lfm2_state::<CrownExact>(&cfg, &dev, false)?);
     request(&mut rs, &turn1, None, 3, &dev)?;
     let same = rs.cache_mut();

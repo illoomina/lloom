@@ -347,7 +347,7 @@ impl ResidencySet {
     /// Asks the OS to make every allocation in the set resident again. A
     /// set nothing has used for a few seconds is unwired, and the next
     /// command buffer then waits while it is wired back
-    /// (`design/measurements/issue-1076-first-token.md`).
+    /// (`docs/machine-model.md` §3.4d).
     pub fn request_residency(&self) {
         if let Some(raw) = &self.raw {
             raw.requestResidency();

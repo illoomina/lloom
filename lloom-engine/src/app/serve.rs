@@ -148,8 +148,9 @@ struct Shared {
     reuse: parking_lot::Mutex<crate::turn::Tally>,
     /// The sessions chat completions' ids name (`docs/sessions.md`).
     sessions: parking_lot::Mutex<super::sessions::Table>,
-    /// When this server last gave the GPU work (`uptime_ns`): a model
-    /// request's end or a keep-warm dispatch; the load before the first.
+    /// When this server last gave the GPU work or kept it ready
+    /// (`uptime_ns`): a model request's end or a keep-warm action; the load
+    /// before the first.
     last_active: AtomicU64,
     /// Keep-warm actions taken (`server.keep_warm`).
     warm_actions: AtomicU64,
@@ -235,8 +236,9 @@ fn run_configured(args: ServeArgs, transport: Option<tiny_http::TransportPolicy>
 /// admission domain. The caller creates its device, configures the same process
 /// account, and completes the genuine load before entering this frontend.
 ///
-/// Only `options.server.host`, `options.server.port`, `options.sampling` and
-/// `options.session` (the request front end's) are honored; the remaining
+/// Only `options.server.host`, `options.server.port`, `options.server.keep_warm`
+/// (and `keep_warm_by`), `options.sampling` and `options.session` (the request
+/// front end's) are honored; the remaining
 /// options do not reconfigure this owner. Shape, decode,
 /// cache, seed, prefix reuse, batch and memory policy are the already-loaded
 /// owner's contract, not inferred from these options. `model_path` is a caller-
@@ -506,7 +508,7 @@ fn run_owner(
 /// the device's memory wired (`residency`) or run one one-element dispatch
 /// (`dispatch`). macOS unwires a residency set nothing used for a few
 /// seconds, and the request after it waits while it is wired back
-/// (`measurements/issue-1076-first-token.md`). Off by default: it holds the
+/// (`docs/machine-model.md` §3.4d). Off by default: it holds the
 /// memory wired while the server idles.
 struct KeepWarm {
     stop: Arc<AtomicBool>,

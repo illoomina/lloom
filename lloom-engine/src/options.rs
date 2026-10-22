@@ -729,15 +729,18 @@ impl Default for ModelConfig {
 }
 
 impl ModelConfig {
+    /// The preset's key.
+    pub const PRESET_KEY: &'static str = "models.lfm2.preset";
+
     /// The preset and the axes, as keys.
     pub const META: &'static [lloom_tensor::options::KnobMeta] = &[
         lloom_tensor::options::KnobMeta {
             key: "cache",
             flag: "cache",
-            doc: "The LFM2 cache preset the axes are applied over: `auto` (the engine's rule: the pool arms at a batch, the rewindable arms under a drafter, the crown otherwise), `crown`, `rewindable`, `rewindable-notap`, `pool`, `pool-spec`.",
+            doc: "The LFM2 cache preset the axes are applied over: `auto` (the engine's rule: the pool arms at a batch, the rewindable arms under a drafter, the crown otherwise), `crown`, `rewindable`, `rewindable-notap`, `pool`, `pool-spec`. A named preset keeps the axes it sets (attention, KV layout, QKV layout, conv state and fusions): the front-end's defaults apply only to the axes it leaves.",
             variants: &["auto", "crown", "rewindable", "rewindable-notap", "pool", "pool-spec"],
             ty: "String",
-            path: "models.lfm2.preset",
+            path: Self::PRESET_KEY,
             status: lloom_tensor::options::Status::Advanced,
             ..lloom_tensor::options::KnobMeta::BASE
         },

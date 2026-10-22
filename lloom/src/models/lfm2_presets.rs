@@ -117,8 +117,9 @@ mod tests {
     /// config, and a preset that leaves it gives as many as there were.
     #[test]
     fn every_preset_sets_exactly_its_axes() {
+        type Preset = Box<dyn Fn(&mut Config)>;
         let dcfg = DSparkConfig::lfm2_2_6b();
-        let presets: [(&str, Box<dyn Fn(&mut Config)>); 5] = [
+        let presets: [(&str, Preset); 5] = [
             ("crown", Box::new(crown)),
             ("pool", Box::new(pool)),
             (

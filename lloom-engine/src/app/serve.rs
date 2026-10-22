@@ -3405,7 +3405,9 @@ impl ChunkedWriter {
 /// **The per-token text does not go through the channel** when the writer
 /// is started with [`Self::start_with_deltas`]: a `send` to the parked writer
 /// is a wake — a syscall — per fragment, and the payload a `format!` and a
-/// `json!` built on the decode thread. The decode thread appends the bare
+/// `json!` built on the decode thread. Only the run's first fragment wakes
+/// the writer (an empty payload), so the first token is not held for a
+/// drain period. The decode thread appends the bare
 /// text to a [`DeltaBuffer`] instead (`sink.rs`: no wait, no syscall, no
 /// allocation once grown), and this thread takes what accumulated every
 /// [`DRAIN_PERIOD`] and wraps it in one event — a delta of several tokens,
@@ -3431,6 +3433,9 @@ struct StreamWriter {
     order: Arc<parking_lot::Mutex<()>>,
     /// The producer's spill (`DeltaBuffer::push`); only the producer locks it.
     spill: parking_lot::Mutex<String>,
+    /// Set by the first delta, which wakes the writer rather than waiting
+    /// for its next drain: one wake a request, none a token.
+    woke: AtomicBool,
 }
 
 type Wrap = Arc<dyn Fn(&str) -> (String, usize) + Send + Sync>;
@@ -3504,6 +3509,17 @@ impl StreamWriter {
                         .map_err(|_| std::sync::mpsc::RecvTimeoutError::Disconnected)
                 };
                 let (work, closed) = match next {
+                    // An empty payload is the first delta's wake: take what
+                    // accumulated now, as a drain would.
+                    Ok((payload, _)) if payload.is_empty() && buf.is_some() => {
+                        Self::pending_after_timeout(
+                            &rx,
+                            buf.as_ref(),
+                            thread_wrap.as_ref(),
+                            &thread_order,
+                            &mut local,
+                        )
+                    }
                     Ok(work) => (Some(work), false),
                     Err(_) => Self::pending_after_timeout(
                         &rx,
@@ -3534,6 +3550,7 @@ impl StreamWriter {
             wrap,
             order,
             spill: parking_lot::Mutex::new(String::new()),
+            woke: AtomicBool::new(false),
         }
     }
 
@@ -3562,10 +3579,17 @@ impl StreamWriter {
     }
 
     /// Hand text to the writer (the decode thread's per-fragment call on a
-    /// writer started with deltas): no wait, no syscall, no allocation.
+    /// writer started with deltas): no wait, no allocation, and no syscall
+    /// but the first fragment's, which wakes the writer so the first token
+    /// does not wait for a drain period.
     fn delta(&self, text: &str) {
         if let Some(b) = &self.deltas {
             b.push(&mut self.spill.lock(), text);
+            if !self.woke.swap(true, Ordering::Relaxed) {
+                if let Some(tx) = &self.tx {
+                    let _ = tx.send((String::new(), 0));
+                }
+            }
         }
     }
 
@@ -4839,6 +4863,42 @@ mod stream_writer_tests {
             .map(|(_, s)| s)
             .collect();
         assert_eq!(body, "ctl<ab>mid<c>", "{out:?}");
+    }
+
+    /// The first fragment's wake is not an event: the writer takes what
+    /// accumulated and writes no chunk of its own (an empty chunk would end
+    /// the chunked body), and everything handed over arrives in order.
+    #[test]
+    fn the_first_fragments_wake_writes_no_chunk_of_its_own() {
+        let mem = Mem::default();
+        let w = ChunkedWriter {
+            w: Box::new(mem.clone()),
+        };
+        let sw = StreamWriter::start_with_deltas(w, |t: &str| format!("<{t}>"));
+        sw.delta("a");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !String::from_utf8_lossy(&mem.0.lock().unwrap()).contains("<a>") {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the first fragment was never written"
+            );
+            std::thread::sleep(std::time::Duration::from_micros(200));
+        }
+        sw.delta("b");
+        let (_w, err) = sw.finish().unwrap();
+        assert!(err.is_none());
+        let out = String::from_utf8(mem.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            !out.starts_with("0\r\n") && !out.contains("\r\n0\r\n"),
+            "an empty chunk: {out:?}"
+        );
+        let body: String = out
+            .split("\r\n")
+            .enumerate()
+            .filter(|(i, _)| i % 2 == 1)
+            .map(|(_, s)| s)
+            .collect();
+        assert_eq!(body, "<a><b>", "{out:?}");
     }
 
     /// The first-write stamp belongs to the first event that carries text: a

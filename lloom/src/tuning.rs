@@ -238,6 +238,15 @@ pub struct Lfm2Tuning {
         invert
     )]
     pub skip_conv_c_fusion: bool,
+    /// The MLP's `silu(w1·x) · w3·x` as one elementwise launch (`silu_mul`, `silu_f16` then `bmul_f16` bit for bit) wherever the composed pair would run; off: the pair. An arm.
+    #[opt(
+        flag = "lfm2-silu-mul",
+        env = "LLOOM_LFM2_SILU_MUL",
+        bool,
+        path = "kernels.fusion.silu_mul",
+        status = "arm"
+    )]
+    pub silu_mul: bool,
     /// The pool rows' kernels: `batched` (the batch in one dispatch per kernel) or `per-row` (the per-row loop, the A/B arm).
     #[opt(flag = "rows-arm", env = "LLOOM_148_ROWS_ARM", parser = "parse_rows_arm", variants = ["batched", "per-row"], path = "models.lfm2.rows_kernels", status = "arm")]
     pub rows_arm: String,
@@ -325,6 +334,7 @@ impl Default for Lfm2Tuning {
     fn default() -> Self {
         Lfm2Tuning {
             skip_conv_c_fusion: false,
+            silu_mul: false,
             rows_arm: "batched".into(),
             flash_partial_bn: 32,
             sdpa_two_pass_k: crate::nn::ops::SDPA_TWO_PASS_K_THRESHOLD,

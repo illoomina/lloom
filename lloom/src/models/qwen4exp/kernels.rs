@@ -1293,6 +1293,22 @@ pub(crate) fn silu_mul(g: &Tensor, u: &Tensor) -> Option<Result<Tensor>> {
     .then(|| g.apply_op2_no_bwd(u, &SiluMul))
 }
 
+/// [`silu_mul`]'s kernel for another family's composed `silu(g) · u`, without
+/// this family's `fused_off` arm: Metal, f32 or f16, `g` and `u` contiguous
+/// and of one dtype and shape; `None` where the composed pair applies.
+pub(crate) fn silu_mul_op(g: &Tensor, u: &Tensor) -> Option<Result<Tensor>> {
+    let float = |t: &Tensor| {
+        t.device().is_metal()
+            && matches!(
+                t.dtype(),
+                lloom_tensor::DType::F32 | lloom_tensor::DType::F16
+            )
+            && t.is_contiguous()
+    };
+    (float(g) && float(u) && g.dtype() == u.dtype() && g.shape() == u.shape())
+        .then(|| g.apply_op2_no_bwd(u, &SiluMul))
+}
+
 /// The routed combine plus the gated shared expert as one launch, into f32:
 /// `y` f32 or f16 (the routed store, read without a cast), the rest f32;
 /// `None` where the composed path applies.

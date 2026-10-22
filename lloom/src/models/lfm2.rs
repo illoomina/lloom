@@ -6251,6 +6251,21 @@ impl Mlp {
         if self.gemv_swiglu_applies(x, p) {
             return crate::nn::ops::gemv_swiglu(x, p.up.weight(), p.gate.weight());
         }
+        // The composed pair as one elementwise launch, bit for bit
+        // (`kernels.fusion.silu_mul`, Qwen4-exp's `silu_mul` kernel).
+        if silu_mul_on()
+            && self.gemv_gate != GateFusion::Mul
+            && !self.gemv_silu_applies(x, p)
+            && !prefill_ablated(PrefillAblation::Silu, x)
+            && !prefill_ablated(PrefillAblation::Mul, x)
+        {
+            let gate = p.gate.forward(x)?;
+            let up = p.up.forward(x)?;
+            if let Some(h) = crate::models::qwen4exp::kernels::silu_mul_op(&gate, &up) {
+                return h;
+            }
+            return crate::nn::ops::silu(&gate)? * up;
+        }
         // The fused arm replaces `gemv` + `silu_f16` with one dispatch, and
         // computes SiLU on the f32 accumulator rather than on the rounded
         // store — so it MOVES THE DIGESTS by construction (§12.2d, §2.3.5a).
@@ -9104,6 +9119,12 @@ fn ablate_norms() -> bool {
             .split(',')
             .any(|s| s.trim() == "norm")
     })
+}
+
+/// `kernels.fusion.silu_mul`, read once.
+fn silu_mul_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::tuning::tuning().lfm2.silu_mul)
 }
 
 /// A class of prefill dispatch `diagnostics.ablate` can skip: `prefill-norm`

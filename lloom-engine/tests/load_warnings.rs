@@ -17,6 +17,9 @@
 //! - `speculation`: the speculative body at one sequence on the paged KV,
 //!   given by name, over a tiny DSpark drafter (the front-end's in-place
 //!   default is the control).
+//!
+//! And the axes a named preset resolves to, on the loaded line, beside the
+//! front-end's own (the control), each load silent.
 #![cfg(feature = "serve")]
 
 use lloom::models::lfm2_testing::Lfm2Tiny;
@@ -405,6 +408,50 @@ fn a_paged_speculative_body_at_one_sequence_reaches_every_surface() {
     assert_eq!(list[0]["kind"], "speculation");
     assert_eq!(list[0]["message"], message);
     assert_eq!(served_warnings(&model, &spec), json!([]));
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A named preset's axes reach the load, silent: chat's Metal default puts
+/// the LFM2 on the paged KV with FlashDecoding (the front-end's rows), and
+/// the crown named by flag or by key loads its own in-place KV with sdpa; a
+/// key named beside the preset holds, and the pool preset is the rows' arms.
+#[cfg(feature = "metal")]
+#[test]
+fn a_named_preset_keeps_its_axes_on_the_loaded_line() {
+    let dir = scratch("preset");
+    let model = write::<Lfm2Tiny>(&dir, None);
+    let cases: [(&[&str], &str, &str); 5] = [
+        (&[], "KvAppend=Paged", "AttnImpl=FlashDecoding"),
+        (&["--cache", "crown"], "KvAppend=InPlace", "AttnImpl=Sdpa"),
+        (
+            &["--set", "models.lfm2.preset=crown"],
+            "KvAppend=InPlace",
+            "AttnImpl=Sdpa",
+        ),
+        (
+            &["--cache", "crown", "--attn", "flash"],
+            "KvAppend=InPlace",
+            "AttnImpl=FlashDecoding",
+        ),
+        (
+            &["--cache", "pool"],
+            "KvAppend=Paged",
+            "AttnImpl=FlashDecoding",
+        ),
+    ];
+    for (extra, kv, attn) in cases {
+        let stderr = chat(&model, extra);
+        let loaded = stderr
+            .lines()
+            .find(|l| l.starts_with("[loaded "))
+            .unwrap_or_else(|| panic!("no loaded line:\n{stderr}"));
+        eprintln!("{extra:?}: {loaded}");
+        assert!(
+            loaded.contains(kv) && loaded.contains(attn),
+            "{extra:?}: {loaded}"
+        );
+        assert_eq!(loaded_warnings(&stderr), "none", "{extra:?}");
+    }
     std::fs::remove_dir_all(&dir).ok();
 }
 

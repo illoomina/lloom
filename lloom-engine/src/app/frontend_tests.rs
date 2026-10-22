@@ -6,13 +6,14 @@
 //! default; and the library tree against the one before the option tree,
 //! with each approved exception asserted by number.
 
-use super::{command, resolve_layers, Cli, Command, CommonArgs, Shape};
+use super::{command, named_keys, preset_keys, resolve_layers, Cli, Command, CommonArgs, Shape};
 use crate::frontend::{self, Frontend, When, EXCEPTIONS, ROWS};
 use crate::option_tree::index;
+use crate::options::{ModelConfig, CACHE_PRESETS};
 use crate::EngineOptions;
 use clap::FromArgMatches;
 use serde_json::{json, Value};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// The tree `lloom config` printed under an empty environment before the
 /// option tree existed.
@@ -396,9 +397,9 @@ fn each_front_end_resolves_its_own_defaults_through_the_command_line() {
 
 /// The speculative body at one sequence takes the in-place KV through the
 /// command line on chat and serve, after the paged row; the KV given by any
-/// spelling holds; at a batch, on the pool preset, without a drafter, with
-/// `auto` (resolved at load, after the rows) and on bench, the row does not
-/// hold.
+/// spelling holds, and a named preset's own KV is left to it; at a batch,
+/// without a drafter, with `auto` (resolved at load, after the rows) and on
+/// bench, the row does not hold.
 #[test]
 fn the_speculative_body_at_one_sequence_keeps_the_in_place_kv() {
     let none = BTreeMap::new();
@@ -441,20 +442,266 @@ fn the_speculative_body_at_one_sequence_keeps_the_in_place_kv() {
             paged,
             "{n} at a batch"
         );
+        // A named preset is explicit for its KV: no row sets it, and the
+        // load takes the preset's (`a_named_preset_keeps_the_axes_it_sets`).
         assert_eq!(
             kv(f, &["--dspark", "--set", "models.lfm2.preset=rewindable"]),
-            in_place,
+            library,
             "{n} on the rewindable preset"
         );
         assert_eq!(
             kv(f, &["--dspark", "--set", "models.lfm2.preset=pool-spec"]),
-            paged,
+            library,
             "{n} on the pool preset"
         );
         assert_eq!(kv(f, &["--speculate", "auto"]), paged, "{n} auto");
         assert_eq!(kv(f, &[]), paged, "{n} plain");
     }
     assert_eq!(kv(Frontend::Bench, &["--dspark"]), library, "bench");
+}
+
+/// The keys of the axes every LFM2 preset sets (`lfm2_presets::AXES`), by
+/// value: what a named preset makes explicit.
+const PRESET_AXIS_KEYS: &[&str] = &[
+    "context.kv.layout",
+    "kernels.attention.impl",
+    "kernels.attention.qkv_layout",
+    "kernels.fusion.conv",
+    "kernels.fusion.gemv_residual",
+    "kernels.fusion.gemv_silu",
+    "models.lfm2.conv_state",
+];
+
+/// The front-end rows a named preset takes over: chat's and serve's rows on
+/// a preset's axes. A row added on one fails here by name.
+const PRESET_ROW_KEYS: &[&str] = &[
+    "context.kv.layout",
+    "kernels.attention.impl",
+    "kernels.attention.qkv_layout",
+    "kernels.fusion.conv",
+];
+
+/// The preset named alone, by its field.
+fn preset_named() -> BTreeSet<String> {
+    index().keys[ModelConfig::PRESET_KEY]
+        .targets
+        .iter()
+        .map(|l| l.storage.clone())
+        .collect()
+}
+
+/// Every spelling that names the preset `p`: the flag, the key and the
+/// field's own dotted spelling, the env name, both JSON groups and a
+/// `--config` file (written under `dir`).
+fn preset_spellings(
+    p: &str,
+    dir: &std::path::Path,
+) -> Vec<(String, Vec<String>, BTreeMap<String, String>)> {
+    let file = dir.join(format!("preset-{p}.json"));
+    std::fs::write(
+        &file,
+        json!({"models": {"lfm2": {"preset": p}}}).to_string(),
+    )
+    .unwrap();
+    let argv = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    let none = BTreeMap::new;
+    vec![
+        ("--cache".into(), argv(&["--cache", p]), none()),
+        (
+            "--set key".into(),
+            argv(&["--set", &format!("{}={p}", ModelConfig::PRESET_KEY)]),
+            none(),
+        ),
+        (
+            "--set model.cache".into(),
+            argv(&["--set", &format!("model.cache={p}")]),
+            none(),
+        ),
+        (
+            "env".into(),
+            vec![],
+            BTreeMap::from([(index().keys[ModelConfig::PRESET_KEY].env(), p.to_string())]),
+        ),
+        (
+            "--model-config".into(),
+            argv(&["--model-config", &json!({ "cache": p }).to_string()]),
+            none(),
+        ),
+        (
+            "--models-config".into(),
+            argv(&[
+                "--models-config",
+                &json!({"lfm2": {"preset": p}}).to_string(),
+            ]),
+            none(),
+        ),
+        (
+            "--config".into(),
+            argv(&["--config", &file.display().to_string()]),
+            none(),
+        ),
+    ]
+}
+
+/// A named preset gives the front-end the axes it sets, and `auto` none, on
+/// any build; the keys a layer named stay the named ones. The rows on those
+/// axes are the pinned ones.
+#[test]
+fn a_named_preset_names_the_axes_it_sets() {
+    let idx = index();
+    let axes: BTreeSet<String> = PRESET_AXIS_KEYS.iter().map(|k| k.to_string()).collect();
+    let named = named_keys(idx, &preset_named());
+    assert_eq!(named, BTreeSet::from([ModelConfig::PRESET_KEY.to_string()]));
+    for p in CACHE_PRESETS {
+        let mut o = EngineOptions::default();
+        idx.set(&mut o, ModelConfig::PRESET_KEY, p).unwrap();
+        let want = if *p == "auto" {
+            BTreeSet::new()
+        } else {
+            axes.clone()
+        };
+        assert_eq!(preset_keys(idx, &o, &named), want, "{p}");
+        // A preset no layer named gives nothing.
+        assert!(preset_keys(idx, &o, &BTreeSet::new()).is_empty(), "{p}");
+    }
+    // A key named beside the preset stays named.
+    let mut o = EngineOptions::default();
+    idx.set(&mut o, ModelConfig::PRESET_KEY, "crown").unwrap();
+    let mut storage = preset_named();
+    storage.insert("model.axes.flash-scratch-sizing".into());
+    let named = named_keys(idx, &storage);
+    assert_eq!(
+        named,
+        BTreeSet::from([
+            "kernels.attention.flash.scratch".to_string(),
+            ModelConfig::PRESET_KEY.to_string()
+        ])
+    );
+    assert_eq!(preset_keys(idx, &o, &named), axes);
+    // The rows on those axes are the pinned ones.
+    let rows: BTreeSet<&str> = ROWS
+        .iter()
+        .filter(|r| axes.contains(r.key))
+        .map(|r| r.key)
+        .collect();
+    assert_eq!(
+        rows,
+        PRESET_ROW_KEYS.iter().copied().collect::<BTreeSet<_>>(),
+        "the rows on a preset's axes moved; pin them here"
+    );
+}
+
+/// A named preset on chat and serve, by every spelling, with and without a
+/// drafter: the tree differs from the unnamed one in the preset and in each
+/// row on its axes that held, which it leaves unset for the preset; every
+/// other row resolves as before. `auto` named is the unnamed tree. A key
+/// named beside the preset holds, and the preset keeps the rest. The arms
+/// the load builds (the preset, then the axes, as `lfm2::shape_key` does):
+/// on Metal the unnamed `auto` takes the rows' paged KV with FlashDecoding,
+/// `--cache crown` the crown's in-place KV with sdpa.
+#[test]
+fn a_named_preset_keeps_the_axes_it_sets() {
+    let idx = index();
+    let none = BTreeMap::new();
+    let dir = std::env::temp_dir().join(format!("lloom-preset-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let flat = |o: &EngineOptions| idx.flat(o);
+    let library = idx.flat(&EngineOptions::default());
+    let mut checked = 0usize;
+    for f in [Frontend::Chat, Frontend::Serve] {
+        for extra in [&[][..], &["--dspark"][..]] {
+            let extra: Vec<String> = extra.iter().map(|s| s.to_string()).collect();
+            let args = |more: &[String]| {
+                let mut a = extra.clone();
+                a.extend_from_slice(more);
+                a
+            };
+            let run = |argv: &[String], env: &BTreeMap<String, String>| {
+                let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
+                resolve(Some(f), f.name(), &argv, env)
+                    .unwrap_or_else(|e| panic!("{} {argv:?}: {e}", f.name()))
+            };
+            let base = run(&args(&[]), &none);
+            let taken: BTreeSet<&str> = ROWS
+                .iter()
+                .filter(|r| r.frontend == f && PRESET_ROW_KEYS.contains(&r.key))
+                .filter(|r| r.when.holds(&base))
+                .map(|r| r.key)
+                .collect();
+            for p in CACHE_PRESETS {
+                for (label, argv, env) in preset_spellings(p, &dir) {
+                    let o = run(&args(&argv), &env);
+                    let (b, n) = (flat(&base), flat(&o));
+                    let moved: BTreeSet<&str> = n
+                        .keys()
+                        .filter(|k| b.get(*k) != n.get(*k))
+                        .map(String::as_str)
+                        .collect();
+                    let mut want: BTreeSet<&str> = BTreeSet::new();
+                    if *p != "auto" {
+                        want.insert(ModelConfig::PRESET_KEY);
+                        want.extend(taken.iter().copied());
+                    }
+                    let what = format!("{} {extra:?} {label} {p}", f.name());
+                    assert_eq!(moved, want, "{what}");
+                    assert_eq!(o.model.cache, *p, "{what}");
+                    if *p != "auto" {
+                        for k in PRESET_ROW_KEYS {
+                            assert_eq!(n[*k], library[*k], "{what}: {k} is the preset's");
+                        }
+                    }
+                    checked += 1;
+                }
+            }
+        }
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+    assert_eq!(checked, 2 * 2 * CACHE_PRESETS.len() * 7);
+
+    // A key named beside the preset holds; the preset keeps the rest.
+    let chat = |argv: &[&str]| resolve(Some(Frontend::Chat), "chat", argv, &none).unwrap();
+    let (kv, attn) = ("context.kv.layout", "kernels.attention.impl");
+    let o = chat(&["--cache", "crown", "--kv-append", "paged"]);
+    assert_eq!(
+        (at(&o, kv), at(&o, attn)),
+        (typed(kv, "paged"), library[attn].clone())
+    );
+    let o = chat(&["--cache", "crown", "--set", "kernels.attention.impl=flash"]);
+    assert_eq!(
+        (at(&o, kv), at(&o, attn)),
+        (library[kv].clone(), typed(attn, "flash"))
+    );
+
+    // The arms the load builds, at one sequence without a drafter.
+    use lloom::models::lfm2::{AttnImpl, Config, KvAppend};
+    let arms = |o: &EngineOptions| {
+        let mut c = Config::default();
+        lloom::models::lfm2_presets::crown(&mut c);
+        o.model.apply_axes(&mut c).unwrap();
+        (c.kv_append, c.attn_impl)
+    };
+    let metal = When::ModelAxes.holds(&chat(&[]));
+    assert_eq!(
+        arms(&chat(&[])),
+        if metal {
+            (KvAppend::Paged, AttnImpl::FlashDecoding)
+        } else {
+            (KvAppend::InPlace, AttnImpl::Sdpa)
+        },
+        "chat, no preset named"
+    );
+    assert_eq!(
+        arms(&chat(&["--cache", "crown"])),
+        (KvAppend::InPlace, AttnImpl::Sdpa)
+    );
+    assert_eq!(
+        arms(&chat(&["--cache", "crown", "--kv-append", "paged"])),
+        (KvAppend::Paged, AttnImpl::Sdpa)
+    );
+    assert_eq!(
+        arms(&chat(&["--cache", "crown", "--attn", "flash"])),
+        (KvAppend::InPlace, AttnImpl::FlashDecoding)
+    );
 }
 
 /// The front-end table is the pinned one, row for row; each row another
@@ -774,6 +1021,27 @@ fn the_unset_defaults_are_the_trees_before_it_except_the_named_exceptions() {
             e.owner,
             e.landed
         );
+    }
+    // An exception on a preset's axis decides the unnamed preset only: under
+    // a named preset its row is skipped and the key left to the preset.
+    for e in EXCEPTIONS
+        .iter()
+        .filter(|e| PRESET_AXIS_KEYS.contains(&e.key))
+    {
+        let r = frontend::rows_for(e.key, e.frontend)
+            .find(|r| r.when == e.when)
+            .unwrap();
+        for p in CACHE_PRESETS.iter().filter(|p| **p != "auto") {
+            let mut argv = batch_for(r);
+            argv.extend(["--cache", p]);
+            let o = resolve(Some(e.frontend), e.frontend.name(), &argv, &none).unwrap();
+            assert_eq!(
+                at(&o, e.key),
+                at(&EngineOptions::default(), e.key),
+                "decision {} under --cache {p}",
+                e.decision
+            );
+        }
     }
     let decided: Vec<u32> = EXCEPTIONS.iter().map(|e| e.decision).collect();
     assert_eq!(

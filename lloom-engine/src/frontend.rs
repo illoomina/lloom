@@ -9,8 +9,9 @@
 //! the flag help and `lloom config --frontend` all read this table.
 //!
 //! A row applies after every layer, to a key no layer named (an optional
-//! key a layer set to `none` is unset, so it takes the row too). Nothing
-//! here runs per token: it is part of resolving the options, once.
+//! key a layer set to `none` is unset, so it takes the row too). A named
+//! LFM2 preset keeps the axes it sets (`app::preset_keys`). Nothing here
+//! runs per token: it is part of resolving the options, once.
 
 use crate::option_tree::index;
 use crate::EngineOptions;
@@ -412,16 +413,18 @@ pub fn describe(key: &str) -> Option<String> {
 
 /// Apply `frontend`'s rows to the keys of `o` no layer named (`explicit`,
 /// by key path) and whose condition holds; an optional key at `null` is
-/// unset whoever wrote it. Returns the keys it set.
+/// unset whoever wrote it. A key a named preset sets (`preset`) is the
+/// preset's, at `null` too. Returns the keys it set.
 pub fn apply(
     o: &mut EngineOptions,
     frontend: Frontend,
     explicit: &BTreeSet<String>,
+    preset: &BTreeSet<String>,
 ) -> Result<Vec<&'static str>, String> {
     let idx = index();
     let mut set = Vec::new();
     for r in ROWS.iter().filter(|r| r.frontend == frontend) {
-        if !r.when.holds(o) {
+        if !r.when.holds(o) || preset.contains(r.key) {
             continue;
         }
         let unset = idx.flat(o).get(r.key).is_some_and(|v| v.is_null());
@@ -483,7 +486,7 @@ mod tests {
                     o
                 };
                 let mut o = base();
-                apply(&mut o, f, &BTreeSet::new()).unwrap();
+                apply(&mut o, f, &BTreeSet::new(), &BTreeSet::new()).unwrap();
                 let flat = idx.flat(&o);
                 for r in ROWS.iter().filter(|r| r.frontend == f) {
                     let mut want = base();
@@ -517,7 +520,7 @@ mod tests {
             o.scheduler.max_sequences = batch;
             o.speculative.method = method.into();
             o.model.cache = cache.into();
-            apply(&mut o, f, &BTreeSet::new()).unwrap();
+            apply(&mut o, f, &BTreeSet::new(), &BTreeSet::new()).unwrap();
             idx.flat(&o)["context.kv.layout"].clone()
         };
         let library = idx.flat(&EngineOptions::default())["context.kv.layout"].clone();
@@ -555,7 +558,7 @@ mod tests {
         let at = |f, key: &str, batch: usize| -> Value {
             let mut o = EngineOptions::default();
             o.scheduler.max_sequences = batch;
-            apply(&mut o, f, &BTreeSet::new()).unwrap();
+            apply(&mut o, f, &BTreeSet::new(), &BTreeSet::new()).unwrap();
             idx.flat(&o)[key].clone()
         };
         let decision_36 = EXCEPTIONS.iter().find(|e| e.decision == 36).unwrap();
@@ -581,23 +584,48 @@ mod tests {
     fn a_key_a_layer_named_keeps_its_value() {
         let idx = index();
         let named = |k: &str| BTreeSet::from([k.to_string()]);
+        let none = BTreeSet::new();
         let mut o = EngineOptions::default();
-        apply(&mut o, Frontend::Chat, &named("generation.max_tokens")).unwrap();
+        apply(
+            &mut o,
+            Frontend::Chat,
+            &named("generation.max_tokens"),
+            &none,
+        )
+        .unwrap();
         assert_eq!(o.sampling.max_tokens, 512, "an explicit 512 is not unset");
         let mut o = EngineOptions::default();
         o.scheduler.max_sequences = 4;
-        apply(&mut o, Frontend::Serve, &named("scheduler.prefill_chunk")).unwrap();
+        apply(
+            &mut o,
+            Frontend::Serve,
+            &named("scheduler.prefill_chunk"),
+            &none,
+        )
+        .unwrap();
         assert_eq!(
             o.decode.prefill.chunk, 0,
             "an explicit 0 is the whole-prompt arm"
         );
         let mut o = EngineOptions::default();
         idx.set(&mut o, "context.prefix.reuse", "false").unwrap();
-        apply(&mut o, Frontend::Chat, &named("context.prefix.reuse")).unwrap();
+        apply(
+            &mut o,
+            Frontend::Chat,
+            &named("context.prefix.reuse"),
+            &none,
+        )
+        .unwrap();
         assert_eq!(o.prefix.reuse, Some(false), "an explicit opt-out holds");
         let mut o = EngineOptions::default();
         idx.set(&mut o, "context.prefix.reuse", "none").unwrap();
-        apply(&mut o, Frontend::Chat, &named("context.prefix.reuse")).unwrap();
+        apply(
+            &mut o,
+            Frontend::Chat,
+            &named("context.prefix.reuse"),
+            &none,
+        )
+        .unwrap();
         assert_eq!(o.prefix.reuse, Some(true), "`none` is the front-end's own");
     }
 

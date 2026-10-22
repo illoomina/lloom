@@ -1955,9 +1955,12 @@ pub struct ServerConfig {
     /// The port; 0 picks a free one (the bound port is in the ready marker).
     #[opt(flag = "port", path = "server.port", status = "stable", cli = "port")]
     pub port: u16,
-    /// While no request runs, one tiny GPU dispatch every this many milliseconds, so the first request after an idle spell does not start on a GPU that has powered down (`--batch 1`, Metal; costs idle power); unset = off.
+    /// While no request runs, keep the GPU ready every this many milliseconds (`server.keep_warm_by`), so the first request after an idle spell does not wait for it (`--batch 1`, Metal); unset = off.
     #[opt(flag = "keep-warm", path = "server.keep_warm", status = "advanced")]
     pub keep_warm: Option<u64>,
+    /// What `server.keep_warm` does each period: `residency` (ask the OS to keep the GPU's memory wired: it unwires it after a few idle seconds and the next request waits while it is wired back) or `dispatch` (one one-element GPU dispatch, committed and waited).
+    #[opt(flag = "keep-warm-by", parser = "parse_keep_warm_by", variants = ["residency", "dispatch"], path = "server.keep_warm_by", status = "advanced")]
+    pub keep_warm_by: String,
     #[opt(nested)]
     pub pipette: PipetteConfig,
 }
@@ -1968,8 +1971,16 @@ impl Default for ServerConfig {
             host: "127.0.0.1".into(),
             port: 0,
             keep_warm: None,
+            keep_warm_by: "residency".into(),
             pipette: PipetteConfig::default(),
         }
+    }
+}
+
+fn parse_keep_warm_by(v: &str) -> Result<String, String> {
+    match v.trim().to_ascii_lowercase().as_str() {
+        s @ ("residency" | "dispatch") => Ok(s.into()),
+        other => Err(format!("`{other}` is not `residency` or `dispatch`")),
     }
 }
 

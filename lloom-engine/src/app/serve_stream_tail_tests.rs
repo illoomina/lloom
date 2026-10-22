@@ -352,7 +352,7 @@ fn run(
         reuse: ParkingMutex::new(Default::default()),
         sessions: super::test_sessions(),
         last_active: AtomicU64::new(0),
-        warm_dispatches: AtomicU64::new(0),
+        warm_actions: AtomicU64::new(0),
     };
     let run = StreamingRun {
         kind: StreamKind::Chat,

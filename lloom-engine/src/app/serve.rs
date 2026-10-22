@@ -151,8 +151,8 @@ struct Shared {
     /// When this server last gave the GPU work (`uptime_ns`): a model
     /// request's end or a keep-warm dispatch; the load before the first.
     last_active: AtomicU64,
-    /// Keep-warm dispatches made (`server.keep_warm`).
-    warm_dispatches: AtomicU64,
+    /// Keep-warm actions taken (`server.keep_warm`).
+    warm_actions: AtomicU64,
 }
 
 /// The largest `/v1/systemone` body a decision-only owner reads: eight
@@ -380,10 +380,14 @@ fn run_owner(
             batch,
         ))),
         last_active: AtomicU64::new(uptime_ns()),
-        warm_dispatches: AtomicU64::new(0),
+        warm_actions: AtomicU64::new(0),
     });
     let keep_warm = match options.server.keep_warm {
-        Some(ms) => Some(KeepWarm::start(&shared, ms)?),
+        Some(ms) => Some(KeepWarm::start(
+            &shared,
+            ms,
+            options.server.keep_warm_by == "dispatch",
+        )?),
         None => None,
     };
 
@@ -409,8 +413,7 @@ fn run_owner(
                     b["reuse"] = shared.reuse.lock().json(shared.engine.reuse_prefix());
                     b["sampling"] = sampling_json(&shared.sampling);
                     b["sessions"] = shared.sessions.lock().json();
-                    b["keep_warm_dispatches"] =
-                        json!(shared.warm_dispatches.load(Ordering::Relaxed));
+                    b["keep_warm_actions"] = json!(shared.warm_actions.load(Ordering::Relaxed));
                     b
                 });
                 let _ = respond_metadata(request, result);
@@ -499,18 +502,19 @@ fn run_owner(
 }
 
 /// `server.keep_warm`: while no request holds the single-sequence slot and
-/// the GPU has had nothing from this server for a period, one one-element
-/// dispatch, committed and waited, so the request after an idle spell does
-/// not start on a GPU that has powered down
-/// (`measurements/issue-1076-first-token.md`). Off by default: it spends
-/// idle power to buy first-token latency.
+/// the GPU has had nothing from this server for a period, ask the OS to keep
+/// the device's memory wired (`residency`) or run one one-element dispatch
+/// (`dispatch`). macOS unwires a residency set nothing used for a few
+/// seconds, and the request after it waits while it is wired back
+/// (`measurements/issue-1076-first-token.md`). Off by default: it holds the
+/// memory wired while the server idles.
 struct KeepWarm {
     stop: Arc<AtomicBool>,
     thread: std::thread::JoinHandle<()>,
 }
 
 impl KeepWarm {
-    fn start(shared: &Arc<Shared>, period_ms: u64) -> Result<Self> {
+    fn start(shared: &Arc<Shared>, period_ms: u64, dispatch: bool) -> Result<Self> {
         if period_ms == 0 {
             anyhow::bail!("server.keep_warm: a period of 0 ms would never let the GPU idle");
         }
@@ -546,16 +550,25 @@ impl KeepWarm {
                     let Some(_turn) = shared.turns.try_take() else {
                         continue;
                     };
-                    if let Err(e) = warm_dispatch(shared.engine.device()) {
+                    if !dispatch {
+                        shared.engine.device().request_residency();
+                    } else if let Err(e) = warm_dispatch(shared.engine.device()) {
                         eprintln!("[keep-warm: stopped: {e}]");
                         return;
                     }
                     shared.last_active.store(uptime_ns(), Ordering::Release);
-                    shared.warm_dispatches.fetch_add(1, Ordering::Relaxed);
+                    shared.warm_actions.fetch_add(1, Ordering::Relaxed);
                 }
             })
             .context("spawning the keep-warm thread")?;
-        eprintln!("[keep-warm: one GPU dispatch every {period_ms} ms while idle]");
+        eprintln!(
+            "[keep-warm: {} every {period_ms} ms while idle]",
+            if dispatch {
+                "one GPU dispatch"
+            } else {
+                "the residency set's memory requested resident"
+            }
+        );
         Ok(Self { stop, thread })
     }
 
@@ -4258,7 +4271,7 @@ pub fn bench(args: BenchArgs) -> Result<()> {
             1,
         ))),
         last_active: AtomicU64::new(0),
-        warm_dispatches: AtomicU64::new(0),
+        warm_actions: AtomicU64::new(0),
     };
     let batch = options.scheduler.max_sequences.max(1);
     for run in 0..options.bench.runs.max(1) {
@@ -4861,8 +4874,9 @@ mod stream_writer_tests {
         );
     }
 
-    /// The request line's field: each stage's offset from the accept in
-    /// microseconds, and `-` for a stage the request did not reach.
+    /// The request line's fields: each stage's offset from the accept in
+    /// microseconds, `-` for a stage the request did not reach, and the
+    /// GPU's idle time before it in milliseconds.
     #[test]
     fn the_first_token_field_is_offsets_from_the_accept() {
         let t = super::FirstToken {
@@ -4875,12 +4889,13 @@ mod stream_writer_tests {
             decode: 2_200_000,
             fragment: 101_000_000,
             written: 102_500_000,
+            idle: 3_500_000_000,
             ..Default::default()
         };
         assert_eq!(
             t.field(),
             "first_token_us=handler:50,body:100,slot:-,json:200,built:1000,headers:1100,\
-             decode:1200,fragment:100000,written:101500"
+             decode:1200,fragment:100000,written:101500 idle_ms=3500"
         );
     }
 
@@ -5319,7 +5334,7 @@ mod checked_trailer_tests {
             reuse: parking_lot::Mutex::new(Default::default()),
             sessions: test_sessions(),
             last_active: AtomicU64::new(0),
-            warm_dispatches: AtomicU64::new(0),
+            warm_actions: AtomicU64::new(0),
         };
         let run = StreamingRun {
             kind: StreamKind::Chat,

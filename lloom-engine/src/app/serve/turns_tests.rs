@@ -215,8 +215,10 @@ fn try_take_never_waits_and_never_jumps_the_queue() {
             released.recv().unwrap();
         })
     };
+    // Tickets 0 (the first try_take) and 1 (`busy`) are taken; the queued
+    // request's is 2.
     let deadline = Instant::now() + Duration::from_secs(10);
-    while turns.state.lock().next < 2 {
+    while turns.state.lock().next < 3 {
         assert!(Instant::now() < deadline, "the request never took a ticket");
         std::thread::sleep(Duration::from_millis(5));
     }

@@ -1955,6 +1955,9 @@ pub struct ServerConfig {
     /// The port; 0 picks a free one (the bound port is in the ready marker).
     #[opt(flag = "port", path = "server.port", status = "stable", cli = "port")]
     pub port: u16,
+    /// While no request runs, one tiny GPU dispatch every this many milliseconds, so the first request after an idle spell does not start on a GPU that has powered down (`--batch 1`, Metal; costs idle power); unset = off.
+    #[opt(flag = "keep-warm", path = "server.keep_warm", status = "advanced")]
+    pub keep_warm: Option<u64>,
     #[opt(nested)]
     pub pipette: PipetteConfig,
 }
@@ -1964,6 +1967,7 @@ impl Default for ServerConfig {
         ServerConfig {
             host: "127.0.0.1".into(),
             port: 0,
+            keep_warm: None,
             pipette: PipetteConfig::default(),
         }
     }

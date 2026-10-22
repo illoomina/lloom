@@ -62,6 +62,19 @@ pub fn pool_spec(config: &mut Config, dcfg: &DSparkConfig) {
     config.tap_layers = dcfg.tap_layers();
 }
 
+/// The axes, by flag, that every preset above sets whatever config it is
+/// applied over. A front-end counts a named preset as explicit for these,
+/// as it counts a named key: its own defaults leave them to the preset.
+pub const AXES: &[&str] = &[
+    "qkv-layout",
+    "attn",
+    "kv-append",
+    "conv-state",
+    "gemv-silu",
+    "gemv-residual",
+    "conv-fused",
+];
+
 /// The presets a harness can name without a drafter, in `--preset` spelling.
 pub const NAMED: &[&str] = &["crown", "pool"];
 
@@ -97,6 +110,85 @@ mod tests {
         rewindable(&mut c, 3, Vec::new());
         assert_eq!(c.conv_state, ConvState::RotatingRing { k: 4 });
         assert!(c.tap_layers.is_empty());
+    }
+
+    /// `AXES` is exactly what each preset sets: applied over configs that
+    /// differ in one axis alone, a preset that sets the axis gives one
+    /// config, and a preset that leaves it gives as many as there were.
+    #[test]
+    fn every_preset_sets_exactly_its_axes() {
+        let dcfg = DSparkConfig::lfm2_2_6b();
+        let presets: [(&str, Box<dyn Fn(&mut Config)>); 5] = [
+            ("crown", Box::new(crown)),
+            ("pool", Box::new(pool)),
+            (
+                "rewindable",
+                Box::new(|c: &mut Config| rewindable(c, 9, vec![3, 10])),
+            ),
+            (
+                "rewindable-notap",
+                Box::new(|c: &mut Config| rewindable(c, 3, Vec::new())),
+            ),
+            (
+                "pool-spec",
+                Box::new(move |c: &mut Config| pool_spec(c, &dcfg)),
+            ),
+        ];
+        let distinct = |cs: &[Config]| {
+            let mut lines: Vec<String> = cs.iter().map(Config::axes_line).collect();
+            lines.sort();
+            lines.dedup();
+            lines.len()
+        };
+        let mut probed = 0;
+        for (name, preset) in &presets {
+            let mut set = Vec::new();
+            let mut varied = 0;
+            for axis in Config::AXES_META {
+                let starts: Vec<Config> = std::iter::once(Config::default())
+                    .chain(
+                        // An arm with parameters (`rotating[:<K>]`) by its
+                        // bare name.
+                        axis.variants
+                            .iter()
+                            .map(|v| v.split('[').next().unwrap_or(v))
+                            .filter(|v| !v.contains('<'))
+                            .filter_map(|v| {
+                                let mut c = Config::default();
+                                c.set_axis(axis.key, v).ok().map(|_| c)
+                            }),
+                    )
+                    .collect();
+                let before = distinct(&starts);
+                if before < 2 {
+                    assert!(
+                        !AXES.contains(&axis.key),
+                        "{} is in AXES and the probe cannot vary it",
+                        axis.key
+                    );
+                    continue;
+                }
+                varied += 1;
+                let after: Vec<Config> = starts
+                    .into_iter()
+                    .map(|mut c| {
+                        preset(&mut c);
+                        c
+                    })
+                    .collect();
+                match distinct(&after) {
+                    1 => set.push(axis.key),
+                    n => assert_eq!(n, before, "{name} sets {} for some arms only", axis.key),
+                }
+            }
+            set.sort();
+            eprintln!("[{name}: sets {set:?}, of the {varied} axes the probe varied]");
+            probed += varied;
+            let mut want = AXES.to_vec();
+            want.sort();
+            assert_eq!(set, want, "the axes {name} sets");
+        }
+        assert!(probed >= 5 * AXES.len(), "{probed} axes probed");
     }
 
     /// Every named preset resolves, and to the function its name says: the

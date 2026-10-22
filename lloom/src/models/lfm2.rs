@@ -9121,10 +9121,10 @@ fn ablate_norms() -> bool {
     })
 }
 
-/// `kernels.fusion.silu_mul`, read once.
+/// `kernels.fusion.silu_mul` (on unless skipped), read once.
 fn silu_mul_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| crate::tuning::tuning().lfm2.silu_mul)
+    *ON.get_or_init(|| !crate::tuning::tuning().lfm2.skip_silu_mul)
 }
 
 /// A class of prefill dispatch `diagnostics.ablate` can skip: `prefill-norm`

@@ -146,6 +146,8 @@ struct Shared {
     front: Front,
     /// What every request reused of its session, counted (`/health`).
     reuse: parking_lot::Mutex<crate::turn::Tally>,
+    /// The sessions chat completions' ids name (`docs/sessions.md`).
+    sessions: parking_lot::Mutex<super::sessions::Table>,
 }
 
 /// The largest `/v1/systemone` body a decision-only owner reads: eight
@@ -346,6 +348,7 @@ fn run_owner(
         }),
     );
     let (host, port) = (options.server.host.clone(), options.server.port);
+    let batch = engine.batch();
 
     let server = listener((host.as_str(), port), transport)
         .map_err(|e| anyhow::anyhow!("binding {host}:{port}: {e}"))?;
@@ -367,6 +370,10 @@ fn run_owner(
         sampling,
         front,
         reuse: parking_lot::Mutex::new(crate::turn::Tally::default()),
+        sessions: parking_lot::Mutex::new(super::sessions::Table::new(session_config(
+            &options.session,
+            batch,
+        ))),
     });
 
     // The ready marker the sidecar runner waits for, on stdout and nothing
@@ -390,6 +397,7 @@ fn run_owner(
                 let result = health_body(shared.engine.as_ref(), &shared.front).map(|mut b| {
                     b["reuse"] = shared.reuse.lock().json(shared.engine.reuse_prefix());
                     b["sampling"] = sampling_json(&shared.sampling);
+                    b["sessions"] = shared.sessions.lock().json();
                     b
                 });
                 let _ = respond_metadata(request, result);
@@ -401,6 +409,34 @@ fn run_owner(
                     &shared.decisions,
                 );
                 let _ = respond_metadata(request, result);
+            }
+            (Method::Get, "/v1l/features") => {
+                let _ = respond_metadata(request, Ok(features_body(&shared)));
+            }
+            (Method::Get, p) if p.starts_with(SESSIONS_ROUTE) => {
+                let auth = auth_digest(request.headers());
+                let found = shared.sessions.lock().inspect(
+                    &p[SESSIONS_ROUTE.len()..],
+                    auth,
+                    Instant::now(),
+                );
+                let _ = match found {
+                    Some(body) => respond_json(request, 200, &body),
+                    None => respond_error(request, 404, "no session holds this id"),
+                };
+            }
+            (Method::Delete, p) if p.starts_with(SESSIONS_ROUTE) => {
+                let auth = auth_digest(request.headers());
+                let gone =
+                    shared
+                        .sessions
+                        .lock()
+                        .delete(&p[SESSIONS_ROUTE.len()..], auth, Instant::now());
+                let _ = if gone {
+                    respond_json(request, 200, &json!({ "deleted": true }))
+                } else {
+                    respond_error(request, 404, "no session holds this id")
+                };
             }
             (Method::Post, "/eval/abort") => {
                 let _ = handle_abort(&shared, request);
@@ -610,10 +646,15 @@ fn handle_model_request(shared: &Shared, path: &str, mut request: Request) -> Re
             }
         }
     };
+    // Every other route that runs the engine leaves its sequence holding no
+    // session's state.
+    if !matches!(path, "/tokenize" | "/v1/chat/completions") {
+        shared.sessions.lock().note_other();
+    }
     let result = match path {
         "/tokenize" => tokenize(shared, &value).map(Reply::Json),
         "/v1/completions" => completions(shared, &value, request.headers()),
-        "/v1/chat/completions" => chat_completions(shared, &value),
+        "/v1/chat/completions" => chat_completions(shared, &value, auth_digest(request.headers())),
         "/prefill_throughput" => prefill_throughput(shared, &value).map(Reply::Json),
         "/decode_throughput" => decode_throughput(shared, &value).map(Reply::Json),
         "/max_memory_usage" => max_memory_usage(shared, &value).map(Reply::Json),
@@ -702,6 +743,8 @@ struct StreamingRun {
     /// `reasoning_in_content`: the deltas carry the whole reply in `content`,
     /// as before decision 51 Q2, rather than splitting the reasoning out.
     reasoning_in_content: bool,
+    /// The session turn the reply leaves (`docs/sessions.md` §3).
+    session: Option<Box<SessionCtx>>,
 }
 
 /// One decode of `prompt_ids`, through the image path when the request
@@ -799,6 +842,18 @@ fn tokenize(shared: &Shared, v: &Value) -> Handled<Value> {
 
 fn completions(shared: &Shared, v: &Value, _headers: &[Header]) -> Handled<Reply> {
     let model = shared.model_name.clone();
+    for field in ["previous_response_id", "input", "keep", "reset"] {
+        if v.get(field).is_some_and(|f| !f.is_null()) {
+            return Err(bad(format!(
+                "field '{field}' is a chat route's (sessions, docs/sessions.md); /v1/completions has no conversation"
+            )));
+        }
+    }
+    if v.get("store").and_then(Value::as_bool) == Some(true) {
+        return Err(bad(
+            "store: true is a chat route's (sessions, docs/sessions.md); /v1/completions keeps nothing",
+        ));
+    }
     let params = sampling_params(&shared.sampling, shared.engine.as_ref(), v)?;
     let stream = v.get("stream").and_then(Value::as_bool).unwrap_or(false);
     if v.get("n").and_then(Value::as_u64).unwrap_or(1) != 1 {
@@ -901,6 +956,7 @@ fn completions(shared: &Shared, v: &Value, _headers: &[Header]) -> Handled<Reply
             return_ids,
             // `/v1/completions` is not a chat route: its text is the reply.
             reasoning_in_content: true,
+            session: None,
         })));
     }
     let started = Instant::now();
@@ -986,10 +1042,43 @@ fn completion_logprobs(engine: &dyn Served, d: &Decoded) -> Result<Value> {
 
 // ---- /v1/chat/completions ----------------------------------------------------
 
-fn chat_completions(shared: &Shared, v: &Value) -> Handled<Reply> {
+fn chat_completions(shared: &Shared, v: &Value, auth: Option<[u8; 32]>) -> Handled<Reply> {
     let model = shared.model_name.clone();
+    let ask = session_ask(v)?;
+    let at = Instant::now();
+    // The session the request continues (`docs/sessions.md` §5), or why
+    // none holds its id.
+    let (resolved, miss) = match &ask.previous {
+        None => (None, None),
+        Some(id) => match shared
+            .sessions
+            .lock()
+            .resolve(id, auth, ask.input.is_some(), at)
+        {
+            Ok(r) => (Some(r), None),
+            Err(m) => (None, Some(m)),
+        },
+    };
+    if ask.input.is_some() && resolved.is_none() {
+        return Err(Failure::NotFound(
+            "previous_response_id: no session holds this id; send the whole conversation in \
+             `messages` instead"
+                .into(),
+        ));
+    }
+    // The `input` form's conversation: the session's through the continued
+    // turn, its reply as the response returned it, then the new messages.
+    let joined: Option<Value> = match (&ask.input, &resolved) {
+        (Some(input), Some(r)) => {
+            let mut m = r.messages.clone().unwrap_or_default();
+            m.extend(input.iter().cloned());
+            Some(Value::Array(m))
+        }
+        _ => None,
+    };
+    let sent = joined.as_ref().or_else(|| v.get("messages"));
     let no_messages = json!([]);
-    let messages = match (v.get("messages"), v.get("prompt_token_ids")) {
+    let messages = match (sent, v.get("prompt_token_ids")) {
         (None | Some(Value::Null), Some(ids)) if !ids.is_null() => &no_messages,
         (Some(_), Some(ids)) if !ids.is_null() => {
             return Err(bad(
@@ -1056,9 +1145,12 @@ fn chat_completions(shared: &Shared, v: &Value) -> Handled<Reply> {
             };
             let expand_ref: front::Expand<'_> = &expand;
             let front_start = Instant::now();
+            // A reset asks that nothing the session cached be taken: its
+            // turns are dropped, and the request is built as a first turn.
+            let by_reference = resolved.as_ref().filter(|_| ask.reset.is_none());
             let prompt = shared
                 .front
-                .prompt(
+                .prompt_by(
                     engine,
                     front::Request {
                         messages: &messages,
@@ -1066,7 +1158,14 @@ fn chat_completions(shared: &Shared, v: &Value) -> Handled<Reply> {
                         want,
                         add_bos: true,
                         expand: (!images.is_empty()).then_some(expand_ref),
-                        history: v.get("messages"),
+                        history: sent,
+                    },
+                    &front::ByRef {
+                        bound: by_reference.map_or(&[][..], |r| r.bound.as_slice()),
+                        prefix: by_reference.and_then(|r| {
+                            r.prefix.as_ref().map(|(rec, ids)| (rec, ids.as_slice()))
+                        }),
+                        record: true,
                     },
                 )
                 .map_err(|e| front_failure("/v1/chat/completions", e))?;
@@ -1147,7 +1246,8 @@ fn chat_completions(shared: &Shared, v: &Value) -> Handled<Reply> {
             (ids, facts, Some(prompt))
         }
     };
-    let id = format!("chatcmpl-{}", short_id());
+    params.cold |= ask.reset == Some(Reset::All);
+    let random_id = format!("chatcmpl-{}", short_id());
 
     if want_logprobs {
         if stream {
@@ -1298,8 +1398,10 @@ fn chat_completions(shared: &Shared, v: &Value) -> Handled<Reply> {
             options.len(),
             ms(started.elapsed())
         );
+        // One forward that leaves no reply: no session's turn.
+        shared.sessions.lock().note_other();
         return Ok(Reply::Json(json!({
-            "id": id,
+            "id": random_id,
             "object": "chat.completion",
             "created": now(),
             "model": model,
@@ -1318,6 +1420,63 @@ fn chat_completions(shared: &Shared, v: &Value) -> Handled<Reply> {
         })));
     }
 
+    // Every chat completion's id names the session its reply leaves
+    // (`docs/sessions.md` §3): its turn is reserved now and kept after the
+    // run. A prompt that is not the conversation (ids sent as ids, turns a
+    // budget dropped) leaves no turn.
+    let session = prompt
+        .as_ref()
+        .filter(|_| facts.dropped.messages == 0)
+        .map(|p| {
+            let carried = resolved.as_ref().map(|r| {
+                r.ids
+                    .iter()
+                    .zip(&prompt_ids)
+                    .take_while(|(a, b)| a == b)
+                    .count()
+            });
+            let mut sessions = shared.sessions.lock();
+            if let (Some(r), Some(_)) = (&resolved, ask.reset) {
+                sessions.reset(r.key);
+            }
+            let reservation = sessions.reserve(
+                super::sessions::Plan {
+                    continued: resolved.as_ref().map(|r| (r.key, r.turn)),
+                    store: ask.store,
+                    auth,
+                    prompt_ids: &prompt_ids,
+                    scopes: &p.scopes,
+                },
+                at,
+            );
+            drop(sessions);
+            Box::new(SessionCtx {
+                reservation,
+                continued: resolved.as_ref().map(|r| Continued {
+                    resident: r.resident,
+                    carried: carried.unwrap_or(0),
+                }),
+                miss,
+                asked: ask.previous.is_some(),
+                input: ask.input.is_some(),
+                reset: ask.reset,
+                conversation: sent.and_then(Value::as_array).cloned().unwrap_or_default(),
+                scope: p.origin.scope,
+                record: p.record.clone(),
+                head: p.blocks.as_ref().map_or(0, |b| b.head),
+                bound: p.spliced.bound,
+                matched: p.spliced.matched,
+                recorded: p.recorded,
+                encoded: p.encoded,
+            })
+        });
+    if session.is_none() {
+        shared.sessions.lock().note_other();
+    }
+    let id = session
+        .as_ref()
+        .map_or(random_id, |s| s.reservation.id.encode());
+
     if stream {
         return Ok(Reply::Stream(Box::new(StreamingRun {
             kind: StreamKind::Chat,
@@ -1330,6 +1489,7 @@ fn chat_completions(shared: &Shared, v: &Value) -> Handled<Reply> {
             record: prompt.as_ref().map(|p| p.origin),
             return_ids,
             reasoning_in_content,
+            session,
         })));
     }
     let split =
@@ -1349,27 +1509,23 @@ fn chat_completions(shared: &Shared, v: &Value) -> Handled<Reply> {
             }
             true
         },
-    )?;
+    )
+    .inspect_err(|_| shared.sessions.lock().note_other())?;
     if let Some(p) = &split {
         append_fields(&mut routed, p.lock().finish());
     }
     let elapsed = started.elapsed();
     let record_start = Instant::now();
-    let frontier = prompt.as_ref().map(|p| {
+    let logged = prompt.as_ref().map(|p| {
         shared
             .front
-            .record_frontier(shared.engine.as_ref(), p.origin, &decoded)
+            .record_reply(shared.engine.as_ref(), p.origin, &decoded)
     });
-    let record_us = frontier.map(|_| record_start.elapsed().as_micros() as u64);
+    let record_us = logged
+        .as_ref()
+        .map(|_| record_start.elapsed().as_micros() as u64);
+    let frontier = logged.as_ref().map(|(f, _)| *f);
     let recorded = frontier.is_some_and(|f| f.logged);
-    report(
-        shared,
-        "/v1/chat/completions",
-        prompt_ids.len(),
-        &facts,
-        &decoded,
-        ms(elapsed),
-    );
     let engine = shared.engine.as_ref();
     let mut message = json!({"role": "assistant", "content": decoded.text});
     if split.is_some() {
@@ -1380,6 +1536,26 @@ fn chat_completions(shared: &Shared, v: &Value) -> Handled<Reply> {
             message["reasoning_content"] = reasoning;
         }
     }
+    let (session_json, session_line) = match session {
+        Some(ctx) => finish_session(
+            shared,
+            *ctx,
+            &prompt_ids,
+            &decoded,
+            logged.and_then(|(_, r)| r),
+            message.clone(),
+        ),
+        None => (Value::Null, String::new()),
+    };
+    report_with(
+        shared,
+        "/v1/chat/completions",
+        prompt_ids.len(),
+        &facts,
+        &decoded,
+        ms(elapsed),
+        &session_line,
+    );
     let mut body = json!({
         "id": id,
         "object": "chat.completion",
@@ -1395,6 +1571,7 @@ fn chat_completions(shared: &Shared, v: &Value) -> Handled<Reply> {
         "timings": timings(shared.engine.as_ref(), prompt_ids.len(), &facts, &decoded, elapsed),
     });
     body["timings"]["logged"] = json!(recorded);
+    body["timings"]["session"] = session_json;
     // What of the reply is the accepted history (decision 42): the whole
     // ids its delivered text begins with, and the text past them.
     body["timings"]["frontier"] = frontier.map_or(Value::Null, |f| f.json());
@@ -1419,6 +1596,310 @@ fn chat_completions(shared: &Shared, v: &Value) -> Handled<Reply> {
     }
     attach_vision(shared, &mut body)?;
     Ok(Reply::Json(body))
+}
+
+// ---- sessions (`docs/sessions.md`) ------------------------------------------
+
+/// The routes a session is inspected and expired by.
+const SESSIONS_ROUTE: &str = "/v1l/sessions/";
+
+/// What a session's `keep` asks that this build cannot serve, and why: the
+/// engine has no checkpoint it never gives back (`docs/sessions.md` §8).
+const KEEP_REFUSED: &str = "not served by this build: the engine's checkpoint ring has no pin \
+     (docs/sessions.md §8); `keep: none` is";
+
+/// The harness's intent after a compaction (`docs/sessions.md` §5.5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Reset {
+    Cache,
+    Prefix,
+    All,
+}
+
+impl Reset {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Cache => "cache",
+            Self::Prefix => "prefix",
+            Self::All => "all",
+        }
+    }
+}
+
+/// A chat request's session fields, checked.
+struct SessionAsk {
+    previous: Option<String>,
+    /// The Responses API's delta: messages appended to the continued turn.
+    input: Option<Vec<Value>>,
+    store: Option<bool>,
+    reset: Option<Reset>,
+}
+
+fn session_ask(v: &Value) -> Handled<SessionAsk> {
+    let given = |k: &str| v.get(k).filter(|f| !f.is_null());
+    let previous = match given("previous_response_id") {
+        None => None,
+        Some(Value::String(s)) => Some(s.clone()),
+        Some(_) => return Err(bad("field 'previous_response_id' must be a string")),
+    };
+    let input = match given("input") {
+        None => None,
+        Some(Value::String(s)) => Some(vec![json!({ "role": "user", "content": s })]),
+        Some(Value::Array(a)) if !a.is_empty() && a.iter().all(Value::is_object) => Some(a.clone()),
+        Some(_) => {
+            return Err(bad(
+                "field 'input' must be a string or a non-empty array of messages",
+            ))
+        }
+    };
+    let store = match given("store") {
+        None => None,
+        Some(Value::Bool(b)) => Some(*b),
+        Some(_) => return Err(bad("field 'store' must be a boolean")),
+    };
+    match given("keep") {
+        None => {}
+        Some(Value::String(k)) if k == "none" => {}
+        Some(Value::String(k)) if k == "prefix" || k == "all" => {
+            return Err(bad(format!("keep: {k}: {KEEP_REFUSED}")))
+        }
+        Some(_) => return Err(bad("field 'keep' must be one of prefix, all, none")),
+    }
+    let reset = match given("reset") {
+        None => None,
+        Some(Value::String(r)) if r == "cache" => Some(Reset::Cache),
+        Some(Value::String(r)) if r == "prefix" => Some(Reset::Prefix),
+        Some(Value::String(r)) if r == "all" => Some(Reset::All),
+        Some(_) => return Err(bad("field 'reset' must be one of cache, prefix, all")),
+    };
+    if input.is_some() && previous.is_none() {
+        return Err(bad(
+            "field 'input' appends to a stored conversation: it needs previous_response_id",
+        ));
+    }
+    if input.is_some() && given("messages").is_some() {
+        return Err(bad(
+            "messages and input are two conversations; send messages (the whole history) or \
+             input (the new messages after previous_response_id)",
+        ));
+    }
+    if reset.is_some() && previous.is_none() {
+        return Err(bad(
+            "field 'reset' resets a session: it needs previous_response_id",
+        ));
+    }
+    if given("prompt_token_ids").is_some() && previous.is_some() {
+        return Err(bad(
+            "prompt_token_ids is the whole prompt; previous_response_id has nothing to continue",
+        ));
+    }
+    Ok(SessionAsk {
+        previous,
+        input,
+        store,
+        reset,
+    })
+}
+
+/// The digest a session is bound to: the request's `Authorization` header,
+/// where it sends one (`docs/sessions.md` §9).
+fn auth_digest(headers: &[Header]) -> Option<[u8; 32]> {
+    use sha2::Digest;
+    headers
+        .iter()
+        .find(|h| h.field.equiv("Authorization"))
+        .map(|h| sha2::Sha256::digest(h.value.as_str().as_bytes()).into())
+}
+
+/// The session table's bounds, from the `session` group.
+fn session_config(c: &crate::options::SessionConfig, batch: usize) -> super::sessions::Config {
+    super::sessions::Config {
+        ttl: std::time::Duration::from_secs(c.ttl_s as u64),
+        capacity: c.capacity,
+        ephemeral: batch.max(1),
+        max_bytes: c.max_mib.saturating_mul(1 << 20),
+        one_sequence: batch <= 1,
+    }
+}
+
+/// A table for a test's `Shared`: one sequence, the defaults' bounds.
+#[cfg(test)]
+fn test_sessions() -> parking_lot::Mutex<super::sessions::Table> {
+    parking_lot::Mutex::new(super::sessions::Table::new(session_config(
+        &Default::default(),
+        1,
+    )))
+}
+
+/// The continued session as the request found it.
+struct Continued {
+    resident: Option<bool>,
+    /// Of the session's ids, those the request's prompt starts with.
+    carried: usize,
+}
+
+/// What a chat request's session report, and its turn's record, need after
+/// the run (`docs/sessions.md` §6).
+struct SessionCtx {
+    reservation: super::sessions::Reservation,
+    continued: Option<Continued>,
+    /// Why the named id found nothing.
+    miss: Option<super::sessions::Miss>,
+    /// The request named a `previous_response_id`.
+    asked: bool,
+    input: bool,
+    reset: Option<Reset>,
+    /// The conversation as the request ran it (as sent).
+    conversation: Vec<Value>,
+    scope: front::Scope,
+    record: Option<front::PrefixRecord>,
+    /// The prompt's ids before the first message's span (the BOS, the
+    /// system turn, a tools preamble).
+    head: usize,
+    bound: usize,
+    matched: usize,
+    recorded: usize,
+    encoded: usize,
+}
+
+/// Keep the request's turn and report what its session did: the
+/// `timings.session` value and the request line's fields.
+fn finish_session(
+    shared: &Shared,
+    ctx: SessionCtx,
+    prompt_ids: &[u32],
+    decoded: &Decoded,
+    reply: Option<Arc<front::Reply>>,
+    reply_msg: Value,
+) -> (Value, String) {
+    let eot = shared
+        .front
+        .constants()
+        .and_then(|c| c.eot())
+        .map(|(id, _)| id)
+        .filter(|_| decoded.stop == Stop::Eos);
+    let id = ctx.reservation.id;
+    let kept = match reply {
+        Some(reply) => shared.sessions.lock().commit(
+            ctx.reservation,
+            super::sessions::Record {
+                messages: ctx.conversation,
+                reply_msg,
+                prompt_ids: prompt_ids.to_vec(),
+                reply,
+                eot,
+                scope: ctx.scope,
+                prefix: ctx.record,
+            },
+            Instant::now(),
+        ),
+        None => false,
+    };
+    if !kept {
+        shared.sessions.lock().note_other();
+    }
+    let reused = decoded.reused;
+    let reprefilled = ctx
+        .continued
+        .as_ref()
+        .map_or(0, |c| c.carried.saturating_sub(reused));
+    let state = match (&ctx.continued, ctx.asked) {
+        (_, false) => "new",
+        (None, true) => "expired",
+        (Some(c), true) => match c.resident {
+            Some(true) => "resident",
+            Some(false) => "evicted",
+            None if reprefilled == 0 => "resident",
+            None => "evicted",
+        },
+    };
+    let switches = match ctx.continued {
+        Some(_) => shared
+            .sessions
+            .lock()
+            .note_continued(id.key, state == "resident"),
+        None => 0,
+    };
+    let prefix = if ctx.head <= 1 {
+        "-"
+    } else if reused >= ctx.head {
+        "reused"
+    } else if state == "new" {
+        "built"
+    } else {
+        "rebuilt"
+    };
+    let history = if ctx.input {
+        "stored"
+    } else if ctx.bound > 0 || ctx.recorded > 0 {
+        "by-id"
+    } else if ctx.matched > 0 {
+        "matched"
+    } else {
+        "as-sent"
+    };
+    let json = json!({
+        "id": kept.then(|| id.encode()),
+        "state": state,
+        "stored": ctx.reservation.stored,
+        "turn": id.turn,
+        "switches": switches,
+        "reprefilled_tokens": reprefilled,
+        "prefix": prefix,
+        "history": history,
+        "bound": ctx.bound,
+        "recorded_tokens": ctx.recorded,
+        "tokenized": ctx.encoded,
+        "keep": "none",
+        "reset": ctx.reset.map(Reset::name),
+        "miss": ctx.miss.map(super::sessions::Miss::name),
+    });
+    let line = format!(
+        "session={state} session_id={} session_kept={kept} session_history={history} \
+         session_prefix={prefix} reprefilled={reprefilled} recorded={} tokenized={}",
+        id.short(),
+        ctx.recorded,
+        ctx.encoded,
+    );
+    (json, line)
+}
+
+/// `GET /v1l/features`: what this process serves of lloom's extensions to
+/// the OpenAI surface, so a client can ask instead of probing
+/// (`docs/sessions.md` §6).
+fn features_body(shared: &Shared) -> Value {
+    let cfg = shared.sessions.lock().config();
+    let engine = shared.engine.as_ref();
+    json!({
+        "object": "lloom.features",
+        "version": 1,
+        "sessions": {
+            "doc": "docs/sessions.md",
+            "id": "chatcmpl-<40 hex: slot, gen, turn, nonce>; every chat completion's names the session its reply left",
+            "previous_response_id": {
+                "messages": "the whole conversation; the session's replies are bound by the conversation before them",
+                "input": "the new messages, appended to the referenced turn's conversation; 404 when no session holds the id",
+            },
+            "store": { "default": false, "true": "kept until the TTL, the capacity or DELETE", "false": "kept while the engine holds its state" },
+            "keep": { "none": true, "prefix": KEEP_REFUSED, "all": KEEP_REFUSED },
+            "reset": ["cache", "prefix", "all"],
+            "ttl_s": cfg.ttl.as_secs(),
+            "capacity": cfg.capacity,
+            "max_bytes": cfg.max_bytes,
+            "binding": "the SHA-256 of the Authorization header, when a request sends one",
+            "routes": ["GET /v1l/sessions/{id}", "DELETE /v1l/sessions/{id}"],
+            "reported": "timings.session; /health sessions",
+        },
+        "chat": {
+            "reasoning_content": engine.think_tags().is_some(),
+            "reasoning_in_content": true,
+            "prompt_token_ids": true,
+            "return_token_ids": true,
+            "thinking_token_budget": engine.thinking_budget_refused().is_none(),
+            "truncate_prompt_tokens": true,
+            "logprobs": logprobs_capability(engine),
+        },
+    })
 }
 
 /// The ids a request sent in place of a prompt (`prompt_token_ids`, the
@@ -1790,11 +2271,16 @@ fn stream_response_with_writer(
         StreamKind::Completion => None,
     }
     .map(|p| Arc::new(parking_lot::Mutex::new(p)));
+    // The reply as the client receives it: a session's turn keeps it.
+    let delivered = Arc::new(parking_lot::Mutex::new(
+        serde_json::Map::<String, Value>::new(),
+    ));
     // Each drained batch of text becomes one chunk, wrapped on the writer's
     // thread (the counted adapter defers unresolved reasoning prefixes).
     let wrap = {
         let (id, model, kind) = (run.id.clone(), run.model.clone(), run.kind);
         let split = split.clone();
+        let delivered = Arc::clone(&delivered);
         move |text: &str| -> (String, usize) {
             let (chunk, resolved) = match kind {
                 StreamKind::Completion => (
@@ -1812,6 +2298,7 @@ fn stream_response_with_writer(
                             text.len(),
                         ),
                     };
+                    append_fields(&mut delivered.lock(), delta.clone());
                     (
                         json!({
                             "id": id, "object": "chat.completion.chunk", "created": created, "model": model,
@@ -1862,11 +2349,15 @@ fn stream_response_with_writer(
     let (mut w, mut write_err) = sw.finish()?;
     let decoded = match decoded {
         Ok(decoded) => decoded,
-        Err(error) => return finish_stream_error(w, error),
+        Err(error) => {
+            shared.sessions.lock().note_other();
+            return finish_stream_error(w, error);
+        }
     };
     if write_err.is_none() {
         if let Some(p) = split {
             let (delta, resolved) = p.lock().finish_counted();
+            append_fields(&mut delivered.lock(), delta.clone());
             if !delta.is_empty() {
                 match w.event(&json!({
                     "id": run.id, "object": "chat.completion.chunk", "created": created, "model": run.model,
@@ -1886,28 +2377,52 @@ fn stream_response_with_writer(
     // what it knows it wrote, and whether a write failed (what the client
     // received is not known either way).
     let record_start = Instant::now();
-    let frontier = run.record.map(|origin| {
+    let logged = run.record.map(|origin| {
         shared
             .front
-            .record_frontier(shared.engine.as_ref(), origin, &decoded)
+            .record_reply(shared.engine.as_ref(), origin, &decoded)
     });
-    let record_us = frontier.map(|_| record_start.elapsed().as_micros() as u64);
+    let record_us = logged
+        .as_ref()
+        .map(|_| record_start.elapsed().as_micros() as u64);
+    let frontier = logged.as_ref().map(|(f, _)| *f);
     let mut frontier_json = frontier.map_or(Value::Null, |f| f.json());
     if frontier_json.is_object() {
         frontier_json["written_bytes"] = json!(written.load(Ordering::Relaxed));
         frontier_json["write_failed"] = json!(write_err.is_some());
     }
+    // The turn is kept whether or not the client stayed: the server's state
+    // is what it accepted (the frontier), not what a client acknowledged.
+    let (session_json, session_line) = match run.session {
+        Some(ctx) => {
+            let mut message = Value::Object(std::mem::take(&mut *delivered.lock()));
+            message["role"] = json!("assistant");
+            if message.get("content").is_none() {
+                message["content"] = json!("");
+            }
+            finish_session(
+                shared,
+                *ctx,
+                &run.prompt_ids,
+                &decoded,
+                logged.and_then(|(_, r)| r),
+                message,
+            )
+        }
+        None => (Value::Null, String::new()),
+    };
     if let Some(e) = write_err {
         anyhow::bail!("client went away mid-stream: {e}; frontier {frontier_json}");
     }
     let elapsed = started.elapsed();
-    report(
+    report_with(
         shared,
         endpoint,
         run.prompt_ids.len(),
         &run.facts,
         &decoded,
         ms(elapsed),
+        &session_line,
     );
     let usage = run_usage(shared.engine.as_ref(), run.prompt_ids.len(), &decoded);
     let last = match run.kind {
@@ -1927,6 +2442,9 @@ fn stream_response_with_writer(
     };
     let mut last = last;
     last["timings"]["frontier"] = frontier_json;
+    if !session_json.is_null() {
+        last["timings"]["session"] = session_json;
+    }
     last["timings"]["front_record_us"] = json!(record_us);
     if run.return_ids {
         last["prompt_token_ids"] = json!(run.prompt_ids);
@@ -2971,6 +3489,20 @@ fn report(
     d: &Decoded,
     total_ms: f64,
 ) {
+    report_with(shared, endpoint, prompt, facts, d, total_ms, "");
+}
+
+/// [`report`], the request line carrying `extra` (a chat request's session
+/// fields) at its end.
+fn report_with(
+    shared: &Shared,
+    endpoint: &str,
+    prompt: usize,
+    facts: &PromptFacts,
+    d: &Decoded,
+    total_ms: f64,
+    extra: &str,
+) {
     let policy = shared.engine.reuse_prefix();
     let turn = d.turn.with_policy(policy);
     shared.reuse.lock().note(&turn);
@@ -2982,7 +3514,7 @@ fn report(
          commits={} poll_fallbacks={} overrun={} eos_gate={} host_fill={} prompt_ids_sha256={} \
          reasoning_effort={} think={} think_by={} thinking_budget={} thought={} budget_fired={} \
          prompt_budget={} prompt_dropped={} reused={} renders={} history={}/{} spliced={}/{} \
-         unverified={} ambiguous={} declined={} reuse_policy={} {} checkpoint={}]",
+         unverified={} ambiguous={} declined={} reuse_policy={} {} checkpoint={}{}{extra}]",
         d.tokens.len(),
         d.stop,
         d.readback.name(),
@@ -3021,6 +3553,7 @@ fn report(
         crate::turn::policy_name(policy),
         turn.fields(),
         d.checkpoint_name(),
+        if extra.is_empty() { "" } else { " " },
     );
     if let Some(note) = &d.readback_note {
         eprintln!("[{endpoint}: warning: {note}]");
@@ -3203,6 +3736,7 @@ fn health_body(engine: &dyn Served, front: &Front) -> Result<Value> {
     // template once and tokenizes the result once.
     body["template_renders"] = json!(engine.template_renders());
     body["tokenizations"] = json!(front.tokenizations());
+    body["tokenized_ids"] = json!(front.tokenized_ids());
     body["session_log"] = json!(front.logged());
     // The history policy as resolved for this template: past reasoning kept
     // unless stripped on request, an unfinished reply's rendering.
@@ -3408,6 +3942,10 @@ pub fn bench(args: BenchArgs) -> Result<()> {
         sampling,
         front,
         reuse: parking_lot::Mutex::new(crate::turn::Tally::default()),
+        sessions: parking_lot::Mutex::new(super::sessions::Table::new(session_config(
+            &options.session,
+            1,
+        ))),
     };
     let batch = options.scheduler.max_sequences.max(1);
     for run in 0..options.bench.runs.max(1) {
@@ -4410,6 +4948,7 @@ mod checked_trailer_tests {
             sampling: Default::default(),
             front,
             reuse: parking_lot::Mutex::new(Default::default()),
+            sessions: test_sessions(),
         };
         let run = StreamingRun {
             kind: StreamKind::Chat,
@@ -4429,6 +4968,7 @@ mod checked_trailer_tests {
             record: None,
             return_ids: false,
             reasoning_in_content: false,
+            session: None,
         };
         let (release, hold) = std::sync::mpsc::channel();
         let worker = std::thread::spawn(move || {

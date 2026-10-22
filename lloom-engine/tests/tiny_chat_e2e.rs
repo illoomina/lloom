@@ -693,12 +693,17 @@ impl Server {
 
     /// One request: the status and the JSON body.
     fn call(&self, method: &str, path: &str, body: &Value) -> (u16, Value) {
+        self.call_with(method, path, body, "")
+    }
+
+    /// [`Self::call`] with extra header lines (`"Name: value\r\n"` each).
+    fn call_with(&self, method: &str, path: &str, body: &Value, headers: &str) -> (u16, Value) {
         let mut s = std::net::TcpStream::connect(("127.0.0.1", self.port)).unwrap();
         let body = body.to_string();
         write!(
             s,
             "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n\
-             Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+             {headers}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
             body.len()
         )
         .unwrap();
@@ -3738,4 +3743,470 @@ fn write_the_tiny_qwen4exp_checkpoint() {
     let model = write::<Qwen4ExpTiny>(&dir);
     println!("model {}", model.display());
     println!("tokenizer {}", dir.join("tokenizer.json").display());
+}
+
+// ---- sessions (`design/docs/sessions.md`) ------------------------------------
+
+/// A greedy, thinking-off chat request whose replies are `a`s (the bias), on
+/// `fields`.
+fn session_req(fields: Value) -> Value {
+    let mut r = json!({ "enable_thinking": false, "temperature": 0, "max_tokens": 6,
+                        "logit_bias": { "97": 100 } });
+    for (k, v) in fields.as_object().unwrap() {
+        r[k] = v.clone();
+    }
+    r
+}
+
+fn ok(server: &Server, fields: Value) -> Value {
+    let (status, body) = server.call("POST", "/v1/chat/completions", &session_req(fields));
+    assert_eq!(status, 200, "{body}");
+    body
+}
+
+/// An id this server issues for a session: `chatcmpl-` and 40 hex digits.
+fn session_id(body: &Value) -> String {
+    let id = body["id"].as_str().unwrap().to_string();
+    let hex = id.strip_prefix("chatcmpl-").unwrap_or("");
+    assert!(
+        hex.len() == 40 && hex.bytes().all(|b| b.is_ascii_hexdigit()),
+        "a session id: {id}"
+    );
+    assert_eq!(
+        body["timings"]["session"]["id"],
+        id.as_str(),
+        "{}",
+        body["timings"]
+    );
+    id
+}
+
+/// Continuing a conversation by its completion's id (`docs/sessions.md`
+/// §5.1–5.2) on the tiny families, thinking off: in the `input` form the
+/// history is the session's own — nothing of it tokenized, its replies bound —
+/// and the engine extends the session's log, replaying nothing; the
+/// `messages` form with the same history builds the same prompt, by
+/// reference.
+/// A tiny family: its name, its checkpoint writer, whether it is a GGUF (its
+/// tokenizer beside it).
+type Family = (&'static str, fn(&Path) -> PathBuf, bool);
+
+#[test]
+fn serve_continues_a_conversation_by_its_completion_id() {
+    let families: [Family; 3] = [
+        ("qwen4exp", write::<Qwen4ExpTiny>, true),
+        ("qwen3_5", write::<Qwen3_5Tiny>, true),
+        ("lfm2", write::<Lfm2Tiny>, false),
+    ];
+    for (name, write_it, gguf) in families {
+        let dir = scratch(&format!("session-{name}"));
+        let model = write_it(&dir);
+        let tok = dir.join("tokenizer.json").to_str().unwrap().to_string();
+        let mut args: Vec<String> = vec!["--cpu".into(), "--prefix-reuse".into(), "true".into()];
+        if gguf {
+            args.extend(["--tokenizer".into(), tok]);
+        }
+        if name == "qwen4exp" {
+            args.extend(["--experts".into(), "resident".into()]);
+        }
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        let server = Server::start(&model, &args);
+        let user1 = json!({ "role": "user", "content": PROMPT });
+        let user2 = json!({ "role": "user", "content": "And Italy?" });
+
+        let one = ok(&server, json!({ "messages": [user1], "store": true }));
+        let id1 = session_id(&one);
+        let s1 = &one["timings"]["session"];
+        assert_eq!(s1["state"], "new", "{name}: {s1}");
+        assert_eq!(s1["stored"], true, "{name}");
+        assert_eq!(s1["turn"], 0, "{name}");
+        let reply = one["choices"][0]["message"].clone();
+        let p1 = one["usage"]["prompt_tokens"].as_u64().unwrap();
+        let r1 = one["timings"]["predicted_n"].as_u64().unwrap();
+
+        let (_, h) = server.call("GET", "/health", &json!({}));
+        let tokenized = h["tokenized_ids"].as_u64().unwrap();
+        let two = ok(
+            &server,
+            json!({ "previous_response_id": id1, "input": [user2], "return_token_ids": true }),
+        );
+        let (_, h) = server.call("GET", "/health", &json!({}));
+        let t = &two["timings"];
+        let s = &t["session"];
+        eprintln!(
+            "SESSION {name} turn 2 (input): {s} reuse={} turn={}",
+            t["reuse"], t["turn"]
+        );
+        assert_eq!(s["state"], "resident", "{name}: {s}");
+        assert_eq!(s["history"], "stored", "{name}: {s}");
+        assert_eq!(s["turn"], 1, "{name}: the session's next turn");
+        assert_eq!(s["bound"], 1, "{name}: the reply bound by reference");
+        let recorded = s["recorded_tokens"].as_u64().unwrap();
+        assert!(
+            recorded > 0 && recorded <= p1,
+            "{name}: the history taken as recorded: {s}"
+        );
+        assert_eq!(
+            h["tokenized_ids"].as_u64().unwrap() - tokenized,
+            s["tokenized"].as_u64().unwrap(),
+            "{name}: /health counts what the request tokenized"
+        );
+        let p2 = two["usage"]["prompt_tokens"].as_u64().unwrap();
+        assert!(
+            s["tokenized"].as_u64().unwrap() < p2 - recorded + 1,
+            "{name}: nothing before the reply tokenized again: {s}"
+        );
+        assert_eq!(t["turn"]["replayed"], 0, "{name}: {}", t["turn"]);
+        assert_eq!(s["reprefilled_tokens"], 0, "{name}");
+        if one["timings"]["thinking_by"] == "engine" {
+            // Thinking off is the engine closing the block its template
+            // opens, which no rendering of the history writes: the turn
+            // restores at the checkpoint the first turn left there, as on the
+            // full path (`sequence-reuse-design.md` §2.3d).
+            assert_eq!(t["turn"]["outcome"], "restore", "{name}: {t}");
+        } else {
+            assert_eq!(t["reuse"], "Extend", "{name}: {t}");
+            assert!(
+                t["reused"].as_u64().unwrap() >= p1 + r1 - 1,
+                "{name}: the first prompt and the reply kept: {t}"
+            );
+        }
+        let id2 = session_id(&two);
+        assert_ne!(id2, id1);
+
+        // The same history in the `messages` form, by reference: the same
+        // prompt, the reply bound rather than found by its text.
+        let full = ok(
+            &server,
+            json!({ "previous_response_id": id1, "messages": [user1, reply, user2],
+                    "return_token_ids": true }),
+        );
+        let fs = &full["timings"]["session"];
+        assert_eq!(fs["history"], "by-id", "{name}: {fs}");
+        assert_eq!(fs["bound"], 1, "{name}: {fs}");
+        assert_eq!(
+            full["prompt_token_ids"], two["prompt_token_ids"],
+            "{name}: one conversation, one prompt"
+        );
+        // And the same history with no reference at all: today's path, the
+        // same prompt again.
+        let plain = ok(
+            &server,
+            json!({ "messages": [user1, reply, user2], "return_token_ids": true }),
+        );
+        assert_eq!(plain["prompt_token_ids"], two["prompt_token_ids"], "{name}");
+        assert_eq!(plain["timings"]["session"]["history"], "matched", "{name}");
+        drop(server);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+/// The lifecycle through `lloom serve` (`docs/sessions.md` §4): a stored
+/// session another conversation evicted is rebuilt from its ids (nothing
+/// tokenized), one deleted is expired — the `messages` form falls back to the
+/// text match, the `input` form is a 404 — and a slot given to another
+/// session leaves the old id missing cleanly.
+#[test]
+fn serve_rebuilds_an_evicted_session_and_falls_back_from_an_expired_one() {
+    let (dir, model, base) = qwen_tiny("session-lifecycle");
+    let mut args: Vec<&str> = base.iter().map(String::as_str).collect();
+    args.extend(["--prefix-reuse", "true", "--session-capacity", "1"]);
+    let server = Server::start(&model, &args);
+    let user1 = json!({ "role": "user", "content": PROMPT });
+    let user2 = json!({ "role": "user", "content": "And Italy?" });
+
+    let one = ok(&server, json!({ "messages": [user1], "store": true }));
+    let id1 = session_id(&one);
+    // Another route runs the engine.
+    let (status, _) = server.call(
+        "POST",
+        "/v1/completions",
+        &json!({ "prompt": "Unrelated text", "max_tokens": 2, "temperature": 0 }),
+    );
+    assert_eq!(status, 200);
+    let two = ok(
+        &server,
+        json!({ "previous_response_id": id1, "input": [user2] }),
+    );
+    let s = &two["timings"]["session"];
+    eprintln!(
+        "SESSION evicted by a completion: {s} reuse={}",
+        two["timings"]["reuse"]
+    );
+    assert_eq!(s["state"], "evicted", "{s}");
+    assert_eq!(s["switches"], 1, "{s}");
+    assert!(s["reprefilled_tokens"].as_u64().unwrap() > 0, "{s}");
+    assert!(
+        s["recorded_tokens"].as_u64().unwrap() > 0,
+        "rebuilt from the ids: {s}"
+    );
+    let id2 = session_id(&two);
+    // Another conversation takes the engine; it is not stored, so the stored
+    // session keeps its slot.
+    let other = ok(
+        &server,
+        json!({ "messages": [{ "role": "user", "content": "Something else entirely." }] }),
+    );
+    assert_eq!(other["timings"]["session"]["stored"], false);
+    let user3 = json!({ "role": "user", "content": "And Spain?" });
+    let three = ok(
+        &server,
+        json!({ "previous_response_id": id2, "input": [user3] }),
+    );
+    let s = &three["timings"]["session"];
+    eprintln!(
+        "SESSION evicted by a conversation: {s} reuse={}",
+        three["timings"]["reuse"]
+    );
+    assert_eq!(s["state"], "evicted", "{s}");
+    assert_eq!(s["switches"], 2, "{s}");
+    assert!(s["recorded_tokens"].as_u64().unwrap() > 0, "{s}");
+    let (_, h) = server.call("GET", "/health", &json!({}));
+    assert_eq!(h["sessions"]["switches"], 2, "{}", h["sessions"]);
+    let reply1 = one["choices"][0]["message"].clone();
+    let reply2 = two["choices"][0]["message"].clone();
+    let reply3 = three["choices"][0]["message"].clone();
+    let id2 = session_id(&three);
+
+    let path = format!("/v1l/sessions/{id2}");
+    let (status, seen) = server.call("GET", &path, &json!({}));
+    assert_eq!(status, 200, "{seen}");
+    assert_eq!(seen["turns"], 3, "{seen}");
+    assert!(
+        seen.get("messages").is_some_and(Value::is_number),
+        "never the content"
+    );
+    let (status, _) = server.call("DELETE", &path, &json!({}));
+    assert_eq!(status, 200);
+    let (status, _) = server.call("GET", &path, &json!({}));
+    assert_eq!(status, 404);
+
+    let user4 = json!({ "role": "user", "content": "Thanks." });
+    let (status, body) = server.call(
+        "POST",
+        "/v1/chat/completions",
+        &session_req(json!({ "previous_response_id": id2, "input": [user4] })),
+    );
+    assert_eq!(
+        status, 404,
+        "the input form has nothing to fall back to: {body}"
+    );
+    let four = ok(
+        &server,
+        json!({ "previous_response_id": id2,
+                "messages": [user1, reply1, user2, reply2, user3, reply3, user4] }),
+    );
+    let s = &four["timings"]["session"];
+    assert_eq!(s["state"], "expired", "{s}");
+    assert_eq!(s["history"], "matched", "the text match is the floor: {s}");
+
+    // One stored slot: a new stored session takes it, and the old id misses.
+    let a = ok(&server, json!({ "messages": [user1], "store": true }));
+    let id_a = session_id(&a);
+    let _b = ok(&server, json!({ "messages": [user2], "store": true }));
+    let (status, _) = server.call(
+        "POST",
+        "/v1/chat/completions",
+        &session_req(json!({ "previous_response_id": id_a, "input": [user4] })),
+    );
+    assert_eq!(status, 404, "a stale generation misses");
+    drop(server);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A standard client (no session field) and `store: false` build today's
+/// prompt and draw today's tokens; the completion's id is real all the same,
+/// and continues the conversation while the engine holds it.
+#[test]
+fn serve_without_store_builds_todays_prompt_and_its_id_lasts_while_resident() {
+    let (dir, model, base) = qwen_tiny("session-store-false");
+    let mut args: Vec<&str> = base.iter().map(String::as_str).collect();
+    args.extend(["--prefix-reuse", "true"]);
+    let server = Server::start(&model, &args);
+    let user1 = json!({ "role": "user", "content": PROMPT });
+    let a = ok(
+        &server,
+        json!({ "messages": [user1], "return_token_ids": true }),
+    );
+    let b = ok(
+        &server,
+        json!({ "messages": [user1], "store": false, "return_token_ids": true }),
+    );
+    assert_eq!(a["prompt_token_ids"], b["prompt_token_ids"]);
+    assert_eq!(a["choices"][0]["token_ids"], b["choices"][0]["token_ids"]);
+    assert_eq!(
+        a["timings"]["prompt_ids_sha256"],
+        b["timings"]["prompt_ids_sha256"]
+    );
+    assert_eq!(b["timings"]["session"]["stored"], false);
+    let id = session_id(&b);
+    let user2 = json!({ "role": "user", "content": "And Italy?" });
+    let c = ok(
+        &server,
+        json!({ "previous_response_id": id, "input": [user2] }),
+    );
+    assert_eq!(
+        c["timings"]["session"]["state"], "resident",
+        "{}",
+        c["timings"]["session"]
+    );
+    assert_eq!(c["timings"]["reuse"], "Extend");
+    // Another request takes the engine: an ephemeral session is gone.
+    ok(
+        &server,
+        json!({ "messages": [{ "role": "user", "content": "Other." }] }),
+    );
+    let (status, _) = server.call(
+        "POST",
+        "/v1/chat/completions",
+        &session_req(json!({ "previous_response_id": session_id(&c), "input": [user2] })),
+    );
+    assert_eq!(status, 404, "not stored: kept only while resident");
+    drop(server);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A harness that updates its system prompt and sends the whole history by
+/// reference (`docs/sessions.md` §5.1 point 3): nothing binds past the first
+/// differing message, the prefix is rebuilt, and the session's lineage starts
+/// anew from this turn. `keep` and `reset`, and the fields' refusals.
+#[test]
+fn serve_rebuilds_an_updated_prefix_and_takes_keep_and_reset() {
+    let (dir, model, base) = qwen_tiny("session-prefix");
+    let mut args: Vec<&str> = base.iter().map(String::as_str).collect();
+    args.extend(["--prefix-reuse", "true"]);
+    let server = Server::start(&model, &args);
+    let sys1 = json!({ "role": "system", "content": "You are a terse assistant." });
+    let sys2 = json!({ "role": "system", "content": "You are a verbose assistant now." });
+    let user1 = json!({ "role": "user", "content": PROMPT });
+    let user2 = json!({ "role": "user", "content": "And Italy?" });
+    let one = ok(&server, json!({ "messages": [sys1, user1], "store": true }));
+    let id1 = session_id(&one);
+    let reply = one["choices"][0]["message"].clone();
+    let two = ok(
+        &server,
+        json!({ "previous_response_id": id1, "messages": [sys2, user1, reply, user2],
+                "keep": "none" }),
+    );
+    let s = &two["timings"]["session"];
+    eprintln!(
+        "SESSION updated system prompt: {s} turn={}",
+        two["timings"]["turn"]
+    );
+    assert_eq!(s["state"], "resident", "{s}");
+    assert_eq!(s["bound"], 0, "{s}");
+    assert_eq!(s["prefix"], "rebuilt", "{s}");
+    assert_eq!(s["turn"], 0, "the lineage starts anew: {s}");
+    assert_eq!(s["keep"], "none");
+
+    let id2 = session_id(&two);
+    let three = ok(
+        &server,
+        json!({ "previous_response_id": id2, "input": [user2], "reset": "cache" }),
+    );
+    let s = &three["timings"]["session"];
+    assert_eq!(s["reset"], "cache", "{s}");
+    assert_eq!(s["turn"], 0, "{s}");
+    assert_ne!(s["history"], "by-id", "a reset takes nothing cached: {s}");
+
+    let id3 = session_id(&three);
+    for (fields, says) in [
+        (
+            json!({ "previous_response_id": id3, "input": [user2], "keep": "prefix" }),
+            "pin",
+        ),
+        (
+            json!({ "previous_response_id": id3, "input": [user2], "keep": "all" }),
+            "pin",
+        ),
+        (json!({ "messages": [user1], "keep": "bogus" }), "keep"),
+        (
+            json!({ "messages": [user1], "reset": "cache" }),
+            "previous_response_id",
+        ),
+        (json!({ "input": [user2] }), "previous_response_id"),
+        (
+            json!({ "previous_response_id": id3, "input": [user2], "messages": [user1] }),
+            "two conversations",
+        ),
+        (
+            json!({ "previous_response_id": 7, "messages": [user1] }),
+            "previous_response_id",
+        ),
+        (json!({ "messages": [user1], "store": "yes" }), "store"),
+        (
+            json!({ "previous_response_id": id3, "prompt_token_ids": [1, 2, 3] }),
+            "prompt_token_ids",
+        ),
+    ] {
+        let (status, body) =
+            server.call("POST", "/v1/chat/completions", &session_req(fields.clone()));
+        assert_eq!(status, 400, "{fields}: {body}");
+        assert!(body.to_string().contains(says), "{fields}: {body}");
+    }
+    let (status, body) = server.call(
+        "POST",
+        "/v1/completions",
+        &json!({ "prompt": "x", "max_tokens": 2, "previous_response_id": id3 }),
+    );
+    assert_eq!(status, 400, "{body}");
+    drop(server);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// `GET /v1l/features` says what the sessions serve; a streamed completion's
+/// chunks carry its session id and its final event the session report; a
+/// session bound to an `Authorization` is not found without it.
+#[test]
+fn serve_advertises_sessions_streams_their_id_and_binds_them_to_a_key() {
+    let (dir, model, base) = qwen_tiny("session-stream");
+    let mut args: Vec<&str> = base.iter().map(String::as_str).collect();
+    args.extend(["--prefix-reuse", "true"]);
+    let server = Server::start(&model, &args);
+    let (status, f) = server.call("GET", "/v1l/features", &json!({}));
+    assert_eq!(status, 200, "{f}");
+    assert_eq!(f["sessions"]["store"]["default"], false, "{f}");
+    assert_eq!(f["sessions"]["keep"]["none"], true, "{f}");
+    assert!(f["sessions"]["keep"]["prefix"].is_string(), "{f}");
+    assert_eq!(f["sessions"]["ttl_s"], 3600);
+
+    let user1 = json!({ "role": "user", "content": PROMPT });
+    let events = sse(
+        &server,
+        &session_req(json!({ "messages": [user1], "store": true, "stream": true })),
+    );
+    let id = events[0]["id"].as_str().unwrap().to_string();
+    assert!(
+        events.iter().all(|e| e["id"] == id.as_str()),
+        "one id per stream"
+    );
+    let last = events.last().unwrap();
+    assert_eq!(last["timings"]["session"]["id"], id.as_str(), "{last}");
+    let user2 = json!({ "role": "user", "content": "And Italy?" });
+    let two = ok(
+        &server,
+        json!({ "previous_response_id": id, "input": [user2] }),
+    );
+    assert_eq!(two["timings"]["session"]["state"], "resident");
+    assert_eq!(two["timings"]["reuse"], "Extend", "{}", two["timings"]);
+
+    // Bound to a key.
+    let key = "Authorization: Bearer sk-one\r\n";
+    let (status, a) = server.call_with(
+        "POST",
+        "/v1/chat/completions",
+        &session_req(json!({ "messages": [user1], "store": true })),
+        key,
+    );
+    assert_eq!(status, 200, "{a}");
+    let ida = session_id(&a);
+    let cont = session_req(json!({ "previous_response_id": ida, "input": [user2] }));
+    for other in ["", "Authorization: Bearer sk-two\r\n"] {
+        let (status, _) = server.call_with("POST", "/v1/chat/completions", &cont, other);
+        assert_eq!(status, 404, "{other:?}");
+    }
+    let (status, b) = server.call_with("POST", "/v1/chat/completions", &cont, key);
+    assert_eq!(status, 200, "{b}");
+    drop(server);
+    std::fs::remove_dir_all(&dir).ok();
 }

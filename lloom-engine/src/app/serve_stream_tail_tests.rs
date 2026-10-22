@@ -350,6 +350,7 @@ fn run(
         model_name: "scripted-tail".into(),
         sampling: Default::default(),
         reuse: ParkingMutex::new(Default::default()),
+        sessions: super::test_sessions(),
     };
     let run = StreamingRun {
         kind: StreamKind::Chat,
@@ -362,6 +363,7 @@ fn run(
         record: Some(origin),
         return_ids: false,
         reasoning_in_content: false,
+        session: None,
     };
     let failed = fail.is_some();
     let result = stream_response_with_writer(&shared, run, || {

@@ -68,9 +68,12 @@ The normal generating listener implements these routes. A d1-omni
 | `POST /eval` | Benchmark JSONL events, not OpenAI chat SSE |
 | `POST /eval/abort` | `sample_id` to stop an evaluation sample |
 | `POST /shutdown` | Orderly shutdown |
+| `GET /v1l/features` | The lloom extensions this process serves: the session fields and their values, the TTL and capacity, the chat extensions |
+| `GET /v1l/sessions/{id}` | What the server holds of a session (turns, ids, age, expiry) — never its content |
+| `DELETE /v1l/sessions/{id}` | Forget a session now |
 
-There are no implemented `/v1/responses`, embeddings, files/assistants, or REST
-session-management routes in this listener. Template `tools` input does not
+There are no implemented `/v1/responses`, embeddings or files/assistants
+routes in this listener; sessions are the chat route's (below). Template `tools` input does not
 execute tools. Guided/constrained decoding fields such as `guided_choice` and
 `guided_json` are refused, not silently enforced.
 
@@ -139,8 +142,8 @@ Serve uses request kwargs, not every chat-only flag.
 
 ## Conversations and history
 
-Send full `messages` on each request; there is no REST session id that replaces
-history. Send the **actual** preceding assistant message, including returned
+Send full `messages` on each request, or continue a session by its id (below).
+Send the **actual** preceding assistant message, including returned
 `reasoning_content`, before the next user message. Python standard-library
 example:
 
@@ -159,6 +162,33 @@ first = turn()
 messages.append(first["choices"][0]["message"])
 messages.append({"role": "user", "content": "Use that name in a sentence."})
 print(turn()["choices"][0]["message"])
+```
+
+**Sessions** (`design/docs/sessions.md`). Every chat completion's `id` names
+the session its reply left (`chatcmpl-` and 40 hex digits). `store: true` keeps
+it (until `session.ttl_s`, `session.capacity` or `DELETE`); without it the id
+lasts while the engine still holds that conversation. To continue:
+
+- `previous_response_id` with `input` (a string, or the new messages): appended
+  to the stored conversation; the history is neither sent nor tokenized again.
+  An id the server does not hold is a 404 — resend the whole history.
+- `previous_response_id` with `messages` (the whole history, as always): the
+  session's replies are bound by the conversation before them, not by their
+  text, so a reply the client restructured (tool calls parsed out of it) is
+  still the model's; an id the server does not hold falls back to today's path.
+- `reset: cache|prefix|all` after a compaction; `keep: none` (`prefix` and `all`
+  need the engine's checkpoint pin and are refused by name in this build).
+
+`timings.session` reports `{id, state: new|resident|evicted|expired, turn,
+switches, reprefilled_tokens, prefix, history, recorded_tokens, tokenized}`;
+`/health` carries `sessions`. An id is a bearer token: a client that sends
+`Authorization` binds its sessions to that header's digest.
+
+```python
+first = post({"messages": [{"role": "user", "content": "Name a blue boat."}],
+              "store": True, "max_tokens": 64})
+second = post({"previous_response_id": first["id"],
+               "input": "Use that name in a sentence.", "max_tokens": 64})
 ```
 
 Serve prefix reuse defaults on (`--no-reuse` opts out); benchmark cells retain

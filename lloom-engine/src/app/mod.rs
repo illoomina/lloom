@@ -24,6 +24,7 @@ pub mod report;
 mod request_slot;
 pub mod serve;
 pub mod served;
+pub mod sessions;
 pub mod template;
 pub mod thinking;
 pub mod vision;

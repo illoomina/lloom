@@ -15,9 +15,7 @@
 //! own process: the switch is read once.
 #![cfg(feature = "metal")]
 
-use lloom::models::lfm2::{
-    AttnImpl, Config, GateFusion, KvAppend, MemoryBudget, QkvLayout, State,
-};
+use lloom::models::lfm2::{AttnImpl, Config, GateFusion, KvAppend, MemoryBudget, QkvLayout, State};
 use lloom::models::lfm2_testing::Lfm2Tiny;
 use lloom::profile::{CrownExact, PoolExact, Profile};
 use lloom::testing::tiny::{TinyCheckpoint, TinyFamily, Weights};

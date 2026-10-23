@@ -8,19 +8,32 @@
 //! a fixed table, so a lookup is O(1); the slot's generation moves whenever it
 //! is given to another session, so a stale id misses rather than landing in
 //! that session; the nonce is per turn and random, so an id is not guessable.
+//!
+//! A session has no lifetime of its own: it is held until the server
+//! reclaims it — unused past the idle policy, the least recently used past
+//! the capacity or the byte budget — or a client ends it, and an id that
+//! misses says which (`Reason`).
 
 use super::front::{Bound, PrefixRecord, Reply, Scope};
 use serde_json::{json, Value};
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const PREFIX: &str = "chatcmpl-";
 
-/// How many sessions a server keeps, and for how long.
+/// Releases a slot remembers, so an id of a session let go can still be told
+/// why; an older one misses without a reason.
+const RELEASES_KEPT: usize = 8;
+
+/// Turns a session remembers dropping by `reset`, for the same purpose.
+const DROPPED_KEPT: usize = 64;
+
+/// The server's retention policy for its sessions.
 #[derive(Debug, Clone, Copy)]
 pub struct Config {
-    /// A session not used for this long is forgotten.
-    pub ttl: Duration,
+    /// A session unused this long is reclaimed (`server.sessions.idle_s`).
+    pub idle: Duration,
     /// Stored sessions.
     pub capacity: usize,
     /// Ephemeral sessions: at most one per engine sequence.
@@ -79,6 +92,66 @@ impl WireId {
     }
 }
 
+/// Why the server let a session, or a turn of it, go
+/// (`docs/sessions.md` §4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reason {
+    /// Unused past the idle policy.
+    Idle,
+    /// Its slot went to another session: the least recently used past the
+    /// table's capacity, or an ephemeral session whose state the engine gave
+    /// to another conversation.
+    Capacity,
+    /// The least recently used past the byte budget.
+    Memory,
+    /// `reset` dropped the turn.
+    Reset,
+    /// `DELETE /v1l/sessions/{id}`.
+    Delete,
+    /// Issued by an earlier server process.
+    Restart,
+}
+
+impl Reason {
+    pub const ALL: [Reason; 6] = [
+        Reason::Idle,
+        Reason::Capacity,
+        Reason::Memory,
+        Reason::Reset,
+        Reason::Delete,
+        Reason::Restart,
+    ];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Idle => "idle",
+            Self::Capacity => "capacity",
+            Self::Memory => "memory",
+            Self::Reset => "reset",
+            Self::Delete => "delete",
+            Self::Restart => "restart",
+        }
+    }
+}
+
+/// A session this slot let go, kept to answer for its ids: the reason, and
+/// what verifies an id against it (the binding, each turn's nonce).
+struct Released {
+    gen: u32,
+    reason: Reason,
+    auth: Option<[u8; 32]>,
+    nonces: Vec<u64>,
+    dropped: VecDeque<Dropped>,
+}
+
+/// A turn `reset` dropped from a session that lives on.
+#[derive(Clone, Copy)]
+struct Dropped {
+    turn: u32,
+    nonce: u64,
+    reason: Reason,
+}
+
 struct Turn {
     nonce: u64,
     /// The messages before this turn's reply.
@@ -107,11 +180,13 @@ struct Session {
     last_used: Instant,
     switches: u64,
     bytes: usize,
+    dropped: VecDeque<Dropped>,
 }
 
 struct Slot {
     gen: u32,
     session: Option<Session>,
+    released: VecDeque<Released>,
 }
 
 /// A continuation the table found.
@@ -180,6 +255,8 @@ struct Counters {
     expired: u64,
     switches: u64,
     committed: u64,
+    /// Sessions let go, and `reset`s, by reason (`Reason::ALL`'s order).
+    released: [u64; 6],
 }
 
 /// The server's sessions.
@@ -187,26 +264,30 @@ pub struct Table {
     cfg: Config,
     /// `[0, capacity)` stored, then the ephemeral ones.
     slots: Vec<Slot>,
+    /// Every slot's first generation, drawn per process: an id whose
+    /// generation this process has not reached was issued by an earlier one.
+    base: u32,
     /// The session the engine's one sequence last served.
     occupant: Option<Key>,
     bytes: usize,
     counters: Counters,
 }
 
-/// Why a lookup found nothing; every case reads as `expired` on the wire,
-/// so a client cannot tell an id that never existed from one that did.
+/// Why a lookup found nothing, for the server's own log. On the wire every
+/// case is `expired`, and only `reason` — present where the id's holder can
+/// be told why — says more.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Miss {
     /// Not an id this server issues.
     Malformed,
     /// The slot's generation moved, or the slot is empty.
     Stale,
-    /// The turn's nonce does not match, or a fork dropped the turn.
+    /// The turn's nonce does not match, or a fork or a reset dropped the turn.
     Turn,
     /// The session was bound to another `Authorization`.
     Binding,
-    /// Unused past the TTL.
-    Ttl,
+    /// Unused past the idle policy.
+    Idle,
     /// An ephemeral session whose state the engine no longer holds.
     Gone,
 }
@@ -218,9 +299,26 @@ impl Miss {
             Self::Stale => "stale",
             Self::Turn => "turn",
             Self::Binding => "binding",
-            Self::Ttl => "ttl",
+            Self::Idle => "idle",
             Self::Gone => "gone",
         }
+    }
+}
+
+/// A lookup that found nothing, and why the server let the session go where
+/// the id verifies against what it let go: its binding and its turn's nonce.
+/// An id that does not — another `Authorization`, a guessed nonce, a release
+/// too old to remember — gets no reason, so a reason is never a hint that an
+/// id exists to anyone but its holder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Lost {
+    pub miss: Miss,
+    pub reason: Option<Reason>,
+}
+
+impl Lost {
+    fn of(miss: Miss, reason: Option<Reason>) -> Self {
+        Self { miss, reason }
     }
 }
 
@@ -232,17 +330,37 @@ fn json_bytes(v: &[Value]) -> usize {
     v.iter().map(|m| m.to_string().len()).sum()
 }
 
+fn push_dropped(q: &mut VecDeque<Dropped>, d: Dropped) {
+    if q.len() == DROPPED_KEPT {
+        q.pop_front();
+    }
+    q.push_back(d);
+}
+
+fn dropped_reason(q: &VecDeque<Dropped>, w: WireId) -> Option<Reason> {
+    q.iter()
+        .find(|d| d.turn == w.turn && same(d.nonce, w.nonce))
+        .map(|d| d.reason)
+}
+
 impl Table {
     pub fn new(cfg: Config) -> Self {
+        Self::with_base(cfg, rand::random::<u32>())
+    }
+
+    /// A table whose slots start at generation `base`; `new` draws it.
+    pub fn with_base(cfg: Config, base: u32) -> Self {
         let n = cfg.capacity + cfg.ephemeral.max(1);
         Self {
             cfg,
             slots: (0..n)
                 .map(|_| Slot {
-                    gen: 0,
+                    gen: base,
                     session: None,
+                    released: VecDeque::new(),
                 })
                 .collect(),
+            base,
             occupant: None,
             bytes: 0,
             counters: Counters::default(),
@@ -261,16 +379,35 @@ impl Table {
         self.cfg.capacity..self.slots.len()
     }
 
-    fn expired(&self, s: &Session, now: Instant) -> bool {
-        now.saturating_duration_since(s.last_used) > self.cfg.ttl
+    fn idle(&self, s: &Session, now: Instant) -> bool {
+        now.saturating_duration_since(s.last_used) > self.cfg.idle
+    }
+
+    /// Whether this process has issued generation `gen` in slot `i`.
+    fn issued(&self, i: usize, gen: u32) -> bool {
+        gen.wrapping_sub(self.base) <= self.slots[i].gen.wrapping_sub(self.base)
     }
 
     /// Empty slot `i` and move its generation: every id naming it misses.
-    fn free(&mut self, i: usize) {
+    /// With a `reason`, the session is let go, and its ids are answered for.
+    fn free(&mut self, i: usize, reason: Option<Reason>) {
         let slot = &mut self.slots[i];
         if let Some(s) = slot.session.take() {
             if s.stored {
                 self.bytes -= s.bytes;
+            }
+            if let Some(reason) = reason {
+                if slot.released.len() == RELEASES_KEPT {
+                    slot.released.pop_front();
+                }
+                slot.released.push_back(Released {
+                    gen: slot.gen,
+                    reason,
+                    auth: s.auth,
+                    nonces: s.turns.iter().map(|t| t.nonce).collect(),
+                    dropped: s.dropped,
+                });
+                self.counters.released[reason as usize] += 1;
             }
         }
         slot.gen = slot.gen.wrapping_add(1);
@@ -279,29 +416,46 @@ impl Table {
         }
     }
 
+    /// Why slot `w.key.slot` let go the session `w` names, where `w`
+    /// verifies against what it let go.
+    fn released_reason(&self, w: WireId, auth: Option<[u8; 32]>) -> Option<Reason> {
+        let r = self.slots[w.key.slot as usize]
+            .released
+            .iter()
+            .find(|r| r.gen == w.key.gen)?;
+        if r.auth != auth {
+            return None;
+        }
+        match r.nonces.get(w.turn as usize) {
+            Some(&n) if same(n, w.nonce) => Some(r.reason),
+            _ => dropped_reason(&r.dropped, w),
+        }
+    }
+
     /// A slot for a new session among `range`: an empty one, else one past
-    /// its TTL, else the least recently used.
+    /// the idle policy, else the least recently used.
     fn take_slot(&mut self, range: std::ops::Range<usize>, now: Instant) -> usize {
-        let pick = range
-            .clone()
-            .find(|&i| self.slots[i].session.is_none())
-            .or_else(|| {
-                range.clone().find(|&i| {
-                    self.slots[i]
-                        .session
-                        .as_ref()
-                        .is_some_and(|s| self.expired(s, now))
-                })
-            })
-            .unwrap_or_else(|| {
+        let empty = range.clone().find(|&i| self.slots[i].session.is_none());
+        let idle = range.clone().find(|&i| {
+            self.slots[i]
+                .session
+                .as_ref()
+                .is_some_and(|s| self.idle(s, now))
+        });
+        let (pick, reason) = match (empty, idle) {
+            (Some(i), _) => (i, None),
+            (None, Some(i)) => (i, Some(Reason::Idle)),
+            (None, None) => (
                 range
                     .min_by_key(|&i| self.slots[i].session.as_ref().map(|s| s.last_used))
-                    .expect("a non-empty range")
-            });
+                    .expect("a non-empty range"),
+                Some(Reason::Capacity),
+            ),
+        };
         if self.slots[pick].session.is_some() {
             self.counters.expired += 1;
         }
-        self.free(pick);
+        self.free(pick, reason);
         pick
     }
 
@@ -327,31 +481,36 @@ impl Table {
         id: &str,
         auth: Option<[u8; 32]>,
         now: Instant,
-    ) -> Result<(Key, usize), Miss> {
-        let w = WireId::parse(id).ok_or(Miss::Malformed)?;
+    ) -> Result<(Key, usize), Lost> {
+        let w = WireId::parse(id).ok_or(Lost::of(Miss::Malformed, None))?;
         let key = w.key;
         let i = key.slot as usize;
+        if i >= self.slots.len() || !self.issued(i, key.gen) {
+            return Err(Lost::of(Miss::Stale, Some(Reason::Restart)));
+        }
         let ephemeral = self.ephemeral_slots().contains(&i);
-        let (expired, gone) = {
-            let s = self.get(key).ok_or(Miss::Stale)?;
+        let (idle, gone) = {
+            let Some(s) = self.get(key) else {
+                return Err(Lost::of(Miss::Stale, self.released_reason(w, auth)));
+            };
             if s.auth != auth {
-                return Err(Miss::Binding);
+                return Err(Lost::of(Miss::Binding, None));
             }
-            let turn = s.turns.get(w.turn as usize).ok_or(Miss::Turn)?;
-            if !same(turn.nonce, w.nonce) {
-                return Err(Miss::Turn);
+            match s.turns.get(w.turn as usize) {
+                Some(t) if same(t.nonce, w.nonce) => {}
+                _ => return Err(Lost::of(Miss::Turn, dropped_reason(&s.dropped, w))),
             }
             let gone = ephemeral && self.cfg.one_sequence && self.occupant != Some(key);
-            (self.expired(s, now), gone)
+            (self.idle(s, now), gone)
         };
-        if expired {
+        if idle {
             self.counters.expired += 1;
-            self.free(i);
-            return Err(Miss::Ttl);
+            self.free(i, Some(Reason::Idle));
+            return Err(Lost::of(Miss::Idle, Some(Reason::Idle)));
         }
         if gone {
-            self.free(i);
-            return Err(Miss::Gone);
+            self.free(i, Some(Reason::Capacity));
+            return Err(Lost::of(Miss::Gone, Some(Reason::Capacity)));
         }
         Ok((key, w.turn as usize))
     }
@@ -365,13 +524,13 @@ impl Table {
         auth: Option<[u8; 32]>,
         messages: bool,
         now: Instant,
-    ) -> Result<Resolved, Miss> {
+    ) -> Result<Resolved, Lost> {
         let found = self.find(id, auth, now);
         let (key, t) = match found {
             Ok(k) => k,
-            Err(m) => {
-                self.counters.expired += u64::from(m != Miss::Ttl);
-                return Err(m);
+            Err(l) => {
+                self.counters.expired += u64::from(l.miss != Miss::Idle);
+                return Err(l);
             }
         };
         let resident = self.cfg.one_sequence.then(|| self.occupant == Some(key));
@@ -425,11 +584,20 @@ impl Table {
     }
 
     /// Forget a session's turns (`reset`): the next turn starts its lineage
-    /// anew under the same session.
+    /// anew under the same session, and the dropped turns' ids miss with
+    /// `reset` as their reason.
     pub fn reset(&mut self, key: Key) {
         let Some(s) = self.get_mut(key) else {
             return;
         };
+        for (turn, t) in s.turns.iter().enumerate() {
+            let d = Dropped {
+                turn: turn as u32,
+                nonce: t.nonce,
+                reason: Reason::Reset,
+            };
+            push_dropped(&mut s.dropped, d);
+        }
         s.turns.clear();
         s.ids.clear();
         s.messages.clear();
@@ -438,6 +606,7 @@ impl Table {
         if stored {
             self.bytes -= old;
         }
+        self.counters.released[Reason::Reset as usize] += 1;
     }
 
     /// Reserve the turn a request will leave, before it runs: its session
@@ -457,7 +626,8 @@ impl Table {
                     .session
                     .take()
                     .expect("present above");
-                self.free(k.slot as usize);
+                // Moved, not let go: the old slot's ids miss without a reason.
+                self.free(k.slot as usize, None);
                 s.stored = true;
                 s.bytes = s.ids.len() * 4 + json_bytes(&s.messages);
                 self.bytes += s.bytes;
@@ -488,6 +658,7 @@ impl Table {
                     last_used: now,
                     switches: 0,
                     bytes: 0,
+                    dropped: VecDeque::new(),
                 });
                 self.counters.created += 1;
                 Key {
@@ -586,7 +757,7 @@ impl Table {
             match victim {
                 Some(i) => {
                     self.counters.expired += 1;
-                    self.free(i);
+                    self.free(i, Some(Reason::Memory));
                 }
                 None => break,
             }
@@ -601,14 +772,20 @@ impl Table {
     }
 
     /// `GET /v1l/sessions/{id}`: what the server holds of it — never its
-    /// content.
-    pub fn inspect(&mut self, id: &str, auth: Option<[u8; 32]>, now: Instant) -> Option<Value> {
-        let (key, t) = self.find(id, auth, now).ok()?;
+    /// content. Its state, never an expiry: when a session goes is the
+    /// server's policy (`/health`'s `sessions`), not the session's.
+    pub fn inspect(
+        &mut self,
+        id: &str,
+        auth: Option<[u8; 32]>,
+        now: Instant,
+    ) -> Result<Value, Lost> {
+        let (key, t) = self.find(id, auth, now)?;
         let resident = self.cfg.one_sequence.then(|| self.occupant == Some(key));
-        let ttl = self.cfg.ttl;
-        let s = self.get(key)?;
-        Some(json!({
+        let s = self.get(key).expect("found above");
+        Ok(json!({
             "id": id,
+            "state": resident.map(|r| if r { "resident" } else { "evicted" }),
             "turn": t,
             "turns": s.turns.len(),
             "stored": s.stored,
@@ -618,32 +795,44 @@ impl Table {
             "bytes": s.bytes.max(s.ids.len() * 4),
             "switches": s.switches,
             "age_s": now.saturating_duration_since(s.created).as_secs(),
-            "idle_s": now.saturating_duration_since(s.last_used).as_secs(),
-            "expires_in_s": ttl.saturating_sub(now.saturating_duration_since(s.last_used)).as_secs(),
+            "unused_s": now.saturating_duration_since(s.last_used).as_secs(),
         }))
     }
 
-    /// `DELETE /v1l/sessions/{id}`: forget the session now.
-    pub fn delete(&mut self, id: &str, auth: Option<[u8; 32]>, now: Instant) -> bool {
-        match self.find(id, auth, now) {
-            Ok((key, _)) => {
-                self.counters.expired += 1;
-                self.free(key.slot as usize);
-                true
-            }
-            Err(_) => false,
-        }
+    /// `DELETE /v1l/sessions/{id}`: let the session go now.
+    pub fn delete(&mut self, id: &str, auth: Option<[u8; 32]>, now: Instant) -> Result<(), Lost> {
+        let (key, _) = self.find(id, auth, now)?;
+        self.counters.expired += 1;
+        self.free(key.slot as usize, Some(Reason::Delete));
+        Ok(())
     }
 
-    /// `/health`'s `sessions`.
+    /// `/health`'s `sessions`: what is held, the retention policy that lets
+    /// sessions go (`held` against `capacity` and `max_mib`, reclaimed after
+    /// `idle_s` unused, the least recently used first), and what the policy
+    /// and the clients have let go, by reason.
     pub fn json(&self) -> Value {
         let held =
             |r: std::ops::Range<usize>| r.filter(|&i| self.slots[i].session.is_some()).count();
+        let released: serde_json::Map<String, Value> = Reason::ALL
+            .iter()
+            .filter(|r| **r != Reason::Restart)
+            .map(|r| {
+                (
+                    r.name().to_string(),
+                    json!(self.counters.released[*r as usize]),
+                )
+            })
+            .collect();
         json!({
+            "held": held(0..self.slots.len()),
             "stored": held(self.stored_slots()),
             "ephemeral": held(self.ephemeral_slots()),
             "capacity": self.cfg.capacity,
-            "ttl_s": self.cfg.ttl.as_secs(),
+            "max_mib": self.cfg.max_bytes >> 20,
+            "idle_s": self.cfg.idle.as_secs(),
+            "reclaim": "lru by last use",
+            "released": released,
             "bytes": self.bytes,
             "max_bytes": self.cfg.max_bytes,
             "created": self.counters.created,

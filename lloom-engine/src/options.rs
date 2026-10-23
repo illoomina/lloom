@@ -1856,9 +1856,6 @@ pub struct SessionConfig {
     /// A past reply of ours whose run ended inside its reasoning block (`max_tokens`, a stop string, a cancellation): `reasoning` (the default) gives it to the template as the open reasoning it is, which the template closes or drops; `text` renders it as the text the client got; `recover` renders it as text and places the turn checkpoint before the divergence that makes.
     #[opt(flag = "incomplete-reasoning", parser = "parse_incomplete_reasoning", variants = ["text", "reasoning", "recover"], path = "session.incomplete_reasoning", status = "advanced")]
     pub incomplete_reasoning: String,
-    /// Seconds a session a chat completion's `id` names is kept after its last use (`store: true`; `docs/sessions.md` §4).
-    #[opt(flag = "session-ttl", path = "session.ttl_s", status = "advanced")]
-    pub ttl_s: usize,
     /// Stored sessions kept at once; past it the least recently used goes.
     #[opt(
         flag = "session-capacity",
@@ -1882,7 +1879,6 @@ impl Default for SessionConfig {
             missing_reasoning: "as-sent".into(),
             keep_logprobs: "none".into(),
             incomplete_reasoning: "reasoning".into(),
-            ttl_s: 3600,
             capacity: 64,
             max_mib: 64,
         }
@@ -1947,6 +1943,29 @@ pub struct PipetteConfig {
     pub prompt_seed_file: Option<std::path::PathBuf>,
 }
 
+/// How `lloom serve` reclaims the sessions its chat completions' ids name: a
+/// session lives until the server lets it go (`docs/sessions.md` §4).
+#[derive(Options, Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[options(v0 = false)]
+#[serde(default)]
+pub struct ServerSessionsConfig {
+    /// Seconds a session may go unused before the server reclaims it (`docs/sessions.md` §4); `session.capacity` and `session.max_mib` reclaim the least recently used before that.
+    #[opt(
+        flag = "session-idle",
+        path = "server.sessions.idle_s",
+        status = "advanced",
+        alias = "session-ttl",
+        legacy_keys = ["session.ttl_s"]
+    )]
+    pub idle_s: usize,
+}
+
+impl Default for ServerSessionsConfig {
+    fn default() -> Self {
+        ServerSessionsConfig { idle_s: 3600 }
+    }
+}
+
 /// `lloom serve`'s socket.
 #[derive(Options, Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[options(v0 = false)]
@@ -1960,6 +1979,8 @@ pub struct ServerConfig {
     pub port: u16,
     #[opt(nested)]
     pub pipette: PipetteConfig,
+    #[opt(nested)]
+    pub sessions: ServerSessionsConfig,
 }
 
 impl Default for ServerConfig {
@@ -1968,6 +1989,7 @@ impl Default for ServerConfig {
             host: "127.0.0.1".into(),
             port: 0,
             pipette: PipetteConfig::default(),
+            sessions: ServerSessionsConfig::default(),
         }
     }
 }

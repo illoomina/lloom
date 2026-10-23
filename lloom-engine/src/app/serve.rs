@@ -372,6 +372,7 @@ fn run_owner(
         reuse: parking_lot::Mutex::new(crate::turn::Tally::default()),
         sessions: parking_lot::Mutex::new(super::sessions::Table::new(session_config(
             &options.session,
+            &options.server.sessions,
             batch,
         ))),
     });
@@ -421,8 +422,8 @@ fn run_owner(
                     Instant::now(),
                 );
                 let _ = match found {
-                    Some(body) => respond_json(request, 200, &body),
-                    None => respond_error(request, 404, "no session holds this id"),
+                    Ok(body) => respond_json(request, 200, &body),
+                    Err(lost) => respond_error(request, 404, &not_held(lost)),
                 };
             }
             (Method::Delete, p) if p.starts_with(SESSIONS_ROUTE) => {
@@ -432,10 +433,9 @@ fn run_owner(
                         .sessions
                         .lock()
                         .delete(&p[SESSIONS_ROUTE.len()..], auth, Instant::now());
-                let _ = if gone {
-                    respond_json(request, 200, &json!({ "deleted": true }))
-                } else {
-                    respond_error(request, 404, "no session holds this id")
+                let _ = match gone {
+                    Ok(()) => respond_json(request, 200, &json!({ "deleted": true })),
+                    Err(lost) => respond_error(request, 404, &not_held(lost)),
                 };
             }
             (Method::Post, "/eval/abort") => {
@@ -1060,11 +1060,10 @@ fn chat_completions(shared: &Shared, v: &Value, auth: Option<[u8; 32]>) -> Handl
         },
     };
     if ask.input.is_some() && resolved.is_none() {
-        return Err(Failure::NotFound(
-            "previous_response_id: no session holds this id; send the whole conversation in \
-             `messages` instead"
-                .into(),
-        ));
+        return Err(Failure::NotFound(format!(
+            "previous_response_id: {}; send the whole conversation in `messages` instead",
+            not_held(miss.expect("a miss where nothing resolved"))
+        )));
     }
     // The `input` form's conversation: the session's through the continued
     // turn, its reply as the response returned it, then the new messages.
@@ -1711,10 +1710,24 @@ fn auth_digest(headers: &[Header]) -> Option<[u8; 32]> {
         .map(|h| sha2::Sha256::digest(h.value.as_str().as_bytes()).into())
 }
 
-/// The session table's bounds, from the `session` group.
-fn session_config(c: &crate::options::SessionConfig, batch: usize) -> super::sessions::Config {
+/// "no session holds this id", and why the server let it go where the id's
+/// holder may be told (`docs/sessions.md` §4).
+fn not_held(lost: super::sessions::Lost) -> String {
+    match lost.reason {
+        Some(r) => format!("no session holds this id (let go: {})", r.name()),
+        None => "no session holds this id".into(),
+    }
+}
+
+/// The session table's retention policy: the budget from the `session`
+/// group, the idle reclamation from `server.sessions`.
+fn session_config(
+    c: &crate::options::SessionConfig,
+    s: &crate::options::ServerSessionsConfig,
+    batch: usize,
+) -> super::sessions::Config {
     super::sessions::Config {
-        ttl: std::time::Duration::from_secs(c.ttl_s as u64),
+        idle: std::time::Duration::from_secs(s.idle_s as u64),
         capacity: c.capacity,
         ephemeral: batch.max(1),
         max_bytes: c.max_mib.saturating_mul(1 << 20),
@@ -1726,6 +1739,7 @@ fn session_config(c: &crate::options::SessionConfig, batch: usize) -> super::ses
 #[cfg(test)]
 fn test_sessions() -> parking_lot::Mutex<super::sessions::Table> {
     parking_lot::Mutex::new(super::sessions::Table::new(session_config(
+        &Default::default(),
         &Default::default(),
         1,
     )))
@@ -1744,7 +1758,7 @@ struct SessionCtx {
     reservation: super::sessions::Reservation,
     continued: Option<Continued>,
     /// Why the named id found nothing.
-    miss: Option<super::sessions::Miss>,
+    miss: Option<super::sessions::Lost>,
     /// The request named a `previous_response_id`.
     asked: bool,
     input: bool,
@@ -1838,6 +1852,12 @@ fn finish_session(
     } else {
         "as-sent"
     };
+    // Why the continued session is gone, where its id's holder may be told;
+    // a session's lifetime is the server's policy, never its own field.
+    let reason = ctx
+        .miss
+        .and_then(|l| l.reason)
+        .map(super::sessions::Reason::name);
     let json = json!({
         "id": kept.then(|| id.encode()),
         "state": state,
@@ -1852,14 +1872,19 @@ fn finish_session(
         "tokenized": ctx.encoded,
         "keep": "none",
         "reset": ctx.reset.map(Reset::name),
-        "miss": ctx.miss.map(super::sessions::Miss::name),
+        "reason": reason,
     });
     let line = format!(
         "session={state} session_id={} session_kept={kept} session_history={history} \
-         session_prefix={prefix} reprefilled={reprefilled} recorded={} tokenized={}",
+         session_prefix={prefix} reprefilled={reprefilled} recorded={} tokenized={}{}",
         id.short(),
         ctx.recorded,
         ctx.encoded,
+        ctx.miss.map_or(String::new(), |l| format!(
+            " session_miss={} session_reason={}",
+            l.miss.name(),
+            reason.unwrap_or("-")
+        )),
     );
     (json, line)
 }
@@ -1880,12 +1905,14 @@ fn features_body(shared: &Shared) -> Value {
                 "messages": "the whole conversation; the session's replies are bound by the conversation before them",
                 "input": "the new messages, appended to the referenced turn's conversation; 404 when no session holds the id",
             },
-            "store": { "default": false, "true": "kept until the TTL, the capacity or DELETE", "false": "kept while the engine holds its state" },
+            "store": { "default": false, "true": "held until the server reclaims it (idle, capacity, memory) or a client lets it go (reset, DELETE)", "false": "held while the engine holds its state" },
             "keep": { "none": true, "prefix": KEEP_REFUSED, "all": KEEP_REFUSED },
             "reset": ["cache", "prefix", "all"],
-            "ttl_s": cfg.ttl.as_secs(),
+            "idle_s": cfg.idle.as_secs(),
             "capacity": cfg.capacity,
             "max_bytes": cfg.max_bytes,
+            "reclaim": "lru by last use",
+            "reasons": super::sessions::Reason::ALL.map(super::sessions::Reason::name),
             "binding": "the SHA-256 of the Authorization header, when a request sends one",
             "routes": ["GET /v1l/sessions/{id}", "DELETE /v1l/sessions/{id}"],
             "reported": "timings.session; /health sessions",
@@ -3944,6 +3971,7 @@ pub fn bench(args: BenchArgs) -> Result<()> {
         reuse: parking_lot::Mutex::new(crate::turn::Tally::default()),
         sessions: parking_lot::Mutex::new(super::sessions::Table::new(session_config(
             &options.session,
+            &options.server.sessions,
             1,
         ))),
     };

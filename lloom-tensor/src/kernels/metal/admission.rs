@@ -179,6 +179,12 @@ pub struct PrefillGeometry {
     /// The attention a prefill pass takes, which decides whether the score
     /// matrices exist at all.
     pub attention: PrefillAttention,
+    /// The MLP's SiLU and gate product as one launch (`silu_mul`): the
+    /// product is stored and the SiLU never is, so a pass holds one
+    /// `intermediate`-wide tensor a position a layer fewer than under the
+    /// composed pair. The caller decides it by the selection its forward
+    /// makes; `false`, the pair, is the larger. Read by the fused arm only.
+    pub silu_mul: bool,
 }
 
 /// The attention a prefill pass takes, as far as what it allocates.
@@ -216,6 +222,7 @@ impl Default for PrefillGeometry {
             vocab: 128_000,
             conv_l_cache: 3,
             attention: PrefillAttention::Composed,
+            silu_mul: false,
         }
     }
 }
@@ -366,7 +373,7 @@ fn composed_prefill_bytes(seq_len: usize, batch: usize, geom: PrefillGeometry) -
 /// |---|---|---|
 /// | model | the embedding, the final norm | `2 H` |
 /// | every layer | the two RMSNorms | `2 H` |
-/// | every MLP | `w1`, its SiLU, `w3`, the product; `w2`, the residual add | `4 I + 2 H` |
+/// | every MLP | `w1`, its SiLU, `w3`, the product; `w2`, the residual add | `4 I + 2 H`; `3 I + 2 H` under `silu_mul`, which stores no SiLU |
 /// | attention | `q`, `k`, `v`; `q` and `k` normed and rotated; the kernel's output; its `[B, P, Hq·D]` copy; `o_proj`; the residual add | `4 Hq·D + 3 KV + 2 H` |
 /// | conv | `in_proj`; `b·x`; the left context's concatenation; the depthwise conv; `c·`; its transpose copy; `out_proj`; the residual add | `10 H` |
 ///
@@ -402,7 +409,8 @@ fn fused_prefill_bytes(
 
     let model = 2 * h;
     let norms = 2 * h;
-    let mlp = 4 * i + 2 * h;
+    let mlp_intermediates = if geom.silu_mul { 3 } else { 4 };
+    let mlp = mlp_intermediates * i + 2 * h;
     let attn = 4 * q + 3 * kv + 2 * h + v_copy;
     let conv = 10 * h;
     let per_position = model
@@ -1822,6 +1830,37 @@ mod tests {
         );
         // And decode is the measured arena on every arm.
         assert_eq!(prefill_activation_bytes(1, 4, g), 4 * ACTIVATION_ARENA_BYTES);
+    }
+
+    /// Under `silu_mul` the MLP stores no SiLU: 30 layers × 10752 × 2 B =
+    /// 645 120 B a position fewer, the per-forward constant unmoved, and the
+    /// gathered arm's copy of the cache untouched by it.
+    #[test]
+    fn silu_mul_stores_one_intermediate_fewer_a_layer() {
+        let pair = fused(PrefillAttention::Fused);
+        let one = PrefillGeometry {
+            silu_mul: true,
+            ..pair
+        };
+        assert_eq!(30 * 10752 * 2, 645_120);
+        for p in [2, 512, 2048] {
+            assert_eq!(
+                prefill_activation_bytes(p, 1, one),
+                p * (4_202_496 - 645_120) + 1_398_784,
+                "P={p}: 3 557 376 B a position under silu_mul"
+            );
+        }
+        let gathered = |silu_mul| PrefillGeometry {
+            silu_mul,
+            ..fused(PrefillAttention::FusedGathered)
+        };
+        assert_eq!(
+            prefill_activation_bytes_at(512, 8704, 1, gathered(false))
+                - prefill_activation_bytes_at(512, 8704, 1, gathered(true)),
+            512 * 645_120
+        );
+        // The decode arena is measured, not this arithmetic.
+        assert_eq!(prefill_activation_bytes(1, 1, one), ACTIVATION_ARENA_BYTES);
     }
 
     /// A pass onto a warm page pool reads a copy of the cache: `v` made

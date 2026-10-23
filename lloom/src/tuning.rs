@@ -238,7 +238,7 @@ pub struct Lfm2Tuning {
         invert
     )]
     pub skip_conv_c_fusion: bool,
-    /// The MLP's `silu(w1·x) · w3·x` as one elementwise launch (`silu_mul`, `silu_f16` then `bmul_f16` bit for bit) wherever the composed pair would run; off: the pair, the A/B arm. Stored as its negation.
+    /// The MLP's `silu(w1·x) · w3·x` as one elementwise launch (`silu_mul`, `silu_f16` then `bmul_f16` bit for bit) wherever the MLP's composed path runs the pair (not under `--gemv-gate mul` or the norm in the GEMVs, which keep it); off: the pair, the A/B arm. Stored as its negation.
     #[opt(
         flag = "skip-lfm2-silu-mul",
         env = "LLOOM_LFM2_SKIP_SILU_MUL",

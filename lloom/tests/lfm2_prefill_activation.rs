@@ -11,7 +11,8 @@
 //! positions, so two pass lengths difference the per-forward constants away
 //! (the logits, the conv carry) and leave the per-position bytes, which are
 //! held to the derivation exactly; the absolute figure is held to it as an
-//! upper bound.
+//! upper bound. Both arms of `kernels.fusion.silu_mul` are held, each in its
+//! own process: the switch is read once.
 #![cfg(feature = "metal")]
 
 use lloom::models::lfm2::{AttnImpl, Config, KvAppend, MemoryBudget, QkvLayout, State};
@@ -159,14 +160,29 @@ fn held_pass<Q: Profile>(cfg: &Config, prefix: usize, positions: usize) -> Resul
 }
 
 /// What admission charges a pass of `positions` over `keys` keys at `cfg`'s
-/// arms: the production arithmetic, through the model's own budget.
+/// arms: the production arithmetic, through the model's own budget, at the
+/// f16 the held model is built at.
 fn derived(cfg: &Config, positions: usize, keys: usize) -> i64 {
     let b = State::<CrownExact>::admission_budget(
         cfg,
+        DType::F16,
         &MemoryBudget::new(0).with_prefill(positions),
         keys,
     );
     b.footprint().activations as i64
+}
+
+/// Installs `kernels.fusion.silu_mul` at `on` before anything reads it, and
+/// checks the arm took: the forward and admission each read it once.
+fn install_silu_mul(on: bool) {
+    let mut t = lloom::tuning::Tuning::default();
+    t.from_env().expect("the tuning's environment");
+    t.lfm2.skip_silu_mul = !on;
+    assert!(
+        lloom::tuning::install(t).is_ok(),
+        "the tuning was read before the arm was installed"
+    );
+    assert_eq!(lloom::tuning::tuning().lfm2.skip_silu_mul, !on);
 }
 
 /// A held pass onto a warm cache acquires exactly what admission charges a
@@ -177,22 +193,42 @@ fn derived(cfg: &Config, positions: usize, keys: usize) -> i64 {
 /// among it — and, on the page pool, by its slot table, which it keeps as
 /// state where a continuation's replaces the previous one; both are held
 /// exactly too, so the bound is not loose by more than those terms.
+///
+/// Under `silu_mul` (the default) each MLP stores no SiLU, and admission
+/// charges it one `intermediate`-wide tensor a position a layer fewer;
+/// under the composed pair it charges that tensor. Each arm is held to its
+/// own charge byte for byte.
 #[test]
 fn a_held_prefill_acquires_what_admission_charges() -> Result<()> {
+    install_silu_mul(true);
+    held_against_admission(true)
+}
+
+#[test]
+fn a_held_prefill_acquires_what_admission_charges_with_silu_mul_off() -> Result<()> {
+    install_silu_mul(false);
+    held_against_admission(false)
+}
+
+fn held_against_admission(silu_mul: bool) -> Result<()> {
     let _serial = SERIAL.lock();
     for arm in ["crown", "paged"] {
         let cfg = config(arm);
-        let route = State::<CrownExact>::admission_budget(&cfg, &MemoryBudget::new(0), 1)
-            .prefill_geometry
-            .attention;
+        let geometry =
+            State::<CrownExact>::admission_budget(&cfg, DType::F16, &MemoryBudget::new(0), 1)
+                .prefill_geometry;
         assert_eq!(
-            route,
+            geometry.attention,
             if arm == "crown" {
                 PrefillAttention::Fused
             } else {
                 PrefillAttention::FusedGathered
             },
             "{arm}: the arm admission reads"
+        );
+        assert_eq!(
+            geometry.silu_mul, silu_mul,
+            "{arm}: the MLP admission charges"
         );
         let conv_layers = cfg
             .layer_types
@@ -215,14 +251,15 @@ fn a_held_prefill_acquires_what_admission_charges() -> Result<()> {
                 0
             };
             eprintln!(
-                "CHARGED arm={arm} prefix={prefix} positions={positions} measured={measured} \
-                 charged={charged} first_pass={first_pass} over={}",
+                "CHARGED arm={arm} silu_mul={silu_mul} prefix={prefix} positions={positions} \
+                 measured={measured} charged={charged} first_pass={first_pass} over={}",
                 charged - measured
             );
             assert_eq!(
                 measured + first_pass,
                 charged,
-                "{arm} prefix {prefix} positions {positions}: the pool against admission"
+                "{arm} silu_mul={silu_mul} prefix {prefix} positions {positions}: the pool \
+                 against admission"
             );
         }
     }

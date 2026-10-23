@@ -1297,16 +1297,17 @@ pub(crate) fn silu_mul(g: &Tensor, u: &Tensor) -> Option<Result<Tensor>> {
 /// this family's `fused_off` arm: Metal, f32 or f16, `g` and `u` contiguous
 /// and of one dtype and shape; `None` where the composed pair applies.
 pub(crate) fn silu_mul_op(g: &Tensor, u: &Tensor) -> Option<Result<Tensor>> {
-    let float = |t: &Tensor| {
-        t.device().is_metal()
-            && matches!(
-                t.dtype(),
-                lloom_tensor::DType::F32 | lloom_tensor::DType::F16
-            )
-            && t.is_contiguous()
-    };
+    let float =
+        |t: &Tensor| t.device().is_metal() && silu_mul_instantiated(t.dtype()) && t.is_contiguous();
     (float(g) && float(u) && g.dtype() == u.dtype() && g.shape() == u.shape())
         .then(|| g.apply_op2_no_bwd(u, &SiluMul))
+}
+
+/// The dtypes `silu_mul`'s kernel is instantiated at, f32 and f16: what
+/// [`silu_mul_op`] takes, and what a family's admission reads to charge the
+/// composed pair at every other.
+pub(crate) fn silu_mul_instantiated(dtype: lloom_tensor::DType) -> bool {
+    matches!(dtype, lloom_tensor::DType::F32 | lloom_tensor::DType::F16)
 }
 
 /// The routed combine plus the gated shared expert as one launch, into f32:

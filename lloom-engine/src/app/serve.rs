@@ -64,6 +64,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
+mod keep_warm;
 mod reasoning;
 mod turns;
 
@@ -148,12 +149,10 @@ struct Shared {
     reuse: parking_lot::Mutex<crate::turn::Tally>,
     /// The sessions chat completions' ids name (`docs/sessions.md`).
     sessions: parking_lot::Mutex<super::sessions::Table>,
-    /// When this server last gave the GPU work or kept it ready
-    /// (`uptime_ns`): a model request's end or a keep-warm action; the load
-    /// before the first.
-    last_active: AtomicU64,
-    /// Keep-warm actions taken (`server.keep_warm`).
-    warm_actions: AtomicU64,
+    /// The requests' ends and the keep-warm's actions (`server.keep_warm`).
+    activity: Arc<keep_warm::Activity>,
+    /// The keep-warm this server runs.
+    keep_warm: keep_warm::Policy,
 }
 
 /// The largest `/v1/systemone` body a decision-only owner reads: eight
@@ -237,8 +236,8 @@ fn run_configured(args: ServeArgs, transport: Option<tiny_http::TransportPolicy>
 /// account, and completes the genuine load before entering this frontend.
 ///
 /// Only `options.server.host`, `options.server.port`, `options.server.keep_warm`
-/// (and `keep_warm_by`), `options.sampling` and `options.session` (the request
-/// front end's) are honored; the remaining
+/// (and `keep_warm_for_s`, `keep_warm_by`), `options.sampling` and
+/// `options.session` (the request front end's) are honored; the remaining
 /// options do not reconfigure this owner. Shape, decode,
 /// cache, seed, prefix reuse, batch and memory policy are the already-loaded
 /// owner's contract, not inferred from these options. `model_path` is a caller-
@@ -291,9 +290,18 @@ fn run_owner(
         .map_err(|e| anyhow::anyhow!("the checkpoint's generation_config.json: {e}"))?;
     let description = engine.describe_checked()?;
     let logprobs = logprobs_line(engine.as_ref());
+    let keep_warm = keep_warm::Policy::resolve(
+        options.server.keep_warm,
+        options.server.keep_warm_for_s,
+        &options.server.keep_warm_by,
+        engine.batch(),
+        engine.device().is_metal(),
+    )
+    .map_err(|e| anyhow::anyhow!(e))?;
+    let warm = keep_warm.short();
     if let Some((load_start, reuse_prefix)) = load_facts {
         eprintln!(
-            "[loaded {} from {} in {:.2}s on {:?}; kv_capacity={} readback={} reuse_prefix={} logprobs={logprobs} {}]",
+            "[loaded {} from {} in {:.2}s on {:?}; kv_capacity={} readback={} reuse_prefix={} keep_warm={warm} logprobs={logprobs} {}]",
             model_name,
             model_path.display(),
             load_start.elapsed().as_secs_f64(),
@@ -305,7 +313,7 @@ fn run_owner(
         );
     } else {
         eprintln!(
-            "[serving existing {} from {} on {:?}; kv_capacity={} readback={} reuse_prefix={} logprobs={logprobs} {}]",
+            "[serving existing {} from {} on {:?}; kv_capacity={} readback={} reuse_prefix={} keep_warm={warm} logprobs={logprobs} {}]",
             model_name,
             model_path.display(),
             engine.device(),
@@ -381,17 +389,10 @@ fn run_owner(
             &options.session,
             batch,
         ))),
-        last_active: AtomicU64::new(uptime_ns()),
-        warm_actions: AtomicU64::new(0),
+        activity: Arc::new(keep_warm::Activity::new(uptime_ns())),
+        keep_warm,
     });
-    let keep_warm = match options.server.keep_warm {
-        Some(ms) => Some(KeepWarm::start(
-            &shared,
-            ms,
-            options.server.keep_warm_by == "dispatch",
-        )?),
-        None => None,
-    };
+    let heartbeat = start_keep_warm(&shared)?;
 
     // The ready marker the sidecar runner waits for, on stdout and nothing
     // else on stdout before it. Everything the operator reads goes to stderr.
@@ -415,7 +416,8 @@ fn run_owner(
                     b["reuse"] = shared.reuse.lock().json(shared.engine.reuse_prefix());
                     b["sampling"] = sampling_json(&shared.sampling);
                     b["sessions"] = shared.sessions.lock().json();
-                    b["keep_warm_actions"] = json!(shared.warm_actions.load(Ordering::Relaxed));
+                    b["keep_warm"] = shared.keep_warm.json(&shared.activity, uptime_ns());
+                    b["keep_warm_actions"] = json!(shared.activity.actions.load(Ordering::Relaxed));
                     b
                 });
                 let _ = respond_metadata(request, result);
@@ -467,7 +469,7 @@ fn run_owner(
             (Method::Post, _) => {
                 let shared = Arc::clone(&shared);
                 let recv = uptime_ns();
-                let idle = recv.saturating_sub(shared.last_active.load(Ordering::Acquire));
+                let idle = recv.saturating_sub(shared.activity.last_active.load(Ordering::Acquire));
                 std::thread::spawn(move || {
                     let path = path;
                     let started = Instant::now();
@@ -477,12 +479,13 @@ fn run_owner(
                         idle,
                         ..FirstToken::default()
                     };
-                    match handle_model_request(&shared, &path, request, first) {
-                        Ok(()) => {}
-                        Err(e) => eprintln!(
+                    let answered = handle_model_request(&shared, &path, request, first);
+                    shared.activity.request_ended(uptime_ns());
+                    if let Err(e) = answered {
+                        eprintln!(
                             "[{path} failed after {:.1} ms: {e:#}]",
                             ms(started.elapsed())
-                        ),
+                        );
                     }
                 });
             }
@@ -495,90 +498,41 @@ fn run_owner(
     // are cut. A request thread still decoding holds the sequence, and the
     // batch thread holds the pool; wait for both so the model is not dropped
     // under a running command buffer.
-    if let Some(k) = keep_warm {
-        k.stop();
+    if let Some(h) = heartbeat {
+        h.stop();
     }
     shutdown_http(&shared.server);
     shared.engine.shutdown();
     Ok(())
 }
 
-/// `server.keep_warm`: while no request holds the single-sequence slot and
-/// the GPU has had nothing from this server for a period, ask the OS to keep
-/// the device's memory wired (`residency`) or run one one-element dispatch
-/// (`dispatch`). macOS unwires a residency set nothing used for a few
-/// seconds, and the request after it waits while it is wired back
-/// (`docs/machine-model.md` §3.4d). Off by default: it holds the
-/// memory wired while the server idles.
-struct KeepWarm {
-    stop: Arc<AtomicBool>,
-    thread: std::thread::JoinHandle<()>,
-}
-
-impl KeepWarm {
-    fn start(shared: &Arc<Shared>, period_ms: u64, dispatch: bool) -> Result<Self> {
-        if period_ms == 0 {
-            anyhow::bail!("server.keep_warm: a period of 0 ms would never let the GPU idle");
-        }
-        if shared.engine.batch() > 1 {
-            anyhow::bail!(
-                "server.keep_warm at --batch {} is not built: the batch thread owns the device; \
-                 serve at --batch 1 or leave it unset",
-                shared.engine.batch()
-            );
-        }
-        if !shared.engine.device().is_metal() {
-            anyhow::bail!(
-                "server.keep_warm: the device is not a GPU; there is nothing to keep warm"
-            );
-        }
-        let period = std::time::Duration::from_millis(period_ms);
-        let stop = Arc::new(AtomicBool::new(false));
-        let (shared, flag) = (Arc::clone(shared), Arc::clone(&stop));
-        let thread = std::thread::Builder::new()
-            .name("keep-warm".into())
-            .spawn(move || {
-                let period_ns = period.as_nanos() as u64;
-                while !flag.load(Ordering::Acquire) {
-                    std::thread::park_timeout(period);
-                    if flag.load(Ordering::Acquire) {
-                        break;
-                    }
-                    let idle =
-                        uptime_ns().saturating_sub(shared.last_active.load(Ordering::Acquire));
-                    if idle < period_ns {
-                        continue;
-                    }
-                    let Some(_turn) = shared.turns.try_take() else {
-                        continue;
-                    };
-                    if !dispatch {
-                        shared.engine.device().request_residency();
-                    } else if let Err(e) = warm_dispatch(shared.engine.device()) {
-                        eprintln!("[keep-warm: stopped: {e}]");
-                        return;
-                    }
-                    shared.last_active.store(uptime_ns(), Ordering::Release);
-                    shared.warm_actions.fetch_add(1, Ordering::Relaxed);
-                }
-            })
-            .context("spawning the keep-warm thread")?;
-        eprintln!(
-            "[keep-warm: {} every {period_ms} ms while idle]",
-            if dispatch {
-                "one GPU dispatch"
-            } else {
-                "the residency set's memory requested resident"
+/// Starts `shared.keep_warm`'s heartbeat, if it is on. Each action takes the
+/// single-sequence slot only when it is free and nobody waits for it, so it
+/// never runs beside a request nor goes ahead of a queued one.
+fn start_keep_warm(shared: &Arc<Shared>) -> Result<Option<keep_warm::Heartbeat>> {
+    eprintln!("[keep-warm: {}]", shared.keep_warm.sentence());
+    let keep_warm::Policy::On { period, window, by } = shared.keep_warm.clone() else {
+        return Ok(None);
+    };
+    let s = Arc::clone(shared);
+    let act = move || {
+        let Some(_turn) = s.turns.try_take() else {
+            return keep_warm::Act::Busy;
+        };
+        match by {
+            keep_warm::By::Residency => {
+                s.engine.device().request_residency();
+                keep_warm::Act::Done
             }
-        );
-        Ok(Self { stop, thread })
-    }
-
-    fn stop(self) {
-        self.stop.store(true, Ordering::Release);
-        self.thread.thread().unpark();
-        let _ = self.thread.join();
-    }
+            keep_warm::By::Dispatch => match warm_dispatch(s.engine.device()) {
+                Ok(()) => keep_warm::Act::Done,
+                Err(e) => keep_warm::Act::Failed(e.to_string()),
+            },
+        }
+    };
+    keep_warm::Heartbeat::spawn(Arc::clone(&shared.activity), period, window, uptime_ns, act)
+        .map(Some)
+        .context("spawning the keep-warm thread")
 }
 
 /// The keep-warm's work: one dispatch over one element, committed and
@@ -788,7 +742,7 @@ fn handle_model_request(
         _ => Err(Failure::NotFound(format!("unknown endpoint: {path}"))),
     };
     first.built = uptime_ns();
-    let answered = match result {
+    match result {
         Ok(Reply::Json(v)) => respond_json(request, 200, &v),
         Ok(Reply::Stream(mut stream)) => {
             stream.first = first;
@@ -798,9 +752,7 @@ fn handle_model_request(
         Err(Failure::BadRequest(m)) => respond_error(request, 400, &m),
         Err(Failure::NotFound(m)) => respond_error(request, 404, &m),
         Err(Failure::Internal(e)) => respond_error(request, 500, &format!("{e:#}")),
-    };
-    shared.last_active.store(uptime_ns(), Ordering::Release);
-    answered
+    }
 }
 
 /// The actual ordered route: return None without parsing other endpoints.
@@ -907,7 +859,7 @@ struct FirstToken {
     /// The writer thread finished writing the first text chunk.
     written: u64,
     /// How long the GPU had had nothing from this server when the request
-    /// arrived (`Shared::last_active`), nanoseconds.
+    /// arrived (`keep_warm::Activity::last_active`), nanoseconds.
     idle: u64,
 }
 
@@ -4296,8 +4248,10 @@ pub fn bench(args: BenchArgs) -> Result<()> {
             &options.session,
             1,
         ))),
-        last_active: AtomicU64::new(0),
-        warm_actions: AtomicU64::new(0),
+        activity: Arc::new(keep_warm::Activity::new(uptime_ns())),
+        keep_warm: keep_warm::Policy::Off {
+            why: "the benchmark cells".into(),
+        },
     };
     let batch = options.scheduler.max_sequences.max(1);
     for run in 0..options.bench.runs.max(1) {
@@ -5395,8 +5349,8 @@ mod checked_trailer_tests {
             front,
             reuse: parking_lot::Mutex::new(Default::default()),
             sessions: test_sessions(),
-            last_active: AtomicU64::new(0),
-            warm_actions: AtomicU64::new(0),
+            activity: Arc::new(keep_warm::Activity::new(0)),
+            keep_warm: keep_warm::Policy::Off { why: "test".into() },
         };
         let run = StreamingRun {
             kind: StreamKind::Chat,

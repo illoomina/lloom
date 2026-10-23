@@ -1958,9 +1958,16 @@ pub struct ServerConfig {
     /// The port; 0 picks a free one (the bound port is in the ready marker).
     #[opt(flag = "port", path = "server.port", status = "stable", cli = "port")]
     pub port: u16,
-    /// While no request runs, keep the GPU ready every this many milliseconds (`server.keep_warm_by`), so the first request after an idle spell does not wait for it (`--batch 1`, Metal); unset = off.
+    /// While no request runs, keep the GPU ready every this many milliseconds (`server.keep_warm_by`), so the first request after an idle spell does not wait for it (`--batch 1`, Metal), until `server.keep_warm_for_s` after the last request; 0 = off, unset = the front-end's own.
     #[opt(flag = "keep-warm", path = "server.keep_warm", status = "advanced")]
     pub keep_warm: Option<u64>,
+    /// Seconds after the last request the keep-warm keeps going; then it stops, so an idle server gives the memory back, and the next request starts it again; 0 = no bound.
+    #[opt(
+        flag = "keep-warm-for",
+        path = "server.keep_warm_for_s",
+        status = "advanced"
+    )]
+    pub keep_warm_for_s: u64,
     /// What `server.keep_warm` does each period: `residency` (ask the OS to keep the GPU's memory wired: it unwires it after a few idle seconds and the next request waits while it is wired back) or `dispatch` (one one-element GPU dispatch, committed and waited).
     #[opt(flag = "keep-warm-by", parser = "parse_keep_warm_by", variants = ["residency", "dispatch"], path = "server.keep_warm_by", status = "advanced")]
     pub keep_warm_by: String,
@@ -1974,6 +1981,7 @@ impl Default for ServerConfig {
             host: "127.0.0.1".into(),
             port: 0,
             keep_warm: None,
+            keep_warm_for_s: 180,
             keep_warm_by: "residency".into(),
             pipette: PipetteConfig::default(),
         }

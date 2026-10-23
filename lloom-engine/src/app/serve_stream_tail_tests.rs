@@ -351,8 +351,8 @@ fn run(
         sampling: Default::default(),
         reuse: ParkingMutex::new(Default::default()),
         sessions: super::test_sessions(),
-        last_active: AtomicU64::new(0),
-        warm_actions: AtomicU64::new(0),
+        activity: Arc::new(keep_warm::Activity::new(0)),
+        keep_warm: keep_warm::Policy::Off { why: "test".into() },
     };
     let run = StreamingRun {
         kind: StreamKind::Chat,

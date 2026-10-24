@@ -2008,6 +2008,13 @@ pub struct ServerConfig {
         status = "arm"
     )]
     pub keep_warm_pressure: bool,
+    /// Read the memory-pressure level from this file (one number: 1 normal, 2 warn, 4 critical) instead of the kernel's sysctl: a measurement's stand-in for `memory_pressure -S`, which needs root. Takes effect with `server.keep_warm_pressure`.
+    #[opt(
+        flag = "keep-warm-pressure-file",
+        path = "server.keep_warm_pressure_file",
+        status = "instrument"
+    )]
+    pub keep_warm_pressure_file: Option<String>,
     #[opt(nested)]
     pub pipette: PipetteConfig,
     #[opt(nested)]
@@ -2023,6 +2030,7 @@ impl Default for ServerConfig {
             keep_warm_for_s: 180,
             keep_warm_by: "residency".into(),
             keep_warm_pressure: false,
+            keep_warm_pressure_file: None,
             pipette: PipetteConfig::default(),
             sessions: ServerSessionsConfig::default(),
         }

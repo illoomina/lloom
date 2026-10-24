@@ -2629,6 +2629,37 @@ fn residency_attach_heartbeat_detaches_the_set_on_metal3_and_binding_still_works
     }
 }
 
+/// The arm `kernels.residency.attach` names (`LLOOM_RESIDENCY_ATTACH`)
+/// reaches `Commands::new`, the constructor every suite's fixture takes: a
+/// run of the suite under the env arm is a run under that attachment. Prints
+/// what it found, so a suite's log shows which arm it ran.
+#[test]
+fn the_tuned_attach_arm_reaches_commands_new() {
+    use crate::kernels::metal::ResidencyAttach;
+    let device = device();
+    let set = Arc::new(ResidencySet::new(&device));
+    if unsafe { set.raw() }.is_none() {
+        return;
+    }
+    let commands = Commands::new(device.new_command_queue().unwrap(), Arc::clone(&set)).unwrap();
+    let arm = ResidencyAttach::selected();
+    let metal4 = commands.actual_command_api() == "metal4";
+    let detached = arm == ResidencyAttach::Heartbeat && !metal4;
+    eprintln!(
+        "RESIDENCY_ATTACH arm={} api={} attachment={} queue_attachments={}",
+        arm.name(),
+        commands.actual_command_api(),
+        commands.residency_attachment().short(),
+        set.queue_attachments()
+    );
+    assert_eq!(
+        arm.name(),
+        crate::tuning::tuning().metal.residency_attach,
+        "the arm is the tuning's"
+    );
+    assert_eq!(set.queue_attachments(), u64::from(!detached));
+}
+
 #[test]
 fn residency_set_batch_insert_remove() {
     use objc2_metal::MTLResidencySet;

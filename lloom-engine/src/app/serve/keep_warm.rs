@@ -80,6 +80,19 @@ pub(super) fn vm_pressure() -> u8 {
         .unwrap_or(0)
 }
 
+/// The file [`file_pressure`] reads (`server.keep_warm_pressure_file`), set
+/// once before the heartbeat starts.
+pub(super) static PRESSURE_FILE: OnceLock<std::path::PathBuf> = OnceLock::new();
+
+/// The level in [`PRESSURE_FILE`]: its first number, 0 when unreadable.
+pub(super) fn file_pressure() -> u8 {
+    PRESSURE_FILE
+        .get()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|t| t.trim().parse().ok())
+        .unwrap_or(0)
+}
+
 /// The level a heartbeat that ignores pressure reads: always normal.
 pub(super) fn pressure_ignored() -> u8 {
     1

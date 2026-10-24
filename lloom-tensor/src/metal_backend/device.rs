@@ -949,7 +949,7 @@ impl MetalDevice {
         let attachment = self.commands.residency_attachment();
         // SAFETY: reads the set's size only; nothing is borrowed past the call.
         let bytes = unsafe { self.residency_set.raw() }
-            .map(|raw| objc2_metal::MTLResidencySet::allocatedSize(raw))
+            .map(objc2_metal::MTLResidencySet::allocatedSize)
             .unwrap_or(0);
         format!(
             "residency={} 1 set {:.2} GiB ({} allocations)",

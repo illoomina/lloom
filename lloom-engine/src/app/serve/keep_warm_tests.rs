@@ -380,6 +380,21 @@ fn under_pressure_a_busy_slot_defers_the_end_until_it_is_free() {
     beat.stop();
 }
 
+/// The file-fed level reads the file's number and 0 when it is absent.
+#[test]
+fn the_pressure_file_is_read_each_beat() {
+    let dir = std::env::temp_dir().join(format!("lloom-kw-pressure-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("level");
+    PRESSURE_FILE.set(file.clone()).unwrap();
+    assert_eq!(file_pressure(), 0, "no file reads as unknown");
+    std::fs::write(&file, "2\n").unwrap();
+    assert_eq!(file_pressure(), 2);
+    std::fs::write(&file, "1").unwrap();
+    assert_eq!(file_pressure(), 1);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
 /// The level names, and an unreadable level does not stop the heartbeat.
 #[test]
 fn the_pressure_levels_are_the_kernels_and_unknown_does_not_stop() {

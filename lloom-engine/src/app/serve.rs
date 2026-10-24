@@ -153,6 +153,9 @@ struct Shared {
     activity: Arc<keep_warm::Activity>,
     /// The keep-warm this server runs.
     keep_warm: keep_warm::Policy,
+    /// Where the keep-warm reads the pressure level, when not the kernel
+    /// (`server.keep_warm_pressure_file`).
+    keep_warm_pressure_file: Option<String>,
 }
 
 /// The largest `/v1/systemone` body a decision-only owner reads: eight
@@ -397,6 +400,7 @@ fn run_owner(
         ))),
         activity: Arc::new(keep_warm::Activity::new(uptime_ns())),
         keep_warm,
+        keep_warm_pressure_file: options.server.keep_warm_pressure_file.clone(),
     });
     let heartbeat = start_keep_warm(&shared)?;
 
@@ -553,10 +557,14 @@ fn start_keep_warm(shared: &Arc<Shared>) -> Result<Option<keep_warm::Heartbeat>>
     };
     let work = keep_warm::Beat {
         clock: uptime_ns,
-        pressure: if pressure {
-            keep_warm::vm_pressure
-        } else {
-            keep_warm::pressure_ignored
+        pressure: match (pressure, &shared.keep_warm_pressure_file) {
+            (true, Some(file)) => {
+                let _ = keep_warm::PRESSURE_FILE.set(file.into());
+                eprintln!("[keep-warm: the memory-pressure level is read from {file}]");
+                keep_warm::file_pressure
+            }
+            (true, None) => keep_warm::vm_pressure,
+            (false, _) => keep_warm::pressure_ignored,
         },
         act,
         end,
@@ -4381,6 +4389,7 @@ pub fn bench(args: BenchArgs) -> Result<()> {
         keep_warm: keep_warm::Policy::Off {
             why: "the benchmark cells".into(),
         },
+        keep_warm_pressure_file: None,
     };
     let batch = options.scheduler.max_sequences.max(1);
     for run in 0..options.bench.runs.max(1) {
@@ -5480,6 +5489,7 @@ mod checked_trailer_tests {
             sessions: test_sessions(),
             activity: Arc::new(keep_warm::Activity::new(0)),
             keep_warm: keep_warm::Policy::Off { why: "test".into() },
+            keep_warm_pressure_file: None,
         };
         let run = StreamingRun {
             kind: StreamKind::Chat,

@@ -123,6 +123,85 @@ pub struct StepReport {
     pub held: usize,
 }
 
+/// One [`BatchDecoder::step`]'s host time by stage, in nanoseconds: read in
+/// a debug or `profile` build, zero in release, where the clock reads are
+/// compiled out (the single-sequence loop's `StepPhases` gate). The stages
+/// partition the step, so their sum is its host time
+/// (`batched-decode-design.md` §13).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BatchStepPhases {
+    /// Admission: a whole prompt fed at its arrival, the step's pieces
+    /// chosen, the held rows set aside, the resumed rows joined.
+    pub admit_ns: u64,
+    /// The batch argmax over `[B, vocab]`, encode only.
+    pub argmax_ns: u64,
+    /// Staging the ids' readback, encode only.
+    pub stage_ns: u64,
+    /// The forward's host setup: its input and every row's `prepare_pass`.
+    pub prepare_ns: u64,
+    /// The pacer's wait before the forward: zero unless the host was its
+    /// in-flight bound ahead of the GPU.
+    pub pace_ns: u64,
+    /// The forward pass, encode only (`begin_pass` to `end_pass`).
+    pub encode_ns: u64,
+    /// The pacer after the forward and the rows' positions.
+    pub after_ns: u64,
+    /// The readback: the host blocked until the step's ids (or, on the host
+    /// sampling arm, its logits, sampled there) are on the host.
+    pub wait_ns: u64,
+    /// Streaming the ids to their rows, the EOS test and the cap.
+    pub stream_ns: u64,
+    /// The rest: the kept rows' logits, the pieces' bookkeeping, the
+    /// executor's step end, the next live set, the retirements.
+    pub tail_ns: u64,
+}
+
+impl BatchStepPhases {
+    /// The step's host time: every stage summed.
+    pub fn total_ns(&self) -> u64 {
+        self.admit_ns
+            + self.argmax_ns
+            + self.stage_ns
+            + self.prepare_ns
+            + self.pace_ns
+            + self.encode_ns
+            + self.after_ns
+            + self.wait_ns
+            + self.stream_ns
+            + self.tail_ns
+    }
+}
+
+/// Laps the host clock between a step's stages in a debug or `profile`
+/// build; nothing in release.
+struct StageClock {
+    #[cfg(any(debug_assertions, feature = "profile"))]
+    last: std::time::Instant,
+}
+
+impl StageClock {
+    #[inline]
+    fn start() -> Self {
+        Self {
+            #[cfg(any(debug_assertions, feature = "profile"))]
+            last: std::time::Instant::now(),
+        }
+    }
+
+    /// Charge the time since the previous lap to `into`.
+    #[inline]
+    fn lap(&mut self, into: &mut u64) {
+        #[cfg(any(debug_assertions, feature = "profile"))]
+        {
+            let now = std::time::Instant::now();
+            *into = into.saturating_add(now.duration_since(self.last).as_nanos() as u64);
+            self.last = now;
+        }
+        #[cfg(not(any(debug_assertions, feature = "profile")))]
+        let _ = into;
+    }
+}
+
 /// What the live rows do in a step that feeds prompt pieces
 /// (`batched-decode-design.md` §11.8).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
@@ -202,6 +281,10 @@ pub trait RowDriver<'m, M: BatchedCausalLM + 'm, R: BorrowMut<Session<'m, M>>> {
     fn row_source(&self, id: RowId) -> Option<(&[u32], &M::Cache, bool)>;
     fn row_prospective_log(&self, id: RowId) -> Option<Vec<u32>>;
     fn holds(&self, id: RowId) -> bool;
+    /// The last step's host time by stage; zero where the driver keeps none.
+    fn step_phases(&self) -> BatchStepPhases {
+        BatchStepPhases::default()
+    }
 }
 
 impl<'m, M: BatchedCausalLM + 'm, R: BorrowMut<Session<'m, M>>> RowDriver<'m, M, R>
@@ -257,6 +340,9 @@ impl<'m, M: BatchedCausalLM + 'm, R: BorrowMut<Session<'m, M>>> RowDriver<'m, M,
     fn holds(&self, id: RowId) -> bool {
         BatchDecoder::holds(self, id)
     }
+    fn step_phases(&self) -> BatchStepPhases {
+        self.phases
+    }
 }
 
 /// The batched decode loop, one step at a time.
@@ -294,6 +380,8 @@ pub struct BatchDecoder<'m, M: BatchedCausalLM, R: BorrowMut<Session<'m, M>>> {
     prefill_batch: usize,
     /// What the live rows do in a step that feeds pieces.
     prefill_decode: PrefillDecode,
+    /// The last step's host time by stage (debug and `profile` builds).
+    phases: BatchStepPhases,
 }
 
 impl<'m, M: BatchedCausalLM, R: BorrowMut<Session<'m, M>>> BatchDecoder<'m, M, R> {
@@ -330,7 +418,13 @@ impl<'m, M: BatchedCausalLM, R: BorrowMut<Session<'m, M>>> BatchDecoder<'m, M, R
             pacer: StepPacer::new(depth),
             prefill_batch: 1,
             prefill_decode: PrefillDecode::Ride,
+            phases: BatchStepPhases::default(),
         })
+    }
+
+    /// The last step's host time by stage; zero in release.
+    pub fn last_step_phases(&self) -> BatchStepPhases {
+        self.phases
     }
 
     /// Feed up to `n` pending rows' chunks in one step under a chunk budget:
@@ -812,6 +906,8 @@ impl<'m, M: BatchedCausalLM, R: BorrowMut<Session<'m, M>>> BatchDecoder<'m, M, R
         let _pool = lloom_tensor::AutoreleaseScope::new(); // per batched step, see the decode loop
         let device = self.device.clone();
         let step_start = std::time::Instant::now();
+        let mut clock = StageClock::start();
+        let mut ph = BatchStepPhases::default();
         let mut joined = if self.opts.prefill_chunk == 0 {
             self.admit_whole()?
         } else {
@@ -845,12 +941,14 @@ impl<'m, M: BatchedCausalLM, R: BorrowMut<Session<'m, M>>> BatchDecoder<'m, M, R
         }
         let device_arm = self.device_arm();
         let lookahead = if device_arm { self.opts.lookahead } else { 0 };
+        clock.lap(&mut ph.admit_ns);
 
         // One argmax over `[B, vocab]`: the ids stay on the device.
         let ids = match &self.logits {
             Some(l) if b > 0 && device_arm => Some(self.device_sampler.sample_argmax_on_device(l)?),
             _ => None,
         };
+        clock.lap(&mut ph.argmax_ns);
 
         // `piece_logits` is `[pieces, vocab]` once the pieces have been
         // fed — by the step's forward (the lookahead arm feeds them with
@@ -862,7 +960,12 @@ impl<'m, M: BatchedCausalLM, R: BorrowMut<Session<'m, M>>> BatchDecoder<'m, M, R
                 if !pieces.is_empty() {
                     let toks = self.piece_tokens(&pieces);
                     let input = Tensor::new(toks.as_slice(), &device)?.unsqueeze(0)?;
-                    piece_logits = Some(self.forward_ragged_live(&[], &pieces, &input)?);
+                    piece_logits = Some(self.forward_ragged_live(
+                        &[],
+                        &pieces,
+                        &input,
+                        (&mut clock, &mut ph),
+                    )?);
                 }
                 (Vec::new(), None)
             }
@@ -870,12 +973,16 @@ impl<'m, M: BatchedCausalLM, R: BorrowMut<Session<'m, M>>> BatchDecoder<'m, M, R
                 // The host arm: every live row sampled by its own sampler,
                 // the next forward fed the host ids (`lookahead = 0`).
                 let logits = self.logits.clone().expect("live rows have logits");
-                (self.sample_host(&logits)?, None)
+                let host = self.sample_host(&logits)?;
+                clock.lap(&mut ph.wait_ns);
+                (host, None)
             }
             (Some(ids), 0) => {
                 // Learn first, then feed: the readback waits on the queue's
                 // tail, which is exactly this step's argmax.
-                (ids.to_vec1::<u32>()?, None)
+                let host = ids.to_vec1::<u32>()?;
+                clock.lap(&mut ph.wait_ns);
+                (host, None)
             }
             (Some(ids), _) => {
                 // Stage the readback BEFORE the next forward is encoded, so
@@ -883,22 +990,26 @@ impl<'m, M: BatchedCausalLM, R: BorrowMut<Session<'m, M>>> BatchDecoder<'m, M, R
                 // forward queued behind it; then feed the device ids — and
                 // the pieces with them, as extra rows of the same forward.
                 let staged = ids.stage_read()?;
+                clock.lap(&mut ph.stage_ns);
                 let live = self.live.clone();
                 let next = if pieces.is_empty() {
                     let input = ids.reshape((b, 1))?;
-                    self.forward_live(&live, &input)?
+                    self.forward_live(&live, &input, (&mut clock, &mut ph))?
                 } else {
                     let toks = self.piece_tokens(&pieces);
                     let input = Tensor::cat(&[ids, &Tensor::new(toks.as_slice(), &device)?], 0)?
                         .unsqueeze(0)?;
-                    let all = self.forward_ragged_live(&live, &pieces, &input)?;
+                    let all =
+                        self.forward_ragged_live(&live, &pieces, &input, (&mut clock, &mut ph))?;
                     piece_logits = Some(all.narrow(0, b, pieces.len())?);
                     all.narrow(0, 0, b)?
                 };
                 for &i in &self.live {
                     self.slots[i].as_mut().expect("live").lane.stats.commits += 1;
                 }
-                (staged.to_vec1::<u32>()?, Some(next))
+                let host = staged.to_vec1::<u32>()?;
+                clock.lap(&mut ph.wait_ns);
+                (host, Some(next))
             }
         };
         if host_ids.len() != b {
@@ -944,6 +1055,7 @@ impl<'m, M: BatchedCausalLM, R: BorrowMut<Session<'m, M>>> BatchDecoder<'m, M, R
                 }
             }
         }
+        clock.lap(&mut ph.stream_ns);
         let step_ns = step_start.elapsed().as_nanos() as u64;
         for &i in &self.live {
             self.slots[i]
@@ -990,11 +1102,12 @@ impl<'m, M: BatchedCausalLM, R: BorrowMut<Session<'m, M>>> BatchDecoder<'m, M, R
                 if pieces.is_empty() {
                     let input =
                         Tensor::new(next_ids.as_slice(), &device)?.reshape((kept.len(), 1))?;
-                    Some(self.forward_live(&kept, &input)?)
+                    Some(self.forward_live(&kept, &input, (&mut clock, &mut ph))?)
                 } else if b > 0 {
                     next_ids.extend(self.piece_tokens(&pieces));
                     let input = Tensor::new(next_ids.as_slice(), &device)?.unsqueeze(0)?;
-                    let all = self.forward_ragged_live(&kept, &pieces, &input)?;
+                    let all =
+                        self.forward_ragged_live(&kept, &pieces, &input, (&mut clock, &mut ph))?;
                     piece_logits = Some(all.narrow(0, kept.len(), pieces.len())?);
                     if kept.is_empty() {
                         None
@@ -1073,6 +1186,8 @@ impl<'m, M: BatchedCausalLM, R: BorrowMut<Session<'m, M>>> BatchDecoder<'m, M, R
                 retired += 1;
             }
         }
+        clock.lap(&mut ph.tail_ns);
+        self.phases = ph;
         Ok(StepReport {
             live: b,
             pieces: pieces.len(),
@@ -1160,6 +1275,7 @@ impl<'m, M: BatchedCausalLM, R: BorrowMut<Session<'m, M>>> BatchDecoder<'m, M, R
         live: &[usize],
         pieces: &[(usize, usize, usize)],
         input: &Tensor,
+        (clock, ph): (&mut StageClock, &mut BatchStepPhases),
     ) -> Result<Tensor> {
         let mut taken: Vec<Option<&mut Slot<'m, M, R>>> =
             self.slots.iter_mut().map(|s| s.as_mut()).collect();
@@ -1203,21 +1319,30 @@ impl<'m, M: BatchedCausalLM, R: BorrowMut<Session<'m, M>>> BatchDecoder<'m, M, R
                 cache: &mut s.seq.cache,
             })
             .collect();
+        clock.lap(&mut ph.prepare_ns);
         self.pacer.before_forward(input.device())?;
+        clock.lap(&mut ph.pace_ns);
         begin_pass(input.device(), shape)?;
         let logits = model.forward_ragged(input, &mut rows)?;
         end_pass(input.device())?;
+        clock.lap(&mut ph.encode_ns);
         self.pacer.after_forward(input.device())?;
         drop(rows);
         for (s, len) in picked {
             s.seq.pos += len;
         }
+        clock.lap(&mut ph.after_ns);
         Ok(logits)
     }
 
     /// One batched forward over the rows named by `live`, in that order,
     /// advancing each one's position.
-    fn forward_live(&mut self, live: &[usize], input: &Tensor) -> Result<Tensor> {
+    fn forward_live(
+        &mut self,
+        live: &[usize],
+        input: &Tensor,
+        (clock, ph): (&mut StageClock, &mut BatchStepPhases),
+    ) -> Result<Tensor> {
         // Disjoint `&mut` borrows of the live rows, in `live`'s order: the
         // indices are distinct by construction (each row is live at most once).
         let mut taken: Vec<Option<&mut Slot<'m, M, R>>> =
@@ -1245,15 +1370,19 @@ impl<'m, M: BatchedCausalLM, R: BorrowMut<Session<'m, M>>> BatchDecoder<'m, M, R
                 cache: &mut s.seq.cache,
             })
             .collect();
+        clock.lap(&mut ph.prepare_ns);
         self.pacer.before_forward(input.device())?;
+        clock.lap(&mut ph.pace_ns);
         begin_pass(input.device(), PassShape::Decode { b: live.len() })?;
         let logits = model.forward_rows(input, &mut rows)?;
         end_pass(input.device())?;
+        clock.lap(&mut ph.encode_ns);
         self.pacer.after_forward(input.device())?;
         drop(rows);
         for s in picked {
             s.seq.pos += 1;
         }
+        clock.lap(&mut ph.after_ns);
         Ok(logits)
     }
 }

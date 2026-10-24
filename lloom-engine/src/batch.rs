@@ -404,8 +404,146 @@ pub struct BatchScheduler<'m, M: BatchedCausalLM, E> {
 #[cfg(feature = "metal")]
 struct ProfileWindow {
     started: std::time::Instant,
-    steps: Vec<(u64, f64, f64, lloom::nn::StepReport)>,
+    steps: Vec<WindowStep>,
 }
+
+/// The profile window's per-step record and its decode-cadence summary,
+/// split out so the arithmetic is testable without a GPU.
+#[cfg(any(feature = "metal", test))]
+mod steady {
+    /// One step of a profile window: its host interval in the GPU's clock, its
+    /// composition, its host time by stage and what it dispatched.
+    #[derive(Debug, Clone, Copy)]
+    pub(super) struct WindowStep {
+        pub(super) step: u64,
+        pub(super) t0: f64,
+        pub(super) t1: f64,
+        pub(super) report: lloom::nn::StepReport,
+        pub(super) phases: lloom::nn::BatchStepPhases,
+        pub(super) dispatches: u64,
+    }
+
+    /// One live-row count's decode cadence over a window: the steps that fed no
+    /// piece and held no row, each timed from its start to the next step's
+    /// start (the scheduler's own work between steps included).
+    #[derive(Debug, Clone, PartialEq)]
+    pub(super) struct SteadyRow {
+        pub(super) live: usize,
+        pub(super) steps: usize,
+        /// Medians, milliseconds: the step's wall (start to the next start), the
+        /// GPU's busy union inside it, the host stages, and the scheduler's time
+        /// between the step's end and the next one's start.
+        pub(super) wall_ms: f64,
+        pub(super) gpu_busy_ms: f64,
+        pub(super) stages_ms: [f64; 10],
+        pub(super) between_ms: f64,
+        pub(super) dispatches: f64,
+    }
+
+    #[cfg_attr(not(feature = "metal"), allow(dead_code))]
+    pub(super) const STAGE_NAMES: [&str; 10] = [
+        "admit", "argmax", "stage", "prepare", "pace", "encode", "after", "wait", "stream", "tail",
+    ];
+
+    pub(super) fn stage_array(p: &lloom::nn::BatchStepPhases) -> [u64; 10] {
+        [
+            p.admit_ns,
+            p.argmax_ns,
+            p.stage_ns,
+            p.prepare_ns,
+            p.pace_ns,
+            p.encode_ns,
+            p.after_ns,
+            p.wait_ns,
+            p.stream_ns,
+            p.tail_ns,
+        ]
+    }
+
+    /// The median of `v` (sorted here); NaN when empty.
+    fn median(v: &mut [f64]) -> f64 {
+        if v.is_empty() {
+            return f64::NAN;
+        }
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        v[(v.len() - 1) / 2]
+    }
+
+    /// The busy union of `intervals` (sorted by start) clipped to `[lo, hi)`.
+    pub(super) fn busy_within(intervals: &[(f64, f64)], lo: f64, hi: f64) -> f64 {
+        let mut busy = 0.0;
+        let mut cursor = lo;
+        for &(s, e) in intervals {
+            if s >= hi {
+                break;
+            }
+            let s = s.max(cursor);
+            let e = e.min(hi);
+            if e > s {
+                busy += e - s;
+                cursor = e;
+            }
+        }
+        busy
+    }
+
+    /// The decode cadence per live-row count: a step counts when it fed no
+    /// piece, held no row and the next step began with the same live rows, so
+    /// its interval is one decode step at that width. `intervals` are the
+    /// window's command buffers' GPU intervals.
+    pub(super) fn steady_rows(steps: &[WindowStep], intervals: &[(f64, f64)]) -> Vec<SteadyRow> {
+        let mut sorted = intervals.to_vec();
+        sorted.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        let mut by_live: std::collections::BTreeMap<usize, Vec<(f64, f64, [f64; 10], f64, f64)>> =
+            Default::default();
+        for w in steps.windows(2) {
+            let (a, b) = (&w[0], &w[1]);
+            if a.report.live == 0
+                || a.report.pieces > 0
+                || a.report.held > 0
+                || b.report.live != a.report.live
+                || b.step != a.step + 1
+            {
+                continue;
+            }
+            let ms = |ns: u64| ns as f64 / 1e6;
+            let stages = stage_array(&a.phases).map(ms);
+            by_live.entry(a.report.live).or_default().push((
+                1e3 * (b.t0 - a.t0),
+                1e3 * busy_within(&sorted, a.t0, b.t0),
+                stages,
+                1e3 * (b.t0 - a.t1),
+                a.dispatches as f64,
+            ));
+        }
+        by_live
+            .into_iter()
+            .map(|(live, rows)| {
+                let col = |f: &dyn Fn(&(f64, f64, [f64; 10], f64, f64)) -> f64| {
+                    let mut v: Vec<f64> = rows.iter().map(f).collect();
+                    median(&mut v)
+                };
+                let mut stages_ms = [0.0; 10];
+                for (k, s) in stages_ms.iter_mut().enumerate() {
+                    *s = col(&|r| r.2[k]);
+                }
+                SteadyRow {
+                    live,
+                    steps: rows.len(),
+                    wall_ms: col(&|r| r.0),
+                    gpu_busy_ms: col(&|r| r.1),
+                    stages_ms,
+                    between_ms: col(&|r| r.3),
+                    dispatches: col(&|r| r.4),
+                }
+            })
+            .collect()
+    }
+}
+#[cfg(feature = "metal")]
+use steady::{stage_array, STAGE_NAMES};
+#[cfg(any(feature = "metal", test))]
+use steady::{steady_rows, WindowStep};
 
 /// What [`spawn`] needs to build the scheduler on its thread.
 pub struct BatchConfig<M: BatchedCausalLM, E> {
@@ -820,8 +958,9 @@ where
         }
         #[cfg(feature = "metal")]
         let t0 = self.window.as_ref().map(|_| {
-            lloom_tensor::kernels::metal::profile::set_step(self.counters.steps);
-            lloom_tensor::kernels::metal::profile::now_s()
+            use lloom_tensor::kernels::metal::profile;
+            profile::set_step(self.counters.steps);
+            (profile::now_s(), profile::dispatch_count())
         });
         let inflight = &self.inflight;
         let report = self.decoder.step(&mut |row, ids| {
@@ -834,9 +973,17 @@ where
             Ok(())
         })?;
         #[cfg(feature = "metal")]
-        if let (Some(w), Some(t0)) = (self.window.as_mut(), t0) {
-            let t1 = lloom_tensor::kernels::metal::profile::now_s();
-            w.steps.push((self.counters.steps, t0, t1, report));
+        if let (Some(w), Some((t0, d0))) = (self.window.as_mut(), t0) {
+            use lloom_tensor::kernels::metal::profile;
+            let t1 = profile::now_s();
+            w.steps.push(WindowStep {
+                step: self.counters.steps,
+                t0,
+                t1,
+                report,
+                phases: self.decoder.step_phases(),
+                dispatches: profile::dispatch_count().saturating_sub(d0),
+            });
         }
         self.counters.steps += 1;
         self.counters.max_live = self.counters.max_live.max(report.live);
@@ -1046,8 +1193,8 @@ where
         eprintln!(
             "[profile: batch window {n}: {} steps, {} with pieces, {} holding rows; gpu_busy_union {:.4} s /              wall {:.4} s = {:.4} busy/wall; {} command buffers, idle between them {:.4} s (starved {:.4} s)]",
             w.steps.len(),
-            w.steps.iter().filter(|x| x.3.pieces > 0).count(),
-            w.steps.iter().filter(|x| x.3.held > 0).count(),
+            w.steps.iter().filter(|x| x.report.pieces > 0).count(),
+            w.steps.iter().filter(|x| x.report.held > 0).count(),
             s.gpu_busy_union_s,
             wall,
             s.gpu_busy_union_s / wall.max(1e-9),
@@ -1055,6 +1202,29 @@ where
             idle,
             starved,
         );
+        let intervals: Vec<(f64, f64)> = s
+            .command_buffer_records
+            .iter()
+            .map(|r| (r.interval.start, r.interval.end))
+            .collect();
+        for row in steady_rows(&w.steps, &intervals) {
+            let stages: Vec<String> = STAGE_NAMES
+                .iter()
+                .zip(row.stages_ms)
+                .map(|(name, ms)| format!("{name} {ms:.3}"))
+                .collect();
+            eprintln!(
+                "[profile: batch window {n} decode at {} live: {} steps; median ms/step: wall {:.3}, \
+                 gpu_busy {:.3}; host {}; between steps {:.3}; {:.0} dispatches/step]",
+                row.live,
+                row.steps,
+                row.wall_ms,
+                row.gpu_busy_ms,
+                stages.join(", "),
+                row.between_ms,
+                row.dispatches,
+            );
+        }
         let Some(path) = lloom_tensor::tuning::tuning()
             .instrument
             .profile_dump
@@ -1070,17 +1240,40 @@ where
             ));
         }
         let mut st = String::from(
-            "step,host_start_s,host_end_s,live,held,pieces,piece_tokens,retired,pending\n",
+            "step,host_start_s,host_end_s,live,held,pieces,piece_tokens,retired,pending,dispatches",
         );
-        for (step, t0, t1, r) in &w.steps {
+        for name in STAGE_NAMES {
+            st.push_str(&format!(",{name}_ns"));
+        }
+        st.push('\n');
+        for x in &w.steps {
+            let r = &x.report;
             st.push_str(&format!(
-                "{step},{t0:.6},{t1:.6},{},{},{},{},{},{}\n",
-                r.live, r.held, r.pieces, r.piece_tokens, r.retired, r.pending
+                "{},{:.6},{:.6},{},{},{},{},{},{},{}",
+                x.step,
+                x.t0,
+                x.t1,
+                r.live,
+                r.held,
+                r.pieces,
+                r.piece_tokens,
+                r.retired,
+                r.pending,
+                x.dispatches
             ));
+            for ns in stage_array(&x.phases) {
+                st.push_str(&format!(",{ns}"));
+            }
+            st.push('\n');
+        }
+        let mut census = String::from("label,dispatches\n");
+        for (label, count) in &s.by_label {
+            census.push_str(&format!("{label},{count}\n"));
         }
         let mut files = vec![
             (format!("{path}.batch{n}.csv"), cb),
             (format!("{path}.batch{n}.steps.csv"), st),
+            (format!("{path}.batch{n}.census.csv"), census),
         ];
         if !s.encoder_records.is_empty() {
             let mut enc = String::from("step,label,start_s,end_s,dispatches\n");
@@ -1608,6 +1801,72 @@ mod tests {
         assert_eq!(idle_len, 2);
         handle.shutdown();
         thread.join().unwrap();
+    }
+
+    /// The decode cadence counts a step only when it is one decode step at
+    /// its width — no piece, no held row, the next step at the same live
+    /// count — and charges it the GPU's busy union inside its interval.
+    #[test]
+    fn the_decode_cadence_counts_only_whole_decode_steps_at_one_width() {
+        let report = |live, pieces| lloom::nn::StepReport {
+            live,
+            pieces,
+            ..Default::default()
+        };
+        let phases = lloom::nn::BatchStepPhases {
+            encode_ns: 2_000_000,
+            wait_ns: 7_000_000,
+            ..Default::default()
+        };
+        let step = |step: u64, t0: f64, live, pieces| WindowStep {
+            step,
+            t0,
+            t1: t0 + 0.009,
+            report: report(live, pieces),
+            phases,
+            dispatches: 400,
+        };
+        // A piece step, three decode steps at 4 live, a step at 3 live
+        // (a row retired), then one at 3 to close its interval.
+        let steps = vec![
+            step(0, 0.000, 4, 1),
+            step(1, 0.030, 4, 0),
+            step(2, 0.040, 4, 0),
+            step(3, 0.050, 4, 0),
+            step(4, 0.060, 3, 0),
+            step(5, 0.069, 3, 0),
+        ];
+        // The GPU busy 8 ms of every 10 from 0.030 on, idle at its edges.
+        let intervals: Vec<(f64, f64)> = (0..5)
+            .map(|k| (0.031 + 0.010 * k as f64, 0.039 + 0.010 * k as f64))
+            .collect();
+        let rows = steady_rows(&steps, &intervals);
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        let four = &rows[1];
+        assert_eq!(
+            (four.live, four.steps),
+            (4, 2),
+            "step 3's successor is at 3 live"
+        );
+        assert!((four.wall_ms - 10.0).abs() < 1e-9, "{four:?}");
+        assert!((four.gpu_busy_ms - 8.0).abs() < 1e-9, "{four:?}");
+        assert!((four.between_ms - 1.0).abs() < 1e-9, "{four:?}");
+        assert!((four.stages_ms[5] - 2.0).abs() < 1e-12);
+        assert!((four.stages_ms[7] - 7.0).abs() < 1e-12);
+        assert_eq!(four.dispatches, 400.0);
+        let three = &rows[0];
+        assert_eq!((three.live, three.steps), (3, 1));
+        assert!((three.wall_ms - 9.0).abs() < 1e-9, "{three:?}");
+        assert!((three.gpu_busy_ms - 8.0).abs() < 1e-9, "{three:?}");
+    }
+
+    /// The busy union does not double-count overlapping buffers and clips
+    /// at the interval's edges.
+    #[test]
+    fn the_busy_union_inside_an_interval_merges_and_clips() {
+        let ivs = [(0.0, 2.0), (1.0, 3.0), (5.0, 6.0), (7.0, 9.0)];
+        assert_eq!(super::steady::busy_within(&ivs, 0.5, 8.0), 2.5 + 1.0 + 1.0);
+        assert_eq!(super::steady::busy_within(&ivs, 3.0, 5.0), 0.0);
     }
 
     /// The static mode runs the waiting rows through the body as one batch

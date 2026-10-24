@@ -1074,3 +1074,60 @@ fn the_pause_arm_holds_streaming_rows_while_pieces_are_fed() -> Result<()> {
     }
     Ok(())
 }
+
+// ---- the decode step's scope and its stages (`batched-decode-design.md` §13)
+
+/// A step's host stages are read where the build carries the clock (debug
+/// and `profile`): a decode step's encode is charged, and the stages sum to
+/// no more than the step's own host time. In a release build every stage is
+/// zero by construction (the clock reads compiled out).
+#[test]
+fn a_steps_host_stages_partition_its_time() -> Result<()> {
+    let device = Device::Cpu;
+    let model = Chain::new(&device)?;
+    let opts = DecodeOptions {
+        lookahead: 1,
+        ..DecodeOptions::new(8)
+    };
+    let mut dec: BatchDecoder<'_, Chain, Session<'_, Chain>> =
+        BatchDecoder::new(opts, &[EOS], device.clone())?;
+    dec.admit(
+        Session::new(&model, 0usize),
+        vec![9, 1],
+        Sampling::ArgMax,
+        0,
+    )?;
+    dec.admit(
+        Session::new(&model, 0usize),
+        vec![9, 0],
+        Sampling::ArgMax,
+        0,
+    )?;
+    let mut decode_steps = 0;
+    while !dec.is_idle() {
+        let t = std::time::Instant::now();
+        let report = dec.step(&mut |_, _| Ok(()))?;
+        let wall = t.elapsed().as_nanos() as u64;
+        let ph = dec.last_step_phases();
+        if cfg!(debug_assertions) {
+            assert!(
+                ph.total_ns() <= wall,
+                "the stages sum past the step: {} > {wall} ({ph:?})",
+                ph.total_ns()
+            );
+            if report.live > 0 {
+                decode_steps += 1;
+                assert!(
+                    ph.encode_ns > 0,
+                    "a decode step's encode was not charged: {ph:?}"
+                );
+            }
+        } else {
+            assert_eq!(ph.total_ns(), 0, "release reads no clock: {ph:?}");
+        }
+    }
+    if cfg!(debug_assertions) {
+        assert!(decode_steps > 0, "no decode step ran");
+    }
+    Ok(())
+}

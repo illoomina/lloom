@@ -601,6 +601,13 @@ fn scalar_snapshot() -> Snapshot {
     }
 }
 
+/// Dispatches recorded since the last [`reset`]: read at a stretch's two ends
+/// to count what that stretch dispatched.
+#[inline]
+pub fn dispatch_count() -> u64 {
+    DISPATCHES.load(Ordering::Relaxed)
+}
+
 pub fn snapshot() -> Snapshot {
     #[cfg(any(debug_assertions, feature = "profile"))]
     {

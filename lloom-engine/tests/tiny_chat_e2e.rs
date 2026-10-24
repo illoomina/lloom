@@ -3976,10 +3976,16 @@ fn serve_rebuilds_an_evicted_session_and_falls_back_from_an_expired_one() {
         seen.get("messages").is_some_and(Value::is_number),
         "never the content"
     );
+    assert!(
+        seen.get("expires_in_s").is_none(),
+        "no lifetime of its own: {seen}"
+    );
     let (status, _) = server.call("DELETE", &path, &json!({}));
     assert_eq!(status, 200);
-    let (status, _) = server.call("GET", &path, &json!({}));
+    let (status, body) = server.call("GET", &path, &json!({}));
     assert_eq!(status, 404);
+    let said = body["error"]["message"].as_str().unwrap_or("");
+    assert!(said.contains("(let go: delete)"), "{body}");
 
     let user4 = json!({ "role": "user", "content": "Thanks." });
     let (status, body) = server.call(
@@ -3991,6 +3997,8 @@ fn serve_rebuilds_an_evicted_session_and_falls_back_from_an_expired_one() {
         status, 404,
         "the input form has nothing to fall back to: {body}"
     );
+    let said = body["error"]["message"].as_str().unwrap_or("");
+    assert!(said.contains("(let go: delete)"), "{body}");
     let four = ok(
         &server,
         json!({ "previous_response_id": id2,
@@ -3998,18 +4006,78 @@ fn serve_rebuilds_an_evicted_session_and_falls_back_from_an_expired_one() {
     );
     let s = &four["timings"]["session"];
     assert_eq!(s["state"], "expired", "{s}");
+    assert_eq!(s["reason"], "delete", "{s}");
     assert_eq!(s["history"], "matched", "the text match is the floor: {s}");
 
-    // One stored slot: a new stored session takes it, and the old id misses.
+    // One stored slot: a new stored session takes it, and the old id misses,
+    // saying why.
     let a = ok(&server, json!({ "messages": [user1], "store": true }));
     let id_a = session_id(&a);
     let _b = ok(&server, json!({ "messages": [user2], "store": true }));
-    let (status, _) = server.call(
+    let (status, body) = server.call(
         "POST",
         "/v1/chat/completions",
         &session_req(json!({ "previous_response_id": id_a, "input": [user4] })),
     );
     assert_eq!(status, 404, "a stale generation misses");
+    let said = body["error"]["message"].as_str().unwrap_or("");
+    assert!(said.contains("(let go: capacity)"), "{body}");
+    let (_, h) = server.call("GET", "/health", &json!({}));
+    let h = &h["sessions"];
+    eprintln!("SESSIONS health: {h}");
+    assert_eq!(h["idle_s"], 3600, "{h}");
+    assert_eq!(h["capacity"], 1, "{h}");
+    assert_eq!(h["reclaim"], "lru by last use", "{h}");
+    assert!(h.get("ttl_s").is_none(), "{h}");
+    assert_eq!(h["released"]["delete"], 1, "{h}");
+    // Two slots went for capacity: the one ephemeral slot, from the
+    // unstored conversation to the expired id's fallback, and the one stored
+    // slot, from A to B.
+    assert_eq!(h["released"]["capacity"], 2, "{h}");
+    drop(server);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A session's lifetime is the server's policy, not the session's: with
+/// `--session-idle 1` a stored session unused for two seconds is reclaimed,
+/// the continuation reports `expired` and why (`idle`), the `input` form's 404
+/// names it, and `/health` carries the policy and the release.
+#[test]
+fn serve_reclaims_an_idle_session_and_says_why() {
+    let (dir, model, base) = qwen_tiny("session-idle");
+    let mut args: Vec<&str> = base.iter().map(String::as_str).collect();
+    args.extend(["--prefix-reuse", "true", "--session-idle", "1"]);
+    let server = Server::start(&model, &args);
+    let user1 = json!({ "role": "user", "content": PROMPT });
+    let user2 = json!({ "role": "user", "content": "And Italy?" });
+    let one = ok(&server, json!({ "messages": [user1], "store": true }));
+    let id1 = session_id(&one);
+    let reply1 = one["choices"][0]["message"].clone();
+    std::thread::sleep(std::time::Duration::from_millis(2100));
+    let (status, body) = server.call(
+        "POST",
+        "/v1/chat/completions",
+        &session_req(json!({ "previous_response_id": id1, "input": [user2] })),
+    );
+    assert_eq!(status, 404, "{body}");
+    let said = body["error"]["message"].as_str().unwrap_or("");
+    assert!(said.contains("(let go: idle)"), "{body}");
+    let two = ok(
+        &server,
+        json!({ "previous_response_id": id1, "messages": [user1, reply1, user2] }),
+    );
+    let s = &two["timings"]["session"];
+    eprintln!("SESSION reclaimed as idle: {s}");
+    assert_eq!(s["state"], "expired", "{s}");
+    assert_eq!(s["reason"], "idle", "{s}");
+    assert!(
+        s.get("ttl_s").is_none() && s.get("expires_in_s").is_none(),
+        "{s}"
+    );
+    let (_, h) = server.call("GET", "/health", &json!({}));
+    let h = &h["sessions"];
+    assert_eq!(h["idle_s"], 1, "{h}");
+    assert_eq!(h["released"]["idle"], 1, "{h}");
     drop(server);
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -4337,7 +4405,13 @@ fn serve_advertises_sessions_streams_their_id_and_binds_them_to_a_key() {
     assert_eq!(f["sessions"]["store"]["default"], false, "{f}");
     assert_eq!(f["sessions"]["keep"]["none"], true, "{f}");
     assert!(f["sessions"]["keep"]["prefix"].is_string(), "{f}");
-    assert_eq!(f["sessions"]["ttl_s"], 3600);
+    assert_eq!(f["sessions"]["idle_s"], 3600, "{f}");
+    assert!(f["sessions"].get("ttl_s").is_none(), "{f}");
+    assert_eq!(
+        f["sessions"]["reasons"],
+        json!(["idle", "capacity", "memory", "reset", "delete", "restart"]),
+        "{f}"
+    );
 
     let user1 = json!({ "role": "user", "content": PROMPT });
     let events = sse(

@@ -7,7 +7,7 @@ use crate::Stop;
 
 fn cfg(capacity: usize, one_sequence: bool) -> Config {
     Config {
-        ttl: Duration::from_secs(60),
+        idle: Duration::from_secs(60),
         capacity,
         ephemeral: 1,
         max_bytes: 1 << 20,
@@ -167,15 +167,23 @@ fn a_stale_generation_misses_and_never_lands_in_the_session_that_took_the_slot()
     );
     assert_eq!(a.key.slot, b.key.slot, "one stored slot: B took A's");
     assert_ne!(a.key.gen, b.key.gen, "and moved its generation");
-    // A's id, even with B's nonce and turn, names nothing.
+    // A's id names nothing, and says why to its holder: B took the one slot.
+    assert_eq!(
+        t.resolve(&a.encode(), None, false, now).err(),
+        Some(Lost {
+            miss: Miss::Stale,
+            reason: Some(Reason::Capacity)
+        }),
+    );
+    // A's key with B's nonce and turn names nothing, and is told nothing.
     let forged = WireId { key: a.key, ..b };
-    for id in [a, forged] {
-        assert_eq!(
-            t.resolve(&id.encode(), None, false, now).err(),
-            Some(Miss::Stale),
-            "{id:?}"
-        );
-    }
+    assert_eq!(
+        t.resolve(&forged.encode(), None, false, now).err(),
+        Some(Lost {
+            miss: Miss::Stale,
+            reason: None
+        })
+    );
     let r = t.resolve(&b.encode(), None, false, now).expect("B is held");
     assert_eq!(r.ids, vec![7, 8, 9]);
 }
@@ -193,7 +201,10 @@ fn a_wrong_nonce_or_a_turn_past_the_last_misses() {
     for x in [wrong, past] {
         assert_eq!(
             t.resolve(&x.encode(), None, false, now).err(),
-            Some(Miss::Turn),
+            Some(Lost {
+                miss: Miss::Turn,
+                reason: None
+            }),
             "{x:?}"
         );
     }
@@ -209,7 +220,11 @@ fn a_session_bound_to_a_key_is_not_found_without_it() {
     for other in [None, Some([6u8; 32])] {
         assert_eq!(
             t.resolve(&id.encode(), other, false, now).err(),
-            Some(Miss::Binding)
+            Some(Lost {
+                miss: Miss::Binding,
+                reason: None
+            }),
+            "another key is told nothing"
         );
     }
     assert!(t.resolve(&id.encode(), key, false, now).is_ok());
@@ -227,8 +242,19 @@ fn an_ephemeral_session_lasts_while_the_engine_holds_it() {
     t.note_other();
     assert_eq!(
         t.resolve(&id.encode(), None, false, now).err(),
-        Some(Miss::Gone),
+        Some(Lost {
+            miss: Miss::Gone,
+            reason: Some(Reason::Capacity)
+        }),
         "its state is gone and nothing else kept it"
+    );
+    assert_eq!(
+        t.resolve(&id.encode(), None, false, now).err(),
+        Some(Lost {
+            miss: Miss::Stale,
+            reason: Some(Reason::Capacity)
+        }),
+        "and asked again, the slot it left says why"
     );
 }
 
@@ -252,8 +278,11 @@ fn store_on_a_continuation_promotes_an_ephemeral_session() {
     assert_eq!(b.turn, 1, "the next turn of the same lineage");
     assert_eq!(
         t.resolve(&a.encode(), None, false, now).err(),
-        Some(Miss::Stale),
-        "the ephemeral slot's ids are gone"
+        Some(Lost {
+            miss: Miss::Stale,
+            reason: None
+        }),
+        "the ephemeral slot's ids are gone: the session moved, nothing let it go"
     );
     let r = t.resolve(&b.encode(), None, false, now).unwrap();
     assert!(r.stored);
@@ -313,8 +342,11 @@ fn a_continuation_that_leaves_a_turn_drops_it_and_its_id() {
     assert_eq!(fork.turn, 1, "the fork takes turn 1's place");
     assert_eq!(
         t.resolve(&t1.encode(), None, false, now).err(),
-        Some(Miss::Turn),
-        "the dropped turn's id misses"
+        Some(Lost {
+            miss: Miss::Turn,
+            reason: None
+        }),
+        "the dropped turn's id misses; a fork is the client's, not a reason"
     );
     assert!(t.resolve(&t0.encode(), None, false, now).is_ok());
     let r = t.resolve(&fork.encode(), None, false, now).unwrap();
@@ -380,7 +412,10 @@ fn a_regeneration_replaces_the_last_turn_and_a_rerendered_turn_stays() {
     assert_eq!(again.turn, 1, "turn 1's place");
     assert_eq!(
         t.resolve(&t1.encode(), None, false, now).err(),
-        Some(Miss::Turn)
+        Some(Lost {
+            miss: Miss::Turn,
+            reason: None
+        })
     );
     // Turn 0's reply re-rendered to other ids (the prompt leaves the log at
     // 2): turn 0 stays, its ids known to 2.
@@ -405,16 +440,75 @@ fn a_regeneration_replaces_the_last_turn_and_a_rerendered_turn_stays() {
 }
 
 #[test]
-fn a_session_unused_past_its_ttl_expires() {
+fn a_session_unused_past_the_idle_policy_is_reclaimed_and_says_so() {
     let mut t = Table::new(cfg(4, true));
     let now = Instant::now();
     let id = turn(&mut t, None, Some(true), None, &[1], &scopes(1), &[2], now);
-    let later = now + Duration::from_secs(61);
+    assert!(
+        t.resolve(&id.encode(), None, false, now + Duration::from_secs(60))
+            .is_ok(),
+        "at the policy's bound, still held"
+    );
+    let later = now + Duration::from_secs(121);
     assert_eq!(
         t.resolve(&id.encode(), None, false, later).err(),
-        Some(Miss::Ttl)
+        Some(Lost {
+            miss: Miss::Idle,
+            reason: Some(Reason::Idle)
+        })
+    );
+    assert_eq!(
+        t.resolve(&id.encode(), None, false, later).err(),
+        Some(Lost {
+            miss: Miss::Stale,
+            reason: Some(Reason::Idle)
+        }),
+        "asked again, the released slot answers"
     );
     assert_eq!(t.json()["stored"], 0);
+    assert_eq!(t.json()["released"]["idle"], 1);
+}
+
+/// A full table gives its slot to a new session: the session idle past the
+/// policy first, else the least recently used — and each says which.
+#[test]
+fn a_slot_taken_for_a_new_session_says_idle_or_capacity() {
+    let mut t = Table::new(cfg(2, true));
+    let now = Instant::now();
+    let a = turn(&mut t, None, Some(true), None, &[1], &scopes(1), &[2], now);
+    let b = turn(
+        &mut t,
+        None,
+        Some(true),
+        None,
+        &[3],
+        &scopes(1),
+        &[4],
+        now + Duration::from_secs(50),
+    );
+    // At 70 s A is past the 60 s policy and B is not: A's slot goes, as idle.
+    let at = now + Duration::from_secs(70);
+    let c = turn(&mut t, None, Some(true), None, &[5], &scopes(1), &[6], at);
+    assert_eq!(c.key.slot, a.key.slot, "the idle session's slot");
+    assert_eq!(
+        t.resolve(&a.encode(), None, false, at).err(),
+        Some(Lost {
+            miss: Miss::Stale,
+            reason: Some(Reason::Idle)
+        })
+    );
+    // Nothing idle now: the least recently used, B, goes for capacity.
+    let d = turn(&mut t, None, Some(true), None, &[7], &scopes(1), &[8], at);
+    assert_eq!(d.key.slot, b.key.slot, "the least recently used slot");
+    assert_eq!(
+        t.resolve(&b.encode(), None, false, at).err(),
+        Some(Lost {
+            miss: Miss::Stale,
+            reason: Some(Reason::Capacity)
+        })
+    );
+    assert_eq!(t.json()["released"]["idle"], 1);
+    assert_eq!(t.json()["released"]["capacity"], 1);
 }
 
 #[test]
@@ -444,7 +538,15 @@ fn over_the_byte_budget_the_least_recently_used_other_session_goes() {
         &[4],
         now + Duration::from_millis(1),
     );
-    assert!(t.resolve(&a.encode(), None, false, now).is_err(), "A went");
+    assert_eq!(
+        t.resolve(&a.encode(), None, false, now).err(),
+        Some(Lost {
+            miss: Miss::Stale,
+            reason: Some(Reason::Memory)
+        }),
+        "A went, for the byte budget"
+    );
+    assert_eq!(t.json()["released"]["memory"], 1);
     assert!(
         t.resolve(&b.encode(), None, false, now).is_ok(),
         "B, being kept, stays"
@@ -469,8 +571,12 @@ fn a_reset_drops_the_turns_and_the_next_turn_starts_the_lineage() {
     t.reset(r.key);
     assert_eq!(
         t.resolve(&a.encode(), None, false, now).err(),
-        Some(Miss::Turn)
+        Some(Lost {
+            miss: Miss::Turn,
+            reason: Some(Reason::Reset)
+        })
     );
+    assert_eq!(t.json()["released"]["reset"], 1);
     let b = turn(
         &mut t,
         Some((r.key, r.turn)),
@@ -501,13 +607,181 @@ fn delete_forgets_a_session_and_inspect_shows_no_content() {
     let seen = t.inspect(&a.encode(), None, now).expect("held");
     assert_eq!(seen["turns"], 1);
     assert_eq!(seen["ids"], 3);
+    assert_eq!(seen["state"], "resident");
     assert!(
         seen.get("messages").is_some_and(Value::is_number),
         "a count, never the messages"
     );
-    assert!(t.delete(&a.encode(), None, now));
-    assert!(t.inspect(&a.encode(), None, now).is_none());
-    assert!(!t.delete(&a.encode(), None, now));
+    assert!(
+        seen.get("expires_in_s").is_none(),
+        "no expiry: when a session goes is the server's policy: {seen}"
+    );
+    assert_eq!(t.delete(&a.encode(), None, now), Ok(()));
+    let gone = Some(Lost {
+        miss: Miss::Stale,
+        reason: Some(Reason::Delete),
+    });
+    assert_eq!(t.inspect(&a.encode(), None, now).err(), gone);
+    assert_eq!(t.delete(&a.encode(), None, now).err(), gone);
+    assert_eq!(t.resolve(&a.encode(), None, false, now).err(), gone);
+    assert_eq!(t.json()["released"]["delete"], 1);
+}
+
+/// An id from an earlier server process — a generation this one never
+/// issued, or a slot it does not have — says `restart`.
+#[test]
+fn an_id_from_an_earlier_process_says_restart() {
+    let now = Instant::now();
+    let mut before = Table::with_base(cfg(4, true), 1_000);
+    let id = turn(
+        &mut before,
+        None,
+        Some(true),
+        None,
+        &[1],
+        &scopes(1),
+        &[2],
+        now,
+    );
+    let mut after = Table::with_base(cfg(4, true), 5_000);
+    let restart = Some(Lost {
+        miss: Miss::Stale,
+        reason: Some(Reason::Restart),
+    });
+    assert_eq!(after.resolve(&id.encode(), None, false, now).err(), restart);
+    let beyond = WireId {
+        key: Key { slot: 99, ..id.key },
+        ..id
+    };
+    assert_eq!(
+        after.resolve(&beyond.encode(), None, false, now).err(),
+        restart
+    );
+    // Across the wrap of the generation: issued just below u32::MAX, read
+    // by a process whose base is past it.
+    let mut wrapped = Table::with_base(cfg(1, true), u32::MAX);
+    let w = turn(
+        &mut wrapped,
+        None,
+        Some(true),
+        None,
+        &[1],
+        &scopes(1),
+        &[2],
+        now,
+    );
+    let _ = turn(
+        &mut wrapped,
+        None,
+        Some(true),
+        None,
+        &[3],
+        &scopes(1),
+        &[4],
+        now,
+    );
+    assert_eq!(
+        wrapped.resolve(&w.encode(), None, false, now).err(),
+        Some(Lost {
+            miss: Miss::Stale,
+            reason: Some(Reason::Capacity)
+        }),
+        "this process's own, across the wrap"
+    );
+}
+
+/// A reason is told only to the id's holder: another `Authorization`, or a
+/// nonce that is not the turn's, gets none — before and after the release.
+#[test]
+fn a_reason_is_never_a_hint_to_anyone_but_the_ids_holder() {
+    let mut t = Table::new(cfg(4, true));
+    let now = Instant::now();
+    let key = Some([5u8; 32]);
+    let id = turn(&mut t, None, Some(true), key, &[1], &scopes(1), &[2], now);
+    let guessed = WireId {
+        nonce: id.nonce ^ 1,
+        ..id
+    };
+    assert_eq!(t.delete(&id.encode(), key, now), Ok(()));
+    let silent = Some(Lost {
+        miss: Miss::Stale,
+        reason: None,
+    });
+    assert_eq!(t.resolve(&id.encode(), None, false, now).err(), silent);
+    assert_eq!(
+        t.resolve(&id.encode(), Some([6u8; 32]), false, now).err(),
+        silent
+    );
+    assert_eq!(t.resolve(&guessed.encode(), key, false, now).err(), silent);
+    assert_eq!(
+        t.resolve(&id.encode(), key, false, now).err(),
+        Some(Lost {
+            miss: Miss::Stale,
+            reason: Some(Reason::Delete)
+        }),
+        "the holder is told"
+    );
+}
+
+/// A slot remembers its last few releases; an id older than them misses
+/// without a reason rather than with a wrong one.
+#[test]
+fn a_release_older_than_the_slots_memory_has_no_reason() {
+    let mut t = Table::new(cfg(1, true));
+    let now = Instant::now();
+    let first = turn(&mut t, None, Some(true), None, &[1], &scopes(1), &[2], now);
+    let mut last = first;
+    // One more release than the slot remembers.
+    for i in 0..=RELEASES_KEPT as u32 {
+        last = turn(
+            &mut t,
+            None,
+            Some(true),
+            None,
+            &[10 + i],
+            &scopes(1),
+            &[2],
+            now,
+        );
+    }
+    assert_eq!(
+        t.resolve(&first.encode(), None, false, now).err(),
+        Some(Lost {
+            miss: Miss::Stale,
+            reason: None
+        })
+    );
+    let _ = turn(&mut t, None, Some(true), None, &[99], &scopes(1), &[2], now);
+    assert_eq!(
+        t.resolve(&last.encode(), None, false, now).err(),
+        Some(Lost {
+            miss: Miss::Stale,
+            reason: Some(Reason::Capacity)
+        }),
+        "a recent one still answers"
+    );
+}
+
+/// `/health`'s `sessions` carries the retention policy and what it let go;
+/// no session carries a lifetime.
+#[test]
+fn health_reports_the_policy_and_the_releases_by_reason() {
+    let mut t = Table::new(Config {
+        max_bytes: 3 << 20,
+        ..cfg(4, true)
+    });
+    let now = Instant::now();
+    let _ = turn(&mut t, None, Some(true), None, &[1], &scopes(1), &[2], now);
+    let h = t.json();
+    assert_eq!(h["held"], 1, "{h}");
+    assert_eq!(h["capacity"], 4);
+    assert_eq!(h["max_mib"], 3);
+    assert_eq!(h["idle_s"], 60);
+    assert_eq!(h["reclaim"], "lru by last use");
+    assert!(h.get("ttl_s").is_none(), "{h}");
+    for r in ["idle", "capacity", "memory", "reset", "delete"] {
+        assert_eq!(h["released"][r], 0, "{r}: {h}");
+    }
 }
 
 #[test]

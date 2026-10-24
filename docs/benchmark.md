@@ -19,6 +19,12 @@ low by up to a third); the 2026-10-22 matrix was the first honest one and the
 the full repository for the record (`xbench-20261019/`, `xbench-20261021/`,
 `xbench-20261022/`).
 
+**lloom's B=4 rows were re-measured on 2026-10-24 (22:52–23:00 UTC)** on the
+default that moved since (decision 54: a batched decode step's 2–10 rows on
+the GEMV's row axis, on by default under `fast`), with the matrix's harness,
+prompts and method, plain decode and DSpark (`xbench-20261024/b4-rows-default/`).
+Every other row is the 2026-10-24 matrix's.
+
 ## A small local benchmark
 
 Use the same release binary and checkpoint as serving, with explicit cells and
@@ -61,7 +67,8 @@ speed (measured 2026-10-21, `xbench-20261021/ab-lead/idle-gap.sh`). lloom's
 B=1); llama.cpp does the same with its own residency heartbeat; MLX pays the
 ramp in these tables.
 
-Engines: lloom `dev` d738e8564 with the chat/serve defaults (F16 weights);
+Engines: lloom `dev` d738e8564 with the chat/serve defaults (F16 weights; the
+B=4 rows a build with decision 54's default, above);
 llama.cpp b11721 `llama-server` with `-fa on`, `-np B`, the F16 GGUF and its
 prompt cache off; MLX via `uvx --from mlx-lm` (mlx-lm 0.32) `mlx_lm.server`
 with the bf16 MLX build and `--prompt-cache-size 0`. DSpark uses LiquidAI's
@@ -84,7 +91,7 @@ Mean TTFT over the B requests, by prompt length in tokens.
 | 1 | lloom | 121 ms | 591 ms | 1.56 s |
 | 1 | llama.cpp | 135 ms | 580 ms | 1.45 s |
 | 1 | MLX | 250 ms | 729 ms | 1.73 s |
-| 4 | lloom | 456 ms | 2.09 s | 4.68 s |
+| 4 | lloom | 434 ms | 2.10 s | 4.75 s |
 | 4 | llama.cpp | 365 ms | 2.12 s | 5.11 s |
 | 16 | lloom | 1.25 s | 7.20 s | 20.81 s |
 | 16 | llama.cpp | 1.38 s | 7.75 s | 17.64 s |
@@ -101,8 +108,8 @@ Mean TTFT over the B requests, by prompt length in tokens.
 | 1 | llama.cpp | code | 155 ms | 617 ms | 1.48 s |
 | 1 | MLX (mlx-dspark) | prose | 155 ms | 652 ms | 1.66 s |
 | 1 | MLX (mlx-dspark) | code | 141 ms | 648 ms | 1.67 s |
-| 4 | lloom | prose | 374 ms | 1.56 s | 4.02 s |
-| 4 | lloom | code | 391 ms | 1.54 s | 4.05 s |
+| 4 | lloom | prose | 389 ms | 1.55 s | 4.04 s |
+| 4 | lloom | code | 355 ms | 1.55 s | 4.04 s |
 | 4 | llama.cpp | prose | 415 ms | 2.19 s | 5.39 s |
 | 4 | llama.cpp | code | 447 ms | 2.32 s | 5.39 s |
 | 4 | MLX (mlx-dspark) | prose | 4.10 s | 7.27 s | 11.80 s |
@@ -128,7 +135,7 @@ its last generated token (prefill excluded; it shows in the TTFT tables).
 | 1 | lloom | 64 | 63 | 62 |
 | 1 | llama.cpp | 60 | 60 | 60 |
 | 1 | MLX | 51 | 51 | 51 |
-| 4 | lloom | 151 | 138 | 98 |
+| 4 | lloom | 217 | 194 | 126 |
 | 4 | llama.cpp | 188 | 187 | 133 |
 | 16 | lloom | 469 | 266 | 143 |
 | 16 | llama.cpp | 297 | 238 | 148 |
@@ -147,8 +154,8 @@ kept apart for that reason):
 | 1 | llama.cpp | code | 210 | 124 | 121 |
 | 1 | MLX (mlx-dspark) | prose | 36 | 73 | 25 |
 | 1 | MLX (mlx-dspark) | code | 45 | 57 | 52 |
-| 4 | lloom | prose | 237 | 164 | 109 |
-| 4 | lloom | code | 228 | 184 | 128 |
+| 4 | lloom | prose | 215 | 164 | 107 |
+| 4 | lloom | code | 241 | 172 | 129 |
 | 4 | llama.cpp | prose | 94 | 118 | 59 |
 | 4 | llama.cpp | code | 118 | 92 | 75 |
 | 4 | MLX (mlx-dspark) | prose | 197 | 165 | 103 |
@@ -188,10 +195,11 @@ What this shows, and what it does not:
   after macOS unwired the residency set; the keep-warm closes it.
 - Batched without speculation: lloom leads at B=16 and B=32 on short and
   mid prompts (654 vs 355 tok/s at B=32, ~100 tokens; 288 vs 222 at ~872)
-  and at B=32 ~2370 tokens (175 vs 141); it trails at B=4 on every length
-  (151 vs 188 at ~100) and is level at B=16 ~2370 (143 vs 148). TTFT under
-  load is level or ahead at B=4 and B=32 and behind at B=16 ~2370 tokens
-  (20.8 s vs 17.6 s).
+  and at B=32 ~2370 tokens (175 vs 141); at B=4 it now leads at ~100 and
+  ~872 tokens (217 vs 188, 194 vs 187) and trails at ~2370 (126 vs 133;
+  a rotated A/B on the same prompts reads 130–135 there); it is level at
+  B=16 ~2370 (143 vs 148). TTFT under load is level or ahead at B=4 and B=32
+  and behind at B=16 ~2370 tokens (20.8 s vs 17.6 s).
 - Single-stream DSpark: level with llama.cpp within the spread above; lloom
   does not decay with context (the in-place KV for the verify window). Raw
   mid-document continuations draft worse than chat answers do (a chat answer
@@ -202,6 +210,14 @@ What this shows, and what it does not:
   (103–197 tok/s) and its B=1 is far behind both.
 
 ## What changed since the earlier matrices
+
+- **2026-10-24 (later): a batched decode step's rows on the row axis by
+  default** (decision 54). lloom's B=4 plain decode 151 / 138 / 98 →
+  217 / 194 / 126 tok/s (~100 / ~872 / ~2370), TTFT unchanged; B=1 does not
+  batch and B ≥ 16 is past the row axis's ceiling, so their rows stand. The
+  B=4 DSpark rows were re-run with them and moved within the per-request
+  nonce's spread (the batched DSpark driver does not take the decode rows'
+  route).
 
 - **2026-10-24: the GPU keep-warm and the fused SiLU·mul are on by default.**
   Single-stream TTFT fell from 233 / 681 ms / 1.69 s to 121 / 591 ms / 1.56 s
@@ -231,10 +247,18 @@ repository and none is hidden by the numbers above.
   copies, norms — the SiLU·mul fusion took the first slice; more fusions are
   the lever). The tile loop, the page-pool gather and the host are not where
   the time goes (profiled 2026-10-20).
-- **Batched decode at small B.** At B=4 lloom's plain decode trails llama.cpp
-  (151 vs 188 tok/s at ~100 tokens) while leading at B ≥ 16; the batched
-  step's fixed cost (packing, per-row readback, step composition) is the
-  suspect. Open item, in work.
+- **Batched decode at small B.** The batched step's weight matmuls took the
+  tiled GEMM from two rows, whose step is flat from 2 to 16 rows (~26 ms
+  against one row's 16.6 on this machine): B = 2–8 paid B = 16's step. The
+  host's per-step work (packing, readback, EOS) is under 0.1 ms of it. Since
+  2026-10-24 a batched decode step of 2–10 rows takes the GEMV's row axis
+  instead (`kernels.gemm.f16_rows_decode`, on by default under `fast`):
+  17–19 ms a step, B=4 decode 151 → 217 tok/s at ~100 tokens and 138 → 194
+  at ~872. At ~2370 tokens B=4 is still level-to-behind (126–135 against
+  133): the other streams' prompt pieces ride the first streams' decode
+  windows, where llama.cpp prefills the whole burst first. Batches of 11–16
+  rows still take the GEMM; where the row axis should stop is measured and
+  open (`issue-1084.md` §8.6).
 - **B=16 at long context.** Prefill trails at ~2370 tokens (20.8 vs 17.6 s);
   prefilling pending prompts together does not help on this machine (the
   per-token prefill cost is flat in the batch; the growth is arrival order

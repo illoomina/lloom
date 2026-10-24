@@ -344,6 +344,35 @@ fn footprint_impl(_pid: u32) -> Option<u64> {
     None
 }
 
+/// The kernel's memory-pressure level, `kern.memorystatus_vm_pressure_level`:
+/// 1 normal, 2 warn, 4 critical. `None` where it cannot be read (not macOS).
+pub fn vm_pressure_level() -> Option<u32> {
+    vm_pressure_impl()
+}
+
+#[cfg(target_os = "macos")]
+fn vm_pressure_impl() -> Option<u32> {
+    let mut level: libc::c_int = 0;
+    let mut len = std::mem::size_of::<libc::c_int>();
+    // SAFETY: the sysctl is an int; `level` and `len` describe exactly that
+    // buffer and outlive the call.
+    let rc = unsafe {
+        libc::sysctlbyname(
+            c"kern.memorystatus_vm_pressure_level".as_ptr(),
+            &mut level as *mut libc::c_int as *mut libc::c_void,
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    (rc == 0).then(|| u32::try_from(level).ok()).flatten()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn vm_pressure_impl() -> Option<u32> {
+    None
+}
+
 /// The macOS/explicit-working-set reserve floor; not the headless host floor.
 pub const RESERVE_FLOOR: u64 = 4 * GIB;
 

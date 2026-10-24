@@ -2000,6 +2000,14 @@ pub struct ServerConfig {
     /// What `server.keep_warm` does each period: `residency` (ask the OS to keep the GPU's memory wired: it unwires it after a few idle seconds and the next request waits while it is wired back) or `dispatch` (one one-element GPU dispatch, committed and waited).
     #[opt(flag = "keep-warm-by", parser = "parse_keep_warm_by", variants = ["residency", "dispatch"], path = "server.keep_warm_by", status = "advanced")]
     pub keep_warm_by: String,
+    /// Read the kernel's memory-pressure level every keep-warm period: at warn or critical stop keeping the GPU's memory wired and give it back (`endResidency`), at normal resume; off = the heartbeat ignores pressure.
+    #[opt(
+        bool,
+        flag = "keep-warm-pressure",
+        path = "server.keep_warm_pressure",
+        status = "arm"
+    )]
+    pub keep_warm_pressure: bool,
     #[opt(nested)]
     pub pipette: PipetteConfig,
     #[opt(nested)]
@@ -2014,6 +2022,7 @@ impl Default for ServerConfig {
             keep_warm: None,
             keep_warm_for_s: 180,
             keep_warm_by: "residency".into(),
+            keep_warm_pressure: false,
             pipette: PipetteConfig::default(),
             sessions: ServerSessionsConfig::default(),
         }

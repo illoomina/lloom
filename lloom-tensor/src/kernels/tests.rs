@@ -2548,6 +2548,87 @@ fn commands_concurrent_acquisition() {
     commands.wait_until_completed().unwrap();
 }
 
+/// `kernels.residency.attach`: under `heartbeat` the device set is not put
+/// on a Metal 3 queue (zero `addResidencySet` calls name it) and a kernel
+/// binding the set's own buffers still computes the right values, since a
+/// Metal 3 command buffer makes what it binds resident; under `queue` the
+/// set is on the queue once. On Metal 4 both arms keep the attachment and
+/// `heartbeat` says why. A mutation that attaches regardless, or detaches
+/// under `queue`, fails the count; one that breaks binding fails the values.
+#[test]
+fn residency_attach_heartbeat_detaches_the_set_on_metal3_and_binding_still_works() {
+    use crate::kernels::metal::completion::CompletionWait;
+    use crate::kernels::metal::{CommandBufferKind, ResidencyAttach};
+
+    let device = device();
+    if unsafe { ResidencySet::new(&device).raw() }.is_none() {
+        return;
+    }
+    let kernels = Kernels::new();
+    let v: Vec<f32> = (0..4096).map(|i| i as f32).collect();
+    for arm in [ResidencyAttach::Heartbeat, ResidencyAttach::Queue] {
+        let set = Arc::new(ResidencySet::new(&device));
+        let commands = Commands::new_with_residency_attach(
+            device.new_command_queue().unwrap(),
+            Arc::clone(&set),
+            CompletionWait::Synchronize,
+            CommandBufferKind::Retaining,
+            arm,
+        )
+        .unwrap();
+        let metal4 = commands.actual_command_api() == "metal4";
+        let got = commands.residency_attachment();
+        let (attached, ignored) = match (arm, metal4) {
+            (ResidencyAttach::Heartbeat, false) => (0, false),
+            (ResidencyAttach::Heartbeat, true) => (1, true),
+            (ResidencyAttach::Queue, _) => (1, false),
+        };
+        assert_eq!(
+            set.queue_attachments(),
+            attached,
+            "{} on {}: addResidencySet calls naming the device set",
+            arm.name(),
+            commands.actual_command_api()
+        );
+        assert_eq!(got.attached, attached == 1, "{got:?}");
+        assert_eq!(got.ignored.is_some(), ignored, "{got:?}");
+        assert_eq!(got.short() == "detached", attached == 0, "{got:?}");
+
+        let input = new_buffer(&device, &v);
+        let output = new_buffer(&device, &v);
+        assert_eq!(set.insert_batch([&input, &output]), 2);
+        let encoder = commands.command_encoder().unwrap();
+        // SAFETY: the test owns every buffer bound here and reads the output
+        // only after waiting for the command buffer that writes it.
+        unsafe {
+            call_affine(
+                &device,
+                &encoder,
+                &kernels,
+                "affine_f32",
+                size_of::<f32>(),
+                v.len(),
+                BufferOffset::zero_offset(&input),
+                &output,
+                2.0,
+                1.0,
+            )
+        }
+        .unwrap();
+        drop(encoder);
+        commands.wait_until_completed().unwrap();
+        let out: Vec<f32> = read_to_vec(&output, v.len());
+        let want: Vec<f32> = v.iter().map(|x| x * 2.0 + 1.0).collect();
+        assert_eq!(
+            out,
+            want,
+            "{} arm: a kernel over the set's buffers",
+            arm.name()
+        );
+        assert_eq!(set.remove_batch([&input, &output]), 2);
+    }
+}
+
 #[test]
 fn residency_set_batch_insert_remove() {
     use objc2_metal::MTLResidencySet;

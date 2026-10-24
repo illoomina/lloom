@@ -82,7 +82,13 @@ impl Retirement {
         }
     }
     fn leave(&self, counter: &AtomicUsize) {
+        self.leave_then(counter, || {});
+    }
+    /// As [`Self::leave`], running `last` when this was the counter's last
+    /// holder, before a waiter is woken.
+    fn leave_then(&self, counter: &AtomicUsize, last: impl FnOnce()) {
         if counter.fetch_sub(1, Ordering::AcqRel) == 1 {
+            last();
             let _guard = self.lock.lock();
             self.settled.notify_all();
         }
@@ -142,7 +148,9 @@ impl PublishedRemovals {
     /// Their prerequisite observer must refuse before epoch/native entry.
     #[cfg(test)]
     pub(crate) fn empty_for_test() -> Self {
-        Self { _leases: Vec::new() }
+        Self {
+            _leases: Vec::new(),
+        }
     }
     pub(crate) fn is_empty(&self) -> bool {
         self._leases.is_empty()
@@ -202,6 +210,10 @@ pub struct ResidencyCounters {
     /// the allocation, kept instead of freed ([`ReleaseWitness`]). A defect
     /// count, not a rate: [`ResidencySet::reset_counters`] leaves it.
     pub listed_at_release: u64,
+    /// `requestResidency` calls (the keep-warm's, and the one at creation).
+    pub requests: u64,
+    /// `endResidency` calls (memory pressure, the last device handle).
+    pub ends: u64,
 }
 
 /// Keeps Metal buffers resident in GPU memory, removing the need for `useResource` calls.
@@ -270,6 +282,10 @@ pub struct ResidencySet {
     retired: AtomicU64,
     insert_batches: AtomicU64,
     remove_batches: AtomicU64,
+    requests: AtomicU64,
+    ends: AtomicU64,
+    /// `addResidencySet` calls naming this set (`kernels.residency.attach`).
+    queue_attachments: AtomicU64,
 
     /// Set by [`Self::add`] when an allocation has been `addAllocation`'d but not
     /// yet `commit`ted, cleared by [`Self::commit_pending`]. The deferred-commit
@@ -302,6 +318,8 @@ impl Drop for ListingRecord {
 }
 
 /// One device root naming a set, held for as long as a device handle lives.
+/// The last one to go ends the set's residency: the model is unloaded, and
+/// its memory goes back to the OS now rather than at the idle collector.
 pub(crate) struct LiveDevice(Arc<ResidencySet>);
 impl LiveDevice {
     pub(crate) fn new(set: &Arc<ResidencySet>) -> Self {
@@ -311,7 +329,89 @@ impl LiveDevice {
 }
 impl Drop for LiveDevice {
     fn drop(&mut self) {
-        self.0.retirement.leave(&self.0.retirement.devices);
+        let set = &self.0;
+        set.retirement
+            .leave_then(&set.retirement.devices, || set.end_residency());
+    }
+}
+
+/// How the device's residency set reaches the command queue
+/// (`kernels.residency.attach`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResidencyAttach {
+    /// `addResidencySet` on the Metal 3 queue: every command buffer waits
+    /// until the whole set is resident.
+    Queue,
+    /// Not attached: a command buffer waits only for the buffers it binds
+    /// (`setBuffer`, an ICB run's `useResources`), and the set is kept wired
+    /// by `requestResidency` (serve's keep-warm, §3.4d).
+    Heartbeat,
+}
+
+impl ResidencyAttach {
+    /// The arm `kernels.residency.attach` names.
+    pub fn selected() -> Self {
+        Self::parse(&crate::tuning::tuning().metal.residency_attach)
+    }
+    fn parse(arm: &str) -> Self {
+        if arm == "heartbeat" {
+            Self::Heartbeat
+        } else {
+            Self::Queue
+        }
+    }
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Queue => "queue",
+            Self::Heartbeat => "heartbeat",
+        }
+    }
+}
+
+/// What a queue did with the device set: the arm asked for, whether the set
+/// is on the queue, and why when the arm was not honoured.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResidencyAttachment {
+    pub requested: ResidencyAttach,
+    pub attached: bool,
+    pub ignored: Option<&'static str>,
+}
+
+impl ResidencyAttachment {
+    /// The decision for a queue that runs on Metal 4 (`metal4`) or Metal 3.
+    /// Metal 4 command buffers go to their own queue, whose per-slot sets
+    /// list every resource a slot binds (its argument tables bind by GPU
+    /// address); the device set sits on the Metal 3 queue there, which runs
+    /// no work. `heartbeat` changes nothing that queue does, so it is
+    /// ignored and the attachment kept as `queue` has it.
+    pub fn decide(requested: ResidencyAttach, metal4: bool) -> Self {
+        match (requested, metal4) {
+            (ResidencyAttach::Heartbeat, false) => Self {
+                requested,
+                attached: false,
+                ignored: None,
+            },
+            (ResidencyAttach::Heartbeat, true) => Self {
+                requested,
+                attached: true,
+                ignored: Some("metal4 binds through its per-slot sets"),
+            },
+            (ResidencyAttach::Queue, _) => Self {
+                requested,
+                attached: true,
+                ignored: None,
+            },
+        }
+    }
+
+    /// The loaded line's word: `queue`, `detached`, or
+    /// `queue(heartbeat ignored: …)`.
+    pub fn short(&self) -> String {
+        match (self.attached, self.ignored) {
+            (false, _) => "detached".into(),
+            (true, Some(why)) => format!("queue(heartbeat ignored: {why})"),
+            (true, None) => "queue".into(),
+        }
     }
 }
 
@@ -330,6 +430,7 @@ impl ResidencySet {
             .newResidencySetWithDescriptor_error(&descriptor)
             .ok()
             .inspect(|set| set.requestResidency());
+        let requested = u64::from(raw.is_some());
         ResidencySet {
             raw,
             members: WakeMutex::new(ResidencyOwners::default()),
@@ -339,6 +440,9 @@ impl ResidencySet {
             retired: AtomicU64::new(0),
             insert_batches: AtomicU64::new(0),
             remove_batches: AtomicU64::new(0),
+            requests: AtomicU64::new(requested),
+            ends: AtomicU64::new(0),
+            queue_attachments: AtomicU64::new(0),
             dirty: std::sync::atomic::AtomicBool::new(false),
             retirement: Retirement::default(),
         }
@@ -351,7 +455,31 @@ impl ResidencySet {
     pub fn request_residency(&self) {
         if let Some(raw) = &self.raw {
             raw.requestResidency();
+            self.requests.fetch_add(1, Ordering::Relaxed);
         }
+    }
+
+    /// Tells the OS the set's memory need not stay resident: under memory
+    /// pressure, and when the set's device is gone, so the memory is given
+    /// back without waiting for the idle collector (§3.4d). Membership is
+    /// untouched; a later [`Self::request_residency`] or a command buffer
+    /// on a queue the set is attached to makes it resident again.
+    pub fn end_residency(&self) {
+        if let Some(raw) = &self.raw {
+            raw.endResidency();
+            self.ends.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// A queue took this set (`addResidencySet`); counted beside the call.
+    pub(crate) fn note_queue_attached(&self) {
+        self.queue_attachments.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// How many queues this set was attached to: 1 under
+    /// `kernels.residency.attach = queue`, 0 when detached.
+    pub fn queue_attachments(&self) -> u64 {
+        self.queue_attachments.load(Ordering::Relaxed)
     }
 
     /// Enters this set in the process registry [`join_device_retirement`]
@@ -446,6 +574,8 @@ impl ResidencySet {
             insert_batches: self.insert_batches.load(Ordering::Relaxed),
             remove_batches: self.remove_batches.load(Ordering::Relaxed),
             listed_at_release: self.retirement.listed_at_release.load(Ordering::Relaxed),
+            requests: self.requests.load(Ordering::Relaxed),
+            ends: self.ends.load(Ordering::Relaxed),
         }
     }
 
@@ -458,6 +588,8 @@ impl ResidencySet {
         self.retired.store(0, Ordering::Relaxed);
         self.insert_batches.store(0, Ordering::Relaxed);
         self.remove_batches.store(0, Ordering::Relaxed);
+        self.requests.store(0, Ordering::Relaxed);
+        self.ends.store(0, Ordering::Relaxed);
     }
 
     /// Raw Metal interoperability, including allAllocations-derived handles.
@@ -589,11 +721,21 @@ impl ResidencySet {
     /// nothing. The returned wrapper must follow host cleanup custody.
     pub(crate) fn commit_pending_extracted(&self) -> (bool, PublishedRemovals) {
         let Some(set) = &self.raw else {
-            return (false, PublishedRemovals { _leases: Vec::new() });
+            return (
+                false,
+                PublishedRemovals {
+                    _leases: Vec::new(),
+                },
+            );
         };
         // The steady state — nothing staged — never takes the lock.
         if !self.dirty.load(Ordering::Acquire) {
-            return (false, PublishedRemovals { _leases: Vec::new() });
+            return (
+                false,
+                PublishedRemovals {
+                    _leases: Vec::new(),
+                },
+            );
         }
         // Under `members`, as every other `commit` here is: a commit applies
         // the set's pending adds AND removes, and two threads applying the same
@@ -630,10 +772,20 @@ impl ResidencySet {
         &self,
     ) -> Result<(bool, PublishedRemovals), ResidencyBusy> {
         let Some(set) = &self.raw else {
-            return Ok((false, PublishedRemovals { _leases: Vec::new() }));
+            return Ok((
+                false,
+                PublishedRemovals {
+                    _leases: Vec::new(),
+                },
+            ));
         };
         if !self.dirty.load(Ordering::Acquire) {
-            return Ok((false, PublishedRemovals { _leases: Vec::new() }));
+            return Ok((
+                false,
+                PublishedRemovals {
+                    _leases: Vec::new(),
+                },
+            ));
         }
         let mut members = self.members.try_lock().ok_or(ResidencyBusy)?;
         let committed = self.dirty.load(Ordering::Relaxed);
@@ -853,7 +1005,9 @@ impl ResidencySet {
         allocations: impl IntoIterator<Item = &'a ProtocolObject<dyn MTLAllocation>>,
     ) -> PublishedRemovals {
         let Some(set) = &self.raw else {
-            return PublishedRemovals { _leases: Vec::new() };
+            return PublishedRemovals {
+                _leases: Vec::new(),
+            };
         };
         let mut members = self.members.lock();
         let mut removed = 0usize;

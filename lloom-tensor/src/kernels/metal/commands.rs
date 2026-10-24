@@ -25,7 +25,8 @@ use crate::kernels::metal::{
     contention::{Access, Censused, Side, SubmissionContention},
     executor::ExecutorSlot,
     BlitCommandEncoder, Buffer, CommandBuffer, ComputeCommandEncoder, ComputePipeline, Device,
-    DispatchGate, Fence, GpuClock, InFlightHold, PrevCeOutputs, ResidencySet,
+    DispatchGate, Fence, GpuClock, InFlightHold, PrevCeOutputs, ResidencyAttach,
+    ResidencyAttachment, ResidencySet,
 };
 use crate::kernels::MetalKernelError;
 use crate::retire::Epoch;
@@ -103,6 +104,56 @@ fn create_command_buffer(
         CommandBufferKind::Retaining => command_queue.commandBuffer(),
     };
     raw.ok_or_else(|| MetalKernelError::FailedToCreateResource("CommandBuffer".to_string()))
+}
+
+/// Whether this queue runs on Metal 4 (`backend.metal.command_buffer.api`):
+/// `metal4` where the device has it, `auto` where it has it and the encoder
+/// counters are off, else Metal 3.
+fn select_metal4(device: &Device) -> Result<bool, MetalKernelError> {
+    let requested_api = crate::tuning::tuning().metal.command_api.as_str();
+    let supported = super::arms::for_device(device).has(super::arms::Feature::Metal4);
+    let counters = super::profile::counters_enabled();
+    if requested_api == "metal4" && counters {
+        return Err(MetalKernelError::InvalidInput(
+            "Metal 4 encoder counter sampling is not implemented; select --metal-api metal3 (or auto) to retain counter profiling".into()));
+    }
+    let supported = supported && !counters;
+    if requested_api == "auto" && counters {
+        eprintln!("[metal] command_api=metal3 auto_fallback=encoder-counter-profiling");
+    }
+    match requested_api {
+        "metal4" if !supported => Err(MetalKernelError::InvalidInput(
+            "Metal 4 is unavailable or disabled on this device; select metal3 or auto".into(),
+        )),
+        "metal4" | "auto" if supported => Ok(true),
+        _ => Ok(false),
+    }
+}
+
+/// Puts the device set on the Metal 3 queue unless `attach` detaches it
+/// ([`ResidencyAttachment::decide`]). Before the queue's first command
+/// buffer, so every buffer committed on it sees the same attachment.
+fn attach_device_set(
+    command_queue: &CommandQueue,
+    residency_set: &ResidencySet,
+    attach: ResidencyAttach,
+    metal4: bool,
+) -> ResidencyAttachment {
+    let decided = ResidencyAttachment::decide(attach, metal4);
+    // SAFETY: queue installation borrows only. The constructor transfers the
+    // SAME Arc into Core; no allAllocations extraction or out-of-band
+    // residency mutation occurs here. This is not an alias terminality proof.
+    match unsafe { residency_set.raw() } {
+        Some(raw) if decided.attached => {
+            command_queue.addResidencySet(raw);
+            residency_set.note_queue_attached();
+            decided
+        }
+        _ => ResidencyAttachment {
+            attached: false,
+            ..decided
+        },
+    }
 }
 
 /// RAII guard for compute command encoder operations.
@@ -603,6 +654,9 @@ struct CommandsCore {
     host_input: produced::HostInputArm,
     /// Producer-side view of the held recordings (`produced.rs`).
     produced: produced::ProducedState,
+    /// Whether the device set is on the Metal 3 queue, decided before the
+    /// queue's first command buffer (`kernels.residency.attach`).
+    residency_attachment: ResidencyAttachment,
     // LAST: native wrapper fields release before this submit-capability pin.
     physical: crate::retirement_service::PhysicalAnchor<
         crate::metal_backend::device_retirement::NamespaceOwner,
@@ -784,15 +838,15 @@ impl Commands {
             _ => CutPolicy::from_env_str(&tuning.cut_policy).unwrap_or_else(|e| panic!("{e}")),
         };
 
-        // SAFETY: queue installation borrows only. This constructor transfers
-        // the SAME Arc into Core; no allAllocations extraction or out-of-band
-        // residency mutation occurs here. This is not an alias terminality proof.
-        if let Some(raw) = unsafe { residency_set.raw() } {
-            command_queue.addResidencySet(raw);
-        }
-
         let kind = CommandBufferKind::selected();
         let device = Device::new(command_queue.device());
+        let metal4 = select_metal4(&device)?;
+        let residency_attachment = attach_device_set(
+            &command_queue,
+            &residency_set,
+            ResidencyAttach::selected(),
+            metal4,
+        );
         // Accounted initial route reserves/initializes header credits before
         // creating its native CB/Slot. Preserve old raw constructor behavior.
         let cb = if binding_metadata.is_some() {
@@ -822,6 +876,8 @@ impl Commands {
             residency_set,
             kind,
             binding_metadata,
+            metal4,
+            residency_attachment,
         )
     }
 
@@ -865,13 +921,30 @@ impl Commands {
     ) -> Result<Self, MetalKernelError> {
         crate::tuning::try_tuning()
             .map_err(|error| MetalKernelError::InvalidInput(error.to_string()))?;
-        // SAFETY: queue installation borrows only. This constructor transfers
-        // the SAME Arc into Core; no allAllocations extraction or out-of-band
-        // residency mutation occurs here. This is not an alias terminality proof.
-        if let Some(raw) = unsafe { residency_set.raw() } {
-            command_queue.addResidencySet(raw);
-        }
+        Self::new_with_residency_attach(
+            command_queue,
+            residency_set,
+            completion_wait,
+            kind,
+            ResidencyAttach::selected(),
+        )
+    }
+
+    /// As [`Self::new_with`], with `kernels.residency.attach`'s arm supplied:
+    /// a test sees both arms in one process.
+    pub fn new_with_residency_attach(
+        command_queue: CommandQueue,
+        residency_set: Arc<ResidencySet>,
+        completion_wait: CompletionWait,
+        kind: CommandBufferKind,
+        attach: ResidencyAttach,
+    ) -> Result<Self, MetalKernelError> {
+        crate::tuning::try_tuning()
+            .map_err(|error| MetalKernelError::InvalidInput(error.to_string()))?;
         let device = Device::new(command_queue.device());
+        let metal4 = select_metal4(&device)?;
+        let residency_attachment =
+            attach_device_set(&command_queue, &residency_set, attach, metal4);
         let cb = create_command_buffer(&command_queue, kind)?;
         Self::with_parts(
             command_queue,
@@ -883,6 +956,8 @@ impl Commands {
             residency_set,
             kind,
             None,
+            metal4,
+            residency_attachment,
         )
     }
 
@@ -900,6 +975,8 @@ impl Commands {
             &crate::memory_admission::ModelDomain,
             &crate::memory_admission::AllocationContext,
         )>,
+        metal4: bool,
+        residency_attachment: ResidencyAttachment,
     ) -> Result<Self, MetalKernelError> {
         // The listener is allocated with the event and only for the arm that
         // needs one (#583). Its lifetime is then the engine's, which is the
@@ -912,27 +989,10 @@ impl Commands {
             None
         };
 
-        let requested_api = crate::tuning::tuning().metal.command_api.as_str();
-        let supported = super::arms::for_device(&device).has(super::arms::Feature::Metal4);
-        let counters = super::profile::counters_enabled();
-        if requested_api == "metal4" && counters {
-            return Err(MetalKernelError::InvalidInput(
-                "Metal 4 encoder counter sampling is not implemented; select --metal-api metal3 (or auto) to retain counter profiling".into()));
-        }
-        let supported = supported && !counters;
-        if requested_api == "auto" && counters {
-            eprintln!("[metal] command_api=metal3 auto_fallback=encoder-counter-profiling");
-        }
-
-        let modern_queue = match requested_api {
-            "metal4" if !supported => {
-                return Err(MetalKernelError::InvalidInput(
-                    "Metal 4 is unavailable or disabled on this device; select metal3 or auto"
-                        .into(),
-                ))
-            }
-            "metal4" | "auto" if supported => Some(super::metal4::Queue::new(device.clone())?),
-            _ => None,
+        let modern_queue = if metal4 {
+            Some(super::metal4::Queue::new(device.clone())?)
+        } else {
+            None
         };
         let legacy_completions = if modern_queue.is_none() {
             Some(super::metal3_retirement::Completions::new()?)
@@ -1084,6 +1144,7 @@ impl Commands {
             failure,
             host_input,
             produced: produced::ProducedState::new(me.clone()),
+            residency_attachment,
             physical: crate::retirement_service::PhysicalAnchor::default(),
         });
         let core = lifecycle::register(core)?;
@@ -1232,6 +1293,12 @@ impl Commands {
     #[cfg(test)]
     pub(crate) fn lock_subscribers_for_test(&self) -> impl Drop + '_ {
         self.core.hook.lock_subscribers_for_test()
+    }
+
+    /// What this queue did with the device's residency set: the arm asked
+    /// for and whether the set is on the queue (`kernels.residency.attach`).
+    pub fn residency_attachment(&self) -> ResidencyAttachment {
+        self.core.residency_attachment
     }
 
     /// The native command API actually installed on this queue.

@@ -1,13 +1,24 @@
 //! The keep-warm's policy and its heartbeat's bound, on the real clock with
 //! a counting action: the heartbeat acts while the window lasts, stops when
 //! it runs out (no action past it), starts again on the next request, and
-//! never stops without a bound.
+//! never stops without a bound. And its memory-pressure stop, on an
+//! injected level: no action at warn or critical, one residency end per
+//! spell, resumed at normal.
 use super::*;
 use parking_lot::Mutex;
 use std::time::Instant;
 
 fn clock() -> u64 {
     super::super::uptime_ns()
+}
+
+fn normal() -> u8 {
+    1
+}
+
+/// An end that must not run: the level never rises.
+fn no_end() -> Act {
+    panic!("a residency end at normal pressure")
 }
 
 /// Waits up to 10 s for `cond`, so a loaded machine slows the test without
@@ -32,10 +43,14 @@ fn counting(
         Arc::clone(&activity),
         Duration::from_millis(period_ms),
         window_ms.map(Duration::from_millis),
-        clock,
-        move || {
-            s.lock().push(clock());
-            Act::Done
+        Beat {
+            clock,
+            pressure: normal,
+            act: move || {
+                s.lock().push(clock());
+                Act::Done
+            },
+            end: no_end,
         },
     )
     .unwrap();
@@ -142,10 +157,14 @@ fn a_busy_slot_takes_no_action_and_the_window_still_ends() {
         Arc::clone(&activity),
         Duration::from_millis(10),
         Some(Duration::from_millis(window)),
-        clock,
-        move || {
-            t.lock().push(clock());
-            Act::Busy
+        Beat {
+            clock,
+            pressure: normal,
+            act: move || {
+                t.lock().push(clock());
+                Act::Busy
+            },
+            end: no_end,
         },
     )
     .unwrap();
@@ -169,17 +188,25 @@ fn a_busy_slot_takes_no_action_and_the_window_still_ends() {
 /// spellings, the refusal at a batch and the CPU's off.
 #[test]
 fn the_policy_resolves_the_default_the_opt_out_and_the_refusal() {
-    let on = Policy::resolve(Some(1000), 180, "residency", 1, true).unwrap();
+    let on = Policy::resolve(Some(1000), 180, "residency", false, 1, true).unwrap();
     assert_eq!(
         on,
         Policy::On {
             period: Duration::from_millis(1000),
             window: Some(Duration::from_secs(180)),
-            by: By::Residency
+            by: By::Residency,
+            pressure: false,
         }
     );
     assert_eq!(on.short(), "1000ms/180s/residency");
     assert!(on.sentence().contains("for 180 s after the last request"));
+    assert!(on.sentence().contains("memory pressure not read"));
+    let stops = Policy::resolve(Some(1000), 180, "residency", true, 1, true).unwrap();
+    assert_eq!(stops.short(), "1000ms/180s/residency/pressure");
+    assert!(stops
+        .sentence()
+        .contains("stopped at memory pressure warn or critical"));
+    assert_eq!(stops.json(&Activity::new(0), 0)["pressure_stop"], true);
     let a = Activity::new(5 * MS);
     let j = on.json(&a, 7 * MS);
     assert_eq!(j["policy"], "on");
@@ -189,7 +216,7 @@ fn the_policy_resolves_the_default_the_opt_out_and_the_refusal() {
     assert_eq!(j["state"]["since_request_ms"], 2);
     assert_eq!(j["state"]["heartbeat"], "stopped");
 
-    let unbounded = Policy::resolve(Some(500), 0, "dispatch", 1, true).unwrap();
+    let unbounded = Policy::resolve(Some(500), 0, "dispatch", false, 1, true).unwrap();
     assert_eq!(unbounded.short(), "500ms/unbounded/dispatch");
     assert_eq!(unbounded.json(&a, 0)["for_s"], Value::Null);
 
@@ -198,29 +225,178 @@ fn the_policy_resolves_the_default_the_opt_out_and_the_refusal() {
         p => panic!("{p:?} is on"),
     };
     assert_eq!(
-        off(Policy::resolve(Some(0), 180, "residency", 1, true).unwrap()),
+        off(Policy::resolve(Some(0), 180, "residency", false, 1, true).unwrap()),
         "server.keep_warm = 0"
     );
     assert_eq!(
-        off(Policy::resolve(None, 180, "residency", 1, true).unwrap()),
+        off(Policy::resolve(None, 180, "residency", false, 1, true).unwrap()),
         "server.keep_warm unset"
     );
     assert_eq!(
-        off(Policy::resolve(None, 180, "residency", 4, true).unwrap()),
+        off(Policy::resolve(None, 180, "residency", false, 4, true).unwrap()),
         "not built at --batch 4"
     );
     assert_eq!(
-        off(Policy::resolve(Some(1000), 180, "residency", 1, false).unwrap()),
+        off(Policy::resolve(Some(1000), 180, "residency", false, 1, false).unwrap()),
         "the device is not a GPU"
     );
     assert_eq!(
-        Policy::resolve(Some(0), 180, "residency", 1, true)
+        Policy::resolve(Some(0), 180, "residency", false, 1, true)
             .unwrap()
             .short(),
         "off"
     );
-    let refused = Policy::resolve(Some(1000), 180, "residency", 4, true).unwrap_err();
+    let refused = Policy::resolve(Some(1000), 180, "residency", false, 4, true).unwrap_err();
     assert!(refused.contains("--batch 4"), "{refused}");
+}
+
+/// The level the pressure tests' heartbeats read. Each test owns its
+/// static: a `fn` seam carries no state.
+static WARN_LEVEL: AtomicU8 = AtomicU8::new(1);
+fn warn_level() -> u8 {
+    WARN_LEVEL.load(Ordering::Acquire)
+}
+
+/// A heartbeat on `level`, counting its actions and its ends, with the slot
+/// free (`ends_busy` false) or held for its ends.
+fn pressured(
+    level: fn() -> u8,
+    ends_busy: Arc<AtomicBool>,
+) -> (Arc<Activity>, Heartbeat, Arc<AtomicU64>, Arc<AtomicU64>) {
+    let activity = Arc::new(Activity::new(clock()));
+    let (acts, ends) = (Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)));
+    let (a, e) = (Arc::clone(&acts), Arc::clone(&ends));
+    let beat = Heartbeat::spawn(
+        Arc::clone(&activity),
+        Duration::from_millis(10),
+        None,
+        Beat {
+            clock,
+            pressure: level,
+            act: move || {
+                a.fetch_add(1, Ordering::Relaxed);
+                Act::Done
+            },
+            end: move || {
+                if ends_busy.load(Ordering::Acquire) {
+                    return Act::Busy;
+                }
+                e.fetch_add(1, Ordering::Relaxed);
+                Act::Done
+            },
+        },
+    )
+    .unwrap();
+    (activity, beat, acts, ends)
+}
+
+/// At warn the heartbeat takes no action and ends the residency once; a
+/// request in the spell makes it end again; at normal it acts again; each
+/// change is one transition, which `/health` names.
+#[test]
+fn memory_pressure_stops_the_heartbeat_ends_residency_once_and_normal_resumes_it() {
+    WARN_LEVEL.store(1, Ordering::Release);
+    let (a, beat, acts, ends) = pressured(warn_level, Arc::new(AtomicBool::new(false)));
+    wait_for("actions at normal", || acts.load(Ordering::Relaxed) >= 3);
+    assert_eq!(ends.load(Ordering::Relaxed), 0, "an end at normal");
+
+    WARN_LEVEL.store(2, Ordering::Release);
+    wait_for("the end at warn", || ends.load(Ordering::Relaxed) == 1);
+    let stopped = acts.load(Ordering::Relaxed);
+    std::thread::sleep(Duration::from_millis(150));
+    assert!(
+        acts.load(Ordering::Relaxed) <= stopped + 1,
+        "{} actions at warn",
+        acts.load(Ordering::Relaxed) - stopped
+    );
+    let at_warn = acts.load(Ordering::Relaxed);
+    std::thread::sleep(Duration::from_millis(150));
+    assert_eq!(acts.load(Ordering::Relaxed), at_warn, "an action at warn");
+    assert_eq!(ends.load(Ordering::Relaxed), 1, "one end per spell");
+    let j = Policy::On {
+        period: Duration::from_millis(10),
+        window: None,
+        by: By::Residency,
+        pressure: true,
+    }
+    .json(&a, clock());
+    assert_eq!(j["state"]["pressure"], "warn", "{j}");
+    assert_eq!(j["state"]["pressure_transition"]["from"], "normal", "{j}");
+    assert_eq!(j["state"]["pressure_transition"]["to"], "warn", "{j}");
+    assert_eq!(j["state"]["pressure_transitions"], 1, "{j}");
+    assert_eq!(j["state"]["residency_ends"], 1, "{j}");
+
+    // A request in the spell wired the set again: one more end, no action.
+    a.request_ended(clock());
+    wait_for("the end after a request", || {
+        ends.load(Ordering::Relaxed) == 2
+    });
+    assert_eq!(acts.load(Ordering::Relaxed), at_warn, "an action at warn");
+
+    // Critical is still a stop, and a change: no end without a request.
+    WARN_LEVEL.store(4, Ordering::Release);
+    wait_for("the change to critical", || {
+        a.transitions.load(Ordering::Relaxed) == 2
+    });
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(ends.load(Ordering::Relaxed), 2, "an end with no request");
+    assert_eq!(
+        acts.load(Ordering::Relaxed),
+        at_warn,
+        "an action at critical"
+    );
+
+    WARN_LEVEL.store(1, Ordering::Release);
+    wait_for("actions at normal again", || {
+        acts.load(Ordering::Relaxed) >= at_warn + 3
+    });
+    assert_eq!(a.transitions.load(Ordering::Relaxed), 3);
+    assert_eq!(a.ends.load(Ordering::Relaxed), 2);
+    beat.stop();
+}
+
+static BUSY_LEVEL: AtomicU8 = AtomicU8::new(2);
+fn busy_level() -> u8 {
+    BUSY_LEVEL.load(Ordering::Acquire)
+}
+
+/// A held slot defers the end: no end while a request holds it, the end on
+/// the first beat the slot is free, and still no action.
+#[test]
+fn under_pressure_a_busy_slot_defers_the_end_until_it_is_free() {
+    BUSY_LEVEL.store(2, Ordering::Release);
+    let busy = Arc::new(AtomicBool::new(true));
+    let (a, beat, acts, ends) = pressured(busy_level, Arc::clone(&busy));
+    wait_for("the change to warn", || {
+        a.transitions.load(Ordering::Relaxed) == 1
+    });
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(ends.load(Ordering::Relaxed), 0, "an end on a held slot");
+    busy.store(false, Ordering::Release);
+    wait_for("the deferred end", || ends.load(Ordering::Relaxed) == 1);
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(ends.load(Ordering::Relaxed), 1, "one end per spell");
+    assert_eq!(acts.load(Ordering::Relaxed), 0, "an action at warn");
+    beat.stop();
+}
+
+/// The level names, and an unreadable level does not stop the heartbeat.
+#[test]
+fn the_pressure_levels_are_the_kernels_and_unknown_does_not_stop() {
+    assert_eq!(Pressure::of(1), Pressure::Normal);
+    assert_eq!(Pressure::of(2), Pressure::Warn);
+    assert_eq!(Pressure::of(4), Pressure::Critical);
+    assert_eq!(Pressure::of(0), Pressure::Unknown);
+    assert_eq!(Pressure::of(3), Pressure::Unknown);
+    assert!(Pressure::Warn.elevated() && Pressure::Critical.elevated());
+    assert!(!Pressure::Normal.elevated() && !Pressure::Unknown.elevated());
+    // The real reading: a documented level on macOS, unreadable elsewhere.
+    let real = vm_pressure();
+    if cfg!(target_os = "macos") {
+        assert!(matches!(real, 1 | 2 | 4), "kern level {real}");
+    } else {
+        assert_eq!(real, 0);
+    }
 }
 
 /// `GET`/`POST` on loopback, `Connection: close`; the body as JSON.

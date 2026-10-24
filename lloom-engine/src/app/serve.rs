@@ -294,14 +294,19 @@ fn run_owner(
         options.server.keep_warm,
         options.server.keep_warm_for_s,
         &options.server.keep_warm_by,
+        options.server.keep_warm_pressure,
         engine.batch(),
         engine.device().is_metal(),
     )
     .map_err(|e| anyhow::anyhow!(e))?;
     let warm = keep_warm.short();
+    let residency = engine
+        .device()
+        .residency_line()
+        .unwrap_or_else(|| "residency=none".into());
     if let Some((load_start, reuse_prefix)) = load_facts {
         eprintln!(
-            "[loaded {} from {} in {:.2}s on {:?}; kv_capacity={} readback={} reuse_prefix={} keep_warm={warm} logprobs={logprobs} {}]",
+            "[loaded {} from {} in {:.2}s on {:?}; kv_capacity={} readback={} reuse_prefix={} keep_warm={warm} {residency} logprobs={logprobs} {}]",
             model_name,
             model_path.display(),
             load_start.elapsed().as_secs_f64(),
@@ -313,7 +318,7 @@ fn run_owner(
         );
     } else {
         eprintln!(
-            "[serving existing {} from {} on {:?}; kv_capacity={} readback={} reuse_prefix={} keep_warm={warm} logprobs={logprobs} {}]",
+            "[serving existing {} from {} on {:?}; kv_capacity={} readback={} reuse_prefix={} keep_warm={warm} {residency} logprobs={logprobs} {}]",
             model_name,
             model_path.display(),
             engine.device(),
@@ -511,7 +516,13 @@ fn run_owner(
 /// never runs beside a request nor goes ahead of a queued one.
 fn start_keep_warm(shared: &Arc<Shared>) -> Result<Option<keep_warm::Heartbeat>> {
     eprintln!("[keep-warm: {}]", shared.keep_warm.sentence());
-    let keep_warm::Policy::On { period, window, by } = shared.keep_warm.clone() else {
+    let keep_warm::Policy::On {
+        period,
+        window,
+        by,
+        pressure,
+    } = shared.keep_warm.clone()
+    else {
         return Ok(None);
     };
     let s = Arc::clone(shared);
@@ -530,7 +541,27 @@ fn start_keep_warm(shared: &Arc<Shared>) -> Result<Option<keep_warm::Heartbeat>>
             },
         }
     };
-    keep_warm::Heartbeat::spawn(Arc::clone(&shared.activity), period, window, uptime_ns, act)
+    // Under memory pressure, both arms: the slot is free, so no request's
+    // command buffer is waiting on the memory this gives back.
+    let s = Arc::clone(shared);
+    let end = move || {
+        let Some(_turn) = s.turns.try_take() else {
+            return keep_warm::Act::Busy;
+        };
+        s.engine.device().end_residency();
+        keep_warm::Act::Done
+    };
+    let work = keep_warm::Beat {
+        clock: uptime_ns,
+        pressure: if pressure {
+            keep_warm::vm_pressure
+        } else {
+            keep_warm::pressure_ignored
+        },
+        act,
+        end,
+    };
+    keep_warm::Heartbeat::spawn(Arc::clone(&shared.activity), period, window, work)
         .map(Some)
         .context("spawning the keep-warm thread")
 }

@@ -1595,7 +1595,12 @@ impl<'p, P: Lfm2Shape> ReplayArm<'p, P> {
                     .iter_mut()
                     .map(|cache| Row { pos, cache })
                     .collect();
-                let out = BatchedCausalLM::forward_rows(ctx.model, &input, &mut rows)?;
+                // The batch's own route: the scope the decoder's step opens
+                // (`kernels.gemm.f16_rows_decode`, `tuning::DecodeRows`).
+                let out = {
+                    let _step = lloom_tensor::tuning::DecodeRows::open();
+                    BatchedCausalLM::forward_rows(ctx.model, &input, &mut rows)
+                }?;
                 self.live = m;
                 let first = host_logits(ctx, &out.get(0)?)?;
                 let mut agree = true;

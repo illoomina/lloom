@@ -252,6 +252,22 @@ Speculative batching differs from the continuous K=1 scheduler. An off-token
 writer keeps socket I/O away from decode; transport cancellation is distinct
 from native completion and memory retirement.
 
+**Keep-warm.** macOS unwires the GPU's memory a few seconds after its last
+use, and the next request then waits while it is wired back. On Metal at
+`--batch 1`, `serve` asks for it to stay resident every second while it idles
+(`server.keep_warm`, default 1000 ms), for 180 s after the last request
+(`server.keep_warm_for_s`). Then the heartbeat stops, an idle server gives the
+memory back, and the next request starts it again. `--keep-warm 0` turns it
+off; `--keep-warm-for 0` removes the bound; `--keep-warm-by dispatch` runs one
+one-element dispatch instead, which keeps less of the memory wired. The loaded
+line says the resolved policy (`keep_warm=1000ms/180s/residency`, or
+`keep_warm=off`), a `[keep-warm: …]` line says it in words (and why, when
+off), and `/health` carries `keep_warm`: the policy, whether the heartbeat is
+running, its actions and how many windows ran out. Asking for it at
+`--batch N` is refused (not built: the batch thread owns the device); on a
+device that is not a GPU it is off. `lloom chat -p` and `lloom bench` run in a
+fresh process and do not idle between load and work.
+
 `--ctx-size`, `--prefill-tile`, batch width, KV precision, resident weights and
 streamed slots affect memory. Machine/backend admission is not a hard process
 quota or an OOM guarantee. Reduce context/batch/working set on refusal; do not

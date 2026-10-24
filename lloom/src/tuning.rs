@@ -238,6 +238,16 @@ pub struct Lfm2Tuning {
         invert
     )]
     pub skip_conv_c_fusion: bool,
+    /// The MLP's `silu(w1·x) · w3·x` as one elementwise launch (`silu_mul`, `silu_f16` then `bmul_f16` bit for bit) wherever the MLP's composed path runs the pair (not under `--gemv-gate mul` or the norm in the GEMVs, which keep it); off: the pair, the A/B arm. Stored as its negation.
+    #[opt(
+        flag = "skip-lfm2-silu-mul",
+        env = "LLOOM_LFM2_SKIP_SILU_MUL",
+        bool,
+        path = "kernels.fusion.silu_mul",
+        status = "arm",
+        invert
+    )]
+    pub skip_silu_mul: bool,
     /// The pool rows' kernels: `batched` (the batch in one dispatch per kernel) or `per-row` (the per-row loop, the A/B arm).
     #[opt(flag = "rows-arm", env = "LLOOM_148_ROWS_ARM", parser = "parse_rows_arm", variants = ["batched", "per-row"], path = "models.lfm2.rows_kernels", status = "arm")]
     pub rows_arm: String,
@@ -264,7 +274,7 @@ pub struct Lfm2Tuning {
     /// The weakest numerical class `kernels.fusion.policy = derived` may land in: `rounding` (the epilogues) or `reorder` (also the norm inside its consumers' GEMVs, whose sum of squares takes another tree). An arm.
     #[opt(flag = "lfm2-fusion-budget", env = "LLOOM_LFM2_FUSION_BUDGET", parser = "parse_fusion_budget", variants = ["rounding", "reorder"], path = "kernels.fusion.budget", status = "arm")]
     pub fusion_budget: String,
-    /// Skip these decode-step dispatches — `norm` (the layers' two RMSNorms) — to price what removing them would buy: a timing bound, the output is WRONG. An instrument.
+    /// Skip these dispatches — `norm` (the layers' two RMSNorms at a decode step); at a prefill pass `prefill-norm`, `prefill-silu` (the MLP's SiLU), `prefill-mul` (the SwiGLU product), `prefill-add` (the two residual adds) — to price what removing them would buy: a timing bound, the output is WRONG. An instrument.
     #[opt(
         flag = "lfm2-ablate",
         env = "LLOOM_LFM2_ABLATE",
@@ -325,6 +335,7 @@ impl Default for Lfm2Tuning {
     fn default() -> Self {
         Lfm2Tuning {
             skip_conv_c_fusion: false,
+            skip_silu_mul: false,
             rows_arm: "batched".into(),
             flash_partial_bn: 32,
             sdpa_two_pass_k: crate::nn::ops::SDPA_TWO_PASS_K_THRESHOLD,

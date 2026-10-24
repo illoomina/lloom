@@ -37,6 +37,7 @@ const MOVED_ELSEWHERE: &[(&str, &str, &str, &str)] = &[(
 const PRE_TREE: &str = "the front-end's own value before the option tree";
 const TUNED_FLOW: &str = "the tuned decode flow as chat's and serve's default (a08b86f5d, #859)";
 const DSPARK_SINGLE: &str = "the tuned flow's paged KV for the speculative body at one sequence (a08b86f5d, #859), which decision 52 (#1068) moves back to its preset's in-place KV";
+const KEEP_WARM: &str = "the maintainer's choice on PR1087 (#1076, 2026-10-23): serve keeps the GPU's memory wired while idle, bounded by server.keep_warm_for_s, as llama.cpp's heartbeat is";
 const CHAT_SERVE: &[Frontend] = &[Frontend::Chat, Frontend::Serve];
 
 /// Every row of the front-end table by value: key, front-ends, condition,
@@ -227,6 +228,13 @@ const PINNED_ROWS: &[(&str, &[Frontend], When, &str, &str)] = &[
         "true",
         TUNED_FLOW,
     ),
+    (
+        "server.keep_warm",
+        &[Frontend::Serve],
+        When::MetalSingle,
+        "1000",
+        KEEP_WARM,
+    ),
 ];
 
 type Front<'a> = Box<dyn Fn(&mut EngineOptions) -> Result<(), String> + 'a>;
@@ -298,7 +306,7 @@ fn batch_for(r: &frontend::Row) -> Vec<&'static str> {
     match r.when {
         When::Batched => vec!["--batch", "4"],
         // No `--model`: the LFM2 snapshot, whose family takes the model axes.
-        When::Always | When::Metal | When::ModelAxes => vec![],
+        When::Always | When::Metal | When::ModelAxes | When::MetalSingle => vec![],
         When::DsparkSingle => vec!["--dspark"],
     }
 }
@@ -352,7 +360,10 @@ fn each_front_end_resolves_its_own_defaults_through_the_command_line() {
             let o = resolve(Some(f), f.name(), argv, &none).unwrap();
             for r in ROWS.iter().filter(|r| {
                 r.frontend == f
-                    && matches!(r.when, When::Metal | When::ModelAxes | When::DsparkSingle)
+                    && matches!(
+                        r.when,
+                        When::Metal | When::ModelAxes | When::DsparkSingle | When::MetalSingle
+                    )
             }) {
                 assert!(
                     !r.when.holds(&o),
@@ -1216,4 +1227,72 @@ fn the_help_and_the_schema_say_each_front_ends_default() {
     assert!(node("decode.in_flight_forwards")
         .get("x-lloom-frontend-defaults")
         .is_none());
+}
+
+/// Serve keeps the GPU warm by default where its row holds — on Metal at one
+/// sequence — for 180 s after the last request; at a batch, on the CPU and
+/// on the other front-ends the key stays unset (off). `0` by any spelling,
+/// the subcommand's flag included, is the opt-out and holds, as do a period
+/// and a bound given; `none` is serve's own.
+#[test]
+fn serve_keeps_warm_by_default_on_metal_at_one_sequence() {
+    let none = BTreeMap::new();
+    let serve = |argv: &[&str]| resolve(Some(Frontend::Serve), "serve", argv, &none).unwrap();
+    let on = When::MetalSingle.holds(&serve(&[]));
+    assert_eq!(on, When::Metal.holds(&serve(&[])), "batch 1 by default");
+    let o = serve(&[]);
+    assert_eq!(o.server.keep_warm, on.then_some(1000), "serve's default");
+    assert_eq!(o.server.keep_warm_for_s, 180, "the bound's default");
+    assert_eq!(o.server.keep_warm_by, "residency");
+    assert_eq!(
+        serve(&["--batch", "4"]).server.keep_warm,
+        None,
+        "at a batch"
+    );
+    assert_eq!(
+        serve(&["--set", "scheduler.max_sequences=2"])
+            .server
+            .keep_warm,
+        None,
+        "at a batch, by key"
+    );
+    assert_eq!(serve(&["--cpu"]).server.keep_warm, None, "on the CPU");
+    assert_eq!(
+        serve(&["--set", "server.keep_warm=none"]).server.keep_warm,
+        on.then_some(1000),
+        "`none` is serve's own"
+    );
+    for argv in [
+        &["--keep-warm", "0"][..],
+        &["--set", "server.keep_warm=0"],
+        &["--server-config", r#"{"keep_warm": 0}"#],
+    ] {
+        assert_eq!(
+            serve(argv).server.keep_warm,
+            Some(0),
+            "the opt-out {argv:?}"
+        );
+    }
+    let env = BTreeMap::from([(index().keys["server.keep_warm"].env(), "0".to_string())]);
+    assert_eq!(
+        resolve(Some(Frontend::Serve), "serve", &[], &env)
+            .unwrap()
+            .server
+            .keep_warm,
+        Some(0),
+        "the opt-out by env"
+    );
+    let o = serve(&["--keep-warm", "500", "--keep-warm-for", "0"]);
+    assert_eq!(
+        (o.server.keep_warm, o.server.keep_warm_for_s),
+        (Some(500), 0)
+    );
+    for f in [Frontend::Chat, Frontend::Bench] {
+        let o = resolve(Some(f), f.name(), &[], &none).unwrap();
+        assert_eq!(o.server.keep_warm, None, "{}", f.name());
+    }
+    assert_eq!(
+        frontend::describe("server.keep_warm").unwrap(),
+        "serve: 1000 when on Metal at scheduler.max_sequences = 1"
+    );
 }

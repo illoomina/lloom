@@ -78,6 +78,10 @@ pub enum When {
     /// copy of the cache gathered out of the pool (`speculation.md`
     /// §10.2z-x).
     DsparkSingle,
+    /// [`When::Metal`] at one sequence (`scheduler.max_sequences = 1`): the
+    /// serve keep-warm takes the single-sequence request slot, which a
+    /// batched server does not have.
+    MetalSingle,
 }
 
 impl When {
@@ -105,6 +109,7 @@ impl When {
                     && o.scheduler.max_sequences == 1
                     && matches!(o.model.cache.as_str(), "auto" | "rewindable")
             }
+            When::MetalSingle => When::Metal.holds(o) && o.scheduler.max_sequences == 1,
         }
     }
 
@@ -117,6 +122,7 @@ impl When {
             When::DsparkSingle => {
                 "speculative.method = dspark at scheduler.max_sequences = 1 on the auto or rewindable preset (LFM2, on Metal)"
             }
+            When::MetalSingle => "on Metal at scheduler.max_sequences = 1",
         }
     }
 }
@@ -235,6 +241,16 @@ rows! {
         frontend: Frontend::Bench,
         when: When::Batched,
         before: "512",
+    },
+    // Serve keeps the GPU's memory wired while it idles, every second
+    // (under the 2–3 s after which the OS unwires an idle residency set),
+    // for `server.keep_warm_for_s` after the last request
+    // (`machine-model.md` §3.4d).
+    Row {
+        key: "server.keep_warm",
+        frontend: Frontend::Serve,
+        when: When::MetalSingle,
+        before: "1000",
     },
 }
 

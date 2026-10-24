@@ -64,6 +64,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
+mod keep_warm;
 mod reasoning;
 mod turns;
 
@@ -148,6 +149,10 @@ struct Shared {
     reuse: parking_lot::Mutex<crate::turn::Tally>,
     /// The sessions chat completions' ids name (`docs/sessions.md`).
     sessions: parking_lot::Mutex<super::sessions::Table>,
+    /// The requests' ends and the keep-warm's actions (`server.keep_warm`).
+    activity: Arc<keep_warm::Activity>,
+    /// The keep-warm this server runs.
+    keep_warm: keep_warm::Policy,
 }
 
 /// The largest `/v1/systemone` body a decision-only owner reads: eight
@@ -230,7 +235,8 @@ fn run_configured(args: ServeArgs, transport: Option<tiny_http::TransportPolicy>
 /// admission domain. The caller creates its device, configures the same process
 /// account, and completes the genuine load before entering this frontend.
 ///
-/// Only `options.server.host`, `options.server.port`, `options.sampling` and
+/// Only `options.server.host`, `options.server.port`, `options.server.keep_warm`
+/// (and `keep_warm_for_s`, `keep_warm_by`), `options.sampling` and
 /// `options.session` (the request front end's) are honored; the remaining
 /// options do not reconfigure this owner. Shape, decode,
 /// cache, seed, prefix reuse, batch and memory policy are the already-loaded
@@ -284,9 +290,18 @@ fn run_owner(
         .map_err(|e| anyhow::anyhow!("the checkpoint's generation_config.json: {e}"))?;
     let description = engine.describe_checked()?;
     let logprobs = logprobs_line(engine.as_ref());
+    let keep_warm = keep_warm::Policy::resolve(
+        options.server.keep_warm,
+        options.server.keep_warm_for_s,
+        &options.server.keep_warm_by,
+        engine.batch(),
+        engine.device().is_metal(),
+    )
+    .map_err(|e| anyhow::anyhow!(e))?;
+    let warm = keep_warm.short();
     if let Some((load_start, reuse_prefix)) = load_facts {
         eprintln!(
-            "[loaded {} from {} in {:.2}s on {:?}; kv_capacity={} readback={} reuse_prefix={} logprobs={logprobs} {}]",
+            "[loaded {} from {} in {:.2}s on {:?}; kv_capacity={} readback={} reuse_prefix={} keep_warm={warm} logprobs={logprobs} {}]",
             model_name,
             model_path.display(),
             load_start.elapsed().as_secs_f64(),
@@ -298,7 +313,7 @@ fn run_owner(
         );
     } else {
         eprintln!(
-            "[serving existing {} from {} on {:?}; kv_capacity={} readback={} reuse_prefix={} logprobs={logprobs} {}]",
+            "[serving existing {} from {} on {:?}; kv_capacity={} readback={} reuse_prefix={} keep_warm={warm} logprobs={logprobs} {}]",
             model_name,
             model_path.display(),
             engine.device(),
@@ -375,7 +390,10 @@ fn run_owner(
             &options.server.sessions,
             batch,
         ))),
+        activity: Arc::new(keep_warm::Activity::new(uptime_ns())),
+        keep_warm,
     });
+    let heartbeat = start_keep_warm(&shared)?;
 
     // The ready marker the sidecar runner waits for, on stdout and nothing
     // else on stdout before it. Everything the operator reads goes to stderr.
@@ -399,6 +417,8 @@ fn run_owner(
                     b["reuse"] = shared.reuse.lock().json(shared.engine.reuse_prefix());
                     b["sampling"] = sampling_json(&shared.sampling);
                     b["sessions"] = shared.sessions.lock().json();
+                    b["keep_warm"] = shared.keep_warm.json(&shared.activity, uptime_ns());
+                    b["keep_warm_actions"] = json!(shared.activity.actions.load(Ordering::Relaxed));
                     b
                 });
                 let _ = respond_metadata(request, result);
@@ -448,15 +468,24 @@ fn run_owner(
             }
             (Method::Post, _) => {
                 let shared = Arc::clone(&shared);
+                let recv = uptime_ns();
+                let idle = recv.saturating_sub(shared.activity.last_active.load(Ordering::Acquire));
                 std::thread::spawn(move || {
                     let path = path;
                     let started = Instant::now();
-                    match handle_model_request(&shared, &path, request) {
-                        Ok(()) => {}
-                        Err(e) => eprintln!(
+                    let first = FirstToken {
+                        recv,
+                        handler: uptime_ns(),
+                        idle,
+                        ..FirstToken::default()
+                    };
+                    let answered = handle_model_request(&shared, &path, request, first);
+                    shared.activity.request_ended(uptime_ns());
+                    if let Err(e) = answered {
+                        eprintln!(
                             "[{path} failed after {:.1} ms: {e:#}]",
                             ms(started.elapsed())
-                        ),
+                        );
                     }
                 });
             }
@@ -469,9 +498,49 @@ fn run_owner(
     // are cut. A request thread still decoding holds the sequence, and the
     // batch thread holds the pool; wait for both so the model is not dropped
     // under a running command buffer.
+    if let Some(h) = heartbeat {
+        h.stop();
+    }
     shutdown_http(&shared.server);
     shared.engine.shutdown();
     Ok(())
+}
+
+/// Starts `shared.keep_warm`'s heartbeat, if it is on. Each action takes the
+/// single-sequence slot only when it is free and nobody waits for it, so it
+/// never runs beside a request nor goes ahead of a queued one.
+fn start_keep_warm(shared: &Arc<Shared>) -> Result<Option<keep_warm::Heartbeat>> {
+    eprintln!("[keep-warm: {}]", shared.keep_warm.sentence());
+    let keep_warm::Policy::On { period, window, by } = shared.keep_warm.clone() else {
+        return Ok(None);
+    };
+    let s = Arc::clone(shared);
+    let act = move || {
+        let Some(_turn) = s.turns.try_take() else {
+            return keep_warm::Act::Busy;
+        };
+        match by {
+            keep_warm::By::Residency => {
+                s.engine.device().request_residency();
+                keep_warm::Act::Done
+            }
+            keep_warm::By::Dispatch => match warm_dispatch(s.engine.device()) {
+                Ok(()) => keep_warm::Act::Done,
+                Err(e) => keep_warm::Act::Failed(e.to_string()),
+            },
+        }
+    };
+    keep_warm::Heartbeat::spawn(Arc::clone(&shared.activity), period, window, uptime_ns, act)
+        .map(Some)
+        .context("spawning the keep-warm thread")
+}
+
+/// The keep-warm's work: one dispatch over one element, committed and
+/// waited for.
+fn warm_dispatch(device: &lloom_tensor::Device) -> lloom_tensor::Result<()> {
+    let x = lloom_tensor::Tensor::zeros(1, lloom_tensor::DType::F32, device)?;
+    let _y = x.affine(1.0, 1.0)?;
+    device.synchronize()
 }
 
 /// Serve a decision-only owner using the SAME ordered dispatcher/status mapper.
@@ -610,12 +679,18 @@ fn run_decisions_configured(
 
 // ---- routing ---------------------------------------------------------------
 
-fn handle_model_request(shared: &Shared, path: &str, mut request: Request) -> Result<()> {
+fn handle_model_request(
+    shared: &Shared,
+    path: &str,
+    mut request: Request,
+    mut first: FirstToken,
+) -> Result<()> {
     let mut body = String::new();
     request
         .as_reader()
         .read_to_string(&mut body)
         .context("reading the request body")?;
+    first.body = uptime_ns();
     // This branch consumes the original bytes exactly once. Parsing through
     // Value first would reorder question/options/legend objects.
     // Decisions that wait together are answered as one group; under `fast`
@@ -635,6 +710,9 @@ fn handle_model_request(shared: &Shared, path: &str, mut request: Request) -> Re
     // A single-sequence engine's model requests take the request slot one at
     // a time; a batched engine schedules its own rows.
     let _turn = (path != "/tokenize" && shared.engine.batch() <= 1).then(|| shared.turns.take());
+    if _turn.is_some() {
+        first.slot = uptime_ns();
+    }
     let value: Value = if body.trim().is_empty() {
         json!({})
     } else {
@@ -646,6 +724,7 @@ fn handle_model_request(shared: &Shared, path: &str, mut request: Request) -> Re
             }
         }
     };
+    first.json = uptime_ns();
     // Every other route that runs the engine leaves its sequence holding no
     // session's state.
     if !matches!(path, "/tokenize" | "/v1/chat/completions") {
@@ -662,9 +741,13 @@ fn handle_model_request(shared: &Shared, path: &str, mut request: Request) -> Re
         "/eval" => Ok(Reply::Eval(value)),
         _ => Err(Failure::NotFound(format!("unknown endpoint: {path}"))),
     };
+    first.built = uptime_ns();
     match result {
         Ok(Reply::Json(v)) => respond_json(request, 200, &v),
-        Ok(Reply::Stream(stream)) => stream_response(shared, request, *stream),
+        Ok(Reply::Stream(mut stream)) => {
+            stream.first = first;
+            stream_response(shared, request, *stream)
+        }
         Ok(Reply::Eval(v)) => eval(shared, request, &v),
         Err(Failure::BadRequest(m)) => respond_error(request, 400, &m),
         Err(Failure::NotFound(m)) => respond_error(request, 404, &m),
@@ -745,6 +828,168 @@ struct StreamingRun {
     reasoning_in_content: bool,
     /// The session turn the reply leaves (`docs/sessions.md` §3).
     session: Option<Box<SessionCtx>>,
+    /// The request's stamps so far; the stream adds the rest.
+    first: FirstToken,
+}
+
+/// Where a streamed request's first token went: stamps in the clock a
+/// command buffer's `GPUStartTime` is in (`uptime_ns`), from the accept to
+/// the first text chunk the writer put on the socket. One clock read a
+/// stage, a request's and never a token's (`docs/invariants.md` §15.2 #10).
+#[derive(Clone, Copy, Debug, Default)]
+struct FirstToken {
+    /// `Server::recv` returned the request (the accept loop).
+    recv: u64,
+    /// The request's thread started.
+    handler: u64,
+    /// The body was read.
+    body: u64,
+    /// The single-sequence request slot was taken (0 when not taken).
+    slot: u64,
+    /// The body was parsed as JSON.
+    json: u64,
+    /// The route built the prompt: template, tokenization, budgets.
+    built: u64,
+    /// The response headers were flushed.
+    headers: u64,
+    /// The decode was entered.
+    decode: u64,
+    /// The first text fragment reached the stream writer's buffer.
+    fragment: u64,
+    /// The writer thread finished writing the first text chunk.
+    written: u64,
+    /// How long the GPU had had nothing from this server when the request
+    /// arrived (`keep_warm::Activity::last_active`), nanoseconds.
+    idle: u64,
+}
+
+/// Now, in nanoseconds of `CLOCK_UPTIME_RAW` (`docs/machine-model.md`
+/// §3.4b's domain A: `Instant`, `GPUStartTime`, a client's
+/// `clock_gettime_ns(CLOCK_UPTIME_RAW)`), or the monotonic clock elsewhere.
+fn uptime_ns() -> u64 {
+    #[cfg(target_vendor = "apple")]
+    {
+        let mut ts = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // SAFETY: `ts` is a valid, writable `timespec`; `CLOCK_UPTIME_RAW` is a
+        // clock id Darwin accepts, so the call cannot fail.
+        unsafe {
+            libc::clock_gettime(libc::CLOCK_UPTIME_RAW, &mut ts);
+        }
+        ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    {
+        static BASE: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+        BASE.get_or_init(Instant::now).elapsed().as_nanos() as u64
+    }
+}
+
+impl FirstToken {
+    /// Each stage's offset from `recv`, in microseconds; a stage that did not
+    /// happen reads `-`.
+    fn stages(&self) -> [(&'static str, Option<f64>); 9] {
+        let at =
+            |t: u64| (t != 0 && self.recv != 0).then(|| t.saturating_sub(self.recv) as f64 / 1e3);
+        [
+            ("handler", at(self.handler)),
+            ("body", at(self.body)),
+            ("slot", at(self.slot)),
+            ("json", at(self.json)),
+            ("built", at(self.built)),
+            ("headers", at(self.headers)),
+            ("decode", at(self.decode)),
+            ("fragment", at(self.fragment)),
+            ("written", at(self.written)),
+        ]
+    }
+
+    /// The request line's fields: `first_token_us=handler:…,…,written:…` and
+    /// the GPU's idle time before the request, `idle_ms=…`.
+    fn field(&self) -> String {
+        let parts: Vec<String> = self
+            .stages()
+            .iter()
+            .map(|(k, v)| match v {
+                Some(us) => format!("{k}:{us:.0}"),
+                None => format!("{k}:-"),
+            })
+            .collect();
+        format!(
+            "first_token_us={} idle_ms={:.0}",
+            parts.join(","),
+            self.idle as f64 / 1e6
+        )
+    }
+
+    /// The trailer's object: the stages and the absolute `recv`, so a client
+    /// on the same clock can place its own send and receive beside them.
+    fn json(&self, st: &lloom::nn::DecodeStats) -> Value {
+        let mut m = Map::new();
+        m.insert("recv_ns".into(), json!(self.recv));
+        m.insert("idle_ms".into(), json!(self.idle as f64 / 1e6));
+        for (k, v) in self.stages() {
+            m.insert(format!("{k}_us"), json!(v));
+        }
+        m.insert(
+            "prefill_submit_us".into(),
+            json!(st.prefill_ns as f64 / 1e3),
+        );
+        m.insert(
+            "step0_submit_us".into(),
+            json!(st.ttft_compute_ns as f64 / 1e3),
+        );
+        Value::Object(m)
+    }
+}
+
+/// Under the profile build's recorder (`diagnostics.gpu_profile.enabled`):
+/// the command buffers committed between the decode's entry and the first
+/// fragment, on the stamps' clock — when the GPU started, how much of the
+/// window it was busy, and what it sat idle.
+#[cfg(feature = "metal")]
+fn first_token_gpu(endpoint: &str, first: &FirstToken) {
+    use lloom_tensor::kernels::metal::profile;
+    if !profile::recorder_enabled() || first.decode == 0 || first.fragment == 0 {
+        return;
+    }
+    let (from, to) = (first.decode as f64 * 1e-9, first.fragment as f64 * 1e-9);
+    let mut cbs: Vec<profile::GpuInterval> = Vec::new();
+    let mut commit0 = f64::INFINITY;
+    for r in profile::command_buffer_records() {
+        if r.committed >= from && r.interval.start <= to {
+            commit0 = commit0.min(r.committed);
+            cbs.push(r.interval);
+        }
+    }
+    let Some(start0) = cbs.iter().map(|i| i.start).min_by(f64::total_cmp) else {
+        eprintln!("[first-token gpu: {endpoint} buffers=0]");
+        return;
+    };
+    cbs.sort_by(|a, b| a.start.total_cmp(&b.start));
+    let (mut busy, mut reach) = (0.0f64, start0);
+    for i in &cbs {
+        let (s, e) = (i.start.max(reach), i.end.min(to));
+        if e > s {
+            busy += e - s;
+        }
+        reach = reach.max(i.end.min(to));
+    }
+    let last_end = cbs.iter().map(|i| i.end).fold(f64::MIN, f64::max);
+    let rel = |t: f64| (t - first.recv as f64 * 1e-9) * 1e6;
+    eprintln!(
+        "[first-token gpu: {endpoint} buffers={} first_commit_us={:.0} first_start_us={:.0} \
+         busy_us={:.0} idle_us={:.0} last_end_us={:.0} fragment_us={:.0}]",
+        cbs.len(),
+        rel(commit0),
+        rel(start0),
+        busy * 1e6,
+        (to - start0 - busy).max(0.0) * 1e6,
+        rel(last_end),
+        rel(to),
+    );
 }
 
 /// One decode of `prompt_ids`, through the image path when the request
@@ -957,6 +1202,7 @@ fn completions(shared: &Shared, v: &Value, _headers: &[Header]) -> Handled<Reply
             // `/v1/completions` is not a chat route: its text is the reply.
             reasoning_in_content: true,
             session: None,
+            first: FirstToken::default(),
         })));
     }
     let started = Instant::now();
@@ -1505,6 +1751,7 @@ fn chat_completions(shared: &Shared, v: &Value, auth: Option<[u8; 32]>) -> Handl
             return_ids,
             reasoning_in_content,
             session,
+            first: FirstToken::default(),
         })));
     }
     let split =
@@ -2406,7 +2653,9 @@ fn stream_response_with_writer(
             (format!("data: {chunk}\n\n"), resolved)
         }
     };
+    let mut first = run.first;
     let writer = start_writer()?;
+    first.headers = uptime_ns();
     let sw = if split.is_some() {
         StreamWriter::start_with_counted_deltas(writer, wrap)
     } else {
@@ -2420,8 +2669,10 @@ fn stream_response_with_writer(
         }));
     }
     let started = Instant::now();
+    first.decode = uptime_ns();
     let decoded = {
         let engine = shared.engine.as_ref();
+        let fragment = &mut first.fragment;
         // The callback runs on the decode thread: it hands the text over;
         // the chunk is built and written on the writer thread. A client that
         // went away stops the run at the next drained batch.
@@ -2435,13 +2686,18 @@ fn stream_response_with_writer(
                 if sw.client_gone() {
                     return false;
                 }
+                if *fragment == 0 {
+                    *fragment = uptime_ns();
+                }
                 sw.delta(frag);
                 true
             },
         )
     };
     let written = sw.written();
+    let first_write = sw.first_write();
     let (mut w, mut write_err) = sw.finish()?;
+    first.written = first_write.load(Ordering::Acquire);
     let decoded = match decoded {
         Ok(decoded) => decoded,
         Err(error) => {
@@ -2510,6 +2766,11 @@ fn stream_response_with_writer(
         anyhow::bail!("client went away mid-stream: {e}; frontier {frontier_json}");
     }
     let elapsed = started.elapsed();
+    let session_line = if session_line.is_empty() {
+        first.field()
+    } else {
+        format!("{session_line} {}", first.field())
+    };
     report_with(
         shared,
         endpoint,
@@ -2519,6 +2780,8 @@ fn stream_response_with_writer(
         ms(elapsed),
         &session_line,
     );
+    #[cfg(feature = "metal")]
+    first_token_gpu(endpoint, &first);
     let usage = run_usage(shared.engine.as_ref(), run.prompt_ids.len(), &decoded);
     let last = match run.kind {
         StreamKind::Completion => json!({
@@ -2541,6 +2804,7 @@ fn stream_response_with_writer(
         last["timings"]["session"] = session_json;
     }
     last["timings"]["front_record_us"] = json!(record_us);
+    last["timings"]["first_token"] = first.json(&decoded.stats);
     if run.return_ids {
         last["prompt_token_ids"] = json!(run.prompt_ids);
         last["choices"][0]["token_ids"] = json!(decoded.tokens);
@@ -3192,7 +3456,9 @@ impl ChunkedWriter {
 /// **The per-token text does not go through the channel** when the writer
 /// is started with [`Self::start_with_deltas`]: a `send` to the parked writer
 /// is a wake — a syscall — per fragment, and the payload a `format!` and a
-/// `json!` built on the decode thread. The decode thread appends the bare
+/// `json!` built on the decode thread. Only the run's first fragment wakes
+/// the writer (an empty payload), so the first token is not held for a
+/// drain period. The decode thread appends the bare
 /// text to a [`DeltaBuffer`] instead (`sink.rs`: no wait, no syscall, no
 /// allocation once grown), and this thread takes what accumulated every
 /// [`DRAIN_PERIOD`] and wraps it in one event — a delta of several tokens,
@@ -3205,6 +3471,9 @@ struct StreamWriter {
     /// deliberately consumed complete markers still count as raw text.
     /// Never a claim about what a client received or JSON/wire byte length.
     written: Arc<AtomicUsize>,
+    /// When the first event carrying text finished writing (`uptime_ns`, 0
+    /// until then).
+    first_write: Arc<AtomicU64>,
     thread: Option<std::thread::JoinHandle<(ChunkedWriter, Option<std::io::Error>)>>,
     deltas: Option<Arc<DeltaBuffer>>,
     /// The deltas' wire wrapping, shared with the thread: [`Self::send`]
@@ -3215,6 +3484,9 @@ struct StreamWriter {
     order: Arc<parking_lot::Mutex<()>>,
     /// The producer's spill (`DeltaBuffer::push`); only the producer locks it.
     spill: parking_lot::Mutex<String>,
+    /// Set by the first delta, which wakes the writer rather than waiting
+    /// for its next drain: one wake a request, none a token.
+    woke: AtomicBool,
 }
 
 type Wrap = Arc<dyn Fn(&str) -> (String, usize) + Send + Sync>;
@@ -3250,6 +3522,8 @@ impl StreamWriter {
         let flag = Arc::clone(&gone);
         let written = Arc::new(AtomicUsize::new(0));
         let wrote = Arc::clone(&written);
+        let first_write = Arc::new(AtomicU64::new(0));
+        let first_wrote = Arc::clone(&first_write);
         let deltas = wrap.as_ref().map(|_| DeltaBuffer::new());
         let buf = deltas.clone();
         let thread_wrap = wrap.clone();
@@ -3268,6 +3542,9 @@ impl StreamWriter {
                 match w.raw(payload) {
                     Ok(()) => {
                         wrote.fetch_add(text, Ordering::Relaxed);
+                        if text > 0 && first_wrote.load(Ordering::Relaxed) == 0 {
+                            first_wrote.store(uptime_ns(), Ordering::Release);
+                        }
                     }
                     Err(e) => {
                         flag.store(true, Ordering::Release);
@@ -3283,6 +3560,17 @@ impl StreamWriter {
                         .map_err(|_| std::sync::mpsc::RecvTimeoutError::Disconnected)
                 };
                 let (work, closed) = match next {
+                    // An empty payload is the first delta's wake: take what
+                    // accumulated now, as a drain would.
+                    Ok((payload, _)) if payload.is_empty() && buf.is_some() => {
+                        Self::pending_after_timeout(
+                            &rx,
+                            buf.as_ref(),
+                            thread_wrap.as_ref(),
+                            &thread_order,
+                            &mut local,
+                        )
+                    }
                     Ok(work) => (Some(work), false),
                     Err(_) => Self::pending_after_timeout(
                         &rx,
@@ -3307,11 +3595,13 @@ impl StreamWriter {
             tx: Some(tx),
             gone,
             written,
+            first_write,
             thread: Some(thread),
             deltas,
             wrap,
             order,
             spill: parking_lot::Mutex::new(String::new()),
+            woke: AtomicBool::new(false),
         }
     }
 
@@ -3340,10 +3630,17 @@ impl StreamWriter {
     }
 
     /// Hand text to the writer (the decode thread's per-fragment call on a
-    /// writer started with deltas): no wait, no syscall, no allocation.
+    /// writer started with deltas): no wait, no allocation, and no syscall
+    /// but the first fragment's, which wakes the writer so the first token
+    /// does not wait for a drain period.
     fn delta(&self, text: &str) {
         if let Some(b) = &self.deltas {
             b.push(&mut self.spill.lock(), text);
+            if !self.woke.swap(true, Ordering::Relaxed) {
+                if let Some(tx) = &self.tx {
+                    let _ = tx.send((String::new(), 0));
+                }
+            }
         }
     }
 
@@ -3384,6 +3681,11 @@ impl StreamWriter {
     /// same counter only after its own successful write.
     fn written(&self) -> Arc<AtomicUsize> {
         Arc::clone(&self.written)
+    }
+
+    /// When the first event carrying text was written ([`FirstToken::written`]).
+    fn first_write(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.first_write)
     }
 
     /// The client stopped reading: a write failed on the writer thread.
@@ -4044,6 +4346,10 @@ pub fn bench(args: BenchArgs) -> Result<()> {
             &options.server.sessions,
             1,
         ))),
+        activity: Arc::new(keep_warm::Activity::new(uptime_ns())),
+        keep_warm: keep_warm::Policy::Off {
+            why: "the benchmark cells".into(),
+        },
     };
     let batch = options.scheduler.max_sequences.max(1);
     for run in 0..options.bench.runs.max(1) {
@@ -4613,6 +4919,100 @@ mod stream_writer_tests {
         assert_eq!(body, "ctl<ab>mid<c>", "{out:?}");
     }
 
+    /// The first fragment's wake is not an event: the writer takes what
+    /// accumulated and writes no chunk of its own (an empty chunk would end
+    /// the chunked body), and everything handed over arrives in order.
+    #[test]
+    fn the_first_fragments_wake_writes_no_chunk_of_its_own() {
+        let mem = Mem::default();
+        let w = ChunkedWriter {
+            w: Box::new(mem.clone()),
+        };
+        let sw = StreamWriter::start_with_deltas(w, |t: &str| format!("<{t}>"));
+        sw.delta("a");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !String::from_utf8_lossy(&mem.0.lock().unwrap()).contains("<a>") {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the first fragment was never written"
+            );
+            std::thread::sleep(std::time::Duration::from_micros(200));
+        }
+        sw.delta("b");
+        let (_w, err) = sw.finish().unwrap();
+        assert!(err.is_none());
+        let out = String::from_utf8(mem.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            !out.starts_with("0\r\n") && !out.contains("\r\n0\r\n"),
+            "an empty chunk: {out:?}"
+        );
+        let body: String = out
+            .split("\r\n")
+            .enumerate()
+            .filter(|(i, _)| i % 2 == 1)
+            .map(|(_, s)| s)
+            .collect();
+        assert_eq!(body, "<a><b>", "{out:?}");
+    }
+
+    /// The first-write stamp belongs to the first event that carries text: a
+    /// control event (the chat route's role chunk) leaves it unset, and the
+    /// text written after it sets it no earlier than the text was handed over.
+    #[test]
+    fn the_first_write_stamp_is_the_first_text_event() {
+        let control_only = {
+            let w = ChunkedWriter {
+                w: Box::new(Mem::default()),
+            };
+            let sw = StreamWriter::start_with_deltas(w, |t: &str| format!("<{t}>"));
+            sw.send("role".to_string());
+            let stamp = sw.first_write();
+            sw.finish().unwrap();
+            stamp.load(std::sync::atomic::Ordering::Acquire)
+        };
+        assert_eq!(control_only, 0, "a control event is not the first token");
+
+        let w = ChunkedWriter {
+            w: Box::new(Mem::default()),
+        };
+        let sw = StreamWriter::start_with_deltas(w, |t: &str| format!("<{t}>"));
+        sw.send("role".to_string());
+        let handed = super::uptime_ns();
+        sw.delta("Paris");
+        let stamp = sw.first_write();
+        sw.finish().unwrap();
+        let written = stamp.load(std::sync::atomic::Ordering::Acquire);
+        assert!(
+            written >= handed,
+            "the text's write ({written}) precedes its hand-over ({handed})"
+        );
+    }
+
+    /// The request line's fields: each stage's offset from the accept in
+    /// microseconds, `-` for a stage the request did not reach, and the
+    /// GPU's idle time before it in milliseconds.
+    #[test]
+    fn the_first_token_field_is_offsets_from_the_accept() {
+        let t = super::FirstToken {
+            recv: 1_000_000,
+            handler: 1_050_000,
+            body: 1_100_000,
+            json: 1_200_000,
+            built: 2_000_000,
+            headers: 2_100_000,
+            decode: 2_200_000,
+            fragment: 101_000_000,
+            written: 102_500_000,
+            idle: 3_500_000_000,
+            ..Default::default()
+        };
+        assert_eq!(
+            t.field(),
+            "first_token_us=handler:50,body:100,slot:-,json:200,built:1000,headers:1100,\
+             decode:1200,fragment:100000,written:101500 idle_ms=3500"
+        );
+    }
+
     /// A writer whose writes wait on a gate (a client that stops reading),
     /// or fail (a client that went away).
     #[derive(Clone, Default)]
@@ -5047,6 +5447,8 @@ mod checked_trailer_tests {
             front,
             reuse: parking_lot::Mutex::new(Default::default()),
             sessions: test_sessions(),
+            activity: Arc::new(keep_warm::Activity::new(0)),
+            keep_warm: keep_warm::Policy::Off { why: "test".into() },
         };
         let run = StreamingRun {
             kind: StreamKind::Chat,
@@ -5067,6 +5469,7 @@ mod checked_trailer_tests {
             return_ids: false,
             reasoning_in_content: false,
             session: None,
+            first: FirstToken::default(),
         };
         let (release, hold) = std::sync::mpsc::channel();
         let worker = std::thread::spawn(move || {

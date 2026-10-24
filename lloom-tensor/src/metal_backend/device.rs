@@ -942,20 +942,14 @@ impl MetalDevice {
         self.residency_set.end_residency();
     }
 
-    /// Where the residency set stands for the loaded line: its attachment
-    /// (`kernels.residency.attach`), and its bytes at the last commit and
-    /// allocations, e.g. `residency=queue 1 set 8.12 GiB (1234 allocations)`.
+    /// Where the residency sets stand for the loaded line: the attachment
+    /// (`kernels.residency.attach`) and the router's layout
+    /// ([`ResidencySet::layout_line`]), e.g. `residency=queue 1 set 8.12 GiB`.
     pub fn residency_line(&self) -> String {
-        let attachment = self.commands.residency_attachment();
-        // SAFETY: reads the set's size only; nothing is borrowed past the call.
-        let bytes = unsafe { self.residency_set.raw() }
-            .map(objc2_metal::MTLResidencySet::allocatedSize)
-            .unwrap_or(0);
         format!(
-            "residency={} 1 set {:.2} GiB ({} allocations)",
-            attachment.short(),
-            bytes as f64 / (1u64 << 30) as f64,
-            self.residency_set.len(),
+            "residency={} {}",
+            self.commands.residency_attachment().short(),
+            self.residency_set.layout_line()
         )
     }
 
@@ -1946,7 +1940,10 @@ impl MetalDevice {
     ) -> Result<usize> {
         let plan = RegionPlan::checked_reserve(reservations).map_err(MetalError::Message)?;
         let bytes = plan.bytes().max(1);
-        let base = Self::allocate_backing(&self.backings.resident_private, bytes, context)?;
+        let base = crate::residency_class::residency_class_scope(
+            crate::residency_class::ResidencyClass::Kv,
+            || Self::allocate_backing(&self.backings.resident_private, bytes, context),
+        )?;
         let region = SessionRegion::new(base.buffer, plan)
             .map_err(|e| MetalError::Message(format!("session region rejected: {e}")))?;
         let previous = {
@@ -2051,7 +2048,10 @@ impl MetalDevice {
         // offset source serve every ordinal; sizing to the smaller one makes the
         // GPU path decline an ordinal that fits the plan perfectly, which is a
         // silent loss of coverage rather than an error.
-        let base = Self::allocate_backing(&self.backings.resident_private, bytes, context)?;
+        let base = crate::residency_class::residency_class_scope(
+            crate::residency_class::ResidencyClass::Scratch,
+            || Self::allocate_backing(&self.backings.resident_private, bytes, context),
+        )?;
         let arena = Arena::new(base.buffer, plan, layout)
             .map_err(|e| MetalError::Message(format!("arena plan rejected: {e}")))?;
         let previous = self.arena.write().replace(arena);
@@ -3270,11 +3270,9 @@ impl MetalDevice {
                 self.private_buffers
                     .check_residual(alloc)
                     .map_err(AllocationError::from)?;
-                let new_buffer = Self::allocate_backing(
-                    self.backings.transient_private.as_ref(),
-                    alloc,
-                    context,
-                )?;
+                let split = self.residency_set.policy().is_split();
+                let new_buffer =
+                    Self::allocate_backing(self.backings.for_miss(true, split), alloc, context)?;
                 // `size` is the pre-rounding request and `alloc` is what Metal
                 // was given; `adopt_requesting` counts both so §9.2's residual
                 // overhang is derivable. The rounding happened at `alloc`
@@ -4005,8 +4003,9 @@ impl MetalDevice {
         self.buffers
             .check_residual(size)
             .map_err(AllocationError::from)?;
+        let split = self.residency_set.policy().is_split();
         let new_buffer =
-            Self::allocate_backing(self.backings.transient_shared.as_ref(), size, context)?;
+            Self::allocate_backing(self.backings.for_miss(false, split), size, context)?;
         Ok(self
             .buffers
             .adopt_after_miss_in(new_buffer, size, miss, &origin)?)

@@ -208,6 +208,7 @@ mod planner_transaction;
 mod prefix_data;
 pub mod quantized;
 #[cfg(any(feature = "metal", test))]
+pub mod residency_class;
 mod residency_ownership;
 pub mod retire;
 #[cfg(any(feature = "metal", test))]

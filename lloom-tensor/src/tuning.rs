@@ -1053,6 +1053,28 @@ fn parse_icb_residency(v: &str) -> Result<String, String> {
 fn parse_residency_attach(v: &str) -> Result<String, String> {
     one_of(v, "residency attach", &["queue", "heartbeat"])
 }
+fn parse_residency_cap_pct(v: &str) -> Result<u32, String> {
+    let pct: u32 = parse_count(v)?;
+    if pct > 100 {
+        return Err(format!("residency set cap {pct} % is over 100"));
+    }
+    Ok(pct)
+}
+fn parse_residency_hot(v: &str) -> Result<String, String> {
+    non_empty(v)?;
+    let names = ["weights", "kv", "heap", "scratch", "experts", "other"];
+    let mut out = Vec::new();
+    for name in v.split(',').map(str::trim) {
+        if !names.contains(&name) {
+            return Err(format!(
+                "`{name}` is not a residency class ({})",
+                names.join(", ")
+            ));
+        }
+        out.push(name);
+    }
+    Ok(out.join(","))
+}
 fn parse_oversize_bound(v: &str) -> Result<Option<f64>, String> {
     if is_none(v) {
         return Ok(None);
@@ -1533,6 +1555,12 @@ pub struct MetalTuning {
     /// How the device's residency set keeps its memory resident: `queue` (attached to the Metal 3 command queue, so a command buffer waits until the whole set is resident) or `heartbeat` (not attached: a command buffer waits only for what it binds, and the set is kept wired by requests — serve's keep-warm). Metal 4 keeps `queue`: its queue binds through per-slot sets, and the loaded line says so.
     #[opt(flag = "residency-attach", env = "LLOOM_RESIDENCY_ATTACH", parser = "parse_residency_attach", variants = ["queue", "heartbeat"], path = "kernels.residency.attach", status = "arm", facets = ["liveness"], flows = ["commands-out"])]
     pub residency_attach: String,
+    /// Each residency set of a class holds at most this percentage of the device's recommended working set; past it the class takes another set (at most 24 device sets). 0 = one set for everything; 5 is MLX's per-set cap.
+    #[opt(flag = "residency-set-cap-pct", env = "LLOOM_RESIDENCY_SET_CAP_PCT", parser = "parse_residency_cap_pct", path = "kernels.residency.set_cap_pct", status = "arm", facets = ["liveness"], flows = ["commands-out"])]
+    pub residency_set_cap_pct: u32,
+    /// The residency classes the keep-warm asks to keep resident when the sets are split (`kernels.residency.set_cap_pct` > 0): a comma list of weights, kv, heap, scratch, experts, other. The rest are left to the OS, and under memory pressure their residency is ended.
+    #[opt(flag = "residency-hot", env = "LLOOM_RESIDENCY_HOT", parser = "parse_residency_hot", path = "kernels.residency.hot", status = "arm", facets = ["liveness"], flows = ["commands-out"])]
+    pub residency_hot: String,
     /// Run these types although this GPU only emulates them (a comma list; `bf16` on Apple7, ~2.6x the f32 time); none = refuse them (§15.2a).
     #[opt(flag = "allow-emulated", env = "LLOOM_METAL_ALLOW_EMULATED", parser = "parse_allow_emulated", variants = ["none", "bf16"], path = "backend.metal.allow_emulated", status = "advanced")]
     pub allow_emulated: Option<String>,
@@ -1616,6 +1644,8 @@ impl Default for MetalTuning {
             icb_quarantine_off: false,
             icb_residency: "per-run".into(),
             residency_attach: "queue".into(),
+            residency_set_cap_pct: 0,
+            residency_hot: "weights,kv".into(),
             allow_emulated: None,
             fast_math: true,
             eager_residency_release: None,

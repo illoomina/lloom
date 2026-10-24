@@ -144,9 +144,8 @@ fn attach_device_set(
     // SAME Arc into Core; no allAllocations extraction or out-of-band
     // residency mutation occurs here. This is not an alias terminality proof.
     match unsafe { residency_set.raw() } {
-        Some(raw) if decided.attached => {
-            command_queue.addResidencySet(raw);
-            residency_set.note_queue_attached();
+        Some(_) if decided.attached => {
+            residency_set.attach_queue(command_queue);
             decided
         }
         _ => ResidencyAttachment {

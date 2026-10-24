@@ -94,6 +94,7 @@ mod quant_parity_matrix;
 mod quant_parity_matrix_rows;
 mod quantized_tests;
 #[cfg(feature = "metal")]
+mod residency_router_device;
 mod rows_identity;
 mod sampling_contract;
 mod serialization_tests;

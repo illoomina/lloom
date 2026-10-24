@@ -379,7 +379,8 @@ impl Heartbeat {
                     &a,
                     period,
                     window,
-                    (work.clock, work.pressure),
+                    work.clock,
+                    work.pressure,
                     &mut work.act,
                     &mut work.end,
                 )
@@ -399,7 +400,8 @@ fn beat(
     a: &Activity,
     period: Duration,
     window: Option<Duration>,
-    (clock, pressure): (fn() -> u64, fn() -> u8),
+    clock: fn() -> u64,
+    pressure: fn() -> u8,
     act: &mut dyn FnMut() -> Act,
     end: &mut dyn FnMut() -> Act,
 ) {

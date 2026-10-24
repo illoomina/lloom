@@ -1219,10 +1219,31 @@ enum Pass {
     Rows(usize),
 }
 
+/// The matmul route a pass's half rows take: one row (the GEMV, unless
+/// `--force-gemm m`), the GEMV's row axis (a batched step of 2 to
+/// `f16_rows_max` rows under `kernels.gemm.f16_rows_decode`, at f16), or the
+/// GEMM.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Route {
+    One,
+    RowAxis,
+    Gemm,
+}
+
 impl Pass {
-    /// The `m = 1` route: the GEMV, unless `--force-gemm m`.
-    fn single(self) -> bool {
-        matches!(self, Pass::Solo | Pass::Rows(1))
+    fn route(self) -> Route {
+        use lloom_tensor::tuning;
+        match self {
+            Pass::Solo | Pass::Rows(1) => Route::One,
+            Pass::Rows(m)
+                if tuning::contract().is_fast()
+                    && tuning::f16_rows_decode()
+                    && tuning::f16_rows_max().is_some_and(|max| m <= max) =>
+            {
+                Route::RowAxis
+            }
+            Pass::Rows(_) => Route::Gemm,
+        }
     }
 }
 
@@ -1248,11 +1269,11 @@ fn batched_passes(
         .collect()
 }
 
-/// The first token whose forward took the `m = 1` route on one arm and not
-/// on the other: where the two arms' GEMV/GEMM seam is first crossed.
+/// The first token whose forward took a different matmul route on the two
+/// arms ([`Pass::route`]): where their seam is first crossed.
 fn seam_crossed(a: &[Pass], b: &[Pass], through: usize) -> Option<usize> {
     (1..=through).find(|&t| match (a.get(t - 1), b.get(t - 1)) {
-        (Some(x), Some(y)) => x.single() != y.single(),
+        (Some(x), Some(y)) => x.route() != y.route(),
         _ => false,
     })
 }
@@ -2273,6 +2294,29 @@ mod tests {
             None
         );
         assert_eq!(seam_crossed(&solo, &[Pass::Rows(1); 4], 4), None);
+    }
+
+    /// Under `kernels.gemm.f16_rows_decode` a batched step of 2 to
+    /// `f16_rows_max` rows takes the GEMV's row axis and a wider one the
+    /// GEMM: two routes, so a row re-batched across the ceiling crosses a
+    /// seam; within it, or with the arm off, it does not.
+    #[test]
+    fn under_the_decode_rows_arm_the_row_axis_is_a_route_of_its_own() {
+        use lloom_tensor::tuning;
+        tuning::pin_contract(tuning::Contract::Fast).expect("an isolated test process");
+        tuning::set_f16_rows(Some(10));
+        let (four, two, twelve) = ([Pass::Rows(4); 4], [Pass::Rows(2); 4], [Pass::Rows(12); 4]);
+        tuning::set_f16_rows_decode(false);
+        assert_eq!(seam_crossed(&four, &twelve, 4), None, "off: both the GEMM");
+        tuning::set_f16_rows_decode(true);
+        assert_eq!(
+            seam_crossed(&four, &twelve, 4),
+            Some(1),
+            "on: the axis, then the GEMM"
+        );
+        assert_eq!(seam_crossed(&four, &two, 4), None, "on: both the axis");
+        assert_eq!(seam_crossed(&[Pass::Solo; 4], &four, 4), Some(1));
+        assert_eq!(seam_crossed(&[Pass::Solo; 4], &[Pass::Rows(1); 4], 4), None);
     }
 
     /// Streams that agree are identical and replay nothing.

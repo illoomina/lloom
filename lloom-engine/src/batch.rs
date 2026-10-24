@@ -487,6 +487,16 @@ mod steady {
         busy
     }
 
+    /// One decode step's interval, milliseconds: the fields [`SteadyRow`]
+    /// takes the medians of.
+    struct Sample {
+        wall: f64,
+        busy: f64,
+        stages: [f64; 10],
+        between: f64,
+        dispatches: f64,
+    }
+
     /// The decode cadence per live-row count: a step counts when it fed no
     /// piece, held no row and the next step began with the same live rows, so
     /// its interval is one decode step at that width. `intervals` are the
@@ -494,8 +504,7 @@ mod steady {
     pub(super) fn steady_rows(steps: &[WindowStep], intervals: &[(f64, f64)]) -> Vec<SteadyRow> {
         let mut sorted = intervals.to_vec();
         sorted.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
-        let mut by_live: std::collections::BTreeMap<usize, Vec<(f64, f64, [f64; 10], f64, f64)>> =
-            Default::default();
+        let mut by_live: std::collections::BTreeMap<usize, Vec<Sample>> = Default::default();
         for w in steps.windows(2) {
             let (a, b) = (&w[0], &w[1]);
             if a.report.live == 0
@@ -508,33 +517,33 @@ mod steady {
             }
             let ms = |ns: u64| ns as f64 / 1e6;
             let stages = stage_array(&a.phases).map(ms);
-            by_live.entry(a.report.live).or_default().push((
-                1e3 * (b.t0 - a.t0),
-                1e3 * busy_within(&sorted, a.t0, b.t0),
+            by_live.entry(a.report.live).or_default().push(Sample {
+                wall: 1e3 * (b.t0 - a.t0),
+                busy: 1e3 * busy_within(&sorted, a.t0, b.t0),
                 stages,
-                1e3 * (b.t0 - a.t1),
-                a.dispatches as f64,
-            ));
+                between: 1e3 * (b.t0 - a.t1),
+                dispatches: a.dispatches as f64,
+            });
         }
         by_live
             .into_iter()
             .map(|(live, rows)| {
-                let col = |f: &dyn Fn(&(f64, f64, [f64; 10], f64, f64)) -> f64| {
+                let col = |f: &dyn Fn(&Sample) -> f64| {
                     let mut v: Vec<f64> = rows.iter().map(f).collect();
                     median(&mut v)
                 };
                 let mut stages_ms = [0.0; 10];
                 for (k, s) in stages_ms.iter_mut().enumerate() {
-                    *s = col(&|r| r.2[k]);
+                    *s = col(&|r| r.stages[k]);
                 }
                 SteadyRow {
                     live,
                     steps: rows.len(),
-                    wall_ms: col(&|r| r.0),
-                    gpu_busy_ms: col(&|r| r.1),
+                    wall_ms: col(&|r| r.wall),
+                    gpu_busy_ms: col(&|r| r.busy),
                     stages_ms,
-                    between_ms: col(&|r| r.3),
-                    dispatches: col(&|r| r.4),
+                    between_ms: col(&|r| r.between),
+                    dispatches: col(&|r| r.dispatches),
                 }
             })
             .collect()

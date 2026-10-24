@@ -1077,6 +1077,136 @@ fn the_pause_arm_holds_streaming_rows_while_pieces_are_fed() -> Result<()> {
 
 // ---- the decode step's scope and its stages (`batched-decode-design.md` §13)
 
+/// [`Chain`] recording, per entry point, how many calls ran with a batched
+/// decode step's scope (`tuning::DecodeRows`) open and how many without.
+struct ScopeChain {
+    inner: Chain,
+    /// `(open, closed)` calls: `forward_rows`, `forward_ragged`, `forward`.
+    rows: ScopeCount,
+    ragged: ScopeCount,
+    single: ScopeCount,
+}
+
+/// Calls made with the scope open and without it.
+#[derive(Default)]
+struct ScopeCount(std::sync::atomic::AtomicU32, std::sync::atomic::AtomicU32);
+
+impl ScopeCount {
+    fn get(&self) -> (u32, u32) {
+        use std::sync::atomic::Ordering::Relaxed;
+        (self.0.load(Relaxed), self.1.load(Relaxed))
+    }
+}
+
+impl ScopeChain {
+    fn new(device: &Device) -> Result<Self> {
+        Ok(Self {
+            inner: Chain::new(device)?,
+            rows: Default::default(),
+            ragged: Default::default(),
+            single: Default::default(),
+        })
+    }
+
+    fn note(c: &ScopeCount) {
+        use std::sync::atomic::Ordering::Relaxed;
+        if lloom_tensor::tuning::in_decode_rows() {
+            c.0.fetch_add(1, Relaxed);
+        } else {
+            c.1.fetch_add(1, Relaxed);
+        }
+    }
+}
+
+impl Model for ScopeChain {
+    type Config = ();
+    fn from_weights(_vb: lloom::nn::VarBuilder, _cfg: &()) -> Result<Self> {
+        lloom_tensor::bail!("ScopeChain has no weights")
+    }
+}
+
+impl CausalLM for ScopeChain {
+    type Cache = usize;
+
+    fn new_cache(&self, cfg: &(), dev: &Device) -> Result<usize> {
+        self.inner.new_cache(cfg, dev)
+    }
+
+    fn embed(&self, tokens: &Tensor) -> Result<Tensor> {
+        self.inner.embed(tokens)
+    }
+
+    fn forward_embeds(&self, embeds: &Tensor, pos: usize, cache: &mut usize) -> Result<Tensor> {
+        Self::note(&self.single);
+        self.inner.forward_embeds(embeds, pos, cache)
+    }
+
+    fn vocab_size(&self) -> usize {
+        VOCAB
+    }
+}
+
+impl BatchedCausalLM for ScopeChain {
+    fn forward_ragged(&self, tokens: &Tensor, rows: &mut [RaggedRow<'_, usize>]) -> Result<Tensor> {
+        Self::note(&self.ragged);
+        self.inner.forward_ragged(tokens, rows)
+    }
+
+    fn forward_rows(&self, tokens: &Tensor, rows: &mut [Row<'_, usize>]) -> Result<Tensor> {
+        Self::note(&self.rows);
+        self.inner.forward_rows(tokens, rows)
+    }
+}
+
+/// The decode step's forward — and only it — runs with the scope
+/// `kernels.gemm.f16_rows_decode` routes open: every `forward_rows` call
+/// has it, and no step that carries prompt pieces (`forward_ragged`) and no
+/// whole-prompt prefill (`forward`) does; the scope is closed again between
+/// steps. On both lookahead arms, with chunked and whole-prompt admission.
+#[test]
+fn only_the_decode_steps_forward_opens_the_decode_rows_scope() -> Result<()> {
+    for device in devices() {
+        for lookahead in [0usize, 1] {
+            for chunk in [0usize, 2] {
+                let tag = format!("{device:?} lookahead {lookahead} chunk {chunk}");
+                let model = ScopeChain::new(&device)?;
+                let opts = DecodeOptions {
+                    lookahead,
+                    prefill_chunk: chunk,
+                    ..DecodeOptions::new(6)
+                };
+                let mut dec: BatchDecoder<'_, ScopeChain, Session<'_, ScopeChain>> =
+                    BatchDecoder::new(opts, &[EOS], device.clone())?;
+                for p in [vec![9u32, 9, 1], vec![9, 0], vec![5]] {
+                    dec.admit(Session::new(&model, 0usize), p, Sampling::ArgMax, 0)?;
+                }
+                let mut n = 0;
+                while !dec.is_idle() {
+                    dec.step(&mut |_, _| Ok(()))?;
+                    assert!(
+                        !lloom_tensor::tuning::in_decode_rows(),
+                        "{tag}: the scope outlived the step"
+                    );
+                    n += 1;
+                    assert!(n < 100, "{tag}: the batch never drained");
+                }
+                let (rows, ragged, single) =
+                    (model.rows.get(), model.ragged.get(), model.single.get());
+                assert!(rows.0 > 0, "{tag}: no decode step ran ({rows:?})");
+                assert_eq!(rows.1, 0, "{tag}: a decode step ran without the scope");
+                assert_eq!(ragged.0, 0, "{tag}: a step with pieces opened the scope");
+                assert_eq!(single.0, 0, "{tag}: a prefill opened the scope");
+                if chunk > 0 {
+                    assert!(ragged.1 > 0, "{tag}: no piece step ran ({ragged:?})");
+                } else {
+                    assert!(single.1 > 0, "{tag}: no whole prompt was fed ({single:?})");
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// A step's host stages are read where the build carries the clock (debug
 /// and `profile`): a decode step's encode is charged, and the stages sum to
 /// no more than the step's own host time. In a release build every stage is

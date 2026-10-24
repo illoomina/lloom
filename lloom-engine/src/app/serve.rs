@@ -3907,13 +3907,26 @@ fn report_with(
     shared.reuse.lock().note(&turn);
     let st = &d.stats;
     let steady = steady_rate_field(&st.step_ns);
+    // The decode rows' arm, where it is on: its engagement since the load.
+    let decode_rows = match d.readback {
+        crate::ReadbackArm::Batched { .. }
+            if lloom_tensor::tuning::f16_rows_decode()
+                && lloom_tensor::tuning::f16_rows_max().is_some() =>
+        {
+            format!(
+                " f16_rows_decode_launches={}",
+                lloom_tensor::tuning::f16_rows_decode_launches()
+            )
+        }
+        _ => String::new(),
+    };
     eprintln!(
         "[{endpoint}: prompt_tokens={prompt} completion_tokens={} stop={:?} total {total_ms:.1} ms, \
          {steady}, readback={} sampling={} reuse={:?} prefilled={} \
          commits={} poll_fallbacks={} overrun={} eos_gate={} host_fill={} prompt_ids_sha256={} \
          reasoning_effort={} think={} think_by={} thinking_budget={} thought={} budget_fired={} \
          prompt_budget={} prompt_dropped={} reused={} renders={} history={}/{} spliced={}/{} \
-         unverified={} ambiguous={} declined={} reuse_policy={} {} checkpoint={}{}{extra}]",
+         unverified={} ambiguous={} declined={} reuse_policy={} {} checkpoint={}{}{extra}{decode_rows}]",
         d.tokens.len(),
         d.stop,
         d.readback.name(),

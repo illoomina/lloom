@@ -1374,7 +1374,12 @@ impl<'m, M: BatchedCausalLM, R: BorrowMut<Session<'m, M>>> BatchDecoder<'m, M, R
         self.pacer.before_forward(input.device())?;
         clock.lap(&mut ph.pace_ns);
         begin_pass(input.device(), PassShape::Decode { b: live.len() })?;
-        let logits = model.forward_rows(input, &mut rows)?;
+        let logits = {
+            // One token per live row: the step `kernels.gemm.f16_rows_decode`
+            // routes (`tuning::DecodeRows`).
+            let _rows = lloom_tensor::tuning::DecodeRows::open();
+            model.forward_rows(input, &mut rows)
+        }?;
         end_pass(input.device())?;
         clock.lap(&mut ph.encode_ns);
         self.pacer.after_forward(input.device())?;

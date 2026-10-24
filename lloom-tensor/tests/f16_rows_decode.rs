@@ -118,6 +118,68 @@ fn a_decode_steps_f16_rows_take_the_row_axis_with_the_one_row_bits() -> Result<(
     Ok(())
 }
 
+/// A ceiling anywhere up to the axis's last capacity changes which rows take
+/// the axis, never what a row computes there: with the ceiling at 16, every
+/// `m` from 11 to 16 takes it and each row is the one-row GEMV's bits, at
+/// LFM2.5's decode stems and at a `k = 5120` model's down projection. With
+/// the decode switch off some GEMM row differs, so the comparison sees the
+/// route.
+#[test]
+fn every_ceiling_to_sixteen_rows_keeps_the_one_row_bits() -> Result<()> {
+    let dev = device(Contract::Fast)?;
+    set_f16_rows(Some(16));
+    let (mut checked, mut gemm_differing) = (0usize, 0usize);
+    for (n, k) in [
+        (35usize, 512usize),
+        (2048, 2048),
+        (6144, 2048),
+        (2048, 10752),
+        (5120, 17408),
+    ] {
+        let rhs = weight(n, k, &dev)?.t()?;
+        for m in 11..=16 {
+            let x = rows(m, k, m as f32 * 0.5, &dev)?;
+            set_f16_rows_decode(true);
+            let before = f16_rows_decode_launches();
+            let y = {
+                let _step = DecodeRows::open();
+                x.matmul(&rhs)?
+            };
+            assert_eq!(
+                f16_rows_decode_launches() - before,
+                1,
+                "[{n}, {k}] m={m}: one decode launch under a ceiling of 16"
+            );
+            set_f16_rows_decode(false);
+            let gemm = {
+                let _step = DecodeRows::open();
+                x.matmul(&rhs)?
+            };
+            for r in 0..m {
+                let one = bits(&x.narrow(0, r, 1)?.contiguous()?.matmul(&rhs)?)?;
+                assert_eq!(
+                    bits(&y.narrow(0, r, 1)?)?,
+                    one,
+                    "[{n}, {k}] m={m} row={r}: the row axis is not the one-row GEMV's bits"
+                );
+                checked += 1;
+                if bits(&gemm.narrow(0, r, 1)?)? != one {
+                    gemm_differing += 1;
+                }
+            }
+        }
+    }
+    println!(
+        "F16_ROWS_DECODE_CEILING16 rows_checked={checked} bit_equal={checked} \
+         gemm_rows_differing_from_one_row={gemm_differing}/{checked}"
+    );
+    assert!(
+        gemm_differing > 0,
+        "no GEMM row differs from its one-row bits: the comparison cannot tell the routes apart"
+    );
+    Ok(())
+}
+
 /// The decode switch reaches only a decode step: outside the scope, with
 /// the row axis itself off, past the ceiling and at one row, nothing takes
 /// it and the bits are the switch-off bits; a verify window opened inside

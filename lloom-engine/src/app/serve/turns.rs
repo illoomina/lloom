@@ -49,6 +49,17 @@ impl Drop for Turn<'_> {
 }
 
 impl Turns {
+    /// A turn now, if nobody holds one or waits for one; never waits, and
+    /// never goes ahead of a request that is queued.
+    pub(super) fn try_take(&self) -> Option<Turn<'_>> {
+        let mut state = self.state.lock();
+        if state.next != state.serving {
+            return None;
+        }
+        state.next += 1;
+        Some(Turn { turns: self })
+    }
+
     /// Wait for a turn of one's own.
     pub(super) fn take(&self) -> Turn<'_> {
         let mut state = self.state.lock();

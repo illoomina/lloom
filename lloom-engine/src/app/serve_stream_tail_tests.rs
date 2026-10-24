@@ -351,6 +351,8 @@ fn run(
         sampling: Default::default(),
         reuse: ParkingMutex::new(Default::default()),
         sessions: super::test_sessions(),
+        activity: Arc::new(keep_warm::Activity::new(0)),
+        keep_warm: keep_warm::Policy::Off { why: "test".into() },
     };
     let run = StreamingRun {
         kind: StreamKind::Chat,
@@ -364,6 +366,7 @@ fn run(
         return_ids: false,
         reasoning_in_content: false,
         session: None,
+        first: FirstToken::default(),
     };
     let failed = fail.is_some();
     let result = stream_response_with_writer(&shared, run, || {

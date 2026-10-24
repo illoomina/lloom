@@ -539,6 +539,16 @@ impl Device {
         }
     }
 
+    /// Asks the OS to keep the device's memory resident: Metal's residency
+    /// set, which is unwired after a few idle seconds otherwise. Nothing to
+    /// do on the other backends.
+    pub fn request_residency(&self) {
+        #[cfg(feature = "metal")]
+        if let Self::Metal(d) = self {
+            d.request_residency();
+        }
+    }
+
     pub fn synchronize(&self) -> Result<()> {
         match self {
             Self::Cpu => Ok(()),

@@ -344,6 +344,16 @@ impl ResidencySet {
         }
     }
 
+    /// Asks the OS to make every allocation in the set resident again. A
+    /// set nothing has used for a few seconds is unwired, and the next
+    /// command buffer then waits while it is wired back
+    /// (`docs/machine-model.md` §3.4d).
+    pub fn request_residency(&self) {
+        if let Some(raw) = &self.raw {
+            raw.requestResidency();
+        }
+    }
+
     /// Enters this set in the process registry [`join_device_retirement`]
     /// walks. Cold: once per device.
     pub(crate) fn register_device_set(self: &Arc<Self>) {

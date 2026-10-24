@@ -1120,7 +1120,7 @@ impl<P: Lfm2Shape> Engine<P> {
                 let room = match config.memory_budget {
                     Some(mut b) => {
                         b.weight_bytes = resident;
-                        let a = State::<P>::admission_budget(&config, &b, opts.kv_capacity)
+                        let a = State::<P>::admission_budget(&config, dtype, &b, opts.kv_capacity)
                             .admit(m.device().recommended_max_working_set_size());
                         // The classes, for the refusal: which one took the room.
                         let f = &a.footprint;
@@ -3179,7 +3179,7 @@ fn resolve_prefill_batch<P: Lfm2Shape>(
                     + opts.batch;
             let budget_ok = config.memory_budget.is_none_or(|mut b| {
                 b.max_seq_len = longest;
-                let a = State::<P>::admission_budget(config, &b, opts.kv_capacity).admit(ws);
+                let a = State::<P>::admission_budget(config, dtype, &b, opts.kv_capacity).admit(ws);
                 a.fits && a.residual >= rope
             });
             let machine_ok = room.is_none_or(|room| {
@@ -3246,7 +3246,7 @@ fn machine_peak<P: Profile>(
         b.batch = rows;
         b.max_seq_len = longest_forward;
         b.activation_rows = activation_rows;
-        let f = State::<P>::admission_budget(config, &b, kv_floor).footprint();
+        let f = State::<P>::admission_budget(config, dtype, &b, kv_floor).footprint();
         let in_flight = in_flight.max(1);
         peak.push(
             format!("activations ({longest_forward}-position forward x {in_flight} in flight)"),

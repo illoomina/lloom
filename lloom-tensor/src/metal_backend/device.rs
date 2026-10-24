@@ -928,6 +928,12 @@ impl MetalDevice {
         self.residency_set.len()
     }
 
+    /// Asks the OS to keep the residency set's memory wired
+    /// ([`ResidencySet::request_residency`]).
+    pub fn request_residency(&self) {
+        self.residency_set.request_residency();
+    }
+
     /// A handle to the residency set that outlives this device.
     ///
     /// Exists so the teardown guard can be observed from outside: after the

@@ -4192,7 +4192,7 @@ impl<P: Profile> State<P> {
         // ~49 MB transient (§9.5k). They are not one of §9.1's five classes,
         // and an admission check placed after them would not see them. Running
         // first means the refusal happens before any of it is allocated.
-        Self::admit_memory_budget(config, device, kv_capacity)?;
+        Self::admit_memory_budget(config, dtype, device, kv_capacity)?;
 
         // The ceiling is bounded by the RoPE tables built below: a position
         // past `max_position_embeddings` has no rotation, and asking for a
@@ -5095,7 +5095,7 @@ impl<P: Profile> State<P> {
     /// any per-token path** (§9.5e). The residual cap it installs is one branch
     /// on counters the pool already maintains, and it calls into Metal nowhere.
     #[cfg(not(feature = "metal"))]
-    fn admit_memory_budget(_: &Config, _: &Device, _: usize) -> Result<()> {
+    fn admit_memory_budget(_: &Config, _: DType, _: &Device, _: usize) -> Result<()> {
         // No Metal, no `recommendedMaxWorkingSetSize`, nothing to check
         // against. The CPU and CUDA backends compile none of the above, which
         // is the constraint upstreaming imposes (§14.1).
@@ -5121,8 +5121,21 @@ impl<P: Profile> State<P> {
         }
     }
 
+    /// Whether a prefill pass's MLP stores the SiLU and product as one
+    /// `silu_mul` launch: the forward's selection (`silu_mul_selected`) at
+    /// the configured gate arm, at a dtype the kernel is instantiated at.
+    /// `Fusion=Derived` sets the gate arm after construction, from the
+    /// plan, so it is charged the composed pair, which is never the smaller.
+    #[cfg(feature = "metal")]
+    fn prefill_silu_mul(config: &Config, dtype: DType) -> bool {
+        config.fusion != FusionPolicy::Derived
+            && silu_mul_selected(config.gemv_gate)
+            && crate::models::qwen4exp::kernels::silu_mul_instantiated(dtype)
+    }
+
     /// §9.5d's admission arithmetic for this configuration, as a pure
-    /// function of `config`, `budget` and the KV ceiling — the figure
+    /// function of `config`, the compute `dtype` the model is loaded at,
+    /// `budget` and the KV ceiling — the figure
     /// `admit_memory_budget` refuses on, exposed so a caller deciding
     /// **before** construction (§4.8's weight streaming, #892 A6a: how many
     /// MLP slots the quota leaves once the resident rest and its predicted
@@ -5133,6 +5146,7 @@ impl<P: Profile> State<P> {
     #[cfg(feature = "metal")]
     pub fn admission_budget(
         config: &Config,
+        dtype: DType,
         budget: &MemoryBudget,
         kv_capacity: usize,
     ) -> lloom_tensor::metal_backend::admission::Budget {
@@ -5172,6 +5186,7 @@ impl<P: Profile> State<P> {
             vocab: config.vocab_size,
             conv_l_cache: config.conv_l_cache,
             attention: Self::prefill_attention(config),
+            silu_mul: Self::prefill_silu_mul(config, dtype),
         };
         // §10.2g: `Shuffle` and `RotatingRing` hold exactly `l_cache` columns
         // (264 KiB); `SlidingRing` holds the slack it slides through as well,
@@ -5219,7 +5234,12 @@ impl<P: Profile> State<P> {
     }
 
     #[cfg(feature = "metal")]
-    fn admit_memory_budget(config: &Config, device: &Device, kv_capacity: usize) -> Result<()> {
+    fn admit_memory_budget(
+        config: &Config,
+        dtype: DType,
+        device: &Device,
+        kv_capacity: usize,
+    ) -> Result<()> {
         use lloom_tensor::metal_backend::admission;
 
         let Some(budget) = config.memory_budget else {
@@ -5233,7 +5253,7 @@ impl<P: Profile> State<P> {
             return Ok(());
         };
 
-        let b = Self::admission_budget(config, &budget, kv_capacity);
+        let b = Self::admission_budget(config, dtype, &budget, kv_capacity);
         let rope = Self::rope_table_bytes(config);
 
         let admission = b.admit(metal.device().recommended_max_working_set_size());
@@ -6175,7 +6195,13 @@ impl Mlp {
             if gemv_residual_applies(true, &gated, &p.down, residual) {
                 return crate::nn::ops::gemv_residual(&gated, p.down.weight(), residual);
             }
+            if prefill_ablated(PrefillAblation::Add, residual) {
+                return p.down.forward(&gated);
+            }
             return p.down.forward(&gated)? + residual;
+        }
+        if prefill_ablated(PrefillAblation::Add, residual) {
+            return self.forward(x, p);
         }
         self.forward(x, p)? + residual
     }
@@ -6245,11 +6271,27 @@ impl Mlp {
         if self.gemv_swiglu_applies(x, p) {
             return crate::nn::ops::gemv_swiglu(x, p.up.weight(), p.gate.weight());
         }
+        // The composed pair as one elementwise launch, bit for bit
+        // (`kernels.fusion.silu_mul`, Qwen4-exp's `silu_mul` kernel).
+        if silu_mul_selected(self.gemv_gate)
+            && !self.gemv_silu_applies(x, p)
+            && !prefill_ablated(PrefillAblation::Silu, x)
+            && !prefill_ablated(PrefillAblation::Mul, x)
+        {
+            let gate = p.gate.forward(x)?;
+            let up = p.up.forward(x)?;
+            if let Some(h) = crate::models::qwen4exp::kernels::silu_mul_op(&gate, &up) {
+                return h;
+            }
+            return crate::nn::ops::silu(&gate)? * up;
+        }
         // The fused arm replaces `gemv` + `silu_f16` with one dispatch, and
         // computes SiLU on the f32 accumulator rather than on the rounded
         // store — so it MOVES THE DIGESTS by construction (§12.2d, §2.3.5a).
         let gate = if self.gemv_silu_applies(x, p) {
             crate::nn::ops::gemv_silu(x, p.gate.weight())?
+        } else if prefill_ablated(PrefillAblation::Silu, x) {
+            p.gate.forward(x)?
         } else {
             crate::nn::ops::silu(&p.gate.forward(x)?)?
         };
@@ -6262,6 +6304,10 @@ impl Mlp {
             return crate::nn::ops::gemv_mul(x, p.up.weight(), &gate);
         }
         let up = p.up.forward(x)?;
+        if prefill_ablated(PrefillAblation::Mul, x) {
+            drop(up);
+            return Ok(gate);
+        }
         gate * up
     }
 
@@ -6470,7 +6516,13 @@ impl<P: Profile> Attention<P> {
             if gemv_residual_applies(true, &y, &w.o, residual) {
                 return crate::nn::ops::gemv_residual(&y, w.o.weight(), residual);
             }
+            if prefill_ablated(PrefillAblation::Add, residual) {
+                return w.o.forward(&y);
+            }
             return w.o.forward(&y)? + residual;
+        }
+        if prefill_ablated(PrefillAblation::Add, residual) {
+            return self.forward(w, x, index_pos, block_idx, cache);
         }
         self.forward(w, x, index_pos, block_idx, cache)? + residual
     }
@@ -8048,7 +8100,13 @@ impl<P: Profile> ShortConv<P> {
             if gemv_residual_applies(true, &conv_out, &w.out_proj, residual) {
                 return crate::nn::ops::gemv_residual(&conv_out, w.out_proj.weight(), residual);
             }
+            if prefill_ablated(PrefillAblation::Add, residual) {
+                return w.out_proj.forward(&conv_out);
+            }
             return w.out_proj.forward(&conv_out)? + residual;
+        }
+        if prefill_ablated(PrefillAblation::Add, residual) {
+            return self.forward(w, x, block_idx, cache);
         }
         self.forward(w, x, block_idx, cache)? + residual
     }
@@ -9082,11 +9140,57 @@ fn ablate_norms() -> bool {
     })
 }
 
+/// `kernels.fusion.silu_mul` (on unless skipped), read once.
+fn silu_mul_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !crate::tuning::tuning().lfm2.skip_silu_mul)
+}
+
+/// Whether the MLP's composed path takes `silu_mul` under the gate arm
+/// `gate`: the switch on, and the product not on `w3`'s store
+/// (`GateFusion::Mul`, whose pair stays a pair where its GEMV does not
+/// serve). The forward selects by it (`Mlp::gated`) and admission charges
+/// by it (`State::admission_budget`).
+fn silu_mul_selected(gate: GateFusion) -> bool {
+    silu_mul_on() && gate != GateFusion::Mul
+}
+
+/// A class of prefill dispatch `diagnostics.ablate` can skip: `prefill-norm`
+/// (the layers' two RMSNorms), `prefill-silu` (the MLP's SiLU),
+/// `prefill-mul` (the SwiGLU product), `prefill-add` (the two residual adds).
+#[derive(Clone, Copy)]
+enum PrefillAblation {
+    Norm,
+    Silu,
+    Mul,
+    Add,
+}
+
+/// Whether `x`, a pass over more than one position, skips `class` — an
+/// instrument pricing on the GPU timeline what removing that class from a
+/// prefill would buy; the output is WRONG. Read once.
+fn prefill_ablated(class: PrefillAblation, x: &Tensor) -> bool {
+    static ON: std::sync::OnceLock<[bool; 4]> = std::sync::OnceLock::new();
+    let on = ON.get_or_init(|| {
+        let names = &crate::tuning::tuning().lfm2.ablate;
+        let has = |n: &str| names.split(',').any(|s| s.trim() == n);
+        [
+            has("prefill-norm"),
+            has("prefill-silu"),
+            has("prefill-mul"),
+            has("prefill-add"),
+        ]
+    });
+    on[class as usize] && x.rank() >= 2 && x.dims()[x.rank() - 2] > 1
+}
+
 impl<P: Profile> DecoderLayer<P> {
     /// The layer's RMSNorm, or `x` itself under the `norm` ablation at a
-    /// one-token step.
+    /// one-token step or the `prefill-norm` one at a prefill.
     fn norm(&self, n: &RmsNorm, x: &Tensor) -> Result<Tensor> {
-        if ablate_norms() && x.dim(x.rank() - 2)? == 1 {
+        if (ablate_norms() && x.dim(x.rank() - 2)? == 1)
+            || prefill_ablated(PrefillAblation::Norm, x)
+        {
             return Ok(x.clone());
         }
         n.forward(x)
@@ -9542,12 +9646,20 @@ fn derive_fusion<P: Profile>(
     }
 
     let graph = crate::optimizer::walk(model);
-    // The kernel fragments run in no LFM2 switch.
+    // The derivation sets the epilogue switches only: `silu_mul` is
+    // `kernels.fusion.silu_mul`'s, outside it, and no switch selects the rest.
     let policy = Policy {
         budget,
         unavailable: crate::optimizer::fragments::kernels()
             .into_iter()
-            .map(|k| (k.name.to_string(), "no LFM2 switch selects it".to_string()))
+            .map(|k| {
+                let why = if k.family == "silu_mul" {
+                    "kernels.fusion.silu_mul selects it, not the derivation"
+                } else {
+                    "no LFM2 switch selects it"
+                };
+                (k.name.to_string(), why.to_string())
+            })
             .collect(),
         ..Policy::default()
     };
@@ -12737,14 +12849,50 @@ mod admission_geometry_tests {
     fn admission_budget_reads_the_configs_geometry() {
         let mb = MemoryBudget::new(1);
         let big = geometry(22, 8, 2048, 32, 8);
-        let b = State::<crate::profile::CrownExact>::admission_budget(&big, &mb, 1024);
+        let b = State::<crate::profile::CrownExact>::admission_budget(&big, DType::F16, &mb, 1024);
         assert_eq!(b.conv_state_bytes, admission::CONV_STATE_BYTES);
         assert_eq!(b.kv_bytes_per_token, admission::KV_BYTES_PER_TOKEN);
         let small = geometry(2, 1, 64, 4, 2);
-        let s = State::<crate::profile::CrownExact>::admission_budget(&small, &mb, 1024);
+        let s =
+            State::<crate::profile::CrownExact>::admission_budget(&small, DType::F16, &mb, 1024);
         let width = small.conv_state.width(small.conv_l_cache);
         assert_eq!(s.conv_state_bytes, 2 * 64 * width * 2);
         assert_eq!(s.kv_bytes_per_token, 2 * 2 * 16 * 2);
         assert!(s.kv_bytes_per_token < b.kv_bytes_per_token);
+    }
+
+    /// Admission reads the forward's `silu_mul` selection: on at the default
+    /// gate arm at f16 and f32 (the switch's default, asserted first so the
+    /// arms below are not vacuous), the pair under `GateFusion::Mul`, at
+    /// bf16 (no instantiation) and under `Fusion=Derived` (the gate is the
+    /// plan's, set after construction).
+    #[test]
+    fn admission_charges_the_forwards_silu_mul_selection() {
+        assert!(silu_mul_on(), "the switch's default arm");
+        let mb = MemoryBudget::new(1).with_prefill(64);
+        let at = |cfg: &Config, dtype: DType| {
+            State::<crate::profile::CrownExact>::admission_budget(cfg, dtype, &mb, 1024)
+                .prefill_geometry
+                .silu_mul
+        };
+        let base = geometry(2, 1, 64, 4, 2);
+        assert!(at(&base, DType::F16));
+        assert!(at(&base, DType::F32));
+        assert!(!at(&base, DType::BF16));
+        let swiglu = Config {
+            gemv_gate: GateFusion::Swiglu,
+            ..base.clone()
+        };
+        assert!(at(&swiglu, DType::F16));
+        let mul = Config {
+            gemv_gate: GateFusion::Mul,
+            ..base.clone()
+        };
+        assert!(!at(&mul, DType::F16));
+        let derived = Config {
+            fusion: FusionPolicy::Derived,
+            ..base.clone()
+        };
+        assert!(!at(&derived, DType::F16));
     }
 }

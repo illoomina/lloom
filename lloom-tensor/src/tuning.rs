@@ -1160,7 +1160,7 @@ pub struct GemmTuning {
         status = "arm"
     )]
     pub f16_rows_max: usize,
-    /// Under `fast`, with `kernels.gemm.f16_rows` on, a batched decode step's f16 matmuls of 2 to `f16_rows_max` rows (one row per live sequence) take the GEMV's row axis: each weight block read once for every row, each row the one-row GEMV's bits; off = the GEMM from two rows. Only a step of decode rows: a step that carries prompt pieces, a single sequence's step and `deterministic` keep their routes.
+    /// Under `fast`, with `kernels.gemm.f16_rows` on, a batched decode step's f16 matmuls of 2 to `f16_rows_max` rows (one row per live sequence) take the GEMV's row axis: each weight block read once for every row, each row the one-row GEMV's bits; off = the GEMM from two rows. Only a step of decode rows: a step that carries prompt pieces, a single sequence's step and `deterministic` keep their routes. Off in the library; `serve` and `bench` turn it on at a batch on Metal (decision 54), `--gemm-f16-rows-decode=false` to measure without it.
     #[opt(
         flag = "gemm-f16-rows-decode",
         env = "LLOOM_GEMM_F16_ROWS_DECODE",

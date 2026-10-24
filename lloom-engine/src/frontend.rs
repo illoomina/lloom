@@ -82,6 +82,10 @@ pub enum When {
     /// serve keep-warm takes the single-sequence request slot, which a
     /// batched server does not have.
     MetalSingle,
+    /// [`When::Metal`] at a batch (`scheduler.max_sequences` above 1): the
+    /// batched decode step's rows on the GEMV's row axis, a Metal kernel
+    /// reached only by the batched loop.
+    MetalBatched,
 }
 
 impl When {
@@ -110,6 +114,7 @@ impl When {
                     && matches!(o.model.cache.as_str(), "auto" | "rewindable")
             }
             When::MetalSingle => When::Metal.holds(o) && o.scheduler.max_sequences == 1,
+            When::MetalBatched => When::Metal.holds(o) && o.scheduler.max_sequences > 1,
         }
     }
 
@@ -123,6 +128,7 @@ impl When {
                 "speculative.method = dspark at scheduler.max_sequences = 1 on the auto or rewindable preset (LFM2, on Metal)"
             }
             When::MetalSingle => "on Metal at scheduler.max_sequences = 1",
+            When::MetalBatched => "on Metal at scheduler.max_sequences > 1",
         }
     }
 }
@@ -252,6 +258,21 @@ rows! {
         when: When::MetalSingle,
         before: "1000",
     },
+    // The batched decode step's rows on the GEMV's row axis under `fast`
+    // (`tuning.md` §13.5zb): `before` is the library's value; decision 54
+    // (`EXCEPTIONS`) lands the new one where a batched loop runs on Metal.
+    Row {
+        key: "kernels.gemm.f16_rows_decode",
+        frontend: Frontend::Serve,
+        when: When::MetalBatched,
+        before: "false",
+    },
+    Row {
+        key: "kernels.gemm.f16_rows_decode",
+        frontend: Frontend::Bench,
+        when: When::MetalBatched,
+        before: "false",
+    },
 }
 
 /// A default changed on purpose: the maintainer's decision by number, the
@@ -365,6 +386,26 @@ pub const EXCEPTIONS: &[Exception] = &[Exception {
     landed: true,
     owner: "#1068",
     what: "the speculative body at one sequence keeps its preset's in-place KV on Metal: the verify window reads the slab instead of a copy gathered out of the page pool every round; --kv-append paged opts out",
+}, Exception {
+    decision: 54,
+    key: "kernels.gemm.f16_rows_decode",
+    frontend: Frontend::Serve,
+    when: When::MetalBatched,
+    before: "false",
+    after: "true",
+    landed: true,
+    owner: "#1084",
+    what: "a batched decode step's f16 matmuls of 2 to kernels.gemm.f16_rows_max rows take the GEMV's row axis under fast (deterministic never does); --gemm-f16-rows-decode=false opts out",
+}, Exception {
+    decision: 54,
+    key: "kernels.gemm.f16_rows_decode",
+    frontend: Frontend::Bench,
+    when: When::MetalBatched,
+    before: "false",
+    after: "true",
+    landed: true,
+    owner: "#1084",
+    what: "a batched decode step's f16 matmuls of 2 to kernels.gemm.f16_rows_max rows take the GEMV's row axis under fast (deterministic never does); --gemm-f16-rows-decode=false opts out",
 }];
 
 /// The first row of `key` for `frontend`, if the front-end resolves it.

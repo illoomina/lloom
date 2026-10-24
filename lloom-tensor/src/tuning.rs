@@ -232,6 +232,11 @@ impl Contract {
     /// rows on the GEMV's row axis, named on the report line then.
     pub const F16_ROWS_ARM: &'static str = "f16-rows";
 
+    /// The arm `fast` takes in a batched decode step while
+    /// `kernels.gemm.f16_rows_decode` is on with the row axis
+    /// ([`f16_rows_decode`]): the step's rows on the GEMV's row axis.
+    pub const F16_ROWS_DECODE_ARM: &'static str = "f16-rows-decode";
+
     /// `profile=<name> arms=<list> cpu_f16_accum=<type>/<promote_every>:<instruction>`,
     /// for the report lines that say which contract a run held and which
     /// accumulator its CPU f16 matmuls ran (`cpu::f16_matmul`).
@@ -257,6 +262,9 @@ impl Contract {
                 let mut on: Vec<&str> = Contract::FAST_ARMS.to_vec();
                 if f16_rows_max().is_some() {
                     on.push(Contract::F16_ROWS_ARM);
+                    if f16_rows_decode() {
+                        on.push(Contract::F16_ROWS_DECODE_ARM);
+                    }
                 }
                 if on.is_empty() {
                     "none".to_string()
@@ -541,6 +549,79 @@ pub fn note_f16_rows() {
 /// The f16 row axis's engagement count now.
 pub fn f16_rows_launches() -> u64 {
     F16_ROWS_LAUNCHES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+thread_local! {
+    /// Open [`DecodeRows`] scopes on this thread.
+    static DECODE_ROWS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// A batched decode step's forward, open on this thread: one row per live
+/// sequence, one token each. Under `kernels.gemm.f16_rows_decode` its half
+/// matmuls of 2 to [`f16_rows_max`] rows take the GEMV's row axis.
+/// Thread-local and nestable, closed when the guard drops: a pass encoded on
+/// another thread keeps its own route.
+#[must_use = "the scope holds only while the guard is alive"]
+pub struct DecodeRows {
+    _thread: std::marker::PhantomData<*const ()>,
+}
+
+impl DecodeRows {
+    pub fn open() -> Self {
+        DECODE_ROWS.with(|c| c.set(c.get() + 1));
+        DecodeRows {
+            _thread: std::marker::PhantomData,
+        }
+    }
+}
+
+impl Drop for DecodeRows {
+    fn drop(&mut self) {
+        DECODE_ROWS.with(|c| c.set(c.get() - 1));
+    }
+}
+
+/// Whether a batched decode step's forward is open on this thread.
+pub fn in_decode_rows() -> bool {
+    DECODE_ROWS.with(|c| c.get() > 0)
+}
+
+/// `kernels.gemm.f16_rows_decode`: 0 unread, 1 off, 2 on.
+static F16_ROWS_DECODE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Launches a batched decode step's f16 matmuls took on the row axis since
+/// process start: the decode arm's engagement count.
+static F16_ROWS_DECODE_LAUNCHES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// `kernels.gemm.f16_rows_decode`, read once; or [`set_f16_rows_decode`].
+/// The decode rows take the axis only while it is on ([`f16_rows_max`]).
+pub fn f16_rows_decode() -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    match F16_ROWS_DECODE.load(Relaxed) {
+        1 => false,
+        2 => true,
+        _ => {
+            let on = tuning().gemm.f16_rows_decode;
+            F16_ROWS_DECODE.store(if on { 2 } else { 1 }, Relaxed);
+            on
+        }
+    }
+}
+
+/// Select the decode rows' arm for this process (a test runs both).
+pub fn set_f16_rows_decode(on: bool) {
+    F16_ROWS_DECODE.store(if on { 2 } else { 1 }, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Count one launch a batched decode step took on the row axis.
+pub fn note_f16_rows_decode() {
+    F16_ROWS_DECODE_LAUNCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The decode rows' engagement count now.
+pub fn f16_rows_decode_launches() -> u64 {
+    F16_ROWS_DECODE_LAUNCHES.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// The contract in force for this process: [`tuning`]'s `contract.profile`,
@@ -1082,6 +1163,15 @@ pub struct GemmTuning {
         status = "arm"
     )]
     pub f16_rows_max: usize,
+    /// Under `fast`, with `kernels.gemm.f16_rows` on, a batched decode step's f16 matmuls of 2 to `f16_rows_max` rows (one row per live sequence) take the GEMV's row axis: each weight block read once for every row, each row the one-row GEMV's bits; off = the GEMM from two rows. Only a step of decode rows: a step that carries prompt pieces, a single sequence's step and `deterministic` keep their routes.
+    #[opt(
+        flag = "gemm-f16-rows-decode",
+        env = "LLOOM_GEMM_F16_ROWS_DECODE",
+        bool,
+        path = "kernels.gemm.f16_rows_decode",
+        status = "arm"
+    )]
+    pub f16_rows_decode: bool,
 }
 
 impl Default for GemmTuning {
@@ -1100,6 +1190,7 @@ impl Default for GemmTuning {
             // axis is no slower than the GEMM at every row count to 10 and
             // slower at 12 on most of them.
             f16_rows_max: 10,
+            f16_rows_decode: false,
         }
     }
 }

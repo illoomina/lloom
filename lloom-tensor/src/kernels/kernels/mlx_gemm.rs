@@ -215,29 +215,39 @@ fn takes_gemv_route(m: usize, n: usize) -> bool {
     (m_is_vec && !suppress_m) || (n_is_vec && !suppress_n)
 }
 
-/// The rows a half matmul takes the GEMV's row axis at, or `None`: under
-/// `fast`, inside a verify window (`tuning::VerifyWindow::open`), with
-/// `kernels.gemm.f16_rows` on, `x · Wᵀ` of 2 to `f16_rows_max` contiguous
-/// rows (a batch folded into them as `check_batch_collapse` folds it)
-/// against one `[n, k]` row-major matrix at a tile the axis is instantiated
-/// at ([`gemv_rows_serves`]). One group holds every row, so the matrix is
-/// read once. Anything else takes the route it took before.
+/// The rows a half matmul takes the GEMV's row axis at, or `None`, and
+/// whether it is a batched decode step's: under `fast`, with
+/// `kernels.gemm.f16_rows` on, inside a verify window
+/// (`tuning::VerifyWindow::open`) or — with `kernels.gemm.f16_rows_decode`
+/// on too — a batched decode step's forward (`tuning::DecodeRows::open`),
+/// `x · Wᵀ` of 2 to `f16_rows_max` contiguous rows (a batch folded into them
+/// as `check_batch_collapse` folds it) against one `[n, k]` row-major matrix
+/// at a tile the axis is instantiated at ([`gemv_rows_serves`]). One group
+/// holds every row, so the matrix is read once. Anything else takes the
+/// route it took before.
 fn f16_rows_route(
     (dtype, out_dtype): (GemmDType, GemmDType),
     (b, m, n, k): (usize, usize, usize, usize),
     (a_trans, b_trans): (bool, bool),
     lhs_stride: &[usize],
     rhs_stride: &[usize],
-) -> Option<usize> {
+) -> Option<(usize, bool)> {
     if dtype != GemmDType::F16 || out_dtype != dtype || m < 2 || n == 1 || a_trans || !b_trans {
         return None;
     }
     let max = crate::tuning::f16_rows_max()?;
-    if !crate::tuning::contract().is_fast() || !crate::tuning::in_verify_window() {
+    if !crate::tuning::contract().is_fast() {
         return None;
     }
+    let decode = if crate::tuning::in_verify_window() {
+        false
+    } else if crate::tuning::in_decode_rows() && crate::tuning::f16_rows_decode() {
+        true
+    } else {
+        return None;
+    };
     let (batch, rows, _) = check_batch_collapse(b, m, k, a_trans, lhs_stride, rhs_stride);
-    (batch == 1 && rows <= max && gemv_rows_serves(n, k)).then_some(rows)
+    (batch == 1 && rows <= max && gemv_rows_serves(n, k)).then_some((rows, decode))
 }
 
 /// Select optimal tile configuration based on matrix dimensions, data type, transpose mode,
@@ -1866,17 +1876,23 @@ pub unsafe fn call_mlx_gemm_out(
         return Ok(());
     }
 
-    // Under `fast` a verify window's half rows take the GEMV's row axis while
-    // `kernels.gemm.f16_rows` is on: one weight sweep for the window's rows,
-    // each row the one-row GEMV's bits (`docs/tuning.md` §13.5y).
-    if let Some(rows) = f16_rows_route(
+    // Under `fast` a verify window's half rows — and, under
+    // `kernels.gemm.f16_rows_decode`, a batched decode step's — take the
+    // GEMV's row axis while `kernels.gemm.f16_rows` is on: one weight sweep
+    // for the rows, each row the one-row GEMV's bits (`docs/tuning.md`
+    // §13.5y, §13.5zb).
+    if let Some((rows, decode)) = f16_rows_route(
         (dtype, out_dtype),
         (b, m, n, k),
         (a_trans, b_trans),
         lhs_stride,
         rhs_stride,
     ) {
-        crate::tuning::note_f16_rows();
+        if decode {
+            crate::tuning::note_f16_rows_decode();
+        } else {
+            crate::tuning::note_f16_rows();
+        }
         // SAFETY: this function's contract (# Safety above).
         return unsafe {
             call_mlx_gemv_rows(

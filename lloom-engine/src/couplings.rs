@@ -196,6 +196,15 @@ pub const COUPLINGS: &[Coupling] = &[
         site: "lloom-engine/src/options.rs ExecutorConfig::pass_plans_armed",
         is_static: false,
     },
+    Coupling {
+        id: "C20",
+        kind: "ignored",
+        when: "kernels.gemm.f16_rows off, determinism = deterministic, scheduler.max_sequences = 1, or a batched step with prompt pieces or more live rows than kernels.gemm.f16_rows_max",
+        effect: "kernels.gemm.f16_rows_decode has no effect: the step's matmuls take the GEMM (the GEMV at one row; the one-row reduction per row under deterministic)",
+        keys: &["kernels.gemm.f16_rows_decode", "kernels.gemm.f16_rows", "kernels.gemm.f16_rows_max", "determinism", "scheduler.max_sequences"],
+        site: "lloom-tensor/src/kernels/kernels/mlx_gemm.rs f16_rows_route; lloom/src/nn/batched.rs BatchDecoder::forward_live (tuning::DecodeRows)",
+        is_static: false,
+    },
 ];
 
 /// The couplings naming `key`.

@@ -129,6 +129,7 @@ struct Shared {
     decisions: super::decisions::Decisions,
     /// Request threads queue here for the family's single request slot.
     turns: turns::Turns,
+    drains: ResponseDrains,
     /// Decisions that wait together join one group (`scheduler.decision_pack`,
     /// and the `fast` contract).
     decision_pack: bool,
@@ -156,6 +157,32 @@ struct Shared {
     /// Where the keep-warm reads the pressure level, when not the kernel
     /// (`server.keep_warm_pressure_file`).
     keep_warm_pressure_file: Option<String>,
+}
+
+const MAX_RESPONSE_DRAINS: usize = 8;
+const MAX_RESPONSE_BACKLOG: usize = 1 << 20;
+
+#[derive(Default)]
+struct ResponseDrains {
+    active: AtomicUsize,
+}
+struct ResponseDrain<'a> {
+    drains: &'a ResponseDrains,
+}
+impl ResponseDrains {
+    fn try_take(&self) -> Option<ResponseDrain<'_>> {
+        self.active
+            .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |n| {
+                (n < MAX_RESPONSE_DRAINS).then_some(n + 1)
+            })
+            .ok()
+            .map(|_| ResponseDrain { drains: self })
+    }
+}
+impl Drop for ResponseDrain<'_> {
+    fn drop(&mut self) {
+        self.drains.active.fetch_sub(1, Ordering::Release);
+    }
 }
 
 /// The largest `/v1/systemone` body a decision-only owner reads: eight
@@ -384,6 +411,7 @@ fn run_owner(
         engine,
         decisions,
         turns: turns::Turns::default(),
+        drains: ResponseDrains::default(),
         decision_pack: options.scheduler.decision_pack
             && lloom_tensor::tuning::contract().is_fast(),
         aborts: Mutex::new(HashSet::new()),
@@ -756,10 +784,24 @@ fn handle_model_request(
     }) {
         return respond_systemone(request, result);
     }
+    let _drain = if matches!(path, "/v1/completions" | "/v1/chat/completions") {
+        match shared.drains.try_take() {
+            Some(drain) => Some(drain),
+            None => {
+                return respond_error(
+                    request,
+                    503,
+                    "response drain capacity exhausted; retry after a response finishes",
+                )
+            }
+        }
+    } else {
+        None
+    };
     // A single-sequence engine's model requests take the request slot one at
     // a time; a batched engine schedules its own rows.
-    let _turn = (path != "/tokenize" && shared.engine.batch() <= 1).then(|| shared.turns.take());
-    if _turn.is_some() {
+    let mut turn = (path != "/tokenize" && shared.engine.batch() <= 1).then(|| shared.turns.take());
+    if turn.is_some() {
         first.slot = uptime_ns();
     }
     let value: Value = if body.trim().is_empty() {
@@ -768,6 +810,7 @@ fn handle_model_request(
         match serde_json::from_str(&body) {
             Ok(v) => v,
             Err(e) => {
+                drop(turn.take());
                 respond_error(request, 400, &format!("request body is not JSON: {e}"))?;
                 return Ok(());
             }
@@ -792,15 +835,32 @@ fn handle_model_request(
     };
     first.built = uptime_ns();
     match result {
-        Ok(Reply::Json(v)) => respond_json(request, 200, &v),
+        Ok(Reply::Json(v)) => {
+            drop(turn.take());
+            respond_json(request, 200, &v)
+        }
         Ok(Reply::Stream(mut stream)) => {
             stream.first = first;
-            stream_response(shared, request, *stream)
+            stream_response_settlement(
+                shared,
+                *stream,
+                || ChunkedWriter::start(request, "text/event-stream"),
+                || drop(turn.take()),
+            )
         }
         Ok(Reply::Eval(v)) => eval(shared, request, &v),
-        Err(Failure::BadRequest(m)) => respond_error(request, 400, &m),
-        Err(Failure::NotFound(m)) => respond_error(request, 404, &m),
-        Err(Failure::Internal(e)) => respond_error(request, 500, &format!("{e:#}")),
+        Err(Failure::BadRequest(m)) => {
+            drop(turn.take());
+            respond_error(request, 400, &m)
+        }
+        Err(Failure::NotFound(m)) => {
+            drop(turn.take());
+            respond_error(request, 404, &m)
+        }
+        Err(Failure::Internal(e)) => {
+            drop(turn.take());
+            respond_error(request, 500, &format!("{e:#}"))
+        }
     }
 }
 
@@ -1059,11 +1119,19 @@ fn run_decode(
 
 fn append_fields(to: &mut serde_json::Map<String, Value>, fields: serde_json::Map<String, Value>) {
     for (key, value) in fields {
-        let previous = to.get(&key).and_then(Value::as_str).unwrap_or("");
-        to.insert(
-            key,
-            Value::String(format!("{previous}{}", value.as_str().unwrap_or(""))),
-        );
+        let next = match value {
+            Value::String(text) => text,
+            _ => String::new(),
+        };
+        match to.entry(key) {
+            serde_json::map::Entry::Vacant(entry) => {
+                entry.insert(Value::String(next));
+            }
+            serde_json::map::Entry::Occupied(mut entry) => match entry.get_mut() {
+                Value::String(previous) => previous.push_str(&next),
+                previous => *previous = Value::String(next),
+            },
+        }
     }
 }
 
@@ -1076,12 +1144,13 @@ fn run_decode_observed(
     on_fragment: &mut (dyn FnMut(&str) -> bool + Send),
 ) -> Result<Decoded> {
     if let Some(split) = split {
+        let mut observer = reasoning::Observer::new(split);
         engine.complete_observed(
             prompt_ids,
             images,
             params,
             on_fragment,
-            &mut |ids, text, from, decode| split.lock().observe(ids, text, from, decode),
+            &mut |ids, text, from, decode| observer.observe(ids, text, from, decode),
         )
     } else {
         run_decode(engine, prompt_ids, images, params, on_fragment)
@@ -2634,6 +2703,7 @@ fn request_processors(
 /// Run the decode on this thread and write the OpenAI SSE stream as fragments
 /// arrive: chunked transfer through the request's raw writer, so a token is on
 /// the wire when the loop's commit drains it.
+#[cfg(test)]
 fn stream_response(shared: &Shared, request: Request, run: StreamingRun) -> Result<()> {
     stream_response_with_writer(shared, run, || {
         ChunkedWriter::start(request, "text/event-stream")
@@ -2643,10 +2713,20 @@ fn stream_response(shared: &Shared, request: Request, run: StreamingRun) -> Resu
 // The HTTP caller and deterministic I/O-failure controls use the same decode,
 // parser finalization, frontier recording and trailer path. Delay opening the
 // writer until the fallible reasoning metadata has been checked.
+#[cfg(test)]
 fn stream_response_with_writer(
     shared: &Shared,
     run: StreamingRun,
     start_writer: impl FnOnce() -> Result<ChunkedWriter>,
+) -> Result<()> {
+    stream_response_settlement(shared, run, start_writer, || {})
+}
+
+fn stream_response_settlement(
+    shared: &Shared,
+    run: StreamingRun,
+    start_writer: impl FnOnce() -> Result<ChunkedWriter>,
+    settled: impl FnOnce(),
 ) -> Result<()> {
     let endpoint = match run.kind {
         StreamKind::Completion => "/v1/completions",
@@ -2662,16 +2742,11 @@ fn stream_response_with_writer(
         StreamKind::Completion => None,
     }
     .map(|p| Arc::new(parking_lot::Mutex::new(p)));
-    // The reply as the client receives it: a session's turn keeps it.
-    let delivered = Arc::new(parking_lot::Mutex::new(
-        serde_json::Map::<String, Value>::new(),
-    ));
     // Each drained batch of text becomes one chunk, wrapped on the writer's
     // thread (the counted adapter defers unresolved reasoning prefixes).
     let wrap = {
         let (id, model, kind) = (run.id.clone(), run.model.clone(), run.kind);
         let split = split.clone();
-        let delivered = Arc::clone(&delivered);
         move |text: &str| -> (String, usize) {
             let (chunk, resolved) = match kind {
                 StreamKind::Completion => (
@@ -2689,7 +2764,6 @@ fn stream_response_with_writer(
                             text.len(),
                         ),
                     };
-                    append_fields(&mut delivered.lock(), delta.clone());
                     (
                         json!({
                             "id": id, "object": "chat.completion.chunk", "created": created, "model": model,
@@ -2738,41 +2812,22 @@ fn stream_response_with_writer(
                 if *fragment == 0 {
                     *fragment = uptime_ns();
                 }
-                sw.delta(frag);
-                true
+                sw.try_delta(frag)
             },
         )
     };
     let written = sw.written();
     let first_write = sw.first_write();
-    let (mut w, mut write_err) = sw.finish()?;
-    first.written = first_write.load(Ordering::Acquire);
+    let backlog_limited = sw.backlog_limited.load(Ordering::Relaxed);
     let decoded = match decoded {
         Ok(decoded) => decoded,
         Err(error) => {
             shared.sessions.lock().note_other();
+            settled();
+            let (w, _) = sw.finish()?;
             return finish_stream_error(w, error);
         }
     };
-    if write_err.is_none() {
-        if let Some(p) = split {
-            let (delta, resolved) = p.lock().finish_counted();
-            append_fields(&mut delivered.lock(), delta.clone());
-            if !delta.is_empty() {
-                match w.event(&json!({
-                    "id": run.id, "object": "chat.completion.chunk", "created": created, "model": run.model,
-                    "choices": [{"index": 0, "delta": delta, "finish_reason": null}],
-                })) {
-                    Ok(()) => {
-                        written.fetch_add(resolved, Ordering::Relaxed);
-                    }
-                    Err(error) => {
-                        write_err = Some(error);
-                    }
-                }
-            }
-        }
-    }
     // The accepted history is what the server handed the writer; of that,
     // what it knows it wrote, and whether a write failed (what the client
     // received is not known either way).
@@ -2787,15 +2842,15 @@ fn stream_response_with_writer(
         .map(|_| record_start.elapsed().as_micros() as u64);
     let frontier = logged.as_ref().map(|(f, _)| *f);
     let mut frontier_json = frontier.map_or(Value::Null, |f| f.json());
-    if frontier_json.is_object() {
-        frontier_json["written_bytes"] = json!(written.load(Ordering::Relaxed));
-        frontier_json["write_failed"] = json!(write_err.is_some());
-    }
     // The turn is kept whether or not the client stayed: the server's state
     // is what it accepted (the frontier), not what a client acknowledged.
     let (session_json, session_line) = match run.session {
         Some(ctx) => {
-            let mut message = Value::Object(std::mem::take(&mut *delivered.lock()));
+            let fields = match &split {
+                Some(parser) => parser.lock().accepted_fields(&decoded.text),
+                None => Map::from_iter([("content".into(), json!(decoded.text))]),
+            };
+            let mut message = Value::Object(fields);
             message["role"] = json!("assistant");
             if message.get("content").is_none() {
                 message["content"] = json!("");
@@ -2811,6 +2866,38 @@ fn stream_response_with_writer(
         }
         None => (Value::Null, String::new()),
     };
+    // Request checkout and callbacks have returned, and publication is complete.
+    // Device/native retirement remains the owner's existing contract, not a
+    // socket-drain witness. Capture mutable request metadata before release.
+    let vision = match run.kind {
+        StreamKind::Chat => shared.engine.vision_report_checked(),
+        StreamKind::Completion => Ok(Value::Null),
+    };
+    settled();
+    let (mut w, mut write_err) = sw.finish()?;
+    first.written = first_write.load(Ordering::Acquire);
+    if write_err.is_none() {
+        if let Some(p) = &split {
+            let (delta, resolved) = p.lock().finish_counted();
+            if !delta.is_empty() {
+                match w.event(&json!({
+                    "id": run.id, "object": "chat.completion.chunk", "created": created, "model": run.model,
+                    "choices": [{"index": 0, "delta": delta, "finish_reason": null}],
+                })) {
+                    Ok(()) => {
+                        written.fetch_add(resolved, Ordering::Relaxed);
+                    }
+                    Err(error) => {
+                        write_err = Some(error);
+                    }
+                }
+            }
+        }
+    }
+    if frontier_json.is_object() {
+        frontier_json["written_bytes"] = json!(written.load(Ordering::Relaxed));
+        frontier_json["write_failed"] = json!(write_err.is_some());
+    }
     if let Some(e) = write_err {
         anyhow::bail!("client went away mid-stream: {e}; frontier {frontier_json}");
     }
@@ -2853,6 +2940,7 @@ fn stream_response_with_writer(
         last["timings"]["session"] = session_json;
     }
     last["timings"]["front_record_us"] = json!(record_us);
+    last["timings"]["response_backlog_limit"] = json!(backlog_limited);
     last["timings"]["first_token"] = first.json(&decoded.stats);
     if run.return_ids {
         last["prompt_token_ids"] = json!(run.prompt_ids);
@@ -2860,8 +2948,10 @@ fn stream_response_with_writer(
         last["timings"]["tokens"] = json!(decoded.tokens);
     }
     write_stream_trailer(w, &mut last, |body| {
-        if let StreamKind::Chat = run.kind {
-            attach_vision(shared, body)?;
+        let vision = vision?;
+        if !vision.is_null() {
+            eprintln!("[vision: {vision}]");
+            body["vision"] = vision;
         }
         Ok(())
     })
@@ -3536,6 +3626,8 @@ struct StreamWriter {
     /// Set by the first delta, which wakes the writer rather than waiting
     /// for its next drain: one wake a request, none a token.
     woke: AtomicBool,
+    submitted: AtomicUsize,
+    backlog_limited: AtomicBool,
 }
 
 type Wrap = Arc<dyn Fn(&str) -> (String, usize) + Send + Sync>;
@@ -3651,6 +3743,8 @@ impl StreamWriter {
             order,
             spill: parking_lot::Mutex::new(String::new()),
             woke: AtomicBool::new(false),
+            submitted: AtomicUsize::new(0),
+            backlog_limited: AtomicBool::new(false),
         }
     }
 
@@ -3676,6 +3770,28 @@ impl StreamWriter {
             _ => None,
         };
         (work, closed)
+    }
+
+    /// Refuse a whole fragment before hand-over when unresolved raw bytes
+    /// would exceed the response's backlog budget. The engine's refusal seam
+    /// retains the earlier accepted frontier and reports cancellation.
+    fn try_delta(&self, text: &str) -> bool {
+        if self.backlog_limited.load(Ordering::Relaxed) {
+            return false;
+        }
+        let submitted = self.submitted.load(Ordering::Relaxed);
+        let written = self.written.load(Ordering::Relaxed);
+        let Some(next) = submitted.checked_add(text.len()) else {
+            self.backlog_limited.store(true, Ordering::Relaxed);
+            return false;
+        };
+        if next.saturating_sub(written) > MAX_RESPONSE_BACKLOG {
+            self.backlog_limited.store(true, Ordering::Relaxed);
+            return false;
+        }
+        self.submitted.store(next, Ordering::Relaxed);
+        self.delta(text);
+        true
     }
 
     /// Hand text to the writer (the decode thread's per-fragment call on a
@@ -4395,6 +4511,7 @@ pub fn bench(args: BenchArgs) -> Result<()> {
             "the benchmark cells do not take decisions".into(),
         ),
         turns: turns::Turns::default(),
+        drains: ResponseDrains::default(),
         decision_pack: false,
         aborts: Mutex::new(HashSet::new()),
         abort_epoch: AtomicU64::new(0),
@@ -4935,6 +5052,134 @@ mod request_processors_tests {
 }
 
 #[cfg(test)]
+mod delivered_field_tests {
+    use super::*;
+
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::cell::Cell;
+
+    thread_local! {
+        static REQUESTED: Cell<Option<usize>> = const { Cell::new(None) };
+    }
+    struct Counter;
+    #[global_allocator]
+    static ALLOCATOR: Counter = Counter;
+
+    fn record(bytes: usize) {
+        let _ = REQUESTED.try_with(|count| {
+            if let Some(previous) = count.get() {
+                count.set(Some(previous.saturating_add(bytes)));
+            }
+        });
+    }
+    // SAFETY: allocation/deallocation are forwarded unchanged to System;
+    // the optional thread-local scalar never dereferences allocator pointers.
+    unsafe impl GlobalAlloc for Counter {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            record(layout.size());
+            // SAFETY: the caller's allocator layout is forwarded unchanged.
+            unsafe { System.alloc(layout) }
+        }
+        unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+            record(layout.size());
+            // SAFETY: the caller's allocator layout is forwarded unchanged.
+            unsafe { System.alloc_zeroed(layout) }
+        }
+        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, size: usize) -> *mut u8 {
+            record(size);
+            // SAFETY: the caller's live allocation/layout/size are forwarded.
+            unsafe { System.realloc(ptr, layout, size) }
+        }
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            // SAFETY: the caller's allocation and its layout are forwarded.
+            unsafe { System.dealloc(ptr, layout) }
+        }
+    }
+    fn counted<T>(run: impl FnOnce() -> T) -> (T, usize) {
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                REQUESTED.with(|count| count.set(None));
+            }
+        }
+        REQUESTED.with(|count| {
+            assert!(count.get().is_none());
+            count.set(Some(0));
+        });
+        let _reset = Reset;
+        let result = run();
+        let bytes = REQUESTED.with(|count| count.get().unwrap());
+        (result, bytes)
+    }
+
+    #[test]
+    fn the_accumulator_allocation_counter_observes_a_known_allocation() {
+        let (allocated, bytes) = counted(|| std::hint::black_box(Vec::<u8>::with_capacity(1024)));
+        assert!(
+            bytes >= 1024,
+            "allocation instrument failed its positive control: {bytes}"
+        );
+        assert_eq!(allocated.capacity(), 1024);
+    }
+
+    #[test]
+    fn appending_fragments_does_not_recopy_the_retained_prefix() {
+        let (control, observed) = counted(|| std::hint::black_box(Vec::<u8>::with_capacity(1024)));
+        assert!(
+            observed >= 1024,
+            "allocation counter positive control failed: {observed}"
+        );
+        drop(control);
+        const N: usize = 2048;
+        let fragment = "aπ";
+        let mut retained = String::with_capacity(N * fragment.len());
+        retained.push_str(fragment);
+        let mut fields = Map::from_iter([("content".into(), Value::String(retained))]);
+        let mut recopied = 0;
+        let mut allocated = 0;
+        for _ in 1..N {
+            let before = fields["content"].as_str().unwrap();
+            let (address, len) = (before.as_ptr(), before.len());
+            let next = Map::from_iter([("content".into(), Value::String(fragment.into()))]);
+            let (_, bytes) = counted(|| append_fields(&mut fields, next));
+            allocated += bytes;
+            if fields["content"].as_str().unwrap().as_ptr() != address {
+                recopied += len;
+            }
+        }
+        assert_eq!(fields["content"], fragment.repeat(N));
+        eprintln!("ACCUMULATOR fragments={N} output_bytes={} relocated_prefix_bytes={recopied} requested_allocation_bytes={allocated}", N * fragment.len());
+        assert_eq!(
+            allocated, 0,
+            "pre-reserved append must allocate no prefix copy, including scratch copies"
+        );
+        assert_eq!(recopied, 0, "pre-reserved retained-prefix bytes recopied");
+    }
+
+    #[test]
+    fn delivered_fields_keep_the_existing_nonstring_and_empty_semantics() {
+        let mut fields = Map::from_iter([
+            ("content".into(), json!(42)),
+            ("reasoning_content".into(), json!("π")),
+        ]);
+        append_fields(
+            &mut fields,
+            Map::from_iter([
+                ("content".into(), json!("answer")),
+                ("reasoning_content".into(), Value::Null),
+                ("extension".into(), json!(false)),
+            ]),
+        );
+        assert_eq!(
+            Value::Object(fields),
+            json!({
+                "content":"answer", "reasoning_content":"π", "extension":""
+            })
+        );
+    }
+}
+
+#[cfg(test)]
 mod stream_writer_tests {
     use super::{ChunkedWriter, StreamWriter};
     use std::io::Write;
@@ -5155,6 +5400,67 @@ mod stream_writer_tests {
             body(&gate.written.lock().unwrap()),
             format!("start{pushed}")
         );
+    }
+
+    #[test]
+    fn a_blocked_writer_refuses_the_next_whole_utf8_fragment_at_the_backlog_bound() {
+        let gate = Gate::default();
+        let sw = StreamWriter::start_with_deltas(
+            ChunkedWriter {
+                w: Box::new(gate.clone()),
+            },
+            str::to_owned,
+        );
+        struct OpenOnDrop(Gate);
+        impl Drop for OpenOnDrop {
+            fn drop(&mut self) {
+                let (lock, changed) = &*self.0.open;
+                *lock.lock() = true;
+                changed.notify_all();
+            }
+        }
+        let _cleanup = OpenOnDrop(gate.clone());
+        sw.send("start".into());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while gate.writes.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        let text = "π".repeat(super::MAX_RESPONSE_BACKLOG / 2);
+        let accepted = sw.try_delta(&text);
+        let refused = !sw.try_delta("λ");
+        let backlog = sw.deltas.as_ref().unwrap().pending_bytes() + sw.spill.lock().len();
+        {
+            let (lock, changed) = &*gate.open;
+            *lock.lock() = true;
+            changed.notify_all();
+        }
+        let limited = sw
+            .backlog_limited
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let (_, error) = sw.finish().unwrap();
+        assert!(accepted && refused && limited);
+        assert_eq!(backlog, super::MAX_RESPONSE_BACKLOG);
+        assert!(error.is_none());
+        assert_eq!(body(&gate.written.lock().unwrap()), format!("start{text}"));
+    }
+
+    #[test]
+    fn response_context_admission_is_finite_and_reclaims_exactly_one_permit() {
+        let drains = super::ResponseDrains::default();
+        let mut held = Vec::new();
+        for _ in 0..super::MAX_RESPONSE_DRAINS {
+            held.push(drains.try_take().expect("capacity available"));
+        }
+        assert!(drains.try_take().is_none());
+        held.pop();
+        let replacement = drains
+            .try_take()
+            .expect("finished response releases permit");
+        assert!(drains.try_take().is_none());
+        drop(replacement);
+        drop(held);
+        assert_eq!(drains.active.load(std::sync::atomic::Ordering::Relaxed), 0);
     }
 
     /// A client that went away: the failed write is latched, the producer
@@ -5501,6 +5807,7 @@ mod checked_trailer_tests {
             engine,
             decisions: super::super::decisions::Decisions::Refused("test".into()),
             turns: turns::Turns::default(),
+            drains: ResponseDrains::default(),
             decision_pack: false,
             aborts: std::sync::Mutex::new(HashSet::new()),
             abort_epoch: AtomicU64::new(0),

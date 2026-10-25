@@ -19,6 +19,7 @@ enum Case {
     PartialTail,
     CompleteMarker,
     SplitMarker,
+    LongReply,
 }
 #[derive(Default)]
 struct Wire {
@@ -138,7 +139,11 @@ impl Served for Scripted {
         "scripted-tail"
     }
     fn kv_capacity(&self) -> usize {
-        64
+        if matches!(self.case, Case::LongReply) {
+            4 << 20
+        } else {
+            64
+        }
     }
     fn readback(&self) -> ReadbackArm {
         ReadbackArm::Blocking
@@ -241,12 +246,18 @@ impl Served for Scripted {
         };
         let ids = match self.case {
             Case::PartialTail => vec![97, end],
+            Case::LongReply => vec![97; 1 << 18],
             _ => vec![97, end, 88],
         };
         let mut stopped = false;
         let mut batched = String::new();
-        for id in ids {
-            let (fragment, hit) = stream.publish(&[id], &mut decoder, &stops)?;
+        let batch = if matches!(self.case, Case::LongReply) {
+            ids.len()
+        } else {
+            1
+        };
+        for batch in ids.chunks(batch) {
+            let (fragment, hit) = stream.publish(batch, &mut decoder, &stops)?;
             if let Some(fragment) = fragment {
                 if matches!(self.case, Case::SplitMarker) {
                     batched.push_str(&fragment);
@@ -344,6 +355,7 @@ fn run(
         front,
         decisions: super::super::decisions::Decisions::Refused("test".into()),
         turns: turns::Turns::default(),
+        drains: ResponseDrains::default(),
         decision_pack: false,
         aborts: Mutex::new(HashSet::new()),
         abort_epoch: AtomicU64::new(0),
@@ -775,4 +787,340 @@ fn a_family_without_decode_observations_splits_by_marker_text() {
         .unwrap();
     let a = p.push("literal </think> stays reasoning");
     assert_eq!(a.get("reasoning_content").and_then(|v| v.as_str()), Some("literal </think> stays reasoning"));
+}
+
+fn scripted_shared(case: Case) -> Arc<Shared> {
+    let progress = Progress::default();
+    let engine = Box::new(Scripted::new(case, progress));
+    let front = Front::new(engine.as_ref(), Default::default());
+    Arc::new(Shared {
+        engine,
+        front,
+        decisions: super::super::decisions::Decisions::Refused("test".into()),
+        turns: turns::Turns::default(),
+        drains: ResponseDrains::default(),
+        decision_pack: false,
+        aborts: Mutex::new(HashSet::new()),
+        abort_epoch: AtomicU64::new(0),
+        server: Server::http("127.0.0.1:0").unwrap(),
+        model_name: "scripted-tail".into(),
+        sampling: Default::default(),
+        reuse: ParkingMutex::new(Default::default()),
+        sessions: super::test_sessions(),
+        activity: Arc::new(keep_warm::Activity::new(0)),
+        keep_warm: keep_warm::Policy::Off { why: "test".into() },
+        keep_warm_pressure_file: None,
+    })
+}
+
+fn assert_continuation_during_drain(
+    case: Case,
+    writer: impl FnOnce() -> Result<ChunkedWriter> + Send + 'static,
+    blocked_rx: std::sync::mpsc::Receiver<()>,
+    release: impl FnOnce(),
+    disconnect: bool,
+) {
+    let shared = scripted_shared(case);
+    let max_tokens = if matches!(case, Case::LongReply) {
+        1 << 18
+    } else {
+        3
+    };
+    let (id_tx, id_rx) = std::sync::mpsc::channel();
+    let first_shared = Arc::clone(&shared);
+    let first = std::thread::spawn(move || {
+        let turn = first_shared.turns.take();
+        let reply = chat_completions(
+            &first_shared,
+            &json!({
+                "messages":[{"role":"user","content":"first"}],
+                "stream":true,"store":true,"max_tokens":max_tokens
+            }),
+            None,
+        )
+        .ok()
+        .expect("first request built");
+        let Reply::Stream(run) = reply else {
+            panic!("stream requested")
+        };
+        id_tx.send(run.id.clone()).unwrap();
+        let result = stream_response_settlement(&first_shared, *run, writer, || drop(turn));
+        if disconnect {
+            let error = result.unwrap_err().to_string();
+            assert!(error.contains("client went away mid-stream"), "{error}");
+        } else {
+            result.unwrap();
+        }
+    });
+    let id = id_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    blocked_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let (started, start_rx) = std::sync::mpsc::channel();
+    let next_shared = Arc::clone(&shared);
+    let next = std::thread::spawn(move || {
+        let _turn = next_shared.turns.take();
+        let reply = chat_completions(
+            &next_shared,
+            &json!({
+                "previous_response_id":id,"input":"continue","stream":true,"max_tokens":max_tokens
+            }),
+            None,
+        )
+        .ok()
+        .expect("published session resolves during prior drain");
+        let Reply::Stream(run) = reply else {
+            panic!("stream requested")
+        };
+        assert!(
+            run.facts.spliced.bound > 0,
+            "previous reply bound by its reference"
+        );
+        started.send(()).unwrap();
+        let split =
+            reasoning::Reasoning::for_chat(next_shared.engine.as_ref(), &run.prompt_ids, false)
+                .unwrap()
+                .map(|p| Arc::new(ParkingMutex::new(p)));
+        let decoded = run_decode_observed(
+            next_shared.engine.as_ref(),
+            &run.prompt_ids,
+            &[],
+            &run.params,
+            split.as_ref(),
+            &mut |_| true,
+        )
+        .unwrap();
+        if matches!(case, Case::LongReply) {
+            assert_eq!(decoded.text.len(), 1 << 18);
+            assert!(decoded.text.bytes().all(|b| b == b'a'));
+        } else {
+            assert_eq!(decoded.text, "a</think>X");
+        }
+    });
+    let progress_budget = if matches!(case, Case::LongReply) {
+        Duration::from_secs(2)
+    } else {
+        Duration::from_millis(250)
+    };
+    let progressed = start_rx.recv_timeout(progress_budget).is_ok();
+    release();
+    let first_result = first.join();
+    let next_result = next.join();
+    first_result.unwrap();
+    next_result.unwrap();
+    assert!(
+        progressed,
+        "next request's model start waited for the previous socket drain"
+    );
+}
+
+#[test]
+fn a_settled_session_and_next_model_request_do_not_wait_for_socket_drain() {
+    struct BlockedWriter {
+        entered: std::sync::mpsc::Sender<()>,
+        release: std::sync::mpsc::Receiver<()>,
+        first: bool,
+    }
+    impl Write for BlockedWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            if self.first {
+                self.first = false;
+                self.entered.send(()).unwrap();
+                self.release
+                    .recv_timeout(Duration::from_secs(5))
+                    .map_err(|e| io::Error::new(io::ErrorKind::TimedOut, e.to_string()))?;
+            }
+            Ok(())
+        }
+    }
+    let (blocked, blocked_rx) = std::sync::mpsc::channel();
+    let (release, release_rx) = std::sync::mpsc::channel();
+    assert_continuation_during_drain(
+        Case::CompleteMarker,
+        move || {
+            Ok(ChunkedWriter {
+                w: Box::new(BlockedWriter {
+                    entered: blocked,
+                    release: release_rx,
+                    first: true,
+                }),
+            })
+        },
+        blocked_rx,
+        || {
+            release.send(()).unwrap();
+        },
+        false,
+    );
+}
+
+#[cfg(unix)]
+fn bounded_sockets() -> (std::net::TcpStream, std::net::TcpStream) {
+    use std::net::{TcpListener, TcpStream};
+    use std::os::fd::AsRawFd;
+    fn socket_buffer(socket: &TcpStream, option: libc::c_int) {
+        let bytes: libc::c_int = 1024;
+        // SAFETY: the live socket owns the fd; bytes is a correctly sized,
+        // readable integer for the SOL_SOCKET buffer option.
+        let result = unsafe {
+            libc::setsockopt(
+                socket.as_raw_fd(),
+                libc::SOL_SOCKET,
+                option,
+                (&bytes as *const libc::c_int).cast(),
+                std::mem::size_of_val(&bytes) as libc::socklen_t,
+            )
+        };
+        assert_eq!(result, 0, "{}", io::Error::last_os_error());
+    }
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    let (socket, _) = listener.accept().unwrap();
+    socket_buffer(&socket, libc::SO_SNDBUF);
+    socket_buffer(&client, libc::SO_RCVBUF);
+    socket
+        .set_write_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    client
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    (client, socket)
+}
+
+#[cfg(unix)]
+struct SocketWriter {
+    socket: std::net::TcpStream,
+    entered: Option<std::sync::mpsc::Sender<()>>,
+    written: Arc<AtomicUsize>,
+}
+#[cfg(unix)]
+impl Write for SocketWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if bytes.len() > 64 << 10 {
+            if let Some(entered) = self.entered.take() {
+                entered.send(()).unwrap();
+            }
+        }
+        let n = self.socket.write(bytes)?;
+        self.written.fetch_add(n, Ordering::Relaxed);
+        Ok(n)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.socket.flush()
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn a_socket_draining_at_one_kib_per_second_does_not_own_the_next_model_request() {
+    let (mut client, socket) = bounded_sockets();
+    let slow = Arc::new(AtomicBool::new(true));
+    let read_slow = Arc::clone(&slow);
+    let reader = std::thread::spawn(move || {
+        let mut buf = [0; 1024];
+        let mut total = 0;
+        loop {
+            let n = client.read(&mut buf).unwrap();
+            if n == 0 {
+                return total;
+            }
+            total += n;
+            if read_slow.load(Ordering::Acquire) {
+                std::thread::sleep(Duration::from_secs(1));
+            }
+        }
+    });
+    let (entered, blocked_rx) = std::sync::mpsc::channel();
+    let written = Arc::new(AtomicUsize::new(0));
+    let sent = Arc::clone(&written);
+    let mut incomplete = false;
+    let mut received = 0;
+    assert_continuation_during_drain(
+        Case::LongReply,
+        move || {
+            Ok(ChunkedWriter {
+                w: Box::new(SocketWriter {
+                    socket,
+                    entered: Some(entered),
+                    written: sent,
+                }),
+            })
+        },
+        blocked_rx,
+        || {
+            incomplete = written.load(Ordering::Relaxed) < 1 << 18;
+            slow.store(false, Ordering::Release);
+            received = reader.join().unwrap();
+        },
+        false,
+    );
+    assert!(
+        incomplete,
+        "the whole response fit before the slow-socket witness"
+    );
+    assert!(received > 1 << 18, "response and trailer actually drained");
+}
+
+#[test]
+fn a_full_response_budget_refuses_the_actual_http_route_before_model_execution() {
+    use std::net::TcpStream;
+    let shared = scripted_shared(Case::CompleteMarker);
+    let held: Vec<_> = (0..MAX_RESPONSE_DRAINS)
+        .map(|_| shared.drains.try_take().unwrap())
+        .collect();
+    let tiny_http::ListenAddr::IP(address) = shared.server.server_addr() else {
+        panic!("IP test listener")
+    };
+    let mut client = TcpStream::connect(address).unwrap();
+    client
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let body = r#"{"prompt":"not executed","max_tokens":1}"#;
+    write!(client, "POST /v1/completions HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}", body.len()).unwrap();
+    let request = shared
+        .server
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap()
+        .unwrap();
+    handle_model_request(&shared, "/v1/completions", request, FirstToken::default()).unwrap();
+    let mut response = String::new();
+    client.read_to_string(&mut response).unwrap();
+    assert!(response.starts_with("HTTP/1.1 503"), "{response}");
+    assert!(
+        response.contains("response drain capacity exhausted"),
+        "{response}"
+    );
+    assert!(
+        shared.turns.try_take().is_some(),
+        "refused request left no model ticket"
+    );
+    assert_eq!(
+        shared.drains.active.load(Ordering::Relaxed),
+        MAX_RESPONSE_DRAINS
+    );
+    drop(held);
+    assert_eq!(shared.drains.active.load(Ordering::Relaxed), 0);
+}
+
+#[test]
+#[cfg(unix)]
+fn a_disconnect_during_socket_drain_keeps_the_published_reference_continuable() {
+    let (client, socket) = bounded_sockets();
+    let (entered, blocked_rx) = std::sync::mpsc::channel();
+    assert_continuation_during_drain(
+        Case::LongReply,
+        move || {
+            Ok(ChunkedWriter {
+                w: Box::new(SocketWriter {
+                    socket,
+                    entered: Some(entered),
+                    written: Arc::new(AtomicUsize::new(0)),
+                }),
+            })
+        },
+        blocked_rx,
+        || drop(client),
+        true,
+    );
 }

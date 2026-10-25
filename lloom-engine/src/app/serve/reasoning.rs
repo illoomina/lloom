@@ -1,14 +1,13 @@
-//! Chat wire fields: a reply's reasoning in `message.reasoning_content` /
-//! `delta.reasoning_content`, its answer in `content` (decision 51 Q2, the
-//! default on every family whose template has reasoning markers; a request
-//! opts out with `reasoning_in_content`). Control markers are identified by
-//! token id, never by a text search: ordinary tokens can spell the same
-//! literal text. Raw engine output/history and non-chat completions remain
-//! unchanged.
+//! Chat wire fields: reasoning in `reasoning_content`, the answer in `content`.
+//! `reasoning_in_content` opts out. Typed observations identify marker tokens,
+//! not ordinary tokens spelling the same literal; legacy adapters use the text
+//! fallback. Raw engine history and non-chat completions remain unchanged.
 use crate::app::served::Served;
 use anyhow::Result;
+use parking_lot::Mutex;
 use serde_json::{Map, Value};
 use std::collections::VecDeque;
+use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug)]
 enum Kind {
@@ -17,11 +16,13 @@ enum Kind {
     Tool,
 }
 
+#[derive(Clone)]
 struct Marker {
     id: u32,
     text: String,
     kind: Kind,
 }
+#[derive(Clone, Copy)]
 struct Event {
     start: usize,
     end: usize,
@@ -30,16 +31,90 @@ struct Event {
 
 pub(super) struct Reasoning {
     markers: Vec<Marker>,
-    events: VecDeque<Event>,
+    events: Arc<Mutex<Events>>,
+    initial_inside: bool,
     inside: bool,
     pending: String,
     offset: usize,
     /// Markers placed from the text itself (each marker's literal, with a
     /// partial suffix held back across pushes) because the family supplies no
-    /// decode observations (`Served::observes_decode`): the fallback that keeps
-    /// decision 51 Q2 on every family (#946, 2026-10-21). Observation-placed
+    /// decode observations (`Served::observes_decode`). Observation-placed
     /// markers are exact by id; text-placed ones match the marker's literal.
     by_text: bool,
+}
+
+const MAX_MARKERS: usize = 1 << 16;
+
+/// The producer replaces only its unpublished UTF-8 suffix. The consumer
+/// removes only markers completed by already accepted text; retained markers
+/// replay the accepted fields before a slow socket finishes.
+#[derive(Default)]
+struct Events {
+    pending: VecDeque<Event>,
+    retained: Vec<Event>,
+}
+
+pub(super) struct Observer {
+    markers: Vec<Marker>,
+    events: Arc<Mutex<Events>>,
+    scratch: Vec<Event>,
+}
+
+impl Observer {
+    pub(super) fn new(parser: &Arc<Mutex<Reasoning>>) -> Self {
+        parser.lock().observer()
+    }
+
+    pub(super) fn observe(
+        &mut self,
+        ids: &[u32],
+        text: &str,
+        from: usize,
+        decode: &dyn Fn(&[u32]) -> lloom_tensor::Result<String>,
+    ) -> lloom_tensor::Result<()> {
+        self.scratch.clear();
+        for (i, id) in ids.iter().enumerate() {
+            let Some(marker) = self.markers.iter().find(|marker| marker.id == *id) else {
+                continue;
+            };
+            let before = decode(&ids[..i])?;
+            let through = decode(&ids[..=i])?;
+            if !text.starts_with(&through)
+                || through.strip_prefix(&before) != Some(marker.text.as_str())
+            {
+                lloom_tensor::bail!("reasoning marker decoding is not an additive literal")
+            }
+            if self.scratch.len() == MAX_MARKERS {
+                lloom_tensor::bail!("response marker descriptor limit exceeded")
+            }
+            self.scratch.push(Event {
+                start: from + before.len(),
+                end: from + through.len(),
+                kind: marker.kind,
+            });
+        }
+        let mut events = self.events.lock();
+        while events
+            .pending
+            .back()
+            .is_some_and(|event| event.start >= from)
+        {
+            events.pending.pop_back();
+        }
+        while events
+            .retained
+            .last()
+            .is_some_and(|event| event.start >= from)
+        {
+            events.retained.pop();
+        }
+        if events.retained.len() + self.scratch.len() > MAX_MARKERS {
+            lloom_tensor::bail!("response marker descriptor limit exceeded")
+        }
+        events.pending.extend(self.scratch.iter().copied());
+        events.retained.extend(self.scratch.iter().copied());
+        Ok(())
+    }
 }
 
 impl Reasoning {
@@ -68,7 +143,8 @@ impl Reasoning {
         }
         Ok(Some(Self {
             markers,
-            events: VecDeque::new(),
+            events: Arc::new(Mutex::new(Events::default())),
+            initial_inside: tags.open_at_end(prompt).is_some(),
             inside: tags.open_at_end(prompt).is_some(),
             pending: String::new(),
             offset: 0,
@@ -99,7 +175,7 @@ impl Reasoning {
                 }
             }
             let Some((at, len, kind)) = best else { break };
-            self.events.push_back(Event {
+            self.events.lock().pending.push_back(Event {
                 start: base + at,
                 end: base + at + len,
                 kind,
@@ -118,9 +194,15 @@ impl Reasoning {
         hold
     }
 
-    /// A pending UTF-8 run can be decoded repeatedly before publication.
-    /// Replace only that run's events; older ones can still await the writer.
-    /// Prefixes are decoded with the exact generation decoder, not re-encoded.
+    fn observer(&self) -> Observer {
+        Observer {
+            markers: self.markers.clone(),
+            events: Arc::clone(&self.events),
+            scratch: Vec::with_capacity(16),
+        }
+    }
+
+    #[cfg(test)]
     pub(super) fn observe(
         &mut self,
         ids: &[u32],
@@ -128,36 +210,37 @@ impl Reasoning {
         from: usize,
         decode: &dyn Fn(&[u32]) -> lloom_tensor::Result<String>,
     ) -> lloom_tensor::Result<()> {
-        // observed_decode's pending-run origin never decreases: it advances
-        // only after nonempty complete UTF-8, by that run's decoded length.
-        // A completed run's additive marker starts are strictly before the
-        // next origin; replacements for the same pending run start at/after
-        // `from` and were appended as one suffix. The writer only pops the
-        // front under this same parser mutex, preserving that partition.
-        // Drop the replaceable suffix, not the lagging writer's whole history.
-        while self.events.back().is_some_and(|event| event.start >= from) {
-            self.events.pop_back();
-        }
-        for (i, id) in ids.iter().enumerate() {
-            let Some(marker) = self.markers.iter().find(|marker| marker.id == *id) else {
-                continue;
-            };
-            let before = decode(&ids[..i])?;
-            let through = decode(&ids[..=i])?;
-            // Do not silently classify a tokenizer whose special token is not
-            // an additive literal. This family promises these marker strings.
-            if !text.starts_with(&through)
-                || through.strip_prefix(&before) != Some(marker.text.as_str())
+        self.observer().observe(ids, text, from, decode)
+    }
+
+    /// Route the settled accepted text without waiting for network delivery.
+    /// Retained descriptors distinguish genuine marker ids from literal bytes.
+    pub(super) fn accepted_fields(&self, text: &str) -> Map<String, Value> {
+        let retained = self.events.lock().retained.clone();
+        let mut parser = Self {
+            markers: self.markers.clone(),
+            events: Arc::new(Mutex::new(Events {
+                pending: retained.into(),
+                retained: Vec::new(),
+            })),
+            initial_inside: self.initial_inside,
+            inside: self.initial_inside,
+            pending: String::new(),
+            offset: 0,
+            by_text: self.by_text,
+        };
+        let mut fields = parser.push(text);
+        for (key, value) in parser.finish() {
+            let next = value.as_str().unwrap_or("");
+            match fields
+                .entry(key)
+                .or_insert_with(|| Value::String(String::new()))
             {
-                lloom_tensor::bail!("reasoning marker decoding is not an additive literal")
+                Value::String(previous) => previous.push_str(next),
+                _ => unreachable!("reasoning fields are strings"),
             }
-            self.events.push_back(Event {
-                start: from + before.len(),
-                end: from + through.len(),
-                kind: marker.kind,
-            });
         }
-        Ok(())
+        fields
     }
 
     /// Only a genuine marker crossing a writer batch is held. A stop string
@@ -170,35 +253,34 @@ impl Reasoning {
             0
         };
         let (mut content, mut reasoning) = (String::new(), String::new());
+        let end = self.offset + self.pending.len() - hold;
+        let mut consumed = 0;
         loop {
-            let end = self.offset + self.pending.len() - hold;
-            let until = self
-                .events
-                .front()
-                .map_or(end, |event| event.start.min(end));
+            let event = self.events.lock().pending.front().copied();
+            let until = event.map_or(end, |event| event.start.min(end));
             let count = until - self.offset;
             let out = if self.inside {
                 &mut reasoning
             } else {
                 &mut content
             };
-            out.push_str(&self.pending[..count]);
-            self.pending.drain(..count);
+            out.push_str(&self.pending[consumed..consumed + count]);
+            consumed += count;
             self.offset = until;
-            let Some(event) = self.events.front() else {
+            let Some(event) = event else {
                 break;
             };
             if event.end > end {
                 break;
             }
-            let event = self.events.pop_front().unwrap();
+            self.events.lock().pending.pop_front();
             let count = event.end - self.offset;
             match event.kind {
                 Kind::Start if !self.inside => self.inside = true,
                 Kind::End if self.inside => self.inside = false,
                 Kind::Tool if self.inside => {
                     self.inside = false;
-                    content.push_str(&self.pending[..count]);
+                    content.push_str(&self.pending[consumed..consumed + count]);
                 }
                 _ => {
                     let out = if self.inside {
@@ -206,12 +288,13 @@ impl Reasoning {
                     } else {
                         &mut content
                     };
-                    out.push_str(&self.pending[..count]);
+                    out.push_str(&self.pending[consumed..consumed + count]);
                 }
             }
-            self.pending.drain(..count);
+            consumed += count;
             self.offset = event.end;
         }
+        self.pending.drain(..consumed);
         fields(content, reasoning)
     }
 
@@ -268,7 +351,8 @@ mod tests {
                 kind,
             })
             .collect(),
-            events: VecDeque::new(),
+            events: Arc::new(Mutex::new(Events::default())),
+            initial_inside: inside,
             inside,
             pending: String::new(),
             offset: 0,
@@ -298,6 +382,87 @@ mod tests {
         }
         (content, reasoning)
     }
+    #[test]
+    fn a_slow_observer_decoder_does_not_hold_the_consumer_parser() {
+        use std::sync::{mpsc, Arc};
+        use std::time::Duration;
+        let parser = Arc::new(parking_lot::Mutex::new(parser(true)));
+        parser
+            .lock()
+            .observe(&[97, 1001, 65], "a</think>A", 0, &decode)
+            .unwrap();
+        let mut observer = Observer::new(&parser);
+        let (entered, entry) = mpsc::channel();
+        let (release, released) = mpsc::channel();
+        let classifier = std::thread::spawn(move || {
+            let released = parking_lot::Mutex::new(released);
+            observer
+                .observe(&[1000], "<think>", 10, &|ids| {
+                    if ids.is_empty() {
+                        entered.send(()).unwrap();
+                        released
+                            .lock()
+                            .recv_timeout(Duration::from_secs(5))
+                            .unwrap();
+                    }
+                    decode(ids)
+                })
+                .unwrap();
+        });
+        entry.recv_timeout(Duration::from_secs(5)).unwrap();
+        let (sent, received) = mpsc::channel();
+        let consumer = std::thread::spawn(move || {
+            sent.send(parser.lock().push_counted("a</think>A")).unwrap();
+        });
+        let progressed = received.recv_timeout(Duration::from_millis(250));
+        release.send(()).unwrap();
+        classifier.join().unwrap();
+        consumer.join().unwrap();
+        let (fields, bytes) = progressed.expect("observer decoding held the consumer parser");
+        assert_eq!(collect([fields]), ("A".into(), "a".into()));
+        assert_eq!(bytes, 10);
+    }
+
+    #[test]
+    fn accepted_fields_do_not_depend_on_the_writer_consumption_frontier() {
+        for consumed in ["", "a<", "a</think>A"] {
+            let mut parser = parser(true);
+            parser
+                .observe(&[97, 1001, 65], "a</think>A", 0, &decode)
+                .unwrap();
+            parser.push(consumed);
+            assert_eq!(
+                collect([parser.accepted_fields("a</think>A")]),
+                ("A".into(), "a".into())
+            );
+            assert_eq!(
+                collect([parser.accepted_fields("a</thi")]),
+                ("".into(), "a</thi".into())
+            );
+        }
+    }
+
+    #[test]
+    fn marker_descriptors_have_a_finite_error_boundary() {
+        let parser = Arc::new(Mutex::new(parser(false)));
+        let mut observer = Observer::new(&parser);
+        for index in 0..MAX_MARKERS {
+            observer
+                .observe(&[1000], "<think>", index * 7, &decode)
+                .unwrap();
+        }
+        let error = observer
+            .observe(&[1000], "<think>", MAX_MARKERS * 7, &decode)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("response marker descriptor limit exceeded"),
+            "{error}"
+        );
+        assert_eq!(parser.lock().events.lock().retained.len(), MAX_MARKERS);
+        assert_eq!(parser.lock().events.lock().pending.len(), MAX_MARKERS);
+    }
+
     #[test]
     fn all_fragment_boundaries_preserve_channels_and_partial_tags() {
         for (open, ids, cut, content, reason) in [
@@ -494,7 +659,7 @@ mod tests {
             published.push_back(text.unwrap());
         }
         assert_eq!(
-            p.lock().events.len(),
+            p.lock().events.lock().pending.len(),
             GROUPS * 2,
             "historical events must really be retained"
         );
@@ -503,7 +668,10 @@ mod tests {
             raw_credited += resolved;
             parts.push(fields);
         }
-        assert_eq!(p.lock().events.len(), (GROUPS - drained_groups) * 2);
+        assert_eq!(
+            p.lock().events.lock().pending.len(),
+            (GROUPS - drained_groups) * 2
+        );
         // Spell the apparent markers with ordinary byte ids, not added ids.
         // They must remain literal content despite identical strings.
         let literal = " literal <think> </think> ";
@@ -518,7 +686,14 @@ mod tests {
         assert!(!stopped);
         published.push_back(text.unwrap());
         let pending_from = from;
-        let prefix: Vec<_> = p.lock().events.iter().map(|e| (e.start, e.end)).collect();
+        let prefix: Vec<_> = p
+            .lock()
+            .events
+            .lock()
+            .pending
+            .iter()
+            .map(|e| (e.start, e.end))
+            .collect();
         assert!(prefix.iter().all(|&(start, _)| start < pending_from));
         // Real first UTF-8 byte: observed text contains an additive genuine
         // marker but ends in U+FFFD, so TextStream publishes nothing.
@@ -530,27 +705,28 @@ mod tests {
                 from, pending_from,
                 "incomplete run must be replaced at the same origin"
             );
-            let guard = p.lock();
+            let parser = p.lock();
+            let guard = parser.events.lock();
             let actual_prefix: Vec<_> = guard
-                .events
+                .pending
                 .iter()
                 .take(prefix.len())
                 .map(|e| (e.start, e.end))
                 .collect();
             assert_eq!(actual_prefix, prefix, "historical prefix changed");
             assert_eq!(
-                guard.events.len(),
+                guard.pending.len(),
                 prefix.len() + 1,
                 "pending marker duplicated or history lost"
             );
-            assert_eq!(guard.events.back().unwrap().start, pending_from);
+            assert_eq!(guard.pending.back().unwrap().start, pending_from);
         }
         let (text, stopped) = publish(&[0x80], &mut stream, &mut from);
         assert!(!stopped);
         assert_eq!(text.as_deref(), Some("</think>π"));
         assert_eq!(from, pending_from + "</think>π".len());
         published.push_back(text.unwrap());
-        assert_eq!(p.lock().events.len(), prefix.len() + 1);
+        assert_eq!(p.lock().events.lock().pending.len(), prefix.len() + 1);
         let tail = " tail <think>";
         for byte in tail.bytes() {
             let (text, stopped) = publish(&[u32::from(byte)], &mut stream, &mut from);
@@ -570,7 +746,7 @@ mod tests {
         raw_credited += resolved;
         parts.push(fields);
         assert_eq!(raw_credited, raw.len());
-        assert!(p.lock().events.is_empty());
+        assert!(p.lock().events.lock().pending.is_empty());
         assert_eq!(
             collect(parts),
             (

@@ -122,6 +122,32 @@ tail remains output. A failed transport is not a successful completed stream
 and need not contain `[DONE]`. Server written-byte witnesses do not prove
 receipt by a client.
 
+Generating completions keep at most **eight response contexts**, including
+requests waiting for their model turn and responses still draining. A ninth
+request receives HTTP 503 (`response drain capacity exhausted`) before model
+execution. The context is reclaimed only when its response writer finishes.
+Each SSE response permits **1 MiB of unresolved raw text**, including the event
+currently being written. Exceeding that backlog refuses the next whole fragment:
+the earlier accepted frontier remains the history, `finish_reason` is
+`cancelled`, and `timings.response_backlog_limit` is true. Typed reasoning
+observations additionally permit 65,536 marker descriptors; exceeding that
+limit fails the run rather than silently treating marker tokens as literal text.
+
+The single-sequence model ticket is released after generation has returned its
+request checkout, the accepted reply/session is published, and request-bound
+metadata is captured — **before** socket draining. A continuation can therefore
+use `previous_response_id` while the preceding response still drains. Stored
+reply fields mean server-accepted text, not remotely acknowledged bytes;
+`written_bytes` and `write_failed` are settled later by transport. No GPU
+retirement certificate or additional global device wait is implied.
+
+These are response-context/backlog limits, not a process-memory, request-body,
+connection-thread, or wall-clock drain guarantee. An indefinitely stalled legacy
+writer can retain one of the eight contexts. Explicit controlled transport
+policies retain their separate I/O/cancellation limits; default listener read,
+disposal and pipelining policies are not changed here. Bulk `/eval` retains its
+existing exclusive-run/control-channel contract.
+
 Thinking is template- and model-dependent. On a compatible checkpoint:
 
 ```json

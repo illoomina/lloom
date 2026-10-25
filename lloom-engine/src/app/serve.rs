@@ -153,6 +153,9 @@ struct Shared {
     activity: Arc<keep_warm::Activity>,
     /// The keep-warm this server runs.
     keep_warm: keep_warm::Policy,
+    /// Where the keep-warm reads the pressure level, when not the kernel
+    /// (`server.keep_warm_pressure_file`).
+    keep_warm_pressure_file: Option<String>,
 }
 
 /// The largest `/v1/systemone` body a decision-only owner reads: eight
@@ -294,14 +297,19 @@ fn run_owner(
         options.server.keep_warm,
         options.server.keep_warm_for_s,
         &options.server.keep_warm_by,
+        options.server.keep_warm_pressure,
         engine.batch(),
         engine.device().is_metal(),
     )
     .map_err(|e| anyhow::anyhow!(e))?;
     let warm = keep_warm.short();
+    let residency = engine
+        .device()
+        .residency_line()
+        .unwrap_or_else(|| "residency=none".into());
     if let Some((load_start, reuse_prefix)) = load_facts {
         eprintln!(
-            "[loaded {} from {} in {:.2}s on {:?}; kv_capacity={} readback={} reuse_prefix={} keep_warm={warm} logprobs={logprobs} {}]",
+            "[loaded {} from {} in {:.2}s on {:?}; kv_capacity={} readback={} reuse_prefix={} keep_warm={warm} {residency} logprobs={logprobs} {}]",
             model_name,
             model_path.display(),
             load_start.elapsed().as_secs_f64(),
@@ -313,7 +321,7 @@ fn run_owner(
         );
     } else {
         eprintln!(
-            "[serving existing {} from {} on {:?}; kv_capacity={} readback={} reuse_prefix={} keep_warm={warm} logprobs={logprobs} {}]",
+            "[serving existing {} from {} on {:?}; kv_capacity={} readback={} reuse_prefix={} keep_warm={warm} {residency} logprobs={logprobs} {}]",
             model_name,
             model_path.display(),
             engine.device(),
@@ -392,6 +400,7 @@ fn run_owner(
         ))),
         activity: Arc::new(keep_warm::Activity::new(uptime_ns())),
         keep_warm,
+        keep_warm_pressure_file: options.server.keep_warm_pressure_file.clone(),
     });
     let heartbeat = start_keep_warm(&shared)?;
 
@@ -511,7 +520,13 @@ fn run_owner(
 /// never runs beside a request nor goes ahead of a queued one.
 fn start_keep_warm(shared: &Arc<Shared>) -> Result<Option<keep_warm::Heartbeat>> {
     eprintln!("[keep-warm: {}]", shared.keep_warm.sentence());
-    let keep_warm::Policy::On { period, window, by } = shared.keep_warm.clone() else {
+    let keep_warm::Policy::On {
+        period,
+        window,
+        by,
+        pressure,
+    } = shared.keep_warm.clone()
+    else {
         return Ok(None);
     };
     let s = Arc::clone(shared);
@@ -530,7 +545,31 @@ fn start_keep_warm(shared: &Arc<Shared>) -> Result<Option<keep_warm::Heartbeat>>
             },
         }
     };
-    keep_warm::Heartbeat::spawn(Arc::clone(&shared.activity), period, window, uptime_ns, act)
+    // Under memory pressure, both arms: the slot is free, so no request's
+    // command buffer is waiting on the memory this gives back.
+    let s = Arc::clone(shared);
+    let end = move || {
+        let Some(_turn) = s.turns.try_take() else {
+            return keep_warm::Act::Busy;
+        };
+        s.engine.device().end_residency();
+        keep_warm::Act::Done
+    };
+    let work = keep_warm::Beat {
+        clock: uptime_ns,
+        pressure: match (pressure, &shared.keep_warm_pressure_file) {
+            (true, Some(file)) => {
+                let _ = keep_warm::PRESSURE_FILE.set(file.into());
+                eprintln!("[keep-warm: the memory-pressure level is read from {file}]");
+                keep_warm::file_pressure
+            }
+            (true, None) => keep_warm::vm_pressure,
+            (false, _) => keep_warm::pressure_ignored,
+        },
+        act,
+        end,
+    };
+    keep_warm::Heartbeat::spawn(Arc::clone(&shared.activity), period, window, work)
         .map(Some)
         .context("spawning the keep-warm thread")
 }
@@ -4363,6 +4402,7 @@ pub fn bench(args: BenchArgs) -> Result<()> {
         keep_warm: keep_warm::Policy::Off {
             why: "the benchmark cells".into(),
         },
+        keep_warm_pressure_file: None,
     };
     let batch = options.scheduler.max_sequences.max(1);
     for run in 0..options.bench.runs.max(1) {
@@ -5462,6 +5502,7 @@ mod checked_trailer_tests {
             sessions: test_sessions(),
             activity: Arc::new(keep_warm::Activity::new(0)),
             keep_warm: keep_warm::Policy::Off { why: "test".into() },
+            keep_warm_pressure_file: None,
         };
         let run = StreamingRun {
             kind: StreamKind::Chat,

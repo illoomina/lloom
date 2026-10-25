@@ -662,6 +662,11 @@ fn dropping_the_last_device_handle_empties_the_residency_set() -> Result<()> {
         live.devices >= 1 && live.records >= 1,
         "a live device must hold the set's retirement open, read {live:?}"
     );
+    assert_eq!(
+        set.counters().ends,
+        0,
+        "a live device's residency must not have been ended"
+    );
 
     // The last handle goes here. `set` outlives it deliberately, which is the
     // whole point: once the device is gone there is nothing left to ask.
@@ -681,6 +686,11 @@ fn dropping_the_last_device_handle_empties_the_residency_set() -> Result<()> {
         0,
         "the retired device's records must have emptied the residency set \
          (`DESIGN.md` §6.3c)"
+    );
+    assert_eq!(
+        set.counters().ends,
+        1,
+        "the last device handle ends the set's residency once, at unload"
     );
     Ok(())
 }

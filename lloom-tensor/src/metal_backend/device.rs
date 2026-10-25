@@ -934,6 +934,31 @@ impl MetalDevice {
         self.residency_set.request_residency();
     }
 
+    /// Tells the OS the residency set's memory need not stay wired
+    /// ([`ResidencySet::end_residency`]): serve's keep-warm under memory
+    /// pressure. The next request, or a command buffer on a queue the set
+    /// is attached to, makes it resident again.
+    pub fn end_residency(&self) {
+        self.residency_set.end_residency();
+    }
+
+    /// Where the residency set stands for the loaded line: its attachment
+    /// (`kernels.residency.attach`), and its bytes at the last commit and
+    /// allocations, e.g. `residency=queue 1 set 8.12 GiB (1234 allocations)`.
+    pub fn residency_line(&self) -> String {
+        let attachment = self.commands.residency_attachment();
+        // SAFETY: reads the set's size only; nothing is borrowed past the call.
+        let bytes = unsafe { self.residency_set.raw() }
+            .map(objc2_metal::MTLResidencySet::allocatedSize)
+            .unwrap_or(0);
+        format!(
+            "residency={} 1 set {:.2} GiB ({} allocations)",
+            attachment.short(),
+            bytes as f64 / (1u64 << 30) as f64,
+            self.residency_set.len(),
+        )
+    }
+
     /// A handle to the residency set that outlives this device.
     ///
     /// Exists so the teardown guard can be observed from outside: after the

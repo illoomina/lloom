@@ -354,6 +354,7 @@ fn run(
         sessions: super::test_sessions(),
         activity: Arc::new(keep_warm::Activity::new(0)),
         keep_warm: keep_warm::Policy::Off { why: "test".into() },
+        keep_warm_pressure_file: None,
     };
     let run = StreamingRun {
         kind: StreamKind::Chat,

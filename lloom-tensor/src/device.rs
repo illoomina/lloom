@@ -549,6 +549,26 @@ impl Device {
         }
     }
 
+    /// Tells the OS the device's memory need not stay resident (Metal's
+    /// residency set): under memory pressure. Nothing to do on the other
+    /// backends.
+    pub fn end_residency(&self) {
+        #[cfg(feature = "metal")]
+        if let Self::Metal(d) = self {
+            d.end_residency();
+        }
+    }
+
+    /// The residency set's attachment and size, for a loaded line (`None`
+    /// off Metal).
+    pub fn residency_line(&self) -> Option<String> {
+        #[cfg(feature = "metal")]
+        if let Self::Metal(d) = self {
+            return Some(d.residency_line());
+        }
+        None
+    }
+
     pub fn synchronize(&self) -> Result<()> {
         match self {
             Self::Cpu => Ok(()),

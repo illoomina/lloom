@@ -32,7 +32,7 @@ cd "$(dirname "$0")/../.."
 # no other gate compiles — the CPU job builds them without `cuda`, the Metal
 # suite without `cuda` — so a lib-only check leaves them unchecked everywhere.
 # Every arm below runs the same CHECK, so the baseline arm is the whole gate.
-CHECK=(cargo check -p lloom-tensor --features cuda --lib --tests)
+CHECK=(cargo check --locked -p lloom-tensor --features cuda --lib --tests)
 
 # A stable, non-excluded kernel in the PTX build set (candle-kernels/build.rs
 # scans src/*.cu; affine.cu is not in its exclude list). The mutation is an

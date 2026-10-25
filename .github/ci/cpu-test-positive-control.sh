@@ -27,7 +27,7 @@ cd "$(dirname "$0")/../.."
 
 # The token-ring tests are modules of lloom's one test binary (tests/main.rs);
 # the `ci` profile is the gate's.
-CHECK=(cargo nextest run -p lloom --cargo-profile ci --no-fail-fast -E 'test(token_ring_fuzz::) | test(token_ring_tests::)')
+CHECK=(cargo nextest run --locked -p lloom --cargo-profile ci --no-fail-fast -E 'test(token_ring_fuzz::) | test(token_ring_tests::)')
 
 TARGET=lloom/src/generation/token_ring.rs
 ORIGINAL='.eq(&self.eos_ids)?'

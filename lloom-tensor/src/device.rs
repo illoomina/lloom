@@ -559,6 +559,19 @@ impl Device {
         }
     }
 
+    /// The Metal 4 queue's per-slot residency counts, as `(adds, commits,
+    /// last_bytes, max_bytes)` (`kernels.residency.slot_trace`; `None` off
+    /// Metal 4 or with the instrument off).
+    pub fn metal4_slot_residency(&self) -> Option<(u64, u64, u64, u64)> {
+        #[cfg(feature = "metal")]
+        if let Self::Metal(d) = self {
+            return d
+                .metal4_slot_residency()
+                .map(|s| (s.adds, s.commits, s.last_bytes, s.max_bytes));
+        }
+        None
+    }
+
     /// The residency set's attachment and size, for a loaded line (`None`
     /// off Metal).
     pub fn residency_line(&self) -> Option<String> {

@@ -323,7 +323,10 @@ fn slot_backing(
     #[cfg(feature = "metal")]
     if let Device::Metal(m) = device {
         use lloom_tensor::{op::BackpropOp, MetalStorage, Storage};
-        let handle = m.new_persistent_shared(_bytes)?;
+        let handle = lloom_tensor::residency_class::residency_class_scope(
+            lloom_tensor::residency_class::ResidencyClass::Experts,
+            || m.new_persistent_shared(_bytes),
+        )?;
         let storage = MetalStorage::new_allocated(handle, m.clone(), _elems, dtype)?;
         return Ok(Tensor::from_storage(
             Storage::Metal(storage),

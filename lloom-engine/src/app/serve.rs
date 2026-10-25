@@ -428,6 +428,16 @@ fn run_owner(
                     b["sessions"] = shared.sessions.lock().json();
                     b["keep_warm"] = shared.keep_warm.json(&shared.activity, uptime_ns());
                     b["keep_warm_actions"] = json!(shared.activity.actions.load(Ordering::Relaxed));
+                    if let Some((adds, commits, last, max)) =
+                        shared.engine.device().metal4_slot_residency()
+                    {
+                        b["metal4_slot_residency"] = json!({
+                            "adds": adds,
+                            "commits": commits,
+                            "last_bytes": last,
+                            "max_bytes": max,
+                        });
+                    }
                     b
                 });
                 let _ = respond_metadata(request, result);

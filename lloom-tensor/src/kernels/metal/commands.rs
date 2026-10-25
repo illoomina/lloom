@@ -144,9 +144,8 @@ fn attach_device_set(
     // SAME Arc into Core; no allAllocations extraction or out-of-band
     // residency mutation occurs here. This is not an alias terminality proof.
     match unsafe { residency_set.raw() } {
-        Some(raw) if decided.attached => {
-            command_queue.addResidencySet(raw);
-            residency_set.note_queue_attached();
+        Some(_) if decided.attached => {
+            residency_set.attach_queue(command_queue);
             decided
         }
         _ => ResidencyAttachment {
@@ -1299,6 +1298,13 @@ impl Commands {
     /// for and whether the set is on the queue (`kernels.residency.attach`).
     pub fn residency_attachment(&self) -> ResidencyAttachment {
         self.core.residency_attachment
+    }
+
+    /// What the Metal 4 queue's per-slot residency sets did
+    /// (`kernels.residency.slot_trace`); `None` on Metal 3 or with the
+    /// instrument off.
+    pub fn metal4_slot_residency(&self) -> Option<super::SlotResidency> {
+        self.core.modern_queue.as_ref()?.slot_residency()
     }
 
     /// The native command API actually installed on this queue.

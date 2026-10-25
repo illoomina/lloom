@@ -1316,3 +1316,200 @@ fn reply_storage_capacities_are_not_hidden_behind_shared_arcs() {
         assert_charge(&t);
     }
 }
+
+#[test]
+fn stored_message_numbers_and_nested_tool_values_are_exact() {
+    let mut floats = vec![
+        0.0,
+        -0.0,
+        f64::MIN_POSITIVE,
+        f64::MAX,
+        f64::from_bits(1),
+        f64::from_bits(0x000f_ffff_ffff_ffff),
+        51.248178375505404,
+        -93.31137037688033,
+        -36.573994842753436,
+        52.314008204106244,
+        97.45365320034685,
+        2.0030397744267762e-253,
+        7.101215824554616e260,
+        1.769268377902049e74,
+        -1.6727517818542075e58,
+        3.9287532173373315e299,
+    ];
+    let mut bits = 0x4837_12fa_93be_714du64;
+    for _ in 0..4096 {
+        bits ^= bits << 13;
+        bits ^= bits >> 7;
+        bits ^= bits << 17;
+        let value = f64::from_bits(bits);
+        if value.is_finite() {
+            floats.push(value);
+        }
+    }
+    let mut float_mismatches = 0;
+    let mut integer_mismatches = 0;
+    let mut examples = Vec::new();
+    let cases = floats.len();
+    for value in floats {
+        let message = json!({"role":"assistant","tool_calls":[{"id":"call-π",
+            "type":"function","function":{"name":"numeric-tool","arguments":{
+                "value":value,"nested":[{"large":u64::MAX,"low":i64::MIN}],
+                "text":"escaped \\ \" \n π"}}}]});
+        let prepared = PreparedRecord::new(Record {
+            messages: vec![message.clone()],
+            reply_msg: json!({"role":"assistant","content":"r"}),
+            prompt_ids: vec![1],
+            reply: reply(&[2]),
+            eot: None,
+            scope: Scope::test(1),
+            prefix: None,
+        })
+        .unwrap();
+        let restored = serde_json::from_str::<Value>(prepared.messages[0].as_ref());
+        let same = restored.as_ref().ok().is_some_and(|restored| {
+            restored["tool_calls"][0]["function"]["arguments"]["value"]
+                .as_f64()
+                .is_some_and(|actual| actual.to_bits() == value.to_bits())
+                && serde_json::to_string(restored).unwrap()
+                    == serde_json::to_string(&message).unwrap()
+        });
+        if !same {
+            float_mismatches += 1;
+            if examples.len() < 8 {
+                examples.push(format!(
+                    "original={value:?} bits={:016x} restored={restored:?}",
+                    value.to_bits()
+                ));
+            }
+        }
+    }
+    for value in [0, i64::MAX as u64, i64::MAX as u64 + 1, u64::MAX] {
+        let message = json!({"role":"tool","content":{"values":[value,{"again":value}]}});
+        let prepared = PreparedRecord::new(Record {
+            messages: vec![message.clone()],
+            reply_msg: Value::Null,
+            prompt_ids: vec![1],
+            reply: reply(&[2]),
+            eot: None,
+            scope: Scope::test(1),
+            prefix: None,
+        })
+        .unwrap();
+        let restored: Value = serde_json::from_str(prepared.messages[0].as_ref()).unwrap();
+        if restored["content"]["values"][0].as_u64() != Some(value) || restored != message {
+            integer_mismatches += 1;
+            if examples.len() < 8 {
+                examples.push(format!("integer={value} restored={restored}"));
+            }
+        }
+    }
+    eprintln!("retention numeric fidelity float_cases={cases} float_mismatches={float_mismatches} integer_cases=4 integer_mismatches={integer_mismatches} examples={examples:?}");
+    assert_eq!(
+        float_mismatches + integer_mismatches,
+        0,
+        "stored JSON must preserve numeric bits, negative zero and nested prompt/template values"
+    );
+}
+
+#[test]
+fn every_mutation_boundary_keeps_the_retention_charge_and_cap() {
+    let mut t = Table::new(Config {
+        max_bytes: 16 * 1024,
+        ..cfg(2, true)
+    });
+    let now = Instant::now();
+    assert_charge(&t);
+    let a = turn(
+        &mut t,
+        None,
+        None,
+        Some([2; 32]),
+        &[1],
+        &scopes(1),
+        &[2],
+        now,
+    );
+    assert_charge(&t);
+    let found = t.resolve(&a.encode(), Some([2; 32]), true, now).unwrap();
+    assert_charge(&t);
+    let ss = scopes(3);
+    let r = t.reserve(
+        Plan {
+            continued: Some((found.key, found.turn)),
+            store: Some(true),
+            keep: None,
+            auth: Some([2; 32]),
+            prompt_ids: &[1, 2, 3],
+            scopes: &ss,
+        },
+        now,
+    );
+    assert_charge(&t);
+    let p = PreparedRecord::new(Record {
+        messages: vec![json!({"role":"user","content":"q"})],
+        reply_msg: json!({"role":"assistant","content":"r"}),
+        prompt_ids: vec![1, 2, 3],
+        reply: reply(&[4]),
+        eot: None,
+        scope: ss[3],
+        prefix: None,
+    })
+    .unwrap();
+    let publication = t.publish(r, p, now);
+    assert!(publication.retained);
+    drop(publication);
+    assert_charge(&t);
+    assert!(t.inspect(&r.id.encode(), Some([2; 32]), now).is_ok());
+    assert_charge(&t);
+    t.reset(r.id.key);
+    assert_charge(&t);
+    assert!(t.resolve(&r.id.encode(), Some([2; 32]), true, now).is_err());
+    assert_charge(&t);
+    let fork_scopes = [Scope::test(90), Scope::test(91)];
+    let next = t.reserve(
+        Plan {
+            continued: Some((r.id.key, 0)),
+            store: None,
+            keep: None,
+            auth: Some([2; 32]),
+            prompt_ids: &[8],
+            scopes: &fork_scopes,
+        },
+        now,
+    );
+    assert_charge(&t);
+    assert!(t.commit(
+        next,
+        Record {
+            messages: vec![json!({"role":"user","content":"fork"})],
+            reply_msg: json!({"role":"assistant","content":"r"}),
+            prompt_ids: vec![8],
+            reply: reply(&[9]),
+            eot: None,
+            scope: fork_scopes[1],
+            prefix: None
+        },
+        now
+    ));
+    assert_charge(&t);
+    assert!(t.delete(&next.id.encode(), Some([2; 32]), now).is_ok());
+    assert_charge(&t);
+    let idle = turn(&mut t, None, Some(true), None, &[1], &scopes(1), &[2], now);
+    assert_charge(&t);
+    assert!(t
+        .resolve(&idle.encode(), None, false, now + Duration::from_secs(61))
+        .is_err());
+    assert_charge(&t);
+    let ephemeral = turn(&mut t, None, None, None, &[1], &scopes(1), &[2], now);
+    assert_charge(&t);
+    t.note_other();
+    assert_charge(&t);
+    assert!(t.resolve(&ephemeral.encode(), None, false, now).is_err());
+    assert_charge(&t);
+    let retained = turn(&mut t, None, Some(true), None, &[1], &scopes(1), &[2], now);
+    let removed = t.free(retained.key.slot as usize, Some(Reason::Delete));
+    assert_charge(&t);
+    drop(removed);
+    assert_charge(&t);
+}

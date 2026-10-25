@@ -1037,3 +1037,6 @@ impl Table {
 #[cfg(test)]
 #[path = "sessions_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod storage;

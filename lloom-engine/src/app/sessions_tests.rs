@@ -926,6 +926,7 @@ mod allocation_receipt {
     use std::sync::atomic::{AtomicIsize, AtomicUsize, Ordering};
     pub static ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
     pub static LIVE: AtomicIsize = AtomicIsize::new(0);
+    pub static BLOCKS: AtomicIsize = AtomicIsize::new(0);
     pub struct Allocator;
     // SAFETY: every allocation/deallocation is forwarded unchanged to System;
     // the counter observes requested live allocation bytes only.
@@ -934,12 +935,14 @@ mod allocation_receipt {
             let ptr = unsafe { System.alloc(layout) };
             if !ptr.is_null() {
                 ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+                BLOCKS.fetch_add(1, Ordering::Relaxed);
                 LIVE.fetch_add(layout.size() as isize, Ordering::Relaxed);
             }
             ptr
         }
         unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
             LIVE.fetch_sub(layout.size() as isize, Ordering::Relaxed);
+            BLOCKS.fetch_sub(1, Ordering::Relaxed);
             unsafe { System.dealloc(ptr, layout) };
         }
     }
@@ -1512,4 +1515,131 @@ fn every_mutation_boundary_keeps_the_retention_charge_and_cap() {
     assert_charge(&t);
     drop(removed);
     assert_charge(&t);
+}
+
+struct MaskedJson<'a>(&'a Value);
+
+impl serde::Serialize for MaskedJson<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::{SerializeMap, SerializeSeq};
+        match self.0 {
+            Value::Number(number) if number.is_f64() => serializer.serialize_f64(0.0),
+            Value::Array(values) => {
+                let mut seq = serializer.serialize_seq(Some(values.len()))?;
+                for value in values {
+                    seq.serialize_element(&MaskedJson(value))?;
+                }
+                seq.end()
+            }
+            Value::Object(values) => {
+                let mut map = serializer.serialize_map(Some(values.len()))?;
+                for (key, value) in values {
+                    map.serialize_entry(key, &MaskedJson(value))?;
+                }
+                map.end()
+            }
+            value => serde::Serialize::serialize(value, serializer),
+        }
+    }
+}
+
+fn masked_storage_candidate(value: &Value) -> (Box<str>, Box<[u64]>) {
+    fn floats(value: &Value, bits: &mut Vec<u64>) {
+        match value {
+            Value::Number(number) if number.is_f64() => {
+                bits.push(number.as_f64().unwrap().to_bits())
+            }
+            Value::Array(values) => {
+                for value in values {
+                    floats(value, bits);
+                }
+            }
+            Value::Object(values) => {
+                for value in values.values() {
+                    floats(value, bits);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut bits = Vec::new();
+    floats(value, &mut bits);
+    (
+        serde_json::to_string(&MaskedJson(value))
+            .unwrap()
+            .into_boxed_str(),
+        bits.into_boxed_slice(),
+    )
+}
+
+#[test]
+fn storage_representation_requested_footprint() {
+    use super::storage::StoredMessage;
+    use std::sync::atomic::Ordering;
+    fn measure<T>(build: impl FnOnce() -> T) -> (isize, isize) {
+        let before = allocation_receipt::LIVE.load(Ordering::Relaxed);
+        let blocks = allocation_receipt::BLOCKS.load(Ordering::Relaxed);
+        let owned = Box::new(build());
+        std::hint::black_box(&owned);
+        let result = (
+            allocation_receipt::LIVE.load(Ordering::Relaxed) - before,
+            allocation_receipt::BLOCKS.load(Ordering::Relaxed) - blocks,
+        );
+        drop(owned);
+        assert_eq!(allocation_receipt::LIVE.load(Ordering::Relaxed), before);
+        assert_eq!(allocation_receipt::BLOCKS.load(Ordering::Relaxed), blocks);
+        result
+    }
+    eprintln!("STORAGE-COST System retained allocation requests and blocks; root boxed uniformly; inputs excluded; N=3 per case; no throughput/RSS claim");
+    let cases = [
+        (
+            "short-chat",
+            json!({"role":"user","content":"What is the capital of France?"}),
+        ),
+        (
+            "long-chat",
+            json!({"role":"user","content":"x".repeat(8192)}),
+        ),
+        (
+            "nested-tool",
+            json!({"role":"assistant","content":null,"tool_calls":[{"id":"call-π",
+            "type":"function","function":{"name":"numeric-tool","arguments":{"value":51.248178375505404,
+                "negative_zero":-0.0,"nested":[{"large":u64::MAX,"low":i64::MIN}],"text":"escaped \\ \" \n π"}}}]}),
+        ),
+        (
+            "numeric-array",
+            json!({"role":"tool","content":vec![0.1f64;1024]}),
+        ),
+        (
+            "small-history",
+            Value::Array(
+                (0..32)
+                    .map(|n| json!({"role":"user","content":format!("turn-{n}")}))
+                    .collect(),
+            ),
+        ),
+    ];
+    for (name, value) in cases {
+        let mut previous = None;
+        for run in 0..3 {
+            let baseline = measure(|| value.clone());
+            let compact = measure(|| StoredMessage::new(value.clone()));
+            let masked = measure(|| masked_storage_candidate(&value));
+            let check = StoredMessage::new(value.clone());
+            assert_eq!(
+                compact.0 as usize,
+                size_of::<StoredMessage>() + check.heap_bytes()
+            );
+            assert_eq!(
+                serde_json::to_string(&check.value()).unwrap(),
+                serde_json::to_string(&value).unwrap()
+            );
+            if let Some(prior) = previous {
+                assert_eq!(prior, (baseline, compact, masked));
+            }
+            previous = Some((baseline, compact, masked));
+            eprintln!("STORAGE-COST case={name} run={run} value_bytes={} value_blocks={} compact_bytes={} compact_blocks={} masked_bytes={} masked_blocks={}",
+                baseline.0, baseline.1, compact.0, compact.1, masked.0, masked.1);
+        }
+    }
 }

@@ -1310,8 +1310,10 @@ fn serve_keeps_warm_by_default_on_metal_at_one_sequence() {
 }
 
 /// Decision 54: serve and bench resolve the batched decode rows' arm on at a
-/// batch on Metal. At one sequence, on chat, on the CPU and wherever a layer
-/// names the key, the library's off (or the value named) holds.
+/// batch on Metal no wider than the row axis's ceiling. At one sequence, at a
+/// batch past the ceiling, on chat, on the CPU and wherever a layer names the
+/// key, the library's off (or the value named) holds; a ceiling raised by key
+/// moves the widest batch with it.
 #[test]
 fn the_batched_decode_rows_arm_is_on_at_a_batch_on_metal() {
     let none = BTreeMap::new();
@@ -1337,6 +1339,30 @@ fn the_batched_decode_rows_arm_is_on_at_a_batch_on_metal() {
             get(f, &["--set", "scheduler.max_sequences=2"], &none),
             Value::Bool(metal),
             "{name} at a batch, by key"
+        );
+        assert_eq!(
+            get(f, &["--batch", "10"], &none),
+            Value::Bool(metal),
+            "{name} at a batch of the ceiling"
+        );
+        assert_eq!(
+            get(f, &["--batch", "11"], &none),
+            Value::Bool(false),
+            "{name} at a batch past the ceiling"
+        );
+        assert_eq!(
+            get(f, &["--batch", "16"], &none),
+            Value::Bool(false),
+            "{name} at a batch of 16"
+        );
+        assert_eq!(
+            get(
+                f,
+                &["--batch", "12", "--set", "kernels.gemm.f16_rows_max=12"],
+                &none
+            ),
+            Value::Bool(metal),
+            "{name} at a batch of a raised ceiling"
         );
         assert_eq!(
             get(f, &[], &none),
@@ -1372,7 +1398,8 @@ fn the_batched_decode_rows_arm_is_on_at_a_batch_on_metal() {
     }
     assert_eq!(
         frontend::describe(key).unwrap(),
-        "serve: true when on Metal at scheduler.max_sequences > 1 (decision 54: was false), \
-         bench: true when on Metal at scheduler.max_sequences > 1 (decision 54: was false)"
+        "serve: true when on Metal at scheduler.max_sequences from 2 to \
+         kernels.gemm.f16_rows_max (decision 54: was false), bench: true when on Metal at \
+         scheduler.max_sequences from 2 to kernels.gemm.f16_rows_max (decision 54: was false)"
     );
 }

@@ -82,9 +82,12 @@ pub enum When {
     /// serve keep-warm takes the single-sequence request slot, which a
     /// batched server does not have.
     MetalSingle,
-    /// [`When::Metal`] at a batch (`scheduler.max_sequences` above 1): the
+    /// [`When::Metal`] at a batch no wider than the row axis's ceiling
+    /// (`scheduler.max_sequences` from 2 to `kernels.gemm.f16_rows_max`): the
     /// batched decode step's rows on the GEMV's row axis, a Metal kernel
-    /// reached only by the batched loop.
+    /// reached only by the batched loop. Every step of such a batch fits
+    /// under the ceiling, so a row's route never depends on how many rows its
+    /// steps held, which follows the requests' arrival.
     MetalBatched,
 }
 
@@ -114,7 +117,11 @@ impl When {
                     && matches!(o.model.cache.as_str(), "auto" | "rewindable")
             }
             When::MetalSingle => When::Metal.holds(o) && o.scheduler.max_sequences == 1,
-            When::MetalBatched => When::Metal.holds(o) && o.scheduler.max_sequences > 1,
+            When::MetalBatched => {
+                When::Metal.holds(o)
+                    && o.scheduler.max_sequences > 1
+                    && o.scheduler.max_sequences <= o.tuning.gemm.f16_rows_max
+            }
         }
     }
 
@@ -128,7 +135,9 @@ impl When {
                 "speculative.method = dspark at scheduler.max_sequences = 1 on the auto or rewindable preset (LFM2, on Metal)"
             }
             When::MetalSingle => "on Metal at scheduler.max_sequences = 1",
-            When::MetalBatched => "on Metal at scheduler.max_sequences > 1",
+            When::MetalBatched => {
+                "on Metal at scheduler.max_sequences from 2 to kernels.gemm.f16_rows_max"
+            }
         }
     }
 }
@@ -395,7 +404,7 @@ pub const EXCEPTIONS: &[Exception] = &[Exception {
     after: "true",
     landed: true,
     owner: "#1084",
-    what: "a batched decode step's f16 matmuls of 2 to kernels.gemm.f16_rows_max rows take the GEMV's row axis under fast (deterministic never does); --gemm-f16-rows-decode=false opts out",
+    what: "at a batch of 2 to kernels.gemm.f16_rows_max sequences, a batched step's live rows take the GEMV's row axis under fast, a step with prompt pieces included (deterministic never does); --gemm-f16-rows-decode=false opts out",
 }, Exception {
     decision: 54,
     key: "kernels.gemm.f16_rows_decode",
@@ -405,7 +414,7 @@ pub const EXCEPTIONS: &[Exception] = &[Exception {
     after: "true",
     landed: true,
     owner: "#1084",
-    what: "a batched decode step's f16 matmuls of 2 to kernels.gemm.f16_rows_max rows take the GEMV's row axis under fast (deterministic never does); --gemm-f16-rows-decode=false opts out",
+    what: "at a batch of 2 to kernels.gemm.f16_rows_max sequences, a batched step's live rows take the GEMV's row axis under fast, a step with prompt pieces included (deterministic never does); --gemm-f16-rows-decode=false opts out",
 }];
 
 /// The first row of `key` for `frontend`, if the front-end resolves it.

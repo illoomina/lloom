@@ -19,6 +19,7 @@ fn the_slot_trace_counts_a_command_buffers_adds_commit_and_bytes() {
         unreachable!()
     };
     if m.commands().actual_command_api() != "metal4" {
+        eprintln!("SLOT_TRACE skipped: no Metal 4 on this device");
         return;
     }
     let n = 1 << 20;
@@ -29,6 +30,7 @@ fn the_slot_trace_counts_a_command_buffers_adds_commit_and_bytes() {
     let c = (&a + &b).unwrap();
     m.wait_until_completed().unwrap();
     let after = m.metal4_slot_residency().unwrap();
+    eprintln!("SLOT_TRACE api=metal4 before={before:?} after={after:?}");
     assert!(
         after.adds - before.adds >= 3,
         "a, b and the sum bound: {before:?} -> {after:?}"

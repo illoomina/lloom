@@ -557,17 +557,7 @@ impl Drop for LiveDevice {
     }
 }
 
-/// What a Metal 4 queue's per-slot residency sets did since the queue was
-/// made (`kernels.residency.slot_trace`): the allocations `Slot::resource`
-/// added, the set commits (one per command buffer), and the committing set's
-/// `allocatedSize` at the last commit and at its largest.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub struct SlotResidency {
-    pub adds: u64,
-    pub commits: u64,
-    pub last_bytes: u64,
-    pub max_bytes: u64,
-}
+pub use crate::residency_class::SlotResidency;
 
 /// How the device's residency set reaches the command queue
 /// (`kernels.residency.attach`).

@@ -1606,7 +1606,7 @@ pub struct MetalTuning {
     /// The residency classes the keep-warm asks to keep resident when the sets are split (`kernels.residency.set_cap_pct` > 0): a comma list of weights, kv, heap, scratch, experts, other. The rest are left to the OS, and under memory pressure their residency is ended.
     #[opt(flag = "residency-hot", env = "LLOOM_RESIDENCY_HOT", parser = "parse_residency_hot", path = "kernels.residency.hot", status = "arm", facets = ["liveness"], flows = ["commands-out"])]
     pub residency_hot: String,
-    /// Count what the Metal 4 queue's per-slot residency sets do: the allocations `Slot::resource` adds per command buffer, the set commits, and the set's `allocatedSize` at each commit (last and largest), read out in `/health` (an instrument for lane B, #1092).
+    /// Count and time what the Metal 4 queue's per-slot residency sets do: the resources `Slot::resource` adds per command buffer and the host time of those adds, the pipelines added, the set commits and their host time (total and longest), and the set's `allocatedSize` at each commit (last and largest), read out in `/health` (an instrument for #1092 lane B; one clock read per add and per commit when on).
     #[opt(
         flag = "residency-slot-trace",
         env = "LLOOM_METAL4_SLOT_TRACE",

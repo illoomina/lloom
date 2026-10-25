@@ -371,13 +371,17 @@ impl Drop for Queue {
     }
 }
 
-/// What the per-slot residency sets do, counted only when
+/// What the per-slot residency sets do, counted and timed only when
 /// `kernels.residency.slot_trace` is on: one load per bind or commit when off.
 #[derive(Default)]
 struct SlotTrace {
     on: bool,
     adds: std::sync::atomic::AtomicU64,
+    add_ns: std::sync::atomic::AtomicU64,
+    pipeline_adds: std::sync::atomic::AtomicU64,
     commits: std::sync::atomic::AtomicU64,
+    commit_ns: std::sync::atomic::AtomicU64,
+    commit_max_ns: std::sync::atomic::AtomicU64,
     last_bytes: std::sync::atomic::AtomicU64,
     max_bytes: std::sync::atomic::AtomicU64,
 }
@@ -389,20 +393,32 @@ impl Queue {
         let t = &self.slot_trace;
         t.on.then(|| super::SlotResidency {
             adds: t.adds.load(Ordering::Relaxed),
+            add_ns: t.add_ns.load(Ordering::Relaxed),
+            pipeline_adds: t.pipeline_adds.load(Ordering::Relaxed),
             commits: t.commits.load(Ordering::Relaxed),
+            commit_ns: t.commit_ns.load(Ordering::Relaxed),
+            commit_max_ns: t.commit_max_ns.load(Ordering::Relaxed),
             last_bytes: t.last_bytes.load(Ordering::Relaxed),
             max_bytes: t.max_bytes.load(Ordering::Relaxed),
         })
     }
 
-    fn note_slot_commit(&self, set: &ProtocolObject<dyn MTLResidencySet>) {
+    /// Commits a slot's set, timing the commit when the instrument is on.
+    fn commit_slot_set(&self, set: &ProtocolObject<dyn MTLResidencySet>) {
         let t = &self.slot_trace;
-        if t.on {
-            let bytes = set.allocatedSize();
-            t.commits.fetch_add(1, Ordering::Relaxed);
-            t.last_bytes.store(bytes, Ordering::Relaxed);
-            t.max_bytes.fetch_max(bytes, Ordering::Relaxed);
+        if !t.on {
+            set.commit();
+            return;
         }
+        let start = std::time::Instant::now();
+        set.commit();
+        let ns = start.elapsed().as_nanos() as u64;
+        let bytes = set.allocatedSize();
+        t.commits.fetch_add(1, Ordering::Relaxed);
+        t.commit_ns.fetch_add(ns, Ordering::Relaxed);
+        t.commit_max_ns.fetch_max(ns, Ordering::Relaxed);
+        t.last_bytes.store(bytes, Ordering::Relaxed);
+        t.max_bytes.fetch_max(bytes, Ordering::Relaxed);
     }
 }
 
@@ -549,10 +565,16 @@ impl Slot {
             self.resources.push(
                 unsafe { Retained::retain(std::ptr::from_ref(resource).cast_mut()) }.unwrap(),
             );
-            self.residency
-                .addAllocation(ProtocolObject::from_ref(resource));
             if self.trace.on {
+                let start = std::time::Instant::now();
+                self.residency
+                    .addAllocation(ProtocolObject::from_ref(resource));
+                let ns = start.elapsed().as_nanos() as u64;
                 self.trace.adds.fetch_add(1, Ordering::Relaxed);
+                self.trace.add_ns.fetch_add(ns, Ordering::Relaxed);
+            } else {
+                self.residency
+                    .addAllocation(ProtocolObject::from_ref(resource));
             }
         }
     }
@@ -1421,8 +1443,7 @@ impl PreparedCommit<'_> {
         self.phase = CommitPhase::Installed;
         // End/commit of the recording's private residency is not native CB
         // execution. Any unwind before queue entry cancels via rooted custody.
-        residency.commit();
-        submission.queue.note_slot_commit(&residency);
+        submission.queue.commit_slot_set(&residency);
         self.extra.last().unwrap_or(&self.first).endCommandBuffer();
         #[cfg(test)]
         if let Some(control) = &self.test_control {
@@ -1682,6 +1703,9 @@ impl Encoder {
             // a residency set too (MTL4ComputeCommandEncoder.h).
             slot.residency
                 .addAllocation(ProtocolObject::from_ref(pipeline));
+            if slot.trace.on {
+                slot.trace.pipeline_adds.fetch_add(1, Ordering::Relaxed);
+            }
             slot.pipelines.push(
                 unsafe { Retained::retain(std::ptr::from_ref(pipeline).cast_mut()) }.unwrap(),
             );

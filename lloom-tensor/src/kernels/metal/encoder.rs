@@ -1990,7 +1990,11 @@ impl ComputeCommandEncoder {
                 self.executor.will_bind_buffer(index, buf, offset, false);
             }
         }
-        unsafe { self.raw.setBuffer_offset_atIndex(native, offset, index) }
+        let covered = buffer.is_some_and(Buffer::device_listed);
+        unsafe {
+            self.raw
+                .setBuffer_offset_atIndex(native, offset, index, covered)
+        }
     }
 
     /// # Safety
@@ -2062,7 +2066,11 @@ impl ComputeCommandEncoder {
                 self.executor.will_bind_buffer(index, buf, offset, true);
             }
         }
-        unsafe { self.raw.setBuffer_offset_atIndex(native, offset, index) }
+        let covered = buffer.is_some_and(Buffer::device_listed);
+        unsafe {
+            self.raw
+                .setBuffer_offset_atIndex(native, offset, index, covered)
+        }
     }
 
     pub fn set_bytes_directly(&self, index: usize, length: usize, bytes: *const c_void) {
@@ -2152,7 +2160,12 @@ impl ComputeCommandEncoder {
         }
         unsafe {
             self.raw
-                .setBuffer_offset_atIndex(Some(buffer.raw_unchecked()), 0, index)
+                .setBuffer_offset_atIndex(
+                    Some(buffer.raw_unchecked()),
+                    0,
+                    index,
+                    buffer.device_listed(),
+                )
         }
         // The staging buffer must stay alive until the dispatch it feeds has
         // completed, not merely until it is encoded. It is parked here and

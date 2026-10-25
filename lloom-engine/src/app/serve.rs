@@ -433,6 +433,8 @@ fn run_owner(
                             "adds": s.adds,
                             "add_ns": s.add_ns,
                             "pipeline_adds": s.pipeline_adds,
+                            "covered": s.covered,
+                            "set_uses": s.set_uses,
                             "commits": s.commits,
                             "commit_ns": s.commit_ns,
                             "commit_max_ns": s.commit_max_ns,

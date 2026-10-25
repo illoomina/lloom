@@ -291,7 +291,7 @@ fn every_variant() -> Vec<(&'static str, Error)> {
             Error::TryFromIntError(u8::try_from(300u32).unwrap_err()),
         ),
         ("Npy", Error::Npy("npy fixture".to_string())),
-        ("Zip", Error::Zip(zip::result::ZipError::FileNotFound)),
+        ("Zip", Error::Zip(Box::new(zip::result::ZipError::FileNotFound))),
         ("ParseInt", Error::ParseInt("x".parse::<u32>().unwrap_err())),
         (
             "FromUtf8",

@@ -61,25 +61,25 @@ jobs:
         env:
           LLOOM_CI_REGISTRY: /home/runner/.cargo/registry
           LLOOM_CI_TARGET: ${{ github.workspace }}/target
-        run: .github/ci/in-container.sh -- cargo build -p lloom-tensor
+        run: .github/ci/in-container.sh -- cargo build --locked -p lloom-tensor
 
       - name: lloom-engine (no metal)
         env:
           LLOOM_CI_REGISTRY: /home/runner/.cargo/registry
           LLOOM_CI_TARGET: ${{ github.workspace }}/target
-        run: .github/ci/in-container.sh -- cargo build -p lloom-engine
+        run: .github/ci/in-container.sh -- cargo build --locked -p lloom-engine
 
       - name: lloom (no metal)
         env:
           LLOOM_CI_REGISTRY: /home/runner/.cargo/registry
           LLOOM_CI_TARGET: ${{ github.workspace }}/target
-        run: .github/ci/in-container.sh -- cargo build -p lloom
+        run: .github/ci/in-container.sh -- cargo build --locked -p lloom
 
       - name: lloom-engine binaries (serve, no metal)
         env:
           LLOOM_CI_REGISTRY: /home/runner/.cargo/registry
           LLOOM_CI_TARGET: ${{ github.workspace }}/target
-        run: .github/ci/in-container.sh -- cargo build -p lloom-engine --features serve --bins
+        run: .github/ci/in-container.sh -- cargo build --locked -p lloom-engine --features serve --bins
 
       - name: shape-probe stays out of lloom-engine
         env:

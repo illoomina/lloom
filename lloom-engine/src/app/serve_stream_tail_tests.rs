@@ -992,6 +992,7 @@ fn bounded_sockets() -> (std::net::TcpStream, std::net::TcpStream) {
 struct SocketWriter {
     socket: std::net::TcpStream,
     entered: Option<std::sync::mpsc::Sender<()>>,
+    before_payload: Option<std::sync::mpsc::Receiver<()>>,
     written: Arc<AtomicUsize>,
 }
 #[cfg(unix)]
@@ -1000,6 +1001,11 @@ impl Write for SocketWriter {
         if bytes.len() > 64 << 10 {
             if let Some(entered) = self.entered.take() {
                 entered.send(()).unwrap();
+                if let Some(release) = self.before_payload.take() {
+                    release
+                        .recv_timeout(Duration::from_secs(5))
+                        .map_err(|e| io::Error::new(io::ErrorKind::TimedOut, e.to_string()))?;
+                }
             }
         }
         let n = self.socket.write(bytes)?;
@@ -1043,6 +1049,7 @@ fn a_socket_draining_at_one_kib_per_second_does_not_own_the_next_model_request()
                 w: Box::new(SocketWriter {
                     socket,
                     entered: Some(entered),
+                    before_payload: None,
                     written: sent,
                 }),
             })
@@ -1108,6 +1115,7 @@ fn a_full_response_budget_refuses_the_actual_http_route_before_model_execution()
 fn a_disconnect_during_socket_drain_keeps_the_published_reference_continuable() {
     let (client, socket) = bounded_sockets();
     let (entered, blocked_rx) = std::sync::mpsc::channel();
+    let (release, wait_release) = std::sync::mpsc::channel();
     assert_continuation_during_drain(
         Case::LongReply,
         move || {
@@ -1115,12 +1123,17 @@ fn a_disconnect_during_socket_drain_keeps_the_published_reference_continuable() 
                 w: Box::new(SocketWriter {
                     socket,
                     entered: Some(entered),
+                    before_payload: Some(wait_release),
                     written: Arc::new(AtomicUsize::new(0)),
                 }),
             })
         },
         blocked_rx,
-        || drop(client),
+        || {
+            client.shutdown(std::net::Shutdown::Both).unwrap();
+            drop(client);
+            release.send(()).unwrap();
+        },
         true,
     );
 }

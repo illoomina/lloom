@@ -953,6 +953,12 @@ impl MetalDevice {
         )
     }
 
+    /// The Metal 4 queue's per-slot residency counts
+    /// ([`Commands::metal4_slot_residency`]).
+    pub fn metal4_slot_residency(&self) -> Option<crate::kernels::metal::SlotResidency> {
+        self.commands.metal4_slot_residency()
+    }
+
     /// A handle to the residency set that outlives this device.
     ///
     /// Exists so the teardown guard can be observed from outside: after the

@@ -1300,6 +1300,13 @@ impl Commands {
         self.core.residency_attachment
     }
 
+    /// What the Metal 4 queue's per-slot residency sets did
+    /// (`kernels.residency.slot_trace`); `None` on Metal 3 or with the
+    /// instrument off.
+    pub fn metal4_slot_residency(&self) -> Option<super::SlotResidency> {
+        self.core.modern_queue.as_ref()?.slot_residency()
+    }
+
     /// The native command API actually installed on this queue.
     /// This observes the resolved queue, not the requested tuning string.
     pub fn actual_command_api(&self) -> &'static str {

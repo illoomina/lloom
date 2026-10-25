@@ -1561,6 +1561,15 @@ pub struct MetalTuning {
     /// The residency classes the keep-warm asks to keep resident when the sets are split (`kernels.residency.set_cap_pct` > 0): a comma list of weights, kv, heap, scratch, experts, other. The rest are left to the OS, and under memory pressure their residency is ended.
     #[opt(flag = "residency-hot", env = "LLOOM_RESIDENCY_HOT", parser = "parse_residency_hot", path = "kernels.residency.hot", status = "arm", facets = ["liveness"], flows = ["commands-out"])]
     pub residency_hot: String,
+    /// Count what the Metal 4 queue's per-slot residency sets do: the allocations `Slot::resource` adds per command buffer, the set commits, and the set's `allocatedSize` at each commit (last and largest), read out in `/health` (an instrument for lane B, #1092).
+    #[opt(
+        flag = "residency-slot-trace",
+        env = "LLOOM_METAL4_SLOT_TRACE",
+        bool,
+        path = "kernels.residency.slot_trace",
+        status = "instrument"
+    )]
+    pub residency_slot_trace: bool,
     /// Run these types although this GPU only emulates them (a comma list; `bf16` on Apple7, ~2.6x the f32 time); none = refuse them (§15.2a).
     #[opt(flag = "allow-emulated", env = "LLOOM_METAL_ALLOW_EMULATED", parser = "parse_allow_emulated", variants = ["none", "bf16"], path = "backend.metal.allow_emulated", status = "advanced")]
     pub allow_emulated: Option<String>,
@@ -1646,6 +1655,7 @@ impl Default for MetalTuning {
             residency_attach: "queue".into(),
             residency_set_cap_pct: 0,
             residency_hot: "weights,kv".into(),
+            residency_slot_trace: false,
             allow_emulated: None,
             fast_math: true,
             eager_residency_release: None,

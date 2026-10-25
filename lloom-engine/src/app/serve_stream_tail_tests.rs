@@ -1151,6 +1151,7 @@ fn a_full_response_budget_refuses_the_actual_http_route_before_model_execution()
         shared.turns.try_take().is_some(),
         "refused request left no model ticket"
     );
+    assert_eq!(shared.drains.json()["overload"]["response_contexts"], 1);
     assert_eq!(
         shared.drains.active.load(Ordering::Relaxed),
         MAX_RESPONSE_DRAINS
@@ -1187,11 +1188,11 @@ fn a_disconnect_during_socket_drain_keeps_the_published_reference_continuable() 
     );
 }
 
-// This baseline-compatibility control intentionally exposes the decision still
-// required for early publication: old session fields depend on a future failed
-// write, although its front reply already holds the complete accepted tail.
+// Decision 59: stored fields preserve the full hook-accepted reply, independently
+// of later socket failure. The old omission reproducer is retained separately
+// in tests/frontier-baseline-control.patch, not asserted as the new contract.
 #[test]
-fn an_earlier_write_failure_preserves_the_baseline_sessions_held_tail_omission() {
+fn an_earlier_write_failure_keeps_the_full_accepted_session_reply() {
     struct FailAfterDecode(Writer);
     impl Write for FailAfterDecode {
         fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
@@ -1259,9 +1260,29 @@ fn an_earlier_write_failure_preserves_the_baseline_sessions_held_tail_omission()
         "EARLY_WRITE_FAILURE accepted={} session={message}",
         front.text
     );
-    // Do not change this to the candidate's full accepted tail without an
-    // explicit contract decision: it would redefine old-ID continuation.
-    assert_eq!(message["reasoning_content"], "a");
+    assert_eq!(message["reasoning_content"], "a</thi");
+    let delivery: Value = serde_json::from_str(error.split_once("; frontier ").unwrap().1).unwrap();
+    assert_eq!(delivery["delivered_bytes"], 6, "raw hook-accepted bytes");
+    assert_eq!(
+        delivery["written_bytes"], 0,
+        "the earlier text event failed"
+    );
+    assert_eq!(delivery["write_failed"], true);
+    assert_eq!(shared.drains.json()["pre_trailer_write_errors"], 1);
+    let continued = chat_completions(
+        &shared,
+        &json!({"previous_response_id":id,"input":"continue","stream":true,"max_tokens":3}),
+        None,
+    )
+    .ok()
+    .expect("accepted reply remains continuable after socket error");
+    let Reply::Stream(continued) = continued else {
+        panic!("stream requested")
+    };
+    assert!(
+        continued.facts.spliced.bound > 0,
+        "reply still binds by its ID"
+    );
 }
 
 // This is the served Err/publication boundary, not a native GPU fault or a
@@ -1379,6 +1400,7 @@ fn a_refused_whole_fragment_cannot_enter_the_raw_frontier_or_stored_message() {
     assert_eq!(last["choices"][0]["finish_reason"], "cancelled");
     assert_eq!(last["usage"]["completion_tokens"], 1);
     assert_eq!(last["timings"]["response_backlog_limit"], true);
+    assert_eq!(shared.drains.json()["overload"]["unresolved_bytes"], 1);
     assert_eq!(last["timings"]["frontier"]["delivered_bytes"], 1);
     assert_eq!(last["timings"]["frontier"]["written_bytes"], 1);
     assert_eq!(last["timings"]["frontier"]["write_failed"], false);

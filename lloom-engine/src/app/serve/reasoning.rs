@@ -32,6 +32,7 @@ struct Event {
 pub(super) struct Reasoning {
     markers: Vec<Marker>,
     events: Arc<Mutex<Events>>,
+    max_markers: usize,
     initial_inside: bool,
     inside: bool,
     pending: String,
@@ -43,7 +44,8 @@ pub(super) struct Reasoning {
     by_text: bool,
 }
 
-const MAX_MARKERS: usize = 1 << 16;
+#[cfg(test)]
+pub(super) const MAX_MARKERS: usize = 1 << 16;
 
 /// The producer replaces only its unpublished UTF-8 suffix. The consumer
 /// removes only markers completed by already accepted text; retained markers
@@ -58,6 +60,7 @@ pub(super) struct Observer {
     markers: Vec<Marker>,
     events: Arc<Mutex<Events>>,
     scratch: Vec<Event>,
+    max_markers: usize,
 }
 
 impl Observer {
@@ -84,7 +87,7 @@ impl Observer {
             {
                 lloom_tensor::bail!("reasoning marker decoding is not an additive literal")
             }
-            if self.scratch.len() == MAX_MARKERS {
+            if self.scratch.len() == self.max_markers {
                 lloom_tensor::bail!("response marker descriptor limit exceeded")
             }
             self.scratch.push(Event {
@@ -108,7 +111,7 @@ impl Observer {
         {
             events.retained.pop();
         }
-        if events.retained.len() + self.scratch.len() > MAX_MARKERS {
+        if events.retained.len() + self.scratch.len() > self.max_markers {
             lloom_tensor::bail!("response marker descriptor limit exceeded")
         }
         events.pending.extend(self.scratch.iter().copied());
@@ -121,10 +124,20 @@ impl Reasoning {
     /// The splitter a chat request runs with: `None` where the request asked
     /// for today's rendering (`reasoning_in_content`) or the template has no
     /// reasoning markers to split on.
+    #[cfg(test)]
     pub(super) fn for_chat(
         engine: &dyn Served,
         prompt: &[u32],
         in_content: bool,
+    ) -> Result<Option<Self>> {
+        Self::for_chat_limited(engine, prompt, in_content, MAX_MARKERS)
+    }
+
+    pub(super) fn for_chat_limited(
+        engine: &dyn Served,
+        prompt: &[u32],
+        in_content: bool,
+        max_markers: usize,
     ) -> Result<Option<Self>> {
         if in_content {
             return Ok(None);
@@ -144,6 +157,7 @@ impl Reasoning {
         Ok(Some(Self {
             markers,
             events: Arc::new(Mutex::new(Events::default())),
+            max_markers,
             initial_inside: tags.open_at_end(prompt).is_some(),
             inside: tags.open_at_end(prompt).is_some(),
             pending: String::new(),
@@ -198,7 +212,8 @@ impl Reasoning {
         Observer {
             markers: self.markers.clone(),
             events: Arc::clone(&self.events),
-            scratch: Vec::with_capacity(16),
+            scratch: Vec::with_capacity(16.min(self.max_markers)),
+            max_markers: self.max_markers,
         }
     }
 
@@ -223,6 +238,7 @@ impl Reasoning {
                 pending: retained.into(),
                 retained: Vec::new(),
             })),
+            max_markers: self.max_markers,
             initial_inside: self.initial_inside,
             inside: self.initial_inside,
             pending: String::new(),
@@ -352,6 +368,7 @@ mod tests {
             })
             .collect(),
             events: Arc::new(Mutex::new(Events::default())),
+            max_markers: MAX_MARKERS,
             initial_inside: inside,
             inside,
             pending: String::new(),
@@ -461,6 +478,29 @@ mod tests {
         );
         assert_eq!(parser.lock().events.lock().retained.len(), MAX_MARKERS);
         assert_eq!(parser.lock().events.lock().pending.len(), MAX_MARKERS);
+    }
+
+    #[test]
+    fn a_configured_zero_descriptor_bound_refuses_markers_but_not_literal_bytes() {
+        let mut p = parser(false);
+        p.max_markers = 0;
+        let p = Arc::new(Mutex::new(p));
+        let mut observer = Observer::new(&p);
+        let literal: Vec<u32> = "<think>".bytes().map(u32::from).collect();
+        observer.observe(&literal, "<think>", 0, &decode).unwrap();
+        assert_eq!(
+            collect([p.lock().push("<think>")]),
+            ("<think>".into(), "".into())
+        );
+        let error = observer
+            .observe(&[1000], "<think>", 7, &decode)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("response marker descriptor limit exceeded"),
+            "{error}"
+        );
+        assert!(p.lock().events.lock().retained.is_empty());
     }
 
     #[test]

@@ -214,6 +214,15 @@ pub const COUPLINGS: &[Coupling] = &[
         site: "lloom-tensor/src/kernels/metal/residency_set.rs ResidencyPolicy::selected, ResidencyAttachment::decide",
         is_static: false,
     },
+    Coupling {
+        id: "C22",
+        kind: "resolves",
+        when: "a generating response is admitted or its SSE/typed-marker handover reaches a configured bound",
+        effect: "server.response bounds contexts (503 before execution), unresolved SSE raw bytes (whole-fragment refusal/cancellation), and typed marker descriptors (run error); these are draft candidate defaults, not a wall-time drain guarantee",
+        keys: &["server.response.contexts", "server.response.raw_bytes", "server.response.markers"],
+        site: "lloom-engine/src/app/serve.rs ResponseDrains::try_take, StreamWriter::try_delta; app/serve/reasoning.rs Observer::observe",
+        is_static: false,
+    },
 ];
 
 /// The couplings naming `key`.
@@ -447,6 +456,13 @@ pub fn explain(o: &EngineOptions) -> Vec<String> {
             ),
         });
     }
+    let response = o.server.response;
+    out.push(format!(
+        "server.response -> contexts={} raw_bytes={} markers={}: draft candidates; \
+         context exhaustion=503, raw-byte exhaustion=whole-fragment cancellation, \
+         descriptor exhaustion=run error; no wall-time bound (C22)",
+        response.contexts, response.raw_bytes, response.markers
+    ));
     out
 }
 
@@ -730,8 +746,11 @@ mod tests {
         assert!(!lines.iter().any(|l| l.contains("(C9)")), "{lines:?}");
         assert_eq!(
             explain(&EngineOptions::default()),
-            vec!["decode.readback.stream_reader -> on <- decode.readback.adaptive_commit (C9)"],
-            "at the defaults only the reader the adaptive commit drains through"
+            vec![
+                "decode.readback.stream_reader -> on <- decode.readback.adaptive_commit (C9)",
+                "server.response -> contexts=8 raw_bytes=1048576 markers=65536: draft candidates; context exhaustion=503, raw-byte exhaustion=whole-fragment cancellation, descriptor exhaustion=run error; no wall-time bound (C22)"
+            ],
+            "defaults name the reader and the response-bound candidates"
         );
         // C20: the decode rows' arm names its ceiling where it can take the
         // row axis, and its cause where it cannot.
@@ -799,5 +818,30 @@ mod tests {
             c20(&[("scheduler.max_sequences", "4")]).is_empty(),
             "the arm off"
         );
+    }
+}
+
+#[cfg(test)]
+mod response_coupling_tests {
+    #[test]
+    fn response_explain_names_configured_limits_and_each_distinct_outcome() {
+        let mut options = crate::options::EngineOptions::default();
+        options.server.response = crate::options::ServerResponseConfig {
+            contexts: 2,
+            raw_bytes: 31,
+            markers: 7,
+        };
+        let lines: Vec<_> = super::explain(&options)
+            .into_iter()
+            .filter(|s| s.ends_with("(C22)"))
+            .collect();
+        assert_eq!(lines, ["server.response -> contexts=2 raw_bytes=31 markers=7: draft candidates; context exhaustion=503, raw-byte exhaustion=whole-fragment cancellation, descriptor exhaustion=run error; no wall-time bound (C22)"]);
+        for key in [
+            "server.response.contexts",
+            "server.response.raw_bytes",
+            "server.response.markers",
+        ] {
+            assert_eq!(super::of(key), ["C22"]);
+        }
     }
 }

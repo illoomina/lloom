@@ -122,7 +122,13 @@ tail remains output. A failed transport is not a successful completed stream
 and need not contain `[DONE]`. Server written-byte witnesses do not prove
 receipt by a client.
 
-Generating completions keep at most **eight response contexts**, including
+**Draft response-bound defaults, awaiting maintainer approval (#946):**
+`server.response.contexts = 8`, `server.response.raw_bytes = 1048576`, and
+`server.response.markers = 65536` (flags `--response-contexts`,
+`--response-raw-bytes`, `--response-markers`). These are configurable hard
+counts; zero allows no corresponding context, nonempty fragment, or typed
+marker, not an unbounded mode. Candidate generating completions keep at most
+**eight response contexts**, including
 requests waiting for their model turn and responses still draining. A ninth
 request receives HTTP 503 (`response drain capacity exhausted`) before model
 execution. The context is reclaimed only when its response writer finishes.
@@ -141,11 +147,14 @@ reply fields mean server-accepted text, not remotely acknowledged bytes;
 `written_bytes` and `write_failed` are settled later by transport. No GPU
 retirement certificate or additional global device wait is implied.
 
-**Draft contract decision pending:** early accepted-message publication changes
-an old error path where an earlier failed write prevented a held partial-marker
-tail from entering the stored session message, despite its presence in the raw
-accepted reply. No all-path stored-message compatibility is claimed; see
-`design/measurements/issue-946.md` section 27.1 for the explicit alternatives.
+**Stored reply versus delivery (decision 59):** a retained session keeps the
+full hook-accepted reply, including a held partial-marker tail even if an
+earlier event later fails to write. `usage.completion_tokens` still counts
+accepted sampled tokens; `written_bytes` and `write_failed` are separate
+transport witnesses, not client acknowledgements. Socket failure can prevent a
+final timings event/[DONE]; the request error line carries its frontier then.
+`/health.response_drain` reports active contexts, configured bounds and named
+overload counters; context exhaustion is also a 503 request-line outcome.
 
 These are response-context/backlog limits, not a process-memory, request-body,
 connection-thread, or wall-clock drain guarantee. An indefinitely stalled legacy

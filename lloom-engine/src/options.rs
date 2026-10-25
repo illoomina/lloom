@@ -1953,6 +1953,33 @@ pub struct PipetteConfig {
     pub prompt_seed_file: Option<std::path::PathBuf>,
 }
 
+/// Generating responses' drain bounds, separate from model execution.
+/// These defaults are draft candidates awaiting maintainer approval (#946).
+#[derive(Options, Serialize, Deserialize, Debug, Clone, Copy, PartialEq)]
+#[options(v0 = false)]
+#[serde(default)]
+pub struct ServerResponseConfig {
+    /// Concurrent generating response contexts, including model wait and socket drain. Draft candidate default 8, not approved: exhaustion returns 503 before execution; 0 admits none. Not a connection-thread or wall-time bound.
+    #[opt(flag = "response-contexts", path = "server.response.contexts", status = "advanced", facets = ["buffer"], flows = ["token-out"])]
+    pub contexts: usize,
+    /// Unresolved raw text bytes per SSE response, including in-flight writes. Draft candidate default 1048576, not approved: the next whole fragment is refused above it, preserving the earlier accepted frontier; 0 refuses nonempty fragments. Not total retained reply size.
+    #[opt(flag = "response-raw-bytes", path = "server.response.raw_bytes", status = "advanced", facets = ["buffer"], flows = ["token-out"])]
+    pub raw_bytes: usize,
+    /// Typed reasoning marker descriptors retained per reply. Draft candidate default 65536, not approved: overflow is a run error, never silent literal fallback; 0 refuses the first marker. Legacy text-only adapters do not produce typed descriptors.
+    #[opt(flag = "response-markers", path = "server.response.markers", status = "advanced", facets = ["buffer"], flows = ["token-out"])]
+    pub markers: usize,
+}
+
+impl Default for ServerResponseConfig {
+    fn default() -> Self {
+        Self {
+            contexts: 8,
+            raw_bytes: 1 << 20,
+            markers: 1 << 16,
+        }
+    }
+}
+
 /// How `lloom serve` reclaims the sessions its chat completions' ids name: a
 /// session lives until the server lets it go (`docs/sessions.md` §4).
 #[derive(Options, Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -2019,6 +2046,9 @@ pub struct ServerConfig {
     pub pipette: PipetteConfig,
     #[opt(nested)]
     pub sessions: ServerSessionsConfig,
+    /// Generating response drain bounds (draft candidate defaults).
+    #[opt(nested)]
+    pub response: ServerResponseConfig,
 }
 
 impl Default for ServerConfig {
@@ -2033,6 +2063,7 @@ impl Default for ServerConfig {
             keep_warm_pressure_file: None,
             pipette: PipetteConfig::default(),
             sessions: ServerSessionsConfig::default(),
+            response: ServerResponseConfig::default(),
         }
     }
 }
@@ -2517,5 +2548,74 @@ mod spark_tests {
             "1 is the tail, not a bulk tile"
         );
         assert!(parse_spark("16/tile:x").is_err());
+    }
+}
+
+#[cfg(test)]
+mod response_option_tests {
+    use super::*;
+
+    #[test]
+    fn response_limits_have_one_canonical_spelling_and_round_trip_every_entry_point() {
+        use clap::Parser;
+        let idx = crate::option_tree::index();
+        let mut options = EngineOptions::default();
+        for (key, value) in [
+            ("server.response.contexts", "3"),
+            ("server.response.raw_bytes", "17"),
+            ("server.response.markers", "5"),
+        ] {
+            assert!(idx.keys.contains_key(key), "{key}");
+            assert_eq!(idx.keys[key].targets.len(), 1, "{key}");
+            assert!(
+                idx.keys[key].meta().doc.contains("Draft candidate"),
+                "{key}"
+            );
+            idx.set(&mut options, key, value).unwrap();
+        }
+        let expected = ServerResponseConfig {
+            contexts: 3,
+            raw_bytes: 17,
+            markers: 5,
+        };
+        assert_eq!(options.server.response, expected);
+        let mut back = EngineOptions::default();
+        idx.merge(&mut back, &idx.render(&options)).unwrap();
+        assert_eq!(back, options);
+        let mut env = ServerResponseConfig::default();
+        env.from_env_with(&|name| match name {
+            "LLOOM_SERVER_RESPONSE_CONTEXTS" => Some("3".into()),
+            "LLOOM_SERVER_RESPONSE_RAW_BYTES" => Some("17".into()),
+            "LLOOM_SERVER_RESPONSE_MARKERS" => Some("5".into()),
+            _ => None,
+        })
+        .unwrap();
+        assert_eq!(env, expected);
+        #[derive(Parser)]
+        struct Cli {
+            #[command(flatten)]
+            response: ServerResponseConfigArgs,
+        }
+        let cli = Cli::try_parse_from([
+            "test",
+            "--response-contexts",
+            "3",
+            "--response-raw-bytes",
+            "17",
+            "--response-markers",
+            "5",
+        ])
+        .unwrap();
+        let mut flags = ServerResponseConfig::default();
+        cli.response.apply(&mut flags).unwrap();
+        assert_eq!(flags, expected);
+        assert_eq!(
+            ServerResponseConfig::default(),
+            ServerResponseConfig {
+                contexts: 8,
+                raw_bytes: 1 << 20,
+                markers: 1 << 16
+            }
+        );
     }
 }

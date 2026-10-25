@@ -159,24 +159,52 @@ struct Shared {
     keep_warm_pressure_file: Option<String>,
 }
 
+#[cfg(test)]
 const MAX_RESPONSE_DRAINS: usize = 8;
+#[cfg(test)]
 const MAX_RESPONSE_BACKLOG: usize = 1 << 20;
 
 #[derive(Default)]
 struct ResponseDrains {
+    limits: crate::options::ServerResponseConfig,
     active: AtomicUsize,
+    admission_refused: AtomicU64,
+    backlog_refused: AtomicU64,
+    pre_trailer_write_errors: AtomicU64,
 }
 struct ResponseDrain<'a> {
     drains: &'a ResponseDrains,
 }
 impl ResponseDrains {
+    fn new(limits: crate::options::ServerResponseConfig) -> Self {
+        Self {
+            limits,
+            ..Self::default()
+        }
+    }
+
     fn try_take(&self) -> Option<ResponseDrain<'_>> {
         self.active
             .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |n| {
-                (n < MAX_RESPONSE_DRAINS).then_some(n + 1)
+                (n < self.limits.contexts).then(|| n + 1)
             })
+            .map_err(|_| self.admission_refused.fetch_add(1, Ordering::Relaxed))
             .ok()
             .map(|_| ResponseDrain { drains: self })
+    }
+
+    fn json(&self) -> Value {
+        json!({
+            "active": self.active.load(Ordering::Relaxed),
+            "max_contexts": self.limits.contexts,
+            "max_unresolved_bytes": self.limits.raw_bytes,
+            "max_marker_descriptors": self.limits.markers,
+            "overload": {
+                "response_contexts": self.admission_refused.load(Ordering::Relaxed),
+                "unresolved_bytes": self.backlog_refused.load(Ordering::Relaxed),
+            },
+            "pre_trailer_write_errors": self.pre_trailer_write_errors.load(Ordering::Relaxed),
+        })
     }
 }
 impl Drop for ResponseDrain<'_> {
@@ -411,7 +439,7 @@ fn run_owner(
         engine,
         decisions,
         turns: turns::Turns::default(),
-        drains: ResponseDrains::default(),
+        drains: ResponseDrains::new(options.server.response),
         decision_pack: options.scheduler.decision_pack
             && lloom_tensor::tuning::contract().is_fast(),
         aborts: Mutex::new(HashSet::new()),
@@ -454,6 +482,7 @@ fn run_owner(
                     b["reuse"] = shared.reuse.lock().json(shared.engine.reuse_prefix());
                     b["sampling"] = sampling_json(&shared.sampling);
                     b["sessions"] = shared.sessions.lock().json();
+                    b["response_drain"] = shared.drains.json();
                     b["keep_warm"] = shared.keep_warm.json(&shared.activity, uptime_ns());
                     b["keep_warm_actions"] = json!(shared.activity.actions.load(Ordering::Relaxed));
                     if let Some((adds, commits, last, max)) =
@@ -788,11 +817,12 @@ fn handle_model_request(
         match shared.drains.try_take() {
             Some(drain) => Some(drain),
             None => {
+                eprintln!("[{path}: status=503 overload=response-contexts response_contexts={} response_context_limit={}]", shared.drains.active.load(Ordering::Relaxed), shared.drains.limits.contexts);
                 return respond_error(
                     request,
                     503,
                     "response drain capacity exhausted; retry after a response finishes",
-                )
+                );
             }
         }
     } else {
@@ -1872,9 +1902,13 @@ fn chat_completions(shared: &Shared, v: &Value, auth: Option<[u8; 32]>) -> Handl
             first: FirstToken::default(),
         })));
     }
-    let split =
-        reasoning::Reasoning::for_chat(shared.engine.as_ref(), &prompt_ids, reasoning_in_content)?
-            .map(|p| Arc::new(parking_lot::Mutex::new(p)));
+    let split = reasoning::Reasoning::for_chat_limited(
+        shared.engine.as_ref(),
+        &prompt_ids,
+        reasoning_in_content,
+        shared.drains.limits.markers,
+    )?
+    .map(|p| Arc::new(parking_lot::Mutex::new(p)));
     let mut routed = serde_json::Map::<String, Value>::new();
     let started = Instant::now();
     let decoded = run_decode_observed(
@@ -2734,10 +2768,11 @@ fn stream_response_settlement(
     };
     let created = now();
     let split = match run.kind {
-        StreamKind::Chat => reasoning::Reasoning::for_chat(
+        StreamKind::Chat => reasoning::Reasoning::for_chat_limited(
             shared.engine.as_ref(),
             &run.prompt_ids,
             run.reasoning_in_content,
+            shared.drains.limits.markers,
         )?,
         StreamKind::Completion => None,
     }
@@ -2783,7 +2818,8 @@ fn stream_response_settlement(
         StreamWriter::start_with_counted_deltas(writer, wrap)
     } else {
         StreamWriter::start_with_deltas(writer, move |text| wrap(text).0)
-    };
+    }
+    .with_backlog_limit(shared.drains.limits.raw_bytes);
     if let StreamKind::Chat = run.kind {
         sw.event(&json!({
             "id": run.id, "object": "chat.completion.chunk", "created": created,
@@ -2819,6 +2855,16 @@ fn stream_response_settlement(
     let written = sw.written();
     let first_write = sw.first_write();
     let backlog_limited = sw.backlog_limited.load(Ordering::Relaxed);
+    if backlog_limited {
+        shared
+            .drains
+            .backlog_refused
+            .fetch_add(1, Ordering::Relaxed);
+        eprintln!(
+            "[{endpoint}: overload=unresolved-bytes response_backlog_limit={}]",
+            shared.drains.limits.raw_bytes
+        );
+    }
     let decoded = match decoded {
         Ok(decoded) => decoded,
         Err(error) => {
@@ -2899,6 +2945,11 @@ fn stream_response_settlement(
         frontier_json["write_failed"] = json!(write_err.is_some());
     }
     if let Some(e) = write_err {
+        shared
+            .drains
+            .pre_trailer_write_errors
+            .fetch_add(1, Ordering::Relaxed);
+        eprintln!("[{endpoint}: delivery_error=true accepted_bytes={} written_bytes={} frontier={frontier_json}]", decoded.text.len(), written.load(Ordering::Relaxed));
         anyhow::bail!("client went away mid-stream: {e}; frontier {frontier_json}");
     }
     let elapsed = started.elapsed();
@@ -3627,6 +3678,7 @@ struct StreamWriter {
     /// for its next drain: one wake a request, none a token.
     woke: AtomicBool,
     submitted: AtomicUsize,
+    max_backlog: usize,
     backlog_limited: AtomicBool,
 }
 
@@ -3744,6 +3796,7 @@ impl StreamWriter {
             spill: parking_lot::Mutex::new(String::new()),
             woke: AtomicBool::new(false),
             submitted: AtomicUsize::new(0),
+            max_backlog: crate::options::ServerResponseConfig::default().raw_bytes,
             backlog_limited: AtomicBool::new(false),
         }
     }
@@ -3772,6 +3825,11 @@ impl StreamWriter {
         (work, closed)
     }
 
+    fn with_backlog_limit(mut self, limit: usize) -> Self {
+        self.max_backlog = limit;
+        self
+    }
+
     /// Refuse a whole fragment before hand-over when unresolved raw bytes
     /// would exceed the response's backlog budget. The engine's refusal seam
     /// retains the earlier accepted frontier and reports cancellation.
@@ -3785,7 +3843,7 @@ impl StreamWriter {
             self.backlog_limited.store(true, Ordering::Relaxed);
             return false;
         };
-        if next.saturating_sub(written) > MAX_RESPONSE_BACKLOG {
+        if next.saturating_sub(written) > self.max_backlog {
             self.backlog_limited.store(true, Ordering::Relaxed);
             return false;
         }
@@ -4511,7 +4569,7 @@ pub fn bench(args: BenchArgs) -> Result<()> {
             "the benchmark cells do not take decisions".into(),
         ),
         turns: turns::Turns::default(),
-        drains: ResponseDrains::default(),
+        drains: ResponseDrains::new(options.server.response),
         decision_pack: false,
         aborts: Mutex::new(HashSet::new()),
         abort_epoch: AtomicU64::new(0),
@@ -5461,6 +5519,80 @@ mod stream_writer_tests {
         drop(replacement);
         drop(held);
         assert_eq!(drains.active.load(std::sync::atomic::Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn overload_health_names_and_counts_admission_refusals_without_losing_active_count() {
+        let drains = super::ResponseDrains::default();
+        let held: Vec<_> = (0..super::MAX_RESPONSE_DRAINS)
+            .map(|_| drains.try_take().unwrap())
+            .collect();
+        assert!(drains.try_take().is_none());
+        assert!(drains.try_take().is_none());
+        let report = drains.json();
+        assert_eq!(report["active"], super::MAX_RESPONSE_DRAINS);
+        assert_eq!(report["overload"]["response_contexts"], 2);
+        assert_eq!(report["overload"]["unresolved_bytes"], 0);
+        assert_eq!(report["max_unresolved_bytes"], super::MAX_RESPONSE_BACKLOG);
+        assert_eq!(
+            report["max_marker_descriptors"],
+            super::reasoning::MAX_MARKERS
+        );
+        drop(held);
+        assert_eq!(drains.json()["active"], 0);
+        assert_eq!(drains.json()["overload"]["response_contexts"], 2);
+    }
+
+    #[test]
+    fn configured_response_bounds_reach_admission_health_and_whole_utf8_handover() {
+        let limits = crate::options::ServerResponseConfig {
+            contexts: 1,
+            raw_bytes: 2,
+            markers: 3,
+        };
+        let drains = super::ResponseDrains::new(limits);
+        let held = drains.try_take().unwrap();
+        assert!(drains.try_take().is_none());
+        assert_eq!(drains.json()["max_contexts"], 1);
+        assert_eq!(drains.json()["max_unresolved_bytes"], 2);
+        assert_eq!(drains.json()["max_marker_descriptors"], 3);
+        drop(held);
+        let none = super::ResponseDrains::new(crate::options::ServerResponseConfig {
+            contexts: 0,
+            ..limits
+        });
+        assert!(
+            none.try_take().is_none(),
+            "zero is a hard zero, never unbounded"
+        );
+        let full = super::ResponseDrains::new(crate::options::ServerResponseConfig {
+            contexts: usize::MAX,
+            ..limits
+        });
+        full.active
+            .store(usize::MAX, std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            full.try_take().is_none(),
+            "full admission does not eagerly overflow its increment"
+        );
+        for (limit, text, expected) in [
+            (0, "", true),
+            (0, "a", false),
+            (1, "π", false),
+            (2, "π", true),
+        ] {
+            let sw = StreamWriter::start_with_deltas(
+                ChunkedWriter {
+                    w: Box::new(std::io::sink()),
+                },
+                str::to_owned,
+            )
+            .with_backlog_limit(limit);
+            let accepted = sw.try_delta(text);
+            let (_, error) = sw.finish().unwrap();
+            assert!(error.is_none());
+            assert_eq!(accepted, expected, "limit={limit} text={text:?}");
+        }
     }
 
     /// A client that went away: the failed write is latched, the producer

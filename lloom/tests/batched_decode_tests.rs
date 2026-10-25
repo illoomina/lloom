@@ -1091,6 +1091,10 @@ struct ScopeChain {
     /// its head.
     led: ScopeCount,
     misled: std::sync::atomic::AtomicU32,
+    /// Led calls whose head's rows differ from their input's (a piece of
+    /// more than one token rode the live rows): the case that tells the two
+    /// counts apart.
+    wide: std::sync::atomic::AtomicU32,
 }
 
 /// Calls made with the scope open and without it.
@@ -1113,6 +1117,7 @@ impl ScopeChain {
             single: Default::default(),
             led: Default::default(),
             misled: Default::default(),
+            wide: Default::default(),
         })
     }
 
@@ -1128,6 +1133,9 @@ impl ScopeChain {
                     && ragged_decode_lead(rows.len()) == Some(live);
                 if !leads {
                     self.misled.fetch_add(1, Relaxed);
+                }
+                if rows.len() != total {
+                    self.wide.fetch_add(1, Relaxed);
                 }
             }
             None => {
@@ -1209,7 +1217,7 @@ fn only_the_decode_steps_forward_opens_the_decode_rows_scope() -> Result<()> {
                 };
                 let mut dec: BatchDecoder<'_, ScopeChain, Session<'_, ScopeChain>> =
                     BatchDecoder::new(opts, &[EOS], device.clone())?;
-                for p in [vec![9u32, 9, 1], vec![9, 0], vec![5]] {
+                for p in [vec![9u32, 9, 1], vec![9, 0], vec![5], vec![9, 9, 9, 0]] {
                     dec.admit(Session::new(&model, 0usize), p, Sampling::ArgMax, 0)?;
                 }
                 let mut n = 0;
@@ -1242,6 +1250,8 @@ fn only_the_decode_steps_forward_opens_the_decode_rows_scope() -> Result<()> {
                 if chunk > 0 {
                     assert!(ragged.1 > 0, "{tag}: no piece step ran ({ragged:?})");
                     assert!(led.0 > 0, "{tag}: no piece rode a live row ({led:?})");
+                    let wide = model.wide.load(std::sync::atomic::Ordering::Relaxed);
+                    assert!(wide > 0, "{tag}: no piece of two tokens rode a live row");
                     assert!(led.1 > 0, "{tag}: no step fed pieces alone ({led:?})");
                 } else {
                     assert!(single.1 > 0, "{tag}: no whole prompt was fed ({single:?})");

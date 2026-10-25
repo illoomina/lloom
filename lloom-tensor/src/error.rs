@@ -279,9 +279,12 @@ pub enum Error {
     #[error("npy/npz error {0}")]
     Npy(String),
 
-    /// Zip file format error.
+    /// Zip file format error. Boxed: zip 9.1.0's `ZipError` carries a
+    /// `u128` (`DecompressedSizeLimitExceeded`), which inline would widen
+    /// every `Result` from 32 to 48 bytes (`invariants.md` §15.2 #15a;
+    /// `tests/error_size.rs`).
     #[error(transparent)]
-    Zip(#[from] zip::result::ZipError),
+    Zip(Box<zip::result::ZipError>),
 
     /// Integer parse error.
     #[error(transparent)]
@@ -339,6 +342,12 @@ pub type Result<T> = std::result::Result<T, Error>;
 impl From<std::string::FromUtf8Error> for Error {
     fn from(e: std::string::FromUtf8Error) -> Self {
         Self::FromUtf8(Box::new(e))
+    }
+}
+
+impl From<zip::result::ZipError> for Error {
+    fn from(e: zip::result::ZipError) -> Self {
+        Self::Zip(Box::new(e))
     }
 }
 

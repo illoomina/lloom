@@ -21,6 +21,7 @@ enum Case {
     SplitMarker,
     LongReply,
     LateFailure,
+    BacklogRefusal,
 }
 #[derive(Default)]
 struct Wire {
@@ -142,7 +143,7 @@ impl Served for Scripted {
         "scripted-tail"
     }
     fn kv_capacity(&self) -> usize {
-        if matches!(self.case, Case::LongReply) {
+        if matches!(self.case, Case::LongReply | Case::BacklogRefusal) {
             4 << 20
         } else {
             64
@@ -255,20 +256,37 @@ impl Served for Scripted {
         let ids = match self.case {
             Case::PartialTail => vec![97, end],
             Case::LongReply => vec![97; 1 << 18],
+            Case::BacklogRefusal => {
+                let mut ids = vec![98; MAX_RESPONSE_BACKLOG + 2];
+                ids[0] = 97;
+                ids
+            }
             _ => vec![97, end, 88],
         };
         let mut stopped = false;
+        let mut cancelled = false;
         let mut batched = String::new();
         let batch = if matches!(self.case, Case::LongReply) {
             ids.len()
         } else {
             1
         };
-        for batch in ids.chunks(batch) {
+        let batches: Vec<_> = if matches!(self.case, Case::BacklogRefusal) {
+            vec![&ids[..1], &ids[1..]]
+        } else {
+            ids.chunks(batch).collect()
+        };
+        for batch in batches {
             let (fragment, hit) = stream.publish(batch, &mut decoder, &stops)?;
             if let Some(fragment) = fragment {
                 if matches!(self.case, Case::SplitMarker) {
                     batched.push_str(&fragment);
+                } else if matches!(self.case, Case::BacklogRefusal) {
+                    if !sink(&fragment) {
+                        stream.refuse_last();
+                        cancelled = true;
+                        break;
+                    }
                 } else {
                     assert!(sink(&fragment));
                 }
@@ -278,7 +296,7 @@ impl Served for Scripted {
                 break;
             }
         }
-        if !stopped {
+        if !stopped && !cancelled {
             let (fragment, _) = stream.flush(&mut decoder, &stops)?;
             if let Some(fragment) = fragment {
                 if matches!(self.case, Case::SplitMarker) {
@@ -309,7 +327,9 @@ impl Served for Scripted {
         Ok(Decoded {
             text,
             tokens,
-            stop: if stopped {
+            stop: if cancelled {
+                Stop::Cancelled
+            } else if stopped {
                 Stop::StopString
             } else {
                 Stop::Length
@@ -1309,4 +1329,60 @@ fn a_late_decode_error_publishes_no_session_and_no_success_trailer() {
     assert!(wire.events.iter().all(|e| e.get("timings").is_none()));
     assert_eq!(wire.model_entries, 1);
     assert!(wire.decoded, "fault really follows accepted generation");
+}
+
+#[test]
+fn a_refused_whole_fragment_cannot_enter_the_raw_frontier_or_stored_message() {
+    let progress = Progress::default();
+    let shared = scripted_shared_with_progress(Case::BacklogRefusal, progress.clone());
+    let reply = chat_completions(
+        &shared,
+        &json!({"messages":[{"role":"user","content":"first"}],
+                "stream":true,"store":true,"max_tokens":MAX_RESPONSE_BACKLOG + 2}),
+        None,
+    )
+    .ok()
+    .expect("stored request");
+    let Reply::Stream(run) = reply else {
+        panic!("stream requested")
+    };
+    let id = run.id.clone();
+    stream_response_with_writer(&shared, *run, || {
+        Ok(ChunkedWriter {
+            w: Box::new(Writer {
+                progress: progress.clone(),
+                pending: Vec::new(),
+                fail_delta: None,
+            }),
+        })
+    })
+    .unwrap();
+    let front = shared.front.reply("a").expect("accepted prefix only");
+    assert_eq!(front.text, "a");
+    assert_eq!(front.ids, vec![97]);
+    assert_eq!(front.partial, 0);
+    let resolved = shared
+        .sessions
+        .lock()
+        .resolve(&id, None, true, Instant::now())
+        .unwrap();
+    let message = resolved.messages.unwrap().pop().unwrap();
+    assert_eq!(message["reasoning_content"], "a");
+    assert_eq!(message["content"], "");
+    let (lock, _) = &*progress.0;
+    let wire = lock.lock();
+    let last = wire
+        .events
+        .iter()
+        .find(|e| e.get("timings").is_some())
+        .unwrap();
+    assert_eq!(last["choices"][0]["finish_reason"], "cancelled");
+    assert_eq!(last["usage"]["completion_tokens"], 1);
+    assert_eq!(last["timings"]["response_backlog_limit"], true);
+    assert_eq!(last["timings"]["frontier"]["delivered_bytes"], 1);
+    assert_eq!(last["timings"]["frontier"]["written_bytes"], 1);
+    assert_eq!(last["timings"]["frontier"]["write_failed"], false);
+    assert!(std::str::from_utf8(&wire.committed)
+        .unwrap()
+        .contains("[DONE]"));
 }

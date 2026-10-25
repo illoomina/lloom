@@ -1375,7 +1375,7 @@ fn chat_completions(shared: &Shared, v: &Value, auth: Option<[u8; 32]>) -> Handl
                 .as_deref()
                 .unwrap_or_default()
                 .iter()
-                .map(|v| serde_json::from_str(v.get()))
+                .map(|v| serde_json::from_str(v.as_ref()))
                 .collect::<serde_json::Result<Vec<Value>>>()
                 .map_err(|e| Failure::Internal(e.into()))?;
             m.extend(input.iter().cloned());

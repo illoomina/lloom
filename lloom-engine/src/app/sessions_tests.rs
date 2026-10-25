@@ -1016,8 +1016,8 @@ fn assert_charge(t: &Table) {
         .map(|slot| {
             let session = slot.session.as_ref().map_or(0, |s| {
                 s.ids.capacity() * size_of::<u32>()
-                    + s.messages.capacity() * size_of::<Box<RawValue>>()
-                    + s.messages.iter().map(|v| v.get().len()).sum::<usize>()
+                    + s.messages.capacity() * size_of::<Box<str>>()
+                    + s.messages.iter().map(|v| v.as_ref().len()).sum::<usize>()
                     + s.turns.capacity() * size_of::<Turn>()
                     + s.turns
                         .iter()
@@ -1169,6 +1169,11 @@ fn unused_id_capacity_is_charged_and_an_oversize_publish_preserves_other_session
 #[test]
 fn prepared_messages_roundtrip_without_a_second_value_log() {
     let messages = vec![json!({"role":"user","content":"\\ \" \n π","nested":{"a":[1,true,null]}})];
+    let mut messages = messages;
+    messages.push(
+        json!({"$serde_json::private::RawValue": "{\"must_stay_a_string\":true}",
+        "other": "ordinary key"}),
+    );
     let expected = messages.clone();
     let p = PreparedRecord::new(Record {
         messages,
@@ -1183,14 +1188,14 @@ fn prepared_messages_roundtrip_without_a_second_value_log() {
     let restored: Vec<Value> = p
         .messages
         .iter()
-        .map(|v| serde_json::from_str(v.get()).unwrap())
+        .map(|v| serde_json::from_str(v.as_ref()).unwrap())
         .collect();
-    assert_eq!(&restored[..1], &expected);
+    assert_eq!(&restored[..expected.len()], &expected);
     assert_eq!(
         p.payload_bytes,
         p.ids.capacity() * size_of::<u32>()
-            + p.messages.capacity() * size_of::<Box<RawValue>>()
-            + p.messages.iter().map(|v| v.get().len()).sum::<usize>()
+            + p.messages.capacity() * size_of::<Box<str>>()
+            + p.messages.iter().map(|v| v.as_ref().len()).sum::<usize>()
     );
 }
 
@@ -1241,4 +1246,73 @@ fn prepared_publication_with_spare_turn_capacity_allocates_nothing() {
     );
     drop(published);
     assert_charge(&t);
+}
+
+#[test]
+fn reply_storage_capacities_are_not_hidden_behind_shared_arcs() {
+    let now = Instant::now();
+    for field in [
+        "ids",
+        "text",
+        "reasoning",
+        "content",
+        "logprobs",
+        "rows",
+        "row",
+    ] {
+        let mut t = Table::new(Config {
+            max_bytes: 32 * 1024,
+            ..cfg(1, true)
+        });
+        let ss = scopes(1);
+        let r = t.reserve(
+            Plan {
+                continued: None,
+                store: Some(true),
+                keep: None,
+                auth: None,
+                prompt_ids: &[1],
+                scopes: &ss,
+            },
+            now,
+        );
+        let mut value = (*reply(&[2])).clone();
+        let text = || {
+            let mut s = String::with_capacity(64 * 1024);
+            s.push('r');
+            s
+        };
+        match field {
+            "ids" => {
+                value.ids = Vec::with_capacity(16 * 1024);
+                value.ids.push(2);
+            }
+            "text" => value.text = text(),
+            "reasoning" => value.reasoning_text = text(),
+            "content" => value.content_text = text(),
+            "logprobs" => value.logprobs = Some(Vec::with_capacity(16 * 1024)),
+            "rows" => value.rows = Some(Vec::with_capacity(4096)),
+            "row" => value.rows = Some(vec![Vec::with_capacity(16 * 1024)]),
+            _ => unreachable!(),
+        }
+        let shared = Arc::new(value);
+        let record = PreparedRecord::new(Record {
+            messages: vec![json!({"role":"user","content":"q"})],
+            reply_msg: json!({"role":"assistant","content":"r"}),
+            prompt_ids: vec![1],
+            reply: Arc::clone(&shared),
+            eot: None,
+            scope: ss[1],
+            prefix: None,
+        })
+        .unwrap();
+        let publication = t.publish(r, record, now);
+        assert!(
+            !publication.retained,
+            "{field} capacity must be charged even while shared"
+        );
+        assert_eq!(publication.reason, Some(Reason::Budget), "{field}");
+        drop(publication);
+        assert_charge(&t);
+    }
 }

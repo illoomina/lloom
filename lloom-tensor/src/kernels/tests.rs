@@ -12465,9 +12465,10 @@ const GEMV_ROWS_BOUND: f64 = 1.0 / (1u64 << 12) as f64;
 /// instantiated tiles (`bm4`, `bm8`), an `n` that is not a multiple of
 /// either tile's rows (35, 300, 4100), a `k` the K-walk does not divide
 /// (2047, 130: the masked last iteration) and offsets on both operands; the row
-/// counts take one full group, a group and a partial one, and two and a
-/// partial one, and nothing is stored past the rows (the guard keeps its
-/// sentinel).
+/// counts take one partial group alone (one row fewer than the capacity, the
+/// launch `kernels.gemm.f16_rows_round` makes), one full group, a group and a
+/// partial one, and two and a partial one, and nothing is stored past the
+/// rows (the guard keeps its sentinel).
 #[test]
 fn gemv_rows_keep_the_one_row_bits_at_every_capacity() {
     let h = GemvRows::new();
@@ -12483,7 +12484,7 @@ fn gemv_rows_keep_the_one_row_bits_at_every_capacity() {
             .map(|i| f16::from_f32(((i as f32) * 0.61).sin() * 0.05))
             .collect();
         for cap in 2..=GEMV_ROWS_MAX {
-            let mut counts = vec![cap, cap + 1 + cap / 2, 2 * cap + 1];
+            let mut counts = vec![cap - 1, cap, cap + 1 + cap / 2, 2 * cap + 1];
             counts.dedup();
             for rows in counts {
                 let x_off = 5;

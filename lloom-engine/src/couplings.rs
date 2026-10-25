@@ -205,6 +205,15 @@ pub const COUPLINGS: &[Coupling] = &[
         site: "lloom-tensor/src/kernels/kernels/mlx_gemm.rs f16_rows_route, f16_rows_lead; lloom/src/nn/batched.rs BatchDecoder::forward_live (tuning::DecodeRows), BatchDecoder::forward_ragged_live (tuning::RaggedDecodeRows)",
         is_static: false,
     },
+    Coupling {
+        id: "C21",
+        kind: "ignored",
+        when: "kernels.gemm.f16_rows off, determinism = deterministic, or the CPU backend",
+        effect: "kernels.gemm.f16_rows_round has no effect: no launch takes the row axis. Where one does, a launch of an odd number of rows takes the next even capacity and every row keeps the one-row GEMV's bits, so the arm moves time, never a bit",
+        keys: &["kernels.gemm.f16_rows_round", "kernels.gemm.f16_rows", "determinism", "backend.device"],
+        site: "lloom-tensor/src/kernels/kernels/mlx_gemm.rs f16_rows_capacity",
+        is_static: false,
+    },
 ];
 
 /// The couplings naming `key`.
@@ -433,6 +442,23 @@ pub fn explain(o: &EngineOptions) -> Vec<String> {
                  (C20)",
                 g.f16_rows_max, g.f16_rows_max
             ),
+        });
+    }
+    if g.f16_rows_round {
+        let cause = if o.tuning.contract.profile == "deterministic" {
+            Some("determinism = deterministic")
+        } else if !g.f16_rows {
+            Some("kernels.gemm.f16_rows = false")
+        } else if !cfg!(feature = "metal") || o.load.device == "cpu" {
+            Some("the CPU backend")
+        } else {
+            None
+        };
+        out.push(match cause {
+            Some(c) => format!("kernels.gemm.f16_rows_round ignored <- {c} (C21)"),
+            None => "kernels.gemm.f16_rows_round: a row-axis launch of an odd number of rows \
+                     takes the next even capacity, the same bits <- kernels.gemm.f16_rows (C21)"
+                .into(),
         });
     }
     out
@@ -757,5 +783,41 @@ mod tests {
             c20(&[("scheduler.max_sequences", "4")]).is_empty(),
             "the arm off"
         );
+        // C21: the capacity rounding names what it does where the row axis
+        // runs, and its cause where it does not.
+        let c21 = |sets: &[(&str, &str)]| -> Vec<String> {
+            explain(&with(sets))
+                .into_iter()
+                .filter(|l| l.ends_with("(C21)"))
+                .collect()
+        };
+        let round = [("kernels.gemm.f16_rows_round", "true")];
+        if cfg!(feature = "metal") {
+            assert_eq!(
+                c21(&round),
+                vec![
+                    "kernels.gemm.f16_rows_round: a row-axis launch of an odd number of rows \
+                     takes the next even capacity, the same bits <- kernels.gemm.f16_rows (C21)"
+                ]
+            );
+        } else {
+            assert_eq!(
+                c21(&round),
+                vec!["kernels.gemm.f16_rows_round ignored <- the CPU backend (C21)"]
+            );
+        }
+        let mut det = round.to_vec();
+        det.push(("determinism", "deterministic"));
+        assert_eq!(
+            c21(&det),
+            vec!["kernels.gemm.f16_rows_round ignored <- determinism = deterministic (C21)"]
+        );
+        let mut rows_off = round.to_vec();
+        rows_off.push(("kernels.gemm.f16_rows", "false"));
+        assert_eq!(
+            c21(&rows_off),
+            vec!["kernels.gemm.f16_rows_round ignored <- kernels.gemm.f16_rows = false (C21)"]
+        );
+        assert!(c21(&[]).is_empty(), "the arm off");
     }
 }

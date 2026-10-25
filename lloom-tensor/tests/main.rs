@@ -30,6 +30,7 @@ mod error_size;
 mod f16_rows_axis;
 mod f16_rows_decode;
 mod f16_rows_identity;
+mod f16_rows_round;
 mod f16_rows_timing;
 mod fp_kind_codes;
 mod gate_contract_pinned;

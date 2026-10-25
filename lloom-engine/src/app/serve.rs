@@ -3957,7 +3957,30 @@ fn report_with(
                 lloom_tensor::tuning::f16_rows_decode_launches()
             )
         }
+        // A speculative request's verify windows on the row axis: the
+        // window's engagement since the load.
+        crate::ReadbackArm::Speculative { .. }
+            if lloom_tensor::tuning::contract().is_fast()
+                && lloom_tensor::tuning::f16_rows_max().is_some() =>
+        {
+            format!(
+                " f16_rows_launches={}",
+                lloom_tensor::tuning::f16_rows_launches()
+            )
+        }
         _ => String::new(),
+    };
+    // The row axis's capacity rounding, where it is on: its engagement since
+    // the load.
+    let decode_rows = if lloom_tensor::tuning::f16_rows_round()
+        && lloom_tensor::tuning::f16_rows_max().is_some()
+    {
+        format!(
+            "{decode_rows} f16_rows_rounded_launches={}",
+            lloom_tensor::tuning::f16_rows_rounded_launches()
+        )
+    } else {
+        decode_rows
     };
     eprintln!(
         "[{endpoint}: prompt_tokens={prompt} completion_tokens={} stop={:?} total {total_ms:.1} ms, \

@@ -669,6 +669,43 @@ pub fn f16_rows_decode_launches() -> u64 {
     F16_ROWS_DECODE_LAUNCHES.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// `kernels.gemm.f16_rows_round`: 0 unread, 1 off, 2 on.
+static F16_ROWS_ROUND: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Launches on the f16 row axis that took a capacity above their rows since
+/// process start: the rounding arm's engagement count.
+static F16_ROWS_ROUNDED_LAUNCHES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// `kernels.gemm.f16_rows_round`, read once; or [`set_f16_rows_round`].
+pub fn f16_rows_round() -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    match F16_ROWS_ROUND.load(Relaxed) {
+        1 => false,
+        2 => true,
+        _ => {
+            let on = tuning().gemm.f16_rows_round;
+            F16_ROWS_ROUND.store(if on { 2 } else { 1 }, Relaxed);
+            on
+        }
+    }
+}
+
+/// Select the capacity rounding for this process (a test runs both).
+pub fn set_f16_rows_round(on: bool) {
+    F16_ROWS_ROUND.store(if on { 2 } else { 1 }, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Count one launch on the f16 row axis at a capacity above its rows.
+pub fn note_f16_rows_rounded() {
+    F16_ROWS_ROUNDED_LAUNCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The rounding arm's engagement count now.
+pub fn f16_rows_rounded_launches() -> u64 {
+    F16_ROWS_ROUNDED_LAUNCHES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// The contract in force for this process: [`tuning`]'s `contract.profile`,
 /// parsed once. Every fast arm reads it here, so the contract is one value
 /// read once (a compile-time profile type would replace this function).
@@ -1217,6 +1254,15 @@ pub struct GemmTuning {
         status = "arm"
     )]
     pub f16_rows_decode: bool,
+    /// Under `fast`, a launch of an odd number of rows (3 to 15) on the f16 row axis takes the next even capacity: the padded lanes re-read the launch's last row and store nothing, so every row keeps the one-row GEMV's bits; off = capacity `m`. A verify window's and a batched decode step's launches alike; one row keeps the one-row GEMV.
+    #[opt(
+        flag = "gemm-f16-rows-round",
+        env = "LLOOM_GEMM_F16_ROWS_ROUND",
+        bool,
+        path = "kernels.gemm.f16_rows_round",
+        status = "arm"
+    )]
+    pub f16_rows_round: bool,
 }
 
 impl Default for GemmTuning {
@@ -1236,6 +1282,7 @@ impl Default for GemmTuning {
             // slower at 12 on most of them.
             f16_rows_max: 10,
             f16_rows_decode: false,
+            f16_rows_round: false,
         }
     }
 }
@@ -1950,6 +1997,7 @@ mod tests {
         // never takes it (`the_report_names_the_f16_row_axis_under_fast_only`).
         assert!(t.gemm.f16_rows);
         assert_eq!(t.gemm.f16_rows_max, 10);
+        assert!(!t.gemm.f16_rows_round);
         assert_eq!(t.qmm.dequant_from, 64);
         assert_eq!(t.moe.mm_from, 64);
         assert!(t.qmm.f16_mm);

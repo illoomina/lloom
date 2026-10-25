@@ -2,12 +2,14 @@
 //! under `fast`, with `kernels.gemm.f16_rows` and
 //! `kernels.gemm.f16_rows_decode` on, inside a batched decode step's forward
 //! (`tuning::DecodeRows`), a half matmul of 2 to `f16_rows_max` rows sweeps
-//! its weight once for every row, each row the one-row GEMV's bits.
-//! Everywhere else the route is the one it was.
+//! its weight once for every row, each row the one-row GEMV's bits; in a
+//! step that carries prompt pieces (`tuning::RaggedDecodeRows`) its live
+//! rows do the same and the pieces keep the GEMM's bits. Everywhere else the
+//! route is the one it was.
 #![cfg(feature = "metal")]
 use lloom_tensor::tuning::{
     f16_rows_decode_launches, f16_rows_launches, set_f16_rows, set_f16_rows_decode, Contract,
-    DecodeRows, VerifyWindow,
+    DecodeRows, RaggedDecodeRows, VerifyWindow,
 };
 use lloom_tensor::{DType, Device, Result, Tensor};
 
@@ -271,6 +273,182 @@ fn the_decode_switch_reaches_a_decode_step_only() -> Result<()> {
     Ok(())
 }
 
+/// A step that carries prompt pieces puts its live rows on the decode
+/// route: inside `RaggedDecodeRows` with both switches on, a half matmul
+/// over the step's input rows or its head's rows takes the row axis for its
+/// first `live` rows — each the one-row GEMV's bits, from one live row to
+/// the ceiling — and the GEMM for the pieces after them, each piece row the
+/// bits the whole matmul's GEMM gives it; one decode launch counted. With
+/// the decode switch off the scope moves no bit, and some live row of the
+/// GEMM differs from its one-row bits, so the comparison sees the route.
+#[test]
+fn a_ragged_steps_live_rows_take_the_decode_route_and_its_pieces_keep_the_gemm() -> Result<()> {
+    let dev = device(Contract::Fast)?;
+    set_f16_rows(Some(10));
+    let (mut live_rows, mut piece_rows, mut gemm_differing) = (0usize, 0usize, 0usize);
+    for (n, k) in [
+        (35usize, 512usize),
+        (2048, 2048),
+        (6144, 2048),
+        (2048, 10752),
+    ] {
+        let rhs = weight(n, k, &dev)?.t()?;
+        for live in [1usize, 2, 3, 4, 7, 10] {
+            for piece in [1usize, 5, 111] {
+                let m = live + piece;
+                let x = rows(m, k, (live * 7 + piece) as f32 * 0.1, &dev)?;
+                // The input's rows, then a head of one row a sequence.
+                for (scope_rows, heads) in [(m, live + 1), (live + 2 * piece, m)] {
+                    set_f16_rows_decode(false);
+                    let whole = x.matmul(&rhs)?;
+                    let off = {
+                        let _s = RaggedDecodeRows::open(live, scope_rows, heads);
+                        x.matmul(&rhs)?
+                    };
+                    assert_eq!(
+                        bits(&off)?,
+                        bits(&whole)?,
+                        "[{n}, {k}] live={live} piece={piece}: the switch off, the scope moved bits"
+                    );
+                    set_f16_rows_decode(true);
+                    let before = f16_rows_decode_launches();
+                    let y = {
+                        let _s = RaggedDecodeRows::open(live, scope_rows, heads);
+                        x.matmul(&rhs)?
+                    };
+                    assert_eq!(
+                        f16_rows_decode_launches() - before,
+                        1,
+                        "[{n}, {k}] live={live} piece={piece}: one decode launch"
+                    );
+                    for r in 0..live {
+                        let one = bits(&x.narrow(0, r, 1)?.contiguous()?.matmul(&rhs)?)?;
+                        assert_eq!(
+                            bits(&y.narrow(0, r, 1)?)?,
+                            one,
+                            "[{n}, {k}] live={live} piece={piece} row={r}: a live row is not the \
+                             one-row GEMV's bits"
+                        );
+                        live_rows += 1;
+                        if bits(&whole.narrow(0, r, 1)?)? != one {
+                            gemm_differing += 1;
+                        }
+                    }
+                    for r in live..m {
+                        assert_eq!(
+                            bits(&y.narrow(0, r, 1)?)?,
+                            bits(&whole.narrow(0, r, 1)?)?,
+                            "[{n}, {k}] live={live} piece={piece} row={r}: a piece row is not \
+                             the whole GEMM's bits"
+                        );
+                        piece_rows += 1;
+                    }
+                }
+            }
+        }
+    }
+    println!(
+        "F16_ROWS_DECODE_RAGGED live_rows={live_rows} one_row_bit_equal={live_rows} \
+         piece_rows={piece_rows} gemm_bit_equal={piece_rows} \
+         gemm_live_rows_differing_from_one_row={gemm_differing}/{live_rows}"
+    );
+    assert!(
+        gemm_differing > 0,
+        "no GEMM live row differs from its one-row bits: the comparison cannot tell the routes apart"
+    );
+    Ok(())
+}
+
+/// The ragged split reaches only the step's own rows: a matmul of another
+/// row count inside the scope, more live rows than the ceiling, the row axis
+/// off, a verify window inside the scope, and the scope closed all keep the
+/// switch-off bits and count nothing; the same matmul over the step's rows
+/// is split (the positive control).
+#[test]
+fn the_ragged_split_reaches_the_steps_rows_only() -> Result<()> {
+    let dev = device(Contract::Fast)?;
+    let (n, k) = (512usize, 1024usize);
+    let rhs = weight(n, k, &dev)?.t()?;
+    let x = rows(9, k, 0.5, &dev)?;
+    let x14 = rows(14, k, 0.25, &dev)?;
+    type Case<'a> = (&'a str, Option<usize>, Box<dyn Fn() -> Result<Tensor> + 'a>);
+    let cases: Vec<Case> = vec![
+        (
+            "another row count",
+            Some(10),
+            Box::new(|| {
+                let _s = RaggedDecodeRows::open(3, 12, 5);
+                x.matmul(&rhs)
+            }),
+        ),
+        (
+            "eleven live rows (past the ceiling)",
+            Some(10),
+            Box::new(|| {
+                let _s = RaggedDecodeRows::open(11, 14, 13);
+                x14.matmul(&rhs)
+            }),
+        ),
+        (
+            "the row axis off",
+            None,
+            Box::new(|| {
+                let _s = RaggedDecodeRows::open(3, 9, 5);
+                x.matmul(&rhs)
+            }),
+        ),
+        (
+            "a verify window inside the scope",
+            Some(10),
+            Box::new(|| {
+                let _s = RaggedDecodeRows::open(3, 9, 5);
+                let _w = VerifyWindow::open();
+                x.matmul(&rhs)
+            }),
+        ),
+        (
+            "the scope closed",
+            Some(10),
+            Box::new(|| {
+                drop(RaggedDecodeRows::open(3, 9, 5));
+                x.matmul(&rhs)
+            }),
+        ),
+    ];
+    for (what, rows_max, run) in &cases {
+        set_f16_rows(*rows_max);
+        set_f16_rows_decode(false);
+        let off = run()?;
+        set_f16_rows_decode(true);
+        let before = f16_rows_decode_launches();
+        let on = run()?;
+        assert_eq!(
+            f16_rows_decode_launches(),
+            before,
+            "{what}: the ragged split reached past the step's rows"
+        );
+        assert_eq!(bits(&on)?, bits(&off)?, "{what}: bits moved");
+    }
+    set_f16_rows(Some(10));
+    set_f16_rows_decode(true);
+    let before = f16_rows_decode_launches();
+    {
+        let _s = RaggedDecodeRows::open(3, 9, 5);
+        x.matmul(&rhs)?;
+    }
+    assert_eq!(f16_rows_decode_launches() - before, 1, "the control");
+    assert_eq!(
+        lloom_tensor::tuning::ragged_decode_lead(9),
+        None,
+        "the scope outlived its guard"
+    );
+    println!(
+        "F16_ROWS_DECODE_RAGGED_SCOPE cases={} control=1",
+        cases.len()
+    );
+    Ok(())
+}
+
 /// `deterministic` never takes it: a decode step's half rows keep the
 /// one-row reduction per row with both switches on.
 #[test]
@@ -292,6 +470,16 @@ fn deterministic_decode_steps_never_take_the_row_axis() -> Result<()> {
     };
     assert_eq!(f16_rows_decode_launches(), before, "deterministic took it");
     assert_eq!(bits(&on)?, bits(&off)?);
+    let ragged = {
+        let _s = RaggedDecodeRows::open(2, 4, 3);
+        x.matmul(&rhs)?
+    };
+    assert_eq!(
+        f16_rows_decode_launches(),
+        before,
+        "deterministic split a ragged step"
+    );
+    assert_eq!(bits(&ragged)?, bits(&off)?);
     assert!(
         !Contract::Deterministic.report().contains("f16-rows-decode"),
         "{}",

@@ -4409,7 +4409,7 @@ fn serve_advertises_sessions_streams_their_id_and_binds_them_to_a_key() {
     assert!(f["sessions"].get("ttl_s").is_none(), "{f}");
     assert_eq!(
         f["sessions"]["reasons"],
-        json!(["idle", "capacity", "memory", "reset", "delete", "restart"]),
+        json!(["idle", "capacity", "memory", "reset", "delete", "restart", "budget"]),
         "{f}"
     );
 
@@ -4452,4 +4452,42 @@ fn serve_advertises_sessions_streams_their_id_and_binds_them_to_a_key() {
     assert_eq!(status, 200, "{b}");
     drop(server);
     std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn serve_reports_budget_release_without_failing_generation_or_keeping_an_id() {
+    let dir = scratch("session-budget");
+    let model = write::<Lfm2Tiny>(&dir);
+    let server = Server::start(&model, &["--cpu", "--session-max-mib", "0"]);
+    for stream in [false, true] {
+        let request = session_req(json!({"messages":[{"role":"user","content":PROMPT}],
+            "store":true, "stream":stream}));
+        let response = if stream {
+            sse(&server, &request).last().unwrap().clone()
+        } else {
+            let (status, body) = server.call("POST", "/v1/chat/completions", &request);
+            assert_eq!(status, 200, "{body}");
+            body
+        };
+        let session = &response["timings"]["session"];
+        assert_eq!(session["state"], "released", "{response}");
+        assert_eq!(session["reason"], "budget", "{response}");
+        assert!(session["id"].is_null(), "{response}");
+        let id = response["id"].as_str().unwrap();
+        let (status, lost) = server.call(
+            "POST",
+            "/v1/chat/completions",
+            &session_req(json!({"previous_response_id":id,"input":"Again."})),
+        );
+        assert_eq!(status, 404, "{lost}");
+        let (_, health) = server.call("GET", "/health", &json!({}));
+        assert_eq!(health["sessions"]["bytes"], 0, "{health}");
+        assert_eq!(health["sessions"]["held"], 0, "{health}");
+        assert!(
+            health["sessions"]["released"]["budget"].as_u64().unwrap() > 0,
+            "{health}"
+        );
+    }
+    drop(server);
+    std::fs::remove_dir_all(&dir).unwrap();
 }

@@ -513,10 +513,7 @@ fn a_slot_taken_for_a_new_session_says_idle_or_capacity() {
 
 #[test]
 fn over_the_byte_budget_the_least_recently_used_other_session_goes() {
-    let mut t = Table::new(Config {
-        max_bytes: 64,
-        ..cfg(4, true)
-    });
+    let mut t = Table::new(cfg(4, true));
     let now = Instant::now();
     let a = turn(
         &mut t,
@@ -528,6 +525,10 @@ fn over_the_byte_budget_the_least_recently_used_other_session_goes() {
         &[2],
         now,
     );
+    // Admit either complete session, but not both; logical payload bytes alone
+    // no longer describe this fixture's retained allocation requirement.
+    let one = t.bytes;
+    t.cfg.max_bytes = one + one / 2;
     let b = turn(
         &mut t,
         None,
@@ -870,4 +871,374 @@ fn the_end_of_turn_id_is_the_sessions_but_not_the_engines() {
         vec![1, 2, 3],
         "the engine held the prompt and the reply"
     );
+}
+
+#[test]
+fn an_oversize_stored_session_declines_retention() {
+    let mut t = Table::new(Config {
+        max_bytes: 1024,
+        ..cfg(1, true)
+    });
+    let now = Instant::now();
+    let prompt = vec![1; 4096];
+    let ss = scopes(1);
+    let r = t.reserve(
+        Plan {
+            continued: None,
+            store: Some(true),
+            keep: None,
+            auth: Some([7; 32]),
+            prompt_ids: &prompt,
+            scopes: &ss,
+        },
+        now,
+    );
+    let kept = t.commit(
+        r,
+        Record {
+            messages: vec![json!({"role":"user","content":"large"})],
+            reply_msg: json!({"role":"assistant","content":"r"}),
+            prompt_ids: prompt,
+            reply: reply(&[2]),
+            eot: None,
+            scope: ss[1],
+            prefix: None,
+        },
+        now,
+    );
+    assert!(
+        !kept,
+        "successful generation must not retain an oversize lineage"
+    );
+    assert!(
+        t.bytes <= t.cfg.max_bytes,
+        "{} > {}",
+        t.bytes,
+        t.cfg.max_bytes
+    );
+    assert!(t
+        .resolve(&r.id.encode(), Some([7; 32]), false, now)
+        .is_err());
+}
+
+mod allocation_receipt {
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::sync::atomic::{AtomicIsize, AtomicUsize, Ordering};
+    pub static ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
+    pub static LIVE: AtomicIsize = AtomicIsize::new(0);
+    pub struct Allocator;
+    // SAFETY: every allocation/deallocation is forwarded unchanged to System;
+    // the counter observes requested live allocation bytes only.
+    unsafe impl GlobalAlloc for Allocator {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            let ptr = unsafe { System.alloc(layout) };
+            if !ptr.is_null() {
+                ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+                LIVE.fetch_add(layout.size() as isize, Ordering::Relaxed);
+            }
+            ptr
+        }
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            LIVE.fetch_sub(layout.size() as isize, Ordering::Relaxed);
+            unsafe { System.dealloc(ptr, layout) };
+        }
+    }
+    #[global_allocator]
+    static ALLOCATOR: Allocator = Allocator;
+}
+
+#[test]
+fn repeated_small_turns_reset_delete_and_eviction_account_retained_allocations() {
+    use std::sync::atomic::Ordering;
+    let before_control = allocation_receipt::LIVE.load(Ordering::Relaxed);
+    let allocation = Box::new([0u8; 4096]);
+    std::hint::black_box(&allocation);
+    assert_eq!(
+        allocation_receipt::LIVE.load(Ordering::Relaxed) - before_control,
+        4096,
+        "the real allocator instrument must observe a live allocation"
+    );
+    drop(allocation);
+    assert_eq!(
+        allocation_receipt::LIVE.load(Ordering::Relaxed),
+        before_control,
+        "the instrument must observe its deallocation"
+    );
+    let mut t = Table::new(cfg(1, true));
+    let now = Instant::now();
+    eprintln!("retention allocator control: System requested live bytes; excludes allocator caches/rounding and fixed empty table");
+    let baseline = allocation_receipt::LIVE.load(Ordering::Relaxed);
+    let mut peak_undercharge = 0isize;
+    for cycle in 0..12 {
+        let mut previous = None;
+        for n in 0..32u8 {
+            let id = turn(
+                &mut t,
+                previous,
+                Some(true),
+                Some([9; 32]),
+                &[1],
+                &scopes(n.saturating_mul(2).saturating_add(1)),
+                &[2],
+                now,
+            );
+            previous = Some((id.key, id.turn as usize));
+        }
+        let key = previous.unwrap().0;
+        if cycle % 2 == 0 {
+            t.reset(key);
+        } else {
+            let id = t.slots[key.slot as usize].session.as_ref().unwrap();
+            let last = id.turns.last().unwrap();
+            let wire = WireId {
+                key,
+                turn: (id.turns.len() - 1) as u32,
+                nonce: last.nonce,
+            };
+            t.delete(&wire.encode(), Some([9; 32]), now).unwrap();
+        }
+        let live = allocation_receipt::LIVE.load(Ordering::Relaxed) - baseline;
+        peak_undercharge = peak_undercharge.max(live - t.bytes as isize);
+        eprintln!(
+            "retention cycle={cycle} allocator_live_requested={live} reported={} undercharge={}",
+            t.bytes,
+            live - t.bytes as isize
+        );
+    }
+    assert!(peak_undercharge <= 0,
+        "retained allocations exceed reported bytes by {peak_undercharge}; fixed empty table excluded");
+}
+
+fn assert_charge(t: &Table) {
+    let slow = t
+        .slots
+        .iter()
+        .map(|slot| {
+            let session = slot.session.as_ref().map_or(0, |s| {
+                s.ids.capacity() * size_of::<u32>()
+                    + s.messages.capacity() * size_of::<Box<RawValue>>()
+                    + s.messages.iter().map(|v| v.get().len()).sum::<usize>()
+                    + s.turns.capacity() * size_of::<Turn>()
+                    + s.turns
+                        .iter()
+                        .map(|turn| {
+                            reply_bytes(&turn.reply)
+                                + turn.prefix.as_ref().map_or(0, PrefixRecord::retained_bytes)
+                        })
+                        .sum::<usize>()
+                    + s.dropped.capacity() * size_of::<Dropped>()
+            });
+            session
+                + slot.released.capacity() * size_of::<Released>()
+                + slot
+                    .released
+                    .iter()
+                    .map(|r| {
+                        r.nonces.capacity() * size_of::<u64>()
+                            + r.dropped.capacity() * size_of::<Dropped>()
+                    })
+                    .sum::<usize>()
+        })
+        .sum::<usize>();
+    assert_eq!(
+        t.bytes, slow,
+        "cached accounting equals retained allocation oracle"
+    );
+    assert!(
+        t.bytes <= t.cfg.max_bytes,
+        "{} > {}",
+        t.bytes,
+        t.cfg.max_bytes
+    );
+}
+
+#[test]
+fn release_histories_share_the_byte_bound_and_authentication() {
+    let mut t = Table::new(Config {
+        max_bytes: 32 * 1024,
+        ..cfg(16, true)
+    });
+    let now = Instant::now();
+    let auth = Some([17; 32]);
+    let mut old = None;
+    for cycle in 0..160 {
+        let mut previous = None;
+        for n in 0..16u8 {
+            let id = turn(
+                &mut t,
+                previous,
+                Some(true),
+                auth,
+                &[1],
+                &scopes(2 * n + 1),
+                &[2],
+                now,
+            );
+            previous = Some((id.key, id.turn as usize));
+            assert_charge(&t);
+            if cycle == 0 && n == 0 {
+                old = Some(id);
+            }
+        }
+    }
+    let old = old.unwrap();
+    for auth in [None, Some([18; 32])] {
+        assert_eq!(
+            t.resolve(&old.encode(), auth, false, now)
+                .err()
+                .unwrap()
+                .reason,
+            None
+        );
+    }
+    assert_charge(&t);
+    assert!(
+        t.slots.iter().any(|s| s.released.len() < RELEASES_KEPT),
+        "byte pressure must limit the release history before the count-only ceiling"
+    );
+}
+
+#[test]
+fn unused_id_capacity_is_charged_and_an_oversize_publish_preserves_other_sessions() {
+    let mut t = Table::new(Config {
+        max_bytes: 32 * 1024,
+        ..cfg(4, true)
+    });
+    let now = Instant::now();
+    let a = turn(&mut t, None, Some(true), None, &[1], &scopes(1), &[2], now);
+    let mut ids = Vec::with_capacity(128 * 1024);
+    ids.push(1);
+    let ss = scopes(1);
+    let r = t.reserve(
+        Plan {
+            continued: None,
+            store: Some(true),
+            keep: None,
+            auth: Some([3; 32]),
+            prompt_ids: &ids,
+            scopes: &ss,
+        },
+        now,
+    );
+    let prepared = PreparedRecord::new(Record {
+        messages: vec![json!({"role":"user","content":"x"})],
+        reply_msg: json!({"role":"assistant","content":"r"}),
+        prompt_ids: ids,
+        reply: reply(&[2]),
+        eot: None,
+        scope: ss[1],
+        prefix: None,
+    })
+    .unwrap();
+    let result = t.publish(r, prepared, now);
+    assert!(!result.retained);
+    assert_eq!(result.reason, Some(Reason::Budget));
+    drop(result);
+    assert!(
+        t.resolve(&a.encode(), None, false, now).is_ok(),
+        "unrelated lineage survives impossible admission"
+    );
+    assert_eq!(
+        t.resolve(&r.id.encode(), Some([3; 32]), false, now)
+            .err()
+            .unwrap()
+            .reason,
+        Some(Reason::Budget)
+    );
+    assert_eq!(
+        t.resolve(&r.id.encode(), None, false, now)
+            .err()
+            .unwrap()
+            .reason,
+        None
+    );
+    let guessed = WireId {
+        nonce: r.id.nonce ^ 1,
+        ..r.id
+    };
+    assert_eq!(
+        t.resolve(&guessed.encode(), Some([3; 32]), false, now)
+            .err()
+            .unwrap()
+            .reason,
+        None
+    );
+    assert_charge(&t);
+}
+
+#[test]
+fn prepared_messages_roundtrip_without_a_second_value_log() {
+    let messages = vec![json!({"role":"user","content":"\\ \" \n π","nested":{"a":[1,true,null]}})];
+    let expected = messages.clone();
+    let p = PreparedRecord::new(Record {
+        messages,
+        reply_msg: json!({"role":"assistant","content":"r"}),
+        prompt_ids: vec![1],
+        reply: reply(&[2]),
+        eot: None,
+        scope: Scope::test(1),
+        prefix: None,
+    })
+    .unwrap();
+    let restored: Vec<Value> = p
+        .messages
+        .iter()
+        .map(|v| serde_json::from_str(v.get()).unwrap())
+        .collect();
+    assert_eq!(&restored[..1], &expected);
+    assert_eq!(
+        p.payload_bytes,
+        p.ids.capacity() * size_of::<u32>()
+            + p.messages.capacity() * size_of::<Box<RawValue>>()
+            + p.messages.iter().map(|v| v.get().len()).sum::<usize>()
+    );
+}
+
+#[test]
+fn prepared_publication_with_spare_turn_capacity_allocates_nothing() {
+    use std::sync::atomic::Ordering;
+    let mut t = Table::new(cfg(4, true));
+    let now = Instant::now();
+    let id = turn(&mut t, None, Some(true), None, &[1], &scopes(1), &[2], now);
+    let ss = scopes(3);
+    let reservation = t.reserve(
+        Plan {
+            continued: Some((id.key, 0)),
+            store: None,
+            keep: None,
+            auth: None,
+            prompt_ids: &[1, 2, 3],
+            scopes: &ss,
+        },
+        now,
+    );
+    assert!(t.get(id.key).unwrap().turns.capacity() > 1);
+    let record = PreparedRecord::new(Record {
+        messages: vec![
+            json!({"role":"user","content":"x".repeat(64*1024)}),
+            json!({"role":"assistant","content":"r"}),
+            json!({"role":"user","content":"next"}),
+        ],
+        reply_msg: json!({"role":"assistant","content":"r"}),
+        prompt_ids: vec![1, 2, 3],
+        reply: reply(&[4]),
+        eot: None,
+        scope: ss[3],
+        prefix: None,
+    })
+    .unwrap();
+    let before = allocation_receipt::ALLOCATIONS.load(Ordering::Relaxed);
+    let published = t.publish(reservation, record, now);
+    let allocated = allocation_receipt::ALLOCATIONS.load(Ordering::Relaxed) - before;
+    eprintln!(
+        "retention publication allocation_calls={allocated} retained={}",
+        published.retained
+    );
+    assert!(published.retained);
+    assert_eq!(
+        allocated, 0,
+        "normal publication consumes prepared buffers without serializing history"
+    );
+    drop(published);
+    assert_charge(&t);
 }

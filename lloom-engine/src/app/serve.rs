@@ -1370,7 +1370,14 @@ fn chat_completions(shared: &Shared, v: &Value, auth: Option<[u8; 32]>) -> Handl
     // turn, its reply as the response returned it, then the new messages.
     let joined: Option<Value> = match (&ask.input, &resolved) {
         (Some(input), Some(r)) => {
-            let mut m = r.messages.clone().unwrap_or_default();
+            let mut m = r
+                .messages
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .map(|v| serde_json::from_str(v.get()))
+                .collect::<serde_json::Result<Vec<Value>>>()
+                .map_err(|e| Failure::Internal(e.into()))?;
             m.extend(input.iter().cloned());
             Some(Value::Array(m))
         }
@@ -2138,31 +2145,12 @@ fn finish_session(
         .map(|(id, _)| id)
         .filter(|_| decoded.stop == Stop::Eos);
     let id = ctx.reservation.id;
-    let kept = match reply {
-        Some(reply) => shared.sessions.lock().commit(
-            ctx.reservation,
-            super::sessions::Record {
-                messages: ctx.conversation,
-                reply_msg,
-                prompt_ids: prompt_ids.to_vec(),
-                reply,
-                eot,
-                scope: ctx.scope,
-                prefix: ctx.record,
-            },
-            Instant::now(),
-        ),
-        None => false,
-    };
-    if !kept {
-        shared.sessions.lock().note_other();
-    }
     let reused = decoded.reused;
     let reprefilled = ctx
         .continued
         .as_ref()
         .map_or(0, |c| c.carried.saturating_sub(reused));
-    let state = match (&ctx.continued, ctx.asked) {
+    let continued_state = match (&ctx.continued, ctx.asked) {
         (_, false) => "new",
         (None, true) => "expired",
         (Some(c), true) => match c.resident {
@@ -2176,14 +2164,45 @@ fn finish_session(
         Some(_) => shared
             .sessions
             .lock()
-            .note_continued(id.key, state == "resident"),
+            .note_continued(id.key, continued_state == "resident"),
         None => 0,
+    };
+    let publication = match reply {
+        Some(reply) => super::sessions::PreparedRecord::new(super::sessions::Record {
+            messages: ctx.conversation,
+            reply_msg,
+            prompt_ids: prompt_ids.to_vec(),
+            reply,
+            eot,
+            scope: ctx.scope,
+            prefix: ctx.record,
+        })
+        .inspect_err(|e| eprintln!("[session record preparation failed: {e}]"))
+        .ok()
+        .map(|record| {
+            shared
+                .sessions
+                .lock()
+                .publish(ctx.reservation, record, Instant::now())
+        }),
+        None => None,
+    };
+    let kept = publication.as_ref().is_some_and(|p| p.retained);
+    let released = publication.as_ref().and_then(|p| p.reason);
+    drop(publication);
+    if !kept {
+        shared.sessions.lock().note_other();
+    }
+    let state = if released.is_some() {
+        "released"
+    } else {
+        continued_state
     };
     let prefix = if ctx.head <= 1 {
         "-"
     } else if reused >= ctx.head {
         "reused"
-    } else if state == "new" {
+    } else if continued_state == "new" {
         "built"
     } else {
         "rebuilt"
@@ -2199,9 +2218,8 @@ fn finish_session(
     };
     // Why the continued session is gone, where its id's holder may be told;
     // a session's lifetime is the server's policy, never its own field.
-    let reason = ctx
-        .miss
-        .and_then(|l| l.reason)
+    let reason = released
+        .or(ctx.miss.and_then(|l| l.reason))
         .map(super::sessions::Reason::name);
     let json = json!({
         "id": kept.then(|| id.encode()),
@@ -2221,10 +2239,13 @@ fn finish_session(
         "reset": ctx.reset.map(Reset::name),
         "reason": reason,
     });
+    let miss_line = ctx.miss.map_or(String::new(), |l| {
+        format!(" session_miss={}", l.miss.name())
+    });
     let line = format!(
         "session={state} session_id={} session_kept={kept} session_history={history} \
          session_prefix={prefix} session_keep={} session_pin={} pinned={} \
-         reprefilled={reprefilled} recorded={} tokenized={}{}",
+         reprefilled={reprefilled} recorded={} tokenized={} session_reason={}{}",
         id.short(),
         ctx.keep.name(),
         decoded.pin.name(),
@@ -2234,11 +2255,8 @@ fn finish_session(
             .map_or_else(|| "-".to_string(), |p| p.to_string()),
         ctx.recorded,
         ctx.encoded,
-        ctx.miss.map_or(String::new(), |l| format!(
-            " session_miss={} session_reason={}",
-            l.miss.name(),
-            reason.unwrap_or("-")
-        )),
+        reason.unwrap_or("-"),
+        miss_line,
     );
     (json, line)
 }
@@ -2259,7 +2277,7 @@ fn features_body(shared: &Shared) -> Value {
                 "messages": "the whole conversation; the session's replies are bound by the conversation before them",
                 "input": "the new messages, appended to the referenced turn's conversation; 404 when no session holds the id",
             },
-            "store": { "default": false, "true": "held until the server reclaims it (idle, capacity, memory) or a client lets it go (reset, DELETE)", "false": "held while the engine holds its state" },
+            "store": { "default": false, "true": "retained if the complete lineage fits the byte budget; otherwise released (reason=budget); held until reclamation or client release", "false": "held while the engine holds its state, subject to the same byte budget" },
             "keep": {
                 "default": match (cfg.keep, engine.prefix_pin_refused()) {
                     (super::sessions::Keep::Prefix, None) => "prefix",
@@ -2273,6 +2291,8 @@ fn features_body(shared: &Shared) -> Value {
             "idle_s": cfg.idle.as_secs(),
             "capacity": cfg.capacity,
             "max_bytes": cfg.max_bytes,
+            "accounting": super::sessions::ACCOUNTING,
+            "states": ["none", "new", "resident", "evicted", "expired", "released"],
             "reclaim": "lru by last use",
             "reasons": super::sessions::Reason::ALL.map(super::sessions::Reason::name),
             "binding": "the SHA-256 of the Authorization header, when a request sends one",

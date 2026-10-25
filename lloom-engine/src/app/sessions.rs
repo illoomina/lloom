@@ -15,12 +15,14 @@
 //! misses says which (`Reason`).
 
 use super::front::{Bound, PrefixRecord, Reply, Scope};
-use serde_json::{json, Value};
+use serde_json::{json, value::RawValue, Value};
 use std::collections::VecDeque;
+use std::mem::size_of;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const PREFIX: &str = "chatcmpl-";
+pub const ACCOUNTING: &str = "retained allocation requests; stored + ephemeral + release history; shared replies charged per owner; excludes fixed table, allocator overhead and transient copies";
 
 /// What a session keeps of the engine's state when the engine's state must
 /// give way (`docs/sessions.md` §5.4).
@@ -57,7 +59,8 @@ pub struct Config {
     pub capacity: usize,
     /// Ephemeral sessions: at most one per engine sequence.
     pub ephemeral: usize,
-    /// Host bytes the stored sessions' ids and messages may hold.
+    /// Dynamic allocation requests retained by sessions and release records.
+    /// Fixed table slots and transient request/response copies are separate.
     pub max_bytes: usize,
     /// Whether the engine runs one sequence (`--batch 1`), so that which
     /// session it holds is the last one served.
@@ -131,16 +134,19 @@ pub enum Reason {
     Delete,
     /// Issued by an earlier server process.
     Restart,
+    /// The complete lineage cannot fit the retention budget.
+    Budget,
 }
 
 impl Reason {
-    pub const ALL: [Reason; 6] = [
+    pub const ALL: [Reason; 7] = [
         Reason::Idle,
         Reason::Capacity,
         Reason::Memory,
         Reason::Reset,
         Reason::Delete,
         Reason::Restart,
+        Reason::Budget,
     ];
 
     pub fn name(self) -> &'static str {
@@ -151,6 +157,7 @@ impl Reason {
             Self::Reset => "reset",
             Self::Delete => "delete",
             Self::Restart => "restart",
+            Self::Budget => "budget",
         }
     }
 }
@@ -163,6 +170,7 @@ struct Released {
     auth: Option<[u8; 32]>,
     nonces: Vec<u64>,
     dropped: VecDeque<Dropped>,
+    bytes: usize,
 }
 
 /// A turn `reset` dropped from a session that lives on.
@@ -186,6 +194,7 @@ struct Turn {
     /// The last of them is the end-of-turn id the template writes for the
     /// position the model's EOS took: the engine never ran it.
     eot: bool,
+    bytes: usize,
 }
 
 struct Session {
@@ -195,7 +204,7 @@ struct Session {
     keep: Option<Keep>,
     turns: Vec<Turn>,
     /// The latest turn's conversation, its reply message last.
-    messages: Vec<Value>,
+    messages: Vec<Box<RawValue>>,
     /// The latest turn's prompt ids, its reply's accepted ids and the
     /// end-of-turn id where the model stopped on EOS.
     ids: Vec<u32>,
@@ -203,6 +212,8 @@ struct Session {
     last_used: Instant,
     switches: u64,
     bytes: usize,
+    payload_bytes: usize,
+    turn_bytes: usize,
     dropped: VecDeque<Dropped>,
 }
 
@@ -227,7 +238,7 @@ pub struct Resolved {
     pub prefix: Option<(PrefixRecord, Vec<u32>)>,
     /// The conversation through the continued turn, its reply message last
     /// (asked for by the `input` form).
-    pub messages: Option<Vec<Value>>,
+    pub messages: Option<Vec<Box<RawValue>>>,
     /// The session's ids the engine held after the continued turn: its
     /// prompt and its reply, not the end-of-turn id after them.
     pub ids: Vec<u32>,
@@ -283,7 +294,7 @@ struct Counters {
     switches: u64,
     committed: u64,
     /// Sessions let go, and `reset`s, by reason (`Reason::ALL`'s order).
-    released: [u64; 6],
+    released: [u64; 7],
 }
 
 /// The server's sessions.
@@ -353,8 +364,84 @@ fn same(a: u64, b: u64) -> bool {
     (a ^ b) == 0
 }
 
-fn json_bytes(v: &[Value]) -> usize {
-    v.iter().map(|m| m.to_string().len()).sum()
+/// Incoming variable-sized work is prepared before taking the table lock.
+pub struct PreparedRecord {
+    ids: Vec<u32>,
+    messages: Vec<Box<RawValue>>,
+    turn: Turn,
+    payload_bytes: usize,
+}
+
+impl PreparedRecord {
+    pub fn new(rec: Record) -> serde_json::Result<Self> {
+        let mut ids = rec.prompt_ids;
+        ids.extend_from_slice(&rec.reply.ids);
+        ids.extend(rec.eot);
+        let msg_len = rec.messages.len();
+        let messages = rec
+            .messages
+            .into_iter()
+            .chain([rec.reply_msg])
+            .map(|v| serde_json::value::to_raw_value(&v))
+            .collect::<serde_json::Result<Vec<_>>>()?;
+        let payload_bytes = ids.capacity() * size_of::<u32>()
+            + messages.capacity() * size_of::<Box<RawValue>>()
+            + messages.iter().map(|v| v.get().len()).sum::<usize>();
+        let bytes =
+            reply_bytes(&rec.reply) + rec.prefix.as_ref().map_or(0, PrefixRecord::retained_bytes);
+        Ok(Self {
+            turn: Turn {
+                nonce: 0,
+                msg_len,
+                scope: rec.scope,
+                reply: rec.reply,
+                prefix: rec.prefix,
+                ids_end: ids.len(),
+                eot: rec.eot.is_some(),
+                bytes,
+            },
+            ids,
+            messages,
+            payload_bytes,
+        })
+    }
+}
+
+fn reply_bytes(r: &Reply) -> usize {
+    size_of::<Reply>()
+        + 2 * size_of::<usize>()
+        + r.ids.capacity() * size_of::<u32>()
+        + r.text.capacity()
+        + r.reasoning_text.capacity()
+        + r.content_text.capacity()
+        + r.logprobs
+            .as_ref()
+            .map_or(0, |v| v.capacity() * size_of::<f32>())
+        + r.rows.as_ref().map_or(0, |v| {
+            v.capacity() * size_of::<Vec<f32>>()
+                + v.iter()
+                    .map(|row| row.capacity() * size_of::<f32>())
+                    .sum::<usize>()
+        })
+}
+
+impl Session {
+    fn account(&mut self) {
+        self.bytes = self.payload_bytes
+            + self.turn_bytes
+            + self.turns.capacity() * size_of::<Turn>()
+            + self.dropped.capacity() * size_of::<Dropped>();
+    }
+}
+
+/// Dropping this result outside the table lock reclaims replaced histories.
+#[must_use]
+pub struct Publication {
+    pub retained: bool,
+    pub reason: Option<Reason>,
+    _retired: Vec<Session>,
+    _replaced: Option<(Vec<u32>, Vec<Box<RawValue>>)>,
+    _unpublished: Option<PreparedRecord>,
 }
 
 fn push_dropped(q: &mut VecDeque<Dropped>, d: Dropped) {
@@ -417,22 +504,26 @@ impl Table {
 
     /// Empty slot `i` and move its generation: every id naming it misses.
     /// With a `reason`, the session is let go, and its ids are answered for.
-    fn free(&mut self, i: usize, reason: Option<Reason>) {
+    fn free(&mut self, i: usize, reason: Option<Reason>) -> Option<Session> {
         let slot = &mut self.slots[i];
-        if let Some(s) = slot.session.take() {
-            if s.stored {
-                self.bytes -= s.bytes;
-            }
+        let old = Self::slot_bytes(slot);
+        let retired = slot.session.take();
+        if let Some(s) = retired.as_ref() {
             if let Some(reason) = reason {
                 if slot.released.len() == RELEASES_KEPT {
                     slot.released.pop_front();
                 }
+                let nonces: Vec<_> = s.turns.iter().map(|t| t.nonce).collect();
+                let dropped = s.dropped.clone();
+                let bytes = nonces.capacity() * size_of::<u64>()
+                    + dropped.capacity() * size_of::<Dropped>();
                 slot.released.push_back(Released {
                     gen: slot.gen,
                     reason,
                     auth: s.auth,
-                    nonces: s.turns.iter().map(|t| t.nonce).collect(),
-                    dropped: s.dropped,
+                    nonces,
+                    dropped,
+                    bytes,
                 });
                 self.counters.released[reason as usize] += 1;
             }
@@ -440,6 +531,30 @@ impl Table {
         slot.gen = slot.gen.wrapping_add(1);
         if self.occupant.is_some_and(|k| k.slot as usize == i) {
             self.occupant = None;
+        }
+        self.bytes = self.bytes - old + Self::slot_bytes(&self.slots[i]);
+        self.trim_releases();
+        retired
+    }
+
+    fn slot_bytes(slot: &Slot) -> usize {
+        slot.session.as_ref().map_or(0, |s| s.bytes)
+            + slot.released.capacity() * size_of::<Released>()
+            + slot.released.iter().map(|r| r.bytes).sum::<usize>()
+    }
+
+    /// Release reasons are best-effort, authenticated history, never a budget bypass.
+    fn trim_releases(&mut self) {
+        while self.bytes > self.cfg.max_bytes {
+            let Some(slot) = self.slots.iter_mut().find(|s| !s.released.is_empty()) else {
+                break;
+            };
+            let old = Self::slot_bytes(slot);
+            slot.released.pop_front();
+            if slot.released.is_empty() {
+                slot.released = VecDeque::new();
+            }
+            self.bytes = self.bytes - old + Self::slot_bytes(slot);
         }
     }
 
@@ -482,7 +597,7 @@ impl Table {
         if self.slots[pick].session.is_some() {
             self.counters.expired += 1;
         }
-        self.free(pick, reason);
+        drop(self.free(pick, reason));
         pick
     }
 
@@ -532,11 +647,11 @@ impl Table {
         };
         if idle {
             self.counters.expired += 1;
-            self.free(i, Some(Reason::Idle));
+            drop(self.free(i, Some(Reason::Idle)));
             return Err(Lost::of(Miss::Idle, Some(Reason::Idle)));
         }
         if gone {
-            self.free(i, Some(Reason::Capacity));
+            drop(self.free(i, Some(Reason::Capacity)));
             return Err(Lost::of(Miss::Gone, Some(Reason::Capacity)));
         }
         Ok((key, w.turn as usize))
@@ -618,6 +733,7 @@ impl Table {
         let Some(s) = self.get_mut(key) else {
             return;
         };
+        let old = s.bytes;
         for (turn, t) in s.turns.iter().enumerate() {
             let d = Dropped {
                 turn: turn as u32,
@@ -626,14 +742,15 @@ impl Table {
             };
             push_dropped(&mut s.dropped, d);
         }
-        s.turns.clear();
-        s.ids.clear();
-        s.messages.clear();
-        let (stored, old) = (s.stored, s.bytes);
-        s.bytes = 0;
-        if stored {
-            self.bytes -= old;
-        }
+        s.turns = Vec::new();
+        s.ids = Vec::new();
+        s.messages = Vec::new();
+        s.payload_bytes = 0;
+        s.turn_bytes = 0;
+        s.account();
+        let bytes = s.bytes;
+        self.bytes = self.bytes - old + bytes;
+        self.trim_releases();
         self.counters.released[Reason::Reset as usize] += 1;
     }
 
@@ -654,10 +771,10 @@ impl Table {
                     .session
                     .take()
                     .expect("present above");
-                // Moved, not let go: the old slot's ids miss without a reason.
-                self.free(k.slot as usize, None);
+                // Moving the lineage invalidates the old slot without a release reason.
+                self.bytes -= s.bytes;
+                drop(self.free(k.slot as usize, None));
                 s.stored = true;
-                s.bytes = s.ids.len() * 4 + json_bytes(&s.messages);
                 self.bytes += s.bytes;
                 self.slots[i].session = Some(s);
                 key = Some(Key {
@@ -687,6 +804,8 @@ impl Table {
                     last_used: now,
                     switches: 0,
                     bytes: 0,
+                    payload_bytes: 0,
+                    turn_bytes: 0,
                     dropped: VecDeque::new(),
                 });
                 self.counters.created += 1;
@@ -697,6 +816,7 @@ impl Table {
             }
         };
         let s = self.get_mut(key).expect("reserved above");
+        let old = s.bytes;
         if plan.keep.is_some() {
             s.keep = plan.keep;
         }
@@ -717,69 +837,92 @@ impl Table {
             .iter()
             .take_while(|t| t.msg_len < n && plan.scopes.get(t.msg_len) == Some(&t.scope))
             .count();
+        s.turn_bytes -= s.turns[kept..].iter().map(|t| t.bytes).sum::<usize>();
         s.turns.truncate(kept);
         for t in &mut s.turns {
             if t.ids_end > lcp {
                 t.ids_end = lcp;
                 t.eot = false;
             }
-            if t.prefix.as_ref().is_some_and(|p| p.ids_len > lcp) {
-                t.prefix = None;
+            if let Some(p) = t.prefix.take_if(|p| p.ids_len > lcp) {
+                let bytes = p.retained_bytes();
+                t.bytes -= bytes;
+                s.turn_bytes -= bytes;
             }
         }
         s.last_used = now;
+        s.account();
+        let stored = s.stored;
+        let bytes = s.bytes;
+        self.bytes = self.bytes - old + bytes;
+        self.trim_releases();
         Reservation {
             id: WireId {
                 key,
                 turn: kept as u32,
                 nonce: rand::random::<u64>() | 1,
             },
-            stored: s.stored,
+            stored,
         }
     }
 
     /// Keep a reserved turn. `false` where the session moved under it (a
     /// concurrent request on the same session, or its slot given away): the
     /// id then names nothing.
+    #[cfg(test)]
     pub fn commit(&mut self, r: Reservation, rec: Record, now: Instant) -> bool {
-        let max_bytes = self.cfg.max_bytes;
+        self.publish(r, PreparedRecord::new(rec).expect("Value serializes"), now)
+            .retained
+    }
+
+    pub fn publish(
+        &mut self,
+        r: Reservation,
+        mut rec: PreparedRecord,
+        now: Instant,
+    ) -> Publication {
+        let mut result = Publication {
+            retained: false,
+            reason: None,
+            _retired: Vec::new(),
+            _replaced: None,
+            _unpublished: None,
+        };
         let Some(s) = self.get_mut(r.id.key) else {
-            return false;
+            result._unpublished = Some(rec);
+            return result;
         };
         if s.turns.len() != r.id.turn as usize {
-            return false;
+            result._unpublished = Some(rec);
+            return result;
         }
-        let mut ids = rec.prompt_ids;
-        ids.extend_from_slice(&rec.reply.ids);
-        ids.extend(rec.eot);
-        let mut messages = rec.messages;
-        let msg_len = messages.len();
-        messages.push(rec.reply_msg);
-        s.turns.push(Turn {
-            nonce: r.id.nonce,
-            msg_len,
-            scope: rec.scope,
-            reply: rec.reply,
-            prefix: rec.prefix,
-            ids_end: ids.len(),
-            eot: rec.eot.is_some(),
-        });
-        let bytes = ids.len() * 4 + json_bytes(&messages);
-        s.ids = ids;
-        s.messages = messages;
+        let old = s.bytes;
+        rec.turn.nonce = r.id.nonce;
+        s.turn_bytes += rec.turn.bytes;
+        s.turns.push(rec.turn);
+        result._replaced = Some((
+            std::mem::replace(&mut s.ids, rec.ids),
+            std::mem::replace(&mut s.messages, rec.messages),
+        ));
+        s.payload_bytes = rec.payload_bytes;
         s.last_used = now;
-        let (stored, old) = (s.stored, s.bytes);
-        s.bytes = bytes;
-        if stored {
-            self.bytes = self.bytes - old + bytes;
-        }
+        s.account();
+        let bytes = s.bytes;
+        self.bytes = self.bytes - old + bytes;
         self.counters.committed += 1;
         if self.cfg.one_sequence {
             self.occupant = Some(r.id.key);
         }
-        // Over the byte budget, the least recently used other stored
-        // sessions go first.
-        while self.bytes > max_bytes {
+        if bytes > self.cfg.max_bytes {
+            self.counters.expired += 1;
+            result.reason = Some(Reason::Budget);
+            result
+                ._retired
+                .extend(self.free(r.id.key.slot as usize, Some(Reason::Budget)));
+            return result;
+        }
+        self.trim_releases();
+        while self.bytes > self.cfg.max_bytes {
             let victim = self
                 .stored_slots()
                 .filter(|&i| i != r.id.key.slot as usize)
@@ -789,12 +932,20 @@ impl Table {
             match victim {
                 Some(i) => {
                     self.counters.expired += 1;
-                    self.free(i, Some(Reason::Memory));
+                    result._retired.extend(self.free(i, Some(Reason::Memory)));
                 }
-                None => break,
+                None => {
+                    self.counters.expired += 1;
+                    result.reason = Some(Reason::Budget);
+                    result
+                        ._retired
+                        .extend(self.free(r.id.key.slot as usize, Some(Reason::Budget)));
+                    return result;
+                }
             }
         }
-        true
+        result.retained = true;
+        result
     }
 
     /// The engine's sequence served something no session holds (another
@@ -824,7 +975,7 @@ impl Table {
             "resident": resident,
             "ids": s.ids.len(),
             "messages": s.messages.len(),
-            "bytes": s.bytes.max(s.ids.len() * 4),
+            "bytes": s.bytes,
             "switches": s.switches,
             "keep": s.keep.unwrap_or(self.cfg.keep).name(),
             "age_s": now.saturating_duration_since(s.created).as_secs(),
@@ -836,7 +987,7 @@ impl Table {
     pub fn delete(&mut self, id: &str, auth: Option<[u8; 32]>, now: Instant) -> Result<(), Lost> {
         let (key, _) = self.find(id, auth, now)?;
         self.counters.expired += 1;
-        self.free(key.slot as usize, Some(Reason::Delete));
+        drop(self.free(key.slot as usize, Some(Reason::Delete)));
         Ok(())
     }
 
@@ -869,6 +1020,8 @@ impl Table {
             "keep": self.cfg.keep.name(),
             "bytes": self.bytes,
             "max_bytes": self.cfg.max_bytes,
+            "accounting": ACCOUNTING,
+            "base_bytes": size_of::<Self>() + self.slots.capacity() * size_of::<Slot>(),
             "created": self.counters.created,
             "continued": self.counters.continued,
             "resident": self.counters.resident,

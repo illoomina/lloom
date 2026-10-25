@@ -170,8 +170,13 @@ it until the server reclaims it — unused for `server.sessions.idle_s` (3600 s)
 or the least recently used past `session.capacity` (64) or `session.max_mib`
 (64) — or the client lets it go (`reset`, `DELETE /v1l/sessions/{id}`); without
 it the id lasts while the engine still holds that conversation. A session has
-no expiry of its own: the policy is the server's, reported on `/health`. To
-continue:
+no expiry of its own: the policy is the server's, reported on `/health`.
+The byte bound includes retained capacities, reply/prefix storage and authenticated
+release history, for stored and ephemeral sessions. When the complete lineage
+cannot fit, generation still succeeds but `timings.session` reports
+`state: released, reason: budget, id: null`; the completion's id is then not
+continuable. Fixed slots, allocator overhead and transient copies are separate,
+not a process-RSS promise. To continue:
 
 - `previous_response_id` with `input` (a string, or the new messages): appended
   to the stored conversation; the history is neither sent nor tokenized again.
@@ -183,10 +188,10 @@ continue:
 - `reset: cache|prefix|all` after a compaction; `keep: none` (`prefix` and `all`
   need the engine's checkpoint pin and are refused by name in this build).
 
-`timings.session` reports `{id, state: new|resident|evicted|expired, reason,
+`timings.session` reports `{id, state: new|resident|evicted|expired|released, reason,
 turn, switches, reprefilled_tokens, prefix, history, recorded_tokens,
 tokenized}`, where `reason` says why an `expired` session was let go — `idle`,
-`capacity`, `memory`, `reset`, `delete`, or `restart` for an id from an earlier
+`capacity`, `memory`, `budget`, `reset`, `delete`, or `restart` for an id from an earlier
 server process — and is `null` where the id's holder cannot be told (another
 `Authorization`, a release too old to remember); a 404 for a session the server
 let go names the reason too. `/health`'s `sessions` carries the policy

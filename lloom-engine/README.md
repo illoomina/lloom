@@ -141,6 +141,12 @@ reply fields mean server-accepted text, not remotely acknowledged bytes;
 `written_bytes` and `write_failed` are settled later by transport. No GPU
 retirement certificate or additional global device wait is implied.
 
+**Draft contract decision pending:** early accepted-message publication changes
+an old error path where an earlier failed write prevented a held partial-marker
+tail from entering the stored session message, despite its presence in the raw
+accepted reply. No all-path stored-message compatibility is claimed; see
+`design/measurements/issue-946.md` section 27.1 for the explicit alternatives.
+
 These are response-context/backlog limits, not a process-memory, request-body,
 connection-thread, or wall-clock drain guarantee. An indefinitely stalled legacy
 writer can retain one of the eight contexts. Explicit controlled transport

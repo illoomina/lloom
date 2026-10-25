@@ -20,6 +20,7 @@ enum Case {
     CompleteMarker,
     SplitMarker,
     LongReply,
+    LateFailure,
 }
 #[derive(Default)]
 struct Wire {
@@ -27,6 +28,8 @@ struct Wire {
     events: Vec<Value>,
     first_text: bool,
     failures: usize,
+    decoded: bool,
+    model_entries: usize,
 }
 #[derive(Clone, Default)]
 struct Progress(Arc<(ParkingMutex<Wire>, Condvar)>);
@@ -229,6 +232,11 @@ impl Served for Scripted {
         sink: &mut (dyn FnMut(&str) -> bool + Send),
         observe: &mut DecodeObserver<'_>,
     ) -> Result<Decoded> {
+        {
+            let (lock, changed) = &*self.progress.0;
+            lock.lock().model_entries += 1;
+            changed.notify_all();
+        }
         let end = self.text.tokenizer.token_to_id("</think>").unwrap();
         let mut stream = crate::stream::TextStream::default();
         let mut from = 0;
@@ -290,6 +298,14 @@ impl Served for Scripted {
             assert!(sink("/think>X"));
         }
         let (text, tokens) = stream.finish(&stops);
+        {
+            let (lock, changed) = &*self.progress.0;
+            lock.lock().decoded = true;
+            changed.notify_all();
+        }
+        if matches!(self.case, Case::LateFailure) {
+            anyhow::bail!("scripted late decode failure after accepted text");
+        }
         Ok(Decoded {
             text,
             tokens,
@@ -790,7 +806,10 @@ fn a_family_without_decode_observations_splits_by_marker_text() {
 }
 
 fn scripted_shared(case: Case) -> Arc<Shared> {
-    let progress = Progress::default();
+    scripted_shared_with_progress(case, Progress::default())
+}
+
+fn scripted_shared_with_progress(case: Case, progress: Progress) -> Arc<Shared> {
     let engine = Box::new(Scripted::new(case, progress));
     let front = Front::new(engine.as_ref(), Default::default());
     Arc::new(Shared {
@@ -820,7 +839,8 @@ fn assert_continuation_during_drain(
     release: impl FnOnce(),
     disconnect: bool,
 ) {
-    let shared = scripted_shared(case);
+    let model_progress = Progress::default();
+    let shared = scripted_shared_with_progress(case, model_progress.clone());
     let max_tokens = if matches!(case, Case::LongReply) {
         1 << 18
     } else {
@@ -854,7 +874,6 @@ fn assert_continuation_during_drain(
     });
     let id = id_rx.recv_timeout(Duration::from_secs(5)).unwrap();
     blocked_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-    let (started, start_rx) = std::sync::mpsc::channel();
     let next_shared = Arc::clone(&shared);
     let next = std::thread::spawn(move || {
         let _turn = next_shared.turns.take();
@@ -874,7 +893,6 @@ fn assert_continuation_during_drain(
             run.facts.spliced.bound > 0,
             "previous reply bound by its reference"
         );
-        started.send(()).unwrap();
         let split =
             reasoning::Reasoning::for_chat(next_shared.engine.as_ref(), &run.prompt_ids, false)
                 .unwrap()
@@ -900,7 +918,18 @@ fn assert_continuation_during_drain(
     } else {
         Duration::from_millis(250)
     };
-    let progressed = start_rx.recv_timeout(progress_budget).is_ok();
+    let progressed = {
+        let (lock, changed) = &*model_progress.0;
+        let deadline = Instant::now() + progress_budget;
+        let mut wire = lock.lock();
+        while wire.model_entries < 2 && Instant::now() < deadline {
+            changed.wait_for(
+                &mut wire,
+                deadline.saturating_duration_since(Instant::now()),
+            );
+        }
+        wire.model_entries >= 2
+    };
     release();
     let first_result = first.join();
     let next_result = next.join();
@@ -1136,4 +1165,148 @@ fn a_disconnect_during_socket_drain_keeps_the_published_reference_continuable() 
         },
         true,
     );
+}
+
+// This baseline-compatibility control intentionally exposes the decision still
+// required for early publication: old session fields depend on a future failed
+// write, although its front reply already holds the complete accepted tail.
+#[test]
+fn an_earlier_write_failure_preserves_the_baseline_sessions_held_tail_omission() {
+    struct FailAfterDecode(Writer);
+    impl Write for FailAfterDecode {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0.write(bytes)
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            if std::str::from_utf8(&self.0.pending)
+                .unwrap()
+                .contains("\"reasoning_content\":\"a\"")
+            {
+                let (lock, changed) = &*self.0.progress.0;
+                let mut wire = lock.lock();
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while !wire.decoded {
+                    assert!(
+                        Instant::now() < deadline,
+                        "accepted generation did not finish"
+                    );
+                    changed.wait_for(&mut wire, Duration::from_millis(2));
+                }
+            }
+            self.0.flush()
+        }
+    }
+    let progress = Progress::default();
+    let shared = scripted_shared_with_progress(Case::PartialTail, progress.clone());
+    let reply = chat_completions(
+        &shared,
+        &json!({"messages":[{"role":"user","content":"first"}],
+                "stream":true,"store":true,"max_tokens":3}),
+        None,
+    )
+    .ok()
+    .expect("stored request");
+    let Reply::Stream(run) = reply else {
+        panic!("stream requested")
+    };
+    let id = run.id.clone();
+    let error = stream_response_with_writer(&shared, *run, || {
+        Ok(ChunkedWriter {
+            w: Box::new(FailAfterDecode(Writer {
+                progress,
+                pending: Vec::new(),
+                fail_delta: Some(json!({"reasoning_content":"a"})),
+            })),
+        })
+    })
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("scripted tail write"), "{error}");
+    let front = shared
+        .front
+        .reply("a</thi")
+        .expect("full accepted raw frontier");
+    assert_eq!(front.text, "a</thi");
+    assert_eq!(front.ids, vec![97]);
+    assert_eq!(front.partial, 5);
+    let resolved = shared
+        .sessions
+        .lock()
+        .resolve(&id, None, true, Instant::now())
+        .unwrap();
+    let message = resolved.messages.unwrap().pop().unwrap();
+    eprintln!(
+        "EARLY_WRITE_FAILURE accepted={} session={message}",
+        front.text
+    );
+    // Do not change this to the candidate's full accepted tail without an
+    // explicit contract decision: it would redefine old-ID continuation.
+    assert_eq!(message["reasoning_content"], "a");
+}
+
+// This is the served Err/publication boundary, not a native GPU fault or a
+// retirement/recovery certificate. The native gate remains separately owed.
+#[test]
+fn a_late_decode_error_publishes_no_session_and_no_success_trailer() {
+    let progress = Progress::default();
+    let shared = scripted_shared_with_progress(Case::LateFailure, progress.clone());
+    let turn = shared.turns.take();
+    let reply = chat_completions(
+        &shared,
+        &json!({"messages":[{"role":"user","content":"first"}],
+                "stream":true,"store":true,"max_tokens":3}),
+        None,
+    )
+    .ok()
+    .expect("stored request");
+    let Reply::Stream(run) = reply else {
+        panic!("stream requested")
+    };
+    let id = run.id.clone();
+    let mut settled = false;
+    let error = stream_response_settlement(
+        &shared,
+        *run,
+        || {
+            Ok(ChunkedWriter {
+                w: Box::new(Writer {
+                    progress: progress.clone(),
+                    pending: Vec::new(),
+                    fail_delta: None,
+                }),
+            })
+        },
+        || {
+            drop(turn);
+            settled = true;
+        },
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("scripted late decode failure"), "{error}");
+    assert!(settled);
+    assert!(
+        shared.turns.try_take().is_some(),
+        "failed run released model FIFO"
+    );
+    assert!(
+        shared.front.reply("a</think>X").is_none(),
+        "failed decode is not a published reply"
+    );
+    assert!(
+        shared
+            .sessions
+            .lock()
+            .resolve(&id, None, true, Instant::now())
+            .is_err(),
+        "failed run's reserved ID is not continuable"
+    );
+    let (lock, _) = &*progress.0;
+    let wire = lock.lock();
+    let bytes = std::str::from_utf8(&wire.committed).unwrap();
+    assert!(bytes.contains("scripted late decode failure"));
+    assert!(!bytes.contains("[DONE]"));
+    assert!(wire.events.iter().all(|e| e.get("timings").is_none()));
+    assert_eq!(wire.model_entries, 1);
+    assert!(wire.decoded, "fault really follows accepted generation");
 }

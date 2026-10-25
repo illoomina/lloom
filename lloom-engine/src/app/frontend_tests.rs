@@ -39,6 +39,8 @@ const TUNED_FLOW: &str = "the tuned decode flow as chat's and serve's default (a
 const DSPARK_SINGLE: &str = "the tuned flow's paged KV for the speculative body at one sequence (a08b86f5d, #859), which decision 52 (#1068) moves back to its preset's in-place KV";
 const KEEP_WARM: &str = "the maintainer's choice on PR1087 (#1076, 2026-10-23): serve keeps the GPU's memory wired while idle, bounded by server.keep_warm_for_s, as llama.cpp's heartbeat is";
 const DECODE_ROWS: &str = "the library's value of the batched decode rows' arm, a key the option tree did not have, which decision 54 (#1084) turns on where a batched loop runs on Metal";
+const RESIDENCY_ATTACH: &str = "the library's value of the device set's attachment, a key the option tree did not have, which decision 56 (#1092) detaches from the Metal 3 queue on chat and serve";
+const KEEP_WARM_PRESSURE: &str = "the library's value of the keep-warm's pressure stop, a key the option tree did not have, which decision 57 (#1092) turns on where serve's keep-warm runs by default";
 const CHAT_SERVE: &[Frontend] = &[Frontend::Chat, Frontend::Serve];
 
 /// Every row of the front-end table by value: key, front-ends, condition,
@@ -160,6 +162,13 @@ const PINNED_ROWS: &[(&str, &[Frontend], When, &str, &str)] = &[
         PRE_TREE,
     ),
     (
+        "kernels.residency.attach",
+        CHAT_SERVE,
+        When::Metal,
+        "queue",
+        RESIDENCY_ATTACH,
+    ),
+    (
         "kernels.attention.flash.partial_block",
         CHAT_SERVE,
         When::ModelAxes,
@@ -235,6 +244,13 @@ const PINNED_ROWS: &[(&str, &[Frontend], When, &str, &str)] = &[
         When::MetalSingle,
         "1000",
         KEEP_WARM,
+    ),
+    (
+        "server.keep_warm_pressure",
+        &[Frontend::Serve],
+        When::MetalSingle,
+        "false",
+        KEEP_WARM_PRESSURE,
     ),
     (
         "kernels.gemm.f16_rows_decode",
@@ -1069,8 +1085,8 @@ fn the_unset_defaults_are_the_trees_before_it_except_the_named_exceptions() {
     let decided: Vec<u32> = EXCEPTIONS.iter().map(|e| e.decision).collect();
     assert_eq!(
         decided,
-        [36, 43, 43, 43, 43, 35, 35, 52, 52, 54, 54],
-        "the approved default changes: decision 36 (serve reuse), 43 (the gate and its cores arm, chat and serve), 35 (the lead, chat and serve), 52 (B = 1 DSpark's in-place KV, chat and serve), 54 (the batched decode rows on the row axis, serve and bench)"
+        [36, 43, 43, 43, 43, 35, 35, 52, 52, 54, 54, 56, 56, 57],
+        "the approved default changes: decision 36 (serve reuse), 43 (the gate and its cores arm, chat and serve), 35 (the lead, chat and serve), 52 (B = 1 DSpark's in-place KV, chat and serve), 54 (the batched decode rows on the row axis, serve and bench), 56 (the device set off the Metal 3 queue, chat and serve), 57 (the keep-warm's pressure stop, serve)"
     );
     // 4. Decision 44: the EOS watch stays opt-in on every front-end.
     // Decisions 43/35 (2026-10-19): the gate, its cores arm and the lead of 4
@@ -1401,5 +1417,152 @@ fn the_batched_decode_rows_arm_is_on_at_a_batch_on_metal() {
         "serve: true when on Metal at scheduler.max_sequences from 2 to \
          kernels.gemm.f16_rows_max (decision 54: was false), bench: true when on Metal at \
          scheduler.max_sequences from 2 to kernels.gemm.f16_rows_max (decision 54: was false)"
+    );
+}
+
+/// Decision 56: chat and serve resolve the device set's attachment to
+/// `heartbeat` on Metal, under either command-buffer API (Metal 4 ignores the
+/// arm at its queue, and says so on the loaded line). Bench, the CPU and every
+/// layer that names the key keep the library's `queue`, or the value named.
+#[test]
+fn chat_and_serve_detach_the_device_set_on_metal_by_default() {
+    let none = BTreeMap::new();
+    let key = "kernels.residency.attach";
+    let get = |f: Frontend, argv: &[&str], env: &BTreeMap<String, String>| {
+        at(&resolve(Some(f), f.name(), argv, env).unwrap(), key)
+    };
+    let metal = When::Metal.holds(&resolve(Some(Frontend::Serve), "serve", &[], &none).unwrap());
+    let (heartbeat, queue) = (typed(key, "heartbeat"), typed(key, "queue"));
+    assert_eq!(
+        at(&EngineOptions::default(), key),
+        queue,
+        "the library's value"
+    );
+    let default = if metal { &heartbeat } else { &queue };
+    for &f in CHAT_SERVE {
+        let name = f.name();
+        assert_eq!(&get(f, &[], &none), default, "{name}");
+        for api in ["metal3", "metal4", "auto"] {
+            assert_eq!(
+                &get(f, &["--metal-api", api], &none),
+                default,
+                "{name} --metal-api {api}"
+            );
+        }
+        assert_eq!(get(f, &["--cpu"], &none), queue, "{name} on the CPU");
+        for argv in [
+            &["--residency-attach", "queue"][..],
+            &["--set", "kernels.residency.attach=queue"],
+            &["--metal-api", "metal3", "--residency-attach", "queue"],
+        ] {
+            assert_eq!(get(f, argv, &none), queue, "{name}: the opt-out {argv:?}");
+        }
+        let env = BTreeMap::from([("LLOOM_RESIDENCY_ATTACH".to_string(), "queue".to_string())]);
+        assert_eq!(get(f, &[], &env), queue, "{name}: the opt-out by env");
+    }
+    for argv in [&[][..], &["--metal-api", "metal3"]] {
+        assert_eq!(get(Frontend::Bench, argv, &none), queue, "bench {argv:?}");
+    }
+    assert_eq!(
+        frontend::describe(key).unwrap(),
+        "chat: heartbeat when on Metal (a Metal build, not --cpu) (decision 56: was queue), \
+         serve: heartbeat when on Metal (a Metal build, not --cpu) (decision 56: was queue)"
+    );
+}
+
+/// Decision 57: serve's keep-warm stands down under memory pressure where it
+/// runs by default — on Metal at one sequence — a period given by name
+/// included. At a batch, on the CPU and on the other front-ends the key stays
+/// unset (the keep-warm ignores pressure); `false` by any spelling, the
+/// subcommand's flag included, is the opt-out and holds; `none` is serve's own.
+#[test]
+fn serves_keep_warm_stands_down_under_memory_pressure_by_default() {
+    let none = BTreeMap::new();
+    let serve = |argv: &[&str], env: &BTreeMap<String, String>| {
+        resolve(Some(Frontend::Serve), "serve", argv, env)
+            .unwrap()
+            .server
+            .keep_warm_pressure
+    };
+    let on = When::MetalSingle.holds(&resolve(Some(Frontend::Serve), "serve", &[], &none).unwrap());
+    let default = on.then_some(true);
+    assert_eq!(
+        EngineOptions::default().server.keep_warm_pressure,
+        None,
+        "the library's value"
+    );
+    assert_eq!(serve(&[], &none), default, "serve's default");
+    assert_eq!(
+        serve(&["--keep-warm", "500"], &none),
+        default,
+        "a period named by the layer keeps the front-end's stop"
+    );
+    assert_eq!(
+        serve(&["--set", "server.keep_warm_pressure=none"], &none),
+        default,
+        "`none` is serve's own"
+    );
+    assert_eq!(serve(&["--batch", "4"], &none), None, "at a batch");
+    assert_eq!(serve(&["--cpu"], &none), None, "on the CPU");
+    for argv in [
+        &["--keep-warm-pressure=false"][..],
+        &["--keep-warm-pressure", "false"],
+        &["--set", "server.keep_warm_pressure=false"],
+        &["--server-config", r#"{"keep_warm_pressure": false}"#],
+    ] {
+        assert_eq!(serve(argv, &none), Some(false), "the opt-out {argv:?}");
+    }
+    let env = BTreeMap::from([(
+        index().keys["server.keep_warm_pressure"].env(),
+        "false".to_string(),
+    )]);
+    assert_eq!(serve(&[], &env), Some(false), "the opt-out by env");
+    for f in [Frontend::Chat, Frontend::Bench] {
+        let o = resolve(Some(f), f.name(), &[], &none).unwrap();
+        assert_eq!(o.server.keep_warm_pressure, None, "{}", f.name());
+    }
+    assert_eq!(
+        frontend::describe("server.keep_warm_pressure").unwrap(),
+        "serve: true when on Metal at scheduler.max_sequences = 1 (decision 57: was false)"
+    );
+}
+
+/// `lloom serve`'s options at `argv`, installed, and the Metal device made
+/// from them: the device set and the loaded line's residency field.
+#[cfg(feature = "metal")]
+fn serves_device_set(argv: &[&str]) -> (u64, String) {
+    let o = resolve(Some(Frontend::Serve), "serve", argv, &BTreeMap::new()).unwrap();
+    assert_eq!(o.tuning.metal.residency_attach, "heartbeat", "{argv:?}");
+    lloom_tensor::tuning::install(o.tuning.tensor()).unwrap();
+    let device = lloom_tensor::Device::new_metal(0).unwrap();
+    let metal = device.as_metal_device().unwrap();
+    let line = metal.residency_line();
+    eprintln!("[serve {argv:?}: {line}]");
+    (metal.residency_set_handle().queue_attachments(), line)
+}
+
+/// Decision 56 reaches the queue: serve's defaults on Metal 3 leave the device
+/// set off the queue (no `addResidencySet` names it) and the loaded line says
+/// `detached`.
+#[cfg(feature = "metal")]
+#[test]
+fn serves_defaults_on_metal3_put_no_set_on_the_queue() {
+    let (attachments, line) = serves_device_set(&["--metal-api", "metal3"]);
+    assert_eq!(attachments, 0, "{line}");
+    assert!(line.starts_with("residency=detached "), "{line}");
+}
+
+/// On Metal 4 the same default is ignored: the set stays on the Metal 3 queue
+/// the device holds, which runs no work, and the loaded line gives the reason.
+#[cfg(feature = "metal")]
+#[test]
+fn serves_defaults_on_metal4_keep_the_set_on_the_queue_and_say_why() {
+    let (attachments, line) = serves_device_set(&["--metal-api", "metal4"]);
+    assert_eq!(attachments, 1, "{line}");
+    assert!(
+        line.starts_with(
+            "residency=queue(heartbeat ignored: metal4 binds through its per-slot sets) "
+        ),
+        "{line}"
     );
 }

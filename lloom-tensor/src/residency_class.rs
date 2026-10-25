@@ -47,6 +47,7 @@ impl ResidencyClass {
     pub fn parse(name: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|c| c.name() == name.trim())
     }
+    #[cfg_attr(not(feature = "metal"), allow(dead_code))]
     pub(crate) fn bit(self) -> u8 {
         1 << (self as u8)
     }

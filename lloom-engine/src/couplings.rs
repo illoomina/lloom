@@ -205,6 +205,15 @@ pub const COUPLINGS: &[Coupling] = &[
         site: "lloom-tensor/src/kernels/kernels/mlx_gemm.rs f16_rows_route, f16_rows_lead; lloom/src/nn/batched.rs BatchDecoder::forward_live (tuning::DecodeRows), BatchDecoder::forward_ragged_live (tuning::RaggedDecodeRows)",
         is_static: false,
     },
+    Coupling {
+        id: "C21",
+        kind: "resolves",
+        when: "kernels.residency.set_cap_pct in 1..=99, or kernels.residency.attach = heartbeat",
+        effect: "the device's residency sets: one per class up to the cap, at most 24, the keep-warm requesting kernels.residency.hot; and whether they are on the Metal 3 queue (Metal 4 keeps the attachment)",
+        keys: &["kernels.residency.set_cap_pct", "kernels.residency.attach", "kernels.residency.hot"],
+        site: "lloom-tensor/src/kernels/metal/residency_set.rs ResidencyPolicy::selected, ResidencyAttachment::decide",
+        is_static: false,
+    },
 ];
 
 /// The couplings naming `key`.
@@ -405,6 +414,9 @@ pub fn explain(o: &EngineOptions) -> Vec<String> {
                 .into(),
         );
     }
+    if let Some(line) = residency_layout(&o.tuning.metal) {
+        out.push(line);
+    }
     let g = &o.tuning.gemm;
     if g.f16_rows_decode {
         let cause = if o.tuning.contract.profile == "deterministic" {
@@ -436,6 +448,36 @@ pub fn explain(o: &EngineOptions) -> Vec<String> {
         });
     }
     out
+}
+
+/// The residency router's layout as the options resolve it (`tuning.md`
+/// §6.3n); `None` on the defaults (one set, attached to the queue).
+fn residency_layout(m: &lloom_tensor::tuning::MetalTuning) -> Option<String> {
+    let pct = m.residency_set_cap_pct;
+    let split = pct > 0 && pct < 100;
+    if !split && m.residency_attach == "queue" {
+        return None;
+    }
+    let sets = if split {
+        format!(
+            "sets per class (weights, kv, heap, scratch, experts, other), each at most {pct} % of \
+             the device's recommended working set, at most {} sets; the keep-warm requests {}",
+            lloom_tensor::residency_class::MAX_DEVICE_SETS,
+            m.residency_hot
+        )
+    } else {
+        "1 set".into()
+    };
+    let attach = if m.residency_attach == "heartbeat" {
+        "detached from the Metal 3 queue (Metal 4: attached as before)"
+    } else {
+        "on the Metal 3 queue"
+    };
+    Some(format!(
+        "kernels.residency -> {sets}, {attach} <- kernels.residency.set_cap_pct = {pct}, \
+         kernels.residency.attach = {} (C21)",
+        m.residency_attach
+    ))
 }
 
 /// The schema's top-level `x-lloom-couplings`.

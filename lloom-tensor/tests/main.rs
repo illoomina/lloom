@@ -48,6 +48,7 @@ mod iq_metal;
 mod kv_pages_cpu;
 mod layout_tests;
 mod matmul_tests;
+mod metal4_slot_trace;
 mod metal_arena_lifetime_fuzz;
 mod metal_arena_teardown_tests;
 mod metal_arg_sort_tests;
@@ -93,6 +94,8 @@ mod quant_parity;
 mod quant_parity_matrix;
 mod quant_parity_matrix_rows;
 mod quantized_tests;
+#[cfg(feature = "metal")]
+mod residency_router_device;
 #[cfg(feature = "metal")]
 mod rows_identity;
 mod sampling_contract;

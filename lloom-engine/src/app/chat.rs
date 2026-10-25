@@ -287,6 +287,9 @@ pub fn run(args: ChatArgs) -> Result<()> {
         engine.describe_checked()?,
         lloom::load_warning::LoadWarning::line(&engine.load_warnings_checked()?),
     );
+    if let Some(residency) = engine.device().residency_line() {
+        eprintln!("[{residency}]");
+    }
     eprintln!("[capabilities: {}]", engine.capabilities().line());
     // `/decide` answers `/v1/systemone` requests on the same loaded model,
     // with the binding `serve` would resolve.

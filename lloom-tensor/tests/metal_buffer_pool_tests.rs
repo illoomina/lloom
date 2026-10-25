@@ -689,9 +689,11 @@ fn dropping_the_last_device_handle_empties_the_residency_set() -> Result<()> {
     );
     assert_eq!(
         set.counters().ends,
-        1,
-        "the last device handle ends the set's residency once, at unload"
+        set.layout().len() as u64,
+        "the last device handle ends each native set's residency once, at unload: {:?}",
+        set.layout()
     );
+    assert!(set.counters().ends >= 1);
     Ok(())
 }
 

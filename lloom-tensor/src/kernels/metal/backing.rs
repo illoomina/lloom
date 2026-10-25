@@ -40,6 +40,7 @@ pub use crate::allocation_admission::PredictionBasis;
 use crate::allocation_admission::{self, Prediction};
 pub use crate::heap_ranges::ReuseCredit;
 use crate::memory_admission::{AllocationContext, AllocationError, DomainKey, ModelDomain};
+use crate::residency_class::{scoped_residency_class, ResidencyClass};
 use objc2_metal::{MTLDevice as _, MTLResource as _, MTLResourceOptions};
 use std::sync::Arc;
 
@@ -217,6 +218,9 @@ pub struct DeviceBuffer {
     // Cold immutable default native payer; None only for explicit standalone legacy.
     default_domain: Option<ModelDomain>,
     requires_context: bool,
+    /// The residency class of what this backing makes, unless the
+    /// allocating thread names one (`residency_class_scope`).
+    class: ResidencyClass,
 }
 
 type RawBuffer = objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>>;
@@ -270,7 +274,14 @@ impl DeviceBuffer {
             membership,
             default_domain: None,
             requires_context: false,
+            class: ResidencyClass::Other,
         }
+    }
+    /// What this backing's allocations are for, where the allocating thread
+    /// names nothing.
+    pub(crate) fn with_class(mut self, class: ResidencyClass) -> Self {
+        self.class = class;
+        self
     }
     pub(crate) fn with_membership(
         mut self,
@@ -485,9 +496,10 @@ impl DeviceBuffer {
             .for_buffer(&buffer)
             .map_err(AllocationError::from)?;
         let buffer = buffer.with_membership(token);
+        let class = scoped_residency_class().unwrap_or(self.class);
         match self.commit {
-            Commit::Deferred => self.residency.add(&buffer),
-            Commit::Now => self.residency.insert(&buffer),
+            Commit::Deferred => self.residency.add_in(&buffer, class),
+            Commit::Now => self.residency.insert_in(&buffer, class),
         };
         // Parallel legacy diagnostics; physical owner remains on every Buffer alias.
         let reservation = self.ledger.as_ref().map(|l| l.reserve(requested));
@@ -762,6 +774,31 @@ pub struct Backings {
     pub resident_private: DeviceBuffer,
     /// Persistent Shared, wired (a slot pool, a KV plane).
     pub mapped_shared: Mapped,
+    /// A pool miss whose thread names a long-lived class (weights, KV,
+    /// experts) while the residency sets are split and the transient pair
+    /// is heap chunks: one buffer per miss, so it lands in a set of its
+    /// class rather than in a chunk the activations share.
+    pub classed_shared: DeviceBuffer,
+    pub classed_private: DeviceBuffer,
+}
+
+impl Backings {
+    /// The backing a pool miss takes: the transient one, or a classed one
+    /// when the miss is named a long-lived class (`classed_*`) under a
+    /// split layout with heap chunks.
+    pub fn for_miss(&self, private: bool, split: bool) -> &dyn Backing {
+        let classed = split && super::heap::transient_heaps_on();
+        let long_lived = matches!(
+            scoped_residency_class(),
+            Some(ResidencyClass::Weights | ResidencyClass::Kv | ResidencyClass::Experts)
+        );
+        match (classed && long_lived, private) {
+            (true, true) => &self.classed_private as &dyn Backing,
+            (true, false) => &self.classed_shared as &dyn Backing,
+            (false, true) => self.transient_private.as_ref(),
+            (false, false) => self.transient_shared.as_ref(),
+        }
+    }
 }
 
 impl std::fmt::Debug for Backings {

@@ -50,11 +50,16 @@ impl QMetalStorage {
         shared: bool,
     ) -> Result<Self> {
         let size = elem_count * dtype.type_size() / dtype.block_size();
-        let buffer = if shared {
-            device.new_persistent_shared(size)?
-        } else {
-            device.new_persistent_private(size)?
-        };
+        let buffer = crate::residency_class::residency_class_scope(
+            crate::residency_class::ResidencyClass::Experts,
+            || {
+                if shared {
+                    device.new_persistent_shared(size)
+                } else {
+                    device.new_persistent_private(size)
+                }
+            },
+        )?;
         {
             let mut blit = device.blit_command_encoder()?;
             blit.set_label("qstorage_persistent_zero");
@@ -1330,11 +1335,16 @@ pub fn load_quantized<T: super::GgmlType + Send + Sync + 'static>(
     device: &MetalDevice,
     data: &[T],
 ) -> Result<QStorage> {
-    let buffer = device
-        .new_buffer_builder()
-        .with_data(data)
-        .with_label("qstorage_load_quantized")
-        .build()?;
+    let buffer = crate::residency_class::residency_class_scope(
+        crate::residency_class::ResidencyClass::Weights,
+        || {
+            device
+                .new_buffer_builder()
+                .with_data(data)
+                .with_label("qstorage_load_quantized")
+                .build()
+        },
+    )?;
     // A weight upload is a Shared buffer (`new_buffer_with_data`): its pages
     // are the process's, compressible under pressure like the slot pools
     // (#749 P27); wired on request (`LLOOM_WIRE_WEIGHTS`).

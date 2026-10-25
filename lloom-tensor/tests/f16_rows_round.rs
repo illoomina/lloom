@@ -276,10 +276,10 @@ fn the_rounding_reaches_a_row_axis_launch_only() -> Result<()> {
     for (what, rows_max, run) in &cases {
         set_f16_rows(*rows_max);
         set_f16_rows_round(false);
-        let (off, off_labels) = kernels(&dev, || run())?;
+        let (off, off_labels) = kernels(&dev, run)?;
         set_f16_rows_round(true);
         let before = f16_rows_rounded_launches();
-        let (on, on_labels) = kernels(&dev, || run())?;
+        let (on, on_labels) = kernels(&dev, run)?;
         assert_eq!(
             f16_rows_rounded_launches(),
             before,

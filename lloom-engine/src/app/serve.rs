@@ -2870,7 +2870,17 @@ fn stream_response_settlement(
         Err(error) => {
             shared.sessions.lock().note_other();
             settled();
-            let (w, _) = sw.finish()?;
+            let (w, write_error) = sw.finish()?;
+            if write_error.is_some() {
+                shared
+                    .drains
+                    .pre_trailer_write_errors
+                    .fetch_add(1, Ordering::Relaxed);
+                eprintln!(
+                    "[{endpoint}: delivery_error=true decode_error=true written_bytes={}]",
+                    written.load(Ordering::Relaxed)
+                );
+            }
             return finish_stream_error(w, error);
         }
     };

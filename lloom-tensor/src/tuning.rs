@@ -586,6 +586,50 @@ pub fn in_decode_rows() -> bool {
     DECODE_ROWS.with(|c| c.get() > 0)
 }
 
+thread_local! {
+    /// The open [`RaggedDecodeRows`] scope on this thread, `(live, rows,
+    /// heads)`; `live == 0` when none is.
+    static RAGGED_DECODE_ROWS: std::cell::Cell<(usize, usize, usize)> =
+        const { std::cell::Cell::new((0, 0, 0)) };
+}
+
+/// A ragged batched step's forward, open on this thread: `live` decode rows
+/// of one token each lead its `rows` input rows, the prompt pieces after
+/// them, and its head projects `heads` rows (one a sequence), the live rows
+/// first. Under `kernels.gemm.f16_rows_decode` the live rows of its half
+/// matmuls take the route a decode step's rows take, so a sequence's bits do
+/// not depend on whether a prompt piece rode its step; the pieces keep the
+/// GEMM. Thread-local; the enclosing scope is restored when the guard drops.
+#[must_use = "the scope holds only while the guard is alive"]
+pub struct RaggedDecodeRows {
+    outer: (usize, usize, usize),
+    _thread: std::marker::PhantomData<*const ()>,
+}
+
+impl RaggedDecodeRows {
+    pub fn open(live: usize, rows: usize, heads: usize) -> Self {
+        let outer = RAGGED_DECODE_ROWS.with(|c| c.replace((live, rows, heads)));
+        RaggedDecodeRows {
+            outer,
+            _thread: std::marker::PhantomData,
+        }
+    }
+}
+
+impl Drop for RaggedDecodeRows {
+    fn drop(&mut self) {
+        RAGGED_DECODE_ROWS.with(|c| c.set(self.outer));
+    }
+}
+
+/// The decode rows leading a matmul of `m` rows in the open
+/// [`RaggedDecodeRows`] scope: `Some(live)` when `m` is the step's input
+/// rows or its head's and the live rows are some but not all of them.
+pub fn ragged_decode_lead(m: usize) -> Option<usize> {
+    let (live, rows, heads) = RAGGED_DECODE_ROWS.with(|c| c.get());
+    (live > 0 && live < m && (m == rows || m == heads)).then_some(live)
+}
+
 /// `kernels.gemm.f16_rows_decode`: 0 unread, 1 off, 2 on.
 static F16_ROWS_DECODE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
@@ -614,7 +658,8 @@ pub fn set_f16_rows_decode(on: bool) {
     F16_ROWS_DECODE.store(if on { 2 } else { 1 }, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// Count one launch a batched decode step took on the row axis.
+/// Count one launch a batched decode step's rows took on the row axis (a
+/// ragged step's live rows included).
 pub fn note_f16_rows_decode() {
     F16_ROWS_DECODE_LAUNCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
@@ -1185,7 +1230,7 @@ pub struct GemmTuning {
         status = "arm"
     )]
     pub f16_rows_max: usize,
-    /// Under `fast`, with `kernels.gemm.f16_rows` on, a batched decode step's f16 matmuls of 2 to `f16_rows_max` rows (one row per live sequence) take the GEMV's row axis: each weight block read once for every row, each row the one-row GEMV's bits; off = the GEMM from two rows. Only a step of decode rows: a step that carries prompt pieces, a single sequence's step and `deterministic` keep their routes.
+    /// Under `fast`, with `kernels.gemm.f16_rows` on, a batched decode step's f16 matmuls of 2 to `f16_rows_max` rows (one row per live sequence) take the GEMV's row axis: each weight block read once for every row, each row the one-row GEMV's bits; off = the GEMM from two rows. A step that carries prompt pieces puts its 1 to `f16_rows_max` live rows on the same route and its pieces on the GEMM, so a row's bits do not depend on whether a piece rode its step; a single sequence's step and `deterministic` keep their routes. Off in the library; `serve` and `bench` turn it on at a batch on Metal (decision 54), `--gemm-f16-rows-decode=false` to measure without it.
     #[opt(
         flag = "gemm-f16-rows-decode",
         env = "LLOOM_GEMM_F16_ROWS_DECODE",

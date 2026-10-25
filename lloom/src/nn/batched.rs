@@ -1323,7 +1323,19 @@ impl<'m, M: BatchedCausalLM, R: BorrowMut<Session<'m, M>>> BatchDecoder<'m, M, R
         self.pacer.before_forward(input.device())?;
         clock.lap(&mut ph.pace_ns);
         begin_pass(input.device(), shape)?;
-        let logits = model.forward_ragged(input, &mut rows)?;
+        let logits = {
+            // The live rows lead the input and the head: under
+            // `kernels.gemm.f16_rows_decode` they take a decode step's route
+            // (`tuning::RaggedDecodeRows`).
+            let _rows = (!live.is_empty()).then(|| {
+                lloom_tensor::tuning::RaggedDecodeRows::open(
+                    live.len(),
+                    live.len() + pieces.iter().map(|p| p.2).sum::<usize>(),
+                    live.len() + pieces.len(),
+                )
+            });
+            model.forward_ragged(input, &mut rows)
+        }?;
         end_pass(input.device())?;
         clock.lap(&mut ph.encode_ns);
         self.pacer.after_forward(input.device())?;

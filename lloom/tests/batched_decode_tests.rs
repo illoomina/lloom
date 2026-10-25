@@ -1085,6 +1085,16 @@ struct ScopeChain {
     rows: ScopeCount,
     ragged: ScopeCount,
     single: ScopeCount,
+    /// `forward_ragged` calls led by their live rows
+    /// (`tuning::RaggedDecodeRows`) and calls with none; `misled` counts a
+    /// lead that is not the call's one-token rows, first, over its input and
+    /// its head.
+    led: ScopeCount,
+    misled: std::sync::atomic::AtomicU32,
+    /// Led calls whose head's rows differ from their input's (a piece of
+    /// more than one token rode the live rows): the case that tells the two
+    /// counts apart.
+    wide: std::sync::atomic::AtomicU32,
 }
 
 /// Calls made with the scope open and without it.
@@ -1105,7 +1115,33 @@ impl ScopeChain {
             rows: Default::default(),
             ragged: Default::default(),
             single: Default::default(),
+            led: Default::default(),
+            misled: Default::default(),
+            wide: Default::default(),
         })
+    }
+
+    fn note_lead(&self, tokens: &Tensor, rows: &[RaggedRow<'_, usize>]) {
+        use lloom_tensor::tuning::ragged_decode_lead;
+        use std::sync::atomic::Ordering::Relaxed;
+        let total = tokens.dim(1).unwrap_or(0);
+        match ragged_decode_lead(total) {
+            Some(live) => {
+                self.led.0.fetch_add(1, Relaxed);
+                let leads = live < rows.len()
+                    && rows[..live].iter().all(|r| r.len == 1)
+                    && ragged_decode_lead(rows.len()) == Some(live);
+                if !leads {
+                    self.misled.fetch_add(1, Relaxed);
+                }
+                if rows.len() != total {
+                    self.wide.fetch_add(1, Relaxed);
+                }
+            }
+            None => {
+                self.led.1.fetch_add(1, Relaxed);
+            }
+        }
     }
 
     fn note(c: &ScopeCount) {
@@ -1149,6 +1185,7 @@ impl CausalLM for ScopeChain {
 impl BatchedCausalLM for ScopeChain {
     fn forward_ragged(&self, tokens: &Tensor, rows: &mut [RaggedRow<'_, usize>]) -> Result<Tensor> {
         Self::note(&self.ragged);
+        self.note_lead(tokens, rows);
         self.inner.forward_ragged(tokens, rows)
     }
 
@@ -1162,7 +1199,10 @@ impl BatchedCausalLM for ScopeChain {
 /// `kernels.gemm.f16_rows_decode` routes open: every `forward_rows` call
 /// has it, and no step that carries prompt pieces (`forward_ragged`) and no
 /// whole-prompt prefill (`forward`) does; the scope is closed again between
-/// steps. On both lookahead arms, with chunked and whole-prompt admission.
+/// steps. A step that carries pieces beside live rows is led by them instead
+/// (`tuning::RaggedDecodeRows`: its one-token rows first, over its input and
+/// its head), and a step of pieces alone by none. On both lookahead arms,
+/// with chunked and whole-prompt admission.
 #[test]
 fn only_the_decode_steps_forward_opens_the_decode_rows_scope() -> Result<()> {
     for device in devices() {
@@ -1177,7 +1217,7 @@ fn only_the_decode_steps_forward_opens_the_decode_rows_scope() -> Result<()> {
                 };
                 let mut dec: BatchDecoder<'_, ScopeChain, Session<'_, ScopeChain>> =
                     BatchDecoder::new(opts, &[EOS], device.clone())?;
-                for p in [vec![9u32, 9, 1], vec![9, 0], vec![5]] {
+                for p in [vec![9u32, 9, 1], vec![9, 0], vec![5], vec![9, 9, 9, 0]] {
                     dec.admit(Session::new(&model, 0usize), p, Sampling::ArgMax, 0)?;
                 }
                 let mut n = 0;
@@ -1186,6 +1226,11 @@ fn only_the_decode_steps_forward_opens_the_decode_rows_scope() -> Result<()> {
                     assert!(
                         !lloom_tensor::tuning::in_decode_rows(),
                         "{tag}: the scope outlived the step"
+                    );
+                    assert_eq!(
+                        lloom_tensor::tuning::ragged_decode_lead(usize::MAX),
+                        None,
+                        "{tag}: the ragged scope outlived the step"
                     );
                     n += 1;
                     assert!(n < 100, "{tag}: the batch never drained");
@@ -1196,8 +1241,18 @@ fn only_the_decode_steps_forward_opens_the_decode_rows_scope() -> Result<()> {
                 assert_eq!(rows.1, 0, "{tag}: a decode step ran without the scope");
                 assert_eq!(ragged.0, 0, "{tag}: a step with pieces opened the scope");
                 assert_eq!(single.0, 0, "{tag}: a prefill opened the scope");
+                let led = model.led.get();
+                let misled = model.misled.load(std::sync::atomic::Ordering::Relaxed);
+                assert_eq!(
+                    misled, 0,
+                    "{tag}: a ragged step led by other rows than its live ones"
+                );
                 if chunk > 0 {
                     assert!(ragged.1 > 0, "{tag}: no piece step ran ({ragged:?})");
+                    assert!(led.0 > 0, "{tag}: no piece rode a live row ({led:?})");
+                    let wide = model.wide.load(std::sync::atomic::Ordering::Relaxed);
+                    assert!(wide > 0, "{tag}: no piece of two tokens rode a live row");
+                    assert!(led.1 > 0, "{tag}: no step fed pieces alone ({led:?})");
                 } else {
                     assert!(single.1 > 0, "{tag}: no whole prompt was fed ({single:?})");
                 }

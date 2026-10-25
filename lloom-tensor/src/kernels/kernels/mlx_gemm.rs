@@ -250,6 +250,37 @@ fn f16_rows_route(
     (batch == 1 && rows <= max && gemv_rows_serves(n, k)).then_some((rows, decode))
 }
 
+/// Bytes of one half element.
+const HALF_BYTES: usize = 2;
+
+/// The live rows leading a ragged batched step's half matmul that take the
+/// decode rows' route, or `None`: under `fast`, with `kernels.gemm.f16_rows`
+/// and `kernels.gemm.f16_rows_decode` on, outside a verify window, `x · Wᵀ`
+/// of contiguous rows against one `[n, k]` row-major matrix at a tile the
+/// axis serves, whose first 1 to `f16_rows_max` rows are the step's decode
+/// rows (`tuning::RaggedDecodeRows`). The rows after them are prompt pieces.
+fn f16_rows_lead(
+    (dtype, out_dtype): (GemmDType, GemmDType),
+    (b, m, n, k): (usize, usize, usize, usize),
+    (a_trans, b_trans): (bool, bool),
+    lhs_stride: &[usize],
+    rhs_stride: &[usize],
+) -> Option<usize> {
+    if dtype != GemmDType::F16 || out_dtype != dtype || n == 1 || a_trans || !b_trans {
+        return None;
+    }
+    let max = crate::tuning::f16_rows_max()?;
+    if !crate::tuning::contract().is_fast()
+        || crate::tuning::in_verify_window()
+        || !crate::tuning::f16_rows_decode()
+    {
+        return None;
+    }
+    let (batch, rows, _) = check_batch_collapse(b, m, k, a_trans, lhs_stride, rhs_stride);
+    let lead = crate::tuning::ragged_decode_lead(rows)?;
+    (batch == 1 && lead <= max && gemv_rows_serves(n, k)).then_some(lead)
+}
+
 /// Select optimal tile configuration based on matrix dimensions, data type, transpose mode,
 /// and device type.
 ///
@@ -1763,24 +1794,6 @@ pub unsafe fn call_mlx_gemm_out(
     rhs_buffer: &Buffer,
     output: &Buffer,
 ) -> Result<(), MetalKernelError> {
-    #[derive(Debug)]
-    #[repr(C)]
-    struct GemmParams {
-        m: i32,
-        n: i32,
-        k: i32,
-        lda: i32,
-        ldb: i32,
-        ldd: i32,
-        tiles_n: i32,
-        tiles_m: i32,
-        batch_stride_a: isize,
-        batch_stride_b: isize,
-        batch_stride_d: isize,
-        swizzle_log: i32,
-        gemm_k_iterations_aligned: i32,
-        batch_ndim: i32,
-    }
     assert!(rhs_stride.len() >= 2);
     assert!(lhs_stride.len() >= 2);
     let rhs_m1 = rhs_stride[rhs_stride.len() - 1];
@@ -1915,6 +1928,56 @@ pub unsafe fn call_mlx_gemm_out(
         };
     }
 
+    // A ragged batched step's live rows take the decode rows' route and its
+    // prompt pieces the GEMM, two launches into disjoint rows of the output,
+    // so a row's bits do not depend on whether a piece rode its step
+    // (`docs/tuning.md` §13.5zb).
+    if let Some(lead) = f16_rows_lead(
+        (dtype, out_dtype),
+        (b, m, n, k),
+        (a_trans, b_trans),
+        lhs_stride,
+        rhs_stride,
+    ) {
+        crate::tuning::note_f16_rows_decode();
+        let (_, rows, _) = check_batch_collapse(b, m, k, a_trans, lhs_stride, rhs_stride);
+        let row = n * HALF_BYTES;
+        let encoder = ep.encoder();
+        let encoder: &ComputeCommandEncoder = encoder.as_ref();
+        // SAFETY: this function's contract (# Safety above).
+        return unsafe {
+            call_mlx_gemv_rows(
+                device,
+                encoder,
+                kernels,
+                dtype,
+                (lead, 1, n, k),
+                &[k, k, 1],
+                lhs_offset,
+                lhs_buffer,
+                &[0, rhs_m2, rhs_m1],
+                rhs_offset,
+                rhs_buffer,
+                &output.view(0, lead * row),
+                GemvEpilogue::None,
+                None,
+                lead,
+            )?;
+            encode_steel_gemm(
+                device,
+                encoder,
+                kernels,
+                (dtype, out_dtype),
+                (1, rows - lead, n, k),
+                (k as i32, false),
+                (ldb, b_trans),
+                (&[k, 1], lhs_offset + lead * k * HALF_BYTES, lhs_buffer),
+                (rhs_stride, rhs_offset, rhs_buffer),
+                &output.view(lead * row, (rows - lead) * row),
+            )
+        };
+    }
+
     // The routing decision this project has never audited (issue #386): no
     // threshold, no config axis, and `select_tile_config` is never consulted.
     // `takes_gemv_route` is `m == 1 || n == 1` unless `LLOOM_386_FORCE_GEMM`
@@ -1936,6 +1999,67 @@ pub unsafe fn call_mlx_gemm_out(
         );
     }
 
+    // SAFETY: this function's contract (# Safety above).
+    unsafe {
+        encode_steel_gemm(
+            device,
+            ep,
+            kernels,
+            (dtype, out_dtype),
+            (b, m, n, k),
+            (lda, a_trans),
+            (ldb, b_trans),
+            (lhs_stride, lhs_offset, lhs_buffer),
+            (rhs_stride, rhs_offset, rhs_buffer),
+            output,
+        )
+    }
+}
+
+#[derive(Debug)]
+#[repr(C)]
+struct GemmParams {
+    m: i32,
+    n: i32,
+    k: i32,
+    lda: i32,
+    ldb: i32,
+    ldd: i32,
+    tiles_n: i32,
+    tiles_m: i32,
+    batch_stride_a: isize,
+    batch_stride_b: isize,
+    batch_stride_d: isize,
+    swizzle_log: i32,
+    gemm_k_iterations_aligned: i32,
+    batch_ndim: i32,
+}
+
+impl EncoderParam for GemmParams {
+    unsafe fn set_param(encoder: &ComputeCommandEncoder, position: usize, data: Self) {
+        encoder.set_bytes(position, &data);
+    }
+}
+
+/// The steel GEMM over `(b, m, n, k)`, the route every matmul [`call_mlx_gemm_out`]
+/// does not send to a GEMV takes: the tile [`select_tile_config`]'s, the batch
+/// folded into `m` where [`check_batch_collapse`] folds it.
+///
+/// # Safety
+/// [`call_mlx_gemm_out`]'s.
+#[allow(clippy::too_many_arguments)]
+unsafe fn encode_steel_gemm(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    (dtype, out_dtype): (GemmDType, GemmDType),
+    (b, m, n, k): (usize, usize, usize, usize),
+    (lda, a_trans): (i32, bool),
+    (ldb, b_trans): (i32, bool),
+    (lhs_stride, lhs_offset, lhs_buffer): (&[usize], usize, &Buffer),
+    (rhs_stride, rhs_offset, rhs_buffer): (&[usize], usize, &Buffer),
+    output: &Buffer,
+) -> Result<(), MetalKernelError> {
     // Check for batch collapse optimization (MLX matmul.cpp lines 700-740)
     // When B is broadcasted (2D), collapse batch into M dimension
     let (effective_batch, effective_m, batch_collapsed) =
@@ -2033,12 +2157,6 @@ pub unsafe fn call_mlx_gemm_out(
     let encoder: &ComputeCommandEncoder = encoder.as_ref();
     encoder.set_compute_pipeline_state(&pipeline);
     debug_group!(encoder, "mlx_gemm {name} B={b} M={m} N={n} K={k}");
-
-    impl EncoderParam for GemmParams {
-        unsafe fn set_param(encoder: &ComputeCommandEncoder, position: usize, data: Self) {
-            encoder.set_bytes(position, &data);
-        }
-    }
 
     // Batch strides for buffer 7 (same as main branch)
     let batch_strides = [batch_stride_a, batch_stride_b];

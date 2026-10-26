@@ -13,6 +13,8 @@ fn the_slot_trace_counts_a_command_buffers_adds_commit_and_bytes() {
     // Read once, before the device exists (one process per test).
     std::env::set_var("LLOOM_METAL_API", "metal4");
     std::env::set_var("LLOOM_METAL4_SLOT_TRACE", "1");
+    // The slot set lists every binding only under `slots` (§6.3p).
+    std::env::set_var("LLOOM_RESIDENCY_METAL4", "slots");
     let dev = match Device::new_metal(0) {
         Ok(d) => d,
         Err(_) => return,

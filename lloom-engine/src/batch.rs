@@ -369,6 +369,10 @@ pub struct BatchCounters {
     /// Steps that held a streaming row back while pieces were fed
     /// (`PrefillDecode::Pause`).
     pub held_steps: u64,
+    /// Ticks whose intake hit its per-tick budget while work was live, so
+    /// the jobs left in the channel waited for the next tick
+    /// (`scheduler.intake_per_tick`).
+    pub intake_deferred: u64,
 }
 
 /// The scheduler: built and run on one thread ([`spawn`]).
@@ -385,6 +389,9 @@ pub struct BatchScheduler<'m, M: BatchedCausalLM, E> {
     share_prefix: bool,
     mode: BatchMode<M, E>,
     extra: E,
+    /// The most jobs one tick takes off the queue while work is live
+    /// (`scheduler.intake_per_tick`): the fairness bound on intake.
+    intake_per_tick: usize,
     decoder: Driver<'m, M>,
     inflight: HashMap<RowId, InFlight>,
     waiting: VecDeque<(BatchRequest, Sender<BatchEvent>)>,
@@ -575,6 +582,11 @@ pub struct BatchConfig<M: BatchedCausalLM, E> {
     pub prefill_batch: usize,
     /// What the K=1 loop's live rows do in a step that feeds prompt pieces.
     pub prefill_decode: PrefillDecode,
+    /// The most jobs one intake tick takes off the request queue while
+    /// work is live (`scheduler.intake_per_tick`, at least 1); the rest
+    /// stay queued in arrival order for the next tick. With nothing live
+    /// the whole queue is drained whatever this says.
+    pub intake_per_tick: usize,
     pub mode: BatchMode<M, E>,
     pub extra: E,
     /// Called after every step with the counters (a log line).
@@ -620,6 +632,7 @@ where
             share_prefix: cfg.share_prefix,
             mode: cfg.mode,
             extra: cfg.extra,
+            intake_per_tick: cfg.intake_per_tick.max(1),
             decoder,
             inflight: HashMap::new(),
             waiting: VecDeque::new(),
@@ -650,8 +663,17 @@ where
         self.inflight.is_empty() && self.decoder.is_idle()
     }
 
-    /// Take the queue: block when there is nothing to do, drain otherwise.
+    /// Take the queue: block when there is nothing to do, else take at most
+    /// [`Self::intake_budget`] jobs before returning to the rows.
     /// `false` on shutdown.
+    ///
+    /// The budget is what keeps a producer that holds the queue non-empty
+    /// from postponing the live rows' next step indefinitely: with work
+    /// live, intake is bounded per tick and the jobs it does not take stay
+    /// queued, in arrival order, for the next tick. With nothing live there
+    /// is no row to starve and the whole queue is drained, as it always
+    /// was — the closed-job and shutdown ordering is the queue's order
+    /// either way.
     fn take_jobs(&mut self) -> bool {
         let block = self.nothing_live() && self.waiting.is_empty() && self.closed.is_empty();
         if block {
@@ -664,9 +686,16 @@ where
                 Err(_) => return false,
             }
         }
-        loop {
+        let budget = if self.nothing_live() {
+            usize::MAX
+        } else {
+            self.intake_per_tick
+        };
+        let mut taken = 0usize;
+        while taken < budget {
             match self.rx.try_recv() {
                 Ok(job) => {
+                    taken += 1;
                     if !self.enqueue(job) {
                         return false;
                     }
@@ -675,6 +704,10 @@ where
                 Err(TryRecvError::Disconnected) => return false,
             }
         }
+        if taken == budget {
+            self.counters.intake_deferred += 1;
+        }
+        true
     }
 
     fn enqueue(&mut self, job: Job<M, E>) -> bool {
@@ -1567,6 +1600,9 @@ mod tests {
         }
     }
 
+    /// `scheduler.intake_per_tick`'s default, which these fixtures run at.
+    const INTAKE_PER_TICK: usize = crate::options::DEFAULT_INTAKE_PER_TICK;
+
     fn start(
         max_rows: usize,
         chunk: usize,
@@ -1583,6 +1619,8 @@ mod tests {
         mode: BatchMode<Chain, ()>,
         on_counters: Option<CountersHook>,
     ) -> (BatchHandle<Chain, ()>, std::thread::JoinHandle<()>) {
+        // The option's default; the fairness test reads the same constant.
+        let intake_per_tick = INTAKE_PER_TICK;
         let device = Device::Cpu;
         let core = Arc::new(Chain::new(&device).unwrap());
         let pool = SlotPool::new(max_rows, || Pos(0));
@@ -1600,6 +1638,7 @@ mod tests {
             share_prefix: false,
             prefill_batch,
             prefill_decode,
+            intake_per_tick,
             mode,
             extra: (),
             on_counters,
@@ -1819,6 +1858,91 @@ mod tests {
         // The closed job runs with the pool whole.
         let idle_len = handle.run_closed_blocking(|idle| idle.pool.idle()).unwrap();
         assert_eq!(idle_len, 2);
+        handle.shutdown();
+        thread.join().unwrap();
+    }
+
+    /// A burst queued while a row is live is taken a bounded number of jobs
+    /// per step, so the live row's next step is not postponed behind the
+    /// whole queue; nothing in the burst is lost, only deferred.
+    ///
+    /// The scheduler is held inside its counters hook after a step with row
+    /// A live, the burst queued meanwhile, then released: every request
+    /// the next tick takes is answered before the step that follows it
+    /// (each is cancelled, so `admit_waiting` answers it at once), so the
+    /// answers counted at that step are the jobs taken in that tick.
+    #[test]
+    fn a_queued_burst_cannot_postpone_a_live_row_past_the_intake_budget() {
+        const BURST: usize = 4096;
+        const BUDGET: usize = INTAKE_PER_TICK;
+        let (paused_tx, paused_rx) = mpsc::channel::<u64>();
+        let (go_tx, go_rx) = mpsc::channel::<()>();
+        let go_rx = parking_lot::Mutex::new(go_rx);
+        let hook: CountersHook = Box::new(move |c| {
+            if c.steps == 3 || c.steps == 4 {
+                let _ = paused_tx.send(c.steps);
+                let _ = go_rx.lock().recv();
+            }
+        });
+        let (handle, thread) = start_with(
+            2,
+            0,
+            1,
+            PrefillDecode::Ride,
+            BatchMode::Continuous,
+            Some(hook),
+        );
+        let live_cancel = Arc::new(AtomicBool::new(false));
+        let live = handle.submit(BatchRequest {
+            prompt_ids: vec![0],
+            params: params(1_000_000),
+            cancel: Arc::clone(&live_cancel),
+        });
+        assert_eq!(paused_rx.recv_timeout(Duration::from_secs(30)).unwrap(), 3);
+        let mut before = 0usize;
+        while let Ok(BatchEvent::Tokens(ids)) = live.try_recv() {
+            before += ids.len();
+        }
+        assert!(before > 0, "the row is live before the burst");
+        let burst: Vec<Receiver<BatchEvent>> = (0..BURST)
+            .map(|_| {
+                handle.submit(BatchRequest {
+                    prompt_ids: vec![5],
+                    params: params(4),
+                    cancel: Arc::new(AtomicBool::new(true)),
+                })
+            })
+            .collect();
+        go_tx.send(()).unwrap();
+        assert_eq!(paused_rx.recv_timeout(Duration::from_secs(30)).unwrap(), 4);
+        let answered = burst.iter().filter(|rx| rx.try_recv().is_ok()).count();
+        let mut after = 0usize;
+        while let Ok(BatchEvent::Tokens(ids)) = live.try_recv() {
+            after += ids.len();
+        }
+        assert!(after > 0, "the live row stepped after the release");
+        assert!(
+            answered <= BUDGET,
+            "the tick before the live row's step took {answered} of {BURST} queued jobs \
+             (budget {BUDGET}): intake postponed the live row behind the queue"
+        );
+        live_cancel.store(true, Ordering::Release);
+        go_tx.send(()).unwrap();
+        // Deferred, not dropped: every queued request is still answered.
+        let mut late = 0usize;
+        for rx in &burst {
+            match rx.recv_timeout(Duration::from_secs(30)) {
+                Ok(BatchEvent::Done(d)) => {
+                    assert!(d.cancelled);
+                    late += 1;
+                }
+                Ok(other) => panic!("a cancelled request got {other:?}"),
+                Err(_) => {}
+            }
+        }
+        assert_eq!(answered + late, BURST, "every queued request is answered");
+        let (_, done) = collect(&live);
+        assert!(done.cancelled);
         handle.shutdown();
         thread.join().unwrap();
     }

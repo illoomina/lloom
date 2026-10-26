@@ -470,6 +470,45 @@ fn owner_parked(commands: &Commands) -> bool {
     }
 }
 
+/// The owner: cuts past every Metal 4 slot and past the held queue's cap,
+/// then reports how its cuts ended.
+fn spawn_owner(
+    commands: &Arc<Commands>,
+) -> (
+    std::thread::JoinHandle<()>,
+    std::sync::mpsc::Receiver<Result<(), String>>,
+) {
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let commands = Arc::clone(commands);
+    let owner = std::thread::spawn(move || {
+        #[cfg(feature = "schedule-hooks")]
+        position::this_thread_is_the_owner();
+        let mut result = Ok(());
+        for _ in 0..produced::HELD_CAP + 2 {
+            if let Err(error) = commands.flush_marker() {
+                result = Err(error.to_string());
+                break;
+            }
+        }
+        let _ = done_tx.send(result);
+    });
+    (owner, done_rx)
+}
+
+/// The owner is parked with nothing but a producer or a canceller able to
+/// move it: every Metal 4 slot held by recordings only a producer releases,
+/// or the held queue at its cap on Metal 3.
+fn stuck(commands: &Commands) -> bool {
+    owner_parked(commands)
+        && match commands.core.modern_queue.as_ref() {
+            Some(queue) => {
+                let (allocated, available) = queue.slots_for_test();
+                available == 0 && commands.produced_stats().held_now + 1 == allocated
+            }
+            None => commands.produced_stats().held_now == produced::HELD_CAP,
+        }
+}
+
 /// Poll `ready` until it holds or `within` passes.
 fn until(within: Duration, mut ready: impl FnMut() -> bool) -> bool {
     let deadline = Instant::now() + within;
@@ -566,33 +605,7 @@ fn a_parked_owner_wakes_for_every_input(shape: Shape, delivery: Delivery, when: 
             unsafe { blit.fill_buffer(&f.dst, (2048, 4096), 0x5c) };
         }
     }
-    let (done_tx, done_rx) = std::sync::mpsc::channel();
-    let owner = {
-        let commands = Arc::clone(&f.commands);
-        std::thread::spawn(move || {
-            #[cfg(feature = "schedule-hooks")]
-            position::this_thread_is_the_owner();
-            let mut result = Ok(());
-            for _ in 0..produced::HELD_CAP + 2 {
-                if let Err(error) = commands.flush_marker() {
-                    result = Err(error.to_string());
-                    break;
-                }
-            }
-            let _ = done_tx.send(result);
-        })
-    };
-    // Stuck: parked, with nothing but a producer able to move it.
-    let stuck = |commands: &Commands| {
-        owner_parked(commands)
-            && match commands.core.modern_queue.as_ref() {
-                Some(queue) => {
-                    let (allocated, available) = queue.slots_for_test();
-                    available == 0 && commands.produced_stats().held_now + 1 == allocated
-                }
-                None => commands.produced_stats().held_now == produced::HELD_CAP,
-            }
-    };
+    let (owner, done_rx) = spawn_owner(&f.commands);
     assert!(
         until(Duration::from_secs(10), || stuck(&f.commands)),
         "the owner never parked behind the held work: {:?}",
@@ -800,6 +813,265 @@ fn a_producer_leaves_its_release_to_the_lock_holder() {
         computed(&f.dst),
         "the dependent compute read the wrong input"
     );
+    f.commands.check_failed().unwrap();
+}
+
+/// A cancellation never waits for the state lock either. With the owner
+/// parked behind work whose input will never come, the canceller returns at
+/// once, the owner applies the cancellation in its park and its cut fails
+/// with the reason; nothing held runs, and the queue goes on.
+#[test]
+fn a_cancel_reaches_an_owner_parked_behind_the_work_it_cancels() {
+    const REASON: &str = "test: the producer failed";
+    let f = fixture();
+    if f.commands.host_input_arm() == HostInputArm::GpuWait {
+        eprintln!("NOT_APPLICABLE nothing is held on the gpu-wait arm");
+        return;
+    }
+    f.commands.commit_when_produced(&f.gate, 1).unwrap();
+    encode_dependent(&f);
+    let (owner, done) = spawn_owner(&f.commands);
+    assert!(
+        until(Duration::from_secs(10), || stuck(&f.commands)),
+        "the owner never parked behind the held work: {:?}",
+        f.commands.produced_stats()
+    );
+    let held = f.commands.produced_stats().held_now;
+    let (tx, rx) = std::sync::mpsc::channel();
+    let canceller = {
+        let gate = Shared(f.gate.clone());
+        let commands = Arc::clone(&f.commands);
+        std::thread::spawn(move || {
+            let gate = gate;
+            let _ = tx.send(
+                commands
+                    .cancel_produced(&gate.0, REASON)
+                    .map_err(|e| e.to_string()),
+            );
+        })
+    };
+    let returned = rx.recv_timeout(Duration::from_secs(5));
+    let finished = done.recv_timeout(Duration::from_secs(20));
+    let stats = f.commands.produced_stats();
+    eprintln!(
+        "CANCEL_PARKED api={} held={held} returned={returned:?} finished={finished:?} stats={stats:?}",
+        f.commands.actual_command_api()
+    );
+    assert_eq!(
+        returned,
+        Ok(Ok(0)),
+        "HANG or wrong owner: the canceller waited for the lock the parked owner holds, \
+         or applied the cancellation itself"
+    );
+    let finished = finished.expect("HANG: the parked owner never applied the cancellation");
+    assert!(
+        finished.as_ref().is_err_and(|e| e.contains(REASON)),
+        "the parked cut did not fail with the cancellation's reason: {finished:?}"
+    );
+    owner.join().unwrap();
+    canceller.join().unwrap();
+    assert!(stats.cancels_delegated >= 1, "{stats:?}");
+    assert_eq!(stats.released, 0, "held work ran: {stats:?}");
+    assert!(stats.cancelled > held as u64, "{stats:?}");
+    assert_eq!(stats.held_now, 0, "{stats:?}");
+    f.commands.flush_and_wait().unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(f.progress.signaledValue(), 0, "cancelled work ran");
+    assert!(
+        dst_bytes(&f.dst).iter().all(|b| *b == WARM),
+        "cancelled work ran"
+    );
+    // The queue goes on: fresh work computes, every epoch taken completes.
+    encode_dependent(&f);
+    f.commands.flush_and_wait().unwrap();
+    assert!(computed(&f.dst));
+    assert_eq!(
+        f.commands.clock().completed_count().0,
+        f.commands.clock().current_epoch().0,
+        "an epoch a cancelled recording took never completed"
+    );
+    f.commands.check_failed().unwrap();
+    if let Some((allocated, available)) = metal4_slots_settle(&f.commands) {
+        assert_eq!(
+            allocated,
+            available + 1,
+            "a cancelled recording stranded its slot"
+        );
+    }
+}
+
+/// A cancellation that finds the state lock held by an owner that is not
+/// parked returns at once; the holder applies it as it unlocks.
+#[test]
+fn a_cancel_left_to_the_lock_holder_runs_as_it_unlocks() {
+    const REASON: &str = "test: cancelled under another thread's lock";
+    let f = fixture();
+    if f.commands.host_input_arm() == HostInputArm::GpuWait {
+        eprintln!("NOT_APPLICABLE nothing is held on the gpu-wait arm");
+        return;
+    }
+    f.commands.commit_when_produced(&f.gate, 1).unwrap();
+    encode_dependent(&f);
+    let held_marker = f.commands.flush_marker().unwrap();
+    let held = 1 + signal_cut(&f.commands);
+    assert_eq!(f.commands.produced_stats().held_now, held);
+    let state = f.commands.lock_state().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let canceller = {
+        let gate = Shared(f.gate.clone());
+        let commands = Arc::clone(&f.commands);
+        std::thread::spawn(move || {
+            let gate = gate;
+            let _ = tx.send(
+                commands
+                    .cancel_produced(&gate.0, REASON)
+                    .map_err(|e| e.to_string()),
+            );
+        })
+    };
+    let returned = rx.recv_timeout(Duration::from_secs(5));
+    let cancelled_while_held = f.commands.produced_stats().cancelled;
+    drop(state);
+    let stats = f.commands.produced_stats();
+    eprintln!(
+        "CANCEL_LEFT_TO_HOLDER api={} returned={returned:?} cancelled_while_held={cancelled_while_held} stats={stats:?}",
+        f.commands.actual_command_api()
+    );
+    assert_eq!(
+        returned,
+        Ok(Ok(0)),
+        "the canceller waited for the state lock, or applied the cancellation itself"
+    );
+    canceller.join().unwrap();
+    assert_eq!(
+        cancelled_while_held, 0,
+        "cancelled under another thread's lock"
+    );
+    // The held recordings and the current one behind them.
+    assert_eq!(stats.cancelled, held as u64 + 1, "{stats:?}");
+    assert_eq!(stats.cancels_delegated, 1, "{stats:?}");
+    assert_eq!(stats.held_now, 0, "{stats:?}");
+    let waited = f.commands.wait_marker(&held_marker);
+    assert!(
+        waited
+            .as_ref()
+            .is_err_and(|e| e.to_string().contains(REASON)),
+        "{waited:?}"
+    );
+    f.gate.setSignaledValue(1);
+    assert_eq!(f.commands.produced(&f.gate, 1).unwrap(), 0);
+    f.commands.flush_and_wait().unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(f.progress.signaledValue(), 0, "cancelled work ran");
+    encode_dependent(&f);
+    f.commands.flush_and_wait().unwrap();
+    assert!(computed(&f.dst));
+    f.commands.check_failed().unwrap();
+}
+
+/// A cancellation left to a holder is applied before the raise its caller
+/// makes next (`HostFedRing::release` cancels, then raises the event past
+/// the run): the raise does not release what the cancellation covers.
+#[test]
+fn a_cancel_is_applied_before_the_raise_that_follows_it() {
+    const REASON: &str = "test: the run was released";
+    let f = fixture();
+    if f.commands.host_input_arm() == HostInputArm::GpuWait {
+        eprintln!("NOT_APPLICABLE nothing is held on the gpu-wait arm");
+        return;
+    }
+    f.commands.commit_when_produced(&f.gate, 1).unwrap();
+    encode_dependent(&f);
+    f.commands.flush_marker().unwrap();
+    let held = 1 + signal_cut(&f.commands);
+    let state = f.commands.lock_state().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let canceller = {
+        let gate = Shared(f.gate.clone());
+        let commands = Arc::clone(&f.commands);
+        std::thread::spawn(move || {
+            let gate = gate;
+            let cancelled = commands
+                .cancel_produced_through(&gate.0, 1, REASON)
+                .map_err(|e| e.to_string());
+            gate.0.setSignaledValue(1);
+            let released = commands.produced(&gate.0, 1).map_err(|e| e.to_string());
+            let _ = tx.send((cancelled, released));
+        })
+    };
+    let returned = rx.recv_timeout(Duration::from_secs(5));
+    drop(state);
+    canceller.join().unwrap();
+    f.commands.flush_and_wait().unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    let stats = f.commands.produced_stats();
+    eprintln!(
+        "CANCEL_THEN_RAISE api={} returned={returned:?} progress={} stats={stats:?}",
+        f.commands.actual_command_api(),
+        f.progress.signaledValue()
+    );
+    assert_eq!(
+        returned,
+        Ok((Ok(0), Ok(0))),
+        "the canceller or the producer waited for the state lock"
+    );
+    assert_eq!(
+        f.progress.signaledValue(),
+        0,
+        "the raise released cancelled work"
+    );
+    assert!(
+        dst_bytes(&f.dst).iter().all(|b| *b == WARM),
+        "the raise released cancelled work"
+    );
+    assert_eq!(stats.released, 0, "{stats:?}");
+    assert_eq!(stats.cancelled, held as u64 + 1, "{stats:?}");
+    f.commands.check_failed().unwrap();
+}
+
+/// A cancellation through a value covers no input above it, whenever it is
+/// applied: a later run's work on the same event is not cancelled.
+#[test]
+fn a_cancel_through_a_value_spares_a_later_one() {
+    let f = fixture();
+    if f.commands.host_input_arm() == HostInputArm::GpuWait {
+        eprintln!("NOT_APPLICABLE nothing is held on the gpu-wait arm");
+        return;
+    }
+    f.commands.commit_when_produced(&f.gate, 3).unwrap();
+    encode_dependent(&f);
+    let state = f.commands.lock_state().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let canceller = {
+        let gate = Shared(f.gate.clone());
+        let commands = Arc::clone(&f.commands);
+        std::thread::spawn(move || {
+            let gate = gate;
+            let _ = tx.send(
+                commands
+                    .cancel_produced_through(&gate.0, 2, "test: an earlier run")
+                    .map_err(|e| e.to_string()),
+            );
+        })
+    };
+    let returned = rx.recv_timeout(Duration::from_secs(5));
+    drop(state);
+    canceller.join().unwrap();
+    f.gate.setSignaledValue(3);
+    f.commands.produced(&f.gate, 3).unwrap();
+    f.commands.flush_and_wait().unwrap();
+    let stats = f.commands.produced_stats();
+    eprintln!(
+        "CANCEL_THROUGH api={} returned={returned:?} stats={stats:?}",
+        f.commands.actual_command_api()
+    );
+    assert_eq!(
+        returned,
+        Ok(Ok(0)),
+        "the canceller waited for the state lock, or applied the cancellation itself"
+    );
+    assert_eq!(stats.cancelled, 0, "{stats:?}");
+    assert!(computed(&f.dst), "a later value's work was cancelled");
     f.commands.check_failed().unwrap();
 }
 

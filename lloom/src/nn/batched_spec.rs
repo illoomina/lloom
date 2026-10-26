@@ -430,8 +430,13 @@ where
         _seed: u64,
         eos_ids: &[u32],
         max_tokens: usize,
-    ) -> Result<RowId> {
-        crate::nn::decode::refuse(
+    ) -> crate::nn::batched::Admission<R> {
+        // Every refusal — this loop's stricter body, an empty EOS set, an
+        // empty prompt, an unreconciled overrun — is decided before a
+        // drafter slot or the session is taken, and hands the session back
+        // (`Rejected`): a refused admission costs the caller's pool
+        // nothing.
+        let refused = crate::nn::decode::refuse(
             crate::nn::decode::Body::BatchedWindow,
             &crate::nn::decode::Asks {
                 sampling: &sampling,
@@ -441,28 +446,37 @@ where
                 logprobs: None,
             },
         )
-        .map_err(|e| lloom_tensor::Error::Msg(format!("decode_spec_batched: {e}")))?;
-        if eos_ids.is_empty() {
-            lloom_tensor::bail!("decode_spec_batched: an empty EOS set; the row would never end");
-        }
-        if prompt.is_empty() {
-            lloom_tensor::bail!("decode_spec_batched: an empty prompt (no resume on this loop)");
-        }
-        {
+        .err()
+        .map(|e| lloom_tensor::Error::Msg(format!("decode_spec_batched: {e}")))
+        .or_else(|| {
+            if eos_ids.is_empty() {
+                return Some(lloom_tensor::Error::msg(
+                    "decode_spec_batched: an empty EOS set; the row would never end",
+                ));
+            }
+            if prompt.is_empty() {
+                return Some(lloom_tensor::Error::msg(
+                    "decode_spec_batched: an empty prompt (no resume on this loop)",
+                ));
+            }
             let s: &mut Session<'m, M> = session.borrow_mut();
-            if s.seq.overrun > 0 {
-                lloom_tensor::bail!(
+            (s.seq.overrun > 0).then(|| {
+                lloom_tensor::Error::msg(format!(
                     "decode_spec_batched: the sequence's cache is {} positions past its last \
                      token; `Session::reconcile` or `Session::reset` first",
                     s.seq.overrun
-                );
-            }
+                ))
+            })
+        });
+        if let Some(error) = refused {
+            return Err(crate::nn::batched::Rejected { session, error });
         }
         let Some(seq) = self.free_seq.pop() else {
-            lloom_tensor::bail!(
+            let error = lloom_tensor::Error::msg(format!(
                 "decode_spec_batched: every drafter slot is taken ({} rows)",
                 self.spec.n_seq()
-            );
+            ));
+            return Err(crate::nn::batched::Rejected { session, error });
         };
         self.generation += 1;
         let generation = self.generation;

@@ -166,8 +166,9 @@ pub fn drive_closed_rows<'m, M: BatchedCausalLM + 'm>(
         );
     }
     let mut ids: Vec<RowId> = Vec::with_capacity(n);
-    // Admitted in order; a row the driver refuses is dropped by `admit`
-    // (the driver's contract), the rows after it are handed back untouched.
+    // Admitted in order; a row the driver refuses comes back with the
+    // refusal (`Rejected`), and the rows after it are handed back
+    // untouched — a failed cell costs the caller no session.
     let mut rest: Vec<Session<'m, M>> = sessions;
     rest.reverse();
     while let Some(s) = rest.pop() {
@@ -181,11 +182,12 @@ pub fn drive_closed_rows<'m, M: BatchedCausalLM + 'm>(
             max_tokens,
         ) {
             Ok(id) => ids.push(id),
-            Err(e) => {
+            Err(rejected) => {
                 let mut back = driver.drain_rows();
+                back.push(rejected.session);
                 rest.reverse();
                 back.append(&mut rest);
-                return (back, Err(e));
+                return (back, Err(rejected.error));
             }
         }
     }
@@ -951,8 +953,17 @@ where
                         },
                     );
                 }
-                Err(e) => {
-                    let _ = tx.send(BatchEvent::Error(e.to_string()));
+                Err(rejected) => {
+                    // The checkout commits only on an admitted row: a
+                    // driver that refuses this request — its own body's
+                    // validation, which is stricter than the scheduler's
+                    // on the speculative loop, an empty prepared suffix,
+                    // no drafter slot left — hands the session back, and
+                    // its sequence returns to the pool. Otherwise every
+                    // such refusal costs the pool one sequence and valid
+                    // requests later fail admission with nothing live.
+                    let _ = tx.send(BatchEvent::Error(rejected.error.to_string()));
+                    self.pool.release(slot, rejected.session.into_sequence());
                 }
             }
         }

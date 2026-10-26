@@ -1709,3 +1709,147 @@ fn retained_message_tree_allocations_are_charged_and_admitted() {
         }
     }
 }
+
+#[test]
+fn released_only_history_enforces_bytes_before_the_count_limit() {
+    use std::sync::atomic::Ordering;
+    let now = Instant::now();
+    let auth = Some([27; 32]);
+    let ss = scopes(1);
+    let prompt = vec![1; 1024];
+    let messages = [
+        json!({"role":"user","content":"release pressure"}),
+        json!({"role":"assistant","content":"r"}),
+    ];
+    let reserve = |t: &mut Table| {
+        t.reserve(
+            Plan {
+                continued: None,
+                store: Some(true),
+                keep: None,
+                auth,
+                prompt_ids: &prompt,
+                scopes: &ss,
+            },
+            now,
+        )
+    };
+    let prepare = || {
+        let p = PreparedRecord::new(Record {
+            messages: vec![messages[0].clone()],
+            reply_msg: messages[1].clone(),
+            prompt_ids: prompt.clone(),
+            reply: reply(&[2]),
+            eot: None,
+            scope: ss[1],
+            prefix: None,
+        })
+        .unwrap();
+        assert_eq!(p.ids.len(), prompt.len() + 1);
+        assert_eq!(&p.ids[..prompt.len()], prompt.as_slice());
+        assert_eq!(p.ids.last(), Some(&2));
+        assert_eq!(p.messages.len(), 2);
+        assert_eq!(p.messages[0].value(), messages[0]);
+        assert_eq!(p.messages[1].value(), messages[1]);
+        assert_eq!(p.turn.msg_len, 1);
+        assert_eq!(p.turn.scope, ss[1]);
+        assert_eq!(p.turn.reply.ids, vec![2]);
+        assert!(p.turn.prefix.is_none());
+        assert!(!p.turn.eot);
+        p
+    };
+
+    // Observe a real, authenticated release with enforcement inactive because
+    // it fits. The paired arm uses the identical request/publication shape.
+    let mut control = Table::with_base(cfg(1, true), 41);
+    // rand::random initializes thread-local RNG ownership on first use. This
+    // is process/thread infrastructure, not retained table ownership.
+    std::hint::black_box(rand::random::<u64>());
+    let baseline = allocation_receipt::LIVE.load(Ordering::Relaxed);
+    let issued = reserve(&mut control);
+    assert_eq!(issued.id.key.slot, 0);
+    let publication = control.publish(issued, prepare(), now);
+    assert!(publication.retained);
+    drop(publication);
+    control.delete(&issued.id.encode(), auth, now).unwrap();
+    let slot = &control.slots[issued.id.key.slot as usize];
+    assert!(slot.session.is_none());
+    assert_eq!(slot.released.len(), 1);
+    assert!(slot.released.len() < RELEASES_KEPT);
+    let released = &slot.released[0];
+    assert_eq!(released.gen, issued.id.key.gen);
+    assert_eq!(released.auth, auth);
+    assert_eq!(released.reason, Reason::Delete);
+    assert_eq!(released.nonces.as_slice(), &[issued.id.nonce]);
+    assert!(released.dropped.is_empty());
+    assert_eq!(
+        released.bytes,
+        released.nonces.capacity() * size_of::<u64>()
+    );
+    let release_only = control.bytes;
+    assert_eq!(release_only, Table::slot_bytes(slot));
+    let live = allocation_receipt::LIVE.load(Ordering::Relaxed) - baseline;
+    assert_eq!(live, release_only as isize);
+    assert_charge(&control);
+    assert!(release_only > 0);
+    assert_eq!(
+        control
+            .resolve(&issued.id.encode(), auth, false, now)
+            .err()
+            .unwrap()
+            .reason,
+        Some(Reason::Delete)
+    );
+    assert_eq!(
+        control
+            .resolve(&issued.id.encode(), None, false, now)
+            .err()
+            .unwrap()
+            .reason,
+        None
+    );
+
+    // A single released record exceeds this observed limit: this is byte
+    // pressure before the eight-record count ceiling, not an unused-slot test.
+    let limit = release_only - 1;
+    let mut pressure = Table::with_base(
+        Config {
+            max_bytes: limit,
+            ..cfg(1, true)
+        },
+        41,
+    );
+    let refused = reserve(&mut pressure);
+    assert_eq!(refused.id.key, issued.id.key);
+    let prepared = prepare();
+    assert!(prepared.ids.capacity() * size_of::<u32>() > limit);
+    let publication = pressure.publish(refused, prepared, now);
+    assert!(!publication.retained);
+    assert_eq!(publication.reason, Some(Reason::Budget));
+    drop(publication);
+    eprintln!("retention release pressure control_requested={live} control_reported={release_only} limit={limit} affected_slot={} generation={} nonces=1 dropped=0 after_bytes={}", refused.id.key.slot, refused.id.key.gen, pressure.bytes);
+    assert!(
+        pressure.bytes <= pressure.cfg.max_bytes,
+        "released-only ownership exceeds the configured byte limit before the count ceiling"
+    );
+    let slot = &pressure.slots[refused.id.key.slot as usize];
+    assert!(slot.session.is_none());
+    assert_eq!(slot.gen, refused.id.key.gen.wrapping_add(1));
+    assert!(slot.released.is_empty());
+    assert_eq!(slot.released.capacity(), 0);
+    assert_eq!(Table::slot_bytes(slot), 0);
+    assert_eq!(pressure.bytes, 0);
+    assert_eq!(pressure.counters.released[Reason::Budget as usize], 1);
+    assert_charge(&pressure);
+    for binding in [auth, None] {
+        assert_eq!(
+            pressure
+                .resolve(&refused.id.encode(), binding, false, now)
+                .err()
+                .unwrap()
+                .reason,
+            None,
+            "the exact refused generation/nonce record left under byte pressure"
+        );
+    }
+}

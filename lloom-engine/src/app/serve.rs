@@ -352,7 +352,7 @@ fn run_owner(
         options.server.keep_warm,
         options.server.keep_warm_for_s,
         &options.server.keep_warm_by,
-        options.server.keep_warm_pressure,
+        options.server.keep_warm_pressure.unwrap_or(false),
         engine.batch(),
         engine.device().is_metal(),
     )

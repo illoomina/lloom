@@ -2027,14 +2027,14 @@ pub struct ServerConfig {
     /// What `server.keep_warm` does each period: `residency` (ask the OS to keep the GPU's memory wired: it unwires it after a few idle seconds and the next request waits while it is wired back) or `dispatch` (one one-element GPU dispatch, committed and waited).
     #[opt(flag = "keep-warm-by", parser = "parse_keep_warm_by", variants = ["residency", "dispatch"], path = "server.keep_warm_by", status = "advanced")]
     pub keep_warm_by: String,
-    /// Read the kernel's memory-pressure level every keep-warm period: at warn or critical stop keeping the GPU's memory wired and give it back (`endResidency`), at normal resume; off = the heartbeat ignores pressure.
+    /// Read the kernel's memory-pressure level every keep-warm period: at warn or critical stop keeping the GPU's memory wired and give it back (`endResidency`), at normal resume; off = the heartbeat ignores pressure. Off in the library; `serve` turns it on where its keep-warm runs by default, on Metal at one sequence (decision 57; measured, `tuning.md` §6.3n: ~6 GiB of wired memory back within ~2 s of a warn, +5–17 ms on the first request after normal), `--keep-warm-pressure=false` to measure without it. Unset = the front-end's own (off where none applies).
     #[opt(
         bool,
         flag = "keep-warm-pressure",
         path = "server.keep_warm_pressure",
         status = "arm"
     )]
-    pub keep_warm_pressure: bool,
+    pub keep_warm_pressure: Option<bool>,
     /// Read the memory-pressure level from this file (one number: 1 normal, 2 warn, 4 critical) instead of the kernel's sysctl: a measurement's stand-in for `memory_pressure -S`, which needs root. Takes effect with `server.keep_warm_pressure`.
     #[opt(
         flag = "keep-warm-pressure-file",
@@ -2059,7 +2059,7 @@ impl Default for ServerConfig {
             keep_warm: None,
             keep_warm_for_s: 180,
             keep_warm_by: "residency".into(),
-            keep_warm_pressure: false,
+            keep_warm_pressure: None,
             keep_warm_pressure_file: None,
             pipette: PipetteConfig::default(),
             sessions: ServerSessionsConfig::default(),

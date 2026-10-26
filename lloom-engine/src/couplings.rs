@@ -209,7 +209,7 @@ pub const COUPLINGS: &[Coupling] = &[
         id: "C21",
         kind: "resolves",
         when: "kernels.residency.set_cap_pct in 1..=99, or kernels.residency.attach = heartbeat",
-        effect: "the device's residency sets: one per class up to the cap, at most 24, the keep-warm requesting kernels.residency.hot; and whether they are on the Metal 3 queue (Metal 4 keeps the attachment)",
+        effect: "the device's residency sets: one per class up to the cap, at most 24, the keep-warm requesting kernels.residency.hot; and whether they are on the Metal 3 queue (Metal 4 keeps the attachment). chat and serve detach them by default on Metal (decision 56); the library keeps them on the queue",
         keys: &["kernels.residency.set_cap_pct", "kernels.residency.attach", "kernels.residency.hot"],
         site: "lloom-tensor/src/kernels/metal/residency_set.rs ResidencyPolicy::selected, ResidencyAttachment::decide",
         is_static: false,
@@ -467,7 +467,8 @@ pub fn explain(o: &EngineOptions) -> Vec<String> {
 }
 
 /// The residency router's layout as the options resolve it (`tuning.md`
-/// §6.3n); `None` on the defaults (one set, attached to the queue).
+/// §6.3n, §6.3o); `None` at the library's values (one set, attached to the
+/// queue).
 fn residency_layout(m: &lloom_tensor::tuning::MetalTuning) -> Option<String> {
     let pct = m.residency_set_cap_pct;
     let split = pct > 0 && pct < 100;
@@ -485,7 +486,8 @@ fn residency_layout(m: &lloom_tensor::tuning::MetalTuning) -> Option<String> {
         "1 set".into()
     };
     let attach = if m.residency_attach == "heartbeat" {
-        "detached from the Metal 3 queue (Metal 4: attached as before)"
+        "detached from the Metal 3 queue (chat's and serve's default on Metal, decision 56; \
+         Metal 4: attached as before)"
     } else {
         "on the Metal 3 queue"
     };
@@ -818,6 +820,36 @@ mod tests {
             c20(&[("scheduler.max_sequences", "4")]).is_empty(),
             "the arm off"
         );
+    }
+
+    /// C21 at the library's values says nothing; where chat's and serve's
+    /// rows hold (Metal) their default detaches the set, and the line names
+    /// decision 56; `queue` named is the library's arrangement again.
+    #[test]
+    fn c21_names_the_default_attachment() {
+        use crate::frontend::{self, Frontend, When};
+        let c21 = |o: &EngineOptions| -> Vec<String> {
+            explain(o)
+                .into_iter()
+                .filter(|l| l.ends_with("(C21)"))
+                .collect()
+        };
+        assert!(c21(&EngineOptions::default()).is_empty(), "the library's");
+        for f in [Frontend::Chat, Frontend::Serve, Frontend::Bench] {
+            let mut o = EngineOptions::default();
+            frontend::apply(&mut o, f, &Default::default(), &Default::default()).unwrap();
+            let detached = f != Frontend::Bench && When::Metal.holds(&o);
+            let want: Vec<String> = if detached {
+                vec!["kernels.residency -> 1 set, detached from the Metal 3 queue (chat's and \
+                      serve's default on Metal, decision 56; Metal 4: attached as before) <- \
+                      kernels.residency.set_cap_pct = 0, kernels.residency.attach = heartbeat (C21)"
+                    .into()]
+            } else {
+                vec![]
+            };
+            assert_eq!(c21(&o), want, "{}", f.name());
+        }
+        assert!(c21(&with(&[("kernels.residency.attach", "queue")])).is_empty());
     }
 }
 

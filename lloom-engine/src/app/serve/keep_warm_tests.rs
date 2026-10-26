@@ -380,6 +380,73 @@ fn under_pressure_a_busy_slot_defers_the_end_until_it_is_free() {
     beat.stop();
 }
 
+static DEFAULT_LEVEL: AtomicU8 = AtomicU8::new(1);
+fn default_level() -> u8 {
+    DEFAULT_LEVEL.load(Ordering::Acquire)
+}
+
+/// Decision 57: the policy serve resolves at its own defaults reads the
+/// pressure where its keep-warm runs (on Metal at one sequence) and says so on
+/// the loaded line and in `/health`; its heartbeat, on an injected level,
+/// acts at normal, takes no action at warn and ends the residency once. On a
+/// build where serve's keep-warm row cannot hold, the policy is off.
+#[test]
+fn serves_default_policy_stands_down_under_pressure() {
+    use crate::frontend::{self, Frontend, When};
+    let mut o = crate::EngineOptions::default();
+    frontend::apply(
+        &mut o,
+        Frontend::Serve,
+        &Default::default(),
+        &Default::default(),
+    )
+    .unwrap();
+    let on = When::MetalSingle.holds(&o);
+    assert_eq!(
+        o.server.keep_warm_pressure,
+        on.then_some(true),
+        "serve's default stop"
+    );
+    let policy = Policy::resolve(
+        o.server.keep_warm,
+        o.server.keep_warm_for_s,
+        &o.server.keep_warm_by,
+        o.server.keep_warm_pressure.unwrap_or(false),
+        o.scheduler.max_sequences,
+        on,
+    )
+    .unwrap();
+    if !on {
+        assert_eq!(policy.short(), "off");
+        return;
+    }
+    assert_eq!(policy.short(), "1000ms/180s/residency/pressure");
+    assert!(policy
+        .sentence()
+        .contains("stopped at memory pressure warn or critical"));
+    let Policy::On { pressure: true, .. } = &policy else {
+        panic!("{policy:?} does not read the pressure");
+    };
+
+    DEFAULT_LEVEL.store(1, Ordering::Release);
+    let (a, beat, acts, ends) = pressured(default_level, Arc::new(AtomicBool::new(false)));
+    wait_for("actions at normal", || acts.load(Ordering::Relaxed) >= 3);
+    DEFAULT_LEVEL.store(2, Ordering::Release);
+    wait_for("the end at warn", || ends.load(Ordering::Relaxed) == 1);
+    let at_warn = acts.load(Ordering::Relaxed);
+    std::thread::sleep(Duration::from_millis(150));
+    assert!(
+        acts.load(Ordering::Relaxed) <= at_warn + 1,
+        "actions at warn"
+    );
+    assert_eq!(ends.load(Ordering::Relaxed), 1, "one end per spell");
+    let j = policy.json(&a, clock());
+    assert_eq!(j["pressure_stop"], true, "{j}");
+    assert_eq!(j["state"]["pressure"], "warn", "{j}");
+    assert_eq!(j["state"]["residency_ends"], 1, "{j}");
+    beat.stop();
+}
+
 /// The file-fed level reads the file's number and 0 when it is absent.
 #[test]
 fn the_pressure_file_is_read_each_beat() {

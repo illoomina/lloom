@@ -204,7 +204,7 @@ struct Session {
     keep: Option<Keep>,
     turns: Vec<Turn>,
     /// The latest turn's conversation, its reply message last.
-    messages: Vec<Box<str>>,
+    messages: Vec<StoredMessage>,
     /// The latest turn's prompt ids, its reply's accepted ids and the
     /// end-of-turn id where the model stopped on EOS.
     ids: Vec<u32>,
@@ -238,7 +238,7 @@ pub struct Resolved {
     pub prefix: Option<(PrefixRecord, Vec<u32>)>,
     /// The conversation through the continued turn, its reply message last
     /// (asked for by the `input` form).
-    pub messages: Option<Vec<Box<str>>>,
+    pub messages: Option<Vec<StoredMessage>>,
     /// The session's ids the engine held after the continued turn: its
     /// prompt and its reply, not the end-of-turn id after them.
     pub ids: Vec<u32>,
@@ -367,7 +367,7 @@ fn same(a: u64, b: u64) -> bool {
 /// Incoming variable-sized work is prepared before taking the table lock.
 pub struct PreparedRecord {
     ids: Vec<u32>,
-    messages: Vec<Box<str>>,
+    messages: Vec<StoredMessage>,
     turn: Turn,
     payload_bytes: usize,
 }
@@ -382,11 +382,14 @@ impl PreparedRecord {
             .messages
             .into_iter()
             .chain([rec.reply_msg])
-            .map(|v| serde_json::to_string(&v).map(String::into_boxed_str))
-            .collect::<serde_json::Result<Vec<_>>>()?;
+            .map(StoredMessage::new)
+            .collect::<Vec<_>>();
         let payload_bytes = ids.capacity() * size_of::<u32>()
-            + messages.capacity() * size_of::<Box<str>>()
-            + messages.iter().map(|v| v.as_ref().len()).sum::<usize>();
+            + messages.capacity() * size_of::<StoredMessage>()
+            + messages
+                .iter()
+                .map(StoredMessage::heap_bytes)
+                .sum::<usize>();
         let bytes =
             reply_bytes(&rec.reply) + rec.prefix.as_ref().map_or(0, PrefixRecord::retained_bytes);
         Ok(Self {
@@ -440,7 +443,7 @@ pub struct Publication {
     pub retained: bool,
     pub reason: Option<Reason>,
     _retired: Vec<Session>,
-    _replaced: Option<(Vec<u32>, Vec<Box<str>>)>,
+    _replaced: Option<(Vec<u32>, Vec<StoredMessage>)>,
     _unpublished: Option<PreparedRecord>,
 }
 
@@ -1038,5 +1041,5 @@ impl Table {
 #[path = "sessions_tests.rs"]
 mod tests;
 
-#[cfg(test)]
 mod storage;
+pub use storage::StoredMessage;

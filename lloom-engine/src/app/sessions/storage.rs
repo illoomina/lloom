@@ -1,9 +1,16 @@
 //! Capacity-visible ownership of a message, without a JSON parser roundtrip.
+//!
+//! `Number` is retained unchanged. The pinned serde_json 1.0.151 feature graph
+//! excludes `arbitrary_precision`: its Number is an inline integer/f64 enum,
+//! not a heap string (number.rs:22-36). A feature/dependency change must re-audit
+//! this assumption; the real allocator footprint and exact-value tests guard it.
+//! Array/object buffers are boxed slices; strings/keys are boxed str, so every
+//! retained allocation request is visible without estimating map internals.
 use serde_json::{Map, Number, Value};
 use std::mem::size_of;
 
 #[derive(Clone)]
-pub(super) struct StoredMessage(StoredValue);
+pub struct StoredMessage(StoredValue);
 
 #[derive(Clone)]
 enum StoredValue {
@@ -20,7 +27,8 @@ impl StoredMessage {
         Self(StoredValue::new(value))
     }
 
-    pub(super) fn value(&self) -> Value {
+    /// Reconstruct a request-owned Value outside the session table mutex.
+    pub fn value(&self) -> Value {
         self.0.value()
     }
 

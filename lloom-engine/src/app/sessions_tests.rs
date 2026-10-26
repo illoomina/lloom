@@ -1019,8 +1019,11 @@ fn assert_charge(t: &Table) {
         .map(|slot| {
             let session = slot.session.as_ref().map_or(0, |s| {
                 s.ids.capacity() * size_of::<u32>()
-                    + s.messages.capacity() * size_of::<Box<str>>()
-                    + s.messages.iter().map(|v| v.as_ref().len()).sum::<usize>()
+                    + s.messages.capacity() * size_of::<StoredMessage>()
+                    + s.messages
+                        .iter()
+                        .map(StoredMessage::heap_bytes)
+                        .sum::<usize>()
                     + s.turns.capacity() * size_of::<Turn>()
                     + s.turns
                         .iter()
@@ -1188,17 +1191,16 @@ fn prepared_messages_roundtrip_without_a_second_value_log() {
         prefix: None,
     })
     .unwrap();
-    let restored: Vec<Value> = p
-        .messages
-        .iter()
-        .map(|v| serde_json::from_str(v.as_ref()).unwrap())
-        .collect();
+    let restored: Vec<Value> = p.messages.iter().map(StoredMessage::value).collect();
     assert_eq!(&restored[..expected.len()], &expected);
     assert_eq!(
         p.payload_bytes,
         p.ids.capacity() * size_of::<u32>()
-            + p.messages.capacity() * size_of::<Box<str>>()
-            + p.messages.iter().map(|v| v.as_ref().len()).sum::<usize>()
+            + p.messages.capacity() * size_of::<StoredMessage>()
+            + p.messages
+                .iter()
+                .map(StoredMessage::heap_bytes)
+                .sum::<usize>()
     );
 }
 
@@ -1369,14 +1371,14 @@ fn stored_message_numbers_and_nested_tool_values_are_exact() {
             prefix: None,
         })
         .unwrap();
-        let restored = serde_json::from_str::<Value>(prepared.messages[0].as_ref());
-        let same = restored.as_ref().ok().is_some_and(|restored| {
+        let restored = prepared.messages[0].value();
+        let same = {
             restored["tool_calls"][0]["function"]["arguments"]["value"]
                 .as_f64()
                 .is_some_and(|actual| actual.to_bits() == value.to_bits())
-                && serde_json::to_string(restored).unwrap()
+                && serde_json::to_string(&restored).unwrap()
                     == serde_json::to_string(&message).unwrap()
-        });
+        };
         if !same {
             float_mismatches += 1;
             if examples.len() < 8 {
@@ -1399,7 +1401,7 @@ fn stored_message_numbers_and_nested_tool_values_are_exact() {
             prefix: None,
         })
         .unwrap();
-        let restored: Value = serde_json::from_str(prepared.messages[0].as_ref()).unwrap();
+        let restored = prepared.messages[0].value();
         if restored["content"]["values"][0].as_u64() != Some(value) || restored != message {
             integer_mismatches += 1;
             if examples.len() < 8 {
@@ -1640,6 +1642,64 @@ fn storage_representation_requested_footprint() {
             previous = Some((baseline, compact, masked));
             eprintln!("STORAGE-COST case={name} run={run} value_bytes={} value_blocks={} compact_bytes={} compact_blocks={} masked_bytes={} masked_blocks={}",
                 baseline.0, baseline.1, compact.0, compact.1, masked.0, masked.1);
+        }
+    }
+}
+
+#[test]
+fn retained_message_tree_allocations_are_charged_and_admitted() {
+    use std::sync::atomic::Ordering;
+    for max_bytes in [1024 * 1024, 16 * 1024] {
+        let mut t = Table::new(Config {
+            max_bytes,
+            ..cfg(1, true)
+        });
+        let ss = scopes(1);
+        let now = Instant::now();
+        let baseline = allocation_receipt::LIVE.load(Ordering::Relaxed);
+        let r = t.reserve(
+            Plan {
+                continued: None,
+                store: Some(true),
+                keep: None,
+                auth: None,
+                prompt_ids: &[1],
+                scopes: &ss,
+            },
+            now,
+        );
+        let mut text = String::with_capacity(32768);
+        text.push('x');
+        let record = PreparedRecord::new(Record {
+            messages: vec![json!({"role":"tool", "content":{
+                "values":vec![0.1f64;1024], "text":text,
+                "nested":[{"negative_zero":-0.0,"large":u64::MAX}]}})],
+            reply_msg: json!({"role":"assistant","content":"r"}),
+            prompt_ids: vec![1],
+            reply: reply(&[2]),
+            eot: None,
+            scope: ss[1],
+            prefix: None,
+        })
+        .unwrap();
+        let publication = t.publish(r, record, now);
+        let retained = publication.retained;
+        let reason = publication.reason;
+        drop(publication);
+        let live = allocation_receipt::LIVE.load(Ordering::Relaxed) - baseline;
+        eprintln!("retention message tree max_bytes={max_bytes} allocator_live_requested={live} reported={} retained={retained}", t.bytes);
+        assert!(live > 0, "allocator guard must observe retained ownership");
+        assert!(
+            live <= t.bytes as isize,
+            "message nodes/strings must not be hidden"
+        );
+        assert_charge(&t);
+        if max_bytes == 16 * 1024 {
+            assert!(!retained, "the message tree alone exceeds this budget");
+            assert_eq!(reason, Some(Reason::Budget));
+        } else {
+            assert!(retained);
+            assert_eq!(reason, None);
         }
     }
 }

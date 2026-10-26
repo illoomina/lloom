@@ -156,6 +156,20 @@ final timings event/[DONE]; the request error line carries its frontier then.
 `/health.response_drain` reports active contexts, configured bounds and named
 overload counters; context exhaustion is also a 503 request-line outcome.
 
+Streaming `timings.total_ms` keeps the endpoint's existing pre-trailer wall
+bracket. `decode_call_ms`, `response_settlement_ms`, and `response_drain_ms`
+separate generation from accepted-reply/metadata capture and subsequent drain.
+Without explicit step clocks, `predicted_ms` uses decode-call time minus
+prefill, not socket-drain time. None is a GPU-retirement witness.
+Optional first-token GPU detail is an owned summary of completed global
+recorder entries available at settlement, filtered by the first-token clock
+window; later resets cannot rewrite it, but it is neither complete retirement
+nor exclusive attribution under concurrent execution. Disabled diagnostics add
+no record read or profiling allocation. The row-launch diagnostic is explicitly
+process-cumulative at report time. `/health.reuse` likewise aggregates reported
+requests in report order (failed drains can omit one); its `last` is not the
+session occupant or a readiness certificate.
+
 These are response-context/backlog limits, not a process-memory, request-body,
 connection-thread, or wall-clock drain guarantee. An indefinitely stalled legacy
 writer can retain one of the eight contexts. Explicit controlled transport

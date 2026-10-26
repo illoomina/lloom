@@ -22,6 +22,7 @@ enum Case {
     LongReply,
     LateFailure,
     BacklogRefusal,
+    LateMetadataFailure,
 }
 #[derive(Default)]
 struct Wire {
@@ -31,6 +32,8 @@ struct Wire {
     failures: usize,
     decoded: bool,
     model_entries: usize,
+    metadata_calls: usize,
+    metadata_before_publication: Option<std::sync::Weak<Shared>>,
 }
 #[derive(Clone, Default)]
 struct Progress(Arc<(ParkingMutex<Wire>, Condvar)>);
@@ -164,6 +167,23 @@ impl Served for Scripted {
     fn bos_id(&self) -> Option<u32> {
         None
     }
+    fn vision_report_checked(&self) -> Result<Value> {
+        let before = {
+            let (lock, _) = &*self.progress.0;
+            let mut wire = lock.lock();
+            wire.metadata_calls += 1;
+            wire.metadata_before_publication.clone()
+        };
+        if let Some(shared) = before.and_then(|weak| weak.upgrade()) {
+            assert_eq!(shared.sessions.lock().json()["turns"], 0,
+                "request-bound metadata capture must precede publication");
+        }
+        if matches!(self.case, Case::LateMetadataFailure) {
+            anyhow::bail!("scripted checked metadata refusal");
+        }
+        Ok(Value::Null)
+    }
+
     fn health(&self) -> Value {
         Value::Null
     }
@@ -1407,4 +1427,312 @@ fn a_refused_whole_fragment_cannot_enter_the_raw_frontier_or_stored_message() {
     assert!(std::str::from_utf8(&wire.committed)
         .unwrap()
         .contains("[DONE]"));
+}
+
+#[test]
+fn checked_metadata_is_captured_before_publication_but_its_error_is_deferred() {
+    for stream in [false, true] {
+        let progress = Progress::default();
+        let shared = scripted_shared_with_progress(Case::LateMetadataFailure, progress.clone());
+        progress.0 .0.lock().metadata_before_publication = Some(Arc::downgrade(&shared));
+        let built = chat_completions(
+            &shared,
+            &json!({"messages":[{"role":"user","content":"first"}],"stream":stream,"store":true,"max_tokens":3}),
+            None,
+        );
+        if stream {
+            let Reply::Stream(run) = built.ok().expect("stream builds before decode") else {
+                panic!("stream requested")
+            };
+            let id = run.id.clone();
+            let error = stream_response_with_writer(&shared, *run, || {
+                Ok(ChunkedWriter {
+                    w: Box::new(Writer {
+                        progress: progress.clone(),
+                        pending: Vec::new(),
+                        fail_delta: None,
+                    }),
+                })
+            })
+            .unwrap_err()
+            .to_string();
+            assert!(
+                error.contains("scripted checked metadata refusal"),
+                "{error}"
+            );
+            let saved = shared
+                .sessions
+                .lock()
+                .resolve(&id, None, true, Instant::now())
+                .unwrap();
+            let message = saved.messages.unwrap().pop().unwrap();
+            assert_eq!(message["reasoning_content"], "a");
+            assert_eq!(message["content"], "X");
+            let wire = progress.0 .0.lock();
+            assert!(std::str::from_utf8(&wire.committed)
+                .unwrap()
+                .contains("scripted checked metadata refusal"));
+            assert!(!std::str::from_utf8(&wire.committed)
+                .unwrap()
+                .contains("[DONE]"));
+            assert!(wire.events.iter().all(|e| e.get("timings").is_none()));
+        } else {
+            let Err(Failure::Internal(error)) = built else {
+                panic!("checked metadata error is deferred until after publication")
+            };
+            assert!(error
+                .to_string()
+                .contains("scripted checked metadata refusal"));
+        }
+        assert_eq!(
+            shared.sessions.lock().json()["turns"],
+            1,
+            "captured Err does not erase accepted lineage"
+        );
+        assert_eq!(shared.front.reply("a</think>X").unwrap().text, "a</think>X");
+        assert_eq!(progress.0 .0.lock().metadata_calls, 1);
+    }
+}
+
+#[test]
+fn stream_timing_brackets_exclude_socket_drain_from_decode_pace() {
+    let shared = scripted_shared(Case::CompleteMarker);
+    let mut decoded = run_decode_observed(
+        shared.engine.as_ref(),
+        &[],
+        &[],
+        &DecodeParams::default(),
+        None,
+        &mut |_| true,
+    )
+    .unwrap();
+    decoded.stats.prefill_ns = 2_000_000;
+    let times = StreamTimes {
+        decode: Duration::from_millis(10),
+        settled: Duration::from_millis(12),
+        total: Duration::from_millis(1012),
+    };
+    let report = stream_timings(
+        shared.engine.as_ref(),
+        3,
+        &PromptFacts::default(),
+        &decoded,
+        times,
+    );
+    assert_eq!(report["total_ms"], 1012.0);
+    assert_eq!(report["decode_call_ms"], 10.0);
+    assert_eq!(report["response_settlement_ms"], 2.0);
+    assert_eq!(report["response_drain_ms"], 1000.0);
+    assert_eq!(report["predicted_ms"], 8.0);
+    assert_eq!(report["predicted_per_second"], 375.0);
+    decoded.stats.step_ns = vec![1_000_000, 2_000_000];
+    let explicit = stream_timings(
+        shared.engine.as_ref(),
+        3,
+        &PromptFacts::default(),
+        &decoded,
+        times,
+    );
+    assert_eq!(
+        explicit["predicted_ms"], 3.0,
+        "explicit step clocks remain authoritative"
+    );
+    assert_eq!(explicit["total_ms"], 1012.0);
+}
+
+#[test]
+fn delayed_a_completion_cannot_rewrite_published_b_or_distinct_c_residency() {
+    struct PausedWriter {
+        entered: Option<std::sync::mpsc::Sender<()>>,
+        released: std::sync::mpsc::Receiver<()>,
+        bytes: Arc<ParkingMutex<Vec<u8>>>,
+    }
+    impl Write for PausedWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.bytes.lock().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            if let Some(entered) = self.entered.take() {
+                entered.send(()).unwrap();
+                self.released
+                    .recv_timeout(Duration::from_secs(5))
+                    .map_err(|e| io::Error::new(io::ErrorKind::TimedOut, e.to_string()))?;
+            }
+            Ok(())
+        }
+    }
+    struct Cleanup {
+        release: Option<std::sync::mpsc::Sender<()>>,
+        thread: Option<std::thread::JoinHandle<Result<()>>>,
+    }
+    impl Cleanup {
+        fn finish(&mut self) -> Result<()> {
+            self.release
+                .take()
+                .unwrap()
+                .send(())
+                .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+            self.thread
+                .take()
+                .unwrap()
+                .join()
+                .map_err(|_| anyhow::anyhow!("A response thread panicked"))?
+        }
+    }
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            if let Some(release) = self.release.take() {
+                let _ = release.send(());
+            }
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+        }
+    }
+    fn publish(shared: &Shared, body: Value) -> String {
+        let turn = shared.turns.take();
+        let Reply::Stream(run) = chat_completions(shared, &body, None)
+            .ok()
+            .expect("request built")
+        else {
+            panic!("stream requested")
+        };
+        if body.get("previous_response_id").is_some() {
+            assert!(run.facts.spliced.bound > 0, "B binds A by its response ID");
+        }
+        let id = run.id.clone();
+        stream_response_settlement(
+            shared,
+            *run,
+            || {
+                Ok(ChunkedWriter {
+                    w: Box::new(std::io::sink()),
+                })
+            },
+            || drop(turn),
+        )
+        .unwrap();
+        id
+    }
+    let shared = scripted_shared(Case::CompleteMarker);
+    let bytes = Arc::new(ParkingMutex::new(Vec::new()));
+    let (entered, entry) = std::sync::mpsc::channel();
+    let (release, released) = std::sync::mpsc::channel();
+    let (sent_id, got_id) = std::sync::mpsc::channel();
+    let (settled, got_settled) = std::sync::mpsc::channel();
+    let first_shared = shared.clone();
+    let first_bytes = bytes.clone();
+    let first = std::thread::spawn(move || {
+        let turn = first_shared.turns.take();
+        let Reply::Stream(run) = chat_completions(&first_shared,
+            &json!({"messages":[{"role":"user","content":"A"}],"stream":true,"store":true,"max_tokens":3}), None)
+            .ok().expect("A built") else { panic!("stream requested") };
+        sent_id.send(run.id.clone()).unwrap();
+        stream_response_settlement(
+            &first_shared,
+            *run,
+            || {
+                Ok(ChunkedWriter {
+                    w: Box::new(PausedWriter {
+                        entered: Some(entered),
+                        released,
+                        bytes: first_bytes,
+                    }),
+                })
+            },
+            || {
+                drop(turn);
+                settled.send(()).unwrap();
+            },
+        )
+    });
+    let mut cleanup = Cleanup {
+        release: Some(release),
+        thread: Some(first),
+    };
+    let id_a = got_id.recv_timeout(Duration::from_secs(5)).unwrap();
+    entry.recv_timeout(Duration::from_secs(5)).unwrap();
+    got_settled.recv_timeout(Duration::from_secs(5)).unwrap();
+    let id_b = publish(
+        &shared,
+        json!({"previous_response_id":id_a.clone(),"input":"B","stream":true,"max_tokens":3}),
+    );
+    let id_c = publish(
+        &shared,
+        json!({"messages":[{"role":"user","content":"independent C"}],"stream":true,"store":true,"max_tokens":3}),
+    );
+    let before_b = shared
+        .sessions
+        .lock()
+        .resolve(&id_b, None, true, Instant::now())
+        .unwrap();
+    let before_c = shared
+        .sessions
+        .lock()
+        .resolve(&id_c, None, true, Instant::now())
+        .unwrap();
+    assert_ne!(before_b.key, before_c.key, "C is a distinct lineage");
+    assert_eq!(before_b.resident, Some(false));
+    assert_eq!(before_c.resident, Some(true));
+    let b_messages = before_b.messages.unwrap();
+    let c_messages = before_c.messages.unwrap();
+    assert_eq!(b_messages.len(), 4);
+    assert_eq!(c_messages.len(), 2);
+    for message in [b_messages.last().unwrap(), c_messages.last().unwrap()] {
+        assert_eq!(message["reasoning_content"], "a");
+        assert_eq!(message["content"], "X");
+    }
+    cleanup.finish().unwrap();
+    let after_b = shared
+        .sessions
+        .lock()
+        .resolve(&id_b, None, true, Instant::now())
+        .unwrap();
+    let after_c = shared
+        .sessions
+        .lock()
+        .resolve(&id_c, None, true, Instant::now())
+        .unwrap();
+    assert_eq!(after_b.messages.unwrap(), b_messages);
+    assert_eq!(after_c.messages.unwrap(), c_messages);
+    assert_eq!(after_b.ids, before_b.ids);
+    assert_eq!(after_c.ids, before_c.ids);
+    assert_eq!(after_b.resident, Some(false));
+    assert_eq!(
+        after_c.resident,
+        Some(true),
+        "late A drain cannot overwrite C's occupant witness"
+    );
+    let wire = String::from_utf8(bytes.lock().clone()).unwrap();
+    let events: Vec<Value> = wire
+        .split("data: ")
+        .skip(1)
+        .filter_map(|s| {
+            let payload = s.split_once("\n\n").unwrap().0;
+            (payload != "[DONE]").then(|| serde_json::from_str(payload).unwrap())
+        })
+        .collect();
+    let last = events.iter().find(|e| e.get("timings").is_some()).unwrap();
+    assert_eq!(last["id"], id_a);
+    assert_eq!(
+        last["timings"]["session"]["id"], id_a,
+        "A's wire metadata remains A's captured publication"
+    );
+    let t = &last["timings"];
+    let total = t["total_ms"].as_f64().unwrap();
+    let decode = t["decode_call_ms"].as_f64().unwrap();
+    let capture = t["response_settlement_ms"].as_f64().unwrap();
+    let drain = t["response_drain_ms"].as_f64().unwrap();
+    assert!(
+        drain > 0.0,
+        "the held writer remains in the endpoint bracket"
+    );
+    assert!((total - (decode + capture + drain)).abs() < 1e-6);
+    assert!(wire.contains("[DONE]"));
+    eprintln!(
+        "BRANCH_CUSTODY saved_b_messages={} saved_c_messages={} c_resident_after_a=true",
+        b_messages.len(),
+        c_messages.len()
+    );
 }

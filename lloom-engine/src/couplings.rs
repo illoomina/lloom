@@ -824,6 +824,16 @@ mod tests {
 #[cfg(test)]
 mod response_coupling_tests {
     #[test]
+    fn additive_coupling_entries_keep_distinct_identifiers() {
+        let ids: std::collections::BTreeSet<_> = super::COUPLINGS.iter().map(|c| c.id).collect();
+        assert_eq!(
+            ids.len(),
+            super::COUPLINGS.len(),
+            "keep-both additive merges must also keep unique coupling IDs"
+        );
+    }
+
+    #[test]
     fn response_explain_names_configured_limits_and_each_distinct_outcome() {
         let mut options = crate::options::EngineOptions::default();
         options.server.response = crate::options::ServerResponseConfig {

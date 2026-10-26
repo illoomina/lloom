@@ -1088,46 +1088,107 @@ impl FirstToken {
 /// the command buffers committed between the decode's entry and the first
 /// fragment, on the stamps' clock — when the GPU started, how much of the
 /// window it was busy, and what it sat idle.
-#[cfg(feature = "metal")]
-fn first_token_gpu(endpoint: &str, first: &FirstToken) {
-    use lloom_tensor::kernels::metal::profile;
-    if !profile::recorder_enabled() || first.decode == 0 || first.fragment == 0 {
-        return;
-    }
+#[cfg(any(feature = "metal", test))]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct FirstGpuSnapshot {
+    enabled: bool,
+    summary: Option<FirstGpuSummary>,
+}
+
+#[cfg(any(feature = "metal", test))]
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct FirstGpuSummary {
+    buffers: usize,
+    first_commit_us: f64,
+    first_start_us: f64,
+    busy_us: f64,
+    idle_us: f64,
+    last_end_us: f64,
+    fragment_us: f64,
+}
+
+/// Completed records available at capture, not a native completion witness.
+#[cfg(any(feature = "metal", test))]
+fn summarize_first_gpu(
+    first: &FirstToken,
+    records: impl IntoIterator<Item = (f64, f64, f64)>,
+) -> FirstGpuSnapshot {
     let (from, to) = (first.decode as f64 * 1e-9, first.fragment as f64 * 1e-9);
-    let mut cbs: Vec<profile::GpuInterval> = Vec::new();
+    let mut intervals = Vec::new();
     let mut commit0 = f64::INFINITY;
-    for r in profile::command_buffer_records() {
-        if r.committed >= from && r.interval.start <= to {
-            commit0 = commit0.min(r.committed);
-            cbs.push(r.interval);
+    for (committed, start, end) in records {
+        if committed >= from && start <= to {
+            commit0 = commit0.min(committed);
+            intervals.push((start, end));
         }
     }
-    let Some(start0) = cbs.iter().map(|i| i.start).min_by(f64::total_cmp) else {
-        eprintln!("[first-token gpu: {endpoint} buffers=0]");
-        return;
+    let Some(start0) = intervals.iter().map(|i| i.0).min_by(f64::total_cmp) else {
+        return FirstGpuSnapshot {
+            enabled: true,
+            summary: None,
+        };
     };
-    cbs.sort_by(|a, b| a.start.total_cmp(&b.start));
+    intervals.sort_by(|a, b| a.0.total_cmp(&b.0));
     let (mut busy, mut reach) = (0.0f64, start0);
-    for i in &cbs {
-        let (s, e) = (i.start.max(reach), i.end.min(to));
+    for &(start, end) in &intervals {
+        let (s, e) = (start.max(reach), end.min(to));
         if e > s {
             busy += e - s;
         }
-        reach = reach.max(i.end.min(to));
+        reach = reach.max(end.min(to));
     }
-    let last_end = cbs.iter().map(|i| i.end).fold(f64::MIN, f64::max);
+    let last_end = intervals.iter().map(|i| i.1).fold(f64::MIN, f64::max);
     let rel = |t: f64| (t - first.recv as f64 * 1e-9) * 1e6;
+    FirstGpuSnapshot {
+        enabled: true,
+        summary: Some(FirstGpuSummary {
+            buffers: intervals.len(),
+            first_commit_us: rel(commit0),
+            first_start_us: rel(start0),
+            busy_us: busy * 1e6,
+            idle_us: (to - start0 - busy).max(0.0) * 1e6,
+            last_end_us: rel(last_end),
+            fragment_us: rel(to),
+        }),
+    }
+}
+
+#[cfg(feature = "metal")]
+fn capture_first_token_gpu(first: &FirstToken) -> FirstGpuSnapshot {
+    use lloom_tensor::kernels::metal::profile;
+    // In optimized shipping PROFILE_INSTRUMENTS is false: no record read,
+    // allocation, synchronization or wait occurs on this disabled path.
+    if !profile::recorder_enabled() || first.decode == 0 || first.fragment == 0 {
+        return FirstGpuSnapshot::default();
+    }
+    summarize_first_gpu(
+        first,
+        profile::command_buffer_records()
+            .into_iter()
+            .map(|r| (r.committed, r.interval.start, r.interval.end)),
+    )
+}
+
+#[cfg(feature = "metal")]
+fn first_token_gpu(endpoint: &str, captured: FirstGpuSnapshot) {
+    if !captured.enabled {
+        return;
+    }
+    let Some(s) = captured.summary else {
+        eprintln!("[first-token gpu: {endpoint} buffers=0 scope=completed-records-at-settlement]");
+        return;
+    };
     eprintln!(
         "[first-token gpu: {endpoint} buffers={} first_commit_us={:.0} first_start_us={:.0} \
-         busy_us={:.0} idle_us={:.0} last_end_us={:.0} fragment_us={:.0}]",
-        cbs.len(),
-        rel(commit0),
-        rel(start0),
-        busy * 1e6,
-        (to - start0 - busy).max(0.0) * 1e6,
-        rel(last_end),
-        rel(to),
+         busy_us={:.0} idle_us={:.0} last_end_us={:.0} fragment_us={:.0} \
+         scope=completed-records-at-settlement]",
+        s.buffers,
+        s.first_commit_us,
+        s.first_start_us,
+        s.busy_us,
+        s.idle_us,
+        s.last_end_us,
+        s.fragment_us,
     );
 }
 
@@ -1929,6 +1990,7 @@ fn chat_completions(shared: &Shared, v: &Value, auth: Option<[u8; 32]>) -> Handl
         append_fields(&mut routed, p.lock().finish());
     }
     let elapsed = started.elapsed();
+    let vision = shared.engine.vision_report_checked();
     let record_start = Instant::now();
     let logged = prompt.as_ref().map(|p| {
         shared
@@ -2008,7 +2070,7 @@ fn chat_completions(shared: &Shared, v: &Value, auth: Option<[u8; 32]>) -> Handl
             }
         }
     }
-    attach_vision(shared, &mut body)?;
+    attach_vision(&mut body, vision)?;
     Ok(Reply::Json(body))
 }
 
@@ -2852,6 +2914,7 @@ fn stream_response_settlement(
             },
         )
     };
+    let decode_elapsed = started.elapsed();
     let written = sw.written();
     let first_write = sw.first_write();
     let backlog_limited = sw.backlog_limited.load(Ordering::Relaxed);
@@ -2884,6 +2947,12 @@ fn stream_response_settlement(
             return finish_stream_error(w, error);
         }
     };
+    let vision = match run.kind {
+        StreamKind::Chat => shared.engine.vision_report_checked(),
+        StreamKind::Completion => Ok(Value::Null),
+    };
+    #[cfg(feature = "metal")]
+    let first_gpu = capture_first_token_gpu(&first);
     // The accepted history is what the server handed the writer; of that,
     // what it knows it wrote, and whether a write failed (what the client
     // received is not known either way).
@@ -2922,13 +2991,10 @@ fn stream_response_settlement(
         }
         None => (Value::Null, String::new()),
     };
-    // Request checkout and callbacks have returned, and publication is complete.
-    // Device/native retirement remains the owner's existing contract, not a
-    // socket-drain witness. Capture mutable request metadata before release.
-    let vision = match run.kind {
-        StreamKind::Chat => shared.engine.vision_report_checked(),
-        StreamKind::Completion => Ok(Value::Null),
-    };
+    // Request checkout and callbacks have returned, metadata is captured,
+    // and publication is complete. Native retirement remains the owner's
+    // existing contract, not a socket-drain or profiler-snapshot witness.
+    let settlement_elapsed = started.elapsed();
     settled();
     let (mut w, mut write_err) = sw.finish()?;
     first.written = first_write.load(Ordering::Acquire);
@@ -2978,7 +3044,7 @@ fn stream_response_settlement(
         &session_line,
     );
     #[cfg(feature = "metal")]
-    first_token_gpu(endpoint, &first);
+    first_token_gpu(endpoint, first_gpu);
     let usage = run_usage(shared.engine.as_ref(), run.prompt_ids.len(), &decoded);
     let last = match run.kind {
         StreamKind::Completion => json!({
@@ -2986,13 +3052,15 @@ fn stream_response_settlement(
             "choices": [{ "index": 0, "text": "", "logprobs": null,
                           "finish_reason": finish_reason(decoded.stop) }],
             "usage": usage,
-            "timings": timings(shared.engine.as_ref(), run.prompt_ids.len(), &run.facts, &decoded, elapsed),
+            "timings": stream_timings(shared.engine.as_ref(), run.prompt_ids.len(), &run.facts, &decoded,
+                StreamTimes { decode: decode_elapsed, settled: settlement_elapsed, total: elapsed }),
         }),
         StreamKind::Chat => json!({
             "id": run.id, "object": "chat.completion.chunk", "created": created, "model": run.model,
             "choices": [{ "index": 0, "delta": {}, "finish_reason": finish_reason(decoded.stop) }],
             "usage": usage,
-            "timings": timings(shared.engine.as_ref(), run.prompt_ids.len(), &run.facts, &decoded, elapsed),
+            "timings": stream_timings(shared.engine.as_ref(), run.prompt_ids.len(), &run.facts, &decoded,
+                StreamTimes { decode: decode_elapsed, settled: settlement_elapsed, total: elapsed }),
         }),
     };
     let mut last = last;
@@ -3008,14 +3076,7 @@ fn stream_response_settlement(
         last["choices"][0]["token_ids"] = json!(decoded.tokens);
         last["timings"]["tokens"] = json!(decoded.tokens);
     }
-    write_stream_trailer(w, &mut last, |body| {
-        let vision = vision?;
-        if !vision.is_null() {
-            eprintln!("[vision: {vision}]");
-            body["vision"] = vision;
-        }
-        Ok(())
-    })
+    write_stream_trailer(w, &mut last, |body| attach_vision(body, vision))
 }
 
 /// Post-header completion: checked metadata refusal propagates as a stream
@@ -3973,8 +4034,8 @@ fn short_id() -> String {
 /// The per-request vision report (`Served::vision_report`: the model's
 /// tensors, whether the tower is loaded, the image census) as a `vision`
 /// field beside `timings`, and on stderr. Nothing for a family without vision.
-fn attach_vision(shared: &Shared, body: &mut Value) -> Result<()> {
-    let report = shared.engine.vision_report_checked()?;
+fn attach_vision(body: &mut Value, report: Result<Value>) -> Result<()> {
+    let report = report?;
     if !report.is_null() {
         eprintln!("[vision: {report}]");
         body["vision"] = report;
@@ -4007,6 +4068,38 @@ fn usage(prompt: usize, completion: usize) -> Value {
 /// and those ids are text the client never received.
 fn run_usage(engine: &dyn Served, prompt: usize, d: &Decoded) -> Value {
     usage(prompt, delivered_ids(engine, d))
+}
+
+#[derive(Clone, Copy)]
+struct StreamTimes {
+    decode: std::time::Duration,
+    settled: std::time::Duration,
+    total: std::time::Duration,
+}
+
+/// Keep endpoint total through pre-trailer drain; derive decode pace only
+/// from the decode call (or explicit per-step clocks), not the socket delay.
+fn stream_timings(
+    engine: &dyn Served,
+    prompt: usize,
+    facts: &PromptFacts,
+    d: &Decoded,
+    times: StreamTimes,
+) -> Value {
+    let mut t = timings(engine, prompt, facts, d, times.total);
+    if d.stats.step_ns.is_empty() {
+        let predicted_ms = (ms(times.decode) - d.stats.prefill_ns as f64 / 1e6).max(0.0);
+        t["predicted_ms"] = json!(predicted_ms);
+        t["predicted_per_second"] = json!(if predicted_ms > 0.0 {
+            d.tokens.len() as f64 / (predicted_ms / 1e3)
+        } else {
+            0.0
+        });
+    }
+    t["decode_call_ms"] = json!(ms(times.decode));
+    t["response_settlement_ms"] = json!(ms(times.settled.saturating_sub(times.decode)));
+    t["response_drain_ms"] = json!(ms(times.total.saturating_sub(times.settled)));
+    t
 }
 
 /// The engine's own brackets beside the request's wall clock: the prompt's
@@ -4147,7 +4240,7 @@ fn report_with(
                 && lloom_tensor::tuning::f16_rows_max().is_some() =>
         {
             format!(
-                " f16_rows_decode_launches={}",
+                " f16_rows_decode_launches={} f16_rows_decode_scope=process-cumulative-at-report",
                 lloom_tensor::tuning::f16_rows_decode_launches()
             )
         }
@@ -5163,7 +5256,7 @@ mod delivered_field_tests {
             unsafe { System.dealloc(ptr, layout) }
         }
     }
-    fn counted<T>(run: impl FnOnce() -> T) -> (T, usize) {
+    pub(super) fn counted<T>(run: impl FnOnce() -> T) -> (T, usize) {
         struct Reset;
         impl Drop for Reset {
             fn drop(&mut self) {
@@ -6258,3 +6351,104 @@ mod ready_configuration_tests {
 #[cfg(test)]
 #[path = "serve_stream_tail_tests.rs"]
 mod stream_tail_tests;
+
+#[cfg(test)]
+mod response_snapshot_tests {
+    use super::*;
+
+    #[test]
+    fn completed_record_summary_is_owned_before_a_later_recorder_reset() {
+        let first = FirstToken {
+            recv: 1_000_000_000,
+            decode: 1_000_000_000,
+            fragment: 4_000_000_000,
+            ..Default::default()
+        };
+        let mut records = vec![(1.0, 1.0, 2.0), (1.5, 2.0, 3.0)];
+        let saved = summarize_first_gpu(&first, records.iter().copied());
+        records.clear();
+        assert_eq!(
+            saved,
+            FirstGpuSnapshot {
+                enabled: true,
+                summary: Some(FirstGpuSummary {
+                    buffers: 2,
+                    first_commit_us: 0.0,
+                    first_start_us: 0.0,
+                    busy_us: 2_000_000.0,
+                    idle_us: 1_000_000.0,
+                    last_end_us: 2_000_000.0,
+                    fragment_us: 3_000_000.0,
+                })
+            }
+        );
+        assert_eq!(
+            summarize_first_gpu(&first, records),
+            FirstGpuSnapshot {
+                enabled: true,
+                summary: None
+            }
+        );
+    }
+}
+
+// Host metadata only: no Device, model, command buffer, wait or GPU dispatch.
+#[cfg(all(test, feature = "metal"))]
+mod gpu_snapshot_host_tests {
+    use super::*;
+    use lloom_tensor::kernels::metal::profile;
+
+    fn first() -> FirstToken {
+        FirstToken {
+            recv: 1_000_000_000,
+            decode: 1_000_000_000,
+            fragment: 4_000_000_000,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn actual_recorder_reset_cannot_change_the_saved_completed_record_summary() {
+        let mut tuning = lloom_tensor::tuning::Tuning::default();
+        tuning.instrument.profile = true;
+        lloom_tensor::tuning::install(tuning).unwrap();
+        profile::reset();
+        profile::record_command_buffer(1.0, 2.0, 1.0, 0);
+        profile::record_command_buffer(2.0, 3.0, 1.5, 1);
+        let saved = capture_first_token_gpu(&first());
+        if profile::recorder_enabled() {
+            assert_eq!(profile::command_buffer_records().len(), 2);
+            assert_eq!(saved.summary.unwrap().buffers, 2);
+            assert_eq!(saved.summary.unwrap().busy_us, 2_000_000.0);
+            profile::reset();
+            assert!(profile::command_buffer_records().is_empty());
+            assert_eq!(saved.summary.unwrap().buffers, 2);
+            assert_eq!(capture_first_token_gpu(&first()).summary, None);
+        } else {
+            assert_eq!(
+                saved,
+                FirstGpuSnapshot::default(),
+                "shipping has no detailed recorder"
+            );
+        }
+    }
+
+    #[test]
+    fn disabled_snapshot_capture_reads_no_records_and_allocates_nothing() {
+        let tuning = lloom_tensor::tuning::Tuning::default();
+        assert!(!tuning.instrument.profile);
+        lloom_tensor::tuning::install(tuning).unwrap();
+        assert_eq!(
+            capture_first_token_gpu(&first()),
+            FirstGpuSnapshot::default()
+        );
+        let (positive, observed) =
+            delivered_field_tests::counted(|| std::hint::black_box(Vec::<u8>::with_capacity(1024)));
+        assert!(observed >= 1024);
+        drop(positive);
+        let (saved, bytes) = delivered_field_tests::counted(|| capture_first_token_gpu(&first()));
+        assert_eq!(saved, FirstGpuSnapshot::default());
+        assert_eq!(bytes, 0);
+        eprintln!("DISABLED_GPU_SNAPSHOT requested_allocation_bytes={bytes}");
+    }
+}

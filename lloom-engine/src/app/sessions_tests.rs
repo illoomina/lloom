@@ -1670,10 +1670,16 @@ fn retained_message_tree_allocations_are_charged_and_admitted() {
         );
         let mut text = String::with_capacity(32768);
         text.push('x');
+        assert!(text.capacity() >= 32768);
+        let mut message = json!({"role":"tool", "content":{
+            "values":vec![0.1f64;1024], "text":null,
+            "nested":[{"negative_zero":-0.0,"large":u64::MAX}]}});
+        // json!(text) borrows and clones: it would leave an external 32768-byte
+        // fixture allocation live in this table-only measurement window.
+        // Move the actual spare-capacity input into table preparation instead.
+        message["content"]["text"] = Value::String(text);
         let record = PreparedRecord::new(Record {
-            messages: vec![json!({"role":"tool", "content":{
-                "values":vec![0.1f64;1024], "text":text,
-                "nested":[{"negative_zero":-0.0,"large":u64::MAX}]}})],
+            messages: vec![message],
             reply_msg: json!({"role":"assistant","content":"r"}),
             prompt_ids: vec![1],
             reply: reply(&[2]),

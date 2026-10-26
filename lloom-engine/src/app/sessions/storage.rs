@@ -37,6 +37,16 @@ impl StoredMessage {
     }
 }
 
+/// Convert a detached, owned lookup snapshot to request/test JSON. Like
+/// `StoredMessage::value`, call this only after releasing the table mutex.
+/// Delegating preserves the same Number/key/order semantics; no retained
+/// second history or native/device owner is introduced.
+impl From<StoredMessage> for Value {
+    fn from(message: StoredMessage) -> Self {
+        message.value()
+    }
+}
+
 impl StoredValue {
     fn new(value: Value) -> Self {
         match value {

@@ -1853,3 +1853,98 @@ fn released_only_history_enforces_bytes_before_the_count_limit() {
         );
     }
 }
+
+#[test]
+fn owned_message_snapshot_converts_after_unlock_and_original_release() {
+    let table = parking_lot::Mutex::new(Table::new(cfg(1, true)));
+    let now = Instant::now();
+    let ss = scopes(1);
+    let message = json!({"role":"user","content":{"tool_args":{
+        "floats":[-0.0, f64::from_bits(1), 51.248178375505404],
+        "integers":[u64::MAX, i64::MIN], "other":[true,null,"π\\\"\n"]}}});
+    let response = json!({"role":"assistant","content":"r"});
+    let expected = vec![message.clone(), response.clone()];
+    let id = {
+        let mut guard = table.lock();
+        let r = guard.reserve(
+            Plan {
+                continued: None,
+                store: Some(true),
+                keep: None,
+                auth: None,
+                prompt_ids: &[1],
+                scopes: &ss,
+            },
+            now,
+        );
+        let prepared = PreparedRecord::new(Record {
+            messages: vec![message],
+            reply_msg: response,
+            prompt_ids: vec![1],
+            reply: reply(&[2]),
+            eot: None,
+            scope: ss[1],
+            prefix: None,
+        })
+        .unwrap();
+        let publication = guard.publish(r, prepared, now);
+        assert!(publication.retained);
+        drop(publication);
+        r.id
+    };
+    let snapshot = {
+        let mut guard = table.lock();
+        guard
+            .resolve(&id.encode(), None, true, now)
+            .unwrap()
+            .messages
+            .unwrap()
+    };
+    assert!(table.try_lock().is_some(), "lookup guard must be gone");
+    {
+        let mut guard = table.lock();
+        guard.delete(&id.encode(), None, now).unwrap();
+        assert!(
+            guard.get(id.key).is_none(),
+            "the original stored history is gone"
+        );
+        assert_charge(&guard);
+    }
+    let borrowed: Vec<Value> = snapshot.iter().map(StoredMessage::value).collect();
+    let owned: Vec<Value> = snapshot
+        .into_iter()
+        .map(|message| {
+            let unlocked = table.try_lock();
+            assert!(
+                unlocked.is_some(),
+                "conversion happens after lookup/delete unlock"
+            );
+            drop(unlocked);
+            Into::<Value>::into(message)
+        })
+        .collect();
+    assert_eq!(
+        serde_json::to_string(&borrowed).unwrap(),
+        serde_json::to_string(&expected).unwrap()
+    );
+    assert_eq!(
+        serde_json::to_string(&owned).unwrap(),
+        serde_json::to_string(&expected).unwrap()
+    );
+    for (i, expected) in [-0.0, f64::from_bits(1), 51.248178375505404]
+        .into_iter()
+        .enumerate()
+    {
+        assert_eq!(
+            owned[0]["content"]["tool_args"]["floats"][i]
+                .as_f64()
+                .unwrap()
+                .to_bits(),
+            expected.to_bits()
+        );
+    }
+    assert_eq!(
+        owned[0]["content"]["tool_args"]["integers"][0].as_u64(),
+        Some(u64::MAX)
+    );
+}

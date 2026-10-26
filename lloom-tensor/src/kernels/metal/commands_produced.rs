@@ -87,6 +87,9 @@ impl HostInputArm {
 pub(super) struct Input {
     event: Retained<ProtocolObject<dyn MTLSharedEvent>>,
     value: u64,
+    /// When it was gated, in the queue's gating order (0: not a gate's); a
+    /// merged input keeps the earliest.
+    seq: u64,
 }
 
 impl Input {
@@ -97,7 +100,11 @@ impl Input {
         // SAFETY: the borrowed event is live; the retain keeps it for the gate.
         let event = unsafe { Retained::retain(std::ptr::from_ref(event).cast_mut()) }
             .ok_or(MetalKernelError::QueueUnavailable("event retain refused"))?;
-        Ok(Self { event, value })
+        Ok(Self {
+            event,
+            value,
+            seq: 0,
+        })
     }
 
     fn produced(&self) -> bool {
@@ -150,11 +157,14 @@ impl Gate {
         }
     }
 
-    /// An input the cancellation covers: on its event, above the value it
-    /// found produced and at or below its bound.
+    /// An input the cancellation covers: gated before it was asked for, on
+    /// its event, above the value it found produced and at or below its
+    /// bound. A cancellation applied late takes nothing gated since.
     fn covered_by(&self, cancel: &Cancel) -> bool {
         self.inputs.iter().flatten().any(|input| {
-            input.is_on(&cancel.event)
+            input.seq != 0
+                && input.seq <= cancel.gated_through
+                && input.is_on(&cancel.event)
                 && input.value > cancel.produced
                 && input.value <= cancel.upto
         })
@@ -286,13 +296,14 @@ enum Pending {
 }
 
 /// A cancellation asked for and not yet applied: every held recording with
-/// an input on `event` above `produced` (the event's value when it was asked
-/// for) and at or below `upto`, everything behind it, and the current
-/// recording.
+/// an input gated by then (`gated_through`) on `event`, above `produced`
+/// (the event's value when it was asked for) and at or below `upto`,
+/// everything behind it, and the current recording.
 pub(super) struct Cancel {
     event: Retained<ProtocolObject<dyn MTLSharedEvent>>,
     produced: u64,
     upto: u64,
+    gated_through: u64,
     reason: &'static str,
 }
 
@@ -331,6 +342,8 @@ pub(super) struct ProducedState {
     cancel_pending: AtomicBool,
     cancels: parking_lot::Mutex<Vec<Cancel>>,
     cancels_delegated: AtomicU64,
+    /// Inputs gated so far: an input's `seq`, a cancellation's bound.
+    gated: AtomicU64,
     late_logged: AtomicBool,
     /// The event and highest value of the last cancellation.
     cancelled_event: AtomicUsize,
@@ -362,6 +375,7 @@ impl ProducedState {
             cancel_pending: AtomicBool::new(false),
             cancels: parking_lot::Mutex::new(Vec::new()),
             cancels_delegated: AtomicU64::new(0),
+            gated: AtomicU64::new(0),
             late_logged: AtomicBool::new(false),
             cancelled_event: AtomicUsize::new(0),
             cancelled_upto: AtomicU64::new(0),
@@ -883,7 +897,8 @@ impl Commands {
         if !pristine || state.gate.is_full() {
             self.cut_locked(&mut state, 0)?;
         }
-        let input = Input::new(event, value)?;
+        let mut input = Input::new(event, value)?;
+        input.seq = self.core.produced.gated.fetch_add(1, Ordering::SeqCst) + 1;
         if state.gate.add(input).is_err() {
             return Err(MetalKernelError::QueueUnavailable(
                 "a fresh recording's gate refused an input",
@@ -1029,6 +1044,7 @@ impl Commands {
             event: retained,
             produced: event.signaledValue(),
             upto,
+            gated_through: core.produced.gated.load(Ordering::SeqCst),
             reason,
         });
         core.produced.cancel_pending.store(true, Ordering::SeqCst);
@@ -1231,5 +1247,51 @@ impl Commands {
         // the old count: the release below sees the event.
         self.core.release_produced_locked(state)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod scope_tests {
+    use super::*;
+    use objc2_metal::MTLDevice;
+
+    /// A cancellation's scope is fixed when it is asked for: an input gated
+    /// after it is not covered, whenever it is applied, and an input merged
+    /// into an earlier one keeps the earlier gating.
+    #[test]
+    fn a_cancellation_covers_only_inputs_gated_before_it() {
+        let device = super::super::Device::system_default().unwrap();
+        let event = device.as_ref().newSharedEvent().unwrap();
+        let input = |value, seq| {
+            let mut input = Input::new(&event, value).unwrap();
+            input.seq = seq;
+            input
+        };
+        let cancel = Cancel {
+            event: event.clone(),
+            produced: 0,
+            upto: u64::MAX,
+            gated_through: 2,
+            reason: "test",
+        };
+        let mut before = Gate::default();
+        assert!(before.add(input(1, 1)).is_ok());
+        let mut after = Gate::default();
+        assert!(after.add(input(1, 3)).is_ok());
+        let mut merged = Gate::default();
+        assert!(merged.add(input(1, 1)).is_ok());
+        assert!(merged.add(input(5, 3)).is_ok());
+        assert!(
+            before.covered_by(&cancel),
+            "an input gated before the request"
+        );
+        assert!(
+            !after.covered_by(&cancel),
+            "an input gated after the request"
+        );
+        assert!(
+            merged.covered_by(&cancel),
+            "a merge lost the earlier gating"
+        );
     }
 }

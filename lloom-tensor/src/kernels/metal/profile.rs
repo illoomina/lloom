@@ -638,8 +638,6 @@ pub fn reset() {
     STEP.store(0, Ordering::Relaxed);
     #[cfg(any(debug_assertions, feature = "profile"))]
     recording::reset();
-    #[cfg(any(debug_assertions, feature = "profile"))]
-    recording::reset_cut_sites();
 }
 
 /// Whether every commit is attributed to the stack that made it
@@ -666,8 +664,8 @@ pub(crate) fn note_commit_site() {
     recording::note_commit_site();
 }
 
-/// Commits since the last [`reset`] that share one stack: the committing
-/// thread, the stack's `lloom*` frames innermost first, and the count.
+/// Commits that share one stack: the committing thread, the stack's
+/// `lloom*` frames innermost first, and the count.
 #[derive(Clone, Debug, PartialEq)]
 pub struct CutSite {
     pub thread: String,
@@ -675,8 +673,11 @@ pub struct CutSite {
     pub commits: u64,
 }
 
-/// What [`note_commit_site`] counted since the last [`reset`], most commits
-/// first; empty when the instrument is off or not compiled.
+/// What [`note_commit_site`] counted since the process began (or the last
+/// [`reset_cut_sites`]), most commits first; empty when the instrument is off
+/// or not compiled. Not cleared by [`reset`]: the batched scheduler opens a
+/// profile window per burst of requests, and a caller differencing two reads
+/// around a request must not see the count go backwards.
 pub fn cut_sites() -> Vec<CutSite> {
     #[cfg(any(debug_assertions, feature = "profile"))]
     {
@@ -686,6 +687,12 @@ pub fn cut_sites() -> Vec<CutSite> {
     {
         Vec::new()
     }
+}
+
+/// Clear what [`cut_sites`] has counted.
+pub fn reset_cut_sites() {
+    #[cfg(any(debug_assertions, feature = "profile"))]
+    recording::reset_cut_sites();
 }
 
 #[cfg(test)]

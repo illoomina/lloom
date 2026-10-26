@@ -63,7 +63,7 @@ fn each_commit_path_is_its_own_site_with_its_own_count() {
         "the instrument must be on for this test"
     );
     dev.synchronize().unwrap();
-    profile::reset();
+    profile::reset_cut_sites();
     let _a = commit_by_marker(&dev, 3);
     let _b = commit_by_wait(&dev, 5);
     let sites = profile::cut_sites();
@@ -82,15 +82,21 @@ fn each_commit_path_is_its_own_site_with_its_own_count() {
         sites.iter().all(|s| s.thread == name),
         "every commit came from this thread ({name}): {sites:#?}"
     );
+    // The profiler's window reset (the batched scheduler opens one per burst
+    // of requests) leaves the attribution alone, so a reader differencing two
+    // reads never sees it go backwards.
     profile::reset();
-    assert!(profile::cut_sites().is_empty(), "reset clears the window");
+    let kept: u64 = profile::cut_sites().iter().map(|s| s.commits).sum();
+    assert_eq!(kept, 8, "profile::reset must not clear the attribution");
+    profile::reset_cut_sites();
+    assert!(profile::cut_sites().is_empty(), "reset_cut_sites clears it");
 }
 
 #[test]
 fn off_the_instrument_attributes_nothing() {
     let dev = device(false);
     assert!(!profile::cut_sites_enabled());
-    profile::reset();
+    profile::reset_cut_sites();
     let _a = commit_by_marker(&dev, 2);
     assert!(profile::cut_sites().is_empty());
 }

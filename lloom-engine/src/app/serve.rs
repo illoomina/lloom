@@ -486,14 +486,18 @@ fn run_owner(
                     b["response_drain"] = shared.drains.json();
                     b["keep_warm"] = shared.keep_warm.json(&shared.activity, uptime_ns());
                     b["keep_warm_actions"] = json!(shared.activity.actions.load(Ordering::Relaxed));
-                    if let Some((adds, commits, last, max)) =
-                        shared.engine.device().metal4_slot_residency()
-                    {
+                    if let Some(s) = shared.engine.device().metal4_slot_residency() {
                         b["metal4_slot_residency"] = json!({
-                            "adds": adds,
-                            "commits": commits,
-                            "last_bytes": last,
-                            "max_bytes": max,
+                            "adds": s.adds,
+                            "add_ns": s.add_ns,
+                            "pipeline_adds": s.pipeline_adds,
+                            "covered": s.covered,
+                            "set_uses": s.set_uses,
+                            "commits": s.commits,
+                            "commit_ns": s.commit_ns,
+                            "commit_max_ns": s.commit_max_ns,
+                            "last_bytes": s.last_bytes,
+                            "max_bytes": s.max_bytes,
                         });
                     }
                     b
@@ -4245,7 +4249,30 @@ fn report_with(
                 lloom_tensor::tuning::f16_rows_decode_launches()
             )
         }
+        // A speculative request's verify windows on the row axis: the
+        // window's engagement since the load.
+        crate::ReadbackArm::Speculative { .. }
+            if lloom_tensor::tuning::contract().is_fast()
+                && lloom_tensor::tuning::f16_rows_max().is_some() =>
+        {
+            format!(
+                " f16_rows_launches={}",
+                lloom_tensor::tuning::f16_rows_launches()
+            )
+        }
         _ => String::new(),
+    };
+    // The row axis's capacity rounding, where it is on: its engagement since
+    // the load.
+    let decode_rows = if lloom_tensor::tuning::f16_rows_round()
+        && lloom_tensor::tuning::f16_rows_max().is_some()
+    {
+        format!(
+            "{decode_rows} f16_rows_rounded_launches={}",
+            lloom_tensor::tuning::f16_rows_rounded_launches()
+        )
+    } else {
+        decode_rows
     };
     eprintln!(
         "[{endpoint}: prompt_tokens={prompt} completion_tokens={} stop={:?} total {total_ms:.1} ms, \

@@ -216,6 +216,16 @@ pub const COUPLINGS: &[Coupling] = &[
     },
     Coupling {
         id: "C22",
+        kind: "ignored",
+        when: "kernels.gemm.f16_rows off, determinism = deterministic, or the CPU backend",
+        effect: "kernels.gemm.f16_rows_round has no effect: no launch takes the row axis. Where one does, a launch of an odd number of rows takes the next even capacity and every row keeps the one-row GEMV's bits, so the arm moves time, never a bit",
+        keys: &["kernels.gemm.f16_rows_round", "kernels.gemm.f16_rows", "determinism", "backend.device"],
+        site: "lloom-tensor/src/kernels/kernels/mlx_gemm.rs f16_rows_capacity",
+        is_static: false,
+    },
+    // Provisional PR1102 allocation; coordinator reservation still pending.
+    Coupling {
+        id: "C23",
         kind: "resolves",
         when: "a generating response is admitted or its SSE/typed-marker handover reaches a configured bound",
         effect: "server.response bounds contexts (503 before execution), unresolved SSE raw bytes (whole-fragment refusal/cancellation), and typed marker descriptors (run error); these are draft candidate defaults, not a wall-time drain guarantee",
@@ -456,11 +466,28 @@ pub fn explain(o: &EngineOptions) -> Vec<String> {
             ),
         });
     }
+    if g.f16_rows_round {
+        let cause = if o.tuning.contract.profile == "deterministic" {
+            Some("determinism = deterministic")
+        } else if !g.f16_rows {
+            Some("kernels.gemm.f16_rows = false")
+        } else if !cfg!(feature = "metal") || o.load.device == "cpu" {
+            Some("the CPU backend")
+        } else {
+            None
+        };
+        out.push(match cause {
+            Some(c) => format!("kernels.gemm.f16_rows_round ignored <- {c} (C22)"),
+            None => "kernels.gemm.f16_rows_round: a row-axis launch of an odd number of rows \
+                     takes the next even capacity, the same bits <- kernels.gemm.f16_rows (C22)"
+                .into(),
+        });
+    }
     let response = o.server.response;
     out.push(format!(
         "server.response -> contexts={} raw_bytes={} markers={}: draft candidates; \
          context exhaustion=503, raw-byte exhaustion=whole-fragment cancellation, \
-         descriptor exhaustion=run error; no wall-time bound (C22)",
+         descriptor exhaustion=run error; no wall-time bound (C23)",
         response.contexts, response.raw_bytes, response.markers
     ));
     out
@@ -750,7 +777,7 @@ mod tests {
             explain(&EngineOptions::default()),
             vec![
                 "decode.readback.stream_reader -> on <- decode.readback.adaptive_commit (C9)",
-                "server.response -> contexts=8 raw_bytes=1048576 markers=65536: draft candidates; context exhaustion=503, raw-byte exhaustion=whole-fragment cancellation, descriptor exhaustion=run error; no wall-time bound (C22)"
+                "server.response -> contexts=8 raw_bytes=1048576 markers=65536: draft candidates; context exhaustion=503, raw-byte exhaustion=whole-fragment cancellation, descriptor exhaustion=run error; no wall-time bound (C23)"
             ],
             "defaults name the reader and the response-bound candidates"
         );
@@ -820,6 +847,42 @@ mod tests {
             c20(&[("scheduler.max_sequences", "4")]).is_empty(),
             "the arm off"
         );
+        // C22: the capacity rounding names what it does where the row axis
+        // runs, and its cause where it does not.
+        let c22 = |sets: &[(&str, &str)]| -> Vec<String> {
+            explain(&with(sets))
+                .into_iter()
+                .filter(|l| l.ends_with("(C22)"))
+                .collect()
+        };
+        let round = [("kernels.gemm.f16_rows_round", "true")];
+        if cfg!(feature = "metal") {
+            assert_eq!(
+                c22(&round),
+                vec![
+                    "kernels.gemm.f16_rows_round: a row-axis launch of an odd number of rows \
+                     takes the next even capacity, the same bits <- kernels.gemm.f16_rows (C22)"
+                ]
+            );
+        } else {
+            assert_eq!(
+                c22(&round),
+                vec!["kernels.gemm.f16_rows_round ignored <- the CPU backend (C22)"]
+            );
+        }
+        let mut det = round.to_vec();
+        det.push(("determinism", "deterministic"));
+        assert_eq!(
+            c22(&det),
+            vec!["kernels.gemm.f16_rows_round ignored <- determinism = deterministic (C22)"]
+        );
+        let mut rows_off = round.to_vec();
+        rows_off.push(("kernels.gemm.f16_rows", "false"));
+        assert_eq!(
+            c22(&rows_off),
+            vec!["kernels.gemm.f16_rows_round ignored <- kernels.gemm.f16_rows = false (C22)"]
+        );
+        assert!(c22(&[]).is_empty(), "the arm off");
     }
 
     /// C21 at the library's values says nothing; where chat's and serve's
@@ -875,15 +938,15 @@ mod response_coupling_tests {
         };
         let lines: Vec<_> = super::explain(&options)
             .into_iter()
-            .filter(|s| s.ends_with("(C22)"))
+            .filter(|s| s.ends_with("(C23)"))
             .collect();
-        assert_eq!(lines, ["server.response -> contexts=2 raw_bytes=31 markers=7: draft candidates; context exhaustion=503, raw-byte exhaustion=whole-fragment cancellation, descriptor exhaustion=run error; no wall-time bound (C22)"]);
+        assert_eq!(lines, ["server.response -> contexts=2 raw_bytes=31 markers=7: draft candidates; context exhaustion=503, raw-byte exhaustion=whole-fragment cancellation, descriptor exhaustion=run error; no wall-time bound (C23)"]);
         for key in [
             "server.response.contexts",
             "server.response.raw_bytes",
             "server.response.markers",
         ] {
-            assert_eq!(super::of(key), ["C22"]);
+            assert_eq!(super::of(key), ["C23"]);
         }
     }
 }

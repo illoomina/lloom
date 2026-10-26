@@ -25,19 +25,9 @@ impl Drop for Checkpoint {
 }
 
 fn native_owner() -> Result<(Checkpoint, Arc<Shared>, &'static str)> {
-    let path = std::env::temp_dir().join(format!(
-        "lloom-response-native-{}-{}",
-        std::process::id(),
-        short_id()
-    ));
-    std::fs::create_dir(&path)?;
-    let checkpoint = Checkpoint(path);
-    let mut cfg = Lfm2Tiny::template();
-    TinyConfig::set_axis(&mut cfg, "vocab_size", Lfm2Tiny::tokenizer().vocab_size());
-    TinyConfig::derive(&mut cfg);
-    let model = TinyCheckpoint::<Lfm2Tiny>::new(cfg, Weights::default()).write(&checkpoint.0)?;
+    // TinyCheckpoint::write constructs a CPU schema model which fixes model
+    // tuning/regime. Install both halves FIRST; the later model install fails.
     let mut options = crate::EngineOptions::default();
-    options.load.model = Some(model);
     options.load.device = "auto".into();
     options.load.warmup = false;
     options.memory.kv_capacity = 256;
@@ -52,6 +42,18 @@ fn native_owner() -> Result<(Checkpoint, Arc<Shared>, &'static str)> {
     );
     options.tuning.metal.command_api = api;
     options.tuning.install().map_err(anyhow::Error::msg)?;
+    let path = std::env::temp_dir().join(format!(
+        "lloom-response-native-{}-{}",
+        std::process::id(),
+        short_id()
+    ));
+    std::fs::create_dir(&path)?;
+    let checkpoint = Checkpoint(path);
+    let mut cfg = Lfm2Tiny::template();
+    TinyConfig::set_axis(&mut cfg, "vocab_size", Lfm2Tiny::tokenizer().vocab_size());
+    TinyConfig::derive(&mut cfg);
+    let model = TinyCheckpoint::<Lfm2Tiny>::new(cfg, Weights::default()).write(&checkpoint.0)?;
+    options.load.model = Some(model);
     let shape = super::super::Shape::of(&options, Frontend::Serve, String::new());
     let (engine, _) = super::super::load_engine(&options.load, shape)?;
     assert!(

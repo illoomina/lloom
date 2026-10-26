@@ -16,6 +16,12 @@ enum Release {
     FullSettlement,
 }
 
+#[derive(Clone, Copy)]
+struct NativeWitness {
+    api: &'static str,
+    contract: &'static str,
+}
+
 struct Checkpoint(PathBuf);
 impl Drop for Checkpoint {
     fn drop(&mut self) {
@@ -24,7 +30,7 @@ impl Drop for Checkpoint {
     }
 }
 
-fn native_owner() -> Result<(Checkpoint, Arc<Shared>, &'static str)> {
+fn native_owner() -> Result<(Checkpoint, Arc<Shared>, NativeWitness)> {
     // TinyCheckpoint::write constructs a CPU schema model which fixes model
     // tuning/regime. Install both halves FIRST; the later model install fails.
     let mut options = crate::EngineOptions::default();
@@ -69,11 +75,22 @@ fn native_owner() -> Result<(Checkpoint, Arc<Shared>, &'static str)> {
         actual_api, options.tuning.metal.command_api,
         "explicit native API must not silently change backend"
     );
+    let actual_contract = lloom_tensor::tuning::contract();
+    assert_eq!(
+        actual_contract,
+        lloom_tensor::tuning::Contract::Deterministic
+    );
+    let witness = NativeWitness {
+        api: actual_api,
+        contract: actual_contract.name(),
+    };
     eprintln!(
-        "NATIVE_RESPONSE_OWNER actual_api={actual_api} selected_readback={}",
+        "NATIVE_RESPONSE_OWNER actual_api={} actual_contract={} selected_readback={}",
+        witness.api,
+        witness.contract,
         engine.readback().name()
     );
-    Ok((checkpoint, shared_with_engine(engine), actual_api))
+    Ok((checkpoint, shared_with_engine(engine), witness))
 }
 
 fn request(fields: Value) -> Value {
@@ -196,7 +213,7 @@ fn assert_reference(result: &Saved, reference: &Value) {
 /// differs. The reference retains it through the ENTIRE settlement return.
 fn scenario(
     shared: &Arc<Shared>,
-    actual_api: &str,
+    witness: NativeWitness,
     release_at: Release,
     late_failure: bool,
     reference_a: &Value,
@@ -252,19 +269,18 @@ fn scenario(
     let id_a = publication
         .recv_timeout(Duration::from_secs(60))
         .expect("A accepted history published");
-    {
+    let (a_message, a_ids) = {
         let a = shared
             .sessions
             .lock()
             .resolve(&id_a, None, true, Instant::now())
             .unwrap();
-        assert_eq!(
-            message_values(a.messages.unwrap()).last().unwrap(),
-            &reference_a["choices"][0]["message"]
-        );
-        // Do not keep Bound/Reply/native-row owners from this lookup alive
-        // across B/C; only the production response context may retain A.
-    }
+        let message = message_values(a.messages.unwrap()).pop().unwrap();
+        assert_eq!(message, reference_a["choices"][0]["message"]);
+        // Pure owned JSON/IDs only: drop every Bound/Reply/native-row owner
+        // from this lookup before B/C. This does not pin model backing.
+        (message, a.ids)
+    };
     assert_eq!(
         shared.drains.active.load(Ordering::Acquire),
         1,
@@ -351,13 +367,31 @@ fn scenario(
         );
         assert!(std::str::from_utf8(&raw).unwrap().contains("[DONE]"));
     }
-    eprintln!("NATIVE_RESPONSE_CUSTODY device=metal api={} release={release_at:?} late_failure={late_failure} b_ids={} c_ids={} c_resident=true", actual_api, b.ids.len(), c.ids.len());
+    let expected_a_ids: Vec<_> = reference_a["prompt_token_ids"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .chain(reference_a["choices"][0]["token_ids"].as_array().unwrap())
+        .cloned()
+        .collect();
+    assert_eq!(json!(&a_ids), json!(expected_a_ids));
+    eprintln!("NATIVE_RESPONSE_CUSTODY device=metal api={} contract={} release={release_at:?} late_failure={late_failure} b_ids={} c_ids={} c_resident=true", witness.api, witness.contract, b.ids.len(), c.ids.len());
+    eprintln!(
+        "NATIVE_RESPONSE_RECEIPT {}",
+        json!({
+            "actual_api":witness.api,"actual_contract":witness.contract,
+            "release":format!("{release_at:?}"),"late_failure":late_failure,
+            "a":{"message":a_message,"saved_ids":a_ids},
+            "b":{"prompt_ids":b.prompt,"reply_ids":b.reply,"messages":b.messages,"saved_ids":b.ids},
+            "c":{"prompt_ids":c.prompt,"reply_ids":c.reply,"messages":c.messages,"saved_ids":c.ids}
+        })
+    );
 }
 
 #[test]
 fn metal_lfm2_held_writer_and_full_settlement_reference_keep_identical_accepted_history(
 ) -> Result<()> {
-    let (checkpoint, shared, actual_api) = native_owner()?;
+    let (checkpoint, shared, witness) = native_owner()?;
     let user_a = json!({"role":"user","content":"A"});
     let a = json_reply(&shared, json!({"messages":[user_a],"reset":"cache"}));
     let b = json_reply(
@@ -374,7 +408,7 @@ fn metal_lfm2_held_writer_and_full_settlement_reference_keep_identical_accepted_
         .is_empty());
     for release in [Release::Publication, Release::FullSettlement] {
         for late_failure in [false, true] {
-            scenario(&shared, actual_api, release, late_failure, &a, &b, &c);
+            scenario(&shared, witness, release, late_failure, &a, &b, &c);
         }
     }
     drop(shared);

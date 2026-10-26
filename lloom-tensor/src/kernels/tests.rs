@@ -2583,9 +2583,12 @@ fn residency_attach_heartbeat_detaches_the_set_on_metal3_and_binding_still_works
             (ResidencyAttach::Heartbeat, true) => (1, true),
             (ResidencyAttach::Queue, _) => (1, false),
         };
+        // `kernels.residency.metal4 = queue-*` also puts the set on the
+        // Metal 4 queue.
+        let metal4_queue = u64::from(commands.metal4_declare().is_some_and(|d| d.on_queue()));
         assert_eq!(
             set.queue_attachments(),
-            attached,
+            attached + metal4_queue,
             "{} on {}: addResidencySet calls naming the device set",
             arm.name(),
             commands.actual_command_api()
@@ -2657,7 +2660,8 @@ fn the_tuned_attach_arm_reaches_commands_new() {
         crate::tuning::tuning().metal.residency_attach,
         "the arm is the tuning's"
     );
-    assert_eq!(set.queue_attachments(), u64::from(!detached));
+    let metal4_queue = u64::from(commands.metal4_declare().is_some_and(|d| d.on_queue()));
+    assert_eq!(set.queue_attachments(), u64::from(!detached) + metal4_queue);
 }
 
 #[test]

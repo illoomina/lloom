@@ -57,6 +57,15 @@ pub struct Buffer {
     /// Whether CPU access is permitted by storage mode and the selected
     /// experimental mapping policy, fixed at construction (see `new`).
     cpu_visible: bool,
+
+    /// Whether the device's residency sets list this allocation from before
+    /// it is handed out until its last GPU reader has completed: a pool's
+    /// buffer (it leaves the sets only on eviction from the free list) or a
+    /// heap chunk's sub-buffer (the chunk is listed for the heap's life).
+    /// A Metal 4 slot set may leave such a binding to those sets
+    /// (`kernels.residency.metal4`, `tuning.md` §6.3p); false for anything
+    /// else, which the slot set lists itself.
+    device_listed: bool,
 }
 
 // SAFETY: Native preserves Buffer's existing retained-MTLBuffer thread-safety
@@ -168,11 +177,13 @@ impl Buffer {
     pub(super) unsafe fn primary(physical: PhysicalStrong<PHYSICAL_SLAB_SLOTS>) -> Self {
         let baseline = unsafe { physical.baseline_unchecked() };
         let cpu_visible = baseline.cpu_visible;
+        let device_listed = baseline.device_listed;
         Self {
             role: BufferRole::Primary(physical),
             base_offset: 0,
             length: None,
             cpu_visible,
+            device_listed,
         }
     }
     /// # Safety
@@ -205,6 +216,7 @@ impl Buffer {
             base_offset: self.base_offset,
             length: self.length,
             cpu_visible: self.cpu_visible,
+            device_listed: self.device_listed,
         })
     }
     /// # Safety
@@ -238,7 +250,23 @@ impl Buffer {
             base_offset: 0,
             length: None,
             cpu_visible,
+            device_listed: false,
         }
+    }
+
+    /// Marks this allocation as listed by the device's residency sets until
+    /// its last GPU reader completes ([`Self::device_listed`]). For the
+    /// device's pool adoption of a fresh allocation from its own backings.
+    pub(crate) fn with_device_listing(mut self) -> Self {
+        self.device_listed = true;
+        self
+    }
+
+    /// See the field: a Metal 4 slot set may leave this binding to the
+    /// device's sets.
+    #[inline]
+    pub(crate) fn device_listed(&self) -> bool {
+        self.device_listed
     }
 
     pub(crate) fn with_membership(mut self, membership: super::membership::Membership) -> Self {
@@ -300,6 +328,7 @@ impl Buffer {
             base_offset: absolute,
             length: Some(length),
             cpu_visible: self.cpu_visible,
+            device_listed: self.device_listed,
         }
     }
 

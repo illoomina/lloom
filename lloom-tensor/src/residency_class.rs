@@ -80,3 +80,25 @@ pub fn scoped_residency_class() -> Option<ResidencyClass> {
 /// The most device sets the residency router makes: Metal's 32 residency
 /// sets per command queue, less the 8 per-slot sets of a Metal 4 queue.
 pub const MAX_DEVICE_SETS: usize = 24;
+
+/// What a Metal 4 queue's per-slot residency sets did since the queue was
+/// made (`kernels.residency.slot_trace`): the resources the slots added and
+/// the host time those `addAllocation`s took, the pipelines added, the
+/// bindings left to the device's sets (`kernels.residency.metal4 = *-diff`),
+/// the device sets marked used per command buffer (`cb-*`), the set
+/// commits (one per
+/// command buffer) and their host time, total and longest, and the
+/// committing set's `allocatedSize` at the last commit and at its largest.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct SlotResidency {
+    pub adds: u64,
+    pub add_ns: u64,
+    pub pipeline_adds: u64,
+    pub covered: u64,
+    pub set_uses: u64,
+    pub commits: u64,
+    pub commit_ns: u64,
+    pub commit_max_ns: u64,
+    pub last_bytes: u64,
+    pub max_bytes: u64,
+}

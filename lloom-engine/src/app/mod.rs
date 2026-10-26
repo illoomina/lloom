@@ -57,6 +57,9 @@ pub struct Shape {
     pub reuse_prefix: bool,
     pub seed_text: String,
     pub batch: usize,
+    /// The most requests one intake tick of the batched scheduler takes
+    /// off its queue while rows are live (`scheduler.intake_per_tick`).
+    pub intake_per_tick: usize,
     pub mem_sample: bool,
     pub rows: String,
     pub share_prefix: bool,
@@ -86,6 +89,7 @@ impl Shape {
             reuse_prefix: o.prefix.reuse.unwrap_or_else(|| frontend.reuse_prefix()),
             seed_text,
             batch: o.scheduler.max_sequences,
+            intake_per_tick: o.scheduler.intake_per_tick,
             mem_sample: o.report.memory_sample,
             rows: o.scheduler.rows.clone(),
             share_prefix: o.prefix.share,
@@ -1119,6 +1123,7 @@ mod option_layer_tests {
                 reuse_prefix: false,
                 seed_text: String::new(),
                 batch: 1,
+                intake_per_tick: crate::options::DEFAULT_INTAKE_PER_TICK,
                 mem_sample: false,
                 rows: "auto".into(),
                 share_prefix: false,

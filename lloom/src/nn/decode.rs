@@ -1286,10 +1286,17 @@ pub(crate) fn end_pass(device: &Device) -> Result<()> {
     device.finish_pass()
 }
 
-fn begin_decode_step(device: &Device) {
-    // The decode step is the `Decode { b: 1 }` pass; with the cache off this
-    // is the legacy bracket, which cannot fail.
-    let _ = begin_pass(device, PassShape::Decode { b: 1 });
+/// Open the decode step's pass — the `Decode { b: 1 }` pass; with the plan
+/// cache off, the legacy arena bracket.
+///
+/// A refusal is the request's error, not something to continue past: the
+/// device can decline a pass whose plan it cannot admit or whose
+/// predecessor was never closed, and a forward encoded after that runs
+/// against state the pass was meant to install. The refusal leaves no open
+/// pass (`MetalDevice::begin_pass`), so the caller owes no `end_pass` on
+/// this path.
+fn begin_decode_step(device: &Device) -> Result<()> {
+    begin_pass(device, PassShape::Decode { b: 1 })
 }
 
 fn end_decode_step(device: &Device) -> Result<()> {
@@ -2505,7 +2512,7 @@ impl<'m, M: CausalLM> Session<'m, M> {
                     pacer.before_forward(&device)?;
                 }
                 self.model.prepare_pass(&mut self.seq.cache, 1)?;
-                begin_decode_step(&device);
+                begin_decode_step(&device)?;
                 logits = self
                     .model
                     .forward(&feed, self.seq.pos, &mut self.seq.cache)?
@@ -2546,7 +2553,7 @@ impl<'m, M: CausalLM> Session<'m, M> {
                 }
                 let t = timed.then(std::time::Instant::now);
                 self.model.prepare_pass(&mut self.seq.cache, 1)?;
-                begin_decode_step(&device);
+                begin_decode_step(&device)?;
                 logits = self
                     .model
                     .forward(&feed, self.seq.pos, &mut self.seq.cache)?
@@ -2616,7 +2623,7 @@ impl<'m, M: CausalLM> Session<'m, M> {
                             pacer.before_forward(&device)?;
                         }
                         self.model.prepare_pass(&mut self.seq.cache, 1)?;
-                        begin_decode_step(&device);
+                        begin_decode_step(&device)?;
                         logits = self
                             .model
                             .forward(&again, self.seq.pos, &mut self.seq.cache)?
@@ -4443,7 +4450,11 @@ mod adaptive_lead_tests {
         };
         assert_eq!(lead(0, 0, true), (8, 16, 24), "the incumbent");
         assert_eq!(lead(4, 0, true), (4, 8, 12), "queued follows the batching");
-        assert_eq!(lead(8, 2, true), (8, 2, 10), "a shallower queue, batching kept");
+        assert_eq!(
+            lead(8, 2, true),
+            (8, 2, 10),
+            "a shallower queue, batching kept"
+        );
         assert_eq!(lead(4, 2, false).2, 0, "no lead off the adaptive commit");
     }
 }

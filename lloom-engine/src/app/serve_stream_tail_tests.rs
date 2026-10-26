@@ -25,6 +25,8 @@ enum Case {
     LateMetadataFailure,
     // Host-only, exact eight-byte reply for the API lineage controls.
     ApiLineage,
+    // Cooperative first-fragment refusal only; incumbent sink assertions stay strict.
+    FirstFragmentRefusal,
 }
 #[derive(Default)]
 struct Wire {
@@ -34,6 +36,11 @@ struct Wire {
     failures: usize,
     decoded: bool,
     model_entries: usize,
+    first_case_offered: usize,
+    first_case_refused: usize,
+    first_case_prompt: Vec<u32>,
+    // One-shot host-only gate before A offers any fragment. No production owner.
+    before_decode: Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>,
     metadata_calls: usize,
     metadata_before_publication: Option<std::sync::Weak<Shared>>,
 }
@@ -150,7 +157,7 @@ impl Served for Scripted {
     fn kv_capacity(&self) -> usize {
         match self.case {
             Case::LongReply | Case::BacklogRefusal => 4 << 20,
-            Case::ApiLineage => 256,
+            Case::ApiLineage | Case::FirstFragmentRefusal => 256,
             _ => 64,
         }
     }
@@ -177,8 +184,11 @@ impl Served for Scripted {
             wire.metadata_before_publication.clone()
         };
         if let Some(shared) = before.and_then(|weak| weak.upgrade()) {
-            assert_eq!(shared.sessions.lock().json()["turns"], 0,
-                "request-bound metadata capture must precede publication");
+            assert_eq!(
+                shared.sessions.lock().json()["turns"],
+                0,
+                "request-bound metadata capture must precede publication"
+            );
         }
         if matches!(self.case, Case::LateMetadataFailure) {
             anyhow::bail!("scripted checked metadata refusal");
@@ -249,16 +259,28 @@ impl Served for Scripted {
     }
     fn complete_observed(
         &self,
-        _: &[u32],
+        prompt: &[u32],
         _: &[DecodedImage],
         _: &DecodeParams,
         sink: &mut (dyn FnMut(&str) -> bool + Send),
         observe: &mut DecodeObserver<'_>,
     ) -> Result<Decoded> {
-        {
+        let before_decode = {
             let (lock, changed) = &*self.progress.0;
-            lock.lock().model_entries += 1;
+            let mut wire = lock.lock();
+            wire.model_entries += 1;
+            if matches!(self.case, Case::FirstFragmentRefusal) {
+                wire.first_case_prompt = prompt.to_vec();
+            }
+            let gate = wire.before_decode.take();
             changed.notify_all();
+            gate
+        };
+        if let Some((entered, released)) = before_decode {
+            let _ = entered.send(());
+            released
+                .recv_timeout(Duration::from_secs(10))
+                .expect("test model barrier released");
         }
         let end = self.text.tokenizer.token_to_id("</think>").unwrap();
         let mut stream = crate::stream::TextStream::default();
@@ -277,7 +299,7 @@ impl Served for Scripted {
         };
         let ids = match self.case {
             Case::PartialTail => vec![97, end],
-            Case::ApiLineage => vec![97; 8],
+            Case::ApiLineage | Case::FirstFragmentRefusal => vec![97; 8],
             Case::LongReply => vec![97; 1 << 18],
             Case::BacklogRefusal => {
                 let mut ids = vec![98; MAX_RESPONSE_BACKLOG + 2];
@@ -304,8 +326,14 @@ impl Served for Scripted {
             if let Some(fragment) = fragment {
                 if matches!(self.case, Case::SplitMarker) {
                     batched.push_str(&fragment);
-                } else if matches!(self.case, Case::BacklogRefusal) {
+                } else if matches!(self.case, Case::BacklogRefusal | Case::FirstFragmentRefusal) {
+                    if matches!(self.case, Case::FirstFragmentRefusal) {
+                        self.progress.0 .0.lock().first_case_offered += 1;
+                    }
                     if !sink(&fragment) {
+                        if matches!(self.case, Case::FirstFragmentRefusal) {
+                            self.progress.0 .0.lock().first_case_refused += 1;
+                        }
                         stream.refuse_last();
                         cancelled = true;
                         break;
@@ -823,10 +851,17 @@ fn a_family_without_decode_observations_splits_by_marker_text() {
         .unwrap()
         .unwrap();
     let a = p.push("The user asks a simple thing.</thi");
-    assert_eq!(a.get("reasoning_content").and_then(|v| v.as_str()), Some("The user asks a simple thing."));
+    assert_eq!(
+        a.get("reasoning_content").and_then(|v| v.as_str()),
+        Some("The user asks a simple thing.")
+    );
     assert!(a.get("content").is_none(), "{a:?}");
     let b = p.push("nk>Paris");
-    assert_eq!(b.get("content").and_then(|v| v.as_str()), Some("Paris"), "{b:?}");
+    assert_eq!(
+        b.get("content").and_then(|v| v.as_str()),
+        Some("Paris"),
+        "{b:?}"
+    );
     assert!(b.get("reasoning_content").is_none(), "{b:?}");
     let c = p.finish();
     assert!(c.is_empty(), "{c:?}");
@@ -836,16 +871,26 @@ fn a_family_without_decode_observations_splits_by_marker_text() {
         .unwrap()
         .unwrap();
     let a = p.push("thought</th");
-    assert_eq!(a.get("reasoning_content").and_then(|v| v.as_str()), Some("thought"));
+    assert_eq!(
+        a.get("reasoning_content").and_then(|v| v.as_str()),
+        Some("thought")
+    );
     let c = p.finish();
-    assert_eq!(c.get("reasoning_content").and_then(|v| v.as_str()), Some("</th"), "{c:?}");
+    assert_eq!(
+        c.get("reasoning_content").and_then(|v| v.as_str()),
+        Some("</th"),
+        "{c:?}"
+    );
     // With observations the splitter is exact by id and ignores literals.
     engine.observes = true;
     let mut p = reasoning::Reasoning::for_chat(&engine, &[tags.start], false)
         .unwrap()
         .unwrap();
     let a = p.push("literal </think> stays reasoning");
-    assert_eq!(a.get("reasoning_content").and_then(|v| v.as_str()), Some("literal </think> stays reasoning"));
+    assert_eq!(
+        a.get("reasoning_content").and_then(|v| v.as_str()),
+        Some("literal </think> stays reasoning")
+    );
 }
 
 fn scripted_shared(case: Case) -> Arc<Shared> {
@@ -1995,3 +2040,7 @@ fn assert_delayed_a_publication_custody(late_failure: bool) {
         c_messages.len()
     );
 }
+
+// Host-only integrated cancellation/client-observed-ID boundary controls.
+#[path = "serve_continuation_boundary_tests.rs"]
+mod continuation_boundary_tests;

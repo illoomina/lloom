@@ -258,3 +258,52 @@ fn queued_witness_follows_ticket_assignment_and_precedes_held_turn_release() {
     });
     assert!(turns.try_take().is_some());
 }
+
+#[test]
+fn scoped_next_take_observer_watches_the_actual_take_and_preserves_newer_scope() {
+    let turns = Turns::default();
+    let (old, observed) = turns.observe_next_take();
+    let turn = turns.take();
+    assert_eq!(
+        observed.recv_timeout(Duration::from_secs(1)).unwrap(),
+        (0, 0)
+    );
+    drop(turn);
+    let (new, _) = turns.observe_next_take();
+    drop(old); // An already consumed older guard must not clear a newer observer.
+    assert!(turns.state.lock().queue_observer.is_some());
+    drop(new);
+    assert!(turns.state.lock().queue_observer.is_none());
+    let turn = turns.take();
+    drop(turn);
+    assert_eq!(
+        turns.state.lock().next,
+        2,
+        "observer never reserves an extra ticket"
+    );
+}
+
+#[test]
+fn timed_observer_preserves_real_assignment_and_acquisition_without_extra_take() {
+    let turns = Turns::default();
+    std::thread::scope(|scope| {
+        let held = turns.take();
+        let (_observation, queued, timing) = turns.observe_next_take_timed();
+        let queue = &turns;
+        let next = scope.spawn(move || {
+            let _turn = queue.take();
+        });
+        let (ticket, serving) = queued.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert!(ticket > serving);
+        assert!(
+            matches!(timing.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)),
+            "held A prevents B acquisition"
+        );
+        drop(held);
+        next.join().unwrap();
+        let t = timing.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert_eq!((t.ticket, t.serving), (ticket, serving));
+        assert!(t.acquired_ns >= t.assigned_ns);
+    });
+    assert_eq!(turns.state.lock().next, 2, "timing observer adds no ticket");
+}

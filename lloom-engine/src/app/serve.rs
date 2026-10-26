@@ -341,6 +341,32 @@ fn run_owner(
     load_facts: Option<(Instant, bool)>,
     transport: Option<tiny_http::TransportPolicy>,
 ) -> Result<()> {
+    run_owner_dispatched(
+        options,
+        engine,
+        model_path,
+        load_facts,
+        transport,
+        |shared, path, request, first| handle_model_request(shared, path, request, first),
+        |_, _| Ok(()),
+    )
+}
+
+// One existing setup/accept/retirement path. Production supplies zero-capture
+// function items; only the private benchmark supplies instrumented callbacks.
+fn run_owner_dispatched<D, R>(
+    options: crate::EngineOptions,
+    engine: Box<dyn Served>,
+    model_path: std::path::PathBuf,
+    load_facts: Option<(Instant, bool)>,
+    transport: Option<tiny_http::TransportPolicy>,
+    dispatch: D,
+    ready: R,
+) -> Result<()>
+where
+    D: Fn(&Arc<Shared>, &str, Request, FirstToken) -> Result<()> + Clone + Send + Sync + 'static,
+    R: FnOnce(&Arc<Shared>, &Value) -> Result<()>,
+{
     let model_name = engine.model_name().to_string();
     let mut sampling = options.sampling.clone();
     sampling.apply_checkpoint(engine.generation_config_checked()?.as_ref());
@@ -461,120 +487,128 @@ fn run_owner(
     });
     let heartbeat = start_keep_warm(&shared)?;
 
-    // The ready marker the sidecar runner waits for, on stdout and nothing
-    // else on stdout before it. Everything the operator reads goes to stderr.
-    println!(
-        "{}",
-        json!({"kind": "ready", "host": host, "port": port, "configuration": configuration})
-    );
-    std::io::stdout().flush().ok();
-    eprintln!("[serving on http://{host}:{port}]");
+    // A fallible private ready hook shares the SAME normal shutdown below.
+    let serving = (|| -> Result<()> {
+        ready(&shared, &configuration)?;
+        // The ready marker the sidecar runner waits for, on stdout and nothing
+        // else on stdout before it. Everything the operator reads goes to stderr.
+        println!(
+            "{}",
+            json!({"kind": "ready", "host": host, "port": port, "configuration": configuration})
+        );
+        std::io::stdout().flush().ok();
+        eprintln!("[serving on http://{host}:{port}]");
 
-    loop {
-        let request = match shared.server.recv() {
-            Ok(r) => r,
-            Err(_) => break,
-        };
-        let path = request.url().split('?').next().unwrap_or("").to_string();
-        let method = request.method().clone();
-        match (method, path.as_str()) {
-            (Method::Get, "/health") => {
-                let result = health_body(shared.engine.as_ref(), &shared.front).map(|mut b| {
-                    b["reuse"] = shared.reuse.lock().json(shared.engine.reuse_prefix());
-                    b["sampling"] = sampling_json(&shared.sampling);
-                    b["sessions"] = shared.sessions.lock().json();
-                    b["response_drain"] = shared.drains.json();
-                    b["keep_warm"] = shared.keep_warm.json(&shared.activity, uptime_ns());
-                    b["keep_warm_actions"] = json!(shared.activity.actions.load(Ordering::Relaxed));
-                    if let Some(s) = shared.engine.device().metal4_slot_residency() {
-                        b["metal4_slot_residency"] = json!({
-                            "adds": s.adds,
-                            "add_ns": s.add_ns,
-                            "pipeline_adds": s.pipeline_adds,
-                            "covered": s.covered,
-                            "set_uses": s.set_uses,
-                            "commits": s.commits,
-                            "commit_ns": s.commit_ns,
-                            "commit_max_ns": s.commit_max_ns,
-                            "last_bytes": s.last_bytes,
-                            "max_bytes": s.max_bytes,
-                        });
-                    }
-                    b
-                });
-                let _ = respond_metadata(request, result);
-            }
-            (Method::Get, "/v1/models") => {
-                let result = models_body(
-                    &shared.model_name,
-                    shared.engine.as_ref(),
-                    &shared.decisions,
-                );
-                let _ = respond_metadata(request, result);
-            }
-            (Method::Get, "/v1l/features") => {
-                let _ = respond_metadata(request, Ok(features_body(&shared)));
-            }
-            (Method::Get, p) if p.starts_with(SESSIONS_ROUTE) => {
-                let auth = auth_digest(request.headers());
-                let found = shared.sessions.lock().inspect(
-                    &p[SESSIONS_ROUTE.len()..],
-                    auth,
-                    Instant::now(),
-                );
-                let _ = match found {
-                    Ok(body) => respond_json(request, 200, &body),
-                    Err(lost) => respond_error(request, 404, &not_held(lost)),
-                };
-            }
-            (Method::Delete, p) if p.starts_with(SESSIONS_ROUTE) => {
-                let auth = auth_digest(request.headers());
-                let gone =
-                    shared
-                        .sessions
-                        .lock()
-                        .delete(&p[SESSIONS_ROUTE.len()..], auth, Instant::now());
-                let _ = match gone {
-                    Ok(()) => respond_json(request, 200, &json!({ "deleted": true })),
-                    Err(lost) => respond_error(request, 404, &not_held(lost)),
-                };
-            }
-            (Method::Post, "/eval/abort") => {
-                let _ = handle_abort(&shared, request);
-            }
-            (Method::Post, "/shutdown") => {
-                let _ = respond_json(request, 200, &json!({}));
-                eprintln!("[shutdown requested]");
-                break;
-            }
-            (Method::Post, _) => {
-                let shared = Arc::clone(&shared);
-                let recv = uptime_ns();
-                let idle = recv.saturating_sub(shared.activity.last_active.load(Ordering::Acquire));
-                std::thread::spawn(move || {
-                    let path = path;
-                    let started = Instant::now();
-                    let first = FirstToken {
-                        recv,
-                        handler: uptime_ns(),
-                        idle,
-                        ..FirstToken::default()
+        loop {
+            let request = match shared.server.recv() {
+                Ok(r) => r,
+                Err(_) => break,
+            };
+            let path = request.url().split('?').next().unwrap_or("").to_string();
+            let method = request.method().clone();
+            match (method, path.as_str()) {
+                (Method::Get, "/health") => {
+                    let result = health_body(shared.engine.as_ref(), &shared.front).map(|mut b| {
+                        b["reuse"] = shared.reuse.lock().json(shared.engine.reuse_prefix());
+                        b["sampling"] = sampling_json(&shared.sampling);
+                        b["sessions"] = shared.sessions.lock().json();
+                        b["response_drain"] = shared.drains.json();
+                        b["keep_warm"] = shared.keep_warm.json(&shared.activity, uptime_ns());
+                        b["keep_warm_actions"] =
+                            json!(shared.activity.actions.load(Ordering::Relaxed));
+                        if let Some(s) = shared.engine.device().metal4_slot_residency() {
+                            b["metal4_slot_residency"] = json!({
+                                "adds": s.adds,
+                                "add_ns": s.add_ns,
+                                "pipeline_adds": s.pipeline_adds,
+                                "covered": s.covered,
+                                "set_uses": s.set_uses,
+                                "commits": s.commits,
+                                "commit_ns": s.commit_ns,
+                                "commit_max_ns": s.commit_max_ns,
+                                "last_bytes": s.last_bytes,
+                                "max_bytes": s.max_bytes,
+                            });
+                        }
+                        b
+                    });
+                    let _ = respond_metadata(request, result);
+                }
+                (Method::Get, "/v1/models") => {
+                    let result = models_body(
+                        &shared.model_name,
+                        shared.engine.as_ref(),
+                        &shared.decisions,
+                    );
+                    let _ = respond_metadata(request, result);
+                }
+                (Method::Get, "/v1l/features") => {
+                    let _ = respond_metadata(request, Ok(features_body(&shared)));
+                }
+                (Method::Get, p) if p.starts_with(SESSIONS_ROUTE) => {
+                    let auth = auth_digest(request.headers());
+                    let found = shared.sessions.lock().inspect(
+                        &p[SESSIONS_ROUTE.len()..],
+                        auth,
+                        Instant::now(),
+                    );
+                    let _ = match found {
+                        Ok(body) => respond_json(request, 200, &body),
+                        Err(lost) => respond_error(request, 404, &not_held(lost)),
                     };
-                    let answered = handle_model_request(&shared, &path, request, first);
-                    shared.activity.request_ended(uptime_ns());
-                    if let Err(e) = answered {
-                        eprintln!(
-                            "[{path} failed after {:.1} ms: {e:#}]",
-                            ms(started.elapsed())
-                        );
-                    }
-                });
-            }
-            _ => {
-                let _ = respond_error(request, 404, &format!("unknown endpoint: {path}"));
+                }
+                (Method::Delete, p) if p.starts_with(SESSIONS_ROUTE) => {
+                    let auth = auth_digest(request.headers());
+                    let gone = shared.sessions.lock().delete(
+                        &p[SESSIONS_ROUTE.len()..],
+                        auth,
+                        Instant::now(),
+                    );
+                    let _ = match gone {
+                        Ok(()) => respond_json(request, 200, &json!({ "deleted": true })),
+                        Err(lost) => respond_error(request, 404, &not_held(lost)),
+                    };
+                }
+                (Method::Post, "/eval/abort") => {
+                    let _ = handle_abort(&shared, request);
+                }
+                (Method::Post, "/shutdown") => {
+                    let _ = respond_json(request, 200, &json!({}));
+                    eprintln!("[shutdown requested]");
+                    break;
+                }
+                (Method::Post, _) => {
+                    let shared = Arc::clone(&shared);
+                    let recv = uptime_ns();
+                    let idle =
+                        recv.saturating_sub(shared.activity.last_active.load(Ordering::Acquire));
+                    let dispatch = dispatch.clone();
+                    std::thread::spawn(move || {
+                        let path = path;
+                        let started = Instant::now();
+                        let first = FirstToken {
+                            recv,
+                            handler: uptime_ns(),
+                            idle,
+                            ..FirstToken::default()
+                        };
+                        let answered = dispatch(&shared, &path, request, first);
+                        shared.activity.request_ended(uptime_ns());
+                        if let Err(e) = answered {
+                            eprintln!(
+                                "[{path} failed after {:.1} ms: {e:#}]",
+                                ms(started.elapsed())
+                            );
+                        }
+                    });
+                }
+                _ => {
+                    let _ = respond_error(request, 404, &format!("unknown endpoint: {path}"));
+                }
             }
         }
-    }
+        Ok(())
+    })();
     // In-flight requests answer within the budget; then their connections
     // are cut. A request thread still decoding holds the sequence, and the
     // batch thread holds the pool; wait for both so the model is not dropped
@@ -584,7 +618,7 @@ fn run_owner(
     }
     shutdown_http(&shared.server);
     shared.engine.shutdown();
-    Ok(())
+    serving
 }
 
 /// Starts `shared.keep_warm`'s heartbeat, if it is on. Each action takes the
@@ -793,8 +827,29 @@ fn run_decisions_configured(
 fn handle_model_request(
     shared: &Shared,
     path: &str,
+    request: Request,
+    first: FirstToken,
+) -> Result<()> {
+    handle_model_request_with_stream(
+        shared,
+        path,
+        request,
+        first,
+        |request| ChunkedWriter::start(request, "text/event-stream"),
+        |turn| drop(turn.take()),
+    )
+}
+
+// One routing/body/admission/error algorithm. Production passes its existing
+// writer and settled action; tests can hold transport without adding a public
+// scheduling option or duplicating the handler. No new per-request allocation.
+fn handle_model_request_with_stream<'a>(
+    shared: &'a Shared,
+    path: &str,
     mut request: Request,
     mut first: FirstToken,
+    start_stream: impl FnOnce(Request) -> Result<ChunkedWriter>,
+    on_settled: impl FnOnce(&mut Option<turns::Turn<'a>>),
 ) -> Result<()> {
     let mut body = String::new();
     request
@@ -879,8 +934,8 @@ fn handle_model_request(
             stream_response_settlement(
                 shared,
                 *stream,
-                || ChunkedWriter::start(request, "text/event-stream"),
-                || drop(turn.take()),
+                || start_stream(request),
+                || on_settled(&mut turn),
             )
         }
         Ok(Reply::Eval(v)) => eval(shared, request, &v),

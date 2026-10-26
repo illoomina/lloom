@@ -150,7 +150,8 @@ retirement certificate or additional global device wait is implied.
 **Stored reply versus delivery (decision 59):** a retained session keeps the
 full hook-accepted reply, including a held partial-marker tail even if an
 earlier event later fails to write. `usage.completion_tokens` still counts
-accepted sampled tokens; `written_bytes` and `write_failed` are separate
+accepted complete sampled tokens (a saved partial raw tail adds no complete
+sampled token); `written_bytes` and `write_failed` are separate
 transport witnesses, not client acknowledgements. Socket failure can prevent a
 final timings event/[DONE]; the request error line carries its frontier then.
 `/health.response_drain` reports active contexts, configured bounds and named

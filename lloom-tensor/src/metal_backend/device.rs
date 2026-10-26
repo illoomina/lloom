@@ -2632,55 +2632,74 @@ impl MetalDevice {
         // Whatever this pass does, the arena the last pass installed must not
         // serve it: a pass is served only under its own key's plan.
         self.clear_arena_keep_base();
-        let state = match (pp.state.pending, pp.plans.contains_key(&key)) {
+        // A refusal past the bits above leaves no half-open pass: the body
+        // bits are cleared and no `current` is registered, so the caller's
+        // error path owes no `finish_pass` and the next pass opens on the
+        // state this one found.
+        let opened = match (pp.state.pending, pp.plans.contains_key(&key)) {
             (Some(closes), cached) => {
                 // The recorder still holds the pending key's pass as its
                 // current step; this pass becomes the step that says what
                 // escaped it.
                 self.next_arena_recording_step();
                 pp.counters.observed += 1;
-                if cached {
+                Ok(if cached {
                     PassState::Observing { closes }
                 } else {
                     PassState::Recording {
                         key,
                         closes: Some(closes),
                     }
-                }
+                })
             }
             (None, true) => {
                 let generation = pp.state.base_generation;
                 let stale = pp.arena_generation.get(&key) != Some(&generation);
-                if stale || !pp.arenas.contains_key(&key) {
+                let built = if stale || !pp.arenas.contains_key(&key) {
                     let plan = pp.plans.get(&key).expect("cached").clone();
                     let base = pp.base.clone().expect("a cached plan has a base");
-                    let arena = Arena::new(base, plan, pp.layout)
-                        .map_err(|e| MetalError::Message(format!("pass plan rejected: {e}")))?;
-                    pp.arenas.insert(key, arena);
-                    pp.arena_generation.insert(key, generation);
-                }
-                let arena = pp.arenas.get(&key).expect("built above").clone();
-                crate::kernels::metal::set_hazard_key_unless_explicit(
-                    crate::kernels::metal::HazardKey::Range,
-                );
-                {
-                    let mut slot = self.arena.write();
-                    *slot = Some(arena.clone());
-                }
-                arena.begin_step();
-                pp.counters.served += 1;
-                self.pass_state
-                    .fetch_or(0b100, std::sync::atomic::Ordering::Relaxed);
-                PassState::Served(key)
+                    Arena::new(base, plan, pp.layout)
+                        .map_err(|e| MetalError::Message(format!("pass plan rejected: {e}")))
+                        .map(|arena| {
+                            pp.arenas.insert(key, arena);
+                            pp.arena_generation.insert(key, generation);
+                        })
+                } else {
+                    Ok(())
+                };
+                built.map(|()| {
+                    let arena = pp.arenas.get(&key).expect("built above").clone();
+                    crate::kernels::metal::set_hazard_key_unless_explicit(
+                        crate::kernels::metal::HazardKey::Range,
+                    );
+                    {
+                        let mut slot = self.arena.write();
+                        *slot = Some(arena.clone());
+                    }
+                    arena.begin_step();
+                    pp.counters.served += 1;
+                    self.pass_state
+                        .fetch_or(0b100, std::sync::atomic::Ordering::Relaxed);
+                    PassState::Served(key)
+                })
             }
             (None, false) => {
                 self.begin_arena_recording();
                 pp.counters.recorded += 1;
-                PassState::Recording { key, closes: None }
+                Ok(PassState::Recording { key, closes: None })
             }
         };
-        pp.state.current = Some(state);
-        Ok(())
+        match opened {
+            Ok(state) => {
+                pp.state.current = Some(state);
+                Ok(())
+            }
+            Err(error) => {
+                self.pass_state
+                    .fetch_and(!0b1110, std::sync::atomic::Ordering::Relaxed);
+                Err(error.into())
+            }
+        }
     }
 
     /// Close the pass `begin_pass` opened: build the plan a pending key was

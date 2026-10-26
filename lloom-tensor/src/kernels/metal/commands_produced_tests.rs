@@ -7,6 +7,7 @@
 //! mutant these tests exist to kill.
 use super::*;
 use objc2_metal::{MTLDevice, MTLSharedEvent};
+use std::ptr::NonNull;
 use std::time::{Duration, Instant};
 
 type Event = Retained<ProtocolObject<dyn MTLSharedEvent>>;
@@ -397,7 +398,10 @@ fn a_hold_deeper_than_the_slots_drains_from_the_parked_owner() {
     let lanes = crate::kernels::metal::io_queue::io_lanes() + 1;
     let state = f.commands.lock_state().unwrap();
     assert_eq!(state.spare_after.len(), produced::HELD_CAP + 1);
-    assert!(state.spare_after.iter().all(|list| list.is_empty() && list.capacity() >= lanes));
+    assert!(state
+        .spare_after
+        .iter()
+        .all(|list| list.is_empty() && list.capacity() >= lanes));
     drop(state);
     assert_eq!(
         f.commands.clock().completed_count().0,
@@ -416,4 +420,367 @@ fn an_input_already_produced_holds_nothing() {
     assert_eq!(f.commands.produced_stats().held, 0);
     f.commands.wait_marker(&marker).unwrap();
     assert!(computed(&f.dst));
+}
+
+/// How the inputs a parked owner waits for reach the queue.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Delivery {
+    /// The IO path's: each event's notification, on the queue's one
+    /// `MTLSharedEventListener` (`Commands::notify_produced_at`).
+    Listener,
+    /// One host thread raises the second input, calls `produced`, then the
+    /// first: a fill or fetch worker producing in order.
+    OneThread,
+    /// A host thread per input. The control: no delivery can wait behind
+    /// another's.
+    ThreadEach,
+}
+
+/// Where the inputs sit in the held queue.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Shape {
+    /// One held recording reads both inputs: a point-of-use batch over two IO
+    /// lanes (`IoQueue::load_ordered`).
+    Lanes,
+    /// The head reads the first input and a later recording the second,
+    /// produced first: concurrent IO completing later-before-earlier.
+    LaterFirst,
+}
+
+/// When the first input is produced, relative to the parked owner's look
+/// after the second input woke it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum When {
+    /// After the owner has looked and parked again.
+    AfterPark,
+    /// Before the owner's wake snapshot (`schedule-hooks` only).
+    #[cfg_attr(not(feature = "schedule-hooks"), allow(dead_code))]
+    BeforeSnapshot,
+    /// After the owner's look, before it parks (`schedule-hooks` only).
+    #[cfg_attr(not(feature = "schedule-hooks"), allow(dead_code))]
+    BeforePark,
+}
+
+/// The owner is parked behind held work: for a slot on Metal 4, at the held
+/// queue's cap on Metal 3.
+fn owner_parked(commands: &Commands) -> bool {
+    match commands.core.modern_queue.as_ref() {
+        Some(queue) => queue.ready_parked_for_test(),
+        None => commands.core.produced.wake.test_is_parked(),
+    }
+}
+
+/// Poll `ready` until it holds or `within` passes.
+fn until(within: Duration, mut ready: impl FnMut() -> bool) -> bool {
+    let deadline = Instant::now() + within;
+    while !ready() {
+        if Instant::now() > deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    true
+}
+
+#[cfg(feature = "schedule-hooks")]
+mod position {
+    //! Raise the first input from the owner thread itself, at one schedule
+    //! point of the park that follows the second input's wake.
+    use super::{Event, Shared, When};
+    use crate::schedule_hook::Site;
+    use std::cell::Cell;
+    use std::sync::atomic::{AtomicU8, Ordering};
+
+    thread_local! {
+        static OWNER: Cell<bool> = const { Cell::new(false) };
+    }
+    /// 0 idle, 1 the second input raised, 2 the first raised by the hook.
+    pub(super) static PHASE: AtomicU8 = AtomicU8::new(0);
+    static AT: AtomicU8 = AtomicU8::new(0);
+    static FIRST: parking_lot::Mutex<Option<Shared>> = parking_lot::Mutex::new(None);
+
+    fn hook(site: Site) {
+        if !OWNER.with(Cell::get) || PHASE.load(Ordering::Acquire) != 1 {
+            return;
+        }
+        let at = match site {
+            Site::WakeParkReturned => When::BeforeSnapshot as u8,
+            Site::WakeRegistered => When::BeforePark as u8,
+            _ => return,
+        };
+        if AT.load(Ordering::Acquire) == at {
+            if let Some(first) = FIRST.lock().as_ref() {
+                first.0.setSignaledValue(1);
+            }
+            PHASE.store(2, Ordering::Release);
+        }
+    }
+
+    pub(super) fn arm(when: When, first: &Event) {
+        AT.store(when as u8, Ordering::Release);
+        *FIRST.lock() = Some(Shared(first.clone()));
+        crate::schedule_hook::install(Some(hook));
+    }
+
+    pub(super) fn this_thread_is_the_owner() {
+        OWNER.with(|owner| owner.set(true));
+    }
+}
+
+/// Park the owner behind two inputs with every way forward held — every
+/// Metal 4 slot held by recordings only a producer can release, or the held
+/// queue at its cap on Metal 3 — then produce the second input, and the first
+/// once the owner has woken, looked and parked again. The owner must wake for
+/// the first and finish: a hang is the defect, bounded here by the test's
+/// own deadline, never by the code under test.
+fn a_parked_owner_wakes_for_every_input(shape: Shape, delivery: Delivery, when: When) {
+    let f = fixture();
+    if f.commands.host_input_arm() == HostInputArm::GpuWait {
+        eprintln!("NOT_APPLICABLE nothing is held on the gpu-wait arm");
+        return;
+    }
+    let first = f.gate.clone();
+    let second = f.native.as_ref().newSharedEvent().unwrap();
+    let listen = |event: &Event| {
+        if delivery == Delivery::Listener {
+            f.commands.notify_produced_at(event, 1).unwrap();
+        }
+    };
+    match shape {
+        Shape::Lanes => {
+            f.commands.commit_when_produced(&first, 1).unwrap();
+            f.commands.commit_when_produced(&second, 1).unwrap();
+            listen(&first);
+            listen(&second);
+            encode_dependent(&f);
+        }
+        Shape::LaterFirst => {
+            f.commands.commit_when_produced(&first, 1).unwrap();
+            listen(&first);
+            encode_dependent(&f);
+            f.commands.commit_when_produced(&second, 1).unwrap();
+            listen(&second);
+            let mut blit = f.commands.blit_command_encoder().unwrap();
+            // SAFETY: as the fixture's fill.
+            unsafe { blit.fill_buffer(&f.dst, (2048, 4096), 0x5c) };
+        }
+    }
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let owner = {
+        let commands = Arc::clone(&f.commands);
+        std::thread::spawn(move || {
+            #[cfg(feature = "schedule-hooks")]
+            position::this_thread_is_the_owner();
+            let mut result = Ok(());
+            for _ in 0..produced::HELD_CAP + 2 {
+                if let Err(error) = commands.flush_marker() {
+                    result = Err(error.to_string());
+                    break;
+                }
+            }
+            let _ = done_tx.send(result);
+        })
+    };
+    // Stuck: parked, with nothing but a producer able to move it.
+    let stuck = |commands: &Commands| {
+        owner_parked(commands)
+            && match commands.core.modern_queue.as_ref() {
+                Some(queue) => {
+                    let (allocated, available) = queue.slots_for_test();
+                    available == 0 && commands.produced_stats().held_now + 1 == allocated
+                }
+                None => commands.produced_stats().held_now == produced::HELD_CAP,
+            }
+    };
+    assert!(
+        until(Duration::from_secs(10), || stuck(&f.commands)),
+        "the owner never parked behind the held work: {:?}",
+        f.commands.produced_stats()
+    );
+    let parks = f.commands.produced_stats().parks;
+    #[cfg(feature = "schedule-hooks")]
+    if when != When::AfterPark {
+        position::arm(when, &first);
+        position::PHASE.store(1, Ordering::Release);
+    }
+    #[cfg(not(feature = "schedule-hooks"))]
+    assert_eq!(when, When::AfterPark, "positions need schedule-hooks");
+    let produce = |event: &Event| {
+        let event = Shared(event.clone());
+        let commands = Arc::clone(&f.commands);
+        move || {
+            let event = event;
+            event.0.setSignaledValue(1);
+            commands.produced(&event.0, 1).map_err(|e| e.to_string())
+        }
+    };
+    let mut producers = Vec::new();
+    match delivery {
+        Delivery::Listener => second.setSignaledValue(1),
+        Delivery::OneThread => {
+            let produce_second = produce(&second);
+            let produce_first = produce(&first);
+            producers.push(std::thread::spawn(move || {
+                produce_second()?;
+                produce_first()
+            }));
+        }
+        Delivery::ThreadEach => producers.push(std::thread::spawn(produce(&second))),
+    }
+    if delivery != Delivery::OneThread && when == When::AfterPark {
+        // The second input woke the owner; it looked, and parked again.
+        assert!(
+            until(Duration::from_secs(10), || {
+                f.commands.produced_stats().parks > parks && owner_parked(&f.commands)
+            }),
+            "the second input never woke the owner: {:?}",
+            f.commands.produced_stats()
+        );
+        match delivery {
+            Delivery::Listener => first.setSignaledValue(1),
+            Delivery::ThreadEach => producers.push(std::thread::spawn(produce(&first))),
+            Delivery::OneThread => unreachable!(),
+        }
+    }
+    let finished = done_rx.recv_timeout(Duration::from_secs(20));
+    let stats = f.commands.produced_stats();
+    eprintln!(
+        "PARKED_OWNER api={} shape={shape:?} delivery={delivery:?} when={when:?} \
+         finished={} first={} second={} owner_parked={} stats={stats:?}",
+        f.commands.actual_command_api(),
+        finished.is_ok(),
+        first.signaledValue(),
+        second.signaledValue(),
+        owner_parked(&f.commands),
+    );
+    assert!(
+        finished.is_ok(),
+        "HANG: the owner parked behind held work was never woken for the first \
+         input (shape={shape:?} delivery={delivery:?} when={when:?}): {stats:?}"
+    );
+    finished.unwrap().unwrap();
+    owner.join().unwrap();
+    for producer in producers {
+        producer.join().unwrap().unwrap();
+    }
+    f.commands.flush_and_wait().unwrap();
+    assert!(
+        computed(&f.dst),
+        "the dependent compute read the wrong input"
+    );
+    if shape == Shape::LaterFirst {
+        assert!(dst_bytes(&f.dst)[2048..].iter().all(|b| *b == 0x5c));
+    }
+    f.commands.check_failed().unwrap();
+    let stats = f.commands.produced_stats();
+    assert_eq!(stats.held_now, 0, "{stats:?}");
+    assert_eq!(
+        f.commands.clock().completed_count().0,
+        f.commands.clock().current_epoch().0,
+        "every epoch taken completed"
+    );
+    if let Some((allocated, available)) = metal4_slots_settle(&f.commands) {
+        assert_eq!(allocated, available + 1, "a Metal 4 slot was stranded");
+    }
+}
+
+/// The IO path's shape: one recording behind two lanes, the second lane's
+/// notification first. Its producer waits for the state lock the parked owner
+/// holds, and must not keep the first lane's notification from waking it.
+#[test]
+fn a_parked_owner_wakes_for_every_io_lane() {
+    a_parked_owner_wakes_for_every_input(Shape::Lanes, Delivery::Listener, When::AfterPark);
+}
+
+/// Concurrent IO completing later-before-earlier: a later held recording's
+/// input lands first, and cannot release anything while the head waits.
+#[test]
+fn a_parked_owner_wakes_when_the_head_input_lands_last() {
+    a_parked_owner_wakes_for_every_input(Shape::LaterFirst, Delivery::Listener, When::AfterPark);
+}
+
+/// A host producer that produces in order: its `produced` for the second
+/// input must return before the owner releases anything, or it never
+/// produces the first.
+#[test]
+fn a_parked_owner_wakes_for_an_in_order_host_producer() {
+    a_parked_owner_wakes_for_every_input(Shape::Lanes, Delivery::OneThread, When::AfterPark);
+}
+
+/// The control: one thread per input, so neither delivery can wait behind
+/// the other. The wake protocol alone moves the owner.
+#[test]
+fn a_parked_owner_wakes_for_a_producer_thread_per_input() {
+    a_parked_owner_wakes_for_every_input(Shape::Lanes, Delivery::ThreadEach, When::AfterPark);
+}
+
+/// The first input produced before the owner's wake snapshot: its look sees
+/// it, whatever the notification does.
+#[cfg(feature = "schedule-hooks")]
+#[test]
+fn a_parked_owner_sees_an_input_produced_before_its_snapshot() {
+    a_parked_owner_wakes_for_every_input(Shape::Lanes, Delivery::Listener, When::BeforeSnapshot);
+}
+
+/// The first input produced after the owner's look, before it parks: only the
+/// notification can wake it.
+#[cfg(feature = "schedule-hooks")]
+#[test]
+fn a_parked_owner_wakes_for_an_input_produced_before_it_parks() {
+    a_parked_owner_wakes_for_every_input(Shape::Lanes, Delivery::Listener, When::BeforePark);
+}
+
+/// The platform premise behind the listener arm: an `MTLSharedEventListener`
+/// runs its blocks one at a time, so a block that waits holds back every
+/// notification queued behind it, on any event.
+#[test]
+fn an_event_listener_runs_one_block_at_a_time() {
+    use std::sync::atomic::AtomicBool;
+    let native = Device::system_default().unwrap();
+    let listener = objc2_metal::MTLSharedEventListener::new();
+    let first = native.as_ref().newSharedEvent().unwrap();
+    let second = native.as_ref().newSharedEvent().unwrap();
+    let entered = Arc::new(AtomicBool::new(false));
+    let release = Arc::new(AtomicBool::new(false));
+    let ran = Arc::new(AtomicBool::new(false));
+    let blocking = {
+        let (entered, release) = (entered.clone(), release.clone());
+        block2::RcBlock::new(
+            move |_: NonNull<ProtocolObject<dyn MTLSharedEvent>>, _: u64| {
+                entered.store(true, Ordering::Release);
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while !release.load(Ordering::Acquire) && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            },
+        )
+    };
+    let marking = {
+        let ran = ran.clone();
+        block2::RcBlock::new(
+            move |_: NonNull<ProtocolObject<dyn MTLSharedEvent>>, _: u64| {
+                ran.store(true, Ordering::Release);
+            },
+        )
+    };
+    // SAFETY: the blocks are valid for the calls; Metal copies them.
+    unsafe {
+        first.notifyListener_atValue_block(&listener, 1, block2::RcBlock::as_ptr(&blocking));
+        second.notifyListener_atValue_block(&listener, 1, block2::RcBlock::as_ptr(&marking));
+    }
+    first.setSignaledValue(1);
+    assert!(until(Duration::from_secs(5), || entered.load(Ordering::Acquire)));
+    second.setSignaledValue(1);
+    let overtook = until(Duration::from_millis(500), || ran.load(Ordering::Acquire));
+    release.store(true, Ordering::Release);
+    let delivered = until(Duration::from_secs(5), || ran.load(Ordering::Acquire));
+    eprintln!(
+        "LISTENER_SERIAL second_ran_while_first_blocked={overtook} delivered_after={delivered}"
+    );
+    assert!(delivered, "the second notification was never delivered");
+    assert!(
+        !overtook,
+        "the listener ran a second block beside a blocked first: the listener \
+         arm's reproduction no longer reaches the defect"
+    );
 }

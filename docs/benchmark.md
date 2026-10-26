@@ -256,9 +256,10 @@ repository and none is hidden by the numbers above.
   17–19 ms a step, B=4 decode 151 → 217 tok/s at ~100 tokens and 138 → 194
   at ~872. At ~2370 tokens B=4 is still level-to-behind (126–135 against
   133): the other streams' prompt pieces ride the first streams' decode
-  windows, where llama.cpp prefills the whole burst first. Batches of 11–16
-  rows still take the GEMM; where the row axis should stop is measured and
-  open (`issue-1084.md` §8.6).
+  windows, where llama.cpp prefills the whole burst first. Since 2026-10-26
+  the row axis takes batches of up to 12 rows (decision 60: B = 11 and 12
+  measured ×1.26 and ×1.18 at ~100 tokens, `issue-1084.md` §9); 13–16 rows
+  still take the GEMM, past the kernel's register limit (§10).
 - **B=16 at long context.** Prefill trails at ~2370 tokens (20.8 vs 17.6 s);
   prefilling pending prompts together does not help on this machine (the
   per-token prefill cost is flat in the batch; the growth is arrival order

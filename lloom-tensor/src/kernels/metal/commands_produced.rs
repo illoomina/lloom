@@ -244,8 +244,31 @@ pub struct ProducedStats {
     /// IO command buffers committed after a held recording instead of at
     /// their issue (the recording carrying their compute signal was held).
     pub io_deferred: u64,
-    /// Summed time producers waited for the state lock, µs.
+    /// Summed time producers spent at the state lock — a try, and the
+    /// release when it was free — µs. No producer waits for it.
     pub producer_lock_us: u64,
+    /// Times a producer found the state lock held and left its release to
+    /// the holder: producers never wait for the lock.
+    pub delegated: u64,
+}
+
+/// Part of every state-lock acquisition's custody, dropped after the lock:
+/// runs the release a producer that found the lock held left to this holder.
+pub(super) struct AfterUnlock<'a>(pub(super) &'a CommandsCore);
+
+impl Drop for AfterUnlock<'_> {
+    fn drop(&mut self) {
+        let core = self.0;
+        // `live` changes only under the lock: zero means nothing is held, so
+        // nothing a producer left can be waiting.
+        if core.produced.live.load(Ordering::Relaxed) == 0 || std::thread::panicking() {
+            return;
+        }
+        if let Err(error) = core.release_pending(false) {
+            core.failure
+                .record(format!("held work its input released was refused: {error}"));
+        }
+    }
 }
 
 /// The block an event's notification runs: the event and the value reached.
@@ -274,6 +297,10 @@ pub(super) struct ProducedState {
     held_us: AtomicU64,
     io_deferred: AtomicU64,
     producer_lock_us: AtomicU64,
+    delegated: AtomicU64,
+    /// A producer found the state lock held: the holder runs the release
+    /// once it unlocks (`AfterUnlock`).
+    release_pending: AtomicBool,
     late_logged: AtomicBool,
     /// The event and highest value of the last cancellation.
     cancelled_event: AtomicUsize,
@@ -300,6 +327,8 @@ impl ProducedState {
             held_us: AtomicU64::new(0),
             io_deferred: AtomicU64::new(0),
             producer_lock_us: AtomicU64::new(0),
+            delegated: AtomicU64::new(0),
+            release_pending: AtomicBool::new(false),
             late_logged: AtomicBool::new(false),
             cancelled_event: AtomicUsize::new(0),
             cancelled_upto: AtomicU64::new(0),
@@ -478,9 +507,12 @@ impl CommandsCore {
     }
 
     /// A producer raised `event` to `value`: commit what that released.
-    /// Wakes an owner parked with the state lock (a Metal 4 slot, a full
-    /// held queue) before taking the lock, so it submits the released work
-    /// itself rather than wait on this thread.
+    /// Never waits for the state lock. An owner parked holding it (a Metal 4
+    /// slot, a full held queue) is woken first and submits the released work
+    /// itself; any other holder runs the release once it unlocks. A producer
+    /// waiting for the lock would hold back every input its thread or its
+    /// event listener delivers next, the one a parked owner waits for among
+    /// them (`docs/invariants.md` §15.1q).
     pub(super) fn produced_on(
         &self,
         event: &ProtocolObject<dyn MTLSharedEvent>,
@@ -496,13 +528,12 @@ impl CommandsCore {
             queue.notify_ready();
         }
         let asked = std::time::Instant::now();
-        let released = self.lock_entry().and_then(|mut state| {
-            self.produced.producer_lock_us.fetch_add(
-                asked.elapsed().as_micros().min(u64::MAX as u128) as u64,
-                Ordering::Relaxed,
-            );
-            self.release_produced_locked(&mut state)
-        });
+        self.produced.release_pending.store(true, Ordering::SeqCst);
+        let released = self.release_pending(true);
+        self.produced.producer_lock_us.fetch_add(
+            asked.elapsed().as_micros().min(u64::MAX as u128) as u64,
+            Ordering::Relaxed,
+        );
         if let Ok(n) = released {
             self.produced
                 .released_by_producer
@@ -515,6 +546,31 @@ impl CommandsCore {
                 .record(format!("held work its input released was refused: {error}"));
         }
         released
+    }
+
+    /// Run the release a producer left pending, while the state lock is
+    /// free. When it is held, the holder runs this once it unlocks: every
+    /// unlock is followed by a look at the flag, and every flag raised is
+    /// followed by an attempt at the lock, so one of the two sees the other.
+    /// `producer` counts a lock found held as a delegation.
+    fn release_pending(&self, producer: bool) -> Result<usize, MetalKernelError> {
+        let mut released = 0;
+        loop {
+            std::sync::atomic::fence(Ordering::SeqCst);
+            if !self.produced.release_pending.load(Ordering::SeqCst) {
+                return Ok(released);
+            }
+            let Some(mut state) = self.try_lock_entry_unhooked() else {
+                if producer {
+                    self.produced.delegated.fetch_add(1, Ordering::Relaxed);
+                }
+                return Ok(released);
+            };
+            self.produced.release_pending.store(false, Ordering::SeqCst);
+            let ran = self.release_produced_locked(&mut state);
+            drop(state);
+            released += ran?;
+        }
     }
 
     /// An input produced after the work waiting for it was cancelled finds
@@ -615,6 +671,7 @@ impl Commands {
             held_us: p.held_us.load(Ordering::Relaxed),
             io_deferred: p.io_deferred.load(Ordering::Relaxed),
             producer_lock_us: p.producer_lock_us.load(Ordering::Relaxed),
+            delegated: p.delegated.load(Ordering::Relaxed),
         }
     }
 
@@ -938,8 +995,8 @@ impl Commands {
             }
             self.core.failure.check()?;
             self.core.refuse_park_in_callback()?;
-            // Parked holding the state lock: a producer wakes this before it
-            // takes the lock, and the release above then runs here.
+            // Parked holding the state lock: a producer wakes this and never
+            // waits for the lock, and the release above then runs here.
             self.core.produced.parks.fetch_add(1, Ordering::Relaxed);
             self.core.produced.wake.wait(seen);
         }

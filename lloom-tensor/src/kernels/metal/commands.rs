@@ -450,9 +450,13 @@ struct ClosedEncoders<'a> {
     cancelled: Vec<CommandBuffer>,
     // This acquisition published residency for a commit already.
     residency_published: bool,
-    // Last: closed wrappers can hand their fields to this same hold before
-    // its existing completed-prefix drain runs. No release occurs under state.
+    // After the closed wrappers: they can hand their fields to this same hold
+    // before its existing completed-prefix drain runs. No release occurs
+    // under state.
     completed_hold: Option<CompletedRelease<'a, Held>>,
+    // Last: the release a producer left to this holder, once every payload
+    // above is gone (`produced::AfterUnlock`).
+    after_unlock: Option<produced::AfterUnlock<'a>>,
 }
 
 type EntryGuard<'a> = DeferredGuard<parking_lot::MutexGuard<'a, EntryState>, ClosedEncoders<'a>>;
@@ -2695,6 +2699,20 @@ impl CommandsCore {
     fn lock_entry(&self) -> Result<EntryGuard<'_>, MetalKernelError> {
         self.state
             .lock_checked(Side::Host, || self.refuse_park_in_callback())
+            .map(|guard| {
+                let custody = ClosedEncoders {
+                    after_unlock: Some(produced::AfterUnlock(self)),
+                    ..ClosedEncoders::default()
+                };
+                DeferredGuard::new(guard, custody)
+            })
+    }
+
+    /// The state lock when it is free, for a producer's release: its caller
+    /// runs what producers left pending itself (`produced::release_pending`).
+    fn try_lock_entry_unhooked(&self) -> Option<EntryGuard<'_>> {
+        self.state
+            .try_lock()
             .map(|guard| DeferredGuard::new(guard, ClosedEncoders::default()))
     }
 

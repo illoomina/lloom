@@ -488,6 +488,7 @@ mod position {
     //! point of the park that follows the second input's wake.
     use super::{Event, Shared, When};
     use crate::schedule_hook::Site;
+    use objc2_metal::MTLSharedEvent;
     use std::cell::Cell;
     use std::sync::atomic::{AtomicU8, Ordering};
 
@@ -674,6 +675,10 @@ fn a_parked_owner_wakes_for_every_input(shape: Shape, delivery: Delivery, when: 
     f.commands.check_failed().unwrap();
     let stats = f.commands.produced_stats();
     assert_eq!(stats.held_now, 0, "{stats:?}");
+    assert!(
+        stats.delegated >= 1,
+        "no producer found the parked owner's lock held: the schedule was not reached: {stats:?}"
+    );
     assert_eq!(
         f.commands.clock().completed_count().0,
         f.commands.clock().current_epoch().0,
@@ -728,6 +733,74 @@ fn a_parked_owner_sees_an_input_produced_before_its_snapshot() {
 #[test]
 fn a_parked_owner_wakes_for_an_input_produced_before_it_parks() {
     a_parked_owner_wakes_for_every_input(Shape::Lanes, Delivery::Listener, When::BeforePark);
+}
+
+/// A producer that finds the state lock held by an owner that is not parked
+/// leaves its release to that owner and returns at once; the owner submits
+/// the released work as it unlocks, with no cut or wait of its own.
+#[test]
+fn a_producer_leaves_its_release_to_the_lock_holder() {
+    let f = fixture();
+    if f.commands.host_input_arm() == HostInputArm::GpuWait {
+        eprintln!("NOT_APPLICABLE nothing is held on the gpu-wait arm");
+        return;
+    }
+    f.commands.commit_when_produced(&f.gate, 1).unwrap();
+    encode_dependent(&f);
+    f.commands.flush_marker().unwrap();
+    let held = 1 + signal_cut(&f.commands);
+    assert_eq!(f.commands.produced_stats().held_now, held);
+    let calls_before = native_calls(&f.commands);
+    let state = f.commands.lock_state().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let producer = {
+        let gate = Shared(f.gate.clone());
+        let commands = Arc::clone(&f.commands);
+        std::thread::spawn(move || {
+            let gate = gate;
+            gate.0.setSignaledValue(1);
+            let _ = tx.send(commands.produced(&gate.0, 1).map_err(|e| e.to_string()));
+        })
+    };
+    let returned = rx.recv_timeout(Duration::from_secs(5));
+    let calls_while_held = native_calls(&f.commands) - calls_before;
+    let released_while_held = f.commands.produced_stats().released;
+    drop(state);
+    // Native calls are per segment (a Metal 4 signal ends one), so the
+    // recordings are counted by `released`.
+    let calls_after_unlock = native_calls(&f.commands) - calls_before;
+    let stats = f.commands.produced_stats();
+    eprintln!(
+        "LEFT_TO_HOLDER api={} returned={returned:?} calls_while_held={calls_while_held} \
+         released_while_held={released_while_held} calls_after_unlock={calls_after_unlock} \
+         stats={stats:?}",
+        f.commands.actual_command_api()
+    );
+    assert_eq!(
+        returned,
+        Ok(Ok(0)),
+        "the producer waited for the state lock, or released work itself"
+    );
+    producer.join().unwrap();
+    assert_eq!(
+        (calls_while_held, released_while_held),
+        (0, 0),
+        "held work was submitted under another thread's lock"
+    );
+    assert!(
+        calls_after_unlock > 0,
+        "the holder did not submit the released work as it unlocked"
+    );
+    assert_eq!(stats.delegated, 1, "{stats:?}");
+    assert_eq!(stats.released_by_producer, 0, "{stats:?}");
+    assert_eq!(stats.released, held as u64, "{stats:?}");
+    assert_eq!(stats.held_now, 0, "{stats:?}");
+    f.commands.flush_and_wait().unwrap();
+    assert!(
+        computed(&f.dst),
+        "the dependent compute read the wrong input"
+    );
+    f.commands.check_failed().unwrap();
 }
 
 /// The platform premise behind the listener arm: an `MTLSharedEventListener`

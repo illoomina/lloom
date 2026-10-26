@@ -1006,13 +1006,14 @@ fn print_churn(m: &lloom_tensor::MetalDevice, before: &ChurnSnapshot) {
     let held = m.commands().produced_stats();
     eprintln!(
         "[host input since load: arm={} held={} released={} (by producer {}) \
-         held_time={:.3} ms producer_lock_wait={:.3} ms cancelled={} late_after_cancel={} parks={} io_deferred={} held_now={}]",
+         held_time={:.3} ms producer_lock_wait={:.3} ms delegated={} cancelled={} late_after_cancel={} parks={} io_deferred={} held_now={}]",
         m.commands().host_input_arm().as_str(),
         held.held,
         held.released,
         held.released_by_producer,
         held.held_us as f64 / 1e3,
         held.producer_lock_us as f64 / 1e3,
+        held.delegated,
         held.cancelled,
         held.late_after_cancel,
         held.parks,

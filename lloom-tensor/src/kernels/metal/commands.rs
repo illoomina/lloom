@@ -456,7 +456,7 @@ struct ClosedEncoders<'a> {
     completed_hold: Option<CompletedRelease<'a, Held>>,
     // Last: the release a producer left to this holder, once every payload
     // above is gone (`produced::AfterUnlock`).
-    after_unlock: Option<produced::AfterUnlock<'a>>,
+    _after_unlock: Option<produced::AfterUnlock<'a>>,
 }
 
 type EntryGuard<'a> = DeferredGuard<parking_lot::MutexGuard<'a, EntryState>, ClosedEncoders<'a>>;
@@ -2701,7 +2701,7 @@ impl CommandsCore {
             .lock_checked(Side::Host, || self.refuse_park_in_callback())
             .map(|guard| {
                 let custody = ClosedEncoders {
-                    after_unlock: Some(produced::AfterUnlock(self)),
+                    _after_unlock: Some(produced::AfterUnlock(self)),
                     ..ClosedEncoders::default()
                 };
                 DeferredGuard::new(guard, custody)

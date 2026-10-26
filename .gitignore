@@ -5,9 +5,8 @@ data/
 dist/
 target/
 
-# Remove Cargo.lock from gitignore if creating an executable, leave it for libraries
-# More information here https://doc.rust-lang.org/cargo/guide/cargo-toml-vs-cargo-lock.html
-Cargo.lock
+# Cargo.lock is tracked: lloom ships binaries, and the gates build --locked
+# (CONTRIBUTING §3.1e). `cargo update` is a reviewed change, not a side effect.
 
 # editor config
 .helix

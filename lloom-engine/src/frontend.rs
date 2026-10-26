@@ -202,6 +202,10 @@ rows! {
         Metal: "models.qwen3_5.eos_gate" = "false",
         Metal: "models.qwen3_5.eos_gate_cores" = "false",
         Metal: "decode.readback.queued_steps" = "0",
+        // The device residency set off the Metal 3 queue (`tuning.md`
+        // §6.3n): `before` is the library's value; decision 56
+        // (`EXCEPTIONS`) lands `heartbeat`. Metal 4 ignores the arm.
+        Metal: "kernels.residency.attach" = "queue",
         // LFM2 (safetensors) only: its `Config` axes and LFM2 kernels.
         ModelAxes: "kernels.attention.flash.partial_block" = "8",
         // Shared with Qwen4-exp's HC norm arm, +6.6% ms/token there.
@@ -266,6 +270,15 @@ rows! {
         frontend: Frontend::Serve,
         when: When::MetalSingle,
         before: "1000",
+    },
+    // Where that keep-warm runs, it stands down under memory pressure
+    // (`tuning.md` §6.3n): `before` is the library's value; decision 57
+    // (`EXCEPTIONS`) lands the stop.
+    Row {
+        key: "server.keep_warm_pressure",
+        frontend: Frontend::Serve,
+        when: When::MetalSingle,
+        before: "false",
     },
     // The batched decode step's rows on the GEMV's row axis under `fast`
     // (`tuning.md` §13.5zb): `before` is the library's value; decision 54
@@ -415,6 +428,36 @@ pub const EXCEPTIONS: &[Exception] = &[Exception {
     landed: true,
     owner: "#1084",
     what: "at a batch of 2 to kernels.gemm.f16_rows_max sequences, a batched step's live rows take the GEMV's row axis under fast, a step with prompt pieces included (deterministic never does); --gemm-f16-rows-decode=false opts out",
+}, Exception {
+    decision: 56,
+    key: "kernels.residency.attach",
+    frontend: Frontend::Chat,
+    when: When::Metal,
+    before: "queue",
+    after: "heartbeat",
+    landed: true,
+    owner: "#1092",
+    what: "the device residency set is not on the Metal 3 queue, so a command buffer waits only for what it binds; Metal 4 ignores the arm (its queue binds through per-slot sets); --residency-attach queue opts out",
+}, Exception {
+    decision: 56,
+    key: "kernels.residency.attach",
+    frontend: Frontend::Serve,
+    when: When::Metal,
+    before: "queue",
+    after: "heartbeat",
+    landed: true,
+    owner: "#1092",
+    what: "the device residency set is not on the Metal 3 queue, so a command buffer waits only for what it binds; Metal 4 ignores the arm (its queue binds through per-slot sets); --residency-attach queue opts out",
+}, Exception {
+    decision: 57,
+    key: "server.keep_warm_pressure",
+    frontend: Frontend::Serve,
+    when: When::MetalSingle,
+    before: "false",
+    after: "true",
+    landed: true,
+    owner: "#1092",
+    what: "the keep-warm reads the memory-pressure level each beat: at warn or critical it stops requesting and ends the set's residency, at normal it resumes; --keep-warm-pressure=false opts out",
 }];
 
 /// The first row of `key` for `frontend`, if the front-end resolves it.

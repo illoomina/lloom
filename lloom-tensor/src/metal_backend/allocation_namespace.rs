@@ -10,6 +10,7 @@ use crate::kernels::metal::{
     MTLResourceOptions, Mapped, ResidencySet, SessionRegion,
 };
 use crate::memory_admission::ModelDomain;
+use crate::residency_class::ResidencyClass;
 use parking_lot::{Mutex, RwLock};
 use std::sync::Arc;
 
@@ -120,7 +121,8 @@ impl AllocationNamespace {
                         Some(Arc::clone(ledger)),
                     )
                     .with_membership(membership.clone())
-                    .with_native_payer(native_domain.clone(), domain.is_some()),
+                    .with_native_payer(native_domain.clone(), domain.is_some())
+                    .with_class(ResidencyClass::Scratch),
                 )
             }
         };
@@ -150,6 +152,24 @@ impl AllocationNamespace {
                 Arc::clone(residency_set),
                 RESOURCE_OPTIONS,
                 Commit::Now,
+                Some(Arc::clone(ledger)),
+            )
+            .with_membership(membership.clone())
+            .with_native_payer(native_domain.clone(), domain.is_some()),
+            classed_shared: DeviceBuffer::new(
+                device,
+                Arc::clone(residency_set),
+                RESOURCE_OPTIONS,
+                Commit::Deferred,
+                Some(Arc::clone(ledger)),
+            )
+            .with_membership(membership.clone())
+            .with_native_payer(native_domain.clone(), domain.is_some()),
+            classed_private: DeviceBuffer::new(
+                device,
+                Arc::clone(residency_set),
+                PRIVATE_RESOURCE_OPTIONS,
+                Commit::Deferred,
                 Some(Arc::clone(ledger)),
             )
             .with_membership(membership.clone())

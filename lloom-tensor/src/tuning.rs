@@ -1135,6 +1135,28 @@ fn parse_icb_residency(v: &str) -> Result<String, String> {
 fn parse_residency_attach(v: &str) -> Result<String, String> {
     one_of(v, "residency attach", &["queue", "heartbeat"])
 }
+fn parse_residency_cap_pct(v: &str) -> Result<u32, String> {
+    let pct: u32 = parse_count(v)?;
+    if pct > 100 {
+        return Err(format!("residency set cap {pct} % is over 100"));
+    }
+    Ok(pct)
+}
+fn parse_residency_hot(v: &str) -> Result<String, String> {
+    non_empty(v)?;
+    let names = ["weights", "kv", "heap", "scratch", "experts", "other"];
+    let mut out = Vec::new();
+    for name in v.split(',').map(str::trim) {
+        if !names.contains(&name) {
+            return Err(format!(
+                "`{name}` is not a residency class ({})",
+                names.join(", ")
+            ));
+        }
+        out.push(name);
+    }
+    Ok(out.join(","))
+}
 fn parse_oversize_bound(v: &str) -> Result<Option<f64>, String> {
     if is_none(v) {
         return Ok(None);
@@ -1622,9 +1644,24 @@ pub struct MetalTuning {
     /// The ICB run's residency declaration: `per-run` (the buffers a run binds) or `plan-wide` (every buffer the plan binds, at every run).
     #[opt(flag = "icb-residency", env = "LLOOM_688_RESIDENCY", parser = "parse_icb_residency", variants = ["per-run", "plan-wide"], path = "executor.replay.residency", status = "arm")]
     pub icb_residency: String,
-    /// How the device's residency set keeps its memory resident: `queue` (attached to the Metal 3 command queue, so a command buffer waits until the whole set is resident) or `heartbeat` (not attached: a command buffer waits only for what it binds, and the set is kept wired by requests — serve's keep-warm). Metal 4 keeps `queue`: its queue binds through per-slot sets, and the loaded line says so.
+    /// How the device's residency set keeps its memory resident: `queue` (attached to the Metal 3 command queue, so a command buffer waits until the whole set is resident) or `heartbeat` (not attached: a command buffer waits only for what it binds, and the set is kept wired by requests — serve's keep-warm). Metal 4 keeps `queue`: its queue binds through per-slot sets, and the loaded line says so. `queue` in the library; `chat` and `serve` default to `heartbeat` on Metal (decision 56; measured on Metal 3, `tuning.md` §6.3n: the first token with the set unwired 203–216 ms queue-attached, 159–190 ms detached; warm, under a desktop-GPU load and in decode no change), `--residency-attach queue` to measure without it.
     #[opt(flag = "residency-attach", env = "LLOOM_RESIDENCY_ATTACH", parser = "parse_residency_attach", variants = ["queue", "heartbeat"], path = "kernels.residency.attach", status = "arm", facets = ["liveness"], flows = ["commands-out"])]
     pub residency_attach: String,
+    /// Each residency set of a class holds at most this percentage of the device's recommended working set; past it the class takes another set (at most 24 device sets). 0 = one set for everything; 5 is MLX's per-set cap.
+    #[opt(flag = "residency-set-cap-pct", env = "LLOOM_RESIDENCY_SET_CAP_PCT", parser = "parse_residency_cap_pct", path = "kernels.residency.set_cap_pct", status = "arm", facets = ["liveness"], flows = ["commands-out"])]
+    pub residency_set_cap_pct: u32,
+    /// The residency classes the keep-warm asks to keep resident when the sets are split (`kernels.residency.set_cap_pct` > 0): a comma list of weights, kv, heap, scratch, experts, other. The rest are left to the OS, and under memory pressure their residency is ended.
+    #[opt(flag = "residency-hot", env = "LLOOM_RESIDENCY_HOT", parser = "parse_residency_hot", path = "kernels.residency.hot", status = "arm", facets = ["liveness"], flows = ["commands-out"])]
+    pub residency_hot: String,
+    /// Count what the Metal 4 queue's per-slot residency sets do: the allocations `Slot::resource` adds per command buffer, the set commits, and the set's `allocatedSize` at each commit (last and largest), read out in `/health` (an instrument for lane B, #1092).
+    #[opt(
+        flag = "residency-slot-trace",
+        env = "LLOOM_METAL4_SLOT_TRACE",
+        bool,
+        path = "kernels.residency.slot_trace",
+        status = "instrument"
+    )]
+    pub residency_slot_trace: bool,
     /// Run these types although this GPU only emulates them (a comma list; `bf16` on Apple7, ~2.6x the f32 time); none = refuse them (§15.2a).
     #[opt(flag = "allow-emulated", env = "LLOOM_METAL_ALLOW_EMULATED", parser = "parse_allow_emulated", variants = ["none", "bf16"], path = "backend.metal.allow_emulated", status = "advanced")]
     pub allow_emulated: Option<String>,
@@ -1708,6 +1745,9 @@ impl Default for MetalTuning {
             icb_quarantine_off: false,
             icb_residency: "per-run".into(),
             residency_attach: "queue".into(),
+            residency_set_cap_pct: 0,
+            residency_hot: "weights,kv".into(),
+            residency_slot_trace: false,
             allow_emulated: None,
             fast_math: true,
             eager_residency_release: None,

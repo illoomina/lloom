@@ -207,6 +207,15 @@ pub const COUPLINGS: &[Coupling] = &[
     },
     Coupling {
         id: "C21",
+        kind: "resolves",
+        when: "kernels.residency.set_cap_pct in 1..=99, or kernels.residency.attach = heartbeat",
+        effect: "the device's residency sets: one per class up to the cap, at most 24, the keep-warm requesting kernels.residency.hot; and whether they are on the Metal 3 queue (Metal 4 keeps the attachment). chat and serve detach them by default on Metal (decision 56); the library keeps them on the queue",
+        keys: &["kernels.residency.set_cap_pct", "kernels.residency.attach", "kernels.residency.hot"],
+        site: "lloom-tensor/src/kernels/metal/residency_set.rs ResidencyPolicy::selected, ResidencyAttachment::decide",
+        is_static: false,
+    },
+    Coupling {
+        id: "C22",
         kind: "ignored",
         when: "kernels.gemm.f16_rows off, determinism = deterministic, or the CPU backend",
         effect: "kernels.gemm.f16_rows_round has no effect: no launch takes the row axis. Where one does, a launch of an odd number of rows takes the next even capacity and every row keeps the one-row GEMV's bits, so the arm moves time, never a bit",
@@ -414,6 +423,9 @@ pub fn explain(o: &EngineOptions) -> Vec<String> {
                 .into(),
         );
     }
+    if let Some(line) = residency_layout(&o.tuning.metal) {
+        out.push(line);
+    }
     let g = &o.tuning.gemm;
     if g.f16_rows_decode {
         let cause = if o.tuning.contract.profile == "deterministic" {
@@ -455,13 +467,45 @@ pub fn explain(o: &EngineOptions) -> Vec<String> {
             None
         };
         out.push(match cause {
-            Some(c) => format!("kernels.gemm.f16_rows_round ignored <- {c} (C21)"),
+            Some(c) => format!("kernels.gemm.f16_rows_round ignored <- {c} (C22)"),
             None => "kernels.gemm.f16_rows_round: a row-axis launch of an odd number of rows \
-                     takes the next even capacity, the same bits <- kernels.gemm.f16_rows (C21)"
+                     takes the next even capacity, the same bits <- kernels.gemm.f16_rows (C22)"
                 .into(),
         });
     }
     out
+}
+
+/// The residency router's layout as the options resolve it (`tuning.md`
+/// §6.3n, §6.3o); `None` at the library's values (one set, attached to the
+/// queue).
+fn residency_layout(m: &lloom_tensor::tuning::MetalTuning) -> Option<String> {
+    let pct = m.residency_set_cap_pct;
+    let split = pct > 0 && pct < 100;
+    if !split && m.residency_attach == "queue" {
+        return None;
+    }
+    let sets = if split {
+        format!(
+            "sets per class (weights, kv, heap, scratch, experts, other), each at most {pct} % of \
+             the device's recommended working set, at most {} sets; the keep-warm requests {}",
+            lloom_tensor::residency_class::MAX_DEVICE_SETS,
+            m.residency_hot
+        )
+    } else {
+        "1 set".into()
+    };
+    let attach = if m.residency_attach == "heartbeat" {
+        "detached from the Metal 3 queue (chat's and serve's default on Metal, decision 56; \
+         Metal 4: attached as before)"
+    } else {
+        "on the Metal 3 queue"
+    };
+    Some(format!(
+        "kernels.residency -> {sets}, {attach} <- kernels.residency.set_cap_pct = {pct}, \
+         kernels.residency.attach = {} (C21)",
+        m.residency_attach
+    ))
 }
 
 /// The schema's top-level `x-lloom-couplings`.
@@ -783,41 +827,71 @@ mod tests {
             c20(&[("scheduler.max_sequences", "4")]).is_empty(),
             "the arm off"
         );
-        // C21: the capacity rounding names what it does where the row axis
+        // C22: the capacity rounding names what it does where the row axis
         // runs, and its cause where it does not.
-        let c21 = |sets: &[(&str, &str)]| -> Vec<String> {
+        let c22 = |sets: &[(&str, &str)]| -> Vec<String> {
             explain(&with(sets))
                 .into_iter()
-                .filter(|l| l.ends_with("(C21)"))
+                .filter(|l| l.ends_with("(C22)"))
                 .collect()
         };
         let round = [("kernels.gemm.f16_rows_round", "true")];
         if cfg!(feature = "metal") {
             assert_eq!(
-                c21(&round),
+                c22(&round),
                 vec![
                     "kernels.gemm.f16_rows_round: a row-axis launch of an odd number of rows \
-                     takes the next even capacity, the same bits <- kernels.gemm.f16_rows (C21)"
+                     takes the next even capacity, the same bits <- kernels.gemm.f16_rows (C22)"
                 ]
             );
         } else {
             assert_eq!(
-                c21(&round),
-                vec!["kernels.gemm.f16_rows_round ignored <- the CPU backend (C21)"]
+                c22(&round),
+                vec!["kernels.gemm.f16_rows_round ignored <- the CPU backend (C22)"]
             );
         }
         let mut det = round.to_vec();
         det.push(("determinism", "deterministic"));
         assert_eq!(
-            c21(&det),
-            vec!["kernels.gemm.f16_rows_round ignored <- determinism = deterministic (C21)"]
+            c22(&det),
+            vec!["kernels.gemm.f16_rows_round ignored <- determinism = deterministic (C22)"]
         );
         let mut rows_off = round.to_vec();
         rows_off.push(("kernels.gemm.f16_rows", "false"));
         assert_eq!(
-            c21(&rows_off),
-            vec!["kernels.gemm.f16_rows_round ignored <- kernels.gemm.f16_rows = false (C21)"]
+            c22(&rows_off),
+            vec!["kernels.gemm.f16_rows_round ignored <- kernels.gemm.f16_rows = false (C22)"]
         );
-        assert!(c21(&[]).is_empty(), "the arm off");
+        assert!(c22(&[]).is_empty(), "the arm off");
+    }
+
+    /// C21 at the library's values says nothing; where chat's and serve's
+    /// rows hold (Metal) their default detaches the set, and the line names
+    /// decision 56; `queue` named is the library's arrangement again.
+    #[test]
+    fn c21_names_the_default_attachment() {
+        use crate::frontend::{self, Frontend, When};
+        let c21 = |o: &EngineOptions| -> Vec<String> {
+            explain(o)
+                .into_iter()
+                .filter(|l| l.ends_with("(C21)"))
+                .collect()
+        };
+        assert!(c21(&EngineOptions::default()).is_empty(), "the library's");
+        for f in [Frontend::Chat, Frontend::Serve, Frontend::Bench] {
+            let mut o = EngineOptions::default();
+            frontend::apply(&mut o, f, &Default::default(), &Default::default()).unwrap();
+            let detached = f != Frontend::Bench && When::Metal.holds(&o);
+            let want: Vec<String> = if detached {
+                vec!["kernels.residency -> 1 set, detached from the Metal 3 queue (chat's and \
+                      serve's default on Metal, decision 56; Metal 4: attached as before) <- \
+                      kernels.residency.set_cap_pct = 0, kernels.residency.attach = heartbeat (C21)"
+                    .into()]
+            } else {
+                vec![]
+            };
+            assert_eq!(c21(&o), want, "{}", f.name());
+        }
+        assert!(c21(&with(&[("kernels.residency.attach", "queue")])).is_empty());
     }
 }

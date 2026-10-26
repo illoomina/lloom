@@ -4,6 +4,7 @@
 //! from a pre-trained checkpoint, e.g. using `VarBuilder::from_mmaped_safetensors`, or initialized
 //! for training, e.g. using `VarBuilder::from_varmap`.
 use crate::nn::VarMap;
+use lloom_tensor::residency_class::{residency_class_scope, ResidencyClass};
 use lloom_tensor::{safetensors::Load, DType, Device, Error, Result, Shape, Tensor};
 use safetensors::{slice::IndexOp, tensor::SafeTensors};
 use std::collections::HashMap;
@@ -223,9 +224,11 @@ impl<B: Backend> VarBuilderArgs<'_, B> {
     pub fn get_unchecked_dtype(&self, name: &str, dtype: DType) -> Result<Tensor> {
         self.data.device.admit_compute_dtype(dtype)?;
         let name = self.path(name);
-        self.data
-            .backend
-            .get_unchecked(&name, dtype, &self.data.device)
+        residency_class_scope(ResidencyClass::Weights, || {
+            self.data
+                .backend
+                .get_unchecked(&name, dtype, &self.data.device)
+        })
     }
 
     /// Retrieve the tensor associated with the given name & dtype at the current path.
@@ -240,9 +243,11 @@ impl<B: Backend> VarBuilderArgs<'_, B> {
         // emulates is refused here, before the first weight (§15.2a).
         self.data.device.admit_compute_dtype(dtype)?;
         let path = self.path(name);
-        self.data
-            .backend
-            .get(s.into(), &path, hints, dtype, &self.data.device)
+        residency_class_scope(ResidencyClass::Weights, || {
+            self.data
+                .backend
+                .get(s.into(), &path, hints, dtype, &self.data.device)
+        })
     }
 
     /// Set the device of the VarBuilder.

@@ -63,6 +63,8 @@ pub(crate) struct Queue {
     ledger: OnceLock<Arc<super::ledger::Ledger>>,
     pub created: AtomicUsize,
     pub reused: AtomicUsize,
+    /// The per-slot sets' counts, shared with every slot (`SlotTrace`).
+    slot_trace: Arc<SlotTrace>,
     // LAST: raw/available slots disappear before final capability publication.
     physical: crate::retirement_service::PhysicalAnchor<
         crate::metal_backend::device_retirement::NamespaceOwner,
@@ -97,6 +99,10 @@ impl Queue {
             ledger: OnceLock::new(),
             created: AtomicUsize::new(0),
             reused: AtomicUsize::new(0),
+            slot_trace: Arc::new(SlotTrace {
+                on: crate::tuning::tuning().metal.residency_slot_trace,
+                ..SlotTrace::default()
+            }),
             physical: crate::retirement_service::PhysicalAnchor::default(),
         });
         let core = super::retirement::Metal4Completions::new(
@@ -365,6 +371,41 @@ impl Drop for Queue {
     }
 }
 
+/// What the per-slot residency sets do, counted only when
+/// `kernels.residency.slot_trace` is on: one load per bind or commit when off.
+#[derive(Default)]
+struct SlotTrace {
+    on: bool,
+    adds: std::sync::atomic::AtomicU64,
+    commits: std::sync::atomic::AtomicU64,
+    last_bytes: std::sync::atomic::AtomicU64,
+    max_bytes: std::sync::atomic::AtomicU64,
+}
+
+impl Queue {
+    /// The per-slot sets' counts (`kernels.residency.slot_trace`); `None`
+    /// when the instrument is off.
+    pub(crate) fn slot_residency(&self) -> Option<super::SlotResidency> {
+        let t = &self.slot_trace;
+        t.on.then(|| super::SlotResidency {
+            adds: t.adds.load(Ordering::Relaxed),
+            commits: t.commits.load(Ordering::Relaxed),
+            last_bytes: t.last_bytes.load(Ordering::Relaxed),
+            max_bytes: t.max_bytes.load(Ordering::Relaxed),
+        })
+    }
+
+    fn note_slot_commit(&self, set: &ProtocolObject<dyn MTLResidencySet>) {
+        let t = &self.slot_trace;
+        if t.on {
+            let bytes = set.allocatedSize();
+            t.commits.fetch_add(1, Ordering::Relaxed);
+            t.last_bytes.store(bytes, Ordering::Relaxed);
+            t.max_bytes.fetch_max(bytes, Ordering::Relaxed);
+        }
+    }
+}
+
 pub(super) struct Slot {
     front_event: Retained<ProtocolObject<dyn MTLSharedEvent>>,
     generation: u64,
@@ -377,6 +418,7 @@ pub(super) struct Slot {
     table: Retained<ProtocolObject<dyn MTL4ArgumentTable>>,
     residency: Retained<ProtocolObject<dyn MTLResidencySet>>,
     queue: Retained<ProtocolObject<dyn MTL4CommandQueue>>,
+    trace: Arc<SlotTrace>,
     resources: Vec<Retained<ProtocolObject<dyn MTLResource>>>,
     pipelines: Vec<Retained<ProtocolObject<dyn MTLComputePipelineState>>>,
     fences: Vec<Retained<ProtocolObject<dyn MTLFence>>>,
@@ -427,6 +469,7 @@ impl Slot {
             table,
             residency,
             queue: queue.raw.clone(),
+            trace: queue.slot_trace.clone(),
             resources: Vec::with_capacity(256),
             pipelines: Vec::with_capacity(64),
             fences: Vec::with_capacity(64),
@@ -508,6 +551,9 @@ impl Slot {
             );
             self.residency
                 .addAllocation(ProtocolObject::from_ref(resource));
+            if self.trace.on {
+                self.trace.adds.fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
 }
@@ -1376,6 +1422,7 @@ impl PreparedCommit<'_> {
         // End/commit of the recording's private residency is not native CB
         // execution. Any unwind before queue entry cancels via rooted custody.
         residency.commit();
+        submission.queue.note_slot_commit(&residency);
         self.extra.last().unwrap_or(&self.first).endCommandBuffer();
         #[cfg(test)]
         if let Some(control) = &self.test_control {

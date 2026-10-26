@@ -850,7 +850,17 @@ fn scripted_shared(case: Case) -> Arc<Shared> {
 }
 
 fn scripted_shared_with_progress(case: Case, progress: Progress) -> Arc<Shared> {
-    let engine = Box::new(Scripted::new(case, progress));
+    shared_with_engine(Box::new(Scripted::new(case, progress)))
+}
+
+// Called only after a lookup's mutex guard has dropped. Baseline Value uses
+// identity Into; retention's owned StoredMessage supplies a consuming adapter.
+pub(super) fn message_values<T: Into<Value>>(messages: Vec<T>) -> Vec<Value> {
+    messages.into_iter().map(Into::into).collect()
+}
+
+pub(super) fn shared_with_engine(engine: Box<dyn Served>) -> Arc<Shared> {
+    let model_name = engine.model_name().to_owned();
     let front = Front::new(engine.as_ref(), Default::default());
     Arc::new(Shared {
         engine,
@@ -862,7 +872,7 @@ fn scripted_shared_with_progress(case: Case, progress: Progress) -> Arc<Shared> 
         aborts: Mutex::new(HashSet::new()),
         abort_epoch: AtomicU64::new(0),
         server: Server::http("127.0.0.1:0").unwrap(),
-        model_name: "scripted-tail".into(),
+        model_name,
         sampling: Default::default(),
         reuse: ParkingMutex::new(Default::default()),
         sessions: super::test_sessions(),
@@ -1275,7 +1285,7 @@ fn an_earlier_write_failure_keeps_the_full_accepted_session_reply() {
         .lock()
         .resolve(&id, None, true, Instant::now())
         .unwrap();
-    let message = resolved.messages.unwrap().pop().unwrap();
+    let message = message_values(resolved.messages.unwrap()).pop().unwrap();
     eprintln!(
         "EARLY_WRITE_FAILURE accepted={} session={message}",
         front.text
@@ -1407,7 +1417,7 @@ fn a_refused_whole_fragment_cannot_enter_the_raw_frontier_or_stored_message() {
         .lock()
         .resolve(&id, None, true, Instant::now())
         .unwrap();
-    let message = resolved.messages.unwrap().pop().unwrap();
+    let message = message_values(resolved.messages.unwrap()).pop().unwrap();
     assert_eq!(message["reasoning_content"], "a");
     assert_eq!(message["content"], "");
     let (lock, _) = &*progress.0;
@@ -1465,7 +1475,7 @@ fn checked_metadata_is_captured_before_publication_but_its_error_is_deferred() {
                 .lock()
                 .resolve(&id, None, true, Instant::now())
                 .unwrap();
-            let message = saved.messages.unwrap().pop().unwrap();
+            let message = message_values(saved.messages.unwrap()).pop().unwrap();
             assert_eq!(message["reasoning_content"], "a");
             assert_eq!(message["content"], "X");
             let wire = progress.0 .0.lock();
@@ -1547,22 +1557,15 @@ fn stream_timing_brackets_exclude_socket_drain_from_decode_pace() {
     assert_eq!(explicit["total_ms"], 1012.0);
 }
 
-#[test]
-fn delayed_a_completion_cannot_rewrite_published_b_or_distinct_c_residency() {
-    assert_delayed_a_publication_custody(false);
-}
-
-#[test]
-fn late_a_writer_failure_cannot_rewrite_published_b_or_distinct_c_residency() {
-    assert_delayed_a_publication_custody(true);
-}
-
-fn assert_delayed_a_publication_custody(late_failure: bool) {
-    struct PausedWriter {
-        entered: Option<std::sync::mpsc::Sender<()>>,
-        released: std::sync::mpsc::Receiver<()>,
-        bytes: Arc<ParkingMutex<Vec<u8>>>,
-        late_failure: bool,
+// Shared deterministic I/O barrier; no device/model construction here.
+pub(super) mod held_writer {
+    use super::*;
+    pub(crate) struct PausedWriter {
+        pub(crate) entered: Option<std::sync::mpsc::Sender<()>>,
+        pub(crate) released: std::sync::mpsc::Receiver<()>,
+        pub(crate) bytes: Arc<ParkingMutex<Vec<u8>>>,
+        pub(crate) late_failure: bool,
+        pub(crate) max_pause: Duration,
     }
     impl Write for PausedWriter {
         fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
@@ -1573,7 +1576,7 @@ fn assert_delayed_a_publication_custody(late_failure: bool) {
             if let Some(entered) = self.entered.take() {
                 entered.send(()).unwrap();
                 self.released
-                    .recv_timeout(Duration::from_secs(5))
+                    .recv_timeout(self.max_pause)
                     .map_err(|e| io::Error::new(io::ErrorKind::TimedOut, e.to_string()))?;
                 if self.late_failure {
                     return Err(io::Error::new(
@@ -1585,12 +1588,12 @@ fn assert_delayed_a_publication_custody(late_failure: bool) {
             Ok(())
         }
     }
-    struct Cleanup {
-        release: Option<std::sync::mpsc::Sender<()>>,
-        thread: Option<std::thread::JoinHandle<Result<()>>>,
+    pub(crate) struct Cleanup {
+        pub(crate) release: Option<std::sync::mpsc::Sender<()>>,
+        pub(crate) thread: Option<std::thread::JoinHandle<Result<()>>>,
     }
     impl Cleanup {
-        fn finish(&mut self) -> Result<()> {
+        pub(crate) fn finish(&mut self) -> Result<()> {
             self.release
                 .take()
                 .unwrap()
@@ -1613,6 +1616,20 @@ fn assert_delayed_a_publication_custody(late_failure: bool) {
             }
         }
     }
+}
+
+#[test]
+fn delayed_a_completion_cannot_rewrite_published_b_or_distinct_c_residency() {
+    assert_delayed_a_publication_custody(false);
+}
+
+#[test]
+fn late_a_writer_failure_cannot_rewrite_published_b_or_distinct_c_residency() {
+    assert_delayed_a_publication_custody(true);
+}
+
+fn assert_delayed_a_publication_custody(late_failure: bool) {
+    use held_writer::{Cleanup, PausedWriter};
     fn publish(shared: &Shared, body: Value) -> String {
         let turn = shared.turns.take();
         let Reply::Stream(run) = chat_completions(shared, &body, None)
@@ -1662,6 +1679,7 @@ fn assert_delayed_a_publication_custody(late_failure: bool) {
                         released,
                         bytes: first_bytes,
                         late_failure,
+                        max_pause: Duration::from_secs(5),
                     }),
                 })
             },
@@ -1699,8 +1717,8 @@ fn assert_delayed_a_publication_custody(late_failure: bool) {
     assert_ne!(before_b.key, before_c.key, "C is a distinct lineage");
     assert_eq!(before_b.resident, Some(false));
     assert_eq!(before_c.resident, Some(true));
-    let b_messages = before_b.messages.unwrap();
-    let c_messages = before_c.messages.unwrap();
+    let b_messages = message_values(before_b.messages.unwrap());
+    let c_messages = message_values(before_c.messages.unwrap());
     assert_eq!(b_messages.len(), 4);
     assert_eq!(c_messages.len(), 2);
     for message in [b_messages.last().unwrap(), c_messages.last().unwrap()] {
@@ -1744,8 +1762,8 @@ fn assert_delayed_a_publication_custody(late_failure: bool) {
         .lock()
         .resolve(&id_c, None, true, Instant::now())
         .unwrap();
-    assert_eq!(after_b.messages.unwrap(), b_messages);
-    assert_eq!(after_c.messages.unwrap(), c_messages);
+    assert_eq!(message_values(after_b.messages.unwrap()), b_messages);
+    assert_eq!(message_values(after_c.messages.unwrap()), c_messages);
     assert_eq!(after_b.ids, before_b.ids);
     assert_eq!(after_c.ids, before_c.ids);
     assert_eq!(after_b.resident, Some(false));

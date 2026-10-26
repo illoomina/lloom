@@ -6352,6 +6352,10 @@ mod ready_configuration_tests {
 #[path = "serve_stream_tail_tests.rs"]
 mod stream_tail_tests;
 
+#[cfg(all(test, feature = "metal"))]
+#[path = "serve_native_custody_tests.rs"]
+mod native_custody_tests;
+
 #[cfg(test)]
 mod response_snapshot_tests {
     use super::*;

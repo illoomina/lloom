@@ -780,6 +780,21 @@ impl MetalDevice {
         Ok(pl)
     }
 
+    /// A fresh allocation from this device's own backings, about to join one
+    /// of its pools: the device's residency sets list it until the pool
+    /// evicts it from the free list, after its last GPU reader
+    /// (`Buffer::device_listed`). Unmarked when the device has no set.
+    fn listed_for_pool(
+        &self,
+        mut allocation: crate::kernels::metal::backing::Allocation,
+    ) -> crate::kernels::metal::backing::Allocation {
+        // SAFETY: asks only whether a native set exists; nothing is borrowed.
+        if unsafe { self.residency_set.raw() }.is_some() {
+            allocation.buffer = allocation.buffer.with_device_listing();
+        }
+        allocation
+    }
+
     fn allocate_backing(
         backing: &dyn Backing,
         bytes: usize,
@@ -946,8 +961,14 @@ impl MetalDevice {
     /// (`kernels.residency.attach`) and the router's layout
     /// ([`ResidencySet::layout_line`]), e.g. `residency=queue 1 set 8.12 GiB`.
     pub fn residency_line(&self) -> String {
+        let metal4 = match self.commands.metal4_declare() {
+            Some(d) if d != crate::kernels::metal::Metal4Declare::Slots => {
+                format!(" metal4={}", d.name())
+            }
+            _ => String::new(),
+        };
         format!(
-            "residency={} {}",
+            "residency={} {}{metal4}",
             self.commands.residency_attachment().short(),
             self.residency_set.layout_line()
         )
@@ -3296,8 +3317,11 @@ impl MetalDevice {
                     .check_residual(alloc)
                     .map_err(AllocationError::from)?;
                 let split = self.residency_set.policy().is_split();
-                let new_buffer =
-                    Self::allocate_backing(self.backings.for_miss(true, split), alloc, context)?;
+                let new_buffer = self.listed_for_pool(Self::allocate_backing(
+                    self.backings.for_miss(true, split),
+                    alloc,
+                    context,
+                )?);
                 // `size` is the pre-rounding request and `alloc` is what Metal
                 // was given; `adopt_requesting` counts both so §9.2's residual
                 // overhang is derivable. The rounding happened at `alloc`
@@ -4029,8 +4053,11 @@ impl MetalDevice {
             .check_residual(size)
             .map_err(AllocationError::from)?;
         let split = self.residency_set.policy().is_split();
-        let new_buffer =
-            Self::allocate_backing(self.backings.for_miss(false, split), size, context)?;
+        let new_buffer = self.listed_for_pool(Self::allocate_backing(
+            self.backings.for_miss(false, split),
+            size,
+            context,
+        )?);
         Ok(self
             .buffers
             .adopt_after_miss_in(new_buffer, size, miss, &origin)?)

@@ -6361,6 +6361,25 @@ mod response_snapshot_tests {
     use super::*;
 
     #[test]
+    fn default_options_leave_native_fixture_tuning_installable() {
+        assert!(!lloom_tensor::tuning::installed());
+        let mut options = crate::EngineOptions::default();
+        assert!(
+            !lloom_tensor::tuning::installed(),
+            "option constructors must not read tensor knobs"
+        );
+        options.tuning.contract.profile = "deterministic".into();
+        options
+            .tuning
+            .install()
+            .expect("both domains remain installable after defaults");
+        assert_eq!(
+            lloom_tensor::tuning::contract(),
+            lloom_tensor::tuning::Contract::Deterministic
+        );
+    }
+
+    #[test]
     fn completed_record_summary_is_owned_before_a_later_recorder_reset() {
         let first = FirstToken {
             recv: 1_000_000_000,

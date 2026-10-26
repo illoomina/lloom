@@ -157,6 +157,11 @@ final timings event/[DONE]; the request error line carries its frontier then.
 `/health.response_drain` reports active contexts, configured bounds and named
 overload counters; context exhaustion is also a 503 request-line outcome.
 
+Acceptance/publication is coherent in-process visibility, **not crash durability**
+or guaranteed retention: session capacity/idle/memory policy still applies, and
+a restart forgets every session (sessions.md §2/§4/§9). Later delivery failure
+does not roll back a retained accepted reply or make it durable.
+
 Streaming `timings.total_ms` keeps the endpoint's existing pre-trailer wall
 bracket. `decode_call_ms`, `response_settlement_ms`, and `response_drain_ms`
 separate generation from accepted-reply/metadata capture and subsequent drain.

@@ -62,13 +62,28 @@ impl Turns {
 
     /// Wait for a turn of one's own.
     pub(super) fn take(&self) -> Turn<'_> {
+        self.take_with_queued(|_, _| {})
+    }
+
+    // One algorithm for production and the test-only queue witness. The
+    // observer runs after ticket assignment, not before attempting admission.
+    fn take_with_queued(&self, queued: impl FnOnce(u64, u64)) -> Turn<'_> {
         let mut state = self.state.lock();
         let ticket = state.next;
         state.next += 1;
+        queued(ticket, state.serving);
         while state.serving != ticket {
             self.changed.wait(&mut state);
         }
         Turn { turns: self }
+    }
+
+    #[cfg(test)]
+    pub(super) fn take_queued(&self, witness: &std::sync::mpsc::Sender<(u64, u64)>) -> Turn<'_> {
+        self.take_with_queued(|ticket, serving| {
+            // A dropped test observer must not unwind after reserving a ticket.
+            let _ = witness.send((ticket, serving));
+        })
     }
 
     /// Answer `body` in its group's turn: join the group that is waiting when

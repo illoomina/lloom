@@ -151,12 +151,23 @@ fn saved(shared: &Shared, id: &str, prompt: Vec<u32>, reply: Value) -> Saved {
 }
 
 fn publish(shared: &Shared, body: Value) -> Saved {
+    publish_with_queue(shared, body, None)
+}
+
+fn publish_with_queue(
+    shared: &Shared,
+    body: Value,
+    queued: Option<&mpsc::Sender<(u64, u64)>>,
+) -> Saved {
     let _drain = shared
         .drains
         .try_take()
         .expect("bounded B/C response context");
     let by_id = body.get("previous_response_id").is_some();
-    let mut turn = Some(shared.turns.take());
+    let mut turn = Some(match queued {
+        Some(witness) => shared.turns.take_queued(witness),
+        None => shared.turns.take(),
+    });
     let Reply::Stream(run) = chat_completions(shared, &request(body), None)
         .ok()
         .expect("native stream built")
@@ -220,172 +231,198 @@ fn scenario(
     reference_b: &Value,
     reference_c: &Value,
 ) {
-    let bytes = Arc::new(ParkingMutex::new(Vec::new()));
-    let (entered, entry) = mpsc::channel();
-    let (release, released) = mpsc::channel();
-    let (published, publication) = mpsc::channel();
-    let owner = shared.clone();
-    let captured = bytes.clone();
-    let thread = std::thread::spawn(move || {
-        let _drain = owner.drains.try_take().expect("bounded A response context");
-        let mut ticket = Some(owner.turns.take());
-        let Reply::Stream(run) = chat_completions(&owner, &request(json!({
-            "messages":[{"role":"user","content":"A"}],"store":true,"stream":true,"reset":"cache"
-        })), None).ok().expect("A built") else { panic!("stream requested") };
-        let id = run.id.clone();
-        let result = stream_response_settlement(
-            &owner,
-            *run,
-            || {
-                Ok(ChunkedWriter {
-                    w: Box::new(PausedWriter {
-                        entered: Some(entered),
-                        released,
-                        bytes: captured,
-                        late_failure,
-                        max_pause: Duration::from_secs(120),
-                    }),
-                })
-            },
-            || {
-                if matches!(release_at, Release::Publication) {
-                    drop(ticket.take());
-                }
-                published.send(id).unwrap();
-            },
+    std::thread::scope(|scope| {
+        let bytes = Arc::new(ParkingMutex::new(Vec::new()));
+        let (entered, entry) = mpsc::channel();
+        let (release, released) = mpsc::channel();
+        let (published, publication) = mpsc::channel();
+        let owner = shared.clone();
+        let captured = bytes.clone();
+        let thread = std::thread::spawn(move || {
+            let _drain = owner.drains.try_take().expect("bounded A response context");
+            let mut ticket = Some(owner.turns.take());
+            let Reply::Stream(run) = chat_completions(&owner, &request(json!({
+                "messages":[{"role":"user","content":"A"}],"store":true,"stream":true,"reset":"cache"
+            })), None).ok().expect("A built") else { panic!("stream requested") };
+            let id = run.id.clone();
+            let result = stream_response_settlement(
+                &owner,
+                *run,
+                || {
+                    Ok(ChunkedWriter {
+                        w: Box::new(PausedWriter {
+                            entered: Some(entered),
+                            released,
+                            bytes: captured,
+                            late_failure,
+                            max_pause: Duration::from_secs(120),
+                        }),
+                    })
+                },
+                || {
+                    if matches!(release_at, Release::Publication) {
+                        drop(ticket.take());
+                    }
+                    published.send(id).unwrap();
+                },
+            );
+            // FullSettlement release is deliberately after function return, not
+            // merely worker join; error return follows the same ownership rule.
+            drop(ticket.take());
+            result
+        });
+        let mut cleanup = Cleanup {
+            release: Some(release),
+            thread: Some(thread),
+        };
+        entry
+            .recv_timeout(Duration::from_secs(60))
+            .expect("A writer reached barrier");
+        let id_a = publication
+            .recv_timeout(Duration::from_secs(60))
+            .expect("A accepted history published");
+        let (a_message, a_ids) = {
+            let a = shared
+                .sessions
+                .lock()
+                .resolve(&id_a, None, true, Instant::now())
+                .unwrap();
+            let message = message_values(a.messages.unwrap()).pop().unwrap();
+            assert_eq!(message, reference_a["choices"][0]["message"]);
+            // Pure owned JSON/IDs only: drop every Bound/Reply/native-row owner
+            // from this lookup before B/C. This does not pin model backing.
+            (message, a.ids)
+        };
+        assert_eq!(
+            shared.drains.active.load(Ordering::Acquire),
+            1,
+            "A retains only its response context through drain"
         );
-        // FullSettlement release is deliberately after function return, not
-        // merely worker join; error return follows the same ownership rule.
-        drop(ticket.take());
-        result
-    });
-    let mut cleanup = Cleanup {
-        release: Some(release),
-        thread: Some(thread),
-    };
-    entry
-        .recv_timeout(Duration::from_secs(60))
-        .expect("A writer reached barrier");
-    let id_a = publication
-        .recv_timeout(Duration::from_secs(60))
-        .expect("A accepted history published");
-    let (a_message, a_ids) = {
-        let a = shared
-            .sessions
-            .lock()
-            .resolve(&id_a, None, true, Instant::now())
-            .unwrap();
-        let message = message_values(a.messages.unwrap()).pop().unwrap();
-        assert_eq!(message, reference_a["choices"][0]["message"]);
-        // Pure owned JSON/IDs only: drop every Bound/Reply/native-row owner
-        // from this lookup before B/C. This does not pin model backing.
-        (message, a.ids)
-    };
-    assert_eq!(
-        shared.drains.active.load(Ordering::Acquire),
-        1,
-        "A retains only its response context through drain"
-    );
-    match release_at {
-        Release::Publication => assert!(
-            shared.turns.try_take().is_some(),
-            "published owner released ticket"
-        ),
-        Release::FullSettlement => assert!(
-            shared.turns.try_take().is_none(),
-            "reference holds ticket through transport"
-        ),
-    }
-    let finish = |cleanup: &mut Cleanup| {
-        let result = cleanup.finish();
-        if late_failure {
-            assert!(result
-                .unwrap_err()
-                .to_string()
-                .contains("late A writer rejection"));
-        } else {
-            result.unwrap();
+        match release_at {
+            Release::Publication => assert!(
+                shared.turns.try_take().is_some(),
+                "published owner released ticket"
+            ),
+            Release::FullSettlement => assert!(
+                shared.turns.try_take().is_none(),
+                "reference holds ticket through transport"
+            ),
         }
-    };
-    if matches!(release_at, Release::FullSettlement) {
-        finish(&mut cleanup);
-    }
-    let b = publish(
-        shared,
-        json!({"previous_response_id":id_a,"input":[{"role":"user","content":"B"}],"stream":true}),
-    );
-    let c = publish(
-        shared,
-        json!({"messages":[{"role":"user","content":"C"}],"store":true,"stream":true}),
-    );
-    assert_reference(&b, reference_b);
-    assert_reference(&c, reference_c);
-    assert_eq!(b.messages.len(), 4);
-    assert_eq!(c.messages.len(), 2);
-    assert_eq!(
-        shared.drains.active.load(Ordering::Acquire),
-        usize::from(matches!(release_at, Release::Publication))
-    );
-    if matches!(release_at, Release::Publication) {
-        finish(&mut cleanup);
-    }
-    for snapshot in [&b, &c] {
-        let after = shared
-            .sessions
-            .lock()
-            .resolve(&snapshot.id, None, true, Instant::now())
-            .unwrap();
-        assert_eq!(after.ids, snapshot.ids);
-        assert_eq!(message_values(after.messages.unwrap()), snapshot.messages);
-        assert_eq!(
-            after.resident,
-            Some(snapshot.id == c.id),
-            "late A cannot replace C residency"
+        let finish = |cleanup: &mut Cleanup| {
+            let result = cleanup.finish();
+            if late_failure {
+                assert!(result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("late A writer rejection"));
+            } else {
+                result.unwrap();
+            }
+        };
+        let (queued, assignment) = mpsc::channel();
+        let b_owner = shared.clone();
+        let b_body = json!({"previous_response_id":id_a,"input":[{"role":"user","content":"B"}],"stream":true});
+        let b_thread = scope.spawn(move || publish_with_queue(&b_owner, b_body, Some(&queued)));
+        let (b_ticket, b_serving) = assignment
+            .recv_timeout(Duration::from_secs(60))
+            .expect("B actually reserved its FIFO ticket");
+        eprintln!("NATIVE_RESPONSE_QUEUE api={} contract={} release={release_at:?} late_failure={late_failure} ticket={b_ticket} serving={b_serving}", witness.api, witness.contract);
+        match release_at {
+            Release::Publication => assert_eq!(
+                b_ticket, b_serving,
+                "B admitted while A writer remains held"
+            ),
+            Release::FullSettlement => {
+                assert!(b_ticket > b_serving, "B is queued behind A's held ticket");
+                assert!(
+                    !b_thread.is_finished(),
+                    "B cannot complete before A's full return"
+                );
+                finish(&mut cleanup);
+            }
+        }
+        let b = b_thread.join().expect("B response thread completed");
+        eprintln!("NATIVE_RESPONSE_B_COMPLETE api={} contract={} release={release_at:?} late_failure={late_failure} a_release_pending={}", witness.api, witness.contract, cleanup.release.is_some());
+        if matches!(release_at, Release::Publication) {
+            assert!(
+                cleanup.release.is_some(),
+                "B completed before the explicit A writer release"
+            );
+        }
+        let c = publish(
+            shared,
+            json!({"messages":[{"role":"user","content":"C"}],"store":true,"stream":true}),
         );
-    }
-    assert_eq!(
-        shared.drains.active.load(Ordering::Acquire),
-        0,
-        "all response contexts released"
-    );
-    let raw = bytes.lock();
-    let all = events(&raw);
-    assert!(!all.is_empty());
-    assert!(all.iter().all(|event| event["id"] == id_a));
-    if late_failure {
-        assert!(all.iter().all(|event| event.get("timings").is_none()));
-        assert!(!std::str::from_utf8(&raw).unwrap().contains("[DONE]"));
-    } else {
-        let last = all
+        assert_reference(&b, reference_b);
+        assert_reference(&c, reference_c);
+        assert_eq!(b.messages.len(), 4);
+        assert_eq!(c.messages.len(), 2);
+        assert_eq!(
+            shared.drains.active.load(Ordering::Acquire),
+            usize::from(matches!(release_at, Release::Publication))
+        );
+        if matches!(release_at, Release::Publication) {
+            finish(&mut cleanup);
+        }
+        for snapshot in [&b, &c] {
+            let after = shared
+                .sessions
+                .lock()
+                .resolve(&snapshot.id, None, true, Instant::now())
+                .unwrap();
+            assert_eq!(after.ids, snapshot.ids);
+            assert_eq!(message_values(after.messages.unwrap()), snapshot.messages);
+            assert_eq!(
+                after.resident,
+                Some(snapshot.id == c.id),
+                "late A cannot replace C residency"
+            );
+        }
+        assert_eq!(
+            shared.drains.active.load(Ordering::Acquire),
+            0,
+            "all response contexts released"
+        );
+        let raw = bytes.lock();
+        let all = events(&raw);
+        assert!(!all.is_empty());
+        assert!(all.iter().all(|event| event["id"] == id_a));
+        if late_failure {
+            assert!(all.iter().all(|event| event.get("timings").is_none()));
+            assert!(!std::str::from_utf8(&raw).unwrap().contains("[DONE]"));
+        } else {
+            let last = all
+                .iter()
+                .find(|event| event.get("timings").is_some())
+                .unwrap();
+            assert_eq!(last["timings"]["session"]["id"], id_a);
+            assert_eq!(
+                last["choices"][0]["token_ids"],
+                reference_a["choices"][0]["token_ids"]
+            );
+            assert!(std::str::from_utf8(&raw).unwrap().contains("[DONE]"));
+        }
+        let expected_a_ids: Vec<_> = reference_a["prompt_token_ids"]
+            .as_array()
+            .unwrap()
             .iter()
-            .find(|event| event.get("timings").is_some())
-            .unwrap();
-        assert_eq!(last["timings"]["session"]["id"], id_a);
-        assert_eq!(
-            last["choices"][0]["token_ids"],
-            reference_a["choices"][0]["token_ids"]
+            .chain(reference_a["choices"][0]["token_ids"].as_array().unwrap())
+            .cloned()
+            .collect();
+        assert_eq!(json!(&a_ids), json!(expected_a_ids));
+        eprintln!("NATIVE_RESPONSE_CUSTODY device=metal api={} contract={} release={release_at:?} late_failure={late_failure} b_ids={} c_ids={} c_resident=true", witness.api, witness.contract, b.ids.len(), c.ids.len());
+        eprintln!(
+            "NATIVE_RESPONSE_RECEIPT {}",
+            json!({
+                "actual_api":witness.api,"actual_contract":witness.contract,
+                "release":format!("{release_at:?}"),"late_failure":late_failure,
+                "b_queue":{"ticket":b_ticket,"serving":b_serving},
+                "a":{"message":a_message,"saved_ids":a_ids},
+                "b":{"prompt_ids":b.prompt,"reply_ids":b.reply,"messages":b.messages,"saved_ids":b.ids},
+                "c":{"prompt_ids":c.prompt,"reply_ids":c.reply,"messages":c.messages,"saved_ids":c.ids}
+            })
         );
-        assert!(std::str::from_utf8(&raw).unwrap().contains("[DONE]"));
-    }
-    let expected_a_ids: Vec<_> = reference_a["prompt_token_ids"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .chain(reference_a["choices"][0]["token_ids"].as_array().unwrap())
-        .cloned()
-        .collect();
-    assert_eq!(json!(&a_ids), json!(expected_a_ids));
-    eprintln!("NATIVE_RESPONSE_CUSTODY device=metal api={} contract={} release={release_at:?} late_failure={late_failure} b_ids={} c_ids={} c_resident=true", witness.api, witness.contract, b.ids.len(), c.ids.len());
-    eprintln!(
-        "NATIVE_RESPONSE_RECEIPT {}",
-        json!({
-            "actual_api":witness.api,"actual_contract":witness.contract,
-            "release":format!("{release_at:?}"),"late_failure":late_failure,
-            "a":{"message":a_message,"saved_ids":a_ids},
-            "b":{"prompt_ids":b.prompt,"reply_ids":b.reply,"messages":b.messages,"saved_ids":b.ids},
-            "c":{"prompt_ids":c.prompt,"reply_ids":c.reply,"messages":c.messages,"saved_ids":c.ids}
-        })
-    );
+    });
 }
 
 #[test]

@@ -237,3 +237,24 @@ fn try_take_never_waits_and_never_jumps_the_queue() {
     queued.join().unwrap();
     assert!(turns.try_take().is_some(), "the slot is free again");
 }
+
+#[test]
+fn queued_witness_follows_ticket_assignment_and_precedes_held_turn_release() {
+    let turns = Turns::default();
+    std::thread::scope(|scope| {
+        // Local to this scope body: a panic drops it before scope joins B.
+        let held = turns.take();
+        let (sent, queued) = std::sync::mpsc::channel();
+        let queue = &turns;
+        let next = scope.spawn(move || {
+            let _turn = queue.take_queued(&sent);
+        });
+        let (ticket, serving) = queued.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert!(ticket > serving, "B has an actual assigned ticket behind A");
+        assert!(turns.try_take().is_none());
+        assert!(!next.is_finished(), "assigned B cannot pass the held turn");
+        drop(held);
+        next.join().unwrap();
+    });
+    assert!(turns.try_take().is_some());
+}

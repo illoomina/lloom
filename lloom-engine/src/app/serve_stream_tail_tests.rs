@@ -859,6 +859,12 @@ pub(super) fn message_values<T: Into<Value>>(messages: Vec<T>) -> Vec<Value> {
     messages.into_iter().map(Into::into).collect()
 }
 
+// The production serving passage, not ambient pipette overrides. The same
+// shape helper is exercised by host tokenization and the loaded native fixture.
+pub(super) fn response_shape(options: &crate::EngineOptions) -> super::super::Shape {
+    super::super::Shape::of(options, Frontend::Serve, DEFAULT_SEED_TEXT.to_owned())
+}
+
 pub(super) fn shared_with_engine(engine: Box<dyn Served>) -> Arc<Shared> {
     let model_name = engine.model_name().to_owned();
     let front = Front::new(engine.as_ref(), Default::default());

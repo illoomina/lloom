@@ -2,7 +2,7 @@
 //! admitted native batch. No synchronization substitutes for dependency safety.
 use super::stream_tail_tests::{
     held_writer::{Cleanup, PausedWriter},
-    message_values, shared_with_engine,
+    message_values, response_shape, shared_with_engine,
 };
 use super::*;
 use lloom::models::lfm2_testing::Lfm2Tiny;
@@ -60,7 +60,7 @@ fn native_owner() -> Result<(Checkpoint, Arc<Shared>, NativeWitness)> {
     TinyConfig::derive(&mut cfg);
     let model = TinyCheckpoint::<Lfm2Tiny>::new(cfg, Weights::default()).write(&checkpoint.0)?;
     options.load.model = Some(model);
-    let shape = super::super::Shape::of(&options, Frontend::Serve, String::new());
+    let shape = response_shape(&options);
     let (engine, _) = super::super::load_engine(&options.load, shape)?;
     assert!(
         engine.device().is_metal(),

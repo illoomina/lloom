@@ -16,9 +16,10 @@
 //! `content`, as before, sends `reasoning_in_content: true` — an opt-out.
 //! `/v1/completions` is unchanged: its text is the reply.
 //!
-//! `usage.completion_tokens` counts the tokens of the completion the client
-//! **received** — the accepted frontier (decision 51 Q4, the standard
-//! semantics). The count the run generated is in `timings.tokens` and
+//! `usage.completion_tokens` counts accepted complete sampled tokens, not
+//! remote receipt (decisions 51 Q4 and 59). Delivery is reported separately;
+//! a late socket failure does not rewrite the retained accepted reply.
+//! The count the run generated is in `timings.tokens` and
 //! `timings.frontier`, which differ past a stop string on the adaptive commit.
 //! - the **benchmark sidecar** contract LiquidAI's `pipette` runners drive an
 //!   engine through (`Liquid4All/pipette-clients`, the MLX sidecar's shape):
@@ -6359,6 +6360,30 @@ mod native_custody_tests;
 #[cfg(test)]
 mod response_snapshot_tests {
     use super::*;
+
+    #[test]
+    fn loaded_response_fixture_uses_a_tokenizer_valid_shared_seed() {
+        use lloom::testing::tiny::{tokenizer::tokenizer_json, TinyTokenizer};
+        let tiny = TinyTokenizer::lfm2();
+        let tokenizer = tokenizers::Tokenizer::from_bytes(tokenizer_json(&tiny.added)).unwrap();
+        // Exact r2 failure condition under the same tokenizer, no model/device.
+        assert!(tokenizer.encode("", false).unwrap().get_ids().is_empty());
+        let shape = stream_tail_tests::response_shape(&crate::EngineOptions::default());
+        let encoded = tokenizer.encode(shape.seed_text.as_str(), false).unwrap();
+        assert!(
+            !encoded.get_ids().is_empty(),
+            "native load refuses an empty seed"
+        );
+        assert_eq!(shape.seed_text, DEFAULT_SEED_TEXT);
+        assert_eq!(
+            encoded.get_ids(),
+            DEFAULT_SEED_TEXT.bytes().map(u32::from).collect::<Vec<_>>()
+        );
+        assert!(encoded
+            .get_ids()
+            .iter()
+            .all(|id| (*id as usize) < tiny.vocab_size()));
+    }
 
     #[test]
     fn default_options_leave_native_fixture_tuning_installable() {

@@ -1364,6 +1364,7 @@ impl<P: QwenShape, R: ExpertResidency + HasStreamStats + Send + Sync + 'static> 
             "kv_capacity": self.kv_capacity,
             "tier": self.tier,
             "stream": self.tier_stats(),
+            "cut_sites": super::common::cut_sites_json(),
         })
     }
     fn describe(&self) -> String {

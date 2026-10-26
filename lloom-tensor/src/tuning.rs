@@ -1854,6 +1854,9 @@ pub struct InstrumentTuning {
     /// Attribute every host readback (`to_cpu`'s fast and blit paths, a staged read's stage, a host-read slot's read) to the model call site that made it (a backtrace per readback, #814 part 5).
     #[opt(flag = "readback-trace", env = "LLOOM_READBACK_TRACE", bool, path = "diagnostics.trace.readbacks", status = "instrument", needs = "profile", flows = ["token-out"])]
     pub readback_trace: bool,
+    /// Under the GPU profiler: attribute every command-buffer commit to the stack and thread that made it (a frame-pointer walk per commit, symbolized once per distinct stack), so a request's commits can be counted by cause (`profile::cut_sites`).
+    #[opt(flag = "cut-sites", env = "LLOOM_CUT_SITES", bool, path = "diagnostics.trace.cut_sites", status = "instrument", needs = "profile", flows = ["commands-out"])]
+    pub cut_sites: bool,
     /// Shadow every host upload and check it back (the #748 corruption instrument).
     #[opt(
         flag = "upload-shadow",

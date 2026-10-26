@@ -1267,6 +1267,7 @@ impl CommandBuffer {
         if !profile::enabled() {
             return None;
         }
+        profile::note_commit_site();
         let committed = profile::now_s();
         let step = profile::current_step();
         let native_key = (!self.is_metal4()).then(|| self.identity());

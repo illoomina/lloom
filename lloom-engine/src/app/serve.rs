@@ -4059,13 +4059,13 @@ fn usage(prompt: usize, completion: usize) -> Value {
     })
 }
 
-/// `usage` for a run: `completion_tokens` is the tokens of the completion the
-/// client received — the accepted frontier (decision 51 Q4, the standard
-/// semantics), which is what [`delivered_ids`] already computes for the
-/// logprobs block. The count the run generated stays in `timings`
-/// (`timings.tokens`, `timings.frontier.generated`): past a stop string on the
-/// adaptive commit with a slow consumer the two differ by up to the backlog,
-/// and those ids are text the client never received.
+/// `usage` for a run: `completion_tokens` counts the accepted completion
+/// frontier (decision 51 Q4 / decision 59), as [`delivered_ids`] computes for
+/// the logprobs block, not acknowledged receipt by the remote client.
+/// `written_bytes` separately credits successful whole-event transport writes.
+/// The generated count stays in `timings.tokens` / `timings.frontier.generated`:
+/// a stop string or consumer refusal can withhold generated text, so the
+/// generated and accepted frontiers need not coincide.
 fn run_usage(engine: &dyn Served, prompt: usize, d: &Decoded) -> Value {
     usage(prompt, delivered_ids(engine, d))
 }

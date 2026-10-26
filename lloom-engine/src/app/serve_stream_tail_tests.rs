@@ -1497,12 +1497,19 @@ fn checked_metadata_is_captured_before_publication_but_its_error_is_deferred() {
 #[test]
 fn stream_timing_brackets_exclude_socket_drain_from_decode_pace() {
     let shared = scripted_shared(Case::CompleteMarker);
+    let split = reasoning::Reasoning::for_chat(shared.engine.as_ref(), &[], false)
+        .unwrap()
+        .map(|parser| Arc::new(ParkingMutex::new(parser)));
+    assert!(
+        split.is_some(),
+        "timing fixture uses the production typed observer seam"
+    );
     let mut decoded = run_decode_observed(
         shared.engine.as_ref(),
         &[],
         &[],
         &DecodeParams::default(),
-        None,
+        split.as_ref(),
         &mut |_| true,
     )
     .unwrap();
@@ -1542,10 +1549,20 @@ fn stream_timing_brackets_exclude_socket_drain_from_decode_pace() {
 
 #[test]
 fn delayed_a_completion_cannot_rewrite_published_b_or_distinct_c_residency() {
+    assert_delayed_a_publication_custody(false);
+}
+
+#[test]
+fn late_a_writer_failure_cannot_rewrite_published_b_or_distinct_c_residency() {
+    assert_delayed_a_publication_custody(true);
+}
+
+fn assert_delayed_a_publication_custody(late_failure: bool) {
     struct PausedWriter {
         entered: Option<std::sync::mpsc::Sender<()>>,
         released: std::sync::mpsc::Receiver<()>,
         bytes: Arc<ParkingMutex<Vec<u8>>>,
+        late_failure: bool,
     }
     impl Write for PausedWriter {
         fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
@@ -1558,6 +1575,12 @@ fn delayed_a_completion_cannot_rewrite_published_b_or_distinct_c_residency() {
                 self.released
                     .recv_timeout(Duration::from_secs(5))
                     .map_err(|e| io::Error::new(io::ErrorKind::TimedOut, e.to_string()))?;
+                if self.late_failure {
+                    return Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "late A writer rejection",
+                    ));
+                }
             }
             Ok(())
         }
@@ -1638,6 +1661,7 @@ fn delayed_a_completion_cannot_rewrite_published_b_or_distinct_c_residency() {
                         entered: Some(entered),
                         released,
                         bytes: first_bytes,
+                        late_failure,
                     }),
                 })
             },
@@ -1683,7 +1707,33 @@ fn delayed_a_completion_cannot_rewrite_published_b_or_distinct_c_residency() {
         assert_eq!(message["reasoning_content"], "a");
         assert_eq!(message["content"], "X");
     }
-    cleanup.finish().unwrap();
+    let finished = cleanup.finish();
+    if late_failure {
+        let error = finished.unwrap_err().to_string();
+        assert!(error.contains("late A writer rejection"), "{error}");
+        let (_, frontier) = error
+            .split_once("; frontier ")
+            .expect("transport refusal names its frontier");
+        let frontier: Value = serde_json::from_str(frontier).unwrap();
+        assert_eq!(frontier["write_failed"], true);
+        assert_eq!(frontier["written_bytes"], 0);
+        assert_eq!(
+            shared
+                .drains
+                .pre_trailer_write_errors
+                .load(Ordering::Relaxed),
+            1
+        );
+    } else {
+        finished.unwrap();
+        assert_eq!(
+            shared
+                .drains
+                .pre_trailer_write_errors
+                .load(Ordering::Relaxed),
+            0
+        );
+    }
     let after_b = shared
         .sessions
         .lock()
@@ -1713,6 +1763,20 @@ fn delayed_a_completion_cannot_rewrite_published_b_or_distinct_c_residency() {
             (payload != "[DONE]").then(|| serde_json::from_str(payload).unwrap())
         })
         .collect();
+    if late_failure {
+        assert!(!events.is_empty(), "the rejected role event was attempted");
+        assert!(
+            events.iter().all(|e| e.get("timings").is_none()),
+            "failed A carries no success timings"
+        );
+        assert!(!wire.contains("[DONE]"));
+        assert!(
+            events.iter().all(|e| e["id"] == id_a),
+            "A's partial wire keeps A's immutable ID"
+        );
+        eprintln!("BRANCH_CUSTODY late_a_failure=true saved_b_messages={} saved_c_messages={} c_resident_after_a=true", b_messages.len(), c_messages.len());
+        return;
+    }
     let last = events.iter().find(|e| e.get("timings").is_some()).unwrap();
     assert_eq!(last["id"], id_a);
     assert_eq!(

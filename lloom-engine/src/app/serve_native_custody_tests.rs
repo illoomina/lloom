@@ -24,7 +24,7 @@ impl Drop for Checkpoint {
     }
 }
 
-fn native_owner() -> Result<(Checkpoint, Arc<Shared>)> {
+fn native_owner() -> Result<(Checkpoint, Arc<Shared>, &'static str)> {
     let path = std::env::temp_dir().join(format!(
         "lloom-response-native-{}-{}",
         std::process::id(),
@@ -33,8 +33,8 @@ fn native_owner() -> Result<(Checkpoint, Arc<Shared>)> {
     std::fs::create_dir(&path)?;
     let checkpoint = Checkpoint(path);
     let mut cfg = Lfm2Tiny::template();
-    cfg.set_axis("vocab_size", Lfm2Tiny::tokenizer().vocab_size());
-    cfg.derive();
+    TinyConfig::set_axis(&mut cfg, "vocab_size", Lfm2Tiny::tokenizer().vocab_size());
+    TinyConfig::derive(&mut cfg);
     let model = TinyCheckpoint::<Lfm2Tiny>::new(cfg, Weights::default()).write(&checkpoint.0)?;
     let mut options = crate::EngineOptions::default();
     options.load.model = Some(model);
@@ -58,7 +58,20 @@ fn native_owner() -> Result<(Checkpoint, Arc<Shared>)> {
         engine.device().is_metal(),
         "native test must not silently fall back to CPU"
     );
-    Ok((checkpoint, shared_with_engine(engine)))
+    let actual_api = engine
+        .device()
+        .as_metal_device()?
+        .commands()
+        .actual_command_api();
+    assert_eq!(
+        actual_api, options.tuning.metal.command_api,
+        "explicit native API must not silently change backend"
+    );
+    eprintln!(
+        "NATIVE_RESPONSE_OWNER actual_api={actual_api} selected_readback={}",
+        engine.readback().name()
+    );
+    Ok((checkpoint, shared_with_engine(engine), actual_api))
 }
 
 fn request(fields: Value) -> Value {
@@ -181,6 +194,7 @@ fn assert_reference(result: &Saved, reference: &Value) {
 /// differs. The reference retains it through the ENTIRE settlement return.
 fn scenario(
     shared: &Arc<Shared>,
+    actual_api: &str,
     release_at: Release,
     late_failure: bool,
     reference_a: &Value,
@@ -335,13 +349,13 @@ fn scenario(
         );
         assert!(std::str::from_utf8(&raw).unwrap().contains("[DONE]"));
     }
-    eprintln!("NATIVE_RESPONSE_CUSTODY device=metal api={} release={release_at:?} late_failure={late_failure} b_ids={} c_ids={} c_resident=true", lloom_tensor::tuning::tuning().metal.command_api, b.ids.len(), c.ids.len());
+    eprintln!("NATIVE_RESPONSE_CUSTODY device=metal api={} release={release_at:?} late_failure={late_failure} b_ids={} c_ids={} c_resident=true", actual_api, b.ids.len(), c.ids.len());
 }
 
 #[test]
 fn metal_lfm2_held_writer_and_full_settlement_reference_keep_identical_accepted_history(
 ) -> Result<()> {
-    let (checkpoint, shared) = native_owner()?;
+    let (checkpoint, shared, actual_api) = native_owner()?;
     let user_a = json!({"role":"user","content":"A"});
     let a = json_reply(&shared, json!({"messages":[user_a],"reset":"cache"}));
     let b = json_reply(
@@ -358,7 +372,7 @@ fn metal_lfm2_held_writer_and_full_settlement_reference_keep_identical_accepted_
         .is_empty());
     for release in [Release::Publication, Release::FullSettlement] {
         for late_failure in [false, true] {
-            scenario(&shared, release, late_failure, &a, &b, &c);
+            scenario(&shared, actual_api, release, late_failure, &a, &b, &c);
         }
     }
     drop(shared);

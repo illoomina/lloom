@@ -139,6 +139,7 @@ mod recurrent_state_metal;
 mod ring_publish_binds;
 mod ring_publish_order;
 mod rnn;
+mod row_driver_ownership;
 mod sampled_cells;
 mod sampling_callback_preservation;
 mod sampling_host_contract;

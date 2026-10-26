@@ -59,9 +59,22 @@ struct Slot<'m, M: BatchedCausalLM, R: BorrowMut<Session<'m, M>>> {
     prompt: Vec<u32>,
     lane: Lane,
     generation: u64,
-    /// The row's drafter slot.
-    seq: SeqId,
+    /// The row's drafter slot, owned here until it goes back to the free
+    /// list: `None` once it has. Retirement returns it, so a retired row
+    /// still holding its [`Slot`] (retired, not yet taken) owns no drafter
+    /// slot, and the drain that removes it returns nothing. A slot returned
+    /// twice would be handed to two live rows, whose drafter contexts would
+    /// then alias.
+    seq: Option<SeqId>,
     _model: std::marker::PhantomData<&'m M>,
+}
+
+impl<'m, M: BatchedCausalLM, R: BorrowMut<Session<'m, M>>> Slot<'m, M, R> {
+    /// The row's drafter slot while it owns one.
+    fn seq(&self) -> SeqId {
+        self.seq
+            .expect("a row that has not retired owns its drafter slot")
+    }
 }
 
 /// The speculative batched loop, one round at a time.
@@ -165,13 +178,14 @@ where
                 generation: slot.generation,
             };
             let t0 = std::time::Instant::now();
+            let drafter_slot = slot.seq();
             let s: &mut Session<'m, M> = slot.session.borrow_mut();
             s.seq.last_logits = None;
             let work = PrefillWork::resolve(&self.opts, s.seq.pos, slot.prompt.len(), true)?;
             let before = self.pacer.counters();
             let seeded = s.prefill_streamed(
                 &mut self.spec,
-                slot.seq,
+                drafter_slot,
                 &slot.prompt,
                 &work,
                 &mut self.pacer,
@@ -187,7 +201,7 @@ where
                 .argmax(lloom_tensor::D::Minus1)?
                 .to_scalar::<u32>()?;
             self.spec
-                .observe(slot.seq, &probe, std::slice::from_ref(&anchor))?;
+                .observe(drafter_slot, &probe, std::slice::from_ref(&anchor))?;
             let lane = &mut slot.lane;
             lane.stats.prefill_ns = t0.elapsed().as_nanos() as u64;
             lane.stats.prefill_units = units;
@@ -220,7 +234,7 @@ where
         let round_start_ns = self.run_start.elapsed().as_nanos() as u64;
         let seqs: Vec<SeqId> = live
             .iter()
-            .map(|&i| self.slots[i].as_ref().expect("live").seq)
+            .map(|&i| self.slots[i].as_ref().expect("live").seq())
             .collect();
         let t = std::time::Instant::now();
         let rb = readbacks();
@@ -319,7 +333,7 @@ where
             let rows: Vec<ObserveRow<'_, S::Probe>> = picked
                 .iter()
                 .zip(results.iter())
-                .map(|(s, (accepted, probe))| (s.seq, probe, accepted.as_slice()))
+                .map(|(s, (accepted, probe))| (s.seq(), probe, accepted.as_slice()))
                 .collect();
             if rows.iter().any(|(_, _, accepted)| accepted.is_empty()) {
                 lloom_tensor::bail!(
@@ -386,10 +400,24 @@ where
         Ok(())
     }
 
+    /// Return `slot`'s drafter slot to the free list, once: a row whose
+    /// ownership was already consumed returns nothing.
+    fn release_drafter_slot(free_seq: &mut Vec<usize>, slot: &mut Slot<'m, M, R>) {
+        if let Some(seq) = slot.seq.take() {
+            debug_assert!(
+                !free_seq.contains(&seq.0),
+                "drafter slot {} was already on the free list",
+                seq.0
+            );
+            free_seq.push(seq.0);
+        }
+    }
+
     /// Per-row bookkeeping at retirement: the accepted ids are the stream's
     /// prefix of the cache (the verify resolved every window to its accepted
     /// length, so nothing overran).
     fn retire(&mut self, i: usize) {
+        let free_seq = &mut self.free_seq;
         let slot = self.slots[i].as_mut().expect("a retiring row is held");
         let lane = &mut slot.lane;
         let s: &mut Session<'m, M> = slot.session.borrow_mut();
@@ -411,7 +439,7 @@ where
             eos: lane.eos,
             stats,
         };
-        self.free_seq.push(slot.seq.0);
+        Self::release_drafter_slot(free_seq, slot);
         self.finished.push((i, out));
     }
 }
@@ -505,7 +533,7 @@ where
             prompt,
             lane,
             generation,
-            seq: SeqId(seq),
+            seq: Some(SeqId(seq)),
             _model: std::marker::PhantomData,
         };
         let idx = match self.free.pop() {
@@ -595,9 +623,12 @@ where
         let mut out = Vec::new();
         self.finished.clear();
         for i in 0..self.slots.len() {
-            if let Some(slot) = self.slots[i].take() {
+            if let Some(mut slot) = self.slots[i].take() {
                 self.free.push(i);
-                self.free_seq.push(slot.seq.0);
+                // A retired row returned its drafter slot at its
+                // retirement: this takes nothing, rather than putting the
+                // same slot on the free list twice.
+                Self::release_drafter_slot(&mut self.free_seq, &mut slot);
                 out.push(slot.session);
             }
         }

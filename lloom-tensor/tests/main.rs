@@ -49,6 +49,7 @@ mod iq_metal;
 mod kv_pages_cpu;
 mod layout_tests;
 mod matmul_tests;
+mod metal4_declare;
 mod metal4_slot_trace;
 mod metal_arena_lifetime_fuzz;
 mod metal_arena_teardown_tests;

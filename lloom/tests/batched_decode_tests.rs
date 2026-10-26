@@ -948,6 +948,9 @@ fn a_step_carries_up_to_prefill_batch_rows_chunks() -> Result<()> {
                     .iter()
                     .map(|p| {
                         dec.admit(Session::new(&model, 0usize), p.clone(), Sampling::ArgMax, 0)
+                            // A refusal hands the row's session back
+                            // (`Rejected`); this fixture admits every row.
+                            .map_err(lloom_tensor::Error::from)
                     })
                     .collect::<Result<_>>()?;
                 let mut streams: Vec<Vec<u32>> = vec![Vec::new(); 8];

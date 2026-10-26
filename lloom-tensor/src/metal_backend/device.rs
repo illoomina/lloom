@@ -780,6 +780,21 @@ impl MetalDevice {
         Ok(pl)
     }
 
+    /// A fresh allocation from this device's own backings, about to join one
+    /// of its pools: the device's residency sets list it until the pool
+    /// evicts it from the free list, after its last GPU reader
+    /// (`Buffer::device_listed`). Unmarked when the device has no set.
+    fn listed_for_pool(
+        &self,
+        mut allocation: crate::kernels::metal::backing::Allocation,
+    ) -> crate::kernels::metal::backing::Allocation {
+        // SAFETY: asks only whether a native set exists; nothing is borrowed.
+        if unsafe { self.residency_set.raw() }.is_some() {
+            allocation.buffer = allocation.buffer.with_device_listing();
+        }
+        allocation
+    }
+
     fn allocate_backing(
         backing: &dyn Backing,
         bytes: usize,
@@ -946,8 +961,14 @@ impl MetalDevice {
     /// (`kernels.residency.attach`) and the router's layout
     /// ([`ResidencySet::layout_line`]), e.g. `residency=queue 1 set 8.12 GiB`.
     pub fn residency_line(&self) -> String {
+        let metal4 = match self.commands.metal4_declare() {
+            Some(d) if d != crate::kernels::metal::Metal4Declare::Slots => {
+                format!(" metal4={}", d.name())
+            }
+            _ => String::new(),
+        };
         format!(
-            "residency={} {}",
+            "residency={} {}{metal4}",
             self.commands.residency_attachment().short(),
             self.residency_set.layout_line()
         )
@@ -2632,55 +2653,74 @@ impl MetalDevice {
         // Whatever this pass does, the arena the last pass installed must not
         // serve it: a pass is served only under its own key's plan.
         self.clear_arena_keep_base();
-        let state = match (pp.state.pending, pp.plans.contains_key(&key)) {
+        // A refusal past the bits above leaves no half-open pass: the body
+        // bits are cleared and no `current` is registered, so the caller's
+        // error path owes no `finish_pass` and the next pass opens on the
+        // state this one found.
+        let opened = match (pp.state.pending, pp.plans.contains_key(&key)) {
             (Some(closes), cached) => {
                 // The recorder still holds the pending key's pass as its
                 // current step; this pass becomes the step that says what
                 // escaped it.
                 self.next_arena_recording_step();
                 pp.counters.observed += 1;
-                if cached {
+                Ok(if cached {
                     PassState::Observing { closes }
                 } else {
                     PassState::Recording {
                         key,
                         closes: Some(closes),
                     }
-                }
+                })
             }
             (None, true) => {
                 let generation = pp.state.base_generation;
                 let stale = pp.arena_generation.get(&key) != Some(&generation);
-                if stale || !pp.arenas.contains_key(&key) {
+                let built = if stale || !pp.arenas.contains_key(&key) {
                     let plan = pp.plans.get(&key).expect("cached").clone();
                     let base = pp.base.clone().expect("a cached plan has a base");
-                    let arena = Arena::new(base, plan, pp.layout)
-                        .map_err(|e| MetalError::Message(format!("pass plan rejected: {e}")))?;
-                    pp.arenas.insert(key, arena);
-                    pp.arena_generation.insert(key, generation);
-                }
-                let arena = pp.arenas.get(&key).expect("built above").clone();
-                crate::kernels::metal::set_hazard_key_unless_explicit(
-                    crate::kernels::metal::HazardKey::Range,
-                );
-                {
-                    let mut slot = self.arena.write();
-                    *slot = Some(arena.clone());
-                }
-                arena.begin_step();
-                pp.counters.served += 1;
-                self.pass_state
-                    .fetch_or(0b100, std::sync::atomic::Ordering::Relaxed);
-                PassState::Served(key)
+                    Arena::new(base, plan, pp.layout)
+                        .map_err(|e| MetalError::Message(format!("pass plan rejected: {e}")))
+                        .map(|arena| {
+                            pp.arenas.insert(key, arena);
+                            pp.arena_generation.insert(key, generation);
+                        })
+                } else {
+                    Ok(())
+                };
+                built.map(|()| {
+                    let arena = pp.arenas.get(&key).expect("built above").clone();
+                    crate::kernels::metal::set_hazard_key_unless_explicit(
+                        crate::kernels::metal::HazardKey::Range,
+                    );
+                    {
+                        let mut slot = self.arena.write();
+                        *slot = Some(arena.clone());
+                    }
+                    arena.begin_step();
+                    pp.counters.served += 1;
+                    self.pass_state
+                        .fetch_or(0b100, std::sync::atomic::Ordering::Relaxed);
+                    PassState::Served(key)
+                })
             }
             (None, false) => {
                 self.begin_arena_recording();
                 pp.counters.recorded += 1;
-                PassState::Recording { key, closes: None }
+                Ok(PassState::Recording { key, closes: None })
             }
         };
-        pp.state.current = Some(state);
-        Ok(())
+        match opened {
+            Ok(state) => {
+                pp.state.current = Some(state);
+                Ok(())
+            }
+            Err(error) => {
+                self.pass_state
+                    .fetch_and(!0b1110, std::sync::atomic::Ordering::Relaxed);
+                Err(error.into())
+            }
+        }
     }
 
     /// Close the pass `begin_pass` opened: build the plan a pending key was
@@ -3277,8 +3317,11 @@ impl MetalDevice {
                     .check_residual(alloc)
                     .map_err(AllocationError::from)?;
                 let split = self.residency_set.policy().is_split();
-                let new_buffer =
-                    Self::allocate_backing(self.backings.for_miss(true, split), alloc, context)?;
+                let new_buffer = self.listed_for_pool(Self::allocate_backing(
+                    self.backings.for_miss(true, split),
+                    alloc,
+                    context,
+                )?);
                 // `size` is the pre-rounding request and `alloc` is what Metal
                 // was given; `adopt_requesting` counts both so §9.2's residual
                 // overhang is derivable. The rounding happened at `alloc`
@@ -4010,8 +4053,11 @@ impl MetalDevice {
             .check_residual(size)
             .map_err(AllocationError::from)?;
         let split = self.residency_set.policy().is_split();
-        let new_buffer =
-            Self::allocate_backing(self.backings.for_miss(false, split), size, context)?;
+        let new_buffer = self.listed_for_pool(Self::allocate_backing(
+            self.backings.for_miss(false, split),
+            size,
+            context,
+        )?);
         Ok(self
             .buffers
             .adopt_after_miss_in(new_buffer, size, miss, &origin)?)

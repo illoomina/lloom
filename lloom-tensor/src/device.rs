@@ -559,15 +559,13 @@ impl Device {
         }
     }
 
-    /// The Metal 4 queue's per-slot residency counts, as `(adds, commits,
-    /// last_bytes, max_bytes)` (`kernels.residency.slot_trace`; `None` off
-    /// Metal 4 or with the instrument off).
-    pub fn metal4_slot_residency(&self) -> Option<(u64, u64, u64, u64)> {
+    /// The Metal 4 queue's per-slot residency counts and times
+    /// (`kernels.residency.slot_trace`; `None` off Metal 4 or with the
+    /// instrument off).
+    pub fn metal4_slot_residency(&self) -> Option<crate::residency_class::SlotResidency> {
         #[cfg(feature = "metal")]
         if let Self::Metal(d) = self {
-            return d
-                .metal4_slot_residency()
-                .map(|s| (s.adds, s.commits, s.last_bytes, s.max_bytes));
+            return d.metal4_slot_residency();
         }
         None
     }

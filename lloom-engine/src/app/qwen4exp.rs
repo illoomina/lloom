@@ -90,6 +90,9 @@ pub struct LoadOptions {
     /// Rows the batch scheduler serves at once (`--batch N`); 1 is the
     /// single-sequence engine.
     pub batch: usize,
+    /// The most requests one intake tick takes while rows are live
+    /// (`scheduler.intake_per_tick`).
+    pub intake_per_tick: usize,
     /// Tokens the MTP drafter proposes per round.
     pub mtp_k: usize,
     /// The streamed tier's prefetcher (`--prefetch`).
@@ -930,6 +933,7 @@ impl<P: QwenShape, R: ExpertResidency + HasStreamStats + Send + Sync + 'static> 
                 // Whole prompts at arrival (no chunk budget): nothing to batch.
                 prefill_batch: 1,
                 prefill_decode: lloom::nn::PrefillDecode::Ride,
+                intake_per_tick: opts.intake_per_tick,
                 mode: BatchMode::Continuous,
                 extra: (),
                 on_counters: None,

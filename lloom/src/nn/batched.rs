@@ -250,12 +250,64 @@ impl std::fmt::Display for PrefillDecode {
 
 lloom_tensor::serde_via_str!(PrefillDecode);
 
+/// An admission the driver refused: the row it did not take, with the
+/// reason.
+///
+/// Admission is transactional. A driver takes the row's session only once
+/// it holds a slot for it, so a refusal — a sampler the body does not run,
+/// a sequence in a state no row can start from, an empty prepared suffix,
+/// no drafter slot left — hands the session back to whoever owns the
+/// sequences. Without that, every refusal past the caller's own validation
+/// costs a scheduler one sequence of its pool, and enough of them leave
+/// valid requests failing admission with nothing live.
+///
+/// `?` on an admission still yields the error alone, so a caller with
+/// nothing to hand the session back to is unchanged.
+pub struct Rejected<R> {
+    /// The session the driver did not take.
+    pub session: R,
+    pub error: lloom_tensor::Error,
+}
+
+impl<R> Rejected<R> {
+    /// The reason, dropping the returned session.
+    pub fn into_error(self) -> lloom_tensor::Error {
+        self.error
+    }
+}
+
+impl<R> From<Rejected<R>> for lloom_tensor::Error {
+    fn from(rejected: Rejected<R>) -> Self {
+        rejected.error
+    }
+}
+
+impl<R> std::fmt::Debug for Rejected<R> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Rejected")
+            .field("error", &self.error)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<R> std::fmt::Display for Rejected<R> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.error.fmt(f)
+    }
+}
+
+/// An admission's outcome: the row's handle, or the refusal with the
+/// session the driver did not take.
+pub type Admission<R> = std::result::Result<RowId, Rejected<R>>;
+
 /// What a scheduler drives, step by step: rows admitted at any step,
 /// cancelled, retired with their outcome — the K=1 batched loop
 /// ([`BatchDecoder`]) or the speculative one
 /// ([`SpecBatchDecoder`](crate::nn::SpecBatchDecoder)), one surface
 /// (`batched-decode-design.md` §12.4).
 pub trait RowDriver<'m, M: BatchedCausalLM + 'm, R: BorrowMut<Session<'m, M>>> {
+    /// Admit a row, or refuse it and hand its session back
+    /// ([`Rejected`]).
     #[allow(clippy::too_many_arguments)]
     fn admit_with_eos(
         &mut self,
@@ -265,7 +317,7 @@ pub trait RowDriver<'m, M: BatchedCausalLM + 'm, R: BorrowMut<Session<'m, M>>> {
         seed: u64,
         eos_ids: &[u32],
         max_tokens: usize,
-    ) -> Result<RowId>;
+    ) -> Admission<R>;
     fn step(
         &mut self,
         on_tokens: &mut dyn FnMut(RowId, &[u32]) -> Result<()>,
@@ -298,7 +350,7 @@ impl<'m, M: BatchedCausalLM + 'm, R: BorrowMut<Session<'m, M>>> RowDriver<'m, M,
         seed: u64,
         eos_ids: &[u32],
         max_tokens: usize,
-    ) -> Result<RowId> {
+    ) -> Admission<R> {
         BatchDecoder::admit_with_eos(self, session, prompt, sampling, seed, eos_ids, max_tokens)
     }
     fn step(
@@ -519,7 +571,7 @@ impl<'m, M: BatchedCausalLM, R: BorrowMut<Session<'m, M>>> BatchDecoder<'m, M, R
         prompt: Vec<u32>,
         sampling: Sampling,
         seed: u64,
-    ) -> Result<RowId> {
+    ) -> Admission<R> {
         let step = self.step;
         self.admit_at(session, prompt, sampling, seed, step)
     }
@@ -535,9 +587,14 @@ impl<'m, M: BatchedCausalLM, R: BorrowMut<Session<'m, M>>> BatchDecoder<'m, M, R
         seed: u64,
         eos_ids: &[u32],
         max_tokens: usize,
-    ) -> Result<RowId> {
+    ) -> Admission<R> {
         if eos_ids.is_empty() {
-            lloom_tensor::bail!("decode_batched: a row with an empty EOS set would never end");
+            return Err(Rejected {
+                session,
+                error: lloom_tensor::Error::msg(
+                    "decode_batched: a row with an empty EOS set would never end",
+                ),
+            });
         }
         let step = self.step;
         self.admit_row(
@@ -566,7 +623,7 @@ impl<'m, M: BatchedCausalLM, R: BorrowMut<Session<'m, M>>> BatchDecoder<'m, M, R
         sampling: Sampling,
         seed: u64,
         arrival: u64,
-    ) -> Result<RowId> {
+    ) -> Admission<R> {
         let eos_ids = self.eos_ids.clone();
         let max_tokens = self.opts.max_tokens;
         self.admit_row(
@@ -584,25 +641,33 @@ impl<'m, M: BatchedCausalLM, R: BorrowMut<Session<'m, M>>> BatchDecoder<'m, M, R
         arrival: u64,
         eos_ids: Vec<u32>,
         max_tokens: usize,
-    ) -> Result<RowId> {
-        crate::nn::decode::refuse(
+    ) -> Admission<R> {
+        // Every refusal is decided before the slot is filled, and hands the
+        // session back ([`Rejected`]): what the row would own is not taken
+        // until the admission commits.
+        let refused = crate::nn::decode::refuse(
             crate::nn::decode::Body::BatchedStep,
             &crate::nn::decode::Asks::sampling(&sampling),
-        )?;
-        {
+        )
+        .err()
+        .or_else(|| {
             let s: &mut Session<'m, M> = session.borrow_mut();
             if s.seq.overrun > 0 {
-                lloom_tensor::bail!(
+                return Some(lloom_tensor::Error::msg(format!(
                     "decode_batched: the sequence's cache is {} positions past its last token \
                      (an earlier run's overrun); `Session::reconcile` or `Session::reset` first",
                     s.seq.overrun
-                );
+                )));
             }
             if prompt.is_empty() && s.seq.last_logits.is_none() {
-                lloom_tensor::bail!(
-                    "decode_batched: an empty prompt and no held logits to resume from"
-                );
+                return Some(lloom_tensor::Error::msg(
+                    "decode_batched: an empty prompt and no held logits to resume from",
+                ));
             }
+            None
+        });
+        if let Some(error) = refused {
+            return Err(Rejected { session, error });
         }
         self.generation += 1;
         let generation = self.generation;

@@ -989,7 +989,17 @@ impl Commands {
         };
 
         let modern_queue = if metal4 {
-            Some(super::metal4::Queue::new(device.clone())?)
+            let queue = super::metal4::Queue::new(device.clone())?;
+            // Before the queue's first command buffer, so every buffer
+            // committed on it declares the same way.
+            let declare = queue.declare();
+            if declare.on_queue() {
+                residency_set.attach_metal4_queue(&queue.raw);
+            }
+            if declare.on_queue() || declare.per_command_buffer() {
+                queue.use_device_sets(Arc::clone(&residency_set));
+            }
+            Some(queue)
         } else {
             None
         };
@@ -1305,6 +1315,12 @@ impl Commands {
     /// instrument off.
     pub fn metal4_slot_residency(&self) -> Option<super::SlotResidency> {
         self.core.modern_queue.as_ref()?.slot_residency()
+    }
+
+    /// What this queue's Metal 4 command buffers declare resident
+    /// (`kernels.residency.metal4`); `None` on Metal 3.
+    pub fn metal4_declare(&self) -> Option<super::Metal4Declare> {
+        Some(self.core.modern_queue.as_ref()?.declare())
     }
 
     /// The native command API actually installed on this queue.

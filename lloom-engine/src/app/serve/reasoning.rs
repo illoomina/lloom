@@ -183,7 +183,7 @@ impl Reasoning {
             for marker in &self.markers {
                 if let Some(at) = self.pending[pos..].find(marker.text.as_str()) {
                     let at = pos + at;
-                    if best.map_or(true, |b: (usize, usize, Kind)| at < b.0) {
+                    if best.is_none_or(|b: (usize, usize, Kind)| at < b.0) {
                         best = Some((at, marker.text.len(), marker.kind));
                     }
                 }

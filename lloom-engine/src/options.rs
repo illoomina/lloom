@@ -2583,13 +2583,13 @@ mod response_option_tests {
         idx.merge(&mut back, &idx.render(&options)).unwrap();
         assert_eq!(back, options);
         let mut env = ServerResponseConfig::default();
-        env.from_env_with(&|name| match name {
-            "LLOOM_SERVER_RESPONSE_CONTEXTS" => Some("3".into()),
-            "LLOOM_SERVER_RESPONSE_RAW_BYTES" => Some("17".into()),
-            "LLOOM_SERVER_RESPONSE_MARKERS" => Some("5".into()),
-            _ => None,
-        })
-        .unwrap();
+        let variables = std::collections::BTreeMap::from([
+            (idx.keys["server.response.contexts"].env(), "3".to_owned()),
+            (idx.keys["server.response.raw_bytes"].env(), "17".to_owned()),
+            (idx.keys["server.response.markers"].env(), "5".to_owned()),
+        ]);
+        env.from_env_with(&|name| variables.get(name).cloned())
+            .unwrap();
         assert_eq!(env, expected);
         #[derive(Parser)]
         struct Cli {

@@ -1,8 +1,11 @@
 //! Actual loaded Metal owner through the response path. Run only under an
 //! admitted native batch. No synchronization substitutes for dependency safety.
 use super::stream_tail_tests::{
+    assert_bootstrap_reset,
     held_writer::{Cleanup, PausedWriter},
-    message_values, response_shape, shared_with_engine,
+    message_values, native_bootstrap, native_initial_fields, native_json_reference as json_reply,
+    native_reset_fields, native_response_request as request, response_reply, response_shape,
+    shared_with_engine,
 };
 use super::*;
 use lloom::models::lfm2_testing::Lfm2Tiny;
@@ -93,28 +96,6 @@ fn native_owner() -> Result<(Checkpoint, Arc<Shared>, NativeWitness)> {
     Ok((checkpoint, shared_with_engine(engine), witness))
 }
 
-fn request(fields: Value) -> Value {
-    let mut body = json!({"max_tokens":8,"temperature":0,"seed":7,"ignore_eos":true,
-        "enable_thinking":false,"return_token_ids":true,
-        "logit_bias":{"97":100,"98":100,"99":100}});
-    for (key, value) in fields.as_object().unwrap() {
-        body[key] = value.clone();
-    }
-    body
-}
-
-fn json_reply(shared: &Shared, body: Value) -> Value {
-    let _turn = shared.turns.take();
-    let reply = chat_completions(shared, &request(body), None)
-        .ok()
-        .expect("native JSON request built");
-    let Reply::Json(body) = reply else {
-        panic!("JSON requested")
-    };
-    assert_eq!(body["choices"][0]["token_ids"].as_array().unwrap().len(), 8);
-    body
-}
-
 fn events(bytes: &[u8]) -> Vec<Value> {
     std::str::from_utf8(bytes)
         .unwrap()
@@ -168,10 +149,10 @@ fn publish_with_queue(
         Some(witness) => shared.turns.take_queued(witness),
         None => shared.turns.take(),
     });
-    let Reply::Stream(run) = chat_completions(shared, &request(body), None)
-        .ok()
-        .expect("native stream built")
-    else {
+    let Reply::Stream(run) = response_reply(
+        chat_completions(shared, &request(body), None),
+        "native B/C stream",
+    ) else {
         panic!("stream requested")
     };
     if by_id {
@@ -231,6 +212,9 @@ fn scenario(
     reference_b: &Value,
     reference_c: &Value,
 ) {
+    // Valid bootstrap happens before the held-writer interval. Only its ID
+    // crosses this boundary; no lookup/native-row owner pins model backing.
+    let bootstrap = native_bootstrap(shared);
     std::thread::scope(|scope| {
         let bytes = Arc::new(ParkingMutex::new(Vec::new()));
         let (entered, entry) = mpsc::channel();
@@ -238,12 +222,19 @@ fn scenario(
         let (published, publication) = mpsc::channel();
         let owner = shared.clone();
         let captured = bytes.clone();
+        let previous = bootstrap.clone();
         let thread = std::thread::spawn(move || {
             let _drain = owner.drains.try_take().expect("bounded A response context");
             let mut ticket = Some(owner.turns.take());
-            let Reply::Stream(run) = chat_completions(&owner, &request(json!({
-                "messages":[{"role":"user","content":"A"}],"store":true,"stream":true,"reset":"cache"
-            })), None).ok().expect("A built") else { panic!("stream requested") };
+            let mut fields = native_reset_fields(&previous, native_initial_fields());
+            fields["store"] = json!(true);
+            fields["stream"] = json!(true);
+            let Reply::Stream(run) = response_reply(
+                chat_completions(&owner, &request(fields), None),
+                "native A stream",
+            ) else {
+                panic!("stream requested")
+            };
             let id = run.id.clone();
             let result = stream_response_settlement(
                 &owner,
@@ -281,14 +272,22 @@ fn scenario(
         let id_a = publication
             .recv_timeout(Duration::from_secs(60))
             .expect("A accepted history published");
+        assert_bootstrap_reset(shared, &bootstrap, &id_a);
         let (a_message, a_ids) = {
             let a = shared
                 .sessions
                 .lock()
                 .resolve(&id_a, None, true, Instant::now())
                 .unwrap();
-            let message = message_values(a.messages.unwrap()).pop().unwrap();
-            assert_eq!(message, reference_a["choices"][0]["message"]);
+            let messages = message_values(a.messages.unwrap());
+            assert_eq!(
+                messages,
+                vec![
+                    json!({"role":"user","content":"A"}),
+                    reference_a["choices"][0]["message"].clone()
+                ]
+            );
+            let message = messages.last().unwrap().clone();
             // Pure owned JSON/IDs only: drop every Bound/Reply/native-row owner
             // from this lookup before B/C. This does not pin model backing.
             (message, a.ids)
@@ -430,7 +429,7 @@ fn metal_lfm2_held_writer_and_full_settlement_reference_keep_identical_accepted_
 ) -> Result<()> {
     let (checkpoint, shared, witness) = native_owner()?;
     let user_a = json!({"role":"user","content":"A"});
-    let a = json_reply(&shared, json!({"messages":[user_a],"reset":"cache"}));
+    let a = json_reply(&shared, native_initial_fields());
     let b = json_reply(
         &shared,
         json!({"messages":[user_a,a["choices"][0]["message"],{"role":"user","content":"B"}],"reset":"cache"}),

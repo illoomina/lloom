@@ -23,6 +23,8 @@ enum Case {
     LateFailure,
     BacklogRefusal,
     LateMetadataFailure,
+    // Host-only, exact eight-byte reply for the API lineage controls.
+    ApiLineage,
 }
 #[derive(Default)]
 struct Wire {
@@ -146,10 +148,10 @@ impl Served for Scripted {
         "scripted-tail"
     }
     fn kv_capacity(&self) -> usize {
-        if matches!(self.case, Case::LongReply | Case::BacklogRefusal) {
-            4 << 20
-        } else {
-            64
+        match self.case {
+            Case::LongReply | Case::BacklogRefusal => 4 << 20,
+            Case::ApiLineage => 256,
+            _ => 64,
         }
     }
     fn readback(&self) -> ReadbackArm {
@@ -275,6 +277,7 @@ impl Served for Scripted {
         };
         let ids = match self.case {
             Case::PartialTail => vec![97, end],
+            Case::ApiLineage => vec![97; 8],
             Case::LongReply => vec![97; 1 << 18],
             Case::BacklogRefusal => {
                 let mut ids = vec![98; MAX_RESPONSE_BACKLOG + 2];
@@ -857,6 +860,174 @@ fn scripted_shared_with_progress(case: Case, progress: Progress) -> Arc<Shared> 
 // identity Into; retention's owned StoredMessage supplies a consuming adapter.
 pub(super) fn message_values<T: Into<Value>>(messages: Vec<T>) -> Vec<Value> {
     messages.into_iter().map(Into::into).collect()
+}
+
+// Shared input/diagnostics for host ingress controls and the actual native
+// fixture. The malformed unbound reset remains a negative control.
+pub(super) fn native_response_request(fields: Value) -> Value {
+    let mut body = json!({"max_tokens":8,"temperature":0,"seed":7,"ignore_eos":true,
+        "enable_thinking":false,"return_token_ids":true,
+        "logit_bias":{"97":100,"98":100,"99":100}});
+    for (key, value) in fields.as_object().unwrap() {
+        body[key] = value.clone();
+    }
+    body
+}
+
+pub(super) fn native_initial_fields() -> Value {
+    json!({"messages":[{"role":"user","content":"A"}],"reset":"cache"})
+}
+
+pub(super) fn response_reply(reply: Handled<Reply>, context: &str) -> Reply {
+    match reply {
+        Ok(reply) => reply,
+        Err(Failure::BadRequest(message)) => panic!("{context}: HTTP400 BadRequest: {message}"),
+        Err(Failure::NotFound(message)) => panic!("{context}: HTTP404 NotFound: {message}"),
+        Err(Failure::Internal(error)) => panic!("{context}: HTTP500 Internal: {error:#}"),
+    }
+}
+
+pub(super) fn native_json_reply(shared: &Shared, fields: Value) -> Value {
+    let _turn = shared.turns.take();
+    let context = format!("native JSON request {fields}");
+    let reply = response_reply(
+        chat_completions(shared, &native_response_request(fields), None),
+        &context,
+    );
+    let Reply::Json(body) = reply else {
+        panic!("JSON requested")
+    };
+    assert_eq!(body["choices"][0]["token_ids"].as_array().unwrap().len(), 8);
+    body
+}
+
+pub(super) fn native_bootstrap(shared: &Shared) -> String {
+    let body = native_json_reply(
+        shared,
+        json!({
+            "messages":[{"role":"user","content":"fixture-bootstrap"}],"store":true
+        }),
+    );
+    let id = body["id"].as_str().unwrap().to_owned();
+    {
+        // No Bound/Reply/native-row owner from this lookup survives to target.
+        let resolved = shared
+            .sessions
+            .lock()
+            .resolve(&id, None, true, Instant::now())
+            .unwrap();
+        let messages = message_values(resolved.messages.unwrap());
+        assert_eq!(
+            messages,
+            vec![
+                json!({"role":"user","content":"fixture-bootstrap"}),
+                body["choices"][0]["message"].clone()
+            ]
+        );
+    }
+    id
+}
+
+pub(super) fn native_reset_fields(bootstrap: &str, mut fields: Value) -> Value {
+    assert!(fields.get("previous_response_id").is_none());
+    assert!(fields.get("input").is_none());
+    assert!(fields["messages"].is_array());
+    assert_eq!(fields["reset"], "cache");
+    fields["previous_response_id"] = json!(bootstrap);
+    fields
+}
+
+pub(super) fn assert_bootstrap_reset(shared: &Shared, bootstrap: &str, target: &str) {
+    assert_ne!(bootstrap, target, "reset must publish a fresh turn nonce");
+    let old = shared
+        .sessions
+        .lock()
+        .resolve(bootstrap, None, true, Instant::now());
+    match old {
+        Err(lost) => assert_eq!(lost.reason, Some(super::super::sessions::Reason::Reset)),
+        Ok(_) => panic!("bootstrap id must not continue the reset target"),
+    }
+}
+
+/// A full-history API reference, not a cold or uncached-front-end oracle.
+/// The reset clears session turns but preserves the model's prefix policy.
+pub(super) fn native_json_reference(shared: &Shared, fields: Value) -> Value {
+    let bootstrap = native_bootstrap(shared);
+    let expected = fields["messages"].as_array().unwrap().clone();
+    let body = native_json_reply(shared, native_reset_fields(&bootstrap, fields));
+    let id = body["id"].as_str().unwrap();
+    assert_eq!(body["timings"]["session"]["reset"], "cache");
+    assert_bootstrap_reset(shared, &bootstrap, id);
+    {
+        // Convert outside the table lock and drop all lookup native owners
+        // before returning the pure JSON reference to the next request.
+        let resolved = shared
+            .sessions
+            .lock()
+            .resolve(id, None, true, Instant::now())
+            .unwrap();
+        let messages = message_values(resolved.messages.unwrap());
+        let mut expected = expected;
+        expected.push(body["choices"][0]["message"].clone());
+        assert_eq!(
+            messages, expected,
+            "no bootstrap message may enter the target"
+        );
+        let expected_ids: Vec<u32> = body["prompt_token_ids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .chain(body["choices"][0]["token_ids"].as_array().unwrap())
+            .map(|v| u32::try_from(v.as_u64().unwrap()).unwrap())
+            .collect();
+        assert_eq!(
+            resolved.ids, expected_ids,
+            "saved IDs are the target prompt plus accepted reply"
+        );
+    }
+    body
+}
+
+#[test]
+fn native_reference_a_is_valid_through_actual_chat_ingress() {
+    let shared = scripted_shared(Case::ApiLineage);
+    let a = native_json_reference(&shared, native_initial_fields());
+    let b = native_json_reference(
+        &shared,
+        json!({
+            "messages":[{"role":"user","content":"A"},a["choices"][0]["message"],{"role":"user","content":"B"}],"reset":"cache"
+        }),
+    );
+    let c = native_json_reference(
+        &shared,
+        json!({
+            "messages":[{"role":"user","content":"C"}],"reset":"cache"
+        }),
+    );
+    for (body, count) in [(&a, 2), (&b, 4), (&c, 2)] {
+        let r = shared
+            .sessions
+            .lock()
+            .resolve(body["id"].as_str().unwrap(), None, true, Instant::now())
+            .unwrap();
+        assert_eq!(message_values(r.messages.unwrap()).len(), count);
+    }
+}
+
+#[test]
+fn an_unbound_native_reset_is_refused_before_model_entry() {
+    let progress = Progress::default();
+    let shared = scripted_shared_with_progress(Case::ApiLineage, progress.clone());
+    let body = native_response_request(native_initial_fields());
+    match chat_completions(&shared, &body, None) {
+        Err(Failure::BadRequest(message)) => assert_eq!(
+            message,
+            "field 'reset' resets a session: it needs previous_response_id"
+        ),
+        _ => panic!("malformed unbound reset must remain HTTP400"),
+    }
+    let (wire, _) = &*progress.0;
+    assert_eq!(wire.lock().model_entries, 0);
 }
 
 // The production serving passage, not ambient pipette overrides. The same

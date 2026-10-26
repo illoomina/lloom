@@ -669,6 +669,43 @@ pub fn f16_rows_decode_launches() -> u64 {
     F16_ROWS_DECODE_LAUNCHES.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// `kernels.gemm.f16_rows_round`: 0 unread, 1 off, 2 on.
+static F16_ROWS_ROUND: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Launches on the f16 row axis that took a capacity above their rows since
+/// process start: the rounding arm's engagement count.
+static F16_ROWS_ROUNDED_LAUNCHES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// `kernels.gemm.f16_rows_round`, read once; or [`set_f16_rows_round`].
+pub fn f16_rows_round() -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    match F16_ROWS_ROUND.load(Relaxed) {
+        1 => false,
+        2 => true,
+        _ => {
+            let on = tuning().gemm.f16_rows_round;
+            F16_ROWS_ROUND.store(if on { 2 } else { 1 }, Relaxed);
+            on
+        }
+    }
+}
+
+/// Select the capacity rounding for this process (a test runs both).
+pub fn set_f16_rows_round(on: bool) {
+    F16_ROWS_ROUND.store(if on { 2 } else { 1 }, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Count one launch on the f16 row axis at a capacity above its rows.
+pub fn note_f16_rows_rounded() {
+    F16_ROWS_ROUNDED_LAUNCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The rounding arm's engagement count now.
+pub fn f16_rows_rounded_launches() -> u64 {
+    F16_ROWS_ROUNDED_LAUNCHES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// The contract in force for this process: [`tuning`]'s `contract.profile`,
 /// parsed once. Every fast arm reads it here, so the contract is one value
 /// read once (a compile-time profile type would replace this function).
@@ -1098,6 +1135,13 @@ fn parse_icb_residency(v: &str) -> Result<String, String> {
 fn parse_residency_attach(v: &str) -> Result<String, String> {
     one_of(v, "residency attach", &["queue", "heartbeat"])
 }
+fn parse_residency_metal4(v: &str) -> Result<String, String> {
+    one_of(
+        v,
+        "residency metal4",
+        &["slots", "queue-diff", "cb-diff", "queue-full", "cb-full"],
+    )
+}
 fn parse_residency_cap_pct(v: &str) -> Result<u32, String> {
     let pct: u32 = parse_count(v)?;
     if pct > 100 {
@@ -1239,6 +1283,15 @@ pub struct GemmTuning {
         status = "arm"
     )]
     pub f16_rows_decode: bool,
+    /// Under `fast`, a launch of an odd number of rows (3 to 15) on the f16 row axis takes the next even capacity: the padded lanes re-read the launch's last row and store nothing, so every row keeps the one-row GEMV's bits; off = capacity `m`. A verify window's and a batched decode step's launches alike; one row keeps the one-row GEMV.
+    #[opt(
+        flag = "gemm-f16-rows-round",
+        env = "LLOOM_GEMM_F16_ROWS_ROUND",
+        bool,
+        path = "kernels.gemm.f16_rows_round",
+        status = "arm"
+    )]
+    pub f16_rows_round: bool,
 }
 
 impl Default for GemmTuning {
@@ -1258,6 +1311,7 @@ impl Default for GemmTuning {
             // slower at 12 on most of them.
             f16_rows_max: 10,
             f16_rows_decode: false,
+            f16_rows_round: false,
         }
     }
 }
@@ -1606,7 +1660,7 @@ pub struct MetalTuning {
     /// The residency classes the keep-warm asks to keep resident when the sets are split (`kernels.residency.set_cap_pct` > 0): a comma list of weights, kv, heap, scratch, experts, other. The rest are left to the OS, and under memory pressure their residency is ended.
     #[opt(flag = "residency-hot", env = "LLOOM_RESIDENCY_HOT", parser = "parse_residency_hot", path = "kernels.residency.hot", status = "arm", facets = ["liveness"], flows = ["commands-out"])]
     pub residency_hot: String,
-    /// Count what the Metal 4 queue's per-slot residency sets do: the allocations `Slot::resource` adds per command buffer, the set commits, and the set's `allocatedSize` at each commit (last and largest), read out in `/health` (an instrument for lane B, #1092).
+    /// Count and time what the Metal 4 queue's per-slot residency sets do: the resources `Slot::resource` adds per command buffer and the host time of those adds, the pipelines added, the set commits and their host time (total and longest), and the set's `allocatedSize` at each commit (last and largest), read out in `/health` (an instrument for #1092 lane B; one clock read per add and per commit when on).
     #[opt(
         flag = "residency-slot-trace",
         env = "LLOOM_METAL4_SLOT_TRACE",
@@ -1615,6 +1669,9 @@ pub struct MetalTuning {
         status = "instrument"
     )]
     pub residency_slot_trace: bool,
+    /// What a Metal 4 command buffer declares resident: `slots` (each command buffer's slot set lists everything it binds), `queue-diff` (the device's residency sets on the Metal 4 queue, the slot set listing only what they do not cover), `cb-diff` (each command buffer uses the device's sets, the slot set listing only what they do not cover); `queue-full` and `cb-full` attach or use the device's sets and keep the full slot lists (controls). A pool buffer or a heap sub-buffer is covered; everything else stays in the slot set (`tuning.md` §6.3p).
+    #[opt(flag = "residency-metal4", env = "LLOOM_RESIDENCY_METAL4", parser = "parse_residency_metal4", variants = ["slots", "queue-diff", "cb-diff", "queue-full", "cb-full"], path = "kernels.residency.metal4", status = "arm", facets = ["liveness"], flows = ["commands-out"])]
+    pub residency_metal4: String,
     /// Run these types although this GPU only emulates them (a comma list; `bf16` on Apple7, ~2.6x the f32 time); none = refuse them (§15.2a).
     #[opt(flag = "allow-emulated", env = "LLOOM_METAL_ALLOW_EMULATED", parser = "parse_allow_emulated", variants = ["none", "bf16"], path = "backend.metal.allow_emulated", status = "advanced")]
     pub allow_emulated: Option<String>,
@@ -1701,6 +1758,7 @@ impl Default for MetalTuning {
             residency_set_cap_pct: 0,
             residency_hot: "weights,kv".into(),
             residency_slot_trace: false,
+            residency_metal4: "slots".into(),
             allow_emulated: None,
             fast_math: true,
             eager_residency_release: None,
@@ -1993,6 +2051,7 @@ mod tests {
         // never takes it (`the_report_names_the_f16_row_axis_under_fast_only`).
         assert!(t.gemm.f16_rows);
         assert_eq!(t.gemm.f16_rows_max, 10);
+        assert!(!t.gemm.f16_rows_round);
         assert_eq!(t.qmm.dequant_from, 64);
         assert_eq!(t.moe.mm_from, 64);
         assert!(t.qmm.f16_mm);

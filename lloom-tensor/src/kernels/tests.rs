@@ -2583,9 +2583,12 @@ fn residency_attach_heartbeat_detaches_the_set_on_metal3_and_binding_still_works
             (ResidencyAttach::Heartbeat, true) => (1, true),
             (ResidencyAttach::Queue, _) => (1, false),
         };
+        // `kernels.residency.metal4 = queue-*` also puts the set on the
+        // Metal 4 queue.
+        let metal4_queue = u64::from(commands.metal4_declare().is_some_and(|d| d.on_queue()));
         assert_eq!(
             set.queue_attachments(),
-            attached,
+            attached + metal4_queue,
             "{} on {}: addResidencySet calls naming the device set",
             arm.name(),
             commands.actual_command_api()
@@ -2657,7 +2660,8 @@ fn the_tuned_attach_arm_reaches_commands_new() {
         crate::tuning::tuning().metal.residency_attach,
         "the arm is the tuning's"
     );
-    assert_eq!(set.queue_attachments(), u64::from(!detached));
+    let metal4_queue = u64::from(commands.metal4_declare().is_some_and(|d| d.on_queue()));
+    assert_eq!(set.queue_attachments(), u64::from(!detached) + metal4_queue);
 }
 
 #[test]
@@ -12465,9 +12469,10 @@ const GEMV_ROWS_BOUND: f64 = 1.0 / (1u64 << 12) as f64;
 /// instantiated tiles (`bm4`, `bm8`), an `n` that is not a multiple of
 /// either tile's rows (35, 300, 4100), a `k` the K-walk does not divide
 /// (2047, 130: the masked last iteration) and offsets on both operands; the row
-/// counts take one full group, a group and a partial one, and two and a
-/// partial one, and nothing is stored past the rows (the guard keeps its
-/// sentinel).
+/// counts take one partial group alone (one row fewer than the capacity, the
+/// launch `kernels.gemm.f16_rows_round` makes), one full group, a group and a
+/// partial one, and two and a partial one, and nothing is stored past the
+/// rows (the guard keeps its sentinel).
 #[test]
 fn gemv_rows_keep_the_one_row_bits_at_every_capacity() {
     let h = GemvRows::new();
@@ -12483,7 +12488,7 @@ fn gemv_rows_keep_the_one_row_bits_at_every_capacity() {
             .map(|i| f16::from_f32(((i as f32) * 0.61).sin() * 0.05))
             .collect();
         for cap in 2..=GEMV_ROWS_MAX {
-            let mut counts = vec![cap, cap + 1 + cap / 2, 2 * cap + 1];
+            let mut counts = vec![cap - 1, cap, cap + 1 + cap / 2, 2 * cap + 1];
             counts.dedup();
             for rows in counts {
                 let x_off = 5;

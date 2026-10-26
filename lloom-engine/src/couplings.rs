@@ -214,6 +214,15 @@ pub const COUPLINGS: &[Coupling] = &[
         site: "lloom-tensor/src/kernels/metal/residency_set.rs ResidencyPolicy::selected, ResidencyAttachment::decide",
         is_static: false,
     },
+    Coupling {
+        id: "C22",
+        kind: "ignored",
+        when: "kernels.gemm.f16_rows off, determinism = deterministic, or the CPU backend",
+        effect: "kernels.gemm.f16_rows_round has no effect: no launch takes the row axis. Where one does, a launch of an odd number of rows takes the next even capacity and every row keeps the one-row GEMV's bits, so the arm moves time, never a bit",
+        keys: &["kernels.gemm.f16_rows_round", "kernels.gemm.f16_rows", "determinism", "backend.device"],
+        site: "lloom-tensor/src/kernels/kernels/mlx_gemm.rs f16_rows_capacity",
+        is_static: false,
+    },
 ];
 
 /// The couplings naming `key`.
@@ -445,6 +454,23 @@ pub fn explain(o: &EngineOptions) -> Vec<String> {
                  (C20)",
                 g.f16_rows_max, g.f16_rows_max
             ),
+        });
+    }
+    if g.f16_rows_round {
+        let cause = if o.tuning.contract.profile == "deterministic" {
+            Some("determinism = deterministic")
+        } else if !g.f16_rows {
+            Some("kernels.gemm.f16_rows = false")
+        } else if !cfg!(feature = "metal") || o.load.device == "cpu" {
+            Some("the CPU backend")
+        } else {
+            None
+        };
+        out.push(match cause {
+            Some(c) => format!("kernels.gemm.f16_rows_round ignored <- {c} (C22)"),
+            None => "kernels.gemm.f16_rows_round: a row-axis launch of an odd number of rows \
+                     takes the next even capacity, the same bits <- kernels.gemm.f16_rows (C22)"
+                .into(),
         });
     }
     out
@@ -801,6 +827,42 @@ mod tests {
             c20(&[("scheduler.max_sequences", "4")]).is_empty(),
             "the arm off"
         );
+        // C22: the capacity rounding names what it does where the row axis
+        // runs, and its cause where it does not.
+        let c22 = |sets: &[(&str, &str)]| -> Vec<String> {
+            explain(&with(sets))
+                .into_iter()
+                .filter(|l| l.ends_with("(C22)"))
+                .collect()
+        };
+        let round = [("kernels.gemm.f16_rows_round", "true")];
+        if cfg!(feature = "metal") {
+            assert_eq!(
+                c22(&round),
+                vec![
+                    "kernels.gemm.f16_rows_round: a row-axis launch of an odd number of rows \
+                     takes the next even capacity, the same bits <- kernels.gemm.f16_rows (C22)"
+                ]
+            );
+        } else {
+            assert_eq!(
+                c22(&round),
+                vec!["kernels.gemm.f16_rows_round ignored <- the CPU backend (C22)"]
+            );
+        }
+        let mut det = round.to_vec();
+        det.push(("determinism", "deterministic"));
+        assert_eq!(
+            c22(&det),
+            vec!["kernels.gemm.f16_rows_round ignored <- determinism = deterministic (C22)"]
+        );
+        let mut rows_off = round.to_vec();
+        rows_off.push(("kernels.gemm.f16_rows", "false"));
+        assert_eq!(
+            c22(&rows_off),
+            vec!["kernels.gemm.f16_rows_round ignored <- kernels.gemm.f16_rows = false (C22)"]
+        );
+        assert!(c22(&[]).is_empty(), "the arm off");
     }
 
     /// C21 at the library's values says nothing; where chat's and serve's

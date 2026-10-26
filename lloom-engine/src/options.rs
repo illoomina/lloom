@@ -1761,6 +1761,15 @@ impl LoadConfig {
     }
 }
 
+/// The most requests one intake tick of the batched scheduler takes off
+/// its queue while rows are live (`scheduler.intake_per_tick`'s default).
+///
+/// An intake tick's cost is dominated by `BatchScheduler::prepare` (the
+/// routing and the prefix reuse), so a budget this size is far above any
+/// arrival rate a step can see and still bounds the producer that holds
+/// the queue non-empty (`batched-decode-design.md` §11.9).
+pub const DEFAULT_INTAKE_PER_TICK: usize = 256;
+
 /// Concurrent sequences: how many decode together and how their state is
 /// held (`lloom serve`, `lloom bench`).
 #[derive(Options, Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -1779,6 +1788,9 @@ pub struct SchedulerConfig {
     /// Read a `/v1/systemone` request's questions as one ragged batch over its state, the state prefilled once and kept for the next request over it (the `fast` contract only: under `deterministic` the questions are read one after another from a restore of the state).
     #[opt(bool, flag = "decision-ragged", path = "scheduler.decision_ragged", status = "advanced", switches = ["no-decision-ragged=false"])]
     pub decision_ragged: bool,
+    /// The most requests one intake tick of the batched scheduler takes off its queue while rows are live; the rest wait, in arrival order, for the next tick, so sustained arrivals cannot postpone a live row's next step. With nothing live the whole queue is taken.
+    #[opt(flag = "intake-per-tick", path = "scheduler.intake_per_tick", status = "advanced", facets = ["cadence"], flows = ["prompt-in"])]
+    pub intake_per_tick: usize,
 }
 
 impl Default for SchedulerConfig {
@@ -1788,6 +1800,7 @@ impl Default for SchedulerConfig {
             rows: "auto".into(),
             decision_pack: true,
             decision_ragged: true,
+            intake_per_tick: DEFAULT_INTAKE_PER_TICK,
         }
     }
 }

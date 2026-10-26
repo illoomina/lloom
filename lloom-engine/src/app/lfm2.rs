@@ -369,6 +369,9 @@ pub struct LoadOptions {
     pub seed_text: String,
     pub model_name: Option<String>,
     pub batch: usize,
+    /// The most requests one intake tick of the batched scheduler takes
+    /// off its queue while rows are live (`scheduler.intake_per_tick`).
+    pub intake_per_tick: usize,
     /// `Some(dir)` loads the DSpark drafter from `dir` (or the newest
     /// LFM2.5-2.6B-DSpark snapshot in the HF cache when the path is empty).
     pub dspark: Option<PathBuf>,
@@ -1557,6 +1560,7 @@ impl<P: Lfm2Shape> Engine<P> {
             share_prefix: opts.share_prefix,
             prefill_batch: engine.prefill_batch.k,
             prefill_decode: engine.prefill_decode,
+            intake_per_tick: opts.intake_per_tick,
             mode,
             extra,
             on_counters: None,

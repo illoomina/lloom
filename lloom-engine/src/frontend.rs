@@ -280,6 +280,21 @@ rows! {
         when: When::MetalSingle,
         before: "false",
     },
+    // The f16 row axis's ceiling where the batched loops run (`tuning.md`
+    // §13.5zb): `before` is the library's value; decision 60 (`EXCEPTIONS`)
+    // lands 12. Ahead of the decode rows' rows, whose condition reads it.
+    Row {
+        key: "kernels.gemm.f16_rows_max",
+        frontend: Frontend::Serve,
+        when: When::Metal,
+        before: "10",
+    },
+    Row {
+        key: "kernels.gemm.f16_rows_max",
+        frontend: Frontend::Bench,
+        when: When::Metal,
+        before: "10",
+    },
     // The batched decode step's rows on the GEMV's row axis under `fast`
     // (`tuning.md` §13.5zb): `before` is the library's value; decision 54
     // (`EXCEPTIONS`) lands the new one where a batched loop runs on Metal.
@@ -458,6 +473,26 @@ pub const EXCEPTIONS: &[Exception] = &[Exception {
     landed: true,
     owner: "#1092",
     what: "the keep-warm reads the memory-pressure level each beat: at warn or critical it stops requesting and ends the set's residency, at normal it resumes; --keep-warm-pressure=false opts out",
+}, Exception {
+    decision: 60,
+    key: "kernels.gemm.f16_rows_max",
+    frontend: Frontend::Serve,
+    when: When::Metal,
+    before: "10",
+    after: "12",
+    landed: true,
+    owner: "#1084",
+    what: "the f16 row axis takes up to 12 rows, one value for the batched decode rows and the batched speculative windows, so the decode rows' default batch is 2 to 12 sequences; --gemm-f16-rows-max 10 opts out",
+}, Exception {
+    decision: 60,
+    key: "kernels.gemm.f16_rows_max",
+    frontend: Frontend::Bench,
+    when: When::Metal,
+    before: "10",
+    after: "12",
+    landed: true,
+    owner: "#1084",
+    what: "the f16 row axis takes up to 12 rows, one value for the batched decode rows and the batched speculative windows, so the decode rows' default batch is 2 to 12 sequences; --gemm-f16-rows-max 10 opts out",
 }];
 
 /// The first row of `key` for `frontend`, if the front-end resolves it.

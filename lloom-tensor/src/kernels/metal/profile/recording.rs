@@ -714,3 +714,118 @@ pub(super) fn record_command_buffer(start: f64, end: f64, committed: f64, step: 
         label,
     });
 }
+
+/// Return addresses kept per commit: deep enough to reach the model's call
+/// site from inside the submission path.
+const CUT_DEPTH: usize = 64;
+
+#[cfg(target_vendor = "apple")]
+extern "C" {
+    fn backtrace(array: *mut *mut std::ffi::c_void, size: std::ffi::c_int) -> std::ffi::c_int;
+}
+
+/// One distinct `(thread, stack)`: the commits it made, and the captured
+/// trace it is symbolized from when read.
+struct CutEntry {
+    commits: u64,
+    trace: std::backtrace::Backtrace,
+    frames: Option<Vec<String>>,
+}
+
+type CutKey = (String, [usize; CUT_DEPTH]);
+
+fn cut_site_map() -> &'static parking_lot::Mutex<HashMap<CutKey, CutEntry>> {
+    static SITES: OnceLock<parking_lot::Mutex<HashMap<CutKey, CutEntry>>> = OnceLock::new();
+    SITES.get_or_init(|| parking_lot::Mutex::new(HashMap::new()))
+}
+
+fn thread_label() -> String {
+    let thread = std::thread::current();
+    match thread.name() {
+        Some(name) => name.to_owned(),
+        None => format!("{:?}", thread.id()),
+    }
+}
+
+/// The calling thread's return addresses by a frame-pointer walk, which costs
+/// microseconds; symbolizing is left to [`cut_sites`], once per distinct key.
+fn return_addresses() -> [usize; CUT_DEPTH] {
+    let mut out = [0usize; CUT_DEPTH];
+    #[cfg(target_vendor = "apple")]
+    {
+        let mut raw = [std::ptr::null_mut::<std::ffi::c_void>(); CUT_DEPTH];
+        // SAFETY: `raw` holds CUT_DEPTH writable pointer slots and `backtrace`
+        // writes at most that many.
+        let n = unsafe { backtrace(raw.as_mut_ptr(), CUT_DEPTH as std::ffi::c_int) };
+        for (slot, ip) in out.iter_mut().zip(raw.iter().take(n.max(0) as usize)) {
+            *slot = *ip as usize;
+        }
+    }
+    out
+}
+
+pub(super) fn note_commit_site() {
+    let key = (thread_label(), return_addresses());
+    let mut map = cut_site_map().lock();
+    if let Some(entry) = map.get_mut(&key) {
+        entry.commits += 1;
+        return;
+    }
+    map.insert(
+        key,
+        CutEntry {
+            commits: 1,
+            trace: std::backtrace::Backtrace::force_capture(),
+            frames: None,
+        },
+    );
+}
+
+/// The `lloom*` frames of a trace, innermost first, without the
+/// instrument's own frames or the symbol hashes.
+fn lloom_frames(trace: &std::backtrace::Backtrace) -> Vec<String> {
+    trace
+        .to_string()
+        .lines()
+        .map(str::trim)
+        .filter_map(|l| l.split_once(": ").map(|(_, f)| f))
+        .map(|f| match f.rfind("::h") {
+            Some(i) if f.len() - i == 19 => &f[..i],
+            _ => f,
+        })
+        .filter(|f| f.starts_with("lloom") || f.starts_with("<lloom"))
+        .filter(|f| !f.contains("profile::recording::") && !f.contains("profile::note_commit_site"))
+        .map(str::to_owned)
+        .collect()
+}
+
+pub(super) fn cut_sites() -> Vec<CutSite> {
+    let mut map = cut_site_map().lock();
+    let mut merged: HashMap<(String, Vec<String>), u64> = HashMap::new();
+    for ((thread, _), entry) in map.iter_mut() {
+        let frames = entry
+            .frames
+            .get_or_insert_with(|| lloom_frames(&entry.trace))
+            .clone();
+        *merged.entry((thread.clone(), frames)).or_default() += entry.commits;
+    }
+    drop(map);
+    let mut out: Vec<CutSite> = merged
+        .into_iter()
+        .map(|((thread, frames), commits)| CutSite {
+            thread,
+            frames,
+            commits,
+        })
+        .collect();
+    out.sort_by(|a, b| {
+        b.commits
+            .cmp(&a.commits)
+            .then_with(|| a.frames.cmp(&b.frames))
+    });
+    out
+}
+
+pub(super) fn reset_cut_sites() {
+    cut_site_map().lock().clear();
+}

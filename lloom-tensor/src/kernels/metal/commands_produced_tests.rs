@@ -88,6 +88,12 @@ fn dst_bytes(dst: &Buffer) -> &[u8] {
 /// The dependent compute: `dst[i] = 2 * src[i] + 1 = 7`, then a progress
 /// signal behind it on the same stream.
 fn encode_dependent(f: &Fixture) {
+    encode_compute(f);
+    f.commands.encode_signal_event(&f.progress, 1).unwrap();
+}
+
+/// The dependent compute alone, with no signal (a signal may cut on Metal 4).
+fn encode_compute(f: &Fixture) {
     let kernels = crate::kernels::Kernels::new();
     {
         let encoder = f.commands.command_encoder().unwrap();
@@ -109,7 +115,6 @@ fn encode_dependent(f: &Fixture) {
             .unwrap();
         }
     }
-    f.commands.encode_signal_event(&f.progress, 1).unwrap();
 }
 
 fn computed(dst: &Buffer) -> bool {
@@ -1072,6 +1077,186 @@ fn a_cancel_through_a_value_spares_a_later_one() {
     );
     assert_eq!(stats.cancelled, 0, "{stats:?}");
     assert!(computed(&f.dst), "a later value's work was cancelled");
+    f.commands.check_failed().unwrap();
+}
+
+/// Two values of one event in the current recording, nothing held: a
+/// cancellation through the lower one takes the recording itself, and
+/// raising the event past both then runs nothing.
+#[test]
+fn a_cancel_through_the_lower_of_two_values_takes_the_current_recording() {
+    const REASON: &str = "test: the lower value will never be produced";
+    let f = fixture();
+    if f.commands.host_input_arm() == HostInputArm::GpuWait {
+        eprintln!("NOT_APPLICABLE nothing is held on the gpu-wait arm");
+        return;
+    }
+    f.commands.commit_when_produced(&f.gate, 1).unwrap();
+    f.commands.commit_when_produced(&f.gate, 5).unwrap();
+    encode_compute(&f);
+    let gated = f.commands.produced_stats();
+    let cancelled = f.commands.cancel_produced_through(&f.gate, 1, REASON);
+    f.gate.setSignaledValue(5);
+    let released = f.commands.produced(&f.gate, 5);
+    f.commands.flush_and_wait().unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    let stats = f.commands.produced_stats();
+    eprintln!(
+        "CANCEL_LOWER_CURRENT api={} debug_assertions={} gated={gated:?} cancelled={cancelled:?} released={released:?} stats={stats:?}",
+        f.commands.actual_command_api(),
+        cfg!(debug_assertions)
+    );
+    assert_eq!(
+        (gated.held, gated.held_now),
+        (0, 1),
+        "the recording was not isolated: {gated:?}"
+    );
+    assert_eq!(gated.beside_its_event, 1, "{gated:?}");
+    assert_eq!(
+        cancelled.map_err(|e| e.to_string()),
+        Ok(1),
+        "the current recording escaped"
+    );
+    assert_eq!(released.map_err(|e| e.to_string()), Ok(0));
+    assert!(
+        dst_bytes(&f.dst).iter().all(|b| *b == WARM),
+        "the cancelled recording ran"
+    );
+    encode_dependent(&f);
+    f.commands.flush_and_wait().unwrap();
+    assert!(computed(&f.dst), "the stream did not go on");
+    f.commands.check_failed().unwrap();
+}
+
+/// A held recording gated on 5 and then on 1, one event: a cancellation
+/// through 1 takes it, whichever order the values came in.
+#[test]
+fn a_cancel_through_a_lower_value_gated_second_takes_the_held_recording() {
+    const REASON: &str = "test: the lower value will never be produced";
+    let f = fixture();
+    if f.commands.host_input_arm() == HostInputArm::GpuWait {
+        eprintln!("NOT_APPLICABLE nothing is held on the gpu-wait arm");
+        return;
+    }
+    f.commands.commit_when_produced(&f.gate, 5).unwrap();
+    f.commands.commit_when_produced(&f.gate, 1).unwrap();
+    encode_dependent(&f);
+    let held_marker = f.commands.flush_marker().unwrap();
+    let held = 1 + signal_cut(&f.commands);
+    assert_eq!(f.commands.produced_stats().held_now, held);
+    let cancelled = f.commands.cancel_produced_through(&f.gate, 1, REASON);
+    f.gate.setSignaledValue(5);
+    let released = f.commands.produced(&f.gate, 5);
+    let waited = f.commands.wait_marker(&held_marker);
+    f.commands.flush_and_wait().unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    let stats = f.commands.produced_stats();
+    eprintln!(
+        "CANCEL_DESCENDING_HELD api={} debug_assertions={} cancelled={cancelled:?} released={released:?} waited={waited:?} progress={} stats={stats:?}",
+        f.commands.actual_command_api(),
+        cfg!(debug_assertions),
+        f.progress.signaledValue()
+    );
+    // The held recordings and the fresh current behind them.
+    assert_eq!(cancelled.map_err(|e| e.to_string()), Ok(held + 1));
+    assert_eq!(released.map_err(|e| e.to_string()), Ok(0));
+    assert!(
+        waited
+            .as_ref()
+            .is_err_and(|e| e.to_string().contains(REASON)),
+        "{waited:?}"
+    );
+    assert_eq!(f.progress.signaledValue(), 0, "the cancelled recording ran");
+    assert!(
+        dst_bytes(&f.dst).iter().all(|b| *b == WARM),
+        "the cancelled recording ran"
+    );
+    assert_eq!(stats.released, 0, "{stats:?}");
+    f.commands.check_failed().unwrap();
+}
+
+/// A held recording gated on 1, 3 and 5 of one event, the event since raised
+/// to 2: a cancellation through 3 takes it, by its interior value.
+#[test]
+fn a_cancel_through_an_interior_value_after_partial_production_takes_the_held_recording() {
+    const REASON: &str = "test: the interior value will never be produced";
+    let f = fixture();
+    if f.commands.host_input_arm() == HostInputArm::GpuWait {
+        eprintln!("NOT_APPLICABLE nothing is held on the gpu-wait arm");
+        return;
+    }
+    for value in [1, 3, 5] {
+        f.commands.commit_when_produced(&f.gate, value).unwrap();
+    }
+    encode_dependent(&f);
+    f.commands.flush_marker().unwrap();
+    let held = 1 + signal_cut(&f.commands);
+    f.gate.setSignaledValue(2);
+    let partial = f.commands.produced(&f.gate, 2);
+    let cancelled = f.commands.cancel_produced_through(&f.gate, 3, REASON);
+    f.gate.setSignaledValue(5);
+    let released = f.commands.produced(&f.gate, 5);
+    f.commands.flush_and_wait().unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    let stats = f.commands.produced_stats();
+    eprintln!(
+        "CANCEL_INTERIOR_HELD api={} debug_assertions={} partial={partial:?} cancelled={cancelled:?} released={released:?} progress={} stats={stats:?}",
+        f.commands.actual_command_api(),
+        cfg!(debug_assertions),
+        f.progress.signaledValue()
+    );
+    assert_eq!(
+        partial.map_err(|e| e.to_string()),
+        Ok(0),
+        "released before 5"
+    );
+    assert_eq!(cancelled.map_err(|e| e.to_string()), Ok(held + 1));
+    assert_eq!(released.map_err(|e| e.to_string()), Ok(0));
+    assert_eq!(f.progress.signaledValue(), 0, "the cancelled recording ran");
+    assert!(
+        dst_bytes(&f.dst).iter().all(|b| *b == WARM),
+        "the cancelled recording ran"
+    );
+    f.commands.check_failed().unwrap();
+}
+
+/// A recording held on 5 alone, then one gated on 1 and 5 behind it: a
+/// cancellation through 1 takes the second and spares the first, which runs
+/// once the event reaches 5.
+#[test]
+fn a_cancel_through_a_lower_value_spares_a_recording_gated_on_a_later_one_alone() {
+    const REASON: &str = "test: the lower value will never be produced";
+    let f = fixture();
+    if f.commands.host_input_arm() == HostInputArm::GpuWait {
+        eprintln!("NOT_APPLICABLE nothing is held on the gpu-wait arm");
+        return;
+    }
+    f.commands.commit_when_produced(&f.gate, 5).unwrap();
+    encode_compute(&f);
+    f.commands.flush_marker().unwrap();
+    f.commands.commit_when_produced(&f.gate, 1).unwrap();
+    f.commands.commit_when_produced(&f.gate, 5).unwrap();
+    f.commands.encode_signal_event(&f.progress, 2).unwrap();
+    let before = f.commands.produced_stats();
+    let cancelled = f.commands.cancel_produced_through(&f.gate, 1, REASON);
+    f.gate.setSignaledValue(5);
+    let released = f.commands.produced(&f.gate, 5);
+    f.commands.flush_and_wait().unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    let stats = f.commands.produced_stats();
+    eprintln!(
+        "CANCEL_SPARES_AHEAD api={} debug_assertions={} before={before:?} cancelled={cancelled:?} released={released:?} progress={} stats={stats:?}",
+        f.commands.actual_command_api(),
+        cfg!(debug_assertions),
+        f.progress.signaledValue()
+    );
+    assert!(cancelled.as_ref().is_ok_and(|n| *n >= 1), "{cancelled:?}");
+    assert_eq!(f.progress.signaledValue(), 0, "the cancelled recording ran");
+    assert!(
+        computed(&f.dst),
+        "the recording gated on 5 alone did not run"
+    );
+    assert_eq!(stats.released, 1, "{stats:?}");
     f.commands.check_failed().unwrap();
 }
 

@@ -3085,12 +3085,14 @@ impl Streamed {
             staging,
             map,
             clock,
+            device,
             ..
         } = inner;
         let ring = match staging.as_ref() {
             Some(r) => r,
             None => lloom_tensor::bail!("land_staged: the tier has no staging ring"),
         };
+        let _landing = hold_landing_cut(device);
         let mut ring = ring.lock();
         let n = landed.len() as u64;
         let mut bytes = 0u64;
@@ -3130,6 +3132,7 @@ impl Streamed {
         }
         match inner.loader.clone() {
             LoaderArm::Pread => {
+                let _landing = hold_landing_cut(&inner.device);
                 #[cfg(feature = "metal")]
                 let Inner {
                     pools,
@@ -3491,6 +3494,25 @@ fn default_spare_slots() -> usize {
 fn settle_batch_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| crate::tuning::tuning().stream.settle_batch)
+}
+
+/// The cut period held while a tier lands its experts
+/// (`weights.experts.landing_cut_period`, read once; 0 = the period in force).
+fn landing_cut_period() -> usize {
+    static P: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *P.get_or_init(|| crate::tuning::tuning().stream.landing_cut)
+}
+
+/// Hold the landing's cut period on `device` for the guard's life: `None`
+/// when the arm is off or a period at least as long is already in force (the
+/// decode loop's), so a landing never shortens the buffers around it.
+fn hold_landing_cut(device: &Device) -> Option<impl Sized> {
+    let period = landing_cut_period();
+    #[cfg(feature = "metal")]
+    let held = matches!(device, Device::Metal(m) if m.compute_per_buffer() >= period);
+    #[cfg(not(feature = "metal"))]
+    let held = true;
+    (period != 0 && !held).then(|| device.cut_period_hold(period))
 }
 
 /// `QWEN4EXP_TRACE_SETTLE=1` (read once): print every settle's ids, flags

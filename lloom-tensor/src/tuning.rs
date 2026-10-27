@@ -1265,7 +1265,7 @@ pub struct GemmTuning {
         status = "arm"
     )]
     pub f16_rows: bool,
-    /// The most rows `kernels.gemm.f16_rows` takes (2..16); a window of more rows takes the GEMM.
+    /// The most rows the f16 row axis takes (2..16), in a verify window and in a batched decode step (`kernels.gemm.f16_rows_decode`, whose serve and bench default holds at a batch of 2 to this many sequences); more rows take the GEMM. 10 in the library; `serve` and `bench` resolve 12 on Metal (decision 60: on LFM2.5-2.6B the served step at 11 and 12 rows is 21.1 and 22.8 ms on the axis against 26.8 and 27.1 on the GEMM, ×1.26 and ×1.18 decode tok/s at B = 11 and 12; from 13 rows the axis is ×1.65 the GEMM's step).
     #[opt(
         flag = "gemm-f16-rows-max",
         env = "LLOOM_GEMM_F16_ROWS_MAX",
@@ -1274,7 +1274,7 @@ pub struct GemmTuning {
         status = "arm"
     )]
     pub f16_rows_max: usize,
-    /// Under `fast`, with `kernels.gemm.f16_rows` on, a batched decode step's f16 matmuls of 2 to `f16_rows_max` rows (one row per live sequence) take the GEMV's row axis: each weight block read once for every row, each row the one-row GEMV's bits; off = the GEMM from two rows. A step that carries prompt pieces puts its 1 to `f16_rows_max` live rows on the same route and its pieces on the GEMM, so a row's bits do not depend on whether a piece rode its step; a single sequence's step and `deterministic` keep their routes. Off in the library; `serve` and `bench` turn it on at a batch on Metal (decision 54), `--gemm-f16-rows-decode=false` to measure without it.
+    /// Under `fast`, with `kernels.gemm.f16_rows` on, a batched decode step's f16 matmuls of 2 to `f16_rows_max` rows (one row per live sequence) take the GEMV's row axis: each weight block read once for every row, each row the one-row GEMV's bits; off = the GEMM from two rows. A step that carries prompt pieces puts its 1 to `f16_rows_max` live rows on the same route and its pieces on the GEMM, so a row's bits do not depend on whether a piece rode its step; a single sequence's step and `deterministic` keep their routes. Off in the library; `serve` and `bench` turn it on on Metal at a batch of 2 to `f16_rows_max` sequences (decision 54; 2 to 12 since decision 60), `--gemm-f16-rows-decode=false` to measure without it.
     #[opt(
         flag = "gemm-f16-rows-decode",
         env = "LLOOM_GEMM_F16_ROWS_DECODE",
@@ -1912,6 +1912,9 @@ pub struct InstrumentTuning {
     /// Attribute every host readback (`to_cpu`'s fast and blit paths, a staged read's stage, a host-read slot's read) to the model call site that made it (a backtrace per readback, #814 part 5).
     #[opt(flag = "readback-trace", env = "LLOOM_READBACK_TRACE", bool, path = "diagnostics.trace.readbacks", status = "instrument", needs = "profile", flows = ["token-out"])]
     pub readback_trace: bool,
+    /// Under the GPU profiler: attribute every command-buffer commit to the stack and thread that made it (a frame-pointer walk per commit, symbolized once per distinct stack), so a request's commits can be counted by cause (`profile::cut_sites`).
+    #[opt(flag = "cut-sites", env = "LLOOM_CUT_SITES", bool, path = "diagnostics.trace.cut_sites", status = "instrument", needs = "profile", flows = ["commands-out"])]
+    pub cut_sites: bool,
     /// Shadow every host upload and check it back (the #748 corruption instrument).
     #[opt(
         flag = "upload-shadow",

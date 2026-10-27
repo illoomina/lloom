@@ -436,6 +436,9 @@ pub struct StreamTuning {
     /// A token's settle submits every layer's loads before waiting for any (off = one layer after another, the A/B arm).
     #[opt(flag = "settle-batch", env = "QWEN4EXP_SETTLE_BATCH", bool, path = "weights.experts.settle_batch", status = "arm", facets = ["cadence"], flows = ["weights-in"])]
     pub settle_batch: bool,
+    /// The command-buffer cut period held while a tier lands the experts it loaded: each plane lands as its own copy dispatch, and at the shipping period (50) a missing pool cuts a buffer every ~17 experts. `0` = the period in force; a larger value is held for the landing (never lowering a longer one in force), and the first encode after it cuts once.
+    #[opt(flag = "landing-cut", env = "QWEN4EXP_LANDING_CUT", path = "weights.experts.landing_cut_period", status = "arm", facets = ["cadence"], flows = ["weights-in", "commands-out"])]
+    pub landing_cut: usize,
     /// Spike 0 of fetch-and-wait: `wait` = a GPU wait on an already-raised event at every device-planned layer's join point (an instrument; off = none).
     #[opt(flag = "spike0", env = "QWEN4EXP_SPIKE0", parser = "parse_spike0", variants = ["off", "wait"], path = "diagnostics.experts.spike0", status = "instrument")]
     pub spike0: String,
@@ -494,6 +497,7 @@ impl Default for StreamTuning {
             hint_recall: false,
             spare_slots: 0,
             settle_batch: true,
+            landing_cut: 0,
             spike0: "off".into(),
             trace_settle: false,
             fetch: "off".into(),

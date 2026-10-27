@@ -88,8 +88,19 @@ pub(super) struct Input {
     event: Retained<ProtocolObject<dyn MTLSharedEvent>>,
     value: u64,
     /// When it was gated, in the queue's gating order (0: not a gate's); a
-    /// merged input keeps the earliest.
+    /// repeated input keeps the earliest.
     seq: u64,
+}
+
+/// How [`Gate::add`] took an input.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Added {
+    /// A slot of its own, the only one on its event.
+    New,
+    /// A slot of its own, beside another value of its event.
+    BesideItsEvent,
+    /// The same value on the same event was gated already.
+    Repeat,
 }
 
 impl Input {
@@ -136,22 +147,27 @@ impl Gate {
         self.inputs.iter().all(Option::is_some)
     }
 
-    /// Add `input`; an input on the same event keeps the higher value (an
-    /// event's values are monotone, so the higher one covers both).
-    fn add(&mut self, input: Input) -> Result<(), Input> {
-        if let Some(same) = self
-            .inputs
-            .iter_mut()
-            .flatten()
-            .find(|held| held.is_on(&input.event))
-        {
-            same.value = same.value.max(input.value);
-            return Ok(());
+    /// Add `input`. A repeat of a gated `(event, value)` keeps the earlier
+    /// gating; another value of a gated event takes a slot of its own, so a
+    /// cancellation through any one of them finds it (`covered_by`).
+    fn add(&mut self, input: Input) -> Result<Added, Input> {
+        let mut beside = false;
+        for held in self.inputs.iter().flatten() {
+            if held.is_on(&input.event) {
+                if held.value == input.value {
+                    return Ok(Added::Repeat);
+                }
+                beside = true;
+            }
         }
         match self.inputs.iter_mut().find(|slot| slot.is_none()) {
             Some(slot) => {
                 *slot = Some(input);
-                Ok(())
+                Ok(if beside {
+                    Added::BesideItsEvent
+                } else {
+                    Added::New
+                })
             }
             None => Err(input),
         }
@@ -256,6 +272,9 @@ pub struct ProducedStats {
     /// IO command buffers committed after a held recording instead of at
     /// their issue (the recording carrying their compute signal was held).
     pub io_deferred: u64,
+    /// Inputs gated beside another value of their event in one recording:
+    /// each holds a gate slot of its own.
+    pub beside_its_event: u64,
     /// Summed time producers spent at the state lock — a try, and the
     /// release when it was free — µs. No producer waits for it.
     pub producer_lock_us: u64,
@@ -342,6 +361,8 @@ pub(super) struct ProducedState {
     cancel_pending: AtomicBool,
     cancels: parking_lot::Mutex<Vec<Cancel>>,
     cancels_delegated: AtomicU64,
+    beside_its_event: AtomicU64,
+    beside_logged: AtomicBool,
     /// Inputs gated so far: an input's `seq`, a cancellation's bound.
     gated: AtomicU64,
     late_logged: AtomicBool,
@@ -375,6 +396,8 @@ impl ProducedState {
             cancel_pending: AtomicBool::new(false),
             cancels: parking_lot::Mutex::new(Vec::new()),
             cancels_delegated: AtomicU64::new(0),
+            beside_its_event: AtomicU64::new(0),
+            beside_logged: AtomicBool::new(false),
             gated: AtomicU64::new(0),
             late_logged: AtomicBool::new(false),
             cancelled_event: AtomicUsize::new(0),
@@ -387,6 +410,17 @@ impl ProducedState {
     /// The error a wait on a cancelled recording returns.
     pub(super) fn cancelled_error(&self) -> MetalKernelError {
         MetalKernelError::QueueUnavailable(*self.cancel_reason.lock())
+    }
+
+    /// A recording gated a second value of one event: counted, and reported
+    /// once, since each value holds a slot a full gate cuts for.
+    fn note_beside_its_event(&self, value: u64) {
+        self.beside_its_event.fetch_add(1, Ordering::Relaxed);
+        if !self.beside_logged.swap(true, Ordering::Relaxed) {
+            eprintln!(
+                "[metal] one recording gated host input {value} beside another value of its event"
+            );
+        }
     }
 
     #[cfg(test)]
@@ -853,6 +887,7 @@ impl Commands {
             producer_lock_us: p.producer_lock_us.load(Ordering::Relaxed),
             delegated: p.delegated.load(Ordering::Relaxed),
             cancels_delegated: p.cancels_delegated.load(Ordering::Relaxed),
+            beside_its_event: p.beside_its_event.load(Ordering::Relaxed),
         }
     }
 
@@ -899,10 +934,14 @@ impl Commands {
         }
         let mut input = Input::new(event, value)?;
         input.seq = self.core.produced.gated.fetch_add(1, Ordering::SeqCst) + 1;
-        if state.gate.add(input).is_err() {
-            return Err(MetalKernelError::QueueUnavailable(
-                "a fresh recording's gate refused an input",
-            ));
+        match state.gate.add(input) {
+            Ok(Added::BesideItsEvent) => self.core.produced.note_beside_its_event(value),
+            Ok(Added::New | Added::Repeat) => {}
+            Err(_) => {
+                return Err(MetalKernelError::QueueUnavailable(
+                    "a fresh recording's gate refused an input",
+                ))
+            }
         }
         self.core.held_live_update(&state);
         // A producer that raised the event since the look above found the
@@ -1023,8 +1062,9 @@ impl Commands {
     }
 
     /// As [`Self::cancel_produced`], for the values on `event` up to `upto`:
-    /// work behind a later value of the same event, a next run's, is not
-    /// covered, whenever the cancellation is applied.
+    /// a recording gated on any value in that range is covered, whatever
+    /// other values of `event` it also waits for; work behind only later
+    /// values, a next run's, is not, whenever the cancellation is applied.
     pub fn cancel_produced_through(
         &self,
         event: &ProtocolObject<dyn MTLSharedEvent>,
@@ -1255,43 +1295,124 @@ mod scope_tests {
     use super::*;
     use objc2_metal::MTLDevice;
 
+    type Event = Retained<ProtocolObject<dyn MTLSharedEvent>>;
+
+    fn new_event() -> Event {
+        let device = super::super::Device::system_default().unwrap();
+        device.as_ref().newSharedEvent().unwrap()
+    }
+
+    fn input(event: &Event, value: u64, seq: u64) -> Input {
+        let mut input = Input::new(event, value).unwrap();
+        input.seq = seq;
+        input
+    }
+
+    /// A gate of `(value, seq)` inputs on `event`, in the order given.
+    fn gate(event: &Event, inputs: &[(u64, u64)]) -> Gate {
+        let mut gate = Gate::default();
+        for &(value, seq) in inputs {
+            assert!(gate.add(input(event, value, seq)).is_ok());
+        }
+        gate
+    }
+
+    fn cancel(event: &Event, produced: u64, upto: u64, gated_through: u64) -> Cancel {
+        Cancel {
+            event: event.clone(),
+            produced,
+            upto,
+            gated_through,
+            reason: "test",
+        }
+    }
+
     /// A cancellation's scope is fixed when it is asked for: an input gated
-    /// after it is not covered, whenever it is applied, and an input merged
-    /// into an earlier one keeps the earlier gating.
+    /// after it is not covered, whenever it is applied, and a repeated input
+    /// keeps the earlier gating.
     #[test]
     fn a_cancellation_covers_only_inputs_gated_before_it() {
-        let device = super::super::Device::system_default().unwrap();
-        let event = device.as_ref().newSharedEvent().unwrap();
-        let input = |value, seq| {
-            let mut input = Input::new(&event, value).unwrap();
-            input.seq = seq;
-            input
-        };
-        let cancel = Cancel {
-            event: event.clone(),
-            produced: 0,
-            upto: u64::MAX,
-            gated_through: 2,
-            reason: "test",
-        };
-        let mut before = Gate::default();
-        assert!(before.add(input(1, 1)).is_ok());
-        let mut after = Gate::default();
-        assert!(after.add(input(1, 3)).is_ok());
-        let mut merged = Gate::default();
-        assert!(merged.add(input(1, 1)).is_ok());
-        assert!(merged.add(input(5, 3)).is_ok());
+        let event = new_event();
+        let all = cancel(&event, 0, u64::MAX, 2);
         assert!(
-            before.covered_by(&cancel),
+            gate(&event, &[(1, 1)]).covered_by(&all),
             "an input gated before the request"
         );
         assert!(
-            !after.covered_by(&cancel),
+            !gate(&event, &[(1, 3)]).covered_by(&all),
             "an input gated after the request"
         );
         assert!(
-            merged.covered_by(&cancel),
-            "a merge lost the earlier gating"
+            gate(&event, &[(1, 1), (5, 3)]).covered_by(&all),
+            "a second value lost the earlier gating"
+        );
+        assert!(
+            gate(&event, &[(3, 1), (3, 3)]).covered_by(&all),
+            "a repeat lost the earlier gating"
+        );
+    }
+
+    /// Every value a recording gates on one event is its own prerequisite: a
+    /// cancellation through any of them covers the recording, whichever
+    /// order they were gated in and whatever was produced since; one through
+    /// none of them does not.
+    #[test]
+    fn a_cancellation_through_a_value_finds_it_beside_other_values_of_its_event() {
+        eprintln!("SCOPE_BUILD debug_assertions={}", cfg!(debug_assertions));
+        let event = new_event();
+        assert!(
+            gate(&event, &[(1, 1), (5, 2)]).covered_by(&cancel(&event, 0, 1, 2)),
+            "two values: the lower one"
+        );
+        assert!(
+            gate(&event, &[(5, 1), (1, 2)]).covered_by(&cancel(&event, 0, 1, 2)),
+            "descending values: the lower one, gated second"
+        );
+        assert!(
+            gate(&event, &[(1, 1), (3, 2), (5, 3)]).covered_by(&cancel(&event, 2, 3, 3)),
+            "an interior value after partial production"
+        );
+        assert!(
+            !gate(&event, &[(1, 1), (3, 2), (5, 3)]).covered_by(&cancel(&event, 3, 4, 3)),
+            "no value in (produced, upto]"
+        );
+        assert!(
+            !gate(&event, &[(5, 1)]).covered_by(&cancel(&event, 0, 1, 1)),
+            "a later value alone"
+        );
+        assert!(
+            !gate(&event, &[(5, 1), (1, 3)]).covered_by(&cancel(&event, 0, 1, 2)),
+            "the covered value was gated after the request"
+        );
+    }
+
+    /// Readiness is every prerequisite produced; a repeat takes no slot, a
+    /// distinct value does, and a full gate refuses the next one.
+    #[test]
+    fn a_gate_opens_once_every_value_is_produced_and_refuses_past_its_slots() {
+        let event = new_event();
+        let mut three = gate(&event, &[(5, 1), (1, 2), (3, 3)]);
+        event.setSignaledValue(3);
+        assert!(!three.is_open(), "open before its highest value");
+        event.setSignaledValue(5);
+        assert!(three.is_open(), "closed with every value produced");
+        assert_eq!(three.add(input(&event, 3, 4)).ok(), Some(Added::Repeat));
+        assert_eq!(
+            three.add(input(&event, 7, 5)).ok(),
+            Some(Added::BesideItsEvent)
+        );
+        let other = new_event();
+        assert_eq!(three.add(input(&other, 1, 6)).ok(), Some(Added::New));
+
+        let mut full = Gate::default();
+        for value in 1..=GATE_INPUTS as u64 {
+            assert!(full.add(input(&event, 10 + value, value)).is_ok());
+        }
+        assert!(full.is_full());
+        assert_eq!(full.add(input(&event, 11, 99)).ok(), Some(Added::Repeat));
+        assert!(
+            full.add(input(&event, 99, 99)).is_err(),
+            "a full gate took a ninth value"
         );
     }
 }

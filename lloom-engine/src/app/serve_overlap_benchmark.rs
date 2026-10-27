@@ -1,7 +1,7 @@
 //! Private optimized libtest experiment; not shipping-binary e2e acceptance.
 //! Only an explicitly admitted exact ignored test may load a real checkpoint.
 use super::*;
-use crate::app::common::MemGauge;
+use crate::app::common::{MemGauge, MemReport};
 use crate::app::{load_engine, resolve_options, Shape};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -65,13 +65,16 @@ impl State {
         }
     }
     fn finish_memory(&self, reason: &str) {
-        let gauge = {
-            let mut memory = self.memory.lock();
-            self.memory_closed.store(true, Ordering::Release);
-            memory.take()
-        };
-        if let Some(gauge) = gauge {
-            let report = gauge.finish(&self.device);
+        self.finish_memory_with(reason, |gauge| gauge.finish(&self.device));
+    }
+    fn finish_memory_with(&self, reason: &str, finish: impl FnOnce(MemGauge) -> MemReport) {
+        // Keep the same lock through join AND report publication. Taking the
+        // gauge is not completion: the server-return caller can race a last
+        // handler already joining it. No Turn is held by this post-return path.
+        let mut memory = self.memory.lock();
+        self.memory_closed.store(true, Ordering::Release);
+        if let Some(gauge) = memory.take() {
+            let report = finish(gauge);
             self.samples.store(report.samples, Ordering::Release);
             self.event(json!({"kind":"memory-finish", "at_ns":uptime_ns(), "reason":reason,
                 "started_ns":self.memory_start_ns.load(Ordering::Acquire), "sample_period_ms":10,
@@ -420,6 +423,220 @@ fn successful_settlement_preserves_normal_pace_completion() {
         "normal finish did not synthesize release"
     );
 }
+// Host-only fixture; real CPU gauge/report. No Metal model/device creation.
+struct MemoryTraceFile(PathBuf);
+impl Drop for MemoryTraceFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+struct ReleaseOnDrop(Option<mpsc::Sender<()>>);
+impl Drop for ReleaseOnDrop {
+    fn drop(&mut self) {
+        if let Some(release) = self.0.take() {
+            let _ = release.send(());
+        }
+    }
+}
+fn cpu_memory_fixture() -> (MemoryTraceFile, Arc<State>) {
+    let path = std::env::temp_dir().join(format!(
+        "946-memory-finish-{}-{}.jsonl",
+        std::process::id(),
+        uptime_ns()
+    ));
+    let trace = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .unwrap();
+    let trace_file = MemoryTraceFile(path.clone());
+    let state = Arc::new(State {
+        settings: Settings {
+            serve_argv: Vec::new(),
+            release: "FullSettlement".into(),
+            hold_ms: 1,
+            writer_timeout_ms: 10,
+            cohorts: 1,
+            warmup_requests: 1,
+            trace_file: path.clone(),
+            ready_file: path.with_extension("unused-ready"),
+        },
+        release_at: Release::FullSettlement,
+        device: lloom_tensor::Device::Cpu,
+        trace: ParkingMutex::new(trace),
+        error: ParkingMutex::new(None),
+        next: Default::default(),
+        returned: Default::default(),
+        writers: Default::default(),
+        peak_writers: Default::default(),
+        memory: ParkingMutex::new(None),
+        memory_started: AtomicBool::new(false),
+        memory_closed: AtomicBool::new(false),
+        memory_start_ns: Default::default(),
+        samples: Default::default(),
+    });
+    (trace_file, state)
+}
+
+// Actual shared finish helper; real CPU samples=0/sampled=false. This tests
+// publication/lock custody, not a fabricated nonzero native memory report.
+#[test]
+fn memory_finish_publishes_before_a_contender_can_observe_terminal_state() {
+    let (trace_file, state) = cpu_memory_fixture();
+    let path = trace_file.0.clone();
+    state.start_memory();
+    std::thread::scope(|scope| {
+        let (entered, entry) = mpsc::channel();
+        let (release, released) = mpsc::channel();
+        // On every panic path this release drops before scope joins workers.
+        let release_on_drop = ReleaseOnDrop(Some(release));
+        let worker_state = state.clone();
+        let worker = scope.spawn(move || {
+            worker_state.finish_memory_with("controlled finish", |gauge| {
+                entered.send(()).unwrap();
+                released
+                    .recv_timeout(WAIT)
+                    .expect("controlled finish released during cleanup");
+                gauge.finish(&lloom_tensor::Device::Cpu)
+            });
+        });
+        entry
+            .recv_timeout(WAIT)
+            .expect("finisher owns the actual gauge");
+        // This is an actual contender on the SAME memory mutex, not a sleep
+        // or a signal before an unobserved lock attempt.
+        let contender = state.memory.try_lock();
+        let exposed_terminal = contender.is_some();
+        drop(contender);
+        assert!(
+            !exposed_terminal,
+            "in-flight memory finish must not expose empty/zero terminal state"
+        );
+        drop(release_on_drop);
+        worker.join().expect("memory finisher joined");
+    });
+    state.finish_memory_with("second finisher", |_| panic!("gauge finished twice"));
+    assert!(state.memory.lock().is_none());
+    assert!(state.memory_closed.load(Ordering::Acquire));
+    assert_eq!(
+        state.samples.load(Ordering::Acquire),
+        0,
+        "real CPU report, not a fabricated native sample"
+    );
+    let events: Vec<Value> = std::fs::read_to_string(&path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(
+        events.len(),
+        1,
+        "exact one report published before terminal state"
+    );
+    assert_eq!(events[0]["kind"], "memory-finish");
+    assert_eq!(events[0]["reason"], "controlled finish");
+    assert_eq!(events[0]["report"]["samples"], 0);
+    assert_eq!(events[0]["report"]["sampled"], false);
+    drop(state);
+    drop(trace_file);
+}
+
+// Last tail is paused before returned increments. A deadline is only a
+// failure; success below requires actual sender disconnection after join.
+#[test]
+fn private_dispatch_tail_finishes_before_memory_finalization() {
+    let (trace_file, state) = cpu_memory_fixture();
+    state.start_memory();
+    let (tail_sender, tails) = mpsc::channel::<std::convert::Infallible>();
+    std::thread::scope(|scope| {
+        let (entered, entry) = mpsc::channel();
+        let (release, released) = mpsc::channel();
+        let release_on_drop = ReleaseOnDrop(Some(release));
+        let released = Arc::new(ParkingMutex::new(released));
+        let worker_state = state.clone();
+        // Same cloned-dispatch captured-Sender lifetime as the native path.
+        let dispatch = move || {
+            let _keep_dispatch_alive = &tail_sender;
+            entered.send(()).unwrap();
+            released
+                .lock()
+                .recv_timeout(WAIT)
+                .expect("paused private tail released during cleanup");
+            worker_state.returned.fetch_add(1, Ordering::AcqRel);
+        };
+        let pending = dispatch.clone();
+        drop(dispatch); // No root sender copy survives.
+        let worker = scope.spawn(pending);
+        entry
+            .recv_timeout(WAIT)
+            .expect("private tail paused before returned");
+        let before = after_private_dispatch_tails(&tails, Duration::ZERO, || {
+            assert_eq!(
+                state.returned.load(Ordering::Acquire),
+                1,
+                "private tail finalizer ran before the last returned increment"
+            );
+            state.finish_memory("after private tails");
+        });
+        assert!(
+            before.is_err(),
+            "live dispatch is not completion at an expired deadline"
+        );
+        assert_eq!(state.returned.load(Ordering::Acquire), 0);
+        assert!(!state.memory_closed.load(Ordering::Acquire));
+        drop(release_on_drop);
+        worker.join().expect("private tail joined");
+    });
+    after_private_dispatch_tails(&tails, WAIT, || {
+        assert_eq!(state.returned.load(Ordering::Acquire), 1);
+        state.finish_memory("after private tails");
+    })
+    .expect("only disconnected dispatch authority permits finalization");
+    let events: Vec<Value> = std::fs::read_to_string(&trace_file.0)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0]["reason"], "after private tails");
+    let error = owner_after_private_tails::<()>(
+        Err(anyhow::anyhow!("original owner failure")),
+        Err(anyhow::anyhow!("secondary private-tail deadline")),
+    )
+    .unwrap_err();
+    assert_eq!(error.to_string(), "original owner failure");
+    drop(state);
+    drop(trace_file);
+}
+
+// No completion messages: each cloned private dispatch owns a Sender, even
+// before entering its body. Disconnection alone proves all clones are gone.
+fn after_private_dispatch_tails<T>(
+    tails: &mpsc::Receiver<std::convert::Infallible>,
+    timeout: Duration,
+    finish: impl FnOnce() -> T,
+) -> Result<T> {
+    match tails.recv_timeout(timeout) {
+        Err(mpsc::RecvTimeoutError::Disconnected) => Ok(finish()),
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            anyhow::bail!("private dispatch tails did not finish within {timeout:?}")
+        }
+        Ok(never) => match never {},
+    }
+}
+
+fn owner_after_private_tails<T>(owner: Result<()>, tails: Result<T>) -> Result<T> {
+    match owner {
+        Err(primary) => {
+            if let Err(secondary) = tails {
+                eprintln!("[private dispatch-tail cleanup also failed: {secondary:#}]");
+            }
+            Err(primary)
+        }
+        Ok(()) => tails,
+    }
+}
+
 struct FinishMemory(Arc<State>);
 impl Drop for FinishMemory {
     fn drop(&mut self) {
@@ -520,13 +737,19 @@ fn real_model_http_overlap_private_policy() -> Result<()> {
     let _finish = FinishMemory(state.clone());
     let dispatch = state.clone();
     let ready = state.clone();
+    let (tail_sender, tails) = mpsc::channel::<std::convert::Infallible>();
     let result = run_owner_dispatched(
         options,
         engine,
         path,
         Some((load_start, reuse)),
         None,
-        move |shared, path, request, first| dispatch.handle(shared, path, request, first),
+        move |shared, path, request, first| {
+            // Captured by D and EACH clone, including not-yet-entered workers.
+            // No message/count protocol or surviving root sender copy.
+            let _keep_dispatch_alive = &tail_sender;
+            dispatch.handle(shared, path, request, first)
+        },
         move |shared, configuration| {
             let tiny_http::ListenAddr::IP(address) = shared.server.server_addr() else {
                 anyhow::bail!("IP listener required")
@@ -543,11 +766,15 @@ fn real_model_http_overlap_private_policy() -> Result<()> {
             Ok(())
         },
     );
-    state.finish_memory("server returned");
+    let tail_result = after_private_dispatch_tails(&tails, WAIT, || {
+        state.finish_memory("server returned after private tails");
+    });
+    state.event(json!({"kind":"dispatch-tails", "completed":tail_result.is_ok(),
+        "authority":"private D clone Sender disconnection", "error":tail_result.as_ref().err().map(|e|format!("{e:#}"))}));
     state.event(json!({"kind":"summary","requests":state.next.load(Ordering::Acquire),"priced_returned":state.returned.load(Ordering::Acquire),
         "peak_owned_writers":state.peak_writers.load(Ordering::Acquire),"open_writers":state.writers.load(Ordering::Acquire),
         "exact_retained_payload_bytes":Value::Null,"scope":"not instrumented; do not infer from raw credit or process footprint"}));
-    result?;
+    owner_after_private_tails(result, tail_result)?;
     anyhow::ensure!(
         state.next.load(Ordering::Acquire) == expected_total,
         "request matrix incomplete"

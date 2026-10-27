@@ -18,6 +18,7 @@ mod accept_frontier;
 mod attention_route;
 mod axes_registry;
 mod batch_norm;
+mod batched_cut_hold;
 mod batched_decode_tests;
 mod block_traits;
 mod cpu_flash_attn;

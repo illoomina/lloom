@@ -215,8 +215,9 @@ impl HostFedRing {
         let v = base.saturating_add(RELEASE_SPAN);
         self.released_upto
             .fetch_max(v, std::sync::atomic::Ordering::AcqRel);
-        if let Err(e) = self.device.commands().cancel_produced(
+        if let Err(e) = self.device.commands().cancel_produced_through(
             &self.event,
+            v,
             "host feed: the run was released; the work held for its fill was cancelled",
         ) {
             eprintln!("[host-fed] cancelling the released run's held work: {e}");

@@ -42,6 +42,7 @@ const DECODE_ROWS: &str = "the library's value of the batched decode rows' arm, 
 const RESIDENCY_ATTACH: &str = "the library's value of the device set's attachment, a key the option tree did not have, which decision 56 (#1092) detaches from the Metal 3 queue on chat and serve";
 const KEEP_WARM_PRESSURE: &str = "the library's value of the keep-warm's pressure stop, a key the option tree did not have, which decision 57 (#1092) turns on where serve's keep-warm runs by default";
 const RESIDENCY_METAL4: &str = "the library's value of what a Metal 4 command buffer declares resident, a key the option tree did not have, which decision 62 (#1092) moves to queue-diff for Qwen4-exp on chat and serve";
+const ROWS_MAX: &str = "the library's ceiling of the f16 row axis, a key the option tree did not have, which decision 60 (#1084) raises to 12 where the batched loops run on Metal";
 const CHAT_SERVE: &[Frontend] = &[Frontend::Chat, Frontend::Serve];
 
 /// Every row of the front-end table by value: key, front-ends, condition,
@@ -259,6 +260,13 @@ const PINNED_ROWS: &[(&str, &[Frontend], When, &str, &str)] = &[
         When::MetalSingle,
         "false",
         KEEP_WARM_PRESSURE,
+    ),
+    (
+        "kernels.gemm.f16_rows_max",
+        &[Frontend::Serve, Frontend::Bench],
+        When::Metal,
+        "10",
+        ROWS_MAX,
     ),
     (
         "kernels.gemm.f16_rows_decode",
@@ -1109,8 +1117,8 @@ fn the_unset_defaults_are_the_trees_before_it_except_the_named_exceptions() {
     let decided: Vec<u32> = EXCEPTIONS.iter().map(|e| e.decision).collect();
     assert_eq!(
         decided,
-        [36, 43, 43, 43, 43, 35, 35, 52, 52, 54, 54, 56, 56, 57, 62, 62],
-        "the approved default changes: decision 36 (serve reuse), 43 (the gate and its cores arm, chat and serve), 35 (the lead, chat and serve), 52 (B = 1 DSpark's in-place KV, chat and serve), 54 (the batched decode rows on the row axis, serve and bench), 56 (the device set off the Metal 3 queue, chat and serve), 57 (the keep-warm's pressure stop, serve), 62 (Qwen4-exp's device sets on the Metal 4 queue, chat and serve)"
+        [36, 43, 43, 43, 43, 35, 35, 52, 52, 54, 54, 56, 56, 57, 60, 60, 62, 62],
+        "the approved default changes: decision 36 (serve reuse), 43 (the gate and its cores arm, chat and serve), 35 (the lead, chat and serve), 52 (B = 1 DSpark's in-place KV, chat and serve), 54 (the batched decode rows on the row axis, serve and bench), 56 (the device set off the Metal 3 queue, chat and serve), 57 (the keep-warm's pressure stop, serve), 60 (the row axis's ceiling 12, serve and bench), 62 (Qwen4-exp's device sets on the Metal 4 queue, chat and serve)"
     );
     // 4. Decision 44: the EOS watch stays opt-in on every front-end.
     // Decisions 43/35 (2026-10-19): the gate, its cores arm and the lead of 4
@@ -1350,10 +1358,11 @@ fn serve_keeps_warm_by_default_on_metal_at_one_sequence() {
 }
 
 /// Decision 54: serve and bench resolve the batched decode rows' arm on at a
-/// batch on Metal no wider than the row axis's ceiling. At one sequence, at a
-/// batch past the ceiling, on chat, on the CPU and wherever a layer names the
-/// key, the library's off (or the value named) holds; a ceiling raised by key
-/// moves the widest batch with it.
+/// batch on Metal no wider than the row axis's ceiling, which decision 60
+/// puts at 12 there (`the_row_axis_ceiling_is_twelve_where_the_batched_loops_run`).
+/// At one sequence, at a batch past the ceiling, on chat, on the CPU and
+/// wherever a layer names the key, the library's off (or the value named)
+/// holds; a ceiling named by key moves the widest batch with it.
 #[test]
 fn the_batched_decode_rows_arm_is_on_at_a_batch_on_metal() {
     let none = BTreeMap::new();
@@ -1380,13 +1389,15 @@ fn the_batched_decode_rows_arm_is_on_at_a_batch_on_metal() {
             Value::Bool(metal),
             "{name} at a batch, by key"
         );
+        for b in ["10", "11", "12"] {
+            assert_eq!(
+                get(f, &["--batch", b], &none),
+                Value::Bool(metal),
+                "{name} at a batch of {b}, within decision 60's ceiling"
+            );
+        }
         assert_eq!(
-            get(f, &["--batch", "10"], &none),
-            Value::Bool(metal),
-            "{name} at a batch of the ceiling"
-        );
-        assert_eq!(
-            get(f, &["--batch", "11"], &none),
+            get(f, &["--batch", "13"], &none),
             Value::Bool(false),
             "{name} at a batch past the ceiling"
         );
@@ -1398,7 +1409,16 @@ fn the_batched_decode_rows_arm_is_on_at_a_batch_on_metal() {
         assert_eq!(
             get(
                 f,
-                &["--batch", "12", "--set", "kernels.gemm.f16_rows_max=12"],
+                &["--batch", "11", "--set", "kernels.gemm.f16_rows_max=10"],
+                &none
+            ),
+            Value::Bool(false),
+            "{name} at a batch past a ceiling named by key"
+        );
+        assert_eq!(
+            get(
+                f,
+                &["--batch", "14", "--set", "kernels.gemm.f16_rows_max=14"],
                 &none
             ),
             Value::Bool(metal),
@@ -1441,6 +1461,63 @@ fn the_batched_decode_rows_arm_is_on_at_a_batch_on_metal() {
         "serve: true when on Metal at scheduler.max_sequences from 2 to \
          kernels.gemm.f16_rows_max (decision 54: was false), bench: true when on Metal at \
          scheduler.max_sequences from 2 to kernels.gemm.f16_rows_max (decision 54: was false)"
+    );
+}
+
+/// Decision 60: serve and bench resolve the f16 row axis's ceiling to 12 on
+/// Metal, one value for the batched decode rows and the batched speculative
+/// windows (`tuning.md` §13.5zb). Chat (one sequence, whose window is at
+/// most 10 rows), the CPU, the library and every layer that names the key
+/// keep the library's 10 or the value named.
+#[test]
+fn the_row_axis_ceiling_is_twelve_where_the_batched_loops_run() {
+    let none = BTreeMap::new();
+    let key = "kernels.gemm.f16_rows_max";
+    let get = |f: Frontend, argv: &[&str], env: &BTreeMap<String, String>| {
+        at(&resolve(Some(f), f.name(), argv, env).unwrap(), key)
+    };
+    let metal = When::Metal.holds(&resolve(Some(Frontend::Serve), "serve", &[], &none).unwrap());
+    let twelve = if metal { json!(12) } else { json!(10) };
+    assert_eq!(
+        at(&EngineOptions::default(), key),
+        json!(10),
+        "the library's value"
+    );
+    assert_eq!(get(Frontend::Chat, &[], &none), json!(10), "chat");
+    for f in [Frontend::Serve, Frontend::Bench] {
+        let name = f.name();
+        assert_eq!(get(f, &[], &none), twelve, "{name} at one sequence");
+        assert_eq!(
+            get(f, &["--batch", "12"], &none),
+            twelve,
+            "{name} at a batch"
+        );
+        assert_eq!(
+            get(f, &["--cpu", "--batch", "4"], &none),
+            json!(10),
+            "{name} on the CPU"
+        );
+        for argv in [
+            &["--batch", "12", "--set", "kernels.gemm.f16_rows_max=10"][..],
+            &["--batch", "12", "--gemm-f16-rows-max", "10"],
+        ] {
+            assert_eq!(
+                get(f, argv, &none),
+                json!(10),
+                "{name}: the opt-out {argv:?}"
+            );
+        }
+        let env = BTreeMap::from([("LLOOM_GEMM_F16_ROWS_MAX".to_string(), "10".to_string())]);
+        assert_eq!(
+            get(f, &["--batch", "12"], &env),
+            json!(10),
+            "{name}: the opt-out by env"
+        );
+    }
+    assert_eq!(
+        frontend::describe(key).unwrap(),
+        "serve: 12 when on Metal (a Metal build, not --cpu) (decision 60: was 10), \
+         bench: 12 when on Metal (a Metal build, not --cpu) (decision 60: was 10)"
     );
 }
 

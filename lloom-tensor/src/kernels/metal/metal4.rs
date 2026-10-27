@@ -215,6 +215,13 @@ impl Queue {
         (self.allocated.load(Ordering::Acquire), self.available.len())
     }
 
+    /// A thread is parked on this queue's slot wake: a test's observation of
+    /// an owner parked for a slot behind held work.
+    #[cfg(test)]
+    pub(super) fn ready_parked_for_test(&self) -> bool {
+        self.ready.test_is_parked()
+    }
+
     /// Wake an acquisition parked for a slot, so it re-runs its park hook: a
     /// producer that released held recordings the parked owner must submit
     /// before any slot can come back (`Commands::produced`).

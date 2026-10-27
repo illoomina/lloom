@@ -11,159 +11,14 @@
 //! misses, whose host plan reads the routing back inside the forward), at
 //! B = 2, 4 and 8.
 //!
-//! The device starts each run at a small period ([`PERIOD`]), so the tiny
+//! The device starts each run at a small period (`PERIOD`), so the tiny
 //! forward cuts many times under it. The reference a held step is checked
 //! against is absolute: two commits a step on LFM2 (no readback inside its
 //! forward), and on Qwen4-exp the same run with the device's period at
 //! `usize::MAX`, where nothing cuts anywhere.
 
-use lloom::generation::Sampling;
-use lloom::nn::model::BatchedCausalLM;
-use lloom::nn::{BatchCutHold, BatchDecoder, DecodeOptions, Session};
-use lloom_tensor::{Device, Result};
-
-/// An id no argmax produces here: every run ends on its step count.
-const NO_EOS: u32 = u32::MAX - 1;
-/// The period each run starts the device at.
-const PERIOD: usize = 4;
-/// Tokens a row decodes.
-const STEPS: usize = 8;
-
-/// What one [`BatchDecoder::step`] did.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Step {
-    live: usize,
-    pieces: usize,
-    retired: usize,
-    /// Command buffers committed during the call.
-    commits: u64,
-    /// The device's counter-cut period after it.
-    period_after: usize,
-}
-
-impl Step {
-    fn shape(&self) -> (usize, usize, usize) {
-        (self.live, self.pieces, self.retired)
-    }
-}
-
-#[derive(Debug)]
-struct Run {
-    ids: Vec<Vec<u32>>,
-    steps: Vec<Step>,
-}
-
-impl Run {
-    /// The decode-only steps whose window holds nothing but the step: every
-    /// row live, no piece, nothing retired, and the step before the same (a
-    /// join or a retirement leaves a gather in the open buffer that the next
-    /// step's commits would carry).
-    fn steady(&self, b: usize) -> Vec<usize> {
-        let quiet = |s: &Step| s.live == b && s.pieces == 0 && s.retired == 0;
-        (1..self.steps.len())
-            .filter(|&i| quiet(&self.steps[i]) && quiet(&self.steps[i - 1]))
-            .collect()
-    }
-
-    fn commits_at(&self, at: &[usize]) -> Vec<u64> {
-        at.iter().map(|&i| self.steps[i].commits).collect()
-    }
-}
-
-fn prompts(b: usize, vocab: usize, long: bool) -> Vec<Vec<u32>> {
-    (0..b)
-        .map(|r| {
-            let len = if long { 3 + (r * 5) % 7 } else { 3 + r % 3 };
-            (0..len)
-                .map(|i| ((r * 7 + i * 3) % (vocab - 2) + 1) as u32)
-                .collect()
-        })
-        .collect()
-}
-
-#[cfg(feature = "metal")]
-fn epoch(dev: &Device) -> u64 {
-    match dev {
-        Device::Metal(m) => m.gpu_clock().current_epoch().0,
-        _ => 0,
-    }
-}
-
-#[cfg(not(feature = "metal"))]
-fn epoch(_dev: &Device) -> u64 {
-    0
-}
-
-#[cfg(feature = "metal")]
-fn period_of(dev: &Device) -> usize {
-    match dev {
-        Device::Metal(m) => m.compute_per_buffer(),
-        _ => 0,
-    }
-}
-
-#[cfg(not(feature = "metal"))]
-fn period_of(_dev: &Device) -> usize {
-    0
-}
-
-/// One batch through `BatchDecoder` under `arm`, the device at `period`.
-#[allow(clippy::too_many_arguments)]
-fn run<M: BatchedCausalLM>(
-    model: &M,
-    make: &dyn Fn() -> Result<M::Cache>,
-    dev: &Device,
-    prompts: &[Vec<u32>],
-    lookahead: usize,
-    chunk: usize,
-    arm: BatchCutHold,
-    period: usize,
-) -> Result<Run> {
-    let _period = dev.cut_period_hold(period);
-    let opts = DecodeOptions {
-        lookahead,
-        prefill_chunk: chunk,
-        ..DecodeOptions::new(STEPS)
-    };
-    let mut dec: BatchDecoder<'_, M, Session<'_, M>> =
-        BatchDecoder::new(opts, &[NO_EOS], dev.clone())?.with_cut_hold(arm);
-    assert_eq!(dec.cut_hold(), arm);
-    let mut rows = Vec::with_capacity(prompts.len());
-    for p in prompts {
-        let s = Session::new(model, make()?);
-        rows.push(
-            dec.admit(s, p.clone(), Sampling::ArgMax, 0)
-                .map_err(|r| r.error)?,
-        );
-    }
-    let mut ids = vec![Vec::new(); prompts.len()];
-    let mut steps = Vec::new();
-    while !dec.is_idle() {
-        let e0 = epoch(dev);
-        let rep = dec.step(&mut |row, t| {
-            let k = rows
-                .iter()
-                .position(|r| *r == row)
-                .expect("an admitted row");
-            ids[k].extend_from_slice(t);
-            Ok(())
-        })?;
-        steps.push(Step {
-            live: rep.live,
-            pieces: rep.pieces,
-            retired: rep.retired,
-            commits: epoch(dev) - e0,
-            period_after: period_of(dev),
-        });
-        assert!(steps.len() < 200, "the batch never drained");
-    }
-    let finished = dec.take_finished();
-    assert_eq!(finished.len(), prompts.len());
-    for row in &ids {
-        assert_eq!(row.len(), STEPS, "a row ended before its cap");
-    }
-    Ok(Run { ids, steps })
-}
+use lloom::nn::BatchCutHold;
+use lloom_tensor::Result;
 
 #[test]
 fn the_arm_names_parse_and_the_default_is_off() -> Result<()> {
@@ -184,19 +39,151 @@ fn the_arm_names_parse_and_the_default_is_off() -> Result<()> {
 #[cfg(feature = "metal")]
 mod metal {
     use super::*;
+    use lloom::generation::Sampling;
     use lloom::models::lfm2::{Config as LfmConfig, State};
     use lloom::models::lfm2_testing::Lfm2Tiny;
     use lloom::models::qwen4exp::testing::Qwen4ExpTiny;
     use lloom::models::qwen4exp::{
         Config as QwenConfig, LoadOptions, SlotBudget, StreamLoader, StreamOptions,
     };
+    use lloom::nn::model::BatchedCausalLM;
     use lloom::nn::model::CausalLM;
+    use lloom::nn::{BatchDecoder, DecodeOptions, Session};
     use lloom::profile::CrownExact;
     use lloom::testing::fixture::{Backend, Fixture};
     use lloom::testing::tiny::TinyFamily;
-    use lloom_tensor::DType;
+    use lloom_tensor::{DType, Device};
 
-    const ARMS: [BatchCutHold; 3] = [BatchCutHold::Off, BatchCutHold::Ahead, BatchCutHold::All];
+    /// An id no argmax produces here: every run ends on its step count.
+    const NO_EOS: u32 = u32::MAX - 1;
+    /// The period each run starts the device at.
+    const PERIOD: usize = 4;
+    /// Tokens a row decodes.
+    const STEPS: usize = 8;
+
+    /// What one [`BatchDecoder::step`] did.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct Step {
+        live: usize,
+        pieces: usize,
+        retired: usize,
+        /// Command buffers committed during the call.
+        commits: u64,
+        /// The device's counter-cut period after it.
+        period_after: usize,
+    }
+
+    impl Step {
+        fn shape(&self) -> (usize, usize, usize) {
+            (self.live, self.pieces, self.retired)
+        }
+    }
+
+    #[derive(Debug)]
+    struct Run {
+        ids: Vec<Vec<u32>>,
+        steps: Vec<Step>,
+    }
+
+    impl Run {
+        /// The decode-only steps whose window holds nothing but the step: every
+        /// row live, no piece, nothing retired, and the step before the same (a
+        /// join or a retirement leaves a gather in the open buffer that the next
+        /// step's commits would carry).
+        fn steady(&self, b: usize) -> Vec<usize> {
+            let quiet = |s: &Step| s.live == b && s.pieces == 0 && s.retired == 0;
+            (1..self.steps.len())
+                .filter(|&i| quiet(&self.steps[i]) && quiet(&self.steps[i - 1]))
+                .collect()
+        }
+
+        fn commits_at(&self, at: &[usize]) -> Vec<u64> {
+            at.iter().map(|&i| self.steps[i].commits).collect()
+        }
+    }
+
+    fn prompts(b: usize, vocab: usize, long: bool) -> Vec<Vec<u32>> {
+        (0..b)
+            .map(|r| {
+                let len = if long { 3 + (r * 5) % 7 } else { 3 + r % 3 };
+                (0..len)
+                    .map(|i| ((r * 7 + i * 3) % (vocab - 2) + 1) as u32)
+                    .collect()
+            })
+            .collect()
+    }
+
+    fn epoch(dev: &Device) -> u64 {
+        match dev {
+            Device::Metal(m) => m.gpu_clock().current_epoch().0,
+            _ => 0,
+        }
+    }
+
+    fn period_of(dev: &Device) -> usize {
+        match dev {
+            Device::Metal(m) => m.compute_per_buffer(),
+            _ => 0,
+        }
+    }
+
+    /// One batch through `BatchDecoder` under `arm`, the device at `period`.
+    #[allow(clippy::too_many_arguments)]
+    fn run<M: BatchedCausalLM>(
+        model: &M,
+        make: &dyn Fn() -> Result<M::Cache>,
+        dev: &Device,
+        prompts: &[Vec<u32>],
+        lookahead: usize,
+        chunk: usize,
+        arm: BatchCutHold,
+        period: usize,
+    ) -> Result<Run> {
+        let _period = dev.cut_period_hold(period);
+        let opts = DecodeOptions {
+            lookahead,
+            prefill_chunk: chunk,
+            ..DecodeOptions::new(STEPS)
+        };
+        let mut dec: BatchDecoder<'_, M, Session<'_, M>> =
+            BatchDecoder::new(opts, &[NO_EOS], dev.clone())?.with_cut_hold(arm);
+        assert_eq!(dec.cut_hold(), arm);
+        let mut rows = Vec::with_capacity(prompts.len());
+        for p in prompts {
+            let s = Session::new(model, make()?);
+            rows.push(
+                dec.admit(s, p.clone(), Sampling::ArgMax, 0)
+                    .map_err(|r| r.error)?,
+            );
+        }
+        let mut ids = vec![Vec::new(); prompts.len()];
+        let mut steps = Vec::new();
+        while !dec.is_idle() {
+            let e0 = epoch(dev);
+            let rep = dec.step(&mut |row, t| {
+                let k = rows
+                    .iter()
+                    .position(|r| *r == row)
+                    .expect("an admitted row");
+                ids[k].extend_from_slice(t);
+                Ok(())
+            })?;
+            steps.push(Step {
+                live: rep.live,
+                pieces: rep.pieces,
+                retired: rep.retired,
+                commits: epoch(dev) - e0,
+                period_after: period_of(dev),
+            });
+            assert!(steps.len() < 200, "the batch never drained");
+        }
+        let finished = dec.take_finished();
+        assert_eq!(finished.len(), prompts.len());
+        for row in &ids {
+            assert_eq!(row.len(), STEPS, "a row ended before its cap");
+        }
+        Ok(Run { ids, steps })
+    }
 
     fn metal() -> Option<Device> {
         if Backend::current().at_scale() {

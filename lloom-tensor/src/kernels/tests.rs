@@ -12544,6 +12544,40 @@ fn gemv_rows_keep_the_one_row_bits_at_every_capacity() {
     );
 }
 
+/// Which entry each `_r<NR>` name is compiled from (`gemv.metal`'s
+/// `instantiate_gemv_rows_bm4`, `_bm8`): `gemv_rows`, without a
+/// threads-per-threadgroup bound, but on the bm4 tile from 11 rows, where
+/// `gemv`'s `max_total_threads_per_threadgroup(BM * 32)` is the faster
+/// compile (`docs/tuning.md` §13.5zb). Read off the pipeline: the bound caps
+/// `maxTotalThreadsPerThreadgroup` at the threadgroup's own 128 or 256
+/// threads, and without it the value is the compiler's register-limited
+/// residency, 384 or more at every capacity.
+#[test]
+fn gemv_rows_take_the_unbounded_entry_but_on_the_bm4_tile_from_eleven_rows() {
+    let device = device();
+    let kernels = Kernels::new();
+    let mut read = Vec::new();
+    for bm in [4usize, 8] {
+        for nr in 2..=GEMV_ROWS_MAX {
+            let name = format!("gemv_float16_bm{bm}_bn1_sm1_sn32_tm4_tn4_nc0_axpby0_r{nr}");
+            let threads = kernels
+                .load_pipeline(&device, Source::Gemv, name.clone())
+                .unwrap()
+                .max_total_threads_per_threadgroup();
+            if bm == 4 && nr >= 11 {
+                assert_eq!(threads, bm * 32, "{name}: compiled without gemv's bound");
+            } else {
+                assert!(
+                    threads > bm * 32,
+                    "{name}: bounded at {threads} threads, gemv's entry rather than gemv_rows'"
+                );
+            }
+            read.push(format!("bm{bm}_r{nr}={threads}"));
+        }
+    }
+    println!("GEMV_ROWS_ENTRY {}", read.join(" "));
+}
+
 /// What the row axis does not serve is refused by name, never run without
 /// it: a fused epilogue at more than one row (the caller takes the plain
 /// store), a capacity outside 2..=16, a tile the axis is not instantiated at

@@ -978,7 +978,7 @@ pub unsafe fn call_mlx_gemv_norm(
 }
 
 /// The most rows one threadgroup of the GEMV's row axis carries
-/// (`gemv.metal`'s `instantiate_gemv_rows_tile`: every count from 2).
+/// (`gemv.metal`'s `instantiate_gemv_rows_bm4`, `_bm8`: every count from 2).
 pub const GEMV_ROWS_MAX: usize = 16;
 
 /// The `[[host_name]]` suffix of each row count, no allocation per dispatch;

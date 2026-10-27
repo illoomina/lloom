@@ -3397,6 +3397,7 @@ impl<P: Lfm2Shape> super::served::Served for Engine<P> {
             "rows": self.rows.name(),
             "share_prefix": self.share_prefix,
             "dspark_k": self.dspark_k,
+            "cut_sites": super::common::cut_sites_json(),
             "decision_ragged": self.decision_ragged.then(|| self.trunks.report()),
             "pool": self.pool.as_ref().map(|p| {
                 let r = p.report();

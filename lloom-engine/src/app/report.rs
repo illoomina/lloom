@@ -970,6 +970,16 @@ fn print_churn(m: &lloom_tensor::MetalDevice, before: &ChurnSnapshot) {
     for (kind, site, n) in lloom_tensor::metal_backend::readback_sites() {
         eprintln!("[readback sites: {n} {kind} {site}]");
     }
+    // `diagnostics.trace.cut_sites`: every commit since the process began,
+    // by committing thread and stack.
+    for c in lloom_tensor::kernels::metal::profile::cut_sites() {
+        eprintln!(
+            "[cut sites: {} {} {}]",
+            c.commits,
+            c.thread,
+            c.frames.join(" <- ")
+        );
+    }
     let (shared, private) = m.pool_free_summary(6);
     let fmt = |s: &lloom_tensor::metal_backend::FreeSummary| {
         let top: Vec<String> = s

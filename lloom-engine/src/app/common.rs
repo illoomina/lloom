@@ -452,6 +452,37 @@ pub fn profile_take() -> Option<ProfileReport> {
     None
 }
 
+/// The profiler's running counts and its commit attribution for `/health`,
+/// cumulative since the process started (a caller differences two reads
+/// around a request); `null` unless `CANDLE_METAL_PROFILE=1` and
+/// `diagnostics.trace.cut_sites` are both on.
+pub fn cut_sites_json() -> Value {
+    #[cfg(feature = "metal")]
+    {
+        use lloom_tensor::kernels::metal::profile;
+        if profile::cut_sites_enabled() {
+            let s = profile::snapshot();
+            let sites: Vec<Value> = profile::cut_sites()
+                .into_iter()
+                .map(|c| json!({ "thread": c.thread, "commits": c.commits, "frames": c.frames }))
+                .collect();
+            return json!({
+                "command_buffers": s.command_buffers,
+                "dispatches": s.dispatches,
+                "encoders": s.encoders,
+                "commits": sites.iter().map(|c| c["commits"].as_u64().unwrap_or(0)).sum::<u64>(),
+                "sites": sites,
+                "by_label": s
+                    .by_label
+                    .into_iter()
+                    .map(|(k, n)| (k, json!(n)))
+                    .collect::<serde_json::Map<String, Value>>(),
+            });
+        }
+    }
+    Value::Null
+}
+
 pub use lloom::nn::memory::{MemGauge, MemReport, MemSnapshot};
 
 /// The label a load's machine reservation is listed under: the family and

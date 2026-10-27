@@ -329,15 +329,12 @@ mod metal {
 
     /// One Qwen4-exp model per run, built by `model` (a streamed tier's pool
     /// state is the run's own), every arm against the run where nothing cuts.
-    fn qwen_arms<M: BatchedCausalLM>(
+    fn qwen_arms<M: BatchedCausalLM<Config = QwenConfig>>(
         tag: &str,
         model: &dyn Fn() -> Result<M>,
         cfg: &QwenConfig,
         dev: &Device,
-    ) -> Result<()>
-    where
-        M: CausalLM<Config = QwenConfig>,
-    {
+    ) -> Result<()> {
         for b in [2usize, 4, 8] {
             let ps = prompts(b, cfg.vocab_size, false);
             for lookahead in [0usize, 1] {

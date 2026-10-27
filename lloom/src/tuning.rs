@@ -442,6 +442,9 @@ pub struct StreamTuning {
     /// Land a group's staged experts with one copy launch per pool, its sources read through a table of GPU addresses, instead of one copy dispatch per plane (Metal; the same bytes; planes that are not whole words land one a plane).
     #[opt(flag = "landing-gather", env = "QWEN4EXP_LANDING_GATHER", bool, path = "weights.experts.landing_gather", status = "arm", facets = ["cadence"], flows = ["weights-in", "commands-out"])]
     pub landing_gather: bool,
+    /// After a tier lands its misses, commit the open command buffer without waiting, unless the loop holds a longer period (decode's): the GPU starts the landing and the work before it while the host reads the next group's experts.
+    #[opt(flag = "landing-commit", env = "QWEN4EXP_LANDING_COMMIT", bool, path = "weights.experts.landing_commit", status = "arm", facets = ["cadence"], flows = ["weights-in", "commands-out"])]
+    pub landing_commit: bool,
     /// Spike 0 of fetch-and-wait: `wait` = a GPU wait on an already-raised event at every device-planned layer's join point (an instrument; off = none).
     #[opt(flag = "spike0", env = "QWEN4EXP_SPIKE0", parser = "parse_spike0", variants = ["off", "wait"], path = "diagnostics.experts.spike0", status = "instrument")]
     pub spike0: String,
@@ -502,6 +505,7 @@ impl Default for StreamTuning {
             settle_batch: true,
             landing_cut: 0,
             landing_gather: false,
+            landing_commit: false,
             spike0: "off".into(),
             trace_settle: false,
             fetch: "off".into(),

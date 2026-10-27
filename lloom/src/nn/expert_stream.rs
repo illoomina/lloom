@@ -1552,6 +1552,10 @@ struct Inner {
     /// (`weights.experts.landing_gather`), not one a plane.
     #[cfg(feature = "metal")]
     gather: bool,
+    /// Commit the open buffer after each landing
+    /// (`weights.experts.landing_commit`; `commit_landing`).
+    #[cfg(feature = "metal")]
+    commit: bool,
     /// The epoch of a group whose slot ids `ensure` handed out and whose
     /// dispatches are not all encoded yet (`down` closes it): the `io` arm's
     /// hint between the two must not give its slots away — the load is
@@ -2155,6 +2159,8 @@ impl Streamed {
                 staging,
                 #[cfg(feature = "metal")]
                 gather: landing_gather(),
+                #[cfg(feature = "metal")]
+                commit: landing_commit(),
                 table: None,
                 table_stale: true,
                 live_pending: Vec::new(),
@@ -2248,6 +2254,13 @@ impl Streamed {
     #[cfg(feature = "metal")]
     pub fn set_landing_gather(&mut self, on: bool) {
         self.inner.get_mut().gather = on;
+    }
+
+    /// Commit the open command buffer after each landing (`true`); the
+    /// default is `weights.experts.landing_commit`.
+    #[cfg(feature = "metal")]
+    pub fn set_landing_commit(&mut self, on: bool) {
+        self.inner.get_mut().commit = on;
     }
 
     /// Let the prefetch hints act on the `io` arm: the hinted experts are
@@ -3106,6 +3119,7 @@ impl Streamed {
             clock,
             device,
             gather,
+            commit,
             ..
         } = inner;
         let ring = match staging.as_ref() {
@@ -3153,6 +3167,9 @@ impl Streamed {
             }
         }
         drop(ring);
+        if *commit {
+            commit_landing(device)?;
+        }
         self.counters
             .bytes_loaded
             .fetch_add(bytes, Ordering::Relaxed);
@@ -3184,6 +3201,8 @@ impl Streamed {
                     sources,
                     staging,
                     gather,
+                    commit,
+                    device,
                     ..
                 } = inner;
                 #[cfg(not(feature = "metal"))]
@@ -3219,6 +3238,10 @@ impl Streamed {
                         bytes += plane as u64;
                         launches += 1;
                     }
+                }
+                #[cfg(feature = "metal")]
+                if *commit {
+                    commit_landing(device)?;
                 }
             }
             #[cfg(feature = "metal")]
@@ -3571,6 +3594,28 @@ fn landing_cut_period() -> usize {
 fn landing_gather() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| crate::tuning::tuning().stream.landing_gather)
+}
+
+/// `weights.experts.landing_commit` (read once): a new tier's commit arm.
+#[cfg(feature = "metal")]
+fn landing_commit() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::tuning::tuning().stream.landing_commit)
+}
+
+/// Commit what `device` has encoded after a landing, without waiting, so the
+/// GPU runs the landing and the work before it while the host goes on to
+/// read the next group's experts. Nothing under a period the loop holds
+/// longer than the landing's (the decode loop's `usize::MAX`): a landing
+/// never shortens the buffers around it.
+#[cfg(feature = "metal")]
+fn commit_landing(device: &Device) -> Result<()> {
+    if let Device::Metal(m) = device {
+        if m.compute_per_buffer() != usize::MAX {
+            m.flush_marker_if_started()?;
+        }
+    }
+    Ok(())
 }
 
 /// Hold the landing's cut period on `device` for the guard's life: `None`
@@ -5678,6 +5723,69 @@ mod tests {
                 );
             }
         }
+        std::fs::remove_file(path).ok();
+    }
+
+    /// Metal, the commit arm (`set_landing_commit`) on a gathered tier: the
+    /// routed output is the same with and without it; outside a held period
+    /// it commits more command buffers, at most one more a landing call (a
+    /// third of the tier's landing launches: three pools a call); under the
+    /// decode loop's held `usize::MAX` it commits exactly what the arm off
+    /// does.
+    #[cfg(feature = "metal")]
+    #[test]
+    fn a_landing_commit_commits_once_a_landing_and_never_under_a_held_period() {
+        use lloom_tensor::kernels::metal::profile;
+        use lloom_tensor::kernels::metal::staging::StagingRing;
+        std::env::set_var("CANDLE_METAL_PROFILE", "1");
+        let dev = match Device::new_metal(0) {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        assert!(profile::enabled());
+        let m = dev.as_metal_device().unwrap().clone();
+        let dtype = GgmlDType::F32;
+        let (e, ff, d, topk) = (12usize, 32usize, 64usize, 3usize);
+        let gate = stacked(e, ff, d, 1.0, dtype);
+        let up = stacked(e, ff, d, 2.0, dtype);
+        let down = stacked(e, d, ff, 3.0, dtype);
+        let path = write_gguf(&[("gate", &gate), ("up", &up), ("down", &down)]);
+        let ring = StagingRing::shared(&m);
+        let xs = x(16, d, 0.5).to_device(&dev).unwrap();
+        let id = ids(16, topk, e, 1).to_device(&dev).unwrap();
+        // A fresh tier per arm, so every run lands the same misses.
+        let measure = |commit: bool, held: bool| -> (Vec<f32>, u64, u64) {
+            let mut t = Streamed::with_staging(
+                open(&path, "gate"),
+                open(&path, "up"),
+                open(&path, "down"),
+                6,
+                LoaderArm::Pread,
+                &dev,
+                Some(Arc::clone(&ring)),
+            )
+            .unwrap();
+            t.set_landing_gather(true);
+            t.set_landing_commit(commit);
+            m.wait_until_completed().unwrap();
+            let _hold = held.then(|| dev.cut_period_hold(usize::MAX));
+            profile::reset();
+            let y = run(&t, &xs, &id);
+            let commits = profile::snapshot().commits;
+            (y, commits, t.stats().landing_launches)
+        };
+        let (y_off, off, _) = measure(false, false);
+        let (y_on, on, launches) = measure(true, false);
+        let (y_held_off, held_off, _) = measure(false, true);
+        let (y_held_on, held_on, _) = measure(true, true);
+        assert!(launches > 0 && launches % 3 == 0, "{launches} launches");
+        assert!(y_off == y_on && y_off == y_held_off && y_off == y_held_on);
+        assert!(
+            on > off && on - off <= launches / 3,
+            "{on} commits with the arm, {off} without, {} landing calls",
+            launches / 3
+        );
+        assert_eq!(held_on, held_off, "a held period took the landing's commit");
         std::fs::remove_file(path).ok();
     }
 

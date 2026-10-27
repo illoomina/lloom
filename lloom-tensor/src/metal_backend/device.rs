@@ -790,7 +790,9 @@ impl MetalDevice {
     ) -> crate::kernels::metal::backing::Allocation {
         // SAFETY: asks only whether a native set exists; nothing is borrowed.
         if unsafe { self.residency_set.raw() }.is_some() {
-            allocation.buffer = allocation.buffer.with_device_listing();
+            allocation.buffer = allocation
+                .buffer
+                .with_device_listing(crate::kernels::metal::DeviceListing::Pool);
         }
         allocation
     }
@@ -967,8 +969,13 @@ impl MetalDevice {
             }
             _ => String::new(),
         };
+        let cover = if self.commands.in_flight_hold().is_some_and(|h| h.unlists()) {
+            " metal4_cover=held"
+        } else {
+            ""
+        };
         format!(
-            "residency={} {}{metal4}",
+            "residency={} {}{metal4}{cover}",
             self.commands.residency_attachment().short(),
             self.residency_set.layout_line()
         )
@@ -978,6 +985,12 @@ impl MetalDevice {
     /// ([`Commands::metal4_slot_residency`]).
     pub fn metal4_slot_residency(&self) -> Option<crate::kernels::metal::SlotResidency> {
         self.commands.metal4_slot_residency()
+    }
+
+    /// The Metal 4 slot census by listing site
+    /// ([`Commands::metal4_slot_sites`]).
+    pub fn metal4_slot_sites(&self) -> Vec<crate::residency_class::SlotSite> {
+        self.commands.metal4_slot_sites()
     }
 
     /// A handle to the residency set that outlives this device.

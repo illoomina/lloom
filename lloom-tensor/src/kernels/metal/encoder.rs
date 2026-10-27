@@ -2,7 +2,7 @@ use crate::kernels::metal::{
     arena,
     contention::{Censused, Side},
     executor::{DispatchAction, DispatchRecord, ExecutorSlot, Grid},
-    late_bind, trace, Buffer, ComputePipeline, Fence,
+    late_bind, trace, Buffer, ComputePipeline, DeviceListing, Fence,
 };
 use objc2::{rc::Retained, runtime::ProtocolObject};
 use objc2_foundation::{NSRange, NSString};
@@ -1990,10 +1990,10 @@ impl ComputeCommandEncoder {
                 self.executor.will_bind_buffer(index, buf, offset, false);
             }
         }
-        let covered = buffer.is_some_and(Buffer::device_listed);
+        let listing = buffer.map_or(DeviceListing::No, Buffer::device_listing);
         unsafe {
             self.raw
-                .setBuffer_offset_atIndex(native, offset, index, covered)
+                .setBuffer_offset_atIndex(native, offset, index, listing)
         }
     }
 
@@ -2066,10 +2066,10 @@ impl ComputeCommandEncoder {
                 self.executor.will_bind_buffer(index, buf, offset, true);
             }
         }
-        let covered = buffer.is_some_and(Buffer::device_listed);
+        let listing = buffer.map_or(DeviceListing::No, Buffer::device_listing);
         unsafe {
             self.raw
-                .setBuffer_offset_atIndex(native, offset, index, covered)
+                .setBuffer_offset_atIndex(native, offset, index, listing)
         }
     }
 
@@ -2159,13 +2159,12 @@ impl ComputeCommandEncoder {
             crate::kernels::metal::hazard_audit::record_binding(self.raw.audit_id(), &range, false);
         }
         unsafe {
-            self.raw
-                .setBuffer_offset_atIndex(
-                    Some(buffer.raw_unchecked()),
-                    0,
-                    index,
-                    buffer.device_listed(),
-                )
+            self.raw.setBuffer_offset_atIndex(
+                Some(buffer.raw_unchecked()),
+                0,
+                index,
+                buffer.device_listing(),
+            )
         }
         // The staging buffer must stay alive until the dispatch it feeds has
         // completed, not merely until it is encoded. It is parked here and

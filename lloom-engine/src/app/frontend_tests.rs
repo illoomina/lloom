@@ -349,7 +349,8 @@ fn batch_for(r: &frontend::Row) -> Vec<&'static str> {
 fn qwen4exp_placeholder() -> &'static str {
     static PATH: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
     PATH.get_or_init(|| {
-        let dir = std::env::temp_dir().join(format!("lloom-frontend-qwen4exp-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("lloom-frontend-qwen4exp-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("placeholder.gguf");
         std::fs::write(&file, "").unwrap();

@@ -826,9 +826,19 @@ mod tests {
             library.clone()
         };
         for f in [Frontend::Chat, Frontend::Serve] {
-            assert_eq!(at(f, Some(&qwen), "metal"), qwen_default, "{} qwen", f.name());
+            assert_eq!(
+                at(f, Some(&qwen), "metal"),
+                qwen_default,
+                "{} qwen",
+                f.name()
+            );
             assert_eq!(at(f, None, "metal"), library, "{} lfm2", f.name());
-            assert_eq!(at(f, Some(&other), "metal"), library, "{} lfm2-gguf", f.name());
+            assert_eq!(
+                at(f, Some(&other), "metal"),
+                library,
+                "{} lfm2-gguf",
+                f.name()
+            );
             assert_eq!(at(f, Some(&qwen), "cpu"), library, "{} --cpu", f.name());
         }
         assert_eq!(at(Frontend::Bench, Some(&qwen), "metal"), library, "bench");

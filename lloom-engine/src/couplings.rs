@@ -965,11 +965,13 @@ mod tests {
                 frontend::apply(&mut o, f, &Default::default(), &Default::default()).unwrap();
                 let on = f != Frontend::Bench && model.is_some() && When::Qwen4Exp.holds(&o);
                 let want: Vec<String> = if on {
-                    vec!["kernels.residency.metal4 -> the device's residency sets on the Metal 4 \
+                    vec![
+                        "kernels.residency.metal4 -> the device's residency sets on the Metal 4 \
                           queue, each slot set listing only what they do not cover (chat's and \
                           serve's default for Qwen4-exp on Metal, decision 62) <- \
                           kernels.residency.metal4 = queue-diff (C23)"
-                        .into()]
+                            .into(),
+                    ]
                 } else {
                     vec![]
                 };
@@ -979,17 +981,21 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
         assert_eq!(
             c23(&with(&[("kernels.residency.metal4", "cb-full")])),
-            vec!["kernels.residency.metal4 = cb-full ignored <- backend.metal.command_buffer.api \
-                  = metal3: no slot sets (C23)"]
+            vec![
+                "kernels.residency.metal4 = cb-full ignored <- backend.metal.command_buffer.api \
+                  = metal3: no slot sets (C23)"
+            ]
         );
         assert_eq!(
             c23(&with(&[
                 ("kernels.residency.metal4", "cb-full"),
                 ("backend.metal.command_buffer.api", "metal4")
             ])),
-            vec!["kernels.residency.metal4 -> the device's residency sets used by each command \
+            vec![
+                "kernels.residency.metal4 -> the device's residency sets used by each command \
                   buffer, each slot set listing every binding (a control) <- \
-                  kernels.residency.metal4 = cb-full (C23)"]
+                  kernels.residency.metal4 = cb-full (C23)"
+            ]
         );
     }
 }

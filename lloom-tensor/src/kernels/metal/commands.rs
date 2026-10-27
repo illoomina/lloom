@@ -450,9 +450,13 @@ struct ClosedEncoders<'a> {
     cancelled: Vec<CommandBuffer>,
     // This acquisition published residency for a commit already.
     residency_published: bool,
-    // Last: closed wrappers can hand their fields to this same hold before
-    // its existing completed-prefix drain runs. No release occurs under state.
+    // After the closed wrappers: they can hand their fields to this same hold
+    // before its existing completed-prefix drain runs. No release occurs
+    // under state.
     completed_hold: Option<CompletedRelease<'a, Held>>,
+    // Last: the release a producer left to this holder, once every payload
+    // above is gone (`produced::AfterUnlock`).
+    _after_unlock: Option<produced::AfterUnlock<'a>>,
 }
 
 type EntryGuard<'a> = DeferredGuard<parking_lot::MutexGuard<'a, EntryState>, ClosedEncoders<'a>>;
@@ -2547,30 +2551,42 @@ impl Commands {
         cb: &CommandBuffer,
     ) -> Result<Option<Option<u64>>, MetalKernelError> {
         let mut state = self.lock_state()?;
-        if !state.held.is_empty() || !state.gate.is_empty() {
-            self.core.release_produced_locked(&mut state)?;
-        }
-        if state.held.iter().any(|held| held.cb.same_recording(cb)) {
-            return Ok(None);
-        }
-        if state
-            .current
-            .recording()
-            .is_some_and(|current| current.same_recording(cb))
-        {
-            if !(state.held.is_empty() && state.gate.is_open()) {
+        loop {
+            if !state.held.is_empty()
+                || !state.gate.is_empty()
+                || self.core.produced_cancel_pending()
+            {
+                self.core.release_produced_locked(&mut state)?;
+            }
+            if state.held.iter().any(|held| held.cb.same_recording(cb)) {
                 return Ok(None);
             }
-            if !state.gate.is_empty() {
-                state.gate = produced::Gate::default();
-                self.core.held_live_update(&state);
+            if !state.current_abandoned
+                && state
+                    .current
+                    .recording()
+                    .is_some_and(|current| current.same_recording(cb))
+            {
+                if !(state.held.is_empty() && state.gate.is_open()) {
+                    return Ok(None);
+                }
+                // The gate's look, then the flag: a cancellation asked for
+                // before the event moved is applied before this commit.
+                std::sync::atomic::fence(Ordering::SeqCst);
+                if self.core.produced_cancel_pending() {
+                    continue;
+                }
+                if !state.gate.is_empty() {
+                    state.gate = produced::Gate::default();
+                    self.core.held_live_update(&state);
+                }
+                return self
+                    .core
+                    .commit_current_locked(&mut state, None)
+                    .map(|receipt| Some(receipt.signalled));
             }
-            return self
-                .core
-                .commit_current_locked(&mut state, None)
-                .map(|receipt| Some(receipt.signalled));
+            return self.recover_unheld_locked(&mut state, cb).map(Some);
         }
-        self.recover_unheld_locked(&mut state, cb).map(Some)
     }
 
     fn recover_unheld_locked(
@@ -2710,6 +2726,20 @@ impl CommandsCore {
     fn lock_entry(&self) -> Result<EntryGuard<'_>, MetalKernelError> {
         self.state
             .lock_checked(Side::Host, || self.refuse_park_in_callback())
+            .map(|guard| {
+                let custody = ClosedEncoders {
+                    _after_unlock: Some(produced::AfterUnlock(self)),
+                    ..ClosedEncoders::default()
+                };
+                DeferredGuard::new(guard, custody)
+            })
+    }
+
+    /// The state lock when it is free, for a producer's release: its caller
+    /// runs what producers left pending itself (`produced::release_pending`).
+    fn try_lock_entry_unhooked(&self) -> Option<EntryGuard<'_>> {
+        self.state
+            .try_lock()
             .map(|guard| DeferredGuard::new(guard, ClosedEncoders::default()))
     }
 

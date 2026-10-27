@@ -571,6 +571,9 @@ fn load_on<P: QwenShape>(
     admission: LoadAdmission,
 ) -> Result<Engines<P>> {
     lloom_tensor::memory_admission::begin_model_load();
+    // The width a prefill forward takes, for the admission and the driver
+    // alike (`prefill.pair_forward`).
+    opts.prefill_tile = lloom::models::qwen4exp::forward_tile(opts.prefill_tile);
     {
         // The DFlash drafter's directory and config first: the slot plan
         // claims what it will hold beside the experts.

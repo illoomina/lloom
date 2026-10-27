@@ -605,6 +605,9 @@ pub struct Qwen4ExpTuning {
         env = "QWEN4EXP_PREFILL_TILES",
         parser = "parse_at_least_two", path = "prefill.tiles_in_flight", status = "advanced", facets = ["lead"], flows = ["prompt-in", "commands-out"])]
     pub prefill_tiles: usize,
+    /// The served driver hands this family `prefill.tiles_in_flight` chunks a forward when its tile is the chunk, so the paired prefill runs inside one forward (off = one tile a forward, which never pairs).
+    #[opt(flag = "prefill-pair-forward", env = "QWEN4EXP_PREFILL_PAIR_FORWARD", bool, path = "prefill.pair_forward", status = "arm", facets = ["lead"], flows = ["prompt-in", "weights-in"])]
+    pub prefill_pair_forward: bool,
     /// Speculate the next layer's routing ahead: 0 (off) or 1.
     #[opt(flag = "spec-ahead", env = "QWEN4EXP_SPEC_AHEAD", parser = "parse_spec_ahead", variants = ["0", "1"], path = "weights.experts.route_ahead_layers", status = "arm", facets = ["lead"], flows = ["weights-in"])]
     pub spec_ahead: usize,
@@ -739,6 +742,7 @@ impl Default for Qwen4ExpTuning {
             prefill_chunk: 0,
             prefill_pair: crate::models::qwen4exp::DEFAULT_PREFILL_PAIR,
             prefill_tiles: crate::models::qwen4exp::DEFAULT_PREFILL_TILES,
+            prefill_pair_forward: false,
             spec_ahead: 0,
             mem_check: "refuse".into(),
             score_no_matmul: false,

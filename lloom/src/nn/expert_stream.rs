@@ -5640,10 +5640,10 @@ mod tests {
         assert!(lloom_tensor::kernels::metal::profile::enabled());
         let m = dev.as_metal_device().unwrap().clone();
         let census = |f: &mut dyn FnMut() -> Vec<f32>| -> (Vec<f32>, u64, u64) {
-            m.wait_until_completed().unwrap();
+            dev.synchronize().unwrap();
             let w = m.dispatch_census().open().unwrap();
             let y = f();
-            m.wait_until_completed().unwrap();
+            dev.synchronize().unwrap();
             let c = w.close();
             let n = |label: &str| -> u64 {
                 c.iter()
@@ -5767,7 +5767,7 @@ mod tests {
             .unwrap();
             t.set_landing_gather(true);
             t.set_landing_commit(commit);
-            m.wait_until_completed().unwrap();
+            dev.synchronize().unwrap();
             let _hold = held.then(|| dev.cut_period_hold(usize::MAX));
             profile::reset();
             let y = run(&t, &xs, &id);

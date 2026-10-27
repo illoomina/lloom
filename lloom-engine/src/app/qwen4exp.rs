@@ -1048,6 +1048,7 @@ impl<P: QwenShape, R: ExpertResidency + HasStreamStats + Send + Sync + 'static> 
             "slots_per_layer": self.core.model.slots_per_layer(),
             "plans": s.plans, "groups": s.groups, "hits": s.hits, "misses": s.misses,
             "evictions": s.evictions, "bytes_loaded": s.bytes_loaded,
+            "landing_launches": s.landing_launches,
             "hit_rate": s.hits as f64 / (s.hits + s.misses).max(1) as f64,
             "staging": { "buffers": st.buffers, "bytes": st.bytes, "allocations": st.allocations,
                           "reuses": st.reuses, "overflows": st.overflows },

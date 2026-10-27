@@ -439,6 +439,9 @@ pub struct StreamTuning {
     /// The command-buffer cut period held while a tier lands the experts it loaded: each plane lands as its own copy dispatch, and at the shipping period (50) a missing pool cuts a buffer every ~17 experts. `0` = the period in force; a larger value is held for the landing (never lowering a longer one in force), and the first encode after it cuts once.
     #[opt(flag = "landing-cut", env = "QWEN4EXP_LANDING_CUT", path = "weights.experts.landing_cut_period", status = "arm", facets = ["cadence"], flows = ["weights-in", "commands-out"])]
     pub landing_cut: usize,
+    /// Land a group's staged experts with one copy launch per pool, its sources read through a table of GPU addresses, instead of one copy dispatch per plane (Metal; the same bytes; planes that are not whole words land one a plane).
+    #[opt(flag = "landing-gather", env = "QWEN4EXP_LANDING_GATHER", bool, path = "weights.experts.landing_gather", status = "arm", facets = ["cadence"], flows = ["weights-in", "commands-out"])]
+    pub landing_gather: bool,
     /// Spike 0 of fetch-and-wait: `wait` = a GPU wait on an already-raised event at every device-planned layer's join point (an instrument; off = none).
     #[opt(flag = "spike0", env = "QWEN4EXP_SPIKE0", parser = "parse_spike0", variants = ["off", "wait"], path = "diagnostics.experts.spike0", status = "instrument")]
     pub spike0: String,
@@ -498,6 +501,7 @@ impl Default for StreamTuning {
             spare_slots: 0,
             settle_batch: true,
             landing_cut: 0,
+            landing_gather: false,
             spike0: "off".into(),
             trace_settle: false,
             fetch: "off".into(),

@@ -200,7 +200,7 @@ pub const COUPLINGS: &[Coupling] = &[
         id: "C20",
         kind: "ignored",
         when: "kernels.gemm.f16_rows off, determinism = deterministic, scheduler.max_sequences = 1, the CPU backend, or a batched step with more live rows than kernels.gemm.f16_rows_max",
-        effect: "kernels.gemm.f16_rows_decode has no effect: the step's matmuls take the GEMM (the GEMV at one row; the one-row reduction per row under deterministic). Under fast a step with prompt pieces puts its live rows on the decode route and its pieces on the GEMM, so a row's route, and so its bits, changes only where a decode step's live rows cross 1 and kernels.gemm.f16_rows_max: the step's two route seams. serve and bench default the arm on only at scheduler.max_sequences up to kernels.gemm.f16_rows_max, where no step crosses the ceiling",
+        effect: "kernels.gemm.f16_rows_decode has no effect: the step's matmuls take the GEMM (the GEMV at one row; the one-row reduction per row under deterministic). Under fast a step with prompt pieces puts its live rows on the decode route and its pieces on the GEMM, so a row's route, and so its bits, changes only where a decode step's live rows cross 1 and kernels.gemm.f16_rows_max: the step's two route seams. serve and bench default the arm on only at scheduler.max_sequences up to kernels.gemm.f16_rows_max (12 there on Metal, decision 60), where no step crosses the ceiling",
         keys: &["kernels.gemm.f16_rows_decode", "kernels.gemm.f16_rows", "kernels.gemm.f16_rows_max", "determinism", "scheduler.max_sequences", "backend.device"],
         site: "lloom-tensor/src/kernels/kernels/mlx_gemm.rs f16_rows_route, f16_rows_lead; lloom/src/nn/batched.rs BatchDecoder::forward_live (tuning::DecodeRows), BatchDecoder::forward_ragged_live (tuning::RaggedDecodeRows)",
         is_static: false,
@@ -427,34 +427,46 @@ pub fn explain(o: &EngineOptions) -> Vec<String> {
         out.push(line);
     }
     let g = &o.tuning.gemm;
+    let rows_cause = if o.tuning.contract.profile == "deterministic" {
+        Some("determinism = deterministic")
+    } else if !g.f16_rows {
+        Some("kernels.gemm.f16_rows = false")
+    } else if !cfg!(feature = "metal") || o.load.device == "cpu" {
+        Some("the CPU backend")
+    } else if o.scheduler.max_sequences <= 1 {
+        Some("scheduler.max_sequences = 1")
+    } else {
+        None
+    };
+    let default_batch = format!(
+        "serve and bench turn it on by default at a batch of 2 to {} sequences",
+        g.f16_rows_max
+    );
     if g.f16_rows_decode {
-        let cause = if o.tuning.contract.profile == "deterministic" {
-            Some("determinism = deterministic")
-        } else if !g.f16_rows {
-            Some("kernels.gemm.f16_rows = false")
-        } else if !cfg!(feature = "metal") || o.load.device == "cpu" {
-            Some("the CPU backend")
-        } else if o.scheduler.max_sequences <= 1 {
-            Some("scheduler.max_sequences = 1")
-        } else {
-            None
-        };
-        out.push(match cause {
+        out.push(match rows_cause {
             Some(c) => format!("kernels.gemm.f16_rows_decode ignored <- {c} (C20)"),
             None if o.scheduler.max_sequences > g.f16_rows_max => format!(
                 "kernels.gemm.f16_rows_decode: a decode step of 2 to {} live rows (1 to {} beside \
                  prompt pieces) takes the row axis, of more the GEMM; a batch of {} sequences \
                  crosses the ceiling, so a row's route follows how many rows its steps hold, \
-                 which follows the requests' arrival <- kernels.gemm.f16_rows_max (C20)",
+                 which follows the requests' arrival; {default_batch} <- \
+                 kernels.gemm.f16_rows_max (C20)",
                 g.f16_rows_max, g.f16_rows_max, o.scheduler.max_sequences
             ),
             None => format!(
                 "kernels.gemm.f16_rows_decode: a decode step of 2 to {} live rows (1 to {} beside \
-                 prompt pieces) takes the row axis, of more the GEMM <- kernels.gemm.f16_rows_max \
-                 (C20)",
+                 prompt pieces) takes the row axis, of more the GEMM; {default_batch} <- \
+                 kernels.gemm.f16_rows_max (C20)",
                 g.f16_rows_max, g.f16_rows_max
             ),
         });
+    } else if rows_cause.is_none() && o.scheduler.max_sequences > g.f16_rows_max {
+        out.push(format!(
+            "kernels.gemm.f16_rows_decode off: {default_batch}, and a batch of {} is past the \
+             ceiling, where a row's route would follow the requests' arrival <- \
+             kernels.gemm.f16_rows_max (C20)",
+            o.scheduler.max_sequences
+        ));
     }
     if g.f16_rows_round {
         let cause = if o.tuning.contract.profile == "deterministic" {
@@ -779,7 +791,22 @@ mod tests {
                 at_batch,
                 vec![
                     "kernels.gemm.f16_rows_decode: a decode step of 2 to 10 live rows (1 to 10 \
-                      beside prompt pieces) takes the row axis, of more the GEMM <- \
+                      beside prompt pieces) takes the row axis, of more the GEMM; serve and bench \
+                      turn it on by default at a batch of 2 to 10 sequences <- \
+                      kernels.gemm.f16_rows_max (C20)"
+                ]
+            );
+            // Decision 60's ceiling, as serve and bench resolve it.
+            assert_eq!(
+                c20(&[
+                    ("kernels.gemm.f16_rows_decode", "true"),
+                    ("kernels.gemm.f16_rows_max", "12"),
+                    ("scheduler.max_sequences", "12"),
+                ]),
+                vec![
+                    "kernels.gemm.f16_rows_decode: a decode step of 2 to 12 live rows (1 to 12 \
+                      beside prompt pieces) takes the row axis, of more the GEMM; serve and bench \
+                      turn it on by default at a batch of 2 to 12 sequences <- \
                       kernels.gemm.f16_rows_max (C20)"
                 ]
             );
@@ -798,8 +825,8 @@ mod tests {
                     "kernels.gemm.f16_rows_decode: a decode step of 2 to 10 live rows (1 to 10 \
                       beside prompt pieces) takes the row axis, of more the GEMM; a batch of 16 \
                       sequences crosses the ceiling, so a row's route follows how many rows its \
-                      steps hold, which follows the requests' arrival <- \
-                      kernels.gemm.f16_rows_max (C20)"
+                      steps hold, which follows the requests' arrival; serve and bench turn it on \
+                      by default at a batch of 2 to 10 sequences <- kernels.gemm.f16_rows_max (C20)"
                 ]
             );
         }
@@ -827,6 +854,24 @@ mod tests {
             c20(&[("scheduler.max_sequences", "4")]).is_empty(),
             "the arm off"
         );
+        // Off past the ceiling: the default batch it would take, named.
+        let past = c20(&[
+            ("kernels.gemm.f16_rows_max", "12"),
+            ("scheduler.max_sequences", "13"),
+        ]);
+        if cfg!(feature = "metal") {
+            assert_eq!(
+                past,
+                vec![
+                    "kernels.gemm.f16_rows_decode off: serve and bench turn it on by default at a \
+                      batch of 2 to 12 sequences, and a batch of 13 is past the ceiling, where a \
+                      row's route would follow the requests' arrival <- kernels.gemm.f16_rows_max \
+                      (C20)"
+                ]
+            );
+        } else {
+            assert!(past.is_empty(), "{past:?}");
+        }
         // C22: the capacity rounding names what it does where the row axis
         // runs, and its cause where it does not.
         let c22 = |sets: &[(&str, &str)]| -> Vec<String> {

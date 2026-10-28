@@ -19,8 +19,8 @@ use std::borrow::{Borrow, BorrowMut};
 
 use crate::generation::{HotThread, Sampling};
 use crate::nn::decode::{
-    begin_pass, end_executor_step, end_pass, ragged_layout, DecodeOptions, DecodeOut, DecodeStats,
-    PassShape, PrefillWork, RoundStats, StepPacer,
+    end_executor_step, ragged_layout, DecodeOptions, DecodeOut, DecodeStats, OpenPass, PassShape,
+    PrefillWork, RoundStats, StepPacer,
 };
 use crate::nn::model::BatchedCausalLM;
 use crate::nn::speculator::{
@@ -297,9 +297,9 @@ where
             layout: ragged_layout(rows.iter().map(|_| (k + 1, false))),
         };
         self.pacer.before_forward(&self.device)?;
-        begin_pass(&self.device, shape)?;
+        let pass = OpenPass::begin(&self.device, shape)?;
         let pending = model.verify_rows_enqueue(&mut rows);
-        end_pass(&self.device)?;
+        pass.close(&pending)?;
         self.pacer.after_forward(&self.device)?;
         let pending = pending?;
         drop(rows);

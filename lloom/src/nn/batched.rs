@@ -33,8 +33,8 @@ use std::borrow::{Borrow, BorrowMut};
 
 use crate::generation::{HotThread, LogitsProcessor, Sampling};
 use crate::nn::decode::{
-    begin_pass, end_executor_step, end_pass, ladder_width, ragged_layout, tile_widths,
-    DecodeOptions, DecodeOut, DecodeStats, PassShape, PassWidths, StepPacer,
+    end_executor_step, ladder_width, ragged_layout, tile_widths, DecodeOptions, DecodeOut,
+    DecodeStats, OpenPass, PassShape, PassWidths, StepPacer,
 };
 use crate::nn::model::{BatchedCausalLM, RaggedRow, Row};
 use crate::nn::speculator::Session;
@@ -942,7 +942,7 @@ impl<'m, M: BatchedCausalLM, R: BorrowMut<Session<'m, M>>> BatchDecoder<'m, M, R
                 let input = Tensor::new(unit, &device)?.unsqueeze(0)?;
                 s.model.prepare_pass(&mut s.seq.cache, w)?;
                 self.pacer.before_forward(&device)?;
-                begin_pass(
+                let pass = OpenPass::begin(
                     &device,
                     PassShape::Prefill {
                         w,
@@ -953,7 +953,7 @@ impl<'m, M: BatchedCausalLM, R: BorrowMut<Session<'m, M>>> BatchDecoder<'m, M, R
                     let _prefill = lloom_tensor::tuning::VerifyWindow::prefill();
                     s.model.forward(&input, s.seq.pos, &mut s.seq.cache)
                 };
-                end_pass(&device)?;
+                pass.close(&out)?;
                 self.pacer.after_forward(&device)?;
                 last = Some(out?);
                 s.seq.pos += w;
@@ -1483,7 +1483,7 @@ impl<'m, M: BatchedCausalLM, R: BorrowMut<Session<'m, M>>> BatchDecoder<'m, M, R
         clock.lap(&mut ph.prepare_ns);
         self.pacer.before_forward(input.device())?;
         clock.lap(&mut ph.pace_ns);
-        begin_pass(input.device(), shape)?;
+        let pass = OpenPass::begin(input.device(), shape)?;
         let logits = {
             // The live rows lead the input and the head: under
             // `kernels.gemm.f16_rows_decode` they take a decode step's route
@@ -1497,7 +1497,7 @@ impl<'m, M: BatchedCausalLM, R: BorrowMut<Session<'m, M>>> BatchDecoder<'m, M, R
             });
             model.forward_ragged(input, &mut rows)
         }?;
-        end_pass(input.device())?;
+        pass.finish()?;
         clock.lap(&mut ph.encode_ns);
         self.pacer.after_forward(input.device())?;
         drop(rows);
@@ -1546,14 +1546,14 @@ impl<'m, M: BatchedCausalLM, R: BorrowMut<Session<'m, M>>> BatchDecoder<'m, M, R
         clock.lap(&mut ph.prepare_ns);
         self.pacer.before_forward(input.device())?;
         clock.lap(&mut ph.pace_ns);
-        begin_pass(input.device(), PassShape::Decode { b: live.len() })?;
+        let pass = OpenPass::begin(input.device(), PassShape::Decode { b: live.len() })?;
         let logits = {
             // One token per live row: the step `kernels.gemm.f16_rows_decode`
             // routes (`tuning::DecodeRows`).
             let _rows = lloom_tensor::tuning::DecodeRows::open();
             model.forward_rows(input, &mut rows)
         }?;
-        end_pass(input.device())?;
+        pass.finish()?;
         clock.lap(&mut ph.encode_ns);
         self.pacer.after_forward(input.device())?;
         drop(rows);

@@ -224,7 +224,7 @@ pub const COUPLINGS: &[Coupling] = &[
         is_static: false,
     },
     Coupling {
-        id: "C23",
+        id: "C24",
         kind: "resolves",
         when: "kernels.residency.metal4 other than slots, or the model is Qwen4-exp on chat or serve",
         effect: "what a Metal 4 command buffer declares resident: the device's residency sets on the Metal 4 queue (queue-*) or used by each command buffer (cb-*), and under *-diff its slot set lists only what they do not cover. chat and serve take queue-diff for Qwen4-exp on Metal (decision 62), slots elsewhere; on Metal 3 there are no slot sets and the arm has no effect",
@@ -542,7 +542,7 @@ fn metal4_declaration(o: &EngineOptions) -> Option<String> {
     if o.tuning.metal.command_api == "metal3" {
         return Some(format!(
             "kernels.residency.metal4 = {arm} ignored <- backend.metal.command_buffer.api = \
-             metal3: no slot sets (C23)"
+             metal3: no slot sets (C24)"
         ));
     }
     let sets = if arm.starts_with("queue") {
@@ -562,7 +562,7 @@ fn metal4_declaration(o: &EngineOptions) -> Option<String> {
     };
     Some(format!(
         "kernels.residency.metal4 -> {sets}, {lists}{default} <- kernels.residency.metal4 = \
-         {arm} (C23)"
+         {arm} (C24)"
     ))
 }
 
@@ -986,20 +986,20 @@ mod tests {
         assert!(c21(&with(&[("kernels.residency.attach", "queue")])).is_empty());
     }
 
-    /// C23 at `slots` says nothing; on a Qwen4-exp checkpoint chat's and
+    /// C24 at `slots` says nothing; on a Qwen4-exp checkpoint chat's and
     /// serve's default names decision 62; on LFM2 neither prints; the arm on
     /// Metal 3 is named as ignored, and a control is named as one.
     #[test]
-    fn c23_names_the_metal4_declaration() {
+    fn c24_names_the_metal4_declaration() {
         use crate::frontend::{self, Frontend, When};
-        let c23 = |o: &EngineOptions| -> Vec<String> {
+        let c24 = |o: &EngineOptions| -> Vec<String> {
             explain(o)
                 .into_iter()
-                .filter(|l| l.ends_with("(C23)"))
+                .filter(|l| l.ends_with("(C24)"))
                 .collect()
         };
-        assert!(c23(&EngineOptions::default()).is_empty(), "the library's");
-        let dir = std::env::temp_dir().join(format!("lloom-c23-{}", std::process::id()));
+        assert!(c24(&EngineOptions::default()).is_empty(), "the library's");
+        let dir = std::env::temp_dir().join(format!("lloom-c24-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let qwen = dir.join("qwen4exp.gguf");
         std::fs::write(&qwen, "").unwrap();
@@ -1014,32 +1014,32 @@ mod tests {
                         "kernels.residency.metal4 -> the device's residency sets on the Metal 4 \
                           queue, each slot set listing only what they do not cover (chat's and \
                           serve's default for Qwen4-exp on Metal, decision 62) <- \
-                          kernels.residency.metal4 = queue-diff (C23)"
+                          kernels.residency.metal4 = queue-diff (C24)"
                             .into(),
                     ]
                 } else {
                     vec![]
                 };
-                assert_eq!(c23(&o), want, "{} {model:?}", f.name());
+                assert_eq!(c24(&o), want, "{} {model:?}", f.name());
             }
         }
         std::fs::remove_dir_all(&dir).unwrap();
         assert_eq!(
-            c23(&with(&[("kernels.residency.metal4", "cb-full")])),
+            c24(&with(&[("kernels.residency.metal4", "cb-full")])),
             vec![
                 "kernels.residency.metal4 = cb-full ignored <- backend.metal.command_buffer.api \
-                  = metal3: no slot sets (C23)"
+                  = metal3: no slot sets (C24)"
             ]
         );
         assert_eq!(
-            c23(&with(&[
+            c24(&with(&[
                 ("kernels.residency.metal4", "cb-full"),
                 ("backend.metal.command_buffer.api", "metal4")
             ])),
             vec![
                 "kernels.residency.metal4 -> the device's residency sets used by each command \
                   buffer, each slot set listing every binding (a control) <- \
-                  kernels.residency.metal4 = cb-full (C23)"
+                  kernels.residency.metal4 = cb-full (C24)"
             ]
         );
     }

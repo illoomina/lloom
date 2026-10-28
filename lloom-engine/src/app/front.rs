@@ -214,6 +214,12 @@ pub struct Constants {
     pub groups_tools: bool,
     /// The family's reasoning tags (`Text::think_tags`).
     pub tags: Option<ThinkTags>,
+    /// The text the template writes to end an assistant turn, and the single
+    /// id it encodes to: the end-of-turn token. `None` where the template's
+    /// ending is not one token, or does not encode to the id the model would
+    /// have sampled. A matched turn's span runs through it
+    /// ([`emit_turn`]).
+    eot: Option<(u32, String)>,
 }
 
 impl Constants {
@@ -226,7 +232,13 @@ impl Constants {
             open: None,
             groups_tools: false,
             tags: None,
+            eot: None,
         }
+    }
+
+    /// The end-of-turn token: its id and the text the template writes for it.
+    pub fn eot(&self) -> Option<(u32, &str)> {
+        self.eot.as_ref().map(|(id, s)| (*id, s.as_str()))
     }
 
     /// The mode for `kwarg` × `want`: `Err` with the reason thinking on
@@ -413,6 +425,35 @@ impl Constants {
         })()
         .unwrap_or(false);
 
+        // The end-of-turn token: what the template writes after an assistant
+        // turn's body. Read by rendering one assistant turn whose content is
+        // a probe, and taking what follows the probe up to the next message's
+        // opening. It counts only if it encodes to exactly one id, and that
+        // id is one of the checkpoint's EOS ids — then it is the token the
+        // model itself samples to end a turn, so a matched turn's span may run
+        // through it (`emit_turn`).
+        let eot = (|| {
+            let two = json!([
+                user,
+                json!({ "role": "assistant", "content": PROBE_ANSWER })
+            ]);
+            let s = render(&two, &Map::new(), false)?;
+            let at = s.rfind(PROBE_ANSWER)? + PROBE_ANSWER.len();
+            let rest = &s[at..];
+            // The template's own ending for the turn, before any next
+            // message's opening and without the whitespace that follows it.
+            let marker = match open.as_deref().and_then(|o| rest.find(o)) {
+                Some(i) => &rest[..i],
+                None => rest,
+            }
+            .trim_end();
+            let ids = enc(marker)?;
+            match ids.as_slice() {
+                [id] if text.eos_ids.contains(id) => Some((*id, marker.to_string())),
+                _ => None,
+            }
+        })();
+
         Self {
             modes,
             effort,
@@ -421,6 +462,7 @@ impl Constants {
             open,
             groups_tools,
             tags,
+            eot,
         }
     }
 }
@@ -536,6 +578,14 @@ enum Matched {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Scope([u8; 32]);
 
+#[cfg(test)]
+impl Scope {
+    /// A scope no conversation hashes to, for a test of what keeps them.
+    pub(crate) fn test(n: u8) -> Self {
+        Self([n; 32])
+    }
+}
+
 /// What a reply is logged against: its scope, and the thinking of the
 /// prompt it followed (where its reasoning block starts).
 #[derive(Debug, Clone, Copy)]
@@ -606,6 +656,22 @@ fn keys(reply: &Reply) -> impl Iterator<Item = &str> {
         .filter(|k| !k.is_empty())
 }
 
+/// How a bound reply's own text is the message's `key`: whole (surrounding
+/// whitespace aside) or its content; `None` where it is neither — a message
+/// the client restructured or edited.
+fn bound_how(reply: &Reply, key: &str) -> Option<Matched> {
+    let key = key.trim();
+    if key.is_empty() {
+        None
+    } else if reply.text.trim() == key {
+        Some(Matched::Full)
+    } else if reply.content_text.trim() == key {
+        Some(Matched::Content)
+    } else {
+        None
+    }
+}
+
 /// The replies one key of one scope names. More than one distinct reply (a
 /// regeneration that sampled other ids or other reasoning) leaves the text
 /// ambiguous for as long as any of them is logged.
@@ -646,8 +712,9 @@ struct ReplyLog {
 }
 
 impl ReplyLog {
-    fn insert(&mut self, scope: Scope, reply: Reply) {
+    fn insert(&mut self, scope: Scope, reply: Reply) -> Arc<Reply> {
         let reply = Arc::new(reply);
+        let kept = Arc::clone(&reply);
         self.tokens += reply.ids.len();
         let texts = self.by_scope.entry(scope).or_default();
         for key in keys(&reply) {
@@ -676,6 +743,7 @@ impl ReplyLog {
             };
             self.forget(old);
         }
+        kept
     }
 
     fn forget(&mut self, old: Logged) {
@@ -785,6 +853,55 @@ pub struct Spliced {
     /// reasoning field): whatever closes the block in the prompt is the
     /// template's text, not a sampled id.
     pub open_apart: usize,
+    /// Matched replies rendered from the ids the model emitted — the whole
+    /// turn, in place of the template's rendering of it (decision 51 Q1).
+    pub emitted: usize,
+    /// Matched replies found by a session's reference — the conversation
+    /// before them is a stored turn's — rather than by their text
+    /// (`docs/sessions.md` §5.1).
+    pub bound: usize,
+}
+
+/// A stored turn's reply, bound by reference (`docs/sessions.md` §5.1): the
+/// assistant message whose conversation before it hashes to `scope` is this
+/// reply, whatever text the client sent for it.
+#[derive(Debug, Clone)]
+pub struct Bound {
+    pub scope: Scope,
+    pub reply: Arc<Reply>,
+}
+
+/// What a prompt records so that a turn continuing it takes its ids instead
+/// of tokenizing them (`docs/sessions.md` §5.1): the rendered text before the
+/// generation prompt's opening — a cut, so the ids before it do not depend on
+/// what follows — its digest, and the ids, openings and sampled runs before
+/// it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrefixRecord {
+    /// Bytes of rendered text before the generation prompt's opening.
+    pub text_len: usize,
+    digest: [u8; 32],
+    /// Prompt ids before that opening.
+    pub ids_len: usize,
+    /// Each opening before it: its text position and the ids before it.
+    cuts: Vec<(usize, usize)>,
+    /// The ids before it that were taken from logged replies.
+    sampled: Vec<Range<usize>>,
+}
+
+/// A request's binding to a stored session (`docs/sessions.md` §5.1).
+#[derive(Default)]
+pub struct ByRef<'a> {
+    /// The session's replies, each bound to the message at its scope.
+    pub bound: &'a [Bound],
+    /// The continued turn's prefix and the session's ids it indexes.
+    pub prefix: Option<(&'a PrefixRecord, &'a [u32])>,
+    /// Record this prompt's own prefix, for the turn after it.
+    pub record: bool,
+}
+
+fn text_digest(text: &str) -> [u8; 32] {
+    Sha256::digest(text.as_bytes()).into()
 }
 
 /// Where each message's rendering starts in the prompt's ids.
@@ -823,6 +940,16 @@ pub struct Prompt {
     pub renders: u64,
     /// What the reply to this prompt is logged against.
     pub origin: Origin,
+    /// Ids the tokenizer produced for this prompt.
+    pub encoded: usize,
+    /// Ids taken from a session's record instead of being tokenized
+    /// ([`ByRef::prefix`]).
+    pub recorded: usize,
+    /// This prompt's prefix, for a turn that continues it ([`ByRef::record`]).
+    pub record: Option<PrefixRecord>,
+    /// The scope before each message and after the last (`n + 1`): what a
+    /// session's turns are matched against (`docs/sessions.md` §2).
+    pub scopes: Vec<Scope>,
 }
 
 /// A prompt fitted to a budget by dropping its oldest turns.
@@ -842,6 +969,8 @@ pub struct Front {
     thinking_kwargs: [Option<bool>; 3],
     log: Mutex<ReplyLog>,
     tokenizations: AtomicU64,
+    /// Ids the tokenizer produced over every prompt.
+    tokenized: AtomicU64,
     /// The model and the template every scope is hashed under.
     context: [u8; 32],
 }
@@ -869,6 +998,7 @@ impl Front {
             }),
             log: Mutex::new(ReplyLog::default()),
             tokenizations: AtomicU64::new(0),
+            tokenized: AtomicU64::new(0),
             context: h.finalize().into(),
         }
     }
@@ -937,6 +1067,12 @@ impl Front {
         self.tokenizations.load(Ordering::Relaxed)
     }
 
+    /// Ids the tokenizer produced over every prompt so far: a prompt whose
+    /// history was taken from a session's record adds only what it encoded.
+    pub fn tokenized_ids(&self) -> u64 {
+        self.tokenized.load(Ordering::Relaxed)
+    }
+
     /// Replies the log holds.
     pub fn logged(&self) -> usize {
         self.log.lock().entries.len()
@@ -1003,6 +1139,41 @@ impl Front {
         })
     }
 
+    /// Whether the history's last message is a reply of ours whose run ended
+    /// inside its reasoning block (decision 51 Q3): then an opt-in strip is
+    /// suspended for that one request, so the model sees the thought it has
+    /// not finished. Looked up as the prompt looks a reply up — in the
+    /// message's own scope, by its text or the reasoning it gives apart — so a
+    /// reply the log does not hold, or another conversation's, does not
+    /// suspend anything.
+    fn last_reply_is_open(&self, c: &Constants, list: &[Value], scopes: &[Scope]) -> bool {
+        if c.tags.is_none() {
+            return false;
+        }
+        let Some((i, m)) = list.iter().enumerate().next_back() else {
+            return false;
+        };
+        if m.get("role").and_then(Value::as_str) != Some("assistant") {
+            return false;
+        }
+        let Some(&scope) = scopes.get(i) else {
+            return false;
+        };
+        let content = m.get("content").and_then(Value::as_str).unwrap_or("");
+        let key = if content.trim().is_empty() {
+            match reasoning_apart(m) {
+                Some(r) => r,
+                None => return false,
+            }
+        } else {
+            content
+        };
+        matches!(
+            self.log.lock().find(scope, key),
+            Found::One(reply, _) if matches!(reply.block, Block::Open { .. })
+        )
+    }
+
     /// The reason a `reasoning_effort` in `kwargs` is refused: the template
     /// does not read it, or renders the same prompt for any value of it.
     fn check_effort(
@@ -1020,6 +1191,12 @@ impl Front {
         let family = engine.capabilities().family;
         let why = match c.effort(kwarg) {
             Effort::Read => return Ok(()),
+            Effort::NotRead
+                if family == "lfm2-gguf" && matches!(value.as_str(), Some("none" | "default")) =>
+            {
+                eprintln!("[{family}: {REASONING_EFFORT}={value} ignored: the chat template does not read it]");
+                return Ok(());
+            }
             Effort::NotRead => format!("{family}'s chat template does not read {REASONING_EFFORT}"),
             Effort::NoEffect => format!(
                 "{family}'s chat template renders the same prompt for any {REASONING_EFFORT} with \
@@ -1033,6 +1210,21 @@ impl Front {
     /// Build a request's prompt: one render, one tokenization pass, the
     /// replies of ours its history carries taking the logged ids.
     pub fn prompt(&self, engine: &dyn Served, req: Request<'_>) -> Result<Prompt> {
+        self.prompt_by(engine, req, &ByRef::default())
+    }
+
+    /// [`Self::prompt`] for a request that continues a stored session
+    /// (`docs/sessions.md` §5.1): the session's replies are bound by the
+    /// conversation before them, not found by their text, and where the
+    /// rendered text up to the continued turn's reply is the text that turn
+    /// recorded, the recorded ids stand for it and only what follows is
+    /// tokenized.
+    pub fn prompt_by(
+        &self,
+        engine: &dyn Served,
+        req: Request<'_>,
+        by: &ByRef<'_>,
+    ) -> Result<Prompt> {
         self.check_effort(engine, &req.kwargs)
             .map_err(anyhow::Error::new)?;
         let (Some(text), Some(c)) = (engine.text(), self.constants.as_ref()) else {
@@ -1051,6 +1243,14 @@ impl Front {
         let scopes = self.scopes(sent, &req.kwargs);
         let mut kwargs = req.kwargs;
         if let (Some(p), false) = (self.persist(c), kwargs.contains_key(PRESERVE_THINKING)) {
+            // Decision 51 Q3: a request whose history ends in a thought the
+            // model did not finish renders with the reasoning kept, even under
+            // an opt-in strip — a stripped prompt would show the model an
+            // empty reply where its own unfinished thinking should be, and a
+            // "continue" turn would have lost it. No template has a per-message
+            // switch, so this keeps every past reply's reasoning, for this
+            // request alone.
+            let p = p || self.last_reply_is_open(c, list, &scopes);
             kwargs.insert(PRESERVE_THINKING.into(), Value::Bool(p));
         }
 
@@ -1085,19 +1285,54 @@ impl Front {
                 }
                 spliced.replies += 1;
                 let content = m.get("content").and_then(Value::as_str).unwrap_or("");
+                // A stored turn's reply is this message by the conversation
+                // before it. Where the text is the reply's own, it is handled
+                // as a match by text; where it is not (the client restructured
+                // or edited it), it goes as sent, nothing is restored into it,
+                // and its span takes the reply's ids only where the
+                // rendering carries the model's bytes (`emit_turn`,
+                // `align_reply`).
+                let bound = by
+                    .bound
+                    .iter()
+                    .find(|b| b.scope == scopes[i])
+                    .map(|b| Arc::clone(&b.reply));
+                let find = |key: &str| -> Found {
+                    match &bound {
+                        Some(r) => match bound_how(r, key) {
+                            Some(how) => Found::One(Arc::clone(r), how),
+                            None => Found::None,
+                        },
+                        None => log.find(scopes[i], key),
+                    }
+                };
+                let by_reference =
+                    |reply: &Arc<Reply>,
+                     spliced: &mut Spliced,
+                     matched: &mut Vec<(usize, Arc<Reply>, bool)>| {
+                        spliced.matched += 1;
+                        spliced.bound += 1;
+                        spliced.reply_tokens += reply.ids.len();
+                        spliced.open += usize::from(matches!(reply.block, Block::Open { .. }));
+                        matched.push((i, Arc::clone(reply), false));
+                    };
                 if content.trim().is_empty() {
                     // No content to find it by: a reply cut inside its
                     // reasoning given back with that reasoning apart, as
                     // the template reads it, is found by the reasoning.
                     // It goes as sent; only its ids are the logged ones.
                     let Some(reasoning) = reasoning_apart(m) else {
+                        if let Some(r) = &bound {
+                            by_reference(r, &mut spliced, &mut matched);
+                        }
                         continue;
                     };
-                    match log.find(scopes[i], reasoning) {
+                    match find(reasoning) {
                         Found::One(reply, Matched::Full)
                             if matches!(reply.block, Block::Open { .. }) =>
                         {
                             spliced.matched += 1;
+                            spliced.bound += usize::from(bound.is_some());
                             spliced.reply_tokens += reply.ids.len();
                             spliced.open += 1;
                             spliced.open_apart += 1;
@@ -1105,12 +1340,25 @@ impl Front {
                         }
                         Found::Ambiguous => spliced.ambiguous += 1,
                         Found::Elsewhere => spliced.unverified += 1,
-                        Found::One(..) | Found::None => {}
+                        Found::One(..) | Found::None => {
+                            if let Some(r) = &bound {
+                                by_reference(r, &mut spliced, &mut matched);
+                            }
+                        }
                     }
                     continue;
                 }
-                let (reply, how) = match log.find(scopes[i], content) {
-                    Found::One(reply, how) => (reply, how),
+                let (reply, how) = match find(content) {
+                    Found::One(reply, how) => {
+                        spliced.bound += usize::from(bound.is_some());
+                        (reply, how)
+                    }
+                    Found::None if bound.is_some() => {
+                        if let Some(r) = &bound {
+                            by_reference(r, &mut spliced, &mut matched);
+                        }
+                        continue;
+                    }
                     Found::Ambiguous => {
                         spliced.ambiguous += 1;
                         continue;
@@ -1185,29 +1433,77 @@ impl Front {
             .as_deref()
             .and_then(|open| text_blocks(&rendered, open, &shown, c.groups_tools));
 
-        // The logged replies' ids, aligned within each one's own span.
+        let cuts: Vec<usize> = text_blocks
+            .as_ref()
+            .map(|tb| tb.starts.clone())
+            .unwrap_or_default();
+        let keep_lp = self.options.keep != KeepLogprobs::None;
+        // The continued turn's recorded ids stand for the text before its
+        // reply where that text is, byte for byte, what the turn rendered:
+        // the ids before a cut are the text's encoding, whatever follows it.
+        let taken: Option<(&PrefixRecord, &[u32])> = by.prefix.filter(|(rec, src)| {
+            !keep_lp
+                && req.expand.is_none()
+                && cuts.contains(&rec.text_len)
+                && src.len() >= rec.ids_len
+                && text_digest(&rendered[..rec.text_len]) == rec.digest
+        });
+        let taken_text = taken.map_or(0, |(rec, _)| rec.text_len);
+
+        // The text of this request's generation prompt: where a past turn's
+        // opening is written the same way, the model's bytes begin after it.
+        let gen_text = match c.mode(
+            kwargs.get(ENABLE_THINKING).and_then(Value::as_bool),
+            req.want,
+        ) {
+            Some(Ok(m)) => decode(text, &m.template),
+            _ => None,
+        };
+
+        // The logged replies' ids in their own spans: the whole turn the model
+        // emitted (decision 51 Q1), or — where that span cannot be identified
+        // — aligned segment by segment inside the template's rendering of it.
         let mut runs: Vec<Run> = Vec::new();
         if let Some(tb) = &text_blocks {
             for (i, reply, apart) in &matched {
                 let Some(region) = tb.region(*i, rendered.len()) else {
                     continue;
                 };
+                if region.end <= taken_text {
+                    continue;
+                }
+                if emit_turn(
+                    text,
+                    &rendered,
+                    region.clone(),
+                    reply,
+                    c.eot(),
+                    gen_text.as_deref(),
+                    &mut runs,
+                ) {
+                    spliced.emitted += 1;
+                    continue;
+                }
                 align_reply(text, &rendered, region, reply, *apart, &mut runs);
             }
         }
         runs.sort_by_key(|r| r.text.start);
 
         // One pass over the text: gaps encoded, runs taken as logged.
-        let cuts: Vec<usize> = text_blocks
-            .as_ref()
-            .map(|tb| tb.starts.clone())
-            .unwrap_or_default();
         let mut ids: Vec<u32> = Vec::with_capacity(rendered.len() / 3);
         let mut logprobs: Vec<Option<f32>> = Vec::new();
-        let keep_lp = self.options.keep != KeepLogprobs::None;
         let mut cut_ids: Vec<(usize, usize)> = Vec::with_capacity(cuts.len());
         let mut sampled: Vec<Range<usize>> = Vec::with_capacity(runs.len());
         let mut pos = 0usize;
+        let mut recorded = 0usize;
+        if let Some((rec, src)) = taken {
+            ids.extend_from_slice(&src[..rec.ids_len]);
+            cut_ids.extend(rec.cuts.iter().copied());
+            sampled.extend(rec.sampled.iter().cloned());
+            pos = rec.text_len;
+            recorded = rec.ids_len;
+        }
+        let mut from_runs = 0usize;
         let encode_gap = |from: usize,
                           to: usize,
                           ids: &mut Vec<u32>,
@@ -1237,9 +1533,19 @@ impl Front {
             sampled.push(ids.len()..ids.len() + run.ids.len());
             ids.extend_from_slice(&run.reply.ids[run.ids.clone()]);
             spliced.spliced_tokens += run.ids.len();
+            from_runs += run.ids.len();
             if keep_lp {
+                // A run can carry one id the model did not sample — the
+                // end-of-turn token, which is the template's bytes for a
+                // position the session fed (`emit_turn`) — and that id has no
+                // logprob of its own. Take what the reply kept and leave the
+                // rest `None`, as every id the prompt encoded carries.
                 match &run.reply.logprobs {
-                    Some(lp) => logprobs.extend(lp[run.ids.clone()].iter().map(|&v| Some(v))),
+                    Some(lp) => {
+                        let have = run.ids.start.min(lp.len())..run.ids.end.min(lp.len());
+                        logprobs.extend(lp[have].iter().map(|&v| Some(v)));
+                        logprobs.resize(ids.len(), None);
+                    }
                     None => logprobs.resize(ids.len(), None),
                 }
             }
@@ -1247,6 +1553,8 @@ impl Front {
         }
         encode_gap(pos, rendered.len(), &mut ids, &mut logprobs, &mut cut_ids)?;
         self.tokenizations.fetch_add(1, Ordering::Relaxed);
+        let encoded = ids.len() - recorded - from_runs;
+        self.tokenized.fetch_add(encoded as u64, Ordering::Relaxed);
         let mut head_shift = 0;
         if req.add_bos {
             if let Some(bos) = text.bos_id {
@@ -1259,9 +1567,39 @@ impl Front {
                 }
             }
         }
+        // A taken prefix carries its own (shifted) positions.
+        let shift = |p: usize| if p < recorded { p } else { p + head_shift };
         for r in &mut sampled {
-            *r = r.start + head_shift..r.end + head_shift;
+            *r = shift(r.start)..shift(r.start) + r.len();
         }
+        for c in &mut cut_ids {
+            c.1 = shift(c.1);
+        }
+
+        // This prompt's prefix, for a turn that continues it: the text before
+        // the generation prompt's opening (the last one) and what stands
+        // for it.
+        let record = (by.record && req.expand.is_none() && !keep_lp)
+            .then(|| {
+                let gen_open = *cuts.last()?;
+                let ids_len = cut_ids.iter().find(|(c, _)| *c == gen_open)?.1;
+                Some(PrefixRecord {
+                    text_len: gen_open,
+                    digest: text_digest(&rendered[..gen_open]),
+                    ids_len,
+                    cuts: cut_ids
+                        .iter()
+                        .copied()
+                        .filter(|(c, _)| *c < gen_open)
+                        .collect(),
+                    sampled: sampled
+                        .iter()
+                        .filter(|r| r.end <= ids_len)
+                        .cloned()
+                        .collect(),
+                })
+            })
+            .flatten();
 
         // The thinking switch on the generation prompt's span.
         let kwarg = kwargs.get(ENABLE_THINKING).and_then(Value::as_bool);
@@ -1297,12 +1635,7 @@ impl Front {
         }
 
         let blocks = text_blocks.map(|tb| {
-            let at = |t: usize| {
-                cut_ids
-                    .iter()
-                    .find(|(c, _)| *c == t)
-                    .map(|(_, i)| i + head_shift)
-            };
+            let at = |t: usize| cut_ids.iter().find(|(c, _)| *c == t).map(|(_, i)| *i);
             Blocks {
                 head: tb.head.and_then(at).unwrap_or(ids.len()),
                 starts: tb.message.iter().map(|s| s.and_then(at)).collect(),
@@ -1366,19 +1699,39 @@ impl Front {
                 scope: *scopes.last().expect("n + 1 scopes"),
                 thinking: Some(thinking),
             },
+            encoded,
+            recorded,
+            record,
+            scopes,
         })
     }
 
     /// A family without a text side: render (with the effort's check),
     /// encode and switch through the seam, as before.
     fn plain(&self, engine: &dyn Served, req: Request<'_>) -> Result<Prompt> {
-        let scope = self
-            .origin(req.history.unwrap_or(req.messages), &req.kwargs, None)
-            .scope;
+        let sent = req
+            .history
+            .unwrap_or(req.messages)
+            .as_array()
+            .map_or(&[][..], Vec::as_slice);
+        let scopes = self.scopes(sent, &req.kwargs);
+        let scope = *scopes.last().expect("n + 1 scopes");
         let before = engine.template_renders();
         let rendered = engine.render_checked(req.messages, &req.kwargs, &[REASONING_EFFORT])?;
         let renders = engine.template_renders() - before;
-        if let Some(i) = rendered.ignored.first() {
+        for ignored in &rendered.ignored {
+            if engine.capabilities().family == "lfm2-gguf"
+                && ignored.reason == NOT_READ
+                && matches!(ignored.value.as_str(), Some("none" | "default"))
+            {
+                eprintln!(
+                    "[{}: {REASONING_EFFORT}={} ignored: the chat template does not read it]",
+                    engine.capabilities().family,
+                    ignored.value
+                );
+                continue;
+            }
+            let i = ignored;
             let family = engine.capabilities().family;
             let why = if i.reason == NOT_READ {
                 format!("{family}'s chat template does not read {REASONING_EFFORT}")
@@ -1400,6 +1753,9 @@ impl Front {
         };
         let mut ids = engine.encode(&rendered, req.add_bos)?;
         self.tokenizations.fetch_add(1, Ordering::Relaxed);
+        self.tokenized
+            .fetch_add(ids.len() as u64, Ordering::Relaxed);
+        let encoded = ids.len();
         let tags = engine.think_tags();
         let mut shown = rendered;
         let before = ids.len();
@@ -1424,6 +1780,10 @@ impl Front {
                 scope,
                 thinking: Some(th),
             },
+            encoded,
+            recorded: 0,
+            record: None,
+            scopes,
         })
     }
 
@@ -1507,6 +1867,17 @@ impl Front {
         origin: Origin,
         decoded: &Decoded,
     ) -> Frontier {
+        self.record_reply(engine, origin, decoded).0
+    }
+
+    /// [`Self::record_frontier`], with the reply as the log keeps it — the
+    /// record a stored session's turn shares (`docs/sessions.md` §2).
+    pub fn record_reply(
+        &self,
+        engine: &dyn Served,
+        origin: Origin,
+        decoded: &Decoded,
+    ) -> (Frontier, Option<Arc<Reply>>) {
         let thinking = origin.thinking;
         let mut frontier = Frontier {
             generated: decoded.tokens.len(),
@@ -1514,18 +1885,18 @@ impl Front {
             ..Frontier::default()
         };
         let Some(text) = engine.text() else {
-            return frontier;
+            return (frontier, None);
         };
         if decoded.tokens.is_empty() {
-            return frontier;
+            return (frontier, None);
         }
         let Some((n, partial)) = accepted(text, &decoded.tokens, &decoded.text) else {
-            return frontier;
+            return (frontier, None);
         };
         frontier.accepted = n;
         frontier.partial = partial;
         if n == 0 {
-            return frontier;
+            return (frontier, None);
         }
         let partial_text = &decoded.text[decoded.text.len() - partial..];
         let full = decoded.text.clone();
@@ -1595,7 +1966,7 @@ impl Front {
             ),
             _ => (None, None),
         };
-        self.log.lock().insert(
+        let reply = self.log.lock().insert(
             origin.scope,
             Reply {
                 ids: ids.to_vec(),
@@ -1613,7 +1984,7 @@ impl Front {
             },
         );
         frontier.logged = true;
-        frontier
+        (frontier, Some(reply))
     }
 
     /// The newest reply the log holds whose text or content is `content`,
@@ -1654,9 +2025,12 @@ pub fn logprobs_refused_on(body: lloom::nn::Body) -> Option<String> {
         digest: false,
         logprobs: Some(0),
     };
-    lloom::nn::refuse(body, &asks)
-        .err()
-        .map(|e| format!("this process decodes through {name}: {e}"))
+    lloom::nn::refuse(body, &asks).err().map(|e| {
+        format!(
+            "this process decodes through {name}: {}",
+            e.without_backtrace()
+        )
+    })
 }
 
 /// Of `tokens`, the longest prefix of whole units whose text `delivered`
@@ -1816,6 +2190,165 @@ fn units(text: &Text, ids: &[u32], base: usize) -> Option<Vec<(Range<usize>, Str
     let whole = decode(text, ids)?;
     let joined: String = out.iter().map(|(_, s)| s.as_str()).collect();
     (joined == whole).then_some(out)
+}
+
+/// Render a past assistant turn from the ids the model emitted (decision 51
+/// Q1): the whole turn — anything before its reasoning block, the block's
+/// markers and interior with its own whitespace, the content — in place of
+/// whatever the template rendered for it. The template's own role header and
+/// everything else it writes stay: the model did not write them.
+///
+/// The run ends at the turn's end: **through the end-of-turn token** for a
+/// reply the model ended itself (that position was fed, and the token is the
+/// template's own bytes for it, since the log does not keep the sampled EOS),
+/// and at the reply's last id for one a limit, a stop string or a cancellation
+/// cut, which fed no end-of-turn position.
+///
+/// So the next prompt's ids are the session's log wherever a reply is matched,
+/// whatever the template would have rewritten — Qwen's `reasoning_content|trim`,
+/// a re-split of an evicted reply, an engine-closed empty block. No restore, no
+/// replay, no tail rewind.
+///
+/// `eot` is the end-of-turn token the template writes after an assistant turn
+/// and the id it encodes to, read at load ([`Constants::eot`]). `gen` is the
+/// text of the request's generation prompt: where the turn's span opens with
+/// it, the model's bytes begin right after it, and any whitespace the template
+/// wrote between it and the reply's first word is the template's rendering of
+/// the turn, which the model's bytes replace.
+///
+/// `false` — the caller's segment alignment takes the span instead, which is
+/// the pre-Q1 path and still splices what it can — wherever this cannot speak
+/// for the span exactly:
+/// - the reply's text is not in the template's rendering of its message
+///   verbatim (the template trimmed, stripped or re-split it; the client
+///   edited it);
+/// - it is there more than once, so which occurrence the ids belong to would
+///   be a guess;
+/// - the ids do not decode to exactly the text they would replace.
+fn emit_turn(
+    text: &Text,
+    rendered: &str,
+    region: Range<usize>,
+    reply: &Arc<Reply>,
+    eot: Option<(u32, &str)>,
+    gen: Option<&str>,
+    runs: &mut Vec<Run>,
+) -> bool {
+    let span = &rendered[region.clone()];
+    // The turn's text as the model emitted it, and the template's rendering
+    // of this message. The emitted text must be there verbatim: anything else
+    // — a trim, a strip, a re-split, a client's edit — is a span this cannot
+    // speak for, and the caller's segment alignment takes it.
+    let emitted = reply.text.as_str();
+    if emitted.is_empty() {
+        return false;
+    }
+    // Where the turn's own bytes begin in the template's rendering of it, and
+    // where they end. The template may have rewritten the stretch between —
+    // Qwen trims the reasoning it is given, deleting whitespace the model
+    // emitted, which no field can carry back — so the match is on the bytes
+    // the rewriting cannot touch: the turn's first non-whitespace run, and the
+    // end-of-turn token the template wrote. Everything between is replaced by
+    // what the model emitted, which is Q1's instruction.
+    let head = emitted.trim_start();
+    let lead: String = head.chars().take_while(|c| !c.is_whitespace()).collect();
+    if lead.is_empty() {
+        return false;
+    }
+    let Some(off) = span.find(lead.as_str()) else {
+        return false;
+    };
+    // Exactly one place it can begin, or which one the ids belong to is a
+    // guess.
+    if span[off + lead.len()..].contains(lead.as_str()) {
+        return false;
+    }
+    // Where the turn's own bytes begin, its leading whitespace included: a
+    // run that started at the first word would put the reply's whitespace
+    // after the template's, and the prompt would carry both.
+    let leading = &emitted[..emitted.len() - head.len()];
+    let lead_at = region.start + off;
+    let start = match gen.filter(|g| g.len() <= off && span.starts_with(g)) {
+        Some(g) if span[g.len()..off].trim().is_empty() => region.start + g.len(),
+        _ if leading.is_empty() => lead_at,
+        _ if rendered[region.start..lead_at].ends_with(leading) => lead_at - leading.len(),
+        _ => return false,
+    };
+    // The turn ends where the template ended it: at the end-of-turn token it
+    // wrote after the body, or — with no such constant — at the span's end.
+    let body_end = match eot {
+        Some((_, marker)) => match span[off..].rfind(marker) {
+            Some(i) => region.start + off + i,
+            None => return false,
+        },
+        None => region.end,
+    };
+    if body_end <= start {
+        return false;
+    }
+    // Through the end-of-turn token where the model ended the turn itself:
+    // that position was fed, and the token is the template's own bytes for it
+    // (the log does not keep the sampled EOS). Only when the template writes
+    // it immediately after the reply, with nothing of its own between.
+    // Bounded by the span: a run never reaches into the next message's text,
+    // nor into the generation prompt.
+    let through = match eot {
+        Some((id, marker))
+            if reply.stop == crate::Stop::Eos && body_end + marker.len() <= region.end =>
+        {
+            Some((id, marker.len()))
+        }
+        _ => None,
+    };
+    let (text_end, ids) = match through {
+        Some((id, len)) => {
+            let mut ids = reply.ids.clone();
+            ids.push(id);
+            (body_end + len, ids)
+        }
+        None => (body_end, reply.ids.clone()),
+    };
+    if ids.is_empty() {
+        return false;
+    }
+    // Two guards, and both are needed.
+    //
+    // The ids must be this reply's turn: what the log holds, with the
+    // end-of-turn token where the model ended the turn itself. Trailing
+    // whitespace aside, because a template normalises the whitespace after
+    // the body.
+    let want = match through {
+        Some(_) => format!("{}{}", emitted.trim_end(), eot.map_or("", |(_, m)| m)),
+        None => emitted.trim_end().to_string(),
+    };
+    match decode(text, &ids) {
+        Some(d) if d.trim_end() == want.trim_end() => {}
+        _ => return false,
+    }
+    // And nothing the template wrote of its own may be inside the run. The
+    // stretch being replaced is allowed to differ from the model's bytes only
+    // in whitespace the template normalised: a closing it wrote for a block
+    // the model left open (`\n</think>\n\n`), a wrapper, a re-split, are all
+    // text of the template's, and a run that swallowed them would put the
+    // model's ids where the template's text stands.
+    let replaced = &rendered[start..text_end];
+    let same = |a: &str, b: &str| -> bool {
+        let f = |s: &str| -> Vec<String> { s.split_whitespace().map(str::to_string).collect() };
+        f(a) == f(b)
+    };
+    if !same(replaced, &want) {
+        return false;
+    }
+    let n = ids.len();
+    runs.push(Run {
+        text: start..text_end,
+        ids: 0..n,
+        reply: Arc::new(Reply {
+            ids,
+            ..Reply::clone(reply)
+        }),
+    });
+    true
 }
 
 /// Align `reply`'s segments — anything before its reasoning block, the

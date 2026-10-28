@@ -96,6 +96,11 @@ pub struct Kernels {
     /// flag at buffer index 30. A separate pipeline-cache key, so the plain
     /// variants are untouched.
     eos_gated: std::sync::atomic::AtomicBool,
+    /// While set with the gate, the quantized mat-vec cores take their gated
+    /// variant too ([`EOS_GATED_CORES`]): the gate's cores arm, which a run
+    /// sets only for a model whose dependency inventory admits it
+    /// (`CausalLM::eos_gate_cores`).
+    eos_gate_cores: std::sync::atomic::AtomicBool,
 }
 
 thread_local! {
@@ -128,15 +133,22 @@ impl Drop for UngatedScope {
     }
 }
 
-/// The sources whose kernels carry `EOS_GATE_ARG` (`utils.metal`).
-const EOS_GATED_SOURCES: [Source; 6] = [
+/// The sources whose kernels carry `EOS_GATE_ARG` (`utils.metal`,
+/// `quantized.metal`): always built with the gate's function constant.
+const EOS_GATED_SOURCES: [Source; 8] = [
     Source::Gemv,
     Source::Reduce,
     Source::Binary,
     Source::Unary,
     Source::Conv,
     Source::Gdn,
+    Source::Quantized,
+    Source::QuantizedStore,
 ];
+
+/// Of those, the quantized mat-vec cores: gated only under the cores arm
+/// (`Kernels::set_eos_gate_cores`), plain under the gate alone.
+const EOS_GATED_CORES: [Source; 2] = [Source::Quantized, Source::QuantizedStore];
 
 impl Default for Kernels {
     fn default() -> Self {
@@ -152,6 +164,7 @@ impl Kernels {
             libraries,
             pipelines,
             eos_gated: std::sync::atomic::AtomicBool::new(false),
+            eos_gate_cores: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -166,10 +179,48 @@ impl Kernels {
         self.eos_gated.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// Whether a pipeline this thread loads now is the gated variant: the
-    /// gate armed and no [`UngatedScope`] open here.
-    fn gated_here(&self) -> bool {
-        self.eos_gated() && UNGATED.with(|d| d.get() == 0)
+    /// The gate's cores arm: with the gate armed, the quantized mat-vec
+    /// cores load their gated variant too. See `metal::eos_gate`.
+    pub fn set_eos_gate_cores(&self, on: bool) {
+        self.eos_gate_cores
+            .store(on, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn eos_gate_cores(&self) -> bool {
+        self.eos_gate_cores
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Whether a pipeline of `source` this thread loads now is the gated
+    /// variant: the gate armed (and its cores arm, for a core), and no
+    /// [`UngatedScope`] open here.
+    fn gated_here(&self, source: Source) -> bool {
+        self.eos_gated()
+            && (!EOS_GATED_CORES.contains(&source) || self.eos_gate_cores())
+            && UNGATED.with(|d| d.get() == 0)
+    }
+
+    /// `constants` with the gate's function constant added for a gated
+    /// source: a function that names a constant builds only specialised,
+    /// so a gated source's pipelines always carry it (`false` the plain
+    /// variant, `true` the gated one; two cache keys).
+    fn with_gate_constant(
+        &self,
+        source: Source,
+        constants: Option<ConstantValues>,
+    ) -> Option<ConstantValues> {
+        if !EOS_GATED_SOURCES.contains(&source) {
+            return constants;
+        }
+        let gate = (
+            crate::kernels::metal::eos_gate::EOS_GATE_FUNCTION_CONSTANT,
+            crate::kernels::metal::library::Value::Bool(self.gated_here(source)),
+        );
+        let mut values = constants
+            .map(ConstantValues::into_values)
+            .unwrap_or_default();
+        values.push(gate);
+        Some(ConstantValues::new(values))
     }
 
     /// Which library a [`Source`] resolves to, and the text to compile for it.
@@ -288,6 +339,7 @@ impl Kernels {
         name: impl Into<KernelName>,
         constants: Option<ConstantValues>,
     ) -> Result<ComputePipeline, MetalKernelError> {
+        let constants = self.with_gate_constant(source, constants);
         let key = (source, name.into(), constants);
         if let Some(pipeline) = self.pipelines.read().get(&key) {
             return Ok(pipeline.clone());
@@ -323,19 +375,9 @@ impl Kernels {
         source: Source,
         name: impl Into<KernelName>,
     ) -> Result<ComputePipeline, MetalKernelError> {
-        // A function that references a function constant can only be built
-        // specialized (Metal refuses `newFunctionWithName:` for it), so the
-        // gated sources are always loaded with the constant set — `false` is
-        // the plain variant, `true` the gated one; two cache keys.
-        let constants = if EOS_GATED_SOURCES.contains(&source) {
-            Some(ConstantValues::new(vec![(
-                crate::kernels::metal::eos_gate::EOS_GATE_FUNCTION_CONSTANT,
-                crate::kernels::metal::library::Value::Bool(self.gated_here()),
-            )]))
-        } else {
-            None
-        };
-        self.load_pipeline_with_constants(device, source, name, constants)
+        // The gated sources take the gate's constant in
+        // `load_pipeline_with_constants` (`with_gate_constant`).
+        self.load_pipeline_with_constants(device, source, name, None)
     }
 
     /// How many distinct Metal libraries this cache has compiled, and how many
@@ -503,7 +545,7 @@ pub fn fast_math_enabled() -> bool {
     crate::tuning::tuning().metal.fast_math
 }
 
-fn get_compile_options() -> Retained<MTLCompileOptions> {
+pub(crate) fn get_compile_options() -> Retained<MTLCompileOptions> {
     let compile_options = MTLCompileOptions::new();
     //unsafe { compile_options.setEnableLogging(true) };
 

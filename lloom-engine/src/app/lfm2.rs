@@ -86,6 +86,8 @@ pub struct Vision {
     files: Vec<PathBuf>,
     dtype: DType,
     text_hidden: usize,
+    /// The load's execution purpose, applied to the tower when it loads.
+    purpose: lloom::nn::attention::route::ExecutionPurpose,
     tower: Mutex<Option<Tower>>,
 }
 
@@ -116,6 +118,8 @@ impl Vision {
         let vb = VarBuilder::from_backend(Box::new(backend), self.dtype, device.clone());
         let encoder = VisionEncoder::new(&self.config, self.text_hidden, vb)
             .context("loading the vision tower and projector")?;
+        self.purpose
+            .admit("lfm2-vl", device, encoder.reference_attention())?;
         device.synchronize()?;
         let pool_delta = MemSnapshot::read(device).pool_live as i64 - before;
         let t = Tower {
@@ -294,6 +298,11 @@ pub struct Engine<P: Profile> {
     pub dspark_k: Option<usize>,
     pub prefill_tile: usize,
     pub prefill_chunk: usize,
+    /// The pending rows' chunks one batched step carries, as resolved at
+    /// load (`scheduler.prefill_batch`, bounded by the admission's room).
+    pub prefill_batch: PrefillBatch,
+    /// What the live rows do in a step that feeds prompt pieces.
+    pub prefill_decode: lloom::nn::PrefillDecode,
     pub memory_fraction: f64,
     pub mem_sample: bool,
     /// How the rows of a batched step hold their state (`--rows`).
@@ -326,6 +335,9 @@ pub struct Engine<P: Profile> {
     /// What the load reserved on the machine, released with the engine.
     pub machine: Option<Arc<lloom_tensor::machine::Holding>>,
     private_cache: PrivateCachePolicy,
+    /// Why a session's head is not pinned here, `None` where it is
+    /// (`Served::prefix_pin_refused`).
+    pin_refused: Option<String>,
     /// `/v1/systemone`'s executor binding: a native d1 checkpoint's own, or
     /// the template `decision.template` selected; `None` refuses by name.
     decisions: Option<ServedDecisions>,
@@ -340,6 +352,9 @@ pub struct Engine<P: Profile> {
 pub struct LoadOptions {
     pub model_dir: PathBuf,
     pub cpu: bool,
+    /// What the run is for (`execution.purpose`): production refuses at load
+    /// an attention that takes the composed scores path on Metal.
+    pub purpose: lloom::nn::attention::route::ExecutionPurpose,
     pub kv_capacity: usize,
     pub readback: ReadbackArm,
     /// The decode loop's options (`DecodeConfig`): what `readback` and the
@@ -348,10 +363,16 @@ pub struct LoadOptions {
     /// The model's axes: the cache preset and the per-axis overrides.
     pub model: crate::ModelConfig,
     pub reuse_prefix: bool,
+    /// One frame more in the turn ring for a session's pinned head
+    /// (`Shape::pin_prefix`).
+    pub pin_prefix: bool,
     pub warmup: bool,
     pub seed_text: String,
     pub model_name: Option<String>,
     pub batch: usize,
+    /// The most requests one intake tick of the batched scheduler takes
+    /// off its queue while rows are live (`scheduler.intake_per_tick`).
+    pub intake_per_tick: usize,
     /// `Some(dir)` loads the DSpark drafter from `dir` (or the newest
     /// LFM2.5-2.6B-DSpark snapshot in the HF cache when the path is empty).
     pub dspark: Option<PathBuf>,
@@ -889,8 +910,12 @@ impl<P: Lfm2Shape> Engine<P> {
                 m.set_free_budget(mb * 1024 * 1024);
             }
         }
+        // What is installed is what the load reports (`ExecutorConfig::under_body`).
+        let (executor, executor_note) = opts.executor.under_body(dspark_dir.is_some());
+        opts.executor = executor;
         let mut installed =
             super::common::install_executor(&device, &opts.executor, dspark_dir.is_some())?;
+        installed.declined = executor_note;
         installed.pass_widths = match opts.decode.prefill.pass_widths {
             lloom::nn::PassWidths::Lru => "lru",
             lloom::nn::PassWidths::Ladder => "ladder",
@@ -901,6 +926,7 @@ impl<P: Lfm2Shape> Engine<P> {
         // verify); structured prompts (7.8–8.3 accepted) pay at every B.
         // Said once at load; the flag is honoured either way.
         let mut load_warnings = Vec::new();
+        load_warnings.extend(installed.declined_warning());
         if dspark_dir.is_some() && opts.batch >= 16 && opts.dspark_k.is_none() {
             let note = format!(
                 "at --batch {} the speculative loop measured slower than plain batched decode \
@@ -941,6 +967,16 @@ impl<P: Lfm2Shape> Engine<P> {
             .apply_axes(&mut config)
             .map_err(|e| anyhow::anyhow!("model axes: {e}"))?;
         refuse_kv_quant_shape(&config, &device, opts.batch)?;
+        if let Some(w) = paged_verify_warning(&config, dcfg.is_some(), opts.batch) {
+            eprintln!("[dspark: {}]", w.message);
+            load_warnings.push(w);
+        }
+        // The route the model resolves at construction, admitted for the
+        // run's purpose before any weight is read.
+        let route =
+            lloom::models::lfm2::AttnRoute::resolve(config.attn_impl, &config, dtype, &device)?;
+        opts.purpose
+            .admit("lfm2", &device, route.composed_reason(&device).as_deref())?;
         if let Some(k) = opts.flash_k {
             if config.attn_impl != AttnImpl::FlashDecoding {
                 anyhow::bail!(
@@ -951,13 +987,13 @@ impl<P: Lfm2Shape> Engine<P> {
             }
             config.flash_pages_per_chunk = k.max(1);
         }
-        config.conv_prefill_ctx = config.conv_prefill_ctx
-            || conv_carry_needed(
-                opts.prefill_tile,
-                opts.prefill_chunk,
-                &opts.decode,
-                opts.reuse_prefix,
-            );
+        config.conv_prefill_ctx = conv_carry_needed(
+            &config,
+            opts.prefill_tile,
+            opts.prefill_chunk,
+            &opts.decode,
+            opts.reuse_prefix,
+        );
         let axes_line = config.axes_line();
         // Stop on the checkpoint's declared EOS plus `<|im_end|>` (the chat
         // turn end).
@@ -1021,11 +1057,12 @@ impl<P: Lfm2Shape> Engine<P> {
             // when the batched steps feed more prompt tokens than one tile per
             // step (`--prefill-chunk` above the tile fuses several rows' pieces
             // into one forward, whose working set is the chunk's).
-            budget = budget.with_prefill(if opts.prefill_tile > 0 {
-                opts.prefill_tile.max(opts.prefill_chunk)
-            } else {
-                opts.kv_capacity
-            });
+            budget = budget.with_prefill(step_prompt_tokens(
+                opts.prefill_tile,
+                opts.prefill_chunk,
+                1,
+                opts.kv_capacity,
+            ));
             if opts.batch > 1 {
                 // The scheduler's step is ONE ragged forward: the chunk's
                 // prompt tokens plus one token per live row, whatever `N` —
@@ -1122,7 +1159,7 @@ impl<P: Lfm2Shape> Engine<P> {
                 let room = match config.memory_budget {
                     Some(mut b) => {
                         b.weight_bytes = resident;
-                        let a = State::<P>::admission_budget(&config, &b, opts.kv_capacity)
+                        let a = State::<P>::admission_budget(&config, dtype, &b, opts.kv_capacity)
                             .admit(m.device().recommended_max_working_set_size());
                         // The classes, for the refusal: which one took the room.
                         let f = &a.footprint;
@@ -1191,11 +1228,6 @@ impl<P: Lfm2Shape> Engine<P> {
         // KV grows past its first bucket, admitted against the host and the
         // other lloom processes before a weight is read.
         let kv_floor = opts.memory.kv_bucket.min(opts.kv_capacity).max(1);
-        let longest = match config.memory_budget {
-            Some(b) => b.max_seq_len,
-            None if opts.prefill_tile > 0 => opts.prefill_tile.max(opts.prefill_chunk),
-            None => opts.kv_capacity,
-        };
         // A prefill of several forwards keeps the pacer's depth of them in
         // flight, each holding its activations until its command buffer
         // completes; the prefill's own bound, else decode's, else the floor.
@@ -1203,6 +1235,38 @@ impl<P: Lfm2Shape> Engine<P> {
             .into_iter()
             .find(|&d| d > 0)
             .unwrap_or(lloom::nn::decode::IN_FLIGHT_FLOOR);
+        // How many pending rows' chunks one batched step carries: the budget
+        // and the gauge above were taken at one; a wider step is charged here
+        // for its activations and kept only where this load still fits.
+        let prefill_batch = resolve_prefill_batch::<P>(
+            &opts,
+            &config,
+            dcfg.is_some(),
+            dtype,
+            machine_weights,
+            kv_floor,
+            in_flight,
+            &device,
+        );
+        if prefill_batch.k > 1 {
+            if let Some(b) = config.memory_budget.as_mut() {
+                b.max_seq_len = step_prompt_tokens(
+                    opts.prefill_tile,
+                    opts.prefill_chunk,
+                    prefill_batch.k,
+                    opts.kv_capacity,
+                ) + opts.batch;
+            }
+        }
+        let longest = match config.memory_budget {
+            Some(b) => b.max_seq_len,
+            None => step_prompt_tokens(
+                opts.prefill_tile,
+                opts.prefill_chunk,
+                prefill_batch.k,
+                opts.kv_capacity,
+            ),
+        };
         let mut peak = machine_peak::<P>(
             &config,
             dtype,
@@ -1212,6 +1276,7 @@ impl<P: Lfm2Shape> Engine<P> {
             longest,
             in_flight,
             config.memory_budget.and_then(|b| b.activation_rows),
+            opts.pin_prefix,
         );
         if let Some(p) = moe_preflight {
             peak.push(
@@ -1255,6 +1320,7 @@ impl<P: Lfm2Shape> Engine<P> {
                 files: files.clone(),
                 dtype,
                 text_hidden: config.hidden_size,
+                purpose: opts.purpose,
                 tower: Mutex::new(None),
             })
         } else {
@@ -1266,7 +1332,20 @@ impl<P: Lfm2Shape> Engine<P> {
             grow_fraction: opts.memory.kv_grow_fraction,
         };
         let make_cache = |device: &Device| private_cache.create::<P>(&config, dtype, device);
-        let cache = make_cache(&device)?;
+        // The served sequence's ring keeps a frame for a session's pinned
+        // head; a decision's private cache keeps none.
+        let cache = make_cache(&device)?.with_pin_frame(opts.pin_prefix);
+        let pin_refused = (!cache.has_pin_frame()).then(|| {
+            if opts.pin_prefix {
+                "this KV arm keeps no turn checkpoints (`KvAppend::Cat`): nothing to pin \
+                 (docs/sessions.md §8)"
+                    .to_string()
+            } else {
+                "the load keeps no frame for a pinned head: session.keep is none, prefix reuse \
+                 is off, or the engine runs more than one sequence (docs/sessions.md §8)"
+                    .to_string()
+            }
+        });
 
         let model_name = opts
             .model_name
@@ -1296,6 +1375,8 @@ impl<P: Lfm2Shape> Engine<P> {
             }),
             prefill_tile: opts.prefill_tile,
             prefill_chunk: opts.prefill_chunk,
+            prefill_batch,
+            prefill_decode: opts.decode.prefill.decode,
             memory_fraction: opts.memory_fraction,
             mem_sample: opts.mem_sample,
             rows: if opts.batch > 1 {
@@ -1316,6 +1397,7 @@ impl<P: Lfm2Shape> Engine<P> {
             load_warnings,
             machine,
             private_cache,
+            pin_refused,
             decisions,
             decision_ragged: opts.decision_ragged,
             trunks: Default::default(),
@@ -1372,6 +1454,11 @@ impl<P: Lfm2Shape> Engine<P> {
             };
             let drafter = DSparkDrafter::new(dcfg.clone(), max_pos, dvb)
                 .context("constructing DSpark drafter")?;
+            opts.purpose.admit(
+                "dspark drafter",
+                &core.device,
+                drafter.reference_attention(),
+            )?;
             // The drafter's context KV: an explicit `tuning.dspark.ctx_kv`
             // (`--dspark-ctx`, the `LLOOM_DSPARK_CTX_KV` alias) wins on every
             // arm; `auto` is one paged pool set shared by every sequence on
@@ -1482,15 +1569,20 @@ impl<P: Lfm2Shape> Engine<P> {
             continuous: dcfg.is_some() && pooled,
             eos_ids: engine.text.eos_ids.clone(),
         };
-        let batch_opts = DecodeOptions {
-            lookahead: 1,
-            prefill_tile: opts.prefill_tile,
-            prefill_chunk: opts.prefill_chunk,
-            ..DecodeOptions::new(0)
+        let static_spec = dcfg.is_some() && !pooled;
+        let batch_opts = if static_spec {
+            static_dspark_scheduler_options(&opts.decode, opts.prefill_tile, opts.prefill_chunk)
+        } else {
+            DecodeOptions {
+                lookahead: 1,
+                prefill_tile: opts.prefill_tile,
+                prefill_chunk: opts.prefill_chunk,
+                ..DecodeOptions::new(0)
+            }
         };
         // `--dspark` on private caches runs the static pipelined driver; on
         // the pool arms the continuous speculative driver (§12.4).
-        let mode: BatchMode<Model<P>, Extra> = if dcfg.is_some() && !pooled {
+        let mode: BatchMode<Model<P>, Extra> = if static_spec {
             BatchMode::Static(Box::new(static_dspark_body))
         } else {
             BatchMode::Continuous
@@ -1503,6 +1595,9 @@ impl<P: Lfm2Shape> Engine<P> {
             max_rows: opts.batch,
             reuse_prefix: opts.reuse_prefix,
             share_prefix: opts.share_prefix,
+            prefill_batch: engine.prefill_batch.k,
+            prefill_decode: engine.prefill_decode,
+            intake_per_tick: opts.intake_per_tick,
             mode,
             extra,
             on_counters: None,
@@ -1510,11 +1605,12 @@ impl<P: Lfm2Shape> Engine<P> {
         let (handle, thread) = spawn_batch(Arc::clone(&core), |c: &Core<P>| &c.model, cfg)
             .map_err(|e| anyhow::anyhow!("starting the batch scheduler: {e}"))?;
         eprintln!(
-            "[batch: scheduler up, {} sequences, {} rows per step, tile {} chunk {}, {}]",
+            "[batch: scheduler up, {} sequences, {} rows per step, tile {} chunk {}, prefill {}, {}]",
             opts.batch,
             opts.batch,
             opts.prefill_tile,
             opts.prefill_chunk,
+            engine.prefill_batch.describe(engine.prefill_decode),
             match (dcfg.is_some(), pooled) {
                 (true, true) => "continuous speculative batching (one drafter, batched drafts)",
                 (true, false) => "static batches through the pipelined speculative driver",
@@ -2113,9 +2209,16 @@ impl<P: Lfm2Shape> Engine<P> {
                     rows: done.joined_beside,
                 },
             },
+            sampling: params.sampling()?,
+            readback_note: None,
             stats: done.stats,
             thinking: None,
             logprobs: None,
+            // The scheduler's rows keep no pin.
+            pin: crate::PinReport {
+                asked: params.pin_prefix,
+                ..Default::default()
+            },
         })
     }
 
@@ -2446,12 +2549,7 @@ impl<P: Lfm2Shape> Engine<P> {
             if let Some(spec) = &mut extra.spec {
                 // One run of `D` tokens; the prompt's submit time subtracted
                 // (the prefill's GPU tail is inside the bracket).
-                let params = DecodeParams {
-                    max_tokens: decode_tokens,
-                    eos_ids: NEVER_EOS.to_vec(),
-                    readback,
-                    ..DecodeParams::default()
-                };
+                let params = throughput_params(decode_tokens, readback, prefill_tile);
                 let t = Instant::now();
                 let run = s.decode_speculative_until(
                     rewindable::<P>()?,
@@ -2490,13 +2588,7 @@ impl<P: Lfm2Shape> Engine<P> {
                 });
             }
             let mut detok = detok;
-            let params = DecodeParams {
-                max_tokens: 1,
-                eos_ids: NEVER_EOS.to_vec(),
-                readback,
-                prefill_tile,
-                ..DecodeParams::default()
-            };
+            let params = throughput_params(1, readback, prefill_tile);
             let t = Instant::now();
             let first = s.decode(&prompt, &mut detok, &params, |_| {})?;
             device.synchronize()?;
@@ -2511,13 +2603,7 @@ impl<P: Lfm2Shape> Engine<P> {
             // logits the context run held rather than re-feeding anything.
             let mut all: Vec<u32> = prompt.clone();
             all.extend_from_slice(&first.tokens);
-            let params = DecodeParams {
-                max_tokens: decode_tokens,
-                eos_ids: NEVER_EOS.to_vec(),
-                readback,
-                prefill_tile,
-                ..DecodeParams::default()
-            };
+            let params = throughput_params(decode_tokens, readback, prefill_tile);
             let t = Instant::now();
             let run = s.decode(&all, &mut detok, &params, |_| {})?;
             let decode_ms = ms(t.elapsed());
@@ -2860,6 +2946,22 @@ fn run_spec_rows<'m, P: Profile>(
     )?)
 }
 
+/// Resolve the static scheduler's seed options at load, retaining the legacy
+/// tile/chunk overrides and the batch lookahead. Continuous rows have their own
+/// option contract; this does not add schedule support to that driver.
+fn static_dspark_scheduler_options(
+    decode: &crate::DecodeConfig,
+    prefill_tile: usize,
+    prefill_chunk: usize,
+) -> DecodeOptions {
+    let mut opts = decode.options(0, ReadbackArm::Blocking, prefill_tile);
+    opts.lookahead = 1;
+    if prefill_chunk > 0 {
+        opts.prefill_chunk = prefill_chunk;
+    }
+    opts
+}
+
 /// The static body under `--dspark --batch N --rows private`: every row's
 /// round pipelined through the one drafter
 /// (`Session::decode_speculative_pipelined`, §10.2y). Greedy, one EOS set
@@ -2900,30 +3002,18 @@ fn static_dspark_body<'a, 'm, P: Profile>(
             );
         }
     }
-    let max_tokens = specs.iter().map(|s| s.max_tokens).max().unwrap_or(0);
-    let opts = DecodeOptions::new(max_tokens);
     let caps: Vec<usize> = specs.iter().map(|s| s.max_tokens).collect();
-    let mut outs = Session::decode_speculative_pipelined(
+    Session::decode_speculative_pipelined_with_caps(
         sessions,
         rewindable::<P>()?,
         spec,
         prompts,
-        &opts,
+        idle.opts,
+        &caps,
         &first.eos_ids,
         idle.device,
-        &mut |i, ids| {
-            // Every row runs to the batch's widest cap; a row past its own
-            // is cut here and below.
-            on_tokens(i, ids)
-        },
-    )?;
-    for (o, cap) in outs.iter_mut().zip(caps) {
-        if cap > 0 && o.ids.len() > cap {
-            o.ids.truncate(cap);
-            o.stats.produced = cap;
-        }
-    }
-    Ok(outs)
+        on_tokens,
+    )
 }
 
 /// The shapes the quantized KV arms have no path on, refused by the flags that
@@ -2956,22 +3046,61 @@ fn refuse_kv_quant_shape(config: &Config, device: &Device, batch: usize) -> Resu
     Ok(())
 }
 
+/// The load warning of a speculative body at one sequence on the paged KV:
+/// every verify window is a multi-row pass, which on the pool attends over a
+/// copy of the cache gathered out of it, a per-round cost that grows with
+/// the context and that the in-place KV does not pay (`speculation.md`
+/// §10.2z-x). `None` on every other shape.
+fn paged_verify_warning(config: &Config, speculative: bool, batch: usize) -> Option<LoadWarning> {
+    (speculative && batch == 1 && config.kv_append == KvAppend::Paged).then(|| {
+        LoadWarning::new(
+            LoadWarningKind::Speculation,
+            "at --batch 1 the speculative body runs on the paged KV (`context.kv.layout = paged`), \
+             whose verify window attends over a copy of the cache gathered out of the pool every \
+             round, ~3 ms a round per 1000 tokens of context; the in-place KV \
+             (`--kv-append in-place`, chat's and serve's default here) reads it where it lies. \
+             Serving it as asked."
+                .to_string(),
+        )
+    })
+}
+
 /// Whether the conv's left-context carry must be on: a prefill fed in more
 /// than one forward — a tile, a chunk, the spark's ramp — or onto a cache a
 /// held sequence extends zero-pads each piece's left edge without it, and
 /// computes something one pass does not (§13.2f defect 1). One forward onto
 /// a cold cache is identical either way.
+/// This resolves load-known options, not later request/config mutations.
 fn conv_carry_needed(
+    config: &Config,
     prefill_tile: usize,
     prefill_chunk: usize,
     decode: &crate::DecodeConfig,
     reuse_prefix: bool,
 ) -> bool {
-    prefill_tile > 0
+    config.conv_prefill_ctx
+        || prefill_tile > 0
         || prefill_chunk > 0
+        || decode.prefill.tile > 0
+        || decode.prefill.chunk > 0
         || decode.prefill.ubatch > 0
         || decode.prefill.spark.is_some()
         || reuse_prefix
+}
+
+/// The B=1 throughput requests share one constructor on both loop bodies.
+fn throughput_params(
+    max_tokens: usize,
+    readback: ReadbackArm,
+    prefill_tile: usize,
+) -> DecodeParams {
+    DecodeParams {
+        max_tokens,
+        eos_ids: NEVER_EOS.to_vec(),
+        readback,
+        prefill_tile,
+        ..DecodeParams::default()
+    }
 }
 
 /// The drafter's context KV: the arm `tuning.dspark.ctx_kv` names when it
@@ -3006,6 +3135,152 @@ fn pipeline_cache_sizes(device: &Device) -> (usize, usize) {
     (0, 0)
 }
 
+/// The prompt tokens one batched step's forward carries at most: the tile,
+/// or `k` rows' chunks when that is wider; the whole KV ceiling without a
+/// tile. At `k = 1` the chunk, which is what a step fed before
+/// `scheduler.prefill_batch`.
+fn step_prompt_tokens(
+    prefill_tile: usize,
+    prefill_chunk: usize,
+    k: usize,
+    kv_capacity: usize,
+) -> usize {
+    if prefill_tile > 0 {
+        prefill_tile.max(prefill_chunk.saturating_mul(k.max(1)))
+    } else {
+        kv_capacity
+    }
+}
+
+/// `scheduler.prefill_batch` as a load resolved it: the pending rows' chunks
+/// one batched step carries (`k`), what was asked (`0` = up to the batch
+/// width), and what bounded `k` below the ask.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PrefillBatch {
+    pub k: usize,
+    pub asked: usize,
+    pub bound: Option<&'static str>,
+}
+
+impl PrefillBatch {
+    fn one() -> Self {
+        Self {
+            k: 1,
+            asked: 1,
+            bound: None,
+        }
+    }
+
+    /// `2 chunks a step (asked 4; the room admits 2), ride` for the load line.
+    pub fn describe(&self, decode: lloom::nn::PrefillDecode) -> String {
+        let asked = match self.asked {
+            0 => "up to the batch".to_string(),
+            n => n.to_string(),
+        };
+        match self.bound {
+            None if self.asked == self.k => format!("{} chunk(s) a step, {decode}", self.k),
+            None => format!("{} chunk(s) a step (asked {asked}), {decode}", self.k),
+            Some(why) => format!(
+                "{} chunk(s) a step (asked {asked}; {why}), {decode}",
+                self.k
+            ),
+        }
+    }
+}
+
+/// How many pending rows' chunks one batched step carries
+/// (`scheduler.prefill_batch`, `batched-decode-design.md` §11.8): the ask
+/// (`0` = the batch width), at most the batch width, and at most what this
+/// load's admission still admits — the most `k` whose step (`k` chunks plus
+/// one token per live row) fits both the process budget at this load's
+/// weights and the machine's room for the peak, `in_flight` such steps'
+/// activations at once. 1 where the K=1 batched loop does not run: at one
+/// sequence, without a chunk budget, under `--dspark` (its driver prefills
+/// each row alone).
+#[allow(clippy::too_many_arguments, unused_variables)]
+fn resolve_prefill_batch<P: Lfm2Shape>(
+    opts: &LoadOptions,
+    config: &Config,
+    dspark: bool,
+    dtype: DType,
+    machine_weights: usize,
+    kv_floor: usize,
+    in_flight: usize,
+    device: &Device,
+) -> PrefillBatch {
+    let asked = opts.decode.prefill.batch;
+    if opts.batch <= 1 || opts.prefill_chunk == 0 {
+        return PrefillBatch::one();
+    }
+    if dspark {
+        return PrefillBatch {
+            k: 1,
+            asked,
+            bound: (asked != 1).then_some("the speculative driver prefills each row alone"),
+        };
+    }
+    let cap = if asked == 0 {
+        opts.batch
+    } else {
+        asked.min(opts.batch)
+    };
+    #[cfg_attr(not(feature = "metal"), allow(unused_mut))]
+    let mut bound = (asked > opts.batch).then_some("at most the batch width");
+    #[cfg(feature = "metal")]
+    if let Device::Metal(m) = device {
+        let gate = lloom::nn::memory::MachineLoad {
+            gate: opts.memory.machine_gate(),
+            label: String::new(),
+            rows: opts.batch,
+            kv_tokens: kv_floor,
+            prefill_tile: opts.prefill_tile,
+        }
+        .gate_for(device);
+        let room = gate.room();
+        let pools = lloom::nn::memory::pool_bound_bytes(device) as i128;
+        let ws = m.device().recommended_max_working_set_size();
+        let rope = State::<P>::rope_table_bytes(config);
+        let fits = |k: usize| -> bool {
+            let longest =
+                step_prompt_tokens(opts.prefill_tile, opts.prefill_chunk, k, opts.kv_capacity)
+                    + opts.batch;
+            let budget_ok = config.memory_budget.is_none_or(|mut b| {
+                b.max_seq_len = longest;
+                let a = State::<P>::admission_budget(config, dtype, &b, opts.kv_capacity).admit(ws);
+                a.fits && a.residual >= rope
+            });
+            let machine_ok = room.is_none_or(|room| {
+                let peak = machine_peak::<P>(
+                    config,
+                    dtype,
+                    machine_weights,
+                    opts.batch,
+                    kv_floor,
+                    longest,
+                    in_flight,
+                    config.memory_budget.and_then(|b| b.activation_rows),
+                    opts.pin_prefix,
+                );
+                peak.total() as i128 + pools <= room
+            });
+            budget_ok && machine_ok
+        };
+        let mut k = cap;
+        while k > 1 && !fits(k) {
+            k -= 1;
+        }
+        if k < cap {
+            bound = Some("the room admits no wider step");
+        }
+        return PrefillBatch { k, asked, bound };
+    }
+    PrefillBatch {
+        k: cap,
+        asked,
+        bound,
+    }
+}
+
 /// What an LFM2 load holds at its peak before its KV grows past
 /// `kv_floor` positions (`memory.md` §9.10): the weights it will hold, each
 /// row's state floor (`lfm2::state_floor_bytes`), and — on Metal — the
@@ -3022,10 +3297,12 @@ fn machine_peak<P: Profile>(
     longest_forward: usize,
     in_flight: usize,
     activation_rows: Option<usize>,
+    pin_frame: bool,
 ) -> lloom_tensor::machine::Peak {
     let rows = batch.max(1);
     let mut peak = lloom_tensor::machine::Peak::new().with("weights", weights as u64);
-    for (name, bytes) in lloom::models::lfm2::state_floor_bytes(config, dtype, kv_floor) {
+    for (name, bytes) in lloom::models::lfm2::state_floor_bytes(config, dtype, kv_floor, pin_frame)
+    {
         let name = if rows > 1 {
             format!("{name} x {rows} rows")
         } else {
@@ -3039,7 +3316,7 @@ fn machine_peak<P: Profile>(
         b.batch = rows;
         b.max_seq_len = longest_forward;
         b.activation_rows = activation_rows;
-        let f = State::<P>::admission_budget(config, &b, kv_floor).footprint();
+        let f = State::<P>::admission_budget(config, dtype, &b, kv_floor).footprint();
         let in_flight = in_flight.max(1);
         peak.push(
             format!("activations ({longest_forward}-position forward x {in_flight} in flight)"),
@@ -3129,6 +3406,9 @@ impl<P: Lfm2Shape> super::served::Served for Engine<P> {
     fn reuse_prefix(&self) -> Option<bool> {
         Some(self.reuse_prefix)
     }
+    fn prefix_pin_refused(&self) -> Option<String> {
+        self.pin_refused.clone()
+    }
     fn prefill_tile(&self) -> usize {
         self.prefill_tile
     }
@@ -3147,11 +3427,14 @@ impl<P: Lfm2Shape> super::served::Served for Engine<P> {
             "batch": self.batch,
             "prefill_tile": self.prefill_tile,
             "prefill_chunk": self.prefill_chunk,
+            "prefill_batch": self.prefill_batch.k,
+            "prefill_decode": self.prefill_decode.name(),
             "memory_fraction": self.memory_fraction,
             "kv_capacity": self.kv_capacity,
             "rows": self.rows.name(),
             "share_prefix": self.share_prefix,
             "dspark_k": self.dspark_k,
+            "cut_sites": super::common::cut_sites_json(),
             "decision_ragged": self.decision_ragged.then(|| self.trunks.report()),
             "pool": self.pool.as_ref().map(|p| {
                 let r = p.report();
@@ -3170,7 +3453,7 @@ impl<P: Lfm2Shape> super::served::Served for Engine<P> {
     }
     fn describe(&self) -> String {
         format!(
-            "family={} batch={} dspark={} prefill_tile={} prefill_chunk={} memory_fraction={} mem_sample={} rows={} cache={} {} {}",
+            "family={} batch={} dspark={} prefill_tile={} prefill_chunk={} prefill_batch={} prefill_decode={} memory_fraction={} mem_sample={} rows={} cache={} {} {}",
             self.capabilities().family,
             self.batch,
             self.dspark_k
@@ -3178,6 +3461,8 @@ impl<P: Lfm2Shape> super::served::Served for Engine<P> {
                 .unwrap_or_else(|| "off".to_string()),
             self.prefill_tile,
             self.prefill_chunk,
+            self.prefill_batch.k,
+            self.prefill_decode,
             self.memory_fraction,
             self.mem_sample,
             self.rows.name(),
@@ -3348,6 +3633,99 @@ mod tests {
     use super::*;
     use lloom::nn::ops::KvQuant;
 
+    #[test]
+    fn conv_carry_reads_configured_tile_and_chunk_without_legacy_fields() {
+        let config = Config::default();
+        assert!(!config.conv_prefill_ctx);
+        for (tile, chunk) in [(16, 0), (0, 8)] {
+            let mut decode = crate::DecodeConfig::default();
+            decode.prefill.tile = tile;
+            decode.prefill.chunk = chunk;
+            let resolved = decode.options(1, ReadbackArm::Blocking, 0);
+            assert_eq!(resolved.prefill_tile, tile);
+            assert_eq!(resolved.prefill_chunk, chunk);
+            assert!(conv_carry_needed(&config, 0, 0, &decode, false));
+        }
+    }
+
+    #[test]
+    fn conv_carry_keeps_legacy_tile_and_chunk_independently() {
+        let config = Config::default();
+        let mut decode = crate::DecodeConfig::default();
+        decode.prefill.tile = 0;
+        for (tile, chunk) in [(16, 0), (0, 8)] {
+            assert!(conv_carry_needed(&config, tile, chunk, &decode, false));
+        }
+        assert!(!conv_carry_needed(&config, 0, 0, &decode, false));
+    }
+
+    #[test]
+    fn conv_carry_keeps_spark_reuse_and_explicit_axis_but_not_zero_split() {
+        let mut config = Config::default();
+        let mut decode = crate::DecodeConfig::default();
+        decode.prefill.tile = 0;
+        assert!(!conv_carry_needed(&config, 0, 0, &decode, false));
+
+        decode.prefill.ubatch = 3;
+        assert!(conv_carry_needed(&config, 0, 0, &decode, false));
+        decode.prefill.ubatch = 0;
+        decode.prefill.spark = Some("progressive:1,16/tile:16".into());
+        let resolved = decode.options(1, ReadbackArm::Blocking, 0);
+        assert_eq!(resolved.prefill_schedule, Some(vec![1, 16]));
+        assert_eq!(resolved.prefill_bulk, 16);
+        assert!(conv_carry_needed(&config, 0, 0, &decode, false));
+        decode.prefill.spark = None;
+
+        assert!(conv_carry_needed(&config, 0, 0, &decode, true));
+        assert!(!conv_carry_needed(&config, 0, 0, &decode, false));
+        config.conv_prefill_ctx = true;
+        assert!(conv_carry_needed(&config, 0, 0, &decode, false));
+    }
+
+    #[test]
+    fn single_throughput_request_construction_preserves_tile_and_group_fallback() {
+        let mut decode = crate::DecodeConfig::default();
+        decode.prefill.tile = 11;
+        decode.prefill.chunk = 5;
+        for readback in [
+            ReadbackArm::Auto,
+            ReadbackArm::Blocking,
+            ReadbackArm::Ring(crate::RingArm::CROWN),
+        ] {
+            for (tile, effective) in [(4, 4), (0, 11)] {
+                for max_tokens in [1, 7] {
+                    let params = throughput_params(max_tokens, readback, tile);
+                    assert_eq!(params.prefill_tile, tile);
+                    assert_eq!(params.max_tokens, max_tokens);
+                    assert_eq!(params.readback, readback);
+                    assert_eq!(params.eos_ids, NEVER_EOS);
+                    assert_eq!(params.seed, 42);
+                    assert!(params.temperature.is_none());
+                    assert!(params.top_p.is_none());
+                    assert!(params.top_k.is_none());
+                    assert!(!params.gumbel);
+                    assert!(!params.processors.is_active());
+                    assert!(params.stop_strings.is_empty());
+                    assert!(!params.logits_digest);
+                    assert!(params.thinking.is_none());
+                    assert_eq!(params.turn_tail, 0);
+                    assert!(params.logprobs.is_none());
+                    assert!(!params.cold);
+                    // The window body resolves with Blocking even when the
+                    // captured request arm is Auto.
+                    let resolved = decode.options(
+                        params.max_tokens,
+                        ReadbackArm::Blocking,
+                        params.prefill_tile,
+                    );
+                    assert_eq!(resolved.max_tokens, max_tokens);
+                    assert_eq!(resolved.prefill_tile, effective);
+                    assert_eq!(resolved.prefill_chunk, 5);
+                }
+            }
+        }
+    }
+
     /// `--dspark-ctx` (the tuning knob) reaches the drafter on every arm;
     /// `auto` is the pool arms' shared pool at N > 1, else per-sequence
     /// pages on Metal, else contiguous.
@@ -3405,6 +3783,34 @@ mod tests {
         c
     }
 
+    /// The speculative body at one sequence on the paged KV is named on the
+    /// load-warning channel; the in-place and cat KVs, no drafter and a
+    /// batch stay silent.
+    #[test]
+    fn a_paged_speculative_body_at_one_sequence_warns() {
+        let w = paged_verify_warning(&config(KvQuant::Off, KvAppend::Paged), true, 1)
+            .expect("the paged KV under a drafter at one sequence warns");
+        assert_eq!(w.kind, LoadWarningKind::Speculation);
+        assert!(
+            w.message.contains("context.kv.layout = paged")
+                && w.message.contains("--kv-append in-place"),
+            "{}",
+            w.message
+        );
+        for (append, speculative, batch) in [
+            (KvAppend::InPlace, true, 1),
+            (KvAppend::Cat, true, 1),
+            (KvAppend::Paged, false, 1),
+            (KvAppend::Paged, true, 4),
+        ] {
+            assert_eq!(
+                paged_verify_warning(&config(KvQuant::Off, append), speculative, batch),
+                None,
+                "{append:?} speculative={speculative} batch={batch}"
+            );
+        }
+    }
+
     #[test]
     fn the_quantized_arms_are_refused_where_they_have_no_path() {
         let err = refuse_kv_quant_shape(&config(KvQuant::Int8, KvAppend::Paged), &Device::Cpu, 4)
@@ -3434,3 +3840,9 @@ mod tests {
 }
 
 pub(crate) mod decision_media;
+
+#[cfg(test)]
+mod speculative_schedule_tests;
+
+#[cfg(test)]
+mod single_speculative_tests;

@@ -194,3 +194,46 @@ fn a_failed_group_answers_its_joiners_and_frees_the_slot() {
     let _next = turns.take();
     assert!(turns.state.lock().groups.is_empty());
 }
+
+/// The keep-warm's turn: taken only when the slot is free and nobody waits,
+/// so it never runs beside a request nor goes ahead of a queued one.
+#[test]
+fn try_take_never_waits_and_never_jumps_the_queue() {
+    let turns = Arc::new(Turns::default());
+    let warm = turns.try_take().expect("a free slot is taken");
+    assert!(turns.try_take().is_none(), "a held slot is not taken twice");
+    drop(warm);
+
+    let busy = turns.take();
+    let (started, has_started) = std::sync::mpsc::channel();
+    let (release, released) = std::sync::mpsc::channel::<()>();
+    let queued = {
+        let turns = turns.clone();
+        std::thread::spawn(move || {
+            let _turn = turns.take();
+            started.send(()).unwrap();
+            released.recv().unwrap();
+        })
+    };
+    // Tickets 0 (the first try_take) and 1 (`busy`) are taken; the queued
+    // request's is 2.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while turns.state.lock().next < 3 {
+        assert!(Instant::now() < deadline, "the request never took a ticket");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(turns.try_take().is_none(), "a request holds the slot");
+    drop(busy);
+    assert!(
+        turns.try_take().is_none(),
+        "the keep-warm went ahead of the queued request"
+    );
+    has_started.recv().unwrap();
+    assert!(
+        turns.try_take().is_none(),
+        "the queued request holds the slot"
+    );
+    release.send(()).unwrap();
+    queued.join().unwrap();
+    assert!(turns.try_take().is_some(), "the slot is free again");
+}

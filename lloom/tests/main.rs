@@ -8,14 +8,17 @@
 //! (`lloom_tensor::isolation`).
 //!
 //! Their own binaries, because a test binary carries at most one
-//! `#[global_allocator]`: `token_ring_nonblocking.rs`, `decode_step_census.rs`.
+//! `#[global_allocator]`: `token_ring_nonblocking.rs`, `decode_step_census.rs`,
+//! `qwen4exp_prefill_transient_cpu.rs`.
 //!
 //! `every_test_file_is_a_module` below reads this directory and this file,
 //! so a file that is not a module here fails the suite instead of silently
 //! not running.
 mod accept_frontier;
+mod attention_route;
 mod axes_registry;
 mod batch_norm;
+mod batched_cut_hold;
 mod batched_decode_tests;
 mod block_traits;
 mod cpu_flash_attn;
@@ -56,6 +59,7 @@ mod lfm2_kv_growth_refusal_metal;
 mod lfm2_moe;
 mod lfm2_paged_kv_blocker;
 mod lfm2_pass_plans;
+mod lfm2_prefill_activation;
 mod lfm2_qkv_layout;
 mod lfm2_sliding_ring_open;
 mod lfm2_spec_conv_rollback;
@@ -80,6 +84,9 @@ mod optimizer_quant_hooks;
 mod optimizer_remarks;
 mod optimizer_walk;
 mod page_cache_probe;
+mod pass_body_failure;
+mod pass_entry_failure;
+mod pinned_prefix;
 mod pos_embed_resample_tests;
 mod prefill_window_gemm;
 mod prepare_path;
@@ -110,6 +117,7 @@ mod qwen4exp_pass_plan_openers;
 mod qwen4exp_pass_plan_requests;
 mod qwen4exp_pass_plans_warmup;
 mod qwen4exp_prefill_plan_variants;
+mod qwen4exp_prefill_transient;
 mod qwen4exp_provisional;
 mod qwen4exp_ring_provisional;
 mod qwen4exp_routed_dense_arm;
@@ -135,7 +143,11 @@ mod recurrent_state_metal;
 mod ring_publish_binds;
 mod ring_publish_order;
 mod rnn;
+mod row_driver_ownership;
 mod sampled_cells;
+mod sampling_callback_preservation;
+mod sampling_host_contract;
+mod sampling_resolve;
 mod scale_synthetic;
 mod sdpa;
 mod sdpa_full_variants;
@@ -164,7 +176,11 @@ mod verify_window_gemm;
 /// files that owns its binary), read from the directory at test time.
 #[test]
 fn every_test_file_is_a_module() {
-    let own: &[&str] = &["token_ring_nonblocking", "decode_step_census"];
+    let own: &[&str] = &[
+        "token_ring_nonblocking",
+        "decode_step_census",
+        "qwen4exp_prefill_transient_cpu",
+    ];
     let dir = format!("{}/tests", lloom_manifest_dir());
     let me = include_str!("main.rs");
     let mut missing = Vec::new();

@@ -220,6 +220,11 @@ fn main() -> Result<()> {
         profile::enabled() || args.unarmed,
         "set CANDLE_METAL_PROFILE=1: the window is read off the profile's command-buffer records"
     );
+    if !args.unarmed {
+        lloom_tensor::tuning::require_profile_recorder().context(
+            "the armed PLE window requires cargo run --profile release-with-debug -p lloom --features metal,profile --example ple_window_probe -- <original arguments>",
+        )?;
+    }
     let gguf = match &args.gguf {
         Some(p) => p.clone(),
         None => hf_snapshot("models--ISTA-DASLab--Qwen3.8-Flash-Next-GSQ-RCO-GGUF")
@@ -259,6 +264,7 @@ fn main() -> Result<()> {
         memory_fraction: Some(args.memory_fraction),
         kv_precision: None,
         machine: None,
+        purpose: lloom::nn::attention::route::ExecutionPurpose::Production,
     };
     let slots = match args.slots.as_str() {
         "auto" => SlotBudget::Auto {

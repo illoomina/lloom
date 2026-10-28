@@ -4,14 +4,22 @@
 //! stderr line it always printed.
 //!
 //! Sources driven here, each against a control that must stay empty:
-//! - `attention_route`: a tiny LFM2 at head_dim 48, which no fused kernel
-//!   instantiates (the template's 64 is the control);
+//! - `attention_route`: a tiny LFM2 at head_dim 72, where the requested
+//!   decode kernel has no entry point and the load takes the nearest fused
+//!   one (the template's 64 is the control); at head_dim 48, which no fused
+//!   kernel instantiates, the load is refused rather than served composed;
 //! - `readback`: `--readback ring` asks for the adaptive commit its EOS read
 //!   cannot carry (`auto` is the control), and Qwen4-exp's `ring-fixed`,
 //!   whose forwards read their fed id back (its `auto` is the control);
 //! - `emulated_type`: an emulated type admitted on the engine's own device,
 //!   read through the loaded engine (a device that admitted none is the
-//!   control).
+//!   control);
+//! - `speculation`: the speculative body at one sequence on the paged KV,
+//!   given by name, over a tiny DSpark drafter (the front-end's in-place
+//!   default is the control).
+//!
+//! And the axes a named preset resolves to, on the loaded line, beside the
+//! front-end's own (the control), each load silent.
 #![cfg(feature = "serve")]
 
 use lloom::models::lfm2_testing::Lfm2Tiny;
@@ -44,6 +52,27 @@ fn write<F: TinyFamily>(dir: &Path, hidden_size: Option<usize>) -> PathBuf {
     }
     cfg.derive();
     TinyCheckpoint::<F>::new(cfg, Weights::default())
+        .write(dir)
+        .expect("the tiny checkpoint writes")
+}
+
+/// The tiny Qwen4-exp at head dim 32, which its fused attention route
+/// serves, so it loads as production loads it: the template's head dim (16)
+/// is the composed oracle's fixture, which production refuses on Metal.
+#[cfg(feature = "metal")]
+fn write_production_qwen(dir: &Path) -> PathBuf {
+    let mut cfg = Qwen4ExpTiny::template();
+    TinyConfig::set_axis(
+        &mut cfg,
+        "vocab_size",
+        Qwen4ExpTiny::tokenizer().vocab_size(),
+    );
+    assert!(
+        TinyConfig::set_axis(&mut cfg, "head_dim", 32),
+        "head_dim is an axis"
+    );
+    TinyConfig::derive(&mut cfg);
+    TinyCheckpoint::<Qwen4ExpTiny>::new(cfg, Weights::default())
         .write(dir)
         .expect("the tiny checkpoint writes")
 }
@@ -146,37 +175,60 @@ fn served_warnings(model: &Path, extra: &[&str]) -> Value {
     health
 }
 
-/// The attention route's fallback, on Metal: the head dim no fused kernel
-/// covers is named on the loaded line, `/health` and the model card, and
-/// the template's head dim (64, inside every set) names nothing.
+/// The attention route on Metal: at head_dim 72 the requested decode kernel
+/// (`sdpa_vector`) has no entry point and the load takes the nearest fused
+/// kernel, named on the loaded line, `/health` and the model card; the
+/// template's head dim (64, inside every set) names nothing. At head_dim 48
+/// no fused kernel covers the attention and the load is refused, naming the
+/// capability: the composed attention does not serve.
 #[cfg(feature = "metal")]
 #[test]
 fn an_uncovered_head_dim_reaches_every_surface() {
-    let dir = scratch("lfm2-48");
-    let off = write::<Lfm2Tiny>(&dir.join("off"), Some(96));
+    let dir = scratch("lfm2-72");
+    let off = write::<Lfm2Tiny>(&dir.join("off"), Some(144));
     let on = write::<Lfm2Tiny>(&dir.join("on"), None);
+    let uncovered = write::<Lfm2Tiny>(&dir.join("uncovered"), Some(96));
+    // `chat`'s Metal default is FlashDecoding over the paged KV layout (the
+    // front-end's model axes), and FlashDecoding is instantiated at 72; the
+    // arm asks for `sdpa_vector`, over the strided layout it reads.
+    let sdpa = ["--attn", "sdpa", "--kv-append", "cat"];
 
-    let stderr = chat(&off, &[]);
+    let stderr = chat(&off, &sdpa);
     let field = loaded_warnings(&stderr);
-    eprintln!("head_dim 48: load_warnings={field}");
+    eprintln!("head_dim 72: load_warnings={field}");
     assert!(
-        field.starts_with("attention_route: lfm2: attention head_dim 48 at F16 under Sdpa: "),
+        field.starts_with("attention_route: lfm2: attention head_dim 72 at F16 under Sdpa: "),
         "{field}"
     );
-    assert!(field.contains("(the composed attention"), "{field}");
+    assert!(field.contains("(the nearest fused kernel)"), "{field}");
+    assert!(!field.contains("composed"), "{field}");
     // The stderr line it always printed is still there, and is the message.
     let message = field.trim_start_matches("attention_route: ");
     assert!(
         stderr.lines().any(|l| l == message),
         "the stderr line is not the channel's message:\n{stderr}"
     );
-    assert_eq!(loaded_warnings(&chat(&on, &[])), "none");
+    assert_eq!(loaded_warnings(&chat(&on, &sdpa)), "none");
 
-    let list = served_warnings(&off, &[]);
+    let list = served_warnings(&off, &sdpa);
     assert_eq!(list.as_array().unwrap().len(), 1, "{list}");
     assert_eq!(list[0]["kind"], "attention_route");
     assert_eq!(list[0]["message"], message);
-    assert_eq!(served_warnings(&on, &[]), json!([]));
+    assert_eq!(served_warnings(&on, &sdpa), json!([]));
+
+    let out = Command::new(env!("CARGO_BIN_EXE_lloom"))
+        .args(["chat", "--model"])
+        .arg(&uncovered)
+        .args(["--raw", "-p", PROMPT, "-n", "2"])
+        .output()
+        .expect("lloom runs");
+    let refused = String::from_utf8_lossy(&out.stderr);
+    eprintln!("head_dim 48: {refused}");
+    assert!(!out.status.success(), "head_dim 48 loaded:\n{refused}");
+    assert!(
+        refused.contains("head dim 48") && refused.contains("does not serve on Metal"),
+        "refused without naming the capability:\n{refused}"
+    );
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -217,7 +269,7 @@ fn a_readback_clamp_reaches_every_surface() {
 #[test]
 fn qwen4exp_readback_that_reads_its_id_back_warns() {
     let dir = scratch("qwen");
-    let model = write::<Qwen4ExpTiny>(&dir, None);
+    let model = write_production_qwen(&dir);
     let tok = dir.join("tokenizer.json");
     let tok = tok.to_str().unwrap();
     let base = ["--tokenizer", tok, "--experts", "resident"];
@@ -234,7 +286,172 @@ fn qwen4exp_readback_that_reads_its_id_back_warns() {
         field.contains("each decode forward reads its fed id back"),
         "{field}"
     );
-    assert_eq!(loaded_warnings(&chat(&model, &base)), "none");
+    // `auto` through `chat` is the front-end's ring for every family on
+    // Metal (the `decode.readback.*` rows), which on this tiny reads its
+    // fed id back too: the same warning, from the resolved arm, beside the
+    // EOS-gate one (its kernels carry no gated variant). The library's own
+    // `auto` (no front-end) stays blocking and silent.
+    let auto = loaded_warnings(&chat(&model, &base));
+    assert!(
+        auto.contains("readback: ring-gpubatch-nonblocking lookahead=1 ")
+            && auto.contains("each decode forward reads its fed id back")
+            && auto.contains("eos_gate is off on qwen4exp"),
+        "{auto}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A DSpark drafter for the tiny LFM2 written at `dir`: one layer at the
+/// target's width and vocabulary over its layers 0 and 1, fixed-ramp
+/// weights. What `DSparkConfig::read_from_dir` and the drafter's loader read.
+#[cfg(feature = "metal")]
+fn write_tiny_drafter(dir: &Path, target: &Path) -> PathBuf {
+    use lloom_tensor::{Device, Tensor};
+    let cfg: Value =
+        serde_json::from_str(&std::fs::read_to_string(target.join("config.json")).unwrap())
+            .unwrap();
+    let at = |k: &str| cfg[k].as_u64().unwrap_or_else(|| panic!("tiny config {k}")) as usize;
+    let (h, vocab, layers) = (at("hidden_size"), at("vocab_size"), at("num_hidden_layers"));
+    let (heads, kv_heads, hd, inter, rank) = (2usize, 1usize, h / 2, 2 * h, 8usize);
+    let taps = [0usize, 1];
+    assert!(
+        taps.iter().all(|&l| l + 1 < layers),
+        "the taps fit the target"
+    );
+    std::fs::create_dir_all(dir).unwrap();
+    let config = json!({
+        "architectures": ["Lfm2DSparkDraftModel"],
+        "hidden_size": h, "num_hidden_layers": 1, "num_attention_heads": heads,
+        "num_key_value_heads": kv_heads, "head_dim": hd, "intermediate_size": inter,
+        "vocab_size": vocab, "rms_norm_eps": 1e-5, "rope_theta": 1e6,
+        "rope_is_neox_style": false, "block_size": 9, "markov_rank": rank,
+        "enable_confidence_head": true,
+        "dflash_config": {"target_layer_ids": taps, "mask_token_id": vocab - 1,
+                          "num_target_layers": layers},
+    });
+    std::fs::write(dir.join("config.json"), config.to_string()).unwrap();
+    let mut t = std::collections::HashMap::new();
+    let mut fill = |name: String, shape: Vec<usize>| {
+        let n: usize = shape.iter().product();
+        let v: Vec<f32> = (0..n).map(|i| ((i % 13) as f32 - 6.0) / 64.0).collect();
+        t.insert(
+            name,
+            Tensor::from_vec(v, shape.as_slice(), &Device::Cpu).unwrap(),
+        );
+    };
+    fill("fc.weight".into(), vec![h, taps.len() * h]);
+    fill("hidden_norm.weight".into(), vec![h]);
+    fill("norm.weight".into(), vec![h]);
+    let p = "layers.0";
+    fill(format!("{p}.self_attn.q_proj.weight"), vec![heads * hd, h]);
+    fill(
+        format!("{p}.self_attn.k_proj.weight"),
+        vec![kv_heads * hd, h],
+    );
+    fill(
+        format!("{p}.self_attn.v_proj.weight"),
+        vec![kv_heads * hd, h],
+    );
+    fill(format!("{p}.self_attn.o_proj.weight"), vec![h, heads * hd]);
+    fill(format!("{p}.self_attn.q_norm.weight"), vec![hd]);
+    fill(format!("{p}.self_attn.k_norm.weight"), vec![hd]);
+    fill(format!("{p}.mlp.gate_proj.weight"), vec![inter, h]);
+    fill(format!("{p}.mlp.up_proj.weight"), vec![inter, h]);
+    fill(format!("{p}.mlp.down_proj.weight"), vec![h, inter]);
+    fill(format!("{p}.input_layernorm.weight"), vec![h]);
+    fill(format!("{p}.post_attention_layernorm.weight"), vec![h]);
+    fill("markov_head.markov_w1.weight".into(), vec![vocab, rank]);
+    fill("markov_head.markov_w2.weight".into(), vec![vocab, rank]);
+    fill("confidence_head.proj.weight".into(), vec![1, h + rank]);
+    fill("confidence_head.proj.bias".into(), vec![1]);
+    lloom_tensor::safetensors::save(&t, dir.join("model.safetensors")).unwrap();
+    dir.to_path_buf()
+}
+
+/// The speculative body at one sequence: chat's and serve's default is the
+/// in-place KV (the front-end's row), and loads silent; the paged KV, given
+/// by name, is served as asked and named on every surface — its verify
+/// window attends over a copy of the cache gathered every round.
+#[cfg(feature = "metal")]
+#[test]
+fn a_paged_speculative_body_at_one_sequence_reaches_every_surface() {
+    let dir = scratch("dspark");
+    let model = write::<Lfm2Tiny>(&dir.join("target"), None);
+    let drafter = write_tiny_drafter(&dir.join("drafter"), &model);
+    let draft = drafter.to_str().unwrap();
+    let spec = ["--dspark", "--draft-dir", draft];
+    let paged = ["--dspark", "--draft-dir", draft, "--kv-append", "paged"];
+
+    let stderr = chat(&model, &spec);
+    let loaded = stderr
+        .lines()
+        .find(|l| l.starts_with("[loaded "))
+        .unwrap_or_else(|| panic!("no loaded line:\n{stderr}"));
+    assert!(loaded.contains("KvAppend=InPlace"), "{loaded}");
+    assert_eq!(loaded_warnings(&stderr), "none");
+
+    let stderr = chat(&model, &paged);
+    let field = loaded_warnings(&stderr);
+    eprintln!("--dspark --kv-append paged: load_warnings={field}");
+    assert!(
+        field.starts_with("speculation: at --batch 1 the speculative body runs on the paged KV"),
+        "{field}"
+    );
+    let message = field.trim_start_matches("speculation: ");
+    assert!(
+        stderr.lines().any(|l| l == format!("[dspark: {message}]")),
+        "the stderr line is not the channel's message:\n{stderr}"
+    );
+
+    let list = served_warnings(&model, &paged);
+    assert_eq!(list.as_array().unwrap().len(), 1, "{list}");
+    assert_eq!(list[0]["kind"], "speculation");
+    assert_eq!(list[0]["message"], message);
+    assert_eq!(served_warnings(&model, &spec), json!([]));
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A named preset's axes reach the load, silent: chat's Metal default puts
+/// the LFM2 on the paged KV with FlashDecoding (the front-end's rows), and
+/// the crown named by flag or by key loads its own in-place KV with sdpa; a
+/// key named beside the preset holds, and the pool preset is the rows' arms.
+#[cfg(feature = "metal")]
+#[test]
+fn a_named_preset_keeps_its_axes_on_the_loaded_line() {
+    let dir = scratch("preset");
+    let model = write::<Lfm2Tiny>(&dir, None);
+    let cases: [(&[&str], &str, &str); 5] = [
+        (&[], "KvAppend=Paged", "AttnImpl=FlashDecoding"),
+        (&["--cache", "crown"], "KvAppend=InPlace", "AttnImpl=Sdpa"),
+        (
+            &["--set", "models.lfm2.preset=crown"],
+            "KvAppend=InPlace",
+            "AttnImpl=Sdpa",
+        ),
+        (
+            &["--cache", "crown", "--attn", "flash"],
+            "KvAppend=InPlace",
+            "AttnImpl=FlashDecoding",
+        ),
+        (
+            &["--cache", "pool"],
+            "KvAppend=Paged",
+            "AttnImpl=FlashDecoding",
+        ),
+    ];
+    for (extra, kv, attn) in cases {
+        let stderr = chat(&model, extra);
+        let loaded = stderr
+            .lines()
+            .find(|l| l.starts_with("[loaded "))
+            .unwrap_or_else(|| panic!("no loaded line:\n{stderr}"));
+        eprintln!("{extra:?}: {loaded}");
+        assert!(
+            loaded.contains(kv) && loaded.contains(attn),
+            "{extra:?}: {loaded}"
+        );
+        assert_eq!(loaded_warnings(&stderr), "none", "{extra:?}");
+    }
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -255,7 +472,7 @@ fn an_admitted_emulated_type_reaches_the_engine() {
     }
     let dir = scratch("emulated");
     let lfm2 = write::<Lfm2Tiny>(&dir.join("lfm2"), None);
-    let qwen = write::<Qwen4ExpTiny>(&dir.join("qwen"), None);
+    let qwen = write_production_qwen(&dir.join("qwen"));
     let tok = dir.join("qwen/tokenizer.json");
     let lfm2_args = vec![
         "t".to_string(),

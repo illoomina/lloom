@@ -255,7 +255,25 @@ pub enum SyncKind {
 pub struct AuditStream {
     pub dispatches: Vec<AuditDispatch>,
     pub syncs: Vec<AuditSync>,
+    /// Where a range starts holding a new logical value (its storage reused),
+    /// as `(commands recorded before it, range)`, in recording order.
+    pub values: Vec<(usize, AuditBinding)>,
     fence_generations: HashMap<usize, u64>,
+}
+
+/// Bytes of a new value read before any write of that value: the successor
+/// did not initialize what its consumer reads (`dependency-ordered-reuse-
+/// design.md` §3, obligation 3).
+#[cfg(feature = "hazard-audit")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UninitializedRead {
+    pub reader_seq: u64,
+    pub reader_kernel: String,
+    pub ptr: usize,
+    /// The first byte of the read no earlier write of the value covers, and
+    /// the end of that gap.
+    pub from: usize,
+    pub to: usize,
 }
 
 #[cfg(feature = "hazard-audit")]
@@ -323,6 +341,82 @@ impl AuditStream {
             event,
             value,
         });
+    }
+
+    /// `ptr`'s bytes `offset..offset + len` (a zero `len`: the allocation
+    /// from `offset`) start holding a new value here: its storage is reused.
+    pub fn new_value(&mut self, ptr: usize, offset: usize, len: usize) {
+        self.values.push((
+            self.dispatches.len(),
+            AuditBinding {
+                ptr,
+                offset,
+                len,
+                is_output: true,
+            },
+        ));
+    }
+
+    /// Every read of a new value's bytes that no earlier write of that value
+    /// covers, up to the next new value of the same storage. A write in the
+    /// reading command itself does not count: it is not ordered before the
+    /// read. Ordering of the writes that do count is [`Self::cover`]'s
+    /// question, not this one's.
+    pub fn uninitialized_reads(&self) -> Vec<UninitializedRead> {
+        let span = |b: &AuditBinding| {
+            let end = if b.len == 0 {
+                usize::MAX
+            } else {
+                b.offset.saturating_add(b.len)
+            };
+            (b.offset, end)
+        };
+        let mut found = Vec::new();
+        for (vi, (start, value)) in self.values.iter().enumerate() {
+            let end = self.values[vi + 1..]
+                .iter()
+                .find(|(_, later)| later.overlaps(value))
+                .map_or(self.dispatches.len(), |(at, _)| *at);
+            let (v0, v1) = span(value);
+            for r in *start..end {
+                let d = &self.dispatches[r];
+                for b in d
+                    .bindings
+                    .iter()
+                    .filter(|b| !b.is_output && b.overlaps(value))
+                {
+                    let (b0, b1) = span(b);
+                    let (lo, hi) = (b0.max(v0), b1.min(v1));
+                    let mut written: Vec<(usize, usize)> = self.dispatches[*start..r]
+                        .iter()
+                        .flat_map(|w| w.bindings.iter())
+                        .filter(|w| w.is_output && w.ptr == value.ptr)
+                        .map(span)
+                        .collect();
+                    written.sort_unstable();
+                    let mut at = lo;
+                    for (w0, w1) in written {
+                        if w0 > at {
+                            break;
+                        }
+                        at = at.max(w1);
+                        if at >= hi {
+                            break;
+                        }
+                    }
+                    if at < hi {
+                        found.push(UninitializedRead {
+                            reader_seq: d.seq,
+                            reader_kernel: d.kernel.clone(),
+                            ptr: value.ptr,
+                            from: at,
+                            to: hi,
+                        });
+                    }
+                }
+            }
+        }
+        found
     }
 
     /// Cover the stream under `policy`.

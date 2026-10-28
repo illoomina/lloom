@@ -19,17 +19,13 @@ use crate::{CpuStorage, CpuStorageRef, DType, Error, Layout, Result, Shape};
 // never used here — the contiguous const-set path uses a function-local
 // `use crate::kernels::unary::contiguous` instead. RESTRUCTURING §7.1.)
 use crate::kernels::{
-    metal::{
-        Backing, Buffer, BufferHandle, Commands, Commit, Device, DeviceBuffer, HeapChunks,
-        MTLResourceOptions, Mapped, ResidencySet,
-    },
-    BufferOffset, CallConvTranspose2dCfg, ConvKernel, IndexingKernel, Kernels, RESOURCE_OPTIONS,
+    metal::{Buffer, BufferHandle, Commands, Device, ResidencySet},
+    BufferOffset, CallConvTranspose2dCfg, ConvKernel, IndexingKernel, Kernels,
 };
 #[cfg(feature = "metal-debug-labels")]
 use objc2_foundation::NSString;
 #[cfg(feature = "metal-debug-labels")]
 use objc2_metal::MTLCommandQueue;
-use std::ffi::c_void;
 use std::sync::{Arc, PoisonError, TryLockError};
 
 mod allocation_namespace;
@@ -51,7 +47,11 @@ pub use device::{
 };
 mod host_fed;
 mod host_slot;
-use device::{DeviceTeardown, PRIVATE_RESOURCE_OPTIONS};
+mod sampling_multinomial;
+mod sampling_topk;
+use device::DeviceTeardown;
+#[cfg(test)]
+use device::PRIVATE_RESOURCE_OPTIONS;
 pub use host_fed::{HostEvent, HostFedRing, PublishEvent};
 pub use host_slot::HostSlot;
 
@@ -228,8 +228,9 @@ fn readback_trace_on() -> bool {
         1 => false,
         2 => true,
         _ => {
-            let on = crate::tuning::tuning().instrument.readback_trace;
-            set_readback_trace(on);
+            let requested = crate::tuning::tuning().instrument.readback_trace;
+            let on = crate::tuning::effective_instrument("readback_trace", requested);
+            READBACK_TRACE.store(if on { 2 } else { 1 }, std::sync::atomic::Ordering::Relaxed);
             on
         }
     }
@@ -237,12 +238,16 @@ fn readback_trace_on() -> bool {
 
 /// Turn the readback attribution on or off for the process (a test's
 /// switch; the knob sets it for a run).
-pub fn set_readback_trace(on: bool) {
+pub fn set_readback_trace(on: bool) -> crate::Result<()> {
+    crate::tuning::check_profile_request("readback_trace", on).map_err(crate::Error::wrap)?;
     READBACK_TRACE.store(if on { 2 } else { 1 }, std::sync::atomic::Ordering::Relaxed);
+    Ok(())
 }
 
+#[cfg(any(debug_assertions, feature = "profile"))]
 type ReadbackSites = std::collections::HashMap<(&'static str, String), u64>;
 
+#[cfg(any(debug_assertions, feature = "profile"))]
 fn readback_sites_map() -> &'static parking_lot::Mutex<ReadbackSites> {
     static SITES: std::sync::OnceLock<parking_lot::Mutex<ReadbackSites>> =
         std::sync::OnceLock::new();
@@ -250,15 +255,19 @@ fn readback_sites_map() -> &'static parking_lot::Mutex<ReadbackSites> {
 }
 
 /// Count one readback of `kind` at its call site, when the trace is on.
-fn note_readback(kind: &'static str) {
+fn note_readback(#[allow(unused_variables)] kind: &'static str) {
     if readback_trace_on() {
-        let site = device::call_site();
-        *readback_sites_map().lock().entry((kind, site)).or_default() += 1;
+        #[cfg(any(debug_assertions, feature = "profile"))]
+        {
+            let site = device::call_site();
+            *readback_sites_map().lock().entry((kind, site)).or_default() += 1;
+        }
     }
 }
 
 /// What `LLOOM_READBACK_TRACE` attributed since the last call: `(kind, site,
 /// readbacks)`, most first. Taking clears it, so a caller reads one window.
+#[cfg(any(debug_assertions, feature = "profile"))]
 pub fn readback_sites() -> Vec<(&'static str, String, u64)> {
     let mut v: Vec<(&'static str, String, u64)> = std::mem::take(&mut *readback_sites_map().lock())
         .into_iter()
@@ -266,6 +275,11 @@ pub fn readback_sites() -> Vec<(&'static str, String, u64)> {
         .collect();
     v.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.1.cmp(&b.1)));
     v
+}
+
+#[cfg(not(any(debug_assertions, feature = "profile")))]
+pub fn readback_sites() -> Vec<(&'static str, String, u64)> {
+    Vec::new()
 }
 
 /// A rank-1 storage's bytes copied to a CPU-mapped staging buffer and fenced by
@@ -713,7 +727,7 @@ impl BackendStorage for MetalStorage {
             }
             .map_err(MetalError::from)?;
         }
-        Ok(Self::new_allocated(buffer, device.clone(), el, dtype)?)
+        Self::new_allocated(buffer, device.clone(), el, dtype)
     }
 
     fn powf(&self, layout: &Layout, pow: f64) -> Result<Self> {
@@ -775,7 +789,7 @@ impl BackendStorage for MetalStorage {
             }
             .map_err(MetalError::from)?;
         }
-        Ok(Self::new_allocated(buffer, device.clone(), el, dtype)?)
+        Self::new_allocated(buffer, device.clone(), el, dtype)
     }
 
     fn elu(&self, layout: &Layout, alpha: f64) -> Result<Self> {
@@ -837,7 +851,7 @@ impl BackendStorage for MetalStorage {
             }
             .map_err(MetalError::from)?;
         }
-        Ok(Self::new_allocated(buffer, device.clone(), el, dtype)?)
+        Self::new_allocated(buffer, device.clone(), el, dtype)
     }
 
     fn reduce_op(&self, op: ReduceOp, layout: &Layout, sum_dims: &[usize]) -> Result<Self> {
@@ -926,7 +940,7 @@ impl BackendStorage for MetalStorage {
             }
             .map_err(MetalError::from)?;
 
-            return Ok(Self::new_allocated(buffer, device, dst_el, dtype)?);
+            return Self::new_allocated(buffer, device, dst_el, dtype);
         }
 
         let (name, check_empty, return_index) = match (op, self.dtype) {
@@ -989,7 +1003,7 @@ impl BackendStorage for MetalStorage {
         }
         .map_err(MetalError::from)?;
 
-        Ok(Self::new_allocated(buffer, device, dst_el, dtype)?)
+        Self::new_allocated(buffer, device, dst_el, dtype)
     }
 
     fn cmp(&self, op: CmpOp, rhs: &Self, lhs_l: &Layout, rhs_l: &Layout) -> Result<Self> {
@@ -1225,12 +1239,12 @@ impl BackendStorage for MetalStorage {
             }
             .map_err(MetalError::from)?;
         }
-        Ok(Self::new_allocated(
+        Self::new_allocated(
             buffer,
             device.clone(),
             el_count,
             dtype,
-        )?)
+        )
     }
 
     fn unary_impl<B: UnaryOpT>(&self, layout: &Layout) -> Result<Self> {
@@ -1422,12 +1436,12 @@ impl BackendStorage for MetalStorage {
             .map_err(MetalError::from)?;
         }
 
-        Ok(Self::new_allocated(
+        Self::new_allocated(
             buffer,
             device.clone(),
             el_count,
             dtype,
-        )?)
+        )
     }
 
     fn binary_impl<B: BinaryOpT>(
@@ -1501,7 +1515,7 @@ impl BackendStorage for MetalStorage {
             )
         }
         .map_err(MetalError::from)?;
-        Ok(Self::new_allocated(buffer, device, el, dtype)?)
+        Self::new_allocated(buffer, device, el, dtype)
     }
 
     fn conv1d(
@@ -1677,12 +1691,12 @@ impl BackendStorage for MetalStorage {
             .map_err(MetalError::from)?,
         }
 
-        Ok(Self::new_allocated(
+        Self::new_allocated(
             dst,
             self.device.clone(),
             dst_el,
             self.dtype,
-        )?)
+        )
     }
 
     fn conv_transpose1d(
@@ -1794,12 +1808,12 @@ impl BackendStorage for MetalStorage {
             .map_err(MetalError::from)?;
             buffer
         };
-        Ok(Self::new_allocated(
+        Self::new_allocated(
             buffer,
             self.device.clone(),
             dst_el,
             self.dtype,
-        )?)
+        )
     }
 
     fn conv2d(
@@ -1942,12 +1956,12 @@ impl BackendStorage for MetalStorage {
             )
         }
         .map_err(MetalError::from)?;
-        Ok(Self::new_allocated(
+        Self::new_allocated(
             buffer,
             self.device.clone(),
             dst_el,
             self.dtype,
-        )?)
+        )
     }
 
     fn avg_pool2d(
@@ -1990,12 +2004,12 @@ impl BackendStorage for MetalStorage {
             )
         }
         .map_err(MetalError::from)?;
-        Ok(Self::new_allocated(
+        Self::new_allocated(
             buffer,
             self.device.clone(),
             dst_el,
             self.dtype,
-        )?)
+        )
     }
 
     fn max_pool2d(
@@ -2038,12 +2052,12 @@ impl BackendStorage for MetalStorage {
             )
         }
         .map_err(MetalError::from)?;
-        Ok(Self::new_allocated(
+        Self::new_allocated(
             buffer,
             self.device.clone(),
             dst_el,
             self.dtype,
-        )?)
+        )
     }
 
     fn upsample_nearest1d(&self, _: &Layout, _: usize) -> Result<Self> {
@@ -2089,12 +2103,12 @@ impl BackendStorage for MetalStorage {
             )
         }
         .map_err(MetalError::from)?;
-        Ok(Self::new_allocated(
+        Self::new_allocated(
             buffer,
             self.device.clone(),
             dst_el,
             self.dtype,
-        )?)
+        )
     }
 
     fn upsample_bilinear2d(
@@ -2151,12 +2165,12 @@ impl BackendStorage for MetalStorage {
         }
         .map_err(MetalError::from)?;
 
-        Ok(Self::new_allocated(
+        Self::new_allocated(
             buffer,
             self.device.clone(),
             dst_el,
             self.dtype,
-        )?)
+        )
     }
 
     fn gather(&self, src_l: &Layout, ids: &Self, ids_l: &Layout, dim: usize) -> Result<Self> {
@@ -2218,7 +2232,7 @@ impl BackendStorage for MetalStorage {
             )
         }
         .map_err(MetalError::from)?;
-        Ok(Self::new_allocated(buffer, device.clone(), dst_el, dtype)?)
+        Self::new_allocated(buffer, device.clone(), dst_el, dtype)
     }
 
     fn scatter_set(
@@ -2359,7 +2373,7 @@ impl BackendStorage for MetalStorage {
             )
         }
         .map_err(MetalError::from)?;
-        Ok(Self::new_allocated(buffer, device.clone(), dst_el, dtype)?)
+        Self::new_allocated(buffer, device.clone(), dst_el, dtype)
     }
 
     fn index_add(
@@ -2480,12 +2494,12 @@ impl BackendStorage for MetalStorage {
         }
         .map_err(MetalError::from)?;
 
-        Ok(Self::new_allocated(
+        Self::new_allocated(
             buffer,
             self.device.clone(),
             b * m * n,
             self.dtype(),
-        )?)
+        )
     }
 
     fn copy2d(
@@ -2782,7 +2796,7 @@ impl MetalStorage {
             )
         }
         .map_err(MetalError::from)?;
-        Ok(Self::new_allocated(buffer, device.clone(), 1, DType::U32)?)
+        Self::new_allocated(buffer, device.clone(), 1, DType::U32)
     }
 
     /// The multinomial draw by inverse CDF (`sample_inverse_cdf_f32`): over
@@ -2929,12 +2943,12 @@ impl MetalStorage {
             .map_err(MetalError::from)?;
             buffer
         };
-        Ok(Self::new_allocated(
+        Self::new_allocated(
             buffer,
             device.clone(),
             el_count,
             dtype,
-        )?)
+        )
     }
 
     /// Stage `count` elements starting at element `offset` for a later host
@@ -3363,6 +3377,7 @@ impl BackendDevice for MetalDevice {
     type Storage = MetalStorage;
 
     fn new(ordinal: usize) -> Result<Self> {
+        crate::tuning::try_tuning().map_err(crate::Error::wrap)?;
         // Cold metadata-only process payer, separate from native allocation custody.
         // Neither payer acquires a machine owner or latches first model load.
         // The process policy remains safely configurable before that load.
@@ -3502,12 +3517,12 @@ impl BackendDevice for MetalDevice {
             .with_size_for(shape.elem_count(), dtype)
             .with_label("alloc-uninit")
             .build()?;
-        Ok(MetalStorage::new_allocated(
+        MetalStorage::new_allocated(
             buffer,
             self.clone(),
             shape.elem_count(),
             dtype,
-        )?)
+        )
     }
 
     fn zeros_impl(&self, shape: &Shape, dtype: DType) -> Result<MetalStorage> {
@@ -3517,12 +3532,12 @@ impl BackendDevice for MetalDevice {
             .with_zeros(size)
             .with_label("zeros")
             .build()?;
-        Ok(MetalStorage::new_allocated(
+        MetalStorage::new_allocated(
             buffer,
             self.clone(),
             shape.elem_count(),
             dtype,
-        )?)
+        )
     }
 
     fn storage_from_slice<T: crate::WithDType>(&self, s: &[T]) -> Result<Self::Storage> {
@@ -3605,12 +3620,12 @@ impl BackendDevice for MetalDevice {
                 return Err(Error::UnsupportedDTypeForOp(T::DTYPE, "to_dtype").bt())
             }
         };
-        Ok(Self::Storage::new_allocated(
+        Self::Storage::new_allocated(
             buffer?,
             self.clone(),
             count,
             T::DTYPE,
-        )?)
+        )
     }
 
     fn storage_from_cpu_storage(&self, storage: &CpuStorage) -> Result<Self::Storage> {
@@ -3693,12 +3708,12 @@ impl BackendDevice for MetalDevice {
                 return Err(Error::UnsupportedDTypeForOp(storage.dtype(), "to_dtype").bt())
             }
         };
-        Ok(Self::Storage::new_allocated(
+        Self::Storage::new_allocated(
             buffer?,
             self.clone(),
             count,
             storage.dtype(),
-        )?)
+        )
     }
 
     fn storage_from_cpu_storage_owned(&self, storage: CpuStorage) -> Result<Self::Storage> {
@@ -3740,12 +3755,12 @@ impl BackendDevice for MetalDevice {
         }
         .map_err(MetalError::from)?;
 
-        Ok(Self::Storage::new_allocated(
+        Self::Storage::new_allocated(
             buffer,
             self.clone(),
             shape.elem_count(),
             dtype,
-        )?)
+        )
     }
 
     fn rand_normal(
@@ -3783,12 +3798,12 @@ impl BackendDevice for MetalDevice {
         }
         .map_err(MetalError::from)?;
 
-        Ok(Self::Storage::new_allocated(
+        Self::Storage::new_allocated(
             buffer,
             self.clone(),
             shape.elem_count(),
             dtype,
-        )?)
+        )
     }
 
     fn set_seed(&self, seed: u64) -> Result<()> {
@@ -3875,6 +3890,14 @@ impl BackendDevice for MetalDevice {
             return Ok(());
         }
         MetalDevice::finish_pass(&view)
+    }
+
+    fn abort_pass(&self) -> Result<()> {
+        let view = self.execution_device()?;
+        if !view.pass_plans_enabled() {
+            return Ok(());
+        }
+        MetalDevice::abort_pass(&view)
     }
 }
 
@@ -5136,4 +5159,25 @@ mod write_host_slice_tests {
 fn copy2d_no_blit() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| crate::tuning::tuning().metal.copy2d_no_blit)
+}
+
+#[cfg(all(test, any(debug_assertions, feature = "profile")))]
+mod attribution_build_tests {
+    #[test]
+    fn readback_attribution_obeys_its_atomic_switch_without_a_device() {
+        super::set_readback_trace(false).unwrap();
+        let _ = super::readback_sites();
+        super::note_readback("host-only-disabled");
+        assert!(super::readback_sites().is_empty());
+        super::set_readback_trace(true).unwrap();
+        super::note_readback("host-only-control");
+        super::note_readback("host-only-control");
+        let sites = super::readback_sites();
+        assert_eq!(
+            sites,
+            vec![("host-only-control", "(no lloom frame)".into(), 2)]
+        );
+        assert!(super::readback_sites().is_empty());
+        super::set_readback_trace(false).unwrap();
+    }
 }

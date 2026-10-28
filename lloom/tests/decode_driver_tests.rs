@@ -22,7 +22,7 @@ use lloom::generation::{
 };
 use lloom::nn::decode::IN_FLIGHT_STEPS;
 use lloom::nn::speculator::{Draft, NoProbe, SeqId, TargetProbe};
-use lloom::nn::{CausalLM, DecodeOptions, IdentityProposer, Model, Session, Speculator};
+use lloom::nn::{CausalLM, DecodeOptions, IdentityProposer, Session, Speculator};
 use lloom_tensor::{DType, Device, Result, Tensor};
 
 const VOCAB: usize = 64;
@@ -53,77 +53,10 @@ fn chain(start: u32, max: usize) -> (Vec<u32>, bool) {
     (ids, false)
 }
 
-/// A decoder whose logits peak at `next_of(last token)`, device-side.
-struct Chain {
-    /// `[VOCAB]` f32: `table[t] = next_of(t)`.
-    table: Tensor,
-    /// `[VOCAB, VOCAB]` f32 identity: row `t` is the one-hot logits for `t`.
-    eye: Tensor,
-    /// A square f32 matrix every forward multiplies by itself and drops: GPU
-    /// time no output depends on, so a loop that nothing paces runs ahead of
-    /// the device. `None` on the plain fixture.
-    ballast: Option<Tensor>,
-}
-
-impl Chain {
-    fn new(device: &Device) -> Result<Self> {
-        Self::with_ballast(device, 0)
-    }
-
-    /// The fixture with a `[n, n]` matmul of ballast per forward (`n = 0`: none).
-    fn with_ballast(device: &Device, n: usize) -> Result<Self> {
-        let table: Vec<f32> = (0..VOCAB as u32).map(|t| next_of(t) as f32).collect();
-        let ballast = (n > 0)
-            .then(|| Tensor::ones((n, n), DType::F32, device))
-            .transpose()?;
-        Ok(Self {
-            table: Tensor::from_vec(table, VOCAB, device)?,
-            eye: Tensor::eye(VOCAB, DType::F32, device)?,
-            ballast,
-        })
-    }
-}
-
-impl Model for Chain {
-    type Config = ();
-    fn from_weights(_vb: lloom::nn::VarBuilder, _cfg: &()) -> Result<Self> {
-        lloom_tensor::bail!("Chain has no weights")
-    }
-}
-
-impl CausalLM for Chain {
-    /// Positions seen, so a test can check `pos` against the cache.
-    type Cache = usize;
-
-    fn new_cache(&self, _cfg: &(), _dev: &Device) -> Result<usize> {
-        Ok(0)
-    }
-
-    fn embed(&self, tokens: &Tensor) -> Result<Tensor> {
-        Ok(tokens.clone())
-    }
-
-    fn forward_embeds(&self, embeds: &Tensor, pos: usize, cache: &mut usize) -> Result<Tensor> {
-        let (_b, seq) = embeds.dims2()?;
-        assert_eq!(
-            *cache, pos,
-            "forward at pos {pos} against a cache of {cache}"
-        );
-        *cache += seq;
-        if let Some(b) = &self.ballast {
-            b.matmul(b)?;
-        }
-        // The last position's token, `[1]` U32, then its successor, then the
-        // one-hot row: all on the device.
-        let last = embeds.narrow(1, seq - 1, 1)?.flatten_all()?;
-        let next = self.table.index_select(&last, 0)?.to_dtype(DType::U32)?;
-        self.eye.index_select(&next, 0)
-    }
-
-    fn vocab_size(&self) -> usize {
-        VOCAB
-    }
-}
+use lloom as subject;
+#[path = "support/chain.rs"]
+mod chain_fixture;
+use chain_fixture::{Chain, RecordingChain};
 
 /// The CPU, and under `metal` the Metal device. A Metal device that fails to
 /// open is a failure, not a skip: every Metal-only assertion in this file
@@ -363,6 +296,15 @@ fn assert_step_clock(stats: &lloom::nn::DecodeStats, tokens: usize, what: &str) 
             "compiled out"
         }
     );
+    if !STEP_CLOCK {
+        assert_eq!(
+            stats.step_ns.capacity(),
+            0,
+            "{what}: an unavailable step clock must not reserve token-sized storage"
+        );
+        assert!(stats.prefill_census.is_none(), "{what}: prefill census");
+        assert!(stats.step0_census.is_none(), "{what}: step-0 census");
+    }
 }
 
 fn run(
@@ -1118,6 +1060,104 @@ fn a_ring_reader_sees_the_loops_stream_off_the_ring() -> Result<()> {
             }
         }
     }
+    Ok(())
+}
+
+#[test]
+fn actual_prefill_work_session_cpu_records_literal_forwards() -> Result<()> {
+    eprintln!("EXECUTABLE {}", std::env::current_exe().unwrap().display());
+    let model = RecordingChain::cpu()?;
+    let mut session = Session::with_pos(&model, 17, 17);
+    let mut rb = Blocking::new(&[EOS], &Device::Cpu)?;
+    let mut options = DecodeOptions::new(1);
+    options.prefill_ubatch = 3;
+    options.prefill_tile = 4;
+    options.in_flight_depth = 65;
+    let prompt = [9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 0];
+    assert_eq!(session.prefill(&mut rb, &prompt, &options)?.units, 3);
+    assert_eq!(*model.forwards.borrow(), [(17, 3), (20, 4), (24, 4)]);
+    eprintln!(
+        "ACTUAL Session::prefill tiled forwards={:?}",
+        model.forwards.borrow()
+    );
+    assert_eq!(session.pos(), 28);
+    assert_eq!(session.tokens(), prompt);
+    assert_eq!(*session.sequence().cache(), 28);
+    let held = session.last_logits().unwrap().to_vec1::<f32>()?;
+    let mut expected = vec![0.0; VOCAB];
+    expected[3] = 1.0;
+    assert_eq!(held, expected);
+    assert_eq!(
+        session.prefill(&mut rb, &[], &options)?,
+        lloom::nn::PrefillOut::default()
+    );
+    assert_eq!(*model.forwards.borrow(), [(17, 3), (20, 4), (24, 4)]);
+    assert_eq!(session.last_logits().unwrap().to_vec1::<f32>()?, expected);
+
+    model.forwards.borrow_mut().clear();
+    options.prefill_tile = 0;
+    options.prefill_schedule = Some(vec![3]);
+    options.prefill_bulk = 4;
+    options.prefill_pacer_depth = 1;
+    assert_eq!(session.prefill(&mut rb, &[9; 9], &options)?.units, 4);
+    assert_eq!(
+        *model.forwards.borrow(),
+        [(28, 3), (31, 4), (35, 1), (36, 1)]
+    );
+    eprintln!(
+        "ACTUAL Session::prefill scheduled forwards={:?}",
+        model.forwards.borrow()
+    );
+    assert_eq!(session.pos(), 37);
+    assert_eq!(*session.sequence().cache(), 37);
+
+    model.forwards.borrow_mut().clear();
+    options.prefill_schedule = None;
+    assert_eq!(session.prefill(&mut rb, &prompt, &options)?.units, 2);
+    assert_eq!(*model.forwards.borrow(), [(37, 3), (40, 8)]);
+    eprintln!(
+        "ACTUAL Session::prefill tile0 forwards={:?}",
+        model.forwards.borrow()
+    );
+    assert_eq!(session.pos(), 48);
+    Ok(())
+}
+
+#[test]
+fn actual_prefill_work_k1_cpu_records_literal_forwards() -> Result<()> {
+    let model = RecordingChain::cpu()?;
+    let mut session = Session::with_pos(&model, 17, 17);
+    let mut rb = Blocking::new(&[EOS], &Device::Cpu)?;
+    let options = DecodeOptions {
+        prefill_ubatch: 3,
+        prefill_tile: 4,
+        in_flight_depth: 3,
+        prefill_pacer_depth: 8,
+        ..DecodeOptions::new(1)
+    };
+    let prompt = [9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 0];
+    let out = session.decode(
+        &mut IdentityProposer,
+        &mut rb,
+        &mut greedy(),
+        &prompt,
+        &options,
+        &mut sink,
+    )?;
+    assert_eq!(out.stats.prefill_units, 3);
+    assert_eq!(out.ids, [3]);
+    assert!(!out.eos);
+    assert_eq!(
+        *model.forwards.borrow(),
+        [(17, 3), (20, 4), (24, 4), (28, 1)]
+    );
+    eprintln!(
+        "ACTUAL Session::decode K=1 forwards={:?}",
+        model.forwards.borrow()
+    );
+    assert_eq!(session.pos(), 29);
+    assert_eq!(*session.sequence().cache(), 29);
+    assert_eq!(session.tokens(), [9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 0, 3]);
     Ok(())
 }
 
@@ -3108,5 +3148,59 @@ fn a_draw_taken_back_on_the_ring_is_read_as_the_one_drawn_again() -> Result<()> 
     assert_eq!(c.ring_retracted, 1);
     assert_eq!(c.ring_publishes, 4);
     // A later reader of this ring maps the same stamps to the same slots.
+    Ok(())
+}
+
+#[test]
+fn filtered_gumbel_ring_refuses_before_session_sampler_or_feed_moves() -> Result<()> {
+    let device = Device::Cpu;
+    let model = Chain::new(&device)?;
+    let mut session = Session::new(&model, 0usize);
+    let mut rb = Ring::new(&[EOS], &device, 8, EosRead::Blocking)?;
+    let mut sampler = LogitsProcessor::from_sampling(
+        7,
+        Sampling::FilteredGumbel {
+            temperature: 0.7,
+            k: 1,
+            p: 0.6,
+        },
+    )
+    .with_processors(lloom::generation::Processors {
+        presence_penalty: 0.5,
+        ..Default::default()
+    })
+    .with_logits_digest(true);
+    sampler.observe_prompt(&[5, 1]);
+    let digest = sampler.logits_digest();
+    let counters = rb.counters();
+    let error = session
+        .decode_until(
+            &mut IdentityProposer,
+            &mut rb,
+            &mut sampler,
+            &[5, 1],
+            &DecodeOptions::new(3),
+            &mut |_| panic!("refused request reached token callback"),
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("explicit host draw"), "{error}");
+    assert_eq!(session.pos(), 0);
+    assert_eq!(*session.sequence().cache(), 0);
+    assert!(session.tokens().is_empty());
+    assert_eq!(sampler.digest_rows(), 0);
+    assert_eq!(sampler.logits_digest(), digest);
+    assert_eq!(rb.counters(), counters);
+    // A successful supported draw after refusal is the control that also
+    // observes processor history/RNG; a refusal must not have advanced either.
+    let mut fresh = LogitsProcessor::from_sampling(7, sampler.sampling().clone())
+        .with_processors(lloom::generation::Processors {
+            presence_penalty: 0.5,
+            ..Default::default()
+        })
+        .with_logits_digest(true);
+    fresh.observe_prompt(&[5, 1]);
+    let logits = Tensor::new(&[0f32; VOCAB], &device)?;
+    assert_eq!(sampler.sample(&logits)?, fresh.sample(&logits)?);
+    assert_eq!(sampler.logits_digest(), fresh.logits_digest());
     Ok(())
 }

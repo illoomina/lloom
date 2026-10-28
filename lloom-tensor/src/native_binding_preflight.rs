@@ -4,6 +4,7 @@
 /// Obtain all fallible custody before consuming a nonrecycled attempt credit.
 /// Error drops P on this caller: production P MUST be counted metadata/pin only;
 /// this generic ordering helper itself establishes no native destructor contract.
+#[cfg(test)]
 pub(crate) fn prepare_before_reserve<P, S, E>(
     prepare: impl FnOnce() -> Result<P, E>,
     reserve: impl FnOnce() -> Result<S, E>,
@@ -104,7 +105,11 @@ pub(crate) fn byte_copy_route(
     // macOS blit contract: all three are multiples of4. Do not round an
     // unaligned view into adjacent bytes. Compute/staged recovery remains a
     // genuine plan-owned route, never a permanent U8 refusal.
-    if !overlap && source % 4 == 0 && destination % 4 == 0 && size % 4 == 0 {
+    if !overlap
+        && source.is_multiple_of(4)
+        && destination.is_multiple_of(4)
+        && size.is_multiple_of(4)
+    {
         Some(ByteCopyRoute::AlignedBlit {
             source,
             destination,
@@ -151,7 +156,7 @@ impl BufferIndexPlan {
 /// safe. Production exact encoder admission and later caller migration remain
 /// separate requirements. Validation callback contains no native/user effect.
 pub(crate) fn preflight_buffer_indices<T, E>(
-    mut capture_cursor: Option<&mut usize>,
+    capture_cursor: Option<&mut usize>,
     entries: &[T],
     mut original_index: impl FnMut(&T) -> usize,
     mut validate: impl FnMut(usize, &T) -> Result<(), E>,
@@ -185,7 +190,7 @@ pub(crate) fn preflight_buffer_indices<T, E>(
     // A previous legacy cursor beyond range is not mutated by an empty batch.
     *entered_effects |= !entries.is_empty();
     if !entries.is_empty() {
-        if let (Some(cursor), Some(end)) = (capture_cursor.as_deref_mut(), end) {
+        if let (Some(cursor), Some(end)) = (capture_cursor, end) {
             *cursor = end;
         }
     }

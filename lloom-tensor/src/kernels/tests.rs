@@ -10,7 +10,7 @@ use std::thread;
 
 fn commands(device: &Device) -> Commands {
     let queue = device.new_command_queue().unwrap();
-    let residency_set = Arc::new(ResidencySet::new(&device));
+    let residency_set = Arc::new(ResidencySet::new(device));
     Commands::new(queue, residency_set).unwrap()
 }
 
@@ -2546,6 +2546,122 @@ fn commands_concurrent_acquisition() {
     }
 
     commands.wait_until_completed().unwrap();
+}
+
+/// `kernels.residency.attach`: under `heartbeat` the device set is not put
+/// on a Metal 3 queue (zero `addResidencySet` calls name it) and a kernel
+/// binding the set's own buffers still computes the right values, since a
+/// Metal 3 command buffer makes what it binds resident; under `queue` the
+/// set is on the queue once. On Metal 4 both arms keep the attachment and
+/// `heartbeat` says why. A mutation that attaches regardless, or detaches
+/// under `queue`, fails the count; one that breaks binding fails the values.
+#[test]
+fn residency_attach_heartbeat_detaches_the_set_on_metal3_and_binding_still_works() {
+    use crate::kernels::metal::completion::CompletionWait;
+    use crate::kernels::metal::{CommandBufferKind, ResidencyAttach};
+
+    let device = device();
+    if unsafe { ResidencySet::new(&device).raw() }.is_none() {
+        return;
+    }
+    let kernels = Kernels::new();
+    let v: Vec<f32> = (0..4096).map(|i| i as f32).collect();
+    for arm in [ResidencyAttach::Heartbeat, ResidencyAttach::Queue] {
+        let set = Arc::new(ResidencySet::new(&device));
+        let commands = Commands::new_with_residency_attach(
+            device.new_command_queue().unwrap(),
+            Arc::clone(&set),
+            CompletionWait::Synchronize,
+            CommandBufferKind::Retaining,
+            arm,
+        )
+        .unwrap();
+        let metal4 = commands.actual_command_api() == "metal4";
+        let got = commands.residency_attachment();
+        let (attached, ignored) = match (arm, metal4) {
+            (ResidencyAttach::Heartbeat, false) => (0, false),
+            (ResidencyAttach::Heartbeat, true) => (1, true),
+            (ResidencyAttach::Queue, _) => (1, false),
+        };
+        // `kernels.residency.metal4 = queue-*` also puts the set on the
+        // Metal 4 queue.
+        let metal4_queue = u64::from(commands.metal4_declare().is_some_and(|d| d.on_queue()));
+        assert_eq!(
+            set.queue_attachments(),
+            attached + metal4_queue,
+            "{} on {}: addResidencySet calls naming the device set",
+            arm.name(),
+            commands.actual_command_api()
+        );
+        assert_eq!(got.attached, attached == 1, "{got:?}");
+        assert_eq!(got.ignored.is_some(), ignored, "{got:?}");
+        assert_eq!(got.short() == "detached", attached == 0, "{got:?}");
+
+        let input = new_buffer(&device, &v);
+        let output = new_buffer(&device, &v);
+        assert_eq!(set.insert_batch([&input, &output]), 2);
+        let encoder = commands.command_encoder().unwrap();
+        // SAFETY: the test owns every buffer bound here and reads the output
+        // only after waiting for the command buffer that writes it.
+        unsafe {
+            call_affine(
+                &device,
+                &encoder,
+                &kernels,
+                "affine_f32",
+                size_of::<f32>(),
+                v.len(),
+                BufferOffset::zero_offset(&input),
+                &output,
+                2.0,
+                1.0,
+            )
+        }
+        .unwrap();
+        drop(encoder);
+        commands.wait_until_completed().unwrap();
+        let out: Vec<f32> = read_to_vec(&output, v.len());
+        let want: Vec<f32> = v.iter().map(|x| x * 2.0 + 1.0).collect();
+        assert_eq!(
+            out,
+            want,
+            "{} arm: a kernel over the set's buffers",
+            arm.name()
+        );
+        assert_eq!(set.remove_batch([&input, &output]), 2);
+    }
+}
+
+/// The arm `kernels.residency.attach` names (`LLOOM_RESIDENCY_ATTACH`)
+/// reaches `Commands::new`, the constructor every suite's fixture takes: a
+/// run of the suite under the env arm is a run under that attachment. Prints
+/// what it found, so a suite's log shows which arm it ran.
+#[test]
+fn the_tuned_attach_arm_reaches_commands_new() {
+    use crate::kernels::metal::ResidencyAttach;
+    let device = device();
+    let set = Arc::new(ResidencySet::new(&device));
+    if unsafe { set.raw() }.is_none() {
+        return;
+    }
+    let commands = Commands::new(device.new_command_queue().unwrap(), Arc::clone(&set)).unwrap();
+    let arm = ResidencyAttach::selected();
+    let metal4 = commands.actual_command_api() == "metal4";
+    let detached = arm == ResidencyAttach::Heartbeat && !metal4;
+    eprintln!(
+        "RESIDENCY_ATTACH arm={} api={} attachment={} queue_attachments={}",
+        arm.name(),
+        commands.actual_command_api(),
+        commands.residency_attachment().short(),
+        set.queue_attachments()
+    );
+    assert_eq!(
+        arm.name(),
+        crate::tuning::tuning().metal.residency_attach,
+        "the arm is the tuning's"
+    );
+    let metal4_queue = u64::from(commands.metal4_declare().is_some_and(|d| d.on_queue()));
+    assert_eq!(set.queue_attachments(), u64::from(!detached) + metal4_queue);
 }
 
 #[test]
@@ -7840,6 +7956,72 @@ fn mlx_gemm_383_tile_parity() {
     }
 }
 
+/// The narrow-projection tile (`DESIGN.md` §13.5z) against a host reference
+/// at LFM2's prefill projection shapes, through the shipping selection on
+/// this device: `x · Wᵀ` at f16, `W` row-major `[n, k]` as the model stores
+/// it (the `nt` layout). The kernel accumulates in f32 and rounds to f16 once
+/// at the store, so the reference is rounded the same way and the bound left
+/// is one f16 ulp of the result plus the f32 accumulation's own error,
+/// `k · 2⁻²⁴ · Σ|x·w|` (CONTRIBUTING §3.1b rule 6). A lattice of outputs
+/// covers every row and column tile and the last row and column; the shapes
+/// sit on both sides of the class: 512 and 344 rows of q/o/out_proj and conv
+/// in_proj on the 64×32 tile, 513 rows and the 10752-wide w1 on 64×64. The
+/// weight pattern is not symmetric in `(n, k)` at any of these depths, so a
+/// kernel that loads the weight operand transposed is seen.
+#[test]
+fn mlx_gemm_narrow_projection_parity() {
+    for &(m, n, k) in &[
+        (512usize, 2048usize, 2048usize),
+        (512, 6144, 2048),
+        (344, 6144, 2048),
+        (513, 2048, 2048),
+        (512, 10752, 2048),
+    ] {
+        let lhs: Vec<f16> = (0..m * k)
+            .map(|i| f16::from_f32(((i % 97) as f32 - 48.0) / 256.0))
+            .collect();
+        let rhs: Vec<f16> = (0..n * k)
+            .map(|i| f16::from_f32((((31 * i + 7 * (i / k)) % 89) as f32 - 44.0) / 256.0))
+            .collect();
+        let got = run_mlx_gemm(
+            GemmDType::F16,
+            (1, m, n, k),
+            &lhs,
+            &[m * k, k, 1],
+            0,
+            &rhs,
+            &[n * k, 1, k],
+            0,
+        );
+        assert_eq!(got.len(), m * n, "({m},{n},{k}): length");
+        let mut checked = 0usize;
+        let mut worst = 0f64;
+        for i in (0..m).step_by(7).chain([m - 1]) {
+            for j in (0..n).step_by(61).chain([n - 1]) {
+                let (mut acc, mut mag) = (0f64, 0f64);
+                for l in 0..k {
+                    let p = lhs[i * k + l].to_f64() * rhs[j * k + l].to_f64();
+                    acc += p;
+                    mag += p.abs();
+                }
+                let want = f16::from_f64(acc);
+                let a = f16::from_f64(want.to_f64().abs());
+                let ulp = f16::from_bits(a.to_bits() + 1).to_f64() - a.to_f64();
+                let bound = ulp + k as f64 * 2f64.powi(-24) * mag;
+                let err = (got[i * n + j].to_f64() - acc).abs();
+                worst = worst.max(err / bound);
+                assert!(
+                    err <= bound,
+                    "({m},{n},{k}) at [{i},{j}]: {} against {acc} (bound {bound})",
+                    got[i * n + j]
+                );
+                checked += 1;
+            }
+        }
+        eprintln!("({m},{n},{k}): {checked} outputs within bound, worst {worst:.3} of it");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Fused SiLU epilogue on the decode-path GEMV (issue #484, `DESIGN.md`
 // §12.2 #3).
@@ -9043,8 +9225,8 @@ fn quant_attention_reference_cells(
             let ks = k_scales[kv_h * capacity + t];
             let kb = k_biases[kv_h * capacity + t];
             let mut score = 0f32;
-            for j in 0..head_dim {
-                score += qv[j] * (code_at(k_codes, kv_h, t, j) * ks + kb);
+            for (j, q) in qv.iter().enumerate() {
+                score += *q * (code_at(k_codes, kv_h, t, j) * ks + kb);
             }
 
             let new_max = max_score.max(score);
@@ -9055,8 +9237,8 @@ fn quant_attention_reference_cells(
 
             let vs = v_scales[kv_h * capacity + t];
             let vb = v_biases[kv_h * capacity + t];
-            for j in 0..head_dim {
-                acc[j] = acc[j] * factor + exp_score * (code_at(v_codes, kv_h, t, j) * vs + vb);
+            for (j, value) in acc.iter_mut().enumerate() {
+                *value = *value * factor + exp_score * (code_at(v_codes, kv_h, t, j) * vs + vb);
             }
         }
 
@@ -9065,6 +9247,16 @@ fn quant_attention_reference_cells(
         }
     }
     out
+}
+
+/// Geometry and code width of one quantizer test fixture.
+struct QuantizeKvCase {
+    n_heads: usize,
+    seq_len: usize,
+    head_dim: usize,
+    capacity: usize,
+    dst_offset: usize,
+    bits: KvQuantBits,
 }
 
 /// Quantize on the GPU, read the planes back, and check them against the
@@ -9077,13 +9269,16 @@ fn run_quantize_kv(
     device: &Device,
     kernels: &Kernels,
     src: &[f16],
-    n_heads: usize,
-    seq_len: usize,
-    head_dim: usize,
-    capacity: usize,
-    dst_offset: usize,
-    bits: KvQuantBits,
+    case: QuantizeKvCase,
 ) -> (Vec<u8>, Vec<f16>, Vec<f16>) {
+    let QuantizeKvCase {
+        n_heads,
+        seq_len,
+        head_dim,
+        capacity,
+        dst_offset,
+        bits,
+    } = case;
     let code_bytes = bits.code_bytes(n_heads * capacity * head_dim);
     let scale_els = n_heads * capacity;
 
@@ -9161,7 +9356,17 @@ fn quantize_kv_matches_the_scalar_reference_at_both_widths() {
 
     for bits in KvQuantBits::ALL {
         let (codes, scales, biases) = run_quantize_kv(
-            &device, &kernels, &src, n_heads, seq_len, head_dim, capacity, dst_offset, bits,
+            &device,
+            &kernels,
+            &src,
+            QuantizeKvCase {
+                n_heads,
+                seq_len,
+                head_dim,
+                capacity,
+                dst_offset,
+                bits,
+            },
         );
 
         let mut checked = 0usize;
@@ -9187,7 +9392,7 @@ fn quantize_kv_matches_the_scalar_reference_at_both_widths() {
                     bits.bits()
                 );
 
-                for j in 0..head_dim {
+                for (j, want) in want_codes.iter().enumerate() {
                     let idx = dst_tok * head_dim + j;
                     let base = bits.code_bytes(h * capacity * head_dim);
                     let got = match bits {
@@ -9203,7 +9408,7 @@ fn quantize_kv_matches_the_scalar_reference_at_both_widths() {
                     };
                     assert_eq!(
                         got,
-                        want_codes[j],
+                        *want,
                         "code disagrees at head {h} token {dst_tok} element {j} at int{}",
                         bits.bits()
                     );
@@ -9249,7 +9454,17 @@ fn quantize_kv_leaves_the_rest_of_the_plane_untouched() {
 
     for bits in KvQuantBits::ALL {
         let (codes, scales, _biases) = run_quantize_kv(
-            &device, &kernels, &src, n_heads, seq_len, head_dim, capacity, dst_offset, bits,
+            &device,
+            &kernels,
+            &src,
+            QuantizeKvCase {
+                n_heads,
+                seq_len,
+                head_dim,
+                capacity,
+                dst_offset,
+                bits,
+            },
         );
 
         for h in 0..n_heads {
@@ -9374,10 +9589,30 @@ fn sdpa_vector_quant_matches_the_scalar_reference_at_both_widths() {
 
     for bits in KvQuantBits::ALL {
         let (k_codes, k_scales, k_biases) = run_quantize_kv(
-            &device, &kernels, &k_src, n_kv_heads, kv_len, head_dim, capacity, 0, bits,
+            &device,
+            &kernels,
+            &k_src,
+            QuantizeKvCase {
+                n_heads: n_kv_heads,
+                seq_len: kv_len,
+                head_dim,
+                capacity,
+                dst_offset: 0,
+                bits,
+            },
         );
         let (v_codes, v_scales, v_biases) = run_quantize_kv(
-            &device, &kernels, &v_src, n_kv_heads, kv_len, head_dim, capacity, 0, bits,
+            &device,
+            &kernels,
+            &v_src,
+            QuantizeKvCase {
+                n_heads: n_kv_heads,
+                seq_len: kv_len,
+                head_dim,
+                capacity,
+                dst_offset: 0,
+                bits,
+            },
         );
 
         let commands = commands(&device);
@@ -9592,10 +9827,30 @@ fn the_two_widths_differ_and_int8_is_closer_to_f16() {
     let mut outs = Vec::new();
     for bits in KvQuantBits::ALL {
         let (k_codes, k_scales, k_biases) = run_quantize_kv(
-            &device, &kernels, &k_src, n_kv_heads, kv_len, head_dim, capacity, 0, bits,
+            &device,
+            &kernels,
+            &k_src,
+            QuantizeKvCase {
+                n_heads: n_kv_heads,
+                seq_len: kv_len,
+                head_dim,
+                capacity,
+                dst_offset: 0,
+                bits,
+            },
         );
         let (v_codes, v_scales, v_biases) = run_quantize_kv(
-            &device, &kernels, &v_src, n_kv_heads, kv_len, head_dim, capacity, 0, bits,
+            &device,
+            &kernels,
+            &v_src,
+            QuantizeKvCase {
+                n_heads: n_kv_heads,
+                seq_len: kv_len,
+                head_dim,
+                capacity,
+                dst_offset: 0,
+                bits,
+            },
         );
 
         let commands = commands(&device);
@@ -10060,7 +10315,7 @@ fn sdpa_vector_quant_sel_reads_the_selected_cells() {
 }
 
 ///////////////////////////////////////////////////////////////////////////////
-/// The SiLU variant axis (issue #599, `DESIGN.md` §12.2l)
+// The SiLU variant axis (issue #599, `DESIGN.md` §12.2l)
 ///////////////////////////////////////////////////////////////////////////////
 
 /// Every `SiluImpl` arm resolves, at every dtype, in both binding forms.
@@ -10155,7 +10410,7 @@ fn silu_arm_names_round_trip() {
 }
 
 ///////////////////////////////////////////////////////////////////////////////
-/// The SiLU consolidation (issue #599, `DESIGN.md` §15.2 #15 / §3.6)
+// The SiLU consolidation (issue #599, `DESIGN.md` §15.2 #15 / §3.6)
 ///////////////////////////////////////////////////////////////////////////////
 
 /// The shipping SiLU expression has exactly ONE definition, and the live
@@ -11646,6 +11901,393 @@ fn inverse_cdf_row_matches_the_f64_definition() {
     assert!(checked > 150, "only {checked} draws compared");
 }
 
+/// The multinomial kernel CAN draw a masked token, at a rounding edge: its
+/// lanes' intervals come from a Hillis–Steele scan, whose association differs
+/// lane to lane, so a lane holding no mass can still hold a non-empty
+/// interval, and the walk over it falls back to the lane's first token.
+///
+/// The row: ids 0 and 1 weigh `w ≈ 4.2e-8` (in `(2^-25, 2^-24]`), id 2 is the
+/// maximum (weight 1), every other id is `-inf`. One id per lane (V = 1024).
+/// The scan gives lane 2 `(w + w) + 1 = 1` but lane 3 `(0 + 1) + (w + w) =
+/// 1 + 2^-23`, and the total is `1 + 2^-23`; `u` just below 1 targets `1.0`,
+/// which lane 3's interval `[1, 1 + 2^-23)` holds — and so do other empty
+/// lanes', the scan being non-monotone there, so several lanes race to write
+/// the pick. Every draw lands on a masked id.
+///
+/// Pinned rather than fixed (`docs/dispatch.md` §11.2j, open question 1):
+/// the contract's `mass` is monotone and its draw cannot land on a
+/// zero-weight token; this test flips when the multinomial arm adopts it.
+#[test]
+fn sample_inverse_cdf_can_draw_a_masked_token_at_a_rounding_edge() {
+    let vocab = 1024;
+    let mut row = vec![f32::NEG_INFINITY; vocab];
+    row[0] = -16.98;
+    row[1] = -16.98;
+    row[2] = 0.0;
+    let reps = 16;
+    let rows: Vec<f32> = (0..reps).flat_map(|_| row.iter().copied()).collect();
+    let got = run_inverse_cdf(&rows, vocab, 1.0, &vec![0.999_999_94f32; reps]);
+    let masked = got
+        .iter()
+        .filter(|&&g| row[g as usize] == f32::NEG_INFINITY)
+        .count();
+    let mut distinct = got.clone();
+    distinct.sort_unstable();
+    distinct.dedup();
+    println!("INVERSE_CDF_MASKED_EDGE draws={reps} masked={masked} ids={distinct:?}");
+    assert_eq!(
+        masked, reps,
+        "the kernel no longer draws a masked token here: the defect this pins is gone"
+    );
+}
+
+// ---- the top-k / top-p contract's arithmetic on Metal ------------------------
+//
+// The contract (`design/docs/dispatch.md` §11.2j) pins its exponential and its
+// sum, so a Metal kernel and the host compute the same f32 bits. These compile
+// the two definitions under the shipping compile options
+// (`kernel::get_compile_options`: fast math, the fast math-function set) and
+// compare them with the host's bit for bit. They are the premise the
+// contract's numerical policy rests on, checked before a kernel is built on
+// it; the kernels themselves are tested against the contract's reference.
+
+const CONTRACT_ARITH_SRC: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+static float exp32(float x) {
+    if (!(x >= -87.0f)) {
+        return 0.0f;
+    }
+    float n = rint(x * as_type<float>(0x3fb8aa3bu));
+    float r = fma(n, -as_type<float>(0x3f318000u), x);
+    r = fma(n, -as_type<float>(0xb95e8083u), r);
+    float a = fma(as_type<float>(0x39506967u), r, as_type<float>(0x3ab743ceu));
+    a = fma(a, r, as_type<float>(0x3c088908u));
+    a = fma(a, r, as_type<float>(0x3d2aa9c1u));
+    a = fma(a, r, as_type<float>(0x3e2aaaaau));
+    a = fma(a, r, as_type<float>(0x3f000000u));
+    float r2 = r * r;
+    float y = fma(a, r2, r) + 1.0f;
+    return y * as_type<float>(uint(int(n) + 127) << 23);
+}
+
+kernel void contract_exp32(
+    device const uint *x [[buffer(0)]],
+    device uint *out [[buffer(1)]],
+    uint i [[thread_position_in_grid]]
+) {
+    out[i] = as_type<uint>(exp32(as_type<float>(x[i])));
+}
+
+kernel void contract_weight(
+    device const float *z [[buffer(0)]],
+    constant float &m [[buffer(1)]],
+    constant float &inv_t [[buffer(2)]],
+    device uint *out [[buffer(3)]],
+    uint i [[thread_position_in_grid]]
+) {
+    out[i] = as_type<uint>(exp32((z[i] - m) * inv_t));
+}
+
+kernel void contract_mass(
+    device const float *a [[buffer(0)]],
+    constant uint &n [[buffer(1)]],
+    device float *out [[buffer(2)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint l [[thread_position_in_threadgroup]]
+) {
+    threadgroup float lanes[1024];
+    threadgroup float groups[32];
+    device const float *r = a + (ulong)row * n;
+    uint c = (n + 1023) / 1024;
+    uint lo = min(l * c, n);
+    uint hi = min(lo + c, n);
+    float s = 0.0f;
+    for (uint i = lo; i < hi; ++i) {
+        s += r[i];
+    }
+    lanes[l] = s;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (l < 32) {
+        float g = 0.0f;
+        for (uint j = 0; j < 32; ++j) {
+            g += lanes[32 * l + j];
+        }
+        groups[l] = g;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (l == 0) {
+        float t = 0.0f;
+        for (uint j = 0; j < 32; ++j) {
+            t += groups[j];
+        }
+        out[row] = t;
+    }
+}
+"#;
+
+/// The host side of the probe: the contract's exponential and sum, as the
+/// reference (`tests/sampling_contract/oracle.rs`) defines them.
+#[allow(clippy::neg_cmp_op_on_partial_ord)] // -inf must take the branch
+fn contract_exp32_host(x: f32) -> f32 {
+    if !(x >= -87.0) {
+        return 0.0;
+    }
+    let f = f32::from_bits;
+    let n = (x * f(0x3fb8_aa3b)).round_ties_even();
+    let r = n.mul_add(-f(0x3f31_8000), x);
+    let r = n.mul_add(-f(0xb95e_8083), r);
+    let mut a = f(0x3950_6967).mul_add(r, f(0x3ab7_43ce));
+    for c in [0x3c08_8908, 0x3d2a_a9c1, 0x3e2a_aaaa, 0x3f00_0000] {
+        a = a.mul_add(r, f(c));
+    }
+    let y = a.mul_add(r * r, r) + 1.0;
+    y * f((((n as i32) + 127) as u32) << 23)
+}
+
+fn contract_mass_host(a: &[f32]) -> f32 {
+    let c = a.len().div_ceil(1024);
+    let lanes: Vec<f32> = (0..1024)
+        .map(|l| {
+            let lo = (l * c).min(a.len());
+            let hi = (lo + c).min(a.len());
+            a[lo..hi].iter().fold(0f32, |s, &x| s + x)
+        })
+        .collect();
+    lanes
+        .chunks(32)
+        .map(|g| g.iter().fold(0f32, |s, &x| s + x))
+        .fold(0f32, |s, x| s + x)
+}
+
+fn contract_pipeline(name: &str) -> ComputePipeline {
+    let device = device();
+    let options = super::kernel::get_compile_options();
+    let library = device
+        .new_library_with_source(CONTRACT_ARITH_SRC, Some(&options))
+        .unwrap();
+    let function = library.get_function(name, None).unwrap();
+    device
+        .new_compute_pipeline_state_with_function(&function)
+        .unwrap()
+}
+
+/// Run `pipeline` over `n` threads in groups of `group`, binding `inputs`
+/// then one `u32` output of `outputs` words, and read the output.
+fn contract_run(
+    pipeline: &ComputePipeline,
+    inputs: &[Buffer],
+    bytes: &[f32],
+    outputs: usize,
+    grid: (usize, usize),
+) -> Vec<u32> {
+    let device = device();
+    let commands = commands(&device);
+    let encoder = commands.command_encoder().unwrap();
+    let out = new_buffer(&device, &vec![u32::MAX; outputs]);
+    let enc: &ComputeCommandEncoder = encoder.as_ref();
+    enc.set_compute_pipeline_state(pipeline);
+    // SAFETY: the test owns every buffer bound here and reads the output only
+    // after waiting for the command buffer that writes it.
+    unsafe {
+        for (i, b) in inputs.iter().enumerate() {
+            enc.set_input_buffer(i, Some(b), 0);
+        }
+        for (j, x) in bytes.iter().enumerate() {
+            enc.set_bytes(inputs.len() + j, x);
+        }
+        enc.set_output_buffer(inputs.len() + bytes.len(), Some(&out), 0);
+    }
+    enc.dispatch_thread_groups(
+        MTLSize {
+            width: grid.0,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: grid.1,
+            height: 1,
+            depth: 1,
+        },
+    );
+    drop(encoder);
+    commands.wait_until_completed().unwrap();
+    read_to_vec::<u32>(&out, outputs)
+}
+
+/// `exp32` on Metal is the host's, bit for bit, over every `stride`-th f32 of
+/// its domain [-87, 0] and the points either side of its ends.
+fn contract_exp32_sweep(stride: u32) -> usize {
+    let pipeline = contract_pipeline("contract_exp32");
+    let lo = (-87.0f32).to_bits();
+    let ends = [
+        0,
+        lo,
+        (-87.0f32).next_down().to_bits(),
+        (-87.0f32).next_up().to_bits(),
+        f32::NEG_INFINITY.to_bits(),
+        f32::MIN.to_bits(),
+    ];
+    let mut domain = ((-0.0f32).to_bits()..=lo)
+        .step_by(stride as usize)
+        .chain(ends);
+    let mut differ = Vec::new();
+    let mut n = 0;
+    loop {
+        let chunk: Vec<u32> = domain.by_ref().take(1 << 22).collect();
+        if chunk.is_empty() {
+            break;
+        }
+        let got = contract_run(
+            &pipeline,
+            &[new_buffer(&device(), &chunk)],
+            &[],
+            chunk.len(),
+            (chunk.len().div_ceil(256), 256),
+        );
+        for (k, &x) in chunk.iter().enumerate() {
+            let want = contract_exp32_host(f32::from_bits(x)).to_bits();
+            if got[k] != want && differ.len() < 8 {
+                differ.push(format!(
+                    "x={:e} metal={:#010x} host={want:#010x}",
+                    f32::from_bits(x),
+                    got[k]
+                ));
+            }
+        }
+        n += chunk.len();
+    }
+    assert!(differ.is_empty(), "exp32 differs on Metal: {differ:?}");
+    n
+}
+
+/// The contract's exponential under the shipping compile options equals the
+/// host's on every 61st f32 of its domain (18 million inputs).
+#[test]
+fn contract_exp32_on_metal_matches_the_host() {
+    let n = contract_exp32_sweep(61);
+    println!("CONTRACT_EXP32 inputs={n} differ=0");
+    assert!(n > 18_000_000, "{n}");
+}
+
+/// The same over EVERY f32 of the domain (1.1 billion inputs): run by hand.
+#[test]
+#[ignore = "exhaustive: about a minute on the M1 Max; run by hand"]
+fn contract_exp32_on_metal_matches_the_host_exhaustively() {
+    let n = contract_exp32_sweep(1);
+    println!("CONTRACT_EXP32_EXHAUSTIVE inputs={n} differ=0");
+}
+
+/// A weight is `exp32((z - m) · inv_t)`, the subtraction and the product each
+/// rounded: under fast math the two must stay two roundings, on Metal as on
+/// the host.
+#[test]
+fn contract_weight_on_metal_matches_the_host() {
+    let pipeline = contract_pipeline("contract_weight");
+    let mut s = 0x1036_u32;
+    let z: Vec<f32> = (0..1 << 20)
+        .map(|_| {
+            s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            ((s >> 8) as f32 / (1u32 << 24) as f32) * 40.0 - 30.0
+        })
+        .collect();
+    let m = z.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let mut differ = 0;
+    for inv_t in [
+        1.0f32,
+        (1.0 / 0.7) as f32,
+        (1.0 / 1.3) as f32,
+        (1.0 / 0.1) as f32,
+    ] {
+        let got = contract_run(
+            &pipeline,
+            &[new_buffer(&device(), &z)],
+            &[m, inv_t],
+            z.len(),
+            (z.len() / 256, 256),
+        );
+        for (i, &x) in z.iter().enumerate() {
+            if got[i] != contract_exp32_host((x - m) * inv_t).to_bits() {
+                differ += 1;
+            }
+        }
+    }
+    println!("CONTRACT_WEIGHT inputs={} differ={differ}", 4 * z.len());
+    assert_eq!(differ, 0);
+}
+
+/// The contract's sum — 1024 lanes folded in id order, 32 groups of 32
+/// lanes, the groups folded — on Metal under fast math is the host's, bit for
+/// bit, at both production vocabularies and a small one, over magnitudes
+/// spanning the weights' range (where a reassociated sum would differ).
+#[test]
+fn contract_mass_on_metal_matches_the_host() {
+    let pipeline = contract_pipeline("contract_mass");
+    assert!(
+        pipeline.max_total_threads_per_threadgroup() >= 1024,
+        "the probe needs 1024 lanes in one threadgroup"
+    );
+    let mut s = 0xfeed_u32;
+    let (mut rows, mut reassociated) = (0, 0);
+    for &n in &[37usize, 128_000, 248_320] {
+        let r = 8;
+        let a: Vec<f32> = (0..n * r)
+            .map(|_| {
+                s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                let e = ((s >> 24) % 50) as i32 - 45;
+                ((s >> 8) & 0xffff) as f32 / 65_536.0 * 2f32.powi(e)
+            })
+            .collect();
+        let device = device();
+        let commands = commands(&device);
+        let encoder = commands.command_encoder().unwrap();
+        let input = new_buffer(&device, &a);
+        let out = new_buffer(&device, &vec![0f32; r]);
+        let enc: &ComputeCommandEncoder = encoder.as_ref();
+        enc.set_compute_pipeline_state(&pipeline);
+        // SAFETY: as in `contract_run`.
+        unsafe {
+            enc.set_input_buffer(0, Some(&input), 0);
+            enc.set_bytes(1, &(n as u32));
+            enc.set_output_buffer(2, Some(&out), 0);
+        }
+        enc.dispatch_thread_groups(
+            MTLSize {
+                width: r,
+                height: 1,
+                depth: 1,
+            },
+            MTLSize {
+                width: 1024,
+                height: 1,
+                depth: 1,
+            },
+        );
+        drop(encoder);
+        commands.wait_until_completed().unwrap();
+        let got: Vec<f32> = read_to_vec(&out, r);
+        for (row, chunk) in a.chunks(n).enumerate() {
+            let want = contract_mass_host(chunk);
+            let sequential = chunk.iter().fold(0f32, |s, &x| s + x);
+            assert_eq!(
+                got[row].to_bits(),
+                want.to_bits(),
+                "n {n} row {row}: metal {} host {want} (a sequential sum is {sequential})",
+                got[row]
+            );
+            rows += 1;
+            reassociated += usize::from(sequential.to_bits() != want.to_bits());
+        }
+    }
+    println!(
+        "CONTRACT_MASS rows={rows} differ=0 rows_where_a_sequential_sum_differs={reassociated}"
+    );
+    // The fixture can tell the two orders apart: otherwise a kernel summing
+    // in another order would pass it.
+    assert!(reassociated >= rows / 2, "{reassociated} of {rows}");
+}
+
 /// Tensor slices are element-aligned, including odd f16/bf16 and u8 offsets.
 /// Split and packed bindings must preserve the same independent CPU reference.
 #[test]
@@ -11714,4 +12356,650 @@ fn strided_copy_accepts_element_aligned_offsets() {
     );
     check((0..16u8).collect(), "copy_u8_strided");
     println!("STRIDED_ALIGNMENT dtypes=3 offsets=3 styles=2 repeats=3 cases=54 cpu_reference=true guard_words=true");
+}
+
+/// The GEMV row axis's harness: one device, library and queue for every
+/// launch of a test (a library is compiled once per `Kernels`).
+struct GemvRows {
+    device: Device,
+    kernels: Kernels,
+    commands: Commands,
+}
+
+/// The value every output element holds before a launch, past the rows'
+/// extent too: a store the launch should not make is seen there.
+const GEMV_ROWS_SENTINEL: f32 = 12344.0;
+/// Sentinel elements past `rows * n` in every output.
+const GEMV_ROWS_GUARD: usize = 64;
+
+impl GemvRows {
+    fn new() -> Self {
+        let device = device();
+        let commands = commands(&device);
+        GemvRows {
+            device,
+            kernels: Kernels::new(),
+            commands,
+        }
+    }
+
+    /// One launch at row capacity `cap` (1: the classical one-row GEMV):
+    /// `rows` half rows of `k`, `k` apart from element `x_off` of `x`, against
+    /// the row-major `[n, k]` matrix at element `w_off` of `w`. Returns the
+    /// output's `rows * n` elements and its guard, or the dispatcher's refusal.
+    fn run(
+        &self,
+        (rows, n, k): (usize, usize, usize),
+        (x, x_off): (&[f16], usize),
+        (w, w_off): (&[f16], usize),
+        cap: usize,
+        epilogue: GemvEpilogue,
+    ) -> Result<(Vec<f16>, Vec<f16>), MetalKernelError> {
+        let xb = new_buffer(&self.device, x);
+        let wb = new_buffer(&self.device, w);
+        let init = vec![f16::from_f32(GEMV_ROWS_SENTINEL); rows * n + GEMV_ROWS_GUARD];
+        let out = new_buffer(&self.device, &init);
+        let operand = new_buffer(&self.device, &init);
+        let encoder = self.commands.command_encoder().unwrap();
+        // SAFETY: the test owns every buffer bound or mapped here and reads its
+        // results only after waiting for the command buffer that writes them.
+        let r = unsafe {
+            call_mlx_gemv_rows(
+                &self.device,
+                &encoder,
+                &self.kernels,
+                GemmDType::F16,
+                (rows, 1, n, k),
+                &[k, k, 1],
+                x_off * 2,
+                &xb,
+                &[0, 1, k],
+                w_off * 2,
+                &wb,
+                &out,
+                epilogue,
+                epilogue.needs_operand().then_some((&operand, 0)),
+                cap,
+            )
+        };
+        drop(encoder);
+        self.commands.wait_until_completed().unwrap();
+        r?;
+        let all: Vec<f16> = read_to_vec(&out, rows * n + GEMV_ROWS_GUARD);
+        Ok((all[..rows * n].to_vec(), all[rows * n..].to_vec()))
+    }
+}
+
+/// `|got − Σx·w|` beyond the store's half-ulp rounding, over `Σ|x·w|`: the
+/// worst over one output row, the reference summed in f64 over the same
+/// half operands.
+fn gemv_rows_worst_error(x: &[f16], w: &[f16], (n, k): (usize, usize), got: &[f16]) -> f64 {
+    let half_ulp = |v: f64| -> f64 {
+        let v = v.abs();
+        if v < 2f64.powi(-14) {
+            2f64.powi(-25)
+        } else {
+            2f64.powi(v.log2().floor() as i32 - 11)
+        }
+    };
+    let mut worst = 0f64;
+    for (j, g) in got.iter().enumerate().take(n) {
+        let (mut exact, mut scale) = (0f64, 0f64);
+        for i in 0..k {
+            let p = x[i].to_f64() * w[j * k + i].to_f64();
+            exact += p;
+            scale += p.abs();
+        }
+        let g = g.to_f64();
+        let err = ((g - exact).abs() - half_ulp(g.abs().max(exact.abs()))).max(0.0);
+        worst = worst.max(err / scale.max(f64::MIN_POSITIVE));
+    }
+    worst
+}
+
+/// Bound on [`gemv_rows_worst_error`]: an f32 sum of `k` products in a fixed
+/// order is within `k · 2⁻²⁴` of its scale, `2⁻¹²` at `k = 4096`; one wrong
+/// coefficient costs about `1/k` of it, 2¹² times more at the largest `k`.
+const GEMV_ROWS_BOUND: f64 = 1.0 / (1u64 << 12) as f64;
+
+/// The GEMV row axis at every capacity from 2 to 16 keeps each row's
+/// one-row bits: every row of a launch at capacity `cap` equals the
+/// classical one-row GEMV's output on that row alone, bit for bit, and is
+/// within [`GEMV_ROWS_BOUND`] of an f64 reference. The shapes take both
+/// instantiated tiles (`bm4`, `bm8`), an `n` that is not a multiple of
+/// either tile's rows (35, 300, 4100), a `k` the K-walk does not divide
+/// (2047, 130: the masked last iteration) and offsets on both operands; the row
+/// counts take one partial group alone (one row fewer than the capacity, the
+/// launch `kernels.gemm.f16_rows_round` makes), one full group, a group and a
+/// partial one, and two and a partial one, and nothing is stored past the
+/// rows (the guard keeps its sentinel).
+#[test]
+fn gemv_rows_keep_the_one_row_bits_at_every_capacity() {
+    let h = GemvRows::new();
+    let (mut rows_checked, mut launches, mut worst) = (0usize, 0usize, 0f64);
+    for (n, k) in [(35usize, 512usize), (4100, 2047), (512, 130), (300, 4096)] {
+        let tile = crate::gemv_tile::gemv_tile(n, k);
+        assert!(
+            gemv_rows_serves(n, k) && (tile.bm == 4 || tile.bm == 8),
+            "[{n}, {k}] must take a decode tile, got {tile:?}"
+        );
+        let w_off = k + 3;
+        let w: Vec<f16> = (0..w_off + n * k)
+            .map(|i| f16::from_f32(((i as f32) * 0.61).sin() * 0.05))
+            .collect();
+        for cap in 2..=GEMV_ROWS_MAX {
+            let mut counts = vec![cap - 1, cap, cap + 1 + cap / 2, 2 * cap + 1];
+            counts.dedup();
+            for rows in counts {
+                let x_off = 5;
+                let x: Vec<f16> = (0..x_off + rows * k)
+                    .map(|i| f16::from_f32(((i as f32) * 0.013 + cap as f32).sin()))
+                    .collect();
+                let (y, guard) = h
+                    .run(
+                        (rows, n, k),
+                        (&x, x_off),
+                        (&w, w_off),
+                        cap,
+                        GemvEpilogue::None,
+                    )
+                    .unwrap();
+                launches += 1;
+                assert!(
+                    guard.iter().all(|v| v.to_f32() == GEMV_ROWS_SENTINEL),
+                    "[{n}, {k}] cap={cap} rows={rows}: a store past the rows"
+                );
+                for r in 0..rows {
+                    let (one, _) = h
+                        .run(
+                            (1, n, k),
+                            (&x, x_off + r * k),
+                            (&w, w_off),
+                            1,
+                            GemvEpilogue::None,
+                        )
+                        .unwrap();
+                    let got = &y[r * n..(r + 1) * n];
+                    assert_eq!(
+                        got.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                        one.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                        "[{n}, {k}] cap={cap} rows={rows} row={r}: not the one-row GEMV's bits"
+                    );
+                    rows_checked += 1;
+                    if r == 0 || r == rows - 1 {
+                        let xr = &x[x_off + r * k..x_off + (r + 1) * k];
+                        worst = worst.max(gemv_rows_worst_error(xr, &w[w_off..], (n, k), got));
+                    }
+                }
+            }
+        }
+    }
+    println!(
+        "GEMV_ROWS_IDENTITY launches={launches} rows_checked={rows_checked} \
+         bit_equal={rows_checked} worst_reduction_error={worst:.3e}"
+    );
+    assert!(
+        worst <= GEMV_ROWS_BOUND,
+        "the row axis is {worst:.3e} of its scale from the f64 reference (bound {GEMV_ROWS_BOUND:.3e})"
+    );
+}
+
+/// Which entry each `_r<NR>` name is compiled from (`gemv.metal`'s
+/// `instantiate_gemv_rows_bm4`, `_bm8`): `gemv_rows`, without a
+/// threads-per-threadgroup bound, but on the bm4 tile from 11 rows, where
+/// `gemv`'s `max_total_threads_per_threadgroup(BM * 32)` is the faster
+/// compile (`docs/tuning.md` §13.5zb). Read off the pipeline: the bound caps
+/// `maxTotalThreadsPerThreadgroup` at the threadgroup's own 128 or 256
+/// threads, and without it the value is the compiler's register-limited
+/// residency, 384 or more at every capacity.
+#[test]
+fn gemv_rows_take_the_unbounded_entry_but_on_the_bm4_tile_from_eleven_rows() {
+    let device = device();
+    let kernels = Kernels::new();
+    let mut read = Vec::new();
+    for bm in [4usize, 8] {
+        for nr in 2..=GEMV_ROWS_MAX {
+            let name = format!("gemv_float16_bm{bm}_bn1_sm1_sn32_tm4_tn4_nc0_axpby0_r{nr}");
+            let threads = kernels
+                .load_pipeline(&device, Source::Gemv, name.clone())
+                .unwrap()
+                .max_total_threads_per_threadgroup();
+            if bm == 4 && nr >= 11 {
+                assert_eq!(threads, bm * 32, "{name}: compiled without gemv's bound");
+            } else {
+                assert!(
+                    threads > bm * 32,
+                    "{name}: bounded at {threads} threads, gemv's entry rather than gemv_rows'"
+                );
+            }
+            read.push(format!("bm{bm}_r{nr}={threads}"));
+        }
+    }
+    println!("GEMV_ROWS_ENTRY {}", read.join(" "));
+}
+
+/// What the row axis does not serve is refused by name, never run without
+/// it: a fused epilogue at more than one row (the caller takes the plain
+/// store), a capacity outside 2..=16, a tile the axis is not instantiated at
+/// (`k ≤ 64` takes `sm8 sn4`), f32, and rows that do not share one matrix.
+/// At one row each of these is the classical GEMV and runs.
+#[test]
+fn gemv_rows_refuse_what_they_do_not_serve() {
+    let h = GemvRows::new();
+    let (n, k) = (64usize, 256usize);
+    let w: Vec<f16> = (0..n * k)
+        .map(|i| f16::from_f32((i as f32 * 0.3).cos()))
+        .collect();
+    let x: Vec<f16> = (0..4 * k)
+        .map(|i| f16::from_f32((i as f32 * 0.1).sin()))
+        .collect();
+    let refused = |r: Result<(Vec<f16>, Vec<f16>), MetalKernelError>, what: &str| match r {
+        Err(MetalKernelError::LoadFunctionError(msg)) => {
+            assert!(msg.contains(what), "refusal `{msg}` must name `{what}`");
+            msg
+        }
+        other => panic!(
+            "expected a refusal naming `{what}`, got {:?}",
+            other.map(|_| ())
+        ),
+    };
+    let mut seen = Vec::new();
+    for epilogue in [
+        GemvEpilogue::Silu,
+        GemvEpilogue::Residual,
+        GemvEpilogue::Mul,
+    ] {
+        seen.push(refused(
+            h.run((4, n, k), (&x, 0), (&w, 0), 4, epilogue),
+            &format!("{epilogue:?}"),
+        ));
+        h.run((1, n, k), (&x, 0), (&w, 0), 1, epilogue)
+            .unwrap_or_else(|e| panic!("{epilogue:?} at one row must run: {e:?}"));
+    }
+    seen.push(refused(
+        h.run((4, n, k), (&x, 0), (&w, 0), 17, GemvEpilogue::None),
+        "2..=16",
+    ));
+    let k_small = 64;
+    seen.push(refused(
+        h.run((4, n, k_small), (&x, 0), (&w, 0), 4, GemvEpilogue::None),
+        "decode tiles",
+    ));
+    let xf = new_buffer(&h.device, &vec![0f32; 4 * k]);
+    let wf = new_buffer(&h.device, &vec![0f32; n * k]);
+    let of = new_buffer(&h.device, &vec![0f32; 4 * n]);
+    let encoder = h.commands.command_encoder().unwrap();
+    for (dtype, rhs_stride, what) in [
+        (GemmDType::F32, [0, 1, k], "f16 only"),
+        (GemmDType::F16, [n * k, 1, k], "share one matrix"),
+    ] {
+        // SAFETY: the test owns every buffer bound here; a refusal encodes nothing.
+        let r = unsafe {
+            call_mlx_gemv_rows(
+                &h.device,
+                &encoder,
+                &h.kernels,
+                dtype,
+                (4, 1, n, k),
+                &[k, k, 1],
+                0,
+                &xf,
+                &rhs_stride,
+                0,
+                &wf,
+                &of,
+                GemvEpilogue::None,
+                None,
+                4,
+            )
+        };
+        seen.push(refused(r.map(|_| (vec![], vec![])), what));
+    }
+    drop(encoder);
+    h.commands.wait_until_completed().unwrap();
+    println!("GEMV_ROWS_REFUSED cases={} first={:?}", seen.len(), seen[0]);
+}
+
+/// The two binding styles' names and the row axis's resolve in the compiled
+/// library: every `_r<N>` from 2 to 16 at both decode tiles, and no `_r1`
+/// (one row is the classical name).
+#[test]
+fn gemv_rows_names_resolve() {
+    let device = device();
+    let kernels = Kernels::new();
+    let mut checked = 0;
+    for bm in [4, 8] {
+        for nr in 2..=GEMV_ROWS_MAX {
+            let name = format!("gemv_float16_bm{bm}_bn1_sm1_sn32_tm4_tn4_nc0_axpby0_r{nr}");
+            kernels
+                .load_pipeline(&device, Source::Gemv, name.clone())
+                .unwrap_or_else(|e| panic!("{name} does not resolve: {e:?}"));
+            checked += 1;
+        }
+        let one = format!("gemv_float16_bm{bm}_bn1_sm1_sn32_tm4_tn4_nc0_axpby0_r1");
+        assert!(
+            kernels
+                .load_pipeline(&device, Source::Gemv, one.clone())
+                .is_err(),
+            "{one} must not exist: one row is the classical name"
+        );
+    }
+    assert_eq!(checked, 30);
+}
+
+/// Every classical GEMV family's output on fixed inputs, folded to one FNV-1a
+/// digest per family: the plain kernel at every non-transposed tile and at
+/// three dtypes (both binding styles), the transposed kernel, the fused
+/// epilogues, the inline and imported norms, the two-weight SwiGLU and the
+/// mixed-precision arms, each at three batch items. A census to run on two
+/// trees and compare (the row axis's one-row instance against the kernel it
+/// replaced), not an assertion: ignored, run by hand with `--ignored
+/// --nocapture`.
+#[test]
+#[ignore]
+fn gemv_one_row_census() {
+    use crate::kernels::kernels::params::ParamStyle;
+    let device = device();
+    let kernels = Kernels::new();
+    let commands = commands(&device);
+    let fnv = |h: &mut u64, bytes: &[u8]| {
+        for b in bytes {
+            *h ^= *b as u64;
+            *h = h.wrapping_mul(0x100000001b3);
+        }
+    };
+    let b = 3usize;
+    // (n, k): k >= 16n (bn8), k <= 64 (sm8 sn4), bm4, bm8, n < 4 (tm1).
+    let shapes = [
+        (20usize, 512usize),
+        (100, 64),
+        (300, 2047),
+        (4100, 1000),
+        (3, 300),
+    ];
+    let vals = |len: usize, s: f32| -> Vec<f32> {
+        (0..len)
+            .map(|i| ((i as f32) * 0.37 + s).sin() * 0.5)
+            .collect()
+    };
+    let mut lines = Vec::new();
+    for (dtype, name, size) in [
+        (GemmDType::F16, "f16", 2usize),
+        (GemmDType::F32, "f32", 4),
+        (GemmDType::BF16, "bf16", 2),
+    ] {
+        let mk = |v: &[f32]| -> Buffer {
+            match dtype {
+                GemmDType::F16 => new_buffer(
+                    &device,
+                    &v.iter().map(|x| f16::from_f32(*x)).collect::<Vec<_>>(),
+                ),
+                GemmDType::BF16 => new_buffer(
+                    &device,
+                    &v.iter().map(|x| bf16::from_f32(*x)).collect::<Vec<_>>(),
+                ),
+                GemmDType::F32 => new_buffer(&device, v),
+            }
+        };
+        for style in [ParamStyle::Split, ParamStyle::Packed] {
+            for transposed in [false, true] {
+                let mut h = 0xcbf29ce484222325u64;
+                for &(n, k) in &shapes {
+                    let x = mk(&vals(b * k, 0.1));
+                    let w = mk(&vals(n * k, 0.7));
+                    let out = device.new_buffer(b * n * size, RESOURCE_OPTIONS).unwrap();
+                    // `[b, 1, k] x [k, n]`: the weight row-major `[n, k]` seen
+                    // transposed (the `gemv` kernel), or `[k, n]` (`gemv_t`).
+                    let rhs_stride = if transposed { [0, n, 1] } else { [0, 1, k] };
+                    let encoder = commands.command_encoder().unwrap();
+                    // SAFETY: the test owns every buffer and waits before reading.
+                    unsafe {
+                        call_mlx_gemv_with(
+                            &device,
+                            &encoder,
+                            &kernels,
+                            dtype,
+                            (b, 1, n, k),
+                            &[k, k, 1],
+                            0,
+                            &x,
+                            &rhs_stride,
+                            0,
+                            &w,
+                            &out,
+                            style,
+                        )
+                    }
+                    .unwrap();
+                    drop(encoder);
+                    commands.wait_until_completed().unwrap();
+                    fnv(&mut h, &read_to_vec::<u8>(&out, b * n * size));
+                }
+                lines.push(format!(
+                    "GEMV_CENSUS {} {name} {style:?} {h:016x}",
+                    if transposed { "gemv_t" } else { "gemv" }
+                ));
+            }
+        }
+        for epilogue in [
+            GemvEpilogue::Silu,
+            GemvEpilogue::Residual,
+            GemvEpilogue::Mul,
+            GemvEpilogue::Swiglu,
+        ] {
+            for style in [ParamStyle::Split, ParamStyle::Packed] {
+                let mut h = 0xcbf29ce484222325u64;
+                for &(n, k) in &[(300usize, 2047usize), (4100, 1000)] {
+                    let x = mk(&vals(b * k, 0.1));
+                    let w = mk(&vals(n * k, 0.7));
+                    let operand = match epilogue {
+                        GemvEpilogue::Swiglu => mk(&vals(n * k, 1.3)),
+                        _ => mk(&vals(b * n, 1.9)),
+                    };
+                    let out = device.new_buffer(b * n * size, RESOURCE_OPTIONS).unwrap();
+                    let encoder = commands.command_encoder().unwrap();
+                    // SAFETY: the test owns every buffer and waits before reading.
+                    unsafe {
+                        call_mlx_gemv_epilogue(
+                            &device,
+                            &encoder,
+                            &kernels,
+                            dtype,
+                            (b, 1, n, k),
+                            &[k, k, 1],
+                            0,
+                            &x,
+                            &[0, 1, k],
+                            0,
+                            &w,
+                            &out,
+                            style,
+                            None,
+                            epilogue,
+                            epilogue.needs_operand().then_some((&operand, 0)),
+                        )
+                    }
+                    .unwrap();
+                    drop(encoder);
+                    commands.wait_until_completed().unwrap();
+                    fnv(&mut h, &read_to_vec::<u8>(&out, b * n * size));
+                }
+                lines.push(format!(
+                    "GEMV_CENSUS {epilogue:?} {name} {style:?} {h:016x}"
+                ));
+            }
+        }
+        for epilogue in [GemvEpilogue::None, GemvEpilogue::Silu, GemvEpilogue::Swiglu] {
+            let mut h = 0xcbf29ce484222325u64;
+            for &(n, k) in &[(300usize, 2047usize), (4100, 1000)] {
+                let x = mk(&vals(b * k, 0.1));
+                let w = mk(&vals(n * k, 0.7));
+                let nw = mk(&vals(k, 2.1));
+                let gate = mk(&vals(n * k, 1.3));
+                let out = device.new_buffer(b * n * size, RESOURCE_OPTIONS).unwrap();
+                let encoder = commands.command_encoder().unwrap();
+                // SAFETY: the test owns every buffer and waits before reading.
+                unsafe {
+                    call_mlx_gemv_norm(
+                        &device,
+                        &encoder,
+                        &kernels,
+                        dtype,
+                        (b, 1, n, k),
+                        &[k, k, 1],
+                        0,
+                        &x,
+                        &[0, 1, k],
+                        0,
+                        &w,
+                        &out,
+                        GemvNormInline {
+                            weight: &nw,
+                            weight_offset: 0,
+                            eps: 1e-5,
+                        },
+                        epilogue,
+                        (epilogue == GemvEpilogue::Swiglu).then_some((&gate, 0)),
+                    )
+                }
+                .unwrap();
+                drop(encoder);
+                commands.wait_until_completed().unwrap();
+                fnv(&mut h, &read_to_vec::<u8>(&out, b * n * size));
+            }
+            lines.push(format!("GEMV_CENSUS norm-{epilogue:?} {name} {h:016x}"));
+        }
+        let mut h = 0xcbf29ce484222325u64;
+        for &(n, k) in &[(300usize, 2047usize), (4100, 1000)] {
+            let x = mk(&vals(b * k, 0.1));
+            let w = mk(&vals(n * k, 0.7));
+            let nw = mk(&vals(k, 2.1));
+            let scale = new_buffer(&device, &[0.7f32, 1.3, 0.9]);
+            let out = device.new_buffer(b * n * size, RESOURCE_OPTIONS).unwrap();
+            let encoder = commands.command_encoder().unwrap();
+            // SAFETY: the test owns every buffer and waits before reading.
+            unsafe {
+                call_mlx_gemv_full(
+                    &device,
+                    &encoder,
+                    &kernels,
+                    dtype,
+                    (b, 1, n, k),
+                    &[k, k, 1],
+                    0,
+                    &x,
+                    &[0, 1, k],
+                    0,
+                    &w,
+                    &out,
+                    ParamStyle::Split,
+                    Some(GemvRmsNorm {
+                        weight: &nw,
+                        weight_offset: 0,
+                        scale: &scale,
+                        scale_offset: 0,
+                    }),
+                    GemvEpilogue::None,
+                )
+            }
+            .unwrap();
+            drop(encoder);
+            commands.wait_until_completed().unwrap();
+            fnv(&mut h, &read_to_vec::<u8>(&out, b * n * size));
+        }
+        lines.push(format!("GEMV_CENSUS rmsnorm {name} {h:016x}"));
+    }
+    // The mixed arms: half weights, f32 vectors, every tile; and the grouped norm.
+    for epilogue in [
+        MixedEpilogue::None,
+        MixedEpilogue::Silu,
+        MixedEpilogue::Sigmoid,
+    ] {
+        let mut h = 0xcbf29ce484222325u64;
+        for &(n, k) in &shapes {
+            let x = new_buffer(&device, &vals(b * k, 0.1));
+            let w = new_buffer(
+                &device,
+                &vals(n * k, 0.7)
+                    .iter()
+                    .map(|v| f16::from_f32(*v))
+                    .collect::<Vec<_>>(),
+            );
+            let out = device.new_buffer(b * n * 4, RESOURCE_OPTIONS).unwrap();
+            let encoder = commands.command_encoder().unwrap();
+            // SAFETY: the test owns every buffer and waits before reading.
+            unsafe {
+                call_mlx_gemv_mixed(
+                    &device,
+                    &encoder,
+                    &kernels,
+                    (b, n, k),
+                    &w,
+                    0,
+                    &x,
+                    0,
+                    k,
+                    &out,
+                    epilogue,
+                    0.5,
+                )
+            }
+            .unwrap();
+            drop(encoder);
+            commands.wait_until_completed().unwrap();
+            fnv(&mut h, &read_to_vec::<u8>(&out, b * n * 4));
+        }
+        lines.push(format!("GEMV_CENSUS mixed-{epilogue:?} {h:016x}"));
+    }
+    {
+        let (n, k, groups) = (320usize, 4 * 2560usize, 4usize);
+        let mut h = 0xcbf29ce484222325u64;
+        let x = new_buffer(&device, &vals(b * k, 0.1));
+        let w = new_buffer(
+            &device,
+            &vals(n * k, 0.7)
+                .iter()
+                .map(|v| f16::from_f32(*v))
+                .collect::<Vec<_>>(),
+        );
+        let nw = new_buffer(&device, &vals(k, 2.1));
+        let out = device.new_buffer(b * n * 4, RESOURCE_OPTIONS).unwrap();
+        let scales = device.new_buffer(b * groups * 4, RESOURCE_OPTIONS).unwrap();
+        let encoder = commands.command_encoder().unwrap();
+        // SAFETY: the test owns every buffer and waits before reading.
+        unsafe {
+            call_mlx_gemv_mixed_gnorm(
+                &device,
+                &encoder,
+                &kernels,
+                (b, n, k),
+                &w,
+                0,
+                &x,
+                0,
+                k,
+                &out,
+                MixedEpilogue::Silu,
+                0.5,
+                GemvGroupNorm {
+                    weight: &nw,
+                    weight_offset: 0,
+                    eps: 1e-5,
+                    group: k / groups,
+                    groups,
+                    scales: Some((&scales, 0)),
+                },
+            )
+        }
+        .unwrap();
+        drop(encoder);
+        commands.wait_until_completed().unwrap();
+        fnv(&mut h, &read_to_vec::<u8>(&out, b * n * 4));
+        fnv(&mut h, &read_to_vec::<u8>(&scales, b * groups * 4));
+        lines.push(format!("GEMV_CENSUS mixed-gnorm-silu {h:016x}"));
+    }
+    for l in &lines {
+        println!("{l}");
+    }
+    println!("GEMV_CENSUS_DONE families={}", lines.len());
 }

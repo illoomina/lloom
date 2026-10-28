@@ -26,6 +26,137 @@ use lloom_macros::Options;
 use serde::{Deserialize, Serialize};
 use std::sync::OnceLock;
 
+/// Whether optional attribution machinery is compiled into this tensor build.
+pub const PROFILE_INSTRUMENTS: bool = cfg!(any(debug_assertions, feature = "profile"));
+
+/// Require the detailed Metal recorder at a cold consumer boundary.
+/// This does not enable profiling or reject scalar-only profiling requests.
+/// The capability/key come from the existing generated instrument declaration.
+pub fn require_profile_recorder() -> Result<(), TuningSetupError> {
+    let meta = crate::options::meta_at(InstrumentTuning::META, "profile")
+        .expect("profile is declared by the generated instrument schema");
+    if !cfg!(feature = "metal") || !PROFILE_INSTRUMENTS {
+        return Err(TuningSetupError::NotCompiled {
+            key: meta.path,
+            capability: if cfg!(feature = "metal") {
+                meta.needs
+            } else {
+                "metal"
+            },
+        });
+    }
+    Ok(())
+}
+
+/// An ordinary setup refusal, distinct from a backend invariant failure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TuningSetupError {
+    AlreadyRead,
+    InvalidEnvironment(String),
+    NotCompiled {
+        key: &'static str,
+        capability: &'static str,
+    },
+}
+
+impl std::fmt::Display for TuningSetupError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::AlreadyRead => f.write_str("tuning: the tensor crate's knobs were already read before install"),
+            Self::InvalidEnvironment(reason) => write!(f, "tuning: {reason}"),
+            Self::NotCompiled { key, capability } => write!(f,
+                "{key}: {capability} instrumentation is not compiled; rebuild with cargo build --profile release-with-debug -p lloom-tensor --features metal,profile"),
+        }
+    }
+}
+impl std::error::Error for TuningSetupError {}
+
+/// A failed install retains the incoming configuration, unchanged.
+#[derive(Debug)]
+pub struct InstallError {
+    pub reason: TuningSetupError,
+    tuning: Box<Tuning>,
+}
+impl InstallError {
+    pub fn into_tuning(self) -> Tuning {
+        *self.tuning
+    }
+}
+impl std::fmt::Display for InstallError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.reason.fmt(f)
+    }
+}
+impl std::error::Error for InstallError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.reason)
+    }
+}
+
+/// Validate one direct instrumentation request against its generated declaration.
+pub(crate) fn check_profile_request(storage: &str, on: bool) -> Result<(), TuningSetupError> {
+    let meta = crate::options::meta_at(InstrumentTuning::META, storage)
+        .expect("instrument control must name its generated option");
+    if on && !PROFILE_INSTRUMENTS && meta.needs == "profile" && meta.needs_part.is_empty() {
+        return Err(TuningSetupError::NotCompiled {
+            key: meta.path,
+            capability: meta.needs,
+        });
+    }
+    Ok(())
+}
+
+/// Legacy cached status means effectively active, not merely requested.
+/// An unavailable request is reported once by each caller's status cache;
+/// primary control/setup APIs return the typed error instead.
+#[cfg(feature = "metal")]
+pub(crate) fn effective_instrument(storage: &str, requested: bool) -> bool {
+    match check_profile_request(storage, requested) {
+        Ok(()) => requested,
+        Err(error) => {
+            eprintln!("{error}");
+            false
+        }
+    }
+}
+
+impl Tuning {
+    /// Cold setup/legacy-cache notice, generated from the same partial-capability
+    /// metadata as the engine. No notice or side effect in diagnostic builds.
+    pub(crate) fn note_partial_instruments(&self) {
+        if PROFILE_INSTRUMENTS || self.instrument == InstrumentTuning::default() {
+            return;
+        }
+        static NOTED: std::sync::Once = std::sync::Once::new();
+        NOTED.call_once(|| {
+            let values = serde_json::to_value(&self.instrument).expect("instrument group serializes");
+            let defaults = serde_json::to_value(InstrumentTuning::default()).expect("instrument defaults serialize");
+            for meta in InstrumentTuning::META {
+                if meta.needs == "profile" && !meta.needs_part.is_empty()
+                    && values.get(meta.key) != defaults.get(meta.key) {
+                    eprintln!("[diagnostics] {}: {} require profile instrumentation absent from this build; remaining scalar output is available; rebuild with cargo build --profile release-with-debug -p lloom-tensor --features metal,profile",meta.path,meta.needs_part);
+                }
+            }
+        });
+    }
+
+    /// Reject unavailable whole instruments, preserving partial scalar-counter routes.
+    pub fn validate_instruments(&self) -> Result<(), TuningSetupError> {
+        if PROFILE_INSTRUMENTS || self.instrument == InstrumentTuning::default() {
+            return Ok(());
+        }
+        let values = serde_json::to_value(&self.instrument).expect("instrument group serializes");
+        let defaults = serde_json::to_value(InstrumentTuning::default())
+            .expect("instrument defaults serialize");
+        for meta in InstrumentTuning::META {
+            if values.get(meta.key) != defaults.get(meta.key) {
+                check_profile_request(meta.key, true)?;
+            }
+        }
+        Ok(())
+    }
+}
+
 static TUNING: OnceLock<Tuning> = OnceLock::new();
 
 /// The determinism contract a run is held to (`--profile`, `LLOOM_PROFILE`;
@@ -96,6 +227,16 @@ impl Contract {
     pub const DRAFT_WINDOW_ARM: &'static str = "draft-gemm";
     pub const PREFILL_WINDOW_ARM: &'static str = "prefill-gemm";
 
+    /// The arm `fast` takes in a speculative verify window while
+    /// `kernels.gemm.f16_rows` is on ([`f16_rows_max`]): the window's f16
+    /// rows on the GEMV's row axis, named on the report line then.
+    pub const F16_ROWS_ARM: &'static str = "f16-rows";
+
+    /// The arm `fast` takes in a batched decode step while
+    /// `kernels.gemm.f16_rows_decode` is on with the row axis
+    /// ([`f16_rows_decode`]): the step's rows on the GEMV's row axis.
+    pub const F16_ROWS_DECODE_ARM: &'static str = "f16-rows-decode";
+
     /// `profile=<name> arms=<list> cpu_f16_accum=<type>/<promote_every>:<instruction>`,
     /// for the report lines that say which contract a run held and which
     /// accumulator its CPU f16 matmuls ran (`cpu::f16_matmul`).
@@ -117,8 +258,20 @@ impl Contract {
                     on.join(",")
                 }
             }
-            Contract::Fast if Contract::FAST_ARMS.is_empty() => "none".to_string(),
-            Contract::Fast => Contract::FAST_ARMS.join(","),
+            Contract::Fast => {
+                let mut on: Vec<&str> = Contract::FAST_ARMS.to_vec();
+                if f16_rows_max().is_some() {
+                    on.push(Contract::F16_ROWS_ARM);
+                    if f16_rows_decode() {
+                        on.push(Contract::F16_ROWS_DECODE_ARM);
+                    }
+                }
+                if on.is_empty() {
+                    "none".to_string()
+                } else {
+                    on.join(",")
+                }
+            }
         };
         format!(
             "profile={} arms={arms} cpu_f16_accum={}",
@@ -332,13 +485,225 @@ pub fn prefill_window_report(since: u64) -> String {
 /// The receipt a speculative run prints: each window's arm under the
 /// contract in force and its launches so far.
 pub fn window_report() -> String {
+    // The f16 row axis is a `fast` arm; under `deterministic` nothing takes it.
+    let rows = match f16_rows_max() {
+        Some(max) if contract().is_fast() => format!("rows-{max}"),
+        _ => "off".to_string(),
+    };
     format!(
-        "arm={} gemm_launches={} draft_arm={} draft_gemm_launches={}",
+        "arm={} gemm_launches={} draft_arm={} draft_gemm_launches={} f16_rows={rows} \
+         f16_rows_launches={}",
         Window::Verify.report(),
         Window::Verify.gemms(),
         Window::Draft.report(),
-        Window::Draft.gemms()
+        Window::Draft.gemms(),
+        f16_rows_launches()
     )
+}
+
+/// `kernels.gemm.f16_rows` and its ceiling, read once; or [`set_f16_rows`].
+/// 0 unread, else the ceiling when on and 1 when off.
+static F16_ROWS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Launches a verify window's f16 matmuls took on the GEMV's row axis since
+/// process start: the arm's engagement count.
+static F16_ROWS_LAUNCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The most rows the f16 row axis takes in a verify window under `fast`, or
+/// `None` while `kernels.gemm.f16_rows` is off.
+pub fn f16_rows_max() -> Option<usize> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let v = match F16_ROWS.load(Relaxed) {
+        0 => {
+            let g = &tuning().gemm;
+            let v = if g.f16_rows { g.f16_rows_max } else { 1 };
+            F16_ROWS.store(v, Relaxed);
+            v
+        }
+        v => v,
+    };
+    (v > 1).then_some(v)
+}
+
+/// Select the f16 row axis for this process: `Some(ceiling)` on, `None` off
+/// (a test runs both).
+pub fn set_f16_rows(max: Option<usize>) {
+    let v = match max {
+        Some(m) => {
+            assert!(
+                (2..=16).contains(&m),
+                "f16 rows a weight read: {m} is not in 2..=16"
+            );
+            m
+        }
+        None => 1,
+    };
+    F16_ROWS.store(v, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Count one launch the f16 row axis took.
+pub fn note_f16_rows() {
+    F16_ROWS_LAUNCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The f16 row axis's engagement count now.
+pub fn f16_rows_launches() -> u64 {
+    F16_ROWS_LAUNCHES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+thread_local! {
+    /// Open [`DecodeRows`] scopes on this thread.
+    static DECODE_ROWS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// A batched decode step's forward, open on this thread: one row per live
+/// sequence, one token each. Under `kernels.gemm.f16_rows_decode` its half
+/// matmuls of 2 to [`f16_rows_max`] rows take the GEMV's row axis.
+/// Thread-local and nestable, closed when the guard drops: a pass encoded on
+/// another thread keeps its own route.
+#[must_use = "the scope holds only while the guard is alive"]
+pub struct DecodeRows {
+    _thread: std::marker::PhantomData<*const ()>,
+}
+
+impl DecodeRows {
+    pub fn open() -> Self {
+        DECODE_ROWS.with(|c| c.set(c.get() + 1));
+        DecodeRows {
+            _thread: std::marker::PhantomData,
+        }
+    }
+}
+
+impl Drop for DecodeRows {
+    fn drop(&mut self) {
+        DECODE_ROWS.with(|c| c.set(c.get() - 1));
+    }
+}
+
+/// Whether a batched decode step's forward is open on this thread.
+pub fn in_decode_rows() -> bool {
+    DECODE_ROWS.with(|c| c.get() > 0)
+}
+
+thread_local! {
+    /// The open [`RaggedDecodeRows`] scope on this thread, `(live, rows,
+    /// heads)`; `live == 0` when none is.
+    static RAGGED_DECODE_ROWS: std::cell::Cell<(usize, usize, usize)> =
+        const { std::cell::Cell::new((0, 0, 0)) };
+}
+
+/// A ragged batched step's forward, open on this thread: `live` decode rows
+/// of one token each lead its `rows` input rows, the prompt pieces after
+/// them, and its head projects `heads` rows (one a sequence), the live rows
+/// first. Under `kernels.gemm.f16_rows_decode` the live rows of its half
+/// matmuls take the route a decode step's rows take, so a sequence's bits do
+/// not depend on whether a prompt piece rode its step; the pieces keep the
+/// GEMM. Thread-local; the enclosing scope is restored when the guard drops.
+#[must_use = "the scope holds only while the guard is alive"]
+pub struct RaggedDecodeRows {
+    outer: (usize, usize, usize),
+    _thread: std::marker::PhantomData<*const ()>,
+}
+
+impl RaggedDecodeRows {
+    pub fn open(live: usize, rows: usize, heads: usize) -> Self {
+        let outer = RAGGED_DECODE_ROWS.with(|c| c.replace((live, rows, heads)));
+        RaggedDecodeRows {
+            outer,
+            _thread: std::marker::PhantomData,
+        }
+    }
+}
+
+impl Drop for RaggedDecodeRows {
+    fn drop(&mut self) {
+        RAGGED_DECODE_ROWS.with(|c| c.set(self.outer));
+    }
+}
+
+/// The decode rows leading a matmul of `m` rows in the open
+/// [`RaggedDecodeRows`] scope: `Some(live)` when `m` is the step's input
+/// rows or its head's and the live rows are some but not all of them.
+pub fn ragged_decode_lead(m: usize) -> Option<usize> {
+    let (live, rows, heads) = RAGGED_DECODE_ROWS.with(|c| c.get());
+    (live > 0 && live < m && (m == rows || m == heads)).then_some(live)
+}
+
+/// `kernels.gemm.f16_rows_decode`: 0 unread, 1 off, 2 on.
+static F16_ROWS_DECODE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Launches a batched decode step's f16 matmuls took on the row axis since
+/// process start: the decode arm's engagement count.
+static F16_ROWS_DECODE_LAUNCHES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// `kernels.gemm.f16_rows_decode`, read once; or [`set_f16_rows_decode`].
+/// The decode rows take the axis only while it is on ([`f16_rows_max`]).
+pub fn f16_rows_decode() -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    match F16_ROWS_DECODE.load(Relaxed) {
+        1 => false,
+        2 => true,
+        _ => {
+            let on = tuning().gemm.f16_rows_decode;
+            F16_ROWS_DECODE.store(if on { 2 } else { 1 }, Relaxed);
+            on
+        }
+    }
+}
+
+/// Select the decode rows' arm for this process (a test runs both).
+pub fn set_f16_rows_decode(on: bool) {
+    F16_ROWS_DECODE.store(if on { 2 } else { 1 }, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Count one launch a batched decode step's rows took on the row axis (a
+/// ragged step's live rows included).
+pub fn note_f16_rows_decode() {
+    F16_ROWS_DECODE_LAUNCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The decode rows' engagement count now.
+pub fn f16_rows_decode_launches() -> u64 {
+    F16_ROWS_DECODE_LAUNCHES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// `kernels.gemm.f16_rows_round`: 0 unread, 1 off, 2 on.
+static F16_ROWS_ROUND: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Launches on the f16 row axis that took a capacity above their rows since
+/// process start: the rounding arm's engagement count.
+static F16_ROWS_ROUNDED_LAUNCHES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// `kernels.gemm.f16_rows_round`, read once; or [`set_f16_rows_round`].
+pub fn f16_rows_round() -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    match F16_ROWS_ROUND.load(Relaxed) {
+        1 => false,
+        2 => true,
+        _ => {
+            let on = tuning().gemm.f16_rows_round;
+            F16_ROWS_ROUND.store(if on { 2 } else { 1 }, Relaxed);
+            on
+        }
+    }
+}
+
+/// Select the capacity rounding for this process (a test runs both).
+pub fn set_f16_rows_round(on: bool) {
+    F16_ROWS_ROUND.store(if on { 2 } else { 1 }, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Count one launch on the f16 row axis at a capacity above its rows.
+pub fn note_f16_rows_rounded() {
+    F16_ROWS_ROUNDED_LAUNCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The rounding arm's engagement count now.
+pub fn f16_rows_rounded_launches() -> u64 {
+    F16_ROWS_ROUNDED_LAUNCHES.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// The contract in force for this process: [`tuning`]'s `contract.profile`,
@@ -390,7 +755,7 @@ pub fn pin_contract(c: Contract) -> Result<Contract, String> {
         t.contract.profile = c.name().to_string();
     }
     let pinned = Contract::parse(&t.contract.profile)?;
-    install(t).map_err(|_| "pin_contract: the tuning was read before the pin".to_string())?;
+    install(t).map_err(|e| e.to_string())?;
     CONTRACT_PINNED.store(true, std::sync::atomic::Ordering::Relaxed);
     Ok(pinned)
 }
@@ -488,12 +853,47 @@ pub fn tuning() -> &'static Tuning {
     TUNING.get_or_init(|| from_process_env().unwrap_or_else(|e| panic!("tuning: {e}")))
 }
 
-/// Install the group for the process, before anything reads it. `Err` hands
-/// the group back if a read already happened (the knobs a `OnceLock` site
-/// took are fixed; installing after would make the report line lie).
-pub fn install(t: Tuning) -> Result<(), Tuning> {
+/// Resolve and validate library setup before creating backend resources.
+/// Failures do not install a group or claim test isolation. An earlier legacy
+/// `tuning()` read is also checked, never silently replaced.
+pub fn try_tuning() -> Result<&'static Tuning, TuningSetupError> {
+    if let Some(t) = TUNING.get() {
+        t.validate_instruments()?;
+        t.note_partial_instruments();
+        return Ok(t);
+    }
+    let t = from_process_env().map_err(TuningSetupError::InvalidEnvironment)?;
+    t.validate_instruments()?;
+    let installed = TUNING.get_or_init(|| t);
+    installed.validate_instruments()?;
+    installed.note_partial_instruments();
+    Ok(installed)
+}
+
+/// Install before first use. Refusal returns the original configuration and
+/// a typed reason; an unsupported request has no global/isolation side effects.
+pub fn install(t: Tuning) -> Result<(), InstallError> {
+    let reason = if TUNING.get().is_some() {
+        Some(TuningSetupError::AlreadyRead)
+    } else {
+        t.validate_instruments().err()
+    };
+    if let Some(reason) = reason {
+        return Err(InstallError {
+            reason,
+            tuning: Box::new(t),
+        });
+    }
     crate::isolation::claim("lloom_tensor::tuning");
-    TUNING.set(t)
+    TUNING.set(t).map_err(|t| InstallError {
+        reason: TuningSetupError::AlreadyRead,
+        tuning: Box::new(t),
+    })?;
+    TUNING
+        .get()
+        .expect("successful tuning installation")
+        .note_partial_instruments();
+    Ok(())
 }
 
 /// Whether [`install`] (or a first read) has already fixed the group.
@@ -578,6 +978,9 @@ fn parse_tile(v: &str) -> Result<Option<String>, String> {
         )
     })
 }
+fn parse_f16_rows_max(v: &str) -> Result<usize, String> {
+    ranged(v, "f16 rows a weight read", 2, 16)
+}
 fn parse_gemv_bm(v: &str) -> Result<Option<usize>, String> {
     if is_none(v) {
         return Ok(None);
@@ -627,6 +1030,9 @@ fn parse_cut_policy(v: &str) -> Result<String, String> {
 }
 fn parse_command_api(v: &str) -> Result<String, String> {
     parse_arm(v, &["metal3", "metal4", "auto"]).map(str::to_owned)
+}
+fn parse_host_input(v: &str) -> Result<String, String> {
+    parse_arm(v, &["commit", "gpu-wait"]).map(str::to_owned)
 }
 
 fn parse_completion_wait(v: &str) -> Result<String, String> {
@@ -726,12 +1132,47 @@ fn parse_pair_order(v: &str) -> Result<String, String> {
 fn parse_icb_residency(v: &str) -> Result<String, String> {
     one_of(v, "icb residency", &["per-run", "plan-wide"])
 }
+fn parse_residency_attach(v: &str) -> Result<String, String> {
+    one_of(v, "residency attach", &["queue", "heartbeat"])
+}
+fn parse_residency_metal4(v: &str) -> Result<String, String> {
+    one_of(
+        v,
+        "residency metal4",
+        &["slots", "queue-diff", "cb-diff", "queue-full", "cb-full"],
+    )
+}
+fn parse_residency_cap_pct(v: &str) -> Result<u32, String> {
+    let pct: u32 = parse_count(v)?;
+    if pct > 100 {
+        return Err(format!("residency set cap {pct} % is over 100"));
+    }
+    Ok(pct)
+}
+fn parse_residency_hot(v: &str) -> Result<String, String> {
+    non_empty(v)?;
+    let names = ["weights", "kv", "heap", "scratch", "experts", "other"];
+    let mut out = Vec::new();
+    for name in v.split(',').map(str::trim) {
+        if !names.contains(&name) {
+            return Err(format!(
+                "`{name}` is not a residency class ({})",
+                names.join(", ")
+            ));
+        }
+        out.push(name);
+    }
+    Ok(out.join(","))
+}
 fn parse_oversize_bound(v: &str) -> Result<Option<f64>, String> {
     if is_none(v) {
         return Ok(None);
     }
     let f = parse_number(v).map_err(|e| format!("reuse oversize bound: {e}"))?;
-    if !(f >= 1.0) {
+    if !matches!(
+        f.partial_cmp(&1.0),
+        Some(std::cmp::Ordering::Equal | std::cmp::Ordering::Greater)
+    ) {
         return Err(format!("reuse oversize bound {f} must be >= 1.0"));
     }
     Ok(Some(f))
@@ -815,6 +1256,42 @@ pub struct GemmTuning {
         status = "arm"
     )]
     pub prefill_window: bool,
+    /// Under `fast`, a speculative verify window's f16 matmuls of 2 to `f16_rows_max` rows take the GEMV's row axis: each weight block read once for every row of the window, each row the one-row GEMV's bits; off = the GEMM from two rows. On by default under `fast` (maintainer, 2026-10-19: DSpark ×1.25 on LFM2.5, the stream parting from K=1 only at an exact tie); `deterministic` never takes it. The K=1 path, the prefill, the drafter and `deterministic` do not read it.
+    #[opt(
+        flag = "gemm-f16-rows",
+        env = "LLOOM_GEMM_F16_ROWS",
+        bool,
+        path = "kernels.gemm.f16_rows",
+        status = "arm"
+    )]
+    pub f16_rows: bool,
+    /// The most rows the f16 row axis takes (2..16), in a verify window and in a batched decode step (`kernels.gemm.f16_rows_decode`, whose serve and bench default holds at a batch of 2 to this many sequences); more rows take the GEMM. 10 in the library; `serve` and `bench` resolve 12 on Metal (decision 60: on LFM2.5-2.6B the served step at 11 and 12 rows is 21.1 and 22.8 ms on the axis against 26.8 and 27.1 on the GEMM, ×1.26 and ×1.18 decode tok/s at B = 11 and 12; from 13 rows the axis is ×1.65 the GEMM's step).
+    #[opt(
+        flag = "gemm-f16-rows-max",
+        env = "LLOOM_GEMM_F16_ROWS_MAX",
+        parser = "parse_f16_rows_max",
+        path = "kernels.gemm.f16_rows_max",
+        status = "arm"
+    )]
+    pub f16_rows_max: usize,
+    /// Under `fast`, with `kernels.gemm.f16_rows` on, a batched decode step's f16 matmuls of 2 to `f16_rows_max` rows (one row per live sequence) take the GEMV's row axis: each weight block read once for every row, each row the one-row GEMV's bits; off = the GEMM from two rows. A step that carries prompt pieces puts its 1 to `f16_rows_max` live rows on the same route and its pieces on the GEMM, so a row's bits do not depend on whether a piece rode its step; a single sequence's step and `deterministic` keep their routes. Off in the library; `serve` and `bench` turn it on on Metal at a batch of 2 to `f16_rows_max` sequences (decision 54; 2 to 12 since decision 60), `--gemm-f16-rows-decode=false` to measure without it.
+    #[opt(
+        flag = "gemm-f16-rows-decode",
+        env = "LLOOM_GEMM_F16_ROWS_DECODE",
+        bool,
+        path = "kernels.gemm.f16_rows_decode",
+        status = "arm"
+    )]
+    pub f16_rows_decode: bool,
+    /// Under `fast`, a launch of an odd number of rows (3 to 15) on the f16 row axis takes the next even capacity: the padded lanes re-read the launch's last row and store nothing, so every row keeps the one-row GEMV's bits; off = capacity `m`. A verify window's and a batched decode step's launches alike; one row keeps the one-row GEMV.
+    #[opt(
+        flag = "gemm-f16-rows-round",
+        env = "LLOOM_GEMM_F16_ROWS_ROUND",
+        bool,
+        path = "kernels.gemm.f16_rows_round",
+        status = "arm"
+    )]
+    pub f16_rows_round: bool,
 }
 
 impl Default for GemmTuning {
@@ -828,6 +1305,13 @@ impl Default for GemmTuning {
             verify_window: true,
             draft_window: true,
             prefill_window: true,
+            f16_rows: true,
+            // Measured (`docs/tuning.md` §13.5y): at LFM2.5's shapes the row
+            // axis is no slower than the GEMM at every row count to 10 and
+            // slower at 12 on most of them.
+            f16_rows_max: 10,
+            f16_rows_decode: false,
+            f16_rows_round: false,
         }
     }
 }
@@ -1076,8 +1560,11 @@ pub struct MetalTuning {
     /// Command API: metal3 (default), metal4 (experimental reusable native buffers), or auto (Metal 4 when available and compatible with diagnostics, otherwise Metal 3).
     #[opt(flag = "metal-api", env = "LLOOM_METAL_API", parser = "parse_command_api", variants = ["metal3", "metal4", "auto"], path = "backend.metal.command_buffer.api", status = "arm", flows = ["commands-out"])]
     pub command_api: String,
+    /// How the command stream orders work behind an input a host thread or the IO queue produces: `commit` (the producer commits the dependent recording once the input exists; the GPU never waits on a host-produced signal) or `gpu-wait` (the dependent recording is committed at once behind a GPU wait on the producer's event — the A/B control; a timed-out Metal 4 queue wait releases the work).
+    #[opt(flag = "host-input", env = "LLOOM_HOST_INPUT", parser = "parse_host_input", variants = ["commit", "gpu-wait"], path = "backend.metal.command_buffer.host_input", status = "arm", facets = ["wait"], flows = ["commands-out", "weights-in"])]
+    pub host_input: String,
     /// How the host waits for a command buffer: `block` (the blocking wait), `event` (park on the buffer's shared event), `event:<dur>` (the same, timed out after whole milliseconds), `event-sleep[:<dur>]` (poll the event, sleeping between looks), `event-listener[:<dur>]` (an event listener, timed out). The older spellings `synchronize`, `shared-event`, `shared-event-wait[:ms]`, `shared-event-sleep[:µs]`, `shared-event-listener[:ms]` are the same arms.
-    #[opt(flag = "completion-wait", env = "CANDLE_METAL_COMPLETION_WAIT", parser = "parse_completion_wait", variants = ["synchronize", "shared-event", "shared-event-sleep[:µs]", "shared-event-wait[:ms]", "shared-event-listener[:ms]"], path = "backend.metal.completion_wait", status = "arm", facets = ["wait"], flows = ["token-out", "prompt-in", "commands-out"], forms = ["block", "event", "event-sleep", "event-listener"], from_v1 = "crate::options::v1::completion_wait_from", to_v1 = "completion_wait_to", schema = "Wait")]
+    #[opt(flag = "completion-wait", env = "CANDLE_METAL_COMPLETION_WAIT", parser = "parse_completion_wait", variants = ["synchronize", "shared-event", "shared-event-sleep[:µs]", "shared-event-wait[:ms]", "shared-event-listener[:ms]"], path = "backend.metal.completion_wait", status = "arm", facets = ["wait"], flows = ["token-out", "prompt-in", "commands-out"], forms = ["block", "event", "event-sleep", "event-listener"], from_v1 = "crate::options::v1::completion_wait_from", to_v1 = "completion_wait_to", schema = "Wait", grammar = "crate::options::wait::COMPLETION_WAIT")]
     pub completion_wait: String,
     /// Dispatches per command buffer on the blocking loop and the prefill (the cut period).
     #[opt(flag = "compute-per-buffer",
@@ -1164,6 +1651,27 @@ pub struct MetalTuning {
     /// The ICB run's residency declaration: `per-run` (the buffers a run binds) or `plan-wide` (every buffer the plan binds, at every run).
     #[opt(flag = "icb-residency", env = "LLOOM_688_RESIDENCY", parser = "parse_icb_residency", variants = ["per-run", "plan-wide"], path = "executor.replay.residency", status = "arm")]
     pub icb_residency: String,
+    /// How the device's residency set keeps its memory resident: `queue` (attached to the Metal 3 command queue, so a command buffer waits until the whole set is resident) or `heartbeat` (not attached: a command buffer waits only for what it binds, and the set is kept wired by requests — serve's keep-warm). Metal 4 keeps `queue`: its queue binds through per-slot sets, and the loaded line says so. `queue` in the library; `chat` and `serve` default to `heartbeat` on Metal (decision 56; measured on Metal 3, `tuning.md` §6.3n: the first token with the set unwired 203–216 ms queue-attached, 159–190 ms detached; warm, under a desktop-GPU load and in decode no change), `--residency-attach queue` to measure without it.
+    #[opt(flag = "residency-attach", env = "LLOOM_RESIDENCY_ATTACH", parser = "parse_residency_attach", variants = ["queue", "heartbeat"], path = "kernels.residency.attach", status = "arm", facets = ["liveness"], flows = ["commands-out"])]
+    pub residency_attach: String,
+    /// Each residency set of a class holds at most this percentage of the device's recommended working set; past it the class takes another set (at most 24 device sets). 0 = one set for everything; 5 is MLX's per-set cap.
+    #[opt(flag = "residency-set-cap-pct", env = "LLOOM_RESIDENCY_SET_CAP_PCT", parser = "parse_residency_cap_pct", path = "kernels.residency.set_cap_pct", status = "arm", facets = ["liveness"], flows = ["commands-out"])]
+    pub residency_set_cap_pct: u32,
+    /// The residency classes the keep-warm asks to keep resident when the sets are split (`kernels.residency.set_cap_pct` > 0): a comma list of weights, kv, heap, scratch, experts, other. The rest are left to the OS, and under memory pressure their residency is ended.
+    #[opt(flag = "residency-hot", env = "LLOOM_RESIDENCY_HOT", parser = "parse_residency_hot", path = "kernels.residency.hot", status = "arm", facets = ["liveness"], flows = ["commands-out"])]
+    pub residency_hot: String,
+    /// Count and time what the Metal 4 queue's per-slot residency sets do: the resources `Slot::resource` adds per command buffer and the host time of those adds, the pipelines added, the set commits and their host time (total and longest), and the set's `allocatedSize` at each commit (last and largest), read out in `/health` (an instrument for #1092 lane B; one clock read per add and per commit when on).
+    #[opt(
+        flag = "residency-slot-trace",
+        env = "LLOOM_METAL4_SLOT_TRACE",
+        bool,
+        path = "kernels.residency.slot_trace",
+        status = "instrument"
+    )]
+    pub residency_slot_trace: bool,
+    /// What a Metal 4 command buffer declares resident: `slots` (each command buffer's slot set lists everything it binds), `queue-diff` (the device's residency sets on the Metal 4 queue, the slot set listing only what they do not cover), `cb-diff` (each command buffer uses the device's sets, the slot set listing only what they do not cover); `queue-full` and `cb-full` attach or use the device's sets and keep the full slot lists (controls). A pool buffer or a heap sub-buffer is covered; everything else stays in the slot set (`tuning.md` §6.3p).
+    #[opt(flag = "residency-metal4", env = "LLOOM_RESIDENCY_METAL4", parser = "parse_residency_metal4", variants = ["slots", "queue-diff", "cb-diff", "queue-full", "cb-full"], path = "kernels.residency.metal4", status = "arm", facets = ["liveness"], flows = ["commands-out"])]
+    pub residency_metal4: String,
     /// Run these types although this GPU only emulates them (a comma list; `bf16` on Apple7, ~2.6x the f32 time); none = refuse them (§15.2a).
     #[opt(flag = "allow-emulated", env = "LLOOM_METAL_ALLOW_EMULATED", parser = "parse_allow_emulated", variants = ["none", "bf16"], path = "backend.metal.allow_emulated", status = "advanced")]
     pub allow_emulated: Option<String>,
@@ -1227,6 +1735,7 @@ impl Default for MetalTuning {
     fn default() -> Self {
         MetalTuning {
             command_api: "metal3".into(),
+            host_input: "commit".into(),
             completion_wait: "synchronize".into(),
             compute_per_buffer: DEFAULT_CANDLE_METAL_COMPUTE_PER_BUFFER,
             pipelined_compute_per_buffer: DEFAULT_CANDLE_METAL_PIPELINED_COMPUTE_PER_BUFFER,
@@ -1245,6 +1754,11 @@ impl Default for MetalTuning {
             merged_unit: false,
             icb_quarantine_off: false,
             icb_residency: "per-run".into(),
+            residency_attach: "queue".into(),
+            residency_set_cap_pct: 0,
+            residency_hot: "weights,kv".into(),
+            residency_slot_trace: false,
+            residency_metal4: "slots".into(),
             allow_emulated: None,
             fast_math: true,
             eager_residency_release: None,
@@ -1341,7 +1855,7 @@ pub struct InstrumentTuning {
         status = "instrument",
         cli = "gpu-profile",
         needs = "profile",
-        needs_part = "the step-0 dispatch census"
+        needs_part = "per-label census, command-buffer intervals and sampled encoder data"
     )]
     pub profile: bool,
     /// Under `profile`: time every compute encoder with stage-boundary counter samples.
@@ -1350,7 +1864,8 @@ pub struct InstrumentTuning {
         env = "CANDLE_METAL_PROFILE_COUNTERS",
         bool,
         path = "diagnostics.gpu_profile.counters",
-        status = "instrument"
+        status = "instrument",
+        needs = "profile"
     )]
     pub profile_counters: bool,
     /// Under `profile`: end the compute encoder after every dispatch, so each counter-sampled encoder is one kernel (an arm: a seam per dispatch).
@@ -1359,7 +1874,8 @@ pub struct InstrumentTuning {
         env = "CANDLE_METAL_PROFILE_ENCODER_PER_DISPATCH",
         bool,
         path = "diagnostics.gpu_profile.encoder_per_dispatch",
-        status = "instrument"
+        status = "instrument",
+        needs = "profile"
     )]
     pub profile_encoder_per_dispatch: bool,
     /// The dispatch trace recorder (kernel, grid, threadgroup, barrier, encoder per dispatch).
@@ -1369,6 +1885,7 @@ pub struct InstrumentTuning {
         bool,
         path = "diagnostics.trace.dispatch",
         status = "instrument",
+        needs = "profile",
         cli = "trace"
     )]
     pub trace: bool,
@@ -1378,7 +1895,8 @@ pub struct InstrumentTuning {
         env = "LLOOM_POOL_TRACE",
         bool,
         path = "diagnostics.trace.pool",
-        status = "instrument"
+        status = "instrument",
+        needs = "profile"
     )]
     pub pool_trace: bool,
     /// Attribute every pool request a served pass makes to the model call site that made it (a backtrace per request; the residue of `served_pass_pool_requests`, §9.2aa).
@@ -1387,12 +1905,16 @@ pub struct InstrumentTuning {
         env = "LLOOM_SERVED_REQUEST_TRACE",
         bool,
         path = "diagnostics.trace.served_requests",
-        status = "instrument"
+        status = "instrument",
+        needs = "profile"
     )]
     pub served_request_trace: bool,
     /// Attribute every host readback (`to_cpu`'s fast and blit paths, a staged read's stage, a host-read slot's read) to the model call site that made it (a backtrace per readback, #814 part 5).
-    #[opt(flag = "readback-trace", env = "LLOOM_READBACK_TRACE", bool, path = "diagnostics.trace.readbacks", status = "instrument", flows = ["token-out"])]
+    #[opt(flag = "readback-trace", env = "LLOOM_READBACK_TRACE", bool, path = "diagnostics.trace.readbacks", status = "instrument", needs = "profile", flows = ["token-out"])]
     pub readback_trace: bool,
+    /// Under the GPU profiler: attribute every command-buffer commit to the stack and thread that made it (a frame-pointer walk per commit, symbolized once per distinct stack), so a request's commits can be counted by cause (`profile::cut_sites`).
+    #[opt(flag = "cut-sites", env = "LLOOM_CUT_SITES", bool, path = "diagnostics.trace.cut_sites", status = "instrument", needs = "profile", flows = ["commands-out"])]
+    pub cut_sites: bool,
     /// Shadow every host upload and check it back (the #748 corruption instrument).
     #[opt(
         flag = "upload-shadow",
@@ -1412,7 +1934,7 @@ pub struct InstrumentTuning {
         path = "diagnostics.gpu_profile.dump",
         status = "instrument",
         needs = "profile",
-        needs_part = "the steps table's host step time column"
+        needs_part = "per-label and interval tables, sampled encoder data, and the steps table's host step time column"
     )]
     pub profile_dump: Option<String>,
 }
@@ -1525,6 +2047,11 @@ mod tests {
         assert_eq!(t.metal.completion_wait, "synchronize");
         assert_eq!(t.pool.buffer_alignment, 128);
         assert_eq!(t.gemm.skinny_max, 33);
+        // On by default under `fast` (maintainer, 2026-10-19); `deterministic`
+        // never takes it (`the_report_names_the_f16_row_axis_under_fast_only`).
+        assert!(t.gemm.f16_rows);
+        assert_eq!(t.gemm.f16_rows_max, 10);
+        assert!(!t.gemm.f16_rows_round);
         assert_eq!(t.qmm.dequant_from, 64);
         assert_eq!(t.moe.mm_from, 64);
         assert!(t.qmm.f16_mm);
@@ -1555,7 +2082,7 @@ mod tests {
         assert_eq!(
             Contract::Fast.report(),
             format!(
-                "profile=fast arms=moe-act-f16,decision-pack,decision-ragged cpu_f16_accum={accum}"
+                "profile=fast arms=moe-act-f16,decision-pack,decision-ragged,f16-rows cpu_f16_accum={accum}"
             )
         );
     }
@@ -1594,6 +2121,28 @@ mod tests {
                 "the window switches do not reach `fast`'s arms"
             );
         }
+    }
+
+    /// `fast`'s report line names the f16 row axis while it is on, after the
+    /// static arms, and `deterministic`'s never does (nothing there takes it).
+    #[test]
+    fn the_report_names_the_f16_row_axis_under_fast_only() {
+        let accum = crate::cpu::f16_matmul::report();
+        let fast = Contract::FAST_ARMS.join(",");
+        set_f16_rows(None);
+        assert_eq!(f16_rows_max(), None);
+        assert_eq!(
+            Contract::Fast.report(),
+            format!("profile=fast arms={fast} cpu_f16_accum={accum}")
+        );
+        let deterministic = Contract::Deterministic.report();
+        set_f16_rows(Some(10));
+        assert_eq!(f16_rows_max(), Some(10));
+        assert_eq!(
+            Contract::Fast.report(),
+            format!("profile=fast arms={fast},f16-rows cpu_f16_accum={accum}")
+        );
+        assert_eq!(Contract::Deterministic.report(), deterministic);
     }
 
     /// The window is the opening thread's, nests, and closes with its guard.
@@ -1679,6 +2228,42 @@ mod tests {
         );
     }
 
+    /// Threshold comparison keeps the finite-number grammar's earlier refusal.
+    /// Pure parser calls only: no process tuning installation or native work.
+    #[test]
+    fn reuse_oversize_bound_keeps_finite_grammar_threshold_and_default() {
+        assert_eq!(PoolTuning::default().reuse_oversize_bound, None);
+        for input in ["none", " NoNe ", "\tnone\n"] {
+            assert_eq!(parse_oversize_bound(input), Ok(None), "{input:?}");
+        }
+        for (input, expected) in [
+            ("1", 1.0_f64),
+            ("1e0", 1.0),
+            (" 1.5 ", 1.5),
+            ("1.0000000000000002", f64::from_bits(1.0_f64.to_bits() + 1)),
+            ("1.7976931348623157e308", f64::MAX),
+        ] {
+            let got = parse_oversize_bound(input).unwrap().unwrap();
+            assert_eq!(got.to_bits(), expected.to_bits(), "{input:?}");
+        }
+        for (input, message) in [
+            ("-1", "reuse oversize bound -1 must be >= 1.0"),
+            ("-0", "reuse oversize bound -0 must be >= 1.0"),
+            ("0", "reuse oversize bound 0 must be >= 1.0"),
+            ("0.9999999999999999", "reuse oversize bound 0.9999999999999999 must be >= 1.0"),
+            ("NaN", "reuse oversize bound: `NaN` is not a finite number"),
+            ("inf", "reuse oversize bound: `inf` is not a finite number"),
+            ("-inf", "reuse oversize bound: `-inf` is not a finite number"),
+            ("1e999", "reuse oversize bound: `1e999` is not a finite number"),
+            ("off", "reuse oversize bound: `off` is not a finite number"),
+            ("not-a-number", "reuse oversize bound: `not-a-number` is not a finite number"),
+            ("", "reuse oversize bound: an empty value is refused (`none` unsets an optional key)"),
+            (" ", "reuse oversize bound: an empty value is refused (`none` unsets an optional key)"),
+        ] {
+            assert_eq!(parse_oversize_bound(input), Err(message.into()), "{input:?}");
+        }
+    }
+
     #[test]
     fn the_parsers_refuse_what_the_sites_refused() {
         let mut t = Tuning::default();
@@ -1747,5 +2332,61 @@ mod tests {
         sorted.sort_unstable();
         sorted.dedup();
         assert_eq!(sorted.len(), aliases.len(), "no two knobs share a variable");
+    }
+}
+
+#[cfg(test)]
+mod diagnostic_build_tests {
+    #[test]
+    fn an_explicit_detail_requirement_uses_the_generated_capability_without_setup() {
+        let meta = crate::options::meta_at(super::InstrumentTuning::META, "profile").unwrap();
+        let result = super::require_profile_recorder();
+        if cfg!(feature = "metal") && super::PROFILE_INSTRUMENTS {
+            result.unwrap();
+        } else {
+            assert_eq!(
+                result,
+                Err(super::TuningSetupError::NotCompiled {
+                    key: meta.path,
+                    capability: if cfg!(feature = "metal") {
+                        meta.needs
+                    } else {
+                        "metal"
+                    },
+                })
+            );
+        }
+        // A cold requirement must not freeze tuning or turn the recorder on.
+        super::install(super::Tuning::default()).unwrap();
+    }
+
+    #[test]
+    fn an_unavailable_direct_attribution_request_is_loud() {
+        assert!(super::check_profile_request("served_request_trace", false).is_ok());
+        assert_eq!(
+            super::check_profile_request("served_request_trace", true).is_ok(),
+            super::PROFILE_INSTRUMENTS
+        );
+    }
+
+    #[test]
+    fn whole_instruments_refuse_but_partial_counts_remain_usable() {
+        let mut t = super::Tuning::default();
+        assert!(t.validate_instruments().is_ok());
+        t.instrument.profile = true;
+        assert!(t.validate_instruments().is_ok());
+        t.instrument.trace = true;
+        assert_eq!(t.validate_instruments().is_ok(), super::PROFILE_INSTRUMENTS);
+    }
+
+    #[test]
+    fn install_returns_incoming_payload_and_preserves_already_read() {
+        let t = super::Tuning::default();
+        super::install(t.clone()).unwrap();
+        let mut incoming = t;
+        incoming.instrument.trace = true;
+        let error = super::install(incoming.clone()).unwrap_err();
+        assert_eq!(error.reason, super::TuningSetupError::AlreadyRead);
+        assert_eq!(error.into_tuning(), incoming);
     }
 }

@@ -5,7 +5,9 @@
 //! 2-pass attention's length set low (`LLOOM_SDPA_TWO_PASS_K`) so that the
 //! later positions take the two-launch kernel — each step's census from the
 //! device's own window, in the IR's families, held to the walk at that
-//! position (derived, for an arm whose epilogues the plan decides).
+//! position (derived, for an arm whose epilogues the plan decides, or whose
+//! MLP `kernels.fusion.silu_mul` composes). Both arms of that switch are
+//! held, each in its own process: the switch is read once.
 #![cfg(feature = "metal")]
 
 use lloom::models::lfm2::{
@@ -106,29 +108,34 @@ fn arms() -> Vec<(&'static str, Config, Set)> {
     arms
 }
 
-/// The fragments only LFM2's flags select: the kernel fragments run in no
-/// LFM2 switch.
-fn unavailable() -> Vec<(String, String)> {
+/// The kernel fragments an arm does not run: every one but `silu_mul`'s,
+/// which `kernels.fusion.silu_mul` selects when `silu_mul` is set.
+fn unavailable(silu_mul: bool) -> Vec<(String, String)> {
     lloom::optimizer::fragments::kernels()
         .into_iter()
+        .filter(|k| !(silu_mul && k.family == "silu_mul"))
         .map(|k| (k.name.to_string(), "no LFM2 switch".to_string()))
         .collect()
 }
 
-/// The composition an arm runs: the derived plan under `Derived`; under
-/// `Manual` the fragments its flags select, every other refused, nothing
-/// re-priced (a hand composition is what it is); `None`, the source.
-fn policy(cfg: &Config, set: Set) -> Option<Policy> {
+/// The composition an arm runs: the derived plan under `Derived` (whose
+/// derivation sets the epilogues alone, every kernel fragment refused);
+/// under `Manual` the fragments its flags select, every other refused,
+/// nothing re-priced (a hand composition is what it is); `None`, the
+/// source. With `silu_mul` (the switch on) the MLP's SiLU and product are
+/// `silu_mul` wherever no epilogue takes them, which the derivation's costs
+/// decide as the forward's order does; the norm arm's MLP composes the pair.
+fn policy(cfg: &Config, set: Set, silu_mul: bool) -> Option<Policy> {
     if set == Set::DerivedReorder {
         return Some(Policy {
             budget: NumericClass::ReorderEquiv,
-            unavailable: unavailable(),
+            unavailable: unavailable(false),
             ..Policy::default()
         });
     }
     if cfg.fusion == FusionPolicy::Derived {
         return Some(Policy {
-            unavailable: unavailable(),
+            unavailable: unavailable(false),
             ..Policy::default()
         });
     }
@@ -145,7 +152,8 @@ fn policy(cfg: &Config, set: Set) -> Option<Policy> {
             excluded.push(name.to_string());
         }
     }
-    (excluded.len() < 5).then(|| Policy {
+    let kernel = silu_mul && !norm;
+    (excluded.len() < 5 || kernel).then(|| Policy {
         excluded,
         barrier_model: None,
         budget: if norm {
@@ -153,7 +161,7 @@ fn policy(cfg: &Config, set: Set) -> Option<Policy> {
         } else {
             NumericClass::Rounding
         },
-        unavailable: unavailable(),
+        unavailable: unavailable(kernel),
         ..Policy::default()
     })
 }
@@ -189,10 +197,17 @@ fn differences(a: &Census, b: &Census) -> Vec<(String, u64, u64)> {
 type Wrong = (usize, Vec<(String, u64, u64)>);
 
 /// The positions of `cfg`'s arm whose step dispatches other than its walk,
-/// and how many of its steps took the 2-pass attention.
-fn check(name: &str, cfg: &Config, set: Set, dev: &Device) -> Result<(Vec<Wrong>, usize)> {
+/// how many of its steps took the 2-pass attention, and how many
+/// `silu_mul` launches its steps ran.
+fn check(
+    name: &str,
+    cfg: &Config,
+    set: Set,
+    silu_mul: bool,
+    dev: &Device,
+) -> Result<(Vec<Wrong>, usize, u64)> {
     let key = cfg.exact_key();
-    lloom::profile::dispatch!(key, lloom::profile::LFM2, P => check_at::<P>(name, cfg, set, dev))
+    lloom::profile::dispatch!(key, lloom::profile::LFM2, P => check_at::<P>(name, cfg, set, silu_mul, dev))
 }
 
 /// `check` at the profile the config names.
@@ -200,8 +215,9 @@ fn check_at<P: Lfm2Shape>(
     name: &str,
     cfg: &Config,
     set: Set,
+    silu_mul: bool,
     dev: &Device,
-) -> Result<(Vec<Wrong>, usize)> {
+) -> Result<(Vec<Wrong>, usize, u64)> {
     let mut model: Model<P> = TinyCheckpoint::<Lfm2Tiny>::new(cfg.clone(), Weights::default())
         .with_dtype(DType::F16)
         .model::<P>(dev)?;
@@ -222,11 +238,12 @@ fn check_at<P: Lfm2Shape>(
     let inp = Tensor::new(prompt.as_slice(), dev)?.reshape((1, prompt.len()))?;
     model.forward(&inp, 0, &mut cache)?;
     dev.synchronize()?;
-    let policy = policy(cfg, set);
+    let policy = policy(cfg, set, silu_mul);
     let sliding = matches!(cfg.conv_state, ConvState::SlidingRing { .. });
     let mut wrong = Vec::new();
     let mut two_pass = 0;
     let mut compactions = 0;
+    let mut silu_mul_launches = 0;
     for pos in prompt.len()..prompt.len() + STEPS {
         let census = dev
             .as_metal_device()?
@@ -235,16 +252,17 @@ fn check_at<P: Lfm2Shape>(
             .expect("the census window");
         let tok = Tensor::new(&[(pos % 60) as u32 + 1], dev)?.reshape((1, 1))?;
         let _ = lloom_tensor::kernels::metal::trace::take_dispatches();
-        lloom_tensor::kernels::metal::trace::set_recording(true);
+        lloom_tensor::kernels::metal::trace::set_recording(true)?;
         model.forward(&tok, pos, &mut cache)?;
         dev.synchronize()?;
-        lloom_tensor::kernels::metal::trace::set_recording(false);
+        lloom_tensor::kernels::metal::trace::set_recording(false)?;
         let order: Vec<String> = lloom_tensor::kernels::metal::trace::take_dispatches()
             .iter()
             .map(|d| d.pipeline.clone())
             .collect();
         let labels = census.close();
         let ran = census_of_labels(labels.iter().map(|(l, n)| (l.as_str(), *n)));
+        silu_mul_launches += ran.get("silu_mul").copied().unwrap_or(0);
         let g = walk_at(&model, pos);
         let walked = match &policy {
             Some(p) => derive(&g, p)?.graph.census(),
@@ -279,7 +297,7 @@ fn check_at<P: Lfm2Shape>(
             "{name}: the positions reach the ring's compaction"
         );
     }
-    Ok((wrong, two_pass))
+    Ok((wrong, two_pass, silu_mul_launches))
 }
 
 /// `d` as (family, 0, ran − walked): what a step ran beyond its walk.
@@ -291,17 +309,38 @@ fn differences_net(d: &[(String, u64, u64)]) -> Vec<(String, u64, u64)> {
 
 #[test]
 fn every_arm_dispatches_what_its_walk_names_at_every_position() -> Result<()> {
-    // The switches are read once, on first use, by this process.
+    every_arm_at(true)
+}
+
+#[test]
+fn every_arm_dispatches_what_its_walk_names_with_silu_mul_off() -> Result<()> {
+    every_arm_at(false)
+}
+
+/// Every arm, with `kernels.fusion.silu_mul` at `silu_mul`; the steps of the
+/// MLPs that run it dispatch `silu_mul` and neither `silu` nor that `bmul`.
+fn every_arm_at(silu_mul: bool) -> Result<()> {
+    // The switches are read once, on first use, by this process: the
+    // environment is set before the tuning reads it.
     std::env::set_var("CANDLE_METAL_PROFILE", "1");
     std::env::set_var("LLOOM_SDPA_TWO_PASS_K", TWO_PASS.to_string());
     std::env::set_var("CANDLE_METAL_TRACE", "1");
+    let mut t = lloom::tuning::Tuning::default();
+    t.from_env().expect("the tuning's environment");
+    t.lfm2.skip_silu_mul = !silu_mul;
+    assert!(
+        lloom::tuning::install(t).is_ok(),
+        "the tuning was read before the arm was installed"
+    );
     let Ok(dev) = Device::new_metal(0) else {
         eprintln!("no Metal device; skipping");
         return Ok(());
     };
     let mut wrong = Vec::new();
+    let mut ran_silu_mul = 0;
     for (name, cfg, set) in arms() {
-        let (w, two_pass) = check(name, &cfg, set, &dev)?;
+        let (w, two_pass, n) = check(name, &cfg, set, silu_mul, &dev)?;
+        ran_silu_mul += n;
         if cfg.attn_impl == AttnImpl::Sdpa {
             assert!(
                 two_pass >= 2,
@@ -312,6 +351,14 @@ fn every_arm_dispatches_what_its_walk_names_at_every_position() -> Result<()> {
             wrong.push((name, w));
         }
     }
+    // The arm is the one installed: the default arms' MLPs run `silu_mul`
+    // under the switch and never without it.
+    eprintln!("silu_mul={silu_mul}: {ran_silu_mul} silu_mul launches over every arm");
+    assert_eq!(
+        ran_silu_mul > 0,
+        silu_mul,
+        "silu_mul={silu_mul}: {ran_silu_mul} silu_mul launches"
+    );
     assert!(
         wrong.is_empty(),
         "arms whose steps dispatch other than their walk (position, (family, walked, ran)): {wrong:?}"

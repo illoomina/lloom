@@ -480,15 +480,18 @@ impl Family for Lfm2Family {
         lfm2::load(lfm2::LoadOptions {
             model_dir: dir,
             cpu: model.cpu(),
+            purpose: model.purpose().map_err(anyhow::Error::msg)?,
             kv_capacity: shape.memory.kv_capacity,
             readback: shape.decode.readback.arm(),
             decode: shape.decode.clone(),
             model: shape.model.clone(),
             reuse_prefix: shape.reuse_prefix,
+            pin_prefix: shape.pin_prefix,
             warmup: model.warmup,
             seed_text: shape.seed_text.clone(),
             model_name: model.model_name.clone(),
             batch: shape.batch,
+            intake_per_tick: shape.intake_per_tick,
             dspark: (spec.method == "dspark").then(|| spec.drafter.clone().unwrap_or_default()),
             prefill_tile: shape.decode.prefill.tile,
             prefill_chunk: shape.decode.prefill.chunk,
@@ -600,6 +603,7 @@ impl Family for Qwen4ExpFamily {
             first_shard: first,
             tokenizer: model.tokenizer.clone(),
             cpu: model.cpu(),
+            purpose: model.purpose().map_err(anyhow::Error::msg)?,
             kv_capacity: shape.memory.kv_capacity,
             readback: shape.decode.readback.arm(),
             decode: shape.decode.clone(),
@@ -623,6 +627,7 @@ impl Family for Qwen4ExpFamily {
             spec_k: spec.k,
             hotlist: model.hotlist.clone(),
             batch: shape.batch,
+            intake_per_tick: shape.intake_per_tick,
             mtp_k: spec.k.unwrap_or(1),
             prefetch: model.prefetch,
             io_hints: model.io_hints,
@@ -681,10 +686,12 @@ impl Family for Qwen3_5Family {
             first_shard: first,
             tokenizer: model.tokenizer.clone(),
             cpu: model.cpu(),
+            purpose: model.purpose().map_err(anyhow::Error::msg)?,
             kv_capacity: shape.memory.kv_capacity,
             readback: shape.decode.readback.arm(),
             decode: shape.decode.clone(),
             reuse_prefix: shape.reuse_prefix,
+            pin_prefix: shape.pin_prefix,
             warmup: model.warmup,
             seed_text: shape.seed_text.clone(),
             model_name: model.model_name.clone(),
@@ -830,23 +837,39 @@ pub fn load(model: &LoadConfig, shape: Shape) -> Result<(Box<dyn Served>, PathBu
     if let Some(note) = &clamp {
         eprintln!("[readback: {note}]");
     }
+    let purpose = model.purpose().map_err(anyhow::Error::msg)?;
     let req = Requested { model, shape };
     family
         .resolve(&req)
         .map_err(|e| anyhow::anyhow!("{} cannot serve this shape: {e}", family.name()))?;
     let mut engine = family.load(checkpoint.clone(), req)?;
-    engine.note_load_warnings_checked(
-        clamp
-            .into_iter()
-            .map(|n| {
-                lloom::load_warning::LoadWarning::new(
-                    lloom::load_warning::LoadWarningKind::Readback,
-                    n,
-                )
-            })
-            .collect(),
-    )?;
+    let mut warnings: Vec<_> = clamp
+        .into_iter()
+        .map(|n| {
+            lloom::load_warning::LoadWarning::new(lloom::load_warning::LoadWarningKind::Readback, n)
+        })
+        .collect();
+    warnings.extend(reference_purpose_warning(purpose));
+    engine.note_load_warnings_checked(warnings)?;
     Ok((engine, checkpoint))
+}
+
+/// A reference load says so, on stderr and as a load warning: its attention
+/// may take the composed scores path, which a production load refuses.
+fn reference_purpose_warning(
+    purpose: lloom::nn::attention::route::ExecutionPurpose,
+) -> Option<lloom::load_warning::LoadWarning> {
+    (purpose == lloom::nn::attention::route::ExecutionPurpose::Reference).then(|| {
+        let note = "execution purpose `reference`: an attention no prepared route serves takes \
+                    the composed attention, which materializes the scores; this is not a \
+                    production load"
+            .to_string();
+        eprintln!("[{note}]");
+        lloom::load_warning::LoadWarning::new(
+            lloom::load_warning::LoadWarningKind::AttentionRoute,
+            note,
+        )
+    })
 }
 
 #[cfg(test)]
@@ -878,10 +901,12 @@ mod tests {
             reuse_prefix: false,
             seed_text: String::new(),
             batch: 1,
+            intake_per_tick: crate::options::DEFAULT_INTAKE_PER_TICK,
             mem_sample: false,
             rows: "auto".into(),
             share_prefix: false,
             decision_ragged: true,
+            pin_prefix: false,
         }
     }
 
@@ -1185,6 +1210,18 @@ mod tests {
         assert!(QWEN4EXP_CAPABILITIES
             .line()
             .contains("kv_quant=[off,f16,int8,int4] kv_dtype=f32"));
+    }
+
+    #[test]
+    fn lfm2_gguf_serves_a_real_f16_dense_store_but_not_integer_kv() {
+        let caps = super::super::causal_loaded::served::lfm2_gguf_capabilities();
+        for value in ["off", "f16"] {
+            resolve_kv_quant(&caps, &with_kv_quant(value).model.axes).unwrap();
+        }
+        for value in ["int8", "int4"] {
+            assert!(resolve_kv_quant(&caps, &with_kv_quant(value).model.axes).is_err());
+        }
+        assert_eq!(caps.kv_quant_names(), ["off", "f16"]);
     }
 
     /// The EOS gate's arm on Qwen3.5 does not open a reduced KV store: the

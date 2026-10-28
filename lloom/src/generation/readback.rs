@@ -148,6 +148,8 @@ pub trait ReadbackStrategy {
     /// Sample this step's token from `logits` and return the next forward's
     /// `[1, 1]` input. The blocking arm reads the id to the host here; the ring
     /// arms leave it on the device and return the ring's own slot.
+    /// Call [`Self::check_sampler`] once before a run, before any state moves;
+    /// this per-token seam does not repeat admission.
     fn sample_and_feed(&mut self, sampler: &mut LogitsProcessor, logits: &Tensor)
         -> Result<Tensor>;
 
@@ -554,9 +556,11 @@ impl ReadbackStrategy for Blocking {
         false
     }
 
-    fn check_sampler(&self, _sampling: &Sampling) -> Result<()> {
-        // Every arm round-trips here, so every arm is honest.
-        Ok(())
+    fn check_sampler(&self, sampling: &Sampling) -> Result<()> {
+        crate::nn::decode::refuse(
+            crate::nn::decode::Body::Step { ring: false },
+            &crate::nn::decode::Asks::sampling(sampling),
+        )
     }
 
     fn sample_and_feed(
@@ -2192,13 +2196,7 @@ impl ReadbackStrategy for Ring {
         // samplers that holds for.
         crate::nn::decode::refuse(
             crate::nn::decode::Body::Step { ring: true },
-            &crate::nn::decode::Asks {
-                sampling,
-                processors: false,
-                budget: false,
-                digest: false,
-                logprobs: None,
-            },
+            &crate::nn::decode::Asks::sampling(sampling),
         )
     }
 

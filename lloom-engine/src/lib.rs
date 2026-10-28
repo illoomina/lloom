@@ -42,8 +42,8 @@ pub use batch::{
     RowSpec, StaticBody,
 };
 pub use decode::{
-    ring_eos_read, DecodeParams, DecodeSession, Decoded, LogprobRequest, ReadbackArm, RingArm,
-    RingPool, Stop,
+    ring_eos_read, DecodeParams, DecodeSession, Decoded, LogprobRequest, PinReport, ReadbackArm,
+    RingArm, RingPool, Stop,
 };
 pub use lloom::generation::Logprobs;
 pub use options::{

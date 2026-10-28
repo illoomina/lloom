@@ -50,11 +50,16 @@ impl QMetalStorage {
         shared: bool,
     ) -> Result<Self> {
         let size = elem_count * dtype.type_size() / dtype.block_size();
-        let buffer = if shared {
-            device.new_persistent_shared(size)?
-        } else {
-            device.new_persistent_private(size)?
-        };
+        let buffer = crate::residency_class::residency_class_scope(
+            crate::residency_class::ResidencyClass::Experts,
+            || {
+                if shared {
+                    device.new_persistent_shared(size)
+                } else {
+                    device.new_persistent_private(size)
+                }
+            },
+        )?;
         {
             let mut blit = device.blit_command_encoder()?;
             blit.set_label("qstorage_persistent_zero");
@@ -218,12 +223,12 @@ impl QMetalStorage {
             .with_data(&out)
             .with_label("qstorage_dequantized")
             .build()?;
-        Ok(MetalStorage::new_allocated(
+        MetalStorage::new_allocated(
             buffer,
             self.device.clone(),
             elem_count,
             DType::F32,
-        )?)
+        )
     }
 
     pub fn quantize(&mut self, src: &MetalStorage) -> Result<()> {
@@ -380,12 +385,12 @@ impl QMetalStorage {
             )
         }
         .map_err(MetalError::from)?;
-        Ok(MetalStorage::new_allocated(
+        MetalStorage::new_allocated(
             dst,
             device.clone(),
             ids_len * hidden,
             DType::F32,
-        )?)
+        )
     }
 
     /// Rows up to which a quantized matmul runs the matmul-vec kernel over
@@ -1096,12 +1101,12 @@ impl QMetalStorage {
                     )
                 }
                 .map_err(MetalError::from)?;
-                Ok(MetalStorage::new_allocated(
+                MetalStorage::new_allocated(
                     dst,
                     device.clone(),
                     shape.elem_count(),
                     store_dtype,
-                )?)
+                )
             };
         let Some(grid) = order.grid() else {
             let shape = Shape::from((batch, topk, n));
@@ -1211,6 +1216,195 @@ impl QMetalStorage {
         entry: Option<usize>,
     ) -> Result<()> {
         self.write_via(offset, len, staging, &mut |_| Ok(()), Some((ring, entry)))
+    }
+
+    /// [`Self::write_staged`] for a group: `len` bytes from each `(offset,
+    /// staging, entry)`'s buffer into this storage at `offset`, in one
+    /// `copy_gather_u32` launch whose table (a ring entry too) carries each
+    /// source's GPU address. This storage is bound as the launch's output,
+    /// so the write is ordered after every earlier reader exactly as each
+    /// per-plane copy's is. Every entry is stamped with the epoch read after
+    /// the encoder is taken, as `write_staged` stamps it. Planes that are not
+    /// whole words at word offsets, or an encoder that cannot address its
+    /// sources indirectly (an executor recording its binds), land one
+    /// `write_staged` a plane instead: the same bytes. Returns the copy
+    /// launches encoded.
+    pub fn write_staged_gather(
+        &self,
+        len: usize,
+        planes: &[(usize, BufferHandle, Option<usize>)],
+        ring: &mut crate::kernels::metal::staging::StagingRing,
+    ) -> Result<usize> {
+        use crate::kernels::CopyGatherEntry;
+        use crate::MetalError;
+        use objc2_metal::MTLBuffer;
+        let release_all = |ring: &mut crate::kernels::metal::staging::StagingRing| {
+            for (_, buf, entry) in planes {
+                ring.release(*entry, buf);
+            }
+        };
+        if planes.is_empty() || len == 0 {
+            release_all(ring);
+            return Ok(0);
+        }
+        let words = len / 4;
+        let whole_words = len.is_multiple_of(4)
+            && u32::try_from(words).is_ok()
+            && planes.iter().all(|(offset, _, _)| offset.is_multiple_of(4));
+        if !whole_words {
+            return self.write_staged_each(len, planes, ring);
+        }
+        for (offset, staging, _) in planes {
+            if staging.size() < len
+                || offset
+                    .checked_add(len)
+                    .is_none_or(|end| end > self.buffer.length())
+            {
+                release_all(ring);
+                crate::bail!(
+                    "write_staged_gather: a {}-byte staging buffer for {len} bytes at {offset} \
+                     of a {}-byte buffer",
+                    staging.size(),
+                    self.buffer.length()
+                )
+            }
+        }
+        let table_len = planes.len() * std::mem::size_of::<CopyGatherEntry>();
+        let (table_entry, table) = match ring.acquire(&self.device, table_len) {
+            Ok(t) => t,
+            Err(e) => {
+                release_all(ring);
+                return Err(e);
+            }
+        };
+        let ptr = std::hint::black_box(unsafe { table.contents() });
+        if ptr.is_null() {
+            ring.release(table_entry, &table);
+            release_all(ring);
+            crate::bail!("write_staged_gather: the table buffer has no CPU mapping")
+        }
+        // SAFETY: a Shared ring buffer of at least `table_len` bytes, acquired
+        // and not yet stamped, so no GPU work reads it; `CopyGatherEntry` is
+        // plain data and the ring's buffers are page-aligned.
+        let entries =
+            unsafe { std::slice::from_raw_parts_mut(ptr.cast::<CopyGatherEntry>(), planes.len()) };
+        for (e, (offset, staging, _)) in entries.iter_mut().zip(planes) {
+            // SAFETY: binding authority (module head): the ring holds the
+            // staging entry until the epoch stamped below completes.
+            let address = unsafe { staging.raw_unchecked() }.gpuAddress();
+            *e = CopyGatherEntry {
+                src: address + staging.base_offset() as u64,
+                dst_word: (offset / 4) as u64,
+            };
+        }
+        let sources: Vec<&Buffer> = planes
+            .iter()
+            .map(|(_, staging, _)| -> &Buffer { staging })
+            .collect();
+        let encoder = self.device.command_encoder()?;
+        // The encoder guard holds the command stream: no cut can move the
+        // launch into a later command buffer than this epoch.
+        let epoch = ring.clock().current_epoch();
+        // SAFETY: binding authority (module head); the table's entries were
+        // checked against `len` and this buffer above, and the sources are
+        // filled by the host alone.
+        let encoded = unsafe {
+            crate::kernels::call_copy_gather_u32(
+                self.device.device(),
+                &encoder,
+                self.device.kernels(),
+                &table,
+                &self.buffer,
+                words as u32,
+                planes.len(),
+                &sources,
+            )
+        };
+        match encoded {
+            Ok(false) => {
+                drop(encoder);
+                ring.release(table_entry, &table);
+                self.write_staged_each(len, planes, ring)
+            }
+            done => {
+                // A failed encode keeps conservative custody: nothing is made
+                // reusable before the epoch it may have been encoded into.
+                ring.stamp(table_entry, &table, epoch);
+                for (_, staging, entry) in planes {
+                    ring.stamp(*entry, staging, epoch);
+                }
+                done.map(|_| 1).map_err(|e| MetalError::from(e).into())
+            }
+        }
+    }
+
+    /// The per-plane landing of [`Self::write_staged_gather`]'s planes.
+    fn write_staged_each(
+        &self,
+        len: usize,
+        planes: &[(usize, BufferHandle, Option<usize>)],
+        ring: &mut crate::kernels::metal::staging::StagingRing,
+    ) -> Result<usize> {
+        let mut rest = planes.iter();
+        for (offset, staging, entry) in rest.by_ref() {
+            if let Err(e) = self.write_staged(*offset, len, staging.clone(), ring, *entry) {
+                for (_, buf, entry) in rest {
+                    ring.release(*entry, buf);
+                }
+                return Err(e);
+            }
+        }
+        Ok(planes.len())
+    }
+
+    /// [`Self::write_with_ring`] for a group: each of `offsets` gets its own
+    /// entry of `ring`, which `fill(i, bytes)` writes on the host with the
+    /// ring unlocked (other users of the ring acquire meanwhile), and the
+    /// group lands as [`Self::write_staged_gather`] lands it.
+    pub fn write_with_ring_gather(
+        &self,
+        len: usize,
+        offsets: &[usize],
+        ring: &crate::kernels::metal::staging::SharedStagingRing,
+        fill: &mut dyn FnMut(usize, &mut [u8]) -> Result<()>,
+    ) -> Result<usize> {
+        let mut planes = Vec::with_capacity(offsets.len());
+        {
+            let mut r = ring.lock();
+            for &offset in offsets {
+                match r.acquire(&self.device, len) {
+                    Ok((entry, staging)) => planes.push((offset, staging, entry)),
+                    Err(e) => {
+                        for (_, buf, entry) in &planes {
+                            r.release(*entry, buf);
+                        }
+                        return Err(e);
+                    }
+                }
+            }
+        }
+        let filled = planes
+            .iter()
+            .enumerate()
+            .try_for_each(|(i, (_, staging, _))| {
+                let ptr = std::hint::black_box(unsafe { staging.contents() });
+                if ptr.is_null() {
+                    crate::bail!(
+                        "write_with_ring_gather: the staging buffer has no CPU mapping (len={len})"
+                    )
+                }
+                // SAFETY: a Shared ring buffer of at least `len` bytes, held
+                // by this call and not yet stamped: no GPU work reads it.
+                fill(i, unsafe { std::slice::from_raw_parts_mut(ptr, len) })
+            });
+        let mut r = ring.lock();
+        if let Err(e) = filled {
+            for (_, buf, entry) in &planes {
+                r.release(*entry, buf);
+            }
+            return Err(e);
+        }
+        self.write_staged_gather(len, &planes, &mut r)
     }
 
     fn write_via(
@@ -1330,11 +1524,16 @@ pub fn load_quantized<T: super::GgmlType + Send + Sync + 'static>(
     device: &MetalDevice,
     data: &[T],
 ) -> Result<QStorage> {
-    let buffer = device
-        .new_buffer_builder()
-        .with_data(data)
-        .with_label("qstorage_load_quantized")
-        .build()?;
+    let buffer = crate::residency_class::residency_class_scope(
+        crate::residency_class::ResidencyClass::Weights,
+        || {
+            device
+                .new_buffer_builder()
+                .with_data(data)
+                .with_label("qstorage_load_quantized")
+                .build()
+        },
+    )?;
     // A weight upload is a Shared buffer (`new_buffer_with_data`): its pages
     // are the process's, compressible under pressure like the slot pools
     // (#749 P27); wired on request (`LLOOM_WIRE_WEIGHTS`).

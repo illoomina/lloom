@@ -5,13 +5,13 @@ use crate::kernels::{
 };
 
 /// # Safety
-
+///
 /// Every buffer bound here stays unreused and unwritten by the host until
-
+///
 /// the command buffer it is encoded into completes, and while an ICB that
-
+///
 /// captured it can replay ([`crate::kernels::utils::EncoderParam`]).
-
+///
 pub unsafe fn call_const_fill(
     device: &Device,
     ep: impl EncoderProvider,

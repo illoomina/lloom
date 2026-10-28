@@ -360,6 +360,9 @@ pub struct PassPlanCounters {
     /// (`MetalDevice::pass_diverged`, a model's replay). None of them was
     /// made a plan.
     pub diverged: u64,
+    /// Passes abandoned after their body failed (`MetalDevice::abort_pass`).
+    /// None of them published a recording or an observation.
+    pub aborted: u64,
 }
 
 /// Alignment of every slot, in bytes.
@@ -3538,10 +3541,10 @@ mod tests {
 
         // Reading one entry many times must also agree -- the lookup is a read
         // of immutable state, so it cannot consume anything.
-        for i in 0..n {
+        for (i, expected) in forward.iter().enumerate() {
             assert_eq!(
                 plan.slot_of(i),
-                forward[i],
+                *expected,
                 "ordinal {i} resolves differently on a second read"
             );
         }

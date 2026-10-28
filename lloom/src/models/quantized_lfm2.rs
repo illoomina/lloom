@@ -35,11 +35,68 @@ struct AttentionLayer {
     n_head: usize,
     n_kv_head: usize,
     head_dim: usize,
+    kv_dtype: DType,
     cos: Tensor,
     sin: Tensor,
     neg_inf: Tensor,
+    /// The fused attention on Metal, prepared at load; `None` on the CPU,
+    /// which attends composed, and wherever `reference` says why.
+    route: Option<crate::nn::attention::route::PreparedAttention>,
+    /// Why this layer attends composed on Metal: no fused kernel covers its
+    /// shape. Serving refuses such a model.
+    reference: Option<String>,
     span_attn: tracing::Span,
     span_rot: tracing::Span,
+}
+
+/// The fused attention route a layer takes on Metal: causal, the queries at
+/// the end of the key range, f32 over a `kv_dtype` cache, up to `context`
+/// positions.
+/// `Err` names the capability no fused kernel provides; the layer then
+/// attends composed, which serving refuses on Metal.
+fn attention_route(
+    device: &Device,
+    heads: usize,
+    kv_heads: usize,
+    head_dim: usize,
+    context: usize,
+    kv_dtype: DType,
+) -> std::result::Result<Option<crate::nn::attention::route::PreparedAttention>, String> {
+    if !device.is_metal() {
+        return Ok(None);
+    }
+    #[cfg(feature = "metal")]
+    {
+        use crate::nn::attention::route::{
+            AttentionBounds, AttentionSpec, KvLayout, MaskKind, MetalKernelSet, PreparedAttention,
+        };
+        let spec = AttentionSpec {
+            q_heads: heads,
+            kv_heads,
+            head_dim,
+            v_head_dim: head_dim,
+            dtype: DType::F32,
+            kv_dtype,
+            mask: MaskKind::Causal,
+            softcap: 1.0,
+            layout: KvLayout::Strided,
+            bounds: AttentionBounds {
+                batch: usize::MAX,
+                min_queries: 1,
+                queries: context.max(1),
+                keys: context.max(1),
+            },
+        };
+        let metal = device.as_metal_device().map_err(|e| e.to_string())?;
+        PreparedAttention::prepare(spec, &MetalKernelSet { device: metal })
+            .map(Some)
+            .map_err(|u| format!("quantized lfm2: {u}"))
+    }
+    #[cfg(not(feature = "metal"))]
+    {
+        let _ = (heads, kv_heads, head_dim, context, kv_dtype);
+        Ok(None)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -141,6 +198,9 @@ impl AttentionLayer {
         let q = self.apply_rotary_emb(&q, index_pos)?;
         let k = self.apply_rotary_emb(&k, index_pos)?;
 
+        // Store only KV in the requested precision; attention arithmetic stays f32.
+        let k = k.to_dtype(self.kv_dtype)?;
+        let v = v.to_dtype(self.kv_dtype)?;
         let (k, v) = match &*kv_cache {
             None => (k, v),
             Some((k_cache, v_cache)) => {
@@ -155,8 +215,17 @@ impl AttentionLayer {
         };
         *kv_cache = Some((k.clone(), v.clone()));
 
-        let k = repeat_kv(k, self.n_head / self.n_kv_head)?;
-        let v = repeat_kv(v, self.n_head / self.n_kv_head)?;
+        if let Some(route) = &self.route {
+            // The causal window is the kernel's own, from the cache offset
+            // `kv_len - seq_len`: the mask the composed path builds below.
+            // The route reads the store's dtype and converts it to f32.
+            let scale = 1.0 / (self.head_dim as f32).sqrt();
+            let y = crate::nn::ops::attention(&q, &k, &v, None, scale, route)?;
+            return y.transpose(1, 2)?.reshape(&[b_sz, seq_len, n_embd]);
+        }
+
+        let k = repeat_kv(k.to_dtype(q.dtype())?, self.n_head / self.n_kv_head)?;
+        let v = repeat_kv(v.to_dtype(q.dtype())?, self.n_head / self.n_kv_head)?;
 
         let att = (q.matmul(&k.t()?)? / (self.head_dim as f64).sqrt())?;
         let att = match mask {
@@ -368,6 +437,15 @@ impl Model {
         Self::from_gguf_content(&ct, reader, device)
     }
 
+    /// Why the model attends composed on Metal, when any layer does:
+    /// serving refuses such a model.
+    pub fn reference_attention(&self) -> Option<&str> {
+        self.layers.iter().find_map(|l| match &l.kind {
+            LayerKind::Attention(a) => a.reference.as_deref(),
+            _ => None,
+        })
+    }
+
     /// Borrow the already-read header so an app factory can resolve its text
     /// metadata after complete model preflight/materialization, without a
     /// second parse or a second weight schema. The incumbent owned entry stays.
@@ -426,28 +504,44 @@ impl Model {
                 w3: QMatMul::from_qtensor(layer.up.read(ct, reader, device)?)?,
             };
             let kind = match &layer.mixer {
-                weights::MixerWeights::Attention(a) => LayerKind::Attention(AttentionLayer {
-                    wq: QMatMul::from_qtensor(a.q.read(ct, reader, device)?)?,
-                    wk: QMatMul::from_qtensor(a.k.read(ct, reader, device)?)?,
-                    wv: QMatMul::from_qtensor(a.v.read(ct, reader, device)?)?,
-                    wo: QMatMul::from_qtensor(a.output.read(ct, reader, device)?)?,
-                    q_norm: RmsNorm::from_qtensor(
-                        a.q_norm.read(ct, reader, device)?,
-                        plan.epsilon,
-                    )?,
-                    k_norm: RmsNorm::from_qtensor(
-                        a.k_norm.read(ct, reader, device)?,
-                        plan.epsilon,
-                    )?,
-                    n_head: plan.heads,
-                    n_kv_head: a.kv_heads,
-                    head_dim,
-                    cos: cos.clone(),
-                    sin: sin.clone(),
-                    neg_inf: neg_inf.clone(),
-                    span_attn: tracing::span!(tracing::Level::TRACE, "attn"),
-                    span_rot: tracing::span!(tracing::Level::TRACE, "attn-rot"),
-                }),
+                weights::MixerWeights::Attention(a) => {
+                    let (route, reference) = match attention_route(
+                        device,
+                        plan.heads,
+                        a.kv_heads,
+                        head_dim,
+                        plan.context,
+                        DType::F32,
+                    ) {
+                        Ok(route) => (route, None),
+                        Err(why) => (None, Some(why)),
+                    };
+                    LayerKind::Attention(AttentionLayer {
+                        wq: QMatMul::from_qtensor(a.q.read(ct, reader, device)?)?,
+                        wk: QMatMul::from_qtensor(a.k.read(ct, reader, device)?)?,
+                        wv: QMatMul::from_qtensor(a.v.read(ct, reader, device)?)?,
+                        wo: QMatMul::from_qtensor(a.output.read(ct, reader, device)?)?,
+                        q_norm: RmsNorm::from_qtensor(
+                            a.q_norm.read(ct, reader, device)?,
+                            plan.epsilon,
+                        )?,
+                        k_norm: RmsNorm::from_qtensor(
+                            a.k_norm.read(ct, reader, device)?,
+                            plan.epsilon,
+                        )?,
+                        n_head: plan.heads,
+                        n_kv_head: a.kv_heads,
+                        head_dim,
+                        kv_dtype: DType::F32,
+                        cos: cos.clone(),
+                        sin: sin.clone(),
+                        neg_inf: neg_inf.clone(),
+                        route,
+                        reference,
+                        span_attn: tracing::span!(tracing::Level::TRACE, "attn"),
+                        span_rot: tracing::span!(tracing::Level::TRACE, "attn-rot"),
+                    })
+                }
                 weights::MixerWeights::Conv(c) => LayerKind::ShortConv(ShortConvLayer {
                     in_proj: QMatMul::from_qtensor(c.input.read(ct, reader, device)?)?,
                     out_proj: QMatMul::from_qtensor(c.output.read(ct, reader, device)?)?,
@@ -478,6 +572,38 @@ impl Model {
             span: tracing::span!(tracing::Level::TRACE, "model"),
             span_output: tracing::span!(tracing::Level::TRACE, "output"),
         })
+    }
+
+    /// Select the KV storage precision before creating any sequence. The default
+    /// remains f32. f16 rounds at each append; projections, RoPE and attention
+    /// still compute in f32, including CPU targets without native half matmul.
+    pub fn with_kv_dtype(mut self, dtype: DType) -> Result<Self> {
+        if !matches!(dtype, DType::F32 | DType::F16) {
+            bail!("quantized lfm2 KV storage requires f32 or f16")
+        }
+        // A cache created before this consuming configuration change must not
+        // be accepted with a different store precision.
+        self.owner = Arc::new(());
+        for layer in &mut self.layers {
+            if let LayerKind::Attention(attn) = &mut layer.kind {
+                attn.kv_dtype = dtype;
+                // The route reads the store: its key dtype, and the
+                // conversion each call makes, follow the store's precision.
+                if let Some(route) = &attn.route {
+                    let s = *route.spec();
+                    attn.route = attention_route(
+                        &self.device,
+                        s.q_heads,
+                        s.kv_heads,
+                        s.head_dim,
+                        s.bounds.keys,
+                        dtype,
+                    )
+                    .map_err(lloom_tensor::Error::Msg)?;
+                }
+            }
+        }
+        Ok(self)
     }
 
     pub fn config(&self) -> &Config {
@@ -731,6 +857,16 @@ pub struct GgufPlan<'a> {
     weights: weights::Lfm2Weights,
 }
 impl GgufPlan<'_> {
+    /// Resolve the requested runtime context before preflight and RoPE allocation.
+    /// A caller may shorten, but not extend, the checkpoint's supported context.
+    pub fn with_context_limit(mut self, max_tokens: usize) -> Result<Self> {
+        if max_tokens == 0 || max_tokens > self.weights.context {
+            bail!("quantized lfm2 requested context {max_tokens} must be in 1..={} (checkpoint context)", self.weights.context)
+        }
+        self.weights.context = max_tokens;
+        Ok(self)
+    }
+
     pub fn config(&self) -> Config {
         Config {
             context_length: self.weights.context,

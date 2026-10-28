@@ -1,13 +1,16 @@
 //! A host-fed input: a ring of Shared buffers a host thread writes in place,
-//! and a shared event the command stream waits on before a kernel reads one
+//! and a shared event that orders the commands reading a slot after the write
 //! (`design/docs/expert-streaming.md` §20.13, option A).
 //!
 //! It is the token ring's stamp run in reverse. For tokens out, the GPU writes
 //! a slot and stamps, and the host polls the stamp; here the host writes a
-//! slot and signals (`setSignaledValue`), and the GPU waits on the value
-//! (`encodeWaitForEvent`) before its first reader. A Metal wait is fixed when
-//! it is encoded, so the value a forward waits on is decided on the encoding
-//! thread and the host thread only ever raises the event.
+//! slot and signals (`setSignaledValue`). The GPU never waits on that signal:
+//! the encoding thread records the commands that read the slot as before, and
+//! their commit waits for the value (`Commands::commit_when_produced`); the
+//! host thread, once it has raised the event, commits what its value released
+//! (`Commands::produced`). The value a forward reads is decided on the
+//! encoding thread, and the host thread only ever raises the event
+//! (`docs/invariants.md` §15.1q).
 //!
 //! Values are monotone and 1-based per [`HostFedRing::base`]: the forward that
 //! consumes value `v` reads slot `v % slots`. The slots are persistent Shared
@@ -25,14 +28,14 @@ use objc2_metal::{MTLDevice, MTLSharedEvent, MTLSharedEventListener};
 /// failed run left encoded (`HostFedRing::release`).
 const RELEASE_SPAN: u64 = 1 << 40;
 
-/// A shared event a host thread raises and the command stream waits on —
-/// [`HostFedRing`]'s protocol without the ring: the caller owns the buffers
-/// (a weight-group tier's slots, `lloom::nn::weight_groups`) and the
-/// values (one per load, monotone). The loader thread writes a slot, then
-/// `signal`s the load's value; the encoding thread `encode_wait`s that value
-/// before the slot's first reader, and only when the host has not raised it
-/// yet (`signaled`) — a wait is an encoder split whether or not it waits
-/// (`profiles-and-memory-design.md` §4.8 R1).
+/// A shared event a host thread raises and the command stream's commits wait
+/// for — [`HostFedRing`]'s protocol without the ring: the caller owns the
+/// buffers (a weight-group tier's slots, `lloom::nn::weight_groups`; an
+/// expert fetch's slots, `lloom::nn::expert_fetch`) and the values (one per
+/// load, monotone). The loader thread writes a slot, then `signal`s the
+/// load's value; the encoding thread calls `commit_when_produced` with that
+/// value before the slot's first reader — a cut when the host has not raised
+/// it yet (`profiles-and-memory-design.md` §4.8 R1).
 pub struct HostEvent {
     device: MetalDevice,
     event: Retained<ProtocolObject<dyn MTLSharedEvent>>,
@@ -60,19 +63,38 @@ impl HostEvent {
         self.event.signaledValue()
     }
 
-    /// Raise the event to `v`; the host writes before this call are visible
-    /// to the commands after a wait for `v`.
+    /// Raise the event to `v` and commit the work its value released; the
+    /// host writes before this call are visible to that work. A release the
+    /// queue refuses fails the queue (`Commands::produced`).
     pub fn signal(&self, v: u64) {
+        // The writes the value guards before it, for a thread that commits
+        // their reader on seeing the value (`Commands::produced`).
+        std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
         self.event.setSignaledValue(v);
+        let _ = self.device.commands().produced(&self.event, v);
     }
 
-    /// Every command encoded after this on the device's stream waits for the
-    /// event to reach `v`. Ends the open compute encoder.
-    pub fn encode_wait(&self, v: u64) -> Result<()> {
+    /// Every command encoded after this on the device's stream is committed
+    /// only once the event has reached `v`. Cuts the open recording unless
+    /// the host has raised it already.
+    pub fn commit_when_produced(&self, v: u64) -> Result<()> {
         self.device
             .commands()
-            .encode_wait_for_event(&self.event, v)
-            .map_err(|e| crate::Error::Msg(format!("HostEvent wait: {e}")))
+            .commit_when_produced(&self.event, v)
+            .map_err(|e| crate::Error::Msg(format!("HostEvent: {e}")))
+    }
+
+    /// The values above the one raised now and up to `upto` will never be
+    /// produced: the work held for them is cancelled, and none of it runs
+    /// (`Commands::cancel_produced_through`). Never waits. The caller may
+    /// raise the event once this returns; the raise cannot release what the
+    /// cancellation covers. On the GPU-wait arm nothing is held, and only the
+    /// raise lets the encoded waits through.
+    pub fn cancel_through(&self, upto: u64, reason: &'static str) -> Result<usize> {
+        self.device
+            .commands()
+            .cancel_produced_through(&self.event, upto, reason)
+            .map_err(|e| crate::Error::Msg(format!("HostEvent cancel: {e}")))
     }
 }
 
@@ -92,6 +114,8 @@ pub struct HostFedRing {
     buffers: Vec<BufferHandle>,
     tensors: Vec<Tensor>,
     len: usize,
+    /// Every value up to this one belongs to a released run: refused.
+    released_upto: std::sync::atomic::AtomicU64,
 }
 
 // SAFETY: the event and the buffers are Metal objects usable from any thread.
@@ -142,6 +166,7 @@ impl HostFedRing {
             buffers,
             tensors,
             len,
+            released_upto: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -182,25 +207,66 @@ impl HostFedRing {
         unsafe { std::slice::from_raw_parts_mut(buf.contents() as *mut f32, self.len) }
     }
 
-    /// Raise the event to `v`: every wait for a value `<= v` may run. The slot
-    /// writes before it are visible to the commands after those waits.
+    /// Raise the event to `v` and commit the work every value `<= v`
+    /// released. The slot writes before it are visible to that work. A
+    /// release the queue refuses fails the queue (`Commands::produced`).
     pub fn signal(&self, v: u64) {
+        // The slot writes before it, for a thread that commits their reader
+        // on seeing the value (`Commands::produced`).
+        std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
         self.event.setSignaledValue(v);
+        let _ = self.device.commands().produced(&self.event, v);
     }
 
-    /// Release every wait a run could have encoded: the event jumps
-    /// [`RELEASE_SPAN`] past `base`. For a run that failed with waits still
-    /// pending; the slots those commands read are whatever they held.
+    /// End a run whose producer will fill no more: the work held for its
+    /// values is cancelled — none of it runs (`Commands::cancel_produced`) —
+    /// a value of the run is refused from here on, and the event jumps
+    /// [`RELEASE_SPAN`] past `base`, so the next run's values start above
+    /// every one this run could have used. On the GPU-wait arm nothing is
+    /// held, and the jump lets the encoded waits through as before.
     pub fn release(&self, base: u64) {
         let v = base.saturating_add(RELEASE_SPAN);
+        self.released_upto
+            .fetch_max(v, std::sync::atomic::Ordering::AcqRel);
+        if let Err(e) = self.device.commands().cancel_produced_through(
+            &self.event,
+            v,
+            "host feed: the run was released; the work held for its fill was cancelled",
+        ) {
+            eprintln!("[host-fed] cancelling the released run's held work: {e}");
+        }
         if self.event.signaledValue() < v {
             self.event.setSignaledValue(v);
         }
     }
 
-    /// Every command encoded after this on the device's stream waits for the
-    /// event to reach `v`. Ends the open compute encoder.
-    pub fn encode_wait(&self, v: u64) -> Result<()> {
+    /// Every command encoded after this on the device's stream is committed
+    /// only once the event has reached `v`. Cuts the open recording unless
+    /// the host has raised it already; refused for a value of a released run.
+    pub fn commit_when_produced(&self, v: u64) -> Result<()> {
+        let released = &self.released_upto;
+        self.device
+            .commands()
+            .commit_when_produced_unless(&self.event, v, || {
+                if v <= released.load(std::sync::atomic::Ordering::Acquire) {
+                    Err(crate::kernels::MetalKernelError::QueueUnavailable(
+                        "a value of a released host-fed run",
+                    ))
+                } else {
+                    Ok(())
+                }
+            })
+            .map_err(|e| crate::Error::Msg(format!("HostFedRing: {e}")))
+    }
+
+    /// A GPU wait for value `v`, which the host has raised already: the cost
+    /// of a satisfied wait, for an instrument. Refused while `v` is pending —
+    /// a GPU wait on a host signal not yet raised is what
+    /// [`Self::commit_when_produced`] exists to avoid.
+    pub fn encode_satisfied_wait(&self, v: u64) -> Result<()> {
+        if self.event.signaledValue() < v {
+            crate::bail!("HostFedRing: a GPU wait on value {v}, not yet raised")
+        }
         self.device
             .commands()
             .encode_wait_for_event(&self.event, v)

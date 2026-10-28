@@ -28,6 +28,10 @@ impl Compute {
     common!(dispatchThreads_threadsPerThreadgroup(grid: MTLSize, group: MTLSize));
     common!(dispatchThreadgroups_threadsPerThreadgroup(grid: MTLSize, group: MTLSize));
     common!(setLabel(label: Option<&NSString>));
+    #[cfg(feature = "debug-labels")]
+    common!(pushDebugGroup(string: &NSString));
+    #[cfg(feature = "debug-labels")]
+    common!(popDebugGroup());
 
     /// The native encoder's address: the pass identity the hazard audit keys
     /// on while the encoder is open.
@@ -58,15 +62,19 @@ impl Compute {
             Self::Metal4(e) => e.pipeline(pipeline),
         }
     }
+    /// `covered`: the device's residency sets list `buffer` until its last
+    /// GPU reader completes (`Buffer::device_listed`), which a Metal 4 slot
+    /// set may rely on; Metal 3 makes what it binds resident itself.
     pub unsafe fn setBuffer_offset_atIndex(
         &self,
         buffer: Option<&ProtocolObject<dyn MTLBuffer>>,
         offset: usize,
         index: usize,
+        covered: bool,
     ) {
         match self {
             Self::Metal3(e) => unsafe { e.setBuffer_offset_atIndex(buffer, offset, index) },
-            Self::Metal4(e) => e.buffer(index, buffer, offset),
+            Self::Metal4(e) => e.buffer(index, buffer, offset, covered),
         }
     }
     pub unsafe fn setBytes_length_atIndex(

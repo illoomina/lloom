@@ -14,8 +14,7 @@
 //! held to the pair BIT FOR BIT, and to themselves run to run.
 #![cfg(feature = "metal")]
 
-#[path = "quant_parity/mod.rs"]
-mod quant_parity;
+use super::quant_parity;
 
 use lloom_tensor::kernels::source::Source;
 use lloom_tensor::quantized::QMatMul;

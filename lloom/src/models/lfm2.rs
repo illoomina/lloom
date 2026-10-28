@@ -432,17 +432,17 @@ impl ConvState {
 pub enum AttnImpl {
     /// `repeat_kv` + F32 upcast + `matmul` + `softmax_last_dim`.
     ///
-    /// The default, and the correctness bar every other arm is compared
-    /// against. Works on every backend.
+    /// The library default and the CPU's path. On Metal it is the reference
+    /// arm: it materializes the scores, and serving refuses it.
     #[default]
     Generic,
-    /// `crate::nn::ops::sdpa`, which is GQA-native and accumulates in F32
-    /// internally, so neither `repeat_kv` nor the upcast is needed.
+    /// The prepared fused route (`nn::attention::route`), GQA-native with F32
+    /// accumulation inside, so neither `repeat_kv` nor the upcast is needed.
     ///
-    /// Metal only. `seq_len == 1` takes `sdpa_vector`; `seq_len > 1` — prefill,
-    /// a verify window, B>1 — takes the tiled `steel_attention`
-    /// (`Attention::sdpa_full_applies`). Every other case falls back to
-    /// `Generic` rather than failing, so this is safe to set unconditionally.
+    /// Metal only. `seq_len == 1` takes `sdpa_vector`, or the tiled kernel at
+    /// a head dim with no one-query kernel; `seq_len > 1` — prefill, a verify
+    /// window, B>1 — takes the tiled `steel_attention`. A shape no fused
+    /// kernel covers is refused at load.
     Sdpa,
     /// FlashDecoding: attention split over independent contiguous KV chunks,
     /// with an index-ordered combine (`DESIGN.md` §10.4, issue #116).
@@ -459,8 +459,8 @@ pub enum AttnImpl {
     /// not be exercised.
     ///
     /// Metal only, `seq_len == 1` only, f16/f32 only. `seq_len > 1` takes the
-    /// tiled `steel_attention` as `Sdpa` does; any other case falls back to
-    /// `Generic`.
+    /// tiled `steel_attention` as `Sdpa` does, and a decode step FlashDecoding
+    /// does not instantiate takes the prepared route's one-query kernel.
     FlashDecoding,
 }
 
@@ -482,10 +482,14 @@ impl AttnImpl {
 /// The kernel an attention layer's `seq_len == 1` step takes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DecodeAttn {
-    /// The composed attention: `repeat_kv`, f32 `matmul`, softmax.
+    /// The composed attention: `repeat_kv`, f32 `matmul`, softmax. The CPU's
+    /// path, and on Metal the reference arm only.
     Generic,
-    /// `sdpa_vector` (and its two-pass sibling past 1024 keys).
+    /// `sdpa_vector` (and its two-pass sibling past the key threshold).
     SdpaVector,
+    /// The tiled `steel_attention` over one query, at a head dim no one-query
+    /// kernel is instantiated at.
+    Steel,
     /// FlashDecoding, over the contiguous cache or the page pool.
     FlashDecoding,
 }
@@ -505,6 +509,7 @@ impl DecodeAttn {
         match self {
             DecodeAttn::Generic => "generic",
             DecodeAttn::SdpaVector => "sdpa_vector",
+            DecodeAttn::Steel => "steel_attention",
             DecodeAttn::FlashDecoding => "flash_decoding",
         }
     }
@@ -520,16 +525,17 @@ impl PrefillAttn {
 }
 
 /// The attention kernels a model's layers take, decided once at load from
-/// the requested arm, the device, the compute dtype and the head dim.
+/// the requested arm, the device, the compute dtype and the geometry.
 ///
-/// Each fused kernel is instantiated at a fixed set of head dims and dtypes.
-/// A phase whose requested kernel does not cover the shape takes the nearest
-/// fused kernel that does, and the composed attention only when none does;
-/// [`Self::warning`] names what was requested and what is taken. Off Metal,
-/// or on [`AttnImpl::Generic`] (the explicit opt-in to the composed path),
-/// every phase is `Generic` and nothing was refused. The head-dim checks are
-/// shape probes (`docs/porting-models.md` §21.8).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// On Metal a fused arm prepares one route (`nn::attention::route`) that the
+/// forward pass dispatches through. A decode phase whose requested kernel does
+/// not cover the shape takes the nearest fused kernel that does, which
+/// [`Self::warning`] names; a shape no fused kernel covers is refused at load
+/// with the missing capability named. The composed attention is the CPU's
+/// path and, on Metal, only the reference arm [`AttnImpl::Generic`], which
+/// serving refuses. [`Self::line`] is printed at every load. The head-dim
+/// checks are shape probes (`docs/porting-models.md` §21.8).
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct AttnRoute {
     pub requested: AttnImpl,
     pub head_dim: usize,
@@ -540,37 +546,69 @@ pub struct AttnRoute {
     pub decode_refused: Option<DecodeAttn>,
     /// The prefill kernel the arm requested, when the route took another.
     pub prefill_refused: Option<PrefillAttn>,
+    /// The prepared fused route; `None` off Metal and on the reference arm.
+    pub prepared: Option<crate::nn::attention::route::PreparedAttention>,
 }
 
 impl AttnRoute {
-    pub fn resolve(requested: AttnImpl, head_dim: usize, dtype: DType, device: &Device) -> Self {
+    pub fn resolve(
+        requested: AttnImpl,
+        cfg: &Config,
+        dtype: DType,
+        device: &Device,
+    ) -> Result<Self> {
         let route = Self {
             requested,
-            head_dim,
+            head_dim: cfg.head_dim(),
             dtype,
             decode: DecodeAttn::Generic,
             prefill: PrefillAttn::Generic,
             decode_refused: None,
             prefill_refused: None,
+            prepared: None,
         };
         if requested == AttnImpl::Generic || !device.is_metal() {
-            return route;
+            return Ok(route);
         }
         #[cfg(feature = "metal")]
-        return route.against_kernel_sets(device);
+        return route.against_kernel_sets(cfg, device);
         #[cfg(not(feature = "metal"))]
-        route
+        Ok(route)
     }
 
-    /// Whether `kernel` is instantiated at this head dim and dtype, and its
-    /// pipelines on `device` admit the threadgroup widths they are dispatched
-    /// at (a pipeline that does not writes nothing; the admitted width falls
-    /// with the head dim's register demand, per device).
+    /// What the fused route serves: causal attention over a strided cache,
+    /// any batch, windows and keys up to the model's positions.
+    pub fn spec(cfg: &Config, dtype: DType) -> crate::nn::attention::route::AttentionSpec {
+        use crate::nn::attention::route::{AttentionBounds, AttentionSpec, KvLayout, MaskKind};
+        let positions = cfg.max_position_embeddings.max(1);
+        AttentionSpec {
+            q_heads: cfg.num_attention_heads,
+            kv_heads: cfg.num_key_value_heads,
+            head_dim: cfg.head_dim(),
+            v_head_dim: cfg.head_dim(),
+            dtype,
+            kv_dtype: dtype,
+            mask: MaskKind::Causal,
+            softcap: 1.0,
+            layout: KvLayout::Strided,
+            bounds: AttentionBounds {
+                batch: usize::MAX,
+                min_queries: 1,
+                queries: positions,
+                keys: positions,
+            },
+        }
+    }
+
+    /// Whether FlashDecoding is instantiated at this head dim and dtype, and
+    /// its pipelines on `device` admit the threadgroup widths they are
+    /// dispatched at (a pipeline that does not writes nothing; the admitted
+    /// width falls with the head dim's register demand, per device). The
+    /// one-query `sdpa_vector` kernels are the prepared route's question.
     #[cfg(feature = "metal")]
-    fn covers(&self, kernel: DecodeAttn, device: &Device) -> bool {
+    fn flash_covers(&self, device: &Device) -> bool {
         use lloom_tensor::kernels::{
-            flash_admits_its_widths, sdpa_vector_admits_its_widths, FlashDType, SdpaDType,
-            FLASH_F32_HEAD_DIMS, FLASH_HEAD_DIMS, SDPA_VECTOR_HEAD_DIMS,
+            flash_admits_its_widths, FlashDType, FLASH_F32_HEAD_DIMS, FLASH_HEAD_DIMS,
         };
         let Ok(metal) = device.as_metal_device() else {
             return false;
@@ -578,102 +616,82 @@ impl AttnRoute {
         let (raw, kernels) = (metal.device(), metal.kernels());
         let head_dim = self.head_dim;
         let is_f32 = self.dtype == DType::F32;
-        match kernel {
-            DecodeAttn::Generic => true,
-            DecodeAttn::SdpaVector => {
-                let itype = match self.dtype {
-                    DType::F16 => SdpaDType::F16,
-                    DType::BF16 => SdpaDType::BF16,
-                    DType::F32 => SdpaDType::F32,
-                    _ => return false,
-                };
-                lloom_tensor::shape_req!(
-                    sdpa_vector_head_dim,
-                    SDPA_VECTOR_HEAD_DIMS.contains(&head_dim) && !(head_dim == 512 && is_f32);
-                    head_dim,
-                    is_f32
-                ) && sdpa_vector_admits_its_widths(raw, kernels, head_dim, itype).unwrap_or(false)
-            }
-            DecodeAttn::FlashDecoding => {
-                let dims: &[usize] = match self.dtype {
-                    DType::F16 => &FLASH_HEAD_DIMS,
-                    DType::F32 => &FLASH_F32_HEAD_DIMS,
-                    _ => &[],
-                };
-                let dtype = if is_f32 {
-                    FlashDType::F32
-                } else {
-                    FlashDType::F16
-                };
-                lloom_tensor::shape_req!(
-                    flash_decoding_head_dim,
-                    dims.contains(&head_dim);
-                    head_dim,
-                    is_f32
-                ) && flash_admits_its_widths(raw, kernels, head_dim, dtype).unwrap_or(false)
-            }
-        }
+        let dims: &[usize] = match self.dtype {
+            DType::F16 => &FLASH_HEAD_DIMS,
+            DType::F32 => &FLASH_F32_HEAD_DIMS,
+            _ => &[],
+        };
+        let dtype = if is_f32 {
+            FlashDType::F32
+        } else {
+            FlashDType::F16
+        };
+        lloom_tensor::shape_req!(
+            flash_decoding_head_dim,
+            dims.contains(&head_dim);
+            head_dim,
+            is_f32
+        ) && flash_admits_its_widths(raw, kernels, head_dim, dtype).unwrap_or(false)
     }
 
-    /// Each phase's kernel in preference order: the requested fused kernel,
-    /// then the other fused decode kernel (both read a contiguous KV, and a
-    /// paged pool is gathered first), then the composed attention.
+    /// The prepared route serves prefill and windows; decode takes, in
+    /// preference order, the requested fused kernel, the other fused decode
+    /// kernel, then the route's own one-query kernel. An attention no fused
+    /// kernel covers is refused.
     #[cfg(feature = "metal")]
-    fn against_kernel_sets(mut self, device: &Device) -> Self {
-        use lloom_tensor::kernels::SDPA_FULL_HEAD_DIMS;
-        let head_dim = self.head_dim;
-        let is_f32 = self.dtype == DType::F32;
+    fn against_kernel_sets(mut self, cfg: &Config, device: &Device) -> Result<Self> {
+        use crate::nn::attention::route::{AttentionKernel, MetalKernelSet, PreparedAttention};
+        let metal = device.as_metal_device()?;
+        let prepared = PreparedAttention::prepare(
+            Self::spec(cfg, self.dtype),
+            &MetalKernelSet { device: metal },
+        )
+        .map_err(|u| {
+            lloom_tensor::Error::Msg(format!(
+                "lfm2: {u}: no fused kernel covers this attention, and the composed attention \
+                 does not serve on Metal (`--attn generic` is the reference arm)"
+            ))
+        })?;
+        self.prepared = Some(prepared);
+        self.prefill = PrefillAttn::Steel;
+        let one = match prepared.kernel_for(1, 1, 1)? {
+            AttentionKernel::Full => DecodeAttn::Steel,
+            _ => DecodeAttn::SdpaVector,
+        };
         let order = match self.requested {
             AttnImpl::Sdpa => [DecodeAttn::SdpaVector, DecodeAttn::FlashDecoding],
             _ => [DecodeAttn::FlashDecoding, DecodeAttn::SdpaVector],
         };
         self.decode = order
             .into_iter()
-            .find(|&k| self.covers(k, device))
-            .unwrap_or(DecodeAttn::Generic);
+            .find(|&k| match k {
+                DecodeAttn::SdpaVector => one == DecodeAttn::SdpaVector,
+                DecodeAttn::FlashDecoding => self.flash_covers(device),
+                DecodeAttn::Generic | DecodeAttn::Steel => false,
+            })
+            .unwrap_or(one);
         if self.decode != order[0] {
             self.decode_refused = Some(order[0]);
         }
-        if lloom_tensor::shape_req!(
-            sdpa_head_dim,
-            SDPA_FULL_HEAD_DIMS.contains(&head_dim) && !(head_dim == 512 && is_f32);
-            head_dim,
-            is_f32
-        ) && matches!(self.dtype, DType::F16 | DType::BF16 | DType::F32)
-        {
-            self.prefill = PrefillAttn::Steel;
-        } else {
-            self.prefill_refused = Some(PrefillAttn::Steel);
-        }
-        self
+        Ok(self)
     }
 
     /// The one line a load prints when a phase does not take the kernel the
-    /// arm requested; `None` when every phase does. "Composed" appears only
-    /// where no fused kernel covers the shape.
+    /// arm requested; `None` when every phase does.
     pub fn warning(&self) -> Option<String> {
-        fn taken(fused: bool, name: &str) -> String {
-            if fused {
-                format!("{name} (the nearest fused kernel)")
-            } else {
-                format!(
-                    "{name} (the composed attention, slower: no fused kernel covers this shape)"
-                )
-            }
-        }
         let mut phases = Vec::new();
         if let Some(k) = self.decode_refused {
             phases.push(format!(
-                "decode requested {} and takes {}",
+                "decode requested {} and takes {} (the nearest fused kernel)",
                 k.name(),
-                taken(self.decode != DecodeAttn::Generic, self.decode.name())
+                self.decode.name()
             ));
         }
         if let Some(k) = self.prefill_refused {
             phases.push(format!(
                 "prefill requested {} and takes {}",
                 k.name(),
-                taken(self.prefill != PrefillAttn::Generic, self.prefill.name())
+                self.prefill.name()
             ));
         }
         (!phases.is_empty()).then(|| {
@@ -685,6 +703,36 @@ impl AttnRoute {
                 phases.join("; ")
             )
         })
+    }
+
+    /// Why this route takes the composed attention on `device`, if it does —
+    /// on Metal only the reference arm, `AttnImpl::Generic`, does (a fused arm
+    /// a shape no kernel covers is refused by [`Self::resolve`]) — for
+    /// `nn::attention::route::ExecutionPurpose::admit`.
+    pub fn composed_reason(&self, device: &Device) -> Option<String> {
+        (device.is_metal() && self.prepared.is_none()).then(|| {
+            format!(
+                "attention under {:?} is the composed reference attention",
+                self.requested
+            )
+        })
+    }
+
+    /// The route, printed at every load.
+    pub fn line(&self) -> String {
+        match &self.prepared {
+            Some(p) => format!(
+                "lfm2: attention under {:?}: decode {}, prefill {}; {}",
+                self.requested,
+                self.decode.name(),
+                self.prefill.name(),
+                p.describe()
+            ),
+            None => format!(
+                "lfm2: attention under {:?}: the composed attention, head_dim {} at {:?}",
+                self.requested, self.head_dim, self.dtype
+            ),
+        }
     }
 
     /// [`Self::warning`] on the load-warning channel.
@@ -3360,6 +3408,22 @@ pub struct State<P: Profile> {
     turn_ckpt_cur: Option<usize>,
     /// The slot the next checkpointing pass takes.
     turn_ckpt_next: usize,
+    /// The ring holds one frame past its slots, [`TURN_CHECKPOINTS`], for a
+    /// pinned checkpoint, which the slots' rotation never takes
+    /// (`sessions.md` §8).
+    turn_pin_frame: bool,
+    /// The pinned checkpoint, in the pin's frame.
+    turn_pinned: Option<TurnCheckpoint>,
+    /// The open request's second target: a checkpoint at this position,
+    /// taken into the pin's frame by the pass that covers it.
+    turn_pin_want: Option<usize>,
+    /// A request is open (`CausalLM::open_checkpoint_request`): a second
+    /// target is scheduled only inside one.
+    turn_request: bool,
+    /// The pass in flight's start and length, and the second target it
+    /// takes, if any.
+    turn_pass: (usize, usize),
+    turn_pin_cur: Option<usize>,
     /// The ring's rotating write index, in slots.
     ///
     /// **Deliberately here and not in a params struct** (`DESIGN.md` §10.2c,
@@ -3603,6 +3667,7 @@ impl<P: Profile> State<P> {
         self.conv_compact = saved.compact;
         self.paged_pass_pending = false;
         self.turn_ckpt_cur = None;
+        self.turn_pin_cur = None;
         for t in &mut self.taps {
             *t = None;
         }
@@ -3879,6 +3944,7 @@ pub fn state_floor_bytes(
     config: &Config,
     dtype: DType,
     kv_floor: usize,
+    pin_frame: bool,
 ) -> [(&'static str, usize); 3] {
     let conv_layers = config
         .layer_types
@@ -3888,7 +3954,7 @@ pub fn state_floor_bytes(
     let elem = dtype.size_in_bytes();
     let conv =
         conv_layers * config.hidden_size * config.conv_state.width(config.conv_l_cache) * elem;
-    let ring = TURN_CHECKPOINTS
+    let ring = (TURN_CHECKPOINTS + usize::from(pin_frame))
         * conv_layers
         * config.hidden_size
         * (config.conv_l_cache + TURN_CHECKPOINT_SLACK)
@@ -4148,7 +4214,7 @@ impl<P: Profile> State<P> {
         // ~49 MB transient (§9.5k). They are not one of §9.1's five classes,
         // and an admission check placed after them would not see them. Running
         // first means the refusal happens before any of it is allocated.
-        Self::admit_memory_budget(config, device, kv_capacity)?;
+        Self::admit_memory_budget(config, dtype, device, kv_capacity)?;
 
         // The ceiling is bounded by the RoPE tables built below: a position
         // past `max_position_embeddings` has no rotation, and asking for a
@@ -4244,6 +4310,12 @@ impl<P: Profile> State<P> {
             layer_tier: None,
             turn_ckpt_cur: None,
             turn_ckpt_next: 0,
+            turn_pin_frame: false,
+            turn_pinned: None,
+            turn_pin_want: None,
+            turn_request: false,
+            turn_pass: (0, 0),
+            turn_pin_cur: None,
             conv_phase: 0,
             conv_phase_prev: 0,
             conv_history: 0,
@@ -5051,15 +5123,47 @@ impl<P: Profile> State<P> {
     /// any per-token path** (§9.5e). The residual cap it installs is one branch
     /// on counters the pool already maintains, and it calls into Metal nowhere.
     #[cfg(not(feature = "metal"))]
-    fn admit_memory_budget(_: &Config, _: &Device, _: usize) -> Result<()> {
+    fn admit_memory_budget(_: &Config, _: DType, _: &Device, _: usize) -> Result<()> {
         // No Metal, no `recommendedMaxWorkingSetSize`, nothing to check
         // against. The CPU and CUDA backends compile none of the above, which
         // is the constraint upstreaming imposes (§14.1).
         Ok(())
     }
 
+    /// What a prefill pass's attention allocates, by the arms `config`
+    /// selects: the composed attention on the reference arm; on every other
+    /// arm the fused kernel, which reads an in-place cache where it lies and
+    /// every other store through a copy of its keys (the page pool's gather,
+    /// `Cat`'s concatenation, the quantized store's dequantization).
+    #[cfg(feature = "metal")]
+    fn prefill_attention(
+        config: &Config,
+    ) -> lloom_tensor::metal_backend::admission::PrefillAttention {
+        use lloom_tensor::metal_backend::admission::PrefillAttention;
+        match config.attn_impl {
+            AttnImpl::Generic => PrefillAttention::Composed,
+            _ if config.kv_append == KvAppend::InPlace && !config.kv_quant.is_on() => {
+                PrefillAttention::Fused
+            }
+            _ => PrefillAttention::FusedGathered,
+        }
+    }
+
+    /// Whether a prefill pass's MLP stores the SiLU and product as one
+    /// `silu_mul` launch: the forward's selection (`silu_mul_selected`) at
+    /// the configured gate arm, at a dtype the kernel is instantiated at.
+    /// `Fusion=Derived` sets the gate arm after construction, from the
+    /// plan, so it is charged the composed pair, which is never the smaller.
+    #[cfg(feature = "metal")]
+    fn prefill_silu_mul(config: &Config, dtype: DType) -> bool {
+        config.fusion != FusionPolicy::Derived
+            && silu_mul_selected(config.gemv_gate)
+            && crate::models::qwen4exp::kernels::silu_mul_instantiated(dtype)
+    }
+
     /// §9.5d's admission arithmetic for this configuration, as a pure
-    /// function of `config`, `budget` and the KV ceiling — the figure
+    /// function of `config`, the compute `dtype` the model is loaded at,
+    /// `budget` and the KV ceiling — the figure
     /// `admit_memory_budget` refuses on, exposed so a caller deciding
     /// **before** construction (§4.8's weight streaming, #892 A6a: how many
     /// MLP slots the quota leaves once the resident rest and its predicted
@@ -5070,6 +5174,7 @@ impl<P: Profile> State<P> {
     #[cfg(feature = "metal")]
     pub fn admission_budget(
         config: &Config,
+        dtype: DType,
         budget: &MemoryBudget,
         kv_capacity: usize,
     ) -> lloom_tensor::metal_backend::admission::Budget {
@@ -5112,6 +5217,11 @@ impl<P: Profile> State<P> {
                     .intermediate_size
                     .max(m.activation_bound(config.hidden_size).div_ceil(3 * 2))
             }),
+            kv_heads: config.num_key_value_heads,
+            vocab: config.vocab_size,
+            conv_l_cache: config.conv_l_cache,
+            attention: Self::prefill_attention(config),
+            silu_mul: Self::prefill_silu_mul(config, dtype),
         };
         // §10.2g: `Shuffle` and `RotatingRing` hold exactly `l_cache` columns
         // (264 KiB); `SlidingRing` holds the slack it slides through as well,
@@ -5159,7 +5269,12 @@ impl<P: Profile> State<P> {
     }
 
     #[cfg(feature = "metal")]
-    fn admit_memory_budget(config: &Config, device: &Device, kv_capacity: usize) -> Result<()> {
+    fn admit_memory_budget(
+        config: &Config,
+        dtype: DType,
+        device: &Device,
+        kv_capacity: usize,
+    ) -> Result<()> {
         use lloom_tensor::metal_backend::admission;
 
         let Some(budget) = config.memory_budget else {
@@ -5173,7 +5288,7 @@ impl<P: Profile> State<P> {
             return Ok(());
         };
 
-        let b = Self::admission_budget(config, &budget, kv_capacity);
+        let b = Self::admission_budget(config, dtype, &budget, kv_capacity);
         let rope = Self::rope_table_bytes(config);
 
         let admission = b.admit(metal.device().recommended_max_working_set_size());
@@ -5300,6 +5415,10 @@ impl<P: Profile> State<P> {
             .iter_mut()
             .for_each(|c| c.valid = false);
         self.turn_ckpt_cur = None;
+        self.turn_pinned = None;
+        self.turn_pin_want = None;
+        self.turn_pin_cur = None;
+        self.turn_request = false;
     }
 
     /// The page pool's live tokens, pages in use and pages held in quarantine,
@@ -5398,11 +5517,19 @@ impl<P: Profile> State<P> {
     /// (`resolve` owns its rollback), a `Cat` KV (no length to move back).
     fn turn_checkpoint_begin(&mut self, seq_len: usize) {
         self.turn_ckpt_cur = None;
+        self.turn_pin_cur = None;
         if !self.use_kv_cache || seq_len < 2 || self.speculative || self.kv_append == KvAppend::Cat
         {
             return;
         }
-        let pos = self.kv_len() + seq_len;
+        let start = self.kv_len();
+        self.turn_pass = (start, seq_len);
+        // The second target, inside the pass: its tail is the input columns
+        // before it, so a position at the pass's start is not one.
+        self.turn_pin_cur = self
+            .turn_pin_want
+            .filter(|&w| self.turn_pin_frame && w > start && w <= start + seq_len);
+        let pos = start + seq_len;
         let slot = self.turn_ckpt_next % TURN_CHECKPOINTS;
         if slot < self.turn_checkpoints.len() {
             let c = &mut self.turn_checkpoints[slot];
@@ -5442,13 +5569,14 @@ impl<P: Profile> State<P> {
         // The whole ring at a sequence's first checkpointing pass — one
         // request, session state, outside every plan — and kept for the next
         // sequence of the same geometry.
+        let frames = self.turn_frames();
         let fresh = match &self.turn_ring {
-            Some(r) => !r.fits(TURN_CHECKPOINTS, frame, conv_in.dtype()),
+            Some(r) => !r.fits(frames, frame, conv_in.dtype()),
             None => true,
         };
         if fresh {
             self.turn_ring = Some(crate::nn::ring::Ring::allocate(
-                TURN_CHECKPOINTS,
+                frames,
                 frame,
                 conv_in.dtype(),
                 conv_in.device(),
@@ -5462,7 +5590,111 @@ impl<P: Profile> State<P> {
         let c = &mut self.turn_checkpoints[slot];
         c.tail_len = keep;
         c.valid = true;
+        // The second target: the columns before it, from the same input.
+        if let Some(w) = self.turn_pin_cur {
+            let (start, seq) = self.turn_pass;
+            let before = src_len - seq + (w - start);
+            let keep = before.min(want);
+            if keep >= l_cache {
+                let src = conv_in.narrow(2, before - keep, keep)?;
+                self.turn_tail_view(TURN_CHECKPOINTS, layer)?
+                    .slice_set(&src, 2, 0)?;
+                self.turn_pinned = Some(TurnCheckpoint {
+                    pos: w,
+                    tail_len: keep,
+                    valid: true,
+                });
+                self.turn_pin_want = None;
+            }
+        }
         Ok(())
+    }
+
+    /// The frames the turn ring holds: the slots, and the pin's.
+    fn turn_frames(&self) -> usize {
+        TURN_CHECKPOINTS + usize::from(self.turn_pin_frame)
+    }
+
+    /// One frame more in the turn ring, for a pinned checkpoint
+    /// ([`Self::pin_checkpoint`]). Set before the first checkpointing pass.
+    pub fn with_pin_frame(mut self, on: bool) -> Self {
+        self.turn_pin_frame = on;
+        self
+    }
+
+    /// Whether the turn ring holds a frame for a pin, on an arm that keeps
+    /// turn checkpoints at all.
+    pub fn has_pin_frame(&self) -> bool {
+        self.turn_pin_frame && self.use_kv_cache && self.kv_append != KvAppend::Cat
+    }
+
+    /// Where the pinned checkpoint stands.
+    pub fn pinned_checkpoint(&self) -> Option<usize> {
+        self.turn_pinned.filter(|c| c.valid).map(|c| c.pos)
+    }
+
+    /// Pin the turn checkpoint at `pos` (`CausalLM::pin_checkpoint`): one
+    /// reaching it is copied into the pin's frame, else — while a request
+    /// is open — the pass that covers it leaves it there beside its own.
+    /// `None` releases the pin. Returns where the pinned checkpoint stands.
+    pub fn pin_checkpoint(&mut self, pos: Option<usize>) -> Result<Option<usize>> {
+        let Some(p) = pos else {
+            self.turn_pinned = None;
+            self.turn_pin_want = None;
+            return Ok(None);
+        };
+        if !self.has_pin_frame() || self.pinned_checkpoint() == Some(p) {
+            return Ok(self.pinned_checkpoint());
+        }
+        match self.slot_reaching(p) {
+            Some(idx) if p <= self.kv_len() => {
+                let c = self.turn_checkpoints[idx];
+                let back = c.pos - p;
+                let keep = (c.tail_len - back).min(self.l_cache + TURN_CHECKPOINT_SLACK);
+                // Two frames of one ring share its storage: the source goes
+                // through a copy of its own.
+                for layer in 0..self.conv_states.len() {
+                    let src = self
+                        .turn_tail_view(idx, layer)?
+                        .narrow(2, c.tail_len - back - keep, keep)?
+                        .copy()?;
+                    self.turn_tail_view(TURN_CHECKPOINTS, layer)?
+                        .slice_set(&src, 2, 0)?;
+                }
+                self.turn_pinned = Some(TurnCheckpoint {
+                    pos: p,
+                    tail_len: keep,
+                    valid: true,
+                });
+                self.turn_pin_want = None;
+            }
+            _ if self.turn_request => self.turn_pin_want = Some(p),
+            _ => {}
+        }
+        Ok(self.pinned_checkpoint())
+    }
+
+    /// A request opens (`CausalLM::open_checkpoint_request`): the turn
+    /// checkpoints are every multi-token pass's, whatever it asks; only a
+    /// second target is scheduled inside it.
+    pub fn open_checkpoint_request(&mut self) {
+        self.turn_request = true;
+        self.turn_pin_want = None;
+    }
+
+    /// The request's end: a second target no pass took is dropped.
+    pub fn close_checkpoint_request(&mut self) {
+        self.turn_request = false;
+        self.turn_pin_want = None;
+    }
+
+    /// The checkpoint record of slot `idx`, the pin's at [`TURN_CHECKPOINTS`].
+    fn turn_checkpoint(&self, idx: usize) -> Option<TurnCheckpoint> {
+        if idx == TURN_CHECKPOINTS {
+            self.turn_pinned
+        } else {
+            self.turn_checkpoints.get(idx).copied()
+        }
     }
 
     /// Slot `slot`'s tail for conv layer `layer`: a contiguous
@@ -5472,28 +5704,59 @@ impl<P: Profile> State<P> {
             .turn_ring
             .as_ref()
             .ok_or_else(|| lloom_tensor::Error::msg("lfm2 turn ring: no ring allocated"))?;
+        if slot >= ring.frames() {
+            lloom_tensor::bail!("lfm2 turn ring: no frame {slot} of {}", ring.frames())
+        }
         ring.frame(slot)?.narrow(0, layer, 1)?.squeeze(0)
     }
 
     /// The checkpoint [`Cache::restore`] would take `pos` from: a valid one
     /// whose pass ended at or after `pos`, within its tail's reach.
     fn checkpoint_for(&self, pos: usize) -> Option<usize> {
-        self.turn_checkpoints
-            .iter()
-            .enumerate()
-            .filter(|(_, c)| c.valid && c.tail_len >= self.l_cache)
-            .filter(|(_, c)| pos <= c.pos && c.pos - pos <= c.tail_len - self.l_cache)
-            .map(|(i, _)| i)
-            .next()
+        self.slot_reaching(pos).or_else(|| {
+            self.turn_pinned
+                .filter(|c| self.reaches(c, pos))
+                .map(|_| TURN_CHECKPOINTS)
+        })
     }
 
-    /// Checkpoints past `pos` describe positions the cache no longer holds.
+    /// The turn slot (never the pin's) whose checkpoint reaches `pos`.
+    fn slot_reaching(&self, pos: usize) -> Option<usize> {
+        self.turn_checkpoints
+            .iter()
+            .position(|c| self.reaches(c, pos))
+    }
+
+    fn reaches(&self, c: &TurnCheckpoint, pos: usize) -> bool {
+        c.valid
+            && c.tail_len >= self.l_cache
+            && pos <= c.pos
+            && c.pos - pos <= c.tail_len - self.l_cache
+    }
+
+    /// Checkpoints past `pos` describe positions the cache no longer holds;
+    /// a pin past it is released.
     fn forget_checkpoints_past(&mut self, pos: usize) {
         for c in self.turn_checkpoints.iter_mut() {
             if c.pos > pos {
                 c.valid = false;
             }
         }
+        if self.turn_pinned.is_some_and(|c| c.pos > pos) {
+            self.turn_pinned = None;
+        }
+    }
+
+    /// Where a request diverging at `pos` is put back
+    /// (`CacheRewind::restore_point`): `pos` itself where a checkpoint
+    /// reaches it, else the pinned checkpoint's own position at or before
+    /// it, from which the request prefills the rest.
+    pub fn restore_point(&self, pos: usize) -> Option<usize> {
+        if self.can_restore(pos) {
+            return Some(pos);
+        }
+        self.pinned_checkpoint()
+            .filter(|&p| p <= pos && self.can_restore(p))
     }
 
     /// Whether [`Cache::restore`] can put the cache back at `pos`: the KV has
@@ -5520,16 +5783,20 @@ impl<P: Profile> State<P> {
                 self.kv_len(),
                 self.turn_checkpoints
                     .iter()
+                    .chain(self.turn_pinned.iter())
                     .filter(|c| c.valid)
                     .map(|c| (c.pos, c.tail_len.saturating_sub(self.l_cache)))
                     .collect::<Vec<_>>()
             )
         }
         let idx = self.checkpoint_for(pos).expect("checked by can_restore");
+        let c = self
+            .turn_checkpoint(idx)
+            .expect("checkpoint_for names a held checkpoint");
         let n = self.kv_len() - pos;
         self.rewind_kv(n)?;
-        let back = self.turn_checkpoints[idx].pos - pos;
-        let tail_len = self.turn_checkpoints[idx].tail_len;
+        let back = c.pos - pos;
+        let tail_len = c.tail_len;
         let l_cache = self.l_cache;
         let width = self.conv_state.width(l_cache);
         let layers = self.conv_states.len();
@@ -6083,8 +6350,7 @@ impl Mlp {
     /// Metal, `seq_len == 1`, no bias, and a dtype the GEMV carries. **Every
     /// other case takes the eager path rather than failing**, because unlike
     /// `flash_decoding` this arm has a correct eager equivalent right beside
-    /// it and prefill is a GEMM the fusion is not instantiated for. The same
-    /// shape as `sdpa_applies` above.
+    /// it and prefill is a GEMM the fusion is not instantiated for.
     fn gemv_silu_applies(&self, x: &Tensor, p: &Projections<'_>) -> bool {
         self.gemv_silu
             && x.device().is_metal()
@@ -6116,7 +6382,13 @@ impl Mlp {
             if gemv_residual_applies(true, &gated, &p.down, residual) {
                 return crate::nn::ops::gemv_residual(&gated, p.down.weight(), residual);
             }
+            if prefill_ablated(PrefillAblation::Add, residual) {
+                return p.down.forward(&gated);
+            }
             return p.down.forward(&gated)? + residual;
+        }
+        if prefill_ablated(PrefillAblation::Add, residual) {
+            return self.forward(x, p);
         }
         self.forward(x, p)? + residual
     }
@@ -6186,11 +6458,27 @@ impl Mlp {
         if self.gemv_swiglu_applies(x, p) {
             return crate::nn::ops::gemv_swiglu(x, p.up.weight(), p.gate.weight());
         }
+        // The composed pair as one elementwise launch, bit for bit
+        // (`kernels.fusion.silu_mul`, Qwen4-exp's `silu_mul` kernel).
+        if silu_mul_selected(self.gemv_gate)
+            && !self.gemv_silu_applies(x, p)
+            && !prefill_ablated(PrefillAblation::Silu, x)
+            && !prefill_ablated(PrefillAblation::Mul, x)
+        {
+            let gate = p.gate.forward(x)?;
+            let up = p.up.forward(x)?;
+            if let Some(h) = crate::models::qwen4exp::kernels::silu_mul_op(&gate, &up) {
+                return h;
+            }
+            return crate::nn::ops::silu(&gate)? * up;
+        }
         // The fused arm replaces `gemv` + `silu_f16` with one dispatch, and
         // computes SiLU on the f32 accumulator rather than on the rounded
         // store — so it MOVES THE DIGESTS by construction (§12.2d, §2.3.5a).
         let gate = if self.gemv_silu_applies(x, p) {
             crate::nn::ops::gemv_silu(x, p.gate.weight())?
+        } else if prefill_ablated(PrefillAblation::Silu, x) {
+            p.gate.forward(x)?
         } else {
             crate::nn::ops::silu(&p.gate.forward(x)?)?
         };
@@ -6203,6 +6491,10 @@ impl Mlp {
             return crate::nn::ops::gemv_mul(x, p.up.weight(), &gate);
         }
         let up = p.up.forward(x)?;
+        if prefill_ablated(PrefillAblation::Mul, x) {
+            drop(up);
+            return Ok(gate);
+        }
         gate * up
     }
 
@@ -6348,32 +6640,6 @@ impl<P: Profile> Attention<P> {
         })
     }
 
-    /// Whether this call takes the fused `sdpa_vector` kernel: the route chose
-    /// it at load (Metal, `--attn sdpa` at a head dim it instantiates, or
-    /// `--attn flash` at one only it does), the call is one token, and the
-    /// dtype is one the kernel is built for. A false is the composed
-    /// attention, never a failure.
-    fn sdpa_applies(&self, q: &Tensor, seq_len: usize) -> bool {
-        self.route.decode == DecodeAttn::SdpaVector
-            && seq_len == 1
-            && matches!(q.dtype(), DType::F16 | DType::BF16 | DType::F32)
-    }
-
-    /// Whether this call takes the tiled `steel_attention` kernel, the
-    /// `seq_len > 1` sibling of `sdpa_vector` (`DESIGN.md` §10.2v): one
-    /// threadgroup per (query block, head), online softmax over K/V blocks,
-    /// GQA-native, the causal mask in-kernel from the cache offset
-    /// `kv_len - seq_len`. Prefill, verify and B>1 are this shape, and every
-    /// fused arm shares it. The route chose it at load (Metal, a fused arm, an
-    /// instantiated head dim); per call, every query needs a key and the dtype
-    /// must be one the kernel is built for. A false is the composed attention.
-    fn sdpa_full_applies(&self, q: &Tensor, seq_len: usize, kv_len: usize) -> bool {
-        self.route.prefill == PrefillAttn::Steel
-            && seq_len > 1
-            && seq_len <= kv_len
-            && matches!(q.dtype(), DType::F16 | DType::BF16 | DType::F32)
-    }
-
     /// Whether this call takes the FlashDecoding kernels (`DESIGN.md` §10.4):
     /// the route chose them at load, the call is one token, and the dtype is
     /// f16 or f32.
@@ -6437,7 +6703,13 @@ impl<P: Profile> Attention<P> {
             if gemv_residual_applies(true, &y, &w.o, residual) {
                 return crate::nn::ops::gemv_residual(&y, w.o.weight(), residual);
             }
+            if prefill_ablated(PrefillAblation::Add, residual) {
+                return w.o.forward(&y);
+            }
             return w.o.forward(&y)? + residual;
+        }
+        if prefill_ablated(PrefillAblation::Add, residual) {
+            return self.forward(w, x, index_pos, block_idx, cache);
         }
         self.forward(w, x, index_pos, block_idx, cache)? + residual
     }
@@ -7410,31 +7682,21 @@ impl<P: Profile> Attention<P> {
                 self.flash_scratch_sizing,
                 reserve_chunks,
             )?
-        } else if self.sdpa_applies(&q, seq_len) {
-            // Scale is applied to `q` inside the kernel before the dot product,
-            // matching `att / sqrt(head_dim)` below. No mask: `seq_len == 1`
-            // attends to the whole cache, which is the same reason the generic
-            // arm skips `masked_fill` in that case.
-            crate::nn::ops::sdpa(
+        } else if let Some(prepared) = &self.route.prepared {
+            // The fused route prepared at load: one query takes the vector
+            // kernel (two passes past its key threshold), or the tiled one at
+            // a head dim no one-query kernel serves; a window takes the tiled
+            // kernel, causal from the cache offset `kv_len - seq_len`. The
+            // scale is applied to `q` inside the kernel, as `att /
+            // sqrt(head_dim)` below. A request the route does not serve is an
+            // error, never the composed attention.
+            crate::nn::ops::attention(
                 &q,
                 &k,
                 &v,
                 None,
-                false,
                 1f32 / (self.head_dim as f32).sqrt(),
-                1.0,
-            )?
-        } else if self.sdpa_full_applies(&q, seq_len, k.dim(2)?) {
-            // The causal mask is the kernel's own, from the cache offset
-            // `kv_len - seq_len`; `Cache::mask` is the generic arm's.
-            crate::nn::ops::sdpa(
-                &q,
-                &k,
-                &v,
-                None,
-                true,
-                1f32 / (self.head_dim as f32).sqrt(),
-                1.0,
+                prepared,
             )?
         } else if self.use_flash_attn {
             let k = repeat_kv(k, self.num_attention_heads / self.num_key_value_heads)?;
@@ -7545,6 +7807,7 @@ impl<P: Profile> crate::optimizer::Visit for Attention<P> {
         ring.extend([k_all, v_all]);
         let kernel = match self.route.decode {
             DecodeAttn::SdpaVector => "sdpa_vector",
+            DecodeAttn::Steel => "steel_attention",
             DecodeAttn::FlashDecoding => "flash_decoding",
             DecodeAttn::Generic => "attention_generic",
         };
@@ -8024,7 +8287,13 @@ impl<P: Profile> ShortConv<P> {
             if gemv_residual_applies(true, &conv_out, &w.out_proj, residual) {
                 return crate::nn::ops::gemv_residual(&conv_out, w.out_proj.weight(), residual);
             }
+            if prefill_ablated(PrefillAblation::Add, residual) {
+                return w.out_proj.forward(&conv_out);
+            }
             return w.out_proj.forward(&conv_out)? + residual;
+        }
+        if prefill_ablated(PrefillAblation::Add, residual) {
+            return self.forward(w, x, block_idx, cache);
         }
         self.forward(w, x, block_idx, cache)? + residual
     }
@@ -9086,11 +9355,57 @@ fn ablate_norms() -> bool {
     })
 }
 
+/// `kernels.fusion.silu_mul` (on unless skipped), read once.
+fn silu_mul_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !crate::tuning::tuning().lfm2.skip_silu_mul)
+}
+
+/// Whether the MLP's composed path takes `silu_mul` under the gate arm
+/// `gate`: the switch on, and the product not on `w3`'s store
+/// (`GateFusion::Mul`, whose pair stays a pair where its GEMV does not
+/// serve). The forward selects by it (`Mlp::gated`) and admission charges
+/// by it (`State::admission_budget`).
+fn silu_mul_selected(gate: GateFusion) -> bool {
+    silu_mul_on() && gate != GateFusion::Mul
+}
+
+/// A class of prefill dispatch `diagnostics.ablate` can skip: `prefill-norm`
+/// (the layers' two RMSNorms), `prefill-silu` (the MLP's SiLU),
+/// `prefill-mul` (the SwiGLU product), `prefill-add` (the two residual adds).
+#[derive(Clone, Copy)]
+enum PrefillAblation {
+    Norm,
+    Silu,
+    Mul,
+    Add,
+}
+
+/// Whether `x`, a pass over more than one position, skips `class` — an
+/// instrument pricing on the GPU timeline what removing that class from a
+/// prefill would buy; the output is WRONG. Read once.
+fn prefill_ablated(class: PrefillAblation, x: &Tensor) -> bool {
+    static ON: std::sync::OnceLock<[bool; 4]> = std::sync::OnceLock::new();
+    let on = ON.get_or_init(|| {
+        let names = &crate::tuning::tuning().lfm2.ablate;
+        let has = |n: &str| names.split(',').any(|s| s.trim() == n);
+        [
+            has("prefill-norm"),
+            has("prefill-silu"),
+            has("prefill-mul"),
+            has("prefill-add"),
+        ]
+    });
+    on[class as usize] && x.rank() >= 2 && x.dims()[x.rank() - 2] > 1
+}
+
 impl<P: Profile> DecoderLayer<P> {
     /// The layer's RMSNorm, or `x` itself under the `norm` ablation at a
-    /// one-token step.
+    /// one-token step or the `prefill-norm` one at a prefill.
     fn norm(&self, n: &RmsNorm, x: &Tensor) -> Result<Tensor> {
-        if ablate_norms() && x.dim(x.rank() - 2)? == 1 {
+        if (ablate_norms() && x.dim(x.rank() - 2)? == 1)
+            || prefill_ablated(PrefillAblation::Norm, x)
+        {
             return Ok(x.clone());
         }
         n.forward(x)
@@ -9191,10 +9506,10 @@ impl<P: Profile> DecoderLayer<P> {
         };
         tier.prefetch(st.depth, st.source.as_ref())?;
         // The group's bytes may still be landing (the loader's thread):
-        // every kernel of this layer waits on the device for them — and
-        // nothing is encoded when they have landed (R1).
+        // every kernel of this layer is committed once they have — and
+        // nothing is held when they have landed already (R1).
         if let Some(ticket) = wait {
-            tier.encode_wait(ticket)?;
+            tier.commit_after_load(ticket)?;
         }
         drop(tier);
         #[cfg(feature = "metal")]
@@ -9555,12 +9870,20 @@ fn derive_fusion<P: Profile>(
     }
 
     let graph = crate::optimizer::walk(model);
-    // The kernel fragments run in no LFM2 switch.
+    // The derivation sets the epilogue switches only: `silu_mul` is
+    // `kernels.fusion.silu_mul`'s, outside it, and no switch selects the rest.
     let policy = Policy {
         budget,
         unavailable: crate::optimizer::fragments::kernels()
             .into_iter()
-            .map(|k| (k.name.to_string(), "no LFM2 switch selects it".to_string()))
+            .map(|k| {
+                let why = if k.family == "silu_mul" {
+                    "kernels.fusion.silu_mul selects it, not the derivation"
+                } else {
+                    "no LFM2 switch selects it"
+                };
+                (k.name.to_string(), why.to_string())
+            })
             .collect(),
         ..Policy::default()
     };
@@ -9816,7 +10139,10 @@ impl<P: Profile> Model<P> {
         } else {
             AttnImpl::Generic
         };
-        let attn_route = AttnRoute::resolve(requested, cfg.head_dim(), vb.dtype(), vb.device());
+        let attn_route = AttnRoute::resolve(requested, cfg, vb.dtype(), vb.device())?;
+        if has_attention {
+            eprintln!("{}", attn_route.line());
+        }
         let mut load_warnings = Vec::new();
         if let Some(w) = attn_route.load_warning() {
             eprintln!("{}", w.message);
@@ -11360,6 +11686,36 @@ impl<P: Profile> CausalLM for Model<P> {
         Model::forward(self, tokens, pos, cache)
     }
 
+    /// Every multi-token pass leaves its own turn checkpoint
+    /// (`sequence-reuse-design.md` §2.3a), whatever the request asks; the
+    /// request scopes only the pin's second target.
+    fn open_checkpoint_request(
+        &self,
+        cache: &mut Self::Cache,
+        _policy: crate::nn::CheckpointPolicy,
+        _end: usize,
+    ) -> Result<()> {
+        cache.open_checkpoint_request();
+        Ok(())
+    }
+
+    fn close_checkpoint_request(&self, cache: &mut Self::Cache) -> Result<()> {
+        cache.close_checkpoint_request();
+        Ok(())
+    }
+
+    fn pin_checkpoint(&self, cache: &mut Self::Cache, pos: Option<usize>) -> Result<Option<usize>> {
+        cache.pin_checkpoint(pos)
+    }
+
+    fn pins_checkpoints(&self, cache: &Self::Cache) -> bool {
+        cache.has_pin_frame()
+    }
+
+    fn pinned_checkpoint(&self, cache: &Self::Cache) -> Option<usize> {
+        cache.pinned_checkpoint()
+    }
+
     fn vocab_size(&self) -> usize {
         // `lm_head` is `[vocab, hidden]` (`Model::new`: `linear(hidden, vocab)`
         // or the tied `[vocab, hidden]` embedding), so its leading dim is the
@@ -11397,6 +11753,10 @@ impl<P: Profile> crate::nn::model::CacheRewind for State<P> {
 
     fn can_restore(&self, pos: usize) -> bool {
         State::<P>::can_restore(self, pos)
+    }
+
+    fn restore_point(&self, pos: usize) -> Option<usize> {
+        State::<P>::restore_point(self, pos)
     }
 
     fn restore(&mut self, pos: usize) -> Result<()> {
@@ -12762,14 +13122,50 @@ mod admission_geometry_tests {
     fn admission_budget_reads_the_configs_geometry() {
         let mb = MemoryBudget::new(1);
         let big = geometry(22, 8, 2048, 32, 8);
-        let b = State::<crate::profile::CrownExact>::admission_budget(&big, &mb, 1024);
+        let b = State::<crate::profile::CrownExact>::admission_budget(&big, DType::F16, &mb, 1024);
         assert_eq!(b.conv_state_bytes, admission::CONV_STATE_BYTES);
         assert_eq!(b.kv_bytes_per_token, admission::KV_BYTES_PER_TOKEN);
         let small = geometry(2, 1, 64, 4, 2);
-        let s = State::<crate::profile::CrownExact>::admission_budget(&small, &mb, 1024);
+        let s =
+            State::<crate::profile::CrownExact>::admission_budget(&small, DType::F16, &mb, 1024);
         let width = small.conv_state.width(small.conv_l_cache);
         assert_eq!(s.conv_state_bytes, 2 * 64 * width * 2);
         assert_eq!(s.kv_bytes_per_token, 2 * 2 * 16 * 2);
         assert!(s.kv_bytes_per_token < b.kv_bytes_per_token);
+    }
+
+    /// Admission reads the forward's `silu_mul` selection: on at the default
+    /// gate arm at f16 and f32 (the switch's default, asserted first so the
+    /// arms below are not vacuous), the pair under `GateFusion::Mul`, at
+    /// bf16 (no instantiation) and under `Fusion=Derived` (the gate is the
+    /// plan's, set after construction).
+    #[test]
+    fn admission_charges_the_forwards_silu_mul_selection() {
+        assert!(silu_mul_on(), "the switch's default arm");
+        let mb = MemoryBudget::new(1).with_prefill(64);
+        let at = |cfg: &Config, dtype: DType| {
+            State::<crate::profile::CrownExact>::admission_budget(cfg, dtype, &mb, 1024)
+                .prefill_geometry
+                .silu_mul
+        };
+        let base = geometry(2, 1, 64, 4, 2);
+        assert!(at(&base, DType::F16));
+        assert!(at(&base, DType::F32));
+        assert!(!at(&base, DType::BF16));
+        let swiglu = Config {
+            gemv_gate: GateFusion::Swiglu,
+            ..base.clone()
+        };
+        assert!(at(&swiglu, DType::F16));
+        let mul = Config {
+            gemv_gate: GateFusion::Mul,
+            ..base.clone()
+        };
+        assert!(!at(&mul, DType::F16));
+        let derived = Config {
+            fusion: FusionPolicy::Derived,
+            ..base.clone()
+        };
+        assert!(!at(&derived, DType::F16));
     }
 }

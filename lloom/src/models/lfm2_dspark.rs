@@ -1931,12 +1931,22 @@ struct DSparkAttention {
     num_kv_heads: usize,
     num_kv_groups: usize,
     head_dim: usize,
+    /// The fused block attention on Metal, prepared at load; `None` on the
+    /// CPU and wherever [`Self::reference`] says why.
+    route: Option<crate::nn::attention::route::PreparedAttention>,
+    /// Why this layer attends through the eager reference on Metal: the
+    /// `dspark.eager_attn` arm, or a shape no fused kernel covers.
+    reference: Option<String>,
 }
 
 impl DSparkAttention {
     fn new(cfg: &DSparkConfig, vb: VarBuilder) -> Result<Self> {
         let h = cfg.hidden_size;
         let hd = cfg.head_dim;
+        let (route, reference) = match Self::route(cfg, vb.dtype(), vb.device()) {
+            Ok(route) => (route, None),
+            Err(why) => (None, Some(why)),
+        };
         Ok(Self {
             q_proj: crate::nn::linear_no_bias(h, cfg.num_attention_heads * hd, vb.pp("q_proj"))?,
             k_proj: crate::nn::linear_no_bias(h, cfg.num_key_value_heads * hd, vb.pp("k_proj"))?,
@@ -1950,21 +1960,64 @@ impl DSparkAttention {
             num_kv_heads: cfg.num_key_value_heads,
             num_kv_groups: cfg.num_kv_groups(),
             head_dim: hd,
+            route,
+            reference,
         })
     }
 
-    /// Whether the fused `sdpa` kernel has an instantiation for this head dim.
-    ///
-    /// The same set the target's `sdpa_full_applies` gates on
-    /// (`lfm2.rs`, `metal/kernels/sdpa.rs`); `head_dim` is `64` on the 2.6B
-    /// drafter, which is in it. Kept as a named predicate so the Metal arm's
-    /// guard reads as one condition and a checkpoint with an un-instantiated
-    /// head dim falls to the eager arm rather than bailing in the kernel.
-    /// A shape probe (`docs/porting-models.md` §21.8): the check is the
-    /// annotation.
-    fn head_dim_instantiated(head_dim: usize) -> bool {
-        const HEAD_DIMS: [usize; 8] = [32, 64, 72, 80, 96, 128, 256, 512];
-        lloom_tensor::shape_req!(sdpa_head_dim, HEAD_DIMS.contains(&head_dim); head_dim)
+    /// The fused route the block attention takes on Metal: bidirectional
+    /// (no mask), the block's queries over `[context ‖ block]`. `Err` names
+    /// why the layer attends through the eager reference instead, which
+    /// serving refuses on Metal.
+    fn route(
+        cfg: &DSparkConfig,
+        dtype: DType,
+        device: &Device,
+    ) -> std::result::Result<Option<crate::nn::attention::route::PreparedAttention>, String> {
+        if !device.is_metal() {
+            return Ok(None);
+        }
+        if dspark_eager_attn() {
+            return Err("dspark.eager_attn selects the eager reference attention".into());
+        }
+        #[cfg(feature = "metal")]
+        {
+            use crate::nn::attention::route::{
+                AttentionBounds, AttentionSpec, KvLayout, MaskKind, MetalKernelSet,
+                PreparedAttention,
+            };
+            let spec = AttentionSpec {
+                q_heads: cfg.num_attention_heads,
+                kv_heads: cfg.num_key_value_heads,
+                head_dim: cfg.head_dim,
+                v_head_dim: cfg.head_dim,
+                dtype,
+                kv_dtype: dtype,
+                mask: MaskKind::None,
+                softcap: 1.0,
+                layout: KvLayout::Strided,
+                bounds: AttentionBounds {
+                    batch: usize::MAX,
+                    min_queries: 1,
+                    queries: usize::MAX,
+                    keys: usize::MAX,
+                },
+            };
+            let metal = device.as_metal_device().map_err(|e| e.to_string())?;
+            PreparedAttention::prepare(spec, &MetalKernelSet { device: metal })
+                .map(Some)
+                .map_err(|u| format!("dspark: {u}"))
+        }
+        #[cfg(not(feature = "metal"))]
+        {
+            let _ = (cfg, dtype);
+            Ok(None)
+        }
+    }
+
+    /// Why this layer attends through the eager reference on Metal, if it does.
+    fn reference(&self) -> Option<&str> {
+        self.reference.as_deref()
     }
 
     /// Project `H_ctx` into this layer's context K/V and append to `cache`.
@@ -2201,15 +2254,12 @@ impl DSparkAttention {
         // (`nn/ops.rs`, "SDPA has no cpu impl"), and the drafter runs on both
         // backends (the backbone's CPU/Metal digests must agree, §10.2p), so the
         // arm is gated on the device rather than made the only path.
-        let out = if q.device().is_metal()
-            && Self::head_dim_instantiated(self.head_dim)
-            && !dspark_eager_attn()
-        {
+        let out = if let Some(route) = &self.route {
             // `q`: [b, num_heads, seq, head_dim]; `k`/`v`: [b, num_kv_heads,
             // ctx+seq, head_dim] — the layout `sdpa` reads, and `q_seq = seq > 1`
             // always (the draft block is a fixed γ ≥ 2, §10.2m), so it takes the
             // full-attention route rather than the seq==1 vector one.
-            crate::nn::ops::sdpa(q, &k, &v, None, false, scale as f32, 1.0)?
+            crate::nn::ops::attention(q, &k, &v, None, scale as f32, route)?
         } else {
             let k = crate::utils::repeat_kv(k, self.num_kv_groups)?;
             let v = crate::utils::repeat_kv(v, self.num_kv_groups)?;
@@ -2528,6 +2578,12 @@ impl DSparkDrafter {
             cfg,
             dtype,
         })
+    }
+
+    /// Why the drafter attends through the eager reference on Metal, when
+    /// any layer does; serving refuses such a drafter.
+    pub fn reference_attention(&self) -> Option<&str> {
+        self.layers.iter().find_map(|l| l.self_attn.reference())
     }
 
     pub fn config(&self) -> &DSparkConfig {

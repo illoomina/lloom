@@ -8,6 +8,18 @@
 //!   chat template through the request front end, `front.rs`, `logprobs`),
 //!   `/v1/models`, `/tokenize`; on both routes the token-level fields
 //!   `prompt_token_ids` (ids in, no template) and `return_token_ids`;
+//!
+//! On the chat route a reply's reasoning comes back **apart from its answer**:
+//! `message.reasoning_content` and `message.content` (the answer only), and on
+//! the stream `delta.reasoning_content` and `delta.content` (decision 51 Q2,
+//! `sequence-reuse-design.md` §2.3d). A request that wants the whole reply in
+//! `content`, as before, sends `reasoning_in_content: true` — an opt-out.
+//! `/v1/completions` is unchanged: its text is the reply.
+//!
+//! `usage.completion_tokens` counts the tokens of the completion the client
+//! **received** — the accepted frontier (decision 51 Q4, the standard
+//! semantics). The count the run generated is in `timings.tokens` and
+//! `timings.frontier`, which differ past a stop string on the adaptive commit.
 //! - the **benchmark sidecar** contract LiquidAI's `pipette` runners drive an
 //!   engine through (`Liquid4All/pipette-clients`, the MLX sidecar's shape):
 //!   `/prefill_throughput`, `/decode_throughput`, `/end_to_end_latency`,
@@ -52,6 +64,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
+mod keep_warm;
+mod reasoning;
 mod turns;
 
 /// The seed passage the throughput cells tile into their prompt when no
@@ -133,6 +147,15 @@ struct Shared {
     front: Front,
     /// What every request reused of its session, counted (`/health`).
     reuse: parking_lot::Mutex<crate::turn::Tally>,
+    /// The sessions chat completions' ids name (`docs/sessions.md`).
+    sessions: parking_lot::Mutex<super::sessions::Table>,
+    /// The requests' ends and the keep-warm's actions (`server.keep_warm`).
+    activity: Arc<keep_warm::Activity>,
+    /// The keep-warm this server runs.
+    keep_warm: keep_warm::Policy,
+    /// Where the keep-warm reads the pressure level, when not the kernel
+    /// (`server.keep_warm_pressure_file`).
+    keep_warm_pressure_file: Option<String>,
 }
 
 /// The largest `/v1/systemone` body a decision-only owner reads: eight
@@ -199,7 +222,7 @@ fn run_configured(args: ServeArgs, transport: Option<tiny_http::TransportPolicy>
     let reuse_prefix = shape.reuse_prefix;
     // A non-generating decision model is served by the decision-only listener.
     if let Some(endpoint) = super::omni::serving::load(&options.load, &shape)? {
-        return run_decisions_configured(options, endpoint, DECISION_BODY_BYTES, transport);
+        return run_decisions_configured(options, endpoint, DECISION_BODY_BYTES, transport, true);
     }
     let (engine, model_path) = super::load_engine(&options.load, shape)?;
     run_owner(
@@ -215,7 +238,8 @@ fn run_configured(args: ServeArgs, transport: Option<tiny_http::TransportPolicy>
 /// admission domain. The caller creates its device, configures the same process
 /// account, and completes the genuine load before entering this frontend.
 ///
-/// Only `options.server.host`, `options.server.port`, `options.sampling` and
+/// Only `options.server.host`, `options.server.port`, `options.server.keep_warm`
+/// (and `keep_warm_for_s`, `keep_warm_by`), `options.sampling` and
 /// `options.session` (the request front end's) are honored; the remaining
 /// options do not reconfigure this owner. Shape, decode,
 /// cache, seed, prefix reuse, batch and memory policy are the already-loaded
@@ -241,6 +265,19 @@ pub fn run_loaded_with_transport_policy(
     run_owner(options, engine, model_path, None, Some(policy))
 }
 
+/// Startup provenance distinguishes configured options from the loaded owner's
+/// actual description. Supplied owners do not install the option tree.
+fn ready_configuration(options: &crate::EngineOptions, installed: bool, owner: Value) -> Value {
+    json!({
+        "schema_version": 1,
+        "frontend": "serve",
+        "options_installed": installed,
+        "configured_options": crate::option_tree::index().flat(options),
+        "owner": owner,
+        "request_resolution": "readback and sampling may resolve per request; read response timings",
+    })
+}
+
 fn run_owner(
     options: crate::EngineOptions,
     engine: Box<dyn Served>,
@@ -256,9 +293,23 @@ fn run_owner(
         .map_err(|e| anyhow::anyhow!("the checkpoint's generation_config.json: {e}"))?;
     let description = engine.describe_checked()?;
     let logprobs = logprobs_line(engine.as_ref());
+    let keep_warm = keep_warm::Policy::resolve(
+        options.server.keep_warm,
+        options.server.keep_warm_for_s,
+        &options.server.keep_warm_by,
+        options.server.keep_warm_pressure.unwrap_or(false),
+        engine.batch(),
+        engine.device().is_metal(),
+    )
+    .map_err(|e| anyhow::anyhow!(e))?;
+    let warm = keep_warm.short();
+    let residency = engine
+        .device()
+        .residency_line()
+        .unwrap_or_else(|| "residency=none".into());
     if let Some((load_start, reuse_prefix)) = load_facts {
         eprintln!(
-            "[loaded {} from {} in {:.2}s on {:?}; kv_capacity={} readback={} reuse_prefix={} logprobs={logprobs} {}]",
+            "[loaded {} from {} in {:.2}s on {:?}; kv_capacity={} readback={} reuse_prefix={} keep_warm={warm} {residency} logprobs={logprobs} {}]",
             model_name,
             model_path.display(),
             load_start.elapsed().as_secs_f64(),
@@ -270,7 +321,7 @@ fn run_owner(
         );
     } else {
         eprintln!(
-            "[serving existing {} from {} on {:?}; kv_capacity={} readback={} reuse_prefix={} logprobs={logprobs} {}]",
+            "[serving existing {} from {} on {:?}; kv_capacity={} readback={} reuse_prefix={} keep_warm={warm} {residency} logprobs={logprobs} {}]",
             model_name,
             model_path.display(),
             engine.device(),
@@ -306,7 +357,21 @@ fn run_owner(
     ) {
         anyhow::bail!("session.keep_logprobs: {why}");
     }
+    let configuration = ready_configuration(
+        &options,
+        load_facts.is_some(),
+        json!({
+            "description": description,
+            "readback": engine.readback().name(),
+            "kv_capacity": engine.kv_capacity(),
+            "batch": engine.batch(),
+            "prefill_tile": engine.prefill_tile(),
+            "prefix_reuse": engine.reuse_prefix(),
+            "capabilities": engine.capabilities().json(),
+        }),
+    );
     let (host, port) = (options.server.host.clone(), options.server.port);
+    let batch = engine.batch();
 
     let server = listener((host.as_str(), port), transport)
         .map_err(|e| anyhow::anyhow!("binding {host}:{port}: {e}"))?;
@@ -328,11 +393,23 @@ fn run_owner(
         sampling,
         front,
         reuse: parking_lot::Mutex::new(crate::turn::Tally::default()),
+        sessions: parking_lot::Mutex::new(super::sessions::Table::new(session_config(
+            &options.session,
+            &options.server.sessions,
+            batch,
+        ))),
+        activity: Arc::new(keep_warm::Activity::new(uptime_ns())),
+        keep_warm,
+        keep_warm_pressure_file: options.server.keep_warm_pressure_file.clone(),
     });
+    let heartbeat = start_keep_warm(&shared)?;
 
     // The ready marker the sidecar runner waits for, on stdout and nothing
     // else on stdout before it. Everything the operator reads goes to stderr.
-    println!("{}", json!({"kind": "ready", "host": host, "port": port}));
+    println!(
+        "{}",
+        json!({"kind": "ready", "host": host, "port": port, "configuration": configuration})
+    );
     std::io::stdout().flush().ok();
     eprintln!("[serving on http://{host}:{port}]");
 
@@ -347,6 +424,24 @@ fn run_owner(
             (Method::Get, "/health") => {
                 let result = health_body(shared.engine.as_ref(), &shared.front).map(|mut b| {
                     b["reuse"] = shared.reuse.lock().json(shared.engine.reuse_prefix());
+                    b["sampling"] = sampling_json(&shared.sampling);
+                    b["sessions"] = shared.sessions.lock().json();
+                    b["keep_warm"] = shared.keep_warm.json(&shared.activity, uptime_ns());
+                    b["keep_warm_actions"] = json!(shared.activity.actions.load(Ordering::Relaxed));
+                    if let Some(s) = shared.engine.device().metal4_slot_residency() {
+                        b["metal4_slot_residency"] = json!({
+                            "adds": s.adds,
+                            "add_ns": s.add_ns,
+                            "pipeline_adds": s.pipeline_adds,
+                            "covered": s.covered,
+                            "set_uses": s.set_uses,
+                            "commits": s.commits,
+                            "commit_ns": s.commit_ns,
+                            "commit_max_ns": s.commit_max_ns,
+                            "last_bytes": s.last_bytes,
+                            "max_bytes": s.max_bytes,
+                        });
+                    }
                     b
                 });
                 let _ = respond_metadata(request, result);
@@ -359,6 +454,33 @@ fn run_owner(
                 );
                 let _ = respond_metadata(request, result);
             }
+            (Method::Get, "/v1l/features") => {
+                let _ = respond_metadata(request, Ok(features_body(&shared)));
+            }
+            (Method::Get, p) if p.starts_with(SESSIONS_ROUTE) => {
+                let auth = auth_digest(request.headers());
+                let found = shared.sessions.lock().inspect(
+                    &p[SESSIONS_ROUTE.len()..],
+                    auth,
+                    Instant::now(),
+                );
+                let _ = match found {
+                    Ok(body) => respond_json(request, 200, &body),
+                    Err(lost) => respond_error(request, 404, &not_held(lost)),
+                };
+            }
+            (Method::Delete, p) if p.starts_with(SESSIONS_ROUTE) => {
+                let auth = auth_digest(request.headers());
+                let gone =
+                    shared
+                        .sessions
+                        .lock()
+                        .delete(&p[SESSIONS_ROUTE.len()..], auth, Instant::now());
+                let _ = match gone {
+                    Ok(()) => respond_json(request, 200, &json!({ "deleted": true })),
+                    Err(lost) => respond_error(request, 404, &not_held(lost)),
+                };
+            }
             (Method::Post, "/eval/abort") => {
                 let _ = handle_abort(&shared, request);
             }
@@ -369,15 +491,24 @@ fn run_owner(
             }
             (Method::Post, _) => {
                 let shared = Arc::clone(&shared);
+                let recv = uptime_ns();
+                let idle = recv.saturating_sub(shared.activity.last_active.load(Ordering::Acquire));
                 std::thread::spawn(move || {
                     let path = path;
                     let started = Instant::now();
-                    match handle_model_request(&shared, &path, request) {
-                        Ok(()) => {}
-                        Err(e) => eprintln!(
+                    let first = FirstToken {
+                        recv,
+                        handler: uptime_ns(),
+                        idle,
+                        ..FirstToken::default()
+                    };
+                    let answered = handle_model_request(&shared, &path, request, first);
+                    shared.activity.request_ended(uptime_ns());
+                    if let Err(e) = answered {
+                        eprintln!(
                             "[{path} failed after {:.1} ms: {e:#}]",
                             ms(started.elapsed())
-                        ),
+                        );
                     }
                 });
             }
@@ -390,9 +521,79 @@ fn run_owner(
     // are cut. A request thread still decoding holds the sequence, and the
     // batch thread holds the pool; wait for both so the model is not dropped
     // under a running command buffer.
+    if let Some(h) = heartbeat {
+        h.stop();
+    }
     shutdown_http(&shared.server);
     shared.engine.shutdown();
     Ok(())
+}
+
+/// Starts `shared.keep_warm`'s heartbeat, if it is on. Each action takes the
+/// single-sequence slot only when it is free and nobody waits for it, so it
+/// never runs beside a request nor goes ahead of a queued one.
+fn start_keep_warm(shared: &Arc<Shared>) -> Result<Option<keep_warm::Heartbeat>> {
+    eprintln!("[keep-warm: {}]", shared.keep_warm.sentence());
+    let keep_warm::Policy::On {
+        period,
+        window,
+        by,
+        pressure,
+    } = shared.keep_warm.clone()
+    else {
+        return Ok(None);
+    };
+    let s = Arc::clone(shared);
+    let act = move || {
+        let Some(_turn) = s.turns.try_take() else {
+            return keep_warm::Act::Busy;
+        };
+        match by {
+            keep_warm::By::Residency => {
+                s.engine.device().request_residency();
+                keep_warm::Act::Done
+            }
+            keep_warm::By::Dispatch => match warm_dispatch(s.engine.device()) {
+                Ok(()) => keep_warm::Act::Done,
+                Err(e) => keep_warm::Act::Failed(e.to_string()),
+            },
+        }
+    };
+    // Under memory pressure, both arms: the slot is free, so no request's
+    // command buffer is waiting on the memory this gives back.
+    let s = Arc::clone(shared);
+    let end = move || {
+        let Some(_turn) = s.turns.try_take() else {
+            return keep_warm::Act::Busy;
+        };
+        s.engine.device().end_residency();
+        keep_warm::Act::Done
+    };
+    let work = keep_warm::Beat {
+        clock: uptime_ns,
+        pressure: match (pressure, &shared.keep_warm_pressure_file) {
+            (true, Some(file)) => {
+                let _ = keep_warm::PRESSURE_FILE.set(file.into());
+                eprintln!("[keep-warm: the memory-pressure level is read from {file}]");
+                keep_warm::file_pressure
+            }
+            (true, None) => keep_warm::vm_pressure,
+            (false, _) => keep_warm::pressure_ignored,
+        },
+        act,
+        end,
+    };
+    keep_warm::Heartbeat::spawn(Arc::clone(&shared.activity), period, window, work)
+        .map(Some)
+        .context("spawning the keep-warm thread")
+}
+
+/// The keep-warm's work: one dispatch over one element, committed and
+/// waited for.
+fn warm_dispatch(device: &lloom_tensor::Device) -> lloom_tensor::Result<()> {
+    let x = lloom_tensor::Tensor::zeros(1, lloom_tensor::DType::F32, device)?;
+    let _y = x.affine(1.0, 1.0)?;
+    device.synchronize()
 }
 
 /// Serve a decision-only owner using the SAME ordered dispatcher/status mapper.
@@ -410,7 +611,7 @@ pub fn run_decisions_loaded(
     endpoint: Box<dyn super::decision_endpoint::DecisionEndpoint>,
     max_body_bytes: usize,
 ) -> Result<()> {
-    run_decisions_configured(options, endpoint, max_body_bytes, None)
+    run_decisions_configured(options, endpoint, max_body_bytes, None, false)
 }
 /// Same narrow endpoint and dispatcher, with explicit dependency disposal/I/O
 /// limits. Header/JSON/queue allocations and thread joining remain separate.
@@ -421,13 +622,14 @@ pub fn run_decisions_loaded_with_transport_policy(
     policy: tiny_http::TransportPolicy,
 ) -> Result<()> {
     policy.validate()?;
-    run_decisions_configured(options, endpoint, max_body_bytes, Some(policy))
+    run_decisions_configured(options, endpoint, max_body_bytes, Some(policy), false)
 }
 fn run_decisions_configured(
     options: crate::EngineOptions,
     endpoint: Box<dyn super::decision_endpoint::DecisionEndpoint>,
     max_body_bytes: usize,
     transport: Option<tiny_http::TransportPolicy>,
+    options_installed: bool,
 ) -> Result<()> {
     let read_bound = max_body_bytes
         .checked_add(1)
@@ -435,6 +637,16 @@ fn run_decisions_configured(
         .ok_or_else(|| {
             anyhow::anyhow!("decision transport body bound must be finite and nonzero")
         })?;
+    let configuration = ready_configuration(
+        &options,
+        options_installed,
+        json!({
+            "generation": false,
+            "decisions": true,
+            "model": endpoint.model_name(),
+            "input_modalities": endpoint.input_modalities(),
+        }),
+    );
     let host = options.server.host;
     let server = listener((host.as_str(), options.server.port), transport)
         .map_err(|error| anyhow::anyhow!("binding decision listener: {error}"))?;
@@ -445,7 +657,7 @@ fn run_decisions_configured(
     };
     println!(
         "{}",
-        json!({"kind":"ready","host":host,"port":port,"generation":false,"decisions":true})
+        json!({"kind":"ready","host":host,"port":port,"generation":false,"decisions":true,"configuration":configuration})
     );
     std::io::stdout().flush()?;
     loop {
@@ -520,12 +732,18 @@ fn run_decisions_configured(
 
 // ---- routing ---------------------------------------------------------------
 
-fn handle_model_request(shared: &Shared, path: &str, mut request: Request) -> Result<()> {
+fn handle_model_request(
+    shared: &Shared,
+    path: &str,
+    mut request: Request,
+    mut first: FirstToken,
+) -> Result<()> {
     let mut body = String::new();
     request
         .as_reader()
         .read_to_string(&mut body)
         .context("reading the request body")?;
+    first.body = uptime_ns();
     // This branch consumes the original bytes exactly once. Parsing through
     // Value first would reorder question/options/legend objects.
     // Decisions that wait together are answered as one group; under `fast`
@@ -545,6 +763,9 @@ fn handle_model_request(shared: &Shared, path: &str, mut request: Request) -> Re
     // A single-sequence engine's model requests take the request slot one at
     // a time; a batched engine schedules its own rows.
     let _turn = (path != "/tokenize" && shared.engine.batch() <= 1).then(|| shared.turns.take());
+    if _turn.is_some() {
+        first.slot = uptime_ns();
+    }
     let value: Value = if body.trim().is_empty() {
         json!({})
     } else {
@@ -556,10 +777,16 @@ fn handle_model_request(shared: &Shared, path: &str, mut request: Request) -> Re
             }
         }
     };
+    first.json = uptime_ns();
+    // Every other route that runs the engine leaves its sequence holding no
+    // session's state.
+    if !matches!(path, "/tokenize" | "/v1/chat/completions") {
+        shared.sessions.lock().note_other();
+    }
     let result = match path {
         "/tokenize" => tokenize(shared, &value).map(Reply::Json),
         "/v1/completions" => completions(shared, &value, request.headers()),
-        "/v1/chat/completions" => chat_completions(shared, &value),
+        "/v1/chat/completions" => chat_completions(shared, &value, auth_digest(request.headers())),
         "/prefill_throughput" => prefill_throughput(shared, &value).map(Reply::Json),
         "/decode_throughput" => decode_throughput(shared, &value).map(Reply::Json),
         "/max_memory_usage" => max_memory_usage(shared, &value).map(Reply::Json),
@@ -567,9 +794,13 @@ fn handle_model_request(shared: &Shared, path: &str, mut request: Request) -> Re
         "/eval" => Ok(Reply::Eval(value)),
         _ => Err(Failure::NotFound(format!("unknown endpoint: {path}"))),
     };
+    first.built = uptime_ns();
     match result {
         Ok(Reply::Json(v)) => respond_json(request, 200, &v),
-        Ok(Reply::Stream(stream)) => stream_response(shared, request, *stream),
+        Ok(Reply::Stream(mut stream)) => {
+            stream.first = first;
+            stream_response(shared, request, *stream)
+        }
         Ok(Reply::Eval(v)) => eval(shared, request, &v),
         Err(Failure::BadRequest(m)) => respond_error(request, 400, &m),
         Err(Failure::NotFound(m)) => respond_error(request, 404, &m),
@@ -645,6 +876,173 @@ struct StreamingRun {
     record: Option<front::Origin>,
     /// `return_token_ids`: the final event carries the ids.
     return_ids: bool,
+    /// `reasoning_in_content`: the deltas carry the whole reply in `content`,
+    /// as before decision 51 Q2, rather than splitting the reasoning out.
+    reasoning_in_content: bool,
+    /// The session turn the reply leaves (`docs/sessions.md` §3).
+    session: Option<Box<SessionCtx>>,
+    /// The request's stamps so far; the stream adds the rest.
+    first: FirstToken,
+}
+
+/// Where a streamed request's first token went: stamps in the clock a
+/// command buffer's `GPUStartTime` is in (`uptime_ns`), from the accept to
+/// the first text chunk the writer put on the socket. One clock read a
+/// stage, a request's and never a token's (`docs/invariants.md` §15.2 #10).
+#[derive(Clone, Copy, Debug, Default)]
+struct FirstToken {
+    /// `Server::recv` returned the request (the accept loop).
+    recv: u64,
+    /// The request's thread started.
+    handler: u64,
+    /// The body was read.
+    body: u64,
+    /// The single-sequence request slot was taken (0 when not taken).
+    slot: u64,
+    /// The body was parsed as JSON.
+    json: u64,
+    /// The route built the prompt: template, tokenization, budgets.
+    built: u64,
+    /// The response headers were flushed.
+    headers: u64,
+    /// The decode was entered.
+    decode: u64,
+    /// The first text fragment reached the stream writer's buffer.
+    fragment: u64,
+    /// The writer thread finished writing the first text chunk.
+    written: u64,
+    /// How long the GPU had had nothing from this server when the request
+    /// arrived (`keep_warm::Activity::last_active`), nanoseconds.
+    idle: u64,
+}
+
+/// Now, in nanoseconds of `CLOCK_UPTIME_RAW` (`docs/machine-model.md`
+/// §3.4b's domain A: `Instant`, `GPUStartTime`, a client's
+/// `clock_gettime_ns(CLOCK_UPTIME_RAW)`), or the monotonic clock elsewhere.
+fn uptime_ns() -> u64 {
+    #[cfg(target_vendor = "apple")]
+    {
+        let mut ts = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // SAFETY: `ts` is a valid, writable `timespec`; `CLOCK_UPTIME_RAW` is a
+        // clock id Darwin accepts, so the call cannot fail.
+        unsafe {
+            libc::clock_gettime(libc::CLOCK_UPTIME_RAW, &mut ts);
+        }
+        ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    {
+        static BASE: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+        BASE.get_or_init(Instant::now).elapsed().as_nanos() as u64
+    }
+}
+
+impl FirstToken {
+    /// Each stage's offset from `recv`, in microseconds; a stage that did not
+    /// happen reads `-`.
+    fn stages(&self) -> [(&'static str, Option<f64>); 9] {
+        let at =
+            |t: u64| (t != 0 && self.recv != 0).then(|| t.saturating_sub(self.recv) as f64 / 1e3);
+        [
+            ("handler", at(self.handler)),
+            ("body", at(self.body)),
+            ("slot", at(self.slot)),
+            ("json", at(self.json)),
+            ("built", at(self.built)),
+            ("headers", at(self.headers)),
+            ("decode", at(self.decode)),
+            ("fragment", at(self.fragment)),
+            ("written", at(self.written)),
+        ]
+    }
+
+    /// The request line's fields: `first_token_us=handler:…,…,written:…` and
+    /// the GPU's idle time before the request, `idle_ms=…`.
+    fn field(&self) -> String {
+        let parts: Vec<String> = self
+            .stages()
+            .iter()
+            .map(|(k, v)| match v {
+                Some(us) => format!("{k}:{us:.0}"),
+                None => format!("{k}:-"),
+            })
+            .collect();
+        format!(
+            "first_token_us={} idle_ms={:.0}",
+            parts.join(","),
+            self.idle as f64 / 1e6
+        )
+    }
+
+    /// The trailer's object: the stages and the absolute `recv`, so a client
+    /// on the same clock can place its own send and receive beside them.
+    fn json(&self, st: &lloom::nn::DecodeStats) -> Value {
+        let mut m = Map::new();
+        m.insert("recv_ns".into(), json!(self.recv));
+        m.insert("idle_ms".into(), json!(self.idle as f64 / 1e6));
+        for (k, v) in self.stages() {
+            m.insert(format!("{k}_us"), json!(v));
+        }
+        m.insert(
+            "prefill_submit_us".into(),
+            json!(st.prefill_ns as f64 / 1e3),
+        );
+        m.insert(
+            "step0_submit_us".into(),
+            json!(st.ttft_compute_ns as f64 / 1e3),
+        );
+        Value::Object(m)
+    }
+}
+
+/// Under the profile build's recorder (`diagnostics.gpu_profile.enabled`):
+/// the command buffers committed between the decode's entry and the first
+/// fragment, on the stamps' clock — when the GPU started, how much of the
+/// window it was busy, and what it sat idle.
+#[cfg(feature = "metal")]
+fn first_token_gpu(endpoint: &str, first: &FirstToken) {
+    use lloom_tensor::kernels::metal::profile;
+    if !profile::recorder_enabled() || first.decode == 0 || first.fragment == 0 {
+        return;
+    }
+    let (from, to) = (first.decode as f64 * 1e-9, first.fragment as f64 * 1e-9);
+    let mut cbs: Vec<profile::GpuInterval> = Vec::new();
+    let mut commit0 = f64::INFINITY;
+    for r in profile::command_buffer_records() {
+        if r.committed >= from && r.interval.start <= to {
+            commit0 = commit0.min(r.committed);
+            cbs.push(r.interval);
+        }
+    }
+    let Some(start0) = cbs.iter().map(|i| i.start).min_by(f64::total_cmp) else {
+        eprintln!("[first-token gpu: {endpoint} buffers=0]");
+        return;
+    };
+    cbs.sort_by(|a, b| a.start.total_cmp(&b.start));
+    let (mut busy, mut reach) = (0.0f64, start0);
+    for i in &cbs {
+        let (s, e) = (i.start.max(reach), i.end.min(to));
+        if e > s {
+            busy += e - s;
+        }
+        reach = reach.max(i.end.min(to));
+    }
+    let last_end = cbs.iter().map(|i| i.end).fold(f64::MIN, f64::max);
+    let rel = |t: f64| (t - first.recv as f64 * 1e-9) * 1e6;
+    eprintln!(
+        "[first-token gpu: {endpoint} buffers={} first_commit_us={:.0} first_start_us={:.0} \
+         busy_us={:.0} idle_us={:.0} last_end_us={:.0} fragment_us={:.0}]",
+        cbs.len(),
+        rel(commit0),
+        rel(start0),
+        busy * 1e6,
+        (to - start0 - busy).max(0.0) * 1e6,
+        rel(last_end),
+        rel(to),
+    );
 }
 
 /// One decode of `prompt_ids`, through the image path when the request
@@ -660,6 +1058,37 @@ fn run_decode(
         engine.complete_until(prompt_ids, params, on_fragment)
     } else {
         engine.complete_images_until(prompt_ids, images, params, on_fragment)
+    }
+}
+
+fn append_fields(to: &mut serde_json::Map<String, Value>, fields: serde_json::Map<String, Value>) {
+    for (key, value) in fields {
+        let previous = to.get(&key).and_then(Value::as_str).unwrap_or("");
+        to.insert(
+            key,
+            Value::String(format!("{previous}{}", value.as_str().unwrap_or(""))),
+        );
+    }
+}
+
+fn run_decode_observed(
+    engine: &dyn Served,
+    prompt_ids: &[u32],
+    images: &[DecodedImage],
+    params: &DecodeParams,
+    split: Option<&Arc<parking_lot::Mutex<reasoning::Reasoning>>>,
+    on_fragment: &mut (dyn FnMut(&str) -> bool + Send),
+) -> Result<Decoded> {
+    if let Some(split) = split {
+        engine.complete_observed(
+            prompt_ids,
+            images,
+            params,
+            on_fragment,
+            &mut |ids, text, from, decode| split.lock().observe(ids, text, from, decode),
+        )
+    } else {
+        run_decode(engine, prompt_ids, images, params, on_fragment)
     }
 }
 
@@ -711,7 +1140,19 @@ fn tokenize(shared: &Shared, v: &Value) -> Handled<Value> {
 
 fn completions(shared: &Shared, v: &Value, _headers: &[Header]) -> Handled<Reply> {
     let model = shared.model_name.clone();
-    let params = sampling_params(shared, v)?;
+    for field in ["previous_response_id", "input", "keep", "reset"] {
+        if v.get(field).is_some_and(|f| !f.is_null()) {
+            return Err(bad(format!(
+                "field '{field}' is a chat route's (sessions, docs/sessions.md); /v1/completions has no conversation"
+            )));
+        }
+    }
+    if v.get("store").and_then(Value::as_bool) == Some(true) {
+        return Err(bad(
+            "store: true is a chat route's (sessions, docs/sessions.md); /v1/completions keeps nothing",
+        ));
+    }
+    let params = sampling_params(&shared.sampling, shared.engine.as_ref(), v)?;
     let stream = v.get("stream").and_then(Value::as_bool).unwrap_or(false);
     if v.get("n").and_then(Value::as_u64).unwrap_or(1) != 1 {
         return Err(bad("n > 1 is not supported"));
@@ -811,6 +1252,10 @@ fn completions(shared: &Shared, v: &Value, _headers: &[Header]) -> Handled<Reply
             model,
             record: None,
             return_ids,
+            // `/v1/completions` is not a chat route: its text is the reply.
+            reasoning_in_content: true,
+            session: None,
+            first: FirstToken::default(),
         })));
     }
     let started = Instant::now();
@@ -838,7 +1283,7 @@ fn completions(shared: &Shared, v: &Value, _headers: &[Header]) -> Handled<Reply
             },
             "finish_reason": finish_reason(decoded.stop),
         }],
-        "usage": usage(prompt_ids.len(), decoded.tokens.len()),
+        "usage": run_usage(shared.engine.as_ref(), prompt_ids.len(), &decoded),
         "timings": timings(shared.engine.as_ref(), prompt_ids.len(), &facts, &decoded, elapsed),
     });
     if return_ids {
@@ -896,10 +1341,48 @@ fn completion_logprobs(engine: &dyn Served, d: &Decoded) -> Result<Value> {
 
 // ---- /v1/chat/completions ----------------------------------------------------
 
-fn chat_completions(shared: &Shared, v: &Value) -> Handled<Reply> {
+fn chat_completions(shared: &Shared, v: &Value, auth: Option<[u8; 32]>) -> Handled<Reply> {
     let model = shared.model_name.clone();
+    let ask = session_ask(v)?;
+    let at = Instant::now();
+    // The session the request continues (`docs/sessions.md` §5), or why
+    // none holds its id.
+    let (resolved, miss) = match &ask.previous {
+        None => (None, None),
+        Some(id) => match shared
+            .sessions
+            .lock()
+            .resolve(id, auth, ask.input.is_some(), at)
+        {
+            Ok(r) => (Some(r), None),
+            Err(m) => (None, Some(m)),
+        },
+    };
+    if ask.input.is_some() && resolved.is_none() {
+        return Err(Failure::NotFound(format!(
+            "previous_response_id: {}; send the whole conversation in `messages` instead",
+            not_held(miss.expect("a miss where nothing resolved"))
+        )));
+    }
+    let keep = resolve_keep(
+        shared.engine.as_ref(),
+        shared.sessions.lock().config().keep,
+        ask.keep,
+        resolved.as_ref().and_then(|r| r.keep),
+    )?;
+    // The `input` form's conversation: the session's through the continued
+    // turn, its reply as the response returned it, then the new messages.
+    let joined: Option<Value> = match (&ask.input, &resolved) {
+        (Some(input), Some(r)) => {
+            let mut m = r.messages.clone().unwrap_or_default();
+            m.extend(input.iter().cloned());
+            Some(Value::Array(m))
+        }
+        _ => None,
+    };
+    let sent = joined.as_ref().or_else(|| v.get("messages"));
     let no_messages = json!([]);
-    let messages = match (v.get("messages"), v.get("prompt_token_ids")) {
+    let messages = match (sent, v.get("prompt_token_ids")) {
         (None | Some(Value::Null), Some(ids)) if !ids.is_null() => &no_messages,
         (Some(_), Some(ids)) if !ids.is_null() => {
             return Err(bad(
@@ -921,7 +1404,7 @@ fn chat_completions(shared: &Shared, v: &Value) -> Handled<Reply> {
         // fall back to `logprobs` looks for.
         return Err(bad("guided decoding is not supported"));
     }
-    let mut params = sampling_params(shared, v)?;
+    let mut params = sampling_params(&shared.sampling, shared.engine.as_ref(), v)?;
     let wanted = request_budgets(shared, v, params.max_tokens)?;
     let stream = v.get("stream").and_then(Value::as_bool).unwrap_or(false);
     let want_logprobs = match v.get("logprobs") {
@@ -966,9 +1449,12 @@ fn chat_completions(shared: &Shared, v: &Value) -> Handled<Reply> {
             };
             let expand_ref: front::Expand<'_> = &expand;
             let front_start = Instant::now();
+            // A reset asks that nothing the session cached be taken: its
+            // turns are dropped, and the request is built as a first turn.
+            let by_reference = resolved.as_ref().filter(|_| ask.reset.is_none());
             let prompt = shared
                 .front
-                .prompt(
+                .prompt_by(
                     engine,
                     front::Request {
                         messages: &messages,
@@ -976,7 +1462,14 @@ fn chat_completions(shared: &Shared, v: &Value) -> Handled<Reply> {
                         want,
                         add_bos: true,
                         expand: (!images.is_empty()).then_some(expand_ref),
-                        history: v.get("messages"),
+                        history: sent,
+                    },
+                    &front::ByRef {
+                        bound: by_reference.map_or(&[][..], |r| r.bound.as_slice()),
+                        prefix: by_reference.and_then(|r| {
+                            r.prefix.as_ref().map(|(rec, ids)| (rec, ids.as_slice()))
+                        }),
+                        record: true,
                     },
                 )
                 .map_err(|e| front_failure("/v1/chat/completions", e))?;
@@ -1057,7 +1550,8 @@ fn chat_completions(shared: &Shared, v: &Value) -> Handled<Reply> {
             (ids, facts, Some(prompt))
         }
     };
-    let id = format!("chatcmpl-{}", short_id());
+    params.cold |= ask.reset == Some(Reset::All);
+    let random_id = format!("chatcmpl-{}", short_id());
 
     if want_logprobs {
         if stream {
@@ -1091,6 +1585,13 @@ fn chat_completions(shared: &Shared, v: &Value) -> Handled<Reply> {
     // top `top_logprobs`), from the run's own steps.
     let return_ids = v
         .get("return_token_ids")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    // Decision 51 Q2: a reply's reasoning comes back in `reasoning_content`
+    // and `content` is the answer alone. A client that wants the whole reply
+    // in `content`, as before, asks for it per request — opt-out, not opt-in.
+    let reasoning_in_content = v
+        .get("reasoning_in_content")
         .and_then(Value::as_bool)
         .unwrap_or(false);
     params.logprobs = logprob_request(
@@ -1201,8 +1702,10 @@ fn chat_completions(shared: &Shared, v: &Value) -> Handled<Reply> {
             options.len(),
             ms(started.elapsed())
         );
+        // One forward that leaves no reply: no session's turn.
+        shared.sessions.lock().note_other();
         return Ok(Reply::Json(json!({
-            "id": id,
+            "id": random_id,
             "object": "chat.completion",
             "created": now(),
             "model": model,
@@ -1221,6 +1724,73 @@ fn chat_completions(shared: &Shared, v: &Value) -> Handled<Reply> {
         })));
     }
 
+    // Every chat completion's id names the session its reply leaves
+    // (`docs/sessions.md` §3): its turn is reserved now and kept after the
+    // run. A prompt that is not the conversation (ids sent as ids, turns a
+    // budget dropped) leaves no turn.
+    let session = prompt
+        .as_ref()
+        .filter(|_| facts.dropped.messages == 0)
+        .map(|p| {
+            let carried = resolved.as_ref().map(|r| {
+                r.ids
+                    .iter()
+                    .zip(&prompt_ids)
+                    .take_while(|(a, b)| a == b)
+                    .count()
+            });
+            let mut sessions = shared.sessions.lock();
+            if let (Some(r), Some(_)) = (&resolved, ask.reset) {
+                sessions.reset(r.key);
+            }
+            let reservation = sessions.reserve(
+                super::sessions::Plan {
+                    continued: resolved.as_ref().map(|r| (r.key, r.turn)),
+                    store: ask.store,
+                    keep: ask.keep,
+                    auth,
+                    prompt_ids: &prompt_ids,
+                    scopes: &p.scopes,
+                },
+                at,
+            );
+            drop(sessions);
+            Box::new(SessionCtx {
+                reservation,
+                continued: resolved.as_ref().map(|r| Continued {
+                    resident: r.resident,
+                    carried: carried.unwrap_or(0),
+                }),
+                miss,
+                asked: ask.previous.is_some(),
+                input: ask.input.is_some(),
+                reset: ask.reset,
+                keep,
+                conversation: sent.and_then(Value::as_array).cloned().unwrap_or_default(),
+                scope: p.origin.scope,
+                record: p.record.clone(),
+                head: p.blocks.as_ref().map_or(0, |b| b.head),
+                bound: p.spliced.bound,
+                matched: p.spliced.matched,
+                recorded: p.recorded,
+                encoded: p.encoded,
+            })
+        });
+    if session.is_none() {
+        shared.sessions.lock().note_other();
+    }
+    // The session's head, pinned in the engine (`docs/sessions.md` §8): a
+    // conversation's turn whose head holds more than a BOS. `reset: prefix`
+    // releases the pin first, so the head is rebuilt and pinned again.
+    params.pin_prefix = session
+        .as_ref()
+        .filter(|s| s.keep == super::sessions::Keep::Prefix && s.head > 1)
+        .map(|s| s.head);
+    params.unpin_prefix = ask.reset == Some(Reset::Prefix);
+    let id = session
+        .as_ref()
+        .map_or(random_id, |s| s.reservation.id.encode());
+
     if stream {
         return Ok(Reply::Stream(Box::new(StreamingRun {
             kind: StreamKind::Chat,
@@ -1232,34 +1802,75 @@ fn chat_completions(shared: &Shared, v: &Value) -> Handled<Reply> {
             model,
             record: prompt.as_ref().map(|p| p.origin),
             return_ids,
+            reasoning_in_content,
+            session,
+            first: FirstToken::default(),
         })));
     }
+    let split =
+        reasoning::Reasoning::for_chat(shared.engine.as_ref(), &prompt_ids, reasoning_in_content)?
+            .map(|p| Arc::new(parking_lot::Mutex::new(p)));
+    let mut routed = serde_json::Map::<String, Value>::new();
     let started = Instant::now();
-    let decoded = run_decode(
+    let decoded = run_decode_observed(
         shared.engine.as_ref(),
         &prompt_ids,
         &images,
         &params,
-        &mut |_| true,
-    )?;
+        split.as_ref(),
+        &mut |text| {
+            if let Some(p) = &split {
+                append_fields(&mut routed, p.lock().push(text));
+            }
+            true
+        },
+    )
+    .inspect_err(|_| shared.sessions.lock().note_other())?;
+    if let Some(p) = &split {
+        append_fields(&mut routed, p.lock().finish());
+    }
     let elapsed = started.elapsed();
     let record_start = Instant::now();
-    let frontier = prompt.as_ref().map(|p| {
+    let logged = prompt.as_ref().map(|p| {
         shared
             .front
-            .record_frontier(shared.engine.as_ref(), p.origin, &decoded)
+            .record_reply(shared.engine.as_ref(), p.origin, &decoded)
     });
-    let record_us = frontier.map(|_| record_start.elapsed().as_micros() as u64);
+    let record_us = logged
+        .as_ref()
+        .map(|_| record_start.elapsed().as_micros() as u64);
+    let frontier = logged.as_ref().map(|(f, _)| *f);
     let recorded = frontier.is_some_and(|f| f.logged);
-    report(
+    let engine = shared.engine.as_ref();
+    let mut message = json!({"role": "assistant", "content": decoded.text});
+    if split.is_some() {
+        message["content"] = routed
+            .remove("content")
+            .unwrap_or(Value::String(String::new()));
+        if let Some(reasoning) = routed.remove("reasoning_content") {
+            message["reasoning_content"] = reasoning;
+        }
+    }
+    let (session_json, session_line) = match session {
+        Some(ctx) => finish_session(
+            shared,
+            *ctx,
+            &prompt_ids,
+            &decoded,
+            logged.and_then(|(_, r)| r),
+            message.clone(),
+        ),
+        None => (Value::Null, String::new()),
+    };
+    report_with(
         shared,
         "/v1/chat/completions",
         prompt_ids.len(),
         &facts,
         &decoded,
         ms(elapsed),
+        &session_line,
     );
-    let engine = shared.engine.as_ref();
     let mut body = json!({
         "id": id,
         "object": "chat.completion",
@@ -1267,14 +1878,15 @@ fn chat_completions(shared: &Shared, v: &Value) -> Handled<Reply> {
         "model": model,
         "choices": [{
             "index": 0,
-            "message": { "role": "assistant", "content": decoded.text },
+            "message": message,
             "logprobs": if want_logprobs { chat_logprobs(engine, &decoded)? } else { Value::Null },
             "finish_reason": finish_reason(decoded.stop),
         }],
-        "usage": usage(prompt_ids.len(), decoded.tokens.len()),
+        "usage": run_usage(shared.engine.as_ref(), prompt_ids.len(), &decoded),
         "timings": timings(shared.engine.as_ref(), prompt_ids.len(), &facts, &decoded, elapsed),
     });
     body["timings"]["logged"] = json!(recorded);
+    body["timings"]["session"] = session_json;
     // What of the reply is the accepted history (decision 42): the whole
     // ids its delivered text begins with, and the text past them.
     body["timings"]["frontier"] = frontier.map_or(Value::Null, |f| f.json());
@@ -1299,6 +1911,388 @@ fn chat_completions(shared: &Shared, v: &Value) -> Handled<Reply> {
     }
     attach_vision(shared, &mut body)?;
     Ok(Reply::Json(body))
+}
+
+// ---- sessions (`docs/sessions.md`) ------------------------------------------
+
+/// The routes a session is inspected and expired by.
+const SESSIONS_ROUTE: &str = "/v1l/sessions/";
+
+/// Why a session's `keep: all` is refused: the whole state kept across
+/// another conversation's requests is the swapped tier (`docs/sessions.md`
+/// §5.4, §12).
+const KEEP_ALL_REFUSED: &str = "not served by this build: the whole state kept across another \
+     conversation's requests is the swapped tier (docs/sessions.md §5.4, §12); `keep: prefix` \
+     and `keep: none` are";
+
+/// The harness's intent after a compaction (`docs/sessions.md` §5.5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Reset {
+    Cache,
+    Prefix,
+    All,
+}
+
+impl Reset {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Cache => "cache",
+            Self::Prefix => "prefix",
+            Self::All => "all",
+        }
+    }
+}
+
+/// A chat request's session fields, checked.
+struct SessionAsk {
+    previous: Option<String>,
+    /// The Responses API's delta: messages appended to the continued turn.
+    input: Option<Vec<Value>>,
+    store: Option<bool>,
+    keep: Option<super::sessions::Keep>,
+    reset: Option<Reset>,
+}
+
+fn session_ask(v: &Value) -> Handled<SessionAsk> {
+    let given = |k: &str| v.get(k).filter(|f| !f.is_null());
+    let previous = match given("previous_response_id") {
+        None => None,
+        Some(Value::String(s)) => Some(s.clone()),
+        Some(_) => return Err(bad("field 'previous_response_id' must be a string")),
+    };
+    let input = match given("input") {
+        None => None,
+        Some(Value::String(s)) => Some(vec![json!({ "role": "user", "content": s })]),
+        Some(Value::Array(a)) if !a.is_empty() && a.iter().all(Value::is_object) => Some(a.clone()),
+        Some(_) => {
+            return Err(bad(
+                "field 'input' must be a string or a non-empty array of messages",
+            ))
+        }
+    };
+    let store = match given("store") {
+        None => None,
+        Some(Value::Bool(b)) => Some(*b),
+        Some(_) => return Err(bad("field 'store' must be a boolean")),
+    };
+    let keep = match given("keep") {
+        None => None,
+        Some(Value::String(k)) if k == "none" => Some(super::sessions::Keep::None),
+        Some(Value::String(k)) if k == "prefix" => Some(super::sessions::Keep::Prefix),
+        Some(Value::String(k)) if k == "all" => {
+            return Err(bad(format!("keep: all: {KEEP_ALL_REFUSED}")))
+        }
+        Some(_) => return Err(bad("field 'keep' must be one of prefix, all, none")),
+    };
+    let reset = match given("reset") {
+        None => None,
+        Some(Value::String(r)) if r == "cache" => Some(Reset::Cache),
+        Some(Value::String(r)) if r == "prefix" => Some(Reset::Prefix),
+        Some(Value::String(r)) if r == "all" => Some(Reset::All),
+        Some(_) => return Err(bad("field 'reset' must be one of cache, prefix, all")),
+    };
+    if input.is_some() && previous.is_none() {
+        return Err(bad(
+            "field 'input' appends to a stored conversation: it needs previous_response_id",
+        ));
+    }
+    if input.is_some() && given("messages").is_some() {
+        return Err(bad(
+            "messages and input are two conversations; send messages (the whole history) or \
+             input (the new messages after previous_response_id)",
+        ));
+    }
+    if reset.is_some() && previous.is_none() {
+        return Err(bad(
+            "field 'reset' resets a session: it needs previous_response_id",
+        ));
+    }
+    if given("prompt_token_ids").is_some() && previous.is_some() {
+        return Err(bad(
+            "prompt_token_ids is the whole prompt; previous_response_id has nothing to continue",
+        ));
+    }
+    Ok(SessionAsk {
+        previous,
+        input,
+        store,
+        keep,
+        reset,
+    })
+}
+
+/// The `keep` a request runs under (`docs/sessions.md` §5.4): its own, else
+/// its session's latest, else the server's (`session.keep`). `prefix` where
+/// this process pins no head is a 400 when the request asked it, and
+/// resolves to `none` otherwise.
+fn resolve_keep(
+    engine: &dyn Served,
+    default: super::sessions::Keep,
+    asked: Option<super::sessions::Keep>,
+    session: Option<super::sessions::Keep>,
+) -> Handled<super::sessions::Keep> {
+    use super::sessions::Keep;
+    let refused = engine.prefix_pin_refused();
+    if let (Some(Keep::Prefix), Some(why)) = (asked, &refused) {
+        return Err(bad(format!("keep: prefix: {why}")));
+    }
+    let keep = asked.or(session).unwrap_or(default);
+    Ok(match (keep, refused) {
+        (Keep::Prefix, Some(_)) => Keep::None,
+        (k, _) => k,
+    })
+}
+
+/// The digest a session is bound to: the request's `Authorization` header,
+/// where it sends one (`docs/sessions.md` §9).
+fn auth_digest(headers: &[Header]) -> Option<[u8; 32]> {
+    use sha2::Digest;
+    headers
+        .iter()
+        .find(|h| h.field.equiv("Authorization"))
+        .map(|h| sha2::Sha256::digest(h.value.as_str().as_bytes()).into())
+}
+
+/// "no session holds this id", and why the server let it go where the id's
+/// holder may be told (`docs/sessions.md` §4).
+fn not_held(lost: super::sessions::Lost) -> String {
+    match lost.reason {
+        Some(r) => format!("no session holds this id (let go: {})", r.name()),
+        None => "no session holds this id".into(),
+    }
+}
+
+/// The session table's retention policy: the budget from the `session`
+/// group, the idle reclamation from `server.sessions`.
+fn session_config(
+    c: &crate::options::SessionConfig,
+    s: &crate::options::ServerSessionsConfig,
+    batch: usize,
+) -> super::sessions::Config {
+    super::sessions::Config {
+        idle: std::time::Duration::from_secs(s.idle_s as u64),
+        capacity: c.capacity,
+        ephemeral: batch.max(1),
+        max_bytes: c.max_mib.saturating_mul(1 << 20),
+        one_sequence: batch <= 1,
+        keep: match c.keep.as_str() {
+            "none" => super::sessions::Keep::None,
+            _ => super::sessions::Keep::Prefix,
+        },
+    }
+}
+
+/// A table for a test's `Shared`: one sequence, the defaults' bounds.
+#[cfg(test)]
+fn test_sessions() -> parking_lot::Mutex<super::sessions::Table> {
+    parking_lot::Mutex::new(super::sessions::Table::new(session_config(
+        &Default::default(),
+        &Default::default(),
+        1,
+    )))
+}
+
+/// The continued session as the request found it.
+struct Continued {
+    resident: Option<bool>,
+    /// Of the session's ids, those the request's prompt starts with.
+    carried: usize,
+}
+
+/// What a chat request's session report, and its turn's record, need after
+/// the run (`docs/sessions.md` §6).
+struct SessionCtx {
+    reservation: super::sessions::Reservation,
+    continued: Option<Continued>,
+    /// Why the named id found nothing.
+    miss: Option<super::sessions::Lost>,
+    /// The request named a `previous_response_id`.
+    asked: bool,
+    input: bool,
+    reset: Option<Reset>,
+    /// The `keep` the request ran under ([`resolve_keep`]).
+    keep: super::sessions::Keep,
+    /// The conversation as the request ran it (as sent).
+    conversation: Vec<Value>,
+    scope: front::Scope,
+    record: Option<front::PrefixRecord>,
+    /// The prompt's ids before the first message's span (the BOS, the
+    /// system turn, a tools preamble).
+    head: usize,
+    bound: usize,
+    matched: usize,
+    recorded: usize,
+    encoded: usize,
+}
+
+/// Keep the request's turn and report what its session did: the
+/// `timings.session` value and the request line's fields.
+fn finish_session(
+    shared: &Shared,
+    ctx: SessionCtx,
+    prompt_ids: &[u32],
+    decoded: &Decoded,
+    reply: Option<Arc<front::Reply>>,
+    reply_msg: Value,
+) -> (Value, String) {
+    let eot = shared
+        .front
+        .constants()
+        .and_then(|c| c.eot())
+        .map(|(id, _)| id)
+        .filter(|_| decoded.stop == Stop::Eos);
+    let id = ctx.reservation.id;
+    let kept = match reply {
+        Some(reply) => shared.sessions.lock().commit(
+            ctx.reservation,
+            super::sessions::Record {
+                messages: ctx.conversation,
+                reply_msg,
+                prompt_ids: prompt_ids.to_vec(),
+                reply,
+                eot,
+                scope: ctx.scope,
+                prefix: ctx.record,
+            },
+            Instant::now(),
+        ),
+        None => false,
+    };
+    if !kept {
+        shared.sessions.lock().note_other();
+    }
+    let reused = decoded.reused;
+    let reprefilled = ctx
+        .continued
+        .as_ref()
+        .map_or(0, |c| c.carried.saturating_sub(reused));
+    let state = match (&ctx.continued, ctx.asked) {
+        (_, false) => "new",
+        (None, true) => "expired",
+        (Some(c), true) => match c.resident {
+            Some(true) => "resident",
+            Some(false) => "evicted",
+            None if reprefilled == 0 => "resident",
+            None => "evicted",
+        },
+    };
+    let switches = match ctx.continued {
+        Some(_) => shared
+            .sessions
+            .lock()
+            .note_continued(id.key, state == "resident"),
+        None => 0,
+    };
+    let prefix = if ctx.head <= 1 {
+        "-"
+    } else if reused >= ctx.head {
+        "reused"
+    } else if state == "new" {
+        "built"
+    } else {
+        "rebuilt"
+    };
+    let history = if ctx.input {
+        "stored"
+    } else if ctx.bound > 0 || ctx.recorded > 0 {
+        "by-id"
+    } else if ctx.matched > 0 {
+        "matched"
+    } else {
+        "as-sent"
+    };
+    // Why the continued session is gone, where its id's holder may be told;
+    // a session's lifetime is the server's policy, never its own field.
+    let reason = ctx
+        .miss
+        .and_then(|l| l.reason)
+        .map(super::sessions::Reason::name);
+    let json = json!({
+        "id": kept.then(|| id.encode()),
+        "state": state,
+        "stored": ctx.reservation.stored,
+        "turn": id.turn,
+        "switches": switches,
+        "reprefilled_tokens": reprefilled,
+        "prefix": prefix,
+        "history": history,
+        "bound": ctx.bound,
+        "recorded_tokens": ctx.recorded,
+        "tokenized": ctx.encoded,
+        "keep": ctx.keep.name(),
+        "pin": decoded.pin.name(),
+        "pinned": decoded.pin.after,
+        "reset": ctx.reset.map(Reset::name),
+        "reason": reason,
+    });
+    let line = format!(
+        "session={state} session_id={} session_kept={kept} session_history={history} \
+         session_prefix={prefix} session_keep={} session_pin={} pinned={} \
+         reprefilled={reprefilled} recorded={} tokenized={}{}",
+        id.short(),
+        ctx.keep.name(),
+        decoded.pin.name(),
+        decoded
+            .pin
+            .after
+            .map_or_else(|| "-".to_string(), |p| p.to_string()),
+        ctx.recorded,
+        ctx.encoded,
+        ctx.miss.map_or(String::new(), |l| format!(
+            " session_miss={} session_reason={}",
+            l.miss.name(),
+            reason.unwrap_or("-")
+        )),
+    );
+    (json, line)
+}
+
+/// `GET /v1l/features`: what this process serves of lloom's extensions to
+/// the OpenAI surface, so a client can ask instead of probing
+/// (`docs/sessions.md` §6).
+fn features_body(shared: &Shared) -> Value {
+    let cfg = shared.sessions.lock().config();
+    let engine = shared.engine.as_ref();
+    json!({
+        "object": "lloom.features",
+        "version": 1,
+        "sessions": {
+            "doc": "docs/sessions.md",
+            "id": "chatcmpl-<40 hex: slot, gen, turn, nonce>; every chat completion's names the session its reply left",
+            "previous_response_id": {
+                "messages": "the whole conversation; the session's replies are bound by the conversation before them",
+                "input": "the new messages, appended to the referenced turn's conversation; 404 when no session holds the id",
+            },
+            "store": { "default": false, "true": "held until the server reclaims it (idle, capacity, memory) or a client lets it go (reset, DELETE)", "false": "held while the engine holds its state" },
+            "keep": {
+                "default": match (cfg.keep, engine.prefix_pin_refused()) {
+                    (super::sessions::Keep::Prefix, None) => "prefix",
+                    _ => "none",
+                },
+                "none": true,
+                "prefix": engine.prefix_pin_refused().map_or(json!(true), |why| json!(why)),
+                "all": KEEP_ALL_REFUSED,
+            },
+            "reset": ["cache", "prefix", "all"],
+            "idle_s": cfg.idle.as_secs(),
+            "capacity": cfg.capacity,
+            "max_bytes": cfg.max_bytes,
+            "reclaim": "lru by last use",
+            "reasons": super::sessions::Reason::ALL.map(super::sessions::Reason::name),
+            "binding": "the SHA-256 of the Authorization header, when a request sends one",
+            "routes": ["GET /v1l/sessions/{id}", "DELETE /v1l/sessions/{id}"],
+            "reported": "timings.session; /health sessions",
+        },
+        "chat": {
+            "reasoning_content": engine.think_tags().is_some(),
+            "reasoning_in_content": true,
+            "prompt_token_ids": true,
+            "return_token_ids": true,
+            "thinking_token_budget": engine.thinking_budget_refused().is_none(),
+            "truncate_prompt_tokens": true,
+            "logprobs": logprobs_capability(engine),
+        },
+    })
 }
 
 /// The ids a request sent in place of a prompt (`prompt_token_ids`, the
@@ -1448,28 +2442,32 @@ fn request_budgets(shared: &Shared, v: &Value, max_tokens: usize) -> Handled<Bud
 }
 
 /// The sampling knobs both OpenAI endpoints share.
-fn sampling_params(shared: &Shared, v: &Value) -> Handled<DecodeParams> {
+fn sampling_params(
+    defaults: &crate::SamplingConfig,
+    engine: &dyn Served,
+    v: &Value,
+) -> Handled<DecodeParams> {
     let max_tokens = v
         .get("max_completion_tokens")
         .or_else(|| v.get("max_tokens"))
         .and_then(Value::as_u64)
         .map(|n| n as usize)
-        .unwrap_or(shared.sampling.max_tokens);
+        .unwrap_or(defaults.max_tokens);
     if max_tokens == 0 {
         return Err(bad("max_tokens must be positive"));
     }
     let temperature = match v.get("temperature") {
-        None | Some(Value::Null) => shared.sampling.temperature,
+        None | Some(Value::Null) => defaults.temperature,
         Some(t) => Some(
             t.as_f64()
                 .ok_or_else(|| bad("field 'temperature' must be a number"))?,
         ),
     };
     let top_k = match v.get("top_k") {
-        None | Some(Value::Null) => shared.sampling.top_k,
+        None | Some(Value::Null) => defaults.top_k,
         Some(k) => Some(
             k.as_u64()
-                .ok_or_else(|| bad("field 'top_k' must be a positive integer"))?
+                .ok_or_else(|| bad("field 'top_k' must be a non-negative integer (0 is off)"))?
                 as usize,
         ),
     };
@@ -1498,30 +2496,34 @@ fn sampling_params(shared: &Shared, v: &Value) -> Handled<DecodeParams> {
         }
         (Some(m), _) => m,
         (None, Some(g)) => g,
-        (None, None) => shared.sampling.gumbel,
+        (None, None) => defaults.gumbel,
     };
     let top_p = match v.get("top_p") {
-        None | Some(Value::Null) => shared.sampling.top_p,
+        None | Some(Value::Null) => defaults.top_p,
         Some(p) => {
             let p = p
                 .as_f64()
                 .ok_or_else(|| bad("field 'top_p' must be a number"))?;
-            // `1.0` is the OpenAI default and means no nucleus.
-            (p > 0.0 && p < 1.0).then_some(p)
+            Some(p)
         }
     };
+    DecodeParams::sampling_of(temperature, top_p, top_k, gumbel)
+        .map_err(|e| bad(e.without_backtrace().to_string()))?;
     // A sampled request with no seed draws a fresh one, so repeats are
-    // independent; a seeded one reproduces.
-    let seed = v
-        .get("seed")
-        .and_then(Value::as_u64)
-        .unwrap_or_else(|| shared.sampling.seed_or_random());
+    // independent; a seeded one reproduces, and a seed that is not one is
+    // refused rather than replaced by a fresh draw.
+    let seed = match v.get("seed") {
+        None | Some(Value::Null) => defaults.seed_or_random(),
+        Some(s) => s
+            .as_u64()
+            .ok_or_else(|| bad("field 'seed' must be a non-negative integer"))?,
+    };
     let ignore_eos = v
         .get("ignore_eos")
         .and_then(Value::as_bool)
-        .unwrap_or(shared.sampling.ignore_eos);
+        .unwrap_or(defaults.ignore_eos);
     let stop_strings: Vec<String> = match v.get("stop") {
-        None | Some(Value::Null) => shared.sampling.stop.clone(),
+        None | Some(Value::Null) => defaults.stop.clone(),
         Some(Value::String(s)) => vec![s.clone()],
         Some(Value::Array(items)) => items
             .iter()
@@ -1547,9 +2549,8 @@ fn sampling_params(shared: &Shared, v: &Value) -> Handled<DecodeParams> {
             return Err(bad(format!("field '{key}' is not supported")));
         }
     }
-    let processors = request_processors(&shared.sampling, v)?;
+    let processors = request_processors(defaults, v)?;
     let (eos_ids, readback) = {
-        let engine = shared.engine.as_ref();
         let eos = if ignore_eos {
             NEVER_EOS.to_vec()
         } else {
@@ -1569,9 +2570,11 @@ fn sampling_params(shared: &Shared, v: &Value) -> Handled<DecodeParams> {
         stop_strings,
         readback,
         logits_digest: false,
-        prefill_tile: shared.engine.prefill_tile(),
+        prefill_tile: engine.prefill_tile(),
         turn_tail: 0,
         no_checkpoint: false,
+        pin_prefix: None,
+        unpin_prefix: false,
         thinking: None,
         logprobs: None,
         cold: false,
@@ -1636,31 +2639,81 @@ fn request_processors(
 /// arrive: chunked transfer through the request's raw writer, so a token is on
 /// the wire when the loop's commit drains it.
 fn stream_response(shared: &Shared, request: Request, run: StreamingRun) -> Result<()> {
+    stream_response_with_writer(shared, run, || {
+        ChunkedWriter::start(request, "text/event-stream")
+    })
+}
+
+// The HTTP caller and deterministic I/O-failure controls use the same decode,
+// parser finalization, frontier recording and trailer path. Delay opening the
+// writer until the fallible reasoning metadata has been checked.
+fn stream_response_with_writer(
+    shared: &Shared,
+    run: StreamingRun,
+    start_writer: impl FnOnce() -> Result<ChunkedWriter>,
+) -> Result<()> {
     let endpoint = match run.kind {
         StreamKind::Completion => "/v1/completions",
         StreamKind::Chat => "/v1/chat/completions",
     };
     let created = now();
+    let split = match run.kind {
+        StreamKind::Chat => reasoning::Reasoning::for_chat(
+            shared.engine.as_ref(),
+            &run.prompt_ids,
+            run.reasoning_in_content,
+        )?,
+        StreamKind::Completion => None,
+    }
+    .map(|p| Arc::new(parking_lot::Mutex::new(p)));
+    // The reply as the client receives it: a session's turn keeps it.
+    let delivered = Arc::new(parking_lot::Mutex::new(
+        serde_json::Map::<String, Value>::new(),
+    ));
     // Each drained batch of text becomes one chunk, wrapped on the writer's
-    // thread (`StreamWriter::start_with_deltas`).
+    // thread (the counted adapter defers unresolved reasoning prefixes).
     let wrap = {
         let (id, model, kind) = (run.id.clone(), run.model.clone(), run.kind);
-        move |text: &str| -> String {
-            let chunk = match kind {
-                StreamKind::Completion => json!({
-                    "id": id, "object": "text_completion", "created": created, "model": model,
-                    "choices": [{ "index": 0, "text": text, "logprobs": null, "finish_reason": null }],
-                }),
-                StreamKind::Chat => json!({
-                    "id": id, "object": "chat.completion.chunk", "created": created, "model": model,
-                    "choices": [{ "index": 0, "delta": { "content": text }, "finish_reason": null }],
-                }),
+        let split = split.clone();
+        let delivered = Arc::clone(&delivered);
+        move |text: &str| -> (String, usize) {
+            let (chunk, resolved) = match kind {
+                StreamKind::Completion => (
+                    json!({
+                        "id": id, "object": "text_completion", "created": created, "model": model,
+                        "choices": [{ "index": 0, "text": text, "logprobs": null, "finish_reason": null }],
+                    }),
+                    text.len(),
+                ),
+                StreamKind::Chat => {
+                    let (delta, resolved) = match &split {
+                        Some(p) => p.lock().push_counted(text),
+                        None => (
+                            serde_json::Map::from_iter([("content".into(), json!(text))]),
+                            text.len(),
+                        ),
+                    };
+                    append_fields(&mut delivered.lock(), delta.clone());
+                    (
+                        json!({
+                            "id": id, "object": "chat.completion.chunk", "created": created, "model": model,
+                            "choices": [{ "index": 0, "delta": delta, "finish_reason": null }],
+                        }),
+                        resolved,
+                    )
+                }
             };
-            format!("data: {chunk}\n\n")
+            (format!("data: {chunk}\n\n"), resolved)
         }
     };
-    let sw =
-        StreamWriter::start_with_deltas(ChunkedWriter::start(request, "text/event-stream")?, wrap);
+    let mut first = run.first;
+    let writer = start_writer()?;
+    first.headers = uptime_ns();
+    let sw = if split.is_some() {
+        StreamWriter::start_with_counted_deltas(writer, wrap)
+    } else {
+        StreamWriter::start_with_deltas(writer, move |text| wrap(text).0)
+    };
     if let StreamKind::Chat = run.kind {
         sw.event(&json!({
             "id": run.id, "object": "chat.completion.chunk", "created": created,
@@ -1669,19 +2722,25 @@ fn stream_response(shared: &Shared, request: Request, run: StreamingRun) -> Resu
         }));
     }
     let started = Instant::now();
+    first.decode = uptime_ns();
     let decoded = {
         let engine = shared.engine.as_ref();
+        let fragment = &mut first.fragment;
         // The callback runs on the decode thread: it hands the text over;
         // the chunk is built and written on the writer thread. A client that
         // went away stops the run at the next drained batch.
-        run_decode(
+        run_decode_observed(
             engine,
             &run.prompt_ids,
             &run.images,
             &run.params,
+            split.as_ref(),
             &mut |frag| {
                 if sw.client_gone() {
                     return false;
+                }
+                if *fragment == 0 {
+                    *fragment = uptime_ns();
                 }
                 sw.delta(frag);
                 true
@@ -1689,39 +2748,94 @@ fn stream_response(shared: &Shared, request: Request, run: StreamingRun) -> Resu
         )
     };
     let written = sw.written();
-    let (w, write_err) = sw.finish()?;
+    let first_write = sw.first_write();
+    let (mut w, mut write_err) = sw.finish()?;
+    first.written = first_write.load(Ordering::Acquire);
     let decoded = match decoded {
         Ok(decoded) => decoded,
-        Err(error) => return finish_stream_error(w, error),
+        Err(error) => {
+            shared.sessions.lock().note_other();
+            return finish_stream_error(w, error);
+        }
     };
+    if write_err.is_none() {
+        if let Some(p) = split {
+            let (delta, resolved) = p.lock().finish_counted();
+            append_fields(&mut delivered.lock(), delta.clone());
+            if !delta.is_empty() {
+                match w.event(&json!({
+                    "id": run.id, "object": "chat.completion.chunk", "created": created, "model": run.model,
+                    "choices": [{"index": 0, "delta": delta, "finish_reason": null}],
+                })) {
+                    Ok(()) => {
+                        written.fetch_add(resolved, Ordering::Relaxed);
+                    }
+                    Err(error) => {
+                        write_err = Some(error);
+                    }
+                }
+            }
+        }
+    }
     // The accepted history is what the server handed the writer; of that,
     // what it knows it wrote, and whether a write failed (what the client
     // received is not known either way).
     let record_start = Instant::now();
-    let frontier = run.record.map(|origin| {
+    let logged = run.record.map(|origin| {
         shared
             .front
-            .record_frontier(shared.engine.as_ref(), origin, &decoded)
+            .record_reply(shared.engine.as_ref(), origin, &decoded)
     });
-    let record_us = frontier.map(|_| record_start.elapsed().as_micros() as u64);
+    let record_us = logged
+        .as_ref()
+        .map(|_| record_start.elapsed().as_micros() as u64);
+    let frontier = logged.as_ref().map(|(f, _)| *f);
     let mut frontier_json = frontier.map_or(Value::Null, |f| f.json());
     if frontier_json.is_object() {
         frontier_json["written_bytes"] = json!(written.load(Ordering::Relaxed));
         frontier_json["write_failed"] = json!(write_err.is_some());
     }
+    // The turn is kept whether or not the client stayed: the server's state
+    // is what it accepted (the frontier), not what a client acknowledged.
+    let (session_json, session_line) = match run.session {
+        Some(ctx) => {
+            let mut message = Value::Object(std::mem::take(&mut *delivered.lock()));
+            message["role"] = json!("assistant");
+            if message.get("content").is_none() {
+                message["content"] = json!("");
+            }
+            finish_session(
+                shared,
+                *ctx,
+                &run.prompt_ids,
+                &decoded,
+                logged.and_then(|(_, r)| r),
+                message,
+            )
+        }
+        None => (Value::Null, String::new()),
+    };
     if let Some(e) = write_err {
         anyhow::bail!("client went away mid-stream: {e}; frontier {frontier_json}");
     }
     let elapsed = started.elapsed();
-    report(
+    let session_line = if session_line.is_empty() {
+        first.field()
+    } else {
+        format!("{session_line} {}", first.field())
+    };
+    report_with(
         shared,
         endpoint,
         run.prompt_ids.len(),
         &run.facts,
         &decoded,
         ms(elapsed),
+        &session_line,
     );
-    let usage = usage(run.prompt_ids.len(), decoded.tokens.len());
+    #[cfg(feature = "metal")]
+    first_token_gpu(endpoint, &first);
+    let usage = run_usage(shared.engine.as_ref(), run.prompt_ids.len(), &decoded);
     let last = match run.kind {
         StreamKind::Completion => json!({
             "id": run.id, "object": "text_completion", "created": created, "model": run.model,
@@ -1739,7 +2853,11 @@ fn stream_response(shared: &Shared, request: Request, run: StreamingRun) -> Resu
     };
     let mut last = last;
     last["timings"]["frontier"] = frontier_json;
+    if !session_json.is_null() {
+        last["timings"]["session"] = session_json;
+    }
     last["timings"]["front_record_us"] = json!(record_us);
+    last["timings"]["first_token"] = first.json(&decoded.stats);
     if run.return_ids {
         last["prompt_token_ids"] = json!(run.prompt_ids);
         last["choices"][0]["token_ids"] = json!(decoded.tokens);
@@ -1864,22 +2982,7 @@ fn decode_throughput(shared: &Shared, v: &Value) -> Handled<Value> {
         } else {
             t.row_rounds.iter().copied().max().unwrap_or(1).max(1) as f64
         };
-        eprintln!(
-            "[/decode_throughput profile: gpu_busy {:.2} ms over the bracket ({:.3} ms per step/round of {steps:.0}), span {:.2} ms, {} dispatches ({:.1} per step), {} command buffers, {} encoders; top kernels: {}]",
-            p.gpu_busy_ms,
-            p.gpu_busy_ms / steps,
-            p.gpu_span_ms,
-            p.dispatches,
-            p.dispatches as f64 / steps,
-            p.command_buffers,
-            p.encoders,
-            p.by_label
-                .iter()
-                .take(12)
-                .map(|(k, n)| format!("{k}={n}"))
-                .collect::<Vec<_>>()
-                .join(" ")
-        );
+        eprintln!("[/decode_throughput profile: {}]", p.summary(steps));
     }
     if !t.row_rounds.is_empty() {
         // The round's phases, per round, on the row that ran the most rounds
@@ -2201,6 +3304,8 @@ fn eval(shared: &Shared, request: Request, v: &Value) -> Result<()> {
                             prefill_tile: engine.prefill_tile(),
                             turn_tail: 0,
                             no_checkpoint: false,
+                            pin_prefix: None,
+                            unpin_prefix: false,
                             thinking: None,
                             logprobs: None,
                             cold: false,
@@ -2404,7 +3509,9 @@ impl ChunkedWriter {
 /// **The per-token text does not go through the channel** when the writer
 /// is started with [`Self::start_with_deltas`]: a `send` to the parked writer
 /// is a wake — a syscall — per fragment, and the payload a `format!` and a
-/// `json!` built on the decode thread. The decode thread appends the bare
+/// `json!` built on the decode thread. Only the run's first fragment wakes
+/// the writer (an empty payload), so the first token is not held for a
+/// drain period. The decode thread appends the bare
 /// text to a [`DeltaBuffer`] instead (`sink.rs`: no wait, no syscall, no
 /// allocation once grown), and this thread takes what accumulated every
 /// [`DRAIN_PERIOD`] and wraps it in one event — a delta of several tokens,
@@ -2412,20 +3519,30 @@ impl ChunkedWriter {
 struct StreamWriter {
     tx: Option<std::sync::mpsc::Sender<(String, usize)>>,
     gone: Arc<AtomicBool>,
-    /// Bytes of handed-over text whose events the writer thread wrote
-    /// without an error (`Self::written`): what the server knows it wrote,
-    /// never what a client received.
+    /// Raw text bytes resolved by successfully written events. A routing
+    /// wrapper can defer credit for held marker prefixes until a later event;
+    /// deliberately consumed complete markers still count as raw text.
+    /// Never a claim about what a client received or JSON/wire byte length.
     written: Arc<AtomicUsize>,
+    /// When the first event carrying text finished writing (`uptime_ns`, 0
+    /// until then).
+    first_write: Arc<AtomicU64>,
     thread: Option<std::thread::JoinHandle<(ChunkedWriter, Option<std::io::Error>)>>,
     deltas: Option<Arc<DeltaBuffer>>,
     /// The deltas' wire wrapping, shared with the thread: [`Self::send`]
     /// wraps what is pending itself so a control event keeps its place.
     wrap: Option<Wrap>,
+    /// Off-token ordering only: extraction, stateful wrapping and enqueue.
+    /// Never held during socket I/O or acquired by `delta`.
+    order: Arc<parking_lot::Mutex<()>>,
     /// The producer's spill (`DeltaBuffer::push`); only the producer locks it.
     spill: parking_lot::Mutex<String>,
+    /// Set by the first delta, which wakes the writer rather than waiting
+    /// for its next drain: one wake a request, none a token.
+    woke: AtomicBool,
 }
 
-type Wrap = Arc<dyn Fn(&str) -> String + Send + Sync>;
+type Wrap = Arc<dyn Fn(&str) -> (String, usize) + Send + Sync>;
 
 impl StreamWriter {
     fn start(w: ChunkedWriter) -> Self {
@@ -2439,6 +3556,16 @@ impl StreamWriter {
         w: ChunkedWriter,
         wrap: impl Fn(&str) -> String + Send + Sync + 'static,
     ) -> Self {
+        Self::start_with_counted_deltas(w, move |text| (wrap(text), text.len()))
+    }
+
+    /// A routing wrapper reports raw bytes resolved by this event, which can
+    /// include a prefix held from an earlier batch. Credit follows successful
+    /// I/O, not parser mutation; a failed event resolves no written bytes.
+    fn start_with_counted_deltas(
+        w: ChunkedWriter,
+        wrap: impl Fn(&str) -> (String, usize) + Send + Sync + 'static,
+    ) -> Self {
         Self::spawn(w, Some(Arc::new(wrap)))
     }
 
@@ -2448,9 +3575,13 @@ impl StreamWriter {
         let flag = Arc::clone(&gone);
         let written = Arc::new(AtomicUsize::new(0));
         let wrote = Arc::clone(&written);
+        let first_write = Arc::new(AtomicU64::new(0));
+        let first_wrote = Arc::clone(&first_write);
         let deltas = wrap.as_ref().map(|_| DeltaBuffer::new());
         let buf = deltas.clone();
         let thread_wrap = wrap.clone();
+        let order = Arc::new(parking_lot::Mutex::new(()));
+        let thread_order = Arc::clone(&order);
         let thread = std::thread::spawn(move || {
             let mut err: Option<std::io::Error> = None;
             let mut local = String::with_capacity(4096);
@@ -2464,19 +3595,13 @@ impl StreamWriter {
                 match w.raw(payload) {
                     Ok(()) => {
                         wrote.fetch_add(text, Ordering::Relaxed);
+                        if text > 0 && first_wrote.load(Ordering::Relaxed) == 0 {
+                            first_wrote.store(uptime_ns(), Ordering::Release);
+                        }
                     }
                     Err(e) => {
                         flag.store(true, Ordering::Release);
                         *err = Some(e);
-                    }
-                }
-            };
-            // The text that accumulated, as one event. (Text pushed before a
-            // control event reaches the channel ahead of it: `send` takes it.)
-            let mut drain = |w: &mut ChunkedWriter, err: &mut Option<std::io::Error>| {
-                if let (Some(b), Some(wrap)) = (&buf, &thread_wrap) {
-                    if b.take_into(&mut local) {
-                        write(w, &wrap(&local), local.len(), err);
                     }
                 }
             };
@@ -2487,13 +3612,34 @@ impl StreamWriter {
                     rx.recv()
                         .map_err(|_| std::sync::mpsc::RecvTimeoutError::Disconnected)
                 };
-                match next {
-                    Ok((payload, text)) => write(&mut w, &payload, text, &mut err),
-                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => drain(&mut w, &mut err),
-                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                        drain(&mut w, &mut err);
-                        break;
+                let (work, closed) = match next {
+                    // An empty payload is the first delta's wake: take what
+                    // accumulated now, as a drain would.
+                    Ok((payload, _)) if payload.is_empty() && buf.is_some() => {
+                        Self::pending_after_timeout(
+                            &rx,
+                            buf.as_ref(),
+                            thread_wrap.as_ref(),
+                            &thread_order,
+                            &mut local,
+                        )
                     }
+                    Ok(work) => (Some(work), false),
+                    Err(_) => Self::pending_after_timeout(
+                        &rx,
+                        buf.as_ref(),
+                        thread_wrap.as_ref(),
+                        &thread_order,
+                        &mut local,
+                    ),
+                };
+                // Selection/wrapping is finished. The sole writer performs
+                // network I/O without the off-token ordering guard.
+                if let Some((payload, resolved)) = work {
+                    write(&mut w, &payload, resolved, &mut err);
+                }
+                if closed {
+                    break;
                 }
             }
             (w, err)
@@ -2502,29 +3648,64 @@ impl StreamWriter {
             tx: Some(tx),
             gone,
             written,
+            first_write,
             thread: Some(thread),
             deltas,
             wrap,
+            order,
             spill: parking_lot::Mutex::new(String::new()),
+            woke: AtomicBool::new(false),
         }
     }
 
+    /// A timeout is not a claim that the channel is still empty. Under the
+    /// same off-token guard used by send, prefer an already queued event over
+    /// bytes appended after that event; then select/wrap at most one batch.
+    /// The guard is dropped before the caller performs any network I/O.
+    fn pending_after_timeout(
+        rx: &std::sync::mpsc::Receiver<(String, usize)>,
+        buf: Option<&Arc<DeltaBuffer>>,
+        wrap: Option<&Wrap>,
+        order: &parking_lot::Mutex<()>,
+        local: &mut String,
+    ) -> (Option<(String, usize)>, bool) {
+        let _guard = order.lock();
+        let closed = match rx.try_recv() {
+            Ok(work) => return (Some(work), false),
+            Err(std::sync::mpsc::TryRecvError::Empty) => false,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => true,
+        };
+        let work = match (buf, wrap) {
+            (Some(buf), Some(wrap)) if buf.take_into(local) => Some(wrap(local)),
+            _ => None,
+        };
+        (work, closed)
+    }
+
     /// Hand text to the writer (the decode thread's per-fragment call on a
-    /// writer started with deltas): no wait, no syscall, no allocation.
+    /// writer started with deltas): no wait, no allocation, and no syscall
+    /// but the first fragment's, which wakes the writer so the first token
+    /// does not wait for a drain period.
     fn delta(&self, text: &str) {
         if let Some(b) = &self.deltas {
             b.push(&mut self.spill.lock(), text);
+            if !self.woke.swap(true, Ordering::Relaxed) {
+                if let Some(tx) = &self.tx {
+                    let _ = tx.send((String::new(), 0));
+                }
+            }
         }
     }
 
     /// Everything handed over so far, wrapped, queued ahead of what comes
-    /// next on the channel. Off the per-token path (a control event).
+    /// next on the channel. Caller `send` holds `order` through both enqueues.
+    /// Off the per-token path (a control event).
     fn queue_pending(&self) {
         if let (Some(b), Some(wrap), Some(tx)) = (&self.deltas, &self.wrap, &self.tx) {
             b.flush(&mut self.spill.lock());
             let mut text = String::new();
             if b.take_into(&mut text) {
-                let _ = tx.send((wrap(&text), text.len()));
+                let _ = tx.send(wrap(&text));
             }
         }
     }
@@ -2540,6 +3721,7 @@ impl StreamWriter {
     }
 
     fn send(&self, payload: String) {
+        let _guard = self.order.lock();
         self.queue_pending();
         if let Some(tx) = &self.tx {
             // A closed receiver means the thread is gone, which `gone` reports.
@@ -2547,10 +3729,16 @@ impl StreamWriter {
         }
     }
 
-    /// The bytes of handed-over text written so far; final once
-    /// [`Self::finish`] has joined the thread.
+    /// Raw resolved bytes written so far. Joining [`Self::finish`] settles
+    /// queued events; a caller's explicit final routing flush credits this
+    /// same counter only after its own successful write.
     fn written(&self) -> Arc<AtomicUsize> {
         Arc::clone(&self.written)
+    }
+
+    /// When the first event carrying text was written ([`FirstToken::written`]).
+    fn first_write(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.first_write)
     }
 
     /// The client stopped reading: a write failed on the writer thread.
@@ -2630,6 +3818,17 @@ fn usage(prompt: usize, completion: usize) -> Value {
     })
 }
 
+/// `usage` for a run: `completion_tokens` is the tokens of the completion the
+/// client received — the accepted frontier (decision 51 Q4, the standard
+/// semantics), which is what [`delivered_ids`] already computes for the
+/// logprobs block. The count the run generated stays in `timings`
+/// (`timings.tokens`, `timings.frontier.generated`): past a stop string on the
+/// adaptive commit with a slow consumer the two differ by up to the backlog,
+/// and those ids are text the client never received.
+fn run_usage(engine: &dyn Served, prompt: usize, d: &Decoded) -> Value {
+    usage(prompt, delivered_ids(engine, d))
+}
+
 /// The engine's own brackets beside the request's wall clock: the prompt's
 /// submit time, the per-step host clock and the arm that ran. `predicted_ms`
 /// is the sum of the loop's steps — the decode window, prefill excluded.
@@ -2658,6 +3857,7 @@ fn timings(
         "predicted_per_second": if predicted_ms > 0.0 { n as f64 / (predicted_ms / 1e3) } else { 0.0 },
         "total_ms": ms(elapsed),
         "readback": d.readback.name(),
+        "sampling": d.sampling.name(),
         "reuse": format!("{:?}", d.reuse),
         "prefilled": d.prefilled,
         "commits": st.commits,
@@ -2672,7 +3872,7 @@ fn timings(
         "host_fill": super::common::host_fill_name(st.host_feed.as_ref()),
         "prompt_ids_sha256": facts.ids_sha256,
         // The template's variable as the prompt reflects it; null for its
-        // default (a value the template would not act on is a 400).
+        // default. Neutral values can be ignored when the template has no control.
         "reasoning_effort": facts.reasoning_effort,
         // Whether the prompt leaves a thinking block open, and who decided:
         // the template (its switch or its own behaviour) or the engine,
@@ -2713,10 +3913,24 @@ fn timings(
     // given to the template as that reasoning.
     t["history_open_reasoning"] = json!(facts.spliced.open);
     t["history_open_apart"] = json!(facts.spliced.open_apart);
+    // Why the blocking arm ran where a ring was asked by name (C2).
+    t["readback_note"] = json!(d.readback_note);
     // The turn checkpoint this request's prefill was asked to leave.
     t["checkpoint"] = json!(d.checkpoint_name());
     t["front_prompt_us"] = json!(facts.front_us);
     t
+}
+
+/// The request line's steady rate: one over the median step. The per-step
+/// clock is the `profile` build's (`nn::decode`), so a build without it has no
+/// steps to take a median of and says so rather than printing a measured zero.
+fn steady_rate_field(step_ns: &[u64]) -> String {
+    let mut steps = step_ns.to_vec();
+    steps.sort_unstable();
+    match steps.get(steps.len() / 2) {
+        Some(&median) => format!("{:.1} tok/s steady (median step)", 1e9 / median as f64),
+        None => "steady rate unavailable (per-step clock not in this build)".to_string(),
+    }
 }
 
 fn report(
@@ -2727,27 +3941,72 @@ fn report(
     d: &Decoded,
     total_ms: f64,
 ) {
+    report_with(shared, endpoint, prompt, facts, d, total_ms, "");
+}
+
+/// [`report`], the request line carrying `extra` (a chat request's session
+/// fields) at its end.
+fn report_with(
+    shared: &Shared,
+    endpoint: &str,
+    prompt: usize,
+    facts: &PromptFacts,
+    d: &Decoded,
+    total_ms: f64,
+    extra: &str,
+) {
     let policy = shared.engine.reuse_prefix();
     let turn = d.turn.with_policy(policy);
     shared.reuse.lock().note(&turn);
     let st = &d.stats;
-    let mut steps: Vec<u64> = st.step_ns.clone();
-    steps.sort_unstable();
-    let steady = if steps.is_empty() {
-        0.0
+    let steady = steady_rate_field(&st.step_ns);
+    // The decode rows' arm, where it is on: its engagement since the load.
+    let decode_rows = match d.readback {
+        crate::ReadbackArm::Batched { .. }
+            if lloom_tensor::tuning::f16_rows_decode()
+                && lloom_tensor::tuning::f16_rows_max().is_some() =>
+        {
+            format!(
+                " f16_rows_decode_launches={}",
+                lloom_tensor::tuning::f16_rows_decode_launches()
+            )
+        }
+        // A speculative request's verify windows on the row axis: the
+        // window's engagement since the load.
+        crate::ReadbackArm::Speculative { .. }
+            if lloom_tensor::tuning::contract().is_fast()
+                && lloom_tensor::tuning::f16_rows_max().is_some() =>
+        {
+            format!(
+                " f16_rows_launches={}",
+                lloom_tensor::tuning::f16_rows_launches()
+            )
+        }
+        _ => String::new(),
+    };
+    // The row axis's capacity rounding, where it is on: its engagement since
+    // the load.
+    let decode_rows = if lloom_tensor::tuning::f16_rows_round()
+        && lloom_tensor::tuning::f16_rows_max().is_some()
+    {
+        format!(
+            "{decode_rows} f16_rows_rounded_launches={}",
+            lloom_tensor::tuning::f16_rows_rounded_launches()
+        )
     } else {
-        1e9 / steps[steps.len() / 2] as f64
+        decode_rows
     };
     eprintln!(
         "[{endpoint}: prompt_tokens={prompt} completion_tokens={} stop={:?} total {total_ms:.1} ms, \
-         {steady:.1} tok/s steady (median step), readback={} reuse={:?} prefilled={} \
+         {steady}, readback={} sampling={} reuse={:?} prefilled={} \
          commits={} poll_fallbacks={} overrun={} eos_gate={} host_fill={} prompt_ids_sha256={} \
          reasoning_effort={} think={} think_by={} thinking_budget={} thought={} budget_fired={} \
          prompt_budget={} prompt_dropped={} reused={} renders={} history={}/{} spliced={}/{} \
-         unverified={} ambiguous={} declined={} reuse_policy={} {} checkpoint={}]",
+         unverified={} ambiguous={} declined={} reuse_policy={} {} checkpoint={}{}{extra}{decode_rows}]",
         d.tokens.len(),
         d.stop,
         d.readback.name(),
+        d.sampling.name(),
         d.reuse,
         d.prefilled,
         st.commits,
@@ -2782,7 +4041,11 @@ fn report(
         crate::turn::policy_name(policy),
         turn.fields(),
         d.checkpoint_name(),
+        if extra.is_empty() { "" } else { " " },
     );
+    if let Some(note) = &d.readback_note {
+        eprintln!("[{endpoint}: warning: {note}]");
+    }
 }
 
 /// What a request's prompt was: the digest of its ids (`lloom chat`'s
@@ -2939,6 +4202,19 @@ fn logprobs_line(engine: &dyn Served) -> String {
     }
 }
 
+/// The server's default sampling as resolved: what a request naming no
+/// sampling field draws with, and where its unset fields came from.
+fn sampling_json(defaults: &crate::SamplingConfig) -> Value {
+    json!({
+        "defaults_from": defaults.defaults,
+        "resolved": defaults.sampling().map(|s| s.name()).unwrap_or_else(|e| e),
+        "temperature": defaults.temperature,
+        "top_k": defaults.top_k,
+        "top_p": defaults.top_p,
+        "method": if defaults.gumbel { "gumbel" } else { "multinomial" },
+    })
+}
+
 fn health_body(engine: &dyn Served, front: &Front) -> Result<Value> {
     let mut body = engine.health_checked()?;
     body["mem"] = MemSnapshot::read(engine.device()).json();
@@ -2948,6 +4224,7 @@ fn health_body(engine: &dyn Served, front: &Front) -> Result<Value> {
     // template once and tokenizes the result once.
     body["template_renders"] = json!(engine.template_renders());
     body["tokenizations"] = json!(front.tokenizations());
+    body["tokenized_ids"] = json!(front.tokenized_ids());
     body["session_log"] = json!(front.logged());
     // The history policy as resolved for this template: past reasoning kept
     // unless stripped on request, an unfinished reply's rendering.
@@ -3101,7 +4378,7 @@ impl Cell {
 
 pub fn bench(args: BenchArgs) -> Result<()> {
     let options = super::resolve_options(&args.common, &|o| args.front(o), Frontend::Bench)?;
-    super::report::arm_trace();
+    super::report::arm_trace()?;
     let mode = match options.bench.mode.as_str() {
         "reuse" => Some(super::modes::Mode::Reuse),
         "concurrent" => Some(super::modes::Mode::Concurrent),
@@ -3153,6 +4430,16 @@ pub fn bench(args: BenchArgs) -> Result<()> {
         sampling,
         front,
         reuse: parking_lot::Mutex::new(crate::turn::Tally::default()),
+        sessions: parking_lot::Mutex::new(super::sessions::Table::new(session_config(
+            &options.session,
+            &options.server.sessions,
+            1,
+        ))),
+        activity: Arc::new(keep_warm::Activity::new(uptime_ns())),
+        keep_warm: keep_warm::Policy::Off {
+            why: "the benchmark cells".into(),
+        },
+        keep_warm_pressure_file: None,
     };
     let batch = options.scheduler.max_sequences.max(1);
     for run in 0..options.bench.runs.max(1) {
@@ -3595,6 +4882,31 @@ mod bench_cells_tests {
 }
 
 #[cfg(test)]
+mod steady_rate_tests {
+    use super::steady_rate_field;
+
+    #[test]
+    fn no_recorded_step_is_unavailable_not_a_zero_rate() {
+        assert_eq!(
+            steady_rate_field(&[]),
+            "steady rate unavailable (per-step clock not in this build)"
+        );
+    }
+
+    #[test]
+    fn recorded_steps_give_one_over_the_median_step() {
+        assert_eq!(
+            steady_rate_field(&[4_000_000, 1_000_000, 2_000_000]),
+            "500.0 tok/s steady (median step)"
+        );
+        assert_eq!(
+            steady_rate_field(&[1_000_000, 3_000_000]),
+            "333.3 tok/s steady (median step)"
+        );
+    }
+}
+
+#[cfg(test)]
 mod request_processors_tests {
     use super::{request_processors, Failure};
     use serde_json::json;
@@ -3695,6 +5007,100 @@ mod stream_writer_tests {
             .map(|(_, s)| s)
             .collect();
         assert_eq!(body, "ctl<ab>mid<c>", "{out:?}");
+    }
+
+    /// The first fragment's wake is not an event: the writer takes what
+    /// accumulated and writes no chunk of its own (an empty chunk would end
+    /// the chunked body), and everything handed over arrives in order.
+    #[test]
+    fn the_first_fragments_wake_writes_no_chunk_of_its_own() {
+        let mem = Mem::default();
+        let w = ChunkedWriter {
+            w: Box::new(mem.clone()),
+        };
+        let sw = StreamWriter::start_with_deltas(w, |t: &str| format!("<{t}>"));
+        sw.delta("a");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !String::from_utf8_lossy(&mem.0.lock().unwrap()).contains("<a>") {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the first fragment was never written"
+            );
+            std::thread::sleep(std::time::Duration::from_micros(200));
+        }
+        sw.delta("b");
+        let (_w, err) = sw.finish().unwrap();
+        assert!(err.is_none());
+        let out = String::from_utf8(mem.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            !out.starts_with("0\r\n") && !out.contains("\r\n0\r\n"),
+            "an empty chunk: {out:?}"
+        );
+        let body: String = out
+            .split("\r\n")
+            .enumerate()
+            .filter(|(i, _)| i % 2 == 1)
+            .map(|(_, s)| s)
+            .collect();
+        assert_eq!(body, "<a><b>", "{out:?}");
+    }
+
+    /// The first-write stamp belongs to the first event that carries text: a
+    /// control event (the chat route's role chunk) leaves it unset, and the
+    /// text written after it sets it no earlier than the text was handed over.
+    #[test]
+    fn the_first_write_stamp_is_the_first_text_event() {
+        let control_only = {
+            let w = ChunkedWriter {
+                w: Box::new(Mem::default()),
+            };
+            let sw = StreamWriter::start_with_deltas(w, |t: &str| format!("<{t}>"));
+            sw.send("role".to_string());
+            let stamp = sw.first_write();
+            sw.finish().unwrap();
+            stamp.load(std::sync::atomic::Ordering::Acquire)
+        };
+        assert_eq!(control_only, 0, "a control event is not the first token");
+
+        let w = ChunkedWriter {
+            w: Box::new(Mem::default()),
+        };
+        let sw = StreamWriter::start_with_deltas(w, |t: &str| format!("<{t}>"));
+        sw.send("role".to_string());
+        let handed = super::uptime_ns();
+        sw.delta("Paris");
+        let stamp = sw.first_write();
+        sw.finish().unwrap();
+        let written = stamp.load(std::sync::atomic::Ordering::Acquire);
+        assert!(
+            written >= handed,
+            "the text's write ({written}) precedes its hand-over ({handed})"
+        );
+    }
+
+    /// The request line's fields: each stage's offset from the accept in
+    /// microseconds, `-` for a stage the request did not reach, and the
+    /// GPU's idle time before it in milliseconds.
+    #[test]
+    fn the_first_token_field_is_offsets_from_the_accept() {
+        let t = super::FirstToken {
+            recv: 1_000_000,
+            handler: 1_050_000,
+            body: 1_100_000,
+            json: 1_200_000,
+            built: 2_000_000,
+            headers: 2_100_000,
+            decode: 2_200_000,
+            fragment: 101_000_000,
+            written: 102_500_000,
+            idle: 3_500_000_000,
+            ..Default::default()
+        };
+        assert_eq!(
+            t.field(),
+            "first_token_us=handler:50,body:100,slot:-,json:200,built:1000,headers:1100,\
+             decode:1200,fragment:100000,written:101500 idle_ms=3500"
+        );
     }
 
     /// A writer whose writes wait on a gate (a client that stops reading),
@@ -4130,6 +5536,10 @@ mod checked_trailer_tests {
             sampling: Default::default(),
             front,
             reuse: parking_lot::Mutex::new(Default::default()),
+            sessions: test_sessions(),
+            activity: Arc::new(keep_warm::Activity::new(0)),
+            keep_warm: keep_warm::Policy::Off { why: "test".into() },
+            keep_warm_pressure_file: None,
         };
         let run = StreamingRun {
             kind: StreamKind::Chat,
@@ -4148,6 +5558,9 @@ mod checked_trailer_tests {
             model: "stub".into(),
             record: None,
             return_ids: false,
+            reasoning_in_content: false,
+            session: None,
+            first: FirstToken::default(),
         };
         let (release, hold) = std::sync::mpsc::channel();
         let worker = std::thread::spawn(move || {
@@ -4235,3 +5648,191 @@ mod logprob_request_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod sampling_ingress_tests {
+    use super::{sampling_params, Failure};
+    use crate::app::served::tests::NoVision;
+    use lloom::generation::{Sampling, GREEDY_BELOW};
+    use serde_json::json;
+
+    #[test]
+    fn actual_http_sampling_parser_preserves_method_filters_and_defaults() {
+        let engine = NoVision::new(None);
+        let defaults = crate::SamplingConfig {
+            seed: Some(7),
+            ..Default::default()
+        };
+        let mut rows = 0;
+        for gumbel in [false, true] {
+            for t in [
+                None,
+                Some(0.0),
+                Some(GREEDY_BELOW / 2.0),
+                Some(GREEDY_BELOW),
+                Some(0.7),
+            ] {
+                for k in [None, Some(0), Some(1), Some(8)] {
+                    for p in [None, Some(0.0), Some(1.0), Some(0.6)] {
+                        let mut v = json!({"seed": 7, "sampling_method": if gumbel { "gumbel" } else { "multinomial" }});
+                        if let Some(t) = t {
+                            v["temperature"] = json!(t);
+                        }
+                        if let Some(k) = k {
+                            v["top_k"] = json!(k);
+                        }
+                        if let Some(p) = p {
+                            v["top_p"] = json!(p);
+                        }
+                        let params = sampling_params(&defaults, &engine, &v)
+                            .ok()
+                            .expect("valid request");
+                        assert_eq!(
+                            (
+                                params.temperature,
+                                params.top_k,
+                                params.top_p,
+                                params.gumbel
+                            ),
+                            (t, k, p, gumbel)
+                        );
+                        assert_eq!(
+                            params.sampling().unwrap(),
+                            Sampling::resolve(t, k, p, gumbel).unwrap()
+                        );
+                        rows += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(rows, 160);
+        let defaults = crate::SamplingConfig {
+            temperature: Some(0.7),
+            top_k: Some(2),
+            top_p: Some(0.6),
+            gumbel: true,
+            seed: Some(7),
+            ..Default::default()
+        };
+        for v in [
+            json!({}),
+            json!({"temperature": null, "top_k": null, "top_p": null, "gumbel": null}),
+        ] {
+            let params = sampling_params(&defaults, &engine, &v).ok().unwrap();
+            assert_eq!(
+                params.sampling().unwrap(),
+                Sampling::FilteredGumbel {
+                    temperature: 0.7,
+                    k: 2,
+                    p: 0.6
+                }
+            );
+        }
+        let off = sampling_params(
+            &defaults,
+            &engine,
+            &json!({"top_k": 0, "top_p": 1, "sampling_method": "multinomial"}),
+        )
+        .ok()
+        .unwrap();
+        assert_eq!(off.sampling().unwrap(), Sampling::All { temperature: 0.7 });
+    }
+
+    #[test]
+    fn actual_http_sampling_parser_refuses_ranges_and_types_before_engine_execution() {
+        let engine = NoVision::new(None);
+        let defaults = crate::SamplingConfig {
+            seed: Some(7),
+            ..Default::default()
+        };
+        for (v, field) in [
+            (json!({"temperature": -1}), "temperature"),
+            (json!({"top_p": -0.1}), "top_p"),
+            (json!({"top_p": 1.1}), "top_p"),
+            (json!({"top_k": -1}), "top_k"),
+            (json!({"top_k": 1.5}), "top_k"),
+            (json!({"temperature": "0.7"}), "temperature"),
+            (json!({"top_k": "2"}), "top_k"),
+            (json!({"top_p": "0.6"}), "top_p"),
+            (json!({"gumbel": "true"}), "gumbel"),
+            (json!({"seed": -1}), "seed"),
+            (json!({"seed": "7"}), "seed"),
+            (json!({"seed": 1.5}), "seed"),
+            (json!({"sampling_method": "GUMBEL"}), "sampling_method"),
+            (
+                json!({"sampling_method": "gumbel", "gumbel": false}),
+                "disagree",
+            ),
+        ] {
+            match sampling_params(&defaults, &engine, &v) {
+                Err(Failure::BadRequest(message)) => {
+                    assert!(message.contains(field), "{v}: {message}")
+                }
+                Err(_) => panic!("{v}: not a bad request"),
+                Ok(_) => panic!("{v}: malformed sampling accepted"),
+            }
+        }
+        // JSON has no NaN/Infinity numeric values; invalid finite values
+        // still refuse under greedy, rather than disappearing as unused.
+    }
+}
+
+#[cfg(test)]
+mod ready_configuration_tests {
+    use super::ready_configuration;
+    use serde_json::json;
+
+    #[test]
+    fn pipette_cell_overrides_use_the_same_serve_option_layers() {
+        use clap::Parser;
+        let args = super::ServeArgs::try_parse_from([
+            "lloom serve",
+            "--kernels-config",
+            r#"{"attention":{"flash":{"partial_block":8}}}"#,
+            "--speculative-config",
+            r#"{"method":"auto"}"#,
+            "--set",
+            "kernels.attention.flash.partial_block=32",
+            "--speculate",
+            "none",
+        ])
+        .unwrap();
+        let (options, _) = crate::app::resolve_layers(
+            &args.common,
+            &|options| args.front(options),
+            &|_| None,
+            false,
+            Some(crate::frontend::Frontend::Serve),
+        )
+        .unwrap();
+        let flat = crate::option_tree::index().flat(&options);
+        assert_eq!(flat["kernels.attention.flash.partial_block"], 32);
+        assert_eq!(flat["speculative.method"], "none");
+        assert_eq!(flat["context.prefix.reuse"], true);
+        assert!(!options.executor.arena && !options.executor.replay);
+    }
+
+    #[test]
+    fn configured_options_are_not_claimed_as_owner_resolution() {
+        let mut options = crate::EngineOptions::default();
+        crate::option_tree::index()
+            .set(&mut options, "kernels.attention.flash.partial_block", "8")
+            .unwrap();
+        let report = ready_configuration(&options, true, json!({"readback": "blocking"}));
+        assert_eq!(report["schema_version"], 1);
+        assert_eq!(
+            report["configured_options"]["kernels.attention.flash.partial_block"],
+            8
+        );
+        assert_eq!(report["owner"]["readback"], "blocking");
+        assert_eq!(report["options_installed"], true);
+        let supplied = ready_configuration(&options, false, json!({"generation": false}));
+        assert_eq!(supplied["options_installed"], false);
+        assert_eq!(supplied["owner"]["generation"], false);
+        assert!(supplied["owner"].get("readback").is_none());
+    }
+}
+
+#[cfg(test)]
+#[path = "serve_stream_tail_tests.rs"]
+mod stream_tail_tests;

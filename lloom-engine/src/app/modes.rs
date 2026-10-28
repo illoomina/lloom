@@ -493,8 +493,10 @@ pub fn run<P: Lfm2Shape>(ctx: Ctx<'_, P>) -> Result<()> {
         eos_watch: None,
         adaptive_commit: false,
         run_ahead: 0,
+        queued_steps: 0,
         stop: None,
         eos_gate: false,
+        eos_gate_cores: None,
         fused_publish: true,
         // The tile bounds every prefill forward, a visit's chunk included.
         prefill_tile: ctx.spec.prefill_tile,
@@ -1109,33 +1111,39 @@ fn run_dspark_concurrent<P: Lfm2Shape>(ctx: &Ctx<'_, P>, common: &str) -> Result
 }
 
 /// The Metal profiler's `(gpu_busy_union_s, dispatches, command_buffers)`
-/// since the last reset, then reset; zeros when the profiler is off or off
-/// Metal. Taken per arm so an arm's GPU-busy is its own.
-fn profile_take() -> (f64, u64, u64) {
+/// since the last reset, then reset; no GPU time when unavailable or off
+/// Metal. Cheap scalar counts remain usable without the detailed recorder.
+/// Taken per arm so an arm's GPU-busy is its own.
+fn profile_take() -> (Option<f64>, u64, u64) {
     #[cfg(feature = "metal")]
     {
         use lloom_tensor::kernels::metal::profile;
         if profile::enabled() {
             let s = profile::snapshot();
             profile::reset();
-            return (s.gpu_busy_union_s, s.dispatches, s.command_buffers);
+            return (
+                profile::recorder_enabled().then_some(s.gpu_busy_union_s),
+                s.dispatches,
+                s.command_buffers,
+            );
         }
     }
-    (0.0, 0, 0)
+    (None, 0, 0)
 }
 
 /// The per-kernel dispatch census since the last reset, under
-/// `CANDLE_METAL_PROFILE=1`; empty otherwise. Read BEFORE `profile_take`,
+/// `CANDLE_METAL_PROFILE=1`; None when detailed recording is unavailable. Read BEFORE `profile_take`,
 /// which resets it.
-fn profile_census() -> HashMap<String, u64> {
+fn profile_census() -> Option<HashMap<String, u64>> {
     #[cfg(feature = "metal")]
     {
         use lloom_tensor::kernels::metal::profile;
         if profile::enabled() {
-            return profile::snapshot().by_label.into_iter().collect();
+            return profile::recorder_enabled()
+                .then(|| profile::snapshot().by_label.into_iter().collect());
         }
     }
-    HashMap::new()
+    None
 }
 
 /// One arm of the `--batched` concurrent run.
@@ -1144,12 +1152,12 @@ struct BatchArm {
     streams: Vec<Vec<u32>>,
     outs: Vec<DecodeOut>,
     wall_s: f64,
-    gpu_busy_s: f64,
+    gpu_busy_s: Option<f64>,
     dispatches: u64,
     command_buffers: u64,
     /// The weight-GEMM/GEMV kernels dispatched, from the census (engagement:
     /// the batched arm must show `gemm_*` where solo shows `gemv_*`).
-    census: HashMap<String, u64>,
+    census: Option<HashMap<String, u64>>,
     /// Per row, the wall stamp (s since the arm's start) of every token the
     /// callback handed over — the batched arm's TTFT and inter-token gaps.
     stamps: Vec<Vec<f64>>,
@@ -1211,10 +1219,31 @@ enum Pass {
     Rows(usize),
 }
 
+/// The matmul route a pass's half rows take: one row (the GEMV, unless
+/// `--force-gemm m`), the GEMV's row axis (a batched step of 2 to
+/// `f16_rows_max` rows under `kernels.gemm.f16_rows_decode`, at f16), or the
+/// GEMM.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Route {
+    One,
+    RowAxis,
+    Gemm,
+}
+
 impl Pass {
-    /// The `m = 1` route: the GEMV, unless `--force-gemm m`.
-    fn single(self) -> bool {
-        matches!(self, Pass::Solo | Pass::Rows(1))
+    fn route(self) -> Route {
+        use lloom_tensor::tuning;
+        match self {
+            Pass::Solo | Pass::Rows(1) => Route::One,
+            Pass::Rows(m)
+                if tuning::contract().is_fast()
+                    && tuning::f16_rows_decode()
+                    && tuning::f16_rows_max().is_some_and(|max| m <= max) =>
+            {
+                Route::RowAxis
+            }
+            Pass::Rows(_) => Route::Gemm,
+        }
     }
 }
 
@@ -1240,11 +1269,11 @@ fn batched_passes(
         .collect()
 }
 
-/// The first token whose forward took the `m = 1` route on one arm and not
-/// on the other: where the two arms' GEMV/GEMM seam is first crossed.
+/// The first token whose forward took a different matmul route on the two
+/// arms ([`Pass::route`]): where their seam is first crossed.
 fn seam_crossed(a: &[Pass], b: &[Pass], through: usize) -> Option<usize> {
     (1..=through).find(|&t| match (a.get(t - 1), b.get(t - 1)) {
-        (Some(x), Some(y)) => x.single() != y.single(),
+        (Some(x), Some(y)) => x.route() != y.route(),
         _ => false,
     })
 }
@@ -1587,7 +1616,12 @@ impl<'p, P: Lfm2Shape> ReplayArm<'p, P> {
                     .iter_mut()
                     .map(|cache| Row { pos, cache })
                     .collect();
-                let out = BatchedCausalLM::forward_rows(ctx.model, &input, &mut rows)?;
+                // The batch's own route: the scope the decoder's step opens
+                // (`kernels.gemm.f16_rows_decode`, `tuning::DecodeRows`).
+                let out = {
+                    let _step = lloom_tensor::tuning::DecodeRows::open();
+                    BatchedCausalLM::forward_rows(ctx.model, &input, &mut rows)
+                }?;
                 self.live = m;
                 let first = host_logits(ctx, &out.get(0)?)?;
                 let mut agree = true;
@@ -1838,10 +1872,10 @@ fn run_batched_concurrent<P: Lfm2Shape>(
         streams: vec![Vec::new(); n],
         outs: Vec::new(),
         wall_s: f64::NAN,
-        gpu_busy_s: 0.0,
+        gpu_busy_s: None,
         dispatches: 0,
         command_buffers: 0,
-        census: HashMap::new(),
+        census: None,
         stamps: vec![Vec::new(); n],
     };
     let (solo, batched) = match (ctx.spec.first.as_str(), ctx.spec.skip_solo) {
@@ -2073,28 +2107,29 @@ fn run_batched_concurrent<P: Lfm2Shape>(
         0.0
     };
     let solo_steps: u64 = solo.outs.iter().map(|o| o.stats.steps).sum();
-    let gemm_disp = |c: &HashMap<String, u64>| -> u64 {
-        c.iter()
-            .filter(|(k, _)| k.starts_with("gemm_"))
-            .map(|(_, v)| v)
-            .sum()
+    let named_dispatches = |c: &Option<HashMap<String, u64>>, prefix: &str| -> String {
+        c.as_ref()
+            .map(|c| {
+                c.iter()
+                    .filter(|(k, _)| k.starts_with(prefix))
+                    .map(|(_, v)| *v)
+                    .sum::<u64>()
+                    .to_string()
+            })
+            .unwrap_or_else(|| "unavailable".into())
     };
-    let gemv_disp = |c: &HashMap<String, u64>| -> u64 {
-        c.iter()
-            .filter(|(k, _)| k.starts_with("gemv"))
-            .map(|(_, v)| v)
-            .sum()
-    };
+    let gemm_disp = |c: &Option<HashMap<String, u64>>| named_dispatches(c, "gemm_");
+    let gemv_disp = |c: &Option<HashMap<String, u64>>| named_dispatches(c, "gemv");
     for arm in [&solo, &batched] {
         eprintln!(
-            "[{}: {} tokens in {:.3} s = {:.1} tok/s aggregate; gpu_busy {:.3} s ({:.1} %), \
+            "[{}: {} tokens in {:.3} s = {:.1} tok/s aggregate; gpu_busy {} s ({} %), \
              {} dispatches, {} command buffers; gemm {} gemv {}]",
             arm.name,
             arm.tokens(),
             arm.wall_s,
             arm.tokens() as f64 / arm.wall_s,
-            arm.gpu_busy_s,
-            100.0 * arm.gpu_busy_s / arm.wall_s.max(1e-9),
+            super::common::profile_metric(arm.gpu_busy_s),
+            super::common::profile_metric(arm.gpu_busy_s.map(|v| 100.0 * v / arm.wall_s.max(1e-9))),
             arm.dispatches,
             arm.command_buffers,
             gemm_disp(&arm.census),
@@ -2105,6 +2140,7 @@ fn run_batched_concurrent<P: Lfm2Shape>(
         let mut mm: Vec<(&String, &u64)> = arm
             .census
             .iter()
+            .flat_map(|c| c.iter())
             .filter(|(k, _)| k.starts_with("gemm_") || k.starts_with("gemv"))
             .collect();
         mm.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
@@ -2114,12 +2150,12 @@ fn run_batched_concurrent<P: Lfm2Shape>(
     }
     eprintln!(
         "[batched: {batched_steps} steps, {mean_rows:.2} live rows/step mean, step median {:.3} ms, \
-         gpu_busy/step {:.3} ms, dispatches/step {:.1}; solo: {solo_steps} steps, \
-         gpu_busy/step {:.3} ms, dispatches/step {:.1}]",
+         gpu_busy/step {} ms, dispatches/step {:.1}; solo: {solo_steps} steps, \
+         gpu_busy/step {} ms, dispatches/step {:.1}]",
         if step_ms.is_empty() { f64::NAN } else { step_ms[step_ms.len() / 2] },
-        1e3 * batched.gpu_busy_s / batched_steps.max(1) as f64,
+        super::common::profile_metric(batched.gpu_busy_s.map(|v| 1e3 * v / batched_steps.max(1) as f64)),
         batched.dispatches as f64 / batched_steps.max(1) as f64,
-        1e3 * solo.gpu_busy_s / solo_steps.max(1) as f64,
+        super::common::profile_metric(solo.gpu_busy_s.map(|v| 1e3 * v / solo_steps.max(1) as f64)),
         solo.dispatches as f64 / solo_steps.max(1) as f64,
     );
     let speedup = (batched.tokens() as f64 / batched.wall_s) / (solo.tokens() as f64 / solo.wall_s);
@@ -2129,9 +2165,9 @@ fn run_batched_concurrent<P: Lfm2Shape>(
          prefill_chunk={} prefill_tile={} stagger={} arrivals={:?} prefill_units={:?} \
          first_token_ms={:?} gap_p50_ms={:?} gap_max_ms={:?} \
          prompt_tokens={:?} solo_tokens={} solo_steps={} solo_wall_s={:.4} solo_aggregate_tok_s={:.4} \
-         solo_gpu_busy_s={:.4} solo_dispatches={} solo_gemm={} solo_gemv={} \
+         solo_gpu_busy_s={} solo_dispatches={} solo_gemm={} solo_gemv={} \
          batched_tokens={} batched_steps={} batched_rows_per_step={:.4} batched_wall_s={:.4} \
-         batched_aggregate_tok_s={:.4} batched_gpu_busy_s={:.4} batched_dispatches={} \
+         batched_aggregate_tok_s={:.4} batched_gpu_busy_s={} batched_dispatches={} \
          batched_gemm={} batched_gemv={} batched_step_ms_median={:.4} \
          speedup={:.4} identical={} per_seq_identical={:?} common_prefix={:?} independent={:?} \
          per_seq_tokens={:?} per_seq_overrun={:?} solo_kernels={} per_seq_verdict={:?} \
@@ -2155,7 +2191,7 @@ fn run_batched_concurrent<P: Lfm2Shape>(
         solo_steps,
         solo.wall_s,
         solo.tokens() as f64 / solo.wall_s,
-        solo.gpu_busy_s,
+        super::common::profile_metric(solo.gpu_busy_s),
         solo.dispatches,
         gemm_disp(&solo.census),
         gemv_disp(&solo.census),
@@ -2164,7 +2200,7 @@ fn run_batched_concurrent<P: Lfm2Shape>(
         mean_rows,
         batched.wall_s,
         batched.tokens() as f64 / batched.wall_s,
-        batched.gpu_busy_s,
+        super::common::profile_metric(batched.gpu_busy_s),
         batched.dispatches,
         gemm_disp(&batched.census),
         gemv_disp(&batched.census),
@@ -2258,6 +2294,29 @@ mod tests {
             None
         );
         assert_eq!(seam_crossed(&solo, &[Pass::Rows(1); 4], 4), None);
+    }
+
+    /// Under `kernels.gemm.f16_rows_decode` a batched step of 2 to
+    /// `f16_rows_max` rows takes the GEMV's row axis and a wider one the
+    /// GEMM: two routes, so a row re-batched across the ceiling crosses a
+    /// seam; within it, or with the arm off, it does not.
+    #[test]
+    fn under_the_decode_rows_arm_the_row_axis_is_a_route_of_its_own() {
+        use lloom_tensor::tuning;
+        tuning::pin_contract(tuning::Contract::Fast).expect("an isolated test process");
+        tuning::set_f16_rows(Some(10));
+        let (four, two, twelve) = ([Pass::Rows(4); 4], [Pass::Rows(2); 4], [Pass::Rows(12); 4]);
+        tuning::set_f16_rows_decode(false);
+        assert_eq!(seam_crossed(&four, &twelve, 4), None, "off: both the GEMM");
+        tuning::set_f16_rows_decode(true);
+        assert_eq!(
+            seam_crossed(&four, &twelve, 4),
+            Some(1),
+            "on: the axis, then the GEMM"
+        );
+        assert_eq!(seam_crossed(&four, &two, 4), None, "on: both the axis");
+        assert_eq!(seam_crossed(&[Pass::Solo; 4], &four, 4), Some(1));
+        assert_eq!(seam_crossed(&[Pass::Solo; 4], &[Pass::Rows(1); 4], 4), None);
     }
 
     /// Streams that agree are identical and replay nothing.

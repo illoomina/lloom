@@ -482,8 +482,9 @@ fn served_request_trace_on() -> bool {
         1 => false,
         2 => true,
         _ => {
-            let on = crate::tuning::tuning().instrument.served_request_trace;
-            set_served_request_trace(on);
+            let requested = crate::tuning::tuning().instrument.served_request_trace;
+            let on = crate::tuning::effective_instrument("served_request_trace", requested);
+            SERVED_TRACE.store(if on { 2 } else { 1 }, std::sync::atomic::Ordering::Relaxed);
             on
         }
     }
@@ -491,8 +492,10 @@ fn served_request_trace_on() -> bool {
 
 /// Turn the served-pass request attribution on or off for the process (a
 /// test's switch; the knob sets it for a run).
-pub fn set_served_request_trace(on: bool) {
+pub fn set_served_request_trace(on: bool) -> crate::Result<()> {
+    crate::tuning::check_profile_request("served_request_trace", on).map_err(crate::Error::wrap)?;
     SERVED_TRACE.store(if on { 2 } else { 1 }, std::sync::atomic::Ordering::Relaxed);
+    Ok(())
 }
 
 /// The admission's second rung (`admit_bytes`: wait the queue out once and
@@ -518,8 +521,10 @@ pub fn set_admission_drain(on: bool) {
     ADMISSION_DRAIN.store(if on { 2 } else { 1 }, std::sync::atomic::Ordering::Relaxed);
 }
 
+#[cfg(any(debug_assertions, feature = "profile"))]
 type SiteCounts = HashMap<(usize, String), u64>;
 
+#[cfg(any(debug_assertions, feature = "profile"))]
 fn served_request_sites_map() -> &'static Mutex<SiteCounts> {
     static SITES: std::sync::OnceLock<Mutex<SiteCounts>> = std::sync::OnceLock::new();
     SITES.get_or_init(|| Mutex::new(HashMap::new()))
@@ -528,6 +533,7 @@ fn served_request_sites_map() -> &'static Mutex<SiteCounts> {
 /// The instrument's half of [`MetalDevice::note_pool_request`]: the first two
 /// frames of the `lloom` crate (the model's call site and its caller) of a
 /// backtrace, counted per pool. Process-wide, like the trace recorder.
+#[cfg(any(debug_assertions, feature = "profile"))]
 fn note_served_request_site(which: usize) {
     let site = call_site();
     *served_request_sites_map()
@@ -540,6 +546,7 @@ fn note_served_request_site(which: usize) {
 /// tensor-crate entry the model called, then the model's (`lloom` crate's)
 /// two innermost frames. For attribution instruments only: it takes one
 /// backtrace a call.
+#[cfg(any(debug_assertions, feature = "profile"))]
 pub(crate) fn call_site() -> String {
     let bt = std::backtrace::Backtrace::force_capture().to_string();
     let frames: Vec<&str> = bt
@@ -570,6 +577,7 @@ pub(crate) fn call_site() -> String {
 /// What `LLOOM_SERVED_REQUEST_TRACE` attributed since the last call:
 /// `(pool, site, requests)`, pool 0 shared and 1 private, most requests
 /// first. Taking clears it, so a caller reads one window.
+#[cfg(any(debug_assertions, feature = "profile"))]
 pub fn served_pass_request_sites() -> Vec<(usize, String, u64)> {
     let mut v: Vec<(usize, String, u64)> = std::mem::take(&mut *served_request_sites_map().lock())
         .into_iter()
@@ -577,6 +585,11 @@ pub fn served_pass_request_sites() -> Vec<(usize, String, u64)> {
         .collect();
     v.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.1.cmp(&b.1)));
     v
+}
+
+#[cfg(not(any(debug_assertions, feature = "profile")))]
+pub fn served_pass_request_sites() -> Vec<(usize, String, u64)> {
+    Vec::new()
 }
 
 /// One cached plan as the harness reports it: `(key, ordinals served,
@@ -767,6 +780,21 @@ impl MetalDevice {
         Ok(pl)
     }
 
+    /// A fresh allocation from this device's own backings, about to join one
+    /// of its pools: the device's residency sets list it until the pool
+    /// evicts it from the free list, after its last GPU reader
+    /// (`Buffer::device_listed`). Unmarked when the device has no set.
+    fn listed_for_pool(
+        &self,
+        mut allocation: crate::kernels::metal::backing::Allocation,
+    ) -> crate::kernels::metal::backing::Allocation {
+        // SAFETY: asks only whether a native set exists; nothing is borrowed.
+        if unsafe { self.residency_set.raw() }.is_some() {
+            allocation.buffer = allocation.buffer.with_device_listing();
+        }
+        allocation
+    }
+
     fn allocate_backing(
         backing: &dyn Backing,
         bytes: usize,
@@ -913,6 +941,43 @@ impl MetalDevice {
     /// so the tests assert on membership -- which is exactly this number.
     pub fn residency_set_len(&self) -> usize {
         self.residency_set.len()
+    }
+
+    /// Asks the OS to keep the residency set's memory wired
+    /// ([`ResidencySet::request_residency`]).
+    pub fn request_residency(&self) {
+        self.residency_set.request_residency();
+    }
+
+    /// Tells the OS the residency set's memory need not stay wired
+    /// ([`ResidencySet::end_residency`]): serve's keep-warm under memory
+    /// pressure. The next request, or a command buffer on a queue the set
+    /// is attached to, makes it resident again.
+    pub fn end_residency(&self) {
+        self.residency_set.end_residency();
+    }
+
+    /// Where the residency sets stand for the loaded line: the attachment
+    /// (`kernels.residency.attach`) and the router's layout
+    /// ([`ResidencySet::layout_line`]), e.g. `residency=queue 1 set 8.12 GiB`.
+    pub fn residency_line(&self) -> String {
+        let metal4 = match self.commands.metal4_declare() {
+            Some(d) if d != crate::kernels::metal::Metal4Declare::Slots => {
+                format!(" metal4={}", d.name())
+            }
+            _ => String::new(),
+        };
+        format!(
+            "residency={} {}{metal4}",
+            self.commands.residency_attachment().short(),
+            self.residency_set.layout_line()
+        )
+    }
+
+    /// The Metal 4 queue's per-slot residency counts
+    /// ([`Commands::metal4_slot_residency`]).
+    pub fn metal4_slot_residency(&self) -> Option<crate::kernels::metal::SlotResidency> {
+        self.commands.metal4_slot_residency()
     }
 
     /// A handle to the residency set that outlives this device.
@@ -1456,6 +1521,13 @@ impl MetalDevice {
         Ok(())
     }
 
+    /// The gate's cores arm for the armed run: the quantized mat-vec cores
+    /// load their gated variant too (`Kernels::set_eos_gate_cores`). Cleared
+    /// by [`Self::eos_gate_end`].
+    pub fn eos_gate_cores(&self, on: bool) {
+        self.kernels.set_eos_gate_cores(on);
+    }
+
     /// See `Device::eos_gate_step`. Offsets in bytes.
     pub fn eos_gate_step(
         &self,
@@ -1637,8 +1709,13 @@ impl MetalDevice {
     /// buffer that failed is recorded for the next wait to report.
     pub fn eos_gate_end(&self) -> crate::EosGateReport {
         let _ = self.wait_until_completed();
+        let cores = self.kernels.eos_gate_cores();
         self.kernels.set_eos_gated(false);
-        self.commands.eos_gate().end()
+        self.kernels.set_eos_gate_cores(false);
+        crate::EosGateReport {
+            cores,
+            ..self.commands.eos_gate().end()
+        }
     }
 
     /// The adaptive commit (lloom #735): see `Commands::flush_marker_if_started`.
@@ -1890,7 +1967,10 @@ impl MetalDevice {
     ) -> Result<usize> {
         let plan = RegionPlan::checked_reserve(reservations).map_err(MetalError::Message)?;
         let bytes = plan.bytes().max(1);
-        let base = Self::allocate_backing(&self.backings.resident_private, bytes, context)?;
+        let base = crate::residency_class::residency_class_scope(
+            crate::residency_class::ResidencyClass::Kv,
+            || Self::allocate_backing(&self.backings.resident_private, bytes, context),
+        )?;
         let region = SessionRegion::new(base.buffer, plan)
             .map_err(|e| MetalError::Message(format!("session region rejected: {e}")))?;
         let previous = {
@@ -1995,7 +2075,10 @@ impl MetalDevice {
         // offset source serve every ordinal; sizing to the smaller one makes the
         // GPU path decline an ordinal that fits the plan perfectly, which is a
         // silent loss of coverage rather than an error.
-        let base = Self::allocate_backing(&self.backings.resident_private, bytes, context)?;
+        let base = crate::residency_class::residency_class_scope(
+            crate::residency_class::ResidencyClass::Scratch,
+            || Self::allocate_backing(&self.backings.resident_private, bytes, context),
+        )?;
         let arena = Arena::new(base.buffer, plan, layout)
             .map_err(|e| MetalError::Message(format!("arena plan rejected: {e}")))?;
         let previous = self.arena.write().replace(arena);
@@ -2194,7 +2277,7 @@ impl MetalDevice {
 
     /// What an armed recording installed, once it has.
     pub fn arena_auto_report(&self) -> Option<ArenaAutoReport> {
-        self.arena_auto_report.lock().clone()
+        *self.arena_auto_report.lock()
     }
 
     /// [`Self::end_decode_step`], plus the install an armed recording is due
@@ -2203,34 +2286,7 @@ impl MetalDevice {
     /// after everything the step encodes.
     pub fn finish_decode_step(&self) -> Result<()> {
         self.end_decode_step();
-        // A step that drifted from the plan is served no further (the arena
-        // deactivated itself at the drift) and the plan is dropped here: the
-        // sequence it describes no longer runs, and the recording is re-armed
-        // over the steps that follow -- none skipped, because the drifted
-        // sequence is the steady state now. Each re-recording is counted, so
-        // a run whose plan moved twice says so beside its coverage.
-        if let Some(arena) = self.arena_slot() {
-            if arena.take_drifted() {
-                let rearm = *self.arena_rerecord.lock();
-                self.clear_arena();
-                if let Some((layout, record_steps)) = rearm {
-                    // The drifted step is the record's step 0 (the count
-                    // below advances it), so `skip: 1` records from the next
-                    // step on -- nothing but the step that drifted is skipped.
-                    {
-                        let mut g = self.arena_auto.lock();
-                        *g = Some(ArenaAutoRecord {
-                            layout,
-                            skip: 1,
-                            record_steps,
-                            step: 0,
-                        });
-                    }
-                    self.arena_rerecordings
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                }
-            }
-        }
+        self.rearm_if_drifted();
         // `parking_lot` guards are infallible; an IIFE returning `Option` keeps
         // the `?` early-return the `and_then` closure used.
         let due = (|| {
@@ -2265,6 +2321,59 @@ impl MetalDevice {
             }
         }
         Ok(())
+    }
+
+    /// Abandon a decode step whose forward failed or unwound: the arena's
+    /// step is closed and a drift handled as at the finish, but the step is
+    /// no recorded step. A recording armed over it is dropped and armed
+    /// again, so no arena is installed from a step that stopped part-way.
+    pub fn abort_decode_step(&self) {
+        self.end_decode_step();
+        self.rearm_if_drifted();
+        let restart = {
+            let mut g = self.arena_auto.lock();
+            match g.as_mut() {
+                Some(auto) if auto.step >= auto.skip => {
+                    auto.step = 0;
+                    true
+                }
+                _ => false,
+            }
+        };
+        if restart {
+            drop(self.discard_arena_recording());
+        }
+    }
+
+    /// A step that drifted from the plan is served no further (the arena
+    /// deactivated itself at the drift) and the plan is dropped: the
+    /// sequence it describes no longer runs, and the recording is re-armed
+    /// over the steps that follow -- none skipped, because the drifted
+    /// sequence is the steady state now. Each re-recording is counted, so a
+    /// run whose plan moved twice says so beside its coverage.
+    fn rearm_if_drifted(&self) {
+        if let Some(arena) = self.arena_slot() {
+            if arena.take_drifted() {
+                let rearm = *self.arena_rerecord.lock();
+                self.clear_arena();
+                if let Some((layout, record_steps)) = rearm {
+                    // The drifted step is the record's step 0 (a finish's
+                    // count advances it), so `skip: 1` records from the next
+                    // step on -- nothing but the step that drifted is skipped.
+                    {
+                        let mut g = self.arena_auto.lock();
+                        *g = Some(ArenaAutoRecord {
+                            layout,
+                            skip: 1,
+                            record_steps,
+                            step: 0,
+                        });
+                    }
+                    self.arena_rerecordings
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+        }
     }
 
     /// Mark the end of a decode step. Allocations outside a step take the pool
@@ -2441,6 +2550,7 @@ impl MetalDevice {
             self.served_pass_pool_requests[which]
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if served_request_trace_on() {
+                #[cfg(any(debug_assertions, feature = "profile"))]
                 note_served_request_site(which);
             }
         }
@@ -2569,55 +2679,74 @@ impl MetalDevice {
         // Whatever this pass does, the arena the last pass installed must not
         // serve it: a pass is served only under its own key's plan.
         self.clear_arena_keep_base();
-        let state = match (pp.state.pending, pp.plans.contains_key(&key)) {
+        // A refusal past the bits above leaves no half-open pass: the body
+        // bits are cleared and no `current` is registered, so the caller's
+        // error path owes no `finish_pass` and the next pass opens on the
+        // state this one found.
+        let opened = match (pp.state.pending, pp.plans.contains_key(&key)) {
             (Some(closes), cached) => {
                 // The recorder still holds the pending key's pass as its
                 // current step; this pass becomes the step that says what
                 // escaped it.
                 self.next_arena_recording_step();
                 pp.counters.observed += 1;
-                if cached {
+                Ok(if cached {
                     PassState::Observing { closes }
                 } else {
                     PassState::Recording {
                         key,
                         closes: Some(closes),
                     }
-                }
+                })
             }
             (None, true) => {
                 let generation = pp.state.base_generation;
                 let stale = pp.arena_generation.get(&key) != Some(&generation);
-                if stale || !pp.arenas.contains_key(&key) {
+                let built = if stale || !pp.arenas.contains_key(&key) {
                     let plan = pp.plans.get(&key).expect("cached").clone();
                     let base = pp.base.clone().expect("a cached plan has a base");
-                    let arena = Arena::new(base, plan, pp.layout)
-                        .map_err(|e| MetalError::Message(format!("pass plan rejected: {e}")))?;
-                    pp.arenas.insert(key, arena);
-                    pp.arena_generation.insert(key, generation);
-                }
-                let arena = pp.arenas.get(&key).expect("built above").clone();
-                crate::kernels::metal::set_hazard_key_unless_explicit(
-                    crate::kernels::metal::HazardKey::Range,
-                );
-                {
-                    let mut slot = self.arena.write();
-                    *slot = Some(arena.clone());
-                }
-                arena.begin_step();
-                pp.counters.served += 1;
-                self.pass_state
-                    .fetch_or(0b100, std::sync::atomic::Ordering::Relaxed);
-                PassState::Served(key)
+                    Arena::new(base, plan, pp.layout)
+                        .map_err(|e| MetalError::Message(format!("pass plan rejected: {e}")))
+                        .map(|arena| {
+                            pp.arenas.insert(key, arena);
+                            pp.arena_generation.insert(key, generation);
+                        })
+                } else {
+                    Ok(())
+                };
+                built.map(|()| {
+                    let arena = pp.arenas.get(&key).expect("built above").clone();
+                    crate::kernels::metal::set_hazard_key_unless_explicit(
+                        crate::kernels::metal::HazardKey::Range,
+                    );
+                    {
+                        let mut slot = self.arena.write();
+                        *slot = Some(arena.clone());
+                    }
+                    arena.begin_step();
+                    pp.counters.served += 1;
+                    self.pass_state
+                        .fetch_or(0b100, std::sync::atomic::Ordering::Relaxed);
+                    PassState::Served(key)
+                })
             }
             (None, false) => {
                 self.begin_arena_recording();
                 pp.counters.recorded += 1;
-                PassState::Recording { key, closes: None }
+                Ok(PassState::Recording { key, closes: None })
             }
         };
-        pp.state.current = Some(state);
-        Ok(())
+        match opened {
+            Ok(state) => {
+                pp.state.current = Some(state);
+                Ok(())
+            }
+            Err(error) => {
+                self.pass_state
+                    .fetch_and(!0b1110, std::sync::atomic::Ordering::Relaxed);
+                Err(error.into())
+            }
+        }
     }
 
     /// Close the pass `begin_pass` opened: build the plan a pending key was
@@ -2736,6 +2865,77 @@ impl MetalDevice {
         drop(g);
         drop(discarded);
         Ok(())
+    }
+
+    /// Abandon the pass `begin_pass` opened, after its body failed or
+    /// unwound. Nothing the pass recorded or observed is published: it
+    /// leaves no key pending, builds no plan, and the pending key it was
+    /// observing records again on its next sight. A served pass keeps its
+    /// cached plan. The base is not replaced, so work already encoded keeps
+    /// what it binds until it retires, and an arena the abort drops is
+    /// dropped outside the planner lock. A no-op when no pass is open; with
+    /// the cache off, the decode step's abort (`abort_decode_step`).
+    pub fn abort_pass(&self) -> Result<()> {
+        if let Some(scope) = super::allocation_scope::active(self)? {
+            return scope.view.abort_pass_in();
+        }
+        self.abort_pass_in()
+    }
+
+    fn abort_pass_in(&self) -> Result<()> {
+        self.next_pass_variant
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        let mut g = self.pass_plans.lock();
+        let Some(pp) = g.as_mut() else {
+            drop(g);
+            self.abort_decode_step();
+            return Ok(());
+        };
+        if pp.state.closing.is_some() {
+            return Err(crate::Error::wrap(PlannerInvalidated(
+                "abort while a finish is closing",
+            )));
+        }
+        let Some(state) = pp.state.current.take() else {
+            return Ok(());
+        };
+        self.pass_state
+            .fetch_and(!0b1110, std::sync::atomic::Ordering::Relaxed);
+        pp.counters.aborted += 1;
+        let mut discarded = None;
+        let recorded = match state {
+            PassState::Served(key) => {
+                self.end_decode_step();
+                if let Some(arena) = self.arena_slot() {
+                    if arena.take_drifted() {
+                        pp.plans.remove(&key);
+                        discarded = pp.arenas.remove(&key);
+                        pp.counters.evicted += 1;
+                    }
+                }
+                self.clear_arena_keep_base();
+                false
+            }
+            PassState::Recording { .. } | PassState::Observing { .. } => {
+                pp.state.pending = None;
+                true
+            }
+        };
+        drop(g);
+        drop(discarded);
+        if recorded {
+            drop(self.discard_arena_recording());
+        }
+        Ok(())
+    }
+
+    /// Stop observing and keep nothing of what was seen: the recorder is
+    /// returned for the caller to drop outside its locks.
+    fn discard_arena_recording(&self) -> Option<Arc<Mutex<ArenaRecorder>>> {
+        let mut g = self.arena_recorder.lock();
+        let rec = g.take()?;
+        crate::kernels::metal::arena::clear_bind_observer_if(&rec);
+        Some(rec)
     }
 
     fn check_closing_scope(&self) -> Result<()> {
@@ -3213,11 +3413,12 @@ impl MetalDevice {
                 self.private_buffers
                     .check_residual(alloc)
                     .map_err(AllocationError::from)?;
-                let new_buffer = Self::allocate_backing(
-                    self.backings.transient_private.as_ref(),
+                let split = self.residency_set.policy().is_split();
+                let new_buffer = self.listed_for_pool(Self::allocate_backing(
+                    self.backings.for_miss(true, split),
                     alloc,
                     context,
-                )?;
+                )?);
                 // `size` is the pre-rounding request and `alloc` is what Metal
                 // was given; `adopt_requesting` counts both so §9.2's residual
                 // overhang is derivable. The rounding happened at `alloc`
@@ -3564,17 +3765,15 @@ impl MetalDevice {
             capsule.allocate_pool_with(
                 metadata,
                 || {
-                    unsafe {
-                        match profile {
-                            super::planned_output_catalog::OutputProfile::Shared => self
-                                .backings
-                                .transient_shared
-                                .alloc_custodied(bytes, context),
-                            super::planned_output_catalog::OutputProfile::Private => self
-                                .backings
-                                .transient_private
-                                .alloc_custodied(bytes, context),
-                        }
+                    match profile {
+                        super::planned_output_catalog::OutputProfile::Shared => self
+                            .backings
+                            .transient_shared
+                            .alloc_custodied(bytes, context),
+                        super::planned_output_catalog::OutputProfile::Private => self
+                            .backings
+                            .transient_private
+                            .alloc_custodied(bytes, context),
                     }
                     .map_err(crate::Error::from)
                 },
@@ -3644,19 +3843,17 @@ impl MetalDevice {
             .ok_or_else(|| crate::Error::Msg("output catalog requires cold installation".into()))?;
         unsafe {
             catalog.append_cold_with(context, profile, || {
-                let slot =
-                    unsafe { self.new_prepared_buffer_profile_in(bytes, profile, Some(context)) }
-                        .map_err(CatalogError::Creator)?;
-                let operation = unsafe {
-                    PreparedAffineOperation::cold_in(
-                        self,
-                        context,
-                        dtype,
-                        operation,
-                        style,
-                        strided_rank,
-                    )
-                }
+                let slot = self
+                    .new_prepared_buffer_profile_in(bytes, profile, Some(context))
+                    .map_err(CatalogError::Creator)?;
+                let operation = PreparedAffineOperation::cold_in(
+                    self,
+                    context,
+                    dtype,
+                    operation,
+                    style,
+                    strided_rank,
+                )
                 .map_err(CatalogError::Operation)?;
                 Ok((slot, OperationPayload::Affine(operation)))
             })
@@ -3725,12 +3922,10 @@ impl MetalDevice {
             capsule.allocate_staging_with(
                 metadata,
                 || {
-                    unsafe {
-                        self.backings
-                            .resident_shared
-                            .alloc_custodied(bytes, context)
-                    }
-                    .map_err(crate::Error::from)
+                    self.backings
+                        .resident_shared
+                        .alloc_custodied(bytes, context)
+                        .map_err(crate::Error::from)
                 },
                 self.commands.clock(),
                 bytes,
@@ -3789,11 +3984,10 @@ impl MetalDevice {
                         // SAFETY: cold private whole-allocation birth, no raw/view escape;
                         // logical extent remains zero and every later native use must
                         // obey the same counted/closed-use contract as nonempty uploads.
-                        Some(bytes) => unsafe {
-                            self.backings
-                                .resident_shared
-                                .alloc_custodied(bytes, context)
-                        },
+                        Some(bytes) => self
+                            .backings
+                            .resident_shared
+                            .alloc_custodied(bytes, context),
                         None => self
                             .backings
                             .resident_shared
@@ -3955,8 +4149,12 @@ impl MetalDevice {
         self.buffers
             .check_residual(size)
             .map_err(AllocationError::from)?;
-        let new_buffer =
-            Self::allocate_backing(self.backings.transient_shared.as_ref(), size, context)?;
+        let split = self.residency_set.policy().is_split();
+        let new_buffer = self.listed_for_pool(Self::allocate_backing(
+            self.backings.for_miss(false, split),
+            size,
+            context,
+        )?);
         Ok(self
             .buffers
             .adopt_after_miss_in(new_buffer, size, miss, &origin)?)
@@ -4295,5 +4493,39 @@ impl PreparedAffineInput {
     }
     pub(crate) fn elements(&self) -> usize {
         self.elements
+    }
+}
+
+#[cfg(all(test, any(debug_assertions, feature = "profile")))]
+mod attribution_build_tests {
+    #[test]
+    fn served_attribution_collects_a_real_backtrace_without_a_device() {
+        let symbol_control = std::backtrace::Backtrace::force_capture().to_string();
+        assert!(
+            symbol_control
+                .contains("served_attribution_collects_a_real_backtrace_without_a_device"),
+            "symbolization positive control: {symbol_control}"
+        );
+        eprintln!("symbolization positive control:\n{symbol_control}");
+        super::set_served_request_trace(false).unwrap();
+        assert!(!super::served_request_trace_on());
+        super::set_served_request_trace(true).unwrap();
+        assert!(super::served_request_trace_on());
+        let _ = super::served_pass_request_sites();
+        super::note_served_request_site(0);
+        super::note_served_request_site(0);
+        super::note_served_request_site(1);
+        let sites = super::served_pass_request_sites();
+        assert_eq!(sites.len(), 2, "{sites:?}");
+        assert_eq!(sites[0].0, 0);
+        assert_eq!(sites[0].2, 2);
+        assert_eq!(
+            sites[0].1, "(no lloom frame)",
+            "this host-only caller is in lloom_tensor, not a model"
+        );
+        assert_eq!(sites[1].0, 1);
+        assert_eq!(sites[1].2, 1);
+        assert!(super::served_pass_request_sites().is_empty());
+        super::set_served_request_trace(false).unwrap();
     }
 }

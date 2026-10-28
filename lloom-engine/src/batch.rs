@@ -40,7 +40,7 @@ use std::sync::Arc;
 use lloom::generation::Sampling;
 use lloom::nn::{
     BatchDecoder, BatchedCausalLM, CacheReset, CacheRewind, CacheShare, DecodeOptions, DecodeOut,
-    DecodeStats, ReuseAction, RowDriver, RowId, Session,
+    DecodeStats, PrefillDecode, ReuseAction, RowDriver, RowId, Session,
 };
 use lloom_tensor::{Device, Result};
 
@@ -166,8 +166,9 @@ pub fn drive_closed_rows<'m, M: BatchedCausalLM + 'm>(
         );
     }
     let mut ids: Vec<RowId> = Vec::with_capacity(n);
-    // Admitted in order; a row the driver refuses is dropped by `admit`
-    // (the driver's contract), the rows after it are handed back untouched.
+    // Admitted in order; a row the driver refuses comes back with the
+    // refusal (`Rejected`), and the rows after it are handed back
+    // untouched — a failed cell costs the caller no session.
     let mut rest: Vec<Session<'m, M>> = sessions;
     rest.reverse();
     while let Some(s) = rest.pop() {
@@ -181,11 +182,12 @@ pub fn drive_closed_rows<'m, M: BatchedCausalLM + 'm>(
             max_tokens,
         ) {
             Ok(id) => ids.push(id),
-            Err(e) => {
+            Err(rejected) => {
                 let mut back = driver.drain_rows();
+                back.push(rejected.session);
                 rest.reverse();
                 back.append(&mut rest);
-                return (back, Err(e));
+                return (back, Err(rejected.error));
             }
         }
     }
@@ -362,6 +364,15 @@ pub struct BatchCounters {
     pub static_batches: u64,
     /// Admissions deferred for a live row's prefix still being fed (§12.3).
     pub share_waits: u64,
+    /// The most prompt pieces one step carried (`prefill_batch`, §11.8).
+    pub max_pieces: usize,
+    /// Steps that held a streaming row back while pieces were fed
+    /// (`PrefillDecode::Pause`).
+    pub held_steps: u64,
+    /// Ticks whose intake hit its per-tick budget while work was live, so
+    /// the jobs left in the channel waited for the next tick
+    /// (`scheduler.intake_per_tick`).
+    pub intake_deferred: u64,
 }
 
 /// The scheduler: built and run on one thread ([`spawn`]).
@@ -378,6 +389,9 @@ pub struct BatchScheduler<'m, M: BatchedCausalLM, E> {
     share_prefix: bool,
     mode: BatchMode<M, E>,
     extra: E,
+    /// The most jobs one tick takes off the queue while work is live
+    /// (`scheduler.intake_per_tick`): the fairness bound on intake.
+    intake_per_tick: usize,
     decoder: Driver<'m, M>,
     inflight: HashMap<RowId, InFlight>,
     waiting: VecDeque<(BatchRequest, Sender<BatchEvent>)>,
@@ -386,7 +400,168 @@ pub struct BatchScheduler<'m, M: BatchedCausalLM, E> {
     counters: BatchCounters,
     /// Under the static mode, the rows the current batch used, by pool slot.
     on_counters: Option<CountersHook>,
+    /// The open profile window, under the profile build's recorder.
+    #[cfg(feature = "metal")]
+    window: Option<ProfileWindow>,
+    #[cfg(feature = "metal")]
+    windows: u64,
 }
+
+/// One batch window under the profile build's recorder (`CANDLE_METAL_PROFILE=1`):
+/// from an admission onto an idle engine until nothing is live, every step's
+/// composition with its host interval in the GPU's clock.
+#[cfg(feature = "metal")]
+struct ProfileWindow {
+    started: std::time::Instant,
+    steps: Vec<WindowStep>,
+}
+
+/// The profile window's per-step record and its decode-cadence summary,
+/// split out so the arithmetic is testable without a GPU.
+#[cfg(any(feature = "metal", test))]
+mod steady {
+    /// One step of a profile window: its host interval in the GPU's clock, its
+    /// composition, its host time by stage and what it dispatched.
+    #[derive(Debug, Clone, Copy)]
+    pub(super) struct WindowStep {
+        pub(super) step: u64,
+        pub(super) t0: f64,
+        pub(super) t1: f64,
+        pub(super) report: lloom::nn::StepReport,
+        pub(super) phases: lloom::nn::BatchStepPhases,
+        pub(super) dispatches: u64,
+    }
+
+    /// One live-row count's decode cadence over a window: the steps that fed no
+    /// piece and held no row, each timed from its start to the next step's
+    /// start (the scheduler's own work between steps included).
+    #[derive(Debug, Clone, PartialEq)]
+    pub(super) struct SteadyRow {
+        pub(super) live: usize,
+        pub(super) steps: usize,
+        /// Medians, milliseconds: the step's wall (start to the next start), the
+        /// GPU's busy union inside it, the host stages, and the scheduler's time
+        /// between the step's end and the next one's start.
+        pub(super) wall_ms: f64,
+        pub(super) gpu_busy_ms: f64,
+        pub(super) stages_ms: [f64; 10],
+        pub(super) between_ms: f64,
+        pub(super) dispatches: f64,
+    }
+
+    #[cfg_attr(not(feature = "metal"), allow(dead_code))]
+    pub(super) const STAGE_NAMES: [&str; 10] = [
+        "admit", "argmax", "stage", "prepare", "pace", "encode", "after", "wait", "stream", "tail",
+    ];
+
+    pub(super) fn stage_array(p: &lloom::nn::BatchStepPhases) -> [u64; 10] {
+        [
+            p.admit_ns,
+            p.argmax_ns,
+            p.stage_ns,
+            p.prepare_ns,
+            p.pace_ns,
+            p.encode_ns,
+            p.after_ns,
+            p.wait_ns,
+            p.stream_ns,
+            p.tail_ns,
+        ]
+    }
+
+    /// The median of `v` (sorted here); NaN when empty.
+    fn median(v: &mut [f64]) -> f64 {
+        if v.is_empty() {
+            return f64::NAN;
+        }
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        v[(v.len() - 1) / 2]
+    }
+
+    /// The busy union of `intervals` (sorted by start) clipped to `[lo, hi)`.
+    pub(super) fn busy_within(intervals: &[(f64, f64)], lo: f64, hi: f64) -> f64 {
+        let mut busy = 0.0;
+        let mut cursor = lo;
+        for &(s, e) in intervals {
+            if s >= hi {
+                break;
+            }
+            let s = s.max(cursor);
+            let e = e.min(hi);
+            if e > s {
+                busy += e - s;
+                cursor = e;
+            }
+        }
+        busy
+    }
+
+    /// One decode step's interval, milliseconds: the fields [`SteadyRow`]
+    /// takes the medians of.
+    struct Sample {
+        wall: f64,
+        busy: f64,
+        stages: [f64; 10],
+        between: f64,
+        dispatches: f64,
+    }
+
+    /// The decode cadence per live-row count: a step counts when it fed no
+    /// piece, held no row and the next step began with the same live rows, so
+    /// its interval is one decode step at that width. `intervals` are the
+    /// window's command buffers' GPU intervals.
+    pub(super) fn steady_rows(steps: &[WindowStep], intervals: &[(f64, f64)]) -> Vec<SteadyRow> {
+        let mut sorted = intervals.to_vec();
+        sorted.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        let mut by_live: std::collections::BTreeMap<usize, Vec<Sample>> = Default::default();
+        for w in steps.windows(2) {
+            let (a, b) = (&w[0], &w[1]);
+            if a.report.live == 0
+                || a.report.pieces > 0
+                || a.report.held > 0
+                || b.report.live != a.report.live
+                || b.step != a.step + 1
+            {
+                continue;
+            }
+            let ms = |ns: u64| ns as f64 / 1e6;
+            let stages = stage_array(&a.phases).map(ms);
+            by_live.entry(a.report.live).or_default().push(Sample {
+                wall: 1e3 * (b.t0 - a.t0),
+                busy: 1e3 * busy_within(&sorted, a.t0, b.t0),
+                stages,
+                between: 1e3 * (b.t0 - a.t1),
+                dispatches: a.dispatches as f64,
+            });
+        }
+        by_live
+            .into_iter()
+            .map(|(live, rows)| {
+                let col = |f: &dyn Fn(&Sample) -> f64| {
+                    let mut v: Vec<f64> = rows.iter().map(f).collect();
+                    median(&mut v)
+                };
+                let mut stages_ms = [0.0; 10];
+                for (k, s) in stages_ms.iter_mut().enumerate() {
+                    *s = col(&|r| r.stages[k]);
+                }
+                SteadyRow {
+                    live,
+                    steps: rows.len(),
+                    wall_ms: col(&|r| r.wall),
+                    gpu_busy_ms: col(&|r| r.busy),
+                    stages_ms,
+                    between_ms: col(&|r| r.between),
+                    dispatches: col(&|r| r.dispatches),
+                }
+            })
+            .collect()
+    }
+}
+#[cfg(feature = "metal")]
+use steady::{stage_array, STAGE_NAMES};
+#[cfg(any(feature = "metal", test))]
+use steady::{steady_rows, WindowStep};
 
 /// What [`spawn`] needs to build the scheduler on its thread.
 pub struct BatchConfig<M: BatchedCausalLM, E> {
@@ -401,6 +576,17 @@ pub struct BatchConfig<M: BatchedCausalLM, E> {
     pub reuse_prefix: bool,
     /// Share a request's prefix from another row's cache, by page (§12.3).
     pub share_prefix: bool,
+    /// How many pending rows' chunks one step of the K=1 loop carries
+    /// (`BatchDecoder::with_prefill_batch`); a driver from `extra` prefills
+    /// its own way and does not read it.
+    pub prefill_batch: usize,
+    /// What the K=1 loop's live rows do in a step that feeds prompt pieces.
+    pub prefill_decode: PrefillDecode,
+    /// The most jobs one intake tick takes off the request queue while
+    /// work is live (`scheduler.intake_per_tick`, at least 1); the rest
+    /// stay queued in arrival order for the next tick. With nothing live
+    /// the whole queue is drained whatever this says.
+    pub intake_per_tick: usize,
     pub mode: BatchMode<M, E>,
     pub extra: E,
     /// Called after every step with the counters (a log line).
@@ -429,11 +615,11 @@ where
         // decoder is built with a placeholder no id matches.
         let decoder: Driver<'m, M> = match cfg.extra.make_driver(model, &cfg.opts, &cfg.device)? {
             Some(d) => d,
-            None => Box::new(BatchDecoder::new(
-                cfg.opts.clone(),
-                &[u32::MAX],
-                cfg.device.clone(),
-            )?),
+            None => Box::new(
+                BatchDecoder::new(cfg.opts.clone(), &[u32::MAX], cfg.device.clone())?
+                    .with_prefill_batch(cfg.prefill_batch)
+                    .with_prefill_decode(cfg.prefill_decode),
+            ),
         };
         Ok(Self {
             model,
@@ -446,6 +632,7 @@ where
             share_prefix: cfg.share_prefix,
             mode: cfg.mode,
             extra: cfg.extra,
+            intake_per_tick: cfg.intake_per_tick.max(1),
             decoder,
             inflight: HashMap::new(),
             waiting: VecDeque::new(),
@@ -453,6 +640,10 @@ where
             rx,
             counters: BatchCounters::default(),
             on_counters: cfg.on_counters,
+            #[cfg(feature = "metal")]
+            window: None,
+            #[cfg(feature = "metal")]
+            windows: 0,
         })
     }
 
@@ -472,8 +663,17 @@ where
         self.inflight.is_empty() && self.decoder.is_idle()
     }
 
-    /// Take the queue: block when there is nothing to do, drain otherwise.
+    /// Take the queue: block when there is nothing to do, else take at most
+    /// [`Self::intake_budget`] jobs before returning to the rows.
     /// `false` on shutdown.
+    ///
+    /// The budget is what keeps a producer that holds the queue non-empty
+    /// from postponing the live rows' next step indefinitely: with work
+    /// live, intake is bounded per tick and the jobs it does not take stay
+    /// queued, in arrival order, for the next tick. With nothing live there
+    /// is no row to starve and the whole queue is drained, as it always
+    /// was — the closed-job and shutdown ordering is the queue's order
+    /// either way.
     fn take_jobs(&mut self) -> bool {
         let block = self.nothing_live() && self.waiting.is_empty() && self.closed.is_empty();
         if block {
@@ -486,9 +686,16 @@ where
                 Err(_) => return false,
             }
         }
-        loop {
+        let budget = if self.nothing_live() {
+            usize::MAX
+        } else {
+            self.intake_per_tick
+        };
+        let mut taken = 0usize;
+        while taken < budget {
             match self.rx.try_recv() {
                 Ok(job) => {
+                    taken += 1;
                     if !self.enqueue(job) {
                         return false;
                     }
@@ -497,6 +704,10 @@ where
                 Err(TryRecvError::Disconnected) => return false,
             }
         }
+        if taken == budget {
+            self.counters.intake_deferred += 1;
+        }
+        true
     }
 
     fn enqueue(&mut self, job: Job<M, E>) -> bool {
@@ -684,8 +895,12 @@ where
         false
     }
 
-    fn sampling_of(params: &DecodeParams) -> Sampling {
-        params.sampling()
+    /// The row's sampler arm, resolved before the row takes a slot: a
+    /// refused field is the request's error, and nothing is prepared for it.
+    fn sampling_of(params: &DecodeParams) -> std::result::Result<Sampling, String> {
+        params
+            .sampling()
+            .map_err(|e| e.without_backtrace().to_string())
     }
 
     /// Admit waiting rows into the continuous decoder while the width allows.
@@ -717,6 +932,13 @@ where
                 self.waiting.push_front((req, tx));
                 break;
             }
+            let sampling = match Self::sampling_of(&req.params) {
+                Ok(s) => s,
+                Err(e) => {
+                    let _ = tx.send(BatchEvent::Error(e));
+                    continue;
+                }
+            };
             let t_prep = std::time::Instant::now();
             let (slot, session, prepared, turn) = match self.prepare(&req) {
                 Ok(p) => p,
@@ -736,7 +958,6 @@ where
                     self.waiting.len()
                 );
             }
-            let sampling = Self::sampling_of(&req.params);
             let joined_beside = self.decoder.live_rows();
             // The row's own EOS set: the decoder stops a row on its own
             // `eos_ids`, so a row with the never-EOS set runs to its cap.
@@ -765,8 +986,17 @@ where
                         },
                     );
                 }
-                Err(e) => {
-                    let _ = tx.send(BatchEvent::Error(e.to_string()));
+                Err(rejected) => {
+                    // The checkout commits only on an admitted row: a
+                    // driver that refuses this request — its own body's
+                    // validation, which is stricter than the scheduler's
+                    // on the speculative loop, an empty prepared suffix,
+                    // no drafter slot left — hands the session back, and
+                    // its sequence returns to the pool. Otherwise every
+                    // such refusal costs the pool one sequence and valid
+                    // requests later fail admission with nothing live.
+                    let _ = tx.send(BatchEvent::Error(rejected.error.to_string()));
+                    self.pool.release(slot, rejected.session.into_sequence());
                 }
             }
         }
@@ -779,6 +1009,12 @@ where
                 self.decoder.cancel(*id);
             }
         }
+        #[cfg(feature = "metal")]
+        let t0 = self.window.as_ref().map(|_| {
+            use lloom_tensor::kernels::metal::profile;
+            profile::set_step(self.counters.steps);
+            (profile::now_s(), profile::dispatch_count())
+        });
         let inflight = &self.inflight;
         let report = self.decoder.step(&mut |row, ids| {
             if let Some(f) = inflight.get(&row) {
@@ -789,13 +1025,31 @@ where
             }
             Ok(())
         })?;
+        #[cfg(feature = "metal")]
+        if let (Some(w), Some((t0, d0))) = (self.window.as_mut(), t0) {
+            use lloom_tensor::kernels::metal::profile;
+            let t1 = profile::now_s();
+            w.steps.push(WindowStep {
+                step: self.counters.steps,
+                t0,
+                t1,
+                report,
+                phases: self.decoder.step_phases(),
+                dispatches: profile::dispatch_count().saturating_sub(d0),
+            });
+        }
         self.counters.steps += 1;
         self.counters.max_live = self.counters.max_live.max(report.live);
+        self.counters.max_pieces = self.counters.max_pieces.max(report.pieces);
+        if report.held > 0 {
+            self.counters.held_steps += 1;
+        }
         if lloom::tuning::tuning().lfm2.share_trace {
             eprintln!(
-                "[share: step {}: live {} pieces {} ({} tokens) retired {} pending {}]",
+                "[share: step {}: live {} held {} pieces {} ({} tokens) retired {} pending {}]",
                 self.counters.steps,
                 report.live,
+                report.held,
                 report.pieces,
                 report.piece_tokens,
                 report.retired,
@@ -845,6 +1099,13 @@ where
         let mut prompts: Vec<Vec<u32>> = Vec::with_capacity(rows.len());
         let mut specs: Vec<RowSpec> = Vec::with_capacity(rows.len());
         for (req, tx) in rows {
+            let sampling = match Self::sampling_of(&req.params) {
+                Ok(s) => s,
+                Err(e) => {
+                    let _ = tx.send(BatchEvent::Error(e));
+                    continue;
+                }
+            };
             match self.prepare(&req) {
                 Ok((slot, session, prepared, turn)) => {
                     // A static body takes the whole prompt as its row: a
@@ -860,7 +1121,7 @@ where
                     sessions.push(session);
                     prompts.push(prepared.suffix.clone());
                     specs.push(RowSpec {
-                        sampling: Self::sampling_of(&req.params),
+                        sampling,
                         seed: req.params.seed,
                         eos_ids: req.params.eos_ids.clone(),
                         max_tokens: req.params.max_tokens,
@@ -940,6 +1201,155 @@ where
         Ok(())
     }
 
+    /// Open a profile window when requests arrive on an idle engine and the
+    /// profile build's recorder is on: the counters start from zero.
+    #[cfg(feature = "metal")]
+    fn open_window(&mut self) {
+        use lloom_tensor::kernels::metal::profile;
+        if self.window.is_some()
+            || self.waiting.is_empty()
+            || !self.nothing_live()
+            || !profile::recorder_enabled()
+        {
+            return;
+        }
+        if self.device.synchronize().is_err() {
+            return;
+        }
+        profile::reset();
+        self.window = Some(ProfileWindow {
+            started: std::time::Instant::now(),
+            steps: Vec::new(),
+        });
+    }
+
+    /// Close the window once nothing is live and nothing waits: the GPU's
+    /// busy union against the window's wall on stderr, and under
+    /// `diagnostics.gpu_profile.dump` the command buffers
+    /// (`<dump>.batch<n>.csv`), the steps (`<dump>.batch<n>.steps.csv`) and,
+    /// with the encoder counters on, every sampled encoder
+    /// (`<dump>.batch<n>.encoders.csv`).
+    #[cfg(feature = "metal")]
+    fn close_window(&mut self) {
+        use lloom_tensor::kernels::metal::profile;
+        if self.window.is_none() || !self.nothing_live() || !self.waiting.is_empty() {
+            return;
+        }
+        let w = self.window.take().expect("checked");
+        let _ = self.device.synchronize();
+        let wall = w.started.elapsed().as_secs_f64();
+        let s = profile::snapshot();
+        let idle: f64 = s.idle_gaps.iter().map(|g| g.idle).sum();
+        let starved: f64 = s.idle_gaps.iter().map(|g| g.starved).sum();
+        let n = self.windows;
+        self.windows += 1;
+        eprintln!(
+            "[profile: batch window {n}: {} steps, {} with pieces, {} holding rows; gpu_busy_union {:.4} s /              wall {:.4} s = {:.4} busy/wall; {} command buffers, idle between them {:.4} s (starved {:.4} s)]",
+            w.steps.len(),
+            w.steps.iter().filter(|x| x.report.pieces > 0).count(),
+            w.steps.iter().filter(|x| x.report.held > 0).count(),
+            s.gpu_busy_union_s,
+            wall,
+            s.gpu_busy_union_s / wall.max(1e-9),
+            s.timed_command_buffers,
+            idle,
+            starved,
+        );
+        let intervals: Vec<(f64, f64)> = s
+            .command_buffer_records
+            .iter()
+            .map(|r| (r.interval.start, r.interval.end))
+            .collect();
+        for row in steady_rows(&w.steps, &intervals) {
+            let stages: Vec<String> = STAGE_NAMES
+                .iter()
+                .zip(row.stages_ms)
+                .map(|(name, ms)| format!("{name} {ms:.3}"))
+                .collect();
+            eprintln!(
+                "[profile: batch window {n} decode at {} live: {} steps; median ms/step: wall {:.3}, \
+                 gpu_busy {:.3}; host {}; between steps {:.3}; {:.0} dispatches/step]",
+                row.live,
+                row.steps,
+                row.wall_ms,
+                row.gpu_busy_ms,
+                stages.join(", "),
+                row.between_ms,
+                row.dispatches,
+            );
+        }
+        let Some(path) = lloom_tensor::tuning::tuning()
+            .instrument
+            .profile_dump
+            .clone()
+        else {
+            return;
+        };
+        let mut cb = String::from("step,committed_s,start_s,end_s\n");
+        for r in &s.command_buffer_records {
+            cb.push_str(&format!(
+                "{},{:.6},{:.6},{:.6}\n",
+                r.step, r.committed, r.interval.start, r.interval.end
+            ));
+        }
+        let mut st = String::from(
+            "step,host_start_s,host_end_s,live,held,pieces,piece_tokens,retired,pending,dispatches",
+        );
+        for name in STAGE_NAMES {
+            st.push_str(&format!(",{name}_ns"));
+        }
+        st.push('\n');
+        for x in &w.steps {
+            let r = &x.report;
+            st.push_str(&format!(
+                "{},{:.6},{:.6},{},{},{},{},{},{},{}",
+                x.step,
+                x.t0,
+                x.t1,
+                r.live,
+                r.held,
+                r.pieces,
+                r.piece_tokens,
+                r.retired,
+                r.pending,
+                x.dispatches
+            ));
+            for ns in stage_array(&x.phases) {
+                st.push_str(&format!(",{ns}"));
+            }
+            st.push('\n');
+        }
+        let mut census = String::from("label,dispatches\n");
+        for (label, count) in &s.by_label {
+            census.push_str(&format!("{label},{count}\n"));
+        }
+        let mut files = vec![
+            (format!("{path}.batch{n}.csv"), cb),
+            (format!("{path}.batch{n}.steps.csv"), st),
+            (format!("{path}.batch{n}.census.csv"), census),
+        ];
+        if !s.encoder_records.is_empty() {
+            let mut enc = String::from("step,label,start_s,end_s,dispatches\n");
+            for e in &s.encoder_records {
+                enc.push_str(&format!(
+                    "{},{},{:.6},{:.6},{}\n",
+                    e.step,
+                    e.label.as_deref().unwrap_or("-"),
+                    e.start,
+                    e.end,
+                    e.dispatches
+                ));
+            }
+            files.push((format!("{path}.batch{n}.encoders.csv"), enc));
+        }
+        for (p, body) in files {
+            match std::fs::write(&p, body) {
+                Ok(()) => eprintln!("[profile: wrote {p}]"),
+                Err(e) => eprintln!("[profile: writing {p} failed: {e}]"),
+            }
+        }
+    }
+
     /// The loop, until shutdown or every sender is dropped.
     fn run(mut self) {
         loop {
@@ -959,6 +1369,8 @@ where
             match self.mode {
                 BatchMode::Continuous => {
                     if self.closed.is_empty() {
+                        #[cfg(feature = "metal")]
+                        self.open_window();
                         self.admit_waiting();
                     }
                     if !self.decoder.is_idle() {
@@ -980,6 +1392,8 @@ where
                             }
                         }
                     }
+                    #[cfg(feature = "metal")]
+                    self.close_window();
                 }
                 BatchMode::Static(_) => {
                     if self.closed.is_empty() && !self.waiting.is_empty() {
@@ -1186,11 +1600,27 @@ mod tests {
         }
     }
 
+    /// `scheduler.intake_per_tick`'s default, which these fixtures run at.
+    const INTAKE_PER_TICK: usize = crate::options::DEFAULT_INTAKE_PER_TICK;
+
     fn start(
         max_rows: usize,
         chunk: usize,
         mode: BatchMode<Chain, ()>,
     ) -> (BatchHandle<Chain, ()>, std::thread::JoinHandle<()>) {
+        start_with(max_rows, chunk, 1, PrefillDecode::Ride, mode, None)
+    }
+
+    fn start_with(
+        max_rows: usize,
+        chunk: usize,
+        prefill_batch: usize,
+        prefill_decode: PrefillDecode,
+        mode: BatchMode<Chain, ()>,
+        on_counters: Option<CountersHook>,
+    ) -> (BatchHandle<Chain, ()>, std::thread::JoinHandle<()>) {
+        // The option's default; the fairness test reads the same constant.
+        let intake_per_tick = INTAKE_PER_TICK;
         let device = Device::Cpu;
         let core = Arc::new(Chain::new(&device).unwrap());
         let pool = SlotPool::new(max_rows, || Pos(0));
@@ -1206,9 +1636,12 @@ mod tests {
             max_rows,
             reuse_prefix: false,
             share_prefix: false,
+            prefill_batch,
+            prefill_decode,
+            intake_per_tick,
             mode,
             extra: (),
-            on_counters: None,
+            on_counters,
         };
         spawn(core, |c: &Chain| c, cfg).unwrap()
     }
@@ -1306,6 +1739,61 @@ mod tests {
         thread.join().unwrap();
     }
 
+    /// The scheduler hands its prefill policy to the K=1 loop: four requests
+    /// queued at once at `prefill_batch` 4 are fed together (a step carries
+    /// all four rows' pieces), and under the pause arm a row streaming while
+    /// another prompt is fed is held; every stream is its chain.
+    ///
+    /// At one chunk a step and the pause arm, steps 1–2 feed row 0, 3–4 row
+    /// 1, 5–6 row 2, 7–8 row 3; a row rides the step after it joins (its
+    /// first token) and is held from the next, so steps 4–8 hold a row.
+    #[test]
+    fn queued_prompts_are_prefilled_together_and_each_decodes_its_own_chain() {
+        for (k, arm, held_steps) in [
+            (1, PrefillDecode::Ride, 0),
+            (4, PrefillDecode::Ride, 0),
+            (1, PrefillDecode::Pause, 5),
+            (4, PrefillDecode::Pause, 0),
+        ] {
+            let seen = Arc::new(parking_lot::Mutex::new(BatchCounters::default()));
+            let sink = Arc::clone(&seen);
+            let hook: CountersHook = Box::new(move |c| *sink.lock() = *c);
+            let (handle, thread) = start_with(4, 2, k, arm, BatchMode::Continuous, Some(hook));
+            let prompts: Vec<Vec<u32>> = vec![
+                vec![9, 9, 9, 1],
+                vec![9, 9, 9, 0],
+                vec![9, 9, 9, 5],
+                vec![9, 9, 9, 7],
+            ];
+            let gate = hold(&handle);
+            let rxs: Vec<Receiver<BatchEvent>> = prompts
+                .iter()
+                .map(|p| {
+                    handle.submit(BatchRequest {
+                        prompt_ids: p.clone(),
+                        params: params(12),
+                        cancel: Arc::new(AtomicBool::new(false)),
+                    })
+                })
+                .collect();
+            gate.send(()).unwrap();
+            for (p, rx) in prompts.iter().zip(&rxs) {
+                let (streamed, done) = collect(rx);
+                let (want, eos) = chain(*p.last().unwrap(), 12);
+                assert_eq!(done.tokens, want, "k {k} {arm}: prompt {p:?}");
+                assert_eq!(streamed, want, "k {k} {arm}: prompt {p:?}");
+                assert_eq!(done.eos, eos);
+            }
+            handle.shutdown();
+            thread.join().unwrap();
+            let c = *seen.lock();
+            // At a chunk of two, one row's piece a step at k = 1, all four
+            // rows' at k = 4 (they were queued before the first step).
+            assert_eq!(c.max_pieces, k, "k {k} {arm}: {c:?}");
+            assert_eq!(c.held_steps, held_steps, "k {k} {arm}: {c:?}");
+        }
+    }
+
     /// A row draws through the batched driver, never through the request's
     /// sampler, so a request carrying logits processors is refused by name
     /// rather than served without them; the next plain request still runs.
@@ -1372,6 +1860,157 @@ mod tests {
         assert_eq!(idle_len, 2);
         handle.shutdown();
         thread.join().unwrap();
+    }
+
+    /// A burst queued while a row is live is taken a bounded number of jobs
+    /// per step, so the live row's next step is not postponed behind the
+    /// whole queue; nothing in the burst is lost, only deferred.
+    ///
+    /// The scheduler is held inside its counters hook after a step with row
+    /// A live, the burst queued meanwhile, then released: every request
+    /// the next tick takes is answered before the step that follows it
+    /// (each is cancelled, so `admit_waiting` answers it at once), so the
+    /// answers counted at that step are the jobs taken in that tick.
+    #[test]
+    fn a_queued_burst_cannot_postpone_a_live_row_past_the_intake_budget() {
+        const BURST: usize = 4096;
+        const BUDGET: usize = INTAKE_PER_TICK;
+        let (paused_tx, paused_rx) = mpsc::channel::<u64>();
+        let (go_tx, go_rx) = mpsc::channel::<()>();
+        let go_rx = parking_lot::Mutex::new(go_rx);
+        let hook: CountersHook = Box::new(move |c| {
+            if c.steps == 3 || c.steps == 4 {
+                let _ = paused_tx.send(c.steps);
+                let _ = go_rx.lock().recv();
+            }
+        });
+        let (handle, thread) = start_with(
+            2,
+            0,
+            1,
+            PrefillDecode::Ride,
+            BatchMode::Continuous,
+            Some(hook),
+        );
+        let live_cancel = Arc::new(AtomicBool::new(false));
+        let live = handle.submit(BatchRequest {
+            prompt_ids: vec![0],
+            params: params(1_000_000),
+            cancel: Arc::clone(&live_cancel),
+        });
+        assert_eq!(paused_rx.recv_timeout(Duration::from_secs(30)).unwrap(), 3);
+        let mut before = 0usize;
+        while let Ok(BatchEvent::Tokens(ids)) = live.try_recv() {
+            before += ids.len();
+        }
+        assert!(before > 0, "the row is live before the burst");
+        let burst: Vec<Receiver<BatchEvent>> = (0..BURST)
+            .map(|_| {
+                handle.submit(BatchRequest {
+                    prompt_ids: vec![5],
+                    params: params(4),
+                    cancel: Arc::new(AtomicBool::new(true)),
+                })
+            })
+            .collect();
+        go_tx.send(()).unwrap();
+        assert_eq!(paused_rx.recv_timeout(Duration::from_secs(30)).unwrap(), 4);
+        let answered = burst.iter().filter(|rx| rx.try_recv().is_ok()).count();
+        let mut after = 0usize;
+        while let Ok(BatchEvent::Tokens(ids)) = live.try_recv() {
+            after += ids.len();
+        }
+        assert!(after > 0, "the live row stepped after the release");
+        assert!(
+            answered <= BUDGET,
+            "the tick before the live row's step took {answered} of {BURST} queued jobs \
+             (budget {BUDGET}): intake postponed the live row behind the queue"
+        );
+        live_cancel.store(true, Ordering::Release);
+        go_tx.send(()).unwrap();
+        // Deferred, not dropped: every queued request is still answered.
+        let mut late = 0usize;
+        for rx in &burst {
+            match rx.recv_timeout(Duration::from_secs(30)) {
+                Ok(BatchEvent::Done(d)) => {
+                    assert!(d.cancelled);
+                    late += 1;
+                }
+                Ok(other) => panic!("a cancelled request got {other:?}"),
+                Err(_) => {}
+            }
+        }
+        assert_eq!(answered + late, BURST, "every queued request is answered");
+        let (_, done) = collect(&live);
+        assert!(done.cancelled);
+        handle.shutdown();
+        thread.join().unwrap();
+    }
+
+    /// The decode cadence counts a step only when it is one decode step at
+    /// its width — no piece, no held row, the next step at the same live
+    /// count — and charges it the GPU's busy union inside its interval.
+    #[test]
+    fn the_decode_cadence_counts_only_whole_decode_steps_at_one_width() {
+        let report = |live, pieces| lloom::nn::StepReport {
+            live,
+            pieces,
+            ..Default::default()
+        };
+        let phases = lloom::nn::BatchStepPhases {
+            encode_ns: 2_000_000,
+            wait_ns: 7_000_000,
+            ..Default::default()
+        };
+        let step = |step: u64, t0: f64, live, pieces| WindowStep {
+            step,
+            t0,
+            t1: t0 + 0.009,
+            report: report(live, pieces),
+            phases,
+            dispatches: 400,
+        };
+        // A piece step, three decode steps at 4 live, a step at 3 live
+        // (a row retired), then one at 3 to close its interval.
+        let steps = vec![
+            step(0, 0.000, 4, 1),
+            step(1, 0.030, 4, 0),
+            step(2, 0.040, 4, 0),
+            step(3, 0.050, 4, 0),
+            step(4, 0.060, 3, 0),
+            step(5, 0.069, 3, 0),
+        ];
+        // The GPU busy 8 ms of every 10 from 0.030 on, idle at its edges.
+        let intervals: Vec<(f64, f64)> = (0..5)
+            .map(|k| (0.031 + 0.010 * k as f64, 0.039 + 0.010 * k as f64))
+            .collect();
+        let rows = steady_rows(&steps, &intervals);
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        let four = &rows[1];
+        assert_eq!(
+            (four.live, four.steps),
+            (4, 2),
+            "step 3's successor is at 3 live"
+        );
+        assert!((four.wall_ms - 10.0).abs() < 1e-9, "{four:?}");
+        assert!((four.gpu_busy_ms - 8.0).abs() < 1e-9, "{four:?}");
+        assert!((four.between_ms - 1.0).abs() < 1e-9, "{four:?}");
+        assert!((four.stages_ms[5] - 2.0).abs() < 1e-12);
+        assert!((four.stages_ms[7] - 7.0).abs() < 1e-12);
+        assert_eq!(four.dispatches, 400.0);
+        let three = &rows[0];
+        assert_eq!((three.live, three.steps), (3, 1));
+        assert!((three.wall_ms - 9.0).abs() < 1e-9, "{three:?}");
+        assert!((three.gpu_busy_ms - 8.0).abs() < 1e-9, "{three:?}");
+    }
+
+    /// The busy union does not double-count overlapping buffers and clips
+    /// at the interval's edges.
+    #[test]
+    fn the_busy_union_inside_an_interval_merges_and_clips() {
+        let ivs = [(0.0, 2.0), (1.0, 3.0), (5.0, 6.0), (7.0, 9.0)];
+        assert_eq!(super::steady::busy_within(&ivs, 0.5, 8.0), 2.5 + 1.0 + 1.0);
+        assert_eq!(super::steady::busy_within(&ivs, 3.0, 5.0), 0.0);
     }
 
     /// The static mode runs the waiting rows through the body as one batch

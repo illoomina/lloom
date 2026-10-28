@@ -18,6 +18,18 @@ use lloom::load_warning::LoadWarning;
 use lloom_tensor::Device;
 use serde_json::{Map, Value};
 
+/// A detokenizer attempt over its pending token run, before text publication.
+/// `from` is its raw byte offset; repeated attempts replace that pending span.
+/// The decoder is the same one used by generation, not retokenization.
+pub type DecodeObserver<'a> = dyn FnMut(
+        &[u32],
+        &str,
+        usize,
+        &dyn Fn(&[u32]) -> lloom_tensor::Result<String>,
+    ) -> lloom_tensor::Result<()>
+    + Send
+    + 'a;
+
 pub trait Served: Send + Sync {
     /// The device the model decodes on.
     fn device(&self) -> &Device;
@@ -29,6 +41,11 @@ pub trait Served: Send + Sync {
     /// ring under `auto`; the blocking arm on Qwen4-exp, whose forward needs
     /// its input ids host-side).
     fn readback(&self) -> ReadbackArm;
+    /// Why a session's `keep: prefix` is not served by this process, `None`
+    /// where it pins a session's head (`docs/sessions.md` §8).
+    fn prefix_pin_refused(&self) -> Option<String> {
+        Some("this family's turn checkpoints take no pin (docs/sessions.md §8)".into())
+    }
     /// Whether the owner keeps a request's prefix for the next one
     /// (`context.prefix.reuse` as it resolved at load); `None` where the
     /// owner does not say (an already-loaded owner whose policy is its own).
@@ -234,6 +251,35 @@ pub trait Served: Send + Sync {
     ) -> Result<Decoded> {
         let _ = (prompt_ids, images, params, on_fragment);
         Err(self.no_vision())
+    }
+
+    /// Generation with typed detokenizer observations. Legacy adapters retain
+    /// their existing fragment seam; the GGUF owner supplies the observations.
+    fn complete_observed(
+        &self,
+        prompt: &[u32],
+        images: &[DecodedImage],
+        params: &DecodeParams,
+        on_fragment: &mut (dyn FnMut(&str) -> bool + Send),
+        _observe: &mut DecodeObserver<'_>,
+    ) -> Result<Decoded> {
+        if images.is_empty() {
+            self.complete_until(prompt, params, on_fragment)
+        } else {
+            self.complete_images_until(prompt, images, params, on_fragment)
+        }
+    }
+
+    /// Whether [`Self::complete_observed`] supplies the typed detokenizer
+    /// observations the chat reasoning splitter places its markers from. The
+    /// default seam above ignores the observer, so on a family that keeps it
+    /// the splitter would start inside the block its prompt opened and never
+    /// see the end marker — the answer came back in `reasoning_content` and
+    /// `content` was empty (#946, 2026-10-21). Such a family returns the whole
+    /// reply in `content` until its decode paths are wired to
+    /// `observed_decode`; the GGUF owner, which supplies them, says so.
+    fn observes_decode(&self) -> bool {
+        false
     }
 
     /// What the last request loaded and encoded: the model's tensors, whether

@@ -820,3 +820,502 @@ fn a_temperature_row_draws_from_its_own_seed_beside_any_neighbours() -> Result<(
     }
     Ok(())
 }
+
+#[test]
+fn filtered_gumbel_runs_the_existing_per_row_host_batch() -> Result<()> {
+    let device = Device::Cpu;
+    let model = Chain::new(&device)?;
+    let mut decoder: BatchDecoder<'_, Chain, Session<'_, Chain>> =
+        BatchDecoder::new(DecodeOptions::new(4), &[EOS], device.clone())?;
+    let arm = Sampling::FilteredGumbel {
+        temperature: 0.7,
+        k: 1,
+        p: 0.6,
+    };
+    let row = decoder.admit(Session::new(&model, 0usize), vec![1], arm.clone(), 7)?;
+    let neighbour = decoder.admit(Session::new(&model, 0usize), vec![0], Sampling::ArgMax, 9)?;
+    let mut streamed = std::collections::BTreeMap::<usize, Vec<u32>>::new();
+    while !decoder.is_idle() {
+        decoder.step(&mut |id, ids| {
+            streamed
+                .entry(id.slot())
+                .or_default()
+                .extend_from_slice(ids);
+            Ok(())
+        })?;
+    }
+    let finished = decoder.take_finished();
+    assert_eq!(finished.len(), 2);
+    for (id, session, out) in finished {
+        let start = if id == row {
+            1
+        } else {
+            assert_eq!(id, neighbour);
+            0
+        };
+        let want = chain(start, 4).0;
+        assert_eq!(out.ids, want);
+        assert_eq!(streamed.get(&id.slot()).unwrap(), &want);
+        assert_eq!(session.overrun(), 0);
+        assert_eq!(*session.sequence().cache(), session.pos());
+    }
+    // Closed legacy batches still promise one device argmax, not per-row
+    // sampling: the public capability must not promote that wrapper.
+    let mut sessions = [Session::new(&model, 0usize)];
+    let mut sampler = LogitsProcessor::from_sampling(7, arm);
+    let error = Session::decode_batched(
+        &mut sessions,
+        &mut sampler,
+        &[&[1]],
+        &DecodeOptions::new(4),
+        &[EOS],
+        &device,
+        &mut |_, _| panic!("closed-batch refusal reached callback"),
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("per-row host sample"), "{error}");
+    assert_eq!(sessions[0].pos(), 0);
+    assert_eq!(*sessions[0].sequence().cache(), 0);
+    Ok(())
+}
+
+// ---- prefilling the pending prompts together (`batched-decode-design.md` §11.8)
+
+use lloom::nn::{PrefillDecode, StepReport};
+
+/// One step, streaming into `streams` keyed by slot.
+fn step_streaming<'m>(
+    dec: &mut BatchDecoder<'m, Chain, Session<'m, Chain>>,
+    streams: &mut [Vec<u32>],
+) -> Result<StepReport> {
+    dec.step(&mut |row, ids| {
+        streams[row.slot()].extend_from_slice(ids);
+        Ok(())
+    })
+}
+
+/// Step until no row is pending, recording each step's report.
+fn steps_until_joined<'m>(
+    dec: &mut BatchDecoder<'m, Chain, Session<'m, Chain>>,
+    streams: &mut [Vec<u32>],
+) -> Result<Vec<StepReport>> {
+    let mut reports = Vec::new();
+    while dec.pending_rows() > 0 {
+        reports.push(step_streaming(dec, streams)?);
+    }
+    Ok(reports)
+}
+
+/// `with_prefill_batch(k)`: a step's prompt budget is `k` chunks over the
+/// pending rows in slot order, each row's piece at most one chunk, so the
+/// pending prompts are fed together — four six-token prompts at a chunk of
+/// two are in after 3 steps at k = 4 against 12 at k = 1 — and every row's
+/// stream is its solo chain at every k. The budget is tokens, not rows: a
+/// row that needs less than a chunk leaves the rest to the next row.
+#[test]
+fn a_step_carries_up_to_prefill_batch_rows_chunks() -> Result<()> {
+    let prompts: Vec<Vec<u32>> = vec![
+        vec![9, 9, 9, 9, 9, 1],
+        vec![9, 9, 9, 9, 9, 0],
+        vec![9, 9, 9, 9, 9, 5],
+        vec![9, 9, 9, 9, 9, 7],
+    ];
+    let max = 10;
+    // (k, the (pieces, tokens) of every step until no row is pending),
+    // hand-derived: a group of up to k rows takes a two-token piece each
+    // per step, three steps a group.
+    let schedules: [(usize, Vec<(usize, usize)>); 5] = [
+        (1, vec![(1, 2); 12]),
+        (2, vec![(2, 4); 6]),
+        (3, [vec![(3, 6); 3], vec![(1, 2); 3]].concat()),
+        (4, vec![(4, 8); 3]),
+        (8, vec![(4, 8); 3]),
+    ];
+    for device in devices() {
+        let model = Chain::new(&device)?;
+        for lookahead in [0usize, 1] {
+            for (k, want_steps) in &schedules {
+                let tag = format!("{device:?} lookahead {lookahead} prefill_batch {k}");
+                let opts = DecodeOptions {
+                    lookahead,
+                    prefill_chunk: 2,
+                    ..DecodeOptions::new(max)
+                };
+                let mut dec: BatchDecoder<'_, Chain, Session<'_, Chain>> =
+                    BatchDecoder::new(opts, &[EOS], device.clone())?.with_prefill_batch(*k);
+                assert_eq!(dec.prefill_batch(), *k, "{tag}");
+                let ids: Vec<RowId> = prompts
+                    .iter()
+                    .map(|p| {
+                        dec.admit(Session::new(&model, 0usize), p.clone(), Sampling::ArgMax, 0)
+                            // A refusal hands the row's session back
+                            // (`Rejected`); this fixture admits every row.
+                            .map_err(lloom_tensor::Error::from)
+                    })
+                    .collect::<Result<_>>()?;
+                let mut streams: Vec<Vec<u32>> = vec![Vec::new(); 8];
+                let reports = steps_until_joined(&mut dec, &mut streams)?;
+                let got: Vec<(usize, usize)> =
+                    reports.iter().map(|r| (r.pieces, r.piece_tokens)).collect();
+                assert_eq!(&got, want_steps, "{tag}: the steps' pieces and tokens");
+                let finished = drain(&mut dec, &mut streams)?;
+                assert_eq!(finished.len(), prompts.len(), "{tag}: every row retires");
+                for (id, _, out) in &finished {
+                    let r = ids.iter().position(|x| x == id).expect("an admitted row");
+                    let (want, want_eos) = chain(*prompts[r].last().unwrap(), max);
+                    assert_eq!(out.ids, want, "{tag}: row {r} ids");
+                    assert_eq!(out.eos, want_eos, "{tag}: row {r} eos");
+                    assert_eq!(streams[id.slot()], want, "{tag}: row {r} streamed");
+                    assert_eq!(out.stats.prefill_units, 3, "{tag}: row {r} pieces");
+                }
+            }
+        }
+        // The budget is tokens: at k = 2 (four tokens a step) a one-token
+        // prompt leaves three, so a third row is fed in the same step.
+        let opts = DecodeOptions {
+            prefill_chunk: 2,
+            ..DecodeOptions::new(4)
+        };
+        let mut dec: BatchDecoder<'_, Chain, Session<'_, Chain>> =
+            BatchDecoder::new(opts, &[EOS], device.clone())?.with_prefill_batch(2);
+        for p in [vec![9u32, 9, 1], vec![0u32], vec![9u32, 5]] {
+            dec.admit(Session::new(&model, 0usize), p, Sampling::ArgMax, 0)?;
+        }
+        let mut streams: Vec<Vec<u32>> = vec![Vec::new(); 8];
+        let first = step_streaming(&mut dec, &mut streams)?;
+        assert_eq!(
+            (first.pieces, first.piece_tokens),
+            (3, 4),
+            "{device:?}: 2 + 1 + 1 tokens in the first step"
+        );
+    }
+    Ok(())
+}
+
+/// Under `PrefillDecode::Pause` a row that has streamed waits while pending
+/// prompts' pieces are fed — held, neither sampled nor fed, its logits kept
+/// — and a row still owing its first token takes it beside the pieces;
+/// every row ends on its solo chain. Under `Ride` the streaming row takes a
+/// token every step. Steps 3–7 are hand-derived: `b`'s one piece, then
+/// `c`'s three, at a chunk of two and one chunk a step.
+#[test]
+fn the_pause_arm_holds_streaming_rows_while_pieces_are_fed() -> Result<()> {
+    let max = 12;
+    for device in devices() {
+        let model = Chain::new(&device)?;
+        for lookahead in [0usize, 1] {
+            for arm in [PrefillDecode::Ride, PrefillDecode::Pause] {
+                let tag = format!("{device:?} lookahead {lookahead} {arm}");
+                let opts = DecodeOptions {
+                    lookahead,
+                    prefill_chunk: 2,
+                    ..DecodeOptions::new(max)
+                };
+                let mut dec: BatchDecoder<'_, Chain, Session<'_, Chain>> =
+                    BatchDecoder::new(opts, &[EOS], device.clone())?.with_prefill_decode(arm);
+                let mut streams: Vec<Vec<u32>> = vec![Vec::new(); 8];
+                let a = dec.admit(Session::new(&model, 0usize), vec![0], Sampling::ArgMax, 0)?;
+                // Step 0 feeds a's prompt; steps 1 and 2 stream its first two.
+                for _ in 0..3 {
+                    step_streaming(&mut dec, &mut streams)?;
+                }
+                assert_eq!(streams[a.slot()].len(), 2, "{tag}: a before the arrivals");
+                let b = dec.admit(
+                    Session::new(&model, 0usize),
+                    vec![3, 1],
+                    Sampling::ArgMax,
+                    0,
+                )?;
+                let c = dec.admit(
+                    Session::new(&model, 0usize),
+                    vec![9, 9, 9, 9, 9, 5],
+                    Sampling::ArgMax,
+                    0,
+                )?;
+                let mut reports = Vec::new();
+                let mut a_len = Vec::new();
+                let mut b_len = Vec::new();
+                for _ in 3..8 {
+                    reports.push(step_streaming(&mut dec, &mut streams)?);
+                    a_len.push(streams[a.slot()].len());
+                    b_len.push(streams[b.slot()].len());
+                }
+                let got: Vec<(usize, usize, usize)> =
+                    reports.iter().map(|r| (r.live, r.held, r.pieces)).collect();
+                match arm {
+                    PrefillDecode::Pause => {
+                        assert_eq!(
+                            got,
+                            vec![(0, 1, 1), (1, 1, 1), (0, 2, 1), (0, 2, 1), (3, 0, 0)],
+                            "{tag}: (live, held, pieces) at steps 3-7"
+                        );
+                        assert_eq!(a_len, vec![2, 2, 2, 2, 3], "{tag}: a waits for the pieces");
+                        assert_eq!(
+                            b_len,
+                            vec![0, 1, 1, 1, 2],
+                            "{tag}: b's first token is not held"
+                        );
+                    }
+                    PrefillDecode::Ride => {
+                        assert_eq!(
+                            got,
+                            vec![(1, 0, 1), (2, 0, 1), (2, 0, 1), (2, 0, 1), (3, 0, 0)],
+                            "{tag}: (live, held, pieces) at steps 3-7"
+                        );
+                        assert_eq!(a_len, vec![3, 4, 5, 6, 7], "{tag}: a rides every step");
+                        assert_eq!(b_len, vec![0, 1, 2, 3, 4], "{tag}: b rides from its join");
+                    }
+                }
+                let finished = drain(&mut dec, &mut streams)?;
+                assert_eq!(finished.len(), 3, "{tag}: every row retires");
+                for (id, start) in [(a, 0u32), (b, 1), (c, 5)] {
+                    let (want, _) = chain(start, max);
+                    assert_eq!(streams[id.slot()], want, "{tag}: row {} stream", id.slot());
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+// ---- the decode step's scope and its stages (`batched-decode-design.md` §13)
+
+/// [`Chain`] recording, per entry point, how many calls ran with a batched
+/// decode step's scope (`tuning::DecodeRows`) open and how many without.
+struct ScopeChain {
+    inner: Chain,
+    /// `(open, closed)` calls: `forward_rows`, `forward_ragged`, `forward`.
+    rows: ScopeCount,
+    ragged: ScopeCount,
+    single: ScopeCount,
+    /// `forward_ragged` calls led by their live rows
+    /// (`tuning::RaggedDecodeRows`) and calls with none; `misled` counts a
+    /// lead that is not the call's one-token rows, first, over its input and
+    /// its head.
+    led: ScopeCount,
+    misled: std::sync::atomic::AtomicU32,
+    /// Led calls whose head's rows differ from their input's (a piece of
+    /// more than one token rode the live rows): the case that tells the two
+    /// counts apart.
+    wide: std::sync::atomic::AtomicU32,
+}
+
+/// Calls made with the scope open and without it.
+#[derive(Default)]
+struct ScopeCount(std::sync::atomic::AtomicU32, std::sync::atomic::AtomicU32);
+
+impl ScopeCount {
+    fn get(&self) -> (u32, u32) {
+        use std::sync::atomic::Ordering::Relaxed;
+        (self.0.load(Relaxed), self.1.load(Relaxed))
+    }
+}
+
+impl ScopeChain {
+    fn new(device: &Device) -> Result<Self> {
+        Ok(Self {
+            inner: Chain::new(device)?,
+            rows: Default::default(),
+            ragged: Default::default(),
+            single: Default::default(),
+            led: Default::default(),
+            misled: Default::default(),
+            wide: Default::default(),
+        })
+    }
+
+    fn note_lead(&self, tokens: &Tensor, rows: &[RaggedRow<'_, usize>]) {
+        use lloom_tensor::tuning::ragged_decode_lead;
+        use std::sync::atomic::Ordering::Relaxed;
+        let total = tokens.dim(1).unwrap_or(0);
+        match ragged_decode_lead(total) {
+            Some(live) => {
+                self.led.0.fetch_add(1, Relaxed);
+                let leads = live < rows.len()
+                    && rows[..live].iter().all(|r| r.len == 1)
+                    && ragged_decode_lead(rows.len()) == Some(live);
+                if !leads {
+                    self.misled.fetch_add(1, Relaxed);
+                }
+                if rows.len() != total {
+                    self.wide.fetch_add(1, Relaxed);
+                }
+            }
+            None => {
+                self.led.1.fetch_add(1, Relaxed);
+            }
+        }
+    }
+
+    fn note(c: &ScopeCount) {
+        use std::sync::atomic::Ordering::Relaxed;
+        if lloom_tensor::tuning::in_decode_rows() {
+            c.0.fetch_add(1, Relaxed);
+        } else {
+            c.1.fetch_add(1, Relaxed);
+        }
+    }
+}
+
+impl Model for ScopeChain {
+    type Config = ();
+    fn from_weights(_vb: lloom::nn::VarBuilder, _cfg: &()) -> Result<Self> {
+        lloom_tensor::bail!("ScopeChain has no weights")
+    }
+}
+
+impl CausalLM for ScopeChain {
+    type Cache = usize;
+
+    fn new_cache(&self, cfg: &(), dev: &Device) -> Result<usize> {
+        self.inner.new_cache(cfg, dev)
+    }
+
+    fn embed(&self, tokens: &Tensor) -> Result<Tensor> {
+        self.inner.embed(tokens)
+    }
+
+    fn forward_embeds(&self, embeds: &Tensor, pos: usize, cache: &mut usize) -> Result<Tensor> {
+        Self::note(&self.single);
+        self.inner.forward_embeds(embeds, pos, cache)
+    }
+
+    fn vocab_size(&self) -> usize {
+        VOCAB
+    }
+}
+
+impl BatchedCausalLM for ScopeChain {
+    fn forward_ragged(&self, tokens: &Tensor, rows: &mut [RaggedRow<'_, usize>]) -> Result<Tensor> {
+        Self::note(&self.ragged);
+        self.note_lead(tokens, rows);
+        self.inner.forward_ragged(tokens, rows)
+    }
+
+    fn forward_rows(&self, tokens: &Tensor, rows: &mut [Row<'_, usize>]) -> Result<Tensor> {
+        Self::note(&self.rows);
+        self.inner.forward_rows(tokens, rows)
+    }
+}
+
+/// The decode step's forward — and only it — runs with the scope
+/// `kernels.gemm.f16_rows_decode` routes open: every `forward_rows` call
+/// has it, and no step that carries prompt pieces (`forward_ragged`) and no
+/// whole-prompt prefill (`forward`) does; the scope is closed again between
+/// steps. A step that carries pieces beside live rows is led by them instead
+/// (`tuning::RaggedDecodeRows`: its one-token rows first, over its input and
+/// its head), and a step of pieces alone by none. On both lookahead arms,
+/// with chunked and whole-prompt admission.
+#[test]
+fn only_the_decode_steps_forward_opens_the_decode_rows_scope() -> Result<()> {
+    for device in devices() {
+        for lookahead in [0usize, 1] {
+            for chunk in [0usize, 2] {
+                let tag = format!("{device:?} lookahead {lookahead} chunk {chunk}");
+                let model = ScopeChain::new(&device)?;
+                let opts = DecodeOptions {
+                    lookahead,
+                    prefill_chunk: chunk,
+                    ..DecodeOptions::new(6)
+                };
+                let mut dec: BatchDecoder<'_, ScopeChain, Session<'_, ScopeChain>> =
+                    BatchDecoder::new(opts, &[EOS], device.clone())?;
+                for p in [vec![9u32, 9, 1], vec![9, 0], vec![5], vec![9, 9, 9, 0]] {
+                    dec.admit(Session::new(&model, 0usize), p, Sampling::ArgMax, 0)?;
+                }
+                let mut n = 0;
+                while !dec.is_idle() {
+                    dec.step(&mut |_, _| Ok(()))?;
+                    assert!(
+                        !lloom_tensor::tuning::in_decode_rows(),
+                        "{tag}: the scope outlived the step"
+                    );
+                    assert_eq!(
+                        lloom_tensor::tuning::ragged_decode_lead(usize::MAX),
+                        None,
+                        "{tag}: the ragged scope outlived the step"
+                    );
+                    n += 1;
+                    assert!(n < 100, "{tag}: the batch never drained");
+                }
+                let (rows, ragged, single) =
+                    (model.rows.get(), model.ragged.get(), model.single.get());
+                assert!(rows.0 > 0, "{tag}: no decode step ran ({rows:?})");
+                assert_eq!(rows.1, 0, "{tag}: a decode step ran without the scope");
+                assert_eq!(ragged.0, 0, "{tag}: a step with pieces opened the scope");
+                assert_eq!(single.0, 0, "{tag}: a prefill opened the scope");
+                let led = model.led.get();
+                let misled = model.misled.load(std::sync::atomic::Ordering::Relaxed);
+                assert_eq!(
+                    misled, 0,
+                    "{tag}: a ragged step led by other rows than its live ones"
+                );
+                if chunk > 0 {
+                    assert!(ragged.1 > 0, "{tag}: no piece step ran ({ragged:?})");
+                    assert!(led.0 > 0, "{tag}: no piece rode a live row ({led:?})");
+                    let wide = model.wide.load(std::sync::atomic::Ordering::Relaxed);
+                    assert!(wide > 0, "{tag}: no piece of two tokens rode a live row");
+                    assert!(led.1 > 0, "{tag}: no step fed pieces alone ({led:?})");
+                } else {
+                    assert!(single.1 > 0, "{tag}: no whole prompt was fed ({single:?})");
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A step's host stages are read where the build carries the clock (debug
+/// and `profile`): a decode step's encode is charged, and the stages sum to
+/// no more than the step's own host time. In a release build every stage is
+/// zero by construction (the clock reads compiled out).
+#[test]
+fn a_steps_host_stages_partition_its_time() -> Result<()> {
+    let device = Device::Cpu;
+    let model = Chain::new(&device)?;
+    let opts = DecodeOptions {
+        lookahead: 1,
+        ..DecodeOptions::new(8)
+    };
+    let mut dec: BatchDecoder<'_, Chain, Session<'_, Chain>> =
+        BatchDecoder::new(opts, &[EOS], device.clone())?;
+    dec.admit(
+        Session::new(&model, 0usize),
+        vec![9, 1],
+        Sampling::ArgMax,
+        0,
+    )?;
+    dec.admit(
+        Session::new(&model, 0usize),
+        vec![9, 0],
+        Sampling::ArgMax,
+        0,
+    )?;
+    let mut decode_steps = 0;
+    while !dec.is_idle() {
+        let t = std::time::Instant::now();
+        let report = dec.step(&mut |_, _| Ok(()))?;
+        let wall = t.elapsed().as_nanos() as u64;
+        let ph = dec.last_step_phases();
+        if cfg!(debug_assertions) {
+            assert!(
+                ph.total_ns() <= wall,
+                "the stages sum past the step: {} > {wall} ({ph:?})",
+                ph.total_ns()
+            );
+            if report.live > 0 {
+                decode_steps += 1;
+                assert!(
+                    ph.encode_ns > 0,
+                    "a decode step's encode was not charged: {ph:?}"
+                );
+            }
+        } else {
+            assert_eq!(ph.total_ns(), 0, "release reads no clock: {ph:?}");
+        }
+    }
+    if cfg!(debug_assertions) {
+        assert!(decode_steps > 0, "no decode step ran");
+    }
+    Ok(())
+}

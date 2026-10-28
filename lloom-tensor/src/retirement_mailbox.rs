@@ -324,6 +324,7 @@ impl<T, F> OwnerMailbox<T, F> {
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn publish_feedback(&self, ticket: Ticket, feedback: F) -> Result<(), Rejected<F>> {
         match self.publish_feedback_observed(ticket, feedback, |_, _| {}, || {}) {
             Ok(()) => Ok(()),
@@ -488,6 +489,7 @@ impl<T, F> OwnerMailbox<T, F> {
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn try_detach_cleanup(&self, ticket: Ticket) -> Result<Detached<T, F>, MailboxError> {
         self.try_detach_cleanup_with_policy(ticket, CleanupPolicy::TerminalFeedback)
     }
@@ -544,6 +546,7 @@ impl<T, F> OwnerMailbox<T, F> {
         }
     }
 
+    #[cfg(test)]
     pub fn cancel_prepared(&self, ticket: Ticket) -> Result<Detached<T, F>, MailboxError> {
         self.transition(ticket, Phase::Prepared, Phase::Taking, 0)?;
         self.take(ticket)
@@ -630,6 +633,7 @@ impl<T, F> OwnerMailbox<T, F> {
         }
     }
 
+    #[cfg(test)]
     pub fn pin(&self, ticket: Ticket) -> Result<MetadataPin<'_, T, F>, MailboxError> {
         Ok(MetadataPin {
             mailbox: self,
@@ -645,10 +649,12 @@ pub(crate) struct PinPermit {
     ticket: Ticket,
 }
 
+#[cfg(test)]
 pub(crate) struct MetadataPin<'a, T, F> {
     mailbox: &'a OwnerMailbox<T, F>,
     permit: Option<PinPermit>,
 }
+#[cfg(test)]
 impl<T, F> MetadataPin<'_, T, F> {
     pub fn ticket(&self) -> Ticket {
         self.permit.as_ref().expect("live pin").ticket
@@ -663,6 +669,7 @@ impl<T, F> MetadataPin<'_, T, F> {
         })
     }
 }
+#[cfg(test)]
 impl<T, F> Drop for MetadataPin<'_, T, F> {
     fn drop(&mut self) {
         self.mailbox
@@ -922,7 +929,11 @@ mod tests {
         let last = first.try_clone().unwrap();
         assert_eq!(last.ticket(), old);
         drop(first);
-        drop(cell.cancel_prepared(old).unwrap());
+        {
+            let detached = cell.cancel_prepared(old).unwrap();
+            assert_eq!(detached.owner, 1);
+            assert_eq!(detached.feedback, None);
+        }
         std::thread::scope(|scope| {
             let (tx, rx) = sync_channel(0);
             let c = &cell;

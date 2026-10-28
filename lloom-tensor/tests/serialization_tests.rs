@@ -160,15 +160,19 @@ fn flagged_invalid_utf8_names_preserve_lossy_decoding() -> Result<()> {
     Ok(())
 }
 
-/// zip8 honors the language flag; raw CP437 bytes can also be valid UTF-8.
-/// The exposed tensor key must not silently change across the security bump.
+/// zip 9 honors the language flag; raw CP437 bytes can also be valid UTF-8.
+/// The exposed tensor key must not silently change across the security bump,
+/// and since zip 9.1.0 (zip-rs/zip2#1080) a decoded CP437 name resolves through
+/// `by_name` too: the lookup tries the raw bytes, then each entry's decoded
+/// name. A flagged name whose bytes are not UTF-8 decodes to CP437 on zip's
+/// side and lossily on ours, so it is reachable by neither spelling by name.
 #[test]
 fn archive_language_flag_preserves_legacy_keys() -> Result<()> {
     use lloom_tensor::{npy::NpzTensors, Device};
     for (label, raw, utf8, expected, raw_lookup) in [
         ("cp437-valid-utf8", [0xc3, 0xa9], false, "├⌐", Some("é")),
         ("utf8-valid", [0xc3, 0xa9], true, "é", Some("é")),
-        ("cp437-invalid-utf8", [0xff, b'x'], false, "\u{a0}x", None),
+        ("cp437-invalid-utf8", [0xff, b'x'], false, "\u{a0}x", Some("\u{a0}x")),
         ("utf8-invalid", [0xff, b'x'], true, "�x", None),
     ] {
         let path = TmpFile::create(label);
@@ -204,8 +208,9 @@ fn archive_language_flag_preserves_legacy_keys() -> Result<()> {
             );
         }
         if raw_lookup != Some(expected) {
-            // Pre-existing raw-byte lookup mismatch, separate from decoding:
-            // by_name indexes UTF-8 spelling, while by_index uses the key.
+            // A flagged, invalid-UTF-8 name: zip decodes it as CP437 and lloom
+            // lossily, so the key lloom exposes is not a spelling `by_name`
+            // resolves (neither raw nor zip-decoded); by_index still reaches it.
             assert!(
                 Tensor::read_npz_by_name(&path, &[expected]).is_err(),
                 "{label}"

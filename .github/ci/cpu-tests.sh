@@ -80,7 +80,7 @@ echo "=== cargo nextest run -p $crate --cargo-profile ci ${features[*]:-} (no me
 # made the first run of this gate's predecessor report the fuzzer as never
 # having run. The parse strips escapes as well.
 set +e
-CARGO_TERM_COLOR=never cargo nextest run -p "$crate" --cargo-profile ci --no-fail-fast \
+CARGO_TERM_COLOR=never cargo nextest run --locked -p "$crate" --cargo-profile ci --no-fail-fast \
   "${features[@]}" 2>&1 | tee "$log"
 rc="${PIPESTATUS[0]}"
 set -e
@@ -89,7 +89,7 @@ sed -i.bak $'s/\x1b\[[0-9;]*m//g' "$log" && rm -f "$log.bak"
 echo
 echo "=== cargo test --doc -p $crate --profile ci (the doctests; builds the examples) ==="
 set +e
-CARGO_TERM_COLOR=never cargo test --doc -p "$crate" --profile ci "${features[@]}" 2>&1 | tee "$doclog"
+CARGO_TERM_COLOR=never cargo test --locked --doc -p "$crate" --profile ci "${features[@]}" 2>&1 | tee "$doclog"
 docrc="${PIPESTATUS[0]}"
 set -e
 sed -i.bak $'s/\x1b\[[0-9;]*m//g' "$doclog" && rm -f "$doclog.bak"
@@ -180,7 +180,7 @@ if [ "$failed" -ne 0 ]; then
   while IFS=$'\t' read -r bin name; do
     echo "--- $bin $name"
     set +e
-    CARGO_TERM_COLOR=never cargo nextest run -p "$crate" --cargo-profile dev --no-capture \
+    CARGO_TERM_COLOR=never cargo nextest run --locked -p "$crate" --cargo-profile dev --no-capture \
       "${features[@]}" -E "binary_id($bin) & test(=$name)" 2>&1 \
       | sed $'s/\x1b\[[0-9;]*m//g' | grep -vE '^\s*(Compiling|Finished|Downloaded|Downloading)' | tail -60
     set -e

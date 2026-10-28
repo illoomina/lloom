@@ -20,7 +20,7 @@ use std::borrow::{Borrow, BorrowMut};
 use crate::generation::{HotThread, Sampling};
 use crate::nn::decode::{
     begin_pass, end_executor_step, end_pass, ragged_layout, DecodeOptions, DecodeOut, DecodeStats,
-    PassShape, RoundStats, StepPacer,
+    PassShape, PrefillWork, RoundStats, StepPacer,
 };
 use crate::nn::model::BatchedCausalLM;
 use crate::nn::speculator::{
@@ -59,9 +59,22 @@ struct Slot<'m, M: BatchedCausalLM, R: BorrowMut<Session<'m, M>>> {
     prompt: Vec<u32>,
     lane: Lane,
     generation: u64,
-    /// The row's drafter slot.
-    seq: SeqId,
+    /// The row's drafter slot, owned here until it goes back to the free
+    /// list: `None` once it has. Retirement returns it, so a retired row
+    /// still holding its [`Slot`] (retired, not yet taken) owns no drafter
+    /// slot, and the drain that removes it returns nothing. A slot returned
+    /// twice would be handed to two live rows, whose drafter contexts would
+    /// then alias.
+    seq: Option<SeqId>,
     _model: std::marker::PhantomData<&'m M>,
+}
+
+impl<'m, M: BatchedCausalLM, R: BorrowMut<Session<'m, M>>> Slot<'m, M, R> {
+    /// The row's drafter slot while it owns one.
+    fn seq(&self) -> SeqId {
+        self.seq
+            .expect("a row that has not retired owns its drafter slot")
+    }
 }
 
 /// The speculative batched loop, one round at a time.
@@ -111,7 +124,7 @@ where
         if spec.n_seq() == 0 {
             lloom_tensor::bail!("decode_spec_batched: the proposer has no sequence slots");
         }
-        let depth = opts.pacer_depth();
+        let pacer = StepPacer::for_decode(&opts);
         Ok(Self {
             free_seq: (0..spec.n_seq()).rev().collect(),
             spec,
@@ -122,7 +135,7 @@ where
             generation: 0,
             rounds: 0,
             finished: Vec::new(),
-            pacer: StepPacer::new(depth),
+            pacer,
             hot_thread: HotThread::claim(),
             run_start: std::time::Instant::now(),
         })
@@ -153,7 +166,6 @@ where
         on_tokens: &mut dyn FnMut(RowId, &[u32]) -> Result<()>,
     ) -> Result<usize> {
         let mut joined = 0usize;
-        let tile = self.opts.prefill_tile;
         for i in 0..self.slots.len() {
             let Some(slot) = self.slots[i].as_mut() else {
                 continue;
@@ -166,21 +178,35 @@ where
                 generation: slot.generation,
             };
             let t0 = std::time::Instant::now();
+            let drafter_slot = slot.seq();
             let s: &mut Session<'m, M> = slot.session.borrow_mut();
             s.seq.last_logits = None;
-            self.pacer.before_forward(&self.device)?;
-            let (logits, probe, units) =
-                s.prefill_streamed(&mut self.spec, slot.seq, &slot.prompt, tile, &self.device)?;
-            self.pacer.after_forward(&self.device)?;
+            let work = PrefillWork::resolve(&self.opts, s.seq.pos, slot.prompt.len(), true)?;
+            let before = self.pacer.counters();
+            let seeded = s.prefill_streamed(
+                &mut self.spec,
+                drafter_slot,
+                &slot.prompt,
+                &work,
+                &mut self.pacer,
+                &self.device,
+            );
+            // Keep the same marker queue across joins and rounds. Restoring
+            // the round's depth never discards an outstanding seed marker.
+            self.pacer.set_depth(self.opts.pacer_depth());
+            let (logits, probe, units) = seeded?;
+            let after = self.pacer.counters();
             let anchor = logits
                 .squeeze(0)?
                 .argmax(lloom_tensor::D::Minus1)?
                 .to_scalar::<u32>()?;
             self.spec
-                .observe(slot.seq, &probe, std::slice::from_ref(&anchor))?;
+                .observe(drafter_slot, &probe, std::slice::from_ref(&anchor))?;
             let lane = &mut slot.lane;
             lane.stats.prefill_ns = t0.elapsed().as_nanos() as u64;
             lane.stats.prefill_units = units;
+            lane.stats.step_markers = after.0 - before.0;
+            lane.stats.step_waits = after.1 - before.1;
             lane.anchor_tok = anchor;
             lane.joined = true;
             joined += 1;
@@ -208,7 +234,7 @@ where
         let round_start_ns = self.run_start.elapsed().as_nanos() as u64;
         let seqs: Vec<SeqId> = live
             .iter()
-            .map(|&i| self.slots[i].as_ref().expect("live").seq)
+            .map(|&i| self.slots[i].as_ref().expect("live").seq())
             .collect();
         let t = std::time::Instant::now();
         let rb = readbacks();
@@ -307,7 +333,7 @@ where
             let rows: Vec<ObserveRow<'_, S::Probe>> = picked
                 .iter()
                 .zip(results.iter())
-                .map(|(s, (accepted, probe))| (s.seq, probe, accepted.as_slice()))
+                .map(|(s, (accepted, probe))| (s.seq(), probe, accepted.as_slice()))
                 .collect();
             if rows.iter().any(|(_, _, accepted)| accepted.is_empty()) {
                 lloom_tensor::bail!(
@@ -352,11 +378,11 @@ where
             }
             let mut batch: Vec<u32> = Vec::with_capacity(accepted.len());
             for &tok in &accepted {
-                if lane.eos_ids.contains(&tok) {
-                    lane.eos = true;
+                if lane.reached(lane.produced + batch.len()) {
                     break;
                 }
-                if lane.reached(lane.produced + batch.len()) {
+                if lane.eos_ids.contains(&tok) {
+                    lane.eos = true;
                     break;
                 }
                 batch.push(tok);
@@ -374,10 +400,24 @@ where
         Ok(())
     }
 
+    /// Return `slot`'s drafter slot to the free list, once: a row whose
+    /// ownership was already consumed returns nothing.
+    fn release_drafter_slot(free_seq: &mut Vec<usize>, slot: &mut Slot<'m, M, R>) {
+        if let Some(seq) = slot.seq.take() {
+            debug_assert!(
+                !free_seq.contains(&seq.0),
+                "drafter slot {} was already on the free list",
+                seq.0
+            );
+            free_seq.push(seq.0);
+        }
+    }
+
     /// Per-row bookkeeping at retirement: the accepted ids are the stream's
     /// prefix of the cache (the verify resolved every window to its accepted
     /// length, so nothing overran).
     fn retire(&mut self, i: usize) {
+        let free_seq = &mut self.free_seq;
         let slot = self.slots[i].as_mut().expect("a retiring row is held");
         let lane = &mut slot.lane;
         let s: &mut Session<'m, M> = slot.session.borrow_mut();
@@ -399,7 +439,7 @@ where
             eos: lane.eos,
             stats,
         };
-        self.free_seq.push(slot.seq.0);
+        Self::release_drafter_slot(free_seq, slot);
         self.finished.push((i, out));
     }
 }
@@ -418,8 +458,13 @@ where
         _seed: u64,
         eos_ids: &[u32],
         max_tokens: usize,
-    ) -> Result<RowId> {
-        crate::nn::decode::refuse(
+    ) -> crate::nn::batched::Admission<R> {
+        // Every refusal — this loop's stricter body, an empty EOS set, an
+        // empty prompt, an unreconciled overrun — is decided before a
+        // drafter slot or the session is taken, and hands the session back
+        // (`Rejected`): a refused admission costs the caller's pool
+        // nothing.
+        let refused = crate::nn::decode::refuse(
             crate::nn::decode::Body::BatchedWindow,
             &crate::nn::decode::Asks {
                 sampling: &sampling,
@@ -429,28 +474,37 @@ where
                 logprobs: None,
             },
         )
-        .map_err(|e| lloom_tensor::Error::Msg(format!("decode_spec_batched: {e}")))?;
-        if eos_ids.is_empty() {
-            lloom_tensor::bail!("decode_spec_batched: an empty EOS set; the row would never end");
-        }
-        if prompt.is_empty() {
-            lloom_tensor::bail!("decode_spec_batched: an empty prompt (no resume on this loop)");
-        }
-        {
+        .err()
+        .map(|e| lloom_tensor::Error::Msg(format!("decode_spec_batched: {e}")))
+        .or_else(|| {
+            if eos_ids.is_empty() {
+                return Some(lloom_tensor::Error::msg(
+                    "decode_spec_batched: an empty EOS set; the row would never end",
+                ));
+            }
+            if prompt.is_empty() {
+                return Some(lloom_tensor::Error::msg(
+                    "decode_spec_batched: an empty prompt (no resume on this loop)",
+                ));
+            }
             let s: &mut Session<'m, M> = session.borrow_mut();
-            if s.seq.overrun > 0 {
-                lloom_tensor::bail!(
+            (s.seq.overrun > 0).then(|| {
+                lloom_tensor::Error::msg(format!(
                     "decode_spec_batched: the sequence's cache is {} positions past its last \
                      token; `Session::reconcile` or `Session::reset` first",
                     s.seq.overrun
-                );
-            }
+                ))
+            })
+        });
+        if let Some(error) = refused {
+            return Err(crate::nn::batched::Rejected { session, error });
         }
         let Some(seq) = self.free_seq.pop() else {
-            lloom_tensor::bail!(
+            let error = lloom_tensor::Error::msg(format!(
                 "decode_spec_batched: every drafter slot is taken ({} rows)",
                 self.spec.n_seq()
-            );
+            ));
+            return Err(crate::nn::batched::Rejected { session, error });
         };
         self.generation += 1;
         let generation = self.generation;
@@ -479,7 +533,7 @@ where
             prompt,
             lane,
             generation,
-            seq: SeqId(seq),
+            seq: Some(SeqId(seq)),
             _model: std::marker::PhantomData,
         };
         let idx = match self.free.pop() {
@@ -534,6 +588,7 @@ where
             piece_tokens: 0,
             retired,
             pending: self.pending_rows(),
+            held: 0,
         })
     }
 
@@ -568,9 +623,12 @@ where
         let mut out = Vec::new();
         self.finished.clear();
         for i in 0..self.slots.len() {
-            if let Some(slot) = self.slots[i].take() {
+            if let Some(mut slot) = self.slots[i].take() {
                 self.free.push(i);
-                self.free_seq.push(slot.seq.0);
+                // A retired row returned its drafter slot at its
+                // retirement: this takes nothing, rather than putting the
+                // same slot on the free list twice.
+                Self::release_drafter_slot(&mut self.free_seq, &mut slot);
                 out.push(slot.session);
             }
         }

@@ -35,13 +35,23 @@ impl Stub {
         let bos_id = (!bos.is_empty())
             .then(|| tokenizer.token_to_id(bos))
             .flatten();
+        // The EOS ids the real loaders resolve (`qwen3_5.rs` `prepare_text`,
+        // `lfm2.rs`): the token a turn ends with, so the end-of-turn constant
+        // the front end reads at load is the one a served checkpoint has. A
+        // placeholder here made every reply look as though the model had not
+        // ended its turn.
+        let eos_ids: Vec<u32> = ["<|im_end|>", "<|endoftext|>", "<|end|>"]
+            .iter()
+            .filter_map(|t| tokenizer.token_to_id(t))
+            .collect();
+        let eos_ids = if eos_ids.is_empty() { vec![0] } else { eos_ids };
         Self {
             text: Text {
                 tokenizer,
                 template: Some(Template::compile(template).unwrap()),
                 bos_token: bos.to_string(),
                 bos_id,
-                eos_ids: vec![0],
+                eos_ids,
                 seed_tokens: vec![1],
                 think: Default::default(),
                 gen_prompts: Default::default(),
@@ -268,11 +278,23 @@ fn decoded(engine: &Stub, ids: Vec<u32>) -> Decoded {
         checkpoint: Default::default(),
         checkpoint_at: None,
         readback: ReadbackArm::Blocking,
+        sampling: lloom::generation::Sampling::ArgMax,
+        readback_note: None,
         logits_sha256: None,
         stats: Default::default(),
         thinking: None,
         logprobs: None,
+        pin: Default::default(),
     }
+}
+
+/// The ids a matched turn splices: the reply's own, and the end-of-turn token
+/// where the model ended its turn (decision 51 Q1 — the log does not keep the
+/// sampled EOS, so the id is the template's own bytes for the position the
+/// session fed).
+fn turn_tokens(front: &Front, reply: &[u32], stop: Stop) -> usize {
+    let through = stop == Stop::Eos && front.constants().and_then(|c| c.eot()).is_some();
+    reply.len() + usize::from(through)
 }
 
 fn bytes(s: &str) -> Vec<u32> {
@@ -453,7 +475,10 @@ fn the_next_turn_reuses_the_sampled_ids_not_their_canonical_tokenization() {
         &p2.ids[..log.len().min(p2.ids.len())]
     );
     assert_eq!(p2.spliced.matched, 1);
-    assert_eq!(p2.spliced.spliced_tokens, sampled.len());
+    assert_eq!(
+        p2.spliced.spliced_tokens,
+        turn_tokens(&front, &sampled, Stop::Eos)
+    );
     assert_eq!(p2.renders, 1);
     // The text is the template's own rendering, whatever the ids.
     assert_eq!(
@@ -709,7 +734,10 @@ fn the_same_text_sampled_as_different_ids_splices_each_conversations_own() {
                 next.ids.starts_with(&log),
                 "reversed={reversed} {q}: not its own ids"
             );
-            assert_eq!(next.spliced.spliced_tokens, ids.len());
+            assert_eq!(
+                next.spliced.spliced_tokens,
+                turn_tokens(&front, ids, Stop::Eos)
+            );
         }
     }
 }
@@ -1156,7 +1184,16 @@ fn a_split_character_aligns_and_a_reply_cut_short_logs_its_part() {
     assert!(front.record(&engine, p1.origin, &d));
     let second = json!([user("Café?"), assistant(&d.text), user("Merci")]);
     let p2 = build(&front, &engine, &second, Some(false));
-    assert_eq!(p2.spliced.spliced_tokens, sampled.len());
+    // The reply's own ids, and the end-of-turn token it ended its turn with:
+    // a matched turn is rendered through it (decision 51 Q1), and the log does
+    // not keep the sampled EOS, so the id comes from the template's own bytes.
+    let eot = front
+        .constants()
+        .unwrap()
+        .eot()
+        .expect("an end-of-turn token");
+    assert_eq!(p2.spliced.spliced_tokens, sampled.len() + 1);
+    assert_eq!(p2.ids[p1.ids.len() + sampled.len()], eot.0);
     // A reply the client got only part of — a stop string cut it, or the
     // run ended inside a character — is logged as the ids of that part.
     let mut cut = decoded(&engine, bytes("abc STOP def"));
@@ -1302,7 +1339,7 @@ fn the_checkpoints_templates_build_the_plain_prompt_and_cut_the_same_spans() {
             );
             assert_eq!(
                 p2.spliced.spliced_tokens,
-                sampled.len(),
+                turn_tokens(&fresh, &sampled, Stop::Eos),
                 "{repo} {want:?}: {:?}",
                 p2.spliced
             );
@@ -2542,11 +2579,12 @@ fn the_checkpoints_templates_persist_what_the_model_generated() {
                              the log at {kept}, before the checkpoint at {ckpt}"
                         ));
                     }
-                    if persist != Some(false)
-                        && !by_engine
-                        && kind != "one more newline before the end marker"
-                        && !extends
-                    {
+                    // Since decision 51 Q1 the trim case extends too: a
+                    // matched reply is rendered from the ids the model
+                    // emitted, so the whitespace the template would trim is
+                    // no longer deleted from the history. Run 5 recorded this
+                    // row at +7, diverging.
+                    if persist != Some(false) && !by_engine && !extends {
                         failures.push(format!(
                             "{name} want={want:?} persist={persist:?} {kind}: the history keeps \
                              what the model generated, so the next prompt extends the log; it \
@@ -2660,4 +2698,878 @@ fn the_load_line_reports_the_tail_the_default_runs_with() {
         "stripped: {:?}",
         tails(Some(false))
     );
+}
+
+#[test]
+fn neutral_gguf_effort_is_accepted_without_inventing_a_template_control() {
+    let mut engine = Stub::lfm2();
+    engine.caps = crate::app::causal_loaded::served::lfm2_gguf_capabilities();
+    let front = Front::new(&engine, SessionOptions::default());
+    let messages = json!([user("Hi")]);
+    let base = front
+        .prompt(
+            &engine,
+            Request {
+                messages: &messages,
+                kwargs: Map::new(),
+                want: None,
+                add_bos: true,
+                expand: None,
+                history: None,
+            },
+        )
+        .unwrap();
+    for effort in ["none", "default"] {
+        let prompt = front
+            .prompt(
+                &engine,
+                Request {
+                    messages: &messages,
+                    kwargs: Map::from_iter([(REASONING_EFFORT.into(), json!(effort))]),
+                    want: None,
+                    add_bos: true,
+                    expand: None,
+                    history: None,
+                },
+            )
+            .unwrap();
+        // The GGUF owner exposes rendering through Served without Text. Its
+        // plain path performs a second ignored-variable check of its own.
+        let plain = front
+            .plain(
+                &engine,
+                Request {
+                    messages: &messages,
+                    kwargs: Map::from_iter([(REASONING_EFFORT.into(), json!(effort))]),
+                    want: None,
+                    add_bos: true,
+                    expand: None,
+                    history: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(plain.ids, base.ids);
+        assert_eq!(prompt.ids, base.ids);
+        assert_eq!(prompt.thinking, base.thinking);
+    }
+    // Meaningful unsupported controls still refuse; supported templates keep
+    // their own validation (covered by the existing template tests).
+    assert!(front
+        .prompt(
+            &engine,
+            Request {
+                messages: &messages,
+                kwargs: Map::from_iter([(REASONING_EFFORT.into(), json!("high"))]),
+                want: None,
+                add_bos: true,
+                expand: None,
+                history: None
+            }
+        )
+        .is_err());
+}
+
+#[test]
+fn other_families_keep_their_existing_neutral_effort_validation() {
+    let engine = Stub::lfm2(); // The safetensors/Metal family, not lfm2-gguf.
+    let front = Front::new(&engine, SessionOptions::default());
+    let messages = json!([user("Hi")]);
+    for effort in ["none", "default"] {
+        let request = || Request {
+            messages: &messages,
+            kwargs: Map::from_iter([(REASONING_EFFORT.into(), json!(effort))]),
+            want: None,
+            add_bos: true,
+            expand: None,
+            history: None,
+        };
+        let error = front.prompt(&engine, request()).unwrap_err().to_string();
+        assert!(
+            error.contains("lfm2's chat template does not read reasoning_effort"),
+            "{error}"
+        );
+        let error = front.plain(&engine, request()).unwrap_err().to_string();
+        assert!(
+            error.contains("lfm2's chat template does not read reasoning_effort"),
+            "{error}"
+        );
+    }
+}
+
+/// Decision 51 Q1 (maintainer, 2026-10-19): a past assistant turn the front
+/// end matches to its log is rendered from the ids the model emitted — the
+/// whole turn, through its end-of-turn token — in place of whatever the
+/// template would render for it. The template renders what the model did not
+/// write. So the next prompt's ids equal the session's log by construction,
+/// and no rewriting a template does to a past reply can make them diverge.
+///
+/// The two rewritings run 5 recorded (`issue-946.md` §25.8) are the cases
+/// that failed before this: Qwen's `reasoning_content|trim` (a reply whose
+/// whitespace is not the template's own format left the log at +7 against
+/// +12), and a reply cut inside its reasoning. Both must now extend.
+///
+/// The end-of-turn token is the template's own: the log does not keep the
+/// sampled EOS (`lloom::nn::DecodeOut::ids` excludes it), and on every
+/// supported checkpoint `eos_token` is the token that ends an assistant turn,
+/// so the span's last id is the one the model sampled. A reply that did not
+/// stop on EOS fed no end-of-turn position, so its span ends at its own ids.
+#[test]
+fn a_past_reply_is_rendered_from_the_ids_the_model_emitted() {
+    let user1 = user("What is the capital of France?");
+    let user2 = user("And Germany?");
+    let mut ran = 0;
+    let mut failures: Vec<String> = Vec::new();
+    for (repo, bos, caps) in AUDITED {
+        let Some(engine) = cached(repo, bos, caps) else {
+            continue;
+        };
+        let name = repo.rsplit("--").next().unwrap();
+        let tags = engine.think_tags();
+        let one = json!([user1]);
+        {
+            let f = Front::new(&engine, SessionOptions::default());
+            let c = f.constants().unwrap();
+            eprintln!(
+                "EMITTED-CONST {name}: eot={:?}",
+                c.eot().map(|(id, s)| (id, s.to_string())),
+            );
+        }
+        for want in wants(&engine) {
+            for persist in [None, Some(true), Some(false)] {
+                let front = Front::new(
+                    &engine,
+                    SessionOptions {
+                        persist,
+                        ..SessionOptions::default()
+                    },
+                );
+                if front.persist_unsupported().is_some() {
+                    continue;
+                }
+                let p1 = build(&front, &engine, &one, want);
+                let on = p1.thinking.unwrap().on;
+                // The replies, each what a model really emits for this
+                // prompt: an answer alone only where the prompt opened no
+                // block (a reply that ends its turn while still inside one is
+                // not a thing a model does — it closes the block first, or
+                // the run is cut, which is the open case below); then a reply
+                // in the template's own format, one whose whitespace is not
+                // (the trim), and one cut inside its reasoning.
+                let mut replies: Vec<(&str, String, Stop)> = Vec::new();
+                if !on {
+                    replies.push(("an answer", "Paris.".to_string(), Stop::Eos));
+                }
+                if on {
+                    let end = engine.token_str(tags.as_ref().unwrap().end);
+                    replies.push((
+                        "reasoning in the template's own format",
+                        format!("The capital of France is Paris.\n{end}\n\nParis."),
+                        Stop::Eos,
+                    ));
+                    replies.push((
+                        "reasoning whose whitespace the template would trim",
+                        format!("The capital of France is Paris.\n\n\n{end}\n\nParis."),
+                        Stop::Eos,
+                    ));
+                    replies.push((
+                        "cut inside its reasoning",
+                        "The capital of France is".into(),
+                        Stop::Length,
+                    ));
+                }
+                for (kind, text, stop) in replies {
+                    let front = Front::new(
+                        &engine,
+                        SessionOptions {
+                            persist,
+                            ..SessionOptions::default()
+                        },
+                    );
+                    let p1 = build(&front, &engine, &one, want);
+                    let sampled = engine.enc(&text);
+                    let mut d = decoded(&engine, sampled.clone());
+                    d.stop = stop;
+                    assert!(front.record(&engine, p1.origin, &d), "{name} {kind}");
+                    let history = json!([user1, assistant(&d.text), user2]);
+                    let p2 = build(&front, &engine, &history, want);
+                    // The session's log after the first turn: its prompt and
+                    // the ids the model emitted. An EOS-stopped reply also fed
+                    // the end-of-turn position, which the template writes.
+                    let mut log: Vec<u32> = p1.ids.iter().chain(&sampled).copied().collect();
+                    // An EOS-stopped reply also fed the end-of-turn position.
+                    // The id is the template's own end-of-turn constant, read
+                    // at load — the same token the model sampled.
+                    if stop == Stop::Eos {
+                        let (id, _) = front.constants().unwrap().eot().unwrap_or_else(|| {
+                            panic!("{name}: no end-of-turn constant for this template")
+                        });
+                        log.push(id);
+                    }
+                    let kept = p2.ids.iter().zip(&log).take_while(|(a, b)| a == b).count();
+                    eprintln!(
+                        "EMITTED {name} want={want:?} persist={persist:?} {kind}: the next prompt \
+                         leaves the log at {:+} from its end ({kept} of {}); emitted {} of {} \
+                         matched",
+                        kept as i64 - log.len() as i64,
+                        log.len(),
+                        p2.spliced.emitted,
+                        p2.spliced.matched,
+                    );
+                    // Two boundaries this does not speak for, and both are
+                    // the prompt's own ids rather than a past reply's:
+                    // - an opt-in strip asks the template to drop the
+                    //   reasoning, so the span is deliberately not the turn
+                    //   the model emitted (§2.3d: the option doing its job);
+                    // - where the engine closed the block the template opened
+                    //   (LFM2.5's thinking off), those ids are the engine's
+                    //   and no rendering of the history writes them, so the
+                    //   divergence is inside the earlier prompt, before any
+                    //   reply. The turn checkpoint stands there (run 5, §25.8)
+                    //   and decision 51 Q1 does not reach it: it is about how
+                    //   a past assistant turn is rendered, not about ids the
+                    //   template never writes.
+                    let engine_closed = p1.thinking.unwrap().by == By::Engine;
+                    let speaks_for = persist != Some(false) && !engine_closed;
+                    // Where the turn is rendered from the emitted ids, the
+                    // span carries the end-of-turn id only if the model ended
+                    // the turn itself: a reply a limit or a stop cut fed no
+                    // such position, and putting that id in the prompt would
+                    // condition the model on a token the session never ran.
+                    // (This is what kills the harness's `m1`.) Under an
+                    // opt-in strip the span is deliberately not the emitted
+                    // turn, so fewer ids are spliced and the count is the
+                    // segment alignment's.
+                    if speaks_for {
+                        assert_eq!(
+                            p2.spliced.spliced_tokens,
+                            turn_tokens(&front, &sampled, stop),
+                            "{name} want={want:?} persist={persist:?} {kind}: the turn's ids"
+                        );
+                    }
+                    if speaks_for && kept < log.len() {
+                        failures.push(format!(
+                            "{name} want={want:?} persist={persist:?} {kind}: the next prompt \
+                             leaves the session's log at {kept} of {}, so the turn the model \
+                             emitted was not what the history rendered",
+                            log.len()
+                        ));
+                    }
+                }
+            }
+        }
+        ran += 1;
+    }
+    if ran == 0 {
+        // As the sibling checkpoint-template tests do: a host without the
+        // cache (the x86 CI container) skips; the Mac arm runs every cached
+        // template.
+        eprintln!("skipped: no checkpoint template in the Hugging Face cache");
+        return;
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// Decision 51 Q3 (maintainer, 2026-10-19): under an opt-in strip
+/// (`--strip-thinking`), a request whose history's last assistant message is a
+/// reply of ours cut inside its reasoning renders with `preserve_thinking`
+/// anyway — for that one request. Stripped, such a history shows the model an
+/// empty assistant message where its own unfinished thought belongs (run 5's
+/// H2, `issue-946.md` §25.2), so a "continue" turn had lost the thought.
+///
+/// No template has a per-message switch, so the suspension keeps every past
+/// reply's reasoning in that request. A closed reply last does not suspend it,
+/// nor does a reply the log does not hold, nor another conversation's.
+#[test]
+fn an_unfinished_thought_last_suspends_an_opt_in_strip() {
+    let engine = Stub::qwen3_6_like();
+    let want = Some(true);
+    let strip = || {
+        Front::new(
+            &engine,
+            SessionOptions {
+                persist: Some(false),
+                ..SessionOptions::default()
+            },
+        )
+    };
+    let q = json!([user("2+2?")]);
+    // A reply cut inside its reasoning, and one that closed its block.
+    let end = engine.token_str(engine.think_tags().unwrap().end);
+    for (case, text, stop, suspends) in [
+        (
+            "cut inside its reasoning",
+            "Add them".to_string(),
+            Stop::Length,
+            true,
+        ),
+        (
+            "closed its block",
+            format!("Add them\n{end}\n\nFour."),
+            Stop::Eos,
+            false,
+        ),
+    ] {
+        let front = strip();
+        let p1 = build(&front, &engine, &q, want);
+        let mut d = decoded(&engine, engine.enc(&text));
+        d.stop = stop;
+        assert!(front.record(&engine, p1.origin, &d), "{case}");
+        let history = json!([user("2+2?"), assistant(&d.text)]);
+        let p2 = build(&front, &engine, &history, want);
+        let kept = p2.kwargs.get(PRESERVE_THINKING).and_then(Value::as_bool);
+        eprintln!("Q3 {case}: preserve_thinking {kept:?} (strip asked)");
+        assert_eq!(
+            kept,
+            Some(suspends),
+            "{case}: an unfinished thought last suspends the strip; a finished one does not"
+        );
+        // The thought itself is in the prompt exactly where it suspends.
+        assert_eq!(
+            p2.text.contains("Add them"),
+            suspends || text.contains(&end),
+            "{case}: the unfinished thought reaches the template iff the strip is suspended"
+        );
+    }
+
+    // A reply the log no longer holds does not suspend it: nothing says the
+    // message is an unfinished thought of ours.
+    let front = strip();
+    let history = json!([user("2+2?"), assistant("Add them")]);
+    let p = build(&front, &engine, &history, want);
+    assert_eq!(
+        p.kwargs.get(PRESERVE_THINKING).and_then(Value::as_bool),
+        Some(false),
+        "a message the log does not hold does not suspend the strip"
+    );
+
+    // Another conversation's reply does not either (the scope chain).
+    let front = strip();
+    let other = build(&front, &engine, &json!([user("9+9?")]), want);
+    let mut d = decoded(&engine, engine.enc("Add them"));
+    d.stop = Stop::Length;
+    assert!(front.record(&engine, other.origin, &d));
+    let p = build(
+        &front,
+        &engine,
+        &json!([user("2+2?"), assistant(&d.text)]),
+        want,
+    );
+    assert_eq!(
+        p.kwargs.get(PRESERVE_THINKING).and_then(Value::as_bool),
+        Some(false),
+        "another conversation's reply does not suspend the strip"
+    );
+}
+
+/// Decision 51 Q5 (maintainer, 2026-10-19): (a), as sent. An open reply of
+/// ours sent back with an empty content and no reasoning field cannot be
+/// found — an empty content is no key, and the message gives no reasoning to
+/// look it up by — so under `missing_reasoning = log` too it goes to the
+/// template as the client sent it: empty. The client's history is the
+/// client's; matching it by its position in the conversation would be
+/// reconstruction by position, which the 2026-10-14 review cautioned against.
+/// `lloom chat` holds its own session and never sends this.
+#[test]
+fn an_open_reply_sent_back_empty_goes_as_sent_under_log_too() {
+    let engine = Stub::qwen4exp();
+    let want = Some(true);
+    let q = json!([user("2+2?")]);
+    for restore in [false, true] {
+        let front = Front::new(
+            &engine,
+            SessionOptions {
+                restore_reasoning: restore,
+                ..SessionOptions::default()
+            },
+        );
+        let p1 = build(&front, &engine, &q, want);
+        let mut d = decoded(&engine, bytes("Add them"));
+        d.stop = Stop::Length;
+        assert!(front.record(&engine, p1.origin, &d));
+        // Empty content, and no reasoning field at all.
+        let history = json!([
+            user("2+2?"),
+            json!({ "role": "assistant", "content": "" }),
+            user("3+3?")
+        ]);
+        let p2 = build(&front, &engine, &history, want);
+        eprintln!(
+            "Q5 missing_reasoning={}: replies {} matched {} restored {} spliced {}",
+            if restore { "log" } else { "as-sent" },
+            p2.spliced.replies,
+            p2.spliced.matched,
+            p2.spliced.restored,
+            p2.spliced.spliced_tokens,
+        );
+        assert_eq!(p2.spliced.replies, 1);
+        assert_eq!(
+            (
+                p2.spliced.matched,
+                p2.spliced.restored,
+                p2.spliced.spliced_tokens
+            ),
+            (0, 0, 0),
+            "as sent, empty: nothing is matched, nothing restored, no id taken"
+        );
+        assert!(
+            !p2.text.contains("Add them"),
+            "the thought the client dropped is not put back"
+        );
+    }
+}
+
+/// [`build`], continuing a session by its reference ([`ByRef`]).
+fn build_by(
+    front: &Front,
+    engine: &dyn Served,
+    messages: &Value,
+    want: Option<bool>,
+    by: &ByRef<'_>,
+) -> Prompt {
+    front
+        .prompt_by(
+            engine,
+            Request {
+                messages,
+                kwargs: kw(engine, want),
+                want,
+                add_bos: true,
+                expand: None,
+                history: None,
+            },
+            by,
+        )
+        .unwrap()
+}
+
+/// A reply as the chat route returns it (decision 51 Q2): its reasoning in
+/// `reasoning_content`, `content` the answer alone.
+fn returned(reply: &Reply) -> Value {
+    match reply.block {
+        Block::None => assistant(&reply.text),
+        _ => json!({
+            "role": "assistant",
+            "content": reply.content_text,
+            "reasoning_content": reply.reasoning_text,
+        }),
+    }
+}
+
+/// The log a turn leaves: its prompt, the ids the model emitted, and the
+/// end-of-turn id where it ended the turn itself (decision 51 Q1).
+fn log_after(front: &Front, prompt: &[u32], sampled: &[u32], stop: Stop) -> Vec<u32> {
+    let mut log: Vec<u32> = prompt.iter().chain(sampled).copied().collect();
+    if stop == Stop::Eos {
+        if let Some((id, _)) = front.constants().and_then(|c| c.eot()) {
+            log.push(id);
+        }
+    }
+    log
+}
+
+/// A turn continued by its session's reference (`docs/sessions.md` §5.1), on
+/// every cached checkpoint's template, every think mode, persisted and
+/// stripped: the prompt is the one the full path builds — the same ids — and
+/// the history before the reply is the turn's recorded ids, none of them
+/// tokenized again. Where decision 51 says the next prompt extends the log, it
+/// does.
+#[test]
+fn a_turn_continued_by_reference_builds_the_full_paths_prompt_from_the_recorded_ids() {
+    let system = json!({ "role": "system", "content": "You answer in one word." });
+    let user1 = user("What is the capital of France?");
+    let user2 = user("And Germany?");
+    let mut ran = 0;
+    for (repo, bos, caps) in AUDITED {
+        let Some(engine) = cached(repo, bos, caps) else {
+            continue;
+        };
+        let name = repo.rsplit("--").next().unwrap();
+        for want in wants(&engine) {
+            for persist in [None, Some(false)] {
+                let front = Front::new(
+                    &engine,
+                    SessionOptions {
+                        persist,
+                        ..SessionOptions::default()
+                    },
+                );
+                if front.persist_unsupported().is_some() {
+                    continue;
+                }
+                let one = json!([system, user1]);
+                let record = ByRef {
+                    record: true,
+                    ..ByRef::default()
+                };
+                let p1 = build_by(&front, &engine, &one, want, &record);
+                let rec = p1.record.clone().unwrap_or_else(|| {
+                    panic!("{name} want={want:?} persist={persist:?}: no prefix recorded")
+                });
+                assert!(
+                    rec.ids_len > 0 && rec.ids_len < p1.ids.len(),
+                    "{name}: the prefix ends before the generation prompt"
+                );
+                let th = p1.thinking.unwrap();
+                let text = if th.on {
+                    let end = engine.token_str(engine.think_tags().unwrap().end);
+                    format!("Paris is the capital.\n{end}\n\nParis.")
+                } else {
+                    "Paris.".to_string()
+                };
+                let sampled = engine.enc(&text);
+                let d = decoded(&engine, sampled.clone());
+                let (_, reply) = front.record_reply(&engine, p1.origin, &d);
+                let reply = reply.expect("the reply is logged");
+                let history = json!([system, user1, returned(&reply), user2]);
+                let full = build_by(&front, &engine, &history, want, &ByRef::default());
+                let bound = [Bound {
+                    scope: p1.origin.scope,
+                    reply: Arc::clone(&reply),
+                }];
+                let by_id = build_by(
+                    &front,
+                    &engine,
+                    &history,
+                    want,
+                    &ByRef {
+                        bound: &bound,
+                        prefix: Some((&rec, &p1.ids)),
+                        record: true,
+                    },
+                );
+                let tag = format!("{name} want={want:?} persist={persist:?}");
+                eprintln!(
+                    "BY-ID {tag}: prompt {} ids, recorded {}, tokenized {} (full path {}), bound {}",
+                    by_id.ids.len(),
+                    by_id.recorded,
+                    by_id.encoded,
+                    full.encoded,
+                    by_id.spliced.bound
+                );
+                assert_eq!(by_id.ids, full.ids, "{tag}: the prompt is the full path's");
+                assert_eq!(
+                    by_id.recorded, rec.ids_len,
+                    "{tag}: the history taken as recorded"
+                );
+                assert_eq!(
+                    by_id.spliced.bound, 1,
+                    "{tag}: the reply bound by reference"
+                );
+                assert_eq!(full.spliced.bound, 0, "{tag}");
+                // Every id before the reply was the record's: what was
+                // tokenized is what the full path tokenized past it (the BOS
+                // an encode does not write is the record's too).
+                let bos = usize::from(engine.text.bos_id.is_some_and(|b| {
+                    p1.ids.first() == Some(&b) && !p1.text.starts_with(&engine.text.bos_token)
+                }));
+                assert_eq!(
+                    by_id.encoded + rec.ids_len - bos,
+                    full.encoded,
+                    "{tag}: no id of the history tokenized again"
+                );
+                assert_eq!(
+                    by_id.record.as_ref().map(|r| r.ids_len),
+                    full.record_len(&front, &engine, &history, want),
+                    "{tag}: the next turn's record is the full path's"
+                );
+                let engine_closed = th.by == By::Engine;
+                if persist != Some(false) && !engine_closed {
+                    let log = log_after(&front, &p1.ids, &sampled, Stop::Eos);
+                    assert!(
+                        by_id.ids.starts_with(&log),
+                        "{tag}: the next prompt extends the session's log"
+                    );
+                }
+            }
+        }
+        ran += 1;
+    }
+    if ran == 0 {
+        eprintln!("skipped: no checkpoint template in the Hugging Face cache");
+    }
+}
+
+impl Prompt {
+    /// The record this prompt's full-path twin would leave, for comparing.
+    fn record_len(
+        &self,
+        front: &Front,
+        engine: &dyn Served,
+        messages: &Value,
+        want: Option<bool>,
+    ) -> Option<usize> {
+        let record = ByRef {
+            record: true,
+            ..ByRef::default()
+        };
+        build_by(front, engine, messages, want, &record)
+            .record
+            .map(|r| r.ids_len)
+    }
+}
+
+/// A reply the client restructured (`docs/sessions.md` §5.1): the reference
+/// client's shim parses a tool call out of our text into `tool_calls` and
+/// sends the message back with an empty `content`. By text it is no reply of
+/// ours (§2.3d: "tokenized as sent"); by reference it is, and where the
+/// template renders the call back to the model's bytes the turn takes the
+/// sampled ids — here deliberately not the text's canonical tokenization, so
+/// re-tokenizing would leave the log inside the reply.
+#[test]
+fn a_reply_the_client_restructured_is_ours_by_reference() {
+    let user1 = user("Weather in Paris?");
+    let user2 = user("And tomorrow?");
+    let call = json!({
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [{ "type": "function",
+            "function": { "name": "get_weather", "arguments": { "city": "Paris" } } }],
+    });
+    let mut ran = 0;
+    let mut checked = 0;
+    for (repo, bos, caps) in AUDITED {
+        let Some(engine) = cached(repo, bos, caps) else {
+            continue;
+        };
+        let name = repo.rsplit("--").next().unwrap();
+        let template = engine.text.template.as_ref().unwrap();
+        for want in wants(&engine) {
+            let front = Front::new(&engine, SessionOptions::default());
+            let one = json!([user1]);
+            let record = ByRef {
+                record: true,
+                ..ByRef::default()
+            };
+            let p1 = build_by(&front, &engine, &one, want, &record);
+            // What the model emits for the call: the template's own rendering
+            // of it after the generation prompt, up to the turn's end.
+            let render = |m: &Value, gen: bool| {
+                template
+                    .render_with(m, &engine.text.bos_token, &p1.kwargs, gen)
+                    .unwrap()
+            };
+            let gen = render(&one, true);
+            let with = render(&json!([user1, call]), false);
+            let Some((_, marker)) = front.constants().and_then(|c| c.eot()) else {
+                continue;
+            };
+            let Some(text) = with
+                .strip_prefix(gen.as_str())
+                .and_then(|rest| rest.rfind(marker).map(|i| rest[..i].to_string()))
+                .filter(|t| t.contains("get_weather") && t.contains("Paris"))
+            else {
+                eprintln!("RESTRUCTURED {name} want={want:?}: the template does not render the call after its generation prompt; skipped");
+                continue;
+            };
+            // Sampled as two runs split inside a word: decodes to the same
+            // text, is not its canonical tokenization.
+            let cut = text.find("weather").unwrap() + 3;
+            let mut sampled = engine.enc(&text[..cut]);
+            sampled.extend(engine.enc(&text[cut..]));
+            let canonical = engine.enc(&text);
+            assert_ne!(sampled, canonical, "{name}: the split is not canonical");
+            let d = decoded(&engine, sampled.clone());
+            assert_eq!(d.text, text, "{name}: the split decodes to the text");
+            let (_, reply) = front.record_reply(&engine, p1.origin, &d);
+            let reply = reply.unwrap();
+            let history = json!([user1, call, user2]);
+            let full = build_by(&front, &engine, &history, want, &ByRef::default());
+            let bound = [Bound {
+                scope: p1.origin.scope,
+                reply: Arc::clone(&reply),
+            }];
+            let rec = p1.record.clone().unwrap();
+            let by_id = build_by(
+                &front,
+                &engine,
+                &history,
+                want,
+                &ByRef {
+                    bound: &bound,
+                    prefix: Some((&rec, &p1.ids)),
+                    record: true,
+                },
+            );
+            let log = log_after(&front, &p1.ids, &sampled, Stop::Eos);
+            let kept = |ids: &[u32]| ids.iter().zip(&log).take_while(|(a, b)| a == b).count();
+            eprintln!(
+                "RESTRUCTURED {name} want={want:?}: by text matched {} and leaves the log at {:+}; \
+                 by reference bound {} emitted {} and leaves it at {:+}",
+                full.spliced.matched,
+                kept(&full.ids) as i64 - log.len() as i64,
+                by_id.spliced.bound,
+                by_id.spliced.emitted,
+                kept(&by_id.ids) as i64 - log.len() as i64,
+            );
+            assert_eq!(
+                full.spliced.matched, 0,
+                "{name} want={want:?}: by text, not ours"
+            );
+            assert!(
+                kept(&full.ids) < log.len(),
+                "{name} want={want:?}: re-tokenized, it leaves the log"
+            );
+            assert_eq!(by_id.spliced.bound, 1, "{name} want={want:?}");
+            assert_eq!(
+                by_id.spliced.emitted, 1,
+                "{name} want={want:?}: rendered from the emitted ids"
+            );
+            assert!(
+                by_id.ids.starts_with(&log),
+                "{name} want={want:?}: by reference the next prompt extends the log"
+            );
+            checked += 1;
+        }
+        ran += 1;
+    }
+    if ran == 0 {
+        eprintln!("skipped: no checkpoint template in the Hugging Face cache");
+        return;
+    }
+    assert!(checked > 0, "no cached template rendered the call");
+}
+
+/// A reply that begins with whitespace the template also writes before it —
+/// the newline after an empty reasoning block opened by the generation
+/// prompt, `<think>\n` + `\n</think>…` — is rendered from the emitted ids
+/// where its own bytes begin, so the template's whitespace and the reply's
+/// are not both in the prompt.
+#[test]
+fn a_reply_that_begins_with_whitespace_is_emitted_where_its_bytes_begin() {
+    let user1 = user("Hi");
+    let user2 = user("And again?");
+    let mut ran = 0;
+    for (repo, bos, caps) in AUDITED {
+        let Some(engine) = cached(repo, bos, caps) else {
+            continue;
+        };
+        let name = repo.rsplit("--").next().unwrap();
+        for want in wants(&engine) {
+            let end = match engine.think_tags() {
+                Some(t) => engine.token_str(t.end),
+                None => continue,
+            };
+            for text in [
+                format!("\n{end}\n\nHello."),
+                format!("\nOk.\n{end}\n\nHello."),
+            ] {
+                // A front of its own per reply: two replies of one
+                // conversation with one content would be ambiguous.
+                let front = Front::new(&engine, SessionOptions::default());
+                let one = json!([user1]);
+                let p1 = build(&front, &engine, &one, want);
+                let th = p1.thinking.unwrap();
+                if !th.on || th.by == By::Engine {
+                    continue;
+                }
+                let sampled = engine.enc(&text);
+                let d = decoded(&engine, sampled.clone());
+                assert!(front.record(&engine, p1.origin, &d));
+                let reply = front.reply(&d.text).unwrap();
+                let history = json!([user1, returned(&reply), user2]);
+                let p2 = build(&front, &engine, &history, want);
+                let log = log_after(&front, &p1.ids, &sampled, Stop::Eos);
+                let kept = p2.ids.iter().zip(&log).take_while(|(a, b)| a == b).count();
+                let shown = engine.text.tokenizer.decode(&p2.ids, false).unwrap();
+                eprintln!(
+                    "LEADING-WS {name} want={want:?} {text:?}: leaves the log at {:+}, emitted {}",
+                    kept as i64 - log.len() as i64,
+                    p2.spliced.emitted
+                );
+                assert!(
+                    p2.ids.starts_with(&log),
+                    "{name} want={want:?} {text:?}: the next prompt extends the log; it \
+                     reads {shown:?}"
+                );
+                assert_eq!(p2.spliced.matched, 1, "{name} want={want:?} {text:?}");
+                ran += 1;
+            }
+        }
+    }
+    if ran == 0 {
+        eprintln!("skipped: no cached template opens a block in its generation prompt");
+    }
+}
+
+/// A recorded prefix stands only for the text it was recorded over: a history
+/// whose earlier text changed — a harness's updated system prompt, here of the
+/// same length, so every opening falls where it fell — takes none of it, and
+/// is the full path's prompt. On every tiny template, every think mode.
+#[test]
+fn a_prefix_the_history_no_longer_renders_is_not_taken() {
+    let sys = |s: &str| json!({ "role": "system", "content": s });
+    let user1 = user("What is the capital of France?");
+    let user2 = user("And Germany?");
+    for engine in [Stub::lfm2(), Stub::qwen3_5(), Stub::qwen4exp()] {
+        for want in wants(&engine) {
+            let front = Front::new(&engine, SessionOptions::default());
+            let record = ByRef {
+                record: true,
+                ..ByRef::default()
+            };
+            let p1 = build_by(
+                &front,
+                &engine,
+                &json!([sys("Terse. AAAA"), user1]),
+                want,
+                &record,
+            );
+            let rec = p1.record.clone().expect("a prefix recorded");
+            let d = decoded(&engine, engine.enc("Paris."));
+            let (_, reply) = front.record_reply(&engine, p1.origin, &d);
+            let reply = reply.unwrap();
+            let history = json!([sys("Terse. BBBB"), user1, returned(&reply), user2]);
+            let full = build_by(&front, &engine, &history, want, &ByRef::default());
+            let bound = [Bound {
+                scope: p1.origin.scope,
+                reply,
+            }];
+            let by_id = build_by(
+                &front,
+                &engine,
+                &history,
+                want,
+                &ByRef {
+                    bound: &bound,
+                    prefix: Some((&rec, &p1.ids)),
+                    record: true,
+                },
+            );
+            assert_eq!(
+                by_id.recorded, 0,
+                "want={want:?}: the old prefix is not this text"
+            );
+            assert_eq!(
+                by_id.spliced.bound, 0,
+                "want={want:?}: nor is the reply's scope"
+            );
+            assert_eq!(by_id.ids, full.ids, "want={want:?}");
+            // The same history, unchanged, takes it.
+            let same = json!([
+                sys("Terse. AAAA"),
+                user1,
+                returned(&front.reply("Paris.").unwrap()),
+                user2
+            ]);
+            let again = build_by(
+                &front,
+                &engine,
+                &same,
+                want,
+                &ByRef {
+                    bound: &bound,
+                    prefix: Some((&rec, &p1.ids)),
+                    record: true,
+                },
+            );
+            assert_eq!(
+                again.recorded, rec.ids_len,
+                "want={want:?}: the control takes it"
+            );
+            assert_eq!(
+                again.ids,
+                build_by(&front, &engine, &same, want, &ByRef::default()).ids
+            );
+        }
+    }
 }

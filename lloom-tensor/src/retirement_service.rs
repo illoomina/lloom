@@ -266,6 +266,7 @@ impl InboxRegistry {
     fn len(&self) -> usize {
         self.legacy.len() + self.priced_len
     }
+    #[cfg(test)]
     fn is_empty(&self) -> bool {
         self.len() == 0
     }
@@ -608,6 +609,7 @@ impl HostRetirementService {
     /// but continue servicing genuinely completed payloads. Unknown ownership
     /// remains registered. There is no "timeout then free" or join that claims
     /// native quiescence. Process-static custody survives a stopped worker.
+    #[cfg(test)]
     pub(crate) fn close_admission(&self) {
         self.failure
             .publish(Failure::Closing, || self.wake.notify());

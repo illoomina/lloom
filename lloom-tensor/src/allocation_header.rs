@@ -288,7 +288,7 @@ impl<const N: usize> HeaderInventory<N> {
         if last {
             cell.transition(ticket.generation, LIVE, DETACHING)?;
         }
-        Ok(last.then(|| HeaderDetachment { ticket }))
+        Ok(last.then_some(HeaderDetachment { ticket }))
     }
     /// Publish last: all cleanup payload/physical custody writes precede this
     /// Release bit. Consuming the non-Clone authority transfers its sole custody
@@ -308,6 +308,7 @@ impl<const N: usize> HeaderInventory<N> {
     /// Service only. The Acquire claim observes producer payload initialization;
     /// bit removal transfers one exclusive authority, not header credit. Native
     /// cleanup/panic custody stays rooted until this claim is finally consumed.
+    #[cfg(test)]
     pub(crate) fn claim_cleanup(&self) -> Result<Option<HeaderDetachment>, HeaderError> {
         self.claim_cleanup_matching(u64::MAX)
     }
@@ -379,6 +380,7 @@ impl<const N: usize> HeaderInventory<N> {
                     && cell.weak.load(Ordering::Acquire) == 0
             })
     }
+    #[cfg(test)]
     pub(crate) fn available(&self) -> usize {
         self.free.load(Ordering::Acquire).count_ones() as usize
     }

@@ -14,12 +14,15 @@
 //! so a file that is not a module here fails the suite instead of silently
 //! not running.
 mod accepted_frontier;
+mod attention_purpose;
+mod batch_admission_ownership;
 mod checkpoint_policy;
 mod failure_next_request;
 mod load_warnings;
 mod machine_gate;
 mod qwen4exp_served_auto;
 mod recovery_frontier_served;
+mod sampling_host_contract;
 mod tiny_chat_e2e;
 mod tiny_templates;
 mod turn_reuse;
@@ -67,3 +70,5 @@ fn every_test_file_is_a_module() {
 fn lloom_manifest_dir() -> String {
     std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| env!("CARGO_MANIFEST_DIR").to_string())
 }
+
+mod sampling_admission;

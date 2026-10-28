@@ -65,14 +65,14 @@ fn two_windows_open_at_once_on_two_devices_each_record_only_their_own() -> Resul
     const SQRTS: usize = 11;
 
     let _ = trace::take_dispatches();
-    trace::set_recording(true);
+    trace::set_recording(true)?;
     let both = Barrier::new(2);
     let (a, b) = std::thread::scope(|s| {
         let a = s.spawn(|| windowed(&both, EXPS, |t| t.exp()));
         let b = s.spawn(|| windowed(&both, SQRTS, |t| t.sqrt()));
         (a.join().unwrap(), b.join().unwrap())
     });
-    trace::set_recording(false);
+    trace::set_recording(false)?;
     let global = trace::take_dispatches();
     let (a, b) = (a?, b?);
     let names = |ds: &[trace::Dispatch]| ds.iter().map(|d| d.pipeline.clone()).collect::<Vec<_>>();

@@ -15,6 +15,7 @@
 //! unarmed run cannot pass for a clean one. Off, each entry point is one
 //! `OnceLock` load and one relaxed atomic load.
 
+use lloom_tensor::residency_class::{residency_class_scope, ResidencyClass};
 use lloom_tensor::scalar::Scalar;
 use lloom_tensor::{DType, Device, Result, Shape, Tensor};
 use parking_lot::RwLock;
@@ -209,10 +210,10 @@ pub fn zeros<S: Into<Shape>>(
     dtype: DType,
     device: &Device,
 ) -> Result<Tensor> {
-    match armed(site) {
+    residency_class_scope(site_class(site), || match armed(site) {
         Some(nan) => sentinel_tensor(site, shape.into(), dtype, device, nan),
         None => Tensor::zeros(shape, dtype, device),
-    }
+    })
 }
 
 /// A tensor whose every element is written before any is read, or whose
@@ -226,11 +227,22 @@ pub fn uninit<S: Into<Shape>>(
     dtype: DType,
     device: &Device,
 ) -> Result<Tensor> {
-    match armed(site) {
+    residency_class_scope(site_class(site), || match armed(site) {
         Some(nan) => sentinel_tensor(site, shape.into(), dtype, device, nan),
         // SAFETY: the site's contract (above): no element is read before it
         // is written.
         None => unsafe { Tensor::empty(shape, dtype, device) },
+    })
+}
+
+/// The residency class a site's storage is: the sequence state (KV, conv
+/// state, turn checkpoints) is `Kv`; the weight-group tier's slots are
+/// `Experts` (`tuning.md` §6.3n).
+pub fn site_class(site: &str) -> ResidencyClass {
+    if site == NN_WEIGHT_GROUPS {
+        ResidencyClass::Experts
+    } else {
+        ResidencyClass::Kv
     }
 }
 

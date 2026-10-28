@@ -148,7 +148,7 @@ ug = "0.5.0"
 ug-cuda = "0.5.0"
 ug-metal = "0.5.0"
 yoke = { version = "0.8.1", features = ["derive"] }
-zip = { version = "9.0.4", default-features = false }
+zip = { version = "9.1.0", default-features = false }
 zerocopy = "0.8"
 objc2-metal = { version = "0.3.2", features = ["block2"] }
 objc2-foundation = { version = "0.3.2" }
@@ -161,15 +161,10 @@ parking_lot = "0.12"
 # moves no digest and no resolvable decode time against thin, and costs build
 # memory and time (docs/architecture.md §14.5e).
 #
-# `panic` and `strip` stay at cargo's defaults on purpose. Abort turns a
-# panicking request thread into the exit of `lloom serve` and removes the
-# retirement service's panic containment; stripping the symbol table blinds
-# the instruments that name frames from a backtrace (`LLOOM_POOL_TRACE`,
-# `LLOOM_SERVED_REQUEST_TRACE`). Both are measured in §14.5e.
-#
-# `release-with-debug` and `sanitize` inherit this profile; `sanitize` sets
-# its own `lto` and `codegen-units`. Declared here rather than passed as
-# `--config` so the tier is a property of the tree (§14.5a).
+# Shipping aborts on bugs and strips symbols. Optional attribution diagnostics also
+# require the `profile` feature; Cargo profile names do not select features.
+# Symbol material for this exact artifact must be retained separately.
+# Investigation builds below deliberately keep unwinding.
 [profile.release]
 opt-level = 3
 lto = "fat"
@@ -181,6 +176,13 @@ codegen-units = 1
 # `release-with-debug` below keeps symbols for the tracing instruments.
 panic = "abort"
 strip = "symbols"
+
+# Production panic strategy with symbols: distinct from the unwind investigation
+# build. This is not asserted byte-identical to a separately stripped binary.
+[profile.release-symbols]
+inherits = "release"
+debug = true
+strip = false
 
 [profile.release-with-debug]
 inherits = "release"

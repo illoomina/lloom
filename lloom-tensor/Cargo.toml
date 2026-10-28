@@ -108,13 +108,17 @@ rand_distr = { workspace = true }
 
 [features]
 default = []
+# Optional attribution and detailed diagnostics in optimized builds.
+profile = []
 # The stateful fuzz MODELS (`buffer_pool_fuzz`, `commands_fuzz`, `scratch_fuzz`)
 # and the one accessor they read, compiled OUTSIDE `#[cfg(test)]` so the
 # coverage-guided harnesses in `lloom-fuzz/` (lloom #706) can drive them. Off by
 # default; a release build with it off is byte-identical to one without it
 # (`measurements/issue-706-libafl-port.md`). The proptest generators and the
 # tests stay `#[cfg(test)]` -- proptest is a dev-dependency.
-fuzzing = []
+# Geometry reachability/coverage consumes the per-label profiler census.
+# Keep that diagnostic recorder in optimized fuzz builds, not an empty map.
+fuzzing = ["profile"]
 # The shape checks' probes (`shape_probe`, `docs/porting-models.md` §21.8):
 # `shape_req!` / `shape_ensure!` also log each evaluation for the shape
 # campaign in `lloom-fuzz/`. Off by default, and enabled only from that
@@ -270,4 +274,8 @@ required-features = ["metal"]
 
 [[example]]
 name = "pool_round_trip_price"
+required-features = ["metal"]
+
+[[example]]
+name = "diagnostic_recorder_control"
 required-features = ["metal"]

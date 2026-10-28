@@ -1,10 +1,15 @@
 use super::{Buffer, Device};
 use crate::allocation_owner::{AllocationLease, AllocationOwner};
 use crate::completion_wake::{Wake, WakeMutex};
+use crate::residency_class::{scoped_residency_class, ResidencyClass, MAX_DEVICE_SETS};
 use crate::residency_ownership::ResidencyOwners;
 use objc2::{rc::Retained, runtime::ProtocolObject};
-use objc2_metal::{MTLAllocation, MTLDevice as _, MTLResidencySet, MTLResidencySetDescriptor};
+use objc2_metal::{
+    MTL4CommandQueue, MTLAllocation, MTLCommandQueue, MTLDevice as _, MTLResidencySet,
+    MTLResidencySetDescriptor,
+};
 use parking_lot::{Condvar, Mutex};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Instant;
@@ -82,7 +87,13 @@ impl Retirement {
         }
     }
     fn leave(&self, counter: &AtomicUsize) {
+        self.leave_then(counter, || {});
+    }
+    /// As [`Self::leave`], running `last` when this was the counter's last
+    /// holder, before a waiter is woken.
+    fn leave_then(&self, counter: &AtomicUsize, last: impl FnOnce()) {
         if counter.fetch_sub(1, Ordering::AcqRel) == 1 {
+            last();
             let _guard = self.lock.lock();
             self.settled.notify_all();
         }
@@ -134,10 +145,20 @@ pub fn join_device_retirement(deadline: Instant) -> DeviceRetirementReport {
 /// their accounting owners; dropping it can release a final machine Holding.
 /// This type does not schedule cleanup and does not delay native commit.
 #[must_use = "published custody must leave outer caller locks before destruction"]
-pub(crate) struct PublishedRemovals(Vec<ResidencyLease>);
+pub(crate) struct PublishedRemovals {
+    _leases: Vec<ResidencyLease>,
+}
 impl PublishedRemovals {
+    /// Omission mutants only: no publication or ownership is manufactured.
+    /// Their prerequisite observer must refuse before epoch/native entry.
+    #[cfg(test)]
+    pub(crate) fn empty_for_test() -> Self {
+        Self {
+            _leases: Vec::new(),
+        }
+    }
     pub(crate) fn is_empty(&self) -> bool {
-        self.0.is_empty()
+        self._leases.is_empty()
     }
 }
 // SAFETY: leases contain only engine-created thread-safe Metal Buffer/Heap
@@ -145,6 +166,229 @@ impl PublishedRemovals {
 // No mutable native allocation metadata is accessed through this wrapper.
 unsafe impl Send for PublishedRemovals {}
 unsafe impl Sync for PublishedRemovals {}
+
+/// How the router lays the device's allocations out over residency sets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResidencyPolicy {
+    /// A set of a class takes allocations until it holds this many bytes;
+    /// `None` is one set for everything, as before the router.
+    pub cap_bytes: Option<u64>,
+    /// The most sets, at most [`MAX_DEVICE_SETS`].
+    pub max_sets: usize,
+    /// The classes the keep-warm asks to keep resident, one bit each.
+    hot: u8,
+}
+
+impl ResidencyPolicy {
+    /// One set holding everything.
+    pub fn single() -> Self {
+        Self {
+            cap_bytes: None,
+            max_sets: 1,
+            hot: u8::MAX,
+        }
+    }
+
+    /// Sets of each class capped at `cap_bytes`, `hot` requested resident.
+    pub fn split(cap_bytes: u64, hot: &[ResidencyClass]) -> Self {
+        Self {
+            cap_bytes: Some(cap_bytes.max(1)),
+            max_sets: MAX_DEVICE_SETS,
+            hot: hot.iter().fold(0, |m, c| m | c.bit()),
+        }
+    }
+
+    /// `kernels.residency.set_cap_pct` of the device's recommended working
+    /// set (0 = one set) and `kernels.residency.hot`.
+    pub fn selected(device: &Device) -> Self {
+        let t = &crate::tuning::tuning().metal;
+        let pct = t.residency_set_cap_pct;
+        if pct == 0 || pct >= 100 {
+            return Self::single();
+        }
+        let budget = device.as_ref().recommendedMaxWorkingSetSize();
+        let hot: Vec<ResidencyClass> = t
+            .residency_hot
+            .split(',')
+            .filter_map(ResidencyClass::parse)
+            .collect();
+        Self::split(budget / 100 * u64::from(pct), &hot)
+    }
+
+    pub fn is_split(&self) -> bool {
+        self.cap_bytes.is_some()
+    }
+
+    /// Whether the keep-warm requests a set of `class` (a set no class has
+    /// claimed yet is requested: it is the one set of an unsplit layout).
+    pub fn is_hot(&self, class: Option<ResidencyClass>) -> bool {
+        class.is_none_or(|c| self.hot & c.bit() != 0)
+    }
+
+    /// The hot classes, by name.
+    pub fn hot_names(&self) -> Vec<&'static str> {
+        ResidencyClass::ALL
+            .into_iter()
+            .filter(|c| self.hot & c.bit() != 0)
+            .map(ResidencyClass::name)
+            .collect()
+    }
+}
+
+/// One native set: its class, what it holds, what it has done.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResidencySetInfo {
+    /// `None` until the first allocation names one (an unsplit set).
+    pub class: Option<ResidencyClass>,
+    /// `allocatedSize` of the allocations in it, summed at each add.
+    pub bytes: u64,
+    pub allocations: usize,
+    pub commits: u64,
+    /// Whether the keep-warm requests it ([`ResidencyPolicy::is_hot`]).
+    pub hot: bool,
+}
+
+struct Native {
+    raw: Retained<ProtocolObject<dyn MTLResidencySet>>,
+    class: Option<ResidencyClass>,
+    bytes: u64,
+    allocations: usize,
+    commits: u64,
+    dirty: bool,
+}
+
+/// Which native set lists an allocation, and the bytes it was added with.
+#[derive(Clone, Copy)]
+struct Placed {
+    native: u8,
+    bytes: u64,
+}
+
+/// Everything behind the set's one lock: the custody records, which native
+/// set lists each allocation, the native sets, and the queues they join.
+struct Inner {
+    owners: ResidencyOwners<ResidencyLease>,
+    placement: HashMap<usize, Placed>,
+    natives: Vec<Native>,
+    queues: Vec<Retained<ProtocolObject<dyn MTLCommandQueue>>>,
+    /// Metal 4 queues the sets are on (`kernels.residency.metal4 = queue-*`).
+    queues4: Vec<Retained<ProtocolObject<dyn MTL4CommandQueue>>>,
+    /// Placements past the cap because every set was already made.
+    overflow: u64,
+}
+
+impl Inner {
+    /// The native set a new allocation of `class`, `bytes` long, goes to:
+    /// the class's newest set while it is under the cap, else a new set,
+    /// else (at the most sets) the class's emptiest, else the emptiest.
+    /// One scan of at most [`MAX_DEVICE_SETS`] sets, on an allocation.
+    fn place(
+        &mut self,
+        policy: &ResidencyPolicy,
+        device: &Device,
+        class: ResidencyClass,
+        bytes: u64,
+        requests: &AtomicU64,
+        attachments: &AtomicU64,
+        generation: &AtomicU64,
+    ) -> usize {
+        let Some(cap) = policy.cap_bytes else {
+            return 0;
+        };
+        let fits = |n: &Native| n.allocations == 0 || n.bytes.saturating_add(bytes) <= cap;
+        if let Some(i) = self
+            .natives
+            .iter()
+            .rposition(|n| n.class == Some(class) && fits(n))
+        {
+            return i;
+        }
+        if let Some(i) = self.natives.iter().position(|n| n.class.is_none()) {
+            self.natives[i].class = Some(class);
+            return i;
+        }
+        if self.natives.len() < policy.max_sets {
+            if let Ok(raw) = device
+                .as_ref()
+                .newResidencySetWithDescriptor_error(&MTLResidencySetDescriptor::new())
+            {
+                if policy.is_hot(Some(class)) {
+                    raw.requestResidency();
+                    requests.fetch_add(1, Ordering::Relaxed);
+                }
+                for q in &self.queues {
+                    q.addResidencySet(&raw);
+                    attachments.fetch_add(1, Ordering::Relaxed);
+                }
+                for q in &self.queues4 {
+                    q.addResidencySet(&raw);
+                    attachments.fetch_add(1, Ordering::Relaxed);
+                }
+                self.natives.push(Native {
+                    raw,
+                    class: Some(class),
+                    bytes: 0,
+                    allocations: 0,
+                    commits: 0,
+                    dirty: false,
+                });
+                generation.fetch_add(1, Ordering::Release);
+                return self.natives.len() - 1;
+            }
+        }
+        self.overflow += 1;
+        let emptiest = |of_class: bool| {
+            self.natives
+                .iter()
+                .enumerate()
+                .filter(|(_, n)| !of_class || n.class == Some(class))
+                .min_by_key(|(_, n)| n.bytes)
+                .map(|(i, _)| i)
+        };
+        emptiest(true).or_else(|| emptiest(false)).unwrap_or(0)
+    }
+
+    fn add_native(&mut self, i: usize, key: usize, alloc: &ProtocolObject<dyn MTLAllocation>) {
+        let bytes = alloc.allocatedSize() as u64;
+        let n = &mut self.natives[i];
+        n.raw.addAllocation(alloc);
+        n.bytes += bytes;
+        n.allocations += 1;
+        n.dirty = true;
+        self.placement.insert(
+            key,
+            Placed {
+                native: i as u8,
+                bytes,
+            },
+        );
+    }
+
+    /// `removeAllocation` on the native set that lists `key`, and only it.
+    fn remove_native(&mut self, key: usize, alloc: &ProtocolObject<dyn MTLAllocation>) {
+        let placed = self
+            .placement
+            .remove(&key)
+            .expect("a listed allocation has a placement");
+        let n = &mut self.natives[usize::from(placed.native)];
+        n.raw.removeAllocation(alloc);
+        n.bytes = n.bytes.saturating_sub(placed.bytes);
+        n.allocations = n.allocations.saturating_sub(1);
+        n.dirty = true;
+    }
+
+    /// Commits every native set with staged changes; returns how many.
+    fn commit_dirty(&mut self) -> u64 {
+        let mut commits = 0;
+        for n in self.natives.iter_mut().filter(|n| n.dirty) {
+            n.raw.commit();
+            n.commits += 1;
+            n.dirty = false;
+            commits += 1;
+        }
+        commits
+    }
+}
 
 /// What the set has done, so the cost model can be checked rather than quoted.
 ///
@@ -194,6 +438,10 @@ pub struct ResidencyCounters {
     /// the allocation, kept instead of freed ([`ReleaseWitness`]). A defect
     /// count, not a rate: [`ResidencySet::reset_counters`] leaves it.
     pub listed_at_release: u64,
+    /// `requestResidency` calls (the keep-warm's, and the one at creation).
+    pub requests: u64,
+    /// `endResidency` calls (memory pressure, the last device handle).
+    pub ends: u64,
 }
 
 /// Keeps Metal buffers resident in GPU memory, removing the need for `useResource` calls.
@@ -236,7 +484,10 @@ pub struct ResidencyCounters {
 /// `ResidencyEvictionObserver`, and [`ResidencyCounters`] for the rate that
 /// decides it.
 pub struct ResidencySet {
+    /// The first native set; the router's later sets are in `members`.
     raw: Option<Retained<ProtocolObject<dyn MTLResidencySet>>>,
+    device: Device,
+    policy: ResidencyPolicy,
 
     /// Native allocation addresses plus their accounting custody. Removed
     /// leases survive until native commit; retired leases survive until clear.
@@ -249,7 +500,7 @@ pub struct ResidencySet {
     /// atomic against a concurrent remove of the same buffer. That pair is
     /// precisely the double-unregister #165's audit found reachable in
     /// principle.
-    members: WakeMutex<ResidencyOwners<ResidencyLease>>,
+    members: WakeMutex<Inner>,
 
     /// See [`ResidencyCounters`]. Atomics rather than fields inside `members`
     /// so a reader never contends with an allocation for the lock, and
@@ -262,6 +513,13 @@ pub struct ResidencySet {
     retired: AtomicU64,
     insert_batches: AtomicU64,
     remove_batches: AtomicU64,
+    requests: AtomicU64,
+    ends: AtomicU64,
+    /// `addResidencySet` calls naming this set (`kernels.residency.attach`).
+    queue_attachments: AtomicU64,
+    /// Bumped each time the router makes a native set, so a Metal 4 slot
+    /// that uses the sets per command buffer re-reads them only then.
+    natives_generation: AtomicU64,
 
     /// Set by [`Self::add`] when an allocation has been `addAllocation`'d but not
     /// yet `commit`ted, cleared by [`Self::commit_pending`]. The deferred-commit
@@ -294,6 +552,8 @@ impl Drop for ListingRecord {
 }
 
 /// One device root naming a set, held for as long as a device handle lives.
+/// The last one to go ends the set's residency: the model is unloaded, and
+/// its memory goes back to the OS now rather than at the idle collector.
 pub(crate) struct LiveDevice(Arc<ResidencySet>);
 impl LiveDevice {
     pub(crate) fn new(set: &Arc<ResidencySet>) -> Self {
@@ -303,7 +563,144 @@ impl LiveDevice {
 }
 impl Drop for LiveDevice {
     fn drop(&mut self) {
-        self.0.retirement.leave(&self.0.retirement.devices);
+        let set = &self.0;
+        set.retirement
+            .leave_then(&set.retirement.devices, || set.end_all_residency());
+    }
+}
+
+pub use crate::residency_class::SlotResidency;
+
+/// How the device's residency set reaches the command queue
+/// (`kernels.residency.attach`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResidencyAttach {
+    /// `addResidencySet` on the Metal 3 queue: every command buffer waits
+    /// until the whole set is resident.
+    Queue,
+    /// Not attached: a command buffer waits only for the buffers it binds
+    /// (`setBuffer`, an ICB run's `useResources`), and the set is kept wired
+    /// by `requestResidency` (serve's keep-warm, §3.4d).
+    Heartbeat,
+}
+
+impl ResidencyAttach {
+    /// The arm `kernels.residency.attach` names.
+    pub fn selected() -> Self {
+        Self::parse(&crate::tuning::tuning().metal.residency_attach)
+    }
+    fn parse(arm: &str) -> Self {
+        if arm == "heartbeat" {
+            Self::Heartbeat
+        } else {
+            Self::Queue
+        }
+    }
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Queue => "queue",
+            Self::Heartbeat => "heartbeat",
+        }
+    }
+}
+
+/// What a Metal 4 command buffer declares resident (`kernels.residency.metal4`,
+/// `tuning.md` §6.3p). Under `Slots` its slot's set lists everything it
+/// binds. The others put the device's sets on the Metal 4 queue (`Queue*`) or
+/// mark them used by each command buffer (`Cb*`); under a `*Diff` the slot's
+/// set then leaves out the bindings those sets cover (a pool buffer, a heap
+/// sub-buffer: `Buffer::device_listed`), under a `*Full` it lists everything
+/// still (the controls that price the attachment without the saving).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Metal4Declare {
+    Slots,
+    QueueDiff,
+    CbDiff,
+    QueueFull,
+    CbFull,
+}
+
+impl Metal4Declare {
+    /// The arm `kernels.residency.metal4` names.
+    pub fn selected() -> Self {
+        Self::parse(&crate::tuning::tuning().metal.residency_metal4)
+    }
+    pub fn parse(arm: &str) -> Self {
+        match arm {
+            "queue-diff" => Self::QueueDiff,
+            "cb-diff" => Self::CbDiff,
+            "queue-full" => Self::QueueFull,
+            "cb-full" => Self::CbFull,
+            _ => Self::Slots,
+        }
+    }
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Slots => "slots",
+            Self::QueueDiff => "queue-diff",
+            Self::CbDiff => "cb-diff",
+            Self::QueueFull => "queue-full",
+            Self::CbFull => "cb-full",
+        }
+    }
+    /// The device's sets are on the Metal 4 queue.
+    pub fn on_queue(self) -> bool {
+        matches!(self, Self::QueueDiff | Self::QueueFull)
+    }
+    /// Each command buffer marks the device's sets as used.
+    pub fn per_command_buffer(self) -> bool {
+        matches!(self, Self::CbDiff | Self::CbFull)
+    }
+    /// A slot's set leaves out what the device's sets cover.
+    pub fn diff(self) -> bool {
+        matches!(self, Self::QueueDiff | Self::CbDiff)
+    }
+}
+
+/// What a queue did with the device set: the arm asked for, whether the set
+/// is on the queue, and why when the arm was not honoured.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResidencyAttachment {
+    pub requested: ResidencyAttach,
+    pub attached: bool,
+    pub ignored: Option<&'static str>,
+}
+
+impl ResidencyAttachment {
+    /// The decision for a queue that runs on Metal 4 (`metal4`) or Metal 3.
+    /// Metal 4 command buffers go to their own queue, whose per-slot sets
+    /// list every resource a slot binds (its argument tables bind by GPU
+    /// address); the device set sits on the Metal 3 queue there, which runs
+    /// no work. `heartbeat` changes nothing that queue does, so it is
+    /// ignored and the attachment kept as `queue` has it.
+    pub fn decide(requested: ResidencyAttach, metal4: bool) -> Self {
+        match (requested, metal4) {
+            (ResidencyAttach::Heartbeat, false) => Self {
+                requested,
+                attached: false,
+                ignored: None,
+            },
+            (ResidencyAttach::Heartbeat, true) => Self {
+                requested,
+                attached: true,
+                ignored: Some("metal4 binds through its per-slot sets"),
+            },
+            (ResidencyAttach::Queue, _) => Self {
+                requested,
+                attached: true,
+                ignored: None,
+            },
+        }
+    }
+
+    /// The loaded line's word: `queue`, `detached`, or
+    /// `queue(heartbeat ignored: …)`.
+    pub fn short(&self) -> String {
+        match (self.attached, self.ignored) {
+            (false, _) => "detached".into(),
+            (true, Some(why)) => format!("queue(heartbeat ignored: {why})"),
+            (true, None) => "queue".into(),
+        }
     }
 }
 
@@ -315,25 +712,220 @@ unsafe impl Send for ResidencySet {}
 unsafe impl Sync for ResidencySet {}
 
 impl ResidencySet {
+    /// The device's set, laid out by `kernels.residency.set_cap_pct` and
+    /// `kernels.residency.hot` ([`ResidencyPolicy::selected`]).
     pub fn new(device: &Device) -> Self {
+        Self::with_policy(device, ResidencyPolicy::selected(device))
+    }
+
+    /// As [`Self::new`], with the layout supplied: a test sees both in one
+    /// process.
+    pub fn with_policy(device: &Device, policy: ResidencyPolicy) -> Self {
         let descriptor = MTLResidencySetDescriptor::new();
         let raw = device
             .as_ref()
             .newResidencySetWithDescriptor_error(&descriptor)
             .ok()
             .inspect(|set| set.requestResidency());
+        let requested = u64::from(raw.is_some());
+        let natives = raw
+            .iter()
+            .map(|raw| Native {
+                raw: raw.clone(),
+                class: None,
+                bytes: 0,
+                allocations: 0,
+                commits: 0,
+                dirty: false,
+            })
+            .collect();
         ResidencySet {
             raw,
-            members: WakeMutex::new(ResidencyOwners::default()),
+            device: device.clone(),
+            policy,
+            members: WakeMutex::new(Inner {
+                owners: ResidencyOwners::default(),
+                placement: HashMap::new(),
+                natives,
+                queues: Vec::new(),
+                queues4: Vec::new(),
+                overflow: 0,
+            }),
             commits: AtomicU64::new(0),
             added: AtomicU64::new(0),
             removed: AtomicU64::new(0),
             retired: AtomicU64::new(0),
             insert_batches: AtomicU64::new(0),
             remove_batches: AtomicU64::new(0),
+            requests: AtomicU64::new(requested),
+            ends: AtomicU64::new(0),
+            queue_attachments: AtomicU64::new(0),
+            natives_generation: AtomicU64::new(0),
             dirty: std::sync::atomic::AtomicBool::new(false),
             retirement: Retirement::default(),
         }
+    }
+
+    /// Asks the OS to make every allocation in the set resident again. A
+    /// set nothing has used for a few seconds is unwired, and the next
+    /// command buffer then waits while it is wired back
+    /// (`docs/machine-model.md` §3.4d).
+    /// Under a split layout, the sets of the hot classes only
+    /// (`kernels.residency.hot`); the rest are left to the OS.
+    pub fn request_residency(&self) {
+        let inner = self.members.lock();
+        for n in inner.natives.iter().filter(|n| self.policy.is_hot(n.class)) {
+            n.raw.requestResidency();
+            self.requests.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Tells the OS the set's memory need not stay resident: under memory
+    /// pressure, and when the set's device is gone, so the memory is given
+    /// back without waiting for the idle collector (§3.4d). Membership is
+    /// untouched; a later [`Self::request_residency`] or a command buffer
+    /// on a queue the set is attached to makes it resident again.
+    ///
+    /// Under a split layout the cold classes' sets only: the keep-warm has
+    /// stopped asking for the hot ones, and the collector takes them. One
+    /// unsplit set is ended.
+    pub fn end_residency(&self) {
+        self.end_where(|n| !self.policy.is_split() || !self.policy.is_hot(n.class));
+    }
+
+    /// Every set's residency ended: the device is gone.
+    pub fn end_all_residency(&self) {
+        self.end_where(|_| true);
+    }
+
+    fn end_where(&self, which: impl Fn(&Native) -> bool) {
+        let inner = self.members.lock();
+        for n in inner.natives.iter().filter(|n| which(n)) {
+            n.raw.endResidency();
+            self.ends.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Puts every set on `queue` now and every set made later when it is
+    /// made (`kernels.residency.attach = queue`).
+    pub(crate) fn attach_queue(&self, queue: &Retained<ProtocolObject<dyn MTLCommandQueue>>) {
+        let mut inner = self.members.lock();
+        for n in &inner.natives {
+            queue.addResidencySet(&n.raw);
+            self.queue_attachments.fetch_add(1, Ordering::Relaxed);
+        }
+        inner.queues.push(queue.clone());
+    }
+
+    /// Puts every set on a Metal 4 queue now and every set made later when
+    /// it is made (`kernels.residency.metal4 = queue-*`). At most
+    /// `MAX_DEVICE_SETS` beside the queue's 8 slot sets: Metal's 32.
+    pub(crate) fn attach_metal4_queue(
+        &self,
+        queue: &Retained<ProtocolObject<dyn MTL4CommandQueue>>,
+    ) {
+        let mut inner = self.members.lock();
+        for n in &inner.natives {
+            queue.addResidencySet(&n.raw);
+            self.queue_attachments.fetch_add(1, Ordering::Relaxed);
+        }
+        inner.queues4.push(queue.clone());
+    }
+
+    /// How many native sets the router has made since the set was built: a
+    /// reader holding [`Self::natives`] from an equal generation holds them
+    /// all.
+    #[inline]
+    pub(crate) fn natives_generation(&self) -> u64 {
+        self.natives_generation.load(Ordering::Acquire)
+    }
+
+    /// The native sets, and the generation they were read at.
+    pub(crate) fn natives(&self) -> (u64, Vec<Retained<ProtocolObject<dyn MTLResidencySet>>>) {
+        let inner = self.members.lock();
+        (
+            self.natives_generation.load(Ordering::Acquire),
+            inner.natives.iter().map(|n| n.raw.clone()).collect(),
+        )
+    }
+
+    /// The layout's policy.
+    pub fn policy(&self) -> ResidencyPolicy {
+        self.policy
+    }
+
+    /// Each native set, in the order the router made them.
+    pub fn layout(&self) -> Vec<ResidencySetInfo> {
+        let inner = self.members.lock();
+        inner
+            .natives
+            .iter()
+            .map(|n| ResidencySetInfo {
+                class: n.class,
+                bytes: n.bytes,
+                allocations: n.allocations,
+                commits: n.commits,
+                hot: self.policy.is_hot(n.class),
+            })
+            .collect()
+    }
+
+    /// Metal's own `allocationCount` of each native set, beside the router's
+    /// bookkeeping: the reference a test checks the placement against.
+    pub fn native_allocation_counts(&self) -> Vec<usize> {
+        let inner = self.members.lock();
+        inner
+            .natives
+            .iter()
+            .map(|n| n.raw.allocationCount())
+            .collect()
+    }
+
+    /// Placements past the cap because every set was already made.
+    pub fn overflow(&self) -> u64 {
+        self.members.lock().overflow
+    }
+
+    /// The layout in words: `1 set 8.12 GiB`, or `7 sets 8.10 GiB (weights
+    /// 5×1.10 GiB, kv 1×0.40 GiB, heap 1×0.50 GiB; hot weights,kv)`.
+    pub fn layout_line(&self) -> String {
+        let sets = self.layout();
+        let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
+        let total: u64 = sets.iter().map(|s| s.bytes).sum();
+        let head = format!(
+            "{} set{} {:.2} GiB",
+            sets.len(),
+            if sets.len() == 1 { "" } else { "s" },
+            gib(total)
+        );
+        if !self.policy.is_split() {
+            return head;
+        }
+        let mut parts = Vec::new();
+        for class in ResidencyClass::ALL {
+            let of: Vec<_> = sets.iter().filter(|s| s.class == Some(class)).collect();
+            if of.is_empty() {
+                continue;
+            }
+            let bytes: u64 = of.iter().map(|s| s.bytes).sum();
+            parts.push(format!(
+                "{} {}×{:.2} GiB",
+                class.name(),
+                of.len(),
+                gib(bytes / of.len() as u64)
+            ));
+        }
+        format!(
+            "{head} ({}; hot {})",
+            parts.join(", "),
+            self.policy.hot_names().join(",")
+        )
+    }
+
+    /// `addResidencySet` calls naming one of this set's native sets: one per
+    /// set under `kernels.residency.attach = queue`, 0 when detached.
+    pub fn queue_attachments(&self) -> u64 {
+        self.queue_attachments.load(Ordering::Relaxed)
     }
 
     /// Enters this set in the process registry [`join_device_retirement`]
@@ -397,7 +989,7 @@ impl ResidencySet {
     /// listing needs a live handle.
     pub(crate) fn release_unlisted(&self, lease: ResidencyLease) {
         let key = Retained::as_ptr(lease.raw()) as usize;
-        let listed = self.members.lock().lists(key);
+        let listed = self.members.lock().owners.lists(key);
         self.retirement.released.fetch_add(1, Ordering::Relaxed);
         if listed {
             self.retirement
@@ -428,6 +1020,8 @@ impl ResidencySet {
             insert_batches: self.insert_batches.load(Ordering::Relaxed),
             remove_batches: self.remove_batches.load(Ordering::Relaxed),
             listed_at_release: self.retirement.listed_at_release.load(Ordering::Relaxed),
+            requests: self.requests.load(Ordering::Relaxed),
+            ends: self.ends.load(Ordering::Relaxed),
         }
     }
 
@@ -440,6 +1034,8 @@ impl ResidencySet {
         self.retired.store(0, Ordering::Relaxed);
         self.insert_batches.store(0, Ordering::Relaxed);
         self.remove_batches.store(0, Ordering::Relaxed);
+        self.requests.store(0, Ordering::Relaxed);
+        self.ends.store(0, Ordering::Relaxed);
     }
 
     /// Raw Metal interoperability, including allAllocations-derived handles.
@@ -457,6 +1053,11 @@ impl ResidencySet {
 
     pub fn insert(&self, buf: &Buffer) -> usize {
         self.insert_batch(std::iter::once(buf))
+    }
+
+    /// [`Self::insert`] of an allocation of `class`.
+    pub fn insert_in(&self, buf: &Buffer, class: ResidencyClass) -> usize {
+        self.insert_batch_in(std::iter::once(buf), class)
     }
 
     /// `addAllocation` **without** committing — the deferred-commit half of the
@@ -478,14 +1079,23 @@ impl ResidencySet {
     /// Returns 1 if `buf` was newly added, 0 if already present (idempotent, as
     /// [`Self::insert_batch`]).
     pub fn add(&self, buf: &Buffer) -> usize {
-        let Some(set) = &self.raw else {
+        self.add_in(
+            buf,
+            scoped_residency_class().unwrap_or(ResidencyClass::Other),
+        )
+    }
+
+    /// [`Self::add`] of an allocation of `class`: the router places it in a
+    /// set of that class ([`Inner::place`]).
+    pub fn add_in(&self, buf: &Buffer, class: ResidencyClass) -> usize {
+        if self.raw.is_none() {
             return 0;
-        };
+        }
         let mut members = self.members.lock();
-        let (added, redundant) =
-            members.insert(allocation_key(buf), buffer_lease(buf), same_charge);
+        let key = allocation_key(buf);
+        let (added, redundant) = members.owners.insert(key, buffer_lease(buf), same_charge);
         if added {
-            set.addAllocation(as_allocation(buf));
+            self.place_and_add(&mut members, class, key, as_allocation(buf));
             self.added.fetch_add(1, Ordering::Relaxed);
             self.dirty.store(true, Ordering::Relaxed);
         }
@@ -494,12 +1104,32 @@ impl ResidencySet {
         usize::from(added)
     }
 
+    /// Places a new member of `class` and lists it in that native set.
+    fn place_and_add(
+        &self,
+        inner: &mut Inner,
+        class: ResidencyClass,
+        key: usize,
+        alloc: &ProtocolObject<dyn MTLAllocation>,
+    ) {
+        let i = inner.place(
+            &self.policy,
+            &self.device,
+            class,
+            alloc.allocatedSize() as u64,
+            &self.requests,
+            &self.queue_attachments,
+            &self.natives_generation,
+        );
+        inner.add_native(i, key, alloc);
+    }
+
     /// Add an allocation that is not a buffer of ours — a heap chunk
     /// (`heap.rs`) — keyed by `key`, and commit at once: a chunk is made a
     /// few times a process and everything it will hold rides on this one
     /// commit. Returns whether it was newly added.
     pub fn insert_allocation(&self, alloc: &ProtocolObject<dyn MTLAllocation>, key: usize) -> bool {
-        self.insert_allocation_with_owner(alloc, key, None)
+        self.insert_allocation_with_owner(alloc, key, None, ResidencyClass::HeapChunk)
     }
 
     /// Heap chunks use one shared owner for the chunk and all its sub-buffers.
@@ -509,7 +1139,7 @@ impl ResidencySet {
         key: usize,
         owner: AllocationOwner,
     ) -> bool {
-        self.insert_allocation_with_owner(alloc, key, Some(owner))
+        self.insert_allocation_with_owner(alloc, key, Some(owner), ResidencyClass::HeapChunk)
     }
 
     fn insert_allocation_with_owner(
@@ -517,17 +1147,18 @@ impl ResidencySet {
         alloc: &ProtocolObject<dyn MTLAllocation>,
         key: usize,
         owner: Option<AllocationOwner>,
+        class: ResidencyClass,
     ) -> bool {
-        let Some(set) = &self.raw else {
+        if self.raw.is_none() {
             return false;
-        };
+        }
         let lease = owner.map(|owner| retained_lease(alloc, owner));
         let mut members = self.members.lock();
-        let (added, redundant) = members.insert(key, lease, same_charge);
+        let (added, redundant) = members.owners.insert(key, lease, same_charge);
         let released = if added {
-            set.addAllocation(alloc);
+            self.place_and_add(&mut members, class, key, alloc);
             self.added.fetch_add(1, Ordering::Relaxed);
-            self.publish(set, &mut members)
+            self.publish(&mut members)
         } else {
             Vec::new()
         };
@@ -539,15 +1170,12 @@ impl ResidencySet {
 
     /// A native commit publishes ALL pending removals, irrespective of which
     /// path triggered it. Return their leases so destruction happens unlocked.
-    fn publish(
-        &self,
-        set: &ProtocolObject<dyn MTLResidencySet>,
-        members: &mut ResidencyOwners<ResidencyLease>,
-    ) -> Vec<ResidencyLease> {
-        set.commit();
-        self.commits.fetch_add(1, Ordering::Relaxed);
+    /// Every native set with staged changes is committed, each counted.
+    fn publish(&self, members: &mut Inner) -> Vec<ResidencyLease> {
+        let commits = members.commit_dirty();
+        self.commits.fetch_add(commits, Ordering::Relaxed);
         self.dirty.store(false, Ordering::Release);
-        members.published_removals()
+        members.owners.published_removals()
     }
 
     /// Commit the residency set iff [`Self::add`] has staged an allocation since
@@ -570,12 +1198,22 @@ impl ResidencySet {
     /// destroying them under a caller's outer lock. Empty fast path allocates
     /// nothing. The returned wrapper must follow host cleanup custody.
     pub(crate) fn commit_pending_extracted(&self) -> (bool, PublishedRemovals) {
-        let Some(set) = &self.raw else {
-            return (false, PublishedRemovals(Vec::new()));
-        };
+        if self.raw.is_none() {
+            return (
+                false,
+                PublishedRemovals {
+                    _leases: Vec::new(),
+                },
+            );
+        }
         // The steady state — nothing staged — never takes the lock.
         if !self.dirty.load(Ordering::Acquire) {
-            return (false, PublishedRemovals(Vec::new()));
+            return (
+                false,
+                PublishedRemovals {
+                    _leases: Vec::new(),
+                },
+            );
         }
         // Under `members`, as every other `commit` here is: a commit applies
         // the set's pending adds AND removes, and two threads applying the same
@@ -592,12 +1230,12 @@ impl ResidencySet {
         // re-dirties under the same mutex, so its update cannot be lost.
         let committed = self.dirty.load(Ordering::Relaxed);
         let released = if committed {
-            self.publish(set, &mut members)
+            self.publish(&mut members)
         } else {
             Vec::new()
         };
         drop(members);
-        (committed, PublishedRemovals(released))
+        (committed, PublishedRemovals { _leases: released })
     }
 
     /// Nonblocking HOST membership acquisition for final lifecycle polling.
@@ -611,21 +1249,31 @@ impl ResidencySet {
     pub(crate) fn try_commit_pending_extracted(
         &self,
     ) -> Result<(bool, PublishedRemovals), ResidencyBusy> {
-        let Some(set) = &self.raw else {
-            return Ok((false, PublishedRemovals(Vec::new())));
-        };
+        if self.raw.is_none() {
+            return Ok((
+                false,
+                PublishedRemovals {
+                    _leases: Vec::new(),
+                },
+            ));
+        }
         if !self.dirty.load(Ordering::Acquire) {
-            return Ok((false, PublishedRemovals(Vec::new())));
+            return Ok((
+                false,
+                PublishedRemovals {
+                    _leases: Vec::new(),
+                },
+            ));
         }
         let mut members = self.members.try_lock().ok_or(ResidencyBusy)?;
         let committed = self.dirty.load(Ordering::Relaxed);
         let released = if committed {
-            self.publish(set, &mut members)
+            self.publish(&mut members)
         } else {
             Vec::new()
         };
         drop(members);
-        Ok((committed, PublishedRemovals(released)))
+        Ok((committed, PublishedRemovals { _leases: released }))
     }
 
     /// Adds multiple buffers in a single commit.
@@ -645,25 +1293,37 @@ impl ResidencySet {
     /// unconditionally -- measured while mutation-testing this change, which is
     /// why this returns a count rather than `()`.
     pub fn insert_batch<'a>(&self, bufs: impl IntoIterator<Item = &'a Buffer>) -> usize {
-        let Some(set) = &self.raw else {
+        self.insert_batch_in(
+            bufs,
+            scoped_residency_class().unwrap_or(ResidencyClass::Other),
+        )
+    }
+
+    /// [`Self::insert_batch`] of allocations of `class`.
+    pub fn insert_batch_in<'a>(
+        &self,
+        bufs: impl IntoIterator<Item = &'a Buffer>,
+        class: ResidencyClass,
+    ) -> usize {
+        if self.raw.is_none() {
             return 0;
-        };
+        }
         self.insert_batches.fetch_add(1, Ordering::Relaxed);
         let mut members = self.members.lock();
         let mut added = 0usize;
         let mut redundant = Vec::new();
         for buf in bufs {
-            let (inserted, duplicate) =
-                members.insert(allocation_key(buf), buffer_lease(buf), same_charge);
+            let key = allocation_key(buf);
+            let (inserted, duplicate) = members.owners.insert(key, buffer_lease(buf), same_charge);
             redundant.extend(duplicate);
             if inserted {
-                set.addAllocation(as_allocation(buf));
+                self.place_and_add(&mut members, class, key, as_allocation(buf));
                 added += 1;
             }
         }
         let released = if added > 0 {
             self.added.fetch_add(added as u64, Ordering::Relaxed);
-            self.publish(set, &mut members)
+            self.publish(&mut members)
         } else {
             Vec::new()
         };
@@ -685,21 +1345,22 @@ impl ResidencySet {
     /// side -- independently of whether anything ever calls it in the wrong
     /// order.
     pub fn remove_batch<'a>(&self, bufs: impl IntoIterator<Item = &'a Buffer>) -> usize {
-        let Some(set) = &self.raw else {
+        if self.raw.is_none() {
             return 0;
-        };
+        }
         self.remove_batches.fetch_add(1, Ordering::Relaxed);
         let mut members = self.members.lock();
         let mut removed = 0usize;
         for buf in bufs {
-            if members.remove(allocation_key(buf)) {
-                set.removeAllocation(as_allocation(buf));
+            let key = allocation_key(buf);
+            if members.owners.remove(key) {
+                members.remove_native(key, as_allocation(buf));
                 removed += 1;
             }
         }
         let released = if removed > 0 {
             self.removed.fetch_add(removed as u64, Ordering::Relaxed);
-            self.publish(set, &mut members)
+            self.publish(&mut members)
         } else {
             Vec::new()
         };
@@ -718,15 +1379,16 @@ impl ResidencySet {
     /// commits anyway. For an eviction round on the encoding thread, where a
     /// commit per round would be a driver round-trip on the hot path.
     pub fn remove_batch_deferred<'a>(&self, bufs: impl IntoIterator<Item = &'a Buffer>) -> usize {
-        let Some(set) = &self.raw else {
+        if self.raw.is_none() {
             return 0;
-        };
+        }
         self.remove_batches.fetch_add(1, Ordering::Relaxed);
         let mut members = self.members.lock();
         let mut removed = 0usize;
         for buf in bufs {
-            if members.remove(allocation_key(buf)) {
-                set.removeAllocation(as_allocation(buf));
+            let key = allocation_key(buf);
+            if members.owners.remove(key) {
+                members.remove_native(key, as_allocation(buf));
                 removed += 1;
             }
         }
@@ -744,12 +1406,13 @@ impl ResidencySet {
     /// would be a driver round-trip per token. Skips buffers the set does not
     /// hold, for the same reason `remove_batch` does (§6.3c).
     pub fn remove_deferred(&self, buf: &Buffer) -> usize {
-        let Some(set) = &self.raw else {
+        if self.raw.is_none() {
             return 0;
-        };
+        }
         let mut members = self.members.lock();
-        if members.remove(allocation_key(buf)) {
-            set.removeAllocation(as_allocation(buf));
+        let key = allocation_key(buf);
+        if members.owners.remove(key) {
+            members.remove_native(key, as_allocation(buf));
             self.removed.fetch_add(1, Ordering::Relaxed);
             self.dirty.store(true, Ordering::Relaxed);
             1
@@ -801,7 +1464,7 @@ impl ResidencySet {
         let mut members = self.members.lock();
         let n = bufs
             .into_iter()
-            .filter(|buf| members.retire(allocation_key(buf)))
+            .filter(|buf| members.owners.retire(allocation_key(buf)))
             .count();
         self.retired.fetch_add(n as u64, Ordering::Relaxed);
         n
@@ -813,7 +1476,7 @@ impl ResidencySet {
     /// guard exists to prevent is a machine panic, which is not a testable
     /// assertion -- so the tests assert on membership, which is.
     pub fn len(&self) -> usize {
-        self.members.lock().len()
+        self.members.lock().owners.len()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -822,7 +1485,7 @@ impl ResidencySet {
 
     /// Whether this buffer's allocation is currently in the set.
     pub fn contains(&self, buf: &Buffer) -> bool {
-        self.members.lock().contains(allocation_key(buf))
+        self.members.lock().owners.contains(allocation_key(buf))
     }
 
     /// Host-only allocation-local teardown. Each borrowed native allocation is
@@ -834,29 +1497,31 @@ impl ResidencySet {
         &self,
         allocations: impl IntoIterator<Item = &'a ProtocolObject<dyn MTLAllocation>>,
     ) -> PublishedRemovals {
-        let Some(set) = &self.raw else {
-            return PublishedRemovals(Vec::new());
-        };
+        if self.raw.is_none() {
+            return PublishedRemovals {
+                _leases: Vec::new(),
+            };
+        }
         let mut members = self.members.lock();
         let mut removed = 0usize;
         for allocation in allocations {
             let key = allocation as *const _ as usize;
-            if members.remove_including_retired(key) {
-                set.removeAllocation(allocation);
+            if members.owners.remove_including_retired(key) {
+                members.remove_native(key, allocation);
                 removed += 1;
             }
         }
         let released = if removed != 0 {
             self.removed.fetch_add(removed as u64, Ordering::Relaxed);
-            self.publish(set, &mut members)
+            self.publish(&mut members)
         } else {
             Vec::new()
         };
         drop(members);
-        PublishedRemovals(released)
+        PublishedRemovals { _leases: released }
     }
 
-    /// Empties the set, in one commit.
+    /// Empties the set, in one commit per native set.
     ///
     /// This is the teardown path (`DESIGN.md` §6.3c): the residency set must be
     /// emptied *before* the pools free the `MTLBuffer`s it lists, or tearing the
@@ -882,14 +1547,20 @@ impl ResidencySet {
     /// Returns how many keys the membership record still held, which is a lower
     /// bound on what Metal removed rather than an exact count of it.
     pub fn remove_all(&self) -> usize {
-        let Some(set) = &self.raw else {
+        if self.raw.is_none() {
             return 0;
-        };
+        }
         let mut members = self.members.lock();
-        let n = members.len();
-        set.removeAllAllocations();
-        let pending = self.publish(set, &mut members);
-        let all = members.cleared();
+        let n = members.owners.len();
+        for native in &mut members.natives {
+            native.raw.removeAllAllocations();
+            native.bytes = 0;
+            native.allocations = 0;
+            native.dirty = true;
+        }
+        members.placement.clear();
+        let pending = self.publish(&mut members);
+        let all = members.owners.cleared();
         drop(members);
         drop(pending);
         drop(all);

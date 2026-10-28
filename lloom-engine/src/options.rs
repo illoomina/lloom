@@ -17,7 +17,7 @@
 use crate::decode::{DecodeParams, ReadbackArm, RingArm};
 use lloom::generation::poll::PollMechanism;
 use lloom::generation::{CommitBudget, EosRead, WAKE_LIVE_EVERY_DEFAULT};
-use lloom::nn::{DecodeOptions, PassWidths};
+use lloom::nn::{DecodeOptions, PassWidths, PrefillDecode};
 use lloom_macros::Options;
 use serde::{Deserialize, Serialize};
 
@@ -142,14 +142,17 @@ lloom_tensor::serde_via_str!(EosKind);
 #[derive(Options, Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(default)]
 pub struct ReadbackConfig {
-    /// The strategy: `auto` (the ring where the sampler admits it), `blocking`, `ring`.
+    /// The strategy: `auto` (the ring where the sampler admits it), `blocking`, `ring` (the
+    /// ring for every sampler it admits; a request whose sampler needs a host sort — top-k,
+    /// top-p — runs on the blocking arm with a warning on its turn line and in
+    /// `timings.readback_note`, coupling C2).
     #[opt(variants = ["auto", "blocking", "ring"], path = "decode.readback.kind", status = "advanced", facets = ["buffer", "locality"], flows = ["token-out"])]
     pub kind: ReadbackKind,
     /// How a ring learns EOS.
     #[opt(variants = ["blocking", "poll", "host-drain", "gpu-batched", "gpu-batched-nonblocking"], path = "decode.readback.eos", status = "arm", facets = ["signal"], flows = ["token-out"])]
     pub eos: EosKind,
     /// The poll mechanism under `eos = poll` (`wfe` on aarch64 by default).
-    #[opt(variants = ["spin", "spin-hint", "wfe", "sleep", "sleep:<µs>"], path = "decode.readback.wait", status = "arm", facets = ["wait"], flows = ["token-out"], forms = ["spin", "spin-hint", "wfe", "sleep"], from_v1 = "lloom_tensor::options::v1::poll_from", to_v1 = "lloom_tensor::options::v1::poll_to", schema = "Wait")]
+    #[opt(variants = ["spin", "spin-hint", "wfe", "sleep", "sleep:<µs>"], path = "decode.readback.wait", status = "arm", facets = ["wait"], flows = ["token-out"], forms = ["spin", "spin-hint", "wfe", "sleep"], from_v1 = "lloom_tensor::options::v1::poll_from", to_v1 = "lloom_tensor::options::v1::poll_to", schema = "Wait", grammar = "lloom_tensor::options::wait::READBACK_WAIT")]
     pub poll: PollMechanism,
     /// Forward passes the host enqueues before it has learned the previous step's EOS (ring arms): 0 or 1.
     #[opt(variants = ["0", "1"], path = "decode.readback.lookahead_forwards", status = "advanced", facets = ["lead"], flows = ["token-out", "commands-out"])]
@@ -163,6 +166,9 @@ pub struct ReadbackConfig {
     /// Under the adaptive commit: the most steps one buffer holds before it closes regardless (0 = 8).
     #[opt(path = "decode.readback.run_ahead_steps", status = "arm", facets = ["lead", "cadence"], flows = ["token-out"])]
     pub run_ahead: usize,
+    /// Under the adaptive commit: the most steps queued in committed buffers the GPU has not completed before the host waits (the lead's queued part, apart from the buffer's batching; 0 = two run-ahead windows).
+    #[opt(path = "decode.readback.queued_steps", status = "arm", facets = ["lead"], flows = ["token-out"])]
+    pub queued_steps: usize,
     /// The EOS gate: the kernels queued past an EOS return at once, so the cache ends at the EOS. Rides the adaptive commit; off where the adaptive commit does not run, or under the ICB replay executor.
     #[opt(bool, path = "decode.readback.eos_gate", status = "advanced", facets = ["lead"], flows = ["token-out", "commands-out"])]
     pub eos_gate: bool,
@@ -190,6 +196,7 @@ impl Default for ReadbackConfig {
             commit_budget: CommitBudget::steps(8).expect("8 > 0"),
             adaptive_commit: true,
             run_ahead: 0,
+            queued_steps: 0,
             eos_gate: true,
             fused_publish: true,
             stream_reader: false,
@@ -218,6 +225,8 @@ impl ReadbackConfig {
     /// The other fields keep their values, so `--readback ring-hostdrain
     /// --lookahead 0` composes in either order.
     pub fn apply_spelling(cfg: &mut Self, s: &str) -> Result<(), String> {
+        let s = lloom_tensor::options::parse_arm(s, Self::SPELLINGS)
+            .map_err(|reason| format!("readback: {reason}"))?;
         match s {
             "auto" => cfg.kind = ReadbackKind::Auto,
             "blocking" => cfg.kind = ReadbackKind::Blocking,
@@ -455,6 +464,12 @@ pub struct PrefillConfig {
     /// An aligned-bucket schedule for the prefill forwards: `N` or `progressive:START,STOP`, optionally `/tile:BULK`.
     #[opt(parser = "parse_spark_field", variants = ["1", "16", "32", "64", "progressive:START,STOP", "…/tile:BULK"], path = "prefill.schedule", status = "arm", facets = ["cadence"], flows = ["prompt-in"])]
     pub spark: Option<String>,
+    /// The pending prompts' chunks one batched step carries under `--batch N`: up to this many rows' chunks, prefilled together in one pass (1 = one chunk a step; 0 = as many as the batch width and the load's admission room allow).
+    #[opt(flag = "prefill-batch", path = "scheduler.prefill_batch", status = "advanced", cli = "prefill-batch", facets = ["cadence"], flows = ["prompt-in"])]
+    pub batch: usize,
+    /// What the live rows do in a batched step that feeds prompt pieces: `ride` (their next token rides the pieces' forward) or `pause` (a row that has streamed a token waits for the pieces).
+    #[opt(flag = "prefill-decode", variants = ["ride", "pause"], path = "scheduler.prefill_decode", status = "arm", facets = ["cadence"], flows = ["prompt-in", "token-out"])]
+    pub decode: PrefillDecode,
     /// How a batched step's prompt pieces are sized: `lru` or `ladder` (DESIGN §9.2aa I4).
     #[opt(flag = "pass-widths", variants = ["lru", "ladder"], path = "scheduler.pass_widths", status = "arm")]
     pub pass_widths: PassWidths,
@@ -470,6 +485,8 @@ impl Default for PrefillConfig {
             ubatch: 0,
             chunk: 0,
             spark: None,
+            batch: 1,
+            decode: PrefillDecode::Ride,
             pass_widths: PassWidths::Lru,
             in_flight: 0,
         }
@@ -549,8 +566,10 @@ impl DecodeConfig {
             host_feed_wait: None,
             eos_park: None,
             eos_watch: None,
+            eos_gate_cores: None,
             adaptive_commit: false,
             run_ahead: self.readback.run_ahead,
+            queued_steps: self.readback.queued_steps,
             stop: None,
             eos_gate: false,
             fused_publish: self.readback.fused_publish,
@@ -662,9 +681,7 @@ impl TuningOptions {
     /// already been read (a knob a `OnceLock` site took is fixed; the report
     /// line would otherwise lie about it).
     pub fn install(&self) -> Result<(), String> {
-        lloom_tensor::tuning::install(self.tensor()).map_err(|_| {
-            "tuning: the tensor crate's knobs were already read before install".to_string()
-        })?;
+        lloom_tensor::tuning::install(self.tensor()).map_err(|error| error.to_string())?;
         lloom::tuning::install(self.lloom()).map_err(|_| {
             "tuning: the model crate's knobs were already read before install".to_string()
         })
@@ -712,15 +729,18 @@ impl Default for ModelConfig {
 }
 
 impl ModelConfig {
+    /// The preset's key.
+    pub const PRESET_KEY: &'static str = "models.lfm2.preset";
+
     /// The preset and the axes, as keys.
     pub const META: &'static [lloom_tensor::options::KnobMeta] = &[
         lloom_tensor::options::KnobMeta {
             key: "cache",
             flag: "cache",
-            doc: "The LFM2 cache preset the axes are applied over: `auto` (the engine's rule: the pool arms at a batch, the rewindable arms under a drafter, the crown otherwise), `crown`, `rewindable`, `rewindable-notap`, `pool`, `pool-spec`.",
+            doc: "The LFM2 cache preset the axes are applied over: `auto` (the engine's rule: the pool arms at a batch, the rewindable arms under a drafter, the crown otherwise), `crown`, `rewindable`, `rewindable-notap`, `pool`, `pool-spec`. A named preset keeps the axes it sets (attention, KV layout, QKV layout, conv state and fusions): the front-end's defaults apply only to the axes it leaves.",
             variants: &["auto", "crown", "rewindable", "rewindable-notap", "pool", "pool-spec"],
             ty: "String",
-            path: "models.lfm2.preset",
+            path: Self::PRESET_KEY,
             status: lloom_tensor::options::Status::Advanced,
             ..lloom_tensor::options::KnobMeta::BASE
         },
@@ -753,7 +773,6 @@ impl ModelConfig {
         // Validate on a scratch config so a bad value is refused here, with
         // the axis's own message, rather than at load; keep the spelling the
         // axis parses (a bool as `true`/`false`, an arm in lower case).
-        let value = lloom_tensor::options::non_empty(value).map_err(|e| format!("--{key}: {e}"))?;
         let is_bool = lloom::models::lfm2::Config::AXES_META
             .iter()
             .any(|a| a.key == key && a.is_bool);
@@ -762,7 +781,9 @@ impl ModelConfig {
                 .map_err(|e| format!("--{key}: {e}"))?
                 .to_string()
         } else {
-            value.to_ascii_lowercase()
+            lloom_tensor::options::non_empty(value)
+                .map_err(|e| format!("--{key}: {e}"))?
+                .to_ascii_lowercase()
         };
         let mut probe = lloom::models::lfm2::Config::default();
         probe.set_axis(key, &value)?;
@@ -836,6 +857,18 @@ impl ModelConfig {
 }
 
 fn json_scalar(key: &str, v: &serde_json::Value) -> Result<String, String> {
+    let axis = key.strip_prefix("axes.").unwrap_or(key);
+    if let Some(meta) = lloom::models::lfm2::Config::AXES_META
+        .iter()
+        .find(|meta| meta.key == axis)
+    {
+        if let Some(value) = meta
+            .native_number(v)
+            .map_err(|error| format!("--{axis}: {error}"))?
+        {
+            return Ok(value);
+        }
+    }
     match v {
         serde_json::Value::String(s) => Ok(s.clone()),
         serde_json::Value::Bool(b) => Ok(b.to_string()),
@@ -955,7 +988,8 @@ pub struct SamplingConfig {
         short = 't',
         path = "generation.temperature",
         status = "stable",
-        cli = "temperature"
+        cli = "temperature",
+        schema = "NonnegativeNumber"
     )]
     pub temperature: Option<f64>,
     /// Nucleus sampling's p (top-p); needs a temperature.
@@ -963,10 +997,11 @@ pub struct SamplingConfig {
         flag = "top-p",
         path = "generation.top_p",
         status = "stable",
-        cli = "top-p"
+        cli = "top-p",
+        schema = "Probability"
     )]
     pub top_p: Option<f64>,
-    /// Top-k sampling's k; with top-p, top-k then top-p. Host-side: the ring arm is refused, the blocking arm runs.
+    /// Top-k sampling's k; with top-p, top-k then top-p. Host-side: a ring asked by name is demoted with a warning and the blocking arm runs this request (C2).
     #[opt(
         flag = "top-k",
         path = "generation.top_k",
@@ -1150,10 +1185,13 @@ impl SamplingConfig {
         }
     }
 
-    /// Refuse an out-of-range processor value, by its field's name. Every
-    /// layer — flags, `--set`, `--generation-config`, the env — lands here,
-    /// since the JSON layer deserializes without the flag parsers.
+    /// Refuse an out-of-range sampling or processor value, by its key and
+    /// the edge it failed. Every layer — flags, `--set`,
+    /// `--generation-config`, the env, a checkpoint's `generation_config.json`
+    /// — lands here, since the JSON layer deserializes without the flag
+    /// parsers.
     pub fn check(&self) -> Result<(), String> {
+        self.sampling()?;
         self.processors()
             .validate()
             .map_err(|e| format!("sampling: {e}"))?;
@@ -1170,9 +1208,11 @@ impl SamplingConfig {
         self.seed.unwrap_or_else(rand::random::<u64>)
     }
 
-    /// The sampler arm these fields name (`LogitsProcessor`'s vocabulary).
-    pub fn sampling(&self) -> lloom::generation::Sampling {
+    /// The sampler arm these fields name ([`DecodeParams::sampling_of`]); a
+    /// refused field is named by its key (`generation.top_p = 1.5: …`).
+    pub fn sampling(&self) -> Result<lloom::generation::Sampling, String> {
         DecodeParams::sampling_of(self.temperature, self.top_p, self.top_k, self.gumbel)
+            .map_err(|e| format!("sampling: generation.{}", e.without_backtrace()))
     }
 
     /// The per-run parameters for `eos_ids` on `readback`, the prefill tile.
@@ -1202,6 +1242,8 @@ impl SamplingConfig {
             thinking: None,
             turn_tail: 0,
             no_checkpoint: false,
+            pin_prefix: None,
+            unpin_prefix: false,
             logprobs: None,
             cold: false,
         }
@@ -1309,7 +1351,8 @@ fn parse_barrier_scope(v: &str) -> Result<String, String> {
 /// The Metal executor arms (`DESIGN.md` §9.2, §11.1–11.3; `--arena
 /// --arena-layout --packed --replay --replay-barriers --replay-barrier-scope
 /// --pass-plans`): installed on the device at load,
-/// before the model. Instruments and A/B arms — none is the shipping path.
+/// before the model. The pass-plan cache is on by default; the others are
+/// instruments and A/B arms. A load installs [`ExecutorConfig::under_body`].
 #[derive(Options, Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(default)]
 pub struct ExecutorConfig {
@@ -1354,6 +1397,36 @@ impl ExecutorConfig {
     /// cache off).
     pub fn pass_plans_armed(&self) -> bool {
         self.pass_plans && !self.arena && !self.replay
+    }
+
+    /// The arms a load installs for its body, and what changed from the
+    /// request. The single-key arena is served by allocation ordinal, which a
+    /// speculative round does not hold stable (`install_executor`, DESIGN.md
+    /// §11.3x), so under a speculative body `arena` is not installed; the
+    /// pass-plan cache, when asked for, is the planned route that serves.
+    /// Replay under a speculative body is refused by the installer. The
+    /// returned arms are what the load reports and installs, so no line
+    /// names an arm that is not installed.
+    pub fn under_body(&self, speculative: bool) -> (ExecutorConfig, Option<String>) {
+        if !(speculative && self.arena && !self.replay) {
+            return (self.clone(), None);
+        }
+        let installed = ExecutorConfig {
+            arena: false,
+            ..self.clone()
+        };
+        let instead = if installed.pass_plans_armed() {
+            "the pass-plan cache serves instead"
+        } else {
+            "no planned executor serves (`--pass-plans false`)"
+        };
+        (
+            installed,
+            Some(format!(
+                "executor.arena is not installed under a speculative body (it is served by \
+                 allocation ordinal, which a speculative round does not hold stable); {instead}"
+            )),
+        )
     }
 
     /// The arms for a report line, from the group that was installed.
@@ -1442,7 +1515,7 @@ pub struct MemoryConfig {
     /// Load even when the machine gate refuses; the reservation is still recorded, so other lloom processes see it.
     #[opt(bool, path = "memory.machine.force", status = "stable", cli = "force")]
     pub force: bool,
-    /// GB the machine gate keeps for macOS and the UI; none = max(4 GiB, the machine's memory less the Metal device's recommended working set), or max(4 GiB, 10 % of the machine's memory) with no Metal device.
+    /// GB the machine gate keeps for the host OS; none on macOS = max(4 GiB, memory less the Metal recommended working set), or max(4 GiB, 10 %) without Metal; other hosts = max(256 MiB, 5 %).
     #[opt(path = "memory.machine.reserve_gb", status = "advanced")]
     pub machine_reserve_gb: Option<f64>,
     /// The directory of the machine-wide registry of lloom processes' reservations; none = ~/.cache/lloom/memory.
@@ -1511,6 +1584,10 @@ fn parse_device(v: &str) -> Result<String, String> {
             "`{other}` is not a device (auto: the GPU this build has, else the CPU; cpu)"
         )),
     }
+}
+fn parse_purpose(v: &str) -> Result<String, String> {
+    lloom::nn::attention::route::ExecutionPurpose::parse(&v.trim().to_ascii_lowercase())
+        .map(|p| p.name().to_string())
 }
 fn parse_experts(v: &str) -> Result<String, String> {
     match v.trim().to_ascii_lowercase().as_str() {
@@ -1601,6 +1678,9 @@ pub struct LoadConfig {
     /// The device: `auto` (the GPU this build has, else the CPU) or `cpu`.
     #[opt(flag = "device", parser = "parse_device", variants = ["auto", "cpu"], path = "backend.device", status = "stable", cli = "device", switches = ["cpu=cpu"])]
     pub device: String,
+    /// What the run is for: `production` (chat and serve — on Metal every attention dispatches through a prepared, bounded-memory route, and a configuration under which any attention takes the composed scores path is refused at load, whatever option selected it) or `reference` (a test or a harness comparing against the composed attention, which materializes the scores; named on the load line and as a load warning). No tuning knob moves it.
+    #[opt(flag = "execution-purpose", parser = "parse_purpose", variants = ["production", "reference"], path = "execution.purpose", status = "reference")]
+    pub purpose: String,
     /// Qwen4-exp: how the routed experts are held — `stream` (a slot pool per layer filled from the checkpoint on demand) or `resident` (every expert in memory). Qwen3.5's MoE loads resident whatever it says, with a load warning.
     #[opt(flag = "experts", parser = "parse_experts", variants = ["stream", "resident"], path = "weights.experts.placement", status = "stable", cli = "experts", facets = ["source"], flows = ["weights-in"])]
     pub experts: String,
@@ -1651,6 +1731,7 @@ impl Default for LoadConfig {
             text_only: false,
             warmup: true,
             device: "auto".into(),
+            purpose: "production".into(),
             experts: "stream".into(),
             loader: "pread".into(),
             ple_cache_rows: 0,
@@ -1671,7 +1752,23 @@ impl LoadConfig {
     pub fn cpu(&self) -> bool {
         self.device == "cpu"
     }
+
+    /// The run's execution purpose (`execution.purpose`).
+    pub fn purpose(
+        &self,
+    ) -> std::result::Result<lloom::nn::attention::route::ExecutionPurpose, String> {
+        lloom::nn::attention::route::ExecutionPurpose::parse(&self.purpose)
+    }
 }
+
+/// The most requests one intake tick of the batched scheduler takes off
+/// its queue while rows are live (`scheduler.intake_per_tick`'s default).
+///
+/// An intake tick's cost is dominated by `BatchScheduler::prepare` (the
+/// routing and the prefix reuse), so a budget this size is far above any
+/// arrival rate a step can see and still bounds the producer that holds
+/// the queue non-empty (`batched-decode-design.md` §11.9).
+pub const DEFAULT_INTAKE_PER_TICK: usize = 256;
 
 /// Concurrent sequences: how many decode together and how their state is
 /// held (`lloom serve`, `lloom bench`).
@@ -1691,6 +1788,9 @@ pub struct SchedulerConfig {
     /// Read a `/v1/systemone` request's questions as one ragged batch over its state, the state prefilled once and kept for the next request over it (the `fast` contract only: under `deterministic` the questions are read one after another from a restore of the state).
     #[opt(bool, flag = "decision-ragged", path = "scheduler.decision_ragged", status = "advanced", switches = ["no-decision-ragged=false"])]
     pub decision_ragged: bool,
+    /// The most requests one intake tick of the batched scheduler takes off its queue while rows are live; the rest wait, in arrival order, for the next tick, so sustained arrivals cannot postpone a live row's next step. With nothing live the whole queue is taken.
+    #[opt(flag = "intake-per-tick", path = "scheduler.intake_per_tick", status = "advanced", facets = ["cadence"], flows = ["prompt-in"])]
+    pub intake_per_tick: usize,
 }
 
 impl Default for SchedulerConfig {
@@ -1700,6 +1800,7 @@ impl Default for SchedulerConfig {
             rows: "auto".into(),
             decision_pack: true,
             decision_ragged: true,
+            intake_per_tick: DEFAULT_INTAKE_PER_TICK,
         }
     }
 }
@@ -1752,13 +1853,17 @@ fn parse_keep_logprobs(v: &str) -> Result<String, String> {
     lloom_tensor::options::parse_arm(v, &["none", "sampled", "full"]).map(str::to_string)
 }
 
+fn parse_session_keep(v: &str) -> Result<String, String> {
+    lloom_tensor::options::parse_arm(v, &["prefix", "none"]).map(str::to_string)
+}
+
 /// The conversation's history as the front end keeps it: the sampled ids of
 /// each reply, and what is kept beside them.
 #[derive(Options, Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[options(v0 = false)]
 #[serde(default)]
 pub struct SessionConfig {
-    /// Keep past replies' reasoning in the history the next turn renders (the chat template's `preserve_thinking`): unset keeps it, as `true` does, wherever the template has the switch (its own rendering where it has none); `false` strips it (opt-in).
+    /// Keep past replies' reasoning in the history the next turn renders (the chat template's `preserve_thinking`): unset keeps it, as `true` does, wherever the template has the switch (its own rendering where it has none); `false` strips it (opt-in) — except for one request whose history ends in a reply of ours cut inside its reasoning, which renders with every past reply's reasoning kept, so the model is not shown an empty reply where its own unfinished thought belongs.
     #[opt(bool, flag = "persist-thinking", path = "session.persist_thinking", status = "stable", cli = "persist-thinking", switches = ["strip-thinking=false"])]
     pub persist_thinking: Option<bool>,
     /// A past reply of ours sent back without the reasoning the model wrote: `as-sent` renders the message as the client sent it; `log` restores the reasoning from the session log.
@@ -1770,6 +1875,23 @@ pub struct SessionConfig {
     /// A past reply of ours whose run ended inside its reasoning block (`max_tokens`, a stop string, a cancellation): `reasoning` (the default) gives it to the template as the open reasoning it is, which the template closes or drops; `text` renders it as the text the client got; `recover` renders it as text and places the turn checkpoint before the divergence that makes.
     #[opt(flag = "incomplete-reasoning", parser = "parse_incomplete_reasoning", variants = ["text", "reasoning", "recover"], path = "session.incomplete_reasoning", status = "advanced")]
     pub incomplete_reasoning: String,
+    /// Stored sessions kept at once; past it the least recently used goes.
+    #[opt(
+        flag = "session-capacity",
+        path = "session.capacity",
+        status = "advanced"
+    )]
+    pub capacity: usize,
+    /// MiB of host memory the stored sessions' ids and messages may hold; past it the least recently used go.
+    #[opt(
+        flag = "session-max-mib",
+        path = "session.max_mib",
+        status = "advanced"
+    )]
+    pub max_mib: usize,
+    /// What a session keeps of the engine's state when a request does not say (`keep`, `docs/sessions.md` §5.4): `prefix` pins the system prompt's checkpoint — one more frame of the checkpoint ring, admitted at load where the engine serves one sequence with prefix reuse on — so a compacted conversation that keeps the system prompt restores there; `none` keeps the session's ids alone and loads no frame for the pin.
+    #[opt(flag = "session-keep", parser = "parse_session_keep", variants = ["prefix", "none"], path = "session.keep", status = "advanced")]
+    pub keep: String,
 }
 
 impl Default for SessionConfig {
@@ -1779,6 +1901,9 @@ impl Default for SessionConfig {
             missing_reasoning: "as-sent".into(),
             keep_logprobs: "none".into(),
             incomplete_reasoning: "reasoning".into(),
+            capacity: 64,
+            max_mib: 64,
+            keep: "prefix".into(),
         }
     }
 }
@@ -1841,6 +1966,29 @@ pub struct PipetteConfig {
     pub prompt_seed_file: Option<std::path::PathBuf>,
 }
 
+/// How `lloom serve` reclaims the sessions its chat completions' ids name: a
+/// session lives until the server lets it go (`docs/sessions.md` §4).
+#[derive(Options, Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[options(v0 = false)]
+#[serde(default)]
+pub struct ServerSessionsConfig {
+    /// Seconds a session may go unused before the server reclaims it (`docs/sessions.md` §4); `session.capacity` and `session.max_mib` reclaim the least recently used before that.
+    #[opt(
+        flag = "session-idle",
+        path = "server.sessions.idle_s",
+        status = "advanced",
+        alias = "session-ttl",
+        legacy_keys = ["session.ttl_s"]
+    )]
+    pub idle_s: usize,
+}
+
+impl Default for ServerSessionsConfig {
+    fn default() -> Self {
+        ServerSessionsConfig { idle_s: 3600 }
+    }
+}
+
 /// `lloom serve`'s socket.
 #[derive(Options, Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[options(v0 = false)]
@@ -1852,8 +2000,38 @@ pub struct ServerConfig {
     /// The port; 0 picks a free one (the bound port is in the ready marker).
     #[opt(flag = "port", path = "server.port", status = "stable", cli = "port")]
     pub port: u16,
+    /// While no request runs, keep the GPU ready every this many milliseconds (`server.keep_warm_by`), so the first request after an idle spell does not wait for it (`--batch 1`, Metal), until `server.keep_warm_for_s` after the last request; 0 = off, unset = the front-end's own.
+    #[opt(flag = "keep-warm", path = "server.keep_warm", status = "advanced")]
+    pub keep_warm: Option<u64>,
+    /// Seconds after the last request the keep-warm keeps going; then it stops, so an idle server gives the memory back, and the next request starts it again; 0 = no bound.
+    #[opt(
+        flag = "keep-warm-for",
+        path = "server.keep_warm_for_s",
+        status = "advanced"
+    )]
+    pub keep_warm_for_s: u64,
+    /// What `server.keep_warm` does each period: `residency` (ask the OS to keep the GPU's memory wired: it unwires it after a few idle seconds and the next request waits while it is wired back) or `dispatch` (one one-element GPU dispatch, committed and waited).
+    #[opt(flag = "keep-warm-by", parser = "parse_keep_warm_by", variants = ["residency", "dispatch"], path = "server.keep_warm_by", status = "advanced")]
+    pub keep_warm_by: String,
+    /// Read the kernel's memory-pressure level every keep-warm period: at warn or critical stop keeping the GPU's memory wired and give it back (`endResidency`), at normal resume; off = the heartbeat ignores pressure. Off in the library; `serve` turns it on where its keep-warm runs by default, on Metal at one sequence (decision 57; measured, `tuning.md` §6.3n: ~6 GiB of wired memory back within ~2 s of a warn, +5–17 ms on the first request after normal), `--keep-warm-pressure=false` to measure without it. Unset = the front-end's own (off where none applies).
+    #[opt(
+        bool,
+        flag = "keep-warm-pressure",
+        path = "server.keep_warm_pressure",
+        status = "arm"
+    )]
+    pub keep_warm_pressure: Option<bool>,
+    /// Read the memory-pressure level from this file (one number: 1 normal, 2 warn, 4 critical) instead of the kernel's sysctl: a measurement's stand-in for `memory_pressure -S`, which needs root. Takes effect with `server.keep_warm_pressure`.
+    #[opt(
+        flag = "keep-warm-pressure-file",
+        path = "server.keep_warm_pressure_file",
+        status = "instrument"
+    )]
+    pub keep_warm_pressure_file: Option<String>,
     #[opt(nested)]
     pub pipette: PipetteConfig,
+    #[opt(nested)]
+    pub sessions: ServerSessionsConfig,
 }
 
 impl Default for ServerConfig {
@@ -1861,8 +2039,21 @@ impl Default for ServerConfig {
         ServerConfig {
             host: "127.0.0.1".into(),
             port: 0,
+            keep_warm: None,
+            keep_warm_for_s: 180,
+            keep_warm_by: "residency".into(),
+            keep_warm_pressure: None,
+            keep_warm_pressure_file: None,
             pipette: PipetteConfig::default(),
+            sessions: ServerSessionsConfig::default(),
         }
+    }
+}
+
+fn parse_keep_warm_by(v: &str) -> Result<String, String> {
+    match v.trim().to_ascii_lowercase().as_str() {
+        s @ ("residency" | "dispatch") => Ok(s.into()),
+        other => Err(format!("`{other}` is not `residency` or `dispatch`")),
     }
 }
 

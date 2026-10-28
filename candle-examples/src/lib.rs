@@ -10,6 +10,149 @@ pub mod wav;
 use candle::utils::{cuda_is_available, metal_is_available};
 use candle::{Device, Result, Tensor};
 
+/// Cold requirement for examples whose explicitly requested profiling arm reports
+/// GPU intervals and per-label census. Mixed-purpose engine scalar profiling does
+/// not use this helper. Creates no device and opens no checkpoint.
+pub fn require_profile_recorder(example: &str) -> Result<()> {
+    let t = candle::tuning::try_tuning().map_err(candle::Error::wrap)?;
+    if t.instrument.profile {
+        candle::tuning::require_profile_recorder().map_err(|error| {
+            candle::Error::msg(format!("{error}; {example}'s requested detailed profiling arm requires cargo run --manifest-path candle/Cargo.toml --profile release-with-debug -p candle-examples --features metal,profile --example {example} -- <original arguments>"))
+        })?;
+    }
+    Ok(())
+}
+
+/// State a gate harness's contract before resolving its diagnostic request.
+/// The order matters: resolving tuning first would make `pin_contract` return
+/// AlreadyRead. An explicit LLOOM_PROFILE still overrides the requested pin.
+/// Creates no device and opens no checkpoint.
+pub fn pin_profiled_contract(
+    example: &str,
+    wanted: candle::tuning::Contract,
+) -> Result<candle::tuning::Contract> {
+    let pinned = candle::tuning::pin_contract(wanted).map_err(candle::Error::Msg)?;
+    require_profile_recorder(example)?;
+    Ok(pinned)
+}
+
+#[cfg(test)]
+mod diagnostic_profile_setup_tests {
+    use super::*;
+    fn pin_with_env(profile: Option<&str>, instrument: Option<&str>) -> candle::tuning::Contract {
+        candle::isolation::claim("example contract and diagnostic setup");
+        for (key, value) in [
+            ("LLOOM_PROFILE", profile),
+            ("CANDLE_METAL_PROFILE", instrument),
+        ] {
+            match value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+        let pinned =
+            pin_profiled_contract("qwen4exp-chat", candle::tuning::Contract::Deterministic)
+                .expect("contract pin must precede diagnostic tuning resolution (not AlreadyRead)");
+        assert_eq!(
+            candle::tuning::gate_contract("host ordering control").unwrap(),
+            pinned
+        );
+        pinned
+    }
+    #[test]
+    fn default_contract_pin_precedes_diagnostic_resolution_without_device() {
+        assert_eq!(
+            pin_with_env(None, None),
+            candle::tuning::Contract::Deterministic
+        );
+    }
+    #[test]
+    fn explicit_profile_off_keeps_deterministic_contract_without_device() {
+        assert_eq!(
+            pin_with_env(None, Some("0")),
+            candle::tuning::Contract::Deterministic
+        );
+    }
+    #[test]
+    fn named_contract_override_survives_diagnostic_resolution_without_device() {
+        assert_eq!(
+            pin_with_env(Some("fast"), Some("0")),
+            candle::tuning::Contract::Fast
+        );
+    }
+    #[test]
+    fn default_profile_off_preserves_example_setup() {
+        candle::tuning::install(candle::tuning::Tuning::default()).unwrap();
+        require_profile_recorder("qwen4exp-chat").unwrap();
+    }
+    #[test]
+    fn explicit_profile_off_preserves_example_setup() {
+        candle::isolation::claim("example detailed profile setup");
+        std::env::set_var("CANDLE_METAL_PROFILE", "0");
+        require_profile_recorder("lfm2-decode-profile").unwrap();
+    }
+    #[cfg(not(feature = "metal"))]
+    #[test]
+    fn missing_metal_backend_refuses_requested_heavy_without_device_work() {
+        let mut t = candle::tuning::Tuning::default();
+        t.instrument.profile = true;
+        candle::tuning::install(t).unwrap();
+        let error = require_profile_recorder("qwen4exp-chat").unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("diagnostics.gpu_profile.enabled"));
+        assert!(message.contains("metal instrumentation is not compiled"));
+        assert!(message.contains("--features metal,profile --example qwen4exp-chat"));
+    }
+    #[test]
+    fn requested_detail_refuses_absent_or_preserves_real_recorder_data() {
+        if let Ok(expected) = std::env::var("LLOOM_TEST_EXPECT_PROFILE_CAPABILITY") {
+            let expected = match expected.as_str() {
+                "available" => true,
+                "absent" => false,
+                other => panic!("unknown test capability expectation: {other}"),
+            };
+            assert_eq!(
+                candle::tuning::PROFILE_INSTRUMENTS,
+                expected,
+                "unexpected transitive diagnostic feature union"
+            );
+            println!(
+                "profile capability actual={} expected={expected}",
+                candle::tuning::PROFILE_INSTRUMENTS
+            );
+        }
+        let mut t = candle::tuning::Tuning::default();
+        t.instrument.profile = true;
+        candle::tuning::install(t).unwrap();
+        let result = require_profile_recorder("lfm2-dspark-verify");
+        if !cfg!(feature = "metal") || !candle::tuning::PROFILE_INSTRUMENTS {
+            let message = result.unwrap_err().to_string();
+            assert!(message.contains("diagnostics.gpu_profile.enabled"));
+            let capability = if cfg!(feature = "metal") {
+                "profile"
+            } else {
+                "metal"
+            };
+            assert!(message.contains(&format!("{capability} instrumentation is not compiled")));
+            assert!(message.contains("--profile release-with-debug -p candle-examples --features metal,profile --example lfm2-dspark-verify"));
+        } else {
+            result.unwrap();
+            #[cfg(feature = "metal")]
+            {
+                use candle::kernels::metal::profile;
+                profile::reset();
+                let label = std::sync::Arc::<str>::from("host-example-positive");
+                profile::record_dispatch(Some(&label), 1);
+                profile::record_command_buffer(1.0, 3.0, 0.5, 1);
+                let s = profile::snapshot();
+                assert_eq!(s.dispatches, 1);
+                assert_eq!(s.by_label, vec![("host-example-positive".into(), 1)]);
+                assert_eq!(s.gpu_busy_union_s, 2.0);
+            }
+        }
+    }
+}
+
 pub fn device(cpu: bool) -> Result<Device> {
     if cpu {
         Ok(Device::Cpu)

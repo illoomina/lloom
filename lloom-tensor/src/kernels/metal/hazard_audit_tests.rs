@@ -14,6 +14,7 @@
 use crate::kernels::metal::encoder::{HazardKind, HazardKinds};
 use crate::kernels::metal::hazard_audit::{
     cover, AuditBinding, AuditDispatch, AuditStream, EventScope, SeamPolicy, StageScope, Stages,
+    UninitializedRead,
 };
 
 /// A slot every dispatch in the single-buffer fixtures shares.
@@ -845,4 +846,249 @@ fn an_edge_names_the_primitive_that_covered_it() {
     assert_eq!((rep.by_fence, rep.by_barrier), (1, 1));
     assert_eq!((rep.by_seam, rep.by_transitive), (0, 0));
     assert_eq!(rep.edges, 2);
+}
+
+/// The Lithos barrier-planner litmus (#985 addendum §3): a delayed writer A
+/// of X, a reader B of X that carries a barrier, a reader C of X with no
+/// dependency on B, and a D that touches neither. Each reader writes its own
+/// output, so the only edges are A -> B and A -> C.
+///
+/// The two barrier primitives are verified apart, not credited for each
+/// other. A stream barrier before B (`memoryBarrierWithScope`) is a point in
+/// the stream: it orders A before B and before C. The same barrier as a
+/// property of B's command (an ICB `setBarrier`) orders B alone, and A -> C
+/// is reported. The barrier on every reader is clean; the planner that
+/// forgets A after B's barrier is the reported arm. D is in no edge.
+#[test]
+fn lithos_litmus_a_barrier_on_one_reader_does_not_order_the_next() {
+    const B_OUT: usize = 0x4000;
+    const C_OUT: usize = 0x5000;
+    const D_OUT: usize = 0x6000;
+    let readers = |s: &mut AuditStream, b_stream_barrier: bool| {
+        let a = dispatch(s, 0, &[write(X)]);
+        let b = if b_stream_barrier {
+            after_barrier(s, 0, &[read(X), write(B_OUT)])
+        } else {
+            dispatch(s, 0, &[read(X), write(B_OUT)])
+        };
+        let c = dispatch(s, 0, &[read(X), write(C_OUT)]);
+        let d = dispatch(s, 0, &[read(Z), write(D_OUT)]);
+        (a, b, c, d)
+    };
+
+    let mut stream = AuditStream::default();
+    readers(&mut stream, true);
+    let rep = stream.cover("litmus-stream-barrier", SeamPolicy::Observed);
+    assert_eq!(rep.edges, 2, "{}", rep.render());
+    assert!(
+        rep.is_clean(),
+        "a stream barrier did not order C: {}",
+        rep.render()
+    );
+    assert_eq!(rep.by_barrier, 2);
+
+    // One ICB run over the four, A at its head; `barriers` names the
+    // commands carrying `setBarrier`.
+    let run = |barriers: &[usize]| {
+        let mut s = AuditStream::default();
+        readers(&mut s, false);
+        for (i, x) in s.dispatches.iter_mut().enumerate() {
+            x.run = Some(0);
+            x.is_run_head = i == 0;
+            x.icb_barrier = barriers.contains(&i);
+        }
+        s
+    };
+    let every_reader = run(&[1, 2]);
+    assert!(every_reader
+        .cover("litmus-icb", SeamPolicy::Observed)
+        .is_clean());
+    assert_eq!(
+        only_uncovered(&run(&[1])),
+        vec![(0, 2, HazardKind::Raw)],
+        "a setBarrier on B was credited with ordering C"
+    );
+    assert_eq!(
+        only_uncovered(&run(&[])),
+        vec![(0, 1, HazardKind::Raw), (0, 2, HazardKind::Raw)],
+        "a run with no barrier reported other than its two edges"
+    );
+}
+
+/// The same litmus across replay tails: the run replays twice back to back,
+/// and the second replay's head overwrites what the first replay's readers
+/// read. A run head's `setBarrier` orders nothing in its run (`icb_orders`),
+/// so that WAR is ordered only by the stream barrier the encoder places before
+/// the second `executeCommandsInBuffer`; without it both tail readers are
+/// reported.
+#[test]
+fn lithos_litmus_across_replay_tails_needs_the_stream_barrier() {
+    const B_OUT: usize = 0x4000;
+    const C_OUT: usize = 0x5000;
+    let replays = |stream_barrier_between: bool| {
+        let mut s = AuditStream::default();
+        for replay in 0..2u64 {
+            let base = s.dispatches.len();
+            dispatch(&mut s, 0, &[write(X)]);
+            dispatch(&mut s, 0, &[read(X), write(B_OUT)]);
+            dispatch(&mut s, 0, &[read(X), write(C_OUT)]);
+            for (i, x) in s.dispatches[base..].iter_mut().enumerate() {
+                x.run = Some(replay);
+                x.is_run_head = i == 0;
+                x.icb_barrier = i > 0;
+            }
+            if replay == 1 {
+                s.dispatches[base].barrier = stream_barrier_between;
+            }
+        }
+        s
+    };
+    assert!(
+        replays(true)
+            .cover("tails", SeamPolicy::Observed)
+            .is_clean(),
+        "{}",
+        replays(true).cover("tails", SeamPolicy::Observed).render()
+    );
+    let bad: Vec<_> = only_uncovered(&replays(false));
+    for (w, r, _) in &bad {
+        assert!(*w < 3 && *r >= 3, "an in-replay edge was reported: {bad:?}");
+    }
+    assert!(
+        bad.contains(&(1, 3, HazardKind::War)) && bad.contains(&(2, 3, HazardKind::War)),
+        "the tail readers' WAR against the next replay's head was not reported: {bad:?}"
+    );
+}
+
+/// The litmus through the planner that places our ICB's `setBarrier`s
+/// (`icb::plan_barriers`): its plan, audited as one run, is clean under the
+/// shipped scan and reports A -> C under `BarrierScope::SinceBarrier`, the
+/// planner that forgets A once B's barrier is placed — Lithos's
+/// `place_barriers` shape, kept compiled as the negative control.
+#[test]
+fn lithos_litmus_through_the_icb_barrier_planner() {
+    use crate::kernels::metal::executor::{Grid, Size3};
+    use crate::kernels::metal::icb::{plan_barriers, BarrierScope, BindingRecord, StepDispatch};
+    let binding = |index: usize, ptr: usize, is_output: bool| BindingRecord {
+        index,
+        ptr,
+        offset: 0,
+        len: 128,
+        is_output,
+    };
+    let one = Size3 {
+        width: 1,
+        height: 1,
+        depth: 1,
+    };
+    let step = |name: &str, bindings: Vec<BindingRecord>| StepDispatch {
+        kernel: Some(name.into()),
+        grid: Grid::Threads(one),
+        threads_per_threadgroup: one,
+        bindings,
+        pipeline: None,
+        retained: Vec::new(),
+    };
+    let steps = vec![
+        step("a", vec![binding(0, X, true)]),
+        step("b", vec![binding(0, X, false), binding(1, 0x4000, true)]),
+        step("c", vec![binding(0, X, false), binding(1, 0x5000, true)]),
+        step("d", vec![binding(0, Z, false), binding(1, 0x6000, true)]),
+    ];
+    let covered = [0, 1, 2, 3];
+    let audited = |scope: BarrierScope| {
+        let plan = plan_barriers(&steps, &covered, scope);
+        let mut s = AuditStream::default();
+        for (i, st) in steps.iter().enumerate() {
+            let binds: Vec<AuditBinding> = st
+                .bindings
+                .iter()
+                .map(|b| AuditBinding {
+                    ptr: b.ptr,
+                    offset: b.offset,
+                    len: b.len,
+                    is_output: b.is_output,
+                })
+                .collect();
+            dispatch(&mut s, 0, &binds);
+            let x = &mut s.dispatches[i];
+            x.run = Some(0);
+            x.is_run_head = i == 0;
+            x.icb_barrier = plan[i];
+        }
+        (plan, only_uncovered(&s))
+    };
+    let (plan, uncovered) = audited(BarrierScope::RunStart);
+    assert_eq!(plan, vec![false, true, true, false]);
+    assert!(uncovered.is_empty(), "the shipped scan left {uncovered:?}");
+    let (plan, uncovered) = audited(BarrierScope::SinceBarrier);
+    assert_eq!(plan, vec![false, true, false, false]);
+    assert_eq!(
+        uncovered,
+        vec![(0, 2, HazardKind::Raw)],
+        "the planner that forgets A was not reported"
+    );
+}
+
+/// Obligation 3 (`dependency-ordered-reuse-design.md` §3): a reused range's
+/// new value must be written before it is read, over every byte the read
+/// covers. The old value's writes do not count, nor does a write in the
+/// reading command itself; a partial write leaves the gap reported, by its
+/// bytes; a full write, or a read of only the written part, is clean.
+#[test]
+fn a_new_value_read_past_its_writes_is_reported_by_its_bytes() {
+    let at = |ptr: usize, offset: usize, len: usize, is_output: bool| AuditBinding {
+        ptr,
+        offset,
+        len,
+        is_output,
+    };
+    let build = |init: &[AuditBinding], read: AuditBinding| {
+        let mut s = AuditStream::default();
+        dispatch(&mut s, 0, &[at(X, 0, 128, true)]);
+        s.new_value(X, 0, 128);
+        for w in init {
+            after_barrier(&mut s, 0, &[*w]);
+        }
+        after_barrier(&mut s, 0, &[read, write(Y)]);
+        s.uninitialized_reads()
+    };
+    let read_all = at(X, 0, 128, false);
+
+    let gaps = |v: Vec<UninitializedRead>| -> Vec<(usize, usize)> {
+        v.iter().map(|u| (u.from, u.to)).collect()
+    };
+    assert_eq!(
+        gaps(build(&[], read_all)),
+        vec![(0, 128)],
+        "the old value's write was taken as the new value's"
+    );
+    assert_eq!(
+        gaps(build(&[at(X, 0, 64, true)], read_all)),
+        vec![(64, 128)]
+    );
+    assert_eq!(
+        gaps(build(&[at(X, 0, 120, true)], read_all)),
+        vec![(120, 128)],
+        "a vector footprint past the write was not reported"
+    );
+    assert!(build(&[at(X, 0, 64, true), at(X, 64, 64, true)], read_all).is_empty());
+    assert!(build(&[at(X, 0, 64, true)], at(X, 0, 64, false)).is_empty());
+
+    let mut in_place = AuditStream::default();
+    in_place.new_value(X, 0, 128);
+    dispatch(&mut in_place, 0, &[read_all, at(X, 0, 128, true)]);
+    assert_eq!(
+        gaps(in_place.uninitialized_reads()),
+        vec![(0, 128)],
+        "a command's own write was taken as initializing its read"
+    );
+
+    // A later new value of the same storage ends the earlier one's window.
+    let mut two = AuditStream::default();
+    two.new_value(X, 0, 128);
+    after_barrier(&mut two, 0, &[at(X, 0, 128, true)]);
+    two.new_value(X, 0, 128);
+    after_barrier(&mut two, 0, &[read_all, write(Y)]);
+    assert_eq!(gaps(two.uninitialized_reads()), vec![(0, 128)]);
 }

@@ -359,6 +359,7 @@ impl MmprojVision {
         tokenizer: &Tokenizer,
         text_hidden: usize,
         device: &Device,
+        purpose: lloom::nn::attention::route::ExecutionPurpose,
     ) -> Result<Self> {
         use lloom_tensor::quantized::gguf_file::Content;
         let image_token_id = tokenizer.token_to_id("<image>").ok_or_else(|| {
@@ -380,6 +381,7 @@ impl MmprojVision {
             dtype,
             device,
         )?;
+        purpose.admit("mmproj vision tower", device, encoder.reference_attention())?;
         Ok(Self {
             encoder,
             config,
@@ -539,6 +541,16 @@ where
         params: &DecodeParams,
         on_fragment: &mut (impl FnMut(&str) -> bool + Send),
     ) -> Result<Decoded> {
+        self.complete_observed(prompt, params, on_fragment, &mut |_, _, _, _| Ok(()))
+    }
+
+    fn complete_observed(
+        &self,
+        prompt: &[u32],
+        params: &DecodeParams,
+        on_fragment: &mut (impl FnMut(&str) -> bool + Send),
+        observe: &mut super::served::DecodeObserver<'_>,
+    ) -> Result<Decoded> {
         check_context_capacity(self.capacity, prompt.len(), params.max_tokens, 0)
             .map_err(Error::wrap)?;
         if prompt
@@ -563,13 +575,10 @@ where
         let mut lease = self.checkout()?;
         lease.start_decode(&self.model, &self.device, self.decode.clone());
         let tokenizer = &self.tokenizer;
+        let mut from = 0usize;
         let result = lease.session().decode_until(
             prompt,
-            |ids| {
-                tokenizer
-                    .decode(ids, false)
-                    .map_err(|error| Error::msg(format!("detokenizing causal output: {error}")))
-            },
+            |ids| observed_decode(tokenizer, ids, &mut from, observe),
             params,
             |fragment| on_fragment(fragment),
         );
@@ -604,8 +613,25 @@ where
         params: &DecodeParams,
         on_fragment: &mut (impl FnMut(&str) -> bool + Send),
     ) -> Result<Decoded> {
+        self.complete_images_observed(
+            prompt,
+            images,
+            params,
+            on_fragment,
+            &mut |_, _, _, _| Ok(()),
+        )
+    }
+
+    pub(crate) fn complete_images_observed(
+        &self,
+        prompt: &[u32],
+        images: &[super::vision::DecodedImage],
+        params: &DecodeParams,
+        on_fragment: &mut (impl FnMut(&str) -> bool + Send),
+        observe: &mut super::served::DecodeObserver<'_>,
+    ) -> Result<Decoded> {
         if images.is_empty() {
-            return self.complete(prompt, params, on_fragment);
+            return self.complete_observed(prompt, params, on_fragment, observe);
         }
         let vision = self
             .vision
@@ -658,16 +684,13 @@ where
             0,
         )?;
         let tokenizer = &self.tokenizer;
+        let mut from = 0usize;
         let decoded =
             lease.with_model(&rows, &self.device, self.decode.clone(), |session, _| {
                 session.reset();
                 session.decode_until(
                     prompt,
-                    |ids| {
-                        tokenizer.decode(ids, false).map_err(|error| {
-                            Error::msg(format!("detokenizing causal output: {error}"))
-                        })
-                    },
+                    |ids| observed_decode(tokenizer, ids, &mut from, observe),
                     params,
                     |fragment| on_fragment(fragment),
                 )
@@ -885,25 +908,35 @@ fn produce_lfm2_gguf(
         tokenizer_path,
         policy_source,
         device,
+        lloom::nn::attention::route::ExecutionPurpose::Production,
         decode,
+        None,
         |_, _, _| Ok(()),
     )
     .map(|(engine, ())| engine)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn produce_lfm2_gguf_with<T>(
     checkpoint: &Path,
     mmproj: Option<&Path>,
     tokenizer_path: TokenizerSource<'_>,
     policy_source: Option<CausalPolicySource>,
     device: &Device,
+    purpose: lloom::nn::attention::route::ExecutionPurpose,
     decode: DecodeConfig,
+    runtime: Option<(usize, lloom_tensor::DType)>,
     preflight: impl FnOnce(
         &lloom::models::quantized_lfm2::Config,
         &Tokenizer,
         Option<&CausalPolicy>,
     ) -> Result<T>,
 ) -> Result<(CausalEngine<lloom::models::quantized_lfm2::Model>, T)> {
+    if runtime.is_some_and(|(_, dtype)| {
+        !matches!(dtype, lloom_tensor::DType::F32 | lloom_tensor::DType::F16)
+    }) {
+        lloom_tensor::bail!("quantized lfm2 KV storage requires f32 or f16")
+    }
     use lloom_tensor::quantized::gguf_file::Content;
     let mut file = std::fs::File::open(checkpoint)?;
     let content = Content::read(&mut file)?;
@@ -916,6 +949,10 @@ fn produce_lfm2_gguf_with<T>(
         lloom_tensor::bail!("causal LFM2 factory received {architecture}")
     }
     let plan = lloom::models::quantized_lfm2::Model::preflight_gguf_content(&content, &mut file)?;
+    let plan = match runtime {
+        Some((context, _)) => plan.with_context_limit(context)?,
+        None => plan,
+    };
     let config = plan.config();
     let capacity = config.context_length;
     let tokenizer = match tokenizer_path {
@@ -960,9 +997,12 @@ fn produce_lfm2_gguf_with<T>(
         lloom_tensor::bail!("tokenizer id is outside resolved GGUF vocabulary")
     }
     let prepared = preflight(&config, &tokenizer, policy.as_ref())?;
-    let model = plan.materialize(&mut file, device)?;
+    let model = plan
+        .materialize(&mut file, device)?
+        .with_kv_dtype(runtime.map_or(lloom_tensor::DType::F32, |(_, dtype)| dtype))?;
+    purpose.admit("lfm2-gguf", device, model.reference_attention())?;
     let vision = mmproj
-        .map(|path| MmprojVision::load(path, &tokenizer, config.hidden_size, device))
+        .map(|path| MmprojVision::load(path, &tokenizer, config.hidden_size, device, purpose))
         .transpose()?;
     let cache = model.new_cache()?;
     Ok((
@@ -989,6 +1029,27 @@ fn produce_lfm2_gguf_with<T>(
         },
         prepared,
     ))
+}
+
+/// Observe the exact pending run TextStream decodes. Its nonterminal append
+/// accepts nonempty text not ending in U+FFFD; terminal flush has no successor.
+pub(super) fn observed_decode(
+    tokenizer: &Tokenizer,
+    ids: &[u32],
+    from: &mut usize,
+    observe: &mut super::served::DecodeObserver<'_>,
+) -> Result<String> {
+    let decode = |ids: &[u32]| {
+        tokenizer
+            .decode(ids, false)
+            .map_err(|error| Error::msg(format!("detokenizing causal output: {error}")))
+    };
+    let text = decode(ids)?;
+    observe(ids, &text, *from, &decode)?;
+    if !text.is_empty() && !text.ends_with('\u{FFFD}') {
+        *from += text.len();
+    }
+    Ok(text)
 }
 
 /// Owning adapter for the actual HTTP/REPL Served seam, with caller-supplied

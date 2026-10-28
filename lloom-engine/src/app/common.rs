@@ -353,21 +353,46 @@ pub struct DecodeTiming {
 /// What the dispatch recorder saw over one timed bracket: the counts, the
 /// GPU-busy union over the bracket's command buffers, and the per-kernel
 /// dispatch census (`lloom_tensor::kernels::metal::profile::Snapshot`).
+/// Pre-release source migration: heavy fields are Option; None is unavailable,
+/// while Some(0) and Some(empty) are valid observations. JSON uses null for None.
 pub struct ProfileReport {
     pub dispatches: u64,
     pub command_buffers: u64,
     pub encoders: u64,
-    pub gpu_busy_ms: f64,
-    pub gpu_span_ms: f64,
-    pub by_label: Vec<(String, u64)>,
+    pub gpu_busy_ms: Option<f64>,
+    pub gpu_span_ms: Option<f64>,
+    pub by_label: Option<Vec<(String, u64)>>,
     /// GPU time by kernel from each command buffer's LAST dispatch label —
     /// `(label, buffers, total_ms, p50_ms)`; exact only at
     /// `CANDLE_METAL_COMPUTE_PER_BUFFER=1` (one dispatch per buffer), else a
     /// buffer is charged to its last kernel.
-    pub gpu_by_label: Vec<(String, u64, f64, f64)>,
+    pub gpu_by_label: Option<Vec<(String, u64, f64, f64)>>,
+    /// Detailed recorder availability; cheap scalar counters remain usable.
+    pub recorder_available: bool,
 }
 
 impl ProfileReport {
+    /// Cold human report. Missing detail is not a measured zero or empty census.
+    pub fn summary(&self, steps: f64) -> String {
+        let steps = steps.max(1.0);
+        let kernels = self
+            .by_label
+            .as_ref()
+            .map(|labels| {
+                labels
+                    .iter()
+                    .take(12)
+                    .map(|(k, n)| format!("{k}={n}"))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .unwrap_or_else(|| "unavailable".into());
+        format!("gpu_busy {} ms over the bracket ({} ms per step/round of {steps:.0}), span {} ms, {} dispatches ({:.1} per step), {} command buffers, {} encoders; top kernels: {}",
+            profile_metric(self.gpu_busy_ms), profile_metric(self.gpu_busy_ms.map(|v| v / steps)),
+            profile_metric(self.gpu_span_ms), self.dispatches, self.dispatches as f64 / steps,
+            self.command_buffers, self.encoders, kernels)
+    }
+
     pub fn json(&self) -> Value {
         json!({
             "dispatches": self.dispatches,
@@ -375,14 +400,18 @@ impl ProfileReport {
             "encoders": self.encoders,
             "gpu_busy_ms": self.gpu_busy_ms,
             "gpu_span_ms": self.gpu_span_ms,
-            "by_label": self.by_label.iter().map(|(k, n)| json!([k, n])).collect::<Vec<_>>(),
-            "gpu_by_label": self
-                .gpu_by_label
-                .iter()
-                .map(|(k, b, t, p)| json!([k, b, t, p]))
-                .collect::<Vec<_>>(),
+            "recorder_available": self.recorder_available,
+            "by_label": self.by_label,
+            "gpu_by_label": self.gpu_by_label,
         })
     }
+}
+
+/// Render only real available metrics; shared by cold profile report consumers.
+pub(super) fn profile_metric(value: Option<f64>) -> String {
+    value
+        .map(|v| format!("{v:.4}"))
+        .unwrap_or_else(|| "unavailable".into())
 }
 
 /// Zero the dispatch recorder before a timed bracket (a no-op unless
@@ -402,21 +431,56 @@ pub fn profile_take() -> Option<ProfileReport> {
         use lloom_tensor::kernels::metal::profile;
         if profile::enabled() {
             let s = profile::snapshot();
+            let recorder_available = profile::recorder_enabled();
             return Some(ProfileReport {
+                recorder_available,
                 dispatches: s.dispatches,
                 command_buffers: s.command_buffers,
                 encoders: s.encoders,
-                gpu_busy_ms: 1e3 * s.gpu_busy_union_s,
-                gpu_span_ms: 1e3 * s.gpu_span_s,
-                by_label: s.by_label,
-                gpu_by_label: profile::gpu_time_by_label_detailed()
-                    .into_iter()
-                    .map(|k| (k.label, k.buffers, 1e3 * k.total_s, 1e3 * k.p50_s))
-                    .collect(),
+                gpu_busy_ms: recorder_available.then_some(1e3 * s.gpu_busy_union_s),
+                gpu_span_ms: recorder_available.then_some(1e3 * s.gpu_span_s),
+                by_label: recorder_available.then_some(s.by_label),
+                gpu_by_label: recorder_available.then(|| {
+                    profile::gpu_time_by_label_detailed()
+                        .into_iter()
+                        .map(|k| (k.label, k.buffers, 1e3 * k.total_s, 1e3 * k.p50_s))
+                        .collect()
+                }),
             });
         }
     }
     None
+}
+
+/// The profiler's running counts and its commit attribution for `/health`,
+/// cumulative since the process started (a caller differences two reads
+/// around a request); `null` unless `CANDLE_METAL_PROFILE=1` and
+/// `diagnostics.trace.cut_sites` are both on.
+pub fn cut_sites_json() -> Value {
+    #[cfg(feature = "metal")]
+    {
+        use lloom_tensor::kernels::metal::profile;
+        if profile::cut_sites_enabled() {
+            let s = profile::snapshot();
+            let sites: Vec<Value> = profile::cut_sites()
+                .into_iter()
+                .map(|c| json!({ "thread": c.thread, "commits": c.commits, "frames": c.frames }))
+                .collect();
+            return json!({
+                "command_buffers": s.command_buffers,
+                "dispatches": s.dispatches,
+                "encoders": s.encoders,
+                "commits": sites.iter().map(|c| c["commits"].as_u64().unwrap_or(0)).sum::<u64>(),
+                "sites": sites,
+                "by_label": s
+                    .by_label
+                    .into_iter()
+                    .map(|(k, n)| (k, json!(n)))
+                    .collect::<serde_json::Map<String, Value>>(),
+            });
+        }
+    }
+    Value::Null
 }
 
 pub use lloom::nn::memory::{MemGauge, MemReport, MemSnapshot};
@@ -445,30 +509,39 @@ pub fn machine_label(family: &str, checkpoint: &Path) -> String {
     format!("lloom {family} {name}")
 }
 
+/// Checked configured setup, before the native/fallback body. Kept separate
+/// so host controls exercise ordering without constructing any native device.
+fn with_checked_device_setup(body: impl FnOnce() -> Result<Device>) -> Result<Device> {
+    lloom_tensor::tuning::try_tuning()?;
+    body()
+}
+
 pub fn open_device() -> Result<Device> {
-    #[cfg(not(feature = "metal"))]
-    if lloom_tensor::tuning::tuning().metal.command_api == "metal4" {
-        anyhow::bail!("--metal-api metal4 requires a build with the metal feature; select metal3/auto for normal device fallback");
-    }
-    #[cfg(feature = "metal")]
-    {
-        match Device::new_metal(0) {
-            Ok(d) => return Ok(d),
-            Err(error) if lloom_tensor::tuning::tuning().metal.command_api == "metal4" => {
-                // An explicit native API request must not silently become a
-                // CPU run when capability or diagnostics reject that API.
-                return Err(error.into());
+    with_checked_device_setup(|| {
+        #[cfg(not(feature = "metal"))]
+        if lloom_tensor::tuning::tuning().metal.command_api == "metal4" {
+            anyhow::bail!("--metal-api metal4 requires a build with the metal feature; select metal3/auto for normal device fallback");
+        }
+        #[cfg(feature = "metal")]
+        {
+            match Device::new_metal(0) {
+                Ok(d) => return Ok(d),
+                Err(error) if lloom_tensor::tuning::tuning().metal.command_api == "metal4" => {
+                    // An explicit native API request must not silently become a
+                    // CPU run when capability or diagnostics reject that API.
+                    return Err(error.into());
+                }
+                Err(_) => {}
             }
-            Err(_) => {}
         }
-    }
-    #[cfg(feature = "cuda")]
-    {
-        if let Ok(d) = Device::new_cuda(0) {
-            return Ok(d);
+        #[cfg(feature = "cuda")]
+        {
+            if let Ok(d) = Device::new_cuda(0) {
+                return Ok(d);
+            }
         }
-    }
-    Ok(Device::Cpu)
+        Ok(Device::Cpu)
+    })
 }
 
 /// The newest snapshot of `repo` in the HF cache, if any.
@@ -620,5 +693,185 @@ pub fn install_executor(
     {
         let _ = (device, cfg);
         Ok(super::report::Installed::default())
+    }
+}
+
+#[cfg(test)]
+mod configured_device_setup_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    #[test]
+    fn invalid_diagnostic_setup_never_enters_device_or_fallback_body() {
+        lloom_tensor::isolation::claim("configured device setup test");
+        let value = if lloom_tensor::tuning::PROFILE_INSTRUMENTS {
+            "not-a-bool"
+        } else {
+            "1"
+        };
+        std::env::set_var("CANDLE_METAL_TRACE", value);
+        let entered = Cell::new(false);
+        let error = with_checked_device_setup(|| {
+            entered.set(true);
+            Ok(Device::Cpu)
+        })
+        .unwrap_err();
+        assert!(
+            !entered.get(),
+            "a refused request must not enter even the fallback body"
+        );
+        assert!(
+            !lloom_tensor::tuning::installed(),
+            "failed setup must not freeze tuning"
+        );
+        let message = error.to_string();
+        let expected = if lloom_tensor::tuning::PROFILE_INSTRUMENTS {
+            "CANDLE_METAL_TRACE"
+        } else {
+            "diagnostics.trace.dispatch"
+        };
+        assert!(message.contains(expected), "{message}");
+    }
+
+    #[test]
+    fn default_setup_retains_the_fallback_body() {
+        lloom_tensor::tuning::install(lloom_tensor::tuning::Tuning::default()).unwrap();
+        let entered = Cell::new(0);
+        let device = with_checked_device_setup(|| {
+            entered.set(entered.get() + 1);
+            Ok(Device::Cpu)
+        })
+        .unwrap();
+        assert!(device.is_cpu());
+        assert_eq!(entered.get(), 1);
+    }
+
+    #[test]
+    fn disabled_diagnostic_setup_retains_the_fallback_body() {
+        lloom_tensor::isolation::claim("configured device setup test");
+        std::env::set_var("CANDLE_METAL_TRACE", "0");
+        let entered = Cell::new(0);
+        let device = with_checked_device_setup(|| {
+            entered.set(entered.get() + 1);
+            Ok(Device::Cpu)
+        })
+        .unwrap();
+        assert!(device.is_cpu());
+        assert_eq!(entered.get(), 1);
+        assert!(!lloom_tensor::tuning::tuning().instrument.trace);
+    }
+}
+
+#[cfg(test)]
+mod profile_report_tests {
+    use super::*;
+    fn report(detail: bool, busy: f64) -> ProfileReport {
+        ProfileReport {
+            dispatches: 7,
+            command_buffers: 3,
+            encoders: 4,
+            recorder_available: detail,
+            gpu_busy_ms: detail.then_some(busy),
+            gpu_span_ms: detail.then_some(0.0),
+            by_label: detail.then(Vec::new),
+            gpu_by_label: detail.then(Vec::new),
+        }
+    }
+    #[test]
+    fn public_round_probe_validates_capability_without_native_work() {
+        let actual = lloom_tensor::tuning::PROFILE_INSTRUMENTS;
+        // Test-only expectation pins controlled build graphs without rejecting
+        // legitimate workspace fuzzing/profile feature unification in other runs.
+        if let Ok(expected) = std::env::var("LLOOM_TEST_EXPECT_PROFILE_CAPABILITY") {
+            let expected = match expected.as_str() {
+                "available" => true,
+                "absent" => false,
+                other => panic!("unknown test capability expectation: {other}"),
+            };
+            assert_eq!(actual, expected, "unexpected diagnostic feature union");
+            println!("profile capability actual={actual} expected={expected}");
+        }
+        lloom::nn::RoundProbe::default().validate().unwrap();
+        lloom::nn::RoundProbe {
+            sync: Some(&Device::Cpu),
+            census: false,
+        }
+        .validate()
+        .unwrap();
+        let error = lloom::nn::RoundProbe {
+            sync: Some(&Device::Cpu),
+            census: true,
+        }
+        .validate()
+        .unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("diagnostics.gpu_profile.enabled"));
+        if !actual {
+            assert!(message.contains("profile instrumentation is not compiled"));
+        } else {
+            assert!(message.contains("requires an active detailed Metal sync probe"));
+        }
+    }
+    #[cfg(feature = "metal")]
+    #[test]
+    fn actual_host_snapshot_retains_counts_and_reports_build_availability() {
+        use lloom_tensor::kernels::metal::profile;
+        let mut tuning = lloom_tensor::tuning::Tuning::default();
+        tuning.instrument.profile = true;
+        lloom_tensor::tuning::install(tuning).unwrap();
+        profile::reset();
+        let label = std::sync::Arc::<str>::from("host-report-positive");
+        profile::record_dispatch(Some(&label), 1);
+        profile::record_encoder();
+        profile::record_command_buffer(1.0, 3.0, 0.5, 1);
+        let p = profile_take().expect("cheap scalar profiling remains enabled");
+        assert_eq!((p.dispatches, p.encoders, p.command_buffers), (1, 1, 1));
+        let available = profile::recorder_enabled();
+        assert_eq!(p.recorder_available, available);
+        if available {
+            assert_eq!(p.gpu_busy_ms, Some(2000.0));
+            assert_eq!(p.by_label, Some(vec![("host-report-positive".into(), 1)]));
+        } else {
+            assert!(p.gpu_busy_ms.is_none());
+            assert!(p.by_label.is_none());
+            assert!(p.json()["gpu_busy_ms"].is_null());
+        }
+    }
+    #[test]
+    fn unavailable_detail_is_null_and_text_not_zero_with_counts_retained() {
+        let p = report(false, 0.0);
+        let j = p.json();
+        for key in ["gpu_busy_ms", "gpu_span_ms", "by_label", "gpu_by_label"] {
+            assert!(j[key].is_null(), "{key}: {j}");
+        }
+        assert_eq!(j["recorder_available"], false);
+        assert_eq!(j["dispatches"], 7);
+        let text = p.summary(2.0);
+        assert!(text.contains("gpu_busy unavailable"));
+        assert!(text.contains("top kernels: unavailable"));
+        assert!(text.contains("7 dispatches"));
+    }
+    #[test]
+    fn available_zero_and_empty_are_real_values_not_missing() {
+        let p = report(true, 0.0);
+        let j = p.json();
+        assert_eq!(j["gpu_busy_ms"], 0.0);
+        assert_eq!(j["by_label"], json!([]));
+        assert_eq!(j["gpu_by_label"], json!([]));
+        assert_eq!(j["recorder_available"], true);
+        assert!(!p.summary(2.0).contains("unavailable"));
+    }
+    #[test]
+    fn available_nonzero_detail_survives_both_production_renderers() {
+        let mut p = report(true, 12.5);
+        p.by_label = Some(vec![("kernel".into(), 7)]);
+        p.gpu_by_label = Some(vec![("kernel".into(), 3, 12.5, 4.0)]);
+        let j = p.json();
+        assert_eq!(j["gpu_busy_ms"], 12.5);
+        assert_eq!(j["gpu_by_label"][0][2], 12.5);
+        let text = p.summary(2.0);
+        assert!(text.contains("12.5000"));
+        assert!(text.contains("6.2500"));
+        assert!(text.contains("kernel=7"));
     }
 }

@@ -1284,6 +1284,9 @@ pub struct StreamCounters {
     /// (already resident, or no slot) — `QWEN4EXP_PREDICT=hotlist`.
     pub predict_landed: AtomicU64,
     pub predict_wasted: AtomicU64,
+    /// Copy launches that landed misses' planes in their slots (one a plane,
+    /// or one a pool and group under `weights.experts.landing_gather`).
+    pub landing_launches: AtomicU64,
 }
 
 /// The fetch worker's counters (`nn::expert_fetch::FetchLane::stats`; zeros
@@ -1358,6 +1361,7 @@ pub struct StreamStats {
     pub slot_bytes_released: u64,
     pub predict_landed: u64,
     pub predict_wasted: u64,
+    pub landing_launches: u64,
 }
 
 impl StreamCounters {
@@ -1398,6 +1402,7 @@ impl StreamCounters {
             slot_bytes_released: self.slot_bytes_released.load(Ordering::Relaxed),
             predict_landed: self.predict_landed.load(Ordering::Relaxed),
             predict_wasted: self.predict_wasted.load(Ordering::Relaxed),
+            landing_launches: self.landing_launches.load(Ordering::Relaxed),
         }
     }
 }
@@ -1433,6 +1438,7 @@ impl std::ops::AddAssign for StreamStats {
         self.slot_bytes_released += o.slot_bytes_released;
         self.predict_landed += o.predict_landed;
         self.predict_wasted += o.predict_wasted;
+        self.landing_launches += o.landing_launches;
         self.plans += o.plans;
         self.groups += o.groups;
         self.hits += o.hits;
@@ -1542,6 +1548,14 @@ struct Inner {
     /// ring shared by every layer of the tier when built by the loader.
     #[cfg(feature = "metal")]
     staging: Option<lloom_tensor::kernels::metal::staging::SharedStagingRing>,
+    /// A group's staged planes land with one copy launch per pool
+    /// (`weights.experts.landing_gather`), not one a plane.
+    #[cfg(feature = "metal")]
+    gather: bool,
+    /// Commit the open buffer after each landing
+    /// (`weights.experts.landing_commit`; `commit_landing`).
+    #[cfg(feature = "metal")]
+    commit: bool,
     /// The epoch of a group whose slot ids `ensure` handed out and whose
     /// dispatches are not all encoded yet (`down` closes it): the `io` arm's
     /// hint between the two must not give its slots away — the load is
@@ -2143,6 +2157,10 @@ impl Streamed {
                 device: device.clone(),
                 #[cfg(feature = "metal")]
                 staging,
+                #[cfg(feature = "metal")]
+                gather: landing_gather(),
+                #[cfg(feature = "metal")]
+                commit: landing_commit(),
                 table: None,
                 table_stale: true,
                 live_pending: Vec::new(),
@@ -2229,6 +2247,20 @@ impl Streamed {
     #[cfg(feature = "metal")]
     pub fn set_prefetcher(&mut self, p: Arc<crate::nn::expert_prefetch::Prefetcher>) {
         self.prefetch = Some(p);
+    }
+
+    /// Land a group's staged planes with one copy launch per pool (`true`)
+    /// or one copy a plane; the default is `weights.experts.landing_gather`.
+    #[cfg(feature = "metal")]
+    pub fn set_landing_gather(&mut self, on: bool) {
+        self.inner.get_mut().gather = on;
+    }
+
+    /// Commit the open command buffer after each landing (`true`); the
+    /// default is `weights.experts.landing_commit`.
+    #[cfg(feature = "metal")]
+    pub fn set_landing_commit(&mut self, on: bool) {
+        self.inner.get_mut().commit = on;
     }
 
     /// Let the prefetch hints act on the `io` arm: the hinted experts are
@@ -3085,34 +3117,65 @@ impl Streamed {
             staging,
             map,
             clock,
+            device,
+            gather,
+            commit,
             ..
         } = inner;
         let ring = match staging.as_ref() {
             Some(r) => r,
             None => lloom_tensor::bail!("land_staged: the tier has no staging ring"),
         };
+        let _landing = hold_landing_cut(device);
         let mut ring = ring.lock();
         let n = landed.len() as u64;
         let mut bytes = 0u64;
+        let mut launches = 0u64;
         let epoch = clock
             .as_ref()
             .map(|c| c.current_epoch())
             .unwrap_or(Epoch::ZERO);
-        for (_, s, st) in landed {
+        if *gather {
             for (i, pool) in pools.iter_mut().enumerate() {
                 let plane = pool.plane_bytes;
-                let (entry, buf) = &st.planes[i];
-                pool.qt
-                    .write_staged(s * plane, plane, buf.clone(), &mut ring, *entry)?;
-                bytes += plane as u64;
+                let planes: Vec<_> = landed
+                    .iter()
+                    .map(|(_, s, st)| {
+                        let (entry, buf) = &st.planes[i];
+                        (s * plane, buf.clone(), *entry)
+                    })
+                    .collect();
+                launches += pool.qt.write_staged_gather(plane, &planes, &mut ring)? as u64;
+                bytes += (plane * planes.len()) as u64;
             }
-            // The copy writes the slot in this command buffer.
-            map.stamp(s, epoch);
+            // The launches write the slots in this command buffer.
+            for (_, s, _) in &landed {
+                map.stamp(*s, epoch);
+            }
+        } else {
+            for (_, s, st) in landed {
+                for (i, pool) in pools.iter_mut().enumerate() {
+                    let plane = pool.plane_bytes;
+                    let (entry, buf) = &st.planes[i];
+                    pool.qt
+                        .write_staged(s * plane, plane, buf.clone(), &mut ring, *entry)?;
+                    bytes += plane as u64;
+                    launches += 1;
+                }
+                // The copy writes the slot in this command buffer.
+                map.stamp(s, epoch);
+            }
         }
         drop(ring);
+        if *commit {
+            commit_landing(device)?;
+        }
         self.counters
             .bytes_loaded
             .fetch_add(bytes, Ordering::Relaxed);
+        self.counters
+            .landing_launches
+            .fetch_add(launches, Ordering::Relaxed);
         if let Some(p) = &self.prefetch {
             p.used(n);
         }
@@ -3122,6 +3185,7 @@ impl Streamed {
     /// Land `(expert, slot)` pairs in all three pools.
     fn load(&self, inner: &mut Inner, misses: &[(usize, usize)]) -> Result<()> {
         let mut bytes = 0u64;
+        let mut launches = 0u64;
         // Whichever arm lands them, the slots are written in this command
         // buffer (the copy, or the IO load ordered into it).
         let epoch = inner.current_epoch();
@@ -3130,17 +3194,33 @@ impl Streamed {
         }
         match inner.loader.clone() {
             LoaderArm::Pread => {
+                let _landing = hold_landing_cut(&inner.device);
                 #[cfg(feature = "metal")]
                 let Inner {
                     pools,
                     sources,
                     staging,
+                    gather,
+                    commit,
+                    device,
                     ..
                 } = inner;
                 #[cfg(not(feature = "metal"))]
                 let Inner { pools, sources, .. } = inner;
                 for (pool, src) in pools.iter_mut().zip(sources.iter()) {
                     let plane = pool.plane_bytes;
+                    #[cfg(feature = "metal")]
+                    if let (true, Some(ring)) = (*gather, staging.as_ref()) {
+                        let offsets: Vec<usize> = misses.iter().map(|&(_, s)| s * plane).collect();
+                        launches += pool.qt.write_with_ring_gather(
+                            plane,
+                            &offsets,
+                            ring,
+                            &mut |i, dst| src.read_plane(misses[i].0, dst),
+                        )? as u64;
+                        bytes += (plane * misses.len()) as u64;
+                        continue;
+                    }
                     for &(e, s) in misses {
                         #[cfg(feature = "metal")]
                         if let Some(ring) = staging.as_ref() {
@@ -3150,12 +3230,18 @@ impl Streamed {
                                     src.read_plane(e, dst)
                                 })?;
                             bytes += plane as u64;
+                            launches += 1;
                             continue;
                         }
                         pool.qt
                             .write_with(s * plane, plane, &mut |dst| src.read_plane(e, dst))?;
                         bytes += plane as u64;
+                        launches += 1;
                     }
+                }
+                #[cfg(feature = "metal")]
+                if *commit {
+                    commit_landing(device)?;
                 }
             }
             #[cfg(feature = "metal")]
@@ -3194,6 +3280,9 @@ impl Streamed {
         self.counters
             .bytes_loaded
             .fetch_add(bytes, Ordering::Relaxed);
+        self.counters
+            .landing_launches
+            .fetch_add(launches, Ordering::Relaxed);
         Ok(())
     }
 }
@@ -3491,6 +3580,54 @@ fn default_spare_slots() -> usize {
 fn settle_batch_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| crate::tuning::tuning().stream.settle_batch)
+}
+
+/// The cut period held while a tier lands its experts
+/// (`weights.experts.landing_cut_period`, read once; 0 = the period in force).
+fn landing_cut_period() -> usize {
+    static P: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *P.get_or_init(|| crate::tuning::tuning().stream.landing_cut)
+}
+
+/// `weights.experts.landing_gather` (read once): a new tier's landing arm.
+#[cfg(feature = "metal")]
+fn landing_gather() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::tuning::tuning().stream.landing_gather)
+}
+
+/// `weights.experts.landing_commit` (read once): a new tier's commit arm.
+#[cfg(feature = "metal")]
+fn landing_commit() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::tuning::tuning().stream.landing_commit)
+}
+
+/// Commit what `device` has encoded after a landing, without waiting, so the
+/// GPU runs the landing and the work before it while the host goes on to
+/// read the next group's experts. Nothing under a period the loop holds
+/// longer than the landing's (the decode loop's `usize::MAX`): a landing
+/// never shortens the buffers around it.
+#[cfg(feature = "metal")]
+fn commit_landing(device: &Device) -> Result<()> {
+    if let Device::Metal(m) = device {
+        if m.compute_per_buffer() != usize::MAX {
+            m.flush_marker_if_started()?;
+        }
+    }
+    Ok(())
+}
+
+/// Hold the landing's cut period on `device` for the guard's life: `None`
+/// when the arm is off or a period at least as long is already in force (the
+/// decode loop's), so a landing never shortens the buffers around it.
+fn hold_landing_cut(device: &Device) -> Option<impl Sized> {
+    let period = landing_cut_period();
+    #[cfg(feature = "metal")]
+    let held = matches!(device, Device::Metal(m) if m.compute_per_buffer() >= period);
+    #[cfg(not(feature = "metal"))]
+    let held = true;
+    (period != 0 && !held).then(|| device.cut_period_hold(period))
 }
 
 /// `QWEN4EXP_TRACE_SETTLE=1` (read once): print every settle's ids, flags
@@ -5480,6 +5617,175 @@ mod tests {
         let pf2 = pre.prefetch_stats();
         assert_eq!(pf2.issued - pf.issued, (e as u64 - resident).min(n));
         assert_eq!((pf2.used - pf2.now) + pf2.wasted, n, "{pf2:?}");
+        std::fs::remove_file(path).ok();
+    }
+
+    /// Metal, the landing arm (`set_landing_gather`): a tier's misses land
+    /// with one copy launch per pool and group, both those read on the
+    /// encoding thread (`load`) and those a prefetcher staged
+    /// (`land_staged`), and the routed output is the per-plane tier's bit
+    /// for bit over a chunk whose experts exceed the pool (several groups,
+    /// slots reused). The per-plane tier's census is the control: its
+    /// landings are `copy2d_u32` launches and no gather.
+    #[cfg(feature = "metal")]
+    #[test]
+    fn the_landing_gather_lands_what_the_per_plane_copies_land() {
+        use crate::nn::expert_prefetch::Prefetcher;
+        use lloom_tensor::kernels::metal::staging::StagingRing;
+        std::env::set_var("CANDLE_METAL_PROFILE", "1");
+        let dev = match Device::new_metal(0) {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        assert!(lloom_tensor::kernels::metal::profile::enabled());
+        let m = dev.as_metal_device().unwrap().clone();
+        let census = |f: &mut dyn FnMut() -> Vec<f32>| -> (Vec<f32>, u64, u64) {
+            dev.synchronize().unwrap();
+            let w = m.dispatch_census().open().unwrap();
+            let y = f();
+            dev.synchronize().unwrap();
+            let c = w.close();
+            let n = |label: &str| -> u64 {
+                c.iter()
+                    .filter(|(l, _)| l.contains(label))
+                    .map(|(_, n)| *n)
+                    .sum()
+            };
+            (y, n("copy_gather_u32"), n("copy2d_u32"))
+        };
+        let dtype = GgmlDType::F32;
+        let (e, ff, d, topk) = (12usize, 32usize, 64usize, 3usize);
+        let gate = stacked(e, ff, d, 1.0, dtype);
+        let up = stacked(e, ff, d, 2.0, dtype);
+        let down = stacked(e, d, ff, 3.0, dtype);
+        let path = write_gguf(&[("gate", &gate), ("up", &up), ("down", &down)]);
+        let ring = StagingRing::shared(&m);
+        let tier = |gather: bool, prefetch: bool| -> Streamed {
+            let mut t = Streamed::with_staging(
+                open(&path, "gate"),
+                open(&path, "up"),
+                open(&path, "down"),
+                6,
+                LoaderArm::Pread,
+                &dev,
+                Some(Arc::clone(&ring)),
+            )
+            .unwrap();
+            t.set_landing_gather(gather);
+            if prefetch {
+                t.set_prefetcher(Arc::new(Prefetcher::new(&m, Arc::clone(&ring))));
+            }
+            t
+        };
+        let xs = x(16, d, 0.5).to_device(&dev).unwrap();
+        let id = ids(16, topk, e, 1).to_device(&dev).unwrap();
+        for prefetch in [false, true] {
+            let plain = tier(false, prefetch);
+            let gathered = tier(true, prefetch);
+            for t in [&plain, &gathered].into_iter().filter(|_| prefetch) {
+                t.prefetch_ahead().unwrap();
+                let t0 = std::time::Instant::now();
+                while t.prefetch_stats().staged < 6 {
+                    assert!(t0.elapsed() < std::time::Duration::from_secs(20));
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+            }
+            let (want, g0, c0) = census(&mut || run(&plain, &xs, &id));
+            let (got, g1, c1) = census(&mut || run(&gathered, &xs, &id));
+            let (s0, s1) = (plain.stats(), gathered.stats());
+            assert!(
+                s0.misses > 6 && s0.groups > 1,
+                "prefetch={prefetch}: {s0:?}"
+            );
+            assert_eq!(
+                want, got,
+                "prefetch={prefetch}: the gather changed the output"
+            );
+            assert_eq!(s0.misses, s1.misses, "prefetch={prefetch}");
+            assert_eq!(s0.bytes_loaded, s1.bytes_loaded, "prefetch={prefetch}");
+            // Both tiers do the same work beside their landings, so the
+            // difference in `copy2d_u32` launches is the per-plane landing's.
+            assert_eq!(g0, 0, "prefetch={prefetch}: the per-plane tier gathered");
+            assert_eq!(
+                c0 - c1,
+                3 * s0.misses,
+                "prefetch={prefetch}: the gather left per-plane copies ({c0} against {c1})"
+            );
+            assert!(
+                g1 > 0 && g1 <= 3 * s1.groups,
+                "prefetch={prefetch}: the gather took {g1} launches over {} groups",
+                s1.groups
+            );
+            if prefetch {
+                assert!(
+                    gathered.prefetch_stats().used > 0,
+                    "the prefetched landing never ran"
+                );
+            }
+        }
+        std::fs::remove_file(path).ok();
+    }
+
+    /// Metal, the commit arm (`set_landing_commit`) on a gathered tier: the
+    /// routed output is the same with and without it; outside a held period
+    /// it commits more command buffers, at most one more a landing call (a
+    /// third of the tier's landing launches: three pools a call); under the
+    /// decode loop's held `usize::MAX` it commits exactly what the arm off
+    /// does.
+    #[cfg(feature = "metal")]
+    #[test]
+    fn a_landing_commit_commits_once_a_landing_and_never_under_a_held_period() {
+        use lloom_tensor::kernels::metal::profile;
+        use lloom_tensor::kernels::metal::staging::StagingRing;
+        std::env::set_var("CANDLE_METAL_PROFILE", "1");
+        let dev = match Device::new_metal(0) {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        assert!(profile::enabled());
+        let m = dev.as_metal_device().unwrap().clone();
+        let dtype = GgmlDType::F32;
+        let (e, ff, d, topk) = (12usize, 32usize, 64usize, 3usize);
+        let gate = stacked(e, ff, d, 1.0, dtype);
+        let up = stacked(e, ff, d, 2.0, dtype);
+        let down = stacked(e, d, ff, 3.0, dtype);
+        let path = write_gguf(&[("gate", &gate), ("up", &up), ("down", &down)]);
+        let ring = StagingRing::shared(&m);
+        let xs = x(16, d, 0.5).to_device(&dev).unwrap();
+        let id = ids(16, topk, e, 1).to_device(&dev).unwrap();
+        // A fresh tier per arm, so every run lands the same misses.
+        let measure = |commit: bool, held: bool| -> (Vec<f32>, u64, u64) {
+            let mut t = Streamed::with_staging(
+                open(&path, "gate"),
+                open(&path, "up"),
+                open(&path, "down"),
+                6,
+                LoaderArm::Pread,
+                &dev,
+                Some(Arc::clone(&ring)),
+            )
+            .unwrap();
+            t.set_landing_gather(true);
+            t.set_landing_commit(commit);
+            dev.synchronize().unwrap();
+            let _hold = held.then(|| dev.cut_period_hold(usize::MAX));
+            profile::reset();
+            let y = run(&t, &xs, &id);
+            let commits = profile::snapshot().commits;
+            (y, commits, t.stats().landing_launches)
+        };
+        let (y_off, off, _) = measure(false, false);
+        let (y_on, on, launches) = measure(true, false);
+        let (y_held_off, held_off, _) = measure(false, true);
+        let (y_held_on, held_on, _) = measure(true, true);
+        assert!(launches > 0 && launches % 3 == 0, "{launches} launches");
+        assert!(y_off == y_on && y_off == y_held_off && y_off == y_held_on);
+        assert!(
+            on > off && on - off <= launches / 3,
+            "{on} commits with the arm, {off} without, {} landing calls",
+            launches / 3
+        );
+        assert_eq!(held_on, held_off, "a held period took the landing's commit");
         std::fs::remove_file(path).ok();
     }
 

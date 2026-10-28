@@ -238,6 +238,16 @@ pub struct Lfm2Tuning {
         invert
     )]
     pub skip_conv_c_fusion: bool,
+    /// The MLP's `silu(w1·x) · w3·x` as one elementwise launch (`silu_mul`, `silu_f16` then `bmul_f16` bit for bit) wherever the MLP's composed path runs the pair (not under `--gemv-gate mul` or the norm in the GEMVs, which keep it); off: the pair, the A/B arm. Stored as its negation.
+    #[opt(
+        flag = "skip-lfm2-silu-mul",
+        env = "LLOOM_LFM2_SKIP_SILU_MUL",
+        bool,
+        path = "kernels.fusion.silu_mul",
+        status = "arm",
+        invert
+    )]
+    pub skip_silu_mul: bool,
     /// The pool rows' kernels: `batched` (the batch in one dispatch per kernel) or `per-row` (the per-row loop, the A/B arm).
     #[opt(flag = "rows-arm", env = "LLOOM_148_ROWS_ARM", parser = "parse_rows_arm", variants = ["batched", "per-row"], path = "models.lfm2.rows_kernels", status = "arm")]
     pub rows_arm: String,
@@ -264,7 +274,7 @@ pub struct Lfm2Tuning {
     /// The weakest numerical class `kernels.fusion.policy = derived` may land in: `rounding` (the epilogues) or `reorder` (also the norm inside its consumers' GEMVs, whose sum of squares takes another tree). An arm.
     #[opt(flag = "lfm2-fusion-budget", env = "LLOOM_LFM2_FUSION_BUDGET", parser = "parse_fusion_budget", variants = ["rounding", "reorder"], path = "kernels.fusion.budget", status = "arm")]
     pub fusion_budget: String,
-    /// Skip these decode-step dispatches — `norm` (the layers' two RMSNorms) — to price what removing them would buy: a timing bound, the output is WRONG. An instrument.
+    /// Skip these dispatches — `norm` (the layers' two RMSNorms at a decode step); at a prefill pass `prefill-norm`, `prefill-silu` (the MLP's SiLU), `prefill-mul` (the SwiGLU product), `prefill-add` (the two residual adds) — to price what removing them would buy: a timing bound, the output is WRONG. An instrument.
     #[opt(
         flag = "lfm2-ablate",
         env = "LLOOM_LFM2_ABLATE",
@@ -325,6 +335,7 @@ impl Default for Lfm2Tuning {
     fn default() -> Self {
         Lfm2Tuning {
             skip_conv_c_fusion: false,
+            skip_silu_mul: false,
             rows_arm: "batched".into(),
             flash_partial_bn: 32,
             sdpa_two_pass_k: crate::nn::ops::SDPA_TWO_PASS_K_THRESHOLD,
@@ -425,6 +436,15 @@ pub struct StreamTuning {
     /// A token's settle submits every layer's loads before waiting for any (off = one layer after another, the A/B arm).
     #[opt(flag = "settle-batch", env = "QWEN4EXP_SETTLE_BATCH", bool, path = "weights.experts.settle_batch", status = "arm", facets = ["cadence"], flows = ["weights-in"])]
     pub settle_batch: bool,
+    /// The command-buffer cut period held while a tier lands the experts it loaded: each plane lands as its own copy dispatch, and at the shipping period (50) a missing pool cuts a buffer every ~17 experts. `0` = the period in force; a larger value is held for the landing (never lowering a longer one in force), and the first encode after it cuts once.
+    #[opt(flag = "landing-cut", env = "QWEN4EXP_LANDING_CUT", path = "weights.experts.landing_cut_period", status = "arm", facets = ["cadence"], flows = ["weights-in", "commands-out"])]
+    pub landing_cut: usize,
+    /// Land a group's staged experts with one copy launch per pool, its sources read through a table of GPU addresses, instead of one copy dispatch per plane (Metal; the same bytes; planes that are not whole words land one a plane).
+    #[opt(flag = "landing-gather", env = "QWEN4EXP_LANDING_GATHER", bool, path = "weights.experts.landing_gather", status = "arm", facets = ["cadence"], flows = ["weights-in", "commands-out"])]
+    pub landing_gather: bool,
+    /// After a tier lands its misses, commit the open command buffer without waiting, unless the loop holds a longer period (decode's): the GPU starts the landing and the work before it while the host reads the next group's experts.
+    #[opt(flag = "landing-commit", env = "QWEN4EXP_LANDING_COMMIT", bool, path = "weights.experts.landing_commit", status = "arm", facets = ["cadence"], flows = ["weights-in", "commands-out"])]
+    pub landing_commit: bool,
     /// Spike 0 of fetch-and-wait: `wait` = a GPU wait on an already-raised event at every device-planned layer's join point (an instrument; off = none).
     #[opt(flag = "spike0", env = "QWEN4EXP_SPIKE0", parser = "parse_spike0", variants = ["off", "wait"], path = "diagnostics.experts.spike0", status = "instrument")]
     pub spike0: String,
@@ -437,7 +457,7 @@ pub struct StreamTuning {
     /// How the fetch worker waits between looks at a layer's routing: `sleep:<dur>` (it never spins; the older spelling is the bare count of microseconds).
     #[opt(flag = "fetch-poll-us",
         env = "QWEN4EXP_FETCH_POLL_US",
-        parser = "parse_at_least_one", path = "weights.experts.fetch.wait", status = "advanced", facets = ["wait"], flows = ["weights-in"], forms = ["sleep"], from_v1 = "lloom_tensor::options::v1::fetch_wait_from", to_v1 = "lloom_tensor::options::v1::fetch_wait_to", schema = "Wait")]
+        parser = "parse_at_least_one", path = "weights.experts.fetch.wait", status = "advanced", facets = ["wait"], flows = ["weights-in"], forms = ["sleep"], from_v1 = "lloom_tensor::options::v1::fetch_wait_from", to_v1 = "lloom_tensor::options::v1::fetch_wait_to", schema = "Wait", grammar = "lloom_tensor::options::wait::FETCH_WAIT")]
     pub fetch_poll_us: usize,
     /// Fetching steps in a row that load nothing before the waits stop (the pool holds the stream again).
     #[opt(flag = "fetch-exit",
@@ -483,6 +503,9 @@ impl Default for StreamTuning {
             hint_recall: false,
             spare_slots: 0,
             settle_batch: true,
+            landing_cut: 0,
+            landing_gather: false,
+            landing_commit: false,
             spike0: "off".into(),
             trace_settle: false,
             fetch: "off".into(),
@@ -586,6 +609,9 @@ pub struct Qwen4ExpTuning {
         env = "QWEN4EXP_PREFILL_TILES",
         parser = "parse_at_least_two", path = "prefill.tiles_in_flight", status = "advanced", facets = ["lead"], flows = ["prompt-in", "commands-out"])]
     pub prefill_tiles: usize,
+    /// The served driver hands this family `prefill.tiles_in_flight` chunks a forward when its tile is the chunk, so the paired prefill runs inside one forward (off = one tile a forward, which never pairs).
+    #[opt(flag = "prefill-pair-forward", env = "QWEN4EXP_PREFILL_PAIR_FORWARD", bool, path = "prefill.pair_forward", status = "arm", facets = ["lead"], flows = ["prompt-in", "weights-in"])]
+    pub prefill_pair_forward: bool,
     /// Speculate the next layer's routing ahead: 0 (off) or 1.
     #[opt(flag = "spec-ahead", env = "QWEN4EXP_SPEC_AHEAD", parser = "parse_spec_ahead", variants = ["0", "1"], path = "weights.experts.route_ahead_layers", status = "arm", facets = ["lead"], flows = ["weights-in"])]
     pub spec_ahead: usize,
@@ -720,6 +746,7 @@ impl Default for Qwen4ExpTuning {
             prefill_chunk: 0,
             prefill_pair: crate::models::qwen4exp::DEFAULT_PREFILL_PAIR,
             prefill_tiles: crate::models::qwen4exp::DEFAULT_PREFILL_TILES,
+            prefill_pair_forward: false,
             spec_ahead: 0,
             mem_check: "refuse".into(),
             score_no_matmul: false,
@@ -759,25 +786,34 @@ pub struct RingTuning {
     /// How the host fill producer waits between tokens: `adaptive[:<dur>]` (`WFE` while a forward waits on an unfilled value, else a sleep of that long: measured fastest), `event[:<dur>]` (park, woken by the ring's publish event or a forward's demand; slower where the pool misses), or one arm throughout: `sleep[:<dur>]`, `wfe`, `spin-hint`, `spin`. The older spellings (`on-demand`, durations as bare µs) are the same arms.
     #[opt(flag = "host-feed-poll",
         env = "LLOOM_HOST_FEED_POLL",
-        parser = "parse_poll", path = "decode.host_feed.wait", status = "advanced", facets = ["wait"], flows = ["host-feed-in"], forms = ["adaptive", "event", "sleep", "wfe", "spin-hint", "spin"], from_v1 = "lloom_tensor::options::v1::feed_wait_from", to_v1 = "lloom_tensor::options::v1::feed_wait_to", schema = "Wait")]
+        parser = "parse_poll", path = "decode.host_feed.wait", status = "advanced", facets = ["wait"], flows = ["host-feed-in"], forms = ["adaptive", "event", "sleep", "wfe", "spin-hint", "spin"], from_v1 = "lloom_tensor::options::v1::feed_wait_from", to_v1 = "lloom_tensor::options::v1::feed_wait_to", schema = "Wait", grammar = "lloom_tensor::options::wait::HOST_FEED_WAIT")]
     pub feed_poll: String,
     /// Time every host fill (encoded, observed, signalled) and the producer's loop, and print a `HOSTFEED` line a run — an instrument.
     #[opt(flag = "host-feed-trace", env = "LLOOM_HOST_FEED_TRACE", bool, path = "diagnostics.trace.host_feed", status = "instrument", flows = ["host-feed-in"])]
     pub feed_trace: bool,
     /// How the fixed cadence's EOS wait learns the stamp: `inherit` (poll it, as the readback's own wait does) or `event` (park on the ring's publish event; measured 8 % slower a token on LFM2's `ring-fixed`, the event landing ~1 ms after the stamp).
-    #[opt(flag = "ring-eos-park", env = "LLOOM_RING_EOS_PARK", bool, path = "decode.ring.eos_wait", status = "arm", facets = ["wait"], flows = ["token-out"], values = ["inherit=false", "event=true"], forms = ["inherit", "event"], schema = "Wait")]
+    #[opt(flag = "ring-eos-park", env = "LLOOM_RING_EOS_PARK", bool, path = "decode.ring.eos_wait", status = "arm", facets = ["wait"], flows = ["token-out"], values = ["inherit=false", "event=true"], normalize_values, forms = ["inherit", "event"], schema = "Wait")]
     pub eos_park: bool,
     /// How DSpark's verify completion is waited for: `event` (park on an event behind the round's stamp) or `inherit` (poll the stamp, the A/B arm).
-    #[opt(flag = "verify-park", env = "LLOOM_VERIFY_PARK", bool, path = "speculative.verify_wait", status = "advanced", facets = ["wait"], flows = ["token-out"], values = ["inherit=false", "event=true"], forms = ["inherit", "event"], schema = "Wait")]
+    #[opt(flag = "verify-park", env = "LLOOM_VERIFY_PARK", bool, path = "speculative.verify_wait", status = "advanced", facets = ["wait"], flows = ["token-out"], values = ["inherit=false", "event=true"], normalize_values, forms = ["inherit", "event"], schema = "Wait")]
     pub verify_park: bool,
     /// The EOS gate on Qwen3.5 (#993's arm B): off (the family's gate is clamped off; the standing window undoes the fixed cadence's one forward past an EOS) or on (`decode.readback.eos_gate` then rides the adaptive commit: the GDN's gated decode step carries its state, the overrun taken back by its counters). An arm until its real-model gates are run.
     #[opt(flag = "qwen3-5-eos-gate", env = "LLOOM_QWEN3_5_EOS_GATE", bool, path = "models.qwen3_5.eos_gate", status = "arm", facets = ["lead"], flows = ["token-out", "commands-out"])]
     pub qwen3_5_eos_gate: bool,
+    /// The gate's cores arm on Qwen3.5 (#993 run 3): off (the gate stops the state; the quantized mat-vec cores of a forward queued past the EOS still run) or on (they return at once too, so a forward past the EOS costs its ungated kernels and the GDN's identity carry). Rides `models.qwen3_5.eos_gate`; taken only by a model whose dependency inventory admits it (`CausalLM::eos_gate_cores`). An arm until it is measured.
+    #[opt(flag = "qwen3-5-eos-gate-cores", env = "LLOOM_QWEN3_5_EOS_GATE_CORES", bool, path = "models.qwen3_5.eos_gate_cores", status = "arm", facets = ["lead"], flows = ["token-out", "commands-out"])]
+    pub qwen3_5_eos_gate_cores: bool,
     /// Whether the adaptive commit's loop watches the ring for a stop id itself (#993): off (it stops only when the reader raises the flag, so a late reader lets it run past an EOS without bound) or on (it reads what the GPU published before each step and stops at a stop id, so at most `adaptive_lead + 1` forwards run past an EOS). An arm until it is measured.
     #[opt(flag = "ring-eos-watch", env = "LLOOM_RING_EOS_WATCH", bool, path = "decode.ring.eos_watch", status = "arm", facets = ["lead"], flows = ["token-out", "commands-out"])]
     pub eos_watch: bool,
+    /// The counter cut on the batched loop's decode-only steps: `off` (the period in force, a cut every 50 dispatches), `ahead` (held off while a forward is encoded ahead of the step's readback, as `decode_until`'s step loop holds it) or `all` (held off on the blocking arm too). A step that feeds prompt pieces keeps the period. An arm until it is measured.
+    #[opt(flag = "batched-cut-hold", env = "LLOOM_BATCHED_CUT_HOLD", parser = "parse_batched_cut_hold", variants = ["off", "ahead", "all"], path = "decode.batched.cut_hold", status = "arm", facets = ["cadence"], flows = ["token-out", "commands-out"])]
+    pub batched_cut_hold: String,
 }
 
+fn parse_batched_cut_hold(v: &str) -> Result<String, String> {
+    one_of(v, "batched cut hold", &["off", "ahead", "all"])
+}
 fn parse_spawned_qos(v: &str) -> Result<String, String> {
     crate::generation::hot_thread::parse_spawned_arm(&non_empty(v)?.to_ascii_lowercase())
 }
@@ -799,7 +835,9 @@ impl Default for RingTuning {
             eos_park: false,
             verify_park: true,
             qwen3_5_eos_gate: false,
+            qwen3_5_eos_gate_cores: false,
             eos_watch: false,
+            batched_cut_hold: "off".into(),
         }
     }
 }

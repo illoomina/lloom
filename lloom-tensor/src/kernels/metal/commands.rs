@@ -1,7 +1,18 @@
+#[cfg(test)]
+#[path = "commands_cold_setup_tests.rs"]
+mod cold_setup_tests;
 #[path = "entry_guard.rs"]
 mod entry_guard;
 #[path = "commands_lifecycle.rs"]
 mod lifecycle;
+#[path = "commands_produced.rs"]
+mod produced;
+#[cfg(test)]
+#[path = "commands_produced_tests.rs"]
+mod produced_tests;
+#[cfg(test)]
+#[path = "commands_submission_test.rs"]
+pub(super) mod submission_test;
 
 use super::in_flight::{CompletedRelease, Held};
 use super::residency_set::PublishedRemovals;
@@ -14,7 +25,8 @@ use crate::kernels::metal::{
     contention::{Access, Censused, Side, SubmissionContention},
     executor::ExecutorSlot,
     BlitCommandEncoder, Buffer, CommandBuffer, ComputeCommandEncoder, ComputePipeline, Device,
-    DispatchGate, Fence, GpuClock, InFlightHold, PrevCeOutputs, ResidencySet,
+    DispatchGate, Fence, GpuClock, InFlightHold, PrevCeOutputs, ResidencyAttach,
+    ResidencyAttachment, ResidencySet,
 };
 use crate::kernels::MetalKernelError;
 use crate::retire::Epoch;
@@ -33,6 +45,7 @@ pub type CommandQueue = Retained<ProtocolObject<dyn MTLCommandQueue>>;
 use crate::tuning::DEFAULT_CANDLE_METAL_COMPUTE_PER_BUFFER;
 
 pub use crate::command_policy::CutPolicy;
+pub use produced::{HostInputArm, ProducedStats};
 
 /// Whether the queue hands out command buffers that do NOT retain the
 /// resources encoded into them (`commandBufferWithUnretainedReferences`).
@@ -91,6 +104,55 @@ fn create_command_buffer(
         CommandBufferKind::Retaining => command_queue.commandBuffer(),
     };
     raw.ok_or_else(|| MetalKernelError::FailedToCreateResource("CommandBuffer".to_string()))
+}
+
+/// Whether this queue runs on Metal 4 (`backend.metal.command_buffer.api`):
+/// `metal4` where the device has it, `auto` where it has it and the encoder
+/// counters are off, else Metal 3.
+fn select_metal4(device: &Device) -> Result<bool, MetalKernelError> {
+    let requested_api = crate::tuning::tuning().metal.command_api.as_str();
+    let supported = super::arms::for_device(device).has(super::arms::Feature::Metal4);
+    let counters = super::profile::counters_enabled();
+    if requested_api == "metal4" && counters {
+        return Err(MetalKernelError::InvalidInput(
+            "Metal 4 encoder counter sampling is not implemented; select --metal-api metal3 (or auto) to retain counter profiling".into()));
+    }
+    let supported = supported && !counters;
+    if requested_api == "auto" && counters {
+        eprintln!("[metal] command_api=metal3 auto_fallback=encoder-counter-profiling");
+    }
+    match requested_api {
+        "metal4" if !supported => Err(MetalKernelError::InvalidInput(
+            "Metal 4 is unavailable or disabled on this device; select metal3 or auto".into(),
+        )),
+        "metal4" | "auto" if supported => Ok(true),
+        _ => Ok(false),
+    }
+}
+
+/// Puts the device set on the Metal 3 queue unless `attach` detaches it
+/// ([`ResidencyAttachment::decide`]). Before the queue's first command
+/// buffer, so every buffer committed on it sees the same attachment.
+fn attach_device_set(
+    command_queue: &CommandQueue,
+    residency_set: &ResidencySet,
+    attach: ResidencyAttach,
+    metal4: bool,
+) -> ResidencyAttachment {
+    let decided = ResidencyAttachment::decide(attach, metal4);
+    // SAFETY: queue installation borrows only. The constructor transfers the
+    // SAME Arc into Core; no allAllocations extraction or out-of-band
+    // residency mutation occurs here. This is not an alias terminality proof.
+    match unsafe { residency_set.raw() } {
+        Some(_) if decided.attached => {
+            residency_set.attach_queue(command_queue);
+            decided
+        }
+        _ => ResidencyAttachment {
+            attached: false,
+            ..decided
+        },
+    }
 }
 
 /// RAII guard for compute command encoder operations.
@@ -316,6 +378,30 @@ struct CommitReceipt {
     signalled: Option<u64>,
 }
 
+/// Borrowed from the owner's exact recording while its submission transaction
+/// excludes replacement. No clone, numeric identity, or native status can mint
+/// this authority. Native preparation consumes it through CommandBuffer.
+pub(super) struct OwnerSubmission<'a> {
+    buffer: &'a CommandBuffer,
+    clock: &'a Arc<GpuClock>,
+}
+
+impl OwnerSubmission<'_> {
+    pub(super) fn authorizes(&self, buffer: &CommandBuffer) -> bool {
+        self.buffer.same_recording(buffer)
+    }
+
+    pub(super) fn authorizes_generation(
+        &self,
+        generation: &super::native_generation_bindings::GenerationBindings,
+    ) -> bool {
+        self.buffer
+            .binding_generation()
+            .is_ok_and(|exact| exact.same(generation))
+            && generation.belongs_to_clock(self.clock)
+    }
+}
+
 struct PendingBlit {
     encoder: BlitCommandEncoder,
     error: Option<MetalKernelError>,
@@ -330,6 +416,24 @@ struct EntryState {
     // Per-call lookahead bound: recovery + one explicit cut can consume TWO.
     // This is not a global generation/cardinality cap. Untracked Core keeps None.
     binding_credits: [Option<super::native_generation_bindings::PreparedGeneration>; 2],
+    /// The inputs the current recording reads that a host thread or the IO
+    /// queue has not produced yet: it is not committed until they exist.
+    gate: produced::Gate,
+    /// Recordings cut while an input they read, or one ahead of them, was
+    /// not yet produced: closed, their epochs taken, not yet committed. In
+    /// commit order (`produced.rs`).
+    held: std::collections::VecDeque<produced::Held>,
+    /// A signal was encoded into the current recording since its cut.
+    signals_since_cut: bool,
+    /// Epochs taken by held recordings that were cancelled before their
+    /// commit: the next commit's completion completes them too.
+    owed_epochs: u32,
+    /// The current recording was cancelled and no replacement was free.
+    current_abandoned: bool,
+    /// Emptied after-commit lists, their storage kept: a held recording
+    /// takes one at its cut and gives it back at its commit, so attaching an
+    /// IO buffer to held work allocates nothing (`produced::spare_after`).
+    spare_after: Vec<Vec<produced::AfterCommit>>,
 }
 
 // One acquisition can close one compute encoder and construct one replacement.
@@ -339,10 +443,20 @@ struct ClosedEncoders<'a> {
     compute: DeferredSlots<ComputeCommandEncoder, 1>,
     blit: DeferredSlots<PendingBlit, 2>,
     executor: DeferredSlots<Arc<ExecutorSlot>, 1>,
-    removals: DeferredSlots<PublishedRemovals, 1>,
-    // Last: closed wrappers can hand their fields to this same hold before
-    // its existing completed-prefix drain runs. No release occurs under state.
+    // A drain of held recordings publishes residency once, before its first
+    // commit; an ordinary commit in the same acquisition takes the other.
+    removals: DeferredSlots<PublishedRemovals, 2>,
+    // Recordings cancelled under the lock; released after it.
+    cancelled: Vec<CommandBuffer>,
+    // This acquisition published residency for a commit already.
+    residency_published: bool,
+    // After the closed wrappers: they can hand their fields to this same hold
+    // before its existing completed-prefix drain runs. No release occurs
+    // under state.
     completed_hold: Option<CompletedRelease<'a, Held>>,
+    // Last: the release a producer left to this holder, once every payload
+    // above is gone (`produced::AfterUnlock`).
+    _after_unlock: Option<produced::AfterUnlock<'a>>,
 }
 
 type EntryGuard<'a> = DeferredGuard<parking_lot::MutexGuard<'a, EntryState>, ClosedEncoders<'a>>;
@@ -356,6 +470,12 @@ impl EntryState {
             current_encoder: None,
             namespace: Default::default(),
             binding_credits: std::array::from_fn(|_| None),
+            gate: produced::Gate::default(),
+            held: std::collections::VecDeque::new(),
+            signals_since_cut: false,
+            owed_epochs: 0,
+            current_abandoned: false,
+            spare_after: Vec::new(),
         }
     }
 }
@@ -365,6 +485,16 @@ pub struct Commands {
 }
 
 struct CommandsCore {
+    #[cfg(test)]
+    submission_control: Arc<submission_test::Control>,
+    #[cfg(test)]
+    deny_replacement: AtomicBool,
+    #[cfg(test)]
+    deny_preflight: AtomicBool,
+    #[cfg(test)]
+    replacement_attempts: AtomicUsize,
+    #[cfg(test)]
+    preflight_attempts: AtomicUsize,
     // Actual control owner; neither Generation/Page C retains this bank/Core.
     binding_bank: Option<super::native_generation_bindings::BindingBank>,
     // Retain service notification custody independently of installed state and
@@ -523,6 +653,13 @@ struct CommandsCore {
     /// The first command buffer that ended in error, latched by its completion
     /// handler so every later commit and wait reports it.
     failure: Arc<CommandBufferFailure>,
+    /// How work behind a host- or IO-produced input is ordered, read once.
+    host_input: produced::HostInputArm,
+    /// Producer-side view of the held recordings (`produced.rs`).
+    produced: produced::ProducedState,
+    /// Whether the device set is on the Metal 3 queue, decided before the
+    /// queue's first command buffer (`kernels.residency.attach`).
+    residency_attachment: ResidencyAttachment,
     // LAST: native wrapper fields release before this submit-capability pin.
     physical: crate::retirement_service::PhysicalAnchor<
         crate::metal_backend::device_retirement::NamespaceOwner,
@@ -652,6 +789,9 @@ unsafe impl Send for CommandsCore {}
 unsafe impl Sync for CommandsCore {}
 
 impl Commands {
+    /// Validate library diagnostic setup before this constructor's native or
+    /// metadata effects. The caller-created raw queue remains a separate
+    /// interoperability boundary; this cannot undo its prior native creation.
     pub fn new(
         command_queue: CommandQueue,
         residency_set: Arc<ResidencySet>,
@@ -683,7 +823,9 @@ impl Commands {
             &crate::memory_admission::AllocationContext,
         )>,
     ) -> Result<Self, MetalKernelError> {
-        let tuning = &crate::tuning::tuning().metal;
+        let tuning = crate::tuning::try_tuning()
+            .map_err(|error| MetalKernelError::InvalidInput(error.to_string()))?;
+        let tuning = &tuning.metal;
         let compute_per_buffer = tuning.compute_per_buffer;
 
         // `DESIGN.md` §13.5m. Absent -- which is every run that does not opt in
@@ -699,15 +841,15 @@ impl Commands {
             _ => CutPolicy::from_env_str(&tuning.cut_policy).unwrap_or_else(|e| panic!("{e}")),
         };
 
-        // SAFETY: queue installation borrows only. This constructor transfers
-        // the SAME Arc into Core; no allAllocations extraction or out-of-band
-        // residency mutation occurs here. This is not an alias terminality proof.
-        if let Some(raw) = unsafe { residency_set.raw() } {
-            command_queue.addResidencySet(raw);
-        }
-
         let kind = CommandBufferKind::selected();
         let device = Device::new(command_queue.device());
+        let metal4 = select_metal4(&device)?;
+        let residency_attachment = attach_device_set(
+            &command_queue,
+            &residency_set,
+            ResidencyAttach::selected(),
+            metal4,
+        );
         // Accounted initial route reserves/initializes header credits before
         // creating its native CB/Slot. Preserve old raw constructor behavior.
         let cb = if binding_metadata.is_some() {
@@ -737,6 +879,8 @@ impl Commands {
             residency_set,
             kind,
             binding_metadata,
+            metal4,
+            residency_attachment,
         )
     }
 
@@ -758,6 +902,9 @@ impl Commands {
         residency_set: Arc<ResidencySet>,
         completion_wait: CompletionWait,
     ) -> Result<Self, MetalKernelError> {
+        // Validate before selected() can initialize its legacy tuning cache.
+        crate::tuning::try_tuning()
+            .map_err(|error| MetalKernelError::InvalidInput(error.to_string()))?;
         Self::new_with(
             command_queue,
             residency_set,
@@ -775,13 +922,32 @@ impl Commands {
         completion_wait: CompletionWait,
         kind: CommandBufferKind,
     ) -> Result<Self, MetalKernelError> {
-        // SAFETY: queue installation borrows only. This constructor transfers
-        // the SAME Arc into Core; no allAllocations extraction or out-of-band
-        // residency mutation occurs here. This is not an alias terminality proof.
-        if let Some(raw) = unsafe { residency_set.raw() } {
-            command_queue.addResidencySet(raw);
-        }
+        crate::tuning::try_tuning()
+            .map_err(|error| MetalKernelError::InvalidInput(error.to_string()))?;
+        Self::new_with_residency_attach(
+            command_queue,
+            residency_set,
+            completion_wait,
+            kind,
+            ResidencyAttach::selected(),
+        )
+    }
+
+    /// As [`Self::new_with`], with `kernels.residency.attach`'s arm supplied:
+    /// a test sees both arms in one process.
+    pub fn new_with_residency_attach(
+        command_queue: CommandQueue,
+        residency_set: Arc<ResidencySet>,
+        completion_wait: CompletionWait,
+        kind: CommandBufferKind,
+        attach: ResidencyAttach,
+    ) -> Result<Self, MetalKernelError> {
+        crate::tuning::try_tuning()
+            .map_err(|error| MetalKernelError::InvalidInput(error.to_string()))?;
         let device = Device::new(command_queue.device());
+        let metal4 = select_metal4(&device)?;
+        let residency_attachment =
+            attach_device_set(&command_queue, &residency_set, attach, metal4);
         let cb = create_command_buffer(&command_queue, kind)?;
         Self::with_parts(
             command_queue,
@@ -793,6 +959,8 @@ impl Commands {
             residency_set,
             kind,
             None,
+            metal4,
+            residency_attachment,
         )
     }
 
@@ -810,6 +978,8 @@ impl Commands {
             &crate::memory_admission::ModelDomain,
             &crate::memory_admission::AllocationContext,
         )>,
+        metal4: bool,
+        residency_attachment: ResidencyAttachment,
     ) -> Result<Self, MetalKernelError> {
         // The listener is allocated with the event and only for the arm that
         // needs one (#583). Its lifetime is then the engine's, which is the
@@ -822,27 +992,20 @@ impl Commands {
             None
         };
 
-        let requested_api = crate::tuning::tuning().metal.command_api.as_str();
-        let supported = super::arms::for_device(&device).has(super::arms::Feature::Metal4);
-        let counters = super::profile::counters_enabled();
-        if requested_api == "metal4" && counters {
-            return Err(MetalKernelError::InvalidInput(
-                "Metal 4 encoder counter sampling is not implemented; select --metal-api metal3 (or auto) to retain counter profiling".into()));
-        }
-        let supported = supported && !counters;
-        if requested_api == "auto" && counters {
-            eprintln!("[metal] command_api=metal3 auto_fallback=encoder-counter-profiling");
-        }
-
-        let modern_queue = match requested_api {
-            "metal4" if !supported => {
-                return Err(MetalKernelError::InvalidInput(
-                    "Metal 4 is unavailable or disabled on this device; select metal3 or auto"
-                        .into(),
-                ))
+        let modern_queue = if metal4 {
+            let queue = super::metal4::Queue::new(device.clone())?;
+            // Before the queue's first command buffer, so every buffer
+            // committed on it declares the same way.
+            let declare = queue.declare();
+            if declare.on_queue() {
+                residency_set.attach_metal4_queue(&queue.raw);
             }
-            "metal4" | "auto" if supported => Some(super::metal4::Queue::new(device.clone())?),
-            _ => None,
+            if declare.on_queue() || declare.per_command_buffer() {
+                queue.use_device_sets(Arc::clone(&residency_set));
+            }
+            Some(queue)
+        } else {
+            None
         };
         let legacy_completions = if modern_queue.is_none() {
             Some(super::metal3_retirement::Completions::new()?)
@@ -943,11 +1106,27 @@ impl Commands {
         let encoder_domain = super::encoder::EncoderDomain::new(retirement_wake.clone());
         let mut state = EntryState::new(cb);
         state.binding_credits = credits;
-        let core = Arc::new(CommandsCore {
+        state
+            .held
+            .try_reserve_exact(produced::HELD_CAP)
+            .map_err(|_| MetalKernelError::QueueUnavailable("held recording storage refused"))?;
+        produced::spare_after(&mut state.spare_after)?;
+        let host_input = produced::HostInputArm::selected()?;
+        let core = Arc::new_cyclic(|me| CommandsCore {
+            #[cfg(test)]
+            submission_control: Arc::default(),
             binding_bank,
             _retirement_wake: retirement_wake,
             encoder_domain,
             state: CachePadded::new(Censused::new(parking_lot::Mutex::new(state))),
+            #[cfg(test)]
+            deny_replacement: AtomicBool::new(false),
+            #[cfg(test)]
+            deny_preflight: AtomicBool::new(false),
+            #[cfg(test)]
+            replacement_attempts: AtomicUsize::new(0),
+            #[cfg(test)]
+            preflight_attempts: AtomicUsize::new(0),
             compute_count: CachePadded::new(AtomicUsize::new(0)),
             replacement_pending: CachePadded::new(AtomicBool::new(false)),
             command_queue,
@@ -976,6 +1155,9 @@ impl Commands {
             kind,
             hold,
             failure,
+            host_input,
+            produced: produced::ProducedState::new(me.clone()),
+            residency_attachment,
             physical: crate::retirement_service::PhysicalAnchor::default(),
         });
         let core = lifecycle::register(core)?;
@@ -1121,11 +1303,43 @@ impl Commands {
         f()
     }
 
-    /// Hold the completion subscribers' lock on the calling thread while `f`
-    /// runs, so a test can show a commit and a completion never take it.
     #[cfg(test)]
-    pub(crate) fn while_subscribers_locked<R>(&self, f: impl FnOnce() -> R) -> R {
-        self.core.hook.while_subscribers_locked(f)
+    pub(crate) fn lock_subscribers_for_test(&self) -> impl Drop + '_ {
+        self.core.hook.lock_subscribers_for_test()
+    }
+
+    /// What this queue did with the device's residency set: the arm asked
+    /// for and whether the set is on the queue (`kernels.residency.attach`).
+    pub fn residency_attachment(&self) -> ResidencyAttachment {
+        self.core.residency_attachment
+    }
+
+    /// What the Metal 4 queue's per-slot residency sets did
+    /// (`kernels.residency.slot_trace`); `None` on Metal 3 or with the
+    /// instrument off.
+    pub fn metal4_slot_residency(&self) -> Option<super::SlotResidency> {
+        self.core.modern_queue.as_ref()?.slot_residency()
+    }
+
+    /// What this queue's Metal 4 command buffers declare resident
+    /// (`kernels.residency.metal4`); `None` on Metal 3.
+    pub fn metal4_declare(&self) -> Option<super::Metal4Declare> {
+        Some(self.core.modern_queue.as_ref()?.declare())
+    }
+
+    /// The native command API actually installed on this queue.
+    /// This observes the resolved queue, not the requested tuning string.
+    pub fn actual_command_api(&self) -> &'static str {
+        if self.core.modern_queue.is_some() {
+            "metal4"
+        } else {
+            "metal3"
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn actual_command_api_for_test(&self) -> &'static str {
+        self.actual_command_api()
     }
 
     /// Install the executor that subsequent compute encoders will submit
@@ -1194,23 +1408,30 @@ impl Commands {
         &self.core.trace
     }
 
-    /// Registers `f` to run after every command buffer that completes from now
-    /// on, after the clock has marked that buffer's epoch.
+    /// Register a queue-wide observer during device setup, before sealing or
+    /// the first owner submission. Every completion reads the sealed immutable
+    /// snapshot without taking the setup lock.
     ///
-    /// Call during device setup, before any work is encoded: a subscriber
-    /// added later misses the buffers that completed before it, and a buffer
-    /// parked against one of those epochs is swept in only at a later one.
-    /// Registration publishes a new snapshot; a completion reads the current
-    /// one without a lock (`completion_hook.rs`).
-    ///
-    /// Runs on Metal's completion thread. Per CONTRIBUTING §3.3a, a callback
-    /// must not acquire a lock the encoding thread takes or submit work that
-    /// waits for that thread. In particular, native-slot backpressure can hold
-    /// the Commands state lock while feedback is responsible for returning a
-    /// slot. Keep callbacks bounded; advance a flag and drain host-owned work
-    /// on the host, as the buffer pools do.
-    pub fn on_command_buffer_complete<F: Fn() + Send + Sync + 'static>(&self, f: F) {
-        self.core.hook.subscribe(Arc::new(f));
+    /// Monitoring installed after model load must migrate to earlier device
+    /// setup. Model hot-swap never reopens this queue configuration. Model and
+    /// request notifications use per-record/request completion APIs instead.
+    /// Rejected callback ownership is returned in the error; drop it outside
+    /// producer locks. Concurrent setup registration returns setup-busy and
+    /// can be retried after the active publication finishes.
+    /// Callbacks must not acquire encoding-thread locks or
+    /// block on their own queue.
+    pub fn on_command_buffer_complete<F: Fn() + Send + Sync + 'static>(
+        &self,
+        f: F,
+    ) -> Result<(), crate::kernels::err::CompletionRegistrationError> {
+        self.core.hook.subscribe(Arc::new(f))
+    }
+
+    /// Finish queue observer setup irreversibly. Active registration returns
+    /// retryable setup-busy, without submitting work or taking an epoch.
+    /// The first owner submission also seals, for constructor compatibility.
+    pub fn seal_completion_subscribers(&self) -> Result<(), MetalKernelError> {
+        self.core.hook.seal()
     }
 
     /// The cut policy in force (`DESIGN.md` §13.5m).
@@ -1308,33 +1529,46 @@ impl Commands {
     /// Native feedback can arrive before commit_swap_locked releases EntryState.
     /// Refuse only actual same-queue blocking; available state remains usable.
     fn lock_state(&self) -> Result<EntryGuard<'_>, MetalKernelError> {
-        self.core
-            .state
-            .lock_checked(Side::Host, || {
-                if let Some(queue) = &self.core.modern_queue {
-                    crate::completion_scope::before_park(Arc::as_ptr(queue) as usize)
-                        .map_err(|_| MetalKernelError::CallbackWouldBlock)?;
-                }
-                if let Some(core) = &self.core.legacy_completions {
-                    crate::completion_scope::before_park(core.identity())
-                        .map_err(|_| MetalKernelError::CallbackWouldBlock)?;
-                }
-                Ok(())
-            })
-            .map(|guard| DeferredGuard::new(guard, ClosedEncoders::default()))
+        self.core.lock_entry()
     }
 
     fn lock_recording_state(&self) -> Result<EntryGuard<'_>, MetalKernelError> {
+        self.lock_preflight_state::<false>()
+    }
+
+    fn lock_drain_state(&self) -> Result<EntryGuard<'_>, MetalKernelError> {
+        self.core.failure.check()?;
+        if let Some(queue) = &self.core.modern_queue {
+            queue.check_failure()?;
+        }
+        if let Some(core) = &self.core.legacy_completions {
+            core.check()?;
+        }
+        self.lock_preflight_state::<true>()
+    }
+
+    fn lock_preflight_state<const DRAIN_RETAINED: bool>(
+        &self,
+    ) -> Result<EntryGuard<'_>, MetalKernelError> {
         let Some(bank) = self.core.binding_bank.as_ref() else {
             return self.lock_state();
         };
         loop {
             let state = self.lock_state()?;
-            if state.binding_credits.iter().all(Option::is_some) {
+            if (DRAIN_RETAINED && state.current.submitted().is_some())
+                || state.binding_credits.iter().all(Option::is_some)
+            {
                 return Ok(state);
             }
             drop(state);
             self.check_failed_atomic()?;
+            #[cfg(test)]
+            {
+                self.core.preflight_attempts.fetch_add(1, Ordering::Relaxed);
+                if self.core.deny_preflight.load(Ordering::Relaxed) {
+                    return Err(crate::memory_admission::AllocationError::HostAllocation.into());
+                }
+            }
             // Typed Full/refill BEFORE EntryState/native acquisition. Any
             // raced unused metadata credit drops only after the guard releases.
             let mut prepared = Some(bank.prepare_before_entry()?);
@@ -1354,7 +1588,7 @@ impl Commands {
         let flush = self.should_cut(count);
 
         if flush {
-            self.commit_swap_locked(&mut state_guard, 1)?;
+            self.cut_locked(&mut state_guard, 1)?;
         }
 
         // The per-kernel timing arm: a counter-sampled encoder per dispatch,
@@ -1477,13 +1711,14 @@ impl Commands {
                 .recording()
                 .expect("recording recovered above")
                 .signal_event(event, value)?;
-            self.commit_swap_locked(&mut state, 0)?;
+            self.cut_locked(&mut state, 0)?;
         } else {
             state
                 .current
                 .recording()
                 .expect("recording recovered above")
                 .signal_event(event, value)?;
+            state.signals_since_cut = true;
         }
         Ok(())
     }
@@ -1491,6 +1726,12 @@ impl Commands {
     /// Make every command encoded after this one on the current command
     /// buffer wait for `event` to reach `value` (the other half of
     /// [`Self::encode_signal_event`]). Ends the open compute encoder.
+    ///
+    /// For a signal the GPU produces only: a wait times out (Metal 4 then
+    /// releases the work behind it, Metal 3 fails its command buffer), and
+    /// nothing bounds a host thread or a disk read by that timeout. Work
+    /// behind a host- or IO-produced input is committed by its producer
+    /// instead ([`Self::commit_when_produced`]).
     pub fn encode_wait_for_event(
         &self,
         event: &ProtocolObject<dyn objc2_metal::MTLSharedEvent>,
@@ -1500,7 +1741,7 @@ impl Commands {
         self.ensure_recording_locked(&mut state)?;
         self.core.close_compute(&mut state)?;
         if self.core.modern_queue.is_some() {
-            self.commit_swap_locked(&mut state, 0)?;
+            self.cut_locked(&mut state, 0)?;
         }
         state
             .current
@@ -1517,7 +1758,7 @@ impl Commands {
         let flush = self.should_cut(count);
 
         if flush {
-            self.commit_swap_locked(&mut state_guard, 1)?;
+            self.cut_locked(&mut state_guard, 1)?;
         }
 
         // End compute encoder before starting blit.
@@ -1561,23 +1802,36 @@ impl Commands {
         self.flush_and_wait()
     }
 
+    /// Drain a retained successful submission without refilling metadata or
+    /// allocating its replacement. Ordinary recording cuts retain swap policy.
     pub fn flush_and_wait(&self) -> Result<(), MetalKernelError> {
-        let (to_wait, retained_current, commit_error) = {
-            let mut state = self.lock_recording_state()?;
+        let (to_wait, retained_current, held_last, commit_error) = {
+            let mut state = self.lock_drain_state()?;
             let commit_error = if state.current.submitted().is_none()
-                && self.core.compute_count.load(Ordering::Acquire) > 0
+                && (self.core.compute_count.load(Ordering::Acquire) > 0 || state.signals_since_cut)
             {
-                self.commit_swap_locked(&mut state, 0).err()
+                self.cut_locked(&mut state, 0).err()
             } else {
                 None
             };
             let retained = state.current.submitted().map(|(cb, _)| cb.clone());
-            (std::mem::take(&mut state.in_flight), retained, commit_error)
+            let held_last = state.held.back().map(|held| held.cb.clone());
+            (
+                std::mem::take(&mut state.in_flight),
+                retained,
+                held_last,
+                commit_error,
+            )
         };
-        // The retained current is newer than every in-flight record. Waiting
-        // it needs no allocation and remains possible after replacement fails.
-        if let Some(last) = retained_current.as_ref().or_else(|| to_wait.last()) {
-            Self::ensure_completed(last)?;
+        // A held recording is newer than everything committed, and the
+        // retained current newer than every in-flight record. Waiting either
+        // needs no allocation and remains possible after replacement fails.
+        if let Some(last) = held_last
+            .as_ref()
+            .or(retained_current.as_ref())
+            .or_else(|| to_wait.last())
+        {
+            self.ensure_completed(last)?;
         }
         // Check earlier CBs for errors (no need to block — they're already done).
         for cb in &to_wait {
@@ -1613,6 +1867,8 @@ impl Commands {
     /// Commit the current command buffer and wait on that specific buffer, for CPU readbacks.
     /// [`Self::wait_until_completed`] waits on the last in-flight buffer, which a concurrent
     /// `flush_and_wait` on another thread may already have taken, returning before our work ran.
+    /// After replacement refusal, retry waits on the retained receipt and its
+    /// original signal; replacement remains the next recording producer's job.
     ///
     /// **This is the per-token serialization point** (`DESIGN.md` §11.5a: 441
     /// µs/token, 2.43 % of a step) and therefore the one call routed through
@@ -1622,9 +1878,13 @@ impl Commands {
     /// path blocks.
     pub fn flush_and_wait_current(&self) -> Result<(), MetalKernelError> {
         let (cb, signalled) = {
-            let mut state = self.lock_recording_state()?;
-            let signalled = self.commit_swap_locked(&mut state, 0)?;
-            (state.in_flight.last().cloned(), signalled)
+            let mut state = self.lock_drain_state()?;
+            if let Some((cb, receipt)) = state.current.submitted() {
+                (Some(cb.clone()), receipt.signalled)
+            } else {
+                let signalled = self.cut_locked(&mut state, 0)?;
+                (Self::last_cut(&state).cloned(), signalled)
+            }
         };
         if let Some(cb) = cb {
             // The seam. On the default arm this is `waitUntilCompleted` and the
@@ -1635,7 +1895,7 @@ impl Commands {
             // never saw, and surfacing an `Error` status -- are kept on both
             // arms, because a dropped error presents as wrong output rather than
             // as a failure (§3.5).
-            let outcome = Self::ensure_completed_via(
+            let outcome = self.ensure_completed_via(
                 &cb,
                 self.core.completion_wait,
                 self.core.completion_event.as_ref(),
@@ -1667,10 +1927,10 @@ impl Commands {
     /// sequence's queued work.
     pub fn flush_marker(&self) -> Result<CommandMarker, MetalKernelError> {
         let mut state = self.lock_recording_state()?;
-        let signalled = self.commit_swap_locked(&mut state, 0)?;
-        let cb = state.in_flight.last().cloned().ok_or_else(|| {
+        let signalled = self.cut_locked(&mut state, 0)?;
+        let cb = Self::last_cut(&state).cloned().ok_or_else(|| {
             MetalKernelError::CommandBufferError(
-                "flush_marker: commit_swap_locked left no buffer in flight".to_string(),
+                "flush_marker: the cut left no buffer in flight or held".to_string(),
             )
         })?;
         Ok(CommandMarker { cb, signalled })
@@ -1698,18 +1958,20 @@ impl Commands {
         if !recovering && self.core.compute_count.load(Ordering::Acquire) == 0 {
             return Ok(None);
         }
-        let incomplete = state
-            .in_flight
-            .iter()
-            .filter(|cb| cb.status() != MTLCommandBufferStatus::Completed)
-            .count();
+        // A held recording is queued work the GPU has yet to run.
+        let incomplete = state.held.len()
+            + state
+                .in_flight
+                .iter()
+                .filter(|cb| cb.status() != MTLCommandBufferStatus::Completed)
+                .count();
         if !recovering && incomplete > 1 {
             return Ok(None);
         }
-        let signalled = self.commit_swap_locked(&mut state, 0)?;
-        let cb = state.in_flight.last().cloned().ok_or_else(|| {
+        let signalled = self.cut_locked(&mut state, 0)?;
+        let cb = Self::last_cut(&state).cloned().ok_or_else(|| {
             MetalKernelError::CommandBufferError(
-                "flush_marker_if_started: commit_swap_locked left no buffer in flight".to_string(),
+                "flush_marker_if_started: the cut left no buffer in flight or held".to_string(),
             )
         })?;
         Ok(Some(CommandMarker { cb, signalled }))
@@ -1744,7 +2006,7 @@ impl Commands {
     /// Same completion seam and counters as [`Self::flush_and_wait_current`];
     /// only the buffer waited on differs.
     pub fn wait_marker(&self, marker: &CommandMarker) -> Result<(), MetalKernelError> {
-        let outcome = Self::ensure_completed_via(
+        let outcome = self.ensure_completed_via(
             &marker.cb,
             self.core.completion_wait,
             self.core.completion_event.as_ref(),
@@ -1789,6 +2051,10 @@ impl Commands {
                 "marker belongs to another queue",
             ));
         }
+        // A marker of a held recording: submitted once its producer is.
+        if marker.cb.status().0 < MTLCommandBufferStatus::Committed.0 {
+            self.recover_pending_submission(&marker.cb)?;
+        }
         marker.cb.try_wait_prefix_data_ready()?;
         self.core.failure.check()?;
         let mut state = self.lock_state()?;
@@ -1799,8 +2065,9 @@ impl Commands {
         let mut state = self.lock_recording_state()?;
         if state.current.submitted().is_some()
             || self.core.compute_count.load(Ordering::Acquire) > 0
+            || state.signals_since_cut
         {
-            self.commit_swap_locked(&mut state, 0)?;
+            self.cut_locked(&mut state, 0)?;
         }
         Ok(())
     }
@@ -1836,8 +2103,9 @@ impl Commands {
         let mut state = self.lock_recording_state()?;
         if state.current.submitted().is_some()
             || self.core.compute_count.load(Ordering::Acquire) > 0
+            || state.signals_since_cut
         {
-            self.commit_swap_locked(&mut state, 0)?;
+            self.cut_locked(&mut state, 0)?;
         }
         // Errors are surfaced here rather than swallowed: without a blocking
         // readback on this path, this is the only place a failed command buffer
@@ -1848,7 +2116,7 @@ impl Commands {
         if let Some(t) = timed {
             crate::kernels::metal::profile::record_prune(t.elapsed());
         }
-        Ok(state.in_flight.len())
+        Ok(state.in_flight.len() + state.held.len())
     }
 
     /// How many command buffers are in flight, **without committing, pruning or
@@ -1979,10 +2247,10 @@ impl Commands {
         // candidate declared BEFORE guard: every refusal releases guard before
         // cancellation/Drop of unused prepared native Submission/Slot custody.
         let mut state = self.lock_state()?;
-        if !state
+        if state
             .current
             .submitted()
-            .is_some_and(|(current, _)| current.identity() == old.identity())
+            .is_none_or(|(current, _)| current.identity() != old.identity())
         {
             return Err(MetalKernelError::QueueUnavailable(
                 "bound recovery receipt changed",
@@ -2004,16 +2272,37 @@ impl Commands {
         &self,
         prepared: Option<super::native_generation_bindings::PreparedGeneration>,
     ) -> Result<CommandBuffer, MetalKernelError> {
+        self.create_replacement_parking(prepared, &mut |ready, seen| {
+            ready.wait(seen);
+            Ok(())
+        })
+    }
+
+    /// As [`Self::create_replacement`], running `park` whenever a Metal 4
+    /// queue has no free slot (`metal4::Queue::acquire_with`).
+    fn create_replacement_parking(
+        &self,
+        prepared: Option<super::native_generation_bindings::PreparedGeneration>,
+        park: &mut dyn FnMut(&crate::completion_wake::Wake, usize) -> Result<(), MetalKernelError>,
+    ) -> Result<CommandBuffer, MetalKernelError> {
+        #[cfg(test)]
+        {
+            self.core
+                .replacement_attempts
+                .fetch_add(1, Ordering::Relaxed);
+            if self.core.deny_replacement.load(Ordering::Relaxed) {
+                return Err(crate::memory_admission::AllocationError::HostAllocation.into());
+            }
+        }
         if self.core.binding_bank.is_some() && prepared.is_none() {
             return Err(MetalKernelError::QueueUnavailable(
                 "bound replacement lacks preflight credit",
             ));
         }
         match &self.core.modern_queue {
-            Some(queue) => Ok(CommandBuffer::from_metal4(match prepared {
-                Some(prepared) => queue.acquire_bound(prepared)?,
-                None => queue.acquire()?,
-            })),
+            Some(queue) => Ok(CommandBuffer::from_metal4(
+                queue.acquire_with(prepared, park)?,
+            )),
             None => {
                 // Counted owner refusal precedes raw CB creation. Never create
                 // an unregistered native resource and then drop it on EntryState
@@ -2048,8 +2337,14 @@ impl Commands {
     }
 
     /// Recovery precedes every recording operation, not just a policy cut.
-    fn ensure_recording_locked(&self, state: &mut EntryGuard<'_>) -> Result<(), MetalKernelError> {
+    fn ensure_recording_locked<'a>(
+        &'a self,
+        state: &mut EntryGuard<'a>,
+    ) -> Result<(), MetalKernelError> {
         self.core.close_pending_blit(state)?;
+        if state.current_abandoned {
+            self.replace_abandoned_locked(state)?;
+        }
         let state = &mut **state;
         let credit = state.binding_credits.iter_mut().find(|slot| slot.is_some());
         let mut absent = None;
@@ -2126,8 +2421,8 @@ impl Commands {
     /// surfacing an `Error` -- is identical on every arm and only the wait
     /// differs, which is the property that makes this a seam rather than a
     /// fork.
-    fn ensure_completed(cb: &CommandBuffer) -> Result<(), MetalKernelError> {
-        let result = Self::ensure_completed_via(cb, CompletionWait::Synchronize, None, None);
+    fn ensure_completed(&self, cb: &CommandBuffer) -> Result<(), MetalKernelError> {
+        let result = self.ensure_completed_via(cb, CompletionWait::Synchronize, None, None);
         // Full drain joins callbacks, even a native terminal error. Failed
         // admission/unknown handoff is not a quiescence proof.
         if result.is_ok()
@@ -2165,6 +2460,7 @@ impl Commands {
     /// asserted: `SharedEventSleep` was added exactly that way and touches this
     /// function not at all.
     fn ensure_completed_via(
+        &self,
         cb: &CommandBuffer,
         arm: CompletionWait,
         event: Option<&SharedEvent>,
@@ -2173,17 +2469,10 @@ impl Commands {
         let mut outcome = WaitOutcome::default();
         match cb.status() {
             MTLCommandBufferStatus::NotEnqueued | MTLCommandBufferStatus::Enqueued => {
-                // This path commits a buffer that `commit_swap_locked` never saw,
-                // so it needs its own registration or its GPU time goes unrecorded.
-                //
-                // **And it carries no signal**, because the signal is encoded in
-                // `commit_swap_locked` and this buffer bypassed it. Passing
-                // `None` here is what routes it to the blocking wait, which is
-                // the fail-safe direction: a poll for a value nothing will
-                // publish is a hang.
-                let prepared = cb.prepare_commit()?;
-                prepared.record_gpu_time_on_completion()?;
-                prepared.commit()?;
+                // Authenticate under owner state and submit without replacing:
+                // waiting on valid recorded work must not allocate a new slot.
+                let recovered = self.recover_pending_submission(cb)?;
+                outcome = arm.wait_for(cb, event, recovered)?;
                 cb.try_wait_data_ready()?;
             }
             MTLCommandBufferStatus::Committed | MTLCommandBufferStatus::Scheduled => {
@@ -2220,6 +2509,102 @@ impl Commands {
         }
 
         Ok(outcome)
+    }
+
+    /// Submit `cb` if it is the owner's unsubmitted current recording, or
+    /// wait — submitting whatever producers release meanwhile — while it, or
+    /// a recording ahead of it, is held for an input not yet produced.
+    fn recover_pending_submission(
+        &self,
+        cb: &CommandBuffer,
+    ) -> Result<Option<u64>, MetalKernelError> {
+        loop {
+            let seen = self.core.produced.wake.snapshot();
+            if let Some(submitted) = self.try_recover_pending_submission(cb)? {
+                return Ok(submitted);
+            }
+            self.core.failure.check()?;
+            self.core.refuse_park_in_callback()?;
+            self.core.produced.wake.wait(seen);
+        }
+    }
+
+    /// One look of [`Self::recover_pending_submission`]: `None` while `cb`
+    /// is held.
+    fn try_recover_pending_submission(
+        &self,
+        cb: &CommandBuffer,
+    ) -> Result<Option<Option<u64>>, MetalKernelError> {
+        let mut state = self.lock_state()?;
+        loop {
+            if !state.held.is_empty()
+                || !state.gate.is_empty()
+                || self.core.produced_cancel_pending()
+            {
+                self.core.release_produced_locked(&mut state)?;
+            }
+            if state.held.iter().any(|held| held.cb.same_recording(cb)) {
+                return Ok(None);
+            }
+            if !state.current_abandoned
+                && state
+                    .current
+                    .recording()
+                    .is_some_and(|current| current.same_recording(cb))
+            {
+                if !(state.held.is_empty() && state.gate.is_open()) {
+                    return Ok(None);
+                }
+                // The gate's look, then the flag: a cancellation asked for
+                // before the event moved is applied before this commit.
+                std::sync::atomic::fence(Ordering::SeqCst);
+                if self.core.produced_cancel_pending() {
+                    continue;
+                }
+                if !state.gate.is_empty() {
+                    state.gate = produced::Gate::default();
+                    self.core.held_live_update(&state);
+                }
+                return self
+                    .core
+                    .commit_current_locked(&mut state, None)
+                    .map(|receipt| Some(receipt.signalled));
+            }
+            return self.recover_unheld_locked(&mut state, cb).map(Some);
+        }
+    }
+
+    fn recover_unheld_locked(
+        &self,
+        state: &mut EntryGuard<'_>,
+        cb: &CommandBuffer,
+    ) -> Result<Option<u64>, MetalKernelError> {
+        if let Some((current, receipt)) = state.current.submitted() {
+            if current.same_recording(cb) {
+                return Ok(receipt.signalled);
+            }
+        }
+        // Current moves a predecessor to in_flight only after submit_once
+        // retained its receipt. It cannot contain unsubmitted owner work.
+        if state
+            .in_flight
+            .iter()
+            .any(|submitted| submitted.same_recording(cb))
+        {
+            return Ok(None);
+        }
+        // A producer may have submitted, replaced and pruned this target
+        // between the caller's status read and this lock. Waiting submitted
+        // data needs no new authority and uses the blocking fallback if its
+        // original signal receipt has already left owner state.
+        if cb.status().0 >= MTLCommandBufferStatus::Committed.0 {
+            return Ok(None);
+        }
+        // Held for an input that was never produced, then cancelled.
+        if cb.abandoned() {
+            return Err(self.core.produced.cancelled_error());
+        }
+        Err(MetalKernelError::OwnerSubmissionRequired)
     }
 
     fn cb_error(cb: &CommandBuffer) -> MetalKernelError {
@@ -2321,6 +2706,42 @@ impl Drop for CloseUnwind<'_> {
 }
 
 impl CommandsCore {
+    /// The state lock, refused inside one of this queue's own completion
+    /// callbacks (`completion_scope`).
+    fn lock_entry(&self) -> Result<EntryGuard<'_>, MetalKernelError> {
+        self.state
+            .lock_checked(Side::Host, || self.refuse_park_in_callback())
+            .map(|guard| {
+                let custody = ClosedEncoders {
+                    _after_unlock: Some(produced::AfterUnlock(self)),
+                    ..ClosedEncoders::default()
+                };
+                DeferredGuard::new(guard, custody)
+            })
+    }
+
+    /// The state lock when it is free, for a producer's release: its caller
+    /// runs what producers left pending itself (`produced::release_pending`).
+    fn try_lock_entry_unhooked(&self) -> Option<EntryGuard<'_>> {
+        self.state
+            .try_lock()
+            .map(|guard| DeferredGuard::new(guard, ClosedEncoders::default()))
+    }
+
+    /// A park on this queue from one of its own completion callbacks would
+    /// wait on itself.
+    fn refuse_park_in_callback(&self) -> Result<(), MetalKernelError> {
+        if let Some(queue) = &self.modern_queue {
+            crate::completion_scope::before_park(Arc::as_ptr(queue) as usize)
+                .map_err(|_| MetalKernelError::CallbackWouldBlock)?;
+        }
+        if let Some(core) = &self.legacy_completions {
+            crate::completion_scope::before_park(core.identity())
+                .map_err(|_| MetalKernelError::CallbackWouldBlock)?;
+        }
+        Ok(())
+    }
+
     fn close_compute(&self, state: &mut EntryGuard<'_>) -> Result<(), MetalKernelError> {
         let (state, custody) = state.parts_mut();
         if let Some(encoder) = state.current_encoder.as_ref() {
@@ -2377,11 +2798,15 @@ impl CommandsCore {
         state: &mut EntryGuard<'_>,
         timed: Option<std::time::Instant>,
     ) -> Result<CommitReceipt, MetalKernelError> {
+        self.hook.seal()?;
         self.close_pending_blit(state)?;
         self.close_compute(state)?;
         let t_end_enc = timed.map(|t| t.elapsed());
         let (state, custody) = state.parts_mut();
-        state
+        let state: &mut EntryState = state;
+        let owed_epochs = &mut state.owed_epochs;
+        let mut published = false;
+        let submitted = state
             .current
             .submit_marked(&self.replacement_pending, |cb| {
                 self.failure.check()?;
@@ -2394,15 +2819,94 @@ impl CommandsCore {
                         .removals
                         .reserve()
                         .ok_or(MetalKernelError::QueueUnavailable(
-                            "published residency custody bound (1) exhausted",
+                            "published residency custody bound (2) exhausted",
                         ))?;
-                let prepared = cb.prepare_commit()?;
-                let (_, removed) = self.residency_set.commit_pending_extracted();
-                *destination = Some(removed);
-                let t_residency = timed.map(|t| t.elapsed());
-                self.submit_prepared(prepared, timed, t_end_enc, t_residency)
+                let authority = OwnerSubmission {
+                    buffer: cb,
+                    clock: &self.clock,
+                };
+                // Epochs of held recordings cancelled before their commit
+                // complete with this one (`produced.rs`).
+                let owed = std::mem::take(owed_epochs);
+                let receipt = self.submit_owned_recording(
+                    authority,
+                    Some(destination),
+                    false,
+                    timed,
+                    t_end_enc,
+                    None,
+                    1 + owed,
+                );
+                match &receipt {
+                    Ok(_) => published = true,
+                    Err(_) => *owed_epochs += owed,
+                }
+                receipt
             })
-            .copied()
+            .copied();
+        custody.residency_published |= published;
+        submitted
+    }
+
+    /// Exact owner authority and retained removal custody are the prerequisites
+    /// for every ordinary, final, or defensive owner submission. This body is
+    /// independent of replacement and cannot manufacture an owner from a queue.
+    ///
+    /// `reserved` is the epoch a held recording took at its cut
+    /// (`produced.rs`); `None` takes the next one now. `hook_runs` is the
+    /// number of epochs the commit's completion completes. `removals` is
+    /// `None` when this acquisition already published residency, after every
+    /// allocation the recording reads.
+    #[allow(clippy::too_many_arguments)]
+    fn submit_owned_recording(
+        &self,
+        authority: OwnerSubmission<'_>,
+        removals: Option<&mut Option<PublishedRemovals>>,
+        nonblocking: bool,
+        timed: Option<std::time::Instant>,
+        t_end_enc: Option<std::time::Duration>,
+        reserved: Option<Epoch>,
+        hook_runs: u32,
+    ) -> Result<CommitReceipt, MetalKernelError> {
+        if !Arc::ptr_eq(authority.clock, &self.clock) {
+            return Err(MetalKernelError::OwnerSubmissionRequired);
+        }
+        self.failure.check()?;
+        self.check_recording_status(authority.buffer)?;
+        self.hook.seal()?;
+        if removals.as_ref().is_some_and(|slot| slot.is_some()) {
+            return Err(MetalKernelError::QueueUnavailable(
+                "residency custody already staged",
+            ));
+        }
+        let prepared = authority
+            .buffer
+            .prepare_owned_commit(authority, nonblocking)?;
+        #[cfg(test)]
+        let prepared = {
+            let mut prepared = prepared;
+            prepared.test_submission_control(self.submission_control.clone());
+            prepared
+        };
+        if let Some(removals) = removals {
+            let (_, removed) = if nonblocking {
+                self.residency_set
+                    .try_commit_pending_extracted()
+                    .map_err(|_| {
+                        MetalKernelError::RecordingAdmission(
+                            crate::command_lifecycle::LifecycleError::Busy,
+                        )
+                    })?
+            } else {
+                self.residency_set.commit_pending_extracted()
+            };
+            *removals = Some(removed);
+        }
+        #[cfg(test)]
+        self.submission_control
+            .observe_residency(self.residency_set.counters().commits);
+        let t_residency = timed.map(|t| t.elapsed());
+        self.submit_prepared(prepared, timed, t_end_enc, t_residency, reserved, hook_runs)
     }
 
     fn check_recording_status(&self, cb: &CommandBuffer) -> Result<(), MetalKernelError> {
@@ -2434,7 +2938,11 @@ impl CommandsCore {
         timed: Option<std::time::Instant>,
         t_end_enc: Option<std::time::Duration>,
         t_residency: Option<std::time::Duration>,
+        reserved: Option<Epoch>,
+        hook_runs: u32,
     ) -> Result<CommitReceipt, MetalKernelError> {
+        #[cfg(test)]
+        self.submission_control.registration()?;
         let signalled = self
             .completion_wait
             .encode_prepared_signal(&prepared, self.completion_event.as_ref())?;
@@ -2442,11 +2950,20 @@ impl CommandsCore {
             self.completion_signals.fetch_add(1, Ordering::Relaxed);
         }
         crate::kernels::metal::trace::note_command_buffer();
-        prepared.run_completion_hook()?;
+        prepared.run_completion_hook(hook_runs)?;
         prepared.record_gpu_time_on_completion()?;
-        let epoch = self.clock.commit_epoch();
-        prepared.stage_binding_epoch(epoch)?;
-        prepared.commit()?;
+        let epoch = match reserved {
+            Some(epoch) => epoch,
+            None => self.clock.commit_epoch(),
+        };
+        prepared.stage_binding_epoch(epoch).inspect_err(|_| {
+            self.failure
+                .record_static("owner epoch staging refused; queue failed");
+        })?;
+        prepared.commit().inspect_err(|_| {
+            self.failure
+                .record_static("owner native handoff refused; queue failed");
+        })?;
         if let (Some(a), Some(b), Some(c)) = (t_end_enc, t_residency, timed.map(|t| t.elapsed())) {
             crate::kernels::metal::profile::record_commit_parts(a, b - a, c - b);
         }
@@ -2718,6 +3235,11 @@ impl lifecycle::FinalCore for CommandsCore {
         captures: &mut lifecycle::FinalCaptures,
     ) -> Result<bool, MetalKernelError> {
         self.failure.check()?;
+        match self.hook.seal() {
+            Ok(()) => {}
+            Err(MetalKernelError::SubscriberSetupBusy) => return Ok(false),
+            Err(error) => return Err(error),
+        }
         if self.encoder_domain.has_external_handles() {
             return Ok(false);
         }
@@ -2754,31 +3276,34 @@ impl lifecycle::FinalCore for CommandsCore {
             }
             // Do NOT take/drop the canonical encoder under EntryState.
         }
+        // Held work whose producer is gone runs as recorded, in order, ahead
+        // of the final submission: nothing is left to observe its input, and
+        // its epochs complete the clock the final prefix waits on.
+        if !self.release_held_for_teardown(&mut state, &mut captures.removals)? {
+            return Ok(false);
+        }
+        let owed = std::mem::take(&mut state.owed_epochs);
+        let removals = if captures.removals.is_none() {
+            Some(&mut captures.removals)
+        } else {
+            None
+        };
         let submitted = state
             .current
             .submit_marked(&self.replacement_pending, |cb| {
                 self.failure.check()?;
                 self.check_recording_status(cb)?;
                 // Busy returns before residency/epoch/event/callback side effects.
-                let prepared = cb.try_prepare_commit()?;
-                if captures.removals.is_some() {
-                    return Err(MetalKernelError::QueueUnavailable(
-                        "final residency custody already staged",
-                    ));
-                }
-                let (_, removals) =
-                    self.residency_set
-                        .try_commit_pending_extracted()
-                        .map_err(|_| {
-                            MetalKernelError::RecordingAdmission(
-                                crate::command_lifecycle::LifecycleError::Busy,
-                            )
-                        })?;
-                // Empty C was staged before entering this method. Even an unwind
-                // after this transfer leaves the opaque raw+charge payload rooted.
-                captures.removals = Some(removals);
-                self.submit_prepared(prepared, None, None, None)
-            });
+                let authority = OwnerSubmission {
+                    buffer: cb,
+                    clock: &self.clock,
+                };
+                self.submit_owned_recording(authority, removals, true, None, None, None, 1 + owed)
+            })
+            .map(|_| ());
+        if submitted.is_err() {
+            state.owed_epochs += owed;
+        }
         match submitted {
             Ok(_) => Ok(true),
             Err(MetalKernelError::RecordingAdmission(
@@ -3027,5 +3552,1082 @@ mod entry_release_tests {
         drop(CompletedRelease::new(&held, clock.completed_count()));
         assert_eq!(*drops.borrow(), ["eligible", "later", "last"]);
         assert!(held.lock().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod owner_submission_tests {
+    use super::*;
+    use crate::backend::BackendDevice;
+    use objc2_metal::{MTLDevice, MTLSharedEvent};
+
+    struct ReleaseBeforeWait<R: FnMut(), W: FnMut()> {
+        release: R,
+        wait: W,
+    }
+    impl<R: FnMut(), W: FnMut()> Drop for ReleaseBeforeWait<R, W> {
+        fn drop(&mut self) {
+            (self.release)();
+            (self.wait)();
+        }
+    }
+
+    /// Exceptional handoff tests cannot infer terminality from an error.
+    /// Retain independent fixture pins even if an assertion itself unwinds.
+    struct RetainUnknown<T>(Option<T>);
+    impl<T> RetainUnknown<T> {
+        fn release(mut self) {
+            drop(self.0.take());
+        }
+    }
+    impl<T> Drop for RetainUnknown<T> {
+        fn drop(&mut self) {
+            std::mem::forget(self.0.take());
+        }
+    }
+
+    #[test]
+    fn unused_owner_preparation_cancels_without_epoch_and_can_retry() {
+        let device = crate::MetalDevice::new(0).unwrap();
+        let commands = device.commands();
+        let cb = pending(commands);
+        for _ in 0..2 {
+            let authority = OwnerSubmission {
+                buffer: &cb,
+                clock: &commands.core.clock,
+            };
+            drop(cb.prepare_owned_commit(authority, false).unwrap());
+            assert_eq!(commands.clock().current_epoch().0, 0);
+            assert_eq!(cb.status(), MTLCommandBufferStatus::NotEnqueued);
+        }
+        commands.ensure_completed(&cb).unwrap();
+        assert_eq!(commands.clock().current_epoch().0, 1);
+        assert_eq!(commands.clock().completed_count().0, 1);
+    }
+
+    #[test]
+    fn registration_refusal_before_epoch_preserves_owner_retry() {
+        let device = crate::MetalDevice::new(0).unwrap();
+        let commands = device.commands();
+        let cb = pending(commands);
+        let raw = device
+            .metal_device()
+            .new_buffer(4096, super::super::MTLResourceOptions::StorageModeShared)
+            .unwrap();
+        let pins = RetainUnknown(Some((device.clone(), cb.clone(), raw.clone())));
+        {
+            let mut blit = commands.blit_command_encoder().unwrap();
+            // SAFETY: independent pins survive any refusal/assertion unwind.
+            unsafe { blit.fill_buffer(&raw, (0, 4096), 0x6a) };
+        }
+        let callbacks = Arc::new(AtomicUsize::new(0));
+        let observed = callbacks.clone();
+        cb.on_completion(move || {
+            observed.fetch_add(1, Ordering::Relaxed);
+        })
+        .unwrap();
+        let control = &commands.core.submission_control;
+        control.arm(submission_test::Fault::Registration);
+        assert!(matches!(
+            commands.recover_pending_submission(&cb),
+            Err(MetalKernelError::QueueUnavailable(
+                "injected completion registration refusal"
+            ))
+        ));
+        assert_eq!(commands.clock().current_epoch().0, 0);
+        assert_eq!(commands.completion_counts().0, 0);
+        assert_eq!(control.native_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(callbacks.load(Ordering::Relaxed), 0);
+        assert!(commands.check_failed().is_ok());
+        commands.ensure_completed(&cb).unwrap();
+        assert_eq!(commands.clock().current_epoch().0, 1);
+        assert_eq!(commands.clock().completed_count().0, 1);
+        assert_eq!(control.native_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(callbacks.load(Ordering::Relaxed), 1);
+        // SAFETY: successful exact owner/native join completed this write.
+        let bytes = unsafe { std::slice::from_raw_parts(raw.contents(), 4096) };
+        assert!(bytes.iter().all(|byte| *byte == 0x6a));
+        pins.release();
+    }
+
+    #[test]
+    fn residency_prerequisite_callsite_precedes_epoch_and_native_entry() {
+        let device = crate::MetalDevice::new(0).unwrap();
+        let commands = device.commands();
+        let cb = pending(commands);
+        let raw = device
+            .metal_device()
+            .new_buffer(4096, super::super::MTLResourceOptions::StorageModeShared)
+            .unwrap();
+        let pins = RetainUnknown(Some((device.clone(), cb.clone(), raw.clone())));
+        let baseline = commands.core.residency_set.counters().commits;
+        commands
+            .core
+            .submission_control
+            .require_residency_after(baseline);
+        assert_eq!(commands.core.residency_set.add(&raw), 1);
+        {
+            let mut blit = commands.blit_command_encoder().unwrap();
+            // SAFETY: independent raw owners survive refusal/assertion unwind.
+            unsafe { blit.fill_buffer(&raw, (0, 4096), 0x68) };
+        }
+        let result = commands.ensure_completed(&cb);
+        if matches!(
+            &result,
+            Err(MetalKernelError::QueueUnavailable(
+                "owner residency prerequisite absent before epoch"
+            ))
+        ) {
+            assert_eq!(commands.clock().current_epoch().0, 0);
+            assert_eq!(
+                commands
+                    .core
+                    .submission_control
+                    .native_calls
+                    .load(Ordering::Relaxed),
+                0
+            );
+            eprintln!(
+                "RESIDENCY_PREREQUISITE_REFUSAL epoch=0 native_calls=0 custody_retained=true"
+            );
+        }
+        result.expect("owner residency prerequisite must precede native entry");
+        assert!(commands.core.residency_set.counters().commits > baseline);
+        assert_eq!(commands.clock().current_epoch().0, 1);
+        assert_eq!(commands.clock().completed_count().0, 1);
+        // SAFETY: successful native join proves these actual writes complete.
+        // This is not inferred from the call-site counter above.
+        let bytes = unsafe { std::slice::from_raw_parts(raw.contents(), 4096) };
+        assert!(bytes.iter().all(|byte| *byte == 0x68));
+        pins.release();
+    }
+
+    #[test]
+    fn known_before_entry_refusal_fails_epoch_without_native_completion_or_retry() {
+        let device = crate::MetalDevice::new(0).unwrap();
+        let commands = device.commands();
+        let cb = pending(commands);
+        // The failure/cancellation protocol retains custody. This fixture does
+        // not substitute status==Committed for actual native entry/terminality.
+        let _pins = RetainUnknown(Some((device.clone(), cb.clone())));
+        let control = &commands.core.submission_control;
+        control.arm(submission_test::Fault::BeforeEntry);
+        assert!(matches!(
+            commands.recover_pending_submission(&cb),
+            Err(MetalKernelError::QueueUnavailable(
+                "injected known-before-entry refusal"
+            ))
+        ));
+        assert_eq!(control.entry_checks.load(Ordering::Relaxed), 1);
+        assert_eq!(control.native_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(commands.clock().current_epoch().0, 1);
+        assert_eq!(commands.clock().completed_count().0, 0);
+        assert!(commands.check_failed().is_err());
+        assert!(commands.recover_pending_submission(&cb).is_err());
+        assert_eq!(commands.clock().current_epoch().0, 1);
+        assert_eq!(control.native_calls.load(Ordering::Relaxed), 0);
+        eprintln!("KNOWN_PRE_ENTRY epoch=1 native_calls=0 completed=0 retry_refused=true custody_retained=true");
+    }
+
+    /// The raw call returns, but the owner never publishes returned handoff.
+    /// This is a logical unknown-return fault, not a fabricated driver error.
+    #[test]
+    fn metal3_unknown_return_retains_custody_without_synthetic_completion() {
+        let device = crate::MetalDevice::new(0).unwrap();
+        let commands = device.commands();
+        let cb = pending(commands);
+        if cb.is_metal4() {
+            eprintln!(
+                "NOT_APPLICABLE unknown-return fixture requires actual Metal 3; actual_api=metal4"
+            );
+            // Ordinary empty owner only: no fault or host wait was armed.
+            commands.ensure_completed(&cb).unwrap();
+            return;
+        }
+        let raw = device
+            .metal_device()
+            .new_buffer(4096, super::super::MTLResourceOptions::StorageModeShared)
+            .unwrap();
+        let gate = device.metal_device().as_ref().newSharedEvent().unwrap();
+        let observer = device.metal_device().as_ref().newSharedEvent().unwrap();
+        // Independent owners are rooted before the first possible native wait.
+        // Unknown logical return is never used to release these pins.
+        let _pins = RetainUnknown(Some((
+            device.clone(),
+            cb.clone(),
+            raw.clone(),
+            gate.clone(),
+            observer.clone(),
+        )));
+        let release = ReleaseBeforeWait {
+            release: || gate.setSignaledValue(1),
+            wait: || {}, // No join/drain/native wait while the gate is held.
+        };
+        assert_eq!(gate.signaledValue(), 0);
+        assert_eq!(observer.signaledValue(), 0);
+        let runs = Arc::new(AtomicUsize::new(0));
+        let observed = runs.clone();
+        commands
+            .on_command_buffer_complete(move || {
+                observed.fetch_add(1, Ordering::Relaxed);
+            })
+            .unwrap();
+        commands.encode_wait_for_event(&gate, 1).unwrap();
+        {
+            let mut blit = commands.blit_command_encoder().unwrap();
+            // SAFETY: independent pins survive every refusal/assertion/unwind.
+            unsafe { blit.fill_buffer(&raw, (0, 4096), 0x73) };
+        }
+        cb.signal_event(&observer, 1).unwrap();
+        let control = &commands.core.submission_control;
+        control.arm(submission_test::Fault::UnknownReturn);
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            commands.recover_pending_submission(&cb)
+        }))
+        .expect_err("unknown return fault must unwind at the exact seam");
+        assert_eq!(
+            panic.downcast_ref::<&str>(),
+            Some(&"controlled unknown return publication")
+        );
+        assert_eq!(control.native_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(commands.clock().current_epoch().0, 1);
+        assert_eq!(commands.clock().completed_count().0, 0);
+        assert_eq!(runs.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            observer.signaledValue(),
+            0,
+            "host gate did not hold native work"
+        );
+        let core = commands.core.legacy_completions.as_ref().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while core.check().is_ok() && std::time::Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert!(
+            core.check().is_err(),
+            "unknown M3 handoff did not fail its queue"
+        );
+        assert!(commands.recover_pending_submission(&cb).is_err());
+        assert_eq!(control.native_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(commands.clock().current_epoch().0, 1);
+        // Release BEFORE any observation that waits for native progress. This
+        // guard also releases on every earlier assertion/error/unwind.
+        drop(release);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while observer.signaledValue() < 1 && std::time::Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert_eq!(
+            observer.signaledValue(),
+            1,
+            "independent M3 observer did not fire"
+        );
+        // SAFETY: actual tail signal proves the earlier fill completed. It is
+        // NOT returned-handoff/logical-terminal/reuse/refund/cleanup authority.
+        let bytes = unsafe { std::slice::from_raw_parts(raw.contents(), 4096) };
+        assert!(bytes.iter().all(|byte| *byte == 0x73));
+        assert_eq!(commands.clock().completed_count().0, 0);
+        assert_eq!(runs.load(Ordering::Relaxed), 0);
+        eprintln!("M3_UNKNOWN_RETURN actual_api=metal3 native_calls=1 epoch=1 completed=0 observer=1 bytes=0x73 custody_retained=true");
+        // No full logical wait or owner cleanup; _pins deliberately retains.
+    }
+
+    /// Pin the cached-Current receipt branch itself: Completed-status routing
+    /// in ensure_completed would otherwise skip this defensive owner branch.
+    #[test]
+    fn cached_current_recovery_returns_receipt_without_attempting_resubmission() {
+        let device = crate::MetalDevice::new(0).unwrap();
+        let commands = device.commands();
+        let cb = pending(commands);
+        let raw = device
+            .metal_device()
+            .new_buffer(4096, super::super::MTLResourceOptions::StorageModeShared)
+            .unwrap();
+        let pins = RetainUnknown(Some((device.clone(), cb.clone(), raw.clone())));
+        let runs = Arc::new(AtomicUsize::new(0));
+        let observed = runs.clone();
+        commands
+            .on_command_buffer_complete(move || {
+                observed.fetch_add(1, Ordering::Relaxed);
+            })
+            .unwrap();
+        let callbacks = Arc::new(AtomicUsize::new(0));
+        let observed = callbacks.clone();
+        cb.on_completion(move || {
+            observed.fetch_add(1, Ordering::Relaxed);
+        })
+        .unwrap();
+        let residency_before = commands.core.residency_set.counters().commits;
+        // This counter counts dirty native publications, not owner calls.
+        // Stage genuine residency before expecting one publication.
+        assert_eq!(commands.core.residency_set.add(&raw), 1);
+        {
+            let mut blit = commands.blit_command_encoder().unwrap();
+            // SAFETY: independent raw pins survive until actual joined work.
+            unsafe { blit.fill_buffer(&raw, (0, 4096), 0x74) };
+        }
+        commands.ensure_completed(&cb).unwrap();
+        let residency_submitted = commands.core.residency_set.counters().commits;
+        // Initial work is genuinely joined before any mutant assertion. No
+        // held host event, background worker or physical second commit exists.
+        let bytes = unsafe { std::slice::from_raw_parts(raw.contents(), 4096) };
+        let correct_bytes = bytes.iter().all(|byte| *byte == 0x74);
+        let (epoch, signalled) = {
+            let state = commands.lock_state().unwrap();
+            let (current, receipt) = state.current.submitted().unwrap();
+            assert!(current.same_recording(&cb));
+            (receipt.epoch, receipt.signalled)
+        };
+        let factories = (
+            commands.core.preflight_attempts.load(Ordering::Relaxed),
+            commands.core.replacement_attempts.load(Ordering::Relaxed),
+        );
+        commands.core.deny_preflight.store(true, Ordering::Relaxed);
+        commands
+            .core
+            .deny_replacement
+            .store(true, Ordering::Relaxed);
+        let first = commands.recover_pending_submission(&cb);
+        let second = commands.recover_pending_submission(&cb);
+        let after = (
+            commands.core.preflight_attempts.load(Ordering::Relaxed),
+            commands.core.replacement_attempts.load(Ordering::Relaxed),
+        );
+        pins.release(); // The original native work/callbacks were joined above.
+        if first.is_err() || second.is_err() {
+            eprintln!(
+                "CACHED_RECOVERY_REFUSAL native_calls={} epoch={} hook={} callback={} first={first:?} second={second:?}",
+                commands.core.submission_control.native_calls.load(Ordering::Relaxed),
+                commands.clock().current_epoch().0,
+                runs.load(Ordering::Relaxed),
+                callbacks.load(Ordering::Relaxed),
+            );
+        }
+        assert!(
+            first.is_ok_and(|value| value == signalled)
+                && second.is_ok_and(|value| value == signalled),
+            "cached owner recovery attempted resubmission instead of returning retained receipt"
+        );
+        assert!(correct_bytes);
+        assert_eq!(commands.clock().current_epoch().0, 1);
+        assert_eq!(commands.clock().completed_count().0, 1);
+        assert_eq!(runs.load(Ordering::Relaxed), 1);
+        assert_eq!(callbacks.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            commands
+                .core
+                .submission_control
+                .native_calls
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(residency_submitted, residency_before + 1);
+        assert_eq!(
+            commands.core.residency_set.counters().commits,
+            residency_submitted,
+            "cached receipt recovery republished residency"
+        );
+        assert_eq!(after, factories, "receipt recovery invoked a slot factory");
+        let state = commands.lock_state().unwrap();
+        let (current, receipt) = state.current.submitted().unwrap();
+        assert!(current.same_recording(&cb));
+        assert_eq!(receipt.epoch, epoch);
+        assert_eq!(receipt.signalled, signalled);
+        assert!(state.in_flight.is_empty());
+        eprintln!("CACHED_RECOVERY actual_api={} native_calls=1 epoch=1 hook=1 callback=1 bytes=0x74 retained_receipt=true new_factory_calls=0", commands.actual_command_api_for_test());
+    }
+
+    #[test]
+    fn callback_reentry_before_return_publication_refuses_to_block() {
+        let device = crate::MetalDevice::new(0).unwrap();
+        let commands = device.commands();
+        let cb = pending(commands);
+        let callback_result = Arc::new(AtomicUsize::new(0));
+        let observed = callback_result.clone();
+        let owner = commands.clone();
+        cb.on_completion(move || {
+            let result = owner.flush_and_wait_current();
+            observed.store(
+                match result {
+                    Err(MetalKernelError::CallbackWouldBlock) => 1,
+                    Err(_) => 2,
+                    Ok(()) => 3,
+                },
+                Ordering::Release,
+            );
+        })
+        .unwrap();
+        let control = commands.core.submission_control.clone();
+        let pins = RetainUnknown(Some((device.clone(), cb.clone())));
+        control.arm(submission_test::Fault::HoldReturn);
+        let join = std::cell::RefCell::new(None::<std::thread::JoinHandle<_>>);
+        let result = std::cell::RefCell::new(None);
+        // Armed before spawn/any barrier wait. Every assertion/error releases
+        // publication before joining the worker; no GPU event wait is encoded.
+        let cleanup = ReleaseBeforeWait {
+            release: || control.release(),
+            wait: || {
+                if let Some(handle) = join.borrow_mut().take() {
+                    *result.borrow_mut() = Some(handle.join());
+                }
+            },
+        };
+        let owner = commands.clone();
+        let target = cb.clone();
+        *join.borrow_mut() = Some(std::thread::spawn(move || owner.ensure_completed(&target)));
+        let paused = control.wait_for_pause();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while callback_result.load(Ordering::Acquire) == 0 && std::time::Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        let before_release = callback_result.load(Ordering::Acquire);
+        drop(cleanup);
+        result.into_inner().unwrap().unwrap().unwrap();
+        assert!(paused, "native return boundary did not engage");
+        assert_eq!(
+            before_release, 1,
+            "callback reentry blocked or bypassed refusal"
+        );
+        assert_eq!(control.native_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(commands.clock().current_epoch().0, 1);
+        assert_eq!(commands.clock().completed_count().0, 1);
+        pins.release();
+    }
+
+    #[test]
+    fn metal4_partial_prefix_observes_native_progress_without_logical_completion() {
+        let device = crate::MetalDevice::new(0).unwrap();
+        let commands = device.commands();
+        let cb = pending(commands);
+        if !cb.is_metal4() {
+            eprintln!("NOT_APPLICABLE partial-prefix fixture requires actual Metal 4");
+            commands.ensure_completed(&cb).unwrap();
+            return;
+        }
+        let first = device
+            .metal_device()
+            .new_buffer(4096, super::super::MTLResourceOptions::StorageModeShared)
+            .unwrap();
+        let second = device
+            .metal_device()
+            .new_buffer(4096, super::super::MTLResourceOptions::StorageModeShared)
+            .unwrap();
+        let boundary = device.metal_device().as_ref().newSharedEvent().unwrap();
+        let observer = device.metal_device().as_ref().newSharedEvent().unwrap();
+        // Armed before encoding too: a failed encoder operation may unwind
+        // into final submission, so raw interop owners cannot disappear first.
+        let _pins = RetainUnknown(Some((
+            device.clone(),
+            cb.clone(),
+            first.clone(),
+            second.clone(),
+            boundary.clone(),
+            observer.clone(),
+        )));
+        // No wait/event/fence dependency can point into an unissued segment:
+        // pristine queue, first raw fill, then signal-only split, second fill.
+        // The independent observer is queued directly after native prefix entry.
+        {
+            let mut blit = commands.blit_command_encoder().unwrap();
+            // SAFETY: independent pins below survive unknown handoff and unwind.
+            unsafe { blit.fill_buffer(&first, (0, 4096), 0x71) };
+        }
+        cb.signal_event(&boundary, 7).unwrap();
+        {
+            let mut blit = commands.blit_command_encoder().unwrap();
+            // SAFETY: same retained independent owners; this segment never enters.
+            unsafe { blit.fill_buffer(&second, (0, 4096), 0x72) };
+        }
+        let control = &commands.core.submission_control;
+        control.install_observer(observer.clone());
+        control.arm(submission_test::Fault::PartialEntry);
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            commands.recover_pending_submission(&cb)
+        }))
+        .expect_err("partial native entry must unwind at the exact seam");
+        assert_eq!(
+            panic.downcast_ref::<&str>(),
+            Some(&"controlled partial native handoff")
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while observer.signaledValue() < 1 && std::time::Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert_eq!(
+            observer.signaledValue(),
+            1,
+            "independent native prefix observer did not fire"
+        );
+        assert_eq!(control.native_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(commands.clock().current_epoch().0, 1);
+        assert_eq!(commands.clock().completed_count().0, 0);
+        assert!(commands
+            .core
+            .modern_queue
+            .as_ref()
+            .unwrap()
+            .check_failure()
+            .is_err());
+        assert!(commands.recover_pending_submission(&cb).is_err());
+        assert_eq!(control.native_calls.load(Ordering::Relaxed), 1);
+        // SAFETY: independent native event AFTER the issued prefix proves its
+        // actual writes done. It does not prove whole-record terminality/reuse.
+        let bytes = unsafe { std::slice::from_raw_parts(first.contents(), 4096) };
+        assert!(bytes.iter().all(|byte| *byte == 0x71));
+        eprintln!("PARTIAL_PREFIX actual_api=metal4 native_calls=1 prefix_event=1 bytes=0x71 completed=0 custody_retained=true");
+    }
+
+    #[test]
+    fn host_gate_cleanup_releases_before_wait_on_unwind() {
+        let released = AtomicBool::new(false);
+        let observed = AtomicBool::new(false);
+        let calls = AtomicUsize::new(0);
+        let panic = std::panic::catch_unwind(|| {
+            let _guard = ReleaseBeforeWait {
+                release: || released.store(true, Ordering::Relaxed),
+                wait: || {
+                    observed.store(released.load(Ordering::Relaxed), Ordering::Relaxed);
+                    calls.fetch_add(1, Ordering::Relaxed);
+                },
+            };
+            panic!("controlled host-gate fixture unwind");
+        });
+        assert!(panic.is_err());
+        assert!(
+            observed.load(Ordering::Relaxed),
+            "wait preceded host gate release"
+        );
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+    }
+
+    fn pending(commands: &Commands) -> CommandBuffer {
+        let actual_api = if commands.core.modern_queue.is_some() {
+            "metal4"
+        } else {
+            "metal3"
+        };
+        let tuning = &crate::tuning::tuning().metal;
+        if tuning.command_api != "auto" {
+            assert_eq!(actual_api, tuning.command_api);
+        }
+        if let Ok(requested) = std::env::var("LLOOM_METAL_API") {
+            if requested != "auto" {
+                assert_eq!(actual_api, requested);
+            }
+        }
+        let arm = commands.completion_wait();
+        assert_eq!(
+            arm,
+            CompletionWait::from_str_arm(&tuning.completion_wait).unwrap()
+        );
+        if let Ok(requested) = std::env::var("CANDLE_METAL_COMPLETION_WAIT") {
+            assert_eq!(arm, CompletionWait::from_str_arm(&requested).unwrap());
+        }
+        assert_eq!(commands.completion_event_present(), arm.needs_event());
+        let buffer = commands
+            .lock_state()
+            .unwrap()
+            .current
+            .recording()
+            .unwrap()
+            .clone();
+        assert_eq!(buffer.is_metal4(), commands.core.modern_queue.is_some());
+        eprintln!(
+            "OWNER_SUBMISSION_ARM requested_api={} actual_api={actual_api} resolved_wait={} event={}",
+            tuning.command_api, arm.name(), commands.completion_event_present()
+        );
+        buffer
+    }
+
+    #[test]
+    fn low_level_bound_preparation_requires_owner_authority() {
+        let device = crate::MetalDevice::new(0).unwrap();
+        let commands = device.commands();
+        let cb = pending(commands);
+        let result = cb.test_direct_native_prepare();
+        let status = cb.status();
+        let epoch = commands.clock().current_epoch().0;
+        // Drain before asserting so a deliberate capability mutant cannot
+        // leave pending native custody to unwind-only fixture cleanup.
+        commands.ensure_completed(&cb).unwrap();
+        assert!(
+            matches!(result, Err(MetalKernelError::OwnerSubmissionRequired)),
+            "low-level preparation bypassed owner authority"
+        );
+        assert_eq!(status, MTLCommandBufferStatus::NotEnqueued);
+        assert_eq!(epoch, 0);
+    }
+
+    #[test]
+    fn bound_public_and_native_refusal_preserve_work_for_owner_recovery() {
+        let device = crate::MetalDevice::new(0).unwrap();
+        let commands = device.commands();
+        let runs = Arc::new(AtomicUsize::new(0));
+        let observer = runs.clone();
+        commands
+            .on_command_buffer_complete(move || {
+                observer.fetch_add(1, Ordering::Relaxed);
+            })
+            .unwrap();
+        let cb = pending(commands);
+        let callbacks = Arc::new(AtomicUsize::new(0));
+        let callback = callbacks.clone();
+        cb.on_completion(move || {
+            callback.fetch_add(1, Ordering::Relaxed);
+        })
+        .unwrap();
+        let raw = device
+            .metal_device()
+            .new_buffer(4096, super::super::MTLResourceOptions::StorageModeShared)
+            .unwrap();
+        assert_eq!(commands.core.residency_set.add(&raw), 1);
+        {
+            let mut blit = commands.blit_command_encoder().unwrap();
+            // SAFETY: the test retains raw storage until its actual owner wait.
+            unsafe {
+                blit.fill_buffer(&raw, (0, 4096), 0x5a);
+            }
+        }
+        let status = cb.status();
+        let epoch = commands.clock().current_epoch();
+        let signals = commands.core.completion_signals.load(Ordering::Relaxed);
+        let residency_commits = commands.core.residency_set.counters().commits;
+        assert!(matches!(
+            cb.commit(),
+            Err(MetalKernelError::OwnerSubmissionRequired)
+        ));
+        assert!(matches!(
+            cb.test_direct_native_commit(),
+            Err(MetalKernelError::OwnerSubmissionRequired)
+        ));
+        assert!(matches!(
+            cb.test_direct_native_prepare(),
+            Err(MetalKernelError::OwnerSubmissionRequired)
+        ));
+        assert!(matches!(
+            cb.prepare_commit(),
+            Err(MetalKernelError::OwnerSubmissionRequired)
+        ));
+        assert_eq!(cb.status(), status);
+        assert_eq!(
+            commands.core.residency_set.counters().commits,
+            residency_commits
+        );
+        assert_eq!(commands.clock().current_epoch(), epoch);
+        assert_eq!(
+            commands.core.completion_signals.load(Ordering::Relaxed),
+            signals
+        );
+        assert_eq!(runs.load(Ordering::Relaxed), 0);
+        assert_eq!(callbacks.load(Ordering::Relaxed), 0);
+        commands.ensure_completed(&cb).unwrap();
+        commands.ensure_completed(&cb).unwrap();
+        assert_eq!(
+            commands.clock().current_epoch().0,
+            epoch.0 + 1,
+            "owner recovery must take exactly one epoch"
+        );
+        assert_eq!(
+            runs.load(Ordering::Relaxed),
+            1,
+            "owner completion hook must run once"
+        );
+        assert_eq!(callbacks.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            commands.core.residency_set.counters().commits,
+            residency_commits + 1
+        );
+        let consumed = OwnerSubmission {
+            buffer: &cb,
+            clock: &commands.core.clock,
+        };
+        assert!(
+            cb.prepare_owned_commit(consumed, false).is_err(),
+            "a submitted recording reopened"
+        );
+        assert_eq!(commands.clock().current_epoch().0, epoch.0 + 1);
+        let state = commands.lock_state().unwrap();
+        assert!(state.current.submitted().unwrap().0.same_recording(&cb));
+        assert!(
+            state.in_flight.is_empty(),
+            "recovery allocated a replacement"
+        );
+        drop(state);
+        // SAFETY: owner recovery joined this exact buffer's native work.
+        let data = unsafe { std::slice::from_raw_parts(raw.contents().cast::<u8>(), 4096) };
+        assert!(data.iter().all(|byte| *byte == 0x5a));
+        assert!(matches!(
+            commands
+                .on_command_buffer_complete(|| {})
+                .unwrap_err()
+                .cause(),
+            MetalKernelError::SubscriberConfigurationSealed
+        ));
+    }
+
+    #[test]
+    fn foreign_owner_and_wrong_recording_capabilities_refuse_before_preparation() {
+        let a = crate::MetalDevice::new(0).unwrap();
+        let b = crate::MetalDevice::new(0).unwrap();
+        let cb = pending(a.commands());
+        let other = pending(b.commands());
+        let authority = OwnerSubmission {
+            buffer: &other,
+            clock: &b.commands().core.clock,
+        };
+        assert!(matches!(
+            cb.prepare_owned_commit(authority, false),
+            Err(MetalKernelError::OwnerSubmissionRequired)
+        ));
+        assert!(matches!(
+            b.commands().recover_pending_submission(&cb),
+            Err(MetalKernelError::OwnerSubmissionRequired)
+        ));
+        let wrong_clock = OwnerSubmission {
+            buffer: &cb,
+            clock: &b.commands().core.clock,
+        };
+        assert!(matches!(
+            cb.prepare_owned_commit(wrong_clock, false),
+            Err(MetalKernelError::OwnerSubmissionRequired)
+        ));
+        assert_eq!(cb.status(), MTLCommandBufferStatus::NotEnqueued);
+        assert_eq!(a.commands().clock().current_epoch().0, 0);
+        assert_eq!(b.commands().clock().current_epoch().0, 0);
+        a.commands().ensure_completed(&cb).unwrap();
+    }
+
+    #[test]
+    fn publication_busy_refuses_owner_submission_before_an_epoch_then_recovers() {
+        let device = crate::MetalDevice::new(0).unwrap();
+        let commands = device.commands();
+        let cb = pending(commands);
+        commands.core.hook.while_registration_held(|| {
+            assert!(matches!(
+                commands.recover_pending_submission(&cb),
+                Err(MetalKernelError::SubscriberSetupBusy)
+            ));
+            assert_eq!(commands.clock().current_epoch().0, 0);
+            assert_eq!(cb.status(), MTLCommandBufferStatus::NotEnqueued);
+            assert!(commands.check_failed().is_ok());
+        });
+        commands.on_command_buffer_complete(|| {}).unwrap();
+        commands.ensure_completed(&cb).unwrap();
+        assert_eq!(commands.clock().current_epoch().0, 1);
+    }
+
+    #[test]
+    fn final_worker_uses_the_same_transaction_and_keeps_its_receipt() {
+        use lifecycle::FinalCore;
+        let device = crate::MetalDevice::new(0).unwrap();
+        let commands = device.commands();
+        let cb = pending(commands);
+        let raw = device
+            .metal_device()
+            .new_buffer(4096, super::super::MTLResourceOptions::StorageModeShared)
+            .unwrap();
+        let pins = RetainUnknown(Some((device.clone(), cb.clone(), raw.clone())));
+        {
+            let mut blit = commands.blit_command_encoder().unwrap();
+            // SAFETY: raw has independent owners until actual terminal join.
+            unsafe { blit.fill_buffer(&raw, (0, 4096), 0x69) };
+        }
+        let mut captures = lifecycle::FinalCaptures::default();
+        assert!(commands.core.poll_final_submission(&mut captures).unwrap());
+        assert!(commands.core.poll_final_submission(&mut captures).unwrap());
+        commands.ensure_completed(&cb).unwrap();
+        assert_eq!(commands.clock().current_epoch().0, 1);
+        assert!(commands.core.poll_final_terminality().unwrap());
+        assert!(commands
+            .lock_state()
+            .unwrap()
+            .current
+            .submitted()
+            .unwrap()
+            .0
+            .same_recording(&cb));
+        drop(captures);
+        // SAFETY: final owner submit was joined above, not inferred from poll.
+        let bytes = unsafe { std::slice::from_raw_parts(raw.contents(), 4096) };
+        assert!(bytes.iter().all(|byte| *byte == 0x69));
+        pins.release();
+    }
+
+    #[test]
+    fn standalone_raw_interoperability_remains_submittable() {
+        let device = Device::system_default().unwrap();
+        let queue = device.new_command_queue().unwrap();
+        // SAFETY: fresh retaining Apple command buffer, imported once, with
+        // no encoded resources or external raw aliases. This family performs
+        // the immediate explicit commit and completion wait below.
+        let cb = unsafe {
+            CommandBuffer::new(create_command_buffer(&queue, CommandBufferKind::Retaining).unwrap())
+        };
+        cb.commit().unwrap();
+        cb.try_wait_until_completed().unwrap();
+        assert_eq!(cb.status(), MTLCommandBufferStatus::Completed);
+        if crate::tuning::tuning().metal.command_api == "metal4" {
+            let queue = super::super::metal4::Queue::new(device).unwrap();
+            let submission = queue.acquire().unwrap();
+            submission.commit().unwrap();
+            submission.try_wait().unwrap();
+            assert_eq!(submission.status(), MTLCommandBufferStatus::Completed);
+        }
+    }
+
+    #[test]
+    fn multiple_event_segments_are_one_owner_epoch_and_one_hook() {
+        let device = crate::MetalDevice::new(0).unwrap();
+        let commands = device.commands();
+        let runs = Arc::new(AtomicUsize::new(0));
+        let observed = runs.clone();
+        commands
+            .on_command_buffer_complete(move || {
+                observed.fetch_add(1, Ordering::Relaxed);
+            })
+            .unwrap();
+        let cb = pending(commands);
+        let event = device.metal_device().as_ref().newSharedEvent().unwrap();
+        cb.signal_event(&event, 1).unwrap();
+        cb.signal_event(&event, 2).unwrap();
+        commands.ensure_completed(&cb).unwrap();
+        assert_eq!(event.signaledValue(), 2);
+        assert_eq!(commands.clock().current_epoch().0, 1);
+        assert_eq!(commands.clock().completed_count().0, 1);
+        assert_eq!(runs.load(Ordering::Relaxed), 1);
+    }
+
+    fn retained_public_drain_after_allocation_refusal(
+        current_only: bool,
+        force_unwind: bool,
+        cleanup_observation: Option<&AtomicBool>,
+    ) {
+        let device = crate::MetalDevice::new(0).unwrap();
+        let commands = device.commands();
+        let actual_api = if commands.core.modern_queue.is_some() {
+            "metal4"
+        } else {
+            "metal3"
+        };
+        let requested = &crate::tuning::tuning().metal;
+        if requested.command_api != "auto" {
+            assert_eq!(actual_api, requested.command_api);
+        }
+        let arm = commands.completion_wait();
+        assert_eq!(
+            arm,
+            CompletionWait::from_str_arm(&requested.completion_wait).unwrap()
+        );
+        if let Ok(selected) = std::env::var("LLOOM_METAL_API") {
+            if selected != "auto" {
+                assert_eq!(actual_api, selected);
+            }
+        }
+        if let Ok(selected) = std::env::var("CANDLE_METAL_COMPLETION_WAIT") {
+            assert_eq!(arm, CompletionWait::from_str_arm(&selected).unwrap());
+        }
+        assert_eq!(commands.completion_event_present(), arm.needs_event());
+        eprintln!(
+            "OWNER_DRAIN_ARM actual_api={actual_api} resolved_wait={} event={} current_only={current_only} force_unwind={force_unwind}",
+            arm.name(),
+            commands.completion_event_present()
+        );
+        let cb = pending(commands);
+        let runs = Arc::new(AtomicUsize::new(0));
+        let observer = runs.clone();
+        commands
+            .on_command_buffer_complete(move || {
+                observer.fetch_add(1, Ordering::Relaxed);
+            })
+            .unwrap();
+        let callbacks = Arc::new(AtomicUsize::new(0));
+        let callback = callbacks.clone();
+        cb.on_completion(move || {
+            callback.fetch_add(1, Ordering::Relaxed);
+        })
+        .unwrap();
+        let raw = device
+            .metal_device()
+            .new_buffer(4096, super::super::MTLResourceOptions::StorageModeShared)
+            .unwrap();
+        let gate = device.metal_device().as_ref().newSharedEvent().unwrap();
+        let release_gate = gate.clone();
+        let mut pins = Some((raw.clone(), gate.clone()));
+        let cleanup_cb = &cb;
+        let cleanup_commands = &**commands;
+        let cleanup_done = Arc::new(AtomicBool::new(false));
+        let cleaned = cleanup_done.clone();
+        let cleanup = ReleaseBeforeWait {
+            release: move || release_gate.setSignaledValue(1),
+            wait: move || {
+                let drained = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    cleanup_commands.ensure_completed(cleanup_cb)
+                }));
+                if matches!(drained, Ok(Ok(()))) {
+                    cleaned.store(true, Ordering::Relaxed);
+                    drop(pins.take());
+                } else {
+                    // Unknown cleanup is not terminality. Keep independent raw
+                    // interoperability and event owners through quarantine.
+                    std::mem::forget(pins.take());
+                    eprintln!("fixture cleanup refused; raw/event owners retained");
+                }
+            },
+        };
+        cb.wait_for_event(&gate, 1).unwrap();
+        {
+            let mut blit = commands.blit_command_encoder().unwrap();
+            // SAFETY: raw remains owned until the exact native wait below,
+            // including the assertion-failure cleanup path.
+            unsafe {
+                blit.fill_buffer(&raw, (0, 4096), 0x6b);
+            }
+        }
+        let exercised = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            commands
+                .core
+                .deny_replacement
+                .store(true, Ordering::Relaxed);
+            let error = commands
+                .flush()
+                .expect_err("replacement allocation must be refused after handoff");
+            assert!(matches!(
+                error,
+                MetalKernelError::Allocation(
+                    crate::memory_admission::AllocationError::HostAllocation
+                )
+            ));
+            let signalled = commands
+                .lock_state()
+                .unwrap()
+                .current
+                .submitted()
+                .expect("handoff retained original receipt")
+                .1
+                .signalled;
+            assert_eq!(signalled.is_some(), arm.needs_event());
+            assert_eq!(commands.completion_counts().0, u64::from(arm.needs_event()));
+            eprintln!("OWNER_DRAIN_HANDOFF encoded_signal={signalled:?} epoch=1");
+            if force_unwind {
+                panic!("controlled post-handoff pending-work fixture unwind");
+            }
+            let (receipt, unused) = {
+                let mut state = commands.lock_state().unwrap();
+                let (submitted, receipt) = state
+                    .current
+                    .submitted()
+                    .expect("successful handoff retained its receipt");
+                assert!(submitted.same_recording(&cb));
+                let receipt = *receipt;
+                let unused: [_; 2] = std::array::from_fn(|i| state.binding_credits[i].take());
+                (receipt, unused)
+            };
+            drop(unused);
+            commands.core.deny_preflight.store(true, Ordering::Relaxed);
+            assert!(matches!(
+                commands.lock_recording_state(),
+                Err(MetalKernelError::Allocation(
+                    crate::memory_admission::AllocationError::HostAllocation
+                ))
+            ));
+            let replacements = commands.core.replacement_attempts.load(Ordering::Relaxed);
+            let preflights = commands.core.preflight_attempts.load(Ordering::Relaxed);
+            assert_eq!(replacements, 1);
+            assert_eq!(preflights, 1);
+            assert_eq!(commands.clock().current_epoch().0, 1);
+            assert!(
+                !cb.data_ready(),
+                "the host gate must hold actual pending work"
+            );
+            assert_eq!(runs.load(Ordering::Relaxed), 0);
+            assert_eq!(callbacks.load(Ordering::Relaxed), 0);
+            let owner = commands.clone();
+            let waiter = std::thread::spawn(move || {
+                if current_only {
+                    owner.flush_and_wait_current()
+                } else {
+                    owner.flush_and_wait()
+                }
+            });
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            let blocked = !waiter.is_finished();
+            gate.setSignaledValue(1);
+            waiter
+                .join()
+                .unwrap()
+                .expect("public retained receipt drain must not allocate or replace");
+            assert!(
+                blocked,
+                "public drain returned before controlled pending work completed"
+            );
+            // Readback waits promise data/error, not arbitrary callback return.
+            cb.try_wait_until_completed().unwrap();
+            let (signals, polls) = commands.completion_counts();
+            if current_only && arm.polls() {
+                assert!(polls > 0, "current readback did not engage its polling arm");
+            }
+            if !current_only {
+                assert_eq!(polls, 0, "full public drain must retain blocking route");
+            }
+            eprintln!(
+                "OWNER_DRAIN_READBACK actual_api={actual_api} resolved_wait={} current_only={current_only} signals={signals} polls={polls} already_complete={}",
+                arm.name(), commands.completion_already_complete()
+            );
+            assert_eq!(
+                commands.core.replacement_attempts.load(Ordering::Relaxed),
+                replacements
+            );
+            assert_eq!(
+                commands.core.preflight_attempts.load(Ordering::Relaxed),
+                preflights
+            );
+            assert_eq!(commands.clock().current_epoch().0, 1);
+            assert_eq!(runs.load(Ordering::Relaxed), 1);
+            assert_eq!(callbacks.load(Ordering::Relaxed), 1);
+            let state = commands.lock_state().unwrap();
+            let (submitted, retained) = state.current.submitted().unwrap();
+            assert!(submitted.same_recording(&cb));
+            assert_eq!(retained.epoch, receipt.epoch);
+            assert_eq!(retained.signalled, receipt.signalled);
+            assert!(state.in_flight.is_empty());
+            drop(state);
+            // SAFETY: the public drain and exact native join completed writes.
+            let bytes = unsafe { std::slice::from_raw_parts(raw.contents(), 4096) };
+            assert!(bytes.iter().all(|byte| *byte == 0x6b));
+        }));
+        drop(cleanup);
+        if let Some(observed) = cleanup_observation {
+            observed.store(cleanup_done.load(Ordering::Relaxed), Ordering::Relaxed);
+        }
+        if let Err(panic) = exercised {
+            std::panic::resume_unwind(panic);
+        }
+        assert!(cleanup_done.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn public_flush_and_wait_drains_retained_receipt_without_refill_or_replacement() {
+        retained_public_drain_after_allocation_refusal(false, false, None);
+    }
+
+    #[test]
+    fn public_current_wait_drains_retained_receipt_without_refill_or_replacement() {
+        retained_public_drain_after_allocation_refusal(true, false, None);
+    }
+    #[test]
+    fn host_gate_fixture_unwind_releases_before_native_cleanup() {
+        let cleaned = AtomicBool::new(false);
+        let panic = std::panic::catch_unwind(|| {
+            retained_public_drain_after_allocation_refusal(false, true, Some(&cleaned));
+        })
+        .expect_err("controlled fixture unwind must propagate");
+        assert_eq!(
+            panic.downcast_ref::<&str>(),
+            Some(&"controlled post-handoff pending-work fixture unwind")
+        );
+        assert!(
+            cleaned.load(Ordering::Relaxed),
+            "released pending native work did not drain"
+        );
     }
 }

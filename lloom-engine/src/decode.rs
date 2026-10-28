@@ -17,7 +17,7 @@
 //! boundary is the [`crate::seam`] trait, one level out, where it is allowed.
 
 use lloom::generation::poll::PollMechanism;
-use lloom::generation::readback::RING_HISTORY_SLOTS;
+use lloom::generation::readback::{RingLap, RING_HISTORY_SLOTS};
 use lloom::generation::{
     Blocking, EosRead, LogitsProcessor, Logprobs, Processors, ReadbackStrategy, Ring, Sampling,
     ThinkingBudget, ThinkingReport,
@@ -40,6 +40,55 @@ fn stop_on_reader_exit<T>(stop: &std::sync::atomic::AtomicBool, read: impl FnOnc
     }
     let _guard = StopOnExit(stop);
     read()
+}
+
+/// Drain published batches, stopping the producer before delivering a batch
+/// whose read found EOS. A hook on an earlier batch can still delay that read.
+fn drain_ring_reader(
+    stop: &std::sync::atomic::AtomicBool,
+    stream_done: &std::sync::atomic::AtomicBool,
+    mut read: impl FnMut(&mut Vec<u32>) -> (std::result::Result<usize, RingLap>, bool),
+    mut hook: impl FnMut(&[u32]) -> Result<bool>,
+) -> Result<()> {
+    use std::sync::atomic::Ordering;
+    stop_on_reader_exit(stop, || {
+        let mut read_and_stop = |buf: &mut Vec<u32>| {
+            let (result, ended) = read(buf);
+            if result.is_ok() && ended {
+                stop.store(true, Ordering::Release);
+            }
+            result
+        };
+        let mut buf = Vec::with_capacity(64);
+        loop {
+            buf.clear();
+            match read_and_stop(&mut buf) {
+                Ok(0) => {
+                    if stream_done.load(Ordering::Acquire) {
+                        buf.clear();
+                        let n = read_and_stop(&mut buf).map_err(|lap| {
+                            stop.store(true, Ordering::Release);
+                            lloom_tensor::Error::msg(format!("ring reader final drain: {lap}"))
+                        })?;
+                        if n > 0 && !hook(&buf)? {
+                            stop.store(true, Ordering::Release);
+                        }
+                        return Ok(());
+                    }
+                    std::thread::sleep(std::time::Duration::from_micros(200));
+                }
+                Ok(_) => {
+                    if !hook(&buf)? {
+                        return Ok(());
+                    }
+                }
+                Err(lap) => {
+                    stop.store(true, Ordering::Release);
+                    lloom_tensor::bail!("ring reader: {lap}");
+                }
+            }
+        }
+    })
 }
 
 /// Why a decode run stopped.
@@ -195,22 +244,44 @@ impl ReadbackArm {
 
     /// Whether the ring arm can serve `sampling` without a host round trip
     /// it would not report (`Ring::check_sampler`).
-    fn ring_admits(sampling: &Sampling) -> bool {
-        matches!(
-            sampling,
-            Sampling::ArgMax | Sampling::All { .. } | Sampling::GumbelSoftmax { .. }
+    pub(crate) fn ring_admits(sampling: &Sampling) -> bool {
+        lloom::nn::refuse(
+            lloom::nn::Body::Step { ring: true },
+            &lloom::nn::Asks::sampling(sampling),
         )
+        .is_ok()
     }
 
     /// The arm that runs for `sampling`: `Auto` resolves here — to
     /// `auto_ring` (the engine's configured ring, `DecodeConfig`) where the
-    /// sampler admits a ring, the blocking arm otherwise; the explicit arms
-    /// pass through.
+    /// sampler admits a ring, the blocking arm otherwise. A ring asked by
+    /// name (the explicit arm or a front-end row) runs for every sampler it
+    /// admits and, for one that needs a host sort, is demoted to the
+    /// blocking arm for that request with a note ([`Self::demotion`]) rather
+    /// than refused (coupling C2, 2026-10-20); the other explicit arms pass
+    /// through.
     pub fn resolve(self, sampling: &Sampling, auto_ring: RingArm) -> ReadbackArm {
         match self {
             ReadbackArm::Auto if Self::ring_admits(sampling) => ReadbackArm::Ring(auto_ring),
             ReadbackArm::Auto => ReadbackArm::Blocking,
+            ReadbackArm::Ring(_) if !Self::ring_admits(sampling) => ReadbackArm::Blocking,
             other => other,
+        }
+    }
+
+    /// The note a run carries when a ring was asked by name and `sampling`
+    /// needs a host sort the ring has no round trip for: the blocking arm
+    /// runs that request, and the turn line and `timings.readback_note` say
+    /// so (coupling C2). `None` for every other pair — `auto`'s choice of the
+    /// blocking arm is not a demotion (C1).
+    pub fn demotion(self, sampling: &Sampling) -> Option<String> {
+        match self {
+            ReadbackArm::Ring(_) if !Self::ring_admits(sampling) => Some(format!(
+                "readback: the ring was asked but {} needs a host sort the ring cannot draw; \
+                 the blocking arm ran this request (C2)",
+                sampling.name()
+            )),
+            _ => None,
         }
     }
 
@@ -234,13 +305,16 @@ impl ReadbackArm {
 #[derive(Debug, Clone)]
 pub struct DecodeParams {
     pub seed: u64,
-    /// `None` (or `< 1e-7`) is greedy argmax; `Some(t)` samples at temperature
-    /// `t`, with `top_p` when set. Matches [`LogitsProcessor::new`].
+    /// `None` (or `< 1e-7`) is greedy argmax; `Some(t)` samples at
+    /// temperature `t`. The four sampling fields resolve together through
+    /// [`Self::sampling`].
     pub temperature: Option<f64>,
+    /// Nucleus mass in [0, 1]: 1 is off, 0 keeps the top token.
     pub top_p: Option<f64>,
-    /// Top-k, with `top_p` top-k-then-top-p (`Sampling::TopK` / `TopKThenTopP`).
+    /// Exactly k candidates; 0 (or at least the vocabulary) is off.
     pub top_k: Option<usize>,
-    /// Device gumbel-max at the temperature (`Sampling::GumbelSoftmax`).
+    /// Gumbel-max at the temperature, over the filtered support when a
+    /// filter is set (`Sampling::GumbelSoftmax`, `Sampling::FilteredGumbel`).
     pub gumbel: bool,
     /// Logit bias, the repetition / presence / frequency penalties and
     /// min-p, run before the draw (`lloom::generation::processors`); the
@@ -281,6 +355,16 @@ pub struct DecodeParams {
     /// The owner keeps nothing of this request's state for the next one
     /// (prefix reuse off): its prefill leaves no turn checkpoint.
     pub no_checkpoint: bool,
+    /// The session's head to keep pinned (`sessions.md` §8): its length in
+    /// ids, the front end's spans' (`Blocks::head`). The prefill leaves the
+    /// turn checkpoint there beside its own, in the same pass, and the cache
+    /// keeps it while the state holds it (`CausalLM::pin_checkpoint`).
+    /// `None` asks nothing; a pin standing stays.
+    pub pin_prefix: Option<usize>,
+    /// Release a standing pin before the request is prepared (a session's
+    /// `reset: prefix`): the head is rebuilt, then pinned again where
+    /// `pin_prefix` asks.
+    pub unpin_prefix: bool,
     /// Keep each returned id's log-probability (`Decoded::logprobs`). A host
     /// read of every step's logits: the run takes the blocking arm, as the
     /// logits digest does, and the speculative body and the batch scheduler
@@ -301,28 +385,33 @@ pub struct LogprobRequest {
 }
 
 impl DecodeParams {
-    /// The sampler arm for these fields: argmax below 1e-7 of temperature,
-    /// else gumbel-max, top-k-then-top-p, top-k, top-p, or plain temperature
-    /// (`LogitsProcessor::new`'s rule, extended to the arms the sampler has).
+    /// The sampler arm these request fields name: [`Sampling::resolve`], the
+    /// one entry point (`docs/dispatch.md` §11.2j). Every field is validated
+    /// whether or not the arm reads it, so a bad field is refused by name
+    /// rather than resolved to some other draw.
     pub fn sampling_of(
         temperature: Option<f64>,
         top_p: Option<f64>,
         top_k: Option<usize>,
         gumbel: bool,
-    ) -> Sampling {
-        let temperature = match temperature {
-            Some(t) if t >= 1e-7 => t,
-            _ => return Sampling::ArgMax,
-        };
-        if gumbel {
-            return Sampling::GumbelSoftmax { temperature };
-        }
-        match (top_k, top_p) {
-            (Some(k), Some(p)) => Sampling::TopKThenTopP { k, p, temperature },
-            (Some(k), None) => Sampling::TopK { k, temperature },
-            (None, Some(p)) => Sampling::TopP { p, temperature },
-            (None, None) => Sampling::All { temperature },
-        }
+    ) -> Result<Sampling> {
+        Sampling::resolve(temperature, top_k, top_p, gumbel)
+    }
+
+    /// The sampler arm of this request ([`Self::sampling_of`]).
+    pub fn sampling(&self) -> Result<Sampling> {
+        Self::sampling_of(self.temperature, self.top_p, self.top_k, self.gumbel)
+    }
+
+    /// The request's sampler: its arm, its processors and the digest, each
+    /// validated before any sequence state moves.
+    pub fn sampler(&self) -> Result<LogitsProcessor> {
+        self.processors
+            .validate()
+            .map_err(lloom_tensor::Error::msg)?;
+        Ok(LogitsProcessor::from_sampling(self.seed, self.sampling()?)
+            .with_processors(self.processors.clone())
+            .with_logits_digest(self.logits_digest))
     }
 
     /// These params under an owner whose prefix reuse is `reuse`: with reuse
@@ -339,23 +428,14 @@ impl DecodeParams {
         }
     }
 
-    /// The sampler arm of this request.
-    pub fn sampling(&self) -> Sampling {
-        Self::sampling_of(self.temperature, self.top_p, self.top_k, self.gumbel)
-    }
-
-    /// The sampler of this request, seeded, with its processors.
-    pub fn sampler(&self) -> LogitsProcessor {
-        LogitsProcessor::from_sampling(self.seed, self.sampling())
-            .with_processors(self.processors.clone())
-            .with_logits_digest(self.logits_digest)
-    }
-
     /// Refuse what `body` cannot serve of this request, by name — the one
     /// table every body asks (`lloom::nn::decode::refuse`); `path` names the
     /// caller in the message.
     pub fn refuse_on(&self, body: lloom::nn::Body, path: &str) -> Result<()> {
-        let sampling = self.sampling();
+        self.processors
+            .validate()
+            .map_err(lloom_tensor::Error::msg)?;
+        let sampling = self.sampling()?;
         lloom::nn::refuse(
             body,
             &lloom::nn::Asks {
@@ -388,6 +468,8 @@ impl Default for DecodeParams {
             thinking: None,
             turn_tail: 0,
             no_checkpoint: false,
+            pin_prefix: None,
+            unpin_prefix: false,
             logprobs: None,
             cold: false,
         }
@@ -418,6 +500,12 @@ pub struct Decoded {
     /// The readback arm that ran: resolved (never [`ReadbackArm::Auto`]), and
     /// on the fixed cadence wherever the adaptive commit did not run.
     pub readback: ReadbackArm,
+    /// The sampler arm that drew the tokens, as the request's fields resolved
+    /// ([`DecodeParams::sampling`]).
+    pub sampling: Sampling,
+    /// Why `readback` is the blocking arm when a ring was asked by name
+    /// ([`ReadbackArm::demotion`]); `None` otherwise.
+    pub readback_note: Option<String>,
     /// The run's logits digest, when `DecodeParams::logits_digest` asked for
     /// one.
     pub logits_sha256: Option<String>,
@@ -430,6 +518,41 @@ pub struct Decoded {
     /// Per returned id, its log-probability (and what else
     /// `DecodeParams::logprobs` asked for).
     pub logprobs: Option<Logprobs>,
+    /// What the request did with the session's pinned head.
+    pub pin: PinReport,
+}
+
+/// What a request did with the pinned head (`sessions.md` §8): what it
+/// asked ([`DecodeParams::pin_prefix`]) and where the pinned checkpoint
+/// stood when the run began and after it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PinReport {
+    pub asked: Option<usize>,
+    /// After the release the request asked for and its preparation: a
+    /// restore or a reset below the pin releases it.
+    pub before: Option<usize>,
+    pub after: Option<usize>,
+    /// The cache keeps a frame for a pin.
+    pub available: bool,
+    /// A pin stood and the request released it ([`DecodeParams::unpin_prefix`]).
+    pub released: bool,
+}
+
+impl PinReport {
+    /// `taken` (this run pinned the head), `kept` (it stood throughout),
+    /// `missed` (asked, and not standing after the run: the head was behind
+    /// the prepared position with nothing standing there, or past the
+    /// pass's reach), `unavailable` (asked, no frame for it), `off` (not
+    /// asked).
+    pub fn name(&self) -> &'static str {
+        match self.asked {
+            None => "off",
+            Some(_) if !self.available => "unavailable",
+            Some(h) if self.after != Some(h) => "missed",
+            Some(h) if self.before == Some(h) => "kept",
+            Some(_) => "taken",
+        }
+    }
 }
 
 impl Decoded {
@@ -743,6 +866,23 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
     pub fn decode_until(
         &mut self,
         prompt_ids: &[u32],
+        detokenize: impl FnMut(&[u32]) -> Result<String> + Send,
+        params: &DecodeParams,
+        on_fragment: impl FnMut(&str) -> bool + Send,
+    ) -> Result<Decoded>
+    where
+        M::Cache: CacheRewind + CacheReset,
+    {
+        let released = self.release_pin(params)?;
+        let out = self.decode_until_open(prompt_ids, detokenize, params, on_fragment);
+        self.close_request(out, released)
+    }
+
+    /// [`Self::decode_until`]'s run, its checkpoint request opened after the
+    /// preparation and closed by the caller.
+    fn decode_until_open(
+        &mut self,
+        prompt_ids: &[u32],
         mut detokenize: impl FnMut(&[u32]) -> Result<String> + Send,
         params: &DecodeParams,
         mut on_fragment: impl FnMut(&str) -> bool + Send,
@@ -753,21 +893,30 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
         if params.eos_ids.is_empty() {
             lloom_tensor::bail!("DecodeSession::decode: eos_ids is empty; a run needs an EOS set");
         }
-        let (prepared, turn) = crate::turn::prepare(&mut self.session, prompt_ids, true)?;
-        let (checkpoint, checkpoint_at) = self.establish_checkpoint(&prepared, params)?;
-
-        let mut sampler = params.sampler();
-        sampler.observe_prompt(prompt_ids);
-        let arm = if params.logits_digest || params.logprobs.is_some() {
-            ReadbackArm::Blocking
+        let mut sampler = params.sampler()?;
+        let sampling = sampler.sampling().clone();
+        let (arm, readback_note) = if params.logits_digest || params.logprobs.is_some() {
+            (ReadbackArm::Blocking, None)
         } else {
-            params
-                .readback
-                .resolve(sampler.sampling(), self.config.readback.ring_arm())
+            (
+                params
+                    .readback
+                    .resolve(sampler.sampling(), self.config.readback.ring_arm()),
+                params.readback.demotion(sampler.sampling()),
+            )
         };
         if let Err(e) = self.config.check() {
             lloom_tensor::bail!("DecodeSession::decode: {e}");
         }
+        params.refuse_on(
+            lloom::nn::Body::Step {
+                ring: matches!(arm, ReadbackArm::Ring(_)),
+            },
+            "DecodeSession::decode",
+        )?;
+        let (prepared, turn) = crate::turn::prepare(&mut self.session, prompt_ids, true)?;
+        let (checkpoint, checkpoint_at, pin) = self.establish_checkpoint(&prepared, params)?;
+        sampler.observe_prompt(prompt_ids);
         let mut spec = IdentityProposer;
 
         let mut stream = crate::stream::TextStream::new(params.max_tokens);
@@ -895,58 +1044,19 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
                             let stop_flag = &stop_flag;
                             let stream_done = &stream_done;
                             let worker = s.spawn(move || {
-                                stop_on_reader_exit(stop_flag, || -> Result<()> {
-                                    let mut buf: Vec<u32> = Vec::with_capacity(64);
-                                    loop {
-                                        buf.clear();
+                                drain_ring_reader(
+                                    stop_flag,
+                                    stream_done,
+                                    |buf| {
                                         if reader.ended() {
                                             stop_flag
                                                 .store(true, std::sync::atomic::Ordering::Release);
                                         }
-                                        match reader.read_new(&mut buf) {
-                                            Ok(0) => {
-                                                if stream_done
-                                                    .load(std::sync::atomic::Ordering::Acquire)
-                                                {
-                                                    buf.clear();
-                                                    let n = reader.read_new(&mut buf).map_err(
-                                                        |lap| {
-                                                            stop_flag.store(
-                                                            true,
-                                                            std::sync::atomic::Ordering::Release,
-                                                        );
-                                                            lloom_tensor::Error::msg(format!(
-                                                                "ring reader final drain: {lap}"
-                                                            ))
-                                                        },
-                                                    )?;
-                                                    if n > 0 && !hook(&buf)? {
-                                                        stop_flag.store(
-                                                            true,
-                                                            std::sync::atomic::Ordering::Release,
-                                                        );
-                                                    }
-                                                    return Ok(());
-                                                }
-                                                std::thread::sleep(
-                                                    std::time::Duration::from_micros(200),
-                                                );
-                                            }
-                                            Ok(_) => {
-                                                if !hook(&buf)? {
-                                                    return Ok(());
-                                                }
-                                            }
-                                            Err(lap) => {
-                                                stop_flag.store(
-                                                    true,
-                                                    std::sync::atomic::Ordering::Release,
-                                                );
-                                                lloom_tensor::bail!("ring reader: {lap}");
-                                            }
-                                        }
-                                    }
-                                })
+                                        let result = reader.read_new(buf);
+                                        (result, reader.ended())
+                                    },
+                                    hook,
+                                )
                             });
                             let out = self.session.decode_until(
                                 &mut spec,
@@ -1013,32 +1123,32 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
             checkpoint,
             checkpoint_at,
             readback: ran,
+            sampling,
+            readback_note,
             logits_sha256: sampler.logits_digest(),
             stats: out.stats,
             thinking,
             logprobs,
+            pin,
         })
     }
 }
 
 impl<'m, M: CausalLM> DecodeSession<'m, M> {
     /// The turn checkpoint this request's prefill leaves
-    /// ([`crate::turn::CheckpointPolicy::of`]), established on the cache
-    /// whatever the request before it asked; returned with the position it
-    /// resolves to.
-    ///
-    /// Until the checkpoint ring takes a request's policy itself
-    /// (`sequence-reuse-design.md` §2.3b), it is expressed through the
-    /// cache's one hint (`CausalLM::checkpoint_at`):
-    /// `At` and `End` hint their position, which a pass covering it meets
-    /// and no other tile does; `None` hints a position no pass reaches, which
-    /// the next request's hint replaces. A cache without checkpoints ignores
-    /// every hint.
+    /// ([`crate::turn::CheckpointPolicy::of`]), opened on the cache as the
+    /// request's own whatever the request before it asked
+    /// (`CausalLM::open_checkpoint_request`), and the head to pin beside it
+    /// where the request asks one (`CausalLM::pin_checkpoint`: the head's
+    /// checkpoint standing, else taken in the same pass). Returned with the
+    /// position the request's own resolves to and the pin as it stood. The
+    /// caller closes the request when the run ends, failed or not
+    /// ([`Self::close_request`]).
     fn establish_checkpoint(
         &mut self,
         prepared: &lloom::nn::Prepared,
         params: &DecodeParams,
-    ) -> Result<(crate::turn::CheckpointPolicy, Option<usize>)> {
+    ) -> Result<(crate::turn::CheckpointPolicy, Option<usize>, PinReport)> {
         let pos = self.session.pos();
         let end = pos + prepared.suffix.len();
         let policy = crate::turn::CheckpointPolicy::of(
@@ -1049,8 +1159,43 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
         );
         let at = policy.position(end);
         let model = self.session.model();
-        model.checkpoint_at(self.session.cache_mut(), at.unwrap_or(usize::MAX))?;
-        Ok((policy, at))
+        let cache = self.session.cache_mut();
+        let pin = PinReport {
+            asked: params.pin_prefix,
+            before: model.pinned_checkpoint(cache),
+            available: model.pins_checkpoints(cache),
+            ..PinReport::default()
+        };
+        model.open_checkpoint_request(cache, policy.into(), end)?;
+        if let Some(head) = params.pin_prefix.filter(|_| !params.no_checkpoint) {
+            model.pin_checkpoint(cache, Some(head))?;
+        }
+        Ok((policy, at, pin))
+    }
+
+    /// Release the pin before the request is prepared, where it asks
+    /// ([`DecodeParams::unpin_prefix`]). Whether one stood.
+    fn release_pin(&mut self, params: &DecodeParams) -> Result<bool> {
+        if !params.unpin_prefix {
+            return Ok(false);
+        }
+        let model = self.session.model();
+        let cache = self.session.cache_mut();
+        let stood = model.pinned_checkpoint(cache).is_some();
+        model.pin_checkpoint(cache, None)?;
+        Ok(stood)
+    }
+
+    /// Close the run's checkpoint request, whatever the run returned, and
+    /// report where the pinned checkpoint stands after it.
+    fn close_request(&mut self, out: Result<Decoded>, released: bool) -> Result<Decoded> {
+        let model = self.session.model();
+        let closed = model.close_checkpoint_request(self.session.cache_mut());
+        let mut decoded = out?;
+        closed?;
+        decoded.pin.after = model.pinned_checkpoint(self.session.sequence().cache());
+        decoded.pin.released = released;
+        Ok(decoded)
     }
 
     /// [`Self::decode_until`] through the speculative body: `spec` drafts a
@@ -1065,6 +1210,28 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
     /// prompt the cache holds whole re-feeds its last token
     /// (`Session::prepare_with`).
     pub fn decode_speculative_until<S>(
+        &mut self,
+        rewind: lloom::profile::RewindProof<M::Profile>,
+        spec: &mut S,
+        prompt_ids: &[u32],
+        detokenize: impl FnMut(&[u32]) -> Result<String> + Send,
+        params: &DecodeParams,
+        on_fragment: impl FnMut(&str) -> bool + Send,
+    ) -> Result<Decoded>
+    where
+        S: lloom::nn::Speculator,
+        M: lloom::nn::Probes<S::Probe> + lloom::profile::Shaped,
+        M::Cache: CacheRewind + CacheReset,
+    {
+        let released = self.release_pin(params)?;
+        let out =
+            self.decode_speculative_open(rewind, spec, prompt_ids, detokenize, params, on_fragment);
+        self.close_request(out, released)
+    }
+
+    /// [`Self::decode_speculative_until`]'s run, its checkpoint request
+    /// opened after the preparation and closed by the caller.
+    fn decode_speculative_open<S>(
         &mut self,
         rewind: lloom::profile::RewindProof<M::Profile>,
         spec: &mut S,
@@ -1092,13 +1259,14 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
         // before it) and the logits digest (over the rows the round keeps)
         // are the K=1 loop's, row for row (`LogitsProcessor::window_draw_device`).
         let mut sampler = params
-            .sampler()
+            .sampler()?
             .with_window_budget(params.thinking.as_ref());
+        let sampling = sampler.sampling().clone();
         sampler.observe_prompt(prompt_ids);
         // A prompt the cache holds whole re-feeds its last token: the first
         // round needs the target's probe there, which held logits lack.
         let (prepared, turn) = crate::turn::prepare(&mut self.session, prompt_ids, false)?;
-        let (checkpoint, checkpoint_at) = self.establish_checkpoint(&prepared, params)?;
+        let (checkpoint, checkpoint_at, pin) = self.establish_checkpoint(&prepared, params)?;
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let mut stream = crate::stream::TextStream::new(params.max_tokens);
         let mut stopped_on_string = false;
@@ -1178,10 +1346,13 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
             checkpoint,
             checkpoint_at,
             readback: ReadbackArm::Speculative { k },
+            sampling,
+            readback_note: None,
             logits_sha256: sampler.logits_digest(),
             stats: out.stats,
             thinking,
             logprobs: None,
+            pin,
         })
     }
 }
@@ -1189,6 +1360,199 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reader_eos_batch_stops_the_producer_before_its_hook() -> Result<()> {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let stop = AtomicBool::new(false);
+        let done = AtomicBool::new(true);
+        let mut reads = 0;
+        let mut hooks = 0;
+        drain_ring_reader(
+            &stop,
+            &done,
+            |buf| {
+                reads += 1;
+                if reads == 1 {
+                    buf.extend_from_slice(&[7, 11]);
+                }
+                (Ok(buf.len()), true)
+            },
+            |buf| {
+                assert_eq!(buf, &[7, 11]);
+                assert!(stop.load(Ordering::Acquire), "EOS hook preceded stop");
+                hooks += 1;
+                Ok(true)
+            },
+        )?;
+        assert_eq!(reads, 3, "normal read, empty read, final drain");
+        assert_eq!(hooks, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn reader_earlier_batch_hook_delays_the_eos_read_not_its_stop() -> Result<()> {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::mpsc::sync_channel;
+        use std::time::Duration;
+        let stop = AtomicBool::new(false);
+        let done = AtomicBool::new(true);
+        let reads = AtomicUsize::new(0);
+        let (entered_tx, entered_rx) = sync_channel(1);
+        let (release_tx, release_rx) = sync_channel(1);
+        std::thread::scope(|scope| -> Result<()> {
+            let (stop, done, reads) = (&stop, &done, &reads);
+            let reader = scope.spawn(move || {
+                let mut hooks = 0;
+                drain_ring_reader(
+                    stop,
+                    done,
+                    |buf| {
+                        let ordinal = reads.fetch_add(1, Ordering::AcqRel);
+                        match ordinal {
+                            0 => {
+                                buf.push(7);
+                                (Ok(1), false)
+                            }
+                            1 => {
+                                buf.push(11);
+                                (Ok(1), true)
+                            }
+                            _ => (Ok(0), true),
+                        }
+                    },
+                    |buf| {
+                        hooks += 1;
+                        if buf == [7] {
+                            assert!(!stop.load(Ordering::Acquire));
+                            entered_tx.send(()).unwrap();
+                            release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                            assert_eq!(reads.load(Ordering::Acquire), 1);
+                            assert!(!stop.load(Ordering::Acquire));
+                        } else {
+                            assert_eq!(buf, &[11]);
+                            assert!(stop.load(Ordering::Acquire), "EOS hook preceded stop");
+                        }
+                        Ok(true)
+                    },
+                )?;
+                assert_eq!(hooks, 2);
+                Ok(())
+            });
+            entered_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            assert_eq!(reads.load(Ordering::Acquire), 1, "EOS remains unread");
+            assert!(!stop.load(Ordering::Acquire), "earlier batch invented EOS");
+            release_tx.send(()).unwrap();
+            reader.join().expect("reader control")
+        })?;
+        assert_eq!(reads.load(Ordering::Acquire), 4);
+        assert!(stop.load(Ordering::Acquire));
+        Ok(())
+    }
+
+    #[test]
+    fn reader_final_drain_retains_delivery_and_error_context() -> Result<()> {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let done = AtomicBool::new(true);
+        for (fail, eos) in [(false, false), (false, true), (true, false)] {
+            let stop = AtomicBool::new(false);
+            let mut reads = 0;
+            let mut hooks = 0;
+            let result = drain_ring_reader(
+                &stop,
+                &done,
+                |buf| {
+                    reads += 1;
+                    if reads == 1 {
+                        return (Ok(0), false);
+                    }
+                    assert_eq!(reads, 2, "final drain is not polled again");
+                    if fail {
+                        (
+                            Err(RingLap {
+                                cursor: 1,
+                                published: 10,
+                                capacity: 4,
+                            }),
+                            false,
+                        )
+                    } else {
+                        buf.push(13);
+                        (Ok(1), eos)
+                    }
+                },
+                |buf| {
+                    hooks += 1;
+                    assert_eq!(buf, &[13]);
+                    assert_eq!(stop.load(Ordering::Acquire), eos);
+                    Ok(false)
+                },
+            );
+            if fail {
+                assert!(result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("ring reader final drain:"));
+            } else {
+                result?;
+            }
+            assert_eq!(hooks, usize::from(!fail));
+            assert_eq!(reads, 2);
+            assert!(stop.load(Ordering::Acquire));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn reader_shared_drain_cancels_on_read_hook_error_and_unwind() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let done = AtomicBool::new(true);
+        for failure in 0..3 {
+            let stop = AtomicBool::new(false);
+            let outcome = std::panic::catch_unwind(|| {
+                drain_ring_reader(
+                    &stop,
+                    &done,
+                    |buf| {
+                        if failure == 0 {
+                            (
+                                Err(RingLap {
+                                    cursor: 1,
+                                    published: 10,
+                                    capacity: 4,
+                                }),
+                                false,
+                            )
+                        } else {
+                            buf.push(7);
+                            (Ok(1), false)
+                        }
+                    },
+                    |_| {
+                        assert_ne!(failure, 0, "a failed read reached the hook");
+                        if failure == 1 {
+                            lloom_tensor::bail!("injected hook error");
+                        }
+                        panic!("injected hook panic");
+                    },
+                )
+            });
+            match failure {
+                0 => assert!(outcome
+                    .unwrap()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("ring reader:")),
+                1 => assert!(outcome
+                    .unwrap()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("hook error")),
+                _ => assert!(outcome.is_err()),
+            }
+            assert!(stop.load(Ordering::Acquire));
+        }
+    }
 
     #[test]
     fn reader_error_and_panic_cancel_the_producer_before_join() {
@@ -1267,7 +1631,18 @@ mod tests {
             adaptive: false,
             ..RingArm::CROWN
         });
-        assert_eq!(ring.resolve(&top_p, crown), ring);
+        // A ring asked by name runs what it admits and is demoted, with the
+        // note, for a sampler that needs a host sort (C2); `auto`'s own
+        // choice of the blocking arm carries no note (C1).
+        assert_eq!(ring.resolve(&argmax, crown), ring);
+        assert_eq!(ring.resolve(&temp, crown), ring);
+        assert_eq!(ring.resolve(&top_p, crown), ReadbackArm::Blocking);
+        assert!(ring.demotion(&argmax).is_none());
+        assert!(ring.demotion(&temp).is_none());
+        let note = ring.demotion(&top_p).unwrap();
+        assert!(note.contains("top-p:p=0.9:t=0.6") && note.contains("(C2)"), "{note}");
+        assert!(ReadbackArm::Auto.demotion(&top_p).is_none());
+        assert!(ReadbackArm::Blocking.demotion(&top_p).is_none());
         assert_ne!(ReadbackArm::CROWN.name(), ReadbackArm::Blocking.name());
         assert!(ReadbackArm::CROWN.name().contains("lookahead=1"));
     }
@@ -2031,6 +2406,66 @@ mod tests {
             }
         }
 
+        /// A ring asked by name with a filtered host draw runs that request
+        /// on the blocking arm with the note (C2), never building a ring; a
+        /// supported request runs; a refused parameter is refused before the
+        /// turn is prepared.
+        #[test]
+        fn a_named_ring_demotes_a_filtered_host_draw_and_a_refusal_precedes_prepare() -> Result<()>
+        {
+            let device = Device::Cpu;
+            let model = Chain::new(&device)?;
+            let mut params = DecodeParams {
+                temperature: Some(0.7),
+                top_k: Some(1),
+                top_p: Some(0.6),
+                gumbel: true,
+                eos_ids: vec![EOS],
+                max_tokens: 3,
+                readback: ReadbackArm::CROWN,
+                ..Default::default()
+            };
+            let mut demoted = DecodeSession::new(&model, Pos(0), device.clone(), 0);
+            let out = demoted.decode_until(&[5, 1], |ids| Ok(text_of(ids)), &params, |_| true)?;
+            assert_eq!(out.readback, ReadbackArm::Blocking);
+            let note = out.readback_note.as_deref().unwrap_or_default();
+            assert!(
+                note.contains("host-filtered-gumbel") && note.contains("(C2)"),
+                "{note:?}"
+            );
+            assert_eq!(out.tokens, chain(1, 3).0);
+            assert!(demoted.rings.is_empty());
+
+            let mut session = DecodeSession::new(&model, Pos(0), device.clone(), 0);
+            params.readback = ReadbackArm::Blocking;
+            params.logits_digest = true;
+            params.logprobs = Some(LogprobRequest::default());
+            let out = session.decode_until(&[5, 1], |ids| Ok(text_of(ids)), &params, |_| true)?;
+            assert_eq!(out.tokens, chain(1, 3).0);
+            assert_eq!(out.readback, ReadbackArm::Blocking);
+            assert_eq!(
+                out.logprobs.as_ref().unwrap().sampled.len(),
+                out.tokens.len()
+            );
+            let pos = session.pos();
+            let tokens = session.session.tokens().to_vec();
+            let cache = session.session.sequence().cache().0;
+            params.top_p = Some(1.1);
+            let error = session
+                .decode_until(
+                    &[0],
+                    |_| panic!("invalid p reached detokenizer"),
+                    &params,
+                    |_| panic!("invalid p reached fragment hook"),
+                )
+                .unwrap_err();
+            assert!(error.to_string().contains("top_p"), "{error}");
+            assert_eq!(session.pos(), pos);
+            assert_eq!(session.session.tokens(), tokens);
+            assert_eq!(session.session.sequence().cache().0, cache);
+            Ok(())
+        }
+
         /// The per-token logprobs are the blocking K=1 body's alone: the ring,
         /// the window and the batched bodies read back ids, never a row, and
         /// each refuses them by name.
@@ -2298,7 +2733,8 @@ mod tests {
                                 );
                                 if device.is_metal() {
                                     let resolved = config.readback.arm().resolve(
-                                        &DecodeParams::sampling_of(Some(t), p, None, false),
+                                        &DecodeParams::sampling_of(Some(t), p, None, false)
+                                            .unwrap(),
                                         config.readback.ring_arm(),
                                     );
                                     assert_eq!(got.readback, resolved, "{at}: the reply reports another arm than the options resolve to");

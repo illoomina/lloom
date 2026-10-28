@@ -126,6 +126,37 @@ fn skinny_max() -> usize {
     crate::tuning::tuning().gemm.skinny_max
 }
 
+/// The largest `m` at which a narrow projection takes the 64×32 tile
+/// ([`narrow_projection`]), inclusive: the prefill tile (`prefill.tile`,
+/// 512 by default), the largest `m` the shape was measured at.
+pub const NARROW_PROJECTION_MAX_M: usize = 512;
+
+/// The widest narrow projection's output, in multiples of its depth `k`.
+const NARROW_PROJECTION_N_PER_K: usize = 3;
+
+/// Whether a GEMM is a narrow projection at a prefill tile's rows: `x · Wᵀ`
+/// at f16 on a Max device, one batch, `m ≤ 512` rows, an output no wider
+/// than three times its depth. On the large-matmul, reasonable-K branch
+/// MLX's medium-device table gives it the 64×64 tile with a 16-deep K step;
+/// measured, the 64×32 tile with a 32-deep step is faster there (LFM2's
+/// q/o/out_proj and conv in_proj at `m` = 512) and the 64×64 tile keeps the
+/// wider outputs it ties or wins on (`docs/tuning.md` §13.5z).
+fn narrow_projection(
+    dtype: GemmDType,
+    (m, n, k): (usize, usize, usize),
+    batch_size: usize,
+    (a_trans, b_trans): (bool, bool),
+    device_type: MetalDeviceType,
+) -> bool {
+    device_type == MetalDeviceType::Max
+        && dtype == GemmDType::F16
+        && batch_size == 1
+        && !a_trans
+        && b_trans
+        && m <= NARROW_PROJECTION_MAX_M
+        && n <= NARROW_PROJECTION_N_PER_K * k
+}
+
 /// Which side of the `m == 1 || n == 1` GEMV route to suppress, so the routing
 /// decision itself becomes an arm (issue #386).
 ///
@@ -182,6 +213,97 @@ fn takes_gemv_route(m: usize, n: usize) -> bool {
         Some(ForceGemm::Both) => (true, true),
     };
     (m_is_vec && !suppress_m) || (n_is_vec && !suppress_n)
+}
+
+/// The rows a half matmul takes the GEMV's row axis at, or `None`, and
+/// whether it is a batched decode step's: under `fast`, with
+/// `kernels.gemm.f16_rows` on, inside a verify window
+/// (`tuning::VerifyWindow::open`) or — with `kernels.gemm.f16_rows_decode`
+/// on too — a batched decode step's forward (`tuning::DecodeRows::open`),
+/// `x · Wᵀ` of 2 to `f16_rows_max` contiguous rows (a batch folded into them
+/// as `check_batch_collapse` folds it) against one `[n, k]` row-major matrix
+/// at a tile the axis is instantiated at ([`gemv_rows_serves`]). One group
+/// holds every row, so the matrix is read once. Anything else takes the
+/// route it took before.
+fn f16_rows_route(
+    (dtype, out_dtype): (GemmDType, GemmDType),
+    (b, m, n, k): (usize, usize, usize, usize),
+    (a_trans, b_trans): (bool, bool),
+    lhs_stride: &[usize],
+    rhs_stride: &[usize],
+) -> Option<(usize, bool)> {
+    if dtype != GemmDType::F16 || out_dtype != dtype || m < 2 || n == 1 || a_trans || !b_trans {
+        return None;
+    }
+    let max = crate::tuning::f16_rows_max()?;
+    if !crate::tuning::contract().is_fast() {
+        return None;
+    }
+    let decode = if crate::tuning::in_verify_window() {
+        false
+    } else if crate::tuning::in_decode_rows() && crate::tuning::f16_rows_decode() {
+        true
+    } else {
+        return None;
+    };
+    let (batch, rows, _) = check_batch_collapse(b, m, k, a_trans, lhs_stride, rhs_stride);
+    (batch == 1 && rows <= max && gemv_rows_serves(n, k)).then_some((rows, decode))
+}
+
+/// The capacities a launch on the f16 row axis takes under
+/// `kernels.gemm.f16_rows_round`: the smallest at or above its rows.
+const F16_ROWS_CAPACITIES: [usize; 8] = [2, 4, 6, 8, 10, 12, 14, 16];
+
+/// The capacity a launch of `rows` rows takes on the f16 row axis: `rows`,
+/// or under `kernels.gemm.f16_rows_round` the smallest of
+/// [`F16_ROWS_CAPACITIES`] at or above it. One row keeps the one-row GEMV. A
+/// group holding fewer rows than its capacity re-reads its last row for the
+/// missing ones and stores only its own, so every row's bits are the same at
+/// either capacity (`gemv_rows_keep_the_one_row_bits_at_every_capacity`).
+fn f16_rows_capacity(rows: usize) -> usize {
+    if rows < 2 || !crate::tuning::f16_rows_round() {
+        return rows;
+    }
+    let cap = F16_ROWS_CAPACITIES
+        .iter()
+        .copied()
+        .find(|&c| c >= rows)
+        .unwrap_or(rows);
+    if cap > rows {
+        crate::tuning::note_f16_rows_rounded();
+    }
+    cap
+}
+
+/// Bytes of one half element.
+const HALF_BYTES: usize = 2;
+
+/// The live rows leading a ragged batched step's half matmul that take the
+/// decode rows' route, or `None`: under `fast`, with `kernels.gemm.f16_rows`
+/// and `kernels.gemm.f16_rows_decode` on, outside a verify window, `x · Wᵀ`
+/// of contiguous rows against one `[n, k]` row-major matrix at a tile the
+/// axis serves, whose first 1 to `f16_rows_max` rows are the step's decode
+/// rows (`tuning::RaggedDecodeRows`). The rows after them are prompt pieces.
+fn f16_rows_lead(
+    (dtype, out_dtype): (GemmDType, GemmDType),
+    (b, m, n, k): (usize, usize, usize, usize),
+    (a_trans, b_trans): (bool, bool),
+    lhs_stride: &[usize],
+    rhs_stride: &[usize],
+) -> Option<usize> {
+    if dtype != GemmDType::F16 || out_dtype != dtype || n == 1 || a_trans || !b_trans {
+        return None;
+    }
+    let max = crate::tuning::f16_rows_max()?;
+    if !crate::tuning::contract().is_fast()
+        || crate::tuning::in_verify_window()
+        || !crate::tuning::f16_rows_decode()
+    {
+        return None;
+    }
+    let (batch, rows, _) = check_batch_collapse(b, m, k, a_trans, lhs_stride, rhs_stride);
+    let lead = crate::tuning::ragged_decode_lead(rows)?;
+    (batch == 1 && lead <= max && gemv_rows_serves(n, k)).then_some(lead)
 }
 
 /// Select optimal tile configuration based on matrix dimensions, data type, transpose mode,
@@ -304,7 +426,17 @@ fn select_tile_config(
                 GemmDType::F16 | GemmDType::BF16 => {
                     if is_large_matmul {
                         if 2 * m.max(n) > k {
-                            TILE_64_64_16_1_2
+                            if narrow_projection(
+                                dtype,
+                                (m, n, k),
+                                batch_size,
+                                (a_trans, b_trans),
+                                device_type,
+                            ) {
+                                TILE_64_32_32_2_2
+                            } else {
+                                TILE_64_64_16_1_2
+                            }
                         } else if !a_trans && b_trans {
                             TILE_64_32_32_2_2
                         } else {
@@ -319,6 +451,19 @@ fn select_tile_config(
             }
         }
     }
+}
+
+/// The tile `call_mlx_gemm` takes for a one-batch `x · Wᵀ` (`x [m, k]`, `W`
+/// row-major `[n, k]`, the `nt` layout) at `dtype` on `device`, as
+/// `(bm, bn, bk, wm, wn)`: what a benchmark prints beside its rate, so the
+/// tile a shape ran on is read from the selection rather than assumed.
+pub fn nt_gemm_tile(
+    device: &Device,
+    dtype: GemmDType,
+    (m, n, k): (usize, usize, usize),
+) -> (usize, usize, usize, usize, usize) {
+    let t = select_tile_config(dtype, m, n, k, 1, false, true, device.device_type());
+    (t.bm, t.bn, t.bk, t.wm, t.wn)
 }
 
 /// Check if batch can be collapsed into M dimension.
@@ -773,6 +918,7 @@ pub unsafe fn call_mlx_gemv_epilogue(
             prologue,
             epilogue,
             epilogue_operand,
+            1,
         )
     }
 }
@@ -826,10 +972,90 @@ pub unsafe fn call_mlx_gemv_norm(
             GemvPrologue::NormInline(norm),
             epilogue,
             epilogue_operand,
+            1,
         )
     }
 }
 
+/// The most rows one threadgroup of the GEMV's row axis carries
+/// (`gemv.metal`'s `instantiate_gemv_rows_bm4`, `_bm8`: every count from 2).
+pub const GEMV_ROWS_MAX: usize = 16;
+
+/// The `[[host_name]]` suffix of each row count, no allocation per dispatch;
+/// the classical name at 1 (0 is never dispatched).
+const GEMV_ROWS_SUFFIX: [&str; GEMV_ROWS_MAX + 1] = [
+    "", "", "_r2", "_r3", "_r4", "_r5", "_r6", "_r7", "_r8", "_r9", "_r10", "_r11", "_r12", "_r13",
+    "_r14", "_r15", "_r16",
+];
+
+/// Whether the GEMV's row axis serves a non-transposed `[out_vec_size,
+/// in_vec_size]` half matrix: the tile the dispatcher selects is one of the
+/// two decode tiles the `_r<N>` kernels are instantiated at. A caller checks
+/// this and takes another route where it is false.
+pub fn gemv_rows_serves(out_vec_size: usize, in_vec_size: usize) -> bool {
+    gemv_norm_serves(out_vec_size, in_vec_size)
+}
+
+/// `out[r, :] = mat · vec[r, :]` for `b` half rows against ONE matrix, the
+/// rows read `capacity` to a threadgroup: each threadgroup sweeps its block
+/// of the matrix once for `capacity` rows, and each row's bits are the
+/// one-row GEMV's on the same input (`gemv.metal`'s `GEMVKernel`,
+/// `docs/tuning.md` §13.5y). The arguments are [`call_mlx_gemv`]'s at
+/// `m = 1`, the rows on the batch axis; the matrix's batch stride must be 0.
+/// `capacity` 1 is the classical GEMV, `epilogue` included. Refused where
+/// the axis is not instantiated ([`gemv_rows_serves`], f16,
+/// `2..=GEMV_ROWS_MAX`) and for a fused epilogue at more than one row, by
+/// name: the caller takes the plain store.
+///
+/// # Safety
+/// Every buffer bound here stays unreused and unwritten by the host until
+/// the command buffer it is encoded into completes, and while an ICB that
+/// captured it can replay ([`crate::kernels::utils::EncoderParam`]).
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn call_mlx_gemv_rows(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    dtype: GemmDType,
+    mnk: (usize, usize, usize, usize),
+    lhs_stride: &[usize],
+    lhs_offset: usize,
+    lhs_buffer: &Buffer,
+    rhs_stride: &[usize],
+    rhs_offset: usize,
+    rhs_buffer: &Buffer,
+    output: &Buffer,
+    epilogue: GemvEpilogue,
+    epilogue_operand: Option<(&Buffer, usize)>,
+    capacity: usize,
+) -> Result<(), MetalKernelError> {
+    // SAFETY: this function's contract (# Safety above).
+    unsafe {
+        gemv_dispatch(
+            device,
+            ep,
+            kernels,
+            dtype,
+            mnk,
+            lhs_stride,
+            lhs_offset,
+            lhs_buffer,
+            rhs_stride,
+            rhs_offset,
+            rhs_buffer,
+            output,
+            ParamStyle::Split,
+            GemvPrologue::None,
+            epilogue,
+            epilogue_operand,
+            capacity,
+        )
+    }
+}
+
+/// `rows` is the row axis's capacity ([`call_mlx_gemv_rows`]); 1 everywhere
+/// else, the classical GEMV.
+///
 /// # Safety
 /// Every buffer bound here stays unreused and unwritten by the host until
 /// the command buffer it is encoded into completes, and while an ICB that
@@ -852,6 +1078,7 @@ unsafe fn gemv_dispatch(
     prologue: GemvPrologue<'_>,
     epilogue: GemvEpilogue,
     epilogue_operand: Option<(&Buffer, usize)>,
+    rows: usize,
 ) -> Result<(), MetalKernelError> {
     debug_assert!(m == 1 || n == 1, "call_mlx_gemv requires M=1 or N=1");
 
@@ -1002,6 +1229,53 @@ unsafe fn gemv_dispatch(
         && tn == 4
         && tm == 4
         && (bm == 4 || bm == 8);
+    // The row axis is instantiated at the decode tiles, half, split params,
+    // with the plain store. A fused prologue or epilogue is REFUSED by name
+    // rather than run without its transform: the caller takes the plain
+    // store and its own transform, or the one-row arm.
+    if rows != 1 {
+        let refused = |why: String| {
+            Err(MetalKernelError::LoadFunctionError(format!(
+                "gemv row axis at {rows} rows: {why} (mnk={m}x{n}x{k}, b={b})"
+            )))
+        };
+        if !(2..=GEMV_ROWS_MAX).contains(&rows) {
+            return refused(format!("instantiated for 2..={GEMV_ROWS_MAX} rows"));
+        }
+        if !decode_tile {
+            return refused(format!(
+                "instantiated at the non-transposed bm4/bm8 decode tiles only, not \
+                 {kernel_prefix} bm{bm}_bn{bn}_sm{sm}_sn{sn}_tm{tm}_tn{tn}"
+            ));
+        }
+        if dtype != GemmDType::F16 {
+            return refused(format!("instantiated for f16 only, not {dtype:?}"));
+        }
+        if style != ParamStyle::Split {
+            return refused(format!("no {style:?} sibling; split params only"));
+        }
+        match &prologue {
+            GemvPrologue::None => {}
+            GemvPrologue::RmsNorm(_) => {
+                return refused("the fused rmsnorm prologue has no row-axis instantiation".into())
+            }
+            GemvPrologue::NormInline(_) => {
+                return refused("the inline norm has no row-axis instantiation".into())
+            }
+        }
+        if epilogue != GemvEpilogue::None {
+            return refused(format!(
+                "the fused {epilogue:?} epilogue has no row-axis instantiation; take the \
+                 plain store"
+            ));
+        }
+        if m != 1 || mat_batch_stride != 0 {
+            return refused(format!(
+                "the rows share one matrix on the batch axis (m=1, matrix batch stride 0), \
+                 got m={m}, stride {mat_batch_stride}"
+            ));
+        }
+    }
     if let GemvPrologue::NormInline(_) = &prologue {
         if !decode_tile || style != ParamStyle::Split {
             return Err(MetalKernelError::LoadFunctionError(format!(
@@ -1106,8 +1380,9 @@ unsafe fn gemv_dispatch(
     // classical name everywhere else, and the replay executor classifies a
     // position by that trailing suffix (`icb.rs` `is_packed`), so a fused
     // packed name is `…_axpby0_silu_packed`, never `…_packed_silu`.
+    let rows_suffix = GEMV_ROWS_SUFFIX[rows];
     let name = format!(
-        "{}_{}_bm{}_bn{}_sm{}_sn{}_tm{}_tn{}_nc0_axpby0{}{}{}",
+        "{}_{}_bm{}_bn{}_sm{}_sn{}_tm{}_tn{}_nc0_axpby0{}{}{}{}",
         kernel_prefix,
         dtype_str,
         bm,
@@ -1118,6 +1393,7 @@ unsafe fn gemv_dispatch(
         tn,
         norm_suffix,
         epilogue_suffix,
+        rows_suffix,
         style.name_suffix()
     );
 
@@ -1218,10 +1494,13 @@ unsafe fn gemv_dispatch(
         bm * sm * tm
     };
     let n_tgp = out_vec_size.div_ceil(n_out_per_tgp);
+    // One threadgroup a block of output rows per group of `rows` batch items
+    // (the kernel reads the batch's size from `batch_shape` for the last
+    // group's count).
     let grid_size = MTLSize {
         width: n_tgp,
         height: 1,
-        depth: b,
+        depth: b.div_ceil(rows),
     };
     let group_size = MTLSize {
         width: 32,
@@ -1540,24 +1819,6 @@ pub unsafe fn call_mlx_gemm_out(
     rhs_buffer: &Buffer,
     output: &Buffer,
 ) -> Result<(), MetalKernelError> {
-    #[derive(Debug)]
-    #[repr(C)]
-    struct GemmParams {
-        m: i32,
-        n: i32,
-        k: i32,
-        lda: i32,
-        ldb: i32,
-        ldd: i32,
-        tiles_n: i32,
-        tiles_m: i32,
-        batch_stride_a: isize,
-        batch_stride_b: isize,
-        batch_stride_d: isize,
-        swizzle_log: i32,
-        gemm_k_iterations_aligned: i32,
-        batch_ndim: i32,
-    }
     assert!(rhs_stride.len() >= 2);
     assert!(lhs_stride.len() >= 2);
     let rhs_m1 = rhs_stride[rhs_stride.len() - 1];
@@ -1653,6 +1914,95 @@ pub unsafe fn call_mlx_gemm_out(
         return Ok(());
     }
 
+    // Under `fast` a verify window's half rows — and, under
+    // `kernels.gemm.f16_rows_decode`, a batched decode step's — take the
+    // GEMV's row axis while `kernels.gemm.f16_rows` is on: one weight sweep
+    // for the rows, each row the one-row GEMV's bits (`docs/tuning.md`
+    // §13.5y, §13.5zb).
+    if let Some((rows, decode)) = f16_rows_route(
+        (dtype, out_dtype),
+        (b, m, n, k),
+        (a_trans, b_trans),
+        lhs_stride,
+        rhs_stride,
+    ) {
+        if decode {
+            crate::tuning::note_f16_rows_decode();
+        } else {
+            crate::tuning::note_f16_rows();
+        }
+        // SAFETY: this function's contract (# Safety above).
+        return unsafe {
+            call_mlx_gemv_rows(
+                device,
+                ep,
+                kernels,
+                dtype,
+                (rows, 1, n, k),
+                &[k, k, 1],
+                lhs_offset,
+                lhs_buffer,
+                &[0, rhs_m2, rhs_m1],
+                rhs_offset,
+                rhs_buffer,
+                output,
+                GemvEpilogue::None,
+                None,
+                f16_rows_capacity(rows),
+            )
+        };
+    }
+
+    // A ragged batched step's live rows take the decode rows' route and its
+    // prompt pieces the GEMM, two launches into disjoint rows of the output,
+    // so a row's bits do not depend on whether a piece rode its step
+    // (`docs/tuning.md` §13.5zb).
+    if let Some(lead) = f16_rows_lead(
+        (dtype, out_dtype),
+        (b, m, n, k),
+        (a_trans, b_trans),
+        lhs_stride,
+        rhs_stride,
+    ) {
+        crate::tuning::note_f16_rows_decode();
+        let (_, rows, _) = check_batch_collapse(b, m, k, a_trans, lhs_stride, rhs_stride);
+        let row = n * HALF_BYTES;
+        let encoder = ep.encoder();
+        let encoder: &ComputeCommandEncoder = encoder.as_ref();
+        // SAFETY: this function's contract (# Safety above).
+        return unsafe {
+            call_mlx_gemv_rows(
+                device,
+                encoder,
+                kernels,
+                dtype,
+                (lead, 1, n, k),
+                &[k, k, 1],
+                lhs_offset,
+                lhs_buffer,
+                &[0, rhs_m2, rhs_m1],
+                rhs_offset,
+                rhs_buffer,
+                &output.view(0, lead * row),
+                GemvEpilogue::None,
+                None,
+                f16_rows_capacity(lead),
+            )?;
+            encode_steel_gemm(
+                device,
+                encoder,
+                kernels,
+                (dtype, out_dtype),
+                (1, rows - lead, n, k),
+                (k as i32, false),
+                (ldb, b_trans),
+                (&[k, 1], lhs_offset + lead * k * HALF_BYTES, lhs_buffer),
+                (rhs_stride, rhs_offset, rhs_buffer),
+                &output.view(lead * row, (rows - lead) * row),
+            )
+        };
+    }
+
     // The routing decision this project has never audited (issue #386): no
     // threshold, no config axis, and `select_tile_config` is never consulted.
     // `takes_gemv_route` is `m == 1 || n == 1` unless `LLOOM_386_FORCE_GEMM`
@@ -1674,6 +2024,67 @@ pub unsafe fn call_mlx_gemm_out(
         );
     }
 
+    // SAFETY: this function's contract (# Safety above).
+    unsafe {
+        encode_steel_gemm(
+            device,
+            ep,
+            kernels,
+            (dtype, out_dtype),
+            (b, m, n, k),
+            (lda, a_trans),
+            (ldb, b_trans),
+            (lhs_stride, lhs_offset, lhs_buffer),
+            (rhs_stride, rhs_offset, rhs_buffer),
+            output,
+        )
+    }
+}
+
+#[derive(Debug)]
+#[repr(C)]
+struct GemmParams {
+    m: i32,
+    n: i32,
+    k: i32,
+    lda: i32,
+    ldb: i32,
+    ldd: i32,
+    tiles_n: i32,
+    tiles_m: i32,
+    batch_stride_a: isize,
+    batch_stride_b: isize,
+    batch_stride_d: isize,
+    swizzle_log: i32,
+    gemm_k_iterations_aligned: i32,
+    batch_ndim: i32,
+}
+
+impl EncoderParam for GemmParams {
+    unsafe fn set_param(encoder: &ComputeCommandEncoder, position: usize, data: Self) {
+        encoder.set_bytes(position, &data);
+    }
+}
+
+/// The steel GEMM over `(b, m, n, k)`, the route every matmul [`call_mlx_gemm_out`]
+/// does not send to a GEMV takes: the tile [`select_tile_config`]'s, the batch
+/// folded into `m` where [`check_batch_collapse`] folds it.
+///
+/// # Safety
+/// [`call_mlx_gemm_out`]'s.
+#[allow(clippy::too_many_arguments)]
+unsafe fn encode_steel_gemm(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    (dtype, out_dtype): (GemmDType, GemmDType),
+    (b, m, n, k): (usize, usize, usize, usize),
+    (lda, a_trans): (i32, bool),
+    (ldb, b_trans): (i32, bool),
+    (lhs_stride, lhs_offset, lhs_buffer): (&[usize], usize, &Buffer),
+    (rhs_stride, rhs_offset, rhs_buffer): (&[usize], usize, &Buffer),
+    output: &Buffer,
+) -> Result<(), MetalKernelError> {
     // Check for batch collapse optimization (MLX matmul.cpp lines 700-740)
     // When B is broadcasted (2D), collapse batch into M dimension
     let (effective_batch, effective_m, batch_collapsed) =
@@ -1771,12 +2182,6 @@ pub unsafe fn call_mlx_gemm_out(
     let encoder: &ComputeCommandEncoder = encoder.as_ref();
     encoder.set_compute_pipeline_state(&pipeline);
     debug_group!(encoder, "mlx_gemm {name} B={b} M={m} N={n} K={k}");
-
-    impl EncoderParam for GemmParams {
-        unsafe fn set_param(encoder: &ComputeCommandEncoder, position: usize, data: Self) {
-            encoder.set_bytes(position, &data);
-        }
-    }
 
     // Batch strides for buffer 7 (same as main branch)
     let batch_strides = [batch_stride_a, batch_stride_b];
@@ -1963,6 +2368,86 @@ mod tile_config_gate {
             "the boundary must be a boundary: if these agree, every §13.5c/§13.5o \
              figure is a comparison of a tile against itself"
         );
+    }
+
+    /// **The claim: at a prefill tile's rows, LFM2's narrow projections take
+    /// the 64×32 tile and its wide ones keep MLX's 64×64.**
+    ///
+    /// `DESIGN.md` §13.5z: at `m` = 512 the 64×32 tile runs q/o/out_proj
+    /// (2048×2048) at 6.6 TFLOP/s against 5.4 and conv in_proj (6144×2048) at
+    /// 8.35 against 7.8–7.9; w1/w3 (10752×2048) tie and keep 64×64, as does the
+    /// lm_head. w2 (a deep `k`) and k/v (an output under a million elements)
+    /// were on the 64×32 tile already. Each `m` here is in the 64-row band and
+    /// puts w1/w3 on the large-matmul branch (`m` ≥ 98): 171 is where conv
+    /// in_proj becomes a large matmul, 344 and 374 the last tiles of the 2392
+    /// and 886-token prompts, 512 the prefill tile.
+    #[test]
+    fn at_a_prefill_tile_the_narrow_projections_take_the_64_32_tile() {
+        let shape = |t: TileConfig| (t.bm, t.bn, t.bk, t.wm, t.wn);
+        let narrow = (64, 32, 32, 2, 2);
+        let wide = (64, 64, 16, 1, 2);
+        for m in [171, 344, 374, 512] {
+            for (label, _, n, k) in SITES {
+                let want = match *label {
+                    "w1 (gate)" | "w3 (up)" | "lm_head" => wide,
+                    _ => narrow,
+                };
+                assert_eq!(
+                    shape(tile_at(m, *n, *k)),
+                    want,
+                    "§13.5z: at m={m} the {label} matmul ({n}x{k})"
+                );
+            }
+        }
+    }
+
+    /// **The claim: the narrow-projection class ends where it was measured,
+    /// on both of its edges, and nowhere else does the table move.**
+    ///
+    /// Past `m` = 512 (unmeasured per shape; the shipping prefill tile is
+    /// 512) and past an output three times the depth, MLX's 64×64 tile
+    /// stands; so do bf16, a batch, the `nn` layout, another device class
+    /// and f32, none of which was measured. Both sides of each edge are
+    /// asserted (§8.1g), so a class that swallowed everything or nothing
+    /// fails here.
+    #[test]
+    fn the_narrow_projection_class_ends_where_it_was_measured() {
+        let shape = |t: TileConfig| (t.bm, t.bn, t.bk, t.wm, t.wn);
+        let narrow = (64, 32, 32, 2, 2);
+        let wide = (64, 64, 16, 1, 2);
+        // The prefill tile, the largest m measured per shape: the literal,
+        // so a moved constant fails here rather than moving the test.
+        let max_m = 512;
+        assert_eq!(
+            NARROW_PROJECTION_MAX_M, max_m,
+            "the class ends at the prefill tile"
+        );
+        for (n, k) in [(2048, 2048), (6144, 2048)] {
+            assert_eq!(shape(tile_at(max_m, n, k)), narrow, "{n}x{k} at m={max_m}");
+            assert_eq!(
+                shape(tile_at(max_m + 1, n, k)),
+                wide,
+                "{n}x{k} past the tile"
+            );
+            assert_eq!(shape(tile_at(2048, n, k)), wide, "{n}x{k} at m=2048");
+        }
+        assert_eq!(shape(tile_at(max_m, 3 * 2048, 2048)), narrow, "n = 3k");
+        assert_eq!(shape(tile_at(max_m, 3 * 2048 + 32, 2048)), wide, "n > 3k");
+        let sel = |dtype, batch, b_trans, dev| {
+            shape(select_tile_config(
+                dtype, max_m, 2048, 2048, batch, false, b_trans, dev,
+            ))
+        };
+        assert_eq!(sel(GemmDType::F16, 1, true, DEV), narrow, "the control");
+        assert_eq!(sel(GemmDType::BF16, 1, true, DEV), wide, "bf16");
+        assert_eq!(sel(GemmDType::F16, 2, true, DEV), wide, "a batch");
+        assert_eq!(sel(GemmDType::F16, 1, false, DEV), wide, "nn");
+        assert_eq!(
+            sel(GemmDType::F16, 1, true, MetalDeviceType::Medium),
+            wide,
+            "another device class"
+        );
+        assert_eq!(sel(GemmDType::F32, 1, true, DEV), (64, 64, 16, 2, 2), "f32");
     }
 
     /// **The claim: `align_M` is false and `align_N` is true at all 167 sites.**

@@ -279,9 +279,12 @@ pub enum Error {
     #[error("npy/npz error {0}")]
     Npy(String),
 
-    /// Zip file format error.
+    /// Zip file format error. Boxed: zip 9.1.0's `ZipError` carries a
+    /// `u128` (`DecompressedSizeLimitExceeded`), which inline would widen
+    /// every `Result` from 32 to 48 bytes (`invariants.md` §15.2 #15a;
+    /// `tests/error_size.rs`).
     #[error(transparent)]
-    Zip(#[from] zip::result::ZipError),
+    Zip(Box<zip::result::ZipError>),
 
     /// Integer parse error.
     #[error(transparent)]
@@ -342,6 +345,12 @@ impl From<std::string::FromUtf8Error> for Error {
     }
 }
 
+impl From<zip::result::ZipError> for Error {
+    fn from(e: zip::result::ZipError) -> Self {
+        Self::Zip(Box::new(e))
+    }
+}
+
 impl From<safetensors::SafeTensorError> for Error {
     fn from(e: safetensors::SafeTensorError) -> Self {
         Self::SafeTensor(Box::new(e))
@@ -370,6 +379,19 @@ impl Error {
                 inner: Box::new(self),
                 backtrace: Box::new(backtrace),
             },
+        }
+    }
+
+    /// Borrow the error beneath any outer diagnostic backtraces, without
+    /// changing this error or its detailed `Display` representation.
+    ///
+    /// Public capability reasons should not depend on the call site that
+    /// captured a trace. Context and path wrappers are deliberately retained;
+    /// this does not strip traces nested inside other error types or context.
+    pub fn without_backtrace(&self) -> &Self {
+        match self {
+            Self::WithBacktrace { inner, .. } => inner.without_backtrace(),
+            error => error,
         }
     }
 
@@ -502,5 +524,53 @@ impl<T> Context<T, Infallible> for Option<T> {
             Some(v) => Ok(v),
             None => Err(Error::UnwrapNone.context(context()).bt()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Error;
+    use std::backtrace::{Backtrace, BacktraceStatus};
+
+    #[inline(never)]
+    fn first_site() -> Error {
+        Error::WithBacktrace {
+            inner: Box::new(Error::Msg("the same refusal".into())),
+            backtrace: Box::new(Backtrace::force_capture()),
+        }
+    }
+
+    #[inline(never)]
+    fn second_site() -> Error {
+        Error::WithBacktrace {
+            inner: Box::new(Error::Msg("the same refusal".into())),
+            backtrace: Box::new(Backtrace::force_capture()),
+        }
+    }
+
+    #[test]
+    fn without_backtrace_keeps_distinct_diagnostics_and_the_same_reason() {
+        let first = first_site();
+        let second = second_site();
+        for error in [&first, &second] {
+            let Error::WithBacktrace { inner, backtrace } = error else {
+                panic!("the captured diagnostic must remain attached");
+            };
+            assert_eq!(backtrace.status(), BacktraceStatus::Captured);
+            assert!(std::ptr::eq(error.without_backtrace(), inner.as_ref()));
+            assert_eq!(error.without_backtrace().to_string(), "the same refusal");
+        }
+        assert_ne!(first.to_string(), second.to_string());
+        let detail = first.to_string();
+        let nested = Error::WithBacktrace {
+            inner: Box::new(first),
+            backtrace: Box::new(Backtrace::force_capture()),
+        };
+        assert_eq!(nested.without_backtrace().to_string(), "the same refusal");
+        assert!(nested.to_string().contains(&detail));
+
+        let context = Error::Msg("the same refusal".into()).context("public context");
+        assert!(std::ptr::eq(context.without_backtrace(), &context));
+        assert_eq!(context.without_backtrace().to_string(), context.to_string());
     }
 }

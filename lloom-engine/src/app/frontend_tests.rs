@@ -6,13 +6,14 @@
 //! default; and the library tree against the one before the option tree,
 //! with each approved exception asserted by number.
 
-use super::{command, resolve_layers, Cli, Command, CommonArgs, Shape};
+use super::{command, named_keys, preset_keys, resolve_layers, Cli, Command, CommonArgs, Shape};
 use crate::frontend::{self, Frontend, When, EXCEPTIONS, ROWS};
 use crate::option_tree::index;
+use crate::options::{ModelConfig, CACHE_PRESETS};
 use crate::EngineOptions;
 use clap::FromArgMatches;
 use serde_json::{json, Value};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// The tree `lloom config` printed under an empty environment before the
 /// option tree existed.
@@ -32,6 +33,241 @@ const MOVED_ELSEWHERE: &[(&str, &str, &str, &str)] = &[(
     "true",
     "the row axis, on under `fast`; `deterministic` never takes it (tuning.md §13.5w)",
 )];
+
+const PRE_TREE: &str = "the front-end's own value before the option tree";
+const TUNED_FLOW: &str = "the tuned decode flow as chat's and serve's default (a08b86f5d, #859)";
+const DSPARK_SINGLE: &str = "the tuned flow's paged KV for the speculative body at one sequence (a08b86f5d, #859), which decision 52 (#1068) moves back to its preset's in-place KV";
+const KEEP_WARM: &str = "the maintainer's choice on PR1087 (#1076, 2026-10-23): serve keeps the GPU's memory wired while idle, bounded by server.keep_warm_for_s, as llama.cpp's heartbeat is";
+const DECODE_ROWS: &str = "the library's value of the batched decode rows' arm, a key the option tree did not have, which decision 54 (#1084) turns on where a batched loop runs on Metal";
+const RESIDENCY_ATTACH: &str = "the library's value of the device set's attachment, a key the option tree did not have, which decision 56 (#1092) detaches from the Metal 3 queue on chat and serve";
+const KEEP_WARM_PRESSURE: &str = "the library's value of the keep-warm's pressure stop, a key the option tree did not have, which decision 57 (#1092) turns on where serve's keep-warm runs by default";
+const ROWS_MAX: &str = "the library's ceiling of the f16 row axis, a key the option tree did not have, which decision 60 (#1084) raises to 12 where the batched loops run on Metal";
+const CHAT_SERVE: &[Frontend] = &[Frontend::Chat, Frontend::Serve];
+
+/// Every row of the front-end table by value: key, front-ends, condition,
+/// `before` and where the value comes from. The table is otherwise its own
+/// reference, so a row added, removed or moved fails here by name. The rows
+/// not `PRE_TREE` were moved by another change on `dev`, recorded so the
+/// audit names each; none of them is an exception this tree approved.
+const PINNED_ROWS: &[(&str, &[Frontend], When, &str, &str)] = &[
+    (
+        "context.prefix.reuse",
+        &[Frontend::Chat],
+        When::Always,
+        "true",
+        PRE_TREE,
+    ),
+    (
+        "context.prefix.reuse",
+        &[Frontend::Serve],
+        When::Always,
+        "false",
+        PRE_TREE,
+    ),
+    (
+        "context.prefix.reuse",
+        &[Frontend::Bench],
+        When::Always,
+        "false",
+        PRE_TREE,
+    ),
+    (
+        "generation.max_tokens",
+        &[Frontend::Chat],
+        When::Always,
+        "1024",
+        PRE_TREE,
+    ),
+    (
+        "scheduler.prefill_chunk",
+        &[Frontend::Serve],
+        When::Batched,
+        "512",
+        PRE_TREE,
+    ),
+    (
+        "scheduler.prefill_chunk",
+        &[Frontend::Bench],
+        When::Batched,
+        "512",
+        PRE_TREE,
+    ),
+    (
+        "backend.metal.command_buffer.api",
+        CHAT_SERVE,
+        When::Metal,
+        "metal4",
+        TUNED_FLOW,
+    ),
+    (
+        "backend.metal.compiler.merged_unit",
+        CHAT_SERVE,
+        When::Metal,
+        "true",
+        TUNED_FLOW,
+    ),
+    (
+        "backend.metal.copy2d_compute",
+        CHAT_SERVE,
+        When::Metal,
+        "true",
+        TUNED_FLOW,
+    ),
+    (
+        "backend.metal.heaps.transient",
+        CHAT_SERVE,
+        When::Metal,
+        "true",
+        TUNED_FLOW,
+    ),
+    (
+        "decode.readback.kind",
+        CHAT_SERVE,
+        When::Metal,
+        "ring",
+        TUNED_FLOW,
+    ),
+    (
+        "decode.readback.eos",
+        CHAT_SERVE,
+        When::Metal,
+        "gpu-batched-nonblocking",
+        TUNED_FLOW,
+    ),
+    (
+        "decode.readback.stream_reader",
+        CHAT_SERVE,
+        When::Metal,
+        "true",
+        TUNED_FLOW,
+    ),
+    (
+        "models.qwen3_5.eos_gate",
+        CHAT_SERVE,
+        When::Metal,
+        "false",
+        PRE_TREE,
+    ),
+    (
+        "models.qwen3_5.eos_gate_cores",
+        CHAT_SERVE,
+        When::Metal,
+        "false",
+        PRE_TREE,
+    ),
+    (
+        "decode.readback.queued_steps",
+        CHAT_SERVE,
+        When::Metal,
+        "0",
+        PRE_TREE,
+    ),
+    (
+        "kernels.residency.attach",
+        CHAT_SERVE,
+        When::Metal,
+        "queue",
+        RESIDENCY_ATTACH,
+    ),
+    (
+        "kernels.attention.flash.partial_block",
+        CHAT_SERVE,
+        When::ModelAxes,
+        "8",
+        TUNED_FLOW,
+    ),
+    (
+        "kernels.fusion.norm_in_gemv",
+        CHAT_SERVE,
+        When::ModelAxes,
+        "true",
+        TUNED_FLOW,
+    ),
+    (
+        "models.lfm2.rows_kernels",
+        CHAT_SERVE,
+        When::ModelAxes,
+        "per-row",
+        TUNED_FLOW,
+    ),
+    (
+        "speculative.dspark.context_kv",
+        CHAT_SERVE,
+        When::ModelAxes,
+        "paged",
+        TUNED_FLOW,
+    ),
+    (
+        "context.kv.layout",
+        CHAT_SERVE,
+        When::ModelAxes,
+        "paged",
+        TUNED_FLOW,
+    ),
+    (
+        "context.kv.layout",
+        CHAT_SERVE,
+        When::DsparkSingle,
+        "paged",
+        DSPARK_SINGLE,
+    ),
+    (
+        "kernels.attention.impl",
+        CHAT_SERVE,
+        When::ModelAxes,
+        "flash",
+        TUNED_FLOW,
+    ),
+    (
+        "kernels.attention.qkv_layout",
+        CHAT_SERVE,
+        When::ModelAxes,
+        "fused",
+        TUNED_FLOW,
+    ),
+    (
+        "kernels.fusion.conv",
+        CHAT_SERVE,
+        When::ModelAxes,
+        "true",
+        TUNED_FLOW,
+    ),
+    (
+        "models.lfm2.conv_prefill_context",
+        CHAT_SERVE,
+        When::ModelAxes,
+        "true",
+        TUNED_FLOW,
+    ),
+    (
+        "server.keep_warm",
+        &[Frontend::Serve],
+        When::MetalSingle,
+        "1000",
+        KEEP_WARM,
+    ),
+    (
+        "server.keep_warm_pressure",
+        &[Frontend::Serve],
+        When::MetalSingle,
+        "false",
+        KEEP_WARM_PRESSURE,
+    ),
+    (
+        "kernels.gemm.f16_rows_max",
+        &[Frontend::Serve, Frontend::Bench],
+        When::Metal,
+        "10",
+        ROWS_MAX,
+    ),
+    (
+        "kernels.gemm.f16_rows_decode",
+        &[Frontend::Serve, Frontend::Bench],
+        When::MetalBatched,
+        "false",
+        DECODE_ROWS,
+    ),
+];
 
 type Front<'a> = Box<dyn Fn(&mut EngineOptions) -> Result<(), String> + 'a>;
 
@@ -76,11 +312,34 @@ fn typed(key: &str, value: &str) -> Value {
     at(&o, key)
 }
 
+/// The library tree before the option tree, read back into today's, and
+/// the fields the dump wrote.
+fn before_tree() -> (EngineOptions, Vec<String>) {
+    #[allow(unused_mut)]
+    let mut before: Value = serde_json::from_str(BEFORE_TREE).unwrap();
+    // The dump was taken on aarch64, where the poll's default is `wfe`; the
+    // grammar refuses `wfe` elsewhere (`unknown poll mechanism`), so off
+    // aarch64 the key is left unset and resolves to that platform's own
+    // default — the one platform-specific value the dump carries.
+    #[cfg(not(target_arch = "aarch64"))]
+    if let Some(r) = before
+        .pointer_mut("/decode/readback")
+        .and_then(Value::as_object_mut)
+    {
+        r.remove("poll");
+    }
+    let mut o = EngineOptions::default();
+    let written = index().merge_written(&mut o, &before).unwrap();
+    (o, written.into_iter().collect())
+}
+
 /// The arguments that put a front-end at a batch where a row needs one.
 fn batch_for(r: &frontend::Row) -> Vec<&'static str> {
     match r.when {
-        When::Batched => vec!["--batch", "4"],
-        When::Always => vec![],
+        When::Batched | When::MetalBatched => vec!["--batch", "4"],
+        // No `--model`: the LFM2 snapshot, whose family takes the model axes.
+        When::Always | When::Metal | When::ModelAxes | When::MetalSingle => vec![],
+        When::DsparkSingle => vec!["--dspark"],
     }
 }
 
@@ -93,13 +352,25 @@ fn each_front_end_resolves_its_own_defaults_through_the_command_line() {
     for r in ROWS {
         let argv = batch_for(r);
         let o = resolve(Some(r.frontend), r.frontend.name(), &argv, &none).unwrap();
-        assert_eq!(
-            at(&o, r.key),
-            typed(r.key, frontend::value(r)),
-            "{} {}",
-            r.frontend.name(),
-            r.key
-        );
+        if r.when.holds(&o) {
+            assert_eq!(
+                at(&o, r.key),
+                typed(r.key, frontend::value(r)),
+                "{} {}",
+                r.frontend.name(),
+                r.key
+            );
+        } else {
+            // A row whose condition this build cannot meet (the model axes
+            // without Metal) leaves the library's own value.
+            assert_eq!(
+                at(&o, r.key),
+                at(&EngineOptions::default(), r.key),
+                "{} {} (row not held)",
+                r.frontend.name(),
+                r.key
+            );
+        }
         checked += 1;
         if r.key == "context.prefix.reuse" {
             let shape = Shape::of(&o, r.frontend, String::new());
@@ -113,6 +384,39 @@ fn each_front_end_resolves_its_own_defaults_through_the_command_line() {
         assert_eq!(at(&lib, r.key), at(&EngineOptions::default(), r.key));
     }
     assert_eq!(checked, ROWS.len());
+    // `--cpu` keeps the model axes at the library's values on every
+    // front-end: the paged pool, FlashDecoding and the fused conv are Metal
+    // kernels, and a CPU load must not be refused by its own defaults.
+    for f in Frontend::ALL {
+        for argv in [&["--cpu"][..], &["--cpu", "--dspark"]] {
+            let o = resolve(Some(f), f.name(), argv, &none).unwrap();
+            for r in ROWS.iter().filter(|r| {
+                r.frontend == f
+                    && matches!(
+                        r.when,
+                        When::Metal
+                            | When::ModelAxes
+                            | When::DsparkSingle
+                            | When::MetalSingle
+                            | When::MetalBatched
+                    )
+            }) {
+                assert!(
+                    !r.when.holds(&o),
+                    "{} {} holds on {argv:?}",
+                    f.name(),
+                    r.key
+                );
+                assert_eq!(
+                    at(&o, r.key),
+                    at(&EngineOptions::default(), r.key),
+                    "{} {} on {argv:?}",
+                    f.name(),
+                    r.key
+                );
+            }
+        }
+    }
     // The shape a front-end loads with, from options no front-end resolved
     // (a harness's, a test's): the front-end's own reuse still applies.
     for f in Frontend::ALL {
@@ -138,6 +442,356 @@ fn each_front_end_resolves_its_own_defaults_through_the_command_line() {
     assert_eq!(c.frontend, Some(Frontend::Serve));
 }
 
+/// The speculative body at one sequence takes the in-place KV through the
+/// command line on chat and serve, after the paged row; the KV given by any
+/// spelling holds, and a named preset's own KV is left to it; at a batch,
+/// without a drafter, with `auto` (resolved at load, after the rows) and on
+/// bench, the row does not hold.
+#[test]
+fn the_speculative_body_at_one_sequence_keeps_the_in_place_kv() {
+    let none = BTreeMap::new();
+    let key = "context.kv.layout";
+    let kv =
+        |f: Frontend, argv: &[&str]| at(&resolve(Some(f), f.name(), argv, &none).unwrap(), key);
+    let library = at(&EngineOptions::default(), key);
+    let metal = When::ModelAxes.holds(&resolve(Some(Frontend::Chat), "chat", &[], &none).unwrap());
+    let (in_place, paged) = if metal {
+        (typed(key, "in-place"), typed(key, "paged"))
+    } else {
+        (library.clone(), library.clone())
+    };
+    for f in [Frontend::Chat, Frontend::Serve] {
+        let n = f.name();
+        assert_eq!(kv(f, &["--dspark"]), in_place, "{n} --dspark");
+        assert_eq!(
+            kv(f, &["--speculate", "dspark"]),
+            in_place,
+            "{n} --speculate dspark"
+        );
+        assert_eq!(
+            kv(f, &["--dspark", "--kv-append", "paged"]),
+            typed(key, "paged"),
+            "{n} named"
+        );
+        assert_eq!(
+            kv(f, &["--dspark", "--set", "context.kv.layout=cat"]),
+            typed(key, "cat"),
+            "{n} named by key"
+        );
+        let env = BTreeMap::from([("LLOOM_CONTEXT__KV__LAYOUT".to_string(), "paged".to_string())]);
+        assert_eq!(
+            at(&resolve(Some(f), n, &["--dspark"], &env).unwrap(), key),
+            typed(key, "paged"),
+            "{n} named by env"
+        );
+        assert_eq!(
+            kv(f, &["--dspark", "--set", "scheduler.max_sequences=2"]),
+            paged,
+            "{n} at a batch"
+        );
+        // A named preset is explicit for its KV: no row sets it, and the
+        // load takes the preset's (`a_named_preset_keeps_the_axes_it_sets`).
+        assert_eq!(
+            kv(f, &["--dspark", "--set", "models.lfm2.preset=rewindable"]),
+            library,
+            "{n} on the rewindable preset"
+        );
+        assert_eq!(
+            kv(f, &["--dspark", "--set", "models.lfm2.preset=pool-spec"]),
+            library,
+            "{n} on the pool preset"
+        );
+        assert_eq!(kv(f, &["--speculate", "auto"]), paged, "{n} auto");
+        assert_eq!(kv(f, &[]), paged, "{n} plain");
+    }
+    assert_eq!(kv(Frontend::Bench, &["--dspark"]), library, "bench");
+}
+
+/// The keys of the axes every LFM2 preset sets (`lfm2_presets::AXES`), by
+/// value: what a named preset makes explicit.
+const PRESET_AXIS_KEYS: &[&str] = &[
+    "context.kv.layout",
+    "kernels.attention.impl",
+    "kernels.attention.qkv_layout",
+    "kernels.fusion.conv",
+    "kernels.fusion.gemv_residual",
+    "kernels.fusion.gemv_silu",
+    "models.lfm2.conv_state",
+];
+
+/// The front-end rows a named preset takes over: chat's and serve's rows on
+/// a preset's axes. A row added on one fails here by name.
+const PRESET_ROW_KEYS: &[&str] = &[
+    "context.kv.layout",
+    "kernels.attention.impl",
+    "kernels.attention.qkv_layout",
+    "kernels.fusion.conv",
+];
+
+/// The preset named alone, by its field.
+fn preset_named() -> BTreeSet<String> {
+    index().keys[ModelConfig::PRESET_KEY]
+        .targets
+        .iter()
+        .map(|l| l.storage.clone())
+        .collect()
+}
+
+/// Every spelling that names the preset `p`: the flag, the key and the
+/// field's own dotted spelling, the env name, both JSON groups and a
+/// `--config` file (written under `dir`).
+fn preset_spellings(
+    p: &str,
+    dir: &std::path::Path,
+) -> Vec<(String, Vec<String>, BTreeMap<String, String>)> {
+    let file = dir.join(format!("preset-{p}.json"));
+    std::fs::write(
+        &file,
+        json!({"models": {"lfm2": {"preset": p}}}).to_string(),
+    )
+    .unwrap();
+    let argv = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    let none = BTreeMap::new;
+    vec![
+        ("--cache".into(), argv(&["--cache", p]), none()),
+        (
+            "--set key".into(),
+            argv(&["--set", &format!("{}={p}", ModelConfig::PRESET_KEY)]),
+            none(),
+        ),
+        (
+            "--set model.cache".into(),
+            argv(&["--set", &format!("model.cache={p}")]),
+            none(),
+        ),
+        (
+            "env".into(),
+            vec![],
+            BTreeMap::from([(index().keys[ModelConfig::PRESET_KEY].env(), p.to_string())]),
+        ),
+        (
+            "--model-config".into(),
+            argv(&["--model-config", &json!({ "cache": p }).to_string()]),
+            none(),
+        ),
+        (
+            "--models-config".into(),
+            argv(&[
+                "--models-config",
+                &json!({"lfm2": {"preset": p}}).to_string(),
+            ]),
+            none(),
+        ),
+        (
+            "--config".into(),
+            argv(&["--config", &file.display().to_string()]),
+            none(),
+        ),
+    ]
+}
+
+/// A named preset gives the front-end the axes it sets, and `auto` none, on
+/// any build; the keys a layer named stay the named ones. The rows on those
+/// axes are the pinned ones.
+#[test]
+fn a_named_preset_names_the_axes_it_sets() {
+    let idx = index();
+    let axes: BTreeSet<String> = PRESET_AXIS_KEYS.iter().map(|k| k.to_string()).collect();
+    let named = named_keys(idx, &preset_named());
+    assert_eq!(named, BTreeSet::from([ModelConfig::PRESET_KEY.to_string()]));
+    for p in CACHE_PRESETS {
+        let mut o = EngineOptions::default();
+        idx.set(&mut o, ModelConfig::PRESET_KEY, p).unwrap();
+        let want = if *p == "auto" {
+            BTreeSet::new()
+        } else {
+            axes.clone()
+        };
+        assert_eq!(preset_keys(idx, &o, &named), want, "{p}");
+        // A preset no layer named gives nothing.
+        assert!(preset_keys(idx, &o, &BTreeSet::new()).is_empty(), "{p}");
+    }
+    // A key named beside the preset stays named.
+    let mut o = EngineOptions::default();
+    idx.set(&mut o, ModelConfig::PRESET_KEY, "crown").unwrap();
+    let mut storage = preset_named();
+    storage.insert("model.axes.flash-scratch-sizing".into());
+    let named = named_keys(idx, &storage);
+    assert_eq!(
+        named,
+        BTreeSet::from([
+            "kernels.attention.flash.scratch".to_string(),
+            ModelConfig::PRESET_KEY.to_string()
+        ])
+    );
+    assert_eq!(preset_keys(idx, &o, &named), axes);
+    // The rows on those axes are the pinned ones.
+    let rows: BTreeSet<&str> = ROWS
+        .iter()
+        .filter(|r| axes.contains(r.key))
+        .map(|r| r.key)
+        .collect();
+    assert_eq!(
+        rows,
+        PRESET_ROW_KEYS.iter().copied().collect::<BTreeSet<_>>(),
+        "the rows on a preset's axes moved; pin them here"
+    );
+}
+
+/// A named preset on chat and serve, by every spelling, with and without a
+/// drafter: the tree differs from the unnamed one in the preset and in each
+/// row on its axes that held, which it leaves unset for the preset; every
+/// other row resolves as before. `auto` named is the unnamed tree. A key
+/// named beside the preset holds, and the preset keeps the rest. The arms
+/// the load builds (the preset, then the axes, as `lfm2::shape_key` does):
+/// on Metal the unnamed `auto` takes the rows' paged KV with FlashDecoding,
+/// `--cache crown` the crown's in-place KV with sdpa.
+#[test]
+fn a_named_preset_keeps_the_axes_it_sets() {
+    let idx = index();
+    let none = BTreeMap::new();
+    let dir = std::env::temp_dir().join(format!("lloom-preset-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let flat = |o: &EngineOptions| idx.flat(o);
+    let library = idx.flat(&EngineOptions::default());
+    let mut checked = 0usize;
+    for f in [Frontend::Chat, Frontend::Serve] {
+        for extra in [&[][..], &["--dspark"][..]] {
+            let extra: Vec<String> = extra.iter().map(|s| s.to_string()).collect();
+            let args = |more: &[String]| {
+                let mut a = extra.clone();
+                a.extend_from_slice(more);
+                a
+            };
+            let run = |argv: &[String], env: &BTreeMap<String, String>| {
+                let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
+                resolve(Some(f), f.name(), &argv, env)
+                    .unwrap_or_else(|e| panic!("{} {argv:?}: {e}", f.name()))
+            };
+            let base = run(&args(&[]), &none);
+            let taken: BTreeSet<&str> = ROWS
+                .iter()
+                .filter(|r| r.frontend == f && PRESET_ROW_KEYS.contains(&r.key))
+                .filter(|r| r.when.holds(&base))
+                .map(|r| r.key)
+                .collect();
+            for p in CACHE_PRESETS {
+                for (label, argv, env) in preset_spellings(p, &dir) {
+                    let o = run(&args(&argv), &env);
+                    let (b, n) = (flat(&base), flat(&o));
+                    let moved: BTreeSet<&str> = n
+                        .keys()
+                        .filter(|k| b.get(*k) != n.get(*k))
+                        .map(String::as_str)
+                        .collect();
+                    let mut want: BTreeSet<&str> = BTreeSet::new();
+                    if *p != "auto" {
+                        want.insert(ModelConfig::PRESET_KEY);
+                        want.extend(taken.iter().copied());
+                    }
+                    let what = format!("{} {extra:?} {label} {p}", f.name());
+                    assert_eq!(moved, want, "{what}");
+                    assert_eq!(o.model.cache, *p, "{what}");
+                    if *p != "auto" {
+                        for k in PRESET_ROW_KEYS {
+                            assert_eq!(n[*k], library[*k], "{what}: {k} is the preset's");
+                        }
+                    }
+                    checked += 1;
+                }
+            }
+        }
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+    assert_eq!(checked, 2 * 2 * CACHE_PRESETS.len() * 7);
+
+    // A key named beside the preset holds; the preset keeps the rest.
+    let chat = |argv: &[&str]| resolve(Some(Frontend::Chat), "chat", argv, &none).unwrap();
+    let (kv, attn) = ("context.kv.layout", "kernels.attention.impl");
+    let o = chat(&["--cache", "crown", "--kv-append", "paged"]);
+    assert_eq!(
+        (at(&o, kv), at(&o, attn)),
+        (typed(kv, "paged"), library[attn].clone())
+    );
+    let o = chat(&["--cache", "crown", "--set", "kernels.attention.impl=flash"]);
+    assert_eq!(
+        (at(&o, kv), at(&o, attn)),
+        (library[kv].clone(), typed(attn, "flash"))
+    );
+
+    // The arms the load builds, at one sequence without a drafter.
+    use lloom::models::lfm2::{AttnImpl, Config, KvAppend};
+    let arms = |o: &EngineOptions| {
+        let mut c = Config::default();
+        lloom::models::lfm2_presets::crown(&mut c);
+        o.model.apply_axes(&mut c).unwrap();
+        (c.kv_append, c.attn_impl)
+    };
+    let metal = When::ModelAxes.holds(&chat(&[]));
+    assert_eq!(
+        arms(&chat(&[])),
+        if metal {
+            (KvAppend::Paged, AttnImpl::FlashDecoding)
+        } else {
+            (KvAppend::InPlace, AttnImpl::Sdpa)
+        },
+        "chat, no preset named"
+    );
+    assert_eq!(
+        arms(&chat(&["--cache", "crown"])),
+        (KvAppend::InPlace, AttnImpl::Sdpa)
+    );
+    assert_eq!(
+        arms(&chat(&["--cache", "crown", "--kv-append", "paged"])),
+        (KvAppend::Paged, AttnImpl::Sdpa)
+    );
+    assert_eq!(
+        arms(&chat(&["--cache", "crown", "--attn", "flash"])),
+        (KvAppend::InPlace, AttnImpl::FlashDecoding)
+    );
+}
+
+/// The front-end table is the pinned one, row for row; each row another
+/// change moved is reported beside the library's value before the option
+/// tree, and none of them is an exception.
+#[test]
+fn every_front_end_row_is_pinned_by_value() {
+    let pinned: Vec<(&str, Frontend, When, &str)> = PINNED_ROWS
+        .iter()
+        .flat_map(|&(k, fs, w, v, _)| fs.iter().map(move |&f| (k, f, w, v)))
+        .collect();
+    let table: Vec<(&str, Frontend, When, &str)> = ROWS
+        .iter()
+        .map(|r| (r.key, r.frontend, r.when, r.before))
+        .collect();
+    let unpinned: Vec<_> = table.iter().filter(|t| !pinned.contains(t)).collect();
+    let gone: Vec<_> = pinned.iter().filter(|p| !table.contains(p)).collect();
+    assert!(
+        unpinned.is_empty() && gone.is_empty(),
+        "the front-end table moved; pin each row with where its value comes from\n\
+         in the table, not pinned: {unpinned:?}\npinned, not in the table: {gone:?}"
+    );
+    assert_eq!(table.len(), pinned.len(), "a row appears twice");
+    let (before, _) = before_tree();
+    for &(k, fs, w, v, why) in PINNED_ROWS.iter().filter(|p| p.4 != PRE_TREE) {
+        // A moved row carries an exception only where its source names it.
+        for e in EXCEPTIONS.iter().filter(|e| e.key == k && e.when == w) {
+            assert!(
+                why.contains(&format!("decision {}", e.decision)),
+                "{k} is decision {}'s, which its pin does not name",
+                e.decision
+            );
+        }
+        let names: Vec<&str> = fs.iter().map(|f| f.name()).collect();
+        eprintln!(
+            "[{k}: the library's {} before the option tree; {} now {}: {why}]",
+            at(&before, k),
+            names.join(", "),
+            typed(k, v)
+        );
+    }
+}
+
 /// Every way to name a key a front-end resolves itself is explicit: the
 /// value given holds, the library's default and the front-end's own
 /// included, through the flags, `--set` by key and by older dotted
@@ -159,8 +813,22 @@ fn every_spelling_of_a_front_end_key_names_it_and_the_value_holds() {
             Value::Null => {}
             v => values.push(lloom_tensor::options::render(v)),
         }
+        // An enum key (`metal3 | metal4 | auto`) takes another of its arms
+        // rather than a number it would refuse.
+        let arms: Vec<&str> = key
+            .meta()
+            .variants
+            .iter()
+            .copied()
+            .filter(|a| !a.contains('<'))
+            .collect();
         if key.meta().is_bool || key.meta().ty.contains("bool") {
             values = vec!["true".into(), "false".into()];
+        } else if !arms.is_empty() {
+            let other = arms
+                .iter()
+                .find(|a| !values.iter().any(|v| typed(r.key, v) == typed(r.key, a)));
+            values.extend(other.map(|a| a.to_string()));
         } else {
             values.push("7".into());
         }
@@ -298,21 +966,7 @@ fn the_unset_defaults_are_the_trees_before_it_except_the_named_exceptions() {
     let idx = index();
     let none = BTreeMap::new();
     // 1. The library tree.
-    #[allow(unused_mut)]
-    let mut before: Value = serde_json::from_str(BEFORE_TREE).unwrap();
-    // The dump was taken on aarch64, where the poll's default is `wfe`; the
-    // grammar refuses `wfe` elsewhere (`unknown poll mechanism`), so off
-    // aarch64 the key is left unset and resolves to that platform's own
-    // default — the one platform-specific value the dump carries.
-    #[cfg(not(target_arch = "aarch64"))]
-    if let Some(r) = before
-        .pointer_mut("/decode/readback")
-        .and_then(Value::as_object_mut)
-    {
-        r.remove("poll");
-    }
-    let mut o = EngineOptions::default();
-    let written = idx.merge_written(&mut o, &before).unwrap();
+    let (o, written) = before_tree();
     assert!(written.len() >= 180, "{} fields read", written.len());
     let now = idx.flat(&EngineOptions::default());
     let mut diff: Vec<String> = Vec::new();
@@ -392,33 +1046,84 @@ fn the_unset_defaults_are_the_trees_before_it_except_the_named_exceptions() {
 
     // 3. The approved exceptions, by number.
     for e in EXCEPTIONS {
-        let r = frontend::row(e.key, e.frontend).unwrap();
+        let r = frontend::rows_for(e.key, e.frontend)
+            .find(|r| r.when == e.when)
+            .unwrap();
         let o = resolve(Some(e.frontend), e.frontend.name(), &batch_for(r), &none).unwrap();
-        let want = if e.landed { e.after } else { e.before };
+        // A landed exception resolves to its `after` where its row holds; a
+        // row a build cannot hold (the Metal rows on the CPU-only x86 gate)
+        // leaves the library's value.
+        let want = if !r.when.holds(&o) {
+            at(&EngineOptions::default(), e.key)
+        } else if e.landed {
+            typed(e.key, e.after)
+        } else {
+            typed(e.key, e.before)
+        };
         assert_eq!(
             at(&o, e.key),
-            typed(e.key, want),
+            want,
             "decision {} ({}, landed = {})",
             e.decision,
             e.owner,
             e.landed
         );
     }
+    // An exception on a preset's axis decides the unnamed preset only: under
+    // a named preset its row is skipped and the key left to the preset.
+    for e in EXCEPTIONS
+        .iter()
+        .filter(|e| PRESET_AXIS_KEYS.contains(&e.key))
+    {
+        let r = frontend::rows_for(e.key, e.frontend)
+            .find(|r| r.when == e.when)
+            .unwrap();
+        for p in CACHE_PRESETS.iter().filter(|p| **p != "auto") {
+            let mut argv = batch_for(r);
+            argv.extend(["--cache", p]);
+            let o = resolve(Some(e.frontend), e.frontend.name(), &argv, &none).unwrap();
+            assert_eq!(
+                at(&o, e.key),
+                at(&EngineOptions::default(), e.key),
+                "decision {} under --cache {p}",
+                e.decision
+            );
+        }
+    }
     let decided: Vec<u32> = EXCEPTIONS.iter().map(|e| e.decision).collect();
     assert_eq!(
         decided,
-        [36],
-        "the approved default changes are decision 36 alone"
+        [36, 43, 43, 43, 43, 35, 35, 52, 52, 54, 54, 56, 56, 57, 60, 60],
+        "the approved default changes: decision 36 (serve reuse), 43 (the gate and its cores arm, chat and serve), 35 (the lead, chat and serve), 52 (B = 1 DSpark's in-place KV, chat and serve), 54 (the batched decode rows on the row axis, serve and bench), 56 (the device set off the Metal 3 queue, chat and serve), 57 (the keep-warm's pressure stop, serve), 60 (the row axis's ceiling 12, serve and bench)"
     );
-
-    // 4. Decisions 43/44: the EOS watch (and the Qwen gate, when it lands)
-    // stay opt-in on every front-end.
+    // 4. Decision 44: the EOS watch stays opt-in on every front-end.
+    // Decisions 43/35 (2026-10-19): the gate, its cores arm and the lead of 4
+    // are chat's and serve's defaults where the Metal rows hold — a Metal
+    // build, not `--cpu` — and the library's values on bench and on the CPU.
     for f in Frontend::ALL {
         let o = resolve(Some(f), f.name(), &[], &none).unwrap();
         assert_eq!(at(&o, "decode.ring.eos_watch"), false, "{}", f.name());
-        if idx.keys.contains_key("models.qwen3_5.eos_gate") {
-            assert_eq!(at(&o, "models.qwen3_5.eos_gate"), false, "{}", f.name());
-        }
+        let on = matches!(f, Frontend::Chat | Frontend::Serve) && When::Metal.holds(&o);
+        assert_eq!(at(&o, "models.qwen3_5.eos_gate"), on, "{} gate", f.name());
+        assert_eq!(
+            at(&o, "models.qwen3_5.eos_gate_cores"),
+            on,
+            "{} cores",
+            f.name()
+        );
+        assert_eq!(
+            at(&o, "decode.readback.queued_steps"),
+            typed("decode.readback.queued_steps", if on { "4" } else { "0" }),
+            "{} lead",
+            f.name()
+        );
+        let cpu = resolve(Some(f), f.name(), &["--cpu"], &none).unwrap();
+        assert_eq!(
+            at(&cpu, "models.qwen3_5.eos_gate"),
+            false,
+            "{} gate on --cpu",
+            f.name()
+        );
     }
 
     // 5. Decisions 32/47: the session's absent, null and explicit values.
@@ -558,4 +1263,383 @@ fn the_help_and_the_schema_say_each_front_ends_default() {
     assert!(node("decode.in_flight_forwards")
         .get("x-lloom-frontend-defaults")
         .is_none());
+}
+
+/// Serve keeps the GPU warm by default where its row holds — on Metal at one
+/// sequence — for 180 s after the last request; at a batch, on the CPU and
+/// on the other front-ends the key stays unset (off). `0` by any spelling,
+/// the subcommand's flag included, is the opt-out and holds, as do a period
+/// and a bound given; `none` is serve's own.
+#[test]
+fn serve_keeps_warm_by_default_on_metal_at_one_sequence() {
+    let none = BTreeMap::new();
+    let serve = |argv: &[&str]| resolve(Some(Frontend::Serve), "serve", argv, &none).unwrap();
+    let on = When::MetalSingle.holds(&serve(&[]));
+    assert_eq!(on, When::Metal.holds(&serve(&[])), "batch 1 by default");
+    let o = serve(&[]);
+    assert_eq!(o.server.keep_warm, on.then_some(1000), "serve's default");
+    assert_eq!(o.server.keep_warm_for_s, 180, "the bound's default");
+    assert_eq!(o.server.keep_warm_by, "residency");
+    assert_eq!(
+        serve(&["--batch", "4"]).server.keep_warm,
+        None,
+        "at a batch"
+    );
+    assert_eq!(
+        serve(&["--set", "scheduler.max_sequences=2"])
+            .server
+            .keep_warm,
+        None,
+        "at a batch, by key"
+    );
+    assert_eq!(serve(&["--cpu"]).server.keep_warm, None, "on the CPU");
+    assert_eq!(
+        serve(&["--set", "server.keep_warm=none"]).server.keep_warm,
+        on.then_some(1000),
+        "`none` is serve's own"
+    );
+    for argv in [
+        &["--keep-warm", "0"][..],
+        &["--set", "server.keep_warm=0"],
+        &["--server-config", r#"{"keep_warm": 0}"#],
+    ] {
+        assert_eq!(
+            serve(argv).server.keep_warm,
+            Some(0),
+            "the opt-out {argv:?}"
+        );
+    }
+    let env = BTreeMap::from([(index().keys["server.keep_warm"].env(), "0".to_string())]);
+    assert_eq!(
+        resolve(Some(Frontend::Serve), "serve", &[], &env)
+            .unwrap()
+            .server
+            .keep_warm,
+        Some(0),
+        "the opt-out by env"
+    );
+    let o = serve(&["--keep-warm", "500", "--keep-warm-for", "0"]);
+    assert_eq!(
+        (o.server.keep_warm, o.server.keep_warm_for_s),
+        (Some(500), 0)
+    );
+    for f in [Frontend::Chat, Frontend::Bench] {
+        let o = resolve(Some(f), f.name(), &[], &none).unwrap();
+        assert_eq!(o.server.keep_warm, None, "{}", f.name());
+    }
+    assert_eq!(
+        frontend::describe("server.keep_warm").unwrap(),
+        "serve: 1000 when on Metal at scheduler.max_sequences = 1"
+    );
+}
+
+/// Decision 54: serve and bench resolve the batched decode rows' arm on at a
+/// batch on Metal no wider than the row axis's ceiling, which decision 60
+/// puts at 12 there (`the_row_axis_ceiling_is_twelve_where_the_batched_loops_run`).
+/// At one sequence, at a batch past the ceiling, on chat, on the CPU and
+/// wherever a layer names the key, the library's off (or the value named)
+/// holds; a ceiling named by key moves the widest batch with it.
+#[test]
+fn the_batched_decode_rows_arm_is_on_at_a_batch_on_metal() {
+    let none = BTreeMap::new();
+    let key = "kernels.gemm.f16_rows_decode";
+    let get = |f: Frontend, argv: &[&str], env: &BTreeMap<String, String>| {
+        at(&resolve(Some(f), f.name(), argv, env).unwrap(), key)
+    };
+    let metal = When::Metal.holds(&resolve(Some(Frontend::Serve), "serve", &[], &none).unwrap());
+    assert_eq!(
+        at(&EngineOptions::default(), key),
+        Value::Bool(false),
+        "the library's value"
+    );
+    assert_eq!(get(Frontend::Chat, &[], &none), Value::Bool(false), "chat");
+    for f in [Frontend::Serve, Frontend::Bench] {
+        let name = f.name();
+        assert_eq!(
+            get(f, &["--batch", "4"], &none),
+            Value::Bool(metal),
+            "{name} at a batch"
+        );
+        assert_eq!(
+            get(f, &["--set", "scheduler.max_sequences=2"], &none),
+            Value::Bool(metal),
+            "{name} at a batch, by key"
+        );
+        for b in ["10", "11", "12"] {
+            assert_eq!(
+                get(f, &["--batch", b], &none),
+                Value::Bool(metal),
+                "{name} at a batch of {b}, within decision 60's ceiling"
+            );
+        }
+        assert_eq!(
+            get(f, &["--batch", "13"], &none),
+            Value::Bool(false),
+            "{name} at a batch past the ceiling"
+        );
+        assert_eq!(
+            get(f, &["--batch", "16"], &none),
+            Value::Bool(false),
+            "{name} at a batch of 16"
+        );
+        assert_eq!(
+            get(
+                f,
+                &["--batch", "11", "--set", "kernels.gemm.f16_rows_max=10"],
+                &none
+            ),
+            Value::Bool(false),
+            "{name} at a batch past a ceiling named by key"
+        );
+        assert_eq!(
+            get(
+                f,
+                &["--batch", "14", "--set", "kernels.gemm.f16_rows_max=14"],
+                &none
+            ),
+            Value::Bool(metal),
+            "{name} at a batch of a raised ceiling"
+        );
+        assert_eq!(
+            get(f, &[], &none),
+            Value::Bool(false),
+            "{name} at one sequence"
+        );
+        assert_eq!(
+            get(f, &["--cpu", "--batch", "4"], &none),
+            Value::Bool(false),
+            "{name} on the CPU"
+        );
+        for argv in [
+            &[
+                "--batch",
+                "4",
+                "--set",
+                "kernels.gemm.f16_rows_decode=false",
+            ][..],
+            &["--batch", "4", "--gemm-f16-rows-decode=false"],
+        ] {
+            assert_eq!(
+                get(f, argv, &none),
+                Value::Bool(false),
+                "{name}: the opt-out {argv:?}"
+            );
+        }
+        let env = BTreeMap::from([("LLOOM_GEMM_F16_ROWS_DECODE".to_string(), "0".to_string())]);
+        assert_eq!(
+            get(f, &["--batch", "4"], &env),
+            Value::Bool(false),
+            "{name}: the opt-out by env"
+        );
+    }
+    assert_eq!(
+        frontend::describe(key).unwrap(),
+        "serve: true when on Metal at scheduler.max_sequences from 2 to \
+         kernels.gemm.f16_rows_max (decision 54: was false), bench: true when on Metal at \
+         scheduler.max_sequences from 2 to kernels.gemm.f16_rows_max (decision 54: was false)"
+    );
+}
+
+/// Decision 60: serve and bench resolve the f16 row axis's ceiling to 12 on
+/// Metal, one value for the batched decode rows and the batched speculative
+/// windows (`tuning.md` §13.5zb). Chat (one sequence, whose window is at
+/// most 10 rows), the CPU, the library and every layer that names the key
+/// keep the library's 10 or the value named.
+#[test]
+fn the_row_axis_ceiling_is_twelve_where_the_batched_loops_run() {
+    let none = BTreeMap::new();
+    let key = "kernels.gemm.f16_rows_max";
+    let get = |f: Frontend, argv: &[&str], env: &BTreeMap<String, String>| {
+        at(&resolve(Some(f), f.name(), argv, env).unwrap(), key)
+    };
+    let metal = When::Metal.holds(&resolve(Some(Frontend::Serve), "serve", &[], &none).unwrap());
+    let twelve = if metal { json!(12) } else { json!(10) };
+    assert_eq!(
+        at(&EngineOptions::default(), key),
+        json!(10),
+        "the library's value"
+    );
+    assert_eq!(get(Frontend::Chat, &[], &none), json!(10), "chat");
+    for f in [Frontend::Serve, Frontend::Bench] {
+        let name = f.name();
+        assert_eq!(get(f, &[], &none), twelve, "{name} at one sequence");
+        assert_eq!(
+            get(f, &["--batch", "12"], &none),
+            twelve,
+            "{name} at a batch"
+        );
+        assert_eq!(
+            get(f, &["--cpu", "--batch", "4"], &none),
+            json!(10),
+            "{name} on the CPU"
+        );
+        for argv in [
+            &["--batch", "12", "--set", "kernels.gemm.f16_rows_max=10"][..],
+            &["--batch", "12", "--gemm-f16-rows-max", "10"],
+        ] {
+            assert_eq!(
+                get(f, argv, &none),
+                json!(10),
+                "{name}: the opt-out {argv:?}"
+            );
+        }
+        let env = BTreeMap::from([("LLOOM_GEMM_F16_ROWS_MAX".to_string(), "10".to_string())]);
+        assert_eq!(
+            get(f, &["--batch", "12"], &env),
+            json!(10),
+            "{name}: the opt-out by env"
+        );
+    }
+    assert_eq!(
+        frontend::describe(key).unwrap(),
+        "serve: 12 when on Metal (a Metal build, not --cpu) (decision 60: was 10), \
+         bench: 12 when on Metal (a Metal build, not --cpu) (decision 60: was 10)"
+    );
+}
+
+/// Decision 56: chat and serve resolve the device set's attachment to
+/// `heartbeat` on Metal, under either command-buffer API (Metal 4 ignores the
+/// arm at its queue, and says so on the loaded line). Bench, the CPU and every
+/// layer that names the key keep the library's `queue`, or the value named.
+#[test]
+fn chat_and_serve_detach_the_device_set_on_metal_by_default() {
+    let none = BTreeMap::new();
+    let key = "kernels.residency.attach";
+    let get = |f: Frontend, argv: &[&str], env: &BTreeMap<String, String>| {
+        at(&resolve(Some(f), f.name(), argv, env).unwrap(), key)
+    };
+    let metal = When::Metal.holds(&resolve(Some(Frontend::Serve), "serve", &[], &none).unwrap());
+    let (heartbeat, queue) = (typed(key, "heartbeat"), typed(key, "queue"));
+    assert_eq!(
+        at(&EngineOptions::default(), key),
+        queue,
+        "the library's value"
+    );
+    let default = if metal { &heartbeat } else { &queue };
+    for &f in CHAT_SERVE {
+        let name = f.name();
+        assert_eq!(&get(f, &[], &none), default, "{name}");
+        for api in ["metal3", "metal4", "auto"] {
+            assert_eq!(
+                &get(f, &["--metal-api", api], &none),
+                default,
+                "{name} --metal-api {api}"
+            );
+        }
+        assert_eq!(get(f, &["--cpu"], &none), queue, "{name} on the CPU");
+        for argv in [
+            &["--residency-attach", "queue"][..],
+            &["--set", "kernels.residency.attach=queue"],
+            &["--metal-api", "metal3", "--residency-attach", "queue"],
+        ] {
+            assert_eq!(get(f, argv, &none), queue, "{name}: the opt-out {argv:?}");
+        }
+        let env = BTreeMap::from([("LLOOM_RESIDENCY_ATTACH".to_string(), "queue".to_string())]);
+        assert_eq!(get(f, &[], &env), queue, "{name}: the opt-out by env");
+    }
+    for argv in [&[][..], &["--metal-api", "metal3"]] {
+        assert_eq!(get(Frontend::Bench, argv, &none), queue, "bench {argv:?}");
+    }
+    assert_eq!(
+        frontend::describe(key).unwrap(),
+        "chat: heartbeat when on Metal (a Metal build, not --cpu) (decision 56: was queue), \
+         serve: heartbeat when on Metal (a Metal build, not --cpu) (decision 56: was queue)"
+    );
+}
+
+/// Decision 57: serve's keep-warm stands down under memory pressure where it
+/// runs by default — on Metal at one sequence — a period given by name
+/// included. At a batch, on the CPU and on the other front-ends the key stays
+/// unset (the keep-warm ignores pressure); `false` by any spelling, the
+/// subcommand's flag included, is the opt-out and holds; `none` is serve's own.
+#[test]
+fn serves_keep_warm_stands_down_under_memory_pressure_by_default() {
+    let none = BTreeMap::new();
+    let serve = |argv: &[&str], env: &BTreeMap<String, String>| {
+        resolve(Some(Frontend::Serve), "serve", argv, env)
+            .unwrap()
+            .server
+            .keep_warm_pressure
+    };
+    let on = When::MetalSingle.holds(&resolve(Some(Frontend::Serve), "serve", &[], &none).unwrap());
+    let default = on.then_some(true);
+    assert_eq!(
+        EngineOptions::default().server.keep_warm_pressure,
+        None,
+        "the library's value"
+    );
+    assert_eq!(serve(&[], &none), default, "serve's default");
+    assert_eq!(
+        serve(&["--keep-warm", "500"], &none),
+        default,
+        "a period named by the layer keeps the front-end's stop"
+    );
+    assert_eq!(
+        serve(&["--set", "server.keep_warm_pressure=none"], &none),
+        default,
+        "`none` is serve's own"
+    );
+    assert_eq!(serve(&["--batch", "4"], &none), None, "at a batch");
+    assert_eq!(serve(&["--cpu"], &none), None, "on the CPU");
+    for argv in [
+        &["--keep-warm-pressure=false"][..],
+        &["--keep-warm-pressure", "false"],
+        &["--set", "server.keep_warm_pressure=false"],
+        &["--server-config", r#"{"keep_warm_pressure": false}"#],
+    ] {
+        assert_eq!(serve(argv, &none), Some(false), "the opt-out {argv:?}");
+    }
+    let env = BTreeMap::from([(
+        index().keys["server.keep_warm_pressure"].env(),
+        "false".to_string(),
+    )]);
+    assert_eq!(serve(&[], &env), Some(false), "the opt-out by env");
+    for f in [Frontend::Chat, Frontend::Bench] {
+        let o = resolve(Some(f), f.name(), &[], &none).unwrap();
+        assert_eq!(o.server.keep_warm_pressure, None, "{}", f.name());
+    }
+    assert_eq!(
+        frontend::describe("server.keep_warm_pressure").unwrap(),
+        "serve: true when on Metal at scheduler.max_sequences = 1 (decision 57: was false)"
+    );
+}
+
+/// `lloom serve`'s options at `argv`, installed, and the Metal device made
+/// from them: the device set and the loaded line's residency field.
+#[cfg(feature = "metal")]
+fn serves_device_set(argv: &[&str]) -> (u64, String) {
+    let o = resolve(Some(Frontend::Serve), "serve", argv, &BTreeMap::new()).unwrap();
+    assert_eq!(o.tuning.metal.residency_attach, "heartbeat", "{argv:?}");
+    lloom_tensor::tuning::install(o.tuning.tensor()).unwrap();
+    let device = lloom_tensor::Device::new_metal(0).unwrap();
+    let metal = device.as_metal_device().unwrap();
+    let line = metal.residency_line();
+    eprintln!("[serve {argv:?}: {line}]");
+    (metal.residency_set_handle().queue_attachments(), line)
+}
+
+/// Decision 56 reaches the queue: serve's defaults on Metal 3 leave the device
+/// set off the queue (no `addResidencySet` names it) and the loaded line says
+/// `detached`.
+#[cfg(feature = "metal")]
+#[test]
+fn serves_defaults_on_metal3_put_no_set_on_the_queue() {
+    let (attachments, line) = serves_device_set(&["--metal-api", "metal3"]);
+    assert_eq!(attachments, 0, "{line}");
+    assert!(line.starts_with("residency=detached "), "{line}");
+}
+
+/// On Metal 4 the same default is ignored: the set stays on the Metal 3 queue
+/// the device holds, which runs no work, and the loaded line gives the reason.
+#[cfg(feature = "metal")]
+#[test]
+fn serves_defaults_on_metal4_keep_the_set_on_the_queue_and_say_why() {
+    let (attachments, line) = serves_device_set(&["--metal-api", "metal4"]);
+    assert_eq!(attachments, 1, "{line}");
+    assert!(
+        line.starts_with(
+            "residency=queue(heartbeat ignored: metal4 binds through its per-slot sets) "
+        ),
+        "{line}"
+    );
 }

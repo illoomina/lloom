@@ -130,6 +130,8 @@ pub(crate) mod membership;
 /// rather than acquire them from a `metal::*`.
 pub mod poison;
 pub mod profile;
+#[cfg(test)]
+mod residency_router_tests;
 pub mod residency_set;
 /// Memory-class and event telemetry (issue #171). Every entry point is inert
 /// without the `run-telemetry` feature, so the module is declared

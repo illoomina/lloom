@@ -18,6 +18,8 @@ pub struct EosGateReport {
     pub fired: bool,
     /// Gate kernels dispatched (`step` calls).
     pub steps: u64,
+    /// The cores arm was on: the quantized mat-vec cores were gated too.
+    pub cores: bool,
 }
 
 /// A `DeviceLocation` represents a physical device whereas multiple `Device`
@@ -31,6 +33,13 @@ pub enum DeviceLocation {
 
 /// Cpu, Cuda, or Metal
 #[derive(Debug, Clone)]
+#[cfg_attr(
+    feature = "metal",
+    expect(
+        clippy::large_enum_variant,
+        reason = "Keep the public MetalDevice payload inline; boxing adds allocation and changes the variant API."
+    )
+)]
 pub enum Device {
     Cpu,
     Cuda(crate::CudaDevice),
@@ -530,6 +539,47 @@ impl Device {
         }
     }
 
+    /// Asks the OS to keep the device's memory resident: Metal's residency
+    /// set, which is unwired after a few idle seconds otherwise. Nothing to
+    /// do on the other backends.
+    pub fn request_residency(&self) {
+        #[cfg(feature = "metal")]
+        if let Self::Metal(d) = self {
+            d.request_residency();
+        }
+    }
+
+    /// Tells the OS the device's memory need not stay resident (Metal's
+    /// residency set): under memory pressure. Nothing to do on the other
+    /// backends.
+    pub fn end_residency(&self) {
+        #[cfg(feature = "metal")]
+        if let Self::Metal(d) = self {
+            d.end_residency();
+        }
+    }
+
+    /// The Metal 4 queue's per-slot residency counts and times
+    /// (`kernels.residency.slot_trace`; `None` off Metal 4 or with the
+    /// instrument off).
+    pub fn metal4_slot_residency(&self) -> Option<crate::residency_class::SlotResidency> {
+        #[cfg(feature = "metal")]
+        if let Self::Metal(d) = self {
+            return d.metal4_slot_residency();
+        }
+        None
+    }
+
+    /// The residency set's attachment and size, for a loaded line (`None`
+    /// off Metal).
+    pub fn residency_line(&self) -> Option<String> {
+        #[cfg(feature = "metal")]
+        if let Self::Metal(d) = self {
+            return Some(d.residency_line());
+        }
+        None
+    }
+
     pub fn synchronize(&self) -> Result<()> {
         match self {
             Self::Cpu => Ok(()),
@@ -559,6 +609,16 @@ impl Device {
             Self::Cpu => Ok(()),
             Self::Cuda(d) => d.finish_pass(),
             Self::Metal(d) => crate::backend::BackendDevice::finish_pass(d),
+        }
+    }
+
+    /// Abandon the pass [`Self::begin_pass`] opened, after its body failed
+    /// (`BackendDevice::abort_pass`).
+    pub fn abort_pass(&self) -> Result<()> {
+        match self {
+            Self::Cpu => Ok(()),
+            Self::Cuda(d) => d.abort_pass(),
+            Self::Metal(d) => crate::backend::BackendDevice::abort_pass(d),
         }
     }
 
@@ -827,6 +887,18 @@ impl Device {
             #[cfg(feature = "metal")]
             Self::Metal(d) => d.eos_gate_armed(),
             _ => false,
+        }
+    }
+
+    /// The gate's cores arm for the armed run (`MetalDevice::eos_gate_cores`):
+    /// the quantized mat-vec cores are gated too. No-op off Metal.
+    pub fn eos_gate_cores(&self, on: bool) {
+        match self {
+            #[cfg(feature = "metal")]
+            Self::Metal(d) => d.eos_gate_cores(on),
+            _ => {
+                let _ = on;
+            }
         }
     }
 

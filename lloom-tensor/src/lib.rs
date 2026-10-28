@@ -83,6 +83,8 @@ mod command_policy;
 mod command_segments;
 mod completion_frontier;
 #[cfg(any(feature = "metal", test))]
+mod completion_setup;
+#[cfg(any(feature = "metal", test))]
 mod completion_scope;
 #[cfg(any(feature = "metal", test))]
 mod completion_wake;
@@ -103,6 +105,9 @@ pub mod dummy_cuda_backend;
 pub mod dummy_dtype;
 mod dummy_metal_backend;
 pub mod error;
+#[cfg(all(test, feature = "metal"))]
+#[path = "../tests/sampling_contract/fixtures.rs"]
+mod fixtures;
 #[cfg(any(feature = "metal", test))]
 mod heap_ranges;
 mod indexer;
@@ -116,6 +121,12 @@ mod memory_accounting;
 mod memory_accounting_machine;
 pub mod memory_admission;
 pub mod memory_arbitration;
+#[cfg(all(test, feature = "metal"))]
+#[path = "../tests/sampling_contract/oracle.rs"]
+mod oracle;
+#[cfg(all(test, not(feature = "metal")))]
+#[path = "metal_backend/sampling_multinomial/result.rs"]
+mod sampling_result;
 // Compile the actual production ledger and its lifecycle tests without Metal.
 // The ledger itself depends only on numeric accounting and machine ownership.
 #[cfg(all(test, not(feature = "metal")))]
@@ -196,6 +207,7 @@ mod planner_transaction;
 #[cfg(any(feature = "metal", test))]
 mod prefix_data;
 pub mod quantized;
+pub mod residency_class;
 #[cfg(any(feature = "metal", test))]
 mod residency_ownership;
 pub mod retire;

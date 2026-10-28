@@ -57,6 +57,9 @@ pub struct LoadOptions {
     pub first_shard: PathBuf,
     pub tokenizer: Option<PathBuf>,
     pub cpu: bool,
+    /// What the run is for (`execution.purpose`): production refuses at load
+    /// an attention that takes the composed scores path on Metal.
+    pub purpose: lloom::nn::attention::route::ExecutionPurpose,
     pub kv_capacity: usize,
     pub readback: ReadbackArm,
     /// The decode loop's options (`DecodeConfig`).
@@ -87,6 +90,9 @@ pub struct LoadOptions {
     /// Rows the batch scheduler serves at once (`--batch N`); 1 is the
     /// single-sequence engine.
     pub batch: usize,
+    /// The most requests one intake tick takes while rows are live
+    /// (`scheduler.intake_per_tick`).
+    pub intake_per_tick: usize,
     /// Tokens the MTP drafter proposes per round.
     pub mtp_k: usize,
     /// The streamed tier's prefetcher (`--prefetch`).
@@ -565,6 +571,9 @@ fn load_on<P: QwenShape>(
     admission: LoadAdmission,
 ) -> Result<Engines<P>> {
     lloom_tensor::memory_admission::begin_model_load();
+    // The width a prefill forward takes, for the admission and the driver
+    // alike (`prefill.pair_forward`).
+    opts.prefill_tile = lloom::models::qwen4exp::forward_tile(opts.prefill_tile);
     {
         // The DFlash drafter's directory and config first: the slot plan
         // claims what it will hold beside the experts.
@@ -624,6 +633,7 @@ fn load_on<P: QwenShape>(
             _ => None,
         };
         let mload = ModelLoad {
+            purpose: opts.purpose,
             ple_shard: None,
             ple: opts.ple,
             moe_act,
@@ -655,8 +665,12 @@ fn load_on<P: QwenShape>(
             "replay" => PrefillMode::Replay,
             other => anyhow::bail!("--prefill-mode {other}: chunk | replay"),
         };
-        let installed =
+        // What is installed is what the load reports (`ExecutorConfig::under_body`).
+        let (executor, executor_note) = opts.executor.under_body(opts.mtp.is_some());
+        opts.executor = executor;
+        let mut installed =
             super::common::install_executor(&device, &opts.executor, opts.mtp.is_some())?;
+        installed.declined = executor_note;
         #[cfg(feature = "metal")]
         if let Some(mb) = opts.memory.free_budget_mb {
             if let Device::Metal(m) = &device {
@@ -790,6 +804,7 @@ impl<P: QwenShape, R: ExpertResidency + HasStreamStats + Send + Sync + 'static> 
         let no_fill = host_fill_absent(&model, &device);
         let (readback, note) = resolve_readback(opts.readback, no_fill);
         let mut load_warnings = Vec::new();
+        load_warnings.extend(installed.declined_warning());
         if let Some(note) = note {
             eprintln!("[readback {note}]");
             // Only the arm that reads its fed id back is slower than asked;
@@ -918,6 +933,10 @@ impl<P: QwenShape, R: ExpertResidency + HasStreamStats + Send + Sync + 'static> 
                 max_rows: opts.batch,
                 reuse_prefix: opts.reuse_prefix,
                 share_prefix: false,
+                // Whole prompts at arrival (no chunk budget): nothing to batch.
+                prefill_batch: 1,
+                prefill_decode: lloom::nn::PrefillDecode::Ride,
+                intake_per_tick: opts.intake_per_tick,
                 mode: BatchMode::Continuous,
                 extra: (),
                 on_counters: None,
@@ -1032,6 +1051,7 @@ impl<P: QwenShape, R: ExpertResidency + HasStreamStats + Send + Sync + 'static> 
             "slots_per_layer": self.core.model.slots_per_layer(),
             "plans": s.plans, "groups": s.groups, "hits": s.hits, "misses": s.misses,
             "evictions": s.evictions, "bytes_loaded": s.bytes_loaded,
+            "landing_launches": s.landing_launches,
             "hit_rate": s.hits as f64 / (s.hits + s.misses).max(1) as f64,
             "staging": { "buffers": st.buffers, "bytes": st.bytes, "allocations": st.allocations,
                           "reuses": st.reuses, "overflows": st.overflows },
@@ -1185,9 +1205,16 @@ impl<P: QwenShape, R: ExpertResidency + HasStreamStats + Send + Sync + 'static> 
             readback: ReadbackArm::Batched {
                 rows: done.joined_beside,
             },
+            sampling: params.sampling()?,
+            readback_note: None,
             stats: done.stats,
             thinking: None,
             logprobs: None,
+            // The scheduler's rows keep no pin.
+            pin: crate::PinReport {
+                asked: params.pin_prefix,
+                ..Default::default()
+            },
         })
     }
 
@@ -1345,6 +1372,7 @@ impl<P: QwenShape, R: ExpertResidency + HasStreamStats + Send + Sync + 'static> 
             "kv_capacity": self.kv_capacity,
             "tier": self.tier,
             "stream": self.tier_stats(),
+            "cut_sites": super::common::cut_sites_json(),
         })
     }
     fn describe(&self) -> String {

@@ -78,6 +78,11 @@ use crate::nn::speculator::{
 };
 use lloom_tensor::{Device, Result, Tensor};
 
+mod prefill_work;
+#[cfg(test)]
+mod speculative_prefill_tests;
+pub(crate) use prefill_work::PrefillWork;
+
 /// The K=1 identity proposer: drafts nothing, so the loop takes the baseline
 /// body. Stage 1's only admitted family.
 #[derive(Debug, Clone, Copy, Default)]
@@ -157,6 +162,17 @@ pub struct Asks<'a> {
 pub const MAX_TOP_LOGPROBS: usize = 64;
 
 impl<'a> Asks<'a> {
+    /// A sampling-only capability query; no auxiliary features requested.
+    pub fn sampling(sampling: &'a Sampling) -> Self {
+        Self {
+            sampling,
+            processors: false,
+            budget: false,
+            digest: false,
+            logprobs: None,
+        }
+    }
+
     /// What `sampler` asks, with or without a thinking budget.
     pub fn of(sampler: &'a LogitsProcessor, budget: bool) -> Self {
         Asks {
@@ -173,19 +189,16 @@ impl<'a> Asks<'a> {
 /// state moves. Every driver asks it; nothing is served under a label it
 /// does not run.
 ///
-/// - The ring step draws on the device: the host-sort arms (top-k, top-p)
-///   sort on the host, and the digest reads every step's logits there.
+/// - The ring step draws on the device: filtered arms require the host,
+///   and the digest reads every step's logits there.
 /// - The window serves every sampler arm and feature: each row is drawn
 ///   keyed to its position against the history its position has
-///   (`LogitsProcessor::window_draw_device`). It reads back the ids a round
-///   keeps, never a row, so the per-token logprobs are the K=1 body's.
+///   (`LogitsProcessor::window_draw_device`). Host-filtered methods also read
+///   processed score rows until the native bridge is admitted. Per-token raw
+///   logprobs remain the K=1 body's separately captured output.
 /// - The batched bodies draw per row without processors, feed no forced
 ///   token and keep no logprobs; the batched windows verify by the argmax.
 pub fn refuse(body: Body, asks: &Asks<'_>) -> Result<()> {
-    let host_sort = matches!(
-        asks.sampling,
-        Sampling::TopK { .. } | Sampling::TopP { .. } | Sampling::TopKThenTopP { .. }
-    );
     if let Some(k) = asks.logprobs.filter(|&k| k > MAX_TOP_LOGPROBS) {
         lloom_tensor::bail!(
             "per-token logprobs name at most {MAX_TOP_LOGPROBS} candidates beside the drawn id, \
@@ -193,10 +206,15 @@ pub fn refuse(body: Body, asks: &Asks<'_>) -> Result<()> {
         );
     }
     match body {
-        Body::Step { ring: true } if host_sort => lloom_tensor::bail!(
+        Body::Step { ring: true } if asks.sampling.requires_host() => lloom_tensor::bail!(
             "the ring needs a device-resident sampler (argmax, multinomial or gumbel-max); \
-             {:?} takes a host sort and cannot ride it (DESIGN.md §11.2c)",
-            asks.sampling
+             {:?} takes {} and cannot ride it (DESIGN.md §11.2c)",
+            asks.sampling,
+            if matches!(asks.sampling, Sampling::FilteredGumbel { .. }) {
+                "an explicit host draw"
+            } else {
+                "a host sort"
+            }
         ),
         Body::Step { ring: true } if asks.digest => lloom_tensor::bail!(
             "the ring draws on the device and the logits digest reads every step's logits on \
@@ -353,6 +371,10 @@ pub struct DecodeOptions {
     /// the pacer, not by the reader: `S − E ≤ adaptive_lead + 1`, however late
     /// the reader raises the flag. `None` takes `decode.ring.eos_watch`.
     pub eos_watch: Option<bool>,
+    /// Under the EOS gate: whether the quantized mat-vec cores are gated
+    /// too, for a model that admits it (`CausalLM::eos_gate_cores`). `None`
+    /// takes `models.qwen3_5.eos_gate_cores`.
+    pub eos_gate_cores: Option<bool>,
     /// The flow's adaptive commit; off is the fixed cadence (module docs, "Two
     /// cadences, both kept"). The loop closes its command buffer only when the
     /// GPU has started every buffer committed before it, on no cadence of its
@@ -366,6 +388,13 @@ pub struct DecodeOptions {
     /// The cut period is held at `usize::MAX` for the run, so the only cuts
     /// are the loop's.
     pub adaptive_commit: bool,
+    /// Under `adaptive_commit`: the most steps queued in committed buffers the
+    /// GPU has not completed before the host waits to encode the next — the
+    /// lead's queued part, apart from the batching [`Self::run_ahead`] sets
+    /// (`0` = two run-ahead windows, the incumbent). The host is at most
+    /// `queued_steps + run_ahead` steps ahead of the oldest incomplete buffer
+    /// ([`Self::adaptive_lead`]).
+    pub queued_steps: usize,
     /// Under `adaptive_commit`: the most steps the host may encode into one
     /// buffer before closing it regardless (0 = 8). Not a cadence — a buffer
     /// closes earlier whenever the GPU has caught up — but the bound on how
@@ -512,6 +541,24 @@ pub struct RoundStats {
     pub start_ns: u64,
 }
 
+/// A resolved output ceiling; zero leaves EOS as the only token boundary.
+#[derive(Clone, Copy)]
+struct TokenLimit(usize);
+
+impl TokenLimit {
+    fn reached(self, produced: usize) -> bool {
+        self.0 != 0 && produced >= self.0
+    }
+
+    fn remaining(self, produced: usize) -> usize {
+        if self.0 == 0 {
+            usize::MAX
+        } else {
+            self.0.saturating_sub(produced)
+        }
+    }
+}
+
 impl DecodeOptions {
     /// Whether the run has no token ceiling (`max_tokens == 0`) — it stops only
     /// on EOS. See [`Self::max_tokens`].
@@ -523,34 +570,47 @@ impl DecodeOptions {
     /// [`Self::unbounded`] (the `0`-is-unbounded convention), so the loops run
     /// until EOS. Use this instead of `produced >= max_tokens`.
     pub fn reached(&self, produced: usize) -> bool {
-        self.max_tokens != 0 && produced >= self.max_tokens
+        TokenLimit(self.max_tokens).reached(produced)
     }
 
     /// The remaining token budget from `produced`, or `usize::MAX` when
     /// unbounded (for `min`-style clamps that want "no limit").
     pub fn remaining(&self, produced: usize) -> usize {
-        if self.max_tokens == 0 {
-            usize::MAX
-        } else {
-            self.max_tokens.saturating_sub(produced)
-        }
+        TokenLimit(self.max_tokens).remaining(produced)
     }
 
     /// The pacer depth: the explicit override if set, else the floor. (The
     /// AUTO path sets `in_flight_depth` from warmup; this reads it back with the
     /// `0 = auto -> floor` convention applied.)
     /// Under `adaptive_commit`: how many steps the host may be ahead of the
-    /// oldest incomplete buffer — two run-ahead windows queued plus the open
-    /// one; 0 otherwise. What the ring's staged-through tiles are sized for.
+    /// oldest incomplete buffer — [`Self::queued`] queued plus the open
+    /// buffer's [`Self::run_ahead_steps`]; 0 otherwise. What the ring's
+    /// staged-through tiles are sized for.
     pub fn adaptive_lead(&self) -> usize {
         if self.adaptive_commit {
-            3 * if self.run_ahead == 0 {
-                8
-            } else {
-                self.run_ahead
-            }
+            self.queued() + self.run_ahead_steps()
         } else {
             0
+        }
+    }
+
+    /// The most steps one open buffer holds under `adaptive_commit`
+    /// (`run_ahead`, `0` = 8).
+    pub fn run_ahead_steps(&self) -> usize {
+        if self.run_ahead == 0 {
+            8
+        } else {
+            self.run_ahead
+        }
+    }
+
+    /// The most steps queued in committed, incomplete buffers before the
+    /// host waits (`queued_steps`, `0` = two run-ahead windows).
+    pub fn queued(&self) -> usize {
+        if self.queued_steps == 0 {
+            2 * self.run_ahead_steps()
+        } else {
+            self.queued_steps
         }
     }
 
@@ -579,8 +639,10 @@ impl DecodeOptions {
             host_feed_wait: None,
             eos_park: None,
             eos_watch: None,
+            eos_gate_cores: None,
             adaptive_commit: false,
             run_ahead: 0,
+            queued_steps: 0,
             stop: None,
             eos_gate: false,
             fused_publish: true,
@@ -703,11 +765,12 @@ pub struct DecodeStats {
     /// The overrun's forwards launched nothing (the gate fired), so the
     /// session reconciles it without a rewind horizon.
     pub overrun_unwritten: bool,
-    /// The prefill's dispatch census, `(kernel, count)`, under
-    /// `CANDLE_METAL_PROFILE=1`; empty otherwise and off Metal.
-    pub prefill_census: Vec<(String, u64)>,
+    /// The prefill's dispatch census, `(kernel, count)`, when detailed Metal
+    /// recording is active in a debug/profile build. `None` means unavailable;
+    /// `Some([])` means an observed window contained no dispatches.
+    pub prefill_census: Option<Vec<(String, u64)>>,
     /// Step 0's dispatch census, on the same terms.
-    pub step0_census: Vec<(String, u64)>,
+    pub step0_census: Option<Vec<(String, u64)>>,
     /// Under [`Session::decode_batched`], the number of live rows in each
     /// step this sequence took part in — one entry per `step_ns` entry. Empty
     /// on the single-sequence bodies.
@@ -955,12 +1018,12 @@ impl HostFeedTrace {
 }
 
 /// The per-kernel dispatch counts so far, under `CANDLE_METAL_PROFILE=1`.
-/// `None` when the census is off, which is every timed run.
+/// `None` when detailed recording is unavailable or off.
 fn census_snapshot() -> Option<std::collections::HashMap<String, u64>> {
-    #[cfg(feature = "metal")]
+    #[cfg(all(feature = "metal", any(debug_assertions, feature = "profile")))]
     {
         use lloom_tensor::kernels::metal::profile;
-        if profile::enabled() {
+        if profile::recorder_enabled() {
             return Some(profile::snapshot().by_label.into_iter().collect());
         }
     }
@@ -971,9 +1034,9 @@ fn census_snapshot() -> Option<std::collections::HashMap<String, u64>> {
 fn census_delta(
     before: &Option<std::collections::HashMap<String, u64>>,
     after: Option<std::collections::HashMap<String, u64>>,
-) -> Vec<(String, u64)> {
+) -> Option<Vec<(String, u64)>> {
     let (Some(before), Some(after)) = (before, after) else {
-        return Vec::new();
+        return None;
     };
     let mut out: Vec<(String, u64)> = after
         .into_iter()
@@ -983,7 +1046,7 @@ fn census_delta(
         })
         .collect();
     out.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
-    out
+    Some(out)
 }
 
 /// Where one decode step's host time went, for the first few steps of a run.
@@ -1044,6 +1107,7 @@ pub struct DecodeOut {
 
 /// One sequence's cursor through [`Session::decode_speculative_pipelined`].
 struct Lane<P> {
+    limit: TokenLimit,
     anchor_tok: u32,
     produced: usize,
     eos: bool,
@@ -1222,14 +1286,60 @@ pub(crate) fn end_pass(device: &Device) -> Result<()> {
     device.finish_pass()
 }
 
-fn begin_decode_step(device: &Device) {
-    // The decode step is the `Decode { b: 1 }` pass; with the cache off this
-    // is the legacy bracket, which cannot fail.
-    let _ = begin_pass(device, PassShape::Decode { b: 1 });
+/// Abandon the pass `begin_pass` opened, after its body failed or unwound
+/// (`MetalDevice::abort_pass`): nothing it recorded or observed is published.
+pub(crate) fn abort_pass(device: &Device) -> Result<()> {
+    #[cfg(feature = "metal")]
+    if let Device::Metal(m) = device {
+        m.abort_pass()?;
+        return Ok(());
+    }
+    device.abort_pass()
 }
 
-fn end_decode_step(device: &Device) -> Result<()> {
-    end_pass(device)
+/// A pass whose body is running. [`Self::finish`] closes it after a body
+/// that succeeded; dropped unfinished — the body returned an error or
+/// unwound — it is aborted, never finished, so a partial recording or
+/// observation never becomes a plan and the next pass opens.
+#[must_use = "an open pass is aborted when dropped"]
+struct OpenPass<'a> {
+    device: &'a Device,
+    open: bool,
+}
+
+impl<'a> OpenPass<'a> {
+    /// A refusal leaves no open pass (`MetalDevice::begin_pass`), so there
+    /// is nothing to abort on that path.
+    fn begin(device: &'a Device, shape: PassShape) -> Result<Self> {
+        begin_pass(device, shape)?;
+        Ok(Self { device, open: true })
+    }
+
+    fn finish(mut self) -> Result<()> {
+        self.open = false;
+        end_pass(self.device)
+    }
+}
+
+impl Drop for OpenPass<'_> {
+    fn drop(&mut self) {
+        if self.open {
+            if let Err(e) = abort_pass(self.device) {
+                eprintln!("[decode] aborting a pass whose body failed: {e}");
+            }
+        }
+    }
+}
+
+/// Open the decode step's pass — the `Decode { b: 1 }` pass; with the plan
+/// cache off, the legacy arena bracket.
+///
+/// A refusal is the request's error, not something to continue past: the
+/// device can decline a pass whose plan it cannot admit or whose
+/// predecessor was never closed, and a forward encoded after that runs
+/// against state the pass was meant to install.
+fn begin_decode_step(device: &Device) -> Result<OpenPass<'_>> {
+    OpenPass::begin(device, PassShape::Decode { b: 1 })
 }
 
 fn flush_and_prune(device: &Device) -> Result<Option<usize>> {
@@ -1406,16 +1516,12 @@ impl StepPacer {
     }
 
     /// Reserve the largest bound this run can use before encoding starts.
-    fn for_decode(opts: &DecodeOptions) -> Self {
+    pub(crate) fn for_decode(opts: &DecodeOptions) -> Self {
         let capacity =
             opts.pacer_depth()
                 .max(opts.prefill_pacer_depth)
                 .max(if opts.adaptive_commit {
-                    2 * if opts.run_ahead == 0 {
-                        8
-                    } else {
-                        opts.run_ahead
-                    }
+                    opts.queued()
                 } else {
                     0
                 });
@@ -1440,13 +1546,21 @@ impl StepPacer {
     }
 
     /// Setup-only depth changes reuse the capacity reserved by `for_decode`.
-    fn set_depth(&mut self, depth: usize) {
+    pub(crate) fn set_depth(&mut self, depth: usize) {
         self.depth = depth.max(IN_FLIGHT_FLOOR);
+        #[cfg(test)]
+        speculative_prefill_tests::note(speculative_prefill_tests::Event::Depth(self.depth));
         #[cfg(feature = "metal")]
         debug_assert!(self.depth <= self.pending.entries.capacity());
     }
 
+    pub(crate) fn counters(&self) -> (u64, u64) {
+        (self.taken, self.waited)
+    }
+
     pub(crate) fn before_forward(&mut self, device: &Device) -> Result<()> {
+        #[cfg(test)]
+        speculative_prefill_tests::note(speculative_prefill_tests::Event::Before(self.depth));
         #[cfg(feature = "metal")]
         if let Device::Metal(m) = device {
             while self.pending.entries.len() >= self.depth {
@@ -1462,6 +1576,8 @@ impl StepPacer {
     }
 
     pub(crate) fn after_forward(&mut self, device: &Device) -> Result<()> {
+        #[cfg(test)]
+        speculative_prefill_tests::note(speculative_prefill_tests::Event::After(self.depth));
         #[cfg(feature = "metal")]
         if let Device::Metal(m) = device {
             self.push(m.flush_marker()?, 1);
@@ -1871,6 +1987,13 @@ impl<'m, M: CausalLM> Session<'m, M> {
         S: Speculator,
         R: ReadbackStrategy,
     {
+        refuse(
+            Body::Step {
+                ring: readback.arms().token_ring,
+            },
+            &Asks::of(sampler, false),
+        )?;
+        readback.check_sampler(sampler.sampling())?;
         let out = self.decode_until_run(spec, readback, sampler, prompt, opts, on_tokens);
         if out.is_err() {
             // A run that failed mid-way may leave a provisional step: settled
@@ -1975,7 +2098,6 @@ impl<'m, M: CausalLM> Session<'m, M> {
         if resume && self.seq.last_logits.is_none() {
             lloom_tensor::bail!("Session::decode: empty prompt and no held logits to resume from");
         }
-        readback.check_sampler(sampler.sampling())?;
         spec.begin_at(SeqId(0), prompt, &self.seq.tokens)?;
         readback.begin_run();
 
@@ -1990,6 +2112,7 @@ impl<'m, M: CausalLM> Session<'m, M> {
         // step.
         let hot_thread = HotThread::claim();
         let mut stats = DecodeStats {
+            #[cfg(any(debug_assertions, feature = "profile"))]
             step_ns: Vec::with_capacity(opts.max_tokens),
             sample_ns: Vec::with_capacity(if opts.sample_split {
                 opts.max_tokens
@@ -2194,17 +2317,21 @@ impl<'m, M: CausalLM> Session<'m, M> {
         } else {
             (opts.lookahead >= 1).then(|| device.pipelined_cut_period())
         };
-        let run_ahead = if opts.run_ahead == 0 {
-            8
-        } else {
-            opts.run_ahead
-        };
+        let run_ahead = opts.run_ahead_steps();
+        let queued = opts.queued();
         let mut steps_open = 0usize;
         // Armed here, disarmed on every exit path (the guard's `Drop`): an
         // armed gate outliving the run would route the next prefill through
         // a stale table.
         let eos_gate = if opts.eos_gate {
             device.eos_gate_begin()?;
+            // The cores arm: the quantized mat-vecs gated too, for a model
+            // whose inventory admits it (`CausalLM::eos_gate_cores`).
+            let cores = opts
+                .eos_gate_cores
+                .unwrap_or(crate::tuning::tuning().ring.qwen3_5_eos_gate_cores)
+                && self.model.eos_gate_cores();
+            device.eos_gate_cores(cores);
             Some(EosGateGuard(&device))
         } else {
             None
@@ -2424,12 +2551,12 @@ impl<'m, M: CausalLM> Session<'m, M> {
                     pacer.before_forward(&device)?;
                 }
                 self.model.prepare_pass(&mut self.seq.cache, 1)?;
-                begin_decode_step(&device);
+                let pass = begin_decode_step(&device)?;
                 logits = self
                     .model
                     .forward(&feed, self.seq.pos, &mut self.seq.cache)?
                     .squeeze(0)?;
-                end_decode_step(&device)?;
+                pass.finish()?;
                 self.seq.pos += 1;
                 if pace {
                     pacer.after_forward(&device)?;
@@ -2455,21 +2582,22 @@ impl<'m, M: CausalLM> Session<'m, M> {
                 // NONE; the one clock read it still needs is `step_ns` (the median).
                 let t_sample = sample_start.map_or(0, |s| s.elapsed().as_nanos() as u64);
                 if opts.adaptive_commit {
-                    // Steps queued in incomplete buffers, not buffers: two
-                    // run-ahead windows deep, so one is running while the
-                    // other waits and the host is never the one being waited on.
-                    pacer.before_forward_bounded(&device, 2 * run_ahead)?;
+                    // Steps queued in incomplete buffers, not buffers: by
+                    // default two run-ahead windows deep, so one is running
+                    // while the other waits and the host is never the one
+                    // being waited on (`DecodeOptions::queued_steps`).
+                    pacer.before_forward_bounded(&device, queued)?;
                 } else if pace {
                     pacer.before_forward(&device)?;
                 }
                 let t = timed.then(std::time::Instant::now);
                 self.model.prepare_pass(&mut self.seq.cache, 1)?;
-                begin_decode_step(&device);
+                let pass = begin_decode_step(&device)?;
                 logits = self
                     .model
                     .forward(&feed, self.seq.pos, &mut self.seq.cache)?
                     .squeeze(0)?;
-                end_decode_step(&device)?;
+                pass.finish()?;
                 self.seq.pos += 1;
                 let t_forward = t.map_or(0, |t| t.elapsed().as_nanos() as u64);
                 // The in-flight bound AFTER the enqueue: retire the oldest
@@ -2534,12 +2662,12 @@ impl<'m, M: CausalLM> Session<'m, M> {
                             pacer.before_forward(&device)?;
                         }
                         self.model.prepare_pass(&mut self.seq.cache, 1)?;
-                        begin_decode_step(&device);
+                        let pass = begin_decode_step(&device)?;
                         logits = self
                             .model
                             .forward(&again, self.seq.pos, &mut self.seq.cache)?
                             .squeeze(0)?;
-                        end_decode_step(&device)?;
+                        pass.finish()?;
                         self.seq.pos += 1;
                         if pace {
                             pacer.after_forward(&device)?;
@@ -2926,33 +3054,37 @@ impl<'m, M: CausalLM> Session<'m, M> {
     where
         R: ReadbackStrategy,
     {
+        let work = PrefillWork::resolve(opts, self.seq.pos, prompt.len(), pace)?;
+        self.prefill_forwards_prepared(readback, prompt, &work, pacer)
+    }
+
+    /// Execute the resolved outer forwards without rescheduling. This seam
+    /// carries no admission promise; ordinary callers resolve work locally.
+    fn prefill_forwards_prepared<R>(
+        &mut self,
+        readback: &mut R,
+        prompt: &[u32],
+        work: &PrefillWork,
+        pacer: &mut StepPacer,
+    ) -> Result<(Option<Tensor>, usize)>
+    where
+        R: ReadbackStrategy,
+    {
+        if work.start() != self.seq.pos
+            || work.end().checked_sub(work.start()) != Some(prompt.len())
+        {
+            lloom_tensor::bail!("prepared prefill work no longer matches the sequence");
+        }
         let device = readback.device().clone();
-        // The widths of the forwards this prompt is fed through, in order:
-        // the incumbent ramp (one-shot, or spark then remainder), the explicit
-        // schedule with its tail, and the tile bound over either. Computed
-        // once, in the prologue; the steady loop never reads it.
-        let widths = tile_widths(
-            prefill_widths(
-                prompt.len(),
-                opts.prefill_ubatch(),
-                &opts.prefill_schedule,
-                opts.prefill_bulk,
-            ),
-            opts.prefill_tile,
-        );
-        // A prefill of more than one forward is paced whatever the arm: on
-        // the blocking arm nothing else bounds the units in flight (its own
-        // readback comes per decode step, and a prompt unit produces none),
-        // so the host would encode every tile back to back with all of their
-        // activations pending at once — 11.3 GB for an 8192-token prompt in
-        // 512-token tiles against 4.5 GB paced, the tile bounding nothing
-        // (issue #148, `measurements/issue-148-serving-batch.md` §7). A
-        // one-unit prefill keeps the arm's own command stream.
-        let pace = pace || widths.len() > 1;
+        if let Some(depth) = work.active_depth() {
+            pacer.set_depth(depth);
+        }
+        let pace = work.active_depth().is_some();
         let mut last_logits = None;
         let mut units = 0usize;
         let mut off = 0usize;
-        for w in widths {
+        for span in work.forwards() {
+            let w = span.width;
             // Drains this unit's autoreleased encoders and command buffers
             // when the iteration ends (`AutoreleaseScope` docs).
             let _pool = lloom_tensor::AutoreleaseScope::new();
@@ -2969,20 +3101,20 @@ impl<'m, M: CausalLM> Session<'m, M> {
             // Session allocations (the KV slab, a bucket grow) happen here,
             // before the bracket, so the planned pass allocates nothing.
             self.model.prepare_pass(&mut self.seq.cache, w)?;
-            begin_pass(
+            let pass = OpenPass::begin(
                 &device,
                 PassShape::Prefill {
                     w,
-                    fresh: self.seq.pos == 0,
+                    fresh: span.past == 0,
                 },
             )?;
             let out = {
                 let _prefill = lloom_tensor::tuning::VerifyWindow::prefill();
                 self.model
-                    .forward(&input, self.seq.pos, &mut self.seq.cache)?
+                    .forward(&input, span.past, &mut self.seq.cache)?
                     .squeeze(0)?
             };
-            end_pass(&device)?;
+            pass.finish()?;
             if pace {
                 pacer.after_forward(&device)?;
             }
@@ -3061,63 +3193,63 @@ impl<'m, M: CausalLM> Session<'m, M> {
         })
     }
 
-    /// Prefill `prompt` in the units `ubatch` names and seed `spec`'s sequence
-    /// `seq` from every one of them: `begin`, then per unit a forward, its
-    /// probe taken and `observe`d with an empty accepted tail — the drafter
-    /// keys the unit's positions into its own context at the offset it
-    /// carries — so the drafter's context covers the whole prompt when the
-    /// last unit's logits come back. Returns those logits and the LAST unit's
-    /// probe, still unobserved: the caller reads the argmax back (the one host
-    /// wait of a seed, kept out of here so a driver can prefill N sequences
-    /// before it waits on any) and observes with it as the accepted tail.
+    /// Seed from the resolved outer forwards, retaining the existing target
+    /// forward's pass ownership (no new driver plan bracket). Each non-final
+    /// probe is observed before the unit's pacing marker, so that marker also
+    /// covers the drafter's queued reads. The last probe is returned unobserved
+    /// with its logits: a pipeline may enqueue other lanes before reading any
+    /// anchor. Producers own probe escapes; pipelined callers hold logits.
     ///
-    /// The units are `decode`'s — `ubatch` first, then the remainder — and
-    /// `0` is the incumbent one-shot; each is a prefill window, as
-    /// [`Self::prefill_forwards`]'s. A target that overwrites its probe per
-    /// forward would seed the drafter from the last unit alone if a unit were
-    /// skipped; `probe_drops` is checked across the seed so that is a refusal
-    /// rather than a lower accept rate nothing else sees (§10.2w). The third
-    /// element is the number of forwards taken (`DecodeStats::prefill_units`).
+    /// `begin_at` follows the reused prefix. Stale probes are drained before
+    /// counting drops; a dropped probe within this seed still refuses the run.
+    /// Each resolved unit is a prefill window, as in ordinary prefill. The
+    /// third result is the number of forwards (`DecodeStats::prefill_units`).
+    /// This descriptor is an execution schedule, not an admission capability.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn prefill_streamed<S>(
         &mut self,
         spec: &mut S,
         seq: SeqId,
         prompt: &[u32],
-        ubatch: usize,
+        work: &PrefillWork,
+        pacer: &mut StepPacer,
         device: &Device,
     ) -> Result<(Tensor, <S::Probe as TargetProbe>::Output, usize)>
     where
         S: Speculator,
         M: Probes<S::Probe>,
     {
-        // The drafter follows the target's reuse: what the cache kept is
-        // `self.seq.tokens` (`Session::prepare` left the log at the reused
-        // prefix), and `prompt` is keyed after it.
+        if prompt.is_empty()
+            || work.start() != self.seq.pos
+            || work.end() - work.start() != prompt.len()
+        {
+            lloom_tensor::bail!("speculative prefill work does not match the non-empty suffix")
+        }
+        if let Some(depth) = work.active_depth() {
+            pacer.set_depth(depth);
+        }
         spec.begin_at(seq, prompt, &self.seq.tokens)?;
-        // Whatever an earlier forward left in the probe slots — a warmup's, a
-        // previous request's — predates this seed and is nobody's positions:
-        // drained here, so the count below can move only between two probes
-        // of THIS seed, which is the defect the refusal is for.
         let _stale = self.model.take_probe(&mut self.seq.cache)?;
         let drops_before = self.model.probe_drops(&self.seq.cache);
         let mut off = 0usize;
-        let mut units = 0usize;
-        let mut step = if ubatch == 0 { prompt.len() } else { ubatch };
-        loop {
+        for (unit, span) in work.forwards().enumerate() {
             let _pool = lloom_tensor::AutoreleaseScope::new();
-            let w = step.min(prompt.len() - off);
+            let w = span.width;
             let chunk = &prompt[off..off + w];
             let input = Tensor::new(chunk, device)?.unsqueeze(0)?;
+            if work.active_depth().is_some() {
+                pacer.before_forward(device)?;
+            }
+            // Keep the incumbent model-owned/pool pass route. Composing this
+            // through ordinary prefill would newly plan retained probes on
+            // targets whose producer has not declared that escape.
             let logits = {
                 let _prefill = lloom_tensor::tuning::VerifyWindow::prefill();
-                self.model
-                    .forward(&input, self.seq.pos, &mut self.seq.cache)?
+                self.model.forward(&input, span.past, &mut self.seq.cache)?
             };
             self.seq.pos += w;
             self.seq.tokens.extend_from_slice(chunk);
             off += w;
-            units += 1;
-            step = prompt.len();
             let probe = self.model.take_probe(&mut self.seq.cache)?;
             let drops = self.model.probe_drops(&self.seq.cache);
             if drops != drops_before {
@@ -3129,11 +3261,19 @@ impl<'m, M: CausalLM> Session<'m, M> {
                 );
             }
             if off < prompt.len() {
+                drop(logits);
                 spec.observe(seq, &probe, &[])?;
+                if work.active_depth().is_some() {
+                    pacer.after_forward(device)?;
+                }
             } else {
-                return Ok((logits, probe, units));
+                if work.active_depth().is_some() {
+                    pacer.after_forward(device)?;
+                }
+                return Ok((logits, probe, unit + 1));
             }
         }
+        unreachable!("non-empty resolved work covers the suffix")
     }
 
     /// Decode from `prompt` with a real speculative proposer — stage 2 of
@@ -3223,6 +3363,7 @@ impl<'m, M: CausalLM> Session<'m, M> {
         M: Probes<S::Probe> + crate::profile::Shaped,
         R: ReadbackStrategy,
     {
+        refuse(Body::Window, &Asks::of(sampler, false))?;
         // The verify draws the target's token per window position with
         // this sampler whenever it does more than read the raw argmax
         // (`Probes::verify_and_probe_sampled`): a temperature on any arm, or
@@ -3275,17 +3416,20 @@ impl<'m, M: CausalLM> Session<'m, M> {
             ..DecodeStats::default()
         };
 
-        // Prefill, in `opts.prefill_ubatch()`'s units, each unit's probe keyed
+        // Prefill in the shared resolved units, each unit's probe keyed
         // into the drafter as it lands (`prefill_streamed`); the last unit's
         // argmax is the first anchor — the token whose logits produced the
         // first draft — exactly as the `lfm2-dspark-verify` example takes
         // `logits.argmax` when it does not hold the last prompt token back.
         let pos_before = self.seq.pos;
         let prefill_start = std::time::Instant::now();
+        let work = PrefillWork::resolve(opts, self.seq.pos, prompt.len(), true)?;
+        let mut prefill_pacer = StepPacer::for_decode(opts);
         let (logits, prefill_probe, prefill_units) =
-            self.prefill_streamed(spec, seq, prompt, opts.prefill_ubatch(), &device)?;
+            self.prefill_streamed(spec, seq, prompt, &work, &mut prefill_pacer, &device)?;
         stats.prefill_ns = prefill_start.elapsed().as_nanos() as u64;
         stats.prefill_units = prefill_units;
+        (stats.step_markers, stats.step_waits) = prefill_pacer.counters();
 
         // The prefill's step closes before its token is drawn, as the K=1
         // loop's does: the draw's allocations are not the prefill pass's.
@@ -3315,6 +3459,14 @@ impl<'m, M: CausalLM> Session<'m, M> {
         // after a fully-accepted prompt.
         spec.observe(seq, &prefill_probe, std::slice::from_ref(&anchor_tok))?;
         end_executor_step(&device)?;
+        // As for intermediate units, observe has queued the probe's last
+        // reader. Release these seed-only views before later rounds; native
+        // custody still follows the queued uses, not these logical drops.
+        drop(prefill_probe);
+        drop(logits);
+        // Dropping seed receipts adds no completion wait.
+        #[cfg(feature = "metal")]
+        drop(prefill_pacer);
 
         // The prefill's own argmax is the first generated token — it is what
         // non-speculative greedy would emit as token 0 (the prefill logits' argmax),
@@ -3362,14 +3514,19 @@ impl<'m, M: CausalLM> Session<'m, M> {
             // The census is one round's worth of allocation; take it once,
             // past the warm-up rounds, so the breakdown carries which kernels
             // each phase dispatches and not only how many.
-            let probe = RoundProbe {
+            let mut probe = RoundProbe {
                 sync: if opts.sample_split {
                     Some(&device)
                 } else {
                     None
                 },
-                census: opts.sample_split && stats.steps == CENSUS_ROUND,
+                census: false,
             };
+            // This automatic enrichment must not turn host/scalar sample_split
+            // into an unsupported explicit detailed-census request.
+            probe.census = opts.sample_split
+                && stats.steps == CENSUS_ROUND
+                && probe.detailed_recorder_active();
             // The verify is a planned pass of `K + 1` positions
             // (`DESIGN.md` §9.2aa): the drafter's own forwards and the
             // observe are OUTSIDE it — they run on the drafter's model and
@@ -3430,11 +3587,13 @@ impl<'m, M: CausalLM> Session<'m, M> {
             // baseline loop drops an EOS token.
             let mut batch: Vec<u32> = Vec::with_capacity(accepted.len());
             for &id in &accepted {
-                if eos_ids.contains(&id) {
-                    eos = true;
+                // A minimum-width verify may predict beyond the output
+                // ceiling. Its unpublished bonus cannot change the stop.
+                if opts.reached(produced + batch.len()) {
                     break;
                 }
-                if opts.reached(produced + batch.len()) {
+                if eos_ids.contains(&id) {
+                    eos = true;
                     break;
                 }
                 batch.push(id);
@@ -3522,10 +3681,75 @@ impl<'m, M: CausalLM> Session<'m, M> {
     #[allow(clippy::too_many_arguments)]
     pub fn decode_speculative_pipelined<S>(
         sessions: &mut [Self],
+        rewind: crate::profile::RewindProof<M::Profile>,
+        spec: &mut S,
+        prompts: &[&[u32]],
+        opts: &DecodeOptions,
+        eos_ids: &[u32],
+        device: &Device,
+        on_tokens: &mut dyn FnMut(usize, &[u32]) -> Result<()>,
+    ) -> Result<Vec<DecodeOut>>
+    where
+        S: Speculator,
+        M: Probes<S::Probe> + crate::profile::Shaped,
+    {
+        let n = sessions.len();
+        Self::decode_speculative_pipelined_limits(
+            sessions,
+            rewind,
+            spec,
+            prompts,
+            opts,
+            std::iter::repeat_n(opts.max_tokens, n),
+            eos_ids,
+            device,
+            on_tokens,
+        )
+    }
+
+    /// The pipelined driver with each lane's own output ceiling (`0` is
+    /// unbounded until EOS). `max_tokens[i]` belongs to `sessions[i]` and
+    /// overrides `opts.max_tokens`; the other options remain shared.
+    ///
+    /// Shape errors are refused before any session or drafter state moves.
+    /// The uniform-cap entry point and this one execute the same decode loop.
+    #[allow(clippy::too_many_arguments)]
+    pub fn decode_speculative_pipelined_with_caps<S>(
+        sessions: &mut [Self],
+        rewind: crate::profile::RewindProof<M::Profile>,
+        spec: &mut S,
+        prompts: &[&[u32]],
+        opts: &DecodeOptions,
+        max_tokens: &[usize],
+        eos_ids: &[u32],
+        device: &Device,
+        on_tokens: &mut dyn FnMut(usize, &[u32]) -> Result<()>,
+    ) -> Result<Vec<DecodeOut>>
+    where
+        S: Speculator,
+        M: Probes<S::Probe> + crate::profile::Shaped,
+    {
+        Self::decode_speculative_pipelined_limits(
+            sessions,
+            rewind,
+            spec,
+            prompts,
+            opts,
+            max_tokens.iter().copied(),
+            eos_ids,
+            device,
+            on_tokens,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn decode_speculative_pipelined_limits<S>(
+        sessions: &mut [Self],
         _rewind: crate::profile::RewindProof<M::Profile>,
         spec: &mut S,
         prompts: &[&[u32]],
         opts: &DecodeOptions,
+        max_tokens: impl ExactSizeIterator<Item = usize>,
         eos_ids: &[u32],
         device: &Device,
         on_tokens: &mut dyn FnMut(usize, &[u32]) -> Result<()>,
@@ -3543,6 +3767,13 @@ impl<'m, M: CausalLM> Session<'m, M> {
                 "decode_speculative_pipelined: {} sessions and {} prompts",
                 n,
                 prompts.len()
+            );
+        }
+        if max_tokens.len() != n {
+            lloom_tensor::bail!(
+                "decode_speculative_pipelined: {} sessions and {} row caps",
+                n,
+                max_tokens.len()
             );
         }
         if spec.max_draft() == 0 {
@@ -3586,29 +3817,43 @@ impl<'m, M: CausalLM> Session<'m, M> {
 
         // Prefill every sequence before reading any back, so the GPU has all
         // the prompts queued while the host waits on the first. Each prefill
-        // runs in `opts.prefill_ubatch()`'s units and seeds its drafter slot
+        // runs in the shared resolved units and seeds its drafter slot
         // unit by unit (`prefill_streamed`); only the last unit's probe waits
         // here for its anchor.
         let mut logits = Vec::with_capacity(n);
-        for (i, s) in sessions.iter_mut().enumerate() {
+        let mut prefill_pacer = StepPacer::for_decode(opts);
+        for (i, (s, cap)) in sessions.iter_mut().zip(max_tokens).enumerate() {
+            let limit = TokenLimit(cap);
             s.seq.last_logits = None;
             let pos_before = s.seq.pos;
             let prefill_start = std::time::Instant::now();
-            let (l, probe, prefill_units) =
-                s.prefill_streamed(spec, SeqId(i), prompts[i], opts.prefill_ubatch(), device)?;
+            let work = PrefillWork::resolve(opts, s.seq.pos, prompts[i].len(), true)?;
+            let before = prefill_pacer.counters();
+            let (l, probe, prefill_units) = s.prefill_streamed(
+                spec,
+                SeqId(i),
+                prompts[i],
+                &work,
+                &mut prefill_pacer,
+                device,
+            )?;
+            let after = prefill_pacer.counters();
             // Read after the other sequences' prefills: held outside them.
             logits.push((s.hold_logits(l)?, probe));
             lanes.push(Lane {
+                limit,
                 anchor_tok: 0,
                 produced: 0,
                 eos: false,
-                all_ids: Vec::with_capacity(opts.max_tokens),
+                all_ids: Vec::with_capacity(cap),
                 pos_before,
                 prompt_len: prompts[i].len(),
                 stats: DecodeStats {
-                    step_ns: Vec::with_capacity(opts.max_tokens),
+                    step_ns: Vec::with_capacity(cap),
                     prefill_ns: prefill_start.elapsed().as_nanos() as u64,
                     prefill_units,
+                    step_markers: after.0 - before.0,
+                    step_waits: after.1 - before.1,
                     hot_thread: hot_thread.report(),
                     ..DecodeStats::default()
                 },
@@ -3632,18 +3877,23 @@ impl<'m, M: CausalLM> Session<'m, M> {
             lane.anchor_tok = anchor_tok;
             if eos_ids.contains(&anchor_tok) {
                 lane.eos = true;
-            } else if !opts.reached(lane.produced) {
+            } else if !lane.limit.reached(lane.produced) {
                 on_tokens(i, std::slice::from_ref(&anchor_tok))?;
                 lane.all_ids.push(anchor_tok);
                 lane.produced += 1;
             }
-            lane.done = lane.eos || opts.reached(lane.produced);
+            lane.done = lane.eos || lane.limit.reached(lane.produced);
         }
+
+        // All anchors have consumed their seed logits; the round pipeline has
+        // its own pending receipts. No terminal drain is introduced here.
+        #[cfg(feature = "metal")]
+        drop(prefill_pacer);
 
         // Prime: one verify in flight per live sequence.
         for i in 0..n {
             if !lanes[i].done {
-                let room = opts.remaining(lanes[i].produced);
+                let room = lanes[i].limit.remaining(lanes[i].produced);
                 Self::pipeline_enqueue(
                     &mut sessions[i],
                     &mut lanes[i],
@@ -3704,11 +3954,13 @@ impl<'m, M: CausalLM> Session<'m, M> {
 
                 let mut batch: Vec<u32> = Vec::with_capacity(accepted.len());
                 for &id in &accepted {
-                    if eos_ids.contains(&id) {
-                        lane.eos = true;
+                    // A minimum-width verify may predict beyond the output
+                    // ceiling. Its unpublished bonus cannot change the stop.
+                    if lane.limit.reached(lane.produced + batch.len()) {
                         break;
                     }
-                    if opts.reached(lane.produced + batch.len()) {
+                    if eos_ids.contains(&id) {
+                        lane.eos = true;
                         break;
                     }
                     batch.push(id);
@@ -3721,9 +3973,9 @@ impl<'m, M: CausalLM> Session<'m, M> {
                 lane.stats.step_ns.push(
                     (run_start.elapsed().as_nanos() as u64).saturating_sub(lane.round_start_ns),
                 );
-                lane.done = lane.eos || opts.reached(lane.produced);
+                lane.done = lane.eos || lane.limit.reached(lane.produced);
                 if !lane.done {
-                    let room = opts.remaining(lane.produced);
+                    let room = lane.limit.remaining(lane.produced);
                     Self::pipeline_enqueue(s, lane, spec, i, run_start, device, room)?;
                 }
             }
@@ -3745,6 +3997,7 @@ impl<'m, M: CausalLM> Session<'m, M> {
             let mut stats = lane.stats;
             stats.overrun = overrun;
             stats.produced = lane.produced;
+            stats.drafter_ctx = spec.context_len(SeqId(i)).map(|n| (n, s.seq.pos));
             outs.push(DecodeOut {
                 ids: lane.all_ids,
                 eos: lane.eos,
@@ -3800,10 +4053,9 @@ impl<'m, M: CausalLM> Session<'m, M> {
         // the key exists to refuse.
         let k = (draft.tokens.len() + 1).min(u16::MAX as usize);
         s.model.prepare_verify(&mut s.seq.cache, k)?;
-        begin_pass(device, PassShape::Verify { k })?;
-        let pending = s.model.verify_enqueue(&draft, &anchor, &mut s.seq.cache);
-        end_pass(device)?;
-        let pending = pending?;
+        let pass = OpenPass::begin(device, PassShape::Verify { k })?;
+        let pending = s.model.verify_enqueue(&draft, &anchor, &mut s.seq.cache)?;
+        pass.finish()?;
         timing.verify_enqueue_ns = t.elapsed().as_nanos() as u64;
         timing.verify_readbacks = readbacks() - rb;
         lane.in_flight = timing;
@@ -3917,6 +4169,7 @@ impl<'m, M: CausalLM> Session<'m, M> {
     where
         M: BatchedCausalLM,
     {
+        refuse(Body::BatchedStep, &Asks::of(sampler, false))?;
         let n = sessions.len();
         if n == 0 {
             lloom_tensor::bail!("decode_batched: no sessions");
@@ -4213,6 +4466,112 @@ pub(crate) fn tile_widths(widths: Vec<usize>, tile: usize) -> Vec<usize> {
         }
     }
     tiled
+}
+
+#[cfg(test)]
+mod adaptive_lead_tests {
+    use super::DecodeOptions;
+
+    /// The lead is its queued part plus one open buffer, the two set apart
+    /// (`queued_steps`, `run_ahead`); the defaults are the incumbent's 16 + 8;
+    /// off the adaptive commit there is none.
+    #[test]
+    fn the_lead_is_its_queued_part_plus_one_buffer() {
+        let lead = |run_ahead, queued_steps, adaptive_commit| {
+            let o = DecodeOptions {
+                adaptive_commit,
+                run_ahead,
+                queued_steps,
+                ..DecodeOptions::new(1)
+            };
+            (o.run_ahead_steps(), o.queued(), o.adaptive_lead())
+        };
+        assert_eq!(lead(0, 0, true), (8, 16, 24), "the incumbent");
+        assert_eq!(lead(4, 0, true), (4, 8, 12), "queued follows the batching");
+        assert_eq!(
+            lead(8, 2, true),
+            (8, 2, 10),
+            "a shallower queue, batching kept"
+        );
+        assert_eq!(lead(4, 2, false).2, 0, "no lead off the adaptive commit");
+    }
+}
+
+#[cfg(test)]
+mod census_tests {
+    use super::{census_delta, census_snapshot, DecodeStats};
+    use std::collections::HashMap;
+
+    #[test]
+    fn a_missing_census_endpoint_is_unavailable_not_an_empty_window() {
+        let empty = Some(HashMap::new());
+        assert_eq!(census_delta(&None, None), None);
+        assert_eq!(census_delta(&None, empty.clone()), None);
+        assert_eq!(census_delta(&empty, None), None);
+        let stats = DecodeStats::default();
+        assert_eq!(stats.prefill_census, None);
+        assert_eq!(stats.step0_census, None);
+    }
+
+    #[test]
+    fn an_observed_window_with_no_dispatches_is_available_and_empty() {
+        let before = Some(HashMap::from([("old".to_owned(), 3)]));
+        assert_eq!(census_delta(&before, before.clone()), Some(Vec::new()));
+        assert_eq!(
+            census_delta(&Some(HashMap::new()), Some(HashMap::new())),
+            Some(Vec::new())
+        );
+    }
+
+    #[test]
+    fn an_observed_window_reports_only_its_dispatches_in_stable_order() {
+        let before = Some(HashMap::from([("old".to_owned(), 3), ("a".to_owned(), 2)]));
+        let after = Some(HashMap::from([
+            ("old".to_owned(), 3),
+            ("a".to_owned(), 4),
+            ("b".to_owned(), 2),
+            ("c".to_owned(), 5),
+        ]));
+        assert_eq!(
+            census_delta(&before, after),
+            Some(vec![("c".into(), 5), ("a".into(), 2), ("b".into(), 2)])
+        );
+    }
+
+    #[test]
+    fn disabled_recording_does_not_publish_an_empty_census() {
+        #[cfg(feature = "metal")]
+        lloom_tensor::tuning::install(lloom_tensor::tuning::Tuning::default()).unwrap();
+        assert_eq!(census_snapshot(), None);
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn scalar_profiling_does_not_claim_an_unavailable_decode_census() {
+        use lloom_tensor::kernels::metal::profile;
+        use std::sync::Arc;
+
+        let mut tuning = lloom_tensor::tuning::Tuning::default();
+        tuning.instrument.profile = true;
+        lloom_tensor::tuning::install(tuning).unwrap();
+        profile::reset();
+        assert!(profile::enabled());
+        let before = census_snapshot();
+        let label: Arc<str> = Arc::from("decode-census-control");
+        profile::record_dispatch(Some(&label), 0);
+        let after = census_snapshot();
+        assert_eq!(profile::snapshot().dispatches, 1);
+        if cfg!(any(debug_assertions, feature = "profile")) {
+            assert_eq!(before, Some(HashMap::new()));
+            assert_eq!(
+                census_delta(&before, after),
+                Some(vec![("decode-census-control".into(), 1)])
+            );
+        } else {
+            assert_eq!(before, None);
+            assert_eq!(after, None);
+        }
+    }
 }
 
 #[cfg(test)]

@@ -36,12 +36,12 @@ pub const COUPLINGS: &[Coupling] = &[
     },
     Coupling {
         id: "C2",
-        kind: "refuses",
+        kind: "resolves",
         when: "decode.readback.kind = ring with the host-side sampler of C1",
-        effect: "refused: the ring has no host round trip for the draw; `auto` makes the choice instead",
+        effect: "the request runs on the blocking arm — the ring has no host round trip for the draw — and the turn line and `timings.readback_note` say so (a warning, not a refusal, since 2026-10-20)",
         keys: &["decode.readback.kind", "generation.top_k", "generation.top_p", "generation.temperature", "generation.sampling.method"],
-        site: "lloom/src/generation/readback.rs Ring::check_sampler; at resolve: couplings::refuse",
-        is_static: true,
+        site: "lloom-engine/src/decode.rs ReadbackArm::{resolve, demotion}; the ring itself still refuses the pair (lloom/src/generation/readback.rs Ring::check_sampler)",
+        is_static: false,
     },
     Coupling {
         id: "C3",
@@ -155,8 +155,8 @@ pub const COUPLINGS: &[Coupling] = &[
         id: "C15",
         kind: "ignored",
         when: "the adaptive commit does not run; for the fused publish also a sampler that is not argmax without processors",
-        effect: "decode.readback.run_ahead_steps and decode.readback.fused_publish have no effect",
-        keys: &["decode.readback.run_ahead_steps", "decode.readback.fused_publish", "decode.readback.adaptive_commit"],
+        effect: "decode.readback.run_ahead_steps, decode.readback.queued_steps and decode.readback.fused_publish have no effect",
+        keys: &["decode.readback.run_ahead_steps", "decode.readback.queued_steps", "decode.readback.fused_publish", "decode.readback.adaptive_commit"],
         site: "lloom/src/nn/decode.rs (set_fused_publish(adaptive && fused); the run-ahead bound under adaptive_commit); lloom-engine/src/decode.rs (fused = argmax, no processors)",
         is_static: false,
     },
@@ -196,6 +196,33 @@ pub const COUPLINGS: &[Coupling] = &[
         site: "lloom-engine/src/options.rs ExecutorConfig::pass_plans_armed",
         is_static: false,
     },
+    Coupling {
+        id: "C20",
+        kind: "ignored",
+        when: "kernels.gemm.f16_rows off, determinism = deterministic, scheduler.max_sequences = 1, the CPU backend, or a batched step with more live rows than kernels.gemm.f16_rows_max",
+        effect: "kernels.gemm.f16_rows_decode has no effect: the step's matmuls take the GEMM (the GEMV at one row; the one-row reduction per row under deterministic). Under fast a step with prompt pieces puts its live rows on the decode route and its pieces on the GEMM, so a row's route, and so its bits, changes only where a decode step's live rows cross 1 and kernels.gemm.f16_rows_max: the step's two route seams. serve and bench default the arm on only at scheduler.max_sequences up to kernels.gemm.f16_rows_max (12 there on Metal, decision 60), where no step crosses the ceiling",
+        keys: &["kernels.gemm.f16_rows_decode", "kernels.gemm.f16_rows", "kernels.gemm.f16_rows_max", "determinism", "scheduler.max_sequences", "backend.device"],
+        site: "lloom-tensor/src/kernels/kernels/mlx_gemm.rs f16_rows_route, f16_rows_lead; lloom/src/nn/batched.rs BatchDecoder::forward_live (tuning::DecodeRows), BatchDecoder::forward_ragged_live (tuning::RaggedDecodeRows)",
+        is_static: false,
+    },
+    Coupling {
+        id: "C21",
+        kind: "resolves",
+        when: "kernels.residency.set_cap_pct in 1..=99, or kernels.residency.attach = heartbeat",
+        effect: "the device's residency sets: one per class up to the cap, at most 24, the keep-warm requesting kernels.residency.hot; and whether they are on the Metal 3 queue (Metal 4 keeps the attachment). chat and serve detach them by default on Metal (decision 56); the library keeps them on the queue",
+        keys: &["kernels.residency.set_cap_pct", "kernels.residency.attach", "kernels.residency.hot"],
+        site: "lloom-tensor/src/kernels/metal/residency_set.rs ResidencyPolicy::selected, ResidencyAttachment::decide",
+        is_static: false,
+    },
+    Coupling {
+        id: "C22",
+        kind: "ignored",
+        when: "kernels.gemm.f16_rows off, determinism = deterministic, or the CPU backend",
+        effect: "kernels.gemm.f16_rows_round has no effect: no launch takes the row axis. Where one does, a launch of an odd number of rows takes the next even capacity and every row keeps the one-row GEMV's bits, so the arm moves time, never a bit",
+        keys: &["kernels.gemm.f16_rows_round", "kernels.gemm.f16_rows", "determinism", "backend.device"],
+        site: "lloom-tensor/src/kernels/kernels/mlx_gemm.rs f16_rows_capacity",
+        is_static: false,
+    },
 ];
 
 /// The couplings naming `key`.
@@ -209,10 +236,7 @@ pub fn of(key: &str) -> Vec<&'static str> {
 
 /// The sampler is drawn on the host, which the ring cannot carry.
 fn host_side(s: &Sampling) -> bool {
-    !matches!(
-        s,
-        Sampling::ArgMax | Sampling::All { .. } | Sampling::GumbelSoftmax { .. }
-    )
+    !crate::ReadbackArm::ring_admits(s)
 }
 
 const DRAFTERS: [&str; 3] = ["dspark", "mtp", "dflash"];
@@ -229,18 +253,33 @@ pub fn refuse_speculative(
     if !DRAFTERS.contains(&method) || max_sequences <= 1 {
         return Ok(());
     }
+    let arm = sampling.sampling()?;
+    let processors = sampling.processors().is_active();
+    let refusal = match lloom::nn::refuse(
+        lloom::nn::Body::BatchedWindow,
+        &lloom::nn::Asks {
+            sampling: &arm,
+            processors,
+            budget: sampling.thinking_budget.is_some(),
+            digest: false,
+            logprobs: None,
+        },
+    ) {
+        Ok(()) => return Ok(()),
+        Err(e) => e,
+    };
     let mut why = Vec::new();
-    if sampling.sampling() != Sampling::ArgMax {
+    if arm != Sampling::ArgMax {
         why.push("a temperature (generation.temperature)");
     }
-    if sampling.processors().is_active() {
+    if processors {
         why.push("a logits processor (generation.min_p, the penalties, generation.logit_bias)");
     }
     if sampling.thinking_budget.is_some() {
         why.push("a thinking budget (reasoning.budget)");
     }
     if why.is_empty() {
-        return Ok(());
+        return Err(format!("C11: speculative.method = {method}: {refusal}"));
     }
     Err(format!(
         "C11: speculative.method = {method} at scheduler.max_sequences = {max_sequences} refuses \
@@ -253,13 +292,7 @@ pub fn refuse_speculative(
 /// options resolve rather than at the first request.
 pub fn refuse(o: &EngineOptions) -> Result<(), String> {
     let s = &o.sampling;
-    if o.decode.readback.kind == crate::ReadbackKind::Ring && host_side(&s.sampling()) {
-        return Err(format!(
-            "C2: decode.readback.kind = ring with a host-side sampler ({:?}): the ring cannot draw it; \
-             `auto` takes the blocking arm for it",
-            s.sampling()
-        ));
-    }
+    let sampling = s.sampling()?;
     if o.decode.readback.lookahead > 1 {
         return Err(format!(
             "C10: decode.readback.lookahead_forwards = {} is not 0 or 1",
@@ -267,7 +300,18 @@ pub fn refuse(o: &EngineOptions) -> Result<(), String> {
         ));
     }
     refuse_speculative(&o.speculative.method, s, o.scheduler.max_sequences)?;
-    if o.scheduler.max_sequences > 1 && (s.processors().is_active() || s.thinking_budget.is_some())
+    if o.scheduler.max_sequences > 1
+        && lloom::nn::refuse(
+            lloom::nn::Body::BatchedStep,
+            &lloom::nn::Asks {
+                sampling: &sampling,
+                processors: s.processors().is_active(),
+                budget: s.thinking_budget.is_some(),
+                digest: false,
+                logprobs: None,
+            },
+        )
+        .is_err()
     {
         return Err(format!(
             "C12: scheduler.max_sequences = {} refuses {}: the batched driver's rows draw without \
@@ -289,16 +333,31 @@ pub fn explain(o: &EngineOptions) -> Vec<String> {
     let mut out = Vec::new();
     let r = &o.decode.readback;
     let s = &o.sampling;
-    let sampling = s.sampling();
-    if r.kind == crate::ReadbackKind::Auto && host_side(&sampling) {
-        let by = match (s.top_k.is_some(), s.top_p.is_some()) {
+    let sampling = match s.sampling() {
+        Ok(sampling) => sampling,
+        Err(e) => {
+            out.push(e);
+            return out;
+        }
+    };
+    if host_side(&sampling) {
+        let k = s.top_k.is_some_and(|k| k > 0);
+        let p = s.top_p.is_some_and(|p| p < 1.0);
+        let by = match (k, p) {
             (true, true) => "generation.top_k, generation.top_p",
             (true, false) => "generation.top_k",
             _ => "generation.top_p",
         };
-        out.push(format!(
-            "decode.readback.kind = auto -> blocking <- {by} (C1)"
-        ));
+        match r.kind {
+            crate::ReadbackKind::Auto => out.push(format!(
+                "decode.readback.kind = auto -> blocking <- {by} (C1)"
+            )),
+            crate::ReadbackKind::Ring => out.push(format!(
+                "decode.readback.kind = ring -> blocking for this sampler <- {by}: the ring cannot \
+                 draw a host sort; each request says so on its turn line (C2)"
+            )),
+            crate::ReadbackKind::Blocking => {}
+        }
     }
     if sampling == Sampling::ArgMax && (s.top_k.is_some() || s.top_p.is_some() || s.gumbel) {
         out.push("generation.top_k / top_p / sampling.method ignored <- generation.temperature unset (C3)".into());
@@ -317,8 +376,7 @@ pub fn explain(o: &EngineOptions) -> Vec<String> {
         );
     }
     // The arm that runs: the blocking one where C1 resolves `auto` to it.
-    let blocking = r.kind == crate::ReadbackKind::Blocking
-        || (r.kind == crate::ReadbackKind::Auto && host_side(&sampling));
+    let blocking = r.kind == crate::ReadbackKind::Blocking || host_side(&sampling);
     let adaptive = !blocking && r.ring_arm().adaptive;
     if adaptive && !r.stream_reader {
         out.push(
@@ -344,8 +402,8 @@ pub fn explain(o: &EngineOptions) -> Vec<String> {
             r.eos
         ));
     }
-    if !adaptive && (r.run_ahead != 0 || !r.fused_publish) {
-        out.push("decode.readback.run_ahead_steps / fused_publish ignored <- the adaptive commit does not run (C15)".into());
+    if !adaptive && (r.run_ahead != 0 || r.queued_steps != 0 || !r.fused_publish) {
+        out.push("decode.readback.run_ahead_steps / queued_steps / fused_publish ignored <- the adaptive commit does not run (C15)".into());
     }
     if DRAFTERS.contains(&o.speculative.method.as_str()) && o.model.cache == "auto" {
         out.push(format!(
@@ -365,7 +423,101 @@ pub fn explain(o: &EngineOptions) -> Vec<String> {
                 .into(),
         );
     }
+    if let Some(line) = residency_layout(&o.tuning.metal) {
+        out.push(line);
+    }
+    let g = &o.tuning.gemm;
+    let rows_cause = if o.tuning.contract.profile == "deterministic" {
+        Some("determinism = deterministic")
+    } else if !g.f16_rows {
+        Some("kernels.gemm.f16_rows = false")
+    } else if !cfg!(feature = "metal") || o.load.device == "cpu" {
+        Some("the CPU backend")
+    } else if o.scheduler.max_sequences <= 1 {
+        Some("scheduler.max_sequences = 1")
+    } else {
+        None
+    };
+    let default_batch = format!(
+        "serve and bench turn it on by default at a batch of 2 to {} sequences",
+        g.f16_rows_max
+    );
+    if g.f16_rows_decode {
+        out.push(match rows_cause {
+            Some(c) => format!("kernels.gemm.f16_rows_decode ignored <- {c} (C20)"),
+            None if o.scheduler.max_sequences > g.f16_rows_max => format!(
+                "kernels.gemm.f16_rows_decode: a decode step of 2 to {} live rows (1 to {} beside \
+                 prompt pieces) takes the row axis, of more the GEMM; a batch of {} sequences \
+                 crosses the ceiling, so a row's route follows how many rows its steps hold, \
+                 which follows the requests' arrival; {default_batch} <- \
+                 kernels.gemm.f16_rows_max (C20)",
+                g.f16_rows_max, g.f16_rows_max, o.scheduler.max_sequences
+            ),
+            None => format!(
+                "kernels.gemm.f16_rows_decode: a decode step of 2 to {} live rows (1 to {} beside \
+                 prompt pieces) takes the row axis, of more the GEMM; {default_batch} <- \
+                 kernels.gemm.f16_rows_max (C20)",
+                g.f16_rows_max, g.f16_rows_max
+            ),
+        });
+    } else if rows_cause.is_none() && o.scheduler.max_sequences > g.f16_rows_max {
+        out.push(format!(
+            "kernels.gemm.f16_rows_decode off: {default_batch}, and a batch of {} is past the \
+             ceiling, where a row's route would follow the requests' arrival <- \
+             kernels.gemm.f16_rows_max (C20)",
+            o.scheduler.max_sequences
+        ));
+    }
+    if g.f16_rows_round {
+        let cause = if o.tuning.contract.profile == "deterministic" {
+            Some("determinism = deterministic")
+        } else if !g.f16_rows {
+            Some("kernels.gemm.f16_rows = false")
+        } else if !cfg!(feature = "metal") || o.load.device == "cpu" {
+            Some("the CPU backend")
+        } else {
+            None
+        };
+        out.push(match cause {
+            Some(c) => format!("kernels.gemm.f16_rows_round ignored <- {c} (C22)"),
+            None => "kernels.gemm.f16_rows_round: a row-axis launch of an odd number of rows \
+                     takes the next even capacity, the same bits <- kernels.gemm.f16_rows (C22)"
+                .into(),
+        });
+    }
     out
+}
+
+/// The residency router's layout as the options resolve it (`tuning.md`
+/// §6.3n, §6.3o); `None` at the library's values (one set, attached to the
+/// queue).
+fn residency_layout(m: &lloom_tensor::tuning::MetalTuning) -> Option<String> {
+    let pct = m.residency_set_cap_pct;
+    let split = pct > 0 && pct < 100;
+    if !split && m.residency_attach == "queue" {
+        return None;
+    }
+    let sets = if split {
+        format!(
+            "sets per class (weights, kv, heap, scratch, experts, other), each at most {pct} % of \
+             the device's recommended working set, at most {} sets; the keep-warm requests {}",
+            lloom_tensor::residency_class::MAX_DEVICE_SETS,
+            m.residency_hot
+        )
+    } else {
+        "1 set".into()
+    };
+    let attach = if m.residency_attach == "heartbeat" {
+        "detached from the Metal 3 queue (chat's and serve's default on Metal, decision 56; \
+         Metal 4: attached as before)"
+    } else {
+        "on the Metal 3 queue"
+    };
+    Some(format!(
+        "kernels.residency -> {sets}, {attach} <- kernels.residency.set_cap_pct = {pct}, \
+         kernels.residency.attach = {} (C21)",
+        m.residency_attach
+    ))
 }
 
 /// The schema's top-level `x-lloom-couplings`.
@@ -387,10 +539,6 @@ pub fn table() -> Value {
 /// file: what [`refuse`] refuses, checked before load by any validator.
 pub fn static_rules() -> Value {
     let hot = json!({"type": "number", "minimum": 1e-7});
-    let host_sampler = json!({"anyOf": [
-        {"properties": {"top_k": {"type": "integer"}}, "required": ["top_k"]},
-        {"properties": {"top_p": {"type": "number"}}, "required": ["top_p"]}
-    ]});
     let active = json!({"anyOf": [
         {"properties": {"repetition_penalty": {"type": "number", "not": {"const": 1}}}, "required": ["repetition_penalty"]},
         {"properties": {"presence_penalty": {"type": "number", "not": {"const": 0}}}, "required": ["presence_penalty"]},
@@ -400,17 +548,8 @@ pub fn static_rules() -> Value {
     ]});
     let budget = json!({"properties": {"reasoning": {"properties": {"budget": {"type": "integer"}}, "required": ["budget"]}}, "required": ["reasoning"]});
     json!([
-        {"$comment": "C2: an explicit ring with a host-side sampler is refused",
-         "if": {"properties": {
-                "decode": {"properties": {"readback": {"properties": {"kind": {"const": "ring"}}, "required": ["kind"]}}, "required": ["readback"]},
-                "generation": {"allOf": [
-                    {"properties": {"temperature": hot}, "required": ["temperature"]},
-                    host_sampler,
-                    {"not": {"properties": {"sampling": {"properties": {"method": {"const": "gumbel"}}, "required": ["method"]}}, "required": ["sampling"]}}]}},
-                "required": ["decode", "generation"]},
-         "then": false},
         {"$comment": "C10: at most one forward past an unlearned EOS",
-         "if": {"properties": {"decode": {"properties": {"readback": {"properties": {"lookahead_forwards": {"type": "integer", "minimum": 2}}, "required": ["lookahead_forwards"]}}, "required": ["readback"]}}, "required": ["decode"]},
+         "if": {"properties": {"decode": {"properties": {"readback": {"type": "object", "properties": {"lookahead_forwards": {"type": "integer", "minimum": 2}}, "required": ["lookahead_forwards"]}}, "required": ["readback"]}}, "required": ["decode"]},
          "then": false},
         {"$comment": "C11: a drafter at more than one sequence refuses a temperature, a logits processor and a thinking budget",
          "if": {"properties": {
@@ -447,14 +586,6 @@ mod tests {
     #[test]
     fn each_static_coupling_refuses_by_name() {
         for (sets, id) in [
-            (
-                &[
-                    ("decode.readback.kind", "ring"),
-                    ("generation.temperature", "0.7"),
-                    ("generation.top_p", "0.9"),
-                ][..],
-                "C2",
-            ),
             (
                 &[
                     ("speculative.method", "mtp"),
@@ -504,11 +635,11 @@ mod tests {
                 ("generation.temperature", "0.7"),
                 ("generation.top_p", "0.9"),
             ][..],
+            // C2 resolves (the blocking arm with a note) instead of refusing.
             &[
                 ("decode.readback.kind", "ring"),
                 ("generation.temperature", "0.7"),
                 ("generation.top_p", "0.9"),
-                ("generation.sampling.method", "gumbel"),
             ][..],
             &[
                 ("speculative.method", "auto"),
@@ -554,9 +685,50 @@ mod tests {
         ] {
             refuse(&with(sets)).unwrap_or_else(|e| panic!("{sets:?}: {e}"));
         }
+        let filtered_gumbel = with(&[
+            ("decode.readback.kind", "ring"),
+            ("generation.temperature", "0.7"),
+            ("generation.top_p", "0.9"),
+            ("generation.sampling.method", "gumbel"),
+        ]);
+        // A ring asked by name with filtered gumbel resolves to the blocking
+        // arm (C2), as top-k / top-p does.
+        refuse(&filtered_gumbel).unwrap();
+        assert!(
+            explain(&filtered_gumbel).iter().any(|l| l.starts_with(
+                "decode.readback.kind = ring -> blocking for this sampler <- generation.top_p"
+            ) && l.ends_with("(C2)")),
+            "{:?}",
+            explain(&filtered_gumbel)
+        );
         let mut o = EngineOptions::default();
         o.decode.readback.lookahead = 2;
         assert!(refuse(&o).unwrap_err().starts_with("C10:"));
+    }
+
+    #[test]
+    fn disabled_filters_stay_on_the_ring_but_filtered_gumbel_is_explicit_host() {
+        for method in ["multinomial", "gumbel"] {
+            let off = with(&[
+                ("decode.readback.kind", "ring"),
+                ("generation.temperature", "0.7"),
+                ("generation.top_k", "0"),
+                ("generation.top_p", "1"),
+                ("generation.sampling.method", method),
+            ]);
+            refuse(&off).unwrap();
+        }
+        let host = with(&[
+            ("decode.readback.kind", "auto"),
+            ("generation.temperature", "0.7"),
+            ("generation.top_p", "0"),
+            ("generation.sampling.method", "gumbel"),
+        ]);
+        refuse(&host).unwrap();
+        assert!(host.sampling.sampling().unwrap().requires_host());
+        assert!(explain(&host)
+            .iter()
+            .any(|s| s.contains("auto -> blocking")));
     }
 
     #[test]
@@ -581,10 +753,190 @@ mod tests {
                 .any(|l| l == "decode.readback.kind = auto -> blocking <- generation.top_k (C1)"),
             "{lines:?}"
         );
+        // A ring asked by name with a host-side sampler is explained (C2),
+        // not refused, and the stream-reader line (C9) is not added for it:
+        // the blocking arm runs.
+        let lines = explain(&with(&[
+            ("decode.readback.kind", "ring"),
+            ("generation.temperature", "0.7"),
+            ("generation.top_p", "0.9"),
+        ]));
+        assert!(
+            lines.iter().any(|l| l.starts_with(
+                "decode.readback.kind = ring -> blocking for this sampler <- generation.top_p"
+            ) && l.ends_with("(C2)")),
+            "{lines:?}"
+        );
+        assert!(!lines.iter().any(|l| l.contains("(C9)")), "{lines:?}");
         assert_eq!(
             explain(&EngineOptions::default()),
             vec!["decode.readback.stream_reader -> on <- decode.readback.adaptive_commit (C9)"],
             "at the defaults only the reader the adaptive commit drains through"
         );
+        // C20: the decode rows' arm names its ceiling where it can take the
+        // row axis, and its cause where it cannot.
+        let c20 = |sets: &[(&str, &str)]| -> Vec<String> {
+            explain(&with(sets))
+                .into_iter()
+                .filter(|l| l.ends_with("(C20)"))
+                .collect()
+        };
+        let on = [
+            ("kernels.gemm.f16_rows_decode", "true"),
+            ("scheduler.max_sequences", "4"),
+        ];
+        let at_batch = c20(&on);
+        if cfg!(feature = "metal") {
+            assert_eq!(
+                at_batch,
+                vec![
+                    "kernels.gemm.f16_rows_decode: a decode step of 2 to 10 live rows (1 to 10 \
+                      beside prompt pieces) takes the row axis, of more the GEMM; serve and bench \
+                      turn it on by default at a batch of 2 to 10 sequences <- \
+                      kernels.gemm.f16_rows_max (C20)"
+                ]
+            );
+            // Decision 60's ceiling, as serve and bench resolve it.
+            assert_eq!(
+                c20(&[
+                    ("kernels.gemm.f16_rows_decode", "true"),
+                    ("kernels.gemm.f16_rows_max", "12"),
+                    ("scheduler.max_sequences", "12"),
+                ]),
+                vec![
+                    "kernels.gemm.f16_rows_decode: a decode step of 2 to 12 live rows (1 to 12 \
+                      beside prompt pieces) takes the row axis, of more the GEMM; serve and bench \
+                      turn it on by default at a batch of 2 to 12 sequences <- \
+                      kernels.gemm.f16_rows_max (C20)"
+                ]
+            );
+        } else {
+            assert_eq!(
+                at_batch,
+                vec!["kernels.gemm.f16_rows_decode ignored <- the CPU backend (C20)"]
+            );
+        }
+        let mut wide = on.to_vec();
+        wide[1] = ("scheduler.max_sequences", "16");
+        if cfg!(feature = "metal") {
+            assert_eq!(
+                c20(&wide),
+                vec![
+                    "kernels.gemm.f16_rows_decode: a decode step of 2 to 10 live rows (1 to 10 \
+                      beside prompt pieces) takes the row axis, of more the GEMM; a batch of 16 \
+                      sequences crosses the ceiling, so a row's route follows how many rows its \
+                      steps hold, which follows the requests' arrival; serve and bench turn it on \
+                      by default at a batch of 2 to 10 sequences <- kernels.gemm.f16_rows_max (C20)"
+                ]
+            );
+        }
+        let mut one = on.to_vec();
+        one[1] = ("scheduler.max_sequences", "1");
+        if cfg!(feature = "metal") {
+            assert_eq!(
+                c20(&one),
+                vec!["kernels.gemm.f16_rows_decode ignored <- scheduler.max_sequences = 1 (C20)"]
+            );
+        }
+        let mut det = on.to_vec();
+        det.push(("determinism", "deterministic"));
+        assert_eq!(
+            c20(&det),
+            vec!["kernels.gemm.f16_rows_decode ignored <- determinism = deterministic (C20)"]
+        );
+        let mut rows_off = on.to_vec();
+        rows_off.push(("kernels.gemm.f16_rows", "false"));
+        assert_eq!(
+            c20(&rows_off),
+            vec!["kernels.gemm.f16_rows_decode ignored <- kernels.gemm.f16_rows = false (C20)"]
+        );
+        assert!(
+            c20(&[("scheduler.max_sequences", "4")]).is_empty(),
+            "the arm off"
+        );
+        // Off past the ceiling: the default batch it would take, named.
+        let past = c20(&[
+            ("kernels.gemm.f16_rows_max", "12"),
+            ("scheduler.max_sequences", "13"),
+        ]);
+        if cfg!(feature = "metal") {
+            assert_eq!(
+                past,
+                vec![
+                    "kernels.gemm.f16_rows_decode off: serve and bench turn it on by default at a \
+                      batch of 2 to 12 sequences, and a batch of 13 is past the ceiling, where a \
+                      row's route would follow the requests' arrival <- kernels.gemm.f16_rows_max \
+                      (C20)"
+                ]
+            );
+        } else {
+            assert!(past.is_empty(), "{past:?}");
+        }
+        // C22: the capacity rounding names what it does where the row axis
+        // runs, and its cause where it does not.
+        let c22 = |sets: &[(&str, &str)]| -> Vec<String> {
+            explain(&with(sets))
+                .into_iter()
+                .filter(|l| l.ends_with("(C22)"))
+                .collect()
+        };
+        let round = [("kernels.gemm.f16_rows_round", "true")];
+        if cfg!(feature = "metal") {
+            assert_eq!(
+                c22(&round),
+                vec![
+                    "kernels.gemm.f16_rows_round: a row-axis launch of an odd number of rows \
+                     takes the next even capacity, the same bits <- kernels.gemm.f16_rows (C22)"
+                ]
+            );
+        } else {
+            assert_eq!(
+                c22(&round),
+                vec!["kernels.gemm.f16_rows_round ignored <- the CPU backend (C22)"]
+            );
+        }
+        let mut det = round.to_vec();
+        det.push(("determinism", "deterministic"));
+        assert_eq!(
+            c22(&det),
+            vec!["kernels.gemm.f16_rows_round ignored <- determinism = deterministic (C22)"]
+        );
+        let mut rows_off = round.to_vec();
+        rows_off.push(("kernels.gemm.f16_rows", "false"));
+        assert_eq!(
+            c22(&rows_off),
+            vec!["kernels.gemm.f16_rows_round ignored <- kernels.gemm.f16_rows = false (C22)"]
+        );
+        assert!(c22(&[]).is_empty(), "the arm off");
+    }
+
+    /// C21 at the library's values says nothing; where chat's and serve's
+    /// rows hold (Metal) their default detaches the set, and the line names
+    /// decision 56; `queue` named is the library's arrangement again.
+    #[test]
+    fn c21_names_the_default_attachment() {
+        use crate::frontend::{self, Frontend, When};
+        let c21 = |o: &EngineOptions| -> Vec<String> {
+            explain(o)
+                .into_iter()
+                .filter(|l| l.ends_with("(C21)"))
+                .collect()
+        };
+        assert!(c21(&EngineOptions::default()).is_empty(), "the library's");
+        for f in [Frontend::Chat, Frontend::Serve, Frontend::Bench] {
+            let mut o = EngineOptions::default();
+            frontend::apply(&mut o, f, &Default::default(), &Default::default()).unwrap();
+            let detached = f != Frontend::Bench && When::Metal.holds(&o);
+            let want: Vec<String> = if detached {
+                vec!["kernels.residency -> 1 set, detached from the Metal 3 queue (chat's and \
+                      serve's default on Metal, decision 56; Metal 4: attached as before) <- \
+                      kernels.residency.set_cap_pct = 0, kernels.residency.attach = heartbeat (C21)"
+                    .into()]
+            } else {
+                vec![]
+            };
+            assert_eq!(c21(&o), want, "{}", f.name());
+        }
+        assert!(c21(&with(&[("kernels.residency.attach", "queue")])).is_empty());
     }
 }

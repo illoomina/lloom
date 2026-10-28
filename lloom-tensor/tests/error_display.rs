@@ -291,7 +291,7 @@ fn every_variant() -> Vec<(&'static str, Error)> {
             Error::TryFromIntError(u8::try_from(300u32).unwrap_err()),
         ),
         ("Npy", Error::Npy("npy fixture".to_string())),
-        ("Zip", Error::Zip(zip::result::ZipError::FileNotFound)),
+        ("Zip", Error::Zip(Box::new(zip::result::ZipError::FileNotFound))),
         ("ParseInt", Error::ParseInt("x".parse::<u32>().unwrap_err())),
         (
             "FromUtf8",
@@ -538,6 +538,18 @@ fn nested_fixtures() -> Vec<(&'static str, Error)> {
         use lloom_tensor::MetalError;
         let k = |e: K| Error::Metal(MetalError::KernelError(e));
         all.extend([
+            (
+                "Metal.Kernel.OwnerSubmissionRequired",
+                k(K::OwnerSubmissionRequired),
+            ),
+            (
+                "Metal.Kernel.SubscriberConfigurationSealed",
+                k(K::SubscriberConfigurationSealed),
+            ),
+            (
+                "Metal.Kernel.SubscriberSetupBusy",
+                k(K::SubscriberSetupBusy),
+            ),
             ("Metal.Kernel.CallbackWouldBlock", k(K::CallbackWouldBlock)),
             (
                 "Metal.Kernel.LockError",
@@ -650,6 +662,9 @@ fn metal_variant(e: &lloom_tensor::MetalError) -> &'static str {
             // `CompletionRegistrationError::new` is crate-private; its text is
             // pinned by `kernels::err`'s `registration_error_tests`.
             K::CompletionRegistration(_) => "Metal.Kernel.CompletionRegistration",
+            K::OwnerSubmissionRequired => "Metal.Kernel.OwnerSubmissionRequired",
+            K::SubscriberConfigurationSealed => "Metal.Kernel.SubscriberConfigurationSealed",
+            K::SubscriberSetupBusy => "Metal.Kernel.SubscriberSetupBusy",
             K::CallbackWouldBlock => "Metal.Kernel.CallbackWouldBlock",
             K::QueueUnavailable(_) => "Metal.Kernel.QueueUnavailable",
             K::CommandBufferError(_) => "Metal.Kernel.CommandBufferError",
@@ -752,6 +767,9 @@ const EXPECTED: &[(&str, &str)] = &[
     ("Allocation.ReuseDomainMismatch.domain-domain", "reusable allocation domain mismatch: container=accounted domain, active payer=accounted domain; accounted domains require identical origin"),
     ("Allocation.ReuseDomainMismatch.domain-legacy", "reusable allocation domain mismatch: container=accounted domain, active payer=legacy/unadmitted; accounted domains require identical origin"),
     ("Allocation.ReuseDomainMismatch.legacy-domain", "reusable allocation domain mismatch: container=legacy/unadmitted, active payer=accounted domain; accounted domains require identical origin"),
+    ("Metal.Kernel.OwnerSubmissionRequired", "Metal error bound command buffer requires its owning Commands submission transaction"),
+    ("Metal.Kernel.SubscriberConfigurationSealed", "Metal error queue completion subscribers are sealed; register during device setup"),
+    ("Metal.Kernel.SubscriberSetupBusy", "Metal error queue subscriber setup publication is active; finish setup and retry"),
     ("Metal.Kernel.CallbackWouldBlock", "Metal error a completion callback cannot block on its own queue"),
     ("Metal.Kernel.LockError", "Metal error Could not lock resource: lock fixture"),
     ("Metal.Kernel.LoadLibraryError", "Metal error Error while loading library: library fixture"),
@@ -802,10 +820,10 @@ fn every_variant_displays_as_before() {
             .iter()
             .filter(|n| n.starts_with("Metal.Kernel."))
             .count();
-        // Twenty variants: `Allocation` is counted above and
+        // Twenty-three variants: `Allocation` is counted above and
         // `CompletionRegistration` is pinned in `kernels::err`.
         assert_eq!(
-            kernel, 18,
+            kernel, 21,
             "MetalKernelError variants with a fixture: {nested:?}"
         );
         let metal = nested

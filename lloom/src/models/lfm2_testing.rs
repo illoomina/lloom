@@ -92,10 +92,14 @@ impl TinyFamily for Lfm2Tiny {
     }
 
     fn schema(ckpt: &TinyCheckpoint<Self>) -> Result<Schema> {
+        Self::schema_for::<crate::profile::CrownExact>(ckpt)
+    }
+
+    fn schema_for<P: Profile>(ckpt: &TinyCheckpoint<Self>) -> Result<Schema> {
         let (be, rec) = backend(ckpt)?;
         let vb = VarBuilder::from_backend(Box::new(be), DType::F32, Device::Cpu);
-        // The schema is the loader's reads, the same at every profile.
-        Model::<crate::profile::CrownExact>::new(&ckpt.cfg, vb)?;
+        // The tensor reads do not vary by profile; recording still obeys its regime.
+        Model::<P>::new(&ckpt.cfg, vb)?;
         Ok(rec.schema(ckpt.weights.dense))
     }
 

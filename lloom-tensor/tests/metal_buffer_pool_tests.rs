@@ -662,6 +662,11 @@ fn dropping_the_last_device_handle_empties_the_residency_set() -> Result<()> {
         live.devices >= 1 && live.records >= 1,
         "a live device must hold the set's retirement open, read {live:?}"
     );
+    assert_eq!(
+        set.counters().ends,
+        0,
+        "a live device's residency must not have been ended"
+    );
 
     // The last handle goes here. `set` outlives it deliberately, which is the
     // whole point: once the device is gone there is nothing left to ask.
@@ -682,6 +687,13 @@ fn dropping_the_last_device_handle_empties_the_residency_set() -> Result<()> {
         "the retired device's records must have emptied the residency set \
          (`DESIGN.md` §6.3c)"
     );
+    assert_eq!(
+        set.counters().ends,
+        set.layout().len() as u64,
+        "the last device handle ends each native set's residency once, at unload: {:?}",
+        set.layout()
+    );
+    assert!(set.counters().ends >= 1);
     Ok(())
 }
 
@@ -751,6 +763,108 @@ fn every_allocation_leaves_the_set_before_its_record_releases_it() -> Result<()>
 
 const EXIT_CHILD: &str = "LLOOM_DEVICE_EXIT_JOIN_CHILD";
 
+// Libtest may print its unfinished `test NAME ... ` prefix before this
+// process::exit child writes. Accept that exact prefix or a standalone receipt,
+// never an arbitrary substring, a second receipt, or a malformed field set.
+fn exit_child_receipt<'a>(
+    stdout: &'a str,
+    test_name: &str,
+) -> std::result::Result<&'a str, &'static str> {
+    let prefix = format!("test {test_name} ... ");
+    let mut found = None;
+    for line in stdout.lines().filter(|line| line.contains("EXIT-CHILD")) {
+        let receipt = line.strip_prefix(prefix.as_str()).unwrap_or(line);
+        let body = receipt
+            .strip_prefix("EXIT-CHILD ")
+            .ok_or("EXIT-CHILD marker outside the exact receipt prefix")?;
+        if found.replace(receipt).is_some() {
+            return Err("duplicate EXIT-CHILD receipt");
+        }
+        if body == "no-device" {
+            continue;
+        }
+        let mut fields = body.split_whitespace();
+        for key in [
+            "listed_before",
+            "completed",
+            "sets_retiring",
+            "records_pending",
+            "set_len",
+            "listed_at_release",
+            "worker_stopped",
+            "late_records",
+        ] {
+            let value = fields
+                .next()
+                .and_then(|field| field.strip_prefix(key))
+                .and_then(|value| value.strip_prefix('='))
+                .ok_or("missing, duplicated, or unordered EXIT-CHILD field")?;
+            if matches!(key, "completed" | "worker_stopped") {
+                if !matches!(value, "true" | "false") {
+                    return Err("invalid EXIT-CHILD boolean");
+                }
+            } else if value.is_empty()
+                || !value.bytes().all(|byte| byte.is_ascii_digit())
+                || value.parse::<usize>().is_err()
+            {
+                return Err("invalid EXIT-CHILD count");
+            }
+        }
+        if fields.next().is_some() {
+            return Err("extra EXIT-CHILD field");
+        }
+    }
+    found.ok_or("missing EXIT-CHILD receipt")
+}
+
+#[test]
+fn exit_child_receipt_accepts_only_standalone_or_exact_libtest_prefix() {
+    let name = "metal_buffer_pool_tests::exiting_at_once_after_the_exit_join_leaves_the_set_empty";
+    let receipt = "EXIT-CHILD listed_before=3 completed=true sets_retiring=0 records_pending=0 set_len=0 listed_at_release=0 worker_stopped=true late_records=3";
+    assert_eq!(exit_child_receipt(receipt, name), Ok(receipt));
+    // Exact original native-run output, including libtest's unfinished line.
+    let captured = format!("\nrunning 1 test\ntest {name} ... {receipt}\n");
+    assert_eq!(exit_child_receipt(&captured, name), Ok(receipt));
+    assert_eq!(
+        exit_child_receipt("EXIT-CHILD no-device", name),
+        Ok("EXIT-CHILD no-device")
+    );
+    // Parsing must not conceal a failed semantic witness; the real parent's
+    // unchanged join/count assertions still receive and reject these values.
+    let incomplete = receipt.replace("completed=true", "completed=false");
+    assert_eq!(
+        exit_child_receipt(&incomplete, name),
+        Ok(incomplete.as_str())
+    );
+}
+
+#[test]
+fn exit_child_receipt_rejects_missing_duplicate_and_malformed_receipts() {
+    let name = "metal_buffer_pool_tests::exiting_at_once_after_the_exit_join_leaves_the_set_empty";
+    let receipt = "EXIT-CHILD listed_before=3 completed=true sets_retiring=0 records_pending=0 set_len=0 listed_at_release=0 worker_stopped=true late_records=3";
+    for invalid in [
+        String::new(),
+        "EXIT-CHILD".to_string(),
+        "EXIT-CHILD no-device junk".to_string(),
+        format!("diagnostic {receipt}"),
+        format!("test wrong_name ... {receipt}"),
+        format!("test {name} ... diagnostic {receipt}\n{receipt}"),
+        format!("{receipt}\n{receipt}\n"),
+        format!("{receipt} {receipt}"),
+        receipt.replace("completed=true", "completed=maybe"),
+        receipt.replace("listed_before=3", "listed_before=-1"),
+        receipt.replace("listed_before=3", &format!("listed_before={}0", usize::MAX)),
+        receipt.replace("sets_retiring=0", "completed=true"),
+        receipt.replace("records_pending=0 ", ""),
+        format!("{receipt} unknown=0"),
+    ] {
+        assert!(
+            exit_child_receipt(&invalid, name).is_err(),
+            "accepted {invalid:?}"
+        );
+    }
+}
+
 /// Dropping the last handle and exiting at once, after the exit join, leaves
 /// the set empty and exits cleanly.
 ///
@@ -815,16 +929,13 @@ fn exiting_at_once_after_the_exit_join_leaves_the_set_empty() -> Result<()> {
         .output()
         .expect("the child ran");
     let stdout = String::from_utf8_lossy(&out.stdout);
-    let line = stdout
-        .lines()
-        .find(|l| l.starts_with("EXIT-CHILD"))
-        .unwrap_or_else(|| {
-            panic!(
-                "the child printed no EXIT-CHILD line; status {:?}\nstdout:\n{stdout}\nstderr:\n{}",
-                out.status,
-                String::from_utf8_lossy(&out.stderr)
-            )
-        });
+    let line = exit_child_receipt(&stdout, &name).unwrap_or_else(|reason| {
+        panic!(
+            "invalid child EXIT-CHILD receipt ({reason}); status {:?}\nstdout:\n{stdout}\nstderr:\n{}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        )
+    });
     eprintln!("{line} status={:?}", out.status);
     assert!(
         out.status.success(),

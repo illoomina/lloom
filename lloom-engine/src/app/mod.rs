@@ -24,6 +24,7 @@ pub mod report;
 mod request_slot;
 pub mod serve;
 pub mod served;
+pub mod sessions;
 pub mod template;
 pub mod thinking;
 pub mod vision;
@@ -56,11 +57,18 @@ pub struct Shape {
     pub reuse_prefix: bool,
     pub seed_text: String,
     pub batch: usize,
+    /// The most requests one intake tick of the batched scheduler takes
+    /// off its queue while rows are live (`scheduler.intake_per_tick`).
+    pub intake_per_tick: usize,
     pub mem_sample: bool,
     pub rows: String,
     pub share_prefix: bool,
     /// `scheduler.decision_ragged`; taken only under the `fast` contract.
     pub decision_ragged: bool,
+    /// The load keeps a frame of the checkpoint ring for a session's pinned
+    /// head (`session.keep = prefix`, `docs/sessions.md` §8): `serve`, one
+    /// sequence, prefix reuse on.
+    pub pin_prefix: bool,
 }
 
 impl Shape {
@@ -81,10 +89,15 @@ impl Shape {
             reuse_prefix: o.prefix.reuse.unwrap_or_else(|| frontend.reuse_prefix()),
             seed_text,
             batch: o.scheduler.max_sequences,
+            intake_per_tick: o.scheduler.intake_per_tick,
             mem_sample: o.report.memory_sample,
             rows: o.scheduler.rows.clone(),
             share_prefix: o.prefix.share,
             decision_ragged: o.scheduler.decision_ragged,
+            pin_prefix: frontend == crate::frontend::Frontend::Serve
+                && o.session.keep == "prefix"
+                && o.prefix.reuse.unwrap_or_else(|| frontend.reuse_prefix())
+                && o.scheduler.max_sequences <= 1,
         }
     }
 }
@@ -456,11 +469,9 @@ pub fn resolve_layers(
     }
     mark("flags", &o);
     if let Some(f) = frontend {
-        let named: std::collections::BTreeSet<String> = named
-            .iter()
-            .filter_map(|storage| idx.key_of_storage(storage).map(|k| k.path.clone()))
-            .collect();
-        crate::frontend::apply(&mut o, f, &named).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let named = named_keys(idx, &named);
+        let preset = preset_keys(idx, &o, &named);
+        crate::frontend::apply(&mut o, f, &named, &preset).map_err(|e| anyhow::anyhow!("{e}"))?;
         mark(&format!("the {} default", f.name()), &o);
     }
     o.check().map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -470,6 +481,70 @@ pub fn resolve_layers(
         eprintln!("{note}");
     }
     Ok((o, layers))
+}
+
+/// The keys a layer named, from the fields it named (`named`, by storage
+/// path): every key with a named field, and every member of a compound group
+/// a layer named by the group's own shorthand or by a member —
+/// `--readback ring-fixed` writes `decode.readback`'s members as one
+/// spelling, and the `decode.readback.eos` row must not re-set the EOS of a
+/// readback the caller named.
+pub(crate) fn named_keys(
+    idx: &crate::option_tree::Index,
+    named: &std::collections::BTreeSet<String>,
+) -> std::collections::BTreeSet<String> {
+    let under = |storage: &str, group: &str| {
+        storage.len() > group.len()
+            && storage.starts_with(group)
+            && storage.as_bytes()[group.len()] == b'.'
+    };
+    let groups: Vec<String> = idx
+        .keys
+        .values()
+        .filter_map(|k| k.compound.clone())
+        .filter(|g| named.contains(g) || named.iter().any(|s| under(s, g)))
+        .collect();
+    idx.keys
+        .values()
+        .filter(|k| {
+            k.targets
+                .iter()
+                .chain(&k.legacy)
+                .any(|l| named.contains(&l.storage) || groups.iter().any(|g| under(&l.storage, g)))
+        })
+        .map(|k| k.path.clone())
+        .collect()
+}
+
+/// The keys of the axes a named LFM2 preset sets (`lfm2_presets::AXES`),
+/// given the keys a layer named (`named`): a preset is explicit for its axes
+/// as a key is, so `--cache crown` keeps the crown's KV and attention. Such
+/// an axis is unset in the tree whatever its spelling — unset is the
+/// preset's. `auto` names no arm: it is the engine's rule over the shape,
+/// which the front-end's rows refine.
+pub(crate) fn preset_keys(
+    idx: &crate::option_tree::Index,
+    o: &crate::EngineOptions,
+    named: &std::collections::BTreeSet<String>,
+) -> std::collections::BTreeSet<String> {
+    if !named.contains(crate::options::ModelConfig::PRESET_KEY) || o.model.cache == "auto" {
+        return Default::default();
+    }
+    lloom::models::lfm2::Config::AXES_META
+        .iter()
+        .filter(|a| lloom::models::lfm2_presets::AXES.contains(&a.key))
+        .flat_map(|axis| {
+            idx.keys
+                .values()
+                .filter(move |k| {
+                    k.targets
+                        .iter()
+                        .chain(&k.legacy)
+                        .any(|l| l.meta.key == axis.key && l.meta.path == axis.path)
+                })
+                .map(|k| k.path.clone())
+        })
+        .collect()
 }
 
 /// `lloom config`: the resolved option tree as JSON — every key with the
@@ -743,23 +818,27 @@ pub fn command() -> clap::Command {
                 .filter_map(|a| {
                     let help = a.get_help()?.to_string();
                     let key = help.split("[key: ").nth(1)?.split(']').next()?.to_string();
-                    let r = crate::frontend::row(&key, f)?;
-                    let when = match r.when.describe() {
-                        "" => String::new(),
-                        w => format!(" when {w}"),
-                    };
-                    let change = match crate::frontend::exception(r) {
-                        Some(e) if !e.landed => {
-                            format!("; decision {}: {} once landed", e.decision, e.after)
-                        }
-                        _ => String::new(),
-                    };
+                    let parts: Vec<String> = crate::frontend::rows_for(&key, f)
+                        .map(|r| {
+                            let when = match r.when.describe() {
+                                "" => String::new(),
+                                w => format!(" when {w}"),
+                            };
+                            let change = match crate::frontend::exception(r) {
+                                Some(e) if !e.landed => {
+                                    format!("; decision {}: {} once landed", e.decision, e.after)
+                                }
+                                _ => String::new(),
+                            };
+                            format!("{}{when}{change}", crate::frontend::value(r))
+                        })
+                        .collect();
+                    if parts.is_empty() {
+                        return None;
+                    }
                     Some((
                         a.get_id().to_string(),
-                        format!(
-                            "{help} [unset here: {}{when}{change}]",
-                            crate::frontend::value(r)
-                        ),
+                        format!("{help} [unset here: {}]", parts.join("; ")),
                     ))
                 })
                 .collect();
@@ -838,6 +917,8 @@ pub fn main_serve_compat(mut argv: Vec<String>) -> Result<()> {
 }
 #[cfg(test)]
 mod frontend_tests;
+#[cfg(test)]
+mod option_acceptance_tests;
 #[cfg(test)]
 mod spellings_tests;
 
@@ -1042,10 +1123,12 @@ mod option_layer_tests {
                 reuse_prefix: false,
                 seed_text: String::new(),
                 batch: 1,
+                intake_per_tick: crate::options::DEFAULT_INTAKE_PER_TICK,
                 mem_sample: false,
                 rows: "auto".into(),
                 share_prefix: false,
                 decision_ragged: true,
+                pin_prefix: false,
             }
         };
         let mut s = shape(&["--replay"]);
@@ -1345,16 +1428,142 @@ mod sampling_and_speculation_tests {
     }
 
     #[test]
+    fn sampling_fields_cross_real_cli_key_and_json_layers() {
+        let cases = [
+            (
+                vec!["-t", "0.7", "--gumbel", "--top-k", "2", "--top-p", "0.6"],
+                Sampling::FilteredGumbel {
+                    temperature: 0.7,
+                    k: 2,
+                    p: 0.6,
+                },
+            ),
+            (
+                vec![
+                    "--set",
+                    "generation.temperature=0.7",
+                    "--set",
+                    "generation.sampling.method=gumbel",
+                    "--set",
+                    "generation.top_k=2",
+                    "--set",
+                    "generation.top_p=0.6",
+                ],
+                Sampling::FilteredGumbel {
+                    temperature: 0.7,
+                    k: 2,
+                    p: 0.6,
+                },
+            ),
+            (
+                vec![
+                    "--generation-config",
+                    r#"{"temperature":" 0.7 ","top_k":"+2","top_p":"0.6","sampling":{"method":"gumbel"}}"#,
+                ],
+                Sampling::FilteredGumbel {
+                    temperature: 0.7,
+                    k: 2,
+                    p: 0.6,
+                },
+            ),
+            (
+                vec![
+                    "--generation-config",
+                    r#"{"temperature":0.7,"top_k":0,"top_p":1,"sampling":{"method":"multinomial"}}"#,
+                ],
+                Sampling::All { temperature: 0.7 },
+            ),
+            (
+                vec!["-t", "0", "--gumbel", "--top-k", "2", "--top-p", "0.6"],
+                Sampling::ArgMax,
+            ),
+            (
+                vec!["-t", "0.0000001", "--gumbel", "--top-k", "2"],
+                Sampling::FilteredGumbel {
+                    temperature: 1e-7,
+                    k: 2,
+                    p: 1.0,
+                },
+            ),
+        ];
+        for (argv, want) in cases {
+            let o = resolve_options_uninstalled(&common(&argv), &no_front).unwrap();
+            assert_eq!(o.sampling.sampling().unwrap(), want, "{argv:?}");
+        }
+        for argv in [
+            vec!["--generation-config", r#"{"temperature":-1}"#],
+            vec!["--generation-config", r#"{"top_p":1.1}"#],
+            vec!["--generation-config", r#"{"top_p":"-0.1"}"#],
+            vec!["--generation-config", r#"{"top_k":-1}"#],
+            vec!["--set", "generation.temperature=nan"],
+        ] {
+            assert!(
+                resolve_options_uninstalled(&common(&argv), &no_front).is_err(),
+                "{argv:?}"
+            );
+        }
+        // A ring named by flag or by key with a host-side sampler resolves
+        // (C2): the options keep the ring and the sampler, and each request
+        // runs on the blocking arm with a note.
+        for argv in [
+            vec![
+                "-t",
+                "0.7",
+                "--gumbel",
+                "--top-k",
+                "2",
+                "--readback",
+                "ring",
+            ],
+            vec![
+                "-t",
+                "0.7",
+                "--gumbel",
+                "--top-k",
+                "2",
+                "--set",
+                "decode.readback.kind=ring",
+            ],
+        ] {
+            let o = resolve_options_uninstalled(&common(&argv), &no_front).unwrap();
+            assert_eq!(
+                o.sampling.sampling().unwrap(),
+                Sampling::FilteredGumbel {
+                    temperature: 0.7,
+                    k: 2,
+                    p: 1.0,
+                },
+                "{argv:?}"
+            );
+            assert_eq!(
+                o.decode.readback.kind,
+                crate::ReadbackKind::Ring,
+                "{argv:?}"
+            );
+            assert!(
+                crate::couplings::explain(&o)
+                    .iter()
+                    .any(|l| l.starts_with("decode.readback.kind = ring -> blocking")),
+                "{argv:?}"
+            );
+        }
+    }
+
+    #[test]
     fn the_sampler_arms_follow_the_fields() {
         let o = resolve_options_uninstalled(&common(&[]), &no_front).unwrap();
-        assert_eq!(o.sampling.sampling(), Sampling::ArgMax, "greedy by default");
+        assert_eq!(
+            o.sampling.sampling().unwrap(),
+            Sampling::ArgMax,
+            "greedy by default"
+        );
         let o = resolve_options_uninstalled(
             &common(&["-t", "0.7", "--top-p", "0.9", "-n", "64", "--seed", "7"]),
             &no_front,
         )
         .unwrap();
         assert_eq!(
-            o.sampling.sampling(),
+            o.sampling.sampling().unwrap(),
             Sampling::TopP {
                 p: 0.9,
                 temperature: 0.7
@@ -1368,7 +1577,7 @@ mod sampling_and_speculation_tests {
         )
         .unwrap();
         assert_eq!(
-            o.sampling.sampling(),
+            o.sampling.sampling().unwrap(),
             Sampling::TopKThenTopP {
                 k: 40,
                 p: 0.9,
@@ -1378,9 +1587,23 @@ mod sampling_and_speculation_tests {
         let o =
             resolve_options_uninstalled(&common(&["-t", "0.7", "--gumbel"]), &no_front).unwrap();
         assert_eq!(
-            o.sampling.sampling(),
+            o.sampling.sampling().unwrap(),
             Sampling::GumbelSoftmax { temperature: 0.7 }
         );
+        let filtered = resolve_options_uninstalled(
+            &common(&["-t", "0.7", "--gumbel", "--top-k", "2", "--top-p", "0.4"]),
+            &no_front,
+        )
+        .unwrap();
+        assert_eq!(
+            filtered.sampling.sampling().unwrap(),
+            Sampling::FilteredGumbel {
+                temperature: 0.7,
+                k: 2,
+                p: 0.4,
+            }
+        );
+        assert!(filtered.sampling.sampling().unwrap().requires_host());
         let o = resolve_options_uninstalled(
             &common(&[
                 "--generation-config",
@@ -1389,7 +1612,10 @@ mod sampling_and_speculation_tests {
             &no_front,
         )
         .unwrap();
-        assert_eq!(o.sampling.sampling(), Sampling::All { temperature: 0.3 });
+        assert_eq!(
+            o.sampling.sampling().unwrap(),
+            Sampling::All { temperature: 0.3 }
+        );
         assert_eq!(o.sampling.stop, vec!["<|im_end|>", "\n\n"]);
         let p = o.sampling.params(&[7], crate::ReadbackArm::Blocking, 0);
         assert_eq!(
@@ -1546,5 +1772,37 @@ mod executor_and_memory_tests {
             "arena=off packed=false replay=off pass_plans=true/non-aliasing"
         );
         assert_eq!(o.memory.kv_capacity, 8704, "the serving default");
+    }
+
+    /// A speculative body does not install the single-key arena, so the load
+    /// installs and reports the pass-plan cache instead and names the change;
+    /// with the cache off nothing planned serves, and says so. A plain body
+    /// keeps the arena, and replay is the installer's refusal, not this.
+    #[test]
+    fn an_arena_under_a_speculative_body_is_not_reported_as_installed() {
+        let o = resolve_options_uninstalled(&common(&["--arena"]), &no_front).unwrap();
+        assert_eq!(o.executor.under_body(false), (o.executor.clone(), None));
+        let (spec, note) = o.executor.under_body(true);
+        assert_eq!(
+            spec.line(),
+            "arena=off packed=false replay=off pass_plans=true"
+        );
+        let note = note.expect("the declined arena is named");
+        assert!(
+            note.starts_with("executor.arena is not installed under a speculative body")
+                && note.ends_with("the pass-plan cache serves instead"),
+            "{note}"
+        );
+        let o =
+            resolve_options_uninstalled(&common(&["--arena", "--pass-plans", "false"]), &no_front)
+                .unwrap();
+        let (spec, note) = o.executor.under_body(true);
+        assert_eq!(
+            spec.line(),
+            "arena=off packed=false replay=off pass_plans=false"
+        );
+        assert!(note.unwrap().contains("no planned executor serves"));
+        let o = resolve_options_uninstalled(&common(&["--replay"]), &no_front).unwrap();
+        assert_eq!(o.executor.under_body(true), (o.executor.clone(), None));
     }
 }

@@ -271,7 +271,13 @@ where
 /// running the same two passes. A restore that reads the other slot's frame
 /// or marks puts back the other checkpoint's state, which differs from
 /// either reference.
-fn two_checkpoints_case<M, L>(model: &M, cfg: &Config, dev: &Device, a: usize, b: usize) -> Result<()>
+fn two_checkpoints_case<M, L>(
+    model: &M,
+    cfg: &Config,
+    dev: &Device,
+    a: usize,
+    b: usize,
+) -> Result<()>
 where
     M: CausalLM<Config = Config, Cache = DecoderState<L>>,
     L: Layer<State = LayerState>,

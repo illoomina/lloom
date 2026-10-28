@@ -80,7 +80,11 @@ fn qwen3_5s_capability_line_reports_the_gate_the_load_resolved() {
             "{extra:?}: the capability line reports the arm the load resolved\n{caps}\n{turn}"
         );
         if want == "false" {
-            assert_eq!(gate(&turn), "off", "{extra:?}: no gate rode the run\n{turn}");
+            assert_eq!(
+                gate(&turn),
+                "off",
+                "{extra:?}: no gate rode the run\n{turn}"
+            );
         }
     }
     std::fs::remove_dir_all(&dir).ok();

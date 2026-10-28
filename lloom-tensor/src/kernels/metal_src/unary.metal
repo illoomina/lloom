@@ -309,6 +309,27 @@ template <typename T>
     copy2d_body<T>(pp->d1, pp->d2, pp->src_s, pp->dst_s, input, output, idx);
 }
 
+// One gather entry: a source by its GPU address (a buffer the host filled,
+// declared resident on the encoder, never bound) and the word it lands at in
+// the destination.
+struct CopyGatherEntry {
+    device const uint *src;
+    ulong dst_word;
+};
+
+// `words` words from each entry's source to `output + dst_word`: a group of
+// staged planes landed in one launch, one entry per grid row.
+[[kernel]] void copy_gather_u32(
+    device const CopyGatherEntry *table,
+    device uint *output,
+    constant uint &words,
+    uint2 idx [[thread_position_in_grid]]
+) {
+    if (idx.x >= words) return;
+    const device CopyGatherEntry &e = table[idx.y];
+    output[e.dst_word + idx.x] = e.src[idx.x];
+}
+
 // Unary functions
 template <typename T> METAL_FUNC T erf(T in){
     // constants

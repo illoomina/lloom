@@ -2073,6 +2073,42 @@ impl ComputeCommandEncoder {
         }
     }
 
+    /// Declare `buffers` resident for the next dispatch, which reads them
+    /// through GPU addresses in a bound table rather than through bindings.
+    /// No hazard edge is recorded for them. Returns `false`, declaring
+    /// nothing, while an executor records this encoder's binds: a recorded
+    /// command would replay without the declaration.
+    ///
+    /// # Safety
+    /// Each buffer is written by the host alone, before this dispatch is
+    /// encoded, and its owner keeps it alive and unwritten until the command
+    /// buffer completes.
+    pub(crate) unsafe fn declare_indirect_reads(&self, buffers: &[&Buffer]) -> bool {
+        use objc2_metal::MTLResource;
+        if !self.executor.is_classical() {
+            return false;
+        }
+        const CHUNK: usize = 64;
+        let mut ptrs = [core::ptr::NonNull::<ProtocolObject<dyn MTLResource>>::dangling(); CHUNK];
+        for chunk in buffers.chunks(CHUNK) {
+            for (p, b) in ptrs.iter_mut().zip(chunk) {
+                // SAFETY: the caller's contract; the reference outlives the call.
+                let raw: &ProtocolObject<dyn MTLResource> =
+                    ProtocolObject::from_ref(unsafe { b.raw_unchecked() });
+                *p = core::ptr::NonNull::from(raw);
+            }
+            // SAFETY: `ptrs[..chunk.len()]` are live resources (above).
+            unsafe {
+                self.raw.useResources_count_usage(
+                    core::ptr::NonNull::from(&ptrs[0]),
+                    chunk.len(),
+                    MTLResourceUsage::Read,
+                );
+            }
+        }
+        true
+    }
+
     pub fn set_bytes_directly(&self, index: usize, length: usize, bytes: *const c_void) {
         let pointer = ptr::NonNull::new(bytes as *mut c_void).unwrap();
         unsafe { self.raw.setBytes_length_atIndex(pointer, length, index) }

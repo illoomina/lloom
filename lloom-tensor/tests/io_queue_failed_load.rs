@@ -1,14 +1,15 @@
 #![cfg(feature = "metal")]
-//! An IO load that does not complete, and the compute held behind it
+//! An IO load that does not land its bytes, and the compute held behind it
 //! (`IoQueue::await_value`, `docs/invariants.md` §15.1q).
 //!
-//! The work behind a load reads the bytes it landed. A load that failed
-//! landed none, so that work must not run: it is cancelled through the
-//! load's value, the way a host producer cancels a value it did not write,
-//! and the request reading it sees the error. Not a hang (a held recording
-//! nothing releases), and not a run over the bytes the slot held before.
-//! Which loads fail, and whether the signal after a failed one still runs,
-//! is Metal's behaviour; the probe below records it.
+//! The work behind a load reads the bytes it landed. A load that landed
+//! none must not release that work: it is refused before it is issued, or
+//! the work is cancelled through the load's value, the way a host producer
+//! cancels a value it did not write, and the request sees the error. Not a
+//! hang (a held recording nothing releases), and not a run over the bytes
+//! the slot held before. What Metal does with such a load, and with the
+//! signal after it, is what the probe below records: a load past the file's
+//! end completes, lands only the bytes that exist, and signals.
 
 use lloom_tensor::kernels::metal::io_queue::{IoLoad, IoQueue};
 use lloom_tensor::kernels::metal::HostInputArm;
@@ -24,10 +25,10 @@ fn temp_file(tag: &str) -> std::path::PathBuf {
     path
 }
 
-/// The repair's acceptance test: red until the IO queue observes a load's
-/// status. Run it with `--run-ignored all`.
+/// A load whose source range starts at the file's end never releases the
+/// work behind it: the IO queue refuses it at `issue` (the range against
+/// the file's length at `open`), or cancels the work behind its value.
 #[test]
-#[ignore = "red until the IO queue cancels the work behind a load that did not complete"]
 fn a_failed_io_load_cancels_the_work_held_behind_it() -> Result<()> {
     let dev = Device::new_metal(0)?;
     let Device::Metal(m) = &dev else {
@@ -43,18 +44,25 @@ fn a_failed_io_load_cancels_the_work_held_behind_it() -> Result<()> {
     let dst = m.new_persistent_shared(LEN)?;
     let before = queue.signaled();
     // The source range starts at the file's end: no byte of it exists.
-    let value = queue
-        .issue(
-            m.commands(),
-            &[IoLoad {
-                dst: &dst,
-                dst_offset: 0,
-                file: &file,
-                src_offset: LEN as u64,
-                len: LEN,
-            }],
-        )
-        .map_err(lloom_tensor::Error::wrap)?;
+    let issued = queue.issue(
+        m.commands(),
+        &[IoLoad {
+            dst: &dst,
+            dst_offset: 0,
+            file: &file,
+            src_offset: LEN as u64,
+            len: LEN,
+        }],
+    );
+    let value = match issued {
+        Ok(value) => value,
+        Err(e) => {
+            eprintln!("IO_FAILED_LOAD refused at issue: {e}");
+            std::fs::remove_file(&path).ok();
+            assert_eq!(m.commands().produced_stats().held_now, 0);
+            return Ok(());
+        }
+    };
     queue
         .await_value(m.commands(), value)
         .map_err(lloom_tensor::Error::wrap)?;

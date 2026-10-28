@@ -1020,7 +1020,8 @@ impl<L: Layer> DecoderState<L> {
     /// Put every layer back where the checkpoint at `pos` was taken — a KV
     /// cache to its length, a recurrent state to the frame's copy — and the
     /// position with them; the standing window settled first, what the
-    /// discarded positions retained gone.
+    /// discarded positions retained gone. A layer that fails to restore
+    /// leaves the layers inconsistent: the state is unusable until a reset.
     pub fn restore(&mut self, pos: usize) -> Result<()> {
         self.usable()?;
         if self.can_restore(pos) {
@@ -1049,8 +1050,13 @@ impl<L: Layer> DecoderState<L> {
         let frames = (0..self.layers.len())
             .map(|l| self.ckpt.frame(idx, l))
             .collect::<Result<Vec<_>>>()?;
-        for ((s, frame), mark) in self.layers.iter_mut().zip(&frames).zip(&marks) {
-            L::restore_checkpoint(s, frame.as_ref(), *mark)?;
+        for (l, ((s, frame), mark)) in self.layers.iter_mut().zip(&frames).zip(&marks).enumerate() {
+            if let Err(e) = L::restore_checkpoint(s, frame.as_ref(), *mark) {
+                self.unusable = Some(format!(
+                    "layer {l} failed to restore the checkpoint at {pos} ({e})"
+                ));
+                return Err(e);
+            }
         }
         self.pos = pos;
         self.nextn.clear();
@@ -1263,7 +1269,8 @@ impl<L: Layer> DecoderState<L> {
     }
 
     /// Cut every layer back to its first `tokens` positions outside a
-    /// window (an attention-only lane, `MixerBlock::truncate_state`).
+    /// window (an attention-only lane, `MixerBlock::truncate_state`). A
+    /// layer that fails to cut leaves the state unusable until a reset.
     pub fn truncate(&mut self, tokens: usize) -> Result<()> {
         self.usable()?;
         if self.window_open() {
@@ -1276,8 +1283,11 @@ impl<L: Layer> DecoderState<L> {
             )
         }
         self.settle_standing()?;
-        for s in &mut self.layers {
-            L::truncate_state(s, tokens)?;
+        for (l, s) in self.layers.iter_mut().enumerate() {
+            if let Err(e) = L::truncate_state(s, tokens) {
+                self.unusable = Some(format!("layer {l} failed to truncate to {tokens} ({e})"));
+                return Err(e);
+            }
         }
         self.pos = tokens;
         self.ckpt.forget_past(tokens);
@@ -2574,6 +2584,10 @@ mod window_tests {
         fail_open: bool,
         fail_rewind: bool,
         fail_resolve: bool,
+        fail_restore: bool,
+        fail_truncate: bool,
+        restored: usize,
+        truncated: usize,
     }
 
     impl Layer for Faulty {
@@ -2626,7 +2640,11 @@ mod window_tests {
             s.open = false;
             Ok(())
         }
-        fn truncate_state(_: &mut FaultyState, _: usize) -> Result<()> {
+        fn truncate_state(s: &mut FaultyState, _: usize) -> Result<()> {
+            if s.fail_truncate {
+                lloom_tensor::bail!("refused to truncate")
+            }
+            s.truncated += 1;
             Ok(())
         }
         fn ring_holds(_: &FaultyState, _: usize) -> bool {
@@ -2659,10 +2677,14 @@ mod window_tests {
             Ok((x.clone(), [WindowMark::default(); MAX_TAKES]))
         }
         fn restore_checkpoint(
-            _: &mut FaultyState,
+            s: &mut FaultyState,
             _: Option<&Tensor>,
             _: WindowMark,
         ) -> Result<()> {
+            if s.fail_restore {
+                lloom_tensor::bail!("refused to restore")
+            }
+            s.restored += 1;
             Ok(())
         }
     }
@@ -2909,6 +2931,98 @@ mod window_tests {
         st.layers[2].fail_resolve = false;
         st.reset();
         st.open_window().expect("usable after the reset");
+    }
+
+    /// A state at position 4 holding a turn checkpoint at 2.
+    fn checkpointed(n: usize) -> DecoderState<Faulty> {
+        let mut st = state(n).with_checkpoints(&vec![0; n], 2);
+        let slot = st.ckpt.open(2, &Device::Cpu).unwrap();
+        st.ckpt.close(slot, vec![WindowMark::default(); n]);
+        st.pos = 4;
+        assert!(st.can_restore(2));
+        st
+    }
+
+    /// A restore that fails mid-way leaves the earlier layers at the
+    /// checkpoint and the later ones past it: the state is unusable — no
+    /// forward, window, restore or cut runs on the mix, the position is not
+    /// moved — until the reset the next request's recovery runs.
+    #[test]
+    fn a_restore_failed_mid_way_leaves_the_state_unusable_until_a_reset() {
+        let mut st = checkpointed(3);
+        st.layers[1].fail_restore = true;
+        assert!(st.restore(2).is_err());
+        let why = st.unusable().expect("marked unusable").to_string();
+        assert!(why.contains("layer 1"), "{why}");
+        assert_eq!(
+            [st.layers[0].restored, st.layers[2].restored],
+            [1, 0],
+            "the restore did not stop mid-way"
+        );
+        assert_eq!(st.pos, 4);
+        assert!(
+            st.usable().is_err(),
+            "a forward would run on the mixed state"
+        );
+        assert!(st.check_acceptance_state().is_err());
+        st.layers[1].fail_restore = false;
+        assert!(st.restore(2).is_err(), "no restore over an unusable state");
+        assert!(st.open_window().is_err(), "no window on an unusable state");
+        assert!(st.truncate(0).is_err(), "no truncate on an unusable state");
+        st.reset();
+        assert!(st.unusable().is_none());
+        st.open_window().expect("usable after the reset");
+        st.resolve_window().unwrap();
+    }
+
+    /// The same for a cut that fails mid-way.
+    #[test]
+    fn a_truncate_failed_mid_way_leaves_the_state_unusable_until_a_reset() {
+        let mut st = state(3);
+        st.pos = 4;
+        st.layers[2].fail_truncate = true;
+        assert!(st.truncate(1).is_err());
+        assert!(st.unusable().expect("marked unusable").contains("layer 2"));
+        assert_eq!(
+            [st.layers[0].truncated, st.layers[1].truncated],
+            [1, 1],
+            "the cut did not stop mid-way"
+        );
+        assert_eq!(st.pos, 4);
+        assert!(st.usable().is_err());
+        st.layers[2].fail_truncate = false;
+        assert!(st.truncate(1).is_err(), "no truncate on an unusable state");
+        st.reset();
+        st.truncate(0).expect("usable after the reset");
+    }
+
+    /// Through a request: a divergence the session serves by restoring the
+    /// checkpoint fails mid-way; the next prepare of the same session does
+    /// not continue on the mixed state, and the reset the request's recovery
+    /// runs serves it fresh.
+    #[test]
+    fn a_request_whose_restore_fails_does_not_leave_the_next_on_the_mixed_state() {
+        let mut st = checkpointed(3);
+        st.layers[1].fail_restore = true;
+        let seq = crate::nn::Sequence::with_tokens(st, vec![10, 20, 30, 40]);
+        let mut session = crate::nn::Session::from_sequence(&Faulty, seq);
+        // Diverges at 3: past the (empty) horizon, the checkpoint at 2.
+        assert!(session.prepare(&[10, 20, 30, 99]).is_err());
+        assert!(session.sequence().cache().unusable().is_some());
+        session.cache_mut().layers[1].fail_restore = false;
+        // The same log extended: no state operation of its own, but its
+        // forward is refused.
+        let next = session.prepare(&[10, 20, 30, 40, 50]);
+        let usable = session.sequence().cache().usable();
+        eprintln!("RESTORE_FAILED next={next:?} usable={usable:?}");
+        assert!(
+            usable.is_err(),
+            "the next request would run on the mixed state"
+        );
+        session.reset();
+        let fresh = session.prepare(&[10, 20, 30, 40, 50]).unwrap();
+        assert_eq!(fresh.action, crate::nn::ReuseAction::Fresh);
+        assert!(session.sequence().cache().usable().is_ok());
     }
 
     #[test]

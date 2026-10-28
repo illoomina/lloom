@@ -623,6 +623,16 @@ impl Device {
         }
     }
 
+    /// Abandon the pass [`Self::begin_pass`] opened, after its body failed
+    /// (`BackendDevice::abort_pass`).
+    pub fn abort_pass(&self) -> Result<()> {
+        match self {
+            Self::Cpu => Ok(()),
+            Self::Cuda(d) => d.abort_pass(),
+            Self::Metal(d) => crate::backend::BackendDevice::abort_pass(d),
+        }
+    }
+
     /// Admit computing at `dtype` here (`BackendDevice::admit_compute_dtype`):
     /// Metal refuses a type its GPU only emulates unless the operator opted
     /// in (§15.2a).

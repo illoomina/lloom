@@ -1166,19 +1166,47 @@ impl WeightGroups {
 }
 
 impl Drop for WeightGroups {
+    /// The loader's writes land before the backing goes. A load still
+    /// pending after the drain (a failed loader, a failed drain) never
+    /// releases the work held for it: that work is cancelled, and a commit
+    /// completes the epochs it took, which the loader's reader waits read.
+    /// The raise after the loader stopped lets through a GPU-wait arm's
+    /// encoded waits, which would otherwise hang the queue.
     fn drop(&mut self) {
         #[cfg(feature = "metal")]
         {
-            // The loader's writes land before the backing goes; a wait
-            // left encoded for a value never raised would hang the queue.
             let _ = self.drain();
-            if let Some(l) = &self.loader {
-                l.shared.event.signal(u64::MAX / 2);
+            let shared = self
+                .loader
+                .as_ref()
+                .map(|l| std::sync::Arc::clone(&l.shared));
+            if let Some(sh) = &shared {
+                if sh.event.signaled() < self.next_ticket {
+                    if let Err(e) = sh.event.cancel_through(self.next_ticket, DROPPED) {
+                        eprintln!("[wg] cancelling the work held for unlanded loads: {e}");
+                    }
+                    if let Device::Metal(m) = &self.device {
+                        let _ = m.flush_marker();
+                    }
+                }
             }
             self.stop_loader();
+            if let Some(sh) = shared {
+                if sh.event.signaled() < self.next_ticket {
+                    sh.event.signal(self.next_ticket);
+                }
+            }
         }
     }
 }
+
+/// The reasons a wait on work behind a load that never landed fails with.
+#[cfg(feature = "metal")]
+const LOAD_FAILED: &str =
+    "weight groups: a load failed; the work that reads its slot was cancelled";
+#[cfg(feature = "metal")]
+const DROPPED: &str =
+    "weight groups: the tier was dropped before a load landed; the work that reads its slot was cancelled";
 
 /// `diagnostics.trace.weight_groups` (read once): the tier and its loader
 /// narrate every request, wait and write on stderr. A diagnosis knob.
@@ -1232,7 +1260,8 @@ mod loader {
         pub source: std::sync::Arc<dyn GroupSource>,
         pub counters: std::sync::Arc<GroupCounters>,
         /// A write the source declined or failed: the tier reports it on
-        /// the next call; the value is raised regardless so no wait hangs.
+        /// the next call. The work held for the load is cancelled, then the
+        /// value is raised, so no GPU wait hangs.
         pub failed: parking_lot::Mutex<Option<String>>,
         /// `LLOOM_WG_SLOW_LOADER_MS`: a sleep before each load (a test's
         /// way to make the device wait matter, and a diagnosis knob).
@@ -1296,6 +1325,7 @@ mod loader {
             let spec = &sh.groups[group.index()];
             let elem = sh.dtype.size_in_bytes();
             let mut bytes = 0usize;
+            let mut wrote = true;
             for (i, part) in spec.parts.iter().enumerate() {
                 let len = part.elems() * elem;
                 let at = sh.base + slot.index() * sh.slot_bytes + part.offset * elem;
@@ -1307,17 +1337,26 @@ mod loader {
                 match sh.source.write(group, i, sh.dtype, dst) {
                     Ok(true) => bytes += len,
                     Ok(false) => {
+                        wrote = false;
                         *sh.failed.lock() = Some(format!(
                             "the source has no {:?} bytes for group {} part {} ({})",
                             sh.dtype, group.0, i, part.name
                         ));
                     }
                     Err(e) => {
+                        wrote = false;
                         *sh.failed.lock() = Some(format!("group {} part {}: {e}", group.0, i));
                     }
                 }
             }
             sh.counters.bytes_loaded.fetch_add(bytes as u64, Relaxed);
+            // A slot holding part of a group, or none: the work held for it
+            // is cancelled before the raise and never reads it.
+            if !wrote {
+                if let Err(e) = sh.event.cancel_through(ticket, LOAD_FAILED) {
+                    eprintln!("[wg-loader] cancelling the work held for ticket {ticket}: {e}");
+                }
+            }
             sh.event.signal(ticket);
         }
     }
@@ -1537,6 +1576,143 @@ mod tests {
         assert_eq!(tier.resident().len(), 3);
         let (slot, _, _) = tier.ensure(WeightGroupId(3), &src).unwrap();
         assert_eq!(slot, SlotId(3), "the new slot is empty and taken first");
+    }
+
+    /// A source whose write of `fail`'s second part is declined, once the
+    /// test lets it go: the slot is left holding the first part only.
+    #[cfg(feature = "metal")]
+    struct Failing {
+        synthetic: Synthetic,
+        fail: WeightGroupId,
+        go: std::sync::atomic::AtomicBool,
+    }
+
+    #[cfg(feature = "metal")]
+    impl GroupSource for Failing {
+        fn part(&self, g: WeightGroupId, part: usize) -> Result<Tensor> {
+            self.synthetic.part(g, part)
+        }
+        fn write(
+            &self,
+            g: WeightGroupId,
+            part: usize,
+            dtype: DType,
+            dst: &mut [u8],
+        ) -> Result<bool> {
+            if g == self.fail {
+                while !self.go.load(std::sync::atomic::Ordering::Acquire) {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                if part == 1 {
+                    return Ok(false);
+                }
+            }
+            let v = self
+                .synthetic
+                .expected(g, part)
+                .flatten_all()?
+                .to_vec1::<f32>()?;
+            if dtype != DType::F32 || dst.len() != v.len() * 4 {
+                return Ok(false);
+            }
+            for (d, x) in dst.chunks_exact_mut(4).zip(v) {
+                d.copy_from_slice(&x.to_ne_bytes());
+            }
+            Ok(true)
+        }
+    }
+
+    /// A load the loader fails to write leaves its slot partly written: the
+    /// stage held behind it is cancelled, never committed over those bytes,
+    /// and the wait on it says why; the tier reports the failure, the stream
+    /// goes on, and the drop completes with every epoch retired once
+    /// (`docs/invariants.md` §15.1q).
+    #[cfg(feature = "metal")]
+    #[test]
+    fn a_failed_load_cancels_the_stage_held_behind_it_metal() {
+        use lloom_tensor::kernels::metal::HostInputArm;
+        use objc2_metal::{MTLDevice, MTLSharedEvent};
+        let Ok(dev) = Device::new_metal(0) else {
+            return;
+        };
+        let m = dev.as_metal_device().unwrap().clone();
+        if m.commands().host_input_arm() == HostInputArm::GpuWait {
+            eprintln!("NOT_APPLICABLE nothing is held on the gpu-wait arm");
+            return;
+        }
+        let src = std::sync::Arc::new(Failing {
+            synthetic: Synthetic {
+                device: Device::Cpu,
+            },
+            fail: WeightGroupId(1),
+            go: std::sync::atomic::AtomicBool::new(false),
+        });
+        let mut tier =
+            WeightGroups::new(Synthetic::spec(3), 3, DType::F32, &dev, "test.groups").unwrap();
+        assert!(tier.start_loader(src.clone()).unwrap(), "the loader is on");
+        let x = Tensor::new(&[3.0f32; 16], &dev).unwrap();
+        m.wait_until_completed().unwrap();
+        let before = m.commands().produced_stats();
+        let progress = m.metal_device().as_ref().newSharedEvent().unwrap();
+        let g = WeightGroupId(1);
+        let (_, _, wait) = tier.ensure(g, &*src).unwrap();
+        let ticket = wait.expect("the load has not landed: the loader is held");
+        tier.commit_after_load(ticket).unwrap();
+        // The stage: a reader of the slot, then progress raised behind it.
+        let _y = tier.tensor(g, 0).unwrap().affine(2.0, 1.0).unwrap();
+        m.commands().encode_signal_event(&progress, 1).unwrap();
+        let marker = m.flush_marker().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(m.commands().produced_stats().held_now > 0);
+        assert_eq!(progress.signaledValue(), 0, "the held stage ran early");
+        src.go.store(true, std::sync::atomic::Ordering::Release);
+        let waited = m.wait_marker(&marker);
+        assert!(
+            waited
+                .as_ref()
+                .is_err_and(|e| e.to_string().contains("a load failed")),
+            "the stage's wait does not say its load failed: {waited:?}"
+        );
+        m.wait_until_completed().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert_eq!(
+            progress.signaledValue(),
+            0,
+            "the stage ran over a slot its load never wrote"
+        );
+        let stats = m.commands().produced_stats();
+        assert_eq!(stats.held_now, 0, "{stats:?}");
+        assert!(stats.cancelled > before.cancelled, "{stats:?}");
+        assert_eq!(
+            stats.late_after_cancel,
+            before.late_after_cancel + 1,
+            "the loader's raise after the cancellation: {stats:?}"
+        );
+        // The tier reports the failure; the stream goes on.
+        let refused = tier.ensure(WeightGroupId(2), &*src);
+        assert!(
+            refused
+                .as_ref()
+                .is_err_and(|e| e.to_string().contains("the loader failed")),
+            "{:?}",
+            refused.map(|_| ())
+        );
+        let z = x.affine(2.0, 1.0).unwrap();
+        assert_eq!(z.to_vec1::<f32>().unwrap(), vec![7.0f32; 16]);
+        drop(tier);
+        m.wait_until_completed().unwrap();
+        let clock = m.gpu_clock();
+        assert_eq!(
+            clock.completed_count().0,
+            clock.current_epoch().0,
+            "an epoch a cancelled stage took never completed"
+        );
+        m.commands().check_failed().unwrap();
+        eprintln!(
+            "WG_LOAD_FAILED api={} stats={:?}",
+            m.commands().actual_command_api(),
+            m.commands().produced_stats()
+        );
     }
 
     #[test]

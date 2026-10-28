@@ -934,6 +934,53 @@ fn churn_snapshot(m: &lloom_tensor::MetalDevice) -> ChurnSnapshot {
     }
 }
 
+/// The `[host input since load: …]` line: what the held queue did since
+/// load. `beside_its_event` counts recordings that gated two values of one
+/// event, each holding a gate slot (`invariants.md` §15.1q).
+#[cfg(feature = "metal")]
+fn host_input_line(arm: &str, held: &lloom_tensor::kernels::metal::ProducedStats) -> String {
+    format!(
+        "[host input since load: arm={arm} held={} released={} (by producer {}) \
+         held_time={:.3} ms producer_lock_wait={:.3} ms delegated={} cancelled={} late_after_cancel={} parks={} io_deferred={} beside_its_event={} held_now={}]",
+        held.held,
+        held.released,
+        held.released_by_producer,
+        held.held_us as f64 / 1e3,
+        held.producer_lock_us as f64 / 1e3,
+        held.delegated,
+        held.cancelled,
+        held.late_after_cancel,
+        held.parks,
+        held.io_deferred,
+        held.beside_its_event,
+        held.held_now,
+    )
+}
+
+#[cfg(all(test, feature = "metal"))]
+mod host_input_line_tests {
+    use super::host_input_line;
+    use lloom_tensor::kernels::metal::ProducedStats;
+
+    /// The count of recordings that gated two values of one event reaches
+    /// the report, next to the counters it is read with.
+    #[test]
+    fn the_report_carries_the_count_of_values_beside_their_event() {
+        let stats = ProducedStats {
+            held: 7,
+            beside_its_event: 3,
+            held_now: 2,
+            ..ProducedStats::default()
+        };
+        let line = host_input_line("commit", &stats);
+        assert!(
+            line.starts_with("[host input since load: arm=commit held=7 "),
+            "{line}"
+        );
+        assert!(line.contains(" beside_its_event=3 held_now=2]"), "{line}");
+    }
+}
+
 /// The run's churn as deltas — pool misses, evictions, residency adds and
 /// commits, the readbacks split fast / blit / null-after-wait — then what
 /// sits in the free budget at the end, which names the sizes an allocation
@@ -1013,22 +1060,12 @@ fn print_churn(m: &lloom_tensor::MetalDevice, before: &ChurnSnapshot) {
     // Work held for a host- or IO-produced input (invariants.md §15.1q),
     // since load: recordings held, committed by their producer, cancelled,
     // and the encoding thread's parks behind them.
-    let held = m.commands().produced_stats();
     eprintln!(
-        "[host input since load: arm={} held={} released={} (by producer {}) \
-         held_time={:.3} ms producer_lock_wait={:.3} ms delegated={} cancelled={} late_after_cancel={} parks={} io_deferred={} held_now={}]",
-        m.commands().host_input_arm().as_str(),
-        held.held,
-        held.released,
-        held.released_by_producer,
-        held.held_us as f64 / 1e3,
-        held.producer_lock_us as f64 / 1e3,
-        held.delegated,
-        held.cancelled,
-        held.late_after_cancel,
-        held.parks,
-        held.io_deferred,
-        held.held_now,
+        "{}",
+        host_input_line(
+            m.commands().host_input_arm().as_str(),
+            &m.commands().produced_stats()
+        )
     );
     // The unretained arm's engagement: what the host held for command buffers
     // that hold nothing themselves (`in_flight.rs`).

@@ -1314,3 +1314,57 @@ fn an_event_listener_runs_one_block_at_a_time() {
          arm's reproduction no longer reaches the defect"
     );
 }
+
+/// A recording that gates a second value of its event is counted, and the
+/// gate path prints nothing: it runs under the state lock, so the count is
+/// left to the run's report (`[host input since load: … beside_its_event=]`).
+///
+/// The test runs the gate in a child of this binary (its own harness name,
+/// `--exact`, output not captured) and reads the child's stderr: the
+/// child's `BESIDE_COUNT` line is the positive control that the gate path
+/// ran there, and it must be the only line about it.
+#[test]
+fn a_value_beside_its_event_is_counted_and_the_gate_path_prints_nothing() {
+    const CHILD: &str = "LLOOM_TEST_BESIDE_CHILD";
+    if std::env::var_os(CHILD).is_some() {
+        let f = fixture();
+        if f.commands.host_input_arm() == HostInputArm::GpuWait {
+            eprintln!("NOT_APPLICABLE nothing is gated on the gpu-wait arm");
+            return;
+        }
+        f.commands.commit_when_produced(&f.gate, 1).unwrap();
+        f.commands.commit_when_produced(&f.gate, 5).unwrap();
+        let stats = f.commands.produced_stats();
+        let cancelled = f
+            .commands
+            .cancel_produced_through(&f.gate, 5, "test: never produced");
+        f.gate.setSignaledValue(5);
+        let _ = f.commands.produced(&f.gate, 5);
+        f.commands.flush_and_wait().unwrap();
+        eprintln!(
+            "BESIDE_COUNT {} cancelled={cancelled:?}",
+            stats.beside_its_event
+        );
+        return;
+    }
+    let name = std::thread::current().name().unwrap().to_string();
+    let out = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", &name, "--nocapture", "--test-threads", "1"])
+        .env(CHILD, "1")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    eprintln!("CHILD status={:?} stderr:\n{stderr}", out.status);
+    assert!(out.status.success(), "the child failed: {stderr}");
+    if stderr.contains("NOT_APPLICABLE") {
+        return;
+    }
+    assert!(
+        stderr.lines().any(|l| l.starts_with("BESIDE_COUNT 1 ")),
+        "the child's gate path did not count one value beside its event: {stderr}"
+    );
+    assert!(
+        !stderr.contains("beside another value of its event"),
+        "the gate path printed under the state lock: {stderr}"
+    );
+}

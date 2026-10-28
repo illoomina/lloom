@@ -33,7 +33,7 @@ use std::borrow::{Borrow, BorrowMut};
 
 use crate::generation::{HotThread, LogitsProcessor, Sampling};
 use crate::nn::decode::{
-    end_executor_step, ladder_width, ragged_layout, tile_widths, DecodeOptions, DecodeOut,
+    end_executor_step, hold_in, ladder_width, ragged_layout, tile_widths, DecodeOptions, DecodeOut,
     DecodeStats, OpenPass, PassShape, PassWidths, StepPacer,
 };
 use crate::nn::model::{BatchedCausalLM, RaggedRow, Row};
@@ -487,6 +487,8 @@ pub struct BatchDecoder<'m, M: BatchedCausalLM, R: BorrowMut<Session<'m, M>>> {
     /// is `[live.len(), vocab]` (unset while nothing is live).
     live: Vec<usize>,
     logits: Option<Tensor>,
+    /// Where `logits` is held across an arriving row's prefill passes.
+    logits_hold: Option<Tensor>,
     step: u64,
     generation: u64,
     /// Retired rows awaiting `take_finished`, with their outcome.
@@ -543,6 +545,7 @@ impl<'m, M: BatchedCausalLM, R: BorrowMut<Session<'m, M>>> BatchDecoder<'m, M, R
             free: Vec::new(),
             live: Vec::new(),
             logits: None,
+            logits_hold: None,
             step: 0,
             generation: 0,
             finished: Vec::new(),
@@ -913,10 +916,16 @@ impl<'m, M: BatchedCausalLM, R: BorrowMut<Session<'m, M>>> BatchDecoder<'m, M, R
     /// fed at its arrival step, before that step's decode is encoded (the
     /// tile still bounds each forward). Returns the rows that completed
     /// their prompt, with their logits, in slot order.
+    ///
+    /// The prefill passes run before this step samples the live rows, and a
+    /// joined row's logits are read after this step's decode and the later
+    /// rows' prefills: both are held in memory a pass cannot serve
+    /// ([`hold_in`]).
     fn admit_whole(&mut self) -> Result<Vec<(usize, Tensor)>> {
         let mut joined = Vec::new();
         let step = self.step;
         let device = self.device.clone();
+        let mut live_held = false;
         for i in 0..self.slots.len() {
             let Some(slot) = self.slots[i].as_mut() else {
                 continue;
@@ -932,6 +941,12 @@ impl<'m, M: BatchedCausalLM, R: BorrowMut<Session<'m, M>>> BatchDecoder<'m, M, R
                 lane.joined = true;
                 joined.push((i, held.unsqueeze(0)?));
                 continue;
+            }
+            if !live_held {
+                live_held = true;
+                if let Some(l) = self.logits.take() {
+                    self.logits = Some(hold_in(&mut self.logits_hold, l)?);
+                }
             }
             let start = std::time::Instant::now();
             let mut last = None;
@@ -961,10 +976,12 @@ impl<'m, M: BatchedCausalLM, R: BorrowMut<Session<'m, M>>> BatchDecoder<'m, M, R
                 off += w;
                 lane.stats.prefill_units += 1;
             }
+            let last = last.expect("a non-empty prompt steps at least once");
+            let last = s.hold_logits(last.squeeze(0)?)?.unsqueeze(0)?;
             lane.prompt_off = slot.prompt.len();
             lane.stats.prefill_ns = start.elapsed().as_nanos() as u64;
             lane.joined = true;
-            joined.push((i, last.expect("a non-empty prompt steps at least once")));
+            joined.push((i, last));
         }
         Ok(joined)
     }

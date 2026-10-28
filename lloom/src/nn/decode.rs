@@ -1278,6 +1278,32 @@ fn activations_may_be_reused(device: &Device) -> Result<bool> {
     Ok(false)
 }
 
+/// `logits`, read after a later pass, in memory `hold` owns.
+///
+/// A pass's output lives in the pass's memory: under the pass cache (or the
+/// arena) that is a slot of one base every pass on the device reuses, so a
+/// value read after another pass has run would be read after its slot was
+/// overwritten. This copies it into a buffer allocated once, outside every
+/// pass (so no plan ever serves it), by one dispatch encoded before any other
+/// pass is: the barrier chain orders the read against the next writer. When
+/// the device serves activations from the pool only, `logits` is its own
+/// and is returned as is (`pass-plan-design.md` §3.3, escapes are declared).
+pub(crate) fn hold_in(hold: &mut Option<Tensor>, logits: Tensor) -> Result<Tensor> {
+    if !activations_may_be_reused(logits.device())? {
+        return Ok(logits);
+    }
+    let h = match hold.as_ref() {
+        Some(h) if h.shape() == logits.shape() && h.dtype() == logits.dtype() => h.clone(),
+        _ => {
+            let h = Tensor::zeros(logits.shape(), logits.dtype(), logits.device())?;
+            *hold = Some(h.clone());
+            h
+        }
+    };
+    h.slice_set(&logits, 0, 0)?;
+    Ok(h)
+}
+
 pub(crate) fn end_pass(device: &Device) -> Result<()> {
     #[cfg(feature = "metal")]
     if let Device::Metal(m) = device {
@@ -3017,33 +3043,11 @@ impl<'m, M: CausalLM> Session<'m, M> {
         Ok(())
     }
 
-    /// The logits a later call resumes from, in memory this sequence owns.
-    ///
-    /// A pass's output lives in the pass's memory: under the pass cache (or
-    /// the arena) that is a slot of one base every pass on the device reuses,
-    /// so logits held across passes — this sequence's next `decode` with an
-    /// empty prompt, a batched resume row, another session's passes in
-    /// between — would be read after their slot was overwritten. This copies
-    /// them into a per-sequence buffer allocated once, outside every pass (so
-    /// no plan ever serves it), by one dispatch encoded before any other pass
-    /// is: the barrier chain orders the read against the next writer. When
-    /// the device serves activations from the pool only, the held buffer is
-    /// its own and is returned as is (`DESIGN.md` §9.2aa, escapes are
-    /// declared).
+    /// The logits a later call resumes from, in memory this sequence owns
+    /// ([`hold_in`]): this sequence's next `decode` with an empty prompt, a
+    /// batched resume row, a row joining a batch after other passes ran.
     pub(crate) fn hold_logits(&mut self, logits: Tensor) -> Result<Tensor> {
-        if !activations_may_be_reused(logits.device())? {
-            return Ok(logits);
-        }
-        let hold = match &self.seq.logits_hold {
-            Some(h) if h.shape() == logits.shape() && h.dtype() == logits.dtype() => h.clone(),
-            _ => {
-                let h = Tensor::zeros(logits.shape(), logits.dtype(), logits.device())?;
-                self.seq.logits_hold = Some(h.clone());
-                h
-            }
-        };
-        hold.slice_set(&logits, 0, 0)?;
-        Ok(hold)
+        hold_in(&mut self.seq.logits_hold, logits)
     }
 
     /// Feed `prompt` through the model as the forwards [`prefill_widths`]

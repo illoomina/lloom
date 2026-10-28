@@ -83,6 +83,7 @@ mod optimizer_quant_hooks;
 mod optimizer_remarks;
 mod optimizer_walk;
 mod page_cache_probe;
+mod pass_body_failure;
 mod pass_entry_failure;
 mod pinned_prefix;
 mod pos_embed_resample_tests;

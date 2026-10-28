@@ -1286,21 +1286,60 @@ pub(crate) fn end_pass(device: &Device) -> Result<()> {
     device.finish_pass()
 }
 
+/// Abandon the pass `begin_pass` opened, after its body failed or unwound
+/// (`MetalDevice::abort_pass`): nothing it recorded or observed is published.
+pub(crate) fn abort_pass(device: &Device) -> Result<()> {
+    #[cfg(feature = "metal")]
+    if let Device::Metal(m) = device {
+        m.abort_pass()?;
+        return Ok(());
+    }
+    device.abort_pass()
+}
+
+/// A pass whose body is running. [`Self::finish`] closes it after a body
+/// that succeeded; dropped unfinished — the body returned an error or
+/// unwound — it is aborted, never finished, so a partial recording or
+/// observation never becomes a plan and the next pass opens.
+#[must_use = "an open pass is aborted when dropped"]
+struct OpenPass<'a> {
+    device: &'a Device,
+    open: bool,
+}
+
+impl<'a> OpenPass<'a> {
+    /// A refusal leaves no open pass (`MetalDevice::begin_pass`), so there
+    /// is nothing to abort on that path.
+    fn begin(device: &'a Device, shape: PassShape) -> Result<Self> {
+        begin_pass(device, shape)?;
+        Ok(Self { device, open: true })
+    }
+
+    fn finish(mut self) -> Result<()> {
+        self.open = false;
+        end_pass(self.device)
+    }
+}
+
+impl Drop for OpenPass<'_> {
+    fn drop(&mut self) {
+        if self.open {
+            if let Err(e) = abort_pass(self.device) {
+                eprintln!("[decode] aborting a pass whose body failed: {e}");
+            }
+        }
+    }
+}
+
 /// Open the decode step's pass — the `Decode { b: 1 }` pass; with the plan
 /// cache off, the legacy arena bracket.
 ///
 /// A refusal is the request's error, not something to continue past: the
 /// device can decline a pass whose plan it cannot admit or whose
 /// predecessor was never closed, and a forward encoded after that runs
-/// against state the pass was meant to install. The refusal leaves no open
-/// pass (`MetalDevice::begin_pass`), so the caller owes no `end_pass` on
-/// this path.
-fn begin_decode_step(device: &Device) -> Result<()> {
-    begin_pass(device, PassShape::Decode { b: 1 })
-}
-
-fn end_decode_step(device: &Device) -> Result<()> {
-    end_pass(device)
+/// against state the pass was meant to install.
+fn begin_decode_step(device: &Device) -> Result<OpenPass<'_>> {
+    OpenPass::begin(device, PassShape::Decode { b: 1 })
 }
 
 fn flush_and_prune(device: &Device) -> Result<Option<usize>> {
@@ -2512,12 +2551,12 @@ impl<'m, M: CausalLM> Session<'m, M> {
                     pacer.before_forward(&device)?;
                 }
                 self.model.prepare_pass(&mut self.seq.cache, 1)?;
-                begin_decode_step(&device)?;
+                let pass = begin_decode_step(&device)?;
                 logits = self
                     .model
                     .forward(&feed, self.seq.pos, &mut self.seq.cache)?
                     .squeeze(0)?;
-                end_decode_step(&device)?;
+                pass.finish()?;
                 self.seq.pos += 1;
                 if pace {
                     pacer.after_forward(&device)?;
@@ -2553,12 +2592,12 @@ impl<'m, M: CausalLM> Session<'m, M> {
                 }
                 let t = timed.then(std::time::Instant::now);
                 self.model.prepare_pass(&mut self.seq.cache, 1)?;
-                begin_decode_step(&device)?;
+                let pass = begin_decode_step(&device)?;
                 logits = self
                     .model
                     .forward(&feed, self.seq.pos, &mut self.seq.cache)?
                     .squeeze(0)?;
-                end_decode_step(&device)?;
+                pass.finish()?;
                 self.seq.pos += 1;
                 let t_forward = t.map_or(0, |t| t.elapsed().as_nanos() as u64);
                 // The in-flight bound AFTER the enqueue: retire the oldest
@@ -2623,12 +2662,12 @@ impl<'m, M: CausalLM> Session<'m, M> {
                             pacer.before_forward(&device)?;
                         }
                         self.model.prepare_pass(&mut self.seq.cache, 1)?;
-                        begin_decode_step(&device)?;
+                        let pass = begin_decode_step(&device)?;
                         logits = self
                             .model
                             .forward(&again, self.seq.pos, &mut self.seq.cache)?
                             .squeeze(0)?;
-                        end_decode_step(&device)?;
+                        pass.finish()?;
                         self.seq.pos += 1;
                         if pace {
                             pacer.after_forward(&device)?;
@@ -3062,7 +3101,7 @@ impl<'m, M: CausalLM> Session<'m, M> {
             // Session allocations (the KV slab, a bucket grow) happen here,
             // before the bracket, so the planned pass allocates nothing.
             self.model.prepare_pass(&mut self.seq.cache, w)?;
-            begin_pass(
+            let pass = OpenPass::begin(
                 &device,
                 PassShape::Prefill {
                     w,
@@ -3075,7 +3114,7 @@ impl<'m, M: CausalLM> Session<'m, M> {
                     .forward(&input, span.past, &mut self.seq.cache)?
                     .squeeze(0)?
             };
-            end_pass(&device)?;
+            pass.finish()?;
             if pace {
                 pacer.after_forward(&device)?;
             }
@@ -4014,10 +4053,9 @@ impl<'m, M: CausalLM> Session<'m, M> {
         // the key exists to refuse.
         let k = (draft.tokens.len() + 1).min(u16::MAX as usize);
         s.model.prepare_verify(&mut s.seq.cache, k)?;
-        begin_pass(device, PassShape::Verify { k })?;
-        let pending = s.model.verify_enqueue(&draft, &anchor, &mut s.seq.cache);
-        end_pass(device)?;
-        let pending = pending?;
+        let pass = OpenPass::begin(device, PassShape::Verify { k })?;
+        let pending = s.model.verify_enqueue(&draft, &anchor, &mut s.seq.cache)?;
+        pass.finish()?;
         timing.verify_enqueue_ns = t.elapsed().as_nanos() as u64;
         timing.verify_readbacks = readbacks() - rb;
         lane.in_flight = timing;

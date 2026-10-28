@@ -806,8 +806,14 @@ pub struct RingTuning {
     /// Whether the adaptive commit's loop watches the ring for a stop id itself (#993): off (it stops only when the reader raises the flag, so a late reader lets it run past an EOS without bound) or on (it reads what the GPU published before each step and stops at a stop id, so at most `adaptive_lead + 1` forwards run past an EOS). An arm until it is measured.
     #[opt(flag = "ring-eos-watch", env = "LLOOM_RING_EOS_WATCH", bool, path = "decode.ring.eos_watch", status = "arm", facets = ["lead"], flows = ["token-out", "commands-out"])]
     pub eos_watch: bool,
+    /// The counter cut on the batched loop's decode-only steps: `off` (the period in force, a cut every 50 dispatches), `ahead` (held off while a forward is encoded ahead of the step's readback, as `decode_until`'s step loop holds it) or `all` (held off on the blocking arm too). A step that feeds prompt pieces keeps the period. An arm until it is measured.
+    #[opt(flag = "batched-cut-hold", env = "LLOOM_BATCHED_CUT_HOLD", parser = "parse_batched_cut_hold", variants = ["off", "ahead", "all"], path = "decode.batched.cut_hold", status = "arm", facets = ["cadence"], flows = ["token-out", "commands-out"])]
+    pub batched_cut_hold: String,
 }
 
+fn parse_batched_cut_hold(v: &str) -> Result<String, String> {
+    one_of(v, "batched cut hold", &["off", "ahead", "all"])
+}
 fn parse_spawned_qos(v: &str) -> Result<String, String> {
     crate::generation::hot_thread::parse_spawned_arm(&non_empty(v)?.to_ascii_lowercase())
 }
@@ -831,6 +837,7 @@ impl Default for RingTuning {
             qwen3_5_eos_gate: false,
             qwen3_5_eos_gate_cores: false,
             eos_watch: false,
+            batched_cut_hold: "off".into(),
         }
     }
 }

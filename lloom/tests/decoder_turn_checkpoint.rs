@@ -265,6 +265,77 @@ where
     Ok(())
 }
 
+/// Two valid checkpoints in the ring, each restored after decode steps past
+/// both: the older (`a`, the first pass's end) against a fresh prefill of
+/// `a` tokens, the newer (`b`, the second pass's end) against a reference
+/// running the same two passes. A restore that reads the other slot's frame
+/// or marks puts back the other checkpoint's state, which differs from
+/// either reference.
+fn two_checkpoints_case<M, L>(model: &M, cfg: &Config, dev: &Device, a: usize, b: usize) -> Result<()>
+where
+    M: CausalLM<Config = Config, Cache = DecoderState<L>>,
+    L: Layer<State = LayerState>,
+{
+    let prompt = tokens(b + 2, cfg.vocab_size, 5);
+    let two_passes = || -> Result<DecoderState<L>> {
+        let mut st = prefill(model, cfg, dev, &prompt[..a], None)?;
+        logits(model, &mut st, a, &prompt[a..b], dev)?;
+        Ok(st)
+    };
+    for at in [a, b] {
+        let mut st = two_passes()?;
+        let mut held = st.checkpoint_positions();
+        held.sort_unstable();
+        assert_eq!(held, vec![a, b], "each pass left a checkpoint at its end");
+        for (i, t) in prompt[b..b + 2].iter().enumerate() {
+            logits(model, &mut st, b + i, &[*t], dev)?;
+        }
+        st.restore(at)?;
+        let mut reference = if at == a {
+            prefill(model, cfg, dev, &prompt[..a], None)?
+        } else {
+            two_passes()?
+        };
+        let (rec, kv) = state_diff(&st, &reference)?;
+        eprintln!("TURN-CKPT two checkpoints {a},{b}: restore {at}: recurrent {rec:e} kv {kv:e}");
+        assert_eq!(
+            (rec, kv),
+            (0.0, 0.0),
+            "the checkpoint at {at} of [{a}, {b}] restores its own state, bit for bit"
+        );
+        let x = logits(model, &mut st, at, &prompt[at..at + 2], dev)?;
+        let y = logits(model, &mut reference, at, &prompt[at..at + 2], dev)?;
+        assert_eq!(
+            max_abs_diff(&x, &y)?,
+            0.0,
+            "the continuation from the checkpoint at {at} is the reference's"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn two_checkpoints_each_restore_their_own_state_on_the_cpu() -> Result<()> {
+    pin();
+    let dev = Device::Cpu;
+    let (model, cfg) = dense::<CrownExact>(&dev, 0)?;
+    two_checkpoints_case(&model, &cfg, &dev, 24, 40)?;
+    let (model, cfg) = moe::<CrownExact>(&dev)?;
+    two_checkpoints_case(&model, &cfg, &dev, 24, 40)?;
+    Ok(())
+}
+
+/// The fused prefill on Metal, both passes from [`same_arms_from`] rows.
+#[cfg(feature = "metal")]
+#[test]
+fn two_checkpoints_each_restore_their_own_state_on_metal() -> Result<()> {
+    pin();
+    let dev = Device::new_metal(0)?;
+    let (model, cfg) = dense::<CrownExact>(&dev, 0)?;
+    two_checkpoints_case(&model, &cfg, &dev, 64, 128)?;
+    Ok(())
+}
+
 fn dense<P: Profile>(
     dev: &Device,
     window: usize,

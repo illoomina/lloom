@@ -135,7 +135,7 @@ impl Drop for UngatedScope {
 
 /// The sources whose kernels carry `EOS_GATE_ARG` (`utils.metal`,
 /// `quantized.metal`): always built with the gate's function constant.
-const EOS_GATED_SOURCES: [Source; 8] = [
+const EOS_GATED_SOURCES: [Source; 9] = [
     Source::Gemv,
     Source::Reduce,
     Source::Binary,
@@ -144,11 +144,16 @@ const EOS_GATED_SOURCES: [Source; 8] = [
     Source::Gdn,
     Source::Quantized,
     Source::QuantizedStore,
+    Source::QuantizedGlu,
 ];
 
 /// Of those, the quantized mat-vec cores: gated only under the cores arm
 /// (`Kernels::set_eos_gate_cores`), plain under the gate alone.
-const EOS_GATED_CORES: [Source; 2] = [Source::Quantized, Source::QuantizedStore];
+const EOS_GATED_CORES: [Source; 3] = [
+    Source::Quantized,
+    Source::QuantizedStore,
+    Source::QuantizedGlu,
+];
 
 impl Default for Kernels {
     fn default() -> Self {
@@ -275,6 +280,7 @@ impl Kernels {
             Source::MlxSort => MLX_SORT,
             Source::Quantized => QUANTIZED,
             Source::QuantizedStore => super::source::quantized_store(),
+            Source::QuantizedGlu => super::source::quantized_glu(),
             Source::Qwen4Exp => QWEN4EXP,
             Source::Random => RANDOM,
             Source::Reduce => REDUCE,
@@ -745,6 +751,8 @@ mod tests {
                 // it beside `Quantized` would define every quantized kernel
                 // twice. Compiled alone, on demand.
                 Source::QuantizedStore => false,
+                // The same, with the routed pair's GLU store.
+                Source::QuantizedGlu => false,
             }
         };
 
@@ -775,6 +783,7 @@ mod tests {
             Source::MlxSort,
             Source::Quantized,
             Source::QuantizedStore,
+            Source::QuantizedGlu,
             Source::Qwen4Exp,
             Source::Random,
             Source::Reduce,

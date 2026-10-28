@@ -2897,6 +2897,17 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
         }
     }
 
+    /// Select whether every layer's routed SwiGLU rides the gate|up launch's
+    /// store (`MoeLayer::set_routed_glu`; `qwen4exp.routed_glu` by default).
+    pub fn set_routed_glu(&mut self, on: bool) {
+        for l in &mut self.layers {
+            l.moe.set_routed_glu(on);
+        }
+        if let Some(m) = &mut self.mtp {
+            m.layer_mut().moe_mut().set_routed_glu(on);
+        }
+    }
+
     /// Select whether every layer's shared expert runs its SwiGLU on its
     /// quantized projections' stores (`MoeLayer::set_shared_store`;
     /// `qwen4exp.shared_store` by default).

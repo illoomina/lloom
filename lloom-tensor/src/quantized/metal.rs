@@ -1119,6 +1119,81 @@ impl QMetalStorage {
         Ok((both, None, shape))
     }
 
+    /// [`Self::indexed_moe_forward_pair`] with the SwiGLU on its store, in one
+    /// launch (`kernel_mul_mv_id2_<stem>_<triple>_glu`): `[2, batch, topk, n]`
+    /// whose plane set 0 is `silu(g) · u` (`silu_mul`'s element over the
+    /// gate and up the pair stores) and 1 is `u`. `None` where that launch
+    /// does not serve this pair (`kernels::mv_id2_glu_applies`: a row count
+    /// the row axis or the union takes, the fold, a kind without the core).
+    #[allow(clippy::too_many_arguments)]
+    pub fn indexed_moe_forward_glu(
+        &self,
+        other: &Self,
+        self_shape: &Shape,
+        input: &MetalStorage,
+        input_l: &Layout,
+        ids: &MetalStorage,
+        ids_l: &Layout,
+        act: DType,
+    ) -> Result<Option<(MetalStorage, Shape)>> {
+        use crate::MetalError;
+        let (n_experts, n, k) = self_shape.dims3()?;
+        if !input_l.is_contiguous() || !ids_l.is_contiguous() || ids.dtype() != DType::U32 {
+            return Ok(None);
+        }
+        let need = self_shape.elem_count() * self.dtype.type_size() / self.dtype.block_size();
+        if other.dtype != self.dtype || other.buffer.length() < need || self.buffer.length() < need
+        {
+            return Ok(None);
+        }
+        let Ok((triple, store_dtype)) =
+            self.routed_triple(input.dtype(), act, "indexed_moe_forward_glu")
+        else {
+            return Ok(None);
+        };
+        let ggml_dtype: crate::kernels::GgmlDType = self.dtype.into();
+        let (batch, in_dim1, k_in) = input_l.shape().dims3()?;
+        let (batch_ids, topk) = ids_l.shape().dims2()?;
+        if k_in != k
+            || batch != batch_ids
+            || (in_dim1 != 1 && in_dim1 != topk)
+            || !crate::kernels::mv_id2_glu_applies(ggml_dtype, triple, batch)
+        {
+            return Ok(None);
+        }
+        let device = self.device.clone();
+        let shape = Shape::from((2, batch, topk, n));
+        let dst = device
+            .new_buffer_builder()
+            .with_size_for(shape.elem_count(), store_dtype)
+            .with_label("qmatmul_id2_glu")
+            .build()?;
+        let encoder = device.command_encoder()?;
+        // SAFETY: binding authority (module head).
+        unsafe {
+            crate::kernels::call_quantized_matmul_mv_id2_glu_t(
+                device.device(),
+                &encoder,
+                device.kernels(),
+                ggml_dtype,
+                triple,
+                (n_experts, n, k),
+                (batch, topk, in_dim1),
+                &self.buffer,
+                &other.buffer,
+                input.buffer(),
+                input_l.start_offset() * input.dtype().size_in_bytes(),
+                ids.buffer(),
+                ids_l.start_offset() * DType::U32.size_in_bytes(),
+                &dst,
+            )
+        }
+        .map_err(MetalError::from)?;
+        let storage =
+            MetalStorage::new_allocated(dst, device.clone(), shape.elem_count(), store_dtype)?;
+        Ok(Some((storage, shape)))
+    }
+
     /// The routed launches' `(activation, f32, store)` triple for an `input`
     /// activation computed in `act` on this weight, and the store's dtype:
     /// f16 reads and stores f16 on the quantized weight rows, f32 keeps the

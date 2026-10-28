@@ -33,8 +33,8 @@ use std::borrow::{Borrow, BorrowMut};
 
 use crate::generation::{HotThread, LogitsProcessor, Sampling};
 use crate::nn::decode::{
-    begin_pass, end_executor_step, end_pass, ladder_width, ragged_layout, tile_widths,
-    DecodeOptions, DecodeOut, DecodeStats, PassShape, PassWidths, StepPacer,
+    end_executor_step, hold_in, ladder_width, ragged_layout, tile_widths, DecodeOptions, DecodeOut,
+    DecodeStats, OpenPass, PassShape, PassWidths, StepPacer,
 };
 use crate::nn::model::{BatchedCausalLM, RaggedRow, Row};
 use crate::nn::speculator::Session;
@@ -487,6 +487,8 @@ pub struct BatchDecoder<'m, M: BatchedCausalLM, R: BorrowMut<Session<'m, M>>> {
     /// is `[live.len(), vocab]` (unset while nothing is live).
     live: Vec<usize>,
     logits: Option<Tensor>,
+    /// Where `logits` is held across an arriving row's prefill passes.
+    logits_hold: Option<Tensor>,
     step: u64,
     generation: u64,
     /// Retired rows awaiting `take_finished`, with their outcome.
@@ -543,6 +545,7 @@ impl<'m, M: BatchedCausalLM, R: BorrowMut<Session<'m, M>>> BatchDecoder<'m, M, R
             free: Vec::new(),
             live: Vec::new(),
             logits: None,
+            logits_hold: None,
             step: 0,
             generation: 0,
             finished: Vec::new(),
@@ -913,10 +916,16 @@ impl<'m, M: BatchedCausalLM, R: BorrowMut<Session<'m, M>>> BatchDecoder<'m, M, R
     /// fed at its arrival step, before that step's decode is encoded (the
     /// tile still bounds each forward). Returns the rows that completed
     /// their prompt, with their logits, in slot order.
+    ///
+    /// The prefill passes run before this step samples the live rows, and a
+    /// joined row's logits are read after this step's decode and the later
+    /// rows' prefills: both are held in memory a pass cannot serve
+    /// ([`hold_in`]).
     fn admit_whole(&mut self) -> Result<Vec<(usize, Tensor)>> {
         let mut joined = Vec::new();
         let step = self.step;
         let device = self.device.clone();
+        let mut live_held = false;
         for i in 0..self.slots.len() {
             let Some(slot) = self.slots[i].as_mut() else {
                 continue;
@@ -933,6 +942,12 @@ impl<'m, M: BatchedCausalLM, R: BorrowMut<Session<'m, M>>> BatchDecoder<'m, M, R
                 joined.push((i, held.unsqueeze(0)?));
                 continue;
             }
+            if !live_held {
+                live_held = true;
+                if let Some(l) = self.logits.take() {
+                    self.logits = Some(hold_in(&mut self.logits_hold, l)?);
+                }
+            }
             let start = std::time::Instant::now();
             let mut last = None;
             let mut off = 0usize;
@@ -942,7 +957,7 @@ impl<'m, M: BatchedCausalLM, R: BorrowMut<Session<'m, M>>> BatchDecoder<'m, M, R
                 let input = Tensor::new(unit, &device)?.unsqueeze(0)?;
                 s.model.prepare_pass(&mut s.seq.cache, w)?;
                 self.pacer.before_forward(&device)?;
-                begin_pass(
+                let pass = OpenPass::begin(
                     &device,
                     PassShape::Prefill {
                         w,
@@ -953,7 +968,7 @@ impl<'m, M: BatchedCausalLM, R: BorrowMut<Session<'m, M>>> BatchDecoder<'m, M, R
                     let _prefill = lloom_tensor::tuning::VerifyWindow::prefill();
                     s.model.forward(&input, s.seq.pos, &mut s.seq.cache)
                 };
-                end_pass(&device)?;
+                pass.close(&out)?;
                 self.pacer.after_forward(&device)?;
                 last = Some(out?);
                 s.seq.pos += w;
@@ -961,10 +976,12 @@ impl<'m, M: BatchedCausalLM, R: BorrowMut<Session<'m, M>>> BatchDecoder<'m, M, R
                 off += w;
                 lane.stats.prefill_units += 1;
             }
+            let last = last.expect("a non-empty prompt steps at least once");
+            let last = s.hold_logits(last.squeeze(0)?)?.unsqueeze(0)?;
             lane.prompt_off = slot.prompt.len();
             lane.stats.prefill_ns = start.elapsed().as_nanos() as u64;
             lane.joined = true;
-            joined.push((i, last.expect("a non-empty prompt steps at least once")));
+            joined.push((i, last));
         }
         Ok(joined)
     }
@@ -1483,7 +1500,7 @@ impl<'m, M: BatchedCausalLM, R: BorrowMut<Session<'m, M>>> BatchDecoder<'m, M, R
         clock.lap(&mut ph.prepare_ns);
         self.pacer.before_forward(input.device())?;
         clock.lap(&mut ph.pace_ns);
-        begin_pass(input.device(), shape)?;
+        let pass = OpenPass::begin(input.device(), shape)?;
         let logits = {
             // The live rows lead the input and the head: under
             // `kernels.gemm.f16_rows_decode` they take a decode step's route
@@ -1497,7 +1514,7 @@ impl<'m, M: BatchedCausalLM, R: BorrowMut<Session<'m, M>>> BatchDecoder<'m, M, R
             });
             model.forward_ragged(input, &mut rows)
         }?;
-        end_pass(input.device())?;
+        pass.finish()?;
         clock.lap(&mut ph.encode_ns);
         self.pacer.after_forward(input.device())?;
         drop(rows);
@@ -1546,14 +1563,14 @@ impl<'m, M: BatchedCausalLM, R: BorrowMut<Session<'m, M>>> BatchDecoder<'m, M, R
         clock.lap(&mut ph.prepare_ns);
         self.pacer.before_forward(input.device())?;
         clock.lap(&mut ph.pace_ns);
-        begin_pass(input.device(), PassShape::Decode { b: live.len() })?;
+        let pass = OpenPass::begin(input.device(), PassShape::Decode { b: live.len() })?;
         let logits = {
             // One token per live row: the step `kernels.gemm.f16_rows_decode`
             // routes (`tuning::DecodeRows`).
             let _rows = lloom_tensor::tuning::DecodeRows::open();
             model.forward_rows(input, &mut rows)
         }?;
-        end_pass(input.device())?;
+        pass.finish()?;
         clock.lap(&mut ph.encode_ns);
         self.pacer.after_forward(input.device())?;
         drop(rows);

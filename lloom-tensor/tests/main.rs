@@ -48,6 +48,7 @@ mod io_queue_held;
 mod iq3xxs_gguf_read;
 mod iq_metal;
 mod kv_pages_cpu;
+mod landing_gather;
 mod layout_tests;
 mod matmul_tests;
 mod metal4_declare;

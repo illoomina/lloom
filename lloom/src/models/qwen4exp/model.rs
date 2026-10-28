@@ -1773,6 +1773,50 @@ pub fn set_prefill_tiles(tiles: usize) {
 
 pub const DEFAULT_PREFILL_TILES: usize = 2;
 
+static PREFILL_PAIR_FORWARD: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(u8::MAX);
+
+/// Whether a driver tile of one chunk is widened to [`prefill_tiles`] chunks
+/// a forward (`prefill.pair_forward`, read once; [`set_prefill_pair_forward`]
+/// for tests). `forward_embeds` pairs chunks only within one forward, and the
+/// served driver hands it one tile a forward (`docs/expert-streaming.md`
+/// §20.5).
+pub fn prefill_pair_forward() -> bool {
+    let v = PREFILL_PAIR_FORWARD.load(std::sync::atomic::Ordering::Relaxed);
+    if v != u8::MAX {
+        return v != 0;
+    }
+    let on = crate::tuning::tuning().qwen4exp.prefill_pair_forward;
+    PREFILL_PAIR_FORWARD.store(on as u8, std::sync::atomic::Ordering::Relaxed);
+    on
+}
+
+pub fn set_prefill_pair_forward(on: bool) {
+    PREFILL_PAIR_FORWARD.store(on as u8, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The prefill tile a driver hands one forward, for a configured `tile`:
+/// [`prefill_tiles`] chunks when [`prefill_pair_forward`] and the paired
+/// prefill are on and `tile` is exactly one chunk, so the forward pairs its
+/// chunks; `tile` otherwise. A tile between one chunk and two already pairs
+/// inside its forward, a tile below one chunk is the caller's bound on the
+/// prefill's working set, and `0` (the whole prompt) pairs already.
+pub fn forward_tile(tile: usize) -> usize {
+    if tile != 0 && tile == prefill_chunk() && prefill_pair_forward() && prefill_pair_on() {
+        tile * prefill_tiles()
+    } else {
+        tile
+    }
+}
+
+static PIPELINED_PASSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Pipelined prefill passes (`prefill_embeds_pipelined`) this process has
+/// run: the paired prefill's reach, read by tests and reports.
+pub fn pipelined_passes() -> u64 {
+    PIPELINED_PASSES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 static DECODE_HINTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// `QWEN4EXP_DECODE_HINT=1` (read once; off by default): at decode under
@@ -3771,6 +3815,7 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
         if n_tiles == 0 {
             lloom_tensor::bail!("prefill_embeds_pipelined: no tiles")
         }
+        PIPELINED_PASSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let n = self.cfg.hc_count;
         let d = self.cfg.hidden_size;
         let mut seqs = Vec::with_capacity(n_tiles);

@@ -916,3 +916,149 @@ fn routed_pair_order_chain() {
         }
     }
 }
+
+/// #1110 (3)'s price: what the routed SwiGLU's own launch costs the decode
+/// step's chain, per routed layer, at each MoE family's geometry (synthetic
+/// experts; the launch's cost is the activation's shape, `topk × inter`).
+/// Three arms take turns within every round on the same experts:
+///   P  the step: gate|up (the pair, expert order), `silu_mul` as the step
+///      launches it (`testing::routed_swiglu`), down
+///   Z  the same with no GLU launch, down reading the gate half: the most an
+///      epilogue on gate|up can save, since it still computes the product
+///   C  the composed `silu` then `mul`, two launches: the positive control.
+///      `expert-streaming.md` §20.15d measured removing that second launch
+///      at about 6 µs a layer on the token.
+/// GPU µs per routed layer from the profiler's busy union over a batch, the
+/// per-round differences' median and how many rounds share its sign; the
+/// token's price is the GLU's difference times the family's MoE layers,
+/// against #749 P33's 0.4 ms bar.
+#[test]
+#[ignore]
+fn routed_glu_launch_price() {
+    use lloom_tensor::kernels::metal::profile;
+    use lloom_tensor::quantized::{MoeArm, PairOrder};
+    let dev = Device::new_metal(0).unwrap();
+    assert!(
+        profile::enabled(),
+        "run with CANDLE_METAL_PROFILE=1: the GPU time is the profiler's"
+    );
+    let rounds = std::env::var("QWEN4EXP_CHAIN_ROUNDS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(12);
+    let cycle = 6usize;
+    let n_experts = 16usize;
+    // (family, hidden, inter, topk, MoE layers a token)
+    let families = [
+        ("qwen4exp-flash-next", 2560usize, 640usize, 10usize, 48usize),
+        ("qwen3.5-moe-35b-a3b", 2048, 512, 8, 40),
+    ];
+    let stack = |out: usize, inp: usize| -> Arc<QTensor> {
+        let w = Tensor::randn(0f32, 0.05, (n_experts, out, inp), &dev).unwrap();
+        let dt = if inp.is_multiple_of(256) {
+            GgmlDType::Q4K
+        } else {
+            GgmlDType::Q8_0
+        };
+        Arc::new(QTensor::quantize(&w, dt).unwrap())
+    };
+    for (family, hidden, inter, topk, moe_layers) in families {
+        let layers: Vec<(Arc<QTensor>, Arc<QTensor>, Arc<QTensor>)> = (0..cycle)
+            .map(|_| {
+                (
+                    stack(inter, hidden),
+                    stack(inter, hidden),
+                    stack(hidden, inter),
+                )
+            })
+            .collect();
+        let ids_v: Vec<u32> = (0..topk as u32)
+            .map(|i| (i * 5 + 1) % n_experts as u32)
+            .collect();
+        let ids = Tensor::from_vec(ids_v, (1, topk), &dev).unwrap();
+        let x0 = Tensor::randn(0f32, 1.0, (1, 1, hidden), &dev).unwrap();
+        let layer = |arm: char, act: DType, l: usize, x: &Tensor| -> Tensor {
+            let (g, u, d) = &layers[l];
+            let xin = x.to_dtype(act).unwrap();
+            let (gg, uu) = g
+                .indexed_moe_forward_pair_in(u, &xin, &ids, MoeArm::MatVec, act, PairOrder::Expert)
+                .unwrap();
+            let h = match arm {
+                'P' => lloom::models::qwen4exp::testing::routed_swiglu(&gg, &uu).unwrap(),
+                'C' => (lloom::nn::ops::silu(&gg).unwrap() * uu).unwrap(),
+                _ => gg,
+            };
+            let y = d
+                .indexed_moe_forward_with(&h, &ids, MoeArm::MatVec)
+                .unwrap();
+            (y.sum_keepdim(1).unwrap().to_dtype(DType::F32).unwrap() * 1e-3).unwrap()
+        };
+        for act in [DType::F16, DType::F32] {
+            let arms = ['P', 'Z', 'C'];
+            let iters = 4 * cycle;
+            let batch = |arm: char| -> f64 {
+                let mut x = x0.clone();
+                for i in 0..2 * cycle {
+                    x = layer(arm, act, i % cycle, &x);
+                }
+                dev.synchronize().unwrap();
+                profile::reset();
+                for i in 0..iters {
+                    x = layer(arm, act, i % cycle, &x);
+                }
+                dev.synchronize().unwrap();
+                profile::snapshot().gpu_busy_union_s * 1e6 / iters as f64
+            };
+            let warm = Instant::now();
+            while warm.elapsed().as_secs_f64() < 1.0 {
+                batch('P');
+            }
+            let mut per: std::collections::BTreeMap<char, Vec<f64>> = Default::default();
+            for r in 0..rounds {
+                let mut order: Vec<char> = arms
+                    .iter()
+                    .cycle()
+                    .skip(r % arms.len())
+                    .take(arms.len())
+                    .cloned()
+                    .collect();
+                if r % 2 == 1 {
+                    order.reverse();
+                }
+                for &arm in &order {
+                    per.entry(arm).or_default().push(batch(arm));
+                }
+                println!(
+                    "GLUPRICE family={family} act={act:?} round={r} {}",
+                    order
+                        .iter()
+                        .map(|a| format!("{a}={:.2}", per[a].last().unwrap()))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                );
+            }
+            let med = |v: &[f64]| {
+                let mut s = v.to_vec();
+                s.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                (s[(s.len() - 1) / 2] + s[s.len() / 2]) / 2.0
+            };
+            let diff = |a: char, b: char| -> (f64, usize) {
+                let d: Vec<f64> = per[&a].iter().zip(&per[&b]).map(|(x, y)| x - y).collect();
+                let m = med(&d);
+                (m, d.iter().filter(|v| v.signum() == m.signum()).count())
+            };
+            let (glu, glu_n) = diff('P', 'Z');
+            let (ctl, ctl_n) = diff('C', 'P');
+            let per_token_ms = glu * moe_layers as f64 / 1e3;
+            println!(
+                "GLUPRICE family={family} act={act:?} rounds={rounds} P={:.2} Z={:.2} C={:.2} \
+                 glu_us_per_layer={glu:.2} ({glu_n}/{rounds} one sign) control_C_minus_P_us={ctl:.2} \
+                 ({ctl_n}/{rounds}) moe_layers={moe_layers} per_token_ms={per_token_ms:.3} bar_ms=0.4 clears={}",
+                med(&per[&'P']),
+                med(&per[&'Z']),
+                med(&per[&'C']),
+                if per_token_ms >= 0.4 { "yes" } else { "no" }
+            );
+        }
+    }
+}

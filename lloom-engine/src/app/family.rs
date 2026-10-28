@@ -938,22 +938,26 @@ mod tests {
                 shape: auto,
             })
             .unwrap();
-        let mut spec = shape();
-        spec.speculative.method = "dspark".into();
-        assert!(family
-            .resolve(&Requested {
-                model: &model,
-                shape: spec
-            })
-            .is_err());
-        let mut executor = shape();
-        executor.executor.replay = true;
-        assert!(family
-            .resolve(&Requested {
-                model: &model,
-                shape: executor
-            })
-            .is_err());
+        // Every unvalidated arm is refused, each by the family's name.
+        type Arm = fn(&mut Shape);
+        let arms: [(&str, Arm); 4] = [
+            ("dspark", |s| s.speculative.method = "dspark".into()),
+            ("arena", |s| s.executor.arena = true),
+            ("packed", |s| s.executor.packed = true),
+            ("replay", |s| s.executor.replay = true),
+        ];
+        for (arm, set) in arms {
+            let mut s = shape();
+            set(&mut s);
+            let err = family
+                .resolve(&Requested {
+                    model: &model,
+                    shape: s,
+                })
+                .expect_err(arm)
+                .to_string();
+            assert!(err.contains("lfm2_moe"), "{arm}: {err}");
+        }
         std::fs::write(dir.join("config.json"), br#"{"model_type":"lfm2"}"#).unwrap();
         assert_eq!(detect(&dir).unwrap().0.name(), "lfm2");
         assert!(LFM2_CAPABILITIES.eos_gate);

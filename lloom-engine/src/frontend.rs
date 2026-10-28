@@ -127,12 +127,8 @@ impl When {
                     && o.scheduler.max_sequences > 1
                     && o.scheduler.max_sequences <= o.tuning.gemm.f16_rows_max
             }
-            // Reads the GGUF header once per resolution, never per token.
             When::Qwen4Exp => {
-                When::Metal.holds(o)
-                    && o.load.model.as_deref().is_some_and(|p| {
-                        crate::app::family::detect(p).is_ok_and(|(f, _)| f.name() == "qwen4exp")
-                    })
+                When::Metal.holds(o) && o.load.model.as_deref().is_some_and(is_qwen4exp)
             }
         }
     }
@@ -152,6 +148,21 @@ impl When {
             }
             When::Qwen4Exp => "the model is Qwen4-exp, on Metal",
         }
+    }
+}
+
+/// Whether the loader dispatches `path` to Qwen4-exp (`app::family::detect`):
+/// it reads the GGUF header, once per resolution, never per token. A build
+/// without `serve` has no loader and no front-end, so nothing is.
+fn is_qwen4exp(path: &std::path::Path) -> bool {
+    #[cfg(feature = "serve")]
+    {
+        crate::app::family::detect(path).is_ok_and(|(f, _)| f.name() == "qwen4exp")
+    }
+    #[cfg(not(feature = "serve"))]
+    {
+        let _ = path;
+        false
     }
 }
 

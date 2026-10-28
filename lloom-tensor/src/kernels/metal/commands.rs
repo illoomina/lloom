@@ -1622,7 +1622,7 @@ impl Commands {
                 ))?;
             *executor = Some(self.executor());
             let executor = executor.as_ref().expect("executor staged above");
-            if self.core.hold.is_some() && !executor.is_classical() {
+            if self.core.kind == CommandBufferKind::Unretained && !executor.is_classical() {
                 // An executor's indirect command buffers and the buffers
                 // their ranges keep resident are its own, replaced as it
                 // records; nothing holds them for a command buffer that does

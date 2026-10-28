@@ -3,13 +3,15 @@
 //! model's logits bit for bit (issue #749, §20.4a's A/B, correctness only).
 #![cfg(feature = "metal")]
 
+use lloom::generation::{Blocking, LogitsProcessor, Sampling};
 use lloom::models::qwen4exp::testing;
 use lloom::models::qwen4exp::{
-    set_prefill_chunk, set_prefill_pair, set_prefill_tiles, Config, Qwen4Exp, Streamed,
-    DEFAULT_PREFILL_TILES, PREFILL_CHUNK,
+    forward_tile, pipelined_passes, set_prefill_chunk, set_prefill_pair, set_prefill_pair_forward,
+    set_prefill_tiles, Config, Qwen4Exp, Streamed, DEFAULT_PREFILL_TILES, PREFILL_CHUNK,
 };
 use lloom::nn::expert_stream::{ExpertSource, LoaderArm};
 use lloom::nn::model::CausalLM;
+use lloom::nn::{DecodeOptions, IdentityProposer, Session};
 use lloom::profile::CrownExact;
 use lloom_tensor::kernels::metal::io_queue::IoQueue;
 use lloom_tensor::quantized::gguf_file::{self, Content};
@@ -276,5 +278,72 @@ fn paired_prefill_matches_chunk_after_chunk_on_metal() -> Result<()> {
         );
     }
     std::fs::remove_file(&path).ok();
+    Ok(())
+}
+
+/// `prefill.pair_forward` under the decode driver (`Session::decode`): a
+/// driver tile of one chunk never pairs, because `forward_embeds` pairs only
+/// within a forward; widened to two chunks a forward (`forward_tile`) the
+/// same prompt runs a pipelined pass, and the run's ids are the one-tile
+/// run's. The counts are the reach: 0 pipelined passes against at least 1.
+#[test]
+fn the_paired_forward_engages_the_pair_under_the_driver() -> Result<()> {
+    let _knobs = KNOBS.lock().unwrap_or_else(|e| e.into_inner());
+    let dev = Device::new_metal(0)?;
+    let mut cfg = Config::tiny();
+    cfg.n_experts = 12;
+    cfg.n_experts_per_tok = 3;
+    cfg.moe_intermediate_size = 32;
+    let path = std::env::temp_dir().join(format!("lloom-1108-pairfwd-{}.gguf", std::process::id()));
+    write_checkpoint(&cfg, &path)?;
+    // Chunks of 3 over an 8-token prompt: one chunk a forward is (3)(3)(2);
+    // two a forward is (3, 3 paired)(2).
+    set_prefill_chunk(3);
+    set_prefill_pair(true);
+    set_prefill_tiles(DEFAULT_PREFILL_TILES);
+    let prompt: Vec<u32> = vec![3, 5, 2, 8, 8, 1, 9, 4];
+    let run = |tile: usize| -> Result<(Vec<u32>, u64)> {
+        let model = streamed(&cfg, &path, 5, LoaderArm::Pread, &dev)?;
+        let mut session = Session::new(&model, model.new_cache(&cfg, &dev)?);
+        let mut rb = Blocking::new(&[u32::MAX], &dev)?;
+        let mut sampler = LogitsProcessor::from_sampling(0, Sampling::ArgMax);
+        let mut spec = IdentityProposer;
+        let mut opts = DecodeOptions::new(5);
+        opts.prefill_tile = tile;
+        let before = pipelined_passes();
+        let out = session.decode(
+            &mut spec,
+            &mut rb,
+            &mut sampler,
+            &prompt,
+            &opts,
+            &mut |_: &[u32]| Ok(()),
+        )?;
+        Ok((out.ids, pipelined_passes() - before))
+    };
+    set_prefill_pair_forward(false);
+    let off = forward_tile(3);
+    let (one, one_passes) = run(off)?;
+    set_prefill_pair_forward(true);
+    let on = forward_tile(3);
+    let edges = (forward_tile(0), forward_tile(2), forward_tile(4));
+    let (two, two_passes) = run(on)?;
+    set_prefill_pair_forward(false);
+    set_prefill_chunk(PREFILL_CHUNK);
+    set_prefill_pair(lloom::models::qwen4exp::DEFAULT_PREFILL_PAIR);
+    std::fs::remove_file(&path).ok();
+    assert_eq!((off, on), (3, 6), "the arm widens one chunk to two");
+    assert_eq!(
+        edges,
+        (0, 2, 4),
+        "only a tile of exactly one chunk is widened"
+    );
+    assert!(
+        one.iter().any(|&t| t != one[0]),
+        "a degenerate stream: {one:?}"
+    );
+    assert_eq!(one_passes, 0, "one chunk a forward must never pair");
+    assert!(two_passes >= 1, "two chunks a forward must pair");
+    assert_eq!(one, two, "the paired forward changed the run's ids");
     Ok(())
 }

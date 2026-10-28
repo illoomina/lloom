@@ -763,12 +763,66 @@ fn mixed_native_model_matches_rounded_cpu_weights_and_repeats() -> Result<()> {
 #[cfg(feature = "metal")]
 #[test]
 fn mixed_native_step_dispatches_the_families_in_its_walk() -> Result<()> {
-    use lloom::optimizer::{census_of_labels, walk_at};
+    mixed_native_census_at(true)
+}
+
+#[cfg(feature = "metal")]
+#[test]
+fn mixed_native_step_dispatches_the_families_in_its_walk_with_silu_mul_off() -> Result<()> {
+    mixed_native_census_at(false)
+}
+
+/// Each decode step's device census, in the IR's families, held to the walk
+/// at that position as `lfm2_walk_census.rs` holds dense LFM2's: composed
+/// under the arm's policy, where `kernels.fusion.silu_mul` (read once per
+/// process, so each arm is its own test) lets the dense MLP's SiLU and
+/// product run as `silu_mul`. The routed experts' `silu_mul` is in the walk
+/// itself. Each arm also pins which form the dense MLP ran.
+#[cfg(feature = "metal")]
+fn mixed_native_census_at(silu_mul: bool) -> Result<()> {
+    use lloom::models::lfm2::{FusionPolicy, GateFusion};
+    use lloom::optimizer::{census_of_labels, derive, walk_at, NumericClass, Policy};
     std::env::set_var("CANDLE_METAL_PROFILE", "1");
+    let mut t = lloom::tuning::Tuning::default();
+    t.from_env().expect("the tuning's environment");
+    t.lfm2.skip_silu_mul = !silu_mul;
+    assert!(
+        lloom::tuning::install(t).is_ok(),
+        "the tuning was read before the arm was installed"
+    );
     let dev = Device::new_metal(0)?;
     let ckpt = TinyCheckpoint::<Lfm2MoeTiny>::template().with_dtype(DType::F16);
+    let cfg = &ckpt.cfg;
+    assert_eq!(
+        cfg.fusion,
+        FusionPolicy::Manual,
+        "the policy below is the manual arm's"
+    );
+    let mut excluded = Vec::new();
+    for (on, name) in [
+        (cfg.gemv_silu, "silu"),
+        (cfg.gemv_residual, "residual"),
+        (cfg.gemv_gate == GateFusion::Mul, "mul"),
+        (cfg.gemv_gate == GateFusion::Swiglu, "swiglu"),
+        (false, "norm"),
+    ] {
+        if !on {
+            excluded.push(name.to_string());
+        }
+    }
+    let policy = Policy {
+        excluded,
+        barrier_model: None,
+        budget: NumericClass::Rounding,
+        unavailable: lloom::optimizer::fragments::kernels()
+            .into_iter()
+            .filter(|k| !(silu_mul && k.family == "silu_mul"))
+            .map(|k| (k.name.to_string(), "no LFM2 switch".to_string()))
+            .collect(),
+        ..Policy::default()
+    };
     let model = ckpt.model::<CrownExact>(&dev)?;
-    let mut state = State::<CrownExact>::new(true, DType::F16, &ckpt.cfg, &dev)?;
+    let mut state = State::<CrownExact>::new(true, DType::F16, cfg, &dev)?;
     let _ = model.forward(&Tensor::new(&[[1u32, 2, 3]], &dev)?, 0, &mut state)?;
     dev.synchronize()?;
     for pos in 3..6 {
@@ -781,9 +835,18 @@ fn mixed_native_step_dispatches_the_families_in_its_walk() -> Result<()> {
         dev.synchronize()?;
         let labels = window.close();
         let ran = census_of_labels(labels.iter().map(|(label, count)| (label.as_str(), *count)));
-        let walked = walk_at(&model, pos).census();
-        eprintln!("lfm2_moe position={pos} walked={walked:?} ran={ran:?} labels={labels:?}");
+        let walked = derive(&walk_at(&model, pos), &policy)?.graph.census();
+        eprintln!(
+            "lfm2_moe silu_mul={silu_mul} position={pos} walked={walked:?} ran={ran:?} labels={labels:?}"
+        );
         assert_eq!(walked, ran, "position {pos}: actual family census != Visit");
+        // The routed experts never take a bare SiLU; the dense MLP does
+        // exactly when the switch is off.
+        assert_eq!(
+            ran.contains_key("silu"),
+            !silu_mul,
+            "position {pos}: the dense MLP's SiLU form under silu_mul={silu_mul}"
+        );
     }
     Ok(())
 }

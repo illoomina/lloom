@@ -227,7 +227,7 @@ pub const QWEN3_5_CAPABILITIES: Capabilities = Capabilities {
     vision: false,
     vision_missing: "no vision tower is built for Qwen3.5 (the text path only; its tower is #765's lineage)",
     eos_gate: false,
-    eos_gate_missing: "an arm here until its real-model gates are run (`models.qwen3_5.eos_gate`, #993's arm B); the standing window undoes the fixed cadence's forward instead",
+    eos_gate_missing: "the `models.qwen3_5.eos_gate` arm is off (chat and serve turn it on on Metal); without it the standing window undoes one forward past an EOS, and a deeper overrun is put back at a turn checkpoint, or the session reset",
 };
 
 /// Qwen3.5's capabilities with the EOS gate as the `models.qwen3_5.eos_gate`

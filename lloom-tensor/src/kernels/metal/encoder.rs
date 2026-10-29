@@ -1,7 +1,7 @@
 use crate::kernels::metal::{
     arena,
-    escape,
     contention::{Censused, Side},
+    escape,
     executor::{DispatchAction, DispatchRecord, ExecutorSlot, Grid},
     late_bind, trace, Buffer, ComputePipeline, DeviceListing, Fence,
 };

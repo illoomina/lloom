@@ -25,10 +25,7 @@ fn device() -> (Device, MetalDevice) {
 
 /// Key A: two allocations, `[N]` f32 each. `y` is the second (ordinal 1).
 fn key_a() -> PassKey {
-    PassKey::new(PassKind::Prefill {
-        w: 8,
-        fresh: false,
-    })
+    PassKey::new(PassKind::Prefill { w: 8, fresh: false })
 }
 
 /// Key B: three small allocations, so its plan's slots end below A's `y`.
@@ -64,7 +61,10 @@ fn warm_a(m: &MetalDevice, x: &Tensor) {
     for k in 0..4 {
         drop(pass_a(m, x, k as f64));
     }
-    assert!(m.pass_plan_cached(&key_a()), "A must be planned before the test");
+    assert!(
+        m.pass_plan_cached(&key_a()),
+        "A must be planned before the test"
+    );
 }
 
 /// The control: a served output dropped before the next pass opens is no
@@ -143,7 +143,10 @@ fn a_value_used_after_a_later_pass_is_found_without_a_layout_collision() {
     // Before any later pass: not an escape.
     assert_eq!(held.to_vec1::<f32>().unwrap(), want_a(30.0));
     let before = m.pass_plan_counters().unwrap();
-    assert_eq!(before.escapes_used, 0, "a read before the next pass is not a use");
+    assert_eq!(
+        before.escapes_used, 0,
+        "a read before the next pass is not a use"
+    );
     pass_b(&m, &s);
     let after_b = m.pass_plan_counters().unwrap();
     assert_eq!(held.to_vec1::<f32>().unwrap(), want_a(30.0));
@@ -258,8 +261,14 @@ fn a_carried_value_dropped_inside_the_next_pass_frees_its_bytes() {
     assert_eq!(got, want_a(81.0));
     let c = m.pass_plan_counters().unwrap();
     println!("{c:?}");
-    assert_eq!(c.undeclared_escapes, 0, "the slot was served once the holder was gone");
-    assert_eq!(c.escapes_used, 0, "the bind was the new value's, not the dead one's");
+    assert_eq!(
+        c.undeclared_escapes, 0,
+        "the slot was served once the holder was gone"
+    );
+    assert_eq!(
+        c.escapes_used, 0,
+        "the bind was the new value's, not the dead one's"
+    );
 }
 
 /// The site that makes a named producer is taken the next time its key

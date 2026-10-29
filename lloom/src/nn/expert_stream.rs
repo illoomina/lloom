@@ -204,6 +204,21 @@ pub trait ExpertResidency {
         act: DType,
     ) -> Result<(Tensor, Tensor)>;
 
+    /// `silu(g) · u` of [`Self::gate_up`]'s halves in one launch, where the
+    /// strategy's pair is one launch (`QTensor::indexed_moe_forward_glu_as`):
+    /// the bits `gate_up` then `silu_mul` give. `None` when it does not serve
+    /// this call; the caller then runs `gate_up` and its own SwiGLU. A
+    /// strategy without the launch answers `None`.
+    fn gate_up_glu(
+        &self,
+        _x: &Tensor,
+        _slot_ids: &Tensor,
+        _arm: MoeArm,
+        _act: DType,
+    ) -> Result<Option<Tensor>> {
+        Ok(None)
+    }
+
     /// `down` projection of `h [rows, topk, n_ff]` through `slot_ids`:
     /// `[rows, topk, hidden]`, on the tile's `arm` as [`Self::gate_up`].
     fn down(&self, h: &Tensor, slot_ids: &Tensor, arm: MoeArm) -> Result<Tensor>;
@@ -524,6 +539,17 @@ impl ExpertResidency for Resident {
         // One launch for the pair on the matmul-vec arm on Metal; two elsewhere.
         self.gate
             .indexed_moe_forward_pair_as(&self.up, x, ids, arm, act)
+    }
+    #[inline]
+    fn gate_up_glu(
+        &self,
+        x: &Tensor,
+        ids: &Tensor,
+        arm: MoeArm,
+        act: DType,
+    ) -> Result<Option<Tensor>> {
+        self.gate
+            .indexed_moe_forward_glu_as(&self.up, x, ids, arm, act)
     }
     #[inline]
     fn down(&self, h: &Tensor, ids: &Tensor, arm: MoeArm) -> Result<Tensor> {
@@ -4804,6 +4830,28 @@ impl ExpertResidency for Streamed {
         // H1 (§4.7): the slots this plan reads are stamped with the open
         // epoch at the dispatch, so a load never writes one under it.
         self.stamp_device_plan_readers(&mut inner);
+        Ok(out)
+    }
+
+    fn gate_up_glu(
+        &self,
+        x: &Tensor,
+        slot_ids: &Tensor,
+        arm: MoeArm,
+        act: DType,
+    ) -> Result<Option<Tensor>> {
+        let mut inner = self.inner.lock();
+        let out = inner.pools[0].qt.indexed_moe_forward_glu_as(
+            &inner.pools[1].qt,
+            x,
+            slot_ids,
+            arm,
+            act,
+        )?;
+        // The slots it read, stamped as `gate_up` stamps them (H1, §4.7).
+        if out.is_some() {
+            self.stamp_device_plan_readers(&mut inner);
+        }
         Ok(out)
     }
 

@@ -160,6 +160,10 @@ pub struct MoeLayer<P: Profile, R: ExpertResidency> {
     /// combine on the f16 routed output, as the f32 step does
     /// (`qwen4exp.f16_fuse`); off, `silu` + multiply and a cast to f32.
     f16_fuse: bool,
+    /// The routed SwiGLU in the gate|up launch's store, where the pair is
+    /// one launch and `routed_swiglu` would run `silu_mul`
+    /// (`kernels.fusion.routed_glu`).
+    routed_glu: bool,
     /// Whether an f16 routed step reads its f32 activation in gate|up,
     /// rounded to half on load (`qwen4exp.f16_fold`); off, a cast launch
     /// first. The same bits either way.
@@ -289,6 +293,7 @@ impl<P: Profile, R: ExpertResidency> MoeLayer<P, R> {
             moe_intermediate_size: geo.moe_intermediate_size,
             routed_act: DType::F32,
             f16_fuse: crate::tuning::tuning().qwen4exp.f16_fuse,
+            routed_glu: crate::tuning::tuning().qwen4exp.routed_glu,
             f16_fold: crate::tuning::tuning().qwen4exp.f16_fold,
             shared_store: crate::tuning::tuning().qwen4exp.shared_store,
             probe_ids: std::sync::Arc::new(parking_lot::Mutex::new(None)),
@@ -327,6 +332,12 @@ impl<P: Profile, R: ExpertResidency> MoeLayer<P, R> {
     /// read (see the field); the tuning's `qwen4exp.f16_fuse` by default.
     pub fn set_f16_fuse(&mut self, on: bool) {
         self.f16_fuse = on;
+    }
+
+    /// The routed SwiGLU in the gate|up launch's store (see the field); the
+    /// tuning's `qwen4exp.routed_glu` by default.
+    pub fn set_routed_glu(&mut self, on: bool) {
+        self.routed_glu = on;
     }
 
     /// Select whether the shared expert's SwiGLU rides its projections'
@@ -694,8 +705,7 @@ impl<P: Profile, R: ExpertResidency> MoeLayer<P, R> {
     fn routed_one_group(&self, x3: &Tensor, slot_ids: &Tensor) -> Result<Tensor> {
         let arm = MoeArm::for_rows(x3.dim(0)?);
         let act = self.tile_act(x3.dim(0)?);
-        let (g, u) = self.experts.gate_up(x3, slot_ids, arm, act)?;
-        let h = self.routed_swiglu(&g, &u)?;
+        let h = self.routed_gate_up_swiglu(x3, slot_ids, arm, act, false)?;
         self.experts.down(&h, slot_ids, arm)
     }
 
@@ -754,10 +764,7 @@ impl<P: Profile, R: ExpertResidency> MoeLayer<P, R> {
             } else {
                 x3.narrow(0, group.rows.start, group.rows.len())?
             };
-            let (g, u) = self.experts.gate_up(&xg, &slot_ids, arm, act)?; // [rows, topk, n_ff] each
-            super::trace("moe.g", usize::MAX, &g);
-            super::trace("moe.u", usize::MAX, &u);
-            let h = self.routed_swiglu(&g, &u)?;
+            let h = self.routed_gate_up_swiglu(&xg, &slot_ids, arm, act, true)?; // [rows, topk, n_ff]
             ys[gi] = Some(self.experts.down(&h, &slot_ids, arm)?); // [rows, topk, hidden]
         }
         let mut ys: Vec<Tensor> = ys
@@ -769,6 +776,38 @@ impl<P: Profile, R: ExpertResidency> MoeLayer<P, R> {
         } else {
             Tensor::cat(&ys, 0)
         }
+    }
+
+    /// The routed experts' `silu(g) · u` for `x` through `slot_ids`: under
+    /// `routed_glu`, the gate|up launch with the SwiGLU on its store wherever
+    /// `routed_swiglu` would run `silu_mul` (so the bits are that path's);
+    /// otherwise `gate_up` then `routed_swiglu`. `traced`: the host plan's
+    /// `QWEN4EXP_TRACE` points (a readback each; the device plan has none).
+    fn routed_gate_up_swiglu(
+        &self,
+        x: &Tensor,
+        slot_ids: &Tensor,
+        arm: MoeArm,
+        act: DType,
+        traced: bool,
+    ) -> Result<Tensor> {
+        if self.routed_glu
+            && (act != DType::F16 || self.f16_fuse)
+            && super::kernels::silu_mul_applies(act)
+        {
+            if let Some(h) = self.experts.gate_up_glu(x, slot_ids, arm, act)? {
+                if traced {
+                    super::trace("moe.h", usize::MAX, &h);
+                }
+                return Ok(h);
+            }
+        }
+        let (g, u) = self.experts.gate_up(x, slot_ids, arm, act)?; // [rows, topk, n_ff] each
+        if traced {
+            super::trace("moe.g", usize::MAX, &g);
+            super::trace("moe.u", usize::MAX, &u);
+        }
+        self.routed_swiglu(&g, &u)
     }
 
     /// `silu(g) · u` over the routed experts' gate|up: one launch at f32,

@@ -446,21 +446,6 @@ kernel void moe_topk_f32(
   }
 }
 
-// One element of `silu(g) · u` at `T`, with `utils.metal`'s `silu<T>`.
-template <typename T>
-METAL_FUNC T silu_times(T g, T u) {
-  return static_cast<T>(silu(g) * u);
-}
-
-// At half the product must round the SiLU `silu_f16` stored: left to
-// reassociate, fast math folds the SiLU's division into the multiply and
-// lands one ulp away on about one element in six.
-template <>
-METAL_FUNC half silu_times(half g, half u) {
-  #pragma clang fp reassociate(off)
-  return static_cast<half>(silu(g) * u);
-}
-
 // `out = silu(g) · u`, elementwise (the routed experts' SwiGLU and the shared
 // expert's): two launches into one, at `T`, so the f16 form is `silu_f16`
 // then `bmul_f16` bit for bit.

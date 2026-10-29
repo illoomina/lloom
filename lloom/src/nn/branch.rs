@@ -1,7 +1,7 @@
 //! Request-owned causal branching over the incumbent paced prefill loop.
 
 use super::decode::{
-    begin_pass, end_executor_step, end_pass, ragged_layout, DecodeOptions, PassShape, PrefillOut,
+    end_executor_step, ragged_layout, DecodeOptions, OpenPass, PassShape, PrefillOut,
 };
 use super::model::{BatchedCausalLM, CacheReset, CausalLM, RaggedRow};
 use super::speculator::Session;
@@ -175,9 +175,9 @@ where
             pieces: u16::try_from(group.len()).map_err(lloom_tensor::Error::wrap)?,
             layout: ragged_layout(group.iter().map(|s| (s.len(), trunk.pos() == 0))),
         };
-        begin_pass(&device, shape)?;
+        let pass = OpenPass::begin(&device, shape)?;
         let logits = model.forward_ragged(&tokens, &mut rows)?;
-        end_pass(&device)?;
+        pass.finish()?;
         drop(rows);
         for cache in &mut caches {
             model.settle_pending(cache)?;

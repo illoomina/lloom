@@ -41,6 +41,7 @@ const KEEP_WARM: &str = "the maintainer's choice on PR1087 (#1076, 2026-10-23): 
 const DECODE_ROWS: &str = "the library's value of the batched decode rows' arm, a key the option tree did not have, which decision 54 (#1084) turns on where a batched loop runs on Metal";
 const RESIDENCY_ATTACH: &str = "the library's value of the device set's attachment, a key the option tree did not have, which decision 56 (#1092) detaches from the Metal 3 queue on chat and serve";
 const KEEP_WARM_PRESSURE: &str = "the library's value of the keep-warm's pressure stop, a key the option tree did not have, which decision 57 (#1092) turns on where serve's keep-warm runs by default";
+const RESIDENCY_METAL4: &str = "the library's value of what a Metal 4 command buffer declares resident, a key the option tree did not have, which decision 62 (#1092) moves to queue-diff for Qwen4-exp on chat and serve";
 const ROWS_MAX: &str = "the library's ceiling of the f16 row axis, a key the option tree did not have, which decision 60 (#1084) raises to 12 where the batched loops run on Metal";
 const CUT_HOLD: &str = "the library's value of the batched loop's counter cut on a decode-only step, a key the option tree did not have, which decision 71 (#1084) moves to all on LFM2 on serve and bench";
 const CHAT_SERVE: &[Frontend] = &[Frontend::Chat, Frontend::Serve];
@@ -169,6 +170,13 @@ const PINNED_ROWS: &[(&str, &[Frontend], When, &str, &str)] = &[
         When::Metal,
         "queue",
         RESIDENCY_ATTACH,
+    ),
+    (
+        "kernels.residency.metal4",
+        CHAT_SERVE,
+        When::Qwen4Exp,
+        "slots",
+        RESIDENCY_METAL4,
     ),
     (
         "kernels.attention.flash.partial_block",
@@ -348,7 +356,22 @@ fn batch_for(r: &frontend::Row) -> Vec<&'static str> {
         // No `--model`: the LFM2 snapshot, whose family takes the model axes.
         When::Always | When::Metal | When::ModelAxes | When::MetalSingle => vec![],
         When::DsparkSingle => vec!["--dspark"],
+        When::Qwen4Exp => vec!["--model", qwen4exp_placeholder()],
     }
+}
+
+/// A file the loader's dispatch names Qwen4-exp (a GGUF with no header,
+/// `family::detect`), made once a process; resolving reads only its header.
+fn qwen4exp_placeholder() -> &'static str {
+    static PATH: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
+    PATH.get_or_init(|| {
+        let dir =
+            std::env::temp_dir().join(format!("lloom-frontend-qwen4exp-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("placeholder.gguf");
+        std::fs::write(&file, "").unwrap();
+        Box::leak(file.display().to_string().into_boxed_str())
+    })
 }
 
 /// Each front-end resolves its own default of every key it resolves itself,
@@ -407,6 +430,7 @@ fn each_front_end_resolves_its_own_defaults_through_the_command_line() {
                             | When::DsparkSingle
                             | When::MetalSingle
                             | When::MetalBatched
+                            | When::Qwen4Exp
                     )
             }) {
                 assert!(
@@ -1101,8 +1125,8 @@ fn the_unset_defaults_are_the_trees_before_it_except_the_named_exceptions() {
     let decided: Vec<u32> = EXCEPTIONS.iter().map(|e| e.decision).collect();
     assert_eq!(
         decided,
-        [36, 43, 43, 43, 43, 35, 35, 52, 52, 54, 54, 56, 56, 57, 60, 60, 71, 71],
-        "the approved default changes: decision 36 (serve reuse), 43 (the gate and its cores arm, chat and serve), 35 (the lead, chat and serve), 52 (B = 1 DSpark's in-place KV, chat and serve), 54 (the batched decode rows on the row axis, serve and bench), 56 (the device set off the Metal 3 queue, chat and serve), 57 (the keep-warm's pressure stop, serve), 60 (the row axis's ceiling 12, serve and bench), 71 (LFM2's batched cut hold, serve and bench)"
+        [36, 43, 43, 43, 43, 35, 35, 52, 52, 54, 54, 56, 56, 57, 60, 60, 62, 62, 71, 71],
+        "the approved default changes: decision 36 (serve reuse), 43 (the gate and its cores arm, chat and serve), 35 (the lead, chat and serve), 52 (B = 1 DSpark's in-place KV, chat and serve), 54 (the batched decode rows on the row axis, serve and bench), 56 (the device set off the Metal 3 queue, chat and serve), 57 (the keep-warm's pressure stop, serve), 60 (the row axis's ceiling 12, serve and bench), 62 (Qwen4-exp's device sets on the Metal 4 queue, chat and serve), 71 (LFM2's batched cut hold, serve and bench)"
     );
     // 4. Decision 44: the EOS watch stays opt-in on every front-end.
     // Decisions 43/35 (2026-10-19): the gate, its cores arm and the lead of 4
@@ -1609,6 +1633,64 @@ fn serves_keep_warm_stands_down_under_memory_pressure_by_default() {
     assert_eq!(
         frontend::describe("server.keep_warm_pressure").unwrap(),
         "serve: true when on Metal at scheduler.max_sequences = 1 (decision 57: was false)"
+    );
+}
+
+/// Decision 62: chat and serve resolve what a Metal 4 command buffer declares
+/// to `queue-diff` when `--model` is a Qwen4-exp checkpoint, on Metal, under
+/// either command-buffer API (Metal 3 has no slot sets, so the arm is inert
+/// there). LFM2 (no `--model`), bench, the CPU and every layer that names the
+/// key keep the library's `slots`, or the value named.
+#[test]
+fn chat_and_serve_declare_the_device_sets_on_the_metal4_queue_for_qwen4exp() {
+    let none = BTreeMap::new();
+    let key = "kernels.residency.metal4";
+    let qwen = qwen4exp_placeholder();
+    let get = |f: Frontend, argv: &[&str], env: &BTreeMap<String, String>| {
+        let mut full = vec!["--model", qwen];
+        full.extend_from_slice(argv);
+        at(&resolve(Some(f), f.name(), &full, env).unwrap(), key)
+    };
+    let metal = When::Metal.holds(&resolve(Some(Frontend::Serve), "serve", &[], &none).unwrap());
+    let (diff, slots) = (typed(key, "queue-diff"), typed(key, "slots"));
+    assert_eq!(
+        at(&EngineOptions::default(), key),
+        slots,
+        "the library's value"
+    );
+    let default = if metal { &diff } else { &slots };
+    for &f in CHAT_SERVE {
+        let name = f.name();
+        assert_eq!(&get(f, &[], &none), default, "{name}");
+        for api in ["metal3", "metal4", "auto"] {
+            assert_eq!(
+                &get(f, &["--metal-api", api], &none),
+                default,
+                "{name} --metal-api {api}"
+            );
+        }
+        assert_eq!(get(f, &["--cpu"], &none), slots, "{name} on the CPU");
+        let lfm2 = resolve(Some(f), name, &[], &none).unwrap();
+        assert_eq!(at(&lfm2, key), slots, "{name} on LFM2");
+        for (argv, named) in [
+            (&["--residency-metal4", "slots"][..], "slots"),
+            (&["--set", "kernels.residency.metal4=slots"], "slots"),
+            (&["--residency-metal4", "cb-diff"], "cb-diff"),
+        ] {
+            assert_eq!(
+                get(f, argv, &none),
+                typed(key, named),
+                "{name}: named {argv:?}"
+            );
+        }
+        let env = BTreeMap::from([("LLOOM_RESIDENCY_METAL4".to_string(), "slots".to_string())]);
+        assert_eq!(get(f, &[], &env), slots, "{name}: the opt-out by env");
+    }
+    assert_eq!(get(Frontend::Bench, &[], &none), slots, "bench");
+    assert_eq!(
+        frontend::describe(key).unwrap(),
+        "chat: queue-diff when the model is Qwen4-exp, on Metal (decision 62: was slots), \
+         serve: queue-diff when the model is Qwen4-exp, on Metal (decision 62: was slots)"
     );
 }
 

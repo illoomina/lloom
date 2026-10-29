@@ -570,6 +570,17 @@ impl Device {
         None
     }
 
+    /// The Metal 4 slot census by the site that listed each allocation
+    /// (`kernels.residency.slot_trace`; empty off Metal 4, with the
+    /// instrument off, and without sites in a build without symbols).
+    pub fn metal4_slot_sites(&self) -> Vec<crate::residency_class::SlotSite> {
+        #[cfg(feature = "metal")]
+        if let Self::Metal(d) = self {
+            return d.metal4_slot_sites();
+        }
+        Vec::new()
+    }
+
     /// The residency set's attachment and size, for a loaded line (`None`
     /// off Metal).
     pub fn residency_line(&self) -> Option<String> {

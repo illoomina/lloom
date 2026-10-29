@@ -58,14 +58,36 @@ pub struct Buffer {
     /// experimental mapping policy, fixed at construction (see `new`).
     cpu_visible: bool,
 
-    /// Whether the device's residency sets list this allocation from before
-    /// it is handed out until its last GPU reader has completed: a pool's
-    /// buffer (it leaves the sets only on eviction from the free list) or a
-    /// heap chunk's sub-buffer (the chunk is listed for the heap's life).
+    /// Whether, and why, the device's residency sets list this allocation
+    /// from before it is handed out until its last GPU reader has completed.
     /// A Metal 4 slot set may leave such a binding to those sets
-    /// (`kernels.residency.metal4`, `tuning.md` §6.3p); false for anything
-    /// else, which the slot set lists itself.
-    device_listed: bool,
+    /// (`kernels.residency.metal4`, `tuning.md` §6.3p).
+    device_listed: DeviceListing,
+}
+
+/// Why the device's residency sets list an allocation until its last GPU
+/// reader completes (`invariants.md` §15.1r), or that nothing says so.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DeviceListing {
+    /// Not known to be: the Metal 4 slot set lists the binding itself.
+    #[default]
+    No,
+    /// A pool's buffer (it leaves the sets only on eviction from the free
+    /// list, after its epoch) or a heap chunk's sub-buffer (the chunk is
+    /// listed for the heap's life).
+    Pool,
+    /// A buffer outside every pool whose removal from the sets, and whose
+    /// membership record, wait in the in-flight hold for the epoch open at
+    /// its last handle's drop (`kernels.residency.metal4_cover = held`).
+    Held,
+}
+
+impl DeviceListing {
+    /// The device's sets list it until its last GPU reader completes.
+    #[inline]
+    pub fn covered(self) -> bool {
+        self != DeviceListing::No
+    }
 }
 
 // SAFETY: Native preserves Buffer's existing retained-MTLBuffer thread-safety
@@ -250,22 +272,30 @@ impl Buffer {
             base_offset: 0,
             length: None,
             cpu_visible,
-            device_listed: false,
+            device_listed: DeviceListing::No,
         }
     }
 
     /// Marks this allocation as listed by the device's residency sets until
-    /// its last GPU reader completes ([`Self::device_listed`]). For the
-    /// device's pool adoption of a fresh allocation from its own backings.
-    pub(crate) fn with_device_listing(mut self) -> Self {
-        self.device_listed = true;
+    /// its last GPU reader completes, for `why` ([`DeviceListing`]): the
+    /// device's pool adoption of a fresh allocation from its own backings,
+    /// or an unpooled buffer whose last drop goes to the in-flight hold.
+    pub(crate) fn with_device_listing(mut self, why: DeviceListing) -> Self {
+        self.device_listed = why;
         self
     }
 
-    /// See the field: a Metal 4 slot set may leave this binding to the
-    /// device's sets.
+    /// Whether a membership record lists this allocation in the device's
+    /// sets: every allocation a device backing published
+    /// (`DeviceBuffer::publish`), and a heap sub-buffer through its chunk's.
     #[inline]
-    pub(crate) fn device_listed(&self) -> bool {
+    pub(crate) fn listed_by_record(&self) -> bool {
+        self.membership().is_some()
+    }
+
+    /// Why the device's sets list this allocation, if they do.
+    #[inline]
+    pub(crate) fn device_listing(&self) -> DeviceListing {
         self.device_listed
     }
 

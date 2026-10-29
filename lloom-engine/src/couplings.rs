@@ -232,6 +232,15 @@ pub const COUPLINGS: &[Coupling] = &[
         site: "lloom-tensor/src/kernels/metal/residency_set.rs Metal4Declare::selected; lloom-tensor/src/kernels/metal/metal4.rs Queue::new, Slot::new; lloom-engine/src/frontend.rs When::Qwen4Exp",
         is_static: false,
     },
+    Coupling {
+        id: "C25",
+        kind: "resolves",
+        when: "decode.batched.cut_hold other than off, or the model is LFM2 on serve or bench",
+        effect: "whether the batched loop's decode-only forwards hold the counter cut off: ahead over a forward encoded ahead of the step's readback, all over every one, the blocking (sampled) arm too; a step that feeds prompt pieces keeps the period. serve and bench take all for LFM2 on Metal (decision 71), off elsewhere; at scheduler.max_sequences = 1 or on the CPU no batched loop cuts and the arm has no effect",
+        keys: &["decode.batched.cut_hold", "scheduler.max_sequences", "model.path", "backend.device"],
+        site: "lloom/src/nn/batched.rs BatchCutHold::{configured, hold}, BatchDecoder::step; lloom-engine/src/frontend.rs When::ModelAxes",
+        is_static: false,
+    },
 ];
 
 /// The couplings naming `key`.
@@ -438,6 +447,9 @@ pub fn explain(o: &EngineOptions) -> Vec<String> {
     if let Some(line) = metal4_declaration(o) {
         out.push(line);
     }
+    if let Some(line) = batched_cut_hold(o) {
+        out.push(line);
+    }
     let g = &o.tuning.gemm;
     let rows_cause = if o.tuning.contract.profile == "deterministic" {
         Some("determinism = deterministic")
@@ -563,6 +575,41 @@ fn metal4_declaration(o: &EngineOptions) -> Option<String> {
     Some(format!(
         "kernels.residency.metal4 -> {sets}, {lists}{default} <- kernels.residency.metal4 = \
          {arm} (C24)"
+    ))
+}
+
+/// The batched loop's counter cut as the options resolve it (`tuning.md`
+/// §13.5r); `None` at `off`, the library's value.
+fn batched_cut_hold(o: &EngineOptions) -> Option<String> {
+    let arm = o.tuning.ring.batched_cut_hold.as_str();
+    if arm == "off" {
+        return None;
+    }
+    if !cfg!(feature = "metal") || o.load.device == "cpu" {
+        return Some(format!(
+            "decode.batched.cut_hold = {arm} ignored <- the CPU backend (C25)"
+        ));
+    }
+    if o.scheduler.max_sequences <= 1 {
+        return Some(format!(
+            "decode.batched.cut_hold = {arm} ignored <- scheduler.max_sequences = 1: no batched \
+             loop runs (C25)"
+        ));
+    }
+    let held = if arm == "ahead" {
+        "a decode-only forward encoded ahead of the step's readback"
+    } else {
+        "every decode-only forward, the blocking arm too"
+    };
+    let default = if arm == "all" && crate::frontend::When::ModelAxes.holds(o) {
+        " (serve's and bench's default for LFM2 on Metal, decision 71)"
+    } else {
+        ""
+    };
+    Some(format!(
+        "decode.batched.cut_hold -> the batched loop holds the counter cut off over {held}; a \
+         step that feeds prompt pieces keeps the period{default} <- decode.batched.cut_hold = \
+         {arm} (C25)"
     ))
 }
 
@@ -1041,6 +1088,70 @@ mod tests {
                   buffer, each slot set listing every binding (a control) <- \
                   kernels.residency.metal4 = cb-full (C24)"
             ]
+        );
+    }
+    /// C25 at `off` says nothing; serve's and bench's default on LFM2 names
+    /// decision 71 at a batch and is named inert at one sequence; Qwen4-exp
+    /// and chat keep `off`; `ahead` is named as itself, and the CPU as the
+    /// reason the arm does nothing.
+    #[test]
+    fn c25_names_the_batched_cut_hold() {
+        use crate::frontend::{self, Frontend, When};
+        let c25 = |o: &EngineOptions| -> Vec<String> {
+            explain(o)
+                .into_iter()
+                .filter(|l| l.ends_with("(C25)"))
+                .collect()
+        };
+        assert!(c25(&EngineOptions::default()).is_empty(), "the library's");
+        let dir = std::env::temp_dir().join(format!("lloom-c25-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let qwen = dir.join("qwen4exp.gguf");
+        std::fs::write(&qwen, "").unwrap();
+        for f in Frontend::ALL {
+            for model in [None, Some(qwen.clone())] {
+                for batch in [1usize, 4] {
+                    let mut o = EngineOptions::default();
+                    o.load.model = model.clone();
+                    o.scheduler.max_sequences = batch;
+                    frontend::apply(&mut o, f, &Default::default(), &Default::default()).unwrap();
+                    let on = f != Frontend::Chat && model.is_none() && When::ModelAxes.holds(&o);
+                    let want: Vec<String> = match (on, batch) {
+                        (false, _) => vec![],
+                        (true, 1) => vec!["decode.batched.cut_hold = all ignored <- \
+                                           scheduler.max_sequences = 1: no batched loop runs (C25)"
+                            .into()],
+                        (true, _) => vec!["decode.batched.cut_hold -> the batched loop holds the \
+                                           counter cut off over every decode-only forward, the \
+                                           blocking arm too; a step that feeds prompt pieces keeps \
+                                           the period (serve's and bench's default for LFM2 on \
+                                           Metal, decision 71) <- decode.batched.cut_hold = all (C25)"
+                            .into()],
+                    };
+                    assert_eq!(c25(&o), want, "{} {model:?} at {batch}", f.name());
+                }
+            }
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+        let ahead = with(&[
+            ("decode.batched.cut_hold", "ahead"),
+            ("scheduler.max_sequences", "4"),
+        ]);
+        let want = if cfg!(feature = "metal") {
+            "decode.batched.cut_hold -> the batched loop holds the counter cut off over a \
+             decode-only forward encoded ahead of the step's readback; a step that feeds prompt \
+             pieces keeps the period <- decode.batched.cut_hold = ahead (C25)"
+        } else {
+            "decode.batched.cut_hold = ahead ignored <- the CPU backend (C25)"
+        };
+        assert_eq!(c25(&ahead), vec![want]);
+        assert_eq!(
+            c25(&with(&[
+                ("decode.batched.cut_hold", "all"),
+                ("scheduler.max_sequences", "4"),
+                ("backend.device", "cpu"),
+            ])),
+            vec!["decode.batched.cut_hold = all ignored <- the CPU backend (C25)"]
         );
     }
 }

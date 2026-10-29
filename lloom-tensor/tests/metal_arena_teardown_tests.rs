@@ -223,6 +223,16 @@ fn a_cleared_arenas_slots_are_not_handed_out_again() -> Result<()> {
         .base()
         .raw_addr();
 
+    // Kept alive to the end: a freed base's object address can be reused by a
+    // fresh allocation (when a hold frees it inside the loop below), which
+    // would read as aliasing; while the base lives, an equal address is a view
+    // of it.
+    let base_alive = metal
+        .arena()
+        .expect("install_arena just installed one")
+        .base()
+        .try_clone()
+        .expect("a clone of the base");
     metal.clear_arena();
 
     // A released buffer is *parked* until the epoch it was released in
@@ -260,6 +270,7 @@ fn a_cleared_arenas_slots_are_not_handed_out_again() -> Result<()> {
             b.base_offset()
         );
     }
+    drop(base_alive);
 
     Ok(())
 }

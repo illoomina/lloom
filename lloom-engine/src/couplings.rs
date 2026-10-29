@@ -224,6 +224,15 @@ pub const COUPLINGS: &[Coupling] = &[
         is_static: false,
     },
     Coupling {
+        id: "C24",
+        kind: "resolves",
+        when: "kernels.residency.metal4 other than slots, or the model is Qwen4-exp on chat or serve",
+        effect: "what a Metal 4 command buffer declares resident: the device's residency sets on the Metal 4 queue (queue-*) or used by each command buffer (cb-*), and under *-diff its slot set lists only what they do not cover. chat and serve take queue-diff for Qwen4-exp on Metal (decision 62), slots elsewhere; on Metal 3 there are no slot sets and the arm has no effect",
+        keys: &["kernels.residency.metal4", "backend.metal.command_buffer.api", "model.path"],
+        site: "lloom-tensor/src/kernels/metal/residency_set.rs Metal4Declare::selected; lloom-tensor/src/kernels/metal/metal4.rs Queue::new, Slot::new; lloom-engine/src/frontend.rs When::Qwen4Exp",
+        is_static: false,
+    },
+    Coupling {
         id: "C25",
         kind: "resolves",
         when: "decode.batched.cut_hold other than off, or the model is LFM2 on serve or bench",
@@ -435,6 +444,9 @@ pub fn explain(o: &EngineOptions) -> Vec<String> {
     if let Some(line) = residency_layout(&o.tuning.metal) {
         out.push(line);
     }
+    if let Some(line) = metal4_declaration(o) {
+        out.push(line);
+    }
     if let Some(line) = batched_cut_hold(o) {
         out.push(line);
     }
@@ -529,6 +541,40 @@ fn residency_layout(m: &lloom_tensor::tuning::MetalTuning) -> Option<String> {
         "kernels.residency -> {sets}, {attach} <- kernels.residency.set_cap_pct = {pct}, \
          kernels.residency.attach = {} (C21)",
         m.residency_attach
+    ))
+}
+
+/// What a Metal 4 command buffer declares resident as the options resolve it
+/// (`tuning.md` §6.3p); `None` at `slots`, the library's value.
+fn metal4_declaration(o: &EngineOptions) -> Option<String> {
+    let arm = o.tuning.metal.residency_metal4.as_str();
+    if arm == "slots" {
+        return None;
+    }
+    if o.tuning.metal.command_api == "metal3" {
+        return Some(format!(
+            "kernels.residency.metal4 = {arm} ignored <- backend.metal.command_buffer.api = \
+             metal3: no slot sets (C24)"
+        ));
+    }
+    let sets = if arm.starts_with("queue") {
+        "the device's residency sets on the Metal 4 queue"
+    } else {
+        "the device's residency sets used by each command buffer"
+    };
+    let lists = if arm.ends_with("diff") {
+        "each slot set listing only what they do not cover"
+    } else {
+        "each slot set listing every binding (a control)"
+    };
+    let default = if arm == "queue-diff" && crate::frontend::When::Qwen4Exp.holds(o) {
+        " (chat's and serve's default for Qwen4-exp on Metal, decision 62)"
+    } else {
+        ""
+    };
+    Some(format!(
+        "kernels.residency.metal4 -> {sets}, {lists}{default} <- kernels.residency.metal4 = \
+         {arm} (C24)"
     ))
 }
 
@@ -987,6 +1033,63 @@ mod tests {
         assert!(c21(&with(&[("kernels.residency.attach", "queue")])).is_empty());
     }
 
+    /// C24 at `slots` says nothing; on a Qwen4-exp checkpoint chat's and
+    /// serve's default names decision 62; on LFM2 neither prints; the arm on
+    /// Metal 3 is named as ignored, and a control is named as one.
+    #[test]
+    fn c24_names_the_metal4_declaration() {
+        use crate::frontend::{self, Frontend, When};
+        let c24 = |o: &EngineOptions| -> Vec<String> {
+            explain(o)
+                .into_iter()
+                .filter(|l| l.ends_with("(C24)"))
+                .collect()
+        };
+        assert!(c24(&EngineOptions::default()).is_empty(), "the library's");
+        let dir = std::env::temp_dir().join(format!("lloom-c24-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let qwen = dir.join("qwen4exp.gguf");
+        std::fs::write(&qwen, "").unwrap();
+        for f in [Frontend::Chat, Frontend::Serve, Frontend::Bench] {
+            for model in [None, Some(qwen.clone())] {
+                let mut o = EngineOptions::default();
+                o.load.model = model.clone();
+                frontend::apply(&mut o, f, &Default::default(), &Default::default()).unwrap();
+                let on = f != Frontend::Bench && model.is_some() && When::Qwen4Exp.holds(&o);
+                let want: Vec<String> = if on {
+                    vec![
+                        "kernels.residency.metal4 -> the device's residency sets on the Metal 4 \
+                          queue, each slot set listing only what they do not cover (chat's and \
+                          serve's default for Qwen4-exp on Metal, decision 62) <- \
+                          kernels.residency.metal4 = queue-diff (C24)"
+                            .into(),
+                    ]
+                } else {
+                    vec![]
+                };
+                assert_eq!(c24(&o), want, "{} {model:?}", f.name());
+            }
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(
+            c24(&with(&[("kernels.residency.metal4", "cb-full")])),
+            vec![
+                "kernels.residency.metal4 = cb-full ignored <- backend.metal.command_buffer.api \
+                  = metal3: no slot sets (C24)"
+            ]
+        );
+        assert_eq!(
+            c24(&with(&[
+                ("kernels.residency.metal4", "cb-full"),
+                ("backend.metal.command_buffer.api", "metal4")
+            ])),
+            vec![
+                "kernels.residency.metal4 -> the device's residency sets used by each command \
+                  buffer, each slot set listing every binding (a control) <- \
+                  kernels.residency.metal4 = cb-full (C24)"
+            ]
+        );
+    }
     /// C25 at `off` says nothing; serve's and bench's default on LFM2 names
     /// decision 71 at a batch and is named inert at one sequence; Qwen4-exp
     /// and chat keep `off`; `ahead` is named as itself, and the CPU as the

@@ -2601,6 +2601,9 @@ impl<'m, M: CausalLM> Session<'m, M> {
                     pacer.before_forward(&device)?;
                 }
                 self.model.prepare_pass(&mut self.seq.cache, 1)?;
+                // Sampled above; held across the next pass it would be an
+                // undeclared escape (`pass-plan-design.md` §26).
+                drop(logits);
                 let pass = begin_decode_step(&device)?;
                 logits = self
                     .model
@@ -2642,6 +2645,9 @@ impl<'m, M: CausalLM> Session<'m, M> {
                 }
                 let t = timed.then(std::time::Instant::now);
                 self.model.prepare_pass(&mut self.seq.cache, 1)?;
+                // Sampled above; held across the next pass it would be an
+                // undeclared escape (`pass-plan-design.md` §26).
+                drop(logits);
                 let pass = begin_decode_step(&device)?;
                 logits = self
                     .model
@@ -2712,6 +2718,7 @@ impl<'m, M: CausalLM> Session<'m, M> {
                             pacer.before_forward(&device)?;
                         }
                         self.model.prepare_pass(&mut self.seq.cache, 1)?;
+                        drop(logits);
                         let pass = begin_decode_step(&device)?;
                         logits = self
                             .model

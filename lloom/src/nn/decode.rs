@@ -1255,13 +1255,23 @@ fn shape_key(shape: PassShape) -> lloom_tensor::backend::PassShapeKey {
 /// bracket the arena needs, which is why the Metal arm is not simply the
 /// hook: `MetalDevice::begin_pass` falls back to `begin_decode_step`.
 pub(crate) fn begin_pass(device: &Device, shape: PassShape) -> Result<()> {
+    begin_pass_with_input(device, shape, lloom_tensor::backend::PassInput::TokenIds)
+}
+
+fn begin_pass_with_input(
+    device: &Device,
+    shape: PassShape,
+    input: lloom_tensor::backend::PassInput,
+) -> Result<()> {
     #[cfg(feature = "metal")]
     if let Device::Metal(m) = device {
         // The legacy arena path lives under the same bracket, so Metal goes
         // through its own entry point rather than the hook's early decline.
-        m.begin_pass(pass_key(shape))?;
+        m.begin_pass(pass_key(shape).with_input(input))?;
         return Ok(());
     }
+    // Prepared sampling remains Metal-only; preserve the CPU/CUDA hook.
+    let _ = input;
     device.begin_pass(shape_key(shape))?;
     Ok(())
 }
@@ -1311,7 +1321,15 @@ impl<'a> OpenPass<'a> {
     /// A refusal leaves no open pass (`MetalDevice::begin_pass`), so there
     /// is nothing to abort on that path.
     fn begin(device: &'a Device, shape: PassShape) -> Result<Self> {
-        begin_pass(device, shape)?;
+        Self::begin_with_input(device, shape, lloom_tensor::backend::PassInput::TokenIds)
+    }
+
+    fn begin_with_input(
+        device: &'a Device,
+        shape: PassShape,
+        input: lloom_tensor::backend::PassInput,
+    ) -> Result<Self> {
+        begin_pass_with_input(device, shape, input)?;
         Ok(Self { device, open: true })
     }
 
@@ -1338,8 +1356,11 @@ impl Drop for OpenPass<'_> {
 /// device can decline a pass whose plan it cannot admit or whose
 /// predecessor was never closed, and a forward encoded after that runs
 /// against state the pass was meant to install.
-fn begin_decode_step(device: &Device) -> Result<OpenPass<'_>> {
-    OpenPass::begin(device, PassShape::Decode { b: 1 })
+fn begin_decode_step(
+    device: &Device,
+    input: lloom_tensor::backend::PassInput,
+) -> Result<OpenPass<'_>> {
+    OpenPass::begin_with_input(device, PassShape::Decode { b: 1 }, input)
 }
 
 fn flush_and_prune(device: &Device) -> Result<Option<usize>> {
@@ -2551,7 +2572,7 @@ impl<'m, M: CausalLM> Session<'m, M> {
                     pacer.before_forward(&device)?;
                 }
                 self.model.prepare_pass(&mut self.seq.cache, 1)?;
-                let pass = begin_decode_step(&device)?;
+                let pass = begin_decode_step(&device, R::PASS_INPUT)?;
                 logits = self
                     .model
                     .forward(&feed, self.seq.pos, &mut self.seq.cache)?
@@ -2592,7 +2613,7 @@ impl<'m, M: CausalLM> Session<'m, M> {
                 }
                 let t = timed.then(std::time::Instant::now);
                 self.model.prepare_pass(&mut self.seq.cache, 1)?;
-                let pass = begin_decode_step(&device)?;
+                let pass = begin_decode_step(&device, R::PASS_INPUT)?;
                 logits = self
                     .model
                     .forward(&feed, self.seq.pos, &mut self.seq.cache)?
@@ -2662,7 +2683,7 @@ impl<'m, M: CausalLM> Session<'m, M> {
                             pacer.before_forward(&device)?;
                         }
                         self.model.prepare_pass(&mut self.seq.cache, 1)?;
-                        let pass = begin_decode_step(&device)?;
+                        let pass = begin_decode_step(&device, R::PASS_INPUT)?;
                         logits = self
                             .model
                             .forward(&again, self.seq.pos, &mut self.seq.cache)?

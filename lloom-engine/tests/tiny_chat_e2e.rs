@@ -3874,6 +3874,17 @@ fn serve_continues_a_conversation_by_its_completion_id() {
         let id2 = session_id(&two);
         assert_ne!(id2, id1);
 
+        // A second input continuation must still reconstruct the original
+        // retained history: only the first request's detached snapshot moved.
+        let repeated = ok(
+            &server,
+            json!({ "previous_response_id": id1, "input": [user2], "return_token_ids": true }),
+        );
+        assert_eq!(
+            repeated["prompt_token_ids"], two["prompt_token_ids"],
+            "{name}: a second input continuation must not see drained retained history"
+        );
+
         // The same history in the `messages` form, by reference: the same
         // prompt, the reply bound rather than found by its text.
         let full = ok(

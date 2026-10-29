@@ -1343,7 +1343,7 @@ fn chat_completions(shared: &Shared, v: &Value, auth: Option<[u8; 32]>) -> Handl
     let at = Instant::now();
     // The session the request continues (`docs/sessions.md` §5), or why
     // none holds its id.
-    let (resolved, miss) = match &ask.previous {
+    let (mut resolved, miss) = match &ask.previous {
         None => (None, None),
         Some(id) => match shared
             .sessions
@@ -1368,14 +1368,14 @@ fn chat_completions(shared: &Shared, v: &Value, auth: Option<[u8; 32]>) -> Handl
     )?;
     // The `input` form's conversation: the session's through the continued
     // turn, its reply as the response returned it, then the new messages.
-    let joined: Option<Value> = match (&ask.input, &resolved) {
+    let joined: Option<Value> = match (&ask.input, &mut resolved) {
         (Some(input), Some(r)) => {
             let mut m = r
                 .messages
-                .as_deref()
+                .take()
                 .unwrap_or_default()
-                .iter()
-                .map(super::sessions::StoredMessage::value)
+                .into_iter()
+                .map(Value::from)
                 .collect::<Vec<Value>>();
             m.extend(input.iter().cloned());
             Some(Value::Array(m))

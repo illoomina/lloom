@@ -1948,3 +1948,26 @@ fn owned_message_snapshot_converts_after_unlock_and_original_release() {
         Some(u64::MAX)
     );
 }
+
+#[test]
+fn owned_string_snapshot_conversion_has_no_new_allocation() {
+    use std::sync::atomic::Ordering;
+    let owned = StoredMessage::new(Value::String("π-string-payload".repeat(1024)));
+    let borrowed = StoredMessage::new(Value::String("π-string-payload".repeat(1024)));
+    let before = allocation_receipt::ALLOCATIONS.load(Ordering::Relaxed);
+    let converted = std::hint::black_box(Value::from(owned));
+    let owned_allocations = allocation_receipt::ALLOCATIONS.load(Ordering::Relaxed) - before;
+    let before = allocation_receipt::ALLOCATIONS.load(Ordering::Relaxed);
+    let copied = std::hint::black_box(borrowed.value());
+    let borrowed_allocations = allocation_receipt::ALLOCATIONS.load(Ordering::Relaxed) - before;
+    assert_eq!(converted, copied);
+    assert!(
+        borrowed_allocations > 0,
+        "borrowed-copy positive control must allocate"
+    );
+    assert_eq!(
+        owned_allocations, 0,
+        "consuming a boxed string must not allocate a second payload"
+    );
+    eprintln!("OWNED_STRING_CONVERSION owned_allocations={owned_allocations} borrowed_allocations={borrowed_allocations}");
+}

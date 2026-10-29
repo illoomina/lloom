@@ -127,6 +127,11 @@ impl<T, const N: usize> Frontier<T, [Option<(u64, T)>; N]> {
     }
 }
 impl<T> RuntimeCompletionFrontier<T> {
+    /// Cold admission accounting of the actual supplied Vec backing.
+    pub fn allocation_layout(&self) -> std::alloc::Layout {
+        self.pending.allocation_layout()
+    }
+
     /// Call only after the adapter has accounted the backing's actual layout.
     pub fn with_storage(storage: RuntimeStorage<T>) -> Result<Self, FrontierError> {
         Self::from_storage(storage)

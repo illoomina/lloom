@@ -20,8 +20,12 @@ use crate::{
 /// Progress/error reporting must not panic, free native resources or block.
 /// No foreign exception recovery is promised by the Rust unwind guard.
 pub(crate) unsafe trait IoSubmissionOwner {
+    type Payload;
     fn core(&self) -> &IoTerminal;
-    fn cell(&self) -> &IoCell;
+    fn cell(&self) -> &IoCell<Self::Payload>;
+    fn refuse_before_handoff(&self, ticket: Ticket) -> Result<(), Error> {
+        self.core().refused_before_handoff(self.cell(), ticket).map(|_| ())
+    }
     fn commit_native(&self, ticket: Ticket);
     fn request_progress(&self);
     fn report_protocol_error(&self, error: Error);
@@ -82,7 +86,7 @@ impl<O: IoSubmissionOwner> DeferredIo<O> {
 
     /// Explicit rejection before any native call; failure retains bank custody.
     pub fn refuse(mut self) -> Result<(), Error> {
-        let result = self.owner.core().refused_before_handoff(self.owner.cell(), self.ticket);
+        let result = self.owner.refuse_before_handoff(self.ticket);
         self.prepared = false;
         self.owner.request_progress();
         result.map(|_| ())
@@ -92,7 +96,7 @@ impl<O: IoSubmissionOwner> DeferredIo<O> {
 impl<O: IoSubmissionOwner> Drop for DeferredIo<O> {
     fn drop(&mut self) {
         if self.prepared {
-            if let Err(error) = self.owner.core().refused_before_handoff(self.owner.cell(), self.ticket) {
+            if let Err(error) = self.owner.refuse_before_handoff(self.ticket) {
                 // Diagnostic only: do not turn a rejected stale/duplicate claim
                 // into feedback or mutate another mailbox generation.
                 self.owner.report_protocol_error(error);
@@ -189,6 +193,7 @@ mod tests {
     // SAFETY: test root retains the bank/resource; only explicit finish frees
     // the payload. Native call is this instrumented boundary, not a real GPU.
     unsafe impl IoSubmissionOwner for Owner {
+        type Payload = ();
         fn core(&self) -> &IoTerminal { &self.bank.core }
         fn cell(&self) -> &IoCell { &self.bank.cell }
         fn commit_native(&self, ticket: Ticket) {
@@ -353,6 +358,7 @@ mod tests {
         // SAFETY: immutable identities and independently rooted payload; this
         // deliberately mismatched pair must be rejected before native handoff.
         unsafe impl IoSubmissionOwner for Foreign {
+            type Payload = ();
             fn core(&self) -> &IoTerminal { &self.wrong }
             fn cell(&self) -> &IoCell { &self.bank.cell }
             fn commit_native(&self, _: Ticket) { panic!("foreign native call forbidden"); }

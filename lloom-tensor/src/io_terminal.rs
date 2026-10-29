@@ -42,14 +42,26 @@ struct Record {
     accepted: bool,
 }
 
+/// Small immutable metadata and its owned physical payload share ONE mailbox.
+/// Copying Record never clones or transfers payload custody.
+struct OwnedRecord<P> {
+    meta: Record,
+    payload: P,
+}
+
+struct OwnedRejected<P> {
+    error: Error,
+    payload: P,
+}
+
 /// Cold-bound metadata cell. The private mailbox prevents replacement/promotion
 /// between a guarded read and a terminal phase claim. Existing Ticket remains
 /// the only identity/generation authority; core_id is queue membership only.
-pub(crate) struct IoCell {
+pub(crate) struct IoCell<P = ()> {
     core_id: u64,
-    mailbox: OwnerMailbox<Record, RawStatus>,
+    mailbox: OwnerMailbox<OwnedRecord<P>, RawStatus>,
 }
-impl IoCell {
+impl<P> IoCell<P> {
     pub fn new(
         core: &IoTerminal,
         failure: Arc<FailureSignal>,
@@ -60,23 +72,25 @@ impl IoCell {
             mailbox: OwnerMailbox::new(failure, wake)?,
         })
     }
-    pub fn prepare_data(&self, sequence: u64) -> Result<Ticket, Error> {
-        self.prepare(sequence, true)
-    }
-    pub fn prepare_gap(&self, sequence: u64) -> Result<Ticket, Error> {
-        self.prepare(sequence, false)
-    }
-    fn prepare(&self, sequence: u64, accepted: bool) -> Result<Ticket, Error> {
+    /// Native bank only: rejection returns the unregistered payload unchanged.
+    /// The caller must dispose it outside existing recording/producer guards.
+    fn prepare_owned(&self, sequence: u64, accepted: bool, payload: P)
+        -> Result<Ticket, OwnedRejected<P>>
+    {
         if sequence == u64::MAX {
-            return Err(Error::Frontier(FrontierError::SequenceExhausted));
+            return Err(OwnedRejected {
+                error: Error::Frontier(FrontierError::SequenceExhausted), payload,
+            });
         }
-        self.mailbox
-            .prepare(Record { sequence, accepted })
-            .map_err(|r| Error::Mailbox(r.error))
+        self.mailbox.prepare(OwnedRecord {
+            meta: Record { sequence, accepted }, payload,
+        }).map_err(|rejected| OwnedRejected {
+            error: Error::Mailbox(rejected.error), payload: rejected.value.payload,
+        })
     }
     fn prepared(&self, ticket: Ticket) -> Result<Record, Error> {
         self.mailbox
-            .edit_prepared(ticket, (), |record, _| *record, || {})
+            .edit_prepared(ticket, (), |record, _| record.meta, || {})
             .map(|(record, _)| record)
             .map_err(|error| match error {
                 crate::retirement_mailbox::PreparedEditError::Rejected(r) => {
@@ -97,6 +111,23 @@ impl IoCell {
         self.mailbox
             .handoff_returned(ticket)
             .map_err(Error::Mailbox)
+    }
+}
+
+impl IoCell<()> {
+    pub fn prepare_data(&self, sequence: u64) -> Result<Ticket, Error> {
+        self.prepare(sequence, true)
+    }
+    pub fn prepare_gap(&self, sequence: u64) -> Result<Ticket, Error> {
+        self.prepare(sequence, false)
+    }
+    fn prepare(&self, sequence: u64, accepted: bool) -> Result<Ticket, Error> {
+        if sequence == u64::MAX {
+            return Err(Error::Frontier(FrontierError::SequenceExhausted));
+        }
+        self.mailbox
+            .prepare(OwnedRecord { meta: Record { sequence, accepted }, payload: () })
+            .map_err(|r| Error::Mailbox(r.error))
     }
     /// Portable metadata-only cleanup. The native adapter must execute its real
     /// resource retirement outside the frontier lock, and qualify native return,
@@ -153,6 +184,10 @@ pub(crate) enum Error {
 struct IoOrder {
     frontier: RuntimeCompletionFrontier<Terminal>,
     validated_next: u64,
+    // Native bank only: ingestion can continue after data validation stops.
+    ingested_next: u64,
+    // Rooted metadata for a popped terminal awaiting strict returned cleanup.
+    retiring: Option<Terminal>,
 }
 
 pub(crate) struct IoTerminal {
@@ -173,6 +208,8 @@ impl IoTerminal {
             order: Mutex::new(IoOrder {
                 frontier: RuntimeCompletionFrontier::with_storage(storage).map_err(Error::Frontier)?,
                 validated_next: 0,
+                ingested_next: 0,
+                retiring: None,
             }),
             failed: AtomicBool::new(false),
             successful: AtomicU64::new(0),
@@ -181,7 +218,7 @@ impl IoTerminal {
     /// Validate a private engine-owned deferred lease without promoting its
     /// phase. The eventual native handoff/cancellation still uses the mailbox
     /// CAS; this check is not a substitute for that arbitration.
-    pub fn validate_prepared_data(&self, cell: &IoCell, ticket: Ticket) -> Result<(), Error> {
+    pub fn validate_prepared_data<P>(&self, cell: &IoCell<P>, ticket: Ticket) -> Result<(), Error> {
         if cell.core_id != self.id {
             return Err(Error::ForeignCore);
         }
@@ -193,7 +230,7 @@ impl IoTerminal {
 
     /// An actual native call unwound without a proved return. The same ticket
     /// remains rooted; no accepted-not-submitted terminal may replace it.
-    pub fn handoff_unknown(&self, cell: &IoCell, ticket: Ticket) -> Result<(), Error> {
+    pub fn handoff_unknown<P>(&self, cell: &IoCell<P>, ticket: Ticket) -> Result<(), Error> {
         if cell.core_id != self.id {
             return Err(Error::ForeignCore);
         }
@@ -220,12 +257,38 @@ impl IoTerminal {
     /// BEFORE the observer can latch failure or enqueue a terminal record.
     /// Failure publication precedes acquiring the reorder lock: an uncompleted
     /// earlier record cannot postpone guarded-admission refusal.
-    pub fn native_terminal(
+    pub fn native_terminal<P>(
         &self,
-        cell: &IoCell,
+        cell: &IoCell<P>,
         ticket: Ticket,
         status: RawStatus,
     ) -> Result<bool, Error> {
+        self.publish(self.record_native_feedback(cell, ticket, status)?)
+    }
+
+    /// Experimental bank entry: actual feedback and immediate failure only.
+    /// No order lock, frontier mutation or resource release. The caller MUST
+    /// retain its installed bank record and request assisted metadata progress
+    /// after success; mailbox Ready alone does not elect a physical drainer.
+    /// This does not wake consumers, certify bytes, or implement native custody.
+    pub fn publish_native_feedback<P>(
+        &self,
+        cell: &IoCell<P>,
+        ticket: Ticket,
+        status: RawStatus,
+    ) -> Result<(), Error> {
+        self.record_native_feedback(cell, ticket, status).map(|_| ())
+    }
+
+    // One classification path for the preserved direct portable API and the
+    // experimental bank path. The returned copy has no ownership authority;
+    // raw status/record remain rooted in the actual mailbox generation.
+    fn record_native_feedback<P>(
+        &self,
+        cell: &IoCell<P>,
+        ticket: Ticket,
+        status: RawStatus,
+    ) -> Result<Terminal, Error> {
         if cell.core_id != self.id {
             return Err(Error::ForeignCore);
         }
@@ -235,10 +298,10 @@ impl IoTerminal {
                 ticket,
                 status,
                 |record, raw| {
-                    if !raw.is_complete() || !record.accepted {
+                    if !raw.is_complete() || !record.meta.accepted {
                         self.failed.store(true, Ordering::Release);
                     }
-                    observed.set(Some(*record));
+                    observed.set(Some(record.meta));
                 },
                 || {},
             )
@@ -254,7 +317,7 @@ impl IoTerminal {
             // Mailbox retains feedback/owner for explicit adapter recovery.
             return Err(Error::UnacceptedNativeHandoff);
         }
-        self.publish(Terminal {
+        Ok(Terminal {
             sequence: record.sequence,
             ticket,
             disposition: Disposition::Native(status),
@@ -264,7 +327,11 @@ impl IoTerminal {
     /// Only an immutable reserved owner in Prepared can become a gap. The
     /// mailbox's phase CAS refuses a concurrent/already-started native handoff.
     /// Accepted failures must take the adapter's failure path, never this one.
-    pub fn abandon(&self, cell: &IoCell, ticket: Ticket) -> Result<bool, Error> {
+    pub fn abandon<P>(&self, cell: &IoCell<P>, ticket: Ticket) -> Result<bool, Error> {
+        self.publish(self.record_abandon(cell, ticket)?)
+    }
+
+    fn record_abandon<P>(&self, cell: &IoCell<P>, ticket: Ticket) -> Result<Terminal, Error> {
         if cell.core_id != self.id {
             return Err(Error::ForeignCore);
         }
@@ -275,7 +342,7 @@ impl IoTerminal {
         cell.mailbox
             .publish_cancelled(ticket)
             .map_err(Error::Mailbox)?;
-        self.publish(Terminal {
+        Ok(Terminal {
             sequence: record.sequence,
             ticket,
             disposition: Disposition::NeverAccepted,
@@ -290,7 +357,11 @@ impl IoTerminal {
     /// Engine-owned deferred work stays Prepared until its actual native call.
     /// Moving its exclusive lease into a held list is not native handoff.
     /// Work whose native handoff already began cannot use this method.
-    pub fn refused_before_handoff(&self, cell: &IoCell, ticket: Ticket) -> Result<bool, Error> {
+    pub fn refused_before_handoff<P>(&self, cell: &IoCell<P>, ticket: Ticket) -> Result<bool, Error> {
+        self.publish(self.record_refusal(cell, ticket)?)
+    }
+
+    fn record_refusal<P>(&self, cell: &IoCell<P>, ticket: Ticket) -> Result<Terminal, Error> {
         if cell.core_id != self.id {
             return Err(Error::ForeignCore);
         }
@@ -302,7 +373,7 @@ impl IoTerminal {
             .publish_cancelled(ticket)
             .map_err(Error::Mailbox)?;
         self.failed.store(true, Ordering::Release);
-        self.publish(Terminal {
+        Ok(Terminal {
             sequence: record.sequence,
             ticket,
             disposition: Disposition::AcceptedNotSubmitted,
@@ -944,3 +1015,7 @@ mod tests {
     }
 
 }
+
+// Experimental private bank: no production IoQueue caller or default route.
+#[path = "io_terminal/native_bank.rs"]
+mod native_bank;

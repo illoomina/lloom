@@ -4453,3 +4453,113 @@ fn serve_advertises_sessions_streams_their_id_and_binds_them_to_a_key() {
     drop(server);
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// The tiny LFM2 checkpoint at `model` (safetensors) written again as the
+/// GGUF llama.cpp writes (`lloom::testing::lfm2_gguf`), its projections and
+/// table at `kind`, its template in the header and its tokenizer beside it.
+fn lfm2_gguf(model: &Path, kind: lloom_tensor::quantized::GgmlDType) -> PathBuf {
+    use lloom_tensor::quantized::gguf_file::Value as V;
+    let cfg: lloom::models::lfm2::Lfm2Config =
+        serde_json::from_slice(&std::fs::read(model.join("config.json")).unwrap()).unwrap();
+    let cfg = cfg.into_config(false);
+    let tensors = lloom_tensor::safetensors::load(
+        model.join("model.safetensors"),
+        &lloom_tensor::Device::Cpu,
+    )
+    .unwrap();
+    let template = std::fs::read_to_string(model.join("chat_template.jinja")).unwrap();
+    let bytes = lloom::testing::lfm2_gguf::write(
+        &cfg,
+        &tensors,
+        kind,
+        vec![("tokenizer.chat_template".into(), V::String(template))],
+    )
+    .unwrap();
+    let dir = model.join(format!("gguf-{kind:?}"));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::copy(model.join("tokenizer.json"), dir.join("tokenizer.json")).unwrap();
+    let file = dir.join("tiny.gguf");
+    std::fs::write(&file, bytes).unwrap();
+    file
+}
+
+/// An LFM2 GGUF on the LFM2 engine (`models.lfm2_gguf.engine`, default
+/// `lfm2`) and on the legacy GGUF model (`legacy`): the same prompt ids
+/// and the same greedy tokens on the CPU and on Metal, the projections
+/// held packed, and the family reported as `lfm2-gguf`.
+#[test]
+fn an_lfm2_gguf_serves_on_the_lfm2_engine_as_on_the_legacy_model() {
+    let dir = scratch("lfm2-gguf-engine");
+    let model = write::<Lfm2Tiny>(&dir);
+    let gguf = lfm2_gguf(&model, lloom_tensor::quantized::GgmlDType::Q8_0);
+    let mut devices = vec![vec!["--cpu"]];
+    if cfg!(feature = "metal") {
+        devices.push(vec![]);
+    }
+    for device in devices {
+        let (new, stderr) = chat_with_stderr(&gguf, &device);
+        assert!(
+            stderr.contains("[lfm2 weights: q8_0 x"),
+            "{device:?}:\n{stderr}"
+        );
+        let mut legacy_args = device.clone();
+        legacy_args.extend(["--gguf-engine", "legacy"]);
+        let (legacy, legacy_stderr) = chat_with_stderr(&gguf, &legacy_args);
+        assert!(!legacy_stderr.contains("[lfm2 weights:"), "{legacy_stderr}");
+        assert_eq!(
+            new["prompt_ids_sha256"], legacy["prompt_ids_sha256"],
+            "{device:?}"
+        );
+        assert_eq!(
+            new["tokens_sha256"], legacy["tokens_sha256"],
+            "{device:?}: {new:?} {legacy:?}"
+        );
+        let server = Server::start(&gguf, &device);
+        let (_, health) = server.call("GET", "/health", &json!({}));
+        assert_eq!(health["capabilities"]["family"], "lfm2-gguf", "{health}");
+        drop(server);
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The same weights as safetensors and as an F32 GGUF, on the CPU (where
+/// both compute at f32): the same prompt and the same tokens.
+#[test]
+fn an_f32_lfm2_gguf_serves_what_its_safetensors_serve() {
+    let dir = scratch("lfm2-gguf-f32");
+    let model = write::<Lfm2Tiny>(&dir);
+    let gguf = lfm2_gguf(&model, lloom_tensor::quantized::GgmlDType::F32);
+    let a = chat(&model, &["--cpu"]);
+    let b = chat(&gguf, &["--cpu"]);
+    assert_eq!(a["prompt_ids_sha256"], b["prompt_ids_sha256"]);
+    assert_eq!(a["tokens_sha256"], b["tokens_sha256"], "{a:?} {b:?}");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The LFM2 engine's rows over a packed GGUF: `--batch 2` on the private
+/// rows (CPU) and on the shared pool (Metal) serves the single row's prompt.
+#[test]
+fn an_lfm2_gguf_serves_batched_rows_on_the_lfm2_engine() {
+    let dir = scratch("lfm2-gguf-rows");
+    let model = write::<Lfm2Tiny>(&dir);
+    let gguf = lfm2_gguf(&model, lloom_tensor::quantized::GgmlDType::Q8_0);
+    let single = Server::start(&gguf, &["--cpu"]);
+    let (status, one) = single.chat(json!({}));
+    assert_eq!(status, 200, "{one}");
+    drop(single);
+    let mut batched = vec![vec!["--cpu", "--batch", "2", "--rows", "private"]];
+    if cfg!(feature = "metal") {
+        batched.push(vec!["--batch", "2"]);
+    }
+    for args in batched {
+        let server = Server::start(&gguf, &args);
+        let (status, body) = server.chat(json!({}));
+        assert_eq!(status, 200, "{args:?}: {body}");
+        assert_eq!(
+            body["timings"]["prompt_ids_sha256"], one["timings"]["prompt_ids_sha256"],
+            "{args:?}"
+        );
+        drop(server);
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}

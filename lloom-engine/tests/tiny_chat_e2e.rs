@@ -71,10 +71,20 @@ fn chat_with_stderr(
     model: &Path,
     extra: &[&str],
 ) -> (std::collections::BTreeMap<String, String>, String) {
+    chat_turn(model, &["--raw", "-p", PROMPT, "-n", MAX_TOKENS], extra)
+}
+
+/// One `lloom chat` turn with `turn`'s arguments (the prompt, its length,
+/// `--raw` or the template); the `[turn 1: …]` line's fields and stderr.
+fn chat_turn(
+    model: &Path,
+    turn: &[&str],
+    extra: &[&str],
+) -> (std::collections::BTreeMap<String, String>, String) {
     let out = Command::new(env!("CARGO_BIN_EXE_lloom"))
         .args(["chat", "--model"])
         .arg(model)
-        .args(["--raw", "-p", PROMPT, "-n", MAX_TOKENS])
+        .args(turn)
         .args(extra)
         .output()
         .expect("lloom runs");
@@ -4468,11 +4478,29 @@ fn lfm2_gguf(model: &Path, kind: lloom_tensor::quantized::GgmlDType) -> PathBuf 
     )
     .unwrap();
     let template = std::fs::read_to_string(model.join("chat_template.jinja")).unwrap();
+    // The vocabulary in the header too, as llama.cpp writes it: the legacy
+    // GGUF model reads its BOS text and its EOS from there.
+    let vocab = tokenizers::Tokenizer::from_file(model.join("tokenizer.json"))
+        .unwrap()
+        .get_vocab(true);
+    let mut tokens = vec![String::new(); vocab.values().max().map_or(0, |&m| m as usize + 1)];
+    for (text, id) in &vocab {
+        tokens[*id as usize] = text.clone();
+    }
+    let id = |t: &str| V::U32(vocab[t]);
     let bytes = lloom::testing::lfm2_gguf::write(
         &cfg,
         &tensors,
         kind,
-        vec![("tokenizer.chat_template".into(), V::String(template))],
+        vec![
+            ("tokenizer.chat_template".into(), V::String(template)),
+            (
+                "tokenizer.ggml.tokens".into(),
+                V::Array(tokens.into_iter().map(V::String).collect()),
+            ),
+            ("tokenizer.ggml.bos_token_id".into(), id("<|startoftext|>")),
+            ("tokenizer.ggml.eos_token_id".into(), id("<|im_end|>")),
+        ],
     )
     .unwrap();
     let dir = model.join(format!("gguf-{kind:?}"));
@@ -4523,16 +4551,29 @@ fn an_lfm2_gguf_serves_on_the_lfm2_engine_as_on_the_legacy_model() {
 }
 
 /// The same weights as safetensors and as an F32 GGUF, on the CPU (where
-/// both compute at f32): the same prompt and the same tokens.
+/// both compute at f32): through the template, the same prompt and the same
+/// tokens. A raw prompt differs by its BOS, by design for now: the GGUF's
+/// raw prompts start with a BOS exactly when its tokenizer adds one (the
+/// legacy GGUF model's behaviour, kept), a safetensors LFM2's always do.
 #[test]
 fn an_f32_lfm2_gguf_serves_what_its_safetensors_serve() {
     let dir = scratch("lfm2-gguf-f32");
     let model = write::<Lfm2Tiny>(&dir);
     let gguf = lfm2_gguf(&model, lloom_tensor::quantized::GgmlDType::F32);
-    let a = chat(&model, &["--cpu"]);
-    let b = chat(&gguf, &["--cpu"]);
-    assert_eq!(a["prompt_ids_sha256"], b["prompt_ids_sha256"]);
+    let templated = ["-p", PROMPT, "-n", MAX_TOKENS];
+    let (a, _) = chat_turn(&model, &templated, &["--cpu"]);
+    let (b, _) = chat_turn(&gguf, &templated, &["--cpu"]);
+    assert_eq!(
+        a["prompt_ids_sha256"], b["prompt_ids_sha256"],
+        "{a:?} {b:?}"
+    );
     assert_eq!(a["tokens_sha256"], b["tokens_sha256"], "{a:?} {b:?}");
+    let raw_st = chat(&model, &["--cpu"]);
+    let raw_gguf = chat(&gguf, &["--cpu"]);
+    let n = |f: &std::collections::BTreeMap<String, String>| -> usize {
+        f["prompt_tokens"].parse().unwrap()
+    };
+    assert_eq!(n(&raw_st), n(&raw_gguf) + 1, "{raw_st:?} {raw_gguf:?}");
     std::fs::remove_dir_all(&dir).ok();
 }
 

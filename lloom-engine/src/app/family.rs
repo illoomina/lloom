@@ -194,12 +194,14 @@ pub const LFM2_GGUF_CAPABILITIES: Capabilities = Capabilities {
     kv_quant: &[KvQuant::Off],
     kv_dtype: "f32",
     kv_dense: &["f32"],
-    kv_quant_missing: "a GGUF computes at f32 on the LFM2 engine; the reduced KV stores were not run there",
+    kv_quant_missing:
+        "a GGUF computes at f32 on the LFM2 engine; the reduced KV stores were not run there",
     vision: false,
     vision_missing: "the mmproj tower is read by the legacy GGUF engine only \
         (models.lfm2_gguf.engine = legacy, --gguf-engine legacy)",
     eos_gate: false,
-    eos_gate_missing: "the quantized matmul cores the packed projections run on carry no gated variant",
+    eos_gate_missing:
+        "the quantized matmul cores the packed projections run on carry no gated variant",
     ..LFM2_CAPABILITIES
 };
 

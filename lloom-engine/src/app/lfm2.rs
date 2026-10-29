@@ -354,6 +354,8 @@ pub struct Engine<P: Profile> {
     /// The checkpoint is an LFM2 GGUF (`lfm2::gguf`): its capabilities are
     /// `LFM2_GGUF_CAPABILITIES`.
     pub gguf: bool,
+    /// A raw prompt (`encode` with `add_special`) starts with the BOS.
+    pub raw_bos: bool,
     /// The vision half, on a VL checkpoint.
     pub vision: Option<Vision>,
     /// What the last request loaded and encoded (`Served::vision_report`).
@@ -1069,6 +1071,13 @@ impl<P: Lfm2Shape> Engine<P> {
         let bos_token = bos_id
             .and_then(|id| tokenizer.id_to_token(id))
             .unwrap_or_default();
+        // A raw prompt starts with the BOS on a safetensors checkpoint; on a
+        // GGUF, exactly when its tokenizer adds one, as lfm2-gguf served raw
+        // prompts before it moved onto this engine.
+        let raw_bos = !is_gguf
+            || tokenizer
+                .encode("", true)
+                .is_ok_and(|e| e.get_ids().first().copied() == bos_id && bos_id.is_some());
 
         let template = match &gguf {
             Some(g) => match g.content.metadata.get("tokenizer.chat_template") {
@@ -1467,6 +1476,7 @@ impl<P: Lfm2Shape> Engine<P> {
             share_prefix: opts.share_prefix && opts.batch > 1 && opts.rows.pooled(),
             lm_record,
             gguf: is_gguf,
+            raw_bos,
             vision,
             last_vision: Mutex::new(Value::Null),
             config: config.clone(),
@@ -1842,7 +1852,7 @@ impl<P: Lfm2Shape> Engine<P> {
             .map_err(|e| anyhow::anyhow!("tokenizing: {e}"))?
             .get_ids()
             .to_vec();
-        if add_special {
+        if add_special && self.raw_bos {
             if let Some(bos) = self.text.bos_id {
                 if ids.first() != Some(&bos) {
                     ids.insert(0, bos);

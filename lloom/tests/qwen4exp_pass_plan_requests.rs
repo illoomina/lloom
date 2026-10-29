@@ -265,6 +265,8 @@ fn decode_request<R: ExpertResidency>(
     let mut steps = Vec::with_capacity(STEPS);
     for _ in 0..STEPS {
         let next = argmax(&logits)?;
+        // Read; held across the next pass it would be an undeclared escape.
+        drop(logits);
         ids.push(next);
         let redos = cache.redos;
         let input = Tensor::new(&[next], dev)?.unsqueeze(0)?;
@@ -432,6 +434,7 @@ fn verify_request<R: ExpertResidency>(
         model.forward(&input, 0, cache)
     })?;
     let mut next = argmax(&logits)?;
+    drop(logits);
     let t = DRAFTS.len() + 1;
     let mut ids = Vec::with_capacity(ROUNDS);
     let mut steps = Vec::with_capacity(ROUNDS);

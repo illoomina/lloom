@@ -66,6 +66,9 @@ fn prefill_in_chunks(
     for c in 0..CHUNKS {
         let toks: Vec<u32> = (0..W).map(|i| ((c * W + i) * 7 + 3) as u32 % 120).collect();
         let input = Tensor::from_vec(toks, (1, W), dev)?;
+        // Only the last chunk's logits are read; held across the next
+        // chunk's pass they would be an undeclared escape.
+        drop(last.take());
         last = Some(model.forward(&input, cache.pos, &mut cache)?);
     }
     last.expect("a chunk").flatten_all()?.to_vec1::<f32>()

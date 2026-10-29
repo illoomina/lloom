@@ -3136,6 +3136,9 @@ impl<'m, M: CausalLM> Session<'m, M> {
             // Session allocations (the KV slab, a bucket grow) happen here,
             // before the bracket, so the planned pass allocates nothing.
             self.model.prepare_pass(&mut self.seq.cache, w)?;
+            // Only the last tile's logits are returned; an earlier tile's,
+            // held across this pass, would be an undeclared escape (§26).
+            drop(last_logits.take());
             let pass = OpenPass::begin(
                 &device,
                 PassShape::Prefill {

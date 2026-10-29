@@ -3598,6 +3598,10 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
                 }
                 for t in 0..seq {
                     let h = embeds.narrow(1, t, 1)?;
+                    // Only the last position's logits are returned; held across
+                    // the next position's pass they would be an undeclared
+                    // escape (`pass-plan-design.md` §26).
+                    drop(logits.take());
                     logits = Some(self.decode_embed(&h, cache, obs)?);
                     if want == Some(cache.pos) {
                         self.checkpoint_here(cache, &dev)?;
@@ -3615,6 +3619,8 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
                         .any(|l| obs.wants::<HcStatePoint>(l) || obs.wants::<LayerOutputPoint>(l));
                 let mut start = 0;
                 while start < seq {
+                    // As above: only the last chunk's logits are returned.
+                    drop(logits.take());
                     let len = chunk_len(start);
                     // Up to `prefill_tiles` multi-position chunks in a row:
                     // one pass, the tiles interleaved a layer apart.
@@ -5900,13 +5906,17 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
             }
             argmax = fed;
         }
+        // Only a redo reads `h`, after the pass; a window with no records (a
+        // resident tier) cannot redo, and holding plan memory past the pass
+        // would be an undeclared escape (§26).
+        let h = (!records.is_empty()).then_some(h);
         Ok(VerifyPass {
             argmax,
             records,
             planned,
             t0,
             tokens: tokens.to_vec(),
-            h: Some(h),
+            h,
             drafts_loaded: drafts,
             fold,
         })

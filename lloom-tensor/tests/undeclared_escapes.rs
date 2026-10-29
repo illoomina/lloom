@@ -237,3 +237,46 @@ fn the_count_mode_counts_and_names_without_listing() {
     assert_eq!(log.named(), vec![(key_a(), 1)]);
     assert!(log.take_hits().is_empty());
 }
+
+/// A carried value that dies inside the next pass frees its bytes there: the
+/// value served on them afterwards is that pass's own, and binding it is no
+/// use of the dead one.
+#[test]
+fn a_carried_value_dropped_inside_the_next_pass_frees_its_bytes() {
+    set_escape_check(EscapeCheck::Report);
+    let (dev, m) = device();
+    let x = Tensor::arange(0f32, N as f32, &dev).unwrap();
+    warm_a(&m, &x);
+    let held = pass_a(&m, &x, 80.0);
+    m.begin_pass(key_a()).unwrap();
+    drop(held);
+    let a = x.affine(2.0, 81.0).unwrap();
+    let y = a.affine(1.0, 1.0).unwrap();
+    drop(a);
+    let got = y.to_vec1::<f32>().unwrap();
+    m.finish_pass().unwrap();
+    assert_eq!(got, want_a(81.0));
+    let c = m.pass_plan_counters().unwrap();
+    println!("{c:?}");
+    assert_eq!(c.undeclared_escapes, 0, "the slot was served once the holder was gone");
+    assert_eq!(c.escapes_used, 0, "the bind was the new value's, not the dead one's");
+}
+
+/// The site that makes a named producer is taken the next time its key
+/// serves it (debug and `profile` builds).
+#[test]
+fn a_named_producer_is_given_its_making_site() {
+    set_escape_check(EscapeCheck::Report);
+    let (dev, m) = device();
+    let x = Tensor::arange(0f32, N as f32, &dev).unwrap();
+    warm_a(&m, &x);
+    let held = pass_a(&m, &x, 90.0);
+    drop(pass_a(&m, &x, 91.0));
+    drop(held);
+    drop(pass_a(&m, &x, 92.0));
+    let producers = m.escape_log().unwrap().producers();
+    println!("{producers:?}");
+    assert_eq!(producers.len(), 1, "{producers:?}");
+    assert_eq!(producers[0].0, (key_a(), 1));
+    assert!(!producers[0].1.is_empty());
+}

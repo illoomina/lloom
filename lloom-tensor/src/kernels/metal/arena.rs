@@ -882,20 +882,27 @@ impl LiveCounters {
 /// immutability is a property of the **write set** and a runtime test can only
 /// observe that no sequence it happened to try disturbed it.
 ///
-/// So the hot path's lookups (`by_ordinal.get(ordinal)`, `slot_handles[slot]`)
+/// So the hot path's lookups (`by_ordinal.get(ordinal)`, `ordinal_handles[ordinal]`)
 /// are reads of immutable data reached through the `Arc`, which is exactly the
 /// shape that needs no synchronisation: the `Arc` already publishes them, and
 /// there is no later write for a reader to race.
 struct ArenaPlanState {
     plan: StepPlan,
     layout: ArenaLayout,
-    /// One handle per slot, created once and held for the plan's lifetime.
+    /// One handle per served ordinal, a view of its slot, created once and
+    /// held for the plan's lifetime; `None` where the plan serves no slot.
     ///
     /// **This is what makes the arena layer 3.** The handles never drop while
     /// the plan lives, so the free list never sees them and no lookup ever
     /// considers them -- exactly how resident weights already behave (§6.3a).
     /// Nothing here calls `free`.
-    slot_handles: Vec<BufferHandle>,
+    ///
+    /// Per ordinal rather than per slot: the values packed into one slot share
+    /// its bytes, not its handle, so a value still referenced after its pass
+    /// is named exactly (`pass-plan-design.md` §26).
+    ordinal_handles: Vec<Option<BufferHandle>>,
+    /// The ordinals each slot serves, in plan order.
+    slot_ordinals: Vec<Vec<usize>>,
 }
 
 /// Why the arena declined an allocation.
@@ -1048,7 +1055,11 @@ impl ArenaAllocationClaim<'_> {
                 .counters
                 .hits
                 .fetch_add(1, Ordering::Relaxed);
-            BufferHandle::clone(&self.arena.inner.plan_state.slot_handles[slot])
+            let _ = slot;
+            let handle = self.arena.inner.plan_state.ordinal_handles[self.ordinal.expect("served")]
+                .as_ref()
+                .expect("a served ordinal has a handle");
+            BufferHandle::clone(handle)
         });
         ArenaOffer {
             served,
@@ -1160,6 +1171,12 @@ struct ArenaInner {
     /// served allocation when there are none.
     watch: Mutex<Vec<ArenaWatch>>,
     watching: std::sync::atomic::AtomicBool,
+    /// Ordinals whose making site the escape log wants (debug and `profile`
+    /// builds): taken at the next serve of the ordinal.
+    #[cfg(any(debug_assertions, feature = "profile"))]
+    wanted: Mutex<Vec<(usize, PassKey, Arc<super::EscapeLog>)>>,
+    #[cfg(any(debug_assertions, feature = "profile"))]
+    wanting: std::sync::atomic::AtomicBool,
 }
 
 impl Arena {
@@ -1218,10 +1235,18 @@ impl Arena {
         //
         // The base itself is unaffected: it is owned by `ArenaInner` and freed
         // by Metal when the last `Arena` clone drops, exactly as before.
-        let slot_handles = plan
-            .slots()
+        let mut slot_ordinals = vec![Vec::new(); plan.slots().len()];
+        let ordinal_handles = plan
+            .by_ordinal
             .iter()
-            .map(|s| BufferHandle::new(PooledBuffer::unpooled(base.view(s.offset, s.size), s.size)))
+            .enumerate()
+            .map(|(ordinal, e)| {
+                e.map(|(slot, _)| {
+                    slot_ordinals[slot].push(ordinal);
+                    let s = &plan.slots()[slot];
+                    BufferHandle::new(PooledBuffer::unpooled(base.view(s.offset, s.size), s.size))
+                })
+            })
             .collect();
 
         Ok(Self {
@@ -1230,7 +1255,8 @@ impl Arena {
                 plan_state: ArenaPlanState {
                     plan,
                     layout,
-                    slot_handles,
+                    ordinal_handles,
+                    slot_ordinals,
                 },
                 // #69's path until a GPU table is verified against the plan.
                 offsets: AtomicU8::new(ArenaOffsets::Cpu.to_bits()),
@@ -1242,6 +1268,10 @@ impl Arena {
                 active: AtomicU64::new(0),
                 watch: Mutex::new(Vec::new()),
                 watching: std::sync::atomic::AtomicBool::new(false),
+                #[cfg(any(debug_assertions, feature = "profile"))]
+                wanted: Mutex::new(Vec::new()),
+                #[cfg(any(debug_assertions, feature = "profile"))]
+                wanting: std::sync::atomic::AtomicBool::new(false),
             }),
         })
     }
@@ -1389,30 +1419,62 @@ impl Arena {
         }
     }
 
-    /// Whether anything outside the arena still references slot `slot`.
-    /// A slot handle is held by the arena and by every storage it served, so
-    /// this is the slot's previous occupants still being alive.
-    pub fn slot_alive(&self, slot: usize) -> bool {
-        BufferHandle::strong_count(&self.inner.plan_state.slot_handles[slot]) > 1
+    /// Whether anything outside the arena still references the value this
+    /// arena served ordinal `ordinal`. Its handle is held by the arena and by
+    /// every storage it was served to.
+    pub fn ordinal_alive(&self, ordinal: usize) -> bool {
+        self.inner.plan_state.ordinal_handles[ordinal]
+            .as_ref()
+            .is_some_and(|h| BufferHandle::strong_count(h) > 1)
     }
 
-    /// Slots still referenced from outside, as `(slot, offset, size, the
-    /// last ordinal the plan gives the slot)`. Read at a pass's opening for
-    /// the arena that served the pass before: what it finds outlived its pass.
-    pub fn live_slots(&self) -> Vec<(usize, usize, usize, usize)> {
-        let plan = &self.inner.plan_state.plan;
-        (0..plan.slots().len())
-            .filter(|&s| self.slot_alive(s))
-            .map(|s| {
-                let slot = &plan.slots()[s];
-                let last = plan
-                    .by_ordinal
+    /// The served values still referenced from outside, as `(ordinal, slot
+    /// offset, slot size)`. Read at a pass's opening for the arena that
+    /// served the pass before: what it finds outlived its pass.
+    pub fn live_ordinals(&self) -> Vec<(usize, usize, usize)> {
+        let state = &self.inner.plan_state;
+        let slots = state.plan.slots();
+        state
+            .slot_ordinals
+            .iter()
+            .enumerate()
+            .flat_map(|(slot, ordinals)| {
+                ordinals
                     .iter()
-                    .rposition(|e| matches!(e, Some((at, _)) if *at == s))
-                    .unwrap_or(0);
-                (s, slot.offset, slot.size, last)
+                    .filter(|&&o| self.ordinal_alive(o))
+                    .map(move |&o| (o, slots[slot].offset, slots[slot].size))
             })
             .collect()
+    }
+
+    /// Name the site that makes `ordinal` (of `key`, which this arena serves)
+    /// to `log` the next time it is served. A no-op in the shipping build.
+    pub fn want_site(&self, ordinal: usize, key: PassKey, log: &Arc<super::EscapeLog>) {
+        #[cfg(any(debug_assertions, feature = "profile"))]
+        {
+            let mut g = self.inner.wanted.lock();
+            if !g.iter().any(|(o, ..)| *o == ordinal) {
+                g.push((ordinal, key, log.clone()));
+            }
+            self.inner.wanting.store(true, Ordering::Relaxed);
+        }
+        #[cfg(not(any(debug_assertions, feature = "profile")))]
+        let _ = (ordinal, key, log);
+    }
+
+    #[cfg(any(debug_assertions, feature = "profile"))]
+    #[cold]
+    fn take_wanted_site(&self, ordinal: usize) {
+        let found = {
+            let mut g = self.inner.wanted.lock();
+            let i = g.iter().position(|(o, ..)| *o == ordinal);
+            let found = i.map(|i| g.swap_remove(i));
+            self.inner.wanting.store(!g.is_empty(), Ordering::Relaxed);
+            found
+        };
+        if let Some((o, key, log)) = found {
+            log.note_producer(key, o, super::escape::site());
+        }
     }
 
     /// The handout's watch, on the declining path: the carried value slot
@@ -1420,16 +1482,16 @@ impl Arena {
     #[cold]
     fn held_over(&self, slot: usize) -> bool {
         let g = self.inner.watch.lock();
-        match g
-            .iter()
-            .find(|w| w.slot == slot && w.victim.slot_alive(w.victim_slot))
-        {
-            Some(w) => {
+        for w in g.iter().filter(|w| w.slot == slot) {
+            if w.stats.alive(&w.victim, w.victim_ordinal) {
                 w.log.note_decline(w);
-                true
+                return true;
             }
-            None => false,
+            // Dead, and its bytes are served now: from here its handle may
+            // name the new value (a key re-serving its own ordinal).
+            w.stats.retired.store(true, Ordering::Relaxed);
         }
+        false
     }
 
     /// Whether a step drifted from the plan since this was last asked, and
@@ -1483,7 +1545,7 @@ impl Arena {
     ///   built once at `install_arena` and never mutated afterwards. It reads
     ///   position `n`; it does not read "the entry the previous call read", so
     ///   no happens-before edge is required against any other `fetch_add`.
-    /// - `state.slot_handles[slot]` -- indexed by the *plan's* slot, not by the
+    /// - `state.ordinal_handles[ordinal]` -- indexed by the *plan's* ordinal, not by the
     ///   ordinal, and likewise immutable for the plan's lifetime.
     ///
     /// **And there is no ordering to supply, which is a stronger statement than
@@ -1628,6 +1690,10 @@ impl Arena {
         if self.inner.watching.load(Ordering::Relaxed) && self.held_over(slot) {
             counters.declined_held.fetch_add(1, Ordering::Relaxed);
             return make_claim(Some(ordinal), None, Some(ArenaDecline::Held));
+        }
+        #[cfg(any(debug_assertions, feature = "profile"))]
+        if self.inner.wanting.load(Ordering::Relaxed) {
+            self.take_wanted_site(ordinal);
         }
         make_claim(Some(ordinal), Some(slot), None)
     }
@@ -3472,7 +3538,7 @@ mod tests {
     /// assigned' is visible in the text and invisible to any pool state."*
     ///
     /// The claim it pins is the one the removal rests on: `plan`,
-    /// `slot_handles` and `layout` are established in `Arena::new` and never
+    /// `ordinal_handles`, `slot_ordinals` and `layout` are established in `Arena::new` and never
     /// assigned again, so every reader on the decode path reads data the `Arc`
     /// already published and no reader can race a writer.
     ///
@@ -3500,7 +3566,7 @@ mod tests {
                 .count()
         };
 
-        for field in ["plan", "slot_handles", "layout"] {
+        for field in ["plan", "ordinal_handles", "slot_ordinals", "layout"] {
             let assign = format!("plan_state.{field} {}", "=");
             assert_eq!(
                 code_only(&assign),
@@ -3529,10 +3595,10 @@ mod tests {
         // renamed out from under this test (§15.1a's VACUOUS class, #457's
         // rule that a zero is not evidence unless something nonzero came from
         // the same command).
-        let reads = code_only("plan_state.plan") + code_only("plan_state.slot_handles");
+        let reads = code_only("plan_state.plan") + code_only("plan_state.ordinal_handles");
         assert!(
             reads > 0,
-            "no read of `plan_state.plan` or `plan_state.slot_handles` -- this \
+            "no read of `plan_state.plan` or `plan_state.ordinal_handles` -- this \
              test is asserting zeros about a field that no longer exists, \
              which reads exactly like a passing check."
         );

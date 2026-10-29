@@ -395,7 +395,6 @@ pub struct PassPlans {
 /// A served value still referenced after the pass that produced it.
 struct Carried {
     arena: Arena,
-    slot: usize,
     held: HeldValue,
     /// The pass that opened while it was still referenced.
     by: PassKey,
@@ -410,7 +409,7 @@ impl PassPlans {
         let mut i = 0;
         while i < self.carried.len() {
             let c = &self.carried[i];
-            if c.arena.slot_alive(c.slot) {
+            if c.stats.alive(&c.arena, c.held.ordinal) {
                 i += 1;
                 continue;
             }
@@ -418,17 +417,17 @@ impl PassPlans {
             self.escape_log.note_dropped(&c.held, c.by, &c.stats);
         }
         if let Some((key, arena)) = self.last_served.take() {
-            for (slot, offset, size, ordinal) in arena.live_slots() {
+            for (ordinal, offset, size) in arena.live_ordinals() {
                 if self
                     .carried
                     .iter()
-                    .any(|c| c.slot == slot && c.arena.same(&arena))
+                    .any(|c| c.held.ordinal == ordinal && c.arena.same(&arena))
                 {
                     continue;
                 }
+                arena.want_site(ordinal, key, &self.escape_log);
                 self.carried.push(Carried {
                     arena: arena.clone(),
-                    slot,
                     held: HeldValue {
                         key,
                         ordinal,
@@ -445,6 +444,8 @@ impl PassPlans {
                 .iter()
                 .map(|c| StaleValue {
                     base: c.arena.base().raw_addr(),
+                    victim: c.arena.clone(),
+                    victim_ordinal: c.held.ordinal,
                     held: c.held,
                     by: c.by,
                     stats: c.stats.clone(),
@@ -470,7 +471,7 @@ impl PassPlans {
                     watch.push(ArenaWatch {
                         slot,
                         victim: c.arena.clone(),
-                        victim_slot: c.slot,
+                        victim_ordinal: c.held.ordinal,
                         held: c.held,
                         by,
                         stats: c.stats.clone(),

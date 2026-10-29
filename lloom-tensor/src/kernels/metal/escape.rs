@@ -98,8 +98,7 @@ pub fn set_escape_check(mode: EscapeCheck) {
 }
 
 /// A served value still referenced after its pass: the pass that produced
-/// it, its ordinal there (the last one served its slot), and its bytes in
-/// the base.
+/// it, its ordinal there, and its slot's bytes in the base.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct HeldValue {
     pub key: PassKey,
@@ -115,12 +114,20 @@ pub struct CarriedStats {
     pub declines: AtomicU64,
     /// Binds of it after a later pass began (debug and `profile` builds).
     pub reads: AtomicU64,
+    /// Set when a handout reused its bytes after it died: its handle may
+    /// then name the new value, which is no use of it.
+    pub retired: std::sync::atomic::AtomicBool,
     /// The first declined allocation's site and the pass it was made in.
     #[cfg(any(debug_assertions, feature = "profile"))]
     first_decline: Mutex<Option<String>>,
 }
 
 impl CarriedStats {
+    /// Whether the value is gone: retired, or its handle no longer held.
+    pub fn alive(&self, victim: &Arena, ordinal: usize) -> bool {
+        !self.retired.load(Ordering::Relaxed) && victim.ordinal_alive(ordinal)
+    }
+
     fn first_decline(&self) -> String {
         #[cfg(any(debug_assertions, feature = "profile"))]
         if let Some(s) = self.first_decline.lock().as_ref() {
@@ -131,12 +138,12 @@ impl CarriedStats {
 }
 
 /// One entry of a served arena's watch for its step: its slot `slot`
-/// overlaps the bytes of `held`, carried in from an earlier pass, which the
-/// slot handle `victim_slot` of `victim` still names.
+/// overlaps the bytes of `held`, carried in from an earlier pass, which
+/// `victim` served as ordinal `victim_ordinal`.
 pub struct ArenaWatch {
     pub slot: usize,
     pub victim: Arena,
-    pub victim_slot: usize,
+    pub victim_ordinal: usize,
     pub held: HeldValue,
     /// The pass this arena is serving.
     pub by: PassKey,
@@ -174,6 +181,7 @@ pub struct EscapeLog {
     held_unused: AtomicU64,
     warned: Mutex<HashSet<(PassKey, usize)>>,
     hits: Mutex<Vec<EscapeHit>>,
+    producers: Mutex<std::collections::HashMap<(PassKey, usize), String>>,
 }
 
 impl EscapeLog {
@@ -197,6 +205,35 @@ impl EscapeLog {
         let mut v: Vec<_> = self.warned.lock().iter().copied().collect();
         v.sort_by_key(|(k, o)| (format!("{k:?}"), *o));
         v
+    }
+
+    /// Where each named producer is made, once its key served it again
+    /// (debug and `profile` builds).
+    pub fn producers(&self) -> Vec<((PassKey, usize), String)> {
+        let mut v: Vec<_> = self
+            .producers
+            .lock()
+            .iter()
+            .map(|(k, s)| (*k, s.clone()))
+            .collect();
+        v.sort_by_key(|((k, o), _)| (format!("{k:?}"), *o));
+        v
+    }
+
+    /// The site that made ordinal `ordinal` of `key`, seen when the key next
+    /// served it. Printed once, for a producer a hit has named.
+    pub(crate) fn note_producer(&self, key: PassKey, ordinal: usize, site: String) {
+        let mut g = self.producers.lock();
+        if g.contains_key(&(key, ordinal)) {
+            return;
+        }
+        if self.warned.lock().contains(&(key, ordinal)) {
+            eprintln!(
+                "[pass plans] producer: ordinal {ordinal} of {} is made at {site}",
+                key_name(&key)
+            );
+        }
+        g.insert((key, ordinal), site);
     }
 
     /// Every hit recorded under `Report` or `Error`, in order. Taking
@@ -305,7 +342,7 @@ pub fn key_name(k: &PassKey) -> String {
 }
 
 /// The site of the current call, as the served-request instrument names it.
-fn site() -> String {
+pub(crate) fn site() -> String {
     #[cfg(any(debug_assertions, feature = "profile"))]
     {
         crate::metal_backend::call_site()
@@ -324,6 +361,10 @@ struct Stale {
     base: usize,
     start: usize,
     end: usize,
+    /// The handle that names the value: once it is gone its bytes may be
+    /// served again, and a bind of them is the new value's.
+    victim: Arena,
+    victim_ordinal: usize,
     held: HeldValue,
     by: PassKey,
     stats: Arc<CarriedStats>,
@@ -338,6 +379,8 @@ static STALE_WATCHING: std::sync::atomic::AtomicBool = std::sync::atomic::Atomic
 /// A carried value the use check watches from now on.
 pub struct StaleValue {
     pub base: usize,
+    pub victim: Arena,
+    pub victim_ordinal: usize,
     pub held: HeldValue,
     pub by: PassKey,
     pub stats: Arc<CarriedStats>,
@@ -355,6 +398,8 @@ pub fn watch_stale(values: Vec<StaleValue>) {
             base: v.base,
             start: v.held.offset,
             end: v.held.offset + v.held.size,
+            victim: v.victim,
+            victim_ordinal: v.victim_ordinal,
             held: v.held,
             by: v.by,
             stats: v.stats,
@@ -389,7 +434,12 @@ fn note_use_slow(base: usize, start: usize, len: usize) {
     let hit = {
         let g = STALE.lock();
         g.iter()
-            .find(|s| s.base == base && s.start < end && start < s.end)
+            .find(|s| {
+                s.base == base
+                    && s.start < end
+                    && start < s.end
+                    && s.stats.alive(&s.victim, s.victim_ordinal)
+            })
             .map(|s| (s.held, s.by, s.stats.clone(), s.log.clone()))
     };
     let Some((held, by, stats, log)) = hit else {

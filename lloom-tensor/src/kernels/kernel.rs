@@ -810,7 +810,11 @@ mod tests {
             "21 non-MLX sources (#466 §4, +rope #659, +eos_index #702's tree, +eos_gate #735, \
              +qwen4exp, +gdn)"
         );
-        assert_eq!(all.len(), 25, "25 Source variants");
+        assert_eq!(
+            all.len(),
+            26,
+            "26 Source variants (+QuantizedGlu, #1110 (3): compiled alone, like QuantizedStore)"
+        );
     }
 
     /// Issue #477. The merged text **compiles**, and it contains kernels from

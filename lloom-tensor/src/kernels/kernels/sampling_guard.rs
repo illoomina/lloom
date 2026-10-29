@@ -26,6 +26,16 @@ pub(crate) enum Consumer<'a> {
         row_bytes: u64,
         bytes: u64,
     },
+    QuantizedEmbedding {
+        ids: &'a Buffer,
+        error: &'a Buffer,
+        table: &'a Buffer,
+        out: (&'a Buffer, usize),
+        dtype: super::quantized::GgmlDType,
+        hidden: usize,
+        row_stride: usize,
+        rows: usize,
+    },
     Copy {
         ids: &'a Buffer,
         error: &'a Buffer,
@@ -75,6 +85,39 @@ pub(crate) unsafe fn call(
     consumer: Consumer<'_>,
 ) -> Result<(), MetalKernelError> {
     let (name, count) = match &consumer {
+        Consumer::QuantizedEmbedding {
+            ids,
+            error,
+            table,
+            out,
+            dtype,
+            hidden,
+            row_stride,
+            rows,
+        } => {
+            if *rows == 0 {
+                return Ok(());
+            }
+            // SAFETY: the opaque carrier checks packed table/output extents,
+            // ids, exact device/origin and sticky request ownership first.
+            return unsafe {
+                super::quantized::call_quantized_get_rows_guarded(
+                    device,
+                    ep,
+                    kernels,
+                    *dtype,
+                    *hidden,
+                    *row_stride,
+                    *rows,
+                    table,
+                    ids,
+                    0,
+                    out.0,
+                    out.1,
+                    error,
+                )
+            };
+        }
         Consumer::Eos { .. } => ("sampling_guarded_eos", 1),
         Consumer::Validate { .. } => ("sampling_validate_tokens", 1),
         Consumer::Embedding { bytes, .. } => ("sampling_guarded_embedding", *bytes as usize),
@@ -107,6 +150,7 @@ pub(crate) unsafe fn call(
     // SAFETY: carrier preflight covers every buffer and scalar span above.
     unsafe {
         match consumer {
+            Consumer::QuantizedEmbedding { .. } => unreachable!("lowered through shared get_rows"),
             Consumer::Eos {
                 ids,
                 error,

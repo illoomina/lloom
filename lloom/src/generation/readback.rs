@@ -37,6 +37,15 @@
 //! encoded before the host knows — and is retracted by [`ReadbackStrategy::eos_of_last`]
 //! rolling the write cursor back one, so the next token overwrites it.
 
+#[cfg(feature = "metal")]
+mod native;
+#[cfg(feature = "metal")]
+pub use native::NativeRing;
+#[cfg(feature = "metal")]
+mod native_blocking;
+#[cfg(feature = "metal")]
+pub use native_blocking::NativeBlocking;
+
 use crate::generation::budget::{DeviceForcing, HostForcing, ThinkingBudget};
 use crate::generation::poll::PollMechanism;
 use crate::generation::token_ring::TokenRing;
@@ -150,6 +159,18 @@ pub trait ReadbackStrategy {
     /// trip it would not report (§7.1a-i's wrong-arm shape).
     fn check_sampler(&self, sampling: &Sampling) -> Result<()>;
 
+    /// Cold shared capability check. The prepared native strategy identifies
+    /// its explicit device sampler to the same body's capability table.
+    fn check_request(&self, sampler: &LogitsProcessor) -> Result<()> {
+        crate::nn::decode::refuse(
+            crate::nn::decode::Body::Step {
+                ring: self.arms().token_ring,
+            },
+            &crate::nn::decode::Asks::of(sampler, false),
+        )?;
+        self.check_sampler(sampler.sampling())
+    }
+
     /// Sample this step's token from `logits` and return the next forward's
     /// `[1, 1]` input. The blocking arm reads the id to the host here; the ring
     /// arms leave it on the device and return the ring's own slot.
@@ -157,6 +178,19 @@ pub trait ReadbackStrategy {
     /// this per-token seam does not repeat admission.
     fn sample_and_feed(&mut self, sampler: &mut LogitsProcessor, logits: &Tensor)
         -> Result<Tensor>;
+
+    /// Shared forward seam for sampled input, including provisional redraws.
+    /// The default is exactly the legacy token forward. Explicit native
+    /// strategies override it to consume already guarded prepared embeddings.
+    fn forward_input<M: crate::nn::CausalLM>(
+        &mut self,
+        model: &M,
+        input: &Tensor,
+        pos: usize,
+        cache: &mut M::Cache,
+    ) -> Result<Tensor> {
+        model.forward(input, pos, cache)
+    }
 
     /// Arm a thinking budget from the next [`Self::sample_and_feed`] on: each
     /// step feeds the budget's token ([`crate::generation::budget`]), which is
@@ -535,6 +569,18 @@ impl Blocking {
         self
     }
 
+    /// Shared finish for ordinary sampled and native checked-host draws.
+    /// The optimized argmax early return keeps its existing device token and
+    /// does not enter this host-upload helper.
+    fn finish_fed(&mut self, logits: &Tensor, id: u32) -> Result<Tensor> {
+        if let Some(capture) = self.capture.as_mut() {
+            capture.push(logits, id)?;
+        }
+        self.ids.push(id);
+        self.last = Some(id);
+        Tensor::new(&[id], &self.device)?.unsqueeze(0)
+    }
+
     /// What the run kept, one entry per returned id.
     pub fn take_logprobs(&mut self) -> Option<Logprobs> {
         self.capture.take().map(LogprobCapture::into_logprobs)
@@ -596,12 +642,7 @@ impl ReadbackStrategy for Blocking {
             Some(f) => sampler.sample_fed(logits, |d| f.feed(d))?,
             None => sampler.sample(logits)?,
         };
-        if let Some(c) = &mut self.capture {
-            c.push(logits, id)?;
-        }
-        self.ids.push(id);
-        self.last = Some(id);
-        Tensor::new(&[id], &self.device)?.unsqueeze(0)
+        self.finish_fed(logits, id)
     }
 
     fn set_thinking_budget(&mut self, budget: Option<&ThinkingBudget>) -> Result<()> {
@@ -2326,84 +2367,9 @@ impl ReadbackStrategy for Ring {
     }
 
     fn publish_marker(&mut self, force_live: bool) -> Result<()> {
-        // The fused publish stamped inside `sample_and_feed`.
-        if self.fused_step {
-            return Ok(());
-        }
-        // Only the deferred-EOS arms write their marker at the commit window; the
-        // per-step reads (poll, flag) stamped inside `sample_and_feed`.
-        if !matches!(
-            self.eos,
-            EosRead::HostOnDrain | EosRead::GpuBatched | EosRead::GpuBatchedNonblocking
-        ) || self.generation == 0
-        {
-            return Ok(());
-        }
-        // The non-blocking batched arm stages its index at `close_window`; a loop
-        // that did not call it (or a window that grew since) is staged here, a
-        // step later than ideal but still fenced by its own buffer, not the tail.
-        // Not during the TTFT ramp (`force_live`), for `close_window`'s reason.
-        if matches!(self.eos, EosRead::GpuBatchedNonblocking) && !force_live {
-            let covered = self.staged_eos.borrow().last().is_some_and(|w| {
-                w.start == self.history.drained && w.start + w.len == self.history.fed
-            });
-            if !covered {
-                self.stage_window()?;
-            }
-        }
-        // GpuBatched: enqueue the batched EOS check over this window's tokens
-        // BEFORE the marker/commit, so the `eos_index` dispatch rides the committing
-        // buffer AFTER the window's slots (queue order) and its `[1]` result is
-        // ready to read back at the drain. The host reads that index once per
-        // commit (`eos_in_drained`), never scanning the tokens itself. A window that
-        // does not present a dense single-segment view (quantum>1, or a
-        // segment-boundary straddle) yields `None` here and the drain falls back to
-        // the host scan for this commit.
-        if matches!(self.eos, EosRead::GpuBatched) {
-            // `eos_index` is a Metal kernel; off Metal the window has no dense
-            // device check and every drain takes the host scan.
-            #[cfg(feature = "metal")]
-            let pending = match self.history.window_view().filter(|t| t.device().is_metal()) {
-                Some(tokens) => {
-                    #[cfg(feature = "metal")]
-                    {
-                        let n = tokens.elem_count();
-                        let idx = tokens.eos_index(n, self.ring.eos_ids_tensor())?;
-                        Some((idx, n))
-                    }
-                    // `eos_index` is a Metal dispatch; without it there is nothing
-                    // to enqueue and the drain's host scan covers this commit.
-                    #[cfg(not(feature = "metal"))]
-                    {
-                        let _ = tokens;
-                        None
-                    }
-                }
-                None => None,
-            };
-            #[cfg(not(feature = "metal"))]
-            let pending = None;
-            *self.pending_eos_index.borrow_mut() = pending;
-        }
-        // The wake-cadence throttle. A commit is LIVE — writes the device word the
-        // host WFE-waits on — when the ramp forces it, or when `live_every`
-        // commits have passed since the last live one. A non-live commit writes
-        // NOTHING: the device word stays at the last live value, so the drain
-        // clamps more conservatively and simply catches up on the next live commit
-        // (or the final `drain_all`, which force-synchronises). Skipping the write
-        // can never read an unwritten slot (§3.5) — it only defers visibility.
-        let since = self.commits_since_live.get() + 1;
-        let live = force_live || since >= self.live_every;
-        if live {
-            // The last entry carries `self.generation`, `fed` through the last fed
-            // step, so the marker publishes exactly the window the drain is about
-            // to read.
-            self.stamp_unstamped()?;
-            self.commits_since_live.set(0);
-        } else {
-            self.commits_since_live.set(since);
-        }
-        Ok(())
+        self.publish_marker_with(force_live, |ring, g, history| {
+            ring.publish_marker(g, &[history])
+        })
     }
 
     /// The per-step EOS reads, unfused, with no thinking budget live: the
@@ -2429,111 +2395,11 @@ impl ReadbackStrategy for Ring {
         if !self.retracts_draw() {
             lloom_tensor::bail!("Ring::retract_draw: this arm does not take a draw back");
         }
-        if !(self.history.tile_open && self.history.in_tile > 0) {
-            lloom_tensor::bail!("Ring::retract_draw: no draw in the open tile to take back");
-        }
-        self.history.retract_one();
-        self.retracted_stamp = Some(self.generation as usize);
-        self.counters.ring_retracted += 1;
-        Ok(())
+        self.retract_last_draw()
     }
 
     fn eos_of_last(&mut self) -> Result<bool> {
-        let is_eos = match self.eos {
-            // EOS is not learned per token on the deferred arms — the loop learns
-            // it from `eos_in_drained` on the batch it streams (a host scan for
-            // `HostOnDrain`, the batched `eos_index` result for `GpuBatched`), so
-            // this always answers `false` and never retracts here (the truncation
-            // happens host-side, at the drain).
-            EosRead::HostOnDrain | EosRead::GpuBatched | EosRead::GpuBatchedNonblocking => false,
-            EosRead::Blocking => {
-                self.counters.poll_iters += 1;
-                self.ring.eos_flag().to_vec1::<u8>()?[0] != 0
-            }
-            // A ring whose words are not CPU-mapped cannot be polled at all —
-            // `poll_eos` declines every time — so the wait is the blocking read
-            // from the start, and counted as the fallback it is.
-            EosRead::Poll(_) if !self.ring.poll_is_mapped() => {
-                self.counters.poll_iters += 1;
-                self.counters.poll_fallbacks += 1;
-                self.ring.eos_flag().to_vec1::<u8>()?[0] != 0
-            }
-            #[cfg(feature = "metal")]
-            EosRead::Poll(_) if self.ring.publish_event().is_some() => {
-                self.counters.poll_iters += 1;
-                let generation = self.generation;
-                match self.ring.poll_eos(generation) {
-                    Some(eos) => eos,
-                    None => {
-                        let ev = self.ring.publish_event().expect("armed above");
-                        // The stamp must be on the GPU before the host parks on
-                        // it: commit the buffer it sits in if nothing has yet.
-                        if !ev.committed() {
-                            if let Device::Metal(m) = self.ring.input_device().device() {
-                                m.flush_and_prune()?;
-                            }
-                        }
-                        self.counters.publish_parks += 1;
-                        let landed = ev.wait(generation as u64, EOS_PARK_TIMEOUT_MS);
-                        match self.ring.poll_eos(generation) {
-                            Some(eos) if landed => eos,
-                            // A timeout, or a stamp not yet visible behind its
-                            // signal: the blocking read, counted.
-                            _ => {
-                                self.counters.poll_fallbacks += 1;
-                                self.ring.eos_flag().to_vec1::<u8>()?[0] != 0
-                            }
-                        }
-                    }
-                }
-            }
-            EosRead::Poll(poll) => {
-                let generation = self.generation;
-                let poll_budget = self.poll_budget;
-                let mut spins: u64 = 0;
-                // The watched word, resolved once; `Wfe` arms the exclusive
-                // monitor on it and every other arm ignores it.
-                //
-                // SAFETY: the pointer is valid while `self.ring` is alive, and
-                // the ring outlives this loop.
-                let watched = unsafe { self.ring.step_addr() };
-                loop {
-                    self.counters.poll_iters += 1;
-                    match self.ring.poll_eos(generation) {
-                        Some(eos) => break eos,
-                        None => {
-                            spins += 1;
-                            if spins > poll_budget {
-                                // Counted, not silent: a fallback nobody
-                                // counts is a null that reads as a result.
-                                self.counters.poll_fallbacks += 1;
-                                break self.ring.eos_flag().to_vec1::<u8>()?[0] != 0;
-                            }
-                            match watched {
-                                // Wait for the counter to CHANGE from what the
-                                // poll just saw; the compare skips the wait
-                                // when the word has already moved.
-                                Some(p) => {
-                                    // SAFETY: as above; the word may be
-                                    // concurrently written, which is the point.
-                                    let seen = unsafe { p.read_volatile() };
-                                    unsafe { poll.wait_on(p, seen) }
-                                }
-                                None => poll.wait(),
-                            }
-                        }
-                    }
-                }
-            }
-        };
-        if is_eos {
-            self.counters.ring_eos_publishes += 1;
-            // Retract the EOS token from the still-open tile (the loop never
-            // streams it). The tile closes on the next `begin_step`.
-            self.history.retract_one();
-            self.retracted_stamp = Some(self.generation as usize);
-        }
-        Ok(is_eos)
+        self.eos_of_last_with(|| Ok(()))
     }
 
     fn take_ids(&mut self) -> Result<Vec<u32>> {
@@ -2737,6 +2603,206 @@ impl ReadbackStrategy for Ring {
 }
 
 impl Ring {
+    /// Shared retraction mechanics; each strategy checks its own sampler/budget arm.
+    fn retract_last_draw(&mut self) -> Result<()> {
+        if !(self.history.tile_open && self.history.in_tile > 0) {
+            lloom_tensor::bail!("Ring::retract_draw: no draw in the open tile to take back");
+        }
+        self.history.retract_one();
+        self.retracted_stamp = Some(self.generation as usize);
+        self.counters.ring_retracted += 1;
+        Ok(())
+    }
+
+    fn publish_marker_with(
+        &mut self,
+        force_live: bool,
+        mut stamp: impl FnMut(&TokenRing, u32, &Tensor) -> Result<()>,
+    ) -> Result<()> {
+        // The fused publish stamped inside `sample_and_feed`.
+        if self.fused_step {
+            return Ok(());
+        }
+        // Only the deferred-EOS arms write their marker at the commit window; the
+        // per-step reads (poll, flag) stamped inside `sample_and_feed`.
+        if !matches!(
+            self.eos,
+            EosRead::HostOnDrain | EosRead::GpuBatched | EosRead::GpuBatchedNonblocking
+        ) || self.generation == 0
+        {
+            return Ok(());
+        }
+        // The non-blocking batched arm stages its index at `close_window`; a loop
+        // that did not call it (or a window that grew since) is staged here, a
+        // step later than ideal but still fenced by its own buffer, not the tail.
+        // Not during the TTFT ramp (`force_live`), for `close_window`'s reason.
+        if matches!(self.eos, EosRead::GpuBatchedNonblocking) && !force_live {
+            let covered = self.staged_eos.borrow().last().is_some_and(|w| {
+                w.start == self.history.drained && w.start + w.len == self.history.fed
+            });
+            if !covered {
+                self.stage_window()?;
+            }
+        }
+        // GpuBatched: enqueue the batched EOS check over this window's tokens
+        // BEFORE the marker/commit, so the `eos_index` dispatch rides the committing
+        // buffer AFTER the window's slots (queue order) and its `[1]` result is
+        // ready to read back at the drain. The host reads that index once per
+        // commit (`eos_in_drained`), never scanning the tokens itself. A window that
+        // does not present a dense single-segment view (quantum>1, or a
+        // segment-boundary straddle) yields `None` here and the drain falls back to
+        // the host scan for this commit.
+        if matches!(self.eos, EosRead::GpuBatched) {
+            // `eos_index` is a Metal kernel; off Metal the window has no dense
+            // device check and every drain takes the host scan.
+            #[cfg(feature = "metal")]
+            let pending = match self.history.window_view().filter(|t| t.device().is_metal()) {
+                Some(tokens) => {
+                    #[cfg(feature = "metal")]
+                    {
+                        let n = tokens.elem_count();
+                        let idx = tokens.eos_index(n, self.ring.eos_ids_tensor())?;
+                        Some((idx, n))
+                    }
+                    // `eos_index` is a Metal dispatch; without it there is nothing
+                    // to enqueue and the drain's host scan covers this commit.
+                    #[cfg(not(feature = "metal"))]
+                    {
+                        let _ = tokens;
+                        None
+                    }
+                }
+                None => None,
+            };
+            #[cfg(not(feature = "metal"))]
+            let pending = None;
+            *self.pending_eos_index.borrow_mut() = pending;
+        }
+        // The wake-cadence throttle. A commit is LIVE — writes the device word the
+        // host WFE-waits on — when the ramp forces it, or when `live_every`
+        // commits have passed since the last live one. A non-live commit writes
+        // NOTHING: the device word stays at the last live value, so the drain
+        // clamps more conservatively and simply catches up on the next live commit
+        // (or the final `drain_all`, which force-synchronises). Skipping the write
+        // can never read an unwritten slot (§3.5) — it only defers visibility.
+        let since = self.commits_since_live.get() + 1;
+        let live = force_live || since >= self.live_every;
+        if live {
+            // The last entry carries `self.generation`, `fed` through the last fed
+            // step, so the marker publishes exactly the window the drain is about
+            // to read.
+            for &(seg, g) in &self.unstamped {
+                stamp(&self.ring, g, &self.history.ring.segments[seg])?;
+            }
+            self.unstamped.clear();
+            self.commits_since_live.set(0);
+        } else {
+            self.commits_since_live.set(since);
+        }
+        Ok(())
+    }
+
+    fn eos_of_last_with(&mut self, mut check_error: impl FnMut() -> Result<()>) -> Result<bool> {
+        check_error()?;
+        let is_eos = match self.eos {
+            // EOS is not learned per token on the deferred arms — the loop learns
+            // it from `eos_in_drained` on the batch it streams (a host scan for
+            // `HostOnDrain`, the batched `eos_index` result for `GpuBatched`), so
+            // this always answers `false` and never retracts here (the truncation
+            // happens host-side, at the drain).
+            EosRead::HostOnDrain | EosRead::GpuBatched | EosRead::GpuBatchedNonblocking => false,
+            EosRead::Blocking => {
+                self.counters.poll_iters += 1;
+                self.ring.eos_flag().to_vec1::<u8>()?[0] != 0
+            }
+            // A ring whose words are not CPU-mapped cannot be polled at all —
+            // `poll_eos` declines every time — so the wait is the blocking read
+            // from the start, and counted as the fallback it is.
+            EosRead::Poll(_) if !self.ring.poll_is_mapped() => {
+                self.counters.poll_iters += 1;
+                self.counters.poll_fallbacks += 1;
+                self.ring.eos_flag().to_vec1::<u8>()?[0] != 0
+            }
+            #[cfg(feature = "metal")]
+            EosRead::Poll(_) if self.ring.publish_event().is_some() => {
+                self.counters.poll_iters += 1;
+                let generation = self.generation;
+                match self.ring.poll_eos(generation) {
+                    Some(eos) => eos,
+                    None => {
+                        let ev = self.ring.publish_event().expect("armed above");
+                        // The stamp must be on the GPU before the host parks on
+                        // it: commit the buffer it sits in if nothing has yet.
+                        if !ev.committed() {
+                            if let Device::Metal(m) = self.ring.input_device().device() {
+                                m.flush_and_prune()?;
+                            }
+                        }
+                        self.counters.publish_parks += 1;
+                        let landed = ev.wait(generation as u64, EOS_PARK_TIMEOUT_MS);
+                        match self.ring.poll_eos(generation) {
+                            Some(eos) if landed => eos,
+                            // A timeout, or a stamp not yet visible behind its
+                            // signal: the blocking read, counted.
+                            _ => {
+                                self.counters.poll_fallbacks += 1;
+                                self.ring.eos_flag().to_vec1::<u8>()?[0] != 0
+                            }
+                        }
+                    }
+                }
+            }
+            EosRead::Poll(poll) => {
+                let generation = self.generation;
+                let poll_budget = self.poll_budget;
+                let mut spins: u64 = 0;
+                // The watched word, resolved once; `Wfe` arms the exclusive
+                // monitor on it and every other arm ignores it.
+                //
+                // SAFETY: the pointer is valid while `self.ring` is alive, and
+                // the ring outlives this loop.
+                let watched = unsafe { self.ring.step_addr() };
+                loop {
+                    check_error()?;
+                    self.counters.poll_iters += 1;
+                    match self.ring.poll_eos(generation) {
+                        Some(eos) => break eos,
+                        None => {
+                            spins += 1;
+                            if spins > poll_budget {
+                                // Counted, not silent: a fallback nobody
+                                // counts is a null that reads as a result.
+                                self.counters.poll_fallbacks += 1;
+                                break self.ring.eos_flag().to_vec1::<u8>()?[0] != 0;
+                            }
+                            match watched {
+                                // Wait for the counter to CHANGE from what the
+                                // poll just saw; the compare skips the wait
+                                // when the word has already moved.
+                                Some(p) => {
+                                    // SAFETY: as above; the word may be
+                                    // concurrently written, which is the point.
+                                    let seen = unsafe { p.read_volatile() };
+                                    unsafe { poll.wait_on(p, seen) }
+                                }
+                                None => poll.wait(),
+                            }
+                        }
+                    }
+                }
+            }
+        };
+        check_error()?;
+        if is_eos {
+            self.counters.ring_eos_publishes += 1;
+            // Retract the EOS token from the still-open tile (the loop never
+            // streams it). The tile closes on the next `begin_step`.
+            self.history.retract_one();
+            self.retracted_stamp = Some(self.generation as usize);
+        }
+        Ok(is_eos)
+    }
+
     /// Stamps issued beyond the history's real tokens: one for every EOS a
     /// per-step arm stamped and then retracted (`eos_of_last`), whose slot the
     /// next write reuses. Changes only at such a retraction, which ends its

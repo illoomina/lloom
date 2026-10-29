@@ -9,6 +9,9 @@ use rand::SeedableRng;
 pub mod budget;
 mod distribution;
 pub mod hot_thread;
+#[cfg(feature = "metal")]
+pub mod native;
+mod noise;
 pub mod poll;
 pub mod processors;
 pub mod readback;
@@ -915,13 +918,26 @@ impl LogitsProcessor {
         feed: impl FnOnce(u32) -> u32,
     ) -> Result<u32> {
         let temperature = self.temperature();
-        let Some(stage) = self.stage.as_mut() else {
-            let id = self.draw(logits, f)?;
-            self.digest_step(logits)?;
-            return Ok(feed(id));
+        let drawn = match self.stage.as_mut() {
+            None => self.draw(logits, f)?,
+            Some(stage) => {
+                let processed = stage.apply(logits, temperature)?;
+                self.draw(&processed, f)?
+            }
         };
-        let processed = stage.apply(logits, temperature)?;
-        let drawn = self.draw(&processed, f)?;
+        self.accept_drawn(logits, drawn, feed)
+    }
+
+    /// Shared post-draw contract for a host-valid id: raw digest -> forcing ->
+    /// the actual fed token in the SAME Stage device count tensor used by the
+    /// next scalar/native draw. NativeBlocking calls only after its checked
+    /// sample readback, not from an unchecked device id.
+    pub(super) fn accept_drawn(
+        &mut self,
+        logits: &Tensor,
+        drawn: u32,
+        feed: impl FnOnce(u32) -> u32,
+    ) -> Result<u32> {
         self.digest_step(logits)?;
         let id = feed(drawn);
         if let Some(stage) = self.stage.as_mut() {

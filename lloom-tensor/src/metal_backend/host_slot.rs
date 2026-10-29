@@ -62,7 +62,11 @@ impl HostSlot {
     /// straight from the device and wires its pages, so the allocation is not
     /// an ordinal any arena could serve and not a buffer any pool can recycle.
     pub fn new(device: &MetalDevice, cap: usize, dtype: DType) -> Result<Self> {
-        let bytes = (cap * dtype.size_in_bytes()).max(1);
+        let bytes = cap
+            .checked_mul(dtype.size_in_bytes())
+            .filter(|&n| n <= isize::MAX as usize)
+            .ok_or_else(|| crate::Error::Msg("HostSlot: byte capacity overflow".into()))?
+            .max(1);
         // Outside any pass plan: the value is the host's, never a later
         // dispatch's ordinal (§9.2aa).
         let _escape = crate::EscapeGuard::new();
@@ -264,32 +268,108 @@ impl HostSlot {
         Ok(())
     }
 
-    /// The first `n` u32 words as the host sees them now, into `out`: no
-    /// wait and no readback counted — a poll of a value the GPU may be
-    /// writing. Each word is the old value or the new one (an aligned u32
-    /// store); which words are new is the caller's to decide.
+    /// The first `n` u32 words as the host sees them now. The caller owns
+    /// ordering; words may individually be old or new during a GPU write.
     pub fn peek_u32(&self, n: usize, out: &mut Vec<u32>) -> Result<()> {
-        self.check_u32(n)?;
-        // SAFETY: session-owned Shared memory, read by aligned volatile loads;
-        // a concurrent GPU store leaves each word old or new.
-        let ptr = unsafe { self.buffer.contents() } as *const u32;
-        out.clear();
-        // SAFETY: as `fill_u32`; reads only.
-        out.extend((0..n).map(|i| unsafe { ptr.add(i).read_volatile() }));
-        Ok(())
+        peek_u32(&self.buffer, self.dtype, self.cap, n, out)
+    }
+
+    /// Retain only future host-read ownership. No write, tensor, reset or
+    /// native-buffer capability escapes; the physical allocation stays live
+    /// until the final reader drops, independently of the producing slot.
+    pub(crate) fn read_view(&self) -> HostReadView {
+        HostReadView {
+            buffer: self.buffer.clone(),
+            dtype: self.dtype,
+            cap: self.cap,
+        }
     }
 
     fn check_u32(&self, n: usize) -> Result<()> {
-        if self.dtype != DType::U32 {
-            crate::bail!("HostSlot: a u32 access to a {:?} slot", self.dtype)
+        check_u32(&self.buffer, self.dtype, self.cap, n)
+    }
+}
+
+/// A retained read owner, not a native-binding or emission-closed receipt.
+#[derive(Clone)]
+pub(crate) struct HostReadView {
+    buffer: BufferHandle,
+    dtype: DType,
+    cap: usize,
+}
+
+impl HostReadView {
+    pub(crate) fn peek_u32(&self, n: usize, out: &mut Vec<u32>) -> Result<()> {
+        peek_u32(&self.buffer, self.dtype, self.cap, n, out)
+    }
+}
+
+fn check_u32(buffer: &BufferHandle, dtype: DType, cap: usize, n: usize) -> Result<()> {
+    if dtype != DType::U32 {
+        crate::bail!("HostSlot: a u32 access to a {dtype:?} slot")
+    }
+    if n > cap || n.checked_mul(4).is_none_or(|bytes| bytes > buffer.length()) {
+        crate::bail!("HostSlot: {n} words exceed logical or physical slot capacity {cap}")
+    }
+    // SAFETY: the pointer is only compared with null.
+    if unsafe { buffer.contents() }.is_null() {
+        crate::bail!("HostSlot: the slot lost its CPU mapping")
+    }
+    Ok(())
+}
+
+fn peek_u32(
+    buffer: &BufferHandle,
+    dtype: DType,
+    cap: usize,
+    n: usize,
+    out: &mut Vec<u32>,
+) -> Result<()> {
+    check_u32(buffer, dtype, cap, n)?;
+    // SAFETY: retained mapped Shared memory; bounds checked against actual
+    // buffer bytes. Aligned volatile loads each see an old or new GPU word.
+    // The caller establishes completion before treating words as a record.
+    let ptr = unsafe { buffer.contents() } as *const u32;
+    out.clear();
+    out.extend((0..n).map(|i| unsafe { ptr.add(i).read_volatile() }));
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retained_read_view_survives_slot_and_checks_actual_bytes() -> Result<()> {
+        crate::isolation::claim("retained HostSlot read owner");
+        let mut tuning = crate::tuning::Tuning::default();
+        tuning.from_env().expect("valid environment");
+        tuning.contract.profile = "deterministic".into();
+        crate::tuning::install(tuning).expect("before device");
+        let d = crate::Device::new_metal(0)?;
+        {
+            let encoder = d.as_metal_device()?.command_encoder()?;
+            println!(
+                "HOST_READ_VIEW_SETUP metal4={}",
+                encoder.as_ref().command_buffer.is_metal4()
+            );
         }
-        if n > self.cap {
-            crate::bail!("HostSlot: {n} words of a slot of {}", self.cap)
-        }
-        // SAFETY: the pointer is only compared with null.
-        if unsafe { self.buffer.contents() }.is_null() {
-            crate::bail!("HostSlot: the slot lost its CPU mapping")
-        }
+        let slot = HostSlot::new(d.as_metal_device()?, 1, DType::U32)?;
+        slot.fill_u32(17, 1)?;
+        let mut view = slot.read_view();
+        drop(slot);
+        let mut words = Vec::with_capacity(1);
+        view.peek_u32(1, &mut words)?;
+        assert_eq!(words, [17]);
+        assert!(view.peek_u32(2, &mut words).is_err());
+        // Corrupt only private logical metadata to establish that physical
+        // bounds, not the advertised capacity alone, fence every reader.
+        view.cap = usize::MAX;
+        assert!(view.peek_u32(usize::MAX, &mut words).is_err());
+        assert!(view
+            .peek_u32(view.buffer.length() / 4 + 1, &mut words)
+            .is_err());
+        assert!(HostSlot::new(d.as_metal_device()?, usize::MAX, DType::U32).is_err());
         Ok(())
     }
 }

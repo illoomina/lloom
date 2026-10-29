@@ -14,7 +14,7 @@ use std::sync::Arc;
 /// Prepared outside the decode loop. A pending snapshot owns its source and
 /// cannot be overwritten, including when the caller abandons a poll.
 #[allow(dead_code, reason = "private bridge; native admission is separate")]
-pub(super) struct SampleReadback {
+pub struct SampleReadback {
     slot: HostSlot,
     destination: MetalStorage,
     device: MetalDevice,
@@ -37,7 +37,7 @@ struct PendingSnapshot {
 /// Only constructed after the entire completed result has passed validation.
 /// No unchecked Tensor/storage escape exists, even for an invalid later row.
 #[allow(dead_code, reason = "private bridge; native admission is separate")]
-pub(super) struct CheckedSample<'a> {
+pub struct CheckedSample<'a> {
     ids: &'a [u32],
 }
 
@@ -88,7 +88,7 @@ impl SampleReadback {
     /// encoder; no flush, wait, native
     /// completion subscriber or global failure injection is added. Prepared
     /// readback capacity is reused; encoder/pipeline costs remain their own.
-    pub fn enqueue(&mut self, sample: PrivateMultinomial) -> Result<()> {
+    pub(super) fn enqueue(&mut self, sample: PrivateMultinomial) -> Result<()> {
         self.enqueue_inner(sample, None)
     }
 
@@ -140,6 +140,7 @@ impl SampleReadback {
         }
         self.poisoned = true;
         let encoder = self.device.command_encoder()?;
+        super::guard::require_classical_encoder(&encoder)?;
         // CommandsGuard holds the recording-state exclusion: neither a cut
         // nor a concurrent commit can change this epoch between these copies.
         let epoch = self.clock.current_epoch();

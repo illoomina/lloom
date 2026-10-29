@@ -200,6 +200,17 @@ impl<'a> Asks<'a> {
 /// - The batched bodies draw per row without processors, feed no forced
 ///   token and keep no logprobs; the batched windows verify by the argmax.
 pub fn refuse(body: Body, asks: &Asks<'_>) -> Result<()> {
+    refuse_with_prepared_sampler(body, asks, false)
+}
+
+/// The request-owned prepared strategy supplies the device filter. All other
+/// restrictions remain in this shared table; ordinary rings keep their routes.
+#[cfg(feature = "metal")]
+pub fn refuse_prepared_step(asks: &Asks<'_>) -> Result<()> {
+    refuse_with_prepared_sampler(Body::Step { ring: true }, asks, true)
+}
+
+fn refuse_with_prepared_sampler(body: Body, asks: &Asks<'_>, prepared: bool) -> Result<()> {
     if let Some(k) = asks.logprobs.filter(|&k| k > MAX_TOP_LOGPROBS) {
         lloom_tensor::bail!(
             "per-token logprobs name at most {MAX_TOP_LOGPROBS} candidates beside the drawn id, \
@@ -207,16 +218,18 @@ pub fn refuse(body: Body, asks: &Asks<'_>) -> Result<()> {
         );
     }
     match body {
-        Body::Step { ring: true } if asks.sampling.requires_host() => lloom_tensor::bail!(
-            "the ring needs a device-resident sampler (argmax, multinomial or gumbel-max); \
+        Body::Step { ring: true } if asks.sampling.requires_host() && !prepared => {
+            lloom_tensor::bail!(
+                "the ring needs a device-resident sampler (argmax, multinomial or gumbel-max); \
              {:?} takes {} and cannot ride it (DESIGN.md §11.2c)",
-            asks.sampling,
-            if matches!(asks.sampling, Sampling::FilteredGumbel { .. }) {
-                "an explicit host draw"
-            } else {
-                "a host sort"
-            }
-        ),
+                asks.sampling,
+                if matches!(asks.sampling, Sampling::FilteredGumbel { .. }) {
+                    "an explicit host draw"
+                } else {
+                    "a host sort"
+                }
+            )
+        }
         Body::Step { ring: true } if asks.digest => lloom_tensor::bail!(
             "the ring draws on the device and the logits digest reads every step's logits on \
              the host: the digest runs on the blocking arm"
@@ -2058,13 +2071,7 @@ impl<'m, M: CausalLM> Session<'m, M> {
         S: Speculator,
         R: ReadbackStrategy,
     {
-        refuse(
-            Body::Step {
-                ring: readback.arms().token_ring,
-            },
-            &Asks::of(sampler, false),
-        )?;
-        readback.check_sampler(sampler.sampling())?;
+        readback.check_request(sampler)?;
         let out = self.decode_until_run(spec, readback, sampler, prompt, opts, on_tokens);
         if out.is_err() {
             // A run that failed mid-way may leave a provisional step: settled
@@ -2623,9 +2630,8 @@ impl<'m, M: CausalLM> Session<'m, M> {
                 }
                 self.model.prepare_pass(&mut self.seq.cache, 1)?;
                 let pass = begin_decode_step(&device, R::PASS_INPUT)?;
-                logits = self
-                    .model
-                    .forward(&feed, self.seq.pos, &mut self.seq.cache)?
+                logits = readback
+                    .forward_input(self.model, &feed, self.seq.pos, &mut self.seq.cache)?
                     .squeeze(0)?;
                 pass.finish()?;
                 self.seq.pos += 1;
@@ -2664,9 +2670,8 @@ impl<'m, M: CausalLM> Session<'m, M> {
                 let t = timed.then(std::time::Instant::now);
                 self.model.prepare_pass(&mut self.seq.cache, 1)?;
                 let pass = begin_decode_step(&device, R::PASS_INPUT)?;
-                logits = self
-                    .model
-                    .forward(&feed, self.seq.pos, &mut self.seq.cache)?
+                logits = readback
+                    .forward_input(self.model, &feed, self.seq.pos, &mut self.seq.cache)?
                     .squeeze(0)?;
                 pass.finish()?;
                 self.seq.pos += 1;
@@ -2734,9 +2739,8 @@ impl<'m, M: CausalLM> Session<'m, M> {
                         }
                         self.model.prepare_pass(&mut self.seq.cache, 1)?;
                         let pass = begin_decode_step(&device, R::PASS_INPUT)?;
-                        logits = self
-                            .model
-                            .forward(&again, self.seq.pos, &mut self.seq.cache)?
+                        logits = readback
+                            .forward_input(self.model, &again, self.seq.pos, &mut self.seq.cache)?
                             .squeeze(0)?;
                         pass.finish()?;
                         self.seq.pos += 1;

@@ -266,9 +266,9 @@ impl MetalStorage {
     }
 }
 
-mod guard;
-mod prepared;
-mod readback;
+pub(super) mod guard;
+pub(super) mod prepared;
+pub(super) mod readback;
 mod result;
 
 #[cfg(test)]

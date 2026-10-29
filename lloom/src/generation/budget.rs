@@ -101,6 +101,15 @@ impl ThinkingBudget {
         &self.forced
     }
 
+    /// Validate the forced token table before preparing native consumers.
+    #[cfg(feature = "metal")]
+    pub(crate) fn check_native_vocab(&self, vocab: usize) -> Result<()> {
+        if self.forced().iter().any(|&id| id as usize >= vocab) {
+            lloom_tensor::bail!("native sampling: forced token exceeds vocabulary");
+        }
+        Ok(())
+    }
+
     /// The first step whose fed token no longer depends on the budget.
     fn window_end(&self) -> usize {
         self.free() + self.forced.len()
@@ -134,6 +143,13 @@ pub(crate) struct ForcingMark {
 }
 
 impl HostForcing {
+    /// A native window must reject an out-of-vocabulary host-forced tail
+    /// before any window/fold encoding, not discover it at a later table read.
+    #[cfg(feature = "metal")]
+    pub(crate) fn check_vocab(&self, vocab: usize) -> Result<()> {
+        self.cfg.check_native_vocab(vocab)
+    }
+
     pub(crate) fn mark(&self) -> ForcingMark {
         ForcingMark {
             step: self.step,
@@ -185,6 +201,8 @@ pub(crate) struct DeviceForcing {
     close: Tensor,
     /// `[k]` `U32`: the forced tail.
     forced: Tensor,
+    #[cfg(feature = "metal")]
+    guarded: Option<(Tensor, Tensor)>,
 }
 
 impl DeviceForcing {
@@ -196,7 +214,76 @@ impl DeviceForcing {
             forced: Tensor::new(cfg.forced.as_slice(), device)?,
             step: 0,
             cfg,
+            #[cfg(feature = "metal")]
+            guarded: None,
         })
+    }
+
+    #[cfg(feature = "metal")]
+    pub(crate) fn prepare_guarded(&mut self) -> Result<()> {
+        if self.step != 0
+            || self.cfg.free() > u32::MAX as usize
+            || self.cfg.forced.len() > u32::MAX as usize
+            || self.cfg.close_ids.len() > u32::MAX as usize
+        {
+            lloom_tensor::bail!(
+                "guarded thinking budget: prepare before feeding with u32 geometry"
+            );
+        }
+        let device = self.closed.device();
+        self.guarded = Some((
+            Tensor::new(&[0u32, 0], device)?,
+            Tensor::zeros(1, DType::U32, device)?,
+        ));
+        Ok(())
+    }
+
+    #[cfg(feature = "metal")]
+    pub(crate) fn check_guarded_device(&self, device: &Device) -> Result<()> {
+        if !self.closed.device().same_device(device) || self.guarded.is_none() {
+            lloom_tensor::bail!("native thinking budget: prepared device mismatch");
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "metal")]
+    pub(crate) fn feed_guarded(
+        &mut self,
+        token: &mut lloom_tensor::metal_backend::sampling::GuardedSample<'_>,
+    ) -> Result<()> {
+        if !self.live() {
+            return Ok(());
+        }
+        let Some((state, out)) = self.guarded.as_ref() else {
+            lloom_tensor::bail!("guarded thinking budget: no prepared state/output");
+        };
+        fn metal(t: &Tensor) -> Result<lloom_tensor::MetalStorage> {
+            let (storage, layout) = t.storage_and_layout();
+            if !layout.is_contiguous() || layout.start_offset() != 0 {
+                lloom_tensor::bail!(
+                    "guarded thinking budget: contiguous prepared storage required"
+                );
+            }
+            let lloom_tensor::Storage::Metal(storage) = &*storage else {
+                lloom_tensor::bail!("guarded thinking budget: Metal storage required");
+            };
+            Ok(storage.clone())
+        }
+        // SAFETY: this request privately owns state/out; the native sampler
+        // API retains its mutable budget borrow through the returned carrier.
+        // Every later feed is queue-ordered after the earlier carrier's reads;
+        // no host mutation or public tensor alias can change these bytes.
+        unsafe {
+            token.feed_into(
+                &metal(&self.forced)?,
+                &metal(&self.close)?,
+                &metal(state)?,
+                &metal(out)?,
+                self.cfg.free() as u32,
+            )?;
+        }
+        self.step += 1;
+        Ok(())
     }
 
     /// Whether this step's fed token can still differ from its draw.

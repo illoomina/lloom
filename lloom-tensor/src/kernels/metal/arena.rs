@@ -81,7 +81,7 @@
 // Its slots are unpooled handles over its own base, which is what §9.2a's
 // layer 3 means -- the free list never sees them. The test module below imports
 // one of its own, to assert that installing an arena leaves it untouched.
-use super::{ArenaOffsets, Buffer, BufferHandle, PooledBuffer};
+use super::{ArenaOffsets, ArenaWatch, Buffer, BufferHandle, PooledBuffer};
 use parking_lot::Mutex;
 use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -363,6 +363,15 @@ pub struct PassPlanCounters {
     /// Passes abandoned after their body failed (`MetalDevice::abort_pass`).
     /// None of them published a recording or an observation.
     pub aborted: u64,
+    /// Served allocations declined because a value an earlier served pass
+    /// produced still held their bytes and was still referenced: undeclared
+    /// escapes (`EscapeLog`, `pass-plan-design.md` §26). Every gate asserts 0.
+    pub undeclared_escapes: u64,
+    /// Such values bound after a later pass began (debug and `profile`
+    /// builds only; 0 in the shipping build).
+    pub escapes_used: u64,
+    /// Such values dropped unused after costing declines.
+    pub escapes_held_unused: u64,
 }
 
 /// Alignment of every slot, in bytes.
@@ -778,6 +787,10 @@ pub struct ArenaCounters {
     pub declined_drift: u64,
     /// Requests made under an [`EscapeGuard`], declined as declared escapes.
     pub declined_escaped: u64,
+    /// Requests declined because their slot's bytes still held a value an
+    /// earlier pass produced and something still referenced
+    /// ([`ArenaDecline::Held`]).
+    pub declined_held: u64,
     /// Decode steps begun.
     pub steps: u64,
     /// Times a GPU-computed offset table was verified equal to the plan and
@@ -824,6 +837,7 @@ struct LiveCounters {
     declined_exhausted: AtomicU64,
     declined_drift: AtomicU64,
     declined_escaped: AtomicU64,
+    declined_held: AtomicU64,
     steps: AtomicU64,
     gpu_verified: AtomicU64,
 }
@@ -838,6 +852,7 @@ impl LiveCounters {
             declined_exhausted: self.declined_exhausted.load(Ordering::Relaxed),
             declined_drift: self.declined_drift.load(Ordering::Relaxed),
             declined_escaped: self.declined_escaped.load(Ordering::Relaxed),
+            declined_held: self.declined_held.load(Ordering::Relaxed),
             steps: self.steps.load(Ordering::Relaxed),
             gpu_verified: self.gpu_verified.load(Ordering::Relaxed),
         }
@@ -851,6 +866,7 @@ impl LiveCounters {
         self.declined_exhausted.store(0, Ordering::Relaxed);
         self.declined_drift.store(0, Ordering::Relaxed);
         self.declined_escaped.store(0, Ordering::Relaxed);
+        self.declined_held.store(0, Ordering::Relaxed);
         self.steps.store(0, Ordering::Relaxed);
         self.gpu_verified.store(0, Ordering::Relaxed);
     }
@@ -911,6 +927,11 @@ pub enum ArenaDecline {
     /// Made under an [`EscapeGuard`]: declared to outlive the pass, so no
     /// slot may hold it whatever the plan says about the ordinal.
     Escaped,
+    /// The slot's bytes still hold a value an earlier pass produced, and
+    /// something still references it: an undeclared escape, counted and
+    /// named by the plan cache's [`EscapeLog`]. Serving the slot would
+    /// overwrite it.
+    Held,
 }
 
 /// What the arena did with one offered allocation.
@@ -1134,6 +1155,11 @@ struct ArenaInner {
     /// Whether a step is currently open. Outside a step the arena declines
     /// everything, so prefill and setup allocate from the pool as before.
     active: AtomicU64,
+    /// This step's slots whose bytes a carried value still holds
+    /// ([`Arena::watch`]), and whether there are any: one relaxed load per
+    /// served allocation when there are none.
+    watch: Mutex<Vec<ArenaWatch>>,
+    watching: std::sync::atomic::AtomicBool,
 }
 
 impl Arena {
@@ -1214,6 +1240,8 @@ impl Arena {
                 typed_step_generation: AtomicU64::new(0),
                 typed_step_valid: std::sync::atomic::AtomicBool::new(false),
                 active: AtomicU64::new(0),
+                watch: Mutex::new(Vec::new()),
+                watching: std::sync::atomic::AtomicBool::new(false),
             }),
         })
     }
@@ -1303,6 +1331,11 @@ impl Arena {
         &self.inner.base
     }
 
+    /// Whether `other` is this arena (a clone of it).
+    pub fn same(&self, other: &Arena) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
     pub fn layout(&self) -> ArenaLayout {
         self.inner.plan_state.layout
     }
@@ -1337,6 +1370,66 @@ impl Arena {
         self.inner.typed_step_valid.store(false, Ordering::Relaxed);
         self.inner.active.store(0, Ordering::Relaxed);
         DISPATCH_COUNTING.store(false, Ordering::Relaxed);
+        self.clear_watch();
+    }
+
+    /// Watch this step's handouts: a slot named in `watch` is declined while
+    /// its carried value is alive. A watch holds the arenas it names, its
+    /// own included, so it lasts one step: [`Self::end_step`] clears it.
+    pub fn watch(&self, watch: Vec<ArenaWatch>) {
+        let mut g = self.inner.watch.lock();
+        *g = watch;
+        self.inner.watching.store(!g.is_empty(), Ordering::Relaxed);
+    }
+
+    fn clear_watch(&self) {
+        if self.inner.watching.swap(false, Ordering::Relaxed) {
+            let old = std::mem::take(&mut *self.inner.watch.lock());
+            drop(old);
+        }
+    }
+
+    /// Whether anything outside the arena still references slot `slot`.
+    /// A slot handle is held by the arena and by every storage it served, so
+    /// this is the slot's previous occupants still being alive.
+    pub fn slot_alive(&self, slot: usize) -> bool {
+        BufferHandle::strong_count(&self.inner.plan_state.slot_handles[slot]) > 1
+    }
+
+    /// Slots still referenced from outside, as `(slot, offset, size, the
+    /// last ordinal the plan gives the slot)`. Read at a pass's opening for
+    /// the arena that served the pass before: what it finds outlived its pass.
+    pub fn live_slots(&self) -> Vec<(usize, usize, usize, usize)> {
+        let plan = &self.inner.plan_state.plan;
+        (0..plan.slots().len())
+            .filter(|&s| self.slot_alive(s))
+            .map(|s| {
+                let slot = &plan.slots()[s];
+                let last = plan
+                    .by_ordinal
+                    .iter()
+                    .rposition(|e| matches!(e, Some((at, _)) if *at == s))
+                    .unwrap_or(0);
+                (s, slot.offset, slot.size, last)
+            })
+            .collect()
+    }
+
+    /// The handout's watch, on the declining path: the carried value slot
+    /// `slot` would overwrite, if it is still alive.
+    #[cold]
+    fn held_over(&self, slot: usize) -> bool {
+        let g = self.inner.watch.lock();
+        match g
+            .iter()
+            .find(|w| w.slot == slot && w.victim.slot_alive(w.victim_slot))
+        {
+            Some(w) => {
+                w.log.note_decline(w);
+                true
+            }
+            None => false,
+        }
     }
 
     /// Whether a step drifted from the plan since this was last asked, and
@@ -1528,6 +1621,13 @@ impl Arena {
                 self.inner.active.store(0, Ordering::Relaxed);
                 return make_claim(Some(ordinal), None, Some(ArenaDecline::Drift));
             }
+        }
+        // The slot's bytes may still hold a value an earlier pass left
+        // referenced. Serving it would overwrite that value; the pool keeps
+        // both right and the plan cache's log names it.
+        if self.inner.watching.load(Ordering::Relaxed) && self.held_over(slot) {
+            counters.declined_held.fetch_add(1, Ordering::Relaxed);
+            return make_claim(Some(ordinal), None, Some(ArenaDecline::Held));
         }
         make_claim(Some(ordinal), Some(slot), None)
     }

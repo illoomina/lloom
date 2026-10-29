@@ -6,6 +6,7 @@
 pub mod admission;
 pub mod arena;
 pub mod arena_cursor;
+pub mod escape;
 #[cfg(test)]
 mod arena_gpu_tests;
 /// The native-arm registry (§15.2a). Not in the glob re-export below:
@@ -162,6 +163,7 @@ pub mod upload_shadow;
 
 pub use arena::*;
 pub use arena_cursor::*;
+pub use escape::*;
 pub use backing::{
     Allocation, Backing, BackingStats, Backings, Commit, DeviceBuffer, Fallback, Heap, Mapped,
 };

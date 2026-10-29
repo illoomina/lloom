@@ -428,6 +428,7 @@ fn run_owner(
                     b["sessions"] = shared.sessions.lock().json();
                     b["keep_warm"] = shared.keep_warm.json(&shared.activity, uptime_ns());
                     b["keep_warm_actions"] = json!(shared.activity.actions.load(Ordering::Relaxed));
+                    b["pass_plans"] = super::report::pass_plan_escapes_json(shared.engine.device());
                     if let Some(s) = shared.engine.device().metal4_slot_residency() {
                         b["metal4_slot_residency"] = json!({
                             "adds": s.adds,

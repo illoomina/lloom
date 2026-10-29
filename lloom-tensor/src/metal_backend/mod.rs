@@ -40,6 +40,8 @@ pub use allocation_scope::{
 mod device;
 pub(crate) mod device_retirement;
 pub(crate) use device::retain_evicted_allocations;
+#[cfg(any(debug_assertions, feature = "profile"))]
+pub(crate) use device::call_site;
 mod physical_context;
 pub use device::{
     served_pass_request_sites, set_admission_drain, set_served_request_trace, wire_weights_on,
@@ -60,8 +62,9 @@ pub use host_slot::HostSlot;
 /// Re-exported for the same reason `trace` is below: a harness selecting a
 /// layout should not need a direct dependency on `candle-metal-kernels`.
 pub use crate::kernels::metal::{
-    hazard_key, set_hazard_key, set_hazard_key_unless_explicit, ArenaCounters, ArenaLayout,
-    EscapeGuard, FreeSummary, HazardKey, PassKey, PassKind, PassOpener, PassPlanCounters, Slot,
+    escape_check, hazard_key, set_escape_check, set_hazard_key, set_hazard_key_unless_explicit,
+    ArenaCounters, ArenaLayout, EscapeCheck, EscapeGuard, EscapeHit, EscapeKind, EscapeLog,
+    FreeSummary, HazardKey, HeldValue, PassKey, PassKind, PassOpener, PassPlanCounters, Slot,
     StepPlan,
 };
 

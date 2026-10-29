@@ -1,5 +1,6 @@
 use crate::kernels::metal::{
     arena,
+    escape,
     contention::{Censused, Side},
     executor::{DispatchAction, DispatchRecord, ExecutorSlot, Grid},
     late_bind, trace, Buffer, ComputePipeline, DeviceListing, Fence,
@@ -1966,6 +1967,7 @@ impl ComputeCommandEncoder {
             // The clock a liveness recording must use: a value is live until the
             // last dispatch that binds it (`DESIGN.md` §6.7 L4).
             arena::note_bind(ptr);
+            escape::note_use(buf);
             let range = Self::bound_range(buf, offset);
             let mut s = self.state.lock();
             late_bind::on_bind(ptr, false, s.current_pipeline.as_deref().unwrap_or("?"));
@@ -2044,6 +2046,7 @@ impl ComputeCommandEncoder {
                 true,
             );
             arena::note_bind(ptr);
+            escape::note_use(buf);
             let range = Self::bound_range(buf, offset);
             let mut s = self.state.lock();
             late_bind::on_bind(ptr, true, s.current_pipeline.as_deref().unwrap_or("?"));
@@ -2801,6 +2804,8 @@ impl BlitCommandEncoder {
         let destination_ptr = destination.raw_ptr() as usize;
         arena::note_bind(source_ptr);
         arena::note_bind(destination_ptr);
+        escape::note_use(&source);
+        escape::note_use(&destination);
         late_bind::on_bind(source_ptr, false, "blit copy");
         late_bind::on_bind(destination_ptr, true, "blit copy");
         self.wait_for_last_writers(&[source_ptr, destination_ptr]);
@@ -2934,6 +2939,8 @@ impl BlitCommandEncoder {
         // the copy still reads it (`DESIGN.md` §9.2aa).
         arena::note_bind(src_ptr);
         arena::note_bind(dst_ptr);
+        escape::note_use(src_buffer);
+        escape::note_use(dst_buffer);
         late_bind::on_bind(src_ptr, false, "blit copy");
         late_bind::on_bind(dst_ptr, true, "blit copy");
         self.wait_for_last_writers(&[src_ptr, dst_ptr]);

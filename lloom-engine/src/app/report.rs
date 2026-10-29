@@ -775,7 +775,8 @@ pub fn print_pass_plans(dev: &lloom_tensor::MetalDevice, widths: &str) {
     let (shared, private) = dev.served_pass_pool_requests();
     eprintln!(
         "[pass plans: served={} recorded={} observed={} plans={} evicted={} \
-         escapes={} capped={} base_grows={} served_pass_pool_requests=shared:{shared},private:{private} \
+         escapes={} undeclared_escapes={} escapes_used={} escapes_held_unused={} capped={} \
+         base_grows={} served_pass_pool_requests=shared:{shared},private:{private} \
          base={:.1} MiB widths={} keys=[{}]]",
         c.served,
         c.recorded,
@@ -783,6 +784,9 @@ pub fn print_pass_plans(dev: &lloom_tensor::MetalDevice, widths: &str) {
         c.plans,
         c.evicted,
         c.escapes,
+        c.undeclared_escapes,
+        c.escapes_used,
+        c.escapes_held_unused,
         c.capped,
         c.base_grows,
         base as f64 / (1024.0 * 1024.0),
@@ -796,6 +800,41 @@ pub fn print_pass_plans(dev: &lloom_tensor::MetalDevice, widths: &str) {
             if pool == 0 { "shared" } else { "private" }
         );
     }
+}
+
+/// The plan cache's undeclared escapes for `/health` and the bench RESULT
+/// (`pass-plan-design.md` §26): what was counted, and the producers named.
+/// `null` off Metal or with the cache off.
+pub fn pass_plan_escapes_json(dev: &lloom_tensor::Device) -> serde_json::Value {
+    #[cfg(feature = "metal")]
+    if let lloom_tensor::Device::Metal(m) = dev {
+        if let (Some(c), Some(log)) = (m.pass_plan_counters(), m.escape_log()) {
+            let named: Vec<String> = log
+                .named()
+                .into_iter()
+                .map(|(k, o)| format!("{:?}#{o}", k.kind))
+                .collect();
+            return serde_json::json!({
+                "undeclared_escapes": c.undeclared_escapes,
+                "escapes_used": c.escapes_used,
+                "escapes_held_unused": c.escapes_held_unused,
+                "named": named,
+            });
+        }
+    }
+    let _ = dev;
+    serde_json::Value::Null
+}
+
+/// The plan cache's undeclared escape count, for a RESULT line's gate (0
+/// off Metal or with the cache off).
+pub fn undeclared_escapes(dev: &lloom_tensor::Device) -> u64 {
+    #[cfg(feature = "metal")]
+    if let lloom_tensor::Device::Metal(m) = dev {
+        return m.pass_plan_counters().map_or(0, |c| c.undeclared_escapes);
+    }
+    let _ = dev;
+    0
 }
 
 /// What the ICB executor did: engagement first, then the residency term

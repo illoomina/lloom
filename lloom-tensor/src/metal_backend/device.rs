@@ -6,6 +6,7 @@ use crate::kernels::metal::CommandMarker;
 use crate::kernels::metal::ComputePipeline;
 use crate::kernels::{
     metal::{
+        escape::{watch_stale, ArenaWatch, CarriedStats, EscapeLog, HeldValue, StaleValue},
         session_region::{RegionCounters, RegionPlan},
         Arena, ArenaCounters, ArenaCursor, ArenaDecline, ArenaLayout, ArenaOffsets, ArenaRecorder,
         Backing, Backings, BlitCommandsGuard, Buffer, BufferHandle, BufferPool, Commands,
@@ -381,6 +382,105 @@ pub struct PassPlans {
     /// before anything is allocated, and the run stops rather than risking
     /// the machine. 0 turns the check off.
     admit_fraction: f64,
+    /// Served values still referenced after a later pass opened: their
+    /// slots' bytes are declined to every handout while they live
+    /// (`pass-plan-design.md` §26).
+    carried: Vec<Carried>,
+    /// The arena that served the last served pass, and its key: what it
+    /// still has referenced when the next pass opens is carried.
+    last_served: Option<(PassKey, Arena)>,
+    escape_log: Arc<EscapeLog>,
+}
+
+/// A served value still referenced after the pass that produced it.
+struct Carried {
+    arena: Arena,
+    slot: usize,
+    held: HeldValue,
+    /// The pass that opened while it was still referenced.
+    by: PassKey,
+    stats: Arc<CarriedStats>,
+}
+
+impl PassPlans {
+    /// At a pass's opening: forget the carried values that died (a held one
+    /// that cost declines unused is reported), carry what the last served
+    /// pass still has referenced, and watch every carried value's uses.
+    fn carry(&mut self, by: PassKey) {
+        let mut i = 0;
+        while i < self.carried.len() {
+            let c = &self.carried[i];
+            if c.arena.slot_alive(c.slot) {
+                i += 1;
+                continue;
+            }
+            let c = self.carried.swap_remove(i);
+            self.escape_log.note_dropped(&c.held, c.by, &c.stats);
+        }
+        if let Some((key, arena)) = self.last_served.take() {
+            for (slot, offset, size, ordinal) in arena.live_slots() {
+                if self
+                    .carried
+                    .iter()
+                    .any(|c| c.slot == slot && c.arena.same(&arena))
+                {
+                    continue;
+                }
+                self.carried.push(Carried {
+                    arena: arena.clone(),
+                    slot,
+                    held: HeldValue {
+                        key,
+                        ordinal,
+                        offset,
+                        size,
+                    },
+                    by,
+                    stats: Arc::default(),
+                });
+            }
+        }
+        watch_stale(
+            self.carried
+                .iter()
+                .map(|c| StaleValue {
+                    base: c.arena.base().raw_addr(),
+                    held: c.held,
+                    by: c.by,
+                    stats: c.stats.clone(),
+                    log: self.escape_log.clone(),
+                })
+                .collect(),
+        );
+    }
+
+    /// The slots of `arena`, serving `by`, whose bytes a carried value on the
+    /// same base still holds.
+    fn watch_for(&self, arena: &Arena, by: PassKey) -> Vec<ArenaWatch> {
+        let base = arena.base().raw_addr();
+        let mut watch = Vec::new();
+        for c in self
+            .carried
+            .iter()
+            .filter(|c| c.arena.base().raw_addr() == base)
+        {
+            let (start, end) = (c.held.offset, c.held.offset + c.held.size);
+            for (slot, s) in arena.slots().iter().enumerate() {
+                if s.offset < end && start < s.offset + s.size {
+                    watch.push(ArenaWatch {
+                        slot,
+                        victim: c.arena.clone(),
+                        victim_slot: c.slot,
+                        held: c.held,
+                        by,
+                        stats: c.stats.clone(),
+                        log: self.escape_log.clone(),
+                    });
+                }
+            }
+        }
+        watch
+    }
 }
 
 #[derive(Debug)]
@@ -629,6 +729,9 @@ impl PassPlans {
             // The KV grow's default (`Cache::kv_grow_fraction`), so the two
             // admissions speak of one budget rather than two.
             admit_fraction: 0.85,
+            carried: Vec::new(),
+            last_served: None,
+            escape_log: Arc::default(),
         }
     }
 }
@@ -2535,7 +2638,22 @@ impl MetalDevice {
     }
 
     pub fn pass_plan_counters(&self) -> Option<PassPlanCounters> {
-        self.pass_plans.lock().as_ref().map(|p| p.counters)
+        self.pass_plans.lock().as_ref().map(|p| PassPlanCounters {
+            undeclared_escapes: p.escape_log.undeclared_escapes(),
+            escapes_used: p.escape_log.used(),
+            escapes_held_unused: p.escape_log.held_unused(),
+            ..p.counters
+        })
+    }
+
+    /// The plan cache's undeclared escapes: what was counted, and the
+    /// producers named so far (`pass-plan-design.md` §26). `None` with the
+    /// cache off.
+    pub fn escape_log(&self) -> Option<Arc<EscapeLog>> {
+        self.pass_plans
+            .lock()
+            .as_ref()
+            .map(|p| p.escape_log.clone())
     }
 
     /// Requests this device's pools received while a served pass was open,
@@ -2682,6 +2800,7 @@ impl MetalDevice {
             )
             .into());
         }
+        pp.carry(key);
         let opener_bit = match key.opener {
             PassOpener::Model => 0b1000,
             PassOpener::Driver => 0,
@@ -2737,6 +2856,9 @@ impl MetalDevice {
                         *slot = Some(arena.clone());
                     }
                     arena.begin_step();
+                    if !pp.carried.is_empty() {
+                        arena.watch(pp.watch_for(&arena, key));
+                    }
                     pp.counters.served += 1;
                     self.pass_state
                         .fetch_or(0b100, std::sync::atomic::Ordering::Relaxed);
@@ -2857,6 +2979,7 @@ impl MetalDevice {
             PassState::Served(key) => {
                 self.end_decode_step();
                 if let Some(arena) = self.arena_slot() {
+                    pp.last_served = Some((key, arena.clone()));
                     if arena.take_drifted() {
                         pp.plans.remove(&key);
                         discarded = pp.arenas.remove(&key);
@@ -2920,6 +3043,7 @@ impl MetalDevice {
             PassState::Served(key) => {
                 self.end_decode_step();
                 if let Some(arena) = self.arena_slot() {
+                    pp.last_served = Some((key, arena.clone()));
                     if arena.take_drifted() {
                         pp.plans.remove(&key);
                         discarded = pp.arenas.remove(&key);

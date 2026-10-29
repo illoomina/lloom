@@ -151,6 +151,140 @@ pub struct MemGauge {
     sampler: Option<PeakSampler>,
 }
 
+#[cfg(test)]
+mod gauge_lifecycle_tests {
+    use super::*;
+
+    #[test]
+    fn abandoned_gauge_stops_and_retires_its_sampler() {
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = Arc::clone(&stop);
+        let retired = Arc::new(AtomicBool::new(false));
+        let worker_retired = Arc::clone(&retired);
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            while !worker_stop.load(Ordering::Acquire) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            worker_retired.store(true, Ordering::Release);
+            let _ = done_tx.send(());
+            (MemSnapshot::default(), 1)
+        });
+        let gauge = MemGauge {
+            before: MemSnapshot::default(),
+            sampler: Some((Arc::clone(&stop), handle)),
+        };
+        drop(gauge); // The same ownership exit as an early `?` in a sampled request.
+        let stopped_on_drop = stop.load(Ordering::Acquire);
+        let retired_on_drop = retired.load(Ordering::Acquire);
+        // Even the original defect/mutant must not leak the fixture's worker.
+        // Capture the observations BEFORE this rescue; rescue cannot satisfy them.
+        stop.store(true, Ordering::Release);
+        done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("fixture worker did not exit after rescue");
+        assert!(stopped_on_drop, "abandoned gauge did not stop its sampler");
+        assert!(retired_on_drop, "abandoned gauge did not join its sampler");
+    }
+    fn sample_owner() -> (MemGauge, Arc<AtomicBool>, std::sync::mpsc::Receiver<()>) {
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = Arc::clone(&stop);
+        let (done, receiver) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            while !worker_stop.load(Ordering::Acquire) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let _ = done.send(());
+            (
+                MemSnapshot {
+                    device_allocated: 17,
+                    ..MemSnapshot::default()
+                },
+                3,
+            )
+        });
+        (
+            MemGauge {
+                before: MemSnapshot {
+                    device_allocated: 5,
+                    ..MemSnapshot::default()
+                },
+                sampler: Some((Arc::clone(&stop), worker)),
+            },
+            stop,
+            receiver,
+        )
+    }
+
+    #[test]
+    fn finish_preserves_sample_and_retires_sampler_once() {
+        let (gauge, stop, done) = sample_owner();
+        let report = gauge.finish(&Device::Cpu);
+        assert!(stop.load(Ordering::Acquire));
+        done.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(
+            Arc::strong_count(&stop),
+            1,
+            "sampler ownership survived finish"
+        );
+        assert_eq!(report.before.device_allocated, 5);
+        assert_eq!(report.after.device_allocated, 0);
+        assert_eq!(report.peak.unwrap().device_allocated, 17);
+        assert_eq!(report.samples, 3);
+    }
+
+    #[test]
+    fn unwind_stops_sampler_without_masking_original_panic() {
+        let (gauge, stop, done) = sample_owner();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _gauge = gauge;
+            panic!("sampled request failed");
+        }));
+        let stopped = stop.load(Ordering::Acquire);
+        let owners = Arc::strong_count(&stop);
+        stop.store(true, Ordering::Release);
+        done.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(
+            result.unwrap_err().downcast_ref::<&str>(),
+            Some(&"sampled request failed")
+        );
+        assert!(stopped, "unwinding request did not stop its sampler");
+        assert_eq!(
+            owners, 1,
+            "unwinding request did not retire sampler ownership"
+        );
+    }
+
+    #[test]
+    fn disabled_and_cpu_gauges_never_create_sampler() {
+        for sampling in [false, true] {
+            let gauge = MemGauge::start(&Device::Cpu, sampling);
+            assert!(gauge.sampler.is_none());
+            let report = gauge.finish(&Device::Cpu);
+            assert!(report.peak.is_none());
+            assert_eq!(report.samples, 0);
+            drop(MemGauge::start(&Device::Cpu, sampling));
+        }
+    }
+
+    #[test]
+    fn failed_sampler_preserves_unsampled_report_contract() {
+        let stop = Arc::new(AtomicBool::new(false));
+        let gauge = MemGauge {
+            before: MemSnapshot::default(),
+            sampler: Some((
+                Arc::clone(&stop),
+                std::thread::spawn(|| panic!("sampler failed")),
+            )),
+        };
+        let report = gauge.finish(&Device::Cpu);
+        assert!(stop.load(Ordering::Acquire));
+        assert_eq!(Arc::strong_count(&stop), 1);
+        assert!(report.peak.is_none());
+        assert_eq!(report.samples, 0);
+    }
+}
+
 impl MemGauge {
     pub fn start(device: &Device, sample: bool) -> Self {
         let before = MemSnapshot::read(device);
@@ -186,8 +320,8 @@ impl MemGauge {
         Self { before, sampler }
     }
 
-    pub fn finish(self, device: &Device) -> MemReport {
-        let (peak, samples) = match self.sampler {
+    fn stop_sampler(&mut self) -> (Option<MemSnapshot>, u64) {
+        match self.sampler.take() {
             Some((stop, handle)) => {
                 stop.store(true, Ordering::Release);
                 match handle.join() {
@@ -196,13 +330,24 @@ impl MemGauge {
                 }
             }
             None => (None, 0),
-        };
+        }
+    }
+
+    pub fn finish(mut self, device: &Device) -> MemReport {
+        let (peak, samples) = self.stop_sampler();
         MemReport {
             before: self.before,
             after: MemSnapshot::read(device),
             peak,
             samples,
         }
+    }
+}
+
+impl Drop for MemGauge {
+    fn drop(&mut self) {
+        // A failed sampled request must release its diagnostic thread and device.
+        self.stop_sampler();
     }
 }
 

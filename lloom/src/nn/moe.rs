@@ -1,3 +1,6 @@
+pub mod routing;
+pub use routing::Routing;
+
 // Adapted from https://github.com/guoqingbao/attention.rs/blob/main/src/moe.rs
 #[cfg(feature = "cuda")]
 use lloom_tensor::cuda_backend::kernels::ffi;

@@ -577,6 +577,15 @@ pub struct Qwen4ExpTuning {
         status = "arm"
     )]
     pub f16_fold: bool,
+    /// The routed experts' SwiGLU on the gate|up pair's store: one launch computes both halves of a row tile and writes `silu(g) · u` (the pair then `silu_mul`, bit for bit) wherever the pair is one launch and the step would run `silu_mul`; off = the pair and `silu_mul` (the A/B arm). An arm, off by default.
+    #[opt(
+        flag = "qwen-routed-glu",
+        env = "QWEN4EXP_ROUTED_GLU",
+        bool,
+        path = "kernels.fusion.routed_glu",
+        status = "arm"
+    )]
+    pub routed_glu: bool,
     /// The DeltaNet prefill's chunk scan as one launch (off = the per-chunk launches).
     #[opt(
         flag = "chunk-scan",
@@ -740,6 +749,7 @@ impl Default for Qwen4ExpTuning {
             shared_store: false,
             mtp_experts: "streamed".into(),
             f16_fold: false,
+            routed_glu: false,
             chunk_scan: true,
             delta_reduce: false,
             state_write: "in-place".into(),

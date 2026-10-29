@@ -44,6 +44,7 @@ mod grad_tests;
 mod heap_transients;
 mod host_fed_ring;
 mod indexing_tests;
+mod io_queue_failed_load;
 mod io_queue_held;
 mod iq3xxs_gguf_read;
 mod iq_metal;

@@ -1314,3 +1314,140 @@ fn an_event_listener_runs_one_block_at_a_time() {
          arm's reproduction no longer reaches the defect"
     );
 }
+
+/// A recording that gates a second value of its event is counted, and the
+/// gate path prints nothing: it runs under the state lock, so the count is
+/// left to the run's report (`[host input since load: … beside_its_event=]`).
+///
+/// The test runs the gate in a child of this binary (its own harness name,
+/// `--exact`, output not captured) and reads the child's stderr: the
+/// child's `BESIDE_COUNT` line is the positive control that the gate path
+/// ran there, and it must be the only line about it.
+#[test]
+fn a_value_beside_its_event_is_counted_and_the_gate_path_prints_nothing() {
+    const CHILD: &str = "LLOOM_TEST_BESIDE_CHILD";
+    if std::env::var_os(CHILD).is_some() {
+        let f = fixture();
+        if f.commands.host_input_arm() == HostInputArm::GpuWait {
+            eprintln!("NOT_APPLICABLE nothing is gated on the gpu-wait arm");
+            return;
+        }
+        f.commands.commit_when_produced(&f.gate, 1).unwrap();
+        f.commands.commit_when_produced(&f.gate, 5).unwrap();
+        let stats = f.commands.produced_stats();
+        let cancelled = f
+            .commands
+            .cancel_produced_through(&f.gate, 5, "test: never produced");
+        f.gate.setSignaledValue(5);
+        let _ = f.commands.produced(&f.gate, 5);
+        f.commands.flush_and_wait().unwrap();
+        eprintln!(
+            "BESIDE_COUNT {} cancelled={cancelled:?}",
+            stats.beside_its_event
+        );
+        return;
+    }
+    let name = std::thread::current().name().unwrap().to_string();
+    let out = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", &name, "--nocapture", "--test-threads", "1"])
+        .env(CHILD, "1")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    eprintln!("CHILD status={:?} stderr:\n{stderr}", out.status);
+    assert!(out.status.success(), "the child failed: {stderr}");
+    if stderr.contains("NOT_APPLICABLE") {
+        return;
+    }
+    assert!(
+        stderr.lines().any(|l| l.starts_with("BESIDE_COUNT 1 ")),
+        "the child's gate path did not count one value beside its event: {stderr}"
+    );
+    assert!(
+        !stderr.contains("beside another value of its event"),
+        "the gate path printed under the state lock: {stderr}"
+    );
+}
+
+/// Final teardown commits held work as recorded, whatever its gate: with
+/// no producer left there is nothing to wait for (`release_held_for_teardown`).
+/// A host producer never leaves work there that waited for a value it gave
+/// up: it cancels through the value, then raises it (`HostEvent::cancel_through`,
+/// `HostFedRing::release`), so that work runs neither before teardown nor at
+/// it. The control is the same held work with its value neither produced nor
+/// cancelled: it runs once the last handle drops, which is what shows the
+/// teardown was reached at all.
+#[test]
+fn final_teardown_runs_nothing_a_host_producer_gave_up() {
+    let mut control_latency = None;
+    for gave_up in [false, true] {
+        let f = fixture();
+        if f.commands.host_input_arm() == HostInputArm::GpuWait {
+            eprintln!("NOT_APPLICABLE nothing is held on the gpu-wait arm");
+            return;
+        }
+        f.commands.commit_when_produced(&f.gate, 1).unwrap();
+        encode_dependent(&f);
+        f.commands.flush_marker().unwrap();
+        assert!(f.commands.produced_stats().held_now > 0, "nothing was held");
+        if gave_up {
+            f.commands
+                .cancel_produced_through(&f.gate, 1, "test: the producer gave up")
+                .unwrap();
+            f.gate.setSignaledValue(1);
+            f.commands.produced(&f.gate, 1).unwrap();
+            let stats = f.commands.produced_stats();
+            assert_eq!(stats.held_now, 0, "{stats:?}");
+            // Nothing is held, so this waits for nothing the producer owes;
+            // it settles the recording the cancellation replaced.
+            f.commands.flush_and_wait().unwrap();
+        }
+        let Fixture {
+            native,
+            commands,
+            src,
+            dst,
+            gate,
+            progress,
+        } = f;
+        let api = commands.actual_command_api();
+        drop(commands);
+        let bound = control_latency.map_or(Duration::from_secs(10), |l: Duration| {
+            (l * 10).max(Duration::from_secs(1))
+        });
+        let t0 = Instant::now();
+        while progress.signaledValue() == 0 && t0.elapsed() < bound {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let waited = t0.elapsed();
+        let ran = progress.signaledValue() >= 1;
+        if ran {
+            // The progress signal follows the compute on the same stream.
+            assert!(computed(&dst), "the progress signal ran before its compute");
+        }
+        eprintln!(
+            "FINAL_TEARDOWN api={api} gave_up={gave_up} ran={ran} waited_ms={} bound_ms={} warm={}",
+            waited.as_millis(),
+            bound.as_millis(),
+            dst_bytes(&dst).iter().all(|b| *b == WARM)
+        );
+        if gave_up {
+            assert!(
+                !ran,
+                "work behind a value its producer gave up ran at teardown"
+            );
+            assert!(
+                dst_bytes(&dst).iter().all(|b| *b == WARM),
+                "cancelled work ran"
+            );
+        } else {
+            assert!(
+                ran,
+                "the control's held work never ran: teardown was not reached, so the arm \
+                 after it reads nothing"
+            );
+            control_latency = Some(waited);
+        }
+        drop((native, src, dst, gate));
+    }
+}

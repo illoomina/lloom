@@ -77,6 +77,7 @@ use crate::nn::speculator::{
     TargetProbe,
 };
 use lloom_tensor::{Device, Result, Tensor};
+use std::borrow::Borrow;
 
 mod prefill_work;
 #[cfg(test)]
@@ -1287,6 +1288,32 @@ fn activations_may_be_reused(device: &Device) -> Result<bool> {
     Ok(false)
 }
 
+/// `logits`, read after a later pass, in memory `hold` owns.
+///
+/// A pass's output lives in the pass's memory: under the pass cache (or the
+/// arena) that is a slot of one base every pass on the device reuses, so a
+/// value read after another pass has run would be read after its slot was
+/// overwritten. This copies it into a buffer allocated once, outside every
+/// pass (so no plan ever serves it), by one dispatch encoded before any other
+/// pass is: the barrier chain orders the read against the next writer. When
+/// the device serves activations from the pool only, `logits` is its own
+/// and is returned as is (`pass-plan-design.md` §3.3, escapes are declared).
+pub(crate) fn hold_in(hold: &mut Option<Tensor>, logits: Tensor) -> Result<Tensor> {
+    if !activations_may_be_reused(logits.device())? {
+        return Ok(logits);
+    }
+    let h = match hold.as_ref() {
+        Some(h) if h.shape() == logits.shape() && h.dtype() == logits.dtype() => h.clone(),
+        _ => {
+            let h = Tensor::zeros(logits.shape(), logits.dtype(), logits.device())?;
+            *hold = Some(h.clone());
+            h
+        }
+    };
+    h.slice_set(&logits, 0, 0)?;
+    Ok(h)
+}
+
 pub(crate) fn end_pass(device: &Device) -> Result<()> {
     #[cfg(feature = "metal")]
     if let Device::Metal(m) = device {
@@ -1310,39 +1337,62 @@ pub(crate) fn abort_pass(device: &Device) -> Result<()> {
 /// A pass whose body is running. [`Self::finish`] closes it after a body
 /// that succeeded; dropped unfinished — the body returned an error or
 /// unwound — it is aborted, never finished, so a partial recording or
-/// observation never becomes a plan and the next pass opens.
+/// observation never becomes a plan and the next pass opens
+/// (`pass-plan-design.md` §24).
+///
+/// `D` is how the guard holds the device: a driver lends it (`&Device`), a
+/// model that opens its own pass hands over the clone it opened on.
 #[must_use = "an open pass is aborted when dropped"]
-struct OpenPass<'a> {
-    device: &'a Device,
+pub(crate) struct OpenPass<D: Borrow<Device>> {
+    device: D,
     open: bool,
 }
 
-impl<'a> OpenPass<'a> {
+impl<D: Borrow<Device>> OpenPass<D> {
     /// A refusal leaves no open pass (`MetalDevice::begin_pass`), so there
     /// is nothing to abort on that path.
-    fn begin(device: &'a Device, shape: PassShape) -> Result<Self> {
+    pub(crate) fn begin(device: D, shape: PassShape) -> Result<Self> {
         Self::begin_with_input(device, shape, lloom_tensor::backend::PassInput::TokenIds)
     }
 
     fn begin_with_input(
-        device: &'a Device,
+        device: D,
         shape: PassShape,
         input: lloom_tensor::backend::PassInput,
     ) -> Result<Self> {
-        begin_pass_with_input(device, shape, input)?;
+        begin_pass_with_input(device.borrow(), shape, input)?;
         Ok(Self { device, open: true })
     }
 
-    fn finish(mut self) -> Result<()> {
+    /// The guard of a pass the caller has just opened through its own entry
+    /// point (a model's key, not a driver's shape).
+    pub(crate) fn adopt(device: D) -> Self {
+        Self { device, open: true }
+    }
+
+    pub(crate) fn finish(mut self) -> Result<()> {
         self.open = false;
-        end_pass(self.device)
+        end_pass(self.device.borrow())
+    }
+
+    /// Close the pass the way its body came out: finished after `Ok`,
+    /// aborted after `Err`. For a caller that runs something between the
+    /// body and reading its result, so the end keeps its place.
+    pub(crate) fn close<T>(self, body: &Result<T>) -> Result<()> {
+        match body {
+            Ok(_) => self.finish(),
+            Err(_) => {
+                drop(self);
+                Ok(())
+            }
+        }
     }
 }
 
-impl Drop for OpenPass<'_> {
+impl<D: Borrow<Device>> Drop for OpenPass<D> {
     fn drop(&mut self) {
         if self.open {
-            if let Err(e) = abort_pass(self.device) {
+            if let Err(e) = abort_pass(self.device.borrow()) {
                 eprintln!("[decode] aborting a pass whose body failed: {e}");
             }
         }
@@ -1359,7 +1409,7 @@ impl Drop for OpenPass<'_> {
 fn begin_decode_step(
     device: &Device,
     input: lloom_tensor::backend::PassInput,
-) -> Result<OpenPass<'_>> {
+) -> Result<OpenPass<&Device>> {
     OpenPass::begin_with_input(device, PassShape::Decode { b: 1 }, input)
 }
 
@@ -3014,33 +3064,11 @@ impl<'m, M: CausalLM> Session<'m, M> {
         Ok(())
     }
 
-    /// The logits a later call resumes from, in memory this sequence owns.
-    ///
-    /// A pass's output lives in the pass's memory: under the pass cache (or
-    /// the arena) that is a slot of one base every pass on the device reuses,
-    /// so logits held across passes — this sequence's next `decode` with an
-    /// empty prompt, a batched resume row, another session's passes in
-    /// between — would be read after their slot was overwritten. This copies
-    /// them into a per-sequence buffer allocated once, outside every pass (so
-    /// no plan ever serves it), by one dispatch encoded before any other pass
-    /// is: the barrier chain orders the read against the next writer. When
-    /// the device serves activations from the pool only, the held buffer is
-    /// its own and is returned as is (`DESIGN.md` §9.2aa, escapes are
-    /// declared).
+    /// The logits a later call resumes from, in memory this sequence owns
+    /// ([`hold_in`]): this sequence's next `decode` with an empty prompt, a
+    /// batched resume row, a row joining a batch after other passes ran.
     pub(crate) fn hold_logits(&mut self, logits: Tensor) -> Result<Tensor> {
-        if !activations_may_be_reused(logits.device())? {
-            return Ok(logits);
-        }
-        let hold = match &self.seq.logits_hold {
-            Some(h) if h.shape() == logits.shape() && h.dtype() == logits.dtype() => h.clone(),
-            _ => {
-                let h = Tensor::zeros(logits.shape(), logits.dtype(), logits.device())?;
-                self.seq.logits_hold = Some(h.clone());
-                h
-            }
-        };
-        hold.slice_set(&logits, 0, 0)?;
-        Ok(hold)
+        hold_in(&mut self.seq.logits_hold, logits)
     }
 
     /// Feed `prompt` through the model as the forwards [`prefill_widths`]

@@ -106,6 +106,29 @@ pub(crate) fn check_profile_request(storage: &str, on: bool) -> Result<(), Tunin
     Ok(())
 }
 
+/// `diagnostics.trace.draws`, resolved once: requested, and compiled in (a
+/// build without the `profile` instruments reports the request and stays off).
+pub fn draw_trace_on() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static ON: AtomicU8 = AtomicU8::new(0);
+    match ON.load(Ordering::Relaxed) {
+        1 => false,
+        2 => true,
+        _ => {
+            let requested = tuning().instrument.draw_trace;
+            let on = match check_profile_request("draw_trace", requested) {
+                Ok(()) => requested,
+                Err(error) => {
+                    eprintln!("{error}");
+                    false
+                }
+            };
+            ON.store(if on { 2 } else { 1 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
 /// Legacy cached status means effectively active, not merely requested.
 /// An unavailable request is reported once by each caller's status cache;
 /// primary control/setup APIs return the typed error instead.
@@ -1919,6 +1942,9 @@ pub struct InstrumentTuning {
     /// Attribute every host readback (`to_cpu`'s fast and blit paths, a staged read's stage, a host-read slot's read) to the model call site that made it (a backtrace per readback, #814 part 5).
     #[opt(flag = "readback-trace", env = "LLOOM_READBACK_TRACE", bool, path = "diagnostics.trace.readbacks", status = "instrument", needs = "profile", flows = ["token-out"])]
     pub readback_trace: bool,
+    /// One line per host draw: the sampler's seed and draw count, the batched step and row, a hash of the scores the draw read, its uniform and the id drawn, so two runs of one seeded workload compare step by step, scores against draw.
+    #[opt(flag = "draw-trace", env = "LLOOM_DRAW_TRACE", bool, path = "diagnostics.trace.draws", status = "instrument", needs = "profile", flows = ["token-out"])]
+    pub draw_trace: bool,
     /// Under the GPU profiler: attribute every command-buffer commit to the stack and thread that made it (a frame-pointer walk per commit, symbolized once per distinct stack), so a request's commits can be counted by cause (`profile::cut_sites`).
     #[opt(flag = "cut-sites", env = "LLOOM_CUT_SITES", bool, path = "diagnostics.trace.cut_sites", status = "instrument", needs = "profile", flows = ["commands-out"])]
     pub cut_sites: bool,

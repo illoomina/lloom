@@ -4,7 +4,7 @@
 //! does not choose it, allocate native owners, change GpuWait, or validate bytes.
 //! In particular, Metal's Complete status is not proof against a short read.
 use crate::{
-    completion_frontier::{FrontierError, RuntimeCompletionFrontier, RuntimeStorage},
+    completion_frontier::{FrontierError, PendingInspection, RuntimeCompletionFrontier, RuntimeStorage},
     completion_wake::Wake,
     retirement_mailbox::{
         CleanupPolicy, FeedbackPublicationError, MailboxError, OwnerMailbox, Ticket,
@@ -145,11 +145,19 @@ pub(crate) enum Error {
     UnacceptedNativeHandoff,
     ForeignCore,
     IdentityExhausted,
+    UnvalidatedPop,
+}
+
+/// One native lane's ordered metadata. No second terminal collection: the
+/// validation cursor inspects the same records physical retirement later owns.
+struct IoOrder {
+    frontier: RuntimeCompletionFrontier<Terminal>,
+    validated_next: u64,
 }
 
 pub(crate) struct IoTerminal {
     id: u64,
-    frontier: Mutex<RuntimeCompletionFrontier<Terminal>>,
+    order: Mutex<IoOrder>,
     failed: AtomicBool,
     successful: AtomicU64,
 }
@@ -162,9 +170,10 @@ impl IoTerminal {
             .map_err(|_| Error::IdentityExhausted)?;
         Ok(Self {
             id,
-            frontier: Mutex::new(
-                RuntimeCompletionFrontier::with_storage(storage).map_err(Error::Frontier)?,
-            ),
+            order: Mutex::new(IoOrder {
+                frontier: RuntimeCompletionFrontier::with_storage(storage).map_err(Error::Frontier)?,
+                validated_next: 0,
+            }),
             failed: AtomicBool::new(false),
             successful: AtomicU64::new(0),
         })
@@ -198,10 +207,11 @@ impl IoTerminal {
     pub fn failed(&self) -> bool {
         self.failed.load(Ordering::Acquire)
     }
-    /// One-based value; 0 initially. Retirement of failed or abandoned records
-    /// alone never advances this. Failure never contributes data readiness.
-    /// An earlier successful retirement can race failure publication; its data
-    /// prefix is still valid, while sticky failure closes later admission.
+    /// One-based validated data value; 0 initially. Physical retirement and
+    /// cleanup do not advance this. An abandoned gap is not data readiness.
+    /// Earlier Complete validation can race a later failure publication: its
+    /// prefix remains safe while sticky failure closes later admission.
+    /// This cursor split alone does not remove native_terminal's reorder Mutex.
     pub fn successful(&self) -> u64 {
         self.successful.load(Ordering::Acquire)
     }
@@ -299,32 +309,73 @@ impl IoTerminal {
         })
     }
 
-    fn publish(&self, terminal: Terminal) -> Result<bool, Error> {
-        self.frontier
-            .lock()
-            .publish(terminal.sequence, terminal)
-            .map_err(|rejected| {
-                // Malformed adapter sequence is visible; its actual mailbox still
-                // retains owner/feedback. A protocol error is not a readiness event.
-                self.failed.store(true, Ordering::Release);
-                Error::Frontier(rejected.reason)
-            })
+    /// Call under the existing order exclusion BEFORE every IO pop. A popped
+    /// healthy record is then already behind validated_next; slow physical
+    /// cleanup cannot hide metadata needed by the next validation pass.
+    fn validate_pending(&self, order: &mut IoOrder) -> Result<(), Error> {
+        while !self.failed() {
+            let terminal = match order.frontier.inspect_pending(order.validated_next)
+                .map_err(Error::Frontier)? {
+                PendingInspection::Record(terminal) => *terminal,
+                PendingInspection::Hole | PendingInspection::WindowEnd | PendingInspection::SequenceEnd => break,
+            };
+            match terminal.disposition {
+                Disposition::Native(raw) if raw.is_complete() => {
+                    let following = terminal.sequence.checked_add(1)
+                        .ok_or(Error::Frontier(FrontierError::SequenceExhausted))?;
+                    order.validated_next = following;
+                    self.successful.store(following, Ordering::Release);
+                }
+                Disposition::NeverAccepted => {
+                    // No public data token exists for a gap. A later accepted
+                    // Complete can publish its own value, never this gap alone.
+                    order.validated_next = terminal.sequence.checked_add(1)
+                        .ok_or(Error::Frontier(FrontierError::SequenceExhausted))?;
+                }
+                // Failure latches at the original terminal writer, BEFORE the
+                // reorder lock, even behind a hole. Do not replace that rule
+                // with delayed failure discovery during ordered inspection.
+                Disposition::Native(_) | Disposition::AcceptedNotSubmitted => break,
+            }
+        }
+        Ok(())
     }
 
-    /// Only the drainer elected by publication calls this. Actual resource
-    /// cleanup/callback work occurs outside the frontier lock, before finish.
+    #[cfg(test)]
+    pub(crate) fn retired_prefix(&self) -> u64 {
+        self.order.lock().frontier.retired_prefix()
+    }
+
+    fn publish(&self, terminal: Terminal) -> Result<bool, Error> {
+        let mut order = self.order.lock();
+        let elected = order.frontier.publish(terminal.sequence, terminal)
+            .map_err(|rejected| {
+                self.failed.store(true, Ordering::Release);
+                Error::Frontier(rejected.reason)
+            })?;
+        self.validate_pending(&mut order)?;
+        Ok(elected)
+    }
+
+    /// Only the drainer elected by publication calls this. Validation precedes
+    /// every IO pop; physical cleanup remains outside the order lock. Once
+    /// failure is sticky, retirement may pass the stopped validation cursor,
+    /// but no reset/re-enable exists that could certify the removed metadata.
     pub fn next(&self) -> Result<Option<Ready<'_>>, Error> {
-        self.frontier
-            .lock()
-            .pop_ready_or_release_drainer()
-            .map(|record| {
-                record.map(|(_, terminal)| Ready {
-                    core: self,
-                    terminal,
-                })
-            })
+        let mut order = self.order.lock();
+        self.validate_pending(&mut order)?;
+        let next = order.frontier.next_sequence();
+        if !self.failed()
+            && next >= order.validated_next
+            && matches!(order.frontier.inspect_pending(next).map_err(Error::Frontier)?, PendingInspection::Record(_))
+        {
+            return Err(Error::UnvalidatedPop);
+        }
+        order.frontier.pop_ready_or_release_drainer()
+            .map(|record| record.map(|(_, terminal)| Ready { core: self, terminal }))
             .map_err(Error::Frontier)
     }
+
 }
 
 /// Non-Clone and bound to its originating core. Dropping without finish retains
@@ -338,19 +389,9 @@ impl Ready<'_> {
         self.terminal
     }
     pub fn finish(self) -> Result<(), Error> {
-        self.core
-            .frontier
-            .lock()
-            .finish(self.terminal.sequence)
-            .map_err(Error::Frontier)?;
-        if matches!(self.terminal.disposition, Disposition::Native(raw) if raw.is_complete())
-            && !self.core.failed()
-        {
-            self.core
-                .successful
-                .store(self.terminal.sequence + 1, Ordering::Release);
-        }
-        Ok(())
+        // Cleanup/physical retirement returns credits, never data readiness.
+        self.core.order.lock().frontier.finish(self.terminal.sequence)
+            .map_err(Error::Frontier)
     }
 }
 
@@ -610,8 +651,9 @@ mod tests {
         );
         assert_eq!(core.successful(), 0);
         let rejected = core
-            .frontier
+            .order
             .lock()
+            .frontier
             .publish(
                 2,
                 Terminal {
@@ -634,8 +676,9 @@ mod tests {
         cleanup(&cells[0], ready.terminal());
         // Dequeuing and owner cleanup alone cannot release sequence credit.
         assert_eq!(
-            core.frontier
+            core.order
                 .lock()
+                .frontier
                 .publish(2, rejected.value)
                 .unwrap_err()
                 .reason,
@@ -792,4 +835,112 @@ mod tests {
         assert!(core.next().unwrap().is_none());
         assert_eq!(core.successful(), 2);
     }
+
+    #[test]
+    fn complete_prefix_advances_while_cleanup_is_held_without_returning_credit() {
+        for capacity in [1, 2] {
+            let core = IoTerminal::new(RuntimeStorage::try_new(capacity).unwrap()).unwrap();
+            let cells: Vec<_> = (0..capacity).map(|_| cell(&core)).collect();
+            let tickets: Vec<_> = cells.iter().enumerate().map(|(i,c)| accepted(c, i as u64)).collect();
+            assert!(core.native_terminal(&cells[0], tickets[0], RawStatus(3)).unwrap());
+            assert_eq!(core.retired_prefix(), 0, "readiness must not return retirement credit");
+            let first = core.next().unwrap().unwrap();
+            for i in 1..capacity {
+                assert!(!core.native_terminal(&cells[i], tickets[i], RawStatus(3)).unwrap());
+            }
+            assert_eq!(core.successful(), capacity as u64, "cleanup must not gate validated data");
+            assert_eq!(core.retired_prefix(), 0, "readiness must not return retirement credit");
+            assert!(!core.failed(), "full validated window is a normal stop");
+            assert_eq!(core.order.lock().frontier.publish(capacity as u64, first.terminal()).unwrap_err().reason,
+                FrontierError::BeyondWindow, "validated data cannot recycle a physical slot");
+            cleanup(&cells[0], first.terminal());
+            assert_eq!(core.retired_prefix(), 0, "cleanup alone cannot return credit");
+            first.finish().unwrap();
+            for i in 1..capacity {
+                let ready = core.next().unwrap().unwrap();
+                cleanup(&cells[i], ready.terminal());
+                ready.finish().unwrap();
+            }
+            assert!(core.next().unwrap().is_none());
+            assert_eq!(core.retired_prefix(), capacity as u64);
+        }
+    }
+
+    #[test]
+    fn six_completion_orders_validate_without_any_retirement() {
+        for order in [[0,1,2],[0,2,1],[1,0,2],[1,2,0],[2,0,1],[2,1,0]] {
+            let core = IoTerminal::new(RuntimeStorage::try_new(3).unwrap()).unwrap();
+            let cells = [cell(&core),cell(&core),cell(&core)];
+            let tickets = std::array::from_fn::<_,3,_>(|i| accepted(&cells[i],i as u64));
+            let mut arrived = [false;3];
+            for i in order {
+                core.native_terminal(&cells[i],tickets[i],RawStatus(3)).unwrap();
+                arrived[i] = true;
+                assert_eq!(core.successful(), arrived.iter().take_while(|&&v|v).count() as u64,
+                    "validation crossed an actual missing terminal");
+                assert_eq!(core.retired_prefix(),0);
+            }
+            assert_eq!(drain(&core,&cells).len(),3);
+        }
+    }
+
+    #[test]
+    fn next_validates_existing_metadata_before_pop_and_failure_cannot_revive_it() {
+        let core = IoTerminal::new(RuntimeStorage::try_new(2).unwrap()).unwrap();
+        let cells = [cell(&core),cell(&core)];
+        let t = accepted(&cells[0],0);
+        // Exercise next's own validation boundary, not the publication helper.
+        core.order.lock().frontier.publish(0,Terminal { sequence:0,ticket:t,
+            disposition:Disposition::Native(RawStatus(3)) }).unwrap();
+        let next = core.next();
+        assert!(matches!(&next, Ok(Some(_))), "every IO pop must first validate its metadata");
+        let ready = next.unwrap().unwrap();
+        assert_eq!(core.successful(),1,"every IO pop must first validate its metadata");
+        assert_eq!(core.retired_prefix(),0);
+        drop(ready); // no fabricated mailbox callback or cleanup in this boundary control
+
+        let failed = IoTerminal::new(RuntimeStorage::try_new(2).unwrap()).unwrap();
+        let cs = [cell(&failed),cell(&failed)];
+        let ts = [accepted(&cs[0],0),accepted(&cs[1],1)];
+        failed.native_terminal(&cs[0],ts[0],RawStatus(3)).unwrap();
+        failed.native_terminal(&cs[1],ts[1],RawStatus(2)).unwrap();
+        assert_eq!(failed.successful(),1,"later failure preserves earlier genuine Complete");
+        assert_eq!(drain(&failed,&cs).len(),2);
+        assert!(failed.failed());
+        assert_eq!(failed.retired_prefix(),2);
+        assert_eq!(failed.successful(),1,"failed retirement cannot revive removed metadata");
+    }
+
+    #[test]
+    fn independent_lane_prefixes_do_not_wait_for_another_lane() {
+        let a = IoTerminal::new(RuntimeStorage::try_new(1).unwrap()).unwrap();
+        let b = IoTerminal::new(RuntimeStorage::try_new(1).unwrap()).unwrap();
+        let ca = cell(&a); let cb = cell(&b);
+        let ta = accepted(&ca,0); let tb = accepted(&cb,0);
+        b.native_terminal(&cb,tb,RawStatus(3)).unwrap();
+        assert_eq!(b.successful(),1);
+        assert_eq!(a.successful(),0);
+        a.native_terminal(&ca,ta,RawStatus(2)).unwrap();
+        assert!(a.failed());
+        assert!(!b.failed());
+        assert_eq!(b.successful(),1,"independent lane readiness is not a global prefix");
+    }
+
+
+    #[test]
+    fn unaccepted_gap_never_certifies_itself_but_unblocks_later_complete() {
+        let core = IoTerminal::new(RuntimeStorage::try_new(2).unwrap()).unwrap();
+        let cells = [cell(&core),cell(&core)];
+        let gap = cells[0].prepare_gap(0).unwrap();
+        core.abandon(&cells[0],gap).unwrap();
+        assert_eq!(core.successful(),0,"abandoned sequence is not data readiness");
+        assert_eq!(core.retired_prefix(),0);
+        let data = accepted(&cells[1],1);
+        core.native_terminal(&cells[1],data,RawStatus(3)).unwrap();
+        assert_eq!(core.successful(),2,"valid later data need not wait for gap cleanup");
+        assert_eq!(core.retired_prefix(),0);
+        assert_eq!(drain(&core,&cells).len(),2);
+        assert!(!core.failed());
+    }
+
 }

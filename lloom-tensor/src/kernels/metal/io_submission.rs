@@ -199,7 +199,8 @@ mod tests {
             if self.bank.callback_inside_call.load(Ordering::SeqCst) {
                 self.bank.core.native_terminal(&self.bank.cell, ticket, RawStatus(3)).unwrap();
                 assert_eq!(self.bank.drops.load(Ordering::SeqCst), 0, "callback cannot drop native owner");
-                assert_eq!(self.bank.core.successful(), 0, "callback is not retirement");
+                assert_eq!(self.bank.core.successful(), 1, "actual Complete validates data before retirement");
+                assert_eq!(self.bank.core.retired_prefix(), 0, "callback cannot return retirement credit");
             }
             if self.bank.panic_after_commit.load(Ordering::SeqCst) { panic!("native call unwind fixture"); }
         }
@@ -406,10 +407,11 @@ mod tests {
         assert!(bank.core.refused_before_handoff(&bank.cell, ticket).is_err());
         assert_eq!(bank.drops.load(Ordering::SeqCst), 0, "unknown native custody stays rooted");
         assert_eq!(bank.core.successful(), 0);
+        assert_eq!(bank.core.retired_prefix(), 0, "unknown return cannot return retirement credit");
     }
 
     #[test]
-    fn callback_then_native_unwind_cannot_detach_or_publish_success() {
+    fn callback_then_native_unwind_preserves_validated_data_but_cannot_detach() {
         let bank = Bank::new();
         bank.callback_inside_call.store(true, Ordering::SeqCst);
         bank.panic_after_commit.store(true, Ordering::SeqCst);
@@ -418,7 +420,9 @@ mod tests {
         let ready = bank.core.next().unwrap().expect("callback published terminal");
         assert!(bank.cell.cleanup(ready.terminal()).is_err(), "unknown return cannot authorize detach");
         assert_eq!(bank.drops.load(Ordering::SeqCst), 0);
-        assert_eq!(bank.core.successful(), 0);
+        assert_eq!(bank.core.successful(), 1, "validated Complete prefix remains monotonic after unknown return");
+        assert!(bank.core.failed(), "unknown return closes future admission");
+        assert_eq!(bank.core.retired_prefix(), 0, "unknown return cannot return retirement credit");
         // Keep ready unfinished: active retirement credit cannot be recycled.
         drop(ready);
     }

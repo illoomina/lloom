@@ -14,6 +14,17 @@ pub(crate) enum FrontierError {
     NoDrainer,
     RetirementPending,
     WrongRetirement,
+    UnexpectedSequence,
+}
+
+/// Non-owning view of the exact retained record. WindowEnd and SequenceEnd
+/// are normal cursor stops, not refusal of an admitted record.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum PendingInspection<'a, T> {
+    Record(&'a T),
+    Hole,
+    WindowEnd,
+    SequenceEnd,
 }
 
 /// Rejection returns the original resource owner without releasing it.
@@ -163,6 +174,38 @@ impl<T, S: FrontierStorage<T>> Frontier<T, S> {
             Ok(false)
         }
     }
+
+    /// Inspect without dequeueing, returning credits, or borrowing payloads
+    /// outside the caller's exclusion. An active/popped record is not a hole:
+    /// IO must validate it before pop, while ordinary users need not inspect.
+    pub fn inspect_pending(&self, sequence: u64) -> Result<PendingInspection<'_, T>, FrontierError> {
+        let distance = sequence.checked_sub(self.retired)
+            .ok_or(FrontierError::BeforeFrontier)?;
+        let capacity = self.pending.slots().len() as u64;
+        if distance > capacity {
+            return Err(FrontierError::BeyondWindow);
+        }
+        if distance == capacity {
+            return Ok(PendingInspection::WindowEnd);
+        }
+        if sequence < self.next {
+            return Err(FrontierError::RetirementPending);
+        }
+        // publish cannot accept MAX: its one-based following value overflows.
+        // This also terminates near exhaustion without retired+capacity wrap.
+        if sequence == u64::MAX {
+            return Ok(PendingInspection::SequenceEnd);
+        }
+        let index = (sequence % capacity) as usize;
+        match &self.pending.slots()[index] {
+            Some((stored, value)) if *stored == sequence => Ok(PendingInspection::Record(value)),
+            Some(_) => Err(FrontierError::UnexpectedSequence),
+            None => Ok(PendingInspection::Hole),
+        }
+    }
+
+    /// Metadata only: exposing the next sequence cannot return its ownership.
+    pub fn next_sequence(&self) -> u64 { self.next }
 
     /// Only the elected drainer calls this. An empty head relinquishes the
     /// election in the same serialized operation that observes the hole.
@@ -583,4 +626,56 @@ mod tests {
             assert_eq!(f.pending.slots.len(), 3);
         }
     }
+
+    #[test]
+    fn inspection_distinguishes_holes_active_records_and_exact_window_end() {
+        both!(u64, 2, f, {
+            assert_eq!(f.inspect_pending(0), Ok(PendingInspection::Hole));
+            assert!(!f.publish(1, 11).unwrap());
+            assert_eq!(f.inspect_pending(1), Ok(PendingInspection::Record(&11)));
+            assert_eq!(f.inspect_pending(2), Ok(PendingInspection::WindowEnd), "exact window end must terminate normally");
+            assert_eq!(f.inspect_pending(3), Err(FrontierError::BeyondWindow));
+            assert!(f.publish(0, 10).unwrap());
+            assert_eq!(f.inspect_pending(0), Ok(PendingInspection::Record(&10)));
+            assert_eq!(f.retired_prefix(), 0, "inspection cannot return credit");
+            assert_eq!(f.pop_ready_or_release_drainer().unwrap(), Some((0, 10)));
+            assert_eq!(f.inspect_pending(0), Err(FrontierError::RetirementPending));
+            assert_eq!(f.inspect_pending(1), Ok(PendingInspection::Record(&11)));
+            f.finish(0).unwrap();
+            assert_eq!(f.inspect_pending(0), Err(FrontierError::BeforeFrontier));
+            assert_eq!(f.inspect_pending(2), Ok(PendingInspection::Hole));
+        });
+        both!(u64, 1, f, {
+            assert!(f.publish(0, 10).unwrap());
+            assert_eq!(f.inspect_pending(1), Ok(PendingInspection::WindowEnd));
+            assert_eq!(f.inspect_pending(2), Err(FrontierError::BeyondWindow));
+            assert_eq!(f.retired_prefix(), 0);
+        });
+    }
+
+    #[test]
+    fn inspection_does_not_alias_a_different_sequence_or_overflow_at_exhaustion() {
+        both!(u64, 2, f, {
+            // Deliberate internal corruption: exact identity, not modulo alone.
+            f.pending.slots_mut()[0] = Some((2, 88));
+            assert_eq!(f.inspect_pending(0), Err(FrontierError::UnexpectedSequence), "inspection must authenticate exact sequence");
+            f.pending.slots_mut()[0] = None;
+            f.next = u64::MAX - 1;
+            f.retired = f.next;
+            assert!(f.publish(u64::MAX - 1, 9).unwrap());
+            assert_eq!(f.inspect_pending(u64::MAX - 1), Ok(PendingInspection::Record(&9)));
+            assert_eq!(f.inspect_pending(u64::MAX), Ok(PendingInspection::SequenceEnd), "exhausted sequence must terminate normally");
+            assert_eq!(f.retired_prefix(), u64::MAX - 1);
+            f.pop_ready_or_release_drainer().unwrap().unwrap();
+            f.finish(u64::MAX - 1).unwrap();
+            assert_eq!(f.inspect_pending(u64::MAX), Ok(PendingInspection::SequenceEnd), "exhausted sequence must terminate normally");
+        });
+        both!(u64, 1, f, {
+            f.next = u64::MAX - 1;
+            f.retired = f.next;
+            assert!(f.publish(u64::MAX - 1, 9).unwrap());
+            assert_eq!(f.inspect_pending(u64::MAX), Ok(PendingInspection::WindowEnd));
+        });
+    }
+
 }

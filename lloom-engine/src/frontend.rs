@@ -310,6 +310,21 @@ rows! {
         when: When::MetalBatched,
         before: "false",
     },
+    // The batched loop's counter cut on a decode-only step (`tuning.md`
+    // §13.5r): `before` is the library's value; decision 71 (`EXCEPTIONS`)
+    // lands `all` on LFM2. Qwen4-exp and the other GGUF families keep `off`.
+    Row {
+        key: "decode.batched.cut_hold",
+        frontend: Frontend::Serve,
+        when: When::ModelAxes,
+        before: "off",
+    },
+    Row {
+        key: "decode.batched.cut_hold",
+        frontend: Frontend::Bench,
+        when: When::ModelAxes,
+        before: "off",
+    },
 }
 
 /// A default changed on purpose: the maintainer's decision by number, the
@@ -493,7 +508,29 @@ pub const EXCEPTIONS: &[Exception] = &[Exception {
     landed: true,
     owner: "#1084",
     what: "the f16 row axis takes up to 12 rows, one value for the batched decode rows and the batched speculative windows, so the decode rows' default batch is 2 to 12 sequences; --gemm-f16-rows-max 10 opts out",
+}, Exception {
+    decision: 71,
+    key: "decode.batched.cut_hold",
+    frontend: Frontend::Serve,
+    when: When::ModelAxes,
+    before: "off",
+    after: "all",
+    landed: true,
+    owner: "#1084",
+    what: DECISION_71,
+}, Exception {
+    decision: 71,
+    key: "decode.batched.cut_hold",
+    frontend: Frontend::Bench,
+    when: When::ModelAxes,
+    before: "off",
+    after: "all",
+    landed: true,
+    owner: "#1084",
+    what: DECISION_71,
 }];
+
+const DECISION_71: &str = "on LFM2 the batched loop holds the counter cut off over every decode-only forward, the blocking (sampled) arm too: +1.7 to +11.4 % decode and 1 to 7 % less request time at a batch of 4 and 8; Qwen4-exp and the GGUF families keep off; --batched-cut-hold off opts out";
 
 /// The first row of `key` for `frontend`, if the front-end resolves it.
 pub fn row(key: &str, frontend: Frontend) -> Option<&'static Row> {

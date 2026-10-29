@@ -735,6 +735,7 @@ where
     type Retained = DecoderRetained<<L::State as crate::nn::branch::RetainState>::Retained>;
 
     fn retain_state(&mut self) -> Result<Self::Retained> {
+        self.usable()?;
         self.settle_standing()?;
         if self.window.is_some() {
             lloom_tensor::bail!("decoder retention requires a settled window")
@@ -749,14 +750,22 @@ where
         })
     }
 
+    /// A layer that fails to restore leaves the layers inconsistent: the
+    /// state is unusable until a reset, as after a failed [`Self::restore`].
     fn restore_retained(&mut self, saved: &Self::Retained) -> Result<()> {
+        self.usable()?;
         self.settle_standing()?;
         if self.window.is_some() || saved.pos > self.pos || saved.layers.len() != self.layers.len()
         {
             lloom_tensor::bail!("decoder retention: invalid window, position or layer count")
         }
-        for (layer, retained) in self.layers.iter_mut().zip(&saved.layers) {
-            layer.restore_retained(retained)?;
+        for (l, (layer, retained)) in self.layers.iter_mut().zip(&saved.layers).enumerate() {
+            if let Err(e) = layer.restore_retained(retained) {
+                self.unusable = Some(format!(
+                    "layer {l} failed to restore its retained state ({e})"
+                ));
+                return Err(e);
+            }
         }
         self.pos = saved.pos;
         self.nextn.clear();
@@ -2586,8 +2595,10 @@ mod window_tests {
         fail_resolve: bool,
         fail_restore: bool,
         fail_truncate: bool,
+        fail_restore_retained: bool,
         restored: usize,
         truncated: usize,
+        restored_retained: usize,
     }
 
     impl Layer for Faulty {
@@ -2691,6 +2702,20 @@ mod window_tests {
 
     fn state(n: usize) -> DecoderState<Faulty> {
         DecoderState::new((0..n).map(|_| FaultyState::default()).collect())
+    }
+
+    impl crate::nn::branch::RetainState for FaultyState {
+        type Retained = ();
+        fn retain_state(&mut self) -> Result<()> {
+            Ok(())
+        }
+        fn restore_retained(&mut self, _: &()) -> Result<()> {
+            if self.fail_restore_retained {
+                lloom_tensor::bail!("refused to restore a retained state")
+            }
+            self.restored_retained += 1;
+            Ok(())
+        }
     }
 
     // No forward executes in these acceptance controls. The actual decoder
@@ -2973,6 +2998,52 @@ mod window_tests {
         assert!(st.unusable().is_none());
         st.open_window().expect("usable after the reset");
         st.resolve_window().unwrap();
+    }
+
+    /// The same for a retained state (`RetainState::restore_retained`, a
+    /// branch trunk's): the layers before the failing one are at the
+    /// retained state and the rest are not, so nothing runs on the mix —
+    /// not a forward, a cut, another restore, or a retention of it — until
+    /// a reset.
+    #[test]
+    fn a_retained_restore_failed_mid_way_leaves_the_state_unusable_until_a_reset() {
+        use crate::nn::branch::RetainState;
+        let mut st = state(3);
+        st.pos = 4;
+        let saved = st.retain_state().expect("a usable state retains");
+        st.pos = 6;
+        st.layers[1].fail_restore_retained = true;
+        assert!(st.restore_retained(&saved).is_err());
+        let why = st.unusable().expect("marked unusable").to_string();
+        assert!(why.contains("layer 1"), "{why}");
+        assert_eq!(
+            [
+                st.layers[0].restored_retained,
+                st.layers[2].restored_retained
+            ],
+            [1, 0],
+            "the restore did not stop mid-way"
+        );
+        assert_eq!(st.pos, 6, "the position moved over a failed restore");
+        assert!(
+            st.usable().is_err(),
+            "a forward would run on the mixed state"
+        );
+        st.layers[1].fail_restore_retained = false;
+        assert!(
+            st.restore_retained(&saved).is_err(),
+            "no restore over an unusable state"
+        );
+        assert!(
+            st.retain_state().is_err(),
+            "no retention of an unusable state"
+        );
+        assert!(st.truncate(0).is_err(), "no truncate on an unusable state");
+        st.reset();
+        assert!(st.unusable().is_none());
+        st.pos = 6;
+        st.restore_retained(&saved).expect("usable after the reset");
+        assert_eq!(st.pos, 4);
     }
 
     /// The same for a cut that fails mid-way.

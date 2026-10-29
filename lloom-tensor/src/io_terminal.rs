@@ -124,7 +124,7 @@ impl IoCell {
 pub(crate) enum Disposition {
     Native(RawStatus),
     NeverAccepted,
-    /// Accepted record, but the Prepared-phase CAS proved native/deferred
+    /// Accepted record, but the Prepared-phase CAS proved actual native
     /// handoff had never begun. This is failure, not a gap or native feedback.
     AcceptedNotSubmitted,
 }
@@ -169,6 +169,32 @@ impl IoTerminal {
             successful: AtomicU64::new(0),
         })
     }
+    /// Validate a private engine-owned deferred lease without promoting its
+    /// phase. The eventual native handoff/cancellation still uses the mailbox
+    /// CAS; this check is not a substitute for that arbitration.
+    pub fn validate_prepared_data(&self, cell: &IoCell, ticket: Ticket) -> Result<(), Error> {
+        if cell.core_id != self.id {
+            return Err(Error::ForeignCore);
+        }
+        if !cell.prepared(ticket)?.accepted {
+            return Err(Error::UnacceptedNativeHandoff);
+        }
+        Ok(())
+    }
+
+    /// An actual native call unwound without a proved return. The same ticket
+    /// remains rooted; no accepted-not-submitted terminal may replace it.
+    pub fn handoff_unknown(&self, cell: &IoCell, ticket: Ticket) -> Result<(), Error> {
+        if cell.core_id != self.id {
+            return Err(Error::ForeignCore);
+        }
+        cell.mailbox
+            .handoff_unknown(ticket, || {})
+            .map_err(Error::Mailbox)?;
+        self.failed.store(true, Ordering::Release);
+        Ok(())
+    }
+
     pub fn failed(&self) -> bool {
         self.failed.load(Ordering::Acquire)
     }
@@ -248,9 +274,12 @@ impl IoTerminal {
 
     /// Accepted metadata whose actual handoff has provably not begun.
     /// The existing mailbox CAS arbitrates against begin_handoff. No accepted
-    /// token, native commit or deferred handoff may escape without that phase.
+    /// native commit may escape without that phase; engine-owned deferred
+    /// custody itself stays Prepared as described below.
     /// A failed/stale CAS does not poison this core or consume another owner.
-    /// Native/deferred work that already escaped cannot use this method.
+    /// Engine-owned deferred work stays Prepared until its actual native call.
+    /// Moving its exclusive lease into a held list is not native handoff.
+    /// Work whose native handoff already began cannot use this method.
     pub fn refused_before_handoff(&self, cell: &IoCell, ticket: Ticket) -> Result<bool, Error> {
         if cell.core_id != self.id {
             return Err(Error::ForeignCore);

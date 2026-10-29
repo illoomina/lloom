@@ -556,9 +556,9 @@ impl GuardedSample<'_> {
         {
             crate::bail!("guarded packed embedding: unsupported dtype/shape/device");
         }
-        // Read-only weights retain their own allocation owner. Same-device
-        // inputs may belong to another payer; only writable outputs/guard
-        // require active-origin reuse. Native binding retains this source.
+        // Read-only weights may belong to another payer; active-origin reuse
+        // applies to writable outputs/guard. This check does not establish
+        // early-drop custody for raw native bindings.
         let (storage, layout) = out.storage_and_layout();
         let Storage::Metal(out) = &*storage else {
             crate::bail!("guarded packed embedding: Metal output required");

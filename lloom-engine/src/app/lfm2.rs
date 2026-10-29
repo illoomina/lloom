@@ -24,6 +24,7 @@ use super::common::{
     DecodeTiming, MemGauge, MemReport, MemSnapshot, PrefillTiming, Text, NEVER_EOS,
 };
 use super::request_slot::{AbortState, Lease as RequestLease, State as RequestState};
+use super::served::Served as _;
 use super::template::{Rendered, Template};
 use super::vision::{take_window, DecodedImage, ImageCensus, ImageRows};
 use crate::{
@@ -549,12 +550,14 @@ fn apply_preset(
 fn shape_key(opts: &LoadOptions) -> Result<ProfileKey> {
     let bytes = std::fs::read(opts.model_dir.join("config.json"))?;
     let root: Value = serde_json::from_slice(&bytes).context("parsing config.json")?;
-    let config: Lfm2Config = if root.get("vision_config").is_some() {
-        text_config_of(&root)?
+    let mut config = if root.get("vision_config").is_some() {
+        text_config_of(&root)?.into_config(false)
     } else {
-        serde_json::from_slice(&bytes).context("parsing config.json")?
+        lloom::models::lfm2_moe::config::parse_lfm_config(root.clone())?
     };
-    let mut config = config.into_config(false);
+    if config.moe.is_some() && opts.dspark.is_some() {
+        anyhow::bail!("lfm2_moe: no validated DSpark drafter is wired for this checkpoint");
+    }
     let dcfg = match drafter_dir(opts)? {
         Some(dir) => Some(
             DSparkConfig::read_from_dir(&dir)
@@ -870,16 +873,27 @@ impl<P: Lfm2Shape> Engine<P> {
         let root: Value = serde_json::from_slice(&config_bytes).context("parsing config.json")?;
         let vl = root.get("vision_config").is_some();
         let decisions = served_decisions(&root, opts.decision_template.as_deref())?;
-        let config: Lfm2Config = if vl {
-            text_config_of(&root)?
+        let mut config = if vl {
+            text_config_of(&root)?.into_config(false)
         } else {
-            serde_json::from_slice(&config_bytes).context("parsing config.json")?
+            lloom::models::lfm2_moe::config::parse_lfm_config(root.clone())?
         };
-        let mut config = config.into_config(false);
+
+        // Direct programmatic loads bypass family::load's capability clamp.
+        // The routed kernels cannot safely inherit dense LFM's EOS gate.
+        if config.moe.is_some() {
+            opts.decode.readback.eos_gate = false;
+            if opts.executor.arena || opts.executor.packed || opts.executor.replay {
+                anyhow::bail!("lfm2_moe: arena/packed/replay acceptance has not been run; use the existing pass-plans executor");
+            }
+        }
 
         // The drafter's config first: the target's cache arms depend on it
         // (the verify window sizes the conv ring, the taps feed the drafter).
         let dspark_dir = drafter_dir(&opts)?;
+        if config.moe.is_some() && dspark_dir.is_some() {
+            anyhow::bail!("lfm2_moe: no validated DSpark drafter is wired for this checkpoint");
+        }
         // The speculative arm's pool budget: 1024 MiB, sized from measurement
         // (#148, the B=1 defaults pass):
         // a round is two models' activations plus the verify's logits,
@@ -1068,6 +1082,13 @@ impl<P: Lfm2Shape> Engine<P> {
         }
 
         let files = weight_files(&model_dir)?;
+        let moe_preflight = if config.moe.is_some() {
+            let source: lloom::models::lfm2_moe::Config = serde_json::from_value(root.clone())?;
+            // SAFETY: the checkpoint is immutable while the load maps it.
+            Some(unsafe { lloom::models::lfm2_moe::preflight(&source, &files, dtype)? })
+        } else {
+            None
+        };
         // SAFETY: the checkpoint is not modified while mapped
         // (`VarBuilder::from_mmaped_safetensors`'s contract; this is that
         // backend with a flag per tensor set on load).
@@ -1089,7 +1110,13 @@ impl<P: Lfm2Shape> Engine<P> {
         // admission leaves after them and the predicted peak, three at least.
         // What the weights hold once loaded: every tensor at the dtype the
         // load converts it to (f32 on the CPU, twice the bf16 file).
-        let loaded_weights = checkpoint_elems(&weight_files(&model_dir)?)? * dtype.size_in_bytes();
+        let loaded_weights = match moe_preflight {
+            Some(p) => p.resident_bytes,
+            None => checkpoint_elems(&files)? * dtype.size_in_bytes(),
+        };
+        if let (Some(p), Some(b)) = (moe_preflight, config.memory_budget.as_mut()) {
+            b.weight_bytes = p.resident_bytes;
+        }
         #[cfg_attr(not(feature = "metal"), allow(unused_mut))]
         let mut machine_weights = loaded_weights;
         #[cfg(feature = "metal")]
@@ -1115,6 +1142,9 @@ impl<P: Lfm2Shape> Engine<P> {
                 * config.head_dim()
                 * elem;
             if quota > 0 && weight_bytes + kv_floor > quota {
+                if config.moe.is_some() {
+                    anyhow::bail!("lfm2_moe: resident expert payload plus KV floor exceeds this quota; dense layer-group streaming cannot represent this checkpoint's experts");
+                }
                 // The room for slots is what §9.5's admission leaves once the
                 // resident rest and its predicted peak (the KV at capacity,
                 // the conv state, the activations, the scratch) are in — the
@@ -1248,6 +1278,13 @@ impl<P: Lfm2Shape> Engine<P> {
             config.memory_budget.and_then(|b| b.activation_rows),
             opts.pin_prefix,
         );
+        if let Some(p) = moe_preflight {
+            peak.push(
+                "expert load packing (conservative bound)",
+                p.packing_bytes as u64,
+            );
+            eprintln!("[lfm2_moe: optional unvalidated port; resident={} packing_bound={}; real-model acceptance pending]", p.resident_bytes, p.packing_bytes);
+        }
         if let Some(dir) = &dspark_dir {
             let drafter = std::fs::metadata(dir.join("model.safetensors")).map_or(0, |m| m.len());
             peak.push("drafter", drafter);
@@ -1860,7 +1897,7 @@ impl<P: Lfm2Shape> Engine<P> {
     fn load_json(&self, images: usize) -> Value {
         let (tensors, bytes) = self.lm_record.totals();
         json!({
-            "family": "lfm2",
+            "family": self.capabilities().family,
             "model_tensors": tensors,
             "model_bytes": bytes,
             "tower": match &self.vision {
@@ -3386,7 +3423,7 @@ impl<P: Lfm2Shape> super::served::Served for Engine<P> {
     }
     fn health(&self) -> Value {
         json!({
-            "family": "lfm2",
+            "family": self.capabilities().family,
             "batch": self.batch,
             "prefill_tile": self.prefill_tile,
             "prefill_chunk": self.prefill_chunk,
@@ -3416,7 +3453,8 @@ impl<P: Lfm2Shape> super::served::Served for Engine<P> {
     }
     fn describe(&self) -> String {
         format!(
-            "family=lfm2 batch={} dspark={} prefill_tile={} prefill_chunk={} prefill_batch={} prefill_decode={} memory_fraction={} mem_sample={} rows={} cache={} {} {}",
+            "family={} batch={} dspark={} prefill_tile={} prefill_chunk={} prefill_batch={} prefill_decode={} memory_fraction={} mem_sample={} rows={} cache={} {} {}",
+            self.capabilities().family,
             self.batch,
             self.dspark_k
                 .map(|k| format!("k={k}"))
@@ -3442,7 +3480,11 @@ impl<P: Lfm2Shape> super::served::Served for Engine<P> {
             vision: self.vision.is_some(),
             vision_missing: "no vision tower is built: the checkpoint names no vision_config, \
                 or it was loaded text only (model.text_only, --text-only)",
-            ..super::family::LFM2_CAPABILITIES
+            ..if self.config.moe.is_some() {
+                super::family::LFM2_MOE_CAPABILITIES
+            } else {
+                super::family::LFM2_CAPABILITIES
+            }
         }
     }
     fn systemone(

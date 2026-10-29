@@ -257,10 +257,13 @@ struct Native {
     dirty: bool,
 }
 
-/// Which native set lists an allocation, and the bytes it was added with.
+/// Which native set lists an allocation, the bytes and class it was added
+/// with, and the site that added it (`listing_sites`; 0 when not recorded).
 #[derive(Clone, Copy)]
 struct Placed {
     native: u8,
+    class: ResidencyClass,
+    site: u32,
     bytes: u64,
 }
 
@@ -348,7 +351,13 @@ impl Inner {
         emptiest(true).or_else(|| emptiest(false)).unwrap_or(0)
     }
 
-    fn add_native(&mut self, i: usize, key: usize, alloc: &ProtocolObject<dyn MTLAllocation>) {
+    fn add_native(
+        &mut self,
+        i: usize,
+        key: usize,
+        alloc: &ProtocolObject<dyn MTLAllocation>,
+        class: ResidencyClass,
+    ) {
         let bytes = alloc.allocatedSize() as u64;
         let n = &mut self.natives[i];
         n.raw.addAllocation(alloc);
@@ -359,6 +368,8 @@ impl Inner {
             key,
             Placed {
                 native: i as u8,
+                class,
+                site: listing_sites::note(),
                 bytes,
             },
         );
@@ -654,6 +665,37 @@ impl Metal4Declare {
     /// A slot's set leaves out what the device's sets cover.
     pub fn diff(self) -> bool {
         matches!(self, Self::QueueDiff | Self::CbDiff)
+    }
+}
+
+/// What a Metal 4 slot set may leave to the device's sets under a `*-diff`
+/// declaration (`kernels.residency.metal4_cover`, `invariants.md` §15.1r):
+/// the pool's and the heap's buffers (`Pool`), or also every unpooled buffer
+/// the device's backings listed, whose removal then waits in the in-flight
+/// hold for the epoch open at its last handle's drop (`Held`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Metal4Cover {
+    Pool,
+    Held,
+}
+
+impl Metal4Cover {
+    /// The arm `kernels.residency.metal4_cover` names.
+    pub fn selected() -> Self {
+        Self::parse(&crate::tuning::tuning().metal.residency_metal4_cover)
+    }
+    pub fn parse(arm: &str) -> Self {
+        if arm == "held" {
+            Self::Held
+        } else {
+            Self::Pool
+        }
+    }
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Pool => "pool",
+            Self::Held => "held",
+        }
     }
 }
 
@@ -1121,7 +1163,7 @@ impl ResidencySet {
             &self.queue_attachments,
             &self.natives_generation,
         );
-        inner.add_native(i, key, alloc);
+        inner.add_native(i, key, alloc, class);
     }
 
     /// Add an allocation that is not a buffer of ours — a heap chunk
@@ -1470,6 +1512,14 @@ impl ResidencySet {
         n
     }
 
+    /// The class an allocation is listed under and the site that listed it
+    /// (0 when not recorded), if the sets list it. Takes the membership
+    /// lock: for the slot census (`kernels.residency.slot_trace`) only.
+    pub(crate) fn listing_of(&self, key: usize) -> Option<(ResidencyClass, u32)> {
+        let inner = self.members.lock();
+        inner.placement.get(&key).map(|p| (p.class, p.site))
+    }
+
     /// How many allocations the set currently holds.
     ///
     /// Exists so a test can observe the mechanism directly. The defect this
@@ -1678,5 +1728,116 @@ mod witness_tests {
             "a window reset does not hide a defect count"
         );
         set.remove_all();
+    }
+}
+
+/// The stacks that listed allocations in the device's sets, for the Metal 4
+/// slot census (`kernels.residency.slot_trace`): one frame-pointer walk per
+/// listing, interned by its return addresses and symbolized once per
+/// distinct site when read. Recorded only in builds that keep symbols
+/// (`debug_assertions` or the `profile` feature), with the census on.
+pub(crate) mod listing_sites {
+    #[cfg(any(debug_assertions, feature = "profile"))]
+    mod on {
+        use std::collections::HashMap;
+        use std::sync::OnceLock;
+
+        const DEPTH: usize = 48;
+
+        #[cfg(target_vendor = "apple")]
+        extern "C" {
+            fn backtrace(
+                array: *mut *mut std::ffi::c_void,
+                size: std::ffi::c_int,
+            ) -> std::ffi::c_int;
+        }
+
+        struct Sites {
+            ids: HashMap<[usize; DEPTH], u32>,
+            traces: Vec<(std::backtrace::Backtrace, Option<Vec<String>>)>,
+        }
+
+        fn sites() -> &'static parking_lot::Mutex<Sites> {
+            static SITES: OnceLock<parking_lot::Mutex<Sites>> = OnceLock::new();
+            SITES.get_or_init(|| {
+                parking_lot::Mutex::new(Sites {
+                    ids: HashMap::new(),
+                    traces: Vec::new(),
+                })
+            })
+        }
+
+        fn enabled() -> bool {
+            static ON: OnceLock<bool> = OnceLock::new();
+            *ON.get_or_init(|| crate::tuning::tuning().metal.residency_slot_trace)
+        }
+
+        pub(crate) fn note() -> u32 {
+            if !enabled() {
+                return 0;
+            }
+            let mut key = [0usize; DEPTH];
+            #[cfg(target_vendor = "apple")]
+            {
+                let mut raw = [std::ptr::null_mut::<std::ffi::c_void>(); DEPTH];
+                // SAFETY: `raw` holds DEPTH writable slots; `backtrace` writes
+                // at most that many.
+                let n = unsafe { backtrace(raw.as_mut_ptr(), DEPTH as std::ffi::c_int) };
+                for (slot, ip) in key.iter_mut().zip(raw.iter().take(n.max(0) as usize)) {
+                    *slot = *ip as usize;
+                }
+            }
+            let mut s = sites().lock();
+            if let Some(&id) = s.ids.get(&key) {
+                return id;
+            }
+            s.traces
+                .push((std::backtrace::Backtrace::force_capture(), None));
+            let id = s.traces.len() as u32;
+            s.ids.insert(key, id);
+            id
+        }
+
+        pub(crate) fn frames(site: u32) -> Vec<String> {
+            let mut s = sites().lock();
+            let Some((trace, frames)) = (site as usize)
+                .checked_sub(1)
+                .and_then(|i| s.traces.get_mut(i))
+            else {
+                return Vec::new();
+            };
+            frames
+                .get_or_insert_with(|| {
+                    trace
+                        .to_string()
+                        .lines()
+                        .map(str::trim)
+                        .filter_map(|l| l.split_once(": ").map(|(_, f)| f))
+                        .map(|f| match f.rfind("::h") {
+                            Some(i) if f.len() - i == 19 => &f[..i],
+                            _ => f,
+                        })
+                        .filter(|f| f.starts_with("lloom") || f.starts_with("<lloom"))
+                        .filter(|f| !f.contains("listing_sites") && !f.contains("residency_set::"))
+                        .map(str::to_owned)
+                        .collect()
+                })
+                .clone()
+        }
+    }
+
+    #[cfg(any(debug_assertions, feature = "profile"))]
+    pub(crate) use on::{frames, note};
+
+    /// No site is recorded in a build without symbols.
+    #[cfg(not(any(debug_assertions, feature = "profile")))]
+    #[inline]
+    pub(crate) fn note() -> u32 {
+        0
+    }
+
+    #[cfg(not(any(debug_assertions, feature = "profile")))]
+    pub(crate) fn frames(_site: u32) -> Vec<String> {
+        Vec::new()
     }
 }

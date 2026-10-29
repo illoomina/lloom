@@ -428,8 +428,21 @@ impl PooledBuffer {
 
     /// The same unpooled buffer, handed to `hold` rather than released when
     /// its last handle drops. A no-op with no hold (the retaining kind).
+    /// Where the hold unlists (`kernels.residency.metal4_cover = held`), a
+    /// buffer a membership record lists in the device's sets is marked
+    /// listed until its last GPU reader completes: its removal and its
+    /// record both wait in the hold for the epoch open at the drop (§15.1r).
     pub fn held_in_flight(mut self, hold: Option<&Arc<super::InFlightHold>>) -> Self {
         self.hold = hold.cloned();
+        if hold.is_some_and(|h| h.unlists()) {
+            self.buffer = self.buffer.take().map(|b| {
+                if b.listed_by_record() {
+                    b.with_device_listing(super::DeviceListing::Held)
+                } else {
+                    b
+                }
+            });
+        }
         self
     }
 
@@ -526,12 +539,22 @@ impl Drop for PooledBuffer {
             // SAFETY: nothing holds this buffer -- this is its last handle, and
             // the pool that could have handed out another is gone. Inert
             // without `asan-poison`.
-            if let Some(set) = &self.residency {
-                set.remove_deferred(&buffer);
+            // Under an unlisting hold the removal waits with the buffer for
+            // the epoch open now; otherwise it is staged here.
+            let unlist_later = self.hold.as_ref().is_some_and(|h| h.unlists());
+            if !unlist_later {
+                if let Some(set) = &self.residency {
+                    set.remove_deferred(&buffer);
+                }
             }
             unsafe { super::poison::unpoison_buffer(&buffer) };
             if let Some(hold) = &self.hold {
-                hold.hold(super::Held::Buffer(buffer));
+                match self.residency.take() {
+                    Some(set) if unlist_later => {
+                        hold.hold(super::Held::Unlist(super::Unlisting::new(set, buffer)))
+                    }
+                    _ => hold.hold(super::Held::Buffer(buffer)),
+                }
             }
         }
     }
@@ -4509,6 +4532,40 @@ mod tests {
 
         assert_eq!(pool.occupancy().free_buffers, 0);
         assert_eq!(pool.counters().releases, 0);
+    }
+
+    /// An unlisting hold marks an unpooled buffer covered only where a
+    /// membership record lists it in the device's sets: a buffer no record
+    /// lists stays the slot set's to list (§15.1r). A hold that does not
+    /// unlist marks nothing.
+    #[test]
+    fn an_unlisting_hold_marks_only_a_buffer_a_record_lists() {
+        let dev = device();
+        let clock = Arc::new(GpuClock::new());
+        let unlisting = Arc::new(super::super::InFlightHold::with_unlisting(
+            clock.clone(),
+            true,
+        ));
+        let plain = Arc::new(super::super::InFlightHold::new(clock));
+        let raw = || {
+            dev.new_buffer(1024, crate::kernels::RESOURCE_OPTIONS)
+                .expect("buffer allocation")
+        };
+        let unrecorded = PooledBuffer::unpooled(raw(), 1024).held_in_flight(Some(&unlisting));
+        assert_eq!(unrecorded.device_listing(), super::super::DeviceListing::No);
+        let set = Arc::new(super::super::ResidencySet::new(&dev));
+        let domain = super::super::membership::MembershipDomain::new(set.clone(), true);
+        let recorded = || {
+            let b = raw();
+            let token = domain.for_buffer(&b).expect("a membership record");
+            b.with_membership(token)
+        };
+        let listed = PooledBuffer::unpooled(recorded(), 1024).held_in_flight(Some(&unlisting));
+        assert_eq!(listed.device_listing(), super::super::DeviceListing::Held);
+        let kept = PooledBuffer::unpooled(recorded(), 1024).held_in_flight(Some(&plain));
+        assert_eq!(kept.device_listing(), super::super::DeviceListing::No);
+        let none = PooledBuffer::unpooled(recorded(), 1024).held_in_flight(None);
+        assert_eq!(none.device_listing(), super::super::DeviceListing::No);
     }
 
     /// The regression that deferring release introduced, and the bound that

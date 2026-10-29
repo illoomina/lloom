@@ -5,6 +5,19 @@ fn values(t: &Tensor) -> Result<Vec<f32>> {
     t.to_dtype(DType::F32)?.flatten_all()?.to_vec1()
 }
 
+#[cfg(feature = "metal")]
+fn metal_device() -> Result<Device> {
+    let dev = Device::new_metal(0)?;
+    let actual = dev.as_metal_device()?.commands().actual_command_api();
+    if let Ok(requested) = std::env::var("LLOOM_METAL_API") {
+        if requested != "auto" {
+            assert_eq!(actual, requested, "requested command API must be installed");
+        }
+    }
+    eprintln!("ADD_RMSNORM_API actual={actual}");
+    Ok(dev)
+}
+
 fn check(dev: &Device, dtype: DType, rows: usize, width: usize, scale: f32) -> Result<()> {
     let n = rows * width;
     let input = |phase: usize| -> Result<Tensor> {
@@ -24,9 +37,51 @@ fn check(dev: &Device, dtype: DType, rows: usize, width: usize, scale: f32) -> R
     let alpha = Tensor::new(w.as_slice(), dev)?
         .to_dtype(dtype)?
         .narrow(0, 3, width)?;
+    // Qualification only: the existing device-local recorder observes actual
+    // dispatch geometry, without substituting a predicted pipeline width.
+    // Ordinary test runs keep their previous no-trace behavior.
+    #[cfg(feature = "metal")]
+    let trace = if dev.is_metal() && std::env::var("CANDLE_METAL_TRACE").as_deref() == Ok("1") {
+        Some(
+            dev.as_metal_device()?
+                .dispatch_trace()
+                .open()
+                .map_err(|error| {
+                    lloom_tensor::Error::Msg(format!("add-rms-norm qualification trace: {error:?}"))
+                })?,
+        )
+    } else {
+        None
+    };
     let want_sum = (&lhs + &rhs)?;
     let want_norm = rms_norm(&want_sum, &alpha, 1e-5)?;
     let (sum, norm) = add_rms_norm(&lhs, &rhs, &alpha, 1e-5)?;
+    #[cfg(feature = "metal")]
+    if let Some(trace) = trace {
+        let dispatches = trace.close();
+        let composed: Vec<_> = dispatches
+            .iter()
+            .filter(|d| d.pipeline.starts_with("rmsnorm_"))
+            .collect();
+        let fused: Vec<_> = dispatches
+            .iter()
+            .filter(|d| d.pipeline.starts_with("add_rmsnorm_"))
+            .collect();
+        assert_eq!(composed.len(), 1, "exact composed norm dispatch witness");
+        assert_eq!(fused.len(), 1, "exact fused norm dispatch witness");
+        let (composed, fused) = (composed[0], fused[0]);
+        eprintln!(
+            "ADD_RMSNORM_WIDTH dtype={dtype:?} rows={rows} width={width} scale={scale} composed={} composed_tg={:?} fused={} fused_tg={:?}",
+            composed.pipeline, composed.threadgroup, fused.pipeline, fused.threadgroup
+        );
+        assert!(composed.by_threadgroups && fused.by_threadgroups);
+        assert_eq!(composed.grid, (rows, 1, 1));
+        assert_eq!(fused.grid, (rows, 1, 1));
+        assert_eq!(
+            fused.threadgroup, composed.threadgroup,
+            "fused/composed selected reduction widths differ"
+        );
+    }
     assert_eq!(sum.dims(), lhs.dims());
     assert_eq!(norm.dims(), lhs.dims());
     assert!(sum.is_contiguous() && norm.is_contiguous());
@@ -57,7 +112,7 @@ fn check(dev: &Device, dtype: DType, rows: usize, width: usize, scale: f32) -> R
                 let truth = row[c] as f64 * weights[c] as f64 / (ssq + 1e-5).sqrt();
                 assert!(
                     (got[r * width + c] as f64 - truth).abs() < tolerance,
-                    "independent reference row={r} col={c} got={} truth={truth}",
+                    "independent reference\nrow={r} col={c} got={} truth={truth}",
                     got[r * width + c]
                 );
             }
@@ -83,7 +138,7 @@ fn composed_cpu_fallback_keeps_both_results() -> Result<()> {
 
 #[cfg(feature = "metal")]
 fn metal_matrix() -> Result<()> {
-    let dev = Device::new_metal(0)?;
+    let dev = metal_device()?;
     for dtype in [DType::F16, DType::F32, DType::BF16] {
         for (rows, width) in [(1, 33), (4, 2048), (9, 64), (17, 257), (512, 2048)] {
             for scale in [1.0, 0.001] {
@@ -133,7 +188,7 @@ fn noncontiguous_fallback_and_invalid_shapes_keep_existing_contract() -> Result<
 #[test]
 fn metal_noncontiguous_fallback_returns_contiguous_results() -> Result<()> {
     lloom_tensor::isolation::claim("add-rms-norm fallback");
-    let dev = Device::new_metal(0)?;
+    let dev = metal_device()?;
     for dtype in [DType::F16, DType::F32, DType::BF16] {
         let a = Tensor::arange(0f32, 24f32, &dev)?
             .to_dtype(dtype)?
@@ -158,7 +213,7 @@ fn metal_noncontiguous_fallback_returns_contiguous_results() -> Result<()> {
 #[test]
 fn paired_storage_keeps_either_plane_alive_until_its_last_reader() -> Result<()> {
     lloom_tensor::isolation::claim("add-rms-norm paired storage");
-    let dev = Device::new_metal(0)?;
+    let dev = metal_device()?;
     let lhs = Tensor::arange(0f32, 256f32, &dev)?.reshape((4, 1, 64))?;
     let rhs = lhs.affine(-0.125, 0.33)?;
     let alpha = Tensor::ones(64, DType::F32, &dev)?;

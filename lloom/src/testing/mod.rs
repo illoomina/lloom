@@ -6,6 +6,7 @@
 #[cfg(not(target_arch = "wasm32"))]
 pub mod fixture;
 pub mod ghost;
+pub mod lfm2_gguf;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod scale;
 pub mod tiny;

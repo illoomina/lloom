@@ -120,6 +120,7 @@ mod qwen4exp_prefill_transient;
 mod qwen4exp_provisional;
 mod qwen4exp_ring_provisional;
 mod qwen4exp_routed_dense_arm;
+mod qwen4exp_routed_glu;
 mod qwen4exp_rows_timing;
 mod qwen4exp_scale_admission;
 mod qwen4exp_schema_real;

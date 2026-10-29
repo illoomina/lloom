@@ -1293,6 +1293,13 @@ pub(crate) fn silu_mul(g: &Tensor, u: &Tensor) -> Option<Result<Tensor>> {
     .then(|| g.apply_op2_no_bwd(u, &SiluMul))
 }
 
+/// Whether [`silu_mul`] would take a gate|up pair computed in `act` (on
+/// Metal, contiguous, as the routed pair stores it): the fused ops on, and
+/// `act` a dtype `silu_mul` is instantiated at.
+pub(crate) fn silu_mul_applies(act: lloom_tensor::DType) -> bool {
+    !fused_off() && silu_mul_instantiated(act)
+}
+
 /// [`silu_mul`]'s kernel for another family's composed `silu(g) · u`, without
 /// this family's `fused_off` arm: Metal, f32 or f16, `g` and `u` contiguous
 /// and of one dtype and shape; `None` where the composed pair applies.

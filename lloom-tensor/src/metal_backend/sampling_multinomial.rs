@@ -271,6 +271,7 @@ pub(super) mod prepared;
 pub(super) mod readback;
 mod result;
 mod host_scratch;
+pub(super) mod prepared_slots;
 
 #[cfg(test)]
 mod tests;

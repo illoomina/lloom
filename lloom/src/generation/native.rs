@@ -1,14 +1,16 @@
 //! Explicit prepared native sampler. This is not a default or a routing policy.
 
 use super::{noise, LogitsProcessor, Sampling};
-use lloom_tensor::metal_backend::sampling::{GuardedSample, PreparedSampler, SampleGuard};
+use lloom_tensor::metal_backend::sampling::{
+    GuardedSample, PreparedSampler, PreparedSamplerSlots, SampleGuard,
+};
 use lloom_tensor::{DType, Device, Result, Storage, Tensor};
 
 /// A request owns its sticky error and a bounded number of reusable uploads.
 /// The returned token borrows its slot through the last consumer encoding.
 pub struct PreparedNativeSampler {
     guard: SampleGuard,
-    slots: Vec<PreparedSampler>,
+    slots: PreparedSamplerSlots,
     next: usize,
     rows: usize,
     vocab: usize,
@@ -78,13 +80,7 @@ impl PreparedNativeSampler {
         if !metal.commands().executor().is_classical() {
             lloom_tensor::bail!("native sampling: captured generation ownership is not admitted");
         }
-        let mut prepared = Vec::new();
-        prepared
-            .try_reserve_exact(slots)
-            .map_err(|e| lloom_tensor::Error::Msg(format!("native sampling slots: {e}")))?;
-        for _ in 0..slots {
-            prepared.push(PreparedSampler::with_noise(metal, rows, vocab)?);
-        }
+        let prepared = PreparedSamplerSlots::with_noise(metal, rows, vocab, slots)?;
         Ok(Self {
             guard: SampleGuard::new(metal)?,
             slots: prepared,

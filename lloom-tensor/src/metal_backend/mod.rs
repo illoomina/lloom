@@ -54,6 +54,7 @@ mod sampling_topk;
 pub mod sampling {
     pub use super::sampling_multinomial::guard::{GuardedSample, SampleGuard, SamplePublisher};
     pub use super::sampling_multinomial::prepared::{Draw, PreparedSampler};
+    pub use super::sampling_multinomial::prepared_slots::PreparedSamplerSlots;
     pub use super::sampling_multinomial::readback::{CheckedSample, SampleReadback};
 }
 use device::DeviceTeardown;

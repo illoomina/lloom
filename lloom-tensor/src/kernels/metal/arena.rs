@@ -3611,7 +3611,10 @@ mod input_key_controls {
         crate::isolation::claim("pass input physical cache selection");
         let device = Device::new_metal(0)?;
         let metal = device.as_metal_device()?;
-        eprintln!("PASS_INPUT_SETUP actual_api={}", metal.commands().actual_command_api());
+        eprintln!(
+            "PASS_INPUT_SETUP actual_api={}",
+            metal.commands().actual_command_api()
+        );
         let table = Tensor::arange(0f32, 128f32, &device)?.reshape((4, 32))?;
         let ids = Tensor::new(&[2u32], &device)?;
         let prepared = table.index_select(&ids, 0)?;

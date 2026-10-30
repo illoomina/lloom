@@ -15,8 +15,10 @@ fn device() -> Result<Device> {
     crate::tuning::install(tuning).expect("install before tuning is read");
     assert!(crate::kernels::metal::profile::enabled());
     let device = Device::new_metal(0)?;
-    eprintln!("SAMPLER_NATIVE_SETUP actual_api={}",
-        device.as_metal_device()?.commands().actual_command_api());
+    eprintln!(
+        "SAMPLER_NATIVE_SETUP actual_api={}",
+        device.as_metal_device()?.commands().actual_command_api()
+    );
     Ok(device)
 }
 
@@ -1424,7 +1426,10 @@ fn checked_bridge_own_data_ready_does_not_require_callback_clock() -> Result<()>
 
     let d = device()?;
     let m = d.as_metal_device()?;
-    eprintln!("SNAPSHOT_SETUP actual_api={}", m.commands().actual_command_api());
+    eprintln!(
+        "SNAPSHOT_SETUP actual_api={}",
+        m.commands().actual_command_api()
+    );
     m.set_compute_per_buffer(usize::MAX);
     let z = Tensor::new(&[[0.0f32, 0.0]], &d)?;
     let u = Tensor::new(&[0.75f32], &d)?;
@@ -1514,7 +1519,10 @@ fn checked_bridge_exact_recording_ignores_foreign_completion_and_later_tail() ->
 
     let d = device()?;
     let m = d.as_metal_device()?;
-    eprintln!("SNAPSHOT_SETUP actual_api={}", m.commands().actual_command_api());
+    eprintln!(
+        "SNAPSHOT_SETUP actual_api={}",
+        m.commands().actual_command_api()
+    );
     m.set_compute_per_buffer(usize::MAX);
     let own_gate = m
         .metal_device()

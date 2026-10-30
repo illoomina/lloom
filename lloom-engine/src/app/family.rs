@@ -183,6 +183,29 @@ pub const LFM2_CAPABILITIES: Capabilities = Capabilities {
     eos_gate_missing: "",
 };
 
+/// An LFM2 GGUF on the LFM2 engine (`models.lfm2_gguf.engine = lfm2`): the
+/// LFM2 family's mechanisms over the file's packed blocks, at f32
+/// (`lloom::models::lfm2::gguf`), less what was not run there.
+pub const LFM2_GGUF_CAPABILITIES: Capabilities = Capabilities {
+    family: "lfm2-gguf",
+    prefix_share: false,
+    speculation: &[],
+    rewind: "the rotating ring's K on the rewindable arms; none on the crown (Shuffle)",
+    executor_arms: false,
+    kv_quant: &[KvQuant::Off],
+    kv_dtype: "f32",
+    kv_dense: &["f32"],
+    kv_quant_missing:
+        "a GGUF computes at f32 on the LFM2 engine; the reduced KV stores were not run there",
+    vision: false,
+    vision_missing: "the mmproj tower is read by the legacy GGUF engine only \
+        (models.lfm2_gguf.engine = legacy, --gguf-engine legacy)",
+    eos_gate: false,
+    eos_gate_missing:
+        "the quantized matmul cores the packed projections run on carry no gated variant",
+    ..LFM2_CAPABILITIES
+};
+
 /// Optional source-checkpoint port: same LFM engine, without borrowing
 /// dense LFM's validation claims for routed kernels and executor arms.
 pub const LFM2_MOE_CAPABILITIES: Capabilities = Capabilities {
@@ -474,40 +497,52 @@ impl Family for Lfm2Family {
         Ok(())
     }
     fn load(&self, dir: PathBuf, req: Requested<'_>) -> Result<Box<dyn Served>> {
-        let (model, shape) = (req.model, req.shape);
-        let rows = lfm2::RowsArm::parse(&shape.rows, shape.batch > 1)?;
-        let spec = &shape.speculative;
-        lfm2::load(lfm2::LoadOptions {
-            model_dir: dir,
-            cpu: model.cpu(),
-            purpose: model.purpose().map_err(anyhow::Error::msg)?,
-            kv_capacity: shape.memory.kv_capacity,
-            readback: shape.decode.readback.arm(),
-            decode: shape.decode.clone(),
-            model: shape.model.clone(),
-            reuse_prefix: shape.reuse_prefix,
-            pin_prefix: shape.pin_prefix,
-            warmup: model.warmup,
-            seed_text: shape.seed_text.clone(),
-            model_name: model.model_name.clone(),
-            batch: shape.batch,
-            intake_per_tick: shape.intake_per_tick,
-            dspark: (spec.method == "dspark").then(|| spec.drafter.clone().unwrap_or_default()),
-            prefill_tile: shape.decode.prefill.tile,
-            prefill_chunk: shape.decode.prefill.chunk,
-            memory_fraction: shape.memory.memory_fraction,
-            mem_sample: shape.mem_sample,
-            rows,
-            share_prefix: shape.share_prefix,
-            dspark_k: spec.k,
-            executor: shape.executor.clone(),
-            memory: shape.memory.clone(),
-            flash_k: model.flash_k,
-            decision_template: model.decision_template.clone(),
-            decision_ragged: shape.decision_ragged,
-            text_only: model.text_only,
-        })
+        lfm2::load(lfm2_load_options(dir, &req)?)
     }
+}
+
+/// What the LFM2 engine loads `checkpoint` with: a safetensors directory,
+/// or an LFM2 GGUF on that engine (`models.lfm2_gguf.engine = lfm2`).
+fn lfm2_load_options(checkpoint: PathBuf, req: &Requested<'_>) -> Result<lfm2::LoadOptions> {
+    let (model, shape) = (req.model, &req.shape);
+    let rows = lfm2::RowsArm::parse(&shape.rows, shape.batch > 1)?;
+    let spec = &shape.speculative;
+    Ok(lfm2::LoadOptions {
+        model_dir: checkpoint,
+        tokenizer: model.tokenizer.clone(),
+        cpu: model.cpu(),
+        purpose: model.purpose().map_err(anyhow::Error::msg)?,
+        kv_capacity: shape.memory.kv_capacity,
+        readback: shape.decode.readback.arm(),
+        decode: shape.decode.clone(),
+        model: shape.model.clone(),
+        reuse_prefix: shape.reuse_prefix,
+        pin_prefix: shape.pin_prefix,
+        warmup: model.warmup,
+        seed_text: shape.seed_text.clone(),
+        model_name: model.model_name.clone(),
+        batch: shape.batch,
+        intake_per_tick: shape.intake_per_tick,
+        dspark: (spec.method == "dspark").then(|| spec.drafter.clone().unwrap_or_default()),
+        prefill_tile: shape.decode.prefill.tile,
+        prefill_chunk: shape.decode.prefill.chunk,
+        memory_fraction: shape.memory.memory_fraction,
+        mem_sample: shape.mem_sample,
+        rows,
+        share_prefix: shape.share_prefix,
+        dspark_k: spec.k,
+        executor: shape.executor.clone(),
+        memory: shape.memory.clone(),
+        flash_k: model.flash_k,
+        decision_template: model.decision_template.clone(),
+        decision_ragged: shape.decision_ragged,
+        text_only: model.text_only,
+    })
+}
+
+/// The arm `models.lfm2_gguf.engine` names is the LFM2 engine.
+fn gguf_on_lfm2(model: &LoadConfig) -> bool {
+    model.gguf_engine != "legacy"
 }
 
 /// The distinct format/capability identity resolves before auto-speculation
@@ -719,11 +754,27 @@ impl Family for Lfm2GgufFamily {
         let (first, arch) = gguf_checkpoint(path)?;
         (arch == "lfm2").then_some(first)
     }
+    /// The default arm's: the LFM2 engine's.
     fn capabilities(&self) -> Capabilities {
-        super::causal_loaded::served::lfm2_gguf_capabilities()
+        LFM2_GGUF_CAPABILITIES
     }
     fn resolve(&self, req: &Requested<'_>) -> Result<()> {
-        let cap = self.capabilities();
+        if gguf_on_lfm2(req.model) {
+            resolve_common(&LFM2_GGUF_CAPABILITIES, req)?;
+            let s = &req.shape;
+            lfm2::RowsArm::parse(&s.rows, s.batch > 1)?;
+            if let Some(key) = qwen4exp_key_set(req.model) {
+                anyhow::bail!("`{key}` is Qwen4-exp's; lfm2-gguf has no such arm");
+            }
+            if req.model.mmproj.is_some() && !req.model.text_only {
+                anyhow::bail!(
+                    "--mmproj on lfm2-gguf: {}",
+                    LFM2_GGUF_CAPABILITIES.vision_missing
+                );
+            }
+            return Ok(());
+        }
+        let cap = super::causal_loaded::served::lfm2_gguf_capabilities();
         resolve_common(&cap, req)?;
         if req.model.flash_k.is_some() {
             anyhow::bail!("--flash-k sizes LFM2's FlashDecoding chunk; lfm2-gguf has no such arm");
@@ -739,6 +790,9 @@ impl Family for Lfm2GgufFamily {
         Ok(())
     }
     fn load(&self, first: PathBuf, req: Requested<'_>) -> Result<Box<dyn Served>> {
+        if gguf_on_lfm2(req.model) {
+            return lfm2::load(lfm2_load_options(first, &req)?);
+        }
         super::lfm2_gguf::load(first, req.model, &req.shape)
     }
 }

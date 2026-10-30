@@ -437,6 +437,21 @@ impl Session {
     }
 }
 
+/// Keep a run's turn in `sessions`: the record is converted and accounted
+/// before the table lock is taken, published under it, and the histories the
+/// publication replaces or retires are dropped after the lock is released
+/// (`docs/sessions.md` §7). Whether the turn is retained, and why not.
+pub fn publish_record(
+    sessions: &parking_lot::Mutex<Table>,
+    r: Reservation,
+    rec: Record,
+    now: Instant,
+) -> serde_json::Result<(bool, Option<Reason>)> {
+    let prepared = PreparedRecord::new(rec)?;
+    let publication = sessions.lock().publish(r, prepared, now);
+    Ok((publication.retained, publication.reason))
+}
+
 /// Dropping this result outside the table lock reclaims replaced histories.
 #[must_use]
 pub struct Publication {

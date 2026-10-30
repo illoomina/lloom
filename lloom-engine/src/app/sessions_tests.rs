@@ -1215,6 +1215,188 @@ fn a_declined_publication_evicts_no_other_session() {
     assert_charge(&t);
 }
 
+/// A turn is converted and accounted before the table lock is taken, and the
+/// history it replaces is freed after the lock is released: through the seam
+/// `finish_session` calls (`publish_record`), a normal publication (spare turn
+/// capacity) allocates and frees nothing while the lock is held. The
+/// instrument's own control comes first: an allocation and a free made with
+/// the lock held are counted as such.
+#[test]
+fn a_turn_is_prepared_before_the_table_lock_and_its_old_history_freed_after() {
+    use crate::app::test_alloc::{under_lock, Watched};
+    let table = parking_lot::Mutex::new(Table::new(cfg(4, true)));
+    let now = Instant::now();
+    let ((), control) = under_lock(&table, || {
+        let _held = table.lock();
+        drop(std::hint::black_box(Box::new(7u64)));
+    });
+    assert_eq!(
+        control,
+        Watched {
+            allocations: 1,
+            frees: 1,
+            locked_allocations: 1,
+            locked_frees: 1
+        },
+        "the instrument counts an allocation and a free made under the lock"
+    );
+    let id = turn(
+        &mut table.lock(),
+        None,
+        Some(true),
+        None,
+        &[1; 64],
+        &scopes(1),
+        &[2],
+        now,
+    );
+    let ss = scopes(3);
+    let prompt: Vec<u32> = [1u32; 64].into_iter().chain([2, 3, 4]).collect();
+    let r = table.lock().reserve(
+        Plan {
+            continued: Some((id.key, 0)),
+            store: None,
+            keep: None,
+            auth: None,
+            prompt_ids: &prompt,
+            scopes: &ss,
+        },
+        now,
+    );
+    assert!(table.lock().get(id.key).unwrap().turns.capacity() > 1);
+    let rec = Record {
+        messages: vec![
+            json!({"role": "user", "content": "x".repeat(4096)}),
+            json!({"role": "assistant", "content": "r"}),
+            json!({"role": "user", "content": "next"}),
+        ],
+        reply_msg: json!({"role": "assistant", "content": "r"}),
+        prompt_ids: prompt.clone(),
+        reply: reply(&[5]),
+        eot: None,
+        scope: ss[3],
+        prefix: None,
+    };
+    let (published, seen) = under_lock(&table, || publish_record(&table, r, rec, now).unwrap());
+    eprintln!("retention lock scope {seen:?} retained={}", published.0);
+    assert_eq!(published, (true, None));
+    assert!(
+        seen.allocations > 0 && seen.frees > 0,
+        "the window saw the call's work: {seen:?}"
+    );
+    assert_eq!(
+        seen.locked_allocations, 0,
+        "a record was converted or accounted with the table lock held: {seen:?}"
+    );
+    assert_eq!(
+        seen.locked_frees, 0,
+        "a replaced history was freed with the table lock held: {seen:?}"
+    );
+    assert_charge(&table.lock());
+}
+
+/// One stored session's retention charge by conversation length, beside the
+/// charge the stored-logical policy made before it (ids at 4 bytes each,
+/// messages at their JSON size), through the production accounting: the
+/// arithmetic behind `session.max_mib` and `session.capacity`
+/// (`docs/sessions.md` §4). Each turn adds `user` prompt ids and a `reply`
+/// of that many ids, the reply's text in `text` and `content_text` (no
+/// reasoning block), as `finish_session` records it. Text is 4 bytes a token:
+/// a stated assumption, not a tokenizer measurement.
+#[test]
+fn retention_charge_by_conversation_length() {
+    const TEXT: usize = 4;
+    const MIB64: usize = 64 << 20;
+    for (turns, user, reply_n) in [
+        (3usize, 50usize, 100usize),
+        (10, 200, 300),
+        (20, 1000, 600),
+        (40, 2600, 600),
+        (8, 125_000, 1000),
+    ] {
+        let mut t = Table::new(Config {
+            max_bytes: usize::MAX,
+            ..cfg(1, true)
+        });
+        let now = Instant::now();
+        let (mut prompt, mut messages, mut previous) =
+            (Vec::<u32>::new(), Vec::<Value>::new(), None);
+        for k in 0..turns {
+            prompt.extend(std::iter::repeat_n(1u32, user));
+            messages.push(json!({"role": "user", "content": "u".repeat(user * TEXT)}));
+            let n = messages.len();
+            let ss: Vec<Scope> = (0..=n as u8).map(Scope::test).collect();
+            let r = t.reserve(
+                Plan {
+                    continued: previous,
+                    store: Some(true),
+                    keep: None,
+                    auth: None,
+                    prompt_ids: &prompt,
+                    scopes: &ss,
+                },
+                now,
+            );
+            let text = "r".repeat(reply_n * TEXT);
+            let reply_ids = vec![2u32; reply_n];
+            let record = Arc::new(Reply {
+                ids: reply_ids.clone(),
+                text: text.clone(),
+                block: Block::None,
+                stop: Stop::Eos,
+                content: 0,
+                tail: 0,
+                reasoning_text: String::new(),
+                content_text: text.clone(),
+                partial: 0,
+                generated: reply_n,
+                logprobs: None,
+                rows: None,
+            });
+            let reply_msg = json!({"role": "assistant", "content": text});
+            assert!(t.commit(
+                r,
+                Record {
+                    messages: messages.clone(),
+                    reply_msg: reply_msg.clone(),
+                    prompt_ids: prompt.to_vec(),
+                    reply: record,
+                    eot: None,
+                    scope: ss[n],
+                    prefix: None,
+                },
+                now,
+            ));
+            messages.push(reply_msg);
+            prompt.extend(&reply_ids);
+            previous = Some((r.id.key, k));
+        }
+        assert_charge(&t);
+        let s = t.slots[0].session.as_ref().unwrap();
+        assert_eq!(s.turns.len(), turns);
+        let logical = s.ids.len() * 4
+            + s.messages
+                .iter()
+                .map(|m| serde_json::to_string(&m.value()).unwrap().len())
+                .sum::<usize>();
+        eprintln!(
+            "retention charge turns={turns} tokens={} ids_capacity={} charge={} logical={} \
+             ratio={:.2} per_64mib_charge={} per_64mib_logical={}",
+            s.ids.len(),
+            s.ids.capacity(),
+            t.bytes,
+            logical,
+            t.bytes as f64 / logical as f64,
+            MIB64 / t.bytes,
+            MIB64 / logical
+        );
+        assert!(
+            t.bytes >= logical,
+            "the retention charge counts at least the logical payload"
+        );
+    }
+}
+
 #[test]
 fn prepared_messages_roundtrip_without_a_second_value_log() {
     let messages = vec![json!({"role":"user","content":"\\ \" \n π","nested":{"a":[1,true,null]}})];

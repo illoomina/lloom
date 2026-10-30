@@ -2611,28 +2611,26 @@ fn finish_session(
         None => 0,
     };
     let publication = match reply {
-        Some(reply) => super::sessions::PreparedRecord::new(super::sessions::Record {
-            messages: ctx.conversation,
-            reply_msg,
-            prompt_ids: prompt_ids.to_vec(),
-            reply,
-            eot,
-            scope: ctx.scope,
-            prefix: ctx.record,
-        })
+        Some(reply) => super::sessions::publish_record(
+            &shared.sessions,
+            ctx.reservation,
+            super::sessions::Record {
+                messages: ctx.conversation,
+                reply_msg,
+                prompt_ids: prompt_ids.to_vec(),
+                reply,
+                eot,
+                scope: ctx.scope,
+                prefix: ctx.record,
+            },
+            Instant::now(),
+        )
         .inspect_err(|e| eprintln!("[session record preparation failed: {e}]"))
-        .ok()
-        .map(|record| {
-            shared
-                .sessions
-                .lock()
-                .publish(ctx.reservation, record, Instant::now())
-        }),
+        .ok(),
         None => None,
     };
-    let kept = publication.as_ref().is_some_and(|p| p.retained);
-    let released = publication.as_ref().and_then(|p| p.reason);
-    drop(publication);
+    let kept = publication.is_some_and(|(retained, _)| retained);
+    let released = publication.and_then(|(_, reason)| reason);
     if !kept {
         shared.sessions.lock().note_other();
     }

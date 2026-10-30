@@ -274,6 +274,11 @@ impl HostSlot {
         peek_u32(&self.buffer, self.dtype, self.cap, n, out)
     }
 
+    /// Fixed destination sibling; caller retains the same completion authority.
+    pub(crate) fn peek_u32_into(&self, out: &mut [u32]) -> Result<()> {
+        peek_u32_into(&self.buffer, self.dtype, self.cap, out)
+    }
+
     /// Retain only future host-read ownership. No write, tensor, reset or
     /// native-buffer capability escapes; the physical allocation stays live
     /// until the final reader drops, independently of the producing slot.
@@ -302,6 +307,10 @@ impl HostReadView {
     pub(crate) fn peek_u32(&self, n: usize, out: &mut Vec<u32>) -> Result<()> {
         peek_u32(&self.buffer, self.dtype, self.cap, n, out)
     }
+
+    pub(crate) fn peek_u32_into(&self, out: &mut [u32]) -> Result<()> {
+        peek_u32_into(&self.buffer, self.dtype, self.cap, out)
+    }
 }
 
 fn check_u32(buffer: &BufferHandle, dtype: DType, cap: usize, n: usize) -> Result<()> {
@@ -326,13 +335,28 @@ fn peek_u32(
     out: &mut Vec<u32>,
 ) -> Result<()> {
     check_u32(buffer, dtype, cap, n)?;
-    // SAFETY: retained mapped Shared memory; bounds checked against actual
-    // buffer bytes. Aligned volatile loads each see an old or new GPU word.
-    // The caller establishes completion before treating words as a record.
-    let ptr = unsafe { buffer.contents() } as *const u32;
-    out.clear();
-    out.extend((0..n).map(|i| unsafe { ptr.add(i).read_volatile() }));
+    out.resize(n, 0);
+    // SAFETY: exact dtype/logical/physical/mapping checks above. Resize affects
+    // only independently owned host output, not the retained native buffer.
+    unsafe { copy_checked_u32(buffer, out) };
     Ok(())
+}
+
+fn peek_u32_into(buffer: &BufferHandle, dtype: DType, cap: usize, out: &mut [u32]) -> Result<()> {
+    check_u32(buffer, dtype, cap, out.len())?;
+    // SAFETY: same checks and retained buffer as the public Vec route.
+    unsafe { copy_checked_u32(buffer, out) };
+    Ok(())
+}
+
+/// Requires check_u32(buffer, dtype, cap, out.len()) before entry. The retained
+/// Shared buffer and disjoint initialized host destination outlive this copy.
+/// Completion interpretation stays with the caller; each word can be old/new.
+unsafe fn copy_checked_u32(buffer: &BufferHandle, out: &mut [u32]) {
+    let ptr = unsafe { buffer.contents() } as *const u32;
+    for (i, word) in out.iter_mut().enumerate() {
+        *word = unsafe { ptr.add(i).read_volatile() };
+    }
 }
 
 #[cfg(test)]
@@ -361,6 +385,30 @@ mod tests {
         let mut words = Vec::with_capacity(1);
         view.peek_u32(1, &mut words)?;
         assert_eq!(words, [17]);
+        let mut fixed = [0xdecafbadu32; 1];
+        view.peek_u32_into(&mut fixed)?;
+        assert_eq!(fixed, [17], "fixed slice must share exact retained copy");
+        view.peek_u32_into(&mut [])?;
+        let mut too_long = [0xdecafbadu32; 2];
+        assert!(view.peek_u32_into(&mut too_long).is_err());
+        assert_eq!(too_long, [0xdecafbad; 2], "logical refusal modified output");
+        let wrong_dtype = HostReadView {
+            buffer: view.buffer.clone(),
+            dtype: DType::F32,
+            cap: 1,
+        };
+        assert!(wrong_dtype.peek_u32_into(&mut fixed).is_err());
+        assert_eq!(fixed, [17], "dtype refusal modified output");
+        let mut beyond_physical = vec![0xdecafbad; view.buffer.length() / 4 + 1];
+        let advertised_large = HostReadView {
+            buffer: view.buffer.clone(),
+            dtype: DType::U32,
+            cap: usize::MAX,
+        };
+        assert!(advertised_large
+            .peek_u32_into(&mut beyond_physical)
+            .is_err());
+        assert!(beyond_physical.iter().all(|&v| v == 0xdecafbad));
         assert!(view.peek_u32(2, &mut words).is_err());
         // Corrupt only private logical metadata to establish that physical
         // bounds, not the advertised capacity alone, fence every reader.

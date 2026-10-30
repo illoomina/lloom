@@ -5,6 +5,7 @@
     reason = "private prepared sampler; native activation remains gated"
 )]
 
+use super::host_scratch::HostScratch;
 use super::{
     guard::{disjoint, span, GuardedSample, SampleGuard},
     PrivateMultinomial,
@@ -61,7 +62,7 @@ struct ValidatedRequest {
 
 struct PreparedNoise {
     storage: MetalStorage,
-    values: Vec<f32>,
+    values: HostScratch<f32>,
 }
 
 impl PreparedSampler {
@@ -126,11 +127,7 @@ impl PreparedSampler {
             };
             storage.clone()
         };
-        let mut values = Vec::new();
-        values
-            .try_reserve_exact(count)
-            .map_err(|e| crate::Error::Msg(format!("prepared sampling noise capacity: {e}")))?;
-        values.resize(count, 0.);
+        let values = HostScratch::new(device, count)?;
         sampler.noise = Some(PreparedNoise { storage, values });
         Ok(sampler)
     }

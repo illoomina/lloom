@@ -860,3 +860,45 @@ fn packed_embedding_rejects_other_queue_and_aliased_weight_output() -> Result<()
     assert_eq!(output.flatten_all()?.to_vec1::<f32>()?, vec![-99.; 32]);
     Ok(())
 }
+
+#[test]
+fn fixed_snapshot_scratch_reads_only_actual_rows_and_guard_suffix() -> Result<()> {
+    let d = device()?;
+    let m = d.as_metal_device()?;
+    let guard = SampleGuard::new(m)?;
+    let mut readback = super::super::readback::SampleReadback::new(m, 3)?;
+    for ids in [&[0u32, 1, 2][..], &[1u32][..]] {
+        let status: Vec<u32> = ids.iter().flat_map(|_| [0, u32::MAX, 3, 2]).collect();
+        let token = guard.bind(sample(&d, ids, &status)?)?;
+        token.snapshot(&mut readback)?;
+        drop(token);
+        assert_eq!(
+            readback
+                .read_committed()?
+                .expect("completed guarded snapshot")
+                .ids(),
+            ids
+        );
+        assert!(
+            readback.poll()?.is_none(),
+            "one completion cannot be read twice"
+        );
+    }
+    // Same larger-capacity storage, but no guard suffix in this snapshot.
+    readback.enqueue(sample(&d, &[2], &[0, u32::MAX, 3, 2])?)?;
+    assert_eq!(
+        readback
+            .read_committed()?
+            .expect("completed unguarded snapshot")
+            .ids(),
+        &[2]
+    );
+    // Zero-row unguarded envelope remains valid and must not expose stale words.
+    readback.enqueue(sample(&d, &[], &[])?)?;
+    assert!(readback
+        .read_committed()?
+        .expect("empty envelope")
+        .ids()
+        .is_empty());
+    Ok(())
+}

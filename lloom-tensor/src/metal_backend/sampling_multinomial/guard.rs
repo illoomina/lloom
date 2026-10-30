@@ -18,7 +18,7 @@ pub struct SampleGuard {
     slot: super::super::host_slot::HostReadView,
     error: MetalStorage,
     progress: Rc<ErrorProgress>,
-    words: Vec<u32>,
+    words: [u32; 4],
 }
 
 // One cold allocation per request. Both owners are deliberately !Send/!Sync:
@@ -63,7 +63,7 @@ pub struct SamplePublisher {
     slot: super::super::host_slot::HostReadView,
     error: MetalStorage,
     progress: Rc<ErrorProgress>,
-    words: Vec<u32>,
+    words: [u32; 4],
 }
 
 /// The only device-id consumer surface. The sample and error owner remain live
@@ -137,7 +137,7 @@ impl SampleGuard {
             slot: slot.read_view(),
             error: error.clone(),
             progress: Rc::default(),
-            words: Vec::with_capacity(4),
+            words: [0; 4],
         })
     }
 
@@ -158,7 +158,7 @@ impl SampleGuard {
             slot: self.slot.clone(),
             error: self.error.clone(),
             progress: Rc::clone(&self.progress),
-            words: Vec::with_capacity(4),
+            words: [0; 4],
         }
     }
 
@@ -254,7 +254,7 @@ fn poll_error(
     error: &MetalStorage,
     progress: &ErrorProgress,
     slot: &super::super::host_slot::HostReadView,
-    words: &mut Vec<u32>,
+    words: &mut [u32; 4],
 ) -> Result<Option<[u32; 4]>> {
     let device = error.device();
     device
@@ -277,7 +277,7 @@ fn poll_error(
         .map_err(MetalError::from)?;
     // No concurrent host encoding is possible: shared progress is !Send/!Sync.
     // This exact queue has completed every possible writer of this request.
-    slot.peek_u32(4, words)?;
+    slot.peek_u32_into(words)?;
     Ok(Some([words[0], words[1], words[2], words[3]]))
 }
 

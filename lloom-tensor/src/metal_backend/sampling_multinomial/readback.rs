@@ -1,6 +1,7 @@
 //! Completion-checked host/window transfer. This is not a device-token API:
 //! ring lookahead needs guarded device consumers before native admission.
 
+use super::host_scratch::HostScratch;
 use super::{
     result::{checked_error, checked_ids},
     PrivateMultinomial,
@@ -20,7 +21,7 @@ pub struct SampleReadback {
     device: MetalDevice,
     clock: Arc<GpuClock>,
     capacity: usize,
-    words: Vec<u32>,
+    words: HostScratch<u32>,
     pending: Option<PendingSnapshot>,
     poisoned: bool,
 }
@@ -59,10 +60,7 @@ impl SampleReadback {
                     .is_some_and(|bytes| bytes <= isize::MAX as usize)
             })
             .ok_or_else(|| crate::Error::Msg("sampling readback capacity overflow".into()))?;
-        let mut words = Vec::new();
-        words
-            .try_reserve_exact(count)
-            .map_err(|e| crate::Error::Msg(format!("sampling readback capacity: {e}")))?;
+        let words = HostScratch::new(device, count)?;
         let slot = HostSlot::new(device, count.max(1), DType::U32)?;
         let tensor = slot.tensor(count.max(1))?;
         let destination = {
@@ -248,11 +246,11 @@ impl SampleReadback {
         let rows = sample.rows;
         let vocab = sample.vocab;
         let count = rows * 5;
-        self.slot
-            .peek_u32(count + if error.is_some() { 4 } else { 0 }, &mut self.words)?;
+        let used = count + if error.is_some() { 4 } else { 0 };
+        self.slot.peek_u32_into(&mut self.words[..used])?;
         // Validation precedes the success type, not merely host publication.
         let result = (if error.is_some() {
-            checked_error(&self.words[count..])
+            checked_error(&self.words[count..used])
         } else {
             Ok(())
         })

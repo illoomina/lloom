@@ -270,6 +270,7 @@ pub(super) mod guard;
 pub(super) mod prepared;
 pub(super) mod readback;
 mod result;
+mod host_scratch;
 
 #[cfg(test)]
 mod tests;

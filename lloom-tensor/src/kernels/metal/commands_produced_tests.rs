@@ -1696,8 +1696,11 @@ fn final_teardown_cancels_work_behind_pending_validated_io() {
     f.commands.flush_marker().unwrap();
     f.commands.commit_when_io_validated(dependency.clone()).unwrap();
     f.commands.encode_signal_event(&f.progress, 1).unwrap();
+    // Hold the IO-dependent recording on both APIs (Metal 4 already cut at
+    // the signal), so teardown cancels a HELD recording and owes its epoch.
+    f.commands.flush_marker().unwrap();
     let held = f.commands.produced_stats().held_now;
-    assert!(held >= 1, "nothing was held");
+    assert!(held >= 2, "the IO-dependent recording was not held behind the first");
     let clock = f.commands.clock();
     let weak = f.commands.core.produced.me_for_test();
     let counters = f.commands.core.submission_control.clone();

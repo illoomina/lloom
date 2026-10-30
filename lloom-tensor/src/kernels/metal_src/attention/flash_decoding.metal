@@ -568,11 +568,18 @@ template <typename T, int D>
   const int head_idx = tid.y;
   const int seq_idx = head_idx / p.heads_per_seq;
   const int n_keys = n_keys_per_seq[(size_t)seq_idx * p.n_keys_stride];
+  // A row past one chunk is the partial pass's and the combine's: in a ragged
+  // batch whose longest row spans chunks, this pass runs after them for the
+  // rows that fit one, so a row's bits are its own count's, not its
+  // neighbours' (the partial's width can differ from this pass's 32).
+  // Uniform across the threadgroup, before any barrier.
+  if (n_keys > p.chunk_size) {
+    return;
+  }
 
-  // The whole live range, starting at the single chunk's first page. This
-  // kernel is dispatched only when the caller computed `n_chunks == 1`, so
-  // `n_keys` fits in that chunk and the range cannot be empty for a real step
-  // (`n_keys >= 1` at decode).
+  // The whole live range, starting at the single chunk's first page: `n_keys`
+  // fits in that chunk (checked above), and the range cannot be empty for a
+  // real step (`n_keys >= 1` at decode).
   const int start = (int)chunk_table[(size_t)seq_idx * p.table_stride] * p.page_size;
   thread U o[elem_per_thread];
   U sum_exp_score, new_max, factor;

@@ -1728,8 +1728,10 @@ impl Commands {
     // Shared implementation: enrolled IO reserves its sequence under this SAME
     // recording exclusion rather than allocating a value before owner entry.
     fn encode_signal_event_locked<'a>(
-        &'a self, state: &mut EntryGuard<'a>,
-        event: &ProtocolObject<dyn objc2_metal::MTLSharedEvent>, value: u64,
+        &'a self,
+        state: &mut EntryGuard<'a>,
+        event: &ProtocolObject<dyn objc2_metal::MTLSharedEvent>,
+        value: u64,
     ) -> Result<(), MetalKernelError> {
         self.core.close_compute(state)?;
         if self.core.modern_queue.is_some() {
@@ -4793,17 +4795,32 @@ mod final_marker_tests {
         assert!(commands.core.state.lock(Side::Host).current_abandoned);
         let held_credits = credits(commands);
         let epoch = commands.clock().current_epoch().0;
-        let calls = commands.core.submission_control.native_calls.load(Ordering::Acquire);
+        let calls = commands
+            .core
+            .submission_control
+            .native_calls
+            .load(Ordering::Acquire);
         let mut captures = lifecycle::FinalCaptures::default();
         commands.core.deny_final_slot.store(true, Ordering::Release);
         let busy = commands.core.poll_final_submission(&mut captures).unwrap();
         let busy_credits = credits(commands);
         let busy_epoch = commands.clock().current_epoch().0;
-        let busy_calls = commands.core.submission_control.native_calls.load(Ordering::Acquire);
+        let busy_calls = commands
+            .core
+            .submission_control
+            .native_calls
+            .load(Ordering::Acquire);
         let still_abandoned = commands.core.state.lock(Side::Host).current_abandoned;
-        commands.core.deny_final_slot.store(false, Ordering::Release);
+        commands
+            .core
+            .deny_final_slot
+            .store(false, Ordering::Release);
         let submitted = commands.core.poll_final_submission(&mut captures).unwrap();
-        let after_calls = commands.core.submission_control.native_calls.load(Ordering::Acquire);
+        let after_calls = commands
+            .core
+            .submission_control
+            .native_calls
+            .load(Ordering::Acquire);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         let mut terminal = false;
         while std::time::Instant::now() < deadline {
@@ -4819,10 +4836,21 @@ mod final_marker_tests {
         );
         assert!(!busy, "FINAL_MARKER_WITHOUT_SLOT_IS_PENDING");
         assert!(still_abandoned, "FINAL_MARKER_PENDING_REPLACES_NOTHING");
-        assert_eq!(busy_credits, held_credits, "FINAL_MARKER_PENDING_KEEPS_ITS_CREDIT");
-        assert_eq!((busy_epoch, busy_calls), (epoch, calls), "FINAL_MARKER_PENDING_TAKES_NO_EPOCH_OR_NATIVE_CALL");
+        assert_eq!(
+            busy_credits, held_credits,
+            "FINAL_MARKER_PENDING_KEEPS_ITS_CREDIT"
+        );
+        assert_eq!(
+            (busy_epoch, busy_calls),
+            (epoch, calls),
+            "FINAL_MARKER_PENDING_TAKES_NO_EPOCH_OR_NATIVE_CALL"
+        );
         assert!(submitted, "FINAL_MARKER_SUBMITTED_ONCE_A_SLOT_IS_FREE");
-        assert_eq!(after_calls, calls + 1, "FINAL_MARKER_IS_ONE_NATIVE_SUBMISSION");
+        assert_eq!(
+            after_calls,
+            calls + 1,
+            "FINAL_MARKER_IS_ONE_NATIVE_SUBMISSION"
+        );
         assert!(terminal, "FINAL_MARKER_REACHES_TERMINALITY");
         drop(captures);
     }

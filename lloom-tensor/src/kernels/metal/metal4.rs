@@ -2063,7 +2063,10 @@ mod tests {
         println!(
             "MTL4_SLOT_WAKE unwatched_notified={freed_unwatched} full={full} watched_notified={freed_watched} free_after={free_after}"
         );
-        assert!(!freed_unwatched, "a slot freed with no waiter notified the slot Wake");
+        assert!(
+            !freed_unwatched,
+            "a slot freed with no waiter notified the slot Wake"
+        );
         assert!(full, "every slot held, yet a free slot was reported");
         assert!(freed_watched, "MTL4_SLOT_WAKE_NOTIFIES_A_WAITING_OWNER");
         assert!(free_after, "the freed slot was not seen free");

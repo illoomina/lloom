@@ -101,6 +101,9 @@ pub(crate) unsafe trait CleanupInbox: Send + Sync {
 /// lock. It returns after bounded progress; a pending dependency must notify the
 /// service Wake when its predicate can change. Native commit may run only after
 /// exclusive recording ownership is established, without acquiring a replacement.
+/// One exception, which never waits: a final owner whose recording a
+/// cancellation abandoned takes one free native slot for an empty marker, and
+/// while none is free it is pending, the freed slot notifying the Wake.
 /// Every owner remains inside this registered inbox across native entry, error,
 /// and unwind. Unknown handoff or failed callbacks cannot become terminal by
 /// poisoning. An error is retained and observable, not a successful drain.

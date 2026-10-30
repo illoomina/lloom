@@ -14,8 +14,8 @@
 //! value per `load_ordered` call serialises the whole exchange. No
 //! `waitUntilCompleted` on this path.
 
-use super::{Buffer, Commands, Device, HostInputArm};
 use super::commands::IoComputeAuthority;
+use super::{Buffer, Commands, Device, HostInputArm};
 use crate::io_terminal::{NativeIoDependency, NativeProducer};
 use crate::kernels::MetalKernelError;
 use objc2::rc::Retained;
@@ -35,7 +35,9 @@ pub(crate) enum ValidatedIssueError {
     Rooted(MetalKernelError),
 }
 impl From<MetalKernelError> for ValidatedIssueError {
-    fn from(error: MetalKernelError) -> Self { Self::NotIssued(error) }
+    fn from(error: MetalKernelError) -> Self {
+        Self::NotIssued(error)
+    }
 }
 
 /// A file opened for `MTLIOCommandQueue` loads.
@@ -405,13 +407,21 @@ impl IoQueue {
     /// through terminal/retirement or quarantine. This is not a constructor for
     /// arbitrary borrowed public IoLoad buffers. Loader enrollment supplies it.
     pub(crate) unsafe fn issue_validated(
-        &self, commands: &Commands, producer: &NativeProducer,
-        compute: &IoComputeAuthority, loads: &[IoLoad<'_>],
+        &self,
+        commands: &Commands,
+        producer: &NativeProducer,
+        compute: &IoComputeAuthority,
+        loads: &[IoLoad<'_>],
     ) -> Result<Option<NativeIoDependency>, ValidatedIssueError> {
-        if loads.is_empty() { return Ok(None); }
+        if loads.is_empty() {
+            return Ok(None);
+        }
         validate_loads(loads)?;
         if commands.host_input_arm() != HostInputArm::Commit {
-            return Err(MetalKernelError::QueueUnavailable("experimental A is not a GpuWait replacement").into());
+            return Err(MetalKernelError::QueueUnavailable(
+                "experimental A is not a GpuWait replacement",
+            )
+            .into());
         }
         let compute_value = commands.signal_enrolled_io(compute)?;
         let cb = self.queue.commandBuffer();
@@ -420,17 +430,28 @@ impl IoQueue {
         for l in loads {
             unsafe {
                 cb.loadBuffer_offset_size_sourceHandle_sourceHandleOffset(
-                    l.dst.raw_unchecked(), l.dst.base_offset() + l.dst_offset,
-                    l.len, &l.file.handle, l.src_offset as usize,
+                    l.dst.raw_unchecked(),
+                    l.dst.base_offset() + l.dst_offset,
+                    l.len,
+                    &l.file.handle,
+                    l.src_offset as usize,
                 );
             }
             total += l.len as u64;
         }
         let (lease, dependency) = producer.prepare_native(cb).map_err(|error| {
-            let cause = MetalKernelError::QueueUnavailable("admitted IO producer refused; no dependent body permitted");
-            if error.rooted() { ValidatedIssueError::Rooted(cause) } else { ValidatedIssueError::NotIssued(cause) }
+            let cause = MetalKernelError::QueueUnavailable(
+                "admitted IO producer refused; no dependent body permitted",
+            );
+            if error.rooted() {
+                ValidatedIssueError::Rooted(cause)
+            } else {
+                ValidatedIssueError::NotIssued(cause)
+            }
         })?;
-        commands.commit_validated_io_after(lease).map_err(ValidatedIssueError::Rooted)?;
+        commands
+            .commit_validated_io_after(lease)
+            .map_err(ValidatedIssueError::Rooted)?;
         self.loads.fetch_add(loads.len() as u64, Ordering::Relaxed);
         self.bytes.fetch_add(total, Ordering::Relaxed);
         Ok(Some(dependency))

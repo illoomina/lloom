@@ -32,25 +32,34 @@ struct NativeHandler(block2::RcBlock<dyn Fn(NonNull<ProtocolObject<dyn MTLIOComm
 unsafe impl Send for NativeHandler {}
 unsafe impl Sync for NativeHandler {}
 
-fn cold_handler(bank: BankHandle<NativeIoCapture, Arc<PersistentIoCohort>>, index: usize)
-    -> NativeHandler
-{
-    NativeHandler(block2::RcBlock::new(move |cb: NonNull<ProtocolObject<dyn MTLIOCommandBuffer>>| {
-        // SAFETY: callback invocation supplies a valid MTLIOCommandBuffer for
-        // this invocation, as in metal3_retirement::native_handler. No borrowed
-        // bank payload is read. Actual ticket/key are revalidated by callback.
-        let raw = unsafe { cb.as_ref() };
-        let status = RawStatus(raw.status().0 as usize);
-        let result = bank.callback(index, cb.as_ptr() as *const () as usize, status);
-        if let Err(error) = result { bank.note_callback_error(&error); }
-    }))
+fn cold_handler(
+    bank: BankHandle<NativeIoCapture, Arc<PersistentIoCohort>>,
+    index: usize,
+) -> NativeHandler {
+    NativeHandler(block2::RcBlock::new(
+        move |cb: NonNull<ProtocolObject<dyn MTLIOCommandBuffer>>| {
+            // SAFETY: callback invocation supplies a valid MTLIOCommandBuffer for
+            // this invocation, as in metal3_retirement::native_handler. No borrowed
+            // bank payload is read. Actual ticket/key are revalidated by callback.
+            let raw = unsafe { cb.as_ref() };
+            let status = RawStatus(raw.status().0 as usize);
+            let result = bank.callback(index, cb.as_ptr() as *const () as usize, status);
+            if let Err(error) = result {
+                bank.note_callback_error(&error);
+            }
+        },
+    ))
 }
 
 // Bank service custody, not this unique lease, owns the native capture/cohort.
 unsafe impl crate::io_submission::IoSubmissionOwner for NativePrepared {
     type Payload = (NativeIoCapture, Arc<PersistentIoCohort>);
-    fn core(&self) -> &IoTerminal { &self.bank.core }
-    fn cell(&self) -> &IoCell<Self::Payload> { &self.bank.slots[self.index].cell }
+    fn core(&self) -> &IoTerminal {
+        &self.bank.core
+    }
+    fn cell(&self) -> &IoCell<Self::Payload> {
+        &self.bank.slots[self.index].cell
+    }
     fn refuse_before_handoff(&self, ticket: Ticket) -> Result<(), Error> {
         self.bank.refuse(self.index, ticket)
     }
@@ -61,9 +70,13 @@ unsafe impl crate::io_submission::IoSubmissionOwner for NativePrepared {
         // not a concurrently edited OwnedRecord and not a cloned native owner.
         assert_eq!(ticket, self.ticket, "private native IO capability ticket");
         let cb = self.native_key as *const ProtocolObject<dyn MTLIOCommandBuffer>;
-        unsafe { (&*cb).commit(); }
+        unsafe {
+            (&*cb).commit();
+        }
     }
-    fn request_progress(&self) { self.bank.request_progress(); }
+    fn request_progress(&self) {
+        self.bank.request_progress();
+    }
     fn report_protocol_error(&self, error: Error) {
         self.bank.note_protocol_error(&error);
     }
@@ -93,22 +106,28 @@ impl NativeProducer {
     ) -> Result<(NativeDeferredIo, NativeIoDependency), NativePrepareError> {
         if self.bank.notice.get().is_none() {
             return Err(NativePrepareError::Admission(PrepareError::NotIssued {
-                error: Error::Mailbox(MailboxError::Busy), captures: NativeIoCapture(cb),
+                error: Error::Mailbox(MailboxError::Busy),
+                captures: NativeIoCapture(cb),
                 anchors: self.cohort.clone(),
             }));
         }
         let key = Retained::as_ptr(&cb) as *const () as usize;
-        let prepared = NativeBank::try_prepare(
-            &self.bank, NativeIoCapture(cb), self.cohort.clone(), key,
-        ).map_err(NativePrepareError::Admission)?;
+        let prepared =
+            NativeBank::try_prepare(&self.bank, NativeIoCapture(cb), self.cohort.clone(), key)
+                .map_err(NativePrepareError::Admission)?;
         // The actual CB is now rooted in the record and still Prepared. The
         // producer's immutable cold handler set is bound to this same bank.
         let raw = key as *const ProtocolObject<dyn MTLIOCommandBuffer>;
-        unsafe { (&*raw).addCompletedHandler(block2::RcBlock::as_ptr(&self.handlers[prepared.index].0)); }
+        unsafe {
+            (&*raw).addCompletedHandler(block2::RcBlock::as_ptr(&self.handlers[prepared.index].0));
+        }
         // SAFETY: try_prepare is the sole constructor of the non-Clone prepared
         // capability. It has not escaped, been copied, or entered native code.
         let ticket = prepared.ticket;
-        let dependency = NativeIoDependency { bank: prepared.bank.clone(), value: prepared.sequence + 1 };
+        let dependency = NativeIoDependency {
+            bank: prepared.bank.clone(),
+            value: prepared.sequence + 1,
+        };
         match unsafe { crate::io_submission::DeferredIo::from_prepared(prepared, ticket) } {
             Ok(lease) => Ok((lease, dependency)),
             Err(rejected) => {
@@ -157,15 +176,28 @@ pub(crate) struct NativeIoDependency {
     value: u64,
 }
 impl NativeIoDependency {
-    pub(crate) fn value(&self) -> u64 { self.value }
-    pub(crate) fn successful(&self) -> u64 { self.bank.core.successful() }
-    pub(crate) fn ready(&self) -> bool { self.successful() >= self.value }
+    pub(crate) fn value(&self) -> u64 {
+        self.value
+    }
+    pub(crate) fn successful(&self) -> u64 {
+        self.bank.core.successful()
+    }
+    pub(crate) fn ready(&self) -> bool {
+        self.successful() >= self.value
+    }
     pub(crate) fn generation_failed(&self) -> bool {
         self.bank.core.failed() || self.bank.failure.get().is_some()
     }
-    pub(crate) fn failed(&self) -> bool { self.generation_failed() && !self.ready() }
+    pub(crate) fn failed(&self) -> bool {
+        self.generation_failed() && !self.ready()
+    }
     pub(crate) fn notification(&self) -> &ProtocolObject<dyn MTLSharedEvent> {
-        &self.bank.notice.get().expect("cold IO notice installed before dependency publication").event
+        &self
+            .bank
+            .notice
+            .get()
+            .expect("cold IO notice installed before dependency publication")
+            .event
     }
 }
 
@@ -187,10 +219,13 @@ pub(crate) struct TestIoGeneration {
 }
 #[cfg(test)]
 impl TestIoGeneration {
-    pub(crate) fn new(device: &ProtocolObject<dyn objc2_metal::MTLDevice>, capacity: usize) -> Self {
-        use objc2_metal::{MTLDevice, MTLIOCommandQueue, MTLIOCommandQueueDescriptor};
+    pub(crate) fn new(
+        device: &ProtocolObject<dyn objc2_metal::MTLDevice>,
+        capacity: usize,
+    ) -> Self {
         use crate::memory_admission::ModelDomain;
         use crate::retirement_service::HostRetirementService;
+        use objc2_metal::{MTLDevice, MTLIOCommandQueue, MTLIOCommandQueueDescriptor};
         let domain = ModelDomain::isolated_numeric_fixture(1 << 20);
         let pass = domain.reserve(1 << 20).unwrap();
         let mut admission = pass.context().take(1 << 20).unwrap();
@@ -201,33 +236,74 @@ impl TestIoGeneration {
         let mut slots = Vec::new();
         slots.try_reserve_exact(capacity).unwrap();
         for _ in 0..capacity {
-            slots.push(Slot { cell: IoCell::new(&core, failure.clone(), wake.clone()).unwrap(), native_key: AtomicUsize::new(0) });
+            slots.push(Slot {
+                cell: IoCell::new(&core, failure.clone(), wake.clone()).unwrap(),
+                native_key: AtomicUsize::new(0),
+            });
         }
-        let bytes = std::alloc::Layout::array::<Slot<NativeIoCapture, Arc<PersistentIoCohort>>>(slots.capacity()).unwrap().size()
-            + std::mem::size_of::<NativeBank>() + core.order.lock().frontier.allocation_layout().size()
+        let bytes = std::alloc::Layout::array::<Slot<NativeIoCapture, Arc<PersistentIoCohort>>>(
+            slots.capacity(),
+        )
+        .unwrap()
+        .size()
+            + std::mem::size_of::<NativeBank>()
+            + core.order.lock().frontier.allocation_layout().size()
             + HostRetirementService::requested_registration_bytes();
         let charge = admission.try_commit(bytes).unwrap();
-        let bank = unsafe { NativeBank::from_admitted(ColdParts { core, slots, failure, wake, charge }, &service) }
-            .unwrap_or_else(|_| panic!("test bank admission"));
+        let bank = unsafe {
+            NativeBank::from_admitted(
+                ColdParts {
+                    core,
+                    slots,
+                    failure,
+                    wake,
+                    charge,
+                },
+                &service,
+            )
+        }
+        .unwrap_or_else(|_| panic!("test bank admission"));
         let notice = device.newSharedEvent().unwrap();
-        assert!(bank.notice.set(NativeNotice { event: notice, published: AtomicU64::new(0) }).is_ok());
+        assert!(bank
+            .notice
+            .set(NativeNotice {
+                event: notice,
+                published: AtomicU64::new(0)
+            })
+            .is_ok());
         let descriptor = MTLIOCommandQueueDescriptor::new();
-        let queue = device.newIOCommandQueueWithDescriptor_error(&descriptor).unwrap();
+        let queue = device
+            .newIOCommandQueueWithDescriptor_error(&descriptor)
+            .unwrap();
         // This empty test cohort owns no destinations. It cannot authorize real
         // loads and does not certify production metadata/cohort admission.
-        let cohort = Arc::new(PersistentIoCohort { destinations: Vec::new() });
+        let cohort = Arc::new(PersistentIoCohort {
+            destinations: Vec::new(),
+        });
         let mut prepared = Vec::new();
         for _ in 0..capacity {
             let cb = queue.commandBuffer();
             let key = Retained::as_ptr(&cb) as *const () as usize;
-            prepared.push(Some(NativeBank::try_prepare(&bank, NativeIoCapture(cb), cohort.clone(), key)
-                .unwrap_or_else(|_| panic!("test prepared record"))));
+            prepared.push(Some(
+                NativeBank::try_prepare(&bank, NativeIoCapture(cb), cohort.clone(), key)
+                    .unwrap_or_else(|_| panic!("test prepared record")),
+            ));
         }
-        Self { bank, prepared, service, _domain: domain }
+        Self {
+            bank,
+            prepared,
+            service,
+            _domain: domain,
+        }
     }
     pub(crate) fn dependency(&self, index: usize) -> NativeIoDependency {
-        let p = self.prepared[index].as_ref().expect("dependency before injected terminal");
-        NativeIoDependency { bank: self.bank.clone(), value: p.sequence + 1 }
+        let p = self.prepared[index]
+            .as_ref()
+            .expect("dependency before injected terminal");
+        NativeIoDependency {
+            bank: self.bank.clone(),
+            value: p.sequence + 1,
+        }
     }
     pub(crate) fn deferred(&mut self, index: usize) -> NativeDeferredIo {
         let p = self.prepared[index].take().unwrap();
@@ -240,15 +316,31 @@ impl TestIoGeneration {
         self.service.close_admission();
     }
     pub(crate) fn untouched_custody(&self) -> (u64, u64, u64, usize, usize) {
-        (self.bank.issued.load(Ordering::Acquire), self.bank.retired.load(Ordering::Acquire),
-         self.bank.core.successful(), self.prepared.iter().filter(|p| p.is_some()).count(),
-         self.bank.slots.iter().filter(|s| s.cell.mailbox.pending_ticket().is_some()).count())
+        (
+            self.bank.issued.load(Ordering::Acquire),
+            self.bank.retired.load(Ordering::Acquire),
+            self.bank.core.successful(),
+            self.prepared.iter().filter(|p| p.is_some()).count(),
+            self.bank
+                .slots
+                .iter()
+                .filter(|s| s.cell.mailbox.pending_ticket().is_some())
+                .count(),
+        )
     }
     pub(crate) fn terminal(&mut self, index: usize, status: usize) {
         let p = self.prepared[index].take().unwrap();
-        self.bank.slots[p.index].cell.begin_handoff(p.ticket).unwrap();
-        self.bank.callback(p.index, p.native_key, RawStatus(status)).unwrap();
-        self.bank.slots[p.index].cell.handoff_returned(p.ticket).unwrap();
+        self.bank.slots[p.index]
+            .cell
+            .begin_handoff(p.ticket)
+            .unwrap();
+        self.bank
+            .callback(p.index, p.native_key, RawStatus(status))
+            .unwrap();
+        self.bank.slots[p.index]
+            .cell
+            .handoff_returned(p.ticket)
+            .unwrap();
         self.bank.request_progress();
         while self.service.manual_pass() {}
     }
@@ -257,12 +349,13 @@ impl TestIoGeneration {
 impl Drop for TestIoGeneration {
     fn drop(&mut self) {
         for p in &mut self.prepared {
-            if let Some(p) = p.take() { let _ = self.bank.refuse(p.index, p.ticket); }
+            if let Some(p) = p.take() {
+                let _ = self.bank.refuse(p.index, p.ticket);
+            }
         }
         while self.service.manual_pass() {}
     }
 }
-
 
 #[cfg(test)]
 mod failure_notice_tests {
@@ -282,13 +375,29 @@ mod failure_notice_tests {
         // Actual holder path, deterministic losing try-lock; no extra scheduler.
         let retired = generation.bank.begin_retire_with(|| {
             generation.fail_service_without_callback();
-            during = Some((dependency.notification().signaledValue(),
-                           generation.bank.pending.load(Ordering::SeqCst)));
+            during = Some((
+                dependency.notification().signaledValue(),
+                generation.bank.pending.load(Ordering::SeqCst),
+            ));
         });
-        let after = (dependency.notification().signaledValue(), generation.untouched_custody());
-        assert_eq!(during, Some((0, true)), "IO_FAILURE_BUSY_HOLDER_PRESERVES_PENDING");
-        assert_eq!(after.0, u64::MAX, "IO_FAILURE_HOLDER_ASSISTS_WITHOUT_CALLBACK");
-        assert_eq!(after.1, before, "IO_FAILURE_NOTICE_DOES_NOT_RETIRE_OR_HANDOFF");
+        let after = (
+            dependency.notification().signaledValue(),
+            generation.untouched_custody(),
+        );
+        assert_eq!(
+            during,
+            Some((0, true)),
+            "IO_FAILURE_BUSY_HOLDER_PRESERVES_PENDING"
+        );
+        assert_eq!(
+            after.0,
+            u64::MAX,
+            "IO_FAILURE_HOLDER_ASSISTS_WITHOUT_CALLBACK"
+        );
+        assert_eq!(
+            after.1, before,
+            "IO_FAILURE_NOTICE_DOES_NOT_RETIRE_OR_HANDOFF"
+        );
         assert!(!retired);
         assert!(!dependency.ready());
     }
@@ -305,18 +414,35 @@ mod failure_notice_tests {
         generation.bank.begin_retire_with(|| {
             generation.fail_service_without_callback();
             // Existing lower-prefix holder still owns the setter exclusion.
-            generation.bank.notice.get().unwrap().publish(captured_prefix, false);
+            generation
+                .bank
+                .notice
+                .get()
+                .unwrap()
+                .publish(captured_prefix, false);
             during = Some(dependency.notification().signaledValue());
         });
-        assert_eq!(during, Some(1), "IO_FAILURE_LOWER_HOLDER_FINISHES_BEFORE_MAX");
+        assert_eq!(
+            during,
+            Some(1),
+            "IO_FAILURE_LOWER_HOLDER_FINISHES_BEFORE_MAX"
+        );
         assert_eq!(dependency.notification().signaledValue(), u64::MAX);
         {
             let _order = generation.bank.core.order.lock();
             // Explicit stale captured argument boundary, NOT new data validity.
-            generation.bank.notice.get().unwrap().publish(captured_prefix, false);
+            generation
+                .bank
+                .notice
+                .get()
+                .unwrap()
+                .publish(captured_prefix, false);
         }
-        assert_eq!(dependency.notification().signaledValue(), u64::MAX,
-                   "IO_FAILURE_MAX_CANNOT_REGRESS_TO_STALE_PREFIX");
+        assert_eq!(
+            dependency.notification().signaledValue(),
+            u64::MAX,
+            "IO_FAILURE_MAX_CANNOT_REGRESS_TO_STALE_PREFIX"
+        );
         assert_eq!(generation.untouched_custody(), before);
         assert_eq!(dependency.successful(), 1);
         assert!(!dependency.ready());
@@ -327,10 +453,16 @@ mod failure_notice_tests {
         let generation = generation(1);
         let dependency = generation.dependency(0);
         let before = generation.untouched_custody();
-        let error = generation.bank.callback(usize::MAX, 1, RawStatus(3)).unwrap_err();
+        let error = generation
+            .bank
+            .callback(usize::MAX, 1, RawStatus(3))
+            .unwrap_err();
         assert!(matches!(error, CallbackError::WrongNativeIdentity));
         generation.bank.note_callback_error(&error);
-        assert!(!dependency.generation_failed(), "IO_FOREIGN_DIAGNOSTIC_NOT_GENERATION_FAILURE");
+        assert!(
+            !dependency.generation_failed(),
+            "IO_FOREIGN_DIAGNOSTIC_NOT_GENERATION_FAILURE"
+        );
         assert_eq!(dependency.notification().signaledValue(), 0);
         assert_eq!(generation.untouched_custody(), before);
         assert_eq!(generation.bank.diagnostics.load(Ordering::Acquire) & 2, 2);

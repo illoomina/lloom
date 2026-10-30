@@ -925,6 +925,16 @@ impl Table {
             return result;
         }
         self.trim_releases();
+        if self.bytes > self.cfg.max_bytes
+            && self.unevictable(r.id.key.slot as usize) > self.cfg.max_bytes
+        {
+            self.counters.expired += 1;
+            result.reason = Some(Reason::Budget);
+            result
+                ._retired
+                .extend(self.free(r.id.key.slot as usize, Some(Reason::Budget)));
+            return result;
+        }
         while self.bytes > self.cfg.max_bytes {
             let victim = self
                 .stored_slots()
@@ -949,6 +959,20 @@ impl Table {
         }
         result.retained = true;
         result
+    }
+
+    /// The bytes no eviction for slot `keep` can give back: its own session's
+    /// and every session the pressure loop does not take (the ephemeral
+    /// ones). Release history is not counted: it is trimmed first.
+    fn unevictable(&self, keep: usize) -> usize {
+        let stored = self.stored_slots();
+        self.slots
+            .iter()
+            .enumerate()
+            .filter(|&(i, _)| i == keep || !stored.contains(&i))
+            .filter_map(|(_, slot)| slot.session.as_ref())
+            .map(|s| s.bytes)
+            .sum()
     }
 
     /// The engine's sequence served something no session holds (another

@@ -1015,6 +1015,7 @@ impl Commands {
             if declare.on_queue() || declare.per_command_buffer() {
                 queue.use_device_sets(Arc::clone(&residency_set));
             }
+            queue.census_sets(Arc::clone(&residency_set));
             Some(queue)
         } else {
             None
@@ -1095,8 +1096,12 @@ impl Commands {
 
         let pipelined_compute_per_buffer =
             crate::tuning::tuning().metal.pipelined_compute_per_buffer;
-        let hold = (kind == CommandBufferKind::Unretained)
-            .then(|| Arc::new(InFlightHold::new(Arc::clone(&clock))));
+        // A Metal 4 queue whose slot sets leave unpooled buffers to the
+        // device's sets keeps them listed through the hold (§15.1r).
+        let unlists =
+            modern_queue.is_some() && super::Metal4Cover::selected() == super::Metal4Cover::Held;
+        let hold = (kind == CommandBufferKind::Unretained || unlists)
+            .then(|| Arc::new(InFlightHold::with_unlisting(Arc::clone(&clock), unlists)));
         let failure: Arc<CommandBufferFailure> = Arc::default();
         let hook = Arc::new(super::completion_hook::CompletionHook::new(
             Arc::clone(&clock),
@@ -1331,6 +1336,16 @@ impl Commands {
     /// instrument off.
     pub fn metal4_slot_residency(&self) -> Option<super::SlotResidency> {
         self.core.modern_queue.as_ref()?.slot_residency()
+    }
+
+    /// The Metal 4 slot census by listing site
+    /// (`kernels.residency.slot_trace`); empty on Metal 3 or with the
+    /// instrument off.
+    pub fn metal4_slot_sites(&self) -> Vec<crate::residency_class::SlotSite> {
+        self.core
+            .modern_queue
+            .as_ref()
+            .map_or_else(Vec::new, |q| q.slot_sites())
     }
 
     /// What this queue's Metal 4 command buffers declare resident
@@ -1619,7 +1634,7 @@ impl Commands {
                 ))?;
             *executor = Some(self.executor());
             let executor = executor.as_ref().expect("executor staged above");
-            if self.core.hold.is_some() && !executor.is_classical() {
+            if self.core.kind == CommandBufferKind::Unretained && !executor.is_classical() {
                 // An executor's indirect command buffers and the buffers
                 // their ranges keep resident are its own, replaced as it
                 // records; nothing holds them for a command buffer that does

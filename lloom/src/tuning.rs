@@ -577,6 +577,15 @@ pub struct Qwen4ExpTuning {
         status = "arm"
     )]
     pub f16_fold: bool,
+    /// The routed experts' SwiGLU on the gate|up pair's store: one launch computes both halves of a row tile and writes `silu(g) · u` (the pair then `silu_mul`, bit for bit) wherever the pair is one launch and the step would run `silu_mul`; off = the pair and `silu_mul` (the A/B arm). An arm, off by default.
+    #[opt(
+        flag = "qwen-routed-glu",
+        env = "QWEN4EXP_ROUTED_GLU",
+        bool,
+        path = "kernels.fusion.routed_glu",
+        status = "arm"
+    )]
+    pub routed_glu: bool,
     /// The DeltaNet prefill's chunk scan as one launch (off = the per-chunk launches).
     #[opt(
         flag = "chunk-scan",
@@ -740,6 +749,7 @@ impl Default for Qwen4ExpTuning {
             shared_store: false,
             mtp_experts: "streamed".into(),
             f16_fold: false,
+            routed_glu: false,
             chunk_scan: true,
             delta_reduce: false,
             state_write: "in-place".into(),
@@ -806,7 +816,7 @@ pub struct RingTuning {
     /// Whether the adaptive commit's loop watches the ring for a stop id itself (#993): off (it stops only when the reader raises the flag, so a late reader lets it run past an EOS without bound) or on (it reads what the GPU published before each step and stops at a stop id, so at most `adaptive_lead + 1` forwards run past an EOS). An arm until it is measured.
     #[opt(flag = "ring-eos-watch", env = "LLOOM_RING_EOS_WATCH", bool, path = "decode.ring.eos_watch", status = "arm", facets = ["lead"], flows = ["token-out", "commands-out"])]
     pub eos_watch: bool,
-    /// The counter cut on the batched loop's decode-only steps: `off` (the period in force, a cut every 50 dispatches), `ahead` (held off while a forward is encoded ahead of the step's readback, as `decode_until`'s step loop holds it) or `all` (held off on the blocking arm too). A step that feeds prompt pieces keeps the period. An arm until it is measured.
+    /// The counter cut on the batched loop's decode-only steps: `off` (the period in force, a cut every 50 dispatches), `ahead` (held off while a forward is encoded ahead of the step's readback, as `decode_until`'s step loop holds it) or `all` (held off on the blocking arm too). A step that feeds prompt pieces keeps the period. `off` in the library; `serve` and `bench` default to `all` on LFM2 on Metal (decision 71; PR1120, LFM2.5 at a batch of 4 and 8: +1.7 to +11.4 % decode and 1 to 7 % less request time, the sampled arm included). Qwen4-exp keeps `off` (no effect resolvable at a batch of 4). `--batched-cut-hold off` to measure without it.
     #[opt(flag = "batched-cut-hold", env = "LLOOM_BATCHED_CUT_HOLD", parser = "parse_batched_cut_hold", variants = ["off", "ahead", "all"], path = "decode.batched.cut_hold", status = "arm", facets = ["cadence"], flows = ["token-out", "commands-out"])]
     pub batched_cut_hold: String,
 }

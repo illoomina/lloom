@@ -19,6 +19,7 @@ enum Case {
     PartialTail,
     CompleteMarker,
     SplitMarker,
+    EarlyFailureThenSuccess,
 }
 #[derive(Default)]
 struct Wire {
@@ -26,6 +27,8 @@ struct Wire {
     events: Vec<Value>,
     first_text: bool,
     failures: usize,
+    model_entries: usize,
+    decoded: bool,
 }
 #[derive(Clone, Default)]
 struct Progress(Arc<(ParkingMutex<Wire>, Condvar)>);
@@ -138,7 +141,11 @@ impl Served for Scripted {
         "scripted-tail"
     }
     fn kv_capacity(&self) -> usize {
-        64
+        if matches!(self.case, Case::EarlyFailureThenSuccess) {
+            256
+        } else {
+            64
+        }
     }
     fn readback(&self) -> ReadbackArm {
         ReadbackArm::Blocking
@@ -210,11 +217,16 @@ impl Served for Scripted {
     }
     fn complete_until(
         &self,
-        _: &[u32],
-        _: &DecodeParams,
-        _: &mut (dyn FnMut(&str) -> bool + Send),
+        prompt: &[u32],
+        params: &DecodeParams,
+        sink: &mut (dyn FnMut(&str) -> bool + Send),
     ) -> Result<Decoded> {
-        panic!("typed observer must be used")
+        // Completions intentionally take the raw-text Served route. Existing
+        // chat controls still require the typed observer rather than falling back.
+        if !matches!(self.case, Case::EarlyFailureThenSuccess) {
+            panic!("typed observer must be used");
+        }
+        self.complete_observed(prompt, &[], params, sink, &mut |_, _, _, _| Ok(()))
     }
     fn complete_observed(
         &self,
@@ -224,6 +236,13 @@ impl Served for Scripted {
         sink: &mut (dyn FnMut(&str) -> bool + Send),
         observe: &mut DecodeObserver<'_>,
     ) -> Result<Decoded> {
+        {
+            let mut wire = self.progress.0 .0.lock();
+            wire.model_entries += 1;
+            if matches!(self.case, Case::EarlyFailureThenSuccess) && wire.model_entries == 1 {
+                anyhow::bail!("scripted pre-token memory refusal");
+            }
+        }
         let end = self.text.tokenizer.token_to_id("</think>").unwrap();
         let mut stream = crate::stream::TextStream::default();
         let mut from = 0;
@@ -279,6 +298,7 @@ impl Served for Scripted {
             assert!(sink("/think>X"));
         }
         let (text, tokens) = stream.finish(&stops);
+        self.progress.0 .0.lock().decoded = true;
         Ok(Decoded {
             text,
             tokens,
@@ -318,28 +338,10 @@ impl Served for Scripted {
     fn shutdown(&self) {}
 }
 
-fn run(
-    case: Case,
-    fail: Option<Value>,
-    raw: &str,
-    expected_written: usize,
-) -> (String, Vec<Value>) {
-    let progress = Progress::default();
-    let engine = Box::new(Scripted::new(case, progress.clone()));
-    let tags = engine
-        .think_tags()
-        .expect("actual template has reasoning tags");
-    let end = tags.end;
+fn scripted_shared_with_progress(case: Case, progress: Progress) -> Shared {
+    let engine = Box::new(Scripted::new(case, progress));
     let front = Front::new(engine.as_ref(), Default::default());
-    let origin = front.origin(
-        &json!([]),
-        &Default::default(),
-        Some(Thinking {
-            on: true,
-            by: super::super::thinking::By::Template,
-        }),
-    );
-    let shared = Shared {
+    Shared {
         engine,
         front,
         decisions: super::super::decisions::Decisions::Refused("test".into()),
@@ -355,7 +357,30 @@ fn run(
         activity: Arc::new(keep_warm::Activity::new(0)),
         keep_warm: keep_warm::Policy::Off { why: "test".into() },
         keep_warm_pressure_file: None,
-    };
+    }
+}
+
+fn run(
+    case: Case,
+    fail: Option<Value>,
+    raw: &str,
+    expected_written: usize,
+) -> (String, Vec<Value>) {
+    let progress = Progress::default();
+    let shared = scripted_shared_with_progress(case, progress.clone());
+    let tags = shared
+        .engine
+        .think_tags()
+        .expect("actual template has reasoning tags");
+    let end = tags.end;
+    let origin = shared.front.origin(
+        &json!([]),
+        &Default::default(),
+        Some(Thinking {
+            on: true,
+            by: super::super::thinking::By::Template,
+        }),
+    );
     let run = StreamingRun {
         kind: StreamKind::Chat,
         prompt_ids: vec![tags.start],
@@ -775,4 +800,169 @@ fn a_family_without_decode_observations_splits_by_marker_text() {
         .unwrap();
     let a = p.push("literal </think> stays reasoning");
     assert_eq!(a.get("reasoning_content").and_then(|v| v.as_str()), Some("literal </think> stays reasoning"));
+}
+
+// Same size-line/dechunk traversal as tiny_chat_e2e.rs's streamed-content
+// control, assembled as bytes before UTF-8/SSE parsing. This fixture writer
+// sends no HTTP trailers/extensions; TCP reads and HTTP chunks may split a
+// JSON event or a UTF-8 code point anywhere.
+fn chunked_sse_body(wire: &[u8]) -> String {
+    let split = wire.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+    let head = std::str::from_utf8(&wire[..split]).unwrap();
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    assert!(
+        head.to_ascii_lowercase()
+            .contains("content-type: text/event-stream"),
+        "{head}"
+    );
+    assert!(
+        head.to_ascii_lowercase()
+            .contains("transfer-encoding: chunked"),
+        "{head}"
+    );
+    let mut rest = &wire[split + 4..];
+    let mut payload = Vec::new();
+    loop {
+        let line = rest.windows(2).position(|w| w == b"\r\n").unwrap();
+        let size = std::str::from_utf8(&rest[..line]).unwrap();
+        let n = usize::from_str_radix(size.trim(), 16).unwrap();
+        rest = &rest[line + 2..];
+        if n == 0 {
+            assert_eq!(rest, b"\r\n", "exact chunk terminator, no trailing bytes");
+            break;
+        }
+        payload.extend_from_slice(rest.get(..n).expect("complete chunk body"));
+        rest = rest
+            .get(n..)
+            .unwrap()
+            .strip_prefix(b"\r\n")
+            .expect("chunk CRLF");
+    }
+    String::from_utf8(payload).unwrap()
+}
+
+#[test]
+fn chunked_sse_assembly_joins_split_event_and_unicode_bytes() {
+    let payload = "data: {\"error\":\"refusé\"}\n\n";
+    let mut wire =
+        b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n"
+            .to_vec();
+    for byte in payload.as_bytes() {
+        wire.extend_from_slice(b"1\r\n");
+        wire.push(*byte);
+        wire.extend_from_slice(b"\r\n");
+    }
+    wire.extend_from_slice(b"0\r\n\r\n");
+    assert_eq!(chunked_sse_body(&wire), payload);
+}
+
+// Actual HTTP headers and chunked SSE, not a fabricated Writer result. The
+// refusal is injected at the Served boundary: this proves error transport and
+// request-owner cleanup, not native allocator rollback or model-state recovery.
+fn early_refusal_is_visible_and_next_request_runs(path: &str, body: Value) {
+    use std::net::TcpStream;
+    let progress = Progress::default();
+    let shared = scripted_shared_with_progress(Case::EarlyFailureThenSuccess, progress.clone());
+    let tiny_http::ListenAddr::IP(address) = shared.server.server_addr() else {
+        panic!("IP test listener")
+    };
+    let body = body.to_string();
+    for attempt in 0..2 {
+        let mut client = TcpStream::connect(address).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        client
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        write!(client, "POST {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}", body.len()).unwrap();
+        let request = shared
+            .server
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        let result = handle_model_request(&shared, path, request, FirstToken::default());
+        let mut wire = Vec::new();
+        client.read_to_end(&mut wire).unwrap();
+        let response = chunked_sse_body(&wire);
+        let events: Vec<Value> = response
+            .lines()
+            .filter_map(|line| {
+                line.strip_prefix("data: ")
+                    .filter(|data| *data != "[DONE]")
+                    .map(|data| serde_json::from_str(data).unwrap())
+            })
+            .collect();
+        if attempt == 0 {
+            assert_eq!(
+                result.unwrap_err().to_string(),
+                "scripted pre-token memory refusal"
+            );
+            assert_eq!(
+                events.last(),
+                Some(&json!({"error":{
+                    "message":"scripted pre-token memory refusal","type":"server_error"
+                }})),
+                "missing terminal SSE error"
+            );
+            if path == "/v1/chat/completions" {
+                assert_eq!(events.len(), 2, "only role then refusal, no token event");
+                assert_eq!(
+                    events[0]["choices"][0]["delta"],
+                    json!({"role":"assistant"})
+                );
+            } else {
+                assert_eq!(events.len(), 1, "only refusal, no token event");
+            }
+            assert!(events.iter().all(|event| event.get("timings").is_none()));
+            assert!(
+                !response.contains("[DONE]"),
+                "failure is not a successful empty completion"
+            );
+            assert_eq!(shared.sessions.lock().json()["turns"], 0);
+            assert!(
+                !progress.0 .0.lock().decoded,
+                "refusal preceded sampled tokens"
+            );
+        } else {
+            result.unwrap();
+            assert_eq!(response.matches("data: [DONE]").count(), 1);
+            assert!(events.iter().all(|event| event.get("error").is_none()));
+            let trailer = events
+                .iter()
+                .find(|event| event.get("timings").is_some())
+                .expect("next request has a success trailer");
+            assert_eq!(
+                trailer["choices"][0]["token_ids"].as_array().unwrap().len(),
+                3
+            );
+            assert!(
+                progress.0 .0.lock().decoded,
+                "next request reached generation"
+            );
+        }
+        assert!(shared.turns.try_take().is_some(), "model FIFO released");
+        assert_eq!(progress.0 .0.lock().model_entries, attempt + 1);
+    }
+}
+
+#[test]
+fn completions_pre_token_refusal_emits_sse_error_and_next_request_succeeds() {
+    early_refusal_is_visible_and_next_request_runs(
+        "/v1/completions",
+        json!({
+            "prompt":"p","stream":true,"max_tokens":3,"return_token_ids":true
+        }),
+    );
+}
+
+#[test]
+fn chat_pre_token_refusal_emits_sse_error_and_next_request_succeeds() {
+    early_refusal_is_visible_and_next_request_runs(
+        "/v1/chat/completions",
+        json!({
+            "messages":[{"role":"user","content":"p"}],"stream":true,
+            "store":true,"max_tokens":3,"return_token_ids":true
+        }),
+    );
 }

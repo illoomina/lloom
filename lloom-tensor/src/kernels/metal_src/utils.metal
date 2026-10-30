@@ -187,6 +187,23 @@ METAL_FUNC T silu(T x) {
     return static_cast<T>(x / (1 + exp(-x)));
 }
 
+// One element of `silu(g) · u` at `T`: the SwiGLU's product, one definition for
+// `qwen4exp.metal`'s `silu_mul` and the routed pair's GLU store
+// (`quantized_glu.metal`), so both round as one expression.
+template <typename T>
+METAL_FUNC T silu_times(T g, T u) {
+  return static_cast<T>(silu(g) * u);
+}
+
+// At half the product must round the SiLU `silu_f16` stored: left to
+// reassociate, fast math folds the SiLU's division into the multiply and
+// lands one ulp away on about one element in six.
+template <>
+METAL_FUNC half silu_times(half g, half u) {
+  #pragma clang fp reassociate(off)
+  return static_cast<half>(silu(g) * u);
+}
+
 // The sigmoid the same two files spell two ways: `unary.metal:308`'s
 // `recip(1 + exp(-x))` and `quantized.metal:1503`'s `1.0f / (1.0f + exp(-x))`.
 //

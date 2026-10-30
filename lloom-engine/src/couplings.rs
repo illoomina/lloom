@@ -30,8 +30,8 @@ pub const COUPLINGS: &[Coupling] = &[
         kind: "resolves",
         when: "decode.readback.kind = auto, and the sampler is host-side (top-k or top-p at a temperature, no device sampler)",
         effect: "the run takes the blocking readback, reported on the turn line",
-        keys: &["decode.readback.kind", "generation.top_k", "generation.top_p", "generation.temperature", "generation.sampling.method"],
-        site: "lloom-engine/src/decode.rs ReadbackArm::{ring_admits, resolve}",
+        keys: &["decode.readback.kind", "decode.readback.device_filter", "generation.top_k", "generation.top_p", "generation.temperature", "generation.sampling.method"],
+        site: "lloom-engine/src/decode.rs DecodeParams::sampler_route; ReadbackArm::{ring_admits, resolve}",
         is_static: false,
     },
     Coupling {
@@ -39,8 +39,8 @@ pub const COUPLINGS: &[Coupling] = &[
         kind: "resolves",
         when: "decode.readback.kind = ring with the host-side sampler of C1",
         effect: "the request runs on the blocking arm — the ring has no host round trip for the draw — and the turn line and `timings.readback_note` say so (a warning, not a refusal, since 2026-10-20)",
-        keys: &["decode.readback.kind", "generation.top_k", "generation.top_p", "generation.temperature", "generation.sampling.method"],
-        site: "lloom-engine/src/decode.rs ReadbackArm::{resolve, demotion}; the ring itself still refuses the pair (lloom/src/generation/readback.rs Ring::check_sampler)",
+        keys: &["decode.readback.kind", "decode.readback.device_filter", "generation.top_k", "generation.top_p", "generation.temperature", "generation.sampling.method"],
+        site: "lloom-engine/src/decode.rs DecodeParams::sampler_route; ReadbackArm::{resolve, demotion}; the ring itself still refuses the pair (lloom/src/generation/readback.rs Ring::check_sampler)",
         is_static: false,
     },
     Coupling {
@@ -358,7 +358,42 @@ pub fn explain(o: &EngineOptions) -> Vec<String> {
             return out;
         }
     };
-    if host_side(&sampling) {
+    // A load-time prediction for scalar defaults only. Actual request params,
+    // model capability and memory admission still decide whether it can run.
+    let scalar = o.scheduler.max_sequences <= 1 && o.speculative.method == "none";
+    let route = if scalar {
+        let params = crate::DecodeParams {
+            readback: r.arm(),
+            logits_digest: o.decode.logits_digest,
+            ..Default::default()
+        };
+        Some(params.sampler_route(
+            r.device_filter,
+            &sampling,
+            cfg!(feature = "metal") && o.load.device != "cpu",
+            r.ring_arm(),
+        ))
+    } else {
+        None
+    };
+    if r.device_filter {
+        match &route {
+            Some(Ok(selected)) if selected.prepared_sampler => out.push(format!(
+                "decode.readback.device_filter -> {} (selected default-request route; model capability/admission still required)",
+                selected.arm.name()
+            )),
+            Some(Err(error)) => out.push(format!(
+                "decode.readback.device_filter: default request would refuse: {error}"
+            )),
+            _ => {}
+        }
+    }
+    let host_demotion = match &route {
+        Some(Ok(selected)) => !selected.prepared_sampler && !o.decode.logits_digest && host_side(&sampling),
+        Some(Err(_)) => false,
+        None => host_side(&sampling),
+    };
+    if host_demotion {
         let k = s.top_k.is_some_and(|k| k > 0);
         let p = s.top_p.is_some_and(|p| p < 1.0);
         let by = match (k, p) {

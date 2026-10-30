@@ -28,10 +28,9 @@ use lloom::nn::{
 };
 use lloom_tensor::{Device, Result};
 
-/// Execute the reader while its producer's stop signal is in scope.
-/// The exit guard also covers a fallible detokenizer and unwinding: error
-/// propagation alone does not wake/cancel the independent producer loop.
-fn stop_on_reader_exit<T>(stop: &std::sync::atomic::AtomicBool, read: impl FnOnce() -> T) -> T {
+/// Publish a peer's exit signal on return or unwind. The reader cancels its
+/// producer; the producer marks completion before a scoped reader is joined.
+fn signal_on_exit<T>(stop: &std::sync::atomic::AtomicBool, read: impl FnOnce() -> T) -> T {
     struct StopOnExit<'a>(&'a std::sync::atomic::AtomicBool);
     impl Drop for StopOnExit<'_> {
         fn drop(&mut self) {
@@ -51,7 +50,7 @@ fn drain_ring_reader(
     mut hook: impl FnMut(&[u32]) -> Result<bool>,
 ) -> Result<()> {
     use std::sync::atomic::Ordering;
-    stop_on_reader_exit(stop, || {
+    signal_on_exit(stop, || {
         let mut read_and_stop = |buf: &mut Vec<u32>| {
             let (result, ended) = read(buf);
             if result.is_ok() && ended {
@@ -89,6 +88,102 @@ fn drain_ring_reader(
             }
         }
     })
+}
+
+/// Keep the producer/reader lifetime and failure ordering shared by every
+/// ring strategy. The strategy stays on the producer thread; only the
+/// independent reader and streaming hook cross the scoped-thread boundary.
+#[allow(clippy::too_many_arguments)]
+fn run_ring_driver_impl<M: CausalLM, R: ReadbackStrategy>(
+    session: &mut Session<'_, M>,
+    readback: &mut R,
+    sampler: &mut LogitsProcessor,
+    prompt: &[u32],
+    opts: &DecodeOptions,
+    reader: Option<lloom::generation::RingReader>,
+    stop_flag: &std::sync::atomic::AtomicBool,
+    on_tokens: &mut (impl FnMut(&[u32]) -> Result<bool> + Send),
+) -> Result<DecodeOut> {
+    let mut spec = IdentityProposer;
+    match reader {
+        None => session.decode_until(&mut spec, readback, sampler, prompt, opts, on_tokens),
+        Some(mut reader) => {
+            let stream_done = std::sync::atomic::AtomicBool::new(false);
+            let (out, drained) = std::thread::scope(|s| {
+                let stream_done = &stream_done;
+                let worker = s.spawn(move || {
+                    drain_ring_reader(
+                        stop_flag,
+                        stream_done,
+                        |buf| {
+                            if reader.ended() {
+                                stop_flag.store(true, std::sync::atomic::Ordering::Release);
+                            }
+                            let result = reader.read_new(buf);
+                            (result, reader.ended())
+                        },
+                        on_tokens,
+                    )
+                });
+                let out = signal_on_exit(stream_done, || {
+                    session.decode_until(
+                        &mut spec,
+                        readback,
+                        sampler,
+                        prompt,
+                        opts,
+                        &mut |_: &[u32]| Ok(true),
+                    )
+                });
+                let drained = worker
+                    .join()
+                    .map_err(|_| lloom_tensor::Error::msg("ring reader thread panicked"));
+                (out, drained)
+            });
+            drained??;
+            out
+        }
+    }
+}
+
+#[cfg(test)]
+#[path = "decode_ring_capture_tests.rs"]
+pub(crate) mod ring_capture;
+
+#[cfg(not(test))]
+use self::run_ring_driver_impl as run_ring_driver;
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+fn run_ring_driver<M: CausalLM, R: ReadbackStrategy>(
+    session: &mut Session<'_, M>,
+    readback: &mut R,
+    sampler: &mut LogitsProcessor,
+    prompt: &[u32],
+    opts: &DecodeOptions,
+    reader: Option<lloom::generation::RingReader>,
+    stop_flag: &std::sync::atomic::AtomicBool,
+    on_tokens: &mut (impl FnMut(&[u32]) -> Result<bool> + Send),
+    capture: Option<&ring_capture::Capture>,
+) -> Result<DecodeOut> {
+    match capture {
+        Some(capture) => run_ring_driver_impl(
+            session,
+            &mut ring_capture::Recording {
+                inner: readback,
+                capture,
+            },
+            sampler,
+            prompt,
+            opts,
+            reader,
+            stop_flag,
+            on_tokens,
+        ),
+        None => run_ring_driver_impl(
+            session, readback, sampler, prompt, opts, reader, stop_flag, on_tokens,
+        ),
+    }
 }
 
 /// Why a decode run stopped.
@@ -261,6 +356,22 @@ impl ReadbackArm {
     /// than refused (coupling C2, 2026-10-20); the other explicit arms pass
     /// through.
     pub fn resolve(self, sampling: &Sampling, auto_ring: RingArm) -> ReadbackArm {
+        self.resolve_prepared(sampling, auto_ring, false)
+    }
+
+    // `prepared` is supplied only after the request's native capability check.
+    fn resolve_prepared(
+        self,
+        sampling: &Sampling,
+        auto_ring: RingArm,
+        prepared: bool,
+    ) -> ReadbackArm {
+        if prepared {
+            return match self {
+                Self::Auto => Self::Ring(auto_ring),
+                other => other,
+            };
+        }
         match self {
             ReadbackArm::Auto if Self::ring_admits(sampling) => ReadbackArm::Ring(auto_ring),
             ReadbackArm::Auto => ReadbackArm::Blocking,
@@ -436,18 +547,77 @@ impl DecodeParams {
             .validate()
             .map_err(lloom_tensor::Error::msg)?;
         let sampling = self.sampling()?;
-        lloom::nn::refuse(
-            body,
-            &lloom::nn::Asks {
-                sampling: &sampling,
-                processors: self.processors.is_active(),
-                budget: self.thinking.is_some(),
-                digest: self.logits_digest,
-                logprobs: self.logprobs.map(|r| r.top),
-            },
-        )
-        .map_err(|e| lloom_tensor::Error::Msg(format!("{path}: {e}")))
+        lloom::nn::refuse(body, &self.asks(&sampling))
+            .map_err(|e| lloom_tensor::Error::Msg(format!("{path}: {e}")))
     }
+
+    fn asks<'a>(&self, sampling: &'a Sampling) -> lloom::nn::Asks<'a> {
+        lloom::nn::Asks {
+            sampling,
+            processors: self.processors.is_active(),
+            budget: self.thinking.is_some(),
+            digest: self.logits_digest,
+            logprobs: self.logprobs.map(|r| r.top),
+        }
+    }
+
+    /// Cold selection shared by request execution and config explanation.
+    /// This is not model capability or allocation admission: callers still
+    /// validate the guarded embedding layout before entering the native arm.
+    pub(crate) fn sampler_route(
+        &self,
+        enabled: bool,
+        sampling: &Sampling,
+        is_metal: bool,
+        auto_ring: RingArm,
+    ) -> Result<SamplerRoute> {
+        let requested_prepared = self.wants_prepared_sampler(enabled, sampling);
+        let legacy_native_request = self.wants_prepared_ring(enabled, sampling);
+        if legacy_native_request && !is_metal {
+            lloom_tensor::bail!("decode.readback.device_filter requires a Metal build and device");
+        }
+        let prepared_sampler = requested_prepared && is_metal;
+        let prepared_ring = prepared_sampler && legacy_native_request;
+        let (arm, note) = if self.logits_digest || self.logprobs.is_some() {
+            (ReadbackArm::Blocking, prepared_sampler.then(|| "native prepared device sampler; checked blocking id + raw diagnostic logits readback".into()))
+        } else {
+            (
+                self.readback.resolve_prepared(sampling, auto_ring, prepared_sampler),
+                if prepared_ring {
+                    Some("native prepared device sampler; no host logits readback".into())
+                } else if prepared_sampler {
+                    Some("native prepared device sampler; checked blocking id readback".into())
+                } else {
+                    self.readback.demotion(sampling)
+                },
+            )
+        };
+        Ok(SamplerRoute { prepared_sampler, prepared_ring, arm, note })
+    }
+
+    fn wants_prepared_ring(&self, enabled: bool, sampling: &Sampling) -> bool {
+        self.wants_prepared_sampler(enabled, sampling)
+            && !self.logits_digest
+            && self.logprobs.is_none()
+            && matches!(self.readback, ReadbackArm::Auto | ReadbackArm::Ring(_))
+    }
+
+    fn wants_prepared_sampler(&self, enabled: bool, sampling: &Sampling) -> bool {
+        enabled
+            && !matches!(sampling, Sampling::ArgMax)
+            && matches!(
+                self.readback,
+                ReadbackArm::Blocking | ReadbackArm::Auto | ReadbackArm::Ring(_)
+            )
+    }
+}
+
+/// A cold route choice, not a model capability/admission receipt.
+pub(crate) struct SamplerRoute {
+    pub(crate) prepared_sampler: bool,
+    pub(crate) prepared_ring: bool,
+    pub(crate) arm: ReadbackArm,
+    pub(crate) note: Option<String>,
 }
 
 impl Default for DecodeParams {
@@ -659,6 +829,8 @@ pub struct DecodeSession<'m, M: CausalLM> {
     /// prefill): the engine's, set once at load, resolved per request into
     /// `DecodeOptions`.
     config: crate::options::DecodeConfig,
+    #[cfg(test)]
+    ring_capture: Option<ring_capture::Capture>,
 }
 
 impl<'m, M: CausalLM> DecodeSession<'m, M> {
@@ -672,6 +844,8 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
             device,
             rings: RingPool::new(),
             config: Default::default(),
+            #[cfg(test)]
+            ring_capture: None,
         }
     }
 
@@ -693,6 +867,8 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
             device,
             rings,
             config: Default::default(),
+            #[cfg(test)]
+            ring_capture: None,
         }
     }
 
@@ -700,6 +876,11 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
     pub fn with_config(mut self, config: crate::options::DecodeConfig) -> Self {
         self.config = config;
         self
+    }
+
+    #[cfg(all(test, feature = "metal"))]
+    pub(crate) fn capture_ring_rows(&mut self, capture: ring_capture::Capture) {
+        self.ring_capture = Some(capture);
     }
 
     pub fn set_config(&mut self, config: crate::options::DecodeConfig) {
@@ -895,25 +1076,93 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
         }
         let mut sampler = params.sampler()?;
         let sampling = sampler.sampling().clone();
-        let (arm, readback_note) = if params.logits_digest || params.logprobs.is_some() {
-            (ReadbackArm::Blocking, None)
+        let route = params.sampler_route(
+            self.config.readback.device_filter,
+            &sampling,
+            self.device.is_metal(),
+            self.config.readback.ring_arm(),
+        )?;
+        let prepared_sampler = route.prepared_sampler;
+        let prepared_ring = route.prepared_ring;
+        #[cfg(feature = "metal")]
+        let native_layout = if prepared_ring {
+            let layout = self.model().guarded_embedding_layout()?;
+            if !layout.device.same_device(&self.device) || layout.vocab != self.model().vocab_size()
+            {
+                lloom_tensor::bail!("native sampling: model embedding geometry/device mismatch");
+            }
+            lloom::nn::decode::refuse_prepared_step(&params.asks(&sampling))?;
+            Some(layout)
         } else {
-            (
-                params
-                    .readback
-                    .resolve(sampler.sampling(), self.config.readback.ring_arm()),
-                params.readback.demotion(sampler.sampling()),
-            )
+            None
         };
+        let (arm, readback_note) = (route.arm, route.note);
         if let Err(e) = self.config.check() {
             lloom_tensor::bail!("DecodeSession::decode: {e}");
         }
-        params.refuse_on(
-            lloom::nn::Body::Step {
-                ring: matches!(arm, ReadbackArm::Ring(_)),
-            },
-            "DecodeSession::decode",
-        )?;
+        if !prepared_ring {
+            params.refuse_on(
+                lloom::nn::Body::Step {
+                    ring: matches!(arm, ReadbackArm::Ring(_)),
+                },
+                "DecodeSession::decode",
+            )?;
+        }
+        #[cfg(feature = "metal")]
+        let native_resources = if let Some(layout) = native_layout {
+            let ReadbackArm::Ring(ring) = arm else {
+                unreachable!("native request resolved to ring")
+            };
+            let ring = ring.resolved();
+            let mut opts = self.config.options(
+                params.max_tokens,
+                ReadbackArm::Ring(ring),
+                params.prefill_tile,
+            );
+            let fixed_slots = opts.prepared_sample_slots()?;
+            opts.adaptive_commit = ring.adaptive;
+            // A platform may not offer a mapped reader and then takes fixed
+            // pacing. Reserve for both outcomes before any prefill mutates state.
+            let slots = fixed_slots.max(opts.prepared_sample_slots()?);
+            // Prepare the native adapter's own budget before turn mutation.
+            // The pooled legacy Ring's forcing state is not used by NativeRing.
+            let forcing = params
+                .thinking
+                .as_ref()
+                .map(|budget| {
+                    lloom::generation::native::PreparedNativeBudget::new(
+                        budget.clone(),
+                        &self.device,
+                        layout.vocab,
+                    )
+                })
+                .transpose()?;
+            let embeds = layout.allocate(1)?;
+            self.model().check_guarded_embedding(&embeds)?;
+            let native = lloom::generation::native::PreparedNativeSampler::new(
+                &self.device,
+                1,
+                layout.vocab,
+                slots,
+            )?;
+            Some((native, embeds, forcing))
+        } else {
+            None
+        };
+        #[cfg(feature = "metal")]
+        let mut native_blocking = if prepared_sampler && !prepared_ring {
+            let mut readback = Blocking::new(&params.eos_ids, &self.device)?;
+            if let Some(r) = params.logprobs {
+                readback = readback.with_logprobs(r.top, r.rows);
+            }
+            readback.set_thinking_budget(params.thinking.as_ref())?;
+            Some(lloom::generation::readback::NativeBlocking::new(
+                readback,
+                self.model().vocab_size(),
+            )?)
+        } else {
+            None
+        };
         let (prepared, turn) = crate::turn::prepare(&mut self.session, prompt_ids, true)?;
         let (checkpoint, checkpoint_at, pin) = self.establish_checkpoint(&prepared, params)?;
         sampler.observe_prompt(prompt_ids);
@@ -946,32 +1195,59 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
         let mut logprobs: Option<Logprobs> = None;
         let (out, ran): (DecodeOut, ReadbackArm) = match arm {
             ReadbackArm::Blocking => {
-                let mut readback = Blocking::new(&params.eos_ids, &self.device)?;
-                if let Some(r) = params.logprobs {
-                    readback = readback.with_logprobs(r.top, r.rows);
-                }
-                readback.set_thinking_budget(params.thinking.as_ref())?;
                 let opts = self.config.options(
                     params.max_tokens,
                     ReadbackArm::Blocking,
                     params.prefill_tile,
                 );
-                let out = self.session.decode_until(
-                    &mut spec,
-                    &mut readback,
-                    &mut sampler,
-                    &prepared.suffix,
-                    &opts,
-                    &mut on_tokens,
-                )?;
-                logprobs = readback.take_logprobs();
+                #[cfg(feature = "metal")]
+                let native_result = match native_blocking.as_mut() {
+                    Some(readback) => Some((
+                        self.session.decode_until(
+                            &mut spec,
+                            readback,
+                            &mut sampler,
+                            &prepared.suffix,
+                            &opts,
+                            &mut on_tokens,
+                        )?,
+                        readback.take_logprobs(),
+                    )),
+                    None => None,
+                };
+                #[cfg(not(feature = "metal"))]
+                let native_result: Option<(DecodeOut, Option<Logprobs>)> = None;
+                let out = match native_result {
+                    Some((out, capture)) => {
+                        logprobs = capture;
+                        out
+                    }
+                    None => {
+                        let mut readback = Blocking::new(&params.eos_ids, &self.device)?;
+                        if let Some(r) = params.logprobs {
+                            readback = readback.with_logprobs(r.top, r.rows);
+                        }
+                        readback.set_thinking_budget(params.thinking.as_ref())?;
+                        let out = self.session.decode_until(
+                            &mut spec,
+                            &mut readback,
+                            &mut sampler,
+                            &prepared.suffix,
+                            &opts,
+                            &mut on_tokens,
+                        )?;
+                        logprobs = readback.take_logprobs();
+                        out
+                    }
+                };
                 (out, ReadbackArm::Blocking)
             }
             ReadbackArm::Ring(ring) => {
                 // The fused publish runs for the argmax sampler only, and
                 // never under processors: its kernel draws the argmax itself,
                 // past them.
-                let fused = self.config.readback.fused_publish
+                let fused = !prepared_sampler
+                    && self.config.readback.fused_publish
                     && matches!(sampler.sampling(), Sampling::ArgMax)
                     && sampler.processors().is_none();
                 let ring = ring.resolved();
@@ -988,7 +1264,11 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
                 readback.set_wake_cadence(wake);
                 // Armed for this run whatever it holds (`None` disarms), so a
                 // pooled ring never carries a budget into another run.
-                readback.set_thinking_budget(params.thinking.as_ref())?;
+                readback.set_thinking_budget(if prepared_ring {
+                    None // disarm pooled legacy state; the adapter owns this request's budget
+                } else {
+                    params.thinking.as_ref()
+                })?;
                 // The adaptive arm needs the ring's reader (a CPU-mapped ring);
                 // without one it is the fixed cadence, reported as such. The
                 // reader alone (`--stream-reader`) streams what the arm stamps:
@@ -1020,62 +1300,54 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
                     adaptive: opts.adaptive_commit,
                     ..ring
                 });
-                let out = match reader {
-                    None => self.session.decode_until(
-                        &mut spec,
+                #[cfg(feature = "metal")]
+                let out = if let Some((native, embeds, forcing)) = native_resources {
+                    let mut readback = lloom::generation::readback::NativeRing::new(
+                        readback,
+                        self.session.model(),
+                        native,
+                        embeds,
+                        forcing,
+                    )?;
+                    run_ring_driver(
+                        &mut self.session,
+                        &mut readback,
+                        &mut sampler,
+                        &prepared.suffix,
+                        &opts,
+                        reader,
+                        &stop_flag,
+                        &mut on_tokens,
+                        #[cfg(test)]
+                        self.ring_capture.as_ref(),
+                    )?
+                } else {
+                    run_ring_driver(
+                        &mut self.session,
                         readback,
                         &mut sampler,
                         &prepared.suffix,
                         &opts,
+                        reader,
+                        &stop_flag,
                         &mut on_tokens,
-                    )?,
-                    Some(mut reader) => {
-                        // The drain is the reader's (`lfm2-chat --stream-reader`):
-                        // a scoped thread reads the ring as the GPU publishes and
-                        // runs the same streaming hook; the loop neither reads
-                        // tokens back nor commits on a cadence. A stop string or
-                        // a cancelled consumer raises `stop_flag`, which the loop
-                        // checks before each step; an EOS the ring has seen
-                        // raises it too. After the loop returns, one last read
-                        // takes what was published behind the reader's cursor.
-                        let stream_done = std::sync::atomic::AtomicBool::new(false);
-                        let (out, drained) = std::thread::scope(|s| {
-                            let hook = &mut on_tokens;
-                            let stop_flag = &stop_flag;
-                            let stream_done = &stream_done;
-                            let worker = s.spawn(move || {
-                                drain_ring_reader(
-                                    stop_flag,
-                                    stream_done,
-                                    |buf| {
-                                        if reader.ended() {
-                                            stop_flag
-                                                .store(true, std::sync::atomic::Ordering::Release);
-                                        }
-                                        let result = reader.read_new(buf);
-                                        (result, reader.ended())
-                                    },
-                                    hook,
-                                )
-                            });
-                            let out = self.session.decode_until(
-                                &mut spec,
-                                readback,
-                                &mut sampler,
-                                &prepared.suffix,
-                                &opts,
-                                &mut |_: &[u32]| Ok(true),
-                            );
-                            stream_done.store(true, std::sync::atomic::Ordering::Release);
-                            let drained = worker.join().map_err(|_| {
-                                lloom_tensor::Error::msg("ring reader thread panicked")
-                            });
-                            (out, drained)
-                        });
-                        drained??;
-                        out?
-                    }
+                        #[cfg(test)]
+                        self.ring_capture.as_ref(),
+                    )?
                 };
+                #[cfg(not(feature = "metal"))]
+                let out = run_ring_driver(
+                    &mut self.session,
+                    readback,
+                    &mut sampler,
+                    &prepared.suffix,
+                    &opts,
+                    reader,
+                    &stop_flag,
+                    &mut on_tokens,
+                    #[cfg(test)]
+                    self.ring_capture.as_ref(),
+                )?;
                 self.rings
                     .ring(&params.eos_ids, &self.device, eos)?
                     .set_thinking_budget(None)?;
@@ -1362,6 +1634,50 @@ mod tests {
     use super::*;
 
     #[test]
+    fn producer_unwind_publishes_done_before_reader_join() -> Result<()> {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::mpsc::sync_channel;
+        use std::time::Duration;
+        let stop = AtomicBool::new(false);
+        let done = AtomicBool::new(false);
+        let (entered, ready) = sync_channel(1);
+        let (panicked, signalled) = std::thread::scope(|scope| -> Result<_> {
+            let reader = scope.spawn(|| {
+                let mut entered = Some(entered);
+                drain_ring_reader(
+                    &stop,
+                    &done,
+                    |_| {
+                        if let Some(entered) = entered.take() {
+                            entered.send(()).unwrap();
+                        }
+                        (Ok(0), false)
+                    },
+                    |_| panic!("empty ring must not deliver a token"),
+                )
+            });
+            let at_read = ready.recv_timeout(Duration::from_secs(5));
+            if at_read.is_err() {
+                done.store(true, Ordering::Release);
+                reader.join().expect("reader cleanup")?;
+                panic!("reader never reached its empty-ring boundary");
+            }
+            let unwind = std::panic::catch_unwind(|| {
+                signal_on_exit(&done, || panic!("injected producer unwind"))
+            });
+            let signalled = done.load(Ordering::Acquire);
+            // Preserve cleanup even when the signal mutant fails the assertion.
+            done.store(true, Ordering::Release);
+            reader.join().expect("reader cleanup")?;
+            Ok((unwind.is_err(), signalled))
+        })?;
+        assert!(panicked);
+        assert!(signalled, "producer unwound without publishing completion");
+        assert!(stop.load(Ordering::Acquire));
+        Ok(())
+    }
+
+    #[test]
     fn reader_eos_batch_stops_the_producer_before_its_hook() -> Result<()> {
         use std::sync::atomic::{AtomicBool, Ordering};
         let stop = AtomicBool::new(false);
@@ -1559,16 +1875,15 @@ mod tests {
         use std::sync::atomic::{AtomicBool, Ordering};
         let stop = AtomicBool::new(false);
         let err: Result<()> =
-            stop_on_reader_exit(&stop, || lloom_tensor::bail!("injected detokenizer error"));
+            signal_on_exit(&stop, || lloom_tensor::bail!("injected detokenizer error"));
         assert!(err.unwrap_err().to_string().contains("detokenizer"));
         assert!(
             stop.load(Ordering::Acquire),
             "reader returned but producer is live"
         );
         stop.store(false, Ordering::Release);
-        let panicked = std::panic::catch_unwind(|| {
-            stop_on_reader_exit(&stop, || panic!("injected reader panic"))
-        });
+        let panicked =
+            std::panic::catch_unwind(|| signal_on_exit(&stop, || panic!("injected reader panic")));
         assert!(panicked.is_err());
         assert!(stop.load(Ordering::Acquire), "unwinding left producer live");
     }
@@ -1603,6 +1918,80 @@ mod tests {
     /// `Auto` takes the crown ring for the device-resident samplers and the
     /// blocking arm for the ones that need a host sort (`Ring::check_sampler`),
     /// and never leaves `Auto` in the resolved value a consumer reports.
+    #[test]
+    fn prepared_sampler_is_explicit_and_keeps_host_diagnostics() -> Result<()> {
+        assert!(!crate::options::ReadbackConfig::default().device_filter);
+        let mut params = DecodeParams {
+            temperature: Some(0.7),
+            top_k: Some(8),
+            ..Default::default()
+        };
+        let sampling = params.sampling()?;
+        assert!(!params.wants_prepared_ring(false, &sampling));
+        assert!(params.wants_prepared_ring(true, &sampling));
+        assert_eq!(
+            ReadbackArm::Auto.resolve_prepared(&sampling, RingArm::CROWN, false),
+            ReadbackArm::Blocking
+        );
+        assert_eq!(
+            ReadbackArm::Auto.resolve_prepared(&sampling, RingArm::CROWN, true),
+            ReadbackArm::CROWN
+        );
+        assert_eq!(
+            ReadbackArm::RING_FIXED.resolve_prepared(&sampling, RingArm::CROWN, true),
+            ReadbackArm::RING_FIXED
+        );
+        params.logits_digest = true;
+        assert!(!params.wants_prepared_ring(true, &sampling));
+        params.logits_digest = false;
+        params.logprobs = Some(LogprobRequest::default());
+        assert!(!params.wants_prepared_ring(true, &sampling));
+        params.logprobs = None;
+        params.readback = ReadbackArm::Blocking;
+        assert!(!params.wants_prepared_ring(true, &sampling));
+        assert_eq!(
+            ReadbackArm::Blocking.resolve_prepared(&sampling, RingArm::CROWN, true),
+            ReadbackArm::Blocking
+        );
+        params.readback = ReadbackArm::Auto;
+        assert!(!params.wants_prepared_ring(true, &Sampling::ArgMax));
+        Ok(())
+    }
+
+    #[test]
+    fn prepared_all_and_unfiltered_gumbel_are_selected_for_blocking_diagnostics() -> Result<()> {
+        for gumbel in [false, true] {
+            for (digest, logprobs) in [(false, false), (true, false), (false, true), (true, true)] {
+                let params = DecodeParams {
+                    temperature: Some(0.7),
+                    gumbel,
+                    readback: ReadbackArm::Blocking,
+                    logits_digest: digest,
+                    logprobs: logprobs.then(LogprobRequest::default),
+                    ..Default::default()
+                };
+                let sampling = params.sampling()?;
+                assert!(matches!(
+                    sampling,
+                    Sampling::All { .. } | Sampling::GumbelSoftmax { .. }
+                ));
+                assert!(params.wants_prepared_sampler(true, &sampling));
+                assert!(!params.wants_prepared_sampler(false, &sampling));
+                assert_eq!(
+                    params
+                        .readback
+                        .resolve_prepared(&sampling, RingArm::CROWN, true),
+                    ReadbackArm::Blocking
+                );
+                params.refuse_on(
+                    lloom::nn::Body::Step { ring: false },
+                    "native blocking control",
+                )?;
+            }
+        }
+        Ok(())
+    }
+
     #[test]
     fn auto_resolves_by_sampler() {
         let argmax = Sampling::ArgMax;
@@ -1640,7 +2029,10 @@ mod tests {
         assert!(ring.demotion(&argmax).is_none());
         assert!(ring.demotion(&temp).is_none());
         let note = ring.demotion(&top_p).unwrap();
-        assert!(note.contains("top-p:p=0.9:t=0.6") && note.contains("(C2)"), "{note}");
+        assert!(
+            note.contains("top-p:p=0.9:t=0.6") && note.contains("(C2)"),
+            "{note}"
+        );
         assert!(ReadbackArm::Auto.demotion(&top_p).is_none());
         assert!(ReadbackArm::Blocking.demotion(&top_p).is_none());
         assert_ne!(ReadbackArm::CROWN.name(), ReadbackArm::Blocking.name());
@@ -1724,6 +2116,28 @@ mod tests {
                     forwards: std::sync::atomic::AtomicUsize::new(0),
                 })
             }
+        }
+
+        #[test]
+        fn unsupported_prepared_sampler_refuses_before_session_or_model_moves() -> Result<()> {
+            let device = Device::Cpu;
+            let model = Chain::new(&device)?;
+            let mut session = DecodeSession::new(&model, Pos(0), device, 0);
+            session.config.readback.device_filter = true;
+            let params = DecodeParams {
+                temperature: Some(0.7),
+                top_k: Some(8),
+                eos_ids: vec![EOS],
+                max_tokens: 3,
+                ..Default::default()
+            };
+            assert!(session
+                .decode_until(&[1, 2], |ids| Ok(text_of(ids)), &params, |_| true)
+                .is_err());
+            assert!(session.tokens().is_empty());
+            assert_eq!(model.forwards.load(std::sync::atomic::Ordering::Relaxed), 0);
+            assert!(session.rings.is_empty());
+            Ok(())
         }
 
         impl Model for Chain {

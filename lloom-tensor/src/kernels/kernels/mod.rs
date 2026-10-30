@@ -89,10 +89,11 @@ pub use params::{
 };
 pub use quantized::{
     call_moe_rowmap, call_quantized_dequant_rows_f16, call_quantized_get_rows,
-    call_quantized_matmul_mm_id_mapped, call_quantized_matmul_mm_t, call_quantized_matmul_mv_id2_t,
+    call_quantized_matmul_mm_id_mapped, call_quantized_matmul_mm_t,
+    call_quantized_matmul_mv_id2_glu_t, call_quantized_matmul_mv_id2_t,
     call_quantized_matmul_mv_id_t, call_quantized_matmul_mv_store, call_quantized_matmul_mv_t,
-    mm_id_block_bound, mv_store_instantiations, GemvFloat, GemvTriple, GgmlDType, MvStore,
-    PairGrid, MM_ID_BLOCK_ROWS,
+    mm_id_block_bound, mv_id2_glu_applies, mv_id2_glu_instantiations, mv_store_instantiations,
+    GemvFloat, GemvTriple, GgmlDType, MvStore, PairGrid, MM_ID_BLOCK_ROWS,
 };
 pub use random::*;
 pub use reduce::*;

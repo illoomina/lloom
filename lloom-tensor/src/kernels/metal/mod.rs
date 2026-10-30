@@ -176,7 +176,7 @@ pub use eos_gate::{DispatchGate, EosGateReport};
 pub use executor::*;
 pub use fence::*;
 pub use heap::*;
-pub use in_flight::{Held, HoldCounts, InFlightHold};
+pub use in_flight::{Held, HoldCounts, InFlightHold, Unlisting};
 pub use kv_pages::*;
 pub use library::*;
 pub use residency_set::*;

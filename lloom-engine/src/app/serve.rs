@@ -440,6 +440,7 @@ fn run_owner(
                             "commit_max_ns": s.commit_max_ns,
                             "last_bytes": s.last_bytes,
                             "max_bytes": s.max_bytes,
+                            "census": slot_census_json(&s, &shared.engine.device().metal4_slot_sites()),
                         });
                     }
                     b
@@ -5836,3 +5837,38 @@ mod ready_configuration_tests {
 #[cfg(test)]
 #[path = "serve_stream_tail_tests.rs"]
 mod stream_tail_tests;
+
+/// `/health`'s slot census: each nonzero `(listing, class)` cell, then each
+/// listing site's (`kernels.residency.slot_trace`, `tuning.md` §6.3p).
+fn slot_census_json(
+    s: &lloom_tensor::residency_class::SlotResidency,
+    sites: &[lloom_tensor::residency_class::SlotSite],
+) -> serde_json::Value {
+    use lloom_tensor::residency_class::{census_column_name, SlotListing};
+    let mut cells = Vec::new();
+    for (row, listing) in SlotListing::ALL.iter().enumerate() {
+        for (col, cell) in s.census[row].iter().enumerate() {
+            if cell.adds > 0 {
+                cells.push(json!({
+                    "listing": listing.name(),
+                    "class": census_column_name(col),
+                    "adds": cell.adds,
+                    "bytes": cell.bytes,
+                }));
+            }
+        }
+    }
+    let sites: Vec<serde_json::Value> = sites
+        .iter()
+        .map(|site| {
+            json!({
+                "listing": site.listing.name(),
+                "class": site.class.map_or("none", |c| c.name()),
+                "adds": site.cell.adds,
+                "bytes": site.cell.bytes,
+                "frames": site.frames,
+            })
+        })
+        .collect();
+    json!({"cells": cells, "sites": sites})
+}

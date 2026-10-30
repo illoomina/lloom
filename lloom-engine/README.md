@@ -122,22 +122,31 @@ tail remains output. A failed transport is not a successful completed stream
 and need not contain `[DONE]`. Server written-byte witnesses do not prove
 receipt by a client.
 
-**Draft response-bound defaults, awaiting maintainer approval (#946):**
-`server.response.contexts = 8`, `server.response.raw_bytes = 1048576`, and
-`server.response.markers = 65536` (flags `--response-contexts`,
-`--response-raw-bytes`, `--response-markers`). These are configurable hard
-counts; zero allows no corresponding context, nonempty fragment, or typed
-marker, not an unbounded mode. Candidate generating completions keep at most
-**eight response contexts**, including
-requests waiting for their model turn and responses still draining. A ninth
-request receives HTTP 503 (`response drain capacity exhausted`) before model
-execution. The context is reclaimed only when its response writer finishes.
+**Response contexts are admitted by memory (decisions 83, 84).** Each
+generating completion holds a response context from its body's read until its
+last byte is written, with a declared footprint: `server.response.raw_bytes`
+(default 1 MiB, `--response-raw-bytes`) plus the request body. It is admitted on
+the machine gate — on Metal committed on the device ledger and admitted through
+the process's machine reservation, elsewhere through the server's own
+reservation. A request past the batch width that fits waits for the model; only
+a memory refusal is an HTTP 503, with `Retry-After`. `server.response.contexts`
+has **no default**; set (`--response-contexts N`), it caps the count as an
+operator override (0 admits none). `/health.response` reports `active`,
+`bytes`, `footprint_bytes` and the memory-derived `ceiling`.
+
 Each SSE response permits **1 MiB of unresolved raw text**, including the event
 currently being written. Exceeding that backlog refuses the next whole fragment:
 the earlier accepted frontier remains the history, `finish_reason` is
-`cancelled`, and `timings.response_backlog_limit` is true. Typed reasoning
-observations additionally permit 65,536 marker descriptors; exceeding that
-limit fails the run rather than silently treating marker tokens as literal text.
+`cancelled`, and `timings.response_backlog_limit` is true.
+
+**The reasoning split is a per-response state machine (decision 85).** It routes
+the published text into `content` / `reasoning_content` as it streams,
+transitioning on the markers' token ids (or their literals where the family
+supplies no decode observations); the socket's deltas and the stored session
+reply are both taken from its buffers. There is no marker list and no marker
+bound (`server.response.markers` is gone); a reply that keeps opening and
+closing its block shows as `reasoning_transitions` on the request line, in the
+final event's `timings` and in `/health.response`.
 
 The single-sequence model ticket is released after generation has returned its
 request checkout, the accepted reply/session is published, and request-bound

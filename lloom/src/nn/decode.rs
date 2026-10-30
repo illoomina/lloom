@@ -1365,7 +1365,8 @@ impl<D: Borrow<Device>> OpenPass<D> {
     /// A refusal leaves no open pass (`MetalDevice::begin_pass`), so there
     /// is nothing to abort on that path.
     pub(crate) fn begin(device: D, shape: PassShape) -> Result<Self> {
-        Self::begin_with_input(device, shape, lloom_tensor::backend::PassInput::TokenIds)
+        begin_pass(device.borrow(), shape)?;
+        Ok(Self { device, open: true })
     }
 
     fn begin_with_input(

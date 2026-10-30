@@ -15,8 +15,10 @@ fn device() -> Result<Device> {
     crate::tuning::install(tuning).expect("install before tuning is read");
     assert!(crate::kernels::metal::profile::enabled());
     let device = Device::new_metal(0)?;
-    eprintln!("SAMPLER_NATIVE_SETUP actual_api={}",
-        device.as_metal_device()?.commands().actual_command_api());
+    eprintln!(
+        "SAMPLER_NATIVE_SETUP actual_api={}",
+        device.as_metal_device()?.commands().actual_command_api()
+    );
     Ok(device)
 }
 
@@ -1402,12 +1404,12 @@ fn checked_bridge_refuses_overwrite_and_capacity_without_adding_waits() -> Resul
 
 /// Test-only hold. Drop releases the callback before a failed assertion can
 /// unwind the device; the callback also has a deadline if the test aborts.
-struct SnapshotCallbackHold(std::sync::Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>);
+struct SnapshotCallbackHold(std::sync::Arc<(parking_lot::Mutex<bool>, parking_lot::Condvar)>);
 
 impl Drop for SnapshotCallbackHold {
     fn drop(&mut self) {
         let (lock, wake) = &*self.0;
-        *lock.lock().unwrap_or_else(|e| e.into_inner()) = true;
+        *lock.lock() = true;
         wake.notify_all();
     }
 }
@@ -1415,14 +1417,19 @@ impl Drop for SnapshotCallbackHold {
 #[test]
 fn checked_bridge_own_data_ready_does_not_require_callback_clock() -> Result<()> {
     use super::readback::SampleReadback;
+    use parking_lot::{Condvar, Mutex};
     use std::sync::{
         atomic::{AtomicBool, Ordering},
-        mpsc, Arc, Condvar, Mutex,
+        mpsc, Arc,
     };
     use std::time::Duration;
 
     let d = device()?;
     let m = d.as_metal_device()?;
+    eprintln!(
+        "SNAPSHOT_SETUP actual_api={}",
+        m.commands().actual_command_api()
+    );
     m.set_compute_per_buffer(usize::MAX);
     let z = Tensor::new(&[[0.0f32, 0.0]], &d)?;
     let u = Tensor::new(&[0.75f32], &d)?;
@@ -1447,10 +1454,9 @@ fn checked_bridge_own_data_ready_does_not_require_callback_clock() -> Result<()>
             .on_completion(move || {
                 let _ = entered_tx.send(());
                 let (lock, wake) = &*released;
-                let guard = lock.lock().unwrap_or_else(|e| e.into_inner());
-                let (guard, timeout) = wake
-                    .wait_timeout_while(guard, Duration::from_secs(10), |released| !*released)
-                    .unwrap_or_else(|e| e.into_inner());
+                let mut guard = lock.lock();
+                let timeout =
+                    wake.wait_while_for(&mut guard, |released| !*released, Duration::from_secs(10));
                 callback_expired.store(timeout.timed_out() && !*guard, Ordering::Release);
             })
             .map_err(|e| crate::Error::Msg(format!("snapshot callback registration: {e:?}")))?;
@@ -1513,6 +1519,10 @@ fn checked_bridge_exact_recording_ignores_foreign_completion_and_later_tail() ->
 
     let d = device()?;
     let m = d.as_metal_device()?;
+    eprintln!(
+        "SNAPSHOT_SETUP actual_api={}",
+        m.commands().actual_command_api()
+    );
     m.set_compute_per_buffer(usize::MAX);
     let own_gate = m
         .metal_device()

@@ -22,7 +22,10 @@ fn fixture(decode: crate::DecodeConfig) -> Result<(FixtureDir, NativeEngine)> {
     fixture_with_trace(decode, false)
 }
 
-fn fixture_with_trace(decode: crate::DecodeConfig, trace: bool) -> Result<(FixtureDir, NativeEngine)> {
+fn fixture_with_trace(
+    decode: crate::DecodeConfig,
+    trace: bool,
+) -> Result<(FixtureDir, NativeEngine)> {
     let requested = std::env::var("LLOOM_METAL_API")?;
     anyhow::ensure!(
         matches!(requested.as_str(), "metal3" | "metal4"),
@@ -289,7 +292,10 @@ impl CausalLM for InvalidLogits<'_> {
         pos: usize,
         cache: &mut Self::Cache,
     ) -> lloom_tensor::Result<Tensor> {
-        self.corrupt(self.observe("token", ids, pos, || self.inner.forward(ids, pos, cache))?, pos)
+        self.corrupt(
+            self.observe("token", ids, pos, || self.inner.forward(ids, pos, cache))?,
+            pos,
+        )
     }
     fn forward_embeds(
         &self,
@@ -297,7 +303,12 @@ impl CausalLM for InvalidLogits<'_> {
         pos: usize,
         cache: &mut Self::Cache,
     ) -> lloom_tensor::Result<Tensor> {
-        self.corrupt(self.observe("embeds", x, pos, || self.inner.forward_embeds(x, pos, cache))?, pos)
+        self.corrupt(
+            self.observe("embeds", x, pos, || {
+                self.inner.forward_embeds(x, pos, cache)
+            })?,
+            pos,
+        )
     }
     fn guarded_embedding_layout(
         &self,
@@ -321,7 +332,12 @@ impl CausalLM for InvalidLogits<'_> {
         cache: &mut Self::Cache,
     ) -> lloom_tensor::Result<Tensor> {
         self.prepared.fetch_add(1, Ordering::Relaxed);
-        self.corrupt(self.observe("prepared", x, pos, || self.inner.forward_prepared_embeds(x, pos, cache))?, pos)
+        self.corrupt(
+            self.observe("prepared", x, pos, || {
+                self.inner.forward_prepared_embeds(x, pos, cache)
+            })?,
+            pos,
+        )
     }
     fn prepare_pass(&self, cache: &mut Self::Cache, n: usize) -> lloom_tensor::Result<()> {
         self.inner.prepare_pass(cache, n)
@@ -480,7 +496,10 @@ fn invalid_row_recovery_population(comparator_first: bool) -> Result<()> {
     }
     assert_eq!(cold.tokens, reference_cold.tokens, "cold after recovery");
     assert_eq!(cold.text, reference_cold.text);
-    assert_eq!(warm.tokens, reference_warm.tokens, "reused prefix after recovery");
+    assert_eq!(
+        warm.tokens, reference_warm.tokens,
+        "reused prefix after recovery"
+    );
     assert_eq!(warm.text, reference_warm.text);
     println!(
         "PREPARED_OWNER_POPULATION comparator_first={comparator_first} reused={} cold={:?} warm={:?}",
@@ -719,7 +738,7 @@ fn prepared_owner_applies_and_clears_request_thinking_budget() -> Result<()> {
             top_k: Some(1),
             gumbel,
             processors: lloom::generation::Processors {
-                logit_bias: vec![(97, 1_000_000.)],
+                logit_bias: vec![(97, 100.)],
                 ..Default::default()
             },
             max_tokens: 8,
@@ -1366,46 +1385,68 @@ fn explicit_edge_binding(
     logical_bytes: usize,
 ) -> Result<&lloom_tensor::kernels::metal::trace::Binding> {
     let mut candidates = dispatch.bindings.iter().filter(|b| b.index == index);
-    let b = candidates.next().ok_or_else(|| anyhow::anyhow!(
-        "model edge witness incomplete: missing explicit argument {index}"))?;
-    anyhow::ensure!(candidates.next().is_none() && b.is_output == output
-        && b.buffer_addr != 0 && b.len >= logical_bytes
-        && b.offset.checked_add(b.len).is_some(),
-        "model edge witness incomplete: duplicate, unknown or short argument {index}");
+    let b = candidates.next().ok_or_else(|| {
+        anyhow::anyhow!("model edge witness incomplete: missing explicit argument {index}")
+    })?;
+    anyhow::ensure!(
+        candidates.next().is_none()
+            && b.is_output == output
+            && b.buffer_addr != 0
+            && b.len >= logical_bytes
+            && b.offset.checked_add(b.len).is_some(),
+        "model edge witness incomplete: duplicate, unknown or short argument {index}"
+    );
     Ok(b)
 }
 
 fn first_conv_edge(
     dispatches: &[lloom_tensor::kernels::metal::trace::Dispatch],
 ) -> Result<FirstConvEdge<'_>> {
-    let first = dispatches.iter().position(|d| d.pipeline == "shortconv_step_f16_k3")
+    let first = dispatches
+        .iter()
+        .position(|d| d.pipeline == "shortconv_step_f16_k3")
         .ok_or_else(|| anyhow::anyhow!("model edge witness incomplete: first shortconv route"))?;
-    let d = dispatches.get(first..first + 7)
+    let d = dispatches
+        .get(first..first + 7)
         .ok_or_else(|| anyhow::anyhow!("model edge witness incomplete: first MLP sequence"))?;
     let gemv = "gemv_float16_bm4_bn1_sm1_sn32_tm4_tn4_nc0_axpby0";
-    anyhow::ensure!(d[1].pipeline == format!("{gemv}_residual")
-        && d[2].pipeline == "rmsnorm_f16"
-        && d[3].pipeline == format!("{gemv}_silu")
-        && d[4].pipeline == gemv && d[5].pipeline == "bmul_f16"
-        && d[6].pipeline == format!("{gemv}_residual")
-        && d.windows(2).all(|w| w[0].seq < w[1].seq),
-        "model edge witness incomplete: changed conv/norm/gate/up/product/down route");
+    anyhow::ensure!(
+        d[1].pipeline == format!("{gemv}_residual")
+            && d[2].pipeline == "rmsnorm_f16"
+            && d[3].pipeline == format!("{gemv}_silu")
+            && d[4].pipeline == gemv
+            && d[5].pipeline == "bmul_f16"
+            && d[6].pipeline == format!("{gemv}_residual")
+            && d.windows(2).all(|w| w[0].seq < w[1].seq),
+        "model edge witness incomplete: changed conv/norm/gate/up/product/down route"
+    );
     let residual = explicit_edge_binding(&d[1], 3, true, 256)?;
     let up = explicit_edge_binding(&d[4], 3, true, 512)?;
     let down_residual = explicit_edge_binding(&d[6], 15, false, 256)?;
-    anyhow::ensure!(residual.buffer_addr == down_residual.buffer_addr
-        && residual.offset == down_residual.offset,
-        "model edge witness incomplete: down does not read original residual");
+    anyhow::ensure!(
+        residual.buffer_addr == down_residual.buffer_addr
+            && residual.offset == down_residual.offset,
+        "model edge witness incomplete: down does not read original residual"
+    );
     // Object identity + within-object byte offsets; NOT GPU virtual addresses.
     let overlap = residual.buffer_addr == up.buffer_addr
-        && residual.offset < up.offset + 512 && up.offset < residual.offset + 256;
-    Ok(FirstConvEdge { residual_dispatch: &d[1], up_dispatch: &d[4],
-        down_dispatch: &d[6], residual, up, down_residual, overlap })
+        && residual.offset < up.offset + 512
+        && up.offset < residual.offset + 256;
+    Ok(FirstConvEdge {
+        residual_dispatch: &d[1],
+        up_dispatch: &d[4],
+        down_dispatch: &d[6],
+        residual,
+        up,
+        down_residual,
+        overlap,
+    })
 }
 
-fn edge_binding_json(b: &lloom_tensor::kernels::metal::trace::Binding, logical_bytes: usize)
-    -> serde_json::Value
-{
+fn edge_binding_json(
+    b: &lloom_tensor::kernels::metal::trace::Binding,
+    logical_bytes: usize,
+) -> serde_json::Value {
     serde_json::json!({"argument": b.index, "output": b.is_output,
         "buffer_object": b.buffer_addr, "interned_id": b.buffer_id,
         "offset": b.offset, "logical_bytes": logical_bytes,
@@ -1435,21 +1476,29 @@ impl BodyObserver {
                 anyhow::bail!("model residual/up alias before down read");
             }
             if let Some(plan) = &frame.plan {
-                let base = plan["base_addr"].as_u64().ok_or_else(||
-                    anyhow::anyhow!("model edge witness incomplete: installed base identity"))?;
-                anyhow::ensure!(plan["served_counter_inside_body"].as_u64().is_some_and(|n| n > 0),
-                    "model edge witness incomplete: no serving counter inside installed body");
+                let base = plan["base_addr"].as_u64().ok_or_else(|| {
+                    anyhow::anyhow!("model edge witness incomplete: installed base identity")
+                })?;
+                anyhow::ensure!(
+                    plan["served_counter_inside_body"]
+                        .as_u64()
+                        .is_some_and(|n| n > 0),
+                    "model edge witness incomplete: no serving counter inside installed body"
+                );
                 // A body actually bound an operand to its installed arena,
                 // stronger than finding a key in the cache AFTER the request.
-                if [edge.residual, edge.up, edge.down_residual].into_iter()
+                if [edge.residual, edge.up, edge.down_residual]
+                    .into_iter()
                     .any(|b| b.buffer_addr as u64 == base)
                 {
                     installed_bodies += 1;
                 }
             }
         }
-        anyhow::ensure!(installed_bodies > 0,
-            "model edge witness incomplete: route executed no arena-bound decode body");
+        anyhow::ensure!(
+            installed_bodies > 0,
+            "model edge witness incomplete: route executed no arena-bound decode body"
+        );
         writeln!(std::io::stdout().lock(), "BODY_PLAN_SERVED arm={arm} arena_bound_bodies={installed_bodies} active_key_event=UNOBSERVED served_offer_ordinals=UNOBSERVED")?;
         Ok(())
     }
@@ -1461,23 +1510,47 @@ mod model_edge_controls {
     use lloom_tensor::kernels::metal::trace::{Binding, Dispatch};
 
     fn binding(index: usize, output: bool, offset: usize, len: usize) -> Binding {
-        Binding { index, is_output: output, buffer_addr: 42, buffer_id: 2, offset, len }
+        Binding {
+            index,
+            is_output: output,
+            buffer_addr: 42,
+            buffer_id: 2,
+            offset,
+            len,
+        }
     }
 
     fn example(up_offset: usize) -> Vec<Dispatch> {
         let gemv = "gemv_float16_bm4_bn1_sm1_sn32_tm4_tn4_nc0_axpby0";
-        ["shortconv_step_f16_k3".into(), format!("{gemv}_residual"), "rmsnorm_f16".into(),
-            format!("{gemv}_silu"), gemv.into(), "bmul_f16".into(), format!("{gemv}_residual")]
-            .into_iter().enumerate().map(|(i, pipeline)| Dispatch {
-                seq: i as u64, pipeline, grid: (1, 1, 1), threadgroup: (1, 1, 1),
-                by_threadgroups: true, bindings: match i {
-                    1 => vec![binding(3, true, 2304, 512)],
-                    4 => vec![binding(3, true, up_offset, 512)],
-                    6 => vec![binding(15, false, 2304, 512)],
-                    _ => Vec::new(),
-                }, barrier: false, kinds: lloom_tensor::kernels::metal::encoder::HazardKinds::NONE,
-                encoder: 1, region: None,
-            }).collect()
+        [
+            "shortconv_step_f16_k3".into(),
+            format!("{gemv}_residual"),
+            "rmsnorm_f16".into(),
+            format!("{gemv}_silu"),
+            gemv.into(),
+            "bmul_f16".into(),
+            format!("{gemv}_residual"),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(i, pipeline)| Dispatch {
+            seq: i as u64,
+            pipeline,
+            grid: (1, 1, 1),
+            threadgroup: (1, 1, 1),
+            by_threadgroups: true,
+            bindings: match i {
+                1 => vec![binding(3, true, 2304, 512)],
+                4 => vec![binding(3, true, up_offset, 512)],
+                6 => vec![binding(15, false, 2304, 512)],
+                _ => Vec::new(),
+            },
+            barrier: false,
+            kinds: lloom_tensor::kernels::metal::encoder::HazardKinds::NONE,
+            encoder: 1,
+            region: None,
+        })
+        .collect()
     }
 
     #[test]
@@ -1505,7 +1578,10 @@ mod model_edge_controls {
                 5 => d[4].pipeline = "unrecognized route".into(),
                 _ => unreachable!(),
             }
-            assert!(first_conv_edge(&d).is_err(), "incomplete case {case} accepted");
+            assert!(
+                first_conv_edge(&d).is_err(),
+                "incomplete case {case} accepted"
+            );
         }
     }
 }
@@ -1579,11 +1655,15 @@ fn observe_same_owner_body_input(reset_each_request: bool, ordinary_first: bool)
     forced[n - 1] = 98;
     let budget = lloom::generation::ThinkingBudget::new(0, vec![98], forced.clone())?;
     let arms = if ordinary_first {
-        [("ordinary-first", ReadbackArm::Blocking, false),
-         ("native-after-ordinary", ReadbackArm::CROWN, true)]
+        [
+            ("ordinary-first", ReadbackArm::Blocking, false),
+            ("native-after-ordinary", ReadbackArm::CROWN, true),
+        ]
     } else {
-        [("native-first", ReadbackArm::CROWN, true),
-         ("ordinary-after-native", ReadbackArm::Blocking, false)]
+        [
+            ("native-first", ReadbackArm::CROWN, true),
+            ("ordinary-after-native", ReadbackArm::Blocking, false),
+        ]
     };
     let metal = engine.core.device.as_metal_device()?;
     let mut key_assertions = Vec::new();
@@ -1643,25 +1723,35 @@ fn observe_same_owner_body_input(reset_each_request: bool, ordinary_first: bool)
             model.prepared.load(Ordering::Relaxed) == if prepared { n } else { 0 },
             "prepared forward count"
         );
-        writeln!(std::io::stdout().lock(), "BODY_TRACE_PREPARATION {}", serde_json::json!({
-            "arm": label, "cold_asked": request.cold,
-            "explicit_session_reset": reset_each_request,
-            "reused": decoded.reused, "prefilled": decoded.prefilled,
-            "reuse": format!("{:?}", decoded.reuse),
-            "turn": decoded.turn.json(Some(engine.reuse_prefix)),
-            "checkpoint": format!("{:?}", decoded.checkpoint),
-            "checkpoint_at": decoded.checkpoint_at,
-        }))?;
+        writeln!(
+            std::io::stdout().lock(),
+            "BODY_TRACE_PREPARATION {}",
+            serde_json::json!({
+                "arm": label, "cold_asked": request.cold,
+                "explicit_session_reset": reset_each_request,
+                "reused": decoded.reused, "prefilled": decoded.prefilled,
+                "reuse": format!("{:?}", decoded.reuse),
+                "turn": decoded.turn.json(Some(engine.reuse_prefix)),
+                "checkpoint": format!("{:?}", decoded.checkpoint),
+                "checkpoint_at": decoded.checkpoint_at,
+            })
+        )?;
         if reset_each_request {
-            anyhow::ensure!(decoded.reused == 0 && decoded.prefilled == prompt.len(),
-                "cold-reset request reused a prefix");
-            anyhow::ensure!(decoded.turn.boundary == 0 && decoded.turn.overrun == 0
-                && decoded.turn.reused == 0 && decoded.turn.replayed == 0
-                && decoded.turn.prefilled == prompt.len()
-                && decoded.turn.outcome == crate::turn::Outcome::Fresh
-                && decoded.turn.reason == crate::turn::Reason::Cold
-                && decoded.turn.state == crate::turn::StateReady::Exact,
-                "cold-reset turn preparation differs");
+            anyhow::ensure!(
+                decoded.reused == 0 && decoded.prefilled == prompt.len(),
+                "cold-reset request reused a prefix"
+            );
+            anyhow::ensure!(
+                decoded.turn.boundary == 0
+                    && decoded.turn.overrun == 0
+                    && decoded.turn.reused == 0
+                    && decoded.turn.replayed == 0
+                    && decoded.turn.prefilled == prompt.len()
+                    && decoded.turn.outcome == crate::turn::Outcome::Fresh
+                    && decoded.turn.reason == crate::turn::Reason::Cold
+                    && decoded.turn.state == crate::turn::StateReady::Exact,
+                "cold-reset turn preparation differs"
+            );
         }
         // Keep exact start0/full prompt coverage; no cross-prefill-split
         // numeric identity is inferred from this control or forced output IDs.
@@ -1671,38 +1761,70 @@ fn observe_same_owner_body_input(reset_each_request: bool, ordinary_first: bool)
             // mutant must reproduce the model edge, not just a missing label.
             observer.check_first_conv_edges(label, decoded.stats.prefill_units)?;
             let served_after = metal.pass_plan_counters().map(|c| c.served);
-            anyhow::ensure!(matches!((served_before, served_after), (Some(a), Some(b)) if b > a),
-                "input-route witness incomplete: no cached pass served this request");
-            let (entries, base_bytes) = metal.pass_plan_report()
+            anyhow::ensure!(
+                matches!((served_before, served_after), (Some(a), Some(b)) if b > a),
+                "input-route witness incomplete: no cached pass served this request"
+            );
+            let (entries, base_bytes) = metal
+                .pass_plan_report()
                 .ok_or_else(|| anyhow::anyhow!("input-route witness incomplete: no plan cache"))?;
-            let expected = if prepared { lloom_tensor::backend::PassInput::PreparedEmbeddings }
-                else { lloom_tensor::backend::PassInput::TokenIds };
-            let decode_keys: Vec<_> = entries.iter().filter(|(k, ..)|
-                k.kind == (lloom_tensor::kernels::metal::arena::PassKind::Decode { b: 1 })
-                && k.opener == lloom_tensor::kernels::metal::arena::PassOpener::Driver)
+            let expected = if prepared {
+                lloom_tensor::backend::PassInput::PreparedEmbeddings
+            } else {
+                lloom_tensor::backend::PassInput::TokenIds
+            };
+            let decode_keys: Vec<_> = entries
+                .iter()
+                .filter(|(k, ..)| {
+                    k.kind == (lloom_tensor::kernels::metal::arena::PassKind::Decode { b: 1 })
+                        && k.opener == lloom_tensor::kernels::metal::arena::PassOpener::Driver
+                })
                 .collect();
-            writeln!(std::io::stdout().lock(), "BODY_PLAN_KEYS {}", serde_json::json!({
-                "arm": label, "expected_input": format!("{expected:?}"),
-                "cached_keys": decode_keys.iter().map(|(k, covered, total, escapes)|
-                    serde_json::json!({"key": format!("{k:?}"), "input": format!("{:?}", k.input),
-                        "variant": k.variant, "arms": k.arms, "covered": covered,
-                        "total": total, "escapes": escapes})).collect::<Vec<_>>(),
-                "base_bytes": base_bytes, "served_before": served_before, "served_after": served_after,
-                "custody": "cached key list; NOT active-key or served-offer ordinal event",
-            }))?;
+            writeln!(
+                std::io::stdout().lock(),
+                "BODY_PLAN_KEYS {}",
+                serde_json::json!({
+                    "arm": label, "expected_input": format!("{expected:?}"),
+                    "cached_keys": decode_keys.iter().map(|(k, covered, total, escapes)|
+                        serde_json::json!({"key": format!("{k:?}"), "input": format!("{:?}", k.input),
+                            "variant": k.variant, "arms": k.arms, "covered": covered,
+                            "total": total, "escapes": escapes})).collect::<Vec<_>>(),
+                    "base_bytes": base_bytes, "served_before": served_before, "served_after": served_after,
+                    "custody": "cached key list; NOT active-key or served-offer ordinal event",
+                })
+            )?;
             // Retain this arm's exact snapshot, but defer key-label verdicts
             // until BOTH physical paths ran. Otherwise a collapse mutant dies
             // on the native-first label before it can encode ordinary's alias.
-            key_assertions.push((label, "expected input-route key absent",
-                decode_keys.iter().any(|(k, ..)| k.input == expected && k.variant == 0)));
+            key_assertions.push((
+                label,
+                "expected input-route key absent",
+                decode_keys
+                    .iter()
+                    .any(|(k, ..)| k.input == expected && k.variant == 0),
+            ));
             if arm_index == 1 {
-                key_assertions.push((label, "both input-route keys must coexist",
-                    [lloom_tensor::backend::PassInput::TokenIds,
-                        lloom_tensor::backend::PassInput::PreparedEmbeddings].into_iter()
-                        .all(|input| decode_keys.iter().any(|(k, ..)| k.input == input && k.variant == 0))));
+                key_assertions.push((
+                    label,
+                    "both input-route keys must coexist",
+                    [
+                        lloom_tensor::backend::PassInput::TokenIds,
+                        lloom_tensor::backend::PassInput::PreparedEmbeddings,
+                    ]
+                    .into_iter()
+                    .all(|input| {
+                        decode_keys
+                            .iter()
+                            .any(|(k, ..)| k.input == input && k.variant == 0)
+                    }),
+                ));
             }
         }
-        let alias_verdict = if reset_each_request { "FIRST_CONV_EDGE_CHECKED" } else { "UNASSESSED" };
+        let alias_verdict = if reset_each_request {
+            "FIRST_CONV_EDGE_CHECKED"
+        } else {
+            "UNASSESSED"
+        };
         writeln!(std::io::stdout().lock(), "BODY_TRACE_COMPLETE arm={label} inputs={:?} output_ids={:?} frames={} alias_verdict={alias_verdict}",
             prompt, decoded.tokens, observer.frames.borrow().len())?;
     }
@@ -1720,16 +1842,25 @@ mod body_trace_output_controls {
     struct FailedOutput;
     impl std::io::Write for FailedOutput {
         fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
-            Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "injected output failure"))
+            Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "injected output failure",
+            ))
         }
-        fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
     }
 
     fn observer() -> BodyObserver {
         let observer = BodyObserver::new(1);
         observer.frames.borrow_mut().push(BodyFrame {
-            route: "host-control", pos: 0, shape: vec![1, 1], plan: None,
-            outcome: "returned".into(), dispatches: Vec::new(),
+            route: "host-control",
+            pos: 0,
+            shape: vec![1, 1],
+            plan: None,
+            outcome: "returned".into(),
+            dispatches: Vec::new(),
         });
         observer
     }
@@ -1738,8 +1869,13 @@ mod body_trace_output_controls {
     fn successful_dump_has_a_positive_output_control() {
         let observer = observer();
         let mut output = Vec::new();
-        let value = finish_body_observation(Ok(Ok(7)), Ok(()),
-            || observer.dump(&mut output, "host", "synchronized"), &mut Vec::new()).unwrap();
+        let value = finish_body_observation(
+            Ok(Ok(7)),
+            Ok(()),
+            || observer.dump(&mut output, "host", "synchronized"),
+            &mut Vec::new(),
+        )
+        .unwrap();
         assert_eq!(value, 7);
         let text = String::from_utf8(output).unwrap();
         assert!(text.starts_with("BODY_TRACE "));
@@ -1753,7 +1889,9 @@ mod body_trace_output_controls {
         let result = finish_body_observation::<()>(
             Ok(Err(lloom_tensor::Error::Msg("primary decode error".into()))),
             Err(lloom_tensor::Error::Msg("secondary fence error".into())),
-            || observer.dump(&mut FailedOutput, "host", "fence failed"), &mut secondary);
+            || observer.dump(&mut FailedOutput, "host", "fence failed"),
+            &mut secondary,
+        );
         assert_eq!(result.unwrap_err().to_string(), "primary decode error");
         let text = String::from_utf8(secondary).unwrap();
         assert!(text.contains("BODY_TRACE_CLEANUP_FAILED secondary fence error"));
@@ -1764,37 +1902,52 @@ mod body_trace_output_controls {
     fn failed_output_preserves_decode_panic_payload() {
         let observer = observer();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            finish_body_observation::<()>(Err(Box::new(781usize)),
+            finish_body_observation::<()>(
+                Err(Box::new(781usize)),
                 Err(lloom_tensor::Error::Msg("secondary fence error".into())),
                 || observer.dump(&mut FailedOutput, "host", "fence failed"),
-                &mut FailedOutput)
+                &mut FailedOutput,
+            )
         }));
         let payload = result.unwrap_err();
-        assert_eq!(*payload.downcast::<usize>().expect("original panic type"), 781);
+        assert_eq!(
+            *payload.downcast::<usize>().expect("original panic type"),
+            781
+        );
     }
 
     #[test]
     fn failed_output_preserves_fence_error_after_decode_success() {
         let observer = observer();
-        let result = finish_body_observation(Ok(Ok(7)),
+        let result = finish_body_observation(
+            Ok(Ok(7)),
             Err(lloom_tensor::Error::Msg("primary fence error".into())),
-            || observer.dump(&mut FailedOutput, "host", "fence failed"), &mut Vec::new());
+            || observer.dump(&mut FailedOutput, "host", "fence failed"),
+            &mut Vec::new(),
+        );
         assert_eq!(result.unwrap_err().to_string(), "primary fence error");
     }
 
     #[test]
     fn output_failure_is_error_when_body_and_fence_succeed() {
         let observer = observer();
-        let result = finish_body_observation(Ok(Ok(7)), Ok(()),
-            || observer.dump(&mut FailedOutput, "host", "synchronized"), &mut Vec::new());
+        let result = finish_body_observation(
+            Ok(Ok(7)),
+            Ok(()),
+            || observer.dump(&mut FailedOutput, "host", "synchronized"),
+            &mut Vec::new(),
+        );
         assert_eq!(result.unwrap_err().to_string(), "injected output failure");
     }
 
     #[test]
     fn unexpected_diagnostic_panic_does_not_replace_decode_error() {
         let result = finish_body_observation::<()>(
-            Ok(Err(lloom_tensor::Error::Msg("primary decode error".into()))), Ok(()),
-            || panic!("injected diagnostic panic"), &mut FailedOutput);
+            Ok(Err(lloom_tensor::Error::Msg("primary decode error".into()))),
+            Ok(()),
+            || panic!("injected diagnostic panic"),
+            &mut FailedOutput,
+        );
         assert_eq!(result.unwrap_err().to_string(), "primary decode error");
     }
 }
@@ -2029,8 +2182,15 @@ fn owner_reused_order(prepared_first: bool) -> Result<()> {
     let before = metal
         .pass_plan_counters()
         .ok_or_else(|| anyhow::anyhow!("before counters absent"))?;
-    for prepared in [prepared_first, !prepared_first] {
-        owner_reused_request(&engine, prepared, false, true, "served-order")?;
+    // Each warm request follows a cold request of the other route, as in the
+    // record order. A warm request after a warm request is not this shape:
+    // the owner replays the prefix (turn outcome Fresh, replayed 10).
+    for (cold, warm) in [
+        (prepared_first, !prepared_first),
+        (!prepared_first, prepared_first),
+    ] {
+        owner_reused_request(&engine, cold, true, true, "served-order")?;
+        owner_reused_request(&engine, warm, false, true, "served-order")?;
     }
     let after = metal
         .pass_plan_counters()
@@ -2079,7 +2239,7 @@ fn stop_owner_request() -> DecodeParams {
         max_tokens: 16,
         top_k: Some(1),
         processors: lloom::generation::Processors {
-            logit_bias: vec![(97, 1_000_000.)],
+            logit_bias: vec![(97, 100.)],
             ..Default::default()
         },
         ..params(ReadbackArm::CROWN, false, false)
@@ -2088,16 +2248,32 @@ fn stop_owner_request() -> DecodeParams {
 
 fn check_native_owner_stop_route(out: &Decoded, labels: &[(String, u64)]) {
     assert!(matches!(out.readback, ReadbackArm::Ring(_)));
-    assert!(out.readback_note.as_deref().is_some_and(|s| s.contains("native prepared")));
-    assert!(labels.iter().any(|(name, n)| name.contains("sampling_topk_mask") && *n > 0), "missing native sampler: {labels:?}");
-    assert!(labels.iter().any(|(name, n)| name.contains("sampling_guarded_embedding") && *n > 0), "missing real guarded model input: {labels:?}");
+    assert!(out
+        .readback_note
+        .as_deref()
+        .is_some_and(|s| s.contains("native prepared")));
+    assert!(
+        labels
+            .iter()
+            .any(|(name, n)| name.contains("sampling_topk_mask") && *n > 0),
+        "missing native sampler: {labels:?}"
+    );
+    assert!(
+        labels
+            .iter()
+            .any(|(name, n)| name.contains("sampling_guarded_embedding") && *n > 0),
+        "missing real guarded model input: {labels:?}"
+    );
 }
 
 // Observe, do not repair, the actual owner after its public call has returned.
 fn stopped_owner_state(engine: &NativeEngine, prompt: &[u32], out: &Decoded) -> (usize, usize) {
     let held = engine.single.lock();
     let held = held.as_ref().expect("public call returned owner custody");
-    assert!(!held.needs_recovery, "ordinary successful stop is not failed-request recovery");
+    assert!(
+        !held.needs_recovery,
+        "ordinary successful stop is not failed-request recovery"
+    );
     let seq = held.sequence.as_ref().expect("held sequence");
     assert_eq!(seq.tokens(), [prompt, out.tokens.as_slice()].concat());
     assert_eq!(seq.overrun(), out.stats.overrun);
@@ -2105,17 +2281,27 @@ fn stopped_owner_state(engine: &NativeEngine, prompt: &[u32], out: &Decoded) -> 
     (seq.tokens().len(), seq.overrun())
 }
 
-fn next_public_after_stop(engine: &NativeEngine, prompt: &[u32], prior: (usize, usize)) -> Result<()> {
+fn next_public_after_stop(
+    engine: &NativeEngine,
+    prompt: &[u32],
+    prior: (usize, usize),
+) -> Result<()> {
     // No reset, reconcile, fence or lease mutation here. Public preparation must
     // settle the previous overrun/rewind and disarm the previous forcing state.
-    let request = DecodeParams { max_tokens: 4, ..stop_owner_request() };
+    let request = DecodeParams {
+        max_tokens: 4,
+        ..stop_owner_request()
+    };
     let out = run(engine, prompt, &request)?;
     assert_eq!(out.tokens, [97; 4]);
     assert_eq!(out.turn.boundary, prior.0);
     assert_eq!(out.turn.overrun, prior.1);
     assert!(out.thinking.is_none());
     assert!(!engine.single.lock().as_ref().unwrap().needs_recovery);
-    println!("OWNER_STOP_NEXT prior_boundary={} prior_overrun={} actual_turn={:?} tokens={:?}", prior.0, prior.1, out.turn, out.tokens);
+    println!(
+        "OWNER_STOP_NEXT prior_boundary={} prior_overrun={} actual_turn={:?} tokens={:?}",
+        prior.0, prior.1, out.turn, out.tokens
+    );
     Ok(())
 }
 
@@ -2130,12 +2316,25 @@ fn prepared_actual_eos_drains_then_next_public_request() -> Result<()> {
     let prompt = engine.encode("Hello world", false)?;
     let request = DecodeParams {
         eos_ids: vec![98],
-        thinking: Some(lloom::generation::ThinkingBudget::new(0, vec![98], vec![97, 98])?),
+        thinking: Some(lloom::generation::ThinkingBudget::new(
+            0,
+            vec![98],
+            vec![97, 98],
+        )?),
         ..stop_owner_request()
     };
-    let census = engine.core.device.as_metal_device()?.dispatch_census().open().expect("isolated census");
+    let census = engine
+        .core
+        .device
+        .as_metal_device()?
+        .dispatch_census()
+        .open()
+        .expect("isolated census");
     let mut delivered = String::new();
-    let out = engine.complete_until(&prompt, &request, |s| { delivered.push_str(s); true })?;
+    let out = engine.complete_until(&prompt, &request, |s| {
+        delivered.push_str(s);
+        true
+    })?;
     let labels = census.close();
     check_native_owner_stop_route(&out, &labels);
     assert_eq!(out.stop, Stop::Eos);
@@ -2157,18 +2356,34 @@ fn prepared_consumer_refusal_drains_then_next_public_request() -> Result<()> {
     let (_files, engine) = fixture(decode)?;
     let prompt = engine.encode("Hello world", false)?;
     let request = stop_owner_request();
-    let census = engine.core.device.as_metal_device()?.dispatch_census().open().expect("isolated census");
+    let census = engine
+        .core
+        .device
+        .as_metal_device()?
+        .dispatch_census()
+        .open()
+        .expect("isolated census");
     let mut offered = Vec::new();
-    let out = engine.complete_until(&prompt, &request, |s| { offered.push(s.to_owned()); false })?;
+    let out = engine.complete_until(&prompt, &request, |s| {
+        offered.push(s.to_owned());
+        false
+    })?;
     let labels = census.close();
     check_native_owner_stop_route(&out, &labels);
     assert_eq!(out.stop, Stop::Cancelled);
-    assert_eq!(offered.len(), 1, "refused consumer must not receive later fragments");
+    assert_eq!(
+        offered.len(),
+        1,
+        "refused consumer must not receive later fragments"
+    );
     assert!(!offered[0].is_empty());
     assert!(offered[0].bytes().all(|b| b == b'a'));
     // Existing TextStream contract: false rejects that fragment; generated ids
     // remain separate from delivered text, so no zero-generated assertion.
-    assert!(out.text.is_empty(), "first refused fragment is not delivered text");
+    assert!(
+        out.text.is_empty(),
+        "first refused fragment is not delivered text"
+    );
     assert!(!out.tokens.is_empty());
     assert!(out.tokens.len() <= request.max_tokens);
     assert!(out.tokens.iter().all(|&id| id == 97));
@@ -2194,19 +2409,37 @@ impl ModelTrait for RefusePreparedOwner<'_> {
 }
 impl CausalLM for RefusePreparedOwner<'_> {
     type Cache = <Inner as CausalLM>::Cache;
-    fn new_cache(&self, cfg: &Config, d: &Device) -> lloom_tensor::Result<Self::Cache> { self.inner.new_cache(cfg, d) }
-    fn embed(&self, ids: &Tensor) -> lloom_tensor::Result<Tensor> { self.inner.embed(ids) }
-    fn forward(&self, ids: &Tensor, pos: usize, cache: &mut Self::Cache) -> lloom_tensor::Result<Tensor> {
+    fn new_cache(&self, cfg: &Config, d: &Device) -> lloom_tensor::Result<Self::Cache> {
+        self.inner.new_cache(cfg, d)
+    }
+    fn embed(&self, ids: &Tensor) -> lloom_tensor::Result<Tensor> {
+        self.inner.embed(ids)
+    }
+    fn forward(
+        &self,
+        ids: &Tensor,
+        pos: usize,
+        cache: &mut Self::Cache,
+    ) -> lloom_tensor::Result<Tensor> {
         self.body_calls.fetch_add(1, Ordering::Relaxed);
         self.inner.forward(ids, pos, cache)
     }
-    fn forward_embeds(&self, x: &Tensor, pos: usize, cache: &mut Self::Cache) -> lloom_tensor::Result<Tensor> {
+    fn forward_embeds(
+        &self,
+        x: &Tensor,
+        pos: usize,
+        cache: &mut Self::Cache,
+    ) -> lloom_tensor::Result<Tensor> {
         self.body_calls.fetch_add(1, Ordering::Relaxed);
         self.inner.forward_embeds(x, pos, cache)
     }
-    fn guarded_embedding_layout(&self) -> lloom_tensor::Result<lloom_tensor::quantized::GuardedEmbeddingLayout> {
+    fn guarded_embedding_layout(
+        &self,
+    ) -> lloom_tensor::Result<lloom_tensor::quantized::GuardedEmbeddingLayout> {
         self.layout_calls.fetch_add(1, Ordering::Relaxed);
-        if !self.preparation { lloom_tensor::bail!("OWNER_NATIVE_CAPABILITY_REFUSAL"); }
+        if !self.preparation {
+            lloom_tensor::bail!("OWNER_NATIVE_CAPABILITY_REFUSAL");
+        }
         self.inner.guarded_embedding_layout()
     }
     fn check_guarded_embedding(&self, out: &Tensor) -> lloom_tensor::Result<()> {
@@ -2214,12 +2447,29 @@ impl CausalLM for RefusePreparedOwner<'_> {
         self.inner.check_guarded_embedding(out)?;
         lloom_tensor::bail!("OWNER_NATIVE_PREPARATION_REFUSAL")
     }
-    fn prepare_pass(&self, cache: &mut Self::Cache, n: usize) -> lloom_tensor::Result<()> { self.inner.prepare_pass(cache, n) }
-    fn checkpoint_at(&self, cache: &mut Self::Cache, pos: usize) -> lloom_tensor::Result<()> { self.inner.checkpoint_at(cache, pos) }
-    fn open_checkpoint_request(&self, cache: &mut Self::Cache, policy: lloom::nn::CheckpointPolicy, end: usize) -> lloom_tensor::Result<()> { self.inner.open_checkpoint_request(cache, policy, end) }
-    fn close_checkpoint_request(&self, cache: &mut Self::Cache) -> lloom_tensor::Result<()> { self.inner.close_checkpoint_request(cache) }
-    fn eos_gate_cores(&self) -> bool { self.inner.eos_gate_cores() }
-    fn vocab_size(&self) -> usize { self.inner.vocab_size() }
+    fn prepare_pass(&self, cache: &mut Self::Cache, n: usize) -> lloom_tensor::Result<()> {
+        self.inner.prepare_pass(cache, n)
+    }
+    fn checkpoint_at(&self, cache: &mut Self::Cache, pos: usize) -> lloom_tensor::Result<()> {
+        self.inner.checkpoint_at(cache, pos)
+    }
+    fn open_checkpoint_request(
+        &self,
+        cache: &mut Self::Cache,
+        policy: lloom::nn::CheckpointPolicy,
+        end: usize,
+    ) -> lloom_tensor::Result<()> {
+        self.inner.open_checkpoint_request(cache, policy, end)
+    }
+    fn close_checkpoint_request(&self, cache: &mut Self::Cache) -> lloom_tensor::Result<()> {
+        self.inner.close_checkpoint_request(cache)
+    }
+    fn eos_gate_cores(&self) -> bool {
+        self.inner.eos_gate_cores()
+    }
+    fn vocab_size(&self) -> usize {
+        self.inner.vocab_size()
+    }
 }
 
 #[test]
@@ -2233,26 +2483,50 @@ fn prepared_metal_capability_and_preparation_refuse_before_first_token() -> Resu
     assert!(engine.core.device.is_metal());
     let prompt = engine.encode("Hello world", false)?;
     for preparation in [false, true] {
-        let fault = RefusePreparedOwner { inner: &engine.core.model, preparation,
-            layout_calls: AtomicUsize::new(0), preparation_calls: AtomicUsize::new(0), body_calls: AtomicUsize::new(0) };
+        let fault = RefusePreparedOwner {
+            inner: &engine.core.model,
+            preparation,
+            layout_calls: AtomicUsize::new(0),
+            preparation_calls: AtomicUsize::new(0),
+            body_calls: AtomicUsize::new(0),
+        };
         let mut fragments = 0;
         let error = {
             let mut lease = engine.checkout_single()?;
             let config = lease.extra().decode.clone();
-            lease.with_model(&fault, &engine.core.device, config, |session, _| {
-                session.decode_until(&prompt, engine.detok(), &stop_owner_request(), |_| { fragments += 1; true })
-            }).expect_err("actual Metal capability/preparation must refuse")
+            lease
+                .with_model(&fault, &engine.core.device, config, |session, _| {
+                    session.decode_until(&prompt, engine.detok(), &stop_owner_request(), |_| {
+                        fragments += 1;
+                        true
+                    })
+                })
+                .expect_err("actual Metal capability/preparation must refuse")
         };
-        let expected = if preparation { "OWNER_NATIVE_PREPARATION_REFUSAL" } else { "OWNER_NATIVE_CAPABILITY_REFUSAL" };
+        let expected = if preparation {
+            "OWNER_NATIVE_PREPARATION_REFUSAL"
+        } else {
+            "OWNER_NATIVE_CAPABILITY_REFUSAL"
+        };
         assert_eq!(error.to_string(), expected);
         assert_eq!(fault.layout_calls.load(Ordering::Relaxed), 1);
-        assert_eq!(fault.preparation_calls.load(Ordering::Relaxed), usize::from(preparation));
+        assert_eq!(
+            fault.preparation_calls.load(Ordering::Relaxed),
+            usize::from(preparation)
+        );
         assert_eq!(fault.body_calls.load(Ordering::Relaxed), 0);
         assert_eq!(fragments, 0);
         assert!(engine.single.lock().as_ref().unwrap().needs_recovery);
         // The real owner performs its own recovery, including any allocated
         // preparation bytes. No manual fence/reset/marker clear intervenes.
-        let next = run(&engine, &prompt, &DecodeParams { max_tokens: 4, ..stop_owner_request() })?;
+        let next = run(
+            &engine,
+            &prompt,
+            &DecodeParams {
+                max_tokens: 4,
+                ..stop_owner_request()
+            },
+        )?;
         assert_eq!(next.tokens, [97; 4]);
         assert_eq!(next.reused, 0);
         assert!(!engine.single.lock().as_ref().unwrap().needs_recovery);

@@ -590,9 +590,10 @@ mod window_controls {
             Tensor::zeros((1, 2, 3), DType::F32, &device)?,
         )?;
         assert!(window.check_rows(3).is_err());
+        // A valid budget whose forced (closing) id 3 is outside vocabulary 3.
         let processor = processor().with_window_budget(Some(&super::super::ThinkingBudget::new(
             0,
-            vec![2],
+            vec![3],
             vec![3],
         )?));
         assert!(window.check_sampling(&processor).is_err());

@@ -389,7 +389,9 @@ pub fn explain(o: &EngineOptions) -> Vec<String> {
         }
     }
     let host_demotion = match &route {
-        Some(Ok(selected)) => !selected.prepared_sampler && !o.decode.logits_digest && host_side(&sampling),
+        Some(Ok(selected)) => {
+            !selected.prepared_sampler && !o.decode.logits_digest && host_side(&sampling)
+        }
         Some(Err(_)) => false,
         None => host_side(&sampling),
     };

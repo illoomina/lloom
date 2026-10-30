@@ -419,8 +419,14 @@ fn fixture_contract_preserves_default_and_validates_explicit_fast_before_install
 #[test]
 fn recording_preserves_token_input_contract_without_a_device() {
     use lloom_tensor::backend::PassInput;
-    assert_eq!(<Recording<'static, Blocking> as ReadbackStrategy>::PASS_INPUT, PassInput::TokenIds);
-    assert_eq!(<Recording<'static, lloom::generation::Ring> as ReadbackStrategy>::PASS_INPUT, PassInput::TokenIds);
+    assert_eq!(
+        <Recording<'static, Blocking> as ReadbackStrategy>::PASS_INPUT,
+        PassInput::TokenIds
+    );
+    assert_eq!(
+        <Recording<'static, lloom::generation::Ring> as ReadbackStrategy>::PASS_INPUT,
+        PassInput::TokenIds
+    );
 }
 
 #[cfg(feature = "metal")]
@@ -429,8 +435,17 @@ fn recording_preserves_prepared_input_but_native_blocking_stays_tokens() {
     use lloom_tensor::backend::PassInput;
     type Model = lloom::models::lfm2::Model<lloom::profile::CrownExact>;
     type Prepared = lloom::generation::readback::NativeRing<'static, Model>;
-    assert_eq!(<Prepared as ReadbackStrategy>::PASS_INPUT, PassInput::PreparedEmbeddings);
-    assert_eq!(<Recording<'static, Prepared> as ReadbackStrategy>::PASS_INPUT, PassInput::PreparedEmbeddings);
-    assert_eq!(<lloom::generation::readback::NativeBlocking as ReadbackStrategy>::PASS_INPUT, PassInput::TokenIds);
+    assert_eq!(
+        <Prepared as ReadbackStrategy>::PASS_INPUT,
+        PassInput::PreparedEmbeddings
+    );
+    assert_eq!(
+        <Recording<'static, Prepared> as ReadbackStrategy>::PASS_INPUT,
+        PassInput::PreparedEmbeddings
+    );
+    assert_eq!(
+        <lloom::generation::readback::NativeBlocking as ReadbackStrategy>::PASS_INPUT,
+        PassInput::TokenIds
+    );
     assert_eq!(<Recording<'static, lloom::generation::readback::NativeBlocking> as ReadbackStrategy>::PASS_INPUT, PassInput::TokenIds);
 }

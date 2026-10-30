@@ -582,7 +582,8 @@ impl DecodeParams {
             (ReadbackArm::Blocking, prepared_sampler.then(|| "native prepared device sampler; checked blocking id + raw diagnostic logits readback".into()))
         } else {
             (
-                self.readback.resolve_prepared(sampling, auto_ring, prepared_sampler),
+                self.readback
+                    .resolve_prepared(sampling, auto_ring, prepared_sampler),
                 if prepared_ring {
                     Some("native prepared device sampler; no host logits readback".into())
                 } else if prepared_sampler {
@@ -592,7 +593,12 @@ impl DecodeParams {
                 },
             )
         };
-        Ok(SamplerRoute { prepared_sampler, prepared_ring, arm, note })
+        Ok(SamplerRoute {
+            prepared_sampler,
+            prepared_ring,
+            arm,
+            note,
+        })
     }
 
     fn wants_prepared_ring(&self, enabled: bool, sampling: &Sampling) -> bool {

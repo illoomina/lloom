@@ -1721,3 +1721,40 @@ fn final_teardown_cancels_work_behind_pending_validated_io() {
     assert_eq!(generation.untouched_custody(), custody, "TEARDOWN_LEAVES_IO_CUSTODY_TO_THE_BANK");
     drop((native, src, dst, gate, progress));
 }
+
+/// As above with the IO-dependent work still in the current recording, its
+/// compute encoder open when the last handle drops: teardown closes it,
+/// cancels the recording and retires through one marker, running nothing.
+#[test]
+fn final_teardown_cancels_a_current_recording_behind_pending_validated_io() {
+    use crate::io_terminal::TestIoGeneration;
+    let f = fixture();
+    if f.commands.host_input_arm() == HostInputArm::GpuWait {
+        eprintln!("NOT_APPLICABLE nothing is held on the gpu-wait arm");
+        return;
+    }
+    let generation = TestIoGeneration::new(f.native.as_ref(), 1);
+    let dependency = generation.dependency(0);
+    f.commands.commit_when_io_validated(dependency.clone()).unwrap();
+    encode_compute(&f);
+    assert!(!f.commands.core.state.lock(Side::Host).current_abandoned);
+    let clock = f.commands.clock();
+    let weak = f.commands.core.produced.me_for_test();
+    let counters = f.commands.core.submission_control.clone();
+    let before = counters.native_calls.load(Ordering::Acquire);
+    let api = f.commands.actual_command_api();
+    let Fixture { native, commands, src, dst, gate, progress } = f;
+    drop(commands);
+    let retired = until(Duration::from_secs(5), || weak.upgrade().is_none());
+    let calls = counters.native_calls.load(Ordering::Acquire) - before;
+    let (opened, completed) = (clock.current_epoch().0, clock.completed_count().0);
+    eprintln!(
+        "TEARDOWN_PENDING_IO_CURRENT api={api} retired={retired} native_calls={calls} epochs={completed}/{opened} warm={}",
+        dst_bytes(&dst).iter().all(|b| *b == WARM)
+    );
+    assert!(retired, "TEARDOWN_PENDING_IO_CURRENT_FINAL_OWNER_RETIRES");
+    assert_eq!(calls, 1, "TEARDOWN_PENDING_IO_CURRENT_ONE_MARKER");
+    assert!(dst_bytes(&dst).iter().all(|b| *b == WARM), "TEARDOWN_PENDING_IO_CURRENT_BODY_NOT_RUN");
+    assert_eq!(completed, opened, "TEARDOWN_PENDING_IO_CURRENT_EVERY_EPOCH_COMPLETES");
+    drop((native, src, dst, gate, progress, generation));
+}

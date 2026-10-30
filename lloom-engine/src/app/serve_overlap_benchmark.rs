@@ -156,7 +156,7 @@ impl State {
             },
             |turn| {
                 // Fixed-size fields only while either policy still owns Turn.
-                publication = Some((uptime_ns(), shared.drains.active.load(Ordering::Acquire)));
+                publication = Some((uptime_ns(), shared.responses.active.load(Ordering::Acquire)));
                 if priced && matches!(state.release_at, Release::Publication) {
                     drop(turn.take());
                 }
@@ -164,7 +164,7 @@ impl State {
         );
         let full_return_ns = uptime_ns();
         let writers_at_return = self.writers.load(Ordering::Acquire);
-        let contexts_at_return = shared.drains.active.load(Ordering::Acquire);
+        let contexts_at_return = shared.responses.active.load(Ordering::Acquire);
         let pace_receipt = if let Some(pace) = &mut pace {
             match pace.finish(returned.is_ok()) {
                 Ok(receipt) => receipt,

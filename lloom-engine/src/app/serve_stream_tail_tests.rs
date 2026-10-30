@@ -14,6 +14,10 @@ use parking_lot::{Condvar, Mutex as ParkingMutex};
 use std::io::{self, Write};
 use std::time::{Duration, Instant};
 
+/// Groups of (end, 'a', start) in [`Case::RunawayMarkers`]: 68,000 marker
+/// tokens, past the retired 65,536-descriptor bound.
+const RUNAWAY_GROUPS: usize = 34_000;
+
 #[derive(Clone, Copy)]
 enum Case {
     PartialTail,
@@ -28,6 +32,8 @@ enum Case {
     // Cooperative first-fragment refusal only; incumbent sink assertions stay strict.
     FirstFragmentRefusal,
     EarlyFailureThenSuccess,
+    // More marker tokens than any fixed descriptor bound: end, 'a', start.
+    RunawayMarkers,
 }
 #[derive(Default)]
 struct Wire {
@@ -157,7 +163,7 @@ impl Served for Scripted {
     }
     fn kv_capacity(&self) -> usize {
         match self.case {
-            Case::LongReply | Case::BacklogRefusal => 4 << 20,
+            Case::LongReply | Case::BacklogRefusal | Case::RunawayMarkers => 4 << 20,
             Case::ApiLineage | Case::FirstFragmentRefusal | Case::EarlyFailureThenSuccess => 256,
             _ => 64,
         }
@@ -310,6 +316,10 @@ impl Served for Scripted {
         let ids = match self.case {
             Case::PartialTail => vec![97, end],
             Case::ApiLineage | Case::FirstFragmentRefusal => vec![97; 8],
+            Case::RunawayMarkers => {
+                let start = self.text.tokenizer.token_to_id("<think>").unwrap();
+                [end, 97, start].repeat(RUNAWAY_GROUPS)
+            }
             Case::LongReply => vec![97; 1 << 18],
             Case::BacklogRefusal => {
                 let mut ids = vec![98; MAX_RESPONSE_BACKLOG + 2];
@@ -755,7 +765,7 @@ fn timeout_before_role_selects_queued_role_before_later_text() {
     }
     let buf = DeltaBuffer::new();
     buf.push(&mut String::new(), "A");
-    let wrap: Wrap = Arc::new(|text| (format!("<{text}>"), text.len()));
+    let wrap: Wrap<String> = Arc::new(|text: &String| (format!("<{text}>"), text.len()));
     let mut local = String::new();
     let (first, closed) =
         StreamWriter::pending_after_timeout(&rx, Some(&buf), Some(&wrap), &order, &mut local);
@@ -855,7 +865,7 @@ fn a_family_without_decode_observations_splits_by_marker_text() {
         "{b:?}"
     );
     assert!(b.get("reasoning_content").is_none(), "{b:?}");
-    let c = p.finish();
+    let c = p.finish_fields();
     assert!(c.is_empty(), "{c:?}");
     // A stop string that cuts the marker short: the partial bytes are emitted
     // at finish, in the block they were in.
@@ -867,7 +877,7 @@ fn a_family_without_decode_observations_splits_by_marker_text() {
         a.get("reasoning_content").and_then(|v| v.as_str()),
         Some("thought")
     );
-    let c = p.finish();
+    let c = p.finish_fields();
     assert_eq!(
         c.get("reasoning_content").and_then(|v| v.as_str()),
         Some("</th"),
@@ -1081,7 +1091,7 @@ pub(super) fn shared_with_engine(engine: Box<dyn Served>) -> Arc<Shared> {
         front,
         decisions: super::super::decisions::Decisions::Refused("test".into()),
         turns: turns::Turns::default(),
-        drains: ResponseDrains::default(),
+        responses: ResponseContexts::default(),
         decision_pack: false,
         aborts: Mutex::new(HashSet::new()),
         abort_epoch: AtomicU64::new(0),
@@ -1160,7 +1170,7 @@ fn assert_continuation_during_drain(
         let split =
             reasoning::Reasoning::for_chat(next_shared.engine.as_ref(), &run.prompt_ids, false)
                 .unwrap()
-                .map(|p| Arc::new(ParkingMutex::new(p)));
+                .map(ParkingMutex::new);
         let decoded = run_decode_observed(
             next_shared.engine.as_ref(),
             &run.prompt_ids,
@@ -1365,9 +1375,18 @@ fn a_socket_draining_at_one_kib_per_second_does_not_own_the_next_model_request()
 #[test]
 fn a_full_response_budget_refuses_the_actual_http_route_before_model_execution() {
     use std::net::TcpStream;
-    let shared = scripted_shared(Case::CompleteMarker);
-    let held: Vec<_> = (0..MAX_RESPONSE_DRAINS)
-        .map(|_| shared.drains.try_take().unwrap())
+    // The operator's count override; memory admission is its own test.
+    const OVERRIDE: usize = 8;
+    let mut shared = scripted_shared(Case::CompleteMarker);
+    Arc::get_mut(&mut shared).unwrap().responses = ResponseContexts::with_memory(
+        crate::options::ServerResponseConfig {
+            contexts: Some(OVERRIDE),
+            ..Default::default()
+        },
+        ResponseMemory::Off,
+    );
+    let held: Vec<_> = (0..OVERRIDE)
+        .map(|_| shared.responses.try_take(0).unwrap())
         .collect();
     let tiny_http::ListenAddr::IP(address) = shared.server.server_addr() else {
         panic!("IP test listener")
@@ -1388,20 +1407,21 @@ fn a_full_response_budget_refuses_the_actual_http_route_before_model_execution()
     client.read_to_string(&mut response).unwrap();
     assert!(response.starts_with("HTTP/1.1 503"), "{response}");
     assert!(
-        response.contains("response drain capacity exhausted"),
+        response.contains("response contexts are in flight"),
+        "{response}"
+    );
+    assert!(
+        response.to_ascii_lowercase().contains("retry-after: 1\r\n"),
         "{response}"
     );
     assert!(
         shared.turns.try_take().is_some(),
         "refused request left no model ticket"
     );
-    assert_eq!(shared.drains.json()["overload"]["response_contexts"], 1);
-    assert_eq!(
-        shared.drains.active.load(Ordering::Relaxed),
-        MAX_RESPONSE_DRAINS
-    );
+    assert_eq!(shared.responses.json()["overload"]["contexts"], 1);
+    assert_eq!(shared.responses.active.load(Ordering::Relaxed), OVERRIDE);
     drop(held);
-    assert_eq!(shared.drains.active.load(Ordering::Relaxed), 0);
+    assert_eq!(shared.responses.active.load(Ordering::Relaxed), 0);
 }
 
 #[test]
@@ -1512,7 +1532,7 @@ fn an_earlier_write_failure_keeps_the_full_accepted_session_reply() {
         "the earlier text event failed"
     );
     assert_eq!(delivery["write_failed"], true);
-    assert_eq!(shared.drains.json()["pre_trailer_write_errors"], 1);
+    assert_eq!(shared.responses.json()["pre_trailer_write_errors"], 1);
     let continued = chat_completions(
         &shared,
         &json!({"previous_response_id":id,"input":"continue","stream":true,"max_tokens":3}),
@@ -1644,7 +1664,7 @@ fn a_refused_whole_fragment_cannot_enter_the_raw_frontier_or_stored_message() {
     assert_eq!(last["choices"][0]["finish_reason"], "cancelled");
     assert_eq!(last["usage"]["completion_tokens"], 1);
     assert_eq!(last["timings"]["response_backlog_limit"], true);
-    assert_eq!(shared.drains.json()["overload"]["unresolved_bytes"], 1);
+    assert_eq!(shared.responses.json()["overload"]["unresolved_bytes"], 1);
     assert_eq!(last["timings"]["frontier"]["delivered_bytes"], 1);
     assert_eq!(last["timings"]["frontier"]["written_bytes"], 1);
     assert_eq!(last["timings"]["frontier"]["write_failed"], false);
@@ -1888,7 +1908,7 @@ fn stream_timing_brackets_exclude_socket_drain_from_decode_pace() {
     let shared = scripted_shared(Case::CompleteMarker);
     let split = reasoning::Reasoning::for_chat(shared.engine.as_ref(), &[], false)
         .unwrap()
-        .map(|parser| Arc::new(ParkingMutex::new(parser)));
+        .map(ParkingMutex::new);
     assert!(
         split.is_some(),
         "timing fixture uses the production typed observer seam"
@@ -2116,7 +2136,7 @@ fn assert_delayed_a_publication_custody(late_failure: bool) {
         assert_eq!(frontier["written_bytes"], 0);
         assert_eq!(
             shared
-                .drains
+                .responses
                 .pre_trailer_write_errors
                 .load(Ordering::Relaxed),
             1
@@ -2125,7 +2145,7 @@ fn assert_delayed_a_publication_custody(late_failure: bool) {
         finished.unwrap();
         assert_eq!(
             shared
-                .drains
+                .responses
                 .pre_trailer_write_errors
                 .load(Ordering::Relaxed),
             0
@@ -2201,3 +2221,7 @@ fn assert_delayed_a_publication_custody(late_failure: bool) {
 // Host-only integrated cancellation/client-observed-ID boundary controls.
 #[path = "serve_continuation_boundary_tests.rs"]
 mod continuation_boundary_tests;
+
+// Response-context admission and the reasoning machine at the HTTP boundary.
+#[path = "serve_response_contexts_tests.rs"]
+mod response_contexts_tests;

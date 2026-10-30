@@ -140,9 +140,9 @@ fn publish_with_queue(
     body: Value,
     queued: Option<&mpsc::Sender<(u64, u64)>>,
 ) -> Saved {
-    let _drain = shared
-        .drains
-        .try_take()
+    let _context = shared
+        .responses
+        .try_take(0)
         .expect("bounded B/C response context");
     let by_id = body.get("previous_response_id").is_some();
     let mut turn = Some(match queued {
@@ -224,7 +224,10 @@ fn scenario(
         let captured = bytes.clone();
         let previous = bootstrap.clone();
         let thread = std::thread::spawn(move || {
-            let _drain = owner.drains.try_take().expect("bounded A response context");
+            let _context = owner
+                .responses
+                .try_take(0)
+                .expect("bounded A response context");
             let mut ticket = Some(owner.turns.take());
             let mut fields = native_reset_fields(&previous, native_initial_fields());
             fields["store"] = json!(true);
@@ -293,7 +296,7 @@ fn scenario(
             (message, a.ids)
         };
         assert_eq!(
-            shared.drains.active.load(Ordering::Acquire),
+            shared.responses.active.load(Ordering::Acquire),
             1,
             "A retains only its response context through drain"
         );
@@ -357,7 +360,7 @@ fn scenario(
         assert_eq!(b.messages.len(), 4);
         assert_eq!(c.messages.len(), 2);
         assert_eq!(
-            shared.drains.active.load(Ordering::Acquire),
+            shared.responses.active.load(Ordering::Acquire),
             usize::from(matches!(release_at, Release::Publication))
         );
         if matches!(release_at, Release::Publication) {
@@ -378,7 +381,7 @@ fn scenario(
             );
         }
         assert_eq!(
-            shared.drains.active.load(Ordering::Acquire),
+            shared.responses.active.load(Ordering::Acquire),
             0,
             "all response contexts released"
         );

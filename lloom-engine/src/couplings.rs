@@ -223,14 +223,13 @@ pub const COUPLINGS: &[Coupling] = &[
         site: "lloom-tensor/src/kernels/kernels/mlx_gemm.rs f16_rows_capacity",
         is_static: false,
     },
-    // Provisional PR1102 allocation; coordinator reservation still pending.
     Coupling {
         id: "C23",
         kind: "resolves",
-        when: "a generating response is admitted or its SSE/typed-marker handover reaches a configured bound",
-        effect: "server.response bounds contexts (503 before execution), unresolved SSE raw bytes (whole-fragment refusal/cancellation), and typed marker descriptors (run error); these are draft candidate defaults, not a wall-time drain guarantee",
-        keys: &["server.response.contexts", "server.response.raw_bytes", "server.response.markers"],
-        site: "lloom-engine/src/app/serve.rs ResponseDrains::try_take, StreamWriter::try_delta; app/serve/reasoning.rs Observer::observe",
+        when: "a generating response is admitted, or its SSE handover reaches server.response.raw_bytes",
+        effect: "a response context is admitted on the machine gate with its declared footprint (server.response.raw_bytes plus the request body), and only a memory refusal is a 503 with Retry-After; server.response.contexts, when set, caps the count instead of a fixed default (decision 83). raw_bytes refuses the next whole fragment past it, keeping the accepted frontier. Not a wall-time drain bound",
+        keys: &["server.response.contexts", "server.response.raw_bytes"],
+        site: "lloom-engine/src/app/serve.rs ResponseContexts::try_take, StreamWriter::admit",
         is_static: false,
     },
     Coupling {
@@ -521,10 +520,13 @@ pub fn explain(o: &EngineOptions) -> Vec<String> {
     }
     let response = o.server.response;
     out.push(format!(
-        "server.response -> contexts={} raw_bytes={} markers={}: draft candidates; \
-         context exhaustion=503, raw-byte exhaustion=whole-fragment cancellation, \
-         descriptor exhaustion=run error; no wall-time bound (C23)",
-        response.contexts, response.raw_bytes, response.markers
+        "server.response -> contexts={} raw_bytes={}: a context is admitted on the machine gate \
+         with raw_bytes plus its body as its footprint; memory refusal=503 with Retry-After, \
+         raw-byte exhaustion=whole-fragment cancellation; no wall-time bound (C23)",
+        response
+            .contexts
+            .map_or("memory".to_owned(), |n| format!("{n} (override)")),
+        response.raw_bytes
     ));
     out
 }
@@ -882,9 +884,9 @@ mod tests {
             explain(&EngineOptions::default()),
             vec![
                 "decode.readback.stream_reader -> on <- decode.readback.adaptive_commit (C9)",
-                "server.response -> contexts=8 raw_bytes=1048576 markers=65536: draft candidates; context exhaustion=503, raw-byte exhaustion=whole-fragment cancellation, descriptor exhaustion=run error; no wall-time bound (C23)"
+                "server.response -> contexts=memory raw_bytes=1048576: a context is admitted on the machine gate with raw_bytes plus its body as its footprint; memory refusal=503 with Retry-After, raw-byte exhaustion=whole-fragment cancellation; no wall-time bound (C23)"
             ],
-            "defaults name the reader and the response-bound candidates"
+            "defaults name the reader and the memory-admitted response contexts"
         );
         // C20: the decode rows' arm names its ceiling where it can take the
         // row axis, and its cause where it cannot.
@@ -1191,21 +1193,19 @@ mod response_coupling_tests {
     #[test]
     fn response_explain_names_configured_limits_and_each_distinct_outcome() {
         let mut options = crate::options::EngineOptions::default();
-        options.server.response = crate::options::ServerResponseConfig {
-            contexts: 2,
-            raw_bytes: 31,
-            markers: 7,
+        let explained = |options: &crate::options::EngineOptions| -> Vec<String> {
+            super::explain(options)
+                .into_iter()
+                .filter(|s| s.ends_with("(C23)"))
+                .collect()
         };
-        let lines: Vec<_> = super::explain(&options)
-            .into_iter()
-            .filter(|s| s.ends_with("(C23)"))
-            .collect();
-        assert_eq!(lines, ["server.response -> contexts=2 raw_bytes=31 markers=7: draft candidates; context exhaustion=503, raw-byte exhaustion=whole-fragment cancellation, descriptor exhaustion=run error; no wall-time bound (C23)"]);
-        for key in [
-            "server.response.contexts",
-            "server.response.raw_bytes",
-            "server.response.markers",
-        ] {
+        assert_eq!(explained(&options), ["server.response -> contexts=memory raw_bytes=1048576: a context is admitted on the machine gate with raw_bytes plus its body as its footprint; memory refusal=503 with Retry-After, raw-byte exhaustion=whole-fragment cancellation; no wall-time bound (C23)"]);
+        options.server.response = crate::options::ServerResponseConfig {
+            contexts: Some(2),
+            raw_bytes: 31,
+        };
+        assert_eq!(explained(&options), ["server.response -> contexts=2 (override) raw_bytes=31: a context is admitted on the machine gate with raw_bytes plus its body as its footprint; memory refusal=503 with Retry-After, raw-byte exhaustion=whole-fragment cancellation; no wall-time bound (C23)"]);
+        for key in ["server.response.contexts", "server.response.raw_bytes"] {
             assert_eq!(super::of(key), ["C23"]);
         }
     }

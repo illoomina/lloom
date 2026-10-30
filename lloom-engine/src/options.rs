@@ -1972,23 +1972,19 @@ pub struct PipetteConfig {
 #[options(v0 = false)]
 #[serde(default)]
 pub struct ServerResponseConfig {
-    /// Concurrent generating response contexts, including model wait and socket drain. Draft candidate default 8, not approved: exhaustion returns 503 before execution; 0 admits none. Not a connection-thread or wall-time bound.
+    /// Operator override: at most this many generating response contexts at once (model wait, decode and socket drain included); past it a request gets 503 with `Retry-After`. Unset, the ceiling is memory's: each context is admitted on the machine gate with its declared footprint, a request past the batch width that fits waits for the model, and only a memory refusal is a 503 (decision 83). 0 admits none.
     #[opt(flag = "response-contexts", path = "server.response.contexts", status = "advanced", facets = ["buffer"], flows = ["token-out"])]
-    pub contexts: usize,
-    /// Unresolved raw text bytes per SSE response, including in-flight writes. Draft candidate default 1048576, not approved: the next whole fragment is refused above it, preserving the earlier accepted frontier; 0 refuses nonempty fragments. Not total retained reply size.
+    pub contexts: Option<usize>,
+    /// Unresolved raw text bytes per SSE response, in-flight writes included: the cold buffer's share of a response context's footprint (decision 83). The next whole fragment is refused above it, keeping the earlier accepted frontier; 0 refuses nonempty fragments. Interim: a per-session page quota once responses are paged token logs (#1145).
     #[opt(flag = "response-raw-bytes", path = "server.response.raw_bytes", status = "advanced", facets = ["buffer"], flows = ["token-out"])]
     pub raw_bytes: usize,
-    /// Typed reasoning marker descriptors retained per reply. Draft candidate default 65536, not approved: overflow is a run error, never silent literal fallback; 0 refuses the first marker. Legacy text-only adapters do not produce typed descriptors.
-    #[opt(flag = "response-markers", path = "server.response.markers", status = "advanced", facets = ["buffer"], flows = ["token-out"])]
-    pub markers: usize,
 }
 
 impl Default for ServerResponseConfig {
     fn default() -> Self {
         Self {
-            contexts: 8,
+            contexts: None,
             raw_bytes: 1 << 20,
-            markers: 1 << 16,
         }
     }
 }
@@ -2059,7 +2055,7 @@ pub struct ServerConfig {
     pub pipette: PipetteConfig,
     #[opt(nested)]
     pub sessions: ServerSessionsConfig,
-    /// Generating response drain bounds (draft candidate defaults).
+    /// Response contexts: memory-admitted, with an optional count override (decision 83).
     #[opt(nested)]
     pub response: ServerResponseConfig,
 }
@@ -2576,20 +2572,19 @@ mod response_option_tests {
         for (key, value) in [
             ("server.response.contexts", "3"),
             ("server.response.raw_bytes", "17"),
-            ("server.response.markers", "5"),
         ] {
             assert!(idx.keys.contains_key(key), "{key}");
             assert_eq!(idx.keys[key].targets.len(), 1, "{key}");
-            assert!(
-                idx.keys[key].meta().doc.contains("Draft candidate"),
-                "{key}"
-            );
+            assert!(idx.keys[key].meta().doc.contains("decision 83"), "{key}");
             idx.set(&mut options, key, value).unwrap();
         }
+        assert!(
+            !idx.keys.contains_key("server.response.markers"),
+            "decision 85 leaves no marker list to bound"
+        );
         let expected = ServerResponseConfig {
-            contexts: 3,
+            contexts: Some(3),
             raw_bytes: 17,
-            markers: 5,
         };
         assert_eq!(options.server.response, expected);
         let mut back = EngineOptions::default();
@@ -2599,7 +2594,6 @@ mod response_option_tests {
         let variables = std::collections::BTreeMap::from([
             (idx.keys["server.response.contexts"].env(), "3".to_owned()),
             (idx.keys["server.response.raw_bytes"].env(), "17".to_owned()),
-            (idx.keys["server.response.markers"].env(), "5".to_owned()),
         ]);
         env.from_env_with(&|name| variables.get(name).cloned())
             .unwrap();
@@ -2615,8 +2609,6 @@ mod response_option_tests {
             "3",
             "--response-raw-bytes",
             "17",
-            "--response-markers",
-            "5",
         ])
         .unwrap();
         let mut flags = ServerResponseConfig::default();
@@ -2625,10 +2617,10 @@ mod response_option_tests {
         assert_eq!(
             ServerResponseConfig::default(),
             ServerResponseConfig {
-                contexts: 8,
+                contexts: None,
                 raw_bytes: 1 << 20,
-                markers: 1 << 16
-            }
+            },
+            "no fixed default count: the ceiling is memory's (decision 83)"
         );
     }
 }

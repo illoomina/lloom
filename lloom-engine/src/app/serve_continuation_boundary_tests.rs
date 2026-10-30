@@ -75,7 +75,7 @@ fn snapshot(shared: &Shared, id: &str) -> Snapshot {
     }
 }
 fn json_reply(shared: &Shared, fields: Value) -> Value {
-    let _drain = shared.drains.try_take().unwrap();
+    let _context = shared.responses.try_take(0).unwrap();
     let _turn = shared.turns.take();
     let Reply::Json(reply) = response_reply(
         chat_completions(shared, &native_response_request(fields), None),
@@ -211,11 +211,13 @@ fn divergent_generation_prefix_preserves_accepted_reply_on_refusal_and_writer_st
 fn assert_first_fragment_refusal(thinking: bool) {
     let progress = Progress::default();
     let mut shared = scripted_shared_with_progress(Case::FirstFragmentRefusal, progress.clone());
-    Arc::get_mut(&mut shared).unwrap().drains =
-        ResponseDrains::new(crate::options::ServerResponseConfig {
+    Arc::get_mut(&mut shared).unwrap().responses = ResponseContexts::with_memory(
+        crate::options::ServerResponseConfig {
             raw_bytes: 0,
             ..Default::default()
-        });
+        },
+        ResponseMemory::Off,
+    );
     // JSON setup/recovery do not use SSE raw-lag admission. R0 is this fixture's
     // explicit existing option value, not a new default or public switch.
     let a = json_reply(
@@ -289,8 +291,8 @@ fn assert_first_fragment_refusal(thinking: bool) {
         .resolve(&cancelled_id, None, true, Instant::now())
         .is_err());
     assert_eq!(shared.sessions.lock().json()["turns"], 1);
-    assert_eq!(shared.drains.json()["overload"]["unresolved_bytes"], 1);
-    assert_eq!(shared.drains.active.load(Ordering::Acquire), 0);
+    assert_eq!(shared.responses.json()["overload"]["unresolved_bytes"], 1);
+    assert_eq!(shared.responses.active.load(Ordering::Acquire), 0);
     assert!(shared.turns.try_take().is_some());
     {
         let wire = progress.0 .0.lock();
@@ -390,7 +392,7 @@ fn assert_pre_decode_writer_start_failure(thinking: bool) {
         1,
         "no D publication"
     );
-    assert_eq!(shared.drains.active.load(Ordering::Acquire), 0);
+    assert_eq!(shared.responses.active.load(Ordering::Acquire), 0);
     assert!(
         shared.turns.try_take().is_some(),
         "outer turn dropped on early Err"
@@ -843,7 +845,7 @@ fn assert_client_observed_continuation(release_at: Release) {
     assert!(events.iter().all(|e| e.get("timings").is_none()));
     drop(attempted);
     cleanup.join();
-    assert_eq!(shared.drains.active.load(Ordering::Acquire), 0);
+    assert_eq!(shared.responses.active.load(Ordering::Acquire), 0);
     assert!(shared.turns.try_take().is_some());
 }
 

@@ -14,12 +14,26 @@ use parking_lot::{Condvar, Mutex as ParkingMutex};
 use std::io::{self, Write};
 use std::time::{Duration, Instant};
 
+/// Groups of (end, 'a', start) in [`Case::RunawayMarkers`]: 68,000 marker
+/// tokens, past the retired 65,536-descriptor bound.
+const RUNAWAY_GROUPS: usize = 34_000;
+
 #[derive(Clone, Copy)]
 enum Case {
     PartialTail,
     CompleteMarker,
     SplitMarker,
+    LongReply,
+    LateFailure,
+    BacklogRefusal,
+    LateMetadataFailure,
+    // Host-only, exact eight-byte reply for the API lineage controls.
+    ApiLineage,
+    // Cooperative first-fragment refusal only; incumbent sink assertions stay strict.
+    FirstFragmentRefusal,
     EarlyFailureThenSuccess,
+    // More marker tokens than any fixed descriptor bound: end, 'a', start.
+    RunawayMarkers,
 }
 #[derive(Default)]
 struct Wire {
@@ -27,8 +41,15 @@ struct Wire {
     events: Vec<Value>,
     first_text: bool,
     failures: usize,
-    model_entries: usize,
     decoded: bool,
+    model_entries: usize,
+    first_case_offered: usize,
+    first_case_refused: usize,
+    first_case_prompt: Vec<u32>,
+    // One-shot host-only gate before A offers any fragment. No production owner.
+    before_decode: Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>,
+    metadata_calls: usize,
+    metadata_before_publication: Option<std::sync::Weak<Shared>>,
 }
 #[derive(Clone, Default)]
 struct Progress(Arc<(ParkingMutex<Wire>, Condvar)>);
@@ -141,10 +162,10 @@ impl Served for Scripted {
         "scripted-tail"
     }
     fn kv_capacity(&self) -> usize {
-        if matches!(self.case, Case::EarlyFailureThenSuccess) {
-            256
-        } else {
-            64
+        match self.case {
+            Case::LongReply | Case::BacklogRefusal | Case::RunawayMarkers => 4 << 20,
+            Case::ApiLineage | Case::FirstFragmentRefusal | Case::EarlyFailureThenSuccess => 256,
+            _ => 64,
         }
     }
     fn readback(&self) -> ReadbackArm {
@@ -162,6 +183,26 @@ impl Served for Scripted {
     fn bos_id(&self) -> Option<u32> {
         None
     }
+    fn vision_report_checked(&self) -> Result<Value> {
+        let before = {
+            let (lock, _) = &*self.progress.0;
+            let mut wire = lock.lock();
+            wire.metadata_calls += 1;
+            wire.metadata_before_publication.clone()
+        };
+        if let Some(shared) = before.and_then(|weak| weak.upgrade()) {
+            assert_eq!(
+                shared.sessions.lock().json()["turns"],
+                0,
+                "request-bound metadata capture must precede publication"
+            );
+        }
+        if matches!(self.case, Case::LateMetadataFailure) {
+            anyhow::bail!("scripted checked metadata refusal");
+        }
+        Ok(Value::Null)
+    }
+
     fn health(&self) -> Value {
         Value::Null
     }
@@ -230,18 +271,32 @@ impl Served for Scripted {
     }
     fn complete_observed(
         &self,
-        _: &[u32],
+        prompt: &[u32],
         _: &[DecodedImage],
         _: &DecodeParams,
         sink: &mut (dyn FnMut(&str) -> bool + Send),
         observe: &mut DecodeObserver<'_>,
     ) -> Result<Decoded> {
-        {
-            let mut wire = self.progress.0 .0.lock();
+        let before_decode = {
+            let (lock, changed) = &*self.progress.0;
+            let mut wire = lock.lock();
             wire.model_entries += 1;
             if matches!(self.case, Case::EarlyFailureThenSuccess) && wire.model_entries == 1 {
+                changed.notify_all();
                 anyhow::bail!("scripted pre-token memory refusal");
             }
+            if matches!(self.case, Case::FirstFragmentRefusal) {
+                wire.first_case_prompt = prompt.to_vec();
+            }
+            let gate = wire.before_decode.take();
+            changed.notify_all();
+            gate
+        };
+        if let Some((entered, released)) = before_decode {
+            let _ = entered.send(());
+            released
+                .recv_timeout(Duration::from_secs(10))
+                .expect("test model barrier released");
         }
         let end = self.text.tokenizer.token_to_id("</think>").unwrap();
         let mut stream = crate::stream::TextStream::default();
@@ -260,15 +315,49 @@ impl Served for Scripted {
         };
         let ids = match self.case {
             Case::PartialTail => vec![97, end],
+            Case::ApiLineage | Case::FirstFragmentRefusal => vec![97; 8],
+            Case::RunawayMarkers => {
+                let start = self.text.tokenizer.token_to_id("<think>").unwrap();
+                [end, 97, start].repeat(RUNAWAY_GROUPS)
+            }
+            Case::LongReply => vec![97; 1 << 18],
+            Case::BacklogRefusal => {
+                let mut ids = vec![98; MAX_RESPONSE_BACKLOG + 2];
+                ids[0] = 97;
+                ids
+            }
             _ => vec![97, end, 88],
         };
         let mut stopped = false;
+        let mut cancelled = false;
         let mut batched = String::new();
-        for id in ids {
-            let (fragment, hit) = stream.publish(&[id], &mut decoder, &stops)?;
+        let batch = if matches!(self.case, Case::LongReply) {
+            ids.len()
+        } else {
+            1
+        };
+        let batches: Vec<_> = if matches!(self.case, Case::BacklogRefusal) {
+            vec![&ids[..1], &ids[1..]]
+        } else {
+            ids.chunks(batch).collect()
+        };
+        for batch in batches {
+            let (fragment, hit) = stream.publish(batch, &mut decoder, &stops)?;
             if let Some(fragment) = fragment {
                 if matches!(self.case, Case::SplitMarker) {
                     batched.push_str(&fragment);
+                } else if matches!(self.case, Case::BacklogRefusal | Case::FirstFragmentRefusal) {
+                    if matches!(self.case, Case::FirstFragmentRefusal) {
+                        self.progress.0 .0.lock().first_case_offered += 1;
+                    }
+                    if !sink(&fragment) {
+                        if matches!(self.case, Case::FirstFragmentRefusal) {
+                            self.progress.0 .0.lock().first_case_refused += 1;
+                        }
+                        stream.refuse_last();
+                        cancelled = true;
+                        break;
+                    }
                 } else {
                     assert!(sink(&fragment));
                 }
@@ -278,7 +367,7 @@ impl Served for Scripted {
                 break;
             }
         }
-        if !stopped {
+        if !stopped && !cancelled {
             let (fragment, _) = stream.flush(&mut decoder, &stops)?;
             if let Some(fragment) = fragment {
                 if matches!(self.case, Case::SplitMarker) {
@@ -298,11 +387,20 @@ impl Served for Scripted {
             assert!(sink("/think>X"));
         }
         let (text, tokens) = stream.finish(&stops);
-        self.progress.0 .0.lock().decoded = true;
+        {
+            let (lock, changed) = &*self.progress.0;
+            lock.lock().decoded = true;
+            changed.notify_all();
+        }
+        if matches!(self.case, Case::LateFailure) {
+            anyhow::bail!("scripted late decode failure after accepted text");
+        }
         Ok(Decoded {
             text,
             tokens,
-            stop: if stopped {
+            stop: if cancelled {
+                Stop::Cancelled
+            } else if stopped {
                 Stop::StopString
             } else {
                 Stop::Length
@@ -336,28 +434,6 @@ impl Served for Scripted {
         Ok(())
     }
     fn shutdown(&self) {}
-}
-
-fn scripted_shared_with_progress(case: Case, progress: Progress) -> Shared {
-    let engine = Box::new(Scripted::new(case, progress));
-    let front = Front::new(engine.as_ref(), Default::default());
-    Shared {
-        engine,
-        front,
-        decisions: super::super::decisions::Decisions::Refused("test".into()),
-        turns: turns::Turns::default(),
-        decision_pack: false,
-        aborts: Mutex::new(HashSet::new()),
-        abort_epoch: AtomicU64::new(0),
-        server: Server::http("127.0.0.1:0").unwrap(),
-        model_name: "scripted-tail".into(),
-        sampling: Default::default(),
-        reuse: ParkingMutex::new(Default::default()),
-        sessions: super::test_sessions(),
-        activity: Arc::new(keep_warm::Activity::new(0)),
-        keep_warm: keep_warm::Policy::Off { why: "test".into() },
-        keep_warm_pressure_file: None,
-    }
 }
 
 fn run(
@@ -689,7 +765,7 @@ fn timeout_before_role_selects_queued_role_before_later_text() {
     }
     let buf = DeltaBuffer::new();
     buf.push(&mut String::new(), "A");
-    let wrap: Wrap = Arc::new(|text| (format!("<{text}>"), text.len()));
+    let wrap: Wrap<String> = Arc::new(|text: &String| (format!("<{text}>"), text.len()));
     let mut local = String::new();
     let (first, closed) =
         StreamWriter::pending_after_timeout(&rx, Some(&buf), Some(&wrap), &order, &mut local);
@@ -777,12 +853,19 @@ fn a_family_without_decode_observations_splits_by_marker_text() {
         .unwrap()
         .unwrap();
     let a = p.push("The user asks a simple thing.</thi");
-    assert_eq!(a.get("reasoning_content").and_then(|v| v.as_str()), Some("The user asks a simple thing."));
+    assert_eq!(
+        a.get("reasoning_content").and_then(|v| v.as_str()),
+        Some("The user asks a simple thing.")
+    );
     assert!(a.get("content").is_none(), "{a:?}");
     let b = p.push("nk>Paris");
-    assert_eq!(b.get("content").and_then(|v| v.as_str()), Some("Paris"), "{b:?}");
+    assert_eq!(
+        b.get("content").and_then(|v| v.as_str()),
+        Some("Paris"),
+        "{b:?}"
+    );
     assert!(b.get("reasoning_content").is_none(), "{b:?}");
-    let c = p.finish();
+    let c = p.finish_fields();
     assert!(c.is_empty(), "{c:?}");
     // A stop string that cuts the marker short: the partial bytes are emitted
     // at finish, in the block they were in.
@@ -790,16 +873,869 @@ fn a_family_without_decode_observations_splits_by_marker_text() {
         .unwrap()
         .unwrap();
     let a = p.push("thought</th");
-    assert_eq!(a.get("reasoning_content").and_then(|v| v.as_str()), Some("thought"));
-    let c = p.finish();
-    assert_eq!(c.get("reasoning_content").and_then(|v| v.as_str()), Some("</th"), "{c:?}");
+    assert_eq!(
+        a.get("reasoning_content").and_then(|v| v.as_str()),
+        Some("thought")
+    );
+    let c = p.finish_fields();
+    assert_eq!(
+        c.get("reasoning_content").and_then(|v| v.as_str()),
+        Some("</th"),
+        "{c:?}"
+    );
     // With observations the splitter is exact by id and ignores literals.
     engine.observes = true;
     let mut p = reasoning::Reasoning::for_chat(&engine, &[tags.start], false)
         .unwrap()
         .unwrap();
     let a = p.push("literal </think> stays reasoning");
-    assert_eq!(a.get("reasoning_content").and_then(|v| v.as_str()), Some("literal </think> stays reasoning"));
+    assert_eq!(
+        a.get("reasoning_content").and_then(|v| v.as_str()),
+        Some("literal </think> stays reasoning")
+    );
+}
+
+fn scripted_shared(case: Case) -> Arc<Shared> {
+    scripted_shared_with_progress(case, Progress::default())
+}
+
+fn scripted_shared_with_progress(case: Case, progress: Progress) -> Arc<Shared> {
+    shared_with_engine(Box::new(Scripted::new(case, progress)))
+}
+
+// Called only after a lookup's mutex guard has dropped. Baseline Value uses
+// identity Into; retention's owned StoredMessage supplies a consuming adapter.
+pub(super) fn message_values<T: Into<Value>>(messages: Vec<T>) -> Vec<Value> {
+    messages.into_iter().map(Into::into).collect()
+}
+
+// Shared input/diagnostics for host ingress controls and the actual native
+// fixture. The malformed unbound reset remains a negative control.
+pub(super) fn native_response_request(fields: Value) -> Value {
+    let mut body = json!({"max_tokens":8,"temperature":0,"seed":7,"ignore_eos":true,
+        "enable_thinking":false,"return_token_ids":true,
+        "logit_bias":{"97":100,"98":100,"99":100}});
+    for (key, value) in fields.as_object().unwrap() {
+        body[key] = value.clone();
+    }
+    body
+}
+
+pub(super) fn native_initial_fields() -> Value {
+    json!({"messages":[{"role":"user","content":"A"}],"reset":"cache"})
+}
+
+pub(super) fn response_reply(reply: Handled<Reply>, context: &str) -> Reply {
+    match reply {
+        Ok(reply) => reply,
+        Err(Failure::BadRequest(message)) => panic!("{context}: HTTP400 BadRequest: {message}"),
+        Err(Failure::NotFound(message)) => panic!("{context}: HTTP404 NotFound: {message}"),
+        Err(Failure::Internal(error)) => panic!("{context}: HTTP500 Internal: {error:#}"),
+    }
+}
+
+pub(super) fn native_json_reply(shared: &Shared, fields: Value) -> Value {
+    let _turn = shared.turns.take();
+    let context = format!("native JSON request {fields}");
+    let reply = response_reply(
+        chat_completions(shared, &native_response_request(fields), None),
+        &context,
+    );
+    let Reply::Json(body) = reply else {
+        panic!("JSON requested")
+    };
+    assert_eq!(body["choices"][0]["token_ids"].as_array().unwrap().len(), 8);
+    body
+}
+
+pub(super) fn native_bootstrap(shared: &Shared) -> String {
+    let body = native_json_reply(
+        shared,
+        json!({
+            "messages":[{"role":"user","content":"fixture-bootstrap"}],"store":true
+        }),
+    );
+    let id = body["id"].as_str().unwrap().to_owned();
+    {
+        // No Bound/Reply/native-row owner from this lookup survives to target.
+        let resolved = shared
+            .sessions
+            .lock()
+            .resolve(&id, None, true, Instant::now())
+            .unwrap();
+        let messages = message_values(resolved.messages.unwrap());
+        assert_eq!(
+            messages,
+            vec![
+                json!({"role":"user","content":"fixture-bootstrap"}),
+                body["choices"][0]["message"].clone()
+            ]
+        );
+    }
+    id
+}
+
+pub(super) fn native_reset_fields(bootstrap: &str, mut fields: Value) -> Value {
+    assert!(fields.get("previous_response_id").is_none());
+    assert!(fields.get("input").is_none());
+    assert!(fields["messages"].is_array());
+    assert_eq!(fields["reset"], "cache");
+    fields["previous_response_id"] = json!(bootstrap);
+    fields
+}
+
+pub(super) fn assert_bootstrap_reset(shared: &Shared, bootstrap: &str, target: &str) {
+    assert_ne!(bootstrap, target, "reset must publish a fresh turn nonce");
+    let old = shared
+        .sessions
+        .lock()
+        .resolve(bootstrap, None, true, Instant::now());
+    match old {
+        Err(lost) => assert_eq!(lost.reason, Some(super::super::sessions::Reason::Reset)),
+        Ok(_) => panic!("bootstrap id must not continue the reset target"),
+    }
+}
+
+/// A full-history API reference, not a cold or uncached-front-end oracle.
+/// The reset clears session turns but preserves the model's prefix policy.
+pub(super) fn native_json_reference(shared: &Shared, fields: Value) -> Value {
+    let bootstrap = native_bootstrap(shared);
+    let expected = fields["messages"].as_array().unwrap().clone();
+    let body = native_json_reply(shared, native_reset_fields(&bootstrap, fields));
+    let id = body["id"].as_str().unwrap();
+    assert_eq!(body["timings"]["session"]["reset"], "cache");
+    assert_bootstrap_reset(shared, &bootstrap, id);
+    {
+        // Convert outside the table lock and drop all lookup native owners
+        // before returning the pure JSON reference to the next request.
+        let resolved = shared
+            .sessions
+            .lock()
+            .resolve(id, None, true, Instant::now())
+            .unwrap();
+        let messages = message_values(resolved.messages.unwrap());
+        let mut expected = expected;
+        expected.push(body["choices"][0]["message"].clone());
+        assert_eq!(
+            messages, expected,
+            "no bootstrap message may enter the target"
+        );
+        let expected_ids: Vec<u32> = body["prompt_token_ids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .chain(body["choices"][0]["token_ids"].as_array().unwrap())
+            .map(|v| u32::try_from(v.as_u64().unwrap()).unwrap())
+            .collect();
+        assert_eq!(
+            resolved.ids, expected_ids,
+            "saved IDs are the target prompt plus accepted reply"
+        );
+    }
+    body
+}
+
+#[test]
+fn native_reference_a_is_valid_through_actual_chat_ingress() {
+    let shared = scripted_shared(Case::ApiLineage);
+    let a = native_json_reference(&shared, native_initial_fields());
+    let b = native_json_reference(
+        &shared,
+        json!({
+            "messages":[{"role":"user","content":"A"},a["choices"][0]["message"],{"role":"user","content":"B"}],"reset":"cache"
+        }),
+    );
+    let c = native_json_reference(
+        &shared,
+        json!({
+            "messages":[{"role":"user","content":"C"}],"reset":"cache"
+        }),
+    );
+    for (body, count) in [(&a, 2), (&b, 4), (&c, 2)] {
+        let r = shared
+            .sessions
+            .lock()
+            .resolve(body["id"].as_str().unwrap(), None, true, Instant::now())
+            .unwrap();
+        assert_eq!(message_values(r.messages.unwrap()).len(), count);
+    }
+}
+
+#[test]
+fn an_unbound_native_reset_is_refused_before_model_entry() {
+    let progress = Progress::default();
+    let shared = scripted_shared_with_progress(Case::ApiLineage, progress.clone());
+    let body = native_response_request(native_initial_fields());
+    match chat_completions(&shared, &body, None) {
+        Err(Failure::BadRequest(message)) => assert_eq!(
+            message,
+            "field 'reset' resets a session: it needs previous_response_id"
+        ),
+        _ => panic!("malformed unbound reset must remain HTTP400"),
+    }
+    let (wire, _) = &*progress.0;
+    assert_eq!(wire.lock().model_entries, 0);
+}
+
+// The production serving passage, not ambient pipette overrides. The same
+// shape helper is exercised by host tokenization and the loaded native fixture.
+pub(super) fn response_shape(options: &crate::EngineOptions) -> super::super::Shape {
+    super::super::Shape::of(options, Frontend::Serve, DEFAULT_SEED_TEXT.to_owned())
+}
+
+pub(super) fn shared_with_engine(engine: Box<dyn Served>) -> Arc<Shared> {
+    let model_name = engine.model_name().to_owned();
+    let front = Front::new(engine.as_ref(), Default::default());
+    Arc::new(Shared {
+        engine,
+        front,
+        decisions: super::super::decisions::Decisions::Refused("test".into()),
+        turns: turns::Turns::default(),
+        responses: ResponseContexts::default(),
+        decision_pack: false,
+        aborts: Mutex::new(HashSet::new()),
+        abort_epoch: AtomicU64::new(0),
+        server: Server::http("127.0.0.1:0").unwrap(),
+        model_name,
+        sampling: Default::default(),
+        reuse: ParkingMutex::new(Default::default()),
+        sessions: super::test_sessions(),
+        activity: Arc::new(keep_warm::Activity::new(0)),
+        keep_warm: keep_warm::Policy::Off { why: "test".into() },
+        keep_warm_pressure_file: None,
+    })
+}
+
+fn assert_continuation_during_drain(
+    case: Case,
+    writer: impl FnOnce() -> Result<ChunkedWriter> + Send + 'static,
+    blocked_rx: std::sync::mpsc::Receiver<()>,
+    release: impl FnOnce(),
+    disconnect: bool,
+) {
+    let model_progress = Progress::default();
+    let shared = scripted_shared_with_progress(case, model_progress.clone());
+    let max_tokens = if matches!(case, Case::LongReply) {
+        1 << 18
+    } else {
+        3
+    };
+    let (id_tx, id_rx) = std::sync::mpsc::channel();
+    let first_shared = Arc::clone(&shared);
+    let first = std::thread::spawn(move || {
+        let turn = first_shared.turns.take();
+        let reply = chat_completions(
+            &first_shared,
+            &json!({
+                "messages":[{"role":"user","content":"first"}],
+                "stream":true,"store":true,"max_tokens":max_tokens
+            }),
+            None,
+        )
+        .ok()
+        .expect("first request built");
+        let Reply::Stream(run) = reply else {
+            panic!("stream requested")
+        };
+        id_tx.send(run.id.clone()).unwrap();
+        let result = stream_response_settlement(&first_shared, *run, writer, || drop(turn));
+        if disconnect {
+            let error = result.unwrap_err().to_string();
+            assert!(error.contains("client went away mid-stream"), "{error}");
+        } else {
+            result.unwrap();
+        }
+    });
+    let id = id_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    blocked_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let next_shared = Arc::clone(&shared);
+    let next = std::thread::spawn(move || {
+        let _turn = next_shared.turns.take();
+        let reply = chat_completions(
+            &next_shared,
+            &json!({
+                "previous_response_id":id,"input":"continue","stream":true,"max_tokens":max_tokens
+            }),
+            None,
+        )
+        .ok()
+        .expect("published session resolves during prior drain");
+        let Reply::Stream(run) = reply else {
+            panic!("stream requested")
+        };
+        assert!(
+            run.facts.spliced.bound > 0,
+            "previous reply bound by its reference"
+        );
+        let split =
+            reasoning::Reasoning::for_chat(next_shared.engine.as_ref(), &run.prompt_ids, false)
+                .unwrap()
+                .map(ParkingMutex::new);
+        let decoded = run_decode_observed(
+            next_shared.engine.as_ref(),
+            &run.prompt_ids,
+            &[],
+            &run.params,
+            split.as_ref(),
+            &mut |_| true,
+        )
+        .unwrap();
+        if matches!(case, Case::LongReply) {
+            assert_eq!(decoded.text.len(), 1 << 18);
+            assert!(decoded.text.bytes().all(|b| b == b'a'));
+        } else {
+            assert_eq!(decoded.text, "a</think>X");
+        }
+    });
+    let progress_budget = if matches!(case, Case::LongReply) {
+        Duration::from_secs(2)
+    } else {
+        Duration::from_millis(250)
+    };
+    let progressed = {
+        let (lock, changed) = &*model_progress.0;
+        let deadline = Instant::now() + progress_budget;
+        let mut wire = lock.lock();
+        while wire.model_entries < 2 && Instant::now() < deadline {
+            changed.wait_for(
+                &mut wire,
+                deadline.saturating_duration_since(Instant::now()),
+            );
+        }
+        wire.model_entries >= 2
+    };
+    release();
+    let first_result = first.join();
+    let next_result = next.join();
+    first_result.unwrap();
+    next_result.unwrap();
+    assert!(
+        progressed,
+        "next request's model start waited for the previous socket drain"
+    );
+}
+
+#[test]
+fn a_settled_session_and_next_model_request_do_not_wait_for_socket_drain() {
+    struct BlockedWriter {
+        entered: std::sync::mpsc::Sender<()>,
+        release: std::sync::mpsc::Receiver<()>,
+        first: bool,
+    }
+    impl Write for BlockedWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            if self.first {
+                self.first = false;
+                self.entered.send(()).unwrap();
+                self.release
+                    .recv_timeout(Duration::from_secs(5))
+                    .map_err(|e| io::Error::new(io::ErrorKind::TimedOut, e.to_string()))?;
+            }
+            Ok(())
+        }
+    }
+    let (blocked, blocked_rx) = std::sync::mpsc::channel();
+    let (release, release_rx) = std::sync::mpsc::channel();
+    assert_continuation_during_drain(
+        Case::CompleteMarker,
+        move || {
+            Ok(ChunkedWriter {
+                w: Box::new(BlockedWriter {
+                    entered: blocked,
+                    release: release_rx,
+                    first: true,
+                }),
+            })
+        },
+        blocked_rx,
+        || {
+            release.send(()).unwrap();
+        },
+        false,
+    );
+}
+
+#[cfg(unix)]
+fn bounded_sockets() -> (std::net::TcpStream, std::net::TcpStream) {
+    use std::net::{TcpListener, TcpStream};
+    use std::os::fd::AsRawFd;
+    fn socket_buffer(socket: &TcpStream, option: libc::c_int) {
+        let bytes: libc::c_int = 1024;
+        // SAFETY: the live socket owns the fd; bytes is a correctly sized,
+        // readable integer for the SOL_SOCKET buffer option.
+        let result = unsafe {
+            libc::setsockopt(
+                socket.as_raw_fd(),
+                libc::SOL_SOCKET,
+                option,
+                (&bytes as *const libc::c_int).cast(),
+                std::mem::size_of_val(&bytes) as libc::socklen_t,
+            )
+        };
+        assert_eq!(result, 0, "{}", io::Error::last_os_error());
+    }
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    let (socket, _) = listener.accept().unwrap();
+    socket_buffer(&socket, libc::SO_SNDBUF);
+    socket_buffer(&client, libc::SO_RCVBUF);
+    socket
+        .set_write_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    client
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    (client, socket)
+}
+
+#[cfg(unix)]
+struct SocketWriter {
+    socket: std::net::TcpStream,
+    entered: Option<std::sync::mpsc::Sender<()>>,
+    before_payload: Option<std::sync::mpsc::Receiver<()>>,
+    written: Arc<AtomicUsize>,
+}
+#[cfg(unix)]
+impl Write for SocketWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if bytes.len() > 64 << 10 {
+            if let Some(entered) = self.entered.take() {
+                entered.send(()).unwrap();
+                if let Some(release) = self.before_payload.take() {
+                    release
+                        .recv_timeout(Duration::from_secs(5))
+                        .map_err(|e| io::Error::new(io::ErrorKind::TimedOut, e.to_string()))?;
+                }
+            }
+        }
+        let n = self.socket.write(bytes)?;
+        self.written.fetch_add(n, Ordering::Relaxed);
+        Ok(n)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.socket.flush()
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn a_socket_draining_at_one_kib_per_second_does_not_own_the_next_model_request() {
+    let (mut client, socket) = bounded_sockets();
+    let slow = Arc::new(AtomicBool::new(true));
+    let read_slow = Arc::clone(&slow);
+    let reader = std::thread::spawn(move || {
+        let mut buf = [0; 1024];
+        let mut total = 0;
+        loop {
+            let n = client.read(&mut buf).unwrap();
+            if n == 0 {
+                return total;
+            }
+            total += n;
+            if read_slow.load(Ordering::Acquire) {
+                std::thread::sleep(Duration::from_secs(1));
+            }
+        }
+    });
+    let (entered, blocked_rx) = std::sync::mpsc::channel();
+    let written = Arc::new(AtomicUsize::new(0));
+    let sent = Arc::clone(&written);
+    let mut incomplete = false;
+    let mut received = 0;
+    assert_continuation_during_drain(
+        Case::LongReply,
+        move || {
+            Ok(ChunkedWriter {
+                w: Box::new(SocketWriter {
+                    socket,
+                    entered: Some(entered),
+                    before_payload: None,
+                    written: sent,
+                }),
+            })
+        },
+        blocked_rx,
+        || {
+            incomplete = written.load(Ordering::Relaxed) < 1 << 18;
+            slow.store(false, Ordering::Release);
+            received = reader.join().unwrap();
+        },
+        false,
+    );
+    assert!(
+        incomplete,
+        "the whole response fit before the slow-socket witness"
+    );
+    assert!(received > 1 << 18, "response and trailer actually drained");
+}
+
+#[test]
+fn a_full_response_budget_refuses_the_actual_http_route_before_model_execution() {
+    use std::net::TcpStream;
+    // The operator's count override; memory admission is its own test.
+    const OVERRIDE: usize = 8;
+    let mut shared = scripted_shared(Case::CompleteMarker);
+    Arc::get_mut(&mut shared).unwrap().responses = ResponseContexts::with_memory(
+        crate::options::ServerResponseConfig {
+            contexts: Some(OVERRIDE),
+            ..Default::default()
+        },
+        ResponseMemory::Off,
+    );
+    let held: Vec<_> = (0..OVERRIDE)
+        .map(|_| shared.responses.try_take(0).unwrap())
+        .collect();
+    let tiny_http::ListenAddr::IP(address) = shared.server.server_addr() else {
+        panic!("IP test listener")
+    };
+    let mut client = TcpStream::connect(address).unwrap();
+    client
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let body = r#"{"prompt":"not executed","max_tokens":1}"#;
+    write!(client, "POST /v1/completions HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}", body.len()).unwrap();
+    let request = shared
+        .server
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap()
+        .unwrap();
+    handle_model_request(&shared, "/v1/completions", request, FirstToken::default()).unwrap();
+    let mut response = String::new();
+    client.read_to_string(&mut response).unwrap();
+    assert!(response.starts_with("HTTP/1.1 503"), "{response}");
+    assert!(
+        response.contains("response contexts are in flight"),
+        "{response}"
+    );
+    assert!(
+        response.to_ascii_lowercase().contains("retry-after: 1\r\n"),
+        "{response}"
+    );
+    assert!(
+        shared.turns.try_take().is_some(),
+        "refused request left no model ticket"
+    );
+    assert_eq!(shared.responses.json()["overload"]["contexts"], 1);
+    assert_eq!(shared.responses.active.load(Ordering::Relaxed), OVERRIDE);
+    drop(held);
+    assert_eq!(shared.responses.active.load(Ordering::Relaxed), 0);
+}
+
+#[test]
+#[cfg(unix)]
+fn a_disconnect_during_socket_drain_keeps_the_published_reference_continuable() {
+    let (client, socket) = bounded_sockets();
+    let (entered, blocked_rx) = std::sync::mpsc::channel();
+    let (release, wait_release) = std::sync::mpsc::channel();
+    assert_continuation_during_drain(
+        Case::LongReply,
+        move || {
+            Ok(ChunkedWriter {
+                w: Box::new(SocketWriter {
+                    socket,
+                    entered: Some(entered),
+                    before_payload: Some(wait_release),
+                    written: Arc::new(AtomicUsize::new(0)),
+                }),
+            })
+        },
+        blocked_rx,
+        || {
+            client.shutdown(std::net::Shutdown::Both).unwrap();
+            drop(client);
+            release.send(()).unwrap();
+        },
+        true,
+    );
+}
+
+// Decision 59: stored fields preserve the full hook-accepted reply, independently
+// of later socket failure. The old omission reproducer is retained separately
+// in tests/frontier-baseline-control.patch, not asserted as the new contract.
+#[test]
+fn an_earlier_write_failure_keeps_the_full_accepted_session_reply() {
+    struct FailAfterDecode(Writer);
+    impl Write for FailAfterDecode {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0.write(bytes)
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            if std::str::from_utf8(&self.0.pending)
+                .unwrap()
+                .contains("\"reasoning_content\":\"a\"")
+            {
+                let (lock, changed) = &*self.0.progress.0;
+                let mut wire = lock.lock();
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while !wire.decoded {
+                    assert!(
+                        Instant::now() < deadline,
+                        "accepted generation did not finish"
+                    );
+                    changed.wait_for(&mut wire, Duration::from_millis(2));
+                }
+            }
+            self.0.flush()
+        }
+    }
+    let progress = Progress::default();
+    let shared = scripted_shared_with_progress(Case::PartialTail, progress.clone());
+    let reply = chat_completions(
+        &shared,
+        &json!({"messages":[{"role":"user","content":"first"}],
+                "stream":true,"store":true,"max_tokens":3}),
+        None,
+    )
+    .ok()
+    .expect("stored request");
+    let Reply::Stream(run) = reply else {
+        panic!("stream requested")
+    };
+    let id = run.id.clone();
+    let error = stream_response_with_writer(&shared, *run, || {
+        Ok(ChunkedWriter {
+            w: Box::new(FailAfterDecode(Writer {
+                progress,
+                pending: Vec::new(),
+                fail_delta: Some(json!({"reasoning_content":"a"})),
+            })),
+        })
+    })
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("scripted tail write"), "{error}");
+    let front = shared
+        .front
+        .reply("a</thi")
+        .expect("full accepted raw frontier");
+    assert_eq!(front.text, "a</thi");
+    assert_eq!(front.ids, vec![97]);
+    assert_eq!(front.partial, 5);
+    let resolved = shared
+        .sessions
+        .lock()
+        .resolve(&id, None, true, Instant::now())
+        .unwrap();
+    let message = message_values(resolved.messages.unwrap()).pop().unwrap();
+    eprintln!(
+        "EARLY_WRITE_FAILURE accepted={} session={message}",
+        front.text
+    );
+    assert_eq!(message["reasoning_content"], "a</thi");
+    let delivery: Value = serde_json::from_str(error.split_once("; frontier ").unwrap().1).unwrap();
+    assert_eq!(delivery["delivered_bytes"], 6, "raw hook-accepted bytes");
+    assert_eq!(
+        delivery["written_bytes"], 0,
+        "the earlier text event failed"
+    );
+    assert_eq!(delivery["write_failed"], true);
+    assert_eq!(shared.responses.json()["pre_trailer_write_errors"], 1);
+    let continued = chat_completions(
+        &shared,
+        &json!({"previous_response_id":id,"input":"continue","stream":true,"max_tokens":3}),
+        None,
+    )
+    .ok()
+    .expect("accepted reply remains continuable after socket error");
+    let Reply::Stream(continued) = continued else {
+        panic!("stream requested")
+    };
+    assert!(
+        continued.facts.spliced.bound > 0,
+        "reply still binds by its ID"
+    );
+}
+
+// This is the served Err/publication boundary, not a native GPU fault or a
+// retirement/recovery certificate. The native gate remains separately owed.
+#[test]
+fn a_late_decode_error_publishes_no_session_and_no_success_trailer() {
+    let progress = Progress::default();
+    let shared = scripted_shared_with_progress(Case::LateFailure, progress.clone());
+    let turn = shared.turns.take();
+    let reply = chat_completions(
+        &shared,
+        &json!({"messages":[{"role":"user","content":"first"}],
+                "stream":true,"store":true,"max_tokens":3}),
+        None,
+    )
+    .ok()
+    .expect("stored request");
+    let Reply::Stream(run) = reply else {
+        panic!("stream requested")
+    };
+    let id = run.id.clone();
+    let mut settled = false;
+    let error = stream_response_settlement(
+        &shared,
+        *run,
+        || {
+            Ok(ChunkedWriter {
+                w: Box::new(Writer {
+                    progress: progress.clone(),
+                    pending: Vec::new(),
+                    fail_delta: None,
+                }),
+            })
+        },
+        || {
+            drop(turn);
+            settled = true;
+        },
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("scripted late decode failure"), "{error}");
+    assert!(settled);
+    assert!(
+        shared.turns.try_take().is_some(),
+        "failed run released model FIFO"
+    );
+    assert!(
+        shared.front.reply("a</think>X").is_none(),
+        "failed decode is not a published reply"
+    );
+    assert!(
+        shared
+            .sessions
+            .lock()
+            .resolve(&id, None, true, Instant::now())
+            .is_err(),
+        "failed run's reserved ID is not continuable"
+    );
+    let (lock, _) = &*progress.0;
+    let wire = lock.lock();
+    let bytes = std::str::from_utf8(&wire.committed).unwrap();
+    assert!(bytes.contains("scripted late decode failure"));
+    assert!(!bytes.contains("[DONE]"));
+    assert!(wire.events.iter().all(|e| e.get("timings").is_none()));
+    assert_eq!(wire.model_entries, 1);
+    assert!(wire.decoded, "fault really follows accepted generation");
+}
+
+#[test]
+fn a_refused_whole_fragment_cannot_enter_the_raw_frontier_or_stored_message() {
+    let progress = Progress::default();
+    let shared = scripted_shared_with_progress(Case::BacklogRefusal, progress.clone());
+    let reply = chat_completions(
+        &shared,
+        &json!({"messages":[{"role":"user","content":"first"}],
+                "stream":true,"store":true,"max_tokens":MAX_RESPONSE_BACKLOG + 2}),
+        None,
+    )
+    .ok()
+    .expect("stored request");
+    let Reply::Stream(run) = reply else {
+        panic!("stream requested")
+    };
+    let id = run.id.clone();
+    stream_response_with_writer(&shared, *run, || {
+        Ok(ChunkedWriter {
+            w: Box::new(Writer {
+                progress: progress.clone(),
+                pending: Vec::new(),
+                fail_delta: None,
+            }),
+        })
+    })
+    .unwrap();
+    let front = shared.front.reply("a").expect("accepted prefix only");
+    assert_eq!(front.text, "a");
+    assert_eq!(front.ids, vec![97]);
+    assert_eq!(front.partial, 0);
+    let resolved = shared
+        .sessions
+        .lock()
+        .resolve(&id, None, true, Instant::now())
+        .unwrap();
+    let message = message_values(resolved.messages.unwrap()).pop().unwrap();
+    assert_eq!(message["reasoning_content"], "a");
+    assert_eq!(message["content"], "");
+    let (lock, _) = &*progress.0;
+    let wire = lock.lock();
+    let last = wire
+        .events
+        .iter()
+        .find(|e| e.get("timings").is_some())
+        .unwrap();
+    assert_eq!(last["choices"][0]["finish_reason"], "cancelled");
+    assert_eq!(last["usage"]["completion_tokens"], 1);
+    assert_eq!(last["timings"]["response_backlog_limit"], true);
+    assert_eq!(shared.responses.json()["overload"]["unresolved_bytes"], 1);
+    assert_eq!(last["timings"]["frontier"]["delivered_bytes"], 1);
+    assert_eq!(last["timings"]["frontier"]["written_bytes"], 1);
+    assert_eq!(last["timings"]["frontier"]["write_failed"], false);
+    assert!(std::str::from_utf8(&wire.committed)
+        .unwrap()
+        .contains("[DONE]"));
+}
+
+#[test]
+fn checked_metadata_is_captured_before_publication_but_its_error_is_deferred() {
+    for stream in [false, true] {
+        let progress = Progress::default();
+        let shared = scripted_shared_with_progress(Case::LateMetadataFailure, progress.clone());
+        progress.0 .0.lock().metadata_before_publication = Some(Arc::downgrade(&shared));
+        let built = chat_completions(
+            &shared,
+            &json!({"messages":[{"role":"user","content":"first"}],"stream":stream,"store":true,"max_tokens":3}),
+            None,
+        );
+        if stream {
+            let Reply::Stream(run) = built.ok().expect("stream builds before decode") else {
+                panic!("stream requested")
+            };
+            let id = run.id.clone();
+            let error = stream_response_with_writer(&shared, *run, || {
+                Ok(ChunkedWriter {
+                    w: Box::new(Writer {
+                        progress: progress.clone(),
+                        pending: Vec::new(),
+                        fail_delta: None,
+                    }),
+                })
+            })
+            .unwrap_err()
+            .to_string();
+            assert!(
+                error.contains("scripted checked metadata refusal"),
+                "{error}"
+            );
+            let saved = shared
+                .sessions
+                .lock()
+                .resolve(&id, None, true, Instant::now())
+                .unwrap();
+            let message = message_values(saved.messages.unwrap()).pop().unwrap();
+            assert_eq!(message["reasoning_content"], "a");
+            assert_eq!(message["content"], "X");
+            let wire = progress.0 .0.lock();
+            assert!(std::str::from_utf8(&wire.committed)
+                .unwrap()
+                .contains("scripted checked metadata refusal"));
+            assert!(!std::str::from_utf8(&wire.committed)
+                .unwrap()
+                .contains("[DONE]"));
+            assert!(wire.events.iter().all(|e| e.get("timings").is_none()));
+        } else {
+            let Err(Failure::Internal(error)) = built else {
+                panic!("checked metadata error is deferred until after publication")
+            };
+            assert!(error
+                .to_string()
+                .contains("scripted checked metadata refusal"));
+        }
+        assert_eq!(
+            shared.sessions.lock().json()["turns"],
+            1,
+            "captured Err does not erase accepted lineage"
+        );
+        assert_eq!(shared.front.reply("a</think>X").unwrap().text, "a</think>X");
+        assert_eq!(progress.0 .0.lock().metadata_calls, 1);
+    }
 }
 
 // Same size-line/dechunk traversal as tiny_chat_e2e.rs's streamed-content
@@ -966,3 +1902,326 @@ fn chat_pre_token_refusal_emits_sse_error_and_next_request_succeeds() {
         }),
     );
 }
+
+#[test]
+fn stream_timing_brackets_exclude_socket_drain_from_decode_pace() {
+    let shared = scripted_shared(Case::CompleteMarker);
+    let split = reasoning::Reasoning::for_chat(shared.engine.as_ref(), &[], false)
+        .unwrap()
+        .map(ParkingMutex::new);
+    assert!(
+        split.is_some(),
+        "timing fixture uses the production typed observer seam"
+    );
+    let mut decoded = run_decode_observed(
+        shared.engine.as_ref(),
+        &[],
+        &[],
+        &DecodeParams::default(),
+        split.as_ref(),
+        &mut |_| true,
+    )
+    .unwrap();
+    decoded.stats.prefill_ns = 2_000_000;
+    let times = StreamTimes {
+        decode: Duration::from_millis(10),
+        settled: Duration::from_millis(12),
+        total: Duration::from_millis(1012),
+    };
+    let report = stream_timings(
+        shared.engine.as_ref(),
+        3,
+        &PromptFacts::default(),
+        &decoded,
+        times,
+    );
+    assert_eq!(report["total_ms"], 1012.0);
+    assert_eq!(report["decode_call_ms"], 10.0);
+    assert_eq!(report["response_settlement_ms"], 2.0);
+    assert_eq!(report["response_drain_ms"], 1000.0);
+    assert_eq!(report["predicted_ms"], 8.0);
+    assert_eq!(report["predicted_per_second"], 375.0);
+    decoded.stats.step_ns = vec![1_000_000, 2_000_000];
+    let explicit = stream_timings(
+        shared.engine.as_ref(),
+        3,
+        &PromptFacts::default(),
+        &decoded,
+        times,
+    );
+    assert_eq!(
+        explicit["predicted_ms"], 3.0,
+        "explicit step clocks remain authoritative"
+    );
+    assert_eq!(explicit["total_ms"], 1012.0);
+}
+
+// Shared deterministic I/O barrier; no device/model construction here.
+pub(super) mod held_writer {
+    use super::*;
+    pub(crate) struct PausedWriter {
+        pub(crate) entered: Option<std::sync::mpsc::Sender<()>>,
+        pub(crate) released: std::sync::mpsc::Receiver<()>,
+        pub(crate) bytes: Arc<ParkingMutex<Vec<u8>>>,
+        pub(crate) late_failure: bool,
+        pub(crate) max_pause: Duration,
+    }
+    impl Write for PausedWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.bytes.lock().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            if let Some(entered) = self.entered.take() {
+                entered.send(()).unwrap();
+                self.released
+                    .recv_timeout(self.max_pause)
+                    .map_err(|e| io::Error::new(io::ErrorKind::TimedOut, e.to_string()))?;
+                if self.late_failure {
+                    return Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "late A writer rejection",
+                    ));
+                }
+            }
+            Ok(())
+        }
+    }
+    pub(crate) struct Cleanup {
+        pub(crate) release: Option<std::sync::mpsc::Sender<()>>,
+        pub(crate) thread: Option<std::thread::JoinHandle<Result<()>>>,
+    }
+    impl Cleanup {
+        pub(crate) fn finish(&mut self) -> Result<()> {
+            self.release
+                .take()
+                .unwrap()
+                .send(())
+                .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+            self.thread
+                .take()
+                .unwrap()
+                .join()
+                .map_err(|_| anyhow::anyhow!("A response thread panicked"))?
+        }
+    }
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            if let Some(release) = self.release.take() {
+                let _ = release.send(());
+            }
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+        }
+    }
+}
+
+#[test]
+fn delayed_a_completion_cannot_rewrite_published_b_or_distinct_c_residency() {
+    assert_delayed_a_publication_custody(false);
+}
+
+#[test]
+fn late_a_writer_failure_cannot_rewrite_published_b_or_distinct_c_residency() {
+    assert_delayed_a_publication_custody(true);
+}
+
+fn assert_delayed_a_publication_custody(late_failure: bool) {
+    use held_writer::{Cleanup, PausedWriter};
+    fn publish(shared: &Shared, body: Value) -> String {
+        let turn = shared.turns.take();
+        let Reply::Stream(run) = chat_completions(shared, &body, None)
+            .ok()
+            .expect("request built")
+        else {
+            panic!("stream requested")
+        };
+        if body.get("previous_response_id").is_some() {
+            assert!(run.facts.spliced.bound > 0, "B binds A by its response ID");
+        }
+        let id = run.id.clone();
+        stream_response_settlement(
+            shared,
+            *run,
+            || {
+                Ok(ChunkedWriter {
+                    w: Box::new(std::io::sink()),
+                })
+            },
+            || drop(turn),
+        )
+        .unwrap();
+        id
+    }
+    let shared = scripted_shared(Case::CompleteMarker);
+    let bytes = Arc::new(ParkingMutex::new(Vec::new()));
+    let (entered, entry) = std::sync::mpsc::channel();
+    let (release, released) = std::sync::mpsc::channel();
+    let (sent_id, got_id) = std::sync::mpsc::channel();
+    let (settled, got_settled) = std::sync::mpsc::channel();
+    let first_shared = shared.clone();
+    let first_bytes = bytes.clone();
+    let first = std::thread::spawn(move || {
+        let turn = first_shared.turns.take();
+        let Reply::Stream(run) = chat_completions(&first_shared,
+            &json!({"messages":[{"role":"user","content":"A"}],"stream":true,"store":true,"max_tokens":3}), None)
+            .ok().expect("A built") else { panic!("stream requested") };
+        sent_id.send(run.id.clone()).unwrap();
+        stream_response_settlement(
+            &first_shared,
+            *run,
+            || {
+                Ok(ChunkedWriter {
+                    w: Box::new(PausedWriter {
+                        entered: Some(entered),
+                        released,
+                        bytes: first_bytes,
+                        late_failure,
+                        max_pause: Duration::from_secs(5),
+                    }),
+                })
+            },
+            || {
+                drop(turn);
+                settled.send(()).unwrap();
+            },
+        )
+    });
+    let mut cleanup = Cleanup {
+        release: Some(release),
+        thread: Some(first),
+    };
+    let id_a = got_id.recv_timeout(Duration::from_secs(5)).unwrap();
+    entry.recv_timeout(Duration::from_secs(5)).unwrap();
+    got_settled.recv_timeout(Duration::from_secs(5)).unwrap();
+    let id_b = publish(
+        &shared,
+        json!({"previous_response_id":id_a.clone(),"input":"B","stream":true,"max_tokens":3}),
+    );
+    let id_c = publish(
+        &shared,
+        json!({"messages":[{"role":"user","content":"independent C"}],"stream":true,"store":true,"max_tokens":3}),
+    );
+    let before_b = shared
+        .sessions
+        .lock()
+        .resolve(&id_b, None, true, Instant::now())
+        .unwrap();
+    let before_c = shared
+        .sessions
+        .lock()
+        .resolve(&id_c, None, true, Instant::now())
+        .unwrap();
+    assert_ne!(before_b.key, before_c.key, "C is a distinct lineage");
+    assert_eq!(before_b.resident, Some(false));
+    assert_eq!(before_c.resident, Some(true));
+    let b_messages = message_values(before_b.messages.unwrap());
+    let c_messages = message_values(before_c.messages.unwrap());
+    assert_eq!(b_messages.len(), 4);
+    assert_eq!(c_messages.len(), 2);
+    for message in [b_messages.last().unwrap(), c_messages.last().unwrap()] {
+        assert_eq!(message["reasoning_content"], "a");
+        assert_eq!(message["content"], "X");
+    }
+    let finished = cleanup.finish();
+    if late_failure {
+        let error = finished.unwrap_err().to_string();
+        assert!(error.contains("late A writer rejection"), "{error}");
+        let (_, frontier) = error
+            .split_once("; frontier ")
+            .expect("transport refusal names its frontier");
+        let frontier: Value = serde_json::from_str(frontier).unwrap();
+        assert_eq!(frontier["write_failed"], true);
+        assert_eq!(frontier["written_bytes"], 0);
+        assert_eq!(
+            shared
+                .responses
+                .pre_trailer_write_errors
+                .load(Ordering::Relaxed),
+            1
+        );
+    } else {
+        finished.unwrap();
+        assert_eq!(
+            shared
+                .responses
+                .pre_trailer_write_errors
+                .load(Ordering::Relaxed),
+            0
+        );
+    }
+    let after_b = shared
+        .sessions
+        .lock()
+        .resolve(&id_b, None, true, Instant::now())
+        .unwrap();
+    let after_c = shared
+        .sessions
+        .lock()
+        .resolve(&id_c, None, true, Instant::now())
+        .unwrap();
+    assert_eq!(message_values(after_b.messages.unwrap()), b_messages);
+    assert_eq!(message_values(after_c.messages.unwrap()), c_messages);
+    assert_eq!(after_b.ids, before_b.ids);
+    assert_eq!(after_c.ids, before_c.ids);
+    assert_eq!(after_b.resident, Some(false));
+    assert_eq!(
+        after_c.resident,
+        Some(true),
+        "late A drain cannot overwrite C's occupant witness"
+    );
+    let wire = String::from_utf8(bytes.lock().clone()).unwrap();
+    let events: Vec<Value> = wire
+        .split("data: ")
+        .skip(1)
+        .filter_map(|s| {
+            let payload = s.split_once("\n\n").unwrap().0;
+            (payload != "[DONE]").then(|| serde_json::from_str(payload).unwrap())
+        })
+        .collect();
+    if late_failure {
+        assert!(!events.is_empty(), "the rejected role event was attempted");
+        assert!(
+            events.iter().all(|e| e.get("timings").is_none()),
+            "failed A carries no success timings"
+        );
+        assert!(!wire.contains("[DONE]"));
+        assert!(
+            events.iter().all(|e| e["id"] == id_a),
+            "A's partial wire keeps A's immutable ID"
+        );
+        eprintln!("BRANCH_CUSTODY late_a_failure=true saved_b_messages={} saved_c_messages={} c_resident_after_a=true", b_messages.len(), c_messages.len());
+        return;
+    }
+    let last = events.iter().find(|e| e.get("timings").is_some()).unwrap();
+    assert_eq!(last["id"], id_a);
+    assert_eq!(
+        last["timings"]["session"]["id"], id_a,
+        "A's wire metadata remains A's captured publication"
+    );
+    let t = &last["timings"];
+    let total = t["total_ms"].as_f64().unwrap();
+    let decode = t["decode_call_ms"].as_f64().unwrap();
+    let capture = t["response_settlement_ms"].as_f64().unwrap();
+    let drain = t["response_drain_ms"].as_f64().unwrap();
+    assert!(
+        drain > 0.0,
+        "the held writer remains in the endpoint bracket"
+    );
+    assert!((total - (decode + capture + drain)).abs() < 1e-6);
+    assert!(wire.contains("[DONE]"));
+    eprintln!(
+        "BRANCH_CUSTODY saved_b_messages={} saved_c_messages={} c_resident_after_a=true",
+        b_messages.len(),
+        c_messages.len()
+    );
+}
+
+// Host-only integrated cancellation/client-observed-ID boundary controls.
+#[path = "serve_continuation_boundary_tests.rs"]
+mod continuation_boundary_tests;
+
+// Response-context admission and the reasoning machine at the HTTP boundary.
+#[path = "serve_response_contexts_tests.rs"]
+mod response_contexts_tests;

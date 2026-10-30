@@ -45,7 +45,8 @@ pub use eos_gate::{call_argmax_publish, call_eos_gate, call_ring_stamp, call_wor
 pub use eos_index::call_eos_index;
 pub use fill::*;
 pub use flash_decoding::{
-    call_flash_decoding, flash_admits_its_widths, flash_chunk_count, ChunkTable, FlashDType,
+    call_flash_decoding, flash_admits_its_widths, flash_chunk_count, flash_one_chunk_rows,
+    ChunkTable, FlashDType,
     FlashKernel, FLASH_COMBINE_THREADS, FLASH_F32_HEAD_DIMS, FLASH_HEAD_DIMS, FLASH_PARTIAL_WIDTHS,
     FLASH_SINGLE_THREADS,
 };

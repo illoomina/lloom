@@ -5625,62 +5625,7 @@ mod request_processors_tests {
 mod delivered_field_tests {
     use super::*;
 
-    use std::alloc::{GlobalAlloc, Layout, System};
-    use std::cell::Cell;
-
-    thread_local! {
-        static REQUESTED: Cell<Option<usize>> = const { Cell::new(None) };
-    }
-    struct Counter;
-    #[global_allocator]
-    static ALLOCATOR: Counter = Counter;
-
-    fn record(bytes: usize) {
-        let _ = REQUESTED.try_with(|count| {
-            if let Some(previous) = count.get() {
-                count.set(Some(previous.saturating_add(bytes)));
-            }
-        });
-    }
-    // SAFETY: allocation/deallocation are forwarded unchanged to System;
-    // the optional thread-local scalar never dereferences allocator pointers.
-    unsafe impl GlobalAlloc for Counter {
-        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-            record(layout.size());
-            // SAFETY: the caller's allocator layout is forwarded unchanged.
-            unsafe { System.alloc(layout) }
-        }
-        unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-            record(layout.size());
-            // SAFETY: the caller's allocator layout is forwarded unchanged.
-            unsafe { System.alloc_zeroed(layout) }
-        }
-        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, size: usize) -> *mut u8 {
-            record(size);
-            // SAFETY: the caller's live allocation/layout/size are forwarded.
-            unsafe { System.realloc(ptr, layout, size) }
-        }
-        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-            // SAFETY: the caller's allocation and its layout are forwarded.
-            unsafe { System.dealloc(ptr, layout) }
-        }
-    }
-    pub(super) fn counted<T>(run: impl FnOnce() -> T) -> (T, usize) {
-        struct Reset;
-        impl Drop for Reset {
-            fn drop(&mut self) {
-                REQUESTED.with(|count| count.set(None));
-            }
-        }
-        REQUESTED.with(|count| {
-            assert!(count.get().is_none());
-            count.set(Some(0));
-        });
-        let _reset = Reset;
-        let result = run();
-        let bytes = REQUESTED.with(|count| count.get().unwrap());
-        (result, bytes)
-    }
+    pub(super) use crate::app::test_alloc::counted;
 
     #[test]
     fn the_accumulator_allocation_counter_observes_a_known_allocation() {

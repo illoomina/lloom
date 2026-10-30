@@ -918,6 +918,8 @@ pub fn main_serve_compat(mut argv: Vec<String>) -> Result<()> {
 #[cfg(test)]
 mod frontend_tests;
 #[cfg(test)]
+mod test_alloc;
+#[cfg(test)]
 mod option_acceptance_tests;
 #[cfg(test)]
 mod spellings_tests;

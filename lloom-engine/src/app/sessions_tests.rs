@@ -922,32 +922,7 @@ fn an_oversize_stored_session_declines_retention() {
 }
 
 mod allocation_receipt {
-    use std::alloc::{GlobalAlloc, Layout, System};
-    use std::sync::atomic::{AtomicIsize, AtomicUsize, Ordering};
-    pub static ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
-    pub static LIVE: AtomicIsize = AtomicIsize::new(0);
-    pub static BLOCKS: AtomicIsize = AtomicIsize::new(0);
-    pub struct Allocator;
-    // SAFETY: every allocation/deallocation is forwarded unchanged to System;
-    // the counter observes requested live allocation bytes only.
-    unsafe impl GlobalAlloc for Allocator {
-        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-            let ptr = unsafe { System.alloc(layout) };
-            if !ptr.is_null() {
-                ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
-                BLOCKS.fetch_add(1, Ordering::Relaxed);
-                LIVE.fetch_add(layout.size() as isize, Ordering::Relaxed);
-            }
-            ptr
-        }
-        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-            LIVE.fetch_sub(layout.size() as isize, Ordering::Relaxed);
-            BLOCKS.fetch_sub(1, Ordering::Relaxed);
-            unsafe { System.dealloc(ptr, layout) };
-        }
-    }
-    #[global_allocator]
-    static ALLOCATOR: Allocator = Allocator;
+    pub use crate::app::test_alloc::{ALLOCATIONS, BLOCKS, LIVE};
 }
 
 #[test]

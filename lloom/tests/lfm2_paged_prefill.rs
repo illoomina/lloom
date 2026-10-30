@@ -22,6 +22,18 @@ fn is_index_select_pipeline(label: &str, dtype: DType) -> bool {
     label == name || label.strip_suffix("_packed") == Some(name)
 }
 
+// Two attention layers, the first followed by conv and attention: the last
+// position reads earlier positions' attention outputs, so the logits see the
+// mask inside a continuation tile. With attention only as the last layer the
+// last query reads every key whatever the mask, and nothing reads the rest.
+fn tiny(head_dim: usize) -> Config {
+    let mut tiny = Lfm2Tiny::template();
+    tiny.hidden_size = tiny.num_attention_heads * head_dim;
+    tiny.num_hidden_layers = 6;
+    tiny.layer_types = Config::tiny_layer_types(6);
+    tiny
+}
+
 fn run<P: Shape>(
     fixture: &Fixture<Lfm2Tiny>,
     cfg: &Config,
@@ -118,9 +130,7 @@ fn check_shape_layout(
     // constructing any Metal device, as its switch is read once.
     std::env::set_var("CANDLE_METAL_PROFILE", "1");
     let dev = Device::new_metal(0)?;
-    let mut tiny = Lfm2Tiny::template();
-    tiny.hidden_size = tiny.num_attention_heads * head_dim;
-    let Some(fixture) = Fixture::<Lfm2Tiny>::new("lfm2_paged_prefill", tiny)? else {
+    let Some(fixture) = Fixture::<Lfm2Tiny>::new("lfm2_paged_prefill", tiny(head_dim))? else {
         return Ok(());
     };
     let cfg = fixture.config(|cfg| {
@@ -336,9 +346,7 @@ fn explicit_paged_verify_matches_in_place_and_preserves_next_step() -> Result<()
     assert!(lloom::tuning::install(tuning).is_ok());
     std::env::set_var("CANDLE_METAL_PROFILE", "1");
     let dev = Device::new_metal(0)?;
-    let mut tiny = Lfm2Tiny::template();
-    tiny.hidden_size = tiny.num_attention_heads * 64;
-    let Some(fixture) = Fixture::<Lfm2Tiny>::new("lfm2_paged_prefill_verify", tiny)? else {
+    let Some(fixture) = Fixture::<Lfm2Tiny>::new("lfm2_paged_prefill_verify", tiny(64))? else {
         return Ok(());
     };
     for layout in [QkvLayout::Contiguous, QkvLayout::Fused] {

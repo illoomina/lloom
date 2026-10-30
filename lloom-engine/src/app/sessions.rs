@@ -375,6 +375,9 @@ pub struct PreparedRecord {
 impl PreparedRecord {
     pub fn new(rec: Record) -> serde_json::Result<Self> {
         let mut ids = rec.prompt_ids;
+        // The session keeps these ids until its next turn: growing them by
+        // doubling would retain (and charge) up to the prompt's size again.
+        ids.reserve_exact(rec.reply.ids.len() + usize::from(rec.eot.is_some()));
         ids.extend_from_slice(&rec.reply.ids);
         ids.extend(rec.eot);
         let msg_len = rec.messages.len();

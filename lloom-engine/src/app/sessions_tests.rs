@@ -1295,6 +1295,31 @@ fn a_turn_is_prepared_before_the_table_lock_and_its_old_history_freed_after() {
     assert_charge(&table.lock());
 }
 
+/// A turn's ids are the prompt's, the reply's and the end-of-turn id, kept
+/// until the next turn: from an exactly sized prompt they hold no growth
+/// slack, so the charge is their bytes rather than up to twice them.
+#[test]
+fn a_prepared_record_keeps_no_growth_slack_in_its_ids() {
+    let prompt: Vec<u32> = (0..1000).collect();
+    assert_eq!(prompt.capacity(), prompt.len());
+    let prepared = PreparedRecord::new(Record {
+        messages: vec![json!({"role": "user", "content": "q"})],
+        reply_msg: json!({"role": "assistant", "content": "r"}),
+        prompt_ids: prompt,
+        reply: reply(&[1, 2, 3]),
+        eot: Some(9),
+        scope: Scope::test(1),
+        prefix: None,
+    })
+    .unwrap();
+    assert_eq!(prepared.ids.len(), 1004);
+    assert_eq!(
+        prepared.ids.capacity(),
+        prepared.ids.len(),
+        "the session's ids keep growth slack"
+    );
+}
+
 /// One stored session's retention charge by conversation length, beside the
 /// charge the stored-logical policy made before it (ids at 4 bytes each,
 /// messages at their JSON size), through the production accounting: the

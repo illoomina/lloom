@@ -957,6 +957,9 @@ impl<'m, M: BatchedCausalLM, R: BorrowMut<Session<'m, M>>> BatchDecoder<'m, M, R
                 let input = Tensor::new(unit, &device)?.unsqueeze(0)?;
                 s.model.prepare_pass(&mut s.seq.cache, w)?;
                 self.pacer.before_forward(&device)?;
+                // Only the last tile's logits are kept; an earlier tile's,
+                // held across this pass, would be an undeclared escape (§26).
+                drop(last.take());
                 let pass = OpenPass::begin(
                     &device,
                     PassShape::Prefill {

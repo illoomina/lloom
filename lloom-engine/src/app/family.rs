@@ -155,6 +155,7 @@ pub trait Family: Send + Sync {
 }
 
 pub struct Lfm2Family;
+pub struct Lfm2MoeFamily;
 pub struct Qwen4ExpFamily;
 pub struct Qwen3_5Family;
 pub struct Lfm2GgufFamily;
@@ -180,6 +181,20 @@ pub const LFM2_CAPABILITIES: Capabilities = Capabilities {
     vision_missing: "",
     eos_gate: true,
     eos_gate_missing: "",
+};
+
+/// Optional source-checkpoint port: same LFM engine, without borrowing
+/// dense LFM's validation claims for routed kernels and executor arms.
+pub const LFM2_MOE_CAPABILITIES: Capabilities = Capabilities {
+    family: "lfm2_moe",
+    speculation: &[],
+    vision: false,
+    vision_missing: "the LFM2 MoE port is text-only",
+    executor_arms: false,
+    eos_gate: false,
+    eos_gate_missing: "the reused routed expert kernels carry no EOS-gated variant; native EOS/recovery acceptance remains unrun",
+    rewind: "existing LFM state/recovery wiring; MoE acceptance remains unrun",
+    ..LFM2_CAPABILITIES
 };
 
 pub const QWEN4EXP_CAPABILITIES: Capabilities = Capabilities {
@@ -227,7 +242,7 @@ pub const QWEN3_5_CAPABILITIES: Capabilities = Capabilities {
     vision: false,
     vision_missing: "no vision tower is built for Qwen3.5 (the text path only; its tower is #765's lineage)",
     eos_gate: false,
-    eos_gate_missing: "an arm here until its real-model gates are run (`models.qwen3_5.eos_gate`, #993's arm B); the standing window undoes the fixed cadence's forward instead",
+    eos_gate_missing: "the `models.qwen3_5.eos_gate` arm is off (chat and serve turn it on on Metal); without it the standing window undoes one forward past an EOS, and a deeper overrun is put back at a turn checkpoint, or the session reset",
 };
 
 /// Qwen3.5's capabilities with the EOS gate as the `models.qwen3_5.eos_gate`
@@ -243,7 +258,8 @@ pub fn qwen3_5_capabilities(eos_gate_arm: bool) -> Capabilities {
 /// Every family, in detection order: the GGUF families read the header's
 /// `general.architecture`, so their order does not matter; LFM2 is a
 /// directory with a `config.json`.
-pub static FAMILIES: [&dyn Family; 4] = [
+pub static FAMILIES: [&dyn Family; 5] = [
+    &Lfm2MoeFamily,
     &Lfm2Family,
     &Qwen3_5Family,
     &Lfm2GgufFamily,
@@ -491,6 +507,32 @@ impl Family for Lfm2Family {
             decision_ragged: shape.decision_ragged,
             text_only: model.text_only,
         })
+    }
+}
+
+/// The distinct format/capability identity resolves before auto-speculation
+/// and EOS clamping. Construction and every consumer remain on Lfm2Family's
+/// engine; this is not another decoder or served owner.
+impl Family for Lfm2MoeFamily {
+    fn name(&self) -> &'static str {
+        "lfm2_moe"
+    }
+    fn detect(&self, path: &Path) -> Option<PathBuf> {
+        let root: Value =
+            serde_json::from_slice(&std::fs::read(path.join("config.json")).ok()?).ok()?;
+        (root.get("model_type").and_then(Value::as_str) == Some("lfm2_moe"))
+            .then(|| path.to_path_buf())
+    }
+    fn capabilities(&self) -> Capabilities {
+        LFM2_MOE_CAPABILITIES
+    }
+    fn resolve(&self, req: &Requested<'_>) -> Result<()> {
+        resolve_common(&LFM2_MOE_CAPABILITIES, req)?;
+        // Reuse LFM's cache/rows/prefix checks rather than copying them.
+        Lfm2Family.resolve(req)
+    }
+    fn load(&self, checkpoint: PathBuf, req: Requested<'_>) -> Result<Box<dyn Served>> {
+        Lfm2Family.load(checkpoint, req)
     }
 }
 
@@ -866,6 +908,61 @@ mod tests {
             decision_ragged: true,
             pin_prefix: false,
         }
+    }
+
+    #[test]
+    fn lfm2_moe_resolves_its_own_capabilities_before_loading() {
+        let model = LoadConfig::default();
+        let dir =
+            std::env::temp_dir().join(format!("lloom-family-lfm2-moe-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("config.json"), br#"{"model_type":"lfm2_moe"}"#).unwrap();
+        let (family, checkpoint) = detect(&dir).unwrap();
+        assert_eq!(family.name(), "lfm2_moe");
+        assert_eq!(checkpoint, dir);
+        assert_eq!(
+            crate::app::detect_family(Some(&dir)).unwrap(),
+            crate::app::Family::Lfm2(dir.clone())
+        );
+        assert_eq!(family.capabilities(), LFM2_MOE_CAPABILITIES);
+        let mut auto = shape();
+        auto.speculative.method = "auto".into();
+        auto.speculative.drafter = Some("dense-lfm-drafter".into());
+        resolve_auto_speculation(family.name(), &mut auto);
+        assert_eq!(auto.speculative.method, "none");
+        clamp_ungated_eos_gate(&family.capabilities(), &mut auto);
+        assert!(!auto.decode.readback.eos_gate);
+        family
+            .resolve(&Requested {
+                model: &model,
+                shape: auto,
+            })
+            .unwrap();
+        // Every unvalidated arm is refused, each by the family's name.
+        type Arm = fn(&mut Shape);
+        let arms: [(&str, Arm); 4] = [
+            ("dspark", |s| s.speculative.method = "dspark".into()),
+            ("arena", |s| s.executor.arena = true),
+            ("packed", |s| s.executor.packed = true),
+            ("replay", |s| s.executor.replay = true),
+        ];
+        for (arm, set) in arms {
+            let mut s = shape();
+            set(&mut s);
+            let err = family
+                .resolve(&Requested {
+                    model: &model,
+                    shape: s,
+                })
+                .expect_err(arm)
+                .to_string();
+            assert!(err.contains("lfm2_moe"), "{arm}: {err}");
+        }
+        std::fs::write(dir.join("config.json"), br#"{"model_type":"lfm2"}"#).unwrap();
+        assert_eq!(detect(&dir).unwrap().0.name(), "lfm2");
+        assert!(LFM2_CAPABILITIES.eos_gate);
+        assert_eq!(LFM2_CAPABILITIES.speculation, &["dspark"]);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

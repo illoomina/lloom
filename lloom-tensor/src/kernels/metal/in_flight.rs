@@ -12,8 +12,13 @@
 //! epoch open at the drop has completed: the pool's own rule, through the same
 //! [`Retire`] (`docs/profiles-and-memory-design.md` §4.5).
 //!
-//! Present only on the unretained arm: a retaining queue gets no hold, and
-//! every drop is the plain release it always was.
+//! Present on the unretained arm, and on a Metal 4 queue whose slot sets
+//! leave unpooled buffers to the device's residency sets
+//! (`kernels.residency.metal4_cover = held`): there the hold also keeps
+//! such a buffer listed in the device's sets until the epoch open at its
+//! drop has completed ([`Held::Unlist`], `invariants.md` §15.1r). Any other
+//! retaining queue gets no hold, and every drop is the plain release it
+//! always was.
 
 use super::{Buffer, GpuClock};
 use crate::retire::{Completed, Retire};
@@ -31,6 +36,29 @@ pub enum Held {
     /// A buffer no pool parks: an unpooled upload, a persistent allocation,
     /// the base of an arena or a session region.
     Buffer(Buffer),
+    /// The same, still listed in the device's residency sets: its removal is
+    /// staged at release, before the buffer goes.
+    Unlist(Unlisting),
+}
+
+/// A buffer whose removal from `set` waits for its epoch, then is staged
+/// for the next cut's commit (`ResidencySet::remove_deferred`) before the
+/// buffer drops: the order §6.3c needs, later than the drop.
+pub struct Unlisting {
+    set: Arc<super::ResidencySet>,
+    buffer: Buffer,
+}
+
+impl Unlisting {
+    pub fn new(set: Arc<super::ResidencySet>, buffer: Buffer) -> Self {
+        Self { set, buffer }
+    }
+}
+
+impl Drop for Unlisting {
+    fn drop(&mut self) {
+        self.set.remove_deferred(&self.buffer);
+    }
 }
 
 // SAFETY: Metal objects are thread-safe to retain and release from any
@@ -44,6 +72,9 @@ pub struct InFlightHold {
     held: parking_lot::Mutex<Retire<Held>>,
     fences: AtomicU64,
     buffers: AtomicU64,
+    /// Unpooled buffers' removals from the device's sets wait here
+    /// ([`Held::Unlist`]).
+    unlists: bool,
 }
 
 /// What a hold has taken, for a run to show the arm engaged.
@@ -51,7 +82,8 @@ pub struct InFlightHold {
 pub struct HoldCounts {
     /// Fences held past their last host handle, since construction.
     pub fences: u64,
-    /// Buffers held past their last host handle, since construction.
+    /// Buffers held past their last host handle, since construction, the
+    /// unlisted ones ([`Held::Unlist`]) included.
     pub buffers: u64,
     /// Objects held now, their epoch not yet complete.
     pub pending: usize,
@@ -59,12 +91,25 @@ pub struct HoldCounts {
 
 impl InFlightHold {
     pub fn new(clock: Arc<GpuClock>) -> Self {
+        Self::with_unlisting(clock, false)
+    }
+
+    /// A hold that also keeps an unpooled buffer listed in the device's sets
+    /// until its epoch completes, when `unlists`.
+    pub fn with_unlisting(clock: Arc<GpuClock>, unlists: bool) -> Self {
         Self {
             clock,
             held: parking_lot::Mutex::new(Retire::new()),
             fences: AtomicU64::new(0),
             buffers: AtomicU64::new(0),
+            unlists,
         }
+    }
+
+    /// Whether an unpooled buffer's removal from the device's sets waits here.
+    #[inline]
+    pub fn unlists(&self) -> bool {
+        self.unlists
     }
 
     /// Hold `item` until every command buffer that could name it has
@@ -76,7 +121,7 @@ impl InFlightHold {
     pub fn hold(&self, item: Held) {
         match &item {
             Held::Fence(_) => self.fences.fetch_add(1, Ordering::Relaxed),
-            Held::Buffer(_) => self.buffers.fetch_add(1, Ordering::Relaxed),
+            Held::Buffer(_) | Held::Unlist(_) => self.buffers.fetch_add(1, Ordering::Relaxed),
         };
         retire_at_current(&self.held, || self.clock.current_epoch(), item);
     }

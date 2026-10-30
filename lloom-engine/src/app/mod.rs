@@ -126,7 +126,7 @@ pub fn detect_family(model: Option<&Path>) -> Result<Family> {
     };
     let (f, checkpoint) = family::detect(&path)?;
     Ok(match f.name() {
-        "lfm2" => Family::Lfm2(checkpoint),
+        "lfm2" | "lfm2_moe" => Family::Lfm2(checkpoint),
         "qwen3_5" => Family::Qwen3_5(checkpoint),
         "lfm2-gguf" => Family::Lfm2Gguf(checkpoint),
         _ => Family::Qwen4Exp(checkpoint),

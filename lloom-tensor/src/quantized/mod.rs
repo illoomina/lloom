@@ -1192,6 +1192,58 @@ impl QTensor {
         }
     }
 
+    /// [`Self::write_staged`] for a group of planes of `len` bytes, each
+    /// `(offset, staging, entry)`, landed in one launch
+    /// (`QMetalStorage::write_staged_gather`); returns the launches. Metal
+    /// only.
+    #[cfg(feature = "metal")]
+    pub fn write_staged_gather(
+        &mut self,
+        len: usize,
+        planes: &[(usize, crate::kernels::metal::BufferHandle, Option<usize>)],
+        ring: &mut crate::kernels::metal::staging::StagingRing,
+    ) -> Result<usize> {
+        let exact = self.shape.elem_count() / self.dtype().block_size() * self.dtype().type_size();
+        if let Some((offset, _, _)) = planes.iter().find(|(o, _, _)| o + len > exact) {
+            for (_, buf, entry) in planes {
+                ring.release(*entry, buf);
+            }
+            crate::bail!("write_staged_gather: {offset}+{len} past the {exact}-byte tensor")
+        }
+        match &mut self.storage {
+            QStorage::Metal(s) => s.write_staged_gather(len, planes, ring),
+            _ => crate::bail!("write_staged_gather: not a Metal quantized tensor"),
+        }
+    }
+
+    /// [`Self::write_with_ring`] for a group of planes of `len` bytes at
+    /// `offsets`, `fill(i, bytes)` writing the `i`-th on the host, landed in
+    /// one launch on Metal; the other backends write each in place. Returns
+    /// the copies taken.
+    #[cfg(feature = "metal")]
+    pub fn write_with_ring_gather(
+        &mut self,
+        len: usize,
+        offsets: &[usize],
+        ring: &crate::kernels::metal::staging::SharedStagingRing,
+        fill: &mut dyn FnMut(usize, &mut [u8]) -> Result<()>,
+    ) -> Result<usize> {
+        let exact = self.shape.elem_count() / self.dtype().block_size() * self.dtype().type_size();
+        if let Some(offset) = offsets.iter().find(|&&o| o + len > exact) {
+            crate::bail!("write_with_ring_gather: {offset}+{len} past the {exact}-byte tensor")
+        }
+        match &mut self.storage {
+            QStorage::Metal(s) => s.write_with_ring_gather(len, offsets, ring, fill),
+            _ => {
+                for (i, &offset) in offsets.iter().enumerate() {
+                    self.storage
+                        .write_with(offset, len, &mut |dst| fill(i, dst))?;
+                }
+                Ok(offsets.len())
+            }
+        }
+    }
+
     /// Overwrite `len` packed bytes at byte `offset` with what `fill` writes
     /// into the slice it is handed. Bounds-checked against the exact packed
     /// size; the Metal arm goes through the compute encoder so the write is
@@ -1346,6 +1398,61 @@ impl QTensor {
             self.indexed_moe_forward_as(x, ids, arm, act)?,
             up.indexed_moe_forward_as(x, ids, arm, act)?,
         ))
+    }
+
+    /// `silu(g) · u` of [`Self::indexed_moe_forward_pair_as`]'s halves in ONE
+    /// launch, where the pair is one launch (Metal, [`MoeArm::MatVec`],
+    /// `LLOOM_MOE_PAIR` on, a one-launch grid order, both stacks of one kind
+    /// and shape, f32 or f16 activations computed in their own dtype, a row
+    /// count the plain pair kernel takes): `silu_mul`'s element over the
+    /// stores the pair would make, bit for bit. `None` everywhere else; the
+    /// caller runs the pair and its own SwiGLU.
+    pub fn indexed_moe_forward_glu_as(
+        &self,
+        up: &QTensor,
+        x: &Tensor,
+        ids: &Tensor,
+        arm: MoeArm,
+        act: DType,
+    ) -> Result<Option<Tensor>> {
+        #[cfg(feature = "metal")]
+        if arm == MoeArm::MatVec
+            && moe_pair_on()
+            && PairOrder::configured() != PairOrder::Split
+            && self.dtype() == up.dtype()
+            && self.shape() == up.shape()
+            && matches!(
+                (x.dtype(), act),
+                (DType::F32, DType::F32) | (DType::F16, DType::F16)
+            )
+        {
+            if let (QStorage::Metal(a), QStorage::Metal(b)) = (&self.storage, &up.storage) {
+                let (xs, is) = (x.storage(), ids.storage());
+                if let (Storage::Metal(xs), Storage::Metal(is)) = (&*xs, &*is) {
+                    let fused = a.indexed_moe_forward_glu(
+                        b,
+                        self.shape(),
+                        xs,
+                        x.layout(),
+                        is,
+                        ids.layout(),
+                        act,
+                    )?;
+                    if let Some((s, shape)) = fused {
+                        let both = crate::tensor::from_storage(
+                            Storage::Metal(s),
+                            shape,
+                            crate::op::BackpropOp::none(),
+                            false,
+                        );
+                        return Ok(Some(both.narrow(0, 0, 1)?.squeeze(0)?));
+                    }
+                }
+            }
+        }
+        #[cfg(not(feature = "metal"))]
+        let _ = (up, x, ids, arm, act);
+        Ok(None)
     }
 
     /// Routed-expert matmul over a stacked quantized weight `[n_experts, n, k]`:

@@ -3891,6 +3891,14 @@ impl BackendDevice for MetalDevice {
         }
         MetalDevice::finish_pass(&view)
     }
+
+    fn abort_pass(&self) -> Result<()> {
+        let view = self.execution_device()?;
+        if !view.pass_plans_enabled() {
+            return Ok(());
+        }
+        MetalDevice::abort_pass(&view)
+    }
 }
 
 /// Copies `n` elements out of a CPU-mapped buffer.

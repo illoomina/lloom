@@ -879,3 +879,14 @@ pub use scaled::scale_shards;
 fn lloom_manifest_dir() -> String {
     std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| env!("CARGO_MANIFEST_DIR").to_string())
 }
+
+/// The routed experts' `silu(g) · u` as the decode step launches it
+/// (`MoeLayer::routed_swiglu` under `f16_fuse`): one `silu_mul` launch at f32
+/// or f16, the composed pair elsewhere. For instruments that price the
+/// launch.
+pub fn routed_swiglu(g: &Tensor, u: &Tensor) -> Result<Tensor> {
+    match super::kernels::silu_mul(g, u) {
+        Some(h) => h,
+        None => crate::nn::ops::silu(g)? * u,
+    }
+}

@@ -1142,6 +1142,9 @@ fn parse_residency_metal4(v: &str) -> Result<String, String> {
         &["slots", "queue-diff", "cb-diff", "queue-full", "cb-full"],
     )
 }
+fn parse_residency_metal4_cover(v: &str) -> Result<String, String> {
+    one_of(v, "residency metal4 cover", &["pool", "held"])
+}
 fn parse_residency_cap_pct(v: &str) -> Result<u32, String> {
     let pct: u32 = parse_count(v)?;
     if pct > 100 {
@@ -1265,7 +1268,7 @@ pub struct GemmTuning {
         status = "arm"
     )]
     pub f16_rows: bool,
-    /// The most rows `kernels.gemm.f16_rows` takes (2..16); a window of more rows takes the GEMM.
+    /// The most rows the f16 row axis takes (2..16), in a verify window and in a batched decode step (`kernels.gemm.f16_rows_decode`, whose serve and bench default holds at a batch of 2 to this many sequences); more rows take the GEMM. 10 in the library; `serve` and `bench` resolve 12 on Metal (decision 60: on LFM2.5-2.6B the served step at 11 and 12 rows is 21.1 and 22.8 ms on the axis against 26.8 and 27.1 on the GEMM, ×1.26 and ×1.18 decode tok/s at B = 11 and 12; from 13 rows the axis is ×1.65 the GEMM's step).
     #[opt(
         flag = "gemm-f16-rows-max",
         env = "LLOOM_GEMM_F16_ROWS_MAX",
@@ -1274,7 +1277,7 @@ pub struct GemmTuning {
         status = "arm"
     )]
     pub f16_rows_max: usize,
-    /// Under `fast`, with `kernels.gemm.f16_rows` on, a batched decode step's f16 matmuls of 2 to `f16_rows_max` rows (one row per live sequence) take the GEMV's row axis: each weight block read once for every row, each row the one-row GEMV's bits; off = the GEMM from two rows. A step that carries prompt pieces puts its 1 to `f16_rows_max` live rows on the same route and its pieces on the GEMM, so a row's bits do not depend on whether a piece rode its step; a single sequence's step and `deterministic` keep their routes. Off in the library; `serve` and `bench` turn it on at a batch on Metal (decision 54), `--gemm-f16-rows-decode=false` to measure without it.
+    /// Under `fast`, with `kernels.gemm.f16_rows` on, a batched decode step's f16 matmuls of 2 to `f16_rows_max` rows (one row per live sequence) take the GEMV's row axis: each weight block read once for every row, each row the one-row GEMV's bits; off = the GEMM from two rows. A step that carries prompt pieces puts its 1 to `f16_rows_max` live rows on the same route and its pieces on the GEMM, so a row's bits do not depend on whether a piece rode its step; a single sequence's step and `deterministic` keep their routes. Off in the library; `serve` and `bench` turn it on on Metal at a batch of 2 to `f16_rows_max` sequences (decision 54; 2 to 12 since decision 60), `--gemm-f16-rows-decode=false` to measure without it.
     #[opt(
         flag = "gemm-f16-rows-decode",
         env = "LLOOM_GEMM_F16_ROWS_DECODE",
@@ -1660,7 +1663,7 @@ pub struct MetalTuning {
     /// The residency classes the keep-warm asks to keep resident when the sets are split (`kernels.residency.set_cap_pct` > 0): a comma list of weights, kv, heap, scratch, experts, other. The rest are left to the OS, and under memory pressure their residency is ended.
     #[opt(flag = "residency-hot", env = "LLOOM_RESIDENCY_HOT", parser = "parse_residency_hot", path = "kernels.residency.hot", status = "arm", facets = ["liveness"], flows = ["commands-out"])]
     pub residency_hot: String,
-    /// Count and time what the Metal 4 queue's per-slot residency sets do: the resources `Slot::resource` adds per command buffer and the host time of those adds, the pipelines added, the set commits and their host time (total and longest), and the set's `allocatedSize` at each commit (last and largest), read out in `/health` (an instrument for #1092 lane B; one clock read per add and per commit when on).
+    /// Count and time what the Metal 4 queue's per-slot residency sets do: the resources `Slot::resource` adds per command buffer and the host time of those adds, the pipelines added, the set commits and their host time (total and longest), and the set's `allocatedSize` at each commit (last and largest), and a census of every first binding a generation by why the slot set listed it or left it to the device's sets (covered, held, listed, unlisted, a constant page, a raw-path resource) and by the residency class the device's sets list it under, with the stack that listed each allocation in builds with symbols, read out in `/health` (an instrument for #1092; when on, one clock read per add and per commit, and one device-set lock per first binding).
     #[opt(
         flag = "residency-slot-trace",
         env = "LLOOM_METAL4_SLOT_TRACE",
@@ -1669,9 +1672,12 @@ pub struct MetalTuning {
         status = "instrument"
     )]
     pub residency_slot_trace: bool,
-    /// What a Metal 4 command buffer declares resident: `slots` (each command buffer's slot set lists everything it binds), `queue-diff` (the device's residency sets on the Metal 4 queue, the slot set listing only what they do not cover), `cb-diff` (each command buffer uses the device's sets, the slot set listing only what they do not cover); `queue-full` and `cb-full` attach or use the device's sets and keep the full slot lists (controls). A pool buffer or a heap sub-buffer is covered; everything else stays in the slot set (`tuning.md` §6.3p).
+    /// What a Metal 4 command buffer declares resident: `slots` (each command buffer's slot set lists everything it binds), `queue-diff` (the device's residency sets on the Metal 4 queue, the slot set listing only what they do not cover), `cb-diff` (each command buffer uses the device's sets, the slot set listing only what they do not cover); `queue-full` and `cb-full` attach or use the device's sets and keep the full slot lists (controls). A pool buffer or a heap sub-buffer is covered; everything else stays in the slot set (`tuning.md` §6.3p). `slots` in the library; `chat` and `serve` default to `queue-diff` for Qwen4-exp on Metal (decision 62; PR1107: a 2372-token first token 42.4 s under `slots`, 31.0 s under `queue-diff`, the slot-set commits 12.9 s and 0.09 s of it). A Qwen4-exp request commits hundreds of command buffers, most of a long prompt's on the expert landing copies (#1108: 4127 of 4806 at 2372 tokens, `weights.experts.landing_cut_period` takes it to 1568), each re-wiring what its slot set lists; LFM2's commits 14 and keeps `slots`. `--residency-metal4 slots` to measure without it.
     #[opt(flag = "residency-metal4", env = "LLOOM_RESIDENCY_METAL4", parser = "parse_residency_metal4", variants = ["slots", "queue-diff", "cb-diff", "queue-full", "cb-full"], path = "kernels.residency.metal4", status = "arm", facets = ["liveness"], flows = ["commands-out"])]
     pub residency_metal4: String,
+    /// What a Metal 4 slot set may leave to the device's residency sets under a `*-diff` declaration: `pool` (a pool buffer or a heap sub-buffer: they leave the sets only after their last GPU reader) or `held` (those, and every buffer outside a pool that the device's backings listed: on Metal 4 its last handle's drop hands it, its removal from the sets and its membership record to the in-flight hold, released once the epoch open at the drop has completed). `pool` in the library (`tuning.md` §6.3p, `invariants.md` §15.1r).
+    #[opt(flag = "residency-metal4-cover", env = "LLOOM_RESIDENCY_METAL4_COVER", parser = "parse_residency_metal4_cover", variants = ["pool", "held"], path = "kernels.residency.metal4_cover", status = "arm", facets = ["liveness"], flows = ["commands-out", "memory-return"])]
+    pub residency_metal4_cover: String,
     /// Run these types although this GPU only emulates them (a comma list; `bf16` on Apple7, ~2.6x the f32 time); none = refuse them (§15.2a).
     #[opt(flag = "allow-emulated", env = "LLOOM_METAL_ALLOW_EMULATED", parser = "parse_allow_emulated", variants = ["none", "bf16"], path = "backend.metal.allow_emulated", status = "advanced")]
     pub allow_emulated: Option<String>,
@@ -1759,6 +1765,7 @@ impl Default for MetalTuning {
             residency_hot: "weights,kv".into(),
             residency_slot_trace: false,
             residency_metal4: "slots".into(),
+            residency_metal4_cover: "pool".into(),
             allow_emulated: None,
             fast_math: true,
             eager_residency_release: None,
@@ -1912,6 +1919,9 @@ pub struct InstrumentTuning {
     /// Attribute every host readback (`to_cpu`'s fast and blit paths, a staged read's stage, a host-read slot's read) to the model call site that made it (a backtrace per readback, #814 part 5).
     #[opt(flag = "readback-trace", env = "LLOOM_READBACK_TRACE", bool, path = "diagnostics.trace.readbacks", status = "instrument", needs = "profile", flows = ["token-out"])]
     pub readback_trace: bool,
+    /// Under the GPU profiler: attribute every command-buffer commit to the stack and thread that made it (a frame-pointer walk per commit, symbolized once per distinct stack), so a request's commits can be counted by cause (`profile::cut_sites`).
+    #[opt(flag = "cut-sites", env = "LLOOM_CUT_SITES", bool, path = "diagnostics.trace.cut_sites", status = "instrument", needs = "profile", flows = ["commands-out"])]
+    pub cut_sites: bool,
     /// Shadow every host upload and check it back (the #748 corruption instrument).
     #[opt(
         flag = "upload-shadow",

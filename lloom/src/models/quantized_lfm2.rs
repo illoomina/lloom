@@ -7,7 +7,7 @@ use lloom_tensor::{bail, DType, Device, IndexOp, Result, Tensor};
 use std::collections::HashMap;
 use std::sync::Arc;
 
-mod weights;
+pub(crate) mod weights;
 
 #[derive(Debug, Clone)]
 struct Mlp {

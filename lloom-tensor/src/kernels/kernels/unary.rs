@@ -1082,6 +1082,64 @@ pub unsafe fn call_copy2d_with(
     Ok(())
 }
 
+/// The gather's table entry, as `unary.metal`'s `CopyGatherEntry` lays it out.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CopyGatherEntry {
+    /// The source's GPU address.
+    pub src: u64,
+    /// The destination word it lands at.
+    pub dst_word: u64,
+}
+
+/// `words` words from each of `table`'s `count` entries' sources into
+/// `output`: one launch for a group of copies whose sources are separate
+/// buffers (`sources`, declared resident, never bound). Returns `false`,
+/// encoding nothing, when the encoder cannot declare them (an executor is
+/// recording its binds); the caller then copies another way.
+///
+/// # Safety
+/// `table` holds `count` entries, each a live address in one of `sources`
+/// with `words` words readable from it and a destination range inside
+/// `output`. Every buffer here stays unreused and unwritten by the host until
+/// the command buffer it is encoded into completes, and `sources` are written
+/// by the host alone.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn call_copy_gather_u32(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    table: &Buffer,
+    output: &Buffer,
+    words: u32,
+    count: usize,
+    sources: &[&Buffer],
+) -> Result<bool, MetalKernelError> {
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoder = encoder.as_ref();
+    // SAFETY: this function's contract (# Safety above).
+    if !unsafe { encoder.declare_indirect_reads(sources) } {
+        return Ok(false);
+    }
+    let pipeline = kernels.load_pipeline(device, Source::Unary, "copy_gather_u32")?;
+    encoder.set_compute_pipeline_state(&pipeline);
+    debug_group!(encoder, "copy_gather_u32 words={words} count={count}");
+    // SAFETY: this function's contract (# Safety above).
+    unsafe {
+        encoder.set_input_buffer(0, Some(table), 0);
+        encoder.set_output_buffer(1, Some(output), 0);
+    }
+    encoder.set_bytes(2, &words);
+    let grid_dims = MTLSize {
+        width: words as usize,
+        height: count,
+        depth: 1,
+    };
+    let group_dims = get_block_dims(words as usize, count, 1);
+    encoder.dispatch_threads(grid_dims, group_dims);
+    Ok(true)
+}
+
 ///////////////////////////////////////////////////////////////////////////////
 // The SiLU variant axis.
 ///////////////////////////////////////////////////////////////////////////////

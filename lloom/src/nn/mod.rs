@@ -74,6 +74,7 @@ pub mod turn_checkpoint;
 pub mod var_builder;
 pub mod var_map;
 pub mod weight_groups;
+pub mod weight_repr;
 pub mod zeros;
 /// Re-export of [`attention::varlen`] for backward compatibility.
 pub mod varlen_attention {
@@ -82,7 +83,9 @@ pub mod varlen_attention {
 
 pub use activation::{prelu, Activation, PReLU};
 pub use batch_norm::{batch_norm, BatchNorm, BatchNormConfig};
-pub use batched::{BatchDecoder, BatchStepPhases, PrefillDecode, RowDriver, RowId, StepReport};
+pub use batched::{
+    BatchCutHold, BatchDecoder, BatchStepPhases, PrefillDecode, RowDriver, RowId, StepReport,
+};
 pub use batched_spec::SpecBatchDecoder;
 pub use channel_affine::ChannelAffine;
 pub use conv::{

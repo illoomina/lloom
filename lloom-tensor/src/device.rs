@@ -559,17 +559,26 @@ impl Device {
         }
     }
 
-    /// The Metal 4 queue's per-slot residency counts, as `(adds, commits,
-    /// last_bytes, max_bytes)` (`kernels.residency.slot_trace`; `None` off
-    /// Metal 4 or with the instrument off).
-    pub fn metal4_slot_residency(&self) -> Option<(u64, u64, u64, u64)> {
+    /// The Metal 4 queue's per-slot residency counts and times
+    /// (`kernels.residency.slot_trace`; `None` off Metal 4 or with the
+    /// instrument off).
+    pub fn metal4_slot_residency(&self) -> Option<crate::residency_class::SlotResidency> {
         #[cfg(feature = "metal")]
         if let Self::Metal(d) = self {
-            return d
-                .metal4_slot_residency()
-                .map(|s| (s.adds, s.commits, s.last_bytes, s.max_bytes));
+            return d.metal4_slot_residency();
         }
         None
+    }
+
+    /// The Metal 4 slot census by the site that listed each allocation
+    /// (`kernels.residency.slot_trace`; empty off Metal 4, with the
+    /// instrument off, and without sites in a build without symbols).
+    pub fn metal4_slot_sites(&self) -> Vec<crate::residency_class::SlotSite> {
+        #[cfg(feature = "metal")]
+        if let Self::Metal(d) = self {
+            return d.metal4_slot_sites();
+        }
+        Vec::new()
     }
 
     /// The residency set's attachment and size, for a loaded line (`None`
@@ -611,6 +620,16 @@ impl Device {
             Self::Cpu => Ok(()),
             Self::Cuda(d) => d.finish_pass(),
             Self::Metal(d) => crate::backend::BackendDevice::finish_pass(d),
+        }
+    }
+
+    /// Abandon the pass [`Self::begin_pass`] opened, after its body failed
+    /// (`BackendDevice::abort_pass`).
+    pub fn abort_pass(&self) -> Result<()> {
+        match self {
+            Self::Cpu => Ok(()),
+            Self::Cuda(d) => d.abort_pass(),
+            Self::Metal(d) => crate::backend::BackendDevice::abort_pass(d),
         }
     }
 

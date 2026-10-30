@@ -780,6 +780,23 @@ impl MetalDevice {
         Ok(pl)
     }
 
+    /// A fresh allocation from this device's own backings, about to join one
+    /// of its pools: the device's residency sets list it until the pool
+    /// evicts it from the free list, after its last GPU reader
+    /// (`Buffer::device_listed`). Unmarked when the device has no set.
+    fn listed_for_pool(
+        &self,
+        mut allocation: crate::kernels::metal::backing::Allocation,
+    ) -> crate::kernels::metal::backing::Allocation {
+        // SAFETY: asks only whether a native set exists; nothing is borrowed.
+        if unsafe { self.residency_set.raw() }.is_some() {
+            allocation.buffer = allocation
+                .buffer
+                .with_device_listing(crate::kernels::metal::DeviceListing::Pool);
+        }
+        allocation
+    }
+
     fn allocate_backing(
         backing: &dyn Backing,
         bytes: usize,
@@ -946,8 +963,19 @@ impl MetalDevice {
     /// (`kernels.residency.attach`) and the router's layout
     /// ([`ResidencySet::layout_line`]), e.g. `residency=queue 1 set 8.12 GiB`.
     pub fn residency_line(&self) -> String {
+        let metal4 = match self.commands.metal4_declare() {
+            Some(d) if d != crate::kernels::metal::Metal4Declare::Slots => {
+                format!(" metal4={}", d.name())
+            }
+            _ => String::new(),
+        };
+        let cover = if self.commands.in_flight_hold().is_some_and(|h| h.unlists()) {
+            " metal4_cover=held"
+        } else {
+            ""
+        };
         format!(
-            "residency={} {}",
+            "residency={} {}{metal4}{cover}",
             self.commands.residency_attachment().short(),
             self.residency_set.layout_line()
         )
@@ -957,6 +985,12 @@ impl MetalDevice {
     /// ([`Commands::metal4_slot_residency`]).
     pub fn metal4_slot_residency(&self) -> Option<crate::kernels::metal::SlotResidency> {
         self.commands.metal4_slot_residency()
+    }
+
+    /// The Metal 4 slot census by listing site
+    /// ([`Commands::metal4_slot_sites`]).
+    pub fn metal4_slot_sites(&self) -> Vec<crate::residency_class::SlotSite> {
+        self.commands.metal4_slot_sites()
     }
 
     /// A handle to the residency set that outlives this device.
@@ -2265,34 +2299,7 @@ impl MetalDevice {
     /// after everything the step encodes.
     pub fn finish_decode_step(&self) -> Result<()> {
         self.end_decode_step();
-        // A step that drifted from the plan is served no further (the arena
-        // deactivated itself at the drift) and the plan is dropped here: the
-        // sequence it describes no longer runs, and the recording is re-armed
-        // over the steps that follow -- none skipped, because the drifted
-        // sequence is the steady state now. Each re-recording is counted, so
-        // a run whose plan moved twice says so beside its coverage.
-        if let Some(arena) = self.arena_slot() {
-            if arena.take_drifted() {
-                let rearm = *self.arena_rerecord.lock();
-                self.clear_arena();
-                if let Some((layout, record_steps)) = rearm {
-                    // The drifted step is the record's step 0 (the count
-                    // below advances it), so `skip: 1` records from the next
-                    // step on -- nothing but the step that drifted is skipped.
-                    {
-                        let mut g = self.arena_auto.lock();
-                        *g = Some(ArenaAutoRecord {
-                            layout,
-                            skip: 1,
-                            record_steps,
-                            step: 0,
-                        });
-                    }
-                    self.arena_rerecordings
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                }
-            }
-        }
+        self.rearm_if_drifted();
         // `parking_lot` guards are infallible; an IIFE returning `Option` keeps
         // the `?` early-return the `and_then` closure used.
         let due = (|| {
@@ -2327,6 +2334,59 @@ impl MetalDevice {
             }
         }
         Ok(())
+    }
+
+    /// Abandon a decode step whose forward failed or unwound: the arena's
+    /// step is closed and a drift handled as at the finish, but the step is
+    /// no recorded step. A recording armed over it is dropped and armed
+    /// again, so no arena is installed from a step that stopped part-way.
+    pub fn abort_decode_step(&self) {
+        self.end_decode_step();
+        self.rearm_if_drifted();
+        let restart = {
+            let mut g = self.arena_auto.lock();
+            match g.as_mut() {
+                Some(auto) if auto.step >= auto.skip => {
+                    auto.step = 0;
+                    true
+                }
+                _ => false,
+            }
+        };
+        if restart {
+            drop(self.discard_arena_recording());
+        }
+    }
+
+    /// A step that drifted from the plan is served no further (the arena
+    /// deactivated itself at the drift) and the plan is dropped: the
+    /// sequence it describes no longer runs, and the recording is re-armed
+    /// over the steps that follow -- none skipped, because the drifted
+    /// sequence is the steady state now. Each re-recording is counted, so a
+    /// run whose plan moved twice says so beside its coverage.
+    fn rearm_if_drifted(&self) {
+        if let Some(arena) = self.arena_slot() {
+            if arena.take_drifted() {
+                let rearm = *self.arena_rerecord.lock();
+                self.clear_arena();
+                if let Some((layout, record_steps)) = rearm {
+                    // The drifted step is the record's step 0 (a finish's
+                    // count advances it), so `skip: 1` records from the next
+                    // step on -- nothing but the step that drifted is skipped.
+                    {
+                        let mut g = self.arena_auto.lock();
+                        *g = Some(ArenaAutoRecord {
+                            layout,
+                            skip: 1,
+                            record_steps,
+                            step: 0,
+                        });
+                    }
+                    self.arena_rerecordings
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+        }
     }
 
     /// Mark the end of a decode step. Allocations outside a step take the pool
@@ -2632,55 +2692,74 @@ impl MetalDevice {
         // Whatever this pass does, the arena the last pass installed must not
         // serve it: a pass is served only under its own key's plan.
         self.clear_arena_keep_base();
-        let state = match (pp.state.pending, pp.plans.contains_key(&key)) {
+        // A refusal past the bits above leaves no half-open pass: the body
+        // bits are cleared and no `current` is registered, so the caller's
+        // error path owes no `finish_pass` and the next pass opens on the
+        // state this one found.
+        let opened = match (pp.state.pending, pp.plans.contains_key(&key)) {
             (Some(closes), cached) => {
                 // The recorder still holds the pending key's pass as its
                 // current step; this pass becomes the step that says what
                 // escaped it.
                 self.next_arena_recording_step();
                 pp.counters.observed += 1;
-                if cached {
+                Ok(if cached {
                     PassState::Observing { closes }
                 } else {
                     PassState::Recording {
                         key,
                         closes: Some(closes),
                     }
-                }
+                })
             }
             (None, true) => {
                 let generation = pp.state.base_generation;
                 let stale = pp.arena_generation.get(&key) != Some(&generation);
-                if stale || !pp.arenas.contains_key(&key) {
+                let built = if stale || !pp.arenas.contains_key(&key) {
                     let plan = pp.plans.get(&key).expect("cached").clone();
                     let base = pp.base.clone().expect("a cached plan has a base");
-                    let arena = Arena::new(base, plan, pp.layout)
-                        .map_err(|e| MetalError::Message(format!("pass plan rejected: {e}")))?;
-                    pp.arenas.insert(key, arena);
-                    pp.arena_generation.insert(key, generation);
-                }
-                let arena = pp.arenas.get(&key).expect("built above").clone();
-                crate::kernels::metal::set_hazard_key_unless_explicit(
-                    crate::kernels::metal::HazardKey::Range,
-                );
-                {
-                    let mut slot = self.arena.write();
-                    *slot = Some(arena.clone());
-                }
-                arena.begin_step();
-                pp.counters.served += 1;
-                self.pass_state
-                    .fetch_or(0b100, std::sync::atomic::Ordering::Relaxed);
-                PassState::Served(key)
+                    Arena::new(base, plan, pp.layout)
+                        .map_err(|e| MetalError::Message(format!("pass plan rejected: {e}")))
+                        .map(|arena| {
+                            pp.arenas.insert(key, arena);
+                            pp.arena_generation.insert(key, generation);
+                        })
+                } else {
+                    Ok(())
+                };
+                built.map(|()| {
+                    let arena = pp.arenas.get(&key).expect("built above").clone();
+                    crate::kernels::metal::set_hazard_key_unless_explicit(
+                        crate::kernels::metal::HazardKey::Range,
+                    );
+                    {
+                        let mut slot = self.arena.write();
+                        *slot = Some(arena.clone());
+                    }
+                    arena.begin_step();
+                    pp.counters.served += 1;
+                    self.pass_state
+                        .fetch_or(0b100, std::sync::atomic::Ordering::Relaxed);
+                    PassState::Served(key)
+                })
             }
             (None, false) => {
                 self.begin_arena_recording();
                 pp.counters.recorded += 1;
-                PassState::Recording { key, closes: None }
+                Ok(PassState::Recording { key, closes: None })
             }
         };
-        pp.state.current = Some(state);
-        Ok(())
+        match opened {
+            Ok(state) => {
+                pp.state.current = Some(state);
+                Ok(())
+            }
+            Err(error) => {
+                self.pass_state
+                    .fetch_and(!0b1110, std::sync::atomic::Ordering::Relaxed);
+                Err(error.into())
+            }
+        }
     }
 
     /// Close the pass `begin_pass` opened: build the plan a pending key was
@@ -2799,6 +2878,77 @@ impl MetalDevice {
         drop(g);
         drop(discarded);
         Ok(())
+    }
+
+    /// Abandon the pass `begin_pass` opened, after its body failed or
+    /// unwound. Nothing the pass recorded or observed is published: it
+    /// leaves no key pending, builds no plan, and the pending key it was
+    /// observing records again on its next sight. A served pass keeps its
+    /// cached plan. The base is not replaced, so work already encoded keeps
+    /// what it binds until it retires, and an arena the abort drops is
+    /// dropped outside the planner lock. A no-op when no pass is open; with
+    /// the cache off, the decode step's abort (`abort_decode_step`).
+    pub fn abort_pass(&self) -> Result<()> {
+        if let Some(scope) = super::allocation_scope::active(self)? {
+            return scope.view.abort_pass_in();
+        }
+        self.abort_pass_in()
+    }
+
+    fn abort_pass_in(&self) -> Result<()> {
+        self.next_pass_variant
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        let mut g = self.pass_plans.lock();
+        let Some(pp) = g.as_mut() else {
+            drop(g);
+            self.abort_decode_step();
+            return Ok(());
+        };
+        if pp.state.closing.is_some() {
+            return Err(crate::Error::wrap(PlannerInvalidated(
+                "abort while a finish is closing",
+            )));
+        }
+        let Some(state) = pp.state.current.take() else {
+            return Ok(());
+        };
+        self.pass_state
+            .fetch_and(!0b1110, std::sync::atomic::Ordering::Relaxed);
+        pp.counters.aborted += 1;
+        let mut discarded = None;
+        let recorded = match state {
+            PassState::Served(key) => {
+                self.end_decode_step();
+                if let Some(arena) = self.arena_slot() {
+                    if arena.take_drifted() {
+                        pp.plans.remove(&key);
+                        discarded = pp.arenas.remove(&key);
+                        pp.counters.evicted += 1;
+                    }
+                }
+                self.clear_arena_keep_base();
+                false
+            }
+            PassState::Recording { .. } | PassState::Observing { .. } => {
+                pp.state.pending = None;
+                true
+            }
+        };
+        drop(g);
+        drop(discarded);
+        if recorded {
+            drop(self.discard_arena_recording());
+        }
+        Ok(())
+    }
+
+    /// Stop observing and keep nothing of what was seen: the recorder is
+    /// returned for the caller to drop outside its locks.
+    fn discard_arena_recording(&self) -> Option<Arc<Mutex<ArenaRecorder>>> {
+        let mut g = self.arena_recorder.lock();
+        let rec = g.take()?;
+        crate::kernels::metal::arena::clear_bind_observer_if(&rec);
+        Some(rec)
     }
 
     fn check_closing_scope(&self) -> Result<()> {
@@ -3277,8 +3427,11 @@ impl MetalDevice {
                     .check_residual(alloc)
                     .map_err(AllocationError::from)?;
                 let split = self.residency_set.policy().is_split();
-                let new_buffer =
-                    Self::allocate_backing(self.backings.for_miss(true, split), alloc, context)?;
+                let new_buffer = self.listed_for_pool(Self::allocate_backing(
+                    self.backings.for_miss(true, split),
+                    alloc,
+                    context,
+                )?);
                 // `size` is the pre-rounding request and `alloc` is what Metal
                 // was given; `adopt_requesting` counts both so §9.2's residual
                 // overhang is derivable. The rounding happened at `alloc`
@@ -4010,8 +4163,11 @@ impl MetalDevice {
             .check_residual(size)
             .map_err(AllocationError::from)?;
         let split = self.residency_set.policy().is_split();
-        let new_buffer =
-            Self::allocate_backing(self.backings.for_miss(false, split), size, context)?;
+        let new_buffer = self.listed_for_pool(Self::allocate_backing(
+            self.backings.for_miss(false, split),
+            size,
+            context,
+        )?);
         Ok(self
             .buffers
             .adopt_after_miss_in(new_buffer, size, miss, &origin)?)

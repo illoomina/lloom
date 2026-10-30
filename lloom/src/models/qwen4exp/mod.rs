@@ -20,6 +20,8 @@ pub mod moe;
 pub mod mtp;
 pub mod ple;
 pub mod qsa;
+#[cfg(all(test, feature = "metal"))]
+mod routed_glu_tests;
 pub mod schema;
 pub mod testing;
 pub mod transient;
@@ -34,7 +36,8 @@ pub use loader::{
     DEFAULT_MEMORY_FRACTION,
 };
 pub use model::{
-    prefill_chunk, prefill_pair_on, prefill_tiles, set_prefill_chunk, set_prefill_pair,
+    forward_tile, pipelined_passes, prefill_chunk, prefill_pair_forward, prefill_pair_on,
+    prefill_tiles, set_prefill_chunk, set_prefill_pair, set_prefill_pair_forward,
     set_prefill_tiles, Layer, MemCheck, Mixer, PassPlan, Qwen4Exp, Shape, State, StatePools,
     DEFAULT_PREFILL_PAIR, DEFAULT_PREFILL_TILES, PREFILL_CHUNK,
 };

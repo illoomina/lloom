@@ -250,6 +250,31 @@ fn f16_rows_route(
     (batch == 1 && rows <= max && gemv_rows_serves(n, k)).then_some((rows, decode))
 }
 
+/// The capacities a launch on the f16 row axis takes under
+/// `kernels.gemm.f16_rows_round`: the smallest at or above its rows.
+const F16_ROWS_CAPACITIES: [usize; 8] = [2, 4, 6, 8, 10, 12, 14, 16];
+
+/// The capacity a launch of `rows` rows takes on the f16 row axis: `rows`,
+/// or under `kernels.gemm.f16_rows_round` the smallest of
+/// [`F16_ROWS_CAPACITIES`] at or above it. One row keeps the one-row GEMV. A
+/// group holding fewer rows than its capacity re-reads its last row for the
+/// missing ones and stores only its own, so every row's bits are the same at
+/// either capacity (`gemv_rows_keep_the_one_row_bits_at_every_capacity`).
+fn f16_rows_capacity(rows: usize) -> usize {
+    if rows < 2 || !crate::tuning::f16_rows_round() {
+        return rows;
+    }
+    let cap = F16_ROWS_CAPACITIES
+        .iter()
+        .copied()
+        .find(|&c| c >= rows)
+        .unwrap_or(rows);
+    if cap > rows {
+        crate::tuning::note_f16_rows_rounded();
+    }
+    cap
+}
+
 /// Bytes of one half element.
 const HALF_BYTES: usize = 2;
 
@@ -953,7 +978,7 @@ pub unsafe fn call_mlx_gemv_norm(
 }
 
 /// The most rows one threadgroup of the GEMV's row axis carries
-/// (`gemv.metal`'s `instantiate_gemv_rows_tile`: every count from 2).
+/// (`gemv.metal`'s `instantiate_gemv_rows_bm4`, `_bm8`: every count from 2).
 pub const GEMV_ROWS_MAX: usize = 16;
 
 /// The `[[host_name]]` suffix of each row count, no allocation per dispatch;
@@ -1923,7 +1948,7 @@ pub unsafe fn call_mlx_gemm_out(
                 output,
                 GemvEpilogue::None,
                 None,
-                rows,
+                f16_rows_capacity(rows),
             )
         };
     }
@@ -1961,7 +1986,7 @@ pub unsafe fn call_mlx_gemm_out(
                 &output.view(0, lead * row),
                 GemvEpilogue::None,
                 None,
-                lead,
+                f16_rows_capacity(lead),
             )?;
             encode_steel_gemm(
                 device,

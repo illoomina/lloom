@@ -1709,12 +1709,15 @@ impl<'m, M: CausalLM> Session<'m, M> {
             // here: the verify's argmax, with the draft ids beside it.
             let t = std::time::Instant::now();
             let rb = readbacks();
-            if let Some((device, shape)) = verify_key {
-                if let (crate::nn::decode::PassShape::Verify { k }, [_]) = (shape, anchors) {
-                    self.model.prepare_verify(&mut self.seq.cache, k)?;
+            let pass = match verify_key {
+                Some((device, shape)) => {
+                    if let (crate::nn::decode::PassShape::Verify { k }, [_]) = (shape, anchors) {
+                        self.model.prepare_verify(&mut self.seq.cache, k)?;
+                    }
+                    Some(crate::nn::decode::OpenPass::begin(device, shape)?)
                 }
-                crate::nn::decode::begin_pass(device, shape)?;
-            }
+                None => None,
+            };
             // The sampled verify draws the target's token per row with `sampler`
             // (#943 §2); the greedy one reads the argmax, as before.
             let verified = match sampler.as_deref_mut() {
@@ -1729,8 +1732,8 @@ impl<'m, M: CausalLM> Session<'m, M> {
                     .model
                     .verify_and_probe(&drafts, anchors, &mut self.seq.cache, eos_ids),
             };
-            if let Some((device, _)) = verify_key {
-                crate::nn::decode::end_pass(device)?;
+            if let Some(pass) = pass {
+                pass.close(&verified)?;
             }
             let (accepted, probe_out) = verified?;
             // A minimum-width verify can accept a bonus outside the output room.

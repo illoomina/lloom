@@ -10,7 +10,7 @@ use objc2::{rc::Retained, runtime::ProtocolObject};
 use objc2_metal::*;
 use parking_lot::Mutex;
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     ptr::NonNull,
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -65,6 +65,13 @@ pub(crate) struct Queue {
     pub reused: AtomicUsize,
     /// The per-slot sets' counts, shared with every slot (`SlotTrace`).
     slot_trace: Arc<SlotTrace>,
+    /// What a command buffer declares (`kernels.residency.metal4`).
+    declare: super::Metal4Declare,
+    /// The device's sets this queue declares with: on the queue (`queue-*`)
+    /// or used by every command buffer (`cb-*`). Installed by `Commands`
+    /// before the first acquisition; a queue without them lists everything
+    /// in its slot sets whatever the arm.
+    device_sets: OnceLock<Arc<super::ResidencySet>>,
     // LAST: raw/available slots disappear before final capability publication.
     physical: crate::retirement_service::PhysicalAnchor<
         crate::metal_backend::device_retirement::NamespaceOwner,
@@ -103,6 +110,8 @@ impl Queue {
                 on: crate::tuning::tuning().metal.residency_slot_trace,
                 ..SlotTrace::default()
             }),
+            declare: super::Metal4Declare::selected(),
+            device_sets: OnceLock::new(),
             physical: crate::retirement_service::PhysicalAnchor::default(),
         });
         let core = super::retirement::Metal4Completions::new(
@@ -155,6 +164,22 @@ impl Queue {
         self.ready.notify();
     }
 
+    /// What this queue's command buffers declare (`kernels.residency.metal4`).
+    pub(super) fn declare(&self) -> super::Metal4Declare {
+        self.declare
+    }
+
+    /// The device's sets this queue declares with, once the caller has put
+    /// them on the queue (`queue-*`) or for every command buffer to use
+    /// (`cb-*`). Once, before the first acquisition: a slot reads it when it
+    /// is made.
+    pub(super) fn use_device_sets(&self, sets: Arc<super::ResidencySet>) {
+        assert!(
+            self.device_sets.set(sets).is_ok(),
+            "Metal 4 device sets installed once, before the first command buffer"
+        );
+    }
+
     pub fn attach_ledger(&self, ledger: Arc<super::ledger::Ledger>) {
         assert!(
             self.ledger.set(ledger).is_ok(),
@@ -188,6 +213,13 @@ impl Queue {
     #[cfg(test)]
     pub(super) fn slots_for_test(&self) -> (usize, usize) {
         (self.allocated.load(Ordering::Acquire), self.available.len())
+    }
+
+    /// A thread is parked on this queue's slot wake: a test's observation of
+    /// an owner parked for a slot behind held work.
+    #[cfg(test)]
+    pub(super) fn ready_parked_for_test(&self) -> bool {
+        self.ready.test_is_parked()
     }
 
     /// Wake an acquisition parked for a slot, so it re-runs its park hook: a
@@ -371,15 +403,76 @@ impl Drop for Queue {
     }
 }
 
-/// What the per-slot residency sets do, counted only when
+/// What the per-slot residency sets do, counted and timed only when
 /// `kernels.residency.slot_trace` is on: one load per bind or commit when off.
 #[derive(Default)]
 struct SlotTrace {
     on: bool,
     adds: std::sync::atomic::AtomicU64,
+    add_ns: std::sync::atomic::AtomicU64,
+    pipeline_adds: std::sync::atomic::AtomicU64,
+    covered: std::sync::atomic::AtomicU64,
+    set_uses: std::sync::atomic::AtomicU64,
     commits: std::sync::atomic::AtomicU64,
+    commit_ns: std::sync::atomic::AtomicU64,
+    commit_max_ns: std::sync::atomic::AtomicU64,
     last_bytes: std::sync::atomic::AtomicU64,
     max_bytes: std::sync::atomic::AtomicU64,
+    /// `[listing][class column][adds, bytes]` (`SlotResidency::census`).
+    census: [[[std::sync::atomic::AtomicU64; 2]; crate::residency_class::CENSUS_CLASSES];
+        crate::residency_class::SlotListing::ALL.len()],
+    /// The census by `(listing, class column, listing site)`.
+    sites: Mutex<HashMap<(u8, u8, u32), crate::residency_class::CensusCell>>,
+    /// The device's sets, read for the class and site a binding is listed
+    /// under.
+    sets: OnceLock<Arc<super::ResidencySet>>,
+}
+
+/// How a slot met a resource: bound by address as a buffer, a constant page
+/// of its own, or named through a raw path (a blit operand, an ICB run's
+/// `useResources`, the ICB itself).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BindKind {
+    Buffer,
+    Page,
+    Raw,
+}
+
+impl SlotTrace {
+    /// Counts `resource`, met for the first time in a generation, in the
+    /// census: why it was or was not left to the device's sets, the class
+    /// they list it under, its bytes, and the site that listed it. The
+    /// instrument only: takes the device set's lock and a map lock.
+    fn census(
+        &self,
+        resource: &ProtocolObject<dyn MTLResource>,
+        listing: super::DeviceListing,
+        kind: BindKind,
+    ) {
+        use crate::residency_class::{census_column, ResidencyClass, SlotListing};
+        let key = resource as *const _ as usize;
+        let placed = self.sets.get().and_then(|sets| sets.listing_of(key));
+        let why = match (kind, listing) {
+            (BindKind::Page, _) => SlotListing::Page,
+            (BindKind::Raw, _) => SlotListing::Raw,
+            (BindKind::Buffer, super::DeviceListing::Pool) => SlotListing::Covered,
+            (BindKind::Buffer, super::DeviceListing::Held) => SlotListing::Held,
+            (BindKind::Buffer, super::DeviceListing::No) if placed.is_some() => SlotListing::Listed,
+            (BindKind::Buffer, super::DeviceListing::No) => SlotListing::Unlisted,
+        };
+        let class = placed
+            .map(|(class, _)| class)
+            .or_else(|| resource.heap().map(|_| ResidencyClass::HeapChunk));
+        let (row, col) = (why as usize, census_column(class));
+        let bytes = MTLResource::allocatedSize(resource) as u64;
+        self.census[row][col][0].fetch_add(1, Ordering::Relaxed);
+        self.census[row][col][1].fetch_add(bytes, Ordering::Relaxed);
+        let site = placed.map_or(0, |(_, site)| site);
+        let mut sites = self.sites.lock();
+        let cell = sites.entry((row as u8, col as u8, site)).or_default();
+        cell.adds += 1;
+        cell.bytes += bytes;
+    }
 }
 
 impl Queue {
@@ -389,20 +482,73 @@ impl Queue {
         let t = &self.slot_trace;
         t.on.then(|| super::SlotResidency {
             adds: t.adds.load(Ordering::Relaxed),
+            add_ns: t.add_ns.load(Ordering::Relaxed),
+            pipeline_adds: t.pipeline_adds.load(Ordering::Relaxed),
+            covered: t.covered.load(Ordering::Relaxed),
+            set_uses: t.set_uses.load(Ordering::Relaxed),
             commits: t.commits.load(Ordering::Relaxed),
+            commit_ns: t.commit_ns.load(Ordering::Relaxed),
+            commit_max_ns: t.commit_max_ns.load(Ordering::Relaxed),
             last_bytes: t.last_bytes.load(Ordering::Relaxed),
             max_bytes: t.max_bytes.load(Ordering::Relaxed),
+            census: std::array::from_fn(|row| {
+                std::array::from_fn(|col| crate::residency_class::CensusCell {
+                    adds: t.census[row][col][0].load(Ordering::Relaxed),
+                    bytes: t.census[row][col][1].load(Ordering::Relaxed),
+                })
+            }),
         })
     }
 
-    fn note_slot_commit(&self, set: &ProtocolObject<dyn MTLResidencySet>) {
-        let t = &self.slot_trace;
-        if t.on {
-            let bytes = set.allocatedSize();
-            t.commits.fetch_add(1, Ordering::Relaxed);
-            t.last_bytes.store(bytes, Ordering::Relaxed);
-            t.max_bytes.fetch_max(bytes, Ordering::Relaxed);
+    /// The slot census by the site that listed each allocation, most
+    /// resources first; empty when the instrument is off. Symbolizes each
+    /// site once.
+    pub(crate) fn slot_sites(&self) -> Vec<crate::residency_class::SlotSite> {
+        use crate::residency_class::{ResidencyClass, SlotListing, SlotSite};
+        if !self.slot_trace.on {
+            return Vec::new();
         }
+        let cells: Vec<_> = self
+            .slot_trace
+            .sites
+            .lock()
+            .iter()
+            .map(|(&k, &c)| (k, c))
+            .collect();
+        let mut out: Vec<SlotSite> = cells
+            .into_iter()
+            .map(|((row, col, site), cell)| SlotSite {
+                listing: SlotListing::ALL[row as usize],
+                class: ResidencyClass::ALL.get(col as usize).copied(),
+                frames: super::residency_set::listing_sites::frames(site),
+                cell,
+            })
+            .collect();
+        out.sort_by(|a, b| b.cell.adds.cmp(&a.cell.adds).then(a.frames.cmp(&b.frames)));
+        out
+    }
+
+    /// The device's sets the slot census reads classes and sites from.
+    pub(super) fn census_sets(&self, sets: Arc<super::ResidencySet>) {
+        let _ = self.slot_trace.sets.set(sets);
+    }
+
+    /// Commits a slot's set, timing the commit when the instrument is on.
+    fn commit_slot_set(&self, set: &ProtocolObject<dyn MTLResidencySet>) {
+        let t = &self.slot_trace;
+        if !t.on {
+            set.commit();
+            return;
+        }
+        let start = std::time::Instant::now();
+        set.commit();
+        let ns = start.elapsed().as_nanos() as u64;
+        let bytes = set.allocatedSize();
+        t.commits.fetch_add(1, Ordering::Relaxed);
+        t.commit_ns.fetch_add(ns, Ordering::Relaxed);
+        t.commit_max_ns.fetch_max(ns, Ordering::Relaxed);
+        t.last_bytes.store(bytes, Ordering::Relaxed);
+        t.max_bytes.fetch_max(bytes, Ordering::Relaxed);
     }
 }
 
@@ -419,6 +565,13 @@ pub(super) struct Slot {
     residency: Retained<ProtocolObject<dyn MTLResidencySet>>,
     queue: Retained<ProtocolObject<dyn MTL4CommandQueue>>,
     trace: Arc<SlotTrace>,
+    /// Leave a binding the device's sets cover out of this slot's set.
+    diff: bool,
+    /// The device's sets, used by each command buffer (`cb-*`), and the
+    /// router generation `used` was read at.
+    device: Option<Arc<super::ResidencySet>>,
+    used: Vec<Retained<ProtocolObject<dyn MTLResidencySet>>>,
+    used_generation: u64,
     resources: Vec<Retained<ProtocolObject<dyn MTLResource>>>,
     pipelines: Vec<Retained<ProtocolObject<dyn MTLComputePipelineState>>>,
     fences: Vec<Retained<ProtocolObject<dyn MTLFence>>>,
@@ -470,6 +623,16 @@ impl Slot {
             residency,
             queue: queue.raw.clone(),
             trace: queue.slot_trace.clone(),
+            // A covered binding is left out only when the device's sets are
+            // wired into this queue's command buffers.
+            diff: queue.declare.diff() && queue.device_sets.get().is_some(),
+            device: queue
+                .declare
+                .per_command_buffer()
+                .then(|| queue.device_sets.get().cloned())
+                .flatten(),
+            used: Vec::new(),
+            used_generation: u64::MAX,
             resources: Vec::with_capacity(256),
             pipelines: Vec::with_capacity(64),
             fences: Vec::with_capacity(64),
@@ -535,6 +698,7 @@ impl Slot {
             next.setLabel(self.cb.label().as_deref());
             self.extra_cbs.push(next);
         }
+        self.use_device_sets(self.segment);
         self.current().endCommandBuffer();
         self.segment += 1;
         self.current()
@@ -542,18 +706,73 @@ impl Slot {
         Ok(())
     }
 
-    fn resource(&mut self, resource: &ProtocolObject<dyn MTLResource>) {
+    /// Lists `resource` in this slot's set and retains it until the slot
+    /// completes, once a generation. `listing`: whether the device's
+    /// residency sets list it until its last GPU reader completes
+    /// (`Buffer::device_listing`); under a `*-diff` declaration the slot's
+    /// set leaves such a binding to them.
+    fn resource(
+        &mut self,
+        resource: &ProtocolObject<dyn MTLResource>,
+        listing: super::DeviceListing,
+        kind: BindKind,
+    ) {
+        let covered = listing.covered();
         if self.seen.insert(resource as *const _ as usize) {
+            if self.trace.on {
+                self.trace.census(resource, listing, kind);
+            }
             // SAFETY: the caller's borrowed resource is live; the retained
-            // reference and residency remain until this slot completes.
+            // reference remains until this slot completes.
             self.resources.push(
                 unsafe { Retained::retain(std::ptr::from_ref(resource).cast_mut()) }.unwrap(),
             );
-            self.residency
-                .addAllocation(ProtocolObject::from_ref(resource));
-            if self.trace.on {
+            if covered && self.diff {
+                if self.trace.on {
+                    self.trace.covered.fetch_add(1, Ordering::Relaxed);
+                }
+            } else if self.trace.on {
+                let start = std::time::Instant::now();
+                self.residency
+                    .addAllocation(ProtocolObject::from_ref(resource));
+                let ns = start.elapsed().as_nanos() as u64;
                 self.trace.adds.fetch_add(1, Ordering::Relaxed);
+                self.trace.add_ns.fetch_add(ns, Ordering::Relaxed);
+            } else {
+                self.residency
+                    .addAllocation(ProtocolObject::from_ref(resource));
             }
+        }
+    }
+}
+impl Slot {
+    /// Marks the device's sets as part of segment `index`'s execution
+    /// (`cb-*`), just before the segment ends: a set the router made while
+    /// the segment recorded is in the list, since every binding of the
+    /// segment followed its allocation. Re-reads the sets only when the
+    /// router has made one since the last read.
+    fn use_device_sets(&mut self, index: usize) {
+        let Some(device) = &self.device else {
+            return;
+        };
+        let generation = device.natives_generation();
+        if generation != self.used_generation {
+            let (generation, sets) = device.natives();
+            self.used = sets;
+            self.used_generation = generation;
+        }
+        let cb = if index == 0 {
+            &self.cb
+        } else {
+            &self.extra_cbs[index - 1]
+        };
+        for set in &self.used {
+            cb.useResidencySet(set);
+        }
+        if self.trace.on {
+            self.trace
+                .set_uses
+                .fetch_add(self.used.len() as u64, Ordering::Relaxed);
         }
     }
 }
@@ -1381,7 +1600,10 @@ impl PreparedCommit<'_> {
             bindings.require_staged()?;
         }
         let mut state = self.state.get_mut().take().expect("prepared recording");
-        let slot = state.slot.take().expect("prepared recording slot");
+        let mut slot = state.slot.take().expect("prepared recording slot");
+        // The recording is closed: every binding of the last segment is in.
+        let last = slot.segment;
+        slot.use_device_sets(last);
         let physical = state.physical.take();
         let residency = slot.residency.clone();
         let callbacks = std::mem::take(&mut state.callbacks);
@@ -1421,8 +1643,7 @@ impl PreparedCommit<'_> {
         self.phase = CommitPhase::Installed;
         // End/commit of the recording's private residency is not native CB
         // execution. Any unwind before queue entry cancels via rooted custody.
-        residency.commit();
-        submission.queue.note_slot_commit(&residency);
+        submission.queue.commit_slot_set(&residency);
         self.extra.last().unwrap_or(&self.first).endCommandBuffer();
         #[cfg(test)]
         if let Some(control) = &self.test_control {
@@ -1612,18 +1833,22 @@ impl Encoder {
             .slot
             .as_mut()
             .expect("encoding")
-            .resource(resource);
+            .resource(resource, super::DeviceListing::No, BindKind::Raw);
     }
+    /// Binds `buffer` at `index` by GPU address. `listing`: whether the
+    /// device's residency sets list it until its last GPU reader completes
+    /// (`Buffer::device_listing`).
     pub fn buffer(
         &self,
         index: usize,
         buffer: Option<&ProtocolObject<dyn MTLBuffer>>,
         offset: usize,
+        listing: super::DeviceListing,
     ) {
         let mut state = self.submission.state.lock();
         let slot = state.slot.as_mut().expect("encoding");
         let address = buffer.map_or(0, |b| {
-            slot.resource(ProtocolObject::from_ref(b));
+            slot.resource(ProtocolObject::from_ref(b), listing, BindKind::Buffer);
             b.gpuAddress() + offset as u64
         });
         unsafe {
@@ -1667,7 +1892,11 @@ impl Encoder {
                 length,
             );
         }
-        slot.resource(ProtocolObject::from_ref(&*page));
+        slot.resource(
+            ProtocolObject::from_ref(&*page),
+            super::DeviceListing::No,
+            BindKind::Page,
+        );
         unsafe {
             slot.table
                 .setAddress_atIndex(page.gpuAddress() + slot.offset as u64, index);
@@ -1682,6 +1911,9 @@ impl Encoder {
             // a residency set too (MTL4ComputeCommandEncoder.h).
             slot.residency
                 .addAllocation(ProtocolObject::from_ref(pipeline));
+            if slot.trace.on {
+                slot.trace.pipeline_adds.fetch_add(1, Ordering::Relaxed);
+            }
             slot.pipelines.push(
                 unsafe { Retained::retain(std::ptr::from_ref(pipeline).cast_mut()) }.unwrap(),
             );
@@ -1700,6 +1932,7 @@ impl Encoder {
 
 #[cfg(test)]
 mod tests {
+    use super::super::DeviceListing;
     use super::*;
     use objc2_foundation::NSString;
     // CPU-only: deliberately stop between feedback initialization and terminal
@@ -1813,7 +2046,7 @@ mod tests {
                 .unwrap();
             let encoder = submission.encoder().unwrap();
             encoder.pipeline(&pipeline);
-            encoder.buffer(0, Some(&buffer), 0);
+            encoder.buffer(0, Some(&buffer), 0, DeviceListing::No);
             unsafe {
                 encoder.bytes(1, NonNull::from(&n).cast(), std::mem::size_of_val(&n));
             }
@@ -1895,7 +2128,7 @@ mod tests {
                 }
                 let encoder = submission.encoder().unwrap();
                 encoder.pipeline(&pipeline);
-                encoder.buffer(0, Some(&buffer), 0);
+                encoder.buffer(0, Some(&buffer), 0, DeviceListing::No);
                 for _ in 0..count {
                     encoder.raw.dispatchThreads_threadsPerThreadgroup(
                         MTLSize {
@@ -2035,7 +2268,7 @@ mod tests {
             let submission = queue.acquire().unwrap();
             let encoder = submission.encoder().unwrap();
             encoder.pipeline(&pipeline);
-            encoder.buffer(0, Some(&buffer), 0);
+            encoder.buffer(0, Some(&buffer), 0, DeviceListing::No);
             // Each recording crosses the regular page boundary and also uses
             // an oversize page. Constants differ within one native buffer.
             for value in [n + 1000, n] {
@@ -2110,6 +2343,76 @@ mod tests {
             "upload reservations retire with native slots"
         );
     }
+    /// Under `cb-*` every segment of a command buffer marks the device's
+    /// sets used: `beginCommandBufferWithAllocator` drops an earlier
+    /// `useResidencySet`, and a segment boundary begins a new buffer.
+    #[test]
+    fn each_segment_of_a_command_buffer_uses_the_device_sets() {
+        // Read once, before the queue exists (one process per test).
+        std::env::set_var("LLOOM_RESIDENCY_METAL4", "cb-full");
+        std::env::set_var("LLOOM_METAL4_SLOT_TRACE", "1");
+        let _pool = crate::AutoreleaseScope::new();
+        let device = Device::system_default().expect("Metal device");
+        if !device.as_ref().supportsFamily(MTLGPUFamily::Metal4) {
+            return;
+        }
+        let queue = Queue::new(device.clone()).unwrap();
+        assert_eq!(queue.declare(), super::super::Metal4Declare::CbFull);
+        let sets = Arc::new(super::super::ResidencySet::new(&device));
+        // SAFETY: only asks whether a native set exists; nothing is borrowed.
+        if unsafe { sets.raw() }.is_none() {
+            return;
+        }
+        queue.use_device_sets(sets);
+        let event = device.as_ref().newSharedEvent().unwrap();
+        let submission = queue.acquire().unwrap();
+        submission.encoder().unwrap().raw.endEncoding();
+        submission.signal(&event, 1).unwrap();
+        submission.encoder().unwrap().raw.endEncoding();
+        submission.commit().unwrap();
+        submission.wait().unwrap();
+        let t = queue.slot_residency().expect("the instrument is on");
+        println!("MTL4_SEGMENT_SETS set_uses={} commits={}", t.set_uses, t.commits);
+        assert_eq!(
+            t.set_uses, 2,
+            "one device set, used by each of the two segments: {t:?}"
+        );
+        assert_eq!(event.signaledValue(), 1, "the boundary's signal ran");
+    }
+
+    /// A `*-diff` queue the device's sets were never installed on lists a
+    /// covered binding itself: nothing else would make it resident.
+    #[test]
+    fn a_queue_without_the_device_sets_lists_covered_bindings() {
+        // Read once, before the queue exists (one process per test).
+        std::env::set_var("LLOOM_RESIDENCY_METAL4", "queue-diff");
+        std::env::set_var("LLOOM_METAL4_SLOT_TRACE", "1");
+        let _pool = crate::AutoreleaseScope::new();
+        let device = Device::system_default().expect("Metal device");
+        if !device.as_ref().supportsFamily(MTLGPUFamily::Metal4) {
+            return;
+        }
+        let queue = Queue::new(device.clone()).unwrap();
+        assert_eq!(queue.declare(), super::super::Metal4Declare::QueueDiff);
+        let buffer = device
+            .as_ref()
+            .newBufferWithLength_options(256, MTLResourceOptions::StorageModeShared)
+            .unwrap();
+        let submission = queue.acquire().unwrap();
+        let encoder = submission.encoder().unwrap();
+        encoder.buffer(0, Some(&buffer), 0, DeviceListing::Pool);
+        encoder.raw.endEncoding();
+        submission.commit().unwrap();
+        submission.wait().unwrap();
+        let t = queue.slot_residency().expect("the instrument is on");
+        println!("MTL4_UNWIRED_DIFF adds={} covered={}", t.adds, t.covered);
+        assert_eq!(
+            (t.adds, t.covered),
+            (1, 0),
+            "the covered binding is listed by the slot: {t:?}"
+        );
+    }
+
     #[test]
     fn queue_events_order_cross_queue_work_and_feedback() {
         let _pool = crate::AutoreleaseScope::new();
@@ -2140,7 +2443,7 @@ mod tests {
             let submission = queue.acquire().unwrap();
             let encoder = submission.encoder().unwrap();
             encoder.pipeline(&pipeline);
-            encoder.buffer(0, Some(&buffer), 0);
+            encoder.buffer(0, Some(&buffer), 0, DeviceListing::No);
             unsafe {
                 encoder.bytes(1, NonNull::from(&n).cast(), 4);
             }

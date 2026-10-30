@@ -122,6 +122,76 @@ tail remains output. A failed transport is not a successful completed stream
 and need not contain `[DONE]`. Server written-byte witnesses do not prove
 receipt by a client.
 
+**Response contexts are admitted by memory (decisions 83, 84).** Each
+generating completion holds a response context from its body's read until its
+last byte is written, with a declared footprint: `server.response.raw_bytes`
+(default 1 MiB, `--response-raw-bytes`) plus the request body. It is admitted on
+the machine gate — on Metal committed on the device ledger and admitted through
+the process's machine reservation, elsewhere through the server's own
+reservation. A request past the batch width that fits waits for the model; only
+a memory refusal is an HTTP 503, with `Retry-After`. `server.response.contexts`
+has **no default**; set (`--response-contexts N`), it caps the count as an
+operator override (0 admits none). `/health.response` reports `active`,
+`bytes`, `footprint_bytes` and the memory-derived `ceiling`.
+
+Each SSE response permits **1 MiB of unresolved raw text**, including the event
+currently being written. Exceeding that backlog refuses the next whole fragment:
+the earlier accepted frontier remains the history, `finish_reason` is
+`cancelled`, and `timings.response_backlog_limit` is true.
+
+**The reasoning split is a per-response state machine (decision 85).** It routes
+the published text into `content` / `reasoning_content` as it streams,
+transitioning on the markers' token ids (or their literals where the family
+supplies no decode observations); the socket's deltas and the stored session
+reply are both taken from its buffers. There is no marker list and no marker
+bound (`server.response.markers` is gone); a reply that keeps opening and
+closing its block shows as `reasoning_transitions` on the request line, in the
+final event's `timings` and in `/health.response`.
+
+The single-sequence model ticket is released after generation has returned its
+request checkout, the accepted reply/session is published, and request-bound
+metadata is captured — **before** socket draining. A continuation can therefore
+use `previous_response_id` while the preceding response still drains. Stored
+reply fields mean server-accepted text, not remotely acknowledged bytes;
+`written_bytes` and `write_failed` are settled later by transport. No GPU
+retirement certificate or additional global device wait is implied.
+
+**Stored reply versus delivery (decision 59):** a retained session keeps the
+full hook-accepted reply, including a held partial-marker tail even if an
+earlier event later fails to write. `usage.completion_tokens` still counts
+accepted complete sampled tokens (a saved partial raw tail adds no complete
+sampled token); `written_bytes` and `write_failed` are separate
+transport witnesses, not client acknowledgements. Socket failure can prevent a
+final timings event/[DONE]; the request error line carries its frontier then.
+`/health.response_drain` reports active contexts, configured bounds and named
+overload counters; context exhaustion is also a 503 request-line outcome.
+
+Acceptance/publication is coherent in-process visibility, **not crash durability**
+or guaranteed retention: session capacity/idle/memory policy still applies, and
+a restart forgets every session (sessions.md §2/§4/§9). Later delivery failure
+does not roll back a retained accepted reply or make it durable.
+
+Streaming `timings.total_ms` keeps the endpoint's existing pre-trailer wall
+bracket. `decode_call_ms`, `response_settlement_ms`, and `response_drain_ms`
+separate generation from accepted-reply/metadata capture and subsequent drain.
+Without explicit step clocks, `predicted_ms` uses decode-call time minus
+prefill, not socket-drain time. None is a GPU-retirement witness.
+Optional first-token GPU detail is an owned summary of completed global
+recorder entries available at settlement, filtered by the first-token clock
+window; later resets cannot rewrite it, but it is neither complete retirement
+nor exclusive attribution under concurrent execution. Disabled diagnostics add
+no record read or profiling allocation. The row-launch diagnostic is explicitly
+process-cumulative at report time. `/health.reuse` likewise aggregates reported
+requests in report order (failed drains can omit one); its `last` is not the
+session occupant or a readiness certificate.
+
+These are response-context/backlog limits, not a process-memory, request-body,
+connection-thread, or wall-clock drain guarantee. An indefinitely stalled legacy
+writer can retain one of the eight contexts. Explicit controlled transport
+policies retain their separate I/O/cancellation limits; default listener read,
+disposal and pipelining policies are not changed here. Bulk `/eval` retains its
+existing exclusive-run/control-channel contract.
+
 Thinking is template- and model-dependent. On a compatible checkpoint:
 
 ```json

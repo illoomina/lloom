@@ -360,6 +360,9 @@ pub struct PassPlanCounters {
     /// (`MetalDevice::pass_diverged`, a model's replay). None of them was
     /// made a plan.
     pub diverged: u64,
+    /// Passes abandoned after their body failed (`MetalDevice::abort_pass`).
+    /// None of them published a recording or an observation.
+    pub aborted: u64,
 }
 
 /// Alignment of every slot, in bytes.

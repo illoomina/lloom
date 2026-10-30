@@ -62,15 +62,19 @@ impl Compute {
             Self::Metal4(e) => e.pipeline(pipeline),
         }
     }
+    /// `listing`: whether the device's residency sets list `buffer` until its
+    /// last GPU reader completes (`Buffer::device_listing`), which a Metal 4
+    /// slot set may rely on; Metal 3 makes what it binds resident itself.
     pub unsafe fn setBuffer_offset_atIndex(
         &self,
         buffer: Option<&ProtocolObject<dyn MTLBuffer>>,
         offset: usize,
         index: usize,
+        listing: super::DeviceListing,
     ) {
         match self {
             Self::Metal3(e) => unsafe { e.setBuffer_offset_atIndex(buffer, offset, index) },
-            Self::Metal4(e) => e.buffer(index, buffer, offset),
+            Self::Metal4(e) => e.buffer(index, buffer, offset, listing),
         }
     }
     pub unsafe fn setBytes_length_atIndex(

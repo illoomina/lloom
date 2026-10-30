@@ -319,8 +319,9 @@ pub fn kernel_family(label: &str) -> String {
     if label.starts_with("gemm_") || label.starts_with("steel_gemm") {
         return "gemm".to_string();
     }
-    // `mlx_sort.metal`: the arg-sorts (`carg_*`) and the value sorts.
-    if label.starts_with("carg_") {
+    // The arg-sorts: `mlx_sort.metal`'s (`carg_*`) and `sort.metal`'s
+    // one-threadgroup row sorts (`asort_asc_*`, `asort_desc_*`).
+    if label.starts_with("carg_") || label.starts_with("asort_") {
         return "arg_sort".to_string();
     }
     if label.starts_with("gdn_step_") {
@@ -880,6 +881,8 @@ mod tests {
             ("cast_f32_u32", "cast"),
             ("gemm_nn_f32_f32_16_32_16_2_2", "gemm"),
             ("carg_block_sort_float32_uint32_bn128_tn8", "arg_sort"),
+            ("asort_desc_f32", "arg_sort"),
+            ("asort_asc_f16", "arg_sort"),
             ("bmaximum_f32_cs", "bmaximum"),
             ("bmul_f32_strided", "bmul"),
             ("fast_sum_f32_strided", "fast_sum"),

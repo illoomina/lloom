@@ -16,9 +16,10 @@
 //! `content`, as before, sends `reasoning_in_content: true` — an opt-out.
 //! `/v1/completions` is unchanged: its text is the reply.
 //!
-//! `usage.completion_tokens` counts the tokens of the completion the client
-//! **received** — the accepted frontier (decision 51 Q4, the standard
-//! semantics). The count the run generated is in `timings.tokens` and
+//! `usage.completion_tokens` counts accepted complete sampled tokens, not
+//! remote receipt (decisions 51 Q4 and 59). Delivery is reported separately;
+//! a late socket failure does not rewrite the retained accepted reply.
+//! The count the run generated is in `timings.tokens` and
 //! `timings.frontier`, which differ past a stop string on the adaptive commit.
 //! - the **benchmark sidecar** contract LiquidAI's `pipette` runners drive an
 //!   engine through (`Liquid4All/pipette-clients`, the MLX sidecar's shape):
@@ -52,7 +53,7 @@ use super::template::{
 use super::thinking::{self, Thinking};
 use super::vision::{expand_image_tokens, split_image_parts, DecodedImage};
 use crate::frontend::Frontend;
-use crate::sink::{DeltaBuffer, DRAIN_PERIOD};
+use crate::sink::{Batch, DeltaBuffer, DRAIN_PERIOD};
 use crate::{DecodeParams, Decoded, Stop};
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -129,6 +130,7 @@ struct Shared {
     decisions: super::decisions::Decisions,
     /// Request threads queue here for the family's single request slot.
     turns: turns::Turns,
+    responses: ResponseContexts,
     /// Decisions that wait together join one group (`scheduler.decision_pack`,
     /// and the `fast` contract).
     decision_pack: bool,
@@ -156,6 +158,269 @@ struct Shared {
     /// Where the keep-warm reads the pressure level, when not the kernel
     /// (`server.keep_warm_pressure_file`).
     keep_warm_pressure_file: Option<String>,
+}
+
+#[cfg(test)]
+const MAX_RESPONSE_BACKLOG: usize = 1 << 20;
+
+/// Seconds a client refused for memory is told to wait (`Retry-After`): a
+/// response context ends when its reply drains, which is the client's pace.
+const RETRY_AFTER_S: u32 = 1;
+
+/// What a response context is admitted against (decisions 83, 84).
+enum ResponseMemory {
+    /// `memory.machine.gate = false`: nothing read, nothing reserved.
+    Off,
+    /// The device's ledger: a context's footprint is committed there for its
+    /// life and admitted on the machine through the process's reservation,
+    /// as a pass's bytes are (`Ledger::admit_machine`, `memory.md` §9.10).
+    #[cfg(feature = "metal")]
+    Ledger {
+        ledger: Arc<lloom_tensor::kernels::metal::ledger::Ledger>,
+        gate: lloom_tensor::machine::Gate,
+    },
+    /// No device ledger: the server's own reservation on the machine,
+    /// widened to the bytes its contexts hold, taken at the first context.
+    Machine {
+        gate: lloom_tensor::machine::Gate,
+        holding: parking_lot::Mutex<Option<Arc<lloom_tensor::machine::Holding>>>,
+    },
+}
+
+/// The generating requests in flight, each holding a response context from
+/// its body's read until its last byte is written: admitted by memory, with
+/// an optional operator count (`server.response.contexts`, decision 83). A
+/// request past the batch width waits for the model; only a refusal is a 503.
+/// Interim: the footprint becomes a per-session page quota on the paged
+/// token logs (#1145, #1146).
+struct ResponseContexts {
+    limits: crate::options::ServerResponseConfig,
+    memory: ResponseMemory,
+    /// The check and the reservation are one critical section, per request.
+    admit: parking_lot::Mutex<()>,
+    active: AtomicUsize,
+    bytes: AtomicUsize,
+    refused_memory: AtomicU64,
+    refused_count: AtomicU64,
+    backlog_refused: AtomicU64,
+    pre_trailer_write_errors: AtomicU64,
+    transitions: AtomicU64,
+    transitions_max: AtomicU64,
+}
+
+/// One admitted context; dropping it gives its footprint back.
+struct ResponseContext<'a> {
+    contexts: &'a ResponseContexts,
+    bytes: usize,
+    #[cfg(feature = "metal")]
+    _reservation: Option<lloom_tensor::kernels::metal::ledger::Reservation>,
+}
+
+/// Why a context was not admitted.
+#[derive(Debug)]
+enum Overload {
+    /// The machine gate refused the footprint, or could not be read.
+    Memory(String),
+    /// `server.response.contexts` contexts are in flight.
+    Count(usize),
+}
+
+impl Default for ResponseContexts {
+    fn default() -> Self {
+        Self::with_memory(Default::default(), ResponseMemory::Off)
+    }
+}
+
+impl ResponseContexts {
+    fn with_memory(limits: crate::options::ServerResponseConfig, memory: ResponseMemory) -> Self {
+        Self {
+            limits,
+            memory,
+            admit: parking_lot::Mutex::new(()),
+            active: AtomicUsize::new(0),
+            bytes: AtomicUsize::new(0),
+            refused_memory: AtomicU64::new(0),
+            refused_count: AtomicU64::new(0),
+            backlog_refused: AtomicU64::new(0),
+            pre_trailer_write_errors: AtomicU64::new(0),
+            transitions: AtomicU64::new(0),
+            transitions_max: AtomicU64::new(0),
+        }
+    }
+
+    /// The contexts a server on `device` admits: the device's ledger where
+    /// it has one, else a reservation of the server's own.
+    fn new(
+        limits: crate::options::ServerResponseConfig,
+        memory: &crate::options::MemoryConfig,
+        device: &lloom_tensor::Device,
+    ) -> Self {
+        if !memory.machine_gate {
+            return Self::with_memory(limits, ResponseMemory::Off);
+        }
+        let gate = memory
+            .machine_gate()
+            .with_device_working_set(lloom::nn::memory::working_set_bytes(device));
+        #[cfg(feature = "metal")]
+        if let lloom_tensor::Device::Metal(m) = device {
+            let ledger = Arc::clone(m.ledger());
+            return Self::with_memory(limits, ResponseMemory::Ledger { ledger, gate });
+        }
+        let _ = device;
+        Self::with_memory(
+            limits,
+            ResponseMemory::Machine {
+                gate,
+                holding: parking_lot::Mutex::new(None),
+            },
+        )
+    }
+
+    /// A context's declared footprint: the cold buffer's share
+    /// (`server.response.raw_bytes`) and the request body it holds.
+    fn footprint(&self, body: usize) -> usize {
+        self.limits.raw_bytes.saturating_add(body)
+    }
+
+    fn try_take(&self, body: usize) -> std::result::Result<ResponseContext<'_>, Overload> {
+        let need = self.footprint(body);
+        let _admit = self.admit.lock();
+        if let Some(limit) = self.limits.contexts {
+            if self.active.load(Ordering::Acquire) >= limit {
+                self.refused_count.fetch_add(1, Ordering::Relaxed);
+                return Err(Overload::Count(limit));
+            }
+        }
+        let refused = |why: String| {
+            self.refused_memory.fetch_add(1, Ordering::Relaxed);
+            Overload::Memory(why)
+        };
+        let in_use = self.bytes.load(Ordering::Acquire);
+        let after = in_use
+            .checked_add(need)
+            .ok_or_else(|| refused("response context bytes overflow".into()))?;
+        #[cfg(feature = "metal")]
+        let mut reservation = None;
+        match &self.memory {
+            ResponseMemory::Off => {}
+            #[cfg(feature = "metal")]
+            ResponseMemory::Ledger { ledger, .. } => {
+                let target = ledger
+                    .committed()
+                    .checked_add(need)
+                    .ok_or_else(|| refused("ledger bytes overflow".into()))?;
+                ledger
+                    .admit_machine(target as u64)
+                    .map_err(|e| refused(e.to_string()))?;
+                reservation = Some(ledger.reserve(need));
+            }
+            ResponseMemory::Machine { gate, holding } => {
+                let mut holding = holding.lock();
+                match holding.as_ref() {
+                    Some(h) => {
+                        h.try_grow_to(after as u64).map_err(|e| {
+                            refused(match e {
+                                lloom_tensor::machine::GrowRefusal::Room(v) => v.line(),
+                                lloom_tensor::machine::GrowRefusal::Unavailable(e) => {
+                                    format!("{e}")
+                                }
+                            })
+                        })?;
+                    }
+                    None => {
+                        let peak = lloom_tensor::machine::Peak::new()
+                            .with("response contexts", after as u64);
+                        let admitted = gate
+                            .admit("lloom serve: response contexts", &peak)
+                            .map_err(|e| refused(format!("{e}")))?;
+                        *holding = admitted.holding;
+                    }
+                }
+            }
+        }
+        self.active.fetch_add(1, Ordering::AcqRel);
+        self.bytes.store(after, Ordering::Release);
+        Ok(ResponseContext {
+            contexts: self,
+            bytes: need,
+            #[cfg(feature = "metal")]
+            _reservation: reservation,
+        })
+    }
+
+    /// A finished reply's transition count, for `/health`.
+    fn note_transitions(&self, n: u64) {
+        self.transitions.fetch_add(n, Ordering::Relaxed);
+        self.transitions_max.fetch_max(n, Ordering::Relaxed);
+    }
+
+    /// How many contexts fit: the count override, or those in flight plus
+    /// what the memory left admits at a context's footprint with an empty
+    /// body. `None` with the gate off, or the machine unreadable.
+    fn ceiling(&self) -> (Option<usize>, &'static str) {
+        if let Some(n) = self.limits.contexts {
+            return (Some(n), "override");
+        }
+        let per = self.footprint(0).max(1);
+        let active = self.active.load(Ordering::Acquire);
+        let headroom = |gate: &lloom_tensor::machine::Gate, reserved: u64, held: u64| {
+            gate.room().map(|room| {
+                let room = u128::try_from(room.max(0)).unwrap_or(0);
+                let slack = u128::from(reserved.saturating_sub(held));
+                active.saturating_add(
+                    usize::try_from((room + slack) / per as u128).unwrap_or(usize::MAX),
+                )
+            })
+        };
+        match &self.memory {
+            ResponseMemory::Off => (None, "gate-off"),
+            #[cfg(feature = "metal")]
+            ResponseMemory::Ledger { ledger, gate } => (
+                headroom(
+                    gate,
+                    ledger.machine_reserved().unwrap_or(0),
+                    ledger.committed() as u64,
+                ),
+                "memory",
+            ),
+            ResponseMemory::Machine { gate, holding } => {
+                let reserved = holding.lock().as_ref().map_or(0, |h| h.reserved());
+                (
+                    headroom(gate, reserved, self.bytes.load(Ordering::Acquire) as u64),
+                    "memory",
+                )
+            }
+        }
+    }
+
+    fn json(&self) -> Value {
+        let (ceiling, basis) = self.ceiling();
+        json!({
+            "active": self.active.load(Ordering::Relaxed),
+            "bytes": self.bytes.load(Ordering::Relaxed),
+            "footprint_bytes": self.footprint(0),
+            "ceiling": ceiling,
+            "ceiling_basis": basis,
+            "raw_bytes": self.limits.raw_bytes,
+            "overload": {
+                "memory": self.refused_memory.load(Ordering::Relaxed),
+                "contexts": self.refused_count.load(Ordering::Relaxed),
+                "unresolved_bytes": self.backlog_refused.load(Ordering::Relaxed),
+            },
+            "pre_trailer_write_errors": self.pre_trailer_write_errors.load(Ordering::Relaxed),
+            "reasoning_transitions": {
+                "total": self.transitions.load(Ordering::Relaxed),
+                "max_per_response": self.transitions_max.load(Ordering::Relaxed),
+            },
+        })
+    }
+}
+
+impl Drop for ResponseContext<'_> {
+    fn drop(&mut self) {
+        self.contexts.bytes.fetch_sub(self.bytes, Ordering::AcqRel);
+        self.contexts.active.fetch_sub(1, Ordering::Release);
+    }
 }
 
 /// The largest `/v1/systemone` body a decision-only owner reads: eight
@@ -285,6 +550,32 @@ fn run_owner(
     load_facts: Option<(Instant, bool)>,
     transport: Option<tiny_http::TransportPolicy>,
 ) -> Result<()> {
+    run_owner_dispatched(
+        options,
+        engine,
+        model_path,
+        load_facts,
+        transport,
+        |shared, path, request, first| handle_model_request(shared, path, request, first),
+        |_, _| Ok(()),
+    )
+}
+
+// One existing setup/accept/retirement path. Production supplies zero-capture
+// function items; only the private benchmark supplies instrumented callbacks.
+fn run_owner_dispatched<D, R>(
+    options: crate::EngineOptions,
+    engine: Box<dyn Served>,
+    model_path: std::path::PathBuf,
+    load_facts: Option<(Instant, bool)>,
+    transport: Option<tiny_http::TransportPolicy>,
+    dispatch: D,
+    ready: R,
+) -> Result<()>
+where
+    D: Fn(&Arc<Shared>, &str, Request, FirstToken) -> Result<()> + Clone + Send + Sync + 'static,
+    R: FnOnce(&Arc<Shared>, &Value) -> Result<()>,
+{
     let model_name = engine.model_name().to_string();
     let mut sampling = options.sampling.clone();
     sampling.apply_checkpoint(engine.generation_config_checked()?.as_ref());
@@ -380,10 +671,13 @@ fn run_owner(
         #[allow(unreachable_patterns)]
         _ => port,
     };
+    let responses =
+        ResponseContexts::new(options.server.response, &options.memory, engine.device());
     let shared = Arc::new(Shared {
         engine,
         decisions,
         turns: turns::Turns::default(),
+        responses,
         decision_pack: options.scheduler.decision_pack
             && lloom_tensor::tuning::contract().is_fast(),
         aborts: Mutex::new(HashSet::new()),
@@ -404,115 +698,132 @@ fn run_owner(
     });
     let heartbeat = start_keep_warm(&shared)?;
 
-    // The ready marker the sidecar runner waits for, on stdout and nothing
-    // else on stdout before it. Everything the operator reads goes to stderr.
-    println!(
-        "{}",
-        json!({"kind": "ready", "host": host, "port": port, "configuration": configuration})
-    );
-    std::io::stdout().flush().ok();
-    eprintln!("[serving on http://{host}:{port}]");
+    // A fallible private ready hook shares the SAME normal shutdown below.
+    let serving = (|| -> Result<()> {
+        ready(&shared, &configuration)?;
+        // The ready marker the sidecar runner waits for, on stdout and nothing
+        // else on stdout before it. Everything the operator reads goes to stderr.
+        println!(
+            "{}",
+            json!({"kind": "ready", "host": host, "port": port, "configuration": configuration})
+        );
+        std::io::stdout().flush().ok();
+        eprintln!("[serving on http://{host}:{port}]");
 
-    loop {
-        let request = match shared.server.recv() {
-            Ok(r) => r,
-            Err(_) => break,
-        };
-        let path = request.url().split('?').next().unwrap_or("").to_string();
-        let method = request.method().clone();
-        match (method, path.as_str()) {
-            (Method::Get, "/health") => {
-                let result = health_body(shared.engine.as_ref(), &shared.front).map(|mut b| {
-                    b["reuse"] = shared.reuse.lock().json(shared.engine.reuse_prefix());
-                    b["sampling"] = sampling_json(&shared.sampling);
-                    b["sessions"] = shared.sessions.lock().json();
-                    b["keep_warm"] = shared.keep_warm.json(&shared.activity, uptime_ns());
-                    b["keep_warm_actions"] = json!(shared.activity.actions.load(Ordering::Relaxed));
-                    if let Some((adds, commits, last, max)) =
-                        shared.engine.device().metal4_slot_residency()
-                    {
-                        b["metal4_slot_residency"] = json!({
-                            "adds": adds,
-                            "commits": commits,
-                            "last_bytes": last,
-                            "max_bytes": max,
-                        });
-                    }
-                    b
-                });
-                let _ = respond_metadata(request, result);
-            }
-            (Method::Get, "/v1/models") => {
-                let result = models_body(
-                    &shared.model_name,
-                    shared.engine.as_ref(),
-                    &shared.decisions,
-                );
-                let _ = respond_metadata(request, result);
-            }
-            (Method::Get, "/v1l/features") => {
-                let _ = respond_metadata(request, Ok(features_body(&shared)));
-            }
-            (Method::Get, p) if p.starts_with(SESSIONS_ROUTE) => {
-                let auth = auth_digest(request.headers());
-                let found = shared.sessions.lock().inspect(
-                    &p[SESSIONS_ROUTE.len()..],
-                    auth,
-                    Instant::now(),
-                );
-                let _ = match found {
-                    Ok(body) => respond_json(request, 200, &body),
-                    Err(lost) => respond_error(request, 404, &not_held(lost)),
-                };
-            }
-            (Method::Delete, p) if p.starts_with(SESSIONS_ROUTE) => {
-                let auth = auth_digest(request.headers());
-                let gone =
-                    shared
-                        .sessions
-                        .lock()
-                        .delete(&p[SESSIONS_ROUTE.len()..], auth, Instant::now());
-                let _ = match gone {
-                    Ok(()) => respond_json(request, 200, &json!({ "deleted": true })),
-                    Err(lost) => respond_error(request, 404, &not_held(lost)),
-                };
-            }
-            (Method::Post, "/eval/abort") => {
-                let _ = handle_abort(&shared, request);
-            }
-            (Method::Post, "/shutdown") => {
-                let _ = respond_json(request, 200, &json!({}));
-                eprintln!("[shutdown requested]");
-                break;
-            }
-            (Method::Post, _) => {
-                let shared = Arc::clone(&shared);
-                let recv = uptime_ns();
-                let idle = recv.saturating_sub(shared.activity.last_active.load(Ordering::Acquire));
-                std::thread::spawn(move || {
-                    let path = path;
-                    let started = Instant::now();
-                    let first = FirstToken {
-                        recv,
-                        handler: uptime_ns(),
-                        idle,
-                        ..FirstToken::default()
+        loop {
+            let request = match shared.server.recv() {
+                Ok(r) => r,
+                Err(_) => break,
+            };
+            let path = request.url().split('?').next().unwrap_or("").to_string();
+            let method = request.method().clone();
+            match (method, path.as_str()) {
+                (Method::Get, "/health") => {
+                    let result = health_body(shared.engine.as_ref(), &shared.front).map(|mut b| {
+                        b["reuse"] = shared.reuse.lock().json(shared.engine.reuse_prefix());
+                        b["sampling"] = sampling_json(&shared.sampling);
+                        b["sessions"] = shared.sessions.lock().json();
+                        b["response"] = shared.responses.json();
+                        b["keep_warm"] = shared.keep_warm.json(&shared.activity, uptime_ns());
+                        b["keep_warm_actions"] =
+                            json!(shared.activity.actions.load(Ordering::Relaxed));
+                        if let Some(s) = shared.engine.device().metal4_slot_residency() {
+                            b["metal4_slot_residency"] = json!({
+                                "adds": s.adds,
+                                "add_ns": s.add_ns,
+                                "pipeline_adds": s.pipeline_adds,
+                                "covered": s.covered,
+                                "set_uses": s.set_uses,
+                                "commits": s.commits,
+                                "commit_ns": s.commit_ns,
+                                "commit_max_ns": s.commit_max_ns,
+                                "last_bytes": s.last_bytes,
+                                "max_bytes": s.max_bytes,
+                                "census": slot_census_json(
+                                    &s,
+                                    &shared.engine.device().metal4_slot_sites(),
+                                ),
+                            });
+                        }
+                        b
+                    });
+                    let _ = respond_metadata(request, result);
+                }
+                (Method::Get, "/v1/models") => {
+                    let result = models_body(
+                        &shared.model_name,
+                        shared.engine.as_ref(),
+                        &shared.decisions,
+                    );
+                    let _ = respond_metadata(request, result);
+                }
+                (Method::Get, "/v1l/features") => {
+                    let _ = respond_metadata(request, Ok(features_body(&shared)));
+                }
+                (Method::Get, p) if p.starts_with(SESSIONS_ROUTE) => {
+                    let auth = auth_digest(request.headers());
+                    let found = shared.sessions.lock().inspect(
+                        &p[SESSIONS_ROUTE.len()..],
+                        auth,
+                        Instant::now(),
+                    );
+                    let _ = match found {
+                        Ok(body) => respond_json(request, 200, &body),
+                        Err(lost) => respond_error(request, 404, &not_held(lost)),
                     };
-                    let answered = handle_model_request(&shared, &path, request, first);
-                    shared.activity.request_ended(uptime_ns());
-                    if let Err(e) = answered {
-                        eprintln!(
-                            "[{path} failed after {:.1} ms: {e:#}]",
-                            ms(started.elapsed())
-                        );
-                    }
-                });
-            }
-            _ => {
-                let _ = respond_error(request, 404, &format!("unknown endpoint: {path}"));
+                }
+                (Method::Delete, p) if p.starts_with(SESSIONS_ROUTE) => {
+                    let auth = auth_digest(request.headers());
+                    let gone = shared.sessions.lock().delete(
+                        &p[SESSIONS_ROUTE.len()..],
+                        auth,
+                        Instant::now(),
+                    );
+                    let _ = match gone {
+                        Ok(()) => respond_json(request, 200, &json!({ "deleted": true })),
+                        Err(lost) => respond_error(request, 404, &not_held(lost)),
+                    };
+                }
+                (Method::Post, "/eval/abort") => {
+                    let _ = handle_abort(&shared, request);
+                }
+                (Method::Post, "/shutdown") => {
+                    let _ = respond_json(request, 200, &json!({}));
+                    eprintln!("[shutdown requested]");
+                    break;
+                }
+                (Method::Post, _) => {
+                    let shared = Arc::clone(&shared);
+                    let recv = uptime_ns();
+                    let idle =
+                        recv.saturating_sub(shared.activity.last_active.load(Ordering::Acquire));
+                    let dispatch = dispatch.clone();
+                    std::thread::spawn(move || {
+                        let path = path;
+                        let started = Instant::now();
+                        let first = FirstToken {
+                            recv,
+                            handler: uptime_ns(),
+                            idle,
+                            ..FirstToken::default()
+                        };
+                        let answered = dispatch(&shared, &path, request, first);
+                        shared.activity.request_ended(uptime_ns());
+                        if let Err(e) = answered {
+                            eprintln!(
+                                "[{path} failed after {:.1} ms: {e:#}]",
+                                ms(started.elapsed())
+                            );
+                        }
+                    });
+                }
+                _ => {
+                    let _ = respond_error(request, 404, &format!("unknown endpoint: {path}"));
+                }
             }
         }
-    }
+        Ok(())
+    })();
     // In-flight requests answer within the budget; then their connections
     // are cut. A request thread still decoding holds the sequence, and the
     // batch thread holds the pool; wait for both so the model is not dropped
@@ -522,7 +833,7 @@ fn run_owner(
     }
     shutdown_http(&shared.server);
     shared.engine.shutdown();
-    Ok(())
+    serving
 }
 
 /// Starts `shared.keep_warm`'s heartbeat, if it is on. Each action takes the
@@ -731,8 +1042,29 @@ fn run_decisions_configured(
 fn handle_model_request(
     shared: &Shared,
     path: &str,
+    request: Request,
+    first: FirstToken,
+) -> Result<()> {
+    handle_model_request_with_stream(
+        shared,
+        path,
+        request,
+        first,
+        |request| ChunkedWriter::start(request, "text/event-stream"),
+        |turn| drop(turn.take()),
+    )
+}
+
+// One routing/body/admission/error algorithm. Production passes its existing
+// writer and settled action; tests can hold transport without adding a public
+// scheduling option or duplicating the handler. No new per-request allocation.
+fn handle_model_request_with_stream<'a>(
+    shared: &'a Shared,
+    path: &str,
     mut request: Request,
     mut first: FirstToken,
+    start_stream: impl FnOnce(Request) -> Result<ChunkedWriter>,
+    on_settled: impl FnOnce(&mut Option<turns::Turn<'a>>),
 ) -> Result<()> {
     let mut body = String::new();
     request
@@ -756,10 +1088,40 @@ fn handle_model_request(
     }) {
         return respond_systemone(request, result);
     }
+    let _context = if matches!(path, "/v1/completions" | "/v1/chat/completions") {
+        match shared.responses.try_take(body.len()) {
+            Ok(context) => Some(context),
+            Err(overload) => {
+                let responses = &shared.responses;
+                let (reason, message) = match &overload {
+                    Overload::Memory(why) => (
+                        "memory",
+                        format!("the machine cannot hold another response context now: {why}"),
+                    ),
+                    Overload::Count(limit) => (
+                        "contexts",
+                        format!(
+                            "{limit} response contexts are in flight (server.response.contexts)"
+                        ),
+                    ),
+                };
+                eprintln!(
+                    "[{path}: status=503 overload={reason} response_contexts={} response_bytes={} \
+                     footprint={}]",
+                    responses.active.load(Ordering::Relaxed),
+                    responses.bytes.load(Ordering::Relaxed),
+                    responses.footprint(body.len()),
+                );
+                return respond_overloaded(request, &message);
+            }
+        }
+    } else {
+        None
+    };
     // A single-sequence engine's model requests take the request slot one at
     // a time; a batched engine schedules its own rows.
-    let _turn = (path != "/tokenize" && shared.engine.batch() <= 1).then(|| shared.turns.take());
-    if _turn.is_some() {
+    let mut turn = (path != "/tokenize" && shared.engine.batch() <= 1).then(|| shared.turns.take());
+    if turn.is_some() {
         first.slot = uptime_ns();
     }
     let value: Value = if body.trim().is_empty() {
@@ -768,6 +1130,7 @@ fn handle_model_request(
         match serde_json::from_str(&body) {
             Ok(v) => v,
             Err(e) => {
+                drop(turn.take());
                 respond_error(request, 400, &format!("request body is not JSON: {e}"))?;
                 return Ok(());
             }
@@ -792,15 +1155,32 @@ fn handle_model_request(
     };
     first.built = uptime_ns();
     match result {
-        Ok(Reply::Json(v)) => respond_json(request, 200, &v),
+        Ok(Reply::Json(v)) => {
+            drop(turn.take());
+            respond_json(request, 200, &v)
+        }
         Ok(Reply::Stream(mut stream)) => {
             stream.first = first;
-            stream_response(shared, request, *stream)
+            stream_response_settlement(
+                shared,
+                *stream,
+                || start_stream(request),
+                || on_settled(&mut turn),
+            )
         }
         Ok(Reply::Eval(v)) => eval(shared, request, &v),
-        Err(Failure::BadRequest(m)) => respond_error(request, 400, &m),
-        Err(Failure::NotFound(m)) => respond_error(request, 404, &m),
-        Err(Failure::Internal(e)) => respond_error(request, 500, &format!("{e:#}")),
+        Err(Failure::BadRequest(m)) => {
+            drop(turn.take());
+            respond_error(request, 400, &m)
+        }
+        Err(Failure::NotFound(m)) => {
+            drop(turn.take());
+            respond_error(request, 404, &m)
+        }
+        Err(Failure::Internal(e)) => {
+            drop(turn.take());
+            respond_error(request, 500, &format!("{e:#}"))
+        }
     }
 }
 
@@ -998,46 +1378,107 @@ impl FirstToken {
 /// the command buffers committed between the decode's entry and the first
 /// fragment, on the stamps' clock — when the GPU started, how much of the
 /// window it was busy, and what it sat idle.
-#[cfg(feature = "metal")]
-fn first_token_gpu(endpoint: &str, first: &FirstToken) {
-    use lloom_tensor::kernels::metal::profile;
-    if !profile::recorder_enabled() || first.decode == 0 || first.fragment == 0 {
-        return;
-    }
+#[cfg(any(feature = "metal", test))]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct FirstGpuSnapshot {
+    enabled: bool,
+    summary: Option<FirstGpuSummary>,
+}
+
+#[cfg(any(feature = "metal", test))]
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct FirstGpuSummary {
+    buffers: usize,
+    first_commit_us: f64,
+    first_start_us: f64,
+    busy_us: f64,
+    idle_us: f64,
+    last_end_us: f64,
+    fragment_us: f64,
+}
+
+/// Completed records available at capture, not a native completion witness.
+#[cfg(any(feature = "metal", test))]
+fn summarize_first_gpu(
+    first: &FirstToken,
+    records: impl IntoIterator<Item = (f64, f64, f64)>,
+) -> FirstGpuSnapshot {
     let (from, to) = (first.decode as f64 * 1e-9, first.fragment as f64 * 1e-9);
-    let mut cbs: Vec<profile::GpuInterval> = Vec::new();
+    let mut intervals = Vec::new();
     let mut commit0 = f64::INFINITY;
-    for r in profile::command_buffer_records() {
-        if r.committed >= from && r.interval.start <= to {
-            commit0 = commit0.min(r.committed);
-            cbs.push(r.interval);
+    for (committed, start, end) in records {
+        if committed >= from && start <= to {
+            commit0 = commit0.min(committed);
+            intervals.push((start, end));
         }
     }
-    let Some(start0) = cbs.iter().map(|i| i.start).min_by(f64::total_cmp) else {
-        eprintln!("[first-token gpu: {endpoint} buffers=0]");
-        return;
+    let Some(start0) = intervals.iter().map(|i| i.0).min_by(f64::total_cmp) else {
+        return FirstGpuSnapshot {
+            enabled: true,
+            summary: None,
+        };
     };
-    cbs.sort_by(|a, b| a.start.total_cmp(&b.start));
+    intervals.sort_by(|a, b| a.0.total_cmp(&b.0));
     let (mut busy, mut reach) = (0.0f64, start0);
-    for i in &cbs {
-        let (s, e) = (i.start.max(reach), i.end.min(to));
+    for &(start, end) in &intervals {
+        let (s, e) = (start.max(reach), end.min(to));
         if e > s {
             busy += e - s;
         }
-        reach = reach.max(i.end.min(to));
+        reach = reach.max(end.min(to));
     }
-    let last_end = cbs.iter().map(|i| i.end).fold(f64::MIN, f64::max);
+    let last_end = intervals.iter().map(|i| i.1).fold(f64::MIN, f64::max);
     let rel = |t: f64| (t - first.recv as f64 * 1e-9) * 1e6;
+    FirstGpuSnapshot {
+        enabled: true,
+        summary: Some(FirstGpuSummary {
+            buffers: intervals.len(),
+            first_commit_us: rel(commit0),
+            first_start_us: rel(start0),
+            busy_us: busy * 1e6,
+            idle_us: (to - start0 - busy).max(0.0) * 1e6,
+            last_end_us: rel(last_end),
+            fragment_us: rel(to),
+        }),
+    }
+}
+
+#[cfg(feature = "metal")]
+fn capture_first_token_gpu(first: &FirstToken) -> FirstGpuSnapshot {
+    use lloom_tensor::kernels::metal::profile;
+    // In optimized shipping PROFILE_INSTRUMENTS is false: no record read,
+    // allocation, synchronization or wait occurs on this disabled path.
+    if !profile::recorder_enabled() || first.decode == 0 || first.fragment == 0 {
+        return FirstGpuSnapshot::default();
+    }
+    summarize_first_gpu(
+        first,
+        profile::command_buffer_records()
+            .into_iter()
+            .map(|r| (r.committed, r.interval.start, r.interval.end)),
+    )
+}
+
+#[cfg(feature = "metal")]
+fn first_token_gpu(endpoint: &str, captured: FirstGpuSnapshot) {
+    if !captured.enabled {
+        return;
+    }
+    let Some(s) = captured.summary else {
+        eprintln!("[first-token gpu: {endpoint} buffers=0 scope=completed-records-at-settlement]");
+        return;
+    };
     eprintln!(
         "[first-token gpu: {endpoint} buffers={} first_commit_us={:.0} first_start_us={:.0} \
-         busy_us={:.0} idle_us={:.0} last_end_us={:.0} fragment_us={:.0}]",
-        cbs.len(),
-        rel(commit0),
-        rel(start0),
-        busy * 1e6,
-        (to - start0 - busy).max(0.0) * 1e6,
-        rel(last_end),
-        rel(to),
+         busy_us={:.0} idle_us={:.0} last_end_us={:.0} fragment_us={:.0} \
+         scope=completed-records-at-settlement]",
+        s.buffers,
+        s.first_commit_us,
+        s.first_start_us,
+        s.busy_us,
+        s.idle_us,
+        s.last_end_us,
+        s.fragment_us,
     );
 }
 
@@ -1057,22 +1498,16 @@ fn run_decode(
     }
 }
 
-fn append_fields(to: &mut serde_json::Map<String, Value>, fields: serde_json::Map<String, Value>) {
-    for (key, value) in fields {
-        let previous = to.get(&key).and_then(Value::as_str).unwrap_or("");
-        to.insert(
-            key,
-            Value::String(format!("{previous}{}", value.as_str().unwrap_or(""))),
-        );
-    }
-}
-
+/// Decode with the reply's split machine observing the marker ids. The
+/// machine is the decode thread's: `on_fragment` publishes into it on the
+/// same thread, so the lock is never contended (a writer reads the batches
+/// the machine routed, never the machine).
 fn run_decode_observed(
     engine: &dyn Served,
     prompt_ids: &[u32],
     images: &[DecodedImage],
     params: &DecodeParams,
-    split: Option<&Arc<parking_lot::Mutex<reasoning::Reasoning>>>,
+    split: Option<&parking_lot::Mutex<reasoning::Reasoning>>,
     on_fragment: &mut (dyn FnMut(&str) -> bool + Send),
 ) -> Result<Decoded> {
     if let Some(split) = split {
@@ -1811,8 +2246,7 @@ fn chat_completions(shared: &Shared, v: &Value, auth: Option<[u8; 32]>) -> Handl
     }
     let split =
         reasoning::Reasoning::for_chat(shared.engine.as_ref(), &prompt_ids, reasoning_in_content)?
-            .map(|p| Arc::new(parking_lot::Mutex::new(p)));
-    let mut routed = serde_json::Map::<String, Value>::new();
+            .map(parking_lot::Mutex::new);
     let started = Instant::now();
     let decoded = run_decode_observed(
         shared.engine.as_ref(),
@@ -1822,16 +2256,20 @@ fn chat_completions(shared: &Shared, v: &Value, auth: Option<[u8; 32]>) -> Handl
         split.as_ref(),
         &mut |text| {
             if let Some(p) = &split {
-                append_fields(&mut routed, p.lock().push(text));
+                p.lock().publish(text);
             }
             true
         },
     )
     .inspect_err(|_| shared.sessions.lock().note_other())?;
-    if let Some(p) = &split {
-        append_fields(&mut routed, p.lock().finish());
-    }
+    let split = split.map(|p| {
+        let mut p = p.into_inner();
+        p.finish();
+        shared.responses.note_transitions(p.transitions());
+        p
+    });
     let elapsed = started.elapsed();
+    let vision = shared.engine.vision_report_checked();
     let record_start = Instant::now();
     let logged = prompt.as_ref().map(|p| {
         shared
@@ -1845,11 +2283,12 @@ fn chat_completions(shared: &Shared, v: &Value, auth: Option<[u8; 32]>) -> Handl
     let recorded = frontier.is_some_and(|f| f.logged);
     let engine = shared.engine.as_ref();
     let mut message = json!({"role": "assistant", "content": decoded.text});
-    if split.is_some() {
-        message["content"] = routed
+    if let Some(p) = &split {
+        let mut fields = p.fields();
+        message["content"] = fields
             .remove("content")
             .unwrap_or(Value::String(String::new()));
-        if let Some(reasoning) = routed.remove("reasoning_content") {
+        if let Some(reasoning) = fields.remove("reasoning_content") {
             message["reasoning_content"] = reasoning;
         }
     }
@@ -1863,6 +2302,11 @@ fn chat_completions(shared: &Shared, v: &Value, auth: Option<[u8; 32]>) -> Handl
             message.clone(),
         ),
         None => (Value::Null, String::new()),
+    };
+    let session_line = match &split {
+        Some(p) if session_line.is_empty() => format!("reasoning_transitions={}", p.transitions()),
+        Some(p) => format!("{session_line} reasoning_transitions={}", p.transitions()),
+        None => session_line,
     };
     report_with(
         shared,
@@ -1911,7 +2355,7 @@ fn chat_completions(shared: &Shared, v: &Value, auth: Option<[u8; 32]>) -> Handl
             }
         }
     }
-    attach_vision(shared, &mut body)?;
+    attach_vision(&mut body, vision)?;
     Ok(Reply::Json(body))
 }
 
@@ -2653,6 +3097,7 @@ fn request_processors(
 /// Run the decode on this thread and write the OpenAI SSE stream as fragments
 /// arrive: chunked transfer through the request's raw writer, so a token is on
 /// the wire when the loop's commit drains it.
+#[cfg(test)]
 fn stream_response(shared: &Shared, request: Request, run: StreamingRun) -> Result<()> {
     stream_response_with_writer(shared, run, || {
         ChunkedWriter::start(request, "text/event-stream")
@@ -2662,10 +3107,20 @@ fn stream_response(shared: &Shared, request: Request, run: StreamingRun) -> Resu
 // The HTTP caller and deterministic I/O-failure controls use the same decode,
 // parser finalization, frontier recording and trailer path. Delay opening the
 // writer until the fallible reasoning metadata has been checked.
+#[cfg(test)]
 fn stream_response_with_writer(
     shared: &Shared,
     run: StreamingRun,
     start_writer: impl FnOnce() -> Result<ChunkedWriter>,
+) -> Result<()> {
+    stream_response_settlement(shared, run, start_writer, || {})
+}
+
+fn stream_response_settlement(
+    shared: &Shared,
+    run: StreamingRun,
+    start_writer: impl FnOnce() -> Result<ChunkedWriter>,
+    settled: impl FnOnce(),
 ) -> Result<()> {
     let endpoint = match run.kind {
         StreamKind::Completion => "/v1/completions",
@@ -2680,55 +3135,32 @@ fn stream_response_with_writer(
         )?,
         StreamKind::Completion => None,
     }
-    .map(|p| Arc::new(parking_lot::Mutex::new(p)));
-    // The reply as the client receives it: a session's turn keeps it.
-    let delivered = Arc::new(parking_lot::Mutex::new(
-        serde_json::Map::<String, Value>::new(),
-    ));
-    // Each drained batch of text becomes one chunk, wrapped on the writer's
-    // thread (the counted adapter defers unresolved reasoning prefixes).
+    .map(parking_lot::Mutex::new);
+    // Each drained batch becomes one chunk, wrapped on the writer's thread.
+    // A split reply's batches arrive routed: the writer reads the text each
+    // field gained, never the machine.
     let wrap = {
         let (id, model, kind) = (run.id.clone(), run.model.clone(), run.kind);
-        let split = split.clone();
-        let delivered = Arc::clone(&delivered);
-        move |text: &str| -> (String, usize) {
-            let (chunk, resolved) = match kind {
-                StreamKind::Completion => (
-                    json!({
-                        "id": id, "object": "text_completion", "created": created, "model": model,
-                        "choices": [{ "index": 0, "text": text, "logprobs": null, "finish_reason": null }],
-                    }),
-                    text.len(),
-                ),
-                StreamKind::Chat => {
-                    let (delta, resolved) = match &split {
-                        Some(p) => p.lock().push_counted(text),
-                        None => (
-                            serde_json::Map::from_iter([("content".into(), json!(text))]),
-                            text.len(),
-                        ),
-                    };
-                    append_fields(&mut delivered.lock(), delta.clone());
-                    (
-                        json!({
-                            "id": id, "object": "chat.completion.chunk", "created": created, "model": model,
-                            "choices": [{ "index": 0, "delta": delta, "finish_reason": null }],
-                        }),
-                        resolved,
-                    )
-                }
+        move |batch: &SplitDelta| -> (String, usize) {
+            let chunk = match kind {
+                StreamKind::Completion => json!({
+                    "id": id, "object": "text_completion", "created": created, "model": model,
+                    "choices": [{ "index": 0, "text": batch.content, "logprobs": null, "finish_reason": null }],
+                }),
+                StreamKind::Chat => json!({
+                    "id": id, "object": "chat.completion.chunk", "created": created, "model": model,
+                    "choices": [{ "index": 0, "delta": reasoning::fields(&batch.content, &batch.reasoning),
+                                  "finish_reason": null }],
+                }),
             };
-            (format!("data: {chunk}\n\n"), resolved)
+            (format!("data: {chunk}\n\n"), batch.raw)
         }
     };
     let mut first = run.first;
     let writer = start_writer()?;
     first.headers = uptime_ns();
-    let sw = if split.is_some() {
-        StreamWriter::start_with_counted_deltas(writer, wrap)
-    } else {
-        StreamWriter::start_with_deltas(writer, move |text| wrap(text).0)
-    };
+    let sw = StreamWriter::start_with_batches(writer, wrap)
+        .with_backlog_limit(shared.responses.limits.raw_bytes);
     if let StreamKind::Chat = run.kind {
         sw.event(&json!({
             "id": run.id, "object": "chat.completion.chunk", "created": created,
@@ -2741,9 +3173,10 @@ fn stream_response_with_writer(
     let decoded = {
         let engine = shared.engine.as_ref();
         let fragment = &mut first.fragment;
-        // The callback runs on the decode thread: it hands the text over;
-        // the chunk is built and written on the writer thread. A client that
-        // went away stops the run at the next drained batch.
+        // The callback runs on the decode thread: it routes the text and
+        // hands the batch over; the chunk is built and written on the writer
+        // thread. A client that went away stops the run at the next drained
+        // batch.
         run_decode_observed(
             engine,
             &run.prompt_ids,
@@ -2757,41 +3190,68 @@ fn stream_response_with_writer(
                 if *fragment == 0 {
                     *fragment = uptime_ns();
                 }
-                sw.delta(frag);
+                if !sw.admit(frag.len()) {
+                    return false;
+                }
+                match &split {
+                    Some(machine) => {
+                        let mut machine = machine.lock();
+                        let routed = machine.publish(frag);
+                        let (content, reasoning) = machine.piece(routed);
+                        sw.delta_with(|b| {
+                            b.content.push_str(content);
+                            b.reasoning.push_str(reasoning);
+                            b.raw += routed.resolved;
+                        });
+                    }
+                    None => sw.delta_with(|b| {
+                        b.content.push_str(frag);
+                        b.raw += frag.len();
+                    }),
+                }
                 true
             },
         )
     };
+    let decode_elapsed = started.elapsed();
     let written = sw.written();
     let first_write = sw.first_write();
-    let (mut w, mut write_err) = sw.finish()?;
-    first.written = first_write.load(Ordering::Acquire);
+    let backlog_limited = sw.backlog_limited.load(Ordering::Relaxed);
+    if backlog_limited {
+        shared
+            .responses
+            .backlog_refused
+            .fetch_add(1, Ordering::Relaxed);
+        eprintln!(
+            "[{endpoint}: overload=unresolved-bytes response_backlog_limit={}]",
+            shared.responses.limits.raw_bytes
+        );
+    }
     let decoded = match decoded {
         Ok(decoded) => decoded,
         Err(error) => {
             shared.sessions.lock().note_other();
+            settled();
+            let (w, write_error) = sw.finish()?;
+            if write_error.is_some() {
+                shared
+                    .responses
+                    .pre_trailer_write_errors
+                    .fetch_add(1, Ordering::Relaxed);
+                eprintln!(
+                    "[{endpoint}: delivery_error=true decode_error=true written_bytes={}]",
+                    written.load(Ordering::Relaxed)
+                );
+            }
             return finish_stream_error(w, error);
         }
     };
-    if write_err.is_none() {
-        if let Some(p) = split {
-            let (delta, resolved) = p.lock().finish_counted();
-            append_fields(&mut delivered.lock(), delta.clone());
-            if !delta.is_empty() {
-                match w.event(&json!({
-                    "id": run.id, "object": "chat.completion.chunk", "created": created, "model": run.model,
-                    "choices": [{"index": 0, "delta": delta, "finish_reason": null}],
-                })) {
-                    Ok(()) => {
-                        written.fetch_add(resolved, Ordering::Relaxed);
-                    }
-                    Err(error) => {
-                        write_err = Some(error);
-                    }
-                }
-            }
-        }
-    }
+    let vision = match run.kind {
+        StreamKind::Chat => shared.engine.vision_report_checked(),
+        StreamKind::Completion => Ok(Value::Null),
+    };
+    #[cfg(feature = "metal")]
+    let first_gpu = capture_first_token_gpu(&first);
     // The accepted history is what the server handed the writer; of that,
     // what it knows it wrote, and whether a write failed (what the client
     // received is not known either way).
@@ -2806,15 +3266,25 @@ fn stream_response_with_writer(
         .map(|_| record_start.elapsed().as_micros() as u64);
     let frontier = logged.as_ref().map(|(f, _)| *f);
     let mut frontier_json = frontier.map_or(Value::Null, |f| f.json());
-    if frontier_json.is_object() {
-        frontier_json["written_bytes"] = json!(written.load(Ordering::Relaxed));
-        frontier_json["write_failed"] = json!(write_err.is_some());
-    }
     // The turn is kept whether or not the client stayed: the server's state
     // is what it accepted (the frontier), not what a client acknowledged.
+    // The machine is at the accepted frontier: a marker it still holds was
+    // cut short and is text in its block. Its buffers are the stored reply.
+    let mut split = split.map(parking_lot::Mutex::into_inner);
+    let tail = split.as_mut().map(|machine| {
+        let routed = machine.finish();
+        shared.responses.note_transitions(machine.transitions());
+        let (content, reasoning) = machine.piece(routed);
+        (reasoning::fields(content, reasoning), routed.resolved)
+    });
+    let transitions = split.as_ref().map(|m| m.transitions());
     let (session_json, session_line) = match run.session {
         Some(ctx) => {
-            let mut message = Value::Object(std::mem::take(&mut *delivered.lock()));
+            let fields = match &split {
+                Some(machine) => machine.fields(),
+                None => Map::from_iter([("content".into(), json!(decoded.text))]),
+            };
+            let mut message = Value::Object(fields);
             message["role"] = json!("assistant");
             if message.get("content").is_none() {
                 message["content"] = json!("");
@@ -2830,15 +3300,51 @@ fn stream_response_with_writer(
         }
         None => (Value::Null, String::new()),
     };
+    // Request checkout and callbacks have returned, metadata is captured,
+    // and publication is complete. Native retirement remains the owner's
+    // existing contract, not a socket-drain or profiler-snapshot witness.
+    let settlement_elapsed = started.elapsed();
+    settled();
+    let (mut w, mut write_err) = sw.finish()?;
+    first.written = first_write.load(Ordering::Acquire);
+    if write_err.is_none() {
+        if let Some((delta, resolved)) = tail {
+            if !delta.is_empty() {
+                match w.event(&json!({
+                    "id": run.id, "object": "chat.completion.chunk", "created": created, "model": run.model,
+                    "choices": [{"index": 0, "delta": delta, "finish_reason": null}],
+                })) {
+                    Ok(()) => {
+                        written.fetch_add(resolved, Ordering::Relaxed);
+                    }
+                    Err(error) => {
+                        write_err = Some(error);
+                    }
+                }
+            }
+        }
+    }
+    if frontier_json.is_object() {
+        frontier_json["written_bytes"] = json!(written.load(Ordering::Relaxed));
+        frontier_json["write_failed"] = json!(write_err.is_some());
+    }
     if let Some(e) = write_err {
+        shared
+            .responses
+            .pre_trailer_write_errors
+            .fetch_add(1, Ordering::Relaxed);
+        eprintln!("[{endpoint}: delivery_error=true accepted_bytes={} written_bytes={} frontier={frontier_json}]", decoded.text.len(), written.load(Ordering::Relaxed));
         anyhow::bail!("client went away mid-stream: {e}; frontier {frontier_json}");
     }
     let elapsed = started.elapsed();
-    let session_line = if session_line.is_empty() {
+    let mut session_line = if session_line.is_empty() {
         first.field()
     } else {
         format!("{session_line} {}", first.field())
     };
+    if let Some(n) = transitions {
+        session_line.push_str(&format!(" reasoning_transitions={n}"));
+    }
     report_with(
         shared,
         endpoint,
@@ -2849,7 +3355,7 @@ fn stream_response_with_writer(
         &session_line,
     );
     #[cfg(feature = "metal")]
-    first_token_gpu(endpoint, &first);
+    first_token_gpu(endpoint, first_gpu);
     let usage = run_usage(shared.engine.as_ref(), run.prompt_ids.len(), &decoded);
     let last = match run.kind {
         StreamKind::Completion => json!({
@@ -2857,13 +3363,15 @@ fn stream_response_with_writer(
             "choices": [{ "index": 0, "text": "", "logprobs": null,
                           "finish_reason": finish_reason(decoded.stop) }],
             "usage": usage,
-            "timings": timings(shared.engine.as_ref(), run.prompt_ids.len(), &run.facts, &decoded, elapsed),
+            "timings": stream_timings(shared.engine.as_ref(), run.prompt_ids.len(), &run.facts, &decoded,
+                StreamTimes { decode: decode_elapsed, settled: settlement_elapsed, total: elapsed }),
         }),
         StreamKind::Chat => json!({
             "id": run.id, "object": "chat.completion.chunk", "created": created, "model": run.model,
             "choices": [{ "index": 0, "delta": {}, "finish_reason": finish_reason(decoded.stop) }],
             "usage": usage,
-            "timings": timings(shared.engine.as_ref(), run.prompt_ids.len(), &run.facts, &decoded, elapsed),
+            "timings": stream_timings(shared.engine.as_ref(), run.prompt_ids.len(), &run.facts, &decoded,
+                StreamTimes { decode: decode_elapsed, settled: settlement_elapsed, total: elapsed }),
         }),
     };
     let mut last = last;
@@ -2872,18 +3380,17 @@ fn stream_response_with_writer(
         last["timings"]["session"] = session_json;
     }
     last["timings"]["front_record_us"] = json!(record_us);
+    last["timings"]["response_backlog_limit"] = json!(backlog_limited);
+    if let Some(n) = transitions {
+        last["timings"]["reasoning_transitions"] = json!(n);
+    }
     last["timings"]["first_token"] = first.json(&decoded.stats);
     if run.return_ids {
         last["prompt_token_ids"] = json!(run.prompt_ids);
         last["choices"][0]["token_ids"] = json!(decoded.tokens);
         last["timings"]["tokens"] = json!(decoded.tokens);
     }
-    write_stream_trailer(w, &mut last, |body| {
-        if let StreamKind::Chat = run.kind {
-            attach_vision(shared, body)?;
-        }
-        Ok(())
-    })
+    write_stream_trailer(w, &mut last, |body| attach_vision(body, vision))
 }
 
 /// Post-header completion: checked metadata refusal propagates as a stream
@@ -3468,6 +3975,16 @@ fn respond_error(request: Request, status: u16, message: &str) -> Result<()> {
     )
 }
 
+/// 503 with `Retry-After`: a response context was refused (decision 83).
+fn respond_overloaded(request: Request, message: &str) -> Result<()> {
+    let body = json!({ "error": { "message": message, "type": "server_error", "code": 503 } });
+    let response = Response::from_string(body.to_string())
+        .with_status_code(StatusCode(503))
+        .with_header(header("Content-Type", "application/json"))
+        .with_header(header("Retry-After", &RETRY_AFTER_S.to_string()));
+    request.respond(response).context("writing the response")
+}
+
 fn header(name: &str, value: &str) -> Header {
     Header::from_bytes(name.as_bytes(), value.as_bytes()).expect("static header")
 }
@@ -3531,7 +4048,7 @@ impl ChunkedWriter {
 /// allocation once grown), and this thread takes what accumulated every
 /// [`DRAIN_PERIOD`] and wraps it in one event — a delta of several tokens,
 /// which the OpenAI stream allows.
-struct StreamWriter {
+struct StreamWriter<B: Batch = String> {
     tx: Option<std::sync::mpsc::Sender<(String, usize)>>,
     gone: Arc<AtomicBool>,
     /// Raw text bytes resolved by successfully written events. A routing
@@ -3543,21 +4060,53 @@ struct StreamWriter {
     /// until then).
     first_write: Arc<AtomicU64>,
     thread: Option<std::thread::JoinHandle<(ChunkedWriter, Option<std::io::Error>)>>,
-    deltas: Option<Arc<DeltaBuffer>>,
+    deltas: Option<Arc<DeltaBuffer<B>>>,
     /// The deltas' wire wrapping, shared with the thread: [`Self::send`]
     /// wraps what is pending itself so a control event keeps its place.
-    wrap: Option<Wrap>,
+    wrap: Option<Wrap<B>>,
     /// Off-token ordering only: extraction, stateful wrapping and enqueue.
     /// Never held during socket I/O or acquired by `delta`.
     order: Arc<parking_lot::Mutex<()>>,
     /// The producer's spill (`DeltaBuffer::push`); only the producer locks it.
-    spill: parking_lot::Mutex<String>,
+    spill: parking_lot::Mutex<B>,
     /// Set by the first delta, which wakes the writer rather than waiting
     /// for its next drain: one wake a request, none a token.
     woke: AtomicBool,
+    submitted: AtomicUsize,
+    max_backlog: usize,
+    backlog_limited: AtomicBool,
 }
 
-type Wrap = Arc<dyn Fn(&str) -> (String, usize) + Send + Sync>;
+type Wrap<B> = Arc<dyn Fn(&B) -> (String, usize) + Send + Sync>;
+
+/// One drained batch of a split reply: the text each field gained, and the
+/// raw bytes it resolved (credited to [`StreamWriter::written`] once written).
+#[derive(Default)]
+struct SplitDelta {
+    content: String,
+    reasoning: String,
+    raw: usize,
+}
+
+impl Batch for SplitDelta {
+    fn absorb(&mut self, other: &mut Self) {
+        self.content.push_str(&other.content);
+        self.reasoning.push_str(&other.reasoning);
+        self.raw += other.raw;
+        other.clear();
+    }
+    fn clear(&mut self) {
+        self.content.clear();
+        self.reasoning.clear();
+        self.raw = 0;
+    }
+    fn is_empty(&self) -> bool {
+        self.raw == 0 && self.content.is_empty() && self.reasoning.is_empty()
+    }
+    fn held_bytes(&self) -> usize {
+        self.content.len() + self.reasoning.len()
+    }
+}
 
 impl StreamWriter {
     fn start(w: ChunkedWriter) -> Self {
@@ -3567,6 +4116,7 @@ impl StreamWriter {
     /// [`Self::start`] with a delta buffer: [`Self::delta`] hands text over,
     /// and `wrap` turns each drained batch into its wire event on this
     /// writer's thread.
+    #[cfg(test)]
     fn start_with_deltas(
         w: ChunkedWriter,
         wrap: impl Fn(&str) -> String + Send + Sync + 'static,
@@ -3577,14 +4127,47 @@ impl StreamWriter {
     /// A routing wrapper reports raw bytes resolved by this event, which can
     /// include a prefix held from an earlier batch. Credit follows successful
     /// I/O, not parser mutation; a failed event resolves no written bytes.
+    #[cfg(test)]
     fn start_with_counted_deltas(
         w: ChunkedWriter,
         wrap: impl Fn(&str) -> (String, usize) + Send + Sync + 'static,
     ) -> Self {
+        Self::spawn(w, Some(Arc::new(move |text: &String| wrap(text))))
+    }
+
+    /// Hand text to the writer (the decode thread's per-fragment call on a
+    /// writer started with deltas): no wait, no allocation, and no syscall
+    /// but the first fragment's, which wakes the writer so the first token
+    /// does not wait for a drain period.
+    #[cfg(test)]
+    fn delta(&self, text: &str) {
+        self.delta_with(|b| b.push_str(text));
+    }
+
+    /// Refuse a whole fragment before hand-over when unresolved raw bytes
+    /// would exceed the response's backlog budget. The engine's refusal seam
+    /// retains the earlier accepted frontier and reports cancellation.
+    #[cfg(test)]
+    fn try_delta(&self, text: &str) -> bool {
+        if !self.admit(text.len()) {
+            return false;
+        }
+        self.delta(text);
+        true
+    }
+}
+
+impl<B: Batch + 'static> StreamWriter<B> {
+    /// A writer whose drained batches `wrap` turns into wire events, with
+    /// the raw bytes each resolves.
+    fn start_with_batches(
+        w: ChunkedWriter,
+        wrap: impl Fn(&B) -> (String, usize) + Send + Sync + 'static,
+    ) -> Self {
         Self::spawn(w, Some(Arc::new(wrap)))
     }
 
-    fn spawn(mut w: ChunkedWriter, wrap: Option<Wrap>) -> Self {
+    fn spawn(mut w: ChunkedWriter, wrap: Option<Wrap<B>>) -> Self {
         let (tx, rx) = std::sync::mpsc::channel::<(String, usize)>();
         let gone = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&gone);
@@ -3599,7 +4182,7 @@ impl StreamWriter {
         let thread_order = Arc::clone(&order);
         let thread = std::thread::spawn(move || {
             let mut err: Option<std::io::Error> = None;
-            let mut local = String::with_capacity(4096);
+            let mut local = B::default();
             let write = |w: &mut ChunkedWriter,
                          payload: &str,
                          text: usize,
@@ -3668,8 +4251,11 @@ impl StreamWriter {
             deltas,
             wrap,
             order,
-            spill: parking_lot::Mutex::new(String::new()),
+            spill: parking_lot::Mutex::new(B::default()),
             woke: AtomicBool::new(false),
+            submitted: AtomicUsize::new(0),
+            max_backlog: crate::options::ServerResponseConfig::default().raw_bytes,
+            backlog_limited: AtomicBool::new(false),
         }
     }
 
@@ -3679,10 +4265,10 @@ impl StreamWriter {
     /// The guard is dropped before the caller performs any network I/O.
     fn pending_after_timeout(
         rx: &std::sync::mpsc::Receiver<(String, usize)>,
-        buf: Option<&Arc<DeltaBuffer>>,
-        wrap: Option<&Wrap>,
+        buf: Option<&Arc<DeltaBuffer<B>>>,
+        wrap: Option<&Wrap<B>>,
         order: &parking_lot::Mutex<()>,
-        local: &mut String,
+        local: &mut B,
     ) -> (Option<(String, usize)>, bool) {
         let _guard = order.lock();
         let closed = match rx.try_recv() {
@@ -3697,13 +4283,37 @@ impl StreamWriter {
         (work, closed)
     }
 
-    /// Hand text to the writer (the decode thread's per-fragment call on a
-    /// writer started with deltas): no wait, no allocation, and no syscall
-    /// but the first fragment's, which wakes the writer so the first token
-    /// does not wait for a drain period.
-    fn delta(&self, text: &str) {
+    fn with_backlog_limit(mut self, limit: usize) -> Self {
+        self.max_backlog = limit;
+        self
+    }
+
+    /// Count `len` raw bytes against the response's backlog budget before a
+    /// fragment is handed over, or refuse the whole fragment past it.
+    fn admit(&self, len: usize) -> bool {
+        if self.backlog_limited.load(Ordering::Relaxed) {
+            return false;
+        }
+        let submitted = self.submitted.load(Ordering::Relaxed);
+        let written = self.written.load(Ordering::Relaxed);
+        let Some(next) = submitted.checked_add(len) else {
+            self.backlog_limited.store(true, Ordering::Relaxed);
+            return false;
+        };
+        if next.saturating_sub(written) > self.max_backlog {
+            self.backlog_limited.store(true, Ordering::Relaxed);
+            return false;
+        }
+        self.submitted.store(next, Ordering::Relaxed);
+        true
+    }
+
+    /// Apply `add` to the writer's pending batch (the decode thread's
+    /// per-fragment call): no wait, no allocation once grown, and no syscall
+    /// but the first hand-over's wake.
+    fn delta_with(&self, add: impl FnOnce(&mut B)) {
         if let Some(b) = &self.deltas {
-            b.push(&mut self.spill.lock(), text);
+            b.push_with(&mut self.spill.lock(), add);
             if !self.woke.swap(true, Ordering::Relaxed) {
                 if let Some(tx) = &self.tx {
                     let _ = tx.send((String::new(), 0));
@@ -3718,9 +4328,9 @@ impl StreamWriter {
     fn queue_pending(&self) {
         if let (Some(b), Some(wrap), Some(tx)) = (&self.deltas, &self.wrap, &self.tx) {
             b.flush(&mut self.spill.lock());
-            let mut text = String::new();
-            if b.take_into(&mut text) {
-                let _ = tx.send(wrap(&text));
+            let mut batch = B::default();
+            if b.take_into(&mut batch) {
+                let _ = tx.send(wrap(&batch));
             }
         }
     }
@@ -3778,7 +4388,7 @@ impl StreamWriter {
     }
 }
 
-impl Drop for StreamWriter {
+impl<B: Batch> Drop for StreamWriter<B> {
     fn drop(&mut self) {
         if let Some(b) = &self.deltas {
             b.flush(&mut self.spill.lock());
@@ -3808,8 +4418,8 @@ fn short_id() -> String {
 /// The per-request vision report (`Served::vision_report`: the model's
 /// tensors, whether the tower is loaded, the image census) as a `vision`
 /// field beside `timings`, and on stderr. Nothing for a family without vision.
-fn attach_vision(shared: &Shared, body: &mut Value) -> Result<()> {
-    let report = shared.engine.vision_report_checked()?;
+fn attach_vision(body: &mut Value, report: Result<Value>) -> Result<()> {
+    let report = report?;
     if !report.is_null() {
         eprintln!("[vision: {report}]");
         body["vision"] = report;
@@ -3833,15 +4443,47 @@ fn usage(prompt: usize, completion: usize) -> Value {
     })
 }
 
-/// `usage` for a run: `completion_tokens` is the tokens of the completion the
-/// client received — the accepted frontier (decision 51 Q4, the standard
-/// semantics), which is what [`delivered_ids`] already computes for the
-/// logprobs block. The count the run generated stays in `timings`
-/// (`timings.tokens`, `timings.frontier.generated`): past a stop string on the
-/// adaptive commit with a slow consumer the two differ by up to the backlog,
-/// and those ids are text the client never received.
+/// `usage` for a run: `completion_tokens` counts the accepted completion
+/// frontier (decision 51 Q4 / decision 59), as [`delivered_ids`] computes for
+/// the logprobs block, not acknowledged receipt by the remote client.
+/// `written_bytes` separately credits successful whole-event transport writes.
+/// The generated count stays in `timings.tokens` / `timings.frontier.generated`:
+/// a stop string or consumer refusal can withhold generated text, so the
+/// generated and accepted frontiers need not coincide.
 fn run_usage(engine: &dyn Served, prompt: usize, d: &Decoded) -> Value {
     usage(prompt, delivered_ids(engine, d))
+}
+
+#[derive(Clone, Copy)]
+struct StreamTimes {
+    decode: std::time::Duration,
+    settled: std::time::Duration,
+    total: std::time::Duration,
+}
+
+/// Keep endpoint total through pre-trailer drain; derive decode pace only
+/// from the decode call (or explicit per-step clocks), not the socket delay.
+fn stream_timings(
+    engine: &dyn Served,
+    prompt: usize,
+    facts: &PromptFacts,
+    d: &Decoded,
+    times: StreamTimes,
+) -> Value {
+    let mut t = timings(engine, prompt, facts, d, times.total);
+    if d.stats.step_ns.is_empty() {
+        let predicted_ms = (ms(times.decode) - d.stats.prefill_ns as f64 / 1e6).max(0.0);
+        t["predicted_ms"] = json!(predicted_ms);
+        t["predicted_per_second"] = json!(if predicted_ms > 0.0 {
+            d.tokens.len() as f64 / (predicted_ms / 1e3)
+        } else {
+            0.0
+        });
+    }
+    t["decode_call_ms"] = json!(ms(times.decode));
+    t["response_settlement_ms"] = json!(ms(times.settled.saturating_sub(times.decode)));
+    t["response_drain_ms"] = json!(ms(times.total.saturating_sub(times.settled)));
+    t
 }
 
 /// The engine's own brackets beside the request's wall clock: the prompt's
@@ -3982,11 +4624,34 @@ fn report_with(
                 && lloom_tensor::tuning::f16_rows_max().is_some() =>
         {
             format!(
-                " f16_rows_decode_launches={}",
+                " f16_rows_decode_launches={} f16_rows_decode_scope=process-cumulative-at-report",
                 lloom_tensor::tuning::f16_rows_decode_launches()
             )
         }
+        // A speculative request's verify windows on the row axis: the
+        // window's engagement since the load.
+        crate::ReadbackArm::Speculative { .. }
+            if lloom_tensor::tuning::contract().is_fast()
+                && lloom_tensor::tuning::f16_rows_max().is_some() =>
+        {
+            format!(
+                " f16_rows_launches={}",
+                lloom_tensor::tuning::f16_rows_launches()
+            )
+        }
         _ => String::new(),
+    };
+    // The row axis's capacity rounding, where it is on: its engagement since
+    // the load.
+    let decode_rows = if lloom_tensor::tuning::f16_rows_round()
+        && lloom_tensor::tuning::f16_rows_max().is_some()
+    {
+        format!(
+            "{decode_rows} f16_rows_rounded_launches={}",
+            lloom_tensor::tuning::f16_rows_rounded_launches()
+        )
+    } else {
+        decode_rows
     };
     eprintln!(
         "[{endpoint}: prompt_tokens={prompt} completion_tokens={} stop={:?} total {total_ms:.1} ms, \
@@ -4408,12 +5073,15 @@ pub fn bench(args: BenchArgs) -> Result<()> {
     // `Shared`, whose listener is unused here (a free loopback port).
     let server = Server::http("127.0.0.1:0").map_err(|e| anyhow::anyhow!("binding: {e}"))?;
     let front = Front::new(engine.as_ref(), front::SessionOptions::of(&options.session));
+    let responses =
+        ResponseContexts::new(options.server.response, &options.memory, engine.device());
     let shared = Shared {
         engine,
         decisions: super::decisions::Decisions::Refused(
             "the benchmark cells do not take decisions".into(),
         ),
         turns: turns::Turns::default(),
+        responses,
         decision_pack: false,
         aborts: Mutex::new(HashSet::new()),
         abort_epoch: AtomicU64::new(0),
@@ -4954,6 +5622,134 @@ mod request_processors_tests {
 }
 
 #[cfg(test)]
+mod delivered_field_tests {
+    use super::*;
+
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::cell::Cell;
+
+    thread_local! {
+        static REQUESTED: Cell<Option<usize>> = const { Cell::new(None) };
+    }
+    struct Counter;
+    #[global_allocator]
+    static ALLOCATOR: Counter = Counter;
+
+    fn record(bytes: usize) {
+        let _ = REQUESTED.try_with(|count| {
+            if let Some(previous) = count.get() {
+                count.set(Some(previous.saturating_add(bytes)));
+            }
+        });
+    }
+    // SAFETY: allocation/deallocation are forwarded unchanged to System;
+    // the optional thread-local scalar never dereferences allocator pointers.
+    unsafe impl GlobalAlloc for Counter {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            record(layout.size());
+            // SAFETY: the caller's allocator layout is forwarded unchanged.
+            unsafe { System.alloc(layout) }
+        }
+        unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+            record(layout.size());
+            // SAFETY: the caller's allocator layout is forwarded unchanged.
+            unsafe { System.alloc_zeroed(layout) }
+        }
+        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, size: usize) -> *mut u8 {
+            record(size);
+            // SAFETY: the caller's live allocation/layout/size are forwarded.
+            unsafe { System.realloc(ptr, layout, size) }
+        }
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            // SAFETY: the caller's allocation and its layout are forwarded.
+            unsafe { System.dealloc(ptr, layout) }
+        }
+    }
+    pub(super) fn counted<T>(run: impl FnOnce() -> T) -> (T, usize) {
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                REQUESTED.with(|count| count.set(None));
+            }
+        }
+        REQUESTED.with(|count| {
+            assert!(count.get().is_none());
+            count.set(Some(0));
+        });
+        let _reset = Reset;
+        let result = run();
+        let bytes = REQUESTED.with(|count| count.get().unwrap());
+        (result, bytes)
+    }
+
+    #[test]
+    fn the_accumulator_allocation_counter_observes_a_known_allocation() {
+        let (allocated, bytes) = counted(|| std::hint::black_box(Vec::<u8>::with_capacity(1024)));
+        assert!(
+            bytes >= 1024,
+            "allocation instrument failed its positive control: {bytes}"
+        );
+        assert_eq!(allocated.capacity(), 1024);
+    }
+
+    /// The split machine's buffers are the reply's accumulator: a fragment
+    /// is appended in place, so a pre-sized buffer copies no earlier prefix
+    /// and allocates nothing per fragment.
+    #[test]
+    fn appending_fragments_does_not_recopy_the_retained_prefix() {
+        let (control, observed) = counted(|| std::hint::black_box(Vec::<u8>::with_capacity(1024)));
+        assert!(
+            observed >= 1024,
+            "allocation counter positive control failed: {observed}"
+        );
+        drop(control);
+        const N: usize = 2048;
+        let fragment = "aπ";
+        let (mut machine, content) = reasoning::Reasoning::sized_for_test(N * fragment.len());
+        let mut recopied = 0;
+        let mut allocated = 0;
+        for _ in 0..N {
+            let (address, len) = (content(&machine).as_ptr(), content(&machine).len());
+            let (_, bytes) = counted(|| machine.publish(fragment));
+            allocated += bytes;
+            if content(&machine).as_ptr() != address {
+                recopied += len;
+            }
+        }
+        assert_eq!(content(&machine), fragment.repeat(N));
+        eprintln!("ACCUMULATOR fragments={N} output_bytes={} relocated_prefix_bytes={recopied} requested_allocation_bytes={allocated}", N * fragment.len());
+        assert_eq!(
+            allocated, 0,
+            "a pre-sized append allocates nothing, scratch copies included"
+        );
+        assert_eq!(recopied, 0, "a pre-sized reply's prefix was recopied");
+    }
+
+    /// Unsized, the buffers grow geometrically: the bytes moved stay within
+    /// twice the reply, where a rebuild per fragment moves the square.
+    #[test]
+    fn an_unsized_reply_moves_at_most_twice_its_bytes() {
+        const N: usize = 2048;
+        let fragment = "aπ";
+        let (mut machine, content) = reasoning::Reasoning::sized_for_test(0);
+        let mut recopied = 0;
+        for _ in 0..N {
+            let (address, len) = (content(&machine).as_ptr(), content(&machine).len());
+            machine.publish(fragment);
+            if content(&machine).as_ptr() != address {
+                recopied += len;
+            }
+        }
+        assert_eq!(content(&machine).len(), N * fragment.len());
+        assert!(
+            recopied <= 2 * N * fragment.len(),
+            "relocated {recopied} bytes for a {}-byte reply",
+            N * fragment.len()
+        );
+    }
+}
+
+#[cfg(test)]
 mod stream_writer_tests {
     use super::{ChunkedWriter, StreamWriter};
     use std::io::Write;
@@ -5174,6 +5970,154 @@ mod stream_writer_tests {
             body(&gate.written.lock().unwrap()),
             format!("start{pushed}")
         );
+    }
+
+    #[test]
+    fn a_blocked_writer_refuses_the_next_whole_utf8_fragment_at_the_backlog_bound() {
+        let gate = Gate::default();
+        let sw = StreamWriter::start_with_deltas(
+            ChunkedWriter {
+                w: Box::new(gate.clone()),
+            },
+            str::to_owned,
+        );
+        struct OpenOnDrop(Gate);
+        impl Drop for OpenOnDrop {
+            fn drop(&mut self) {
+                let (lock, changed) = &*self.0.open;
+                *lock.lock() = true;
+                changed.notify_all();
+            }
+        }
+        let _cleanup = OpenOnDrop(gate.clone());
+        sw.send("start".into());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while gate.writes.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        let text = "π".repeat(super::MAX_RESPONSE_BACKLOG / 2);
+        let accepted = sw.try_delta(&text);
+        let refused = !sw.try_delta("λ");
+        let backlog = sw.deltas.as_ref().unwrap().pending_bytes() + sw.spill.lock().len();
+        {
+            let (lock, changed) = &*gate.open;
+            *lock.lock() = true;
+            changed.notify_all();
+        }
+        let limited = sw
+            .backlog_limited
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let (_, error) = sw.finish().unwrap();
+        assert!(accepted && refused && limited);
+        assert_eq!(backlog, super::MAX_RESPONSE_BACKLOG);
+        assert!(error.is_none());
+        assert_eq!(body(&gate.written.lock().unwrap()), format!("start{text}"));
+    }
+
+    /// The operator's count (`server.response.contexts`) at the retired
+    /// draft default, 8: admission is finite and a release reclaims exactly
+    /// one context. Memory admission is off here (the gate's own tests are
+    /// `serve_response_contexts_tests.rs`).
+    const OVERRIDE: usize = 8;
+
+    fn counted(limit: usize, raw_bytes: usize) -> super::ResponseContexts {
+        super::ResponseContexts::with_memory(
+            crate::options::ServerResponseConfig {
+                contexts: Some(limit),
+                raw_bytes,
+            },
+            super::ResponseMemory::Off,
+        )
+    }
+
+    #[test]
+    fn response_context_admission_is_finite_and_reclaims_exactly_one_permit() {
+        let contexts = counted(OVERRIDE, super::MAX_RESPONSE_BACKLOG);
+        let mut held = Vec::new();
+        for _ in 0..OVERRIDE {
+            held.push(contexts.try_take(0).expect("capacity available"));
+        }
+        assert!(contexts.try_take(0).is_err());
+        held.pop();
+        let replacement = contexts
+            .try_take(0)
+            .expect("finished response releases permit");
+        assert!(contexts.try_take(0).is_err());
+        drop(replacement);
+        drop(held);
+        assert_eq!(
+            contexts.active.load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+        assert_eq!(contexts.bytes.load(std::sync::atomic::Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn overload_health_names_and_counts_admission_refusals_without_losing_active_count() {
+        let contexts = counted(OVERRIDE, super::MAX_RESPONSE_BACKLOG);
+        let held: Vec<_> = (0..OVERRIDE)
+            .map(|_| contexts.try_take(0).unwrap())
+            .collect();
+        assert!(matches!(
+            contexts.try_take(0),
+            Err(super::Overload::Count(OVERRIDE))
+        ));
+        assert!(contexts.try_take(0).is_err());
+        let report = contexts.json();
+        assert_eq!(report["active"], OVERRIDE);
+        assert_eq!(report["bytes"], OVERRIDE * super::MAX_RESPONSE_BACKLOG);
+        assert_eq!(report["overload"]["contexts"], 2);
+        assert_eq!(report["overload"]["memory"], 0);
+        assert_eq!(report["overload"]["unresolved_bytes"], 0);
+        assert_eq!(report["raw_bytes"], super::MAX_RESPONSE_BACKLOG);
+        assert_eq!(report["ceiling"], OVERRIDE);
+        assert_eq!(report["ceiling_basis"], "override");
+        drop(held);
+        assert_eq!(contexts.json()["active"], 0);
+        assert_eq!(contexts.json()["bytes"], 0);
+        assert_eq!(contexts.json()["overload"]["contexts"], 2);
+    }
+
+    #[test]
+    fn configured_response_bounds_reach_admission_health_and_whole_utf8_handover() {
+        let contexts = counted(1, 2);
+        let held = contexts.try_take(5).unwrap();
+        assert!(contexts.try_take(0).is_err());
+        assert_eq!(contexts.json()["ceiling"], 1);
+        assert_eq!(contexts.json()["raw_bytes"], 2);
+        assert_eq!(contexts.json()["bytes"], 2 + 5, "raw_bytes plus the body");
+        drop(held);
+        let none = counted(0, 2);
+        assert!(
+            none.try_take(0).is_err(),
+            "zero is a hard zero, never unbounded"
+        );
+        let full = counted(usize::MAX, 2);
+        full.active
+            .store(usize::MAX, std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            full.try_take(0).is_err(),
+            "full admission does not eagerly overflow its increment"
+        );
+        for (limit, text, expected) in [
+            (0, "", true),
+            (0, "a", false),
+            (1, "π", false),
+            (2, "π", true),
+        ] {
+            let sw = StreamWriter::start_with_deltas(
+                ChunkedWriter {
+                    w: Box::new(std::io::sink()),
+                },
+                str::to_owned,
+            )
+            .with_backlog_limit(limit);
+            let accepted = sw.try_delta(text);
+            let (_, error) = sw.finish().unwrap();
+            assert!(error.is_none());
+            assert_eq!(accepted, expected, "limit={limit} text={text:?}");
+        }
     }
 
     /// A client that went away: the failed write is latched, the producer
@@ -5520,6 +6464,7 @@ mod checked_trailer_tests {
             engine,
             decisions: super::super::decisions::Decisions::Refused("test".into()),
             turns: turns::Turns::default(),
+            responses: ResponseContexts::default(),
             decision_pack: false,
             aborts: std::sync::Mutex::new(HashSet::new()),
             abort_epoch: AtomicU64::new(0),
@@ -5828,3 +6773,186 @@ mod ready_configuration_tests {
 #[cfg(test)]
 #[path = "serve_stream_tail_tests.rs"]
 mod stream_tail_tests;
+
+#[cfg(all(test, feature = "metal"))]
+#[path = "serve_native_custody_tests.rs"]
+mod native_custody_tests;
+
+#[cfg(test)]
+mod response_snapshot_tests {
+    use super::*;
+
+    #[test]
+    fn loaded_response_fixture_uses_a_tokenizer_valid_shared_seed() {
+        use lloom::testing::tiny::{tokenizer::tokenizer_json, TinyTokenizer};
+        let tiny = TinyTokenizer::lfm2();
+        let tokenizer = tokenizers::Tokenizer::from_bytes(tokenizer_json(&tiny.added)).unwrap();
+        // Exact r2 failure condition under the same tokenizer, no model/device.
+        assert!(tokenizer.encode("", false).unwrap().get_ids().is_empty());
+        let shape = stream_tail_tests::response_shape(&crate::EngineOptions::default());
+        let encoded = tokenizer.encode(shape.seed_text.as_str(), false).unwrap();
+        assert!(
+            !encoded.get_ids().is_empty(),
+            "native load refuses an empty seed"
+        );
+        assert_eq!(shape.seed_text, DEFAULT_SEED_TEXT);
+        assert_eq!(
+            encoded.get_ids(),
+            DEFAULT_SEED_TEXT.bytes().map(u32::from).collect::<Vec<_>>()
+        );
+        assert!(encoded
+            .get_ids()
+            .iter()
+            .all(|id| (*id as usize) < tiny.vocab_size()));
+    }
+
+    #[test]
+    fn default_options_leave_native_fixture_tuning_installable() {
+        assert!(!lloom_tensor::tuning::installed());
+        let mut options = crate::EngineOptions::default();
+        assert!(
+            !lloom_tensor::tuning::installed(),
+            "option constructors must not read tensor knobs"
+        );
+        options.tuning.contract.profile = "deterministic".into();
+        options
+            .tuning
+            .install()
+            .expect("both domains remain installable after defaults");
+        assert_eq!(
+            lloom_tensor::tuning::contract(),
+            lloom_tensor::tuning::Contract::Deterministic
+        );
+    }
+
+    #[test]
+    fn completed_record_summary_is_owned_before_a_later_recorder_reset() {
+        let first = FirstToken {
+            recv: 1_000_000_000,
+            decode: 1_000_000_000,
+            fragment: 4_000_000_000,
+            ..Default::default()
+        };
+        let mut records = vec![(1.0, 1.0, 2.0), (1.5, 2.0, 3.0)];
+        let saved = summarize_first_gpu(&first, records.iter().copied());
+        records.clear();
+        assert_eq!(
+            saved,
+            FirstGpuSnapshot {
+                enabled: true,
+                summary: Some(FirstGpuSummary {
+                    buffers: 2,
+                    first_commit_us: 0.0,
+                    first_start_us: 0.0,
+                    busy_us: 2_000_000.0,
+                    idle_us: 1_000_000.0,
+                    last_end_us: 2_000_000.0,
+                    fragment_us: 3_000_000.0,
+                })
+            }
+        );
+        assert_eq!(
+            summarize_first_gpu(&first, records),
+            FirstGpuSnapshot {
+                enabled: true,
+                summary: None
+            }
+        );
+    }
+}
+
+// Host metadata only: no Device, model, command buffer, wait or GPU dispatch.
+#[cfg(all(test, feature = "metal"))]
+mod gpu_snapshot_host_tests {
+    use super::*;
+    use lloom_tensor::kernels::metal::profile;
+
+    fn first() -> FirstToken {
+        FirstToken {
+            recv: 1_000_000_000,
+            decode: 1_000_000_000,
+            fragment: 4_000_000_000,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn actual_recorder_reset_cannot_change_the_saved_completed_record_summary() {
+        let mut tuning = lloom_tensor::tuning::Tuning::default();
+        tuning.instrument.profile = true;
+        lloom_tensor::tuning::install(tuning).unwrap();
+        profile::reset();
+        profile::record_command_buffer(1.0, 2.0, 1.0, 0);
+        profile::record_command_buffer(2.0, 3.0, 1.5, 1);
+        let saved = capture_first_token_gpu(&first());
+        if profile::recorder_enabled() {
+            assert_eq!(profile::command_buffer_records().len(), 2);
+            assert_eq!(saved.summary.unwrap().buffers, 2);
+            assert_eq!(saved.summary.unwrap().busy_us, 2_000_000.0);
+            profile::reset();
+            assert!(profile::command_buffer_records().is_empty());
+            assert_eq!(saved.summary.unwrap().buffers, 2);
+            assert_eq!(capture_first_token_gpu(&first()).summary, None);
+        } else {
+            assert_eq!(
+                saved,
+                FirstGpuSnapshot::default(),
+                "shipping has no detailed recorder"
+            );
+        }
+    }
+
+    #[test]
+    fn disabled_snapshot_capture_reads_no_records_and_allocates_nothing() {
+        let tuning = lloom_tensor::tuning::Tuning::default();
+        assert!(!tuning.instrument.profile);
+        lloom_tensor::tuning::install(tuning).unwrap();
+        assert_eq!(
+            capture_first_token_gpu(&first()),
+            FirstGpuSnapshot::default()
+        );
+        let (positive, observed) =
+            delivered_field_tests::counted(|| std::hint::black_box(Vec::<u8>::with_capacity(1024)));
+        assert!(observed >= 1024);
+        drop(positive);
+        let (saved, bytes) = delivered_field_tests::counted(|| capture_first_token_gpu(&first()));
+        assert_eq!(saved, FirstGpuSnapshot::default());
+        assert_eq!(bytes, 0);
+        eprintln!("DISABLED_GPU_SNAPSHOT requested_allocation_bytes={bytes}");
+    }
+}
+
+/// `/health`'s slot census: each nonzero `(listing, class)` cell, then each
+/// listing site's (`kernels.residency.slot_trace`, `tuning.md` §6.3p).
+fn slot_census_json(
+    s: &lloom_tensor::residency_class::SlotResidency,
+    sites: &[lloom_tensor::residency_class::SlotSite],
+) -> serde_json::Value {
+    use lloom_tensor::residency_class::{census_column_name, SlotListing};
+    let mut cells = Vec::new();
+    for (row, listing) in SlotListing::ALL.iter().enumerate() {
+        for (col, cell) in s.census[row].iter().enumerate() {
+            if cell.adds > 0 {
+                cells.push(json!({
+                    "listing": listing.name(),
+                    "class": census_column_name(col),
+                    "adds": cell.adds,
+                    "bytes": cell.bytes,
+                }));
+            }
+        }
+    }
+    let sites: Vec<serde_json::Value> = sites
+        .iter()
+        .map(|site| {
+            json!({
+                "listing": site.listing.name(),
+                "class": site.class.map_or("none", |c| c.name()),
+                "adds": site.cell.adds,
+                "bytes": site.cell.bytes,
+                "frames": site.frames,
+            })
+        })
+        .collect();
+    json!({"cells": cells, "sites": sites})
+}

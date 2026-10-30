@@ -24,6 +24,7 @@ use super::common::{
     DecodeTiming, MemGauge, MemReport, MemSnapshot, PrefillTiming, Text, NEVER_EOS,
 };
 use super::request_slot::{AbortState, Lease as RequestLease, State as RequestState};
+use super::served::Served as _;
 use super::template::{Rendered, Template};
 use super::vision::{take_window, DecodedImage, ImageCensus, ImageRows};
 use crate::{
@@ -189,6 +190,43 @@ fn text_config_of(root: &Value) -> Result<Lfm2Config> {
     serde_json::from_value(Value::Object(text)).context("parsing config.json's text_config")
 }
 
+/// An LFM2 GGUF the LFM2 engine serves (`lloom::models::lfm2::gguf`): its
+/// header, read once, and the config the GGUF schema resolves from it.
+struct GgufText {
+    content: lloom_tensor::quantized::gguf_file::Content,
+    header: lloom::models::lfm2::gguf::GgufCheckpoint,
+}
+
+/// `Some` when `path` names an LFM2 GGUF file rather than a safetensors
+/// directory.
+fn gguf_text(path: &Path) -> Result<Option<GgufText>> {
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let mut file =
+        std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    let content = lloom_tensor::quantized::gguf_file::Content::read(&mut file)
+        .with_context(|| format!("reading the GGUF header of {}", path.display()))?;
+    let header = lloom::models::lfm2::gguf::GgufCheckpoint::read(&content)
+        .with_context(|| format!("resolving {} as an LFM2 GGUF", path.display()))?;
+    Ok(Some(GgufText { content, header }))
+}
+
+/// The text config of the checkpoint at `path`: a GGUF's header, or a
+/// directory's `config.json` (its `text_config` on a VL checkpoint).
+fn checkpoint_config(path: &Path) -> Result<Config> {
+    if let Some(g) = gguf_text(path)? {
+        return Ok(g.header.config);
+    }
+    let bytes = std::fs::read(path.join("config.json"))?;
+    let root: Value = serde_json::from_slice(&bytes).context("parsing config.json")?;
+    if root.get("vision_config").is_some() {
+        Ok(text_config_of(&root)?.into_config(false))
+    } else {
+        Ok(lloom::models::lfm2_moe::config::parse_lfm_config(root)?)
+    }
+}
+
 /// The batch thread's ONE drafter (`--dspark --batch N`). On the pool arms
 /// the continuous speculative driver takes it at start (`MakeDriver`) and
 /// the closed cells run THROUGH that driver (`Idle::driver`,
@@ -313,6 +351,11 @@ pub struct Engine<P: Profile> {
     pub share_prefix: bool,
     /// The language model's load: which of the checkpoint's tensors it named.
     pub lm_record: LoadRecord,
+    /// The checkpoint is an LFM2 GGUF (`lfm2::gguf`): its capabilities are
+    /// `LFM2_GGUF_CAPABILITIES`.
+    pub gguf: bool,
+    /// A raw prompt (`encode` with `add_special`) starts with the BOS.
+    pub raw_bos: bool,
     /// The vision half, on a VL checkpoint.
     pub vision: Option<Vision>,
     /// What the last request loaded and encoded (`Served::vision_report`).
@@ -349,7 +392,11 @@ pub struct Engine<P: Profile> {
 }
 
 pub struct LoadOptions {
+    /// The checkpoint: a safetensors directory, or an LFM2 GGUF file.
     pub model_dir: PathBuf,
+    /// An LFM2 GGUF's tokenizer (`model.tokenizer`): unset, the
+    /// `tokenizer.json` beside the file, else the GGUF's own vocabulary.
+    pub tokenizer: Option<PathBuf>,
     pub cpu: bool,
     /// What the run is for (`execution.purpose`): production refuses at load
     /// an attention that takes the composed scores path on Metal.
@@ -369,6 +416,9 @@ pub struct LoadOptions {
     pub seed_text: String,
     pub model_name: Option<String>,
     pub batch: usize,
+    /// The most requests one intake tick of the batched scheduler takes
+    /// off its queue while rows are live (`scheduler.intake_per_tick`).
+    pub intake_per_tick: usize,
     /// `Some(dir)` loads the DSpark drafter from `dir` (or the newest
     /// LFM2.5-2.6B-DSpark snapshot in the HF cache when the path is empty).
     pub dspark: Option<PathBuf>,
@@ -544,14 +594,10 @@ fn apply_preset(
 /// The profile the resolved config names (`Config::shape`, at the contract
 /// in force): what `load` instantiates the engine at.
 fn shape_key(opts: &LoadOptions) -> Result<ProfileKey> {
-    let bytes = std::fs::read(opts.model_dir.join("config.json"))?;
-    let root: Value = serde_json::from_slice(&bytes).context("parsing config.json")?;
-    let config: Lfm2Config = if root.get("vision_config").is_some() {
-        text_config_of(&root)?
-    } else {
-        serde_json::from_slice(&bytes).context("parsing config.json")?
-    };
-    let mut config = config.into_config(false);
+    let mut config = checkpoint_config(&opts.model_dir)?;
+    if config.moe.is_some() && opts.dspark.is_some() {
+        anyhow::bail!("lfm2_moe: no validated DSpark drafter is wired for this checkpoint");
+    }
     let dcfg = match drafter_dir(opts)? {
         Some(dir) => Some(
             DSparkConfig::read_from_dir(&dir)
@@ -852,7 +898,12 @@ impl<P: Lfm2Shape> Engine<P> {
         preflight: impl FnOnce(&Config, &Text) -> Result<()>,
     ) -> Result<Self> {
         let model_dir = opts.model_dir.clone();
-        let dtype = if device.is_cpu() {
+        // A GGUF's packed blocks compute at f32 (`lfm2::gguf`).
+        let mut gguf = gguf_text(&model_dir)?;
+        let is_gguf = gguf.is_some();
+        let dtype = if is_gguf {
+            lloom::models::lfm2::gguf::GGUF_COMPUTE_DTYPE
+        } else if device.is_cpu() {
             DType::F32
         } else {
             DType::F16
@@ -861,22 +912,67 @@ impl<P: Lfm2Shape> Engine<P> {
             anyhow::bail!("--batch must be positive");
         }
 
-        let tokenizer = Tokenizer::from_file(model_dir.join("tokenizer.json"))
-            .map_err(|e| anyhow::anyhow!("loading tokenizer: {e}"))?;
-        let config_bytes = std::fs::read(model_dir.join("config.json"))?;
-        let root: Value = serde_json::from_slice(&config_bytes).context("parsing config.json")?;
-        let vl = root.get("vision_config").is_some();
-        let decisions = served_decisions(&root, opts.decision_template.as_deref())?;
-        let config: Lfm2Config = if vl {
-            text_config_of(&root)?
-        } else {
-            serde_json::from_slice(&config_bytes).context("parsing config.json")?
+        let (tokenizer, root, decisions, mut config) = match &gguf {
+            Some(g) => {
+                let beside = model_dir.with_file_name("tokenizer.json");
+                let tokenizer = match opts
+                    .tokenizer
+                    .clone()
+                    .or(beside.is_file().then_some(beside))
+                {
+                    Some(path) => Tokenizer::from_file(&path).map_err(|e| {
+                        anyhow::anyhow!("loading tokenizer {}: {e}", path.display())
+                    })?,
+                    None => {
+                        use lloom_tensor::quantized::tokenizer::TokenizerFromGguf;
+                        Tokenizer::from_gguf(&g.content)
+                            .map_err(|e| anyhow::anyhow!("the GGUF's tokenizer: {e}"))?
+                    }
+                };
+                let facts =
+                    crate::decision::binding::CheckpointDecision::from_gguf(&g.content.metadata)?;
+                let decisions =
+                    ServedDecisions::resolve(&facts, opts.decision_template.as_deref())?;
+                (tokenizer, Value::Null, decisions, g.header.config.clone())
+            }
+            None => {
+                let tokenizer = Tokenizer::from_file(model_dir.join("tokenizer.json"))
+                    .map_err(|e| anyhow::anyhow!("loading tokenizer: {e}"))?;
+                let config_bytes = std::fs::read(model_dir.join("config.json"))?;
+                let root: Value =
+                    serde_json::from_slice(&config_bytes).context("parsing config.json")?;
+                let decisions = served_decisions(&root, opts.decision_template.as_deref())?;
+                let config = if root.get("vision_config").is_some() {
+                    text_config_of(&root)?.into_config(false)
+                } else {
+                    lloom::models::lfm2_moe::config::parse_lfm_config(root.clone())?
+                };
+                (tokenizer, root, decisions, config)
+            }
         };
-        let mut config = config.into_config(false);
+        let vl = root.get("vision_config").is_some();
+
+        // Direct programmatic loads bypass family::load's capability clamp.
+        // The routed kernels cannot safely inherit dense LFM's EOS gate.
+        if config.moe.is_some() {
+            opts.decode.readback.eos_gate = false;
+            if opts.executor.arena || opts.executor.packed || opts.executor.replay {
+                anyhow::bail!("lfm2_moe: arena/packed/replay acceptance has not been run; use the existing pass-plans executor");
+            }
+        }
 
         // The drafter's config first: the target's cache arms depend on it
         // (the verify window sizes the conv ring, the taps feed the drafter).
         let dspark_dir = drafter_dir(&opts)?;
+        if is_gguf && dspark_dir.is_some() {
+            anyhow::bail!(
+                "--dspark on an LFM2 GGUF: the drafter was not run against a GGUF target on the \
+                 LFM2 engine (its taps and shared head over packed blocks at f32)"
+            );
+        }
+        if config.moe.is_some() && dspark_dir.is_some() {
+            anyhow::bail!("lfm2_moe: no validated DSpark drafter is wired for this checkpoint");
+        }
         // The speculative arm's pool budget: 1024 MiB, sized from measurement
         // (#148, the B=1 defaults pass):
         // a round is two models' activations plus the verify's logits,
@@ -990,10 +1086,23 @@ impl<P: Lfm2Shape> Engine<P> {
         let bos_token = bos_id
             .and_then(|id| tokenizer.id_to_token(id))
             .unwrap_or_default();
+        // A raw prompt starts with the BOS on a safetensors checkpoint; on a
+        // GGUF, exactly when its tokenizer adds one, as lfm2-gguf served raw
+        // prompts before it moved onto this engine.
+        let raw_bos = !is_gguf
+            || tokenizer
+                .encode("", true)
+                .is_ok_and(|e| e.get_ids().first().copied() == bos_id && bos_id.is_some());
 
-        let template = match std::fs::read_to_string(model_dir.join("chat_template.jinja")) {
-            Ok(src) => Some(Template::compile(&src)?),
-            Err(_) => None,
+        let template = match &gguf {
+            Some(g) => match g.content.metadata.get("tokenizer.chat_template") {
+                Some(v) => Some(Template::compile(v.to_string()?)?),
+                None => None,
+            },
+            None => match std::fs::read_to_string(model_dir.join("chat_template.jinja")) {
+                Ok(src) => Some(Template::compile(&src)?),
+                Err(_) => None,
+            },
         };
 
         let seed_tokens = tokenizer
@@ -1028,10 +1137,15 @@ impl<P: Lfm2Shape> Engine<P> {
         // one-shot prefill's working set grows with the prompt (~3.5 MB per
         // token on the crown, #728), which is what a 32k-token one-shot
         // prefill turned into a kernel panic on this machine (#148).
-        let weight_bytes: usize = weight_files(&model_dir)?
-            .iter()
-            .map(|f| std::fs::metadata(f).map(|m| m.len() as usize).unwrap_or(0))
-            .sum();
+        // A GGUF's: its packed blocks as stored, its dense tensors at the
+        // compute dtype (`weight_repr::loaded_bytes`).
+        let weight_bytes: usize = match &gguf {
+            Some(g) => lloom::nn::weight_repr::loaded_bytes(&g.content, dtype),
+            None => weight_files(&model_dir)?
+                .iter()
+                .map(|f| std::fs::metadata(f).map(|m| m.len() as usize).unwrap_or(0))
+                .sum(),
+        };
         if opts.memory_fraction > 0.0 {
             let mut budget = MemoryBudget::new(weight_bytes);
             budget.batch = opts.batch;
@@ -1064,12 +1178,35 @@ impl<P: Lfm2Shape> Engine<P> {
                 .set_quota((ws * opts.memory_fraction.max(0.0)) as usize);
         }
 
-        let files = weight_files(&model_dir)?;
-        // SAFETY: the checkpoint is not modified while mapped
-        // (`VarBuilder::from_mmaped_safetensors`'s contract; this is that
-        // backend with a flag per tensor set on load).
-        let (backend, lm_record) = unsafe { RecordingBackend::over_safetensors(&files)? };
-        let vb = VarBuilder::from_backend(Box::new(backend), dtype, device.clone());
+        let files = if is_gguf {
+            vec![model_dir.clone()]
+        } else {
+            weight_files(&model_dir)?
+        };
+        let moe_preflight = if config.moe.is_some() {
+            let source: lloom::models::lfm2_moe::Config = serde_json::from_value(root.clone())?;
+            // SAFETY: the checkpoint is immutable while the load maps it.
+            Some(unsafe { lloom::models::lfm2_moe::preflight(&source, &files, dtype)? })
+        } else {
+            None
+        };
+        let (vb, lm_record) = match gguf.take() {
+            Some(g) => {
+                let file = std::fs::File::open(&model_dir)
+                    .with_context(|| format!("opening {}", model_dir.display()))?;
+                g.header.recording_var_builder(g.content, file, &device)
+            }
+            None => {
+                // SAFETY: the checkpoint is not modified while mapped
+                // (`VarBuilder::from_mmaped_safetensors`'s contract; this is
+                // that backend with a flag per tensor set on load).
+                let (backend, lm_record) = unsafe { RecordingBackend::over_safetensors(&files)? };
+                (
+                    VarBuilder::from_backend(Box::new(backend), dtype, device.clone()),
+                    lm_record,
+                )
+            }
+        };
         let vb = if vl {
             vb.rename_f(|name: &str| match name.strip_prefix("model.") {
                 Some(rest) => format!("model.language_model.{rest}"),
@@ -1086,7 +1223,14 @@ impl<P: Lfm2Shape> Engine<P> {
         // admission leaves after them and the predicted peak, three at least.
         // What the weights hold once loaded: every tensor at the dtype the
         // load converts it to (f32 on the CPU, twice the bf16 file).
-        let loaded_weights = checkpoint_elems(&weight_files(&model_dir)?)? * dtype.size_in_bytes();
+        let loaded_weights = match moe_preflight {
+            Some(p) => p.resident_bytes,
+            None if is_gguf => weight_bytes,
+            None => checkpoint_elems(&files)? * dtype.size_in_bytes(),
+        };
+        if let (Some(p), Some(b)) = (moe_preflight, config.memory_budget.as_mut()) {
+            b.weight_bytes = p.resident_bytes;
+        }
         #[cfg_attr(not(feature = "metal"), allow(unused_mut))]
         let mut machine_weights = loaded_weights;
         #[cfg(feature = "metal")]
@@ -1111,7 +1255,19 @@ impl<P: Lfm2Shape> Engine<P> {
                 * config.num_key_value_heads
                 * config.head_dim()
                 * elem;
+            if is_gguf && quota > 0 && weight_bytes + kv_floor > quota {
+                anyhow::bail!(
+                    "the GGUF's weights ({:.2} GB) and the KV floor ({:.2} GB) do not fit the \
+                     quota {:.2} GB, and the streamed-layer tier reads safetensors only",
+                    weight_bytes as f64 / 1e9,
+                    kv_floor as f64 / 1e9,
+                    quota as f64 / 1e9
+                );
+            }
             if quota > 0 && weight_bytes + kv_floor > quota {
+                if config.moe.is_some() {
+                    anyhow::bail!("lfm2_moe: resident expert payload plus KV floor exceeds this quota; dense layer-group streaming cannot represent this checkpoint's experts");
+                }
                 // The room for slots is what §9.5's admission leaves once the
                 // resident rest and its predicted peak (the KV at capacity,
                 // the conv state, the activations, the scratch) are in — the
@@ -1245,6 +1401,13 @@ impl<P: Lfm2Shape> Engine<P> {
             config.memory_budget.and_then(|b| b.activation_rows),
             opts.pin_prefix,
         );
+        if let Some(p) = moe_preflight {
+            peak.push(
+                "expert load packing (conservative bound)",
+                p.packing_bytes as u64,
+            );
+            eprintln!("[lfm2_moe: optional unvalidated port; resident={} packing_bound={}; real-model acceptance pending]", p.resident_bytes, p.packing_bytes);
+        }
         if let Some(dir) = &dspark_dir {
             let drafter = std::fs::metadata(dir.join("model.safetensors")).map_or(0, |m| m.len());
             peak.push("drafter", drafter);
@@ -1347,6 +1510,8 @@ impl<P: Lfm2Shape> Engine<P> {
             pool: None,
             share_prefix: opts.share_prefix && opts.batch > 1 && opts.rows.pooled(),
             lm_record,
+            gguf: is_gguf,
+            raw_bos,
             vision,
             last_vision: Mutex::new(Value::Null),
             config: config.clone(),
@@ -1557,6 +1722,7 @@ impl<P: Lfm2Shape> Engine<P> {
             share_prefix: opts.share_prefix,
             prefill_batch: engine.prefill_batch.k,
             prefill_decode: engine.prefill_decode,
+            intake_per_tick: opts.intake_per_tick,
             mode,
             extra,
             on_counters: None,
@@ -1721,7 +1887,7 @@ impl<P: Lfm2Shape> Engine<P> {
             .map_err(|e| anyhow::anyhow!("tokenizing: {e}"))?
             .get_ids()
             .to_vec();
-        if add_special {
+        if add_special && self.raw_bos {
             if let Some(bos) = self.text.bos_id {
                 if ids.first() != Some(&bos) {
                     ids.insert(0, bos);
@@ -1856,7 +2022,7 @@ impl<P: Lfm2Shape> Engine<P> {
     fn load_json(&self, images: usize) -> Value {
         let (tensors, bytes) = self.lm_record.totals();
         json!({
-            "family": "lfm2",
+            "family": self.capabilities().family,
             "model_tensors": tensors,
             "model_bytes": bytes,
             "tower": match &self.vision {
@@ -3382,7 +3548,7 @@ impl<P: Lfm2Shape> super::served::Served for Engine<P> {
     }
     fn health(&self) -> Value {
         json!({
-            "family": "lfm2",
+            "family": self.capabilities().family,
             "batch": self.batch,
             "prefill_tile": self.prefill_tile,
             "prefill_chunk": self.prefill_chunk,
@@ -3393,6 +3559,7 @@ impl<P: Lfm2Shape> super::served::Served for Engine<P> {
             "rows": self.rows.name(),
             "share_prefix": self.share_prefix,
             "dspark_k": self.dspark_k,
+            "cut_sites": super::common::cut_sites_json(),
             "decision_ragged": self.decision_ragged.then(|| self.trunks.report()),
             "pool": self.pool.as_ref().map(|p| {
                 let r = p.report();
@@ -3411,7 +3578,8 @@ impl<P: Lfm2Shape> super::served::Served for Engine<P> {
     }
     fn describe(&self) -> String {
         format!(
-            "family=lfm2 batch={} dspark={} prefill_tile={} prefill_chunk={} prefill_batch={} prefill_decode={} memory_fraction={} mem_sample={} rows={} cache={} {} {}",
+            "family={} batch={} dspark={} prefill_tile={} prefill_chunk={} prefill_batch={} prefill_decode={} memory_fraction={} mem_sample={} rows={} cache={} {} {}",
+            self.capabilities().family,
             self.batch,
             self.dspark_k
                 .map(|k| format!("k={k}"))
@@ -3432,12 +3600,22 @@ impl<P: Lfm2Shape> super::served::Served for Engine<P> {
         self.generation.clone()
     }
     fn capabilities(&self) -> super::family::Capabilities {
+        if self.gguf {
+            return super::family::Capabilities {
+                decisions: self.decisions.is_some(),
+                ..super::family::LFM2_GGUF_CAPABILITIES
+            };
+        }
         super::family::Capabilities {
             decisions: self.decisions.is_some(),
             vision: self.vision.is_some(),
             vision_missing: "no vision tower is built: the checkpoint names no vision_config, \
                 or it was loaded text only (model.text_only, --text-only)",
-            ..super::family::LFM2_CAPABILITIES
+            ..if self.config.moe.is_some() {
+                super::family::LFM2_MOE_CAPABILITIES
+            } else {
+                super::family::LFM2_CAPABILITIES
+            }
         }
     }
     fn systemone(

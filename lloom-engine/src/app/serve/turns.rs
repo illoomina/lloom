@@ -27,6 +27,14 @@ struct State {
     /// The decision group still waiting for its turn, open to joiners.
     open: Option<u64>,
     groups: HashMap<u64, Group>,
+    #[cfg(test)]
+    queue_observer: Option<(
+        u64,
+        std::sync::mpsc::Sender<(u64, u64)>,
+        Option<std::sync::mpsc::Sender<TakeTiming>>,
+    )>,
+    #[cfg(test)]
+    observer_epoch: u64,
 }
 
 struct Group {
@@ -62,13 +70,103 @@ impl Turns {
 
     /// Wait for a turn of one's own.
     pub(super) fn take(&self) -> Turn<'_> {
+        self.take_with_queued(|_, _| {})
+    }
+
+    // One algorithm for production and the test-only queue witness. The
+    // observer runs after ticket assignment, not before attempting admission.
+    fn take_with_queued(&self, queued: impl FnOnce(u64, u64)) -> Turn<'_> {
         let mut state = self.state.lock();
         let ticket = state.next;
         state.next += 1;
+        queued(ticket, state.serving);
+        #[cfg(test)]
+        let timed = if let Some((_, observer, timing)) = state.queue_observer.take() {
+            let assigned = timing.as_ref().map(|_| super::uptime_ns());
+            let serving = state.serving;
+            let _ = observer.send((ticket, serving));
+            timing.map(|sender| (sender, assigned.unwrap(), serving))
+        } else {
+            None
+        };
         while state.serving != ticket {
             self.changed.wait(&mut state);
         }
+        #[cfg(test)]
+        if let Some((sender, assigned_ns, serving)) = timed {
+            let _ = sender.send(TakeTiming {
+                ticket,
+                serving,
+                assigned_ns,
+                acquired_ns: super::uptime_ns(),
+            });
+        }
         Turn { turns: self }
+    }
+
+    #[cfg(test)]
+    pub(super) fn take_queued(&self, witness: &std::sync::mpsc::Sender<(u64, u64)>) -> Turn<'_> {
+        self.take_with_queued(|ticket, serving| {
+            // A dropped test observer must not unwind after reserving a ticket.
+            let _ = witness.send((ticket, serving));
+        })
+    }
+
+    /// Observe the actual held ticket without assigning a second test ticket.
+    #[cfg(test)]
+    pub(super) fn serving_for_test(&self) -> u64 {
+        self.state.lock().serving
+    }
+
+    #[cfg(test)]
+    pub(super) fn observe_next_take(
+        &self,
+    ) -> (QueueObservation<'_>, std::sync::mpsc::Receiver<(u64, u64)>) {
+        let (scope, queued, _) = self.observe_take(false);
+        (scope, queued)
+    }
+
+    #[cfg(test)]
+    pub(super) fn observe_next_take_timed(
+        &self,
+    ) -> (
+        QueueObservation<'_>,
+        std::sync::mpsc::Receiver<(u64, u64)>,
+        std::sync::mpsc::Receiver<TakeTiming>,
+    ) {
+        let (scope, queued, timed) = self.observe_take(true);
+        (scope, queued, timed.unwrap())
+    }
+
+    #[cfg(test)]
+    fn observe_take(
+        &self,
+        timed: bool,
+    ) -> (
+        QueueObservation<'_>,
+        std::sync::mpsc::Receiver<(u64, u64)>,
+        Option<std::sync::mpsc::Receiver<TakeTiming>>,
+    ) {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let (clock_sender, clock_receiver) = if timed {
+            let (s, r) = std::sync::mpsc::channel();
+            (Some(s), Some(r))
+        } else {
+            (None, None)
+        };
+        let mut state = self.state.lock();
+        assert!(state.queue_observer.is_none(), "one scoped queue observer");
+        state.observer_epoch = state
+            .observer_epoch
+            .checked_add(1)
+            .expect("test observer epoch");
+        let epoch = state.observer_epoch;
+        state.queue_observer = Some((epoch, sender, clock_sender));
+        (
+            QueueObservation { turns: self, epoch },
+            receiver,
+            clock_receiver,
+        )
     }
 
     /// Answer `body` in its group's turn: join the group that is waiting when
@@ -144,6 +242,34 @@ impl Turns {
         let mine = answers[0].take().expect("the leader's answer");
         leader.answers = Some(answers);
         mine
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug)]
+pub(super) struct TakeTiming {
+    pub ticket: u64,
+    pub serving: u64,
+    pub assigned_ns: u64,
+    pub acquired_ns: u64,
+}
+
+#[cfg(test)]
+pub(super) struct QueueObservation<'a> {
+    turns: &'a Turns,
+    epoch: u64,
+}
+#[cfg(test)]
+impl Drop for QueueObservation<'_> {
+    fn drop(&mut self) {
+        let mut state = self.turns.state.lock();
+        if state
+            .queue_observer
+            .as_ref()
+            .is_some_and(|(epoch, _, _)| *epoch == self.epoch)
+        {
+            state.queue_observer = None;
+        }
     }
 }
 

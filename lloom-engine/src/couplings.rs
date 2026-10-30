@@ -200,7 +200,7 @@ pub const COUPLINGS: &[Coupling] = &[
         id: "C20",
         kind: "ignored",
         when: "kernels.gemm.f16_rows off, determinism = deterministic, scheduler.max_sequences = 1, the CPU backend, or a batched step with more live rows than kernels.gemm.f16_rows_max",
-        effect: "kernels.gemm.f16_rows_decode has no effect: the step's matmuls take the GEMM (the GEMV at one row; the one-row reduction per row under deterministic). Under fast a step with prompt pieces puts its live rows on the decode route and its pieces on the GEMM, so a row's route, and so its bits, changes only where a decode step's live rows cross 1 and kernels.gemm.f16_rows_max: the step's two route seams. serve and bench default the arm on only at scheduler.max_sequences up to kernels.gemm.f16_rows_max, where no step crosses the ceiling",
+        effect: "kernels.gemm.f16_rows_decode has no effect: the step's matmuls take the GEMM (the GEMV at one row; the one-row reduction per row under deterministic). Under fast a step with prompt pieces puts its live rows on the decode route and its pieces on the GEMM, so a row's route, and so its bits, changes only where a decode step's live rows cross 1 and kernels.gemm.f16_rows_max: the step's two route seams. serve and bench default the arm on only at scheduler.max_sequences up to kernels.gemm.f16_rows_max (12 there on Metal, decision 60), where no step crosses the ceiling",
         keys: &["kernels.gemm.f16_rows_decode", "kernels.gemm.f16_rows", "kernels.gemm.f16_rows_max", "determinism", "scheduler.max_sequences", "backend.device"],
         site: "lloom-tensor/src/kernels/kernels/mlx_gemm.rs f16_rows_route, f16_rows_lead; lloom/src/nn/batched.rs BatchDecoder::forward_live (tuning::DecodeRows), BatchDecoder::forward_ragged_live (tuning::RaggedDecodeRows)",
         is_static: false,
@@ -212,6 +212,42 @@ pub const COUPLINGS: &[Coupling] = &[
         effect: "the device's residency sets: one per class up to the cap, at most 24, the keep-warm requesting kernels.residency.hot; and whether they are on the Metal 3 queue (Metal 4 keeps the attachment). chat and serve detach them by default on Metal (decision 56); the library keeps them on the queue",
         keys: &["kernels.residency.set_cap_pct", "kernels.residency.attach", "kernels.residency.hot"],
         site: "lloom-tensor/src/kernels/metal/residency_set.rs ResidencyPolicy::selected, ResidencyAttachment::decide",
+        is_static: false,
+    },
+    Coupling {
+        id: "C22",
+        kind: "ignored",
+        when: "kernels.gemm.f16_rows off, determinism = deterministic, or the CPU backend",
+        effect: "kernels.gemm.f16_rows_round has no effect: no launch takes the row axis. Where one does, a launch of an odd number of rows takes the next even capacity and every row keeps the one-row GEMV's bits, so the arm moves time, never a bit",
+        keys: &["kernels.gemm.f16_rows_round", "kernels.gemm.f16_rows", "determinism", "backend.device"],
+        site: "lloom-tensor/src/kernels/kernels/mlx_gemm.rs f16_rows_capacity",
+        is_static: false,
+    },
+    Coupling {
+        id: "C23",
+        kind: "resolves",
+        when: "a generating response is admitted, or its SSE handover reaches server.response.raw_bytes",
+        effect: "a response context is admitted on the machine gate with its declared footprint (server.response.raw_bytes plus the request body), and only a memory refusal is a 503 with Retry-After; server.response.contexts, when set, caps the count instead of a fixed default (decision 83). raw_bytes refuses the next whole fragment past it, keeping the accepted frontier. Not a wall-time drain bound",
+        keys: &["server.response.contexts", "server.response.raw_bytes"],
+        site: "lloom-engine/src/app/serve.rs ResponseContexts::try_take, StreamWriter::admit",
+        is_static: false,
+    },
+    Coupling {
+        id: "C24",
+        kind: "resolves",
+        when: "kernels.residency.metal4 other than slots, or the model is Qwen4-exp on chat or serve",
+        effect: "what a Metal 4 command buffer declares resident: the device's residency sets on the Metal 4 queue (queue-*) or used by each command buffer (cb-*), and under *-diff its slot set lists only what they do not cover. chat and serve take queue-diff for Qwen4-exp on Metal (decision 62), slots elsewhere; on Metal 3 there are no slot sets and the arm has no effect",
+        keys: &["kernels.residency.metal4", "backend.metal.command_buffer.api", "model.path"],
+        site: "lloom-tensor/src/kernels/metal/residency_set.rs Metal4Declare::selected; lloom-tensor/src/kernels/metal/metal4.rs Queue::new, Slot::new; lloom-engine/src/frontend.rs When::Qwen4Exp",
+        is_static: false,
+    },
+    Coupling {
+        id: "C25",
+        kind: "resolves",
+        when: "decode.batched.cut_hold other than off, or the model is LFM2 on serve or bench",
+        effect: "whether the batched loop's decode-only forwards hold the counter cut off: ahead over a forward encoded ahead of the step's readback, all over every one, the blocking (sampled) arm too; a step that feeds prompt pieces keeps the period. serve and bench take all for LFM2 on Metal (decision 71), off elsewhere; at scheduler.max_sequences = 1 or on the CPU no batched loop cuts and the arm has no effect",
+        keys: &["decode.batched.cut_hold", "scheduler.max_sequences", "model.path", "backend.device"],
+        site: "lloom/src/nn/batched.rs BatchCutHold::{configured, hold}, BatchDecoder::step; lloom-engine/src/frontend.rs When::ModelAxes",
         is_static: false,
     },
 ];
@@ -417,36 +453,81 @@ pub fn explain(o: &EngineOptions) -> Vec<String> {
     if let Some(line) = residency_layout(&o.tuning.metal) {
         out.push(line);
     }
+    if let Some(line) = metal4_declaration(o) {
+        out.push(line);
+    }
+    if let Some(line) = batched_cut_hold(o) {
+        out.push(line);
+    }
     let g = &o.tuning.gemm;
+    let rows_cause = if o.tuning.contract.profile == "deterministic" {
+        Some("determinism = deterministic")
+    } else if !g.f16_rows {
+        Some("kernels.gemm.f16_rows = false")
+    } else if !cfg!(feature = "metal") || o.load.device == "cpu" {
+        Some("the CPU backend")
+    } else if o.scheduler.max_sequences <= 1 {
+        Some("scheduler.max_sequences = 1")
+    } else {
+        None
+    };
+    let default_batch = format!(
+        "serve and bench turn it on by default at a batch of 2 to {} sequences",
+        g.f16_rows_max
+    );
     if g.f16_rows_decode {
+        out.push(match rows_cause {
+            Some(c) => format!("kernels.gemm.f16_rows_decode ignored <- {c} (C20)"),
+            None if o.scheduler.max_sequences > g.f16_rows_max => format!(
+                "kernels.gemm.f16_rows_decode: a decode step of 2 to {} live rows (1 to {} beside \
+                 prompt pieces) takes the row axis, of more the GEMM; a batch of {} sequences \
+                 crosses the ceiling, so a row's route follows how many rows its steps hold, \
+                 which follows the requests' arrival; {default_batch} <- \
+                 kernels.gemm.f16_rows_max (C20)",
+                g.f16_rows_max, g.f16_rows_max, o.scheduler.max_sequences
+            ),
+            None => format!(
+                "kernels.gemm.f16_rows_decode: a decode step of 2 to {} live rows (1 to {} beside \
+                 prompt pieces) takes the row axis, of more the GEMM; {default_batch} <- \
+                 kernels.gemm.f16_rows_max (C20)",
+                g.f16_rows_max, g.f16_rows_max
+            ),
+        });
+    } else if rows_cause.is_none() && o.scheduler.max_sequences > g.f16_rows_max {
+        out.push(format!(
+            "kernels.gemm.f16_rows_decode off: {default_batch}, and a batch of {} is past the \
+             ceiling, where a row's route would follow the requests' arrival <- \
+             kernels.gemm.f16_rows_max (C20)",
+            o.scheduler.max_sequences
+        ));
+    }
+    if g.f16_rows_round {
         let cause = if o.tuning.contract.profile == "deterministic" {
             Some("determinism = deterministic")
         } else if !g.f16_rows {
             Some("kernels.gemm.f16_rows = false")
         } else if !cfg!(feature = "metal") || o.load.device == "cpu" {
             Some("the CPU backend")
-        } else if o.scheduler.max_sequences <= 1 {
-            Some("scheduler.max_sequences = 1")
         } else {
             None
         };
         out.push(match cause {
-            Some(c) => format!("kernels.gemm.f16_rows_decode ignored <- {c} (C20)"),
-            None if o.scheduler.max_sequences > g.f16_rows_max => format!(
-                "kernels.gemm.f16_rows_decode: a decode step of 2 to {} live rows (1 to {} beside \
-                 prompt pieces) takes the row axis, of more the GEMM; a batch of {} sequences \
-                 crosses the ceiling, so a row's route follows how many rows its steps hold, \
-                 which follows the requests' arrival <- kernels.gemm.f16_rows_max (C20)",
-                g.f16_rows_max, g.f16_rows_max, o.scheduler.max_sequences
-            ),
-            None => format!(
-                "kernels.gemm.f16_rows_decode: a decode step of 2 to {} live rows (1 to {} beside \
-                 prompt pieces) takes the row axis, of more the GEMM <- kernels.gemm.f16_rows_max \
-                 (C20)",
-                g.f16_rows_max, g.f16_rows_max
-            ),
+            Some(c) => format!("kernels.gemm.f16_rows_round ignored <- {c} (C22)"),
+            None => "kernels.gemm.f16_rows_round: a row-axis launch of an odd number of rows \
+                     takes the next even capacity, the same bits <- kernels.gemm.f16_rows (C22)"
+                .into(),
         });
     }
+    let response = o.server.response;
+    out.push(format!(
+        "server.response -> contexts={} raw_bytes={}: a context is admitted on the machine gate \
+         with raw_bytes plus its body as its footprint; memory refusal=503 with Retry-After, \
+         raw-byte exhaustion=whole-fragment cancellation; no wall-time bound (C23)",
+        response
+            .contexts
+            .map_or("memory".to_owned(), |n| format!("{n} (override)")),
+        response.raw_bytes
+    ));
     out
 }
 
@@ -479,6 +560,75 @@ fn residency_layout(m: &lloom_tensor::tuning::MetalTuning) -> Option<String> {
         "kernels.residency -> {sets}, {attach} <- kernels.residency.set_cap_pct = {pct}, \
          kernels.residency.attach = {} (C21)",
         m.residency_attach
+    ))
+}
+
+/// What a Metal 4 command buffer declares resident as the options resolve it
+/// (`tuning.md` §6.3p); `None` at `slots`, the library's value.
+fn metal4_declaration(o: &EngineOptions) -> Option<String> {
+    let arm = o.tuning.metal.residency_metal4.as_str();
+    if arm == "slots" {
+        return None;
+    }
+    if o.tuning.metal.command_api == "metal3" {
+        return Some(format!(
+            "kernels.residency.metal4 = {arm} ignored <- backend.metal.command_buffer.api = \
+             metal3: no slot sets (C24)"
+        ));
+    }
+    let sets = if arm.starts_with("queue") {
+        "the device's residency sets on the Metal 4 queue"
+    } else {
+        "the device's residency sets used by each command buffer"
+    };
+    let lists = if arm.ends_with("diff") {
+        "each slot set listing only what they do not cover"
+    } else {
+        "each slot set listing every binding (a control)"
+    };
+    let default = if arm == "queue-diff" && crate::frontend::When::Qwen4Exp.holds(o) {
+        " (chat's and serve's default for Qwen4-exp on Metal, decision 62)"
+    } else {
+        ""
+    };
+    Some(format!(
+        "kernels.residency.metal4 -> {sets}, {lists}{default} <- kernels.residency.metal4 = \
+         {arm} (C24)"
+    ))
+}
+
+/// The batched loop's counter cut as the options resolve it (`tuning.md`
+/// §13.5r); `None` at `off`, the library's value.
+fn batched_cut_hold(o: &EngineOptions) -> Option<String> {
+    let arm = o.tuning.ring.batched_cut_hold.as_str();
+    if arm == "off" {
+        return None;
+    }
+    if !cfg!(feature = "metal") || o.load.device == "cpu" {
+        return Some(format!(
+            "decode.batched.cut_hold = {arm} ignored <- the CPU backend (C25)"
+        ));
+    }
+    if o.scheduler.max_sequences <= 1 {
+        return Some(format!(
+            "decode.batched.cut_hold = {arm} ignored <- scheduler.max_sequences = 1: no batched \
+             loop runs (C25)"
+        ));
+    }
+    let held = if arm == "ahead" {
+        "a decode-only forward encoded ahead of the step's readback"
+    } else {
+        "every decode-only forward, the blocking arm too"
+    };
+    let default = if arm == "all" && crate::frontend::When::ModelAxes.holds(o) {
+        " (serve's and bench's default for LFM2 on Metal, decision 71)"
+    } else {
+        ""
+    };
+    Some(format!(
+        "decode.batched.cut_hold -> the batched loop holds the counter cut off over {held}; a \
+         step that feeds prompt pieces keeps the period{default} <- decode.batched.cut_hold = \
+         {arm} (C25)"
     ))
 }
 
@@ -732,8 +882,11 @@ mod tests {
         assert!(!lines.iter().any(|l| l.contains("(C9)")), "{lines:?}");
         assert_eq!(
             explain(&EngineOptions::default()),
-            vec!["decode.readback.stream_reader -> on <- decode.readback.adaptive_commit (C9)"],
-            "at the defaults only the reader the adaptive commit drains through"
+            vec![
+                "decode.readback.stream_reader -> on <- decode.readback.adaptive_commit (C9)",
+                "server.response -> contexts=memory raw_bytes=1048576: a context is admitted on the machine gate with raw_bytes plus its body as its footprint; memory refusal=503 with Retry-After, raw-byte exhaustion=whole-fragment cancellation; no wall-time bound (C23)"
+            ],
+            "defaults name the reader and the memory-admitted response contexts"
         );
         // C20: the decode rows' arm names its ceiling where it can take the
         // row axis, and its cause where it cannot.
@@ -753,7 +906,22 @@ mod tests {
                 at_batch,
                 vec![
                     "kernels.gemm.f16_rows_decode: a decode step of 2 to 10 live rows (1 to 10 \
-                      beside prompt pieces) takes the row axis, of more the GEMM <- \
+                      beside prompt pieces) takes the row axis, of more the GEMM; serve and bench \
+                      turn it on by default at a batch of 2 to 10 sequences <- \
+                      kernels.gemm.f16_rows_max (C20)"
+                ]
+            );
+            // Decision 60's ceiling, as serve and bench resolve it.
+            assert_eq!(
+                c20(&[
+                    ("kernels.gemm.f16_rows_decode", "true"),
+                    ("kernels.gemm.f16_rows_max", "12"),
+                    ("scheduler.max_sequences", "12"),
+                ]),
+                vec![
+                    "kernels.gemm.f16_rows_decode: a decode step of 2 to 12 live rows (1 to 12 \
+                      beside prompt pieces) takes the row axis, of more the GEMM; serve and bench \
+                      turn it on by default at a batch of 2 to 12 sequences <- \
                       kernels.gemm.f16_rows_max (C20)"
                 ]
             );
@@ -772,8 +940,8 @@ mod tests {
                     "kernels.gemm.f16_rows_decode: a decode step of 2 to 10 live rows (1 to 10 \
                       beside prompt pieces) takes the row axis, of more the GEMM; a batch of 16 \
                       sequences crosses the ceiling, so a row's route follows how many rows its \
-                      steps hold, which follows the requests' arrival <- \
-                      kernels.gemm.f16_rows_max (C20)"
+                      steps hold, which follows the requests' arrival; serve and bench turn it on \
+                      by default at a batch of 2 to 10 sequences <- kernels.gemm.f16_rows_max (C20)"
                 ]
             );
         }
@@ -801,6 +969,60 @@ mod tests {
             c20(&[("scheduler.max_sequences", "4")]).is_empty(),
             "the arm off"
         );
+        // Off past the ceiling: the default batch it would take, named.
+        let past = c20(&[
+            ("kernels.gemm.f16_rows_max", "12"),
+            ("scheduler.max_sequences", "13"),
+        ]);
+        if cfg!(feature = "metal") {
+            assert_eq!(
+                past,
+                vec![
+                    "kernels.gemm.f16_rows_decode off: serve and bench turn it on by default at a \
+                      batch of 2 to 12 sequences, and a batch of 13 is past the ceiling, where a \
+                      row's route would follow the requests' arrival <- kernels.gemm.f16_rows_max \
+                      (C20)"
+                ]
+            );
+        } else {
+            assert!(past.is_empty(), "{past:?}");
+        }
+        // C22: the capacity rounding names what it does where the row axis
+        // runs, and its cause where it does not.
+        let c22 = |sets: &[(&str, &str)]| -> Vec<String> {
+            explain(&with(sets))
+                .into_iter()
+                .filter(|l| l.ends_with("(C22)"))
+                .collect()
+        };
+        let round = [("kernels.gemm.f16_rows_round", "true")];
+        if cfg!(feature = "metal") {
+            assert_eq!(
+                c22(&round),
+                vec![
+                    "kernels.gemm.f16_rows_round: a row-axis launch of an odd number of rows \
+                     takes the next even capacity, the same bits <- kernels.gemm.f16_rows (C22)"
+                ]
+            );
+        } else {
+            assert_eq!(
+                c22(&round),
+                vec!["kernels.gemm.f16_rows_round ignored <- the CPU backend (C22)"]
+            );
+        }
+        let mut det = round.to_vec();
+        det.push(("determinism", "deterministic"));
+        assert_eq!(
+            c22(&det),
+            vec!["kernels.gemm.f16_rows_round ignored <- determinism = deterministic (C22)"]
+        );
+        let mut rows_off = round.to_vec();
+        rows_off.push(("kernels.gemm.f16_rows", "false"));
+        assert_eq!(
+            c22(&rows_off),
+            vec!["kernels.gemm.f16_rows_round ignored <- kernels.gemm.f16_rows = false (C22)"]
+        );
+        assert!(c22(&[]).is_empty(), "the arm off");
     }
 
     /// C21 at the library's values says nothing; where chat's and serve's
@@ -831,5 +1053,160 @@ mod tests {
             assert_eq!(c21(&o), want, "{}", f.name());
         }
         assert!(c21(&with(&[("kernels.residency.attach", "queue")])).is_empty());
+    }
+
+    /// C24 at `slots` says nothing; on a Qwen4-exp checkpoint chat's and
+    /// serve's default names decision 62; on LFM2 neither prints; the arm on
+    /// Metal 3 is named as ignored, and a control is named as one.
+    #[test]
+    fn c24_names_the_metal4_declaration() {
+        use crate::frontend::{self, Frontend, When};
+        let c24 = |o: &EngineOptions| -> Vec<String> {
+            explain(o)
+                .into_iter()
+                .filter(|l| l.ends_with("(C24)"))
+                .collect()
+        };
+        assert!(c24(&EngineOptions::default()).is_empty(), "the library's");
+        let dir = std::env::temp_dir().join(format!("lloom-c24-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let qwen = dir.join("qwen4exp.gguf");
+        std::fs::write(&qwen, "").unwrap();
+        for f in [Frontend::Chat, Frontend::Serve, Frontend::Bench] {
+            for model in [None, Some(qwen.clone())] {
+                let mut o = EngineOptions::default();
+                o.load.model = model.clone();
+                frontend::apply(&mut o, f, &Default::default(), &Default::default()).unwrap();
+                let on = f != Frontend::Bench && model.is_some() && When::Qwen4Exp.holds(&o);
+                let want: Vec<String> = if on {
+                    vec![
+                        "kernels.residency.metal4 -> the device's residency sets on the Metal 4 \
+                          queue, each slot set listing only what they do not cover (chat's and \
+                          serve's default for Qwen4-exp on Metal, decision 62) <- \
+                          kernels.residency.metal4 = queue-diff (C24)"
+                            .into(),
+                    ]
+                } else {
+                    vec![]
+                };
+                assert_eq!(c24(&o), want, "{} {model:?}", f.name());
+            }
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(
+            c24(&with(&[("kernels.residency.metal4", "cb-full")])),
+            vec![
+                "kernels.residency.metal4 = cb-full ignored <- backend.metal.command_buffer.api \
+                  = metal3: no slot sets (C24)"
+            ]
+        );
+        assert_eq!(
+            c24(&with(&[
+                ("kernels.residency.metal4", "cb-full"),
+                ("backend.metal.command_buffer.api", "metal4")
+            ])),
+            vec![
+                "kernels.residency.metal4 -> the device's residency sets used by each command \
+                  buffer, each slot set listing every binding (a control) <- \
+                  kernels.residency.metal4 = cb-full (C24)"
+            ]
+        );
+    }
+    /// C25 at `off` says nothing; serve's and bench's default on LFM2 names
+    /// decision 71 at a batch and is named inert at one sequence; Qwen4-exp
+    /// and chat keep `off`; `ahead` is named as itself, and the CPU as the
+    /// reason the arm does nothing.
+    #[test]
+    fn c25_names_the_batched_cut_hold() {
+        use crate::frontend::{self, Frontend, When};
+        let c25 = |o: &EngineOptions| -> Vec<String> {
+            explain(o)
+                .into_iter()
+                .filter(|l| l.ends_with("(C25)"))
+                .collect()
+        };
+        assert!(c25(&EngineOptions::default()).is_empty(), "the library's");
+        let dir = std::env::temp_dir().join(format!("lloom-c25-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let qwen = dir.join("qwen4exp.gguf");
+        std::fs::write(&qwen, "").unwrap();
+        for f in Frontend::ALL {
+            for model in [None, Some(qwen.clone())] {
+                for batch in [1usize, 4] {
+                    let mut o = EngineOptions::default();
+                    o.load.model = model.clone();
+                    o.scheduler.max_sequences = batch;
+                    frontend::apply(&mut o, f, &Default::default(), &Default::default()).unwrap();
+                    let on = f != Frontend::Chat && model.is_none() && When::ModelAxes.holds(&o);
+                    let want: Vec<String> = match (on, batch) {
+                        (false, _) => vec![],
+                        (true, 1) => vec!["decode.batched.cut_hold = all ignored <- \
+                                           scheduler.max_sequences = 1: no batched loop runs (C25)"
+                            .into()],
+                        (true, _) => vec!["decode.batched.cut_hold -> the batched loop holds the \
+                                           counter cut off over every decode-only forward, the \
+                                           blocking arm too; a step that feeds prompt pieces keeps \
+                                           the period (serve's and bench's default for LFM2 on \
+                                           Metal, decision 71) <- decode.batched.cut_hold = all (C25)"
+                            .into()],
+                    };
+                    assert_eq!(c25(&o), want, "{} {model:?} at {batch}", f.name());
+                }
+            }
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+        let ahead = with(&[
+            ("decode.batched.cut_hold", "ahead"),
+            ("scheduler.max_sequences", "4"),
+        ]);
+        let want = if cfg!(feature = "metal") {
+            "decode.batched.cut_hold -> the batched loop holds the counter cut off over a \
+             decode-only forward encoded ahead of the step's readback; a step that feeds prompt \
+             pieces keeps the period <- decode.batched.cut_hold = ahead (C25)"
+        } else {
+            "decode.batched.cut_hold = ahead ignored <- the CPU backend (C25)"
+        };
+        assert_eq!(c25(&ahead), vec![want]);
+        assert_eq!(
+            c25(&with(&[
+                ("decode.batched.cut_hold", "all"),
+                ("scheduler.max_sequences", "4"),
+                ("backend.device", "cpu"),
+            ])),
+            vec!["decode.batched.cut_hold = all ignored <- the CPU backend (C25)"]
+        );
+    }
+}
+
+#[cfg(test)]
+mod response_coupling_tests {
+    #[test]
+    fn additive_coupling_entries_keep_distinct_identifiers() {
+        let ids: std::collections::BTreeSet<_> = super::COUPLINGS.iter().map(|c| c.id).collect();
+        assert_eq!(
+            ids.len(),
+            super::COUPLINGS.len(),
+            "keep-both additive merges must also keep unique coupling IDs"
+        );
+    }
+
+    #[test]
+    fn response_explain_names_configured_limits_and_each_distinct_outcome() {
+        let mut options = crate::options::EngineOptions::default();
+        let explained = |options: &crate::options::EngineOptions| -> Vec<String> {
+            super::explain(options)
+                .into_iter()
+                .filter(|s| s.ends_with("(C23)"))
+                .collect()
+        };
+        assert_eq!(explained(&options), ["server.response -> contexts=memory raw_bytes=1048576: a context is admitted on the machine gate with raw_bytes plus its body as its footprint; memory refusal=503 with Retry-After, raw-byte exhaustion=whole-fragment cancellation; no wall-time bound (C23)"]);
+        options.server.response = crate::options::ServerResponseConfig {
+            contexts: Some(2),
+            raw_bytes: 31,
+        };
+        assert_eq!(explained(&options), ["server.response -> contexts=2 (override) raw_bytes=31: a context is admitted on the machine gate with raw_bytes plus its body as its footprint; memory refusal=503 with Retry-After, raw-byte exhaustion=whole-fragment cancellation; no wall-time bound (C23)"]);
+        for key in ["server.response.contexts", "server.response.raw_bytes"] {
+            assert_eq!(super::of(key), ["C23"]);
+        }
     }
 }

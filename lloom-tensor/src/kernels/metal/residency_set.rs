@@ -5,7 +5,8 @@ use crate::residency_class::{scoped_residency_class, ResidencyClass, MAX_DEVICE_
 use crate::residency_ownership::ResidencyOwners;
 use objc2::{rc::Retained, runtime::ProtocolObject};
 use objc2_metal::{
-    MTLAllocation, MTLCommandQueue, MTLDevice as _, MTLResidencySet, MTLResidencySetDescriptor,
+    MTL4CommandQueue, MTLAllocation, MTLCommandQueue, MTLDevice as _, MTLResidencySet,
+    MTLResidencySetDescriptor,
 };
 use parking_lot::{Condvar, Mutex};
 use std::collections::HashMap;
@@ -256,10 +257,13 @@ struct Native {
     dirty: bool,
 }
 
-/// Which native set lists an allocation, and the bytes it was added with.
+/// Which native set lists an allocation, the bytes and class it was added
+/// with, and the site that added it (`listing_sites`; 0 when not recorded).
 #[derive(Clone, Copy)]
 struct Placed {
     native: u8,
+    class: ResidencyClass,
+    site: u32,
     bytes: u64,
 }
 
@@ -270,6 +274,8 @@ struct Inner {
     placement: HashMap<usize, Placed>,
     natives: Vec<Native>,
     queues: Vec<Retained<ProtocolObject<dyn MTLCommandQueue>>>,
+    /// Metal 4 queues the sets are on (`kernels.residency.metal4 = queue-*`).
+    queues4: Vec<Retained<ProtocolObject<dyn MTL4CommandQueue>>>,
     /// Placements past the cap because every set was already made.
     overflow: u64,
 }
@@ -287,6 +293,7 @@ impl Inner {
         bytes: u64,
         requests: &AtomicU64,
         attachments: &AtomicU64,
+        generation: &AtomicU64,
     ) -> usize {
         let Some(cap) = policy.cap_bytes else {
             return 0;
@@ -316,6 +323,10 @@ impl Inner {
                     q.addResidencySet(&raw);
                     attachments.fetch_add(1, Ordering::Relaxed);
                 }
+                for q in &self.queues4 {
+                    q.addResidencySet(&raw);
+                    attachments.fetch_add(1, Ordering::Relaxed);
+                }
                 self.natives.push(Native {
                     raw,
                     class: Some(class),
@@ -324,6 +335,7 @@ impl Inner {
                     commits: 0,
                     dirty: false,
                 });
+                generation.fetch_add(1, Ordering::Release);
                 return self.natives.len() - 1;
             }
         }
@@ -339,7 +351,13 @@ impl Inner {
         emptiest(true).or_else(|| emptiest(false)).unwrap_or(0)
     }
 
-    fn add_native(&mut self, i: usize, key: usize, alloc: &ProtocolObject<dyn MTLAllocation>) {
+    fn add_native(
+        &mut self,
+        i: usize,
+        key: usize,
+        alloc: &ProtocolObject<dyn MTLAllocation>,
+        class: ResidencyClass,
+    ) {
         let bytes = alloc.allocatedSize() as u64;
         let n = &mut self.natives[i];
         n.raw.addAllocation(alloc);
@@ -350,6 +368,8 @@ impl Inner {
             key,
             Placed {
                 native: i as u8,
+                class,
+                site: listing_sites::note(),
                 bytes,
             },
         );
@@ -508,6 +528,9 @@ pub struct ResidencySet {
     ends: AtomicU64,
     /// `addResidencySet` calls naming this set (`kernels.residency.attach`).
     queue_attachments: AtomicU64,
+    /// Bumped each time the router makes a native set, so a Metal 4 slot
+    /// that uses the sets per command buffer re-reads them only then.
+    natives_generation: AtomicU64,
 
     /// Set by [`Self::add`] when an allocation has been `addAllocation`'d but not
     /// yet `commit`ted, cleared by [`Self::commit_pending`]. The deferred-commit
@@ -557,17 +580,7 @@ impl Drop for LiveDevice {
     }
 }
 
-/// What a Metal 4 queue's per-slot residency sets did since the queue was
-/// made (`kernels.residency.slot_trace`): the allocations `Slot::resource`
-/// added, the set commits (one per command buffer), and the committing set's
-/// `allocatedSize` at the last commit and at its largest.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub struct SlotResidency {
-    pub adds: u64,
-    pub commits: u64,
-    pub last_bytes: u64,
-    pub max_bytes: u64,
-}
+pub use crate::residency_class::SlotResidency;
 
 /// How the device's residency set reaches the command queue
 /// (`kernels.residency.attach`).
@@ -598,6 +611,90 @@ impl ResidencyAttach {
         match self {
             Self::Queue => "queue",
             Self::Heartbeat => "heartbeat",
+        }
+    }
+}
+
+/// What a Metal 4 command buffer declares resident (`kernels.residency.metal4`,
+/// `tuning.md` §6.3p). Under `Slots` its slot's set lists everything it
+/// binds. The others put the device's sets on the Metal 4 queue (`Queue*`) or
+/// mark them used by each command buffer (`Cb*`); under a `*Diff` the slot's
+/// set then leaves out the bindings those sets cover (a pool buffer, a heap
+/// sub-buffer: `Buffer::device_listed`), under a `*Full` it lists everything
+/// still (the controls that price the attachment without the saving).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Metal4Declare {
+    Slots,
+    QueueDiff,
+    CbDiff,
+    QueueFull,
+    CbFull,
+}
+
+impl Metal4Declare {
+    /// The arm `kernels.residency.metal4` names.
+    pub fn selected() -> Self {
+        Self::parse(&crate::tuning::tuning().metal.residency_metal4)
+    }
+    pub fn parse(arm: &str) -> Self {
+        match arm {
+            "queue-diff" => Self::QueueDiff,
+            "cb-diff" => Self::CbDiff,
+            "queue-full" => Self::QueueFull,
+            "cb-full" => Self::CbFull,
+            _ => Self::Slots,
+        }
+    }
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Slots => "slots",
+            Self::QueueDiff => "queue-diff",
+            Self::CbDiff => "cb-diff",
+            Self::QueueFull => "queue-full",
+            Self::CbFull => "cb-full",
+        }
+    }
+    /// The device's sets are on the Metal 4 queue.
+    pub fn on_queue(self) -> bool {
+        matches!(self, Self::QueueDiff | Self::QueueFull)
+    }
+    /// Each command buffer marks the device's sets as used.
+    pub fn per_command_buffer(self) -> bool {
+        matches!(self, Self::CbDiff | Self::CbFull)
+    }
+    /// A slot's set leaves out what the device's sets cover.
+    pub fn diff(self) -> bool {
+        matches!(self, Self::QueueDiff | Self::CbDiff)
+    }
+}
+
+/// What a Metal 4 slot set may leave to the device's sets under a `*-diff`
+/// declaration (`kernels.residency.metal4_cover`, `invariants.md` §15.1r):
+/// the pool's and the heap's buffers (`Pool`), or also every unpooled buffer
+/// the device's backings listed, whose removal then waits in the in-flight
+/// hold for the epoch open at its last handle's drop (`Held`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Metal4Cover {
+    Pool,
+    Held,
+}
+
+impl Metal4Cover {
+    /// The arm `kernels.residency.metal4_cover` names.
+    pub fn selected() -> Self {
+        Self::parse(&crate::tuning::tuning().metal.residency_metal4_cover)
+    }
+    pub fn parse(arm: &str) -> Self {
+        if arm == "held" {
+            Self::Held
+        } else {
+            Self::Pool
+        }
+    }
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Pool => "pool",
+            Self::Held => "held",
         }
     }
 }
@@ -693,6 +790,7 @@ impl ResidencySet {
                 placement: HashMap::new(),
                 natives,
                 queues: Vec::new(),
+                queues4: Vec::new(),
                 overflow: 0,
             }),
             commits: AtomicU64::new(0),
@@ -704,6 +802,7 @@ impl ResidencySet {
             requests: AtomicU64::new(requested),
             ends: AtomicU64::new(0),
             queue_attachments: AtomicU64::new(0),
+            natives_generation: AtomicU64::new(0),
             dirty: std::sync::atomic::AtomicBool::new(false),
             retirement: Retirement::default(),
         }
@@ -758,6 +857,38 @@ impl ResidencySet {
             self.queue_attachments.fetch_add(1, Ordering::Relaxed);
         }
         inner.queues.push(queue.clone());
+    }
+
+    /// Puts every set on a Metal 4 queue now and every set made later when
+    /// it is made (`kernels.residency.metal4 = queue-*`). At most
+    /// `MAX_DEVICE_SETS` beside the queue's 8 slot sets: Metal's 32.
+    pub(crate) fn attach_metal4_queue(
+        &self,
+        queue: &Retained<ProtocolObject<dyn MTL4CommandQueue>>,
+    ) {
+        let mut inner = self.members.lock();
+        for n in &inner.natives {
+            queue.addResidencySet(&n.raw);
+            self.queue_attachments.fetch_add(1, Ordering::Relaxed);
+        }
+        inner.queues4.push(queue.clone());
+    }
+
+    /// How many native sets the router has made since the set was built: a
+    /// reader holding [`Self::natives`] from an equal generation holds them
+    /// all.
+    #[inline]
+    pub(crate) fn natives_generation(&self) -> u64 {
+        self.natives_generation.load(Ordering::Acquire)
+    }
+
+    /// The native sets, and the generation they were read at.
+    pub(crate) fn natives(&self) -> (u64, Vec<Retained<ProtocolObject<dyn MTLResidencySet>>>) {
+        let inner = self.members.lock();
+        (
+            self.natives_generation.load(Ordering::Acquire),
+            inner.natives.iter().map(|n| n.raw.clone()).collect(),
+        )
     }
 
     /// The layout's policy.
@@ -1030,8 +1161,9 @@ impl ResidencySet {
             alloc.allocatedSize() as u64,
             &self.requests,
             &self.queue_attachments,
+            &self.natives_generation,
         );
-        inner.add_native(i, key, alloc);
+        inner.add_native(i, key, alloc, class);
     }
 
     /// Add an allocation that is not a buffer of ours — a heap chunk
@@ -1380,6 +1512,14 @@ impl ResidencySet {
         n
     }
 
+    /// The class an allocation is listed under and the site that listed it
+    /// (0 when not recorded), if the sets list it. Takes the membership
+    /// lock: for the slot census (`kernels.residency.slot_trace`) only.
+    pub(crate) fn listing_of(&self, key: usize) -> Option<(ResidencyClass, u32)> {
+        let inner = self.members.lock();
+        inner.placement.get(&key).map(|p| (p.class, p.site))
+    }
+
     /// How many allocations the set currently holds.
     ///
     /// Exists so a test can observe the mechanism directly. The defect this
@@ -1588,5 +1728,116 @@ mod witness_tests {
             "a window reset does not hide a defect count"
         );
         set.remove_all();
+    }
+}
+
+/// The stacks that listed allocations in the device's sets, for the Metal 4
+/// slot census (`kernels.residency.slot_trace`): one frame-pointer walk per
+/// listing, interned by its return addresses and symbolized once per
+/// distinct site when read. Recorded only in builds that keep symbols
+/// (`debug_assertions` or the `profile` feature), with the census on.
+pub(crate) mod listing_sites {
+    #[cfg(any(debug_assertions, feature = "profile"))]
+    mod on {
+        use std::collections::HashMap;
+        use std::sync::OnceLock;
+
+        const DEPTH: usize = 48;
+
+        #[cfg(target_vendor = "apple")]
+        extern "C" {
+            fn backtrace(
+                array: *mut *mut std::ffi::c_void,
+                size: std::ffi::c_int,
+            ) -> std::ffi::c_int;
+        }
+
+        struct Sites {
+            ids: HashMap<[usize; DEPTH], u32>,
+            traces: Vec<(std::backtrace::Backtrace, Option<Vec<String>>)>,
+        }
+
+        fn sites() -> &'static parking_lot::Mutex<Sites> {
+            static SITES: OnceLock<parking_lot::Mutex<Sites>> = OnceLock::new();
+            SITES.get_or_init(|| {
+                parking_lot::Mutex::new(Sites {
+                    ids: HashMap::new(),
+                    traces: Vec::new(),
+                })
+            })
+        }
+
+        fn enabled() -> bool {
+            static ON: OnceLock<bool> = OnceLock::new();
+            *ON.get_or_init(|| crate::tuning::tuning().metal.residency_slot_trace)
+        }
+
+        pub(crate) fn note() -> u32 {
+            if !enabled() {
+                return 0;
+            }
+            let mut key = [0usize; DEPTH];
+            #[cfg(target_vendor = "apple")]
+            {
+                let mut raw = [std::ptr::null_mut::<std::ffi::c_void>(); DEPTH];
+                // SAFETY: `raw` holds DEPTH writable slots; `backtrace` writes
+                // at most that many.
+                let n = unsafe { backtrace(raw.as_mut_ptr(), DEPTH as std::ffi::c_int) };
+                for (slot, ip) in key.iter_mut().zip(raw.iter().take(n.max(0) as usize)) {
+                    *slot = *ip as usize;
+                }
+            }
+            let mut s = sites().lock();
+            if let Some(&id) = s.ids.get(&key) {
+                return id;
+            }
+            s.traces
+                .push((std::backtrace::Backtrace::force_capture(), None));
+            let id = s.traces.len() as u32;
+            s.ids.insert(key, id);
+            id
+        }
+
+        pub(crate) fn frames(site: u32) -> Vec<String> {
+            let mut s = sites().lock();
+            let Some((trace, frames)) = (site as usize)
+                .checked_sub(1)
+                .and_then(|i| s.traces.get_mut(i))
+            else {
+                return Vec::new();
+            };
+            frames
+                .get_or_insert_with(|| {
+                    trace
+                        .to_string()
+                        .lines()
+                        .map(str::trim)
+                        .filter_map(|l| l.split_once(": ").map(|(_, f)| f))
+                        .map(|f| match f.rfind("::h") {
+                            Some(i) if f.len() - i == 19 => &f[..i],
+                            _ => f,
+                        })
+                        .filter(|f| f.starts_with("lloom") || f.starts_with("<lloom"))
+                        .filter(|f| !f.contains("listing_sites") && !f.contains("residency_set::"))
+                        .map(str::to_owned)
+                        .collect()
+                })
+                .clone()
+        }
+    }
+
+    #[cfg(any(debug_assertions, feature = "profile"))]
+    pub(crate) use on::{frames, note};
+
+    /// No site is recorded in a build without symbols.
+    #[cfg(not(any(debug_assertions, feature = "profile")))]
+    #[inline]
+    pub(crate) fn note() -> u32 {
+        0
+    }
+
+    #[cfg(not(any(debug_assertions, feature = "profile")))]
+    pub(crate) fn frames(_site: u32) -> Vec<String> {
+        Vec::new()
     }
 }

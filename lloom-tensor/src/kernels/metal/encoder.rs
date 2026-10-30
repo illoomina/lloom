@@ -2,7 +2,7 @@ use crate::kernels::metal::{
     arena,
     contention::{Censused, Side},
     executor::{DispatchAction, DispatchRecord, ExecutorSlot, Grid},
-    late_bind, trace, Buffer, ComputePipeline, Fence,
+    late_bind, trace, Buffer, ComputePipeline, DeviceListing, Fence,
 };
 use objc2::{rc::Retained, runtime::ProtocolObject};
 use objc2_foundation::{NSRange, NSString};
@@ -1990,7 +1990,11 @@ impl ComputeCommandEncoder {
                 self.executor.will_bind_buffer(index, buf, offset, false);
             }
         }
-        unsafe { self.raw.setBuffer_offset_atIndex(native, offset, index) }
+        let listing = buffer.map_or(DeviceListing::No, Buffer::device_listing);
+        unsafe {
+            self.raw
+                .setBuffer_offset_atIndex(native, offset, index, listing)
+        }
     }
 
     /// # Safety
@@ -2062,7 +2066,47 @@ impl ComputeCommandEncoder {
                 self.executor.will_bind_buffer(index, buf, offset, true);
             }
         }
-        unsafe { self.raw.setBuffer_offset_atIndex(native, offset, index) }
+        let listing = buffer.map_or(DeviceListing::No, Buffer::device_listing);
+        unsafe {
+            self.raw
+                .setBuffer_offset_atIndex(native, offset, index, listing)
+        }
+    }
+
+    /// Declare `buffers` resident for the next dispatch, which reads them
+    /// through GPU addresses in a bound table rather than through bindings.
+    /// No hazard edge is recorded for them. Returns `false`, declaring
+    /// nothing, while an executor records this encoder's binds: a recorded
+    /// command would replay without the declaration.
+    ///
+    /// # Safety
+    /// Each buffer is written by the host alone, before this dispatch is
+    /// encoded, and its owner keeps it alive and unwritten until the command
+    /// buffer completes.
+    pub(crate) unsafe fn declare_indirect_reads(&self, buffers: &[&Buffer]) -> bool {
+        use objc2_metal::MTLResource;
+        if !self.executor.is_classical() {
+            return false;
+        }
+        const CHUNK: usize = 64;
+        let mut ptrs = [core::ptr::NonNull::<ProtocolObject<dyn MTLResource>>::dangling(); CHUNK];
+        for chunk in buffers.chunks(CHUNK) {
+            for (p, b) in ptrs.iter_mut().zip(chunk) {
+                // SAFETY: the caller's contract; the reference outlives the call.
+                let raw: &ProtocolObject<dyn MTLResource> =
+                    ProtocolObject::from_ref(unsafe { b.raw_unchecked() });
+                *p = core::ptr::NonNull::from(raw);
+            }
+            // SAFETY: `ptrs[..chunk.len()]` are live resources (above).
+            unsafe {
+                self.raw.useResources_count_usage(
+                    core::ptr::NonNull::from(&ptrs[0]),
+                    chunk.len(),
+                    MTLResourceUsage::Read,
+                );
+            }
+        }
+        true
     }
 
     pub fn set_bytes_directly(&self, index: usize, length: usize, bytes: *const c_void) {
@@ -2151,8 +2195,12 @@ impl ComputeCommandEncoder {
             crate::kernels::metal::hazard_audit::record_binding(self.raw.audit_id(), &range, false);
         }
         unsafe {
-            self.raw
-                .setBuffer_offset_atIndex(Some(buffer.raw_unchecked()), 0, index)
+            self.raw.setBuffer_offset_atIndex(
+                Some(buffer.raw_unchecked()),
+                0,
+                index,
+                buffer.device_listing(),
+            )
         }
         // The staging buffer must stay alive until the dispatch it feeds has
         // completed, not merely until it is encoded. It is parked here and

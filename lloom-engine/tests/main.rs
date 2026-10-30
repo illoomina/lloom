@@ -15,6 +15,8 @@
 //! not running.
 mod accepted_frontier;
 mod attention_purpose;
+mod batch_admission_ownership;
+mod capabilities_report;
 mod checkpoint_policy;
 mod failure_next_request;
 mod load_warnings;

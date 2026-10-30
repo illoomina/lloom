@@ -1019,3 +1019,8 @@ mod tests {
 // Experimental private bank: no production IoQueue caller or default route.
 #[path = "io_terminal/native_bank.rs"]
 mod native_bank;
+
+#[cfg(feature = "metal")]
+pub(crate) use native_bank::native::{NativeDeferredIo, NativeIoDependency, NativeProducer};
+#[cfg(all(feature = "metal", test))]
+pub(crate) use native_bank::native::TestIoGeneration;

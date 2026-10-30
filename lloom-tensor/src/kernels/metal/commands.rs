@@ -7,6 +7,7 @@ mod entry_guard;
 mod lifecycle;
 #[path = "commands_produced.rs"]
 mod produced;
+pub(crate) use produced::IoComputeAuthority;
 #[cfg(test)]
 #[path = "commands_produced_tests.rs"]
 mod produced_tests;
@@ -1702,7 +1703,16 @@ impl Commands {
     ) -> Result<(), MetalKernelError> {
         let mut state = self.lock_recording_state()?;
         self.ensure_recording_locked(&mut state)?;
-        self.core.close_compute(&mut state)?;
+        self.encode_signal_event_locked(&mut state, event, value)
+    }
+
+    // Shared implementation: enrolled IO reserves its sequence under this SAME
+    // recording exclusion rather than allocating a value before owner entry.
+    fn encode_signal_event_locked<'a>(
+        &'a self, state: &mut EntryGuard<'a>,
+        event: &ProtocolObject<dyn objc2_metal::MTLSharedEvent>, value: u64,
+    ) -> Result<(), MetalKernelError> {
+        self.core.close_compute(state)?;
         if self.core.modern_queue.is_some() {
             // Queue the signal as part of this commit, before acquiring a
             // replacement slot can apply backpressure.
@@ -1711,7 +1721,7 @@ impl Commands {
                 .recording()
                 .expect("recording recovered above")
                 .signal_event(event, value)?;
-            self.cut_locked(&mut state, 0)?;
+            self.cut_locked(state, 0)?;
         } else {
             state
                 .current

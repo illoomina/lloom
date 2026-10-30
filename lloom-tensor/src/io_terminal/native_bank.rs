@@ -12,7 +12,7 @@ pub(super) struct Slot<C, A> {
     native_key: AtomicUsize,
 }
 
-pub(super) struct Bank<C, A> {
+pub(crate) struct Bank<C, A> {
     core: IoTerminal,
     slots: Vec<Slot<C, A>>,
     issued: AtomicU64,
@@ -25,13 +25,17 @@ pub(super) struct Bank<C, A> {
     failure: Arc<FailureSignal>,
     wake: Arc<Wake>,
     metadata_charge: parking_lot::Mutex<Option<crate::memory_admission::PhysicalCharge>>,
+    // Cold installed before producer publication; notifications never certify data.
+    #[cfg(feature = "metal")]
+    notice: std::sync::OnceLock<native::NativeNotice>,
 }
 
-pub(super) struct Prepared<C, A> {
+pub(crate) struct Prepared<C, A> {
     bank: BankHandle<C, A>,
     index: usize,
     ticket: Ticket,
     native_key: usize,
+    sequence: u64,
 }
 
 pub(super) enum PrepareError<C, A> {
@@ -57,6 +61,31 @@ impl<C, A> Bank<C, A> {
     fn fail(&self) {
         self.core.failed.store(true, Ordering::Release);
         self.failure.publish(Failure::AdapterFailed, || self.wake.notify());
+        self.notify_failure();
+    }
+
+    /// Failure notification only: no mailbox owner borrow, metadata ingestion,
+    /// capture destruction, native-slot acquisition or blocking order lock.
+    /// Leave pending unconsumed for existing holders / the live host service.
+    fn notify_failure(&self) {
+        #[cfg(feature = "metal")]
+        {
+            if !self.core.failed() && self.failure.get().is_none() { return; }
+            let Some(notice) = self.notice.get() else { return; };
+            if notice.failure_published() { return; }
+            self.core.failed.store(true, Ordering::Release);
+            self.pending.fetch_or(true, Ordering::SeqCst);
+            if let Some(order) = self.core.order.try_lock() {
+                // Serialize the native setter with all lower-prefix publishers.
+                // MAX wakes dependents; it NEVER certifies valid input bytes.
+                notice.publish(self.core.successful(), true);
+                drop(order);
+            }
+            // A failed try-lock delegates notice to the existing holder's
+            // unlock assistance. If a terminal publisher lost OUR guard, its
+            // pending metadata remains for the live service (not a fake retire).
+            self.wake.notify();
+        }
     }
 
     /// Private, already-admitted backing only. Concurrent callers use the SAME
@@ -125,7 +154,7 @@ impl<C, A> Bank<C, A> {
             }
             return Err(PrepareError::RootedRefused);
         }
-        Ok(Prepared { bank: handle.clone(), index, ticket, native_key })
+        Ok(Prepared { bank: handle.clone(), index, ticket, native_key, sequence })
     }
 
     /// Called only by the cold per-cell native block with the actual valid CB
@@ -158,6 +187,7 @@ impl<C, A> Bank<C, A> {
                 }
                 self.core.failed.store(true, Ordering::Release);
                 self.failure.publish(Failure::CallbackPanic, || self.wake.notify());
+                self.request_progress();
                 Err(CallbackError::Terminal(Error::ObserverPanicked))
             }
         }
@@ -171,6 +201,8 @@ impl<C, A> Bank<C, A> {
         };
         self.diagnostics.fetch_or(flag, Ordering::Release);
         self.wake.notify();
+        // Rejected foreign/stale probes do not themselves latch failure.
+        self.notify_failure();
     }
 
     fn note_protocol_error(&self, error: &Error) {
@@ -217,6 +249,13 @@ impl<C, A> Bank<C, A> {
             before_consume();
             self.pending.swap(false, Ordering::SeqCst);
             let result = self.ingest_locked(&mut order);
+            if result.is_err() { self.fail(); }
+            // The existing metadata exclusion serializes notification values;
+            // callbacks only try this lock and holders assist after unlocking.
+            #[cfg(feature = "metal")]
+            if let Some(notice) = self.notice.get() {
+                notice.publish(self.core.successful(), self.core.failed() || self.failure.get().is_some());
+            }
             drop(order);
             // Future physical/service holders MUST call this assistance after
             // dropping their guard; otherwise a lost try-lock can strand work.
@@ -376,6 +415,7 @@ unsafe impl<C: Send + Sync + 'static, A: Send + Sync + 'static>
         self.metadata_charge.lock().take()
     }
     fn fail(&self, _reason: Failure) { Bank::fail(self) }
+    fn service_notify(&self) { self.notify_failure(); }
 }
 
 impl<C, A> crate::retirement_registry::MetadataWake for Bank<C, A> {
@@ -385,7 +425,7 @@ impl<C, A> crate::retirement_registry::MetadataWake for Bank<C, A> {
 // Only counted HostMetadataHandle is permitted outside registered service root;
 // a raw public Arc/Weak path would invalidate worker-final root census. Prepared
 // and cold native blocks will use this handle, not export their Arc<Bank>.
-type BankHandle<C, A> = crate::retirement_registry::HostMetadataHandle<Bank<C, A>>;
+pub(crate) type BankHandle<C, A> = crate::retirement_registry::HostMetadataHandle<Bank<C, A>>;
 
 struct ColdParts<C, A> {
     core: IoTerminal,
@@ -452,6 +492,8 @@ impl<C: Send + Sync + 'static, A: Send + Sync + 'static> Bank<C, A> {
             core, slots, issued: AtomicU64::new(0), retired: AtomicU64::new(0),
             pending: AtomicBool::new(false), diagnostics: AtomicU64::new(0), active: ActiveRetirement::new(),
             failure, wake, metadata_charge: parking_lot::Mutex::new(Some(charge)),
+            #[cfg(feature = "metal")]
+            notice: std::sync::OnceLock::new(),
         });
         let inbox: Arc<dyn crate::retirement_service::CleanupInbox> = bank.clone();
         let result = service.register_owned(&inbox);
@@ -471,7 +513,7 @@ impl<C: Send + Sync + 'static, A: Send + Sync + 'static> Bank<C, A> {
 
 #[cfg(feature = "metal")]
 #[path = "native_callback_binding.rs"]
-mod native;
+pub(super) mod native;
 #[cfg(test)]
 #[path = "native_bank_tests.rs"]
 mod tests;

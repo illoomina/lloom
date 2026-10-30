@@ -18,9 +18,10 @@ use super::{
     PublishedRemovals,
 };
 use crate::kernels::MetalKernelError;
+use crate::io_terminal::{NativeDeferredIo, NativeIoDependency};
 use crate::retire::Epoch;
 use objc2::{rc::Retained, runtime::ProtocolObject};
-use objc2_metal::{MTLCommandBuffer, MTLCommandQueue, MTLIOCommandBuffer, MTLSharedEvent};
+use objc2_metal::{MTLCommandBuffer, MTLCommandQueue, MTLDevice, MTLIOCommandBuffer, MTLSharedEvent};
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{OnceLock, Weak};
@@ -90,6 +91,21 @@ pub(super) struct Input {
     /// When it was gated, in the queue's gating order (0: not a gate's); a
     /// repeated input keeps the earliest.
     seq: u64,
+    // None preserves the ordinary event/cancellation contract.
+    io: Option<NativeIoDependency>,
+}
+
+/// Cold enrolled compute authority. One event certifies ONE Commands queue;
+/// cloning/moving a Commands wrapper cannot change the retained core identity.
+pub(crate) struct IoComputeAuthority {
+    owner: Weak<CommandsCore>,
+    event: Retained<ProtocolObject<dyn MTLSharedEvent>>,
+    next: AtomicU64,
+}
+unsafe impl Send for IoComputeAuthority {}
+unsafe impl Sync for IoComputeAuthority {}
+impl IoComputeAuthority {
+    pub(crate) fn event(&self) -> &ProtocolObject<dyn MTLSharedEvent> { &self.event }
 }
 
 /// How [`Gate::add`] took an input.
@@ -115,11 +131,28 @@ impl Input {
             event,
             value,
             seq: 0,
+            io: None,
         })
     }
 
+    fn from_io(io: NativeIoDependency) -> Result<Self, MetalKernelError> {
+        let mut input = Self::new(io.notification(), io.value())?;
+        input.io = Some(io);
+        Ok(input)
+    }
+
+    fn failed_io_cancel(&self) -> Option<Cancel> {
+        let io = self.io.as_ref()?;
+        if !io.failed() { return None; }
+        // Taken while applying under owner exclusion, NOT an asynchronously
+        // captured gating snapshot. Ordinary Cancel remains unchanged.
+        Some(Cancel { event: self.event.clone(), produced: io.successful(),
+            upto: u64::MAX, gated_through: u64::MAX,
+            reason: "validated IO generation failed before dependent submission" })
+    }
+
     fn produced(&self) -> bool {
-        self.event.signaledValue() >= self.value
+        self.io.as_ref().map_or_else(|| self.event.signaledValue() >= self.value, NativeIoDependency::ready)
     }
 
     fn is_on(&self, event: &ProtocolObject<dyn MTLSharedEvent>) -> bool {
@@ -199,6 +232,8 @@ impl Gate {
 
 /// What a held recording's commit leaves to run after it.
 pub(super) enum AfterCommit {
+    /// Already rooted Prepared custody; cancellation drops/refuses, never rehomes.
+    ValidatedIo(NativeDeferredIo),
     /// An IO command buffer that waits on `signal`, encoded in the recording:
     /// committed once that signal is on the GPU, so the IO queue never waits
     /// on a signal nothing will run. `rehomed` once the recording carrying
@@ -356,6 +391,8 @@ pub(super) struct ProducedState {
     /// A producer found the state lock held: the holder runs the release
     /// once it unlocks (`AfterUnlock`).
     release_pending: AtomicBool,
+    // Exceptional terminal notification, not a success-path full gate scan.
+    io_failure_pending: AtomicBool,
     /// A cancellation found the state lock held: whichever holder looks next
     /// applies it, before any release (`Commands::cancel_produced`).
     cancel_pending: AtomicBool,
@@ -374,6 +411,8 @@ pub(super) struct ProducedState {
     cancel_reason: parking_lot::Mutex<&'static str>,
     /// Wakes the queue for an input the GPU or the IO queue produces.
     listener: OnceLock<Listener>,
+    // IO-only callback: ordinary host/event notifications keep their old path.
+    io_notify: OnceLock<NotifyBlock>,
 }
 
 impl ProducedState {
@@ -393,6 +432,7 @@ impl ProducedState {
             producer_lock_us: AtomicU64::new(0),
             delegated: AtomicU64::new(0),
             release_pending: AtomicBool::new(false),
+            io_failure_pending: AtomicBool::new(false),
             cancel_pending: AtomicBool::new(false),
             cancels: parking_lot::Mutex::new(Vec::new()),
             cancels_delegated: AtomicU64::new(0),
@@ -404,6 +444,7 @@ impl ProducedState {
             cancelled_upto: AtomicU64::new(0),
             cancel_reason: parking_lot::Mutex::new("cancelled before its input was produced"),
             listener: OnceLock::new(),
+            io_notify: OnceLock::new(),
         }
     }
 
@@ -426,6 +467,28 @@ impl ProducedState {
     #[cfg(test)]
     pub(super) fn late_logged_for_test(&self) -> bool {
         self.late_logged.load(Ordering::Relaxed)
+    }
+
+    pub(super) fn io_notification(&self) -> &NotifyBlock {
+        self.io_notify.get_or_init(|| {
+            let me = self.me.clone();
+            block2::RcBlock::new(
+                move |event: NonNull<ProtocolObject<dyn MTLSharedEvent>>, _threshold: u64| {
+                    if let Some(core) = me.upgrade() {
+                        // SAFETY: Metal supplies the retained registered event.
+                        let event = unsafe { event.as_ref() };
+                        // A callback argument need not report a later terminal
+                        // signal. Read THIS IO notice, never infer data validity
+                        // from it: produced_on checks the retained typed gates.
+                        if let Err(error) = core.produced_on(event, event.signaledValue()) {
+                            core.failure.record(format!(
+                                "an IO notification could not release its held work: {error}"
+                            ));
+                        }
+                    }
+                },
+            )
+        })
     }
 
     fn listener(&self) -> &Listener {
@@ -484,10 +547,23 @@ impl CommandsCore {
     ) -> Result<usize, MetalKernelError> {
         let mut released = 0usize;
         let mut opened = false;
-        let result = loop {
+        let result = 'release: loop {
             if self.produced.cancel_pending.load(Ordering::SeqCst) {
                 if let Err(error) = self.apply_cancels_locked(state) {
                     break Err(error);
+                }
+            }
+            if self.produced.io_failure_pending.swap(false, Ordering::SeqCst) {
+                // Bounded CURRENT/HELD gates only, not retained IO/history. Each
+                // failed generation cancels its first dependent plus suffix.
+                loop {
+                    let failure = state.held.iter().flat_map(|h| h.gate.inputs.iter())
+                        .chain(state.gate.inputs.iter()).flatten()
+                        .find_map(Input::failed_io_cancel);
+                    let Some(cancel) = failure else { break; };
+                    if let Err(error) = self.cancel_locked(state, &cancel) {
+                        break 'release Err(error);
+                    }
                 }
             }
             let head = state.held.front().is_some_and(|held| held.gate.is_open());
@@ -576,6 +652,9 @@ impl CommandsCore {
     fn run_after_commit(&self, after: &mut Vec<AfterCommit>) -> Result<(), MetalKernelError> {
         for action in after.drain(..) {
             match action {
+                AfterCommit::ValidatedIo(io) => {
+                    io.commit().map_err(|_| MetalKernelError::QueueUnavailable("validated IO handoff refused"))?;
+                }
                 AfterCommit::Io {
                     io,
                     signal,
@@ -623,6 +702,9 @@ impl CommandsCore {
         event: &ProtocolObject<dyn MTLSharedEvent>,
         value: u64,
     ) -> Result<usize, MetalKernelError> {
+        if value == u64::MAX {
+            self.produced.io_failure_pending.store(true, Ordering::SeqCst);
+        }
         std::sync::atomic::fence(Ordering::SeqCst);
         if self.produced.live.load(Ordering::SeqCst) == 0 {
             self.note_late(event, value);
@@ -733,12 +815,16 @@ impl CommandsCore {
                 entry.owed_epochs += 1;
                 let mut after = held.after;
                 for action in after.drain(..) {
-                    let AfterCommit::Io { io, signal, .. } = action;
-                    rehome.push(AfterCommit::Io {
-                        io,
-                        signal,
-                        rehomed: true,
-                    });
+                    match action {
+                        AfterCommit::Io { io, signal, .. } => rehome.push(AfterCommit::Io {
+                            io, signal, rehomed: true,
+                        }),
+                        AfterCommit::ValidatedIo(io) => {
+                            if io.refuse().is_err() {
+                                refused.get_or_insert(MetalKernelError::QueueUnavailable("cancelled IO refusal failed"));
+                            }
+                        }
+                    }
                 }
                 recycle_after(&mut entry.spare_after, after);
                 custody.cancelled.push(held.cb);
@@ -814,6 +900,15 @@ impl CommandsCore {
         state: &mut EntryState,
         removals: &mut Option<PublishedRemovals>,
     ) -> Result<bool, MetalKernelError> {
+        // EXPERIMENTAL INTEGRATION BLOCKER: do not submit unvalidated IO during
+        // teardown. This safety-only refusal is NOT accepted ordinary-failure
+        // recovery. LifecycleInbox forbids replacement acquisition/cold refill;
+        // a preserving final-resource/terminality route remains to be proved.
+        if state.held.iter().flat_map(|h| h.gate.inputs.iter())
+            .chain(state.gate.inputs.iter()).flatten()
+            .any(|input| input.io.as_ref().is_some_and(|io| !io.ready())) {
+            return Err(MetalKernelError::QueueUnavailable("experimental IO final recovery incomplete"));
+        }
         let had = state.held.len();
         while let Some(held) = state.held.front() {
             let owed = std::mem::take(&mut state.owed_epochs);
@@ -986,6 +1081,100 @@ impl Commands {
                 value,
                 block2::RcBlock::as_ptr(&listener.block),
             );
+        }
+        Ok(())
+    }
+
+    /// Cold enrollment; the caller accounts this metadata/native event before
+    /// publishing an experimental producer. No event is created per issue.
+    pub(crate) fn new_io_compute_authority(&self) -> Result<IoComputeAuthority, MetalKernelError> {
+        let event = self.core.device.as_ref().newSharedEvent()
+            .ok_or_else(|| MetalKernelError::FailedToCreateResource("IO compute event".into()))?;
+        Ok(IoComputeAuthority { owner: self.core.produced.me.clone(), event, next: AtomicU64::new(0) })
+    }
+
+    pub(crate) fn signal_enrolled_io(&self, authority: &IoComputeAuthority) -> Result<u64, MetalKernelError> {
+        if authority.owner.as_ptr() != &*self.core as *const CommandsCore {
+            return Err(MetalKernelError::QueueUnavailable("IO compute authority belongs to another Commands queue"));
+        }
+        let mut state = self.lock_recording_state()?;
+        self.ensure_recording_locked(&mut state)?;
+        let value = authority.next.load(Ordering::Relaxed).checked_add(1)
+            .ok_or(MetalKernelError::QueueUnavailable("IO compute sequence exhausted"))?;
+        // Reserve even when encoding later fails: a partially encoded signal
+        // must never satisfy a retried IO with a reused numeric identity.
+        authority.next.store(value, Ordering::Release);
+        self.encode_signal_event_locked(&mut state, authority.event(), value)?;
+        Ok(value)
+    }
+
+    /// Experimental A only. Recording remains overlapped; this is a status
+    /// dependency in the EXISTING held-recording queue, not a CPU wait.
+    pub(crate) fn commit_when_io_validated(&self, io: NativeIoDependency) -> Result<(), MetalKernelError> {
+        if !self.gate_when_io_validated(&io)? { return Ok(()); }
+        // Race closure: terminal before or during listener installation must
+        // run status release. The retained status gate, not event MAX, decides
+        // which accepted values are valid or cancelled.
+        let notified = io.notification().signaledValue();
+        if notified < io.value() {
+            let listener = self.core.produced.listener();
+            let block = self.core.produced.io_notification();
+            // SAFETY: both cached blocks remain owned by ProducedState; Metal
+            // copies the supplied block, which retains only a weak queue root.
+            unsafe {
+                io.notification().notifyListener_atValue_block(
+                    &listener.listener, io.value(), block2::RcBlock::as_ptr(block),
+                );
+            }
+        }
+        let notified = io.notification().signaledValue();
+        if notified >= io.value() { self.core.produced_on(io.notification(), notified)?; }
+        Ok(())
+    }
+
+    // The same admission transition is exercised without a platform listener
+    // in deterministic callback-argument controls. No alternate gate algorithm.
+    pub(super) fn gate_when_io_validated(&self, io: &NativeIoDependency) -> Result<bool, MetalKernelError> {
+        if self.core.host_input != HostInputArm::Commit {
+            return Err(MetalKernelError::QueueUnavailable("validated-submission arm requires explicit commit selection"));
+        }
+        let mut state = self.lock_recording_state()?;
+        self.ensure_recording_locked(&mut state)?;
+        if io.generation_failed() {
+            return Err(MetalKernelError::QueueUnavailable("IO generation refuses new dependent admission"));
+        }
+        if io.ready() { return Ok(false); }
+        let pristine = self.core.compute_count.load(Ordering::Acquire) == 0
+            && !state.signals_since_cut && state.current_encoder.is_none() && state.pending_blit.is_none();
+        if !pristine || state.gate.is_full() { self.cut_locked(&mut state, 0)?; }
+        let mut input = Input::from_io(io.clone())?;
+        input.seq = self.core.produced.gated.fetch_add(1, Ordering::SeqCst) + 1;
+        state.gate.add(input).map_err(|_| MetalKernelError::QueueUnavailable("fresh IO gate refused input"))?;
+        self.core.held_live_update(&state);
+        if io.generation_failed() { self.core.produced.io_failure_pending.store(true, Ordering::SeqCst); }
+        self.core.release_produced_locked(&mut state)?;
+        let abandoned = state.current_abandoned;
+        drop(state);
+        if abandoned { return Err(self.core.produced.cancelled_error()); }
+        Ok(true)
+    }
+
+    /// Private typed counterpart; moving into the after-list leaves Prepared.
+    pub(crate) fn commit_validated_io_after(&self, io: NativeDeferredIo) -> Result<(), MetalKernelError> {
+        if self.core.host_input != HostInputArm::Commit {
+            return Err(MetalKernelError::QueueUnavailable("validated IO arm requires explicit commit selection"));
+        }
+        let mut state = self.lock_recording_state()?;
+        self.ensure_recording_locked(&mut state)?;
+        let pristine = self.core.compute_count.load(Ordering::Acquire) == 0
+            && !state.signals_since_cut && state.current_encoder.is_none() && state.pending_blit.is_none();
+        if !pristine { self.cut_locked(&mut state, 0)?; }
+        if let Some(held) = state.held.back_mut() {
+            held.after.try_reserve(1).map_err(|_| MetalKernelError::QueueUnavailable("held IO storage refused"))?;
+            held.after.push(AfterCommit::ValidatedIo(io));
+            self.core.produced.io_deferred.fetch_add(1, Ordering::Relaxed);
+        } else {
+            io.commit().map_err(|_| MetalKernelError::QueueUnavailable("validated IO handoff refused"))?;
         }
         Ok(())
     }

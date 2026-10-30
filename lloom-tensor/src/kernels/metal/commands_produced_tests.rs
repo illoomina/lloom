@@ -1314,3 +1314,189 @@ fn an_event_listener_runs_one_block_at_a_time() {
          arm's reproduction no longer reaches the defect"
     );
 }
+
+/// Real Commands boundary, controlled actual-bank terminal metadata. This does
+/// NOT exercise native file IO; the native short-read suite remains separate.
+#[test]
+fn validated_io_failure_cancels_v_plus_one_only_gate_and_recovers_next_generation() {
+    use crate::io_terminal::TestIoGeneration;
+    let f = fixture();
+    assert_eq!(f.commands.host_input_arm(), HostInputArm::Commit);
+    let mut old = TestIoGeneration::new(f.native.as_ref(), 2);
+    let later_only = old.dependency(1);
+    f.commands.commit_when_io_validated(later_only.clone()).unwrap();
+    encode_dependent(&f);
+    // The gate contains ONLY v+1. No v prerequisite can accidentally make
+    // snapshot cancellation appear to cover the failing generation.
+    old.terminal(0, 2);
+    f.commands.core.produced_on(later_only.notification(), u64::MAX).unwrap();
+    {
+        let state = f.commands.core.state.lock();
+        assert!(state.current_abandoned, "IO_GENERATION_FAILURE_COVERS_V_PLUS_ONE");
+        assert!(state.held.is_empty(), "IO_FAILURE_NO_DEPENDENT_SUBMISSION");
+    }
+    assert!(f.commands.commit_when_io_validated(later_only).is_err(), "IO_FAILED_GENERATION_REFUSES_LATER_ADMISSION");
+    assert!(f.commands.core.failure.check().is_ok(), "IO_FAILURE_NOT_WHOLE_QUEUE_POISON");
+    let mut fresh = TestIoGeneration::new(f.native.as_ref(), 1);
+    let ready = fresh.dependency(0);
+    fresh.terminal(0, 3);
+    f.commands.commit_when_io_validated(ready).unwrap();
+    encode_dependent(&f);
+    f.commands.flush_and_wait().unwrap();
+    assert!(computed(&f.dst), "IO_NEXT_GENERATION_COMPUTED");
+    assert!(f.commands.core.failure.check().is_ok(), "IO_NEXT_GENERATION_RECOVERS");
+}
+
+#[test]
+fn validated_io_notification_is_not_data_and_preserves_successful_prefix() {
+    use crate::io_terminal::TestIoGeneration;
+    let f = fixture();
+    let mut generation = TestIoGeneration::new(f.native.as_ref(), 2);
+    let earlier = generation.dependency(0);
+    let later = generation.dependency(1);
+    generation.terminal(0, 3);
+    generation.terminal(1, 2);
+    assert_eq!(later.notification().signaledValue(), u64::MAX);
+    assert!(earlier.ready(), "IO_VALIDATED_PREFIX_SURVIVES_LATER_FAILURE");
+    assert!(!later.ready(), "IO_TERMINAL_NOTICE_NOT_DATA_READY");
+    assert!(later.failed());
+    assert!(f.commands.commit_when_io_validated(earlier).is_err(), "IO_FAILED_GENERATION_REJECTS_NEW_ADMISSION_EVEN_READY");
+}
+
+#[test]
+fn enrolled_io_compute_authority_refuses_independent_commands_queue() {
+    let a = fixture();
+    let b = fixture();
+    let authority = a.commands.new_io_compute_authority().unwrap();
+    assert!(b.commands.signal_enrolled_io(&authority).is_err(), "IO_COMPUTE_CERTIFICATE_OWNER");
+    assert_eq!(a.commands.signal_enrolled_io(&authority).unwrap(), 1);
+    a.commands.flush_and_wait().unwrap();
+}
+
+#[test]
+fn cancelled_validated_deferred_io_is_refused_not_rehomed() {
+    use crate::io_terminal::TestIoGeneration;
+    let f = fixture();
+    assert_eq!(f.commands.host_input_arm(), HostInputArm::Commit);
+    let mut generation = TestIoGeneration::new(f.native.as_ref(), 1);
+    let dependency = generation.dependency(0);
+    f.commands.commit_when_produced(&f.gate, 1).unwrap();
+    encode_compute(&f);
+    f.commands.commit_validated_io_after(generation.deferred(0)).unwrap();
+    assert!(!dependency.generation_failed(), "IO_DEFERRED_STILL_PREPARED");
+    f.commands.cancel_produced(&f.gate, "test cancellation before native handoff").unwrap();
+    assert!(dependency.generation_failed(), "IO_DEFERRED_CANCEL_REFUSES_INSTEAD_OF_REHOME");
+    assert!(!dependency.ready(), "IO_REFUSAL_IS_NOT_DATA");
+    assert!(f.commands.core.failure.check().is_ok(), "IO_REFUSAL_NOT_QUEUE_POISON");
+    // Exercise the existing replacement and final receipt path before fixture
+    // teardown; no native IO callback was invented for the refused record.
+    encode_dependent(&f);
+    f.commands.flush_and_wait().unwrap();
+    assert!(computed(&f.dst), "IO_REFUSAL_NEXT_RECORDING_RECOVERS");
+}
+
+#[test]
+fn validated_io_listener_wakes_failure_without_manual_produced_call() {
+    use crate::io_terminal::TestIoGeneration;
+    let f = fixture();
+    let mut generation = TestIoGeneration::new(f.native.as_ref(), 2);
+    f.commands.commit_when_io_validated(generation.dependency(1)).unwrap();
+    encode_compute(&f);
+    generation.terminal(0, 2);
+    // No produced_on call: exercises the real registered Metal event listener.
+    assert!(until(Duration::from_secs(5), || f.commands.core.state.lock().current_abandoned),
+        "IO_REAL_LISTENER_FAILURE_WAKE");
+    assert!(dst_bytes(&f.dst).iter().all(|b| *b == WARM), "IO_LISTENER_DID_NOT_SUBMIT_INVALID_READ");
+    assert!(f.commands.core.failure.check().is_ok());
+}
+
+#[test]
+fn validated_io_direct_teardown_after_cancellation_uses_empty_owned_marker() {
+    use crate::io_terminal::TestIoGeneration;
+    let f = fixture();
+    let mut generation = TestIoGeneration::new(f.native.as_ref(), 2);
+    let dependency = generation.dependency(1);
+    f.commands.commit_when_io_validated(dependency.clone()).unwrap();
+    encode_compute(&f);
+    generation.terminal(0, 2);
+    f.commands.core.produced_on(dependency.notification(), u64::MAX).unwrap();
+    assert!(f.commands.core.state.lock().current_abandoned);
+    let weak = Arc::downgrade(&f.commands.core);
+    let dst = f.dst.clone();
+    let counters = f.commands.core.submission_control.clone();
+    let before = counters.native_calls.load(Ordering::Acquire);
+    // Deliberately no caller encode/flush repair before final public drop.
+    drop(f);
+    assert!(until(Duration::from_secs(5), || weak.upgrade().is_none()), "IO_CANCELLED_FINAL_OWNER_RETIRES");
+    assert_eq!(counters.native_calls.load(Ordering::Acquire), before + 1, "IO_FINAL_EMPTY_MARKER_SUBMITTED_ONCE");
+    assert!(dst_bytes(&dst).iter().all(|b| *b == WARM), "IO_FINAL_MARKER_DID_NOT_EXECUTE_CANCELLED_BODY");
+}
+
+/// The notification argument may be the subscribed threshold, not the later
+/// terminal event value. Invoke the actual IO block without a competing native
+/// listener so the old argument-only callback cannot pass through timing luck.
+#[test]
+fn validated_io_threshold_callback_observes_later_terminal_notice() {
+    use crate::io_terminal::TestIoGeneration;
+    let f = fixture();
+    let mut generation = TestIoGeneration::new(f.native.as_ref(), 2);
+    let dependency = generation.dependency(1);
+    assert!(f.commands.gate_when_io_validated(&dependency).unwrap());
+    encode_compute(&f);
+    generation.terminal(0, 2);
+    assert_eq!(dependency.notification().signaledValue(), u64::MAX);
+    assert_eq!(dependency.value(), 2);
+    f.commands.core.produced.io_notification().call((
+        NonNull::from(dependency.notification()), dependency.value(),
+    ));
+    let cancelled = f.commands.core.state.lock().current_abandoned;
+    let poison = f.commands.core.failure.check().is_err();
+    // Cleanup is explicit even for the argument-only causal mutant. Preserve
+    // the observation before this helper; it cannot make the assertion pass.
+    f.commands.core.produced_on(dependency.notification(), u64::MAX).unwrap();
+    let mut fresh = TestIoGeneration::new(f.native.as_ref(), 1);
+    let ready = fresh.dependency(0);
+    fresh.terminal(0, 3);
+    f.commands.commit_when_io_validated(ready).unwrap();
+    encode_dependent(&f);
+    f.commands.flush_and_wait().unwrap();
+    assert!(cancelled, "IO_THRESHOLD_CALLBACK_MUST_OBSERVE_TERMINAL_NOTICE");
+    assert!(!poison, "IO_THRESHOLD_CALLBACK_NOT_QUEUE_POISON");
+    assert!(computed(&f.dst), "IO_THRESHOLD_CALLBACK_NEXT_GENERATION_RECOVERS");
+}
+
+
+/// Actual service fanout and real Commands event listener, with NO native IO
+/// terminal callback. Empty prepared IOCBs remain rooted until explicit cleanup.
+#[test]
+fn validated_io_service_failure_without_callback_notifies_commands() {
+    use crate::io_terminal::TestIoGeneration;
+    let f = fixture();
+    assert_eq!(f.commands.host_input_arm(), HostInputArm::Commit);
+    let generation = TestIoGeneration::new(f.native.as_ref(), 2);
+    let dependency = generation.dependency(1);
+    let before = generation.untouched_custody();
+    f.commands.commit_when_io_validated(dependency.clone()).unwrap();
+    encode_compute(&f);
+    generation.fail_service_without_callback();
+    // Saved observations precede ANY manual repair/pass/terminal injection.
+    let cancelled = until(Duration::from_secs(5), || f.commands.core.state.lock().current_abandoned);
+    let notice = dependency.notification().signaledValue();
+    let custody = generation.untouched_custody();
+    let unchanged = dst_bytes(&f.dst).iter().all(|b| *b == WARM);
+    let poisoned = f.commands.core.failure.check().is_err();
+    // Cleanup for the missing-edge mutant cannot make the saved oracle pass.
+    f.commands.core.produced_on(dependency.notification(), u64::MAX).unwrap();
+    let mut fresh = TestIoGeneration::new(f.native.as_ref(), 1);
+    let ready = fresh.dependency(0);
+    fresh.terminal(0, 3);
+    f.commands.commit_when_io_validated(ready).unwrap();
+    encode_dependent(&f);
+    f.commands.flush_and_wait().unwrap();
+    assert!(cancelled, "IO_SERVICE_FAILURE_WITHOUT_CALLBACK_NOTIFIES_COMMANDS");
+    assert_eq!(notice, u64::MAX, "IO_SERVICE_FAILURE_PUBLISHES_NOTICE");
+    assert_eq!(custody, before, "IO_SERVICE_FAILURE_NOTICE_NOT_NATIVE_RETIREMENT");
+    assert!(unchanged, "IO_SERVICE_FAILURE_NO_INVALID_CONSUMER_EXECUTION");
+    assert!(!poisoned, "IO_SERVICE_FAILURE_NOT_WHOLE_COMMANDS_POISON");
+    assert!(computed(&f.dst), "IO_SERVICE_FAILURE_FRESH_GENERATION_RECOVERS");
+}

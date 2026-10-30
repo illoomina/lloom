@@ -15,6 +15,8 @@
 //! `waitUntilCompleted` on this path.
 
 use super::{Buffer, Commands, Device, HostInputArm};
+use super::commands::IoComputeAuthority;
+use crate::io_terminal::{NativeIoDependency, NativeProducer};
 use crate::kernels::MetalKernelError;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
@@ -25,6 +27,16 @@ use objc2_metal::{
 };
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Enrolled caller disposition: Rooted requires accepted range quarantine;
+/// NotIssued preserves the caller's uninstalled map/range ownership.
+pub(crate) enum ValidatedIssueError {
+    NotIssued(MetalKernelError),
+    Rooted(MetalKernelError),
+}
+impl From<MetalKernelError> for ValidatedIssueError {
+    fn from(error: MetalKernelError) -> Self { Self::NotIssued(error) }
+}
 
 /// A file opened for `MTLIOCommandQueue` loads.
 pub struct IoFile {
@@ -351,6 +363,48 @@ impl IoQueue {
         self.loads.fetch_add(loads.len() as u64, Ordering::Relaxed);
         self.bytes.fetch_add(total, Ordering::Relaxed);
         Ok(value)
+    }
+
+    /// Experimental A's actual native issue path. The legacy public issue and
+    /// GpuWait arm remain unchanged. This returns accepted bank identity, not
+    /// an integer reserved before custody. No successful-data native signal is
+    /// encoded: actual terminal status drives the validated contiguous prefix.
+    ///
+    /// # Safety
+    /// The cold producer's admitted persistent cohort owns every destination
+    /// allocation AND the caller retains exclusive logical range reuse custody
+    /// through terminal/retirement or quarantine. This is not a constructor for
+    /// arbitrary borrowed public IoLoad buffers. Loader enrollment supplies it.
+    pub(crate) unsafe fn issue_validated(
+        &self, commands: &Commands, producer: &NativeProducer,
+        compute: &IoComputeAuthority, loads: &[IoLoad<'_>],
+    ) -> Result<Option<NativeIoDependency>, ValidatedIssueError> {
+        if loads.is_empty() { return Ok(None); }
+        validate_loads(loads)?;
+        if commands.host_input_arm() != HostInputArm::Commit {
+            return Err(MetalKernelError::QueueUnavailable("experimental A is not a GpuWait replacement").into());
+        }
+        let compute_value = commands.signal_enrolled_io(compute)?;
+        let cb = self.queue.commandBuffer();
+        cb.waitForEvent_value(compute.event(), compute_value);
+        let mut total = 0u64;
+        for l in loads {
+            unsafe {
+                cb.loadBuffer_offset_size_sourceHandle_sourceHandleOffset(
+                    l.dst.raw_unchecked(), l.dst.base_offset() + l.dst_offset,
+                    l.len, &l.file.handle, l.src_offset as usize,
+                );
+            }
+            total += l.len as u64;
+        }
+        let (lease, dependency) = producer.prepare_native(cb).map_err(|error| {
+            let cause = MetalKernelError::QueueUnavailable("admitted IO producer refused; no dependent body permitted");
+            if error.rooted() { ValidatedIssueError::Rooted(cause) } else { ValidatedIssueError::NotIssued(cause) }
+        })?;
+        commands.commit_validated_io_after(lease).map_err(ValidatedIssueError::Rooted)?;
+        self.loads.fetch_add(loads.len() as u64, Ordering::Relaxed);
+        self.bytes.fetch_add(total, Ordering::Relaxed);
+        Ok(Some(dependency))
     }
 
     /// The latest reserved nonempty IO value (0 before any). Empty issues do

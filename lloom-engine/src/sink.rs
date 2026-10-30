@@ -28,63 +28,101 @@ use std::time::Duration;
 /// How often a consumer takes the accumulated text.
 pub const DRAIN_PERIOD: Duration = Duration::from_millis(2);
 
+/// What a [`DeltaBuffer`] accumulates between takes: text (`String`), or a
+/// batch with more than one field, appended in place so both buffers keep
+/// their capacity across takes.
+pub trait Batch: Default + Send {
+    /// Append `other` and leave it empty, its capacity kept.
+    fn absorb(&mut self, other: &mut Self);
+    /// Empty, capacity kept.
+    fn clear(&mut self);
+    fn is_empty(&self) -> bool;
+    /// Bytes held: the backlog a slow consumer leaves.
+    fn held_bytes(&self) -> usize;
+}
+
+impl Batch for String {
+    fn absorb(&mut self, other: &mut Self) {
+        self.push_str(other);
+        other.clear();
+    }
+    fn clear(&mut self) {
+        String::clear(self);
+    }
+    fn is_empty(&self) -> bool {
+        str::is_empty(self)
+    }
+    fn held_bytes(&self) -> usize {
+        self.len()
+    }
+}
+
 /// The buffer the producer appends to and a consumer swaps out.
 #[derive(Debug, Default)]
-pub struct DeltaBuffer {
-    buf: Mutex<String>,
+pub struct DeltaBuffer<B: Batch = String> {
+    buf: Mutex<B>,
     dirty: AtomicBool,
 }
 
-impl DeltaBuffer {
+impl<B: Batch> DeltaBuffer<B> {
     pub fn new() -> Arc<Self> {
-        Arc::new(Self::default())
+        Arc::new(Self {
+            buf: Mutex::new(B::default()),
+            dirty: AtomicBool::new(false),
+        })
     }
 
-    /// Append `frag` (and `spill`, first) without waiting: under `try_lock`,
-    /// or into `spill` when a consumer holds the buffer this instant.
-    pub fn push(&self, spill: &mut String, frag: &str) {
+    /// Apply `add` (after `spill`) without waiting: under `try_lock`, or to
+    /// `spill` when a consumer holds the buffer this instant.
+    pub fn push_with(&self, spill: &mut B, add: impl FnOnce(&mut B)) {
         let mut g = match self.buf.try_lock() {
             Some(g) => g,
             None => {
-                spill.push_str(frag);
+                add(spill);
                 return;
             }
         };
         if !spill.is_empty() {
-            g.push_str(spill);
-            spill.clear();
+            g.absorb(spill);
         }
-        g.push_str(frag);
+        add(&mut g);
         drop(g);
         self.dirty.store(true, Ordering::Release);
     }
 
     /// Carry `spill` over, waiting for the lock if it must: the run's end,
     /// off the per-token path.
-    pub fn flush(&self, spill: &mut String) {
+    pub fn flush(&self, spill: &mut B) {
         if spill.is_empty() {
             return;
         }
-        self.buf.lock().push_str(spill);
-        spill.clear();
+        self.buf.lock().absorb(spill);
         self.dirty.store(true, Ordering::Release);
     }
 
     /// Bytes handed over and not yet taken: the backlog a slow consumer
     /// leaves (a lock; off the per-token path).
     pub fn pending_bytes(&self) -> usize {
-        self.buf.lock().len()
+        self.buf.lock().held_bytes()
     }
 
-    /// Swap what accumulated into `out` (cleared first; both strings keep
-    /// their capacity). Returns whether anything was taken.
-    pub fn take_into(&self, out: &mut String) -> bool {
+    /// Swap what accumulated into `out` (cleared first; both keep their
+    /// capacity). Returns whether anything was taken.
+    pub fn take_into(&self, out: &mut B) -> bool {
         out.clear();
         if !self.dirty.swap(false, Ordering::AcqRel) {
             return false;
         }
         std::mem::swap(&mut *self.buf.lock(), out);
         !out.is_empty()
+    }
+}
+
+impl DeltaBuffer<String> {
+    /// Append `frag` (and `spill`, first) without waiting: under `try_lock`,
+    /// or into `spill` when a consumer holds the buffer this instant.
+    pub fn push(&self, spill: &mut String, frag: &str) {
+        self.push_with(spill, |b| b.push_str(frag));
     }
 }
 

@@ -28,7 +28,8 @@
 
 use crate::kernels::kernels::params::{FlashCombineParams, FlashPartialParams, FlashScatterParams};
 use crate::kernels::kernels::{
-    flash_chunk_count, ChunkTable, FlashDType, FlashKernel, FLASH_COMBINE_THREADS, FLASH_HEAD_DIMS,
+    flash_chunk_count, flash_one_chunk_rows, ChunkTable, FlashDType, FlashKernel,
+    FLASH_COMBINE_THREADS, FLASH_HEAD_DIMS,
     FLASH_PARTIAL_WIDTHS, FLASH_SINGLE_THREADS,
 };
 use crate::kernels::metal::kv_pages::KvPagePool;
@@ -470,6 +471,7 @@ fn run_flash_guarded(
                 n_chunks,
                 dtype,
                 partial_width,
+                false,
             )
         }
         .unwrap();
@@ -1768,6 +1770,136 @@ fn ragged_rows_on_the_single_chunk_path_read_their_own_live_counts() {
     }
 }
 
+/// Two rows of a ragged batch, `own` and `beside` live keys over their own
+/// tables, run together and each alone. Returns, per row, (batched, alone)
+/// at storage `dtype` and partial width `width`, LFM2's attention geometry:
+/// head_dim 64, 32 query heads over 8 KV heads, 256-key pages, one page a
+/// chunk.
+fn rows_together_and_alone(
+    own: usize,
+    beside: usize,
+    dtype: FlashDType,
+    width: usize,
+) -> [(Vec<f32>, Vec<f32>); 2] {
+    let device = device();
+    let kernels = Kernels::new();
+    let (head_dim, heads_per_seq, n_kv_heads, page_size, pool_pages) = (64, 32, 8, 256, 6);
+    let scale = 1.0 / (head_dim as f32).sqrt();
+    let tables: [Vec<u32>; 2] = [vec![1, 4], vec![3, 0]];
+    let keys = [own, beside];
+    let longest = own.max(beside);
+    let table_stride = 2;
+    let mut pool_k = vec![-7.0f32; n_kv_heads * pool_pages * page_size * head_dim];
+    let mut pool_v = pool_k.clone();
+    let mut queries = Vec::new();
+    for (b, table) in tables.iter().enumerate() {
+        let n_keys = keys[b];
+        queries.extend(fill(heads_per_seq * head_dim, 371 + b as u32));
+        let own_chunks = flash_chunk_count(n_keys, page_size);
+        let (pk, pv) = lay_out_paged(
+            &fill(n_kv_heads * n_keys * head_dim, 381 + b as u32),
+            &fill(n_kv_heads * n_keys * head_dim, 391 + b as u32),
+            n_kv_heads,
+            n_keys,
+            head_dim,
+            page_size,
+            pool_pages,
+            &table[..own_chunks],
+        );
+        for (c, &page) in table[..own_chunks].iter().enumerate() {
+            for h in 0..n_kv_heads {
+                let live = (n_keys - c * page_size).min(page_size);
+                let base = (h * pool_pages * page_size + page as usize * page_size) * head_dim;
+                let n = live * head_dim;
+                pool_k[base..base + n].copy_from_slice(&pk[base..base + n]);
+                pool_v[base..base + n].copy_from_slice(&pv[base..base + n]);
+            }
+        }
+    }
+    let geometry = |n_seqs: usize, n_keys: usize, table: Vec<u32>| FlashGeometry {
+        n_seqs,
+        heads_per_seq,
+        n_kv_heads,
+        head_dim,
+        n_keys,
+        page_size,
+        pages_per_chunk: 1,
+        k_stride: [0, pool_pages * page_size * head_dim, head_dim, 1],
+        table,
+        table_stride,
+    };
+    let row = heads_per_seq * head_dim;
+    let both = run_flash_with_typed(
+        &device,
+        &kernels,
+        &queries,
+        &pool_k,
+        &pool_v,
+        geometry(2, longest, tables.concat()),
+        Some(&keys[..]),
+        scale,
+        dtype,
+        width,
+    );
+    let alone = |b: usize| {
+        run_flash_with_typed(
+            &device,
+            &kernels,
+            &queries[b * row..(b + 1) * row],
+            &pool_k,
+            &pool_v,
+            geometry(1, keys[b], tables[b].clone()),
+            Some(&keys[b..b + 1]),
+            scale,
+            dtype,
+            width,
+        )
+        .out
+    };
+    [
+        (both.out[..row].to_vec(), alone(0)),
+        (both.out[row..2 * row].to_vec(), alone(1)),
+    ]
+}
+
+/// A row's attention does not depend on the length of the row beside it,
+/// including where the neighbour's length changes the dispatch's chunk count
+/// and so its kernels: a row of one chunk (here, exactly 256 keys) beside a
+/// row of 257 runs the partial pass and the combine, alone the single-chunk
+/// pass. The batched decode joins rows at different steps, so a row that
+/// joined one step later reaches a chunk boundary one step after the row
+/// beside it (`DESIGN.md` 2.3.3 #7; the per-row bit-identity
+/// `flash_decoding_paged_ragged` states). At every partial width
+/// (`FLASH_PARTIAL_WIDTHS`), 8 being what serve takes for LFM2. The two
+/// controls stay on one side of the boundary.
+#[test]
+fn a_full_chunk_row_keeps_its_bits_beside_a_row_past_the_boundary() {
+    let mut differing = Vec::new();
+    for width in FLASH_PARTIAL_WIDTHS {
+        for dtype in [FlashDType::F16, FlashDType::F32] {
+            for (own, beside) in [(256, 257), (100, 300), (255, 256), (257, 300)] {
+                let rows = rows_together_and_alone(own, beside, dtype, width);
+                for (r, (b, a)) in rows.iter().enumerate() {
+                    let n = b.iter().zip(a).filter(|(x, y)| x.to_bits() != y.to_bits()).count();
+                    eprintln!(
+                        "FLASH_ROW_BESIDE width={width} dtype={dtype:?} own={own} beside={beside} \
+                         row={r} differing={n}/{}",
+                        a.len()
+                    );
+                    if n > 0 {
+                        differing.push((width, dtype, own, beside, r, n));
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        differing.is_empty(),
+        "a row's attention moved with the length of the row beside it: {differing:?} (partial \
+         width, dtype, row 0's keys, row 1's keys, the row, elements differing)"
+    );
+}
+
 /// The KV write lands each `(sequence, token)` row at the slot its table names
 /// and nowhere else — asserted against a CPU placement of the same bytes,
 /// poison included.
@@ -2076,6 +2208,36 @@ fn run_flash_with(
     keys_per_seq: Option<&[usize]>,
     scale: f32,
 ) -> FlashRun {
+    run_flash_with_typed(
+        device,
+        kernels,
+        queries,
+        keys,
+        values,
+        g,
+        keys_per_seq,
+        scale,
+        FlashDType::F32,
+        PARTIAL_WIDTH,
+    )
+}
+
+/// [`run_flash_with`] at storage `dtype` and partial width `width`
+/// (`FLASH_PARTIAL_WIDTHS`): `q`, `k`, `v` and the output are held at
+/// `dtype` (the partials, sums and maxima are f32 at every dtype).
+#[allow(clippy::too_many_arguments)]
+fn run_flash_with_typed(
+    device: &Device,
+    kernels: &Kernels,
+    queries: &[f32],
+    keys: &[f32],
+    values: &[f32],
+    g: FlashGeometry,
+    keys_per_seq: Option<&[usize]>,
+    scale: f32,
+    dtype: FlashDType,
+    width: usize,
+) -> FlashRun {
     let cmds = commands(device);
     let n_q_heads = g.n_seqs * g.heads_per_seq;
     let chunk_size = g.page_size * g.pages_per_chunk;
@@ -2098,9 +2260,9 @@ fn run_flash_with(
         "the table must cover every sequence's chunks"
     );
 
-    let q_buf = new_f32(device, queries);
-    let k_buf = new_f32(device, keys);
-    let v_buf = new_f32(device, values);
+    let q_buf = new_typed(device, queries, dtype);
+    let k_buf = new_typed(device, keys, dtype);
+    let v_buf = new_typed(device, values, dtype);
     let out = device
         .new_buffer(n_q_heads * g.head_dim * 4, SHARED)
         .unwrap();
@@ -2161,8 +2323,9 @@ fn run_flash_with(
                 n_q_heads,
                 g.head_dim,
                 n_chunks,
-                FlashDType::F32,
-                PARTIAL_WIDTH,
+                dtype,
+                width,
+                flash_one_chunk_rows(n_chunks, chunk_size, &key_counts),
             )
         }
         .unwrap();
@@ -2174,7 +2337,7 @@ fn run_flash_with(
     // SAFETY: shared storage sized for `n_q_heads * n_chunks` u32, waited.
     let walk = unsafe { std::slice::from_raw_parts(walk_p, n_q_heads * n_chunks) }.to_vec();
     FlashRun {
-        out: read_f32(&out, n_q_heads * g.head_dim),
+        out: read_typed(&out, n_q_heads * g.head_dim, dtype),
         sums: read_f32(&sums, n_q_heads * n_chunks),
         maxs: read_f32(&maxs, n_q_heads * n_chunks),
         walk,
@@ -2310,6 +2473,7 @@ fn run_partials(
                 n_chunks,
                 FlashDType::F32,
                 PARTIAL_WIDTH,
+                false,
             )
         }
         .unwrap();
@@ -2510,6 +2674,7 @@ fn token_stride_is_read_from_the_parameter() {
                 n_chunks,
                 FlashDType::F32,
                 PARTIAL_WIDTH,
+                false,
             )
         }
         .unwrap();
@@ -2677,6 +2842,7 @@ fn walk_order_of(
                 n_chunks,
                 FlashDType::F32,
                 PARTIAL_WIDTH,
+                false,
             )
         }
         .unwrap();

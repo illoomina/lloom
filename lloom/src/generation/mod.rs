@@ -8,6 +8,8 @@ use rand::SeedableRng;
 
 pub mod budget;
 mod distribution;
+#[cfg(any(debug_assertions, feature = "profile"))]
+pub(crate) mod draw_trace;
 pub mod hot_thread;
 #[cfg(feature = "metal")]
 pub mod native;
@@ -206,6 +208,9 @@ pub struct LogitsProcessor {
     window_forcing: Option<budget::HostForcing>,
     /// Rows of logits the digest has taken.
     digest_rows: usize,
+    /// Host draws taken, for `diagnostics.trace.draws`.
+    #[cfg(any(debug_assertions, feature = "profile"))]
+    draws: u64,
 }
 
 /// A [`LogitsProcessor`]'s state before a draw ([`LogitsProcessor::mark`]).
@@ -232,6 +237,8 @@ impl LogitsProcessor {
             window_logits: None,
             window_forcing: None,
             digest_rows: 0,
+            #[cfg(any(debug_assertions, feature = "profile"))]
+            draws: 0,
         }
     }
 
@@ -1021,33 +1028,34 @@ impl LogitsProcessor {
         }
         #[cfg(not(feature = "metal"))]
         self.host.load(&logits)?;
-        self.host.prepare(
-            temperature,
-            k,
-            p,
-            matches!(
-                self.sampling,
-                Sampling::FilteredGumbel { .. } | Sampling::GumbelSoftmax { .. }
-            ),
-        )?;
-        Ok(
-            if matches!(
-                self.sampling,
-                Sampling::FilteredGumbel { .. } | Sampling::GumbelSoftmax { .. }
-            ) {
-                match self.position {
-                    Some(pos) => {
-                        let mut rng =
-                            rand::rngs::StdRng::seed_from_u64(Self::stream_key(self.seed, pos));
-                        self.host.gumbel(temperature, &mut rng)
-                    }
-                    None => self.host.gumbel(temperature, &mut self.rng),
+        #[cfg(any(debug_assertions, feature = "profile"))]
+        let traced =
+            lloom_tensor::tuning::draw_trace_on().then(|| draw_trace::Read::of(&self.host.values));
+        let gumbel = matches!(
+            self.sampling,
+            Sampling::FilteredGumbel { .. } | Sampling::GumbelSoftmax { .. }
+        );
+        self.host.prepare(temperature, k, p, gumbel)?;
+        let (id, _u) = if gumbel {
+            let id = match self.position {
+                Some(pos) => {
+                    let mut rng =
+                        rand::rngs::StdRng::seed_from_u64(Self::stream_key(self.seed, pos));
+                    self.host.gumbel(temperature, &mut rng)
                 }
-            } else {
-                let u = self.next_uniform();
-                self.host.draw(u)
-            },
-        )
+                None => self.host.gumbel(temperature, &mut self.rng),
+            };
+            (id, None)
+        } else {
+            let u = self.next_uniform();
+            (self.host.draw(u), Some(u))
+        };
+        #[cfg(any(debug_assertions, feature = "profile"))]
+        if let Some(read) = traced {
+            self.draws += 1;
+            read.emit(self.seed, self.draws, _u, id);
+        }
+        Ok(id)
     }
 
     /// Device-return Gumbel accepts multiple rows. One call consumes the

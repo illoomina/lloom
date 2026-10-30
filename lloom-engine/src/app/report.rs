@@ -803,8 +803,9 @@ pub fn print_pass_plans(dev: &lloom_tensor::MetalDevice, widths: &str) {
 }
 
 /// The plan cache's undeclared escapes for `/health` and the bench RESULT
-/// (`pass-plan-design.md` §26): what was counted, and the producers named.
-/// `null` off Metal or with the cache off.
+/// (`pass-plan-design.md` §26): what was counted and the producers named,
+/// beside the passes served and recorded, so a zero reads against the passes
+/// it covered. `null` off Metal or with the cache off.
 pub fn pass_plan_escapes_json(dev: &lloom_tensor::Device) -> serde_json::Value {
     #[cfg(feature = "metal")]
     if let lloom_tensor::Device::Metal(m) = dev {
@@ -815,6 +816,8 @@ pub fn pass_plan_escapes_json(dev: &lloom_tensor::Device) -> serde_json::Value {
                 .map(|(k, o)| format!("{:?}#{o}", k.kind))
                 .collect();
             return serde_json::json!({
+                "served": c.served,
+                "recorded": c.recorded,
                 "undeclared_escapes": c.undeclared_escapes,
                 "escapes_used": c.escapes_used,
                 "escapes_held_unused": c.escapes_held_unused,

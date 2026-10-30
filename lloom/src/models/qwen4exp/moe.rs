@@ -17,10 +17,11 @@
 //! host readback of the ids).
 
 use super::config::Config;
+use crate::nn::moe::Routing;
 use crate::nn::ops;
 use crate::profile::Profile;
 use lloom_tensor::quantized::{MoeArm, QMatMul};
-use lloom_tensor::{DType, Module, Result, Tensor, D};
+use lloom_tensor::{DType, Module, Result, Tensor};
 use std::marker::PhantomData;
 
 pub use crate::nn::expert_stream::{
@@ -137,14 +138,12 @@ pub struct MoeLayer<P: Profile, R: ExpertResidency> {
     profile: PhantomData<P>,
     /// Router `hidden -> n_experts` (`ffn_gate_inp`).
     router: QMatMul,
+    routing: Routing,
+    weight_names: (&'static str, &'static str, &'static str, &'static str),
+    expert_storage_dtype: DType,
     /// The routed experts, behind the residency seam.
     experts: R,
-    /// Shared expert `up`/`gate`/`down` (`ffn_*_shexp`).
-    sh_gate: QMatMul,
-    sh_up: QMatMul,
-    sh_down: QMatMul,
-    /// Shared-expert gate `hidden -> 1` (`ffn_gate_inp_shexp`).
-    sh_router: QMatMul,
+    shared: Option<SharedExpert>,
     n_experts_per_tok: usize,
     /// The routed experts' count and intermediate width, which the residency
     /// does not expose (the walk reads them here).
@@ -174,6 +173,14 @@ pub struct MoeLayer<P: Profile, R: ExpertResidency> {
     /// plan's verdict): the SiLU on the gate's store, the up projection
     /// multiplied into the gate's buffer — `silu_mul`'s launch removed.
     shared_store: bool,
+}
+
+#[derive(Debug, Clone)]
+struct SharedExpert {
+    gate: QMatMul,
+    up: QMatMul,
+    down: QMatMul,
+    router: QMatMul,
 }
 
 /// What a routed MoE layer needs of a family's config: the expert count,
@@ -230,14 +237,57 @@ impl<P: Profile, R: ExpertResidency> MoeLayer<P, R> {
         sh_router: QMatMul,
         geo: &MoeGeometry,
     ) -> Self {
-        Self {
-            profile: PhantomData,
+        Self::from_parts(
             router,
             experts,
-            sh_gate,
-            sh_up,
-            sh_down,
-            sh_router,
+            Some(SharedExpert {
+                gate: sh_gate,
+                up: sh_up,
+                down: sh_down,
+                router: sh_router,
+            }),
+            geo,
+            Routing::Softmax,
+        )
+    }
+
+    /// Routed experts without a shared expert, using the same execution and
+    /// residency paths as the gated-shared composition.
+    pub fn routed_only(
+        router: QMatMul,
+        experts: R,
+        geo: &MoeGeometry,
+        routing: Routing,
+    ) -> Result<Self> {
+        if geo.n_experts_per_tok == 0
+            || geo.n_experts_per_tok > geo.n_experts
+            || geo.moe_intermediate_size == 0
+        {
+            lloom_tensor::bail!("MoE: invalid expert geometry")
+        }
+        Ok(Self::from_parts(router, experts, None, geo, routing))
+    }
+
+    fn from_parts(
+        router: QMatMul,
+        experts: R,
+        shared: Option<SharedExpert>,
+        geo: &MoeGeometry,
+        routing: Routing,
+    ) -> Self {
+        Self {
+            profile: PhantomData,
+            routing,
+            weight_names: (
+                "ffn_gate_inp.weight",
+                "ffn_gate_exps.weight",
+                "ffn_up_exps.weight",
+                "ffn_down_exps.weight",
+            ),
+            expert_storage_dtype: DType::U8,
+            router,
+            experts,
+            shared,
             n_experts_per_tok: geo.n_experts_per_tok,
             n_experts: geo.n_experts,
             moe_intermediate_size: geo.moe_intermediate_size,
@@ -248,6 +298,18 @@ impl<P: Profile, R: ExpertResidency> MoeLayer<P, R> {
             shared_store: crate::tuning::tuning().qwen4exp.shared_store,
             probe_ids: std::sync::Arc::new(parking_lot::Mutex::new(None)),
         }
+    }
+
+    /// Runtime stack names for inspection after a format adapter packs
+    /// individual checkpoint tensors. This does not change execution.
+    pub fn with_weight_names(
+        mut self,
+        names: (&'static str, &'static str, &'static str, &'static str),
+        dtype: DType,
+    ) -> Self {
+        self.weight_names = names;
+        self.expert_storage_dtype = dtype;
+        self
     }
 
     /// The ids of the last routing this layer ran, kept only under the
@@ -368,17 +430,16 @@ impl<P: Profile, R: ExpertResidency> MoeLayer<P, R> {
             return self.decode_fetched(&r, hook);
         }
         let Some((slot_ids, rec)) = self.experts.plan_device(&r.ids)? else {
-            let groups = self.experts.plan(&r.ids)?;
-            let y = self.routed_groups(&r.x3, &groups)?;
+            let y = self.routed_host(&r)?;
             return Ok((self.finish(&r, &y)?, None));
         };
         hook.after_plan(&rec)?;
         let y = self.routed_one_group(&r.x3, &slot_ids)?;
-        let (shared, sh_logit) = self.shared_expert(&r)?;
+        let shared = self.shared_expert(&r)?;
         hook.at_join()?;
         let flags = self.mask_flags(&r, &rec)?;
         Ok((
-            self.combine(&r, &y, &shared, &sh_logit, flags.as_ref())?,
+            self.combine(&r, &y, shared.as_ref(), flags.as_ref())?,
             Some(rec),
         ))
     }
@@ -396,17 +457,16 @@ impl<P: Profile, R: ExpertResidency> MoeLayer<P, R> {
         r: &PrefillRouted,
         hook: &mut H,
     ) -> Result<(Tensor, Option<Tensor>)> {
-        let (shared, sh_logit) = self.shared_expert(r)?;
+        let shared = self.shared_expert(r)?;
         hook.fetch_join(&self.experts, &r.ids)?;
         let Some((slot_ids, rec)) = self.experts.plan_device(&r.ids)? else {
-            let groups = self.experts.plan(&r.ids)?;
-            let y = self.routed_groups(&r.x3, &groups)?;
-            return Ok((self.combine(r, &y, &shared, &sh_logit, None)?, None));
+            let y = self.routed_host(&r)?;
+            return Ok((self.combine(r, &y, shared.as_ref(), None)?, None));
         };
         let y = self.routed_one_group(&r.x3, &slot_ids)?;
         let flags = self.mask_flags(r, &rec)?;
         Ok((
-            self.combine(r, &y, &shared, &sh_logit, flags.as_ref())?,
+            self.combine(r, &y, shared.as_ref(), flags.as_ref())?,
             Some(rec),
         ))
     }
@@ -449,8 +509,7 @@ impl<P: Profile, R: ExpertResidency> MoeLayer<P, R> {
                 }
             }
         }
-        let groups = self.experts.plan(&r.ids)?;
-        let y = self.routed_groups(&r.x3, &groups)?;
+        let y = self.routed_host(&r)?;
         Ok((self.finish(&r, &y)?, None))
     }
 
@@ -464,17 +523,37 @@ impl<P: Profile, R: ExpertResidency> MoeLayer<P, R> {
         let (_, seq, hidden) = x.dims3()?;
         let x1 = x.reshape((seq, hidden))?;
         let topk = self.n_experts_per_tok;
-        let logits = self.router.forward(&x1)?.to_dtype(DType::F32)?;
-        match super::kernels::moe_topk(&logits, topk) {
-            Some(r) => Ok(r?.0),
-            None => {
-                let probs = ops::softmax_last_dim(&logits)?;
-                probs
-                    .arg_sort_last_dim(false)?
-                    .narrow(D::Minus1, 0, topk)?
-                    .contiguous()
+        let logits = self.router.forward(&x1)?;
+        Ok(self.route_logits(&logits, topk, None)?.0)
+    }
+
+    fn route_logits(
+        &self,
+        logits: &Tensor,
+        topk: usize,
+        ids: Option<Tensor>,
+    ) -> Result<(Tensor, Tensor)> {
+        if self.routing.is_softmax() {
+            let logits = logits.to_dtype(DType::F32)?;
+            let native = match &ids {
+                Some(_) => super::kernels::moe_topk_into(&logits, topk, ids.clone()),
+                None => super::kernels::moe_topk(&logits, topk),
+            };
+            if let Some(route) = native {
+                return route;
             }
         }
+        let (selected, weights) = self.routing.route(logits, topk)?;
+        let selected = if let Some(slot) = ids {
+            if slot.dims() != selected.dims() || slot.dtype() != DType::U32 {
+                lloom_tensor::bail!("MoE routing: ids slot does not match the selection")
+            }
+            slot.slice_set(&selected, 0, 0)?;
+            slot
+        } else {
+            selected
+        };
+        Ok((selected, weights))
     }
 
     fn forward_inner(&self, x: &Tensor, device_plan: bool) -> Result<(Tensor, Option<Tensor>)> {
@@ -487,10 +566,7 @@ impl<P: Profile, R: ExpertResidency> MoeLayer<P, R> {
         let (y, record) = match device_plan {
             // One group over the slot ids the device resolved.
             Some((slot_ids, rec)) => (self.routed_one_group(&r.x3, &slot_ids)?, Some(rec)),
-            None => {
-                let groups = self.experts.plan(&r.ids)?;
-                (self.routed_groups(&r.x3, &groups)?, None)
-            }
+            None => (self.routed_host(&r)?, None),
         };
         Ok((self.finish(&r, &y)?, record))
     }
@@ -518,7 +594,7 @@ impl<P: Profile, R: ExpertResidency> MoeLayer<P, R> {
 
         // Router: softmax over all experts, then top-k select + renormalize —
         // one launch on Metal (`kernels::MoeTopk`), the composed six elsewhere.
-        let logits = self.router.forward(&x1)?.to_dtype(DType::F32)?; // [seq, n_experts]
+        let logits = self.router.forward(&x1)?; // [seq, n_experts]
         super::trace("moe.logits", usize::MAX, &logits);
         // One row: the ids go straight into the residency's host-read slot,
         // which its host plan reads in place (#814 part 5).
@@ -534,19 +610,7 @@ impl<P: Profile, R: ExpertResidency> MoeLayer<P, R> {
         // their memory on (§9.2aa).
         let _declared = (ids_slot.is_none() && self.experts.plans_on_device())
             .then(lloom_tensor::EscapeGuard::new);
-        let (ids, w) = match super::kernels::moe_topk_into(&logits, topk, ids_slot) {
-            Some(r) => r?,
-            None => {
-                let probs = ops::softmax_last_dim(&logits)?; // [seq, n_experts]
-                let ids = probs
-                    .arg_sort_last_dim(false)?
-                    .narrow(D::Minus1, 0, topk)?
-                    .contiguous()?; // [seq, topk] u32
-                let w = probs.gather(&ids, D::Minus1)?; // [seq, topk]
-                let w = w.broadcast_div(&w.sum_keepdim(D::Minus1)?)?;
-                (ids, w)
-            }
-        };
+        let (ids, w) = self.route_logits(&logits, topk, ids_slot)?;
         drop(_declared);
         if super::trace_enabled() {
             eprintln!(
@@ -628,6 +692,11 @@ impl<P: Profile, R: ExpertResidency> MoeLayer<P, R> {
     pub fn prefill_execute(&self, r: &PrefillRouted, groups: &[RoutedGroup]) -> Result<Tensor> {
         let y = self.routed_groups(&r.x3, groups)?;
         self.finish(r, &y)
+    }
+
+    fn routed_host(&self, r: &PrefillRouted) -> Result<Tensor> {
+        let groups = self.experts.plan(&r.ids)?;
+        self.routed_groups(&r.x3, &groups)
     }
 
     /// The routed experts over one device-resolved group of slot ids. Its
@@ -761,8 +830,8 @@ impl<P: Profile, R: ExpertResidency> MoeLayer<P, R> {
     /// [`Self::finish`] with the mask arm's flags (a device plan's).
     fn finish_with(&self, r: &PrefillRouted, y: &Tensor, flags: Option<&Tensor>) -> Result<Tensor> {
         super::trace("moe.y", usize::MAX, y);
-        let (shared, sh_logit) = self.shared_expert(r)?;
-        self.combine(r, y, &shared, &sh_logit, flags)
+        let shared = self.shared_expert(r)?;
+        self.combine(r, y, shared.as_ref(), flags)
     }
 
     /// The mask arm's flags from a device plan's record `[3·n]` (slot ids
@@ -780,17 +849,14 @@ impl<P: Profile, R: ExpertResidency> MoeLayer<P, R> {
 
     /// The shared expert — SwiGLU, gated by `sigmoid(sh_router·x)`, always
     /// on — and its gate's logit `[seq, 1]`.
-    fn shared_expert(&self, r: &PrefillRouted) -> Result<(Tensor, Tensor)> {
+    fn shared_expert(&self, r: &PrefillRouted) -> Result<Option<(Tensor, Tensor)>> {
+        let Some(s) = &self.shared else {
+            return Ok(None);
+        };
         let x1 = &r.x1;
-        let shared = swiglu(
-            x1,
-            &self.sh_gate,
-            &self.sh_up,
-            &self.sh_down,
-            self.shared_store,
-        )?;
-        let sh_logit = self.sh_router.forward(x1)?.to_dtype(shared.dtype())?; // [seq, 1]
-        Ok((shared, sh_logit))
+        let shared = swiglu(x1, &s.gate, &s.up, &s.down, self.shared_store)?;
+        let sh_logit = s.router.forward(x1)?.to_dtype(shared.dtype())?;
+        Ok(Some((shared, sh_logit)))
     }
 
     /// The routed combine over `y [seq, topk, hidden]` plus the gated
@@ -799,8 +865,7 @@ impl<P: Profile, R: ExpertResidency> MoeLayer<P, R> {
         &self,
         r: &PrefillRouted,
         y: &Tensor,
-        shared: &Tensor,
-        sh_logit: &Tensor,
+        shared: Option<&(Tensor, Tensor)>,
         flags: Option<&Tensor>,
     ) -> Result<Tensor> {
         let (x1, w, seq, hidden, topk) = (&r.x1, &r.w, r.seq, r.hidden, r.topk);
@@ -814,12 +879,13 @@ impl<P: Profile, R: ExpertResidency> MoeLayer<P, R> {
         } else {
             y.clone()
         };
-        let out = match super::kernels::moe_combine(&y_in, w, shared, sh_logit, topk, hidden, flags)
-        {
+        let fused = shared.and_then(|(shared, sh_logit)| {
+            super::kernels::moe_combine(&y_in, w, shared, sh_logit, topk, hidden, flags)
+        });
+        let out = match fused {
             Some(o) => o?.to_dtype(x1.dtype())?,
             None => {
                 let y32 = y_in.to_dtype(DType::F32)?;
-                // The mask: a flagged plane's weight is zero (`1 − flag`).
                 let w = match flags {
                     Some(f) => (w * (f.to_dtype(DType::F32)?.neg()? + 1.0)?)?,
                     None => w.clone(),
@@ -827,10 +893,15 @@ impl<P: Profile, R: ExpertResidency> MoeLayer<P, R> {
                 let routed = y32
                     .broadcast_mul(&w.reshape((seq, topk, 1))?)?
                     .sum(1)?
-                    .to_dtype(x1.dtype())?; // [seq, hidden]
-                let sh_gate_v = ops::sigmoid(sh_logit)?;
-                let shared = shared.broadcast_mul(&sh_gate_v)?;
-                (routed + shared)?
+                    .to_dtype(x1.dtype())?;
+                match shared {
+                    Some((shared, sh_logit)) => {
+                        let sh_gate_v = ops::sigmoid(sh_logit)?;
+                        let shared = shared.broadcast_mul(&sh_gate_v)?;
+                        (routed + shared)?
+                    }
+                    None => routed,
+                }
             }
         };
         out.reshape((r.b0, r.seq0, hidden))
@@ -923,11 +994,16 @@ impl<P: Profile, R: ExpertResidency> MoeLayer<P, R> {
         let topk = self.n_experts_per_tok;
         let (e, mi) = (self.n_experts, self.moe_intermediate_size);
         let x1 = w.view("reshape", x, Shape::of(&[1, h]));
-        let logits = w.project_qmat("ffn_gate_inp.weight", &self.router, x1);
-        // The ids and their weights, one launch.
-        let route = w.opaque("moe_topk", &[logits], Shape::of(&[1, topk]), f32);
+        let logits = w.project_qmat(self.weight_names.0, &self.router, x1);
+        let (route, weights) = if self.routing.is_softmax() {
+            let route = w.opaque("moe_topk", &[logits], Shape::of(&[1, topk]), f32);
+            (route, route)
+        } else {
+            self.routing.visit_composed(w, logits, topk)
+        };
         let act = self.tile_act(1);
-        let x3 = if act != f32 && !self.folds(f32, act) {
+        let input_dtype = w.node(x1).dtype;
+        let x3 = if act != input_dtype && !self.folds(input_dtype, act) {
             w.opaque("cast", &[x1], Shape::of(&[1, h]), act)
         } else {
             x1
@@ -941,9 +1017,21 @@ impl<P: Profile, R: ExpertResidency> MoeLayer<P, R> {
         } else {
             route
         };
-        let wg = w.weight("ffn_gate_exps.weight", Shape::of(&[e, mi, h]), DType::U8);
-        let wu = w.weight("ffn_up_exps.weight", Shape::of(&[e, mi, h]), DType::U8);
-        let wd = w.weight("ffn_down_exps.weight", Shape::of(&[e, h, mi]), DType::U8);
+        let wg = w.weight(
+            self.weight_names.1,
+            Shape::of(&[e, mi, h]),
+            self.expert_storage_dtype,
+        );
+        let wu = w.weight(
+            self.weight_names.2,
+            Shape::of(&[e, mi, h]),
+            self.expert_storage_dtype,
+        );
+        let wd = w.weight(
+            self.weight_names.3,
+            Shape::of(&[e, h, mi]),
+            self.expert_storage_dtype,
+        );
         let gu = w.opaque(
             "mul_mv_id2",
             &[wg, wu, x3, slots],
@@ -955,8 +1043,15 @@ impl<P: Profile, R: ExpertResidency> MoeLayer<P, R> {
         // The SwiGLU and, at f16, the combine's widening, as what they
         // compute: the derivation composes them (`silu_mul`, the combine
         // reading f16) where the step's switch does.
-        let s = w.silu(g);
-        let hmid = w.mul(s, u);
+        let hmid = if self.shared.is_none() && (act != DType::F16 || self.f16_fuse) {
+            // The routed-only composition has no family switch to derive:
+            // its native SwiGLU is fixed at this arm. Keep the incumbent
+            // Qwen composed walk below for its switches_policy contract.
+            w.opaque("silu_mul", &[g, u], Shape::of(&[1, topk, mi]), act)
+        } else {
+            let s = w.silu(g);
+            w.mul(s, u)
+        };
         let y = w.opaque(
             "mul_mv_id",
             &[wd, hmid, slots],
@@ -968,18 +1063,32 @@ impl<P: Profile, R: ExpertResidency> MoeLayer<P, R> {
         } else {
             y
         };
-        let sg = w.project_qmat("ffn_gate_shexp.weight", &self.sh_gate, x1);
-        let su = w.project_qmat("ffn_up_shexp.weight", &self.sh_up, x1);
-        let ss = w.silu(sg);
-        let sm = w.mul(ss, su);
-        let shared = w.project_qmat("ffn_down_shexp.weight", &self.sh_down, sm);
-        let sh_logit = w.project_qmat("ffn_gate_inp_shexp.weight", &self.sh_router, x1);
-        let out = w.opaque(
-            "moe_combine",
-            &[y, route, shared, sh_logit],
-            Shape::of(&[1, h]),
-            f32,
-        );
+        let out = match &self.shared {
+            Some(s) => {
+                let sg = w.project_qmat("ffn_gate_shexp.weight", &s.gate, x1);
+                let su = w.project_qmat("ffn_up_shexp.weight", &s.up, x1);
+                let ss = w.silu(sg);
+                let sm = w.mul(ss, su);
+                let shared = w.project_qmat("ffn_down_shexp.weight", &s.down, sm);
+                let sh_logit = w.project_qmat("ffn_gate_inp_shexp.weight", &s.router, x1);
+                w.opaque(
+                    "moe_combine",
+                    &[y, route, shared, sh_logit],
+                    Shape::of(&[1, h]),
+                    f32,
+                )
+            }
+            None => {
+                let weights = w.view("reshape", weights, Shape::of(&[1, topk, 1]));
+                let weighted = w.opaque("bmul", &[y, weights], Shape::of(&[1, topk, h]), f32);
+                let sum = w.opaque("fast_sum", &[weighted], Shape::of(&[1, h]), f32);
+                if input_dtype != f32 {
+                    w.opaque("cast", &[sum], Shape::of(&[1, h]), input_dtype)
+                } else {
+                    sum
+                }
+            }
+        };
         w.view("reshape", out, Shape::of(&[1, 1, h]))
     }
 }
@@ -1018,6 +1127,7 @@ mod tests {
     use crate::profile::CrownExact;
     use lloom_tensor::quantized::{GgmlDType, QTensor};
     use lloom_tensor::Device;
+    use lloom_tensor::D;
     use std::sync::Arc;
 
     fn lin(out: usize, inp: usize, seed: f32, dev: &Device) -> QMatMul {

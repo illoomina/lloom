@@ -10621,8 +10621,22 @@ impl<P: Profile> Model<P> {
         // as live at `K > 0`.
         self.advance_conv_phase(seq_len, cache);
 
-        let mut hidden_states = self.embed_tokens.forward(input_ids)?;
+        let hidden_states = self.embed_tokens.forward(input_ids)?;
+        self.forward_residual(hidden_states, seq_len, index_pos, cache, true)
+    }
 
+    /// Shared residual walk and last-position projection. Pass admission and
+    /// conv-phase advance belong to the entry point and have already happened.
+    /// `token_head` preserves the token path's fused-head choice; the ordinary
+    /// multimodal embeds entry deliberately keeps its existing composed head.
+    fn forward_residual(
+        &self,
+        mut hidden_states: Tensor,
+        seq_len: usize,
+        index_pos: usize,
+        cache: &mut State<P>,
+        token_head: bool,
+    ) -> Result<Tensor> {
         Self::begin_taps(cache);
         for (block_idx, layer) in self.layers.iter().enumerate() {
             // The graph position, announced before the layer's dispatches are
@@ -10636,7 +10650,8 @@ impl<P: Profile> Model<P> {
 
         #[cfg(feature = "metal")]
         cache.flush_ring_snapshots();
-        if seq_len == 1
+        if token_head
+            && seq_len == 1
             && norm_gemv_applies(
                 self.norm_gemv_head,
                 &hidden_states,
@@ -10894,49 +10909,49 @@ impl<P: Profile> Model<P> {
         self.embed_tokens.forward(input_ids)
     }
 
-    /// `forward`, but starting from a residual stream the caller has already
-    /// built.
+    /// Forward from caller-supplied `[batch, sequence, hidden]` embeddings.
     ///
-    /// # Why this is a second entry point rather than a flag on `forward`
-    ///
-    /// The same reason `forward_all` is: `forward` is on the per-token path and
-    /// its shape is what every recorded digest belongs to (`DESIGN.md` §2.3.8c).
-    /// A branch inside it would put a caller decode does not have onto the
-    /// decode path — §11.3l finding 4's shape, where a window drawn for one
-    /// purpose silently changed another. **Text-only decode does not reach this
-    /// function at all**, which is what makes "the text path is unregressed" a
-    /// structural claim rather than a measured hope.
-    ///
-    /// `embeds` is `[b, seq, hidden]` and must already carry whatever the caller
-    /// wanted substituted into it. Everything after the embedding is `forward`'s
-    /// code exactly, including the conv-phase advance, so a prompt whose embeds
-    /// happen to be the plain token embeddings produces `forward`'s own answer.
+    /// This is the multimodal entry: its composed output normalization and
+    /// projection are preserved, even when token decode enables a fused head.
+    /// The residual walk is shared with token decode; callers requiring the
+    /// token entry's exact head choice use [`Self::forward_prepared_embeds`].
     pub fn forward_embeds(
         &self,
         embeds: &Tensor,
         index_pos: usize,
         cache: &mut State<P>,
     ) -> Result<Tensor> {
+        self.forward_embeds_with_head(embeds, index_pos, cache, false)
+    }
+
+    /// Forward from embeddings already prepared for token decode, preserving
+    /// [`Self::forward`]'s output-head selection (including `norm_gemv`).
+    ///
+    /// Preparing embeddings does not advance sequence state. This entry owns
+    /// pass admission and the conv-phase advance exactly once, like `forward`.
+    /// It does not itself certify a device-token producer: callers must retain
+    /// and order the embedding input until its consumers finish.
+    pub fn forward_prepared_embeds(
+        &self,
+        embeds: &Tensor,
+        index_pos: usize,
+        cache: &mut State<P>,
+    ) -> Result<Tensor> {
+        self.forward_embeds_with_head(embeds, index_pos, cache, true)
+    }
+
+    fn forward_embeds_with_head(
+        &self,
+        embeds: &Tensor,
+        index_pos: usize,
+        cache: &mut State<P>,
+        token_head: bool,
+    ) -> Result<Tensor> {
         let (_, seq_len, _) = embeds.dims3()?;
         self.attach_layer_tier(cache);
         cache.prepare_pass(seq_len)?;
         self.advance_conv_phase(seq_len, cache);
-
-        let mut hidden_states = embeds.clone();
-        Self::begin_taps(cache);
-        for (block_idx, layer) in self.layers.iter().enumerate() {
-            mark_graph_node(&cache.device, block_idx);
-            Self::tap_layer_input(&hidden_states, block_idx, cache)?;
-            hidden_states = layer.forward(&hidden_states, index_pos, block_idx, cache)?;
-        }
-
-        #[cfg(feature = "metal")]
-        cache.flush_ring_snapshots();
-        let hidden_states = self.embedding_norm.forward(&hidden_states)?;
-        let hidden_states = hidden_states.i((.., seq_len - 1, ..))?.contiguous()?;
-        let logits = self.lm_head.forward(&hidden_states)?;
-        dump_logits(&logits, index_pos + seq_len - 1)?;
-        logits.to_dtype(DType::F32)
+        self.forward_residual(embeds.clone(), seq_len, index_pos, cache, token_head)
     }
 
     /// Run the model and project **every** position, not only the last.
@@ -11858,10 +11873,10 @@ pub use crate::nn::speculator::accept_prefix;
 // (`RESTRUCTURING_DESIGN.md` §3.1). No computation is threaded through them that
 // the inherent methods above do not already do; each wires to one of them.
 //
-// `forward` is overridden rather than taking `CausalLM`'s provided
-// `embed`+`forward_embeds` default: the inherent `forward` is on the per-token
-// path and its shape is what every recorded digest belongs to (`DESIGN.md`
-// §2.3.8c), so it stays byte-identical rather than routing through two calls.
+// `forward` overrides the `embed` + `forward_embeds` default because token
+// decode and ordinary multimodal embeddings retain distinct output-head
+// policies. Both now share the residual walk; prepared token embeddings must
+// use the explicit token-policy entry, not the multimodal default.
 impl<P: Profile> crate::profile::Shaped for Model<P> {
     type Profile = P;
 }
@@ -11875,6 +11890,11 @@ impl<P: Profile> ModelTrait for Model<P> {
 }
 
 impl<P: Profile> CausalLM for Model<P> {
+    #[cfg(feature = "metal")]
+    fn guarded_embedding_layout(&self) -> Result<lloom_tensor::quantized::GuardedEmbeddingLayout> {
+        self.embed_tokens.guarded_layout()
+    }
+
     type Cache = State<P>;
 
     fn new_cache(&self, cfg: &Self::Config, dev: &Device) -> Result<Self::Cache> {
@@ -11883,6 +11903,38 @@ impl<P: Profile> CausalLM for Model<P> {
 
     fn embed(&self, tokens: &Tensor) -> Result<Tensor> {
         Model::embed(self, tokens)
+    }
+
+    #[cfg(feature = "metal")]
+    fn check_guarded_embedding(&self, out: &Tensor) -> Result<()> {
+        let (batch, rows, _) = out.dims3()?;
+        if batch != 1 || rows == 0 {
+            lloom_tensor::bail!("lfm2: guarded embedding requires [1, rows, hidden]");
+        }
+        self.embed_tokens.check_guarded_output(out)
+    }
+
+    #[cfg(feature = "metal")]
+    fn embed_guarded_into(
+        &self,
+        tokens: &lloom_tensor::metal_backend::sampling::GuardedSample<'_>,
+        out: &Tensor,
+    ) -> Result<()> {
+        let (batch, rows, _) = out.dims3()?;
+        if batch != 1 || rows != tokens.rows() {
+            lloom_tensor::bail!("lfm2: guarded embedding row count mismatch");
+        }
+        self.embed_tokens.forward_guarded_into(tokens, out)
+    }
+
+    #[cfg(feature = "metal")]
+    fn forward_prepared_embeds(
+        &self,
+        embeds: &Tensor,
+        pos: usize,
+        cache: &mut Self::Cache,
+    ) -> Result<Tensor> {
+        Model::forward_prepared_embeds(self, embeds, pos, cache)
     }
 
     fn forward_embeds(

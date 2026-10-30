@@ -260,6 +260,39 @@ impl ReprEmbedding {
             Table::Blocks(_) => DType::U8,
         }
     }
+
+    /// The output a guarded lookup writes: the table's dense dtype, or f32 for
+    /// packed rows, as [`Module::forward`] returns them.
+    #[cfg(feature = "metal")]
+    pub fn guarded_layout(&self) -> Result<lloom_tensor::quantized::GuardedEmbeddingLayout> {
+        match &self.inner {
+            Table::Dense(e) => e.guarded_layout(),
+            Table::Blocks(q) => QMatMul::QTensor(q.clone()).guarded_embedding_layout(),
+        }
+    }
+
+    #[cfg(feature = "metal")]
+    pub fn check_guarded_output(&self, out: &Tensor) -> Result<()> {
+        match &self.inner {
+            Table::Dense(e) => e.check_guarded_output(out),
+            Table::Blocks(q) => QMatMul::QTensor(q.clone()).check_guarded_embedding_output(out),
+        }
+    }
+
+    /// Look up a checked device sample's rows into `out`. An invalid sample
+    /// indexes nothing and leaves `out` unchanged.
+    #[cfg(feature = "metal")]
+    pub fn forward_guarded_into(
+        &self,
+        tokens: &lloom_tensor::metal_backend::sampling::GuardedSample<'_>,
+        out: &Tensor,
+    ) -> Result<()> {
+        let _enter = self.span.enter();
+        match &self.inner {
+            Table::Dense(e) => e.forward_guarded_into(tokens, out),
+            Table::Blocks(q) => q.embedding_guarded_into(tokens, out),
+        }
+    }
 }
 
 impl Module for ReprEmbedding {

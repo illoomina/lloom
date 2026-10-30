@@ -587,7 +587,7 @@ mod tests {
         m.enable_pass_plans(ArenaLayout::Packed);
         let key = PassKey::new(PassKind::Decode { b: 1 });
         for turn in 0..5 {
-            m.begin_pass(key.clone())?;
+            m.begin_pass(key)?;
             let body = (|| -> Result<(PreparedSampler, Tensor)> {
                 let before = m.arena_counters();
                 let sampler = PreparedSampler::with_noise(m, 1, 3)?;

@@ -634,7 +634,7 @@ mod window_controls {
         let key = PassKey::new(PassKind::Decode { b: 1 });
         let mut owners = Vec::new();
         for _ in 0..5 {
-            m.begin_pass(key.clone())?;
+            m.begin_pass(key)?;
             let body = (|| -> Result<_> {
                 let window = PreparedNativeWindow::new(&d, 1, 3, 1, embeds.clone())?;
                 let forcing = PreparedNativeBudget::new(

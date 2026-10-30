@@ -26,15 +26,19 @@ pub enum LoadWarningKind {
     /// An executor arm the run asked for is not installed as asked
     /// (`ExecutorConfig::under_body`).
     Executor,
+    /// A fused arm the run asked for reads a dense weight the checkpoint
+    /// stores packed (`nn::weight_repr`): those projections run composed.
+    FusedArm,
 }
 
 impl LoadWarningKind {
-    pub const ALL: [LoadWarningKind; 5] = [
+    pub const ALL: [LoadWarningKind; 6] = [
         LoadWarningKind::AttentionRoute,
         LoadWarningKind::EmulatedType,
         LoadWarningKind::Readback,
         LoadWarningKind::Speculation,
         LoadWarningKind::Executor,
+        LoadWarningKind::FusedArm,
     ];
 
     /// The `kind` a structured reader keys on.
@@ -45,6 +49,7 @@ impl LoadWarningKind {
             LoadWarningKind::Readback => "readback",
             LoadWarningKind::Speculation => "speculation",
             LoadWarningKind::Executor => "executor",
+            LoadWarningKind::FusedArm => "fused_arm",
         }
     }
 }

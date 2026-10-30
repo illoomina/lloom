@@ -593,6 +593,27 @@ impl DecodeOptions {
         TokenLimit(self.max_tokens).remaining(produced)
     }
 
+    /// Cold workspace count for a one-row prepared sampler on the ring.
+    /// A draw precedes the pacer wait. Fixed cadence therefore needs one
+    /// more slot than its forward depth; adaptive cadence includes the
+    /// largest just-closed group as well. This is not an admission quote.
+    pub fn prepared_sample_slots(&self) -> Result<usize> {
+        let slots = if self.adaptive_commit && self.lookahead > 0 {
+            let run = self.run_ahead_steps();
+            let queued = if self.queued_steps == 0 {
+                run.checked_mul(2)
+            } else {
+                Some(self.queued_steps)
+            };
+            queued.and_then(|queued| queued.checked_add(run))
+        } else {
+            self.pacer_depth().max(IN_FLIGHT_FLOOR).checked_add(1)
+        };
+        slots.ok_or_else(|| {
+            lloom_tensor::Error::Msg("prepared sampling: workspace count overflow".into())
+        })
+    }
+
     /// The pacer depth: the explicit override if set, else the floor. (The
     /// AUTO path sets `in_flight_depth` from warmup; this reads it back with the
     /// `0 = auto -> floor` convention applied.)
@@ -4986,4 +5007,94 @@ fn cache_sizes(device: &Device) -> (usize, usize) {
     }
     let _ = device;
     (0, 0)
+}
+
+#[cfg(test)]
+mod prepared_sample_slots_tests {
+    use super::*;
+
+    #[test]
+    fn fixed_count_includes_the_draw_before_the_wait() -> Result<()> {
+        for (depth, expected) in [(0, 3), (1, 3), (2, 3), (7, 8)] {
+            let opts = DecodeOptions {
+                in_flight_depth: depth,
+                ..DecodeOptions::new(100)
+            };
+            assert_eq!(opts.prepared_sample_slots()?, expected);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn adaptive_count_covers_a_just_closed_group() -> Result<()> {
+        for (run_ahead, queued_steps, expected) in [(0, 0, 24), (4, 0, 12), (8, 2, 10), (1, 1, 2)] {
+            let opts = DecodeOptions {
+                adaptive_commit: true,
+                lookahead: 1,
+                run_ahead,
+                queued_steps,
+                ..DecodeOptions::new(100)
+            };
+            assert_eq!(opts.prepared_sample_slots()?, expected);
+        }
+        // The no-lookahead branch uses fixed pacing even with this flag set.
+        let opts = DecodeOptions {
+            adaptive_commit: true,
+            lookahead: 0,
+            run_ahead: 8,
+            queued_steps: 2,
+            ..DecodeOptions::new(100)
+        };
+        assert_eq!(opts.prepared_sample_slots()?, 3);
+        Ok(())
+    }
+
+    #[test]
+    fn count_overflow_is_a_cold_error() {
+        let fixed = DecodeOptions {
+            in_flight_depth: usize::MAX,
+            ..DecodeOptions::new(1)
+        };
+        assert!(fixed.prepared_sample_slots().is_err());
+        for (run_ahead, queued_steps) in [(usize::MAX, 0), (usize::MAX / 2 + 1, 0), (1, usize::MAX)]
+        {
+            let opts = DecodeOptions {
+                adaptive_commit: true,
+                lookahead: 1,
+                run_ahead,
+                queued_steps,
+                ..DecodeOptions::new(1)
+            };
+            assert!(opts.prepared_sample_slots().is_err());
+        }
+    }
+
+    #[test]
+    fn fixed_draw_reuse_follows_retirement_even_across_redraws() -> Result<()> {
+        for depth in [2, 3, 7] {
+            let opts = DecodeOptions {
+                in_flight_depth: depth,
+                lookahead: 1,
+                ..DecodeOptions::new(100)
+            };
+            let slots = opts.prepared_sample_slots()?;
+            let mut pending = PacerQueue::new(depth);
+            let mut busy = vec![false; slots];
+            for draw in 0..1000 {
+                // Every draw, including a provisional redraw, happens before
+                // before_forward; its forward then receives a pacing marker.
+                let slot = draw % slots;
+                assert!(!busy[slot], "draw {draw} reused live slot {slot}");
+                busy[slot] = true;
+                while pending.entries.len() >= depth {
+                    pending.retire(|old: &usize| {
+                        busy[*old] = false;
+                        Ok(true)
+                    })?;
+                }
+                pending.push(slot, 1);
+            }
+        }
+        Ok(())
+    }
 }

@@ -4,7 +4,7 @@ use crate::nn::gguf_weights::{Weight, WeightDType, WeightPlan};
 use lloom_tensor::quantized::gguf_file::Content;
 use lloom_tensor::{bail, Result, Shape};
 
-pub(super) struct AttentionWeights {
+pub(crate) struct AttentionWeights {
     pub q: Weight,
     pub k: Weight,
     pub v: Weight,
@@ -13,16 +13,16 @@ pub(super) struct AttentionWeights {
     pub k_norm: Weight,
     pub kv_heads: usize,
 }
-pub(super) struct ConvWeights {
+pub(crate) struct ConvWeights {
     pub input: Weight,
     pub output: Weight,
     pub conv: Weight,
 }
-pub(super) enum MixerWeights {
+pub(crate) enum MixerWeights {
     Attention(AttentionWeights),
     Conv(ConvWeights),
 }
-pub(super) struct LayerWeights {
+pub(crate) struct LayerWeights {
     pub operator_norm: Weight,
     pub ffn_norm: Weight,
     pub gate: Weight,
@@ -30,7 +30,7 @@ pub(super) struct LayerWeights {
     pub up: Weight,
     pub mixer: MixerWeights,
 }
-pub(super) struct Lfm2Weights {
+pub(crate) struct Lfm2Weights {
     pub heads: usize,
     pub width: usize,
     pub context: usize,
@@ -64,7 +64,7 @@ fn aliases(names: &[&str]) -> Vec<String> {
     names.iter().map(|s| (*s).to_owned()).collect()
 }
 impl Lfm2Weights {
-    pub fn resolve(ct: &Content) -> Result<Self> {
+    pub(crate) fn resolve(ct: &Content) -> Result<Self> {
         let md = |s: &str| {
             ct.metadata
                 .get(s)

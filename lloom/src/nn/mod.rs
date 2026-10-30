@@ -74,6 +74,7 @@ pub mod turn_checkpoint;
 pub mod var_builder;
 pub mod var_map;
 pub mod weight_groups;
+pub mod weight_repr;
 pub mod zeros;
 /// Re-export of [`attention::varlen`] for backward compatibility.
 pub mod varlen_attention {

@@ -72,6 +72,8 @@ fn engine_fixture() -> Result<(Fixture<Lfm2Tiny>, TinyEngine)> {
             pool: None,
             share_prefix: false,
             lm_record,
+            gguf: false,
+            raw_bos: true,
             vision: None,
             last_vision: Mutex::new(Value::Null),
             config,

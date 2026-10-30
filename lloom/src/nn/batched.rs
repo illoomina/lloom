@@ -1066,8 +1066,12 @@ impl<'m, M: BatchedCausalLM, R: BorrowMut<Session<'m, M>>> BatchDecoder<'m, M, R
         for (k, &i) in self.live.iter().enumerate() {
             let row = logits.narrow(0, k, 1)?.squeeze(0)?;
             let slot = self.slots[i].as_mut().expect("a live row is held");
+            #[cfg(any(debug_assertions, feature = "profile"))]
+            crate::generation::draw_trace::set_row(self.step, self.live.len(), k);
             ids.push(slot.sampler.sample(&row)?);
         }
+        #[cfg(any(debug_assertions, feature = "profile"))]
+        crate::generation::draw_trace::clear_row();
         Ok(ids)
     }
 
@@ -1330,6 +1334,19 @@ impl<'m, M: BatchedCausalLM, R: BorrowMut<Session<'m, M>>> BatchDecoder<'m, M, R
             }
         }
         end_executor_step(&device)?;
+        // The step's forward, for `diagnostics.trace.draws`: under the
+        // lookahead it fed every sampled row, on the host arm the kept ones,
+        // each with the pieces beside them.
+        #[cfg(any(debug_assertions, feature = "profile"))]
+        if lloom_tensor::tuning::draw_trace_on() {
+            eprintln!(
+                "[draw-step: step={} sampled={b} lookahead={lookahead} kept={} pieces={} piece_tokens={piece_tokens} joined={}]",
+                self.step,
+                kept.len(),
+                pieces.len(),
+                joined.len()
+            );
+        }
 
         // Next step's rows: the held rows, the kept rows, then the rows that
         // joined this step, each with its own logits row. A row joining with `done`

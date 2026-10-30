@@ -87,6 +87,20 @@ impl HostInputArm {
 pub(super) struct Input {
     event: Retained<ProtocolObject<dyn MTLSharedEvent>>,
     value: u64,
+    /// When it was gated, in the queue's gating order (0: not a gate's); a
+    /// repeated input keeps the earliest.
+    seq: u64,
+}
+
+/// How [`Gate::add`] took an input.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Added {
+    /// A slot of its own, the only one on its event.
+    New,
+    /// A slot of its own, beside another value of its event.
+    BesideItsEvent,
+    /// The same value on the same event was gated already.
+    Repeat,
 }
 
 impl Input {
@@ -97,7 +111,11 @@ impl Input {
         // SAFETY: the borrowed event is live; the retain keeps it for the gate.
         let event = unsafe { Retained::retain(std::ptr::from_ref(event).cast_mut()) }
             .ok_or(MetalKernelError::QueueUnavailable("event retain refused"))?;
-        Ok(Self { event, value })
+        Ok(Self {
+            event,
+            value,
+            seq: 0,
+        })
     }
 
     fn produced(&self) -> bool {
@@ -129,33 +147,43 @@ impl Gate {
         self.inputs.iter().all(Option::is_some)
     }
 
-    /// Add `input`; an input on the same event keeps the higher value (an
-    /// event's values are monotone, so the higher one covers both).
-    fn add(&mut self, input: Input) -> Result<(), Input> {
-        if let Some(same) = self
-            .inputs
-            .iter_mut()
-            .flatten()
-            .find(|held| held.is_on(&input.event))
-        {
-            same.value = same.value.max(input.value);
-            return Ok(());
+    /// Add `input`. A repeat of a gated `(event, value)` keeps the earlier
+    /// gating; another value of a gated event takes a slot of its own, so a
+    /// cancellation through any one of them finds it (`covered_by`).
+    fn add(&mut self, input: Input) -> Result<Added, Input> {
+        let mut beside = false;
+        for held in self.inputs.iter().flatten() {
+            if held.is_on(&input.event) {
+                if held.value == input.value {
+                    return Ok(Added::Repeat);
+                }
+                beside = true;
+            }
         }
         match self.inputs.iter_mut().find(|slot| slot.is_none()) {
             Some(slot) => {
                 *slot = Some(input);
-                Ok(())
+                Ok(if beside {
+                    Added::BesideItsEvent
+                } else {
+                    Added::New
+                })
             }
             None => Err(input),
         }
     }
 
-    /// An input on `event` this recording still waits for.
-    fn waits_on(&self, event: &ProtocolObject<dyn MTLSharedEvent>) -> bool {
-        self.inputs
-            .iter()
-            .flatten()
-            .any(|input| input.is_on(event) && !input.produced())
+    /// An input the cancellation covers: gated before it was asked for, on
+    /// its event, above the value it found produced and at or below its
+    /// bound. A cancellation applied late takes nothing gated since.
+    fn covered_by(&self, cancel: &Cancel) -> bool {
+        self.inputs.iter().flatten().any(|input| {
+            input.seq != 0
+                && input.seq <= cancel.gated_through
+                && input.is_on(&cancel.event)
+                && input.value > cancel.produced
+                && input.value <= cancel.upto
+        })
     }
 
     fn highest_on(&self, event: &ProtocolObject<dyn MTLSharedEvent>) -> u64 {
@@ -244,8 +272,58 @@ pub struct ProducedStats {
     /// IO command buffers committed after a held recording instead of at
     /// their issue (the recording carrying their compute signal was held).
     pub io_deferred: u64,
-    /// Summed time producers waited for the state lock, µs.
+    /// Inputs gated beside another value of their event in one recording:
+    /// each holds a gate slot of its own.
+    pub beside_its_event: u64,
+    /// Summed time producers spent at the state lock — a try, and the
+    /// release when it was free — µs. No producer waits for it.
     pub producer_lock_us: u64,
+    /// Times a producer found the state lock held and left its release to
+    /// the holder: producers never wait for the lock.
+    pub delegated: u64,
+    /// Times a cancellation found the state lock held and left itself to the
+    /// holder: a cancellation never waits for the lock either.
+    pub cancels_delegated: u64,
+}
+
+/// Part of every state-lock acquisition's custody, dropped after the lock:
+/// runs the release or cancellation that a producer or a canceller, finding
+/// the lock held, left to this holder.
+pub(super) struct AfterUnlock<'a>(pub(super) &'a CommandsCore);
+
+impl Drop for AfterUnlock<'_> {
+    fn drop(&mut self) {
+        let core = self.0;
+        // `live` changes only under the lock: zero means nothing is held or
+        // gated, so nothing left pending can be waiting or covered.
+        if core.produced.live.load(Ordering::Relaxed) == 0 || std::thread::panicking() {
+            return;
+        }
+        if let Err(error) = core.run_pending(Pending::Holder) {
+            core.failure
+                .record(format!("held work its input released was refused: {error}"));
+        }
+    }
+}
+
+/// Who runs what is left pending, for the delegation counts.
+#[derive(Clone, Copy)]
+enum Pending {
+    Producer,
+    Canceller,
+    Holder,
+}
+
+/// A cancellation asked for and not yet applied: every held recording with
+/// an input gated by then (`gated_through`) on `event`, above `produced`
+/// (the event's value when it was asked for) and at or below `upto`,
+/// everything behind it, and the current recording.
+pub(super) struct Cancel {
+    event: Retained<ProtocolObject<dyn MTLSharedEvent>>,
+    produced: u64,
+    upto: u64,
+    gated_through: u64,
+    reason: &'static str,
 }
 
 /// The block an event's notification runs: the event and the value reached.
@@ -274,6 +352,18 @@ pub(super) struct ProducedState {
     held_us: AtomicU64,
     io_deferred: AtomicU64,
     producer_lock_us: AtomicU64,
+    delegated: AtomicU64,
+    /// A producer found the state lock held: the holder runs the release
+    /// once it unlocks (`AfterUnlock`).
+    release_pending: AtomicBool,
+    /// A cancellation found the state lock held: whichever holder looks next
+    /// applies it, before any release (`Commands::cancel_produced`).
+    cancel_pending: AtomicBool,
+    cancels: parking_lot::Mutex<Vec<Cancel>>,
+    cancels_delegated: AtomicU64,
+    beside_its_event: AtomicU64,
+    /// Inputs gated so far: an input's `seq`, a cancellation's bound.
+    gated: AtomicU64,
     late_logged: AtomicBool,
     /// The event and highest value of the last cancellation.
     cancelled_event: AtomicUsize,
@@ -300,6 +390,13 @@ impl ProducedState {
             held_us: AtomicU64::new(0),
             io_deferred: AtomicU64::new(0),
             producer_lock_us: AtomicU64::new(0),
+            delegated: AtomicU64::new(0),
+            release_pending: AtomicBool::new(false),
+            cancel_pending: AtomicBool::new(false),
+            cancels: parking_lot::Mutex::new(Vec::new()),
+            cancels_delegated: AtomicU64::new(0),
+            beside_its_event: AtomicU64::new(0),
+            gated: AtomicU64::new(0),
             late_logged: AtomicBool::new(false),
             cancelled_event: AtomicUsize::new(0),
             cancelled_upto: AtomicU64::new(0),
@@ -311,6 +408,13 @@ impl ProducedState {
     /// The error a wait on a cancelled recording returns.
     pub(super) fn cancelled_error(&self) -> MetalKernelError {
         MetalKernelError::QueueUnavailable(*self.cancel_reason.lock())
+    }
+
+    /// A recording gated a second value of one event: counted, since each
+    /// value holds a slot a full gate cuts for. Called under the state lock,
+    /// so it only counts; the count is printed at the run's report.
+    fn note_beside_its_event(&self) {
+        self.beside_its_event.fetch_add(1, Ordering::Relaxed);
     }
 
     #[cfg(test)]
@@ -344,6 +448,11 @@ impl ProducedState {
 }
 
 impl CommandsCore {
+    /// A cancellation is left pending for the state lock's holder.
+    pub(super) fn produced_cancel_pending(&self) -> bool {
+        self.produced.cancel_pending.load(Ordering::SeqCst)
+    }
+
     /// Publish how much is held, then order the publication before the
     /// caller's next look at the inputs: a producer that raised its event
     /// before the look either sees this count or is seen by the look.
@@ -357,19 +466,42 @@ impl CommandsCore {
 
     /// Commit, in order, every held recording whose inputs all exist, and
     /// open the current recording's gate once nothing is held ahead of it.
-    /// Each commit is the owner's submission transaction, with the epoch the
-    /// recording's cut took; residency is published once per acquisition.
+    /// A cancellation left pending is applied first, and looked for again
+    /// after every gate found open, so one asked for before its event moved
+    /// is applied before the move can release what it covers. Each commit is
+    /// the owner's submission transaction, with the epoch the recording's cut
+    /// took; residency is published once per acquisition. A caller that goes
+    /// on to use the current recording checks `current_abandoned` after.
     pub(super) fn release_produced_locked(
         &self,
         state: &mut EntryGuard<'_>,
     ) -> Result<usize, MetalKernelError> {
         let mut released = 0usize;
+        let mut opened = false;
         let result = loop {
-            if !state.held.front().is_some_and(|held| held.gate.is_open()) {
+            if self.produced.cancel_pending.load(Ordering::SeqCst) {
+                if let Err(error) = self.apply_cancels_locked(state) {
+                    break Err(error);
+                }
+            }
+            let head = state.held.front().is_some_and(|held| held.gate.is_open());
+            let current =
+                !head && state.held.is_empty() && !state.gate.is_empty() && state.gate.is_open();
+            if !head && !current {
                 break Ok(());
             }
-            // The producer wrote its input before it raised the event.
-            std::sync::atomic::fence(Ordering::Acquire);
+            // The gate's look, then the flag: a cancellation asked for before
+            // its event was raised is seen here. The producer wrote its input
+            // before it raised the event.
+            std::sync::atomic::fence(Ordering::SeqCst);
+            if self.produced.cancel_pending.load(Ordering::SeqCst) {
+                continue;
+            }
+            if current {
+                state.gate = Gate::default();
+                opened = true;
+                break Ok(());
+            }
             let (entry, custody) = state.parts_mut();
             let publish = !custody.residency_published;
             let removals: Option<&mut Option<PublishedRemovals>> = if publish {
@@ -422,10 +554,6 @@ impl CommandsCore {
                 }
             }
         };
-        let opened = state.held.is_empty() && !state.gate.is_empty() && state.gate.is_open();
-        if opened {
-            state.gate = Gate::default();
-        }
         self.held_live_update(state);
         if released > 0 {
             self.produced
@@ -478,9 +606,12 @@ impl CommandsCore {
     }
 
     /// A producer raised `event` to `value`: commit what that released.
-    /// Wakes an owner parked with the state lock (a Metal 4 slot, a full
-    /// held queue) before taking the lock, so it submits the released work
-    /// itself rather than wait on this thread.
+    /// Never waits for the state lock. An owner parked holding it (a Metal 4
+    /// slot, a full held queue) is woken first and submits the released work
+    /// itself; any other holder runs the release once it unlocks. A producer
+    /// waiting for the lock would hold back every input its thread or its
+    /// event listener delivers next, the one a parked owner waits for among
+    /// them (`docs/invariants.md` §15.1q).
     pub(super) fn produced_on(
         &self,
         event: &ProtocolObject<dyn MTLSharedEvent>,
@@ -496,13 +627,12 @@ impl CommandsCore {
             queue.notify_ready();
         }
         let asked = std::time::Instant::now();
-        let released = self.lock_entry().and_then(|mut state| {
-            self.produced.producer_lock_us.fetch_add(
-                asked.elapsed().as_micros().min(u64::MAX as u128) as u64,
-                Ordering::Relaxed,
-            );
-            self.release_produced_locked(&mut state)
-        });
+        self.produced.release_pending.store(true, Ordering::SeqCst);
+        let released = self.run_pending(Pending::Producer);
+        self.produced.producer_lock_us.fetch_add(
+            asked.elapsed().as_micros().min(u64::MAX as u128) as u64,
+            Ordering::Relaxed,
+        );
         if let Ok(n) = released {
             self.produced
                 .released_by_producer
@@ -515,6 +645,140 @@ impl CommandsCore {
                 .record(format!("held work its input released was refused: {error}"));
         }
         released
+    }
+
+    /// Run the release and the cancellations left pending, while the state
+    /// lock is free; returns what this call released. When the lock is held,
+    /// its holder runs this once it unlocks: every unlock is followed by a
+    /// look at the flags, and every flag raised is followed by an attempt at
+    /// the lock, so one of the two sees the other.
+    fn run_pending(&self, by: Pending) -> Result<usize, MetalKernelError> {
+        let mut released = 0;
+        loop {
+            std::sync::atomic::fence(Ordering::SeqCst);
+            if !self.produced.release_pending.load(Ordering::SeqCst)
+                && !self.produced.cancel_pending.load(Ordering::SeqCst)
+            {
+                return Ok(released);
+            }
+            let Some(mut state) = self.try_lock_entry_unhooked() else {
+                match by {
+                    Pending::Producer => &self.produced.delegated,
+                    Pending::Canceller => &self.produced.cancels_delegated,
+                    Pending::Holder => return Ok(released),
+                }
+                .fetch_add(1, Ordering::Relaxed);
+                return Ok(released);
+            };
+            self.produced.release_pending.store(false, Ordering::SeqCst);
+            let ran = self.release_produced_locked(&mut state);
+            drop(state);
+            released += ran?;
+        }
+    }
+
+    /// Apply every cancellation left pending, in the order asked for.
+    fn apply_cancels_locked(&self, state: &mut EntryGuard<'_>) -> Result<(), MetalKernelError> {
+        self.produced.cancel_pending.store(false, Ordering::SeqCst);
+        let pending = std::mem::take(&mut *self.produced.cancels.lock());
+        let mut refused = None;
+        for cancel in &pending {
+            if let Err(error) = self.cancel_locked(state, cancel) {
+                refused.get_or_insert(error);
+            }
+        }
+        refused.map_or(Ok(()), Err)
+    }
+
+    /// One cancellation, under the lock. The current recording is left
+    /// abandoned, never replaced here: a replacement may park for a slot, and
+    /// a cancellation runs wherever the lock is found — a producer's thread,
+    /// an owner parked mid-cut. The next recording operation or cut replaces
+    /// it.
+    fn cancel_locked(
+        &self,
+        state: &mut EntryGuard<'_>,
+        cancel: &Cancel,
+    ) -> Result<usize, MetalKernelError> {
+        let first = state
+            .held
+            .iter()
+            .position(|held| held.gate.covered_by(cancel));
+        if first.is_none() && !state.gate.covered_by(cancel) {
+            return Ok(0);
+        }
+        let from = first.unwrap_or(state.held.len());
+        let event: &ProtocolObject<dyn MTLSharedEvent> = &cancel.event;
+        let mut upto = state.gate.highest_on(event);
+        let mut rehome: Vec<AfterCommit> = Vec::new();
+        let mut cancelled = 0usize;
+        let mut refused = None;
+        {
+            let (entry, custody) = state.parts_mut();
+            let entry: &mut EntryState = entry;
+            // Cancellation is not on the token's path: the drained
+            // recordings are collected so their after-lists can go back.
+            let drained: Vec<Held> = entry.held.drain(from..).collect();
+            for held in drained {
+                upto = upto.max(held.gate.highest_on(event));
+                if let Err(error) = held.cb.cancel_unsubmitted() {
+                    refused.get_or_insert(error);
+                }
+                entry.owed_epochs += 1;
+                let mut after = held.after;
+                for action in after.drain(..) {
+                    let AfterCommit::Io { io, signal, .. } = action;
+                    rehome.push(AfterCommit::Io {
+                        io,
+                        signal,
+                        rehomed: true,
+                    });
+                }
+                recycle_after(&mut entry.spare_after, after);
+                custody.cancelled.push(held.cb);
+                cancelled += 1;
+            }
+        }
+        // The current recording is behind every held one, or waits itself.
+        self.close_pending_blit(state)?;
+        self.close_compute(state)?;
+        if !state.current_abandoned {
+            if let Some(current) = state.current.recording().cloned() {
+                if let Err(error) = current.cancel_unsubmitted() {
+                    refused.get_or_insert(error);
+                }
+                cancelled += 1;
+                state.gate = Gate::default();
+                state.signals_since_cut = false;
+                self.compute_count.store(0, Ordering::Release);
+                state.current_abandoned = true;
+            }
+        }
+        // Loads ordered behind a cancelled signal keep that order.
+        match state.held.back_mut() {
+            Some(held) => held.after.extend(rehome),
+            None => {
+                if let Err(error) = self.run_after_commit(&mut rehome) {
+                    refused.get_or_insert(error);
+                }
+            }
+        }
+        let p = &self.produced;
+        *p.cancel_reason.lock() = cancel.reason;
+        p.cancelled.fetch_add(cancelled as u64, Ordering::Relaxed);
+        p.cancelled_upto.store(upto, Ordering::Release);
+        p.cancelled_event.store(
+            event as *const ProtocolObject<dyn MTLSharedEvent> as *const () as usize,
+            Ordering::Release,
+        );
+        self.held_live_update(state);
+        p.wake.notify();
+        if let Some(error) = refused {
+            self.failure
+                .record_static("a held recording could not be cancelled; queue failed");
+            return Err(error);
+        }
+        Ok(cancelled)
     }
 
     /// An input produced after the work waiting for it was cancelled finds
@@ -615,6 +879,9 @@ impl Commands {
             held_us: p.held_us.load(Ordering::Relaxed),
             io_deferred: p.io_deferred.load(Ordering::Relaxed),
             producer_lock_us: p.producer_lock_us.load(Ordering::Relaxed),
+            delegated: p.delegated.load(Ordering::Relaxed),
+            cancels_delegated: p.cancels_delegated.load(Ordering::Relaxed),
+            beside_its_event: p.beside_its_event.load(Ordering::Relaxed),
         }
     }
 
@@ -659,16 +926,25 @@ impl Commands {
         if !pristine || state.gate.is_full() {
             self.cut_locked(&mut state, 0)?;
         }
-        let input = Input::new(event, value)?;
-        if state.gate.add(input).is_err() {
-            return Err(MetalKernelError::QueueUnavailable(
-                "a fresh recording's gate refused an input",
-            ));
+        let mut input = Input::new(event, value)?;
+        input.seq = self.core.produced.gated.fetch_add(1, Ordering::SeqCst) + 1;
+        match state.gate.add(input) {
+            Ok(Added::BesideItsEvent) => self.core.produced.note_beside_its_event(),
+            Ok(Added::New | Added::Repeat) => {}
+            Err(_) => {
+                return Err(MetalKernelError::QueueUnavailable(
+                    "a fresh recording's gate refused an input",
+                ))
+            }
         }
         self.core.held_live_update(&state);
         // A producer that raised the event since the look above found the
         // count without this gate: the release below sees the event.
         self.core.release_produced_locked(&mut state)?;
+        if state.current_abandoned {
+            // A cancellation applied here took the gated recording.
+            return Err(self.core.produced.cancelled_error());
+        }
         Ok(())
     }
 
@@ -758,100 +1034,66 @@ impl Commands {
         Ok(())
     }
 
-    /// The input on `event` will never be produced (its producer failed, or
-    /// its run ended early): cancel the held recordings waiting for it, every
-    /// recording behind them and the current one. Nothing they encoded runs;
-    /// their native work is abandoned through host retirement, their epochs
-    /// complete with the next commit, and an IO load ordered behind them
-    /// keeps its order through a signal re-issued on the queue. A wait on a
-    /// cancelled recording fails with `reason`. Returns the recordings
-    /// cancelled; 0 when nothing waits on `event`.
+    /// The inputs on `event` will never be produced (its producer failed, or
+    /// its run ended early): cancel the held recordings waiting for one,
+    /// every recording behind them and the current one. Nothing they encoded
+    /// runs; their native work is abandoned through host retirement, their
+    /// epochs complete with the next commit, and an IO load ordered behind
+    /// them keeps its order through a signal re-issued on the queue. A wait on
+    /// a cancelled recording, or a cut of the recording a cancellation takes,
+    /// fails with `reason`. Never waits for the state lock: when it is held,
+    /// the holder applies the cancellation as it unlocks, an owner parked
+    /// behind the work applies it in its park, and every release applies it
+    /// first, so raising `event` after this call cannot release what it
+    /// covers. Returns the recordings cancelled while this call held the
+    /// lock: 0 when nothing waited on `event` or a holder applies it.
     pub fn cancel_produced(
         &self,
         event: &ProtocolObject<dyn MTLSharedEvent>,
         reason: &'static str,
     ) -> Result<usize, MetalKernelError> {
-        let mut state = self.lock_recording_state()?;
-        let first = state.held.iter().position(|held| held.gate.waits_on(event));
-        if first.is_none() && !state.gate.waits_on(event) {
+        self.cancel_produced_through(event, u64::MAX, reason)
+    }
+
+    /// As [`Self::cancel_produced`], for the values on `event` up to `upto`:
+    /// a recording gated on any value in that range is covered, whatever
+    /// other values of `event` it also waits for; work behind only later
+    /// values, a next run's, is not, whenever the cancellation is applied.
+    pub fn cancel_produced_through(
+        &self,
+        event: &ProtocolObject<dyn MTLSharedEvent>,
+        upto: u64,
+        reason: &'static str,
+    ) -> Result<usize, MetalKernelError> {
+        let core = &self.core;
+        std::sync::atomic::fence(Ordering::SeqCst);
+        if core.produced.live.load(Ordering::SeqCst) == 0 {
             return Ok(0);
         }
-        let from = first.unwrap_or(state.held.len());
-        let mut upto = state.gate.highest_on(event);
-        let mut rehome: Vec<AfterCommit> = Vec::new();
-        let mut cancelled = 0usize;
-        let mut refused = None;
-        {
-            let (entry, custody) = state.parts_mut();
-            let entry: &mut EntryState = entry;
-            // Cancellation is not on the token's path: the drained
-            // recordings are collected so their after-lists can go back.
-            let drained: Vec<Held> = entry.held.drain(from..).collect();
-            for held in drained {
-                upto = upto.max(held.gate.highest_on(event));
-                if let Err(error) = held.cb.cancel_unsubmitted() {
-                    refused.get_or_insert(error);
-                }
-                entry.owed_epochs += 1;
-                let mut after = held.after;
-                for action in after.drain(..) {
-                    let AfterCommit::Io { io, signal, .. } = action;
-                    rehome.push(AfterCommit::Io {
-                        io,
-                        signal,
-                        rehomed: true,
-                    });
-                }
-                recycle_after(&mut entry.spare_after, after);
-                custody.cancelled.push(held.cb);
-                cancelled += 1;
-            }
+        // SAFETY: the borrowed event is live; the retain keeps it until the
+        // cancellation is applied.
+        let retained = unsafe { Retained::retain(std::ptr::from_ref(event).cast_mut()) }
+            .ok_or(MetalKernelError::QueueUnavailable("event retain refused"))?;
+        core.produced.cancels.lock().push(Cancel {
+            event: retained,
+            produced: event.signaledValue(),
+            upto,
+            gated_through: core.produced.gated.load(Ordering::SeqCst),
+            reason,
+        });
+        core.produced.cancel_pending.store(true, Ordering::SeqCst);
+        // An owner parked behind the work applies it in its park.
+        core.produced.wake.notify();
+        if let Some(queue) = &core.modern_queue {
+            queue.notify_ready();
         }
-        // The current recording is behind every held one, or waits itself.
-        self.core.close_pending_blit(&mut state)?;
-        self.core.close_compute(&mut state)?;
-        if let Some(current) = state.current.recording().cloned() {
-            if let Err(error) = current.cancel_unsubmitted() {
-                refused.get_or_insert(error);
-            }
-            cancelled += 1;
-            state.gate = Gate::default();
-            state.signals_since_cut = false;
-            self.core.compute_count.store(0, Ordering::Release);
-            state.current_abandoned = true;
-            // Replaced now when a slot is free; else by the next recording.
-            let replaced = self.replace_abandoned_locked(&mut state);
-            if let Err(error) = replaced {
-                refused.get_or_insert(error);
-            }
-        }
-        // Loads ordered behind a cancelled signal keep that order.
-        match state.held.back_mut() {
-            Some(held) => held.after.extend(rehome),
-            None => {
-                if let Err(error) = self.core.run_after_commit(&mut rehome) {
-                    refused.get_or_insert(error);
-                }
-            }
-        }
-        let p = &self.core.produced;
-        *p.cancel_reason.lock() = reason;
-        p.cancelled.fetch_add(cancelled as u64, Ordering::Relaxed);
-        p.cancelled_upto.store(upto, Ordering::Release);
-        p.cancelled_event.store(
-            event as *const ProtocolObject<dyn MTLSharedEvent> as *const () as usize,
-            Ordering::Release,
-        );
-        self.core.held_live_update(&state);
-        p.wake.notify();
-        drop(state);
-        if let Some(error) = refused {
-            self.core
-                .failure
-                .record_static("a held recording could not be cancelled; queue failed");
-            return Err(error);
-        }
-        Ok(cancelled)
+        let before = core.produced.cancelled.load(Ordering::Relaxed);
+        core.run_pending(Pending::Canceller)?;
+        Ok(core
+            .produced
+            .cancelled
+            .load(Ordering::Relaxed)
+            .saturating_sub(before) as usize)
     }
 
     /// Swap a fresh recording in for an abandoned current one.
@@ -869,7 +1111,10 @@ impl Commands {
             .and_then(Option::take);
         let core = &self.core;
         let next = self.create_replacement_parking(credit, &mut |ready, seen| {
-            if core.release_produced_locked(state)? == 0 {
+            let cancelled = core.produced.cancelled.load(Ordering::Relaxed);
+            if core.release_produced_locked(state)? == 0
+                && core.produced.cancelled.load(Ordering::Relaxed) == cancelled
+            {
                 ready.wait(seen);
             }
             Ok(())
@@ -890,21 +1135,46 @@ impl Commands {
 
     /// The cut every commit path takes: an ordinary commit, or — while an
     /// input this recording or one held ahead of it reads is not produced —
-    /// a held cut.
+    /// a held cut. A current recording a cancellation abandoned before the
+    /// cut is replaced first; one a cancellation takes during the cut fails
+    /// it with the cancellation's reason.
     pub(super) fn cut_locked<'a>(
         &'a self,
         state: &mut EntryGuard<'a>,
         reset_to: usize,
     ) -> Result<Option<u64>, MetalKernelError> {
-        if state.held.is_empty() && state.gate.is_open() {
-            if !state.gate.is_empty() {
-                state.gate = Gate::default();
-                self.core.held_live_update(state);
+        if state.current_abandoned {
+            self.replace_abandoned_locked(state)?;
+        }
+        while state.held.is_empty() && state.gate.is_open() {
+            // The gate's look, then the flag, as `release_produced_locked`.
+            std::sync::atomic::fence(Ordering::SeqCst);
+            if !self.core.produced.cancel_pending.load(Ordering::SeqCst) {
+                if !state.gate.is_empty() {
+                    state.gate = Gate::default();
+                    self.core.held_live_update(state);
+                }
+                return self.commit_swap_locked(state, reset_to);
             }
-            return self.commit_swap_locked(state, reset_to);
+            self.core.release_produced_locked(state)?;
+            if state.current_abandoned {
+                return Err(self.cut_cancelled(state));
+            }
         }
         self.hold_swap_locked(state, reset_to)?;
+        if state.current_abandoned {
+            return Err(self.cut_cancelled(state));
+        }
         Ok(None)
+    }
+
+    /// A cancellation took the recording being cut: replace it, and fail the
+    /// cut with the cancellation's reason.
+    fn cut_cancelled<'a>(&'a self, state: &mut EntryGuard<'a>) -> MetalKernelError {
+        match self.replace_abandoned_locked(state) {
+            Ok(()) => self.core.produced.cancelled_error(),
+            Err(error) => error,
+        }
     }
 
     /// The buffer the last cut closed: held, or committed.
@@ -933,13 +1203,21 @@ impl Commands {
         }
         while state.held.len() >= HELD_CAP {
             let seen = self.core.produced.wake.snapshot();
+            let cancelled = self.core.produced.cancelled.load(Ordering::Relaxed);
             if self.core.release_produced_locked(state)? > 0 {
+                continue;
+            }
+            if state.current_abandoned {
+                return Err(self.cut_cancelled(state));
+            }
+            if self.core.produced.cancelled.load(Ordering::Relaxed) != cancelled {
                 continue;
             }
             self.core.failure.check()?;
             self.core.refuse_park_in_callback()?;
-            // Parked holding the state lock: a producer wakes this before it
-            // takes the lock, and the release above then runs here.
+            // Parked holding the state lock: a producer or a canceller wakes
+            // this and never waits for the lock, and the release above, a
+            // cancellation first, then runs here.
             self.core.produced.parks.fetch_add(1, Ordering::Relaxed);
             self.core.produced.wake.wait(seen);
         }
@@ -950,14 +1228,33 @@ impl Commands {
             .and_then(Option::take);
         let core = &self.core;
         let next = self.create_replacement_parking(credit, &mut |ready, seen| {
-            // No slot comes back before the held recordings run: submit
-            // what producers released, then wait for a slot.
-            if core.release_produced_locked(state)? == 0 {
+            // No slot comes back before the held recordings run: submit what
+            // producers released, apply what was cancelled, then wait.
+            let cancelled = core.produced.cancelled.load(Ordering::Relaxed);
+            if core.release_produced_locked(state)? == 0
+                && core.produced.cancelled.load(Ordering::Relaxed) == cancelled
+            {
                 core.produced.parks.fetch_add(1, Ordering::Relaxed);
                 ready.wait(seen);
             }
             Ok(())
         })?;
+        if state.current_abandoned {
+            // A cancellation in the park took the recording being cut: the
+            // slot acquired for its successor replaces it.
+            let (entry, custody) = state.parts_mut();
+            match entry.current.replace_recording(next) {
+                Ok(old) => custody.cancelled.push(old),
+                Err(unused) => custody.cancelled.push(unused),
+            }
+            entry.current_abandoned = false;
+            entry.namespace.reset();
+            self.core.compute_count.store(0, Ordering::Release);
+            self.core
+                .replacement_pending
+                .store(false, Ordering::Release);
+            return Err(self.core.produced.cancelled_error());
+        }
         let epoch = self.core.clock.commit_epoch();
         let gate = std::mem::take(&mut state.gate);
         let old = match state.current.replace_recording(next) {
@@ -984,5 +1281,132 @@ impl Commands {
         // the old count: the release below sees the event.
         self.core.release_produced_locked(state)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod scope_tests {
+    use super::*;
+    use objc2_metal::MTLDevice;
+
+    type Event = Retained<ProtocolObject<dyn MTLSharedEvent>>;
+
+    fn new_event() -> Event {
+        let device = super::super::Device::system_default().unwrap();
+        device.as_ref().newSharedEvent().unwrap()
+    }
+
+    fn input(event: &Event, value: u64, seq: u64) -> Input {
+        let mut input = Input::new(event, value).unwrap();
+        input.seq = seq;
+        input
+    }
+
+    /// A gate of `(value, seq)` inputs on `event`, in the order given.
+    fn gate(event: &Event, inputs: &[(u64, u64)]) -> Gate {
+        let mut gate = Gate::default();
+        for &(value, seq) in inputs {
+            assert!(gate.add(input(event, value, seq)).is_ok());
+        }
+        gate
+    }
+
+    fn cancel(event: &Event, produced: u64, upto: u64, gated_through: u64) -> Cancel {
+        Cancel {
+            event: event.clone(),
+            produced,
+            upto,
+            gated_through,
+            reason: "test",
+        }
+    }
+
+    /// A cancellation's scope is fixed when it is asked for: an input gated
+    /// after it is not covered, whenever it is applied, and a repeated input
+    /// keeps the earlier gating.
+    #[test]
+    fn a_cancellation_covers_only_inputs_gated_before_it() {
+        let event = new_event();
+        let all = cancel(&event, 0, u64::MAX, 2);
+        assert!(
+            gate(&event, &[(1, 1)]).covered_by(&all),
+            "an input gated before the request"
+        );
+        assert!(
+            !gate(&event, &[(1, 3)]).covered_by(&all),
+            "an input gated after the request"
+        );
+        assert!(
+            gate(&event, &[(1, 1), (5, 3)]).covered_by(&all),
+            "a second value lost the earlier gating"
+        );
+        assert!(
+            gate(&event, &[(3, 1), (3, 3)]).covered_by(&all),
+            "a repeat lost the earlier gating"
+        );
+    }
+
+    /// Every value a recording gates on one event is its own prerequisite: a
+    /// cancellation through any of them covers the recording, whichever
+    /// order they were gated in and whatever was produced since; one through
+    /// none of them does not.
+    #[test]
+    fn a_cancellation_through_a_value_finds_it_beside_other_values_of_its_event() {
+        eprintln!("SCOPE_BUILD debug_assertions={}", cfg!(debug_assertions));
+        let event = new_event();
+        assert!(
+            gate(&event, &[(1, 1), (5, 2)]).covered_by(&cancel(&event, 0, 1, 2)),
+            "two values: the lower one"
+        );
+        assert!(
+            gate(&event, &[(5, 1), (1, 2)]).covered_by(&cancel(&event, 0, 1, 2)),
+            "descending values: the lower one, gated second"
+        );
+        assert!(
+            gate(&event, &[(1, 1), (3, 2), (5, 3)]).covered_by(&cancel(&event, 2, 3, 3)),
+            "an interior value after partial production"
+        );
+        assert!(
+            !gate(&event, &[(1, 1), (3, 2), (5, 3)]).covered_by(&cancel(&event, 3, 4, 3)),
+            "no value in (produced, upto]"
+        );
+        assert!(
+            !gate(&event, &[(5, 1)]).covered_by(&cancel(&event, 0, 1, 1)),
+            "a later value alone"
+        );
+        assert!(
+            !gate(&event, &[(5, 1), (1, 3)]).covered_by(&cancel(&event, 0, 1, 2)),
+            "the covered value was gated after the request"
+        );
+    }
+
+    /// Readiness is every prerequisite produced; a repeat takes no slot, a
+    /// distinct value does, and a full gate refuses the next one.
+    #[test]
+    fn a_gate_opens_once_every_value_is_produced_and_refuses_past_its_slots() {
+        let event = new_event();
+        let mut three = gate(&event, &[(5, 1), (1, 2), (3, 3)]);
+        event.setSignaledValue(3);
+        assert!(!three.is_open(), "open before its highest value");
+        event.setSignaledValue(5);
+        assert!(three.is_open(), "closed with every value produced");
+        assert_eq!(three.add(input(&event, 3, 4)).ok(), Some(Added::Repeat));
+        assert_eq!(
+            three.add(input(&event, 7, 5)).ok(),
+            Some(Added::BesideItsEvent)
+        );
+        let other = new_event();
+        assert_eq!(three.add(input(&other, 1, 6)).ok(), Some(Added::New));
+
+        let mut full = Gate::default();
+        for value in 1..=GATE_INPUTS as u64 {
+            assert!(full.add(input(&event, 10 + value, value)).is_ok());
+        }
+        assert!(full.is_full());
+        assert_eq!(full.add(input(&event, 11, 99)).ok(), Some(Added::Repeat));
+        assert!(
+            full.add(input(&event, 99, 99)).is_err(),
+            "a full gate took a ninth value"
+        );
     }
 }

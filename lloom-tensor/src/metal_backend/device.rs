@@ -790,7 +790,9 @@ impl MetalDevice {
     ) -> crate::kernels::metal::backing::Allocation {
         // SAFETY: asks only whether a native set exists; nothing is borrowed.
         if unsafe { self.residency_set.raw() }.is_some() {
-            allocation.buffer = allocation.buffer.with_device_listing();
+            allocation.buffer = allocation
+                .buffer
+                .with_device_listing(crate::kernels::metal::DeviceListing::Pool);
         }
         allocation
     }
@@ -967,8 +969,13 @@ impl MetalDevice {
             }
             _ => String::new(),
         };
+        let cover = if self.commands.in_flight_hold().is_some_and(|h| h.unlists()) {
+            " metal4_cover=held"
+        } else {
+            ""
+        };
         format!(
-            "residency={} {}{metal4}",
+            "residency={} {}{metal4}{cover}",
             self.commands.residency_attachment().short(),
             self.residency_set.layout_line()
         )
@@ -978,6 +985,12 @@ impl MetalDevice {
     /// ([`Commands::metal4_slot_residency`]).
     pub fn metal4_slot_residency(&self) -> Option<crate::kernels::metal::SlotResidency> {
         self.commands.metal4_slot_residency()
+    }
+
+    /// The Metal 4 slot census by listing site
+    /// ([`Commands::metal4_slot_sites`]).
+    pub fn metal4_slot_sites(&self) -> Vec<crate::residency_class::SlotSite> {
+        self.commands.metal4_slot_sites()
     }
 
     /// A handle to the residency set that outlives this device.
@@ -2286,34 +2299,7 @@ impl MetalDevice {
     /// after everything the step encodes.
     pub fn finish_decode_step(&self) -> Result<()> {
         self.end_decode_step();
-        // A step that drifted from the plan is served no further (the arena
-        // deactivated itself at the drift) and the plan is dropped here: the
-        // sequence it describes no longer runs, and the recording is re-armed
-        // over the steps that follow -- none skipped, because the drifted
-        // sequence is the steady state now. Each re-recording is counted, so
-        // a run whose plan moved twice says so beside its coverage.
-        if let Some(arena) = self.arena_slot() {
-            if arena.take_drifted() {
-                let rearm = *self.arena_rerecord.lock();
-                self.clear_arena();
-                if let Some((layout, record_steps)) = rearm {
-                    // The drifted step is the record's step 0 (the count
-                    // below advances it), so `skip: 1` records from the next
-                    // step on -- nothing but the step that drifted is skipped.
-                    {
-                        let mut g = self.arena_auto.lock();
-                        *g = Some(ArenaAutoRecord {
-                            layout,
-                            skip: 1,
-                            record_steps,
-                            step: 0,
-                        });
-                    }
-                    self.arena_rerecordings
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                }
-            }
-        }
+        self.rearm_if_drifted();
         // `parking_lot` guards are infallible; an IIFE returning `Option` keeps
         // the `?` early-return the `and_then` closure used.
         let due = (|| {
@@ -2348,6 +2334,59 @@ impl MetalDevice {
             }
         }
         Ok(())
+    }
+
+    /// Abandon a decode step whose forward failed or unwound: the arena's
+    /// step is closed and a drift handled as at the finish, but the step is
+    /// no recorded step. A recording armed over it is dropped and armed
+    /// again, so no arena is installed from a step that stopped part-way.
+    pub fn abort_decode_step(&self) {
+        self.end_decode_step();
+        self.rearm_if_drifted();
+        let restart = {
+            let mut g = self.arena_auto.lock();
+            match g.as_mut() {
+                Some(auto) if auto.step >= auto.skip => {
+                    auto.step = 0;
+                    true
+                }
+                _ => false,
+            }
+        };
+        if restart {
+            drop(self.discard_arena_recording());
+        }
+    }
+
+    /// A step that drifted from the plan is served no further (the arena
+    /// deactivated itself at the drift) and the plan is dropped: the
+    /// sequence it describes no longer runs, and the recording is re-armed
+    /// over the steps that follow -- none skipped, because the drifted
+    /// sequence is the steady state now. Each re-recording is counted, so a
+    /// run whose plan moved twice says so beside its coverage.
+    fn rearm_if_drifted(&self) {
+        if let Some(arena) = self.arena_slot() {
+            if arena.take_drifted() {
+                let rearm = *self.arena_rerecord.lock();
+                self.clear_arena();
+                if let Some((layout, record_steps)) = rearm {
+                    // The drifted step is the record's step 0 (a finish's
+                    // count advances it), so `skip: 1` records from the next
+                    // step on -- nothing but the step that drifted is skipped.
+                    {
+                        let mut g = self.arena_auto.lock();
+                        *g = Some(ArenaAutoRecord {
+                            layout,
+                            skip: 1,
+                            record_steps,
+                            step: 0,
+                        });
+                    }
+                    self.arena_rerecordings
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+        }
     }
 
     /// Mark the end of a decode step. Allocations outside a step take the pool
@@ -2839,6 +2878,77 @@ impl MetalDevice {
         drop(g);
         drop(discarded);
         Ok(())
+    }
+
+    /// Abandon the pass `begin_pass` opened, after its body failed or
+    /// unwound. Nothing the pass recorded or observed is published: it
+    /// leaves no key pending, builds no plan, and the pending key it was
+    /// observing records again on its next sight. A served pass keeps its
+    /// cached plan. The base is not replaced, so work already encoded keeps
+    /// what it binds until it retires, and an arena the abort drops is
+    /// dropped outside the planner lock. A no-op when no pass is open; with
+    /// the cache off, the decode step's abort (`abort_decode_step`).
+    pub fn abort_pass(&self) -> Result<()> {
+        if let Some(scope) = super::allocation_scope::active(self)? {
+            return scope.view.abort_pass_in();
+        }
+        self.abort_pass_in()
+    }
+
+    fn abort_pass_in(&self) -> Result<()> {
+        self.next_pass_variant
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        let mut g = self.pass_plans.lock();
+        let Some(pp) = g.as_mut() else {
+            drop(g);
+            self.abort_decode_step();
+            return Ok(());
+        };
+        if pp.state.closing.is_some() {
+            return Err(crate::Error::wrap(PlannerInvalidated(
+                "abort while a finish is closing",
+            )));
+        }
+        let Some(state) = pp.state.current.take() else {
+            return Ok(());
+        };
+        self.pass_state
+            .fetch_and(!0b1110, std::sync::atomic::Ordering::Relaxed);
+        pp.counters.aborted += 1;
+        let mut discarded = None;
+        let recorded = match state {
+            PassState::Served(key) => {
+                self.end_decode_step();
+                if let Some(arena) = self.arena_slot() {
+                    if arena.take_drifted() {
+                        pp.plans.remove(&key);
+                        discarded = pp.arenas.remove(&key);
+                        pp.counters.evicted += 1;
+                    }
+                }
+                self.clear_arena_keep_base();
+                false
+            }
+            PassState::Recording { .. } | PassState::Observing { .. } => {
+                pp.state.pending = None;
+                true
+            }
+        };
+        drop(g);
+        drop(discarded);
+        if recorded {
+            drop(self.discard_arena_recording());
+        }
+        Ok(())
+    }
+
+    /// Stop observing and keep nothing of what was seen: the recorder is
+    /// returned for the caller to drop outside its locks.
+    fn discard_arena_recording(&self) -> Option<Arc<Mutex<ArenaRecorder>>> {
+        let mut g = self.arena_recorder.lock();
+        let rec = g.take()?;
+        crate::kernels::metal::arena::clear_bind_observer_if(&rec);
+        Some(rec)
     }
 
     fn check_closing_scope(&self) -> Result<()> {

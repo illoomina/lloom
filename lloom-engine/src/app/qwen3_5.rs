@@ -823,7 +823,7 @@ where
         )
     }
     fn capabilities(&self) -> super::family::Capabilities {
-        super::family::QWEN3_5_CAPABILITIES
+        super::family::qwen3_5_capabilities(lloom::tuning::tuning().ring.qwen3_5_eos_gate)
     }
     fn load_warnings(&self) -> Vec<LoadWarning> {
         let mut w = self.load_warnings.clone();

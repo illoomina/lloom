@@ -1773,6 +1773,50 @@ pub fn set_prefill_tiles(tiles: usize) {
 
 pub const DEFAULT_PREFILL_TILES: usize = 2;
 
+static PREFILL_PAIR_FORWARD: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(u8::MAX);
+
+/// Whether a driver tile of one chunk is widened to [`prefill_tiles`] chunks
+/// a forward (`prefill.pair_forward`, read once; [`set_prefill_pair_forward`]
+/// for tests). `forward_embeds` pairs chunks only within one forward, and the
+/// served driver hands it one tile a forward (`docs/expert-streaming.md`
+/// §20.5).
+pub fn prefill_pair_forward() -> bool {
+    let v = PREFILL_PAIR_FORWARD.load(std::sync::atomic::Ordering::Relaxed);
+    if v != u8::MAX {
+        return v != 0;
+    }
+    let on = crate::tuning::tuning().qwen4exp.prefill_pair_forward;
+    PREFILL_PAIR_FORWARD.store(on as u8, std::sync::atomic::Ordering::Relaxed);
+    on
+}
+
+pub fn set_prefill_pair_forward(on: bool) {
+    PREFILL_PAIR_FORWARD.store(on as u8, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The prefill tile a driver hands one forward, for a configured `tile`:
+/// [`prefill_tiles`] chunks when [`prefill_pair_forward`] and the paired
+/// prefill are on and `tile` is exactly one chunk, so the forward pairs its
+/// chunks; `tile` otherwise. A tile between one chunk and two already pairs
+/// inside its forward, a tile below one chunk is the caller's bound on the
+/// prefill's working set, and `0` (the whole prompt) pairs already.
+pub fn forward_tile(tile: usize) -> usize {
+    if tile != 0 && tile == prefill_chunk() && prefill_pair_forward() && prefill_pair_on() {
+        tile * prefill_tiles()
+    } else {
+        tile
+    }
+}
+
+static PIPELINED_PASSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Pipelined prefill passes (`prefill_embeds_pipelined`) this process has
+/// run: the paired prefill's reach, read by tests and reports.
+pub fn pipelined_passes() -> u64 {
+    PIPELINED_PASSES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 static DECODE_HINTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// `QWEN4EXP_DECODE_HINT=1` (read once; off by default): at decode under
@@ -2326,26 +2370,35 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
     /// Open a planned pass for `shape` (`DESIGN.md` §9.2aa: the pass's
     /// activations served by ordinal from one base, no allocation on a
     /// cached key) — when the device has pass plans enabled and no driver
-    /// holds a pass already. Returns whether this call opened it. The pass
-    /// is keyed as the model's own: it opens after the embedding a driver's
-    /// pass of the same shape holds, so the two are different sequences.
-    /// It opens the allocation sequence `variant` of `shape`
-    /// ([`Self::decode_variant`]); variant 0 is the shape's plain sequence.
-    fn open_pass_variant(&self, shape: crate::nn::decode::PassShape, variant: u32) -> Result<bool> {
+    /// holds a pass already. Returns the pass when this call opened it, for
+    /// [`Self::close_pass`]; dropped instead, after the body failed, it
+    /// aborts the pass (`pass-plan-design.md` §24). The pass is keyed as the
+    /// model's own: it opens after the embedding a driver's pass of the same
+    /// shape holds, so the two are different sequences. It opens the
+    /// allocation sequence `variant` of `shape` ([`Self::decode_variant`]);
+    /// variant 0 is the shape's plain sequence.
+    fn open_pass_variant(
+        &self,
+        shape: crate::nn::decode::PassShape,
+        variant: u32,
+    ) -> Result<Option<crate::nn::decode::OpenPass<lloom_tensor::Device>>> {
         #[cfg(feature = "metal")]
-        if let Ok(m) = self.device().as_metal_device() {
-            let m = m.execution_device()?;
-            if !m.pass_plans_enabled() || m.pass_open() {
-                return Ok(false);
+        {
+            let device = self.device();
+            if let Ok(m) = device.as_metal_device() {
+                let m = m.execution_device()?;
+                if !m.pass_plans_enabled() || m.pass_open() {
+                    return Ok(None);
+                }
+                let Some(key) = Self::pass_key(shape, PassOpener::Model) else {
+                    return Ok(None);
+                };
+                m.begin_pass(key.with_variant(variant))?;
+                return Ok(Some(crate::nn::decode::OpenPass::adopt(device)));
             }
-            let Some(key) = Self::pass_key(shape, PassOpener::Model) else {
-                return Ok(false);
-            };
-            m.begin_pass(key.with_variant(variant))?;
-            return Ok(true);
         }
         let _ = (shape, variant);
-        Ok(false)
+        Ok(None)
     }
 
     /// Which of this model's decode sequences a step at `pos` runs, as its
@@ -2450,11 +2503,14 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
         Some(PassKey::new(kind).opened_by(opener))
     }
 
-    fn close_pass(&self, opened: bool) -> Result<()> {
-        if opened {
-            crate::nn::decode::end_pass(&self.device())?;
+    fn close_pass(
+        &self,
+        opened: Option<crate::nn::decode::OpenPass<lloom_tensor::Device>>,
+    ) -> Result<()> {
+        match opened {
+            Some(pass) => pass.finish(),
+            None => Ok(()),
         }
-        Ok(())
     }
 
     /// Decode hints handed to the prefetchers so far (the process).
@@ -2850,6 +2906,17 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
         }
         if let Some(m) = &mut self.mtp {
             m.layer_mut().moe_mut().set_f16_fuse(on);
+        }
+    }
+
+    /// Select whether every layer's routed SwiGLU rides the gate|up launch's
+    /// store (`MoeLayer::set_routed_glu`; `qwen4exp.routed_glu` by default).
+    pub fn set_routed_glu(&mut self, on: bool) {
+        for l in &mut self.layers {
+            l.moe.set_routed_glu(on);
+        }
+        if let Some(m) = &mut self.mtp {
+            m.layer_mut().moe_mut().set_routed_glu(on);
         }
     }
 
@@ -3771,6 +3838,7 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
         if n_tiles == 0 {
             lloom_tensor::bail!("prefill_embeds_pipelined: no tiles")
         }
+        PIPELINED_PASSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let n = self.cfg.hc_count;
         let d = self.cfg.hidden_size;
         let mut seqs = Vec::with_capacity(n_tiles);

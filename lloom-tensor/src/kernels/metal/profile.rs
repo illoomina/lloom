@@ -640,6 +640,61 @@ pub fn reset() {
     recording::reset();
 }
 
+/// Whether every commit is attributed to the stack that made it
+/// (`diagnostics.trace.cut_sites`, under the profiler), read once.
+pub fn cut_sites_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        crate::tuning::effective_instrument(
+            "cut_sites",
+            crate::tuning::tuning().instrument.cut_sites,
+        ) && enabled()
+    })
+}
+
+/// Count the commit the calling thread is registering under its stack.
+/// Called once per command-buffer commit, on the committing thread, where
+/// the GPU-time handler is built.
+#[inline]
+pub(crate) fn note_commit_site() {
+    if !cut_sites_enabled() {
+        return;
+    }
+    #[cfg(any(debug_assertions, feature = "profile"))]
+    recording::note_commit_site();
+}
+
+/// Commits that share one stack: the committing thread, the stack's
+/// `lloom*` frames innermost first, and the count.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CutSite {
+    pub thread: String,
+    pub frames: Vec<String>,
+    pub commits: u64,
+}
+
+/// What [`note_commit_site`] counted since the process began (or the last
+/// [`reset_cut_sites`]), most commits first; empty when the instrument is off
+/// or not compiled. Not cleared by [`reset`]: the batched scheduler opens a
+/// profile window per burst of requests, and a caller differencing two reads
+/// around a request must not see the count go backwards.
+pub fn cut_sites() -> Vec<CutSite> {
+    #[cfg(any(debug_assertions, feature = "profile"))]
+    {
+        recording::cut_sites()
+    }
+    #[cfg(not(any(debug_assertions, feature = "profile")))]
+    {
+        Vec::new()
+    }
+}
+
+/// Clear what [`cut_sites`] has counted.
+pub fn reset_cut_sites() {
+    #[cfg(any(debug_assertions, feature = "profile"))]
+    recording::reset_cut_sites();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -151,6 +151,35 @@ pub fn quantized_store() -> &'static str {
         s
     })
 }
+/// The routed gate|up pair with the SwiGLU on its store
+/// (`metal_src/quantized_glu.metal`): the union prologue, `utils.metal` (for
+/// `silu_times`, `silu_mul`'s element), the quantized source, the GLU kernel,
+/// and one instantiation per routed kind and store width, generated from the
+/// kinds table — `kernel_mul_mv_id2_<stem>_<triple>_glu`. Its own translation
+/// unit, compiled only when a dispatch asks for it, so the default and merged
+/// libraries are untouched.
+pub fn quantized_glu() -> &'static str {
+    static TEXT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    TEXT.get_or_init(|| {
+        use std::fmt::Write as _;
+        let mut s = String::with_capacity(QUANTIZED.len() + 16384);
+        s.push_str("#include <metal_stdlib>\n#include <metal_simdgroup>\nusing namespace metal;\n");
+        s.push_str(include_str!("metal_src/utils.metal"));
+        s.push('\n');
+        s.push_str(QUANTIZED);
+        s.push('\n');
+        s.push_str(include_str!("metal_src/quantized_glu.metal"));
+        s.push('\n');
+        for (name, store, core) in super::kernels::quantized::mv_id2_glu_instantiations() {
+            let _ = writeln!(
+                s,
+                "template [[host_name(\"{name}\")]] kernel \
+                 decltype(kernel_mul_mv_id2_glu<{store}, {core}>) kernel_mul_mv_id2_glu<{store}, {core}>;"
+            );
+        }
+        s
+    })
+}
 pub const RANDOM: &str = concat!(
     include_str!("metal_src/random.metal"),
     "\n",
@@ -370,6 +399,9 @@ pub enum Source {
     /// The quantized matvec with a block on its store ([`quantized_store`]):
     /// its own translation unit, compiled on the first dispatch that asks.
     QuantizedStore,
+    /// The routed gate|up pair with the SwiGLU on its store ([`quantized_glu`]):
+    /// its own translation unit, compiled on the first dispatch that asks.
+    QuantizedGlu,
     /// The Qwen4-exp block kernels (`lloom::models::qwen4exp::kernels`).
     Qwen4Exp,
     Random,

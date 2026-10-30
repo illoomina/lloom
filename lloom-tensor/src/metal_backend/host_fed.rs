@@ -83,6 +83,19 @@ impl HostEvent {
             .commit_when_produced(&self.event, v)
             .map_err(|e| crate::Error::Msg(format!("HostEvent: {e}")))
     }
+
+    /// The values above the one raised now and up to `upto` will never be
+    /// produced: the work held for them is cancelled, and none of it runs
+    /// (`Commands::cancel_produced_through`). Never waits. The caller may
+    /// raise the event once this returns; the raise cannot release what the
+    /// cancellation covers. On the GPU-wait arm nothing is held, and only the
+    /// raise lets the encoded waits through.
+    pub fn cancel_through(&self, upto: u64, reason: &'static str) -> Result<usize> {
+        self.device
+            .commands()
+            .cancel_produced_through(&self.event, upto, reason)
+            .map_err(|e| crate::Error::Msg(format!("HostEvent cancel: {e}")))
+    }
 }
 
 impl std::fmt::Debug for HostEvent {
@@ -215,8 +228,9 @@ impl HostFedRing {
         let v = base.saturating_add(RELEASE_SPAN);
         self.released_upto
             .fetch_max(v, std::sync::atomic::Ordering::AcqRel);
-        if let Err(e) = self.device.commands().cancel_produced(
+        if let Err(e) = self.device.commands().cancel_produced_through(
             &self.event,
+            v,
             "host feed: the run was released; the work held for its fill was cancelled",
         ) {
             eprintln!("[host-fed] cancelling the released run's held work: {e}");

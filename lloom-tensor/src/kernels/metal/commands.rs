@@ -450,9 +450,13 @@ struct ClosedEncoders<'a> {
     cancelled: Vec<CommandBuffer>,
     // This acquisition published residency for a commit already.
     residency_published: bool,
-    // Last: closed wrappers can hand their fields to this same hold before
-    // its existing completed-prefix drain runs. No release occurs under state.
+    // After the closed wrappers: they can hand their fields to this same hold
+    // before its existing completed-prefix drain runs. No release occurs
+    // under state.
     completed_hold: Option<CompletedRelease<'a, Held>>,
+    // Last: the release a producer left to this holder, once every payload
+    // above is gone (`produced::AfterUnlock`).
+    _after_unlock: Option<produced::AfterUnlock<'a>>,
 }
 
 type EntryGuard<'a> = DeferredGuard<parking_lot::MutexGuard<'a, EntryState>, ClosedEncoders<'a>>;
@@ -999,6 +1003,7 @@ impl Commands {
             if declare.on_queue() || declare.per_command_buffer() {
                 queue.use_device_sets(Arc::clone(&residency_set));
             }
+            queue.census_sets(Arc::clone(&residency_set));
             Some(queue)
         } else {
             None
@@ -1079,8 +1084,12 @@ impl Commands {
 
         let pipelined_compute_per_buffer =
             crate::tuning::tuning().metal.pipelined_compute_per_buffer;
-        let hold = (kind == CommandBufferKind::Unretained)
-            .then(|| Arc::new(InFlightHold::new(Arc::clone(&clock))));
+        // A Metal 4 queue whose slot sets leave unpooled buffers to the
+        // device's sets keeps them listed through the hold (§15.1r).
+        let unlists =
+            modern_queue.is_some() && super::Metal4Cover::selected() == super::Metal4Cover::Held;
+        let hold = (kind == CommandBufferKind::Unretained || unlists)
+            .then(|| Arc::new(InFlightHold::with_unlisting(Arc::clone(&clock), unlists)));
         let failure: Arc<CommandBufferFailure> = Arc::default();
         let hook = Arc::new(super::completion_hook::CompletionHook::new(
             Arc::clone(&clock),
@@ -1315,6 +1324,16 @@ impl Commands {
     /// instrument off.
     pub fn metal4_slot_residency(&self) -> Option<super::SlotResidency> {
         self.core.modern_queue.as_ref()?.slot_residency()
+    }
+
+    /// The Metal 4 slot census by listing site
+    /// (`kernels.residency.slot_trace`); empty on Metal 3 or with the
+    /// instrument off.
+    pub fn metal4_slot_sites(&self) -> Vec<crate::residency_class::SlotSite> {
+        self.core
+            .modern_queue
+            .as_ref()
+            .map_or_else(Vec::new, |q| q.slot_sites())
     }
 
     /// What this queue's Metal 4 command buffers declare resident
@@ -1603,7 +1622,7 @@ impl Commands {
                 ))?;
             *executor = Some(self.executor());
             let executor = executor.as_ref().expect("executor staged above");
-            if self.core.hold.is_some() && !executor.is_classical() {
+            if self.core.kind == CommandBufferKind::Unretained && !executor.is_classical() {
                 // An executor's indirect command buffers and the buffers
                 // their ranges keep resident are its own, replaced as it
                 // records; nothing holds them for a command buffer that does
@@ -2532,30 +2551,42 @@ impl Commands {
         cb: &CommandBuffer,
     ) -> Result<Option<Option<u64>>, MetalKernelError> {
         let mut state = self.lock_state()?;
-        if !state.held.is_empty() || !state.gate.is_empty() {
-            self.core.release_produced_locked(&mut state)?;
-        }
-        if state.held.iter().any(|held| held.cb.same_recording(cb)) {
-            return Ok(None);
-        }
-        if state
-            .current
-            .recording()
-            .is_some_and(|current| current.same_recording(cb))
-        {
-            if !(state.held.is_empty() && state.gate.is_open()) {
+        loop {
+            if !state.held.is_empty()
+                || !state.gate.is_empty()
+                || self.core.produced_cancel_pending()
+            {
+                self.core.release_produced_locked(&mut state)?;
+            }
+            if state.held.iter().any(|held| held.cb.same_recording(cb)) {
                 return Ok(None);
             }
-            if !state.gate.is_empty() {
-                state.gate = produced::Gate::default();
-                self.core.held_live_update(&state);
+            if !state.current_abandoned
+                && state
+                    .current
+                    .recording()
+                    .is_some_and(|current| current.same_recording(cb))
+            {
+                if !(state.held.is_empty() && state.gate.is_open()) {
+                    return Ok(None);
+                }
+                // The gate's look, then the flag: a cancellation asked for
+                // before the event moved is applied before this commit.
+                std::sync::atomic::fence(Ordering::SeqCst);
+                if self.core.produced_cancel_pending() {
+                    continue;
+                }
+                if !state.gate.is_empty() {
+                    state.gate = produced::Gate::default();
+                    self.core.held_live_update(&state);
+                }
+                return self
+                    .core
+                    .commit_current_locked(&mut state, None)
+                    .map(|receipt| Some(receipt.signalled));
             }
-            return self
-                .core
-                .commit_current_locked(&mut state, None)
-                .map(|receipt| Some(receipt.signalled));
+            return self.recover_unheld_locked(&mut state, cb).map(Some);
         }
-        self.recover_unheld_locked(&mut state, cb).map(Some)
     }
 
     fn recover_unheld_locked(
@@ -2695,6 +2726,20 @@ impl CommandsCore {
     fn lock_entry(&self) -> Result<EntryGuard<'_>, MetalKernelError> {
         self.state
             .lock_checked(Side::Host, || self.refuse_park_in_callback())
+            .map(|guard| {
+                let custody = ClosedEncoders {
+                    _after_unlock: Some(produced::AfterUnlock(self)),
+                    ..ClosedEncoders::default()
+                };
+                DeferredGuard::new(guard, custody)
+            })
+    }
+
+    /// The state lock when it is free, for a producer's release: its caller
+    /// runs what producers left pending itself (`produced::release_pending`).
+    fn try_lock_entry_unhooked(&self) -> Option<EntryGuard<'_>> {
+        self.state
+            .try_lock()
             .map(|guard| DeferredGuard::new(guard, ClosedEncoders::default()))
     }
 

@@ -1811,6 +1811,178 @@ pub unsafe fn call_quantized_matmul_mv_id2_t(
     Ok(())
 }
 
+/// The GLU pair's instantiations ([`super::super::source::quantized_glu`]):
+/// `(name, store, core)` for every routed kind at the triples the one-launch
+/// pair takes and the GLU serves — `_f32` for every kind, `_f16_f16` for the
+/// genericized quantized cores — each the core `kernel_mul_mv_id2_<stem>_<triple>`
+/// wraps.
+pub fn mv_id2_glu_instantiations() -> Vec<(String, &'static str, String)> {
+    let mut out = Vec::new();
+    for dtype in GgmlDType::ALL {
+        let k = dtype.kind();
+        match k.mul_mv {
+            MulMv::Quant(_) => {
+                out.push((
+                    glu_name(k.stem, GemvTriple::F32F32F32),
+                    "float",
+                    format!("mmv_fn<kernel_mul_mv_{}_f32_impl>", k.stem),
+                ));
+                out.push((
+                    glu_name(k.stem, GemvTriple::F16F32F16),
+                    "half",
+                    format!("mmv_fn_h<half, kernel_mul_mv_{}_impl<half, half>>", k.stem),
+                ));
+            }
+            MulMv::Dense(_) => {
+                let w = match dtype {
+                    GgmlDType::F32 => "float, float4",
+                    GgmlDType::F16 => "half, half4",
+                    _ => continue,
+                };
+                out.push((
+                    glu_name(k.stem, GemvTriple::F32F32F32),
+                    "float",
+                    format!("mmv_fn<kernel_mul_mv_impl<{w}, float, float4>>"),
+                ));
+            }
+            MulMv::None => {}
+        }
+    }
+    out
+}
+
+fn glu_name(stem: &str, triple: GemvTriple) -> String {
+    format!("kernel_mul_mv_id2_{stem}_{}_glu", triple.name_suffix())
+}
+
+/// Whether [`call_quantized_matmul_mv_id2_glu_t`] serves a routed pair of
+/// `dtype` weights over `batch` rows under `triple`: exactly where the pair
+/// would be the plain one-launch `kernel_mul_mv_id2_<stem>_<triple>` (not
+/// the row axis's `_r<N>` nor the union's `_r1`, which group a slot's
+/// planes differently) at a triple the GLU is instantiated at (`_f32`,
+/// and `_f16_f16` on a genericized quantized core; never the fold).
+pub fn mv_id2_glu_applies(dtype: GgmlDType, triple: GemvTriple, batch: usize) -> bool {
+    let k = dtype.kind();
+    let instantiated = match triple {
+        GemvTriple::F32F32F32 => {
+            matches!(k.mul_mv, MulMv::Quant(_)) || matches!(dtype, GgmlDType::F32 | GgmlDType::F16)
+        }
+        GemvTriple::F16F32F16 => matches!(k.mul_mv, MulMv::Quant(_)),
+        _ => false,
+    };
+    instantiated
+        && mv_rows_capacity(dtype, batch, true) <= 1
+        && !((2..=MV_ID_UNION_MAX_ROWS).contains(&batch) && id_union_on())
+}
+
+/// [`call_quantized_matmul_mv_id2_t`] with the SwiGLU on its store
+/// (`kernel_mul_mv_id2_<stem>_<triple>_glu`, `Source::QuantizedGlu`): `dst`
+/// is `[2, batch, topk, n]` in the triple's store leg; after the launch
+/// `dst[0]` holds `silu(g) · u` — `silu_mul`'s element over the gate and up
+/// the pair would store — and `dst[1]` holds `u`. One threadgroup per row
+/// tile of each plane runs both halves; the grid is the single launch's.
+/// Refused where [`mv_id2_glu_applies`] is false.
+///
+/// # Safety
+/// Every buffer bound here stays unreused and unwritten by the host until
+/// the command buffer it is encoded into completes, and while an ICB that
+/// captured it can replay ([`crate::kernels::utils::EncoderParam`]).
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn call_quantized_matmul_mv_id2_glu_t(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    dtype: GgmlDType,
+    triple: GemvTriple,
+    (n_experts, n, k): (usize, usize, usize),
+    (batch, topk, in_dim1): (usize, usize, usize),
+    src0a: &Buffer,
+    src0b: &Buffer,
+    src1: &Buffer,
+    src1_offset: usize,
+    ids: &Buffer,
+    ids_offset: usize,
+    dst: &Buffer,
+) -> Result<(), MetalKernelError> {
+    triple.check(device, "routed quantized matmul-vec GLU pair")?;
+    if !mv_id2_glu_applies(dtype, triple, batch) || (in_dim1 != 1 && in_dim1 != topk) {
+        return Err(MetalKernelError::UnsupportedDTypeForOp(Box::new(
+            UnsupportedDTypeForOp {
+                dtype: "no one-launch GLU pair for this kind, triple and row count",
+                op: "routed quantized matmul-vec GLU pair",
+            },
+        )));
+    }
+    let stem = mv_id_stem(dtype)?;
+    let name = glu_name(stem, triple);
+    let (act_size, store_size) = triple_leg_bytes(triple);
+    let row_bytes = ((k / dtype_block_size(dtype)) * dtype_type_size(dtype)) as u64;
+    let (nth0, nth1, align) = mv_threadgroup(dtype);
+    let thread_groups_count = MTLSize {
+        width: divide(n, align),
+        height: 1,
+        depth: batch * topk,
+    };
+    let threads_per_threadgroup = MTLSize {
+        width: nth0,
+        height: nth1,
+        depth: 1,
+    };
+    let pipeline = kernels.load_pipeline_with_constants(
+        device,
+        Source::QuantizedGlu,
+        name.clone(),
+        mv_id_constants(dtype),
+    )?;
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoder = encoder.as_ref();
+    encoder.set_compute_pipeline_state(&pipeline);
+    if needs_iq_shared(dtype) {
+        encoder.set_threadgroup_memory_length(0, 8192);
+    }
+    debug_group!(
+        encoder,
+        "qmm_mv_id2_glu {name} E={n_experts} B={batch} topk={topk} K={k} N={n}"
+    );
+
+    // SAFETY: this function's contract (# Safety above).
+    unsafe {
+        set_params!(
+            encoder,
+            (
+                src0a,
+                src0b,
+                (src1, src1_offset),
+                Output::new(dst),
+                (ids, ids_offset),
+                topk as i64,
+                batch as i64,
+                (topk * core::mem::size_of::<u32>()) as u64,
+                k as i64,
+                n as i64,
+                n_experts as i64,
+                dtype_type_size(dtype) as u64,
+                row_bytes,
+                n as u64 * row_bytes,
+                k as i64,
+                in_dim1 as i64,
+                batch as i64,
+                1i64,
+                act_size,
+                k as u64 * act_size,
+                (in_dim1 * k) as u64 * act_size,
+                n as i64,
+                topk as i64,
+                n as u64 * store_size,
+                align as i64
+            )
+        );
+    }
+
+    encoder.dispatch_thread_groups(thread_groups_count, threads_per_threadgroup);
+    Ok(())
+}
+
 #[cfg(test)]
 mod kind_tests {
     /// The table is indexed by the enum's discriminant: every row sits at

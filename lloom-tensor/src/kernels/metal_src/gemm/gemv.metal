@@ -1063,7 +1063,7 @@ METAL_FUNC void gemv_body(
 
 // `NR` is the row axis (`GEMVKernel`): `NR` batch items against the one
 // matrix per threadgroup, the classical names its `NR = 1` instance and the
-// `_r<NR>` names its others (`instantiate_gemv_rows_blocks`).
+// `_r<NR>` names its others (`instantiate_gemv_rows_bm4`, `_bm8`).
 template <
     typename T,
     const int BM, const int BN,
@@ -1074,6 +1074,60 @@ template <
     const int NR = 1>
 [[kernel, max_total_threads_per_threadgroup(BM * BN * 32)]]
 void gemv(
+    const device T* mat [[buffer(0)]],
+    const device T* in_vec [[buffer(1)]],
+    const device T* bias [[buffer(2)]],
+    device T* out_vec [[buffer(3)]],
+    const constant int& in_vec_size [[buffer(4)]],
+    const constant int& out_vec_size [[buffer(5)]],
+    const constant int& matrix_ld [[buffer(6)]],
+    const constant float& alpha [[buffer(7)]],
+    const constant float& beta [[buffer(8)]],
+    const constant int& batch_ndim [[buffer(9)]],
+    const constant int* batch_shape [[buffer(10)]],
+    const constant int64_t* vector_batch_stride [[buffer(11)]],
+    const constant int64_t* matrix_batch_stride [[buffer(12)]],
+    const constant int64_t* bias_batch_stride [[buffer(13)]],
+    const constant int& bias_stride [[buffer(14)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint3 lid [[thread_position_in_threadgroup]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]],
+    EOS_GATE_ARG) {
+    EOS_GATE_CHECK
+  using kernel_t = GEMVKernel<T, BM, BN, SM, SN, TM, TN, kDoAxpby>;
+  using prologue_t = PrologueNone<T, typename kernel_t::acc_type>;
+  using epilogue_t = EpilogueNone<T, typename kernel_t::acc_type>;
+  gemv_tgp_memory(kernel_t);
+  const prologue_t prologue(nullptr, nullptr);
+  gemv_body<T, BM, BN, SM, SN, TM, TN, kDoNCBatch, kDoAxpby, prologue_t,
+                 epilogue_t, NR>(
+      mat, in_vec, bias, out_vec,
+      in_vec_size, out_vec_size, matrix_ld, alpha, beta,
+      batch_ndim, batch_shape, vector_batch_stride, matrix_batch_stride,
+      bias_batch_stride, bias_stride,
+      kernel_t::tgp_mem_size == 0 ? nullptr : tgp_memory,
+      prologue, epilogue_t(),
+      tid, lid, simd_gid, simd_lid);
+}
+
+// `gemv` without `max_total_threads_per_threadgroup`: the row axis's entry
+// wherever the bound costs (`instantiate_gemv_rows_bm4`, `_bm8`). Bounded by its
+// threadgroup's own 128 or 256 threads, the compiler spends registers past
+// what residency affords at some row counts (5, 7 and 9 rows, and from 11 on
+// the bm8 tile); unbounded, it holds them to the residency its rows need.
+// The same body, so the same bits (`gemv_rows_keep_the_one_row_bits_at_every_capacity`).
+// `docs/tuning.md` §13.5zb.
+template <
+    typename T,
+    const int BM, const int BN,
+    const int SM, const int SN,
+    const int TM, const int TN,
+    const bool kDoNCBatch,
+    const bool kDoAxpby,
+    const int NR>
+[[kernel]]
+void gemv_rows(
     const device T* mat [[buffer(0)]],
     const device T* in_vec [[buffer(1)]],
     const device T* bias [[buffer(2)]],
@@ -2580,32 +2634,51 @@ instantiate_gemv_blocks(bfloat16, bfloat)
 // after the classical name, at the two decode tiles (the only ones whose
 // simdgroup walks all of K), `nc0_axpby0`, split params, half only — the
 // dense f16 matmul is its one caller (`call_mlx_gemv_rows`). Every count
-// from 2 to 16, so a window of `m` rows is one group of exactly `m`.
-#define instantiate_gemv_rows_helper(nm, itype, bm, nr)                        \
+// from 2 to 16, so a window of `m` rows is one group of exactly `m`. The
+// entry is `gemv_rows` (no threads-per-threadgroup bound) but on the bm4
+// tile from 11 rows, where `gemv`'s bound is the faster compile (§13.5zb).
+#define instantiate_gemv_rows_helper(entry, nm, itype, bm, nr)                 \
   template [[host_name("gemv_" #nm "_bm" #bm                                   \
       "_bn1_sm1_sn32_tm4_tn4_nc0_axpby0_r" #nr)]]                              \
-  [[kernel]] decltype(gemv<itype, bm, 1, 1, 32, 4, 4, false, false, nr>)       \
-             gemv<itype, bm, 1, 1, 32, 4, 4, false, false, nr>;
+  [[kernel]] decltype(entry<itype, bm, 1, 1, 32, 4, 4, false, false, nr>)      \
+             entry<itype, bm, 1, 1, 32, 4, 4, false, false, nr>;
 
-#define instantiate_gemv_rows_tile(nm, itype, bm)  \
-  instantiate_gemv_rows_helper(nm, itype, bm, 2)   \
-  instantiate_gemv_rows_helper(nm, itype, bm, 3)   \
-  instantiate_gemv_rows_helper(nm, itype, bm, 4)   \
-  instantiate_gemv_rows_helper(nm, itype, bm, 5)   \
-  instantiate_gemv_rows_helper(nm, itype, bm, 6)   \
-  instantiate_gemv_rows_helper(nm, itype, bm, 7)   \
-  instantiate_gemv_rows_helper(nm, itype, bm, 8)   \
-  instantiate_gemv_rows_helper(nm, itype, bm, 9)   \
-  instantiate_gemv_rows_helper(nm, itype, bm, 10)  \
-  instantiate_gemv_rows_helper(nm, itype, bm, 11)  \
-  instantiate_gemv_rows_helper(nm, itype, bm, 12)  \
-  instantiate_gemv_rows_helper(nm, itype, bm, 13)  \
-  instantiate_gemv_rows_helper(nm, itype, bm, 14)  \
-  instantiate_gemv_rows_helper(nm, itype, bm, 15)  \
-  instantiate_gemv_rows_helper(nm, itype, bm, 16)
+#define instantiate_gemv_rows_bm4(nm, itype)                  \
+  instantiate_gemv_rows_helper(gemv_rows, nm, itype, 4, 2)    \
+  instantiate_gemv_rows_helper(gemv_rows, nm, itype, 4, 3)    \
+  instantiate_gemv_rows_helper(gemv_rows, nm, itype, 4, 4)    \
+  instantiate_gemv_rows_helper(gemv_rows, nm, itype, 4, 5)    \
+  instantiate_gemv_rows_helper(gemv_rows, nm, itype, 4, 6)    \
+  instantiate_gemv_rows_helper(gemv_rows, nm, itype, 4, 7)    \
+  instantiate_gemv_rows_helper(gemv_rows, nm, itype, 4, 8)    \
+  instantiate_gemv_rows_helper(gemv_rows, nm, itype, 4, 9)    \
+  instantiate_gemv_rows_helper(gemv_rows, nm, itype, 4, 10)   \
+  instantiate_gemv_rows_helper(gemv, nm, itype, 4, 11)        \
+  instantiate_gemv_rows_helper(gemv, nm, itype, 4, 12)        \
+  instantiate_gemv_rows_helper(gemv, nm, itype, 4, 13)        \
+  instantiate_gemv_rows_helper(gemv, nm, itype, 4, 14)        \
+  instantiate_gemv_rows_helper(gemv, nm, itype, 4, 15)        \
+  instantiate_gemv_rows_helper(gemv, nm, itype, 4, 16)
 
-instantiate_gemv_rows_tile(float16, half, 4)
-instantiate_gemv_rows_tile(float16, half, 8)
+#define instantiate_gemv_rows_bm8(nm, itype)                  \
+  instantiate_gemv_rows_helper(gemv_rows, nm, itype, 8, 2)    \
+  instantiate_gemv_rows_helper(gemv_rows, nm, itype, 8, 3)    \
+  instantiate_gemv_rows_helper(gemv_rows, nm, itype, 8, 4)    \
+  instantiate_gemv_rows_helper(gemv_rows, nm, itype, 8, 5)    \
+  instantiate_gemv_rows_helper(gemv_rows, nm, itype, 8, 6)    \
+  instantiate_gemv_rows_helper(gemv_rows, nm, itype, 8, 7)    \
+  instantiate_gemv_rows_helper(gemv_rows, nm, itype, 8, 8)    \
+  instantiate_gemv_rows_helper(gemv_rows, nm, itype, 8, 9)    \
+  instantiate_gemv_rows_helper(gemv_rows, nm, itype, 8, 10)   \
+  instantiate_gemv_rows_helper(gemv_rows, nm, itype, 8, 11)   \
+  instantiate_gemv_rows_helper(gemv_rows, nm, itype, 8, 12)   \
+  instantiate_gemv_rows_helper(gemv_rows, nm, itype, 8, 13)   \
+  instantiate_gemv_rows_helper(gemv_rows, nm, itype, 8, 14)   \
+  instantiate_gemv_rows_helper(gemv_rows, nm, itype, 8, 15)   \
+  instantiate_gemv_rows_helper(gemv_rows, nm, itype, 8, 16)
+
+instantiate_gemv_rows_bm4(float16, half)
+instantiate_gemv_rows_bm8(float16, half)
 
 // The two decode-path tiles, per dtype. `bm8` serves w1/w3 (N=10752) and
 // conv.in_proj (N=6144); `bm4` serves q_proj (N=2048) and k/v_proj (N=512).

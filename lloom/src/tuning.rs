@@ -446,6 +446,15 @@ pub struct StreamTuning {
     /// A token's settle submits every layer's loads before waiting for any (off = one layer after another, the A/B arm).
     #[opt(flag = "settle-batch", env = "QWEN4EXP_SETTLE_BATCH", bool, path = "weights.experts.settle_batch", status = "arm", facets = ["cadence"], flows = ["weights-in"])]
     pub settle_batch: bool,
+    /// The command-buffer cut period held while a tier lands the experts it loaded: each plane lands as its own copy dispatch, and at the shipping period (50) a missing pool cuts a buffer every ~17 experts. `0` = the period in force; a larger value is held for the landing (never lowering a longer one in force), and the first encode after it cuts once.
+    #[opt(flag = "landing-cut", env = "QWEN4EXP_LANDING_CUT", path = "weights.experts.landing_cut_period", status = "arm", facets = ["cadence"], flows = ["weights-in", "commands-out"])]
+    pub landing_cut: usize,
+    /// Land a group's staged experts with one copy launch per pool, its sources read through a table of GPU addresses, instead of one copy dispatch per plane (Metal; the same bytes; planes that are not whole words land one a plane).
+    #[opt(flag = "landing-gather", env = "QWEN4EXP_LANDING_GATHER", bool, path = "weights.experts.landing_gather", status = "arm", facets = ["cadence"], flows = ["weights-in", "commands-out"])]
+    pub landing_gather: bool,
+    /// After a tier lands its misses, commit the open command buffer without waiting, unless the loop holds a longer period (decode's): the GPU starts the landing and the work before it while the host reads the next group's experts.
+    #[opt(flag = "landing-commit", env = "QWEN4EXP_LANDING_COMMIT", bool, path = "weights.experts.landing_commit", status = "arm", facets = ["cadence"], flows = ["weights-in", "commands-out"])]
+    pub landing_commit: bool,
     /// Spike 0 of fetch-and-wait: `wait` = a GPU wait on an already-raised event at every device-planned layer's join point (an instrument; off = none).
     #[opt(flag = "spike0", env = "QWEN4EXP_SPIKE0", parser = "parse_spike0", variants = ["off", "wait"], path = "diagnostics.experts.spike0", status = "instrument")]
     pub spike0: String,
@@ -504,6 +513,9 @@ impl Default for StreamTuning {
             hint_recall: false,
             spare_slots: 0,
             settle_batch: true,
+            landing_cut: 0,
+            landing_gather: false,
+            landing_commit: false,
             spike0: "off".into(),
             trace_settle: false,
             fetch: "off".into(),
@@ -575,6 +587,15 @@ pub struct Qwen4ExpTuning {
         status = "arm"
     )]
     pub f16_fold: bool,
+    /// The routed experts' SwiGLU on the gate|up pair's store: one launch computes both halves of a row tile and writes `silu(g) · u` (the pair then `silu_mul`, bit for bit) wherever the pair is one launch and the step would run `silu_mul`; off = the pair and `silu_mul` (the A/B arm). An arm, off by default.
+    #[opt(
+        flag = "qwen-routed-glu",
+        env = "QWEN4EXP_ROUTED_GLU",
+        bool,
+        path = "kernels.fusion.routed_glu",
+        status = "arm"
+    )]
+    pub routed_glu: bool,
     /// The DeltaNet prefill's chunk scan as one launch (off = the per-chunk launches).
     #[opt(
         flag = "chunk-scan",
@@ -607,6 +628,9 @@ pub struct Qwen4ExpTuning {
         env = "QWEN4EXP_PREFILL_TILES",
         parser = "parse_at_least_two", path = "prefill.tiles_in_flight", status = "advanced", facets = ["lead"], flows = ["prompt-in", "commands-out"])]
     pub prefill_tiles: usize,
+    /// The served driver hands this family `prefill.tiles_in_flight` chunks a forward when its tile is the chunk, so the paired prefill runs inside one forward (off = one tile a forward, which never pairs).
+    #[opt(flag = "prefill-pair-forward", env = "QWEN4EXP_PREFILL_PAIR_FORWARD", bool, path = "prefill.pair_forward", status = "arm", facets = ["lead"], flows = ["prompt-in", "weights-in"])]
+    pub prefill_pair_forward: bool,
     /// Speculate the next layer's routing ahead: 0 (off) or 1.
     #[opt(flag = "spec-ahead", env = "QWEN4EXP_SPEC_AHEAD", parser = "parse_spec_ahead", variants = ["0", "1"], path = "weights.experts.route_ahead_layers", status = "arm", facets = ["lead"], flows = ["weights-in"])]
     pub spec_ahead: usize,
@@ -735,12 +759,14 @@ impl Default for Qwen4ExpTuning {
             shared_store: false,
             mtp_experts: "streamed".into(),
             f16_fold: false,
+            routed_glu: false,
             chunk_scan: true,
             delta_reduce: false,
             state_write: "in-place".into(),
             prefill_chunk: 0,
             prefill_pair: crate::models::qwen4exp::DEFAULT_PREFILL_PAIR,
             prefill_tiles: crate::models::qwen4exp::DEFAULT_PREFILL_TILES,
+            prefill_pair_forward: false,
             spec_ahead: 0,
             mem_check: "refuse".into(),
             score_no_matmul: false,
@@ -800,8 +826,14 @@ pub struct RingTuning {
     /// Whether the adaptive commit's loop watches the ring for a stop id itself (#993): off (it stops only when the reader raises the flag, so a late reader lets it run past an EOS without bound) or on (it reads what the GPU published before each step and stops at a stop id, so at most `adaptive_lead + 1` forwards run past an EOS). An arm until it is measured.
     #[opt(flag = "ring-eos-watch", env = "LLOOM_RING_EOS_WATCH", bool, path = "decode.ring.eos_watch", status = "arm", facets = ["lead"], flows = ["token-out", "commands-out"])]
     pub eos_watch: bool,
+    /// The counter cut on the batched loop's decode-only steps: `off` (the period in force, a cut every 50 dispatches), `ahead` (held off while a forward is encoded ahead of the step's readback, as `decode_until`'s step loop holds it) or `all` (held off on the blocking arm too). A step that feeds prompt pieces keeps the period. `off` in the library; `serve` and `bench` default to `all` on LFM2 on Metal (decision 71; PR1120, LFM2.5 at a batch of 4 and 8: +1.7 to +11.4 % decode and 1 to 7 % less request time, the sampled arm included). Qwen4-exp keeps `off` (no effect resolvable at a batch of 4). `--batched-cut-hold off` to measure without it.
+    #[opt(flag = "batched-cut-hold", env = "LLOOM_BATCHED_CUT_HOLD", parser = "parse_batched_cut_hold", variants = ["off", "ahead", "all"], path = "decode.batched.cut_hold", status = "arm", facets = ["cadence"], flows = ["token-out", "commands-out"])]
+    pub batched_cut_hold: String,
 }
 
+fn parse_batched_cut_hold(v: &str) -> Result<String, String> {
+    one_of(v, "batched cut hold", &["off", "ahead", "all"])
+}
 fn parse_spawned_qos(v: &str) -> Result<String, String> {
     crate::generation::hot_thread::parse_spawned_arm(&non_empty(v)?.to_ascii_lowercase())
 }
@@ -825,6 +857,7 @@ impl Default for RingTuning {
             qwen3_5_eos_gate: false,
             qwen3_5_eos_gate_cores: false,
             eos_watch: false,
+            batched_cut_hold: "off".into(),
         }
     }
 }

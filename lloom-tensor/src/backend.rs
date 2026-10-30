@@ -228,6 +228,13 @@ pub trait BackendDevice: Sized + std::fmt::Debug + Clone {
         Ok(())
     }
 
+    /// Abandon the pass [`Self::begin_pass`] opened, after its body failed:
+    /// nothing it recorded is published. A no-op on a backend that declined
+    /// it.
+    fn abort_pass(&self) -> Result<()> {
+        Ok(())
+    }
+
     /// Admit computing at `dtype` on this device: `Ok` for a dtype it
     /// executes natively, and for one it emulates in software once the
     /// operator has opted in (one warning, at the first admission); otherwise

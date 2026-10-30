@@ -76,8 +76,11 @@ fn an_unretained_queue_holds_a_forgotten_fence_until_its_epoch_completes() {
     assert_eq!(hold.counts().pending, 0);
 
     let retaining = commands(&device, CommandBufferKind::Retaining);
+    // On this kind Metal holds it; the one hold a retaining queue can carry is
+    // a Metal 4 queue's under `kernels.residency.metal4_cover = held`, which
+    // keeps unpooled buffers listed (§15.1r), not what the queue fails to retain.
     assert!(
-        retaining.in_flight_hold().is_none(),
+        retaining.in_flight_hold().is_none_or(|h| h.unlists()),
         "Metal holds it on this kind"
     );
 }

@@ -1172,6 +1172,74 @@ fn unused_id_capacity_is_charged_and_an_oversize_publish_preserves_other_session
     assert_charge(&t);
 }
 
+/// Under the byte budget a publication evicts other sessions only when doing
+/// so lets it be retained: one that is declined anyway (`reason=budget`)
+/// leaves every other session where it was. Here the bytes that cannot be
+/// evicted for it — an ephemeral session's, which the pressure loop never
+/// takes — plus its own exceed the budget, though its own alone do not.
+#[test]
+fn a_declined_publication_evicts_no_other_session() {
+    let mut t = Table::new(cfg(4, true));
+    let now = Instant::now();
+    let a = turn(&mut t, None, Some(true), None, &[1], &scopes(1), &[2], now);
+    let long = vec![7u32; 4096];
+    let e = turn(
+        &mut t,
+        None,
+        None,
+        None,
+        &long,
+        &scopes(1),
+        &[8],
+        now + Duration::from_millis(1),
+    );
+    let a_bytes = t.slots[a.key.slot as usize].session.as_ref().unwrap().bytes;
+    let e_bytes = t.slots[e.key.slot as usize].session.as_ref().unwrap().bytes;
+    assert!(e_bytes > 2 * a_bytes, "{e_bytes} {a_bytes}");
+    // A and E fit; B, shaped as E, fits alone, but not beside E.
+    t.cfg.max_bytes = t.bytes + e_bytes / 2;
+    let ss = scopes(1);
+    let r = t.reserve(
+        Plan {
+            continued: None,
+            store: Some(true),
+            keep: None,
+            auth: None,
+            prompt_ids: &long,
+            scopes: &ss,
+        },
+        now + Duration::from_millis(2),
+    );
+    let prepared = PreparedRecord::new(Record {
+        messages: vec![json!({ "role": "user", "content": 0 })],
+        reply_msg: json!({ "role": "assistant", "content": "r" }),
+        prompt_ids: long.clone(),
+        reply: reply(&[8]),
+        eot: None,
+        scope: ss[1],
+        prefix: None,
+    })
+    .unwrap();
+    let result = t.publish(r, prepared, now + Duration::from_millis(2));
+    let (retained, reason) = (result.retained, result.reason);
+    drop(result);
+    eprintln!(
+        "retention declined-eviction a_bytes={a_bytes} e_bytes={e_bytes} max={} \
+         retained={retained} reason={reason:?} memory_released={}",
+        t.cfg.max_bytes,
+        t.json()["released"]["memory"]
+    );
+    if !retained {
+        assert_eq!(reason, Some(Reason::Budget));
+        assert!(
+            t.resolve(&a.encode(), None, false, now).is_ok(),
+            "a declined publication evicted another stored session"
+        );
+        assert_eq!(t.json()["released"]["memory"], 0, "{}", t.json());
+    }
+    assert_charge(&t);
+}
+
 #[test]
 fn prepared_messages_roundtrip_without_a_second_value_log() {
     let messages = vec![json!({"role":"user","content":"\\ \" \n π","nested":{"a":[1,true,null]}})];

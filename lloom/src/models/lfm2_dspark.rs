@@ -83,8 +83,8 @@
 //! This module projects whatever taps it is given. The producer's order and
 //! layer choice are the caller's contract, checked where they are made.
 
-use crate::models::with_tracing::{Embedding as TracedEmbedding, Linear as TracedLinear};
 use crate::nn::speculator::{Draft, DraftTokens, KvSource, LayerTaps, SeqId, Speculator};
+use crate::nn::weight_repr::{ReprEmbedding as TracedEmbedding, ReprLinear as TracedLinear};
 use crate::nn::{Linear, RmsNorm, VarBuilder};
 #[cfg(feature = "metal")]
 use lloom_tensor::kernels::metal::Epoch;
@@ -3135,11 +3135,17 @@ pub trait SharedHead {
 pub struct DenseHead {
     embed: TracedEmbedding,
     lm_head: TracedLinear,
+    device: Device,
 }
 
 impl DenseHead {
     pub fn new(embed: TracedEmbedding, lm_head: TracedLinear) -> Self {
-        Self { embed, lm_head }
+        let device = lm_head.device();
+        Self {
+            embed,
+            lm_head,
+            device,
+        }
     }
 }
 
@@ -3152,12 +3158,12 @@ impl SharedHead for DenseHead {
     /// returns F32 for the argmax chain.
     fn logits(&self, hidden: &Tensor) -> Result<Tensor> {
         self.lm_head
-            .forward(&hidden.to_dtype(self.embed.embeddings().dtype())?)?
+            .forward(&hidden.to_dtype(self.embed.compute_dtype())?)?
             .to_dtype(DType::F32)
     }
 
     fn device(&self) -> &Device {
-        self.lm_head.weight().device()
+        &self.device
     }
 }
 

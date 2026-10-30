@@ -1607,6 +1607,12 @@ fn parse_moe_act(v: &str) -> Result<String, String> {
         other => Err(format!("`{other}` is not `auto`, `f32` or `f16`")),
     }
 }
+fn parse_gguf_engine(v: &str) -> Result<String, String> {
+    match v.trim().to_ascii_lowercase().as_str() {
+        s @ ("lfm2" | "legacy") => Ok(s.into()),
+        other => Err(format!("`{other}` is not `lfm2` or `legacy`")),
+    }
+}
 fn parse_prefill_mode(v: &str) -> Result<String, String> {
     match v.trim().to_ascii_lowercase().as_str() {
         s @ ("chunk" | "replay") => Ok(s.into()),
@@ -1693,6 +1699,9 @@ pub struct LoadConfig {
     /// Qwen4-exp: load the N-gram PLE (off: a measurement arm; the digests belong to the PLE-on model).
     #[opt(bool, flag = "ple", path = "models.qwen4exp.ple.enabled", status = "reference", switches = ["no-ple=false"], facets = ["source"], flows = ["host-feed-in"])]
     pub ple: bool,
+    /// An LFM2 GGUF: which model serves it — `lfm2` (the LFM2 engine over the GGUF's blocks, the one implementation every LFM2 checkpoint shares) or `legacy` (the separate GGUF model, kept as the reference arm; the one that reads an `--mmproj` tower).
+    #[opt(flag = "gguf-engine", parser = "parse_gguf_engine", variants = ["lfm2", "legacy"], path = "models.lfm2_gguf.engine", status = "reference")]
+    pub gguf_engine: String,
     /// Qwen4-exp: the routed experts' activation dtype — `auto` (`f16` under the `fast` contract, `f32` under `deterministic`), `f32` (the byte-identical routed arm) or `f16`.
     #[opt(flag = "moe-act", parser = "parse_moe_act", variants = ["auto", "f32", "f16"], path = "models.qwen4exp.moe.activation_dtype", status = "advanced")]
     pub moe_act: String,
@@ -1737,6 +1746,7 @@ impl Default for LoadConfig {
             ple_cache_rows: 0,
             ple: true,
             moe_act: "auto".into(),
+            gguf_engine: "lfm2".into(),
             hotlist: None,
             prefetch: true,
             io_hints: false,

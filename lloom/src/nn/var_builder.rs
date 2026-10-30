@@ -3,6 +3,7 @@
 //! A `VarBuilder` is used to retrieve variables used by a model. These variables can either come
 //! from a pre-trained checkpoint, e.g. using `VarBuilder::from_mmaped_safetensors`, or initialized
 //! for training, e.g. using `VarBuilder::from_varmap`.
+use crate::nn::weight_repr::WeightRepr;
 use crate::nn::VarMap;
 use lloom_tensor::residency_class::{residency_class_scope, ResidencyClass};
 use lloom_tensor::{safetensors::Load, DType, Device, Error, Result, Shape, Tensor};
@@ -65,6 +66,19 @@ pub trait Backend: Send + Sync {
     fn get_unchecked(&self, name: &str, dtype: DType, dev: &Device) -> Result<Tensor>;
 
     fn contains_tensor(&self, name: &str) -> bool;
+
+    /// The tensor as the container stores it (`nn::weight_repr`): dense
+    /// unless the backend keeps packed blocks.
+    fn get_repr(
+        &self,
+        s: Shape,
+        name: &str,
+        h: Self::Hints,
+        dtype: DType,
+        dev: &Device,
+    ) -> Result<WeightRepr> {
+        self.get(s, name, h, dtype, dev).map(WeightRepr::Dense)
+    }
 }
 
 pub trait SimpleBackend: Send + Sync {
@@ -82,6 +96,18 @@ pub trait SimpleBackend: Send + Sync {
     fn get_unchecked(&self, name: &str, dtype: DType, dev: &Device) -> Result<Tensor>;
 
     fn contains_tensor(&self, name: &str) -> bool;
+
+    /// [`Backend::get_repr`].
+    fn get_repr(
+        &self,
+        s: Shape,
+        name: &str,
+        h: crate::nn::Init,
+        dtype: DType,
+        dev: &Device,
+    ) -> Result<WeightRepr> {
+        self.get(s, name, h, dtype, dev).map(WeightRepr::Dense)
+    }
 }
 
 impl Backend for Box<dyn SimpleBackend + '_> {
@@ -103,6 +129,17 @@ impl Backend for Box<dyn SimpleBackend + '_> {
 
     fn contains_tensor(&self, name: &str) -> bool {
         self.as_ref().contains_tensor(name)
+    }
+
+    fn get_repr(
+        &self,
+        s: Shape,
+        name: &str,
+        h: Self::Hints,
+        dtype: DType,
+        dev: &Device,
+    ) -> Result<WeightRepr> {
+        self.as_ref().get_repr(s, name, h, dtype, dev)
     }
 }
 
@@ -247,6 +284,34 @@ impl<B: Backend> VarBuilderArgs<'_, B> {
             self.data
                 .backend
                 .get(s.into(), &path, hints, dtype, &self.data.device)
+        })
+    }
+
+    /// The tensor at the current path as the container stores it
+    /// ([`Backend::get_repr`]), with `hints` for an initializing backend.
+    pub fn get_repr_with_hints<S: Into<Shape>>(
+        &self,
+        s: S,
+        name: &str,
+        hints: B::Hints,
+    ) -> Result<WeightRepr> {
+        self.get_repr_with_hints_dtype(s, name, hints, self.dtype)
+    }
+
+    /// [`Self::get_repr_with_hints`] at `dtype` (a dense answer's dtype).
+    pub fn get_repr_with_hints_dtype<S: Into<Shape>>(
+        &self,
+        s: S,
+        name: &str,
+        hints: B::Hints,
+        dtype: DType,
+    ) -> Result<WeightRepr> {
+        self.data.device.admit_compute_dtype(dtype)?;
+        let path = self.path(name);
+        residency_class_scope(ResidencyClass::Weights, || {
+            self.data
+                .backend
+                .get_repr(s.into(), &path, hints, dtype, &self.data.device)
         })
     }
 
@@ -925,6 +990,18 @@ impl<R: Renamer + Sync + Send> SimpleBackend for Rename<'_, R> {
         let name = self.renamer.rename(name);
         self.inner.contains_tensor(&name)
     }
+
+    fn get_repr(
+        &self,
+        s: Shape,
+        name: &str,
+        h: crate::nn::Init,
+        dtype: DType,
+        _dev: &Device,
+    ) -> Result<WeightRepr> {
+        let name = self.renamer.rename(name);
+        self.inner.get_repr_with_hints_dtype(s, &name, h, dtype)
+    }
 }
 
 impl<'a, R: Renamer> Rename<'a, R> {
@@ -978,34 +1055,15 @@ impl LoadRecord {
     }
 }
 
-/// A checkpoint backend that records which tensors are loaded through it.
-///
-/// Loading is a lookup by name, so the names a constructor asks for are exactly
-/// the tensors that become device buffers (`DESIGN.md` §5.5a). One flag per
-/// header entry, set on load: no lock, and nothing on any path after load.
-/// Otherwise it is the safetensors backend it wraps, method for method.
-pub struct RecordingBackend {
-    inner: lloom_tensor::safetensors::MmapedSafetensors,
+/// The flags a recording backend sets: one per header entry, by name.
+pub(crate) struct Recorder {
     index: HashMap<String, usize>,
     record: LoadRecord,
 }
 
-impl RecordingBackend {
-    /// Map `paths` and record loads against every tensor their headers name.
-    ///
-    /// # Safety
-    ///
-    /// As [`VarBuilderArgs::from_mmaped_safetensors`]: the files must not be
-    /// modified while mapped.
-    pub unsafe fn over_safetensors<P: AsRef<std::path::Path>>(
-        paths: &[P],
-    ) -> Result<(Self, LoadRecord)> {
-        let inner = lloom_tensor::safetensors::MmapedSafetensors::multi(paths)?;
-        let mut entries: Vec<(String, usize)> = inner
-            .tensors()
-            .into_iter()
-            .map(|(n, v)| (n, v.data().len()))
-            .collect();
+impl Recorder {
+    /// A recorder over the header's `(name, bytes on disk)` entries.
+    pub(crate) fn new(mut entries: Vec<(String, usize)>) -> Self {
         entries.sort();
         let index = entries
             .iter()
@@ -1020,20 +1078,54 @@ impl RecordingBackend {
                 .map(|_| std::sync::atomic::AtomicBool::new(false))
                 .collect(),
         };
-        Ok((
-            Self {
-                inner,
-                index,
-                record: record.clone(),
-            },
-            record,
-        ))
+        Self { index, record }
     }
 
-    fn mark(&self, name: &str) {
+    pub(crate) fn record(&self) -> LoadRecord {
+        self.record.clone()
+    }
+
+    pub(crate) fn mark(&self, name: &str) {
         if let Some(&i) = self.index.get(name) {
             self.record.loaded[i].store(true, std::sync::atomic::Ordering::Relaxed);
         }
+    }
+}
+
+/// A checkpoint backend that records which tensors are loaded through it.
+///
+/// Loading is a lookup by name, so the names a constructor asks for are exactly
+/// the tensors that become device buffers (`DESIGN.md` §5.5a). One flag per
+/// header entry, set on load: no lock, and nothing on any path after load.
+/// Otherwise it is the safetensors backend it wraps, method for method.
+pub struct RecordingBackend {
+    inner: lloom_tensor::safetensors::MmapedSafetensors,
+    recorder: Recorder,
+}
+
+impl RecordingBackend {
+    /// Map `paths` and record loads against every tensor their headers name.
+    ///
+    /// # Safety
+    ///
+    /// As [`VarBuilderArgs::from_mmaped_safetensors`]: the files must not be
+    /// modified while mapped.
+    pub unsafe fn over_safetensors<P: AsRef<std::path::Path>>(
+        paths: &[P],
+    ) -> Result<(Self, LoadRecord)> {
+        let inner = lloom_tensor::safetensors::MmapedSafetensors::multi(paths)?;
+        let entries: Vec<(String, usize)> = inner
+            .tensors()
+            .into_iter()
+            .map(|(n, v)| (n, v.data().len()))
+            .collect();
+        let recorder = Recorder::new(entries);
+        let record = recorder.record();
+        Ok((Self { inner, recorder }, record))
+    }
+
+    fn mark(&self, name: &str) {
+        self.recorder.mark(name);
     }
 }
 

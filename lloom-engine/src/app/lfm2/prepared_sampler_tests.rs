@@ -69,6 +69,7 @@ fn fixture_with_trace(decode: crate::DecodeConfig, trace: bool) -> Result<(Fixtu
     )?;
     let opts = LoadOptions {
         model_dir: dir,
+        tokenizer: None,
         cpu: false,
         purpose: lloom::nn::attention::route::ExecutionPurpose::Production,
         kv_capacity: 256,

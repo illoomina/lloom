@@ -131,28 +131,11 @@ impl TinyFamily for Lfm2Tiny {
     }
 
     fn write(ckpt: &TinyCheckpoint<Self>, dir: &Path) -> Result<PathBuf> {
-        let schema = ckpt.schema()?;
-        let store = store_dtype(ckpt.weights.dense)?;
-        let w = &ckpt.weights;
-        let mut tensors = std::collections::HashMap::new();
-        for t in &schema.tensors {
-            let v = w
-                .law
-                .tensor(
-                    w.seed,
-                    &t.name,
-                    t.role,
-                    &Shape::from(t.shape.clone()),
-                    &Device::Cpu,
-                )?
-                .to_dtype(store)?;
-            tensors.insert(t.name.clone(), v);
-        }
-        lloom_tensor::safetensors::save(&tensors, dir.join("model.safetensors"))?;
-        let tok = Self::tokenizer();
-        std::fs::write(dir.join("config.json"), config_json(&ckpt.cfg, &tok))?;
-        tok.write(dir)?;
-        Ok(dir.to_path_buf())
+        write_schema(ckpt, dir, ckpt.schema()?)
+    }
+
+    fn write_for<P: Profile>(ckpt: &TinyCheckpoint<Self>, dir: &Path) -> Result<PathBuf> {
+        write_schema(ckpt, dir, ckpt.schema_for::<P>()?)
     }
 
     fn load<P: Profile>(path: &Path, dev: &Device) -> Result<Model<P>> {
@@ -340,4 +323,29 @@ pub fn load_recorded<P: Profile>(
 /// on silverberry from a Mac-built archive).
 fn lloom_manifest_dir() -> String {
     std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| env!("CARGO_MANIFEST_DIR").to_string())
+}
+
+/// The checkpoint files for `ckpt` under `schema`.
+fn write_schema(ckpt: &TinyCheckpoint<Lfm2Tiny>, dir: &Path, schema: Schema) -> Result<PathBuf> {
+    let store = store_dtype(ckpt.weights.dense)?;
+    let w = &ckpt.weights;
+    let mut tensors = std::collections::HashMap::new();
+    for t in &schema.tensors {
+        let v = w
+            .law
+            .tensor(
+                w.seed,
+                &t.name,
+                t.role,
+                &Shape::from(t.shape.clone()),
+                &Device::Cpu,
+            )?
+            .to_dtype(store)?;
+        tensors.insert(t.name.clone(), v);
+    }
+    lloom_tensor::safetensors::save(&tensors, dir.join("model.safetensors"))?;
+    let tok = Lfm2Tiny::tokenizer();
+    std::fs::write(dir.join("config.json"), config_json(&ckpt.cfg, &tok))?;
+    tok.write(dir)?;
+    Ok(dir.to_path_buf())
 }

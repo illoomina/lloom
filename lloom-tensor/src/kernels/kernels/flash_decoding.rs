@@ -287,6 +287,19 @@ impl ChunkTable {
     }
 }
 
+/// Whether a dispatch of `n_chunks` chunks also runs the single-chunk pass,
+/// for the rows whose own live count (`row_keys`, the host's copy of the
+/// per-row counts; empty for a lockstep batch) fits one chunk.
+///
+/// The single-chunk pass and the partial pass reduce a chunk with their own
+/// simdgroup counts (32, and `FLASH_PARTIAL_WIDTHS`), so a row's bits follow
+/// the pass it takes. A row that fits one chunk takes the single pass alone,
+/// and must take it beside a row that does not, or its bits would move with
+/// its neighbours' lengths (`DESIGN.md` 2.3.3 #7).
+pub fn flash_one_chunk_rows(n_chunks: usize, chunk_size: usize, row_keys: &[u32]) -> bool {
+    n_chunks > 1 && row_keys.iter().any(|&n| n as usize <= chunk_size)
+}
+
 /// Chunks a `kv_len` splits into at a given chunk size.
 ///
 /// `ceil(kv_len / chunk_size)`. §10.6: contiguous is paged with one page and
@@ -517,6 +530,9 @@ pub unsafe fn call_flash_decoding(
     // (`FLASH_PARTIAL_WIDTHS`); the single-chunk and combine passes have
     // their own fixed geometry.
     partial_width: usize,
+    // At `n_chunks > 1`: run the single-chunk pass after the combine for the
+    // rows that fit one chunk ([`flash_one_chunk_rows`]).
+    one_chunk_rows: bool,
 ) -> Result<(), MetalKernelError> {
     // The single-chunk fast path: at `n_chunks == 1` the split-K machinery
     // manufactures no parallelism (one chunk is one threadgroup per head), and
@@ -532,7 +548,8 @@ pub unsafe fn call_flash_decoding(
     // chunk count until it has the params. `chunk_table` IS read: the single
     // chunk starts at the page its table names, which is page 0 only on a
     // fresh pool (§10.3h).
-    if n_chunks == 1 {
+    // The single-chunk pass, writing `out` for the rows that fit one chunk.
+    let single = || -> Result<(), MetalKernelError> {
         let name = FlashKernel::single(itype, head_dim)?;
         let pipeline =
             kernels.load_pipeline(device, Source::FlashDecoding, KernelName::Value(name))?;
@@ -571,7 +588,10 @@ pub unsafe fn call_flash_decoding(
             depth: 1,
         };
         encoder.dispatch_thread_groups(grid_dims, group_dims);
-        return Ok(());
+        Ok(())
+    };
+    if n_chunks == 1 {
+        return single();
     }
 
     // Pass 1 -- partials.
@@ -667,6 +687,11 @@ pub unsafe fn call_flash_decoding(
         encoder.dispatch_thread_groups(grid_dims, group_dims);
     }
 
+    // The rows that fit one chunk again, on the pass they take alone: it
+    // overwrites what the combine wrote for them and returns at every other.
+    if one_chunk_rows {
+        single()?;
+    }
     Ok(())
 }
 

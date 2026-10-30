@@ -1607,6 +1607,12 @@ fn parse_moe_act(v: &str) -> Result<String, String> {
         other => Err(format!("`{other}` is not `auto`, `f32` or `f16`")),
     }
 }
+fn parse_gguf_engine(v: &str) -> Result<String, String> {
+    match v.trim().to_ascii_lowercase().as_str() {
+        s @ ("lfm2" | "legacy") => Ok(s.into()),
+        other => Err(format!("`{other}` is not `lfm2` or `legacy`")),
+    }
+}
 fn parse_prefill_mode(v: &str) -> Result<String, String> {
     match v.trim().to_ascii_lowercase().as_str() {
         s @ ("chunk" | "replay") => Ok(s.into()),
@@ -1693,6 +1699,9 @@ pub struct LoadConfig {
     /// Qwen4-exp: load the N-gram PLE (off: a measurement arm; the digests belong to the PLE-on model).
     #[opt(bool, flag = "ple", path = "models.qwen4exp.ple.enabled", status = "reference", switches = ["no-ple=false"], facets = ["source"], flows = ["host-feed-in"])]
     pub ple: bool,
+    /// An LFM2 GGUF: which model serves it — `lfm2` (the LFM2 engine over the GGUF's blocks, the one implementation every LFM2 checkpoint shares) or `legacy` (the separate GGUF model, kept as the reference arm; the one that reads an `--mmproj` tower).
+    #[opt(flag = "gguf-engine", parser = "parse_gguf_engine", variants = ["lfm2", "legacy"], path = "models.lfm2_gguf.engine", status = "reference")]
+    pub gguf_engine: String,
     /// Qwen4-exp: the routed experts' activation dtype — `auto` (`f16` under the `fast` contract, `f32` under `deterministic`), `f32` (the byte-identical routed arm) or `f16`.
     #[opt(flag = "moe-act", parser = "parse_moe_act", variants = ["auto", "f32", "f16"], path = "models.qwen4exp.moe.activation_dtype", status = "advanced")]
     pub moe_act: String,
@@ -1737,6 +1746,7 @@ impl Default for LoadConfig {
             ple_cache_rows: 0,
             ple: true,
             moe_act: "auto".into(),
+            gguf_engine: "lfm2".into(),
             hotlist: None,
             prefetch: true,
             io_hints: false,
@@ -1966,6 +1976,29 @@ pub struct PipetteConfig {
     pub prompt_seed_file: Option<std::path::PathBuf>,
 }
 
+/// Generating responses' drain bounds, separate from model execution.
+/// These defaults are draft candidates awaiting maintainer approval (#946).
+#[derive(Options, Serialize, Deserialize, Debug, Clone, Copy, PartialEq)]
+#[options(v0 = false)]
+#[serde(default)]
+pub struct ServerResponseConfig {
+    /// Operator override: at most this many generating response contexts at once (model wait, decode and socket drain included); past it a request gets 503 with `Retry-After`. Unset, the ceiling is memory's: each context is admitted on the machine gate with its declared footprint, a request past the batch width that fits waits for the model, and only a memory refusal is a 503 (decision 83). 0 admits none.
+    #[opt(flag = "response-contexts", path = "server.response.contexts", status = "advanced", facets = ["buffer"], flows = ["token-out"])]
+    pub contexts: Option<usize>,
+    /// Unresolved raw text bytes per SSE response, in-flight writes included: the cold buffer's share of a response context's footprint (decision 83). The next whole fragment is refused above it, keeping the earlier accepted frontier; 0 refuses nonempty fragments. Interim: a per-session page quota once responses are paged token logs (#1145).
+    #[opt(flag = "response-raw-bytes", path = "server.response.raw_bytes", status = "advanced", facets = ["buffer"], flows = ["token-out"])]
+    pub raw_bytes: usize,
+}
+
+impl Default for ServerResponseConfig {
+    fn default() -> Self {
+        Self {
+            contexts: None,
+            raw_bytes: 1 << 20,
+        }
+    }
+}
+
 /// How `lloom serve` reclaims the sessions its chat completions' ids name: a
 /// session lives until the server lets it go (`docs/sessions.md` §4).
 #[derive(Options, Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -2032,6 +2065,9 @@ pub struct ServerConfig {
     pub pipette: PipetteConfig,
     #[opt(nested)]
     pub sessions: ServerSessionsConfig,
+    /// Response contexts: memory-admitted, with an optional count override (decision 83).
+    #[opt(nested)]
+    pub response: ServerResponseConfig,
 }
 
 impl Default for ServerConfig {
@@ -2046,6 +2082,7 @@ impl Default for ServerConfig {
             keep_warm_pressure_file: None,
             pipette: PipetteConfig::default(),
             sessions: ServerSessionsConfig::default(),
+            response: ServerResponseConfig::default(),
         }
     }
 }
@@ -2530,5 +2567,70 @@ mod spark_tests {
             "1 is the tail, not a bulk tile"
         );
         assert!(parse_spark("16/tile:x").is_err());
+    }
+}
+
+#[cfg(test)]
+mod response_option_tests {
+    use super::*;
+
+    #[test]
+    fn response_limits_have_one_canonical_spelling_and_round_trip_every_entry_point() {
+        use clap::Parser;
+        let idx = crate::option_tree::index();
+        let mut options = EngineOptions::default();
+        for (key, value) in [
+            ("server.response.contexts", "3"),
+            ("server.response.raw_bytes", "17"),
+        ] {
+            assert!(idx.keys.contains_key(key), "{key}");
+            assert_eq!(idx.keys[key].targets.len(), 1, "{key}");
+            assert!(idx.keys[key].meta().doc.contains("decision 83"), "{key}");
+            idx.set(&mut options, key, value).unwrap();
+        }
+        assert!(
+            !idx.keys.contains_key("server.response.markers"),
+            "decision 85 leaves no marker list to bound"
+        );
+        let expected = ServerResponseConfig {
+            contexts: Some(3),
+            raw_bytes: 17,
+        };
+        assert_eq!(options.server.response, expected);
+        let mut back = EngineOptions::default();
+        idx.merge(&mut back, &idx.render(&options)).unwrap();
+        assert_eq!(back, options);
+        let mut env = ServerResponseConfig::default();
+        let variables = std::collections::BTreeMap::from([
+            (idx.keys["server.response.contexts"].env(), "3".to_owned()),
+            (idx.keys["server.response.raw_bytes"].env(), "17".to_owned()),
+        ]);
+        env.from_env_with(&|name| variables.get(name).cloned())
+            .unwrap();
+        assert_eq!(env, expected);
+        #[derive(Parser)]
+        struct Cli {
+            #[command(flatten)]
+            response: ServerResponseConfigArgs,
+        }
+        let cli = Cli::try_parse_from([
+            "test",
+            "--response-contexts",
+            "3",
+            "--response-raw-bytes",
+            "17",
+        ])
+        .unwrap();
+        let mut flags = ServerResponseConfig::default();
+        cli.response.apply(&mut flags).unwrap();
+        assert_eq!(flags, expected);
+        assert_eq!(
+            ServerResponseConfig::default(),
+            ServerResponseConfig {
+                contexts: None,
+                raw_bytes: 1 << 20,
+            },
+            "no fixed default count: the ceiling is memory's (decision 83)"
+        );
     }
 }

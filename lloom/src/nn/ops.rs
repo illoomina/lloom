@@ -4249,6 +4249,15 @@ impl lloom_tensor::CustomOp3 for FlashDecoding<'_> {
         let combine = lloom_tensor::kernels::FlashCombineParams::for_step(n_chunks, chunk_capacity);
         let combine_params = device.constant_of(&combine)?;
 
+        // A ragged batch's rows that fit one chunk take the single-chunk pass
+        // beside rows that span more, as they would alone.
+        let row_keys: &[u32] = match &self.paged {
+            Some(p) if ragged => p.n_keys.as_slice(),
+            _ => &[],
+        };
+        let one_chunk_rows =
+            lloom_tensor::kernels::flash_one_chunk_rows(n_chunks, chunk_size, row_keys);
+
         let encoder = q.device().command_encoder()?;
         encoder.set_label("flash_decoding");
         // SAFETY: the op binds storages, constant-cache blocks and uploads made
@@ -4278,6 +4287,7 @@ impl lloom_tensor::CustomOp3 for FlashDecoding<'_> {
                 n_chunks,
                 itype,
                 flash_partial_width(),
+                one_chunk_rows,
             )
         }
         .map_err(lloom_tensor::Error::wrap)?;

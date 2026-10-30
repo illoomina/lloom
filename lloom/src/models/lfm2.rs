@@ -5,9 +5,14 @@
 //!
 //! This implementation supports the LFM2ForCausalLM architecture from HuggingFace transformers.
 
-use crate::models::with_tracing::{linear_no_bias as linear, Embedding, Linear, RmsNorm};
+use crate::models::with_tracing::RmsNorm;
+// The projections and the token table hold each weight as the container
+// stored it: dense, or packed blocks (`nn::weight_repr`).
 use crate::nn::kv_quant::QuantKvSlab;
 use crate::nn::ops::{FlashScratchSizing, KvQuant};
+use crate::nn::weight_repr::{
+    linear_no_bias as linear, ReprEmbedding as Embedding, ReprLinear as Linear,
+};
 use crate::nn::zeros as zs;
 use crate::nn::{
     BatchedCausalLM, CacheReset, CausalLM, Conv1d, Conv1dConfig, Model as ModelTrait, RaggedRow,
@@ -27,6 +32,8 @@ use std::collections::{BTreeMap, HashMap};
 use std::marker::PhantomData;
 #[cfg(feature = "metal")]
 use std::sync::Arc;
+
+pub mod gguf;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -6256,27 +6263,31 @@ fn flash_attn(_: &Tensor, _: &Tensor, _: &Tensor, _: f32, _: bool) -> Result<Ten
 /// the op — is a fused request the kernel cannot honour, because that would
 /// otherwise run unfused and silently skip the add.
 fn gemv_residual_applies(enabled: bool, x: &Tensor, proj: &Linear, residual: &Tensor) -> bool {
+    // The fused GEMV reads a dense weight; packed blocks take the eager path.
+    let Some(weight) = proj.dense() else {
+        return false;
+    };
     enabled
         && x.device().is_metal()
         // One row only: the fused op is a GEMV, and a `[B, 1, k]` input would
         // dispatch it `B` times over the weight where the batched step reads
         // the weight once through the `m = B` GEMM (§13.5).
         && matches!(x.dims(), [1, 1, _] | [1, _])
-        && x.dims().last() == Some(&proj.weight().dims()[1])
+        && x.dims().last() == Some(&weight.dims()[1])
         && proj.bias().is_none()
         // `Linear::forward` reshapes a contiguous input and broadcasts a
         // non-contiguous one onto a different weight layout. The fused op
         // builds the transposed stride by hand, so it serves the contiguous
         // case only and defers the other to the eager path.
         && x.is_contiguous()
-        && proj.weight().is_contiguous()
+        && weight.is_contiguous()
         && matches!(x.dtype(), DType::F16 | DType::BF16 | DType::F32)
         && residual.dtype() == x.dtype()
         // The residual is read at the storing thread's own output row, so it
         // must be exactly the output extent and contiguous — a strided or
         // offset view would be indexed wrongly and produce a well-formed wrong
         // number that §3.5 says nothing reports. Checked again in the op.
-        && residual.elem_count() == proj.weight().dims()[0]
+        && residual.elem_count() == weight.dims()[0]
         && residual.is_contiguous()
 }
 
@@ -6360,9 +6371,12 @@ impl Mlp {
     /// `flash_decoding` this arm has a correct eager equivalent right beside
     /// it and prefill is a GEMM the fusion is not instantiated for.
     fn gemv_silu_applies(&self, x: &Tensor, p: &Projections<'_>) -> bool {
+        let Some(gate) = p.gate.dense() else {
+            return false;
+        };
         self.gemv_silu
             && x.device().is_metal()
-            && x.dims().last() == Some(&p.gate.weight().dims()[1])
+            && x.dims().last() == Some(&gate.dims()[1])
             // One row only, for `gemv_residual_applies`'s reason: at `B > 1`
             // the fused GEMV would sweep `w1` once per row.
             && matches!(x.dims(), [1, 1, _] | [1, _])
@@ -6370,7 +6384,7 @@ impl Mlp {
             // See `gemv_residual_applies`: the fused op serves the contiguous
             // layout `Linear::forward` reshapes, not the broadcast one.
             && x.is_contiguous()
-            && p.gate.weight().is_contiguous()
+            && gate.is_contiguous()
             && matches!(x.dtype(), DType::F16 | DType::BF16 | DType::F32)
     }
 
@@ -6388,7 +6402,7 @@ impl Mlp {
             let _enter = self.span.enter();
             let gated = self.gated(x, p)?;
             if gemv_residual_applies(true, &gated, &p.down, residual) {
-                return crate::nn::ops::gemv_residual(&gated, p.down.weight(), residual);
+                return crate::nn::ops::gemv_residual(&gated, p.down.dense_weight()?, residual);
             }
             if prefill_ablated(PrefillAblation::Add, residual) {
                 return p.down.forward(&gated);
@@ -6410,7 +6424,7 @@ impl Mlp {
     fn norm_gemv_applies(&self, on: bool, x: &Tensor, norm: &RmsNorm, p: &Projections<'_>) -> bool {
         let gate = match self.gemv_gate {
             GateFusion::Off => true,
-            GateFusion::Swiglu => p.gate.weight().dims() == p.up.weight().dims(),
+            GateFusion::Swiglu => p.gate.dims() == p.up.dims(),
             GateFusion::Mul => false,
         };
         gate && norm_gemv_applies(on, x, norm, &p.gate) && norm_gemv_applies(on, x, norm, &p.up)
@@ -6436,8 +6450,8 @@ impl Mlp {
             // one kernel, the SiLU arm moot as it is there.
             crate::nn::ops::gemv_norm_swiglu(
                 x,
-                p.up.weight(),
-                p.gate.weight(),
+                p.up.dense_weight()?,
+                p.gate.dense_weight()?,
                 norm.weight(),
                 norm.eps() as f32,
             )?
@@ -6451,7 +6465,7 @@ impl Mlp {
             (gate * up)?
         };
         if self.gemv_residual && gemv_residual_applies(true, &gated, &p.down, residual) {
-            return crate::nn::ops::gemv_residual(&gated, p.down.weight(), residual);
+            return crate::nn::ops::gemv_residual(&gated, p.down.dense_weight()?, residual);
         }
         p.down.forward(&gated)? + residual
     }
@@ -6464,7 +6478,7 @@ impl Mlp {
         // product, #732). Under it the SiLU arm is moot — `w1` is never
         // dispatched alone — so it is tried first.
         if self.gemv_swiglu_applies(x, p) {
-            return crate::nn::ops::gemv_swiglu(x, p.up.weight(), p.gate.weight());
+            return crate::nn::ops::gemv_swiglu(x, p.up.dense_weight()?, p.gate.dense_weight()?);
         }
         // The composed pair as one elementwise launch, bit for bit
         // (`kernels.fusion.silu_mul`, Qwen4-exp's `silu_mul` kernel).
@@ -6484,7 +6498,7 @@ impl Mlp {
         // computes SiLU on the f32 accumulator rather than on the rounded
         // store — so it MOVES THE DIGESTS by construction (§12.2d, §2.3.5a).
         let gate = if self.gemv_silu_applies(x, p) {
-            crate::nn::ops::gemv_silu(x, p.gate.weight())?
+            crate::nn::ops::gemv_silu(x, p.gate.dense_weight()?)?
         } else if prefill_ablated(PrefillAblation::Silu, x) {
             p.gate.forward(x)?
         } else {
@@ -6496,7 +6510,7 @@ impl Mlp {
         // gate is exactly `w3`'s output extent, contiguous, as `gemv_silu`
         // and `silu` both store it.
         if self.gemv_gate == GateFusion::Mul && gemv_residual_applies(true, x, &p.up, &gate) {
-            return crate::nn::ops::gemv_mul(x, p.up.weight(), &gate);
+            return crate::nn::ops::gemv_mul(x, p.up.dense_weight()?, &gate);
         }
         let up = p.up.forward(x)?;
         if prefill_ablated(PrefillAblation::Mul, x) {
@@ -6510,16 +6524,19 @@ impl Mlp {
     /// conditions on `w1`, and `w3` the same shape and layout — the kernel
     /// streams both under one leading dimension.
     fn gemv_swiglu_applies(&self, x: &Tensor, p: &Projections<'_>) -> bool {
+        let (Some(gate), Some(up)) = (p.gate.dense(), p.up.dense()) else {
+            return false;
+        };
         self.gemv_gate == GateFusion::Swiglu
             && x.device().is_metal()
-            && x.dims().last() == Some(&p.gate.weight().dims()[1])
+            && x.dims().last() == Some(&gate.dims()[1])
             && matches!(x.dims(), [1, 1, _] | [1, _])
             && p.gate.bias().is_none()
             && p.up.bias().is_none()
             && x.is_contiguous()
-            && p.gate.weight().is_contiguous()
-            && p.up.weight().is_contiguous()
-            && p.gate.weight().dims() == p.up.weight().dims()
+            && gate.is_contiguous()
+            && up.is_contiguous()
+            && gate.dims() == up.dims()
             && matches!(x.dtype(), DType::F16 | DType::BF16 | DType::F32)
     }
 }
@@ -6534,7 +6551,24 @@ impl crate::optimizer::Visit for Mlp {
     fn visit(&self, w: &mut crate::optimizer::Walker, xn: Self::In) -> Self::Out {
         use crate::optimizer::Shape;
         let (h, i) = self.dims;
-        let dt = self.down_proj.weight().dtype();
+        let dt = w.node(xn).dtype;
+        if [&self.gate_proj, &self.up_proj, &self.down_proj]
+            .iter()
+            .any(|p| p.blocks().is_some())
+        {
+            let gate = visit_proj(w, "w1.weight", &self.gate_proj, Shape::of(&[i, h]), dt, xn);
+            let gate = w.silu(gate);
+            let up = visit_proj(w, "w3.weight", &self.up_proj, Shape::of(&[i, h]), dt, xn);
+            let gated = w.mul(gate, up);
+            return visit_proj(
+                w,
+                "w2.weight",
+                &self.down_proj,
+                Shape::of(&[h, i]),
+                dt,
+                gated,
+            );
+        }
         let w1 = w.weight("w1.weight", Shape::of(&[i, h]), dt);
         let w3 = w.weight("w3.weight", Shape::of(&[i, h]), dt);
         let w2 = w.weight("w2.weight", Shape::of(&[h, i]), dt);
@@ -6733,7 +6767,7 @@ impl<P: Profile> Attention<P> {
         if self.gemv_residual {
             let y = self.attend(w, x, index_pos, block_idx, cache)?;
             if gemv_residual_applies(true, &y, &w.o, residual) {
-                return crate::nn::ops::gemv_residual(&y, w.o.weight(), residual);
+                return crate::nn::ops::gemv_residual(&y, w.o.dense_weight()?, residual);
             }
             if prefill_ablated(PrefillAblation::Add, residual) {
                 return w.o.forward(&y);
@@ -6761,7 +6795,7 @@ impl<P: Profile> Attention<P> {
     ) -> Result<Tensor> {
         let y = self.attend_normed(w, x, Some(norm), index_pos, block_idx, cache)?;
         if self.gemv_residual && gemv_residual_applies(true, &y, &w.o, residual) {
-            return crate::nn::ops::gemv_residual(&y, w.o.weight(), residual);
+            return crate::nn::ops::gemv_residual(&y, w.o.dense_weight()?, residual);
         }
         w.o.forward(&y)? + residual
     }
@@ -6781,7 +6815,7 @@ impl<P: Profile> Attention<P> {
     ) -> Result<Tensor> {
         let y = self.attend_rows(w, x, block_idx, rows)?;
         if self.gemv_residual && gemv_residual_applies(true, &y, &w.o, residual) {
-            return crate::nn::ops::gemv_residual(&y, w.o.weight(), residual);
+            return crate::nn::ops::gemv_residual(&y, w.o.dense_weight()?, residual);
         }
         w.o.forward(&y)? + residual
     }
@@ -6870,7 +6904,7 @@ impl<P: Profile> Attention<P> {
     ) -> Result<Tensor> {
         let y = self.attend_ragged(w, x, block_idx, rows)?;
         if self.gemv_residual && gemv_residual_applies(true, &y, &w.o, residual) {
-            return crate::nn::ops::gemv_residual(&y, w.o.weight(), residual);
+            return crate::nn::ops::gemv_residual(&y, w.o.dense_weight()?, residual);
         }
         w.o.forward(&y)? + residual
     }
@@ -7791,13 +7825,36 @@ impl<P: Profile> crate::optimizer::Visit for Attention<P> {
         let (h, hd) = (self.hidden_size, self.head_dim);
         let (heads, kvh) = (self.num_attention_heads, self.num_key_value_heads);
         let kv = kvh * hd;
-        let dt = self.o_proj.weight().dtype();
-        let wq = w.weight("q_proj.weight", Shape::of(&[h, h]), dt);
-        let wk = w.weight("k_proj.weight", Shape::of(&[kv, h]), dt);
-        let wv = w.weight("v_proj.weight", Shape::of(&[kv, h]), dt);
-        let q = w.gemv(wq, xn);
-        let k = w.gemv(wk, xn);
-        let v = w.gemv(wv, xn);
+        let dt = w.node(xn).dtype;
+        let (q, k, v) = if [&self.q_proj, &self.k_proj, &self.v_proj]
+            .iter()
+            .any(|p| p.blocks().is_some())
+        {
+            (
+                visit_proj(w, "q_proj.weight", &self.q_proj, Shape::of(&[h, h]), dt, xn),
+                visit_proj(
+                    w,
+                    "k_proj.weight",
+                    &self.k_proj,
+                    Shape::of(&[kv, h]),
+                    dt,
+                    xn,
+                ),
+                visit_proj(
+                    w,
+                    "v_proj.weight",
+                    &self.v_proj,
+                    Shape::of(&[kv, h]),
+                    dt,
+                    xn,
+                ),
+            )
+        } else {
+            let wq = w.weight("q_proj.weight", Shape::of(&[h, h]), dt);
+            let wk = w.weight("k_proj.weight", Shape::of(&[kv, h]), dt);
+            let wv = w.weight("v_proj.weight", Shape::of(&[kv, h]), dt);
+            (w.gemv(wq, xn), w.gemv(wk, xn), w.gemv(wv, xn))
+        };
         let q = w.view("reshape", q, Shape::of(&[1, heads, 1, hd]));
         let k = w.view("reshape", k, Shape::of(&[1, kvh, 1, hd]));
         let v = w.view("reshape", v, Shape::of(&[1, kvh, 1, hd]));
@@ -7877,8 +7934,14 @@ impl<P: Profile> crate::optimizer::Visit for Attention<P> {
         ring.push(y);
         w.mark(&ring, Region::Kv(l));
         let y = w.view("reshape", y, Shape::of(&[1, 1, h]));
-        let wo = w.weight("out_proj.weight", Shape::of(&[h, h]), dt);
-        w.gemv(wo, y)
+        visit_proj(
+            w,
+            "out_proj.weight",
+            &self.o_proj,
+            Shape::of(&[h, h]),
+            dt,
+            y,
+        )
     }
 }
 
@@ -8333,7 +8396,11 @@ impl<P: Profile> ShortConv<P> {
         if self.gemv_residual {
             let conv_out = self.convolve(w, x, block_idx, cache)?;
             if gemv_residual_applies(true, &conv_out, &w.out_proj, residual) {
-                return crate::nn::ops::gemv_residual(&conv_out, w.out_proj.weight(), residual);
+                return crate::nn::ops::gemv_residual(
+                    &conv_out,
+                    w.out_proj.dense_weight()?,
+                    residual,
+                );
             }
             if prefill_ablated(PrefillAblation::Add, residual) {
                 return w.out_proj.forward(&conv_out);
@@ -8361,7 +8428,7 @@ impl<P: Profile> ShortConv<P> {
         let bcx = norm_gemv(x, norm, &w.in_proj, false)?.transpose(1, 2)?;
         let conv_out = self.convolve_bcx(&bcx, block_idx, cache)?;
         if self.gemv_residual && gemv_residual_applies(true, &conv_out, &w.out_proj, residual) {
-            return crate::nn::ops::gemv_residual(&conv_out, w.out_proj.weight(), residual);
+            return crate::nn::ops::gemv_residual(&conv_out, w.out_proj.dense_weight()?, residual);
         }
         w.out_proj.forward(&conv_out)? + residual
     }
@@ -8380,7 +8447,7 @@ impl<P: Profile> ShortConv<P> {
     ) -> Result<Tensor> {
         let conv_out = self.convolve_rows(w, x, block_idx, rows)?;
         if self.gemv_residual && gemv_residual_applies(true, &conv_out, &w.out_proj, residual) {
-            return crate::nn::ops::gemv_residual(&conv_out, w.out_proj.weight(), residual);
+            return crate::nn::ops::gemv_residual(&conv_out, w.out_proj.dense_weight()?, residual);
         }
         w.out_proj.forward(&conv_out)? + residual
     }
@@ -8437,7 +8504,7 @@ impl<P: Profile> ShortConv<P> {
     ) -> Result<Tensor> {
         let conv_out = self.convolve_ragged(w, x, block_idx, rows)?;
         if self.gemv_residual && gemv_residual_applies(true, &conv_out, &w.out_proj, residual) {
-            return crate::nn::ops::gemv_residual(&conv_out, w.out_proj.weight(), residual);
+            return crate::nn::ops::gemv_residual(&conv_out, w.out_proj.dense_weight()?, residual);
         }
         w.out_proj.forward(&conv_out)? + residual
     }
@@ -9135,8 +9202,14 @@ impl<P: Profile> crate::optimizer::Visit for ShortConv<P> {
         let (h, lc) = (self.hidden_size, self.l_cache);
         let width = self.conv_state.width(lc);
         let dt = self.conv_weight.dtype();
-        let w_in = w.weight("in_proj.weight", Shape::of(&[3 * h, h]), dt);
-        let bcx = w.gemv(w_in, xn);
+        let bcx = visit_proj(
+            w,
+            "in_proj.weight",
+            &self.in_proj,
+            Shape::of(&[3 * h, h]),
+            dt,
+            xn,
+        );
         let bcx = w.view("transpose", bcx, Shape::of(&[1, 3 * h, 1]));
         let b = w.view("narrow", bcx, Shape::of(&[1, h, 1]));
         let c = w.view("narrow", bcx, Shape::of(&[1, h, 1]));
@@ -9166,8 +9239,14 @@ impl<P: Profile> crate::optimizer::Visit for ShortConv<P> {
                 );
                 ring.push(out);
                 w.mark(&ring, Region::ConvRing(l));
-                let w_out = w.weight("out_proj.weight", Shape::of(&[h, h]), dt);
-                return w.gemv(w_out, out);
+                return visit_proj(
+                    w,
+                    "out_proj.weight",
+                    &self.out_proj,
+                    Shape::of(&[h, h]),
+                    dt,
+                    out,
+                );
             }
             (arm, fused) => {
                 let bx = w.mul(b, x);
@@ -9222,8 +9301,14 @@ impl<P: Profile> crate::optimizer::Visit for ShortConv<P> {
         };
         w.mark(&ring, Region::ConvRing(l));
         let out = w.view("transpose", out, Shape::of(&[1, 1, h]));
-        let w_out = w.weight("out_proj.weight", Shape::of(&[h, h]), dt);
-        w.gemv(w_out, out)
+        visit_proj(
+            w,
+            "out_proj.weight",
+            &self.out_proj,
+            Shape::of(&[h, h]),
+            dt,
+            out,
+        )
     }
 }
 
@@ -9282,6 +9367,27 @@ fn placeholder_linear(vb: &VarBuilder) -> Result<Linear> {
         Tensor::zeros((1, 1), vb.dtype(), vb.device())?,
         None,
     ))
+}
+
+/// The walk's product of `proj` (the weight `leaf`, `shape`) and `x`: the
+/// GEMV over a dense weight at `dt`, the quantized matvec over packed blocks
+/// (`optimizer::walk::qmat_operand`).
+#[cfg(not(target_arch = "wasm32"))]
+fn visit_proj(
+    w: &mut crate::optimizer::Walker,
+    leaf: &str,
+    proj: &Linear,
+    shape: crate::optimizer::Shape,
+    dt: DType,
+    x: crate::optimizer::NodeId,
+) -> crate::optimizer::NodeId {
+    match proj.blocks() {
+        Some(q) => w.project_qmat(leaf, q, x),
+        None => {
+            let weight = w.weight(leaf, shape, dt);
+            w.gemv(weight, x)
+        }
+    }
 }
 
 /// The parts of layer `l`'s weight group, in `GROUP_PART_*` order: the
@@ -9371,22 +9477,31 @@ fn norm_gemv_arm() -> bool {
 /// instantiated at (`nn::ops::gemv_norm_serves`: at `k <= 64` or
 /// `k >= 16 n` the GEMV takes another tile, and the unfused pair runs).
 fn norm_gemv_applies(on: bool, x: &Tensor, norm: &RmsNorm, proj: &Linear) -> bool {
+    let Some(weight) = proj.dense() else {
+        return false;
+    };
     on && x.device().is_metal()
         && matches!(x.dims(), [1, 1, _] | [1, _])
-        && x.dims().last() == Some(&proj.weight().dims()[1])
-        && crate::nn::ops::gemv_norm_serves(proj.weight().dims()[0], proj.weight().dims()[1])
+        && x.dims().last() == Some(&weight.dims()[1])
+        && crate::nn::ops::gemv_norm_serves(weight.dims()[0], weight.dims()[1])
         && proj.bias().is_none()
         && x.is_contiguous()
-        && proj.weight().is_contiguous()
+        && weight.is_contiguous()
         && matches!(x.dtype(), DType::F16 | DType::BF16 | DType::F32)
         && norm.weight().dtype() == x.dtype()
         && norm.weight().is_contiguous()
-        && norm.weight().elem_count() == proj.weight().dims()[1]
+        && norm.weight().elem_count() == weight.dims()[1]
 }
 
 /// `proj(rmsnorm(x))` (and its SiLU) in one dispatch.
 fn norm_gemv(x: &Tensor, norm: &RmsNorm, proj: &Linear, silu: bool) -> Result<Tensor> {
-    crate::nn::ops::gemv_norm(x, proj.weight(), norm.weight(), norm.eps() as f32, silu)
+    crate::nn::ops::gemv_norm(
+        x,
+        proj.dense_weight()?,
+        norm.weight(),
+        norm.eps() as f32,
+        silu,
+    )
 }
 
 /// `LLOOM_LFM2_ABLATE` names `norm`: the decode step skips the layers'
@@ -9448,6 +9563,19 @@ fn prefill_ablated(class: PrefillAblation, x: &Tensor) -> bool {
 }
 
 impl<P: Profile> DecoderLayer<P> {
+    /// The layer's resident projections: the mixer's, then a dense MLP's
+    /// (a routed FFN's experts are the MoE layer's own storage).
+    fn projections(&self) -> Vec<&Linear> {
+        let mut out = match &self.kind {
+            LayerKind::Attention(a) => vec![&a.q_proj, &a.k_proj, &a.v_proj, &a.o_proj],
+            LayerKind::ShortConv(c) => vec![&c.in_proj, &c.out_proj],
+        };
+        if let FeedForward::Dense(m) = &self.mlp {
+            out.extend([&m.gate_proj, &m.up_proj, &m.down_proj]);
+        }
+        out
+    }
+
     /// The layer's RMSNorm, or `x` itself under the `norm` ablation at a
     /// one-token step or the `prefill-norm` one at a prefill.
     fn norm(&self, n: &RmsNorm, x: &Tensor) -> Result<Tensor> {
@@ -9562,7 +9690,7 @@ impl<P: Profile> DecoderLayer<P> {
         drop(tier);
         #[cfg(feature = "metal")]
         if moved {
-            if let Device::Metal(m) = mlp.gate.weight().device() {
+            if let Device::Metal(m) = mlp.gate.device() {
                 m.execution_device()?.drop_pass_plans();
             }
         }
@@ -10268,7 +10396,7 @@ impl<P: Profile> Model<P> {
             RmsNorm::new(cfg.hidden_size, cfg.norm_eps, vb_m.pp("embedding_norm"))?;
 
         let lm_head = if cfg.tie_embedding {
-            Linear::from_weights(embed_tokens.embeddings().clone(), None)
+            embed_tokens.tied_head()?
         } else {
             linear(cfg.hidden_size, cfg.vocab_size, vb.pp("lm_head"))?
         };
@@ -10311,7 +10439,89 @@ impl<P: Profile> Model<P> {
             eprintln!("{r}");
             model.fusion_report = Some(r);
         }
+        model.report_packed_weights();
         Ok(model)
+    }
+
+    /// What the projections and the token table hold, by storage kind
+    /// (`f16`, `f32`, `q8_0`, …), with how many of each.
+    pub fn weight_kinds(&self) -> BTreeMap<String, usize> {
+        let mut kinds = BTreeMap::new();
+        let mut count = |kind: String| *kinds.entry(kind).or_insert(0) += 1;
+        count(self.embed_tokens.kind());
+        if !self.embed_tokens.ties(&self.lm_head) {
+            count(self.lm_head.kind());
+        }
+        for layer in &self.layers {
+            for p in layer.projections() {
+                count(p.kind());
+            }
+        }
+        kinds
+    }
+
+    /// The fused GEMV arms the blocks were set to that a packed projection
+    /// cannot take, by arm name: those projections run the composed path.
+    pub fn declined_fused_arms(&self) -> Vec<&'static str> {
+        let mut arms = Vec::new();
+        let mut decline = |on: bool, packed: bool, arm: &'static str| {
+            if on && packed && !arms.contains(&arm) {
+                arms.push(arm);
+            }
+        };
+        for layer in &self.layers {
+            let packed = |p: &Linear| p.blocks().is_some();
+            let mut residual = match &layer.kind {
+                LayerKind::Attention(a) => a.gemv_residual && packed(&a.o_proj),
+                LayerKind::ShortConv(c) => c.gemv_residual && packed(&c.out_proj),
+            };
+            if let FeedForward::Dense(mlp) = &layer.mlp {
+                decline(mlp.gemv_silu, packed(&mlp.gate_proj), "gemv_silu");
+                decline(
+                    mlp.gemv_gate != GateFusion::Off,
+                    packed(&mlp.gate_proj) || packed(&mlp.up_proj),
+                    "gemv_gate",
+                );
+                residual |= mlp.gemv_residual && packed(&mlp.down_proj);
+            }
+            decline(residual, true, "gemv_residual");
+            decline(
+                layer.norm_gemv,
+                layer.projections().iter().any(|p| packed(p)),
+                "norm_gemv",
+            );
+        }
+        arms
+    }
+
+    /// One line naming the packed storage when there is any, and one load
+    /// warning per load when a fused arm declines on it.
+    fn report_packed_weights(&mut self) {
+        let kinds = self.weight_kinds();
+        if kinds
+            .keys()
+            .all(|k| matches!(k.as_str(), "f16" | "bf16" | "f32"))
+        {
+            return;
+        }
+        let list = kinds
+            .iter()
+            .map(|(k, n)| format!("{k} x{n}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        eprintln!("[lfm2 weights: {list}; compute {}]", self.dtype.as_str());
+        let declined = self.declined_fused_arms();
+        if !declined.is_empty() {
+            let w = crate::load_warning::LoadWarning::new(
+                crate::load_warning::LoadWarningKind::FusedArm,
+                format!(
+                    "{} read a dense weight; the packed projections ({list}) run composed",
+                    declined.join(", ")
+                ),
+            );
+            eprintln!("[lfm2: {}]", w.message);
+            self.load_warnings.push(w);
+        }
     }
 
     /// Set every block's epilogue arms (`Fusion=Derived`'s plan).
@@ -10333,7 +10543,7 @@ impl<P: Profile> Model<P> {
     /// The weight name the walk gives `lm_head`'s GEMV: the embedding table
     /// when the two are tied.
     fn lm_head_site(&self) -> String {
-        if self.lm_head.weight().id() == self.embed_tokens.embeddings().id() {
+        if self.embed_tokens.ties(&self.lm_head) {
             "model.embed_tokens.weight".to_string()
         } else {
             "lm_head.weight".to_string()
@@ -11362,12 +11572,12 @@ impl<P: Profile> crate::optimizer::Visit for Model<P> {
     type Out = crate::optimizer::NodeId;
     fn visit(&self, w: &mut crate::optimizer::Walker, (): ()) -> Self::Out {
         use crate::optimizer::Shape;
-        let table = self.embed_tokens.embeddings();
-        let (vocab, h) = (table.dims()[0], table.dims()[1]);
+        let (vocab, h) = (self.lm_head.dims().0, self.embed_tokens.hidden_size());
         let dt = self.dtype;
+        let table_dt = self.embed_tokens.walk_dtype();
         let ids = w.input("input_ids", Shape::of(&[1, 1]), DType::U32);
         let embed = w.scoped("model", |w| {
-            w.weight("embed_tokens.weight", Shape::of(&[vocab, h]), dt)
+            w.weight("embed_tokens.weight", Shape::of(&[vocab, h]), table_dt)
         });
         let mut hidden = w.opaque("is_u32", &[embed, ids], Shape::of(&[1, 1, h]), dt);
         for (l, layer) in self.layers.iter().enumerate() {
@@ -11379,13 +11589,19 @@ impl<P: Profile> crate::optimizer::Visit for Model<P> {
         let hn = w.rms_norm(norm_w, hidden);
         // `i((.., seq_len - 1, ..)).contiguous()`: at `seq_len == 1` a view.
         let last = w.view("index", hn, Shape::of(&[1, h]));
-        let tied = self.lm_head.weight().id() == table.id();
-        let lm_head = if tied {
-            embed
-        } else {
-            w.weight("lm_head.weight", Shape::of(&[vocab, h]), dt)
+        let tied = self.embed_tokens.ties(&self.lm_head);
+        let logits = match (tied, self.lm_head.blocks()) {
+            (true, None) => w.gemv(embed, last),
+            (true, Some(q)) => {
+                let (core, _, _) = crate::optimizer::walk::qmat_operand(q);
+                w.gemv_on(core, embed, last)
+            }
+            (false, None) => {
+                let lm_head = w.weight("lm_head.weight", Shape::of(&[vocab, h]), dt);
+                w.gemv(lm_head, last)
+            }
+            (false, Some(q)) => w.project_qmat("lm_head.weight", q, last),
         };
-        let logits = w.gemv(lm_head, last);
         w.opaque("cast", &[logits], Shape::of(&[1, vocab]), DType::F32)
     }
 }
@@ -11768,7 +11984,7 @@ impl<P: Profile> CausalLM for Model<P> {
         // `lm_head` is `[vocab, hidden]` (`Model::new`: `linear(hidden, vocab)`
         // or the tied `[vocab, hidden]` embedding), so its leading dim is the
         // vocabulary. 2D by construction, so `dims()[0]` cannot be absent.
-        self.lm_head.weight().dims()[0]
+        self.lm_head.dims().0
     }
 }
 

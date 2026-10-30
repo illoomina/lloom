@@ -20,17 +20,19 @@ fn metal_device() -> Result<Device> {
 
 fn check(dev: &Device, dtype: DType, rows: usize, width: usize, scale: f32) -> Result<()> {
     let n = rows * width;
-    let input = |phase: usize| -> Result<Tensor> {
-        let v: Vec<f32> = (0..n + width)
+    // The operands start at different nonzero offsets, so a binding that
+    // reads one operand at the other's offset is visible.
+    let input = |phase: usize, start: usize| -> Result<Tensor> {
+        let v: Vec<f32> = (0..n + 2 * width)
             .map(|i| (((i * 17 + phase) % 97) as f32 / 43.0 - 1.0) * scale)
             .collect();
         Tensor::new(v.as_slice(), dev)?
             .to_dtype(dtype)?
-            .narrow(0, width, n)?
+            .narrow(0, start, n)?
             .reshape((rows, 1, width))
     };
-    let lhs = input(3)?;
-    let rhs = input(29)?;
+    let lhs = input(3, width)?;
+    let rhs = input(29, 2 * width)?;
     let w: Vec<f32> = (0..width + 3)
         .map(|i| 0.5 + (i % 13) as f32 / 11.0)
         .collect();

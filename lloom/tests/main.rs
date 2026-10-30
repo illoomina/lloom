@@ -32,6 +32,7 @@ mod dspark_decode_identity;
 mod emulated_bf16_load;
 mod fixture_switch;
 mod flash_decoding_batch;
+mod flash_paged_rows_own_bits;
 mod gdn_step_forms;
 mod gemv_norm;
 mod gemv_swiglu_shape;

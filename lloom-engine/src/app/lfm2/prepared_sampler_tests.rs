@@ -609,7 +609,7 @@ fn prepared_unfiltered_owner_uses_native_blocking_including_diagnostics() -> Res
             let request = DecodeParams {
                 readback: ReadbackArm::Blocking,
                 logits_digest: digest,
-                logprobs: logprobs.then(|| crate::LogprobRequest { top: 3, rows: true }),
+                logprobs: logprobs.then_some(crate::LogprobRequest { top: 3, rows: true }),
                 ..base.clone()
             };
             let out = run(&engine, &prompt, &request)?;

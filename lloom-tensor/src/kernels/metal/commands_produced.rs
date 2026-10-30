@@ -399,7 +399,6 @@ pub(super) struct ProducedState {
     cancels: parking_lot::Mutex<Vec<Cancel>>,
     cancels_delegated: AtomicU64,
     beside_its_event: AtomicU64,
-    beside_logged: AtomicBool,
     /// Inputs gated so far: an input's `seq`, a cancellation's bound.
     gated: AtomicU64,
     late_logged: AtomicBool,
@@ -437,7 +436,6 @@ impl ProducedState {
             cancels: parking_lot::Mutex::new(Vec::new()),
             cancels_delegated: AtomicU64::new(0),
             beside_its_event: AtomicU64::new(0),
-            beside_logged: AtomicBool::new(false),
             gated: AtomicU64::new(0),
             late_logged: AtomicBool::new(false),
             cancelled_event: AtomicUsize::new(0),
@@ -453,20 +451,21 @@ impl ProducedState {
         MetalKernelError::QueueUnavailable(*self.cancel_reason.lock())
     }
 
-    /// A recording gated a second value of one event: counted, and reported
-    /// once, since each value holds a slot a full gate cuts for.
-    fn note_beside_its_event(&self, value: u64) {
+    /// A recording gated a second value of one event: counted, since each
+    /// value holds a slot a full gate cuts for. Called under the state lock,
+    /// so it only counts; the count is printed at the run's report.
+    fn note_beside_its_event(&self) {
         self.beside_its_event.fetch_add(1, Ordering::Relaxed);
-        if !self.beside_logged.swap(true, Ordering::Relaxed) {
-            eprintln!(
-                "[metal] one recording gated host input {value} beside another value of its event"
-            );
-        }
     }
 
     #[cfg(test)]
     pub(super) fn late_logged_for_test(&self) -> bool {
         self.late_logged.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(super) fn me_for_test(&self) -> Weak<CommandsCore> {
+        self.me.clone()
     }
 
     pub(super) fn io_notification(&self) -> &NotifyBlock {
@@ -1030,7 +1029,7 @@ impl Commands {
         let mut input = Input::new(event, value)?;
         input.seq = self.core.produced.gated.fetch_add(1, Ordering::SeqCst) + 1;
         match state.gate.add(input) {
-            Ok(Added::BesideItsEvent) => self.core.produced.note_beside_its_event(value),
+            Ok(Added::BesideItsEvent) => self.core.produced.note_beside_its_event(),
             Ok(Added::New | Added::Repeat) => {}
             Err(_) => {
                 return Err(MetalKernelError::QueueUnavailable(

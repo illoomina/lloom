@@ -10,7 +10,7 @@ use objc2::{rc::Retained, runtime::ProtocolObject};
 use objc2_metal::*;
 use parking_lot::Mutex;
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     ptr::NonNull,
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -418,6 +418,61 @@ struct SlotTrace {
     commit_max_ns: std::sync::atomic::AtomicU64,
     last_bytes: std::sync::atomic::AtomicU64,
     max_bytes: std::sync::atomic::AtomicU64,
+    /// `[listing][class column][adds, bytes]` (`SlotResidency::census`).
+    census: [[[std::sync::atomic::AtomicU64; 2]; crate::residency_class::CENSUS_CLASSES];
+        crate::residency_class::SlotListing::ALL.len()],
+    /// The census by `(listing, class column, listing site)`.
+    sites: Mutex<HashMap<(u8, u8, u32), crate::residency_class::CensusCell>>,
+    /// The device's sets, read for the class and site a binding is listed
+    /// under.
+    sets: OnceLock<Arc<super::ResidencySet>>,
+}
+
+/// How a slot met a resource: bound by address as a buffer, a constant page
+/// of its own, or named through a raw path (a blit operand, an ICB run's
+/// `useResources`, the ICB itself).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BindKind {
+    Buffer,
+    Page,
+    Raw,
+}
+
+impl SlotTrace {
+    /// Counts `resource`, met for the first time in a generation, in the
+    /// census: why it was or was not left to the device's sets, the class
+    /// they list it under, its bytes, and the site that listed it. The
+    /// instrument only: takes the device set's lock and a map lock.
+    fn census(
+        &self,
+        resource: &ProtocolObject<dyn MTLResource>,
+        listing: super::DeviceListing,
+        kind: BindKind,
+    ) {
+        use crate::residency_class::{census_column, ResidencyClass, SlotListing};
+        let key = resource as *const _ as usize;
+        let placed = self.sets.get().and_then(|sets| sets.listing_of(key));
+        let why = match (kind, listing) {
+            (BindKind::Page, _) => SlotListing::Page,
+            (BindKind::Raw, _) => SlotListing::Raw,
+            (BindKind::Buffer, super::DeviceListing::Pool) => SlotListing::Covered,
+            (BindKind::Buffer, super::DeviceListing::Held) => SlotListing::Held,
+            (BindKind::Buffer, super::DeviceListing::No) if placed.is_some() => SlotListing::Listed,
+            (BindKind::Buffer, super::DeviceListing::No) => SlotListing::Unlisted,
+        };
+        let class = placed
+            .map(|(class, _)| class)
+            .or_else(|| resource.heap().map(|_| ResidencyClass::HeapChunk));
+        let (row, col) = (why as usize, census_column(class));
+        let bytes = MTLResource::allocatedSize(resource) as u64;
+        self.census[row][col][0].fetch_add(1, Ordering::Relaxed);
+        self.census[row][col][1].fetch_add(bytes, Ordering::Relaxed);
+        let site = placed.map_or(0, |(_, site)| site);
+        let mut sites = self.sites.lock();
+        let cell = sites.entry((row as u8, col as u8, site)).or_default();
+        cell.adds += 1;
+        cell.bytes += bytes;
+    }
 }
 
 impl Queue {
@@ -436,7 +491,46 @@ impl Queue {
             commit_max_ns: t.commit_max_ns.load(Ordering::Relaxed),
             last_bytes: t.last_bytes.load(Ordering::Relaxed),
             max_bytes: t.max_bytes.load(Ordering::Relaxed),
+            census: std::array::from_fn(|row| {
+                std::array::from_fn(|col| crate::residency_class::CensusCell {
+                    adds: t.census[row][col][0].load(Ordering::Relaxed),
+                    bytes: t.census[row][col][1].load(Ordering::Relaxed),
+                })
+            }),
         })
+    }
+
+    /// The slot census by the site that listed each allocation, most
+    /// resources first; empty when the instrument is off. Symbolizes each
+    /// site once.
+    pub(crate) fn slot_sites(&self) -> Vec<crate::residency_class::SlotSite> {
+        use crate::residency_class::{ResidencyClass, SlotListing, SlotSite};
+        if !self.slot_trace.on {
+            return Vec::new();
+        }
+        let cells: Vec<_> = self
+            .slot_trace
+            .sites
+            .lock()
+            .iter()
+            .map(|(&k, &c)| (k, c))
+            .collect();
+        let mut out: Vec<SlotSite> = cells
+            .into_iter()
+            .map(|((row, col, site), cell)| SlotSite {
+                listing: SlotListing::ALL[row as usize],
+                class: ResidencyClass::ALL.get(col as usize).copied(),
+                frames: super::residency_set::listing_sites::frames(site),
+                cell,
+            })
+            .collect();
+        out.sort_by(|a, b| b.cell.adds.cmp(&a.cell.adds).then(a.frames.cmp(&b.frames)));
+        out
+    }
+
+    /// The device's sets the slot census reads classes and sites from.
+    pub(super) fn census_sets(&self, sets: Arc<super::ResidencySet>) {
+        let _ = self.slot_trace.sets.set(sets);
     }
 
     /// Commits a slot's set, timing the commit when the instrument is on.
@@ -613,11 +707,21 @@ impl Slot {
     }
 
     /// Lists `resource` in this slot's set and retains it until the slot
-    /// completes, once a generation. `covered`: the device's residency sets
-    /// list it until its last GPU reader completes (`Buffer::device_listed`);
-    /// under a `*-diff` declaration the slot's set leaves it to them.
-    fn resource(&mut self, resource: &ProtocolObject<dyn MTLResource>, covered: bool) {
+    /// completes, once a generation. `listing`: whether the device's
+    /// residency sets list it until its last GPU reader completes
+    /// (`Buffer::device_listing`); under a `*-diff` declaration the slot's
+    /// set leaves such a binding to them.
+    fn resource(
+        &mut self,
+        resource: &ProtocolObject<dyn MTLResource>,
+        listing: super::DeviceListing,
+        kind: BindKind,
+    ) {
+        let covered = listing.covered();
         if self.seen.insert(resource as *const _ as usize) {
+            if self.trace.on {
+                self.trace.census(resource, listing, kind);
+            }
             // SAFETY: the caller's borrowed resource is live; the retained
             // reference remains until this slot completes.
             self.resources.push(
@@ -1729,22 +1833,22 @@ impl Encoder {
             .slot
             .as_mut()
             .expect("encoding")
-            .resource(resource, false);
+            .resource(resource, super::DeviceListing::No, BindKind::Raw);
     }
-    /// Binds `buffer` at `index` by GPU address. `covered`: the device's
-    /// residency sets list it until its last GPU reader completes
-    /// (`Buffer::device_listed`).
+    /// Binds `buffer` at `index` by GPU address. `listing`: whether the
+    /// device's residency sets list it until its last GPU reader completes
+    /// (`Buffer::device_listing`).
     pub fn buffer(
         &self,
         index: usize,
         buffer: Option<&ProtocolObject<dyn MTLBuffer>>,
         offset: usize,
-        covered: bool,
+        listing: super::DeviceListing,
     ) {
         let mut state = self.submission.state.lock();
         let slot = state.slot.as_mut().expect("encoding");
         let address = buffer.map_or(0, |b| {
-            slot.resource(ProtocolObject::from_ref(b), covered);
+            slot.resource(ProtocolObject::from_ref(b), listing, BindKind::Buffer);
             b.gpuAddress() + offset as u64
         });
         unsafe {
@@ -1788,7 +1892,11 @@ impl Encoder {
                 length,
             );
         }
-        slot.resource(ProtocolObject::from_ref(&*page), false);
+        slot.resource(
+            ProtocolObject::from_ref(&*page),
+            super::DeviceListing::No,
+            BindKind::Page,
+        );
         unsafe {
             slot.table
                 .setAddress_atIndex(page.gpuAddress() + slot.offset as u64, index);
@@ -1824,6 +1932,7 @@ impl Encoder {
 
 #[cfg(test)]
 mod tests {
+    use super::super::DeviceListing;
     use super::*;
     use objc2_foundation::NSString;
     // CPU-only: deliberately stop between feedback initialization and terminal
@@ -1937,7 +2046,7 @@ mod tests {
                 .unwrap();
             let encoder = submission.encoder().unwrap();
             encoder.pipeline(&pipeline);
-            encoder.buffer(0, Some(&buffer), 0, false);
+            encoder.buffer(0, Some(&buffer), 0, DeviceListing::No);
             unsafe {
                 encoder.bytes(1, NonNull::from(&n).cast(), std::mem::size_of_val(&n));
             }
@@ -2019,7 +2128,7 @@ mod tests {
                 }
                 let encoder = submission.encoder().unwrap();
                 encoder.pipeline(&pipeline);
-                encoder.buffer(0, Some(&buffer), 0, false);
+                encoder.buffer(0, Some(&buffer), 0, DeviceListing::No);
                 for _ in 0..count {
                     encoder.raw.dispatchThreads_threadsPerThreadgroup(
                         MTLSize {
@@ -2159,7 +2268,7 @@ mod tests {
             let submission = queue.acquire().unwrap();
             let encoder = submission.encoder().unwrap();
             encoder.pipeline(&pipeline);
-            encoder.buffer(0, Some(&buffer), 0, false);
+            encoder.buffer(0, Some(&buffer), 0, DeviceListing::No);
             // Each recording crosses the regular page boundary and also uses
             // an oversize page. Constants differ within one native buffer.
             for value in [n + 1000, n] {
@@ -2291,7 +2400,7 @@ mod tests {
             .unwrap();
         let submission = queue.acquire().unwrap();
         let encoder = submission.encoder().unwrap();
-        encoder.buffer(0, Some(&buffer), 0, true);
+        encoder.buffer(0, Some(&buffer), 0, DeviceListing::Pool);
         encoder.raw.endEncoding();
         submission.commit().unwrap();
         submission.wait().unwrap();
@@ -2334,7 +2443,7 @@ mod tests {
             let submission = queue.acquire().unwrap();
             let encoder = submission.encoder().unwrap();
             encoder.pipeline(&pipeline);
-            encoder.buffer(0, Some(&buffer), 0, false);
+            encoder.buffer(0, Some(&buffer), 0, DeviceListing::No);
             unsafe {
                 encoder.bytes(1, NonNull::from(&n).cast(), 4);
             }

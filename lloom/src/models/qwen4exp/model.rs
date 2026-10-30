@@ -2370,26 +2370,35 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
     /// Open a planned pass for `shape` (`DESIGN.md` §9.2aa: the pass's
     /// activations served by ordinal from one base, no allocation on a
     /// cached key) — when the device has pass plans enabled and no driver
-    /// holds a pass already. Returns whether this call opened it. The pass
-    /// is keyed as the model's own: it opens after the embedding a driver's
-    /// pass of the same shape holds, so the two are different sequences.
-    /// It opens the allocation sequence `variant` of `shape`
-    /// ([`Self::decode_variant`]); variant 0 is the shape's plain sequence.
-    fn open_pass_variant(&self, shape: crate::nn::decode::PassShape, variant: u32) -> Result<bool> {
+    /// holds a pass already. Returns the pass when this call opened it, for
+    /// [`Self::close_pass`]; dropped instead, after the body failed, it
+    /// aborts the pass (`pass-plan-design.md` §24). The pass is keyed as the
+    /// model's own: it opens after the embedding a driver's pass of the same
+    /// shape holds, so the two are different sequences. It opens the
+    /// allocation sequence `variant` of `shape` ([`Self::decode_variant`]);
+    /// variant 0 is the shape's plain sequence.
+    fn open_pass_variant(
+        &self,
+        shape: crate::nn::decode::PassShape,
+        variant: u32,
+    ) -> Result<Option<crate::nn::decode::OpenPass<lloom_tensor::Device>>> {
         #[cfg(feature = "metal")]
-        if let Ok(m) = self.device().as_metal_device() {
-            let m = m.execution_device()?;
-            if !m.pass_plans_enabled() || m.pass_open() {
-                return Ok(false);
+        {
+            let device = self.device();
+            if let Ok(m) = device.as_metal_device() {
+                let m = m.execution_device()?;
+                if !m.pass_plans_enabled() || m.pass_open() {
+                    return Ok(None);
+                }
+                let Some(key) = Self::pass_key(shape, PassOpener::Model) else {
+                    return Ok(None);
+                };
+                m.begin_pass(key.with_variant(variant))?;
+                return Ok(Some(crate::nn::decode::OpenPass::adopt(device)));
             }
-            let Some(key) = Self::pass_key(shape, PassOpener::Model) else {
-                return Ok(false);
-            };
-            m.begin_pass(key.with_variant(variant))?;
-            return Ok(true);
         }
         let _ = (shape, variant);
-        Ok(false)
+        Ok(None)
     }
 
     /// Which of this model's decode sequences a step at `pos` runs, as its
@@ -2494,11 +2503,14 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
         Some(PassKey::new(kind).opened_by(opener))
     }
 
-    fn close_pass(&self, opened: bool) -> Result<()> {
-        if opened {
-            crate::nn::decode::end_pass(&self.device())?;
+    fn close_pass(
+        &self,
+        opened: Option<crate::nn::decode::OpenPass<lloom_tensor::Device>>,
+    ) -> Result<()> {
+        match opened {
+            Some(pass) => pass.finish(),
+            None => Ok(()),
         }
-        Ok(())
     }
 
     /// Decode hints handed to the prefetchers so far (the process).
@@ -2894,6 +2906,17 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
         }
         if let Some(m) = &mut self.mtp {
             m.layer_mut().moe_mut().set_f16_fuse(on);
+        }
+    }
+
+    /// Select whether every layer's routed SwiGLU rides the gate|up launch's
+    /// store (`MoeLayer::set_routed_glu`; `qwen4exp.routed_glu` by default).
+    pub fn set_routed_glu(&mut self, on: bool) {
+        for l in &mut self.layers {
+            l.moe.set_routed_glu(on);
+        }
+        if let Some(m) = &mut self.mtp {
+            m.layer_mut().moe_mut().set_routed_glu(on);
         }
     }
 

@@ -657,6 +657,98 @@ fn ragged_steps_are_planned_under_both_width_arms() -> Result<()> {
     Ok(())
 }
 
+/// Rows admitted whole (`prefill_chunk == 0`) under the plan cache decode
+/// what the pool path decodes. Each arrival's prefill runs in passes of its
+/// own before the step samples the live rows, so the live rows' logits are
+/// read after a later pass ran; and the arrival's own logits are read after
+/// the step's decode pass and the later arrivals' prefills. Under a served
+/// plan those passes write into the slots the logits were left in, unless
+/// the logits are held (`decode::hold_in`). The gaps in the arrivals give a
+/// step whose live rows' logits are a pass's output as it left them.
+#[test]
+fn rows_admitted_whole_decode_the_pool_paths_ids_under_plans() -> Result<()> {
+    use lloom::generation::{LogitsProcessor, Sampling};
+    use lloom::nn::{DecodeOptions, Session};
+    let _serial = SERIAL.lock();
+    let dev = Device::new_metal(0)?;
+    let Device::Metal(m) = &dev else {
+        unreachable!()
+    };
+    let mut cfg = tiny_config(ConvState::RotatingRing { k: 4 });
+    cfg.conv_prefill_ctx = true;
+    let model = build::<RewindableExact>(&cfg, &dev)?;
+    let prompts: Vec<Vec<u32>> = vec![(1..=10).collect(), (11..=17).collect(), (21..=33).collect()];
+    let refs: Vec<&[u32]> = prompts.iter().map(|p| p.as_slice()).collect();
+    let arrivals = [0u64, 2, 3];
+    let run = |lookahead: usize| -> Result<Vec<Vec<u32>>> {
+        let mut sessions: Vec<Session<'_, Model<RewindableExact>>> = prompts
+            .iter()
+            .map(|_| {
+                Ok(Session::new(
+                    &model,
+                    State::<RewindableExact>::new(true, DType::F16, &cfg, &dev)?,
+                ))
+            })
+            .collect::<Result<_>>()?;
+        let opts = DecodeOptions {
+            lookahead,
+            prefill_chunk: 0,
+            ..DecodeOptions::new(5)
+        };
+        let outs = Session::decode_batched_admitted(
+            &mut sessions,
+            &mut LogitsProcessor::from_sampling(0, Sampling::ArgMax),
+            &refs,
+            &arrivals,
+            &opts,
+            &[u32::MAX],
+            &dev,
+            &mut |_, _| Ok(()),
+        )?;
+        Ok(outs.into_iter().map(|o| o.ids).collect())
+    };
+    let want: Vec<_> = [0, 1].map(&run).into_iter().collect::<Result<_>>()?;
+    assert!(want.iter().flatten().all(|ids| ids.len() == 5), "{want:?}");
+
+    m.enable_pass_plans(ArenaLayout::Packed);
+    let mut seen = Vec::new();
+    for round in 0..3 {
+        for (arm, lookahead) in [0, 1].into_iter().enumerate() {
+            let before = m.pass_plan_counters().unwrap();
+            let got = run(lookahead)?;
+            let c = m.pass_plan_counters().unwrap();
+            eprintln!(
+                "ADMIT_WHOLE round={round} lookahead={lookahead} same_as_pool={} \
+                 served+={} got={got:?} pool={:?}",
+                got == want[arm],
+                c.served - before.served,
+                want[arm]
+            );
+            seen.push((round, lookahead, got == want[arm]));
+        }
+    }
+    let (keys, _) = m.pass_plan_report().unwrap();
+    let prefill = keys
+        .iter()
+        .filter(|(k, ..)| matches!(k.kind, PassKind::Prefill { .. }))
+        .count();
+    let c = m.pass_plan_counters().unwrap();
+    eprintln!(
+        "ADMIT_WHOLE counters={c:?} prefill_keys={prefill} of {}",
+        keys.len()
+    );
+    assert!(
+        prefill > 0 && c.served > 0,
+        "no prefill pass was planned or nothing was served, so nothing here was read: {c:?}"
+    );
+    let wrong: Vec<_> = seen.iter().filter(|(.., same)| !same).collect();
+    assert!(
+        wrong.is_empty(),
+        "rows admitted whole left the pool path's ids under plans (round, lookahead): {wrong:?}"
+    );
+    Ok(())
+}
+
 #[test]
 fn the_ladder_rounds_down_to_a_rung() {
     use lloom::nn::ladder_width;

@@ -174,3 +174,31 @@ fn default_executor_is_classical() {
     let device = device();
     assert!(commands(&device).executor().is_classical());
 }
+
+/// An executor is refused on the unretained kind only: its indirect command
+/// buffers are not held for a command buffer that does not retain them. A
+/// retaining queue carrying the unlisting hold (`kernels.residency.metal4_cover
+/// = held`, §15.1r) is not that kind, and the refusal keys on the kind, not on
+/// the hold.
+#[test]
+fn an_executor_is_refused_on_the_unretained_kind_only() {
+    use crate::kernels::metal::commands::CommandBufferKind;
+    use crate::kernels::metal::completion::CompletionWait;
+    let device = device();
+    let refused = |kind| {
+        let queue = device.new_command_queue().unwrap();
+        let residency_set = Arc::new(ResidencySet::new(&device));
+        let cmds =
+            Commands::new_with(queue, residency_set, CompletionWait::Synchronize, kind).unwrap();
+        cmds.set_executor(Arc::new(ExecutorSlot::Custom(Arc::new(Recorder::default()))));
+        let refused = matches!(
+            cmds.command_encoder(),
+            Err(crate::kernels::MetalKernelError::ArmRefused(_))
+        );
+        (refused, cmds.in_flight_hold().is_some())
+    };
+    let (unretained, unretained_hold) = refused(CommandBufferKind::Unretained);
+    assert!(unretained && unretained_hold, "the unretained kind refuses it");
+    let (retaining, _) = refused(CommandBufferKind::Retaining);
+    assert!(!retaining, "a retaining queue runs it, a hold or none");
+}

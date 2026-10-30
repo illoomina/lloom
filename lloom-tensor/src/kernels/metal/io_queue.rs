@@ -41,6 +41,10 @@ impl From<MetalKernelError> for ValidatedIssueError {
 /// A file opened for `MTLIOCommandQueue` loads.
 pub struct IoFile {
     handle: Retained<ProtocolObject<dyn MTLIOFileHandle>>,
+    /// The file's length when it was opened: a load past it completes
+    /// without an error and lands only the bytes that exist, so it is
+    /// refused before it is issued (`checked_source_range`).
+    len: u64,
 }
 
 // SAFETY: an `MTLIOFileHandle` is an immutable Metal object usable from any
@@ -85,6 +89,25 @@ fn checked_load_range(
     Ok(())
 }
 
+/// A load's source range against the file's length. Metal reports a load
+/// past the end as complete, with only the bytes that exist landed, so the
+/// work behind it would read a slot the load never wrote.
+fn checked_source_range(
+    src_offset: u64,
+    len: usize,
+    file_len: u64,
+) -> Result<(), MetalKernelError> {
+    let end = u64::try_from(len)
+        .ok()
+        .and_then(|len| src_offset.checked_add(len));
+    match end {
+        Some(end) if end <= file_len => Ok(()),
+        _ => Err(MetalKernelError::FailedToCreateResource(format!(
+            "io load source range {src_offset}+{len} passes the file's end ({file_len} bytes)"
+        ))),
+    }
+}
+
 /// Entire-batch validation precedes the first compute signal or IO submission,
 /// including ranges assigned to later lanes. No descriptor copy is needed:
 /// IoLoad and Buffer extents remain immutable throughout the borrowed batch.
@@ -99,6 +122,7 @@ fn validate_loads(loads: &[IoLoad<'_>]) -> Result<(), MetalKernelError> {
             load.src_offset,
             load.len,
         )?;
+        checked_source_range(load.src_offset, load.len, load.file.len)?;
         total = total
             .checked_add(u64::try_from(load.len).map_err(|_| {
                 MetalKernelError::FailedToCreateResource("io load byte count overflow".into())
@@ -253,6 +277,11 @@ impl IoQueue {
         let s = path.to_str().ok_or_else(|| {
             MetalKernelError::FailedToCreateResource(format!("{}: not UTF-8", path.display()))
         })?;
+        let len = std::fs::metadata(path)
+            .map_err(|e| {
+                MetalKernelError::FailedToCreateResource(format!("{}: {e}", path.display()))
+            })?
+            .len();
         let url = NSURL::fileURLWithPath(&NSString::from_str(s));
         let handle = self
             .device
@@ -264,7 +293,7 @@ impl IoQueue {
                     path.display()
                 ))
             })?;
-        Ok(IoFile { handle })
+        Ok(IoFile { handle, len })
     }
 
     /// Issue `loads` as one IO command buffer, ordered after every command
@@ -461,7 +490,17 @@ impl std::fmt::Debug for IoFile {
 
 #[cfg(test)]
 mod preflight_tests {
-    use super::checked_load_range;
+    use super::{checked_load_range, checked_source_range};
+
+    #[test]
+    fn a_source_range_past_the_files_end_is_refused() {
+        assert!(checked_source_range(0, 16, 16).is_ok());
+        assert!(checked_source_range(8, 8, 16).is_ok());
+        assert!(checked_source_range(16, 0, 16).is_ok());
+        assert!(checked_source_range(16, 1, 16).is_err());
+        assert!(checked_source_range(8, 16, 16).is_err());
+        assert!(checked_source_range(u64::MAX, 1, u64::MAX).is_err());
+    }
 
     #[test]
     fn view_and_raw_extents_are_checked_independently() {

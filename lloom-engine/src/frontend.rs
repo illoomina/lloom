@@ -89,6 +89,11 @@ pub enum When {
     /// under the ceiling, so a row's route never depends on how many rows its
     /// steps held, which follows the requests' arrival.
     MetalBatched,
+    /// [`When::Metal`] with `--model` naming a Qwen4-exp checkpoint (the
+    /// family the loader dispatches to: a GGUF whose header names
+    /// `qwen4exp`). Its request commits hundreds of command buffers where
+    /// LFM2's commits tens (`tuning.md` §6.3p).
+    Qwen4Exp,
 }
 
 impl When {
@@ -122,6 +127,9 @@ impl When {
                     && o.scheduler.max_sequences > 1
                     && o.scheduler.max_sequences <= o.tuning.gemm.f16_rows_max
             }
+            When::Qwen4Exp => {
+                When::Metal.holds(o) && o.load.model.as_deref().is_some_and(is_qwen4exp)
+            }
         }
     }
 
@@ -138,7 +146,23 @@ impl When {
             When::MetalBatched => {
                 "on Metal at scheduler.max_sequences from 2 to kernels.gemm.f16_rows_max"
             }
+            When::Qwen4Exp => "the model is Qwen4-exp, on Metal",
         }
+    }
+}
+
+/// Whether the loader dispatches `path` to Qwen4-exp (`app::family::detect`):
+/// it reads the GGUF header, once per resolution, never per token. A build
+/// without `serve` has no loader and no front-end, so nothing is.
+fn is_qwen4exp(path: &std::path::Path) -> bool {
+    #[cfg(feature = "serve")]
+    {
+        crate::app::family::detect(path).is_ok_and(|(f, _)| f.name() == "qwen4exp")
+    }
+    #[cfg(not(feature = "serve"))]
+    {
+        let _ = path;
+        false
     }
 }
 
@@ -206,6 +230,11 @@ rows! {
         // §6.3n): `before` is the library's value; decision 56
         // (`EXCEPTIONS`) lands `heartbeat`. Metal 4 ignores the arm.
         Metal: "kernels.residency.attach" = "queue",
+        // What a Metal 4 command buffer declares resident (`tuning.md`
+        // §6.3p): `before` is the library's value; decision 62
+        // (`EXCEPTIONS`) lands `queue-diff` for Qwen4-exp, whose request
+        // commits hundreds of command buffers. LFM2 keeps `slots`.
+        Qwen4Exp: "kernels.residency.metal4" = "slots",
         // LFM2 (safetensors) only: its `Config` axes and LFM2 kernels.
         ModelAxes: "kernels.attention.flash.partial_block" = "8",
         // Shared with Qwen4-exp's HC norm arm, +6.6% ms/token there.
@@ -309,6 +338,21 @@ rows! {
         frontend: Frontend::Bench,
         when: When::MetalBatched,
         before: "false",
+    },
+    // The batched loop's counter cut on a decode-only step (`tuning.md`
+    // §13.5r): `before` is the library's value; decision 71 (`EXCEPTIONS`)
+    // lands `all` on LFM2. Qwen4-exp and the other GGUF families keep `off`.
+    Row {
+        key: "decode.batched.cut_hold",
+        frontend: Frontend::Serve,
+        when: When::ModelAxes,
+        before: "off",
+    },
+    Row {
+        key: "decode.batched.cut_hold",
+        frontend: Frontend::Bench,
+        when: When::ModelAxes,
+        before: "off",
     },
 }
 
@@ -493,7 +537,51 @@ pub const EXCEPTIONS: &[Exception] = &[Exception {
     landed: true,
     owner: "#1084",
     what: "the f16 row axis takes up to 12 rows, one value for the batched decode rows and the batched speculative windows, so the decode rows' default batch is 2 to 12 sequences; --gemm-f16-rows-max 10 opts out",
+}, Exception {
+    decision: 62,
+    key: "kernels.residency.metal4",
+    frontend: Frontend::Chat,
+    when: When::Qwen4Exp,
+    before: "slots",
+    after: "queue-diff",
+    landed: true,
+    owner: "#1092",
+    what: DECISION_62,
+}, Exception {
+    decision: 62,
+    key: "kernels.residency.metal4",
+    frontend: Frontend::Serve,
+    when: When::Qwen4Exp,
+    before: "slots",
+    after: "queue-diff",
+    landed: true,
+    owner: "#1092",
+    what: DECISION_62,
+}, Exception {
+    decision: 71,
+    key: "decode.batched.cut_hold",
+    frontend: Frontend::Serve,
+    when: When::ModelAxes,
+    before: "off",
+    after: "all",
+    landed: true,
+    owner: "#1084",
+    what: DECISION_71,
+}, Exception {
+    decision: 71,
+    key: "decode.batched.cut_hold",
+    frontend: Frontend::Bench,
+    when: When::ModelAxes,
+    before: "off",
+    after: "all",
+    landed: true,
+    owner: "#1084",
+    what: DECISION_71,
 }];
+
+const DECISION_62: &str = "on Qwen4-exp the device's residency sets go on the Metal 4 queue and each command buffer's slot set lists only what they do not cover: a request commits hundreds of command buffers there, each re-wiring what its slot set lists; LFM2 keeps slots; --residency-metal4 slots opts out";
+
+const DECISION_71: &str = "on LFM2 the batched loop holds the counter cut off over every decode-only forward, the blocking (sampled) arm too: +1.7 to +11.4 % decode and 1 to 7 % less request time at a batch of 4 and 8; Qwen4-exp and the GGUF families keep off; --batched-cut-hold off opts out";
 
 /// The first row of `key` for `frontend`, if the front-end resolves it.
 pub fn row(key: &str, frontend: Frontend) -> Option<&'static Row> {
@@ -771,6 +859,78 @@ mod tests {
         )
         .unwrap();
         assert_eq!(o.prefix.reuse, Some(true), "`none` is the front-end's own");
+    }
+
+    /// Decision 62 by family: a Qwen4-exp checkpoint takes `queue-diff` on
+    /// chat and serve, on Metal; LFM2 (no `--model`, the snapshot), a GGUF of
+    /// another family, bench and the CPU keep the library's `slots`.
+    #[test]
+    fn qwen4exp_alone_declares_the_device_sets_on_the_metal4_queue() {
+        let idx = index();
+        let dir = std::env::temp_dir().join(format!("lloom-frontend-d62-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // A GGUF with no header is Qwen4-exp's (`family::detect`).
+        let qwen = dir.join("qwen4exp.gguf");
+        std::fs::write(&qwen, "").unwrap();
+        let lfm2 = lloom_tensor::quantized::gguf_file::Value::String("lfm2".into());
+        let mut header = std::io::Cursor::new(Vec::new());
+        lloom_tensor::quantized::gguf_file::write(
+            &mut header,
+            &[("general.architecture", &lfm2)],
+            &[],
+        )
+        .unwrap();
+        let other = dir.join("lfm2.gguf");
+        std::fs::write(&other, header.into_inner()).unwrap();
+        let key = "kernels.residency.metal4";
+        let at = |f: Frontend, model: Option<&std::path::Path>, device: &str| -> Value {
+            let mut o = EngineOptions::default();
+            o.load.model = model.map(|p| p.to_path_buf());
+            o.load.device = device.into();
+            apply(&mut o, f, &BTreeSet::new(), &BTreeSet::new()).unwrap();
+            idx.flat(&o)[key].clone()
+        };
+        let typed = |v: &str| {
+            let mut o = EngineOptions::default();
+            idx.set(&mut o, key, v).unwrap();
+            idx.flat(&o)[key].clone()
+        };
+        let library = idx.flat(&EngineOptions::default())[key].clone();
+        assert_eq!(library, typed("slots"), "the library's value");
+        let metal = When::Metal.holds(&EngineOptions::default());
+        let mut probe = EngineOptions::default();
+        probe.load.model = Some(qwen.clone());
+        assert_eq!(When::Qwen4Exp.holds(&probe), metal);
+        probe.load.model = Some(other.clone());
+        assert!(!When::Qwen4Exp.holds(&probe), "an LFM2 GGUF");
+        let qwen_default = if metal {
+            typed("queue-diff")
+        } else {
+            library.clone()
+        };
+        for f in [Frontend::Chat, Frontend::Serve] {
+            assert_eq!(
+                at(f, Some(&qwen), "metal"),
+                qwen_default,
+                "{} qwen",
+                f.name()
+            );
+            assert_eq!(at(f, None, "metal"), library, "{} lfm2", f.name());
+            assert_eq!(
+                at(f, Some(&other), "metal"),
+                library,
+                "{} lfm2-gguf",
+                f.name()
+            );
+            assert_eq!(at(f, Some(&qwen), "cpu"), library, "{} --cpu", f.name());
+        }
+        assert_eq!(at(Frontend::Bench, Some(&qwen), "metal"), library, "bench");
+        assert_eq!(
+            describe(key).unwrap(),
+            "chat: queue-diff when the model is Qwen4-exp, on Metal (decision 62: was slots), \
+             serve: queue-diff when the model is Qwen4-exp, on Metal (decision 62: was slots)"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

@@ -20,6 +20,8 @@ pub mod moe;
 pub mod mtp;
 pub mod ple;
 pub mod qsa;
+#[cfg(all(test, feature = "metal"))]
+mod routed_glu_tests;
 pub mod schema;
 pub mod testing;
 pub mod transient;

@@ -1637,3 +1637,87 @@ fn final_teardown_runs_nothing_a_host_producer_gave_up() {
         drop((native, src, dst, gate));
     }
 }
+
+/// A cancellation that takes the current recording, then the last handle
+/// drops with no recording operation between: the final owner must still
+/// retire, through one owned empty marker, and run nothing the cancellation
+/// took. The ordinary host-producer counterpart of the validated-IO control
+/// above (`validated_io_direct_teardown_after_cancellation_uses_empty_owned_marker`).
+#[test]
+fn final_owner_retires_after_a_cancellation_took_the_current_recording() {
+    let f = fixture();
+    if f.commands.host_input_arm() == HostInputArm::GpuWait {
+        eprintln!("NOT_APPLICABLE nothing is held on the gpu-wait arm");
+        return;
+    }
+    f.commands.commit_when_produced(&f.gate, 1).unwrap();
+    encode_dependent(&f);
+    f.commands
+        .cancel_produced(&f.gate, "test: the producer gave up")
+        .unwrap();
+    assert!(f.commands.core.state.lock(Side::Host).current_abandoned);
+    let weak = f.commands.core.produced.me_for_test();
+    let counters = f.commands.core.submission_control.clone();
+    let before = counters.native_calls.load(Ordering::Acquire);
+    let api = f.commands.actual_command_api();
+    let Fixture { native, commands, src, dst, gate, progress } = f;
+    drop(commands);
+    let retired = until(Duration::from_secs(5), || weak.upgrade().is_none());
+    let calls = counters.native_calls.load(Ordering::Acquire) - before;
+    eprintln!(
+        "FINAL_AFTER_CANCEL api={api} retired={retired} native_calls={calls} progress={} warm={}",
+        progress.signaledValue(),
+        dst_bytes(&dst).iter().all(|b| *b == WARM)
+    );
+    assert!(retired, "FINAL_OWNER_RETIRES_AFTER_CANCELLED_CURRENT");
+    assert_eq!(calls, 1, "FINAL_EMPTY_MARKER_SUBMITTED_ONCE");
+    assert_eq!(progress.signaledValue(), 0, "FINAL_MARKER_RAN_NOTHING_CANCELLED");
+    assert!(dst_bytes(&dst).iter().all(|b| *b == WARM), "FINAL_CANCELLED_BODY_NOT_EXECUTED");
+    drop((native, src, dst, gate, progress));
+}
+
+/// Teardown with an IO load still pending: ordinary held work ahead of it
+/// runs as recorded, the work behind the load is cancelled (its bytes never
+/// landed), the final owner retires through one marker, and every epoch the
+/// cancelled recordings took completes with it.
+#[test]
+fn final_teardown_cancels_work_behind_pending_validated_io() {
+    use crate::io_terminal::TestIoGeneration;
+    let f = fixture();
+    if f.commands.host_input_arm() == HostInputArm::GpuWait {
+        eprintln!("NOT_APPLICABLE nothing is held on the gpu-wait arm");
+        return;
+    }
+    let generation = TestIoGeneration::new(f.native.as_ref(), 1);
+    let dependency = generation.dependency(0);
+    let custody = generation.untouched_custody();
+    f.commands.commit_when_produced(&f.gate, 1).unwrap();
+    encode_compute(&f);
+    f.commands.flush_marker().unwrap();
+    f.commands.commit_when_io_validated(dependency.clone()).unwrap();
+    f.commands.encode_signal_event(&f.progress, 1).unwrap();
+    let held = f.commands.produced_stats().held_now;
+    assert!(held >= 1, "nothing was held");
+    let clock = f.commands.clock();
+    let weak = f.commands.core.produced.me_for_test();
+    let counters = f.commands.core.submission_control.clone();
+    let before = counters.native_calls.load(Ordering::Acquire);
+    let api = f.commands.actual_command_api();
+    let Fixture { native, commands, src, dst, gate, progress } = f;
+    drop(commands);
+    let retired = until(Duration::from_secs(5), || weak.upgrade().is_none());
+    let calls = counters.native_calls.load(Ordering::Acquire) - before;
+    let (opened, completed) = (clock.current_epoch().0, clock.completed_count().0);
+    eprintln!(
+        "TEARDOWN_PENDING_IO api={api} held={held} retired={retired} native_calls={calls} epochs={completed}/{opened} progress={} computed={}",
+        progress.signaledValue(),
+        computed(&dst)
+    );
+    assert!(retired, "TEARDOWN_PENDING_IO_FINAL_OWNER_RETIRES");
+    assert!(computed(&dst), "TEARDOWN_ORDINARY_HELD_RUNS_AS_RECORDED");
+    assert_eq!(progress.signaledValue(), 0, "TEARDOWN_WORK_BEHIND_PENDING_IO_NOT_RUN");
+    assert_eq!(completed, opened, "TEARDOWN_EVERY_EPOCH_COMPLETES");
+    assert!(!dependency.ready(), "TEARDOWN_CANCELLATION_IS_NOT_DATA");
+    assert_eq!(generation.untouched_custody(), custody, "TEARDOWN_LEAVES_IO_CUSTODY_TO_THE_BANK");
+    drop((native, src, dst, gate, progress));
+}

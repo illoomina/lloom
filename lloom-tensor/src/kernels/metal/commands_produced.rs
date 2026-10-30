@@ -219,6 +219,14 @@ impl Gate {
         })
     }
 
+    /// An input is an IO load whose bytes are not validated yet.
+    fn waits_for_unvalidated_io(&self) -> bool {
+        self.inputs
+            .iter()
+            .flatten()
+            .any(|input| input.io.as_ref().is_some_and(|io| !io.ready()))
+    }
+
     fn highest_on(&self, event: &ProtocolObject<dyn MTLSharedEvent>) -> u64 {
         self.inputs
             .iter()
@@ -893,30 +901,27 @@ impl CommandsCore {
 
     /// Final teardown: no producer is left to raise the inputs, and nothing
     /// is left to observe the work, so the held recordings are committed as
-    /// recorded, in order. `false` when a lock was busy; retried later.
+    /// recorded, in order — up to the first that waits for an IO load not
+    /// validated yet, which would read bytes that never landed. That one,
+    /// every recording behind it and the current one are cancelled instead
+    /// (`cancel_for_teardown`). `false` when a lock was busy; retried later.
     pub(super) fn release_held_for_teardown(
         &self,
         state: &mut EntryState,
-        removals: &mut Option<PublishedRemovals>,
+        captures: &mut super::lifecycle::FinalCaptures,
     ) -> Result<bool, MetalKernelError> {
-        // EXPERIMENTAL INTEGRATION BLOCKER: do not submit unvalidated IO during
-        // teardown. This safety-only refusal is NOT accepted ordinary-failure
-        // recovery. LifecycleInbox forbids replacement acquisition/cold refill;
-        // a preserving final-resource/terminality route remains to be proved.
-        if state.held.iter().flat_map(|h| h.gate.inputs.iter())
-            .chain(state.gate.inputs.iter()).flatten()
-            .any(|input| input.io.as_ref().is_some_and(|io| !io.ready())) {
-            return Err(MetalKernelError::QueueUnavailable("experimental IO final recovery incomplete"));
-        }
-        let had = state.held.len();
+        let mut committed = 0usize;
         while let Some(held) = state.held.front() {
+            if held.gate.waits_for_unvalidated_io() {
+                break;
+            }
             let owed = std::mem::take(&mut state.owed_epochs);
             let authority = OwnerSubmission {
                 buffer: &held.cb,
                 clock: &self.clock,
             };
-            let staged = if removals.is_none() {
-                Some(&mut *removals)
+            let staged = if captures.removals.is_none() {
+                Some(&mut captures.removals)
             } else {
                 None
             };
@@ -932,6 +937,7 @@ impl CommandsCore {
                 Ok(_) => {
                     let held = state.held.pop_front().expect("checked above");
                     state.in_flight.push(held.cb);
+                    committed += 1;
                     let mut after = held.after;
                     let ran = self.run_after_commit(&mut after);
                     recycle_after(&mut state.spare_after, after);
@@ -949,13 +955,94 @@ impl CommandsCore {
                 }
             }
         }
-        if had > 0 || !state.gate.is_empty() {
+        let gated = !state.gate.is_empty();
+        let cancelled = self.cancel_for_teardown(state, captures)?;
+        if committed > 0 || (gated && cancelled == 0) {
             eprintln!(
-                "[metal] teardown committed {had} held recording(s) whose input was never produced"
+                "[metal] teardown committed {committed} held recording(s) whose input was never produced"
+            );
+        }
+        if cancelled > 0 {
+            eprintln!(
+                "[metal] teardown cancelled {cancelled} recording(s) behind IO not yet validated"
             );
         }
         state.gate = Gate::default();
         Ok(true)
+    }
+
+    /// The teardown half of `cancel_locked`: every held recording left (the
+    /// first waits for unvalidated IO) and the current one, when it is behind
+    /// them or waits itself, are abandoned before any native entry. Their
+    /// epochs are owed to the final submission, validated IO deferred behind
+    /// them is refused and ordinary IO keeps its order, as a cancellation's.
+    /// The abandoned recordings leave with the final captures.
+    fn cancel_for_teardown(
+        &self,
+        state: &mut EntryState,
+        captures: &mut super::lifecycle::FinalCaptures,
+    ) -> Result<usize, MetalKernelError> {
+        if state.held.is_empty() && !state.gate.waits_for_unvalidated_io() {
+            return Ok(0);
+        }
+        captures
+            .cancelled
+            .try_reserve(state.held.len())
+            .map_err(|_| MetalKernelError::QueueUnavailable("final cancelled-recording custody refused"))?;
+        let mut rehome: Vec<AfterCommit> = Vec::new();
+        let mut cancelled = 0usize;
+        let mut refused = None;
+        for held in state.held.drain(..) {
+            if let Err(error) = held.cb.cancel_unsubmitted() {
+                refused.get_or_insert(error);
+            }
+            state.owed_epochs += 1;
+            let mut after = held.after;
+            for action in after.drain(..) {
+                match action {
+                    AfterCommit::Io { io, signal, .. } => rehome.push(AfterCommit::Io {
+                        io,
+                        signal,
+                        rehomed: true,
+                    }),
+                    AfterCommit::ValidatedIo(io) => {
+                        if io.refuse().is_err() {
+                            refused.get_or_insert(MetalKernelError::QueueUnavailable(
+                                "cancelled IO refusal failed",
+                            ));
+                        }
+                    }
+                }
+            }
+            recycle_after(&mut state.spare_after, after);
+            captures.cancelled.push(held.cb);
+            cancelled += 1;
+        }
+        if !state.current_abandoned {
+            if let Some(current) = state.current.recording() {
+                if let Err(error) = current.cancel_unsubmitted() {
+                    refused.get_or_insert(error);
+                }
+                cancelled += 1;
+                state.signals_since_cut = false;
+                self.compute_count.store(0, Ordering::Release);
+                state.current_abandoned = true;
+            }
+        }
+        state.gate = Gate::default();
+        if let Err(error) = self.run_after_commit(&mut rehome) {
+            refused.get_or_insert(error);
+        }
+        self.held_live_update(state);
+        self.produced
+            .cancelled
+            .fetch_add(cancelled as u64, Ordering::Relaxed);
+        if let Some(error) = refused {
+            self.failure
+                .record_static("a recording could not be cancelled at teardown; queue failed");
+            return Err(error);
+        }
+        Ok(cancelled)
     }
 }
 

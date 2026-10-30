@@ -491,6 +491,8 @@ struct CommandsCore {
     #[cfg(test)]
     deny_replacement: AtomicBool,
     #[cfg(test)]
+    deny_final_slot: AtomicBool,
+    #[cfg(test)]
     deny_preflight: AtomicBool,
     #[cfg(test)]
     replacement_attempts: AtomicUsize,
@@ -1127,6 +1129,8 @@ impl Commands {
             state: CachePadded::new(Censused::new(parking_lot::Mutex::new(state))),
             #[cfg(test)]
             deny_replacement: AtomicBool::new(false),
+            #[cfg(test)]
+            deny_final_slot: AtomicBool::new(false),
             #[cfg(test)]
             deny_preflight: AtomicBool::new(false),
             #[cfg(test)]
@@ -2319,46 +2323,7 @@ impl Commands {
                 return Err(crate::memory_admission::AllocationError::HostAllocation.into());
             }
         }
-        if self.core.binding_bank.is_some() && prepared.is_none() {
-            return Err(MetalKernelError::QueueUnavailable(
-                "bound replacement lacks preflight credit",
-            ));
-        }
-        match &self.core.modern_queue {
-            Some(queue) => Ok(CommandBuffer::from_metal4(
-                queue.acquire_with(prepared, park)?,
-            )),
-            None => {
-                // Counted owner refusal precedes raw CB creation. Never create
-                // an unregistered native resource and then drop it on EntryState
-                // merely because acquiring its metadata pin failed.
-                let physical = self.core.physical.try_owner(
-                    crate::metal_backend::device_retirement::NamespaceOwner::try_clone,
-                )?;
-                let raw = create_command_buffer(&self.core.command_queue, self.core.kind)?;
-                let core = self
-                    .core
-                    .legacy_completions
-                    .as_ref()
-                    .expect("M3 core constructed")
-                    .clone();
-                let handler = self
-                    .core
-                    .legacy_handler
-                    .as_ref()
-                    .expect("M3 handler constructed")
-                    .clone();
-                match prepared {
-                    Some(prepared) => super::metal3_retirement::AssociatedBuffer::new_bound(
-                        raw, core, handler, physical, prepared,
-                    ),
-                    None => super::metal3_retirement::AssociatedBuffer::new(
-                        raw, core, handler, physical,
-                    ),
-                }
-                .map(CommandBuffer::from_metal3_associated)
-            }
-        }
+        self.core.create_recording(prepared, park)
     }
 
     /// Recovery precedes every recording operation, not just a policy cut.
@@ -2731,6 +2696,106 @@ impl Drop for CloseUnwind<'_> {
 }
 
 impl CommandsCore {
+    /// A fresh recording on this queue: a Metal 4 slot (`park` runs while
+    /// none is free) or a Metal 3 associated buffer. A bound queue spends
+    /// the preflight credit it is given.
+    fn create_recording(
+        &self,
+        prepared: Option<super::native_generation_bindings::PreparedGeneration>,
+        park: &mut dyn FnMut(&crate::completion_wake::Wake, usize) -> Result<(), MetalKernelError>,
+    ) -> Result<CommandBuffer, MetalKernelError> {
+        if self.binding_bank.is_some() && prepared.is_none() {
+            return Err(MetalKernelError::QueueUnavailable(
+                "bound replacement lacks preflight credit",
+            ));
+        }
+        match &self.modern_queue {
+            Some(queue) => Ok(CommandBuffer::from_metal4(
+                queue.acquire_with(prepared, park)?,
+            )),
+            None => {
+                // Counted owner refusal precedes raw CB creation. Never create
+                // an unregistered native resource and then drop it on EntryState
+                // merely because acquiring its metadata pin failed.
+                let physical = self.physical.try_owner(
+                    crate::metal_backend::device_retirement::NamespaceOwner::try_clone,
+                )?;
+                let raw = create_command_buffer(&self.command_queue, self.kind)?;
+                let core = self
+                    .legacy_completions
+                    .as_ref()
+                    .expect("M3 core constructed")
+                    .clone();
+                let handler = self
+                    .legacy_handler
+                    .as_ref()
+                    .expect("M3 handler constructed")
+                    .clone();
+                match prepared {
+                    Some(prepared) => super::metal3_retirement::AssociatedBuffer::new_bound(
+                        raw, core, handler, physical, prepared,
+                    ),
+                    None => super::metal3_retirement::AssociatedBuffer::new(
+                        raw, core, handler, physical,
+                    ),
+                }
+                .map(CommandBuffer::from_metal3_associated)
+            }
+        }
+    }
+
+    /// The final owner's stand-in for a current recording a cancellation
+    /// abandoned: one empty recording, owned by the final submission, taken
+    /// without waiting. `false` while a Metal 4 queue has no free slot; the
+    /// freed slot then notifies the retirement service. A Metal 3 buffer is
+    /// created as every cancellation's re-homed signal is, under the held
+    /// cap's bound on live buffers (`docs/invariants.md` §15.1q). The
+    /// abandoned recording leaves with the final captures.
+    fn replace_abandoned_for_final(
+        &self,
+        state: &mut EntryState,
+        captures: &mut lifecycle::FinalCaptures,
+    ) -> Result<bool, MetalKernelError> {
+        #[cfg(test)]
+        if self.deny_final_slot.load(Ordering::Acquire) {
+            return Ok(false);
+        }
+        if let Some(queue) = &self.modern_queue {
+            if !queue.free_slot_or_wait() {
+                return Ok(false);
+            }
+        }
+        captures.cancelled.try_reserve(1).map_err(|_| {
+            MetalKernelError::QueueUnavailable("final cancelled-recording custody refused")
+        })?;
+        let credit = state
+            .binding_credits
+            .iter_mut()
+            .find(|slot| slot.is_some())
+            .and_then(Option::take);
+        // No other acquirer exists once the last handle is gone, so the slot
+        // seen free above is there; a park would be an ownership violation.
+        let next = self.create_recording(credit, &mut |_, _| {
+            Err(MetalKernelError::QueueUnavailable(
+                "final marker found no slot after one was free",
+            ))
+        })?;
+        match state.current.replace_recording(next) {
+            Ok(old) => captures.cancelled.push(old),
+            Err(unused) => {
+                captures.cancelled.push(unused);
+                return Err(MetalKernelError::QueueUnavailable(
+                    "abandoned final recording carries a receipt",
+                ));
+            }
+        }
+        state.current_abandoned = false;
+        state.namespace.reset();
+        self.compute_count.store(0, Ordering::Release);
+        self.replacement_pending.store(false, Ordering::Release);
+        Ok(true)
+    }
+
     /// The state lock, refused inside one of this queue's own completion
     /// callbacks (`completion_scope`).
     fn lock_entry(&self) -> Result<EntryGuard<'_>, MetalKernelError> {
@@ -3244,6 +3309,11 @@ impl lifecycle::FinalCore for CommandsCore {
         &self,
         wake: Arc<crate::completion_wake::Wake>,
     ) -> Result<(), MetalKernelError> {
+        if let Some(queue) = &self.modern_queue {
+            queue
+                .install_slot_wake(wake.clone())
+                .map_err(|_| MetalKernelError::QueueUnavailable("foreign Metal 4 slot Wake"))?;
+        }
         self.residency_set
             .install_retirement_wake(wake)
             .map_err(|_| MetalKernelError::QueueUnavailable("foreign residency retirement Wake"))
@@ -3268,6 +3338,25 @@ impl lifecycle::FinalCore for CommandsCore {
         if self.encoder_domain.has_external_handles() {
             return Ok(false);
         }
+        // A bound queue's final marker spends a preflight credit; refill one
+        // before EntryState, as every recording operation does. Declared
+        // before the guard, so a raced surplus drops after it unlocks.
+        let mut refill = None;
+        if let Some(bank) = self.binding_bank.as_ref() {
+            let needs = self.state.try_lock().map(|state| {
+                state.current.submitted().is_none()
+                    && state.binding_credits.iter().all(Option::is_none)
+            });
+            match needs {
+                Some(true) => refill = Some(bank.prepare_before_entry()?),
+                Some(false) => {}
+                None => {
+                    return Err(MetalKernelError::QueueUnavailable(
+                        "final EntryState still borrowed",
+                    ))
+                }
+            }
+        }
         let Some(mut state) = self.state.try_lock() else {
             // EntryState is privately owned, and all public guards borrow
             // Commands. No such borrow survives final Commands::drop. Treat a
@@ -3276,6 +3365,11 @@ impl lifecycle::FinalCore for CommandsCore {
                 "final EntryState still borrowed",
             ));
         };
+        if refill.is_some() {
+            if let Some(slot) = state.binding_credits.iter_mut().find(|slot| slot.is_none()) {
+                *slot = refill.take();
+            }
+        }
         if state.current.submitted().is_some() {
             return Ok(true);
         }
@@ -3303,8 +3397,12 @@ impl lifecycle::FinalCore for CommandsCore {
         }
         // Held work whose producer is gone runs as recorded, in order, ahead
         // of the final submission: nothing is left to observe its input, and
-        // its epochs complete the clock the final prefix waits on.
-        if !self.release_held_for_teardown(&mut state, &mut captures.removals)? {
+        // its epochs complete the clock the final prefix waits on. Work behind
+        // IO not yet validated is cancelled instead, its epochs owed.
+        if !self.release_held_for_teardown(&mut state, captures)? {
+            return Ok(false);
+        }
+        if state.current_abandoned && !self.replace_abandoned_for_final(&mut state, captures)? {
             return Ok(false);
         }
         let owed = std::mem::take(&mut state.owed_epochs);
@@ -4654,5 +4752,78 @@ mod owner_submission_tests {
             cleaned.load(Ordering::Relaxed),
             "released pending native work did not drain"
         );
+    }
+}
+
+#[cfg(test)]
+mod final_marker_tests {
+    use super::*;
+    use crate::backend::BackendDevice;
+    use lifecycle::FinalCore;
+    use objc2_metal::MTLDevice;
+
+    fn credits(commands: &Commands) -> usize {
+        commands
+            .core
+            .state
+            .lock(Side::Host)
+            .binding_credits
+            .iter()
+            .filter(|credit| credit.is_some())
+            .count()
+    }
+
+    /// A final owner whose current recording a cancellation took, on a
+    /// bound queue (the production device's): while no Metal 4 slot is free
+    /// it is pending, with its binding credit, its epoch and its native
+    /// calls untouched; once one is, it submits one empty marker.
+    #[test]
+    fn final_marker_is_pending_without_a_free_slot_and_keeps_its_credit() {
+        let device = crate::MetalDevice::new(0).unwrap();
+        let commands = device.commands();
+        if commands.host_input_arm() == HostInputArm::GpuWait {
+            eprintln!("NOT_APPLICABLE nothing is held on the gpu-wait arm");
+            return;
+        }
+        let event = device.metal_device().as_ref().newSharedEvent().unwrap();
+        commands.commit_when_produced(&event, 1).unwrap();
+        commands
+            .cancel_produced(&event, "test: the producer gave up")
+            .unwrap();
+        assert!(commands.core.state.lock(Side::Host).current_abandoned);
+        let held_credits = credits(commands);
+        let epoch = commands.clock().current_epoch().0;
+        let calls = commands.core.submission_control.native_calls.load(Ordering::Acquire);
+        let mut captures = lifecycle::FinalCaptures::default();
+        commands.core.deny_final_slot.store(true, Ordering::Release);
+        let busy = commands.core.poll_final_submission(&mut captures).unwrap();
+        let busy_credits = credits(commands);
+        let busy_epoch = commands.clock().current_epoch().0;
+        let busy_calls = commands.core.submission_control.native_calls.load(Ordering::Acquire);
+        let still_abandoned = commands.core.state.lock(Side::Host).current_abandoned;
+        commands.core.deny_final_slot.store(false, Ordering::Release);
+        let submitted = commands.core.poll_final_submission(&mut captures).unwrap();
+        let after_calls = commands.core.submission_control.native_calls.load(Ordering::Acquire);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut terminal = false;
+        while std::time::Instant::now() < deadline {
+            if commands.core.poll_final_terminality().unwrap() {
+                terminal = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        eprintln!(
+            "FINAL_MARKER_BUSY api={} busy={busy} credits={held_credits}->{busy_credits} epoch={epoch}->{busy_epoch} calls={calls}->{busy_calls}->{after_calls} submitted={submitted} terminal={terminal}",
+            commands.actual_command_api()
+        );
+        assert!(!busy, "FINAL_MARKER_WITHOUT_SLOT_IS_PENDING");
+        assert!(still_abandoned, "FINAL_MARKER_PENDING_REPLACES_NOTHING");
+        assert_eq!(busy_credits, held_credits, "FINAL_MARKER_PENDING_KEEPS_ITS_CREDIT");
+        assert_eq!((busy_epoch, busy_calls), (epoch, calls), "FINAL_MARKER_PENDING_TAKES_NO_EPOCH_OR_NATIVE_CALL");
+        assert!(submitted, "FINAL_MARKER_SUBMITTED_ONCE_A_SLOT_IS_FREE");
+        assert_eq!(after_calls, calls + 1, "FINAL_MARKER_IS_ONE_NATIVE_SUBMISSION");
+        assert!(terminal, "FINAL_MARKER_REACHES_TERMINALITY");
+        drop(captures);
     }
 }

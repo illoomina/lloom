@@ -304,6 +304,7 @@ pub(crate) struct HostReadView {
 }
 
 impl HostReadView {
+    #[cfg(test)]
     pub(crate) fn peek_u32(&self, n: usize, out: &mut Vec<u32>) -> Result<()> {
         peek_u32(&self.buffer, self.dtype, self.cap, n, out)
     }

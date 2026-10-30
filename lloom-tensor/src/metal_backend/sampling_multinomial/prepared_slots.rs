@@ -56,7 +56,7 @@ impl<T> InitializedSlots<T> {
         // the allocation's element count, so `Vec` frees it with that layout.
         SlotValues {
             values: unsafe { Vec::from_raw_parts(raw, count, count) },
-            charge,
+            _charge: charge,
         }
     }
     fn new(
@@ -152,7 +152,8 @@ impl<T> DerefMut for InitializedSlots<T> {
 /// Fields free the actual Vec backing BEFORE its accounting receipt.
 struct SlotValues<T> {
     values: Vec<T>,
-    charge: Option<PhysicalCharge>,
+    // Held for its drop: the receipt is released after `values` frees.
+    _charge: Option<PhysicalCharge>,
 }
 pub struct PreparedSamplerSlots(SlotValues<PreparedSampler>);
 impl PreparedSamplerSlots {
@@ -181,7 +182,7 @@ impl PreparedSamplerSlots {
         }
         Ok(Self(SlotValues {
             values,
-            charge: None,
+            _charge: None,
         }))
     }
 }

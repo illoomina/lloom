@@ -642,9 +642,19 @@ impl QMetalStorage {
         dst_shape.push(n);
         let dst_shape = Shape::from(dst_shape);
         let device = storage.device().clone();
+        // The store follows the triple's store leg; the steel arm stores f32.
+        let triple = match route {
+            Route::Gemm(t) | Route::DequantOnceGemm(t) => t,
+            Route::DequantOnceSteel | Route::Matvec(_) => crate::kernels::GemvTriple::F32F32F32,
+        };
+        let store_dtype = match triple.store() {
+            crate::kernels::GemvFloat::F16 => DType::F16,
+            crate::kernels::GemvFloat::F32 => DType::F32,
+        };
+        let act_size = storage.dtype().size_in_bytes();
         let dst = device
             .new_buffer_builder()
-            .with_size_for(dst_shape.elem_count(), DType::F32)
+            .with_size_for(dst_shape.elem_count(), store_dtype)
             .with_label("qmatmul")
             .build()?;
         // The dequantise-once scratch is taken BEFORE the encoder guard
@@ -652,10 +662,10 @@ impl QMetalStorage {
         // lock is not reentrant).
         let (n_rows_w, k_w) = (self_shape.dims()[self_shape.rank() - 2], k);
         let dequant_scratch_buf = match route {
-            Route::DequantOnceGemm | Route::DequantOnceSteel => {
+            Route::DequantOnceGemm(_) | Route::DequantOnceSteel => {
                 Some(dequant_scratch(&device, n_rows_w * k_w * 2)?)
             }
-            Route::Gemm | Route::Matvec(_) => None,
+            Route::Gemm(_) | Route::Matvec(_) => None,
         };
         let encoder = device.command_encoder()?;
 
@@ -758,6 +768,7 @@ impl QMetalStorage {
                     &encoder,
                     device.kernels(),
                     crate::kernels::GgmlDType::F16,
+                    triple,
                     src0_l.dims(),
                     &src0_stride,
                     &scratch,
@@ -766,7 +777,7 @@ impl QMetalStorage {
                     &src1_l
                         .stride()
                         .iter()
-                        .map(|x| x * DType::F32.size_in_bytes())
+                        .map(|x| x * act_size)
                         .collect::<Vec<_>>(),
                     storage.buffer(),
                     // The activation view's own offset: `src1_l` is a fresh contiguous
@@ -783,7 +794,7 @@ impl QMetalStorage {
                 dst,
                 device.clone(),
                 dst_shape.elem_count(),
-                DType::F32,
+                store_dtype,
             )?;
             return Ok((dst_storage, dst_shape));
         }
@@ -813,6 +824,7 @@ impl QMetalStorage {
                 &encoder,
                 device.kernels(),
                 self.dtype.into(),
+                triple,
                 src0_l.dims(),
                 &src0_stride,
                 &self.buffer,
@@ -821,7 +833,7 @@ impl QMetalStorage {
                 &src1_l
                     .stride()
                     .iter()
-                    .map(|x| x * DType::F32.size_in_bytes())
+                    .map(|x| x * act_size)
                     .collect::<Vec<_>>(),
                 storage.buffer(),
                 // The activation view's own offset: `src1_l` is a fresh contiguous
@@ -839,7 +851,7 @@ impl QMetalStorage {
             dst,
             device.clone(),
             dst_shape.elem_count(),
-            DType::F32,
+            store_dtype,
         )?;
         Ok((dst_storage, dst_shape))
     }
@@ -1807,6 +1819,7 @@ pub fn matmul_f16_weight_f32(xs: &crate::Tensor, w: &crate::Tensor) -> Result<cr
             &encoder,
             device.kernels(),
             crate::kernels::GgmlDType::F16,
+            crate::kernels::GemvTriple::F32F32F32,
             src0_l.dims(),
             &src0_stride,
             wm.buffer(),

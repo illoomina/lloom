@@ -86,6 +86,7 @@ mod qmatmul_f16w_mm;
 mod qmatmul_id_mm;
 mod qmatmul_id_mm_arm;
 mod qmatmul_id_mm_k_block;
+mod qmatmul_mm_f16_act;
 mod qmatmul_rows_arm;
 mod qmatmul_rows_ceiling;
 mod qmatmul_rows_default;

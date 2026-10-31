@@ -63,12 +63,13 @@ pub enum Route {
     /// `kernel_mul_mv_<kind>_<triple>` over each row (the row axis's
     /// capacity is the dispatch's, per kind).
     Matvec(GemvTriple),
-    /// `kernel_mul_mm_<kind>_f32`, unpacking the weight per tile.
-    Gemm,
+    /// `kernel_mul_mm_<kind>_<triple>`, unpacking the weight per tile.
+    Gemm(GemvTriple),
     /// `kernel_dequant_rows_f16_<kind>` into a scratch, then the quantized
-    /// GEMM's f16-weight arm (`kernel_mul_mm_f16_f32`).
-    DequantOnceGemm,
-    /// The same scratch read by the steel GEMM, the activations cast to half.
+    /// GEMM's f16-weight arm (`kernel_mul_mm_f16_<triple>`).
+    DequantOnceGemm(GemvTriple),
+    /// The same scratch read by the steel GEMM, the activations cast to half
+    /// (f32 activations only).
     DequantOnceSteel,
 }
 
@@ -112,20 +113,34 @@ pub fn resolve(w: Weight, s: Spec, p: Policy) -> Result<Route, Refused> {
             }),
         };
     }
-    if s.act != DType::F32 {
+    if w.kind.kind().mul_mm.is_none() {
         return Err(Refused {
             cell: cell(w, s),
-            need: "a GEMM arm reading this activation dtype (the GEMMs read f32)",
+            need: "a GEMM arm for this weight kind",
         });
     }
+    let triple = match s.act {
+        DType::F32 => GemvTriple::F32F32F32,
+        DType::F16 if w.kind.kind().mul_mm_f16_arm() => GemvTriple::F16F32F16,
+        _ => {
+            return Err(Refused {
+                cell: cell(w, s),
+                need: "a GEMM arm reading this activation dtype",
+            })
+        }
+    };
     let dequant = p.dequant_from > 0
         && s.rows >= p.dequant_from
         && w.rank == 2
         && w.k.is_multiple_of(16)
         && w.kind.kind().dequant_rows_f16;
-    Ok(match (dequant, p.dequant_steel) {
-        (false, _) => Route::Gemm,
-        (true, false) => Route::DequantOnceGemm,
-        (true, true) => Route::DequantOnceSteel,
-    })
+    match (dequant, p.dequant_steel, triple) {
+        (false, _, t) => Ok(Route::Gemm(t)),
+        (true, false, t) => Ok(Route::DequantOnceGemm(t)),
+        (true, true, GemvTriple::F32F32F32) => Ok(Route::DequantOnceSteel),
+        (true, true, _) => Err(Refused {
+            cell: cell(w, s),
+            need: "the f32 activations the steel dequantise-once arm reads",
+        }),
+    }
 }

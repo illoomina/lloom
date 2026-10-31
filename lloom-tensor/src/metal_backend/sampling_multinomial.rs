@@ -278,3 +278,6 @@ mod tests;
 
 #[cfg(test)]
 mod gumbel_tests;
+
+#[cfg(test)]
+mod timing_tests;

@@ -58,6 +58,14 @@ impl ComputePipeline {
     pub fn max_total_threads_per_threadgroup(&self) -> usize {
         self.raw.maxTotalThreadsPerThreadgroup()
     }
+
+    pub fn thread_execution_width(&self) -> usize {
+        self.raw.threadExecutionWidth()
+    }
+
+    pub fn static_threadgroup_memory_length(&self) -> usize {
+        self.raw.staticThreadgroupMemoryLength()
+    }
 }
 
 impl AsRef<ProtocolObject<dyn MTLComputePipelineState>> for ComputePipeline {

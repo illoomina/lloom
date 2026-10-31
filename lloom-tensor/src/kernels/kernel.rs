@@ -366,6 +366,17 @@ impl Kernels {
                 .new_compute_pipeline_state_with_function(&func)
                 .map_err(|e| MetalKernelError::FailedToCreatePipeline(e.to_string()))?
                 .with_name(name.as_ref());
+            if super::pipeline_census::armed() {
+                eprintln!(
+                    "{}",
+                    super::pipeline_census::line(
+                        source,
+                        name.as_ref(),
+                        constants.as_ref(),
+                        &pipeline
+                    )
+                );
+            }
             pipelines.insert((source, name, constants), pipeline.clone());
 
             Ok(pipeline)

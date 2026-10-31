@@ -305,6 +305,8 @@ pub struct PassKey {
     pub kind: PassKind,
     pub arms: u64,
     pub opener: PassOpener,
+    /// Input allocations inside this bracket, independent of the model variant.
+    pub input: crate::backend::PassInput,
     pub variant: u32,
 }
 
@@ -315,6 +317,7 @@ impl PassKey {
             kind,
             arms: 0,
             opener: PassOpener::Driver,
+            input: crate::backend::PassInput::TokenIds,
             variant: 0,
         }
     }
@@ -322,6 +325,12 @@ impl PassKey {
     /// This key, for a pass `opener` bracketed.
     pub fn opened_by(self, opener: PassOpener) -> Self {
         Self { opener, ..self }
+    }
+
+    /// This key, for the driver's actual forward-input allocation contract.
+    /// Do not pack this independent factor into the full model variant.
+    pub fn with_input(self, input: crate::backend::PassInput) -> Self {
+        Self { input, ..self }
     }
 
     /// This key, for the model's allocation sequence `variant`.
@@ -3724,5 +3733,123 @@ mod tests {
             "the fixture's slots overlap, so this test cannot speak to \
              uniqueness"
         );
+    }
+}
+
+#[cfg(test)]
+mod input_key_controls {
+    use super::*;
+    use crate::backend::PassInput;
+    use std::collections::HashMap;
+
+    #[test]
+    fn input_route_and_full_model_variant_are_independent_plan_keys() {
+        let mut quotes = HashMap::new();
+        for input in [PassInput::TokenIds, PassInput::PreparedEmbeddings] {
+            for variant in [0, 1, u32::MAX] {
+                for opener in [PassOpener::Driver, PassOpener::Model] {
+                    let base = PassKey::new(PassKind::Decode { b: 1 }).opened_by(opener);
+                    let key = base.with_input(input).with_variant(variant);
+                    assert_eq!(key, base.with_variant(variant).with_input(input));
+                    assert_eq!(key.variant, variant);
+                    assert!(quotes.insert(key, input).is_none());
+                    // The quote and execution key retain every independent factor.
+                    assert_eq!(
+                        quotes.get(&base.with_variant(variant).with_input(input)),
+                        Some(&input)
+                    );
+                }
+            }
+        }
+        assert_eq!(quotes.len(), 12);
+        assert_eq!(
+            PassKey::new(PassKind::Decode { b: 1 }).input,
+            PassInput::TokenIds
+        );
+    }
+
+    /// Production recorder/cache, not a stand-in HashMap: the gather is an
+    /// allocation inside TokenIds and outside PreparedEmbeddings. Collapsing
+    /// with_input must fail the two-plan and served-plan assertions below.
+    #[test]
+    fn physical_input_layout_selects_its_own_cached_plan() -> crate::Result<()> {
+        use crate::{Device, Tensor};
+        crate::isolation::claim("pass input physical cache selection");
+        let device = Device::new_metal(0)?;
+        let metal = device.as_metal_device()?;
+        eprintln!(
+            "PASS_INPUT_SETUP actual_api={}",
+            metal.commands().actual_command_api()
+        );
+        let table = Tensor::arange(0f32, 128f32, &device)?.reshape((4, 32))?;
+        let ids = Tensor::new(&[2u32], &device)?;
+        let prepared = table.index_select(&ids, 0)?;
+        metal.wait_until_completed()?;
+        metal.enable_pass_plans(ArenaLayout::Packed);
+        let key = |input| PassKey::new(PassKind::Decode { b: 1 }).with_input(input);
+        let run = |input| -> crate::Result<()> {
+            metal.begin_pass(key(input))?;
+            let result = (|| -> crate::Result<Vec<Vec<f32>>> {
+                let x = match input {
+                    PassInput::TokenIds => table.index_select(&ids, 0)?,
+                    PassInput::PreparedEmbeddings => prepared.clone(),
+                };
+                x.affine(2.0, 1.0)?.to_vec2::<f32>()
+            })();
+            if result.is_err() {
+                metal.abort_pass()?;
+                return result.map(|_| ());
+            }
+            metal.finish_pass()?;
+            let want: Vec<f32> = (64..96).map(|v| 2.0 * v as f32 + 1.0).collect();
+            assert_eq!(result?, vec![want]);
+            Ok(())
+        };
+        for input in [PassInput::TokenIds, PassInput::PreparedEmbeddings] {
+            for _ in 0..4 {
+                run(input)?;
+            }
+        }
+        let (plans, _) = metal.pass_plan_report().expect("enabled cache");
+        assert_eq!(plans.len(), 2, "physical layouts shared a plan: {plans:?}");
+        let token = plans
+            .iter()
+            .find(|p| p.0 == key(PassInput::TokenIds))
+            .unwrap();
+        let prepared_plan = plans
+            .iter()
+            .find(|p| p.0 == key(PassInput::PreparedEmbeddings))
+            .unwrap();
+        assert!(
+            token.2 > prepared_plan.2,
+            "inside-gather allocation must distinguish physical plans: {plans:?}"
+        );
+        assert!(
+            token.1 > 0 && prepared_plan.1 > 0,
+            "no plan-covered allocation: {plans:?}"
+        );
+        let before = metal.pass_plan_counters().unwrap();
+        for _ in 0..3 {
+            run(PassInput::PreparedEmbeddings)?;
+            run(PassInput::TokenIds)?;
+        }
+        let after = metal.pass_plan_counters().unwrap();
+        assert_eq!(
+            after.served - before.served,
+            6,
+            "warm input routes did not use cached plans"
+        );
+        assert_eq!(
+            after.evicted, before.evicted,
+            "cross-route drift evicted a plan"
+        );
+        assert_eq!(
+            after.recorded, before.recorded,
+            "warm input routes re-recorded"
+        );
+        eprintln!("PASS_INPUT_PHYSICAL actual_api={} token_allocations={} prepared_allocations={} served_delta=6 eviction_delta=0",
+            metal.commands().actual_command_api_for_test(), token.2, prepared_plan.2);
+        metal.wait_until_completed()?;
+        Ok(())
     }
 }

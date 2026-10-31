@@ -14,7 +14,12 @@ fn device() -> Result<Device> {
     tuning.instrument.profile = true;
     crate::tuning::install(tuning).expect("install before tuning is read");
     assert!(crate::kernels::metal::profile::enabled());
-    Device::new_metal(0)
+    let device = Device::new_metal(0)?;
+    eprintln!(
+        "SAMPLER_NATIVE_SETUP actual_api={}",
+        device.as_metal_device()?.commands().actual_command_api()
+    );
+    Ok(device)
 }
 
 fn encode(z: &Tensor, params: Params, u: &Tensor) -> Result<PrivateMultinomial> {
@@ -1357,9 +1362,7 @@ fn checked_bridge_waits_for_its_copy_epoch_and_preserves_refusal_before_ids() ->
     let u = Tensor::new(&[0.75f32, 0.75], &d)?;
     bridge.enqueue(encode(&z, Params::new(1.0, 0, 1.0), &u)?)?;
     assert!(bridge.poll()?.is_none(), "copy epoch was not committed");
-    let marker = m.flush_marker()?;
-    m.wait_marker(&marker)?;
-    let error = match bridge.poll() {
+    let error = match bridge.read_committed() {
         Err(e) => e,
         _ => panic!("invalid later row exposed ids"),
     };
@@ -1367,8 +1370,10 @@ fn checked_bridge_waits_for_its_copy_epoch_and_preserves_refusal_before_ids() ->
     let good = Tensor::new(&[[0.0f32, 0.0], [0.0, 0.0]], &d)?;
     bridge.enqueue(encode(&good, Params::new(1.0, 0, 1.0), &u)?)?;
     assert!(bridge.poll()?.is_none());
-    m.wait_marker(&m.flush_marker()?)?;
-    assert_eq!(bridge.poll()?.expect("completed snapshot").ids(), &[1, 1]);
+    assert_eq!(
+        bridge.read_committed()?.expect("completed snapshot").ids(),
+        &[1, 1]
+    );
     assert!(bridge.poll()?.is_none(), "result delivered twice");
     Ok(())
 }
@@ -1385,11 +1390,233 @@ fn checked_bridge_refuses_overwrite_and_capacity_without_adding_waits() -> Resul
     bridge.enqueue(sample()?)?;
     assert!(bridge.enqueue(sample()?).is_err());
     assert!(bridge.poll()?.is_none());
-    m.wait_marker(&m.flush_marker()?)?;
-    assert_eq!(bridge.poll()?.expect("completed").ids(), &[1]);
+    assert_eq!(bridge.read_committed()?.expect("completed").ids(), &[1]);
+    assert!(
+        bridge.read_committed()?.is_none(),
+        "blocking result delivered twice"
+    );
     let mut too_small = SampleReadback::new(m, 0)?;
     assert!(too_small.enqueue(sample()?).is_err());
     assert!(too_small.poll()?.is_none());
     m.wait_marker(&m.flush_marker()?)?;
+    Ok(())
+}
+
+/// Test-only hold. Drop releases the callback before a failed assertion can
+/// unwind the device; the callback also has a deadline if the test aborts.
+struct SnapshotCallbackHold(std::sync::Arc<(parking_lot::Mutex<bool>, parking_lot::Condvar)>);
+
+impl Drop for SnapshotCallbackHold {
+    fn drop(&mut self) {
+        let (lock, wake) = &*self.0;
+        *lock.lock() = true;
+        wake.notify_all();
+    }
+}
+
+#[test]
+fn checked_bridge_own_data_ready_does_not_require_callback_clock() -> Result<()> {
+    use super::readback::SampleReadback;
+    use parking_lot::{Condvar, Mutex};
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc, Arc,
+    };
+    use std::time::Duration;
+
+    let d = device()?;
+    let m = d.as_metal_device()?;
+    eprintln!(
+        "SNAPSHOT_SETUP actual_api={}",
+        m.commands().actual_command_api()
+    );
+    m.set_compute_per_buffer(usize::MAX);
+    let z = Tensor::new(&[[0.0f32, 0.0]], &d)?;
+    let u = Tensor::new(&[0.75f32], &d)?;
+    let mut bridge = SampleReadback::new(m, 1)?;
+    let sample = encode(&z, Params::new(1.0, 0, 1.0), &u)?;
+    // A producer cut must not make the snapshot use the producer's identity:
+    // the copy itself is encoded into the next recording.
+    m.flush_marker()?;
+    bridge.enqueue(sample)?;
+    assert!(bridge.poll()?.is_none(), "copy not submitted yet");
+    let epoch = m.gpu_clock().current_epoch();
+    let released = Arc::new((Mutex::new(false), Condvar::new()));
+    let hold = SnapshotCallbackHold(released.clone());
+    let expired = Arc::new(AtomicBool::new(false));
+    let callback_expired = expired.clone();
+    let (entered_tx, entered_rx) = mpsc::channel();
+    {
+        let encoder = m.command_encoder()?;
+        encoder
+            .as_ref()
+            .command_buffer
+            .on_completion(move || {
+                let _ = entered_tx.send(());
+                let (lock, wake) = &*released;
+                let mut guard = lock.lock();
+                let timeout =
+                    wake.wait_while_for(&mut guard, |released| !*released, Duration::from_secs(10));
+                callback_expired.store(timeout.timed_out() && !*guard, Ordering::Release);
+            })
+            .map_err(|e| crate::Error::Msg(format!("snapshot callback registration: {e:?}")))?;
+    }
+    let marker = m.flush_marker()?;
+    entered_rx
+        .recv_timeout(Duration::from_secs(5))
+        .map_err(|e| crate::Error::Msg(format!("snapshot callback entry: {e}")))?;
+    // Entry proves native feedback is available. The callback is still held,
+    // so the ordered hook has not advanced this recording's clock.
+    m.wait_marker(&marker)?;
+    assert!(
+        !m.gpu_clock().is_complete(epoch),
+        "callback clock escaped hold"
+    );
+    assert!(
+        bridge.poll()?.is_none(),
+        "async poll must remain conservative"
+    );
+    assert_eq!(
+        bridge.read_committed()?.expect("own-data snapshot").ids(),
+        &[1]
+    );
+    assert!(
+        !m.gpu_clock().is_complete(epoch),
+        "read joined callback completion"
+    );
+    assert!(
+        !expired.load(Ordering::Acquire),
+        "callback deadline escaped hold"
+    );
+    assert!(bridge.poll()?.is_none(), "snapshot delivered twice");
+    assert!(
+        bridge.read_committed()?.is_none(),
+        "blocking snapshot delivered twice"
+    );
+    drop(hold);
+    // Explicit cleanup joins the callback after releasing it, outside the
+    // property being tested. No worker or held callback survives the fixture.
+    m.wait_until_completed()?;
+    assert!(!expired.load(Ordering::Acquire));
+    eprintln!("SNAPSHOT_DATA_READY callback_clock_pending=true own_data_read=true ids=[1] exactly_once=true");
+    Ok(())
+}
+
+struct SnapshotRelease<F: Fn()>(F);
+
+impl<F: Fn()> Drop for SnapshotRelease<F> {
+    fn drop(&mut self) {
+        (self.0)();
+    }
+}
+
+#[test]
+fn checked_bridge_exact_recording_ignores_foreign_completion_and_later_tail() -> Result<()> {
+    use super::readback::SampleReadback;
+    use objc2_metal::{MTLDevice, MTLSharedEvent};
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let d = device()?;
+    let m = d.as_metal_device()?;
+    eprintln!(
+        "SNAPSHOT_SETUP actual_api={}",
+        m.commands().actual_command_api()
+    );
+    m.set_compute_per_buffer(usize::MAX);
+    let own_gate = m
+        .metal_device()
+        .as_ref()
+        .newSharedEvent()
+        .expect("own gate");
+    let tail_gate = m
+        .metal_device()
+        .as_ref()
+        .newSharedEvent()
+        .expect("tail gate");
+    // Release on every refusal/unwind, before the worker is joined and before
+    // any buffer owner is dropped. No fixture can strand a native event wait.
+    let release = SnapshotRelease(|| {
+        own_gate.setSignaledValue(1);
+        tail_gate.setSignaledValue(1);
+    });
+    let z = Tensor::new(&[[0.0f32, 0.0]], &d)?;
+    let u = Tensor::new(&[0.75f32], &d)?;
+    let mut bridge = SampleReadback::new(m, 1)?;
+    let sample = encode(&z, Params::new(1.0, 0, 1.0), &u)?;
+    m.wait_marker(&m.flush_marker()?)?;
+    m.commands()
+        .encode_wait_for_event(&own_gate, 1)
+        .map_err(crate::MetalError::from)?;
+    bridge.enqueue(sample)?;
+    let own = m.flush_marker()?;
+    m.commands()
+        .encode_wait_for_event(&tail_gate, 1)
+        .map_err(crate::MetalError::from)?;
+    let tail_value = z.affine(1.0, 0.0)?;
+    let tail = m.flush_marker()?;
+
+    // A genuinely separate queue completes a later recording. Neither its
+    // completion nor the shared physical GPU authenticates our pending copy.
+    let other = Device::new_metal(0)?;
+    let other_m = other.as_metal_device()?;
+    let foreign_value = Tensor::new(&[19.0f32], &other)?.affine(2.0, 0.0)?;
+    let foreign = other_m.flush_marker()?;
+    other_m.wait_marker(&foreign)?;
+    assert!(other_m.marker_complete(&foreign));
+    assert!(!m.marker_complete(&own), "snapshot gate did not hold");
+    assert!(!m.marker_complete(&tail), "tail gate did not hold");
+    assert!(
+        bridge.poll()?.is_none(),
+        "foreign completion exposed snapshot bytes"
+    );
+
+    std::thread::scope(|scope| -> Result<()> {
+        // This guard is inside the scope so it releases before scope's implicit
+        // join on error/panic. The outer guard also covers setup refusals.
+        let inner_release = SnapshotRelease(|| {
+            own_gate.setSignaledValue(1);
+            tail_gate.setSignaledValue(1);
+        });
+        let (started_tx, started_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let worker = scope.spawn(move || {
+            let _ = started_tx.send(());
+            let result = bridge.read_committed().and_then(|sample| {
+                sample
+                    .map(|s| s.ids().to_vec())
+                    .ok_or_else(|| crate::Error::Msg("missing own snapshot".into()))
+            });
+            let _ = done_tx.send(result);
+        });
+        started_rx
+            .recv_timeout(Duration::from_secs(2))
+            .map_err(|e| crate::Error::Msg(format!("snapshot worker start: {e}")))?;
+        assert!(
+            matches!(
+                done_rx.recv_timeout(Duration::from_millis(200)),
+                Err(mpsc::RecvTimeoutError::Timeout)
+            ),
+            "read escaped the held copy recording"
+        );
+        assert!(!m.marker_complete(&own));
+        own_gate.setSignaledValue(1);
+        let ids = done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .map_err(|e| crate::Error::Msg(format!("own read joined unrelated tail: {e}")))??;
+        assert_eq!(ids, [1]);
+        assert!(
+            !m.marker_complete(&tail),
+            "tail gate did not remain pending"
+        );
+        drop(inner_release);
+        worker.join().expect("snapshot worker panicked");
+        Ok(())
+    })?;
+    drop(release);
+    m.wait_until_completed()?;
+    other_m.wait_until_completed()?;
+    drop((tail_value, foreign_value));
+    eprintln!("SNAPSHOT_EXACT_RECORDING foreign_complete=true own_pending_refused=true own_ids=[1] later_tail_pending_at_return=true");
     Ok(())
 }

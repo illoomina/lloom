@@ -4262,6 +4262,9 @@ impl<B: Batch + 'static> StreamWriter<B> {
     /// A timeout is not a claim that the channel is still empty. Under the
     /// same off-token guard used by send, prefer an already queued event over
     /// bytes appended after that event; then select/wrap at most one batch.
+    /// The first delta's wake found here is skipped, never written: its empty
+    /// payload would be the chunk that ends the body, and an event queued
+    /// behind it still goes before the bytes.
     /// The guard is dropped before the caller performs any network I/O.
     fn pending_after_timeout(
         rx: &std::sync::mpsc::Receiver<(String, usize)>,
@@ -4271,10 +4274,13 @@ impl<B: Batch + 'static> StreamWriter<B> {
         local: &mut B,
     ) -> (Option<(String, usize)>, bool) {
         let _guard = order.lock();
-        let closed = match rx.try_recv() {
-            Ok(work) => return (Some(work), false),
-            Err(std::sync::mpsc::TryRecvError::Empty) => false,
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => true,
+        let closed = loop {
+            match rx.try_recv() {
+                Ok((payload, _)) if payload.is_empty() && buf.is_some() => continue,
+                Ok(work) => return (Some(work), false),
+                Err(std::sync::mpsc::TryRecvError::Empty) => break false,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => break true,
+            }
         };
         let work = match (buf, wrap) {
             (Some(buf), Some(wrap)) if buf.take_into(local) => Some(wrap(local)),
@@ -5717,7 +5723,10 @@ mod stream_writer_tests {
     /// text stays before it, text handed over before a control event goes
     /// out ahead of it (`send` takes it), and text handed over just before
     /// the run ends is written (`finish` flushes the spill; the writer drains
-    /// once more on its way out, whatever its tick was doing).
+    /// once more on its way out, whatever its tick was doing). How the text
+    /// between two control events is cut into delta events depends on when
+    /// the writer's wake and drains land, so adjacent deltas are joined
+    /// before comparing: the assertion is the order, not the batching.
     #[test]
     fn text_pushed_at_the_end_is_written_after_what_preceded_it() {
         let mem = Mem::default();
@@ -5733,13 +5742,69 @@ mod stream_writer_tests {
         let (_w, err) = sw.finish().unwrap();
         assert!(err.is_none());
         let out = String::from_utf8(mem.0.lock().unwrap().clone()).unwrap();
-        let body: String = out
-            .split("\r\n")
-            .enumerate()
-            .filter(|(i, _)| i % 2 == 1)
-            .map(|(_, s)| s)
-            .collect();
-        assert_eq!(body, "ctl<ab>mid<c>", "{out:?}");
+        assert_eq!(
+            in_order(&out),
+            [
+                Event::Control("ctl".into()),
+                Event::Text("ab".into()),
+                Event::Control("mid".into()),
+                Event::Text("c".into()),
+            ],
+            "{out:?}"
+        );
+    }
+
+    #[derive(Debug, PartialEq)]
+    enum Event {
+        Control(String),
+        Text(String),
+    }
+
+    /// The chunk bodies of `out` in wire order, each a control event or a
+    /// `<…>` delta, with adjacent deltas joined. A delta event that carries
+    /// no text is refused: the writer never wraps an empty batch.
+    fn in_order(out: &str) -> Vec<Event> {
+        let mut events = Vec::new();
+        for body in out.split("\r\n").skip(1).step_by(2) {
+            match body.strip_prefix('<').and_then(|b| b.strip_suffix('>')) {
+                Some(text) => {
+                    assert!(!text.is_empty(), "an empty delta event: {out:?}");
+                    match events.last_mut() {
+                        Some(Event::Text(run)) => run.push_str(text),
+                        _ => events.push(Event::Text(text.to_string())),
+                    }
+                }
+                None => events.push(Event::Control(body.to_string())),
+            }
+        }
+        events
+    }
+
+    /// A drain that finds the first delta's wake queued behind its timeout
+    /// skips it: alone, it returns no event (the wake's empty payload
+    /// written would be `0\r\n\r\n`, the chunk that ends a chunked body);
+    /// with a control event queued behind it, it returns that event, ahead
+    /// of any text handed over after it.
+    #[test]
+    fn a_wake_found_after_a_timeout_is_skipped_not_written() {
+        let (tx, rx) = std::sync::mpsc::channel::<(String, usize)>();
+        let buf = super::DeltaBuffer::new();
+        let order = parking_lot::Mutex::new(());
+        let mut local = String::new();
+        let mut drain =
+            || StreamWriter::pending_after_timeout(&rx, Some(&buf), None, &order, &mut local);
+
+        tx.send((String::new(), 0)).unwrap();
+        assert_eq!(drain(), (None, false), "the wake alone");
+
+        tx.send((String::new(), 0)).unwrap();
+        tx.send(("mid".to_string(), 0)).unwrap();
+        assert_eq!(
+            drain(),
+            (Some(("mid".to_string(), 0)), false),
+            "the event queued behind the wake"
+        );
+        assert_eq!(drain(), (None, false), "nothing left queued");
     }
 
     /// The first fragment's wake is not an event: the writer takes what

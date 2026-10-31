@@ -1490,7 +1490,8 @@ impl HostFeed {
 }
 
 /// Tokens a run's fill records before its log of them grows: a fill
-/// allocates nothing up to here.
+/// allocates nothing up to here, and past it the log doubles (an allocation
+/// every doubling, outside the per-token rule's bound).
 pub const FILL_TOKENS_RESERVED: usize = 8192;
 
 /// The producer's half of a [`HostFeed`]: fills one slot per token the loop

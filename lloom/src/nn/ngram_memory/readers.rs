@@ -18,11 +18,15 @@ use std::sync::OnceLock;
 use std::thread::Thread;
 use std::time::{Duration, Instant};
 
-/// Rows one request reads at most.
+/// Rows one request reads at most: a token's 16, a batch of 16 rows'. A
+/// larger request is refused and read on rayon's pool, counted
+/// ([`ReaderStats::refused`]).
 pub const MAX_ROWS: usize = 256;
-/// Bytes one row may take.
+/// Bytes one row may take (an IQ4_NL row of 160 is 90; f32 of 160 is 640):
+/// a wider table's request is refused as [`MAX_ROWS`] says.
 pub const MAX_ROW_BYTES: usize = 1024;
-/// Threads the set holds at most.
+/// Threads the set holds at most: a configured count past it is clamped, and
+/// the set reports the count it runs ([`ReaderStats::threads`]).
 pub const MAX_THREADS: usize = 64;
 
 /// The longest a caller parks before it looks at its request again. The read

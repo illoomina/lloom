@@ -4,6 +4,9 @@
 use lloom_tensor::{CpuStorage, DType, Layout, Module, Result, Shape, Tensor, D};
 use rayon::prelude::*;
 
+mod flash_metadata;
+pub use flash_metadata::FlashDecodingMetadata;
+
 /// Applies the softmax function to the input tensor, rescaling the element so that elements on
 /// a slice of fixed index on dimension `dim` are between 0 and 1 and sum to 1.
 ///
@@ -3888,23 +3891,9 @@ struct PagedTable<'a> {
     /// resident table, appended in place as chunks are added — with the live
     /// count bound by value per step.
     table_t: Option<&'a Tensor>,
-}
-
-impl PagedTable<'_> {
-    /// The longest row's live length: the dispatch depth.
-    fn max_keys(&self) -> usize {
-        self.n_keys.as_slice().iter().copied().max().unwrap_or(0) as usize
-    }
-
-    /// Row `b`'s live length.
-    fn keys_of(&self, b: usize) -> usize {
-        let keys = self.n_keys.as_slice();
-        if keys.len() == 1 {
-            keys[0] as usize
-        } else {
-            keys.get(b).copied().unwrap_or(0) as usize
-        }
-    }
+    /// Authenticated immutable publication: its cached scalar summary avoids
+    /// rescanning the same table for each layer. Raw/host forms prepare locally.
+    summary: Option<&'a super::attention::flash_validation::PageSummary>,
 }
 
 /// FlashDecoding: attention split over independent contiguous KV chunks, with
@@ -3957,6 +3946,41 @@ struct FlashDecoding<'a> {
     /// other two arms, and carried rather than recomputed so the op does not
     /// need to know what a context length is.
     reserve_chunks: usize,
+    geometry: Option<super::attention::flash_validation::Geometry>,
+}
+
+impl FlashDecoding<'_> {
+    fn apply(mut self, q: &Tensor, k: &Tensor, v: &Tensor) -> Result<Tensor> {
+        use super::attention::flash_validation::{prepare_pages, validate, Pages};
+        let summary = match &self.paged {
+            Some(p) => Some(match p.summary {
+                Some(s) => *s,
+                None => prepare_pages(
+                    Pages {
+                        entries: p.entries,
+                        stride: p.stride,
+                        keys: p.n_keys.as_slice(),
+                    },
+                    q.dims4()?.0,
+                    self.page_size,
+                    self.pages_per_chunk,
+                )?,
+            }),
+            None => None,
+        };
+        self.geometry = Some(validate(
+            q.layout(),
+            k.layout(),
+            v.layout(),
+            q.dtype(),
+            k.dtype(),
+            v.dtype(),
+            self.page_size,
+            self.pages_per_chunk,
+            summary.as_ref(),
+        )?);
+        q.apply_op3_no_bwd(k, v, &self)
+    }
 }
 
 impl lloom_tensor::CustomOp3 for FlashDecoding<'_> {
@@ -3991,182 +4015,28 @@ impl lloom_tensor::CustomOp3 for FlashDecoding<'_> {
 
         let device = q.device();
 
-        let out_dims = [q_l.dim(0)?, q_l.dim(1)?, q_l.dim(2)?, v_l.dim(3)?];
-        let elem_count: usize = out_dims.iter().product();
-        let out_shape = Shape::from_dims(&out_dims);
-        let out_layout = Layout::contiguous(out_shape.clone());
-
-        // Every condition below is one this kernel cannot serve, and each fails
-        // loudly rather than computing something plausible — §3.5 makes a wrong
-        // answer here silent, so the caller's fallback has to be a *decision*
-        // and not a discovery.
-        if q_l.dim(2)? != 1 {
-            lloom_tensor::bail!("flash-decoding is a decode kernel: q seq must be 1");
-        }
-        if q_l.dim(D::Minus1)? != k_l.dim(D::Minus1)? {
-            lloom_tensor::bail!("`q` and `k` last dims must match");
-        }
-        if v_l.dim(D::Minus(3))? != k_l.dim(D::Minus(3))? {
-            lloom_tensor::bail!("`k` and `v` head dims must match");
-        }
-        if q_l.dim(D::Minus(3))? % k_l.dim(D::Minus(3))? != 0 {
-            lloom_tensor::bail!("query `n_heads` must be a multiple of `n_kv_heads`");
-        }
-        for t in [k.dtype(), v.dtype()] {
-            if q.dtype() != t {
-                lloom_tensor::bail!("all q, k, v dtypes must match.");
-            }
-        }
-        // The batch row must be exactly `n_kv_heads` head-strides wide, on both
-        // K and V.
-        //
-        // **This is the precondition the flattened grid below rests on**, and it
-        // is asserted rather than assumed because §3.5 makes the failure silent:
-        // the kernel reaches a batch row only via `kv_head_idx * k_head_stride`
-        // with `kv_head_idx = head_idx / gqa_factor`, so row `b`'s KV sits at
-        // `b * n_kv_heads * stride[1]`. That is the right address iff
-        // `stride[0] == n_kv_heads * stride[1]`.
-        //
-        // It holds for the shapes this path is given — a contiguous
-        // `[B, H_kv, capacity, D]` cache, including under the `narrow(2, 0, len)`
-        // the KV slot hands out, since a dim-2 narrow changes the length and no
-        // stride (§10.3b: *"`N` is the live length and the stride is the
-        // reserved capacity"*). It would **not** hold for a view offset or
-        // narrowed on dim 0 or 1, which is precisely what a paged or
-        // per-sequence cache could introduce — so this check is what such a
-        // change trips on rather than corrupts.
-        // `q` is reached as `queries += head_idx * D` with a flat `head_idx`, so
-        // the (batch, head) plane must be densely packed. At `q seq == 1` — which
-        // the first check above already enforces — contiguity is exactly that.
-        if !q_l.is_contiguous() {
-            lloom_tensor::bail!(
-                "flash-decoding needs a contiguous `q`: the grid flattens (batch, head) into one \
-                 axis and indexes queries by `head_idx * head_dim` (DESIGN.md 3.5)"
-            );
-        }
-        // A pool has no batch stride to check: its one "row" is read by every
-        // sequence through its own table, and the kernel takes a sequence
-        // stride of 0. The check below is the contiguous cache's.
-        if let Some(paged) = &self.paged {
-            let b_sz = q_l.dim(0)?;
-            let chunk = self.page_size * self.pages_per_chunk;
-            let need = flash_chunk_count(paged.max_keys(), chunk);
-            if k_l.dim(0)? != 1 || v_l.dim(0)? != 1 {
-                lloom_tensor::bail!(
-                    "flash-decoding over a page pool needs a pool of one row, got k {:?}",
-                    k_l.dims()
-                );
-            }
-            if paged.n_keys.len() != 1 && paged.n_keys.len() != b_sz {
-                lloom_tensor::bail!(
-                    "flash-decoding over a page pool: {} live key counts for {b_sz} sequences \
-                     (one for the batch, or one per row)",
-                    paged.n_keys.len()
-                );
-            }
-            if paged.n_keys.len() > 1 && paged.stride == 0 {
-                lloom_tensor::bail!(
-                    "flash-decoding over a page pool: per-row live key counts need per-row \
-                     tables (table stride 0 shares one table)"
-                );
-            }
-            for (b, &n) in paged.n_keys.as_slice().iter().enumerate() {
-                if n == 0 || n as usize > k_l.dim(2)? {
-                    lloom_tensor::bail!(
-                        "flash-decoding over a page pool: row {b} has {n} live keys against a \
-                         pool of {} slots",
-                        k_l.dim(2)?
-                    );
-                }
-            }
-            if paged.entries.len() < need + (b_sz - 1) * paged.stride {
-                lloom_tensor::bail!(
-                    "flash-decoding over a page pool: {} table entries for {b_sz} sequences x \
-                     {need} chunks at stride {}",
-                    paged.entries.len(),
-                    paged.stride
-                );
-            }
-            let slots = k_l.dim(2)?;
-            for (i, &page) in paged.entries.iter().enumerate() {
-                let stride = paged.stride.max(1);
-                let (b, c) = (i / stride, i % stride);
-                let n_keys = paged.keys_of(b);
-                let live = (n_keys - (c * chunk).min(n_keys)).min(chunk);
-                if live > 0 && page as usize * self.page_size + live > slots {
-                    lloom_tensor::bail!(
-                        "flash-decoding over a page pool: table entry {i} names page {page}, \
-                         whose chunk would read past the pool's {slots} slots (DESIGN.md 3.5)"
-                    );
-                }
-            }
-        }
-        for (name, l) in [("k", k_l), ("v", v_l)] {
-            if self.paged.is_some() {
-                break;
-            }
-            let (st, dims) = (l.stride(), l.dims());
-            if st[0] != dims[1] * st[1] {
-                lloom_tensor::bail!(
-                    "flash-decoding needs `{name}`'s batch stride to be `n_kv_heads` head-strides \
-                     ({} * {} = {}), got {}: the grid flattens (batch, head) into one axis and \
-                     reaches a row by head stride alone (DESIGN.md 3.5, 10.3b)",
-                    dims[1],
-                    st[1],
-                    dims[1] * st[1],
-                    st[0]
-                );
-            }
-        }
+        let geometry = self.geometry.ok_or_else(|| {
+            lloom_tensor::Error::Msg("flash-decoding: missing checked geometry".into())
+        })?;
+        let elem_count = geometry.output_elements;
         let itype = match q.dtype() {
             DType::F16 => FlashDType::F16,
             DType::F32 => FlashDType::F32,
             other => lloom_tensor::bail!("unsupported flash-decoding type {other:?}"),
         };
 
-        // The grid's `y` axis is **(batch x q head) flattened**, not the q head
-        // count — which is what `call_sdpa_vector` already does
-        // (`sdpa.rs`: `let b = q_shape[0] * q_shape[1]`), and the reason the two
-        // must agree is that every offset in `flash_decoding.metal` is computed
-        // from a flat `head_idx`: `queries += head_idx * D`,
-        // `partials + head_idx * stride_chunks * D`, `out + head_idx * D`.
-        //
-        // **Passing `q_l.dim(1)` here is what left rows 1..B-1 unwritten**: the
-        // output is sized `B*H*1*D` by `out_dims` above while the grid covered
-        // only `H`, so at B=2 row 1 read whatever its buffer happened to hold —
-        // measured as a `--batch-check` divergence at step 1 emitting a token
-        // that varied between runs (127999 at B=2, 20392 at B=4), the signature
-        // of unwritten memory rather than of a mis-index.
-        //
-        // # Why flattening is correct for the KV mapping, and its condition
-        //
-        // The kernel derives `kv_head_idx = head_idx / gqa_factor`. For
-        // `head_idx = b*H + h` that is `b*(H/g) + h/g`, which equals the wanted
-        // `b*H_kv + h/g` **iff `H/g == H_kv`** — exactly what the
-        // `n_heads % n_kv_heads == 0` guard above already establishes, since
-        // `g = H/H_kv`. So the same guard that makes GQA well-formed is what
-        // makes the flattening sound; there is no new precondition.
-        //
-        // `gqa_factor` itself is unaffected: `FlashPartialParams::for_step`
-        // derives it from `q_shape[1] / k_shape[1]`, the true head counts.
-        let b_sz = q_l.dim(0)?;
-        let n_q_heads = b_sz * q_l.dim(1)?;
-        let head_dim = q_l.dim(D::Minus1)?;
-        let n_keys = match &self.paged {
-            Some(p) => p.max_keys(),
-            None => k_l.dim(2)?,
-        };
-        let chunk_size = self.page_size * self.pages_per_chunk;
-        let n_chunks = flash_chunk_count(n_keys, chunk_size);
-        if n_chunks == 0 {
-            lloom_tensor::bail!("flash-decoding needs at least one key");
+        if !itype.head_dims().contains(&geometry.dim) {
+            lloom_tensor::bail!(
+                "flash-decoding: no instantiated kernel for {:?} channels={}",
+                q.dtype(),
+                geometry.dim
+            )
         }
-
-        let output = device
-            .new_buffer_builder()
-            .with_size_for(elem_count, q.dtype())
-            .with_label("flash_decoding_o")
-            .build()?;
+        let n_q_heads = geometry.heads;
+        let head_dim = geometry.dim;
+        let n_keys = geometry.keys;
+        let chunk_size = geometry.chunk;
+        let n_chunks = geometry.chunks;
 
         // The scratch class, §9.1a — **and it now reads the policy** (#234).
         //
@@ -4193,6 +4063,15 @@ impl lloom_tensor::CustomOp3 for FlashDecoding<'_> {
         let chunk_capacity = sizing
             .sized_chunks(n_chunks, self.reserve_chunks, &rungs)
             .map_err(lloom_tensor::Error::msg)?;
+        geometry.validate_capacity(chunk_capacity)?;
+        let out_dims = [q_l.dim(0)?, q_l.dim(1)?, 1, head_dim];
+        let out_shape = Shape::from_dims(&out_dims);
+        let out_layout = Layout::contiguous(out_shape);
+        let output = device
+            .new_buffer_builder()
+            .with_size_for(elem_count, q.dtype())
+            .with_label("flash_decoding_o")
+            .build()?;
 
         // Sized for the **capacity** and written for the **live** count. Both
         // numbers reach the kernel: `chunk_capacity` is the stride the partial
@@ -4262,9 +4141,9 @@ impl lloom_tensor::CustomOp3 for FlashDecoding<'_> {
         // 0, and its live length is the table's, not the token axis's.
         let (k_shape, k_stride, v_stride): (Vec<usize>, Vec<usize>, Vec<usize>) = match &self.paged
         {
-            Some(p) => {
+            Some(_) => {
                 let mut ks = k_l.dims().to_vec();
-                ks[2] = p.max_keys();
+                ks[2] = geometry.keys;
                 let mut kst = k_l.stride().to_vec();
                 kst[0] = 0;
                 let mut vst = v_l.stride().to_vec();
@@ -4374,12 +4253,14 @@ impl lloom_tensor::CustomOp3 for FlashDecoding<'_> {
 
         // A ragged batch's rows that fit one chunk take the single-chunk pass
         // beside rows that span more, as they would alone.
-        let row_keys: &[u32] = match &self.paged {
-            Some(p) if ragged => p.n_keys.as_slice(),
-            _ => &[],
-        };
-        let one_chunk_rows =
-            lloom_tensor::kernels::flash_one_chunk_rows(n_chunks, chunk_size, row_keys);
+        // Membership is determined by the minimum published ragged count:
+        // min(counts) <= chunk iff any(count <= chunk). Keep the existing
+        // selector, but supply at most one cached value, not B counts/layer.
+        let one_chunk_rows = lloom_tensor::kernels::flash_one_chunk_rows(
+            n_chunks,
+            chunk_size,
+            geometry.min_ragged_keys.as_slice(),
+        );
 
         let encoder = q.device().command_encoder()?;
         encoder.set_label("flash_decoding");
@@ -4428,10 +4309,12 @@ impl lloom_tensor::CustomOp3 for FlashDecoding<'_> {
 /// FlashDecoding attention over a contiguous KV cache.
 ///
 /// `q` is `[b, n_q_heads, 1, head_dim]` — a decode step. `k`/`v` are
-/// `[b, n_kv_heads, kv_len, head_dim]`, and may be a `narrow` of a
+/// `[kv_batch, n_kv_heads, kv_len, head_dim]`, and may be a `narrow` of a
 /// pre-allocated cache: the kernel takes the head stride and the token stride
 /// as parameters, so the reserved capacity and the live length are separate
-/// numbers (`DESIGN.md` §10.3b).
+/// numbers (`DESIGN.md` §10.3b). Only the first `b` cache rows are consumed;
+/// both K/V batch extents must cover them. K supplies the live key count;
+/// V may have additional reserved token capacity, which is not read.
 ///
 /// `page_size` is the **allocation** granularity and `pages_per_chunk` is the
 /// `k` of `chunk_size = k * page_size` — the **computation** granularity. §10.4
@@ -4461,19 +4344,17 @@ pub fn flash_decoding(
     scratch_sizing: FlashScratchSizing,
     reserve_chunks: usize,
 ) -> Result<Tensor> {
-    q.apply_op3_no_bwd(
-        k,
-        v,
-        &FlashDecoding {
-            scale,
-            softcapping,
-            paged: None,
-            page_size,
-            pages_per_chunk,
-            scratch_sizing,
-            reserve_chunks,
-        },
-    )
+    FlashDecoding {
+        scale,
+        softcapping,
+        paged: None,
+        page_size,
+        pages_per_chunk,
+        scratch_sizing,
+        reserve_chunks,
+        geometry: None,
+    }
+    .apply(q, k, v)
 }
 
 /// FlashDecoding over a shared page pool (`DESIGN.md` §10.3c–§10.3h, #148).
@@ -4510,25 +4391,73 @@ pub fn flash_decoding_paged_ragged(
     table_stride: usize,
     n_keys: Vec<u32>,
 ) -> Result<Tensor> {
-    q.apply_op3_no_bwd(
-        k,
-        v,
-        &FlashDecoding {
-            scale,
-            softcapping,
-            paged: Some(PagedTable {
-                entries: &table,
-                stride: table_stride,
-                n_keys: PagedKeys::Rows(&n_keys),
-                bound: None,
-                table_t: None,
-            }),
-            page_size,
-            pages_per_chunk,
-            scratch_sizing,
-            reserve_chunks,
-        },
-    )
+    FlashDecoding {
+        scale,
+        softcapping,
+        paged: Some(PagedTable {
+            entries: &table,
+            stride: table_stride,
+            n_keys: PagedKeys::Rows(&n_keys),
+            bound: None,
+            table_t: None,
+            summary: None,
+        }),
+        page_size,
+        pages_per_chunk,
+        scratch_sizing,
+        reserve_chunks,
+        geometry: None,
+    }
+    .apply(q, k, v)
+}
+
+/// FlashDecoding with one immutable, authenticated metadata publication.
+///
+/// The owner moves the caller's existing host vectors and uploads them once.
+/// Every layer borrows the same owner and consumes its cached page-span proof;
+/// this entrypoint adds no per-layer upload, table scan or allocation. Ordinary
+/// FlashDecoding output/scratch/parameter allocations remain unchanged.
+///
+/// The publication records page geometry and row count. K/V pool capacities
+/// and query layout are independently checked for every call. No Tensor alias
+/// to the owner's table/count storage is exposed to safe callers.
+#[allow(clippy::too_many_arguments)]
+pub fn flash_decoding_paged_metadata(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    scale: f32,
+    softcapping: f32,
+    scratch_sizing: FlashScratchSizing,
+    reserve_chunks: usize,
+    metadata: &FlashDecodingMetadata,
+) -> Result<Tensor> {
+    let (tables_t, n_keys_t) = metadata.bindings();
+    // Both private tensors were constructed by the same publication on one
+    // device. Unlike Q/K/V, metadata is not an apply_op3 operand, so its
+    // query-device match must be checked here, before any native allocation.
+    if !tables_t.device().same_device(q.device()) {
+        lloom_tensor::bail!("flash-decoding: metadata must share the query device")
+    }
+    let (page_size, pages_per_chunk) = metadata.route();
+    FlashDecoding {
+        scale,
+        softcapping,
+        paged: Some(PagedTable {
+            entries: metadata.table(),
+            stride: metadata.table_stride(),
+            n_keys: PagedKeys::Rows(metadata.keys()),
+            bound: Some((tables_t, n_keys_t)),
+            table_t: None,
+            summary: Some(metadata.summary()),
+        }),
+        page_size,
+        pages_per_chunk,
+        scratch_sizing,
+        reserve_chunks,
+        geometry: None,
+    }
+    .apply(q, k, v)
 }
 
 /// [`flash_decoding_paged_ragged`] with the table and the live counts
@@ -4568,25 +4497,24 @@ pub fn flash_decoding_paged_ragged_bound(
             n_keys.len()
         );
     }
-    q.apply_op3_no_bwd(
-        k,
-        v,
-        &FlashDecoding {
-            scale,
-            softcapping,
-            paged: Some(PagedTable {
-                entries: table,
-                stride: table_stride,
-                n_keys: PagedKeys::Rows(n_keys),
-                bound: Some((tables_t, n_keys_t)),
-                table_t: None,
-            }),
-            page_size,
-            pages_per_chunk,
-            scratch_sizing,
-            reserve_chunks,
-        },
-    )
+    FlashDecoding {
+        scale,
+        softcapping,
+        paged: Some(PagedTable {
+            entries: table,
+            stride: table_stride,
+            n_keys: PagedKeys::Rows(n_keys),
+            bound: Some((tables_t, n_keys_t)),
+            table_t: None,
+            summary: None,
+        }),
+        page_size,
+        pages_per_chunk,
+        scratch_sizing,
+        reserve_chunks,
+        geometry: None,
+    }
+    .apply(q, k, v)
 }
 
 pub fn flash_decoding_paged(
@@ -4651,25 +4579,26 @@ pub fn flash_decoding_paged_resident(
             );
         }
     }
-    q.apply_op3_no_bwd(
-        k,
-        v,
-        &FlashDecoding {
-            scale,
-            softcapping,
-            paged: Some(PagedTable {
-                entries: table,
-                stride: table_stride,
-                n_keys: PagedKeys::One(n_keys as u32),
-                bound: None,
-                table_t,
-            }),
-            page_size,
-            pages_per_chunk,
-            scratch_sizing,
-            reserve_chunks,
-        },
-    )
+    FlashDecoding {
+        scale,
+        softcapping,
+        paged: Some(PagedTable {
+            entries: table,
+            stride: table_stride,
+            n_keys: PagedKeys::One(u32::try_from(n_keys).map_err(|_| {
+                lloom_tensor::Error::Msg("flash-decoding: live count exceeds U32".into())
+            })?),
+            bound: None,
+            table_t,
+            summary: None,
+        }),
+        page_size,
+        pages_per_chunk,
+        scratch_sizing,
+        reserve_chunks,
+        geometry: None,
+    }
+    .apply(q, k, v)
 }
 
 /// Which transform a fused GEMV epilogue applies at the accumulator (issue
@@ -5253,4 +5182,209 @@ pub fn gemv_mul(x: &Tensor, weight: &Tensor, gate: &Tensor) -> Result<Tensor> {
 pub fn gemv_swiglu(x: &Tensor, up_weight: &Tensor, gate_weight: &Tensor) -> Result<Tensor> {
     use crate::nn::fusion::{gemv, Swiglu};
     gemv(up_weight).then(Swiglu::of(gate_weight)).eval(x)
+}
+
+#[cfg(test)]
+mod flash_decoding_validation_tests {
+    use super::*;
+    use lloom_tensor::Device;
+
+    fn tensor(dims: [usize; 4]) -> Result<Tensor> {
+        Tensor::zeros(&dims, DType::F32, &Device::Cpu)
+    }
+
+    fn refuses(result: Result<Tensor>, reason: &str) {
+        let error = result
+            .expect_err("malformed geometry must refuse before dispatch")
+            .to_string();
+        assert!(error.contains(reason), "expected {reason:?}, got {error:?}");
+    }
+
+    #[test]
+    fn flash_validation_rejects_value_width_before_backend() -> Result<()> {
+        let q = tensor([1, 1, 1, 64])?;
+        let k = tensor([1, 1, 1, 64])?;
+        let v = tensor([1, 1, 1, 32])?;
+        refuses(
+            flash_decoding(&q, &k, &v, 1., 1., 256, 1, FlashScratchSizing::Grow, 0),
+            "flash-decoding: Q/K/V channel dimensions must match",
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn flash_validation_rejects_short_values_before_backend() -> Result<()> {
+        let q = tensor([1, 1, 1, 64])?;
+        let k = tensor([1, 1, 2, 64])?;
+        let v = tensor([1, 1, 1, 64])?;
+        refuses(
+            flash_decoding(&q, &k, &v, 1., 1., 256, 1, FlashScratchSizing::Grow, 0),
+            "flash-decoding: V key extent must cover K live keys",
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn flash_validation_rejects_page_past_values_before_backend() -> Result<()> {
+        let q = tensor([1, 1, 1, 64])?;
+        let k = tensor([1, 1, 512, 64])?;
+        let v = tensor([1, 1, 256, 64])?;
+        refuses(
+            flash_decoding_paged(
+                &q,
+                &k,
+                &v,
+                1.,
+                1.,
+                256,
+                1,
+                FlashScratchSizing::Grow,
+                0,
+                vec![1],
+                1,
+                1,
+            ),
+            "flash-decoding: page span exceeds K/V pool",
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn flash_validation_rejects_short_ragged_table_before_backend() -> Result<()> {
+        let q = tensor([2, 1, 1, 64])?;
+        let k = tensor([1, 1, 1024, 64])?;
+        let v = tensor([1, 1, 1024, 64])?;
+        refuses(
+            flash_decoding_paged_ragged(
+                &q,
+                &k,
+                &v,
+                1.,
+                1.,
+                256,
+                1,
+                FlashScratchSizing::Grow,
+                0,
+                vec![0, 1],
+                2,
+                vec![1, 257],
+            ),
+            "flash-decoding: chunk table is shorter than live rows",
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn flash_validation_rejects_zero_heads_before_backend() -> Result<()> {
+        let q = tensor([1, 1, 1, 64])?;
+        let k = tensor([1, 0, 1, 64])?;
+        let v = tensor([1, 0, 1, 64])?;
+        refuses(
+            flash_decoding(&q, &k, &v, 1., 1., 256, 1, FlashScratchSizing::Grow, 0),
+            "flash-decoding: Q/K/V dimensions must be positive",
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn flash_validation_rejects_inner_stride_before_backend() -> Result<()> {
+        let q = tensor([1, 1, 1, 64])?;
+        let k = tensor([1, 1, 64, 2])?.transpose(2, 3)?;
+        let v = tensor([1, 1, 2, 64])?;
+        refuses(
+            flash_decoding(&q, &k, &v, 1., 1., 256, 1, FlashScratchSizing::Grow, 0),
+            "flash-decoding: packed Q and unit K/V channel strides required",
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn flash_validation_rejects_zero_chunk_before_backend() -> Result<()> {
+        let q = tensor([1, 1, 1, 64])?;
+        let k = tensor([1, 1, 1, 64])?;
+        let v = tensor([1, 1, 1, 64])?;
+        refuses(
+            flash_decoding(&q, &k, &v, 1., 1., 0, 1, FlashScratchSizing::Grow, 0),
+            "flash-decoding: page size and pages per chunk must be positive",
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn flash_validation_preserves_valid_narrowed_cache_geometry() -> Result<()> {
+        let q = tensor([2, 4, 1, 64])?;
+        let k = tensor([2, 2, 512, 64])?.narrow(2, 0, 17)?;
+        let v = tensor([2, 2, 512, 64])?.narrow(2, 0, 17)?;
+        // A valid geometry reaches the existing CPU refusal. This is not a
+        // numerical/native route gate, only evidence validation preserves it.
+        refuses(
+            flash_decoding(&q, &k, &v, 1., 1., 256, 1, FlashScratchSizing::Grow, 0),
+            "no cpu support for metal-flash-decoding",
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn flash_validation_preserves_ragged_padded_tables() -> Result<()> {
+        let q = tensor([2, 2, 1, 64])?;
+        let k = tensor([1, 1, 1024, 64])?;
+        let v = tensor([1, 1, 1024, 64])?;
+        // Row zero's inactive padding names a page past the physical pool;
+        // the entry is read but no K/V values are read from that page.
+        refuses(
+            flash_decoding_paged_ragged(
+                &q,
+                &k,
+                &v,
+                1.,
+                1.,
+                256,
+                1,
+                FlashScratchSizing::Grow,
+                0,
+                vec![2, 100, 0, 3],
+                2,
+                vec![1, 257],
+            ),
+            "no cpu support for metal-flash-decoding",
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn flash_validation_rejects_mismatched_batch_before_backend() -> Result<()> {
+        let q = tensor([2, 1, 1, 64])?;
+        let k = tensor([1, 1, 1, 64])?;
+        let v = tensor([1, 1, 1, 64])?;
+        refuses(
+            flash_decoding(&q, &k, &v, 1., 1., 256, 1, FlashScratchSizing::Grow, 0),
+            "flash-decoding: K/V batch extents must cover query rows",
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn flash_validation_rejects_live_count_truncation_before_backend() -> Result<()> {
+        let q = tensor([1, 1, 1, 64])?;
+        let k = tensor([1, 1, 256, 64])?;
+        let v = tensor([1, 1, 256, 64])?;
+        refuses(
+            flash_decoding_paged(
+                &q,
+                &k,
+                &v,
+                1.,
+                1.,
+                256,
+                1,
+                FlashScratchSizing::Grow,
+                0,
+                vec![0],
+                1,
+                usize::MAX,
+            ),
+            "flash-decoding: live count exceeds U32",
+        );
+        Ok(())
+    }
 }

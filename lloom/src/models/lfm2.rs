@@ -7767,13 +7767,11 @@ impl<P: Profile> Attention<P> {
                                 }
                                 let pass = if pending {
                                     let slot = b.slot();
-                                    let pass = Arc::new(
-                                        b.pool
-                                            .inner
-                                            .lock()
-                                            .kv
-                                            .begin_rows(&[(slot, seq_len)], false, &device)?,
-                                    );
+                                    let pass = Arc::new(b.pool.inner.lock().kv.begin_rows(
+                                        &[(slot, seq_len)],
+                                        false,
+                                        &device,
+                                    )?);
                                     b.pass = Some(pass.clone());
                                     pass
                                 } else {

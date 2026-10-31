@@ -120,11 +120,20 @@ fn check(name: &str, script: &[Op]) -> Result<()> {
     let want = run(&reference, &inplace, &dev, script)?;
     assert_eq!(got.len(), want.len());
     for (i, (g, w)) in got.iter().zip(&want).enumerate() {
-        assert_eq!(g, w, "{name}: forward {i} of {script:?} differs from InPlace");
+        assert_eq!(
+            g, w,
+            "{name}: forward {i} of {script:?} differs from InPlace"
+        );
     }
     // Non-vacuity: the forwards are not all one answer.
-    assert!(got.windows(2).any(|w| w[0] != w[1]), "{name}: every forward agreed");
-    println!("STEP_FRAME {name} forwards={} identical_to_inplace=true", got.len());
+    assert!(
+        got.windows(2).any(|w| w[0] != w[1]),
+        "{name}: every forward agreed"
+    );
+    println!(
+        "STEP_FRAME {name} forwards={} identical_to_inplace=true",
+        got.len()
+    );
     Ok(())
 }
 
@@ -194,7 +203,11 @@ fn a_decode_step_uploads_nothing() -> Result<()> {
     // Positive control: the counter sees an upload.
     let before = host_upload_count();
     let _one = Tensor::new(&[1u32], &dev)?;
-    assert_eq!(host_upload_count() - before, 1, "the counter missed an upload");
+    assert_eq!(
+        host_upload_count() - before,
+        1,
+        "the counter missed an upload"
+    );
 
     let prompt: Vec<u32> = (0..5).map(tok).collect();
     let input = Tensor::new(prompt.as_slice(), &dev)?.unsqueeze(0)?;
@@ -213,7 +226,11 @@ fn a_decode_step_uploads_nothing() -> Result<()> {
     }
     dev.synchronize()?;
     for o in &outs {
-        assert!(o.flatten_all()?.to_vec1::<f32>()?.iter().all(|x| x.is_finite()));
+        assert!(o
+            .flatten_all()?
+            .to_vec1::<f32>()?
+            .iter()
+            .all(|x| x.is_finite()));
     }
     // Step `i` writes position `5 + i`; it opens a chunk when that position
     // is a multiple of the chunk.

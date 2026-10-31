@@ -261,3 +261,61 @@ fn every_routed_kind_at_every_capacity() {
         }
     }
 }
+
+/// Achieved weight bandwidth of the one-row quantized matvec, per kind, at
+/// the `(f32, f32, f32)` and `(f16, f32, f16)` triples (#1154 C's bandwidth
+/// column): at the 27B's three stem shapes, one row, the two arms and a
+/// second f32 arm (the null) interleaved rep by rep, `reps` medians of
+/// `iters` launches. GB/s divides the weight's bytes alone by the launch's
+/// time, the decode roofline's numerator (`docs/machine-model.md` §3.4).
+/// Ignored; under `lloom-arb measure`, `--ignored --nocapture`.
+#[test]
+#[ignore]
+fn one_row_bandwidth_per_kind_and_triple() {
+    let dev = device();
+    let (iters, reps) = (50usize, 9usize);
+    let shapes = [(10240usize, 2560usize), (17408, 5120), (5120, 17408)];
+    let kinds = [GgmlDType::Q4K, GgmlDType::Q5K, GgmlDType::Q6K, GgmlDType::Q8_0];
+    lloom_tensor::kernels::set_qmv_rows(false);
+    println!("BANDWIDTH contract=fast m=1 iters={iters} reps={reps} interleaved f32,f16,f32-null; median ms per launch");
+    println!("| kind | shape | weight MB | f32 ms | f16 ms | null ms | f32 GB/s | f16 GB/s | f16/f32 | null/f32 |");
+    for (n, k) in shapes {
+        for dtype in kinds {
+            let q = weight(dtype, (n, k), &dev);
+            let bytes = (n * k / dtype.block_size() * dtype.type_size()) as f64;
+            let x32 = Tensor::randn(0f32, 1.0, (1, k), &dev).unwrap();
+            let x16 = x32.to_dtype(lloom_tensor::DType::F16).unwrap();
+            assert_eq!(q.forward(&x16).unwrap().dtype(), lloom_tensor::DType::F16);
+            let mut arms: [Vec<f64>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+            for _ in 0..3 {
+                q.forward(&x32).unwrap();
+                q.forward(&x16).unwrap();
+            }
+            dev.synchronize().unwrap();
+            for _ in 0..reps {
+                for (a, x) in [&x32, &x16, &x32].into_iter().enumerate() {
+                    let t = Instant::now();
+                    for _ in 0..iters {
+                        q.forward(x).unwrap();
+                    }
+                    dev.synchronize().unwrap();
+                    arms[a].push(t.elapsed().as_secs_f64() * 1e3 / iters as f64);
+                }
+            }
+            let med = |v: &mut Vec<f64>| {
+                v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                v[v.len() / 2]
+            };
+            let (a, b, c) = (med(&mut arms[0]), med(&mut arms[1]), med(&mut arms[2]));
+            println!(
+                "| {dtype:?} | [{n} x {k}] | {:.2} | {a:.4} | {b:.4} | {c:.4} | {:.1} | {:.1} | {:.3} | {:.3} |",
+                bytes / 1e6,
+                bytes / (a * 1e-3) / 1e9,
+                bytes / (b * 1e-3) / 1e9,
+                b / a,
+                c / a
+            );
+        }
+    }
+    lloom_tensor::kernels::set_qmv_rows(true);
+}

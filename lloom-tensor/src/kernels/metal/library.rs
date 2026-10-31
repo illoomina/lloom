@@ -144,6 +144,10 @@ impl ConstantValues {
         self.0
     }
 
+    pub fn values(&self) -> &[(usize, Value)] {
+        &self.0
+    }
+
     fn function_constant_values(&self) -> FunctionConstantValues {
         let f = FunctionConstantValues::new();
         for (index, value) in &self.0 {

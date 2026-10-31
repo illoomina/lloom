@@ -58,7 +58,11 @@ struct Args {
     #[arg(long)]
     out: PathBuf,
     /// Live-scalar counts for the ladder control.
-    #[arg(long, value_delimiter = ',', default_value = "1,8,16,32,48,64,80,96,112,128,160,192,256")]
+    #[arg(
+        long,
+        value_delimiter = ',',
+        default_value = "1,8,16,32,48,64,80,96,112,128,160,192,256"
+    )]
     ladder: Vec<usize>,
     /// Pipelines no run reached, by `<Source>:<function-name prefix>`: every
     /// function of that source's library starting with the prefix is built
@@ -154,7 +158,10 @@ fn f16_candidates(name: &str) -> Vec<String> {
             out.push(format!("{head}_f16_f16{}", &tail[4..]));
         }
     }
-    if let Some(stem) = name.strip_prefix("kernel_mul_mm_").and_then(|s| s.strip_suffix("_f32")) {
+    if let Some(stem) = name
+        .strip_prefix("kernel_mul_mm_")
+        .and_then(|s| s.strip_suffix("_f32"))
+    {
         out.push(format!("kernel_mul_mm_{stem}_f16_f16"));
         out.push(format!("kernel_mul_mm_{stem}_f16"));
     }
@@ -217,7 +224,11 @@ fn ladder_options() -> objc2::rc::Retained<MTLCompileOptions> {
     o
 }
 
-fn run_ladder(device: &Device, counts: &[usize], out: &Path) -> Result<BTreeMap<(String, usize), usize>> {
+fn run_ladder(
+    device: &Device,
+    counts: &[usize],
+    out: &Path,
+) -> Result<BTreeMap<(String, usize), usize>> {
     let raw: &ProtocolObject<dyn MTLDevice> = device.as_ref();
     let mut got = BTreeMap::new();
     println!("LADDER ty live max_threads tg_mem archive");
@@ -225,7 +236,10 @@ fn run_ladder(device: &Device, counts: &[usize], out: &Path) -> Result<BTreeMap<
         for &n in counts {
             let src = ladder_source(ty, n);
             let lib = raw
-                .newLibraryWithSource_options_error(&NSString::from_str(&src), Some(&ladder_options()))
+                .newLibraryWithSource_options_error(
+                    &NSString::from_str(&src),
+                    Some(&ladder_options()),
+                )
                 .map_err(|e| anyhow::anyhow!("ladder {ty} {n}: {e}"))?;
             let func = lib
                 .newFunctionWithName(&NSString::from_str("k_ladder"))
@@ -236,7 +250,10 @@ fn run_ladder(device: &Device, counts: &[usize], out: &Path) -> Result<BTreeMap<
             let file = format!("ladder-{ty}-{n:03}.metallib");
             archive(device, &func, &out.join(&file))?;
             let m = p.maxTotalThreadsPerThreadgroup();
-            println!("LADDER {ty} {n} {m} {} {file}", p.staticThreadgroupMemoryLength());
+            println!(
+                "LADDER {ty} {n} {m} {} {file}",
+                p.staticThreadgroupMemoryLength()
+            );
             got.insert((ty.to_string(), n), m);
         }
     }
@@ -245,7 +262,10 @@ fn run_ladder(device: &Device, counts: &[usize], out: &Path) -> Result<BTreeMap<
 
 fn main() -> Result<()> {
     let args = Args::parse();
-    ensure!(!args.logs.is_empty(), "name at least one log carrying [pipeline: …] lines");
+    ensure!(
+        !args.logs.is_empty(),
+        "name at least one log carrying [pipeline: …] lines"
+    );
     std::fs::create_dir_all(&args.out)?;
     let device = Device::system_default().context("no Metal device")?;
     let kernels = Kernels::new();
@@ -275,8 +295,14 @@ fn main() -> Result<()> {
     let mut lines = 0usize;
     for log in &args.logs {
         let text = std::fs::read_to_string(log).with_context(|| log.display().to_string())?;
-        let tag = log.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-        for l in text.lines().filter(|l| l.trim_start().starts_with("[pipeline: ")) {
+        let tag = log
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        for l in text
+            .lines()
+            .filter(|l| l.trim_start().starts_with("[pipeline: "))
+        {
             lines += 1;
             let Some(entry) = pipeline_census::parse(l) else {
                 bail!("{}: unparsable census line: {l}", log.display());
@@ -299,7 +325,10 @@ fn main() -> Result<()> {
                 .insert(tag.clone());
         }
     }
-    ensure!(lines > 0, "no [pipeline: …] line in any log (was LLOOM_PIPELINE_CENSUS=1 set?)");
+    ensure!(
+        lines > 0,
+        "no [pipeline: …] line in any log (was LLOOM_PIPELINE_CENSUS=1 set?)"
+    );
     println!("POPULATION lines={lines} distinct={}", entries.len());
 
     // Every library, so a counterpart is found wherever it is instantiated.
@@ -341,7 +370,14 @@ fn main() -> Result<()> {
         let logs = logs.iter().cloned().collect::<Vec<_>>().join("+");
         println!(
             "ROW run {:?} {} {} {} {} {} {} {}",
-            entry.source, entry.function, cstr, b.max_threads, b.exec_width, b.tg_mem, b.archive, logs
+            entry.source,
+            entry.function,
+            cstr,
+            b.max_threads,
+            b.exec_width,
+            b.tg_mem,
+            b.archive,
+            logs
         );
         let mut found = false;
         for cand in f16_candidates(&entry.function) {
@@ -368,9 +404,20 @@ fn main() -> Result<()> {
                 match build(&device, clib, &cand, cvals.as_deref(), &args.out, &ctag) {
                     Ok(cb) => println!(
                         "ROW f16-of:{} {:?} {} {} {} {} {} {} {}",
-                        entry.function, src, cand, cstr, cb.max_threads, cb.exec_width, cb.tg_mem, cb.archive, logs
+                        entry.function,
+                        src,
+                        cand,
+                        cstr,
+                        cb.max_threads,
+                        cb.exec_width,
+                        cb.tg_mem,
+                        cb.archive,
+                        logs
                     ),
-                    Err(e) => println!("ROW f16-of:{} {:?} {} BUILD-FAILED {e}", entry.function, src, cand),
+                    Err(e) => println!(
+                        "ROW f16-of:{} {:?} {} BUILD-FAILED {e}",
+                        entry.function, src, cand
+                    ),
                 }
                 found = true;
                 break;
@@ -396,7 +443,10 @@ fn main() -> Result<()> {
             .find(|(s, _, _)| format!("{s:?}") == src_name)
             .with_context(|| format!("no source named {src_name}"))?;
         let matched: Vec<&String> = names.iter().filter(|n| n.starts_with(prefix)).collect();
-        ensure!(!matched.is_empty(), "--extra {spec}: no function of {src_name} starts with {prefix}");
+        ensure!(
+            !matched.is_empty(),
+            "--extra {spec}: no function of {src_name} starts with {prefix}"
+        );
         for name in matched {
             let tag = format!("x{extras:04}");
             extras += 1;
@@ -406,10 +456,7 @@ fn main() -> Result<()> {
             match built {
                 Ok((b, cstr)) => println!(
                     "ROW extra {src:?} {name} {cstr} {} {} {} {} {spec}",
-                    b.max_threads,
-                    b.exec_width,
-                    b.tg_mem,
-                    b.archive
+                    b.max_threads, b.exec_width, b.tg_mem, b.archive
                 ),
                 Err(e) => println!("ROW extra {src:?} {name} BUILD-FAILED {e}"),
             }

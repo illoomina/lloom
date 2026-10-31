@@ -275,7 +275,12 @@ fn one_row_bandwidth_per_kind_and_triple() {
     let dev = device();
     let (iters, reps) = (50usize, 9usize);
     let shapes = [(10240usize, 2560usize), (17408, 5120), (5120, 17408)];
-    let kinds = [GgmlDType::Q4K, GgmlDType::Q5K, GgmlDType::Q6K, GgmlDType::Q8_0];
+    let kinds = [
+        GgmlDType::Q4K,
+        GgmlDType::Q5K,
+        GgmlDType::Q6K,
+        GgmlDType::Q8_0,
+    ];
     lloom_tensor::kernels::set_qmv_rows(false);
     println!("BANDWIDTH contract=fast m=1 iters={iters} reps={reps} interleaved f32,f16,f32-null; median ms per launch");
     println!("| kind | shape | weight MB | f32 ms | f16 ms | null ms | f32 GB/s | f16 GB/s | f16/f32 | null/f32 |");

@@ -369,7 +369,12 @@ impl Kernels {
             if super::pipeline_census::armed() {
                 eprintln!(
                     "{}",
-                    super::pipeline_census::line(source, name.as_ref(), constants.as_ref(), &pipeline)
+                    super::pipeline_census::line(
+                        source,
+                        name.as_ref(),
+                        constants.as_ref(),
+                        &pipeline
+                    )
                 );
             }
             pipelines.insert((source, name, constants), pipeline.clone());

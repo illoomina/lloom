@@ -157,9 +157,7 @@ pub fn parse(text: &str) -> Option<Entry> {
             .find_map(|part| part.strip_prefix(key)?.strip_prefix('='))
     };
     let source_name = field("source")?;
-    let source = *SOURCES
-        .iter()
-        .find(|s| format!("{s:?}") == source_name)?;
+    let source = *SOURCES.iter().find(|s| format!("{s:?}") == source_name)?;
     let function = field("function")?.to_string();
     let constants = match field("constants")? {
         "-" => None,

@@ -98,6 +98,7 @@ mod quant_mv_store;
 mod quant_parity;
 mod quant_parity_matrix;
 mod quant_parity_matrix_rows;
+mod quant_route;
 mod quantized_tests;
 #[cfg(feature = "metal")]
 mod residency_router_device;

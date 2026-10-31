@@ -80,6 +80,7 @@ fn fixture(eos_gate: bool) -> Result<(FixtureDir, Engine<Owner>)> {
         flash_k: None,
         decision_template: None,
         decision_ragged: false,
+        text_only: true,
     })?;
     let actual = engine
         .core

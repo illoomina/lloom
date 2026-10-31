@@ -3977,3 +3977,6 @@ mod speculative_schedule_tests;
 
 #[cfg(test)]
 mod single_speculative_tests;
+
+#[cfg(all(test, feature = "metal"))]
+mod unwind_eos_gate_tests;

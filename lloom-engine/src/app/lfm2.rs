@@ -3606,9 +3606,19 @@ impl<P: Lfm2Shape> super::served::Served for Engine<P> {
     }
     fn capabilities(&self) -> super::family::Capabilities {
         if self.gguf {
-            return super::family::Capabilities {
+            let c = super::family::Capabilities {
                 decisions: self.decisions.is_some(),
                 ..super::family::LFM2_GGUF_CAPABILITIES
+            };
+            // The KV is held at the dtype the model computes in.
+            return if self.core.model.dtype() == DType::F16 {
+                super::family::Capabilities {
+                    kv_dtype: "f16",
+                    kv_dense: &["f16"],
+                    ..c
+                }
+            } else {
+                c
             };
         }
         super::family::Capabilities {

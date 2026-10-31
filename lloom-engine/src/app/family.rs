@@ -1038,6 +1038,45 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// `--gguf-act` is the LFM2 engine's over an LFM2 GGUF: every family
+    /// with no such arm refuses it by key; the LFM2 engine over a GGUF takes
+    /// it.
+    #[test]
+    fn the_gguf_activation_dtype_is_refused_where_no_family_reads_it() {
+        let f16 = model_args(&["--gguf-act", "f16"]);
+        assert_eq!(f16.gguf_act, "f16");
+        let legacy = model_args(&["--gguf-act", "f16", "--gguf-engine", "legacy"]);
+        let key = "models.lfm2_gguf.activation_dtype";
+        let families: [(&dyn Family, &LoadConfig); 4] = [
+            (&Lfm2Family, &f16),
+            (&Qwen4ExpFamily, &f16),
+            (&Qwen3_5Family, &f16),
+            (&Lfm2GgufFamily, &legacy),
+        ];
+        for (family, model) in families {
+            let err = family
+                .resolve(&Requested {
+                    model,
+                    shape: shape(),
+                })
+                .expect_err(family.name())
+                .to_string();
+            assert!(err.contains(key), "{}: {err}", family.name());
+        }
+        Lfm2GgufFamily
+            .resolve(&Requested {
+                model: &f16,
+                shape: shape(),
+            })
+            .unwrap();
+        Lfm2GgufFamily
+            .resolve(&Requested {
+                model: &model_args(&[]),
+                shape: shape(),
+            })
+            .unwrap();
+    }
+
     #[test]
     fn each_family_refuses_the_others_shapes_with_the_reason() {
         let m = model_args(&[]);

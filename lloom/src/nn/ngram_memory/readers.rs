@@ -39,8 +39,8 @@ const PENDING: u64 = 0;
 const LANDED: u64 = 1;
 const FAILED: u64 = 2;
 
-fn claim(gen: u64, state: u64) -> u64 {
-    (gen << 2) | state
+fn claim(round: u64, state: u64) -> u64 {
+    (round << 2) | state
 }
 
 /// A value on a cache line of its own (128 bytes on Apple silicon).
@@ -59,7 +59,7 @@ struct Item {
 /// One thread's job. The caller writes it only while the thread is idle
 /// (`finished == seq`) and hands it over by advancing `seq`.
 struct Job {
-    gen: u64,
+    round: u64,
     fd: i32,
     row_bytes: usize,
     /// Rows in the whole request: the `done` count that completes it.
@@ -123,7 +123,7 @@ pub struct Readers {
     /// Held by the one caller whose request is in flight; another caller is
     /// refused and reads another way.
     busy: AtomicBool,
-    gen: AtomicU64,
+    round: AtomicU64,
     counters: Counters,
 }
 
@@ -156,7 +156,7 @@ fn start(threads: usize) -> Option<&'static Readers> {
             seq: Line::default(),
             finished: Line::default(),
             job: UnsafeCell::new(Job {
-                gen: 0,
+                round: 0,
                 fd: -1,
                 row_bytes: 0,
                 rows: 0,
@@ -178,7 +178,7 @@ fn start(threads: usize) -> Option<&'static Readers> {
             errno: AtomicI32::new(0),
         },
         busy: AtomicBool::new(false),
-        gen: AtomicU64::new(0),
+        round: AtomicU64::new(0),
         counters: Counters::default(),
     }));
     for w in 0..threads {
@@ -258,9 +258,9 @@ impl Readers {
         if n_idle == 0 {
             return None;
         }
-        let gen = self.gen.fetch_add(1, Ordering::Relaxed) + 1;
+        let round = self.round.fetch_add(1, Ordering::Relaxed) + 1;
         for c in &self.req.claims[..rows] {
-            c.store(claim(gen, PENDING), Ordering::Relaxed);
+            c.store(claim(round, PENDING), Ordering::Relaxed);
         }
         self.req.done.0.store(0, Ordering::Relaxed);
         self.req.errno.store(0, Ordering::Relaxed);
@@ -272,7 +272,9 @@ impl Readers {
                 row: i as u32,
                 off: offset(i),
             });
-            self.hand(w as usize, &me, gen, fd, rows, row_bytes, dst, false, items);
+            self.hand(
+                w as usize, &me, round, fd, rows, row_bytes, dst, false, items,
+            );
         }
         self.counters.requests.fetch_add(1, Ordering::Relaxed);
         self.counters.rows.fetch_add(rows as u64, Ordering::Relaxed);
@@ -283,7 +285,7 @@ impl Readers {
                 Some((t0, h)) => {
                     let left = h.saturating_sub(t0.elapsed());
                     if left.is_zero() {
-                        self.hedge(gen, &me, fd, rows, row_bytes, dst, offset);
+                        self.hedge(round, &me, fd, rows, row_bytes, dst, offset);
                         deadline = None;
                     } else {
                         std::thread::park_timeout(left);
@@ -312,12 +314,12 @@ impl Readers {
         n
     }
 
-    /// Read the rows of request `gen` still in flight again, one on each idle
+    /// Read the rows of request `round` still in flight again, one on each idle
     /// thread, as far as the idle threads go.
     #[allow(clippy::too_many_arguments)]
     fn hedge(
         &self,
-        gen: u64,
+        round: u64,
         me: &Thread,
         fd: i32,
         rows: usize,
@@ -327,13 +329,13 @@ impl Readers {
     ) {
         let mut idle = [0u8; MAX_THREADS];
         let n_idle = self.idle(&mut idle);
-        let pending = claim(gen, PENDING);
+        let pending = claim(round, PENDING);
         let mut j = 0;
-        for i in 0..rows {
+        for (i, c) in self.req.claims[..rows].iter().enumerate() {
             if j == n_idle {
                 break;
             }
-            if self.req.claims[i].load(Ordering::Acquire) != pending {
+            if c.load(Ordering::Acquire) != pending {
                 continue;
             }
             let item = Item {
@@ -344,7 +346,7 @@ impl Readers {
             self.hand(
                 w,
                 me,
-                gen,
+                round,
                 fd,
                 rows,
                 row_bytes,
@@ -363,7 +365,7 @@ impl Readers {
         &self,
         w: usize,
         me: &Thread,
-        gen: u64,
+        round: u64,
         fd: i32,
         rows: usize,
         row_bytes: usize,
@@ -375,7 +377,7 @@ impl Readers {
         // SAFETY: the worker is idle (`finished == seq`, read with Acquire by
         // `idle`), and reads its job again only once `seq` advances below.
         let job = unsafe { &mut *wk.job.get() };
-        job.gen = gen;
+        job.round = round;
         job.fd = fd;
         job.row_bytes = row_bytes;
         job.rows = rows;
@@ -421,7 +423,7 @@ impl Readers {
     /// Read each row of `job` still in flight and claim it; the claim's
     /// winner lands it in the caller's destination and counts it.
     fn serve(&self, job: &Job, buf: &mut [u8]) {
-        let pending = claim(job.gen, PENDING);
+        let pending = claim(job.round, PENDING);
         for it in &job.items[..job.count] {
             let c = &self.req.claims[it.row as usize];
             // Landed by its twin, or its request has ended: nothing to read.
@@ -432,7 +434,7 @@ impl Readers {
             let state = if errno == 0 { LANDED } else { FAILED };
             if c.compare_exchange(
                 pending,
-                claim(job.gen, state),
+                claim(job.round, state),
                 Ordering::AcqRel,
                 Ordering::Relaxed,
             )

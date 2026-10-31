@@ -342,4 +342,177 @@ mod flash_validation_tests {
         assert_eq!(new_live.to_vec1::<f32>()?, &[257.]);
         Ok(())
     }
+
+    // Same release-before-drain fixture discipline as the actual tensor
+    // completion_hook_gpu_tests. This is test cleanup, not a new executor.
+    #[cfg(feature = "metal")]
+    struct ReleaseBeforeDrain<R: FnMut(), D: FnMut()> {
+        release: R,
+        drain: D,
+    }
+    #[cfg(feature = "metal")]
+    impl<R: FnMut(), D: FnMut()> Drop for ReleaseBeforeDrain<R, D> {
+        fn drop(&mut self) {
+            (self.release)();
+            (self.drain)();
+        }
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn resident_native_fixture_releases_before_drain_on_unwind() {
+        let released = std::cell::Cell::new(false);
+        let drained_after_release = std::cell::Cell::new(false);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _cleanup = ReleaseBeforeDrain {
+                release: || released.set(true),
+                drain: || drained_after_release.set(released.get()),
+            };
+            panic!("controlled resident fixture assertion unwind");
+        }));
+        assert!(result.is_err());
+        assert!(
+            drained_after_release.get(),
+            "fixture drained before releasing its event"
+        );
+    }
+
+    /// Distinct from the encoded-but-uncommitted fixture: an unsignalled
+    /// existing shared-event wait keeps an actually submitted old reader held.
+    #[cfg(feature = "metal")]
+    #[test]
+    fn resident_mapped_suffix_preserves_a_committed_inflight_prefix_reader() -> Result<()> {
+        use objc2_metal::{MTLDevice as _, MTLSharedEvent as _};
+        let device = Device::new_metal(0)?;
+        let metal = device.as_metal_device()?;
+        eprintln!(
+            "FLASH_METADATA_NATIVE control=mapped-suffix-committed-inflight api={} cb_kind={:?}",
+            metal.commands().actual_command_api(),
+            metal.command_buffer_kind()
+        );
+        metal.set_compute_per_buffer(usize::MAX);
+        // Complete the exact cast before the GPU is held: a cold compiler or
+        // pipeline creation has no bounded relation to a native event timeout.
+        assert_eq!(
+            Tensor::new(&[0u32], &device)?
+                .to_dtype(DType::F32)?
+                .to_vec1::<f32>()?,
+            &[0.]
+        );
+        let mut owner = ResidentMetadata::new(256, 1, 4)?;
+        owner.publish_suffix(&[2], &device)?;
+        let old_count = ResidentCount::new(1, &device)?;
+        let next_count = ResidentCount::new(257, &device)?;
+        let event = metal
+            .metal_device()
+            .as_ref()
+            .newSharedEvent()
+            .ok_or_else(|| {
+                lloom_tensor::Error::Msg("resident fixture newSharedEvent returned nil".into())
+            })?;
+        // Independent owners survive an unknown terminality outcome. Tensor
+        // aliases are confined to this privileged test; no caller can get them
+        // from the safe resident owner. All actual data writes still use its
+        // production publish_suffix/publish_with implementation.
+        let pins = std::cell::RefCell::new(Some((
+            device.clone(),
+            event.clone(),
+            vec![
+                owner.table_t.as_ref().expect("published").clone(),
+                old_count.tensor.clone(),
+                next_count.tensor.clone(),
+            ],
+        )));
+        let cleanup_terminal = std::cell::Cell::new(false);
+        // Arm BEFORE encoding even the first possibly blocking wait. On every
+        // early return or assertion unwind release the event before draining.
+        let cleanup = ReleaseBeforeDrain {
+            release: || event.setSignaledValue(1),
+            drain: || {
+                let drained = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    metal.flush_and_wait_current()
+                }));
+                if matches!(drained, Ok(Ok(()))) {
+                    cleanup_terminal.set(true);
+                    drop(pins.borrow_mut().take());
+                } else {
+                    std::mem::forget(pins.borrow_mut().take());
+                    eprintln!("resident fixture cleanup unknown; independent owners retained");
+                }
+            },
+        };
+        metal
+            .commands()
+            .encode_wait_for_event(&event, 1)
+            .map_err(lloom_tensor::Error::wrap)?;
+        let (old_prefix, old_live) = {
+            let read = owner.read(&old_count)?;
+            let (table, count) = read.bindings();
+            (
+                table.narrow(0, 0, 1)?.to_dtype(DType::F32)?,
+                count.to_dtype(DType::F32)?,
+            )
+        };
+        pins.borrow_mut()
+            .as_mut()
+            .expect("cleanup not run")
+            .2
+            .extend([old_prefix.clone(), old_live.clone()]);
+        let held = metal.flush_marker()?;
+        assert!(
+            !metal.commands().marker_failed(&held),
+            "fixture reader failed before append"
+        );
+        metal
+            .commands()
+            .check_failed()
+            .map_err(lloom_tensor::Error::wrap)?;
+        assert!(
+            !metal.commands().marker_complete(&held),
+            "fixture did not hold the submitted old reader"
+        );
+        // The only permitted mutation is the unpublished suffix. Refusing the
+        // upload fallback makes successful mapped-write coverage non-vacuous.
+        owner.publish_with(&[3], &device, |_, _| {
+            lloom_tensor::bail!("inflight control unexpectedly used replacement upload")
+        })?;
+        let (new_prefix, new_live) = {
+            let read = owner.read(&next_count)?;
+            let (table, count) = read.bindings();
+            (
+                table.narrow(0, 0, 2)?.to_dtype(DType::F32)?,
+                count.to_dtype(DType::F32)?,
+            )
+        };
+        pins.borrow_mut()
+            .as_mut()
+            .expect("cleanup not run")
+            .2
+            .extend([new_prefix.clone(), new_live.clone()]);
+        assert!(
+            !metal.commands().marker_complete(&held),
+            "submitted old reader completed before release"
+        );
+
+        assert!(
+            !metal.commands().marker_failed(&held),
+            "fixture reader failed during mapped append"
+        );
+        metal
+            .commands()
+            .check_failed()
+            .map_err(lloom_tensor::Error::wrap)?;
+        event.setSignaledValue(1);
+        assert_eq!(old_prefix.to_vec1::<f32>()?, &[2.]);
+        assert_eq!(old_live.to_vec1::<f32>()?, &[1.]);
+        assert_eq!(new_prefix.to_vec1::<f32>()?, &[2., 3.]);
+        assert_eq!(new_live.to_vec1::<f32>()?, &[257.]);
+        assert!(metal.commands().marker_complete(&held));
+        drop(cleanup);
+        assert!(
+            cleanup_terminal.get(),
+            "resident fixture terminality is unknown"
+        );
+        Ok(())
+    }
 }

@@ -795,6 +795,12 @@ pub unsafe fn call_quantized_matmul_mv_t(
     }
 }
 
+/// Whether the kind's plain matmul-vec is instantiated at row capacity
+/// `nr1`: every kind at 1, the quantized cores at [`MV_ROWS_CAPACITIES`].
+pub fn mv_rows_instantiated(dtype: GgmlDType, nr1: usize) -> bool {
+    nr1 == 1 || (dtype.kind().mul_mv_quant() && MV_ROWS_CAPACITIES.contains(&nr1))
+}
+
 /// [`call_quantized_matmul_mv_t`] at the row capacity `nr1` the caller
 /// resolved (`quantized::route`): 1 is the one-row core over each row, 2, 4
 /// or 8 the core at that capacity (`_r<nr1>`). A capacity the kind does not
@@ -817,7 +823,7 @@ pub unsafe fn call_quantized_matmul_mv_rows_t(
     dst_offset: usize,
     dst: &Buffer,
 ) -> Result<(), MetalKernelError> {
-    if nr1 != 1 && !(dtype.kind().mul_mv_quant() && MV_ROWS_CAPACITIES.contains(&nr1)) {
+    if !mv_rows_instantiated(dtype, nr1) {
         return Err(MetalKernelError::UnsupportedDTypeForOp(Box::new(
             UnsupportedDTypeForOp {
                 dtype: "a row capacity this kind's matmul-vec is not instantiated at",
@@ -2189,6 +2195,50 @@ mod arm_tests {
                 "{msg}"
             );
         }
+    }
+
+    /// The plain matmul-vec is dispatched only at a capacity the kind
+    /// instantiates; any other is refused before a pipeline is resolved.
+    #[test]
+    fn a_row_capacity_the_kind_lacks_is_refused() {
+        for (d, nr1, want) in [
+            (GgmlDType::Q4K, 1, true),
+            (GgmlDType::Q4K, 2, true),
+            (GgmlDType::Q4K, 8, true),
+            (GgmlDType::Q2K, 4, true),
+            (GgmlDType::Q4K, 3, false),
+            (GgmlDType::Q4K, 16, false),
+            (GgmlDType::F16, 1, true),
+            (GgmlDType::F16, 2, false),
+            (GgmlDType::F32, 4, false),
+        ] {
+            assert_eq!(mv_rows_instantiated(d, nr1), want, "{d:?} at {nr1}");
+        }
+        let (device, kernels, commands, buf) = setup();
+        let encoder = commands.command_encoder().unwrap();
+        // SAFETY: the dispatch is refused before anything is encoded.
+        let err = unsafe {
+            call_quantized_matmul_mv_rows_t(
+                &device,
+                &encoder,
+                &kernels,
+                GgmlDType::Q4K,
+                GemvTriple::F32F32F32,
+                (1, 3, 32, 256),
+                3,
+                &buf,
+                0,
+                &buf,
+                0,
+                &buf,
+            )
+        }
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("a row capacity this kind's matmul-vec is not instantiated at"),
+            "{err}"
+        );
     }
 
     /// The float arms pass the device check here, which registers `f16` on

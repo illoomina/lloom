@@ -1759,13 +1759,13 @@ mod tests {
         }
     }
 
-    /// A table stored in a float-code kind (the FP8 checkpoint stores its
-    /// n-gram table as E4M3 under one bf16 scale) gathers, row by row, what
-    /// the kind's own `to_float` of the whole table holds — an absolute
-    /// reference, not the row path compared with itself.
+    /// A table stored in a block kind (the FP8 checkpoint stores its n-gram
+    /// table as E4M3 under one bf16 scale, Qwen4-exp's as IQ4_NL) gathers,
+    /// row by row, what the kind's own `to_float` of the whole table holds —
+    /// an absolute reference, not the row path compared with itself.
     #[test]
     fn a_float_code_table_gathers_its_to_float_rows() {
-        for dtype in [GgmlDType::MXFP4, GgmlDType::FP8E4M3] {
+        for dtype in [GgmlDType::MXFP4, GgmlDType::FP8E4M3, GgmlDType::IQ4NL] {
             let (rows, head_dim) = (300usize, 160usize);
             let path = table_file(&format!("fp-{dtype:?}"), rows, head_dim, dtype);
             let mut f = std::fs::File::open(&path).unwrap();

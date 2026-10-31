@@ -5,7 +5,10 @@ use lloom_tensor::{CpuStorage, DType, Layout, Module, Result, Shape, Tensor, D};
 use rayon::prelude::*;
 
 mod flash_metadata;
-pub use flash_metadata::FlashDecodingMetadata;
+pub use flash_metadata::{
+    FlashDecodingCount, FlashDecodingMetadata, FlashDecodingMetadataView,
+    FlashDecodingResidentMetadata,
+};
 
 /// Applies the softmax function to the input tensor, rescaling the element so that elements on
 /// a slice of fixed index on dimension `dim` are between 0 and 1 and sum to 1.
@@ -4432,6 +4435,35 @@ pub fn flash_decoding_paged_metadata(
     reserve_chunks: usize,
     metadata: &FlashDecodingMetadata,
 ) -> Result<Tensor> {
+    flash_decoding_paged_view(
+        q,
+        k,
+        v,
+        scale,
+        softcapping,
+        scratch_sizing,
+        reserve_chunks,
+        &metadata.view(),
+    )
+}
+
+/// FlashDecoding over one authenticated borrowed upload/resident publication.
+/// Construct the view once per pass and borrow it for every layer; its owner
+/// supplies immutable payloads and a publication-time span summary. Each call
+/// independently checks the current layer's Q/K/V dimensions/strides/capacity.
+/// No trait dispatch, boxing, refcount, table scan, metadata upload or readback
+/// is added by this view. Normal output/scratch allocation remains unchanged.
+#[allow(clippy::too_many_arguments)]
+pub fn flash_decoding_paged_view(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    scale: f32,
+    softcapping: f32,
+    scratch_sizing: FlashScratchSizing,
+    reserve_chunks: usize,
+    metadata: &FlashDecodingMetadataView<'_>,
+) -> Result<Tensor> {
     let (tables_t, n_keys_t) = metadata.bindings();
     // Both private tensors were constructed by the same publication on one
     // device. Unlike Q/K/V, metadata is not an apply_op3 operand, so its
@@ -4439,7 +4471,7 @@ pub fn flash_decoding_paged_metadata(
     if !tables_t.device().same_device(q.device()) {
         lloom_tensor::bail!("flash-decoding: metadata must share the query device")
     }
-    let (page_size, pages_per_chunk) = metadata.route();
+    let (page_size, pages_per_chunk) = metadata.page_geometry();
     FlashDecoding {
         scale,
         softcapping,

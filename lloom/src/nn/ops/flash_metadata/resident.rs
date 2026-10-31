@@ -5,17 +5,48 @@
 //! future mutation while it may still be encoded; it does NOT by itself retain
 //! resources for queued GPU work. The ordinary Tensor upload/pool/in-flight
 //! lifetime remains responsible for those already-encoded readers.
-use crate::nn::attention::flash_validation::{PageSummary, ResidentSpans};
+use super::FlashDecodingMetadataView;
+use crate::nn::attention::flash_validation::ResidentSpans;
 use lloom_tensor::{Device, Result, Tensor};
 
-pub(in crate::nn::ops) struct ResidentMetadata {
+/// One B=1 resident table with exclusive append/reset custody.
+///
+/// Clone copies host state but detaches device publication; publish its existing
+/// prefix with an empty suffix before the clone's next read. Immutable uploaded
+/// counts may be shared; no native table or count Tensor is exported.
+///
+/// ```
+/// use lloom::nn::ops::{FlashDecodingCount, FlashDecodingResidentMetadata};
+/// use lloom_tensor::Device;
+/// let mut table = FlashDecodingResidentMetadata::new(256, 1, 4)?;
+/// table.publish_suffix(&[0], &Device::Cpu)?;
+/// let count = FlashDecodingCount::new(1, &Device::Cpu)?;
+/// let view = table.view(&count)?;
+/// assert_eq!(view.table(), &[0]);
+/// assert_eq!(view.keys(), &[1]);
+/// table.reset(); // the view's last use was above
+/// # Ok::<(), lloom_tensor::Error>(())
+/// ```
+/// A future use of a borrowed view prevents resetting/rewriting its owner:
+/// ```compile_fail,E0502
+/// use lloom::nn::ops::{FlashDecodingCount, FlashDecodingResidentMetadata};
+/// use lloom_tensor::Device;
+/// let mut table = FlashDecodingResidentMetadata::new(256, 1, 4)?;
+/// table.publish_suffix(&[0], &Device::Cpu)?;
+/// let count = FlashDecodingCount::new(1, &Device::Cpu)?;
+/// let view = table.view(&count)?;
+/// table.reset();
+/// assert_eq!(view.keys(), &[1]);
+/// # Ok::<(), lloom_tensor::Error>(())
+/// ```
+pub struct FlashDecodingResidentMetadata {
     spans: ResidentSpans,
     reserve_entries: usize,
     // No safe Tensor accessor, clone, or mutable alias may escape this module.
     table_t: Option<Tensor>,
 }
 
-impl Clone for ResidentMetadata {
+impl Clone for FlashDecodingResidentMetadata {
     fn clone(&self) -> Self {
         // Host ownership clones normally; native publication must not alias an
         // independently writable clone. Re-publish before the clone's first use.
@@ -27,9 +58,9 @@ impl Clone for ResidentMetadata {
     }
 }
 
-impl std::fmt::Debug for ResidentMetadata {
+impl std::fmt::Debug for FlashDecodingResidentMetadata {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ResidentMetadata")
+        f.debug_struct("FlashDecodingResidentMetadata")
             .field("published_entries", &self.spans.entries().len())
             .field("reserve_entries", &self.reserve_entries)
             .field("has_native_publication", &self.table_t.is_some())
@@ -37,12 +68,8 @@ impl std::fmt::Debug for ResidentMetadata {
     }
 }
 
-impl ResidentMetadata {
-    pub(in crate::nn::ops) fn new(
-        page_size: usize,
-        pages_per_chunk: usize,
-        reserve_entries: usize,
-    ) -> Result<Self> {
+impl FlashDecodingResidentMetadata {
+    pub fn new(page_size: usize, pages_per_chunk: usize, reserve_entries: usize) -> Result<Self> {
         Ok(Self {
             spans: ResidentSpans::new(page_size, pages_per_chunk)?,
             reserve_entries,
@@ -50,14 +77,14 @@ impl ResidentMetadata {
         })
     }
 
-    pub(in crate::nn::ops) fn entries(&self) -> &[u32] {
+    pub fn table(&self) -> &[u32] {
         self.spans.entries()
     }
 
     /// Detach rather than rewrite a prefix still reachable by queued work.
     /// Existing Tensor/command retirement retains the old physical allocation;
     /// this owner does not introduce a second pool, ring or retirement protocol.
-    pub(in crate::nn::ops) fn reset(&mut self) {
+    pub fn reset(&mut self) {
         self.table_t = None;
         self.spans.clear();
     }
@@ -65,11 +92,7 @@ impl ResidentMetadata {
     /// Append a previously unpublished suffix. An empty suffix re-publishes a
     /// clone's detached host prefix; it does nothing for an already-ready owner.
     /// The caller moves the existing PagedKv shadow state here, not a second copy.
-    pub(in crate::nn::ops) fn publish_suffix(
-        &mut self,
-        suffix: &[u32],
-        device: &Device,
-    ) -> Result<()> {
+    pub fn publish_suffix(&mut self, suffix: &[u32], device: &Device) -> Result<()> {
         self.publish_with(suffix, device, |data, device| Tensor::new(data, device))
     }
 
@@ -114,10 +137,10 @@ impl ResidentMetadata {
 
     /// A lifetime-bound checked view; no Tensor or writer alias is exposed.
     /// Preparation is O(1) prefix/tail arithmetic, never a table scan/upload.
-    pub(in crate::nn::ops) fn read<'a>(
+    pub fn view<'a>(
         &'a self,
-        count: &'a ResidentCount,
-    ) -> Result<ResidentRead<'a>> {
+        count: &'a FlashDecodingCount,
+    ) -> Result<FlashDecodingMetadataView<'a>> {
         let table = self.table_t.as_ref().ok_or_else(|| {
             lloom_tensor::Error::Msg("flash-decoding: resident table is not published".into())
         })?;
@@ -125,23 +148,34 @@ impl ResidentMetadata {
             lloom_tensor::bail!("flash-decoding: resident table/count devices differ")
         }
         let summary = self.spans.summary(count.keys)?;
-        Ok(ResidentRead {
-            owner: self,
-            count,
+        Ok(FlashDecodingMetadataView {
+            table: self.spans.entries(),
+            keys: std::slice::from_ref(&count.keys),
+            table_stride: 0,
             summary,
+            table_t: table,
+            keys_t: &count.tensor,
         })
     }
 }
 
 /// One immutable step count: inline host value and the existing one-value upload.
 /// A frame-backed variant is deliberately absent pending #1147's scoped lease.
-pub(in crate::nn::ops) struct ResidentCount {
+#[derive(Clone)]
+pub struct FlashDecodingCount {
     keys: u32,
     tensor: Tensor,
 }
 
-impl ResidentCount {
-    pub(in crate::nn::ops) fn new(keys: u32, device: &Device) -> Result<Self> {
+impl std::fmt::Debug for FlashDecodingCount {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FlashDecodingCount")
+            .field("keys", &self.keys)
+            .finish_non_exhaustive()
+    }
+}
+impl FlashDecodingCount {
+    pub fn new(keys: u32, device: &Device) -> Result<Self> {
         if keys == 0 || keys > i32::MAX as u32 {
             lloom_tensor::bail!("flash-decoding: resident live count must be positive signed U32")
         }
@@ -149,33 +183,6 @@ impl ResidentCount {
             keys,
             tensor: Tensor::new(&[keys], device)?,
         })
-    }
-}
-
-/// The existing op may bind these private tensors only while this view lives.
-/// No Arc, atomic, new allocator or ring is added to layer consumption.
-pub(in crate::nn::ops) struct ResidentRead<'a> {
-    owner: &'a ResidentMetadata,
-    count: &'a ResidentCount,
-    summary: PageSummary,
-}
-impl ResidentRead<'_> {
-    pub(in crate::nn::ops) fn summary(&self) -> &PageSummary {
-        &self.summary
-    }
-    pub(in crate::nn::ops) fn entries(&self) -> &[u32] {
-        self.owner.entries()
-    }
-    pub(in crate::nn::ops) fn keys(&self) -> &[u32] {
-        std::slice::from_ref(&self.count.keys)
-    }
-    // Kept private to the encapsulation module until the actual op binding seam
-    // is integrated. Widening this outside nn::ops would invalidate custody.
-    fn bindings(&self) -> (&Tensor, &Tensor) {
-        (
-            self.owner.table_t.as_ref().expect("checked by read"),
-            &self.count.tensor,
-        )
     }
 }
 
@@ -194,11 +201,11 @@ mod flash_validation_tests {
 
     #[test]
     fn resident_publication_and_counts_authenticate_one_matching_pair() -> Result<()> {
-        let mut owner = ResidentMetadata::new(256, 1, 8)?;
+        let mut owner = FlashDecodingResidentMetadata::new(256, 1, 8)?;
         owner.publish_suffix(&[2, 0], &Device::Cpu)?;
-        let count = ResidentCount::new(257, &Device::Cpu)?;
-        let read = owner.read(&count)?;
-        assert_eq!(read.entries(), &[2, 0]);
+        let count = FlashDecodingCount::new(257, &Device::Cpu)?;
+        let read = owner.view(&count)?;
+        assert_eq!(read.table(), &[2, 0]);
         assert_eq!(read.keys(), &[257]);
         assert_eq!(
             read.bindings().0.to_vec1::<u32>()?,
@@ -210,48 +217,48 @@ mod flash_validation_tests {
 
     #[test]
     fn resident_failed_append_retains_old_prefix_and_refuses_new_live_count() -> Result<()> {
-        let mut owner = ResidentMetadata::new(256, 1, 2)?;
+        let mut owner = FlashDecodingResidentMetadata::new(256, 1, 2)?;
         owner.publish_suffix(&[1], &Device::Cpu)?;
         let error = owner.publish_with(&[3], &Device::Cpu, |_, _| {
             lloom_tensor::bail!("injected resident upload refusal")
         });
         refused(error, "injected resident upload refusal");
-        assert_eq!(owner.entries(), &[1]);
-        let old_count = ResidentCount::new(1, &Device::Cpu)?;
+        assert_eq!(owner.table(), &[1]);
+        let old_count = FlashDecodingCount::new(1, &Device::Cpu)?;
         assert_eq!(
-            owner.read(&old_count)?.bindings().0.to_vec1::<u32>()?,
+            owner.view(&old_count)?.bindings().0.to_vec1::<u32>()?,
             &[1, 0]
         );
-        let new_count = ResidentCount::new(257, &Device::Cpu)?;
-        refused(owner.read(&new_count), "shorter than the live prefix");
+        let new_count = FlashDecodingCount::new(257, &Device::Cpu)?;
+        refused(owner.view(&new_count), "shorter than the live prefix");
         owner.publish_suffix(&[3], &Device::Cpu)?;
-        assert_eq!(owner.read(&new_count)?.entries(), &[1, 3]);
+        assert_eq!(owner.view(&new_count)?.table(), &[1, 3]);
         Ok(())
     }
 
     #[test]
     fn resident_clone_detaches_publication_and_reset_requires_republication() -> Result<()> {
-        let mut source = ResidentMetadata::new(256, 1, 2)?;
+        let mut source = FlashDecodingResidentMetadata::new(256, 1, 2)?;
         source.publish_suffix(&[1], &Device::Cpu)?;
-        let count = ResidentCount::new(1, &Device::Cpu)?;
+        let count = FlashDecodingCount::new(1, &Device::Cpu)?;
         let mut clone = source.clone();
-        refused(clone.read(&count), "not published");
+        refused(clone.view(&count), "not published");
         clone.publish_suffix(&[], &Device::Cpu)?;
         clone.reset();
-        refused(clone.read(&count), "not published");
+        refused(clone.view(&count), "not published");
         clone.publish_suffix(&[3], &Device::Cpu)?;
-        assert_eq!(source.read(&count)?.entries(), &[1]);
-        assert_eq!(clone.read(&count)?.entries(), &[3]);
-        assert_eq!(source.read(&count)?.bindings().0.to_vec1::<u32>()?, &[1, 0]);
+        assert_eq!(source.view(&count)?.table(), &[1]);
+        assert_eq!(clone.view(&count)?.table(), &[3]);
+        assert_eq!(source.view(&count)?.bindings().0.to_vec1::<u32>()?, &[1, 0]);
         Ok(())
     }
 
     #[test]
     fn resident_step_summary_checks_each_layers_independent_pool_capacity() -> Result<()> {
-        let mut owner = ResidentMetadata::new(256, 1, 2)?;
+        let mut owner = FlashDecodingResidentMetadata::new(256, 1, 2)?;
         owner.publish_suffix(&[0, 3], &Device::Cpu)?;
-        let count = ResidentCount::new(257, &Device::Cpu)?;
-        let read = owner.read(&count)?;
+        let count = FlashDecodingCount::new(257, &Device::Cpu)?;
+        let read = owner.view(&count)?;
         let q = Layout::contiguous(&[1, 1, 1, 64]);
         let good = Layout::contiguous(&[1, 1, 769, 64]);
         let short = Layout::contiguous(&[1, 1, 768, 64]);
@@ -290,22 +297,18 @@ mod flash_validation_tests {
     fn resident_mapped_suffix_preserves_an_encoded_old_prefix_reader() -> Result<()> {
         let device = Device::new_metal(0)?;
         let metal = device.as_metal_device()?;
-        eprintln!(
-            "FLASH_METADATA_NATIVE control=mapped-suffix-encoded-uncommitted api={} cb_kind={:?}",
-            metal.commands().actual_command_api(),
-            metal.command_buffer_kind()
-        );
+        super::super::assert_native_fixture_arm(metal, "mapped-suffix-encoded-uncommitted");
         // Keep this fixture's two casts encoded/pending until after the host append.
         // No waited event, giant tensor or intentionally invalid GPU access.
         metal.set_compute_per_buffer(usize::MAX);
-        let mut owner = ResidentMetadata::new(256, 1, 4)?;
+        let mut owner = FlashDecodingResidentMetadata::new(256, 1, 4)?;
         owner.publish_suffix(&[2], &device)?;
-        let old_count = ResidentCount::new(1, &device)?;
+        let old_count = FlashDecodingCount::new(1, &device)?;
         let clock = metal.commands().clock();
         let epoch = clock.current_epoch();
         let completed = clock.completed_count();
         let (old_prefix, old_live) = {
-            let read = owner.read(&old_count)?;
+            let read = owner.view(&old_count)?;
             let (table, count) = read.bindings();
             // to_dtype(U32->F32) reaches actual cast_u32_f32 dispatches; not a
             // same-dtype Tensor clone or CPU readback masquerading as a GPU reader.
@@ -329,8 +332,8 @@ mod flash_validation_tests {
         owner.publish_with(&[3], &device, |_, _| {
             lloom_tensor::bail!("native control unexpectedly used replacement upload")
         })?;
-        let next_count = ResidentCount::new(257, &device)?;
-        let next = owner.read(&next_count)?;
+        let next_count = FlashDecodingCount::new(257, &device)?;
+        let next = owner.view(&next_count)?;
         let (table, count) = next.bindings();
         let new_prefix = table.narrow(0, 0, 2)?.to_dtype(DType::F32)?;
         let new_live = count.to_dtype(DType::F32)?;
@@ -385,11 +388,7 @@ mod flash_validation_tests {
         use objc2_metal::{MTLDevice as _, MTLSharedEvent as _};
         let device = Device::new_metal(0)?;
         let metal = device.as_metal_device()?;
-        eprintln!(
-            "FLASH_METADATA_NATIVE control=mapped-suffix-committed-inflight api={} cb_kind={:?}",
-            metal.commands().actual_command_api(),
-            metal.command_buffer_kind()
-        );
+        super::super::assert_native_fixture_arm(metal, "mapped-suffix-committed-inflight");
         metal.set_compute_per_buffer(usize::MAX);
         // Complete the exact cast before the GPU is held: a cold compiler or
         // pipeline creation has no bounded relation to a native event timeout.
@@ -399,10 +398,10 @@ mod flash_validation_tests {
                 .to_vec1::<f32>()?,
             &[0.]
         );
-        let mut owner = ResidentMetadata::new(256, 1, 4)?;
+        let mut owner = FlashDecodingResidentMetadata::new(256, 1, 4)?;
         owner.publish_suffix(&[2], &device)?;
-        let old_count = ResidentCount::new(1, &device)?;
-        let next_count = ResidentCount::new(257, &device)?;
+        let old_count = FlashDecodingCount::new(1, &device)?;
+        let next_count = FlashDecodingCount::new(257, &device)?;
         let event = metal
             .metal_device()
             .as_ref()
@@ -446,7 +445,7 @@ mod flash_validation_tests {
             .encode_wait_for_event(&event, 1)
             .map_err(lloom_tensor::Error::wrap)?;
         let (old_prefix, old_live) = {
-            let read = owner.read(&old_count)?;
+            let read = owner.view(&old_count)?;
             let (table, count) = read.bindings();
             (
                 table.narrow(0, 0, 1)?.to_dtype(DType::F32)?,
@@ -477,7 +476,7 @@ mod flash_validation_tests {
             lloom_tensor::bail!("inflight control unexpectedly used replacement upload")
         })?;
         let (new_prefix, new_live) = {
-            let read = owner.read(&next_count)?;
+            let read = owner.view(&next_count)?;
             let (table, count) = read.bindings();
             (
                 table.narrow(0, 0, 2)?.to_dtype(DType::F32)?,

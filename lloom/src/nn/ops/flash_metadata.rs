@@ -5,11 +5,15 @@
 use crate::nn::attention::flash_validation::{prepare_pages, PageSummary, Pages};
 use lloom_tensor::{Device, Result, Tensor};
 
-// No production caller until the #1147 owner migration is reviewed. The
-// module exercises the actual publication mechanism, not a second allocator.
-#[allow(dead_code)]
+// The owner has one implementation; the protected model/frame migration is
+// still pending. These safe types do not expose their native Tensor payloads.
 #[path = "flash_metadata/resident.rs"]
 mod resident;
+pub use resident::{FlashDecodingCount, FlashDecodingResidentMetadata};
+
+#[path = "flash_metadata/view.rs"]
+mod view;
+pub use view::FlashDecodingMetadataView;
 
 /// A published table/count pair with one authenticated source of values.
 ///
@@ -23,6 +27,9 @@ mod resident;
 /// let metadata = FlashDecodingMetadata::new(vec![0], 1, vec![1], 1, 256, 1, &Device::Cpu)?;
 /// assert_eq!(metadata.table(), &[0]);
 /// assert_eq!(metadata.keys(), &[1]);
+/// let view = metadata.view();
+/// assert_eq!(view.table(), &[0]);
+/// assert_eq!(view.keys(), &[1]);
 /// # Ok::<(), lloom_tensor::Error>(())
 /// ```
 /// Device tensors are not available to a safe caller (including mutation via
@@ -104,17 +111,71 @@ impl FlashDecodingMetadata {
         self.table_stride
     }
 
-    // This module must remain a private child of nn::ops. In particular do not
-    // widen these accessors to pub(crate): safe caller mutation through a Tensor
-    // alias would invalidate the authenticated publication proof.
-    pub(super) fn route(&self) -> (usize, usize) {
+    /// Recover the unique host staging vectors for the next publication.
+    ///
+    /// Consuming this owner closes future views; an outstanding future use of a
+    /// borrowed view prevents the move. Tensor::new initialized independent
+    /// device storage, so later host edits cannot rewrite its old payload.
+    /// Already-encoded native readers separately retain that storage through the
+    /// normal Tensor/command retirement contract; host-vector ownership is not
+    /// a substitute for their completion.
+    pub fn into_host_vectors(self) -> (Vec<u32>, Vec<u32>) {
+        let Self { table, keys, .. } = self;
+        (table, keys)
+    }
+
+    /// Borrow the existing publication; no table/count copy, upload or scan.
+    pub fn view(&self) -> FlashDecodingMetadataView<'_> {
+        let (table_t, keys_t) = self.bindings();
+        FlashDecodingMetadataView {
+            table: &self.table,
+            keys: &self.keys,
+            table_stride: self.table_stride,
+            summary: *self.summary(),
+            table_t,
+            keys_t,
+        }
+    }
+    pub fn page_geometry(&self) -> (usize, usize) {
         self.summary.route()
     }
+
+    // This module remains private to nn::ops; do not expose native Tensor
+    // aliases to any safe external caller.
+
     pub(super) fn summary(&self) -> &PageSummary {
         &self.summary
     }
     pub(super) fn bindings(&self) -> (&Tensor, &Tensor) {
         (&self.table_t, &self.keys_t)
+    }
+}
+
+// Same identity checks as the existing completion-hook GPU fixture. This is
+// test-only; it neither changes process configuration nor exists on a hot path.
+#[cfg(all(test, feature = "metal"))]
+fn assert_native_fixture_arm(device: &lloom_tensor::MetalDevice, control: &str) {
+    let actual = device.commands().actual_command_api();
+    eprintln!(
+        "FLASH_METADATA_NATIVE control={control} api={actual} cb_kind={:?}",
+        device.command_buffer_kind()
+    );
+    let selected = &lloom_tensor::tuning::tuning().metal.command_api;
+    if selected != "auto" {
+        assert_eq!(
+            actual,
+            selected.as_str(),
+            "native fixture resolved a different API"
+        );
+    }
+    if let Ok(requested) = std::env::var("LLOOM_METAL_API") {
+        let requested = requested.trim().to_ascii_lowercase();
+        if requested != "auto" {
+            assert_eq!(
+                actual, requested,
+                "native fixture did not honor its explicit API arm"
+            );
+        }
     }
 }
 
@@ -188,11 +249,76 @@ mod flash_validation_tests {
     }
 
     #[test]
+    fn consuming_owner_recovers_unique_host_staging_without_rewriting_payloads() -> Result<()> {
+        let table = vec![0];
+        let keys = vec![1];
+        let (table_ptr, keys_ptr) = (table.as_ptr(), keys.as_ptr());
+        let owner = FlashDecodingMetadata::new(table, 1, keys, 1, 256, 1, &Device::Cpu)?;
+        // Privileged test aliases observe initialization independently; the
+        // public owner/view API never exports these Tensor references.
+        let old_table = owner.table_t.clone();
+        let old_keys = owner.keys_t.clone();
+        let (mut table, mut keys) = owner.into_host_vectors();
+        assert_eq!(table.as_ptr(), table_ptr);
+        assert_eq!(keys.as_ptr(), keys_ptr);
+        table[0] = 3;
+        keys[0] = 2;
+        assert_eq!(old_table.to_vec1::<u32>()?, &[0]);
+        assert_eq!(old_keys.to_vec1::<u32>()?, &[1]);
+        let next = FlashDecodingMetadata::new(table, 1, keys, 1, 256, 1, &Device::Cpu)?;
+        assert_eq!(next.table(), &[3]);
+        assert_eq!(next.keys(), &[2]);
+        Ok(())
+    }
+
+    #[test]
+    fn resident_view_uses_the_shared_safe_frontdoor_without_rescanning() -> Result<()> {
+        use crate::nn::ops::flash_decoding_paged_view;
+        let device = Device::Cpu;
+        let mut table = FlashDecodingResidentMetadata::new(256, 1, 4)?;
+        table.publish_suffix(&[3], &device)?;
+        let count = FlashDecodingCount::new(1, &device)?;
+        let view = table.view(&count)?;
+        let prepared = preparation_count();
+        let q = Tensor::zeros((1, 1, 1, 64), DType::F32, &device)?;
+        let kv = Tensor::zeros((1, 1, 769, 64), DType::F32, &device)?;
+        let short_v = Tensor::zeros((1, 1, 768, 64), DType::F32, &device)?;
+        for _ in 0..2 {
+            let error =
+                flash_decoding_paged_view(&q, &kv, &kv, 1., 1., FlashScratchSizing::Grow, 0, &view)
+                    .unwrap_err()
+                    .to_string();
+            assert!(error.contains("no cpu support"), "{error}");
+        }
+        let error = flash_decoding_paged_view(
+            &q,
+            &kv,
+            &short_v,
+            1.,
+            1.,
+            FlashScratchSizing::Grow,
+            0,
+            &view,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("page span exceeds K/V pool"), "{error}");
+        assert_eq!(preparation_count(), prepared);
+        Ok(())
+    }
+
+    #[test]
     fn owner_diagnostics_do_not_delegate_to_device_tensor_debug() -> Result<()> {
         let owner = FlashDecodingMetadata::new(vec![0], 1, vec![1], 1, 256, 1, &Device::Cpu)?;
-        let printed = format!("{owner:?}");
-        assert!(!printed.contains("Tensor["), "{printed}");
-        assert!(printed.contains("table_entries"));
+        let count = FlashDecodingCount::new(1, &Device::Cpu)?;
+        for printed in [
+            format!("{owner:?}"),
+            format!("{:?}", owner.view()),
+            format!("{count:?}"),
+        ] {
+            assert!(!printed.contains("Tensor["), "{printed}");
+        }
+        assert!(format!("{owner:?}").contains("table_entries"));
         Ok(())
     }
 
@@ -204,11 +330,7 @@ mod flash_validation_tests {
     fn owner_refusals_precede_native_pool_lookup_and_dispatch() -> Result<()> {
         let device = Device::new_metal(0)?;
         let metal = device.as_metal_device()?;
-        eprintln!(
-            "FLASH_METADATA_NATIVE control=pre-builder-refusals api={} cb_kind={:?}",
-            metal.commands().actual_command_api(),
-            metal.command_buffer_kind()
-        );
+        assert_native_fixture_arm(metal, "pre-builder-refusals");
         let q = Tensor::zeros((1, 1, 1, 64), DType::F32, &device)?;
         let k = Tensor::zeros((1, 1, 769, 64), DType::F32, &device)?;
         let short_v = Tensor::zeros((1, 1, 768, 64), DType::F32, &device)?;

@@ -15,7 +15,17 @@
 //! * `pread-par` — the 16 `pread`s concurrently on a rayon pool (ds4's
 //!   `d0b7434` shape);
 //! * `cached:N` — `PleTable::Cached` with N rows: the hot-row cache's hit
-//!   rate on the stream (`PLECACHE`), cold and again warm.
+//!   rate on the stream (`PLECACHE`), cold and again warm;
+//! * `production` — the table as it ships (`ReadPolicy::Adaptive`, the read
+//!   pool and the hedge `weights.ngram.*` set), through the producer's
+//!   scratch;
+//! * `rayon` — `Adaptive` with the cold rows on rayon's pool, the read the
+//!   producer made before the fixed read threads;
+//! * `workers` / `workers-par` — `Adaptive` / every row by `pread`, on the
+//!   fixed read threads (`--worker-threads`), no hedge;
+//! * `hedge:<µs>` — `workers` with a row still in flight after `<µs>` read
+//!   again on an idle thread. A `READERS` line after each arm counts the
+//!   threads' requests, re-reads and wins.
 //!
 //! Cold is made, not assumed: before an arm's cold pass every page the
 //! stream's rows touch is dropped with `msync(MS_INVALIDATE)` (it drops a
@@ -32,7 +42,7 @@
 use anyhow::{bail, Context, Result};
 use clap::Parser;
 use lloom::models::qwen4exp::{CachedPleTable, MmapPleTable, NgramHash, NgramWindow, PleTable};
-use lloom::nn::ngram_memory::ReadPolicy;
+use lloom::nn::ngram_memory::{ReadPolicy, ReadPool, ReadScratch};
 use rayon::prelude::*;
 use std::os::unix::fs::FileExt;
 use std::path::PathBuf;
@@ -74,6 +84,10 @@ struct Args {
     /// Threads of the `pread-par` pool.
     #[arg(long, default_value_t = 16)]
     par_threads: usize,
+    /// Threads of the fixed read set (`workers`, `hedge:`); the tuning's
+    /// (`weights.ngram.read_threads`) when absent.
+    #[arg(long)]
+    worker_threads: Option<usize>,
 }
 
 /// The checkpoint's hash: the reference derivation, which
@@ -250,6 +264,13 @@ fn main() -> Result<()> {
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(args.par_threads)
         .build()?;
+    if let Some(n) = args.worker_threads {
+        anyhow::ensure!(
+            lloom::nn::ngram_memory::start_read_workers(n),
+            "the read threads did not start"
+        );
+    }
+    let mut read = ReadScratch::with_rows(n_heads, table.row_bytes());
     println!(
         "TABLE rows={} head_dim={hd} row_bytes={} dtype={:?} heads={n_heads} page={}",
         table.rows(),
@@ -344,10 +365,27 @@ fn main() -> Result<()> {
             // #758; `production` is the table as it ships (its default
             // policy); `cached:N` is the hot-row cache of N rows over it,
             // empty at the cold pass and holding the stream at the warm one.
+            let hedge = arm.strip_prefix("hedge:");
             table.set_read_policy(match arm.as_str() {
-                "production" => ReadPolicy::Adaptive,
+                "production" | "rayon" | "workers" => ReadPolicy::Adaptive,
+                "workers-par" => ReadPolicy::Concurrent,
+                _ if hedge.is_some() => ReadPolicy::Adaptive,
                 _ => ReadPolicy::Serial,
             });
+            let shipped = (table.read_pool(), table.hedge());
+            match arm.as_str() {
+                "rayon" => table.set_read_pool(ReadPool::Rayon),
+                "workers" | "workers-par" => {
+                    table.set_read_pool(ReadPool::Workers);
+                    table.set_hedge_us(0);
+                }
+                _ => {}
+            }
+            if let Some(us) = hedge {
+                table.set_read_pool(ReadPool::Workers);
+                table.set_hedge_us(us.parse().context("hedge:<µs>")?);
+            }
+            let stats0 = lloom::nn::ngram_memory::read_worker_stats();
             let cached = match arm.strip_prefix("cached:") {
                 Some(n) => Some(PleTable::Cached(CachedPleTable::new(
                     MmapPleTable::open(&args.shard)?,
@@ -377,7 +415,13 @@ fn main() -> Result<()> {
                     let s = Instant::now();
                     hash.row_ids(&window, &mut ids);
                     match arm.as_str() {
-                        "mmap" | "production" => table.gather_into(&ids, &mut slot)?,
+                        "mmap" | "rayon" => table.gather_into(&ids, &mut slot)?,
+                        "production" | "workers" | "workers-par" => {
+                            table.gather_into_with(&ids, &mut slot, &mut read)?
+                        }
+                        a if a.starts_with("hedge:") => {
+                            table.gather_into_with(&ids, &mut slot, &mut read)?
+                        }
                         a if a.starts_with("cached:") => {
                             cached.as_ref().unwrap().gather_into(&ids, &mut slot)?
                         }
@@ -462,6 +506,20 @@ fn main() -> Result<()> {
                     );
                 }
             }
+            if let Some(after) = lloom::nn::ngram_memory::read_worker_stats() {
+                let before = stats0.unwrap_or_default();
+                println!(
+                    "READERS label={label} arm={arm} threads={} requests={} rows={} hedged={} hedge_wins={} refused={}",
+                    after.threads,
+                    after.requests - before.requests,
+                    after.rows - before.rows,
+                    after.hedged - before.hedged,
+                    after.hedge_wins - before.hedge_wins,
+                    after.refused - before.refused
+                );
+            }
+            table.set_read_pool(shipped.0);
+            table.set_hedge_us(shipped.1.map_or(0, |d| d.as_micros() as u64));
         }
 
         // The hot-row cache: its hit rate on this stream, from empty, again

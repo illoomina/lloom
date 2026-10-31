@@ -83,6 +83,10 @@ path = "tests/decode_step_census.rs"
 name = "qwen4exp_prefill_transient_cpu"
 path = "tests/qwen4exp_prefill_transient_cpu.rs"
 
+[[test]]
+name = "ngram_fill_alloc_free"
+path = "tests/ngram_fill_alloc_free.rs"
+
 [dev-dependencies]
 # The integration tests drive the fuzz models that live behind `fuzzing`, and
 # read the shape probes (`shape-probe`); a self dev-dependency is how cargo

@@ -199,6 +199,9 @@ fn parse_qsa_window(v: &str) -> Result<String, String> {
 fn parse_plan(v: &str) -> Result<String, String> {
     one_of(v, "expert plan", &["device", "host"])
 }
+fn parse_ngram_read_pool(v: &str) -> Result<String, String> {
+    one_of(v, "ngram read pool", &["workers", "rayon"])
+}
 fn parse_fetch_settle(v: &str) -> Result<String, String> {
     one_of(v, "fetch settle", &["behind", "now"])
 }
@@ -497,6 +500,15 @@ pub struct StreamTuning {
     /// Where a decode step that missed replays: `host` (the host plan, the plan disarmed) or `device` (the device plan, kept armed).
     #[opt(flag = "expert-replay", env = "QWEN4EXP_REPLAY", parser = "parse_replay", variants = ["host", "device"], path = "weights.experts.replay_arming", status = "arm", facets = ["locality"], flows = ["weights-in", "commands-out"])]
     pub replay: String,
+    /// The threads an n-gram table's cold rows are read on: `workers` (a fixed set, each handed its rows through a job of its own and parked between requests; no allocation or lock per request) or `rayon` (the library's pool, the A/B arm).
+    #[opt(flag = "ngram-read-pool", env = "LLOOM_NGRAM_READ_POOL", parser = "parse_ngram_read_pool", variants = ["workers", "rayon"], path = "weights.ngram.read_pool", status = "arm", facets = ["transport"], flows = ["host-feed-in"])]
+    pub ngram_read_pool: String,
+    /// Threads of the `workers` read pool (≥ 1): a token's cold rows, one read each in flight. Read when the pool starts.
+    #[opt(flag = "ngram-read-threads", env = "LLOOM_NGRAM_READ_THREADS", parser = "parse_at_least_one", path = "weights.ngram.read_threads", status = "advanced", facets = ["transport"], flows = ["host-feed-in"])]
+    pub ngram_read_threads: usize,
+    /// A cold n-gram row still in flight this many µs after its request is read again on an idle thread, and the first read to land is kept (0 = never; the `workers` pool only).
+    #[opt(flag = "ngram-hedge-us", env = "LLOOM_NGRAM_HEDGE_US", path = "weights.ngram.hedge_us", status = "arm", facets = ["transport"], flows = ["host-feed-in"])]
+    pub ngram_hedge_us: usize,
 }
 
 impl Default for StreamTuning {
@@ -528,6 +540,9 @@ impl Default for StreamTuning {
             predict: "off".into(),
             ready_first: false,
             replay: "host".into(),
+            ngram_read_pool: "workers".into(),
+            ngram_read_threads: 16,
+            ngram_hedge_us: 0,
         }
     }
 }
@@ -747,6 +762,15 @@ pub struct Qwen4ExpTuning {
         status = "arm"
     )]
     pub mtp_fold: bool,
+    /// The N-gram PLE of a batch's rows and of a verify window's positions: on (every position's window hashed first, all their rows read in one request into one host-written region the model keeps, the block then run per position on its slice: no upload per position) or off (each position hashed, read and uploaded on its own, the A/B arm).
+    #[opt(
+        flag = "ple-rows-batch",
+        env = "QWEN4EXP_PLE_ROWS_BATCH",
+        bool,
+        path = "models.qwen4exp.ple.rows_batch",
+        status = "arm"
+    )]
+    pub ple_rows_batch: bool,
 }
 
 impl Default for Qwen4ExpTuning {
@@ -784,6 +808,7 @@ impl Default for Qwen4ExpTuning {
             mtp_verify_key: "kind".into(),
             qsa_window: "rows".into(),
             mtp_fold: false,
+            ple_rows_batch: true,
         }
     }
 }

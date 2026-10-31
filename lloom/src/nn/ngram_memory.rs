@@ -15,24 +15,27 @@
 //! does not hold is an SSD read of ~0.1 ms, and a token's sixteen of them read
 //! one after another cost ~1.6-2.2 ms on the host. [`ReadPolicy::Adaptive`]
 //! reads the rows the page cache holds through the map and the others
-//! concurrently: ~0.35 ms for sixteen cold rows (§20.13).
+//! concurrently (§20.13), on a fixed set of parked threads by default
+//! ([`ReadPool`]).
 //!
 //! # The host fill (§20.13, option A)
 //!
 //! A decode step whose rows depend on the token the step before it sampled
-//! cannot be encoded ahead by a host that must know the token first. The host
-//! fill moves the wait onto the GPU: the forward encodes a wait on a shared
-//! event just before its first reader of the rows and reads a staging slot
-//! ([`FeedLink::encode_read`]); a producer thread learns each published token,
-//! hashes its window, gathers the rows into the slot and signals
-//! ([`NgramFill::fill`]). The rows are the ones the host path reads, through
-//! the same math, so the arms are byte-identical by construction.
+//! cannot be encoded ahead by a host that must know the token first. With the
+//! host fill the forward is encoded ahead anyway, reading a staging slot
+//! ([`FeedLink::encode_read`]); its work from the rows' first reader on is
+//! held, uncommitted, until a producer thread that learns each published
+//! token has hashed its window, gathered the rows into the slot and signalled
+//! ([`NgramFill::fill`]), and the producer commits it (§20.13d). Neither the
+//! GPU nor the encoding thread waits. The rows are the ones the host path
+//! reads, through the same math, so the arms are byte-identical by
+//! construction.
 //!
-//! Every wait is satisfiable when it is encoded: the forward that reads value
-//! `k` consumes the `k`-th token the loop fed, and a forward is refused unless
-//! that token is already in the command stream ahead of it. A producer that
-//! fails, or a run that ends early, releases every wait it left
-//! ([`FeedLink::release`]) rather than leaving the queue parked.
+//! Every value a forward reads is one the producer will fill: the forward that
+//! reads value `k` consumes the `k`-th token the loop fed, and a forward is
+//! refused unless that token is already in the command stream ahead of it. A
+//! producer that fails, or a run that ends early, releases the run
+//! ([`FeedLink::release`]): its held work is cancelled, never committed.
 
 use crate::nn::slot_cache::{Hashed, ListLru, SlotCache};
 use lloom_tensor::quantized::gguf_file::Content;
@@ -42,8 +45,77 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering, Ordering::Relaxed};
 use std::sync::Arc;
 
+#[cfg(unix)]
+mod readers;
+#[cfg(unix)]
+pub use readers::ReaderStats;
+
 /// The per-layer token embedding table's GGUF name (Qwen4-exp's N-gram PLE).
 pub const PER_LAYER_TOKEN_EMBD: &str = "per_layer_token_embd.weight";
+
+/// Which threads read [`MmapRows`]' cold rows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReadPool {
+    /// A fixed set of threads, each handed its rows through a job of its own
+    /// and parked between requests: no allocation and no lock per request,
+    /// and a row still in flight past the hedge is read again.
+    Workers,
+    /// rayon's pool (the A/B arm).
+    Rayon,
+}
+
+/// `weights.ngram.{read_pool, read_threads, hedge_us}` (read once).
+fn read_defaults() -> (ReadPool, usize, u64) {
+    static D: std::sync::OnceLock<(ReadPool, usize, u64)> = std::sync::OnceLock::new();
+    *D.get_or_init(|| {
+        let s = &crate::tuning::tuning().stream;
+        let pool = if s.ngram_read_pool == "rayon" {
+            ReadPool::Rayon
+        } else {
+            ReadPool::Workers
+        };
+        (pool, s.ngram_read_threads.max(1), s.ngram_hedge_us as u64)
+    })
+}
+
+/// Start the cold-row read threads with `threads` threads, if they have not
+/// started (later calls, and the first read, get the set already started).
+/// Whether a set is running.
+pub fn start_read_workers(threads: usize) -> bool {
+    #[cfg(unix)]
+    {
+        readers::readers(threads).is_some()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = threads;
+        false
+    }
+}
+
+/// The cold-row read threads' counts, once they have started.
+#[cfg(unix)]
+pub fn read_worker_stats() -> Option<ReaderStats> {
+    readers::started().map(|r| r.stats())
+}
+
+/// What a read keeps between calls so that it allocates nothing: which of a
+/// request's rows are read by `pread`, and their packed bytes.
+#[derive(Debug, Default)]
+pub struct ReadScratch {
+    cold: Vec<u32>,
+    packed: Vec<u8>,
+}
+
+impl ReadScratch {
+    /// Room for `rows` rows of `row_bytes`.
+    pub fn with_rows(rows: usize, row_bytes: usize) -> Self {
+        Self {
+            cold: Vec::with_capacity(rows),
+            packed: Vec::with_capacity(rows * row_bytes),
+        }
+    }
+}
 
 /// How [`MmapRows`] reads a token's rows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -78,22 +150,23 @@ impl ReadPolicy {
     }
 }
 
-/// Threads of the read pool: a token's rows, one read each in flight.
+/// Threads of rayon's read pool ([`ReadPool::Rayon`]): a token's rows, one
+/// read each in flight.
 const READ_THREADS: usize = 16;
 
-/// The read pool's scheduling class, stated (`default`) and read back by its
-/// threads at start: the host fill's producer waits on these reads, and the
-/// GPU on the producer (`docs/invariants.md` §15.2 #10b).
+/// The read threads' scheduling class (either pool's), stated (`default`) and
+/// read back by the threads at start: the host fill's producer waits on these
+/// reads (`docs/invariants.md` §15.2 #10b).
 static READ_POOL_QOS: AtomicU8 = AtomicU8::new(0);
 
-/// The read pool's class (`Unknown` before it starts, or off macOS).
+/// The read threads' class (`Unknown` before they start, or off macOS).
 pub fn read_pool_qos() -> crate::generation::QosClass {
     crate::generation::QosClass::from_index(READ_POOL_QOS.load(Relaxed))
 }
 
-/// The pool cold rows are read on, built on first use.
+/// rayon's pool for cold rows ([`ReadPool::Rayon`]), built on first use.
 #[cfg(unix)]
-fn read_pool() -> &'static rayon::ThreadPool {
+fn rayon_pool() -> &'static rayon::ThreadPool {
     static POOL: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
     POOL.get_or_init(|| {
         rayon::ThreadPoolBuilder::new()
@@ -149,10 +222,31 @@ impl RowTable {
     /// The rows of `ids` dequantized into `out` (`ids.len() · head_dim`
     /// floats) on the host — the form a host-filled staging slot takes.
     pub fn gather_into(&self, ids: &[i64], out: &mut [f32]) -> Result<()> {
+        self.gather_into_with(ids, out, &mut ReadScratch::default())
+    }
+
+    /// [`Self::gather_into`] through a caller's `scratch`: the memory map's
+    /// read then allocates nothing ([`ReadScratch::with_rows`]). The cached
+    /// arm allocates as before.
+    pub fn gather_into_with(
+        &self,
+        ids: &[i64],
+        out: &mut [f32],
+        scratch: &mut ReadScratch,
+    ) -> Result<()> {
         match self {
-            RowTable::Mmap(m) => m.gather_into(ids, out),
+            RowTable::Mmap(m) => m.gather_into_with(ids, out, scratch),
             RowTable::Cached(c) => c.gather_into(ids, out),
             RowTable::Dense(_) => lloom_tensor::bail!("ngram rows: gather_into on a dense table"),
+        }
+    }
+
+    /// Packed bytes a row takes (0 for the dense arm).
+    pub fn row_bytes(&self) -> usize {
+        match self {
+            RowTable::Mmap(m) => m.row_bytes,
+            RowTable::Cached(c) => c.inner.row_bytes,
+            RowTable::Dense(_) => 0,
         }
     }
 
@@ -310,51 +404,55 @@ fn check_out(ids: &[i64], head_dim: usize, out: &[f32]) -> Result<()> {
     Ok(())
 }
 
-/// Dequantize one packed row of `dtype` into `out`.
+/// Dequantize one packed row of `dtype` into `out`, a block at a time on the
+/// stack: each block kind's `to_float` treats its blocks independently, so a
+/// block at a time is the whole row's conversion, without collecting the row.
 fn dequant_row(dtype: GgmlDType, bytes: &[u8], out: &mut [f32]) -> Result<()> {
     match dtype {
         GgmlDType::IQ4NL => {
             use lloom_tensor::quantized::iq_quants::BlockIQ4nl;
             let bs = std::mem::size_of::<BlockIQ4nl>();
-            let blocks: Vec<BlockIQ4nl> = bytes
+            for (b, o) in bytes
                 .chunks_exact(bs)
-                .map(|b| {
-                    let mut qs = [0u8; 16];
-                    qs.copy_from_slice(&b[2..18]);
-                    BlockIQ4nl {
-                        d: half::f16::from_le_bytes([b[0], b[1]]),
-                        qs,
-                    }
-                })
-                .collect();
-            BlockIQ4nl::to_float(&blocks, out);
+                .zip(out.chunks_exact_mut(BlockIQ4nl::BLCK_SIZE))
+            {
+                let mut qs = [0u8; 16];
+                qs.copy_from_slice(&b[2..18]);
+                let block = BlockIQ4nl {
+                    d: half::f16::from_le_bytes([b[0], b[1]]),
+                    qs,
+                };
+                BlockIQ4nl::to_float(std::slice::from_ref(&block), o);
+            }
         }
         GgmlDType::MXFP4 => {
             use lloom_tensor::quantized::fp_quants::BlockMxfp4;
-            let blocks: Vec<BlockMxfp4> = bytes
-                .chunks_exact(std::mem::size_of::<BlockMxfp4>())
-                .map(|b| {
-                    let mut qs = [0u8; 16];
-                    qs.copy_from_slice(&b[1..17]);
-                    BlockMxfp4 { e: b[0], qs }
-                })
-                .collect();
-            BlockMxfp4::to_float(&blocks, out);
+            let bs = std::mem::size_of::<BlockMxfp4>();
+            for (b, o) in bytes
+                .chunks_exact(bs)
+                .zip(out.chunks_exact_mut(BlockMxfp4::BLCK_SIZE))
+            {
+                let mut qs = [0u8; 16];
+                qs.copy_from_slice(&b[1..17]);
+                let block = BlockMxfp4 { e: b[0], qs };
+                BlockMxfp4::to_float(std::slice::from_ref(&block), o);
+            }
         }
         GgmlDType::FP8E4M3 => {
             use lloom_tensor::quantized::fp_quants::BlockFp8E4M3;
-            let blocks: Vec<BlockFp8E4M3> = bytes
-                .chunks_exact(std::mem::size_of::<BlockFp8E4M3>())
-                .map(|b| {
-                    let mut qs = [0u8; 32];
-                    qs.copy_from_slice(&b[2..34]);
-                    BlockFp8E4M3 {
-                        d: half::bf16::from_le_bytes([b[0], b[1]]),
-                        qs,
-                    }
-                })
-                .collect();
-            BlockFp8E4M3::to_float(&blocks, out);
+            let bs = std::mem::size_of::<BlockFp8E4M3>();
+            for (b, o) in bytes
+                .chunks_exact(bs)
+                .zip(out.chunks_exact_mut(BlockFp8E4M3::BLCK_SIZE))
+            {
+                let mut qs = [0u8; 32];
+                qs.copy_from_slice(&b[2..34]);
+                let block = BlockFp8E4M3 {
+                    d: half::bf16::from_le_bytes([b[0], b[1]]),
+                    qs,
+                };
+                BlockFp8E4M3::to_float(std::slice::from_ref(&block), o);
+            }
         }
         GgmlDType::F32 => {
             for (o, b) in out.iter_mut().zip(bytes.chunks_exact(4)) {
@@ -389,6 +487,11 @@ pub struct MmapRows {
     row_bytes: usize,
     dtype: GgmlDType,
     policy: AtomicU8,
+    /// [`ReadPool`]: 0 as `weights.ngram.read_pool` says, 1 the workers, 2
+    /// rayon.
+    pool: AtomicU8,
+    /// The hedge in µs; `u64::MAX` as `weights.ngram.hedge_us` says.
+    hedge_us: AtomicU64,
     /// Rows read through the map, and rows read by `pread` on the pool.
     mapped_rows: AtomicU64,
     pooled_rows: AtomicU64,
@@ -445,6 +548,8 @@ impl MmapRows {
             row_bytes,
             dtype,
             policy: AtomicU8::new(ReadPolicy::Adaptive.as_u8()),
+            pool: AtomicU8::new(0),
+            hedge_us: AtomicU64::new(u64::MAX),
             mapped_rows: AtomicU64::new(0),
             pooled_rows: AtomicU64::new(0),
         })
@@ -473,6 +578,38 @@ impl MmapRows {
 
     pub fn set_read_policy(&self, policy: ReadPolicy) {
         self.policy.store(policy.as_u8(), Relaxed);
+    }
+
+    /// The threads the cold rows are read on.
+    pub fn read_pool(&self) -> ReadPool {
+        match self.pool.load(Relaxed) {
+            1 => ReadPool::Workers,
+            2 => ReadPool::Rayon,
+            _ => read_defaults().0,
+        }
+    }
+
+    pub fn set_read_pool(&self, pool: ReadPool) {
+        let v = match pool {
+            ReadPool::Workers => 1,
+            ReadPool::Rayon => 2,
+        };
+        self.pool.store(v, Relaxed);
+    }
+
+    /// How long a cold row may be in flight before the workers read it
+    /// again on an idle thread; `None` never.
+    pub fn hedge(&self) -> Option<std::time::Duration> {
+        let us = match self.hedge_us.load(Relaxed) {
+            u64::MAX => read_defaults().2,
+            v => v,
+        };
+        (us > 0).then(|| std::time::Duration::from_micros(us))
+    }
+
+    /// The hedge in µs, 0 for none.
+    pub fn set_hedge_us(&self, us: u64) {
+        self.hedge_us.store(us.min(u64::MAX - 1), Relaxed);
     }
 
     /// `(rows read through the map, rows read by pread on the pool)`.
@@ -525,10 +662,22 @@ impl MmapRows {
     }
 
     pub fn gather_into(&self, ids: &[i64], out: &mut [f32]) -> Result<()> {
+        self.gather_into_with(ids, out, &mut ReadScratch::default())
+    }
+
+    /// [`Self::gather_into`] through a caller's `scratch`, which a read with
+    /// room in it does not grow: with the [`ReadPool::Workers`] pool the read
+    /// allocates nothing.
+    pub fn gather_into_with(
+        &self,
+        ids: &[i64],
+        out: &mut [f32],
+        scratch: &mut ReadScratch,
+    ) -> Result<()> {
         check_out(ids, self.head_dim, out)?;
         let hd = self.head_dim;
         let dtype = self.dtype;
-        self.read_with(ids, |i, row| {
+        self.read_with_scratch(ids, scratch, |i, row| {
             dequant_row(dtype, row, &mut out[i * hd..(i + 1) * hd])
         })
     }
@@ -551,32 +700,42 @@ impl MmapRows {
 
     /// Hand each row of `ids` to `sink(index, bytes)` on the calling thread,
     /// read under the table's [`ReadPolicy`].
-    fn read_with(
+    fn read_with(&self, ids: &[i64], sink: impl FnMut(usize, &[u8]) -> Result<()>) -> Result<()> {
+        self.read_with_scratch(ids, &mut ReadScratch::default(), sink)
+    }
+
+    /// [`Self::read_with`] through `scratch`: which rows go to `pread`, and
+    /// their bytes.
+    fn read_with_scratch(
         &self,
         ids: &[i64],
+        scratch: &mut ReadScratch,
         mut sink: impl FnMut(usize, &[u8]) -> Result<()>,
     ) -> Result<()> {
         for &id in ids {
             self.check_id(id)?;
         }
-        let pooled: Vec<usize> = match self.read_policy() {
-            ReadPolicy::Serial => Vec::new(),
-            ReadPolicy::Concurrent => (0..ids.len()).collect(),
+        let cold = &mut scratch.cold;
+        cold.clear();
+        match self.read_policy() {
+            ReadPolicy::Serial => {}
+            ReadPolicy::Concurrent => cold.extend(0..ids.len() as u32),
             ReadPolicy::Adaptive => {
-                let cold: Vec<usize> = (0..ids.len()).filter(|&i| !self.resident(ids[i])).collect();
+                cold.extend((0..ids.len() as u32).filter(|&i| !self.resident(ids[i as usize])));
                 if cold.len() < 2 {
-                    Vec::new()
-                } else {
-                    cold
+                    cold.clear();
                 }
             }
-        };
-        let fetched = self.pread_rows(ids, &pooled)?;
+        }
+        let rb = self.row_bytes;
+        scratch.packed.clear();
+        scratch.packed.resize(scratch.cold.len() * rb, 0);
+        self.pread_rows(ids, &scratch.cold, &mut scratch.packed)?;
+        let pooled = &scratch.cold;
         let mut next = 0;
         for (i, &id) in ids.iter().enumerate() {
-            if next < pooled.len() && pooled[next] == i {
-                let rb = self.row_bytes;
-                sink(i, &fetched[next * rb..(next + 1) * rb])?;
+            if next < pooled.len() && pooled[next] as usize == i {
+                sink(i, &scratch.packed[next * rb..(next + 1) * rb])?;
                 next += 1;
             } else {
                 sink(i, self.packed_row(id)?)?;
@@ -588,36 +747,50 @@ impl MmapRows {
         Ok(())
     }
 
-    /// `pread` the rows `ids[which]` concurrently on the read pool, packed in
-    /// `which`'s order.
+    /// `pread` the rows `ids[which]` concurrently into `buf`, packed in
+    /// `which`'s order: on the read threads ([`ReadPool::Workers`]), or on
+    /// rayon's pool when that is the arm or the threads cannot take the
+    /// request.
     #[cfg(unix)]
-    fn pread_rows(&self, ids: &[i64], which: &[usize]) -> Result<Vec<u8>> {
+    fn pread_rows(&self, ids: &[i64], which: &[u32], buf: &mut [u8]) -> Result<()> {
         use rayon::prelude::*;
+        use std::os::fd::AsRawFd;
         use std::os::unix::fs::FileExt;
         let rb = self.row_bytes;
-        let mut buf = vec![0u8; which.len() * rb];
         if which.is_empty() {
-            return Ok(buf);
+            return Ok(());
         }
-        read_pool().install(|| {
+        let base = self.data_start as u64;
+        let at = |k: usize| base + ids[which[k] as usize] as u64 * rb as u64;
+        if self.read_pool() == ReadPool::Workers {
+            if let Some(set) = readers::readers(read_defaults().1) {
+                if let Some(done) = set.read(
+                    self.file.as_raw_fd(),
+                    which.len(),
+                    rb,
+                    at,
+                    buf,
+                    self.hedge(),
+                ) {
+                    return Ok(done?);
+                }
+            }
+        }
+        rayon_pool().install(|| {
             buf.par_chunks_mut(rb)
-                .zip(which.par_iter())
-                .try_for_each(|(dst, &i)| {
-                    let off = self.data_start as u64 + ids[i] as u64 * rb as u64;
-                    self.file.read_exact_at(dst, off)
-                })
+                .enumerate()
+                .try_for_each(|(k, dst)| self.file.read_exact_at(dst, at(k)))
         })?;
-        Ok(buf)
+        Ok(())
     }
 
     #[cfg(not(unix))]
-    fn pread_rows(&self, ids: &[i64], which: &[usize]) -> Result<Vec<u8>> {
+    fn pread_rows(&self, ids: &[i64], which: &[u32], buf: &mut [u8]) -> Result<()> {
         let rb = self.row_bytes;
-        let mut buf = vec![0u8; which.len() * rb];
         for (dst, &i) in buf.chunks_mut(rb).zip(which) {
-            dst.copy_from_slice(self.packed_row(ids[i])?);
+            dst.copy_from_slice(self.packed_row(ids[i as usize])?);
         }
-        Ok(buf)
+        Ok(())
     }
 
     /// Whether every page row `id` spans is in memory (`mincore`); `true`
@@ -1142,10 +1315,10 @@ impl FeedLink {
         Ok(self.index_at(pos)? + self.shift.load(Ordering::Acquire))
     }
 
-    /// The rows the forward at `pos` reads: a wait for its value, encoded
-    /// here, and the `[len]` f32 slot the producer fills. Refused when the
-    /// loop has not yet fed the token that value is filled from — a wait
-    /// nothing would ever signal.
+    /// The rows the forward at `pos` reads: the `[len]` f32 slot the
+    /// producer fills, with the forward's work from here on held until the
+    /// producer has signalled its value. Refused when the loop has not yet fed
+    /// the token that value is filled from — a value nothing would ever fill.
     pub fn encode_read(&self, pos: usize) -> Result<Tensor> {
         if self.released() {
             lloom_tensor::bail!(
@@ -1183,9 +1356,9 @@ impl FeedLink {
         lloom_tensor::bail!("host feed: no host-fed ring off Metal")
     }
 
-    /// Let every wait of the run through: the event jumps past any value the
-    /// run could have encoded. For a run that fails, or ends, with waits its
-    /// producer will not fill; the slots those forwards read are stale.
+    /// End the run: the work it holds is cancelled, never committed, and the
+    /// event jumps past any value the run could have read. For a run that
+    /// fails, or ends, with values its producer will not fill.
     pub fn release(&self) {
         self.released.store(true, Ordering::Release);
         #[cfg(feature = "metal")]
@@ -1289,6 +1462,7 @@ impl HostFeed {
         window: NgramWindow,
     ) -> Self {
         let n = hash.n_heads();
+        let read = ReadScratch::with_rows(n, rows.row_bytes());
         Self {
             fill: NgramFill {
                 link: Arc::clone(&link),
@@ -1299,7 +1473,8 @@ impl HostFeed {
                 filled: 0,
                 ids: vec![0; n],
                 scratch: Vec::with_capacity(n + 1),
-                consumed: Vec::new(),
+                read,
+                consumed: Vec::with_capacity(FILL_TOKENS_RESERVED),
             },
             link,
         }
@@ -1314,8 +1489,13 @@ impl HostFeed {
     }
 }
 
+/// Tokens a run's fill records before its log of them grows: a fill
+/// allocates nothing up to here.
+pub const FILL_TOKENS_RESERVED: usize = 8192;
+
 /// The producer's half of a [`HostFeed`]: fills one slot per token the loop
-/// published, in order.
+/// published, in order. A fill allocates nothing: every buffer it uses is
+/// sized when the run starts.
 #[derive(Debug)]
 pub struct NgramFill {
     link: Arc<FeedLink>,
@@ -1328,6 +1508,8 @@ pub struct NgramFill {
     filled: u64,
     ids: Vec<i64>,
     scratch: Vec<Option<u32>>,
+    #[cfg_attr(not(feature = "metal"), allow(dead_code))]
+    read: ReadScratch,
     consumed: Vec<u32>,
 }
 
@@ -1348,16 +1530,16 @@ impl NgramFill {
     }
 
     #[cfg(feature = "metal")]
-    fn gather_into_slot(&self, k: u64) -> Result<()> {
+    fn gather_into_slot(&mut self, k: u64) -> Result<()> {
         // SAFETY: token `k` is published (the caller read it off the ring's
         // stamp), so the forward that read value `k - 2`'s slot — two tokens
         // back — has run; this thread is the only writer.
         let slot = unsafe { self.link.slot_mut(k) };
-        self.rows.gather_into(&self.ids, slot)
+        self.rows.gather_into_with(&self.ids, slot, &mut self.read)
     }
 
     #[cfg(not(feature = "metal"))]
-    fn gather_into_slot(&self, _k: u64) -> Result<()> {
+    fn gather_into_slot(&mut self, _k: u64) -> Result<()> {
         lloom_tensor::bail!("host feed: no host-fed ring off Metal")
     }
 
@@ -1434,11 +1616,11 @@ mod tests {
         path
     }
 
-    /// Every read policy gathers the rows the map holds: the concurrent path
-    /// (`pread` on the pool, landed by index) against the serial map read,
-    /// on a scattered id set with a row repeated, at f32 and at IQ4_NL.
-    /// Pins the pool path's addressing: a row read at the wrong offset or
-    /// landed in the wrong slot differs from the map's.
+    /// Every read policy, on either read pool, gathers the rows the map
+    /// holds: the concurrent path (`pread` on the pool, landed by index)
+    /// against the serial map read, on a scattered id set with a row
+    /// repeated, at f32 and at IQ4_NL. Pins the pools' addressing: a row read
+    /// at the wrong offset or landed in the wrong slot differs from the map's.
     /// A token the loop takes back ([`FeedLink::retract`]) is filled again as
     /// if the run had never seen it: the producer's handshake rewinds the
     /// window, the token drawn again fills the NEXT value, whose rows are
@@ -1551,11 +1733,21 @@ mod tests {
                     .unwrap();
                 assert_eq!(row, want[i * head_dim..(i + 1) * head_dim], "row {id}");
             }
-            for policy in [ReadPolicy::Concurrent, ReadPolicy::Adaptive] {
-                t.set_read_policy(policy);
-                let mut got = vec![0f32; ids.len() * head_dim];
-                t.gather_into(&ids, &mut got).unwrap();
-                assert!(got == want, "{policy:?} differs at {dtype:?}");
+            for pool in [ReadPool::Workers, ReadPool::Rayon] {
+                t.set_read_pool(pool);
+                for policy in [ReadPolicy::Concurrent, ReadPolicy::Adaptive] {
+                    t.set_read_policy(policy);
+                    let mut got = vec![0f32; ids.len() * head_dim];
+                    t.gather_into(&ids, &mut got).unwrap();
+                    assert!(got == want, "{policy:?} on {pool:?} differs at {dtype:?}");
+                    let mut scratch = ReadScratch::with_rows(ids.len(), t.row_bytes());
+                    let mut got = vec![0f32; ids.len() * head_dim];
+                    t.gather_into_with(&ids, &mut got, &mut scratch).unwrap();
+                    assert!(
+                        got == want,
+                        "{policy:?} on {pool:?} through a scratch differs at {dtype:?}"
+                    );
+                }
             }
             let (_, pooled) = t.read_counters();
             assert!(

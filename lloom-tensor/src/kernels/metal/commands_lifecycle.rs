@@ -87,6 +87,9 @@ pub(super) struct FinalCaptures {
     pub(super) subscribers: Vec<Box<Vec<super::super::completion_hook::Subscriber>>>,
     pub(super) encoder_executor: Option<Arc<ExecutorSlot>>,
     pub(super) removals: Option<super::super::residency_set::PublishedRemovals>,
+    /// Recordings the final submission cancelled or replaced, unsubmitted:
+    /// released with the other captures, after every native marker is terminal.
+    pub(super) cancelled: Vec<super::CommandBuffer>,
 }
 
 pub(super) fn register<C: FinalCore>(core: Arc<C>) -> Result<OwnedCore<C>, MetalKernelError> {

@@ -1780,7 +1780,7 @@ fn chat_completions(shared: &Shared, v: &Value, auth: Option<[u8; 32]>) -> Handl
     let at = Instant::now();
     // The session the request continues (`docs/sessions.md` §5), or why
     // none holds its id.
-    let (resolved, miss) = match &ask.previous {
+    let (mut resolved, miss) = match &ask.previous {
         None => (None, None),
         Some(id) => match shared
             .sessions
@@ -1805,9 +1805,15 @@ fn chat_completions(shared: &Shared, v: &Value, auth: Option<[u8; 32]>) -> Handl
     )?;
     // The `input` form's conversation: the session's through the continued
     // turn, its reply as the response returned it, then the new messages.
-    let joined: Option<Value> = match (&ask.input, &resolved) {
+    let joined: Option<Value> = match (&ask.input, &mut resolved) {
         (Some(input), Some(r)) => {
-            let mut m = r.messages.clone().unwrap_or_default();
+            let mut m = r
+                .messages
+                .take()
+                .unwrap_or_default()
+                .into_iter()
+                .map(Value::from)
+                .collect::<Vec<Value>>();
             m.extend(input.iter().cloned());
             Some(Value::Array(m))
         }
@@ -2584,31 +2590,12 @@ fn finish_session(
         .map(|(id, _)| id)
         .filter(|_| decoded.stop == Stop::Eos);
     let id = ctx.reservation.id;
-    let kept = match reply {
-        Some(reply) => shared.sessions.lock().commit(
-            ctx.reservation,
-            super::sessions::Record {
-                messages: ctx.conversation,
-                reply_msg,
-                prompt_ids: prompt_ids.to_vec(),
-                reply,
-                eot,
-                scope: ctx.scope,
-                prefix: ctx.record,
-            },
-            Instant::now(),
-        ),
-        None => false,
-    };
-    if !kept {
-        shared.sessions.lock().note_other();
-    }
     let reused = decoded.reused;
     let reprefilled = ctx
         .continued
         .as_ref()
         .map_or(0, |c| c.carried.saturating_sub(reused));
-    let state = match (&ctx.continued, ctx.asked) {
+    let continued_state = match (&ctx.continued, ctx.asked) {
         (_, false) => "new",
         (None, true) => "expired",
         (Some(c), true) => match c.resident {
@@ -2622,14 +2609,43 @@ fn finish_session(
         Some(_) => shared
             .sessions
             .lock()
-            .note_continued(id.key, state == "resident"),
+            .note_continued(id.key, continued_state == "resident"),
         None => 0,
+    };
+    let publication = match reply {
+        Some(reply) => super::sessions::publish_record(
+            &shared.sessions,
+            ctx.reservation,
+            super::sessions::Record {
+                messages: ctx.conversation,
+                reply_msg,
+                prompt_ids: prompt_ids.to_vec(),
+                reply,
+                eot,
+                scope: ctx.scope,
+                prefix: ctx.record,
+            },
+            Instant::now(),
+        )
+        .inspect_err(|e| eprintln!("[session record preparation failed: {e}]"))
+        .ok(),
+        None => None,
+    };
+    let kept = publication.is_some_and(|(retained, _)| retained);
+    let released = publication.and_then(|(_, reason)| reason);
+    if !kept {
+        shared.sessions.lock().note_other();
+    }
+    let state = if released.is_some() {
+        "released"
+    } else {
+        continued_state
     };
     let prefix = if ctx.head <= 1 {
         "-"
     } else if reused >= ctx.head {
         "reused"
-    } else if state == "new" {
+    } else if continued_state == "new" {
         "built"
     } else {
         "rebuilt"
@@ -2645,9 +2661,8 @@ fn finish_session(
     };
     // Why the continued session is gone, where its id's holder may be told;
     // a session's lifetime is the server's policy, never its own field.
-    let reason = ctx
-        .miss
-        .and_then(|l| l.reason)
+    let reason = released
+        .or(ctx.miss.and_then(|l| l.reason))
         .map(super::sessions::Reason::name);
     let json = json!({
         "id": kept.then(|| id.encode()),
@@ -2667,10 +2682,13 @@ fn finish_session(
         "reset": ctx.reset.map(Reset::name),
         "reason": reason,
     });
+    let miss_line = ctx.miss.map_or(String::new(), |l| {
+        format!(" session_miss={}", l.miss.name())
+    });
     let line = format!(
         "session={state} session_id={} session_kept={kept} session_history={history} \
          session_prefix={prefix} session_keep={} session_pin={} pinned={} \
-         reprefilled={reprefilled} recorded={} tokenized={}{}",
+         reprefilled={reprefilled} recorded={} tokenized={} session_reason={}{}",
         id.short(),
         ctx.keep.name(),
         decoded.pin.name(),
@@ -2680,11 +2698,8 @@ fn finish_session(
             .map_or_else(|| "-".to_string(), |p| p.to_string()),
         ctx.recorded,
         ctx.encoded,
-        ctx.miss.map_or(String::new(), |l| format!(
-            " session_miss={} session_reason={}",
-            l.miss.name(),
-            reason.unwrap_or("-")
-        )),
+        reason.unwrap_or("-"),
+        miss_line,
     );
     (json, line)
 }
@@ -2705,7 +2720,7 @@ fn features_body(shared: &Shared) -> Value {
                 "messages": "the whole conversation; the session's replies are bound by the conversation before them",
                 "input": "the new messages, appended to the referenced turn's conversation; 404 when no session holds the id",
             },
-            "store": { "default": false, "true": "held until the server reclaims it (idle, capacity, memory) or a client lets it go (reset, DELETE)", "false": "held while the engine holds its state" },
+            "store": { "default": false, "true": "retained if the complete lineage fits the byte budget; otherwise released (reason=budget); held until reclamation or client release", "false": "held while the engine holds its state, subject to the same byte budget" },
             "keep": {
                 "default": match (cfg.keep, engine.prefix_pin_refused()) {
                     (super::sessions::Keep::Prefix, None) => "prefix",
@@ -2719,6 +2734,8 @@ fn features_body(shared: &Shared) -> Value {
             "idle_s": cfg.idle.as_secs(),
             "capacity": cfg.capacity,
             "max_bytes": cfg.max_bytes,
+            "accounting": super::sessions::ACCOUNTING,
+            "states": ["none", "new", "resident", "evicted", "expired", "released"],
             "reclaim": "lru by last use",
             "reasons": super::sessions::Reason::ALL.map(super::sessions::Reason::name),
             "binding": "the SHA-256 of the Authorization header, when a request sends one",
@@ -5608,62 +5625,7 @@ mod request_processors_tests {
 mod delivered_field_tests {
     use super::*;
 
-    use std::alloc::{GlobalAlloc, Layout, System};
-    use std::cell::Cell;
-
-    thread_local! {
-        static REQUESTED: Cell<Option<usize>> = const { Cell::new(None) };
-    }
-    struct Counter;
-    #[global_allocator]
-    static ALLOCATOR: Counter = Counter;
-
-    fn record(bytes: usize) {
-        let _ = REQUESTED.try_with(|count| {
-            if let Some(previous) = count.get() {
-                count.set(Some(previous.saturating_add(bytes)));
-            }
-        });
-    }
-    // SAFETY: allocation/deallocation are forwarded unchanged to System;
-    // the optional thread-local scalar never dereferences allocator pointers.
-    unsafe impl GlobalAlloc for Counter {
-        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-            record(layout.size());
-            // SAFETY: the caller's allocator layout is forwarded unchanged.
-            unsafe { System.alloc(layout) }
-        }
-        unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-            record(layout.size());
-            // SAFETY: the caller's allocator layout is forwarded unchanged.
-            unsafe { System.alloc_zeroed(layout) }
-        }
-        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, size: usize) -> *mut u8 {
-            record(size);
-            // SAFETY: the caller's live allocation/layout/size are forwarded.
-            unsafe { System.realloc(ptr, layout, size) }
-        }
-        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-            // SAFETY: the caller's allocation and its layout are forwarded.
-            unsafe { System.dealloc(ptr, layout) }
-        }
-    }
-    pub(super) fn counted<T>(run: impl FnOnce() -> T) -> (T, usize) {
-        struct Reset;
-        impl Drop for Reset {
-            fn drop(&mut self) {
-                REQUESTED.with(|count| count.set(None));
-            }
-        }
-        REQUESTED.with(|count| {
-            assert!(count.get().is_none());
-            count.set(Some(0));
-        });
-        let _reset = Reset;
-        let result = run();
-        let bytes = REQUESTED.with(|count| count.get().unwrap());
-        (result, bytes)
-    }
+    pub(super) use crate::app::test_alloc::counted;
 
     #[test]
     fn the_accumulator_allocation_counter_observes_a_known_allocation() {

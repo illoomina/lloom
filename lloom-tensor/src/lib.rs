@@ -83,6 +83,11 @@ mod command_policy;
 mod command_segments;
 mod completion_frontier;
 #[cfg(any(feature = "metal", test))]
+mod io_terminal;
+#[cfg(any(feature = "metal", test))]
+#[path = "kernels/metal/io_submission.rs"]
+mod io_submission;
+#[cfg(any(feature = "metal", test))]
 mod completion_setup;
 #[cfg(any(feature = "metal", test))]
 mod completion_scope;

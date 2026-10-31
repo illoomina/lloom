@@ -266,14 +266,17 @@ fn every_routed_kind_at_every_capacity() {
 /// the `(f32, f32, f32)` and `(f16, f32, f16)` triples (#1154 C's bandwidth
 /// column): at the 27B's three stem shapes, one row, the two arms and a
 /// second f32 arm (the null) interleaved rep by rep, `reps` medians of
-/// `iters` launches. GB/s divides the weight's bytes alone by the launch's
-/// time, the decode roofline's numerator (`docs/machine-model.md` §3.4).
+/// `iters` launches. Each launch reads the next of enough distinct copies of
+/// the weight to pass 512 MB, so no launch is served from the system-level
+/// cache a decode step's weights never fit. GB/s divides the weight's bytes
+/// alone by the launch's time, the decode roofline's numerator
+/// (`docs/machine-model.md` §3.4).
 /// Ignored; under `lloom-arb measure`, `--ignored --nocapture`.
 #[test]
 #[ignore]
 fn one_row_bandwidth_per_kind_and_triple() {
     let dev = device();
-    let (iters, reps) = (50usize, 9usize);
+    let (iters, reps) = (64usize, 9usize);
     let shapes = [(10240usize, 2560usize), (17408, 5120), (5120, 17408)];
     let kinds = [
         GgmlDType::Q4K,
@@ -283,16 +286,20 @@ fn one_row_bandwidth_per_kind_and_triple() {
     ];
     lloom_tensor::kernels::set_qmv_rows(false);
     println!("BANDWIDTH contract=fast m=1 iters={iters} reps={reps} interleaved f32,f16,f32-null; median ms per launch");
-    println!("| kind | shape | weight MB | f32 ms | f16 ms | null ms | f32 GB/s | f16 GB/s | f16/f32 | null/f32 |");
+    println!("| kind | shape | weight MB x copies | f32 ms | f16 ms | null ms | f32 GB/s | f16 GB/s | f16/f32 | null/f32 |");
     for (n, k) in shapes {
         for dtype in kinds {
-            let q = weight(dtype, (n, k), &dev);
             let bytes = (n * k / dtype.block_size() * dtype.type_size()) as f64;
+            let copies = ((512e6 / bytes).ceil() as usize).max(2);
+            let qs: Vec<QMatMul> = (0..copies).map(|_| weight(dtype, (n, k), &dev)).collect();
             let x32 = Tensor::randn(0f32, 1.0, (1, k), &dev).unwrap();
             let x16 = x32.to_dtype(lloom_tensor::DType::F16).unwrap();
-            assert_eq!(q.forward(&x16).unwrap().dtype(), lloom_tensor::DType::F16);
+            assert_eq!(
+                qs[0].forward(&x16).unwrap().dtype(),
+                lloom_tensor::DType::F16
+            );
             let mut arms: [Vec<f64>; 3] = [Vec::new(), Vec::new(), Vec::new()];
-            for _ in 0..3 {
+            for q in &qs {
                 q.forward(&x32).unwrap();
                 q.forward(&x16).unwrap();
             }
@@ -300,8 +307,8 @@ fn one_row_bandwidth_per_kind_and_triple() {
             for _ in 0..reps {
                 for (a, x) in [&x32, &x16, &x32].into_iter().enumerate() {
                     let t = Instant::now();
-                    for _ in 0..iters {
-                        q.forward(x).unwrap();
+                    for i in 0..iters {
+                        qs[i % copies].forward(x).unwrap();
                     }
                     dev.synchronize().unwrap();
                     arms[a].push(t.elapsed().as_secs_f64() * 1e3 / iters as f64);
@@ -313,7 +320,7 @@ fn one_row_bandwidth_per_kind_and_triple() {
             };
             let (a, b, c) = (med(&mut arms[0]), med(&mut arms[1]), med(&mut arms[2]));
             println!(
-                "| {dtype:?} | [{n} x {k}] | {:.2} | {a:.4} | {b:.4} | {c:.4} | {:.1} | {:.1} | {:.3} | {:.3} |",
+                "| {dtype:?} | [{n} x {k}] | {:.2} x {copies} | {a:.4} | {b:.4} | {c:.4} | {:.1} | {:.1} | {:.3} | {:.3} |",
                 bytes / 1e6,
                 bytes / (a * 1e-3) / 1e9,
                 bytes / (b * 1e-3) / 1e9,

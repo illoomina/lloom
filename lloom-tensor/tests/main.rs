@@ -86,6 +86,7 @@ mod qmatmul_f16w_mm;
 mod qmatmul_id_mm;
 mod qmatmul_id_mm_arm;
 mod qmatmul_id_mm_k_block;
+mod qmatmul_mm_f16_act;
 mod qmatmul_rows_arm;
 mod qmatmul_rows_ceiling;
 mod qmatmul_rows_default;
@@ -98,6 +99,7 @@ mod quant_mv_store;
 mod quant_parity;
 mod quant_parity_matrix;
 mod quant_parity_matrix_rows;
+mod quant_route;
 mod quantized_tests;
 #[cfg(feature = "metal")]
 mod residency_router_device;

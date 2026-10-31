@@ -158,6 +158,13 @@ impl QuantKind {
     pub fn mul_mv_quant(&self) -> bool {
         matches!(self.mul_mv, MulMv::Quant(_))
     }
+
+    /// Whether the GEMM has the `(f16, f32, f16)` arm,
+    /// `kernel_mul_mm_<stem>_f16_f16`: every quantized kind, and the dense
+    /// f16 weight the dequantise-once scratch holds.
+    pub fn mul_mm_f16_arm(&self) -> bool {
+        self.mul_mv_quant() || matches!(self.dtype, GgmlDType::F16)
+    }
 }
 
 impl GgmlDType {
@@ -1465,6 +1472,7 @@ pub unsafe fn call_quantized_matmul_mm_t(
     ep: impl EncoderProvider,
     kernels: &Kernels,
     dtype: GgmlDType,
+    triple: GemvTriple,
     src0_shape: &[usize],
     src0_stride: &[usize],
     src0: &Buffer,
@@ -1511,14 +1519,29 @@ pub unsafe fn call_quantized_matmul_mm_t(
         height: 1,
         depth: 1,
     };
-    let name = dtype.kind().mul_mm.ok_or_else(|| {
+    let f32_name = dtype.kind().mul_mm.ok_or_else(|| {
         MetalKernelError::UnsupportedDTypeForOp(Box::new(UnsupportedDTypeForOp {
             dtype: "no kernel_mul_mm arm for this weight dtype (Q8_1, Q8_K)",
             op: "qmatmul",
         }))
     })?;
+    // The `(f16, f32, f16)` arm is `kernel_mul_mm_<stem>_f16_f16` beside the
+    // `_f32` name the kind table carries; no other triple has a GEMM arm.
+    let name: crate::kernels::kernel::KernelName = match triple {
+        GemvTriple::F32F32F32 => f32_name.into(),
+        GemvTriple::F16F32F16 => format!("kernel_mul_mm_{}_f16_f16", dtype.kind().stem).into(),
+        other => {
+            return Err(MetalKernelError::UnsupportedDTypeForOp(Box::new(
+                UnsupportedDTypeForOp {
+                    dtype: other.label(),
+                    op: "qmatmul GEMM (no arm at this triple)",
+                },
+            )))
+        }
+    };
 
-    let pipeline = kernels.load_pipeline(device, Source::Quantized, name)?;
+    let pipeline = kernels.load_pipeline(device, Source::Quantized, name.clone())?;
+    let name: &str = name.as_ref();
     let encoder = ep.encoder();
     let encoder: &ComputeCommandEncoder = encoder.as_ref();
     encoder.set_compute_pipeline_state(&pipeline);

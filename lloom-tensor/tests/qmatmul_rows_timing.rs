@@ -261,3 +261,139 @@ fn every_routed_kind_at_every_capacity() {
         }
     }
 }
+
+/// Achieved weight bandwidth of the one-row quantized matvec, per kind, at
+/// the `(f32, f32, f32)` and `(f16, f32, f16)` triples (#1154 C's bandwidth
+/// column): at the 27B's three stem shapes, one row, the two arms and a
+/// second f32 arm (the null) interleaved rep by rep, `reps` medians of
+/// `iters` launches. Each launch reads the next of enough distinct copies of
+/// the weight to pass 512 MB, so no launch is served from the system-level
+/// cache a decode step's weights never fit. GB/s divides the weight's bytes
+/// alone by the launch's time, the decode roofline's numerator
+/// (`docs/machine-model.md` §3.4).
+/// Ignored; under `lloom-arb measure`, `--ignored --nocapture`.
+#[test]
+#[ignore]
+fn one_row_bandwidth_per_kind_and_triple() {
+    let dev = device();
+    let (iters, reps) = (64usize, 9usize);
+    let shapes = [(10240usize, 2560usize), (17408, 5120), (5120, 17408)];
+    let kinds = [
+        GgmlDType::Q4K,
+        GgmlDType::Q5K,
+        GgmlDType::Q6K,
+        GgmlDType::Q8_0,
+    ];
+    lloom_tensor::kernels::set_qmv_rows(false);
+    println!("BANDWIDTH contract=fast m=1 iters={iters} reps={reps} interleaved f32,f16,f32-null; median ms per launch");
+    println!("| kind | shape | weight MB x copies | f32 ms | f16 ms | null ms | f32 GB/s | f16 GB/s | f16/f32 | null/f32 |");
+    for (n, k) in shapes {
+        for dtype in kinds {
+            let bytes = (n * k / dtype.block_size() * dtype.type_size()) as f64;
+            let copies = ((512e6 / bytes).ceil() as usize).max(2);
+            let qs: Vec<QMatMul> = (0..copies).map(|_| weight(dtype, (n, k), &dev)).collect();
+            let x32 = Tensor::randn(0f32, 1.0, (1, k), &dev).unwrap();
+            let x16 = x32.to_dtype(lloom_tensor::DType::F16).unwrap();
+            assert_eq!(
+                qs[0].forward(&x16).unwrap().dtype(),
+                lloom_tensor::DType::F16
+            );
+            let mut arms: [Vec<f64>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+            for q in &qs {
+                q.forward(&x32).unwrap();
+                q.forward(&x16).unwrap();
+            }
+            dev.synchronize().unwrap();
+            for _ in 0..reps {
+                for (a, x) in [&x32, &x16, &x32].into_iter().enumerate() {
+                    let t = Instant::now();
+                    for i in 0..iters {
+                        qs[i % copies].forward(x).unwrap();
+                    }
+                    dev.synchronize().unwrap();
+                    arms[a].push(t.elapsed().as_secs_f64() * 1e3 / iters as f64);
+                }
+            }
+            let med = |v: &mut Vec<f64>| {
+                v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                v[v.len() / 2]
+            };
+            let (a, b, c) = (med(&mut arms[0]), med(&mut arms[1]), med(&mut arms[2]));
+            println!(
+                "| {dtype:?} | [{n} x {k}] | {:.2} x {copies} | {a:.4} | {b:.4} | {c:.4} | {:.1} | {:.1} | {:.3} | {:.3} |",
+                bytes / 1e6,
+                bytes / (a * 1e-3) / 1e9,
+                bytes / (b * 1e-3) / 1e9,
+                b / a,
+                c / a
+            );
+        }
+    }
+    lloom_tensor::kernels::set_qmv_rows(true);
+}
+
+/// The quantized GEMM at its two activation triples (#1154 A): the 27B's
+/// stem shapes at a prefill tile's rows (64) and at 512, on both GEMM routes
+/// (the in-kernel unpack, `dequant_from` 0, and the dequantise-once scratch,
+/// the default from 64 rows). The f32 arm, the f16 arm and a second f32 arm
+/// (the null) interleave rep by rep over enough weight copies to pass
+/// 512 MB. Ignored; under `lloom-arb measure`, `--ignored --nocapture`.
+#[test]
+#[ignore]
+fn gemm_per_kind_and_triple() {
+    let dev = device();
+    let (iters, reps) = (8usize, 7usize);
+    let shapes = [(10240usize, 2560usize), (17408, 5120), (5120, 17408)];
+    let kinds = [
+        GgmlDType::Q4K,
+        GgmlDType::Q5K,
+        GgmlDType::Q6K,
+        GgmlDType::Q8_0,
+    ];
+    println!("GEMM contract=fast iters={iters} reps={reps} interleaved f32,f16,f32-null; median ms per launch");
+    println!("| route | kind | shape | rows | f32 ms | f16 ms | null ms | f16/f32 | null/f32 |");
+    for (route, from) in [("unpack", 0usize), ("dequant-once", 64)] {
+        lloom_tensor::quantized::metal::set_dequant_once_from(from);
+        for (n, k) in shapes {
+            for dtype in kinds {
+                let bytes = (n * k / dtype.block_size() * dtype.type_size()) as f64;
+                let copies = ((512e6 / bytes).ceil() as usize).max(2);
+                let qs: Vec<QMatMul> = (0..copies).map(|_| weight(dtype, (n, k), &dev)).collect();
+                for rows in [64usize, 512] {
+                    let x32 = Tensor::randn(0f32, 1.0, (1, rows, k), &dev).unwrap();
+                    let x16 = x32.to_dtype(lloom_tensor::DType::F16).unwrap();
+                    assert_eq!(
+                        qs[0].forward(&x16).unwrap().dtype(),
+                        lloom_tensor::DType::F16
+                    );
+                    for q in &qs {
+                        q.forward(&x32).unwrap();
+                        q.forward(&x16).unwrap();
+                    }
+                    dev.synchronize().unwrap();
+                    let mut arms: [Vec<f64>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+                    for _ in 0..reps {
+                        for (a, x) in [&x32, &x16, &x32].into_iter().enumerate() {
+                            let t = Instant::now();
+                            for i in 0..iters {
+                                qs[i % copies].forward(x).unwrap();
+                            }
+                            dev.synchronize().unwrap();
+                            arms[a].push(t.elapsed().as_secs_f64() * 1e3 / iters as f64);
+                        }
+                    }
+                    let med = |v: &mut Vec<f64>| {
+                        v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                        v[v.len() / 2]
+                    };
+                    let (a, b, c) = (med(&mut arms[0]), med(&mut arms[1]), med(&mut arms[2]));
+                    println!(
+                        "| {route} | {dtype:?} | [{n} x {k}] | {rows} | {a:.4} | {b:.4} | {c:.4} | {:.3} | {:.3} |",
+                        b / a,
+                        c / a
+                    );
+                }
+            }
+        }
+    }
+}

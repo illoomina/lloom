@@ -4602,6 +4602,13 @@ mod tests {
         byte_safe::<FlashPartialParams>();
         byte_safe::<FlashCombineParams>();
         byte_safe::<FlashScatterParams>();
+        eprintln!(
+            "CONSTANT_ABI capability_size={} handle_size={} capability_align={} handle_align={} partial_size={} combine_size={} scatter_size={}",
+            std::mem::size_of::<ConstantBuffer>(), std::mem::size_of::<BufferHandle>(),
+            std::mem::align_of::<ConstantBuffer>(), std::mem::align_of::<BufferHandle>(),
+            std::mem::size_of::<FlashPartialParams>(), std::mem::size_of::<FlashCombineParams>(),
+            std::mem::size_of::<FlashScatterParams>(),
+        );
         assert_eq!(
             std::mem::size_of::<ConstantBuffer>(),
             std::mem::size_of::<BufferHandle>()

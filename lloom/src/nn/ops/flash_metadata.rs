@@ -5,6 +5,46 @@
 use crate::nn::attention::flash_validation::{prepare_pages, PageSummary, Pages};
 use lloom_tensor::{Device, Result, Tensor};
 
+/// Only table publications use the pre-existing by-value cache. Counts keep
+/// their existing once/pass ordinary upload. This tag is publication-local,
+/// never consulted by a layer or native dispatch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MetadataUpload {
+    Table,
+    Counts,
+}
+
+fn upload_metadata(data: &[u32], device: &Device, kind: MetadataUpload) -> Result<Tensor> {
+    #[cfg(feature = "metal")]
+    if kind == MetadataUpload::Table {
+        if let Device::Metal(metal) = device {
+            let constant = metal.constant_buffer(super::slice_bytes(data))?;
+            // SAFETY: exact initialized U32 bytes from the sealed cache. The
+            // counted creator handle transfers into this PRIVATE Tensor; no
+            // native payload or mutable alias is exposed by metadata/view APIs.
+            // Every consumer reads only, with ordinary Tensor retirement.
+            let handle = unsafe { constant.into_handle_unchecked() };
+            // Match ordinary storage_from_slice: choose/check the actual
+            // active allocation namespace; never relabel through unchecked new.
+            let storage = lloom_tensor::MetalStorage::new_allocated(
+                handle,
+                metal.clone(),
+                data.len(),
+                lloom_tensor::DType::U32,
+            )?;
+            return Ok(Tensor::from_storage(
+                lloom_tensor::Storage::Metal(storage),
+                data.len(),
+                lloom_tensor::op::BackpropOp::none(),
+                false,
+            ));
+        }
+    }
+    #[cfg(not(feature = "metal"))]
+    let _ = kind;
+    Tensor::new(data, device)
+}
+
 // The owner has one implementation; the protected model/frame migration is
 // still pending. These safe types do not expose their native Tensor payloads.
 #[path = "flash_metadata/resident.rs"]
@@ -65,8 +105,10 @@ impl std::fmt::Debug for FlashDecodingMetadata {
 
 impl FlashDecodingMetadata {
     /// Publish one immutable metadata pair, validated before either upload.
-    /// Per-pass callers move their two host vectors into this constructor;
-    /// publication performs one table upload and one live-count upload.
+    /// Per-pass callers move their two host vectors into this constructor.
+    /// Metal tables use the existing by-value cache once/publication (one
+    /// lookup, reusing an equal entry or uploading on a miss); counts retain
+    /// one ordinary upload. A cache miss keeps its existing key allocations.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         table: Vec<u32>,
@@ -87,7 +129,7 @@ impl FlashDecodingMetadata {
             page_size,
             pages_per_chunk,
         )?;
-        let table_t = Tensor::new(table.as_slice(), device)?;
+        let table_t = upload_metadata(table.as_slice(), device, MetadataUpload::Table)?;
         let keys_t = Tensor::new(keys.as_slice(), device)?;
         Ok(Self {
             table,
@@ -115,9 +157,7 @@ impl FlashDecodingMetadata {
         rows: usize,
         device: &Device,
     ) -> Result<(Vec<u32>, Vec<u32>)> {
-        self.republish_with(table, table_stride, keys, rows, device, |data, device| {
-            Tensor::new(data, device)
-        })
+        self.republish_with(table, table_stride, keys, rows, device, upload_metadata)
     }
 
     fn republish_with(
@@ -127,7 +167,7 @@ impl FlashDecodingMetadata {
         keys: Vec<u32>,
         rows: usize,
         device: &Device,
-        mut upload: impl FnMut(&[u32], &Device) -> Result<Tensor>,
+        mut upload: impl FnMut(&[u32], &Device, MetadataUpload) -> Result<Tensor>,
     ) -> Result<(Vec<u32>, Vec<u32>)> {
         let (page_size, pages_per_chunk) = self.page_geometry();
         let summary = prepare_pages(
@@ -141,11 +181,11 @@ impl FlashDecodingMetadata {
             pages_per_chunk,
         )?;
         let replacement = if table != self.table || !self.table_t.device().same_device(device) {
-            Some(upload(&table, device)?)
+            Some(upload(&table, device, MetadataUpload::Table)?)
         } else {
             None
         };
-        let keys_t = upload(&keys, device)?;
+        let keys_t = upload(&keys, device, MetadataUpload::Counts)?;
         let staging = (
             std::mem::replace(&mut self.table, table),
             std::mem::replace(&mut self.keys, keys),
@@ -403,10 +443,11 @@ mod flash_validation_tests {
         let next_keys = vec![2];
         let next_ptrs = (next_table.as_ptr(), next_keys.as_ptr());
         let mut uploads = 0;
-        let staging = owner.republish_with(next_table, 1, next_keys, 2, &device, |data, d| {
-            uploads += 1;
-            Tensor::new(data, d)
-        })?;
+        let staging =
+            owner.republish_with(next_table, 1, next_keys, 2, &device, |data, d, _kind| {
+                uploads += 1;
+                Tensor::new(data, d)
+            })?;
         assert_eq!(
             uploads, 1,
             "an unchanged private table must not be uploaded"
@@ -428,10 +469,17 @@ mod flash_validation_tests {
         let old_table = owner.table_t.clone();
         let old_keys = owner.keys_t.clone();
         let mut uploads = 0;
-        owner.republish_with(vec![3, 1, 0, 2], 2, vec![258], 2, &device, |data, d| {
-            uploads += 1;
-            Tensor::new(data, d)
-        })?;
+        owner.republish_with(
+            vec![3, 1, 0, 2],
+            2,
+            vec![258],
+            2,
+            &device,
+            |data, d, _kind| {
+                uploads += 1;
+                Tensor::new(data, d)
+            },
+        )?;
         assert_eq!(uploads, 2);
         assert!(!shares_storage(&owner.table_t, &old_table));
         assert_eq!(old_table.to_vec1::<u32>()?, vec![0, 1, 2, 3]);
@@ -448,10 +496,17 @@ mod flash_validation_tests {
             FlashDecodingMetadata::new(vec![0, 1, 2, 3], 1, vec![1], 2, 256, 1, &device)?;
         let old_table = owner.table_t.clone();
         let mut uploads = 0;
-        owner.republish_with(vec![0, 1, 2, 3], 2, vec![2], 2, &device, |data, d| {
-            uploads += 1;
-            Tensor::new(data, d)
-        })?;
+        owner.republish_with(
+            vec![0, 1, 2, 3],
+            2,
+            vec![2],
+            2,
+            &device,
+            |data, d, _kind| {
+                uploads += 1;
+                Tensor::new(data, d)
+            },
+        )?;
         assert_eq!(uploads, 1, "a stride change is not a native byte change");
         assert!(shares_storage(&owner.table_t, &old_table));
         assert_eq!(owner.table_stride(), 2);
@@ -496,7 +551,7 @@ mod flash_validation_tests {
         let old_ptrs = (owner.table.as_ptr(), owner.keys.as_ptr());
         let mut uploads = 0;
         let error = owner
-            .republish_with(vec![2, 3], 1, vec![2], 2, &device, |data, d| {
+            .republish_with(vec![2, 3], 1, vec![2], 2, &device, |data, d, _kind| {
                 uploads += 1;
                 if uploads == 2 {
                     lloom_tensor::bail!("injected count upload failure")
@@ -539,7 +594,7 @@ mod flash_validation_tests {
         let mut owner = FlashDecodingMetadata::new(vec![0, 1], 1, vec![1], 2, 256, 1, &device)?;
         let mut uploads = 0;
         let error = owner
-            .republish_with(vec![0], 1, vec![1], 2, &device, |data, d| {
+            .republish_with(vec![0], 1, vec![1], 2, &device, |data, d, _kind| {
                 uploads += 1;
                 Tensor::new(data, d)
             })
@@ -552,6 +607,184 @@ mod flash_validation_tests {
         assert_eq!(uploads, 0);
         assert_eq!(owner.table(), &[0, 1]);
         assert_eq!(owner.keys(), &[1]);
+        Ok(())
+    }
+
+    #[cfg(feature = "metal")]
+    fn same_native_table_handle(a: &Tensor, b: &Tensor) -> bool {
+        use lloom_tensor::{kernels::metal::BufferHandle, Storage};
+        let (a, _) = a.storage_and_layout();
+        let (b, _) = b.storage_and_layout();
+        let (Storage::Metal(a), Storage::Metal(b)) = (&*a, &*b) else {
+            panic!("native table identity control requires Metal");
+        };
+        BufferHandle::ptr_eq(a.buffer_handle(), b.buffer_handle())
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn hybrid_table_shares_equal_bytes_without_relooking_up_unchanged_publication() -> Result<()> {
+        let device = Device::new_metal(0)?;
+        let metal = device.as_metal_device()?;
+        assert_native_fixture_arm(metal, "hybrid-table-sharing");
+        let before = metal.constants_counters();
+        let mut first = FlashDecodingMetadata::new(vec![0, 1], 1, vec![1], 2, 256, 1, &device)?;
+        let second = FlashDecodingMetadata::new(vec![0, 1], 1, vec![2], 2, 256, 1, &device)?;
+        assert!(same_native_table_handle(&first.table_t, &second.table_t));
+        let after = metal.constants_counters();
+        assert_eq!((after.0 - before.0, after.1 - before.1), (1, 1));
+        let old = first.table_t.clone();
+        first.republish(vec![0, 1], 1, vec![3], 2, &device)?;
+        assert_eq!(
+            metal.constants_counters(),
+            after,
+            "unchanged table does not hash/lock cache"
+        );
+        assert!(same_native_table_handle(&old, &first.table_t));
+        first.republish(vec![1, 0], 1, vec![4], 2, &device)?;
+        assert!(!same_native_table_handle(&first.table_t, &second.table_t));
+        assert_eq!(old.to_vec1::<u32>()?, vec![0, 1]);
+        assert_eq!(second.table_t.to_vec1::<u32>()?, vec![0, 1]);
+        assert_eq!(first.table_t.to_vec1::<u32>()?, vec![1, 0]);
+        assert_eq!(first.keys_t.to_vec1::<u32>()?, vec![4]);
+        Ok(())
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn hybrid_old_publication_keeps_creator_after_cache_eviction() -> Result<()> {
+        let device = Device::new_metal(0)?;
+        let metal = device.as_metal_device()?;
+        assert_native_fixture_arm(metal, "hybrid-table-eviction");
+        let first = FlashDecodingMetadata::new(vec![0, 1], 1, vec![1], 2, 256, 1, &device)?;
+        // Existing cache is bounded to512 entries. Each value here is unique
+        // and four bytes, distinct from the table's eight-byte cache key.
+        for value in 0..513u32 {
+            drop(metal.constant_of(&value)?);
+        }
+        let before = metal.constants_counters();
+        let again = FlashDecodingMetadata::new(vec![0, 1], 1, vec![2], 2, 256, 1, &device)?;
+        let after = metal.constants_counters();
+        assert_eq!(
+            (after.0 - before.0, after.1 - before.1),
+            (0, 1),
+            "old cache entry was actually evicted"
+        );
+        assert!(!same_native_table_handle(&first.table_t, &again.table_t));
+        assert_eq!(first.table_t.to_vec1::<u32>()?, vec![0, 1]);
+        assert_eq!(again.table_t.to_vec1::<u32>()?, vec![0, 1]);
+        Ok(())
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn hybrid_count_failure_does_not_commit_cached_replacement() -> Result<()> {
+        let device = Device::new_metal(0)?;
+        assert_native_fixture_arm(device.as_metal_device()?, "hybrid-count-rollback");
+        let mut owner = FlashDecodingMetadata::new(vec![0, 1], 1, vec![1], 2, 256, 1, &device)?;
+        let old = owner.table_t.clone();
+        let old_keys = owner.keys_t.clone();
+        let old_summary = format!("{:?}", owner.summary);
+        let mut stages = Vec::new();
+        let error = owner
+            .republish_with(vec![2, 3], 1, vec![2], 2, &device, |data, d, kind| {
+                stages.push(kind);
+                if kind == MetadataUpload::Counts {
+                    lloom_tensor::bail!("injected native hybrid count refusal")
+                }
+                upload_metadata(data, d, kind)
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("injected native hybrid count refusal"),
+            "{error}"
+        );
+        assert_eq!(stages, [MetadataUpload::Table, MetadataUpload::Counts]);
+        assert_eq!(owner.table(), &[0, 1]);
+        assert_eq!(owner.keys(), &[1]);
+        assert_eq!(format!("{:?}", owner.summary), old_summary);
+        assert!(same_native_table_handle(&owner.table_t, &old));
+        assert!(same_native_table_handle(&owner.keys_t, &old_keys));
+        assert_eq!(old.to_vec1::<u32>()?, vec![0, 1]);
+        assert_eq!(old_keys.to_vec1::<u32>()?, vec![1]);
+        Ok(())
+    }
+
+    /// Numeric/accounting fixture only, not machine admission/RSS proof. Two
+    /// public namespace APIs share one actual device while retaining distinct
+    /// caches and allocation-origin authority. No new fixture allocator.
+    #[cfg(feature = "metal")]
+    #[test]
+    fn hybrid_table_wrapper_preserves_active_allocation_namespace() -> Result<()> {
+        use lloom_tensor::memory_admission::process_account;
+        use lloom_tensor::metal_backend::MetalAllocationDomain;
+        let base = Device::new_metal(0)?;
+        let metal = base.as_metal_device()?;
+        assert_native_fixture_arm(metal, "hybrid-table-namespace");
+        let a = MetalAllocationDomain::new(
+            metal,
+            process_account().unadmitted_domain(Some(128 << 20))?,
+        )?;
+        let b = MetalAllocationDomain::new(
+            metal,
+            process_account().unadmitted_domain(Some(128 << 20))?,
+        )?;
+        assert_ne!(a.domain().key(), b.domain().key());
+        let pass_a = a.domain().reserve(32 << 20)?;
+        let pass_b = b.domain().reserve(32 << 20)?;
+        let scope_a = a.scope(pass_a.context())?;
+        let scope_b = b.scope(pass_b.context())?;
+        let before = metal.constants_counters();
+        // Deliberately supply the ORIGINAL device; new_allocated must resolve
+        // the checked active view instead of assigning this original tag.
+        let mut first = scope_a
+            .run(|_| FlashDecodingMetadata::new(vec![0, 1], 1, vec![1], 2, 256, 1, &base))?;
+        let second = scope_b
+            .run(|_| FlashDecodingMetadata::new(vec![0, 1], 1, vec![2], 2, 256, 1, &base))?;
+        assert!(base.same_device(first.table_t.device()));
+        assert!(base.same_device(second.table_t.device()));
+        assert!(!same_native_table_handle(&first.table_t, &second.table_t));
+        assert_eq!(
+            metal.constants_counters(),
+            before,
+            "base cache must not receive scoped uploads"
+        );
+        // An accounted storage's saved device refuses allocation queries with
+        // no active scope. Unchecked new(handle,original,...) would return Ok.
+        for table in [&first.table_t, &second.table_t] {
+            let error = table
+                .device()
+                .as_metal_device()?
+                .allocation_origin()
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("requires an active execution scope"),
+                "{error}"
+            );
+        }
+        let old_table = first.table_t.clone();
+        scope_b.run(|m| {
+            let cache_before = m.constants_counters();
+            first.republish(vec![0, 1], 1, vec![3], 2, &base)?;
+            assert_eq!(
+                m.constants_counters(),
+                cache_before,
+                "existing input origin is not republished/reclassified"
+            );
+            assert!(same_native_table_handle(&first.table_t, &old_table));
+            Ok(())
+        })?;
+        // Read only inside a checked scope; other-domain immutable input is
+        // legal and keeps its own original handle throughout.
+        scope_b.run(|_| {
+            assert_eq!(first.table_t.to_vec1::<u32>()?, vec![0, 1]);
+            assert_eq!(first.keys_t.to_vec1::<u32>()?, vec![3]);
+            Ok(())
+        })?;
+        drop((first, second, old_table));
+        drop((scope_a, scope_b, pass_a, pass_b));
         Ok(())
     }
 

@@ -72,6 +72,11 @@ pub(crate) struct Queue {
     /// before the first acquisition; a queue without them lists everything
     /// in its slot sets whatever the arm.
     device_sets: OnceLock<Arc<super::ResidencySet>>,
+    /// The host retirement service's Wake, notified when a slot becomes free
+    /// while a final owner that found none is waiting for one
+    /// (`slot_waiter`): it returned pending and is polled again on this.
+    slot_wake: OnceLock<Arc<Wake>>,
+    slot_waiter: AtomicBool,
     // LAST: raw/available slots disappear before final capability publication.
     physical: crate::retirement_service::PhysicalAnchor<
         crate::metal_backend::device_retirement::NamespaceOwner,
@@ -112,6 +117,8 @@ impl Queue {
             }),
             declare: super::Metal4Declare::selected(),
             device_sets: OnceLock::new(),
+            slot_wake: OnceLock::new(),
+            slot_waiter: AtomicBool::new(false),
             physical: crate::retirement_service::PhysicalAnchor::default(),
         });
         let core = super::retirement::Metal4Completions::new(
@@ -155,6 +162,7 @@ impl Queue {
     pub(super) fn return_retirement_slot(&self, slot: Slot) -> Result<(), Slot> {
         self.available.push(slot)?;
         self.ready.notify();
+        self.notify_slot_wake();
         Ok(())
     }
 
@@ -162,6 +170,45 @@ impl Queue {
         drop(slot);
         self.allocated.fetch_sub(1, Ordering::AcqRel);
         self.ready.notify();
+        self.notify_slot_wake();
+    }
+
+    /// Cold, once: the Wake a freed slot notifies besides `ready`.
+    pub(super) fn install_slot_wake(&self, wake: Arc<Wake>) -> Result<(), Arc<Wake>> {
+        match self.slot_wake.get() {
+            Some(installed) if Arc::ptr_eq(installed, &wake) => Ok(()),
+            Some(_) => Err(wake),
+            None => self.slot_wake.set(wake),
+        }
+    }
+
+    /// After the slot was made free: the free, then the look at the waiter,
+    /// against the waiter's flag, then its look at the slots
+    /// (`free_slot_or_wait`), so one of the two sees the other.
+    fn notify_slot_wake(&self) {
+        std::sync::atomic::fence(Ordering::SeqCst);
+        if self.slot_waiter.load(Ordering::Relaxed) {
+            if let Some(wake) = self.slot_wake.get() {
+                wake.notify();
+            }
+        }
+    }
+
+    fn has_free_slot(&self) -> bool {
+        !self.available.is_empty() || self.allocated.load(Ordering::Acquire) < SLOTS
+    }
+
+    /// Whether an acquisition would find a slot without parking. When it
+    /// would not, the next freed slot notifies the installed slot Wake. Only
+    /// an owner with no concurrent acquirer may act on `true` (the final
+    /// owner, which never waits for a slot).
+    pub(super) fn free_slot_or_wait(&self) -> bool {
+        if self.has_free_slot() {
+            return true;
+        }
+        self.slot_waiter.store(true, Ordering::Relaxed);
+        std::sync::atomic::fence(Ordering::SeqCst);
+        self.has_free_slot()
     }
 
     /// What this queue's command buffers declare (`kernels.residency.metal4`).
@@ -329,6 +376,7 @@ impl Queue {
                     Err(e) => {
                         self.allocated.fetch_sub(1, Ordering::AcqRel);
                         self.ready.notify();
+                        self.notify_slot_wake();
                         return Err(e);
                     }
                 }
@@ -1973,6 +2021,55 @@ mod tests {
     fn completion_wake_covers_notify_before_and_during_registration() {
         crate::completion_wake::tests::registration_control();
         println!("MTL4_WAKE transitions=1001 lost_wakes=0 waiters=0");
+    }
+
+    /// The final owner's slot Wake: a slot freed while it waits for one
+    /// notifies it; one freed before anything waits does not (the wake costs
+    /// the steady state nothing but a flag read).
+    #[test]
+    fn a_freed_slot_notifies_the_slot_wake_only_while_an_owner_waits() {
+        let _pool = crate::AutoreleaseScope::new();
+        let device = Device::system_default().expect("Metal device");
+        if !device.as_ref().supportsFamily(MTLGPUFamily::Metal4) {
+            return;
+        }
+        let queue = Queue::new(device.clone()).unwrap();
+        let wake = Arc::new(Wake::default());
+        assert!(queue.install_slot_wake(wake.clone()).is_ok());
+        assert!(queue.install_slot_wake(Arc::new(Wake::default())).is_err());
+        let settle = |seen: usize| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while wake.snapshot() == seen && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            wake.snapshot() != seen
+        };
+        let unwatched = wake.snapshot();
+        let first = queue.acquire().unwrap();
+        first.commit().unwrap();
+        first.wait().unwrap();
+        let freed_unwatched = settle(unwatched);
+        let held: Vec<_> = (0..SLOTS).map(|_| queue.acquire().unwrap()).collect();
+        let full = !queue.free_slot_or_wait();
+        let watched = wake.snapshot();
+        held[0].commit().unwrap();
+        held[0].wait().unwrap();
+        let freed_watched = settle(watched);
+        let free_after = queue.free_slot_or_wait();
+        for submission in &held[1..] {
+            submission.commit().unwrap();
+            submission.wait().unwrap();
+        }
+        println!(
+            "MTL4_SLOT_WAKE unwatched_notified={freed_unwatched} full={full} watched_notified={freed_watched} free_after={free_after}"
+        );
+        assert!(
+            !freed_unwatched,
+            "a slot freed with no waiter notified the slot Wake"
+        );
+        assert!(full, "every slot held, yet a free slot was reported");
+        assert!(freed_watched, "MTL4_SLOT_WAKE_NOTIFIES_A_WAITING_OWNER");
+        assert!(free_after, "the freed slot was not seen free");
     }
 
     #[test]

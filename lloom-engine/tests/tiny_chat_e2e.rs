@@ -3994,6 +3994,17 @@ fn serve_continues_a_conversation_by_its_completion_id() {
         let id2 = session_id(&two);
         assert_ne!(id2, id1);
 
+        // A second input continuation must still reconstruct the original
+        // retained history: only the first request's detached snapshot moved.
+        let repeated = ok(
+            &server,
+            json!({ "previous_response_id": id1, "input": [user2], "return_token_ids": true }),
+        );
+        assert_eq!(
+            repeated["prompt_token_ids"], two["prompt_token_ids"],
+            "{name}: a second input continuation must not see drained retained history"
+        );
+
         // The same history in the `messages` form, by reference: the same
         // prompt, the reply bound rather than found by its text.
         let full = ok(
@@ -4529,7 +4540,7 @@ fn serve_advertises_sessions_streams_their_id_and_binds_them_to_a_key() {
     assert!(f["sessions"].get("ttl_s").is_none(), "{f}");
     assert_eq!(
         f["sessions"]["reasons"],
-        json!(["idle", "capacity", "memory", "reset", "delete", "restart"]),
+        json!(["idle", "capacity", "memory", "reset", "delete", "restart", "budget"]),
         "{f}"
     );
 
@@ -4572,6 +4583,44 @@ fn serve_advertises_sessions_streams_their_id_and_binds_them_to_a_key() {
     assert_eq!(status, 200, "{b}");
     drop(server);
     std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn serve_reports_budget_release_without_failing_generation_or_keeping_an_id() {
+    let dir = scratch("session-budget");
+    let model = write::<Lfm2Tiny>(&dir);
+    let server = Server::start(&model, &["--cpu", "--session-max-mib", "0"]);
+    for stream in [false, true] {
+        let request = session_req(json!({"messages":[{"role":"user","content":PROMPT}],
+            "store":true, "stream":stream}));
+        let response = if stream {
+            sse(&server, &request).last().unwrap().clone()
+        } else {
+            let (status, body) = server.call("POST", "/v1/chat/completions", &request);
+            assert_eq!(status, 200, "{body}");
+            body
+        };
+        let session = &response["timings"]["session"];
+        assert_eq!(session["state"], "released", "{response}");
+        assert_eq!(session["reason"], "budget", "{response}");
+        assert!(session["id"].is_null(), "{response}");
+        let id = response["id"].as_str().unwrap();
+        let (status, lost) = server.call(
+            "POST",
+            "/v1/chat/completions",
+            &session_req(json!({"previous_response_id":id,"input":"Again."})),
+        );
+        assert_eq!(status, 404, "{lost}");
+        let (_, health) = server.call("GET", "/health", &json!({}));
+        assert_eq!(health["sessions"]["bytes"], 0, "{health}");
+        assert_eq!(health["sessions"]["held"], 0, "{health}");
+        assert!(
+            health["sessions"]["released"]["budget"].as_u64().unwrap() > 0,
+            "{health}"
+        );
+    }
+    drop(server);
+    std::fs::remove_dir_all(&dir).unwrap();
 }
 
 /// The tiny LFM2 checkpoint at `model` (safetensors) written again as the

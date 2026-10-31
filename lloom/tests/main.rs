@@ -59,6 +59,7 @@ mod lfm2_kv_growth_metal;
 mod lfm2_kv_growth_refusal_metal;
 mod lfm2_moe;
 mod lfm2_paged_kv_blocker;
+mod lfm2_paged_prefill;
 mod lfm2_pass_plans;
 mod lfm2_prefill_activation;
 mod lfm2_qkv_layout;

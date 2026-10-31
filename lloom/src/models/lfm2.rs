@@ -1819,6 +1819,8 @@ pub struct PagedKv {
     /// Every sequence's chunk table, `table_stride` entries each.
     table: Vec<u32>,
     table_stride: usize,
+    /// Per-page indices for the own-cache multi-query reader, independent of decode chunks.
+    prefill_table: Vec<u32>,
     /// `table` resident on the device for the one-sequence read: `U32`, sized
     /// for the ceiling, its first `table_written` entries the host's. A
     /// chunk's entry never changes once written (pages do not move; a rewind
@@ -1861,6 +1863,7 @@ impl PagedKv {
             max_slot: 0,
             table: Vec::new(),
             table_stride: 0,
+            prefill_table: Vec::new(),
             table_t: None,
             table_written: 0,
             table_shadow: Vec::new(),
@@ -2046,6 +2049,10 @@ impl PagedKv {
             pool.extend_table_for(s, self.pages_per_chunk, &mut self.table);
             debug_assert_eq!(self.table.len() - before, n_chunks);
         }
+        self.prefill_table.clear();
+        if n_seqs == 1 && seq_len > 1 && crate::tuning::tuning().lfm2.paged_prefill {
+            pool.extend_table_for(0, 1, &mut self.prefill_table);
+        }
         self.sync_resident_table(n_seqs, device)?;
         Ok(())
     }
@@ -2170,6 +2177,7 @@ impl PagedKv {
         self.max_slot = 0;
         self.table.clear();
         self.table_stride = 0;
+        self.prefill_table.clear();
     }
 
     /// Discard the last `n` positions of every sequence: a length decrement,
@@ -6598,6 +6606,8 @@ struct Attention<P: Profile> {
     use_flash_attn: bool,
     /// The kernels this layer takes, decided at load (`AttnRoute::resolve`).
     route: AttnRoute,
+    #[cfg(feature = "metal")]
+    paged_prefill: bool,
     flash_page_size: usize,
     flash_pages_per_chunk: usize,
     /// §9.1a's sizing policy, wired to FlashDecoding's allocation by #234.
@@ -6662,6 +6672,8 @@ impl<P: Profile> Attention<P> {
             head_dim,
             use_flash_attn: cfg.use_flash_attn,
             route,
+            #[cfg(feature = "metal")]
+            paged_prefill: Self::paged_prefill_supported(cfg, &route),
             flash_page_size: cfg.flash_page_size,
             flash_pages_per_chunk: cfg.flash_pages_per_chunk,
             flash_scratch_sizing: cfg.flash_scratch_sizing,
@@ -6672,6 +6684,26 @@ impl<P: Profile> Attention<P> {
             span: tracing::span!(tracing::Level::TRACE, "attn"),
             span_rot: tracing::span!(tracing::Level::TRACE, "attn-rot"),
         })
+    }
+
+    #[cfg(feature = "metal")]
+    fn paged_prefill_supported(cfg: &Config, route: &AttnRoute) -> bool {
+        use lloom_tensor::kernels::{sdpa_full_tile, SdpaDType};
+        if !crate::tuning::tuning().lfm2.paged_prefill
+            || cfg.kv_append != KvAppend::Paged
+            || cfg.kv_quant.is_on()
+            || route.prefill != PrefillAttn::Steel
+        {
+            return false;
+        }
+        let dtype = match route.dtype {
+            DType::F16 => SdpaDType::F16,
+            DType::BF16 => SdpaDType::BF16,
+            DType::F32 => SdpaDType::F32,
+            _ => return false,
+        };
+        sdpa_full_tile(route.head_dim, dtype)
+            .is_ok_and(|(_, bk, _, _)| cfg.flash_page_size.max(1).is_multiple_of(bk))
     }
 
     /// Whether this call takes the FlashDecoding kernels (`DESIGN.md` §10.4):
@@ -7558,6 +7590,22 @@ impl<P: Profile> Attention<P> {
                                 // The write: this pass's tokens to the slots the table
                                 // names, one dispatch for K and one for V.
                                 paged.write_layer(block_idx, &k, &v)?;
+                                if self.paged_prefill && b_sz == 1 && seq_len > 1 && n_prev > 0 {
+                                    let (pk, pv) = paged.pools[block_idx]
+                                        .as_ref()
+                                        .expect("write_layer allocates the layer's pool");
+                                    return crate::nn::ops::sdpa_paged(
+                                        &q,
+                                        pk,
+                                        pv,
+                                        true,
+                                        1f32 / (self.head_dim as f32).sqrt(),
+                                        paged.page_size,
+                                        &paged.prefill_table,
+                                        paged.prefill_table.len(),
+                                        paged.len,
+                                    );
+                                }
                                 if reads_pool {
                                     // Decode reads the pool through the table below;
                                     // the tensors handed on are the pool itself.

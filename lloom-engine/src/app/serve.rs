@@ -1778,7 +1778,7 @@ fn chat_completions(shared: &Shared, v: &Value, auth: Option<[u8; 32]>) -> Handl
     let at = Instant::now();
     // The session the request continues (`docs/sessions.md` §5), or why
     // none holds its id.
-    let (resolved, miss) = match &ask.previous {
+    let (mut resolved, miss) = match &ask.previous {
         None => (None, None),
         Some(id) => match shared
             .sessions
@@ -1803,9 +1803,15 @@ fn chat_completions(shared: &Shared, v: &Value, auth: Option<[u8; 32]>) -> Handl
     )?;
     // The `input` form's conversation: the session's through the continued
     // turn, its reply as the response returned it, then the new messages.
-    let joined: Option<Value> = match (&ask.input, &resolved) {
+    let joined: Option<Value> = match (&ask.input, &mut resolved) {
         (Some(input), Some(r)) => {
-            let mut m = r.messages.clone().unwrap_or_default();
+            let mut m = r
+                .messages
+                .take()
+                .unwrap_or_default()
+                .into_iter()
+                .map(Value::from)
+                .collect::<Vec<Value>>();
             m.extend(input.iter().cloned());
             Some(Value::Array(m))
         }
@@ -2582,31 +2588,12 @@ fn finish_session(
         .map(|(id, _)| id)
         .filter(|_| decoded.stop == Stop::Eos);
     let id = ctx.reservation.id;
-    let kept = match reply {
-        Some(reply) => shared.sessions.lock().commit(
-            ctx.reservation,
-            super::sessions::Record {
-                messages: ctx.conversation,
-                reply_msg,
-                prompt_ids: prompt_ids.to_vec(),
-                reply,
-                eot,
-                scope: ctx.scope,
-                prefix: ctx.record,
-            },
-            Instant::now(),
-        ),
-        None => false,
-    };
-    if !kept {
-        shared.sessions.lock().note_other();
-    }
     let reused = decoded.reused;
     let reprefilled = ctx
         .continued
         .as_ref()
         .map_or(0, |c| c.carried.saturating_sub(reused));
-    let state = match (&ctx.continued, ctx.asked) {
+    let continued_state = match (&ctx.continued, ctx.asked) {
         (_, false) => "new",
         (None, true) => "expired",
         (Some(c), true) => match c.resident {
@@ -2620,14 +2607,43 @@ fn finish_session(
         Some(_) => shared
             .sessions
             .lock()
-            .note_continued(id.key, state == "resident"),
+            .note_continued(id.key, continued_state == "resident"),
         None => 0,
+    };
+    let publication = match reply {
+        Some(reply) => super::sessions::publish_record(
+            &shared.sessions,
+            ctx.reservation,
+            super::sessions::Record {
+                messages: ctx.conversation,
+                reply_msg,
+                prompt_ids: prompt_ids.to_vec(),
+                reply,
+                eot,
+                scope: ctx.scope,
+                prefix: ctx.record,
+            },
+            Instant::now(),
+        )
+        .inspect_err(|e| eprintln!("[session record preparation failed: {e}]"))
+        .ok(),
+        None => None,
+    };
+    let kept = publication.is_some_and(|(retained, _)| retained);
+    let released = publication.and_then(|(_, reason)| reason);
+    if !kept {
+        shared.sessions.lock().note_other();
+    }
+    let state = if released.is_some() {
+        "released"
+    } else {
+        continued_state
     };
     let prefix = if ctx.head <= 1 {
         "-"
     } else if reused >= ctx.head {
         "reused"
-    } else if state == "new" {
+    } else if continued_state == "new" {
         "built"
     } else {
         "rebuilt"
@@ -2643,9 +2659,8 @@ fn finish_session(
     };
     // Why the continued session is gone, where its id's holder may be told;
     // a session's lifetime is the server's policy, never its own field.
-    let reason = ctx
-        .miss
-        .and_then(|l| l.reason)
+    let reason = released
+        .or(ctx.miss.and_then(|l| l.reason))
         .map(super::sessions::Reason::name);
     let json = json!({
         "id": kept.then(|| id.encode()),
@@ -2665,10 +2680,13 @@ fn finish_session(
         "reset": ctx.reset.map(Reset::name),
         "reason": reason,
     });
+    let miss_line = ctx.miss.map_or(String::new(), |l| {
+        format!(" session_miss={}", l.miss.name())
+    });
     let line = format!(
         "session={state} session_id={} session_kept={kept} session_history={history} \
          session_prefix={prefix} session_keep={} session_pin={} pinned={} \
-         reprefilled={reprefilled} recorded={} tokenized={}{}",
+         reprefilled={reprefilled} recorded={} tokenized={} session_reason={}{}",
         id.short(),
         ctx.keep.name(),
         decoded.pin.name(),
@@ -2678,11 +2696,8 @@ fn finish_session(
             .map_or_else(|| "-".to_string(), |p| p.to_string()),
         ctx.recorded,
         ctx.encoded,
-        ctx.miss.map_or(String::new(), |l| format!(
-            " session_miss={} session_reason={}",
-            l.miss.name(),
-            reason.unwrap_or("-")
-        )),
+        reason.unwrap_or("-"),
+        miss_line,
     );
     (json, line)
 }
@@ -2703,7 +2718,7 @@ fn features_body(shared: &Shared) -> Value {
                 "messages": "the whole conversation; the session's replies are bound by the conversation before them",
                 "input": "the new messages, appended to the referenced turn's conversation; 404 when no session holds the id",
             },
-            "store": { "default": false, "true": "held until the server reclaims it (idle, capacity, memory) or a client lets it go (reset, DELETE)", "false": "held while the engine holds its state" },
+            "store": { "default": false, "true": "retained if the complete lineage fits the byte budget; otherwise released (reason=budget); held until reclamation or client release", "false": "held while the engine holds its state, subject to the same byte budget" },
             "keep": {
                 "default": match (cfg.keep, engine.prefix_pin_refused()) {
                     (super::sessions::Keep::Prefix, None) => "prefix",
@@ -2717,6 +2732,8 @@ fn features_body(shared: &Shared) -> Value {
             "idle_s": cfg.idle.as_secs(),
             "capacity": cfg.capacity,
             "max_bytes": cfg.max_bytes,
+            "accounting": super::sessions::ACCOUNTING,
+            "states": ["none", "new", "resident", "evicted", "expired", "released"],
             "reclaim": "lru by last use",
             "reasons": super::sessions::Reason::ALL.map(super::sessions::Reason::name),
             "binding": "the SHA-256 of the Authorization header, when a request sends one",
@@ -4243,6 +4260,9 @@ impl<B: Batch + 'static> StreamWriter<B> {
     /// A timeout is not a claim that the channel is still empty. Under the
     /// same off-token guard used by send, prefer an already queued event over
     /// bytes appended after that event; then select/wrap at most one batch.
+    /// The first delta's wake found here is skipped, never written: its empty
+    /// payload would be the chunk that ends the body, and an event queued
+    /// behind it still goes before the bytes.
     /// The guard is dropped before the caller performs any network I/O.
     fn pending_after_timeout(
         rx: &std::sync::mpsc::Receiver<(String, usize)>,
@@ -4252,10 +4272,13 @@ impl<B: Batch + 'static> StreamWriter<B> {
         local: &mut B,
     ) -> (Option<(String, usize)>, bool) {
         let _guard = order.lock();
-        let closed = match rx.try_recv() {
-            Ok(work) => return (Some(work), false),
-            Err(std::sync::mpsc::TryRecvError::Empty) => false,
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => true,
+        let closed = loop {
+            match rx.try_recv() {
+                Ok((payload, _)) if payload.is_empty() && buf.is_some() => continue,
+                Ok(work) => return (Some(work), false),
+                Err(std::sync::mpsc::TryRecvError::Empty) => break false,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => break true,
+            }
         };
         let work = match (buf, wrap) {
             (Some(buf), Some(wrap)) if buf.take_into(local) => Some(wrap(local)),
@@ -5606,62 +5629,7 @@ mod request_processors_tests {
 mod delivered_field_tests {
     use super::*;
 
-    use std::alloc::{GlobalAlloc, Layout, System};
-    use std::cell::Cell;
-
-    thread_local! {
-        static REQUESTED: Cell<Option<usize>> = const { Cell::new(None) };
-    }
-    struct Counter;
-    #[global_allocator]
-    static ALLOCATOR: Counter = Counter;
-
-    fn record(bytes: usize) {
-        let _ = REQUESTED.try_with(|count| {
-            if let Some(previous) = count.get() {
-                count.set(Some(previous.saturating_add(bytes)));
-            }
-        });
-    }
-    // SAFETY: allocation/deallocation are forwarded unchanged to System;
-    // the optional thread-local scalar never dereferences allocator pointers.
-    unsafe impl GlobalAlloc for Counter {
-        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-            record(layout.size());
-            // SAFETY: the caller's allocator layout is forwarded unchanged.
-            unsafe { System.alloc(layout) }
-        }
-        unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-            record(layout.size());
-            // SAFETY: the caller's allocator layout is forwarded unchanged.
-            unsafe { System.alloc_zeroed(layout) }
-        }
-        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, size: usize) -> *mut u8 {
-            record(size);
-            // SAFETY: the caller's live allocation/layout/size are forwarded.
-            unsafe { System.realloc(ptr, layout, size) }
-        }
-        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-            // SAFETY: the caller's allocation and its layout are forwarded.
-            unsafe { System.dealloc(ptr, layout) }
-        }
-    }
-    pub(super) fn counted<T>(run: impl FnOnce() -> T) -> (T, usize) {
-        struct Reset;
-        impl Drop for Reset {
-            fn drop(&mut self) {
-                REQUESTED.with(|count| count.set(None));
-            }
-        }
-        REQUESTED.with(|count| {
-            assert!(count.get().is_none());
-            count.set(Some(0));
-        });
-        let _reset = Reset;
-        let result = run();
-        let bytes = REQUESTED.with(|count| count.get().unwrap());
-        (result, bytes)
-    }
+    pub(super) use crate::app::test_alloc::counted;
 
     #[test]
     fn the_accumulator_allocation_counter_observes_a_known_allocation() {
@@ -5753,7 +5721,10 @@ mod stream_writer_tests {
     /// text stays before it, text handed over before a control event goes
     /// out ahead of it (`send` takes it), and text handed over just before
     /// the run ends is written (`finish` flushes the spill; the writer drains
-    /// once more on its way out, whatever its tick was doing).
+    /// once more on its way out, whatever its tick was doing). How the text
+    /// between two control events is cut into delta events depends on when
+    /// the writer's wake and drains land, so adjacent deltas are joined
+    /// before comparing: the assertion is the order, not the batching.
     #[test]
     fn text_pushed_at_the_end_is_written_after_what_preceded_it() {
         let mem = Mem::default();
@@ -5769,13 +5740,69 @@ mod stream_writer_tests {
         let (_w, err) = sw.finish().unwrap();
         assert!(err.is_none());
         let out = String::from_utf8(mem.0.lock().unwrap().clone()).unwrap();
-        let body: String = out
-            .split("\r\n")
-            .enumerate()
-            .filter(|(i, _)| i % 2 == 1)
-            .map(|(_, s)| s)
-            .collect();
-        assert_eq!(body, "ctl<ab>mid<c>", "{out:?}");
+        assert_eq!(
+            in_order(&out),
+            [
+                Event::Control("ctl".into()),
+                Event::Text("ab".into()),
+                Event::Control("mid".into()),
+                Event::Text("c".into()),
+            ],
+            "{out:?}"
+        );
+    }
+
+    #[derive(Debug, PartialEq)]
+    enum Event {
+        Control(String),
+        Text(String),
+    }
+
+    /// The chunk bodies of `out` in wire order, each a control event or a
+    /// `<…>` delta, with adjacent deltas joined. A delta event that carries
+    /// no text is refused: the writer never wraps an empty batch.
+    fn in_order(out: &str) -> Vec<Event> {
+        let mut events = Vec::new();
+        for body in out.split("\r\n").skip(1).step_by(2) {
+            match body.strip_prefix('<').and_then(|b| b.strip_suffix('>')) {
+                Some(text) => {
+                    assert!(!text.is_empty(), "an empty delta event: {out:?}");
+                    match events.last_mut() {
+                        Some(Event::Text(run)) => run.push_str(text),
+                        _ => events.push(Event::Text(text.to_string())),
+                    }
+                }
+                None => events.push(Event::Control(body.to_string())),
+            }
+        }
+        events
+    }
+
+    /// A drain that finds the first delta's wake queued behind its timeout
+    /// skips it: alone, it returns no event (the wake's empty payload
+    /// written would be `0\r\n\r\n`, the chunk that ends a chunked body);
+    /// with a control event queued behind it, it returns that event, ahead
+    /// of any text handed over after it.
+    #[test]
+    fn a_wake_found_after_a_timeout_is_skipped_not_written() {
+        let (tx, rx) = std::sync::mpsc::channel::<(String, usize)>();
+        let buf = super::DeltaBuffer::new();
+        let order = parking_lot::Mutex::new(());
+        let mut local = String::new();
+        let mut drain =
+            || StreamWriter::pending_after_timeout(&rx, Some(&buf), None, &order, &mut local);
+
+        tx.send((String::new(), 0)).unwrap();
+        assert_eq!(drain(), (None, false), "the wake alone");
+
+        tx.send((String::new(), 0)).unwrap();
+        tx.send(("mid".to_string(), 0)).unwrap();
+        assert_eq!(
+            drain(),
+            (Some(("mid".to_string(), 0)), false),
+            "the event queued behind the wake"
+        );
+        assert_eq!(drain(), (None, false), "nothing left queued");
     }
 
     /// The first fragment's wake is not an event: the writer takes what

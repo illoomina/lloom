@@ -1898,7 +1898,7 @@ pub struct SessionConfig {
         status = "advanced"
     )]
     pub capacity: usize,
-    /// MiB of host memory the stored sessions' ids and messages may hold; past it the least recently used go.
+    /// MiB of dynamic allocation requests retained by stored/ephemeral sessions and release history, including capacities and shared replies charged per owner. A lineage that cannot fit is released after successful generation; fixed slots, allocator overhead and transient copies are separate.
     #[opt(
         flag = "session-max-mib",
         path = "session.max_mib",

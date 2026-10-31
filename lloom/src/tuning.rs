@@ -254,6 +254,15 @@ pub struct Lfm2Tuning {
     /// The FlashDecoding partial kernel's block width: 8 or 32 (the kernels differ only in this geometry).
     #[opt(flag = "flash-partial-bn", env = "LLOOM_FLASH_PARTIAL_BN", parser = "parse_flash_bn", variants = ["8", "32"], path = "kernels.attention.flash.partial_block", status = "arm")]
     pub flash_partial_bn: usize,
+    /// Read B=1 continuation prefill directly from compatible paged KV, retaining the gathered path otherwise. An opt-in arm until end-to-end measurements justify a default.
+    #[opt(
+        flag = "lfm2-paged-prefill",
+        env = "LLOOM_LFM2_PAGED_PREFILL",
+        bool,
+        path = "kernels.attention.paged_prefill",
+        status = "arm"
+    )]
+    pub paged_prefill: bool,
     /// Keys from which a one-query attention takes the 2-pass vector kernel instead of the single-pass one, at every head dim; 0 = the measured threshold per head dim and dtype (`nn::ops::sdpa_vector_two_pass_from`, the arm). Moves digests at the lengths it moves.
     #[opt(
         flag = "sdpa-two-pass-k",
@@ -338,6 +347,7 @@ impl Default for Lfm2Tuning {
             skip_silu_mul: false,
             rows_arm: "batched".into(),
             flash_partial_bn: 32,
+            paged_prefill: false,
             sdpa_two_pass_k: crate::nn::ops::SDPA_TWO_PASS_K_THRESHOLD,
             norm_gemv: false,
             fusion_budget: "rounding".into(),

@@ -697,6 +697,18 @@ impl std::ops::Deref for MetalDevice {
 /// ids or a weight staging buffer is not.
 pub const SMALL_UPLOAD_BYTES: usize = 32 * 1024;
 
+#[cfg(any(debug_assertions, feature = "profile"))]
+static HOST_UPLOADS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Host-to-device uploads made in this process (`new_buffer_with_data`, every
+/// `Tensor::new` on Metal and every by-value constant miss). Debug and profile
+/// builds only; a test reads its delta across decode steps to assert a step
+/// uploads nothing (`profiles-and-memory-design.md` §4.6).
+#[cfg(any(debug_assertions, feature = "profile"))]
+pub fn host_upload_count() -> u64 {
+    HOST_UPLOADS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Device buffers keyed by their contents (`MetalDevice::constant_buffer`).
 ///
 /// A kernel's argument block is a value: the same bytes every step until a
@@ -4021,6 +4033,8 @@ impl MetalDevice {
         data: &[T],
         context: Option<&crate::memory_admission::AllocationContext>,
     ) -> Result<BufferHandle> {
+        #[cfg(any(debug_assertions, feature = "profile"))]
+        HOST_UPLOADS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let unpooled_uploads = Self::unpooled;
         let size = core::mem::size_of_val(data);
         // Metal refuses a zero-length `newBufferWithBytes`, and an empty tensor

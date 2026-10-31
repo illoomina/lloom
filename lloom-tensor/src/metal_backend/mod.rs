@@ -45,6 +45,8 @@ pub use device::{
     served_pass_request_sites, set_admission_drain, set_served_request_trace, wire_weights_on,
     DeviceId, MetalDevice, PassPlansPaused,
 };
+#[cfg(any(debug_assertions, feature = "profile"))]
+pub use device::host_upload_count;
 mod host_fed;
 mod host_slot;
 mod sampling_multinomial;

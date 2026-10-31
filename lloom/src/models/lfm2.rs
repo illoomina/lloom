@@ -1808,17 +1808,30 @@ pub struct PagedKv {
     pass_len: usize,
     /// `[n_seqs * pass_len]` U32: the token slot of each `(sequence, token)`
     /// this pass writes, and the largest of them (checked against the pool by
-    /// the scatter without a readback).
+    /// the scatter without a readback). A field of the pass's step frame for
+    /// one sequence, else an upload of its own.
     slots: Option<Tensor>,
-    /// Host staging reused across passes; device uploads remain immutable while queued.
+    /// Host staging reused across passes.
     slot_staging: Vec<u32>,
-    /// One live count for every attention layer of a one-sequence decode pass.
-    /// Replaced, never overwritten: preceding GPU readers retain the old upload.
+    /// One live count for every attention layer of a one-sequence decode pass:
+    /// the step frame's field. A queued step keeps reading its own frame,
+    /// which no later pass writes until that step has completed (§4.6).
     live_count: Option<Tensor>,
     max_slot: usize,
-    /// Every sequence's chunk table, `table_stride` entries each.
+    /// The one-sequence passes' step frames: the live count and the write
+    /// slots, written by the host, bound by the kernels (§4.6).
+    frames: crate::nn::step_frame::OwnedFrames,
+    /// Every sequence's chunk table. Several sequences: `table_stride`
+    /// entries each, rebuilt per pass. One sequence: the chunks of every page
+    /// it holds, appended as pages are added and cleared only when it is
+    /// released, so a pass reads its first `table_stride` entries and a
+    /// decode step rebuilds nothing.
     table: Vec<u32>,
     table_stride: usize,
+    /// Pages the one sequence held when `table` was last extended.
+    table_pages: usize,
+    /// `table` was cleared by a release: the resident copy's prefix is stale.
+    table_reset: bool,
     /// Per-page indices for the own-cache multi-query reader, independent of decode chunks.
     prefill_table: Vec<u32>,
     /// `table` resident on the device for the one-sequence read: `U32`, sized
@@ -1861,8 +1874,11 @@ impl PagedKv {
             slot_staging: Vec::new(),
             live_count: None,
             max_slot: 0,
+            frames: Default::default(),
             table: Vec::new(),
             table_stride: 0,
+            table_pages: 0,
+            table_reset: false,
             prefill_table: Vec::new(),
             table_t: None,
             table_written: 0,
@@ -2025,41 +2041,99 @@ impl PagedKv {
         self.len = start + seq_len;
         self.pass_len = seq_len;
         self.max_slot = slots.iter().copied().max().unwrap_or(0) as usize;
-        self.slots = Some(Tensor::new(slots.as_slice(), device)?);
-        self.live_count = if n_seqs == 1 && seq_len == 1 {
-            Some(Tensor::new(&[self.len as u32], device)?)
-        } else {
-            None
-        };
 
         // The chunk tables the reader is handed, one per sequence, all the
         // same length because the batch is lockstep.
         let n_chunks = self.len.div_ceil(self.page_size * self.pages_per_chunk);
         self.table_stride = n_chunks;
-        self.table.clear();
-        for s in 0..n_seqs {
-            if !pool.chunk_pages_are_contiguous(s, self.pages_per_chunk) {
-                lloom_tensor::bail!(
-                    "lfm2 paged KV: sequence {s}'s pages do not form contiguous chunks at \
-                     pages_per_chunk={}; a recycled pool needs `--flash-k 1` (DESIGN.md 10.3d)",
-                    self.pages_per_chunk
-                )
+        if n_seqs == 1 {
+            // Pages are only ever added to a held sequence (a rewind keeps
+            // them, §10.2a), so its table only grows: extended at a page
+            // boundary, never rebuilt on a step.
+            let held = pool.seq(0).expect("sequence 0").pages();
+            if held.len() != self.table_pages {
+                if !pool.chunk_pages_are_contiguous(0, self.pages_per_chunk) {
+                    lloom_tensor::bail!(
+                        "lfm2 paged KV: sequence 0's pages do not form contiguous chunks at \
+                         pages_per_chunk={}; a recycled pool needs `--flash-k 1` (DESIGN.md 10.3d)",
+                        self.pages_per_chunk
+                    )
+                }
+                let k = self.pages_per_chunk.max(1);
+                for c in self.table.len()..held.len().div_ceil(k) {
+                    self.table.push(held[c * k].0);
+                }
+                self.table_pages = held.len();
             }
-            let before = self.table.len();
-            pool.extend_table_for(s, self.pages_per_chunk, &mut self.table);
-            debug_assert_eq!(self.table.len() - before, n_chunks);
+            debug_assert!(self.table.len() >= n_chunks);
+        } else {
+            self.table.clear();
+            for s in 0..n_seqs {
+                if !pool.chunk_pages_are_contiguous(s, self.pages_per_chunk) {
+                    lloom_tensor::bail!(
+                        "lfm2 paged KV: sequence {s}'s pages do not form contiguous chunks at \
+                         pages_per_chunk={}; a recycled pool needs `--flash-k 1` (DESIGN.md 10.3d)",
+                        self.pages_per_chunk
+                    )
+                }
+                // A rewind keeps its pages, so a sequence may hold more
+                // chunks than its live length reads; every table is cut to
+                // the stride the reader walks.
+                let before = self.table.len();
+                pool.extend_table_for(s, self.pages_per_chunk, &mut self.table);
+                debug_assert!(self.table.len() - before >= n_chunks);
+                self.table.truncate(before + n_chunks);
+            }
         }
         self.prefill_table.clear();
         if n_seqs == 1 && seq_len > 1 && crate::tuning::tuning().lfm2.paged_prefill {
             pool.extend_table_for(0, 1, &mut self.prefill_table);
         }
+        self.publish_pass(n_seqs, seq_len, device)?;
         self.sync_resident_table(n_seqs, device)?;
         Ok(())
     }
 
+    /// Hand the pass's write slots and (for a one-sequence decode step) its
+    /// live count to the kernels: through a step frame when one is free, so
+    /// the step uploads nothing, else as uploads of their own.
+    fn publish_pass(&mut self, n_seqs: usize, seq_len: usize, device: &Device) -> Result<()> {
+        use crate::nn::step_frame::{StepFrames, LINE_WORDS};
+        // Word 0 the live count, then the slots: one line per frame.
+        const COUNT: usize = 0;
+        const SLOTS: usize = 1;
+        if n_seqs == 1 && seq_len < LINE_WORDS {
+            if let Device::Metal(m) = device {
+                if self.frames.0.is_none() {
+                    self.frames.0 = Some(StepFrames::new(m, Arc::clone(&self.clock), LINE_WORDS)?);
+                }
+                let ring = self.frames.0.as_mut().expect("created above");
+                if let Some(f) = ring.take()? {
+                    ring.write(f, COUNT, &[self.len as u32])?;
+                    ring.write(f, SLOTS, &self.slot_staging)?;
+                    self.slots = Some(ring.field(f, SLOTS, seq_len)?);
+                    self.live_count = if seq_len == 1 {
+                        Some(ring.field(f, COUNT, 1)?)
+                    } else {
+                        None
+                    };
+                    return Ok(());
+                }
+            }
+        }
+        self.slots = Some(Tensor::new(self.slot_staging.as_slice(), device)?);
+        self.live_count = if n_seqs == 1 && seq_len == 1 {
+            Some(Tensor::new(&[self.len as u32], device)?)
+        } else {
+            None
+        };
+        Ok(())
+    }
+
     /// Keep the one-sequence resident table in step with `table`: append the
-    /// new entries in place, or start a fresh tensor when the written prefix
-    /// changed or the batch is not one sequence (then the read binds by value).
+    /// new entries in place, or start a fresh tensor after a release (the
+    /// prefix the queued steps read changed) or when the batch is not one
+    /// sequence (then the read binds by value).
     fn sync_resident_table(&mut self, n_seqs: usize, device: &Device) -> Result<()> {
         if n_seqs != 1 || !device.is_metal() {
             self.table_t = None;
@@ -2072,16 +2146,19 @@ impl PagedKv {
             .max(self.table.len());
         let fresh = match &self.table_t {
             Some(t) => {
-                t.elem_count() < self.table.len() || self.table_written > self.table.len() || {
-                    // The written prefix must still be the table's prefix
-                    // (a host compare against what was written; never a
-                    // device read on the step).
-                    let written = self.table_written.min(self.table.len());
-                    self.table_shadow[..written] != self.table[..written]
-                }
+                self.table_reset
+                    || t.elem_count() < self.table.len()
+                    || self.table_written > self.table.len()
             }
             None => true,
         };
+        // Between releases the table only grows, so what was written is
+        // still its prefix; checked against the host's copy, never the device.
+        debug_assert!(
+            fresh || self.table_shadow[..self.table_written] == self.table[..self.table_written],
+            "lfm2 paged KV: the resident table's prefix changed without a release"
+        );
+        self.table_reset = false;
         if fresh {
             let mut init = self.table.clone();
             init.resize(capacity, 0);
@@ -2177,7 +2254,14 @@ impl PagedKv {
         self.max_slot = 0;
         self.table.clear();
         self.table_stride = 0;
+        self.table_pages = 0;
+        self.table_reset = true;
         self.prefill_table.clear();
+    }
+
+    /// The chunk tables a pass reads: `table_stride` entries per sequence.
+    fn read_table(&self) -> &[u32] {
+        &self.table[..self.n_seqs.max(1) * self.table_stride]
     }
 
     /// Discard the last `n` positions of every sequence: a length decrement,
@@ -2262,7 +2346,17 @@ impl PagedKv {
     /// its table and computing the token slots the write scatters to and
     /// the tables the read walks. Runs once per pass, at its first attention
     /// layer; every layer of the pass reuses the result.
-    fn begin_rows(&mut self, rows: &[(usize, usize)], device: &Device) -> Result<RowsPass> {
+    ///
+    /// `framed`: the pass is the batch's one pass, open until the next one
+    /// begins, so its fields may live in a step frame (§4.6). A row's own
+    /// pass in the per-row loop is not: the next row's pass begins while
+    /// this one's later layers are still to be encoded.
+    fn begin_rows(
+        &mut self,
+        rows: &[(usize, usize)],
+        framed: bool,
+        device: &Device,
+    ) -> Result<RowsPass> {
         let (pool_pages, page_size, ppc) =
             (self.pool_pages(), self.page_size, self.pages_per_chunk);
         let pool = self
@@ -2328,11 +2422,24 @@ impl PagedKv {
             t.resize(table_stride, 0);
             tables.extend(t);
         }
-        // Uploaded here, once, and bound by every attention layer of the pass
-        // (`flash_decoding_paged_ragged_bound`): the per-layer upload was the
-        // pool arm's per-row host cost (§12.8).
-        let tables_t = Tensor::new(tables.as_slice(), device)?;
-        let n_keys_t = Tensor::new(n_keys.as_slice(), device)?;
+        // A pass of decode rows only hands its counts, slots, positions and
+        // tables to the kernels through a step frame (§4.6); any other pass,
+        // or one finding every frame queued, uploads them once, and every
+        // attention layer binds them (`flash_decoding_paged_ragged_bound`).
+        let framed = if framed && rows.iter().all(|&(_, n)| n == 1) {
+            self.frame_rows(device, &n_keys, &slots, &prev, &tables, table_stride)?
+        } else {
+            None
+        };
+        let (slots_t, tables_t, n_keys_t, pos_t) = match framed {
+            Some(f) => (f.slots, f.tables, f.n_keys, Some(f.pos)),
+            None => (
+                Tensor::new(slots.as_slice(), device)?,
+                Tensor::new(tables.as_slice(), device)?,
+                Tensor::new(n_keys.as_slice(), device)?,
+                None,
+            ),
+        };
         let dec_rows: Vec<usize> = (0..rows.len()).filter(|&r| rows[r].1 == 1).collect();
         let dec = if dec_rows.is_empty() || dec_rows.len() == rows.len() {
             None
@@ -2353,7 +2460,7 @@ impl PagedKv {
         };
         Ok(RowsPass {
             rows: rows.to_vec(),
-            slots: Tensor::new(slots.as_slice(), device)?,
+            slots: slots_t,
             max_slot,
             tables,
             table_stride,
@@ -2362,8 +2469,61 @@ impl PagedKv {
             prev,
             tables_t,
             n_keys_t,
+            pos_t,
             dec,
         })
+    }
+
+    /// Write a decode pass's per-row fields into the shared pool's next step
+    /// frame and return them as views, or `None` when no frame is free or
+    /// the pass's tables do not fit one (the caller uploads them).
+    ///
+    /// A frame holds, for every slot the pool has: the live count, the KV
+    /// write slot and the position of the row in that place of the pass, and
+    /// its chunk table, at the pass's table stride.
+    fn frame_rows(
+        &mut self,
+        device: &Device,
+        n_keys: &[u32],
+        slots: &[u32],
+        prev: &[usize],
+        tables: &[u32],
+        table_stride: usize,
+    ) -> Result<Option<FramedRows>> {
+        use crate::nn::step_frame::StepFrames;
+        let Device::Metal(m) = device else {
+            return Ok(None);
+        };
+        let r = self.n_seqs.max(1);
+        let rows = n_keys.len();
+        let chunk = (self.page_size * self.pages_per_chunk).max(1);
+        let table_cap = self.kv_capacity.div_ceil(chunk).min(MAX_FRAMED_CHUNKS);
+        if rows > r || table_stride > table_cap {
+            return Ok(None);
+        }
+        if self.frames.0.is_none() {
+            self.frames.0 = Some(StepFrames::new(
+                m,
+                Arc::clone(&self.clock),
+                3 * r + r * table_cap,
+            )?);
+        }
+        let ring = self.frames.0.as_mut().expect("created above");
+        let Some(f) = ring.take()? else {
+            return Ok(None);
+        };
+        let (count_at, slot_at, pos_at, table_at) = (0, r, 2 * r, 3 * r);
+        let pos: Vec<u32> = prev.iter().map(|&p| p as u32).collect();
+        ring.write(f, count_at, n_keys)?;
+        ring.write(f, slot_at, slots)?;
+        ring.write(f, pos_at, &pos)?;
+        ring.write(f, table_at, tables)?;
+        Ok(Some(FramedRows {
+            n_keys: ring.field(f, count_at, rows)?,
+            slots: ring.field(f, slot_at, rows)?,
+            pos: ring.field(f, pos_at, rows)?,
+            tables: ring.field(f, table_at, rows * table_stride)?,
+        }))
     }
 
     /// Write one layer's K and V for a pass: `k`/`v` are `[1, H_kv, T, D]`
@@ -2504,13 +2664,31 @@ pub(crate) struct RowsPass {
     pages: Vec<Vec<u32>>,
     /// Every row's live length BEFORE the pass.
     prev: Vec<usize>,
-    /// `tables` and `n_keys` on the device, `U32`, uploaded once per pass.
+    /// `tables` and `n_keys` on the device, `U32`: a step frame's fields
+    /// for a decode pass, else uploaded once per pass.
     tables_t: Tensor,
     n_keys_t: Tensor,
+    /// Every row's position, `U32`, for the rotation's table gather: a step
+    /// frame's field for a decode pass, else `None` (the layer uploads it).
+    pos_t: Option<Tensor>,
     /// The one-token rows' own tables and counts when the pass also feeds
     /// longer rows (a piece, a verify window); `None` when every row is a
     /// decode row (the whole pass is the subset) or none is.
     dec: Option<DecRows>,
+}
+
+/// Chunks of a row's table a shared pool's step frame holds; a pass whose
+/// tables are wider uploads them.
+#[cfg(feature = "metal")]
+const MAX_FRAMED_CHUNKS: usize = 512;
+
+/// A decode pass's per-row fields, as views of its step frame.
+#[cfg(feature = "metal")]
+struct FramedRows {
+    n_keys: Tensor,
+    slots: Tensor,
+    pos: Tensor,
+    tables: Tensor,
 }
 
 /// The decode rows of a pass with longer rows beside them: their pass
@@ -2558,6 +2736,8 @@ struct BatchInner {
     /// The batched conv arm's `(slots, phases)` index buffers, reused while
     /// the rows and phases are those they were built for.
     row_index: Option<RowIndex>,
+    /// The step frames `row_index` lives in (§4.6): slots, then phases.
+    conv_frames: crate::nn::step_frame::OwnedFrames,
     /// The conv rings after a page's LAST token, keyed by the page: taken
     /// when a row's pass begins at a page boundary, dropped when the page's
     /// last referent goes. What a row sharing the page starts its own ring
@@ -2617,6 +2797,38 @@ impl BatchInner {
         for p in freed {
             self.snapshots.remove(&p);
         }
+    }
+
+    /// The batched conv arm's row slots and phases written into the next
+    /// conv step frame, as views; `None` when no frame is free (the caller
+    /// uploads them).
+    fn frame_conv_rows(
+        &mut self,
+        device: &Device,
+        slots: &[u32],
+        phases: &[u32],
+    ) -> Result<Option<(Tensor, Tensor)>> {
+        use crate::nn::step_frame::StepFrames;
+        let Device::Metal(m) = device else {
+            return Ok(None);
+        };
+        let r = self.slots.max(1);
+        if slots.len() > r {
+            return Ok(None);
+        }
+        if self.conv_frames.0.is_none() {
+            self.conv_frames.0 = Some(StepFrames::new(m, Arc::clone(&self.kv.clock), 2 * r)?);
+        }
+        let ring = self.conv_frames.0.as_mut().expect("created above");
+        let Some(f) = ring.take()? else {
+            return Ok(None);
+        };
+        ring.write(f, 0, slots)?;
+        ring.write(f, r, phases)?;
+        Ok(Some((
+            ring.field(f, 0, slots.len())?,
+            ring.field(f, r, phases.len())?,
+        )))
     }
 }
 
@@ -2682,6 +2894,7 @@ impl BatchPool {
                     slots,
                     free: (0..slots).rev().collect(),
                     row_index: None,
+                    conv_frames: Default::default(),
                     snapshots: HashMap::new(),
                     batched_arms: crate::tuning::tuning().lfm2.rows_arm != "per-row",
                     shared_calls: 0,
@@ -7017,7 +7230,7 @@ impl<P: Profile> Attention<P> {
             for c in caches.iter_mut() {
                 c.paged_pass_pending = false;
             }
-            let pass = Arc::new(pool.inner.lock().kv.begin_rows(rows, device)?);
+            let pass = Arc::new(pool.inner.lock().kv.begin_rows(rows, true, device)?);
             for c in caches.iter_mut() {
                 if let Some(b) = c.shared_mut() {
                     b.pass = Some(pass.clone());
@@ -7066,15 +7279,6 @@ impl<P: Profile> Attention<P> {
         let k = k.contiguous()?;
         let v = v.contiguous()?;
 
-        // RoPE at every row's own position: the tables' rows gathered per
-        // batch row, `[B, 1, D/2]`, which the rope kernel indexes per batch.
-        let pos: Vec<u32> = rows.iter().map(|r| r.pos as u32).collect();
-        let pos_t = Tensor::new(pos.as_slice(), &device)?;
-        let cos = rows[0].cache.cos.index_select(&pos_t, 0)?.unsqueeze(1)?;
-        let sin = rows[0].cache.sin.index_select(&pos_t, 0)?.unsqueeze(1)?;
-        let q = crate::nn::rotary_emb::rope(&q, &cos, &sin)?;
-        let k = crate::nn::rotary_emb::rope(&k, &cos, &sin)?;
-
         let pool = rows[0].cache.shared().expect("checked").pool.clone();
         let slots: Vec<(usize, usize)> = rows
             .iter()
@@ -7086,6 +7290,23 @@ impl<P: Profile> Attention<P> {
             .kv_capacity
             .div_ceil((self.flash_page_size * self.flash_pages_per_chunk).max(1));
         drop(caches);
+
+        // RoPE at every row's own position: the tables' rows gathered per
+        // batch row, `[B, 1, D/2]`, which the rope kernel indexes per batch.
+        // The positions are the pass's step frame field when it has one and
+        // every row sits at its slot's length (the frame holds the length).
+        let at_len = rows.iter().zip(&pass.prev).all(|(r, &p)| r.pos == p);
+        let pos_t = match &pass.pos_t {
+            Some(t) if at_len => t.clone(),
+            _ => {
+                let pos: Vec<u32> = rows.iter().map(|r| r.pos as u32).collect();
+                Tensor::new(pos.as_slice(), &device)?
+            }
+        };
+        let cos = rows[0].cache.cos.index_select(&pos_t, 0)?.unsqueeze(1)?;
+        let sin = rows[0].cache.sin.index_select(&pos_t, 0)?.unsqueeze(1)?;
+        let q = crate::nn::rotary_emb::rope(&q, &cos, &sin)?;
+        let k = crate::nn::rotary_emb::rope(&k, &cos, &sin)?;
 
         let (pk, pv) = {
             let mut g = pool.inner.lock();
@@ -7551,7 +7772,7 @@ impl<P: Profile> Attention<P> {
                                             .inner
                                             .lock()
                                             .kv
-                                            .begin_rows(&[(slot, seq_len)], &device)?,
+                                            .begin_rows(&[(slot, seq_len)], false, &device)?,
                                     );
                                     b.pass = Some(pass.clone());
                                     pass
@@ -7706,7 +7927,7 @@ impl<P: Profile> Attention<P> {
                             self.flash_pages_per_chunk,
                             self.flash_scratch_sizing,
                             reserve_chunks,
-                            &paged.table,
+                            paged.read_table(),
                             paged.table_stride,
                             &[paged.len as u32],
                             table,
@@ -7723,7 +7944,7 @@ impl<P: Profile> Attention<P> {
                             self.flash_pages_per_chunk,
                             self.flash_scratch_sizing,
                             reserve_chunks,
-                            &paged.table,
+                            paged.read_table(),
                             paged.table_stride,
                             paged.len,
                             paged.table_t.as_ref(),
@@ -8607,11 +8828,18 @@ impl<P: Profile> ShortConv<P> {
                 None => true,
             };
             if fresh {
+                let (slots_t, phases_t) = match g.frame_conv_rows(&device, &slots, &phases)? {
+                    Some(views) => views,
+                    None => (
+                        Tensor::new(slots.as_slice(), &device)?,
+                        Tensor::new(phases.as_slice(), &device)?,
+                    ),
+                };
                 g.row_index = Some(RowIndex {
                     slots: slots.clone(),
                     phases: phases.clone(),
-                    slots_t: Tensor::new(slots.as_slice(), &device)?,
-                    phases_t: Tensor::new(phases.as_slice(), &device)?,
+                    slots_t,
+                    phases_t,
                 });
             }
             let ix = g.row_index.as_ref().expect("set above");

@@ -550,10 +550,10 @@ pub unsafe fn call_shortconv_ring(
     weights: BufferOffset,
     dst: &Buffer,
     // `params.per_row == 1`: `u32` per batch row, the ring of the state pool
-    // row `b` writes and the phase it writes at. Unread at `per_row == 0`
-    // (bind any buffer).
-    row_slots: &Buffer,
-    row_phases: &Buffer,
+    // row `b` writes and the phase it writes at, from each one's offset.
+    // Unread at `per_row == 0` (bind any buffer).
+    row_slots: BufferOffset,
+    row_phases: BufferOffset,
 ) -> Result<(), MetalKernelError> {
     // SAFETY: this function's contract (# Safety above).
     unsafe {
@@ -595,8 +595,8 @@ pub unsafe fn call_shortconv_ring_with(
     state: BufferOffset,
     weights: BufferOffset,
     dst: &Buffer,
-    row_slots: &Buffer,
-    row_phases: &Buffer,
+    row_slots: BufferOffset,
+    row_phases: BufferOffset,
     style: ParamStyle,
 ) -> Result<(), MetalKernelError> {
     let pipeline = kernels.load_pipeline(device, Source::Conv, style.kernel_name(name))?;
@@ -635,8 +635,8 @@ pub unsafe fn call_shortconv_ring_with(
                 Output::from_buffer_offset(&state),
                 &weights,
                 Output::new(dst),
-                row_slots,
-                row_phases
+                &row_slots,
+                &row_phases
             )
         );
     }

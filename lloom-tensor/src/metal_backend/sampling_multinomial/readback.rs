@@ -6,7 +6,7 @@ use super::{
     PrivateMultinomial,
 };
 use crate::backend::{BackendDevice, BackendStorage};
-use crate::kernels::metal::GpuClock;
+use crate::kernels::metal::{CommandMarker, GpuClock};
 use crate::metal_backend::{HostSlot, MetalDevice};
 use crate::{DType, MetalError, MetalStorage, Result, Storage};
 use std::sync::Arc;
@@ -21,12 +21,17 @@ pub(super) struct SampleReadback {
     clock: Arc<GpuClock>,
     capacity: usize,
     words: Vec<u32>,
-    pending: Option<(
-        crate::retire::Epoch,
-        PrivateMultinomial,
-        Option<MetalStorage>,
-    )>,
+    pending: Option<PendingSnapshot>,
     poisoned: bool,
+}
+
+/// The copy's recording is captured under the same encoder guard as its
+/// dispatches. A callback clock may lag this recording's own data completion.
+struct PendingSnapshot {
+    epoch: crate::retire::Epoch,
+    marker: Option<CommandMarker>,
+    sample: PrivateMultinomial,
+    error: Option<MetalStorage>,
 }
 
 /// Only constructed after the entire completed result has passed validation.
@@ -125,7 +130,12 @@ impl SampleReadback {
             crate::bail!("sampling readback capacity/device mismatch");
         }
         if sample.rows == 0 && error.is_none() {
-            self.pending = Some((self.clock.current_epoch(), sample, error));
+            self.pending = Some(PendingSnapshot {
+                epoch: self.clock.current_epoch(),
+                marker: None,
+                sample,
+                error,
+            });
             return Ok(());
         }
         self.poisoned = true;
@@ -133,9 +143,15 @@ impl SampleReadback {
         // CommandsGuard holds the recording-state exclusion: neither a cut
         // nor a concurrent commit can change this epoch between these copies.
         let epoch = self.clock.current_epoch();
-        self.pending = Some((epoch, sample, error));
-        let sample = &self.pending.as_ref().expect("stored above").1;
-        let error = self.pending.as_ref().expect("stored above").2.as_ref();
+        self.pending = Some(PendingSnapshot {
+            epoch,
+            marker: Some(encoder.recording_marker()),
+            sample,
+            error,
+        });
+        let pending = self.pending.as_ref().expect("stored above");
+        let sample = &pending.sample;
+        let error = pending.error.as_ref();
         for item in [
             Some((&sample.status, sample.rows * 4, 0)),
             Some((&sample.ids, sample.rows, sample.rows * 16)),
@@ -181,12 +197,49 @@ impl SampleReadback {
         if self.poisoned {
             crate::bail!("sampling readback is poisoned");
         }
-        let Some((epoch, sample, error)) = self.pending.as_ref() else {
+        let Some(pending) = self.pending.as_ref() else {
             return Ok(None);
         };
-        if (sample.rows != 0 || error.is_some()) && !self.clock.is_complete(*epoch) {
+        if pending.marker.is_some() && !self.clock.is_complete(pending.epoch) {
             return Ok(None);
         }
+        self.read_completed()
+    }
+
+    /// Commit pending work, wait for this snapshot's exact copy recording and
+    /// validate it. Unlike `poll`, this boundary needs own data/error readiness,
+    /// not arbitrary completion callbacks or their queue clock. It cannot be
+    /// authenticated by a marker supplied by another caller or a later epoch.
+    /// The retained recording also distinguishes reused Metal4 slots.
+    pub fn read_committed(&mut self) -> Result<Option<CheckedSample<'_>>> {
+        self.device
+            .commands()
+            .check_failed_atomic()
+            .map_err(MetalError::from)?;
+        if self.poisoned {
+            crate::bail!("sampling readback is poisoned");
+        }
+        let Some(pending) = self.pending.as_ref() else {
+            return Ok(None);
+        };
+        if let Some(marker) = pending.marker.as_ref() {
+            // wait_marker authenticates and submits an uncommitted owner
+            // recording itself. Do not flush an unrelated later tail or force
+            // allocation of a replacement command buffer just for this read.
+            self.device.wait_marker(marker)?;
+        }
+        self.read_completed()
+    }
+
+    /// Caller has authenticated completion through either the conservative
+    /// callback clock or the snapshot's exact own-data recording.
+    fn read_completed(&mut self) -> Result<Option<CheckedSample<'_>>> {
+        let pending = self
+            .pending
+            .as_ref()
+            .expect("completion requires a snapshot");
+        let sample = &pending.sample;
+        let error = pending.error.as_ref();
         self.device
             .commands()
             .check_failed_atomic()

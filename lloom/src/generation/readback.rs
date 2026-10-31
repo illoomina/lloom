@@ -122,6 +122,11 @@ pub struct ReadbackCounters {
 /// [`Self::admits_lookahead`] says the answer is not already known at feed
 /// time.
 pub trait ReadbackStrategy {
+    /// Physical input allocation contract inside the driver pass. Existing
+    /// strategies feed token IDs; a prepared-embedding strategy must override
+    /// this witness, and wrappers must preserve their inner strategy's witness.
+    const PASS_INPUT: lloom_tensor::backend::PassInput = lloom_tensor::backend::PassInput::TokenIds;
+
     /// The device the strategy's tensors live on; the loop's uploads and its
     /// periodic commit go through it.
     fn device(&self) -> &Device;

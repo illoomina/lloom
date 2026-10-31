@@ -168,6 +168,18 @@ impl AsRef<ComputeCommandEncoder> for CommandsGuard<'_> {
 }
 
 impl CommandsGuard<'_> {
+    /// Pin the exact recording while the canonical encoder guard excludes a
+    /// cut. This is a data-completion identity, not a committed epoch or a
+    /// callback-prefix receipt. Waiting before commit remains owner-authenticated.
+    pub(crate) fn recording_marker(&self) -> CommandMarker {
+        CommandMarker {
+            cb: self.as_ref().command_buffer.clone(),
+            // The signal is minted at commit, after this guard is released.
+            // A pending wait therefore uses the existing own-data fallback.
+            signalled: None,
+        }
+    }
+
     pub(crate) fn retain_namespace(
         &mut self,
         owner: crate::metal_backend::device_retirement::NamespaceOwner,

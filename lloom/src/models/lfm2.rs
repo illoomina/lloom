@@ -12925,6 +12925,38 @@ mod tests {
         Ok(())
     }
 
+    /// A rewind keeps its pages (§10.2a), so a sequence can hold more chunks
+    /// than its live length reads. Every sequence's table in a lockstep pass
+    /// must still start at `s * table_stride` and name that sequence's own
+    /// pages: built from every held page and strided by the live chunk count,
+    /// sequence 1 would read sequence 0's retained page.
+    #[cfg(feature = "metal")]
+    #[test]
+    fn a_rewound_lockstep_batch_reads_each_sequence_its_own_table() -> Result<()> {
+        let _pool = lloom_tensor::AutoreleaseScope::new();
+        let device = Device::new_metal(0)?;
+        let Device::Metal(m) = &device else {
+            unreachable!()
+        };
+        let config = Config {
+            flash_page_size: 4,
+            flash_pages_per_chunk: 1,
+            ..Default::default()
+        };
+        let mut paged = PagedKv::new(&config, 64, 64, 1, m.gpu_clock())?;
+        paged.begin_pass(2, 9, &device)?; // 9 tokens each: 3 pages each
+        paged.rewind(2)?; // 7 live, 3 pages still held
+        paged.begin_pass(2, 1, &device)?; // 8 live: 2 chunks read
+        assert_eq!(paged.table_stride, 2);
+        let pages = paged.pool.as_ref().expect("a pass ran").pages();
+        let want: Vec<u32> = (0..2)
+            .flat_map(|s| pages.table_for(s, 1)[..2].to_vec())
+            .collect();
+        assert_ne!(want[2], 2, "sequence 1's pages are not sequence 0's");
+        assert_eq!(paged.read_table(), want.as_slice());
+        Ok(())
+    }
+
     /// The unfused `Shuffle` decode step takes no spare state: the spare is
     /// the fused step's (it writes the next state there and swaps), and a
     /// step that does not take the fused arm asked for one, zeroed it and

@@ -114,6 +114,11 @@ fn an_unserved_triple_is_refused_by_name() -> Result<()> {
         assert!(e.contains(text) && e.contains("q8_0"), "{e}");
         assert!(project(&x, &w, spec(t, 1)).is_err());
     }
+    let copy = Weight::Blocks(QMatMul::Tensor(weights(&dev)?));
+    let e = project(&x.to_dtype(DType::F16)?, &copy, spec(Triple::F16, 1))
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("dequantize_all"), "{e}");
     let dense = Weight::Dense(Linear::new(weights(&dev)?, None));
     let e = resolve(&dense, &spec(Triple::F16, 1), DType::F16)
         .unwrap_err()

@@ -127,6 +127,8 @@ impl std::fmt::Display for Resolved {
     }
 }
 
+const F32_COPY: &str = "the f32 copy `qmm.dequantize_all` makes at load reads f32 activations";
+
 fn refuse(w: &Weight, spec: &Spec, why: &str) -> lloom_tensor::Error {
     lloom_tensor::Error::msg(format!(
         "projection over {} [{:?}] at {} × {} rows: {why}",
@@ -177,7 +179,12 @@ pub fn resolve(w: &Weight, spec: &Spec, input: DType) -> Result<Resolved> {
             }
             Route::Dense(t.act)
         }
-        Weight::Blocks(QMatMul::Tensor(_)) => Route::Dequantized(DType::F32),
+        Weight::Blocks(QMatMul::Tensor(_)) => {
+            if t.act != DType::F32 {
+                return Err(refuse(w, spec, F32_COPY));
+            }
+            Route::Dequantized(DType::F32)
+        }
         Weight::Blocks(QMatMul::TensorF16(_)) => Route::Dequantized(DType::F16),
         Weight::Blocks(QMatMul::QTensor(q)) => packed_route(q, w, spec)?,
     };
@@ -228,14 +235,18 @@ pub fn project(x: &Tensor, w: &Weight, spec: Spec) -> Result<Tensor> {
     if t.acc != DType::F32 || t.store != t.act {
         return Err(refuse(w, &spec, "an unserved triple"));
     }
-    if let Weight::Dense(l) = w {
-        if l.weight().dtype() != t.act {
+    match w {
+        Weight::Dense(l) if l.weight().dtype() != t.act => {
             return Err(refuse(
                 w,
                 &spec,
                 "a dense weight is read at its own dtype; the triple's activation leg must match it",
             ));
         }
+        Weight::Blocks(QMatMul::Tensor(_)) if t.act != DType::F32 => {
+            return Err(refuse(w, &spec, F32_COPY));
+        }
+        _ => {}
     }
     let cast;
     let x = if x.dtype() == t.act {

@@ -476,6 +476,19 @@ impl TokenRing {
         Ok(())
     }
 
+    /// Reuse the existing event notification after a guarded stamp. The event
+    /// is a wakeup, not token-validity proof: readers still inspect the stamp,
+    /// and the producer independently checks request errors when it is absent.
+    #[cfg(feature = "metal")]
+    pub(crate) fn signal_publication(&self, generation: u32) -> Result<()> {
+        if self.publish_armed.get() {
+            if let Some(ev) = &*self.publish_event.borrow() {
+                ev.encode_signal(generation as u64)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Stamp the generation counter after the writes it certifies, WITHOUT a
     /// per-call allocation — the completion marker the host WFE-waits on and
     /// the drain clamps to ([`Self::published_generation`]).
@@ -507,11 +520,7 @@ impl TokenRing {
         if device.is_metal() {
             device.ring_stamp(&self.step, generation, certified)?;
             #[cfg(feature = "metal")]
-            if self.publish_armed.get() {
-                if let Some(ev) = &*self.publish_event.borrow() {
-                    ev.encode_signal(generation as u64)?;
-                }
-            }
+            self.signal_publication(generation)?;
             return Ok(());
         }
         // Cycle to a fresh source tile so the stage does not race an in-flight

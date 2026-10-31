@@ -87,6 +87,46 @@ pub trait CausalLM: Model {
         self.forward_embeds(&embeds, pos, cache)
     }
 
+    #[cfg(feature = "metal")]
+    fn guarded_embedding_layout(&self) -> Result<lloom_tensor::quantized::GuardedEmbeddingLayout> {
+        lloom_tensor::bail!("this model has no guarded prepared-token layout")
+    }
+
+    /// Cold admission for guarded token embeddings and the matching prepared
+    /// token-forward entry. An implementation promises both the input layout
+    /// and the token path's head/math policy; the multimodal embeds entry is
+    /// not assumed to have that policy. Unsupported models keep ordinary
+    /// token decoding and are declined before this explicit arm starts.
+    #[cfg(feature = "metal")]
+    fn check_guarded_embedding(&self, _out: &Tensor) -> Result<()> {
+        lloom_tensor::bail!("this model has no guarded prepared-token entry")
+    }
+
+    /// Encode the checked sample's embedding into request-owned storage.
+    /// Invalid rows must not index a table or modify that output.
+    #[cfg(feature = "metal")]
+    fn embed_guarded_into(
+        &self,
+        _tokens: &lloom_tensor::metal_backend::sampling::GuardedSample<'_>,
+        _out: &Tensor,
+    ) -> Result<()> {
+        lloom_tensor::bail!("this model has no guarded prepared-token entry")
+    }
+
+    /// Consume embeddings produced by the admitted token route, preserving
+    /// `forward`'s residual/head behavior. This does not embed a second time.
+    /// Prior sample validity, input custody and final failure reconciliation
+    /// remain the request driver's obligations; this is not a success signal.
+    #[cfg(feature = "metal")]
+    fn forward_prepared_embeds(
+        &self,
+        _embeds: &Tensor,
+        _pos: usize,
+        _cache: &mut Self::Cache,
+    ) -> Result<Tensor> {
+        lloom_tensor::bail!("this model has no guarded prepared-token entry")
+    }
+
     /// Make `cache` ready for a pass of `seq_len` tokens — every session
     /// allocation the pass would otherwise make on entry (a KV slab, a
     /// bucket grow), so that a planned pass allocates nothing of its own

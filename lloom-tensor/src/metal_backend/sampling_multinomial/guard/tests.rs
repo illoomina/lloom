@@ -44,6 +44,113 @@ fn finish(d: &Device) -> Result<()> {
     m.wait_until_completed()
 }
 
+#[test]
+fn generated_noise_slot_refuses_busy_before_invoking_its_filler() -> Result<()> {
+    let d = device()?;
+    let m = d.as_metal_device()?;
+    let scores = Tensor::new(&[0f32, 0., 0.], &d)?;
+    let scores_storage = storage(&scores);
+    let layout = Layout::contiguous(3);
+    let mut prepared = super::super::prepared::PreparedSampler::with_noise(m, 1, 3)?;
+    let guard = SampleGuard::new(m)?;
+    let mut readback = super::super::readback::SampleReadback::new(m, 1)?;
+    let token = prepared.draw_generated(
+        &guard,
+        &scores_storage,
+        &layout,
+        1.,
+        0,
+        1.,
+        false,
+        |out, rows, vocab| {
+            assert_eq!((rows, vocab), (1, 3));
+            out[0] = 0.5;
+            Ok(())
+        },
+    )?;
+    token.snapshot(&mut readback)?;
+    drop(token);
+    let called = Cell::new(false);
+    assert!(prepared
+        .draw_generated(
+            &guard,
+            &scores_storage,
+            &layout,
+            1.,
+            0,
+            1.,
+            false,
+            |_, _, _| {
+                called.set(true);
+                Ok(())
+            }
+        )
+        .is_err());
+    assert!(
+        !called.get(),
+        "a busy upload must not advance the caller's RNG"
+    );
+    finish(&d)?;
+    assert_eq!(readback.poll()?.expect("completed").ids(), [1]);
+    let token = prepared.draw_generated(
+        &guard,
+        &scores_storage,
+        &layout,
+        1.,
+        0,
+        1.,
+        false,
+        |out, _, _| {
+            out[0] = 0.;
+            Ok(())
+        },
+    )?;
+    token.snapshot(&mut readback)?;
+    drop(token);
+    finish(&d)?;
+    assert_eq!(readback.poll()?.expect("completed").ids(), [0]);
+    Ok(())
+}
+
+#[test]
+fn generated_noise_parameter_refusal_precedes_noise_or_rng_mutation() -> Result<()> {
+    let d = device()?;
+    let m = d.as_metal_device()?;
+    let scores = storage(&Tensor::new(&[0f32, 0., 0.], &d)?);
+    let layout = Layout::contiguous(3);
+    let mut prepared = super::super::prepared::PreparedSampler::with_noise(m, 1, 3)?;
+    let guard = SampleGuard::new(m)?;
+    for (temperature, p) in [
+        (f64::NAN, 1.),
+        (0., 1.),
+        (1., f64::NAN),
+        (1., -0.1),
+        (1., 1.1),
+    ] {
+        let called = Cell::new(false);
+        assert!(prepared
+            .draw_generated(
+                &guard,
+                &scores,
+                &layout,
+                temperature,
+                0,
+                p,
+                false,
+                |_, _, _| {
+                    called.set(true);
+                    Ok(())
+                }
+            )
+            .is_err());
+        assert!(
+            !called.get(),
+            "invalid request must not call the noise generator"
+        );
+    }
+    Ok(())
+}
+
 fn consumer_graph(force_cut: bool) -> Result<()> {
     let d = device()?;
     let m = d.as_metal_device()?;
@@ -127,13 +234,17 @@ fn sticky_error_suppresses_already_queued_valid_successor_and_forced_tail() -> R
     let invalid = guard.bind(sample(&d, &[u32::MAX], &[3, u32::MAX, 0, 0])?)?;
     drop(invalid);
     let mut next = guard.bind(sample(&d, &[1], &[0, u32::MAX, 3, 2])?)?;
-    next.feed_into(
-        &storage(&forced),
-        &storage(&close),
-        &storage(&state),
-        &storage(&output),
-        0,
-    )?;
+    // SAFETY: fixture owns every state/output alias, does not mutate them
+    // through the final consumer, and waits before inspecting/reusing them.
+    unsafe {
+        next.feed_into(
+            &storage(&forced),
+            &storage(&close),
+            &storage(&state),
+            &storage(&output),
+            0,
+        )?;
+    }
     next.copy_into(&storage(&history), 0)?;
     drop(next);
     finish(&d)?;
@@ -157,13 +268,17 @@ fn fed_id_not_drawn_id_reaches_history_and_counts_and_invalid_forcing_is_termina
         let history = Tensor::new(&[88u32], &d)?;
         let eos = Tensor::new(&[9u8], &d)?;
         let mut token = guard.bind(sample(&d, &[1], &[0, u32::MAX, 3, 2])?)?;
-        token.feed_into(
-            &storage(&forced),
-            &storage(&close),
-            &storage(&state),
-            &storage(&output),
-            0,
-        )?;
+        // SAFETY: fixture owns every state/output alias, does not mutate them
+        // through the final consumer, and waits before inspecting/reusing them.
+        unsafe {
+            token.feed_into(
+                &storage(&forced),
+                &storage(&close),
+                &storage(&state),
+                &storage(&output),
+                0,
+            )?;
+        }
         token.record_counts(&storage(&counts))?;
         token.eos_flag_into(&storage(&close), &storage(&eos))?;
         token.copy_into(&storage(&history), 0)?;
@@ -342,5 +457,448 @@ fn prepared_invalid_window_and_queued_successor_stay_errors_in_the_host_bridge()
         _ => panic!("sticky error exposed ids"),
     };
     assert!(error.to_string().contains("row 1: Empty"), "{error}");
+    Ok(())
+}
+
+#[test]
+fn retained_publisher_observes_later_writer_and_survives_guard_drop() -> Result<()> {
+    let d = device()?;
+    let m = d.as_metal_device()?;
+    let guard = SampleGuard::new(m)?;
+    let mut publisher = guard.publisher();
+    assert!(publisher.check_error()?, "initialized request is clean");
+    let valid = guard.bind(sample(&d, &[1], &[0, u32::MAX, 3, 2])?)?;
+    drop(valid);
+    finish(&d)?;
+    assert!(publisher.check_error()?);
+
+    let invalid = guard.bind(sample(&d, &[u32::MAX], &[3, u32::MAX, 0, 0])?)?;
+    drop(invalid);
+    assert!(
+        !publisher.check_error()?,
+        "later open-epoch writer supersedes the completed epoch"
+    );
+    drop(guard);
+    finish(&d)?;
+    assert!(
+        publisher.check_error().is_err(),
+        "sticky diagnostic survives producer drop without any token stamp"
+    );
+    Ok(())
+}
+
+#[test]
+fn retained_publisher_checks_poison_and_uses_guarded_final_stamp() -> Result<()> {
+    let d = device()?;
+    let m = d.as_metal_device()?;
+    let guard = SampleGuard::new(m)?;
+    let mut publisher = guard.publisher();
+    let marker = Tensor::new(&[0u32], &d)?;
+    let history = Tensor::new(&[1u32], &d)?;
+    let input = Tensor::new(&[1u32], &d)?;
+    let eos = Tensor::new(&[0u8], &d)?;
+    let token = guard.bind(sample(&d, &[1], &[0, u32::MAX, 3, 2])?)?;
+    drop(token);
+    publisher.publish_marker(
+        &storage(&marker),
+        7,
+        &storage(&history),
+        &storage(&input),
+        &storage(&eos),
+    )?;
+    finish(&d)?;
+    assert_eq!(marker.to_vec1::<u32>()?, [7]);
+    assert!(publisher.check_error()?);
+    guard.progress.poisoned.set(true);
+    assert!(
+        publisher.check_error().is_err(),
+        "a poisoned native entry must not expose old completed words"
+    );
+    assert!(publisher
+        .publish_marker(
+            &storage(&marker),
+            8,
+            &storage(&history),
+            &storage(&input),
+            &storage(&eos)
+        )
+        .is_err());
+    Ok(())
+}
+
+#[test]
+fn failed_native_entry_is_visible_to_older_publisher_without_a_stamp() -> Result<()> {
+    let d = device()?;
+    let guard = SampleGuard::new(d.as_metal_device()?)?;
+    let mut publisher = guard.publisher();
+    assert!(publisher.check_error()?);
+    drop(guard.native_entry());
+    assert!(publisher.check_error().is_err());
+    assert!(guard.bind(sample(&d, &[1], &[0, u32::MAX, 3, 2])?).is_err());
+    let fresh = SampleGuard::new(d.as_metal_device()?)?;
+    let mut fresh_publisher = fresh.publisher();
+    assert!(fresh_publisher.check_error()?);
+    assert!(
+        publisher.check_error().is_err(),
+        "fresh request cannot clear its predecessor's failed native entry"
+    );
+    Ok(())
+}
+
+#[test]
+fn invalid_later_row_and_valid_queued_successor_never_index_a_packed_table() -> Result<()> {
+    use crate::quantized::{GgmlDType, QMatMul, QTensor};
+    let d = device()?;
+    let weights = Tensor::from_vec(
+        (0..96).map(|x| (x as f32 - 31.) / 17.).collect(),
+        (3, 32),
+        &d,
+    )?;
+    let table = QMatMul::QTensor(std::sync::Arc::new(QTensor::quantize(
+        &weights,
+        GgmlDType::Q4_0,
+    )?));
+    let mut guard = SampleGuard::new(d.as_metal_device()?)?;
+    let output = Tensor::full(-99f32, (2, 32), &d)?;
+    let bad = guard.bind(sample(
+        &d,
+        &[1, u32::MAX],
+        &[0, u32::MAX, 3, 2, 3, u32::MAX, 0, 0],
+    )?)?;
+    table.embedding_guarded_into(&bad, &output)?;
+    drop(bad);
+    let good = guard.bind(sample(
+        &d,
+        &[1, 2],
+        &[0, u32::MAX, 3, 2, 0, u32::MAX, 3, 2],
+    )?)?;
+    table.embedding_guarded_into(&good, &output)?;
+    drop(good);
+    finish(&d)?;
+    assert!(guard.check_error().is_err());
+    assert_eq!(
+        output.flatten_all()?.to_vec1::<f32>()?,
+        vec![-99.; 64],
+        "all rows fail before get_rows can index; queued valid successors stay suppressed"
+    );
+    Ok(())
+}
+
+// The current encoder may differ from the installed default without a race:
+// replacement affects only the next encoder. A forward-only custom executor
+// makes the old predicate observable without constructing unsafe native work.
+fn retained_custom_encoder(
+    m: &MetalDevice,
+) -> Result<std::sync::Arc<std::sync::atomic::AtomicUsize>> {
+    use crate::kernels::metal::executor::{DispatchRecord, Executor, ExecutorSlot};
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+    struct Count(Arc<AtomicUsize>);
+    impl Executor for Count {
+        fn dispatch(&self, _: &DispatchRecord) -> bool {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            true
+        }
+    }
+    m.commands().flush().map_err(MetalError::from)?;
+    m.wait_until_completed()?;
+    assert_eq!(
+        m.cut_policy(),
+        crate::kernels::metal::CutPolicy::DispatchCounter,
+        "actual-encoder fixture requires counter cuts"
+    );
+    m.set_compute_per_buffer(usize::MAX);
+    let count = Arc::new(AtomicUsize::new(0));
+    m.set_executor(Arc::new(ExecutorSlot::Custom(Arc::new(Count(
+        count.clone(),
+    )))));
+    {
+        let encoder = m.command_encoder()?;
+        assert!(!encoder.as_ref().executor.is_classical());
+    }
+    m.set_executor(Arc::new(ExecutorSlot::Classical));
+    assert!(m.commands().executor().is_classical());
+    {
+        let encoder = m.command_encoder()?;
+        assert!(
+            !encoder.as_ref().executor.is_classical(),
+            "fixture must retain old encoder"
+        );
+    }
+    Ok(count)
+}
+
+#[test]
+fn prepared_draw_checks_retained_encoder_not_installed_default() -> Result<()> {
+    let d = device()?;
+    let m = d.as_metal_device()?;
+    let scores = storage(&Tensor::new(&[0f32, 0., 0.], &d)?);
+    let layout = Layout::contiguous(3);
+    let mut prepared = super::super::prepared::PreparedSampler::with_noise(m, 1, 3)?;
+    let guard = SampleGuard::new(m)?;
+    let dispatched = retained_custom_encoder(m)?;
+    let result =
+        prepared.draw_generated(&guard, &scores, &layout, 1., 0, 1., false, |out, _, _| {
+            out[0] = 0.5;
+            Ok(())
+        });
+    let error = match result {
+        Ok(token) => {
+            drop(token);
+            None
+        }
+        Err(e) => Some(e),
+    };
+    finish(&d)?;
+    println!("ACTUAL_ENCODER_TERMINAL prepared=true");
+    let err = error.expect("prepared sampler admitted a retained nonclassical encoder");
+    assert!(err.to_string().contains("actual encoder"), "{err}");
+    assert_eq!(dispatched.load(std::sync::atomic::Ordering::Relaxed), 0);
+    Ok(())
+}
+
+#[test]
+fn guarded_consumer_checks_retained_encoder_not_installed_default() -> Result<()> {
+    let d = device()?;
+    let m = d.as_metal_device()?;
+    let guard = SampleGuard::new(m)?;
+    let input = sample(&d, &[1], &[0, u32::MAX, 3, 2])?;
+    let dispatched = retained_custom_encoder(m)?;
+    let error = match guard.bind(input) {
+        Ok(token) => {
+            drop(token);
+            None
+        }
+        Err(e) => Some(e),
+    };
+    finish(&d)?;
+    println!("ACTUAL_ENCODER_TERMINAL guard=true");
+    let err = error.expect("guard admitted a retained nonclassical encoder");
+    assert!(err.to_string().contains("actual encoder"), "{err}");
+    assert_eq!(dispatched.load(std::sync::atomic::Ordering::Relaxed), 0);
+    Ok(())
+}
+
+#[test]
+fn sample_readback_checks_retained_encoder_not_installed_default() -> Result<()> {
+    let d = device()?;
+    let m = d.as_metal_device()?;
+    let mut readback = super::super::readback::SampleReadback::new(m, 1)?;
+    let input = sample(&d, &[1], &[0, u32::MAX, 3, 2])?;
+    let dispatched = retained_custom_encoder(m)?;
+    let error = readback.enqueue(input).err();
+    finish(&d)?;
+    println!("ACTUAL_ENCODER_TERMINAL readback=true");
+    let err = error.expect("readback admitted nonclassical encoder");
+    assert!(err.to_string().contains("actual encoder"), "{err}");
+    assert_eq!(dispatched.load(std::sync::atomic::Ordering::Relaxed), 0);
+    assert!(
+        readback.poll().is_err(),
+        "failed snapshot must remain poisoned"
+    );
+    Ok(())
+}
+
+#[test]
+fn prepared_draw_accepts_classical_encoder_after_a_cut() -> Result<()> {
+    let d = device()?;
+    let m = d.as_metal_device()?;
+    let scores = storage(&Tensor::new(&[0f32, 0., 0.], &d)?);
+    let layout = Layout::contiguous(3);
+    let mut prepared = super::super::prepared::PreparedSampler::with_noise(m, 1, 3)?;
+    let guard = SampleGuard::new(m)?;
+    let mut readback = super::super::readback::SampleReadback::new(m, 1)?;
+    let dispatched = retained_custom_encoder(m)?;
+    // A cut replaces the old custom encoder with the installed Classical
+    // executor. Rejecting the queue merely because it once held Custom would
+    // disable a supported route instead of validating the actual dispatch.
+    m.set_compute_per_buffer(1);
+    let token =
+        prepared.draw_generated(&guard, &scores, &layout, 1., 0, 1., false, |out, _, _| {
+            out[0] = 0.5;
+            Ok(())
+        })?;
+    token.snapshot(&mut readback)?;
+    drop(token);
+    finish(&d)?;
+    assert_eq!(readback.poll()?.expect("completed snapshot").ids(), [1]);
+    assert_eq!(dispatched.load(std::sync::atomic::Ordering::Relaxed), 0);
+    Ok(())
+}
+
+#[test]
+fn packed_embedding_accepts_foreign_readonly_owner_but_not_foreign_output() -> Result<()> {
+    use crate::metal_backend::MetalAllocationDomain;
+    use crate::quantized::{GgmlDType, QMatMul, QTensor};
+    let d = device()?;
+    let weights = Tensor::from_vec((0..96).map(|x| x as f32 / 17.).collect(), (3, 32), &d)?;
+    let table = QMatMul::QTensor(std::sync::Arc::new(QTensor::quantize(
+        &weights,
+        GgmlDType::Q4_0,
+    )?));
+    let foreign_output = Tensor::full(-99f32, (1, 32), &d)?;
+    let domain = crate::memory_admission::ModelDomain::isolated_numeric_fixture(64 << 20);
+    let namespace = MetalAllocationDomain::new(d.as_metal_device()?, domain)?;
+    let promise = namespace.domain().reserve(16 << 20)?;
+    let scope = namespace.scope(promise.context())?;
+    scope.run(|metal| {
+        let local = Device::Metal(metal.clone());
+        let body = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<()> {
+            let guard = SampleGuard::new(metal)?;
+            let output = Tensor::full(-99f32, (1, 32), &local)?;
+            let token = guard.bind(sample(&local, &[1], &[0, u32::MAX, 3, 2])?)?;
+            let error = table
+                .embedding_guarded_into(&token, &foreign_output)
+                .unwrap_err();
+            assert!(error.to_string().contains("domain"), "{error}");
+            table.embedding_guarded_into(&token, &output)?;
+            drop(token);
+            finish(&local)?;
+            // Same dequantization/get_rows representation, not original float weights.
+            let expected = table.embedding(&Tensor::new(&[1u32], &local)?)?;
+            assert_eq!(output.to_vec2::<f32>()?, expected.to_vec2::<f32>()?);
+            assert_eq!(
+                foreign_output.flatten_all()?.to_vec1::<f32>()?,
+                vec![-99.; 32]
+            );
+            Ok(())
+        }));
+        let cleanup = metal.wait_until_completed();
+        match body {
+            Ok(result) => {
+                result?;
+                cleanup
+            }
+            Err(p) => {
+                let _ = cleanup;
+                std::panic::resume_unwind(p)
+            }
+        }
+    })
+}
+
+#[test]
+fn filler_reentrant_invalid_guard_remains_sticky_for_its_own_draw() -> Result<()> {
+    let d = device()?;
+    let m = d.as_metal_device()?;
+    let scores = storage(&Tensor::new(&[0f32; 3], &d)?);
+    let bad = sample(&d, &[u32::MAX], &[3, u32::MAX, 0, 0])?;
+    let guard = SampleGuard::new(m)?;
+    let mut prepared = super::super::prepared::PreparedSampler::with_noise(m, 1, 3)?;
+    let mut readback = super::super::readback::SampleReadback::new(m, 1)?;
+    let token = prepared.draw_generated(
+        &guard,
+        &scores,
+        &Layout::contiguous(3),
+        1.,
+        0,
+        1.,
+        false,
+        |out, _, _| {
+            drop(guard.bind(bad)?);
+            out[0] = 0.5;
+            Ok(())
+        },
+    )?;
+    token.snapshot(&mut readback)?;
+    drop(token);
+    let result = readback.read_committed();
+    assert!(
+        result.is_err(),
+        "reentrant invalid row was reset by outer draw"
+    );
+    finish(&d)
+}
+
+#[test]
+fn packed_embedding_rejects_other_queue_and_aliased_weight_output() -> Result<()> {
+    use crate::kernels::metal::{BufferHandle, PooledBuffer};
+    use crate::quantized::{metal::QMetalStorage, GgmlDType};
+    let d = device()?;
+    let m = d.as_metal_device()?;
+    let other = Device::new_metal(0)?;
+    let foreign = QMetalStorage::zeros(other.as_metal_device()?, 96, GgmlDType::F32)?;
+    let table = QMetalStorage::zeros(m, 96, GgmlDType::F32)?;
+    let guard = SampleGuard::new(m)?;
+    let output = Tensor::full(-99f32, (1, 32), &d)?;
+    let token = guard.bind(sample(&d, &[1], &[0, u32::MAX, 3, 2])?)?;
+    assert!(
+        !foreign.device().same_device(m),
+        "fixture needs distinct Commands identity"
+    );
+    assert!(token
+        .quantized_embedding_into(&foreign, 3, 32, &output)
+        .is_err());
+    // Retain the creator until all uses finish. This second owned view is only
+    // passed to the rejecting preflight, not submitted as independent storage.
+    let alias = Tensor::from_storage(
+        Storage::Metal(MetalStorage::new(
+            BufferHandle::new(PooledBuffer::unpooled(
+                table.buffer().clone(),
+                table.buffer().length(),
+            )),
+            m.clone(),
+            96,
+            DType::F32,
+        )),
+        (1, 32),
+        crate::op::BackpropOp::none(),
+        false,
+    );
+    let error = token
+        .quantized_embedding_into(&table, 3, 32, &alias)
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("aliased weight/output"),
+        "{error}"
+    );
+    drop(token);
+    finish(&d)?;
+    finish(&other)?;
+    assert_eq!(output.flatten_all()?.to_vec1::<f32>()?, vec![-99.; 32]);
+    Ok(())
+}
+
+#[test]
+fn fixed_snapshot_scratch_reads_only_actual_rows_and_guard_suffix() -> Result<()> {
+    let d = device()?;
+    let m = d.as_metal_device()?;
+    let guard = SampleGuard::new(m)?;
+    let mut readback = super::super::readback::SampleReadback::new(m, 3)?;
+    for ids in [&[0u32, 1, 2][..], &[1u32][..]] {
+        let status: Vec<u32> = ids.iter().flat_map(|_| [0, u32::MAX, 3, 2]).collect();
+        let token = guard.bind(sample(&d, ids, &status)?)?;
+        token.snapshot(&mut readback)?;
+        drop(token);
+        assert_eq!(
+            readback
+                .read_committed()?
+                .expect("completed guarded snapshot")
+                .ids(),
+            ids
+        );
+        assert!(
+            readback.poll()?.is_none(),
+            "one completion cannot be read twice"
+        );
+    }
+    // Same larger-capacity storage, but no guard suffix in this snapshot.
+    readback.enqueue(sample(&d, &[2], &[0, u32::MAX, 3, 2])?)?;
+    assert_eq!(
+        readback
+            .read_committed()?
+            .expect("completed unguarded snapshot")
+            .ids(),
+        &[2]
+    );
+    // Zero-row unguarded envelope remains valid and must not expose stale words.
+    readback.enqueue(sample(&d, &[], &[])?)?;
+    assert!(readback
+        .read_committed()?
+        .expect("empty envelope")
+        .ids()
+        .is_empty());
     Ok(())
 }

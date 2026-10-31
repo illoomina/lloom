@@ -51,6 +51,14 @@ mod host_fed;
 mod host_slot;
 mod sampling_multinomial;
 mod sampling_topk;
+/// Guarded sampling primitives. Construction is explicit; no public sampling
+/// route or default is selected by exposing this consumer surface.
+pub mod sampling {
+    pub use super::sampling_multinomial::guard::{GuardedSample, SampleGuard, SamplePublisher};
+    pub use super::sampling_multinomial::prepared::{Draw, PreparedSampler};
+    pub use super::sampling_multinomial::prepared_slots::PreparedSamplerSlots;
+    pub use super::sampling_multinomial::readback::{CheckedSample, SampleReadback};
+}
 use device::DeviceTeardown;
 #[cfg(test)]
 use device::PRIVATE_RESOURCE_OPTIONS;

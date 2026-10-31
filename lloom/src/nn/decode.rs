@@ -200,6 +200,17 @@ impl<'a> Asks<'a> {
 /// - The batched bodies draw per row without processors, feed no forced
 ///   token and keep no logprobs; the batched windows verify by the argmax.
 pub fn refuse(body: Body, asks: &Asks<'_>) -> Result<()> {
+    refuse_with_prepared_sampler(body, asks, false)
+}
+
+/// The request-owned prepared strategy supplies the device filter. All other
+/// restrictions remain in this shared table; ordinary rings keep their routes.
+#[cfg(feature = "metal")]
+pub fn refuse_prepared_step(asks: &Asks<'_>) -> Result<()> {
+    refuse_with_prepared_sampler(Body::Step { ring: true }, asks, true)
+}
+
+fn refuse_with_prepared_sampler(body: Body, asks: &Asks<'_>, prepared: bool) -> Result<()> {
     if let Some(k) = asks.logprobs.filter(|&k| k > MAX_TOP_LOGPROBS) {
         lloom_tensor::bail!(
             "per-token logprobs name at most {MAX_TOP_LOGPROBS} candidates beside the drawn id, \
@@ -207,16 +218,18 @@ pub fn refuse(body: Body, asks: &Asks<'_>) -> Result<()> {
         );
     }
     match body {
-        Body::Step { ring: true } if asks.sampling.requires_host() => lloom_tensor::bail!(
-            "the ring needs a device-resident sampler (argmax, multinomial or gumbel-max); \
+        Body::Step { ring: true } if asks.sampling.requires_host() && !prepared => {
+            lloom_tensor::bail!(
+                "the ring needs a device-resident sampler (argmax, multinomial or gumbel-max); \
              {:?} takes {} and cannot ride it (DESIGN.md §11.2c)",
-            asks.sampling,
-            if matches!(asks.sampling, Sampling::FilteredGumbel { .. }) {
-                "an explicit host draw"
-            } else {
-                "a host sort"
-            }
-        ),
+                asks.sampling,
+                if matches!(asks.sampling, Sampling::FilteredGumbel { .. }) {
+                    "an explicit host draw"
+                } else {
+                    "a host sort"
+                }
+            )
+        }
         Body::Step { ring: true } if asks.digest => lloom_tensor::bail!(
             "the ring draws on the device and the logits digest reads every step's logits on \
              the host: the digest runs on the blocking arm"
@@ -578,6 +591,27 @@ impl DecodeOptions {
     /// unbounded (for `min`-style clamps that want "no limit").
     pub fn remaining(&self, produced: usize) -> usize {
         TokenLimit(self.max_tokens).remaining(produced)
+    }
+
+    /// Cold workspace count for a one-row prepared sampler on the ring.
+    /// A draw precedes the pacer wait. Fixed cadence therefore needs one
+    /// more slot than its forward depth; adaptive cadence includes the
+    /// largest just-closed group as well. This is not an admission quote.
+    pub fn prepared_sample_slots(&self) -> Result<usize> {
+        let slots = if self.adaptive_commit && self.lookahead > 0 {
+            let run = self.run_ahead_steps();
+            let queued = if self.queued_steps == 0 {
+                run.checked_mul(2)
+            } else {
+                Some(self.queued_steps)
+            };
+            queued.and_then(|queued| queued.checked_add(run))
+        } else {
+            self.pacer_depth().max(IN_FLIGHT_FLOOR).checked_add(1)
+        };
+        slots.ok_or_else(|| {
+            lloom_tensor::Error::Msg("prepared sampling: workspace count overflow".into())
+        })
     }
 
     /// The pacer depth: the explicit override if set, else the floor. (The
@@ -2059,13 +2093,7 @@ impl<'m, M: CausalLM> Session<'m, M> {
         S: Speculator,
         R: ReadbackStrategy,
     {
-        refuse(
-            Body::Step {
-                ring: readback.arms().token_ring,
-            },
-            &Asks::of(sampler, false),
-        )?;
-        readback.check_sampler(sampler.sampling())?;
+        readback.check_request(sampler)?;
         let out = self.decode_until_run(spec, readback, sampler, prompt, opts, on_tokens);
         if out.is_err() {
             // A run that failed mid-way may leave a provisional step: settled
@@ -2627,9 +2655,8 @@ impl<'m, M: CausalLM> Session<'m, M> {
                 // undeclared escape (`pass-plan-design.md` §26).
                 drop(logits);
                 let pass = begin_decode_step(&device, R::PASS_INPUT)?;
-                logits = self
-                    .model
-                    .forward(&feed, self.seq.pos, &mut self.seq.cache)?
+                logits = readback
+                    .forward_input(self.model, &feed, self.seq.pos, &mut self.seq.cache)?
                     .squeeze(0)?;
                 pass.finish()?;
                 self.seq.pos += 1;
@@ -2671,9 +2698,8 @@ impl<'m, M: CausalLM> Session<'m, M> {
                 // undeclared escape (`pass-plan-design.md` §26).
                 drop(logits);
                 let pass = begin_decode_step(&device, R::PASS_INPUT)?;
-                logits = self
-                    .model
-                    .forward(&feed, self.seq.pos, &mut self.seq.cache)?
+                logits = readback
+                    .forward_input(self.model, &feed, self.seq.pos, &mut self.seq.cache)?
                     .squeeze(0)?;
                 pass.finish()?;
                 self.seq.pos += 1;
@@ -2742,9 +2768,8 @@ impl<'m, M: CausalLM> Session<'m, M> {
                         self.model.prepare_pass(&mut self.seq.cache, 1)?;
                         drop(logits);
                         let pass = begin_decode_step(&device, R::PASS_INPUT)?;
-                        logits = self
-                            .model
-                            .forward(&again, self.seq.pos, &mut self.seq.cache)?
+                        logits = readback
+                            .forward_input(self.model, &again, self.seq.pos, &mut self.seq.cache)?
                             .squeeze(0)?;
                         pass.finish()?;
                         self.seq.pos += 1;
@@ -4992,4 +5017,94 @@ fn cache_sizes(device: &Device) -> (usize, usize) {
     }
     let _ = device;
     (0, 0)
+}
+
+#[cfg(test)]
+mod prepared_sample_slots_tests {
+    use super::*;
+
+    #[test]
+    fn fixed_count_includes_the_draw_before_the_wait() -> Result<()> {
+        for (depth, expected) in [(0, 3), (1, 3), (2, 3), (7, 8)] {
+            let opts = DecodeOptions {
+                in_flight_depth: depth,
+                ..DecodeOptions::new(100)
+            };
+            assert_eq!(opts.prepared_sample_slots()?, expected);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn adaptive_count_covers_a_just_closed_group() -> Result<()> {
+        for (run_ahead, queued_steps, expected) in [(0, 0, 24), (4, 0, 12), (8, 2, 10), (1, 1, 2)] {
+            let opts = DecodeOptions {
+                adaptive_commit: true,
+                lookahead: 1,
+                run_ahead,
+                queued_steps,
+                ..DecodeOptions::new(100)
+            };
+            assert_eq!(opts.prepared_sample_slots()?, expected);
+        }
+        // The no-lookahead branch uses fixed pacing even with this flag set.
+        let opts = DecodeOptions {
+            adaptive_commit: true,
+            lookahead: 0,
+            run_ahead: 8,
+            queued_steps: 2,
+            ..DecodeOptions::new(100)
+        };
+        assert_eq!(opts.prepared_sample_slots()?, 3);
+        Ok(())
+    }
+
+    #[test]
+    fn count_overflow_is_a_cold_error() {
+        let fixed = DecodeOptions {
+            in_flight_depth: usize::MAX,
+            ..DecodeOptions::new(1)
+        };
+        assert!(fixed.prepared_sample_slots().is_err());
+        for (run_ahead, queued_steps) in [(usize::MAX, 0), (usize::MAX / 2 + 1, 0), (1, usize::MAX)]
+        {
+            let opts = DecodeOptions {
+                adaptive_commit: true,
+                lookahead: 1,
+                run_ahead,
+                queued_steps,
+                ..DecodeOptions::new(1)
+            };
+            assert!(opts.prepared_sample_slots().is_err());
+        }
+    }
+
+    #[test]
+    fn fixed_draw_reuse_follows_retirement_even_across_redraws() -> Result<()> {
+        for depth in [2, 3, 7] {
+            let opts = DecodeOptions {
+                in_flight_depth: depth,
+                lookahead: 1,
+                ..DecodeOptions::new(100)
+            };
+            let slots = opts.prepared_sample_slots()?;
+            let mut pending = PacerQueue::new(depth);
+            let mut busy = vec![false; slots];
+            for draw in 0..1000 {
+                // Every draw, including a provisional redraw, happens before
+                // before_forward; its forward then receives a pacing marker.
+                let slot = draw % slots;
+                assert!(!busy[slot], "draw {draw} reused live slot {slot}");
+                busy[slot] = true;
+                while pending.entries.len() >= depth {
+                    pending.retire(|old: &usize| {
+                        busy[*old] = false;
+                        Ok(true)
+                    })?;
+                }
+                pending.push(slot, 1);
+            }
+        }
+        Ok(())
+    }
 }

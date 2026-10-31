@@ -1929,3 +1929,120 @@ fn fetch_wait_native_refusals_keep_existing_count_errors_and_state() {
         assert_eq!(options, prior);
     }
 }
+
+/// The real serving parser + shared layer resolver, without starting HTTP,
+/// opening a checkpoint, installing tuning or creating a device.
+fn native_sampler_serving_options(argv: &[&str], env: &BTreeMap<String, String>) -> EngineOptions {
+    let mut full = vec!["lloom", "serve"];
+    full.extend_from_slice(argv);
+    let Command::Serve(args) = parse(&full).expect("actual serve command").command else {
+        unreachable!()
+    };
+    resolve_layers(
+        &args.common,
+        &|o| args.front(o),
+        &|name| env.get(name).cloned(),
+        false,
+        Some(Frontend::Serve),
+    )
+    .expect("actual serving layers")
+    .0
+}
+
+#[test]
+fn device_filter_serving_ingress_and_schema_share_one_opt_in() {
+    let path = "decode.readback.device_filter";
+    let key = index().keys.get(path).expect("generated registry entry");
+    assert!(key.flags().contains(&"--device-filter".to_string()));
+    let schema = crate::option_schema::schema();
+    let node = schema_node(&schema, path);
+    for value in [json!(false), json!(true)] {
+        assert!(schema_valid(node, &value, &schema["$defs"]));
+    }
+    assert!(!schema_valid(node, &json!("maybe"), &schema["$defs"]));
+    let none = BTreeMap::new();
+    assert!(
+        !native_sampler_serving_options(&[], &none)
+            .decode
+            .readback
+            .device_filter
+    );
+    for argv in [
+        vec!["--device-filter"],
+        vec!["--set", "decode.readback.device_filter=true"],
+        vec!["--decode-config", r#"{"readback":{"device_filter":true}}"#],
+    ] {
+        assert!(
+            native_sampler_serving_options(&argv, &none)
+                .decode
+                .readback
+                .device_filter
+        );
+    }
+    assert!(
+        native_sampler_serving_options(&[], &BTreeMap::from([(key.env(), "true".into())]))
+            .decode
+            .readback
+            .device_filter
+    );
+    assert!(
+        !native_sampler_serving_options(
+            &["--device-filter=false"],
+            &BTreeMap::from([(key.env(), "true".into())])
+        )
+        .decode
+        .readback
+        .device_filter
+    );
+}
+
+#[test]
+fn device_filter_reports_shared_selection_not_unconditional_host_demotion() {
+    let o = native_sampler_serving_options(
+        &[
+            "--device-filter",
+            "--readback",
+            "ring",
+            "--temperature",
+            "1",
+            "--top-k",
+            "2",
+        ],
+        &BTreeMap::new(),
+    );
+    let sampling = o.sampling.sampling().unwrap();
+    let params = crate::DecodeParams {
+        readback: o.decode.readback.arm(),
+        ..Default::default()
+    };
+    // Unsupported backend uses the exact request resolver; options parsing is
+    // not itself model/device capability admission.
+    assert!(params
+        .sampler_route(true, &sampling, false, o.decode.readback.ring_arm())
+        .err()
+        .unwrap()
+        .to_string()
+        .contains("requires a Metal build and device"));
+    let selected = params
+        .sampler_route(true, &sampling, true, o.decode.readback.ring_arm())
+        .unwrap();
+    assert!(selected.prepared_ring);
+    assert!(matches!(selected.arm, crate::ReadbackArm::Ring(_)));
+    let lines = crate::couplings::explain(&o);
+    assert!(!lines
+        .iter()
+        .any(|line| line.ends_with("(C1)") || line.ends_with("(C2)")));
+    if cfg!(feature = "metal") {
+        assert!(lines.iter().any(|line| line.contains(&selected.arm.name())
+            && line.contains("model capability/admission still required")));
+    } else {
+        assert!(lines
+            .iter()
+            .any(|line| line.contains("default request would refuse")));
+    }
+    let mut host = o.clone();
+    host.decode.readback.device_filter = false;
+    assert!(crate::couplings::explain(&host)
+        .iter()
+        .any(|line| line.ends_with("(C2)")));
+}

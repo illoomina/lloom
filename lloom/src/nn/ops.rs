@@ -2564,15 +2564,20 @@ impl lloom_tensor::CustomOp3 for Sdpa<'_> {
                 None => None,
             };
             let paged = match (&self.paged, &table) {
-                (Some(p), Some((t, n))) => Some(lloom_tensor::kernels::SdpaPageTable {
-                    table: t,
-                    table_offset: 0,
-                    table_stride: p.stride,
-                    page_size: p.page_size,
-                    n_keys: n,
-                    n_keys_offset: 0,
-                    n_keys_stride: usize::from(p.n_keys.len() > 1),
-                }),
+                (Some(p), Some((t, n))) => {
+                    // SAFETY: the sealed cache holder stays live through this
+                    // read-only binding; no mutable alias is exposed.
+                    let table = unsafe { t.buffer_unchecked() };
+                    Some(lloom_tensor::kernels::SdpaPageTable {
+                        table,
+                        table_offset: 0,
+                        table_stride: p.stride,
+                        page_size: p.page_size,
+                        n_keys: n,
+                        n_keys_offset: 0,
+                        n_keys_stride: usize::from(p.n_keys.len() > 1),
+                    })
+                }
                 _ => None,
             };
 
@@ -4021,6 +4026,11 @@ impl lloom_tensor::CustomOp3 for FlashDecoding<'_> {
         let geometry = self.geometry.ok_or_else(|| {
             lloom_tensor::Error::Msg("flash-decoding: missing checked geometry".into())
         })?;
+        geometry.validate_backings([
+            q.buffer().length(),
+            k.buffer().length(),
+            v.buffer().length(),
+        ])?;
         let elem_count = geometry.output_elements;
         let itype = match q.dtype() {
             DType::F16 => FlashDType::F16,
@@ -4217,7 +4227,11 @@ impl lloom_tensor::CustomOp3 for FlashDecoding<'_> {
                 };
                 (t, n)
             }
-            (None, Some(t), Some(n)) => (t, n),
+            (None, Some(t), Some(n)) => {
+                // SAFETY: this sealed cache holder spans the read-only native
+                // call and its normal counted pool retirement below.
+                (unsafe { t.buffer_unchecked() }, n)
+            }
             _ => unreachable!("either bound or uploaded"),
         };
         let mut partial = lloom_tensor::kernels::FlashPartialParams::for_step(
@@ -4285,8 +4299,8 @@ impl lloom_tensor::CustomOp3 for FlashDecoding<'_> {
                 &sums,
                 &maxs,
                 chunk_table,
-                &partial_params,
-                &combine_params,
+                partial_params.buffer_unchecked(),
+                combine_params.buffer_unchecked(),
                 &walk_order,
                 n_keys_per_seq,
                 n_q_heads,

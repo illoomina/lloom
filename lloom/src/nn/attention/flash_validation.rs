@@ -28,6 +28,7 @@ pub(crate) struct Geometry {
     pub chunks: usize,
     pub output_elements: usize,
     pub min_ragged_keys: Option<u32>,
+    required_bytes: [usize; 3],
 }
 
 fn product(values: &[usize]) -> Result<usize> {
@@ -38,6 +39,29 @@ fn product(values: &[usize]) -> Result<usize> {
         .ok_or_else(|| {
             lloom_tensor::Error::Msg("flash-decoding: extent/byte arithmetic overflow".into())
         })
+}
+
+fn read_span(
+    layout: &Layout,
+    rows: usize,
+    heads: usize,
+    tokens: usize,
+    dim: usize,
+    width: usize,
+) -> Result<usize> {
+    let used = [rows, heads, tokens, dim];
+    let last =
+        used.iter()
+            .zip(layout.stride())
+            .try_fold(layout.start_offset(), |at, (&n, &stride)| {
+                at.checked_add(product(&[n - 1, stride])?).ok_or_else(|| {
+                    lloom_tensor::Error::Msg("flash-decoding: physical read span overflow".into())
+                })
+            })?;
+    let end = last.checked_add(1).ok_or_else(|| {
+        lloom_tensor::Error::Msg("flash-decoding: physical read span overflow".into())
+    })?;
+    product(&[end, width])
 }
 
 fn native_int(value: usize) -> Result<()> {
@@ -278,6 +302,16 @@ pub(crate) fn validate(
         lloom_tensor::Error::Msg("flash-decoding: query index exceeds U32 native range".into())
     })?;
     product(&[output_elements, dtype.size_in_bytes()])?;
+    let (pool_rows, read_keys) = match pages {
+        Some(p) => (1, p.max_read_end),
+        None => (qd[0], keys),
+    };
+    let width = dtype.size_in_bytes();
+    let required_bytes = [
+        read_span(q, qd[0], qd[1], 1, qd[3], width)?,
+        read_span(k, pool_rows, kd[1], read_keys, kd[3], width)?,
+        read_span(v, pool_rows, vd[1], read_keys, vd[3], width)?,
+    ];
     Ok(Geometry {
         heads,
         dim: qd[3],
@@ -286,11 +320,28 @@ pub(crate) fn validate(
         chunks,
         output_elements,
         min_ragged_keys: pages.and_then(|p| p.min_ragged_keys),
+        required_bytes,
     })
 }
 
 #[cfg(any(feature = "metal", test))]
 impl Geometry {
+    /// The kernel reads only the selected rows and published physical ranges.
+    /// Logical spare capacity cannot substitute for authentic backing bytes.
+    pub fn validate_backings(self, bytes: [usize; 3]) -> Result<()> {
+        for ((required, actual), name) in self
+            .required_bytes
+            .into_iter()
+            .zip(bytes)
+            .zip(["Q", "K", "V"])
+        {
+            if required > actual {
+                lloom_tensor::bail!("flash-decoding: {name} read span exceeds native buffer view")
+            }
+        }
+        Ok(())
+    }
+
     /// Validate every scratch shape and native cast before allocating output.
     pub fn validate_capacity(self, capacity: usize) -> Result<()> {
         validate_chunk_count(self.chunks)?;
@@ -466,6 +517,81 @@ mod tests {
     }
 
     #[test]
+    fn physical_spans_consume_only_query_rows_and_live_value_keys() -> Result<()> {
+        let q = Layout::contiguous(&[2, 4, 1, 64]);
+        let k = Layout::contiguous(&[3, 2, 17, 64]);
+        let v = Layout::contiguous(&[4, 2, 512, 64]);
+        let geometry = plain(&q, &k, &v, 256, 1)?;
+        assert_eq!(geometry.required_bytes, [2048, 17408, 397568]);
+        geometry.validate_backings([2048, 17408, 397568])?;
+        for (at, label) in ["Q", "K", "V"].into_iter().enumerate() {
+            let mut bytes = geometry.required_bytes;
+            bytes[at] -= 1;
+            let error = geometry.validate_backings(bytes).unwrap_err().to_string();
+            assert!(
+                error.contains(&format!("{label} read span exceeds native buffer view")),
+                "{error}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn physical_spans_include_each_offset_and_element_width() -> Result<()> {
+        let q = Layout::contiguous_with_offset(&[1, 1, 1, 32], 3);
+        let k = Layout::contiguous_with_offset(&[1, 1, 2, 32], 7);
+        let v = Layout::contiguous_with_offset(&[1, 1, 2, 32], 11);
+        let geometry = validate(&q, &k, &v, DType::F16, DType::F16, DType::F16, 256, 1, None)?;
+        assert_eq!(geometry.required_bytes, [70, 142, 150]);
+        geometry.validate_backings([70, 142, 150])?;
+        assert!(geometry.validate_backings([69, 142, 150]).is_err());
+        assert!(geometry.validate_backings([70, 141, 150]).is_err());
+        assert!(geometry.validate_backings([70, 142, 149]).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn paged_physical_spans_use_live_partial_tail_not_padded_entries() -> Result<()> {
+        let summary = prepare_pages(
+            Pages {
+                entries: &[2, 100, 0, 3],
+                stride: 2,
+                keys: &[1, 257],
+            },
+            2,
+            256,
+            1,
+        )?;
+        let q = Layout::contiguous(&[2, 4, 1, 64]);
+        let k = Layout::contiguous(&[1, 2, 1024, 64]);
+        let v = Layout::contiguous(&[1, 2, 800, 64]);
+        let geometry = validate(
+            &q,
+            &k,
+            &v,
+            DType::F32,
+            DType::F32,
+            DType::F32,
+            256,
+            1,
+            Some(&summary),
+        )?;
+        assert_eq!(geometry.required_bytes, [2048, 459008, 401664]);
+        geometry.validate_backings([2048, 459008, 401664])?;
+        assert!(geometry.validate_backings([2048, 459007, 401664]).is_err());
+        assert!(geometry.validate_backings([2048, 459008, 401663]).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn physical_span_arithmetic_refuses_before_any_native_access() {
+        let q = Layout::contiguous_with_offset(&[1, 1, 1, 64], usize::MAX - 63);
+        assert!(read_span(&q, 1, 1, 1, 64, 4).is_err());
+        let stride = Layout::new((&[2, 1, 1, 64]).into(), vec![usize::MAX, 64, 64, 1], 0);
+        assert!(read_span(&stride, 2, 1, 1, 64, 4).is_err());
+    }
+
+    #[test]
     fn combine_stride_increment_is_checked_without_giant_metadata() {
         let mut g = Geometry {
             heads: 1,
@@ -475,6 +601,7 @@ mod tests {
             chunks: i32::MAX as usize,
             output_elements: 64,
             min_ragged_keys: None,
+            required_bytes: [256; 3],
         };
         let error = g.validate_capacity(g.chunks).unwrap_err().to_string();
         assert!(error.contains("signed combine loop range"), "{error}");

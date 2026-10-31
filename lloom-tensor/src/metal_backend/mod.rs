@@ -45,7 +45,7 @@ pub(crate) use device::retain_evicted_allocations;
 mod physical_context;
 pub use device::{
     served_pass_request_sites, set_admission_drain, set_served_request_trace, wire_weights_on,
-    DeviceId, MetalDevice, PassPlansPaused,
+    ConstantBuffer, DeviceId, MetalDevice, PassPlansPaused,
 };
 mod host_fed;
 mod host_slot;
@@ -5081,7 +5081,7 @@ impl MetalStorage {
                 &dst.buffer,
                 &slots.buffer,
                 g.slots_offset * DType::U32.size_in_bytes(),
-                &params_buf,
+                params_buf.buffer_unchecked(),
                 n_rows,
                 g.n_kv_heads,
                 g.head_dim,

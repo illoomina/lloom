@@ -99,6 +99,66 @@ impl FlashDecodingMetadata {
         })
     }
 
+    /// Publish a new pass while retaining unchanged private table storage.
+    ///
+    /// Performs shared metadata validation and exact table comparison once per
+    /// pass, not per attention layer. Only a changed table/device is uploaded;
+    /// live counts are uploaded once per pass. Returned old vectors can be
+    /// reused as the producer's staging allocations. Failure keeps this owner's
+    /// prior host values, native publication and checked summary unchanged.
+    #[allow(clippy::too_many_arguments)]
+    pub fn republish(
+        &mut self,
+        table: Vec<u32>,
+        table_stride: usize,
+        keys: Vec<u32>,
+        rows: usize,
+        device: &Device,
+    ) -> Result<(Vec<u32>, Vec<u32>)> {
+        self.republish_with(table, table_stride, keys, rows, device, |data, device| {
+            Tensor::new(data, device)
+        })
+    }
+
+    fn republish_with(
+        &mut self,
+        table: Vec<u32>,
+        table_stride: usize,
+        keys: Vec<u32>,
+        rows: usize,
+        device: &Device,
+        mut upload: impl FnMut(&[u32], &Device) -> Result<Tensor>,
+    ) -> Result<(Vec<u32>, Vec<u32>)> {
+        let (page_size, pages_per_chunk) = self.page_geometry();
+        let summary = prepare_pages(
+            Pages {
+                entries: &table,
+                stride: table_stride,
+                keys: &keys,
+            },
+            rows,
+            page_size,
+            pages_per_chunk,
+        )?;
+        let replacement = if table != self.table || !self.table_t.device().same_device(device) {
+            Some(upload(&table, device)?)
+        } else {
+            None
+        };
+        let keys_t = upload(&keys, device)?;
+        let staging = (
+            std::mem::replace(&mut self.table, table),
+            std::mem::replace(&mut self.keys, keys),
+        );
+        self.table_stride = table_stride;
+        self.summary = summary;
+        if let Some(table_t) = replacement {
+            self.table_t = table_t;
+        }
+        self.keys_t = keys_t;
+        Ok(staging)
+    }
+
     /// Host table; immutable, including while native consumers are queued.
     pub fn table(&self) -> &[u32] {
         &self.table
@@ -185,6 +245,14 @@ mod flash_validation_tests {
     use crate::nn::attention::flash_validation::preparation_count;
     use crate::nn::ops::{flash_decoding_paged_metadata, FlashScratchSizing};
     use lloom_tensor::DType;
+
+    // Test-only backing-object identity; scoped guards never survive a later
+    // write/readback. This is not native reuse or concurrency authority.
+    fn shares_storage(left: &Tensor, right: &Tensor) -> bool {
+        let (left, _) = left.storage_and_layout();
+        let (right, _) = right.storage_and_layout();
+        std::ptr::eq(&*left, &*right)
+    }
 
     #[test]
     fn upload_owner_moves_host_vectors_and_initializes_matching_values() -> Result<()> {
@@ -319,6 +387,250 @@ mod flash_validation_tests {
             assert!(!printed.contains("Tensor["), "{printed}");
         }
         assert!(format!("{owner:?}").contains("table_entries"));
+        Ok(())
+    }
+
+    #[test]
+    fn stable_table_republication_uploads_only_counts_and_recovers_staging() -> Result<()> {
+        let device = Device::Cpu;
+        let table = vec![0, 1];
+        let keys = vec![1];
+        let old_ptrs = (table.as_ptr(), keys.as_ptr());
+        let mut owner = FlashDecodingMetadata::new(table, 1, keys, 2, 256, 1, &device)?;
+        let old_table = owner.table_t.clone();
+        let old_keys = owner.keys_t.clone();
+        let next_table = vec![0, 1];
+        let next_keys = vec![2];
+        let next_ptrs = (next_table.as_ptr(), next_keys.as_ptr());
+        let mut uploads = 0;
+        let staging = owner.republish_with(next_table, 1, next_keys, 2, &device, |data, d| {
+            uploads += 1;
+            Tensor::new(data, d)
+        })?;
+        assert_eq!(
+            uploads, 1,
+            "an unchanged private table must not be uploaded"
+        );
+        assert!(shares_storage(&owner.table_t, &old_table));
+        assert!(!shares_storage(&owner.keys_t, &old_keys));
+        assert_eq!((staging.0.as_ptr(), staging.1.as_ptr()), old_ptrs);
+        assert_eq!((owner.table.as_ptr(), owner.keys.as_ptr()), next_ptrs);
+        assert_eq!(old_keys.to_vec1::<u32>()?, vec![1]);
+        assert_eq!(owner.keys_t.to_vec1::<u32>()?, vec![2]);
+        Ok(())
+    }
+
+    #[test]
+    fn changed_table_republication_retains_old_native_values() -> Result<()> {
+        let device = Device::Cpu;
+        let mut owner =
+            FlashDecodingMetadata::new(vec![0, 1, 2, 3], 2, vec![257], 2, 256, 1, &device)?;
+        let old_table = owner.table_t.clone();
+        let old_keys = owner.keys_t.clone();
+        let mut uploads = 0;
+        owner.republish_with(vec![3, 1, 0, 2], 2, vec![258], 2, &device, |data, d| {
+            uploads += 1;
+            Tensor::new(data, d)
+        })?;
+        assert_eq!(uploads, 2);
+        assert!(!shares_storage(&owner.table_t, &old_table));
+        assert_eq!(old_table.to_vec1::<u32>()?, vec![0, 1, 2, 3]);
+        assert_eq!(old_keys.to_vec1::<u32>()?, vec![257]);
+        assert_eq!(owner.table_t.to_vec1::<u32>()?, vec![3, 1, 0, 2]);
+        assert_eq!(owner.keys_t.to_vec1::<u32>()?, vec![258]);
+        Ok(())
+    }
+
+    #[test]
+    fn unchanged_table_bytes_with_new_stride_reuse_payload_but_revalidate_span() -> Result<()> {
+        let device = Device::Cpu;
+        let mut owner =
+            FlashDecodingMetadata::new(vec![0, 1, 2, 3], 1, vec![1], 2, 256, 1, &device)?;
+        let old_table = owner.table_t.clone();
+        let mut uploads = 0;
+        owner.republish_with(vec![0, 1, 2, 3], 2, vec![2], 2, &device, |data, d| {
+            uploads += 1;
+            Tensor::new(data, d)
+        })?;
+        assert_eq!(uploads, 1, "a stride change is not a native byte change");
+        assert!(shares_storage(&owner.table_t, &old_table));
+        assert_eq!(owner.table_stride(), 2);
+        let q = Tensor::zeros((2, 1, 1, 64), DType::F32, &device)?;
+        let short = Tensor::zeros((1, 1, 513, 64), DType::F32, &device)?;
+        let error = flash_decoding_paged_metadata(
+            &q,
+            &short,
+            &short,
+            1.,
+            1.,
+            FlashScratchSizing::Grow,
+            0,
+            &owner,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("page span exceeds K/V pool"), "{error}");
+        let valid = Tensor::zeros((1, 1, 514, 64), DType::F32, &device)?;
+        let error = flash_decoding_paged_metadata(
+            &q,
+            &valid,
+            &valid,
+            1.,
+            1.,
+            FlashScratchSizing::Grow,
+            0,
+            &owner,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("no cpu support"), "{error}");
+        Ok(())
+    }
+
+    #[test]
+    fn failed_count_upload_keeps_previous_publication_transactional() -> Result<()> {
+        let device = Device::Cpu;
+        let mut owner = FlashDecodingMetadata::new(vec![0, 1], 1, vec![1], 2, 256, 1, &device)?;
+        let old_table = owner.table_t.clone();
+        let old_keys = owner.keys_t.clone();
+        let old_ptrs = (owner.table.as_ptr(), owner.keys.as_ptr());
+        let mut uploads = 0;
+        let error = owner
+            .republish_with(vec![2, 3], 1, vec![2], 2, &device, |data, d| {
+                uploads += 1;
+                if uploads == 2 {
+                    lloom_tensor::bail!("injected count upload failure")
+                }
+                Tensor::new(data, d)
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("injected count upload failure"), "{error}");
+        assert_eq!(uploads, 2);
+        assert_eq!(owner.table(), &[0, 1]);
+        assert_eq!(owner.keys(), &[1]);
+        assert_eq!((owner.table.as_ptr(), owner.keys.as_ptr()), old_ptrs);
+        assert!(shares_storage(&owner.table_t, &old_table));
+        assert!(shares_storage(&owner.keys_t, &old_keys));
+        let q = Tensor::zeros((2, 1, 1, 64), DType::F32, &device)?;
+        let pool = Tensor::zeros((1, 1, 257, 64), DType::F32, &device)?;
+        let error = flash_decoding_paged_metadata(
+            &q,
+            &pool,
+            &pool,
+            1.,
+            1.,
+            FlashScratchSizing::Grow,
+            0,
+            &owner,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("no cpu support"),
+            "stale new summary: {error}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_republication_refuses_before_any_upload_or_host_change() -> Result<()> {
+        let device = Device::Cpu;
+        let mut owner = FlashDecodingMetadata::new(vec![0, 1], 1, vec![1], 2, 256, 1, &device)?;
+        let mut uploads = 0;
+        let error = owner
+            .republish_with(vec![0], 1, vec![1], 2, &device, |data, d| {
+                uploads += 1;
+                Tensor::new(data, d)
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("chunk table is shorter than live rows"),
+            "{error}"
+        );
+        assert_eq!(uploads, 0);
+        assert_eq!(owner.table(), &[0, 1]);
+        assert_eq!(owner.keys(), &[1]);
+        Ok(())
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn native_views_add_buffer_base_and_layout_offsets_independently() -> Result<()> {
+        use lloom_tensor::kernels::metal::{Buffer, BufferHandle, PooledBuffer};
+        use lloom_tensor::{op::BackpropOp, MetalStorage, Storage};
+        let device = Device::new_metal(0)?;
+        let metal = device.as_metal_device()?;
+        assert_native_fixture_arm(metal, "view-base-plus-layout-offset");
+        let mut q_data = vec![0f32; 112];
+        q_data[48] = 1.;
+        let mut k_data = vec![0f32; 200];
+        k_data[72] = 1.;
+        k_data[136] = -1.;
+        let mut v_data = vec![-7f32; 192];
+        v_data[64..128].fill(1.);
+        v_data[128..192].fill(3.);
+        // Keep the genuine creator tensors through final readback. A native
+        // Buffer view alone is not the legacy pool's creator reuse census.
+        let q_base = Tensor::new(q_data.as_slice(), &device)?;
+        let k_base = Tensor::new(k_data.as_slice(), &device)?;
+        let v_base = Tensor::new(v_data.as_slice(), &device)?;
+        let view_tensor = |base: &Tensor,
+                           at: usize,
+                           bytes: usize,
+                           skip: usize,
+                           shape: [usize; 4]|
+         -> Result<Tensor> {
+            let (storage, _) = base.storage_and_layout();
+            let Storage::Metal(storage) = &*storage else {
+                unreachable!("Metal fixture input")
+            };
+            let native: Buffer = storage.buffer().view(at, bytes);
+            let handle = BufferHandle::new(PooledBuffer::unpooled(native, bytes));
+            let tensor = Tensor::from_storage(
+                Storage::Metal(MetalStorage::new(
+                    handle,
+                    metal.clone(),
+                    bytes / 4,
+                    DType::F32,
+                )),
+                bytes / 4,
+                BackpropOp::none(),
+                false,
+            );
+            tensor
+                .narrow(0, skip, shape.iter().product())?
+                .reshape(shape)
+        };
+        let q = view_tensor(&q_base, 128, 320, 16, [1, 1, 1, 64])?;
+        let k = view_tensor(&k_base, 192, 608, 24, [1, 1, 2, 64])?;
+        let v = view_tensor(&v_base, 128, 640, 32, [1, 1, 2, 64])?;
+        assert_eq!(q.layout().start_offset(), 16);
+        assert_eq!(k.layout().start_offset(), 24);
+        assert_eq!(v.layout().start_offset(), 32);
+        let metadata = FlashDecodingMetadata::new(vec![0], 1, vec![2], 1, 256, 1, &device)?;
+        let output = flash_decoding_paged_metadata(
+            &q,
+            &k,
+            &v,
+            1.,
+            1.,
+            FlashScratchSizing::Grow,
+            0,
+            &metadata,
+        )?;
+        let actual = output.flatten_all()?.to_vec1::<f32>()?;
+        let expected = (1f32.exp() + 3. * (-1f32).exp()) / (1f32.exp() + (-1f32).exp());
+        assert_eq!(actual.len(), 64);
+        for (at, &value) in actual.iter().enumerate() {
+            assert!(
+                (value - expected).abs() <= 2e-6,
+                "offset control channel {at}: {value} vs {expected}"
+            );
+        }
+        drop((q, k, v));
+        drop((q_base, k_base, v_base));
         Ok(())
     }
 

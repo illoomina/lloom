@@ -8,6 +8,13 @@
 //! this file is its own binary with one test. Its positive control is the
 //! same read without the scratch, which allocates the cold rows' indices and
 //! bytes per call: a counter that reads 0 there is not counting.
+//!
+//! With debug assertions on, objc2 checks every message send's signature
+//! against the runtime's (`objc2` `runtime/message_receiver.rs`,
+//! `msg_send_check`), and that check allocates: the fill's one message, the
+//! event's `setSignaledValue`, is then one allocation a token that the
+//! shipping build does not make. So the fill is held to the bare signal's
+//! count, measured beside it, and to zero where debug assertions are off.
 
 use lloom::nn::ngram_memory::{
     read_worker_stats, MmapRows, NgramHash, ReadPolicy, ReadPool, ReadScratch, PER_LAYER_TOKEN_EMBD,
@@ -210,8 +217,27 @@ fn fill_on_metal(path: &std::path::Path, hash: &NgramHash) -> Result<()> {
         fill.fill(t)?;
     }
     let fills = allocs() - a0;
-    println!("ALLOCS fill={fills} over {} tokens", tokens.len() - 2);
-    assert_eq!(fills, 0, "the producer's fill allocated");
+    let n = tokens.len() - 2;
+    // The bare signal, as many times, on a ring of its own.
+    let other = HostFedRing::new(&m, HOST_FILL_SLOTS, hash.n_heads() * HEAD_DIM)?;
+    let base = other.base();
+    other.signal(base + 1);
+    let a0 = allocs();
+    for k in 0..n as u64 {
+        other.signal(base + 2 + k);
+    }
+    let signals = allocs() - a0;
+    println!(
+        "ALLOCS fill={fills} signal={signals} over {n} tokens (debug assertions {})",
+        cfg!(debug_assertions)
+    );
+    assert_eq!(
+        fills, signals,
+        "the producer's fill allocated beyond its signal's message send"
+    );
+    if !cfg!(debug_assertions) {
+        assert_eq!(fills, 0, "the producer's fill allocated");
+    }
     assert_eq!(fill.filled(), tokens.len() as u64);
     Ok(())
 }

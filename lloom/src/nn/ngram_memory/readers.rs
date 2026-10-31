@@ -191,11 +191,6 @@ fn start(threads: usize) -> Option<&'static Readers> {
 }
 
 impl Readers {
-    /// Threads in the set.
-    pub fn threads(&self) -> usize {
-        self.workers.len()
-    }
-
     pub fn stats(&self) -> ReaderStats {
         let c = &self.counters;
         ReaderStats {

@@ -284,4 +284,62 @@ mod flash_validation_tests {
         );
         Ok(())
     }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn resident_mapped_suffix_preserves_an_encoded_old_prefix_reader() -> Result<()> {
+        let device = Device::new_metal(0)?;
+        let metal = device.as_metal_device()?;
+        eprintln!(
+            "FLASH_METADATA_NATIVE control=mapped-suffix-encoded-uncommitted api={} cb_kind={:?}",
+            metal.commands().actual_command_api(),
+            metal.command_buffer_kind()
+        );
+        // Keep this fixture's two casts encoded/pending until after the host append.
+        // No waited event, giant tensor or intentionally invalid GPU access.
+        metal.set_compute_per_buffer(usize::MAX);
+        let mut owner = ResidentMetadata::new(256, 1, 4)?;
+        owner.publish_suffix(&[2], &device)?;
+        let old_count = ResidentCount::new(1, &device)?;
+        let clock = metal.commands().clock();
+        let epoch = clock.current_epoch();
+        let completed = clock.completed_count();
+        let (old_prefix, old_live) = {
+            let read = owner.read(&old_count)?;
+            let (table, count) = read.bindings();
+            // to_dtype(U32->F32) reaches actual cast_u32_f32 dispatches; not a
+            // same-dtype Tensor clone or CPU readback masquerading as a GPU reader.
+            (
+                table.narrow(0, 0, 1)?.to_dtype(DType::F32)?,
+                count.to_dtype(DType::F32)?,
+            )
+        };
+        assert_eq!(
+            clock.current_epoch(),
+            epoch,
+            "fixture unexpectedly cut its command buffer"
+        );
+        assert_eq!(
+            clock.completed_count(),
+            completed,
+            "fixture unexpectedly completed before append"
+        );
+        // Failure-inject ONLY the replacement-upload branch: success now proves
+        // that the real unsafe mapped suffix-write path was exercised.
+        owner.publish_with(&[3], &device, |_, _| {
+            lloom_tensor::bail!("native control unexpectedly used replacement upload")
+        })?;
+        let next_count = ResidentCount::new(257, &device)?;
+        let next = owner.read(&next_count)?;
+        let (table, count) = next.bindings();
+        let new_prefix = table.narrow(0, 0, 2)?.to_dtype(DType::F32)?;
+        let new_live = count.to_dtype(DType::F32)?;
+        // The readbacks flush after the append; old encoded work must still observe
+        // its old immutable prefix/count, while new work sees the appended table.
+        assert_eq!(old_prefix.to_vec1::<f32>()?, &[2.]);
+        assert_eq!(old_live.to_vec1::<f32>()?, &[1.]);
+        assert_eq!(new_prefix.to_vec1::<f32>()?, &[2., 3.]);
+        assert_eq!(new_live.to_vec1::<f32>()?, &[257.]);
+        Ok(())
+    }
 }

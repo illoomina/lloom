@@ -195,4 +195,110 @@ mod flash_validation_tests {
         assert!(printed.contains("table_entries"));
         Ok(())
     }
+
+    /// This native fixture separately proves that both instruments can see a
+    /// valid dispatch. Refusal alone is not evidence of no allocation/encoding
+    /// if a disabled instrument always reports zero.
+    #[cfg(feature = "metal")]
+    #[test]
+    fn owner_refusals_precede_native_pool_lookup_and_dispatch() -> Result<()> {
+        let device = Device::new_metal(0)?;
+        let metal = device.as_metal_device()?;
+        eprintln!(
+            "FLASH_METADATA_NATIVE control=pre-builder-refusals api={} cb_kind={:?}",
+            metal.commands().actual_command_api(),
+            metal.command_buffer_kind()
+        );
+        let q = Tensor::zeros((1, 1, 1, 64), DType::F32, &device)?;
+        let k = Tensor::zeros((1, 1, 769, 64), DType::F32, &device)?;
+        let short_v = Tensor::zeros((1, 1, 768, 64), DType::F32, &device)?;
+        let valid_v = Tensor::ones((1, 1, 769, 64), DType::F32, &device)?;
+        let metadata = FlashDecodingMetadata::new(vec![3], 1, vec![1], 1, 256, 1, &device)?;
+        let cpu_metadata =
+            FlashDecodingMetadata::new(vec![0], 1, vec![1], 1, 256, 1, &Device::Cpu)?;
+        let lookups = || {
+            let (shared, private) = metal.pool_counters();
+            (shared.lookups, private.lookups)
+        };
+        let before = lookups();
+        let census = metal.dispatch_census().open().map_err(|e| {
+            lloom_tensor::Error::Msg(format!("native refusal control census unavailable: {e:?}"))
+        })?;
+        let bad_publication =
+            FlashDecodingMetadata::new(vec![u32::MAX], 1, vec![1], 1, 256, 1, &device)
+                .unwrap_err()
+                .to_string();
+        assert!(
+            bad_publication.contains("signed native token range"),
+            "{bad_publication}"
+        );
+        let bad_pool = flash_decoding_paged_metadata(
+            &q,
+            &k,
+            &short_v,
+            1.,
+            1.,
+            FlashScratchSizing::Grow,
+            0,
+            &metadata,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            bad_pool.contains("page span exceeds K/V pool"),
+            "{bad_pool}"
+        );
+        let bad_device = flash_decoding_paged_metadata(
+            &q,
+            &k,
+            &valid_v,
+            1.,
+            1.,
+            FlashScratchSizing::Grow,
+            0,
+            &cpu_metadata,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            bad_device.contains("metadata must share the query device"),
+            "{bad_device}"
+        );
+        assert_eq!(
+            lookups(),
+            before,
+            "a refused native call visited a buffer pool"
+        );
+        assert!(
+            census.close().is_empty(),
+            "a refused native call encoded a dispatch"
+        );
+
+        let before_positive = lookups();
+        let positive = metal.dispatch_census().open().map_err(|e| {
+            lloom_tensor::Error::Msg(format!("native positive census unavailable: {e:?}"))
+        })?;
+        let output = flash_decoding_paged_metadata(
+            &q,
+            &k,
+            &valid_v,
+            1.,
+            1.,
+            FlashScratchSizing::Grow,
+            0,
+            &metadata,
+        )?;
+        let dispatches = positive.close();
+        let after_positive = lookups();
+        assert!(
+            after_positive.0 > before_positive.0 || after_positive.1 > before_positive.1,
+            "the pool-lookup instrument did not observe an actual valid output/scratch allocation",
+        );
+        assert!(
+            dispatches.iter().any(|(_, count)| *count > 0),
+            "the dispatch instrument missed the valid attention kernel"
+        );
+        assert_eq!(output.flatten_all()?.to_vec1::<f32>()?, vec![1.; 64]);
+        Ok(())
+    }
 }

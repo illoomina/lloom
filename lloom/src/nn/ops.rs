@@ -1380,6 +1380,129 @@ impl lloom_tensor::CustomOp2 for RmsNorm {
     }
 }
 
+#[cfg(feature = "metal")]
+#[derive(Debug, Clone)]
+struct AddRmsNorm {
+    eps: f32,
+}
+
+#[cfg(feature = "metal")]
+impl lloom_tensor::CustomOp3 for AddRmsNorm {
+    fn name(&self) -> &'static str {
+        "add-rms-norm"
+    }
+
+    fn cpu_fwd(
+        &self,
+        _: &CpuStorage,
+        _: &Layout,
+        _: &CpuStorage,
+        _: &Layout,
+        _: &CpuStorage,
+        _: &Layout,
+    ) -> Result<(CpuStorage, Shape)> {
+        lloom_tensor::bail!("add-rms-norm: CPU uses the composed operations")
+    }
+
+    fn metal_fwd(
+        &self,
+        lhs: &lloom_tensor::MetalStorage,
+        ll: &Layout,
+        rhs: &lloom_tensor::MetalStorage,
+        rl: &Layout,
+        alpha: &lloom_tensor::MetalStorage,
+        al: &Layout,
+    ) -> Result<(lloom_tensor::MetalStorage, Shape)> {
+        use lloom_tensor::backend::BackendStorage;
+        use lloom_tensor::kernels::BufferOffset;
+        let device = lhs.device();
+        let n = ll.shape().elem_count();
+        let width = *ll
+            .dims()
+            .last()
+            .ok_or_else(|| lloom_tensor::Error::Msg("add-rms-norm: scalar".into()))?;
+        let name = match lhs.dtype() {
+            DType::F16 => "add_rmsnorm_f16",
+            DType::BF16 => "add_rmsnorm_bf16",
+            DType::F32 => "add_rmsnorm_f32",
+            dt => lloom_tensor::bail!("add-rms-norm: unsupported {dt:?}"),
+        };
+        let output = device
+            .new_buffer_builder()
+            .with_size_for(2 * n, lhs.dtype())
+            .with_label("add-rms-norm")
+            .build()?;
+        let encoder = device.command_encoder()?;
+        let offset = |buffer, layout: &Layout| BufferOffset {
+            buffer,
+            offset_in_bytes: layout.start_offset() * lhs.dtype().size_in_bytes(),
+        };
+        // SAFETY: the public wrapper validates contiguous input extents; the
+        // output is freshly allocated for both complete planes.
+        unsafe {
+            lloom_tensor::kernels::call_add_rms_norm(
+                device.metal_device(),
+                &encoder,
+                device.kernels(),
+                name,
+                n,
+                width,
+                self.eps,
+                offset(lhs.buffer(), ll),
+                offset(rhs.buffer(), rl),
+                offset(alpha.buffer(), al),
+                &output,
+            )
+        }
+        .map_err(lloom_tensor::Error::wrap)?;
+        let storage =
+            lloom_tensor::MetalStorage::new_allocated(output, device.clone(), 2 * n, lhs.dtype())?;
+        Ok((storage, Shape::from((2, n))))
+    }
+}
+
+/// The rounded residual sum and its RMSNorm, in one Metal dispatch for
+/// contiguous operands; the existing operations compose on other backends
+/// and layouts. Both returned tensors are contiguous, non-overlapping views.
+pub fn add_rms_norm(
+    lhs: &Tensor,
+    rhs: &Tensor,
+    alpha: &Tensor,
+    eps: f32,
+) -> Result<(Tensor, Tensor)> {
+    #[cfg(feature = "metal")]
+    if add_rms_norm_applies(lhs, rhs, alpha) {
+        let both = lhs.apply_op3_no_bwd(rhs, alpha, &AddRmsNorm { eps })?;
+        return Ok((
+            both.get(0)?.reshape(lhs.shape())?,
+            both.get(1)?.reshape(lhs.shape())?,
+        ));
+    }
+    let sum = (lhs + rhs)?;
+    let norm = rms_norm(&sum, alpha, eps)?;
+    Ok((sum, norm))
+}
+
+/// Whether the add-norm fusion can read these operands without a copy.
+pub fn add_rms_norm_applies(lhs: &Tensor, rhs: &Tensor, alpha: &Tensor) -> bool {
+    lhs.device().is_metal()
+        && lhs.device().same_device(rhs.device())
+        && lhs.device().same_device(alpha.device())
+        && lhs.shape() == rhs.shape()
+        && lhs.dtype() == rhs.dtype()
+        && lhs.dtype() == alpha.dtype()
+        && matches!(lhs.dtype(), DType::F16 | DType::BF16 | DType::F32)
+        && lhs.is_contiguous()
+        && rhs.is_contiguous()
+        && alpha.is_contiguous()
+        && lhs
+            .dims()
+            .last()
+            .is_some_and(|&d| d > 0 && alpha.dims() == [d])
+        && lhs.elem_count() > 0
+        && lhs.elem_count() <= u32::MAX as usize
+}
+
 /// RMSNorm and RoPE in one dispatch: each `[.., t, d]` row normalised by
 /// `alpha` and rotated at its own position by the `[t, d/2]` `cos`/`sin`
 /// rows, `rope`'s pairing `(i, i + d/2)`. Metal only; see [`rms_norm_rope`]

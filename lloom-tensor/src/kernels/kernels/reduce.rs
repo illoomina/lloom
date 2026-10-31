@@ -469,6 +469,73 @@ pub unsafe fn call_rms_norm_with(
     Ok(())
 }
 
+/// Add two contiguous rows and normalize the rounded sum. The output has
+/// two planes: the residual sum, then its RMSNorm.
+///
+/// # Safety
+/// `elements_to_sum` and `length` are positive, fit in `u32`, and `length`
+/// is an exact multiple of `elements_to_sum`. `kernel_name` selects the
+/// element type of every binding. The input offsets are element-aligned:
+/// `lhs` and `rhs` each cover `length` elements after their offsets, and
+/// `alpha` covers `elements_to_sum` elements after its offset. `output`
+/// covers `2 * length` elements from offset zero without size arithmetic
+/// overflow and does not overlap any input binding.
+///
+/// Every binding stays live, unreused and unwritten by the host until the
+/// command buffer completes, and while an ICB that captured it can replay
+/// ([`crate::kernels::utils::EncoderParam`]).
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn call_add_rms_norm(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    kernel_name: &'static str,
+    length: usize,
+    elements_to_sum: usize,
+    eps: f32,
+    lhs: BufferOffset<'_>,
+    rhs: BufferOffset<'_>,
+    alpha: BufferOffset<'_>,
+    output: &Buffer,
+) -> Result<(), MetalKernelError> {
+    let style = ParamStyle::default();
+    let name = style.kernel_name(kernel_name);
+    let pipeline = kernels.load_pipeline(device, Source::Reduce, name)?;
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoder = encoder.as_ref();
+    encoder.set_compute_pipeline_state(&pipeline);
+    let _capture = begin_packed_params(encoder, style);
+    // SAFETY: the caller supplies the live, correctly sized bindings above.
+    unsafe {
+        set_params!(
+            encoder,
+            (
+                length as u32,
+                elements_to_sum as u32,
+                &lhs,
+                &rhs,
+                Output::new(output),
+                &alpha,
+                eps
+            )
+        );
+    }
+    let _staged = finish_packed_params(device, encoder, style, NORM_PARAMS_ALIGN)?;
+    encoder.dispatch_thread_groups(
+        MTLSize {
+            width: length / elements_to_sum,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: rms_norm_width(&pipeline, elements_to_sum),
+            height: 1,
+            depth: 1,
+        },
+    );
+    Ok(())
+}
+
 /// The threadgroup width `call_rms_norm` dispatches for a row of `last_dim`
 /// elements: `min(max_threads, (last_dim / 2).next_power_of_two())`. Stated
 /// once, because the rotated form below requires it to equal `last_dim / 2`.

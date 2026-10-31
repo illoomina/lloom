@@ -1530,6 +1530,61 @@ template<typename T>
     norm_entry(rms_norm_case)
 }
 
+// Preserve the residual's storage rounding before the shared RMSNorm tree.
+// Each threadgroup owns one complete row in both output planes.
+template<typename T>
+METAL_FUNC void add_norm_row(
+    NormParams p, device const T *lhs, device const T *rhs,
+    device T *sum, uint tid, uint row, uint width
+) {
+    const uint offset = row * p.el_per_block;
+    const uint end = min(offset + p.el_per_block, p.src_numel);
+    for (uint i = offset + tid; i < end; i += width) {
+        sum[i] = static_cast<T>(lhs[i] + rhs[i]);
+    }
+    threadgroup_barrier(mem_flags::mem_device);
+}
+
+template<typename T>
+[[kernel]] void add_rms_norm_kernel(
+    constant uint &in_src_numel, constant uint &in_el_per_block,
+    device const T *lhs, device const T *rhs, device T *output,
+    device const T *alpha, constant float &in_eps,
+    uint tid [[thread_index_in_threadgroup]],
+    uint dst_id [[threadgroup_position_in_grid]],
+    uint block_dim [[threads_per_threadgroup]],
+    EOS_GATE_ARG
+) {
+    EOS_GATE_CHECK
+    NormParams p {in_src_numel, in_el_per_block, in_eps};
+    add_norm_row(p, lhs, rhs, output, tid, dst_id, block_dim);
+    device const T *src = output;
+    device T *dst = output + p.src_numel;
+    indexer_t<uint, false> indexer;
+    StoreNorm store;
+    norm_entry(rms_norm_case)
+}
+
+template<typename T>
+[[kernel]] void add_rms_norm_kernel_packed(
+    device const NormParams *pp,
+    device const T *lhs, device const T *rhs, device T *output,
+    device const T *alpha,
+    uint tid [[thread_index_in_threadgroup]],
+    uint dst_id [[threadgroup_position_in_grid]],
+    uint block_dim [[threads_per_threadgroup]],
+    EOS_GATE_ARG
+) {
+    EOS_GATE_CHECK
+    NormParams p = *pp;
+    add_norm_row(p, lhs, rhs, output, tid, dst_id, block_dim);
+    device const T *src = output;
+    device T *dst = output + p.src_numel;
+    indexer_t<uint, false> indexer;
+    StoreNorm store;
+    norm_entry(rms_norm_case)
+}
+
 // The scalars of the strided and the rotated RMSNorm entry points. One struct
 // for the three, as `NormParams` is one for the two norms: `num_dims` is read
 // by the strided forms and `t_len` by the rotated ones, and binding a field a
@@ -1682,6 +1737,8 @@ template<typename T>
 // together, in both binding styles, so an arm cannot exist at one dtype and
 // not another.
 #define init_rms_norm(tname, t)                                                             \
+    init_kernel("add_rmsnorm_" #tname, add_rms_norm_kernel, t)                            \
+    init_kernel("add_rmsnorm_" #tname "_packed", add_rms_norm_kernel_packed, t)           \
     init_kernel("rmsnorm_" #tname, rms_norm_kernel, t)                                      \
     init_kernel("rmsnorm_" #tname "_packed", rms_norm_kernel_packed, t)                     \
     init_kernel("rmsnorm_" #tname "_strided", rms_norm_kernel_strided, t)                   \

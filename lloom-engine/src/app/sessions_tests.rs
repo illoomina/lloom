@@ -513,10 +513,7 @@ fn a_slot_taken_for_a_new_session_says_idle_or_capacity() {
 
 #[test]
 fn over_the_byte_budget_the_least_recently_used_other_session_goes() {
-    let mut t = Table::new(Config {
-        max_bytes: 64,
-        ..cfg(4, true)
-    });
+    let mut t = Table::new(cfg(4, true));
     let now = Instant::now();
     let a = turn(
         &mut t,
@@ -528,6 +525,10 @@ fn over_the_byte_budget_the_least_recently_used_other_session_goes() {
         &[2],
         now,
     );
+    // Admit either complete session, but not both; logical payload bytes alone
+    // no longer describe this fixture's retained allocation requirement.
+    let one = t.bytes;
+    t.cfg.max_bytes = one + one / 2;
     let b = turn(
         &mut t,
         None,
@@ -870,4 +871,1353 @@ fn the_end_of_turn_id_is_the_sessions_but_not_the_engines() {
         vec![1, 2, 3],
         "the engine held the prompt and the reply"
     );
+}
+
+#[test]
+fn an_oversize_stored_session_declines_retention() {
+    let mut t = Table::new(Config {
+        max_bytes: 1024,
+        ..cfg(1, true)
+    });
+    let now = Instant::now();
+    let prompt = vec![1; 4096];
+    let ss = scopes(1);
+    let r = t.reserve(
+        Plan {
+            continued: None,
+            store: Some(true),
+            keep: None,
+            auth: Some([7; 32]),
+            prompt_ids: &prompt,
+            scopes: &ss,
+        },
+        now,
+    );
+    let kept = t.commit(
+        r,
+        Record {
+            messages: vec![json!({"role":"user","content":"large"})],
+            reply_msg: json!({"role":"assistant","content":"r"}),
+            prompt_ids: prompt,
+            reply: reply(&[2]),
+            eot: None,
+            scope: ss[1],
+            prefix: None,
+        },
+        now,
+    );
+    assert!(
+        !kept,
+        "successful generation must not retain an oversize lineage"
+    );
+    assert!(
+        t.bytes <= t.cfg.max_bytes,
+        "{} > {}",
+        t.bytes,
+        t.cfg.max_bytes
+    );
+    assert!(t
+        .resolve(&r.id.encode(), Some([7; 32]), false, now)
+        .is_err());
+}
+
+mod allocation_receipt {
+    pub use crate::app::test_alloc::{ALLOCATIONS, BLOCKS, LIVE};
+}
+
+#[test]
+fn repeated_small_turns_reset_delete_and_eviction_account_retained_allocations() {
+    use std::sync::atomic::Ordering;
+    let before_control = allocation_receipt::LIVE.load(Ordering::Relaxed);
+    let allocation = Box::new([0u8; 4096]);
+    std::hint::black_box(&allocation);
+    assert_eq!(
+        allocation_receipt::LIVE.load(Ordering::Relaxed) - before_control,
+        4096,
+        "the real allocator instrument must observe a live allocation"
+    );
+    drop(allocation);
+    assert_eq!(
+        allocation_receipt::LIVE.load(Ordering::Relaxed),
+        before_control,
+        "the instrument must observe its deallocation"
+    );
+    let mut t = Table::new(cfg(1, true));
+    let now = Instant::now();
+    eprintln!("retention allocator control: System requested live bytes; excludes allocator caches/rounding and fixed empty table");
+    let baseline = allocation_receipt::LIVE.load(Ordering::Relaxed);
+    let mut peak_undercharge = 0isize;
+    for cycle in 0..12 {
+        let mut previous = None;
+        for n in 0..32u8 {
+            let id = turn(
+                &mut t,
+                previous,
+                Some(true),
+                Some([9; 32]),
+                &[1],
+                &scopes(n.saturating_mul(2).saturating_add(1)),
+                &[2],
+                now,
+            );
+            previous = Some((id.key, id.turn as usize));
+        }
+        let key = previous.unwrap().0;
+        if cycle % 2 == 0 {
+            t.reset(key);
+        } else {
+            let id = t.slots[key.slot as usize].session.as_ref().unwrap();
+            let last = id.turns.last().unwrap();
+            let wire = WireId {
+                key,
+                turn: (id.turns.len() - 1) as u32,
+                nonce: last.nonce,
+            };
+            t.delete(&wire.encode(), Some([9; 32]), now).unwrap();
+        }
+        let live = allocation_receipt::LIVE.load(Ordering::Relaxed) - baseline;
+        peak_undercharge = peak_undercharge.max(live - t.bytes as isize);
+        eprintln!(
+            "retention cycle={cycle} allocator_live_requested={live} reported={} undercharge={}",
+            t.bytes,
+            live - t.bytes as isize
+        );
+    }
+    assert!(peak_undercharge <= 0,
+        "retained allocations exceed reported bytes by {peak_undercharge}; fixed empty table excluded");
+}
+
+fn assert_charge(t: &Table) {
+    let slow = t
+        .slots
+        .iter()
+        .map(|slot| {
+            let session = slot.session.as_ref().map_or(0, |s| {
+                s.ids.capacity() * size_of::<u32>()
+                    + s.messages.capacity() * size_of::<StoredMessage>()
+                    + s.messages
+                        .iter()
+                        .map(StoredMessage::heap_bytes)
+                        .sum::<usize>()
+                    + s.turns.capacity() * size_of::<Turn>()
+                    + s.turns
+                        .iter()
+                        .map(|turn| {
+                            reply_bytes(&turn.reply)
+                                + turn.prefix.as_ref().map_or(0, PrefixRecord::retained_bytes)
+                        })
+                        .sum::<usize>()
+                    + s.dropped.capacity() * size_of::<Dropped>()
+            });
+            session
+                + slot.released.capacity() * size_of::<Released>()
+                + slot
+                    .released
+                    .iter()
+                    .map(|r| {
+                        r.nonces.capacity() * size_of::<u64>()
+                            + r.dropped.capacity() * size_of::<Dropped>()
+                    })
+                    .sum::<usize>()
+        })
+        .sum::<usize>();
+    assert_eq!(
+        t.bytes, slow,
+        "cached accounting equals retained allocation oracle"
+    );
+    assert!(
+        t.bytes <= t.cfg.max_bytes,
+        "{} > {}",
+        t.bytes,
+        t.cfg.max_bytes
+    );
+}
+
+#[test]
+fn release_histories_share_the_byte_bound_and_authentication() {
+    let mut t = Table::new(Config {
+        max_bytes: 32 * 1024,
+        ..cfg(16, true)
+    });
+    let now = Instant::now();
+    let auth = Some([17; 32]);
+    let mut old = None;
+    for cycle in 0..160 {
+        let mut previous = None;
+        for n in 0..16u8 {
+            let id = turn(
+                &mut t,
+                previous,
+                Some(true),
+                auth,
+                &[1],
+                &scopes(2 * n + 1),
+                &[2],
+                now,
+            );
+            previous = Some((id.key, id.turn as usize));
+            assert_charge(&t);
+            if cycle == 0 && n == 0 {
+                old = Some(id);
+            }
+        }
+    }
+    let old = old.unwrap();
+    for auth in [None, Some([18; 32])] {
+        assert_eq!(
+            t.resolve(&old.encode(), auth, false, now)
+                .err()
+                .unwrap()
+                .reason,
+            None
+        );
+    }
+    assert_charge(&t);
+    assert!(
+        t.slots.iter().any(|s| s.released.len() < RELEASES_KEPT),
+        "byte pressure must limit the release history before the count-only ceiling"
+    );
+}
+
+#[test]
+fn unused_id_capacity_is_charged_and_an_oversize_publish_preserves_other_sessions() {
+    let mut t = Table::new(Config {
+        max_bytes: 32 * 1024,
+        ..cfg(4, true)
+    });
+    let now = Instant::now();
+    let a = turn(&mut t, None, Some(true), None, &[1], &scopes(1), &[2], now);
+    let mut ids = Vec::with_capacity(128 * 1024);
+    ids.push(1);
+    let ss = scopes(1);
+    let r = t.reserve(
+        Plan {
+            continued: None,
+            store: Some(true),
+            keep: None,
+            auth: Some([3; 32]),
+            prompt_ids: &ids,
+            scopes: &ss,
+        },
+        now,
+    );
+    let prepared = PreparedRecord::new(Record {
+        messages: vec![json!({"role":"user","content":"x"})],
+        reply_msg: json!({"role":"assistant","content":"r"}),
+        prompt_ids: ids,
+        reply: reply(&[2]),
+        eot: None,
+        scope: ss[1],
+        prefix: None,
+    })
+    .unwrap();
+    let result = t.publish(r, prepared, now);
+    assert!(!result.retained);
+    assert_eq!(result.reason, Some(Reason::Budget));
+    drop(result);
+    assert!(
+        t.resolve(&a.encode(), None, false, now).is_ok(),
+        "unrelated lineage survives impossible admission"
+    );
+    assert_eq!(
+        t.resolve(&r.id.encode(), Some([3; 32]), false, now)
+            .err()
+            .unwrap()
+            .reason,
+        Some(Reason::Budget)
+    );
+    assert_eq!(
+        t.resolve(&r.id.encode(), None, false, now)
+            .err()
+            .unwrap()
+            .reason,
+        None
+    );
+    let guessed = WireId {
+        nonce: r.id.nonce ^ 1,
+        ..r.id
+    };
+    assert_eq!(
+        t.resolve(&guessed.encode(), Some([3; 32]), false, now)
+            .err()
+            .unwrap()
+            .reason,
+        None
+    );
+    assert_charge(&t);
+}
+
+/// Under the byte budget a publication evicts other sessions only when doing
+/// so lets it be retained: one that is declined anyway (`reason=budget`)
+/// leaves every other session where it was. Here the bytes that cannot be
+/// evicted for it — an ephemeral session's, which the pressure loop never
+/// takes — plus its own exceed the budget, though its own alone do not.
+#[test]
+fn a_declined_publication_evicts_no_other_session() {
+    let mut t = Table::new(cfg(4, true));
+    let now = Instant::now();
+    let a = turn(&mut t, None, Some(true), None, &[1], &scopes(1), &[2], now);
+    let long = vec![7u32; 4096];
+    let e = turn(
+        &mut t,
+        None,
+        None,
+        None,
+        &long,
+        &scopes(1),
+        &[8],
+        now + Duration::from_millis(1),
+    );
+    let a_bytes = t.slots[a.key.slot as usize].session.as_ref().unwrap().bytes;
+    let e_bytes = t.slots[e.key.slot as usize].session.as_ref().unwrap().bytes;
+    assert!(e_bytes > 2 * a_bytes, "{e_bytes} {a_bytes}");
+    // A and E fit; B, shaped as E, fits alone, but not beside E.
+    t.cfg.max_bytes = t.bytes + e_bytes / 2;
+    let ss = scopes(1);
+    let r = t.reserve(
+        Plan {
+            continued: None,
+            store: Some(true),
+            keep: None,
+            auth: None,
+            prompt_ids: &long,
+            scopes: &ss,
+        },
+        now + Duration::from_millis(2),
+    );
+    let prepared = PreparedRecord::new(Record {
+        messages: vec![json!({ "role": "user", "content": 0 })],
+        reply_msg: json!({ "role": "assistant", "content": "r" }),
+        prompt_ids: long.clone(),
+        reply: reply(&[8]),
+        eot: None,
+        scope: ss[1],
+        prefix: None,
+    })
+    .unwrap();
+    let result = t.publish(r, prepared, now + Duration::from_millis(2));
+    let (retained, reason) = (result.retained, result.reason);
+    drop(result);
+    eprintln!(
+        "retention declined-eviction a_bytes={a_bytes} e_bytes={e_bytes} max={} \
+         retained={retained} reason={reason:?} memory_released={}",
+        t.cfg.max_bytes,
+        t.json()["released"]["memory"]
+    );
+    if !retained {
+        assert_eq!(reason, Some(Reason::Budget));
+        assert!(
+            t.resolve(&a.encode(), None, false, now).is_ok(),
+            "a declined publication evicted another stored session"
+        );
+        assert_eq!(t.json()["released"]["memory"], 0, "{}", t.json());
+    }
+    assert_charge(&t);
+}
+
+/// A turn is converted and accounted before the table lock is taken, and the
+/// history it replaces is freed after the lock is released: through the seam
+/// `finish_session` calls (`publish_record`), a normal publication (spare turn
+/// capacity) allocates and frees nothing while the lock is held. The
+/// instrument's own control comes first: an allocation and a free made with
+/// the lock held are counted as such.
+#[test]
+fn a_turn_is_prepared_before_the_table_lock_and_its_old_history_freed_after() {
+    use crate::app::test_alloc::{under_lock, Watched};
+    let table = parking_lot::Mutex::new(Table::new(cfg(4, true)));
+    let now = Instant::now();
+    let ((), control) = under_lock(&table, || {
+        let _held = table.lock();
+        drop(std::hint::black_box(Box::new(7u64)));
+    });
+    assert_eq!(
+        control,
+        Watched {
+            allocations: 1,
+            frees: 1,
+            locked_allocations: 1,
+            locked_frees: 1
+        },
+        "the instrument counts an allocation and a free made under the lock"
+    );
+    let id = turn(
+        &mut table.lock(),
+        None,
+        Some(true),
+        None,
+        &[1; 64],
+        &scopes(1),
+        &[2],
+        now,
+    );
+    let ss = scopes(3);
+    let prompt: Vec<u32> = [1u32; 64].into_iter().chain([2, 3, 4]).collect();
+    let r = table.lock().reserve(
+        Plan {
+            continued: Some((id.key, 0)),
+            store: None,
+            keep: None,
+            auth: None,
+            prompt_ids: &prompt,
+            scopes: &ss,
+        },
+        now,
+    );
+    assert!(table.lock().get(id.key).unwrap().turns.capacity() > 1);
+    let rec = Record {
+        messages: vec![
+            json!({"role": "user", "content": "x".repeat(4096)}),
+            json!({"role": "assistant", "content": "r"}),
+            json!({"role": "user", "content": "next"}),
+        ],
+        reply_msg: json!({"role": "assistant", "content": "r"}),
+        prompt_ids: prompt.clone(),
+        reply: reply(&[5]),
+        eot: None,
+        scope: ss[3],
+        prefix: None,
+    };
+    let (published, seen) = under_lock(&table, || publish_record(&table, r, rec, now).unwrap());
+    eprintln!("retention lock scope {seen:?} retained={}", published.0);
+    assert_eq!(published, (true, None));
+    assert!(
+        seen.allocations > 0 && seen.frees > 0,
+        "the window saw the call's work: {seen:?}"
+    );
+    assert_eq!(
+        seen.locked_allocations, 0,
+        "a record was converted or accounted with the table lock held: {seen:?}"
+    );
+    assert_eq!(
+        seen.locked_frees, 0,
+        "a replaced history was freed with the table lock held: {seen:?}"
+    );
+    assert_charge(&table.lock());
+}
+
+/// A turn's ids are the prompt's, the reply's and the end-of-turn id, kept
+/// until the next turn: from an exactly sized prompt they hold no growth
+/// slack, so the charge is their bytes rather than up to twice them.
+#[test]
+fn a_prepared_record_keeps_no_growth_slack_in_its_ids() {
+    let prompt: Vec<u32> = (0..1000).collect();
+    assert_eq!(prompt.capacity(), prompt.len());
+    let prepared = PreparedRecord::new(Record {
+        messages: vec![json!({"role": "user", "content": "q"})],
+        reply_msg: json!({"role": "assistant", "content": "r"}),
+        prompt_ids: prompt,
+        reply: reply(&[1, 2, 3]),
+        eot: Some(9),
+        scope: Scope::test(1),
+        prefix: None,
+    })
+    .unwrap();
+    assert_eq!(prepared.ids.len(), 1004);
+    assert_eq!(
+        prepared.ids.capacity(),
+        prepared.ids.len(),
+        "the session's ids keep growth slack"
+    );
+}
+
+/// One stored session's retention charge by conversation length, beside the
+/// charge the stored-logical policy made before it (ids at 4 bytes each,
+/// messages at their JSON size), through the production accounting: the
+/// arithmetic behind `session.max_mib` and `session.capacity`
+/// (`docs/sessions.md` §4). Each turn adds `user` prompt ids and a `reply`
+/// of that many ids, the reply's text in `text` and `content_text` (no
+/// reasoning block), as `finish_session` records it. Text is 4 bytes a token:
+/// a stated assumption, not a tokenizer measurement.
+#[test]
+fn retention_charge_by_conversation_length() {
+    const TEXT: usize = 4;
+    const MIB64: usize = 64 << 20;
+    for (turns, user, reply_n) in [
+        (3usize, 50usize, 100usize),
+        (10, 200, 300),
+        (20, 1000, 600),
+        (40, 2600, 600),
+        (8, 125_000, 1000),
+    ] {
+        let mut t = Table::new(Config {
+            max_bytes: usize::MAX,
+            ..cfg(1, true)
+        });
+        let now = Instant::now();
+        let (mut prompt, mut messages, mut previous) =
+            (Vec::<u32>::new(), Vec::<Value>::new(), None);
+        for k in 0..turns {
+            prompt.extend(std::iter::repeat_n(1u32, user));
+            messages.push(json!({"role": "user", "content": "u".repeat(user * TEXT)}));
+            let n = messages.len();
+            let ss: Vec<Scope> = (0..=n as u8).map(Scope::test).collect();
+            let r = t.reserve(
+                Plan {
+                    continued: previous,
+                    store: Some(true),
+                    keep: None,
+                    auth: None,
+                    prompt_ids: &prompt,
+                    scopes: &ss,
+                },
+                now,
+            );
+            let text = "r".repeat(reply_n * TEXT);
+            let reply_ids = vec![2u32; reply_n];
+            let record = Arc::new(Reply {
+                ids: reply_ids.clone(),
+                text: text.clone(),
+                block: Block::None,
+                stop: Stop::Eos,
+                content: 0,
+                tail: 0,
+                reasoning_text: String::new(),
+                content_text: text.clone(),
+                partial: 0,
+                generated: reply_n,
+                logprobs: None,
+                rows: None,
+            });
+            let reply_msg = json!({"role": "assistant", "content": text});
+            assert!(t.commit(
+                r,
+                Record {
+                    messages: messages.clone(),
+                    reply_msg: reply_msg.clone(),
+                    prompt_ids: prompt.to_vec(),
+                    reply: record,
+                    eot: None,
+                    scope: ss[n],
+                    prefix: None,
+                },
+                now,
+            ));
+            messages.push(reply_msg);
+            prompt.extend(&reply_ids);
+            previous = Some((r.id.key, k));
+        }
+        assert_charge(&t);
+        let s = t.slots[0].session.as_ref().unwrap();
+        assert_eq!(s.turns.len(), turns);
+        let logical = s.ids.len() * 4
+            + s.messages
+                .iter()
+                .map(|m| serde_json::to_string(&m.value()).unwrap().len())
+                .sum::<usize>();
+        eprintln!(
+            "retention charge turns={turns} tokens={} ids_capacity={} charge={} logical={} \
+             ratio={:.2} per_64mib_charge={} per_64mib_logical={}",
+            s.ids.len(),
+            s.ids.capacity(),
+            t.bytes,
+            logical,
+            t.bytes as f64 / logical as f64,
+            MIB64 / t.bytes,
+            MIB64 / logical
+        );
+        assert!(
+            t.bytes >= logical,
+            "the retention charge counts at least the logical payload"
+        );
+    }
+}
+
+#[test]
+fn prepared_messages_roundtrip_without_a_second_value_log() {
+    let messages = vec![json!({"role":"user","content":"\\ \" \n π","nested":{"a":[1,true,null]}})];
+    let mut messages = messages;
+    messages.push(
+        json!({"$serde_json::private::RawValue": "{\"must_stay_a_string\":true}",
+        "other": "ordinary key"}),
+    );
+    let expected = messages.clone();
+    let p = PreparedRecord::new(Record {
+        messages,
+        reply_msg: json!({"role":"assistant","content":"r"}),
+        prompt_ids: vec![1],
+        reply: reply(&[2]),
+        eot: None,
+        scope: Scope::test(1),
+        prefix: None,
+    })
+    .unwrap();
+    let restored: Vec<Value> = p.messages.iter().map(StoredMessage::value).collect();
+    assert_eq!(&restored[..expected.len()], &expected);
+    assert_eq!(
+        p.payload_bytes,
+        p.ids.capacity() * size_of::<u32>()
+            + p.messages.capacity() * size_of::<StoredMessage>()
+            + p.messages
+                .iter()
+                .map(StoredMessage::heap_bytes)
+                .sum::<usize>()
+    );
+}
+
+#[test]
+fn prepared_publication_with_spare_turn_capacity_allocates_nothing() {
+    use std::sync::atomic::Ordering;
+    let mut t = Table::new(cfg(4, true));
+    let now = Instant::now();
+    let id = turn(&mut t, None, Some(true), None, &[1], &scopes(1), &[2], now);
+    let ss = scopes(3);
+    let reservation = t.reserve(
+        Plan {
+            continued: Some((id.key, 0)),
+            store: None,
+            keep: None,
+            auth: None,
+            prompt_ids: &[1, 2, 3],
+            scopes: &ss,
+        },
+        now,
+    );
+    assert!(t.get(id.key).unwrap().turns.capacity() > 1);
+    let record = PreparedRecord::new(Record {
+        messages: vec![
+            json!({"role":"user","content":"x".repeat(64*1024)}),
+            json!({"role":"assistant","content":"r"}),
+            json!({"role":"user","content":"next"}),
+        ],
+        reply_msg: json!({"role":"assistant","content":"r"}),
+        prompt_ids: vec![1, 2, 3],
+        reply: reply(&[4]),
+        eot: None,
+        scope: ss[3],
+        prefix: None,
+    })
+    .unwrap();
+    let before = allocation_receipt::ALLOCATIONS.load(Ordering::Relaxed);
+    let published = t.publish(reservation, record, now);
+    let allocated = allocation_receipt::ALLOCATIONS.load(Ordering::Relaxed) - before;
+    eprintln!(
+        "retention publication allocation_calls={allocated} retained={}",
+        published.retained
+    );
+    assert!(published.retained);
+    assert_eq!(
+        allocated, 0,
+        "normal publication consumes prepared buffers without serializing history"
+    );
+    drop(published);
+    assert_charge(&t);
+}
+
+#[test]
+fn reply_storage_capacities_are_not_hidden_behind_shared_arcs() {
+    let now = Instant::now();
+    for field in [
+        "ids",
+        "text",
+        "reasoning",
+        "content",
+        "logprobs",
+        "rows",
+        "row",
+    ] {
+        let mut t = Table::new(Config {
+            max_bytes: 32 * 1024,
+            ..cfg(1, true)
+        });
+        let ss = scopes(1);
+        let r = t.reserve(
+            Plan {
+                continued: None,
+                store: Some(true),
+                keep: None,
+                auth: None,
+                prompt_ids: &[1],
+                scopes: &ss,
+            },
+            now,
+        );
+        let mut value = (*reply(&[2])).clone();
+        let text = || {
+            let mut s = String::with_capacity(64 * 1024);
+            s.push('r');
+            s
+        };
+        match field {
+            "ids" => {
+                value.ids = Vec::with_capacity(16 * 1024);
+                value.ids.push(2);
+            }
+            "text" => value.text = text(),
+            "reasoning" => value.reasoning_text = text(),
+            "content" => value.content_text = text(),
+            "logprobs" => value.logprobs = Some(Vec::with_capacity(16 * 1024)),
+            "rows" => value.rows = Some(Vec::with_capacity(4096)),
+            "row" => value.rows = Some(vec![Vec::with_capacity(16 * 1024)]),
+            _ => unreachable!(),
+        }
+        let shared = Arc::new(value);
+        let record = PreparedRecord::new(Record {
+            messages: vec![json!({"role":"user","content":"q"})],
+            reply_msg: json!({"role":"assistant","content":"r"}),
+            prompt_ids: vec![1],
+            reply: Arc::clone(&shared),
+            eot: None,
+            scope: ss[1],
+            prefix: None,
+        })
+        .unwrap();
+        let publication = t.publish(r, record, now);
+        assert!(
+            !publication.retained,
+            "{field} capacity must be charged even while shared"
+        );
+        assert_eq!(publication.reason, Some(Reason::Budget), "{field}");
+        drop(publication);
+        assert_charge(&t);
+    }
+}
+
+#[test]
+fn stored_message_numbers_and_nested_tool_values_are_exact() {
+    let mut floats = vec![
+        0.0,
+        -0.0,
+        f64::MIN_POSITIVE,
+        f64::MAX,
+        f64::from_bits(1),
+        f64::from_bits(0x000f_ffff_ffff_ffff),
+        51.248178375505404,
+        -93.31137037688033,
+        -36.573994842753436,
+        52.314008204106244,
+        97.45365320034685,
+        2.0030397744267762e-253,
+        7.101215824554616e260,
+        1.769268377902049e74,
+        -1.6727517818542075e58,
+        3.9287532173373315e299,
+    ];
+    let mut bits = 0x4837_12fa_93be_714du64;
+    for _ in 0..4096 {
+        bits ^= bits << 13;
+        bits ^= bits >> 7;
+        bits ^= bits << 17;
+        let value = f64::from_bits(bits);
+        if value.is_finite() {
+            floats.push(value);
+        }
+    }
+    let mut float_mismatches = 0;
+    let mut integer_mismatches = 0;
+    let mut examples = Vec::new();
+    let cases = floats.len();
+    for value in floats {
+        let message = json!({"role":"assistant","tool_calls":[{"id":"call-π",
+            "type":"function","function":{"name":"numeric-tool","arguments":{
+                "value":value,"nested":[{"large":u64::MAX,"low":i64::MIN}],
+                "text":"escaped \\ \" \n π"}}}]});
+        let prepared = PreparedRecord::new(Record {
+            messages: vec![message.clone()],
+            reply_msg: json!({"role":"assistant","content":"r"}),
+            prompt_ids: vec![1],
+            reply: reply(&[2]),
+            eot: None,
+            scope: Scope::test(1),
+            prefix: None,
+        })
+        .unwrap();
+        let restored = prepared.messages[0].value();
+        let same = {
+            restored["tool_calls"][0]["function"]["arguments"]["value"]
+                .as_f64()
+                .is_some_and(|actual| actual.to_bits() == value.to_bits())
+                && serde_json::to_string(&restored).unwrap()
+                    == serde_json::to_string(&message).unwrap()
+        };
+        if !same {
+            float_mismatches += 1;
+            if examples.len() < 8 {
+                examples.push(format!(
+                    "original={value:?} bits={:016x} restored={restored:?}",
+                    value.to_bits()
+                ));
+            }
+        }
+    }
+    for value in [0, i64::MAX as u64, i64::MAX as u64 + 1, u64::MAX] {
+        let message = json!({"role":"tool","content":{"values":[value,{"again":value}]}});
+        let prepared = PreparedRecord::new(Record {
+            messages: vec![message.clone()],
+            reply_msg: Value::Null,
+            prompt_ids: vec![1],
+            reply: reply(&[2]),
+            eot: None,
+            scope: Scope::test(1),
+            prefix: None,
+        })
+        .unwrap();
+        let restored = prepared.messages[0].value();
+        if restored["content"]["values"][0].as_u64() != Some(value) || restored != message {
+            integer_mismatches += 1;
+            if examples.len() < 8 {
+                examples.push(format!("integer={value} restored={restored}"));
+            }
+        }
+    }
+    eprintln!("retention numeric fidelity float_cases={cases} float_mismatches={float_mismatches} integer_cases=4 integer_mismatches={integer_mismatches} examples={examples:?}");
+    assert_eq!(
+        float_mismatches + integer_mismatches,
+        0,
+        "stored JSON must preserve numeric bits, negative zero and nested prompt/template values"
+    );
+}
+
+#[test]
+fn every_mutation_boundary_keeps_the_retention_charge_and_cap() {
+    let mut t = Table::new(Config {
+        max_bytes: 16 * 1024,
+        ..cfg(2, true)
+    });
+    let now = Instant::now();
+    assert_charge(&t);
+    let a = turn(
+        &mut t,
+        None,
+        None,
+        Some([2; 32]),
+        &[1],
+        &scopes(1),
+        &[2],
+        now,
+    );
+    assert_charge(&t);
+    let found = t.resolve(&a.encode(), Some([2; 32]), true, now).unwrap();
+    assert_charge(&t);
+    let ss = scopes(3);
+    let r = t.reserve(
+        Plan {
+            continued: Some((found.key, found.turn)),
+            store: Some(true),
+            keep: None,
+            auth: Some([2; 32]),
+            prompt_ids: &[1, 2, 3],
+            scopes: &ss,
+        },
+        now,
+    );
+    assert_charge(&t);
+    let p = PreparedRecord::new(Record {
+        messages: vec![json!({"role":"user","content":"q"})],
+        reply_msg: json!({"role":"assistant","content":"r"}),
+        prompt_ids: vec![1, 2, 3],
+        reply: reply(&[4]),
+        eot: None,
+        scope: ss[3],
+        prefix: None,
+    })
+    .unwrap();
+    let publication = t.publish(r, p, now);
+    assert!(publication.retained);
+    drop(publication);
+    assert_charge(&t);
+    assert!(t.inspect(&r.id.encode(), Some([2; 32]), now).is_ok());
+    assert_charge(&t);
+    t.reset(r.id.key);
+    assert_charge(&t);
+    assert!(t.resolve(&r.id.encode(), Some([2; 32]), true, now).is_err());
+    assert_charge(&t);
+    let fork_scopes = [Scope::test(90), Scope::test(91)];
+    let next = t.reserve(
+        Plan {
+            continued: Some((r.id.key, 0)),
+            store: None,
+            keep: None,
+            auth: Some([2; 32]),
+            prompt_ids: &[8],
+            scopes: &fork_scopes,
+        },
+        now,
+    );
+    assert_charge(&t);
+    assert!(t.commit(
+        next,
+        Record {
+            messages: vec![json!({"role":"user","content":"fork"})],
+            reply_msg: json!({"role":"assistant","content":"r"}),
+            prompt_ids: vec![8],
+            reply: reply(&[9]),
+            eot: None,
+            scope: fork_scopes[1],
+            prefix: None
+        },
+        now
+    ));
+    assert_charge(&t);
+    assert!(t.delete(&next.id.encode(), Some([2; 32]), now).is_ok());
+    assert_charge(&t);
+    let idle = turn(&mut t, None, Some(true), None, &[1], &scopes(1), &[2], now);
+    assert_charge(&t);
+    assert!(t
+        .resolve(&idle.encode(), None, false, now + Duration::from_secs(61))
+        .is_err());
+    assert_charge(&t);
+    let ephemeral = turn(&mut t, None, None, None, &[1], &scopes(1), &[2], now);
+    assert_charge(&t);
+    t.note_other();
+    assert_charge(&t);
+    assert!(t.resolve(&ephemeral.encode(), None, false, now).is_err());
+    assert_charge(&t);
+    let retained = turn(&mut t, None, Some(true), None, &[1], &scopes(1), &[2], now);
+    let removed = t.free(retained.key.slot as usize, Some(Reason::Delete));
+    assert_charge(&t);
+    drop(removed);
+    assert_charge(&t);
+}
+
+struct MaskedJson<'a>(&'a Value);
+
+impl serde::Serialize for MaskedJson<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::{SerializeMap, SerializeSeq};
+        match self.0 {
+            Value::Number(number) if number.is_f64() => serializer.serialize_f64(0.0),
+            Value::Array(values) => {
+                let mut seq = serializer.serialize_seq(Some(values.len()))?;
+                for value in values {
+                    seq.serialize_element(&MaskedJson(value))?;
+                }
+                seq.end()
+            }
+            Value::Object(values) => {
+                let mut map = serializer.serialize_map(Some(values.len()))?;
+                for (key, value) in values {
+                    map.serialize_entry(key, &MaskedJson(value))?;
+                }
+                map.end()
+            }
+            value => serde::Serialize::serialize(value, serializer),
+        }
+    }
+}
+
+fn masked_storage_candidate(value: &Value) -> (Box<str>, Box<[u64]>) {
+    fn floats(value: &Value, bits: &mut Vec<u64>) {
+        match value {
+            Value::Number(number) if number.is_f64() => {
+                bits.push(number.as_f64().unwrap().to_bits())
+            }
+            Value::Array(values) => {
+                for value in values {
+                    floats(value, bits);
+                }
+            }
+            Value::Object(values) => {
+                for value in values.values() {
+                    floats(value, bits);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut bits = Vec::new();
+    floats(value, &mut bits);
+    (
+        serde_json::to_string(&MaskedJson(value))
+            .unwrap()
+            .into_boxed_str(),
+        bits.into_boxed_slice(),
+    )
+}
+
+#[test]
+fn storage_representation_requested_footprint() {
+    use super::storage::StoredMessage;
+    use std::sync::atomic::Ordering;
+    fn measure<T>(build: impl FnOnce() -> T) -> (isize, isize) {
+        let before = allocation_receipt::LIVE.load(Ordering::Relaxed);
+        let blocks = allocation_receipt::BLOCKS.load(Ordering::Relaxed);
+        let owned = Box::new(build());
+        std::hint::black_box(&owned);
+        let result = (
+            allocation_receipt::LIVE.load(Ordering::Relaxed) - before,
+            allocation_receipt::BLOCKS.load(Ordering::Relaxed) - blocks,
+        );
+        drop(owned);
+        assert_eq!(allocation_receipt::LIVE.load(Ordering::Relaxed), before);
+        assert_eq!(allocation_receipt::BLOCKS.load(Ordering::Relaxed), blocks);
+        result
+    }
+    eprintln!("STORAGE-COST System retained allocation requests and blocks; root boxed uniformly; inputs excluded; N=3 per case; no throughput/RSS claim");
+    let cases = [
+        (
+            "short-chat",
+            json!({"role":"user","content":"What is the capital of France?"}),
+        ),
+        (
+            "long-chat",
+            json!({"role":"user","content":"x".repeat(8192)}),
+        ),
+        (
+            "nested-tool",
+            json!({"role":"assistant","content":null,"tool_calls":[{"id":"call-π",
+            "type":"function","function":{"name":"numeric-tool","arguments":{"value":51.248178375505404,
+                "negative_zero":-0.0,"nested":[{"large":u64::MAX,"low":i64::MIN}],"text":"escaped \\ \" \n π"}}}]}),
+        ),
+        (
+            "numeric-array",
+            json!({"role":"tool","content":vec![0.1f64;1024]}),
+        ),
+        (
+            "small-history",
+            Value::Array(
+                (0..32)
+                    .map(|n| json!({"role":"user","content":format!("turn-{n}")}))
+                    .collect(),
+            ),
+        ),
+    ];
+    for (name, value) in cases {
+        let mut previous = None;
+        for run in 0..3 {
+            let baseline = measure(|| value.clone());
+            let compact = measure(|| StoredMessage::new(value.clone()));
+            let masked = measure(|| masked_storage_candidate(&value));
+            let check = StoredMessage::new(value.clone());
+            assert_eq!(
+                compact.0 as usize,
+                size_of::<StoredMessage>() + check.heap_bytes()
+            );
+            assert_eq!(
+                serde_json::to_string(&check.value()).unwrap(),
+                serde_json::to_string(&value).unwrap()
+            );
+            if let Some(prior) = previous {
+                assert_eq!(prior, (baseline, compact, masked));
+            }
+            previous = Some((baseline, compact, masked));
+            eprintln!("STORAGE-COST case={name} run={run} value_bytes={} value_blocks={} compact_bytes={} compact_blocks={} masked_bytes={} masked_blocks={}",
+                baseline.0, baseline.1, compact.0, compact.1, masked.0, masked.1);
+        }
+    }
+}
+
+#[test]
+fn retained_message_tree_allocations_are_charged_and_admitted() {
+    use std::sync::atomic::Ordering;
+    for max_bytes in [1024 * 1024, 16 * 1024] {
+        let mut t = Table::new(Config {
+            max_bytes,
+            ..cfg(1, true)
+        });
+        let ss = scopes(1);
+        let now = Instant::now();
+        let baseline = allocation_receipt::LIVE.load(Ordering::Relaxed);
+        let r = t.reserve(
+            Plan {
+                continued: None,
+                store: Some(true),
+                keep: None,
+                auth: None,
+                prompt_ids: &[1],
+                scopes: &ss,
+            },
+            now,
+        );
+        let mut text = String::with_capacity(32768);
+        text.push('x');
+        assert!(text.capacity() >= 32768);
+        let mut message = json!({"role":"tool", "content":{
+            "values":vec![0.1f64;1024], "text":null,
+            "nested":[{"negative_zero":-0.0,"large":u64::MAX}]}});
+        // json!(text) borrows and clones: it would leave an external 32768-byte
+        // fixture allocation live in this table-only measurement window.
+        // Move the actual spare-capacity input into table preparation instead.
+        message["content"]["text"] = Value::String(text);
+        let record = PreparedRecord::new(Record {
+            messages: vec![message],
+            reply_msg: json!({"role":"assistant","content":"r"}),
+            prompt_ids: vec![1],
+            reply: reply(&[2]),
+            eot: None,
+            scope: ss[1],
+            prefix: None,
+        })
+        .unwrap();
+        let publication = t.publish(r, record, now);
+        let retained = publication.retained;
+        let reason = publication.reason;
+        drop(publication);
+        let live = allocation_receipt::LIVE.load(Ordering::Relaxed) - baseline;
+        eprintln!("retention message tree max_bytes={max_bytes} allocator_live_requested={live} reported={} retained={retained}", t.bytes);
+        assert!(live > 0, "allocator guard must observe retained ownership");
+        assert!(
+            live <= t.bytes as isize,
+            "message nodes/strings must not be hidden"
+        );
+        assert_charge(&t);
+        if max_bytes == 16 * 1024 {
+            assert!(!retained, "the message tree alone exceeds this budget");
+            assert_eq!(reason, Some(Reason::Budget));
+        } else {
+            assert!(retained);
+            assert_eq!(reason, None);
+        }
+    }
+}
+
+#[test]
+fn released_only_history_enforces_bytes_before_the_count_limit() {
+    use std::sync::atomic::Ordering;
+    let now = Instant::now();
+    let auth = Some([27; 32]);
+    let ss = scopes(1);
+    let prompt = vec![1; 1024];
+    let messages = [
+        json!({"role":"user","content":"release pressure"}),
+        json!({"role":"assistant","content":"r"}),
+    ];
+    let reserve = |t: &mut Table| {
+        t.reserve(
+            Plan {
+                continued: None,
+                store: Some(true),
+                keep: None,
+                auth,
+                prompt_ids: &prompt,
+                scopes: &ss,
+            },
+            now,
+        )
+    };
+    let prepare = || {
+        let p = PreparedRecord::new(Record {
+            messages: vec![messages[0].clone()],
+            reply_msg: messages[1].clone(),
+            prompt_ids: prompt.clone(),
+            reply: reply(&[2]),
+            eot: None,
+            scope: ss[1],
+            prefix: None,
+        })
+        .unwrap();
+        assert_eq!(p.ids.len(), prompt.len() + 1);
+        assert_eq!(&p.ids[..prompt.len()], prompt.as_slice());
+        assert_eq!(p.ids.last(), Some(&2));
+        assert_eq!(p.messages.len(), 2);
+        assert_eq!(p.messages[0].value(), messages[0]);
+        assert_eq!(p.messages[1].value(), messages[1]);
+        assert_eq!(p.turn.msg_len, 1);
+        assert_eq!(p.turn.scope, ss[1]);
+        assert_eq!(p.turn.reply.ids, vec![2]);
+        assert!(p.turn.prefix.is_none());
+        assert!(!p.turn.eot);
+        p
+    };
+
+    // Observe a real, authenticated release with enforcement inactive because
+    // it fits. The paired arm uses the identical request/publication shape.
+    let mut control = Table::with_base(cfg(1, true), 41);
+    // rand::random initializes thread-local RNG ownership on first use. This
+    // is process/thread infrastructure, not retained table ownership.
+    std::hint::black_box(rand::random::<u64>());
+    let baseline = allocation_receipt::LIVE.load(Ordering::Relaxed);
+    let issued = reserve(&mut control);
+    assert_eq!(issued.id.key.slot, 0);
+    let publication = control.publish(issued, prepare(), now);
+    assert!(publication.retained);
+    drop(publication);
+    control.delete(&issued.id.encode(), auth, now).unwrap();
+    let slot = &control.slots[issued.id.key.slot as usize];
+    assert!(slot.session.is_none());
+    assert_eq!(slot.released.len(), 1);
+    assert!(slot.released.len() < RELEASES_KEPT);
+    let released = &slot.released[0];
+    assert_eq!(released.gen, issued.id.key.gen);
+    assert_eq!(released.auth, auth);
+    assert_eq!(released.reason, Reason::Delete);
+    assert_eq!(released.nonces.as_slice(), &[issued.id.nonce]);
+    assert!(released.dropped.is_empty());
+    assert_eq!(
+        released.bytes,
+        released.nonces.capacity() * size_of::<u64>()
+    );
+    let release_only = control.bytes;
+    assert_eq!(release_only, Table::slot_bytes(slot));
+    let live = allocation_receipt::LIVE.load(Ordering::Relaxed) - baseline;
+    assert_eq!(live, release_only as isize);
+    assert_charge(&control);
+    assert!(release_only > 0);
+    assert_eq!(
+        control
+            .resolve(&issued.id.encode(), auth, false, now)
+            .err()
+            .unwrap()
+            .reason,
+        Some(Reason::Delete)
+    );
+    assert_eq!(
+        control
+            .resolve(&issued.id.encode(), None, false, now)
+            .err()
+            .unwrap()
+            .reason,
+        None
+    );
+
+    // A single released record exceeds this observed limit: this is byte
+    // pressure before the eight-record count ceiling, not an unused-slot test.
+    let limit = release_only - 1;
+    let mut pressure = Table::with_base(
+        Config {
+            max_bytes: limit,
+            ..cfg(1, true)
+        },
+        41,
+    );
+    let refused = reserve(&mut pressure);
+    assert_eq!(refused.id.key, issued.id.key);
+    let prepared = prepare();
+    assert!(prepared.ids.capacity() * size_of::<u32>() > limit);
+    let publication = pressure.publish(refused, prepared, now);
+    assert!(!publication.retained);
+    assert_eq!(publication.reason, Some(Reason::Budget));
+    drop(publication);
+    eprintln!("retention release pressure control_requested={live} control_reported={release_only} limit={limit} affected_slot={} generation={} nonces=1 dropped=0 after_bytes={}", refused.id.key.slot, refused.id.key.gen, pressure.bytes);
+    assert!(
+        pressure.bytes <= pressure.cfg.max_bytes,
+        "released-only ownership exceeds the configured byte limit before the count ceiling"
+    );
+    let slot = &pressure.slots[refused.id.key.slot as usize];
+    assert!(slot.session.is_none());
+    assert_eq!(slot.gen, refused.id.key.gen.wrapping_add(1));
+    assert!(slot.released.is_empty());
+    assert_eq!(slot.released.capacity(), 0);
+    assert_eq!(Table::slot_bytes(slot), 0);
+    assert_eq!(pressure.bytes, 0);
+    assert_eq!(pressure.counters.released[Reason::Budget as usize], 1);
+    assert_charge(&pressure);
+    for binding in [auth, None] {
+        assert_eq!(
+            pressure
+                .resolve(&refused.id.encode(), binding, false, now)
+                .err()
+                .unwrap()
+                .reason,
+            None,
+            "the exact refused generation/nonce record left under byte pressure"
+        );
+    }
+}
+
+#[test]
+fn owned_message_snapshot_converts_after_unlock_and_original_release() {
+    let table = parking_lot::Mutex::new(Table::new(cfg(1, true)));
+    let now = Instant::now();
+    let ss = scopes(1);
+    let message = json!({"role":"user","content":{"tool_args":{
+        "floats":[-0.0, f64::from_bits(1), 51.248178375505404],
+        "integers":[u64::MAX, i64::MIN], "other":[true,null,"π\\\"\n"]}}});
+    let response = json!({"role":"assistant","content":"r"});
+    let expected = vec![message.clone(), response.clone()];
+    let id = {
+        let mut guard = table.lock();
+        let r = guard.reserve(
+            Plan {
+                continued: None,
+                store: Some(true),
+                keep: None,
+                auth: None,
+                prompt_ids: &[1],
+                scopes: &ss,
+            },
+            now,
+        );
+        let prepared = PreparedRecord::new(Record {
+            messages: vec![message],
+            reply_msg: response,
+            prompt_ids: vec![1],
+            reply: reply(&[2]),
+            eot: None,
+            scope: ss[1],
+            prefix: None,
+        })
+        .unwrap();
+        let publication = guard.publish(r, prepared, now);
+        assert!(publication.retained);
+        drop(publication);
+        r.id
+    };
+    let snapshot = {
+        let mut guard = table.lock();
+        guard
+            .resolve(&id.encode(), None, true, now)
+            .unwrap()
+            .messages
+            .unwrap()
+    };
+    assert!(table.try_lock().is_some(), "lookup guard must be gone");
+    {
+        let mut guard = table.lock();
+        guard.delete(&id.encode(), None, now).unwrap();
+        assert!(
+            guard.get(id.key).is_none(),
+            "the original stored history is gone"
+        );
+        assert_charge(&guard);
+    }
+    let borrowed: Vec<Value> = snapshot.iter().map(StoredMessage::value).collect();
+    let owned: Vec<Value> = snapshot
+        .into_iter()
+        .map(|message| {
+            let unlocked = table.try_lock();
+            assert!(
+                unlocked.is_some(),
+                "conversion happens after lookup/delete unlock"
+            );
+            drop(unlocked);
+            Into::<Value>::into(message)
+        })
+        .collect();
+    assert_eq!(
+        serde_json::to_string(&borrowed).unwrap(),
+        serde_json::to_string(&expected).unwrap()
+    );
+    assert_eq!(
+        serde_json::to_string(&owned).unwrap(),
+        serde_json::to_string(&expected).unwrap()
+    );
+    for (i, expected) in [-0.0, f64::from_bits(1), 51.248178375505404]
+        .into_iter()
+        .enumerate()
+    {
+        assert_eq!(
+            owned[0]["content"]["tool_args"]["floats"][i]
+                .as_f64()
+                .unwrap()
+                .to_bits(),
+            expected.to_bits()
+        );
+    }
+    assert_eq!(
+        owned[0]["content"]["tool_args"]["integers"][0].as_u64(),
+        Some(u64::MAX)
+    );
+}
+
+#[test]
+fn owned_string_snapshot_conversion_has_no_new_allocation() {
+    use std::sync::atomic::Ordering;
+    let owned = StoredMessage::new(Value::String("π-string-payload".repeat(1024)));
+    let borrowed = StoredMessage::new(Value::String("π-string-payload".repeat(1024)));
+    let before = allocation_receipt::ALLOCATIONS.load(Ordering::Relaxed);
+    let converted = std::hint::black_box(Value::from(owned));
+    let owned_allocations = allocation_receipt::ALLOCATIONS.load(Ordering::Relaxed) - before;
+    let before = allocation_receipt::ALLOCATIONS.load(Ordering::Relaxed);
+    let copied = std::hint::black_box(borrowed.value());
+    let borrowed_allocations = allocation_receipt::ALLOCATIONS.load(Ordering::Relaxed) - before;
+    assert_eq!(converted, copied);
+    assert!(
+        borrowed_allocations > 0,
+        "borrowed-copy positive control must allocate"
+    );
+    assert_eq!(
+        owned_allocations, 0,
+        "consuming a boxed string must not allocate a second payload"
+    );
+    eprintln!("OWNED_STRING_CONVERSION owned_allocations={owned_allocations} borrowed_allocations={borrowed_allocations}");
 }

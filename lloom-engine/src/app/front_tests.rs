@@ -3573,3 +3573,70 @@ fn a_prefix_the_history_no_longer_renders_is_not_taken() {
         }
     }
 }
+
+#[test]
+fn stored_prefix_spare_capacity_obeys_retention_bound() {
+    use crate::app::sessions::{Config, Keep, Plan, PreparedRecord, Reason, Record, Table};
+    let mut prefix = PrefixRecord {
+        text_len: 0,
+        digest: [0; 32],
+        ids_len: 1,
+        cuts: Vec::with_capacity(4096),
+        sampled: Vec::with_capacity(4096),
+    };
+    prefix.cuts.push((0, 0));
+    prefix.sampled.push(0..1);
+    assert!(prefix.retained_bytes() >= 128 * 1024);
+    let mut table = Table::new(Config {
+        idle: std::time::Duration::from_secs(60),
+        capacity: 1,
+        ephemeral: 1,
+        max_bytes: 32 * 1024,
+        one_sequence: true,
+        keep: Keep::None,
+    });
+    let now = std::time::Instant::now();
+    let scopes = [Scope::test(0), Scope::test(1)];
+    let reservation = table.reserve(
+        Plan {
+            continued: None,
+            store: Some(true),
+            keep: None,
+            auth: None,
+            prompt_ids: &[1],
+            scopes: &scopes,
+        },
+        now,
+    );
+    let record = PreparedRecord::new(Record {
+        messages: vec![json!({"role":"user","content":"q"})],
+        reply_msg: json!({"role":"assistant","content":"r"}),
+        prompt_ids: vec![1],
+        reply: Arc::new(Reply {
+            ids: vec![2],
+            text: "r".into(),
+            block: Block::None,
+            stop: Stop::Eos,
+            content: 0,
+            tail: 0,
+            reasoning_text: String::new(),
+            content_text: "r".into(),
+            partial: 0,
+            generated: 1,
+            logprobs: None,
+            rows: None,
+        }),
+        eot: None,
+        scope: scopes[1],
+        prefix: Some(prefix),
+    })
+    .unwrap();
+    let publication = table.publish(reservation, record, now);
+    assert!(
+        !publication.retained,
+        "spare prefix capacity is not a budget exemption"
+    );
+    assert_eq!(publication.reason, Some(Reason::Budget));
+    drop(publication);
+    assert!(table.json()["bytes"].as_u64().unwrap() <= 32 * 1024);
+}

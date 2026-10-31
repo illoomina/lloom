@@ -393,29 +393,54 @@ impl<T, F> OwnerMailbox<T, F> {
         run: impl FnOnce(&mut T, &F),
         wake_all: impl FnOnce(),
     ) -> Result<(), MailboxError> {
-        self.transition(ticket, Phase::Ready, Phase::CallbackActive, 0)?;
-        // SAFETY: Ready publication makes both initialized values visible.
-        // CallbackActive excludes every other owner access, detach and reuse; references do not escape
-        // the closure call. Native handoff-return touches only atomic flags.
+        self.with_phase_owner(ticket, Phase::Ready, Phase::CallbacksFinished,
+            |owner, feedback| run(owner, feedback.expect("published feedback")), wake_all)
+    }
+
+    /// Trusted metadata inspection of a cancelled record. CleanupReady is
+    /// exclusively claimed during the borrow and restored afterward. The owner
+    /// stays in this mailbox; neither capture destruction nor credit return is
+    /// performed. Caller distinguishes true cancellation from native cleanup
+    /// using its ordered-ingestion state, not the phase hint alone.
+    pub(crate) fn with_cancelled_metadata<R>(
+        &self,
+        ticket: Ticket,
+        inspect: impl FnOnce(&T) -> R,
+        wake_all: impl FnOnce(),
+    ) -> Result<R, MailboxError> {
+        self.with_phase_owner(ticket, Phase::CleanupReady, Phase::CleanupReady,
+            |owner, _| inspect(owner), wake_all)
+    }
+
+    fn with_phase_owner<R>(
+        &self,
+        ticket: Ticket,
+        from: Phase,
+        finished: Phase,
+        run: impl FnOnce(&mut T, Option<&F>) -> R,
+        wake_all: impl FnOnce(),
+    ) -> Result<R, MailboxError> {
+        self.transition(ticket, from, Phase::CallbackActive, 0)?;
+        // SAFETY: Ready/CleanupReady publish initialized owner. CallbackActive
+        // excludes all other payload borrows, detach and reuse. A cancelled
+        // record has no feedback; the preserved Ready API requires Some.
         let result = catch_unwind(AssertUnwindSafe(|| unsafe {
-            run(
-                (*self.owner.get()).as_mut().expect("registered owner"),
-                (*self.feedback.get()).as_ref().expect("published feedback"),
-            );
+            run((*self.owner.get()).as_mut().expect("registered owner"),
+                (*self.feedback.get()).as_ref())
         }));
         match result {
-            Ok(()) => self.transition(ticket, Phase::CallbackActive, Phase::CallbacksFinished, 0),
+            Ok(value) => {
+                self.transition(ticket, Phase::CallbackActive, finished, 0)?;
+                Ok(value)
+            }
             Err(payload) => {
-                // SAFETY: the callback borrow ended during unwinding, and this
-                // exclusive callback owner is the sole writer of panic payload.
-                unsafe {
-                    *self.panic.get() = Some(payload);
-                }
+                // Existing single failure-retention implementation, shared with
+                // the original logical callback entry. Never Drop on unwind.
+                unsafe { *self.panic.get() = Some(payload); }
                 self.transition(ticket, Phase::CallbackActive, Phase::CallbackFailed, 0)
                     .expect("exclusive callback retains its phase");
                 self.failure.publish(Failure::CallbackPanic, || {
-                    self.wake.notify();
-                    wake_all();
+                    self.wake.notify(); wake_all();
                 });
                 Err(MailboxError::CallbackPanicked)
             }
@@ -514,6 +539,27 @@ impl<T, F> OwnerMailbox<T, F> {
         self.take(ticket)
     }
 
+    /// Native callback identity hint only. Exact generation is rechecked by
+    /// feedback publication; this does not authorize a payload borrow.
+    pub(crate) fn pending_ticket(&self) -> Option<Ticket> {
+        let state = self.state.load(Ordering::Acquire);
+        (state & PHASE_MASK == Phase::Pending as u64).then_some(Ticket {
+            mailbox: self.identity, generation: state >> GENERATION_SHIFT,
+        })
+    }
+
+    /// Non-owning native-feedback readiness hint. The bank must compare this
+    /// actual ticket with its installed sequence record, then acquire phase
+    /// ownership through with_callbacks; the hint is not a borrow or a claim.
+    /// No wrong phase or newer generation is silently promoted to Ready.
+    pub(crate) fn feedback_ticket(&self) -> Option<Ticket> {
+        let state = self.state.load(Ordering::Acquire);
+        (state & PHASE_MASK == Phase::Ready as u64).then_some(Ticket {
+            mailbox: self.identity,
+            generation: state >> GENERATION_SHIFT,
+        })
+    }
+
     /// Host cleanup observes only an already published cleanup phase. The
     /// generation remains checked again by try_detach_cleanup.
     pub(crate) fn cleanup_ticket(&self) -> Option<Ticket> {
@@ -546,10 +592,19 @@ impl<T, F> OwnerMailbox<T, F> {
         }
     }
 
-    #[cfg(test)]
-    pub fn cancel_prepared(&self, ticket: Ticket) -> Result<Detached<T, F>, MailboxError> {
+    /// Unique unpublished registration authority only. No native handler,
+    /// external token, deferred lease or handoff may have escaped for this
+    /// ticket. Returns owners without executing their destructors. The bank
+    /// uses this for a stale head claim that lost its issued-sequence CAS.
+    /// Existing mailbox phase/generation CAS remains authoritative.
+    pub(crate) fn cancel_unissued(&self, ticket: Ticket) -> Result<Detached<T, F>, MailboxError> {
         self.transition(ticket, Phase::Prepared, Phase::Taking, 0)?;
         self.take(ticket)
+    }
+
+    #[cfg(test)]
+    pub fn cancel_prepared(&self, ticket: Ticket) -> Result<Detached<T, F>, MailboxError> {
+        self.cancel_unissued(ticket)
     }
 
     fn take(&self, ticket: Ticket) -> Result<Detached<T, F>, MailboxError> {

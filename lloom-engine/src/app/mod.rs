@@ -921,6 +921,8 @@ mod frontend_tests;
 mod option_acceptance_tests;
 #[cfg(test)]
 mod spellings_tests;
+#[cfg(test)]
+mod test_alloc;
 
 #[cfg(test)]
 mod retirement_verdict_tests {

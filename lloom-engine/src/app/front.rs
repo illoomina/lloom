@@ -889,6 +889,13 @@ pub struct PrefixRecord {
     sampled: Vec<Range<usize>>,
 }
 
+impl PrefixRecord {
+    pub(super) fn retained_bytes(&self) -> usize {
+        self.cuts.capacity() * std::mem::size_of::<(usize, usize)>()
+            + self.sampled.capacity() * std::mem::size_of::<Range<usize>>()
+    }
+}
+
 /// A request's binding to a stored session (`docs/sessions.md` §5.1).
 #[derive(Default)]
 pub struct ByRef<'a> {

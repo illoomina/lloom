@@ -223,12 +223,7 @@ impl QMetalStorage {
             .with_data(&out)
             .with_label("qstorage_dequantized")
             .build()?;
-        MetalStorage::new_allocated(
-            buffer,
-            self.device.clone(),
-            elem_count,
-            DType::F32,
-        )
+        MetalStorage::new_allocated(buffer, self.device.clone(), elem_count, DType::F32)
     }
 
     pub fn quantize(&mut self, src: &MetalStorage) -> Result<()> {
@@ -385,12 +380,7 @@ impl QMetalStorage {
             )
         }
         .map_err(MetalError::from)?;
-        MetalStorage::new_allocated(
-            dst,
-            device.clone(),
-            ids_len * hidden,
-            DType::F32,
-        )
+        MetalStorage::new_allocated(dst, device.clone(), ids_len * hidden, DType::F32)
     }
 
     /// Rows up to which a quantized matmul runs the matmul-vec kernel over
@@ -902,6 +892,22 @@ impl QMetalStorage {
         if in_dim1 != 1 && in_dim1 != topk {
             crate::bail!("indexed_moe_forward: input dim1 {in_dim1} must be 1 or topk {topk}")
         }
+        // Validate compact routing coordinates before any output or map allocation.
+        let mapped = if arm == super::MoeArm::Gemm
+            && triple == GemvTriple::F32F32F32
+            && mm_id_has_arm(ggml_dtype)
+            && crate::shape_req!(moe_mm_id, k % 32 == 0; k)
+        {
+            let geometry = super::moe_rowmap::geometry(batch, topk, n_experts, 32)?;
+            let bn = moe_mm_bn(geometry.pairs as usize, geometry.experts as usize);
+            Some(if bn == 32 {
+                geometry
+            } else {
+                super::moe_rowmap::geometry(batch, topk, n_experts, bn)?
+            })
+        } else {
+            None
+        };
         let device = self.device.clone();
         let dst_shape = Shape::from((batch, topk, n));
         let dst = device
@@ -915,13 +921,9 @@ impl QMetalStorage {
         // as the f16-weight GEMM does (#749 P30 (1)): a K off the block
         // reads past the row, so such a weight keeps the matmul-vec at every
         // row count.
-        if arm == super::MoeArm::Gemm
-            && triple == GemvTriple::F32F32F32
-            && mm_id_has_arm(ggml_dtype)
-            && crate::shape_req!(moe_mm_id, k % 32 == 0; k)
-        {
-            let bn = moe_mm_bn(batch * topk, n_experts);
-            let bound = crate::kernels::mm_id_block_bound(batch, topk, n_experts, bn);
+        if let Some(geometry) = mapped {
+            let bn = geometry.block_n as usize;
+            let bound = geometry.bound as usize;
             let rowids = device
                 .new_buffer_builder()
                 .with_size_for(batch * topk, DType::U32)
@@ -1101,12 +1103,7 @@ impl QMetalStorage {
                     )
                 }
                 .map_err(MetalError::from)?;
-                MetalStorage::new_allocated(
-                    dst,
-                    device.clone(),
-                    shape.elem_count(),
-                    store_dtype,
-                )
+                MetalStorage::new_allocated(dst, device.clone(), shape.elem_count(), store_dtype)
             };
         let Some(grid) = order.grid() else {
             let shape = Shape::from((batch, topk, n));

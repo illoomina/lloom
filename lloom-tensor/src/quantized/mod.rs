@@ -18,6 +18,8 @@ pub mod iq_quants;
 pub mod k_quants;
 #[cfg(feature = "metal")]
 pub mod metal;
+#[cfg(any(feature = "metal", test))]
+pub(crate) mod moe_rowmap;
 pub mod tokenizer;
 #[cfg(not(feature = "metal"))]
 mod metal {

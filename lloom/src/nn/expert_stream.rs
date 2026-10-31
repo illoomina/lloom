@@ -231,8 +231,8 @@ pub trait ExpertResidency {
     fn shrink_slots(&self, _active: usize, _floor: usize) -> Result<usize> {
         Ok(0)
     }
-    fn grow_slots(&self, _active: usize) -> usize {
-        0
+    fn grow_slots(&self, _active: usize) -> Result<usize> {
+        Ok(0)
     }
 
     /// The pass that follows replays the token the last settle counted
@@ -1599,6 +1599,8 @@ struct Inner {
     /// The slot pools are Shared: the direct read's, or the fetch arm's
     /// (`fetch_on`), whose worker writes a slot from the host.
     shared_pools: bool,
+    #[cfg(test)]
+    resize_fail_at: Option<(usize, bool)>,
     /// A settle's distinct ids and misses, kept between calls so a settle
     /// allocates nothing once they have grown.
     scratch_ids: Vec<u32>,
@@ -1840,14 +1842,18 @@ impl LiveTable {
     fn store(&self, _e: usize, _v: u32) {}
 }
 
+struct PreparedPools {
+    pools: [SlotPool; 3],
+    before: usize,
+    after: usize,
+    writer: Epoch,
+}
+
 impl Inner {
-    /// Allocate the three plane pools at `active` slots and carry the
-    /// first `keep` slots' planes over (a blit on Metal; on the CPU the
-    /// pools come back empty and the caller evicts everything). The old
-    /// pools drop here: their handles' reservations leave the ledger at
-    /// once, the residency set forgets them at the next cut. Returns the
-    /// pools' bytes before and after.
-    fn reallocate_pools(&mut self, active: usize, keep: usize) -> Result<(usize, usize)> {
+    /// Prepare replacement banks without publishing usable slots. Shared banks
+    /// get a publication cut so later fetch floors cover their zero/copy writes.
+    /// No explicit completion drain; existing queue backpressure may park.
+    fn prepare_pools(&self, active: usize, keep: usize) -> Result<PreparedPools> {
         let before: usize = self
             .pools
             .iter()
@@ -1855,15 +1861,29 @@ impl Inner {
             .sum();
         let mut fresh = Vec::with_capacity(3);
         for (i, src) in self.sources.iter().enumerate() {
+            #[cfg(test)]
+            if self.resize_fail_at == Some((i, false)) {
+                lloom_tensor::bail!("injected bank allocation failure at {i}")
+            }
             let (n, k) = src.dims();
-            let qt = QTensor::zeros_persistent_with(
+            let mut qt = QTensor::zeros_persistent_with(
                 (active, n, k),
                 src.dtype(),
                 &self.device,
-                self.direct,
+                self.shared_pools,
             )?;
-            #[cfg(not(feature = "metal"))]
-            let _ = keep;
+            #[cfg(test)]
+            if self.resize_fail_at == Some((i, true)) {
+                lloom_tensor::bail!("injected bank copy preparation failure at {i}")
+            }
+            if self.device.is_cpu() && keep > 0 {
+                let bytes = keep * self.pools[i].plane_bytes;
+                let data = self.pools[i].qt.data()?;
+                qt.write_with(0, bytes, &mut |dst| {
+                    dst.copy_from_slice(&data[..bytes]);
+                    Ok(())
+                })?;
+            }
             #[cfg(feature = "metal")]
             if let Device::Metal(m) = &self.device {
                 let bytes = keep * self.pools[i].plane_bytes;
@@ -1881,22 +1901,29 @@ impl Inner {
                 plane_bytes: self.pools[i].plane_bytes,
             });
         }
-        // The copies are encoded on the queue, which retains the old pools
-        // until they run; the handles may drop now (their reservations
-        // leave the ledger at once, the residency set forgets them at the
-        // next cut). No wait here: the tier never drains the device
-        // (`qwen4exp_eviction_no_drain`); the yield's one host wait is the
-        // admission's, before it asks (`Qwen4Exp::apply_expert_grant`).
+        // Encoded initialization retains its sources and destinations even when
+        // a later preparation fails; map publication does not control that custody.
         let fresh: [SlotPool; 3] = fresh
             .try_into()
             .map_err(|_| lloom_tensor::Error::Msg("three slot pools".into()))?;
-        self.pools = fresh;
-        let after: usize = self
-            .pools
-            .iter()
-            .map(|p| p.qt.storage_size_in_bytes())
-            .sum();
-        Ok((before, after))
+        let after = fresh.iter().map(|p| p.qt.storage_size_in_bytes()).sum();
+        #[cfg(test)]
+        if self.resize_fail_at == Some((3, false)) {
+            lloom_tensor::bail!("injected bank publication cut failure")
+        }
+        let writer = self.current_epoch();
+        #[cfg(feature = "metal")]
+        if self.shared_pools {
+            if let Device::Metal(m) = &self.device {
+                m.flush_marker()?;
+            }
+        }
+        Ok(PreparedPools {
+            pools: fresh,
+            before,
+            after,
+            writer,
+        })
     }
 
     /// Store the landed entries whose copies' epochs have completed (and
@@ -2196,6 +2223,8 @@ impl Streamed {
                 clock,
                 direct,
                 shared_pools: shared,
+                #[cfg(test)]
+                resize_fail_at: None,
                 scratch_ids: Vec::new(),
                 scratch_missing: Vec::new(),
                 counted: Vec::new(),
@@ -4158,9 +4187,10 @@ impl ExpertResidency for Streamed {
     /// (§21.13; the tier itself never drains the device,
     /// `qwen4exp_eviction_no_drain`) — and the three plane pools are
     /// reallocated at `active` slots with the kept slots' planes carried
-    /// over: the old pools' reservations leave the ledger. The cached pass
-    /// plans, which bound the old pools, are dropped. Returns the bytes
-    /// released. Refused while a device plan is open, a load is in flight,
+    /// over. The copy retains the old banks until native retirement; dropping
+    /// their host owners is not proof of physical reclamation. Cached pass
+    /// plans binding the old pools are dropped. Returns the logical bank
+    /// capacity reduction. Refused while a device plan is open, a load is in flight,
     /// or a slot leaving service still has a reader the clock has not
     /// completed.
     fn shrink_slots(&self, active: usize, floor: usize) -> Result<usize> {
@@ -4175,45 +4205,47 @@ impl ExpertResidency for Streamed {
             )
         }
         let was = inner.map.active();
-        let evict: Vec<u32> = inner.map.shrink_to(active, floor);
-        let active = inner.map.active();
+        let mut map = inner.map.clone();
+        let evict = map.shrink_to(active, floor);
+        let active = map.active();
         if active >= was {
             return Ok(0);
         }
+        let mut evicted = Vec::new();
         for e in evict {
-            if let Some(s) = inner.map.slot_of(e as usize) {
-                let epoch = inner.map.reader_epoch(s);
-                inner.map.evict(s, epoch, false);
-                inner.table_set(e, NONE);
-                self.counters.evictions.fetch_add(1, Ordering::Relaxed);
+            if let Some(s) = map.slot_of(e as usize) {
+                let epoch = map.reader_epoch(s);
+                map.evict(s, epoch, false);
+                evicted.push(e);
             }
         }
-        let completed = inner.completed_epochs();
-        inner.map.recycle(completed);
-        let epoch = inner.current_epoch();
+        map.recycle(inner.completed_epochs());
         if !matches!(inner.device, Device::Metal(_)) {
-            // The CPU pools come back empty (no blit): every resident
-            // expert goes.
-            let all: Vec<u32> = inner.map.resident();
-            for e in all {
-                if let Some(s) = inner.map.slot_of(e as usize) {
-                    inner.map.evict(s, epoch, false);
-                    inner.table_set(e, NONE);
-                    self.counters.evictions.fetch_add(1, Ordering::Relaxed);
+            let epoch = inner.current_epoch();
+            for e in map.resident() {
+                if let Some(s) = map.slot_of(e as usize) {
+                    map.evict(s, epoch, false);
+                    evicted.push(e);
                 }
             }
-            inner.map.recycle(Completed::ALL);
+            map.recycle(Completed::ALL);
         }
-        if !inner.map.settled_past_active() {
-            // Undone: the slots come back into service with their experts
-            // gone (they are in the quarantine and recycle as usual).
-            inner.map.grow_to(was);
+        if !map.settled_past_active() {
             lloom_tensor::bail!(
                 "shrink_slots: a slot leaving service still has a reader the clock has not \
                  completed; wait the queue out first"
             )
         }
-        let (before, after) = inner.reallocate_pools(active, active)?;
+        let keep = if inner.device.is_cpu() { 0 } else { active };
+        let prepared = inner.prepare_pools(active, keep)?;
+        map.plan_read_all(prepared.writer);
+        let (before, after) = (prepared.before, prepared.after);
+        inner.pools = prepared.pools;
+        inner.map = map;
+        for e in evicted {
+            inner.table_set(e, NONE);
+            self.counters.evictions.fetch_add(1, Ordering::Relaxed);
+        }
         inner.table_stale = true;
         inner.table = None;
         #[cfg(feature = "metal")]
@@ -4229,32 +4261,37 @@ impl ExpertResidency for Streamed {
         Ok(before.saturating_sub(after))
     }
 
-    /// Grow the slots in service to `active`: the pools are reallocated
-    /// at `active` slots with every slot in service carried over; the
-    /// slots brought back are empty. Returns the bytes taken.
     fn note_replay(&self) {
         let mut inner = self.inner.lock();
         inner.replay_pending = !inner.counted.is_empty();
     }
 
-    fn grow_slots(&self, active: usize) -> usize {
+    /// Grow the slots in service to `active`: the pools are reallocated
+    /// at `active` slots with every slot in service carried over; the
+    /// slots brought back are empty. Returns the bytes taken.
+    fn grow_slots(&self, active: usize) -> Result<usize> {
         let mut inner = self.inner.lock();
-        let was = inner.map.active();
-        let back = inner.map.grow_to(active);
-        let active = inner.map.active();
-        if active <= was || back.is_empty() && active == was {
-            return 0;
+        if inner.plans_open > 0 {
+            lloom_tensor::bail!("grow_slots while a device plan is open")
         }
-        let keep = if matches!(inner.device, Device::Metal(_)) {
-            was
-        } else {
-            0
-        };
-        let realloc = inner.reallocate_pools(active, keep);
-        let taken = match realloc {
-            Ok((before, after)) => after.saturating_sub(before),
-            Err(_) => 0,
-        };
+        if inner.map.inflight_count() > 0 {
+            lloom_tensor::bail!(
+                "grow_slots with {} loads in flight",
+                inner.map.inflight_count()
+            )
+        }
+        let was = inner.map.active();
+        let mut map = inner.map.clone();
+        map.grow_to(active);
+        let active = map.active();
+        if active <= was {
+            return Ok(0);
+        }
+        let prepared = inner.prepare_pools(active, was)?;
+        map.plan_read_all(prepared.writer);
+        let (before, after) = (prepared.before, prepared.after);
+        inner.pools = prepared.pools;
+        inner.map = map;
         inner.table_stale = true;
         inner.table = None;
         #[cfg(feature = "metal")]
@@ -4264,7 +4301,7 @@ impl ExpertResidency for Streamed {
         self.counters
             .slot_reallocations
             .fetch_add(1, Ordering::Relaxed);
-        taken
+        Ok(after.saturating_sub(before))
     }
 
     fn plans_on_device(&self) -> bool {
@@ -5344,6 +5381,445 @@ mod tests {
         std::fs::remove_file(path).ok();
     }
 
+    #[cfg(feature = "metal")]
+    fn resize_control_device() -> Device {
+        let dev = Device::new_metal(0).expect("native resize control requires Metal");
+        let actual = dev
+            .as_metal_device()
+            .unwrap()
+            .commands()
+            .actual_command_api();
+        eprintln!("BANK_RESIZE_CONTROL actual_api={actual}");
+        if let Ok(requested) = std::env::var("LLOOM_METAL_API") {
+            if matches!(requested.as_str(), "metal3" | "metal4") {
+                assert_eq!(
+                    actual, requested,
+                    "requested native control must not fall back"
+                );
+            }
+        }
+        dev
+    }
+
+    #[test]
+    fn streamed_supports_shared_owner_access() {
+        fn assert_shared<T: Send + Sync>() {}
+        assert_shared::<Streamed>();
+    }
+
+    fn bank_growth_failure_control(dev: &Device) {
+        let gate = stacked(8, 32, 32, 1.0, GgmlDType::F32);
+        let up = stacked(8, 32, 32, 2.0, GgmlDType::F32);
+        let down = stacked(8, 32, 32, 3.0, GgmlDType::F32);
+        let path = write_gguf(&[("g", &gate), ("u", &up), ("d", &down)]);
+        for (projection, copying) in (0..3)
+            .flat_map(|i| [(i, false), (i, true)])
+            .chain([(3, false)])
+        {
+            let streamed = Streamed::new(
+                open(&path, "g"),
+                open(&path, "u"),
+                open(&path, "d"),
+                4,
+                LoaderArm::Pread,
+                dev,
+            )
+            .unwrap();
+            streamed.shrink_slots(2, 1).unwrap();
+            streamed.warm(&[0, 1]).unwrap();
+            let xs = x(1, 32, 0.25).to_device(dev).unwrap();
+            let ids = Tensor::new(&[[0u32, 1]], dev).unwrap();
+            let before = run(&streamed, &xs, &ids);
+            dev.synchronize().unwrap();
+            let (map, sizes) = {
+                let mut inner = streamed.inner.lock();
+                inner.resize_fail_at = Some((projection, copying));
+                (
+                    format!("{:?}", inner.map),
+                    inner.pools.each_ref().map(|p| p.qt.storage_size_in_bytes()),
+                )
+            };
+            let reallocations = streamed.stats().slot_reallocations;
+            let error = streamed.grow_slots(4).unwrap_err();
+            assert!(error.to_string().contains("injected bank"));
+            {
+                let inner = streamed.inner.lock();
+                assert_eq!(
+                    inner.map.active(),
+                    2,
+                    "projection {projection}, copying={copying}"
+                );
+                assert_eq!(format!("{:?}", inner.map), map);
+                assert_eq!(
+                    inner.pools.each_ref().map(|p| p.qt.storage_size_in_bytes()),
+                    sizes
+                );
+            }
+            assert_eq!(streamed.stats().slot_reallocations, reallocations);
+            assert_eq!(run(&streamed, &xs, &ids), before);
+            streamed.inner.lock().resize_fail_at = None;
+            streamed.grow_slots(4).unwrap();
+            assert_eq!(streamed.active_slots(), 4);
+            assert_eq!(
+                run(&streamed, &xs, &ids),
+                before,
+                "a retry preserves existing experts"
+            );
+        }
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn failed_bank_growth_keeps_the_original_geometry_and_can_retry() {
+        bank_growth_failure_control(&Device::Cpu);
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn failed_bank_growth_keeps_the_original_geometry_and_can_retry_metal() {
+        bank_growth_failure_control(&resize_control_device());
+    }
+
+    #[test]
+    fn a_failed_bank_shrink_keeps_geometry_residents_and_counters() {
+        let gate = stacked(8, 32, 32, 1.0, GgmlDType::F32);
+        let up = stacked(8, 32, 32, 2.0, GgmlDType::F32);
+        let down = stacked(8, 32, 32, 3.0, GgmlDType::F32);
+        let path = write_gguf(&[("g", &gate), ("u", &up), ("d", &down)]);
+        for fault in (0..3)
+            .flat_map(|i| [(i, false), (i, true)])
+            .chain([(3, false)])
+        {
+            let tier = Streamed::new(
+                open(&path, "g"),
+                open(&path, "u"),
+                open(&path, "d"),
+                4,
+                LoaderArm::Pread,
+                &Device::Cpu,
+            )
+            .unwrap();
+            tier.warm(&[0, 1, 2, 3]).unwrap();
+            let before = {
+                let mut inner = tier.inner.lock();
+                inner.resize_fail_at = Some(fault);
+                (
+                    format!("{:?}", inner.map),
+                    inner.pools.each_ref().map(|p| p.qt.storage_size_in_bytes()),
+                )
+            };
+            let stats = tier.stats();
+            assert!(tier
+                .shrink_slots(2, 1)
+                .unwrap_err()
+                .to_string()
+                .contains("injected bank"));
+            {
+                let inner = tier.inner.lock();
+                assert_eq!(format!("{:?}", inner.map), before.0);
+                assert_eq!(
+                    inner.pools.each_ref().map(|p| p.qt.storage_size_in_bytes()),
+                    before.1
+                );
+            }
+            let after = tier.stats();
+            assert_eq!(
+                (
+                    after.slot_reallocations,
+                    after.slot_bytes_released,
+                    after.evictions
+                ),
+                (
+                    stats.slot_reallocations,
+                    stats.slot_bytes_released,
+                    stats.evictions
+                )
+            );
+            tier.inner.lock().resize_fail_at = None;
+            assert!(tier.shrink_slots(2, 1).unwrap() > 0);
+            assert_eq!(tier.active_slots(), 2);
+        }
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn bank_growth_refuses_open_plans_or_inflight_loads_without_mutation() {
+        let gate = stacked(8, 32, 32, 1.0, GgmlDType::F32);
+        let up = stacked(8, 32, 32, 2.0, GgmlDType::F32);
+        let down = stacked(8, 32, 32, 3.0, GgmlDType::F32);
+        let path = write_gguf(&[("g", &gate), ("u", &up), ("d", &down)]);
+        let tier = Streamed::new(
+            open(&path, "g"),
+            open(&path, "u"),
+            open(&path, "d"),
+            4,
+            LoaderArm::Pread,
+            &Device::Cpu,
+        )
+        .unwrap();
+        tier.shrink_slots(2, 1).unwrap();
+        tier.warm(&[0]).unwrap();
+        for open in [true, false] {
+            let map = {
+                let mut inner = tier.inner.lock();
+                if open {
+                    inner.plans_open = 1;
+                } else {
+                    inner.map.set_inflight(0, 7);
+                }
+                format!("{:?}", inner.map)
+            };
+            let error = tier.grow_slots(4).unwrap_err().to_string();
+            assert!(
+                error.contains(if open {
+                    "device plan is open"
+                } else {
+                    "loads in flight"
+                }),
+                "{error}"
+            );
+            let mut inner = tier.inner.lock();
+            assert_eq!(format!("{:?}", inner.map), map);
+            assert_eq!(inner.map.active(), 2);
+            inner.plans_open = 0;
+            inner.map.set_inflight(0, 0);
+        }
+        tier.grow_slots(4).unwrap();
+        assert_eq!(tier.active_slots(), 4);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn a_cpu_bank_grow_preserves_the_exact_retained_packed_bytes() {
+        for dtype in [GgmlDType::F32, GgmlDType::Q8_0] {
+            let gate = stacked(8, 32, 32, 1.0, dtype);
+            let up = stacked(8, 32, 32, 2.0, dtype);
+            let down = stacked(8, 32, 32, 3.0, dtype);
+            let path = write_gguf(&[("g", &gate), ("u", &up), ("d", &down)]);
+            let tier = Streamed::new(
+                open(&path, "g"),
+                open(&path, "u"),
+                open(&path, "d"),
+                4,
+                LoaderArm::Pread,
+                &Device::Cpu,
+            )
+            .unwrap();
+            tier.shrink_slots(2, 1).unwrap();
+            tier.warm(&[0, 1]).unwrap();
+            let old: Vec<Vec<u8>> = tier
+                .inner
+                .lock()
+                .pools
+                .iter()
+                .map(|p| p.qt.data().unwrap().into_owned())
+                .collect();
+            tier.grow_slots(4).unwrap();
+            let inner = tier.inner.lock();
+            assert_eq!(inner.map.slot_of(0), Some(0));
+            assert_eq!(inner.map.slot_of(1), Some(1));
+            for (pool, old) in inner.pools.iter().zip(old) {
+                assert_eq!(
+                    &pool.qt.data().unwrap()[..old.len()],
+                    old.as_slice(),
+                    "{dtype:?} retained packed bytes"
+                );
+            }
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn resized_fetch_banks_keep_their_actual_shared_storage_and_fetch_new_experts() {
+        use crate::nn::expert_prefetch::Prefetcher;
+        use lloom_tensor::kernels::metal::staging::StagingRing;
+        use objc2_metal::{MTLBuffer as _, MTLStorageMode};
+
+        let dev = resize_control_device();
+        let m = dev.as_metal_device().unwrap();
+        let gate = stacked(8, 32, 32, 1.0, GgmlDType::F32);
+        let up = stacked(8, 32, 32, 2.0, GgmlDType::F32);
+        let down = stacked(8, 32, 32, 3.0, GgmlDType::F32);
+        let path = write_gguf(&[("g", &gate), ("u", &up), ("d", &down)]);
+        let resident = Resident::new(
+            Arc::new(
+                QTensor::quantize_onto(
+                    &gate.dequantize(&Device::Cpu).unwrap(),
+                    GgmlDType::F32,
+                    &dev,
+                )
+                .unwrap(),
+            ),
+            Arc::new(
+                QTensor::quantize_onto(&up.dequantize(&Device::Cpu).unwrap(), GgmlDType::F32, &dev)
+                    .unwrap(),
+            ),
+            Arc::new(
+                QTensor::quantize_onto(
+                    &down.dequantize(&Device::Cpu).unwrap(),
+                    GgmlDType::F32,
+                    &dev,
+                )
+                .unwrap(),
+            ),
+        );
+        for (direct, shared) in [(false, false), (false, true), (true, true)] {
+            let ring = StagingRing::shared(m);
+            let mut tier = Streamed::with_staging_pools(
+                open(&path, "g"),
+                open(&path, "u"),
+                open(&path, "d"),
+                4,
+                LoaderArm::Pread,
+                &dev,
+                Some(Arc::clone(&ring)),
+                direct,
+                shared,
+            )
+            .unwrap();
+            tier.set_spare_slots(1).unwrap();
+            tier.set_prefetcher(Arc::new(Prefetcher::new(m, ring)));
+            tier.warm(&[0, 1]).unwrap();
+            let xs = x(1, 32, 0.25).to_device(&dev).unwrap();
+            let ids = Tensor::new(&[[0u32, 1]], &dev).unwrap();
+            let before = run(&tier, &xs, &ids);
+            dev.synchronize().unwrap();
+            tier.shrink_slots(3, 1).unwrap();
+            for active in [3, 4] {
+                if active == 4 {
+                    tier.grow_slots(4).unwrap();
+                }
+                {
+                    let inner = tier.inner.lock();
+                    assert_eq!(inner.map.active(), active);
+                    for pool in &inner.pools {
+                        let buffer = pool.qt.metal_buffer().unwrap();
+                        // SAFETY: inspect only storage metadata while the owning
+                        // persistent bank and its mutex guard remain alive.
+                        let mode = unsafe { buffer.raw_unchecked() }.storageMode();
+                        assert_eq!(
+                            mode,
+                            if shared {
+                                MTLStorageMode::Shared
+                            } else {
+                                MTLStorageMode::Private
+                            }
+                        );
+                    }
+                }
+                assert_eq!(run(&tier, &xs, &ids), before);
+                if shared && !direct {
+                    dev.synchronize().unwrap();
+                    assert!(tier.fetch_ready());
+                    let expert = if active == 3 { 6 } else { 7 };
+                    assert!(tier.inner.lock().map.slot_of(expert).is_none());
+                    assert_eq!(tier.fetch_beside(&[expert as u32], Epoch::ZERO), (1, 0));
+                    let ids = Tensor::new(&[[expert as u32, 1]], &dev).unwrap();
+                    assert_eq!(run(&tier, &xs, &ids), run(&resident, &xs, &ids));
+                }
+            }
+        }
+        dev.synchronize().unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn a_resized_bank_keeps_direct_warm_behind_pending_initialization() {
+        use crate::nn::expert_prefetch::Prefetcher;
+        use lloom_tensor::kernels::metal::staging::StagingRing;
+        use lloom_tensor::metal_backend::HostEvent;
+
+        let dev = resize_control_device();
+        let m = dev.as_metal_device().unwrap();
+        let gate = stacked(8, 32, 32, 1.0, GgmlDType::F32);
+        let up = stacked(8, 32, 32, 2.0, GgmlDType::F32);
+        let down = stacked(8, 32, 32, 3.0, GgmlDType::F32);
+        let path = write_gguf(&[("g", &gate), ("u", &up), ("d", &down)]);
+        let ring = StagingRing::shared(m);
+        let mut tier = Streamed::with_staging_pools(
+            open(&path, "g"),
+            open(&path, "u"),
+            open(&path, "d"),
+            4,
+            LoaderArm::Pread,
+            &dev,
+            Some(Arc::clone(&ring)),
+            true,
+            true,
+        )
+        .unwrap();
+        tier.set_prefetcher(Arc::new(Prefetcher::new(m, ring)));
+        tier.warm(&[0, 1]).unwrap();
+        dev.synchronize().unwrap();
+        tier.shrink_slots(2, 1).unwrap();
+        dev.synchronize().unwrap();
+
+        let event = Arc::new(HostEvent::new(m).unwrap());
+        event.commit_when_produced(1).unwrap();
+        let (release, released) = std::sync::mpsc::channel();
+        let signal = Arc::clone(&event);
+        let releaser = std::thread::spawn(move || {
+            // Independent of Inner and the thread exercising resize: even a
+            // broken cut that parks cannot strand this process indefinitely.
+            let requested = released
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .is_ok();
+            signal.signal(1);
+            requested
+        });
+        let result = (|| -> Result<(u64, Epoch, Epoch)> {
+            tier.grow_slots(4)?;
+            let writer = tier.inner.lock().map.plan_epoch();
+            let next_floor = m.gpu_clock().current_epoch();
+            let before = tier.stats().direct_loads;
+            tier.warm(&[7])?;
+            Ok((tier.stats().direct_loads - before, writer, next_floor))
+        })();
+        // Release even when preparation returned an error. The watchdog's
+        // release is a failed control, not evidence of pending initialization.
+        let _ = release.send(());
+        assert!(
+            releaser.join().unwrap(),
+            "resize/warm parked until watchdog release"
+        );
+        let (direct, writer, next_floor) = result.unwrap();
+        assert_eq!(direct, 0, "pending zero/copy must take staged landing");
+        assert!(
+            writer < next_floor,
+            "the fetch floor must follow the initialization cut"
+        );
+        let ids = Tensor::new(&[[7u32]], &dev).unwrap();
+        let xs = x(1, 32, 0.25).to_device(&dev).unwrap();
+        let got = run(&tier, &xs, &ids);
+        let reference = Resident::new(
+            Arc::new(
+                QTensor::quantize_onto(
+                    &gate.dequantize(&Device::Cpu).unwrap(),
+                    GgmlDType::F32,
+                    &dev,
+                )
+                .unwrap(),
+            ),
+            Arc::new(
+                QTensor::quantize_onto(&up.dequantize(&Device::Cpu).unwrap(), GgmlDType::F32, &dev)
+                    .unwrap(),
+            ),
+            Arc::new(
+                QTensor::quantize_onto(
+                    &down.dequantize(&Device::Cpu).unwrap(),
+                    GgmlDType::F32,
+                    &dev,
+                )
+                .unwrap(),
+            ),
+        );
+        assert_eq!(got, run(&reference, &xs, &ids));
+        dev.synchronize().unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
+
     /// The elastic surface (§4.2): a shrink takes the top slots out of
     /// service — their experts evicted, later loads and victims confined to
     /// the slots in service — and a grow brings them back; the floor holds.
@@ -5403,7 +5879,7 @@ mod tests {
             assert_eq!(streamed.shrink_slots(1, topk + 1).unwrap(), 0);
             assert_eq!(streamed.active_slots(), 2, "a shrink never grows");
             assert_eq!(
-                streamed.grow_slots(4),
+                streamed.grow_slots(4).unwrap(),
                 2 * per_slot,
                 "two slots' bytes taken"
             );
@@ -5495,7 +5971,7 @@ mod tests {
             (1, per_slot as u64)
         );
         // A grow takes the slot back; a fourth expert lands in it.
-        assert_eq!(streamed.grow_slots(4), per_slot);
+        assert_eq!(streamed.grow_slots(4).unwrap(), per_slot);
         assert_eq!(m.ledger().committed(), committed);
         let id4 = Tensor::from_vec(vec![3u32, 1], (1, topk), &Device::Cpu)
             .unwrap()

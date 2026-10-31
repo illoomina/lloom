@@ -2613,7 +2613,7 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
             if wanted < active {
                 parked += tier.shrink_slots(wanted, t.floor_units())?;
             } else if wanted > active {
-                tier.grow_slots(wanted);
+                tier.grow_slots(wanted)?;
             }
         }
         Ok(parked)

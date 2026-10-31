@@ -57,6 +57,9 @@ struct Wire {
     first_case_prompt: Vec<u32>,
     // One-shot host-only gate before A offers any fragment. No production owner.
     before_decode: Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>,
+    // One-shot host-only gate after A's sink accepted its first fragment: the
+    // reply's headers and first events are out, its turn not yet accepted.
+    after_first_fragment: Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>,
     metadata_calls: usize,
     metadata_before_publication: Option<std::sync::Weak<Shared>>,
 }
@@ -369,6 +372,13 @@ impl Served for Scripted {
                     }
                 } else {
                     assert!(sink(&fragment));
+                }
+                let gate = self.progress.0 .0.lock().after_first_fragment.take();
+                if let Some((entered, released)) = gate {
+                    let _ = entered.send(());
+                    released
+                        .recv_timeout(Duration::from_secs(10))
+                        .expect("test model barrier released");
                 }
             }
             if hit {

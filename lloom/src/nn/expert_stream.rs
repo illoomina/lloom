@@ -4733,8 +4733,9 @@ impl ExpertResidency for Streamed {
         // The loaded rows must be resident at once: wider than the pool's
         // unpinned capacity, they are the grouped host plan's (`plan` /
         // `ensure`, a group at a time) — no record, nothing speculative.
-        let capacity = self
-            .n_slots
+        let capacity = inner
+            .map
+            .active()
             .saturating_sub(inner.map.pinned_count() + inner.map.spare());
         if distinct.len() + drafts.len() > capacity {
             return Ok(None);
@@ -5379,6 +5380,101 @@ mod tests {
         drop(inner);
         assert!(streamed.stats().evictions > 0);
         std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn a_elastic_host_window_uses_active_capacity_before_resolution() {
+        let gate = stacked(8, 32, 32, 1.0, GgmlDType::F32);
+        let up = stacked(8, 32, 32, 2.0, GgmlDType::F32);
+        let down = stacked(8, 32, 32, 3.0, GgmlDType::F32);
+        let path = write_gguf(&[("g", &gate), ("u", &up), ("d", &down)]);
+        let tier = Streamed::new(
+            open(&path, "g"),
+            open(&path, "u"),
+            open(&path, "d"),
+            6,
+            LoaderArm::Pread,
+            &Device::Cpu,
+        )
+        .unwrap();
+        tier.shrink_slots(2, 1).unwrap();
+        let before = {
+            let inner = tier.inner.lock();
+            assert_eq!(
+                (
+                    inner.map.active(),
+                    inner.map.pinned_count(),
+                    inner.map.spare()
+                ),
+                (2, 0, 0)
+            );
+            format!("{:?}", inner.map)
+        };
+        let ids = Tensor::new(&[[0u32], [1], [2]], &Device::Cpu).unwrap();
+        let result = tier.plan_window(&ids, 3, 3);
+        assert!(
+            result.as_ref().is_ok_and(|value| value.is_none()),
+            "a 3-distinct window cannot fit active2; must fall back before resolving: {result:?}"
+        );
+        let inner = tier.inner.lock();
+        assert_eq!(
+            format!("{:?}", inner.map),
+            before,
+            "fallback partially resolved experts"
+        );
+        assert!(inner.open_epoch.is_none());
+        let stats = tier.stats();
+        assert_eq!(
+            (
+                stats.hits,
+                stats.misses,
+                stats.bytes_loaded,
+                stats.evictions
+            ),
+            (0, 0, 0, 0)
+        );
+        drop(inner);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn a_elastic_host_window_growth_back_keeps_normal_resolution() {
+        let gate = stacked(8, 32, 32, 1.0, GgmlDType::F32);
+        let up = stacked(8, 32, 32, 2.0, GgmlDType::F32);
+        let down = stacked(8, 32, 32, 3.0, GgmlDType::F32);
+        let path = write_gguf(&[("g", &gate), ("u", &up), ("d", &down)]);
+        let tier = Streamed::new(
+            open(&path, "g"),
+            open(&path, "u"),
+            open(&path, "d"),
+            6,
+            LoaderArm::Pread,
+            &Device::Cpu,
+        )
+        .unwrap();
+        tier.shrink_slots(2, 1).unwrap();
+        assert!(tier.grow_slots(6).unwrap() > 0);
+        assert_eq!(tier.active_slots(), 6);
+        let ids = Tensor::new(&[[0u32], [1], [2]], &Device::Cpu).unwrap();
+        let (slots, record) = tier.plan_window(&ids, 3, 3).unwrap().expect("grown6 fits3");
+        assert_eq!((record.rows, record.topk, record.real_loads), (3, 1, 3));
+        let xs = x(3, 32, 0.25);
+        let (g, u) = tier
+            .gate_up(&xs, &slots, MoeArm::MatVec, DType::F32)
+            .unwrap();
+        let h = (crate::nn::ops::silu(&g).unwrap() * u).unwrap();
+        let got = tier
+            .down(&h, &slots, MoeArm::MatVec)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        let reference = Resident::new(Arc::new(gate), Arc::new(up), Arc::new(down));
+        assert_eq!(got, run(&reference, &xs, &ids));
+        assert_eq!(tier.resident().len(), 3);
+        assert!(tier.inner.lock().open_epoch.is_none());
+        std::fs::remove_file(path).unwrap();
     }
 
     #[cfg(feature = "metal")]

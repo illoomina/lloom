@@ -417,6 +417,7 @@ impl QMetalStorage {
         storage: &MetalStorage,
         layout: &crate::Layout,
         triple: crate::kernels::GemvTriple,
+        nr1: usize,
     ) -> Result<(MetalStorage, Shape)> {
         use crate::MetalError;
 
@@ -447,8 +448,9 @@ impl QMetalStorage {
         let dst_shape = Shape::from(dst_shape);
         let device = storage.device().clone();
 
-        // The triple is the route's (`route::resolve`): the activation dtype
-        // chose it, and the store dtype follows its store leg.
+        // The triple and the row capacity are the route's (`route::resolve`):
+        // the activation dtype chose the triple, and the store dtype follows
+        // its store leg.
         use crate::kernels::GemvFloat;
         let ggml_dtype: crate::kernels::GgmlDType = self.dtype.into();
         let store_dtype = match triple.store() {
@@ -470,13 +472,14 @@ impl QMetalStorage {
         // computes, without the launch per row (a decode batch's `B` rows).
         // SAFETY: binding authority (module head).
         unsafe {
-            crate::kernels::call_quantized_matmul_mv_t(
+            crate::kernels::call_quantized_matmul_mv_rows_t(
                 device.device(),
                 &encoder,
                 device.kernels(),
                 ggml_dtype,
                 triple,
                 (1, m, n, k),
+                nr1,
                 storage.buffer(),
                 layout.start_offset() * storage.dtype().size_in_bytes(),
                 &self.buffer,
@@ -631,8 +634,8 @@ impl QMetalStorage {
         )
         .map_err(crate::Error::msg)?;
         use super::route::Route;
-        if let Route::Matvec(triple) = route {
-            return self.fwd_mv(self_shape, storage, layout, triple);
+        if let Route::Matvec { triple, rows } = route {
+            return self.fwd_mv(self_shape, storage, layout, triple, rows);
         }
 
         let last_k = dst_shape.pop().unwrap();
@@ -645,7 +648,7 @@ impl QMetalStorage {
         // The store follows the triple's store leg; the steel arm stores f32.
         let triple = match route {
             Route::Gemm(t) | Route::DequantOnceGemm(t) => t,
-            Route::DequantOnceSteel | Route::Matvec(_) => crate::kernels::GemvTriple::F32F32F32,
+            Route::DequantOnceSteel | Route::Matvec { .. } => crate::kernels::GemvTriple::F32F32F32,
         };
         let store_dtype = match triple.store() {
             crate::kernels::GemvFloat::F16 => DType::F16,
@@ -665,7 +668,7 @@ impl QMetalStorage {
             Route::DequantOnceGemm(_) | Route::DequantOnceSteel => {
                 Some(dequant_scratch(&device, n_rows_w * k_w * 2)?)
             }
-            Route::Gemm(_) | Route::Matvec(_) => None,
+            Route::Gemm(_) | Route::Matvec { .. } => None,
         };
         let encoder = device.command_encoder()?;
 

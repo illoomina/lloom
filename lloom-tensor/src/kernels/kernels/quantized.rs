@@ -556,9 +556,34 @@ pub const MV_ROWS_CAPACITIES: [usize; 3] = [2, 4, 8];
 /// launch takes it up to the largest capacity's rows: past that a slot's
 /// threadgroup would run most of the planes one after another.
 pub fn mv_rows_capacity(dtype: GgmlDType, m: usize, routed: bool) -> usize {
+    // The axis's switch and the contract are read only where the ceiling
+    // admits more than one row, as before the route resolved it.
+    let rows_max = if dtype.kind().mul_mv_quant() {
+        rows_max_override()
+    } else {
+        None
+    };
+    if m < 2 || mv_rows_capacity_under(dtype, m, routed, true, rows_max) < 2 {
+        return 1;
+    }
+    mv_rows_capacity_under(dtype, m, routed, mv_rows_axis_on(), rows_max)
+}
+
+/// [`mv_rows_capacity`] as a pure function of the policy it reads: `axis`
+/// is the row axis being on under `fast` ([`mv_rows_axis_on`]), `rows_max`
+/// the override of every kind's ceiling ([`mv_rows_max_override`]). The
+/// projection route (`quantized::route`) resolves the plain matmul-vec's
+/// capacity through it.
+pub fn mv_rows_capacity_under(
+    dtype: GgmlDType,
+    m: usize,
+    routed: bool,
+    axis: bool,
+    rows_max: Option<usize>,
+) -> usize {
     let kind = dtype.kind();
     let ceiling = if kind.mul_mv_quant() {
-        rows_max_override().unwrap_or(if routed {
+        rows_max.unwrap_or(if routed {
             kind.rows_max_routed
         } else {
             kind.rows_max
@@ -566,7 +591,7 @@ pub fn mv_rows_capacity(dtype: GgmlDType, m: usize, routed: bool) -> usize {
     } else {
         1
     };
-    if m < 2 || ceiling < 2 || !rows_on() || !crate::tuning::contract().is_fast() {
+    if m < 2 || ceiling < 2 || !axis {
         return 1;
     }
     if routed && m > MV_ROWS_CAPACITIES[MV_ROWS_CAPACITIES.len() - 1] {
@@ -578,6 +603,17 @@ pub fn mv_rows_capacity(dtype: GgmlDType, m: usize, routed: bool) -> usize {
         .copied()
         .find(|&c| c >= want)
         .unwrap_or(MV_ROWS_CAPACITIES[MV_ROWS_CAPACITIES.len() - 1])
+}
+
+/// The row axis is on for this process: `qmv.rows` under `fast`;
+/// `deterministic` never takes it.
+pub fn mv_rows_axis_on() -> bool {
+    rows_on() && crate::tuning::contract().is_fast()
+}
+
+/// The process's override of every kind's row ceiling (`qmv.rows_max`).
+pub fn mv_rows_max_override() -> Option<usize> {
+    rows_max_override()
 }
 
 /// `qmv.rows_max` (`LLOOM_QMV_ROWS_MAX`, read once; or
@@ -740,6 +776,55 @@ pub unsafe fn call_quantized_matmul_mv_t(
     dst_offset: usize,
     dst: &Buffer,
 ) -> Result<(), MetalKernelError> {
+    // SAFETY: the caller's contract, passed through.
+    unsafe {
+        call_quantized_matmul_mv_rows_t(
+            device,
+            ep,
+            kernels,
+            dtype,
+            triple,
+            (b, m, n, k),
+            mv_rows_capacity(dtype, m, false),
+            lhs,
+            lhs_offset,
+            rhs,
+            dst_offset,
+            dst,
+        )
+    }
+}
+
+/// [`call_quantized_matmul_mv_t`] at the row capacity `nr1` the caller
+/// resolved (`quantized::route`): 1 is the one-row core over each row, 2, 4
+/// or 8 the core at that capacity (`_r<nr1>`). A capacity the kind does not
+/// instantiate is refused by name.
+///
+/// # Safety
+/// As [`call_quantized_matmul_mv_t`].
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn call_quantized_matmul_mv_rows_t(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    dtype: GgmlDType,
+    triple: GemvTriple,
+    (b, m, n, k): (usize, usize, usize, usize),
+    nr1: usize,
+    lhs: &Buffer,
+    lhs_offset: usize,
+    rhs: &Buffer,
+    dst_offset: usize,
+    dst: &Buffer,
+) -> Result<(), MetalKernelError> {
+    if nr1 != 1 && !(dtype.kind().mul_mv_quant() && MV_ROWS_CAPACITIES.contains(&nr1)) {
+        return Err(MetalKernelError::UnsupportedDTypeForOp(Box::new(
+            UnsupportedDTypeForOp {
+                dtype: "a row capacity this kind's matmul-vec is not instantiated at",
+                op: "quantized matmul-vec",
+            },
+        )));
+    }
     // Everything is in reverse
     let ne00 = k as i64;
     let ne01 = n as i64;
@@ -821,7 +906,6 @@ pub unsafe fn call_quantized_matmul_mv_t(
     // The row axis: `nr1` activation rows a weight read (`_r<nr1>`, the
     // core at that capacity, at the core's own geometry), the grid's second
     // axis over the row groups.
-    let nr1 = mv_rows_capacity(dtype, m, false);
     let name = rows_name(name, nr1, false);
     let thread_groups_count = MTLSize {
         width: thread_groups_count.width,

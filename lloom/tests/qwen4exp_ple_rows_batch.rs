@@ -22,6 +22,13 @@ use std::path::{Path, PathBuf};
 
 const TABLE_ROWS: usize = 80;
 
+/// Read requests the table has made so far: those the read threads took and
+/// those they handed back to rayon's pool (another request in flight).
+fn requests() -> u64 {
+    let s = read_worker_stats().unwrap_or_default();
+    s.requests + s.refused
+}
+
 fn temp_gguf(tag: &str) -> PathBuf {
     std::env::temp_dir().join(format!(
         "lloom-ple-rows-batch-{}-{tag}.gguf",
@@ -161,7 +168,7 @@ fn batched(
     }
     let prefill_uploads = model.ple_row_uploads() - u0;
     let u1 = model.ple_row_uploads();
-    let r1 = read_worker_stats().unwrap_or_default().requests;
+    let r1 = requests();
     let mut logits = vec![Vec::new(); b];
     for _ in 0..steps {
         let tokens = Tensor::from_vec(next.clone(), (b, 1), dev)?;
@@ -182,7 +189,7 @@ fn batched(
     Ok(Run {
         logits,
         step_uploads: model.ple_row_uploads() - u1,
-        step_requests: read_worker_stats().unwrap_or_default().requests - r1,
+        step_requests: requests() - r1,
         prefill_uploads,
     })
 }
@@ -269,13 +276,13 @@ fn window_on(dev: &Device, tag: &str) -> Result<()> {
                 let mut c = State::<RewindableExact>::in_ring(&cfg, &pools)?;
                 let input = Tensor::from_vec(prompt.clone(), (1, prompt.len()), dev)?;
                 model.forward(&input, 0, &mut c)?;
-                let r1 = read_worker_stats().unwrap_or_default().requests;
+                let r1 = requests();
                 let argmax = model.verify_window(&window, &mut c)?;
-                let requests = read_worker_stats().unwrap_or_default().requests - r1;
+                let asked = requests() - r1;
                 if dev.is_metal() {
                     let want = if on { 1 } else { t as u64 };
                     assert_eq!(
-                        requests, want,
+                        asked, want,
                         "{tag} {dtype:?}: the window's read requests (batched {on})"
                     );
                 }

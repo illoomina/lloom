@@ -2,6 +2,14 @@
 //! This validates geometry, not the contents of arbitrary device metadata.
 use lloom_tensor::{DType, Layout, Result};
 
+// The resident producer migration is tracked on #1147. Keep the owner
+// implementation private and unwired until that lifecycle is delegated.
+#[allow(dead_code)]
+#[path = "flash_validation/resident.rs"]
+mod resident;
+#[allow(unused_imports)]
+pub(crate) use resident::ResidentSpans;
+
 #[derive(Clone, Copy)]
 pub(crate) struct Pages<'a> {
     pub entries: &'a [u32],

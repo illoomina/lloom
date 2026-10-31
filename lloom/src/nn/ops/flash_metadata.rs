@@ -5,6 +5,12 @@
 use crate::nn::attention::flash_validation::{prepare_pages, PageSummary, Pages};
 use lloom_tensor::{Device, Result, Tensor};
 
+// No production caller until the #1147 owner migration is reviewed. The
+// module exercises the actual publication mechanism, not a second allocator.
+#[allow(dead_code)]
+#[path = "flash_metadata/resident.rs"]
+mod resident;
+
 /// A published table/count pair with one authenticated source of values.
 ///
 /// Owns the allocations the caller already made for per-pass metadata. No

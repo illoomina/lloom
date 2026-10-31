@@ -429,6 +429,17 @@ fn qwen4exp_key_set(model: &LoadConfig) -> Option<&'static str> {
     .find_map(|(set, key)| set.then_some(key))
 }
 
+/// `models.lfm2_gguf.activation_dtype` off its default on a family that
+/// computes at no other dtype for it: refused by name.
+fn refuse_gguf_act(model: &LoadConfig, family: &str) -> Result<()> {
+    if model.gguf_act != LoadConfig::default().gguf_act {
+        anyhow::bail!(
+            "`models.lfm2_gguf.activation_dtype` (--gguf-act) is the LFM2 engine's over an LFM2 GGUF; {family} has no such arm"
+        );
+    }
+    Ok(())
+}
+
 /// The refusals every family shares.
 fn resolve_common(cap: &Capabilities, req: &Requested<'_>) -> Result<()> {
     let s = &req.shape;
@@ -489,6 +500,7 @@ impl Family for Lfm2Family {
     }
     fn resolve(&self, req: &Requested<'_>) -> Result<()> {
         resolve_common(&LFM2_CAPABILITIES, req)?;
+        refuse_gguf_act(req.model, "a safetensors LFM2 checkpoint")?;
         let s = &req.shape;
         lfm2::RowsArm::parse(&s.rows, s.batch > 1)?;
         if s.share_prefix && !(s.batch > 1 && lfm2::RowsArm::parse(&s.rows, true)?.pooled()) {
@@ -537,6 +549,10 @@ fn lfm2_load_options(checkpoint: PathBuf, req: &Requested<'_>) -> Result<lfm2::L
         decision_template: model.decision_template.clone(),
         decision_ragged: shape.decision_ragged,
         text_only: model.text_only,
+        gguf_act: match model.gguf_act.as_str() {
+            "f16" => lloom_tensor::DType::F16,
+            _ => lloom_tensor::DType::F32,
+        },
     })
 }
 
@@ -586,6 +602,7 @@ impl Family for Qwen4ExpFamily {
     }
     fn resolve(&self, req: &Requested<'_>) -> Result<()> {
         resolve_common(&QWEN4EXP_CAPABILITIES, req)?;
+        refuse_gguf_act(req.model, "qwen4exp")?;
         let s = &req.shape;
         if s.speculative.method == "mtp" {
             if s.speculative.drafter.is_none() {
@@ -692,6 +709,7 @@ impl Family for Qwen3_5Family {
     }
     fn resolve(&self, req: &Requested<'_>) -> Result<()> {
         resolve_common(&self.capabilities(), req)?;
+        refuse_gguf_act(req.model, "qwen3_5")?;
         let s = &req.shape;
         if s.speculative.method == "mtp" {
             if let Some(d) = &s.speculative.drafter {
@@ -776,6 +794,7 @@ impl Family for Lfm2GgufFamily {
         }
         let cap = super::causal_loaded::served::lfm2_gguf_capabilities();
         resolve_common(&cap, req)?;
+        refuse_gguf_act(req.model, "the legacy GGUF engine")?;
         if req.model.flash_k.is_some() {
             anyhow::bail!("--flash-k sizes LFM2's FlashDecoding chunk; lfm2-gguf has no such arm");
         }

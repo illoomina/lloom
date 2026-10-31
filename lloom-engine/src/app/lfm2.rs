@@ -455,6 +455,9 @@ pub struct LoadOptions {
     pub decision_ragged: bool,
     /// `model.text_only`: build no vision tower on a VL checkpoint.
     pub text_only: bool,
+    /// `models.lfm2_gguf.activation_dtype`: the dtype an LFM2 GGUF computes
+    /// in (`lfm2::gguf::check_compute_dtype`).
+    pub gguf_act: DType,
 }
 
 /// How the rows of `--batch N` hold their KV and conv state, and how a step
@@ -898,11 +901,11 @@ impl<P: Lfm2Shape> Engine<P> {
         preflight: impl FnOnce(&Config, &Text) -> Result<()>,
     ) -> Result<Self> {
         let model_dir = opts.model_dir.clone();
-        // A GGUF's packed blocks compute at f32 (`lfm2::gguf`).
+        // A GGUF computes at its arm's dtype (`lfm2::gguf`).
         let mut gguf = gguf_text(&model_dir)?;
         let is_gguf = gguf.is_some();
         let dtype = if is_gguf {
-            lloom::models::lfm2::gguf::GGUF_COMPUTE_DTYPE
+            lloom::models::lfm2::gguf::check_compute_dtype(opts.gguf_act)?
         } else if device.is_cpu() {
             DType::F32
         } else {
@@ -1194,7 +1197,8 @@ impl<P: Lfm2Shape> Engine<P> {
             Some(g) => {
                 let file = std::fs::File::open(&model_dir)
                     .with_context(|| format!("opening {}", model_dir.display()))?;
-                g.header.recording_var_builder(g.content, file, &device)
+                g.header
+                    .recording_var_builder(g.content, file, &device, dtype)
             }
             None => {
                 // SAFETY: the checkpoint is not modified while mapped
@@ -3557,6 +3561,7 @@ impl<P: Lfm2Shape> super::served::Served for Engine<P> {
             "memory_fraction": self.memory_fraction,
             "kv_capacity": self.kv_capacity,
             "rows": self.rows.name(),
+            "projections": self.core.model.projection_routes(),
             "share_prefix": self.share_prefix,
             "dspark_k": self.dspark_k,
             "cut_sites": super::common::cut_sites_json(),

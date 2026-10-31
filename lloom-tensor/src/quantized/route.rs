@@ -103,7 +103,32 @@ fn cell(w: Weight, s: Spec) -> String {
 
 /// The route `s` takes over `w` under `p`.
 pub fn resolve(w: Weight, s: Spec, p: Policy) -> Result<Route, Refused> {
+    // Geometry the dispatch needs, checked here so a refusal costs nothing
+    // (Codex review on PR1161, 2026-10-31): an empty request or a weight of
+    // rank below 2 has no route; the matmul-vec takes one matrix (rank 2,
+    // `fwd_mv`'s `dims2`), the GEMM a stack of them.
+    if s.rows == 0 || w.k == 0 || w.rank < 2 {
+        return Err(Refused {
+            cell: cell(w, s),
+            need: "a non-empty request over a weight of rank >= 2",
+        });
+    }
     if s.row_per_batch || s.rows <= p.mv_rows_max {
+        if matches!(
+            w.kind.kind().mul_mv,
+            crate::kernels::kernels::quantized::MulMv::None
+        ) {
+            return Err(Refused {
+                cell: cell(w, s),
+                need: "a matmul-vec arm for this weight kind",
+            });
+        }
+        if w.rank != 2 {
+            return Err(Refused {
+                cell: cell(w, s),
+                need: "a rank-2 weight (the matmul-vec takes one matrix)",
+            });
+        }
         return match s.act {
             DType::F32 => Ok(Route::Matvec(GemvTriple::F32F32F32)),
             DType::F16 if w.kind.has_gemv_triple() => Ok(Route::Matvec(GemvTriple::F16F32F16)),

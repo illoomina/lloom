@@ -88,6 +88,12 @@ struct Args {
     /// (`weights.ngram.read_threads`) when absent.
     #[arg(long)]
     worker_threads: Option<usize>,
+    /// A batch's read (`FILLB`): each stream cut into `B` contiguous parts,
+    /// a row each with its own window; per step the `B` rows' ids read in
+    /// one request (`batched`, the batched PLE gather) or row by row
+    /// (`per-row`), cold and warm, on the fixed read threads, no hedge.
+    #[arg(long, value_delimiter = ',')]
+    batch_rows: Vec<usize>,
 }
 
 /// The checkpoint's hash: the reference derivation, which
@@ -236,6 +242,91 @@ fn pread_fill(
                 .try_for_each(|(&id, dst)| one(id, dst))
         }),
     }
+}
+
+/// `--batch-rows`: `tokens` cut into `b` rows; per step every row's 16 ids
+/// read in one request or row by row, each arm's pass cold (every page the
+/// rows touch dropped first) and warm, in the order per-row, batched,
+/// batched, per-row (the same arm twice is the null).
+fn batch_rows(
+    table: &MmapPleTable,
+    hash: &NgramHash,
+    pages: &Pages,
+    label: &str,
+    tokens: &[u32],
+    b: usize,
+    dump: &mut Option<std::io::BufWriter<std::fs::File>>,
+) -> Result<()> {
+    let nh = hash.n_heads();
+    let hd = table.head_dim();
+    let part = tokens.len() / b.max(1);
+    anyhow::ensure!(part > 0, "--batch-rows {b}: {} tokens", tokens.len());
+    let rows: Vec<Vec<Vec<i64>>> = (0..b)
+        .map(|r| row_ids(hash, &tokens[r * part..(r + 1) * part]))
+        .collect();
+    let mut touched: Vec<usize> = rows
+        .iter()
+        .flatten()
+        .flatten()
+        .flat_map(|&id| pages.span(table.row_file_offset(id).unwrap(), table.row_bytes()))
+        .collect();
+    touched.sort_unstable();
+    touched.dedup();
+    let shipped = (table.read_policy(), table.read_pool(), table.hedge());
+    table.set_read_policy(ReadPolicy::Adaptive);
+    table.set_read_pool(ReadPool::Workers);
+    table.set_hedge_us(0);
+    let mut whole = ReadScratch::with_rows(b * nh, table.row_bytes());
+    let mut one = ReadScratch::with_rows(nh, table.row_bytes());
+    let mut out = vec![0f32; b * nh * hd];
+    let mut ids = vec![0i64; b * nh];
+    for (slot, arm) in ["per-row", "batched", "batched", "per-row"]
+        .iter()
+        .enumerate()
+    {
+        for pass in ["cold", "warm"] {
+            let mut still = 0;
+            if pass == "cold" {
+                for &p in &touched {
+                    pages.evict(p);
+                }
+                still = touched.iter().filter(|&&p| pages.resident(p)).count();
+            }
+            let mut us = Vec::with_capacity(part);
+            for t in 0..part {
+                for (r, row) in rows.iter().enumerate() {
+                    ids[r * nh..(r + 1) * nh].copy_from_slice(&row[t]);
+                }
+                let s = Instant::now();
+                if *arm == "batched" {
+                    table.gather_into_with(&ids, &mut out, &mut whole)?;
+                } else {
+                    for r in 0..b {
+                        table.gather_into_with(
+                            &ids[r * nh..(r + 1) * nh],
+                            &mut out[r * nh * hd..(r + 1) * nh * hd],
+                            &mut one,
+                        )?;
+                    }
+                }
+                let v = s.elapsed().as_secs_f64() * 1e6;
+                if let Some(f) = dump.as_mut() {
+                    use std::io::Write;
+                    writeln!(f, "{label},batch{b}-{arm}-{slot},{pass},{t},-,{v:.3}")?;
+                }
+                us.push(v);
+            }
+            println!(
+                "FILLB label={label} rows={b} arm={arm} slot={slot} pass={pass} pages={} resident_after_evict={still} {}",
+                touched.len(),
+                dist(&mut us)
+            );
+        }
+    }
+    table.set_read_policy(shipped.0);
+    table.set_read_pool(shipped.1);
+    table.set_hedge_us(shipped.2.map_or(0, |d| d.as_micros() as u64));
+    Ok(())
 }
 
 fn main() -> Result<()> {
@@ -520,6 +611,10 @@ fn main() -> Result<()> {
             }
             table.set_read_pool(shipped.0);
             table.set_hedge_us(shipped.1.map_or(0, |d| d.as_micros() as u64));
+        }
+
+        for &b in &args.batch_rows {
+            batch_rows(&table, &hash, &pages, label, &tokens, b, &mut dump)?;
         }
 
         // The hot-row cache: its hit rate on this stream, from empty, again

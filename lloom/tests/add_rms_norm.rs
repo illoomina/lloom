@@ -15,6 +15,9 @@ fn metal_device() -> Result<Device> {
         }
     }
     eprintln!("ADD_RMSNORM_API actual={actual}");
+    // The matrix runs a bf16 arm on purpose, where the GPU may only emulate
+    // it (§15.2a, #860); as the short-conv fixtures do.
+    lloom_tensor::test_utils::allow_emulated(&dev, DType::BF16);
     Ok(dev)
 }
 

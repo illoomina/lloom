@@ -292,14 +292,14 @@ pub trait Served: Send + Sync {
         Ok(self.vision_report())
     }
 
-    /// The refusal a family without vision gives, by the family's own reason.
+    /// The refusal a family without vision gives, by the family's own reason:
+    /// the request's input, typed as the client's (`refusal::InputRefused`).
     fn no_vision(&self) -> anyhow::Error {
         let c = self.capabilities();
-        anyhow::anyhow!(
+        anyhow::Error::new(super::refusal::InputRefused(format!(
             "{} does not take image input: {}",
-            c.family,
-            c.vision_missing
-        )
+            c.family, c.vision_missing
+        )))
     }
 
     /// The executor arms armed at load, for their engagement reports

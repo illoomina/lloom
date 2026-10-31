@@ -28,10 +28,9 @@ use lloom::nn::{
 };
 use lloom_tensor::{Device, Result};
 
-/// Execute the reader while its producer's stop signal is in scope.
-/// The exit guard also covers a fallible detokenizer and unwinding: error
-/// propagation alone does not wake/cancel the independent producer loop.
-fn stop_on_reader_exit<T>(stop: &std::sync::atomic::AtomicBool, read: impl FnOnce() -> T) -> T {
+/// Publish a peer's exit signal on return or unwind. The reader cancels its
+/// producer; the producer marks completion before a scoped reader is joined.
+fn signal_on_exit<T>(stop: &std::sync::atomic::AtomicBool, read: impl FnOnce() -> T) -> T {
     struct StopOnExit<'a>(&'a std::sync::atomic::AtomicBool);
     impl Drop for StopOnExit<'_> {
         fn drop(&mut self) {
@@ -51,7 +50,7 @@ fn drain_ring_reader(
     mut hook: impl FnMut(&[u32]) -> Result<bool>,
 ) -> Result<()> {
     use std::sync::atomic::Ordering;
-    stop_on_reader_exit(stop, || {
+    signal_on_exit(stop, || {
         let mut read_and_stop = |buf: &mut Vec<u32>| {
             let (result, ended) = read(buf);
             if result.is_ok() && ended {
@@ -1058,15 +1057,16 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
                                     hook,
                                 )
                             });
-                            let out = self.session.decode_until(
-                                &mut spec,
-                                readback,
-                                &mut sampler,
-                                &prepared.suffix,
-                                &opts,
-                                &mut |_: &[u32]| Ok(true),
-                            );
-                            stream_done.store(true, std::sync::atomic::Ordering::Release);
+                            let out = signal_on_exit(stream_done, || {
+                                self.session.decode_until(
+                                    &mut spec,
+                                    readback,
+                                    &mut sampler,
+                                    &prepared.suffix,
+                                    &opts,
+                                    &mut |_: &[u32]| Ok(true),
+                                )
+                            });
                             let drained = worker.join().map_err(|_| {
                                 lloom_tensor::Error::msg("ring reader thread panicked")
                             });
@@ -1559,16 +1559,15 @@ mod tests {
         use std::sync::atomic::{AtomicBool, Ordering};
         let stop = AtomicBool::new(false);
         let err: Result<()> =
-            stop_on_reader_exit(&stop, || lloom_tensor::bail!("injected detokenizer error"));
+            signal_on_exit(&stop, || lloom_tensor::bail!("injected detokenizer error"));
         assert!(err.unwrap_err().to_string().contains("detokenizer"));
         assert!(
             stop.load(Ordering::Acquire),
             "reader returned but producer is live"
         );
         stop.store(false, Ordering::Release);
-        let panicked = std::panic::catch_unwind(|| {
-            stop_on_reader_exit(&stop, || panic!("injected reader panic"))
-        });
+        let panicked =
+            std::panic::catch_unwind(|| signal_on_exit(&stop, || panic!("injected reader panic")));
         assert!(panicked.is_err());
         assert!(stop.load(Ordering::Acquire), "unwinding left producer live");
     }

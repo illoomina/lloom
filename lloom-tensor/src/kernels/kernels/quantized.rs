@@ -1323,6 +1323,15 @@ pub unsafe fn call_quantized_matmul_mm_id_mapped(
             },
         )));
     }
+    if batch == 0 || topk == 0 {
+        crate::quantized::moe_rowmap::empty_native_strides(
+            (batch, topk, in_dim1),
+            (n_experts, n, k),
+            dtype_block_size(dtype),
+            dtype_type_size(dtype),
+        )
+        .map_err(|e| MetalKernelError::LoadFunctionError(e.to_string()))?;
+    }
     let name = if bn == 16 {
         format!("kernel_mul_mm_id_mapped16_{stem}_f32")
     } else {

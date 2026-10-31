@@ -899,6 +899,14 @@ impl QMetalStorage {
             && crate::shape_req!(moe_mm_id, k % 32 == 0; k)
         {
             let geometry = super::moe_rowmap::geometry(batch, topk, n_experts, 32)?;
+            if geometry.pairs == 0 {
+                super::moe_rowmap::empty_native_strides(
+                    (batch, topk, in_dim1),
+                    (n_experts, n, k),
+                    self.dtype.block_size(),
+                    self.dtype.type_size(),
+                )?;
+            }
             let bn = moe_mm_bn(geometry.pairs as usize, geometry.experts as usize);
             Some(if bn == 32 {
                 geometry

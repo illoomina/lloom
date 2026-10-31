@@ -18,9 +18,17 @@ pub(crate) fn geometry(
     block_n: usize,
 ) -> Result<Geometry> {
     const COORDINATES: usize = u16::MAX as usize + 1;
-    if rows > COORDINATES || topk > COORDINATES {
-        crate::bail!("moe_rowmap: rows {rows} and topk {topk} must be in 0..={COORDINATES}")
+    if rows != 0 && topk != 0 && (rows > COORDINATES || topk > COORDINATES) {
+        crate::bail!(
+            "moe_rowmap: nonempty rows {rows} and topk {topk} must be in 1..={COORDINATES}"
+        )
     }
+    // Empty maps form no ushort coordinates, but the actual native arguments
+    // still have types: mapper topk is uint, mapped GEMM batch is int64_t.
+    let topk_native = u32::try_from(topk)
+        .map_err(|_| crate::Error::Msg("moe_rowmap: topk exceeds u32".into()))?;
+    i64::try_from(rows)
+        .map_err(|_| crate::Error::Msg("moe_rowmap: rows exceeds native i64".into()))?;
     if experts == 0 || experts > 1024 {
         crate::bail!("moe_rowmap: n_experts {experts} must be in 1..=1024")
     }
@@ -47,11 +55,57 @@ pub(crate) fn geometry(
         .ok_or_else(|| crate::Error::Msg("moe_rowmap: row bytes exceed usize".into()))?;
     Ok(Geometry {
         pairs,
-        topk: topk as u32,
+        topk: topk_native,
         experts: experts as u32,
         block_n: block_n as u32,
         bound,
     })
+}
+
+/// Empty maps still take the production mapper/mapped-GEMM route. Check the
+/// dimensions and stride products the Rust wrapper actually forms, even though
+/// meta=0 makes the MSL return before reading coordinates. No arbitrary empty
+/// cap and no alternate kernel route. The nonempty route is unchanged.
+pub(crate) fn empty_native_strides(
+    (rows, topk, in_dim1): (usize, usize, usize),
+    (experts, n, k): (usize, usize, usize),
+    weight_block: usize,
+    weight_type: usize,
+) -> Result<()> {
+    if rows != 0 && topk != 0 {
+        return Ok(());
+    }
+    u32::try_from(topk).map_err(|_| crate::Error::Msg("moe_rowmap: topk exceeds u32".into()))?;
+    for (name, value) in [
+        ("rows", rows),
+        ("topk", topk),
+        ("input dim1", in_dim1),
+        ("experts", experts),
+        ("n", n),
+        ("k", k),
+    ] {
+        i64::try_from(value)
+            .map_err(|_| crate::Error::Msg(format!("moe_rowmap: {name} exceeds native i64")))?;
+    }
+    let row_bytes = k
+        .checked_div(weight_block)
+        .and_then(|blocks| blocks.checked_mul(weight_type))
+        .and_then(|bytes| u64::try_from(bytes).ok())
+        .ok_or_else(|| crate::Error::Msg("moe_rowmap: weight row bytes overflow".into()))?;
+    u64::try_from(n)
+        .ok()
+        .and_then(|n| n.checked_mul(row_bytes))
+        .ok_or_else(|| crate::Error::Msg("moe_rowmap: weight expert stride overflow".into()))?;
+    u64::try_from(k)
+        .ok()
+        .and_then(|k| k.checked_mul(4))
+        .ok_or_else(|| crate::Error::Msg("moe_rowmap: activation row stride overflow".into()))?;
+    in_dim1
+        .checked_mul(k)
+        .and_then(|elems| u64::try_from(elems).ok())
+        .and_then(|elems| elems.checked_mul(4))
+        .ok_or_else(|| crate::Error::Msg("moe_rowmap: activation batch stride overflow".into()))?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -103,6 +157,41 @@ mod tests {
             );
         }
     }
+    #[test]
+    fn empty_maps_do_not_form_ushort_coordinates() {
+        for (rows, topk) in [(65537usize, 0usize), (0, 65537)] {
+            for bn in [16, 32] {
+                let g = geometry(rows, topk, 2, bn).unwrap();
+                assert_eq!(g.pairs, 0);
+                assert_eq!(g.topk as usize, topk);
+                assert_eq!(g.bound, 2);
+            }
+        }
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn empty_native_representations_are_checked_without_coordinate_caps() {
+        assert!(geometry(0, u32::MAX as usize, 2, 16).is_ok());
+        assert!(geometry(i64::MAX as usize, 0, 2, 16).is_ok());
+        assert!(geometry(0, u32::MAX as usize + 1, 2, 16).is_err());
+        assert!(geometry(i64::MAX as usize + 1, 0, 2, 16).is_err());
+        for args in [(65537, 0, 1), (0, 65537, 1), (0, 65537, 65537)] {
+            empty_native_strides(args, (2, 1, 32), 1, 4).unwrap();
+        }
+        // Representable dimensions do not imply representable native strides.
+        let topk = u32::MAX as usize;
+        let k = (u64::MAX / 4 / topk as u64 + 1) as usize;
+        let error = empty_native_strides((0, topk, topk), (2, 1, k), 1, 4).unwrap_err();
+        assert!(
+            error.to_string().contains("activation batch stride"),
+            "{error}"
+        );
+        assert!(empty_native_strides((0, 1, 1), (2, i64::MAX as usize, 1), 1, 4).is_err());
+        assert!(empty_native_strides((0, 1, 1), (2, 1, i64::MAX as usize), 1, 4).is_err());
+        assert!(empty_native_strides((0, 1, 1), (2, 1, 32), 0, 4).is_err());
+    }
+
     #[cfg(feature = "metal")]
     #[test]
     fn safe_mapped_matmul_checks_coordinates_and_preserves_empty_tiles() {
@@ -137,11 +226,8 @@ mod tests {
             (pools_before.0.lookups, pools_before.1.lookups),
             "invalid coordinates must be refused before output/map pool requests"
         );
-        assert!(
-            error.to_string().contains("moe_rowmap: rows 65537"),
-            "{error}"
-        );
-        for (rows, topk) in [(0usize, 1usize), (1, 0)] {
+        assert!(error.to_string().contains("rows 65537"), "{error}");
+        for (rows, topk) in [(0usize, 1usize), (1, 0), (0, 65537), (65537, 0)] {
             let input = Tensor::zeros((rows, 1, 32), DType::F32, &dev).unwrap();
             let ids = Tensor::zeros((rows, topk), DType::U32, &dev).unwrap();
             let output = weights

@@ -21,14 +21,22 @@ impl Drop for FixtureDir {
 }
 
 fn fixture(eos_gate: bool) -> Result<(FixtureDir, Engine<Owner>)> {
+    // LLOOM_METAL_API=metal3|metal4 pins the API (the lane's per-API runs);
+    // unset or `auto`, the fixture runs on the default API, as the CI gate
+    // runs it.
     let requested = std::env::var("LLOOM_METAL_API")
-        .context("LLOOM_METAL_API=metal3|metal4 selects the API this runs on")?;
-    anyhow::ensure!(matches!(requested.as_str(), "metal3" | "metal4"));
+        .ok()
+        .filter(|v| v != "auto");
+    if let Some(r) = &requested {
+        anyhow::ensure!(matches!(r.as_str(), "metal3" | "metal4"), "LLOOM_METAL_API={r}");
+    }
     // Install the tuning before the checkpoint is written: the writer builds a
     // CPU schema model, which fixes the regime.
     let mut options = crate::EngineOptions::default();
     options.tuning.contract.profile = "deterministic".into();
-    options.tuning.metal.command_api = requested.clone();
+    if let Some(r) = &requested {
+        options.tuning.metal.command_api = r.clone();
+    }
     options.tuning.install().map_err(anyhow::Error::msg)?;
     static NEXT: AtomicUsize = AtomicUsize::new(0);
     let dir = std::env::temp_dir().join(format!(
@@ -88,7 +96,9 @@ fn fixture(eos_gate: bool) -> Result<(FixtureDir, Engine<Owner>)> {
         .as_metal_device()?
         .commands()
         .actual_command_api();
-    assert_eq!(actual, requested, "the fixture runs on the API it names");
+    if let Some(r) = &requested {
+        assert_eq!(actual, r.as_str(), "the fixture runs on the API it names");
+    }
     println!("UNWIND_EOS_GATE actual_api={actual} eos_gate={eos_gate}");
     Ok((owner, engine))
 }

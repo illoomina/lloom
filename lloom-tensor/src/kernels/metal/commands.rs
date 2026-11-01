@@ -1404,11 +1404,11 @@ impl Commands {
             return Ok(());
         };
         if let Some(enc) = &state.current_encoder {
-            let _unwind = CloseUnwind {
-                failure: &self.core.failure,
-                message: "compute encoder setup exited exceptionally; custody retained",
-                buffer: Some(&enc.command_buffer),
-            };
+            let _unwind = CloseUnwind::new(
+                &self.core.failure,
+                "compute encoder setup exited exceptionally; custody retained",
+                Some(&enc.command_buffer),
+            );
             // SAFETY: the flag is the gate's own buffer, held for this queue's life;
             // the host writes it only in `EosGate::begin`, before a round's first
             // gated dispatch.
@@ -1688,11 +1688,11 @@ impl Commands {
             // A custom bind may unwind after partially changing native state.
             // The canonical wrapper stays rooted, but no later recording gate
             // may treat it as a successfully initialized encoder.
-            let _unwind = CloseUnwind {
-                failure: &self.core.failure,
-                message: "compute encoder setup exited exceptionally; custody retained",
-                buffer: Some(&enc.command_buffer),
-            };
+            let _unwind = CloseUnwind::new(
+                &self.core.failure,
+                "compute encoder setup exited exceptionally; custody retained",
+                Some(&enc.command_buffer),
+            );
             if let Some(flag) = self.core.eos_gate.armed_flag() {
                 // The EOS gate (lloom #735 step 4): the gated kernel variants
                 // read the flag at this index; bound once per encoder.
@@ -2693,14 +2693,34 @@ impl Commands {
 
 /// Native close can unwind before returning a Result. Custody was already
 /// staged in EntryState; latch only a static failure without allocating here.
+/// The failure is the close's only when the unwind began inside it: a close
+/// started while the thread was already unwinding (an unrelated panic whose
+/// cleanup closes the encoder) cannot itself unwind, because a second panic
+/// there aborts, so its completion is not a failure.
 struct CloseUnwind<'a> {
     failure: &'a CommandBufferFailure,
     message: &'static str,
     buffer: Option<&'a CommandBuffer>,
+    /// The thread was already unwinding when the close started.
+    unwinding_at_start: bool,
+}
+impl<'a> CloseUnwind<'a> {
+    fn new(
+        failure: &'a CommandBufferFailure,
+        message: &'static str,
+        buffer: Option<&'a CommandBuffer>,
+    ) -> Self {
+        Self {
+            failure,
+            message,
+            buffer,
+            unwinding_at_start: std::thread::panicking(),
+        }
+    }
 }
 impl Drop for CloseUnwind<'_> {
     fn drop(&mut self) {
-        if std::thread::panicking() {
+        if std::thread::panicking() && !self.unwinding_at_start {
             self.failure.record_static(self.message);
             if let Some(buffer) = self.buffer {
                 buffer.notify_lifecycle();
@@ -2872,11 +2892,11 @@ impl CommandsCore {
                 .ok_or(MetalKernelError::QueueUnavailable(
                     "closed blit custody bound (2) exhausted",
                 ))?;
-            let _unwind = CloseUnwind {
-                failure: &self.failure,
-                message: "blit close exited exceptionally; custody retained",
-                buffer: None,
-            };
+            let _unwind = CloseUnwind::new(
+                &self.failure,
+                "blit close exited exceptionally; custody retained",
+                None,
+            );
             if let Err(error) = pending.encoder.end_encoding() {
                 if !matches!(
                     error,
@@ -3126,11 +3146,11 @@ impl EncoderFinalizer {
         nonblocking: bool,
     ) -> Result<(), MetalKernelError> {
         self.failure.check()?;
-        let _unwind = CloseUnwind {
-            failure: &self.failure,
-            message: "compute close exited exceptionally; custody retained",
-            buffer: Some(&encoder.command_buffer),
-        };
+        let _unwind = CloseUnwind::new(
+            &self.failure,
+            "compute close exited exceptionally; custody retained",
+            Some(&encoder.command_buffer),
+        );
         encoder.end_encoding_prepared(
             nonblocking,
             || {
@@ -3393,11 +3413,11 @@ impl lifecycle::FinalCore for CommandsCore {
                     "retained blit close failure",
                 ));
             }
-            let _unwind = CloseUnwind {
-                failure: &self.failure,
-                message: "final blit close exited exceptionally; custody retained",
-                buffer: None,
-            };
+            let _unwind = CloseUnwind::new(
+                &self.failure,
+                "final blit close exited exceptionally; custody retained",
+                None,
+            );
             if !pending.encoder.try_end_encoding()? {
                 return Ok(false);
             }
@@ -3550,11 +3570,11 @@ mod entry_unwind_tests {
         let state = parking_lot::Mutex::new(Some(owner));
         assert!(catch_unwind(AssertUnwindSafe(|| {
             let _entry = DeferredGuard::new(state.lock(), ());
-            let _setup = CloseUnwind {
-                failure: &failure,
-                message: "compute encoder setup exited exceptionally; custody retained",
-                buffer: None,
-            };
+            let _setup = CloseUnwind::new(
+                &failure,
+                "compute encoder setup exited exceptionally; custody retained",
+                None,
+            );
             panic!("controlled setup unwind");
         }))
         .is_err());
@@ -3568,6 +3588,43 @@ mod entry_unwind_tests {
             .try_lock()
             .expect("setup unwind retained EntryState lock")
             .is_some());
+    }
+
+    /// A close that starts while an unrelated unwind is in progress, as the
+    /// EOS gate's guard closes the open encoder when a decode forward
+    /// panics, returns normally: it is not a close that exited exceptionally.
+    #[test]
+    fn a_close_started_during_an_unrelated_unwind_is_not_a_failure() {
+        struct CloseInCleanup<'a> {
+            failure: &'a CommandBufferFailure,
+            unwinding: &'a std::cell::Cell<bool>,
+        }
+        impl Drop for CloseInCleanup<'_> {
+            fn drop(&mut self) {
+                self.unwinding.set(std::thread::panicking());
+                let _close = CloseUnwind::new(
+                    self.failure,
+                    "compute close exited exceptionally; custody retained",
+                    None,
+                );
+            }
+        }
+        let failure = CommandBufferFailure::default();
+        let unwinding = std::cell::Cell::new(false);
+        assert!(catch_unwind(AssertUnwindSafe(|| {
+            let _cleanup = CloseInCleanup {
+                failure: &failure,
+                unwinding: &unwinding,
+            };
+            panic!("unrelated decode-forward unwind");
+        }))
+        .is_err());
+        assert!(unwinding.get(), "the close ran during the unwind");
+        assert!(
+            failure.check().is_ok(),
+            "a completed close during an unrelated unwind latched a failure: {:?}",
+            failure.check()
+        );
     }
 }
 

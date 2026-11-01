@@ -1958,17 +1958,11 @@ pub struct Qwen4Exp<P: Profile, R: ExpertResidency> {
     /// (`ReplayInputs`).
     #[cfg(feature = "metal")]
     replay_h: parking_lot::Mutex<ReplayInputs>,
-    /// A one-position step's PLE rows, gathered on the host into a Shared
-    /// buffer the model keeps rather than uploaded per step
-    /// (`ple_rows_owned`), and the epoch of its last reader.
+    /// A step's PLE rows — one position's, a batch's rows', a verify
+    /// window's positions' — gathered on the host into Shared regions the
+    /// model keeps rather than uploaded per step (`ple_rows_owned`).
     #[cfg(feature = "metal")]
-    ple_rows: parking_lot::Mutex<
-        Option<(
-            lloom_tensor::kernels::metal::BufferHandle,
-            Tensor,
-            Option<lloom_tensor::kernels::metal::Epoch>,
-        )>,
-    >,
+    ple_rows: parking_lot::Mutex<PleRowSlots>,
     /// What `qwen4exp.fusion = derived` decided at load (`derive_fusion`).
     fusion_report: Option<String>,
     cfg: Config,
@@ -2110,7 +2104,7 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
             #[cfg(feature = "metal")]
             replay_h: parking_lot::Mutex::new(ReplayInputs::default()),
             #[cfg(feature = "metal")]
-            ple_rows: parking_lot::Mutex::new(None),
+            ple_rows: parking_lot::Mutex::new(PleRowSlots::default()),
             fusion_report: None,
             cfg,
         })
@@ -3415,7 +3409,7 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
                     at = Some(cache.ngram.clone());
                 }
             }
-            let emb = ple.table.gather(&ids, res_hc.device())?;
+            let emb = self.ple_rows_uploaded(ple, &ids, res_hc.device())?;
             let emb = emb.reshape((seq, emb.elem_count() / seq))?;
             let (out, hist) =
                 ple.block
@@ -3440,12 +3434,7 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
         let n_heads = ple.hash.n_heads();
         let mut ids = vec![0i64; seq * n_heads];
         for t in 0..seq {
-            let token = cache.pending_tokens.pop_front();
-            let token = token.or(self.cfg.ple_image_token_id);
-            let window = cache.ngram.window(token);
-            ple.hash
-                .row_ids(&window, &mut ids[t * n_heads..(t + 1) * n_heads]);
-            cache.ngram.push(token);
+            self.ple_hash_next(ple, cache, &mut ids[t * n_heads..(t + 1) * n_heads]);
         }
         if seq == 1 {
             if let Some(emb) = self.ple_rows_owned(ple, &ids, res_hc.device())? {
@@ -3457,16 +3446,122 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
                 return out;
             }
         }
-        let emb = ple.table.gather(&ids, res_hc.device())?; // [seq·n_heads·head_dim]
+        let emb = self.ple_rows_uploaded(ple, &ids, res_hc.device())?; // [seq·n_heads·head_dim]
         let emb = emb.reshape((seq, emb.elem_count() / seq))?;
         ple.block
             .forward(res_hc, &emb, &mut cache.ple_conv, ple.layer)
     }
 
-    /// One position's PLE rows gathered on the host straight into the
-    /// model's Shared buffer, once the step that last read it has retired;
-    /// `None` — the caller uploads them, as always — while it may still run,
-    /// off Metal, or for a table that cannot gather into a slice.
+    /// Hash `cache`'s next position — its noted token, or the image token
+    /// where none is noted — into `out` (`n_heads` row ids), and advance its
+    /// window past it.
+    fn ple_hash_next(&self, ple: &Ple<P>, cache: &mut State<P>, out: &mut [i64]) {
+        let token = cache.pending_tokens.pop_front();
+        let token = token.or(self.cfg.ple_image_token_id);
+        let window = cache.ngram.window(token);
+        ple.hash.row_ids(&window, out);
+        cache.ngram.push(token);
+    }
+
+    /// The PLE deltas of `k` single-position forwards against `res_hc [k, 1,
+    /// n·d]` → `[k, 1, n·d]`: the rows of a batch, one position of each of
+    /// `caches` (`per_cache = 1`), or the positions of one cache's verify
+    /// window (`caches` one, `per_cache = k`). Every position's window is
+    /// hashed first, in order; all their rows are read in one request into
+    /// one region (`ple_rows_owned`, else one upload); then the block runs
+    /// per position on its slice of the region, against its own history, in
+    /// the order the positions take. Each position computes what `ple_delta`
+    /// of it alone computes, from the same rows. `None` — the caller runs
+    /// `ple_delta` per position — with the arm off
+    /// (`models.qwen4exp.ple.rows_batch`), or when a position is not a
+    /// decode step's: a turn checkpoint inside the pass, or no noted token.
+    fn ple_deltas_batched(
+        &self,
+        ple: &Ple<P>,
+        res_hc: &Tensor,
+        caches: &mut [&mut State<P>],
+        per_cache: usize,
+    ) -> Result<Option<Tensor>> {
+        let k = caches.len() * per_cache;
+        if !ple_rows_batch() || k == 0 || res_hc.dim(0)? != k {
+            return Ok(None);
+        }
+        if caches
+            .iter()
+            .any(|c| c.ckpt_ple_rows(ple.layer).is_some() || c.pending_tokens.len() < per_cache)
+        {
+            return Ok(None);
+        }
+        for p in 0..k {
+            self.ple_window_cut(&res_hc.narrow(0, p, 1)?)?;
+        }
+        let n_heads = ple.hash.n_heads();
+        let mut ids = vec![0i64; k * n_heads];
+        for p in 0..k {
+            let cache = &mut *caches[p / per_cache];
+            self.ple_hash_next(ple, cache, &mut ids[p * n_heads..(p + 1) * n_heads]);
+        }
+        let dev = res_hc.device();
+        let (rows, owned) = match self.ple_rows_owned(ple, &ids, dev)? {
+            Some(t) => (t, true),
+            None => (self.ple_rows_uploaded(ple, &ids, dev)?, false),
+        };
+        let len = rows.elem_count() / k;
+        let mut deltas = Vec::with_capacity(k);
+        for p in 0..k {
+            let emb = rows.narrow(0, p * len, len)?.reshape((1, len))?;
+            let cache = &mut *caches[p / per_cache];
+            deltas.push(ple.block.forward(
+                &res_hc.narrow(0, p, 1)?,
+                &emb,
+                &mut cache.ple_conv,
+                ple.layer,
+            )?);
+        }
+        if owned {
+            self.ple_rows_read_encoded();
+        }
+        Ok(Some(if k == 1 {
+            deltas.pop().expect("one position")
+        } else {
+            Tensor::cat(&deltas, 0)?
+        }))
+    }
+
+    /// `ids`' rows uploaded: one `[ids.len() · head_dim]` tensor through the
+    /// pool, counted on Metal (`ple_row_uploads`).
+    fn ple_rows_uploaded(
+        &self,
+        ple: &Ple<P>,
+        ids: &[i64],
+        dev: &lloom_tensor::Device,
+    ) -> Result<Tensor> {
+        #[cfg(feature = "metal")]
+        if dev.is_metal() {
+            self.ple_rows.lock().uploads += 1;
+        }
+        ple.table.gather(ids, dev)
+    }
+
+    /// PLE row gathers this model has uploaded through the pool rather than
+    /// written into a region it keeps: the prompt chunks', and a step's that
+    /// found every region still read by a queued step (0 off Metal).
+    pub fn ple_row_uploads(&self) -> u64 {
+        #[cfg(feature = "metal")]
+        {
+            self.ple_rows.lock().uploads
+        }
+        #[cfg(not(feature = "metal"))]
+        {
+            0
+        }
+    }
+
+    /// `ids`' rows gathered on the host straight into a Shared region the
+    /// model keeps (`PleRowSlots`), one no queued step still reads; `None` —
+    /// the caller uploads them — when every region is read by a queued step
+    /// and the ring is at its bound, off Metal, or for a table that cannot
+    /// gather into a slice.
     fn ple_rows_owned(
         &self,
         ple: &Ple<P>,
@@ -3481,51 +3576,38 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
             let n = ids.len() * hd;
             let clock = m.gpu_clock();
             let mut g = self.ple_rows.lock();
-            let fits = matches!(g.as_ref(), Some((_, t, _)) if t.elem_count() == n);
-            if !fits {
-                // Outlives every pass: no plan serves it.
-                let _declared = lloom_tensor::EscapeGuard::new();
-                let buf = m.new_persistent_shared(n * std::mem::size_of::<f32>())?;
-                // SAFETY: the pointer is only compared with null.
-                if unsafe { buf.contents() }.is_null() {
-                    return Ok(None);
-                }
-                let storage =
-                    lloom_tensor::Storage::Metal(lloom_tensor::MetalStorage::new_allocated(
-                        buf.clone(),
-                        m.clone(),
-                        n,
-                        lloom_tensor::DType::F32,
-                    )?);
-                let t =
-                    Tensor::from_storage(storage, n, lloom_tensor::op::BackpropOp::none(), false);
-                *g = Some((buf, t, None));
-            }
-            let (buf, t, read) = g.as_mut().expect("made above");
-            if !read.is_none_or(|e| clock.is_complete(e)) {
+            let Some(i) = g.take(n, m, |e| clock.is_complete(e))? else {
                 return Ok(None);
-            }
-            // SAFETY: a CPU-mapped Shared buffer of `n` f32 (checked when
-            // made); the step that last read it has completed (above), and
+            };
+            let slot = &mut g.slots[i];
+            // SAFETY: a CPU-mapped Shared buffer of `slot.cap ≥ n` f32
+            // (checked when made); no queued step reads it (`take`), and
             // nothing on the device writes it.
-            let out = unsafe { std::slice::from_raw_parts_mut(buf.contents() as *mut f32, n) };
+            let out = unsafe { std::slice::from_raw_parts_mut(slot.buf.contents() as *mut f32, n) };
             if ple.table.gather_into(ids, out).is_err() {
                 return Ok(None);
             }
-            *read = None;
-            return Ok(Some(t.clone()));
+            slot.read = None;
+            let t = if slot.cap == n {
+                slot.t.clone()
+            } else {
+                slot.t.narrow(0, 0, n)?
+            };
+            g.taken = Some(i);
+            return Ok(Some(t));
         }
         let _ = (ple, ids, dev);
         Ok(None)
     }
 
-    /// The PLE block has encoded its reads of the model's rows buffer: stamp
-    /// the epoch they ride (`ple_rows_owned`).
+    /// The PLE block has encoded its reads of the region `ple_rows_owned`
+    /// last handed out: stamp the epoch they ride.
     fn ple_rows_read_encoded(&self) {
         #[cfg(feature = "metal")]
         if let Ok(m) = self.device().as_metal_device() {
-            if let Some((_, _, read)) = self.ple_rows.lock().as_mut() {
-                *read = Some(m.gpu_clock().current_epoch());
+            let mut g = self.ple_rows.lock();
+            if let Some(i) = g.taken.take() {
+                g.slots[i].read = Some(m.gpu_clock().current_epoch());
             }
         }
     }
@@ -3609,6 +3691,10 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
                 }
                 for t in 0..seq {
                     let h = embeds.narrow(1, t, 1)?;
+                    // Only the last position's logits are returned; held across
+                    // the next position's pass they would be an undeclared
+                    // escape (`pass-plan-design.md` §26).
+                    drop(logits.take());
                     logits = Some(self.decode_embed(&h, cache, obs)?);
                     if want == Some(cache.pos) {
                         self.checkpoint_here(cache, &dev)?;
@@ -3626,6 +3712,8 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
                         .any(|l| obs.wants::<HcStatePoint>(l) || obs.wants::<LayerOutputPoint>(l));
                 let mut start = 0;
                 while start < seq {
+                    // As above: only the last chunk's logits are returned.
+                    drop(logits.take());
                     let len = chunk_len(start);
                     // Up to `prefill_tiles` multi-position chunks in a row:
                     // one pass, the tiles interleaved a layer apart.
@@ -5653,14 +5741,23 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
             if let Some(ple) = &self.ple {
                 if ple.layer == l {
                     // The PLE per row: each row's own token window and history.
-                    let mut deltas = Vec::with_capacity(b);
-                    for (r, cache) in caches.iter_mut().enumerate() {
-                        deltas.push(self.ple_delta(ple, &res_hc.narrow(0, r, 1)?, cache)?);
-                    }
-                    let delta = if b == 1 {
-                        deltas.pop().expect("one row")
-                    } else {
-                        Tensor::cat(&deltas, 0)?
+                    let delta = match self.ple_deltas_batched(ple, &res_hc, caches, 1)? {
+                        Some(delta) => delta,
+                        None => {
+                            let mut deltas = Vec::with_capacity(b);
+                            for (r, cache) in caches.iter_mut().enumerate() {
+                                deltas.push(self.ple_delta(
+                                    ple,
+                                    &res_hc.narrow(0, r, 1)?,
+                                    cache,
+                                )?);
+                            }
+                            if b == 1 {
+                                deltas.pop().expect("one row")
+                            } else {
+                                Tensor::cat(&deltas, 0)?
+                            }
+                        }
                     };
                     res_hc = (res_hc + delta)?;
                 }
@@ -5911,13 +6008,17 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
             }
             argmax = fed;
         }
+        // Only a redo reads `h`, after the pass; a window with no records (a
+        // resident tier) cannot redo, and holding plan memory past the pass
+        // would be an undeclared escape (§26).
+        let h = (!records.is_empty()).then_some(h);
         Ok(VerifyPass {
             argmax,
             records,
             planned,
             t0,
             tokens: tokens.to_vec(),
-            h: Some(h),
+            h,
             drafts_loaded: drafts,
             fold,
         })
@@ -6255,15 +6356,25 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
             if let Some(ple) = &self.ple {
                 if ple.layer == l {
                     // Per position: its own token window and history phase.
-                    let mut deltas = Vec::with_capacity(t);
-                    for p in 0..t {
-                        deltas.push(self.ple_delta(ple, &res_hc.narrow(0, p, 1)?, cache)?);
-                    }
-                    let delta = if t == 1 {
-                        deltas.pop().expect("one position")
-                    } else {
-                        Tensor::cat(&deltas, 0)?
-                    };
+                    let delta =
+                        match self.ple_deltas_batched(ple, &res_hc, &mut [&mut *cache], t)? {
+                            Some(delta) => delta,
+                            None => {
+                                let mut deltas = Vec::with_capacity(t);
+                                for p in 0..t {
+                                    deltas.push(self.ple_delta(
+                                        ple,
+                                        &res_hc.narrow(0, p, 1)?,
+                                        cache,
+                                    )?);
+                                }
+                                if t == 1 {
+                                    deltas.pop().expect("one position")
+                                } else {
+                                    Tensor::cat(&deltas, 0)?
+                                }
+                            }
+                        };
                     res_hc = (res_hc + delta)?;
                 }
             }
@@ -6451,6 +6562,114 @@ impl Pending {
 struct ReplayInputs {
     bufs: [Option<(Tensor, Option<lloom_tensor::kernels::metal::Epoch>)>; 2],
     at: usize,
+}
+
+/// Regions a step's PLE rows are written into on the host, up to this many:
+/// past it a step whose every region is still read by a queued step uploads
+/// its rows instead (counted, `Qwen4Exp::ple_row_uploads`).
+#[cfg(feature = "metal")]
+const PLE_ROW_SLOTS: usize = 8;
+
+/// One host-written Shared region of PLE rows.
+#[cfg(feature = "metal")]
+#[derive(Debug)]
+struct PleRowSlot {
+    buf: lloom_tensor::kernels::metal::BufferHandle,
+    /// `[cap]` f32 over `buf`.
+    t: Tensor,
+    cap: usize,
+    /// The epoch of its last reader; the host writes it again once that
+    /// epoch has completed.
+    read: Option<lloom_tensor::kernels::metal::Epoch>,
+}
+
+/// The model's PLE row regions, taken on the GPU clock: a region is the
+/// GPU's from the step that reads it until that step's epoch completes, then
+/// the host's again — a step frame's ownership (`profiles-and-memory-design.md`
+/// §4.6), kept by the model until the frame carries the PLE rows. The ring
+/// grows a region at a time, up to [`PLE_ROW_SLOTS`].
+#[cfg(feature = "metal")]
+#[derive(Debug, Default)]
+struct PleRowSlots {
+    slots: Vec<PleRowSlot>,
+    /// The region handed out for the step being encoded, until its reads are
+    /// stamped.
+    taken: Option<usize>,
+    /// Gathers uploaded instead.
+    uploads: u64,
+}
+
+#[cfg(feature = "metal")]
+impl PleRowSlots {
+    /// A region of at least `n` floats no queued step reads (`done` says
+    /// whether an epoch has completed): a free one with room, else a free one
+    /// made again at `n`, else a new one while the ring is under its bound;
+    /// `None` past that.
+    fn take(
+        &mut self,
+        n: usize,
+        m: &lloom_tensor::MetalDevice,
+        done: impl Fn(lloom_tensor::kernels::metal::Epoch) -> bool,
+    ) -> Result<Option<usize>> {
+        let free = |s: &PleRowSlot| s.read.is_none_or(&done);
+        if let Some(i) = self.slots.iter().position(|s| free(s) && s.cap >= n) {
+            return Ok(Some(i));
+        }
+        let at = match self.slots.iter().position(free) {
+            Some(i) => i,
+            None if self.slots.len() < PLE_ROW_SLOTS => self.slots.len(),
+            None => return Ok(None),
+        };
+        // Outlives every pass: no plan serves it.
+        let _declared = lloom_tensor::EscapeGuard::new();
+        let buf = m.new_persistent_shared(n * std::mem::size_of::<f32>())?;
+        // SAFETY: the pointer is only compared with null.
+        if unsafe { buf.contents() }.is_null() {
+            return Ok(None);
+        }
+        let storage = lloom_tensor::Storage::Metal(lloom_tensor::MetalStorage::new_allocated(
+            buf.clone(),
+            m.clone(),
+            n,
+            lloom_tensor::DType::F32,
+        )?);
+        let t = Tensor::from_storage(storage, n, lloom_tensor::op::BackpropOp::none(), false);
+        let slot = PleRowSlot {
+            buf,
+            t,
+            cap: n,
+            read: None,
+        };
+        if at == self.slots.len() {
+            self.slots.push(slot);
+        } else {
+            self.slots[at] = slot;
+        }
+        Ok(Some(at))
+    }
+}
+
+/// 0 unread, 1 off, 2 on.
+static PLE_ROWS_BATCH: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Gather a batch's or a window's PLE rows in one request for this process
+/// (a test runs both arms; `QWEN4EXP_PLE_ROWS_BATCH` otherwise).
+pub fn set_ple_rows_batch(on: bool) {
+    PLE_ROWS_BATCH.store(if on { 2 } else { 1 }, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// `models.qwen4exp.ple.rows_batch` (read once, or [`set_ple_rows_batch`]).
+fn ple_rows_batch() -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    match PLE_ROWS_BATCH.load(Relaxed) {
+        1 => false,
+        2 => true,
+        _ => {
+            let on = crate::tuning::tuning().qwen4exp.ple_rows_batch;
+            PLE_ROWS_BATCH.store(if on { 2 } else { 1 }, Relaxed);
+            on
+        }
+    }
 }
 
 /// A provisional device-planned decode step (`State::provisional`).
@@ -6877,5 +7096,33 @@ mod tests {
             h2.flatten_all()?.to_vec1::<f32>()?
         );
         Ok(())
+    }
+
+    /// The PLE row regions: a new one while every region is still read by a
+    /// queued step, none past [`super::PLE_ROW_SLOTS`] (the caller uploads,
+    /// counted), the first again once its reader's epoch completed, and a
+    /// free region too small made again at the size asked.
+    #[cfg(feature = "metal")]
+    #[test]
+    fn the_ple_row_regions_stop_at_their_bound_and_reuse_a_completed_one() {
+        use lloom_tensor::kernels::metal::Epoch;
+        let Ok(dev) = Device::new_metal(0) else {
+            return;
+        };
+        let m = dev.as_metal_device().unwrap();
+        let mut g = super::PleRowSlots::default();
+        for i in 0..super::PLE_ROW_SLOTS {
+            assert_eq!(g.take(64, m, |_| false).unwrap(), Some(i), "region {i}");
+            g.slots[i].read = Some(Epoch(1));
+        }
+        assert_eq!(
+            g.take(64, m, |_| false).unwrap(),
+            None,
+            "a region past the bound"
+        );
+        assert_eq!(g.take(64, m, |_| true).unwrap(), Some(0));
+        let i = g.take(128, m, |_| true).unwrap().expect("a free region");
+        assert_eq!(g.slots[i].cap, 128, "a free region too small, made again");
+        assert_eq!(g.slots.len(), super::PLE_ROW_SLOTS);
     }
 }

@@ -1042,16 +1042,21 @@ fn shortconv_ring_impl(
         // The per-row index buffers, or — unread at `per_row == 0` — the
         // weights' buffer bound in their place, so no buffer is allocated
         // for a binding the kernel never dereferences.
-        let (rs_guard, rp_guard) = match rows {
+        // A row buffer may be a view (a step frame's field, §4.6): bound at
+        // its byte offset.
+        let (rs_guard, rp_guard, rs_off, rp_off) = match rows {
             Some((rs, rp)) => {
                 let (a, al) = rs.storage_and_layout();
                 let (b2, bl) = rp.storage_and_layout();
-                if al.start_offset() != 0 || bl.start_offset() != 0 {
-                    lloom_tensor::bail!("shortconv_ring_rows: row buffers must start at offset 0");
-                }
-                (Some(a), Some(b2))
+                let u = DType::U32.size_in_bytes();
+                (
+                    Some(a),
+                    Some(b2),
+                    al.start_offset() * u,
+                    bl.start_offset() * u,
+                )
             }
-            None => (None, None),
+            None => (None, None, 0, 0),
         };
         let rs_buf = match rs_guard.as_deref() {
             Some(lloom_tensor::Storage::Metal(m)) => m.buffer(),
@@ -1096,8 +1101,14 @@ fn shortconv_ring_impl(
                 buffer_o(st_s.buffer(), st_l, dtype),
                 buffer_o(w_s.buffer(), w_l, dtype),
                 &dst,
-                rs_buf,
-                rp_buf,
+                lloom_tensor::kernels::BufferOffset {
+                    buffer: rs_buf,
+                    offset_in_bytes: rs_off,
+                },
+                lloom_tensor::kernels::BufferOffset {
+                    buffer: rp_buf,
+                    offset_in_bytes: rp_off,
+                },
             )
         }
         .map_err(lloom_tensor::Error::wrap)?;
@@ -1378,6 +1389,129 @@ impl lloom_tensor::CustomOp2 for RmsNorm {
         )?;
         Ok((newstorage, l1.shape().clone()))
     }
+}
+
+#[cfg(feature = "metal")]
+#[derive(Debug, Clone)]
+struct AddRmsNorm {
+    eps: f32,
+}
+
+#[cfg(feature = "metal")]
+impl lloom_tensor::CustomOp3 for AddRmsNorm {
+    fn name(&self) -> &'static str {
+        "add-rms-norm"
+    }
+
+    fn cpu_fwd(
+        &self,
+        _: &CpuStorage,
+        _: &Layout,
+        _: &CpuStorage,
+        _: &Layout,
+        _: &CpuStorage,
+        _: &Layout,
+    ) -> Result<(CpuStorage, Shape)> {
+        lloom_tensor::bail!("add-rms-norm: CPU uses the composed operations")
+    }
+
+    fn metal_fwd(
+        &self,
+        lhs: &lloom_tensor::MetalStorage,
+        ll: &Layout,
+        rhs: &lloom_tensor::MetalStorage,
+        rl: &Layout,
+        alpha: &lloom_tensor::MetalStorage,
+        al: &Layout,
+    ) -> Result<(lloom_tensor::MetalStorage, Shape)> {
+        use lloom_tensor::backend::BackendStorage;
+        use lloom_tensor::kernels::BufferOffset;
+        let device = lhs.device();
+        let n = ll.shape().elem_count();
+        let width = *ll
+            .dims()
+            .last()
+            .ok_or_else(|| lloom_tensor::Error::Msg("add-rms-norm: scalar".into()))?;
+        let name = match lhs.dtype() {
+            DType::F16 => "add_rmsnorm_f16",
+            DType::BF16 => "add_rmsnorm_bf16",
+            DType::F32 => "add_rmsnorm_f32",
+            dt => lloom_tensor::bail!("add-rms-norm: unsupported {dt:?}"),
+        };
+        let output = device
+            .new_buffer_builder()
+            .with_size_for(2 * n, lhs.dtype())
+            .with_label("add-rms-norm")
+            .build()?;
+        let encoder = device.command_encoder()?;
+        let offset = |buffer, layout: &Layout| BufferOffset {
+            buffer,
+            offset_in_bytes: layout.start_offset() * lhs.dtype().size_in_bytes(),
+        };
+        // SAFETY: the public wrapper validates contiguous input extents; the
+        // output is freshly allocated for both complete planes.
+        unsafe {
+            lloom_tensor::kernels::call_add_rms_norm(
+                device.metal_device(),
+                &encoder,
+                device.kernels(),
+                name,
+                n,
+                width,
+                self.eps,
+                offset(lhs.buffer(), ll),
+                offset(rhs.buffer(), rl),
+                offset(alpha.buffer(), al),
+                &output,
+            )
+        }
+        .map_err(lloom_tensor::Error::wrap)?;
+        let storage =
+            lloom_tensor::MetalStorage::new_allocated(output, device.clone(), 2 * n, lhs.dtype())?;
+        Ok((storage, Shape::from((2, n))))
+    }
+}
+
+/// The rounded residual sum and its RMSNorm, in one Metal dispatch for
+/// contiguous operands; the existing operations compose on other backends
+/// and layouts. Both returned tensors are contiguous, non-overlapping views.
+pub fn add_rms_norm(
+    lhs: &Tensor,
+    rhs: &Tensor,
+    alpha: &Tensor,
+    eps: f32,
+) -> Result<(Tensor, Tensor)> {
+    #[cfg(feature = "metal")]
+    if add_rms_norm_applies(lhs, rhs, alpha) {
+        let both = lhs.apply_op3_no_bwd(rhs, alpha, &AddRmsNorm { eps })?;
+        return Ok((
+            both.get(0)?.reshape(lhs.shape())?,
+            both.get(1)?.reshape(lhs.shape())?,
+        ));
+    }
+    let sum = (lhs + rhs)?;
+    let norm = rms_norm(&sum, alpha, eps)?;
+    Ok((sum, norm))
+}
+
+/// Whether the add-norm fusion can read these operands without a copy.
+pub fn add_rms_norm_applies(lhs: &Tensor, rhs: &Tensor, alpha: &Tensor) -> bool {
+    lhs.device().is_metal()
+        && lhs.device().same_device(rhs.device())
+        && lhs.device().same_device(alpha.device())
+        && lhs.shape() == rhs.shape()
+        && lhs.dtype() == rhs.dtype()
+        && lhs.dtype() == alpha.dtype()
+        && matches!(lhs.dtype(), DType::F16 | DType::BF16 | DType::F32)
+        && lhs.is_contiguous()
+        && rhs.is_contiguous()
+        && alpha.is_contiguous()
+        && lhs
+            .dims()
+            .last()
+            .is_some_and(|&d| d > 0 && alpha.dims() == [d])
+        && lhs.elem_count() > 0
+        && lhs.elem_count() <= u32::MAX as usize
 }
 
 /// RMSNorm and RoPE in one dispatch: each `[.., t, d]` row normalised by
@@ -4179,27 +4313,24 @@ impl lloom_tensor::CustomOp3 for FlashDecoding<'_> {
             }
             Some(_) => None,
         };
-        let (chunk_table, n_keys_per_seq): (
+        // The table and the live counts may be views into a larger buffer (a
+        // step frame's fields, §4.6): each bound at its byte offset.
+        let u32_bytes = DType::U32.size_in_bytes();
+        let (chunk_table, chunk_table_offset, n_keys_per_seq, n_keys_offset): (
             &lloom_tensor::kernels::metal::buffer::Buffer,
+            usize,
             &lloom_tensor::kernels::metal::buffer::Buffer,
+            usize,
         ) = match (&bound_guards, &uploaded, &uploaded_keys) {
             (None, None, Some(n)) if resident_guard.is_some() => {
                 let (ts, tl) = resident_guard.as_ref().expect("checked");
-                if tl.start_offset() != 0 {
-                    lloom_tensor::bail!("flash-decoding: a resident table must start at offset 0");
-                }
                 let t = match &**ts {
                     lloom_tensor::Storage::Metal(m) => m.buffer(),
                     _ => lloom_tensor::bail!("flash-decoding: the resident table must be on metal"),
                 };
-                (t, n)
+                (t, tl.start_offset() * u32_bytes, n, 0)
             }
             (Some(((ts, tl), (ns, nl))), _, _) => {
-                if tl.start_offset() != 0 || nl.start_offset() != 0 {
-                    lloom_tensor::bail!(
-                        "flash-decoding: a bound table or live-count tensor must start at offset 0"
-                    );
-                }
                 let t = match &**ts {
                     lloom_tensor::Storage::Metal(m) => m.buffer(),
                     _ => lloom_tensor::bail!("flash-decoding: the bound table must be on metal"),
@@ -4210,9 +4341,14 @@ impl lloom_tensor::CustomOp3 for FlashDecoding<'_> {
                         "flash-decoding: the bound live counts must be on metal"
                     ),
                 };
-                (t, n)
+                (
+                    t,
+                    tl.start_offset() * u32_bytes,
+                    n,
+                    nl.start_offset() * u32_bytes,
+                )
             }
-            (None, Some(t), Some(n)) => (t, n),
+            (None, Some(t), Some(n)) => (t, 0, n, 0),
             _ => unreachable!("either bound or uploaded"),
         };
         let mut partial = lloom_tensor::kernels::FlashPartialParams::for_step(
@@ -4278,10 +4414,12 @@ impl lloom_tensor::CustomOp3 for FlashDecoding<'_> {
                 &sums,
                 &maxs,
                 chunk_table,
+                chunk_table_offset,
                 &partial_params,
                 &combine_params,
                 &walk_order,
                 n_keys_per_seq,
+                n_keys_offset,
                 n_q_heads,
                 head_dim,
                 n_chunks,

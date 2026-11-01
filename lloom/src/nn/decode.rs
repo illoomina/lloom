@@ -2651,6 +2651,9 @@ impl<'m, M: CausalLM> Session<'m, M> {
                     pacer.before_forward(&device)?;
                 }
                 self.model.prepare_pass(&mut self.seq.cache, 1)?;
+                // Sampled above; held across the next pass it would be an
+                // undeclared escape (`pass-plan-design.md` §26).
+                drop(logits);
                 let pass = begin_decode_step(&device, R::PASS_INPUT)?;
                 logits = readback
                     .forward_input(self.model, &feed, self.seq.pos, &mut self.seq.cache)?
@@ -2691,6 +2694,9 @@ impl<'m, M: CausalLM> Session<'m, M> {
                 }
                 let t = timed.then(std::time::Instant::now);
                 self.model.prepare_pass(&mut self.seq.cache, 1)?;
+                // Sampled above; held across the next pass it would be an
+                // undeclared escape (`pass-plan-design.md` §26).
+                drop(logits);
                 let pass = begin_decode_step(&device, R::PASS_INPUT)?;
                 logits = readback
                     .forward_input(self.model, &feed, self.seq.pos, &mut self.seq.cache)?
@@ -2760,6 +2766,7 @@ impl<'m, M: CausalLM> Session<'m, M> {
                             pacer.before_forward(&device)?;
                         }
                         self.model.prepare_pass(&mut self.seq.cache, 1)?;
+                        drop(logits);
                         let pass = begin_decode_step(&device, R::PASS_INPUT)?;
                         logits = readback
                             .forward_input(self.model, &again, self.seq.pos, &mut self.seq.cache)?
@@ -3176,6 +3183,9 @@ impl<'m, M: CausalLM> Session<'m, M> {
             // Session allocations (the KV slab, a bucket grow) happen here,
             // before the bracket, so the planned pass allocates nothing.
             self.model.prepare_pass(&mut self.seq.cache, w)?;
+            // Only the last tile's logits are returned; an earlier tile's,
+            // held across this pass, would be an undeclared escape (§26).
+            drop(last_logits.take());
             let pass = OpenPass::begin(
                 &device,
                 PassShape::Prefill {

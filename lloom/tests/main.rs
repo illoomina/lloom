@@ -15,6 +15,7 @@
 //! so a file that is not a module here fails the suite instead of silently
 //! not running.
 mod accept_frontier;
+mod add_rms_norm;
 mod attention_route;
 mod axes_registry;
 mod batch_norm;
@@ -66,6 +67,7 @@ mod lfm2_qkv_layout;
 mod lfm2_sliding_ring_open;
 mod lfm2_spec_conv_rollback;
 mod lfm2_spec_conv_shape;
+mod lfm2_step_frame;
 mod lfm2_streamed_layers;
 mod lfm2_vl_embeds_entry;
 mod lfm2_walk_census;
@@ -118,6 +120,7 @@ mod qwen4exp_mtpvar;
 mod qwen4exp_pass_plan_openers;
 mod qwen4exp_pass_plan_requests;
 mod qwen4exp_pass_plans_warmup;
+mod qwen4exp_ple_rows_batch;
 mod qwen4exp_prefill_plan_variants;
 mod qwen4exp_prefill_transient;
 mod qwen4exp_provisional;
@@ -183,6 +186,7 @@ fn every_test_file_is_a_module() {
         "token_ring_nonblocking",
         "decode_step_census",
         "qwen4exp_prefill_transient_cpu",
+        "ngram_fill_alloc_free",
     ];
     let dir = format!("{}/tests", lloom_manifest_dir());
     let me = include_str!("main.rs");

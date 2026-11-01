@@ -1970,6 +1970,15 @@ pub struct InstrumentTuning {
         needs_part = "per-label and interval tables, sampled encoder data, and the steps table's host step time column"
     )]
     pub profile_dump: Option<String>,
+    /// One stderr line per compute pipeline the process creates: its source, function, function constants and the driver's register-bound fields (`maxTotalThreadsPerThreadgroup`, execution width, static threadgroup memory). Once per pipeline variant, never per dispatch; the population `register_census` reads.
+    #[opt(
+        flag = "pipeline-census",
+        env = "LLOOM_PIPELINE_CENSUS",
+        bool,
+        path = "diagnostics.trace.pipelines",
+        status = "instrument"
+    )]
+    pub pipeline_census: bool,
 }
 
 /// The CPU side (`utils.rs`, `safetensors.rs`, `backprop.rs`, `cpu/f16_matmul.rs`).

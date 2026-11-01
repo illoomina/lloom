@@ -931,6 +931,96 @@ mod pool_arms {
         Ok(())
     }
 
+    /// A decode step over a pool takes every row's live count, write slot,
+    /// position, table and conv ring index from step frames
+    /// (`profiles-and-memory-design.md` §4.6): it uploads nothing, and every
+    /// row reads what its own contiguous cache reads, to the bit, across page
+    /// boundaries. The reference is a private `InPlace` cache per row, at
+    /// `m = 1` on the batch's GEMM (`knobs`), so a frame field the batch read
+    /// wrong cannot agree with it.
+    #[test]
+    fn a_pool_decode_step_uploads_nothing_and_reads_what_each_row_reads_alone() -> Result<()> {
+        knobs();
+        let dev = Device::new_metal(0)?;
+        let cfg = pool_config();
+        let mut private_cfg = cfg.clone();
+        private_cfg.kv_append = KvAppend::InPlace;
+        let dtype = DType::F32;
+        let model = build::<PoolSpec>(&cfg, dtype, &dev)?;
+        let alone_model = build::<lloom::profile::Rewindable>(&private_cfg, dtype, &dev)?;
+        let rows = pool_rows();
+        let pool = BatchPool::new(&cfg, &dev, 4, 128)?;
+        pool.set_batched_arms(true);
+        let mut pooled = Vec::new();
+        let mut private = Vec::new();
+        for (prompt, _) in &rows {
+            let input = Tensor::new(prompt.as_slice(), &dev)?.unsqueeze(0)?;
+            let mut a = State::<PoolSpec>::for_batch(true, dtype, &cfg, &dev, &pool)?;
+            let mut b = State::<lloom::profile::Rewindable>::new(true, dtype, &private_cfg, &dev)?;
+            let _ = model.forward(&input, 0, &mut a)?;
+            let _ = alone_model.forward(&input, 0, &mut b)?;
+            pooled.push(a);
+            private.push(b);
+        }
+        let steps = 30usize;
+        let token = |r: usize, i: usize| ((r * 13 + i * 7 + 1) % cfg.vocab_size) as u32;
+        let batch_inputs: Vec<Tensor> = (0..steps)
+            .map(|i| {
+                let t: Vec<u32> = (0..rows.len()).map(|r| token(r, i)).collect();
+                Tensor::new(t.as_slice(), &dev)?.reshape((rows.len(), 1))
+            })
+            .collect::<Result<_>>()?;
+        dev.synchronize()?;
+        #[allow(unused_mut)]
+        let mut uploads: Vec<u64> = Vec::with_capacity(steps);
+        let mut got = Vec::with_capacity(steps);
+        for (i, input) in batch_inputs.iter().enumerate() {
+            let mut refs: Vec<Row<'_, State<PoolSpec>>> = pooled
+                .iter_mut()
+                .zip(rows.iter())
+                .map(|(cache, (prompt, _))| Row {
+                    pos: prompt.len() + i,
+                    cache,
+                })
+                .collect();
+            #[cfg(any(debug_assertions, feature = "profile"))]
+            let before = lloom_tensor::metal_backend::host_upload_count();
+            got.push(model.forward_rows(input, &mut refs)?);
+            #[cfg(any(debug_assertions, feature = "profile"))]
+            uploads.push(lloom_tensor::metal_backend::host_upload_count() - before);
+        }
+        dev.synchronize()?;
+        for (i, step) in got.iter().enumerate() {
+            let step = logits_rows(step)?;
+            for (r, (prompt, _)) in rows.iter().enumerate() {
+                let input = Tensor::new(&[token(r, i)], &dev)?.unsqueeze(0)?;
+                let alone = alone_model.forward(&input, prompt.len() + i, &mut private[r])?;
+                assert_bit_equal(
+                    &format!("step {i} row {r}"),
+                    &step[r..r + 1],
+                    &logits_rows(&alone)?,
+                );
+            }
+        }
+        // A step opens a chunk for a row whose position is a multiple of
+        // the page (one page per chunk): its parameter blocks change there.
+        let page = cfg.flash_page_size;
+        let opens = |i: usize| rows.iter().any(|(p, _)| (p.len() + i) % page == 0);
+        let steady: Vec<(usize, u64)> = uploads
+            .iter()
+            .enumerate()
+            .skip(1)
+            .filter(|&(i, _)| !opens(i))
+            .map(|(i, &n)| (i, n))
+            .collect();
+        println!("STEP_FRAME pool uploads per decode step {uploads:?}");
+        assert!(
+            steady.iter().all(|&(_, n)| n == 0),
+            "a pool decode step uploaded: (step, uploads) {steady:?}"
+        );
+        Ok(())
+    }
+
     /// A slot returns to the pool when its cache drops, and a cleared row
     /// starts over on a zeroed ring.
     #[test]

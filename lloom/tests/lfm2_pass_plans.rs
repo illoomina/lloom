@@ -667,6 +667,20 @@ fn ragged_steps_are_planned_under_both_width_arms() -> Result<()> {
 /// step whose live rows' logits are a pass's output as it left them.
 #[test]
 fn rows_admitted_whole_decode_the_pool_paths_ids_under_plans() -> Result<()> {
+    admitted_whole_matches_the_pool(0)
+}
+
+/// As above, with each arrival's prompt fed in 4-token tiles: every tile is
+/// a pass of its own, and only the last tile's logits may outlive the next
+/// tile's pass (`pass-plan-design.md` §26). The 13-token prompt's middle
+/// tiles share one key, so a held tile's logits sit where the next tile's
+/// plan writes, and the check counts it.
+#[test]
+fn rows_admitted_whole_in_tiles_decode_the_pool_paths_ids_under_plans() -> Result<()> {
+    admitted_whole_matches_the_pool(4)
+}
+
+fn admitted_whole_matches_the_pool(tile: usize) -> Result<()> {
     use lloom::generation::{LogitsProcessor, Sampling};
     use lloom::nn::{DecodeOptions, Session};
     let _serial = SERIAL.lock();
@@ -693,6 +707,7 @@ fn rows_admitted_whole_decode_the_pool_paths_ids_under_plans() -> Result<()> {
         let opts = DecodeOptions {
             lookahead,
             prefill_chunk: 0,
+            prefill_tile: tile,
             ..DecodeOptions::new(5)
         };
         let outs = Session::decode_batched_admitted(
@@ -744,7 +759,11 @@ fn rows_admitted_whole_decode_the_pool_paths_ids_under_plans() -> Result<()> {
     let wrong: Vec<_> = seen.iter().filter(|(.., same)| !same).collect();
     assert!(
         wrong.is_empty(),
-        "rows admitted whole left the pool path's ids under plans (round, lookahead): {wrong:?}"
+        "tile {tile}: rows admitted whole left the pool path's ids under plans (round, lookahead): {wrong:?}"
+    );
+    assert_eq!(
+        c.undeclared_escapes, 0,
+        "tile {tile}: a value was held past its pass and cost declined handouts: {c:?}"
     );
     Ok(())
 }

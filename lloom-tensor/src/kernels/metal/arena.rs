@@ -81,7 +81,7 @@
 // Its slots are unpooled handles over its own base, which is what §9.2a's
 // layer 3 means -- the free list never sees them. The test module below imports
 // one of its own, to assert that installing an arena leaves it untouched.
-use super::{ArenaOffsets, Buffer, BufferHandle, PooledBuffer};
+use super::{ArenaOffsets, ArenaWatch, Buffer, BufferHandle, PooledBuffer};
 use parking_lot::Mutex;
 use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -305,6 +305,8 @@ pub struct PassKey {
     pub kind: PassKind,
     pub arms: u64,
     pub opener: PassOpener,
+    /// Input allocations inside this bracket, independent of the model variant.
+    pub input: crate::backend::PassInput,
     pub variant: u32,
 }
 
@@ -315,6 +317,7 @@ impl PassKey {
             kind,
             arms: 0,
             opener: PassOpener::Driver,
+            input: crate::backend::PassInput::TokenIds,
             variant: 0,
         }
     }
@@ -322,6 +325,12 @@ impl PassKey {
     /// This key, for a pass `opener` bracketed.
     pub fn opened_by(self, opener: PassOpener) -> Self {
         Self { opener, ..self }
+    }
+
+    /// This key, for the driver's actual forward-input allocation contract.
+    /// Do not pack this independent factor into the full model variant.
+    pub fn with_input(self, input: crate::backend::PassInput) -> Self {
+        Self { input, ..self }
     }
 
     /// This key, for the model's allocation sequence `variant`.
@@ -363,6 +372,15 @@ pub struct PassPlanCounters {
     /// Passes abandoned after their body failed (`MetalDevice::abort_pass`).
     /// None of them published a recording or an observation.
     pub aborted: u64,
+    /// Served allocations declined because a value an earlier served pass
+    /// produced still held their bytes and was still referenced: undeclared
+    /// escapes (`EscapeLog`, `pass-plan-design.md` §26). Every gate asserts 0.
+    pub undeclared_escapes: u64,
+    /// Such values bound after a later pass began (debug and `profile`
+    /// builds only; 0 in the shipping build).
+    pub escapes_used: u64,
+    /// Such values dropped unused after costing declines.
+    pub escapes_held_unused: u64,
 }
 
 /// Alignment of every slot, in bytes.
@@ -778,6 +796,10 @@ pub struct ArenaCounters {
     pub declined_drift: u64,
     /// Requests made under an [`EscapeGuard`], declined as declared escapes.
     pub declined_escaped: u64,
+    /// Requests declined because their slot's bytes still held a value an
+    /// earlier pass produced and something still referenced
+    /// ([`ArenaDecline::Held`]).
+    pub declined_held: u64,
     /// Decode steps begun.
     pub steps: u64,
     /// Times a GPU-computed offset table was verified equal to the plan and
@@ -824,6 +846,7 @@ struct LiveCounters {
     declined_exhausted: AtomicU64,
     declined_drift: AtomicU64,
     declined_escaped: AtomicU64,
+    declined_held: AtomicU64,
     steps: AtomicU64,
     gpu_verified: AtomicU64,
 }
@@ -838,6 +861,7 @@ impl LiveCounters {
             declined_exhausted: self.declined_exhausted.load(Ordering::Relaxed),
             declined_drift: self.declined_drift.load(Ordering::Relaxed),
             declined_escaped: self.declined_escaped.load(Ordering::Relaxed),
+            declined_held: self.declined_held.load(Ordering::Relaxed),
             steps: self.steps.load(Ordering::Relaxed),
             gpu_verified: self.gpu_verified.load(Ordering::Relaxed),
         }
@@ -851,6 +875,7 @@ impl LiveCounters {
         self.declined_exhausted.store(0, Ordering::Relaxed);
         self.declined_drift.store(0, Ordering::Relaxed);
         self.declined_escaped.store(0, Ordering::Relaxed);
+        self.declined_held.store(0, Ordering::Relaxed);
         self.steps.store(0, Ordering::Relaxed);
         self.gpu_verified.store(0, Ordering::Relaxed);
     }
@@ -866,20 +891,27 @@ impl LiveCounters {
 /// immutability is a property of the **write set** and a runtime test can only
 /// observe that no sequence it happened to try disturbed it.
 ///
-/// So the hot path's lookups (`by_ordinal.get(ordinal)`, `slot_handles[slot]`)
+/// So the hot path's lookups (`by_ordinal.get(ordinal)`, `ordinal_handles[ordinal]`)
 /// are reads of immutable data reached through the `Arc`, which is exactly the
 /// shape that needs no synchronisation: the `Arc` already publishes them, and
 /// there is no later write for a reader to race.
 struct ArenaPlanState {
     plan: StepPlan,
     layout: ArenaLayout,
-    /// One handle per slot, created once and held for the plan's lifetime.
+    /// One handle per served ordinal, a view of its slot, created once and
+    /// held for the plan's lifetime; `None` where the plan serves no slot.
     ///
     /// **This is what makes the arena layer 3.** The handles never drop while
     /// the plan lives, so the free list never sees them and no lookup ever
     /// considers them -- exactly how resident weights already behave (§6.3a).
     /// Nothing here calls `free`.
-    slot_handles: Vec<BufferHandle>,
+    ///
+    /// Per ordinal rather than per slot: the values packed into one slot share
+    /// its bytes, not its handle, so a value still referenced after its pass
+    /// is named exactly (`pass-plan-design.md` §26).
+    ordinal_handles: Vec<Option<BufferHandle>>,
+    /// The ordinals each slot serves, in plan order.
+    slot_ordinals: Vec<Vec<usize>>,
 }
 
 /// Why the arena declined an allocation.
@@ -911,6 +943,11 @@ pub enum ArenaDecline {
     /// Made under an [`EscapeGuard`]: declared to outlive the pass, so no
     /// slot may hold it whatever the plan says about the ordinal.
     Escaped,
+    /// The slot's bytes still hold a value an earlier pass produced, and
+    /// something still references it: an undeclared escape, counted and
+    /// named by the plan cache's [`EscapeLog`]. Serving the slot would
+    /// overwrite it.
+    Held,
 }
 
 /// What the arena did with one offered allocation.
@@ -1027,7 +1064,11 @@ impl ArenaAllocationClaim<'_> {
                 .counters
                 .hits
                 .fetch_add(1, Ordering::Relaxed);
-            BufferHandle::clone(&self.arena.inner.plan_state.slot_handles[slot])
+            let _ = slot;
+            let handle = self.arena.inner.plan_state.ordinal_handles[self.ordinal.expect("served")]
+                .as_ref()
+                .expect("a served ordinal has a handle");
+            BufferHandle::clone(handle)
         });
         ArenaOffer {
             served,
@@ -1134,6 +1175,17 @@ struct ArenaInner {
     /// Whether a step is currently open. Outside a step the arena declines
     /// everything, so prefill and setup allocate from the pool as before.
     active: AtomicU64,
+    /// This step's slots whose bytes a carried value still holds
+    /// ([`Arena::watch`]), and whether there are any: one relaxed load per
+    /// served allocation when there are none.
+    watch: Mutex<Vec<ArenaWatch>>,
+    watching: std::sync::atomic::AtomicBool,
+    /// Ordinals whose making site the escape log wants (debug and `profile`
+    /// builds): taken at the next serve of the ordinal.
+    #[cfg(any(debug_assertions, feature = "profile"))]
+    wanted: Mutex<Vec<(usize, PassKey, Arc<super::EscapeLog>)>>,
+    #[cfg(any(debug_assertions, feature = "profile"))]
+    wanting: std::sync::atomic::AtomicBool,
 }
 
 impl Arena {
@@ -1192,10 +1244,18 @@ impl Arena {
         //
         // The base itself is unaffected: it is owned by `ArenaInner` and freed
         // by Metal when the last `Arena` clone drops, exactly as before.
-        let slot_handles = plan
-            .slots()
+        let mut slot_ordinals = vec![Vec::new(); plan.slots().len()];
+        let ordinal_handles = plan
+            .by_ordinal
             .iter()
-            .map(|s| BufferHandle::new(PooledBuffer::unpooled(base.view(s.offset, s.size), s.size)))
+            .enumerate()
+            .map(|(ordinal, e)| {
+                e.map(|(slot, _)| {
+                    slot_ordinals[slot].push(ordinal);
+                    let s = &plan.slots()[slot];
+                    BufferHandle::new(PooledBuffer::unpooled(base.view(s.offset, s.size), s.size))
+                })
+            })
             .collect();
 
         Ok(Self {
@@ -1204,7 +1264,8 @@ impl Arena {
                 plan_state: ArenaPlanState {
                     plan,
                     layout,
-                    slot_handles,
+                    ordinal_handles,
+                    slot_ordinals,
                 },
                 // #69's path until a GPU table is verified against the plan.
                 offsets: AtomicU8::new(ArenaOffsets::Cpu.to_bits()),
@@ -1214,6 +1275,12 @@ impl Arena {
                 typed_step_generation: AtomicU64::new(0),
                 typed_step_valid: std::sync::atomic::AtomicBool::new(false),
                 active: AtomicU64::new(0),
+                watch: Mutex::new(Vec::new()),
+                watching: std::sync::atomic::AtomicBool::new(false),
+                #[cfg(any(debug_assertions, feature = "profile"))]
+                wanted: Mutex::new(Vec::new()),
+                #[cfg(any(debug_assertions, feature = "profile"))]
+                wanting: std::sync::atomic::AtomicBool::new(false),
             }),
         })
     }
@@ -1303,6 +1370,11 @@ impl Arena {
         &self.inner.base
     }
 
+    /// Whether `other` is this arena (a clone of it).
+    pub fn same(&self, other: &Arena) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
     pub fn layout(&self) -> ArenaLayout {
         self.inner.plan_state.layout
     }
@@ -1337,6 +1409,98 @@ impl Arena {
         self.inner.typed_step_valid.store(false, Ordering::Relaxed);
         self.inner.active.store(0, Ordering::Relaxed);
         DISPATCH_COUNTING.store(false, Ordering::Relaxed);
+        self.clear_watch();
+    }
+
+    /// Watch this step's handouts: a slot named in `watch` is declined while
+    /// its carried value is alive. A watch holds the arenas it names, its
+    /// own included, so it lasts one step: [`Self::end_step`] clears it.
+    pub fn watch(&self, watch: Vec<ArenaWatch>) {
+        let mut g = self.inner.watch.lock();
+        *g = watch;
+        self.inner.watching.store(!g.is_empty(), Ordering::Relaxed);
+    }
+
+    fn clear_watch(&self) {
+        if self.inner.watching.swap(false, Ordering::Relaxed) {
+            let old = std::mem::take(&mut *self.inner.watch.lock());
+            drop(old);
+        }
+    }
+
+    /// Whether anything outside the arena still references the value this
+    /// arena served ordinal `ordinal`. Its handle is held by the arena and by
+    /// every storage it was served to.
+    pub fn ordinal_alive(&self, ordinal: usize) -> bool {
+        self.inner.plan_state.ordinal_handles[ordinal]
+            .as_ref()
+            .is_some_and(|h| BufferHandle::strong_count(h) > 1)
+    }
+
+    /// The served values still referenced from outside, as `(ordinal, slot
+    /// offset, slot size)`. Read at a pass's opening for the arena that
+    /// served the pass before: what it finds outlived its pass.
+    pub fn live_ordinals(&self) -> Vec<(usize, usize, usize)> {
+        let state = &self.inner.plan_state;
+        let slots = state.plan.slots();
+        state
+            .slot_ordinals
+            .iter()
+            .enumerate()
+            .flat_map(|(slot, ordinals)| {
+                ordinals
+                    .iter()
+                    .filter(|&&o| self.ordinal_alive(o))
+                    .map(move |&o| (o, slots[slot].offset, slots[slot].size))
+            })
+            .collect()
+    }
+
+    /// Name the site that makes `ordinal` (of `key`, which this arena serves)
+    /// to `log` the next time it is served. A no-op in the shipping build.
+    pub fn want_site(&self, ordinal: usize, key: PassKey, log: &Arc<super::EscapeLog>) {
+        #[cfg(any(debug_assertions, feature = "profile"))]
+        {
+            let mut g = self.inner.wanted.lock();
+            if !g.iter().any(|(o, ..)| *o == ordinal) {
+                g.push((ordinal, key, log.clone()));
+            }
+            self.inner.wanting.store(true, Ordering::Relaxed);
+        }
+        #[cfg(not(any(debug_assertions, feature = "profile")))]
+        let _ = (ordinal, key, log);
+    }
+
+    #[cfg(any(debug_assertions, feature = "profile"))]
+    #[cold]
+    fn take_wanted_site(&self, ordinal: usize) {
+        let found = {
+            let mut g = self.inner.wanted.lock();
+            let i = g.iter().position(|(o, ..)| *o == ordinal);
+            let found = i.map(|i| g.swap_remove(i));
+            self.inner.wanting.store(!g.is_empty(), Ordering::Relaxed);
+            found
+        };
+        if let Some((o, key, log)) = found {
+            log.note_producer(key, o, super::escape::site());
+        }
+    }
+
+    /// The handout's watch, on the declining path: the carried value slot
+    /// `slot` would overwrite, if it is still alive.
+    #[cold]
+    fn held_over(&self, slot: usize) -> bool {
+        let g = self.inner.watch.lock();
+        for w in g.iter().filter(|w| w.slot == slot) {
+            if w.stats.alive(&w.victim, w.victim_ordinal) {
+                w.log.note_decline(w);
+                return true;
+            }
+            // Dead, and its bytes are served now: from here its handle may
+            // name the new value (a key re-serving its own ordinal).
+            w.stats.retired.store(true, Ordering::Relaxed);
+        }
+        false
     }
 
     /// Whether a step drifted from the plan since this was last asked, and
@@ -1390,7 +1554,7 @@ impl Arena {
     ///   built once at `install_arena` and never mutated afterwards. It reads
     ///   position `n`; it does not read "the entry the previous call read", so
     ///   no happens-before edge is required against any other `fetch_add`.
-    /// - `state.slot_handles[slot]` -- indexed by the *plan's* slot, not by the
+    /// - `state.ordinal_handles[ordinal]` -- indexed by the *plan's* ordinal, not by the
     ///   ordinal, and likewise immutable for the plan's lifetime.
     ///
     /// **And there is no ordering to supply, which is a stronger statement than
@@ -1528,6 +1692,17 @@ impl Arena {
                 self.inner.active.store(0, Ordering::Relaxed);
                 return make_claim(Some(ordinal), None, Some(ArenaDecline::Drift));
             }
+        }
+        // The slot's bytes may still hold a value an earlier pass left
+        // referenced. Serving it would overwrite that value; the pool keeps
+        // both right and the plan cache's log names it.
+        if self.inner.watching.load(Ordering::Relaxed) && self.held_over(slot) {
+            counters.declined_held.fetch_add(1, Ordering::Relaxed);
+            return make_claim(Some(ordinal), None, Some(ArenaDecline::Held));
+        }
+        #[cfg(any(debug_assertions, feature = "profile"))]
+        if self.inner.wanting.load(Ordering::Relaxed) {
+            self.take_wanted_site(ordinal);
         }
         make_claim(Some(ordinal), Some(slot), None)
     }
@@ -3372,7 +3547,7 @@ mod tests {
     /// assigned' is visible in the text and invisible to any pool state."*
     ///
     /// The claim it pins is the one the removal rests on: `plan`,
-    /// `slot_handles` and `layout` are established in `Arena::new` and never
+    /// `ordinal_handles`, `slot_ordinals` and `layout` are established in `Arena::new` and never
     /// assigned again, so every reader on the decode path reads data the `Arc`
     /// already published and no reader can race a writer.
     ///
@@ -3400,7 +3575,7 @@ mod tests {
                 .count()
         };
 
-        for field in ["plan", "slot_handles", "layout"] {
+        for field in ["plan", "ordinal_handles", "slot_ordinals", "layout"] {
             let assign = format!("plan_state.{field} {}", "=");
             assert_eq!(
                 code_only(&assign),
@@ -3429,10 +3604,10 @@ mod tests {
         // renamed out from under this test (§15.1a's VACUOUS class, #457's
         // rule that a zero is not evidence unless something nonzero came from
         // the same command).
-        let reads = code_only("plan_state.plan") + code_only("plan_state.slot_handles");
+        let reads = code_only("plan_state.plan") + code_only("plan_state.ordinal_handles");
         assert!(
             reads > 0,
-            "no read of `plan_state.plan` or `plan_state.slot_handles` -- this \
+            "no read of `plan_state.plan` or `plan_state.ordinal_handles` -- this \
              test is asserting zeros about a field that no longer exists, \
              which reads exactly like a passing check."
         );
@@ -3558,5 +3733,123 @@ mod tests {
             "the fixture's slots overlap, so this test cannot speak to \
              uniqueness"
         );
+    }
+}
+
+#[cfg(test)]
+mod input_key_controls {
+    use super::*;
+    use crate::backend::PassInput;
+    use std::collections::HashMap;
+
+    #[test]
+    fn input_route_and_full_model_variant_are_independent_plan_keys() {
+        let mut quotes = HashMap::new();
+        for input in [PassInput::TokenIds, PassInput::PreparedEmbeddings] {
+            for variant in [0, 1, u32::MAX] {
+                for opener in [PassOpener::Driver, PassOpener::Model] {
+                    let base = PassKey::new(PassKind::Decode { b: 1 }).opened_by(opener);
+                    let key = base.with_input(input).with_variant(variant);
+                    assert_eq!(key, base.with_variant(variant).with_input(input));
+                    assert_eq!(key.variant, variant);
+                    assert!(quotes.insert(key, input).is_none());
+                    // The quote and execution key retain every independent factor.
+                    assert_eq!(
+                        quotes.get(&base.with_variant(variant).with_input(input)),
+                        Some(&input)
+                    );
+                }
+            }
+        }
+        assert_eq!(quotes.len(), 12);
+        assert_eq!(
+            PassKey::new(PassKind::Decode { b: 1 }).input,
+            PassInput::TokenIds
+        );
+    }
+
+    /// Production recorder/cache, not a stand-in HashMap: the gather is an
+    /// allocation inside TokenIds and outside PreparedEmbeddings. Collapsing
+    /// with_input must fail the two-plan and served-plan assertions below.
+    #[test]
+    fn physical_input_layout_selects_its_own_cached_plan() -> crate::Result<()> {
+        use crate::{Device, Tensor};
+        crate::isolation::claim("pass input physical cache selection");
+        let device = Device::new_metal(0)?;
+        let metal = device.as_metal_device()?;
+        eprintln!(
+            "PASS_INPUT_SETUP actual_api={}",
+            metal.commands().actual_command_api()
+        );
+        let table = Tensor::arange(0f32, 128f32, &device)?.reshape((4, 32))?;
+        let ids = Tensor::new(&[2u32], &device)?;
+        let prepared = table.index_select(&ids, 0)?;
+        metal.wait_until_completed()?;
+        metal.enable_pass_plans(ArenaLayout::Packed);
+        let key = |input| PassKey::new(PassKind::Decode { b: 1 }).with_input(input);
+        let run = |input| -> crate::Result<()> {
+            metal.begin_pass(key(input))?;
+            let result = (|| -> crate::Result<Vec<Vec<f32>>> {
+                let x = match input {
+                    PassInput::TokenIds => table.index_select(&ids, 0)?,
+                    PassInput::PreparedEmbeddings => prepared.clone(),
+                };
+                x.affine(2.0, 1.0)?.to_vec2::<f32>()
+            })();
+            if result.is_err() {
+                metal.abort_pass()?;
+                return result.map(|_| ());
+            }
+            metal.finish_pass()?;
+            let want: Vec<f32> = (64..96).map(|v| 2.0 * v as f32 + 1.0).collect();
+            assert_eq!(result?, vec![want]);
+            Ok(())
+        };
+        for input in [PassInput::TokenIds, PassInput::PreparedEmbeddings] {
+            for _ in 0..4 {
+                run(input)?;
+            }
+        }
+        let (plans, _) = metal.pass_plan_report().expect("enabled cache");
+        assert_eq!(plans.len(), 2, "physical layouts shared a plan: {plans:?}");
+        let token = plans
+            .iter()
+            .find(|p| p.0 == key(PassInput::TokenIds))
+            .unwrap();
+        let prepared_plan = plans
+            .iter()
+            .find(|p| p.0 == key(PassInput::PreparedEmbeddings))
+            .unwrap();
+        assert!(
+            token.2 > prepared_plan.2,
+            "inside-gather allocation must distinguish physical plans: {plans:?}"
+        );
+        assert!(
+            token.1 > 0 && prepared_plan.1 > 0,
+            "no plan-covered allocation: {plans:?}"
+        );
+        let before = metal.pass_plan_counters().unwrap();
+        for _ in 0..3 {
+            run(PassInput::PreparedEmbeddings)?;
+            run(PassInput::TokenIds)?;
+        }
+        let after = metal.pass_plan_counters().unwrap();
+        assert_eq!(
+            after.served - before.served,
+            6,
+            "warm input routes did not use cached plans"
+        );
+        assert_eq!(
+            after.evicted, before.evicted,
+            "cross-route drift evicted a plan"
+        );
+        assert_eq!(
+            after.recorded, before.recorded,
+            "warm input routes re-recorded"
+        );
+        eprintln!("PASS_INPUT_PHYSICAL actual_api={} token_allocations={} prepared_allocations={} served_delta=6 eviction_delta=0",
+            metal.commands().actual_command_api_for_test(), token.2, prepared_plan.2);
+        metal.wait_until_completed()?;
+        Ok(())
     }
 }

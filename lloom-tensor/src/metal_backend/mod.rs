@@ -39,6 +39,8 @@ pub use allocation_scope::{
 };
 mod device;
 pub(crate) mod device_retirement;
+#[cfg(any(debug_assertions, feature = "profile"))]
+pub(crate) use device::call_site;
 pub(crate) use device::retain_evicted_allocations;
 mod physical_context;
 pub use device::{
@@ -49,6 +51,14 @@ mod host_fed;
 mod host_slot;
 mod sampling_multinomial;
 mod sampling_topk;
+/// Guarded sampling primitives. Construction is explicit; no public sampling
+/// route or default is selected by exposing this consumer surface.
+pub mod sampling {
+    pub use super::sampling_multinomial::guard::{GuardedSample, SampleGuard, SamplePublisher};
+    pub use super::sampling_multinomial::prepared::{Draw, PreparedSampler};
+    pub use super::sampling_multinomial::prepared_slots::PreparedSamplerSlots;
+    pub use super::sampling_multinomial::readback::{CheckedSample, SampleReadback};
+}
 use device::DeviceTeardown;
 #[cfg(test)]
 use device::PRIVATE_RESOURCE_OPTIONS;
@@ -60,8 +70,9 @@ pub use host_slot::HostSlot;
 /// Re-exported for the same reason `trace` is below: a harness selecting a
 /// layout should not need a direct dependency on `candle-metal-kernels`.
 pub use crate::kernels::metal::{
-    hazard_key, set_hazard_key, set_hazard_key_unless_explicit, ArenaCounters, ArenaLayout,
-    EscapeGuard, FreeSummary, HazardKey, PassKey, PassKind, PassOpener, PassPlanCounters, Slot,
+    escape_check, hazard_key, set_escape_check, set_hazard_key, set_hazard_key_unless_explicit,
+    ArenaCounters, ArenaLayout, EscapeCheck, EscapeGuard, EscapeHit, EscapeKind, EscapeLog,
+    FreeSummary, HazardKey, HeldValue, PassKey, PassKind, PassOpener, PassPlanCounters, Slot,
     StepPlan,
 };
 

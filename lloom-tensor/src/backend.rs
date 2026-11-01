@@ -252,6 +252,18 @@ pub trait BackendDevice: Sized + std::fmt::Debug + Clone {
     }
 }
 
+/// Which input computation a driver includes inside its decode pass.
+/// Independent of a model's variant: both are factors of a cached plan key.
+/// Metadata only; this does not enable a device sampler or change arithmetic.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum PassInput {
+    /// The model gathers token IDs inside the pass.
+    #[default]
+    TokenIds,
+    /// Guarded embeddings were prepared before the pass.
+    PreparedEmbeddings,
+}
+
 /// The shape of a forward pass, backend-neutrally: what a plan is keyed by
 /// (`DESIGN.md` §9.2aa). Mirrors the Metal backend's `PassKind` without
 /// depending on it, so a driver names a pass shape once and every backend

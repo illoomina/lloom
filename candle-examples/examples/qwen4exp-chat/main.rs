@@ -287,14 +287,16 @@ struct Args {
     #[arg(long)]
     raw: bool,
 
-    /// Substring the output must contain (case-insensitive); exits 1 otherwise.
+    /// Substring the final run's output must contain (Unicode case-insensitive).
+    /// With --rows, every row is checked separately; exits 1 on any miss.
     #[arg(long)]
     expect: Option<String>,
 
     #[arg(long, default_value_t = 32)]
     max_tokens: usize,
 
-    /// Fresh-cache repetitions; all must produce one token digest.
+    /// Fresh-cache repetitions; all must produce one full token digest.
+    /// With --rows, corresponding row indices must agree across runs.
     #[arg(long, default_value_t = 1)]
     runs: usize,
 
@@ -836,9 +838,18 @@ fn run<P: QwenShape>(args: Args) -> Result<()> {
             model.set_mem_check(mem_check);
             model.set_host_fill(args.host_fill);
             if args.rows > 1 || args.batched_driver {
-                rows_gate(&model, &args, &device, &prompt_ids, &eos_ids)
+                rows_gate(&model, &args, &device, &tokenizer, &prompt_ids, &eos_ids)
             } else if !args.legacy_loop {
-                driver_gate(&model, &args, &shards, &device, &prompt_ids, &eos_ids, t0)
+                driver_gate(
+                    &model,
+                    &args,
+                    &shards,
+                    &device,
+                    &tokenizer,
+                    &prompt_ids,
+                    &eos_ids,
+                    t0,
+                )
             } else {
                 gate(
                     &model,
@@ -907,9 +918,18 @@ fn run<P: QwenShape>(args: Args) -> Result<()> {
                 }
             }
             let out = if args.rows > 1 || args.batched_driver {
-                rows_gate(&model, &args, &device, &prompt_ids, &eos_ids)
+                rows_gate(&model, &args, &device, &tokenizer, &prompt_ids, &eos_ids)
             } else if !args.legacy_loop {
-                driver_gate(&model, &args, &shards, &device, &prompt_ids, &eos_ids, t0)
+                driver_gate(
+                    &model,
+                    &args,
+                    &shards,
+                    &device,
+                    &tokenizer,
+                    &prompt_ids,
+                    &eos_ids,
+                    t0,
+                )
             } else {
                 gate(
                     &model,
@@ -963,12 +983,16 @@ fn rows_gate<P: QwenShape, R: ExpertResidency + HasStreamStats>(
     model: &Qwen4Exp<P, R>,
     args: &Args,
     device: &Device,
+    tokenizer: &Tokenizer,
     prompt_ids: &[u32],
     eos_ids: &[u32],
 ) -> Result<()> {
     use lloom::generation::{LogitsProcessor, Sampling};
     use lloom::nn::{DecodeOptions, Session};
     let cfg = model.config();
+    let mut run_digests = Vec::with_capacity(args.runs);
+    let mut last_texts = Vec::with_capacity(args.rows);
+    let mut ok = true;
     for run in 0..args.runs {
         // The rows' states at the shape: pooled (`Paged`) or each its own.
         let (pools, caches) = if args.rows_pool || args.mtp.is_some() {
@@ -1025,7 +1049,7 @@ fn rows_gate<P: QwenShape, R: ExpertResidency + HasStreamStats>(
                 for id in &o.ids {
                     h.update(&id.to_le_bytes());
                 }
-                sha256::hex(&h.finalize())[..8].to_string()
+                sha256::hex(&h.finalize())
             })
             .collect();
         println!(
@@ -1036,8 +1060,18 @@ fn rows_gate<P: QwenShape, R: ExpertResidency + HasStreamStats>(
             wall.as_millis(),
             generated as f64 / wall.as_secs_f64(),
             generated as f64 / wall.as_secs_f64() / args.rows as f64,
-            digests
+            digests.iter().map(|digest| &digest[..8]).collect::<Vec<_>>()
         );
+        ok &= outs.len() == args.rows;
+        last_texts.clear();
+        if args.expect.is_some() {
+            for (row, output) in outs.iter().enumerate() {
+                let text = decode_gate_output(tokenizer, &output.ids)?;
+                println!("output(row={row}): {text}");
+                last_texts.push(text);
+            }
+        }
+        run_digests.push(digests);
         let s = model.stream_stats();
         let pf = model.prefetch_stats();
         if s.plans + s.device_plans > 0 {
@@ -1101,10 +1135,13 @@ fn rows_gate<P: QwenShape, R: ExpertResidency + HasStreamStats>(
                 .zip(&outs)
                 .map(|(a, b)| a.ids == b.ids)
                 .collect();
+            ok &= matching_rows(outs.len(), spec.len(), &same);
             let rounds: usize = spec.iter().map(|o| o.stats.rounds.len()).sum();
             println!(
-                "MTPROWS run={run} rows={} k={} identical_to_greedy={:?} generated={spec_generated} rounds={rounds} tokens_per_round={:.3} wall_ms={} tok_s={:.2} greedy_tok_s={:.2}",
+                "MTPROWS run={run} rows={} expected_rows={} actual_rows={} k={} identical_to_greedy={:?} generated={spec_generated} rounds={rounds} tokens_per_round={:.3} wall_ms={} tok_s={:.2} greedy_tok_s={:.2}",
                 args.rows,
+                outs.len(),
+                spec.len(),
                 drafter.k(),
                 same,
                 spec_generated as f64 / rounds.max(1) as f64,
@@ -1114,7 +1151,14 @@ fn rows_gate<P: QwenShape, R: ExpertResidency + HasStreamStats>(
             );
         }
     }
-    Ok(())
+    let identical = repeated_digests_identical(&run_digests);
+    println!(
+        "ROWDETERMINISM runs={} rows={} identical={identical} digests={:?}",
+        args.runs,
+        args.rows,
+        run_digests.first().map(Vec::as_slice).unwrap_or_default()
+    );
+    finish_rows_gate(identical, ok, &last_texts, args.expect.as_deref())
 }
 
 /// The `LOADED` line and the post-load `MEM` line, shared by the gates.
@@ -1301,6 +1345,7 @@ fn driver_gate<P: QwenShape, R: ExpertResidency + HasStreamStats>(
     args: &Args,
     shards: &[PathBuf],
     device: &Device,
+    tokenizer: &Tokenizer,
     prompt_ids: &[u32],
     eos_ids: &[u32],
     t0: std::time::Instant,
@@ -1330,7 +1375,8 @@ fn driver_gate<P: QwenShape, R: ExpertResidency + HasStreamStats>(
         args.readback,
         args.readback != "blocking" && model.host_fill()
     );
-    let mut greedy_digest: Option<String> = None;
+    let mut digests = Vec::with_capacity(args.runs);
+    let mut last_text = String::new();
     for run in 0..args.runs {
         let cache: State<P> = P::single(model, device, args.mtp_k)?;
         let mut session = Session::new(model, cache);
@@ -1480,8 +1526,14 @@ fn driver_gate<P: QwenShape, R: ExpertResidency + HasStreamStats>(
             }
             stream_line(run, model, args, session.sequence().cache());
         }
-        greedy_digest = Some(digest);
+        if args.expect.is_some() {
+            last_text = decode_gate_output(tokenizer, &out.ids)?;
+            println!("output: {last_text}");
+        }
+        digests.push(digest);
     }
+    let identical = report_determinism(&digests, args.runs);
+    let greedy_digest = digests.last().map(String::as_str);
     // `--mtp <sidecar>`: the same prompt once more through the driver's
     // speculative body (`Session::decode_speculative`, the DSpark seams:
     // `MtpDrafter: Speculator`, `Qwen4Exp: Probes<NextnHidden>`), its
@@ -1533,7 +1585,7 @@ fn driver_gate<P: QwenShape, R: ExpertResidency + HasStreamStats>(
         let rounds = out.stats.rounds.len();
         let accepted_drafts = out.stats.rounds.iter().filter(|r| r.accepted > 1).count();
         let tokens: usize = out.stats.rounds.iter().map(|r| r.accepted).sum();
-        let same = greedy_digest.as_deref() == Some(mtp_digest.as_str());
+        let same = greedy_digest == Some(mtp_digest.as_str());
         let sum = |f: &dyn Fn(&lloom::nn::RoundTiming) -> u64| -> f64 {
             out.stats.rounds.iter().map(|r| f(&r.timing)).sum::<u64>() as f64 / 1e6
         };
@@ -1612,10 +1664,10 @@ fn driver_gate<P: QwenShape, R: ExpertResidency + HasStreamStats>(
             prompt_ids,
             eos_ids,
             tile,
-            greedy_digest.as_deref(),
+            greedy_digest,
         )?;
     }
-    Ok(())
+    finish_gate(identical, true, &last_text, args.expect.as_deref())
 }
 
 /// `--dflash`: the prompt through the speculative body with the DFlash
@@ -1725,6 +1777,65 @@ fn dflash_runs<P: QwenShape, R: ExpertResidency + HasStreamStats>(
         }
     }
     Ok(())
+}
+
+// Tokenizer decoding, special-token handling and Unicode matching follow the
+// legacy gate; do not substitute a token-id or ASCII-only smoke check.
+fn decode_gate_output(tokenizer: &Tokenizer, ids: &[u32]) -> Result<String> {
+    tokenizer.decode(ids, true).map_err(anyhow::Error::msg)
+}
+
+fn repeated_digests_identical<T: PartialEq>(digests: &[T]) -> bool {
+    digests.windows(2).all(|w| w[0] == w[1])
+}
+
+fn report_determinism(digests: &[String], runs: usize) -> bool {
+    let identical = repeated_digests_identical(digests);
+    println!(
+        "DETERMINISM runs={runs} identical={identical} digest={}",
+        digests.first().map(String::as_str).unwrap_or_default()
+    );
+    identical
+}
+
+fn finish_gate(
+    identical: bool,
+    other_checks: bool,
+    last_text: &str,
+    expect: Option<&str>,
+) -> Result<()> {
+    let mut ok = identical && other_checks;
+    if let Some(expect) = expect {
+        let found = last_text.to_lowercase().contains(&expect.to_lowercase());
+        println!("TEXT expect={expect:?} found={found}");
+        ok &= found;
+    }
+    if !ok {
+        anyhow::bail!("gate FAILED (identical={identical})");
+    }
+    Ok(())
+}
+
+fn matching_rows(expected: usize, actual: usize, matches: &[bool]) -> bool {
+    expected == actual && matches.len() == expected && matches.iter().all(|same| *same)
+}
+
+fn finish_rows_gate(
+    identical: bool,
+    other_checks: bool,
+    last_texts: &[String],
+    expect: Option<&str>,
+) -> Result<()> {
+    // No runs leaves the same empty text as the single-sequence gate.
+    if last_texts.is_empty() {
+        return finish_gate(identical, other_checks, "", expect);
+    }
+    let mut ok = other_checks;
+    for (row, text) in last_texts.iter().enumerate() {
+        println!("TEXTROW row={row}");
+        ok &= finish_gate(identical, true, text, expect).is_ok();
+    }
+    finish_gate(identical, ok, "", None)
 }
 
 fn gate<P: QwenShape, R: ExpertResidency + HasStreamStats>(
@@ -1922,9 +2033,7 @@ fn gate<P: QwenShape, R: ExpertResidency + HasStreamStats>(
             h.update(&t.to_le_bytes());
         }
         let digest = sha256::hex(&h.finalize());
-        last_text = tokenizer
-            .decode(&generated, true)
-            .map_err(anyhow::Error::msg)?;
+        last_text = decode_gate_output(tokenizer, &generated)?;
         println!("--- run {run} ---");
         println!("prompt: {}", args.prompt);
         println!("output: {last_text}");
@@ -1985,12 +2094,7 @@ fn gate<P: QwenShape, R: ExpertResidency + HasStreamStats>(
         }
         digests.push(digest);
     }
-    let identical = digests.windows(2).all(|w| w[0] == w[1]);
-    println!(
-        "DETERMINISM runs={} identical={identical} digest={}",
-        args.runs,
-        digests.first().cloned().unwrap_or_default()
-    );
+    let identical = report_determinism(&digests, args.runs);
     let mut ok = identical;
     if let Some(head) = model.mtp_head() {
         // One speculative decode of the same prompt: the MTP drafter on the
@@ -2059,15 +2163,7 @@ fn gate<P: QwenShape, R: ExpertResidency + HasStreamStats>(
         );
         ok &= same;
     }
-    if let Some(expect) = &args.expect {
-        let found = last_text.to_lowercase().contains(&expect.to_lowercase());
-        println!("TEXT expect={expect:?} found={found}");
-        ok &= found;
-    }
-    if !ok {
-        anyhow::bail!("gate FAILED (identical={identical})");
-    }
-    Ok(())
+    finish_gate(identical, ok, &last_text, args.expect.as_deref())
 }
 
 /// The rollback probe (see `--rollback-probe`).
@@ -2410,5 +2506,126 @@ mod metal_prefetch_report_tests {
         };
         assert_eq!(render_prefetch_line(2, true, 3, &pf).to_string(),
             "PREFETCH run=2 on=true spec_ahead=3 issued=7 staged=5 used=0 wasted=0 stale=0 bytes=0 parked=0 stage_read_gb_s=2.00 direct_read_gb_s=3.00");
+    }
+}
+
+#[cfg(test)]
+mod gate_validation_tests {
+    use super::*;
+
+    fn validate(digests: &[&str], text: &str, expect: Option<&str>) -> Result<()> {
+        let digests: Vec<String> = digests.iter().map(|s| (*s).to_owned()).collect();
+        finish_gate(
+            report_determinism(&digests, digests.len()),
+            true,
+            text,
+            expect,
+        )
+    }
+
+    #[test]
+    fn equal_repeats_and_single_run_pass() {
+        assert!(validate(&["a"], "", None).is_ok());
+        assert!(validate(&["a", "a", "a"], "Paris", Some("paris")).is_ok());
+    }
+
+    #[test]
+    fn any_repeat_mismatch_fails_even_when_last_matches_first() {
+        for digests in [["a", "b", "a"], ["b", "a", "a"], ["a", "a", "b"]] {
+            let error = validate(&digests, "Paris", Some("paris")).unwrap_err();
+            assert_eq!(error.to_string(), "gate FAILED (identical=false)");
+        }
+    }
+
+    #[test]
+    fn full_digest_not_display_prefix_is_compared() {
+        let a = format!("12345678{}", "a".repeat(56));
+        let b = format!("12345678{}", "b".repeat(56));
+        assert!(validate(&[&a, &b], "", None).is_err());
+    }
+
+    #[test]
+    fn text_miss_fails_even_when_digests_agree() {
+        let error = validate(&["a", "a"], "London", Some("paris")).unwrap_err();
+        assert_eq!(error.to_string(), "gate FAILED (identical=true)");
+    }
+
+    #[test]
+    fn unicode_lowercase_is_preserved_without_extra_normalization() {
+        assert!(validate(&["a"], "Un CAFÉ à Paris", Some("café À PARIS")).is_ok());
+        assert!(validate(&["a"], "Paris", Some(" Paris ")).is_err());
+        assert!(validate(&["a"], "Café", Some("Cafe\u{301}")).is_err());
+    }
+
+    #[test]
+    fn zero_runs_preserves_legacy_empty_text_semantics() {
+        assert!(validate(&[], "", None).is_ok());
+        assert!(validate(&[], "", Some("")).is_ok());
+        assert!(validate(&[], "", Some("Paris")).is_err());
+    }
+
+    #[test]
+    fn empty_generation_does_not_invent_smoke_text() {
+        assert!(validate(&["empty", "empty"], "", None).is_ok());
+        assert!(validate(&["empty", "empty"], "", Some("")).is_ok());
+        assert!(validate(&["empty", "empty"], "", Some("Paris")).is_err());
+    }
+
+    #[test]
+    fn speculative_failure_cannot_be_overridden_by_text_success() {
+        assert!(finish_gate(true, false, "Paris", Some("paris")).is_err());
+        assert!(finish_gate(false, true, "Paris", Some("paris")).is_err());
+    }
+
+    #[test]
+    fn smoke_uses_actual_tokenizer_and_skips_special_tokens() {
+        use tokenizers::{models::wordlevel::WordLevel, AddedToken};
+        let vocab = [("<unk>", 0), ("CAFÉ", 1), ("Paris", 2), ("<eos>", 3)]
+            .into_iter()
+            .map(|(s, id)| (s.to_owned(), id))
+            .collect();
+        let mut tokenizer = Tokenizer::new(WordLevel::builder().vocab(vocab).build().unwrap());
+        tokenizer.add_special_tokens(&[AddedToken::from("<eos>", true)]);
+        let text = decode_gate_output(&tokenizer, &[1, 3, 2]).unwrap();
+        assert_eq!(text, "CAFÉ Paris");
+        assert!(validate(&["a"], &text, Some("café paris")).is_ok());
+        assert!(validate(&["a"], &text, Some("<eos>")).is_err());
+        assert_eq!(decode_gate_output(&tokenizer, &[]).unwrap(), "");
+    }
+
+    #[test]
+    fn corresponding_rows_use_full_digests_and_preserve_order() {
+        let a = format!("12345678{}", "a".repeat(56));
+        let b = format!("12345678{}", "b".repeat(56));
+        assert!(repeated_digests_identical(&[vec![&a, &b], vec![&a, &b]]));
+        assert!(!repeated_digests_identical(&[vec![&a, &b], vec![&b, &a]]));
+        assert!(!repeated_digests_identical(&[vec![&a, &b], vec![&a, &a]]));
+        assert!(!repeated_digests_identical(&[vec![&a, &b], vec![&a]]));
+    }
+
+    #[test]
+    fn every_final_row_must_match_without_cross_row_concatenation() {
+        let texts = |a: &str, b: &str| vec![a.to_owned(), b.to_owned()];
+        assert!(finish_rows_gate(true, true, &texts("Paris", "PARIS"), Some("paris")).is_ok());
+        assert!(finish_rows_gate(true, true, &texts("Paris", "London"), Some("paris")).is_err());
+        assert!(finish_rows_gate(true, true, &texts("Par", "is"), Some("paris")).is_err());
+        assert!(finish_rows_gate(true, true, &texts("", ""), Some("")).is_ok());
+    }
+
+    #[test]
+    fn rows_zero_runs_keep_legacy_smoke_semantics() {
+        assert!(finish_rows_gate(true, true, &[], None).is_ok());
+        assert!(finish_rows_gate(true, true, &[], Some("")).is_ok());
+        assert!(finish_rows_gate(true, true, &[], Some("paris")).is_err());
+    }
+
+    #[test]
+    fn mtp_requires_exact_row_population_and_every_match() {
+        assert!(matching_rows(2, 2, &[true, true]));
+        assert!(!matching_rows(2, 1, &[true]));
+        assert!(!matching_rows(1, 2, &[true]));
+        assert!(!matching_rows(2, 2, &[true]));
+        assert!(!matching_rows(2, 2, &[true, false]));
+        assert!(finish_rows_gate(true, false, &["Paris".to_owned()], Some("paris")).is_err());
     }
 }

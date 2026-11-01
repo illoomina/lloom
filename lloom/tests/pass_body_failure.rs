@@ -1191,3 +1191,6 @@ fn a_failing_body_and_a_restore_on_a_real_qwen3_5_checkpoint() -> Result<()> {
     );
     Ok(())
 }
+
+#[path = "support/pass_input_route.rs"]
+mod pass_input_route;

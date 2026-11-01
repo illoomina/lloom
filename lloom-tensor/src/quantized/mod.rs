@@ -41,6 +41,34 @@ pub mod simd128;
 pub mod utils;
 use half::{bf16, f16};
 
+/// Cold output geometry shared by guarded embedding validation and request
+/// preparation. Payload excludes allocator rounding and metadata; callers retain
+/// their existing allocation namespace and admission obligations.
+#[cfg(feature = "metal")]
+#[derive(Clone, Debug)]
+pub struct GuardedEmbeddingLayout {
+    pub vocab: usize,
+    pub hidden: usize,
+    pub dtype: DType,
+    pub device: Device,
+}
+
+#[cfg(feature = "metal")]
+impl GuardedEmbeddingLayout {
+    pub fn payload_bytes(&self, rows: usize) -> Result<usize> {
+        rows.checked_mul(self.hidden)
+            .and_then(|n| n.checked_mul(self.dtype.size_in_bytes()))
+            .filter(|&n| rows > 0 && n > 0 && n <= isize::MAX as usize)
+            .ok_or_else(|| crate::Error::Msg("guarded embedding output size overflow".into()))
+    }
+
+    /// Allocate only after the owning request has admitted its complete quote.
+    pub fn allocate(&self, rows: usize) -> Result<Tensor> {
+        self.payload_bytes(rows)?;
+        Tensor::zeros((1, rows, self.hidden), self.dtype, &self.device)
+    }
+}
+
 pub use k_quants::GgmlType;
 
 fn as_t_slice<T>(data: &[u8]) -> &[T] {
@@ -1053,6 +1081,19 @@ impl QTensor {
         }
     }
 
+    #[cfg(feature = "metal")]
+    pub fn embedding_guarded_into(
+        &self,
+        tokens: &crate::metal_backend::sampling::GuardedSample<'_>,
+        out: &Tensor,
+    ) -> Result<()> {
+        let (vocab, hidden) = self.shape.dims2()?;
+        let QStorage::Metal(storage) = &self.storage else {
+            crate::bail!("guarded packed embedding requires Metal weights");
+        };
+        tokens.quantized_embedding_into(storage, vocab, hidden, out)
+    }
+
     pub fn embedding(&self, ids: &Tensor) -> Result<Tensor> {
         let (rows, hidden) = self.shape.dims2()?;
         if !hidden.is_multiple_of(self.dtype().block_size()) {
@@ -1697,6 +1738,77 @@ impl QMatMul {
             Self::QTensor(t) => t.indexed_moe_forward(x, ids),
             _ => {
                 panic!("Not implemented!")
+            }
+        }
+    }
+
+    /// Cold prepared-output capability check, without exposing a packed
+    /// storage handle or materializing the complete embedding table.
+    #[cfg(feature = "metal")]
+    pub fn guarded_embedding_layout(&self) -> Result<GuardedEmbeddingLayout> {
+        let (vocab, hidden, dtype, device) = match self {
+            Self::QTensor(table) => {
+                let (vocab, hidden) = table.shape().dims2()?;
+                let kind =
+                    crate::kernels::kernels::quantized::GgmlDType::from(table.dtype()).kind();
+                if kind.guarded_get_rows.is_none() || !hidden.is_multiple_of(kind.block_size) {
+                    crate::bail!("guarded embedding: unsupported packed dtype/block geometry");
+                }
+                (vocab, hidden, DType::F32, table.device())
+            }
+            Self::Tensor(table) | Self::TensorF16(table) => {
+                let (vocab, hidden) = table.dims2()?;
+                if !matches!(table.dtype(), DType::F32 | DType::F16 | DType::BF16) {
+                    crate::bail!("guarded embedding: unsupported dense dtype");
+                }
+                if !table.is_contiguous() {
+                    crate::bail!("guarded embedding: contiguous dense table required");
+                }
+                (vocab, hidden, table.dtype(), table.device().clone())
+            }
+        };
+        if vocab == 0 || hidden == 0 || !device.is_metal() {
+            crate::bail!("guarded embedding: nonempty Metal table required");
+        }
+        Ok(GuardedEmbeddingLayout {
+            vocab,
+            hidden,
+            dtype,
+            device,
+        })
+    }
+
+    #[cfg(feature = "metal")]
+    pub fn check_guarded_embedding_output(&self, out: &Tensor) -> Result<()> {
+        let GuardedEmbeddingLayout {
+            hidden,
+            dtype,
+            device,
+            ..
+        } = self.guarded_embedding_layout()?;
+        let (_, layout) = out.storage_and_layout();
+        if out.dim(D::Minus1)? != hidden
+            || out.elem_count() == 0
+            || out.dtype() != dtype
+            || !device.is_metal()
+            || !device.same_device(out.device())
+            || !layout.is_contiguous()
+        {
+            crate::bail!("guarded embedding: prepared shape/dtype/device/span mismatch");
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "metal")]
+    pub fn embedding_guarded_into(
+        &self,
+        tokens: &crate::metal_backend::sampling::GuardedSample<'_>,
+        out: &Tensor,
+    ) -> Result<()> {
+        match self {
+            Self::QTensor(table) => table.embedding_guarded_into(tokens, out),
+            Self::Tensor(table) | Self::TensorF16(table) => {
+                tokens.embedding_into_tensor(table, out)
             }
         }
     }

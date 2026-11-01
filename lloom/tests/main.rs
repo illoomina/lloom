@@ -15,6 +15,7 @@
 //! so a file that is not a module here fails the suite instead of silently
 //! not running.
 mod accept_frontier;
+mod add_rms_norm;
 mod attention_route;
 mod axes_registry;
 mod batch_norm;
@@ -59,6 +60,7 @@ mod lfm2_kv_growth_metal;
 mod lfm2_kv_growth_refusal_metal;
 mod lfm2_moe;
 mod lfm2_paged_kv_blocker;
+mod lfm2_paged_prefill;
 mod lfm2_pass_plans;
 mod lfm2_prefill_activation;
 mod lfm2_qkv_layout;

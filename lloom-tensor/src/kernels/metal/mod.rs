@@ -13,6 +13,7 @@ mod arena_gpu_tests;
 pub mod arms;
 pub mod backing;
 pub mod buffer;
+pub mod escape;
 mod physical_roles;
 pub(crate) use physical_roles::{
     ColdUnpooled, PreparedPoolSlot, PreparedStagingSlot, StagingError,
@@ -173,6 +174,7 @@ pub use compute_pipeline::*;
 pub use device::*;
 pub use encoder::*;
 pub use eos_gate::{DispatchGate, EosGateReport};
+pub use escape::*;
 pub use executor::*;
 pub use fence::*;
 pub use heap::*;

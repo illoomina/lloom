@@ -3204,3 +3204,11 @@ fn filtered_gumbel_ring_refuses_before_session_sampler_or_feed_moves() -> Result
     assert_eq!(sampler.logits_digest(), fresh.logits_digest());
     Ok(())
 }
+
+#[test]
+fn token_only_any_arm_keeps_the_token_input_contract() {
+    use lloom_tensor::backend::PassInput;
+    assert_eq!(AnyArm::PASS_INPUT, PassInput::TokenIds);
+    assert_eq!(Blocking::PASS_INPUT, PassInput::TokenIds);
+    assert_eq!(Ring::PASS_INPUT, PassInput::TokenIds);
+}

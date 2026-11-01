@@ -219,4 +219,39 @@ mod tests {
         p.grow(2);
         assert_eq!(p.pages().pool_pages(), 6);
     }
+
+    /// A page given up while the command buffer that writes it is still
+    /// being encoded comes back only once that buffer has completed: the
+    /// release is held against the epoch OPEN at the release, not the last
+    /// one committed. A sequence reset right after a failed step relies on
+    /// it, because the step's encoded work can still be in the open buffer
+    /// when the pages are released (`batched-decode-design.md` §11.11).
+    #[cfg(feature = "metal")]
+    #[test]
+    fn a_page_released_while_its_writer_is_encoded_waits_for_that_writer() {
+        use lloom_tensor::kernels::metal::GpuClock;
+        let clock = Arc::new(GpuClock::new());
+        let mut p = PagePool::with_clock(4, 4, 2, 5, Arc::clone(&clock));
+        for _ in 0..2 {
+            let e = clock.commit_epoch();
+            clock.mark_completed(e);
+        }
+        p.pages_mut().append(0, 8).unwrap();
+        let writer = clock.current_epoch();
+        assert_eq!(p.release(0).len(), 2);
+        assert_eq!(
+            p.recycle_ready().unwrap(),
+            0,
+            "back while the epoch that writes them is still open"
+        );
+        assert_eq!(clock.commit_epoch(), writer);
+        assert_eq!(
+            p.recycle_ready().unwrap(),
+            0,
+            "back once their writer was committed, before it completed"
+        );
+        clock.mark_completed(writer);
+        assert_eq!(p.recycle_ready().unwrap(), 2);
+        assert_eq!(p.pages().pages_free(), 4);
+    }
 }

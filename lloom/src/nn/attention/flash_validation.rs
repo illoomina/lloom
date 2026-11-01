@@ -31,6 +31,75 @@ pub(crate) struct Geometry {
     required_bytes: [usize; 3],
 }
 
+/// The native metadata consumer reads a contiguous U32 prefix, not the unused
+/// tail of the logical tensor. Offsets are relative to the native Buffer view;
+/// its own base is applied separately by the existing binding implementation.
+#[cfg_attr(not(any(feature = "metal", test)), allow(dead_code))]
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct MetadataSpan {
+    pub offset_bytes: usize,
+    required_bytes: usize,
+}
+
+impl MetadataSpan {
+    #[cfg(any(feature = "metal", test))]
+    pub(crate) fn validate_backing(self, bytes: usize, name: &str) -> Result<()> {
+        if self.required_bytes > bytes {
+            lloom_tensor::bail!("flash-decoding: {name} read span exceeds native buffer view")
+        }
+        Ok(())
+    }
+}
+
+pub(crate) fn metadata_table_entries(rows: usize, stride: usize, chunks: usize) -> Result<usize> {
+    rows.checked_sub(1)
+        .and_then(|n| n.checked_mul(stride))
+        .and_then(|n| n.checked_add(chunks))
+        .ok_or_else(|| {
+            lloom_tensor::Error::Msg("flash-decoding: table index arithmetic overflow".into())
+        })
+}
+
+pub(crate) fn metadata_span(
+    layout: &Layout,
+    dtype: DType,
+    minimum_elements: usize,
+    consumed_elements: usize,
+    name: &str,
+) -> Result<MetadataSpan> {
+    if dtype != DType::U32 {
+        lloom_tensor::bail!("flash-decoding: {name} must be U32")
+    }
+    // Check the logical descriptor before is_contiguous's stride products.
+    // Its unused tail is NOT charged against native backing below.
+    let logical = layout
+        .dims()
+        .iter()
+        .try_fold(1usize, |n, &d| n.checked_mul(d))
+        .ok_or_else(|| {
+            lloom_tensor::Error::Msg("flash-decoding: metadata logical extent overflow".into())
+        })?;
+    if consumed_elements == 0 || logical < minimum_elements || logical < consumed_elements {
+        lloom_tensor::bail!("flash-decoding: {name} is shorter than the required metadata")
+    }
+    if !layout.is_contiguous() {
+        lloom_tensor::bail!("flash-decoding: {name} must be contiguous")
+    }
+    let width = DType::U32.size_in_bytes();
+    let offset_bytes = layout.start_offset().checked_mul(width);
+    let required_bytes = layout
+        .start_offset()
+        .checked_add(consumed_elements)
+        .and_then(|n| n.checked_mul(width));
+    match (offset_bytes, required_bytes) {
+        (Some(offset_bytes), Some(required_bytes)) => Ok(MetadataSpan {
+            offset_bytes,
+            required_bytes,
+        }),
+        _ => lloom_tensor::bail!("flash-decoding: metadata byte offset/span overflow"),
+    }
+}
+
 fn product(values: &[usize]) -> Result<usize> {
     values
         .iter()
@@ -158,12 +227,7 @@ pub(crate) fn prepare_pages(
     native_int(max_keys)?;
     let chunks = max_keys.div_ceil(chunk);
     validate_chunk_count(chunks)?;
-    let required = (rows - 1)
-        .checked_mul(pages.stride)
-        .and_then(|n| n.checked_add(chunks))
-        .ok_or_else(|| {
-            lloom_tensor::Error::Msg("flash-decoding: table index arithmetic overflow".into())
-        })?;
+    let required = metadata_table_entries(rows, pages.stride, chunks)?;
     if pages.entries.len() < required {
         lloom_tensor::bail!("flash-decoding: chunk table is shorter than live rows")
     }
@@ -717,6 +781,83 @@ mod tests {
             1,
         )?;
         assert_eq!(padded.max_read_end, 769);
+        Ok(())
+    }
+
+    #[test]
+    fn metadata_spans_cover_only_the_consumed_prefix_and_keep_offsets() -> Result<()> {
+        let layout = Layout::contiguous_with_offset(&[24], 1);
+        let consumed = metadata_table_entries(3, 8, 2)?;
+        assert_eq!(consumed, 18, "do not charge the last row's unused padding");
+        let span = metadata_span(&layout, DType::U32, 24, consumed, "metadata table")?;
+        assert_eq!(span.offset_bytes, 4);
+        assert_eq!(span.required_bytes, 76);
+        span.validate_backing(76, "metadata table")?;
+        assert!(span
+            .validate_backing(75, "metadata table")
+            .unwrap_err()
+            .to_string()
+            .contains("read span exceeds native buffer view"));
+        Ok(())
+    }
+
+    #[test]
+    fn metadata_offsets_and_consumed_bytes_refuse_overflow_without_native_work() {
+        let start = Layout::contiguous_with_offset(&[2], usize::MAX / 4 + 1);
+        assert!(metadata_span(&start, DType::U32, 2, 2, "metadata table").is_err());
+        let end = Layout::contiguous_with_offset(&[2], usize::MAX / 4);
+        assert!(metadata_span(&end, DType::U32, 2, 2, "metadata table").is_err());
+        let huge = Layout::new((&[usize::MAX, 2]).into(), vec![2, 1], 0);
+        assert!(metadata_span(&huge, DType::U32, 1, 1, "metadata table").is_err());
+        assert!(metadata_table_entries(3, usize::MAX, 1).is_err());
+    }
+
+    #[test]
+    fn metadata_dtype_layout_and_logical_prefix_are_independent_guards() {
+        let contiguous = Layout::contiguous(&[2]);
+        assert!(metadata_span(&contiguous, DType::F32, 2, 2, "metadata table").is_err());
+        assert!(metadata_span(&contiguous, DType::U32, 3, 2, "metadata table").is_err());
+        let strided = Layout::new((&[2]).into(), vec![2], 0);
+        assert!(metadata_span(&strided, DType::U32, 2, 2, "metadata table").is_err());
+        assert!(metadata_span(
+            &Layout::contiguous(&[0]),
+            DType::U32,
+            0,
+            0,
+            "metadata table"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn metadata_table_and_count_backing_refusals_use_their_own_spans() -> Result<()> {
+        let table = metadata_span(
+            &Layout::contiguous_with_offset(&[2], 2),
+            DType::U32,
+            2,
+            2,
+            "metadata table",
+        )?;
+        let counts = metadata_span(
+            &Layout::contiguous_with_offset(&[2], 1),
+            DType::U32,
+            2,
+            2,
+            "metadata live counts",
+        )?;
+        assert_eq!((table.required_bytes, counts.required_bytes), (16, 12));
+        assert!(table
+            .validate_backing(15, "metadata table")
+            .unwrap_err()
+            .to_string()
+            .contains("metadata table read span"));
+        assert!(counts
+            .validate_backing(11, "metadata live counts")
+            .unwrap_err()
+            .to_string()
+            .contains("metadata live counts read span"));
+        table.validate_backing(16, "metadata table")?;
+        counts.validate_backing(12, "metadata live counts")?;
         Ok(())
     }
 }

@@ -1101,4 +1101,168 @@ mod flash_validation_tests {
         assert_eq!(output.flatten_all()?.to_vec1::<f32>()?, vec![1.; 64]);
         Ok(())
     }
+
+    /// Run ONLY against the checked candidate (or a late-validation mutant
+    /// that still refuses BEFORE encoding), never an extent-check bypass.
+    #[cfg(feature = "metal")]
+    #[test]
+    fn metadata_backing_refusals_precede_builders_and_offset_views_remain_valid() -> Result<()> {
+        use crate::nn::ops::flash_decoding_paged_ragged_bound;
+        use lloom_tensor::kernels::metal::{BufferHandle, PooledBuffer};
+        use lloom_tensor::{op::BackpropOp, MetalStorage, Storage};
+        let device = Device::new_metal(0)?;
+        let metal = device.as_metal_device()?;
+        assert_native_fixture_arm(metal, "metadata-span-pre-builder-and-offsets");
+        let k = Tensor::zeros((1, 1, 512, 64), DType::F32, &device)?;
+        let mut values = vec![1f32; 512 * 64];
+        values[256 * 64..].fill(3.);
+        let v = Tensor::from_vec(values, (1, 1, 512, 64), &device)?;
+        let lookups = || {
+            let (s, p) = metal.pool_counters();
+            (s.lookups, p.lookups)
+        };
+        // Creator tensors stay live across every native use. Only the declared
+        // Buffer view is short; there is no upload/read from the short view.
+        let table_base = Tensor::new(&[0u32, 1, 0, 1, 1], &device)?;
+        let keys_base = Tensor::new(&[1u32, 1, 257, 1], &device)?;
+        let keys_two = Tensor::new(&[1u32, 1, 1, 1, 1], &device)?;
+        let view = |base: &Tensor, at, bytes, declared, skip, used| -> Result<Tensor> {
+            let (storage, _) = base.storage_and_layout();
+            let Storage::Metal(storage) = &*storage else {
+                unreachable!("native fixture")
+            };
+            let native = storage.buffer().view(at, bytes);
+            let handle = BufferHandle::new(PooledBuffer::unpooled(native, bytes));
+            let tensor = Tensor::from_storage(
+                Storage::Metal(MetalStorage::new(
+                    handle,
+                    metal.clone(),
+                    declared,
+                    DType::U32,
+                )),
+                declared,
+                BackpropOp::none(),
+                false,
+            );
+            tensor.narrow(0, skip, used)
+        };
+        for short_table in [true, false] {
+            let rows = if short_table { 1 } else { 2 };
+            let q = Tensor::zeros((rows, 1, 1, 64), DType::F32, &device)?;
+            let keys = if short_table {
+                vec![257u32]
+            } else {
+                vec![1u32, 1]
+            };
+            let stride = if short_table { 2 } else { 1 };
+            let good_table = view(&table_base, 4, 16, 4, 1, 2)?;
+            let good_keys = if short_table {
+                view(&keys_base, 4, 12, 3, 1, 1)?
+            } else {
+                view(&keys_two, 4, 16, 4, 1, 2)?
+            };
+            let bad_table;
+            let bad_keys;
+            let (tables, counts, expected) = if short_table {
+                bad_table = view(&table_base, 8, 4, 2, 0, 2)?;
+                (
+                    &bad_table,
+                    &good_keys,
+                    "metadata table read span exceeds native buffer view",
+                )
+            } else {
+                bad_keys = view(&keys_two, 8, 4, 2, 0, 2)?;
+                (
+                    &good_table,
+                    &bad_keys,
+                    "metadata live counts read span exceeds native buffer view",
+                )
+            };
+            let before = lookups();
+            let census = metal.dispatch_census().open().map_err(|e| {
+                lloom_tensor::Error::Msg(format!("metadata refusal census unavailable: {e:?}"))
+            })?;
+            let error = flash_decoding_paged_ragged_bound(
+                &q,
+                &k,
+                &v,
+                1.,
+                1.,
+                256,
+                1,
+                FlashScratchSizing::Grow,
+                0,
+                &[0, 1],
+                stride,
+                &keys,
+                tables,
+                counts,
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(error.contains(expected), "{error}");
+            assert_eq!(
+                lookups(),
+                before,
+                "metadata backing refusal visited an output/scratch pool"
+            );
+            assert!(
+                census.close().is_empty(),
+                "metadata backing refusal encoded a dispatch"
+            );
+            let before = lookups();
+            let census = metal.dispatch_census().open().map_err(|e| {
+                lloom_tensor::Error::Msg(format!("metadata valid census unavailable: {e:?}"))
+            })?;
+            let output = flash_decoding_paged_ragged_bound(
+                &q,
+                &k,
+                &v,
+                1.,
+                1.,
+                256,
+                1,
+                FlashScratchSizing::Grow,
+                0,
+                &[0, 1],
+                stride,
+                &keys,
+                &good_table,
+                &good_keys,
+            )?;
+            let dispatches = census.close();
+            let after = lookups();
+            assert!(
+                after.0 > before.0 || after.1 > before.1,
+                "metadata fixture allocation census was not engaged"
+            );
+            assert!(
+                dispatches.iter().any(|(_, n)| *n > 0),
+                "metadata fixture dispatch census was not engaged"
+            );
+            let actual = output.flatten_all()?.to_vec1::<f32>()?;
+            assert_eq!(actual.len(), rows * 64);
+            for (at, &value) in actual.iter().enumerate() {
+                // q/k are zero, so every live key has equal weight. Page0=1,
+                // page1=3: 257 keys => (256*1+3)/257. Two one-key rows select
+                // page0 and page1 independently. Every sentinel page/count
+                // stays in-range even if an address term is lost.
+                let expected = if short_table {
+                    (256f64 + 3.) / 257.
+                } else if at < 64 {
+                    1.
+                } else {
+                    3.
+                };
+                assert!(
+                    (f64::from(value) - expected).abs() <= 2e-6,
+                    "metadata offset row/channel {at}: {value} vs {expected}"
+                );
+            }
+            assert_eq!(good_table.layout().start_offset(), 1);
+            assert_eq!(good_keys.layout().start_offset(), 1);
+        }
+        drop((table_base, keys_base, keys_two));
+        Ok(())
+    }
 }

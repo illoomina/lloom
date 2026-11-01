@@ -3915,6 +3915,15 @@ struct PagedTable<'a> {
     summary: Option<&'a super::attention::flash_validation::PageSummary>,
 }
 
+// Computed once in the shared safe entry, consumed again only for the native
+// backing check. No storage alias escapes and no table contents are inferred.
+#[cfg_attr(not(feature = "metal"), allow(dead_code))]
+#[derive(Clone, Copy)]
+struct FlashMetadataSpans {
+    table: super::attention::flash_validation::MetadataSpan,
+    keys: Option<super::attention::flash_validation::MetadataSpan>,
+}
+
 /// FlashDecoding: attention split over independent contiguous KV chunks, with
 /// an index-ordered combine (`DESIGN.md` §10.4, issue #116).
 ///
@@ -3966,11 +3975,14 @@ struct FlashDecoding<'a> {
     /// need to know what a context length is.
     reserve_chunks: usize,
     geometry: Option<super::attention::flash_validation::Geometry>,
+    metadata_spans: Option<FlashMetadataSpans>,
 }
 
 impl FlashDecoding<'_> {
     fn apply(mut self, q: &Tensor, k: &Tensor, v: &Tensor) -> Result<Tensor> {
-        use super::attention::flash_validation::{prepare_pages, validate, Pages};
+        use super::attention::flash_validation::{
+            metadata_span, metadata_table_entries, prepare_pages, validate, Pages,
+        };
         let summary = match &self.paged {
             Some(p) => Some(match p.summary {
                 Some(s) => *s,
@@ -3998,6 +4010,37 @@ impl FlashDecoding<'_> {
             self.pages_per_chunk,
             summary.as_ref(),
         )?);
+        let geometry = self.geometry.expect("validated above");
+        self.metadata_spans = match &self.paged {
+            Some(p) if p.bound.is_some() || p.table_t.is_some() => {
+                let consumed = metadata_table_entries(q.dim(0)?, p.stride, geometry.chunks)?;
+                let check = |tensor: &Tensor, minimum, used, name| -> Result<_> {
+                    let span = metadata_span(tensor.layout(), tensor.dtype(), minimum, used, name)?;
+                    if !tensor.device().same_device(q.device()) {
+                        lloom_tensor::bail!("flash-decoding: metadata must share the query device")
+                    }
+                    Ok(span)
+                };
+                match (p.bound, p.table_t) {
+                    (Some((table, keys)), None) => Some(FlashMetadataSpans {
+                        table: check(table, p.entries.len(), consumed, "metadata table")?,
+                        keys: Some(check(
+                            keys,
+                            p.n_keys.as_slice().len(),
+                            p.n_keys.as_slice().len(),
+                            "metadata live counts",
+                        )?),
+                    }),
+                    (None, Some(table)) => Some(FlashMetadataSpans {
+                        table: check(table, p.entries.len(), consumed, "metadata table")?,
+                        keys: None,
+                    }),
+                    (None, None) => None,
+                    _ => lloom_tensor::bail!("flash-decoding: incompatible metadata bindings"),
+                }
+            }
+            _ => None,
+        };
         q.apply_op3_no_bwd(k, v, &self)
     }
 }
@@ -4029,7 +4072,7 @@ impl lloom_tensor::CustomOp3 for FlashDecoding<'_> {
         v: &lloom_tensor::MetalStorage,
         v_l: &Layout,
     ) -> Result<(lloom_tensor::MetalStorage, Shape)> {
-        use lloom_tensor::backend::BackendStorage;
+        use lloom_tensor::backend::{BackendDevice, BackendStorage};
         use lloom_tensor::kernels::{flash_chunk_count, ChunkTable, FlashDType};
 
         let device = q.device();
@@ -4088,6 +4131,49 @@ impl lloom_tensor::CustomOp3 for FlashDecoding<'_> {
             .sized_chunks(n_chunks, self.reserve_chunks, &rungs)
             .map_err(lloom_tensor::Error::msg)?;
         geometry.validate_capacity(chunk_capacity)?;
+        // Freeze existing metadata storage custody and check actual view-relative
+        // backing BEFORE output/scratch builders. Dispatch reuses these guards
+        // and the exact checked offsets; it never recomputes unchecked products.
+        let bound = self.paged.as_ref().and_then(|p| p.bound);
+        let bound_guards = bound.map(|(t, n)| (t.storage_and_layout(), n.storage_and_layout()));
+        let resident_table = self.paged.as_ref().and_then(|p| p.table_t);
+        let resident_guard = resident_table.map(|t| t.storage_and_layout());
+        let spans = self.metadata_spans;
+        let check_backing = |storage: &lloom_tensor::Storage,
+                             span: super::attention::flash_validation::MetadataSpan,
+                             name: &str|
+         -> Result<()> {
+            let storage = match storage {
+                lloom_tensor::Storage::Metal(storage) => storage,
+                _ => lloom_tensor::bail!("flash-decoding: {name} must be on metal"),
+            };
+            if storage.dtype() != DType::U32 {
+                lloom_tensor::bail!("flash-decoding: {name} must be U32")
+            }
+            if !storage.device().same_device(device) {
+                lloom_tensor::bail!("flash-decoding: metadata must share the query device")
+            }
+            span.validate_backing(storage.buffer().length(), name)
+        };
+        match (&bound_guards, &resident_guard, spans) {
+            (Some(((table, _), (keys, _))), None, Some(spans)) => {
+                check_backing(&**table, spans.table, "metadata table")?;
+                check_backing(
+                    &**keys,
+                    spans.keys.ok_or_else(|| {
+                        lloom_tensor::Error::Msg(
+                            "flash-decoding: missing checked metadata counts".into(),
+                        )
+                    })?,
+                    "metadata live counts",
+                )?;
+            }
+            (None, Some((table, _)), Some(spans)) => {
+                check_backing(&**table, spans.table, "metadata table")?
+            }
+            (None, None, None) => (),
+            _ => lloom_tensor::bail!("flash-decoding: missing checked metadata spans"),
+        }
         let out_dims = [q_l.dim(0)?, q_l.dim(1)?, 1, head_dim];
         let out_shape = Shape::from_dims(&out_dims);
         let out_layout = Layout::contiguous(out_shape);
@@ -4152,10 +4238,6 @@ impl lloom_tensor::CustomOp3 for FlashDecoding<'_> {
         // the same table is the same buffer across the layers of a step and
         // across steps until a chunk is added; the live count is one small
         // entry per step (`MetalDevice::constant_buffer`).
-        let bound = self.paged.as_ref().and_then(|p| p.bound);
-        let bound_guards = bound.map(|(t, n)| (t.storage_and_layout(), n.storage_and_layout()));
-        let resident_table = self.paged.as_ref().and_then(|p| p.table_t);
-        let resident_guard = resident_table.map(|t| t.storage_and_layout());
         let uploaded = match (bound, resident_table) {
             (None, None) => Some(device.constant_buffer(slice_bytes(&table))?),
             _ => None,
@@ -4207,7 +4289,6 @@ impl lloom_tensor::CustomOp3 for FlashDecoding<'_> {
         };
         // The table and the live counts may be views into a larger buffer (a
         // step frame's fields, §4.6): each bound at its byte offset.
-        let u32_bytes = DType::U32.size_in_bytes();
         let (chunk_table, chunk_table_offset, n_keys_per_seq, n_keys_offset): (
             &lloom_tensor::kernels::metal::buffer::Buffer,
             usize,
@@ -4215,14 +4296,19 @@ impl lloom_tensor::CustomOp3 for FlashDecoding<'_> {
             usize,
         ) = match (&bound_guards, &uploaded, &uploaded_keys) {
             (None, None, Some(n)) if resident_guard.is_some() => {
-                let (ts, tl) = resident_guard.as_ref().expect("checked");
+                let (ts, _) = resident_guard.as_ref().expect("checked");
                 let t = match &**ts {
                     lloom_tensor::Storage::Metal(m) => m.buffer(),
                     _ => lloom_tensor::bail!("flash-decoding: the resident table must be on metal"),
                 };
-                (t, tl.start_offset() * u32_bytes, n, 0)
+                (
+                    t,
+                    spans.expect("checked before builders").table.offset_bytes,
+                    n,
+                    0,
+                )
             }
-            (Some(((ts, tl), (ns, nl))), _, _) => {
+            (Some(((ts, _), (ns, _))), _, _) => {
                 let t = match &**ts {
                     lloom_tensor::Storage::Metal(m) => m.buffer(),
                     _ => lloom_tensor::bail!("flash-decoding: the bound table must be on metal"),
@@ -4235,9 +4321,13 @@ impl lloom_tensor::CustomOp3 for FlashDecoding<'_> {
                 };
                 (
                     t,
-                    tl.start_offset() * u32_bytes,
+                    spans.expect("checked before builders").table.offset_bytes,
                     n,
-                    nl.start_offset() * u32_bytes,
+                    spans
+                        .expect("checked before builders")
+                        .keys
+                        .expect("checked bound counts")
+                        .offset_bytes,
                 )
             }
             (None, Some(t), Some(n)) => {
@@ -4386,6 +4476,7 @@ pub fn flash_decoding(
         scratch_sizing,
         reserve_chunks,
         geometry: None,
+        metadata_spans: None,
     }
     .apply(q, k, v)
 }
@@ -4440,6 +4531,7 @@ pub fn flash_decoding_paged_ragged(
         scratch_sizing,
         reserve_chunks,
         geometry: None,
+        metadata_spans: None,
     }
     .apply(q, k, v)
 }
@@ -4495,12 +4587,8 @@ pub fn flash_decoding_paged_view(
     metadata: &FlashDecodingMetadataView<'_>,
 ) -> Result<Tensor> {
     let (tables_t, n_keys_t) = metadata.bindings();
-    // Both private tensors were constructed by the same publication on one
-    // device. Unlike Q/K/V, metadata is not an apply_op3 operand, so its
-    // query-device match must be checked here, before any native allocation.
-    if !tables_t.device().same_device(q.device()) {
-        lloom_tensor::bail!("flash-decoding: metadata must share the query device")
-    }
+    // Device/layout/offset checks share the same apply preflight as the legacy
+    // bindings. Publication ownership alone does not prove this layer's match.
     let (page_size, pages_per_chunk) = metadata.page_geometry();
     FlashDecoding {
         scale,
@@ -4518,6 +4606,7 @@ pub fn flash_decoding_paged_view(
         scratch_sizing,
         reserve_chunks,
         geometry: None,
+        metadata_spans: None,
     }
     .apply(q, k, v)
 }
@@ -4546,19 +4635,6 @@ pub fn flash_decoding_paged_ragged_bound(
     tables_t: &Tensor,
     n_keys_t: &Tensor,
 ) -> Result<Tensor> {
-    if tables_t.dtype() != DType::U32 || n_keys_t.dtype() != DType::U32 {
-        lloom_tensor::bail!("flash-decoding: the bound table and live counts must be U32");
-    }
-    if tables_t.elem_count() < table.len() || n_keys_t.elem_count() < n_keys.len() {
-        lloom_tensor::bail!(
-            "flash-decoding: the bound table ({}) or live counts ({}) are shorter than the host's \
-             ({}, {})",
-            tables_t.elem_count(),
-            n_keys_t.elem_count(),
-            table.len(),
-            n_keys.len()
-        );
-    }
     FlashDecoding {
         scale,
         softcapping,
@@ -4575,6 +4651,7 @@ pub fn flash_decoding_paged_ragged_bound(
         scratch_sizing,
         reserve_chunks,
         geometry: None,
+        metadata_spans: None,
     }
     .apply(q, k, v)
 }
@@ -4631,16 +4708,6 @@ pub fn flash_decoding_paged_resident(
     n_keys: usize,
     table_t: Option<&Tensor>,
 ) -> Result<Tensor> {
-    if let Some(t) = table_t {
-        if t.dtype() != DType::U32 || t.elem_count() < table.len() {
-            lloom_tensor::bail!(
-                "flash-decoding: the resident table must be U32 and hold the host's {} entries \
-                 (has {})",
-                table.len(),
-                t.elem_count()
-            );
-        }
-    }
     FlashDecoding {
         scale,
         softcapping,
@@ -4659,6 +4726,7 @@ pub fn flash_decoding_paged_resident(
         scratch_sizing,
         reserve_chunks,
         geometry: None,
+        metadata_spans: None,
     }
     .apply(q, k, v)
 }
@@ -5446,6 +5514,105 @@ mod flash_decoding_validation_tests {
                 usize::MAX,
             ),
             "flash-decoding: live count exceeds U32",
+        );
+        Ok(())
+    }
+
+    fn bound_metadata_frontdoor(
+        table: &[u32],
+        stride: usize,
+        keys: &[u32],
+        table_t: &Tensor,
+        keys_t: &Tensor,
+    ) -> Result<Tensor> {
+        let q = tensor([keys.len(), 1, 1, 64])?;
+        let k = tensor([1, 1, 1024, 64])?;
+        let v = tensor([1, 1, 1024, 64])?;
+        flash_decoding_paged_ragged_bound(
+            &q,
+            &k,
+            &v,
+            1.,
+            1.,
+            256,
+            1,
+            FlashScratchSizing::Grow,
+            0,
+            table,
+            stride,
+            keys,
+            table_t,
+            keys_t,
+        )
+    }
+
+    #[test]
+    fn flash_metadata_bound_table_layout_refuses_before_backend() -> Result<()> {
+        let table = Tensor::new(&[[0u32, 99], [1, 99]], &Device::Cpu)?.narrow(1, 0, 1)?;
+        let keys = Tensor::new(&[257u32], &Device::Cpu)?;
+        refuses(
+            bound_metadata_frontdoor(&[0, 1], 2, &[257], &table, &keys),
+            "metadata table must be contiguous",
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn flash_metadata_bound_counts_layout_refuses_before_backend() -> Result<()> {
+        let table = Tensor::new(&[0u32, 0], &Device::Cpu)?;
+        let keys = Tensor::new(&[[1u32, 99], [1, 99]], &Device::Cpu)?.narrow(1, 0, 1)?;
+        refuses(
+            bound_metadata_frontdoor(&[0, 0], 1, &[1, 1], &table, &keys),
+            "metadata live counts must be contiguous",
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn flash_metadata_resident_table_layout_refuses_before_backend() -> Result<()> {
+        let q = tensor([1, 1, 1, 64])?;
+        let k = tensor([1, 1, 1024, 64])?;
+        let v = tensor([1, 1, 1024, 64])?;
+        let table = Tensor::new(&[[0u32, 99], [1, 99]], &Device::Cpu)?.narrow(1, 0, 1)?;
+        refuses(
+            flash_decoding_paged_resident(
+                &q,
+                &k,
+                &v,
+                1.,
+                1.,
+                256,
+                1,
+                FlashScratchSizing::Grow,
+                0,
+                &[0, 1],
+                2,
+                257,
+                Some(&table),
+            ),
+            "metadata table must be contiguous",
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn flash_metadata_nonzero_offsets_and_padded_rows_reach_backend() -> Result<()> {
+        let table = Tensor::new(&[99u32, 2, 100, 0, 3, 99], &Device::Cpu)?.narrow(0, 1, 4)?;
+        let keys = Tensor::new(&[99u32, 1, 257, 99], &Device::Cpu)?.narrow(0, 1, 2)?;
+        refuses(
+            bound_metadata_frontdoor(&[2, 100, 0, 3], 2, &[1, 257], &table, &keys),
+            "no cpu support for metal-flash-decoding",
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn flash_metadata_unused_logical_tail_remains_supported() -> Result<()> {
+        let table = Tensor::new(&[99u32, 0, 88, 77, 66], &Device::Cpu)?.narrow(0, 1, 4)?;
+        let keys = Tensor::new(&[99u32, 1, 55, 44], &Device::Cpu)?.narrow(0, 1, 3)?;
+        refuses(
+            bound_metadata_frontdoor(&[0], 0, &[1], &table, &keys),
+            "no cpu support for metal-flash-decoding",
         );
         Ok(())
     }

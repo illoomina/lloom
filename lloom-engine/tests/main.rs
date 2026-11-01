@@ -24,6 +24,7 @@ mod machine_gate;
 mod qwen4exp_served_auto;
 mod recovery_frontier_served;
 mod sampling_host_contract;
+mod static_batch_recovery;
 mod tiny_chat_e2e;
 mod tiny_templates;
 mod turn_reuse;

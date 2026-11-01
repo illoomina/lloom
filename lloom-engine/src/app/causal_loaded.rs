@@ -205,12 +205,7 @@ pub trait Recovery<M: CausalLM>: Send + Sync {
 pub struct AssociatedDeviceRecovery;
 impl<M: CausalLM> Recovery<M> for AssociatedDeviceRecovery {
     fn before_reuse(&self, _model: &M, device: &Device) -> Result<()> {
-        #[cfg(feature = "metal")]
-        if let Device::Metal(device) = device {
-            let marker = device.flush_marker()?;
-            return device.wait_marker_prefix_data(&marker);
-        }
-        device.synchronize()
+        crate::recovery::fence_failed_execution(device)
     }
 }
 

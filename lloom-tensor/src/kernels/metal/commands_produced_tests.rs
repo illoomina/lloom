@@ -2164,6 +2164,80 @@ fn a_bound_refusal_is_latched_when_a_close_refuses_after_it() {
     // A failed queue's teardown quarantines and retains its Core by design.
 }
 
+/// The re-homed IO behind a cancelled signal survives a close refusal. A
+/// held recording carries an IO load's compute signal (`commit_io_after`
+/// deferred the IO buffer behind it); its producer gives up while the
+/// current recording has an open encoder whose close refuses. The load is
+/// still committed behind a signal re-issued on the queue, and lands. Before
+/// the re-homed list was placed ahead of the closes, the refusal's early exit
+/// dropped it and the IO buffer was never committed (#944 decision-99 lane,
+/// the dev defect beside lane C's §3).
+#[test]
+fn a_close_refusal_keeps_the_rehomed_io_behind_a_cancelled_signal() {
+    use crate::kernels::metal::io_queue::{IoLoad, IoQueue};
+    const LEN: usize = 64 * 1024;
+    let f = fixture();
+    if f.commands.host_input_arm() == HostInputArm::GpuWait {
+        eprintln!("NOT_APPLICABLE nothing is held on the gpu-wait arm");
+        return;
+    }
+    let bytes: Vec<u8> = (0..LEN).map(|i| (i * 31 % 251) as u8).collect();
+    let path = std::env::temp_dir().join(format!(
+        "lloom-d99-rehome-{}-{}.bin",
+        f.commands.actual_command_api(),
+        std::process::id()
+    ));
+    std::fs::write(&path, &bytes).unwrap();
+    let queue = IoQueue::new(&f.native).unwrap();
+    let file = queue.open(&path).unwrap();
+    let dst = f
+        .native
+        .new_buffer(LEN, super::super::MTLResourceOptions::StorageModeShared)
+        .unwrap();
+    // The held recording: the gated compute, then the load's compute signal.
+    f.commands.commit_when_produced(&f.gate, 1).unwrap();
+    encode_compute(&f);
+    let before = queue.signaled();
+    let value = queue
+        .issue(
+            &f.commands,
+            &[IoLoad {
+                dst: &dst,
+                dst_offset: 0,
+                file: &file,
+                src_offset: 0,
+                len: LEN,
+            }],
+        )
+        .unwrap();
+    let held = f.commands.produced_stats().held_now;
+    assert!(held >= 1, "the signal's recording was not held");
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(queue.signaled(), before, "the load ran before its signal");
+    // An open encoder on the current recording; its close refuses.
+    encode_compute(&f);
+    f.commands
+        .core
+        .submission_control
+        .arm(submission_test::Fault::CloseRefusal);
+    let cancelled = f
+        .commands
+        .cancel_produced(&f.gate, "test: the producer gave up");
+    let landed = until(Duration::from_secs(5), || queue.signaled() >= value);
+    // SAFETY: a CPU-mapped Shared buffer of LEN bytes; its only writer, the
+    // load, has signalled (or never ran).
+    let got = unsafe { std::slice::from_raw_parts(dst.contents() as *const u8, LEN) };
+    let right = got == bytes.as_slice();
+    eprintln!(
+        "REHOME_AFTER_CLOSE_REFUSAL api={} held={held} cancel={cancelled:?} landed={landed} bytes_right={right}",
+        f.commands.actual_command_api()
+    );
+    std::fs::remove_file(&path).ok();
+    assert!(cancelled.is_err(), "the close refusal was not reported");
+    assert!(landed, "REHOMED_IO_SURVIVES_A_CLOSE_REFUSAL");
+    assert!(right, "REHOMED_IO_LANDS_THE_FILES_BYTES");
+}
+
 /// One held reader per gate, each on an event of its own: the dependent
 /// compute recorded behind `commit_when_produced(event, 1)`, then cut. Its
 /// marker and the epoch the cut took.

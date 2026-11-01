@@ -38,7 +38,8 @@ enum NoiseInput<'a> {
 }
 
 pub struct PreparedSampler {
-    kept: MetalStorage,
+    scratch_ids: MetalStorage,
+    work: MetalStorage,
     selection_status: MetalStorage,
     weights: MetalStorage,
     result: PrivateMultinomial,
@@ -73,10 +74,13 @@ impl PreparedSampler {
         {
             crate::bail!("prepared sampling: capacity/vocabulary");
         }
+        let work = crate::kernels::kernels::sampling_topk::sampling_work_words(capacity, vocab)
+            .and_then(|n| n.checked_mul(4));
         capacity
             .checked_mul(vocab)
             .and_then(|n| n.checked_mul(12))
             .and_then(|n| capacity.checked_mul(36).and_then(|r| n.checked_add(r)))
+            .and_then(|n| work.and_then(|w| n.checked_add(w)))
             .filter(|&n| n <= isize::MAX as usize)
             .ok_or_else(|| crate::Error::Msg("prepared sampling payload overflow".into()))
     }
@@ -94,8 +98,11 @@ impl PreparedSampler {
                 .build()?;
             MetalStorage::new_allocated(buffer, device.clone(), count, dtype)
         };
+        let words = crate::kernels::kernels::sampling_topk::sampling_work_words(capacity, vocab)
+            .ok_or_else(|| crate::Error::Msg("prepared sampling scratch overflow".into()))?;
         Ok(Self {
-            kept: allocate(elements, DType::U32, "sampling_prepared_k")?,
+            scratch_ids: allocate(elements, DType::U32, "sampling_prepared_scratch_ids")?,
+            work: allocate(words, DType::U32, "sampling_prepared_work")?,
             selection_status: allocate(capacity * 4, DType::U32, "sampling_prepared_k_status")?,
             weights: allocate(elements, DType::F32, "sampling_prepared_weights")?,
             result: PrivateMultinomial {
@@ -137,11 +144,11 @@ impl PreparedSampler {
             || self
                 .last_use
                 .get()
-                .is_some_and(|e| !self.kept.device().gpu_clock().is_complete(e))
+                .is_some_and(|e| !self.scratch_ids.device().gpu_clock().is_complete(e))
         {
             crate::bail!("prepared sampling: busy or poisoned slot");
         }
-        let device = self.kept.device();
+        let device = self.scratch_ids.device();
         device
             .commands()
             .check_failed_atomic()
@@ -161,7 +168,7 @@ impl PreparedSampler {
         p: f64,
     ) -> Result<ValidatedRequest> {
         self.check_reuse()?;
-        let device = self.kept.device();
+        let device = self.scratch_ids.device();
         let (vocab, elements, rows, offset, _) = scores.sampling_topk_geometry(layout)?;
         if vocab != self.vocab || rows > self.capacity || !scores.device().same_device(device) {
             crate::bail!("prepared sampling: capacity/device/vocabulary mismatch");
@@ -189,10 +196,11 @@ impl PreparedSampler {
     // it may replace the executor, close an allocation context, or poison the
     // shared guard through a reentrant consumer. Nothing is uploaded first.
     fn check_custody(&self, guard: &SampleGuard) -> Result<()> {
-        let device = self.kept.device();
+        let device = self.scratch_ids.device();
         let origin = device.allocation_origin()?;
         for output in [
-            &self.kept,
+            &self.scratch_ids,
+            &self.work,
             &self.selection_status,
             &self.weights,
             &self.result.ids,
@@ -229,7 +237,7 @@ impl PreparedSampler {
             rows,
             ..
         } = request;
-        let origin = self.kept.device().allocation_origin()?;
+        let origin = self.scratch_ids.device().allocation_origin()?;
         let count = if gumbel { elements } else { rows };
         let noise = self
             .noise
@@ -248,7 +256,7 @@ impl PreparedSampler {
             .storage
             .device()
             .declared_allocation_origin()
-            .validate_reuse(&self.kept.device().allocation_origin()?)?;
+            .validate_reuse(&self.scratch_ids.device().allocation_origin()?)?;
         let values = &noise.values[..count];
         // SAFETY: setup owns contiguous F32 Shared storage at offset zero;
         // the retained MetalStorage owns the same allocation as the cold tensor.
@@ -318,7 +326,7 @@ impl PreparedSampler {
             inv,
             p,
         } = request;
-        let device = self.kept.device();
+        let device = self.scratch_ids.device();
         let (input, input_offset, count, gumbel) = match noise {
             NoiseInput::Supplied(draw) => {
                 let (input, input_layout, gumbel) = match draw {
@@ -349,7 +357,8 @@ impl PreparedSampler {
         let input_range = span(input, DType::F32, input_offset, count)?;
         let score_range = span(scores, DType::F32, layout.start_offset(), elements)?;
         for output in [
-            &self.kept,
+            &self.scratch_ids,
+            &self.work,
             &self.selection_status,
             &self.weights,
             &self.result.ids,
@@ -370,7 +379,7 @@ impl PreparedSampler {
             // SAFETY: preflight above checked all spans/scalars/devices; setup
             // owns disjoint scratch/results and reuse requires last completion.
             unsafe {
-                crate::kernels::kernels::sampling_topk::call_sampling_topk_mask(
+                crate::kernels::kernels::sampling_topk::call_sampling_select(
                     device.metal_device(),
                     &encoder,
                     device.kernels(),
@@ -378,7 +387,9 @@ impl PreparedSampler {
                     rows as u32,
                     vocab as u32,
                     k.min(vocab) as u32,
-                    self.kept.buffer(),
+                    u32::from(p != 1.0),
+                    self.work.buffer(),
+                    self.scratch_ids.buffer(),
                     self.selection_status.buffer(),
                 )
             }
@@ -408,8 +419,8 @@ impl PreparedSampler {
                     p as f32,
                     u32::from(p != 1.0),
                     (input.buffer(), input_offset * 4),
-                    self.kept.buffer(),
-                    self.selection_status.buffer(),
+                    self.work.buffer(),
+                    self.scratch_ids.buffer(),
                     self.weights.buffer(),
                     self.result.support.buffer(),
                     self.result.ids.buffer(),
@@ -578,7 +589,8 @@ mod tests {
     }
 
     #[test]
-    fn persistent_sampler_construction_during_served_pass_declares_all_six_escapes() -> Result<()> {
+    fn persistent_sampler_construction_during_served_pass_declares_all_seven_escapes() -> Result<()>
+    {
         use crate::kernels::metal::{ArenaLayout, PassKey, PassKind};
         let d = device()?;
         let m = d.as_metal_device()?;
@@ -599,8 +611,8 @@ mod tests {
                         "persistent slot served from ordinal"
                     );
                     assert!(
-                        after.declined_escaped - before.declined_escaped >= 6,
-                        "all six private slots must escape: {before:?} -> {after:?}"
+                        after.declined_escaped - before.declined_escaped >= 7,
+                        "all seven private slots must escape: {before:?} -> {after:?}"
                     );
                 }
                 let y = x.affine(2., 1.)?;

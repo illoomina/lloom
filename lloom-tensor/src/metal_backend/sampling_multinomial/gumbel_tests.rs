@@ -48,7 +48,8 @@ fn checked_encode(
     let census = window.close();
     assert_eq!(readback_counts(), before, "primitive readback");
     let n = u64::from(result.is_ok() && l.dims().iter().all(|&d| d != 0));
-    for name in ["sampling_topk_mask_f32", "sampling_filtered_gumbel_f32"] {
+    use crate::kernels::kernels::sampling_topk::{GUMBEL_KERNELS, SELECT_KERNELS};
+    for name in SELECT_KERNELS.iter().chain(GUMBEL_KERNELS) {
         assert_eq!(
             census
                 .iter()
@@ -61,7 +62,7 @@ fn checked_encode(
     }
     assert_eq!(
         census.iter().map(|(_, n)| *n).sum::<u64>(),
-        2 * n,
+        (SELECT_KERNELS.len() + GUMBEL_KERNELS.len()) as u64 * n,
         "{census:?}"
     );
     result
@@ -532,6 +533,10 @@ fn raw_abi_offsets_scratch_initialization_and_canaries() -> Result<()> {
     let support = make(rows * v)?;
     let ids = make(rows)?;
     let status = make(4 * rows)?;
+    let words = crate::kernels::kernels::sampling_topk::sampling_work_words(rows, v).unwrap();
+    let work = make(words)?;
+    let scratch = make(rows * v)?;
+    let selection = make(4 * rows)?;
     {
         let (zs, _) = input.storage_and_layout();
         let (gs, _) = g.storage_and_layout();
@@ -539,6 +544,9 @@ fn raw_abi_offsets_scratch_initialization_and_canaries() -> Result<()> {
         let (ms, _) = support.storage_and_layout();
         let (is, _) = ids.storage_and_layout();
         let (ss, _) = status.storage_and_layout();
+        let (wk, _) = work.storage_and_layout();
+        let (sc, _) = scratch.storage_and_layout();
+        let (sel, _) = selection.storage_and_layout();
         let (
             Storage::Metal(z),
             Storage::Metal(g),
@@ -546,34 +554,52 @@ fn raw_abi_offsets_scratch_initialization_and_canaries() -> Result<()> {
             Storage::Metal(mask),
             Storage::Metal(id),
             Storage::Metal(s),
-        ) = (&*zs, &*gs, &*ws, &*ms, &*is, &*ss)
+            Storage::Metal(wk),
+            Storage::Metal(sc),
+            Storage::Metal(sel),
+        ) = (&*zs, &*gs, &*ws, &*ms, &*is, &*ss, &*wk, &*sc, &*sel)
         else {
             unreachable!()
         };
-        let (k, ks) = z.sampling_topk_mask(&Layout::contiguous_with_offset((rows, v), 1), 2)?;
         let m = z.device();
         let encoder = m.command_encoder()?;
         // SAFETY: all inputs/outputs disjoint and sized with guard tails,
-        // selector belongs to these exact rows, live storage retains custody.
+        // the selection belongs to these exact rows, live storage retains
+        // custody.
         unsafe {
-            crate::kernels::kernels::sampling_topk::call_sampling_filtered_gumbel_f32(
+            crate::kernels::kernels::sampling_topk::call_sampling_select(
                 m.metal_device(),
                 &encoder,
                 m.kernels(),
                 (z.buffer(), 4),
                 rows as u32,
                 v as u32,
-                1.0,
-                1.0,
+                2,
                 0,
-                (g.buffer(), 4),
-                k.buffer(),
-                ks.buffer(),
-                w.buffer(),
-                mask.buffer(),
-                id.buffer(),
-                s.buffer(),
+                wk.buffer(),
+                sc.buffer(),
+                sel.buffer(),
             )
+            .and_then(|()| {
+                crate::kernels::kernels::sampling_topk::call_sampling_filtered_gumbel_f32(
+                    m.metal_device(),
+                    &encoder,
+                    m.kernels(),
+                    (z.buffer(), 4),
+                    rows as u32,
+                    v as u32,
+                    1.0,
+                    1.0,
+                    0,
+                    (g.buffer(), 4),
+                    wk.buffer(),
+                    sc.buffer(),
+                    w.buffer(),
+                    mask.buffer(),
+                    id.buffer(),
+                    s.buffer(),
+                )
+            })
         }
         .map_err(crate::Error::wrap)?;
     }
@@ -685,4 +711,64 @@ fn queued_score_and_noise_producers_draw_diagnostic_consumers_same_encoder() -> 
 #[test]
 fn queued_score_and_noise_producers_draw_diagnostic_consumers_forced_cuts() -> Result<()> {
     dependency(true)
+}
+
+/// The device Gumbel draws over 16 000 variate rows have the reference's
+/// distribution (dispatch §11.2j's χ²), on the multinomial test's cells:
+/// Gumbel-max over the kept set samples the same categorical. Control: the
+/// same draws against the distribution with the temperature dropped fail.
+#[test]
+fn device_gumbel_draws_have_the_reference_distribution() -> Result<()> {
+    use super::tests::{chi_square, chi_square_cells, reference_distribution, splitmix};
+    let d = device()?;
+    let (n, rows) = (16_000usize, 2_000usize);
+    const CHI2_999: [f64; 21] = [
+        0.0, 10.828, 13.816, 16.266, 18.467, 20.515, 22.458, 24.322, 26.124, 27.877, 29.588,
+        31.264, 32.909, 34.528, 36.123, 37.697, 39.252, 40.790, 42.312, 43.820, 45.315,
+    ];
+    for (what, z, p) in chi_square_cells() {
+        let v = z.len();
+        let want = reference_distribution(&z, p);
+        let mut s = 0x6b5u64;
+        let mut draws = Vec::with_capacity(n);
+        for _ in 0..n / rows {
+            // The production noise: f32(-ln(-ln u)), u uniform in
+            // [1e-9, 0.9999999) in f64, one variate per vocabulary id.
+            let noise: Vec<f32> = (0..rows * v)
+                .map(|_| {
+                    let u = ((splitmix(&mut s) >> 11) as f64 / (1u64 << 53) as f64)
+                        .clamp(1e-9, 0.999_999_9);
+                    (-(-u.ln()).ln()) as f32
+                })
+                .collect();
+            let input = Tensor::from_vec(z.repeat(rows), (rows, v), &d)?;
+            let g = Tensor::from_vec(noise.clone(), (rows, v), &d)?;
+            let got = read(encode(&input, p, &g)?)?;
+            for (row, &id) in got.ids.iter().enumerate() {
+                assert_eq!(
+                    id,
+                    reference(&z, p, &noise[row * v..(row + 1) * v]),
+                    "{what} row {row}"
+                );
+            }
+            draws.extend(got.ids);
+        }
+        let (chi2, df, outside) = chi_square(&draws, &want);
+        assert!(
+            (2..CHI2_999.len()).contains(&df),
+            "{what}: support {}",
+            df + 1
+        );
+        println!(
+            "CHI2 device gumbel {what} T={} k={} p={} chi2={chi2:.2} df={df} critical={} outside={outside}",
+            p.temperature, p.k, p.p, CHI2_999[df]
+        );
+        assert_eq!(outside, 0, "{what} {p:?}: drew outside the kept set");
+        assert!(chi2 < CHI2_999[df], "{what} {p:?}: chi2 {chi2}");
+        let cold = reference_distribution(&z, Params::new(1.0, p.k, p.p));
+        let (chi2, _, _) = chi_square(&draws, &cold);
+        println!("CHI2-CONTROL device gumbel {what} T dropped: chi2={chi2:.2}");
+        assert!(chi2 > CHI2_999[df], "{what}: T = 1 passed at {chi2}");
+    }
+    Ok(())
 }

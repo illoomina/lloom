@@ -113,171 +113,532 @@ inline float sampling_weight_from_bits(uint scaled) {
     return sampling_exp32(as_type<float>(scaled));
 }
 
-// Contract lanes retain their original vocabulary positions even on sparse
-// sets; the threadgroup width only schedules those 1024 logical lanes.
-inline float sampling_mass(
-    device const uint *scores, device const uint *kept,
-    device const float *weights, uint vocab, ulong cutoff, uint last_id,
-    threadgroup float *lanes, threadgroup float *groups,
-    uint tid, uint width
+inline float sampling_weight(uint bits, uint m, uint inv_t_bits) {
+    uint delta = sampling_sub_bits(bits, m);
+    uint scaled = sampling_mul_bits(delta, inv_t_bits);
+    return sampling_weight_from_bits(scaled);
+}
+
+// The contract's lane fold of the weights whose key is at least `cutoff`,
+// over the ids up to `last_id`: 1024 lanes of ceil(V / 1024) consecutive ids,
+// each folded left to right from +0. The weights are already zero outside
+// K, so the kept test is the key alone. Emulated by `width` threads.
+inline void sampling_lane_sums(
+    device const uint *scores, device const float *weights, uint vocab,
+    ulong cutoff, uint last_id, threadgroup float *lanes, uint tid, uint width
 ) {
     ulong chunk = (ulong(vocab) + 1023ul) / 1024ul;
-    for (uint lane = tid; lane < 1024; lane += width) {
+    for (uint lane = tid; lane < 1024u; lane += width) {
         ulong lo = min(ulong(lane) * chunk, ulong(vocab));
         ulong hi = min(lo + chunk, ulong(vocab));
         volatile float sum = 0.0f;
         for (ulong i = lo; i < hi; ++i) {
-            float term = kept[i] != 0u && uint(i) <= last_id
+            float term = uint(i) <= last_id
                        && sampling_topk_key(scores[i], uint(i)) >= cutoff
                        ? weights[i] : 0.0f;
             sum = sum + term;
         }
         lanes[lane] = sum;
     }
+}
+
+// The 32 groups of 32 lanes, each folded left to right, then the groups.
+inline float sampling_fold_lanes(
+    threadgroup const float *lanes, threadgroup float *groups, uint tid, uint width
+) {
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint group = tid; group < 32; group += width) {
+    for (uint group = tid; group < 32u; group += width) {
         volatile float sum = 0.0f;
-        for (uint lane = 0; lane < 32; ++lane)
-            sum = sum + lanes[group * 32 + lane];
+        for (uint lane = 0u; lane < 32u; ++lane)
+            sum = sum + lanes[group * 32u + lane];
         groups[group] = sum;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     volatile float total = 0.0f;
-    for (uint group = 0; group < 32; ++group) total = total + groups[group];
+    for (uint group = 0u; group < 32u; ++group) total = total + groups[group];
     threadgroup_barrier(mem_flags::mem_threadgroup);
     return total;
 }
 
-// Both private draws consume this exact processed-score preparation. The
-// caller has already checked the selector status and its variates.
-struct SamplingPrepared {
-    ulong cutoff;
-    float total;
-    uint maximum;
-};
-
-inline SamplingPrepared sampling_prepare_support(
-    device const uint *z, device const uint *k, device float *w,
-    uint vocab, uint inv_t_bits, uint p_bits, uint filter_p,
-    threadgroup float *lanes, threadgroup float *groups,
-    threadgroup ulong *maxima, uint tid, uint width
+inline float sampling_mass(
+    device const uint *scores, device const float *weights, uint vocab,
+    ulong cutoff, uint last_id, threadgroup float *lanes, threadgroup float *groups,
+    uint tid, uint width
 ) {
-    ulong best = 0ul;
-    for (ulong i = tid; i < vocab; i += width)
-        if (k[i] != 0u) best = max(best, sampling_topk_key(z[i], uint(i)));
-    maxima[tid] = best;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    best = 0ul;
-    for (uint t = 0; t < width; ++t) best = max(best, maxima[t]);
-    uint top_id = ~uint(best);
-    uint m = z[top_id];
-    for (ulong i = tid; i < vocab; i += width) {
-        float weight = 0.0f;
-        if (k[i] != 0u) {
-            uint delta = sampling_sub_bits(z[i], m);
-            uint scaled = sampling_mul_bits(delta, inv_t_bits);
-            weight = sampling_weight_from_bits(scaled);
-        }
-        w[i] = weight;
-    }
-    threadgroup_barrier(mem_flags::mem_device);
-    ulong cutoff = 0ul;
-    if (filter_p != 0u) {
-        float total = sampling_mass(z, k, w, vocab, 0ul, vocab - 1u,
-                                    lanes, groups, tid, width);
-        float target = as_type<float>(sampling_mul_bits(p_bits, as_type<uint>(total)));
-        ulong lo = 0ul, hi = best;
-        while (lo < hi) {
-            ulong mid = lo + (hi - lo) / 2ul + (hi - lo) % 2ul;
-            float mass = sampling_mass(z, k, w, vocab, mid, vocab - 1u,
-                                       lanes, groups, tid, width);
-            if (mass >= target) lo = mid;
-            else hi = mid - 1ul;
-        }
-        cutoff = lo;
-    }
-    float total = sampling_mass(z, k, w, vocab, cutoff, vocab - 1u,
-                               lanes, groups, tid, width);
-    return {cutoff, total, m};
+    sampling_lane_sums(scores, weights, vocab, cutoff, last_id, lanes, tid, width);
+    return sampling_fold_lanes(lanes, groups, tid, width);
 }
 
-// Mechanism: exact key-threshold bisection for the conditional nucleus,
-// then exact token-id-prefix bisection for one supplied uniform. Neither
-// search depends on k fitting local scratch. The top-k stage owns validation
-// of the entire score row, including scores outside K.
-// Private status: (0 ok / 1 NaN / 2 +inf / 3 empty / 4 bad uniform /
-// 5 invalid mass, first bad score id or UINT_MAX, finite count, support count).
-// Refusal always writes UINT_MAX as id and an empty support, never a candidate.
-kernel void sampling_multinomial_f32(
+// The nucleus over a kept set too large for the compact path: the largest key
+// threshold whose mass reaches the target, by bisection over the key space,
+// each step one full row pass. Exact and slow; `W_FALLBACK` records it.
+inline ulong sampling_nucleus_bisect(
+    device const uint *scores, device const float *weights, uint vocab, ulong best,
+    float target, threadgroup float *lanes, threadgroup float *groups, uint tid, uint width
+) {
+    ulong lo = 0ul, hi = best;
+    while (lo < hi) {
+        ulong mid = lo + (hi - lo) / 2ul + (hi - lo) % 2ul;
+        float mass = sampling_mass(scores, weights, vocab, mid, vocab - 1u,
+                                   lanes, groups, tid, width);
+        if (mass >= target) lo = mid;
+        else hi = mid - 1ul;
+    }
+    return lo;
+}
+
+// The compact kept set in threadgroup memory: members in appended order with
+// their score bits and weights, each member's rank by key (0 = the top) and
+// the id order (`order[q]` = the member with the q-th smallest id).
+struct SamplingCompact {
+    threadgroup uint *id;
+    threadgroup uint *score;
+    threadgroup float *weight;
+    threadgroup uint *rank;
+    threadgroup uint *order;
+    uint n;
+    uint chunk;
+};
+
+inline void sampling_compact_load(
+    SamplingCompact c, device const uint *scores, device const float *weights,
+    device const uint *members, uint tid, uint width
+) {
+    for (uint j = tid; j < c.n; j += width) {
+        uint id = members[j];
+        c.id[j] = id;
+        c.score[j] = scores[id];
+        c.weight[j] = weights[id];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint j = tid; j < c.n; j += width) {
+        ulong mine = sampling_topk_key(c.score[j], c.id[j]);
+        uint above = 0u, before = 0u;
+        for (uint i = 0u; i < c.n; ++i) {
+            above += uint(sampling_topk_key(c.score[i], c.id[i]) > mine);
+            before += uint(c.id[i] < c.id[j]);
+        }
+        c.rank[j] = above;
+        c.order[before] = j;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+}
+
+// mass(R_j ∩ [0, id of the q-th member in id order]) over the compact set:
+// the contract's fold with the lanes and groups no member touches skipped
+// (an absent id adds +0 exactly). One thread, O(q).
+inline float sampling_compact_mass(SamplingCompact c, uint j, uint q_last) {
+    volatile float total = 0.0f;
+    volatile float group = 0.0f;
+    volatile float lane = 0.0f;
+    uint cur_lane = 0xffffffffu, cur_group = 0xffffffffu;
+    for (uint q = 0u; q <= q_last; ++q) {
+        uint member = c.order[q];
+        if (c.rank[member] >= j) continue;
+        uint l = c.id[member] / c.chunk;
+        uint g = l / 32u;
+        if (l != cur_lane) {
+            if (cur_lane != 0xffffffffu) group = group + lane;
+            if (g != cur_group) {
+                if (cur_group != 0xffffffffu) total = total + group;
+                group = 0.0f;
+                cur_group = g;
+            }
+            lane = 0.0f;
+            cur_lane = l;
+        }
+        lane = lane + c.weight[member];
+    }
+    if (cur_lane != 0xffffffffu) {
+        group = group + lane;
+        total = total + group;
+    }
+    return total;
+}
+
+// The prefix of the full-row lane sums up to lane `L` inclusive, with lane L
+// itself replaced by `partial`: the contract's fold of groups then lanes.
+inline float sampling_lane_prefix(
+    threadgroup const float *lanes, threadgroup const float *groups, uint L, float partial
+) {
+    uint g = L / 32u;
+    volatile float total = 0.0f;
+    for (uint i = 0u; i < g; ++i) total = total + groups[i];
+    volatile float part = 0.0f;
+    for (uint l = g * 32u; l < L; ++l) part = part + lanes[l];
+    part = part + partial;
+    return total + part;
+}
+
+// Stage 5: the weights of K, zero elsewhere; the compact set's members
+// appended; the Gumbel variates checked. One thread per id.
+kernel void sampling_weights_f32(
     device const uint *scores [[buffer(0)]],
     constant uint &vocab [[buffer(1)]],
     constant uint &inv_t_bits [[buffer(2)]],
-    constant uint &p_bits [[buffer(3)]],
-    constant uint &filter_p [[buffer(4)]],
-    device const uint *uniforms [[buffer(5)]],
-    device const uint *kept [[buffer(6)]],
-    device const uint *selection_status [[buffer(7)]],
-    device float *weight_scratch [[buffer(8)]],
-    device uint *support [[buffer(9)]],
-    device uint *ids [[buffer(10)]],
-    device uint *status [[buffer(11)]],
-    uint row [[threadgroup_position_in_grid]],
-    uint tid [[thread_position_in_threadgroup]],
-    uint width [[threads_per_threadgroup]]
+    constant uint &gumbel [[buffer(3)]],
+    device const uint *variates [[buffer(4)]],
+    device uint *work [[buffer(5)]],
+    device atomic_uint *work_atomic [[buffer(6)]],
+    device uint *members [[buffer(7)]],
+    device float *weights [[buffer(8)]],
+    uint2 tg [[threadgroup_position_in_grid]],
+    uint2 tid2 [[thread_position_in_threadgroup]],
+    uint2 width2 [[threads_per_threadgroup]]
 ) {
+    uint tid = tid2.x;
+    uint width = width2.x;
+    uint row = tg.y;
+    uint i = tg.x * width + tid;
+    if (i >= vocab) return;
+    ulong base = sampling_word_offset(row, vocab, 0u);
+    device const uint *words = work + base;
+    device float *w = weights + ulong(row) * vocab;
+    if (words[W_CODE] != 0u) {
+        w[i] = 0.0f;
+        return;
+    }
+    uint bits = scores[ulong(row) * vocab + i];
+    bool finite = sampling_topk_finite(bits);
+    ulong key = sampling_topk_key(bits, i);
+    bool member = finite && key >= sampling_key_pair(words, W_CUTK_LO);
+    w[i] = member ? sampling_weight(bits, words[W_M], inv_t_bits) : 0.0f;
+    if (words[W_COMPACT_ON] != 0u && finite && key >= sampling_key_pair(words, W_CUTS_LO)) {
+        uint at = atomic_fetch_add_explicit(work_atomic + base + W_COMPACT, 1u,
+                                            memory_order_relaxed);
+        if (at < SAMPLING_CAP) members[ulong(row) * vocab + at] = i;
+        else atomic_store_explicit(work_atomic + base + W_COMPACT_OVER, 1u, memory_order_relaxed);
+    }
+    if (gumbel != 0u && !sampling_topk_finite(variates[ulong(row) * vocab + i]))
+        atomic_fetch_min_explicit(work_atomic + base + W_GBAD, i, memory_order_relaxed);
+}
+
+// Stage 6: the contract's 1024 lane sums over K, one thread per lane.
+kernel void sampling_lanes_f32(
+    constant uint &vocab [[buffer(0)]],
+    device uint *work [[buffer(1)]],
+    device const float *weights [[buffer(2)]],
+    uint2 tg [[threadgroup_position_in_grid]],
+    uint2 tid2 [[thread_position_in_threadgroup]],
+    uint2 width2 [[threads_per_threadgroup]]
+) {
+    uint tid = tid2.x;
+    uint width = width2.x;
+    uint row = tg.y;
+    uint lane = tg.x * width + tid;
+    if (lane >= 1024u) return;
+    SamplingWork wk = sampling_work(work, row, vocab);
+    device const float *w = weights + ulong(row) * vocab;
+    ulong chunk = (ulong(vocab) + 1023ul) / 1024ul;
+    ulong lo = min(ulong(lane) * chunk, ulong(vocab));
+    ulong hi = min(lo + chunk, ulong(vocab));
+    volatile float sum = 0.0f;
+    for (ulong i = lo; i < hi; ++i) sum = sum + w[i];
+    wk.lanes[lane] = sum;
+}
+
+// Shared by the multinomial and the Gumbel draw: the total mass of K, the
+// nucleus N (the shortest key prefix of K whose mass reaches p × mass(K)),
+// its cutoff key, size and mass. Returns the row code (0, or 5 on an invalid
+// mass). The compact arrays are the caller's threadgroup memory.
+struct SamplingNucleus {
+    uint code;
+    float total;      // mass(K)
+    float nucleus;    // mass(N)
+    ulong cutoff;     // N = {finite, key >= cutoff}
+    uint count;       // |N|
+    uint jstar;       // |N| on the compact path
+    bool compact;     // N is held in the compact arrays
+};
+
+inline SamplingNucleus sampling_prepare_nucleus(
+    device const uint *z, device const float *w, device const uint *members,
+    uint vocab, uint p_bits, uint filter_p, SamplingWork wk,
+    SamplingCompact c, threadgroup float *lanes, threadgroup float *groups,
+    threadgroup float *reds, threadgroup uint *redu, uint tid, uint width
+) {
+    SamplingNucleus out;
+    out.code = 0u;
+    out.compact = wk.words[W_COMPACT_ON] != 0u && wk.words[W_COMPACT_OVER] == 0u;
+    ulong cutoff_k = sampling_key_pair(wk.words, W_CUTK_LO);
+    for (uint l = tid; l < 1024u; l += width) lanes[l] = wk.lanes[l];
+    out.total = sampling_fold_lanes(lanes, groups, tid, width);
+    out.cutoff = cutoff_k;
+    out.count = wk.words[W_KEEP];
+    out.nucleus = out.total;
+    out.jstar = 0u;
+    if (!(out.total > 0.0f) || !sampling_topk_finite(as_type<uint>(out.total))) {
+        out.code = 5u;
+        return out;
+    }
+    if (out.compact) {
+        sampling_compact_load(c, z, w, members, tid, width);
+        out.jstar = c.n;
+    }
+    if (filter_p == 0u) return out;
+    float target = as_type<float>(sampling_mul_bits(p_bits, as_type<uint>(out.total)));
+    bool found = false;
+    if (out.compact) {
+        // The least j with mass(R_j) >= target, each j by its own thread.
+        uint best = 0xffffffffu;
+        for (uint j = tid + 1u; j <= c.n; j += width)
+            if (sampling_compact_mass(c, j, c.n - 1u) >= target) {
+                best = j;
+                break;
+            }
+        redu[tid] = best;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tid == 0u) {
+            for (uint t = 1u; t < width; ++t) best = min(best, redu[t]);
+            redu[0] = best;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        best = redu[0];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (best != 0xffffffffu) {
+            found = true;
+            out.jstar = best;
+            out.count = best;
+            if (tid == 0u) reds[0] = sampling_compact_mass(c, best, c.n - 1u);
+            for (uint j = tid; j < c.n; j += width)
+                if (c.rank[j] == best - 1u) redu[1] = j;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            out.nucleus = reds[0];
+            uint member = redu[1];
+            out.cutoff = sampling_topk_key(c.score[member], c.id[member]);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+    if (!found) {
+        // The nucleus reaches past the compact set (or there is none): the
+        // key bisection over the whole row.
+        out.compact = false;
+        ulong best = sampling_key_pair(wk.words, W_MAX_LO);
+        out.cutoff = sampling_nucleus_bisect(z, w, vocab, best, target, lanes, groups,
+                                             tid, width);
+        out.nucleus = sampling_mass(z, w, vocab, out.cutoff, vocab - 1u, lanes, groups,
+                                    tid, width);
+        uint n = 0u;
+        for (uint i = tid; i < vocab; i += width)
+            n += uint(sampling_topk_finite(z[i]) && sampling_topk_key(z[i], i) >= out.cutoff);
+        redu[tid] = n;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tid == 0u) {
+            for (uint t = 1u; t < width; ++t) n += redu[t];
+            redu[0] = n;
+            wk.words[W_FALLBACK] = 1u;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        out.count = redu[0];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    return out;
+}
+
+inline void sampling_publish_nucleus(SamplingWork wk, SamplingNucleus n, uint code) {
+    wk.words[W_CODE] = code;
+    sampling_store_key(wk.words, W_CUTP_LO, n.cutoff);
+    wk.words[W_NCOUNT] = code == 0u ? n.count : 0u;
+    wk.words[W_TOTAL] = as_type<uint>(n.total);
+    wk.words[W_NMASS] = as_type<uint>(n.nucleus);
+}
+
+// Stage 7: one threadgroup per row draws the token: the inverse CDF in
+// token-id order over N with the row's uniform. Private status: (0 ok / 1
+// NaN / 2 +inf / 3 empty / 4 bad uniform / 5 invalid mass, first bad score
+// id or UINT_MAX, finite count, support count). Refusal writes UINT_MAX as
+// the id and an empty support, never a candidate.
+kernel void sampling_draw_f32(
+    device const uint *scores [[buffer(0)]],
+    constant uint &vocab [[buffer(1)]],
+    constant uint &p_bits [[buffer(2)]],
+    constant uint &filter_p [[buffer(3)]],
+    device const uint *uniforms [[buffer(4)]],
+    device uint *work [[buffer(5)]],
+    device const uint *members [[buffer(6)]],
+    device const float *weights [[buffer(7)]],
+    device uint *ids [[buffer(8)]],
+    device uint *status [[buffer(9)]],
+    uint2 tg [[threadgroup_position_in_grid]],
+    uint2 tid2 [[thread_position_in_threadgroup]],
+    uint2 width2 [[threads_per_threadgroup]]
+) {
+    uint tid = tid2.x;
+    uint width = width2.x;
+    threadgroup uint cid[SAMPLING_CAP];
+    threadgroup uint cscore[SAMPLING_CAP];
+    threadgroup float cweight[SAMPLING_CAP];
+    threadgroup uint crank[SAMPLING_CAP];
+    threadgroup uint corder[SAMPLING_CAP];
     threadgroup float lanes[1024];
     threadgroup float groups[32];
-    threadgroup ulong maxima[256];
+    threadgroup float reds[SAMPLING_WIDTH];
+    threadgroup uint redu[SAMPLING_WIDTH];
+    uint row = tg.y;
+    SamplingWork wk = sampling_work(work, row, vocab);
     device const uint *z = scores + ulong(row) * vocab;
-    device const uint *k = kept + ulong(row) * vocab;
-    device float *w = weight_scratch + ulong(row) * vocab;
-    device uint *out = support + ulong(row) * vocab;
-    device const uint *s = selection_status + ulong(row) * 4;
-    device uint *result = status + ulong(row) * 4;
+    device const float *w = weights + ulong(row) * vocab;
+    device const uint *mem = members + ulong(row) * vocab;
+    device uint *result = status + ulong(row) * 4ul;
+    uint code = wk.words[W_CODE];
     uint ubits = uniforms[row];
     bool uniform_ok = (ubits & 0x7fffffffu) < 0x3f800000u
                    && ((ubits & 0x80000000u) == 0u || ubits == 0x80000000u);
-    uint code = s[0] != 0u ? s[0] : (uniform_ok ? 0u : 4u);
-    if (code != 0u) {
-        for (ulong i = tid; i < vocab; i += width) { out[i] = 0u; w[i] = 0.0f; }
-        if (tid == 0) {
-            ids[row] = 0xffffffffu;
-            result[0] = code; result[1] = s[1]; result[2] = s[2]; result[3] = 0u;
-        }
-        return;
+    if (code == 0u && !uniform_ok) code = 4u;
+    SamplingCompact c;
+    c.id = cid;
+    c.score = cscore;
+    c.weight = cweight;
+    c.rank = crank;
+    c.order = corder;
+    c.n = min(wk.words[W_COMPACT], SAMPLING_CAP);
+    c.chunk = (vocab + 1023u) / 1024u;
+    SamplingNucleus n;
+    n.cutoff = 0ul;
+    n.count = 0u;
+    n.total = 0.0f;
+    n.nucleus = 0.0f;
+    if (code == 0u) {
+        n = sampling_prepare_nucleus(z, w, mem, vocab, p_bits, filter_p, wk, c,
+                                     lanes, groups, reds, redu, tid, width);
+        code = n.code;
     }
-    SamplingPrepared prepared = sampling_prepare_support(
-        z, k, w, vocab, inv_t_bits, p_bits, filter_p,
-        lanes, groups, maxima, tid, width);
-    ulong cutoff = prepared.cutoff;
-    float total = prepared.total;
-    if (!(total > 0.0f) || !sampling_topk_finite(as_type<uint>(total))) code = 5u;
     uint pick = 0xffffffffu;
     if (code == 0u) {
-        float target = as_type<float>(sampling_mul_bits(ubits, as_type<uint>(total)));
-        if (total > target) {
-            uint lo = 0u, hi = vocab - 1u;
-            while (lo < hi) {
-                uint mid = lo + (hi - lo) / 2u;
-                float mass = sampling_mass(z, k, w, vocab, cutoff, mid,
-                                           lanes, groups, tid, width);
-                if (mass > target) hi = mid;
-                else lo = mid + 1u;
+        float target = as_type<float>(sampling_mul_bits(ubits, as_type<uint>(n.nucleus)));
+        if (n.compact) {
+            // The first member in id order whose prefix mass passes the
+            // target; else the last member with a positive weight (kept as
+            // id + 1, so 0 is none).
+            uint first = 0xffffffffu, last1 = 0u;
+            for (uint q = tid; q < c.n; q += width) {
+                uint member = c.order[q];
+                if (c.rank[member] >= n.jstar) continue;
+                if (n.nucleus > target) {
+                    if (first == 0xffffffffu
+                        && sampling_compact_mass(c, n.jstar, q) > target)
+                        first = c.id[member];
+                } else if (c.weight[member] > 0.0f) {
+                    last1 = c.id[member] + 1u;
+                }
             }
-            pick = lo;
+            redu[tid] = first;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (tid == 0u) {
+                for (uint t = 1u; t < width; ++t) first = min(first, redu[t]);
+                redu[0] = first;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            first = redu[0];
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            redu[tid] = last1;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (tid == 0u) {
+                for (uint t = 1u; t < width; ++t) last1 = max(last1, redu[t]);
+                redu[0] = n.nucleus > target ? first
+                        : (last1 != 0u ? last1 - 1u : 0xffffffffu);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            pick = redu[0];
+        } else {
+            // The large path: lane sums over N, the group and lane whose
+            // prefix passes the target, then that lane walked in id order.
+            if (n.cutoff != sampling_key_pair(wk.words, W_CUTK_LO))
+                sampling_lane_sums(z, w, vocab, n.cutoff, vocab - 1u, lanes, tid, width);
+            else
+                for (uint l = tid; l < 1024u; l += width) lanes[l] = wk.lanes[l];
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (uint group = tid; group < 32u; group += width) {
+                volatile float sum = 0.0f;
+                for (uint lane = 0u; lane < 32u; ++lane)
+                    sum = sum + lanes[group * 32u + lane];
+                groups[group] = sum;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (tid == 0u) {
+                if (n.nucleus > target) {
+                    uint L = 0xffffffffu;
+                    volatile float acc = 0.0f;
+                    for (uint g = 0u; g < 32u && L == 0xffffffffu; ++g) {
+                        if (!(acc + groups[g] > target)) {
+                            acc = acc + groups[g];
+                            continue;
+                        }
+                        volatile float part = 0.0f;
+                        for (uint l = g * 32u; l < g * 32u + 32u; ++l) {
+                            part = part + lanes[l];
+                            if (acc + part > target) { L = l; break; }
+                        }
+                    }
+                    if (L != 0xffffffffu) {
+                        ulong chunk = ulong(c.chunk);
+                        ulong lo = min(ulong(L) * chunk, ulong(vocab));
+                        ulong hi = min(lo + chunk, ulong(vocab));
+                        volatile float sum = 0.0f;
+                        for (ulong i = lo; i < hi; ++i) {
+                            bool member = sampling_topk_key(z[i], uint(i)) >= n.cutoff;
+                            sum = sum + (member ? w[i] : 0.0f);
+                            if (sampling_lane_prefix(lanes, groups, L, sum) > target) {
+                                pick = uint(i);
+                                break;
+                            }
+                        }
+                    }
+                }
+                redu[0] = pick;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            pick = redu[0];
+            if (pick == 0xffffffffu) {
+                uint last = 0xffffffffu;
+                for (uint i = tid; i < vocab; i += width)
+                    if (w[i] > 0.0f && sampling_topk_key(z[i], i) >= n.cutoff) last = i;
+                redu[tid] = last;
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                if (tid == 0u) {
+                    uint best = 0xffffffffu;
+                    for (uint t = 0u; t < width; ++t)
+                        if (redu[t] != 0xffffffffu)
+                            best = best == 0xffffffffu ? redu[t] : max(best, redu[t]);
+                    redu[0] = best;
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                pick = redu[0];
+            }
         }
     }
-    for (ulong i = tid; i < vocab; i += width)
-        out[i] = uint(code == 0u && k[i] != 0u
-                      && sampling_topk_key(z[i], uint(i)) >= cutoff);
-    if (tid == 0) {
-        uint count = 0u, last = 0xffffffffu;
-        for (ulong i = 0; i < vocab; ++i) {
-            bool member = code == 0u && k[i] != 0u
-                       && sampling_topk_key(z[i], uint(i)) >= cutoff;
-            if (member) { ++count; if (w[i] > 0.0f) last = uint(i); }
-        }
-        ids[row] = code != 0u ? 0xffffffffu : (pick == 0xffffffffu ? last : pick);
-        result[0] = code; result[1] = s[1]; result[2] = s[2]; result[3] = count;
+    if (tid == 0u) {
+        sampling_publish_nucleus(wk, n, code);
+        ids[row] = code != 0u ? 0xffffffffu : pick;
+        result[0] = code;
+        result[1] = wk.words[W_BAD_OUT];
+        result[2] = wk.words[W_COUNT];
+        result[3] = code == 0u ? n.count : 0u;
     }
+}
+
+// Stage 8: the support mask, N as a dense u32 mask. A refused row's mask and
+// weights are zero.
+kernel void sampling_support_f32(
+    device const uint *scores [[buffer(0)]],
+    constant uint &vocab [[buffer(1)]],
+    device const uint *work [[buffer(2)]],
+    device uint *support [[buffer(3)]],
+    device float *weights [[buffer(4)]],
+    uint2 tg [[threadgroup_position_in_grid]],
+    uint2 tid2 [[thread_position_in_threadgroup]],
+    uint2 width2 [[threads_per_threadgroup]]
+) {
+    uint tid = tid2.x;
+    uint width = width2.x;
+    uint row = tg.y;
+    uint i = tg.x * width + tid;
+    if (i >= vocab) return;
+    device const uint *words = work + sampling_word_offset(row, vocab, 0u);
+    uint code = words[W_CODE];
+    uint bits = scores[ulong(row) * vocab + i];
+    bool member = code == 0u && sampling_topk_finite(bits)
+               && sampling_topk_key(bits, i) >= sampling_key_pair(words, W_CUTP_LO);
+    support[ulong(row) * vocab + i] = uint(member);
+    if (code != 0u) weights[ulong(row) * vocab + i] = 0.0f;
 }

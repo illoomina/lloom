@@ -48,7 +48,8 @@ fn checked_encode(
     } else {
         0
     };
-    for name in ["sampling_topk_mask_f32", "sampling_multinomial_f32"] {
+    use crate::kernels::kernels::sampling_topk::{MULTINOMIAL_KERNELS, SELECT_KERNELS};
+    for name in SELECT_KERNELS.iter().chain(MULTINOMIAL_KERNELS) {
         let count: u64 = census
             .iter()
             .filter(|(label, _)| label == name)
@@ -58,7 +59,7 @@ fn checked_encode(
     }
     assert_eq!(
         census.iter().map(|(_, n)| *n).sum::<u64>(),
-        expected * 2,
+        expected * (SELECT_KERNELS.len() + MULTINOMIAL_KERNELS.len()) as u64,
         "unexpected dispatch: {census:?}"
     );
     result
@@ -699,6 +700,10 @@ fn raw_abi_offsets_initialization_and_tail_canaries() -> Result<()> {
     let support = make(rows * v)?;
     let ids = make(rows)?;
     let status = make(rows * 4)?;
+    let words = crate::kernels::kernels::sampling_topk::sampling_work_words(rows, v).unwrap();
+    let work = make(words)?;
+    let scratch = make(rows * v)?;
+    let selection = make(rows * 4)?;
     {
         let (input, _) = input.storage_and_layout();
         let (u, _) = uniforms.storage_and_layout();
@@ -706,6 +711,9 @@ fn raw_abi_offsets_initialization_and_tail_canaries() -> Result<()> {
         let (mask, _) = support.storage_and_layout();
         let (id, _) = ids.storage_and_layout();
         let (s, _) = status.storage_and_layout();
+        let (work, _) = work.storage_and_layout();
+        let (scratch, _) = scratch.storage_and_layout();
+        let (ks, _) = selection.storage_and_layout();
         let (
             Storage::Metal(z),
             Storage::Metal(u),
@@ -713,34 +721,54 @@ fn raw_abi_offsets_initialization_and_tail_canaries() -> Result<()> {
             Storage::Metal(mask),
             Storage::Metal(id),
             Storage::Metal(s),
-        ) = (&*input, &*u, &*w, &*mask, &*id, &*s)
+            Storage::Metal(work),
+            Storage::Metal(scratch),
+            Storage::Metal(ks),
+        ) = (
+            &*input, &*u, &*w, &*mask, &*id, &*s, &*work, &*scratch, &*ks,
+        )
         else {
             unreachable!()
         };
-        let (k, ks) = z.sampling_topk_mask(&Layout::contiguous_with_offset((rows, v), 5), 2)?;
         let m = z.device();
         let encoder = m.command_encoder()?;
-        // SAFETY: sized disjoint live storage; K/status from these exact rows;
-        // scratch is four-byte storage regardless of its test-only U32 label.
+        // SAFETY: sized disjoint live storage; the selection and the draw
+        // read these exact rows; scratch is four-byte storage regardless of
+        // its test-only U32 label.
         unsafe {
-            crate::kernels::kernels::sampling_topk::call_sampling_multinomial(
+            crate::kernels::kernels::sampling_topk::call_sampling_select(
                 m.metal_device(),
                 &encoder,
                 m.kernels(),
                 (z.buffer(), 20),
                 rows as u32,
                 v as u32,
-                1.0,
-                0.5,
+                2,
                 1,
-                (u.buffer(), 4),
-                k.buffer(),
+                work.buffer(),
+                scratch.buffer(),
                 ks.buffer(),
-                w.buffer(),
-                mask.buffer(),
-                id.buffer(),
-                s.buffer(),
             )
+            .and_then(|()| {
+                crate::kernels::kernels::sampling_topk::call_sampling_multinomial(
+                    m.metal_device(),
+                    &encoder,
+                    m.kernels(),
+                    (z.buffer(), 20),
+                    rows as u32,
+                    v as u32,
+                    1.0,
+                    0.5,
+                    1,
+                    (u.buffer(), 4),
+                    work.buffer(),
+                    scratch.buffer(),
+                    w.buffer(),
+                    mask.buffer(),
+                    id.buffer(),
+                    s.buffer(),
+                )
+            })
         }
         .map_err(crate::Error::wrap)?;
     }
@@ -1618,5 +1646,99 @@ fn checked_bridge_exact_recording_ignores_foreign_completion_and_later_tail() ->
     other_m.wait_until_completed()?;
     drop((tail_value, foreign_value));
     eprintln!("SNAPSHOT_EXACT_RECORDING foreign_complete=true own_pending_refused=true own_ids=[1] later_tail_pending_at_return=true");
+    Ok(())
+}
+
+const CHI2_999: [f64; 21] = [
+    0.0, 10.828, 13.816, 16.266, 18.467, 20.515, 22.458, 24.322, 26.124, 27.877, 29.588, 31.264,
+    32.909, 34.528, 36.123, 37.697, 39.252, 40.790, 42.312, 43.820, 45.315,
+];
+
+/// The reference's distribution: its f32 weights over its kept set,
+/// normalised in f64. Zero off the kept set.
+pub(super) fn reference_distribution(z: &[f32], params: Params) -> Vec<f64> {
+    let kept = oracle::CONTRACT.nucleus(z, params).unwrap();
+    let inv = oracle::inv_t(params.temperature).unwrap();
+    let w = oracle::CONTRACT.weights(z, &kept, z[kept[0]], inv);
+    let total: f64 = w.iter().map(|&x| x as f64).sum();
+    w.iter().map(|&x| x as f64 / total).collect()
+}
+
+/// (χ², degrees of freedom, draws where the distribution is zero).
+pub(super) fn chi_square(draws: &[u32], want: &[f64]) -> (f64, usize, usize) {
+    let mut counts = vec![0usize; want.len()];
+    for &id in draws {
+        counts[id as usize] += 1;
+    }
+    let n = draws.len() as f64;
+    let support: Vec<usize> = (0..want.len()).filter(|&i| want[i] > 0.0).collect();
+    let outside = draws.len() - support.iter().map(|&i| counts[i]).sum::<usize>();
+    let chi2 = support
+        .iter()
+        .map(|&i| (counts[i] as f64 - n * want[i]).powi(2) / (n * want[i]))
+        .sum();
+    (chi2, support.len() - 1, outside)
+}
+
+pub(super) fn splitmix(s: &mut u64) -> u64 {
+    *s = s.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut z = *s;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+/// The host χ² test's two rows and five cells (`sampling_host_contract.rs`).
+pub(super) fn chi_square_cells() -> Vec<(&'static str, Vec<f32>, Params)> {
+    let peaked: Vec<f32> = (0..64).map(|i| 2.0 - 0.25 * i as f32).collect();
+    let mut s = 0xc415u64;
+    let spread: Vec<f32> = (0..48)
+        .map(|_| (splitmix(&mut s) >> 40) as f32 / (1u64 << 24) as f32 * 12.0 - 6.0)
+        .collect();
+    vec![
+        ("top-k", peaked.clone(), Params::new(0.7, 6, 1.0)),
+        ("top-k", peaked, Params::new(1.3, 6, 1.0)),
+        ("top-p", spread.clone(), Params::new(0.7, 0, 0.8)),
+        ("top-p", spread.clone(), Params::new(1.3, 0, 0.8)),
+        ("top-k-top-p", spread, Params::new(1.3, 6, 0.9)),
+    ]
+}
+
+/// The device draws over 16 000 uniforms have the reference's distribution
+/// (dispatch §11.2j's χ²): top-k, top-p and both, at two temperatures. Each
+/// draw also equals the reference's for its uniform (`batch` asserts every
+/// row). Control: the same draws against the distribution with the
+/// temperature dropped fail.
+#[test]
+fn device_draws_have_the_reference_distribution() -> Result<()> {
+    let d = device()?;
+    let (n, rows) = (16_000usize, 2_000usize);
+    for (what, z, params) in chi_square_cells() {
+        let want = reference_distribution(&z, params);
+        let mut s = 77u64;
+        let uniforms: Vec<f32> = (0..n)
+            .map(|_| (splitmix(&mut s) >> 40) as f32 / (1u64 << 24) as f32)
+            .collect();
+        let mut draws = Vec::with_capacity(n);
+        for chunk in uniforms.chunks(rows) {
+            draws.extend(batch(&z, params, chunk, &d)?.ids);
+        }
+        let (chi2, df, outside) = chi_square(&draws, &want);
+        assert!(
+            (2..CHI2_999.len()).contains(&df),
+            "{what}: support {}",
+            df + 1
+        );
+        println!(
+            "CHI2 device multinomial {what} T={} k={} p={} chi2={chi2:.2} df={df} critical={} outside={outside}",
+            params.temperature, params.k, params.p, CHI2_999[df]
+        );
+        assert_eq!(outside, 0, "{what} {params:?}: drew outside the kept set");
+        assert!(chi2 < CHI2_999[df], "{what} {params:?}: chi2 {chi2}");
+        let cold = reference_distribution(&z, Params::new(1.0, params.k, params.p));
+        let (chi2, _, _) = chi_square(&draws, &cold);
+        println!("CHI2-CONTROL device multinomial {what} T dropped: chi2={chi2:.2}");
+        assert!(chi2 > CHI2_999[df], "{what}: T = 1 passed at {chi2}");
+    }
     Ok(())
 }

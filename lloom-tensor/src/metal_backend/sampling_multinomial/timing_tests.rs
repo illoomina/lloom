@@ -7,13 +7,15 @@
 //!
 //! ```text
 //! cargo nextest run --locked -p lloom-tensor --features metal,profile \
-//!   --cargo-profile ci --run-ignored only --no-capture \
+//!   --cargo-profile ci --run-ignored all --no-capture \
 //!   -E 'test(=metal_backend::sampling_multinomial::timing_tests::sampler_kernel_gpu_time)'
 //! ```
 //!
 //! `SAMPLER_TIMING_CELLS=lfm2-ckpt-b1,…` selects cells by name,
-//! `SAMPLER_TIMING_REPS=n` the repetitions (default 25).
-use crate::backend::BackendStorage;
+//! `SAMPLER_TIMING_REPS=n` the repetitions (default 25). `SAMPLER_TIMING_STAGES=1`
+//! adds each stage's own time from stage-boundary counter samples with one
+//! encoder per dispatch (`LLOOM_METAL_API=metal3`; Metal 4 refuses the
+//! counters, #1128) — a different submission, reported beside the whole.
 use crate::kernels::metal::profile;
 use crate::metal_backend::MetalDevice;
 use crate::{DType, Device, Result, Storage, Tensor};
@@ -32,22 +34,113 @@ const QWEN: usize = 248_320;
 
 const CELLS: &[Cell] = &[
     // LFM2.5's checkpoint sampling: T 0.1, top-k 50.
-    Cell { name: "lfm2-ckpt-b1", vocab: LFM2, rows: 1, temperature: 0.1, k: 50, p: 1.0 },
-    Cell { name: "lfm2-ckpt-b4", vocab: LFM2, rows: 4, temperature: 0.1, k: 50, p: 1.0 },
+    Cell {
+        name: "lfm2-ckpt-b1",
+        vocab: LFM2,
+        rows: 1,
+        temperature: 0.1,
+        k: 50,
+        p: 1.0,
+    },
+    Cell {
+        name: "lfm2-ckpt-b4",
+        vocab: LFM2,
+        rows: 4,
+        temperature: 0.1,
+        k: 50,
+        p: 1.0,
+    },
     // Qwen3.6's checkpoint sampling: T 1.0, top-k 20, top-p 0.95.
-    Cell { name: "lfm2-qwenp-b1", vocab: LFM2, rows: 1, temperature: 1.0, k: 20, p: 0.95 },
-    Cell { name: "lfm2-qwenp-b4", vocab: LFM2, rows: 4, temperature: 1.0, k: 20, p: 0.95 },
+    Cell {
+        name: "lfm2-qwenp-b1",
+        vocab: LFM2,
+        rows: 1,
+        temperature: 1.0,
+        k: 20,
+        p: 0.95,
+    },
+    Cell {
+        name: "lfm2-qwenp-b4",
+        vocab: LFM2,
+        rows: 4,
+        temperature: 1.0,
+        k: 20,
+        p: 0.95,
+    },
     // Temperature only.
-    Cell { name: "lfm2-temp-b1", vocab: LFM2, rows: 1, temperature: 0.8, k: 0, p: 1.0 },
-    Cell { name: "lfm2-temp-b4", vocab: LFM2, rows: 4, temperature: 0.8, k: 0, p: 1.0 },
+    Cell {
+        name: "lfm2-temp-b1",
+        vocab: LFM2,
+        rows: 1,
+        temperature: 0.8,
+        k: 0,
+        p: 1.0,
+    },
+    Cell {
+        name: "lfm2-temp-b4",
+        vocab: LFM2,
+        rows: 4,
+        temperature: 0.8,
+        k: 0,
+        p: 1.0,
+    },
     // Top-p alone (PR1156's end-to-end arm: p 0.9, T 0.8).
-    Cell { name: "lfm2-topp-b1", vocab: LFM2, rows: 1, temperature: 0.8, k: 0, p: 0.9 },
-    Cell { name: "qwen-ckpt-b1", vocab: QWEN, rows: 1, temperature: 0.1, k: 50, p: 1.0 },
-    Cell { name: "qwen-ckpt-b4", vocab: QWEN, rows: 4, temperature: 0.1, k: 50, p: 1.0 },
-    Cell { name: "qwen-qwenp-b1", vocab: QWEN, rows: 1, temperature: 1.0, k: 20, p: 0.95 },
-    Cell { name: "qwen-qwenp-b4", vocab: QWEN, rows: 4, temperature: 1.0, k: 20, p: 0.95 },
-    Cell { name: "qwen-temp-b1", vocab: QWEN, rows: 1, temperature: 0.8, k: 0, p: 1.0 },
-    Cell { name: "qwen-temp-b4", vocab: QWEN, rows: 4, temperature: 0.8, k: 0, p: 1.0 },
+    Cell {
+        name: "lfm2-topp-b1",
+        vocab: LFM2,
+        rows: 1,
+        temperature: 0.8,
+        k: 0,
+        p: 0.9,
+    },
+    Cell {
+        name: "qwen-ckpt-b1",
+        vocab: QWEN,
+        rows: 1,
+        temperature: 0.1,
+        k: 50,
+        p: 1.0,
+    },
+    Cell {
+        name: "qwen-ckpt-b4",
+        vocab: QWEN,
+        rows: 4,
+        temperature: 0.1,
+        k: 50,
+        p: 1.0,
+    },
+    Cell {
+        name: "qwen-qwenp-b1",
+        vocab: QWEN,
+        rows: 1,
+        temperature: 1.0,
+        k: 20,
+        p: 0.95,
+    },
+    Cell {
+        name: "qwen-qwenp-b4",
+        vocab: QWEN,
+        rows: 4,
+        temperature: 1.0,
+        k: 20,
+        p: 0.95,
+    },
+    Cell {
+        name: "qwen-temp-b1",
+        vocab: QWEN,
+        rows: 1,
+        temperature: 0.8,
+        k: 0,
+        p: 1.0,
+    },
+    Cell {
+        name: "qwen-temp-b4",
+        vocab: QWEN,
+        rows: 4,
+        temperature: 0.8,
+        k: 0,
+        p: 1.0,
+    },
 ];
 
 fn device() -> Result<Device> {
@@ -56,6 +149,10 @@ fn device() -> Result<Device> {
     tuning.from_env().expect("valid test environment");
     tuning.contract.profile = "fast".into();
     tuning.instrument.profile = true;
+    if stages() {
+        tuning.instrument.profile_counters = true;
+        tuning.instrument.profile_encoder_per_dispatch = true;
+    }
     crate::tuning::install(tuning).expect("install before tuning is read");
     assert!(
         profile::recorder_enabled(),
@@ -148,6 +245,53 @@ fn timed(m: &MetalDevice, label: &str, encode: impl FnOnce() -> Result<()>) -> R
     }
 }
 
+fn stages() -> bool {
+    std::env::var_os("SAMPLER_TIMING_STAGES").is_some()
+}
+
+/// Each stage's GPU microseconds over `reps` runs of `encode`, from the
+/// per-encoder counter samples: `(label, min, p50, max)` in label order of
+/// first appearance.
+fn stage_breakdown(
+    m: &MetalDevice,
+    encode: impl Fn() -> Result<()>,
+    reps: usize,
+) -> Result<Vec<(String, f64, f64, f64)>> {
+    let mut by_label: Vec<(String, Vec<f64>)> = Vec::new();
+    for _ in 0..reps {
+        settle(m)?;
+        encode()?;
+        m.wait_until_completed()?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let records = loop {
+            let snap = profile::snapshot();
+            if let Some(why) = &snap.counters_unavailable {
+                panic!("counters unavailable: {why}");
+            }
+            if !snap.encoder_records.is_empty() && snap.encoder_buffers_unresolved == 0 {
+                break snap.encoder_records;
+            }
+            assert!(std::time::Instant::now() < deadline, "no encoder records");
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        };
+        for r in records {
+            let label = r.label.as_deref().unwrap_or("<unlabelled>").to_string();
+            let us = (r.end - r.start) * 1e6;
+            match by_label.iter_mut().find(|(l, _)| *l == label) {
+                Some((_, v)) => v.push(us),
+                None => by_label.push((label, vec![us])),
+            }
+        }
+    }
+    Ok(by_label
+        .into_iter()
+        .map(|(l, v)| {
+            let (min, p50, max) = stats(v);
+            (l, min, p50, max)
+        })
+        .collect())
+}
+
 fn stats(mut us: Vec<f64>) -> (f64, f64, f64) {
     us.sort_by(|a, b| a.partial_cmp(b).expect("finite"));
     (us[0], us[us.len() / 2], us[us.len() - 1])
@@ -187,7 +331,10 @@ fn sampler_kernel_gpu_time() -> Result<()> {
                 .build()
         };
         let elements = vocab * rows;
-        let kept = alloc(elements, DType::U32, "timing_kept")?;
+        let words =
+            crate::kernels::kernels::sampling_topk::sampling_work_words(rows, vocab).unwrap();
+        let work = alloc(words, DType::U32, "timing_work")?;
+        let scratch = alloc(elements, DType::U32, "timing_scratch_ids")?;
         let selection = alloc(rows * 4, DType::U32, "timing_selection")?;
         let weights = alloc(elements, DType::F32, "timing_weights")?;
         let support = alloc(elements, DType::U32, "timing_support")?;
@@ -196,11 +343,11 @@ fn sampler_kernel_gpu_time() -> Result<()> {
         let inv_t = (1.0 / cell.temperature) as f32;
         let filter_p = u32::from(cell.p != 1.0);
         let k = cell.k.min(vocab) as u32;
-        let topk = || -> Result<()> {
+        let select = || -> Result<()> {
             let encoder = m.command_encoder()?;
             // SAFETY: sized, disjoint, live buffers owned by this test.
             unsafe {
-                crate::kernels::kernels::sampling_topk::call_sampling_topk_mask(
+                crate::kernels::kernels::sampling_topk::call_sampling_select(
                     m.metal_device(),
                     &encoder,
                     m.kernels(),
@@ -208,7 +355,9 @@ fn sampler_kernel_gpu_time() -> Result<()> {
                     rows as u32,
                     vocab as u32,
                     k,
-                    &kept,
+                    filter_p,
+                    &work,
+                    &scratch,
                     &selection,
                 )
             }
@@ -236,8 +385,8 @@ fn sampler_kernel_gpu_time() -> Result<()> {
                     cell.p as f32,
                     filter_p,
                     (noise.buffer(), 0),
-                    &kept,
-                    &selection,
+                    &work,
+                    &scratch,
                     &weights,
                     &support,
                     &ids,
@@ -246,28 +395,47 @@ fn sampler_kernel_gpu_time() -> Result<()> {
             }
             .map_err(crate::Error::wrap)
         };
-        let kernels: [(&str, Box<dyn Fn() -> Result<()> + '_>); 3] = [
-            ("sampling_topk_mask_f32", Box::new(topk)),
-            ("sampling_multinomial_f32", Box::new(|| draw(false))),
-            ("sampling_filtered_gumbel_f32", Box::new(|| draw(true))),
+        // Each pipeline is one command buffer; the record carries its last
+        // dispatch's label.
+        let kernels: [(&str, &str, Box<dyn Fn() -> Result<()> + '_>); 3] = [
+            ("select", "sampling_select_rank_f32", Box::new(select)),
+            (
+                "multinomial",
+                "sampling_support_f32",
+                Box::new(|| draw(false)),
+            ),
+            (
+                "gumbel",
+                "sampling_gumbel_pick_f32",
+                Box::new(|| draw(true)),
+            ),
         ];
-        // The selector runs first so the draws read a real kept set.
-        for (label, encode) in &kernels {
+        // The selection runs first so the draws read a real kept set.
+        for (_, label, encode) in &kernels {
             for _ in 0..3 {
                 timed(m, label, encode)?;
             }
         }
-        for (label, encode) in &kernels {
+        for (stage, label, encode) in &kernels {
             let us: Vec<f64> = (0..reps)
                 .map(|_| timed(m, label, encode))
                 .collect::<Result<_>>()?;
             let (min, p50, max) = stats(us);
             println!(
-                "SAMPLER_GPU_US cell={} vocab={vocab} rows={rows} T={} k={} p={} kernel={label} n={reps} min={min:.1} p50={p50:.1} max={max:.1}",
+                "SAMPLER_GPU_US cell={} vocab={vocab} rows={rows} T={} k={} p={} stage={stage} last={label} n={reps} min={min:.1} p50={p50:.1} max={max:.1}",
                 cell.name, cell.temperature, cell.k, cell.p
             );
-            table.push((cell.name, label.to_string(), rows, p50));
+            table.push((cell.name, stage.to_string(), rows, p50));
+            if stages() {
+                for (label, min, p50, max) in stage_breakdown(m, encode, reps.min(7))? {
+                    println!(
+                        "SAMPLER_STAGE_US cell={} rows={rows} stage={stage} kernel={label} min={min:.1} p50={p50:.1} max={max:.1}",
+                        cell.name
+                    );
+                }
+            }
         }
+        drop(kernels);
         let ids = crate::MetalStorage::new_allocated(ids, m.clone(), rows, DType::U32)?;
         let status = crate::MetalStorage::new_allocated(status, m.clone(), rows * 4, DType::U32)?;
         println!(
@@ -281,7 +449,10 @@ fn sampler_kernel_gpu_time() -> Result<()> {
     println!("|---|---:|---:|---:|---:|");
     for chunk in table.chunks(3) {
         if let [a, b, c] = chunk {
-            println!("| {} | {} | {:.1} | {:.1} | {:.1} |", a.0, a.2, a.3, b.3, c.3);
+            println!(
+                "| {} | {} | {:.1} | {:.1} | {:.1} |",
+                a.0, a.2, a.3, b.3, c.3
+            );
         }
     }
     Ok(())

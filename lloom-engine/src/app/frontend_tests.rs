@@ -1925,8 +1925,10 @@ fn the_lfm2_rows_key_on_the_representation_not_the_container() {
     let measured_only = |w: When| matches!(w, When::Lfm2Dense | When::DsparkSingle);
     for f in Frontend::ALL {
         for batch in ["1", "4"] {
+            // `chat` takes no `--batch`; every front-end takes the key.
+            let sequences = format!("scheduler.max_sequences={batch}");
             let at_model = |model: Option<&str>, extra: &[&str]| {
-                let mut argv = vec!["--batch", batch];
+                let mut argv = vec!["--set", sequences.as_str()];
                 if let Some(m) = model {
                     argv.extend(["--model", m]);
                 }

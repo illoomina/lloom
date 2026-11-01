@@ -353,9 +353,11 @@ impl Owed {
         }
     }
 
-    /// A commit carrying `runs` (from [`Self::runs_for`]) was submitted.
-    /// Saturating either way: an inconsistent settle can only leave epochs
-    /// owed or the frontier low, which marks later, never early.
+    /// A commit carrying `runs` (from [`Self::runs_for`]) was submitted. A
+    /// valid settle is exact: the reserved epochs are the frontier plus the
+    /// owed and the held ones, so neither counter reaches its bound. The
+    /// counters saturate rather than wrap; that guards the arithmetic, not
+    /// a hook count already installed.
     pub(super) fn settle(&mut self, runs: u32) {
         let paid = runs.saturating_sub(1);
         debug_assert!(runs >= 1 && paid <= self.count);
@@ -2084,6 +2086,9 @@ mod owed_tests {
         assert_eq!((owed.count(), owed.flagged()), (0, 7 + u64::from(u32::MAX)));
     }
 
+    /// Defensive arithmetic only: a frontier this close to `u64::MAX` with
+    /// epochs owed is unreachable on a valid schedule (reserved epochs are
+    /// the frontier plus the owed and held ones).
     #[test]
     fn the_frontier_saturates_and_then_carries_no_holes() {
         let mut owed = Owed {

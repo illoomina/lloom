@@ -5141,7 +5141,7 @@ mod issue_535_peek_is_not_blocking {
             );
         }
         // `to_cpu` is the blocking sibling: the identical scan must trip on it.
-        let to_cpu = body_of(src, "to_cpu<T: Clone>");
+        let to_cpu = body_of(src, "to_cpu<T: ReadbackElement>");
         assert!(
             BLOCKING.iter().any(|n| to_cpu.contains(n)),
             "the blocking sibling contains none of the needles, so the gate \
@@ -5192,7 +5192,7 @@ mod issue_535_peek_is_not_blocking {
             let body = body_of(src, name);
             for other in NON_BLOCKING
                 .iter()
-                .chain(std::iter::once(&"to_cpu<T: Clone>"))
+                .chain(std::iter::once(&"to_cpu<T: ReadbackElement>"))
             {
                 if other == name {
                     continue;

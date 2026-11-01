@@ -11,10 +11,12 @@
 //!
 //! With debug assertions on, objc2 checks every message send's signature
 //! against the runtime's (`objc2` `runtime/message_receiver.rs`,
-//! `msg_send_check`), and that check allocates: the fill's one message, the
-//! event's `setSignaledValue`, is then one allocation a token that the
-//! shipping build does not make. So the fill is held to the bare signal's
-//! count, measured beside it, and to zero where debug assertions are off.
+//! `msg_send_check`), and parsing a pointer type in it allocates: the slot's
+//! `contents` (a `void *`, sent by `Buffer::data`) is then one allocation a
+//! token that the shipping build does not make (`setSignaledValue:` has no
+//! pointer and allocates nothing). So the fill is held to the count of the
+//! same two Metal calls made bare beside it, and to zero where debug
+//! assertions are off.
 
 use lloom::nn::ngram_memory::{
     read_worker_stats, MmapRows, NgramHash, ReadPolicy, ReadPool, ReadScratch, PER_LAYER_TOKEN_EMBD,
@@ -218,22 +220,26 @@ fn fill_on_metal(path: &std::path::Path, hash: &NgramHash) -> Result<()> {
     }
     let fills = allocs() - a0;
     let n = tokens.len() - 2;
-    // The bare signal, as many times, on a ring of its own.
+    // The fill's two Metal calls, the slot and the signal, bare, as many
+    // times, on a ring of its own.
     let other = HostFedRing::new(&m, HOST_FILL_SLOTS, hash.n_heads() * HEAD_DIM)?;
     let base = other.base();
     other.signal(base + 1);
     let a0 = allocs();
     for k in 0..n as u64 {
+        // SAFETY: nothing reads this ring; this thread is its only writer.
+        let slot = unsafe { other.slot_mut(base + 2 + k) };
+        std::hint::black_box(slot.as_mut_ptr());
         other.signal(base + 2 + k);
     }
-    let signals = allocs() - a0;
+    let calls = allocs() - a0;
     println!(
-        "ALLOCS fill={fills} signal={signals} over {n} tokens (debug assertions {})",
+        "ALLOCS fill={fills} metal_calls={calls} over {n} tokens (debug assertions {})",
         cfg!(debug_assertions)
     );
     assert_eq!(
-        fills, signals,
-        "the producer's fill allocated beyond its signal's message send"
+        fills, calls,
+        "the producer's fill allocated beyond its slot's and its signal's Metal calls"
     );
     if !cfg!(debug_assertions) {
         assert_eq!(fills, 0, "the producer's fill allocated");

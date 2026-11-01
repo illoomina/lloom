@@ -3409,7 +3409,7 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
                     at = Some(cache.ngram.clone());
                 }
             }
-            let emb = ple.table.gather(&ids, res_hc.device())?;
+            let emb = self.ple_rows_uploaded(ple, &ids, res_hc.device())?;
             let emb = emb.reshape((seq, emb.elem_count() / seq))?;
             let (out, hist) =
                 ple.block
@@ -7096,5 +7096,33 @@ mod tests {
             h2.flatten_all()?.to_vec1::<f32>()?
         );
         Ok(())
+    }
+
+    /// The PLE row regions: a new one while every region is still read by a
+    /// queued step, none past [`super::PLE_ROW_SLOTS`] (the caller uploads,
+    /// counted), the first again once its reader's epoch completed, and a
+    /// free region too small made again at the size asked.
+    #[cfg(feature = "metal")]
+    #[test]
+    fn the_ple_row_regions_stop_at_their_bound_and_reuse_a_completed_one() {
+        use lloom_tensor::kernels::metal::Epoch;
+        let Ok(dev) = Device::new_metal(0) else {
+            return;
+        };
+        let m = dev.as_metal_device().unwrap();
+        let mut g = super::PleRowSlots::default();
+        for i in 0..super::PLE_ROW_SLOTS {
+            assert_eq!(g.take(64, m, |_| false).unwrap(), Some(i), "region {i}");
+            g.slots[i].read = Some(Epoch(1));
+        }
+        assert_eq!(
+            g.take(64, m, |_| false).unwrap(),
+            None,
+            "a region past the bound"
+        );
+        assert_eq!(g.take(64, m, |_| true).unwrap(), Some(0));
+        let i = g.take(128, m, |_| true).unwrap().expect("a free region");
+        assert_eq!(g.slots[i].cap, 128, "a free region too small, made again");
+        assert_eq!(g.slots.len(), super::PLE_ROW_SLOTS);
     }
 }

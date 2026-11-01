@@ -4,9 +4,8 @@
 //! bit at B = 1, 2 and 8, and the same window argmaxes and states after every
 //! accept, at f32 and IQ4_NL. The batched arm reads a step's rows in ONE
 //! request where the per-position arm reads one a position, and on Metal it
-//! uploads nothing at a decode step, at B = 16 too, where the per-position
-//! arm has more rows than the model keeps regions and uploads the rest (the
-//! counter's positive control).
+//! uploads nothing at a decode step, B = 16 included, while the prompt's
+//! prefill uploads its rows (the counter's positive control).
 use lloom::models::qwen4exp::testing;
 use lloom::models::qwen4exp::{
     set_ple_rows_batch, Config, MmapPleTable, NgramHash, PleLayer, PleTable, Qwen4Exp, Resident,
@@ -137,12 +136,14 @@ fn prompts(b: usize) -> Vec<Vec<u32>> {
         .collect()
 }
 
-/// What one arm's batched decode left: every row's logits at every step, and
-/// the PLE uploads and the read requests of the decode steps alone.
+/// What one arm's batched decode left: every row's logits at every step, the
+/// PLE uploads and the read requests of the decode steps alone, and the
+/// prefills' uploads.
 struct Run {
     logits: Vec<Vec<Vec<f32>>>,
     step_uploads: u64,
     step_requests: u64,
+    prefill_uploads: u64,
 }
 
 fn batched(
@@ -154,6 +155,7 @@ fn batched(
 ) -> Result<Run> {
     let mut caches: Vec<State<CrownExact>> = Vec::with_capacity(b);
     let mut next = Vec::with_capacity(b);
+    let u0 = model.ple_row_uploads();
     for p in prompts(b) {
         let mut cache = model.new_cache(cfg, dev)?;
         let input = Tensor::from_vec(p.clone(), (1, p.len()), dev)?;
@@ -164,6 +166,7 @@ fn batched(
         next.push(argmax(&logits));
         caches.push(cache);
     }
+    let prefill_uploads = model.ple_row_uploads() - u0;
     let u1 = model.ple_row_uploads();
     let r1 = requests();
     let mut logits = vec![Vec::new(); b];
@@ -187,6 +190,7 @@ fn batched(
         logits,
         step_uploads: model.ple_row_uploads() - u1,
         step_requests: requests() - r1,
+        prefill_uploads,
     })
 }
 
@@ -231,19 +235,20 @@ fn rows_on(dev: &Device, tag: &str) -> Result<()> {
                     batch.step_uploads, 0,
                     "{tag} {dtype:?} B={b}: a decode step uploaded PLE rows"
                 );
-                if b == 16 {
-                    // 16 rows a step, a region each on the per-position arm,
-                    // and the model keeps 8: the rest upload.
-                    assert!(
-                        rows.step_uploads >= (8 * steps) as u64,
-                        "{tag} {dtype:?} B={b}: the per-position arm uploaded {} over {steps} steps: the counter is dead",
-                        rows.step_uploads
-                    );
-                }
+                assert!(
+                    batch.prefill_uploads >= b as u64,
+                    "{tag} {dtype:?} B={b}: {} prefills uploaded {} PLE gathers: the counter is dead",
+                    b,
+                    batch.prefill_uploads
+                );
             }
             println!(
-                "PLEROWS {tag} {dtype:?} B={b}: requests {} vs {}, step uploads {} vs {}",
-                batch.step_requests, rows.step_requests, batch.step_uploads, rows.step_uploads
+                "PLEROWS {tag} {dtype:?} B={b}: requests {} vs {}, step uploads {} vs {}, prefill uploads {}",
+                batch.step_requests,
+                rows.step_requests,
+                batch.step_uploads,
+                rows.step_uploads,
+                batch.prefill_uploads
             );
         }
         std::fs::remove_file(&path).ok();

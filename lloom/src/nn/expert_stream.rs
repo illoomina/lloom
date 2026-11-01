@@ -30,6 +30,8 @@ use lloom_tensor::{DType, Device, Result, Tensor};
 use std::fs::File;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
+#[cfg(feature = "metal")]
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -173,6 +175,255 @@ impl WindowRecord {
     }
 }
 
+/// Opaque resolved expert IDs and their provider's lifetime/custody.
+///
+/// A host group owns one checked generation until its final `down` dispatch
+/// or abort. It cannot be cloned or detached as a bare Tensor through the safe
+/// API. Device groups retain the existing device-plan lifetime contract: this
+/// value does not settle/discard a plan, pin its banks, or replace its pass owner.
+#[must_use = "dropping an unfinished host group aborts that exact generation"]
+pub struct ResolvedExperts<'a, R: ExpertResidency + ?Sized> {
+    owner: &'a R,
+    ids: Tensor,
+    authority: usize,
+    generation: Option<std::num::NonZeroU64>,
+    /// A finished/failed host value never degrades into an untracked device value.
+    closed: bool,
+}
+
+impl<R: ExpertResidency + ?Sized> std::fmt::Debug for ResolvedExperts<'_, R> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ResolvedExperts")
+            .field("shape", &self.ids.dims())
+            .field("host_generation", &self.generation)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<'a, R: ExpertResidency + ?Sized> ResolvedExperts<'a, R> {
+    fn new(
+        owner: &'a R,
+        ids: Tensor,
+        authority: usize,
+        generation: Option<std::num::NonZeroU64>,
+    ) -> Self {
+        Self {
+            owner,
+            ids,
+            authority,
+            generation,
+            closed: false,
+        }
+    }
+
+    /// Construct a resolved value inside a third-party residency provider.
+    /// Existing safe projection calls remain safe; this is a new provider-only
+    /// interoperability boundary, not a safe arbitrary Streamed+Tensor factory.
+    ///
+    /// # Safety
+    /// `owner` must be the actual custody authority for these IDs/bank bindings.
+    /// A host generation must be unique/nonwrapping under `authority` and its
+    /// provider must implement exact-generation abort. Without a host generation,
+    /// the provider/caller must retain the existing device-plan/pass custody for
+    /// every projection; this value alone does not extend that custody. Moving
+    /// IDs here must not alias a mutable/reusable buffer without that protection.
+    pub unsafe fn from_provider_unchecked(
+        owner: &'a R,
+        ids: Tensor,
+        authority: usize,
+        generation: Option<std::num::NonZeroU64>,
+    ) -> Self {
+        Self::new(owner, ids, authority, generation)
+    }
+}
+
+impl<R: ExpertResidency + ?Sized> Drop for ResolvedExperts<'_, R> {
+    fn drop(&mut self) {
+        if let Some(generation) = self.generation.take() {
+            self.owner
+                .abort_resolved_host_group(self.authority, generation);
+        }
+    }
+}
+
+/// Opaque identity of the provider's actual custody. This is not a buffer
+/// handle, admission ticket or permission to inspect/rebind another provider.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ResolvedOwnerIdentity {
+    kind: ResolvedOwnerKind,
+    words: [usize; 3],
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ResolvedOwnerKind {
+    External,
+    Resident,
+    Streamed,
+}
+impl ResolvedOwnerIdentity {
+    /// # Safety
+    /// The provider keeps `authority` stable and unique for the actual custody
+    /// lifetime. Aliased/cloned providers use the SAME actual owner identity;
+    /// unrelated or recycled authorities must not authenticate a live group.
+    pub unsafe fn for_provider_unchecked(authority: usize) -> Self {
+        Self {
+            kind: ResolvedOwnerKind::External,
+            words: [authority, 0, 0],
+        }
+    }
+}
+
+/// Explicit compatibility owner capability. Shared retains its ORIGINAL Sync
+/// cleanup provider; no pointer rebinding or unconditional unsafe Send exists.
+enum ErasedResolvedInner<'a> {
+    Local(ResolvedExperts<'a, dyn ExpertResidency + 'a>),
+    Shared(ResolvedExperts<'a, dyn ExpertResidency + Sync + 'a>),
+}
+#[must_use = "unfinished erased host groups retain the same exact abort custody"]
+pub struct ErasedResolvedExperts<'a> {
+    inner: ErasedResolvedInner<'a>,
+}
+/// Sending this borrowed guard requires a genuinely Sync original provider.
+/// The old bare Tensor's unconditional Send is not promised for local cleanup.
+pub type SendResolvedExperts<'a> = ResolvedExperts<'a, dyn ExpertResidency + Sync + 'a>;
+
+enum ErasedProjectionInner<'group, 'owner> {
+    Local(&'group mut ResolvedExperts<'owner, dyn ExpertResidency + 'owner>),
+    Shared(&'group mut ResolvedExperts<'owner, dyn ExpertResidency + Sync + 'owner>),
+}
+/// Borrowed compatibility projection view. It cannot outlive/detach the owned
+/// group, and its safe API never exposes the slot-ID Tensor.
+pub struct ErasedResolvedProjection<'group, 'owner> {
+    inner: ErasedProjectionInner<'group, 'owner>,
+}
+impl<'owner> ErasedResolvedExperts<'owner> {
+    pub fn as_projection(&mut self) -> ErasedResolvedProjection<'_, 'owner> {
+        ErasedResolvedProjection {
+            inner: match &mut self.inner {
+                ErasedResolvedInner::Local(group) => ErasedProjectionInner::Local(group),
+                ErasedResolvedInner::Shared(group) => ErasedProjectionInner::Shared(group),
+            },
+        }
+    }
+    pub fn try_into_send(self) -> std::result::Result<SendResolvedExperts<'owner>, Self> {
+        match self.inner {
+            ErasedResolvedInner::Shared(group) => Ok(group),
+            inner @ ErasedResolvedInner::Local(_) => Err(Self { inner }),
+        }
+    }
+}
+impl<'owner> SendResolvedExperts<'owner> {
+    pub fn as_erased_projection(&mut self) -> ErasedResolvedProjection<'_, 'owner> {
+        ErasedResolvedProjection {
+            inner: ErasedProjectionInner::Shared(self),
+        }
+    }
+}
+impl ErasedResolvedProjection<'_, '_> {
+    /// Read-only provider lease key; it conveys neither IDs nor a close right.
+    pub fn host_lease(&self) -> (usize, Option<std::num::NonZeroU64>) {
+        match &self.inner {
+            ErasedProjectionInner::Local(group) => (group.authority, group.generation),
+            ErasedProjectionInner::Shared(group) => (group.authority, group.generation),
+        }
+    }
+    pub fn owner_identity(&self) -> ResolvedOwnerIdentity {
+        match &self.inner {
+            ErasedProjectionInner::Local(group) => group.owner.resolved_owner_identity(),
+            ErasedProjectionInner::Shared(group) => group.owner.resolved_owner_identity(),
+        }
+    }
+    fn ids(&self) -> &Tensor {
+        match &self.inner {
+            ErasedProjectionInner::Local(group) => &group.ids,
+            ErasedProjectionInner::Shared(group) => &group.ids,
+        }
+    }
+    fn is_closed(&self) -> bool {
+        match &self.inner {
+            ErasedProjectionInner::Local(group) => group.closed,
+            ErasedProjectionInner::Shared(group) => group.closed,
+        }
+    }
+    /// # Safety
+    /// Provider has authenticated owner_identity and retains the actual bank/
+    /// plan/group custody through its dispatch. Do not clone/detach these IDs
+    /// as an independently usable slot tensor or hand them to another provider.
+    pub unsafe fn ids_for_provider_unchecked(&self) -> &Tensor {
+        self.ids()
+    }
+    /// # Safety
+    /// The provider already closed/stamped this exact host generation under its
+    /// actual authority, preventing every later use before disarming cleanup.
+    pub unsafe fn close_for_provider_unchecked(&mut self) {
+        match &mut self.inner {
+            ErasedProjectionInner::Local(group) => {
+                group.generation = None;
+                group.closed = true;
+            }
+            ErasedProjectionInner::Shared(group) => {
+                group.generation = None;
+                group.closed = true;
+            }
+        }
+    }
+}
+
+impl<'a, R: ExpertResidency + ?Sized> ResolvedExperts<'a, R> {
+    /// Move, not clone, the same payload while coercing the SAME owner.
+    /// Only the two checked capability coercions below call this helper.
+    fn with_erased_owner<T: ExpertResidency + ?Sized>(
+        self,
+        owner: &'a T,
+    ) -> ResolvedExperts<'a, T> {
+        let this = std::mem::ManuallyDrop::new(self);
+        ResolvedExperts {
+            owner,
+            // SAFETY: ManuallyDrop suppresses the old guard's cleanup; this
+            // single move transfers its owned Tensor exactly once. Scalar
+            // generation/closed state and exact owner are preserved together.
+            ids: unsafe { std::ptr::read(&this.ids) },
+            authority: this.authority,
+            generation: this.generation,
+            closed: this.closed,
+        }
+    }
+    pub fn into_erased(self) -> ErasedResolvedExperts<'a>
+    where
+        R: Sized,
+    {
+        let owner: &'a dyn ExpertResidency = self.owner;
+        ErasedResolvedExperts {
+            inner: ErasedResolvedInner::Local(self.with_erased_owner(owner)),
+        }
+    }
+    pub fn into_shared_erased(self) -> ErasedResolvedExperts<'a>
+    where
+        R: Sized + Sync,
+    {
+        let owner: &'a (dyn ExpertResidency + Sync) = self.owner;
+        ErasedResolvedExperts {
+            inner: ErasedResolvedInner::Shared(self.with_erased_owner(owner)),
+        }
+    }
+    /// Read-only exact provider lease key; no permission to forge or detach IDs.
+    pub fn host_lease(&self) -> (usize, Option<std::num::NonZeroU64>) {
+        (self.authority, self.generation)
+    }
+    /// # Safety
+    /// Actual provider custody/identity has been authenticated. The borrowed
+    /// IDs cannot escape the guarded dispatch/plan lifetime by clone/detach.
+    pub unsafe fn ids_for_provider_unchecked(&self) -> &Tensor {
+        &self.ids
+    }
+    /// # Safety
+    /// Actual provider has closed/stamped this exact generation before
+    /// disarming cleanup and rejects every subsequent projection on the value.
+    pub unsafe fn close_for_provider_unchecked(&mut self) {
+        self.generation = None;
+        self.closed = true;
+    }
+}
+
 /// How a layer's routed experts are held and applied.
 ///
 /// The contract is the routed matmul's: the strategy receives the activation
@@ -180,6 +431,63 @@ impl WindowRecord {
 /// `[rows, topk, n]`, plane `(r, t)` for `ids[r, t]` — so the combine above
 /// the seam never learns whether the experts were resident or streamed.
 pub trait ExpertResidency {
+    /// Default authority is this separately addressed provider. Providers
+    /// issuing groups from shared/aliased or zero-sized state must override
+    /// with their actual unique custody identity; see provider constructors.
+    fn resolved_owner_identity(&self) -> ResolvedOwnerIdentity {
+        ResolvedOwnerIdentity {
+            kind: ResolvedOwnerKind::External,
+            words: [std::ptr::from_ref(self).cast::<()>().addr(), 0, 0],
+        }
+    }
+
+    /// Object-safe compatibility surface. Production generic callers use the
+    /// typed methods below directly, not an erased construction roundtrip.
+    /// Sync providers return into_shared_erased to retain optional Send custody;
+    /// local/thread-affine providers return into_erased and remain usable here.
+    fn ensure_erased(&self, group: &RoutedGroup) -> Result<ErasedResolvedExperts<'_>>;
+    fn gate_up_erased(
+        &self,
+        x: &Tensor,
+        group: &mut ErasedResolvedProjection<'_, '_>,
+        arm: MoeArm,
+        act: DType,
+    ) -> Result<(Tensor, Tensor)>;
+    fn gate_up_glu_erased(
+        &self,
+        _x: &Tensor,
+        _group: &mut ErasedResolvedProjection<'_, '_>,
+        _arm: MoeArm,
+        _act: DType,
+    ) -> Result<Option<Tensor>> {
+        Ok(None)
+    }
+    fn down_erased(
+        &self,
+        h: &Tensor,
+        group: &mut ErasedResolvedProjection<'_, '_>,
+        arm: MoeArm,
+    ) -> Result<Tensor>;
+    fn plan_device_erased(
+        &self,
+        _ids: &Tensor,
+    ) -> Result<Option<(ErasedResolvedExperts<'_>, Tensor)>> {
+        Ok(None)
+    }
+    fn plan_window_erased(
+        &self,
+        _ids: &Tensor,
+        _real_rows: usize,
+        _loaded_rows: usize,
+    ) -> Result<Option<(ErasedResolvedExperts<'_>, WindowRecord)>> {
+        Ok(None)
+    }
+
+    /// Abort only the matching unfinished host group. Providers issuing a
+    /// host generation must override this; no device-plan lifetime is ended here.
+    /// Successful `down` disarms its value under the existing projection lock.
+    fn abort_resolved_host_group(&self, _authority: usize, _generation: std::num::NonZeroU64) {}
+
     /// Group the rows of `ids [rows, topk]` (u32, on the device) into
     /// dispatchable groups: `Resident` returns one group; `Streamed` groups
     /// rows so each group's distinct experts fit its slot pool.
@@ -188,7 +496,9 @@ pub trait ExpertResidency {
     /// Make the group's experts resident and return the ids the dispatch reads,
     /// `[rows, topk]` u32 on the device — the group's ids themselves for
     /// `Resident`, slot indices for `Streamed`.
-    fn ensure(&self, group: &RoutedGroup) -> Result<Tensor>;
+    fn ensure(&self, group: &RoutedGroup) -> Result<ResolvedExperts<'_, Self>>
+    where
+        Self: Sized;
 
     /// `gate` and `up` projections of `x [rows, 1, hidden]` through the experts
     /// `slot_ids [rows, topk]`: each `[rows, topk, n_ff]`. `arm` is the
@@ -199,10 +509,12 @@ pub trait ExpertResidency {
     fn gate_up(
         &self,
         x: &Tensor,
-        slot_ids: &Tensor,
+        slot_ids: &mut ResolvedExperts<'_, Self>,
         arm: MoeArm,
         act: DType,
-    ) -> Result<(Tensor, Tensor)>;
+    ) -> Result<(Tensor, Tensor)>
+    where
+        Self: Sized;
 
     /// `silu(g) · u` of [`Self::gate_up`]'s halves in one launch, where the
     /// strategy's pair is one launch (`QTensor::indexed_moe_forward_glu_as`):
@@ -212,16 +524,26 @@ pub trait ExpertResidency {
     fn gate_up_glu(
         &self,
         _x: &Tensor,
-        _slot_ids: &Tensor,
+        _slot_ids: &mut ResolvedExperts<'_, Self>,
         _arm: MoeArm,
         _act: DType,
-    ) -> Result<Option<Tensor>> {
+    ) -> Result<Option<Tensor>>
+    where
+        Self: Sized,
+    {
         Ok(None)
     }
 
     /// `down` projection of `h [rows, topk, n_ff]` through `slot_ids`:
     /// `[rows, topk, hidden]`, on the tile's `arm` as [`Self::gate_up`].
-    fn down(&self, h: &Tensor, slot_ids: &Tensor, arm: MoeArm) -> Result<Tensor>;
+    fn down(
+        &self,
+        h: &Tensor,
+        slot_ids: &mut ResolvedExperts<'_, Self>,
+        arm: MoeArm,
+    ) -> Result<Tensor>
+    where
+        Self: Sized;
 
     /// The elastic surface (`profiles-and-memory-design.md` §4.2): slots in
     /// service, and shrinking / growing them. A resident tier has none.
@@ -284,7 +606,10 @@ pub trait ExpertResidency {
     /// maps to slot 0 and is flagged — and the plan's record for
     /// [`Self::settle`]. `None` where the strategy has no device plan (the
     /// caller takes [`Self::plan`] / [`Self::ensure`]).
-    fn plan_device(&self, _ids: &Tensor) -> Result<Option<(Tensor, Tensor)>> {
+    fn plan_device(&self, _ids: &Tensor) -> Result<Option<(ResolvedExperts<'_, Self>, Tensor)>>
+    where
+        Self: Sized,
+    {
         Ok(None)
     }
 
@@ -380,7 +705,10 @@ pub trait ExpertResidency {
         _ids: &Tensor,
         _real_rows: usize,
         _loaded_rows: usize,
-    ) -> Result<Option<(Tensor, WindowRecord)>> {
+    ) -> Result<Option<(ResolvedExperts<'_, Self>, WindowRecord)>>
+    where
+        Self: Sized,
+    {
         Ok(None)
     }
 
@@ -510,38 +838,45 @@ impl Resident {
     pub fn new(gate: Arc<QTensor>, up: Arc<QTensor>, down: Arc<QTensor>) -> Self {
         Self { gate, up, down }
     }
-}
 
-impl ExpertResidency for Resident {
     #[inline]
-    fn plan(&self, ids: &Tensor) -> Result<Vec<RoutedGroup>> {
-        let rows = ids.dim(0)?;
-        Ok(vec![RoutedGroup {
-            rows: 0..rows,
-            ids: GroupIds::Device(ids.clone()),
-        }])
-    }
-    #[inline]
-    fn ensure(&self, group: &RoutedGroup) -> Result<Tensor> {
-        match &group.ids {
-            GroupIds::Device(t) => Ok(t.clone()),
-            GroupIds::Host { .. } => lloom_tensor::bail!("Resident::ensure: a host-planned group"),
+    fn validate_typed_group(&self, group: &ResolvedExperts<'_, Self>) -> Result<()> {
+        if group.closed {
+            lloom_tensor::bail!("resolved expert group is already closed")
         }
+        if !std::ptr::eq(self, group.owner)
+            && !(Arc::ptr_eq(&self.gate, &group.owner.gate)
+                && Arc::ptr_eq(&self.up, &group.owner.up)
+                && Arc::ptr_eq(&self.down, &group.owner.down))
+        {
+            lloom_tensor::bail!("resolved expert group belongs to another resident bank owner")
+        }
+        Ok(())
     }
+
+    fn validate_erased_group(&self, group: &ErasedResolvedProjection<'_, '_>) -> Result<()> {
+        if group.is_closed() {
+            lloom_tensor::bail!("resolved expert group is already closed")
+        }
+        if group.owner_identity() != self.resolved_owner_identity() {
+            lloom_tensor::bail!("resolved expert group belongs to another resident bank owner")
+        }
+        Ok(())
+    }
+
     #[inline]
-    fn gate_up(
+    fn gate_up_ids(
         &self,
         x: &Tensor,
         ids: &Tensor,
         arm: MoeArm,
         act: DType,
     ) -> Result<(Tensor, Tensor)> {
-        // One launch for the pair on the matmul-vec arm on Metal; two elsewhere.
         self.gate
             .indexed_moe_forward_pair_as(&self.up, x, ids, arm, act)
     }
     #[inline]
-    fn gate_up_glu(
+    fn gate_up_glu_ids(
         &self,
         x: &Tensor,
         ids: &Tensor,
@@ -552,8 +887,95 @@ impl ExpertResidency for Resident {
             .indexed_moe_forward_glu_as(&self.up, x, ids, arm, act)
     }
     #[inline]
-    fn down(&self, h: &Tensor, ids: &Tensor, arm: MoeArm) -> Result<Tensor> {
+    fn down_ids(&self, h: &Tensor, ids: &Tensor, arm: MoeArm) -> Result<Tensor> {
         self.down.indexed_moe_forward_with(h, ids, arm)
+    }
+}
+
+impl ExpertResidency for Resident {
+    fn resolved_owner_identity(&self) -> ResolvedOwnerIdentity {
+        ResolvedOwnerIdentity {
+            kind: ResolvedOwnerKind::Resident,
+            words: [
+                Arc::as_ptr(&self.gate).addr(),
+                Arc::as_ptr(&self.up).addr(),
+                Arc::as_ptr(&self.down).addr(),
+            ],
+        }
+    }
+    fn ensure_erased(&self, group: &RoutedGroup) -> Result<ErasedResolvedExperts<'_>> {
+        self.ensure(group).map(|group| group.into_shared_erased())
+    }
+    fn gate_up_erased(
+        &self,
+        x: &Tensor,
+        group: &mut ErasedResolvedProjection<'_, '_>,
+        arm: MoeArm,
+        act: DType,
+    ) -> Result<(Tensor, Tensor)> {
+        self.validate_erased_group(group)?;
+        self.gate_up_ids(x, group.ids(), arm, act)
+    }
+    fn gate_up_glu_erased(
+        &self,
+        x: &Tensor,
+        group: &mut ErasedResolvedProjection<'_, '_>,
+        arm: MoeArm,
+        act: DType,
+    ) -> Result<Option<Tensor>> {
+        self.validate_erased_group(group)?;
+        self.gate_up_glu_ids(x, group.ids(), arm, act)
+    }
+    fn down_erased(
+        &self,
+        h: &Tensor,
+        group: &mut ErasedResolvedProjection<'_, '_>,
+        arm: MoeArm,
+    ) -> Result<Tensor> {
+        self.validate_erased_group(group)?;
+        self.down_ids(h, group.ids(), arm)
+    }
+    #[inline]
+    fn plan(&self, ids: &Tensor) -> Result<Vec<RoutedGroup>> {
+        let rows = ids.dim(0)?;
+        Ok(vec![RoutedGroup {
+            rows: 0..rows,
+            ids: GroupIds::Device(ids.clone()),
+        }])
+    }
+    #[inline]
+    fn ensure(&self, group: &RoutedGroup) -> Result<ResolvedExperts<'_, Self>> {
+        match &group.ids {
+            GroupIds::Device(t) => Ok(ResolvedExperts::new(self, t.clone(), 0, None)),
+            GroupIds::Host { .. } => lloom_tensor::bail!("Resident::ensure: a host-planned group"),
+        }
+    }
+    #[inline]
+    fn gate_up(
+        &self,
+        x: &Tensor,
+        ids: &mut ResolvedExperts<'_, Self>,
+        arm: MoeArm,
+        act: DType,
+    ) -> Result<(Tensor, Tensor)> {
+        self.validate_typed_group(ids)?;
+        self.gate_up_ids(x, &ids.ids, arm, act)
+    }
+    #[inline]
+    fn gate_up_glu(
+        &self,
+        x: &Tensor,
+        ids: &mut ResolvedExperts<'_, Self>,
+        arm: MoeArm,
+        act: DType,
+    ) -> Result<Option<Tensor>> {
+        self.validate_typed_group(ids)?;
+        self.gate_up_glu_ids(x, &ids.ids, arm, act)
+    }
+    #[inline]
+    fn down(&self, h: &Tensor, ids: &mut ResolvedExperts<'_, Self>, arm: MoeArm) -> Result<Tensor> {
+        self.validate_typed_group(ids)?;
+        self.down_ids(h, &ids.ids, arm)
     }
 }
 
@@ -760,7 +1182,7 @@ impl ResidencyMap {
 
     /// Free slots on the quarantined arm's list.
     fn free_len(&self) -> usize {
-        self.cache.free_len()
+        self.cache.free_len_unborrowed()
     }
 
     /// Whether any slot holds an expert.
@@ -776,7 +1198,14 @@ impl ResidencyMap {
 
     /// A free slot, if any.
     fn take_free(&mut self) -> Option<usize> {
-        self.cache.take_free().map(SlotId::index)
+        self.cache.take_free_unborrowed().map(SlotId::index)
+    }
+
+    #[cfg(feature = "metal")]
+    fn take_free_beside(&mut self, floor: Epoch, completed: Completed) -> Option<usize> {
+        self.cache
+            .take_free_beside(floor, completed)
+            .map(SlotId::index)
     }
 
     /// Plan free-only hints without exposing a key or an unsignaled sentinel.
@@ -1036,6 +1465,10 @@ impl ResidencyMap {
         self.cache.set_pinned(SlotId(slot as u32), pinned)
     }
 
+    fn set_host_borrowed(&mut self, slot: usize, borrowed: bool) {
+        self.cache.set_host_borrowed(SlotId(slot as u32), borrowed);
+    }
+
     fn is_pinned(&self, slot: usize) -> bool {
         self.cache.is_pinned(SlotId(slot as u32))
     }
@@ -1047,7 +1480,7 @@ impl ResidencyMap {
     /// Slots a load can take without evicting (the arm's rule,
     /// [`SlotCache::free_slots`]).
     pub fn free_slots(&self) -> usize {
-        self.cache.free_slots()
+        self.cache.free_slots_unborrowed()
     }
 }
 
@@ -1238,6 +1671,10 @@ mod hint_transaction_tests {
 /// hot path).
 #[derive(Debug, Default)]
 pub struct StreamCounters {
+    #[cfg(test)]
+    host_group_abort_locks: AtomicU64,
+    #[cfg(all(test, feature = "metal"))]
+    initializer_data_waits: AtomicU64,
     pub plans: AtomicU64,
     pub groups: AtomicU64,
     pub hits: AtomicU64,
@@ -1544,6 +1981,15 @@ struct SlotPool {
     plane_bytes: usize,
 }
 
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HostGroupFault {
+    SlotTensor,
+    GateUp,
+    GateUpGlu,
+    Down,
+}
+
 struct Inner {
     /// The experts the last settle counted into the hotlist's usage (the
     /// record's distinct ids: the resident ones touched, the missing ones
@@ -1590,6 +2036,10 @@ struct Inner {
     /// That group's slots: stamped with the GPU epoch at `down` (their last
     /// reader's command buffer), for the direct read's wait.
     open_slots: Vec<usize>,
+    /// Exact host-group identity; independent of map-use Tick and GPU epoch.
+    /// Never wraps: exhaustion refuses before resolution/loading.
+    host_group_last: u64,
+    host_group_active: Option<std::num::NonZeroU64>,
     /// The pool clock (Metal), for those stamps.
     #[cfg(feature = "metal")]
     clock: Option<Arc<lloom_tensor::kernels::metal::GpuClock>>,
@@ -1599,8 +2049,18 @@ struct Inner {
     /// The slot pools are Shared: the direct read's, or the fetch arm's
     /// (`fetch_on`), whose worker writes a slot from the host.
     shared_pools: bool,
+    /// Initialization alone, not later device-plan readers. A job's floor
+    /// must cover it even if that pass captured its floor before a resize.
+    #[cfg(feature = "metal")]
+    initialization: BankInitialization,
     #[cfg(test)]
     resize_fail_at: Option<(usize, bool)>,
+    #[cfg(test)]
+    host_group_fail_at: Option<HostGroupFault>,
+    /// Requested owner reservation, then actual prepared pointer/capacity.
+    /// Test observation only; absent from shipping layout and code.
+    #[cfg(test)]
+    host_reader_reservation: Option<(usize, usize, usize)>,
     /// A settle's distinct ids and misses, kept between calls so a settle
     /// allocates nothing once they have grown.
     scratch_ids: Vec<u32>,
@@ -1842,18 +2302,169 @@ impl LiveTable {
     fn store(&self, _e: usize, _v: u32) {}
 }
 
+/// Unpublished host ownership while fallible slot-ID construction runs.
+/// Enrollment occurs in the existing ID-mapping loop; success moves the already
+/// existing slots Vec. Error/unwind cleanup owns Inner and never relocks it.
+struct PendingHostGroup<'a> {
+    inner: &'a mut Inner,
+    slots: Vec<usize>,
+    generation: std::num::NonZeroU64,
+    tick: Tick,
+    published: bool,
+    #[cfg(feature = "metal")]
+    slots_read_before: Option<Epoch>,
+}
+
+impl<'a> PendingHostGroup<'a> {
+    fn new(
+        inner: &'a mut Inner,
+        slots: Vec<usize>,
+        generation: std::num::NonZeroU64,
+        tick: Tick,
+    ) -> Self {
+        #[cfg(feature = "metal")]
+        let slots_read_before = inner.decode_io.slots_read_at;
+        Self {
+            inner,
+            slots,
+            generation,
+            tick,
+            published: false,
+            #[cfg(feature = "metal")]
+            slots_read_before,
+        }
+    }
+
+    #[inline]
+    fn borrow_slot(&mut self, slot: usize) -> u32 {
+        self.inner.map.set_host_borrowed(slot, true);
+        slot as u32
+    }
+
+    fn reserve_slots(&mut self, capacity: usize) -> Result<()> {
+        self.slots
+            .try_reserve_exact(capacity)
+            .map_err(lloom_tensor::Error::wrap)?;
+        #[cfg(test)]
+        {
+            self.inner.host_reader_reservation = Some((
+                capacity,
+                self.slots.as_ptr() as usize,
+                self.slots.capacity(),
+            ));
+        }
+        Ok(())
+    }
+
+    // Only unloaded rows need membership lookup: every loaded distinct slot
+    // already occurs in `slots`, and its earlier row enrolled HOST. The same
+    // byte deduplicates extra resident hits and physical miss placeholder0.
+    fn borrow_extra_slot(&mut self, slot: usize) -> u32 {
+        if !self.inner.map.cache.host_borrowed(SlotId(slot as u32)) {
+            debug_assert!(
+                self.slots.len() < self.slots.capacity(),
+                "host reader capacity exceeded physical bound"
+            );
+            self.slots.push(slot);
+        }
+        self.borrow_slot(slot)
+    }
+
+    fn publish(mut self) {
+        self.inner
+            .open_host_group(self.generation, self.tick, std::mem::take(&mut self.slots));
+        self.published = true;
+    }
+}
+
+impl Drop for PendingHostGroup<'_> {
+    fn drop(&mut self) {
+        if !self.published {
+            for &slot in &self.slots {
+                self.inner.map.set_host_borrowed(slot, false);
+            }
+            #[cfg(feature = "metal")]
+            if self.inner.decode_io.slots_read_at == Some(BUSY)
+                && self.slots_read_before != Some(BUSY)
+            {
+                self.inner.decode_io.slots_read_at = self.slots_read_before;
+            }
+        }
+    }
+}
+
+/// Exact required writes of one bank generation. Old pending initialization is
+/// carried when a replacement copies its prefix; successful replacement work
+/// cannot upgrade an abandoned source initializer into valid DATA.
+#[cfg(feature = "metal")]
+#[derive(Default)]
+struct BankInitialization {
+    required: Vec<(Epoch, lloom_tensor::kernels::metal::CommandMarker)>,
+    floor: Epoch,
+    proven: bool,
+}
+
+#[cfg(feature = "metal")]
+impl BankInitialization {
+    fn push(
+        &mut self,
+        receipt: (Epoch, lloom_tensor::kernels::metal::CommandMarker),
+    ) -> Result<()> {
+        let floor = Epoch(receipt.0 .0.checked_add(1).ok_or_else(|| {
+            lloom_tensor::Error::Msg("bank initialization epoch exhausted".into())
+        })?);
+        self.floor = self.floor.max(floor);
+        self.required.push(receipt);
+        self.proven = false;
+        Ok(())
+    }
+
+    /// Pending is allowed for later queue-ordered GPU work, never for a CPU
+    /// write into Shared storage. No wait/cut/native submission here.
+    fn poll(&mut self) -> Result<bool> {
+        if self.proven {
+            return Ok(true);
+        }
+        let mut ready = true;
+        for (_, marker) in &self.required {
+            ready &= marker
+                .poll_data_ready()
+                .map_err(lloom_tensor::Error::wrap)?;
+        }
+        if ready {
+            self.proven = true;
+            self.required.clear();
+        }
+        Ok(ready)
+    }
+
+    fn replacement_dependency(&self) -> Self {
+        Self {
+            required: self.required.clone(),
+            floor: self.floor,
+            proven: self.proven,
+        }
+    }
+}
+
 struct PreparedPools {
     pools: [SlotPool; 3],
     before: usize,
     after: usize,
     writer: Epoch,
+    #[cfg(feature = "metal")]
+    initialization: BankInitialization,
 }
 
 impl Inner {
     /// Prepare replacement banks without publishing usable slots. Shared banks
     /// get a publication cut so later fetch floors cover their zero/copy writes.
     /// No explicit completion drain; existing queue backpressure may park.
-    fn prepare_pools(&self, active: usize, keep: usize) -> Result<PreparedPools> {
+    fn prepare_pools(&mut self, active: usize, keep: usize) -> Result<PreparedPools> {
+        #[cfg(feature = "metal")]
+        self.initialization.poll()?;
+        #[cfg(feature = "metal")]
+        let mut initialization = self.initialization.replacement_dependency();
         let before: usize = self
             .pools
             .iter()
@@ -1866,6 +2477,18 @@ impl Inner {
                 lloom_tensor::bail!("injected bank allocation failure at {i}")
             }
             let (n, k) = src.dims();
+            #[cfg(feature = "metal")]
+            let (mut qt, receipt) = QTensor::zeros_persistent_with_receipt(
+                (active, n, k),
+                src.dtype(),
+                &self.device,
+                self.shared_pools,
+            )?;
+            #[cfg(feature = "metal")]
+            if let Some(receipt) = receipt {
+                initialization.push(receipt)?;
+            }
+            #[cfg(not(feature = "metal"))]
             let mut qt = QTensor::zeros_persistent_with(
                 (active, n, k),
                 src.dtype(),
@@ -1894,6 +2517,7 @@ impl Inner {
                     // SAFETY: both pools are persistent tier buffers no pool
                     // recycles, and nothing writes the old one after this copy.
                     unsafe { blit.copy_from_buffer(old, 0, new, 0, bytes) };
+                    initialization.push(blit.recording_receipt())?;
                 }
             }
             fresh.push(SlotPool {
@@ -1911,6 +2535,9 @@ impl Inner {
         if self.resize_fail_at == Some((3, false)) {
             lloom_tensor::bail!("injected bank publication cut failure")
         }
+        #[cfg(feature = "metal")]
+        let writer = Epoch(initialization.floor.0.saturating_sub(1));
+        #[cfg(not(feature = "metal"))]
         let writer = self.current_epoch();
         #[cfg(feature = "metal")]
         if self.shared_pools {
@@ -1923,6 +2550,8 @@ impl Inner {
             before,
             after,
             writer,
+            #[cfg(feature = "metal")]
+            initialization,
         })
     }
 
@@ -2029,6 +2658,39 @@ type NowInFlight = (
     std::time::Duration,
 );
 
+/// A published fetch job's owned resize exclusion. Cleanup touches only this
+/// counter, never the tier pointer, Inner, native queues or callbacks. The
+/// counter remains alive even if an invalid caller drops its tier early; this
+/// does not otherwise repair TierRef's existing pass-outlives-model contract.
+#[cfg(feature = "metal")]
+pub(crate) struct FetchJobCustody {
+    active: Arc<AtomicUsize>,
+    floor: Epoch,
+}
+
+#[cfg(feature = "metal")]
+impl FetchJobCustody {
+    fn acquire(active: &Arc<AtomicUsize>, floor: Epoch) -> Result<Self> {
+        let active = Arc::clone(active);
+        active
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_add(1))
+            .map_err(|_| lloom_tensor::Error::Msg("expert fetch job count exhausted".into()))?;
+        Ok(Self { active, floor })
+    }
+
+    pub(crate) fn required_floor(&self) -> Epoch {
+        self.floor
+    }
+}
+
+#[cfg(feature = "metal")]
+impl Drop for FetchJobCustody {
+    fn drop(&mut self) {
+        let was = self.active.fetch_sub(1, Ordering::Release);
+        debug_assert!(was > 0, "expert fetch custody released twice");
+    }
+}
+
 /// The routed experts streamed from the checkpoint into a slot pool (§20.6).
 pub struct Streamed {
     inner: parking_lot::Mutex<Inner>,
@@ -2045,6 +2707,17 @@ pub struct Streamed {
     #[cfg(feature = "metal")]
     io_hints: bool,
     key: usize,
+    /// One cold Arc allocation per Shared Metal tier, no allocation per job.
+    /// Acquired under Inner before job publication; worker cleanup uses atomics.
+    #[cfg(feature = "metal")]
+    fetch_jobs: Option<Arc<AtomicUsize>>,
+    /// Test-only pause at the real initializer-check → descriptor publication
+    /// seam: 0 idle, 1 armed, 2 paused, 3 released. Never shipped.
+    #[cfg(all(test, feature = "metal"))]
+    fetch_registration_pause: std::sync::atomic::AtomicUsize,
+    /// One-shot proof-observation fault, not a native driver failure. Never shipped.
+    #[cfg(all(test, feature = "metal"))]
+    initializer_data_observation_fault: std::sync::atomic::AtomicBool,
 }
 
 /// Distinct per `Streamed` for the life of the process (the prefetcher's
@@ -2181,10 +2854,22 @@ impl Streamed {
         let (direct, shared) = (direct && pread_metal, (shared || direct) && pread_metal);
         #[cfg(not(feature = "metal"))]
         let (direct, shared) = (false, false);
-        let pool = |s: &ExpertSource| -> Result<SlotPool> {
+        #[cfg(feature = "metal")]
+        let mut initialization = BankInitialization::default();
+        #[allow(unused_mut)]
+        let mut pool = |s: &ExpertSource| -> Result<SlotPool> {
             let (n, k) = s.dims();
+            #[cfg(feature = "metal")]
+            let (qt, receipt) =
+                QTensor::zeros_persistent_with_receipt((n_slots, n, k), s.dtype(), device, shared)?;
+            #[cfg(feature = "metal")]
+            if let Some(receipt) = receipt {
+                initialization.push(receipt)?;
+            }
+            #[cfg(not(feature = "metal"))]
+            let qt = QTensor::zeros_persistent_with((n_slots, n, k), s.dtype(), device, shared)?;
             Ok(SlotPool {
-                qt: QTensor::zeros_persistent_with((n_slots, n, k), s.dtype(), device, shared)?,
+                qt,
                 plane_bytes: s.plane_bytes(),
             })
         };
@@ -2200,7 +2885,7 @@ impl Streamed {
         // still pending would zero what the read landed.
         let mut map = ResidencyMap::new(n_experts, n_slots);
         #[cfg(feature = "metal")]
-        map.plan_read_all(clock.as_ref().map_or(Epoch::ZERO, |c| c.current_epoch()));
+        map.plan_read_all(Epoch(initialization.floor.0.saturating_sub(1)));
         Ok(Self {
             inner: parking_lot::Mutex::new(Inner {
                 pools,
@@ -2219,12 +2904,20 @@ impl Streamed {
                 live_pending: Vec::new(),
                 open_epoch: None,
                 open_slots: Vec::new(),
+                host_group_last: 0,
+                host_group_active: None,
                 #[cfg(feature = "metal")]
                 clock,
                 direct,
                 shared_pools: shared,
+                #[cfg(feature = "metal")]
+                initialization,
                 #[cfg(test)]
                 resize_fail_at: None,
+                #[cfg(test)]
+                host_group_fail_at: None,
+                #[cfg(test)]
+                host_reader_reservation: None,
                 scratch_ids: Vec::new(),
                 scratch_missing: Vec::new(),
                 counted: Vec::new(),
@@ -2244,6 +2937,12 @@ impl Streamed {
             #[cfg(feature = "metal")]
             io_hints: false,
             key: NEXT_KEY.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            #[cfg(feature = "metal")]
+            fetch_jobs: shared.then(|| Arc::new(AtomicUsize::new(0))),
+            #[cfg(all(test, feature = "metal"))]
+            fetch_registration_pause: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(all(test, feature = "metal"))]
+            initializer_data_observation_fault: std::sync::atomic::AtomicBool::new(false),
         })
         .and_then(|mut t| {
             t.set_spare_slots(default_spare_slots())?;
@@ -2508,6 +3207,8 @@ impl Streamed {
         tick: Tick,
         replenish: bool,
     ) -> Result<Pending> {
+        #[cfg(feature = "metal")]
+        let initializer_data_ready = inner.initialization.poll()?;
         let mut slots = Vec::with_capacity(experts.len());
         let mut misses: Vec<(usize, usize)> = Vec::new();
         // What the prefetcher staged for this layer: a miss with a staged
@@ -2729,10 +3430,10 @@ impl Streamed {
                 if let Some(p) = &self.prefetch {
                     let t0 = std::time::Instant::now();
                     let settled = inner.completed_epochs();
-                    let (now, later): (Vec<_>, Vec<_>) = misses
-                        .iter()
-                        .copied()
-                        .partition(|&(_, s)| settled.covers(inner.map.reader_epoch(s)));
+                    let (now, later): (Vec<_>, Vec<_>) =
+                        misses.iter().copied().partition(|&(_, s)| {
+                            initializer_data_ready && settled.covers(inner.map.reader_epoch(s))
+                        });
                     misses = later;
                     let mut jobs = Vec::with_capacity(now.len());
                     let mut bytes = 0u64;
@@ -3562,6 +4263,58 @@ impl Inner {
         }
     }
 
+    #[cfg(test)]
+    fn host_group_fault(&mut self, point: HostGroupFault) -> Result<()> {
+        if self.host_group_fail_at == Some(point) {
+            self.host_group_fail_at = None;
+            lloom_tensor::bail!("test-only host group fault at {point:?}")
+        }
+        Ok(())
+    }
+
+    /// Validate a new host group BEFORE resolution, loading or open-state
+    /// overwrite. The candidate ID is published only after fallible slot-ID
+    /// construction succeeds while this same Inner guard remains held.
+    fn next_host_group(&self) -> Result<std::num::NonZeroU64> {
+        if self.host_group_active.is_some() || self.open_epoch.is_some() {
+            lloom_tensor::bail!("one host group is already open")
+        }
+        self.host_group_last
+            .checked_add(1)
+            .and_then(std::num::NonZeroU64::new)
+            .ok_or_else(|| {
+                lloom_tensor::Error::Msg("host expert group generation exhausted".into())
+            })
+    }
+
+    fn open_host_group(&mut self, generation: std::num::NonZeroU64, tick: Tick, slots: Vec<usize>) {
+        debug_assert!(self.host_group_active.is_none() && self.open_epoch.is_none());
+        self.host_group_last = generation.get();
+        self.host_group_active = Some(generation);
+        self.open_epoch = Some(tick);
+        self.open_slots = slots;
+    }
+
+    /// Close/stamp only this exact generation. No fallible operation, native
+    /// drain or callback join; callers already hold the existing Inner guard.
+    fn close_host_group(&mut self, generation: std::num::NonZeroU64) -> bool {
+        if self.host_group_active != Some(generation) {
+            return false;
+        }
+        let epoch = self.current_epoch();
+        self.host_group_active = None;
+        self.open_epoch = None;
+        for slot in std::mem::take(&mut self.open_slots) {
+            self.map.stamp(slot, epoch);
+            self.map.set_host_borrowed(slot, false);
+        }
+        #[cfg(feature = "metal")]
+        if self.decode_io.slots_read_at == Some(BUSY) {
+            self.decode_io.slots_read_at = Some(epoch);
+        }
+        true
+    }
+
     /// The pool clock's current epoch (0 off Metal).
     fn current_epoch(&self) -> Epoch {
         #[cfg(feature = "metal")]
@@ -4063,9 +4816,9 @@ impl Streamed {
     /// `floor` has completed (`FetchLane::begin_pass`). The routed experts
     /// of this layer are touched first and never chosen. No use is counted
     /// here: the pass's settle counts every routed expert once.
-    pub(crate) fn fetch_beside(&self, ids: &[u32], floor: Epoch) -> (u64, u64) {
+    pub(crate) fn fetch_beside(&self, ids: &[u32], floor: Epoch) -> Result<(u64, u64)> {
         let Some(p) = &self.prefetch else {
-            return (0, ids.len() as u64);
+            return Ok((0, ids.len() as u64));
         };
         let mut jobs: Vec<crate::nn::expert_prefetch::DirectJob> = Vec::new();
         let mut installed: Vec<(u32, u32)> = Vec::new();
@@ -4073,8 +4826,14 @@ impl Streamed {
         let mut bytes = 0u64;
         {
             let mut inner = self.inner.lock();
+            if !inner.initialization.poll()? {
+                // Completion-hook epochs may become visible just before own
+                // DATA feedback. Reuse the worker's existing bounded retry;
+                // do not touch a destination before exact DATA succeeds.
+                return Ok((0, ids.len() as u64));
+            }
             if inner.live.is_none() {
-                return (0, ids.len() as u64);
+                return Ok((0, ids.len() as u64));
             }
             let completed = inner.completed_epochs();
             let quarantined = inner.map.quarantined();
@@ -4097,7 +4856,10 @@ impl Streamed {
             }
             for &e in &missing {
                 let free = if quarantined {
-                    inner.map.take_free().map(|s| (s, false))
+                    inner
+                        .map
+                        .take_free_beside(floor, completed)
+                        .map(|s| (s, false))
                 } else {
                     None
                 };
@@ -4117,8 +4879,9 @@ impl Streamed {
                 self.counters.misses.fetch_add(1, Ordering::Relaxed);
                 let mut dsts = [crate::nn::expert_prefetch::DirectDst(std::ptr::null_mut()); 3];
                 for (i, pool) in inner.pools.iter().enumerate() {
-                    // SAFETY: `s` came from `take_free` or `victim_beside` under
-                    // `completed`: no command that reads it is pending.
+                    // SAFETY: both free and resident selection prove HOST is
+                    // clear and this slot's OWN reader ran before `floor` or
+                    // is covered by `completed`; raw CPU writes need that proof.
                     let base = match pool.qt.metal_buffer() {
                         Ok(b) => unsafe { b.contents() },
                         Err(_) => std::ptr::null_mut(),
@@ -4169,11 +4932,216 @@ impl Streamed {
                 }
             }
         }
-        (installed.len() as u64, short)
+        Ok((installed.len() as u64, short))
+    }
+}
+
+impl Streamed {
+    fn resolved_authority(&self) -> usize {
+        std::ptr::from_ref(&self.inner).addr()
+    }
+
+    fn validate_resolved<R: ExpertResidency + ?Sized>(
+        &self,
+        inner: &Inner,
+        group: &ResolvedExperts<'_, R>,
+    ) -> Result<()> {
+        if group.closed {
+            lloom_tensor::bail!("resolved host expert group is already closed")
+        }
+        if group.authority != self.resolved_authority() {
+            lloom_tensor::bail!("resolved expert group belongs to another custody authority")
+        }
+        if let Some(generation) = group.generation {
+            if inner.host_group_active != Some(generation) || inner.open_epoch.is_none() {
+                lloom_tensor::bail!("resolved host expert group is no longer active")
+            }
+        }
+        Ok(())
+    }
+
+    fn finish_resolved<R: ExpertResidency + ?Sized>(
+        inner: &mut Inner,
+        group: &mut ResolvedExperts<'_, R>,
+    ) {
+        if let Some(generation) = group.generation.take() {
+            inner.close_host_group(generation);
+            group.closed = true;
+        }
+    }
+}
+
+impl Streamed {
+    fn validate_erased_group(&self, group: &ErasedResolvedProjection<'_, '_>) -> Result<()> {
+        if group.owner_identity() != self.resolved_owner_identity() {
+            lloom_tensor::bail!("resolved expert group belongs to another custody authority")
+        }
+        Ok(())
+    }
+    fn gate_up_resolved<R: ExpertResidency + ?Sized>(
+        &self,
+        x: &Tensor,
+        group: &mut ResolvedExperts<'_, R>,
+        arm: MoeArm,
+        act: DType,
+    ) -> Result<(Tensor, Tensor)> {
+        let mut inner = self.inner.lock();
+        self.validate_resolved(&inner, group)?;
+        let out = (|| {
+            #[cfg(feature = "metal")]
+            inner.initialization.poll()?;
+            let out = inner.pools[0].qt.indexed_moe_forward_pair_as(
+                &inner.pools[1].qt,
+                x,
+                &group.ids,
+                arm,
+                act,
+            )?;
+            #[cfg(test)]
+            inner.host_group_fault(HostGroupFault::GateUp)?;
+            Ok(out)
+        })();
+        // Also stamp readers on a partial-dispatch error before exact cleanup.
+        self.stamp_device_plan_readers(&mut inner);
+        if out.is_err() {
+            Self::finish_resolved(&mut inner, group);
+        }
+        out
+    }
+    fn gate_up_glu_resolved<R: ExpertResidency + ?Sized>(
+        &self,
+        x: &Tensor,
+        group: &mut ResolvedExperts<'_, R>,
+        arm: MoeArm,
+        act: DType,
+    ) -> Result<Option<Tensor>> {
+        let mut inner = self.inner.lock();
+        self.validate_resolved(&inner, group)?;
+        let out = (|| {
+            #[cfg(feature = "metal")]
+            inner.initialization.poll()?;
+            let out = inner.pools[0].qt.indexed_moe_forward_glu_as(
+                &inner.pools[1].qt,
+                x,
+                &group.ids,
+                arm,
+                act,
+            )?;
+            #[cfg(test)]
+            inner.host_group_fault(HostGroupFault::GateUpGlu)?;
+            Ok(out)
+        })();
+        if !matches!(&out, Ok(None)) {
+            self.stamp_device_plan_readers(&mut inner);
+        }
+        if out.is_err() {
+            Self::finish_resolved(&mut inner, group);
+        }
+        out
+    }
+    fn down_resolved<R: ExpertResidency + ?Sized>(
+        &self,
+        h: &Tensor,
+        group: &mut ResolvedExperts<'_, R>,
+        arm: MoeArm,
+    ) -> Result<Tensor> {
+        let mut inner = self.inner.lock();
+        self.validate_resolved(&inner, group)?;
+        let out = (|| {
+            #[cfg(feature = "metal")]
+            inner.initialization.poll()?;
+            let out = inner.pools[2]
+                .qt
+                .indexed_moe_forward_with(h, &group.ids, arm)?;
+            #[cfg(test)]
+            inner.host_group_fault(HostGroupFault::Down)?;
+            Ok(out)
+        })();
+        self.stamp_device_plan_readers(&mut inner);
+        // Successful final dispatch and failure both close exactly this host
+        // group under this existing lock. Device groups retain their pass owner.
+        Self::finish_resolved(&mut inner, group);
+        out
     }
 }
 
 impl ExpertResidency for Streamed {
+    fn resolved_owner_identity(&self) -> ResolvedOwnerIdentity {
+        ResolvedOwnerIdentity {
+            kind: ResolvedOwnerKind::Streamed,
+            words: [self.resolved_authority(), 0, 0],
+        }
+    }
+    fn ensure_erased(&self, group: &RoutedGroup) -> Result<ErasedResolvedExperts<'_>> {
+        self.ensure(group).map(|group| group.into_shared_erased())
+    }
+    fn gate_up_erased(
+        &self,
+        x: &Tensor,
+        group: &mut ErasedResolvedProjection<'_, '_>,
+        arm: MoeArm,
+        act: DType,
+    ) -> Result<(Tensor, Tensor)> {
+        self.validate_erased_group(group)?;
+        match &mut group.inner {
+            ErasedProjectionInner::Local(group) => self.gate_up_resolved(x, group, arm, act),
+            ErasedProjectionInner::Shared(group) => self.gate_up_resolved(x, group, arm, act),
+        }
+    }
+    fn gate_up_glu_erased(
+        &self,
+        x: &Tensor,
+        group: &mut ErasedResolvedProjection<'_, '_>,
+        arm: MoeArm,
+        act: DType,
+    ) -> Result<Option<Tensor>> {
+        self.validate_erased_group(group)?;
+        match &mut group.inner {
+            ErasedProjectionInner::Local(group) => self.gate_up_glu_resolved(x, group, arm, act),
+            ErasedProjectionInner::Shared(group) => self.gate_up_glu_resolved(x, group, arm, act),
+        }
+    }
+    fn down_erased(
+        &self,
+        h: &Tensor,
+        group: &mut ErasedResolvedProjection<'_, '_>,
+        arm: MoeArm,
+    ) -> Result<Tensor> {
+        self.validate_erased_group(group)?;
+        match &mut group.inner {
+            ErasedProjectionInner::Local(group) => self.down_resolved(h, group, arm),
+            ErasedProjectionInner::Shared(group) => self.down_resolved(h, group, arm),
+        }
+    }
+    fn plan_device_erased(
+        &self,
+        ids: &Tensor,
+    ) -> Result<Option<(ErasedResolvedExperts<'_>, Tensor)>> {
+        Ok(self
+            .plan_device(ids)?
+            .map(|(group, record)| (group.into_shared_erased(), record)))
+    }
+    fn plan_window_erased(
+        &self,
+        ids: &Tensor,
+        real_rows: usize,
+        loaded_rows: usize,
+    ) -> Result<Option<(ErasedResolvedExperts<'_>, WindowRecord)>> {
+        Ok(self
+            .plan_window(ids, real_rows, loaded_rows)?
+            .map(|(group, record)| (group.into_shared_erased(), record)))
+    }
+    fn abort_resolved_host_group(&self, authority: usize, generation: std::num::NonZeroU64) {
+        if authority != self.resolved_authority() {
+            return;
+        }
+        #[cfg(test)]
+        self.counters
+            .host_group_abort_locks
+            .fetch_add(1, Ordering::Relaxed);
+        self.inner.lock().close_host_group(generation);
+    }
+
     /// Slots in service (`profiles-and-memory-design.md` §4.2, the expert
     /// pool as an elastic tenant): `0..active` of the pool's `n_slots`.
     fn active_slots(&self) -> usize {
@@ -4198,6 +5166,13 @@ impl ExpertResidency for Streamed {
         if inner.plans_open > 0 {
             lloom_tensor::bail!("shrink_slots while a device plan is open")
         }
+        #[cfg(feature = "metal")]
+        if let Some(jobs) = &self.fetch_jobs {
+            let n = jobs.load(Ordering::Acquire);
+            if n != 0 {
+                lloom_tensor::bail!("shrink_slots with {n} fetch jobs in flight")
+            }
+        }
         if inner.map.inflight_count() > 0 {
             lloom_tensor::bail!(
                 "shrink_slots with {} loads in flight",
@@ -4210,6 +5185,9 @@ impl ExpertResidency for Streamed {
         let active = map.active();
         if active >= was {
             return Ok(0);
+        }
+        if inner.open_epoch.is_some() || inner.host_group_active.is_some() {
+            lloom_tensor::bail!("shrink_slots while a host group is open")
         }
         let mut evicted = Vec::new();
         for e in evict {
@@ -4240,6 +5218,10 @@ impl ExpertResidency for Streamed {
         let prepared = inner.prepare_pools(active, keep)?;
         map.plan_read_all(prepared.writer);
         let (before, after) = (prepared.before, prepared.after);
+        #[cfg(feature = "metal")]
+        {
+            inner.initialization = prepared.initialization;
+        }
         inner.pools = prepared.pools;
         inner.map = map;
         for e in evicted {
@@ -4274,6 +5256,13 @@ impl ExpertResidency for Streamed {
         if inner.plans_open > 0 {
             lloom_tensor::bail!("grow_slots while a device plan is open")
         }
+        #[cfg(feature = "metal")]
+        if let Some(jobs) = &self.fetch_jobs {
+            let n = jobs.load(Ordering::Acquire);
+            if n != 0 {
+                lloom_tensor::bail!("grow_slots with {n} fetch jobs in flight")
+            }
+        }
         if inner.map.inflight_count() > 0 {
             lloom_tensor::bail!(
                 "grow_slots with {} loads in flight",
@@ -4290,6 +5279,10 @@ impl ExpertResidency for Streamed {
         let prepared = inner.prepare_pools(active, was)?;
         map.plan_read_all(prepared.writer);
         let (before, after) = (prepared.before, prepared.after);
+        #[cfg(feature = "metal")]
+        {
+            inner.initialization = prepared.initialization;
+        }
         inner.pools = prepared.pools;
         inner.map = map;
         inner.table_stale = true;
@@ -4505,11 +5498,88 @@ impl ExpertResidency for Streamed {
         if !self.fetch_ready() {
             return Ok(false);
         }
-        let slot = DecodeIo::holding(&self.inner.lock().decode_io.ids_slots, ids);
-        let Some(slot) = slot else {
-            return Ok(false);
+        let (slot, custody, initialization_ready) = {
+            let mut inner = self.inner.lock();
+            let initialization_ready = inner.initialization.poll()?;
+            let Some(slot) = DecodeIo::holding(&inner.decode_io.ids_slots, ids) else {
+                return Ok(false);
+            };
+            let jobs = self.fetch_jobs.as_ref().ok_or_else(|| {
+                lloom_tensor::Error::Msg("a Shared fetch tier has no job custody".into())
+            })?;
+            // No resize can pass its guard between this acquisition and the
+            // descriptor becoming visible to the worker. The published Job,
+            // not register's Result, owns cleanup once it is enqueued.
+            let custody = FetchJobCustody::acquire(jobs, inner.initialization.floor)?;
+            (slot, custody, initialization_ready)
         };
-        lane.register(self, slot, ids.elem_count(), self.n_experts)?;
+        // Only a new/unproven generation takes this cold path. Ordinary
+        // registration uses the cached success under its existing Inner lock.
+        if !initialization_ready {
+            // No Inner lock while a cut or exact DATA wait can park. Custody
+            // prevents bank replacement until registration/worker cleanup.
+            let device = ids.device().as_metal_device()?;
+            if device.gpu_clock().current_epoch() < custody.required_floor() {
+                device.flush_marker()?;
+            }
+            let gpu_wait = device.commands().host_input_arm()
+                == lloom_tensor::kernels::metal::HostInputArm::GpuWait;
+            let required = {
+                let mut inner = self.inner.lock();
+                if inner.initialization.poll()? || !gpu_wait {
+                    Vec::new()
+                } else {
+                    inner
+                        .initialization
+                        .required
+                        .iter()
+                        .map(|(_, marker)| marker.clone())
+                        .collect()
+                }
+            };
+            // GpuWait commits consumers early; cancel_through cannot retract
+            // those native waits. Prove this cold initializer successful BEFORE
+            // any dependent Job is published, not by raising its event on error.
+            // HostCommit keeps recording overlap and validates in the worker.
+            for marker in &required {
+                #[cfg(test)]
+                self.counters
+                    .initializer_data_waits
+                    .fetch_add(1, Ordering::Release);
+                #[cfg(test)]
+                let data = if self
+                    .initializer_data_observation_fault
+                    .swap(false, Ordering::AcqRel)
+                {
+                    Err(lloom_tensor::kernels::MetalKernelError::QueueUnavailable(
+                        "test-only initializer DATA observation fault".into(),
+                    ))
+                } else {
+                    device.commands().wait_marker(marker)
+                };
+                #[cfg(not(test))]
+                let data = device.commands().wait_marker(marker);
+                data.map_err(lloom_tensor::Error::wrap)?;
+            }
+            if gpu_wait && !self.inner.lock().initialization.poll()? {
+                lloom_tensor::bail!("fetch bank initialization did not establish DATA")
+            }
+        }
+        #[cfg(test)]
+        if self
+            .fetch_registration_pause
+            .compare_exchange(1, 2, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            let start = std::time::Instant::now();
+            while self.fetch_registration_pause.load(Ordering::Acquire) != 3 {
+                if start.elapsed() > std::time::Duration::from_secs(10) {
+                    lloom_tensor::bail!("test registration pause watchdog expired")
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
+        lane.register(self, slot, ids.elem_count(), self.n_experts, custody)?;
         Ok(true)
     }
 
@@ -4562,7 +5632,7 @@ impl ExpertResidency for Streamed {
         }
     }
 
-    fn plan_device(&self, ids: &Tensor) -> Result<Option<(Tensor, Tensor)>> {
+    fn plan_device(&self, ids: &Tensor) -> Result<Option<(ResolvedExperts<'_, Self>, Tensor)>> {
         let (rows, topk) = ids.dims2()?;
         let n = rows * topk;
         let ids = ids.flatten_all()?.contiguous()?;
@@ -4578,6 +5648,8 @@ impl ExpertResidency for Streamed {
             // The table outlives the pass: the tier's, rebuilt when stale.
             let _escape = escape_guard();
             let mut inner = self.inner.lock();
+            #[cfg(feature = "metal")]
+            inner.initialization.poll()?;
             // What the prefetcher staged for this tier (the hotlist's
             // prediction, `prefetch_hot`) lands now — the copies encoded
             // ahead of this plan's readers on the one queue, the table
@@ -4612,7 +5684,10 @@ impl ExpertResidency for Streamed {
             out,
         })?; // [3·n]
         let slots = plan.narrow(0, 0, n)?.reshape((rows, topk))?;
-        Ok(Some((slots, plan)))
+        Ok(Some((
+            ResolvedExperts::new(self, slots, self.resolved_authority(), None),
+            plan,
+        )))
     }
 
     fn settle(&self, record: &Tensor) -> Result<bool> {
@@ -4702,15 +5777,13 @@ impl ExpertResidency for Streamed {
         ids: &Tensor,
         real_rows: usize,
         loaded_rows: usize,
-    ) -> Result<Option<(Tensor, WindowRecord)>> {
+    ) -> Result<Option<(ResolvedExperts<'_, Self>, WindowRecord)>> {
         // What the tier allocates depends on the pool's state, not the
         // pass's shape: declared outside any pass plan (§9.2aa).
         let _escape = escape_guard();
         let (rows, topk) = ids.dims2()?;
         let n = rows * topk;
         let host = self.read_ids_host(ids, rows, topk)?;
-        self.counters.plans.fetch_add(1, Ordering::Relaxed);
-        self.counters.groups.fetch_add(1, Ordering::Relaxed);
         let loaded_rows = loaded_rows.min(rows);
         // The real rows (the first `real_rows`, row 0 of a verify window):
         // resident within this epoch, their misses loaded, their uses
@@ -4730,6 +5803,9 @@ impl ExpertResidency for Streamed {
         drafts.sort_unstable();
         drafts.dedup();
         let mut inner = self.inner.lock();
+        let generation = inner.next_host_group()?;
+        self.counters.plans.fetch_add(1, Ordering::Relaxed);
+        self.counters.groups.fetch_add(1, Ordering::Relaxed);
         // The loaded rows must be resident at once: wider than the pool's
         // unpinned capacity, they are the grouped host plan's (`plan` /
         // `ensure`, a group at a time) — no record, nothing speculative.
@@ -4754,8 +5830,22 @@ impl ExpertResidency for Streamed {
         };
         let draft_loads = self.counters.misses.load(Ordering::Relaxed) - misses_before - real_loads;
         let mut data = vec![0u32; 3 * n];
-        let mut open_slots: Vec<usize> = slots.clone();
-        open_slots.extend_from_slice(&draft_slots);
+        // One owner list, allocated once before mapping. HOST membership
+        // deduplicates extra slots, so repeated misses never reserve O(rows)
+        // storage: at most every active physical slot can become a reader.
+        let loaded_slots = slots
+            .len()
+            .checked_add(draft_slots.len())
+            .ok_or_else(|| lloom_tensor::Error::Msg("host reader slot count overflow".into()))?;
+        let extra_pairs = n - loaded_rows * topk;
+        let extra_slots = extra_pairs.min(inner.map.active().saturating_sub(loaded_slots));
+        let reader_capacity = loaded_slots
+            .checked_add(extra_slots)
+            .ok_or_else(|| lloom_tensor::Error::Msg("host reader slot capacity overflow".into()))?;
+        let mut pending = PendingHostGroup::new(&mut inner, Vec::new(), generation, tick);
+        pending.reserve_slots(reader_capacity)?;
+        pending.slots.extend_from_slice(&slots);
+        pending.slots.extend_from_slice(&draft_slots);
         for (i, &e) in host.iter().enumerate() {
             let (slot, miss) = if i / topk < real_rows {
                 let j = distinct
@@ -4773,29 +5863,30 @@ impl ExpertResidency for Streamed {
             } else if (e as usize) < self.n_experts {
                 // A draft row reads what is resident; a miss reads slot 0
                 // and flags the row — nothing is loaded for it.
-                match inner.map.slot_of(e as usize) {
-                    Some(s) => {
-                        open_slots.push(s);
-                        (s as u32, false)
-                    }
-                    None => (0, true),
+                match pending.inner.map.slot_of(e as usize) {
+                    Some(s) => (pending.borrow_extra_slot(s), false),
+                    None => (pending.borrow_extra_slot(0), true),
                 }
             } else {
                 lloom_tensor::bail!("expert {e} out of {}", self.n_experts)
             };
+            if i / topk < loaded_rows {
+                pending.borrow_slot(slot as usize);
+            }
             data[i] = slot;
             data[n + i] = e;
             data[2 * n + i] = miss as u32;
         }
         // Every slot the dispatch reads is a reader of this epoch (`down`
         // stamps them: a direct read into one waits for it).
-        open_slots.sort_unstable();
-        open_slots.dedup();
-        inner.open_epoch = Some(tick);
-        inner.open_slots = open_slots;
-        let slot_ids = Tensor::from_vec(data[..n].to_vec(), (rows, topk), &inner.device)?;
+        pending.slots.sort_unstable();
+        pending.slots.dedup();
+        #[cfg(test)]
+        pending.inner.host_group_fault(HostGroupFault::SlotTensor)?;
+        let slot_ids = Tensor::from_vec(data[..n].to_vec(), (rows, topk), &pending.inner.device)?;
+        pending.publish();
         Ok(Some((
-            slot_ids,
+            ResolvedExperts::new(self, slot_ids, self.resolved_authority(), Some(generation)),
             WindowRecord {
                 data,
                 rows,
@@ -4817,7 +5908,7 @@ impl ExpertResidency for Streamed {
         Ok(rejected_flags)
     }
 
-    fn ensure(&self, group: &RoutedGroup) -> Result<Tensor> {
+    fn ensure(&self, group: &RoutedGroup) -> Result<ResolvedExperts<'_, Self>> {
         // What the tier allocates depends on the pool's state, not the
         // pass's shape: declared outside any pass plan (§9.2aa).
         let _escape = escape_guard();
@@ -4829,91 +5920,71 @@ impl ExpertResidency for Streamed {
         distinct.sort_unstable();
         distinct.dedup();
         let mut inner = self.inner.lock();
+        let generation = inner.next_host_group()?;
         let tick = inner.map.begin();
         let slots = self.resolve(&mut inner, &distinct, tick)?;
-        inner.open_epoch = Some(tick);
-        inner.open_slots = slots.clone();
+        let mut pending = PendingHostGroup::new(&mut inner, slots, generation, tick);
         let slot_ids: Vec<u32> = ids
             .iter()
             .map(|e| {
                 let i = distinct.binary_search(e).expect("distinct covers ids");
-                slots[i] as u32
+                let slot = pending.slots[i];
+                pending.borrow_slot(slot)
             })
             .collect();
+        #[cfg(test)]
+        pending.inner.host_group_fault(HostGroupFault::SlotTensor)?;
         #[cfg(feature = "metal")]
-        if group.rows.len() == 1 {
-            if let Some(t) = inner.write_decode_slots(&slot_ids)? {
-                return Ok(t);
-            }
-        }
-        Tensor::from_vec(slot_ids, (group.rows.len(), topk), &inner.device)
+        let reused = if group.rows.len() == 1 {
+            pending.inner.write_decode_slots(&slot_ids)?
+        } else {
+            None
+        };
+        #[cfg(not(feature = "metal"))]
+        let reused: Option<Tensor> = None;
+        let slot_ids = match reused {
+            Some(tensor) => tensor,
+            None => Tensor::from_vec(slot_ids, (group.rows.len(), topk), &pending.inner.device)?,
+        };
+        pending.publish();
+        Ok(ResolvedExperts::new(
+            self,
+            slot_ids,
+            self.resolved_authority(),
+            Some(generation),
+        ))
     }
 
+    #[inline]
     fn gate_up(
         &self,
         x: &Tensor,
-        slot_ids: &Tensor,
+        group: &mut ResolvedExperts<'_, Self>,
         arm: MoeArm,
         act: DType,
     ) -> Result<(Tensor, Tensor)> {
-        let mut inner = self.inner.lock();
-        // One launch for the pair on the matmul-vec arm on Metal; two elsewhere.
-        let out = inner.pools[0].qt.indexed_moe_forward_pair_as(
-            &inner.pools[1].qt,
-            x,
-            slot_ids,
-            arm,
-            act,
-        )?;
-        // H1 (§4.7): the slots this plan reads are stamped with the open
-        // epoch at the dispatch, so a load never writes one under it.
-        self.stamp_device_plan_readers(&mut inner);
-        Ok(out)
+        self.gate_up_resolved(x, group, arm, act)
     }
 
+    #[inline]
     fn gate_up_glu(
         &self,
         x: &Tensor,
-        slot_ids: &Tensor,
+        group: &mut ResolvedExperts<'_, Self>,
         arm: MoeArm,
         act: DType,
     ) -> Result<Option<Tensor>> {
-        let mut inner = self.inner.lock();
-        let out = inner.pools[0].qt.indexed_moe_forward_glu_as(
-            &inner.pools[1].qt,
-            x,
-            slot_ids,
-            arm,
-            act,
-        )?;
-        // The slots it read, stamped as `gate_up` stamps them (H1, §4.7).
-        if out.is_some() {
-            self.stamp_device_plan_readers(&mut inner);
-        }
-        Ok(out)
+        self.gate_up_glu_resolved(x, group, arm, act)
     }
 
-    fn down(&self, h: &Tensor, slot_ids: &Tensor, arm: MoeArm) -> Result<Tensor> {
-        let mut inner = self.inner.lock();
-        let y = inner.pools[2]
-            .qt
-            .indexed_moe_forward_with(h, slot_ids, arm)?;
-        self.stamp_device_plan_readers(&mut inner);
-        // The group's last dispatch is encoded: its slots may be given away
-        // — to a direct read once this command buffer has run.
-        inner.open_epoch = None;
-        let epoch = inner.current_epoch();
-        let slots = std::mem::take(&mut inner.open_slots);
-        for s in slots {
-            inner.map.stamp(s, epoch);
-        }
-        // The group's slot ids, if they were the tier's own buffer: its last
-        // reader is encoded into this epoch's command buffer.
-        #[cfg(feature = "metal")]
-        if inner.decode_io.slots_read_at == Some(BUSY) {
-            inner.decode_io.slots_read_at = Some(epoch);
-        }
-        Ok(y)
+    #[inline]
+    fn down(
+        &self,
+        h: &Tensor,
+        group: &mut ResolvedExperts<'_, Self>,
+        arm: MoeArm,
+    ) -> Result<Tensor> {
+        self.down_resolved(h, group, arm)
     }
 }
 
@@ -4921,6 +5992,8 @@ impl ExpertResidency for Streamed {
 mod tests {
     use super::*;
     use lloom_tensor::quantized::gguf_file;
+    #[cfg(feature = "metal")]
+    use objc2_metal::MTLResource as _;
 
     /// A stacked `[e, out, inp]` expert weight quantized to `dtype`.
     fn stacked(e: usize, out: usize, inp: usize, seed: f32, dtype: GgmlDType) -> QTensor {
@@ -4971,11 +6044,11 @@ mod tests {
         let arm = MoeArm::for_rows(x3.dim(0).unwrap());
         let mut ys = Vec::new();
         for g in &groups {
-            let slot_ids = r.ensure(g).unwrap();
+            let mut slot_ids = r.ensure(g).unwrap();
             let xg = x3.narrow(0, g.rows.start, g.rows.len()).unwrap();
-            let (gt, u) = r.gate_up(&xg, &slot_ids, arm, xg.dtype()).unwrap();
+            let (gt, u) = r.gate_up(&xg, &mut slot_ids, arm, xg.dtype()).unwrap();
             let h = (crate::nn::ops::silu(&gt).unwrap() * u).unwrap();
-            ys.push(r.down(&h, &slot_ids, arm).unwrap());
+            ys.push(r.down(&h, &mut slot_ids, arm).unwrap());
         }
         let y = Tensor::cat(&ys, 0).unwrap();
         y.flatten_all().unwrap().to_vec1::<f32>().unwrap()
@@ -5009,7 +6082,7 @@ mod tests {
         // would have found 7 missing — its record says so.
         let pre = Tensor::new(&[[1u32, 2]], &Device::Cpu).unwrap();
         for g in streamed.plan(&pre).unwrap() {
-            streamed.ensure(&g).unwrap();
+            drop(streamed.ensure(&g).unwrap());
         }
         let before = streamed.usage();
         // The record: [slots.. | ids.. | flags..] for n = topk ids.
@@ -5049,7 +6122,7 @@ mod tests {
         streamed.note_replay();
         let tok = Tensor::new(&[[1u32, 2, 7]], &Device::Cpu).unwrap();
         for g in streamed.plan(&tok).unwrap() {
-            streamed.ensure(&g).unwrap();
+            drop(streamed.ensure(&g).unwrap());
         }
         let replayed = streamed.usage();
         for &i in &ids_tok {
@@ -5060,7 +6133,7 @@ mod tests {
         }
         // A new token with the same experts: counted.
         for g in streamed.plan(&tok).unwrap() {
-            streamed.ensure(&g).unwrap();
+            drop(streamed.ensure(&g).unwrap());
         }
         let next = streamed.usage();
         for &i in &ids_tok {
@@ -5094,7 +6167,7 @@ mod tests {
         .unwrap();
         let pre = Tensor::new(&[[1u32, 2]], &Device::Cpu).unwrap();
         for g in streamed.plan(&pre).unwrap() {
-            streamed.ensure(&g).unwrap();
+            drop(streamed.ensure(&g).unwrap());
         }
         let ids_tok = [1u32, 2, 7];
         let record = |streamed: &Streamed| -> Vec<u32> {
@@ -5235,14 +6308,14 @@ mod tests {
             if missed {
                 settled_with_misses += 1;
                 // Replay: every expert is resident now, the plan is clean.
-                let (slots2, record2) = streamed.plan_device(&id).unwrap().unwrap();
+                let (mut slots2, record2) = streamed.plan_device(&id).unwrap().unwrap();
                 assert!(
                     !streamed.settle(&record2).unwrap(),
                     "token {t}: a second miss"
                 );
-                let s2: Vec<u32> = slots2.flatten_all().unwrap().to_vec1().unwrap();
+                let s2: Vec<u32> = slots2.ids.flatten_all().unwrap().to_vec1().unwrap();
                 let host = streamed.ensure(&streamed.plan(&id).unwrap()[0]).unwrap();
-                let h: Vec<u32> = host.flatten_all().unwrap().to_vec1().unwrap();
+                let h: Vec<u32> = host.ids.flatten_all().unwrap().to_vec1().unwrap();
                 assert_eq!(
                     s2, h,
                     "token {t}: the device plan's slots vs the host plan's"
@@ -5250,18 +6323,19 @@ mod tests {
                 let out = {
                     let x3 = xs.reshape((1, 1, d)).unwrap();
                     let (g, u) = streamed
-                        .gate_up(&x3, &slots2, MoeArm::MatVec, x3.dtype())
+                        .gate_up(&x3, &mut slots2, MoeArm::MatVec, x3.dtype())
                         .unwrap();
                     let hh = (crate::nn::ops::silu(&g).unwrap() * u).unwrap();
-                    streamed.down(&hh, &slots2, MoeArm::MatVec).unwrap()
+                    streamed.down(&hh, &mut slots2, MoeArm::MatVec).unwrap()
                 };
                 let want = {
                     let x3 = xs.reshape((1, 1, d)).unwrap();
+                    let mut resolved = resident.ensure(&resident.plan(&id).unwrap()[0]).unwrap();
                     let (g, u) = resident
-                        .gate_up(&x3, &id, MoeArm::MatVec, x3.dtype())
+                        .gate_up(&x3, &mut resolved, MoeArm::MatVec, x3.dtype())
                         .unwrap();
                     let hh = (crate::nn::ops::silu(&g).unwrap() * u).unwrap();
-                    resident.down(&hh, &id, MoeArm::MatVec).unwrap()
+                    resident.down(&hh, &mut resolved, MoeArm::MatVec).unwrap()
                 };
                 assert_eq!(
                     out.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
@@ -5269,9 +6343,9 @@ mod tests {
                     "token {t}: routed output"
                 );
             } else {
-                let s1: Vec<u32> = slots.flatten_all().unwrap().to_vec1().unwrap();
+                let s1: Vec<u32> = slots.ids.flatten_all().unwrap().to_vec1().unwrap();
                 let host = streamed.ensure(&streamed.plan(&id).unwrap()[0]).unwrap();
-                let h: Vec<u32> = host.flatten_all().unwrap().to_vec1().unwrap();
+                let h: Vec<u32> = host.ids.flatten_all().unwrap().to_vec1().unwrap();
                 assert_eq!(s1, h, "token {t}: a clean device plan vs the host plan");
             }
         }
@@ -5328,7 +6402,7 @@ mod tests {
         let u = streamed.usage();
         assert_eq!((u[7], u[3], u[9], u[1]), (1, 1, 1, 0));
         let groups = streamed.plan(&id).unwrap();
-        streamed.ensure(&groups[0]).unwrap();
+        drop(streamed.ensure(&groups[0]).unwrap());
         assert_eq!(
             streamed.usage()[7],
             2,
@@ -5380,6 +6454,713 @@ mod tests {
         drop(inner);
         assert!(streamed.stats().evictions > 0);
         std::fs::remove_file(path).ok();
+    }
+
+    fn finish_test_host_group<R: ExpertResidency>(
+        r: &R,
+        xs: &Tensor,
+        slots: &mut ResolvedExperts<'_, R>,
+    ) -> Vec<f32> {
+        let x3 = xs.reshape((1, 1, 32)).unwrap();
+        let (g, u) = r.gate_up(&x3, slots, MoeArm::MatVec, DType::F32).unwrap();
+        let h = (crate::nn::ops::silu(&g).unwrap() * u).unwrap();
+        let out = r.down(&h, slots, MoeArm::MatVec);
+        xs.device().synchronize().unwrap();
+        out.unwrap().flatten_all().unwrap().to_vec1().unwrap()
+    }
+
+    #[test]
+    fn a_host_group_prevents_shrink_until_down_then_the_same_resize_retries() {
+        let gate = stacked(8, 32, 32, 1.0, GgmlDType::F32);
+        let up = stacked(8, 32, 32, 2.0, GgmlDType::F32);
+        let down = stacked(8, 32, 32, 3.0, GgmlDType::F32);
+        let path = write_gguf(&[("g", &gate), ("u", &up), ("d", &down)]);
+        let tier = Streamed::new(
+            open(&path, "g"),
+            open(&path, "u"),
+            open(&path, "d"),
+            6,
+            LoaderArm::Pread,
+            &Device::Cpu,
+        )
+        .unwrap();
+        tier.shrink_slots(4, 1).unwrap();
+        assert_eq!(tier.warm(&[0, 1, 2, 3]).unwrap(), 4);
+        let ids = Tensor::new(&[[3u32]], &Device::Cpu).unwrap();
+        let groups = tier.plan(&ids).unwrap();
+        let mut slots = tier.ensure(&groups[0]).unwrap();
+        assert_eq!(slots.ids.to_vec2::<u32>().unwrap(), vec![vec![3]]);
+        let before = {
+            let inner = tier.inner.lock();
+            assert!(inner.open_epoch.is_some(), "must hold a real host group");
+            assert_eq!(inner.plans_open, 0, "not a device-plan refusal control");
+            assert_eq!(inner.map.inflight_count(), 0);
+            (
+                format!("{:?}", inner.map),
+                inner.pools.each_ref().map(|p| p.qt.storage_size_in_bytes()),
+                inner
+                    .pools
+                    .iter()
+                    .map(|p| p.qt.data().unwrap().into_owned())
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let stats = format!("{:?}", tier.stats());
+        let error = tier.shrink_slots(2, 1).unwrap_err();
+        assert!(error.to_string().contains("host group"), "{error}");
+        {
+            let inner = tier.inner.lock();
+            assert_eq!(format!("{:?}", inner.map), before.0);
+            assert_eq!(
+                inner.pools.each_ref().map(|p| p.qt.storage_size_in_bytes()),
+                before.1
+            );
+            for (p, bytes) in inner.pools.iter().zip(&before.2) {
+                assert_eq!(p.qt.data().unwrap().as_ref(), bytes.as_slice());
+            }
+            assert!(
+                inner.open_epoch.is_some(),
+                "refusal closed the caller's group"
+            );
+        }
+        assert_eq!(format!("{:?}", tier.stats()), stats);
+        let xs = x(1, 32, 0.25);
+        let reference = Resident::new(Arc::new(gate), Arc::new(up), Arc::new(down));
+        let want = run(&reference, &xs, &ids);
+        assert_eq!(finish_test_host_group(&tier, &xs, &mut slots), want);
+        assert!(tier.inner.lock().open_epoch.is_none());
+        assert!(
+            tier.shrink_slots(2, 1).unwrap() > 0,
+            "retry after down must work"
+        );
+        assert_eq!(tier.active_slots(), 2);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    /// Fixture cleanup is not a production wait: native readers must retire
+    /// before a failed control unwinds through its owning tier.
+    struct HostGroupTestDrain<'a>(&'a Device);
+    impl Drop for HostGroupTestDrain<'_> {
+        fn drop(&mut self) {
+            let result = self.0.synchronize();
+            if std::thread::panicking() {
+                if let Err(error) = result {
+                    eprintln!("HOST_GROUP_TEST_DRAIN_FAILED {error}");
+                }
+            } else {
+                result.unwrap();
+            }
+        }
+    }
+
+    fn host_group_growth_control(dev: &Device) {
+        let gate = stacked(8, 32, 32, 1.0, GgmlDType::F32);
+        let up = stacked(8, 32, 32, 2.0, GgmlDType::F32);
+        let down = stacked(8, 32, 32, 3.0, GgmlDType::F32);
+        let path = write_gguf(&[("g", &gate), ("u", &up), ("d", &down)]);
+        let tier = Streamed::new(
+            open(&path, "g"),
+            open(&path, "u"),
+            open(&path, "d"),
+            6,
+            LoaderArm::Pread,
+            dev,
+        )
+        .unwrap();
+        let _drain = HostGroupTestDrain(dev);
+        tier.shrink_slots(4, 1).unwrap();
+        let warmed = tier.warm(&[0, 1, 2, 3]);
+        dev.synchronize().unwrap();
+        assert_eq!(warmed.unwrap(), 4);
+        let ids = Tensor::new(&[[3u32]], dev).unwrap();
+        let groups = tier.plan(&ids).unwrap();
+        let mut slots = tier.ensure(&groups[0]).unwrap();
+        let group = tier.inner.lock().open_epoch.expect("host group nonvacuity");
+        let grown = tier.grow_slots(6);
+        dev.synchronize().unwrap();
+        assert!(grown.unwrap() > 0);
+        assert_eq!(tier.active_slots(), 6);
+        assert_eq!(
+            tier.inner.lock().open_epoch,
+            Some(group),
+            "growth changed group ownership"
+        );
+        let xs = x(1, 32, 0.25).to_device(dev).unwrap();
+        let onto = |q: QTensor| {
+            if dev.is_cpu() {
+                q
+            } else {
+                QTensor::quantize_onto(&q.dequantize(&Device::Cpu).unwrap(), GgmlDType::F32, dev)
+                    .unwrap()
+            }
+        };
+        let reference = Resident::new(
+            Arc::new(onto(gate)),
+            Arc::new(onto(up)),
+            Arc::new(onto(down)),
+        );
+        let want = run(&reference, &xs, &ids);
+        assert_eq!(finish_test_host_group(&tier, &xs, &mut slots), want);
+        assert!(tier.inner.lock().open_epoch.is_none());
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn a_host_group_survives_growth_without_a_new_refusal_or_changed_projections() {
+        host_group_growth_control(&Device::Cpu);
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn a_host_group_survives_growth_and_projects_through_replacement_banks_metal() {
+        host_group_growth_control(&resize_control_device());
+    }
+
+    fn host_group_fixture_on(dev: &Device) -> (Streamed, PathBuf) {
+        let g = stacked(8, 32, 32, 1.0, GgmlDType::F32);
+        let u = stacked(8, 32, 32, 2.0, GgmlDType::F32);
+        let d = stacked(8, 32, 32, 3.0, GgmlDType::F32);
+        let path = write_gguf(&[("g", &g), ("u", &u), ("d", &d)]);
+        let tier = Streamed::new(
+            open(&path, "g"),
+            open(&path, "u"),
+            open(&path, "d"),
+            6,
+            LoaderArm::Pread,
+            dev,
+        )
+        .unwrap();
+        tier.shrink_slots(4, 1).unwrap();
+        tier.warm(&[0, 1, 2, 3]).unwrap();
+        dev.synchronize().unwrap();
+        (tier, path)
+    }
+
+    fn host_group_fixture() -> (Streamed, PathBuf) {
+        host_group_fixture_on(&Device::Cpu)
+    }
+
+    #[test]
+    fn a_host_group_refuses_a_second_before_resolution_but_preserves_noop_resizes() {
+        let (tier, path) = host_group_fixture();
+        let groups = tier.plan_host(&[3u32], 1, 1).unwrap().unwrap();
+        let second = tier.plan_host(&[7u32], 1, 1).unwrap().unwrap();
+        let mut first = tier.ensure(&groups[0]).unwrap();
+        let before = (
+            format!("{:?}", tier.inner.lock().map),
+            format!("{:?}", tier.stats()),
+        );
+        let generation = tier.inner.lock().host_group_active.unwrap();
+        assert!(tier
+            .ensure(&second[0])
+            .unwrap_err()
+            .to_string()
+            .contains("already open"));
+        assert_eq!(format!("{:?}", tier.inner.lock().map), before.0);
+        assert_eq!(format!("{:?}", tier.stats()), before.1);
+        assert_eq!(tier.inner.lock().host_group_active, Some(generation));
+        assert_eq!(tier.shrink_slots(4, 1).unwrap(), 0);
+        assert_eq!(tier.shrink_slots(1, 4).unwrap(), 0);
+        assert_eq!(tier.grow_slots(4).unwrap(), 0);
+        assert_eq!(tier.inner.lock().host_group_active, Some(generation));
+        finish_test_host_group(&tier, &x(1, 32, 0.25), &mut first);
+        let retry = tier.ensure(&second[0]).unwrap();
+        drop(retry);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn a_host_group_pre_return_slot_fault_has_no_open_marker_then_retries() {
+        for window in [false, true] {
+            let (tier, path) = host_group_fixture();
+            let ids = Tensor::new(&[[3u32]], &Device::Cpu).unwrap();
+            let groups = tier.plan(&ids).unwrap();
+            tier.inner.lock().host_group_fail_at = Some(HostGroupFault::SlotTensor);
+            let message = if window {
+                tier.plan_window(&ids, 1, 1).unwrap_err().to_string()
+            } else {
+                tier.ensure(&groups[0]).unwrap_err().to_string()
+            };
+            assert!(message.contains("SlotTensor"), "{message}");
+            {
+                let inner = tier.inner.lock();
+                assert_eq!(inner.open_epoch, None);
+                assert_eq!(inner.host_group_active, None);
+                assert!(
+                    (0..inner.map.n_slots())
+                        .all(|slot| !inner.map.cache.host_borrowed(SlotId(slot as u32))),
+                    "pre-return failure leaked HOST custody before resize could erase it"
+                );
+                assert_eq!(
+                    inner.host_group_last, 0,
+                    "failed return published a generation"
+                );
+            }
+            assert!(tier.shrink_slots(2, 1).unwrap() > 0);
+            assert!(tier.grow_slots(4).unwrap() > 0);
+            let mut retry = tier.ensure(&groups[0]).unwrap();
+            finish_test_host_group(&tier, &x(1, 32, 0.25), &mut retry);
+            assert!(retry.closed);
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+
+    fn host_group_projection_fault_control(dev: &Device) {
+        #[cfg(feature = "metal")]
+        if dev.is_metal() {
+            use lloom_tensor::kernels::{mv_id2_glu_applies, GemvTriple};
+            use lloom_tensor::quantized::PairOrder;
+            assert_eq!(std::env::var("LLOOM_MOE_PAIR").as_deref(), Ok("on"));
+            assert_eq!(
+                std::env::var("LLOOM_MOE_PAIR_ORDER").as_deref(),
+                Ok("expert")
+            );
+            assert!(lloom_tensor::tuning::tuning().moe.pair);
+            assert_eq!(PairOrder::configured(), PairOrder::Expert);
+            assert!(
+                mv_id2_glu_applies(
+                    lloom_tensor::kernels::GgmlDType::F32,
+                    GemvTriple::F32F32F32,
+                    1,
+                ),
+                "encoded-fault fixture must have a supported one-launch GLU route"
+            );
+            eprintln!("HOST_GROUP_ENCODED_ROUTE pair=on order=expert weights=F32 triple=F32F32F32 batch=1");
+            assert!(
+                lloom_tensor::kernels::metal::profile::enabled(),
+                "native encoded-work control requires CANDLE_METAL_PROFILE=1"
+            );
+        }
+        for fault in [
+            HostGroupFault::GateUp,
+            HostGroupFault::GateUpGlu,
+            HostGroupFault::Down,
+        ] {
+            let (tier, path) = host_group_fixture_on(dev);
+            let _drain = HostGroupTestDrain(dev);
+            let ids = Tensor::new(&[[3u32]], dev).unwrap();
+            let group = tier.plan(&ids).unwrap();
+            let mut resolved = tier.ensure(&group[0]).unwrap();
+            let xs = x(1, 32, 0.25).to_device(dev).unwrap();
+            #[cfg(feature = "metal")]
+            if dev.is_metal() {
+                // Force/complete an independent recording AFTER resolution.
+                // The projection's reader epoch must then be strictly newer
+                // than any ensure/initialization stamp; omission cannot hide
+                // behind an already-stamped same epoch.
+                let fence = Tensor::ones(1, DType::F32, dev)
+                    .unwrap()
+                    .affine(2.0, 1.0)
+                    .unwrap();
+                dev.synchronize().unwrap();
+                assert_eq!(fence.to_vec1::<f32>().unwrap(), vec![3.0]);
+            }
+            tier.inner.lock().host_group_fail_at = Some(fault);
+            #[cfg(feature = "metal")]
+            let mut native_before = if dev.is_metal() {
+                use lloom_tensor::kernels::metal::profile;
+                let inner = tier.inner.lock();
+                assert_eq!(xs.dtype(), DType::F32);
+                assert_eq!(xs.dim(0).unwrap(), 1);
+                assert!(inner
+                    .pools
+                    .iter()
+                    .all(|pool| pool.qt.dtype() == GgmlDType::F32));
+                let slot = inner.map.slot_of(3).unwrap();
+                let epoch = inner.current_epoch();
+                assert!(
+                    inner.map.reader_epoch(slot) < epoch,
+                    "fixture has no fresh projection epoch; omission could be masked"
+                );
+                Some((profile::dispatch_count(), epoch, slot))
+            } else {
+                None
+            };
+            let result = match fault {
+                HostGroupFault::GateUp => tier
+                    .gate_up(&xs, &mut resolved, MoeArm::MatVec, DType::F32)
+                    .map(|_| ()),
+                HostGroupFault::GateUpGlu => tier
+                    .gate_up_glu(&xs, &mut resolved, MoeArm::MatVec, DType::F32)
+                    .map(|_| ()),
+                HostGroupFault::Down => {
+                    let gu = tier.gate_up(&xs, &mut resolved, MoeArm::MatVec, DType::F32);
+                    dev.synchronize().unwrap();
+                    let (g, u) = gu.unwrap();
+                    let h = (crate::nn::ops::silu(&g).unwrap() * u).unwrap();
+                    dev.synchronize().unwrap();
+                    #[cfg(feature = "metal")]
+                    if let Some((_, _, slot)) = native_before {
+                        let inner = tier.inner.lock();
+                        let epoch = inner.current_epoch();
+                        assert!(
+                            inner.map.reader_epoch(slot) < epoch,
+                            "down omission would be masked by an earlier reader stamp"
+                        );
+                        native_before = Some((
+                            lloom_tensor::kernels::metal::profile::dispatch_count(),
+                            epoch,
+                            slot,
+                        ));
+                    }
+                    tier.down(&h, &mut resolved, MoeArm::MatVec).map(|_| ())
+                }
+                HostGroupFault::SlotTensor => unreachable!(),
+            };
+            #[cfg(feature = "metal")]
+            let native_after = native_before.map(|(_, _, slot)| {
+                (
+                    lloom_tensor::kernels::metal::profile::dispatch_count(),
+                    tier.inner.lock().map.reader_epoch(slot),
+                )
+            });
+            // This is a host-injected error AFTER successful native encode, not
+            // a GPU fault/retirement claim. Complete actual readers before any
+            // result/assertion unwind or the resize/retry below.
+            dev.synchronize().unwrap();
+            let error = result.unwrap_err().to_string();
+            #[cfg(feature = "metal")]
+            if let (Some((before, epoch, _)), Some((after, reader))) = (native_before, native_after)
+            {
+                assert!(
+                    after > before,
+                    "{fault:?} did not encode native work before error"
+                );
+                assert!(reader >= epoch, "{fault:?} failed to stamp encoded readers");
+                eprintln!("HOST_GROUP_FAULT_ENCODED fault={fault:?} dispatches={} reader={reader:?} epoch={epoch:?}", after - before);
+            }
+            assert!(error.contains("test-only host group fault"), "{error}");
+            assert!(resolved.closed);
+            assert!(resolved.generation.is_none());
+            assert_eq!(tier.inner.lock().open_epoch, None);
+            assert_eq!(tier.inner.lock().host_group_active, None);
+            assert!(tier.shrink_slots(2, 1).unwrap() > 0);
+            assert!(tier.grow_slots(4).unwrap() > 0);
+            let mut retry = tier.ensure(&group[0]).unwrap();
+            assert!(
+                tier.gate_up(&xs, &mut resolved, MoeArm::MatVec, DType::F32)
+                    .is_err(),
+                "closed host handle degraded into an untracked device group"
+            );
+            let active = tier.inner.lock().host_group_active;
+            drop(resolved);
+            assert_eq!(
+                tier.inner.lock().host_group_active,
+                active,
+                "old drop closed retry"
+            );
+            finish_test_host_group(&tier, &xs, &mut retry);
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_host_group_projection_faults_close_under_existing_lock_and_allow_resize_retry() {
+        host_group_projection_fault_control(&Device::Cpu);
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn a_host_group_encoded_projection_faults_close_then_retire_and_retry_metal() {
+        host_group_projection_fault_control(&resize_control_device());
+    }
+
+    #[test]
+    fn a_host_group_drop_stale_generation_and_wrong_authority_cannot_close_a_new_group() {
+        let (tier, path) = host_group_fixture();
+        let ids = Tensor::new(&[[3u32]], &Device::Cpu).unwrap();
+        let groups = tier.plan(&ids).unwrap();
+        let first = tier.ensure(&groups[0]).unwrap();
+        let old = first.generation.unwrap();
+        drop(first); // external narrow/prefetch/SwiGLU error's scoped cleanup.
+        assert_eq!(tier.inner.lock().host_group_active, None);
+        assert!(tier.shrink_slots(2, 1).unwrap() > 0);
+        tier.grow_slots(4).unwrap();
+        let mut next = tier.ensure(&groups[0]).unwrap();
+        let current = next.generation.unwrap();
+        assert!(current > old);
+        let stale = ResolvedExperts::new(
+            &tier,
+            next.ids.clone(),
+            tier.resolved_authority(),
+            Some(old),
+        );
+        drop(stale);
+        assert_eq!(tier.inner.lock().host_group_active, Some(current));
+        let wrong = ResolvedExperts::new(
+            &tier,
+            next.ids.clone(),
+            tier.resolved_authority() ^ 1,
+            Some(current),
+        );
+        drop(wrong);
+        assert_eq!(tier.inner.lock().host_group_active, Some(current));
+        finish_test_host_group(&tier, &x(1, 32, 0.25), &mut next);
+        assert!(next.closed);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn a_host_group_success_keeps_tensor_identity_and_adds_no_drop_cleanup_lock() {
+        let (tier, path) = host_group_fixture();
+        let query = Tensor::new(&[[3u32]], &Device::Cpu).unwrap();
+        let groups = tier.plan(&query).unwrap();
+        let mut host = tier.ensure(&groups[0]).unwrap();
+        let id = host.ids.id();
+        assert_eq!(
+            tier.counters.host_group_abort_locks.load(Ordering::Relaxed),
+            0
+        );
+        finish_test_host_group(&tier, &x(1, 32, 0.25), &mut host);
+        assert_eq!(host.ids.id(), id, "closing rebuilt/cloned a Tensor view");
+        drop(host);
+        assert_eq!(
+            tier.counters.host_group_abort_locks.load(Ordering::Relaxed),
+            0,
+            "successful down added a cleanup lock"
+        );
+        let device_ids = Tensor::new(&[[0u32]], &Device::Cpu).unwrap();
+        let id = device_ids.id();
+        let device = ResolvedExperts::new(&tier, device_ids, tier.resolved_authority(), None);
+        assert_eq!(
+            device.ids.id(),
+            id,
+            "opaque wrapper changed device Tensor identity"
+        );
+        drop(device);
+        assert_eq!(
+            tier.counters.host_group_abort_locks.load(Ordering::Relaxed),
+            0,
+            "device handle attempted host-group cleanup"
+        );
+        let unfinished = tier.ensure(&groups[0]).unwrap();
+        drop(unfinished);
+        assert_eq!(
+            tier.counters.host_group_abort_locks.load(Ordering::Relaxed),
+            1,
+            "external-error cleanup positive was not exercised"
+        );
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn a_resolved_resident_checks_all_bank_owners_and_preserves_identical_clones() {
+        let gate = Arc::new(stacked(8, 32, 32, 1.0, GgmlDType::F32));
+        let up = Arc::new(stacked(8, 32, 32, 2.0, GgmlDType::F32));
+        let down = Arc::new(stacked(8, 32, 32, 3.0, GgmlDType::F32));
+        let owner = Resident::new(gate.clone(), up, down.clone());
+        let clone = owner.clone();
+        // Same gate alone is NOT the same bank custody.
+        let other = Resident::new(
+            gate,
+            Arc::new(stacked(8, 32, 32, 4.0, GgmlDType::F32)),
+            down,
+        );
+        let ids = Tensor::new(&[[3u32]], &Device::Cpu).unwrap();
+        let groups = owner.plan(&ids).unwrap();
+        let xs = x(1, 32, 0.25);
+        let mut typed = owner.ensure(&groups[0]).unwrap();
+        assert!(other
+            .gate_up(&xs, &mut typed, MoeArm::MatVec, DType::F32)
+            .is_err());
+        let (g, _) = clone
+            .gate_up(&xs, &mut typed, MoeArm::MatVec, DType::F32)
+            .unwrap();
+        let expected = clone.down(&g, &mut typed, MoeArm::MatVec).unwrap();
+        let mut erased = owner.ensure_erased(&groups[0]).unwrap();
+        assert!(other
+            .gate_up_erased(&xs, &mut erased.as_projection(), MoeArm::MatVec, DType::F32)
+            .is_err());
+        let (g, _) = clone
+            .gate_up_erased(&xs, &mut erased.as_projection(), MoeArm::MatVec, DType::F32)
+            .unwrap();
+        let actual = clone
+            .down_erased(&g, &mut erased.as_projection(), MoeArm::MatVec)
+            .unwrap();
+        assert_eq!(
+            actual.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            expected.flatten_all().unwrap().to_vec1::<f32>().unwrap()
+        );
+    }
+
+    #[test]
+    fn a_resolved_erased_streamed_slots_are_not_resident_expert_ids_or_another_tiers_slots() {
+        let (tier, path) = host_group_fixture();
+        let other = Streamed::new(
+            open(&path, "g"),
+            open(&path, "u"),
+            open(&path, "d"),
+            6,
+            LoaderArm::Pread,
+            &Device::Cpu,
+        )
+        .unwrap();
+        let resident = Resident::new(
+            Arc::new(stacked(8, 32, 32, 1.0, GgmlDType::F32)),
+            Arc::new(stacked(8, 32, 32, 2.0, GgmlDType::F32)),
+            Arc::new(stacked(8, 32, 32, 3.0, GgmlDType::F32)),
+        );
+        let ids = Tensor::new(&[[3u32]], &Device::Cpu).unwrap();
+        let groups = tier.plan(&ids).unwrap();
+        let xs = x(1, 32, 0.25);
+        let mut typed = tier.ensure(&groups[0]).unwrap();
+        let other_groups = other.plan(&ids).unwrap();
+        let mut other_live = other.ensure(&other_groups[0]).unwrap();
+        assert_eq!(
+            typed.generation, other_live.generation,
+            "wrong-owner control must not be saved by a generation mismatch"
+        );
+        let generations = (
+            tier.inner.lock().host_group_active,
+            other.inner.lock().host_group_active,
+        );
+        assert!(
+            other
+                .gate_up(&xs, &mut typed, MoeArm::MatVec, DType::F32)
+                .is_err(),
+            "different live same-generation owner accepted typed slots"
+        );
+        assert_eq!(
+            (
+                tier.inner.lock().host_group_active,
+                other.inner.lock().host_group_active
+            ),
+            generations,
+            "wrong-owner typed refusal changed either live group"
+        );
+        finish_test_host_group(&tier, &xs, &mut typed);
+        let mut erased = tier.ensure_erased(&groups[0]).unwrap();
+        assert!(other
+            .gate_up_erased(&xs, &mut erased.as_projection(), MoeArm::MatVec, DType::F32)
+            .is_err());
+        assert!(resident
+            .gate_up_erased(&xs, &mut erased.as_projection(), MoeArm::MatVec, DType::F32)
+            .is_err());
+        assert!(
+            tier.inner.lock().host_group_active.is_some(),
+            "wrong owner closed the original group"
+        );
+        assert_eq!(
+            other.inner.lock().host_group_active,
+            other_live.generation,
+            "wrong erased owner altered its unrelated live group"
+        );
+        drop(erased);
+        assert!(tier.inner.lock().host_group_active.is_none());
+        let mut logical = resident
+            .ensure_erased(&resident.plan(&ids).unwrap()[0])
+            .unwrap();
+        assert!(tier
+            .gate_up_erased(
+                &xs,
+                &mut logical.as_projection(),
+                MoeArm::MatVec,
+                DType::F32
+            )
+            .is_err());
+        finish_test_host_group(&other, &xs, &mut other_live);
+        assert!(other_live.closed);
+        assert!(other.inner.lock().host_group_active.is_none());
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn a_resolved_shared_and_rejected_send_extractions_keep_exact_once_original_cleanup() {
+        let (tier, path) = host_group_fixture();
+        let ids = Tensor::new(&[[3u32]], &Device::Cpu).unwrap();
+        let groups = tier.plan(&ids).unwrap();
+        let xs = x(1, 32, 0.25);
+        let before = tier.counters.host_group_abort_locks.load(Ordering::Relaxed);
+        let local = tier.ensure(&groups[0]).unwrap().into_erased();
+        let local = match local.try_into_send() {
+            Err(original) => original,
+            Ok(_) => panic!("Local capability was silently upgraded to Shared"),
+        };
+        assert!(tier.inner.lock().host_group_active.is_some());
+        drop(local);
+        assert_eq!(
+            tier.counters.host_group_abort_locks.load(Ordering::Relaxed),
+            before + 1
+        );
+        assert!(tier.inner.lock().host_group_active.is_none());
+        let owner: &(dyn ExpertResidency + Sync) = &tier;
+        let shared = match owner.ensure_erased(&groups[0]).unwrap().try_into_send() {
+            Ok(shared) => shared,
+            Err(_) => panic!("Streamed did not retain its actual Sync owner"),
+        };
+        let active = shared.host_lease().1;
+        std::thread::scope(|scope| {
+            scope
+                .spawn(move || {
+                    let mut shared = shared;
+                    let (g, _) = owner
+                        .gate_up_erased(
+                            &xs,
+                            &mut shared.as_erased_projection(),
+                            MoeArm::MatVec,
+                            DType::F32,
+                        )
+                        .unwrap();
+                    owner
+                        .down_erased(&g, &mut shared.as_erased_projection(), MoeArm::MatVec)
+                        .unwrap();
+                    assert!(shared.host_lease().1.is_none());
+                    drop(shared);
+                })
+                .join()
+                .unwrap();
+        });
+        assert!(active.is_some());
+        assert!(tier.inner.lock().host_group_active.is_none());
+        assert_eq!(
+            tier.counters.host_group_abort_locks.load(Ordering::Relaxed),
+            before + 1,
+            "success added Drop abort/lock"
+        );
+        let shared = match owner.ensure_erased(&groups[0]).unwrap().try_into_send() {
+            Ok(shared) => shared,
+            Err(_) => panic!("missing Shared custody"),
+        };
+        assert_ne!(shared.host_lease().1, active);
+        std::thread::scope(|scope| {
+            scope.spawn(move || drop(shared)).join().unwrap();
+        });
+        assert_eq!(
+            tier.counters.host_group_abort_locks.load(Ordering::Relaxed),
+            before + 2,
+            "error Drop must abort once"
+        );
+        assert!(tier.inner.lock().host_group_active.is_none());
+        // Same production owner remains usable after both extraction paths.
+        let mut retry = tier.ensure(&groups[0]).unwrap();
+        finish_test_host_group(&tier, &x(1, 32, 0.25), &mut retry);
+        assert_eq!(
+            tier.counters.host_group_abort_locks.load(Ordering::Relaxed),
+            before + 2
+        );
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn a_host_group_generation_exhaustion_refuses_before_resolution_without_wrapping() {
+        let (tier, path) = host_group_fixture();
+        let groups = tier.plan_host(&[7u32], 1, 1).unwrap().unwrap();
+        tier.inner.lock().host_group_last = u64::MAX;
+        let before = (
+            format!("{:?}", tier.inner.lock().map),
+            format!("{:?}", tier.stats()),
+        );
+        let error = tier.ensure(&groups[0]).unwrap_err();
+        assert!(
+            error.to_string().contains("generation exhausted"),
+            "{error}"
+        );
+        assert_eq!(tier.inner.lock().host_group_last, u64::MAX);
+        assert_eq!(tier.inner.lock().host_group_active, None);
+        assert_eq!(format!("{:?}", tier.inner.lock().map), before.0);
+        assert_eq!(format!("{:?}", tier.stats()), before.1);
+        assert!(!tier.resident().contains(&7));
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
@@ -5456,15 +7237,15 @@ mod tests {
         assert!(tier.grow_slots(6).unwrap() > 0);
         assert_eq!(tier.active_slots(), 6);
         let ids = Tensor::new(&[[0u32], [1], [2]], &Device::Cpu).unwrap();
-        let (slots, record) = tier.plan_window(&ids, 3, 3).unwrap().expect("grown6 fits3");
+        let (mut slots, record) = tier.plan_window(&ids, 3, 3).unwrap().expect("grown6 fits3");
         assert_eq!((record.rows, record.topk, record.real_loads), (3, 1, 3));
         let xs = x(3, 32, 0.25);
         let (g, u) = tier
-            .gate_up(&xs, &slots, MoeArm::MatVec, DType::F32)
+            .gate_up(&xs, &mut slots, MoeArm::MatVec, DType::F32)
             .unwrap();
         let h = (crate::nn::ops::silu(&g).unwrap() * u).unwrap();
         let got = tier
-            .down(&h, &slots, MoeArm::MatVec)
+            .down(&h, &mut slots, MoeArm::MatVec)
             .unwrap()
             .flatten_all()
             .unwrap()
@@ -5474,6 +7255,593 @@ mod tests {
         assert_eq!(got, run(&reference, &xs, &ids));
         assert_eq!(tier.resident().len(), 3);
         assert!(tier.inner.lock().open_epoch.is_none());
+        std::fs::remove_file(path).unwrap();
+    }
+
+    fn host_pin_fixture() -> (Streamed, Resident, PathBuf) {
+        let g = stacked(8, 32, 32, 1.0, GgmlDType::F32);
+        let u = stacked(8, 32, 32, 2.0, GgmlDType::F32);
+        let d = stacked(8, 32, 32, 3.0, GgmlDType::F32);
+        let path = write_gguf(&[("g", &g), ("u", &u), ("d", &d)]);
+        let tier = Streamed::new(
+            open(&path, "g"),
+            open(&path, "u"),
+            open(&path, "d"),
+            6,
+            LoaderArm::Pread,
+            &Device::Cpu,
+        )
+        .unwrap();
+        tier.shrink_slots(4, 1).unwrap();
+        tier.warm(&[0, 1, 2, 3]).unwrap();
+        (
+            tier,
+            Resident::new(Arc::new(g), Arc::new(u), Arc::new(d)),
+            path,
+        )
+    }
+
+    #[test]
+    fn a_live_host_group_refuses_pin_only_when_other_slots_cannot_hold_it() {
+        let (tier, _reference, path) = host_pin_fixture();
+        let ids = Tensor::new(&[[3u32]], &Device::Cpu).unwrap();
+        let groups = tier.plan(&ids).unwrap();
+        let slots = tier.ensure(&groups[0]).unwrap();
+        let slot = slots.ids.to_vec2::<u32>().unwrap()[0][0] as usize;
+        assert!(tier.inner.lock().open_epoch.is_some());
+        assert_eq!(tier.inner.lock().map.expert_in(slot), 3);
+        let result = tier.pin(&[4, 5, 6, 7]);
+        assert!(
+            result.is_err(),
+            "public pin replaced a live host group's slot: {result:?}, resident={:?}",
+            tier.resident()
+        );
+        assert_eq!(tier.inner.lock().map.expert_in(slot), 3);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn a_live_host_group_pin_touch_then_unpin_does_not_erase_custody() {
+        let (tier, _reference, path) = host_pin_fixture();
+        let ids = Tensor::new(&[[3u32]], &Device::Cpu).unwrap();
+        let groups = tier.plan(&ids).unwrap();
+        let slots = tier.ensure(&groups[0]).unwrap();
+        let slot = slots.ids.to_vec2::<u32>().unwrap()[0][0] as usize;
+        let group_tick = tier.inner.lock().open_epoch.unwrap();
+        tier.pin(&[3]).unwrap(); // touches the live slot with a different recency tick.
+        tier.unpin_all(); // user pin policy must remain independent of host custody.
+        assert_ne!(tier.inner.lock().map.tick(), group_tick);
+        assert_eq!(tier.inner.lock().map.pinned_count(), 0);
+        let result = tier.pin(&[4, 5, 6, 7]);
+        assert!(
+            result.is_err(),
+            "touch/unpin erased the live-group protection: {result:?}, resident={:?}",
+            tier.resident()
+        );
+        assert_eq!(tier.inner.lock().map.expert_in(slot), 3);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn a_live_host_group_allows_pin_on_other_slots_and_preserves_its_projection() {
+        let (tier, reference, path) = host_pin_fixture();
+        let ids = Tensor::new(&[[3u32]], &Device::Cpu).unwrap();
+        let groups = tier.plan(&ids).unwrap();
+        let mut slots = tier.ensure(&groups[0]).unwrap();
+        tier.pin(&[4, 5, 6]).unwrap();
+        assert_eq!(tier.inner.lock().map.pinned_count(), 3);
+        let xs = x(1, 32, 0.25);
+        let (g, u) = tier
+            .gate_up(&xs, &mut slots, MoeArm::MatVec, DType::F32)
+            .unwrap();
+        let h = (crate::nn::ops::silu(&g).unwrap() * u).unwrap();
+        let got = tier
+            .down(&h, &mut slots, MoeArm::MatVec)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        assert_eq!(got, run(&reference, &xs, &ids));
+        assert_eq!(
+            tier.inner.lock().map.pinned_count(),
+            3,
+            "group cleanup cleared user pins"
+        );
+        // Other slots remain user-pinned: after down only the former host
+        // slot can serve this request. This detects missing down enrollment release.
+        tier.pin(&[0]).unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn a_live_host_group_window_enrollment_protects_its_slots_and_down_releases_them() {
+        let (tier, reference, path) = host_pin_fixture();
+        let ids = Tensor::new(&[[3u32]], &Device::Cpu).unwrap();
+        let (mut slots, _) = tier.plan_window(&ids, 1, 1).unwrap().unwrap();
+        let slot = slots.ids.to_vec2::<u32>().unwrap()[0][0] as usize;
+        let result = tier.pin(&[4, 5, 6, 7]);
+        assert!(
+            result.is_err(),
+            "host window did not enroll custody: {result:?}"
+        );
+        assert_eq!(tier.inner.lock().map.expert_in(slot), 3);
+        let xs = x(1, 32, 0.25);
+        let (g, u) = tier
+            .gate_up(&xs, &mut slots, MoeArm::MatVec, DType::F32)
+            .unwrap();
+        let h = (crate::nn::ops::silu(&g).unwrap() * u).unwrap();
+        let got = tier
+            .down(&h, &mut slots, MoeArm::MatVec)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        assert_eq!(got, run(&reference, &xs, &ids));
+        assert!(
+            !tier
+                .inner
+                .lock()
+                .map
+                .cache
+                .host_borrowed(SlotId(slot as u32)),
+            "down left host custody set"
+        );
+        std::fs::remove_file(path).unwrap();
+    }
+
+    fn empty_fallback_window_control(spare: usize) {
+        let g = stacked(8, 32, 32, 1.0, GgmlDType::F32);
+        let u = stacked(8, 32, 32, 2.0, GgmlDType::F32);
+        let d = stacked(8, 32, 32, 3.0, GgmlDType::F32);
+        let path = write_gguf(&[("g", &g), ("u", &u), ("d", &d)]);
+        let mut tier = Streamed::new(
+            open(&path, "g"),
+            open(&path, "u"),
+            open(&path, "d"),
+            4,
+            LoaderArm::Pread,
+            &Device::Cpu,
+        )
+        .unwrap();
+        tier.set_spare_slots(spare).unwrap();
+        assert!(tier.resident().is_empty());
+        let ids = Tensor::new(&[[7u32]], &Device::Cpu).unwrap();
+        let (mut group, record) = tier.plan_window(&ids, 0, 0).unwrap().unwrap();
+        assert_eq!(group.ids.to_vec2::<u32>().unwrap(), vec![vec![0]]);
+        assert_eq!(record.flags(), &[1]);
+        assert_eq!(tier.inner.lock().map.expert_in(0), NONE);
+        // Initialized physical0 is readable even though no expert key is
+        // installed. Other slots remain usable: no blanket warm refusal.
+        assert_eq!(tier.warm(&[1]).unwrap(), 1);
+        {
+            let inner = tier.inner.lock();
+            assert_eq!(
+                inner.map.expert_in(0),
+                NONE,
+                "warm selected physically borrowed empty fallback0, spare={spare}"
+            );
+            assert_ne!(inner.map.slot_of(1), Some(0));
+            assert_eq!(inner.open_slots, vec![0]);
+            assert!(inner.map.cache.host_borrowed(SlotId(0)));
+            assert_eq!(inner.host_group_active, group.generation);
+            assert_eq!(inner.map.pinned_count(), 0);
+        }
+        let xs = x(1, 32, 0.25);
+        let (gate, up) = tier
+            .gate_up(&xs, &mut group, MoeArm::MatVec, DType::F32)
+            .unwrap();
+        assert!(gate
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+            .iter()
+            .all(|&v| v == 0.));
+        assert!(up
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+            .iter()
+            .all(|&v| v == 0.));
+        // Drop is a CPU epoch0 control only, NOT GPU retirement proof.
+        drop(group);
+        {
+            let inner = tier.inner.lock();
+            assert!(inner.host_group_active.is_none());
+            assert!(!inner.map.cache.host_borrowed(SlotId(0)));
+        }
+        assert_eq!(tier.warm(&[2]).unwrap(), 1);
+        assert_eq!(
+            tier.inner.lock().map.slot_of(2),
+            Some(0),
+            "closed CPU fallback0 was not returned through normal free/recycle"
+        );
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn a_host_window_fallback_zero_empty_inplace_keeps_warm_off_live_physical_reader() {
+        empty_fallback_window_control(0);
+    }
+
+    #[test]
+    fn a_host_window_fallback_zero_empty_quarantined_keeps_warm_off_live_physical_reader() {
+        empty_fallback_window_control(1);
+    }
+
+    #[test]
+    fn a_host_window_fallback_zero_blocks_pin_and_down_releases_it() {
+        let (tier, reference, path) = host_pin_fixture();
+        let ids = Tensor::new(&[[3u32], [7], [7]], &Device::Cpu).unwrap();
+        let (mut resolved, record) = tier.plan_window(&ids, 1, 1).unwrap().unwrap();
+        assert_eq!(
+            resolved.ids.to_vec2::<u32>().unwrap(),
+            vec![vec![3], vec![0], vec![0]]
+        );
+        let n = record.rows * record.topk;
+        assert_eq!(
+            &record.data[2 * n..],
+            &[0, 1, 1],
+            "must exercise unloaded misses, not hits"
+        );
+        let generation = resolved.generation;
+        assert_eq!(tier.inner.lock().map.expert_in(0), 0);
+        let result = tier.pin(&[4, 5, 6]);
+        assert!(
+            result.is_err(),
+            "public pin replaced a physically bound fallback slot0: {result:?}, resident={:?}",
+            tier.resident()
+        );
+        {
+            let inner = tier.inner.lock();
+            assert_eq!(inner.host_group_active, generation);
+            assert_eq!(
+                inner.host_group_last, 1,
+                "fallback created an extra owner/generation"
+            );
+            assert_eq!(inner.map.expert_in(0), 0);
+            assert_eq!(
+                inner.open_slots,
+                vec![0, 3],
+                "one physical fallback, deduplicated with real readers"
+            );
+            assert!(inner.map.cache.host_borrowed(SlotId(0)));
+            assert!(inner.map.cache.host_borrowed(SlotId(3)));
+        }
+        // Compare the bytes actually bound, NOT the logical missing experts.
+        // Their flags still require replay; discarded output is not retirement.
+        let physical = Tensor::new(&[[3u32], [0], [0]], &Device::Cpu).unwrap();
+        let xs = x(3, 32, 0.25);
+        let arm = MoeArm::for_rows(3);
+        let (g, u) = tier.gate_up(&xs, &mut resolved, arm, DType::F32).unwrap();
+        let h = (crate::nn::ops::silu(&g).unwrap() * u).unwrap();
+        let got = tier
+            .down(&h, &mut resolved, arm)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        assert_eq!(got, run(&reference, &xs, &physical));
+        assert!(resolved.closed);
+        drop(resolved);
+        assert!(tier.inner.lock().host_group_active.is_none());
+        assert!(
+            !tier.inner.lock().map.cache.host_borrowed(SlotId(0)),
+            "completed fallback0 HOST bit not cleared"
+        );
+        tier.pin(&[4, 5, 6]).unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn a_host_window_fallback_zero_dedups_misses_and_drop_preserves_user_pins() {
+        let (tier, _, path) = host_pin_fixture();
+        tier.pin(&[2]).unwrap();
+        let ids = Tensor::new(&[[3u32], [7], [7]], &Device::Cpu).unwrap();
+        let (resolved, record) = tier.plan_window(&ids, 1, 1).unwrap().unwrap();
+        assert_eq!(
+            resolved.ids.to_vec2::<u32>().unwrap(),
+            vec![vec![3], vec![0], vec![0]]
+        );
+        assert_eq!(record.flags(), &[0, 1, 1]);
+        {
+            let inner = tier.inner.lock();
+            assert_eq!(
+                inner.open_slots,
+                vec![0, 3],
+                "physical fallback0 is missing/duplicated in the reader owner"
+            );
+            assert_eq!(inner.host_group_active, resolved.generation);
+            assert_eq!(
+                inner.host_group_last, 1,
+                "fallback allocated a second group identity"
+            );
+            assert_eq!(inner.map.pinned_count(), 1);
+            assert!(inner.map.cache.host_borrowed(SlotId(0)));
+        }
+        drop(resolved);
+        {
+            let inner = tier.inner.lock();
+            assert!(inner.open_slots.is_empty());
+            assert!(inner.host_group_active.is_none());
+            assert!(inner.open_epoch.is_none());
+            assert_eq!(
+                inner.map.pinned_count(),
+                1,
+                "fallback cleanup cleared user pins"
+            );
+            assert!((0..inner.map.n_slots())
+                .all(|slot| !inner.map.cache.host_borrowed(SlotId(slot as u32))));
+        }
+        // The failure occurs after placeholder/real enrollment but before
+        // returning any handle. Cleanup must use the same owner list, not a
+        // separate fallback release path, and must preserve user pin2.
+        tier.inner.lock().host_group_fail_at = Some(HostGroupFault::SlotTensor);
+        let error = tier.plan_window(&ids, 1, 1).unwrap_err();
+        assert!(error.to_string().contains("SlotTensor"), "{error}");
+        {
+            let inner = tier.inner.lock();
+            assert!(inner.open_slots.is_empty());
+            assert!(inner.host_group_active.is_none());
+            assert!(inner.open_epoch.is_none());
+            assert_eq!(
+                inner.host_group_last, 1,
+                "failed placeholder return published a generation"
+            );
+            assert_eq!(inner.map.pinned_count(), 1);
+            assert!(
+                (0..inner.map.n_slots())
+                    .all(|slot| !inner.map.cache.host_borrowed(SlotId(slot as u32))),
+                "pre-publication placeholder fault leaked HOST custody"
+            );
+        }
+        let (retry, _) = tier.plan_window(&ids, 1, 1).unwrap().unwrap();
+        assert_eq!(retry.generation.unwrap().get(), 2);
+        assert_eq!(tier.inner.lock().open_slots, vec![0, 3]);
+        drop(retry);
+        assert!(tier.inner.lock().host_group_active.is_none());
+        tier.pin(&[4, 5]).unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn a_host_window_fallback_zero_no_miss_keeps_other_slots_available() {
+        let (tier, _, path) = host_pin_fixture();
+        let ids = Tensor::new(&[[3u32], [3], [3]], &Device::Cpu).unwrap();
+        let (resolved, record) = tier.plan_window(&ids, 1, 1).unwrap().unwrap();
+        assert_eq!(record.flags(), &[0, 0, 0]);
+        {
+            let inner = tier.inner.lock();
+            assert_eq!(inner.open_slots, vec![3]);
+            assert!(
+                !inner.map.cache.host_borrowed(SlotId(0)),
+                "no miss must not borrow a speculative placeholder"
+            );
+            assert_eq!(inner.host_group_last, 1);
+        }
+        tier.pin(&[4, 5, 6]).unwrap();
+        assert_eq!(tier.inner.lock().map.expert_in(3), 3);
+        drop(resolved);
+        tier.pin(&[0]).unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn a_host_window_fallback_zero_aliases_and_bounds_the_existing_reader_list() {
+        for logical in [
+            vec![0u32, 7, 7],
+            vec![3, 0, 7],
+            vec![3, 7, 0],
+            vec![3; 65536],
+            {
+                let mut ids = vec![7; 65536];
+                ids[0] = 3;
+                ids
+            },
+        ] {
+            let (tier, _, path) = host_pin_fixture();
+            let ids = Tensor::from_vec(logical.clone(), (logical.len(), 1), &Device::Cpu).unwrap();
+            let (group, record) = tier.plan_window(&ids, 1, 1).unwrap().unwrap();
+            let expected: Vec<_> = logical
+                .iter()
+                .map(|&id| if id == 7 { 0 } else { id as usize })
+                .collect();
+            let mut distinct = expected.clone();
+            distinct.sort_unstable();
+            distinct.dedup();
+            let inner = tier.inner.lock();
+            assert_eq!(
+                inner.open_slots, distinct,
+                "one existing reader list, including alias0"
+            );
+            assert_eq!(inner.host_group_last, 1, "aliases made another owner");
+            let bound = 1 + (logical.len() - 1).min(inner.map.active() - 1);
+            let cap = inner.open_slots.capacity();
+            let (requested, prepared_ptr, prepared_cap) = inner.host_reader_reservation.unwrap();
+            assert_eq!(
+                requested, bound,
+                "engine reservation grew with repeated rows"
+            );
+            assert_eq!(
+                inner.open_slots.as_ptr() as usize,
+                prepared_ptr,
+                "reader list reallocated after its one prepared reservation"
+            );
+            assert_eq!(cap, prepared_cap, "reader capacity grew during mapping");
+            assert!(inner.open_slots.len() <= inner.map.active());
+            for &slot in &distinct {
+                assert!(inner.map.cache.host_borrowed(SlotId(slot as u32)));
+            }
+            eprintln!("FALLBACK_READER_CAPACITY rows={} loaded_distinct=1 active={} before_initial_request_bytes={} after_request_bytes={} actual_capacity_bytes={} actual_reader_count={}",
+                logical.len(), inner.map.active(), std::mem::size_of::<usize>(), bound * std::mem::size_of::<usize>(), cap * std::mem::size_of::<usize>(), inner.open_slots.len());
+            drop(inner);
+            assert_eq!(
+                record.flags(),
+                logical
+                    .iter()
+                    .map(|&id| u32::from(id == 7))
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(
+                group.ids.flatten_all().unwrap().to_vec1::<u32>().unwrap(),
+                expected.iter().map(|&s| s as u32).collect::<Vec<_>>()
+            );
+            drop(group);
+            assert!(tier.inner.lock().host_group_active.is_none());
+            tier.pin(&[4, 5, 6]).unwrap();
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_host_window_reader_reservation_refusal_leaves_no_owner_then_retries() {
+        let (tier, _, path) = host_pin_fixture();
+        tier.pin(&[2]).unwrap();
+        let mut inner = tier.inner.lock();
+        let before = format!("{:?}", inner.map);
+        let generation = inner.next_host_group().unwrap();
+        let tick = inner.map.tick();
+        {
+            let mut pending = PendingHostGroup::new(&mut inner, Vec::new(), generation, tick);
+            // Real production reserve boundary; deterministic capacity overflow,
+            // NOT an allocator OOM or native failure injection claim.
+            assert!(pending.reserve_slots(usize::MAX).is_err());
+            assert_eq!(pending.slots.capacity(), 0);
+        }
+        assert_eq!(format!("{:?}", inner.map), before);
+        assert!(inner.host_group_active.is_none());
+        assert!(inner.open_epoch.is_none());
+        assert_eq!(inner.host_group_last, 0);
+        assert_eq!(inner.map.pinned_count(), 1);
+        drop(inner);
+        let ids = Tensor::new(&[[3u32], [7], [7]], &Device::Cpu).unwrap();
+        let (group, _) = tier.plan_window(&ids, 1, 1).unwrap().unwrap();
+        assert_eq!(group.generation.unwrap().get(), 1);
+        assert_eq!(tier.inner.lock().open_slots, vec![0, 3]);
+        drop(group);
+        assert_eq!(tier.inner.lock().map.pinned_count(), 1);
+        tier.pin(&[4, 5]).unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn a_host_window_empty_fallback_hint_preview_error_and_consumption_keep_order() {
+        let mut map = ResidencyMap::new(8, 4);
+        map.set_spare(1);
+        map.set_host_borrowed(0, true);
+        let tick = map.begin();
+        let before = format!("{map:?}");
+        let failed = map.issue_free_hint(&[4, 5], tick, |chosen| {
+            assert_eq!(
+                chosen,
+                &[(4, 1), (5, 2)],
+                "hint included live empty0 or reordered free slots"
+            );
+            lloom_tensor::bail!("pre-submit fallback hint control")
+        });
+        assert!(failed
+            .unwrap_err()
+            .to_string()
+            .contains("pre-submit fallback"));
+        assert_eq!(
+            format!("{map:?}"),
+            before,
+            "failed hint mutated free/HOST state"
+        );
+        assert_eq!(map.free_slots(), 3);
+        assert_eq!(map.free_len(), 3);
+        let (issued, bytes) = map
+            .issue_free_hint(&[4, 5], tick, |chosen| {
+                assert_eq!(chosen, &[(4, 1), (5, 2)]);
+                Ok((17, 2048))
+            })
+            .unwrap();
+        assert_eq!((issued, bytes), (2, 2048));
+        assert_eq!((map.slot_of(4), map.slot_of(5)), (Some(1), Some(2)));
+        assert_eq!(map.expert_in(0), NONE);
+        assert_eq!((map.free_slots(), map.free_len()), (1, 1));
+        map.set_host_borrowed(0, false);
+        assert_eq!((map.free_slots(), map.free_len()), (2, 2));
+        assert_eq!(map.take_free(), Some(0));
+        assert_eq!(map.take_free(), Some(3));
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn a_host_window_fallback_zero_records_a_real_reader_before_drop_reuse_metal() {
+        use lloom_tensor::kernels::metal::profile;
+        let dev = resize_control_device();
+        assert!(
+            profile::enabled(),
+            "fallback reader control requires CANDLE_METAL_PROFILE=1"
+        );
+        let (tier, path) = host_group_fixture_on(&dev);
+        let _drain = HostGroupTestDrain(&dev);
+        let ids = Tensor::new(&[[3u32], [7], [7]], &dev).unwrap();
+        let (resolved, record) = tier.plan_window(&ids, 1, 1).unwrap().unwrap();
+        dev.synchronize().unwrap();
+        assert_eq!(
+            resolved.ids.to_vec2::<u32>().unwrap(),
+            vec![vec![3], vec![0], vec![0]]
+        );
+        assert_eq!(record.flags(), &[0, 1, 1]);
+        let fence = Tensor::ones(1, DType::F32, &dev)
+            .unwrap()
+            .affine(2.0, 1.0)
+            .unwrap();
+        dev.synchronize().unwrap();
+        assert_eq!(fence.to_vec1::<f32>().unwrap(), vec![3.0]);
+        let epoch = tier.inner.lock().current_epoch();
+        let reader_before = tier.inner.lock().map.reader_epoch(0);
+        assert!(
+            reader_before < epoch,
+            "old same-epoch stamp could mask missing fallback custody"
+        );
+        let xs = x(3, 32, 0.25).to_device(&dev).unwrap();
+        let mut resolved = resolved;
+        let dispatches = profile::dispatch_count();
+        let projections = tier.gate_up(&xs, &mut resolved, MoeArm::for_rows(3), DType::F32);
+        let after = profile::dispatch_count();
+        // No CPU bank write/replacement occurs while these readers are live.
+        // Scoped abort must stamp the physical placeholder as well as real3.
+        drop(resolved);
+        let reader_after = tier.inner.lock().map.reader_epoch(0);
+        dev.synchronize().unwrap();
+        let (gate, up) = projections.unwrap();
+        assert!(after > dispatches, "no native projection encoded");
+        assert!(reader_after >= epoch,
+            "fallback slot0 read was not stamped: before={reader_before:?} after={reader_after:?} dispatch={epoch:?}");
+        assert_eq!(gate.dims(), &[3, 1, 32]);
+        assert_eq!(up.dims(), &[3, 1, 32]);
+        assert!(gate
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+            .iter()
+            .all(|x| x.is_finite()));
+        assert!(up
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+            .iter()
+            .all(|x| x.is_finite()));
+        {
+            let inner = tier.inner.lock();
+            assert!(inner.host_group_active.is_none());
+            assert!(!inner.map.cache.host_borrowed(SlotId(0)));
+        }
+        // Actual DATA is complete now; this is valid reuse, never an injected
+        // native overwrite race. This does not fix #944's held-cancel prefix.
+        tier.pin(&[4, 5, 6]).unwrap();
+        dev.synchronize().unwrap();
+        eprintln!("FALLBACK_ZERO_NATIVE_READER actual_api={} dispatches={} reader_before={reader_before:?} reader_after={reader_after:?} dispatch_epoch={epoch:?} completed_before_reuse=true",
+            dev.as_metal_device().unwrap().commands().actual_command_api(), after - dispatches);
         std::fs::remove_file(path).unwrap();
     }
 
@@ -5810,7 +8178,10 @@ mod tests {
                     assert!(tier.fetch_ready());
                     let expert = if active == 3 { 6 } else { 7 };
                     assert!(tier.inner.lock().map.slot_of(expert).is_none());
-                    assert_eq!(tier.fetch_beside(&[expert as u32], Epoch::ZERO), (1, 0));
+                    assert_eq!(
+                        tier.fetch_beside(&[expert as u32], Epoch::ZERO).unwrap(),
+                        (1, 0)
+                    );
                     let ids = Tensor::new(&[[expert as u32, 1]], &dev).unwrap();
                     assert_eq!(run(&tier, &xs, &ids), run(&resident, &xs, &ids));
                 }
@@ -5818,6 +8189,768 @@ mod tests {
         }
         dev.synchronize().unwrap();
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn a_constructor_fetch_initializer_closes_before_gpu_wait_join_and_is_cached() {
+        use crate::nn::expert_fetch::FetchLane;
+        use crate::nn::expert_prefetch::Prefetcher;
+        use lloom_tensor::kernels::metal::{staging::StagingRing, HostInputArm};
+        use lloom_tensor::metal_backend::HostEvent;
+        use std::time::{Duration, Instant};
+        let dev = resize_control_device();
+        let m = dev.as_metal_device().unwrap();
+        assert_eq!(
+            m.commands().host_input_arm(),
+            HostInputArm::GpuWait,
+            "this population must exercise actual GPU waits, not host commit"
+        );
+        let gate = stacked(8, 32, 32, 1.0, GgmlDType::F32);
+        let up = stacked(8, 32, 32, 2.0, GgmlDType::F32);
+        let down = stacked(8, 32, 32, 3.0, GgmlDType::F32);
+        let path = write_gguf(&[("g", &gate), ("u", &up), ("d", &down)]);
+        // Compile/warm the independent consumer BEFORE creating bank writers.
+        let consumer_source = Tensor::ones(16, DType::F32, &dev)
+            .unwrap()
+            .affine(2.0, 1.0)
+            .unwrap();
+        dev.synchronize().unwrap();
+        struct Release(HostEvent);
+        impl std::ops::Deref for Release {
+            type Target = HostEvent;
+            fn deref(&self) -> &HostEvent {
+                &self.0
+            }
+        }
+        impl Drop for Release {
+            fn drop(&mut self) {
+                self.0.signal(1);
+            }
+        }
+        let release = Release(HostEvent::new(m).unwrap());
+        release.commit_when_produced(1).unwrap();
+        let ring = StagingRing::shared(m);
+        let mut tier = Streamed::with_staging_pools(
+            open(&path, "g"),
+            open(&path, "u"),
+            open(&path, "d"),
+            4,
+            LoaderArm::Pread,
+            &dev,
+            Some(Arc::clone(&ring)),
+            false,
+            true,
+        )
+        .unwrap();
+        tier.set_spare_slots(1).unwrap();
+        tier.set_prefetcher(Arc::new(Prefetcher::new(m, ring)));
+        assert!(tier.fetch_prepare(1).unwrap());
+        let (slot, ids) = {
+            let mut inner = tier.inner.lock();
+            assert!(
+                !inner.initialization.poll().unwrap(),
+                "held zero writers must really be pending"
+            );
+            assert!(!inner.initialization.required.is_empty());
+            let slot = inner.decode_ids_slot(1).unwrap().unwrap();
+            (Arc::clone(&slot), slot.tensor((1, 1)).unwrap())
+        };
+        slot.fill_u32(7, 1).unwrap();
+        let lane = FetchLane::new(m, Duration::from_millis(1), "inherit").unwrap();
+        let mut pass = lane.begin_pass(m.gpu_clock().current_epoch());
+        // The releasing controller never takes Inner. Always release before
+        // assertions or scope join, including a failing mutant, so no fixture
+        // relies on a watchdog signal to satisfy the native wait.
+        std::thread::scope(|scope| {
+            let registration = scope.spawn(|| tier.fetch_register(&lane, &ids));
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while tier.counters.initializer_data_waits.load(Ordering::Acquire) == 0
+                && Instant::now() < deadline
+            {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let wait_entered = tier.counters.initializer_data_waits.load(Ordering::Acquire) > 0;
+            let jobs_before_release = lane.stats().jobs;
+            release.signal(1);
+            let result = registration.join().unwrap();
+            assert!(wait_entered, "cold exact DATA wait did not engage");
+            assert_eq!(
+                jobs_before_release, 0,
+                "dependent job published before initializer DATA"
+            );
+            assert!(result.unwrap());
+        });
+        pass.seal();
+        let consumer = consumer_source.affine(2.0, 1.0).unwrap();
+        dev.synchronize().unwrap();
+        assert_eq!(consumer.to_vec1::<f32>().unwrap(), vec![7.0; 16]);
+        let stats = lane.settled_stats();
+        pass.finish();
+        assert_eq!(
+            (stats.jobs, stats.loads, stats.timeouts),
+            (1, 1, 0),
+            "{stats:?}"
+        );
+        assert!(tier.resident().contains(&7));
+        let waits = tier.counters.initializer_data_waits.load(Ordering::Acquire);
+        {
+            let inner = tier.inner.lock();
+            assert!(inner.initialization.proven);
+            assert!(inner.initialization.required.is_empty());
+        }
+        slot.fill_u32(6, 1).unwrap();
+        let mut second = lane.begin_pass(m.gpu_clock().current_epoch());
+        assert!(tier.fetch_register(&lane, &ids).unwrap());
+        second.seal();
+        let _consumer = consumer_source.affine(2.0, 1.0).unwrap();
+        dev.synchronize().unwrap();
+        let stats = lane.settled_stats();
+        second.finish();
+        assert_eq!(
+            tier.counters.initializer_data_waits.load(Ordering::Acquire),
+            waits,
+            "cached registration repeated the cold initializer wait"
+        );
+        assert_eq!(
+            (stats.jobs, stats.loads, stats.timeouts),
+            (2, 2, 0),
+            "{stats:?}"
+        );
+        assert_eq!(tier.fetch_jobs.as_ref().unwrap().load(Ordering::Acquire), 0);
+        eprintln!("INITIALIZER_GPU_WAIT actual_api={} jobs=2 loads=2 cold_wait_calls={waits} cached_extra_waits=0",
+            m.commands().actual_command_api());
+        std::fs::remove_file(path).unwrap();
+    }
+
+    /// This injects an error observation at the exact DATA wait result; it
+    /// does not induce, or claim to reproduce, a native driver failure.
+    #[cfg(feature = "metal")]
+    #[test]
+    fn a_gpu_wait_initializer_data_observation_error_refuses_before_job_publication() {
+        use crate::nn::expert_fetch::FetchLane;
+        use crate::nn::expert_prefetch::Prefetcher;
+        use lloom_tensor::kernels::metal::{staging::StagingRing, HostInputArm};
+        use lloom_tensor::metal_backend::HostEvent;
+        use std::time::{Duration, Instant};
+        let dev = resize_control_device();
+        let m = dev.as_metal_device().unwrap();
+        assert_eq!(m.commands().host_input_arm(), HostInputArm::GpuWait);
+        let gate = stacked(8, 32, 32, 1.0, GgmlDType::F32);
+        let up = stacked(8, 32, 32, 2.0, GgmlDType::F32);
+        let down = stacked(8, 32, 32, 3.0, GgmlDType::F32);
+        let path = write_gguf(&[("g", &gate), ("u", &up), ("d", &down)]);
+        dev.synchronize().unwrap();
+        struct Release(HostEvent);
+        impl Drop for Release {
+            fn drop(&mut self) {
+                self.0.signal(1);
+            }
+        }
+        let release = Release(HostEvent::new(m).unwrap());
+        release.0.commit_when_produced(1).unwrap();
+        let ring = StagingRing::shared(m);
+        let mut tier = Streamed::with_staging_pools(
+            open(&path, "g"),
+            open(&path, "u"),
+            open(&path, "d"),
+            4,
+            LoaderArm::Pread,
+            &dev,
+            Some(Arc::clone(&ring)),
+            false,
+            true,
+        )
+        .unwrap();
+        tier.set_prefetcher(Arc::new(Prefetcher::new(m, ring)));
+        assert!(tier.fetch_prepare(1).unwrap());
+        let (slot, ids) = {
+            let mut inner = tier.inner.lock();
+            assert!(
+                !inner.initialization.poll().unwrap(),
+                "writer positive is pending"
+            );
+            let slot = inner.decode_ids_slot(1).unwrap().unwrap();
+            (Arc::clone(&slot), slot.tensor((1, 1)).unwrap())
+        };
+        slot.fill_u32(7, 1).unwrap();
+        let lane = FetchLane::new(m, Duration::from_millis(1), "inherit").unwrap();
+        let pass = lane.begin_pass(m.gpu_clock().current_epoch());
+        let before = lane.registration_counts_for_test();
+        tier.initializer_data_observation_fault
+            .store(true, Ordering::Release);
+        let (result, proof_entered) = std::thread::scope(|scope| {
+            let registration = scope.spawn(|| tier.fetch_register(&lane, &ids));
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while tier.counters.initializer_data_waits.load(Ordering::Acquire) == 0
+                && Instant::now() < deadline
+            {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let entered = tier.counters.initializer_data_waits.load(Ordering::Acquire) > 0;
+            // Independent release precedes assertions/join, including a mutant
+            // that ignores the injected Result and attempts the next real wait.
+            release.0.signal(1);
+            (registration.join().unwrap(), entered)
+        });
+        dev.synchronize().unwrap();
+        let stats = lane.settled_stats();
+        pass.finish();
+        assert!(proof_entered, "exact DATA proof was not exercised");
+        let error = result.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("initializer DATA observation fault"),
+            "{error}"
+        );
+        assert_eq!(
+            lane.registration_counts_for_test(),
+            before,
+            "job descriptor was published"
+        );
+        assert_eq!((stats.jobs, stats.loads), (0, 0));
+        assert_eq!(tier.fetch_jobs.as_ref().unwrap().load(Ordering::Acquire), 0);
+        assert!(!tier.resident().contains(&7));
+        let fresh = Streamed::new(
+            open(&path, "g"),
+            open(&path, "u"),
+            open(&path, "d"),
+            4,
+            LoaderArm::Pread,
+            &dev,
+        )
+        .unwrap();
+        let resident = Resident::new(
+            Arc::new(
+                QTensor::quantize_onto(
+                    &gate.dequantize(&Device::Cpu).unwrap(),
+                    GgmlDType::F32,
+                    &dev,
+                )
+                .unwrap(),
+            ),
+            Arc::new(
+                QTensor::quantize_onto(&up.dequantize(&Device::Cpu).unwrap(), GgmlDType::F32, &dev)
+                    .unwrap(),
+            ),
+            Arc::new(
+                QTensor::quantize_onto(
+                    &down.dequantize(&Device::Cpu).unwrap(),
+                    GgmlDType::F32,
+                    &dev,
+                )
+                .unwrap(),
+            ),
+        );
+        let input = x(1, 32, 0.25).to_device(&dev).unwrap();
+        let query = Tensor::new(&[[6u32]], &dev).unwrap();
+        assert_eq!(run(&fresh, &input, &query), run(&resident, &input, &query));
+        dev.synchronize().unwrap();
+        eprintln!("INITIALIZER_GPU_WAIT_OBSERVATION_FAULT actual_api={} native_driver_failure=false registered=0 jobs=0 custody=0 fresh_request_matches_resident=true", m.commands().actual_command_api());
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn a_cancelled_initializer_is_not_a_successful_successor_or_a_published_fetch_job() {
+        use crate::nn::expert_fetch::FetchLane;
+        use crate::nn::expert_prefetch::Prefetcher;
+        use lloom_tensor::kernels::metal::{staging::StagingRing, HostInputArm};
+        use lloom_tensor::metal_backend::HostEvent;
+        use std::time::Duration;
+        let dev = resize_control_device();
+        let m = dev.as_metal_device().unwrap();
+        assert_eq!(
+            m.commands().host_input_arm(),
+            HostInputArm::Commit,
+            "this cancellation population must use actual HostCommit"
+        );
+        let gate = stacked(8, 32, 32, 1.0, GgmlDType::F32);
+        let up = stacked(8, 32, 32, 2.0, GgmlDType::F32);
+        let down = stacked(8, 32, 32, 3.0, GgmlDType::F32);
+        let path = write_gguf(&[("g", &gate), ("u", &up), ("d", &down)]);
+        let consumer = Tensor::ones((1, 1, 32), DType::F32, &dev).unwrap();
+        dev.synchronize().unwrap();
+        struct Release(HostEvent);
+        impl Drop for Release {
+            fn drop(&mut self) {
+                self.0.signal(1);
+            }
+        }
+        let release = Release(HostEvent::new(m).unwrap());
+        release.0.commit_when_produced(1).unwrap();
+        let ring = StagingRing::shared(m);
+        let mut tier = Streamed::with_staging_pools(
+            open(&path, "g"),
+            open(&path, "u"),
+            open(&path, "d"),
+            4,
+            LoaderArm::Pread,
+            &dev,
+            Some(Arc::clone(&ring)),
+            false,
+            true,
+        )
+        .unwrap();
+        tier.set_prefetcher(Arc::new(Prefetcher::new(m, ring)));
+        assert!(tier.fetch_prepare(1).unwrap());
+        let (slot, ids, initial_floor) = {
+            let mut inner = tier.inner.lock();
+            assert!(!inner.initialization.poll().unwrap());
+            let slot = inner.decode_ids_slot(1).unwrap().unwrap();
+            (
+                Arc::clone(&slot),
+                slot.tensor((1, 1)).unwrap(),
+                inner.initialization.floor,
+            )
+        };
+        slot.fill_u32(7, 1).unwrap();
+        assert!(
+            release
+                .0
+                .cancel_through(1, "initializer cancellation control")
+                .unwrap()
+                > 0
+        );
+        release.0.signal(1);
+        // Give one later plane a real successful initializer. The earlier
+        // two planes remain abandoned: looking only at the last marker would
+        // now be a false DATA proof. This deterministically splits recordings
+        // that automatic encoder/capacity cuts may split during construction.
+        let (later_down, later_receipt) =
+            QTensor::zeros_persistent_with_receipt((4, 32, 32), GgmlDType::F32, &dev, true)
+                .unwrap();
+        let later_receipt = later_receipt.unwrap();
+        let successful_plane = later_receipt.1.clone();
+        {
+            let mut inner = tier.inner.lock();
+            inner.pools[2].qt = later_down;
+            inner.initialization.push(later_receipt).unwrap();
+        }
+        // A genuine later successful native recording must not upgrade the
+        // exact abandoned initializer, even after the clock passes its floor.
+        let successor = consumer.affine(2.0, 1.0).unwrap();
+        dev.synchronize().unwrap();
+        assert_eq!(
+            successor.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            vec![3.0; 32]
+        );
+        assert!(m.gpu_clock().current_epoch() >= initial_floor);
+        assert!(successful_plane.poll_data_ready().unwrap());
+        let lane = FetchLane::new(m, Duration::from_millis(1), "inherit").unwrap();
+        let pass = lane.begin_pass(m.gpu_clock().current_epoch());
+        let error = tier.fetch_register(&lane, &ids).unwrap_err();
+        assert!(error.to_string().contains("abandoned"), "{error}");
+        assert_eq!(
+            lane.settled_stats().jobs,
+            0,
+            "failed initializer published a job"
+        );
+        assert_eq!(tier.fetch_jobs.as_ref().unwrap().load(Ordering::Acquire), 0);
+        pass.finish();
+        assert!(tier.warm(&[0]).is_err());
+        assert!(tier.plan_device(&ids).is_err());
+        let host = tier.plan_host(&[0u32], 1, 1).unwrap().unwrap();
+        assert!(
+            tier.ensure(&host[0]).is_err(),
+            "failed initializer handed out a safe projection handle"
+        );
+        assert!(tier.grow_slots(6).is_err());
+        assert_eq!(tier.active_slots(), 4);
+        // Cancellation is not a permanent queue failure: a new tier can use
+        // the same device, while this invalid generation remains refused.
+        let fresh = Streamed::new(
+            open(&path, "g"),
+            open(&path, "u"),
+            open(&path, "d"),
+            4,
+            LoaderArm::Pread,
+            &dev,
+        )
+        .unwrap();
+        assert_eq!(fresh.warm(&[0]).unwrap(), 1);
+        dev.synchronize().unwrap();
+        assert!(fresh.resident().contains(&0));
+        eprintln!("INITIALIZER_CANCEL actual_api={} successor_ok=true failed_jobs=0 custody=0 invalid_tier_refused=true fresh_tier_ok=true",
+            m.commands().actual_command_api());
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn a_late_abandoned_initializer_cancels_the_new_host_commit_join_then_recovers() {
+        use crate::nn::expert_fetch::FetchLane;
+        use crate::nn::expert_prefetch::Prefetcher;
+        use lloom_tensor::kernels::metal::{staging::StagingRing, HostInputArm};
+        use lloom_tensor::metal_backend::HostEvent;
+        use std::time::{Duration, Instant};
+        let dev = resize_control_device();
+        let m = dev.as_metal_device().unwrap();
+        assert_eq!(m.commands().host_input_arm(), HostInputArm::Commit);
+        let gate = stacked(8, 32, 32, 1.0, GgmlDType::F32);
+        let up = stacked(8, 32, 32, 2.0, GgmlDType::F32);
+        let down = stacked(8, 32, 32, 3.0, GgmlDType::F32);
+        let path = write_gguf(&[("g", &gate), ("u", &up), ("d", &down)]);
+        let source = Tensor::ones(16, DType::F32, &dev)
+            .unwrap()
+            .affine(2.0, 1.0)
+            .unwrap();
+        dev.synchronize().unwrap();
+        struct Release(HostEvent);
+        impl Drop for Release {
+            fn drop(&mut self) {
+                self.0.signal(1);
+            }
+        }
+        let release = Release(HostEvent::new(m).unwrap());
+        release.0.commit_when_produced(1).unwrap();
+        let ring = StagingRing::shared(m);
+        let mut tier = Streamed::with_staging_pools(
+            open(&path, "g"),
+            open(&path, "u"),
+            open(&path, "d"),
+            4,
+            LoaderArm::Pread,
+            &dev,
+            Some(Arc::clone(&ring)),
+            false,
+            true,
+        )
+        .unwrap();
+        tier.set_prefetcher(Arc::new(Prefetcher::new(m, ring)));
+        assert!(tier.fetch_prepare(1).unwrap());
+        let (slot, ids) = {
+            let mut inner = tier.inner.lock();
+            assert!(!inner.initialization.poll().unwrap());
+            let slot = inner.decode_ids_slot(1).unwrap().unwrap();
+            (Arc::clone(&slot), slot.tensor((1, 1)).unwrap())
+        };
+        let lane = FetchLane::new(m, Duration::from_millis(1), "inherit").unwrap();
+        let mut pass = lane.begin_pass(m.gpu_clock().current_epoch());
+        tier.fetch_registration_pause.store(1, Ordering::Release);
+        std::thread::scope(|scope| {
+            struct Unpause<'a>(&'a Streamed);
+            impl Drop for Unpause<'_> {
+                fn drop(&mut self) {
+                    self.0.fetch_registration_pause.store(3, Ordering::Release);
+                }
+            }
+            let registration = scope.spawn(|| tier.fetch_register(&lane, &ids));
+            let unpause = Unpause(&tier);
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while tier.fetch_registration_pause.load(Ordering::Acquire) != 2
+                && Instant::now() < deadline
+            {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let paused = tier.fetch_registration_pause.load(Ordering::Acquire) == 2;
+            // Abandon AFTER the actual exact-marker recheck, BEFORE descriptor
+            // publication/commit_when_produced. Complete a different recording
+            // while registration remains paused so its owed epochs cannot hide
+            // behind the new job's own wait and timeout instead of testing DATA.
+            let cancelled = release.0.cancel_through(1, "late initializer control");
+            release.0.signal(1);
+            let successor = source.affine(2.0, 1.0);
+            let completed = m.flush_and_wait_current();
+            drop(unpause);
+            let registered = registration.join().unwrap();
+            assert!(paused, "real pre-publication pause did not engage");
+            assert!(cancelled.unwrap() > 0);
+            assert_eq!(successor.unwrap().to_vec1::<f32>().unwrap(), vec![7.0; 16]);
+            completed.unwrap();
+            assert!(
+                registered.unwrap(),
+                "this late order must publish the new join"
+            );
+        });
+        pass.seal();
+        // Keep routing unwritten until the real consumer is behind the NEW
+        // join. It reads no bank bytes, so even the broken worker is memory-safe.
+        let _dependent = source.affine(2.0, 1.0).unwrap();
+        let marker = m.flush_marker().unwrap();
+        slot.fill_u32(7, 1).unwrap();
+        let stats = lane.settled_stats();
+        let result = m.wait_marker(&marker);
+        pass.finish();
+        assert!(
+            result.is_err(),
+            "new join ran after an abandoned initializer: {stats:?}"
+        );
+        assert_eq!(
+            (stats.jobs, stats.loads, stats.timeouts),
+            (1, 0, 0),
+            "{stats:?}"
+        );
+        assert_eq!(tier.fetch_jobs.as_ref().unwrap().load(Ordering::Acquire), 0);
+        assert!(!tier.resident().contains(&7));
+        assert!(tier.warm(&[0]).is_err());
+        let fresh = Streamed::new(
+            open(&path, "g"),
+            open(&path, "u"),
+            open(&path, "d"),
+            4,
+            LoaderArm::Pread,
+            &dev,
+        )
+        .unwrap();
+        assert_eq!(fresh.warm(&[0]).unwrap(), 1);
+        dev.synchronize().unwrap();
+        assert!(fresh.resident().contains(&0));
+        eprintln!("INITIALIZER_LATE_CANCEL actual_api={} joined_consumer_refused=true loads=0 timeouts=0 custody=0 fresh_tier_ok=true",
+            m.commands().actual_command_api());
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[cfg(feature = "metal")]
+    #[derive(Clone, Copy, Debug)]
+    enum FetchFloorControl {
+        Settled,
+        Timeout,
+        Cancelled,
+        CapturedBeforeResize,
+        RegistrationPin,
+    }
+
+    #[cfg(feature = "metal")]
+    fn fetch_floor_control(mode: FetchFloorControl) {
+        use crate::nn::expert_fetch::FetchLane;
+        use crate::nn::expert_prefetch::Prefetcher;
+        use lloom_tensor::kernels::metal::{staging::StagingRing, HostInputArm};
+        use lloom_tensor::metal_backend::HostEvent;
+        use std::time::{Duration, Instant};
+        let dev = resize_control_device();
+        let m = dev.as_metal_device().unwrap();
+        assert_eq!(
+            m.commands().host_input_arm(),
+            HostInputArm::Commit,
+            "fetch cancellation controls require the shipped commit arm"
+        );
+        eprintln!(
+            "FETCH_FLOOR_CONTROL mode={mode:?} actual_host_input={:?}",
+            m.commands().host_input_arm()
+        );
+        let gate = stacked(8, 32, 32, 1.0, GgmlDType::F32);
+        let up = stacked(8, 32, 32, 2.0, GgmlDType::F32);
+        let down = stacked(8, 32, 32, 3.0, GgmlDType::F32);
+        let path = write_gguf(&[("g", &gate), ("u", &up), ("d", &down)]);
+        let ring = StagingRing::shared(m);
+        let mut tier = Streamed::with_staging_pools(
+            open(&path, "g"),
+            open(&path, "u"),
+            open(&path, "d"),
+            4,
+            LoaderArm::Pread,
+            &dev,
+            Some(Arc::clone(&ring)),
+            false,
+            true,
+        )
+        .unwrap();
+        tier.set_spare_slots(1).unwrap();
+        tier.set_prefetcher(Arc::new(Prefetcher::new(m, ring)));
+        tier.shrink_slots(2, 1).unwrap();
+        tier.warm(&[0]).unwrap();
+        assert!(tier.fetch_prepare(1).unwrap());
+        let (slot, ids) = {
+            let mut inner = tier.inner.lock();
+            let slot = inner.decode_ids_slot(1).unwrap().unwrap();
+            (Arc::clone(&slot), slot.tensor((1, 1)).unwrap())
+        };
+        // Warm the independent consumer kernel before the bounded routing job.
+        let consumer_source = Tensor::ones(16, DType::F32, &dev)
+            .unwrap()
+            .affine(2.0, 1.0)
+            .unwrap();
+        dev.synchronize().unwrap();
+        let captured_floor = m.gpu_clock().current_epoch();
+        let held = matches!(
+            mode,
+            FetchFloorControl::Timeout
+                | FetchFloorControl::Cancelled
+                | FetchFloorControl::CapturedBeforeResize
+        );
+        let release = if held {
+            let event = Arc::new(HostEvent::new(m).unwrap());
+            event.commit_when_produced(1).unwrap();
+            let signal = Arc::clone(&event);
+            let (tx, rx) = std::sync::mpsc::channel();
+            let join = std::thread::spawn(move || {
+                let requested = rx.recv_timeout(Duration::from_secs(10)).is_ok();
+                signal.signal(1);
+                requested
+            });
+            if matches!(mode, FetchFloorControl::CapturedBeforeResize) {
+                tier.grow_slots(4).unwrap();
+            } else {
+                // The held epoch need not read bank bytes. The broken worker
+                // may write them, but never races a GPU reader in this control.
+                let queued = Tensor::ones(1, DType::F32, &dev)
+                    .unwrap()
+                    .affine(2.0, 1.0)
+                    .unwrap();
+                m.flush_marker().unwrap();
+                drop(queued);
+            }
+            Some((tx, join))
+        } else {
+            None
+        };
+        let floor = if matches!(mode, FetchFloorControl::CapturedBeforeResize) {
+            captured_floor
+        } else {
+            m.gpu_clock().current_epoch()
+        };
+        let lane = FetchLane::new(m, Duration::from_millis(1), "inherit").unwrap();
+        let mut pass = Some(lane.begin_pass(floor));
+        let cancelled_before = m.commands().produced_stats().cancelled;
+        if !matches!(mode, FetchFloorControl::RegistrationPin) {
+            slot.fill_u32(7, 1).unwrap();
+        }
+        assert!(tier.fetch_register(&lane, &ids).unwrap());
+        pass.as_mut().unwrap().seal();
+        // Real native work held behind the job, independent of the bank bytes.
+        let consumer = consumer_source.affine(2.0, 1.0).unwrap();
+        let consumer_marker = m.flush_marker().unwrap();
+        let refusal = if matches!(mode, FetchFloorControl::RegistrationPin) {
+            let pending = pass.take().unwrap();
+            let (cancel, requested) = std::sync::mpsc::channel();
+            let canceller = std::thread::spawn(move || {
+                let normal = requested.recv_timeout(Duration::from_secs(10)).is_ok();
+                // Routing is still the sentinel: cancelling this job does not
+                // need Inner, even if a broken resize parks while holding it.
+                drop(pending);
+                normal
+            });
+            let result = tier.grow_slots(4);
+            let _ = cancel.send(());
+            assert!(
+                canceller.join().unwrap(),
+                "resize needed watchdog cancellation"
+            );
+            Some(result)
+        } else {
+            None
+        };
+        if matches!(mode, FetchFloorControl::Cancelled) {
+            let start = Instant::now();
+            while lane.stats().floor_waits == 0 && start.elapsed() < Duration::from_secs(3) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            // Drain cancels during the actual production floor wait.
+            drop(pass.take());
+        }
+        let stats = lane.settled_stats();
+        if let Some((tx, join)) = release {
+            let _ = tx.send(());
+            assert!(join.join().unwrap(), "control needed watchdog release");
+        }
+        let waited = m.wait_marker(&consumer_marker);
+        if matches!(
+            mode,
+            FetchFloorControl::Cancelled | FetchFloorControl::RegistrationPin
+        ) {
+            assert!(
+                waited
+                    .as_ref()
+                    .is_err_and(|e| e.to_string().contains("expert fetch")),
+                "cancelled job released native consumers: {waited:?}"
+            );
+        } else {
+            waited.unwrap();
+            assert_eq!(consumer.to_vec1::<f32>().unwrap(), vec![7.0; 16]);
+        }
+        m.wait_until_completed().unwrap();
+        if let Some(pass) = pass.take() {
+            pass.finish();
+        }
+        match mode {
+            FetchFloorControl::Settled => {
+                assert_eq!(stats.loads, 1, "{stats:?}");
+                assert!(tier.resident().contains(&7));
+            }
+            FetchFloorControl::Timeout | FetchFloorControl::CapturedBeforeResize => {
+                assert!(
+                    stats.floor_waits > 0,
+                    "floor did not cover initializer: {stats:?}"
+                );
+                assert!(stats.timeouts > 0, "control did not time out: {stats:?}");
+                assert_eq!(
+                    stats.loads, 0,
+                    "failed floor proof still wrote tier: {stats:?}"
+                );
+                assert!(!tier.resident().contains(&7));
+            }
+            FetchFloorControl::Cancelled => {
+                assert!(
+                    stats.floor_waits > 0,
+                    "cancellation missed floor wait: {stats:?}"
+                );
+                assert_eq!(
+                    stats.loads, 0,
+                    "cancelled floor still wrote tier: {stats:?}"
+                );
+                assert!(!tier.resident().contains(&7));
+                assert!(
+                    m.commands().produced_stats().cancelled > cancelled_before,
+                    "cancelled floor must cancel held consumers before raise"
+                );
+            }
+            FetchFloorControl::RegistrationPin => {
+                let error = refusal.unwrap().unwrap_err();
+                assert!(
+                    error.to_string().contains("fetch job"),
+                    "wrong refusal: {error}"
+                );
+                assert_eq!(tier.active_slots(), 2, "refusal changed bank geometry");
+                // Completion/cancellation must release custody, not leak it.
+                tier.grow_slots(4).unwrap();
+            }
+        }
+        let plain = Streamed::new(
+            open(&path, "g"),
+            open(&path, "u"),
+            open(&path, "d"),
+            4,
+            LoaderArm::Pread,
+            &dev,
+        )
+        .unwrap();
+        let xs = x(1, 32, 0.25).to_device(&dev).unwrap();
+        let ids = Tensor::new(&[[6u32]], &dev).unwrap();
+        assert_eq!(
+            run(&tier, &xs, &ids),
+            run(&plain, &xs, &ids),
+            "next request after {mode:?}"
+        );
+        dev.synchronize().unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn a_fetch_floor_success_still_loads_and_publishes() {
+        fetch_floor_control(FetchFloorControl::Settled);
+    }
+    #[cfg(feature = "metal")]
+    #[test]
+    fn a_fetch_floor_timeout_does_not_write_the_tier() {
+        fetch_floor_control(FetchFloorControl::Timeout);
+    }
+    #[cfg(feature = "metal")]
+    #[test]
+    fn a_fetch_floor_cancellation_does_not_write_and_cancels_consumers() {
+        fetch_floor_control(FetchFloorControl::Cancelled);
+    }
+    #[cfg(feature = "metal")]
+    #[test]
+    fn a_floor_captured_before_resize_covers_the_new_banks_at_registration() {
+        fetch_floor_control(FetchFloorControl::CapturedBeforeResize);
+    }
+    #[cfg(feature = "metal")]
+    #[test]
+    fn a_registered_fetch_job_excludes_resize_until_its_cleanup() {
+        fetch_floor_control(FetchFloorControl::RegistrationPin);
     }
 
     #[cfg(feature = "metal")]
@@ -6112,7 +9245,7 @@ mod tests {
         let xs = x(6, d, 0.5);
         for g in &groups {
             let slots = streamed.ensure(g).unwrap();
-            assert_eq!(slots.dims(), &[g.rows.len(), topk]);
+            assert_eq!(slots.ids.dims(), &[g.rows.len(), topk]);
         }
         let _ = xs;
         std::fs::remove_file(path).ok();
@@ -6481,7 +9614,7 @@ mod tests {
         // A token wanting 9 (staged, hot) with 3 and 4 (resident): the plan
         // lands 9 in the empty slot and maps every expert.
         let tok = Tensor::new(&[[9u32, 3, 4]], &dev).unwrap();
-        let (slots, rec) = pre.plan_device(&tok).unwrap().expect("a device plan");
+        let (mut slots, rec) = pre.plan_device(&tok).unwrap().expect("a device plan");
         let s = pre.stats();
         assert_eq!((s.predict_landed, s.predict_wasted), (1, 0), "{s:?}");
         assert_eq!(s.evictions, 0, "a prediction never evicts: {s:?}");
@@ -6499,10 +9632,10 @@ mod tests {
         assert_eq!(&r[6..9], &[0, 0, 0], "a landed expert is no miss: {r:?}");
         let xs = x(1, d, 0.5).to_device(&dev).unwrap();
         let arm = MoeArm::for_rows(1);
-        let (gt, u) = pre.gate_up(&xs, &slots, arm, xs.dtype()).unwrap();
+        let (gt, u) = pre.gate_up(&xs, &mut slots, arm, xs.dtype()).unwrap();
         let h = (crate::nn::ops::silu(&gt).unwrap() * u).unwrap();
         let y = pre
-            .down(&h, &slots, arm)
+            .down(&h, &mut slots, arm)
             .unwrap()
             .flatten_all()
             .unwrap()
@@ -6630,7 +9763,7 @@ mod tests {
         // The device plan for a token wanting 9 and 10: the wait encoded
         // once, both entries settled by it, no miss flagged.
         let tok = Tensor::new(&[[9u32, 10, 9]], &dev).unwrap();
-        let (slots, rec) = io.plan_device(&tok).unwrap().expect("a device plan");
+        let (mut slots, rec) = io.plan_device(&tok).unwrap().expect("a device plan");
         let s = io.stats();
         assert_eq!(io.inflight_count(), 0, "{s:?}");
         assert_eq!(s.io_inflight_planned + s.io_inflight_landed, 2, "{s:?}");
@@ -6648,10 +9781,10 @@ mod tests {
         assert_eq!(&r[6..9], &[0, 0, 0], "a hinted expert is no miss: {r:?}");
         let xs = x(1, d, 0.5).to_device(&dev).unwrap();
         let arm = MoeArm::for_rows(1);
-        let (gt, u) = io.gate_up(&xs, &slots, arm, xs.dtype()).unwrap();
+        let (gt, u) = io.gate_up(&xs, &mut slots, arm, xs.dtype()).unwrap();
         let h = (crate::nn::ops::silu(&gt).unwrap() * u).unwrap();
         let y = io
-            .down(&h, &slots, arm)
+            .down(&h, &mut slots, arm)
             .unwrap()
             .flatten_all()
             .unwrap()
@@ -6980,16 +10113,16 @@ mod tests {
                 let xs = x(1, d, (t * 2 + l) as f32).to_device(&dev).unwrap();
                 // The same ops on both twins, so their LRU clocks stay equal.
                 let out = |tier: &Streamed| -> Vec<f32> {
-                    let (slots, rec) = tier.plan_device(&id[l]).unwrap().unwrap();
+                    let (mut slots, rec) = tier.plan_device(&id[l]).unwrap().unwrap();
                     assert!(
                         !tier.settle(&rec).unwrap(),
                         "token {t} layer {l}: still missing"
                     );
                     let (g, u) = tier
-                        .gate_up(&xs, &slots, MoeArm::MatVec, xs.dtype())
+                        .gate_up(&xs, &mut slots, MoeArm::MatVec, xs.dtype())
                         .unwrap();
                     let hh = (crate::nn::ops::silu(&g).unwrap() * u).unwrap();
-                    tier.down(&hh, &slots, MoeArm::MatVec)
+                    tier.down(&hh, &mut slots, MoeArm::MatVec)
                         .unwrap()
                         .flatten_all()
                         .unwrap()
@@ -7134,7 +10267,7 @@ mod tests {
             t.set_prefetcher(Arc::new(Prefetcher::new(&m, Arc::clone(&ring))));
             t
         };
-        let routed = |t: &Streamed, slots: &Tensor| -> Vec<f32> {
+        let routed = |t: &Streamed, slots: &mut ResolvedExperts<'_, Streamed>| -> Vec<f32> {
             let arm = MoeArm::for_rows(xs.dim(0).unwrap());
             let (g, u) = t.gate_up(&xs, slots, arm, xs.dtype()).unwrap();
             let hh = (crate::nn::ops::silu(&g).unwrap() * u).unwrap();
@@ -7161,8 +10294,8 @@ mod tests {
         let want = {
             let t = tier(0);
             t.warm(&[a, b]).unwrap();
-            let (slots, rec) = t.plan_device(&ids_ab).unwrap().unwrap();
-            let out = routed(&t, &slots);
+            let (mut slots, rec) = t.plan_device(&ids_ab).unwrap().unwrap();
+            let out = routed(&t, &mut slots);
             assert!(!t.settle(&rec).unwrap());
             out
         };
@@ -7171,12 +10304,15 @@ mod tests {
             // In place the pool is full; quarantined it keeps its spare free.
             let warm: &[u32] = if spare == 0 { &[a, b, x_exp] } else { &[a, b] };
             assert_eq!(t.warm(warm).unwrap(), warm.len());
-            let (slots, rec) = t.plan_device(&ids_ab).unwrap().unwrap();
+            let (mut slots, rec) = t.plan_device(&ids_ab).unwrap().unwrap();
             // P's slot map has run; its experts are not encoded yet.
-            let mapped: Vec<u32> = slots.flatten_all().unwrap().to_vec1().unwrap();
+            let mapped: Vec<u32> = slots.ids.flatten_all().unwrap().to_vec1().unwrap();
             drain();
             let g = t.plan(&one(c)).unwrap();
-            let c_load = t.ensure(&g[0]);
+            // This control tests loading under device plan P, not a host
+            // projection: explicitly abort any returned temporary host group
+            // so the second attempt still exercises H2, not one-live-group policy.
+            let c_load = t.ensure(&g[0]).map(drop);
             // H3, the quarantined arm: c's landing refilled the spare by
             // evicting a or b under the open plan; the host map says so, the
             // live table P reads does not — yet.
@@ -7199,12 +10335,12 @@ mod tests {
             });
             drain();
             let g = t.plan(&one(dd)).unwrap();
-            let d_load = t.ensure(&g[0]);
+            let d_load = t.ensure(&g[0]).map(drop);
             // H1: P's routed kernels are encoded now, after the drains' cuts
             // — in a later command buffer than its slot map; the slots they
             // read must carry the kernels' epoch, not the plan's.
             let kernel_epoch = clock.current_epoch();
-            let got = routed(&t, &slots);
+            let got = routed(&t, &mut slots);
             {
                 let inner = t.inner.lock();
                 for &s in &mapped {
@@ -7343,7 +10479,10 @@ mod tests {
                 .map(|&x| inner.map.slot_of(x as usize).unwrap() as u32)
                 .collect()
         };
-        assert_eq!(slots.flatten_all().unwrap().to_vec1::<u32>().unwrap(), want);
+        assert_eq!(
+            slots.ids.flatten_all().unwrap().to_vec1::<u32>().unwrap(),
+            want
+        );
         std::fs::remove_file(path).ok();
     }
 }

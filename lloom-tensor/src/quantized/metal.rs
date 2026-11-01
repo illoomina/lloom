@@ -49,6 +49,35 @@ impl QMetalStorage {
         dtype: GgmlDType,
         shared: bool,
     ) -> Result<Self> {
+        Ok(Self::persistent_with_capture(device, elem_count, dtype, shared, false)?.0)
+    }
+
+    /// Persistent zero storage plus the exact initialization recording. This
+    /// additive cold arm captures under the encoder guard, not a later cut.
+    pub fn persistent_with_receipt(
+        device: &MetalDevice,
+        elem_count: usize,
+        dtype: GgmlDType,
+        shared: bool,
+    ) -> Result<(
+        Self,
+        (crate::retire::Epoch, crate::kernels::metal::CommandMarker),
+    )> {
+        let (storage, receipt) =
+            Self::persistent_with_capture(device, elem_count, dtype, shared, true)?;
+        Ok((storage, receipt.expect("capture requested")))
+    }
+
+    fn persistent_with_capture(
+        device: &MetalDevice,
+        elem_count: usize,
+        dtype: GgmlDType,
+        shared: bool,
+        capture: bool,
+    ) -> Result<(
+        Self,
+        Option<(crate::retire::Epoch, crate::kernels::metal::CommandMarker)>,
+    )> {
         let size = elem_count * dtype.type_size() / dtype.block_size();
         let buffer = crate::residency_class::residency_class_scope(
             crate::residency_class::ResidencyClass::Experts,
@@ -60,18 +89,22 @@ impl QMetalStorage {
                 }
             },
         )?;
-        {
+        let receipt = {
             let mut blit = device.blit_command_encoder()?;
             blit.set_label("qstorage_persistent_zero");
             // SAFETY: binding authority (module head).
             unsafe { blit.fill_buffer(&buffer, (0, size), 0) };
-        }
+            capture.then(|| blit.recording_receipt())
+        };
         let device = device.allocated_output_device(&buffer)?;
-        Ok(Self {
-            buffer,
-            device,
-            dtype,
-        })
+        Ok((
+            Self {
+                buffer,
+                device,
+                dtype,
+            },
+            receipt,
+        ))
     }
 
     pub fn dtype(&self) -> GgmlDType {

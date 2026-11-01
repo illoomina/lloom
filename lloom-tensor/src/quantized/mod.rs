@@ -1193,6 +1193,36 @@ impl QTensor {
         Self::new(storage, shape)
     }
 
+    /// Persistent zero storage with an exact Metal initialization receipt.
+    /// CPU/CUDA retain their existing zero-storage path and return no receipt.
+    /// A receipt is DATA identity, not a completion/retirement guarantee.
+    #[cfg(feature = "metal")]
+    pub fn zeros_persistent_with_receipt<S: Into<Shape>>(
+        shape: S,
+        dtype: GgmlDType,
+        device: &Device,
+        shared: bool,
+    ) -> Result<(
+        Self,
+        Option<(crate::retire::Epoch, crate::kernels::metal::CommandMarker)>,
+    )> {
+        let shape = shape.into();
+        check_shape(&shape, dtype.block_size())?;
+        let (storage, receipt) = match device {
+            Device::Metal(d) => {
+                let (storage, receipt) = metal::QMetalStorage::persistent_with_receipt(
+                    d,
+                    shape.elem_count(),
+                    dtype,
+                    shared,
+                )?;
+                (QStorage::Metal(storage), Some(receipt))
+            }
+            other => (other.qzeros(shape.elem_count(), dtype)?, None),
+        };
+        Ok((Self::new(storage, shape)?, receipt))
+    }
+
     /// [`Self::write_with`] staged through a [`StagingRing`] on Metal (a
     /// reused buffer instead of an allocation per call); the other backends
     /// take the plain path.

@@ -212,15 +212,32 @@ mod tests {
                 );
             }
         }
+        assert!(
+            crate::kernels::GgmlDType::F32.kind().mul_mm_id_mapped,
+            "native fixture must exercise a mapped-capable weight kind"
+        );
         let weights = Tensor::zeros((2, 1, 32), DType::F32, &dev).unwrap();
         let weights = QTensor::quantize(&weights, GgmlDType::F32).unwrap();
         let input = Tensor::zeros((65537, 1, 32), DType::F32, &dev).unwrap();
-        let ids = Tensor::zeros((65537, 1), DType::U32, &dev).unwrap();
+        assert_eq!(input.dtype(), DType::F32);
+        assert_eq!(weights.dtype(), GgmlDType::F32);
+        // Dimension refusal must be independent of ID values. All NONE ids
+        // also keep a guard-bypass mutant safe: histogram/scatter form no
+        // ushort coordinates, meta0 makes both GEMMs return before output.
+        let ids = Tensor::from_vec(vec![u32::MAX; 65537], (65537, 1), &dev).unwrap();
         let pools_before = dev.as_metal_device().unwrap().pool_counters();
-        let error = weights
-            .indexed_moe_forward_with(&input, &ids, MoeArm::Gemm)
-            .unwrap_err();
+        let result = weights.indexed_moe_forward_with(&input, &ids, MoeArm::Gemm);
         let pools_after = dev.as_metal_device().unwrap().pool_counters();
+        // Complete even a bypass mutant's safe meta0 work before assertions;
+        // do not Debug-print/read its intentionally unwritten output tensor.
+        dev.synchronize().unwrap();
+        let error = match result {
+            Err(error) => error,
+            Ok(output) => {
+                drop(output);
+                panic!("oversize nonempty coordinates were accepted");
+            }
+        };
         assert_eq!(
             (pools_after.0.lookups, pools_after.1.lookups),
             (pools_before.0.lookups, pools_before.1.lookups),
@@ -236,5 +253,103 @@ mod tests {
             assert_eq!(output.dims(), &[rows, topk, 1]);
         }
         dev.synchronize().unwrap();
+    }
+    #[cfg(all(feature = "metal", target_pointer_width = "64"))]
+    #[test]
+    fn raw_empty_mapped_stride_refusal_and_both_block_routes_use_valid_meta_zero() {
+        use crate::kernels::GgmlDType;
+        use crate::Device;
+        let dev = Device::new_metal(0).expect("native raw mapped control requires Metal");
+        let m = dev.as_metal_device().unwrap();
+        let actual = m.commands().actual_command_api();
+        eprintln!("EMPTY_MAPPED_RAW_CONTROL actual_api={actual}");
+        if let Ok(requested) = std::env::var("LLOOM_METAL_API") {
+            if matches!(requested.as_str(), "metal3" | "metal4") {
+                assert_eq!(actual, requested, "raw mapped control must not fall back");
+            }
+        }
+        // Genuine retained Shared allocations, no encoded initializer writes.
+        // With meta0, both real mapped kernels return before touching any
+        // coordinate/weight/input/output. This also keeps a guard-bypass mutant
+        // safe: no intentionally invalid resource lifetime or GPU bounds read.
+        let weight = m.new_persistent_shared(256).unwrap();
+        let input = m.new_persistent_shared(256).unwrap();
+        let rows = m.new_persistent_shared(4).unwrap();
+        let blocks = m.new_persistent_shared(12).unwrap();
+        let meta = m.new_persistent_shared(4).unwrap();
+        let output = m.new_persistent_shared(4).unwrap();
+        unsafe {
+            meta.contents().cast::<u32>().write(0);
+            output.contents().cast::<u32>().write(0x1a2b3c4d);
+        }
+        for bn in [16usize, 32] {
+            let topk = u32::MAX as usize;
+            let k = ((u64::MAX / 4 / topk as u64 + 1) as usize).div_ceil(32) * 32;
+            let refused = {
+                let encoder = m.command_encoder().unwrap();
+                // SAFETY: all owners live through synchronize; meta0 makes
+                // even the deliberately disabled-validation mutant no-read.
+                unsafe {
+                    crate::kernels::call_quantized_matmul_mm_id_mapped(
+                        m.metal_device(),
+                        &encoder,
+                        m.kernels(),
+                        GgmlDType::F32,
+                        (1, 1, k),
+                        (0, topk, topk),
+                        &weight,
+                        &input,
+                        0,
+                        &rows,
+                        &blocks,
+                        &meta,
+                        1,
+                        bn,
+                        &output,
+                    )
+                }
+            };
+            // Always finish native work before assertions/unwind. Never print
+            // or read an uninitialized output from a rejected/mutated route.
+            dev.synchronize().unwrap();
+            let error = refused.expect_err("overflowing empty native stride was accepted");
+            assert!(
+                error.to_string().contains("activation batch stride"),
+                "{error}"
+            );
+            {
+                let encoder = m.command_encoder().unwrap();
+                // SAFETY: same retained owners and meta0; this valid empty
+                // case deliberately executes each production block route.
+                unsafe {
+                    crate::kernels::call_quantized_matmul_mm_id_mapped(
+                        m.metal_device(),
+                        &encoder,
+                        m.kernels(),
+                        GgmlDType::F32,
+                        (1, 1, 32),
+                        (65537, 0, 1),
+                        &weight,
+                        &input,
+                        0,
+                        &rows,
+                        &blocks,
+                        &meta,
+                        1,
+                        bn,
+                        &output,
+                    )
+                }
+                .unwrap();
+            }
+            dev.synchronize().unwrap();
+            // SAFETY: successful exact native completion, no device writer
+            // was reached under meta0, and no CPU write raced native work.
+            assert_eq!(
+                unsafe { output.contents().cast::<u32>().read() },
+                0x1a2b3c4d
+            );
+            eprintln!("EMPTY_MAPPED_RAW_CONTROL actual_api={actual} bn={bn} overflow_refused=true valid_empty_executed=true meta=0 output_untouched=true");
+        }
     }
 }

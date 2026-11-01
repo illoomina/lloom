@@ -19,7 +19,7 @@
 //! (`docs/invariants.md` §15.2 #10b). A GPU→host event would tell it of the
 //! routing ~1 ms late (§20.14b).
 
-use crate::nn::expert_stream::{FetchStats, Streamed};
+use crate::nn::expert_stream::{FetchJobCustody, FetchStats, Streamed};
 use lloom_tensor::kernels::metal::GpuClock;
 use lloom_tensor::metal_backend::{HostEvent, HostSlot};
 use lloom_tensor::retire::Epoch;
@@ -49,6 +49,9 @@ struct Job {
     n_experts: usize,
     value: u64,
     floor: Epoch,
+    /// RAII resize exclusion through CPU IO/publication or cancellation. Drop
+    /// does not lock Inner or dereference TierRef; legacy null-tier tests carry None.
+    _custody: Option<FetchJobCustody>,
 }
 
 /// A tier of the pass that registered the job.
@@ -187,6 +190,13 @@ impl FetchLane {
         self.lane.state.lock().registered
     }
 
+    /// Test-only publication census, separate from the worker's jobs counter.
+    #[cfg(test)]
+    pub(crate) fn registration_counts_for_test(&self) -> (u64, u64, usize) {
+        let state = self.lane.state.lock();
+        (state.registered, state.done, state.jobs.len())
+    }
+
     /// Register `tier`'s layer of the open pass and encode the device's
     /// wait for it: the commands encoded after this run once the worker has
     /// served the routing the router writes into `ids`.
@@ -196,8 +206,15 @@ impl FetchLane {
         ids: Arc<HostSlot>,
         topk: usize,
         n_experts: usize,
+        custody: FetchJobCustody,
     ) -> Result<()> {
-        self.register_job(TierRef(tier as *const Streamed), ids, topk, n_experts)
+        self.register_job(
+            TierRef(tier as *const Streamed),
+            ids,
+            topk,
+            n_experts,
+            Some(custody),
+        )
     }
 
     fn register_job(
@@ -206,13 +223,20 @@ impl FetchLane {
         ids: Arc<HostSlot>,
         topk: usize,
         n_experts: usize,
+        custody: Option<FetchJobCustody>,
     ) -> Result<()> {
         let value = {
             let mut g = self.lane.state.lock();
             g.next += 1;
             g.registered += 1;
             let value = g.next;
-            let floor = g.floor;
+            // A replacement initializer was cut before the tier published it,
+            // hence before this job can acquire custody and publish its join.
+            // Earlier jobs are served/signalled FIFO before this floor is tested;
+            // the floor cannot contain this not-yet-published job's own join.
+            let floor = g
+                .floor
+                .max(custody.as_ref().map_or(Epoch::ZERO, |c| c.required_floor()));
             g.jobs.push_back(Job {
                 tier,
                 ids,
@@ -220,6 +244,7 @@ impl FetchLane {
                 n_experts,
                 value,
                 floor,
+                _custody: custody,
             });
             value
         };
@@ -366,7 +391,7 @@ fn work(lane: &Lane) {
         };
         lane.counters.jobs.fetch_add(1, Ordering::Relaxed);
         let t0 = Instant::now();
-        let seen = loop {
+        let mut seen = loop {
             if lane.cancel.load(Ordering::Acquire) {
                 break false;
             }
@@ -391,31 +416,49 @@ fn work(lane: &Lane) {
                 settled_floor = Some(floor);
             } else {
                 lane.counters.timeouts.fetch_add(1, Ordering::Relaxed);
+                // Routing is not permission to write: a failed floor proof
+                // preserves the unserved/replay path, or cancellation below.
+                seen = false;
             }
         }
+        let mut initialization_failed = false;
         if seen {
             // SAFETY: the job's pass has not returned (`TierRef`).
             let tier = unsafe { &*tier };
             // A layer that found no slot looks again: slots free up as their
             // readers complete and in-flight loads land, so a pass computes
             // on a missing expert only past the fail-safe.
-            let (mut loaded, mut short) = tier.fetch_beside(&ids, floor);
-            let t_retry = Instant::now();
-            while short > 0
-                && !lane.cancel.load(Ordering::Acquire)
-                && t_retry.elapsed() <= ROUTING_TIMEOUT
-            {
-                lane.counters.retries.fetch_add(1, Ordering::Relaxed);
-                std::thread::sleep(lane.poll);
-                let (l, s) = tier.fetch_beside(&ids, floor);
-                loaded += l;
-                short = s;
+            let result = (|| -> Result<(u64, u64)> {
+                let (mut loaded, mut short) = tier.fetch_beside(&ids, floor)?;
+                let t_retry = Instant::now();
+                while short > 0
+                    && !lane.cancel.load(Ordering::Acquire)
+                    && t_retry.elapsed() <= ROUTING_TIMEOUT
+                {
+                    lane.counters.retries.fetch_add(1, Ordering::Relaxed);
+                    std::thread::sleep(lane.poll);
+                    let (l, s) = tier.fetch_beside(&ids, floor)?;
+                    loaded += l;
+                    short = s;
+                }
+                Ok((loaded, short))
+            })();
+            match result {
+                Ok((loaded, short)) => {
+                    if loaded + short > 0 {
+                        lane.counters.missed_layers.fetch_add(1, Ordering::Relaxed);
+                    }
+                    lane.counters.loads.fetch_add(loaded, Ordering::Relaxed);
+                    lane.counters.short.fetch_add(short, Ordering::Relaxed);
+                }
+                Err(error) => {
+                    // A failed/abandoned initializer cannot be replayed as a
+                    // mere absent expert. Cancel consumers before raising value.
+                    eprintln!("[expert-fetch] bank initialization: {error}");
+                    initialization_failed = true;
+                    seen = false;
+                }
             }
-            if loaded + short > 0 {
-                lane.counters.missed_layers.fetch_add(1, Ordering::Relaxed);
-            }
-            lane.counters.loads.fetch_add(loaded, Ordering::Relaxed);
-            lane.counters.short.fetch_add(short, Ordering::Relaxed);
         }
         lane.counters
             .serve_ns
@@ -424,13 +467,22 @@ fn work(lane: &Lane) {
         // pass nobody redoes: the work behind its wait is cancelled before
         // the raise, and never runs. The fail-safe's raise lets it run on the
         // table as it stands, for the settle to flag and redo.
-        if !seen && lane.cancel.load(Ordering::Acquire) {
-            if let Err(e) = lane.event.cancel_through(value, CANCELLED) {
+        if !seen && (initialization_failed || lane.cancel.load(Ordering::Acquire)) {
+            let reason = if initialization_failed {
+                "expert fetch: bank initialization failed; dependent work was cancelled"
+            } else {
+                CANCELLED
+            };
+            if let Err(e) = lane.event.cancel_through(value, reason) {
                 eprintln!("[expert-fetch] cancelling the work behind value {value}: {e}");
             }
         }
         {
             let mut g = lane.state.lock();
+            // CPU reads/writes and live-table publication have returned, or
+            // a HostCommit cancellation request was published. This does not
+            // prove callback/native retirement. Dropping
+            // custody before the raise is safe: signal does not acquire Inner.
             g.jobs.pop_front();
             g.done += 1;
         }
@@ -535,8 +587,14 @@ mod tests {
         let progress = m.metal_device().as_ref().newSharedEvent().unwrap();
         let before = m.commands().produced_stats();
         let lane = FetchLane::new(&m, Duration::from_millis(1), "inherit").unwrap();
-        lane.register_job(TierRef(std::ptr::null()), unwritten_routing(&m, 2), 2, 4)
-            .unwrap();
+        lane.register_job(
+            TierRef(std::ptr::null()),
+            unwritten_routing(&m, 2),
+            2,
+            4,
+            None,
+        )
+        .unwrap();
         let (_y, marker) = encode_consumer(&m, &x, || {
             m.commands().encode_signal_event(&progress, 1).unwrap()
         });
@@ -571,8 +629,14 @@ mod tests {
         let before = m.commands().produced_stats();
         let lane = FetchLane::new(&m, Duration::from_millis(1), "inherit").unwrap();
         let mut pass = lane.begin_pass(Epoch(0));
-        lane.register_job(TierRef(std::ptr::null()), unwritten_routing(&m, 2), 2, 4)
-            .unwrap();
+        lane.register_job(
+            TierRef(std::ptr::null()),
+            unwritten_routing(&m, 2),
+            2,
+            4,
+            None,
+        )
+        .unwrap();
         let (_y, marker) = encode_consumer(&m, &x, || {
             m.commands().encode_signal_event(&progress, 1).unwrap()
         });

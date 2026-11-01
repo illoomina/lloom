@@ -232,6 +232,26 @@ impl<'a> AsMut<BlitCommandEncoder> for BlitCommandsGuard<'a> {
 }
 
 impl BlitCommandsGuard<'_> {
+    /// Cold initialization receipt captured while the same canonical guard
+    /// excludes a cut of the blit that encoded the write. The epoch orders
+    /// later readers; only the exact marker can prove successful DATA.
+    /// Does not cut, submit, wait, join callbacks or prove native retirement.
+    pub fn recording_receipt(&self) -> (Epoch, CommandMarker) {
+        let cb = self
+            ._guard
+            .current
+            .recording()
+            .expect("live blit recording")
+            .clone();
+        (
+            self.core.clock.current_epoch(),
+            CommandMarker {
+                cb,
+                signalled: None,
+            },
+        )
+    }
+
     pub(crate) fn retain_namespace(
         &mut self,
         owner: crate::metal_backend::device_retirement::NamespaceOwner,
@@ -376,6 +396,14 @@ impl CommandMarker {
     /// Nonblocking known-error observation; false also includes pending work.
     pub fn is_failed(&self) -> bool {
         self.cb.status() == MTLCommandBufferStatus::Error
+    }
+
+    /// Nonparking own-DATA observation of this exact recording. Pending
+    /// recording/handoff returns false; abandoned/failed submission returns an
+    /// error even if the queue clock has advanced. Success does not join
+    /// callbacks, a queue prefix or physical retirement. It does not submit work.
+    pub fn poll_data_ready(&self) -> Result<bool, MetalKernelError> {
+        self.cb.poll_data_ready()
     }
 
     /// The buffer's GPU end time (`CLOCK_UPTIME_RAW` seconds), valid once
@@ -3724,6 +3752,294 @@ mod owner_submission_tests {
     }
 
     #[test]
+    fn exact_blit_receipt_poll_is_read_only_pending_then_successful_data() {
+        let device = crate::MetalDevice::new(0).unwrap();
+        let commands = device.commands();
+        let cb = pending(commands);
+        let buffer = device.new_persistent_shared(256).unwrap();
+        let pins = RetainUnknown(Some((device.clone(), cb.clone(), buffer.clone())));
+        let native_before = commands
+            .core
+            .submission_control
+            .native_calls
+            .load(Ordering::Relaxed);
+        let epoch = commands.clock().current_epoch();
+        let (writer, marker) = {
+            let mut blit = commands.blit_command_encoder().unwrap();
+            // SAFETY: independent pins survive every refusal/assertion unwind.
+            unsafe { blit.fill_buffer(&buffer, (0, 256), 0x4a) };
+            let receipt = blit.recording_receipt();
+            assert!(
+                !receipt.1.poll_data_ready().unwrap(),
+                "open encoder is not submitted DATA"
+            );
+            blit.finish().unwrap();
+            receipt
+        };
+        assert_eq!(writer, epoch);
+        assert!(marker.cb.same_recording(&cb));
+        assert!(!marker.poll_data_ready().unwrap());
+        assert_eq!(
+            commands.clock().current_epoch(),
+            epoch,
+            "poll consumed an epoch"
+        );
+        assert_eq!(
+            commands
+                .core
+                .submission_control
+                .native_calls
+                .load(Ordering::Relaxed),
+            native_before,
+            "poll submitted native work"
+        );
+        let cut = commands.flush_marker().unwrap();
+        assert!(
+            cut.cb.same_recording(&marker.cb),
+            "receipt drifted to a successor"
+        );
+        commands.wait_marker(&marker).unwrap();
+        assert!(marker.poll_data_ready().unwrap());
+        let after_epoch = commands.clock().current_epoch();
+        let after_native = commands
+            .core
+            .submission_control
+            .native_calls
+            .load(Ordering::Relaxed);
+        for _ in 0..3 {
+            assert!(marker.poll_data_ready().unwrap());
+        }
+        assert_eq!(commands.clock().current_epoch(), after_epoch);
+        assert_eq!(
+            commands
+                .core
+                .submission_control
+                .native_calls
+                .load(Ordering::Relaxed),
+            after_native
+        );
+        // SAFETY: this exact writer's successful DATA proof covers these bytes.
+        let bytes = unsafe { std::slice::from_raw_parts(buffer.contents(), 256) };
+        assert!(bytes.iter().all(|b| *b == 0x4a));
+        pins.release();
+    }
+
+    #[test]
+    fn exact_data_poll_does_not_join_a_still_held_callback() {
+        let device = crate::MetalDevice::new(0).unwrap();
+        let commands = device.commands();
+        let cb = pending(commands);
+        let gate = Arc::new((parking_lot::Mutex::new(false), parking_lot::Condvar::new()));
+        let callback_gate = Arc::clone(&gate);
+        let exited = Arc::new(AtomicBool::new(false));
+        let callback_exited = Arc::clone(&exited);
+        let (entered, observed) = std::sync::mpsc::channel();
+        cb.on_completion(move || {
+            let _ = entered.send(());
+            let (lock, changed) = &*callback_gate;
+            let mut released = lock.lock();
+            while !*released {
+                changed.wait(&mut released);
+            }
+            callback_exited.store(true, Ordering::Release);
+        })
+        .unwrap();
+        let waited = std::cell::RefCell::new(None);
+        // Install release before the first possible submission or assertion.
+        let cleanup = ReleaseBeforeWait {
+            release: || {
+                let (lock, changed) = &*gate;
+                *lock.lock() = true;
+                changed.notify_all();
+            },
+            wait: || {
+                *waited.borrow_mut() = Some(cb.wait_until_completed());
+            },
+        };
+        let marker = commands.flush_marker().unwrap();
+        observed
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("callback did not enter");
+        let epoch = commands.clock().current_epoch();
+        let native = commands
+            .core
+            .submission_control
+            .native_calls
+            .load(Ordering::Relaxed);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let ready = loop {
+            match marker.poll_data_ready() {
+                Ok(true) => break true,
+                Err(error) => panic!("DATA poll refused while callback held: {error}"),
+                Ok(false) if std::time::Instant::now() >= deadline => break false,
+                Ok(false) => std::thread::yield_now(),
+            }
+        };
+        assert!(ready, "own DATA was hidden behind callback completion");
+        assert!(!exited.load(Ordering::Acquire));
+        assert_eq!(commands.clock().current_epoch(), epoch);
+        assert_eq!(
+            commands
+                .core
+                .submission_control
+                .native_calls
+                .load(Ordering::Relaxed),
+            native
+        );
+        drop(cleanup);
+        waited.into_inner().unwrap().unwrap();
+        assert!(exited.load(Ordering::Acquire));
+    }
+
+    /// The status/error inputs below are injected observations, not a native
+    /// driver failure. Genuine successful DATA remains observable afterward;
+    /// the test does not claim a second native writer or physical retirement.
+    #[test]
+    fn data_poll_native_error_observation_is_lazy_and_preserves_admission() {
+        use std::cell::Cell;
+        let device = crate::MetalDevice::new(0).unwrap();
+        let commands = device.commands();
+        let cb = pending(commands);
+        let buffer = device.new_persistent_shared(256).unwrap();
+        let pins = RetainUnknown(Some((device.clone(), cb.clone(), buffer.clone())));
+        let epoch = commands.clock().current_epoch();
+        let native = commands
+            .core
+            .submission_control
+            .native_calls
+            .load(Ordering::Relaxed);
+        assert!(
+            !cb.test_poll_data_ready_with_observation(
+                || MTLCommandBufferStatus::Completed,
+                || panic!("pending DATA eagerly constructed error text"),
+            )
+            .unwrap(),
+            "observed completion bypassed unsubmitted admission"
+        );
+        assert_eq!(commands.clock().current_epoch(), epoch);
+        assert_eq!(
+            commands
+                .core
+                .submission_control
+                .native_calls
+                .load(Ordering::Relaxed),
+            native
+        );
+        {
+            let mut blit = commands.blit_command_encoder().unwrap();
+            // SAFETY: independent pins survive assertion/refusal unwind.
+            unsafe { blit.fill_buffer(&buffer, (0, 256), 0x5b) };
+        }
+        let marker = commands.flush_marker().unwrap();
+        assert!(
+            marker.cb.same_recording(&cb),
+            "observations must target the genuine writer recording"
+        );
+        commands.wait_marker(&marker).unwrap();
+        assert!(marker.poll_data_ready().unwrap());
+        // SAFETY: the genuine exact native writer's DATA completed above.
+        let bytes = unsafe { std::slice::from_raw_parts(buffer.contents(), 256) };
+        assert!(bytes.iter().all(|byte| *byte == 0x5b));
+        let epoch = commands.clock().current_epoch();
+        let native = commands
+            .core
+            .submission_control
+            .native_calls
+            .load(Ordering::Relaxed);
+        for (status, expected) in [
+            (MTLCommandBufferStatus::Completed, true),
+            (MTLCommandBufferStatus::Committed, false),
+        ] {
+            assert_eq!(
+                cb.test_poll_data_ready_with_observation(
+                    || status,
+                    || panic!("non-error DATA status eagerly constructed error text"),
+                )
+                .unwrap(),
+                expected
+            );
+        }
+        let status_calls = Cell::new(0);
+        let error_calls = Cell::new(0);
+        let error = cb
+            .test_poll_data_ready_with_observation(
+                || {
+                    status_calls.set(status_calls.get() + 1);
+                    MTLCommandBufferStatus::Error
+                },
+                || {
+                    error_calls.set(error_calls.get() + 1);
+                    Some("injected native-status observation".into())
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            MetalKernelError::CommandBufferError(ref message)
+                if message == "injected native-status observation"
+        ));
+        assert_eq!((status_calls.get(), error_calls.get()), (1, 1));
+        assert!(matches!(
+            cb.test_poll_data_ready_with_observation(|| MTLCommandBufferStatus::Error, || None),
+            Err(MetalKernelError::CommandBufferError(ref message)) if message == "unknown error"
+        ));
+        assert!(marker.poll_data_ready().unwrap());
+        assert_eq!(commands.clock().current_epoch(), epoch);
+        assert_eq!(
+            commands
+                .core
+                .submission_control
+                .native_calls
+                .load(Ordering::Relaxed),
+            native
+        );
+        pins.release();
+
+        // A distinct queue's known-before-entry failure must win BEFORE either
+        // observation callback. This does not induce a native driver error.
+        let failed_device = crate::MetalDevice::new(0).unwrap();
+        let failed_commands = failed_device.commands();
+        let failed_cb = pending(failed_commands);
+        let _failed_pins = RetainUnknown(Some((failed_device.clone(), failed_cb.clone())));
+        failed_commands
+            .core
+            .submission_control
+            .arm(submission_test::Fault::BeforeEntry);
+        assert!(failed_commands
+            .recover_pending_submission(&failed_cb)
+            .is_err());
+        let status_calls = Cell::new(0);
+        let error_calls = Cell::new(0);
+        assert!(failed_cb
+            .test_poll_data_ready_with_observation(
+                || {
+                    status_calls.set(status_calls.get() + 1);
+                    MTLCommandBufferStatus::Error
+                },
+                || {
+                    error_calls.set(error_calls.get() + 1);
+                    Some("must not construct after failed admission".into())
+                },
+            )
+            .is_err());
+        assert_eq!(
+            (status_calls.get(), error_calls.get()),
+            (0, 0),
+            "failed admission was observed too late"
+        );
+        assert_eq!(
+            failed_commands
+                .core
+                .submission_control
+                .native_calls
+                .load(Ordering::Relaxed),
+            0
+        );
+        eprintln!("DATA_ERROR_OBSERVATION actual_api={} injected_status=true native_driver_failure=false actual_writer_success=true error_branch=true lazy_error=true admission_precedes_observation=true",
+            commands.actual_command_api());
+    }
+
+    #[test]
     fn unused_owner_preparation_cancels_without_epoch_and_can_retry() {
         let device = crate::MetalDevice::new(0).unwrap();
         let commands = device.commands();
@@ -3733,7 +4049,16 @@ mod owner_submission_tests {
                 buffer: &cb,
                 clock: &commands.core.clock,
             };
-            drop(cb.prepare_owned_commit(authority, false).unwrap());
+            let prepared = cb.prepare_owned_commit(authority, false).unwrap();
+            assert!(
+                !cb.poll_data_ready().unwrap(),
+                "PREPARED is pending, not successful DATA"
+            );
+            drop(prepared);
+            assert!(
+                !cb.poll_data_ready().unwrap(),
+                "cancelled preparation preserves open recording"
+            );
             assert_eq!(commands.clock().current_epoch().0, 0);
             assert_eq!(cb.status(), MTLCommandBufferStatus::NotEnqueued);
         }
@@ -3860,6 +4185,10 @@ mod owner_submission_tests {
         assert_eq!(commands.clock().current_epoch().0, 1);
         assert_eq!(commands.clock().completed_count().0, 0);
         assert!(commands.check_failed().is_err());
+        assert!(
+            cb.poll_data_ready().is_err(),
+            "failed admission must not become merely pending DATA"
+        );
         assert!(commands.recover_pending_submission(&cb).is_err());
         assert_eq!(commands.clock().current_epoch().0, 1);
         assert_eq!(control.native_calls.load(Ordering::Relaxed), 0);
@@ -4118,9 +4447,15 @@ mod owner_submission_tests {
             std::thread::yield_now();
         }
         let before_release = callback_result.load(Ordering::Acquire);
+        let data_pending_during_entered_handoff = cb.poll_data_ready();
         drop(cleanup);
         result.into_inner().unwrap().unwrap().unwrap();
         assert!(paused, "native return boundary did not engage");
+        assert!(
+            !data_pending_during_entered_handoff.unwrap(),
+            "unknown returned handoff was accepted as DATA"
+        );
+        assert!(cb.poll_data_ready().unwrap());
         assert_eq!(
             before_release, 1,
             "callback reentry blocked or bypassed refusal"

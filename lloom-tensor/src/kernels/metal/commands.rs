@@ -461,8 +461,8 @@ struct EntryState {
     /// A signal was encoded into the current recording since its cut.
     signals_since_cut: bool,
     /// Epochs taken by held recordings that were cancelled before their
-    /// commit: the next commit's completion completes them too.
-    owed_epochs: u32,
+    /// commit: a later commit's completion completes them (`produced::Owed`).
+    owed_epochs: produced::Owed,
     /// The current recording was cancelled and no replacement was free.
     current_abandoned: bool,
     /// Emptied after-commit lists, their storage kept: a held recording
@@ -508,7 +508,7 @@ impl EntryState {
             gate: produced::Gate::default(),
             held: std::collections::VecDeque::new(),
             signals_since_cut: false,
-            owed_epochs: 0,
+            owed_epochs: produced::Owed::default(),
             current_abandoned: false,
             spare_after: Vec::new(),
         }
@@ -2951,6 +2951,7 @@ impl CommandsCore {
         let (state, custody) = state.parts_mut();
         let state: &mut EntryState = state;
         let owed_epochs = &mut state.owed_epochs;
+        let held_ahead = state.held.len();
         let mut published = false;
         let submitted = state
             .current
@@ -2972,8 +2973,9 @@ impl CommandsCore {
                     clock: &self.clock,
                 };
                 // Epochs of held recordings cancelled before their commit
-                // complete with this one (`produced.rs`).
-                let owed = std::mem::take(owed_epochs);
+                // complete with this one (`produced::Owed`); an ordinary
+                // commit runs with nothing held.
+                let runs = owed_epochs.runs_for(None, held_ahead);
                 let receipt = self.submit_owned_recording(
                     authority,
                     Some(destination),
@@ -2981,11 +2983,11 @@ impl CommandsCore {
                     timed,
                     t_end_enc,
                     None,
-                    1 + owed,
+                    runs,
                 );
-                match &receipt {
-                    Ok(_) => published = true,
-                    Err(_) => *owed_epochs += owed,
+                if receipt.is_ok() {
+                    owed_epochs.settle(runs);
+                    published = true;
                 }
                 receipt
             })
@@ -3461,7 +3463,7 @@ impl lifecycle::FinalCore for CommandsCore {
         if state.current_abandoned && !self.replace_abandoned_for_final(&mut state, captures)? {
             return Ok(false);
         }
-        let owed = std::mem::take(&mut state.owed_epochs);
+        let runs = state.owed_epochs.runs_for(None, state.held.len());
         let removals = if captures.removals.is_none() {
             Some(&mut captures.removals)
         } else {
@@ -3477,11 +3479,11 @@ impl lifecycle::FinalCore for CommandsCore {
                     buffer: cb,
                     clock: &self.clock,
                 };
-                self.submit_owned_recording(authority, removals, true, None, None, None, 1 + owed)
+                self.submit_owned_recording(authority, removals, true, None, None, None, runs)
             })
             .map(|_| ());
-        if submitted.is_err() {
-            state.owed_epochs += owed;
+        if submitted.is_ok() {
+            state.owed_epochs.settle(runs);
         }
         match submitted {
             Ok(_) => Ok(true),

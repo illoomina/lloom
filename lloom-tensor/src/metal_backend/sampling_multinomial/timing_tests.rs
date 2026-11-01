@@ -178,7 +178,7 @@ impl Lcg {
 
 /// A logit row shaped like a language model's: a Gaussian bulk (sigma 3) and
 /// a sparse upper tail, so the k-th largest sits well above the bulk.
-fn logits(vocab: usize, rows: usize) -> Vec<f32> {
+pub(super) fn logits(vocab: usize, rows: usize) -> Vec<f32> {
     let mut rng = Lcg(0x1036);
     let mut z = Vec::with_capacity(vocab * rows);
     for row in 0..rows {
@@ -397,8 +397,8 @@ fn sampler_kernel_gpu_time() -> Result<()> {
         };
         // Each pipeline is one command buffer; the record carries its last
         // dispatch's label.
-        let kernels: [(&str, &str, Box<dyn Fn() -> Result<()> + '_>); 3] = [
-            ("select", "sampling_select_rank_f32", Box::new(select)),
+        let kernels: [(&str, &str, Box<dyn Fn() -> Result<()> + '_>); 5] = [
+            ("select", "sampling_select_rank_f32", Box::new(&select)),
             (
                 "multinomial",
                 "sampling_support_f32",
@@ -408,6 +408,17 @@ fn sampler_kernel_gpu_time() -> Result<()> {
                 "gumbel",
                 "sampling_gumbel_pick_f32",
                 Box::new(|| draw(true)),
+            ),
+            // The production shape: the selection and the draw in one buffer.
+            (
+                "select+multinomial",
+                "sampling_support_f32",
+                Box::new(|| select().and_then(|()| draw(false))),
+            ),
+            (
+                "select+gumbel",
+                "sampling_gumbel_pick_f32",
+                Box::new(|| select().and_then(|()| draw(true))),
             ),
         ];
         // The selection runs first so the draws read a real kept set.
@@ -445,13 +456,15 @@ fn sampler_kernel_gpu_time() -> Result<()> {
             status.to_cpu::<u32>()?
         );
     }
-    println!("| cell | rows | selector us | multinomial us | gumbel us |");
-    println!("|---|---:|---:|---:|---:|");
-    for chunk in table.chunks(3) {
-        if let [a, b, c] = chunk {
+    println!(
+        "| cell | rows | select us | multinomial us | gumbel us | select+multinomial us | select+gumbel us |"
+    );
+    println!("|---|---:|---:|---:|---:|---:|---:|");
+    for chunk in table.chunks(5) {
+        if let [a, b, c, d, e] = chunk {
             println!(
-                "| {} | {} | {:.1} | {:.1} | {:.1} |",
-                a.0, a.2, a.3, b.3, c.3
+                "| {} | {} | {:.1} | {:.1} | {:.1} | {:.1} | {:.1} |",
+                a.0, a.2, a.3, b.3, c.3, d.3, e.3
             );
         }
     }

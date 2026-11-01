@@ -58,6 +58,7 @@ kernel void sampling_gumbel_support_f32(
                                      lanes, groups, reds, redu, tid, width);
         code = n.code;
     }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
     if (tid == 0u) sampling_publish_nucleus(wk, n, code);
 }
 

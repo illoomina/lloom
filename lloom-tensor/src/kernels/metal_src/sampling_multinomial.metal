@@ -435,12 +435,18 @@ inline SamplingNucleus sampling_prepare_nucleus(
     return out;
 }
 
+// Also returns the words the weights stage appends to and the Gumbel check
+// writes to their reset state, so a draw repeated from one selection starts
+// clean; every thread's reads of them precede the caller's barrier.
 inline void sampling_publish_nucleus(SamplingWork wk, SamplingNucleus n, uint code) {
     wk.words[W_CODE] = code;
     sampling_store_key(wk.words, W_CUTP_LO, n.cutoff);
     wk.words[W_NCOUNT] = code == 0u ? n.count : 0u;
     wk.words[W_TOTAL] = as_type<uint>(n.total);
     wk.words[W_NMASS] = as_type<uint>(n.nucleus);
+    wk.words[W_COMPACT] = 0u;
+    wk.words[W_COMPACT_OVER] = 0u;
+    wk.words[W_GBAD] = 0xffffffffu;
 }
 
 // Stage 7: one threadgroup per row draws the token: the inverse CDF in
@@ -607,6 +613,7 @@ kernel void sampling_draw_f32(
             }
         }
     }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
     if (tid == 0u) {
         sampling_publish_nucleus(wk, n, code);
         ids[row] = code != 0u ? 0xffffffffu : pick;

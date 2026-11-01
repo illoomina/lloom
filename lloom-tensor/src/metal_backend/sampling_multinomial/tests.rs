@@ -1742,3 +1742,204 @@ fn device_draws_have_the_reference_distribution() -> Result<()> {
     }
     Ok(())
 }
+
+/// The microbench's rows at the served width with top-k AND top-p: the
+/// shape the fixtures' wide rows do not carry (they are k-only or p-only).
+/// Every row's kept set, draw and status against the reference, five times
+/// in one process (a race shows as a run that differs).
+#[test]
+fn wide_rows_with_top_k_and_top_p_match_the_reference_repeatedly() -> Result<()> {
+    let d = device()?;
+    for (vocab, k, p, t) in [
+        (128_000usize, 20usize, 0.95f64, 1.0f64),
+        (248_320, 20, 0.95, 1.0),
+        (128_000, 50, 1.0, 0.1),
+    ] {
+        let z = super::timing_tests::logits(vocab, 4);
+        let uniforms = [0.37f32, 0.5, 0.63, 0.76];
+        for run in 0..5 {
+            let input = Tensor::from_vec(z.clone(), (4, vocab), &d)?;
+            let u = Tensor::from_vec(uniforms.to_vec(), 4, &d)?;
+            let got = read(encode(&input, Params::new(t, k, p), &u)?)?;
+            for row in 0..4 {
+                let zr = &z[row * vocab..(row + 1) * vocab];
+                let want = oracle::draw(zr, Params::new(t, k, p), uniforms[row]).unwrap();
+                let kept = oracle::kept_ids(zr, Params::new(t, k, p)).unwrap();
+                assert_eq!(
+                    (got.ids[row], &got.status[row * 4..row * 4 + 4]),
+                    (want, &[0, u32::MAX, vocab as u32, kept.len() as u32][..]),
+                    "vocab {vocab} k {k} p {p} run {run} row {row}"
+                );
+            }
+            println!(
+                "WIDE_KP vocab={vocab} k={k} p={p} run={run} ids={:?} counts={:?}",
+                got.ids,
+                (0..4).map(|r| got.status[r * 4 + 3]).collect::<Vec<_>>()
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Diagnostic for the shape above: every stage's scratch words after a
+/// full draw, per row, five times. Ignored; `--no-capture` prints it.
+#[test]
+#[ignore]
+fn diag_wide_rows_with_top_k_and_top_p() -> Result<()> {
+    use crate::kernels::kernels::sampling_topk::{sampling_tiles, sampling_work_words};
+    let d = device()?;
+    let m = d.as_metal_device()?;
+    let (vocab, rows, k, p, t) = (128_000usize, 4usize, 20usize, 0.95f64, 1.0f64);
+    let z = super::timing_tests::logits(vocab, rows);
+    let input = Tensor::from_vec(z.clone(), (rows, vocab), &d)?;
+    let u = Tensor::from_vec(vec![0.37f32, 0.5, 0.63, 0.76], rows, &d)?;
+    let (zs, layout) = input.storage_and_layout();
+    let (us, ul) = u.storage_and_layout();
+    let (Storage::Metal(zs), Storage::Metal(us)) = (&*zs, &*us) else {
+        unreachable!()
+    };
+    let words = sampling_work_words(rows, vocab).unwrap();
+    let per_row = words / rows;
+    let tiles = sampling_tiles(vocab);
+    let alloc = |count: usize, dtype, label| -> Result<MetalStorage> {
+        let b = m
+            .new_buffer_builder()
+            .with_size_for(count, dtype)
+            .with_label(label)
+            .build()?;
+        MetalStorage::new_allocated(b, m.clone(), count, dtype)
+    };
+    for run in 0..5 {
+        let work = alloc(words, DType::U32, "diag_work")?;
+        let scratch = alloc(rows * vocab, DType::U32, "diag_scratch")?;
+        let selection = alloc(rows * 4, DType::U32, "diag_selection")?;
+        let weights = alloc(rows * vocab, DType::F32, "diag_weights")?;
+        let support = alloc(rows * vocab, DType::U32, "diag_support")?;
+        let ids = alloc(rows, DType::U32, "diag_ids")?;
+        let status = alloc(rows * 4, DType::U32, "diag_status")?;
+        {
+            let encoder = m.command_encoder()?;
+            // SAFETY: sized, disjoint, live storage owned by this test.
+            unsafe {
+                crate::kernels::kernels::sampling_topk::call_sampling_select(
+                    m.metal_device(),
+                    &encoder,
+                    m.kernels(),
+                    (zs.buffer(), 0),
+                    rows as u32,
+                    vocab as u32,
+                    k as u32,
+                    u32::from(p != 1.0),
+                    work.buffer(),
+                    scratch.buffer(),
+                    selection.buffer(),
+                )
+            }
+            .map_err(crate::Error::wrap)?;
+        }
+        m.wait_until_completed()?;
+        let w_after_select = work.to_cpu::<u32>()?;
+        {
+            let encoder = m.command_encoder()?;
+            // SAFETY: as above; the selection is these rows'.
+            unsafe {
+                crate::kernels::kernels::sampling_topk::call_sampling_multinomial(
+                    m.metal_device(),
+                    &encoder,
+                    m.kernels(),
+                    (zs.buffer(), 0),
+                    rows as u32,
+                    vocab as u32,
+                    (1.0 / t) as f32,
+                    p as f32,
+                    u32::from(p != 1.0),
+                    (us.buffer(), 0),
+                    work.buffer(),
+                    scratch.buffer(),
+                    weights.buffer(),
+                    support.buffer(),
+                    ids.buffer(),
+                    status.buffer(),
+                )
+            }
+            .map_err(crate::Error::wrap)?;
+        }
+        m.wait_until_completed()?;
+        // Draws repeated from the one selection: the appended compact set
+        // must not accumulate across them.
+        for redraw in 0..4 {
+            let encoder = m.command_encoder()?;
+            // SAFETY: as above.
+            unsafe {
+                crate::kernels::kernels::sampling_topk::call_sampling_multinomial(
+                    m.metal_device(),
+                    &encoder,
+                    m.kernels(),
+                    (zs.buffer(), 0),
+                    rows as u32,
+                    vocab as u32,
+                    (1.0 / t) as f32,
+                    p as f32,
+                    u32::from(p != 1.0),
+                    (us.buffer(), 0),
+                    work.buffer(),
+                    scratch.buffer(),
+                    weights.buffer(),
+                    support.buffer(),
+                    ids.buffer(),
+                    status.buffer(),
+                )
+            }
+            .map_err(crate::Error::wrap)?;
+            drop(encoder);
+            m.wait_until_completed()?;
+            let st = status.to_cpu::<u32>()?;
+            let wa = work.to_cpu::<u32>()?;
+            println!(
+                "DIAG-REDRAW run={run} redraw={redraw} counts={:?} compact_after={:?} fallback={:?}",
+                (0..rows).map(|r| st[r * 4 + 3]).collect::<Vec<_>>(),
+                (0..rows).map(|r| wa[r * per_row + 16]).collect::<Vec<_>>(),
+                (0..rows).map(|r| wa[r * per_row + 22]).collect::<Vec<_>>()
+            );
+        }
+        let w_after = work.to_cpu::<u32>()?;
+        let wts = weights.to_cpu::<f32>()?;
+        let mem = scratch.to_cpu::<u32>()?;
+        let st = status.to_cpu::<u32>()?;
+        let idv = ids.to_cpu::<u32>()?;
+        let _ = (layout, ul);
+        for row in 0..rows {
+            let ws = &w_after_select[row * per_row..row * per_row + 64];
+            let wa = &w_after[row * per_row..row * per_row + 64];
+            let ghist = &w_after[row * per_row + 64 + 4 * tiles + 2048 * tiles
+                ..row * per_row + 64 + 4 * tiles + 2048 * tiles + 2048];
+            let lanes: Vec<f32> = w_after[row * per_row + 64 + 4 * tiles + 2048 * tiles + 2048..]
+                [..1024]
+                .iter()
+                .map(|&b| f32::from_bits(b))
+                .collect();
+            let top_bins: Vec<(usize, u32)> = ghist
+                .iter()
+                .enumerate()
+                .filter(|(b, &n)| n != 0 && *b >= 1540)
+                .map(|(b, &n)| (b, n))
+                .collect();
+            let hist_top: Vec<u32> = (0..tiles)
+                .map(|tl| w_after[row * per_row + 64 + 4 * tiles + tl * 2048 + 1546])
+                .collect();
+            let wrow = &wts[row * vocab..(row + 1) * vocab];
+            let nonzero = wrow.iter().filter(|&&x| x != 0.0).count();
+            let wsum: f64 = wrow.iter().map(|&x| x as f64).sum();
+            let lane_sum: f64 = lanes.iter().map(|&x| x as f64).sum();
+            let n_compact = wa[16] as usize;
+            let members: Vec<u32> = mem[row * vocab..row * vocab + n_compact.min(24)].to_vec();
+            println!(
+                "DIAG run={run} row={row} select: code={} count={} keep={} rsel={} ksel={} bin={} nabove={} cand={} cutk={:#x}:{:#x} cuts={:#x}:{:#x} compact_on={} | after: compact={} over={} fallback={} cutp={:#x}:{:#x} ncount={} total={} nmass={} code={} | weights nonzero={} sum={wsum:.4} lanes sum={lane_sum:.4} | ghist top bins={top_bins:?} hist[1546] per tile sum={} | members={members:?} | id={} status={:?}",
+                ws[0], ws[2], ws[3], ws[7], ws[8], ws[9], ws[10], ws[11], ws[13], ws[12], ws[15], ws[14], ws[17],
+                wa[16], wa[25], wa[22], wa[20], wa[19], wa[21], f32::from_bits(wa[23]), f32::from_bits(wa[24]), wa[0],
+                nonzero, hist_top.iter().sum::<u32>(), idv[row], &st[row * 4..row * 4 + 4]
+            );
+        }
+    }
+    Ok(())
+}

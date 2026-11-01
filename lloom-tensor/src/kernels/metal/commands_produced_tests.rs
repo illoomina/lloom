@@ -1905,3 +1905,434 @@ fn final_teardown_cancels_a_current_recording_behind_pending_validated_io() {
     );
     drop((native, src, dst, gate, progress, generation));
 }
+
+/// One held reader per gate, each on an event of its own: the dependent
+/// compute recorded behind `commit_when_produced(event, 1)`, then cut. Its
+/// marker and the epoch the cut took.
+fn hold_on(f: &Fixture, event: &Event) -> (CommandMarker, Epoch) {
+    let epoch = f.commands.clock().current_epoch();
+    f.commands.commit_when_produced(event, 1).unwrap();
+    encode_compute(f);
+    let marker = f.commands.flush_marker().unwrap();
+    assert!(
+        !marker.is_submitted(),
+        "a gated reader was submitted at its cut"
+    );
+    (marker, epoch)
+}
+
+fn raise(f: &Fixture, event: &Event) -> usize {
+    event.setSignaledValue(1);
+    f.commands.produced(event, 1).unwrap()
+}
+
+/// The clock once the completions a wait returned on have run: polled past
+/// `at_least`, then given time for any further hook run of the same
+/// completion to land, so an over-marking completion is read at its end.
+fn settled_completed(f: &Fixture, at_least: u64) -> u64 {
+    let clock = f.commands.clock();
+    assert!(
+        until(Duration::from_secs(5), || clock.completed_count().0
+            >= at_least),
+        "epoch {} never completed",
+        at_least - 1
+    );
+    std::thread::sleep(Duration::from_millis(200));
+    clock.completed_count().0
+}
+
+/// A pool buffer of `size` bytes released now: parked at the clock's current
+/// epoch, the one the next cut takes, until that epoch completes
+/// (`BufferPool`'s reuse rule, `GpuClock::is_complete`).
+fn park(f: &Fixture, pool: &crate::kernels::metal::BufferPool, size: usize) {
+    let raw = f
+        .native
+        .new_buffer(size, super::super::MTLResourceOptions::StorageModeShared)
+        .unwrap();
+    drop(pool.adopt(raw, size));
+}
+
+/// Whether the pool would hand a parked `size` buffer out again now.
+fn reusable(pool: &crate::kernels::metal::BufferPool, size: usize) -> bool {
+    pool.acquire(size).is_some()
+}
+
+fn owed_now(f: &Fixture) -> u32 {
+    f.commands.core.state.lock(Side::Host).owed_epochs.count()
+}
+
+/// The counterexample on #944 (H0/H1/H2 on gates A/B/C, cancel C, produce
+/// A). H0's completion completes H0's epoch alone: H1 is still held, so its
+/// epoch is not covered and anything the pool parked on it stays parked
+/// (`BufferPool`'s reuse test is `GpuClock::is_complete`). Once B is produced
+/// and H1 completes, every epoch has completed, the cancelled H2's with H1's.
+#[test]
+fn a_cancelled_tail_leaves_a_still_held_reader_uncovered() {
+    let f = fixture();
+    if f.commands.host_input_arm() == HostInputArm::GpuWait {
+        eprintln!("NOT_APPLICABLE nothing is held on the gpu-wait arm");
+        return;
+    }
+    let [a, b, c] = std::array::from_fn(|_| f.native.as_ref().newSharedEvent().unwrap());
+    let pool = crate::kernels::metal::BufferPool::with_clock(f.commands.clock());
+    const H1_FRAME: usize = 3 * 4096;
+    let (m0, e0) = hold_on(&f, &a);
+    // Memory H1 reads, released as H1 is recorded: parked at H1's epoch.
+    park(&f, &pool, H1_FRAME);
+    let (m1, e1) = hold_on(&f, &b);
+    let (m2, e2) = hold_on(&f, &c);
+    assert_eq!((e1.0, e2.0), (e0.0 + 1, e0.0 + 2));
+    assert_eq!(f.commands.produced_stats().held_now, 3);
+    let calls = native_calls(&f.commands);
+    // H2 and the current recording behind it.
+    assert_eq!(
+        f.commands.cancel_produced(&c, "test: C gave up").unwrap(),
+        2
+    );
+    assert_eq!(owed_now(&f), 1);
+    assert_eq!(raise(&f, &a), 1, "A releases H0 alone");
+    f.commands.wait_marker(&m0).unwrap();
+    let completed = settled_completed(&f, e0.0 + 1);
+    let clock = f.commands.clock();
+    eprintln!(
+        "OWED_H0_DONE api={} completed={completed} e0={} e1={} h1_submitted={} owed={} held={}",
+        f.commands.actual_command_api(),
+        e0.0,
+        e1.0,
+        m1.is_submitted(),
+        owed_now(&f),
+        f.commands.produced_stats().held_now
+    );
+    assert_eq!(
+        native_calls(&f.commands) - calls,
+        1,
+        "H0 alone was submitted"
+    );
+    assert!(!m1.is_submitted(), "H1 left the held queue before B");
+    assert_eq!(f.commands.produced_stats().held_now, 1);
+    assert_eq!(
+        completed,
+        e0.0 + 1,
+        "H0's completion marked an epoch past its own"
+    );
+    assert!(
+        !clock.is_complete(e1),
+        "H1's epoch completed while H1 was still held"
+    );
+    assert!(
+        !reusable(&pool, H1_FRAME),
+        "the pool handed out memory a still-held recording reads"
+    );
+    assert_eq!(
+        owed_now(&f),
+        1,
+        "the owed epoch went with a non-tail commit"
+    );
+    assert_eq!(raise(&f, &b), 1, "B releases H1");
+    f.commands.wait_marker(&m1).unwrap();
+    let completed = settled_completed(&f, e2.0 + 1);
+    eprintln!(
+        "OWED_H1_DONE api={} completed={completed} current={} owed={}",
+        f.commands.actual_command_api(),
+        clock.current_epoch().0,
+        owed_now(&f)
+    );
+    assert_eq!(completed, e2.0 + 1, "H1 completes its epoch and H2's");
+    assert!(
+        reusable(&pool, H1_FRAME),
+        "H1's memory stayed parked after H1"
+    );
+    assert_eq!(clock.current_epoch().0, e2.0 + 1);
+    assert!(clock.is_complete(e1) && clock.is_complete(e2));
+    assert_eq!(owed_now(&f), 0);
+    assert!(computed(&f.dst));
+    let waited = f.commands.wait_marker(&m2);
+    assert!(
+        waited
+            .as_ref()
+            .is_err_and(|e| e.to_string().contains("C gave up")),
+        "{waited:?}"
+    );
+    // The stream goes on.
+    encode_compute(&f);
+    f.commands.flush_and_wait().unwrap();
+    assert_eq!(
+        clock.completed_count().0,
+        clock.current_epoch().0,
+        "every epoch taken completed"
+    );
+    f.commands.check_failed().unwrap();
+}
+
+/// Held work added after a cancellation (H0; H1 cancelled; H2, H3 held
+/// after it): H0's completion completes H0's epoch; H2 — the first commit
+/// above the cancelled epoch — completes the cancelled epoch and its own at
+/// its own completion, with H3 still held; H3 completes its own.
+#[test]
+fn work_held_after_a_cancellation_completes_its_own_epoch_at_its_completion() {
+    let f = fixture();
+    if f.commands.host_input_arm() == HostInputArm::GpuWait {
+        eprintln!("NOT_APPLICABLE nothing is held on the gpu-wait arm");
+        return;
+    }
+    let [a, b, c, d] = std::array::from_fn(|_| f.native.as_ref().newSharedEvent().unwrap());
+    let (m0, e0) = hold_on(&f, &a);
+    let (_m1, e1) = hold_on(&f, &b);
+    assert_eq!(
+        f.commands.cancel_produced(&b, "test: B gave up").unwrap(),
+        2
+    );
+    assert_eq!(owed_now(&f), 1);
+    let (m2, e2) = hold_on(&f, &c);
+    let (m3, e3) = hold_on(&f, &d);
+    assert_eq!((e1.0, e2.0, e3.0), (e0.0 + 1, e0.0 + 2, e0.0 + 3));
+    let clock = f.commands.clock();
+    assert_eq!(raise(&f, &a), 1);
+    f.commands.wait_marker(&m0).unwrap();
+    assert_eq!(settled_completed(&f, e0.0 + 1), e0.0 + 1);
+    assert_eq!(owed_now(&f), 1);
+    assert_eq!(raise(&f, &c), 1);
+    f.commands.wait_marker(&m2).unwrap();
+    let completed = settled_completed(&f, e2.0 + 1);
+    eprintln!(
+        "OWED_ADDED api={} completed={completed} e2={} h3_submitted={} owed={}",
+        f.commands.actual_command_api(),
+        e2.0,
+        m3.is_submitted(),
+        owed_now(&f)
+    );
+    assert!(!m3.is_submitted());
+    assert_eq!(
+        completed,
+        e2.0 + 1,
+        "H2's completion left its own epoch open"
+    );
+    assert!(!clock.is_complete(e3));
+    assert_eq!(owed_now(&f), 0);
+    assert_eq!(raise(&f, &d), 1);
+    f.commands.wait_marker(&m3).unwrap();
+    assert_eq!(settled_completed(&f, e3.0 + 1), e3.0 + 1);
+    assert_eq!(clock.current_epoch().0, e3.0 + 1);
+    f.commands.check_failed().unwrap();
+}
+
+/// Two cancellations, the later one shallower in the queue (H0..H3; cancel
+/// D, then C): H0 completes its own epoch; H1, the last live one,
+/// completes its own and both cancelled ones.
+#[test]
+fn repeated_cancellations_complete_with_the_last_live_reader() {
+    let f = fixture();
+    if f.commands.host_input_arm() == HostInputArm::GpuWait {
+        eprintln!("NOT_APPLICABLE nothing is held on the gpu-wait arm");
+        return;
+    }
+    let [a, b, c, d] = std::array::from_fn(|_| f.native.as_ref().newSharedEvent().unwrap());
+    let (m0, e0) = hold_on(&f, &a);
+    let (m1, e1) = hold_on(&f, &b);
+    let (_, _) = hold_on(&f, &c);
+    let (_, e3) = hold_on(&f, &d);
+    assert_eq!(
+        f.commands.cancel_produced(&d, "test: D gave up").unwrap(),
+        2
+    );
+    assert_eq!(
+        f.commands.cancel_produced(&c, "test: C gave up").unwrap(),
+        1
+    );
+    assert_eq!(owed_now(&f), 2);
+    let clock = f.commands.clock();
+    assert_eq!(raise(&f, &a), 1);
+    f.commands.wait_marker(&m0).unwrap();
+    assert_eq!(settled_completed(&f, e0.0 + 1), e0.0 + 1);
+    assert!(!clock.is_complete(e1));
+    assert!(!m1.is_submitted());
+    assert_eq!(raise(&f, &b), 1);
+    f.commands.wait_marker(&m1).unwrap();
+    assert_eq!(settled_completed(&f, e3.0 + 1), e3.0 + 1);
+    assert_eq!(clock.current_epoch().0, e3.0 + 1);
+    assert_eq!(owed_now(&f), 0);
+    f.commands.check_failed().unwrap();
+}
+
+/// A held release the owner's submission refuses before its epoch keeps
+/// what is owed: the retry carries it, and the mapping is exact.
+#[test]
+fn a_refused_release_keeps_the_owed_epochs_for_its_retry() {
+    let f = fixture();
+    if f.commands.host_input_arm() == HostInputArm::GpuWait {
+        eprintln!("NOT_APPLICABLE nothing is held on the gpu-wait arm");
+        return;
+    }
+    let [a, b] = std::array::from_fn(|_| f.native.as_ref().newSharedEvent().unwrap());
+    let (m0, _) = hold_on(&f, &a);
+    let (_, e1) = hold_on(&f, &b);
+    assert_eq!(
+        f.commands.cancel_produced(&b, "test: B gave up").unwrap(),
+        2
+    );
+    assert_eq!(owed_now(&f), 1);
+    // A produced but not announced: the owner's wait releases H0.
+    a.setSignaledValue(1);
+    let calls = native_calls(&f.commands);
+    let control = &f.commands.core.submission_control;
+    control.arm(submission_test::Fault::Registration);
+    let refused = f.commands.wait_marker(&m0);
+    assert!(
+        matches!(
+            refused,
+            Err(MetalKernelError::QueueUnavailable(
+                "injected completion registration refusal"
+            ))
+        ),
+        "{refused:?}"
+    );
+    assert_eq!(
+        native_calls(&f.commands),
+        calls,
+        "a refused release reached the GPU"
+    );
+    assert!(!m0.is_submitted());
+    assert_eq!(owed_now(&f), 1, "a refused release consumed the owed epoch");
+    assert_eq!(f.commands.clock().current_epoch().0, e1.0 + 1);
+    f.commands.wait_marker(&m0).unwrap();
+    assert_eq!(settled_completed(&f, e1.0 + 1), e1.0 + 1);
+    assert_eq!(owed_now(&f), 0);
+    f.commands.check_failed().unwrap();
+}
+
+/// The ordinary current commit after a cancellation emptied the held queue
+/// carries what is owed: its completion completes every epoch taken.
+#[test]
+fn the_next_current_commit_carries_the_owed_epochs() {
+    let f = fixture();
+    if f.commands.host_input_arm() == HostInputArm::GpuWait {
+        eprintln!("NOT_APPLICABLE nothing is held on the gpu-wait arm");
+        return;
+    }
+    let [a] = std::array::from_fn(|_| f.native.as_ref().newSharedEvent().unwrap());
+    let (_, e0) = hold_on(&f, &a);
+    assert_eq!(
+        f.commands.cancel_produced(&a, "test: A gave up").unwrap(),
+        2
+    );
+    assert_eq!(owed_now(&f), 1);
+    let clock = f.commands.clock();
+    assert_eq!(clock.completed_count().0, e0.0);
+    encode_compute(&f);
+    f.commands.flush_and_wait().unwrap();
+    assert_eq!(settled_completed(&f, e0.0 + 2), e0.0 + 2);
+    assert_eq!(clock.current_epoch().0, e0.0 + 2);
+    assert_eq!(owed_now(&f), 0);
+    assert!(computed(&f.dst));
+    f.commands.check_failed().unwrap();
+}
+
+/// Final teardown with a cancelled tail and a live reader not produced: the
+/// teardown commits H0 and H1 as recorded, the owed epoch rides H1, and
+/// every epoch has completed once the owner retires.
+#[test]
+fn teardown_after_a_cancelled_tail_completes_every_epoch() {
+    let f = fixture();
+    if f.commands.host_input_arm() == HostInputArm::GpuWait {
+        eprintln!("NOT_APPLICABLE nothing is held on the gpu-wait arm");
+        return;
+    }
+    let [a, b, c] = std::array::from_fn(|_| f.native.as_ref().newSharedEvent().unwrap());
+    let (_, _) = hold_on(&f, &a);
+    let (_, _) = hold_on(&f, &b);
+    let (_, e2) = hold_on(&f, &c);
+    assert_eq!(
+        f.commands.cancel_produced(&c, "test: C gave up").unwrap(),
+        2
+    );
+    let clock = f.commands.clock();
+    let weak = f.commands.core.produced.me_for_test();
+    let Fixture {
+        native,
+        commands,
+        src,
+        dst,
+        gate,
+        progress,
+    } = f;
+    drop(commands);
+    let retired = until(Duration::from_secs(5), || weak.upgrade().is_none());
+    eprintln!(
+        "OWED_TEARDOWN retired={retired} completed={} current={} e2={}",
+        clock.completed_count().0,
+        clock.current_epoch().0,
+        e2.0
+    );
+    assert!(retired);
+    // H0, H1, the final marker; H2's epoch owed and completed with H1.
+    assert_eq!(clock.current_epoch().0, e2.0 + 2);
+    assert_eq!(clock.completed_count().0, clock.current_epoch().0);
+    assert!(computed(&dst));
+    drop((native, src, dst, gate, progress, a, b, c));
+}
+
+/// Interleaved holes (H0 | cancelled H1 | H2 | cancelled H3 | H4, the review
+/// on #944): H2's completion completes the hole below it and its own epoch
+/// while H4's producer has not run, so memory parked at H2's epoch is
+/// reusable then; H4 completes the hole above H2 and its own.
+#[test]
+fn a_reader_between_two_cancelled_ranges_completes_at_its_own_completion() {
+    let f = fixture();
+    if f.commands.host_input_arm() == HostInputArm::GpuWait {
+        eprintln!("NOT_APPLICABLE nothing is held on the gpu-wait arm");
+        return;
+    }
+    let [a, b, c, d, e] = std::array::from_fn(|_| f.native.as_ref().newSharedEvent().unwrap());
+    let pool = crate::kernels::metal::BufferPool::with_clock(f.commands.clock());
+    const H2_FRAME: usize = 5 * 4096;
+    let (m0, e0) = hold_on(&f, &a);
+    let (_, e1) = hold_on(&f, &b);
+    assert_eq!(
+        f.commands.cancel_produced(&b, "test: B gave up").unwrap(),
+        2
+    );
+    park(&f, &pool, H2_FRAME);
+    let (m2, e2) = hold_on(&f, &c);
+    let (_, e3) = hold_on(&f, &d);
+    assert_eq!(
+        f.commands.cancel_produced(&d, "test: D gave up").unwrap(),
+        2
+    );
+    let (m4, e4) = hold_on(&f, &e);
+    assert_eq!(
+        (e1.0, e2.0, e3.0, e4.0),
+        (e0.0 + 1, e0.0 + 2, e0.0 + 3, e0.0 + 4)
+    );
+    assert_eq!(owed_now(&f), 2);
+    let clock = f.commands.clock();
+    assert_eq!(raise(&f, &a), 1);
+    f.commands.wait_marker(&m0).unwrap();
+    assert_eq!(settled_completed(&f, e0.0 + 1), e0.0 + 1);
+    assert!(!reusable(&pool, H2_FRAME), "H2's memory left before H2 ran");
+    assert_eq!(raise(&f, &c), 1);
+    f.commands.wait_marker(&m2).unwrap();
+    let completed = settled_completed(&f, e2.0 + 1);
+    let h2_frame = reusable(&pool, H2_FRAME);
+    eprintln!(
+        "OWED_INTERLEAVED api={} completed={completed} e2={} e4={} h4_submitted={} owed={} h2_frame_reusable={h2_frame}",
+        f.commands.actual_command_api(),
+        e2.0,
+        e4.0,
+        m4.is_submitted(),
+        owed_now(&f)
+    );
+    assert!(!m4.is_submitted(), "H4 ran without its producer");
+    assert_eq!(completed, e2.0 + 1, "H2's completion did not complete H2");
+    assert!(!clock.is_complete(e3) && !clock.is_complete(e4));
+    assert!(
+        h2_frame,
+        "memory H2 read stayed parked behind H4's producer"
+    );
+    assert_eq!(owed_now(&f), 1);
+    assert_eq!(raise(&f, &e), 1);
+    f.commands.wait_marker(&m4).unwrap();
+    assert_eq!(settled_completed(&f, e4.0 + 1), e4.0 + 1);
+    assert_eq!(clock.current_epoch().0, e4.0 + 1);
+    assert_eq!(owed_now(&f), 0);
+    f.commands.check_failed().unwrap();
+}

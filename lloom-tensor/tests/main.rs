@@ -108,6 +108,7 @@ mod rows_identity;
 mod sampling_contract;
 mod serialization_tests;
 mod slice_set_strided_tests;
+mod staged_readback_contract;
 mod staged_readback_plans;
 mod tensor_tests;
 mod typed_tests;

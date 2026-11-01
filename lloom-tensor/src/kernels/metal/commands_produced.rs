@@ -2073,10 +2073,11 @@ mod owed_tests {
             Owed::MAX_OWED,
             "a refused cancellation counted"
         );
-        // The largest carry is representable.
+        // The largest carry is representable: every owed epoch, or a front
+        // with every owed epoch below it.
         assert_eq!(owed.runs_for(None, 0), u32::MAX);
         assert_eq!(
-            owed.runs_for(Some(Epoch(7 + u64::from(u32::MAX) + 5)), 1),
+            owed.runs_for(Some(Epoch(7 + u64::from(Owed::MAX_OWED))), 1),
             u32::MAX
         );
         owed.settle(u32::MAX);

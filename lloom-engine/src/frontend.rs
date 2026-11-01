@@ -15,6 +15,8 @@
 
 use crate::option_tree::index;
 use crate::EngineOptions;
+use lloom_tensor::DType;
+use std::cell::OnceCell;
 use std::collections::BTreeSet;
 
 /// A front-end of the `lloom` binary.
@@ -66,11 +68,18 @@ pub enum When {
     /// its GPU-batched EOS and the Metal backend arms are Metal mechanisms;
     /// a CPU run keeps the library's blocking readback (and its silence).
     Metal,
-    /// The model's family takes the `model` axes (LFM2's `Config`; no
-    /// `--model` = the LFM2 snapshot), so a default axis never refuses a
-    /// family at load.
-    ModelAxes,
-    /// LFM2's speculative body at one sequence: [`When::ModelAxes`],
+    /// [`When::Metal`], and the LFM2 engine serves the model, in any
+    /// representation it loads: a safetensors checkpoint, or an LFM2 GGUF on
+    /// that engine (not `models.lfm2_gguf.engine = legacy`). For a row whose
+    /// arm LFM2's presets already run on every representation.
+    Lfm2,
+    /// [`When::Lfm2`] at [`Representation::MEASURED`], dense weights at
+    /// f16: the representation the LFM2 rows were measured on (no `--model`
+    /// is the LFM2 snapshot). A row's evidence does not transfer to packed
+    /// blocks or to f32 compute; there it is withheld by name
+    /// ([`withheld`]).
+    Lfm2Dense,
+    /// LFM2's speculative body at one sequence: [`When::Lfm2Dense`],
     /// `speculative.method = dspark`, `scheduler.max_sequences = 1`, on a
     /// preset whose own KV under a drafter is the in-place one (`auto`,
     /// `rewindable`; `pool-spec` keeps its page pool). Every verify window
@@ -98,25 +107,27 @@ pub enum When {
 
 impl When {
     pub fn holds(self, o: &EngineOptions) -> bool {
+        self.holds_on(o, &OnceCell::new())
+    }
+
+    /// [`Self::holds`] with the checkpoint read at most once for every row
+    /// of one resolution (`ck`).
+    fn holds_on(self, o: &EngineOptions, ck: &OnceCell<Checkpoint>) -> bool {
+        let ck = || ck.get_or_init(|| Checkpoint::of(o));
         match self {
             When::Always => true,
             When::Batched => o.scheduler.max_sequences > 1,
-            // LFM2's detection (`app::family::Lfm2Family`, first in order):
-            // a directory holding `config.json`; the GGUF families take none.
             // The rows are Metal defaults (the paged KV pool is read by a
             // Metal kernel, FlashDecoding, the fused conv): on `--cpu`, or a
             // build without Metal, they would refuse every LFM2 load
             // (`KvAppend::Paged is Metal-only`, 22 engine tests red on
             // 2026-10-19), so the library's own values stay.
             When::Metal => cfg!(feature = "metal") && o.load.device != "cpu",
-            When::ModelAxes => {
-                When::Metal.holds(o)
-                    && o.load.model.as_deref().is_none_or(|p| {
-                        p.is_dir() && p.join("config.json").is_file()
-                    })
-            }
+            When::Lfm2 => When::Metal.holds(o) && ck().lfm2.is_some(),
+            When::Lfm2Dense => When::Metal.holds(o) && ck().lfm2 == Some(Representation::MEASURED),
             When::DsparkSingle => {
-                When::ModelAxes.holds(o)
+                When::Metal.holds(o)
+                    && ck().lfm2 == Some(Representation::MEASURED)
                     && o.speculative.method == "dspark"
                     && o.scheduler.max_sequences == 1
                     && matches!(o.model.cache.as_str(), "auto" | "rewindable")
@@ -127,9 +138,7 @@ impl When {
                     && o.scheduler.max_sequences > 1
                     && o.scheduler.max_sequences <= o.tuning.gemm.f16_rows_max
             }
-            When::Qwen4Exp => {
-                When::Metal.holds(o) && o.load.model.as_deref().is_some_and(is_qwen4exp)
-            }
+            When::Qwen4Exp => When::Metal.holds(o) && ck().qwen4exp,
         }
     }
 
@@ -138,9 +147,12 @@ impl When {
             When::Always => "",
             When::Batched => "scheduler.max_sequences > 1",
             When::Metal => "on Metal (a Metal build, not --cpu)",
-            When::ModelAxes => "the model's family takes the model axes (LFM2), on Metal",
+            When::Lfm2 => "the LFM2 engine serves the model, in any representation, on Metal",
+            When::Lfm2Dense => {
+                "the LFM2 engine serves the model dense at f16 (the representation its rows were measured on), on Metal"
+            }
             When::DsparkSingle => {
-                "speculative.method = dspark at scheduler.max_sequences = 1 on the auto or rewindable preset (LFM2, on Metal)"
+                "speculative.method = dspark at scheduler.max_sequences = 1 on the auto or rewindable preset (LFM2 dense at f16, on Metal)"
             }
             When::MetalSingle => "on Metal at scheduler.max_sequences = 1",
             When::MetalBatched => {
@@ -151,18 +163,98 @@ impl When {
     }
 }
 
-/// Whether the loader dispatches `path` to Qwen4-exp (`app::family::detect`):
-/// it reads the GGUF header, once per resolution, never per token. A build
-/// without `serve` has no loader and no front-end, so nothing is.
-fn is_qwen4exp(path: &std::path::Path) -> bool {
-    #[cfg(feature = "serve")]
-    {
-        crate::app::family::detect(path).is_ok_and(|(f, _)| f.name() == "qwen4exp")
+/// How the LFM2 engine holds a checkpoint's weights, and the dtype it
+/// computes in: what the LFM2 rows key on, never the container (decision 80
+/// item 4). Read off the checkpoint before load (`app::lfm2::representation`,
+/// the loader's own rule); the loaded engine reports the one it built
+/// (`/health`'s `representation`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Representation {
+    /// A projection or the token table is held as packed blocks.
+    pub blocks: bool,
+    pub compute: DType,
+}
+
+impl Representation {
+    /// What every LFM2 row was measured on: LFM2's safetensors checkpoints,
+    /// dense weights at f16 on Metal.
+    pub const MEASURED: Representation = Representation {
+        blocks: false,
+        compute: DType::F16,
+    };
+
+    /// From the storage kinds of the projections and the token table
+    /// (`f16`, `q8_0`, …): blocks where any kind is not a float.
+    pub fn of_kinds<'a>(kinds: impl IntoIterator<Item = &'a str>, compute: DType) -> Self {
+        Representation {
+            blocks: kinds
+                .into_iter()
+                .any(|k| !matches!(k, "f16" | "bf16" | "f32")),
+            compute,
+        }
     }
-    #[cfg(not(feature = "serve"))]
-    {
-        let _ = path;
-        false
+
+    /// `dense f16`, `blocks f32`.
+    pub fn name(&self) -> String {
+        format!(
+            "{} {}",
+            if self.blocks { "blocks" } else { "dense" },
+            self.compute.as_str()
+        )
+    }
+}
+
+/// What a resolution reads off `--model`, once, never per token: the
+/// representation the LFM2 engine would build it in on Metal (`None`
+/// where another engine serves it, or its header does not read; the load
+/// reports why), and whether Qwen4-exp serves it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Checkpoint {
+    pub lfm2: Option<Representation>,
+    pub qwen4exp: bool,
+}
+
+impl Checkpoint {
+    /// No `--model` is the LFM2 snapshot, a safetensors checkpoint. A build
+    /// without `serve` has no loader and no front-end, so a named model is
+    /// nothing's.
+    pub fn of(o: &EngineOptions) -> Checkpoint {
+        let none = Checkpoint {
+            lfm2: None,
+            qwen4exp: false,
+        };
+        let Some(path) = o.load.model.as_deref() else {
+            return Checkpoint {
+                lfm2: Some(Representation::MEASURED),
+                qwen4exp: false,
+            };
+        };
+        #[cfg(feature = "serve")]
+        {
+            let Ok((family, first)) = crate::app::family::detect(path) else {
+                return none;
+            };
+            match family.name() {
+                "qwen4exp" => Checkpoint {
+                    lfm2: None,
+                    qwen4exp: true,
+                },
+                "lfm2" | "lfm2_moe" => Checkpoint {
+                    lfm2: crate::app::lfm2::representation(&first, false).ok(),
+                    qwen4exp: false,
+                },
+                "lfm2-gguf" if o.load.gguf_engine != "legacy" => Checkpoint {
+                    lfm2: crate::app::lfm2::representation(&first, false).ok(),
+                    qwen4exp: false,
+                },
+                _ => none,
+            }
+        }
+        #[cfg(not(feature = "serve"))]
+        {
+            let _ = path;
+            none
+        }
     }
 }
 
@@ -235,13 +327,15 @@ rows! {
         // (`EXCEPTIONS`) lands `queue-diff` for Qwen4-exp, whose request
         // commits hundreds of command buffers. LFM2 keeps `slots`.
         Qwen4Exp: "kernels.residency.metal4" = "slots",
-        // LFM2 (safetensors) only: its `Config` axes and LFM2 kernels.
-        ModelAxes: "kernels.attention.flash.partial_block" = "8",
+        // LFM2's `Config` axes and LFM2 kernels, at the representation they
+        // were measured on (dense f16): each changes the step a packed or
+        // f32 GGUF runs, so there it is withheld by name (`withheld`).
+        Lfm2Dense: "kernels.attention.flash.partial_block" = "8",
         // Shared with Qwen4-exp's HC norm arm, +6.6% ms/token there.
-        ModelAxes: "kernels.fusion.norm_in_gemv" = "true",
-        ModelAxes: "models.lfm2.rows_kernels" = "per-row",
-        ModelAxes: "speculative.dspark.context_kv" = "paged",
-        ModelAxes: "context.kv.layout" = "paged",
+        Lfm2Dense: "kernels.fusion.norm_in_gemv" = "true",
+        Lfm2Dense: "models.lfm2.rows_kernels" = "per-row",
+        Lfm2Dense: "speculative.dspark.context_kv" = "paged",
+        Lfm2Dense: "context.kv.layout" = "paged",
         // LFM2's speculative body at one sequence: `before` is the paged
         // KV the row above gave it; decision 52 (`EXCEPTIONS`) keeps its
         // preset's in-place KV, because a verify window is a multi-row
@@ -249,10 +343,14 @@ rows! {
         // gathered every round (`speculation.md` §10.2z-x). After the
         // paged row, which it overrides where both hold.
         DsparkSingle: "context.kv.layout" = "paged",
-        ModelAxes: "kernels.attention.impl" = "flash",
-        ModelAxes: "kernels.attention.qkv_layout" = "fused",
-        ModelAxes: "kernels.fusion.conv" = "true",
-        ModelAxes: "models.lfm2.conv_prefill_context" = "true",
+        Lfm2Dense: "kernels.attention.impl" = "flash",
+        // What the crown and pool presets set on every representation the
+        // LFM2 engine loads (`lfm2_presets`), and the conv carry
+        // `conv_carry_needed` forces wherever a pass meets a warm cache: the
+        // step a GGUF runs is the same either way.
+        Lfm2: "kernels.attention.qkv_layout" = "fused",
+        Lfm2: "kernels.fusion.conv" = "true",
+        Lfm2: "models.lfm2.conv_prefill_context" = "true",
     ]
     Row {
         key: "context.prefix.reuse",
@@ -341,17 +439,18 @@ rows! {
     },
     // The batched loop's counter cut on a decode-only step (`tuning.md`
     // §13.5r): `before` is the library's value; decision 71 (`EXCEPTIONS`)
-    // lands `all` on LFM2. Qwen4-exp and the other GGUF families keep `off`.
+    // lands `all` on LFM2 at the representation it was measured on (LFM2.5's
+    // safetensors, dense f16). Qwen4-exp and a GGUF keep `off`.
     Row {
         key: "decode.batched.cut_hold",
         frontend: Frontend::Serve,
-        when: When::ModelAxes,
+        when: When::Lfm2Dense,
         before: "off",
     },
     Row {
         key: "decode.batched.cut_hold",
         frontend: Frontend::Bench,
-        when: When::ModelAxes,
+        when: When::Lfm2Dense,
         before: "off",
     },
 }
@@ -561,7 +660,7 @@ pub const EXCEPTIONS: &[Exception] = &[Exception {
     decision: 71,
     key: "decode.batched.cut_hold",
     frontend: Frontend::Serve,
-    when: When::ModelAxes,
+    when: When::Lfm2Dense,
     before: "off",
     after: "all",
     landed: true,
@@ -571,7 +670,7 @@ pub const EXCEPTIONS: &[Exception] = &[Exception {
     decision: 71,
     key: "decode.batched.cut_hold",
     frontend: Frontend::Bench,
-    when: When::ModelAxes,
+    when: When::Lfm2Dense,
     before: "off",
     after: "all",
     landed: true,
@@ -598,8 +697,9 @@ pub fn rows_for(key: &str, frontend: Frontend) -> impl Iterator<Item = &'static 
 /// The value `frontend`'s rows give `key` on `o`, where no layer named it:
 /// the last row whose condition holds, `None` where none holds.
 pub fn resolved(key: &str, frontend: Frontend, o: &EngineOptions) -> Option<&'static str> {
+    let ck = OnceCell::new();
     rows_for(key, frontend)
-        .filter(|r| r.when.holds(o))
+        .filter(|r| r.when.holds_on(o, &ck))
         .last()
         .map(value)
 }
@@ -654,13 +754,10 @@ pub fn apply(
     preset: &BTreeSet<String>,
 ) -> Result<Vec<&'static str>, String> {
     let idx = index();
+    let ck = OnceCell::new();
     let mut set = Vec::new();
     for r in ROWS.iter().filter(|r| r.frontend == frontend) {
-        if !r.when.holds(o) || preset.contains(r.key) {
-            continue;
-        }
-        let unset = idx.flat(o).get(r.key).is_some_and(|v| v.is_null());
-        if explicit.contains(r.key) && !unset {
+        if !r.when.holds_on(o, &ck) || !unnamed(r, o, explicit, preset) {
             continue;
         }
         idx.set(o, r.key, value(r))
@@ -668,6 +765,60 @@ pub fn apply(
         set.push(r.key);
     }
     Ok(set)
+}
+
+/// Whether no layer and no named preset gave `r`'s key a value, so the row
+/// decides it: a key at `null` is unset whoever wrote it, except a preset.
+fn unnamed(
+    r: &Row,
+    o: &EngineOptions,
+    explicit: &BTreeSet<String>,
+    preset: &BTreeSet<String>,
+) -> bool {
+    !preset.contains(r.key)
+        && (!explicit.contains(r.key) || index().flat(o).get(r.key).is_some_and(|v| v.is_null()))
+}
+
+/// The rows `frontend` would take on `o` at [`Representation::MEASURED`]
+/// that it does not take because the LFM2 engine loads `o`'s checkpoint in
+/// another representation (decision 80 item 4), as one line naming the
+/// representation and each `key=value` (and the decision that landed the
+/// value). A key a layer or a named preset set is not listed: it was never
+/// the row's. `None` unless the LFM2 engine serves the model, on Metal, at
+/// another representation, and some row is withheld.
+pub fn withheld(
+    o: &EngineOptions,
+    frontend: Frontend,
+    explicit: &BTreeSet<String>,
+    preset: &BTreeSet<String>,
+) -> Option<String> {
+    if !When::Metal.holds(o) {
+        return None;
+    }
+    let actual = Checkpoint::of(o);
+    let rep = actual.lfm2.filter(|r| *r != Representation::MEASURED)?;
+    let measured = OnceCell::from(Checkpoint {
+        lfm2: Some(Representation::MEASURED),
+        qwen4exp: actual.qwen4exp,
+    });
+    let actual = OnceCell::from(actual);
+    let rows: Vec<String> = ROWS
+        .iter()
+        .filter(|r| r.frontend == frontend && unnamed(r, o, explicit, preset))
+        .filter(|r| r.when.holds_on(o, &measured) && !r.when.holds_on(o, &actual))
+        .map(|r| match exception(r) {
+            Some(e) if e.landed => format!("{}={} (decision {})", r.key, e.after, e.decision),
+            _ => format!("{}={}", r.key, value(r)),
+        })
+        .collect();
+    (!rows.is_empty()).then(|| {
+        format!(
+            "{}: the LFM2 rows withheld on {} weights, measured on dense f16 (decision 80): {}",
+            frontend.name(),
+            rep.name(),
+            rows.join(", ")
+        )
+    })
 }
 
 #[cfg(test)]
@@ -756,7 +907,7 @@ mod tests {
             idx.flat(&o)["context.kv.layout"].clone()
         };
         let library = idx.flat(&EngineOptions::default())["context.kv.layout"].clone();
-        let metal = When::ModelAxes.holds(&EngineOptions::default());
+        let metal = When::Lfm2Dense.holds(&EngineOptions::default());
         let typed = |v: &str| {
             let mut o = EngineOptions::default();
             idx.set(&mut o, "context.kv.layout", v).unwrap();

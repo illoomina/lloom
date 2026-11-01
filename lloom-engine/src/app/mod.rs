@@ -472,6 +472,9 @@ pub fn resolve_layers(
         let named = named_keys(idx, &named);
         let preset = preset_keys(idx, &o, &named);
         crate::frontend::apply(&mut o, f, &named, &preset).map_err(|e| anyhow::anyhow!("{e}"))?;
+        if let Some(line) = crate::frontend::withheld(&o, f, &named, &preset) {
+            eprintln!("[front-end: {line}]");
+        }
         mark(&format!("the {} default", f.name()), &o);
     }
     o.check().map_err(|e| anyhow::anyhow!("{e}"))?;

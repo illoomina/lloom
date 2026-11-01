@@ -7673,11 +7673,15 @@ kernel void kernel_get_rows_i32(
 #define SG_MAT_SIZE 64 // simdgroup matrix is of shape 8x8
 #define SG_MAT_ROW 8
 
-// each block_q contains 16*nl weights
-template<typename T, typename T4x4, typename simdgroup_T8x8, typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread T4x4 &)>
+// each block_q contains 16*nl weights. `TA` is the activation (src1) element
+// and `TD` the store (dst) element: (float, float) is the f32 arm, (half, half)
+// the (f16, f32, f16) arm, whose half activations are widened into the same
+// float tile so it computes the f32 arm's sums on its inputs and rounds once
+// at the store (docs/invariants.md §15.2a).
+template<typename T, typename T4x4, typename simdgroup_T8x8, typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread T4x4 &), typename TA = float, typename TD = float>
 kernel void kernel_mul_mm(device const  uchar * src0,
                           device const  uchar * src1,
-                          device        float * dst,
+                          device           TD * dst,
                           constant    int64_t & ne00,
                           constant    int64_t & ne02,
                           constant   uint64_t & nb01,
@@ -7729,7 +7733,7 @@ kernel void kernel_mul_mm(device const  uchar * src0,
     ushort offset1 = il/nl;
 
     device const block_q * x = (device const block_q *)(src0 + (r0*BLOCK_SIZE_M + thread_row)*nb01 + offset0) + offset1;
-    device const float   * y = (device const float   *)(src1
+    device const TA      * y = (device const TA      *)(src1
         + nb13 * i13
         + nb12 * i12
         + nb11 * (r1 * BLOCK_SIZE_N + thread_col)
@@ -7748,7 +7752,13 @@ kernel void kernel_mul_mm(device const  uchar * src0,
             +                     (tiitg/THREAD_PER_ROW)%8  + (i&7)*8) = temp_a[i/4][i%4];
         }
 
-        *(threadgroup float2x4 *)(sb + (tiitg % THREAD_PER_COL)*8*32 + 8*(tiitg/THREAD_PER_COL)) = *((device float2x4 *) y);
+        if (is_same<TA, float>::value) {
+            *(threadgroup float2x4 *)(sb + (tiitg % THREAD_PER_COL)*8*32 + 8*(tiitg/THREAD_PER_COL)) = *((device float2x4 *) y);
+        } else {
+            threadgroup float4 * sb4 = (threadgroup float4 *)(sb + (tiitg % THREAD_PER_COL)*8*32 + 8*(tiitg/THREAD_PER_COL));
+            sb4[0] = float4(((device const vec<TA, 4> *) y)[0]);
+            sb4[1] = float4(((device const vec<TA, 4> *) y)[1]);
+        }
 
         il = (il + 2 < nl) ? il + 2 : il % 2;
         x  = (il < 2) ? x + (2+nl-1)/nl : x;
@@ -7782,8 +7792,11 @@ kernel void kernel_mul_mm(device const  uchar * src0,
         }
     }
 
-    if ((r0 + 1) * BLOCK_SIZE_M <= ne0 && (r1 + 1) * BLOCK_SIZE_N <= ne1) {
-        device float * C = dst + (BLOCK_SIZE_M * r0 + 32 * (sgitg &  1)) \
+    // A float store writes the accumulators straight out on a full tile; a
+    // half store, like a partial tile, goes through the threadgroup staging
+    // and rounds each element once.
+    if (is_same<TD, float>::value && (r0 + 1) * BLOCK_SIZE_M <= ne0 && (r1 + 1) * BLOCK_SIZE_N <= ne1) {
+        device float * C = (device float *) dst + (BLOCK_SIZE_M * r0 + 32 * (sgitg &  1)) \
                                + (BLOCK_SIZE_N * r1 + 16 * (sgitg >> 1)) * ne0 + im*ne1*ne0;
         for (short i = 0; i < 8; i++) {
             simdgroup_store(mc[i], C + 8 * (i%4) + 8 * ne0 * (i/4), ne0);
@@ -7801,20 +7814,20 @@ kernel void kernel_mul_mm(device const  uchar * src0,
 
         if (sgitg == 0) {
             for (int j = tiitg; j < n_cols; j += BLOCK_SIZE_N) {
-                device float  * D  = dst + (r0*BLOCK_SIZE_M) + (r1*BLOCK_SIZE_N + j)*ne0 + im*ne1*ne0;
-                device float4 * D4 = (device float4 *) D;
+                device TD          * D  = dst + (r0*BLOCK_SIZE_M) + (r1*BLOCK_SIZE_N + j)*ne0 + im*ne1*ne0;
+                device vec<TD, 4>  * D4 = (device vec<TD, 4> *) D;
 
                 threadgroup float  * C  = temp_str + (j*BLOCK_SIZE_M);
                 threadgroup float4 * C4 = (threadgroup float4 *) C;
 
                 int i = 0;
                 for (; i < n_rows/4; i++) {
-                    *(D4 + i) = *(C4 + i);
+                    *(D4 + i) = vec<TD, 4>(*(C4 + i));
                 }
 
                 i *= 4;
                 for (; i < n_rows; i++) {
-                    *(D + i) = *(C + i);
+                    *(D + i) = TD(*(C + i));
                 }
             }
         }
@@ -8291,6 +8304,11 @@ typedef decltype(kernel_mul_mm<half, half4x4, simdgroup_half8x8, float4x4, 1, de
 
 template [[host_name("kernel_mul_mm_f32_f32")]]     kernel mat_mm_t kernel_mul_mm<half,   half4x4,   simdgroup_half8x8,   float4x4,      1,     dequantize_f32>;
 template [[host_name("kernel_mul_mm_f16_f32")]]     kernel mat_mm_t kernel_mul_mm<half,   half4x4,   simdgroup_half8x8,   half4x4,       1,     dequantize_f16>;
+
+// The (f16, f32, f16) arm: half activations and store (the dequantise-once
+// scratch's GEMM at f16 activations reads this one).
+typedef decltype(kernel_mul_mm<half, half4x4, simdgroup_half8x8, float4x4, 1, dequantize_f32, half, half>) mat_mm_h_t;
+template [[host_name("kernel_mul_mm_f16_f16_f16")]] kernel mat_mm_h_t kernel_mul_mm<half,   half4x4,   simdgroup_half8x8,   half4x4,       1,     dequantize_f16, half, half>;
 #if defined(__HAVE_BFLOAT__)
 template [[host_name("kernel_mul_mm_bf16_f32")]]    kernel mat_mm_t kernel_mul_mm<bfloat, bfloat4x4, simdgroup_bfloat8x8, bfloat4x4,     1,     dequantize_bf16>;
 #endif
@@ -9692,6 +9710,7 @@ LLOOM_QUANT_KIND_ROWS(STEM, 8) \
 template [[host_name("kernel_get_rows_" #STEM)]]              kernel get_rows_q_t          kernel_get_rows_q<BLOCK, NL, DEQ>; \
 template [[host_name("kernel_get_rows_" #STEM "_guarded")]] kernel get_rows_q_guarded_t kernel_get_rows_q_guarded<BLOCK, NL, DEQ>; \
 template [[host_name("kernel_mul_mm_" #STEM "_f32")]]          kernel mat_mm_t              kernel_mul_mm<half, half4x4, simdgroup_half8x8, BLOCK, NL, DEQ>; \
+template [[host_name("kernel_mul_mm_" #STEM "_f16_f16")]]      kernel mat_mm_h_t            kernel_mul_mm<half, half4x4, simdgroup_half8x8, BLOCK, NL, DEQ, half, half>; \
 template [[host_name("kernel_mul_mm_id_mapped_" #STEM "_f32")]]   kernel mat_mm_id_mapped_t   kernel_mul_mm_id_mapped<BLOCK, NL, DEQ>; \
 template [[host_name("kernel_mul_mm_id_mapped16_" #STEM "_f32")]] kernel mat_mm_id_mapped16_t kernel_mul_mm_id_mapped16<BLOCK, NL, DEQ>; \
 template [[host_name("kernel_dequant_rows_f16_" #STEM)]]       kernel dequant_rows_f16_t    kernel_dequant_rows_f16<BLOCK, NL, DEQ>; \

@@ -12,7 +12,7 @@ use super::quant_parity;
 use lloom_tensor::{Device, Result};
 use quant_parity::{Entry, Matrix};
 
-const ENTRIES: [Entry; 12] = [
+const ENTRIES: [Entry; 13] = [
     Entry::MulMv,
     Entry::MulMvId,
     Entry::MulMvId2,
@@ -21,6 +21,7 @@ const ENTRIES: [Entry; 12] = [
     Entry::MmId32,
     Entry::MmId16,
     Entry::GetRows,
+    Entry::GetRowsGuarded,
     Entry::DequantRowsF16,
     Entry::KvSdpa,
     Entry::KvSdpaSel,

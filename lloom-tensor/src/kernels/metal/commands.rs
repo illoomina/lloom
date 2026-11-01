@@ -3374,6 +3374,9 @@ impl lifecycle::FinalCore for CommandsCore {
                 .install_slot_wake(wake.clone())
                 .map_err(|_| MetalKernelError::QueueUnavailable("foreign Metal 4 slot Wake"))?;
         }
+        self.hook
+            .install_final_wake(wake.clone())
+            .map_err(|_| MetalKernelError::QueueUnavailable("foreign final completion Wake"))?;
         self.residency_set
             .install_retirement_wake(wake)
             .map_err(|_| MetalKernelError::QueueUnavailable("foreign residency retirement Wake"))
@@ -3405,6 +3408,7 @@ impl lifecycle::FinalCore for CommandsCore {
         if let Some(bank) = self.binding_bank.as_ref() {
             let needs = self.state.try_lock().map(|state| {
                 state.current.submitted().is_none()
+                    && !state.current_abandoned
                     && state.binding_credits.iter().all(Option::is_none)
             });
             match needs {
@@ -3462,8 +3466,15 @@ impl lifecycle::FinalCore for CommandsCore {
         if !self.release_held_for_teardown(&mut state, captures)? {
             return Ok(false);
         }
-        if state.current_abandoned && !self.replace_abandoned_for_final(&mut state, captures)? {
-            return Ok(false);
+        if state.current_abandoned {
+            // A cancellation took the current recording: nothing is submitted.
+            // What is owed completes by accounting once every earlier record
+            // has retired (`CompletionHook::abandon`); terminality waits for it.
+            let hook = &self.hook;
+            state
+                .owed_epochs
+                .abandon(|from, through| hook.abandon(from, through))?;
+            return Ok(true);
         }
         let runs = state.owed_epochs.runs_for(None, state.held.len());
         let removals = if captures.removals.is_none() {
@@ -3499,6 +3510,9 @@ impl lifecycle::FinalCore for CommandsCore {
     /// Every retained marker, including submitted current, requires its own
     /// returned handoff and ordered callback completion. Error/poison is never
     /// a terminality certificate. The final prefix also covers older pruned CBs.
+    /// An abandoned final has no marker: its prefix is closed once the hook
+    /// has settled the abandonment, which happens only after every record
+    /// carrying a hook run has retired in its adapter.
     fn poll_final_terminality(&self) -> Result<bool, MetalKernelError> {
         self.failure.check()?;
         let state = self
@@ -3508,7 +3522,27 @@ impl lifecycle::FinalCore for CommandsCore {
                 "final EntryState still borrowed",
             ))?;
         let Some((current, _)) = state.current.submitted() else {
-            return Err(MetalKernelError::QueueUnavailable("final receipt absent"));
+            if !state.current_abandoned {
+                return Err(MetalKernelError::QueueUnavailable("final receipt absent"));
+            }
+            if let Some(queue) = &self.modern_queue {
+                queue.check_failure()?;
+            }
+            if let Some(core) = &self.legacy_completions {
+                core.check()?;
+            }
+            if !self.hook.abandonment_settled() {
+                return Ok(false);
+            }
+            for cb in &state.in_flight {
+                if !cb.poll_logical_completed()? {
+                    return Err(MetalKernelError::QueueUnavailable(
+                        "abandoned final settled ahead of its in-flight work",
+                    ));
+                }
+            }
+            self.failure.check()?;
+            return Ok(true);
         };
         if !current.poll_logical_completed()? {
             return Ok(false);

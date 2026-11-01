@@ -957,6 +957,9 @@ impl<'m, M: BatchedCausalLM, R: BorrowMut<Session<'m, M>>> BatchDecoder<'m, M, R
                 let input = Tensor::new(unit, &device)?.unsqueeze(0)?;
                 s.model.prepare_pass(&mut s.seq.cache, w)?;
                 self.pacer.before_forward(&device)?;
+                // Only the last tile's logits are kept; an earlier tile's,
+                // held across this pass, would be an undeclared escape (§26).
+                drop(last.take());
                 let pass = OpenPass::begin(
                     &device,
                     PassShape::Prefill {
@@ -1171,6 +1174,9 @@ impl<'m, M: BatchedCausalLM, R: BorrowMut<Session<'m, M>>> BatchDecoder<'m, M, R
                 // the pieces with them, as extra rows of the same forward.
                 let staged = ids.stage_read()?;
                 clock.lap(&mut ph.stage_ns);
+                // Read by the argmax above; held across the forward's pass it
+                // would be an undeclared escape (`pass-plan-design.md` §26).
+                self.logits = None;
                 let live = self.live.clone();
                 let next = if pieces.is_empty() {
                     let input = ids.reshape((b, 1))?;
@@ -1193,6 +1199,9 @@ impl<'m, M: BatchedCausalLM, R: BorrowMut<Session<'m, M>>> BatchDecoder<'m, M, R
                 (host, Some(next))
             }
         };
+        // Every arm has read this step's logits; the next forward's pass must
+        // not find them held (§26).
+        self.logits = None;
         if host_ids.len() != b {
             lloom_tensor::bail!(
                 "decode_batched: {} ids read back for {b} live rows",

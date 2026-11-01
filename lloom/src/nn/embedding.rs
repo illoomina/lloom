@@ -19,6 +19,27 @@ impl Embedding {
         &self.embeddings
     }
 
+    #[cfg(feature = "metal")]
+    pub fn guarded_layout(&self) -> Result<lloom_tensor::quantized::GuardedEmbeddingLayout> {
+        lloom_tensor::quantized::QMatMul::Tensor(self.embeddings.clone()).guarded_embedding_layout()
+    }
+
+    #[cfg(feature = "metal")]
+    pub fn check_guarded_output(&self, out: &Tensor) -> Result<()> {
+        // Cold-only descriptor: reuse the dense/packed prepared-output law.
+        lloom_tensor::quantized::QMatMul::Tensor(self.embeddings.clone())
+            .check_guarded_embedding_output(out)
+    }
+
+    #[cfg(feature = "metal")]
+    pub fn forward_guarded_into(
+        &self,
+        tokens: &lloom_tensor::metal_backend::sampling::GuardedSample<'_>,
+        out: &Tensor,
+    ) -> Result<()> {
+        tokens.embedding_into_tensor(&self.embeddings, out)
+    }
+
     /// Get the hidden size of the embedding matrix
     pub fn hidden_size(&self) -> usize {
         self.hidden_size

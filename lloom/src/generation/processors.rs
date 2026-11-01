@@ -308,6 +308,27 @@ impl Stage {
         d.counts.scatter_add_set(&idx, &d.one, 0)
     }
 
+    #[cfg(feature = "metal")]
+    pub(crate) fn record_guarded(
+        &mut self,
+        token: &lloom_tensor::metal_backend::sampling::GuardedSample<'_>,
+    ) -> Result<()> {
+        if !self.cfg.reads_history() {
+            return Ok(());
+        }
+        let Some(d) = self.dev.as_ref() else {
+            lloom_tensor::bail!("logits processors: a token recorded before any logits");
+        };
+        let (storage, layout) = d.counts.storage_and_layout();
+        if !layout.is_contiguous() || layout.start_offset() != 0 {
+            lloom_tensor::bail!("guarded counts: contiguous prepared counts required");
+        }
+        let lloom_tensor::Storage::Metal(storage) = &*storage else {
+            lloom_tensor::bail!("guarded counts: Metal history required");
+        };
+        token.record_counts(storage)
+    }
+
     /// [`Self::record`] for a token the host already holds.
     pub(crate) fn record_id(&mut self, id: u32) -> Result<()> {
         if !self.cfg.reads_history() {

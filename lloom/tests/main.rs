@@ -67,6 +67,7 @@ mod lfm2_qkv_layout;
 mod lfm2_sliding_ring_open;
 mod lfm2_spec_conv_rollback;
 mod lfm2_spec_conv_shape;
+mod lfm2_step_frame;
 mod lfm2_streamed_layers;
 mod lfm2_vl_embeds_entry;
 mod lfm2_walk_census;

@@ -158,6 +158,10 @@ pub enum PageError {
     /// double free returns a live page to the list and a later allocation
     /// aliases two sequences onto it.
     NotAllocated { page: PageIdx },
+    /// The sequence kept its pages across a clear and has not settled them:
+    /// a read of them may still be running in `epoch` or before
+    /// ([`KvPagePool::clear_keep`], `memory.md` §9.5r).
+    Owed { seq: usize, epoch: Epoch },
 }
 
 impl std::fmt::Display for PageError {
@@ -182,6 +186,12 @@ impl std::fmt::Display for PageError {
                 f,
                 "page {page} is not allocated: a double free would hand a live page back to the \
                  free list and alias two sequences onto it, which DESIGN.md 3.5 makes silent"
+            ),
+            PageError::Owed { seq, epoch } => write!(
+                f,
+                "sequence {seq} kept its pages across a clear and owes epoch {epoch}: settle it \
+                 before writing, since a read of those pages may still be running (memory.md \
+                 9.5r)"
             ),
         }
     }
@@ -214,6 +224,10 @@ pub fn reserve_pages_for(b: usize, max_context: usize, page_size: usize) -> usiz
 pub struct SeqPages {
     pages: Vec<PageIdx>,
     len: usize,
+    /// Set by [`KvPagePool::clear_keep`]: every earlier read of the kept
+    /// pages is in this epoch or before, and they are written again only once
+    /// it has completed ([`KvPagePool::settle_kept`]).
+    owed: Option<Epoch>,
 }
 
 impl SeqPages {
@@ -230,6 +244,11 @@ impl SeqPages {
     /// The pages backing this sequence, in token order.
     pub fn pages(&self) -> &[PageIdx] {
         &self.pages
+    }
+
+    /// The epoch a clear that kept the pages left owing, until it is settled.
+    pub fn owed(&self) -> Option<Epoch> {
+        self.owed
     }
 
     /// The pool cell of each token in `tokens` — `page · page_size + offset`,
@@ -368,6 +387,7 @@ impl KvPagePool {
     /// Returns the pages allocated by this call, which is empty in the common
     /// case: only the token that crosses a page boundary allocates.
     pub fn append(&mut self, seq: usize, n: usize) -> Result<Vec<PageIdx>, PageError> {
+        self.check_not_owed(seq)?;
         let mut fresh = Vec::new();
         for _ in 0..n {
             let s = &self.seqs[seq];
@@ -403,6 +423,7 @@ impl KvPagePool {
     /// them before allocating more, [`Self::rewind`] keeps them and
     /// [`Self::release`] returns them with the rest.
     pub fn reserve(&mut self, seq: usize, extra: usize) -> Result<Vec<PageIdx>, PageError> {
+        self.check_not_owed(seq)?;
         let mut fresh = Vec::new();
         loop {
             let s = &self.seqs[seq];
@@ -520,6 +541,8 @@ impl KvPagePool {
         dst: usize,
         n_pages: usize,
     ) -> Result<(), PageError> {
+        self.check_not_owed(src)?;
+        self.check_not_owed(dst)?;
         let pages: Vec<PageIdx> = self.seqs[src].pages.iter().take(n_pages).copied().collect();
         if self.seqs[dst].pages.len() + pages.len() > self.table_capacity_pages {
             return Err(PageError::TableFull {
@@ -563,6 +586,7 @@ impl KvPagePool {
     pub fn release(&mut self, seq: usize) -> Vec<PageIdx> {
         let pages = std::mem::take(&mut self.seqs[seq].pages);
         self.seqs[seq].len = 0;
+        self.seqs[seq].owed = None;
         let mut freed = Vec::new();
         for p in pages {
             let rc = &mut self.refcount[p.index()];
@@ -572,6 +596,75 @@ impl KvPagePool {
             }
         }
         freed
+    }
+
+    /// Empty `seq` for the same sequence's next turn, keeping the pages it
+    /// alone holds, in table order, owing `owed`.
+    ///
+    /// `owed` must bound the epoch of every read of those pages encoded so
+    /// far: they are written again only once it has completed
+    /// ([`Self::settle_kept`]), because a fresh refill has no data dependency
+    /// on the old turn and the stream orders a write after earlier writers,
+    /// not after earlier readers (`memory.md` §9.5r). A page another sequence
+    /// also holds is not kept: the reference is dropped and the other
+    /// sequence keeps reading it. Returns the pages whose last referent this
+    /// was, for the caller's quarantine, as [`Self::release`] does. A second
+    /// clear before the settle owes the later epoch.
+    pub fn clear_keep(&mut self, seq: usize, owed: Epoch) -> Vec<PageIdx> {
+        let s = &mut self.seqs[seq];
+        let pages = std::mem::take(&mut s.pages);
+        let mut freed = Vec::new();
+        for p in pages {
+            let rc = &mut self.refcount[p.index()];
+            if *rc == 1 {
+                self.seqs[seq].pages.push(p);
+            } else {
+                *rc -= 1;
+                if *rc == 0 {
+                    freed.push(p);
+                }
+            }
+        }
+        let s = &mut self.seqs[seq];
+        s.len = 0;
+        s.owed = if s.pages.is_empty() {
+            None
+        } else {
+            Some(s.owed.map_or(owed, |e| e.max(owed)))
+        };
+        freed
+    }
+
+    /// Settle a kept sequence before its next write: if `completed` covers
+    /// the epoch it owes, the pages are its own again and nothing is
+    /// returned; otherwise they are given up, and returned for the caller's
+    /// quarantine at the epoch open now (later than the one owed, so safe).
+    pub fn settle_kept(&mut self, seq: usize, completed: Completed) -> Vec<PageIdx> {
+        let s = &mut self.seqs[seq];
+        let Some(owed) = s.owed.take() else {
+            return Vec::new();
+        };
+        if completed.covers(owed) {
+            return Vec::new();
+        }
+        self.release(seq)
+    }
+
+    /// The pages `seq`'s next append can fill without allocating: what it
+    /// holds, or nothing while it owes an epoch `completed` does not cover
+    /// (its settle will give them up).
+    pub fn pages_held_for(&self, seq: usize, completed: Completed) -> usize {
+        match self.seqs.get(seq) {
+            Some(s) if s.owed.is_none_or(|e| completed.covers(e)) => s.pages.len(),
+            _ => 0,
+        }
+    }
+
+    fn check_not_owed(&self, seq: usize) -> Result<(), PageError> {
+        match self.seqs[seq].owed {
+            Some(epoch) => Err(PageError::Owed { seq, epoch }),
+            None => Ok(()),
+        }
     }
 
     /// Return pages to the free list, after their last GPU read has completed.

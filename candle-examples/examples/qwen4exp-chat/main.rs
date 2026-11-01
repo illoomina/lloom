@@ -283,6 +283,12 @@ struct Args {
     )]
     prompt: String,
 
+    /// `--rows N`: row `r` decodes the prompt in file `r mod len` (each
+    /// file's text, templated as `--prompt` is) instead of every row the
+    /// same `--prompt`, so the rows read different N-gram PLE rows.
+    #[arg(long, value_delimiter = ',')]
+    row_prompts: Vec<PathBuf>,
+
     /// Send the prompt raw (no chat template, no thinking-off prefix).
     #[arg(long)]
     raw: bool,
@@ -812,21 +818,7 @@ fn run<P: QwenShape>(args: Args) -> Result<()> {
         "io" => StreamLoader::Io,
         other => anyhow::bail!("--loader {other}: pread | io"),
     };
-    let text = if args.raw {
-        args.prompt.clone()
-    } else {
-        // The checkpoint's chat template with thinking disabled
-        // (`enable_thinking=false` → an empty think block after the assistant tag).
-        format!(
-            "<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
-            args.prompt
-        )
-    };
-    let prompt_ids: Vec<u32> = tokenizer
-        .encode(text.as_str(), false)
-        .map_err(anyhow::Error::msg)?
-        .get_ids()
-        .to_vec();
+    let prompt_ids = encode_prompt(&tokenizer, &args.prompt, args.raw)?;
 
     match args.experts.as_str() {
         "resident" => {
@@ -976,8 +968,27 @@ fn rewindable<P: lloom::profile::Profile>() -> Result<lloom::profile::RewindProo
     })
 }
 
+/// `prompt` as the gate sends it: raw, or in the checkpoint's chat template
+/// with thinking disabled (`enable_thinking=false` → an empty think block
+/// after the assistant tag).
+fn encode_prompt(tokenizer: &Tokenizer, prompt: &str, raw: bool) -> Result<Vec<u32>> {
+    let text = if raw {
+        prompt.to_string()
+    } else {
+        format!(
+            "<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+        )
+    };
+    Ok(tokenizer
+        .encode(text.as_str(), false)
+        .map_err(anyhow::Error::msg)?
+        .get_ids()
+        .to_vec())
+}
+
 /// `--rows N`: the prompt decoded `N` times at once through the batched
-/// driver; `ROWS` lines with the per-run aggregate rate.
+/// driver (or the `--row-prompts`, one a row); `ROWS` lines with the
+/// per-run aggregate rate.
 #[allow(clippy::too_many_arguments)]
 fn rows_gate<P: QwenShape, R: ExpertResidency + HasStreamStats>(
     model: &Qwen4Exp<P, R>,
@@ -992,6 +1003,15 @@ fn rows_gate<P: QwenShape, R: ExpertResidency + HasStreamStats>(
     let cfg = model.config();
     let mut run_digests = Vec::with_capacity(args.runs);
     let mut last_texts = Vec::with_capacity(args.rows);
+    let row_ids: Vec<Vec<u32>> = args
+        .row_prompts
+        .iter()
+        .map(|p| -> Result<Vec<u32>> {
+            let text = std::fs::read_to_string(p)
+                .map_err(|e| anyhow::anyhow!("--row-prompts {}: {e}", p.display()))?;
+            encode_prompt(tokenizer, text.trim_end(), args.raw)
+        })
+        .collect::<Result<_>>()?;
     let mut ok = true;
     for run in 0..args.runs {
         // The rows' states at the shape: pooled (`Paged`) or each its own.
@@ -1006,7 +1026,12 @@ fn rows_gate<P: QwenShape, R: ExpertResidency + HasStreamStats>(
         };
         let mut sessions: Vec<Session<'_, Qwen4Exp<P, R>>> =
             caches.into_iter().map(|c| Session::new(model, c)).collect();
-        let prompts: Vec<&[u32]> = (0..args.rows).map(|_| prompt_ids).collect();
+        let prompts: Vec<&[u32]> = (0..args.rows)
+            .map(|r| match row_ids.len() {
+                0 => prompt_ids,
+                n => row_ids[r % n].as_slice(),
+            })
+            .collect();
         let mut sampler = LogitsProcessor::from_sampling(0, Sampling::ArgMax);
         let opts = DecodeOptions {
             prefill_tile: args.prefill_tile,

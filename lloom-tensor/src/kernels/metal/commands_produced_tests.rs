@@ -33,10 +33,17 @@ const WARM: u8 = 0x31;
 /// A standalone queue on the process's API and host-input arm, its
 /// destination warmed to a known byte through a drained submission.
 fn fixture() -> Fixture {
+    fixture_with(|_| {})
+}
+
+/// As [`fixture`], with `setup` run on the queue before its first submission
+/// seals it (a completion subscriber).
+fn fixture_with(setup: impl FnOnce(&Commands)) -> Fixture {
     let native = Device::system_default().unwrap();
     let queue = native.new_command_queue().unwrap();
     let residency = Arc::new(ResidencySet::new(&native));
     let commands = Arc::new(Commands::new(queue, residency).unwrap());
+    setup(&commands);
     if let Ok(requested) = std::env::var("LLOOM_METAL_API") {
         if requested != "auto" {
             assert_eq!(commands.actual_command_api(), requested);
@@ -1461,8 +1468,12 @@ fn validated_io_listener_wakes_failure_without_manual_produced_call() {
     assert!(f.commands.core.failure.check().is_ok());
 }
 
+/// A failed IO generation cancels the current recording that waited for it,
+/// then the last handle drops with no recording operation between: the final
+/// owner retires by accounting, with no native call and no epoch of its own,
+/// and runs nothing the cancellation took (decision 99).
 #[test]
-fn validated_io_direct_teardown_after_cancellation_uses_empty_owned_marker() {
+fn validated_io_direct_teardown_after_cancellation_retires_by_accounting() {
     use crate::io_terminal::TestIoGeneration;
     let f = fixture();
     let mut generation = TestIoGeneration::new(f.native.as_ref(), 2);
@@ -1479,22 +1490,25 @@ fn validated_io_direct_teardown_after_cancellation_uses_empty_owned_marker() {
     assert!(f.commands.core.state.lock(Side::Host).current_abandoned);
     let weak = f.commands.core.produced.me_for_test();
     let dst = f.dst.clone();
+    let clock = f.commands.clock();
+    let opened = clock.current_epoch().0;
     let counters = f.commands.core.submission_control.clone();
     let before = counters.native_calls.load(Ordering::Acquire);
     // Deliberately no caller encode/flush repair before final public drop.
     drop(f);
-    assert!(
-        until(Duration::from_secs(5), || weak.upgrade().is_none()),
-        "IO_CANCELLED_FINAL_OWNER_RETIRES"
+    let retired = until(Duration::from_secs(5), || weak.upgrade().is_none());
+    let calls = counters.native_calls.load(Ordering::Acquire) - before;
+    let (after, completed) = (clock.current_epoch().0, clock.completed_count().0);
+    eprintln!(
+        "IO_FINAL_ABANDONED retired={retired} native_calls={calls} epochs={completed}/{after} opened_before={opened}"
     );
-    assert_eq!(
-        counters.native_calls.load(Ordering::Acquire),
-        before + 1,
-        "IO_FINAL_EMPTY_MARKER_SUBMITTED_ONCE"
-    );
+    assert!(retired, "IO_CANCELLED_FINAL_OWNER_RETIRES");
+    assert_eq!(calls, 0, "IO_FINAL_ABANDONMENT_MAKES_NO_NATIVE_CALL");
+    assert_eq!(after, opened, "IO_FINAL_ABANDONMENT_OPENS_NO_EPOCH");
+    assert_eq!(completed, after, "IO_FINAL_EVERY_EPOCH_COMPLETES");
     assert!(
         dst_bytes(&dst).iter().all(|b| *b == WARM),
-        "IO_FINAL_MARKER_DID_NOT_EXECUTE_CANCELLED_BODY"
+        "IO_FINAL_ABANDONMENT_DID_NOT_EXECUTE_CANCELLED_BODY"
     );
 }
 
@@ -1735,9 +1749,10 @@ fn final_teardown_runs_nothing_a_host_producer_gave_up() {
 
 /// A cancellation that takes the current recording, then the last handle
 /// drops with no recording operation between: the final owner must still
-/// retire, through one owned empty marker, and run nothing the cancellation
-/// took. The ordinary host-producer counterpart of the validated-IO control
-/// above (`validated_io_direct_teardown_after_cancellation_uses_empty_owned_marker`).
+/// retire, by accounting, with no native call and no epoch of its own, and
+/// run nothing the cancellation took. The ordinary host-producer counterpart
+/// of the validated-IO control above
+/// (`validated_io_direct_teardown_after_cancellation_retires_by_accounting`).
 #[test]
 fn final_owner_retires_after_a_cancellation_took_the_current_recording() {
     let f = fixture();
@@ -1752,6 +1767,8 @@ fn final_owner_retires_after_a_cancellation_took_the_current_recording() {
         .unwrap();
     assert!(f.commands.core.state.lock(Side::Host).current_abandoned);
     let weak = f.commands.core.produced.me_for_test();
+    let clock = f.commands.clock();
+    let opened = clock.current_epoch().0;
     let counters = f.commands.core.submission_control.clone();
     let before = counters.native_calls.load(Ordering::Acquire);
     let api = f.commands.actual_command_api();
@@ -1766,17 +1783,20 @@ fn final_owner_retires_after_a_cancellation_took_the_current_recording() {
     drop(commands);
     let retired = until(Duration::from_secs(5), || weak.upgrade().is_none());
     let calls = counters.native_calls.load(Ordering::Acquire) - before;
+    let (after, completed) = (clock.current_epoch().0, clock.completed_count().0);
     eprintln!(
-        "FINAL_AFTER_CANCEL api={api} retired={retired} native_calls={calls} progress={} warm={}",
+        "FINAL_AFTER_CANCEL api={api} retired={retired} native_calls={calls} epochs={completed}/{after} opened_before={opened} progress={} warm={}",
         progress.signaledValue(),
         dst_bytes(&dst).iter().all(|b| *b == WARM)
     );
     assert!(retired, "FINAL_OWNER_RETIRES_AFTER_CANCELLED_CURRENT");
-    assert_eq!(calls, 1, "FINAL_EMPTY_MARKER_SUBMITTED_ONCE");
+    assert_eq!(calls, 0, "FINAL_ABANDONMENT_MAKES_NO_NATIVE_CALL");
+    assert_eq!(after, opened, "FINAL_ABANDONMENT_OPENS_NO_EPOCH");
+    assert_eq!(completed, after, "FINAL_ABANDONMENT_EVERY_EPOCH_COMPLETES");
     assert_eq!(
         progress.signaledValue(),
         0,
-        "FINAL_MARKER_RAN_NOTHING_CANCELLED"
+        "FINAL_ABANDONMENT_RAN_NOTHING_CANCELLED"
     );
     assert!(
         dst_bytes(&dst).iter().all(|b| *b == WARM),
@@ -1787,8 +1807,9 @@ fn final_owner_retires_after_a_cancellation_took_the_current_recording() {
 
 /// Teardown with an IO load still pending: ordinary held work ahead of it
 /// runs as recorded, the work behind the load is cancelled (its bytes never
-/// landed), the final owner retires through one marker, and every epoch the
-/// cancelled recordings took completes with it.
+/// landed), the final owner retires by accounting — the ordinary held work is
+/// the only native call, and no epoch is opened — and every epoch the
+/// cancelled recordings took completes once that work has.
 #[test]
 fn final_teardown_cancels_work_behind_pending_validated_io() {
     use crate::io_terminal::TestIoGeneration;
@@ -1816,6 +1837,7 @@ fn final_teardown_cancels_work_behind_pending_validated_io() {
         "the IO-dependent recording was not held behind the first"
     );
     let clock = f.commands.clock();
+    let opened_before = clock.current_epoch().0;
     let weak = f.commands.core.produced.me_for_test();
     let counters = f.commands.core.submission_control.clone();
     let before = counters.native_calls.load(Ordering::Acquire);
@@ -1833,11 +1855,16 @@ fn final_teardown_cancels_work_behind_pending_validated_io() {
     let calls = counters.native_calls.load(Ordering::Acquire) - before;
     let (opened, completed) = (clock.current_epoch().0, clock.completed_count().0);
     eprintln!(
-        "TEARDOWN_PENDING_IO api={api} held={held} retired={retired} native_calls={calls} epochs={completed}/{opened} progress={} computed={}",
+        "TEARDOWN_PENDING_IO api={api} held={held} retired={retired} native_calls={calls} epochs={completed}/{opened} opened_before={opened_before} progress={} computed={}",
         progress.signaledValue(),
         computed(&dst)
     );
     assert!(retired, "TEARDOWN_PENDING_IO_FINAL_OWNER_RETIRES");
+    assert_eq!(
+        calls, 1,
+        "TEARDOWN_PENDING_IO_ONLY_THE_ORDINARY_HELD_WORK_IS_SUBMITTED"
+    );
+    assert_eq!(opened, opened_before, "TEARDOWN_PENDING_IO_OPENS_NO_EPOCH");
     assert!(computed(&dst), "TEARDOWN_ORDINARY_HELD_RUNS_AS_RECORDED");
     assert_eq!(
         progress.signaledValue(),
@@ -1856,7 +1883,8 @@ fn final_teardown_cancels_work_behind_pending_validated_io() {
 
 /// As above with the IO-dependent work still in the current recording, its
 /// compute encoder open when the last handle drops: teardown closes it,
-/// cancels the recording and retires through one marker, running nothing.
+/// cancels the recording and retires by accounting, running nothing and
+/// making no native call.
 #[test]
 fn final_teardown_cancels_a_current_recording_behind_pending_validated_io() {
     use crate::io_terminal::TestIoGeneration;
@@ -1873,6 +1901,7 @@ fn final_teardown_cancels_a_current_recording_behind_pending_validated_io() {
     encode_compute(&f);
     assert!(!f.commands.core.state.lock(Side::Host).current_abandoned);
     let clock = f.commands.clock();
+    let opened_before = clock.current_epoch().0;
     let weak = f.commands.core.produced.me_for_test();
     let counters = f.commands.core.submission_control.clone();
     let before = counters.native_calls.load(Ordering::Acquire);
@@ -1890,11 +1919,15 @@ fn final_teardown_cancels_a_current_recording_behind_pending_validated_io() {
     let calls = counters.native_calls.load(Ordering::Acquire) - before;
     let (opened, completed) = (clock.current_epoch().0, clock.completed_count().0);
     eprintln!(
-        "TEARDOWN_PENDING_IO_CURRENT api={api} retired={retired} native_calls={calls} epochs={completed}/{opened} warm={}",
+        "TEARDOWN_PENDING_IO_CURRENT api={api} retired={retired} native_calls={calls} epochs={completed}/{opened} opened_before={opened_before} warm={}",
         dst_bytes(&dst).iter().all(|b| *b == WARM)
     );
     assert!(retired, "TEARDOWN_PENDING_IO_CURRENT_FINAL_OWNER_RETIRES");
-    assert_eq!(calls, 1, "TEARDOWN_PENDING_IO_CURRENT_ONE_MARKER");
+    assert_eq!(calls, 0, "TEARDOWN_PENDING_IO_CURRENT_NO_NATIVE_CALL");
+    assert_eq!(
+        opened, opened_before,
+        "TEARDOWN_PENDING_IO_CURRENT_OPENS_NO_EPOCH"
+    );
     assert!(
         dst_bytes(&dst).iter().all(|b| *b == WARM),
         "TEARDOWN_PENDING_IO_CURRENT_BODY_NOT_RUN"
@@ -1904,6 +1937,231 @@ fn final_teardown_cancels_a_current_recording_behind_pending_validated_io() {
         "TEARDOWN_PENDING_IO_CURRENT_EVERY_EPOCH_COMPLETES"
     );
     drop((native, src, dst, gate, progress, generation));
+}
+
+/// The owed epochs of an abandoned final ride the last submission still in
+/// flight. A submission held on the GPU by a wait, then a held reader whose
+/// producer gives up: until the submission completes, neither its epoch nor
+/// the cancelled one is covered (`GpuClock::mark_completed` is a maximum, so an
+/// early mark would cover both) and the final owner stays pending; once it
+/// completes, every epoch completes and the final owner retires with no
+/// native call of its own (decision 99).
+#[test]
+fn final_abandonment_rides_the_last_submission_still_in_flight() {
+    let f = fixture();
+    if f.commands.host_input_arm() == HostInputArm::GpuWait {
+        eprintln!("NOT_APPLICABLE nothing is held on the gpu-wait arm");
+        return;
+    }
+    // A GPU wait on an event this test raises well inside the queue timeout.
+    let block = f.native.as_ref().newSharedEvent().unwrap();
+    let clock = f.commands.clock();
+    f.commands.encode_wait_for_event(&block, 1).unwrap();
+    encode_compute(&f);
+    // Metal 4 cuts before a wait: the blocked recording's epoch is the one
+    // its own cut takes, read after the wait was encoded.
+    let in_flight = clock.current_epoch();
+    let marker = f.commands.flush_marker().unwrap();
+    assert!(marker.is_submitted(), "the blocked submission was held");
+    let (_held, held_epoch) = hold_on(&f, &f.gate);
+    f.commands
+        .cancel_produced(&f.gate, "test: the producer gave up")
+        .unwrap();
+    assert!(f.commands.core.state.lock(Side::Host).current_abandoned);
+    assert_eq!(owed_now(&f), 1, "the cancelled reader's epoch is not owed");
+    let weak = f.commands.core.produced.me_for_test();
+    let counters = f.commands.core.submission_control.clone();
+    let before = counters.native_calls.load(Ordering::Acquire);
+    let opened = clock.current_epoch().0;
+    let api = f.commands.actual_command_api();
+    let Fixture {
+        native,
+        commands,
+        src,
+        dst,
+        gate,
+        progress,
+    } = f;
+    drop(commands);
+    std::thread::sleep(Duration::from_millis(300));
+    let pending = weak.upgrade().is_some();
+    let in_flight_done = clock.is_complete(in_flight);
+    let held_done = clock.is_complete(held_epoch);
+    block.setSignaledValue(1);
+    let retired = until(Duration::from_secs(5), || weak.upgrade().is_none());
+    let calls = counters.native_calls.load(Ordering::Acquire) - before;
+    let (after, completed) = (clock.current_epoch().0, clock.completed_count().0);
+    eprintln!(
+        "FINAL_RIDES api={api} pending={pending} in_flight_done={in_flight_done} held_done={held_done} retired={retired} native_calls={calls} epochs={completed}/{after} opened_before={opened}"
+    );
+    assert!(pending, "FINAL_ABANDONMENT_PENDING_WHILE_EARLIER_WORK_RUNS");
+    assert!(
+        !in_flight_done,
+        "FINAL_ABANDONMENT_COVERS_NO_EPOCH_STILL_IN_FLIGHT"
+    );
+    assert!(!held_done, "FINAL_ABANDONED_EPOCH_WAITS_FOR_THE_PREFIX");
+    assert!(
+        retired,
+        "FINAL_ABANDONMENT_RETIRES_ONCE_THE_PREFIX_COMPLETES"
+    );
+    assert_eq!(calls, 0, "FINAL_ABANDONMENT_MAKES_NO_NATIVE_CALL");
+    assert_eq!(after, opened, "FINAL_ABANDONMENT_OPENS_NO_EPOCH");
+    assert_eq!(completed, after, "FINAL_ABANDONMENT_EVERY_EPOCH_COMPLETES");
+    drop((native, src, dst, gate, progress, block));
+}
+
+/// A completion subscriber blocks on the completion thread inside the last
+/// submission's hook run. That submission's epoch is marked before its
+/// subscribers run, but its record has not finished: the abandoned epoch
+/// stays uncovered and the final owner pending until the subscriber
+/// returns. A prefix proof read from the hook's run count alone would
+/// certify here, with a subscriber still running on a snapshot the final
+/// captures are about to take.
+#[test]
+fn final_abandonment_waits_for_the_last_completion_to_return() {
+    struct Blocker {
+        armed: std::sync::atomic::AtomicBool,
+        entered: std::sync::atomic::AtomicBool,
+        released: std::sync::atomic::AtomicBool,
+    }
+    let block = Arc::new(Blocker {
+        armed: false.into(),
+        entered: false.into(),
+        released: false.into(),
+    });
+    let observed = block.clone();
+    let f = fixture_with(move |commands| {
+        commands
+            .on_command_buffer_complete(move || {
+                if !observed.armed.swap(false, Ordering::AcqRel) {
+                    return;
+                }
+                observed.entered.store(true, Ordering::Release);
+                let t0 = Instant::now();
+                while !observed.released.load(Ordering::Acquire)
+                    && t0.elapsed() < Duration::from_secs(10)
+                {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            })
+            .unwrap_or_else(|_| panic!("subscriber registration refused"));
+    });
+    if f.commands.host_input_arm() == HostInputArm::GpuWait {
+        block.released.store(true, Ordering::Release);
+        eprintln!("NOT_APPLICABLE nothing is held on the gpu-wait arm");
+        return;
+    }
+    block.armed.store(true, Ordering::Release);
+    encode_compute(&f);
+    let marker = f.commands.flush_marker().unwrap();
+    assert!(marker.is_submitted(), "the last submission was held");
+    assert!(
+        until(Duration::from_secs(5), || block
+            .entered
+            .load(Ordering::Acquire)),
+        "the subscriber never ran"
+    );
+    let (_held, held_epoch) = hold_on(&f, &f.gate);
+    f.commands
+        .cancel_produced(&f.gate, "test: the producer gave up")
+        .unwrap();
+    assert!(f.commands.core.state.lock(Side::Host).current_abandoned);
+    let clock = f.commands.clock();
+    let opened = clock.current_epoch().0;
+    let weak = f.commands.core.produced.me_for_test();
+    let counters = f.commands.core.submission_control.clone();
+    let before = counters.native_calls.load(Ordering::Acquire);
+    let api = f.commands.actual_command_api();
+    let Fixture {
+        native,
+        commands,
+        src,
+        dst,
+        gate,
+        progress,
+    } = f;
+    drop(commands);
+    std::thread::sleep(Duration::from_millis(300));
+    let pending = weak.upgrade().is_some();
+    let held_done = clock.is_complete(held_epoch);
+    block.released.store(true, Ordering::Release);
+    let retired = until(Duration::from_secs(5), || weak.upgrade().is_none());
+    let calls = counters.native_calls.load(Ordering::Acquire) - before;
+    let (after, completed) = (clock.current_epoch().0, clock.completed_count().0);
+    eprintln!(
+        "FINAL_WAITS_FOR_RETURN api={api} pending={pending} held_done={held_done} retired={retired} native_calls={calls} epochs={completed}/{after} opened_before={opened}"
+    );
+    assert!(pending, "FINAL_ABANDONMENT_PENDING_WHILE_A_COMPLETION_RUNS");
+    assert!(
+        !held_done,
+        "FINAL_ABANDONED_EPOCH_WAITS_FOR_THE_COMPLETION_TO_RETURN"
+    );
+    assert!(retired, "FINAL_ABANDONMENT_RETIRES_ONCE_IT_RETURNS");
+    assert_eq!(calls, 0, "FINAL_ABANDONMENT_MAKES_NO_NATIVE_CALL");
+    assert_eq!(after, opened, "FINAL_ABANDONMENT_OPENS_NO_EPOCH");
+    assert_eq!(completed, after, "FINAL_ABANDONMENT_EVERY_EPOCH_COMPLETES");
+    drop((native, src, dst, gate, progress));
+}
+
+/// A cancellation whose owed-epoch bound refuses, and whose close of the
+/// current encoder refuses after it, still fails the queue for good: the
+/// refusal is latched on that early exit. No later submission is accepted,
+/// no epoch is marked, and the cancelled held recording is abandoned in
+/// custody, never run (lane C, #944 6556673766 §3).
+#[test]
+fn a_bound_refusal_is_latched_when_a_close_refuses_after_it() {
+    let f = fixture();
+    if f.commands.host_input_arm() == HostInputArm::GpuWait {
+        eprintln!("NOT_APPLICABLE nothing is held on the gpu-wait arm");
+        return;
+    }
+    let (held, held_epoch) = hold_on(&f, &f.gate);
+    // An open compute encoder on the current recording: the close refuses.
+    encode_compute(&f);
+    {
+        let mut state = f.commands.core.state.lock(Side::Host);
+        assert!(state.current_encoder.is_some(), "no encoder to close");
+        let flagged = state.owed_epochs.flagged();
+        state.owed_epochs = produced::Owed::for_test(produced::Owed::MAX_OWED, flagged);
+    }
+    let clock = f.commands.clock();
+    let completed = clock.completed_count().0;
+    let calls = native_calls(&f.commands);
+    let api = f.commands.actual_command_api();
+    f.commands
+        .core
+        .submission_control
+        .arm(submission_test::Fault::CloseRefusal);
+    let cancelled = f.commands.cancel_produced(&f.gate, "test: bound");
+    let sticky = f.commands.core.failure.check();
+    eprintln!(
+        "BOUND_REFUSAL_LATCH api={api} cancel={cancelled:?} sticky={sticky:?} held_abandoned={}",
+        held.cb.abandoned()
+    );
+    assert!(cancelled.is_err(), "BOUND_REFUSAL_REPORTED");
+    assert!(sticky.is_err(), "BOUND_REFUSAL_LATCHED_ON_THE_EARLY_EXIT");
+    let flushed = f.commands.flush_and_wait();
+    f.gate.setSignaledValue(1);
+    let released = f.commands.produced(&f.gate, 1);
+    std::thread::sleep(Duration::from_millis(200));
+    let after_calls = native_calls(&f.commands);
+    let after_completed = clock.completed_count().0;
+    eprintln!(
+        "BOUND_REFUSAL_AFTER api={api} flushed={flushed:?} released={released:?} calls={calls}->{after_calls} completed={completed}->{after_completed} held_epoch_done={}",
+        clock.is_complete(held_epoch)
+    );
+    assert!(flushed.is_err(), "NO_SUBMISSION_ACCEPTED_AFTER_THE_REFUSAL");
+    assert_eq!(after_calls, calls, "NO_NATIVE_CALL_AFTER_THE_REFUSAL");
+    assert_eq!(after_completed, completed, "NO_EPOCH_MARKED_BY_THE_REFUSAL");
+    assert!(
+        !clock.is_complete(held_epoch),
+        "THE_CANCELLED_EPOCH_IS_NOT_COMPLETE"
+    );
+    assert!(
+        held.cb.abandoned(),
+        "THE_CANCELLED_HELD_RECORDING_IS_ABANDONED_IN_CUSTODY"
+    );
+    // A failed queue's teardown quarantines and retains its Core by design.
 }
 
 /// One held reader per gate, each on an event of its own: the dependent

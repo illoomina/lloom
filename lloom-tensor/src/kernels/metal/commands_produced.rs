@@ -370,6 +370,12 @@ impl Owed {
         self.count
     }
 
+    /// A state no short test reaches by cancelling: near the bound.
+    #[cfg(test)]
+    pub(super) fn for_test(count: u32, flagged: u64) -> Self {
+        Self { count, flagged }
+    }
+
     #[cfg(test)]
     pub(super) fn flagged(&self) -> u64 {
         self.flagged

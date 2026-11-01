@@ -2891,6 +2891,8 @@ impl CommandsCore {
     fn close_compute(&self, state: &mut EntryGuard<'_>) -> Result<(), MetalKernelError> {
         let (state, custody) = state.parts_mut();
         if let Some(encoder) = state.current_encoder.as_ref() {
+            #[cfg(test)]
+            self.submission_control.close()?;
             let destination =
                 custody
                     .compute

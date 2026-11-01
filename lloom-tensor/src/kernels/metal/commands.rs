@@ -525,8 +525,6 @@ struct CommandsCore {
     #[cfg(test)]
     deny_replacement: AtomicBool,
     #[cfg(test)]
-    deny_final_slot: AtomicBool,
-    #[cfg(test)]
     deny_preflight: AtomicBool,
     #[cfg(test)]
     replacement_attempts: AtomicUsize,
@@ -1163,8 +1161,6 @@ impl Commands {
             state: CachePadded::new(Censused::new(parking_lot::Mutex::new(state))),
             #[cfg(test)]
             deny_replacement: AtomicBool::new(false),
-            #[cfg(test)]
-            deny_final_slot: AtomicBool::new(false),
             #[cfg(test)]
             deny_preflight: AtomicBool::new(false),
             #[cfg(test)]
@@ -2800,58 +2796,6 @@ impl CommandsCore {
         }
     }
 
-    /// The final owner's stand-in for a current recording a cancellation
-    /// abandoned: one empty recording, owned by the final submission, taken
-    /// without waiting. `false` while a Metal 4 queue has no free slot; the
-    /// freed slot then notifies the retirement service. A Metal 3 buffer is
-    /// created as every cancellation's re-homed signal is, under the held
-    /// cap's bound on live buffers (`docs/invariants.md` §15.1q). The
-    /// abandoned recording leaves with the final captures.
-    fn replace_abandoned_for_final(
-        &self,
-        state: &mut EntryState,
-        captures: &mut lifecycle::FinalCaptures,
-    ) -> Result<bool, MetalKernelError> {
-        #[cfg(test)]
-        if self.deny_final_slot.load(Ordering::Acquire) {
-            return Ok(false);
-        }
-        if let Some(queue) = &self.modern_queue {
-            if !queue.free_slot_or_wait() {
-                return Ok(false);
-            }
-        }
-        captures.cancelled.try_reserve(1).map_err(|_| {
-            MetalKernelError::QueueUnavailable("final cancelled-recording custody refused")
-        })?;
-        let credit = state
-            .binding_credits
-            .iter_mut()
-            .find(|slot| slot.is_some())
-            .and_then(Option::take);
-        // No other acquirer exists once the last handle is gone, so the slot
-        // seen free above is there; a park would be an ownership violation.
-        let next = self.create_recording(credit, &mut |_, _| {
-            Err(MetalKernelError::QueueUnavailable(
-                "final marker found no slot after one was free",
-            ))
-        })?;
-        match state.current.replace_recording(next) {
-            Ok(old) => captures.cancelled.push(old),
-            Err(unused) => {
-                captures.cancelled.push(unused);
-                return Err(MetalKernelError::QueueUnavailable(
-                    "abandoned final recording carries a receipt",
-                ));
-            }
-        }
-        state.current_abandoned = false;
-        state.namespace.reset();
-        self.compute_count.store(0, Ordering::Release);
-        self.replacement_pending.store(false, Ordering::Release);
-        Ok(true)
-    }
-
     /// The state lock, refused inside one of this queue's own completion
     /// callbacks (`completion_scope`).
     fn lock_entry(&self) -> Result<EntryGuard<'_>, MetalKernelError> {
@@ -3369,11 +3313,6 @@ impl lifecycle::FinalCore for CommandsCore {
         &self,
         wake: Arc<crate::completion_wake::Wake>,
     ) -> Result<(), MetalKernelError> {
-        if let Some(queue) = &self.modern_queue {
-            queue
-                .install_slot_wake(wake.clone())
-                .map_err(|_| MetalKernelError::QueueUnavailable("foreign Metal 4 slot Wake"))?;
-        }
         self.hook
             .install_final_wake(wake.clone())
             .map_err(|_| MetalKernelError::QueueUnavailable("foreign final completion Wake"))?;
@@ -3401,26 +3340,6 @@ impl lifecycle::FinalCore for CommandsCore {
         if self.encoder_domain.has_external_handles() {
             return Ok(false);
         }
-        // A bound queue's final marker spends a preflight credit; refill one
-        // before EntryState, as every recording operation does. Declared
-        // before the guard, so a raced surplus drops after it unlocks.
-        let mut refill = None;
-        if let Some(bank) = self.binding_bank.as_ref() {
-            let needs = self.state.try_lock().map(|state| {
-                state.current.submitted().is_none()
-                    && !state.current_abandoned
-                    && state.binding_credits.iter().all(Option::is_none)
-            });
-            match needs {
-                Some(true) => refill = Some(bank.prepare_before_entry()?),
-                Some(false) => {}
-                None => {
-                    return Err(MetalKernelError::QueueUnavailable(
-                        "final EntryState still borrowed",
-                    ))
-                }
-            }
-        }
         let Some(mut state) = self.state.try_lock() else {
             // EntryState is privately owned, and all public guards borrow
             // Commands. No such borrow survives final Commands::drop. Treat a
@@ -3429,11 +3348,6 @@ impl lifecycle::FinalCore for CommandsCore {
                 "final EntryState still borrowed",
             ));
         };
-        if refill.is_some() {
-            if let Some(slot) = state.binding_credits.iter_mut().find(|slot| slot.is_none()) {
-                *slot = refill.take();
-            }
-        }
         if state.current.submitted().is_some() {
             return Ok(true);
         }

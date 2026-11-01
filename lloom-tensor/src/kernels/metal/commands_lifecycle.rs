@@ -87,8 +87,8 @@ pub(super) struct FinalCaptures {
     pub(super) subscribers: Vec<Box<Vec<super::super::completion_hook::Subscriber>>>,
     pub(super) encoder_executor: Option<Arc<ExecutorSlot>>,
     pub(super) removals: Option<super::super::residency_set::PublishedRemovals>,
-    /// Recordings the final submission cancelled or replaced, unsubmitted:
-    /// released with the other captures, after every native marker is terminal.
+    /// Recordings the final teardown cancelled, unsubmitted: released with
+    /// the other captures, after every native marker is terminal.
     pub(super) cancelled: Vec<super::CommandBuffer>,
 }
 
@@ -141,8 +141,10 @@ impl<C: FinalCore> Teardown<C> {
     }
 }
 
-// SAFETY: poll uses only try admissions and returned-handoff/logical predicates;
-// no replacement slot is acquired. C is staged before native/retirement edits,
+// SAFETY: poll uses only try admissions and returned-handoff/logical predicates
+// (a final receipt's logical completion, or the completion hook's settle of an
+// abandoned final); no replacement slot or recording is ever acquired. C is
+// staged before native/retirement edits,
 // Core remains in the registered inbox across arbitrary C Drop. All externally
 // changeable pending predicates notify the shared service Wake (see report).
 // Native API calls themselves are synchronous; this contract excludes host

@@ -234,6 +234,7 @@ impl FlashDecodingMetadata {
     /// publication replaces the private payloads instead of mutating them.
     /// The post-PR1166 PagedKv migration consumes this helper; it is otherwise
     /// intentionally not wired to a model in this owned-source candidate.
+    #[cfg(any(feature = "metal", test))]
     pub(crate) fn clone_immutable_publication(&self) -> Self {
         Self {
             table: self.table.clone(),

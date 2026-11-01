@@ -224,6 +224,27 @@ impl FlashDecodingMetadata {
         (table, keys)
     }
 
+    /// Retain an ordinary immutable publication for a producer's own Clone
+    /// implementation. This is NOT a public Clone capability and never applies
+    /// to mapped resident tables or mutable frame/count writers.
+    ///
+    /// Host Vecs are copied and existing Tensor ownership is incremented; this
+    /// is not allocation-free. No native upload, recording, readback, new
+    /// validation or fallible native operation is performed. Subsequent
+    /// publication replaces the private payloads instead of mutating them.
+    /// The post-PR1166 PagedKv migration consumes this helper; it is otherwise
+    /// intentionally not wired to a model in this owned-source candidate.
+    pub(crate) fn clone_immutable_publication(&self) -> Self {
+        Self {
+            table: self.table.clone(),
+            keys: self.keys.clone(),
+            table_stride: self.table_stride,
+            summary: self.summary,
+            table_t: self.table_t.clone(),
+            keys_t: self.keys_t.clone(),
+        }
+    }
+
     /// Borrow the existing publication; no table/count copy, upload or scan.
     pub fn view(&self) -> FlashDecodingMetadataView<'_> {
         let (table_t, keys_t) = self.bindings();
@@ -427,6 +448,117 @@ mod flash_validation_tests {
             assert!(!printed.contains("Tensor["), "{printed}");
         }
         assert!(format!("{owner:?}").contains("table_entries"));
+        Ok(())
+    }
+
+    #[test]
+    fn immutable_clone_keeps_payload_custody_but_not_host_vector_aliases() -> Result<()> {
+        let owner = FlashDecodingMetadata::new(vec![0, 1], 1, vec![1], 2, 256, 1, &Device::Cpu)?;
+        let preparations = preparation_count();
+        let copy = owner.clone_immutable_publication();
+        assert_eq!(
+            preparation_count(),
+            preparations,
+            "clone reuses existing checked proof"
+        );
+        assert_ne!(owner.table.as_ptr(), copy.table.as_ptr());
+        assert_ne!(owner.keys.as_ptr(), copy.keys.as_ptr());
+        assert!(shares_storage(&owner.table_t, &copy.table_t));
+        assert!(shares_storage(&owner.keys_t, &copy.keys_t));
+        assert_eq!(
+            format!("{:?}", owner.summary),
+            format!("{:?}", copy.summary)
+        );
+        let saved_table = copy.table_t.clone();
+        let saved_keys = copy.keys_t.clone();
+        let (mut table, mut keys) = copy.into_host_vectors();
+        table[0] = 7;
+        keys[0] = 9;
+        assert_eq!(owner.table(), &[0, 1]);
+        assert_eq!(owner.keys(), &[1]);
+        assert_eq!(saved_table.to_vec1::<u32>()?, vec![0, 1]);
+        assert_eq!(saved_keys.to_vec1::<u32>()?, vec![1]);
+        Ok(())
+    }
+
+    #[test]
+    fn immutable_clone_preserves_padded_stride_and_nondefault_page_geometry() -> Result<()> {
+        // Two rows, two pages/chunk, and three table entries/row although only
+        // two chunks dispatch. Row1's second chunk is padded/empty.
+        let owner = FlashDecodingMetadata::new(
+            vec![2, 4, 9, 6, 8, 10],
+            3,
+            vec![129, 65],
+            2,
+            64,
+            2,
+            &Device::Cpu,
+        )?;
+        let copy = owner.clone_immutable_publication();
+        assert_eq!(copy.table_stride(), 3);
+        assert_eq!(copy.page_geometry(), (64, 2));
+        assert_eq!(copy.table(), &[2, 4, 9, 6, 8, 10]);
+        assert_eq!(copy.keys(), &[129, 65]);
+        assert_eq!(
+            format!("{:?}", copy.summary),
+            format!("{:?}", owner.summary)
+        );
+        let view = copy.view();
+        assert_eq!(view.table_stride(), 3);
+        assert_eq!(view.page_geometry(), (64, 2));
+        assert_eq!(view.table(), owner.table());
+        assert_eq!(view.keys(), owner.keys());
+        assert!(shares_storage(&copy.table_t, &owner.table_t));
+        assert!(shares_storage(&copy.keys_t, &owner.keys_t));
+        Ok(())
+    }
+
+    #[test]
+    fn immutable_clone_republication_and_failure_leave_sibling_unchanged() -> Result<()> {
+        let device = Device::Cpu;
+        let owner = FlashDecodingMetadata::new(vec![0, 1], 1, vec![1], 2, 256, 1, &device)?;
+        let mut changed = owner.clone_immutable_publication();
+        changed.republish(vec![1, 0], 1, vec![2], 2, &device)?;
+        assert_eq!(changed.table_t.to_vec1::<u32>()?, vec![1, 0]);
+        assert_eq!(changed.keys_t.to_vec1::<u32>()?, vec![2]);
+        assert_eq!(owner.table_t.to_vec1::<u32>()?, vec![0, 1]);
+        assert_eq!(owner.keys_t.to_vec1::<u32>()?, vec![1]);
+        assert_eq!(owner.table(), &[0, 1]);
+        assert_eq!(owner.keys(), &[1]);
+        assert!(!shares_storage(&owner.table_t, &changed.table_t));
+        assert!(!shares_storage(&owner.keys_t, &changed.keys_t));
+
+        let mut failed = owner.clone_immutable_publication();
+        let before_summary = format!("{:?}", failed.summary);
+        let error = failed
+            .republish_with(vec![2, 3], 1, vec![2], 2, &device, |data, d, kind| {
+                if kind == MetadataUpload::Counts {
+                    lloom_tensor::bail!("injected clone count refusal")
+                }
+                upload_metadata(data, d, kind)
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("injected clone count refusal"), "{error}");
+        assert_eq!(failed.table(), &[0, 1]);
+        assert_eq!(failed.keys(), &[1]);
+        assert_eq!(format!("{:?}", failed.summary), before_summary);
+        assert!(shares_storage(&owner.table_t, &failed.table_t));
+        assert!(shares_storage(&owner.keys_t, &failed.keys_t));
+        assert_eq!(owner.table_t.to_vec1::<u32>()?, vec![0, 1]);
+        assert_eq!(owner.keys_t.to_vec1::<u32>()?, vec![1]);
+
+        let mut stable = owner.clone_immutable_publication();
+        let mut stages = Vec::new();
+        stable.republish_with(vec![0, 1], 1, vec![3], 2, &device, |data, d, kind| {
+            stages.push(kind);
+            upload_metadata(data, d, kind)
+        })?;
+        assert_eq!(stages, [MetadataUpload::Counts]);
+        assert!(shares_storage(&owner.table_t, &stable.table_t));
+        assert!(!shares_storage(&owner.keys_t, &stable.keys_t));
+        assert_eq!(stable.keys_t.to_vec1::<u32>()?, vec![3]);
+        assert_eq!(owner.keys_t.to_vec1::<u32>()?, vec![1]);
         Ok(())
     }
 

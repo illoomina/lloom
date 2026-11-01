@@ -419,7 +419,8 @@ pub fn parse_quantized(name: &str) -> Option<Key> {
         return None;
     }
     if let Some(r) = name.strip_prefix("kernel_mul_mm_") {
-        return cell(Entry::MulMm, r.strip_suffix("_f32")?, Act::F32);
+        let (s, a) = act_suffix(r)?;
+        return cell(Entry::MulMm, s, a);
     }
     if let Some(r) = name.strip_prefix("kernel_get_rows_") {
         return cell(Entry::GetRows, r, Act::F32);
@@ -927,13 +928,13 @@ impl Matrix {
         Ok(())
     }
 
-    pub fn run_mul_mm(&mut self, d: GgmlDType, dequant_once: bool) -> Result<()> {
+    pub fn run_mul_mm(&mut self, d: GgmlDType, dequant_once: bool, act: Act) -> Result<()> {
         let entry = if dequant_once {
             Entry::DequantMm
         } else {
             Entry::MulMm
         };
-        let key: Key = (entry, stem(d).into(), Act::F32);
+        let key: Key = (entry, stem(d).into(), act);
         let ms: &[usize] = if dequant_once { &[64, 70] } else { &[9, 37] };
         let mut first = true;
         for (k, mag) in Self::kmags(d) {
@@ -941,16 +942,18 @@ impl Matrix {
                 let w = weight(&self.dev, d, &[n, k], 11 + n as u32 + k as u32, mag)?;
                 for &m in ms {
                     let at = format!("m={m} n={n} k={k} mag={mag}");
-                    let (x, xv) =
-                        activations(&self.dev, &[m, k], Act::F32, m as u32 * 7 + k as u32)?;
+                    let (x, xv) = activations(&self.dev, &[m, k], act, m as u32 * 7 + k as u32)?;
                     let (out, census) = self.census(|| x.apply_op1_no_bwd(&w.q))?;
+                    // The f32 arm keeps the single `_f32` suffix; the f16 arm
+                    // spells both legs (`_f16_f16`).
+                    let triple = if act == Act::F16 { "f16_f16" } else { "f32" };
                     let expect = if dequant_once {
                         vec![
                             format!("kernel_dequant_rows_f16_{}", stem(d)),
-                            "kernel_mul_mm_f16_f32".to_string(),
+                            format!("kernel_mul_mm_f16_{triple}"),
                         ]
                     } else {
-                        vec![format!("kernel_mul_mm_{}_f32", stem(d))]
+                        vec![format!("kernel_mul_mm_{}_{triple}", stem(d))]
                     };
                     self.check_census(&key, &at, &census, &expect);
                     let got = to_f32(&out)?;
@@ -966,7 +969,7 @@ impl Matrix {
                         m,
                         n,
                         stages_half(d),
-                        false,
+                        act == Act::F16,
                     );
                     if first {
                         let again = x.apply_op1_no_bwd(&w.q)?;
@@ -1737,14 +1740,15 @@ impl Matrix {
                 Entry::MulMvId2 => self.run_mv_id(d, act, true, false)?,
                 Entry::RowsId => self.run_mv_id(d, act, false, true)?,
                 Entry::RowsId2 => self.run_mv_id(d, act, true, true)?,
-                Entry::MulMm => self.run_mul_mm(d, false)?,
+                Entry::MulMm => self.run_mul_mm(d, false, act)?,
                 Entry::MmId32 => self.run_mm_id(d, 32)?,
                 Entry::MmId16 => self.run_mm_id(d, 16)?,
                 Entry::GetRows => self.run_get_rows(d)?,
                 Entry::DequantRowsF16 => {
                     self.run_dequant_rows_f16(d)?;
                     if entries.contains(&Entry::DequantMm) {
-                        self.run_mul_mm(d, true)?;
+                        self.run_mul_mm(d, true, Act::F32)?;
+                        self.run_mul_mm(d, true, Act::F16)?;
                     }
                 }
                 Entry::DequantMm | Entry::KvSdpa | Entry::KvSdpaSel | Entry::KvDequant => {}
@@ -1784,11 +1788,6 @@ impl Matrix {
                 Entry::MulMm => {
                     let w = weight(&self.dev, d, &[4, k], 1, 1.0)?;
                     let (x, _) = activations(&self.dev, &[9, k], act, 1)?;
-                    if act == Act::F16 {
-                        return Err(lloom_tensor::Error::Msg(
-                            "not probed: the mm path asserts f32 activations".into(),
-                        ));
-                    }
                     self.census(|| x.apply_op1_no_bwd(&w.q))
                 }
                 Entry::MulMvId

@@ -18,6 +18,8 @@ pub mod iq_quants;
 pub mod k_quants;
 #[cfg(feature = "metal")]
 pub mod metal;
+#[cfg(feature = "metal")]
+pub mod route;
 pub mod tokenizer;
 #[cfg(not(feature = "metal"))]
 mod metal {

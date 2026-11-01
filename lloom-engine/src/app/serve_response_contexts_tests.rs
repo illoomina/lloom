@@ -251,6 +251,45 @@ fn the_machine_reservation_accounts_every_context_byte() {
     assert_eq!(contexts.json()["overload"]["memory"], 0);
 }
 
+/// A release that lands between an admission's read of the bytes in use and
+/// its publication is not lost (Codex review on #1145): the counters return
+/// to exactly zero, gate off and machine-gated, in both orders, and a refused
+/// admission publishes nothing. Publishing with `store(after)` loses the
+/// release and fails here.
+#[test]
+fn a_release_between_admission_and_publication_is_not_lost() {
+    const R: usize = 1000;
+    let registry = Registry::new("release-race");
+    for contexts in [ResponseContexts::default(), registry.contexts(R, 1 << 30)] {
+        let need = |body: usize| contexts.footprint(body);
+        // A releases inside B's admission interval.
+        let a = contexts.try_take(10).unwrap();
+        let b = contexts.try_take_between(20, || drop(a)).unwrap();
+        assert_eq!(contexts.bytes.load(Ordering::Acquire), need(20));
+        assert_eq!(contexts.active.load(Ordering::Acquire), 1);
+        drop(b);
+        assert_eq!(contexts.bytes.load(Ordering::Acquire), 0, "no phantom bytes");
+        assert_eq!(contexts.active.load(Ordering::Acquire), 0);
+        // The other order: B published, then A released.
+        let a = contexts.try_take(10).unwrap();
+        let b = contexts.try_take(20).unwrap();
+        drop(a);
+        assert_eq!(contexts.bytes.load(Ordering::Acquire), need(20));
+        drop(b);
+        assert_eq!(contexts.bytes.load(Ordering::Acquire), 0);
+        assert_eq!(contexts.active.load(Ordering::Acquire), 0);
+    }
+    // A refused admission (no room past the first context) with a release
+    // inside its interval publishes nothing and keeps the release.
+    let tight = Registry::new("release-race-refused");
+    let contexts = tight.contexts(R, (R + 10) as u64);
+    let a = contexts.try_take(10).unwrap();
+    let refused = contexts.try_take_between(5_000, || drop(a));
+    assert!(refused.is_err(), "the oversized admission is refused");
+    assert_eq!(contexts.bytes.load(Ordering::Acquire), 0);
+    assert_eq!(contexts.active.load(Ordering::Acquire), 0);
+}
+
 /// The gate refuses a footprint the machine cannot hold, at the boundary:
 /// room for exactly one context admits it, one byte less refuses it.
 #[test]

@@ -967,7 +967,7 @@ mod flash_validation_tests {
             );
             tensor
                 .narrow(0, skip, shape.iter().product())?
-                .reshape(shape)
+                .reshape(&shape)
         };
         let q = view_tensor(&q_base, 128, 320, 16, [1, 1, 1, 64])?;
         let k = view_tensor(&k_base, 192, 608, 24, [1, 1, 2, 64])?;

@@ -175,6 +175,11 @@ pub struct ReadbackConfig {
     /// Under the adaptive commit: publish with the fused argmax·eos·stamp kernel (off = the six-launch chain, the A/B arm).
     #[opt(bool, path = "decode.readback.fused_publish", status = "arm", facets = ["produce"], flows = ["token-out"])]
     pub fused_publish: bool,
+    /// Opt-in request-prepared Metal sampler for non-greedy scalar requests.
+    /// Ring requests use guarded model input; explicit blocking and diagnostics
+    /// retain checked host ID/logit readback. Argmax keeps its existing route.
+    #[opt(bool, path = "decode.readback.device_filter", status = "arm", facets = ["produce"], flows = ["token-out"])]
+    pub device_filter: bool,
     /// Stream tokens off a ring-reader thread per token instead of the loop's commit-cadence drain (ring arms; implied by the adaptive commit).
     #[opt(bool, path = "decode.readback.stream_reader", status = "arm", facets = ["consume"], flows = ["token-out"])]
     pub stream_reader: bool,
@@ -199,6 +204,7 @@ impl Default for ReadbackConfig {
             queued_steps: 0,
             eos_gate: true,
             fused_publish: true,
+            device_filter: false,
             stream_reader: false,
             wake_cadence: WAKE_LIVE_EVERY_DEFAULT,
         }

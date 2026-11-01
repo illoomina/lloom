@@ -1,6 +1,7 @@
 //! Completion-checked host/window transfer. This is not a device-token API:
 //! ring lookahead needs guarded device consumers before native admission.
 
+use super::host_scratch::HostScratch;
 use super::{
     result::{checked_error, checked_ids},
     PrivateMultinomial,
@@ -14,13 +15,13 @@ use std::sync::Arc;
 /// Prepared outside the decode loop. A pending snapshot owns its source and
 /// cannot be overwritten, including when the caller abandons a poll.
 #[allow(dead_code, reason = "private bridge; native admission is separate")]
-pub(super) struct SampleReadback {
+pub struct SampleReadback {
     slot: HostSlot,
     destination: MetalStorage,
     device: MetalDevice,
     clock: Arc<GpuClock>,
     capacity: usize,
-    words: Vec<u32>,
+    words: HostScratch<u32>,
     pending: Option<PendingSnapshot>,
     poisoned: bool,
 }
@@ -37,7 +38,7 @@ struct PendingSnapshot {
 /// Only constructed after the entire completed result has passed validation.
 /// No unchecked Tensor/storage escape exists, even for an invalid later row.
 #[allow(dead_code, reason = "private bridge; native admission is separate")]
-pub(super) struct CheckedSample<'a> {
+pub struct CheckedSample<'a> {
     ids: &'a [u32],
 }
 
@@ -59,10 +60,7 @@ impl SampleReadback {
                     .is_some_and(|bytes| bytes <= isize::MAX as usize)
             })
             .ok_or_else(|| crate::Error::Msg("sampling readback capacity overflow".into()))?;
-        let mut words = Vec::new();
-        words
-            .try_reserve_exact(count)
-            .map_err(|e| crate::Error::Msg(format!("sampling readback capacity: {e}")))?;
+        let words = HostScratch::new(device, count)?;
         let slot = HostSlot::new(device, count.max(1), DType::U32)?;
         let tensor = slot.tensor(count.max(1))?;
         let destination = {
@@ -88,7 +86,7 @@ impl SampleReadback {
     /// encoder; no flush, wait, native
     /// completion subscriber or global failure injection is added. Prepared
     /// readback capacity is reused; encoder/pipeline costs remain their own.
-    pub fn enqueue(&mut self, sample: PrivateMultinomial) -> Result<()> {
+    pub(super) fn enqueue(&mut self, sample: PrivateMultinomial) -> Result<()> {
         self.enqueue_inner(sample, None)
     }
 
@@ -140,6 +138,7 @@ impl SampleReadback {
         }
         self.poisoned = true;
         let encoder = self.device.command_encoder()?;
+        super::guard::require_classical_encoder(&encoder)?;
         // CommandsGuard holds the recording-state exclusion: neither a cut
         // nor a concurrent commit can change this epoch between these copies.
         let epoch = self.clock.current_epoch();
@@ -247,11 +246,11 @@ impl SampleReadback {
         let rows = sample.rows;
         let vocab = sample.vocab;
         let count = rows * 5;
-        self.slot
-            .peek_u32(count + if error.is_some() { 4 } else { 0 }, &mut self.words)?;
+        let used = count + if error.is_some() { 4 } else { 0 };
+        self.slot.peek_u32_into(&mut self.words[..used])?;
         // Validation precedes the success type, not merely host publication.
         let result = (if error.is_some() {
-            checked_error(&self.words[count..])
+            checked_error(&self.words[count..used])
         } else {
             Ok(())
         })

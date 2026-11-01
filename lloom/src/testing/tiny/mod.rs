@@ -221,6 +221,14 @@ pub trait TinyFamily: Sized {
     ) -> Result<Self::Model<P>>;
     /// The checkpoint's files in `dir`; the path `lloom --model` takes.
     fn write(ckpt: &TinyCheckpoint<Self>, dir: &Path) -> Result<PathBuf>;
+    /// `write`, with constructor-backed schemas recorded at `P`, for a
+    /// process already held to `P`'s regime.
+    fn write_for<P: crate::profile::Profile>(
+        ckpt: &TinyCheckpoint<Self>,
+        dir: &Path,
+    ) -> Result<PathBuf> {
+        Self::write(ckpt, dir)
+    }
     /// A written checkpoint, through the family's real loader.
     fn load<P: crate::profile::Profile>(path: &Path, dev: &Device) -> Result<Self::Model<P>>;
 

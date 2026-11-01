@@ -286,11 +286,47 @@ fn the_policy_moves_the_cells_it_names() {
 /// `f16_arm`, the GEMM cell `mul_mm_f16_arm` (the table cells above pin both
 /// on Q4_K, Q8_0, F16, F32 and BF16).
 #[test]
+fn kinds_without_a_matvec_and_bad_geometry_are_refused_by_name() {
+    for kind in [GgmlDType::BF16, GgmlDType::Q8_1, GgmlDType::Q8K] {
+        let r = resolve(
+            Weight { kind, rank: 2, k: 4096 },
+            Spec { act: DType::F32, rows: 1, row_per_batch: true },
+            SHIPPED,
+        );
+        let e = r.expect_err("no matvec kernel: refused, not certified");
+        assert_eq!(e.need, "a matmul-vec arm for this weight kind", "{kind:?}");
+        assert!(e.to_string().contains("no route for"), "{e}");
+    }
+    let q = GgmlDType::Q4K;
+    let rank3_mv = resolve(
+        Weight { kind: q, rank: 3, k: 4096 },
+        Spec { act: DType::F32, rows: 1, row_per_batch: true },
+        SHIPPED,
+    );
+    assert_eq!(
+        rank3_mv.unwrap_err().need,
+        "a rank-2 weight (the matmul-vec takes one matrix)"
+    );
+    for (rows, k, rank) in [(0, 4096, 2), (1, 0, 2), (1, 4096, 1)] {
+        let r = resolve(
+            Weight { kind: q, rank, k },
+            Spec { act: DType::F32, rows, row_per_batch: false },
+            SHIPPED,
+        );
+        assert_eq!(
+            r.unwrap_err().need,
+            "a non-empty request over a weight of rank >= 2",
+            "rows={rows} k={k} rank={rank}"
+        );
+    }
+}
+
+#[test]
 fn every_kind_resolves_or_refuses() {
     for kind in GgmlDType::ALL {
         for act in [DType::F32, DType::F16, DType::BF16] {
             for (rows, rpb) in [(1, true), (4, false), (9, false), (512, false), (512, true)] {
-                let _ = resolve(
+                let got = resolve(
                     Weight {
                         kind,
                         rank: 2,
@@ -303,6 +339,33 @@ fn every_kind_resolves_or_refuses() {
                     },
                     SHIPPED,
                 );
+                // Every cell's outcome is the kind table's capability, not
+                // merely "some route" (Codex review on PR1161).
+                let mv = rpb || rows <= SHIPPED.mv_rows_max;
+                let has_mv = !matches!(
+                    kind.kind().mul_mv,
+                    lloom_tensor::kernels::kernels::quantized::MulMv::None
+                );
+                let expect = if mv {
+                    has_mv
+                        && match act {
+                            DType::F32 => true,
+                            DType::F16 => kind.has_gemv_triple(),
+                            _ => false,
+                        }
+                } else {
+                    kind.kind().mul_mm.is_some()
+                        && match act {
+                            DType::F32 => true,
+                            DType::F16 => kind.kind().mul_mm_f16_arm(),
+                            _ => false,
+                        }
+                };
+                assert_eq!(got.is_ok(), expect, "{kind:?} {act:?} rows={rows} rpb={rpb}: {got:?}");
+                if mv && !has_mv {
+                    let e = got.unwrap_err();
+                    assert_eq!(e.need, "a matmul-vec arm for this weight kind", "{kind:?}");
+                }
             }
         }
         let decode = resolve(

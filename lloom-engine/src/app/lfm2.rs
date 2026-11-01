@@ -3977,3 +3977,18 @@ mod speculative_schedule_tests;
 
 #[cfg(test)]
 mod single_speculative_tests;
+
+#[cfg(all(test, feature = "metal"))]
+mod unwind_eos_gate_tests;
+
+#[cfg(all(test, feature = "metal"))]
+mod prepared_sampler_tests {
+    type OwnerProfile = lloom::profile::CrownExact;
+    include!("lfm2/prepared_sampler_tests.rs");
+}
+
+#[cfg(all(test, feature = "metal"))]
+mod prepared_sampler_fast_tests {
+    type OwnerProfile = lloom::profile::Crown;
+    include!("lfm2/prepared_sampler_tests.rs");
+}

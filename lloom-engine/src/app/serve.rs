@@ -283,6 +283,18 @@ impl ResponseContexts {
     }
 
     fn try_take(&self, body: usize) -> std::result::Result<ResponseContext<'_>, Overload> {
+        self.try_take_between(body, || {})
+    }
+
+    /// `try_take`, with `between` run after the bytes in use are read and
+    /// before this context's bytes are published: the interval a concurrent
+    /// release can fall into (`ResponseContext::drop` subtracts without the
+    /// admission lock). Tests use it to force that interleaving.
+    fn try_take_between(
+        &self,
+        body: usize,
+        between: impl FnOnce(),
+    ) -> std::result::Result<ResponseContext<'_>, Overload> {
         let need = self.footprint(body);
         let _admit = self.admit.lock();
         if let Some(limit) = self.limits.contexts {
@@ -295,10 +307,17 @@ impl ResponseContexts {
             self.refused_memory.fetch_add(1, Ordering::Relaxed);
             Overload::Memory(why)
         };
+        // Admissions are serialized by `admit`; releases are not. `after` is
+        // therefore an upper bound (a release may land before publication),
+        // which is the safe side for the admission checks below, and the
+        // publication adds `need` rather than storing `after`, so a
+        // concurrent release is never overwritten (Codex review on #1145,
+        // 2026-10-31).
         let in_use = self.bytes.load(Ordering::Acquire);
         let after = in_use
             .checked_add(need)
             .ok_or_else(|| refused("response context bytes overflow".into()))?;
+        between();
         #[cfg(feature = "metal")]
         let mut reservation = None;
         match &self.memory {
@@ -339,7 +358,7 @@ impl ResponseContexts {
             }
         }
         self.active.fetch_add(1, Ordering::AcqRel);
-        self.bytes.store(after, Ordering::Release);
+        self.bytes.fetch_add(need, Ordering::AcqRel);
         Ok(ResponseContext {
             contexts: self,
             bytes: need,
@@ -727,6 +746,8 @@ where
                         b["keep_warm"] = shared.keep_warm.json(&shared.activity, uptime_ns());
                         b["keep_warm_actions"] =
                             json!(shared.activity.actions.load(Ordering::Relaxed));
+                        b["pass_plans"] =
+                            super::report::pass_plan_escapes_json(shared.engine.device());
                         if let Some(s) = shared.engine.device().metal4_slot_residency() {
                             b["metal4_slot_residency"] = json!({
                                 "adds": s.adds,

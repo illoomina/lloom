@@ -608,8 +608,9 @@ fn run_reuse<P: Lfm2Shape>(
         reply2_reuse.len(),
         reply2_fresh.len()
     );
+    let escapes = super::report::undeclared_escapes(ctx.device);
     println!(
-        "RESULT mode=reuse {common} eos_read={} turn1_tokens={} reuse_action={:?} reused={} \
+        "RESULT mode=reuse {common} undeclared_escapes={escapes} eos_read={} turn1_tokens={} reuse_action={:?} reused={} \
          prefilled_reuse={} prefilled_fresh={} turn2_tokens_reuse={} turn2_tokens_fresh={} \
          identical={} common_prefix={} ttft_reuse_ms={:.3} ttft_fresh_ms={:.3}",
         arm.eos_read(),
@@ -806,8 +807,9 @@ fn run_concurrent<P: Lfm2Shape>(
         total as f64 / wall,
         solo_rates.iter().sum::<f64>() / n as f64,
     );
+    let escapes = super::report::undeclared_escapes(ctx.device);
     println!(
-        "RESULT mode=concurrent {common} eos_read={} sequences={n} chunk={} prefill_chunk={} \
+        "RESULT mode=concurrent {common} undeclared_escapes={escapes} eos_read={} sequences={n} chunk={} prefill_chunk={} \
          prefill_tile={} stagger={} prompt_tokens={:?} visits={} prefill_visits={:?} \
          prefill_units={:?} resumes={} total_tokens={} interleaved_wall_s={:.4} \
          aggregate_tok_s={:.4} solo_wall_s={:.4} solo_mean_tok_s={:.4} identical={} \
@@ -1084,8 +1086,9 @@ fn run_dspark_concurrent<P: Lfm2Shape>(ctx: &Ctx<'_, P>, common: &str) -> Result
         std::fs::write(path, w).with_context(|| format!("writing {}", path.display()))?;
     }
     let speedup = (pipe.tokens() as f64 / pipe.wall_s) / (solo.tokens() as f64 / solo.wall_s);
+    let escapes = super::report::undeclared_escapes(ctx.device);
     println!(
-        "RESULT mode=concurrent dspark=true first={} {common} k={k} sequences={n} \
+        "RESULT mode=concurrent dspark=true first={} {common} undeclared_escapes={escapes} k={k} sequences={n} \
          prefill_ubatch={} solo_prefill_units={:?} pipelined_prefill_units={:?} \
          solo_tokens={} solo_rounds={} solo_wall_s={:.4} solo_aggregate_tok_s={:.4} \
          pipelined_tokens={} pipelined_rounds={} pipelined_wall_s={:.4} pipelined_aggregate_tok_s={:.4} \
@@ -2068,6 +2071,17 @@ fn run_batched_concurrent<P: Lfm2Shape>(
                 .filter(|(_, v, _)| matches!(v, RowVerdict::Differs(_)))
                 .map(|(i, _, line)| format!("seq {i} across the re-batch: {line}")),
         )
+        .chain(
+            // An undeclared escape fails the gate whatever the streams say:
+            // the decline that kept them right is the defect (§26).
+            (super::report::undeclared_escapes(ctx.device) > 0).then(|| {
+                format!(
+                    "undeclared_escapes={}: {}",
+                    super::report::undeclared_escapes(ctx.device),
+                    super::report::pass_plan_escapes_json(ctx.device)
+                )
+            }),
+        )
         .collect();
     // A bit gate under the `fast` contract certifies nothing: its arms may
     // move a row's bits by design (architecture.md §2.3.5b), so the rows
@@ -2160,8 +2174,9 @@ fn run_batched_concurrent<P: Lfm2Shape>(
     );
     let speedup = (batched.tokens() as f64 / batched.wall_s) / (solo.tokens() as f64 / solo.wall_s);
     let batched_gaps: Vec<(f64, f64)> = batched.stamps.iter().map(|v| gap_stats_ms(v)).collect();
+    let escapes = super::report::undeclared_escapes(ctx.device);
     println!(
-        "RESULT mode=concurrent batched=true first={} {common} batched_lookahead={} sequences={n} \
+        "RESULT mode=concurrent batched=true first={} {common} undeclared_escapes={escapes} batched_lookahead={} sequences={n} \
          prefill_chunk={} prefill_tile={} stagger={} arrivals={:?} prefill_units={:?} \
          first_token_ms={:?} gap_p50_ms={:?} gap_max_ms={:?} \
          prompt_tokens={:?} solo_tokens={} solo_steps={} solo_wall_s={:.4} solo_aggregate_tok_s={:.4} \

@@ -24,6 +24,26 @@ impl Embedding {
     pub fn embeddings(&self) -> &Tensor {
         self.inner.embeddings()
     }
+
+    #[cfg(feature = "metal")]
+    pub fn guarded_layout(&self) -> Result<lloom_tensor::quantized::GuardedEmbeddingLayout> {
+        self.inner.guarded_layout()
+    }
+
+    #[cfg(feature = "metal")]
+    pub fn check_guarded_output(&self, out: &Tensor) -> Result<()> {
+        self.inner.check_guarded_output(out)
+    }
+
+    #[cfg(feature = "metal")]
+    pub fn forward_guarded_into(
+        &self,
+        tokens: &lloom_tensor::metal_backend::sampling::GuardedSample<'_>,
+        out: &Tensor,
+    ) -> Result<()> {
+        let _enter = self.span.enter();
+        self.inner.forward_guarded_into(tokens, out)
+    }
 }
 
 impl Module for Embedding {

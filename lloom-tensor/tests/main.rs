@@ -111,6 +111,7 @@ mod slice_set_strided_tests;
 mod staged_readback_plans;
 mod tensor_tests;
 mod typed_tests;
+mod undeclared_escapes;
 mod words_publish_order;
 
 /// Every `tests/*.rs` beside this file is declared above (or is one of the

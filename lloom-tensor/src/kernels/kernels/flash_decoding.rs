@@ -488,6 +488,8 @@ pub unsafe fn call_flash_decoding(
     sums: &Buffer,
     maxs: &Buffer,
     chunk_table: &Buffer,
+    // Byte offset of the first table entry in `chunk_table`.
+    chunk_table_offset: usize,
     // Both params blocks are **caller-owned buffers**, not `setBytes` scalars.
     //
     // That is `call_scratch_partials`'s shape and it is deliberate on two
@@ -522,6 +524,9 @@ pub unsafe fn call_flash_decoding(
     // batch, one per row at stride 1 for a ragged one (§12.2). Caller-owned
     // for the reason the params blocks are.
     n_keys_per_seq: &Buffer,
+    // Byte offset of the first live count in `n_keys_per_seq`: a step frame
+    // binds its own field of a ring shared by every step (§4.6).
+    n_keys_offset: usize,
     n_q_heads: usize,
     head_dim: usize,
     n_chunks: usize,
@@ -568,8 +573,8 @@ pub unsafe fn call_flash_decoding(
                     (v_buffer, v_offset),
                     Output::new(output),
                     partial_params,
-                    chunk_table,
-                    n_keys_per_seq
+                    (chunk_table, chunk_table_offset),
+                    (n_keys_per_seq, n_keys_offset)
                 )
             );
         }
@@ -618,9 +623,9 @@ pub unsafe fn call_flash_decoding(
                     Output::new(partials),
                     Output::new(sums),
                     Output::new(maxs),
-                    chunk_table,
+                    (chunk_table, chunk_table_offset),
                     partial_params,
-                    n_keys_per_seq
+                    (n_keys_per_seq, n_keys_offset)
                 )
             );
         }

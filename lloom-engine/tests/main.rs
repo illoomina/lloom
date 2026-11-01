@@ -18,6 +18,7 @@ mod attention_purpose;
 mod batch_admission_ownership;
 mod capabilities_report;
 mod checkpoint_policy;
+mod continuous_batch_recovery;
 mod failure_next_request;
 mod load_warnings;
 mod machine_gate;

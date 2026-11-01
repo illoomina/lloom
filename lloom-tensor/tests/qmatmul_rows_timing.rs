@@ -271,6 +271,108 @@ fn every_kind_at_every_capacity_from_dram() {
     lloom_tensor::kernels::set_qmv_rows(true);
 }
 
+/// Qwen3.6-27B Q4_K_M's projections (kind, `n`, `k`, per token), read off
+/// the checkpoint's tensor table.
+const QWEN36_27B: [(GgmlDType, usize, usize, usize, &str); 13] = [
+    (GgmlDType::Q4K, 10240, 5120, 24, "attn_qkv"),
+    (GgmlDType::Q6K, 10240, 5120, 24, "attn_qkv"),
+    (GgmlDType::Q4K, 6144, 5120, 48, "attn_gate"),
+    (GgmlDType::Q5K, 5120, 6144, 48, "ssm_out"),
+    (GgmlDType::Q4K, 17408, 5120, 128, "ffn_gate|up"),
+    (GgmlDType::Q4K, 5120, 17408, 32, "ffn_down"),
+    (GgmlDType::Q6K, 5120, 17408, 32, "ffn_down"),
+    (GgmlDType::Q4K, 12288, 5120, 16, "attn_q"),
+    (GgmlDType::Q4K, 1024, 5120, 24, "attn_k|v"),
+    (GgmlDType::Q6K, 1024, 5120, 8, "attn_v"),
+    (GgmlDType::Q4K, 5120, 6144, 16, "attn_output"),
+    (GgmlDType::Q6K, 248320, 5120, 1, "output"),
+    (GgmlDType::Q8_0, 10240, 5120, 0, "control"),
+];
+
+/// The MTP verify window's two f32 rows on Qwen3.6-27B's own projections,
+/// per-row against the axis (`_r2`), in two regimes: `independent`, each
+/// launch reading the same activation (what the timings above measure; the
+/// GPU may overlap consecutive launches), and `dependent`, each launch's
+/// activation computed from the previous launch's output (a reduction, a
+/// zero scale and a broadcast add, the same three dispatches in every arm),
+/// so the launches run one after another as a decode step's do. Weights
+/// rotate over enough copies to pass 512 MB. Per rep: per-row, axis,
+/// per-row again (A B A'). Prints the per-token sum over the checkpoint's
+/// projection counts. The Q8_0 row (count 0) is the control: its table
+/// ceiling is already 2. Ignored; under `lloom-arb measure`.
+#[test]
+#[ignore]
+fn the_qwen36_27b_window_in_both_regimes() {
+    let dev = device();
+    let reps = 7usize;
+    let med = |v: &mut Vec<f64>| {
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        v[v.len() / 2]
+    };
+    println!("WINDOW27B contract=fast m=2 f32 reps={reps} A B A' (per-row, axis _r2, per-row); median ms per launch");
+    println!("| regime | proj | kind | [n x k] | per token | per-row ms | axis ms | null ms | axis/bracket | null/per-row |");
+    let mut sums = std::collections::BTreeMap::<&str, [f64; 3]>::new();
+    for (dtype, n, k, count, label) in QWEN36_27B {
+        let bytes = (n * k / dtype.block_size() * dtype.type_size()) as f64;
+        let copies = ((512e6 / bytes).ceil() as usize).max(2);
+        let iters = if bytes > 2e8 { 16 } else { 48 };
+        let qs: Vec<QMatMul> = (0..copies).map(|_| weight(dtype, (n, k), &dev)).collect();
+        let x0 = Tensor::randn(0f32, 1.0, (2, k), &dev).unwrap();
+        for regime in ["independent", "dependent"] {
+            let run = |axis: bool| {
+                lloom_tensor::kernels::set_qmv_rows(axis);
+                for q in &qs {
+                    q.forward(&x0).unwrap();
+                }
+                dev.synchronize().unwrap();
+                let t = Instant::now();
+                let mut x = x0.clone();
+                for i in 0..iters {
+                    let y = qs[i % copies].forward(&x).unwrap();
+                    if regime == "dependent" {
+                        let z = y.sum_keepdim(1).unwrap().affine(0.0, 0.0).unwrap();
+                        x = x0.broadcast_add(&z).unwrap();
+                    }
+                }
+                dev.synchronize().unwrap();
+                t.elapsed().as_secs_f64() * 1e3 / iters as f64
+            };
+            lloom_tensor::kernels::set_qmv_rows(true);
+            assert_eq!(
+                lloom_tensor::kernels::mv_rows_capacity(dtype.into(), 2, false),
+                2,
+                "{dtype:?}: the axis arm is not on `_r2`"
+            );
+            let mut arms: [Vec<f64>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+            for _ in 0..reps {
+                arms[0].push(run(false));
+                arms[1].push(run(true));
+                arms[2].push(run(false));
+            }
+            let (a, b, c) = (med(&mut arms[0]), med(&mut arms[1]), med(&mut arms[2]));
+            println!(
+                "| {regime} | {label} | {dtype:?} | [{n} x {k}] | {count} | {a:.4} | {b:.4} | {c:.4} | {:.3} | {:.3} |",
+                b / ((a + c) / 2.0),
+                c / a
+            );
+            let s = sums.entry(regime).or_insert([0.0; 3]);
+            s[0] += a * count as f64;
+            s[1] += b * count as f64;
+            s[2] += c * count as f64;
+        }
+    }
+    for (regime, s) in sums {
+        println!(
+            "SUM {regime}: per-row {:.3} ms, axis {:.3} ms, null {:.3} ms per token's window projections; axis/bracket {:.3}",
+            s[0],
+            s[1],
+            s[2],
+            s[1] / ((s[0] + s[2]) / 2.0)
+        );
+    }
+    lloom_tensor::kernels::set_qmv_rows(true);
+}
+
 /// The routed matmul-vec on the row axis, per kind: `batch` rows at top-8
 /// over 64 experts of `[512 × 2048]` (Qwen3.6-35B-A3B's gate/up expert),
 /// the ids from a fixed LCG (rows share a slot where the draw repeats, as a

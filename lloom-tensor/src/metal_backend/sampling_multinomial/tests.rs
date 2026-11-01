@@ -1943,3 +1943,146 @@ fn diag_wide_rows_with_top_k_and_top_p() -> Result<()> {
     }
     Ok(())
 }
+
+/// The draw stage repeated from one selection, as the microbench times it:
+/// every repeat must read the selection's compact set, not the previous
+/// draw's appends on top of it. Production never repeats a draw (each
+/// `sampling_multinomial` / `PreparedSampler::draw` encodes the selection
+/// immediately before its draw, and the selection's scan stage resets the
+/// counters), so this pins the draw's own reset for the bench and for any
+/// caller that reuses a selection.
+#[test]
+fn a_draw_repeated_from_one_selection_starts_clean() -> Result<()> {
+    use crate::kernels::kernels::sampling_topk::{
+        call_sampling_multinomial, call_sampling_select, sampling_work_words,
+    };
+    let d = device()?;
+    let m = d.as_metal_device()?;
+    let rows = 2usize;
+    for (vocab, k, p, t) in [
+        (128_000usize, 20usize, 0.95f64, 1.0f64),
+        (128_000, 50, 1.0, 0.1),
+        (4_096, 6, 0.9, 0.7),
+    ] {
+        let z = super::timing_tests::logits(vocab, rows);
+        let uniforms = [0.37f32, 0.76];
+        let params = Params::new(t, k, p);
+        let input = Tensor::from_vec(z.clone(), (rows, vocab), &d)?;
+        let u = Tensor::from_vec(uniforms.to_vec(), rows, &d)?;
+        let (zs, _) = input.storage_and_layout();
+        let (us, _) = u.storage_and_layout();
+        let (Storage::Metal(zs), Storage::Metal(us)) = (&*zs, &*us) else {
+            unreachable!()
+        };
+        let alloc = |count: usize, dtype, label| -> Result<MetalStorage> {
+            let b = m
+                .new_buffer_builder()
+                .with_size_for(count, dtype)
+                .with_label(label)
+                .build()?;
+            MetalStorage::new_allocated(b, m.clone(), count, dtype)
+        };
+        let work = alloc(
+            sampling_work_words(rows, vocab).unwrap(),
+            DType::U32,
+            "redraw_work",
+        )?;
+        let scratch = alloc(rows * vocab, DType::U32, "redraw_scratch")?;
+        let selection = alloc(rows * 4, DType::U32, "redraw_selection")?;
+        let weights = alloc(rows * vocab, DType::F32, "redraw_weights")?;
+        let support = alloc(rows * vocab, DType::U32, "redraw_support")?;
+        let ids = alloc(rows, DType::U32, "redraw_ids")?;
+        let status = alloc(rows * 4, DType::U32, "redraw_status")?;
+        {
+            let encoder = m.command_encoder()?;
+            // SAFETY: sized, disjoint, live storage owned by this test.
+            unsafe {
+                call_sampling_select(
+                    m.metal_device(),
+                    &encoder,
+                    m.kernels(),
+                    (zs.buffer(), 0),
+                    rows as u32,
+                    vocab as u32,
+                    k as u32,
+                    u32::from(p != 1.0),
+                    work.buffer(),
+                    scratch.buffer(),
+                    selection.buffer(),
+                )
+            }
+            .map_err(crate::Error::wrap)?;
+        }
+        m.wait_until_completed()?;
+        let want: Vec<(u32, Vec<u32>, Vec<u32>)> = (0..rows)
+            .map(|row| {
+                let zr = &z[row * vocab..(row + 1) * vocab];
+                let kept = oracle::kept_ids(zr, params).unwrap();
+                let mut mask = vec![0u32; vocab];
+                for &id in &kept {
+                    mask[id as usize] = 1;
+                }
+                (
+                    oracle::draw(zr, params, uniforms[row]).unwrap(),
+                    mask,
+                    vec![0, u32::MAX, vocab as u32, kept.len() as u32],
+                )
+            })
+            .collect();
+        // Past `SAMPLING_CAP / |K|` repeats an accumulating count would
+        // overflow the compact set and route the draw to its exact slow
+        // paths, so the repeats stay inside that window, where the defect
+        // is a wrong answer rather than a slow one.
+        for redraw in 0..8 {
+            {
+                let encoder = m.command_encoder()?;
+                // SAFETY: as above; the selection is these rows'.
+                unsafe {
+                    call_sampling_multinomial(
+                        m.metal_device(),
+                        &encoder,
+                        m.kernels(),
+                        (zs.buffer(), 0),
+                        rows as u32,
+                        vocab as u32,
+                        (1.0 / t) as f32,
+                        p as f32,
+                        u32::from(p != 1.0),
+                        (us.buffer(), 0),
+                        work.buffer(),
+                        scratch.buffer(),
+                        weights.buffer(),
+                        support.buffer(),
+                        ids.buffer(),
+                        status.buffer(),
+                    )
+                }
+                .map_err(crate::Error::wrap)?;
+            }
+            m.wait_until_completed()?;
+            let (got_ids, got_support, got_status) = (
+                ids.to_cpu::<u32>()?,
+                support.to_cpu::<u32>()?,
+                status.to_cpu::<u32>()?,
+            );
+            for row in 0..rows {
+                let (id, mask, st) = &want[row];
+                assert_eq!(
+                    (got_ids[row], &got_status[row * 4..row * 4 + 4]),
+                    (*id, &st[..]),
+                    "vocab {vocab} k {k} p {p} redraw {redraw} row {row}"
+                );
+                assert_eq!(
+                    &got_support[row * vocab..(row + 1) * vocab],
+                    &mask[..],
+                    "vocab {vocab} k {k} p {p} redraw {redraw} row {row}: mask"
+                );
+            }
+            println!(
+                "REDRAW vocab={vocab} k={k} p={p} redraw={redraw} ids={got_ids:?} counts={:?}",
+                (0..rows).map(|r| got_status[r * 4 + 3]).collect::<Vec<_>>()
+            );
+        }
+    }
+    Ok(())
+}

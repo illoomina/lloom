@@ -193,7 +193,7 @@ pub(super) fn logits(vocab: usize, rows: usize) -> Vec<f32> {
     z
 }
 
-fn variates(vocab: usize, rows: usize) -> Vec<f32> {
+pub(super) fn variates(vocab: usize, rows: usize) -> Vec<f32> {
     let mut rng = Lcg(0x6b5);
     (0..vocab * rows)
         .map(|_| {
@@ -249,9 +249,11 @@ fn stages() -> bool {
     std::env::var_os("SAMPLER_TIMING_STAGES").is_some()
 }
 
-/// Each stage's GPU microseconds over `reps` runs of `encode`, from the
-/// per-encoder counter samples: `(label, min, p50, max)` in label order of
-/// first appearance.
+/// Each sampled encoder's GPU microseconds over `reps` runs of `encode`, from
+/// the counter samples: `(label:dispatches, min, p50, max)` in order of first
+/// appearance, the label its first dispatch's. The per-dispatch cut acts when
+/// an encoder is acquired, and a pipeline's stages share the one its entry
+/// acquired, so an encoder here holds a whole pipeline's dispatches.
 fn stage_breakdown(
     m: &MetalDevice,
     encode: impl Fn() -> Result<()>,
@@ -277,6 +279,7 @@ fn stage_breakdown(
         for r in records {
             let label = r.label.as_deref().unwrap_or("<unlabelled>").to_string();
             let us = (r.end - r.start) * 1e6;
+            let label = format!("{label}:{}", r.dispatches);
             match by_label.iter_mut().find(|(l, _)| *l == label) {
                 Some((_, v)) => v.push(us),
                 None => by_label.push((label, vec![us])),

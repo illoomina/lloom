@@ -200,6 +200,7 @@ pub(crate) unsafe fn call_sampling_select(
 /// # Safety
 /// As [`call_sampling_select`], on the same `scores` and `work`; `mask`
 /// covers `rows * vocab` u32 values.
+#[allow(clippy::too_many_arguments, reason = "private kernel ABI")]
 pub(crate) unsafe fn call_sampling_select_mask(
     device: &Device,
     ep: impl EncoderProvider,

@@ -4564,6 +4564,22 @@ impl<'a> ReadyBufferBuilder<'a> {
 mod tests {
     use super::*;
 
+    impl MetalDevice {
+        // Test-only permission bridge for the genuine default-native fixture.
+        // The reservation and context never become a production accessor.
+        pub(crate) fn with_default_native_context_for_test(
+            &self,
+            run: impl FnOnce(&crate::memory_admission::AllocationContext) -> Result<()>,
+        ) -> Result<()> {
+            if self.allocation_namespace.domain.is_some() {
+                crate::bail!("default-native fixture requires the default namespace")
+            }
+            let permission = self.allocation_namespace.native_domain.reserve(0)?;
+            let context = permission.context();
+            run(&context)
+        }
+    }
+
     #[test]
     fn cached_constants_preserve_identity_and_initialized_bytes() -> Result<()> {
         let device = crate::Device::new_metal(0)?;

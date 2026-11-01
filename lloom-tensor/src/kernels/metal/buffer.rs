@@ -762,38 +762,36 @@ mod native_extent_tests {
     fn actual_prepared_factory_preserves_primary_external_and_view_extents() -> crate::Result<()> {
         let device = crate::Device::new_metal(0)?;
         let metal = device.as_metal_device()?;
-        let permission = metal.allocation_namespace.native_domain.reserve(0)?;
-        let context = permission.context();
-        // SAFETY: existing cold factory owns its normal default metadata/native
-        // payer. This fixture reads only ownership/extent metadata: no data,
-        // command encoding, raw SDK reference or escaped capability exists.
-        let slot = unsafe { metal.new_prepared_buffer_in(256, None) }?;
-        let capacity = slot.capacity();
-        // SAFETY: authentic same-domain permission; no output bytes are read,
-        // no native work can escape, and every clone/view closes below before
-        // the existing slot/namespace cleanup. No fake enrollment is performed.
-        let handle = unsafe { slot.try_checkout(&context, metal.commands()) }
-            .map_err(|e| crate::Error::Msg(format!("rich extent checkout: {e:?}")))?;
-        let primary: &Buffer = handle.as_ref();
-        assert!(matches!(&primary.role, BufferRole::Primary(_)));
-        assert!(capacity >= 256);
-        assert_eq!(primary.length(), capacity);
-        assert_eq!(primary.length(), primary.native_allocation_length());
-        let external = primary.try_clone()?;
-        assert!(matches!(&external.role, BufferRole::External(_)));
-        assert_eq!(external.length(), capacity);
-        let view = external.view(32, 128);
-        let nested = view.view(16, 32);
-        assert_eq!((view.base_offset(), view.length()), (32, 128));
-        assert_eq!((nested.base_offset(), nested.length()), (48, 32));
-        assert_eq!(nested.native_allocation_length(), capacity);
-        drop(nested);
-        drop(view);
-        drop(external);
-        drop(handle);
-        drop(slot);
-        drop(context);
-        drop(permission);
-        Ok(())
+        metal.with_default_native_context_for_test(|context| {
+            // SAFETY: existing cold factory owns its normal default metadata/native
+            // payer. This fixture reads only ownership/extent metadata: no data,
+            // command encoding, raw SDK reference or escaped capability exists.
+            let slot = unsafe { metal.new_prepared_buffer_in(256, None) }?;
+            let capacity = slot.capacity();
+            // SAFETY: authentic same-domain permission; no output bytes are read,
+            // no native work can escape, and every clone/view closes below before
+            // the existing slot/namespace cleanup. No fake enrollment is performed.
+            let handle = unsafe { slot.try_checkout(context, metal.commands()) }
+                .map_err(|e| crate::Error::Msg(format!("rich extent checkout: {e:?}")))?;
+            let primary: &Buffer = handle.as_ref();
+            assert!(matches!(&primary.role, BufferRole::Primary(_)));
+            assert!(capacity >= 256);
+            assert_eq!(primary.length(), capacity);
+            assert_eq!(primary.length(), primary.native_allocation_length());
+            let external = primary.try_clone()?;
+            assert!(matches!(&external.role, BufferRole::External(_)));
+            assert_eq!(external.length(), capacity);
+            let view = external.view(32, 128);
+            let nested = view.view(16, 32);
+            assert_eq!((view.base_offset(), view.length()), (32, 128));
+            assert_eq!((nested.base_offset(), nested.length()), (48, 32));
+            assert_eq!(nested.native_allocation_length(), capacity);
+            drop(nested);
+            drop(view);
+            drop(external);
+            drop(handle);
+            drop(slot);
+            Ok(())
+        })
     }
 }

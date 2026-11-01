@@ -47,6 +47,22 @@ fn fill(n: usize, seed: usize) -> Vec<f32> {
         .collect()
 }
 
+/// Fixture identity must observe the installed queue, not infer it from env.
+fn padded_fixture_device() -> Result<Device> {
+    let device = Device::new_metal(0)?;
+    let actual = device.as_metal_device()?.commands().actual_command_api();
+    if let Ok(requested) = std::env::var("LLOOM_METAL_API") {
+        if matches!(requested.as_str(), "metal3" | "metal4") {
+            assert_eq!(
+                actual, requested,
+                "padded fixture installed the wrong command API"
+            );
+        }
+    }
+    eprintln!("PADDED_KV_FIXTURE actual_api={actual}");
+    Ok(device)
+}
+
 /// Every batch row must reproduce the `B = 1` answer.
 ///
 /// The rows carry identical queries against identical KV, so the correct output
@@ -139,7 +155,7 @@ fn flash_decoding_writes_every_batch_row() -> Result<()> {
 /// with the same values packed contiguously instead of forbidding valid views.
 #[test]
 fn flash_decoding_padded_kv_batch_stride_matches_original_packed_fixture() -> Result<()> {
-    let device = Device::new_metal(0)?;
+    let device = padded_fixture_device()?;
     const H: usize = 8;
     const H_KV: usize = 2;
     const D: usize = 64;
@@ -181,7 +197,7 @@ fn flash_decoding_padded_kv_batch_stride_matches_original_packed_fixture() -> Re
 #[test]
 fn flash_decoding_padded_batch_and_independent_value_strides_match_packed_bits() -> Result<()> {
     use lloom::nn::ops::{flash_decoding, FlashScratchSizing};
-    let device = Device::new_metal(0)?;
+    let device = padded_fixture_device()?;
     const B: usize = 2;
     const H: usize = 8;
     const H_KV: usize = 2;

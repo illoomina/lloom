@@ -1265,4 +1265,166 @@ mod flash_validation_tests {
         drop((table_base, keys_base, keys_two));
         Ok(())
     }
+    /// Direct safe frontdoors must use authentic view-relative backing bytes,
+    /// not a caller's larger logical count or PooledBuffer size. Creator buffers
+    /// remain alive, and rejected short views never reach native encoding.
+    #[cfg(feature = "metal")]
+    fn native_qkv_backing_refusal_control(which: usize) -> Result<()> {
+        use lloom_tensor::kernels::metal::{BufferHandle, PooledBuffer};
+        use lloom_tensor::{op::BackpropOp, MetalStorage, Storage};
+        let device = Device::new_metal(0)?;
+        let metal = device.as_metal_device()?;
+        let name = ["Q", "K", "V"][which];
+        let control = ["short-q-backing", "short-k-backing", "short-v-backing"][which];
+        assert_native_fixture_arm(metal, control);
+        const D: usize = 64;
+        const KEYS: usize = 2;
+        const SKIP: usize = 8;
+        const BASE_BYTES: usize = 16;
+        let metadata =
+            FlashDecodingMetadata::new(vec![0], 1, vec![KEYS as u32], 1, 32, 1, &device)?;
+        let lookups = || {
+            let (shared, private) = metal.pool_counters();
+            (shared.lookups, private.lookups)
+        };
+        for dtype in [DType::F16, DType::F32] {
+            let width = dtype.size_in_bytes();
+            let value_start = BASE_BYTES / width + SKIP;
+            let q_base = Tensor::zeros(128, DType::F32, &device)?.to_dtype(dtype)?;
+            let k_base = Tensor::zeros(256, DType::F32, &device)?.to_dtype(dtype)?;
+            let mut values = vec![-7f32; 256];
+            values[value_start..value_start + D].fill(1.);
+            values[value_start + D..value_start + KEYS * D].fill(3.);
+            let v_base = Tensor::new(values.as_slice(), &device)?.to_dtype(dtype)?;
+            // This fixture tests bounds, not queued initializer/read aliasing.
+            // Complete legitimate F16 casts before creating the bounded views.
+            metal.flush_and_wait_current()?;
+            let bases = [&q_base, &k_base, &v_base];
+            let shapes = [[1, 1, 1, D], [1, 1, KEYS, D], [1, 1, KEYS, D]];
+            let view = |base: &Tensor, shape: [usize; 4], short: bool| -> Result<Tensor> {
+                let used: usize = shape.iter().product();
+                let declared = SKIP + used;
+                let bytes = (declared - usize::from(short)) * width;
+                let (storage, _) = base.storage_and_layout();
+                let Storage::Metal(storage) = &*storage else {
+                    unreachable!("native fixture creator")
+                };
+                let native = storage.buffer().view(BASE_BYTES, bytes);
+                // Deliberately retain the declared capacity in the outer
+                // wrapper; only the genuine Buffer view is one element short.
+                let handle = BufferHandle::new(PooledBuffer::unpooled(native, declared * width));
+                let tensor = Tensor::from_storage(
+                    Storage::Metal(MetalStorage::new(handle, metal.clone(), declared, dtype)),
+                    declared,
+                    BackpropOp::none(),
+                    false,
+                );
+                tensor.narrow(0, SKIP, used)?.reshape(&shape)
+            };
+            let q = view(bases[0], shapes[0], false)?;
+            let k = view(bases[1], shapes[1], false)?;
+            let v = view(bases[2], shapes[2], false)?;
+            let short = view(bases[which], shapes[which], true)?;
+            let mut inputs = [&q, &k, &v];
+            inputs[which] = &short;
+            for paged in [false, true] {
+                let call = |q: &Tensor, k: &Tensor, v: &Tensor| -> Result<Tensor> {
+                    if paged {
+                        flash_decoding_paged_metadata(
+                            q,
+                            k,
+                            v,
+                            1.,
+                            1.,
+                            FlashScratchSizing::Grow,
+                            0,
+                            &metadata,
+                        )
+                    } else {
+                        super::super::flash_decoding(
+                            q,
+                            k,
+                            v,
+                            1.,
+                            1.,
+                            32,
+                            1,
+                            FlashScratchSizing::Grow,
+                            0,
+                        )
+                    }
+                };
+                let before = lookups();
+                let census = metal.dispatch_census().open().map_err(|e| {
+                    lloom_tensor::Error::Msg(format!("Q/K/V refusal census unavailable: {e:?}"))
+                })?;
+                let error = call(inputs[0], inputs[1], inputs[2])
+                    .unwrap_err()
+                    .to_string();
+                assert!(
+                    error.contains(&format!("{name} read span exceeds native buffer view")),
+                    "dtype={dtype:?},paged={paged}: {error}"
+                );
+                assert_eq!(
+                    lookups(), before,
+                    "{name} backing refusal visited an output/scratch pool: dtype={dtype:?},paged={paged}"
+                );
+                assert!(
+                    census.close().is_empty(),
+                    "{name} backing refusal encoded a dispatch: dtype={dtype:?},paged={paged}"
+                );
+
+                let before = lookups();
+                let census = metal.dispatch_census().open().map_err(|e| {
+                    lloom_tensor::Error::Msg(format!("Q/K/V valid census unavailable: {e:?}"))
+                })?;
+                let output = call(&q, &k, &v)?;
+                let dispatches = census.close();
+                let after = lookups();
+                assert!(
+                    after.0 > before.0 || after.1 > before.1,
+                    "{name} valid allocation instrument not engaged"
+                );
+                assert!(
+                    dispatches.iter().any(|(_, n)| *n > 0),
+                    "{name} valid dispatch instrument not engaged"
+                );
+                let actual: Vec<f32> = match dtype {
+                    DType::F16 => output
+                        .flatten_all()?
+                        .to_vec1::<half::f16>()?
+                        .into_iter()
+                        .map(half::f16::to_f32)
+                        .collect(),
+                    DType::F32 => output.flatten_all()?.to_vec1::<f32>()?,
+                    _ => unreachable!(),
+                };
+                assert_eq!(actual, vec![2.; D], "{name} dtype={dtype:?},paged={paged}");
+                assert_eq!(q.layout().start_offset(), SKIP);
+                assert_eq!(k.layout().start_offset(), SKIP);
+                assert_eq!(v.layout().start_offset(), SKIP);
+            }
+            // Every valid output readback has completed before these genuine
+            // creators and their temporary bounded views leave scope.
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn native_q_backing_refuses_before_builders_with_valid_counter_control() -> Result<()> {
+        native_qkv_backing_refusal_control(0)
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn native_k_backing_refuses_before_builders_with_valid_counter_control() -> Result<()> {
+        native_qkv_backing_refusal_control(1)
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn native_v_backing_refuses_before_builders_with_valid_counter_control() -> Result<()> {
+        native_qkv_backing_refusal_control(2)
+    }
 }

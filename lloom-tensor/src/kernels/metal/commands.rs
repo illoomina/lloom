@@ -232,6 +232,22 @@ impl<'a> AsMut<BlitCommandEncoder> for BlitCommandsGuard<'a> {
 }
 
 impl BlitCommandsGuard<'_> {
+    /// The exact recording this blit encodes into, pinned while the guard
+    /// excludes a cut: the blit twin of [`CommandsGuard::recording_marker`].
+    pub(crate) fn recording_marker(&self) -> Result<CommandMarker, MetalKernelError> {
+        let cb = self
+            ._guard
+            .current
+            .recording()
+            .ok_or(MetalKernelError::QueueUnavailable(
+                "a blit marker requires a recording",
+            ))?;
+        Ok(CommandMarker {
+            cb: cb.clone(),
+            signalled: None,
+        })
+    }
+
     pub(crate) fn retain_namespace(
         &mut self,
         owner: crate::metal_backend::device_retirement::NamespaceOwner,
@@ -371,6 +387,12 @@ impl CommandMarker {
     /// Whether the marker's buffer has completed (successfully or not).
     pub fn is_complete(&self) -> bool {
         self.cb.status().0 >= MTLCommandBufferStatus::Completed.0
+    }
+
+    /// Whether the marker's buffer has been handed to the queue: committed,
+    /// running, or finished. False for a recording still open or held.
+    pub fn is_submitted(&self) -> bool {
+        self.cb.status().0 >= MTLCommandBufferStatus::Committed.0
     }
 
     /// Nonblocking known-error observation; false also includes pending work.

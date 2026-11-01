@@ -316,10 +316,20 @@ pub(super) struct Owed {
 }
 
 impl Owed {
+    /// The most epochs owed at once: a commit's hook runs, `1 + count`, are
+    /// a `u32`. Past it a cancellation is refused and the queue fails.
+    pub(super) const MAX_OWED: u32 = u32::MAX - 1;
+
     /// A held recording that took `epoch` was cancelled before its commit.
-    pub(super) fn cancel(&mut self, epoch: Epoch) {
+    pub(super) fn cancel(&mut self, epoch: Epoch) -> Result<(), MetalKernelError> {
         debug_assert!(epoch.0 >= self.flagged, "a flagged epoch was cancelled");
+        if self.count >= Self::MAX_OWED {
+            return Err(MetalKernelError::QueueUnavailable(
+                "owed epoch bound reached",
+            ));
+        }
         self.count += 1;
+        Ok(())
     }
 
     /// The hook runs a commit carries. With no other recording live and
@@ -344,10 +354,13 @@ impl Owed {
     }
 
     /// A commit carrying `runs` (from [`Self::runs_for`]) was submitted.
+    /// Saturating either way: an inconsistent settle can only leave epochs
+    /// owed or the frontier low, which marks later, never early.
     pub(super) fn settle(&mut self, runs: u32) {
-        debug_assert!(runs >= 1 && runs - 1 <= self.count);
-        self.count -= runs - 1;
-        self.flagged += u64::from(runs);
+        let paid = runs.saturating_sub(1);
+        debug_assert!(runs >= 1 && paid <= self.count);
+        self.count = self.count.saturating_sub(paid);
+        self.flagged = self.flagged.saturating_add(u64::from(runs));
     }
 
     #[cfg(test)]
@@ -904,7 +917,9 @@ impl CommandsCore {
                 if let Err(error) = held.cb.cancel_unsubmitted() {
                     refused.get_or_insert(error);
                 }
-                entry.owed_epochs.cancel(held.epoch);
+                if let Err(error) = entry.owed_epochs.cancel(held.epoch) {
+                    refused.get_or_insert(error);
+                }
                 let mut after = held.after;
                 for action in after.drain(..) {
                     match action {
@@ -1084,7 +1099,9 @@ impl CommandsCore {
             if let Err(error) = held.cb.cancel_unsubmitted() {
                 refused.get_or_insert(error);
             }
-            state.owed_epochs.cancel(held.epoch);
+            if let Err(error) = state.owed_epochs.cancel(held.epoch) {
+                refused.get_or_insert(error);
+            }
             let mut after = held.after;
             for action in after.drain(..) {
                 match action {
@@ -1877,7 +1894,7 @@ mod owed_tests {
 
         fn cancel_from(&mut self, at: usize) {
             for epoch in self.held.drain(at..) {
-                self.owed.cancel(Epoch(epoch));
+                self.owed.cancel(Epoch(epoch)).unwrap();
                 self.cancelled.insert(epoch);
             }
         }
@@ -2040,6 +2057,45 @@ mod owed_tests {
         q.release();
         assert_eq!(q.marked_by(e0), vec![0, 1]);
         q.all_complete();
+    }
+
+    #[test]
+    fn the_owed_count_refuses_past_a_u32_of_hook_runs() {
+        let mut owed = Owed {
+            count: Owed::MAX_OWED - 1,
+            flagged: 7,
+        };
+        owed.cancel(Epoch(7)).unwrap();
+        assert_eq!(owed.count(), Owed::MAX_OWED);
+        assert!(owed.cancel(Epoch(8)).is_err(), "the bound did not refuse");
+        assert_eq!(
+            owed.count(),
+            Owed::MAX_OWED,
+            "a refused cancellation counted"
+        );
+        // The largest carry is representable.
+        assert_eq!(owed.runs_for(None, 0), u32::MAX);
+        assert_eq!(
+            owed.runs_for(Some(Epoch(7 + u64::from(u32::MAX) + 5)), 1),
+            u32::MAX
+        );
+        owed.settle(u32::MAX);
+        assert_eq!((owed.count(), owed.flagged()), (0, 7 + u64::from(u32::MAX)));
+    }
+
+    #[test]
+    fn the_frontier_saturates_and_then_carries_no_holes() {
+        let mut owed = Owed {
+            count: 3,
+            flagged: u64::MAX - 1,
+        };
+        owed.settle(1);
+        owed.settle(1);
+        assert_eq!((owed.count(), owed.flagged()), (3, u64::MAX));
+        // At its ceiling the frontier is above any front: no hole is carried,
+        // so nothing is marked ahead; the tail still carries what is owed.
+        assert_eq!(owed.runs_for(Some(Epoch(9)), 1), 1);
+        assert_eq!(owed.runs_for(Some(Epoch(9)), 0), 4);
     }
 
     #[test]

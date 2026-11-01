@@ -131,6 +131,9 @@ const fn kind(
 /// discriminant; a test pins the order). The last column is the row axis's
 /// ceilings, plain and routed (`rows_max`, `rows_max_routed`; the dense rows
 /// read 1 whatever it says), from `measurements/issue-942-rows-axis.md` §3.
+/// Q4_K/Q5_K/Q6_K's plain ceiling of 2 is set on the end-to-end evidence
+/// (Qwen3.6-27B + MTP ×1.09, `measurements/issue-942-core.md` §5) against
+/// their isolated kernel timings (§3, §3a), by decision 106; `fast` only.
 #[rustfmt::skip]
 const KINDS: [QuantKind; 25] = [
     kind(GgmlDType::Q4_0,   "q4_0",    32,  18, MulMv::Quant("kernel_mul_mv_q4_0"),    Some("kernel_mul_mm_q4_0_f32"),    Some(("kernel_get_rows_q4_0", "kernel_get_rows_q4_0_guarded")),    false, (1, 1)),
@@ -141,9 +144,9 @@ const KINDS: [QuantKind; 25] = [
     kind(GgmlDType::Q8_1,   "q8_1",    32,  36, MulMv::None,                           None,                              None,                            false, (1, 1)),
     kind(GgmlDType::Q2K,    "q2_K",   256,  84, MulMv::Quant("kernel_mul_mv_q2_K"),    Some("kernel_mul_mm_q2_K_f32"),    Some(("kernel_get_rows_q2_K", "kernel_get_rows_q2_K_guarded")),    false, (8, 1)),
     kind(GgmlDType::Q3K,    "q3_K",   256, 110, MulMv::Quant("kernel_mul_mv_q3_K"),    Some("kernel_mul_mm_q3_K_f32"),    Some(("kernel_get_rows_q3_K", "kernel_get_rows_q3_K_guarded")),    false, (1, 1)),
-    kind(GgmlDType::Q4K,    "q4_K",   256, 144, MulMv::Quant("kernel_mul_mv_q4_K"),    Some("kernel_mul_mm_q4_K_f32"),    Some(("kernel_get_rows_q4_K", "kernel_get_rows_q4_K_guarded")),    false, (1, 1)),
-    kind(GgmlDType::Q5K,    "q5_K",   256, 176, MulMv::Quant("kernel_mul_mv_q5_K"),    Some("kernel_mul_mm_q5_K_f32"),    Some(("kernel_get_rows_q5_K", "kernel_get_rows_q5_K_guarded")),    false, (1, 1)),
-    kind(GgmlDType::Q6K,    "q6_K",   256, 210, MulMv::Quant("kernel_mul_mv_q6_K"),    Some("kernel_mul_mm_q6_K_f32"),    Some(("kernel_get_rows_q6_K", "kernel_get_rows_q6_K_guarded")),    false, (1, 1)),
+    kind(GgmlDType::Q4K,    "q4_K",   256, 144, MulMv::Quant("kernel_mul_mv_q4_K"),    Some("kernel_mul_mm_q4_K_f32"),    Some(("kernel_get_rows_q4_K", "kernel_get_rows_q4_K_guarded")),    false, (2, 1)),
+    kind(GgmlDType::Q5K,    "q5_K",   256, 176, MulMv::Quant("kernel_mul_mv_q5_K"),    Some("kernel_mul_mm_q5_K_f32"),    Some(("kernel_get_rows_q5_K", "kernel_get_rows_q5_K_guarded")),    false, (2, 1)),
+    kind(GgmlDType::Q6K,    "q6_K",   256, 210, MulMv::Quant("kernel_mul_mv_q6_K"),    Some("kernel_mul_mm_q6_K_f32"),    Some(("kernel_get_rows_q6_K", "kernel_get_rows_q6_K_guarded")),    false, (2, 1)),
     kind(GgmlDType::Q8K,    "q8_K",   256, 292, MulMv::None,                           None,                              None,                            false, (1, 1)),
     kind(GgmlDType::F16,    "f16",      1,   2, MulMv::Dense("kernel_mul_mv_f16_f32"), Some("kernel_mul_mm_f16_f32"),     Some(("kernel_get_rows_f16", "kernel_get_rows_f16_guarded")),     false, (1, 1)),
     kind(GgmlDType::F32,    "f32",      1,   4, MulMv::Dense("kernel_mul_mv_f32_f32"), Some("kernel_mul_mm_f32_f32"),     Some(("kernel_get_rows_f32", "kernel_get_rows_f32_guarded")),     false, (1, 1)),

@@ -72,10 +72,10 @@ fn every_cell_resolves_as_tabled() {
     check(GgmlDType::Q4K, DType::F16, 1, true, 2, 2560, p, Mv(H, 1));
     check(GgmlDType::Q4K, DType::F16, 512, true, 2, 2560, p, Mv(H, 1));
     check(GgmlDType::Q8_0, DType::F16, 1, true, 2, 2048, p, Mv(H, 1));
-    check(GgmlDType::Q6K, DType::F32, 4, false, 2, 5120, p, Mv(F, 1));
+    check(GgmlDType::Q6K, DType::F32, 4, false, 2, 5120, p, Mv(F, 2));
     // The matmul-vec's last row and the GEMM's first, at both triples.
-    check(GgmlDType::Q4K, DType::F32, 8, false, 2, 2560, p, Mv(F, 1));
-    check(GgmlDType::Q4K, DType::F16, 8, false, 2, 2560, p, Mv(H, 1));
+    check(GgmlDType::Q4K, DType::F32, 8, false, 2, 2560, p, Mv(F, 2));
+    check(GgmlDType::Q4K, DType::F16, 8, false, 2, 2560, p, Mv(H, 2));
     check(GgmlDType::Q4K, DType::F32, 9, false, 2, 2560, p, Gemm(F));
     check(GgmlDType::Q4K, DType::F16, 9, false, 2, 2560, p, Gemm(H));
     check(GgmlDType::Q4K, DType::F32, 63, false, 2, 2560, p, Gemm(F));
@@ -424,7 +424,7 @@ fn the_row_capacity_resolves_as_tabled() {
     check(GgmlDType::Q8_0, DType::F32, 2, false, 2, 2048, p, Mv(F, 2));
     check(GgmlDType::Q8_0, DType::F16, 6, false, 2, 2048, p, Mv(H, 2));
     check(GgmlDType::Q4K, DType::F32, 2, true, 2, 2560, p, Mv(F, 1));
-    check(GgmlDType::Q5K, DType::F16, 8, false, 2, 5120, p, Mv(H, 1));
+    check(GgmlDType::Q5K, DType::F16, 8, false, 2, 5120, p, Mv(H, 2));
     check(GgmlDType::IQ4XS, DType::F32, 4, false, 2, 4096, p, Mv(F, 1));
     let off = Policy {
         rows: RowsPolicy::Fixed {

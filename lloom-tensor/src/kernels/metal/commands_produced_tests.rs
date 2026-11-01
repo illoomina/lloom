@@ -2522,8 +2522,9 @@ fn teardown_after_a_cancelled_tail_completes_every_epoch() {
         e2.0
     );
     assert!(retired);
-    // H0, H1, the final marker; H2's epoch owed and completed with H1.
-    assert_eq!(clock.current_epoch().0, e2.0 + 2);
+    // H0, H1; H2's epoch owed and completed with H1. The abandoned final
+    // opens no epoch of its own (decision 99).
+    assert_eq!(clock.current_epoch().0, e2.0 + 1);
     assert_eq!(clock.completed_count().0, clock.current_epoch().0);
     assert!(computed(&dst));
     drop((native, src, dst, gate, progress, a, b, c));

@@ -3470,6 +3470,9 @@ impl lifecycle::FinalCore for CommandsCore {
             // A cancellation took the current recording: nothing is submitted.
             // What is owed completes by accounting once every earlier record
             // has retired (`CompletionHook::abandon`); terminality waits for it.
+            if self.hook.abandonment_published() {
+                return Ok(true);
+            }
             let hook = &self.hook;
             state
                 .owed_epochs
@@ -4905,11 +4908,12 @@ mod final_marker_tests {
     }
 
     /// A final owner whose current recording a cancellation took, on a
-    /// bound queue (the production device's): while no Metal 4 slot is free
-    /// it is pending, with its binding credit, its epoch and its native
-    /// calls untouched; once one is, it submits one empty marker.
+    /// bound queue (the production device's): it completes at once, taking
+    /// no slot, spending or refilling no binding credit, opening no epoch and
+    /// making no native call, and reaches terminality (decision 99). A
+    /// second poll, as the device's own teardown makes, publishes nothing.
     #[test]
-    fn final_marker_is_pending_without_a_free_slot_and_keeps_its_credit() {
+    fn final_abandonment_takes_no_slot_credit_epoch_or_native_call() {
         let device = crate::MetalDevice::new(0).unwrap();
         let commands = device.commands();
         if commands.host_input_arm() == HostInputArm::GpuWait {
@@ -4929,27 +4933,22 @@ mod final_marker_tests {
             .submission_control
             .native_calls
             .load(Ordering::Acquire);
+        let slots = commands.core.modern_queue.as_ref().map(|queue| {
+            queue.created.load(Ordering::Acquire) + queue.reused.load(Ordering::Acquire)
+        });
         let mut captures = lifecycle::FinalCaptures::default();
-        commands.core.deny_final_slot.store(true, Ordering::Release);
-        let busy = commands.core.poll_final_submission(&mut captures).unwrap();
-        let busy_credits = credits(commands);
-        let busy_epoch = commands.clock().current_epoch().0;
-        let busy_calls = commands
-            .core
-            .submission_control
-            .native_calls
-            .load(Ordering::Acquire);
-        let still_abandoned = commands.core.state.lock(Side::Host).current_abandoned;
-        commands
-            .core
-            .deny_final_slot
-            .store(false, Ordering::Release);
         let submitted = commands.core.poll_final_submission(&mut captures).unwrap();
+        let after_credits = credits(commands);
+        let after_epoch = commands.clock().current_epoch().0;
         let after_calls = commands
             .core
             .submission_control
             .native_calls
             .load(Ordering::Acquire);
+        let after_slots = commands.core.modern_queue.as_ref().map(|queue| {
+            queue.created.load(Ordering::Acquire) + queue.reused.load(Ordering::Acquire)
+        });
+        let still_abandoned = commands.core.state.lock(Side::Host).current_abandoned;
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         let mut terminal = false;
         while std::time::Instant::now() < deadline {
@@ -4959,28 +4958,23 @@ mod final_marker_tests {
             }
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
+        let again = commands.core.poll_final_submission(&mut captures).unwrap();
         eprintln!(
-            "FINAL_MARKER_BUSY api={} busy={busy} credits={held_credits}->{busy_credits} epoch={epoch}->{busy_epoch} calls={calls}->{busy_calls}->{after_calls} submitted={submitted} terminal={terminal}",
+            "FINAL_ABANDONMENT_BOUND api={} submitted={submitted} credits={held_credits}->{after_credits} epoch={epoch}->{after_epoch} calls={calls}->{after_calls} acquisitions={slots:?}->{after_slots:?} abandoned={still_abandoned} terminal={terminal} again={again}",
             commands.actual_command_api()
         );
-        assert!(!busy, "FINAL_MARKER_WITHOUT_SLOT_IS_PENDING");
-        assert!(still_abandoned, "FINAL_MARKER_PENDING_REPLACES_NOTHING");
+        assert!(submitted, "FINAL_ABANDONMENT_IS_NEVER_PENDING_FOR_A_SLOT");
+        assert!(still_abandoned, "FINAL_ABANDONMENT_REPLACES_NOTHING");
         assert_eq!(
-            busy_credits, held_credits,
-            "FINAL_MARKER_PENDING_KEEPS_ITS_CREDIT"
+            after_credits, held_credits,
+            "FINAL_ABANDONMENT_KEEPS_ITS_CREDIT"
         );
-        assert_eq!(
-            (busy_epoch, busy_calls),
-            (epoch, calls),
-            "FINAL_MARKER_PENDING_TAKES_NO_EPOCH_OR_NATIVE_CALL"
-        );
-        assert!(submitted, "FINAL_MARKER_SUBMITTED_ONCE_A_SLOT_IS_FREE");
-        assert_eq!(
-            after_calls,
-            calls + 1,
-            "FINAL_MARKER_IS_ONE_NATIVE_SUBMISSION"
-        );
-        assert!(terminal, "FINAL_MARKER_REACHES_TERMINALITY");
+        assert_eq!(after_epoch, epoch, "FINAL_ABANDONMENT_OPENS_NO_EPOCH");
+        assert_eq!(after_calls, calls, "FINAL_ABANDONMENT_MAKES_NO_NATIVE_CALL");
+        assert_eq!(after_slots, slots, "FINAL_ABANDONMENT_ACQUIRES_NO_SLOT");
+        assert!(terminal, "FINAL_ABANDONMENT_REACHES_TERMINALITY");
+        assert!(again, "FINAL_ABANDONMENT_POLLED_AGAIN_STAYS_SUBMITTED");
+        assert!(commands.check_failed().is_ok());
         drop(captures);
     }
 }

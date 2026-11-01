@@ -117,6 +117,11 @@ impl CompletionHook {
         Ok(())
     }
 
+    /// A final abandonment was published.
+    pub(super) fn abandonment_published(&self) -> bool {
+        self.abandoned.load(Ordering::Acquire)
+    }
+
     /// The published abandonment has settled: its epochs are marked and
     /// every record carrying a run below them has retired.
     pub(super) fn abandonment_settled(&self) -> bool {

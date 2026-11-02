@@ -9,6 +9,12 @@
 //! same read without the scratch, which allocates the cold rows' indices and
 //! bytes per call: a counter that reads 0 there is not counting.
 //!
+//! The hedged reads are not left to the host's read latency: one row of each
+//! hedged request is held on its read thread until the request's hedge has
+//! run (`hold_read_worker_row`), so the hedge always has a row to re-read.
+//! One row at a time, under each winner, the held row lands once: the hedge
+//! re-reads it, the winning read lands it, and the loser is not counted.
+//!
 //! With debug assertions on, objc2 checks every message send's signature
 //! against the runtime's (`objc2` `runtime/message_receiver.rs`,
 //! `msg_send_check`), and parsing a pointer type in it allocates: the slot's
@@ -19,7 +25,9 @@
 //! assertions are off.
 
 use lloom::nn::ngram_memory::{
-    read_worker_stats, MmapRows, NgramHash, ReadPolicy, ReadPool, ReadScratch, PER_LAYER_TOKEN_EMBD,
+    hold_read_worker_row, read_worker_hold_stats, read_worker_stats, settle_read_workers,
+    HeldWinner, HoldStats, MmapRows, NgramHash, ReadPolicy, ReadPool, ReadScratch,
+    PER_LAYER_TOKEN_EMBD,
 };
 use lloom_tensor::quantized::{gguf_file, GgmlDType, QStorage, QTensor};
 use lloom_tensor::{Device, Result};
@@ -55,6 +63,8 @@ fn allocs() -> u64 {
 const HEAD_DIM: usize = 160;
 const HEADS_PER_NGRAM: usize = 8;
 const HEAD_ROWS: i64 = 257;
+/// The row of each hedged request whose first read waits for the hedge.
+const HELD: usize = 5;
 
 /// Sixteen heads of 257 rows each: the checkpoint's shape (16 rows a token,
 /// IQ4_NL rows of 160) over a table small enough for a test.
@@ -131,8 +141,18 @@ fn the_host_fill_allocates_nothing_per_token() -> Result<()> {
     }
     let reads = allocs() - a0;
 
-    // Every row in flight hedged at once, on the 16 idle threads: the second
-    // reads allocate nothing either.
+    // Every row in flight hedged at once, on the idle threads: the second
+    // reads allocate nothing either. Row `HELD` waits for its request's
+    // hedge, and with the threads settled the first request's hedge finds
+    // the 16 it did not use idle, so it re-reads that row whatever the
+    // host's read latency.
+    let n = hash.n_heads() as u32;
+    assert_eq!(
+        settle_read_workers(),
+        Some(n),
+        "an unhedged request counted its rows other than once each"
+    );
+    assert!(hold_read_worker_row(Some((HELD, HeldWinner::Hedge))));
     t.set_hedge_us(1);
     let h0 = read_worker_stats().unwrap_or_default();
     let a0 = allocs();
@@ -141,6 +161,8 @@ fn the_host_fill_allocates_nothing_per_token() -> Result<()> {
     }
     let hedged_reads = allocs() - a0;
     let h1 = read_worker_stats().unwrap_or_default();
+    let held = read_worker_hold_stats().unwrap_or_default();
+    hold_read_worker_row(None);
     t.set_hedge_us(0);
 
     // The positive control: the same reads without the scratch.
@@ -160,7 +182,7 @@ fn the_host_fill_allocates_nothing_per_token() -> Result<()> {
     t.set_read_pool(ReadPool::Workers);
 
     println!(
-        "ALLOCS reads={reads} hedged={hedged_reads} (re-read {} rows, {} won) control={control} rayon={rayon} over {} tokens",
+        "ALLOCS reads={reads} hedged={hedged_reads} (re-read {} rows, {} won; {held:?}) control={control} rayon={rayon} over {} tokens",
         h1.hedged - h0.hedged,
         h1.hedge_wins - h0.hedge_wins,
         sets.len()
@@ -171,15 +193,92 @@ fn the_host_fill_allocates_nothing_per_token() -> Result<()> {
         sets.len()
     );
     assert_eq!(reads, 0, "the read threads' reads allocated");
+    assert_eq!(
+        held.gave_up,
+        0,
+        "a held read's hedge did not run within {:?}: {held:?}",
+        lloom::nn::ngram_memory::HOLD_BOUND
+    );
     assert!(
         h1.hedged > h0.hedged,
         "a 1 µs hedge re-read nothing: {h1:?}"
     );
+    assert!(
+        held.rehedged >= 1 && h1.hedge_wins > h0.hedge_wins,
+        "the held row was not re-read and landed by its hedge: {held:?}, {h1:?}"
+    );
     assert_eq!(hedged_reads, 0, "the hedged reads allocated");
+
+    a_held_row_lands_once(&t, &sets, &mut scratch)?;
 
     #[cfg(feature = "metal")]
     fill_on_metal(&path, &hash)?;
     std::fs::remove_file(&path).ok();
+    Ok(())
+}
+
+/// One row a request, its first read held, under each winner: the hedge
+/// re-reads it once, the winner lands it, and the loser writes nothing the
+/// caller reads and is not counted (the request's count is 1 once every
+/// read has finished). The reference is the row read through the map.
+fn a_held_row_lands_once(t: &MmapRows, sets: &[Vec<i64>], scratch: &mut ReadScratch) -> Result<()> {
+    let ids: Vec<i64> = sets.iter().take(4).map(|s| s[HELD]).collect();
+    let mut want = vec![0f32; HEAD_DIM];
+    let mut got = vec![0f32; HEAD_DIM];
+    t.set_hedge_us(1);
+    for winner in [HeldWinner::Hedge, HeldWinner::First] {
+        for &id in &ids {
+            t.set_read_policy(ReadPolicy::Serial);
+            t.gather_into(&[id], &mut want)?;
+            t.set_read_policy(ReadPolicy::Concurrent);
+            settle_read_workers();
+            assert!(hold_read_worker_row(Some((0, winner))));
+            let s0 = read_worker_stats().unwrap_or_default();
+            got.fill(f32::NAN);
+            t.gather_into_with(&[id], &mut got, scratch)?;
+            let done = settle_read_workers();
+            let s1 = read_worker_stats().unwrap_or_default();
+            let held = read_worker_hold_stats().unwrap_or_default();
+            hold_read_worker_row(None);
+            let tag = format!("row {id}, the {winner:?} read to win");
+            assert_eq!(
+                (s1.requests - s0.requests, s1.refused - s0.refused),
+                (1, 0),
+                "{tag}: the read threads did not take the request"
+            );
+            assert_eq!(
+                held,
+                HoldStats {
+                    held: 1,
+                    rehedged: 1,
+                    gave_up: 0
+                },
+                "{tag}: the held read was not re-read by its hedge"
+            );
+            assert_eq!(
+                s1.hedged - s0.hedged,
+                1,
+                "{tag}: the hedge re-read other than the held row"
+            );
+            assert_eq!(
+                s1.hedge_wins - s0.hedge_wins,
+                u64::from(winner == HeldWinner::Hedge),
+                "{tag}: the other read landed it"
+            );
+            assert_eq!(done, Some(1), "{tag}: the row was counted other than once");
+            assert!(
+                got.iter()
+                    .map(|v| v.to_bits())
+                    .eq(want.iter().map(|v| v.to_bits())),
+                "{tag}: the row landed is not the file's"
+            );
+        }
+    }
+    t.set_hedge_us(0);
+    println!(
+        "HELD a held row landed once, {} rows under each winner",
+        ids.len()
+    );
     Ok(())
 }
 

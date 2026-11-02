@@ -444,6 +444,12 @@ fn a_ledger_context_is_committed_for_its_life_and_admitted_on_the_machine() {
 /// The writer never takes the split machine: while the decode thread holds
 /// it (a slow observer decode), a batch already handed over is still
 /// written.
+///
+/// The write is waited for, bounded by [`WRITER_BOUND`], while the observer
+/// holds the machine: a writer that needed the machine could never write
+/// inside that wait, however long it is, so the bound sets only how soon a
+/// defect goes red. A 250 ms bound made a writer thread scheduled late under
+/// load look like one that waited for the lock (#1205, census row 5).
 #[test]
 fn a_slow_observer_decode_does_not_hold_the_writer() {
     use std::sync::mpsc;
@@ -492,10 +498,7 @@ fn a_slow_observer_decode_does_not_hold_the_writer() {
                 .observe(&[tags.end], "</think>", 1, &|ids| {
                     if ids.is_empty() && !once.swap(true, Ordering::AcqRel) {
                         entered.send(()).unwrap();
-                        released
-                            .lock()
-                            .recv_timeout(Duration::from_secs(5))
-                            .unwrap();
+                        released.lock().recv_timeout(OBSERVER_HOLD).unwrap();
                     }
                     Ok(if ids.is_empty() {
                         String::new()
@@ -507,15 +510,16 @@ fn a_slow_observer_decode_does_not_hold_the_writer() {
         })
     };
     entry.recv_timeout(Duration::from_secs(5)).unwrap();
-    let deadline = Instant::now() + Duration::from_millis(250);
-    let mut written = false;
-    while Instant::now() < deadline {
+    let start = Instant::now();
+    let mut written = None;
+    while start.elapsed() < WRITER_BOUND {
         if String::from_utf8_lossy(&wire.0.lock()).contains(r#""reasoning_content":"a""#) {
-            written = true;
+            written = Some(start.elapsed());
             break;
         }
         std::thread::sleep(Duration::from_millis(2));
     }
+    eprintln!("WRITER written after {written:?} with the machine held (bound {WRITER_BOUND:?})");
     assert!(
         machine.is_locked(),
         "the observer held the machine throughout"
@@ -524,5 +528,17 @@ fn a_slow_observer_decode_does_not_hold_the_writer() {
     observer.join().unwrap();
     let (_, error) = sw.finish().unwrap();
     assert!(error.is_none());
-    assert!(written, "the writer waited for the observer's machine lock");
+    assert!(
+        written.is_some(),
+        "the writer waited for the observer's machine lock: nothing written in {WRITER_BOUND:?}"
+    );
 }
+
+/// How long the test waits for the writer while the observer holds the
+/// machine. The writer needs only to be scheduled; this is far past any
+/// scheduling delay measured under load here (#1205), and only a defect waits
+/// it out.
+const WRITER_BOUND: Duration = Duration::from_secs(10);
+/// How long the observer holds the machine at most: past [`WRITER_BOUND`],
+/// so the hold outlasts the wait.
+const OBSERVER_HOLD: Duration = Duration::from_secs(30);

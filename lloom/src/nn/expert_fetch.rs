@@ -54,6 +54,14 @@ struct Job {
     _custody: Option<FetchJobCustody>,
 }
 
+#[cfg(test)]
+pub(crate) fn fetch_layout_for_test() -> (usize, usize) {
+    (
+        std::mem::size_of::<FetchJobCustody>(),
+        std::mem::size_of::<Job>(),
+    )
+}
+
 /// A tier of the pass that registered the job.
 ///
 /// SAFETY of the pointer: the pass that registers a job does not return
@@ -195,6 +203,11 @@ impl FetchLane {
     pub(crate) fn registration_counts_for_test(&self) -> (u64, u64, usize) {
         let state = self.lane.state.lock();
         (state.registered, state.done, state.jobs.len())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cancellation_requested_for_test(&self) -> bool {
+        self.lane.cancel.load(Ordering::Acquire)
     }
 
     /// Register `tier`'s layer of the open pass and encode the device's
@@ -370,7 +383,7 @@ fn work(lane: &Lane) {
     let mut ids: Vec<u32> = Vec::new();
     let mut settled_floor: Option<Epoch> = None;
     loop {
-        let (tier, slot, topk, n_experts, value, floor) = {
+        let (tier, slot, topk, n_experts, value, floor, initialization_unproven) = {
             let mut g = lane.state.lock();
             loop {
                 if lane.stop.load(Ordering::Acquire) {
@@ -384,6 +397,9 @@ fn work(lane: &Lane) {
                         j.n_experts,
                         j.value,
                         j.floor,
+                        j._custody
+                            .as_ref()
+                            .is_some_and(FetchJobCustody::initialization_unproven),
                     );
                 }
                 lane.cv.wait(&mut g);
@@ -421,7 +437,7 @@ fn work(lane: &Lane) {
                 seen = false;
             }
         }
-        let mut initialization_failed = false;
+        let mut initialization_refusal = None;
         if seen {
             // SAFETY: the job's pass has not returned (`TierRef`).
             let tier = unsafe { &*tier };
@@ -455,7 +471,9 @@ fn work(lane: &Lane) {
                     // A failed/abandoned initializer cannot be replayed as a
                     // mere absent expert. Cancel consumers before raising value.
                     eprintln!("[expert-fetch] bank initialization: {error}");
-                    initialization_failed = true;
+                    initialization_refusal = Some(
+                        "expert fetch: bank initialization failed; dependent work was cancelled",
+                    );
                     seen = false;
                 }
             }
@@ -463,16 +481,35 @@ fn work(lane: &Lane) {
         lane.counters
             .serve_ns
             .fetch_add(t1.elapsed().as_nanos() as u64, Ordering::Relaxed);
-        // A job given up to a cancellation leaves the table unwritten for a
-        // pass nobody redoes: the work behind its wait is cancelled before
-        // the raise, and never runs. The fail-safe's raise lets it run on the
-        // table as it stands, for the settle to flag and redo.
-        if !seen && (initialization_failed || lane.cancel.load(Ordering::Acquire)) {
-            let reason = if initialization_failed {
-                "expert fetch: bank initialization failed; dependent work was cancelled"
-            } else {
-                CANCELLED
-            };
+        // A routing timeout is not a DATA proof. Only jobs registered while
+        // their generation was unproven take this cold final poll; ordinary
+        // proven jobs add no Inner lock or receipt scan. Ready preserves the
+        // existing healthy timeout/replay route. Failed OR still Pending must
+        // cancel this join before the signal, even when no routing was seen.
+        if initialization_unproven && initialization_refusal.is_none() {
+            // SAFETY: the published Job retains its pass lifetime and bank
+            // resize custody through this poll and cancellation/publication.
+            let tier = unsafe { &*tier };
+            match tier.fetch_initialization_ready() {
+                Ok(true) => {}
+                Ok(false) => {
+                    initialization_refusal = Some(
+                        "expert fetch: bank initialization DATA unresolved; dependent work was cancelled",
+                    );
+                }
+                Err(error) => {
+                    eprintln!("[expert-fetch] bank initialization at join release: {error}");
+                    initialization_refusal = Some(
+                        "expert fetch: bank initialization failed; dependent work was cancelled",
+                    );
+                }
+            }
+        }
+        // Unresolved Pending refuses this request only: the generation stays
+        // pending and a later successful DATA proof can serve the next one.
+        if let Some(reason) = initialization_refusal
+            .or_else(|| (!seen && lane.cancel.load(Ordering::Acquire)).then_some(CANCELLED))
+        {
             if let Err(e) = lane.event.cancel_through(value, reason) {
                 eprintln!("[expert-fetch] cancelling the work behind value {value}: {e}");
             }

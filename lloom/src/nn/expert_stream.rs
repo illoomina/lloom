@@ -2666,20 +2666,35 @@ type NowInFlight = (
 pub(crate) struct FetchJobCustody {
     active: Arc<AtomicUsize>,
     floor: Epoch,
+    // Captured under the registration's existing Inner lock. A proven
+    // generation needs no additional worker-side Inner poll.
+    initialization_unproven: bool,
 }
 
 #[cfg(feature = "metal")]
 impl FetchJobCustody {
-    fn acquire(active: &Arc<AtomicUsize>, floor: Epoch) -> Result<Self> {
+    fn acquire(
+        active: &Arc<AtomicUsize>,
+        floor: Epoch,
+        initialization_unproven: bool,
+    ) -> Result<Self> {
         let active = Arc::clone(active);
         active
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_add(1))
             .map_err(|_| lloom_tensor::Error::Msg("expert fetch job count exhausted".into()))?;
-        Ok(Self { active, floor })
+        Ok(Self {
+            active,
+            floor,
+            initialization_unproven,
+        })
     }
 
     pub(crate) fn required_floor(&self) -> Epoch {
         self.floor
+    }
+
+    pub(crate) fn initialization_unproven(&self) -> bool {
+        self.initialization_unproven
     }
 }
 
@@ -2718,6 +2733,10 @@ pub struct Streamed {
     /// One-shot proof-observation fault, not a native driver failure. Never shipped.
     #[cfg(all(test, feature = "metal"))]
     initializer_data_observation_fault: std::sync::atomic::AtomicBool,
+    /// Test-only Pending observation on genuinely successful initialization:
+    /// 0 off, 1 armed, 2 first short, 3 paused retry, 4 released, 5 watchdog.
+    #[cfg(all(test, feature = "metal"))]
+    initializer_pending_observation: std::sync::atomic::AtomicUsize,
 }
 
 /// Distinct per `Streamed` for the life of the process (the prefetcher's
@@ -2943,6 +2962,8 @@ impl Streamed {
             fetch_registration_pause: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(all(test, feature = "metal"))]
             initializer_data_observation_fault: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(all(test, feature = "metal"))]
+            initializer_pending_observation: std::sync::atomic::AtomicUsize::new(0),
         })
         .and_then(|mut t| {
             t.set_spare_slots(default_spare_slots())?;
@@ -4800,6 +4821,16 @@ impl Streamed {
 
 #[cfg(feature = "metal")]
 impl Streamed {
+    /// Cold completion proof for a job registered before this bank generation
+    /// was proven. Job custody prevents replacement while this poll runs.
+    /// Pending is not failure of the generation, but cannot release this join.
+    pub(crate) fn fetch_initialization_ready(&self) -> Result<bool> {
+        let ready = self.inner.lock().initialization.poll()?;
+        #[cfg(test)]
+        let ready = ready && self.initializer_pending_observation.load(Ordering::Acquire) == 0;
+        Ok(ready)
+    }
+
     /// The fetch worker's turn at this tier's layer of a running pass whose
     /// router chose `ids` (`nn::expert_fetch`): the experts the pool lacks
     /// given slots — a free slot, else the LRU slot not routed to now whose
@@ -4830,6 +4861,33 @@ impl Streamed {
                 // Completion-hook epochs may become visible just before own
                 // DATA feedback. Reuse the worker's existing bounded retry;
                 // do not touch a destination before exact DATA succeeds.
+                return Ok((0, ids.len() as u64));
+            }
+            #[cfg(test)]
+            if self.initializer_pending_observation.load(Ordering::Acquire) != 0 {
+                // Observation injection only AFTER genuine initializer DATA:
+                // never fabricate an epoch or make any raw destination job.
+                if self
+                    .initializer_pending_observation
+                    .compare_exchange(1, 2, Ordering::AcqRel, Ordering::Acquire)
+                    .is_err()
+                    && self
+                        .initializer_pending_observation
+                        .compare_exchange(2, 3, Ordering::AcqRel, Ordering::Acquire)
+                        .is_ok()
+                {
+                    // The second call is made inside the real retry loop.
+                    // No cancellation producer or test release needs Inner.
+                    let started = std::time::Instant::now();
+                    while self.initializer_pending_observation.load(Ordering::Acquire) == 3 {
+                        if started.elapsed() > std::time::Duration::from_secs(10) {
+                            self.initializer_pending_observation
+                                .store(5, Ordering::Release);
+                            break;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                }
                 return Ok((0, ids.len() as u64));
             }
             if inner.live.is_none() {
@@ -5510,7 +5568,8 @@ impl ExpertResidency for Streamed {
             // No resize can pass its guard between this acquisition and the
             // descriptor becoming visible to the worker. The published Job,
             // not register's Result, owns cleanup once it is enqueued.
-            let custody = FetchJobCustody::acquire(jobs, inner.initialization.floor)?;
+            let custody =
+                FetchJobCustody::acquire(jobs, inner.initialization.floor, !initialization_ready)?;
             (slot, custody, initialization_ready)
         };
         // Only a new/unproven generation takes this cold path. Ordinary
@@ -7846,6 +7905,200 @@ mod tests {
     }
 
     #[cfg(feature = "metal")]
+    #[test]
+    fn a_pending_native_empty_fallback_reader_excludes_raw_free_zero_until_completion() {
+        use crate::nn::expert_prefetch::Prefetcher;
+        use lloom_tensor::kernels::metal::staging::StagingRing;
+        use lloom_tensor::kernels::metal::{profile, HostInputArm};
+        use lloom_tensor::metal_backend::HostEvent;
+        use objc2_metal::MTLStorageMode;
+        use std::time::Duration;
+
+        let dev = resize_control_device();
+        let m = dev.as_metal_device().unwrap();
+        assert_eq!(m.commands().host_input_arm(), HostInputArm::Commit);
+        assert!(profile::enabled(), "requires CANDLE_METAL_PROFILE=1");
+        let gate = stacked(8, 32, 32, 1.0, GgmlDType::F32);
+        let up = stacked(8, 32, 32, 2.0, GgmlDType::F32);
+        let down = stacked(8, 32, 32, 3.0, GgmlDType::F32);
+        let path = write_gguf(&[("g", &gate), ("u", &up), ("d", &down)]);
+        let ring = StagingRing::shared(m);
+        let mut tier = Streamed::with_staging_pools(
+            open(&path, "g"),
+            open(&path, "u"),
+            open(&path, "d"),
+            4,
+            LoaderArm::Pread,
+            &dev,
+            Some(Arc::clone(&ring)),
+            false,
+            true,
+        )
+        .unwrap();
+        tier.set_spare_slots(1).unwrap();
+        tier.set_prefetcher(Arc::new(Prefetcher::new(m, ring)));
+        let _drain = HostGroupTestDrain(&dev);
+        assert!(tier.fetch_ready());
+        let xs = x(1, 32, 0.25).to_device(&dev).unwrap();
+        let logical = Tensor::new(&[[7u32]], &dev).unwrap();
+        let (resolved, record) = tier.plan_window(&logical, 0, 0).unwrap().unwrap();
+        dev.synchronize().unwrap();
+        assert_eq!(resolved.ids.to_vec2::<u32>().unwrap(), vec![vec![0]]);
+        assert_eq!(record.flags(), &[1]);
+        let eligible = |map: &ResidencyMap, floor: Epoch, completed: Completed| {
+            let mut copy = map.clone();
+            let mut slots = Vec::new();
+            while let Some(slot) = copy.take_free_beside(floor, completed) {
+                slots.push(slot);
+            }
+            slots.sort_unstable();
+            slots
+        };
+        {
+            let mut inner = tier.inner.lock();
+            assert!(inner.initialization.poll().unwrap());
+            for pool in &inner.pools {
+                let bank = pool.qt.metal_buffer().unwrap();
+                // SAFETY: metadata only; owning persistent bank stays alive.
+                assert_eq!(
+                    unsafe { bank.raw_unchecked() }.storageMode(),
+                    MTLStorageMode::Shared
+                );
+            }
+            assert_eq!(inner.map.expert_in(0), NONE);
+            assert!(inner.map.cache.host_borrowed(SlotId(0)));
+            assert_eq!(
+                eligible(&inner.map, inner.current_epoch(), inner.completed_epochs()),
+                vec![1, 2, 3]
+            );
+        }
+        // Independent cleanup producer never acquires Streamed::Inner. Sender
+        // disconnect also releases on unwind before HostGroupTestDrain waits.
+        let event = Arc::new(HostEvent::new(m).unwrap());
+        let signal = Arc::clone(&event);
+        let (release, requested) = std::sync::mpsc::channel();
+        let producer = std::thread::spawn(move || {
+            let explicit = requested.recv_timeout(Duration::from_secs(10)).is_ok();
+            signal.signal(1);
+            explicit
+        });
+        let mut resolved = Some(resolved);
+        // No assertions/output reads or bank writes while held. Even a broken
+        // selector mutates only an expendable metadata clone, not raw bytes.
+        let observed = (|| -> Result<_> {
+            event.commit_when_produced(1)?;
+            let (epoch, exact) = {
+                let blit = m
+                    .commands()
+                    .blit_command_encoder()
+                    .map_err(lloom_tensor::Error::wrap)?;
+                blit.recording_receipt()
+            };
+            let reader_before = tier.inner.lock().map.reader_epoch(0);
+            let before_dispatch = profile::dispatch_count();
+            let group = resolved
+                .as_mut()
+                .ok_or_else(|| lloom_tensor::Error::Msg("missing fixture group".into()))?;
+            let projections = tier.gate_up(&xs, group, MoeArm::MatVec, DType::F32)?;
+            let dispatches = profile::dispatch_count() - before_dispatch;
+            drop(resolved.take());
+            let epoch_before_cut = m.gpu_clock().current_epoch();
+            let _held_marker = m.flush_marker()?;
+            let pending_data = exact.poll_data_ready().map_err(lloom_tensor::Error::wrap)?;
+            let held = m.commands().produced_stats().held_now;
+            let signaled = event.signaled();
+            let inner = tier.inner.lock();
+            let reader = inner.map.reader_epoch(0);
+            let completed = inner.completed_epochs();
+            let before = format!("{:?}", inner.map);
+            let available = eligible(&inner.map, epoch, completed);
+            let after = format!("{:?}", inner.map);
+            let host = inner.map.cache.host_borrowed(SlotId(0));
+            Ok((
+                epoch,
+                exact,
+                epoch_before_cut,
+                reader_before,
+                reader,
+                completed,
+                pending_data,
+                held,
+                signaled,
+                dispatches,
+                available,
+                before,
+                after,
+                host,
+                projections,
+            ))
+        })();
+        // Error paths abort any remaining group before releasing. Never assert
+        // until the independent producer has run and real native DATA drained.
+        drop(resolved.take());
+        let _ = release.send(());
+        let explicit = producer.join();
+        let drained = dev.synchronize();
+        let explicit = explicit.unwrap();
+        drained.unwrap();
+        let (
+            epoch,
+            exact,
+            epoch_before_cut,
+            reader_before,
+            reader,
+            pending_completed,
+            pending_data,
+            held,
+            signaled,
+            dispatches,
+            available,
+            before,
+            after,
+            host,
+            (gate, up),
+        ) = observed.unwrap();
+        assert!(
+            explicit,
+            "watchdog/disconnect release is cleanup, not acceptance"
+        );
+        assert_eq!(
+            epoch_before_cut, epoch,
+            "reader left captured native recording"
+        );
+        assert!(reader_before < epoch, "old reader could mask omitted stamp");
+        assert_eq!(reader, epoch);
+        assert!(!host);
+        assert!(dispatches > 0, "no native bank reader encoded");
+        assert_eq!(signaled, 0, "producer released before pending observation");
+        assert!(held > 0, "recording was not actually held");
+        assert!(!pending_data, "exact native DATA already complete");
+        assert!(!pending_completed.covers(reader));
+        assert_eq!(
+            available,
+            vec![1, 2, 3],
+            "pending actual native reader exposed empty free0 to raw fetch policy"
+        );
+        assert_eq!(before, after, "probe mutated actual free-map state");
+        let inner = tier.inner.lock();
+        let complete = inner.completed_epochs();
+        assert!(complete.covers(epoch));
+        assert!(exact.poll_data_ready().unwrap());
+        assert_eq!(eligible(&inner.map, epoch, complete), vec![0, 1, 2, 3]);
+        assert_eq!(format!("{:?}", inner.map), after);
+        assert!(inner.host_group_active.is_none());
+        drop(inner);
+        for output in [gate, up] {
+            assert_eq!(output.dims(), &[1, 1, 32]);
+            let values = output.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+            assert_eq!(values.len(), 32, "zero oracle must be nonempty");
+            assert!(values.iter().all(|&v| v == 0.0));
+        }
+        eprintln!("PENDING_NATIVE_FREE0 actual_api={} arm={:?} epoch={epoch:?} pending_completed={pending_completed:?} completed={complete:?} held={held} dispatches={dispatches} pending_slots={available:?} completed_slots=[0,1,2,3]",
+            m.commands().actual_command_api(), m.commands().host_input_arm());
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[cfg(feature = "metal")]
     fn resize_control_device() -> Device {
         let dev = Device::new_metal(0).expect("native resize control requires Metal");
         let actual = dev
@@ -8457,7 +8710,6 @@ mod tests {
         use crate::nn::expert_fetch::FetchLane;
         use crate::nn::expert_prefetch::Prefetcher;
         use lloom_tensor::kernels::metal::{staging::StagingRing, HostInputArm};
-        use lloom_tensor::metal_backend::HostEvent;
         use std::time::Duration;
         let dev = resize_control_device();
         let m = dev.as_metal_device().unwrap();
@@ -8472,20 +8724,12 @@ mod tests {
         let path = write_gguf(&[("g", &gate), ("u", &up), ("d", &down)]);
         let consumer = Tensor::ones((1, 1, 32), DType::F32, &dev).unwrap();
         dev.synchronize().unwrap();
-        struct Release(HostEvent);
-        impl Drop for Release {
-            fn drop(&mut self) {
-                self.0.signal(1);
-            }
-        }
-        let release = Release(HostEvent::new(m).unwrap());
-        release.0.commit_when_produced(1).unwrap();
         let ring = StagingRing::shared(m);
         let mut tier = Streamed::with_staging_pools(
             open(&path, "g"),
             open(&path, "u"),
             open(&path, "d"),
-            4,
+            6,
             LoaderArm::Pread,
             &dev,
             Some(Arc::clone(&ring)),
@@ -8493,7 +8737,24 @@ mod tests {
             true,
         )
         .unwrap();
+        // This fixture uses the real fetch-ready, live-table route independent
+        // of the process's default spare/fetch tuning. No bank DATA wait here.
+        tier.set_spare_slots(1).unwrap();
+        assert_eq!(tier.spare_slots(), 1);
+        assert!(tier.live_table());
         tier.set_prefetcher(Arc::new(Prefetcher::new(m, ring)));
+        // Prepare a valid elastic geometry BEFORE holding a new generation.
+        // Capacity six permits actual later growth: grow(6) on capacity four
+        // is intentionally a no-op and cannot test failed replacement.
+        tier.shrink_slots(4, 1).unwrap();
+        dev.synchronize().unwrap();
+        assert_eq!(tier.active_slots(), 4);
+        assert!(tier.inner.lock().initialization.poll().unwrap());
+        let mut release = InitializerControlInput::new(m);
+        // A cold grow cut may park; its independent producer always releases
+        // on cleanup. Watchdog release must fail the control, not pass it.
+        assert!(tier.grow_slots(5).unwrap() > 0);
+        assert_eq!(tier.active_slots(), 5);
         assert!(tier.fetch_prepare(1).unwrap());
         let (slot, ids, initial_floor) = {
             let mut inner = tier.inner.lock();
@@ -8508,18 +8769,21 @@ mod tests {
         slot.fill_u32(7, 1).unwrap();
         assert!(
             release
-                .0
+                .event
                 .cancel_through(1, "initializer cancellation control")
                 .unwrap()
                 > 0
         );
-        release.0.signal(1);
+        assert!(
+            release.request(),
+            "initializer producer required watchdog cleanup"
+        );
         // Give one later plane a real successful initializer. The earlier
         // two planes remain abandoned: looking only at the last marker would
         // now be a false DATA proof. This deterministically splits recordings
         // that automatic encoder/capacity cuts may split during construction.
         let (later_down, later_receipt) =
-            QTensor::zeros_persistent_with_receipt((4, 32, 32), GgmlDType::F32, &dev, true)
+            QTensor::zeros_persistent_with_receipt((5, 32, 32), GgmlDType::F32, &dev, true)
                 .unwrap();
         let later_receipt = later_receipt.unwrap();
         let successful_plane = later_receipt.1.clone();
@@ -8557,7 +8821,7 @@ mod tests {
             "failed initializer handed out a safe projection handle"
         );
         assert!(tier.grow_slots(6).is_err());
-        assert_eq!(tier.active_slots(), 4);
+        assert_eq!(tier.active_slots(), 5);
         // Cancellation is not a permanent queue failure: a new tier can use
         // the same device, while this invalid generation remains refused.
         let fresh = Streamed::new(
@@ -8574,6 +8838,418 @@ mod tests {
         assert!(fresh.resident().contains(&0));
         eprintln!("INITIALIZER_CANCEL actual_api={} successor_ok=true failed_jobs=0 custody=0 invalid_tier_refused=true fresh_tier_ok=true",
             m.commands().actual_command_api());
+        std::fs::remove_file(path).unwrap();
+    }
+
+    /// Independent test cleanup. Watchdog release is a failed control, never
+    /// accepted as evidence of Pending DATA or cancellation.
+    #[cfg(feature = "metal")]
+    struct InitializerControlInput {
+        event: Arc<lloom_tensor::metal_backend::HostEvent>,
+        tx: Option<std::sync::mpsc::Sender<()>>,
+        join: Option<std::thread::JoinHandle<bool>>,
+    }
+
+    #[cfg(feature = "metal")]
+    impl InitializerControlInput {
+        fn new(m: &lloom_tensor::MetalDevice) -> Self {
+            let event = Arc::new(lloom_tensor::metal_backend::HostEvent::new(m).unwrap());
+            event.commit_when_produced(1).unwrap();
+            let producer = Arc::clone(&event);
+            let (tx, rx) = std::sync::mpsc::channel();
+            let join = std::thread::spawn(move || {
+                let requested = rx.recv_timeout(std::time::Duration::from_secs(20)).is_ok();
+                producer.signal(1);
+                requested
+            });
+            Self {
+                event,
+                tx: Some(tx),
+                join: Some(join),
+            }
+        }
+
+        fn request(&mut self) -> bool {
+            if let Some(tx) = self.tx.take() {
+                let _ = tx.send(());
+            }
+            self.join.take().is_none_or(|join| join.join().unwrap())
+        }
+    }
+
+    #[cfg(feature = "metal")]
+    impl Drop for InitializerControlInput {
+        fn drop(&mut self) {
+            let _ = self.request();
+        }
+    }
+
+    #[cfg(feature = "metal")]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum UnservedInitializationControl {
+        Abandoned,
+        Pending,
+        Ready,
+    }
+
+    #[cfg(feature = "metal")]
+    fn unserved_initialization_control(mode: UnservedInitializationControl) {
+        use crate::nn::expert_fetch::FetchLane;
+        use crate::nn::expert_prefetch::Prefetcher;
+        use lloom_tensor::kernels::metal::{staging::StagingRing, HostInputArm};
+        use std::time::{Duration, Instant};
+        let dev = resize_control_device();
+        let m = dev.as_metal_device().unwrap();
+        assert_eq!(m.commands().host_input_arm(), HostInputArm::Commit);
+        let _cut = dev.cut_period_hold(usize::MAX);
+        let source = Tensor::ones(16, DType::F32, &dev)
+            .unwrap()
+            .affine(2.0, 1.0)
+            .unwrap();
+        dev.synchronize().unwrap();
+        let gate = stacked(8, 32, 32, 1.0, GgmlDType::F32);
+        let up = stacked(8, 32, 32, 2.0, GgmlDType::F32);
+        let down = stacked(8, 32, 32, 3.0, GgmlDType::F32);
+        let path = write_gguf(&[("g", &gate), ("u", &up), ("d", &down)]);
+        let mut release =
+            (mode != UnservedInitializationControl::Ready).then(|| InitializerControlInput::new(m));
+        let ring = StagingRing::shared(m);
+        let mut tier = Streamed::with_staging_pools(
+            open(&path, "g"),
+            open(&path, "u"),
+            open(&path, "d"),
+            4,
+            LoaderArm::Pread,
+            &dev,
+            Some(Arc::clone(&ring)),
+            false,
+            true,
+        )
+        .unwrap();
+        tier.set_spare_slots(1).unwrap();
+        tier.set_prefetcher(Arc::new(Prefetcher::new(m, ring)));
+        if mode == UnservedInitializationControl::Ready {
+            dev.synchronize().unwrap();
+            assert!(tier.inner.lock().initialization.poll().unwrap());
+        } else {
+            assert!(!tier.inner.lock().initialization.poll().unwrap());
+        }
+        assert!(tier.fetch_prepare(1).unwrap());
+        let (slot, ids) = {
+            let mut inner = tier.inner.lock();
+            let slot = inner.decode_ids_slot(1).unwrap().unwrap();
+            (Arc::clone(&slot), slot.tensor((1, 1)).unwrap())
+        };
+        let lane = FetchLane::new(m, Duration::from_millis(1), "inherit").unwrap();
+        let mut pass = lane.begin_pass(m.gpu_clock().current_epoch());
+        let mut normal_release = true;
+        if mode == UnservedInitializationControl::Abandoned {
+            // The exact proof passed while Pending, then failed before a NEW
+            // join was published. The old cancellation cannot cover that join.
+            tier.fetch_registration_pause.store(1, Ordering::Release);
+            std::thread::scope(|scope| {
+                struct Unpause<'a>(&'a Streamed);
+                impl Drop for Unpause<'_> {
+                    fn drop(&mut self) {
+                        self.0.fetch_registration_pause.store(3, Ordering::Release);
+                    }
+                }
+                let registration = scope.spawn(|| tier.fetch_register(&lane, &ids));
+                let unpause = Unpause(&tier);
+                let deadline = Instant::now() + Duration::from_secs(2);
+                while tier.fetch_registration_pause.load(Ordering::Acquire) != 2
+                    && Instant::now() < deadline
+                {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                let paused = tier.fetch_registration_pause.load(Ordering::Acquire) == 2;
+                let release = release.as_mut().unwrap();
+                let cancelled = release
+                    .event
+                    .cancel_through(1, "unserved initializer control");
+                normal_release = release.request();
+                let successor = source.affine(2.0, 1.0);
+                let completed = m.flush_and_wait_current();
+                // Read the OLD successor before publishing the NEW join:
+                // ordinary to_vec1 drains the queue tail, not only this value.
+                let successor_values = successor.and_then(|t| t.to_vec1::<f32>());
+                drop(unpause);
+                let registered = registration.join().unwrap();
+                assert!(paused, "unserved control did not pause real registration");
+                assert!(cancelled.unwrap() > 0);
+                completed.unwrap();
+                assert_eq!(successor_values.unwrap(), vec![7.0; 16]);
+                assert!(
+                    registered.unwrap(),
+                    "unserved control did not publish the NEW join"
+                );
+            });
+        } else {
+            assert!(tier.fetch_register(&lane, &ids).unwrap());
+        }
+        pass.seal();
+        // No router writes these IDs. This deliberately exercises the normal
+        // unserved path rather than racing a bounded routing producer.
+        let mut words = Vec::new();
+        slot.peek_u32(1, &mut words).unwrap();
+        assert_eq!(words, vec![NONE]);
+        let dependent = source.affine(2.0, 1.0).unwrap();
+        let exact = m.blit_command_encoder().unwrap().recording_receipt().1;
+        let initially_pending = exact.poll_data_ready();
+        let submitted_before_cut = exact.is_submitted();
+        let cut = m.flush_marker();
+        let stats = lane.settled_stats();
+        let state_before_release = tier.inner.lock().initialization.poll();
+        if let Some(release) = release.as_mut() {
+            normal_release &= release.request();
+        }
+        // Release the independent initializer input BEFORE any DATA wait, so
+        // even a mutant which wrongly releases the join cannot need watchdog
+        // cleanup or leave a live dependent GPU consumer on assertion unwind.
+        let outcome = m.wait_marker(&exact);
+        pass.finish();
+        dev.synchronize().unwrap();
+        assert!(
+            normal_release,
+            "initializer producer required watchdog cleanup"
+        );
+        assert!(
+            matches!(initially_pending, Ok(false)),
+            "join was not pending: {initially_pending:?}"
+        );
+        assert!(
+            !submitted_before_cut,
+            "consumer escaped the actual HostCommit join"
+        );
+        assert_eq!(
+            (stats.jobs, stats.loads, stats.timeouts),
+            (1, 0, 1),
+            "{stats:?}"
+        );
+        assert_eq!(tier.fetch_jobs.as_ref().unwrap().load(Ordering::Acquire), 0);
+        assert_eq!(lane.registration_counts_for_test(), (1, 1, 0));
+        match mode {
+            UnservedInitializationControl::Ready => {
+                assert!(state_before_release.unwrap());
+                cut.unwrap();
+                outcome.unwrap();
+                assert_eq!(dependent.to_vec1::<f32>().unwrap(), vec![7.0; 16]);
+            }
+            UnservedInitializationControl::Abandoned => {
+                assert!(state_before_release
+                    .unwrap_err()
+                    .to_string()
+                    .contains("abandoned"));
+                assert!(
+                    outcome.is_err(),
+                    "unserved abandoned initializer released its NEW join: {stats:?}"
+                );
+            }
+            UnservedInitializationControl::Pending => {
+                assert!(
+                    !state_before_release.unwrap(),
+                    "Pending control was already DATA ready"
+                );
+                assert!(
+                    outcome.is_err(),
+                    "unserved unresolved initializer released its NEW join: {stats:?}"
+                );
+                assert!(
+                    tier.inner.lock().initialization.poll().unwrap(),
+                    "Pending refusal poisoned the generation after genuine DATA"
+                );
+            }
+        }
+        let fresh;
+        let next = if mode == UnservedInitializationControl::Abandoned {
+            assert!(tier.warm(&[0]).is_err());
+            fresh = Streamed::new(
+                open(&path, "g"),
+                open(&path, "u"),
+                open(&path, "d"),
+                4,
+                LoaderArm::Pread,
+                &dev,
+            )
+            .unwrap();
+            &fresh
+        } else {
+            &tier
+        };
+        assert_eq!(next.warm(&[0]).unwrap(), 1);
+        let recovery = source.affine(2.0, 1.0).unwrap();
+        dev.synchronize().unwrap();
+        assert!(next.resident().contains(&0));
+        assert_eq!(recovery.to_vec1::<f32>().unwrap(), vec![7.0; 16]);
+        let (custody_bytes, job_bytes) = crate::nn::expert_fetch::fetch_layout_for_test();
+        eprintln!("UNSERVED_INITIALIZER actual_api={} state={mode:?} jobs=1 loads=0 timeouts=1 recovery=true custody_bytes={custody_bytes} job_bytes={job_bytes}", m.commands().actual_command_api());
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn a_unserved_abandoned_initializer_cancels_its_new_join_and_recovers() {
+        unserved_initialization_control(UnservedInitializationControl::Abandoned);
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn a_unserved_pending_initializer_cancels_without_poisoning_later_data() {
+        unserved_initialization_control(UnservedInitializationControl::Pending);
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn a_unserved_ready_initializer_keeps_healthy_timeout_replay() {
+        unserved_initialization_control(UnservedInitializationControl::Ready);
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn a_valid_routing_cancelled_retry_cannot_release_unresolved_initializer() {
+        use crate::nn::expert_fetch::FetchLane;
+        use crate::nn::expert_prefetch::Prefetcher;
+        use lloom_tensor::kernels::metal::{staging::StagingRing, HostInputArm};
+        use std::time::{Duration, Instant};
+        let dev = resize_control_device();
+        let m = dev.as_metal_device().unwrap();
+        assert_eq!(m.commands().host_input_arm(), HostInputArm::Commit);
+        let _cut = dev.cut_period_hold(usize::MAX);
+        let source = Tensor::ones(16, DType::F32, &dev)
+            .unwrap()
+            .affine(2.0, 1.0)
+            .unwrap();
+        dev.synchronize().unwrap();
+        let gate = stacked(8, 32, 32, 1.0, GgmlDType::F32);
+        let up = stacked(8, 32, 32, 2.0, GgmlDType::F32);
+        let down = stacked(8, 32, 32, 3.0, GgmlDType::F32);
+        let path = write_gguf(&[("g", &gate), ("u", &up), ("d", &down)]);
+        let mut release = InitializerControlInput::new(m);
+        let ring = StagingRing::shared(m);
+        let mut tier = Streamed::with_staging_pools(
+            open(&path, "g"),
+            open(&path, "u"),
+            open(&path, "d"),
+            4,
+            LoaderArm::Pread,
+            &dev,
+            Some(Arc::clone(&ring)),
+            false,
+            true,
+        )
+        .unwrap();
+        tier.set_spare_slots(1).unwrap();
+        tier.set_prefetcher(Arc::new(Prefetcher::new(m, ring)));
+        assert!(tier.fetch_prepare(1).unwrap());
+        let (slot, ids, required) = {
+            let mut inner = tier.inner.lock();
+            assert!(!inner.initialization.poll().unwrap());
+            let required: Vec<_> = inner
+                .initialization
+                .required
+                .iter()
+                .map(|(_, marker)| marker.clone())
+                .collect();
+            let slot = inner.decode_ids_slot(1).unwrap().unwrap();
+            (Arc::clone(&slot), slot.tensor((1, 1)).unwrap(), required)
+        };
+        let lane = FetchLane::new(m, Duration::from_millis(1), "inherit").unwrap();
+        let mut pass = Some(lane.begin_pass(m.gpu_clock().current_epoch()));
+        assert!(tier.fetch_register(&lane, &ids).unwrap());
+        pass.as_mut().unwrap().seal();
+        // The job captured genuinely unproven initialization. Now complete
+        // those EXACT writers, never the queue tail containing this new join.
+        assert!(release.request(), "initializer cleanup needed watchdog");
+        for marker in &required {
+            m.wait_marker(marker).unwrap();
+        }
+        assert!(tier.inner.lock().initialization.poll().unwrap());
+        tier.initializer_pending_observation
+            .store(1, Ordering::Release);
+        struct Unblock<'a> {
+            tier: &'a Streamed,
+            armed: bool,
+        }
+        impl Drop for Unblock<'_> {
+            fn drop(&mut self) {
+                if self.armed {
+                    self.tier
+                        .initializer_pending_observation
+                        .store(4, Ordering::Release);
+                }
+            }
+        }
+        // Declared after pass: unwind releases the retry before pass drains.
+        let mut unblock = Unblock {
+            tier: &tier,
+            armed: true,
+        };
+        let _dependent = source.affine(2.0, 1.0).unwrap();
+        let exact = m.blit_command_encoder().unwrap().recording_receipt().1;
+        let pending = exact.poll_data_ready();
+        let submitted = exact.is_submitted();
+        slot.fill_u32(7, 1).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while tier.initializer_pending_observation.load(Ordering::Acquire) != 3
+            && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let retry_paused = tier.initializer_pending_observation.load(Ordering::Acquire) == 3;
+        let retry_before_cancel = lane.stats().retries;
+        let cancel_was_requested = std::thread::scope(|scope| {
+            let pass = pass.take().unwrap();
+            let cancellation = scope.spawn(move || drop(pass));
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !lane.cancellation_requested_for_test() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let requested = lane.cancellation_requested_for_test();
+            tier.initializer_pending_observation
+                .store(4, Ordering::Release);
+            cancellation.join().unwrap();
+            requested
+        });
+        let stats = lane.settled_stats();
+        let phase = tier.initializer_pending_observation.load(Ordering::Acquire);
+        // Observation injection ends only AFTER the real worker and its final
+        // cold proof have returned; native DATA was successful throughout it.
+        tier.initializer_pending_observation
+            .store(0, Ordering::Release);
+        unblock.armed = false;
+        let _cut_result = m.flush_marker();
+        let outcome = m.wait_marker(&exact);
+        dev.synchronize().unwrap();
+        assert!(
+            matches!(pending, Ok(false)),
+            "new join wasn't pending: {pending:?}"
+        );
+        assert!(!submitted, "new join was already submitted");
+        assert!(
+            retry_paused && retry_before_cancel > 0,
+            "real retry not observed before cancellation: {stats:?}"
+        );
+        assert!(
+            cancel_was_requested,
+            "pass cancellation was not observed while retry paused"
+        );
+        assert_eq!(phase, 4, "retry pause needed watchdog release");
+        assert_eq!(
+            (stats.jobs, stats.loads, stats.timeouts),
+            (1, 0, 0),
+            "{stats:?}"
+        );
+        assert!(
+            outcome.is_err(),
+            "valid-routing cancelled retry released an unresolved initializer join: {stats:?}"
+        );
+        assert_eq!(tier.fetch_jobs.as_ref().unwrap().load(Ordering::Acquire), 0);
+        assert!(tier.inner.lock().initialization.poll().unwrap());
+        assert_eq!(tier.warm(&[0]).unwrap(), 1);
+        let recovery = source.affine(2.0, 1.0).unwrap();
+        dev.synchronize().unwrap();
+        assert_eq!(recovery.to_vec1::<f32>().unwrap(), vec![7.0; 16]);
+        eprintln!("INITIALIZER_PENDING_OBSERVATION actual_api={} native_driver_failure=false genuine_initializer_data=true retry_before_cancel={retry_before_cancel} cancellation_observed=true next_request=true", m.commands().actual_command_api());
         std::fs::remove_file(path).unwrap();
     }
 
@@ -8618,6 +9294,11 @@ mod tests {
             true,
         )
         .unwrap();
+        // This fixture uses the real fetch-ready, live-table route independent
+        // of the process's default spare/fetch tuning. No bank DATA wait here.
+        tier.set_spare_slots(1).unwrap();
+        assert_eq!(tier.spare_slots(), 1);
+        assert!(tier.live_table());
         tier.set_prefetcher(Arc::new(Prefetcher::new(m, ring)));
         assert!(tier.fetch_prepare(1).unwrap());
         let (slot, ids) = {
@@ -8625,6 +9306,15 @@ mod tests {
             assert!(!inner.initialization.poll().unwrap());
             let slot = inner.decode_ids_slot(1).unwrap().unwrap();
             (Arc::clone(&slot), slot.tensor((1, 1)).unwrap())
+        };
+        // Correctness-only phase receipts: diagnose producer scheduling, not
+        // throughput/latency evidence. Keep all original assertions below.
+        let phase_started = Instant::now();
+        let phase = |name: &str| {
+            eprintln!(
+                "INITIALIZER_LATE_PHASE {name} elapsed_us={}",
+                phase_started.elapsed().as_micros()
+            );
         };
         let lane = FetchLane::new(m, Duration::from_millis(1), "inherit").unwrap();
         let mut pass = lane.begin_pass(m.gpu_clock().current_epoch());
@@ -8636,7 +9326,13 @@ mod tests {
                     self.0.fetch_registration_pause.store(3, Ordering::Release);
                 }
             }
-            let registration = scope.spawn(|| tier.fetch_register(&lane, &ids));
+            phase("registration-spawn");
+            let registration = scope.spawn(|| {
+                phase("registration-enter");
+                let result = tier.fetch_register(&lane, &ids);
+                phase("registration-return");
+                result
+            });
             let unpause = Unpause(&tier);
             let deadline = Instant::now() + Duration::from_secs(2);
             while tier.fetch_registration_pause.load(Ordering::Acquire) != 2
@@ -8649,15 +9345,26 @@ mod tests {
             // publication/commit_when_produced. Complete a different recording
             // while registration remains paused so its owed epochs cannot hide
             // behind the new job's own wait and timeout instead of testing DATA.
+            phase("cancel-enter");
             let cancelled = release.0.cancel_through(1, "late initializer control");
+            phase("cancel-return");
             release.0.signal(1);
             let successor = source.affine(2.0, 1.0);
+            phase("successor-data-wait-enter");
             let completed = m.flush_and_wait_current();
+            phase("successor-data-wait-return");
+            phase("successor-read-enter");
+            // Ordinary to_vec1 drains the queue tail. Read the old value
+            // while registration is paused, before its NEW join exists.
+            let successor_values = successor.and_then(|t| t.to_vec1::<f32>());
+            phase("successor-read-return");
             drop(unpause);
+            phase("scope-join-enter");
             let registered = registration.join().unwrap();
+            phase("scope-join-return");
             assert!(paused, "real pre-publication pause did not engage");
             assert!(cancelled.unwrap() > 0);
-            assert_eq!(successor.unwrap().to_vec1::<f32>().unwrap(), vec![7.0; 16]);
+            assert_eq!(successor_values.unwrap(), vec![7.0; 16]);
             completed.unwrap();
             assert!(
                 registered.unwrap(),
@@ -8667,11 +9374,21 @@ mod tests {
         pass.seal();
         // Keep routing unwritten until the real consumer is behind the NEW
         // join. It reads no bank bytes, so even the broken worker is memory-safe.
+        phase("consumer-encode-enter");
         let _dependent = source.affine(2.0, 1.0).unwrap();
+        phase("consumer-encode-return");
+        phase("consumer-cut-enter");
         let marker = m.flush_marker().unwrap();
+        phase("consumer-cut-return");
+        phase("routing-fill-enter");
         slot.fill_u32(7, 1).unwrap();
+        phase("routing-fill-return");
+        phase("worker-settle-enter");
         let stats = lane.settled_stats();
+        phase("worker-settle-return");
+        phase("consumer-data-wait-enter");
         let result = m.wait_marker(&marker);
+        phase("consumer-data-wait-return");
         pass.finish();
         assert!(
             result.is_err(),

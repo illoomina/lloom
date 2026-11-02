@@ -584,3 +584,202 @@ fn an_epoch_quarantine_of_slots_drains_one_at_a_time_in_epoch_order() {
     assert!(q.is_empty());
     assert_eq!(out.capacity(), cap, "the drain reallocated its output");
 }
+
+// ---------------------------------------------------------------------------
+// A clear that keeps the same sequence's pages (`memory.md` §9.5r, decision
+// 107). A kept page is written again only once the epoch every earlier read
+// of it is in has completed; a page leaving for another sequence, or shared
+// with one, still goes through the quarantine.
+// ---------------------------------------------------------------------------
+
+/// The turn boundary of §9.5r, at the pool: a chat's turn fills the pool, the
+/// clear quarantines nothing of what the sequence alone held, and the next
+/// turn refills the same pages without a grow and without a recycle.
+///
+/// The epochs are the boundary's own: the turn's reads are in epoch 4 or
+/// before, epoch 5 is open at the clear, and the refill comes when 4 has
+/// completed and 5 has not. The quarantine would have waited for 5, which
+/// nothing commits between turns: that is the case A1 grows the pool for.
+/// The reference is absolute: the same page indices, the same table.
+#[test]
+fn a_same_sequence_clear_keeps_its_pages_and_refills_without_a_grow() {
+    let mut p = pool(2);
+    let mut q = PageQuarantine::new();
+    assert_eq!(
+        p.append(0, 8).unwrap(),
+        pg([0, 1]),
+        "the turn fills the pool"
+    );
+
+    let given_up = p.clear_keep(0, Epoch(4));
+    q.retire_all(Epoch(5), given_up);
+    assert_eq!(p.seq(0).unwrap().len(), 0, "the clear empties the sequence");
+
+    let completed = Completed(5);
+    p.recycle(&q.drain(completed)).unwrap();
+    let settled = p.settle_kept(0, completed);
+    let fresh = p.append(0, 8).map_err(|e| e.to_string());
+    assert_eq!(
+        fresh,
+        Ok(vec![]),
+        "the refill writes its own kept pages and allocates nothing"
+    );
+    assert!(
+        settled.is_empty(),
+        "epoch 4 has completed: the kept pages stay the sequence's"
+    );
+    assert_eq!(
+        q.held(),
+        0,
+        "a page the sequence alone holds is kept, not quarantined"
+    );
+    assert_eq!(p.pool_pages(), 2, "no grow");
+    assert_eq!(
+        p.table_for(0, 1),
+        vec![0, 1],
+        "the same table as the turn before"
+    );
+}
+
+/// A kept page whose readers have not completed is given up, not written.
+///
+/// The counterexample in `memory.md` §9.5r is a read in epoch 4 still running
+/// when the refill comes. `settle_kept` at a count that does not cover epoch 4
+/// must hand the pages back for the quarantine, and the refill must be served
+/// from pages nobody read. Before the settle, a write is refused.
+#[test]
+fn a_kept_page_is_not_written_before_its_readers_complete() {
+    let mut p = pool(4);
+    let mut q = PageQuarantine::new();
+    p.append(0, 8).unwrap();
+    q.retire_all(Epoch(5), p.clear_keep(0, Epoch(4)));
+
+    assert_eq!(
+        p.append(0, 1),
+        Err(PageError::Owed {
+            seq: 0,
+            epoch: Epoch(4)
+        }),
+        "an owing sequence is refused before its settle"
+    );
+    let given_up = p.settle_kept(0, Completed(4));
+    assert_eq!(
+        given_up,
+        pg([0, 1]),
+        "epoch 4 is still running: the kept pages are given up for the quarantine"
+    );
+    assert_eq!(p.seq(0).unwrap().owed(), None);
+    q.retire_all(Epoch(5), given_up);
+    assert_eq!(
+        p.append(0, 8).unwrap(),
+        pg([2, 3]),
+        "the refill is served from pages no reader holds"
+    );
+    assert_eq!(
+        q.drain(Completed(6)),
+        pg([0, 1]),
+        "and the given-up pages come back after"
+    );
+}
+
+/// A page leaving for another sequence still waits for its retirement.
+///
+/// While sequence 0 keeps its pages they are its own: another sequence finds
+/// the pool exhausted. When sequence 0 leaves for good, its pages go to the
+/// quarantine at the epoch open then, and sequence 1 is handed them only after
+/// that epoch completes.
+#[test]
+fn a_cross_sequence_take_still_waits_for_retirement() {
+    let mut p = pool(2);
+    let mut q = PageQuarantine::new();
+    p.append(0, 8).unwrap();
+    q.retire_all(Epoch(5), p.clear_keep(0, Epoch(4)));
+    assert_eq!(
+        p.append(1, 4),
+        Err(PageError::Exhausted { pool_pages: 2 }),
+        "a kept page is never free for another sequence"
+    );
+
+    let freed = p.release(0);
+    assert_eq!(
+        freed,
+        pg([0, 1]),
+        "leaving for good gives the kept pages up"
+    );
+    assert_eq!(p.seq(0).unwrap().owed(), None);
+    q.retire_all(Epoch(5), freed);
+    p.recycle(&q.drain(Completed(5))).unwrap();
+    assert_eq!(
+        p.append(1, 4),
+        Err(PageError::Exhausted { pool_pages: 2 }),
+        "a cross-sequence take waits for the epoch open at the release"
+    );
+    p.recycle(&q.drain(Completed(6))).unwrap();
+    assert_eq!(p.append(1, 4).unwrap(), pg([1]));
+}
+
+/// A page another sequence shares is never kept by one of them.
+///
+/// Sequence 1 reads page 0 as its prefix; sequence 0's clear keeps only page
+/// 1, which it alone holds, and gives up its reference to page 0. The refill
+/// takes a fresh page beside the kept one and never writes page 0.
+#[test]
+fn a_shared_prefix_page_is_never_kept_by_one_sequence() {
+    let mut p = pool(4);
+    let mut q = PageQuarantine::new();
+    p.append(0, 8).unwrap();
+    p.share_prefix(0, 1, 1).unwrap();
+    let given_up = p.clear_keep(0, Epoch(4));
+    assert!(
+        given_up.is_empty(),
+        "page 0 keeps a referent, so nothing reaches the quarantine"
+    );
+    q.retire_all(Epoch(5), given_up);
+    assert_eq!(
+        p.seq(0).unwrap().pages(),
+        pg([1]).as_slice(),
+        "only the private page is kept"
+    );
+    assert_eq!(p.seq(1).unwrap().pages(), pg([0]).as_slice());
+    assert_eq!(p.pages_in_use(), 2);
+
+    assert!(p.settle_kept(0, Completed(5)).is_empty());
+    assert_eq!(p.append(0, 8).unwrap(), pg([2]));
+    assert_eq!(p.seq(0).unwrap().pages(), pg([1, 2]).as_slice());
+    assert_eq!(
+        p.release(1),
+        pg([0]),
+        "page 0 leaves with its last referent"
+    );
+}
+
+/// The debt refuses every write and every share until it is settled, and a
+/// second clear owes the later of the two epochs.
+#[test]
+fn an_owing_sequence_refuses_writes_and_shares_until_it_settles() {
+    let mut p = pool(8);
+    p.append(0, 8).unwrap();
+    p.append(1, 8).unwrap();
+    p.clear_keep(0, Epoch(4));
+    let owed = Err(PageError::Owed {
+        seq: 0,
+        epoch: Epoch(4),
+    });
+    assert_eq!(p.reserve(0, 4).map(|_| ()), owed);
+    assert_eq!(p.share_prefix(0, 2, 1), owed, "an owing source is refused");
+    assert_eq!(
+        p.share_prefix(1, 0, 1),
+        owed,
+        "an owing destination is refused"
+    );
+    p.clear_keep(0, Epoch(9));
+    assert_eq!(p.seq(0).unwrap().owed(), Some(Epoch(9)));
+    assert_eq!(
+        p.pages_held_for(0, Completed(9)),
+        0,
+        "uncovered: the plan cannot count them"
+    );
+    assert_eq!(p.pages_held_for(0, Completed(10)), 2);
+    assert!(p.settle_kept(0, Completed(10)).is_empty());
+    assert_eq!(p.append(0, 4).unwrap(), Vec::<PageIdx>::new());
+}

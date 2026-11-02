@@ -483,22 +483,27 @@ mod metal {
             .0;
         let model = Model::<CrownExact>::new(&cfg, vb)?;
         let routes = model.projection_routes();
-        let band = |t: &str, cast: &str| {
-            format!(
-                "rows 1+ {cast}Matvec({t}), rows 9+ {cast}Gemm({t}), rows 64+ {cast}DequantOnceGemm({t})"
-            )
+        // The bands' edges and triples, written out; between the one-row
+        // core and the GEMM the process's row policy may open an `_r` band
+        // (`project_route.rs` pins both policies).
+        let band = |line: &str, t: &str, cast: &str| {
+            line.contains(&format!(": rows 1+ {cast}Matvec({t}), "))
+                && line.ends_with(&format!(
+                    "rows 9+ {cast}Gemm({t}), rows 64+ {cast}DequantOnceGemm({t})"
+                ))
         };
         // 2 conv layers × (in, out, w1, w3, w2) + 1 attention layer × (q, k,
         // v, o, w1, w3, w2).
-        assert_eq!(
-            routes,
-            vec![
-                format!("17 x q8_0 at (f16, f32, f16): {}", band("F16F32F16", "")),
-                format!(
-                    "head q8_0 (tied) at (f32, f32, f32): {}",
-                    band("F32F32F32", "cast f16 + ")
-                ),
-            ]
+        assert_eq!(routes.len(), 2, "{routes:?}");
+        assert!(
+            routes[0].starts_with("17 x q8_0 at (f16, f32, f16): ")
+                && band(&routes[0], "F16F32F16", ""),
+            "{routes:?}"
+        );
+        assert!(
+            routes[1].starts_with("head q8_0 (tied) at (f32, f32, f32): ")
+                && band(&routes[1], "F32F32F32", "cast f16 + "),
+            "{routes:?}"
         );
         assert_eq!(
             model.embed(&Tensor::new(&[[1u32]], &dev)?)?.dtype(),

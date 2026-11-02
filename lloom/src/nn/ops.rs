@@ -1042,16 +1042,21 @@ fn shortconv_ring_impl(
         // The per-row index buffers, or — unread at `per_row == 0` — the
         // weights' buffer bound in their place, so no buffer is allocated
         // for a binding the kernel never dereferences.
-        let (rs_guard, rp_guard) = match rows {
+        // A row buffer may be a view (a step frame's field, §4.6): bound at
+        // its byte offset.
+        let (rs_guard, rp_guard, rs_off, rp_off) = match rows {
             Some((rs, rp)) => {
                 let (a, al) = rs.storage_and_layout();
                 let (b2, bl) = rp.storage_and_layout();
-                if al.start_offset() != 0 || bl.start_offset() != 0 {
-                    lloom_tensor::bail!("shortconv_ring_rows: row buffers must start at offset 0");
-                }
-                (Some(a), Some(b2))
+                let u = DType::U32.size_in_bytes();
+                (
+                    Some(a),
+                    Some(b2),
+                    al.start_offset() * u,
+                    bl.start_offset() * u,
+                )
             }
-            None => (None, None),
+            None => (None, None, 0, 0),
         };
         let rs_buf = match rs_guard.as_deref() {
             Some(lloom_tensor::Storage::Metal(m)) => m.buffer(),
@@ -1096,8 +1101,14 @@ fn shortconv_ring_impl(
                 buffer_o(st_s.buffer(), st_l, dtype),
                 buffer_o(w_s.buffer(), w_l, dtype),
                 &dst,
-                rs_buf,
-                rp_buf,
+                lloom_tensor::kernels::BufferOffset {
+                    buffer: rs_buf,
+                    offset_in_bytes: rs_off,
+                },
+                lloom_tensor::kernels::BufferOffset {
+                    buffer: rp_buf,
+                    offset_in_bytes: rp_off,
+                },
             )
         }
         .map_err(lloom_tensor::Error::wrap)?;
@@ -4302,27 +4313,24 @@ impl lloom_tensor::CustomOp3 for FlashDecoding<'_> {
             }
             Some(_) => None,
         };
-        let (chunk_table, n_keys_per_seq): (
+        // The table and the live counts may be views into a larger buffer (a
+        // step frame's fields, §4.6): each bound at its byte offset.
+        let u32_bytes = DType::U32.size_in_bytes();
+        let (chunk_table, chunk_table_offset, n_keys_per_seq, n_keys_offset): (
             &lloom_tensor::kernels::metal::buffer::Buffer,
+            usize,
             &lloom_tensor::kernels::metal::buffer::Buffer,
+            usize,
         ) = match (&bound_guards, &uploaded, &uploaded_keys) {
             (None, None, Some(n)) if resident_guard.is_some() => {
                 let (ts, tl) = resident_guard.as_ref().expect("checked");
-                if tl.start_offset() != 0 {
-                    lloom_tensor::bail!("flash-decoding: a resident table must start at offset 0");
-                }
                 let t = match &**ts {
                     lloom_tensor::Storage::Metal(m) => m.buffer(),
                     _ => lloom_tensor::bail!("flash-decoding: the resident table must be on metal"),
                 };
-                (t, n)
+                (t, tl.start_offset() * u32_bytes, n, 0)
             }
             (Some(((ts, tl), (ns, nl))), _, _) => {
-                if tl.start_offset() != 0 || nl.start_offset() != 0 {
-                    lloom_tensor::bail!(
-                        "flash-decoding: a bound table or live-count tensor must start at offset 0"
-                    );
-                }
                 let t = match &**ts {
                     lloom_tensor::Storage::Metal(m) => m.buffer(),
                     _ => lloom_tensor::bail!("flash-decoding: the bound table must be on metal"),
@@ -4333,9 +4341,14 @@ impl lloom_tensor::CustomOp3 for FlashDecoding<'_> {
                         "flash-decoding: the bound live counts must be on metal"
                     ),
                 };
-                (t, n)
+                (
+                    t,
+                    tl.start_offset() * u32_bytes,
+                    n,
+                    nl.start_offset() * u32_bytes,
+                )
             }
-            (None, Some(t), Some(n)) => (t, n),
+            (None, Some(t), Some(n)) => (t, 0, n, 0),
             _ => unreachable!("either bound or uploaded"),
         };
         let mut partial = lloom_tensor::kernels::FlashPartialParams::for_step(
@@ -4401,10 +4414,12 @@ impl lloom_tensor::CustomOp3 for FlashDecoding<'_> {
                 &sums,
                 &maxs,
                 chunk_table,
+                chunk_table_offset,
                 &partial_params,
                 &combine_params,
                 &walk_order,
                 n_keys_per_seq,
+                n_keys_offset,
                 n_q_heads,
                 head_dim,
                 n_chunks,

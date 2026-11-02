@@ -228,6 +228,10 @@ name = "gemv_ceiling"
 required-features = ["metal"]
 
 [[example]]
+name = "register_census"
+required-features = ["metal"]
+
+[[example]]
 name = "counter_sample_limit"
 required-features = ["metal"]
 

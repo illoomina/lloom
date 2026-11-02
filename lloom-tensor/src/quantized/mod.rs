@@ -20,6 +20,8 @@ pub mod k_quants;
 pub mod metal;
 #[cfg(any(feature = "metal", test))]
 pub(crate) mod moe_rowmap;
+#[cfg(feature = "metal")]
+pub mod route;
 pub mod tokenizer;
 #[cfg(not(feature = "metal"))]
 mod metal {

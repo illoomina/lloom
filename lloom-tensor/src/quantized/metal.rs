@@ -423,7 +423,7 @@ impl QMetalStorage {
     /// q6_K `[10240 × 2560]` at 4 rows) and is another accumulation order
     /// than the row gemvs, so it is the measurement arm for a multi-row
     /// pass that gives up bit-identity with the single row.
-    fn qmv_rows_max() -> usize {
+    pub(crate) fn qmv_rows_max() -> usize {
         static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
         *N.get_or_init(|| {
             crate::tuning::tuning()
@@ -439,6 +439,8 @@ impl QMetalStorage {
         self_shape: &Shape,
         storage: &MetalStorage,
         layout: &crate::Layout,
+        triple: crate::kernels::GemvTriple,
+        nr1: usize,
     ) -> Result<(MetalStorage, Shape)> {
         use crate::MetalError;
 
@@ -469,27 +471,11 @@ impl QMetalStorage {
         let dst_shape = Shape::from(dst_shape);
         let device = storage.device().clone();
 
-        // Issue #750: the activation dtype chooses the `(activation, accumulate,
-        // store)` triple. An f16 activation reads and stores f16 (accumulating in
-        // f32 — §8.1.4), so a quantized weight no longer forces the activation and
-        // store to f32; anything else keeps the historical `(f32, f32, f32)` arm,
-        // which is byte-identical to the pre-#750 kernel. The store dtype follows
-        // the store leg of the triple, so `dst` is allocated and tagged to match.
-        use crate::kernels::{GemvFloat, GemvTriple};
+        // The triple and the row capacity are the route's (`route::resolve`):
+        // the activation dtype chose the triple, and the store dtype follows
+        // its store leg.
+        use crate::kernels::GemvFloat;
         let ggml_dtype: crate::kernels::GgmlDType = self.dtype.into();
-        let triple = match storage.dtype() {
-            DType::F32 => GemvTriple::F32F32F32,
-            DType::F16 if ggml_dtype.has_gemv_triple() => GemvTriple::F16F32F16,
-            // An f16 activation on a weight whose core has no f16 arm (dense/Q8),
-            // or any other activation dtype, is not a triple this dispatch can
-            // serve. Refuse rather than read the buffer under the wrong dtype
-            // (§8.1.4: the kernel reads `src1` as the triple's activation leg, so
-            // a mismatched buffer is silent corruption, not an error).
-            other => crate::bail!(
-                "quantized matmul-vec has no ({other:?}, f32, _) arm for weight {:?}",
-                self.dtype
-            ),
-        };
         let store_dtype = match triple.store() {
             GemvFloat::F16 => DType::F16,
             GemvFloat::F32 => DType::F32,
@@ -509,13 +495,14 @@ impl QMetalStorage {
         // computes, without the launch per row (a decode batch's `B` rows).
         // SAFETY: binding authority (module head).
         unsafe {
-            crate::kernels::call_quantized_matmul_mv_t(
+            crate::kernels::call_quantized_matmul_mv_rows_t(
                 device.device(),
                 &encoder,
                 device.kernels(),
                 ggml_dtype,
                 triple,
                 (1, m, n, k),
+                nr1,
                 storage.buffer(),
                 layout.start_offset() * storage.dtype().size_in_bytes(),
                 &self.buffer,
@@ -648,15 +635,30 @@ impl QMetalStorage {
             )
         }
 
-        // A handful of rows go through the matmul-vec kernel once per row:
-        // the mm kernels tile the rows by 32 and dequantize whole tiles, so
-        // at a decode batch's `m` (a few rows, `[B, 1, k]` or `[1, B, k]`)
-        // they cost several times the per-row gemvs; and per-row gemvs make
-        // every row exactly what it computes alone (the batched decode's
-        // identity). Prefill widths keep the mm kernels.
+        // The route is decided before anything is allocated, so a refused
+        // request costs nothing (`route::resolve`). A handful of rows take the
+        // matmul-vec once per row: the mm kernels tile the rows by 32 and
+        // dequantize whole tiles, so at a decode batch's `m` they cost several
+        // times the per-row gemvs, and per-row gemvs make every row exactly
+        // what it computes alone (the batched decode's identity).
         let rows_total = src_shape.elem_count() / k.max(1);
-        if src_shape.dim(D::Minus2)? == 1 || rows_total <= Self::qmv_rows_max() {
-            return self.fwd_mv(self_shape, storage, layout);
+        let route = super::route::resolve(
+            super::route::Weight {
+                kind: self.dtype.into(),
+                rank: self_shape.rank(),
+                k,
+            },
+            super::route::Spec {
+                act: storage.dtype(),
+                rows: rows_total,
+                row_per_batch: src_shape.dim(D::Minus2)? == 1,
+            },
+            super::route::Policy::current(),
+        )
+        .map_err(crate::Error::msg)?;
+        use super::route::Route;
+        if let Route::Matvec { triple, rows } = route {
+            return self.fwd_mv(self_shape, storage, layout, triple, rows);
         }
 
         let last_k = dst_shape.pop().unwrap();
@@ -666,38 +668,32 @@ impl QMetalStorage {
         dst_shape.push(n);
         let dst_shape = Shape::from(dst_shape);
         let device = storage.device().clone();
+        // The store follows the triple's store leg; the steel arm stores f32.
+        let triple = match route {
+            Route::Gemm(t) | Route::DequantOnceGemm(t) => t,
+            Route::DequantOnceSteel | Route::Matvec { .. } => crate::kernels::GemvTriple::F32F32F32,
+        };
+        let store_dtype = match triple.store() {
+            crate::kernels::GemvFloat::F16 => DType::F16,
+            crate::kernels::GemvFloat::F32 => DType::F32,
+        };
+        let act_size = storage.dtype().size_in_bytes();
         let dst = device
             .new_buffer_builder()
-            .with_size_for(dst_shape.elem_count(), DType::F32)
+            .with_size_for(dst_shape.elem_count(), store_dtype)
             .with_label("qmatmul")
             .build()?;
         // The dequantise-once scratch is taken BEFORE the encoder guard
         // (`new_persistent_private` may open its own encoder; the commands
         // lock is not reentrant).
-        let dequant_from = dequant_once_from();
         let (n_rows_w, k_w) = (self_shape.dims()[self_shape.rank() - 2], k);
-        let dequant_scratch_buf = if dequant_from > 0
-            && rows_total >= dequant_from
-            && self_shape.rank() == 2
-            && k_w.is_multiple_of(16)
-            && dequant_once_kind(self.dtype.into())
-        {
-            Some(dequant_scratch(&device, n_rows_w * k_w * 2)?)
-        } else {
-            None
+        let dequant_scratch_buf = match route {
+            Route::DequantOnceGemm(_) | Route::DequantOnceSteel => {
+                Some(dequant_scratch(&device, n_rows_w * k_w * 2)?)
+            }
+            Route::Gemm(_) | Route::Matvec { .. } => None,
         };
         let encoder = device.command_encoder()?;
-
-        // The GEMM arms read f32 activations; an f16 activation past the
-        // matmul-vec's rows is refused here (#907's finding: it panicked on
-        // an assert), not read under the wrong dtype.
-        if storage.dtype() != DType::F32 {
-            crate::bail!(
-                "quantized matmul on Metal reads f32 activations at {rows_total} rows (the GEMM arms); got {:?} for weight {:?} — the f16 arm is the matmul-vec's, rows <= 8",
-                storage.dtype(),
-                self.dtype
-            )
-        }
 
         if self_shape.rank() > 4 {
             crate::bail!("weight rank ({}) must be <= 4", self_shape.rank())
@@ -730,7 +726,7 @@ impl QMetalStorage {
             // (`OutT`), no cast back. A different tile loop, so a different
             // reduction order than the unpacking arm — and measured no faster
             // than the quantized f16 arm below (P26), which is the default.
-            if dequant_gemm_steel() && layout.is_contiguous() {
+            if route == Route::DequantOnceSteel {
                 let x16 = device
                     .new_buffer_builder()
                     .with_size_for(rows_total * k, DType::F16)
@@ -798,6 +794,7 @@ impl QMetalStorage {
                     &encoder,
                     device.kernels(),
                     crate::kernels::GgmlDType::F16,
+                    triple,
                     src0_l.dims(),
                     &src0_stride,
                     &scratch,
@@ -806,7 +803,7 @@ impl QMetalStorage {
                     &src1_l
                         .stride()
                         .iter()
-                        .map(|x| x * DType::F32.size_in_bytes())
+                        .map(|x| x * act_size)
                         .collect::<Vec<_>>(),
                     storage.buffer(),
                     // The activation view's own offset: `src1_l` is a fresh contiguous
@@ -823,7 +820,7 @@ impl QMetalStorage {
                 dst,
                 device.clone(),
                 dst_shape.elem_count(),
-                DType::F32,
+                store_dtype,
             )?;
             return Ok((dst_storage, dst_shape));
         }
@@ -853,6 +850,7 @@ impl QMetalStorage {
                 &encoder,
                 device.kernels(),
                 self.dtype.into(),
+                triple,
                 src0_l.dims(),
                 &src0_stride,
                 &self.buffer,
@@ -861,7 +859,7 @@ impl QMetalStorage {
                 &src1_l
                     .stride()
                     .iter()
-                    .map(|x| x * DType::F32.size_in_bytes())
+                    .map(|x| x * act_size)
                     .collect::<Vec<_>>(),
                 storage.buffer(),
                 // The activation view's own offset: `src1_l` is a fresh contiguous
@@ -879,7 +877,7 @@ impl QMetalStorage {
             dst,
             device.clone(),
             dst_shape.elem_count(),
-            DType::F32,
+            store_dtype,
         )?;
         Ok((dst_storage, dst_shape))
     }
@@ -1862,6 +1860,7 @@ pub fn matmul_f16_weight_f32(xs: &crate::Tensor, w: &crate::Tensor) -> Result<cr
             &encoder,
             device.kernels(),
             crate::kernels::GgmlDType::F16,
+            crate::kernels::GemvTriple::F32F32F32,
             src0_l.dims(),
             &src0_stride,
             wm.buffer(),
@@ -1952,12 +1951,6 @@ pub fn set_dequant_once_from(from: usize) {
 
 static DEQUANT_ONCE_FROM: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(usize::MAX);
-
-/// The weight kinds with a `kernel_dequant_rows_f16` arm (every quantized
-/// kind; the float kinds have nothing to dequantise).
-fn dequant_once_kind(dtype: crate::kernels::GgmlDType) -> bool {
-    dtype.kind().dequant_rows_f16
-}
 
 /// Domain-local scratch retains its identity across stems; the hazard chain
 /// orders each write after the preceding stem's read.

@@ -68,6 +68,7 @@ mod lfm2_qkv_layout;
 mod lfm2_sliding_ring_open;
 mod lfm2_spec_conv_rollback;
 mod lfm2_spec_conv_shape;
+mod lfm2_step_frame;
 mod lfm2_streamed_layers;
 mod lfm2_vl_embeds_entry;
 mod lfm2_walk_census;
@@ -99,6 +100,7 @@ mod qwen3_5_mtp;
 mod qwen3_5_tiny;
 mod qwen4exp_batched_rows;
 mod qwen4exp_chunk_past_dense;
+mod qwen4exp_decode_hint_drain;
 mod qwen4exp_decode_plan_variants;
 mod qwen4exp_device_plan;
 mod qwen4exp_dflash;
@@ -120,6 +122,7 @@ mod qwen4exp_mtpvar;
 mod qwen4exp_pass_plan_openers;
 mod qwen4exp_pass_plan_requests;
 mod qwen4exp_pass_plans_warmup;
+mod qwen4exp_ple_rows_batch;
 mod qwen4exp_prefill_plan_variants;
 mod qwen4exp_prefill_transient;
 mod qwen4exp_provisional;
@@ -185,6 +188,7 @@ fn every_test_file_is_a_module() {
         "token_ring_nonblocking",
         "decode_step_census",
         "qwen4exp_prefill_transient_cpu",
+        "ngram_fill_alloc_free",
     ];
     let dir = format!("{}/tests", lloom_manifest_dir());
     let me = include_str!("main.rs");

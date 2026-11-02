@@ -801,6 +801,18 @@ impl std::ops::Deref for MetalDevice {
 /// ids or a weight staging buffer is not.
 pub const SMALL_UPLOAD_BYTES: usize = 32 * 1024;
 
+#[cfg(any(debug_assertions, feature = "profile"))]
+static HOST_UPLOADS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Host-to-device uploads made in this process (`new_buffer_with_data`, every
+/// `Tensor::new` on Metal and every by-value constant miss). Debug and profile
+/// builds only; a test reads its delta across decode steps to assert a step
+/// uploads nothing (`profiles-and-memory-design.md` §4.6).
+#[cfg(any(debug_assertions, feature = "profile"))]
+pub fn host_upload_count() -> u64 {
+    HOST_UPLOADS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Device buffers keyed by their contents (`MetalDevice::constant_buffer`).
 ///
 /// A kernel's argument block is a value: the same bytes every step until a
@@ -4146,6 +4158,8 @@ impl MetalDevice {
         data: &[T],
         context: Option<&crate::memory_admission::AllocationContext>,
     ) -> Result<BufferHandle> {
+        #[cfg(any(debug_assertions, feature = "profile"))]
+        HOST_UPLOADS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let unpooled_uploads = Self::unpooled;
         let size = core::mem::size_of_val(data);
         // Metal refuses a zero-length `newBufferWithBytes`, and an empty tensor
@@ -4639,10 +4653,16 @@ mod attribution_build_tests {
     #[test]
     fn served_attribution_collects_a_real_backtrace_without_a_device() {
         let symbol_control = std::backtrace::Backtrace::force_capture().to_string();
+        let named_by_path = symbol_control
+            .lines()
+            .filter_map(|l| l.trim().split_once(": ").map(|(_, f)| f))
+            .any(|f| {
+                f.starts_with("lloom_tensor::metal_backend::device::attribution_build_tests::served_attribution_collects_a_real_backtrace_without_a_device")
+            });
         assert!(
-            symbol_control
-                .contains("served_attribution_collects_a_real_backtrace_without_a_device"),
-            "symbolization positive control: {symbol_control}"
+            named_by_path,
+            "symbolization positive control: this test's frame must be named by its \
+             path, as `call_site` reads frames, not only by its bare name: {symbol_control}"
         );
         eprintln!("symbolization positive control:\n{symbol_control}");
         super::set_served_request_trace(false).unwrap();

@@ -59,10 +59,10 @@ fn a_kind_takes_the_axis_where_its_ceiling_says() -> Result<()> {
         (GgmlDType::Q2K, 8, Some("kernel_mul_mv_q2_K_f32_r8")),
         (GgmlDType::Q8_0, 2, Some("kernel_mul_mv_q8_0_f32_r2")),
         (GgmlDType::Q8_0, 5, Some("kernel_mul_mv_q8_0_f32_r2")),
-        (GgmlDType::Q4K, 2, None),
-        (GgmlDType::Q4K, 8, None),
+        (GgmlDType::Q4K, 2, Some("kernel_mul_mv_q4_K_f32_r2")),
+        (GgmlDType::Q4K, 8, Some("kernel_mul_mv_q4_K_f32_r2")),
         (GgmlDType::IQ3XXS, 4, None),
-        (GgmlDType::Q6K, 4, None),
+        (GgmlDType::Q6K, 4, Some("kernel_mul_mv_q6_K_f32_r2")),
     ];
     let mut failures = Vec::new();
     for (dtype, m, want) in cases {

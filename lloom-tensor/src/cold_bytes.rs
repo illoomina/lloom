@@ -194,6 +194,17 @@ mod tests {
     unsafe fn must_not_allocate(_: Layout) -> *mut u8 {
         panic!("allocation before entitlement")
     }
+    /// `alloc_zeroed` with the block made observable. On the refusal path the
+    /// block is born and freed without ever being read, so at `opt-level >= 1`
+    /// LLVM may delete the pair outright (allocator calls are elidable, also
+    /// under a custom `#[global_allocator]`), and the observer then counts
+    /// `(born, freed) = (0, 0)`. Whether it does depends on inlining, so it
+    /// moved with unrelated changes to the crate. `black_box` escapes the
+    /// pointer, which keeps the allocation real.
+    unsafe fn observed_alloc_zeroed(layout: Layout) -> *mut u8 {
+        // SAFETY: forwarded caller contract of `alloc_zeroed`.
+        std::hint::black_box(unsafe { alloc_zeroed(layout) })
+    }
 
     #[cfg(lloom_audited_arc_layout)]
     #[test]
@@ -267,6 +278,9 @@ mod tests {
         let pass = domain.reserve(quote).unwrap();
         let report = crate::free_observer::observe(&domain, |watch| {
             let scratch = ColdScratch::<f32>::zeroed_in(&pass.context(), 7).unwrap();
+            // Escape the block so its birth and free stay real (see
+            // `observed_alloc_zeroed`).
+            let scratch = std::hint::black_box(scratch);
             watch.watch();
             drop(scratch);
         });
@@ -307,7 +321,7 @@ mod tests {
             // SAFETY: actual Global zeroed birth; synthetic commit refusal does
             // not create a charge or modify/retain the issued ticket.
             let failed = unsafe {
-                ColdScratch::<u32>::zeroed_with(&context, 7, alloc_zeroed, |_, _| {
+                ColdScratch::<u32>::zeroed_with(&context, 7, observed_alloc_zeroed, |_, _| {
                     // Close unused issuance while the actual ticket still owns
                     // the full demand: premature ticket Drop now refunds to zero.
                     drop(pass);

@@ -252,6 +252,22 @@ impl BlitCommandsGuard<'_> {
         )
     }
 
+    /// The exact recording this blit encodes into, pinned while the guard
+    /// excludes a cut: the blit twin of [`CommandsGuard::recording_marker`].
+    pub(crate) fn recording_marker(&self) -> Result<CommandMarker, MetalKernelError> {
+        let cb = self
+            ._guard
+            .current
+            .recording()
+            .ok_or(MetalKernelError::QueueUnavailable(
+                "a blit marker requires a recording",
+            ))?;
+        Ok(CommandMarker {
+            cb: cb.clone(),
+            signalled: None,
+        })
+    }
+
     pub(crate) fn retain_namespace(
         &mut self,
         owner: crate::metal_backend::device_retirement::NamespaceOwner,
@@ -393,6 +409,12 @@ impl CommandMarker {
         self.cb.status().0 >= MTLCommandBufferStatus::Completed.0
     }
 
+    /// Whether the marker's buffer has been handed to the queue: committed,
+    /// running, or finished. False for a recording still open or held.
+    pub fn is_submitted(&self) -> bool {
+        self.cb.status().0 >= MTLCommandBufferStatus::Committed.0
+    }
+
     /// Nonblocking known-error observation; false also includes pending work.
     pub fn is_failed(&self) -> bool {
         self.cb.status() == MTLCommandBufferStatus::Error
@@ -467,8 +489,8 @@ struct EntryState {
     /// A signal was encoded into the current recording since its cut.
     signals_since_cut: bool,
     /// Epochs taken by held recordings that were cancelled before their
-    /// commit: the next commit's completion completes them too.
-    owed_epochs: u32,
+    /// commit: a later commit's completion completes them (`produced::Owed`).
+    owed_epochs: produced::Owed,
     /// The current recording was cancelled and no replacement was free.
     current_abandoned: bool,
     /// Emptied after-commit lists, their storage kept: a held recording
@@ -514,7 +536,7 @@ impl EntryState {
             gate: produced::Gate::default(),
             held: std::collections::VecDeque::new(),
             signals_since_cut: false,
-            owed_epochs: 0,
+            owed_epochs: produced::Owed::default(),
             current_abandoned: false,
             spare_after: Vec::new(),
         }
@@ -1432,11 +1454,11 @@ impl Commands {
             return Ok(());
         };
         if let Some(enc) = &state.current_encoder {
-            let _unwind = CloseUnwind {
-                failure: &self.core.failure,
-                message: "compute encoder setup exited exceptionally; custody retained",
-                buffer: Some(&enc.command_buffer),
-            };
+            let _unwind = CloseUnwind::new(
+                &self.core.failure,
+                "compute encoder setup exited exceptionally; custody retained",
+                Some(&enc.command_buffer),
+            );
             // SAFETY: the flag is the gate's own buffer, held for this queue's life;
             // the host writes it only in `EosGate::begin`, before a round's first
             // gated dispatch.
@@ -1716,11 +1738,11 @@ impl Commands {
             // A custom bind may unwind after partially changing native state.
             // The canonical wrapper stays rooted, but no later recording gate
             // may treat it as a successfully initialized encoder.
-            let _unwind = CloseUnwind {
-                failure: &self.core.failure,
-                message: "compute encoder setup exited exceptionally; custody retained",
-                buffer: Some(&enc.command_buffer),
-            };
+            let _unwind = CloseUnwind::new(
+                &self.core.failure,
+                "compute encoder setup exited exceptionally; custody retained",
+                Some(&enc.command_buffer),
+            );
             if let Some(flag) = self.core.eos_gate.armed_flag() {
                 // The EOS gate (lloom #735 step 4): the gated kernel variants
                 // read the flag at this index; bound once per encoder.
@@ -2721,14 +2743,34 @@ impl Commands {
 
 /// Native close can unwind before returning a Result. Custody was already
 /// staged in EntryState; latch only a static failure without allocating here.
+/// The failure is the close's only when the unwind began inside it: a close
+/// started while the thread was already unwinding (an unrelated panic whose
+/// cleanup closes the encoder) cannot itself unwind, because a second panic
+/// there aborts, so its completion is not a failure.
 struct CloseUnwind<'a> {
     failure: &'a CommandBufferFailure,
     message: &'static str,
     buffer: Option<&'a CommandBuffer>,
+    /// The thread was already unwinding when the close started.
+    unwinding_at_start: bool,
+}
+impl<'a> CloseUnwind<'a> {
+    fn new(
+        failure: &'a CommandBufferFailure,
+        message: &'static str,
+        buffer: Option<&'a CommandBuffer>,
+    ) -> Self {
+        Self {
+            failure,
+            message,
+            buffer,
+            unwinding_at_start: std::thread::panicking(),
+        }
+    }
 }
 impl Drop for CloseUnwind<'_> {
     fn drop(&mut self) {
-        if std::thread::panicking() {
+        if std::thread::panicking() && !self.unwinding_at_start {
             self.failure.record_static(self.message);
             if let Some(buffer) = self.buffer {
                 buffer.notify_lifecycle();
@@ -2900,11 +2942,11 @@ impl CommandsCore {
                 .ok_or(MetalKernelError::QueueUnavailable(
                     "closed blit custody bound (2) exhausted",
                 ))?;
-            let _unwind = CloseUnwind {
-                failure: &self.failure,
-                message: "blit close exited exceptionally; custody retained",
-                buffer: None,
-            };
+            let _unwind = CloseUnwind::new(
+                &self.failure,
+                "blit close exited exceptionally; custody retained",
+                None,
+            );
             if let Err(error) = pending.encoder.end_encoding() {
                 if !matches!(
                     error,
@@ -2937,6 +2979,7 @@ impl CommandsCore {
         let (state, custody) = state.parts_mut();
         let state: &mut EntryState = state;
         let owed_epochs = &mut state.owed_epochs;
+        let held_ahead = state.held.len();
         let mut published = false;
         let submitted = state
             .current
@@ -2958,8 +3001,9 @@ impl CommandsCore {
                     clock: &self.clock,
                 };
                 // Epochs of held recordings cancelled before their commit
-                // complete with this one (`produced.rs`).
-                let owed = std::mem::take(owed_epochs);
+                // complete with this one (`produced::Owed`); an ordinary
+                // commit runs with nothing held.
+                let runs = owed_epochs.runs_for(None, held_ahead);
                 let receipt = self.submit_owned_recording(
                     authority,
                     Some(destination),
@@ -2967,11 +3011,11 @@ impl CommandsCore {
                     timed,
                     t_end_enc,
                     None,
-                    1 + owed,
+                    runs,
                 );
-                match &receipt {
-                    Ok(_) => published = true,
-                    Err(_) => *owed_epochs += owed,
+                if receipt.is_ok() {
+                    owed_epochs.settle(runs);
+                    published = true;
                 }
                 receipt
             })
@@ -3154,11 +3198,11 @@ impl EncoderFinalizer {
         nonblocking: bool,
     ) -> Result<(), MetalKernelError> {
         self.failure.check()?;
-        let _unwind = CloseUnwind {
-            failure: &self.failure,
-            message: "compute close exited exceptionally; custody retained",
-            buffer: Some(&encoder.command_buffer),
-        };
+        let _unwind = CloseUnwind::new(
+            &self.failure,
+            "compute close exited exceptionally; custody retained",
+            Some(&encoder.command_buffer),
+        );
         encoder.end_encoding_prepared(
             nonblocking,
             || {
@@ -3421,11 +3465,11 @@ impl lifecycle::FinalCore for CommandsCore {
                     "retained blit close failure",
                 ));
             }
-            let _unwind = CloseUnwind {
-                failure: &self.failure,
-                message: "final blit close exited exceptionally; custody retained",
-                buffer: None,
-            };
+            let _unwind = CloseUnwind::new(
+                &self.failure,
+                "final blit close exited exceptionally; custody retained",
+                None,
+            );
             if !pending.encoder.try_end_encoding()? {
                 return Ok(false);
             }
@@ -3447,7 +3491,7 @@ impl lifecycle::FinalCore for CommandsCore {
         if state.current_abandoned && !self.replace_abandoned_for_final(&mut state, captures)? {
             return Ok(false);
         }
-        let owed = std::mem::take(&mut state.owed_epochs);
+        let runs = state.owed_epochs.runs_for(None, state.held.len());
         let removals = if captures.removals.is_none() {
             Some(&mut captures.removals)
         } else {
@@ -3463,11 +3507,11 @@ impl lifecycle::FinalCore for CommandsCore {
                     buffer: cb,
                     clock: &self.clock,
                 };
-                self.submit_owned_recording(authority, removals, true, None, None, None, 1 + owed)
+                self.submit_owned_recording(authority, removals, true, None, None, None, runs)
             })
             .map(|_| ());
-        if submitted.is_err() {
-            state.owed_epochs += owed;
+        if submitted.is_ok() {
+            state.owed_epochs.settle(runs);
         }
         match submitted {
             Ok(_) => Ok(true),
@@ -3578,11 +3622,11 @@ mod entry_unwind_tests {
         let state = parking_lot::Mutex::new(Some(owner));
         assert!(catch_unwind(AssertUnwindSafe(|| {
             let _entry = DeferredGuard::new(state.lock(), ());
-            let _setup = CloseUnwind {
-                failure: &failure,
-                message: "compute encoder setup exited exceptionally; custody retained",
-                buffer: None,
-            };
+            let _setup = CloseUnwind::new(
+                &failure,
+                "compute encoder setup exited exceptionally; custody retained",
+                None,
+            );
             panic!("controlled setup unwind");
         }))
         .is_err());
@@ -3596,6 +3640,43 @@ mod entry_unwind_tests {
             .try_lock()
             .expect("setup unwind retained EntryState lock")
             .is_some());
+    }
+
+    /// A close that starts while an unrelated unwind is in progress, as the
+    /// EOS gate's guard closes the open encoder when a decode forward
+    /// panics, returns normally: it is not a close that exited exceptionally.
+    #[test]
+    fn a_close_started_during_an_unrelated_unwind_is_not_a_failure() {
+        struct CloseInCleanup<'a> {
+            failure: &'a CommandBufferFailure,
+            unwinding: &'a std::cell::Cell<bool>,
+        }
+        impl Drop for CloseInCleanup<'_> {
+            fn drop(&mut self) {
+                self.unwinding.set(std::thread::panicking());
+                let _close = CloseUnwind::new(
+                    self.failure,
+                    "compute close exited exceptionally; custody retained",
+                    None,
+                );
+            }
+        }
+        let failure = CommandBufferFailure::default();
+        let unwinding = std::cell::Cell::new(false);
+        assert!(catch_unwind(AssertUnwindSafe(|| {
+            let _cleanup = CloseInCleanup {
+                failure: &failure,
+                unwinding: &unwinding,
+            };
+            panic!("unrelated decode-forward unwind");
+        }))
+        .is_err());
+        assert!(unwinding.get(), "the close ran during the unwind");
+        assert!(
+            failure.check().is_ok(),
+            "a completed close during an unrelated unwind latched a failure: {:?}",
+            failure.check()
+        );
     }
 }
 

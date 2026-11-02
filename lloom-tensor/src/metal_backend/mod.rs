@@ -43,6 +43,8 @@ pub(crate) mod device_retirement;
 pub(crate) use device::call_site;
 pub(crate) use device::retain_evicted_allocations;
 mod physical_context;
+#[cfg(any(debug_assertions, feature = "profile"))]
+pub use device::host_upload_count;
 pub use device::{
     served_pass_request_sites, set_admission_drain, set_served_request_trace, wire_weights_on,
     DeviceId, MetalDevice, PassPlansPaused,
@@ -163,8 +165,8 @@ pub static TO_CPU_STAGED_READBACK: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
 /// Of `TO_CPU_STAGED_READBACK`, the reads that waited on their blit's
-/// command buffer: a host sync. A deferred stage reads after a drain some
-/// other readback already waited for, and is not one.
+/// command buffer: a host sync. A deferred stage finished after the drain
+/// some other readback already waited for is not one.
 pub static TO_CPU_STAGED_WAIT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Reads of a host-read slot ([`HostSlot::read`]): the producing kernel
@@ -191,9 +193,12 @@ pub struct ReadbackCounts {
     pub staged: u64,
     /// `stage_readback` reads.
     pub staged_readback: u64,
-    /// Of `staged_readback`, the ones that waited on their blit (not a
-    /// deferred stage).
+    /// Of `staged_readback`, the ones that waited on their blit: every
+    /// committed stage, and a deferred one its drain had not completed.
     pub staged_wait: u64,
+    /// Of `staged_wait`, the deferred stages whose recording no drain had
+    /// submitted: `finish` submitted it.
+    pub deferred_undrained: u64,
     /// Host-read slot reads.
     pub slot: u64,
     /// Staging buffers allocated for readbacks.
@@ -210,6 +215,7 @@ pub fn readback_counts() -> ReadbackCounts {
         staged: TO_CPU_STAGED.load(Relaxed),
         staged_readback: TO_CPU_STAGED_READBACK.load(Relaxed),
         staged_wait: TO_CPU_STAGED_WAIT.load(Relaxed),
+        deferred_undrained: TO_CPU_DEFERRED_UNDRAINED.load(Relaxed),
         slot: TO_CPU_SLOT.load(Relaxed),
         staging_allocs: TO_CPU_STAGING_ALLOCS.load(Relaxed),
     }
@@ -225,6 +231,7 @@ impl ReadbackCounts {
             staged: self.staged - before.staged,
             staged_readback: self.staged_readback - before.staged_readback,
             staged_wait: self.staged_wait - before.staged_wait,
+            deferred_undrained: self.deferred_undrained - before.deferred_undrained,
             slot: self.slot - before.slot,
             staging_allocs: self.staging_allocs - before.staging_allocs,
         }
@@ -293,6 +300,28 @@ pub fn readback_sites() -> Vec<(&'static str, String, u64)> {
     Vec::new()
 }
 
+pub use crate::dtype::ReadbackElement;
+
+/// Refuse reading `count` elements of `T` out of a stage of `dtype` covering
+/// `staged` bytes, before any byte is touched.
+fn check_staged_read<T: ReadbackElement>(
+    what: &'static str,
+    dtype: DType,
+    count: usize,
+    staged: usize,
+) -> Result<()> {
+    if T::DTYPE != dtype {
+        crate::bail!("{what}: staged {dtype:?}, asked as {:?}", T::DTYPE)
+    }
+    match count.checked_mul(std::mem::size_of::<T>()) {
+        Some(bytes) if bytes <= staged => Ok(()),
+        _ => crate::bail!(
+            "{what}: {count} elements of {:?} exceed the {staged} bytes staged",
+            T::DTYPE
+        ),
+    }
+}
+
 /// A rank-1 storage's bytes copied to a CPU-mapped staging buffer and fenced by
 /// the command buffer that produced them (`MetalStorage::stage_read`).
 ///
@@ -314,13 +343,36 @@ pub struct StagedMetalRead {
 
 impl StagedMetalRead {
     /// Wait for the producing command buffer and copy the staged bytes out.
-    pub fn read<T: Clone>(&self) -> Result<Vec<T>> {
+    /// `T` must be the staged dtype's element type; anything else is refused
+    /// before the wait.
+    ///
+    /// ```no_run
+    /// # use lloom_tensor::{Device, StagedRead, Tensor};
+    /// let t = Tensor::new(&[1u32, 2], &Device::new_metal(0).unwrap()).unwrap();
+    /// if let StagedRead::Metal(staged) = t.stage_read().unwrap() {
+    ///     let _: Vec<u32> = staged.read().unwrap();
+    /// }
+    /// ```
+    ///
+    /// An element type outside [`ReadbackElement`] does not compile:
+    ///
+    /// ```compile_fail
+    /// # use lloom_tensor::{Device, StagedRead, Tensor};
+    /// let t = Tensor::new(&[1u32, 2], &Device::new_metal(0).unwrap()).unwrap();
+    /// if let StagedRead::Metal(staged) = t.stage_read().unwrap() {
+    ///     let _: Vec<String> = staged.read().unwrap();
+    /// }
+    /// ```
+    pub fn read<T: ReadbackElement>(&self) -> Result<Vec<T>> {
+        check_staged_read::<T>(
+            "StagedMetalRead::read",
+            self.dtype,
+            self.count,
+            self.count * self.dtype.size_in_bytes(),
+        )?;
         self.device.wait_marker(&self.marker)?;
         TO_CPU_STAGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        // The staging buffer is from the shared pool, so its mapping is not
-        // the allocator's choice; `read_to_vec` still refuses a null rather
-        // than reading one.
-        Ok(read_to_vec(&self.staging, self.count))
+        read_to_vec(&self.staging, self.count)
     }
 
     pub fn dtype(&self) -> DType {
@@ -335,6 +387,12 @@ impl StagedMetalRead {
     }
 }
 
+/// Of `TO_CPU_STAGED_READBACK`, the deferred stages whose recording was not
+/// yet submitted at `finish`: the drain the caller relied on had not run, so
+/// `finish` submitted and waited on the recording itself.
+pub static TO_CPU_DEFERRED_UNDRAINED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 /// A readback in two halves (`DESIGN.md` §11.5z-ix item 2): `stage_readback`
 /// copies the storage into a CPU-visible buffer NOW — a blit on the current
 /// command buffer, which it commits with a marker — and `finish` waits for
@@ -345,32 +403,79 @@ impl StagedMetalRead {
 /// issued after the other tile's work would wait for that work too.
 pub struct StagedReadback {
     buffer: BufferHandle,
-    /// `None` for a deferred stage (`stage_readback_deferred`): the blit is
-    /// encoded and NOT committed; `finish` reads with no wait, on the
-    /// caller's word that a drain (`flush_and_wait_current`, a plain
-    /// readback) has run between.
-    marker: Option<CommandMarker>,
+    /// The recording the copy was encoded into, pinned under the encoder's
+    /// guard. A committed stage holds the marker its own cut returned; a
+    /// deferred one (`stage_readback_deferred`) holds the recording left
+    /// open for a later drain.
+    marker: CommandMarker,
+    deferred: bool,
     count: usize,
+    dtype: DType,
     device: MetalDevice,
 }
 
 impl StagedReadback {
-    /// Wait for the blit's command buffer and read the copy.
-    pub fn finish<T: Clone>(self) -> Result<Vec<T>> {
-        if let Some(marker) = &self.marker {
-            self.device.wait_marker(marker)?;
+    /// Wait for the copy's recording and read it. `T` must be the staged
+    /// dtype's element type; anything else is refused before any wait.
+    ///
+    /// A deferred stage whose drain has completed reads with no wait and no
+    /// cut. One that is not complete is waited on exactly, and submitted by
+    /// that wait if no drain has run; a recording that failed or was
+    /// cancelled returns its error rather than the bytes.
+    ///
+    /// ```no_run
+    /// # use lloom_tensor::{Device, Tensor};
+    /// let t = Tensor::new(&[1u32, 2], &Device::new_metal(0).unwrap()).unwrap();
+    /// let _: Vec<u32> = lloom_tensor::metal_backend::stage_readback(&t)
+    ///     .unwrap()
+    ///     .finish()
+    ///     .unwrap();
+    /// ```
+    ///
+    /// An element type outside [`ReadbackElement`] does not compile:
+    ///
+    /// ```compile_fail
+    /// # use lloom_tensor::{Device, Tensor};
+    /// let t = Tensor::new(&[1u32, 2], &Device::new_metal(0).unwrap()).unwrap();
+    /// let _: Vec<String> = lloom_tensor::metal_backend::stage_readback(&t)
+    ///     .unwrap()
+    ///     .finish()
+    ///     .unwrap();
+    /// ```
+    ///
+    /// ```compile_fail
+    /// # use lloom_tensor::{Device, Tensor};
+    /// let t = Tensor::new(&[1u32, 2], &Device::new_metal(0).unwrap()).unwrap();
+    /// let _: Vec<char> = lloom_tensor::metal_backend::stage_readback(&t)
+    ///     .unwrap()
+    ///     .finish()
+    ///     .unwrap();
+    /// ```
+    pub fn finish<T: ReadbackElement>(self) -> Result<Vec<T>> {
+        check_staged_read::<T>(
+            "StagedReadback::finish",
+            self.dtype,
+            self.count,
+            self.count * self.dtype.size_in_bytes(),
+        )?;
+        if !self.deferred || !self.device.marker_complete(&self.marker) {
+            if self.deferred && !self.marker.is_submitted() {
+                TO_CPU_DEFERRED_UNDRAINED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             TO_CPU_STAGED_WAIT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
+        // Completed: the data-readiness and error check, no wait.
+        self.device.wait_marker(&self.marker)?;
         TO_CPU_STAGED_READBACK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        Ok(read_to_vec(&self.buffer, self.count))
+        read_to_vec(&self.buffer, self.count)
     }
 }
 
 /// [`stage_readback`] without the commit: the blit rides the open command
-/// buffer and `finish` waits for nothing — for a caller whose own later
-/// readback drains the queue anyway (the host plan's, at decode), so the
-/// stage costs no command-buffer cut. The caller's obligation: that drain
-/// runs before `finish`.
+/// buffer — for a caller whose own later readback drains the queue anyway
+/// (the host plan's, at decode), so the stage costs no command-buffer cut.
+/// [`StagedReadback::finish`] checks that recording's completion: after the
+/// drain it reads with no wait; before it, it waits (`finish`).
 pub fn stage_readback_deferred(t: &crate::Tensor) -> Result<StagedReadback> {
     stage_readback_with(t, false, None)
 }
@@ -430,7 +535,9 @@ fn stage_readback_with(
                 .build()?
         }
     };
-    if m.device.base_mode() {
+    // A deferred stage pins the recording it encoded into, under the
+    // encoder's guard; a committed one takes the marker of its own cut.
+    let pinned = if m.device.base_mode() {
         // Under a pass plan a blit is outside the compute barrier chain
         // (`pass-plan-design.md` §9): the copy is a compute kernel, ordered
         // like any dispatch.
@@ -464,21 +571,28 @@ fn stage_readback_with(
             )
         }
         .map_err(MetalError::from)?;
+        (!commit).then(|| encoder.recording_marker())
     } else {
         let mut blit = m.device.blit_command_encoder()?;
         blit.set_label("staged_readback");
         // SAFETY: storage-owned buffers (binding authority, module head).
         unsafe { blit.copy_from_buffer(&m.buffer, layout.start_offset() * elem, &buffer, 0, size) };
-    }
-    let marker = if commit {
-        Some(m.device.flush_marker()?)
-    } else {
-        None
+        if commit {
+            None
+        } else {
+            Some(blit.recording_marker().map_err(MetalError::from)?)
+        }
+    };
+    let marker = match pinned {
+        Some(marker) => marker,
+        None => m.device.flush_marker()?,
     };
     Ok(StagedReadback {
         buffer,
         marker,
+        deferred: !commit,
         count,
+        dtype: m.dtype,
         device: m.device.clone(),
     })
 }
@@ -3210,7 +3324,7 @@ impl MetalStorage {
         true
     }
 
-    pub(crate) fn to_cpu<T: Clone>(&self) -> Result<Vec<T>> {
+    pub(crate) fn to_cpu<T: ReadbackElement>(&self) -> Result<Vec<T>> {
         let size = self.count * self.dtype.size_in_bytes();
         if size == 0 {
             // Preserve the completion/error boundary without issuing Metal's
@@ -3359,7 +3473,7 @@ impl MetalStorage {
             unsafe { blit.copy_from_buffer(&self.buffer, 0, &buffer, 0, size) };
         }
         self.device.flush_and_wait_current()?;
-        Ok(read_to_vec(&buffer, self.count))
+        read_to_vec(&buffer, self.count)
     }
 }
 
@@ -3932,7 +4046,10 @@ impl BackendDevice for MetalDevice {
 /// message string is absent from the binary here too, exactly as this comment
 /// records for the pre-#366 `assert!`. The `black_box` below is what keeps the
 /// test, and it is the same repair the fast path in `to_cpu` now carries.
-fn read_to_vec<T: Clone>(buffer: &Buffer, n: usize) -> Vec<T> {
+///
+/// `T` accepts every bit pattern ([`ReadbackElement`]); the span and the
+/// alignment are checked against the mapping before the slice is formed.
+fn read_to_vec<T: ReadbackElement>(buffer: &Buffer, n: usize) -> Result<Vec<T>> {
     let ptr = std::hint::black_box(unsafe { buffer.contents() }) as *const T;
     if ptr.is_null() {
         panic!(
@@ -3940,10 +4057,77 @@ fn read_to_vec<T: Clone>(buffer: &Buffer, n: usize) -> Vec<T> {
             buffer.length()
         );
     }
-    // SAFETY: `ptr` is non-null and CPU-mapped, and the caller has waited for
-    // the GPU work that writes it.
+    check_mapped_span::<T>(ptr as usize, buffer.length(), n)?;
+    // SAFETY: `ptr` is non-null, CPU-mapped, aligned for `T` and covers
+    // `n * size_of::<T>()` bytes (checked above); every bit pattern is a valid
+    // `T`; and the caller has waited for the GPU work that writes it.
     let slice = unsafe { std::slice::from_raw_parts(ptr, n) };
-    slice.to_vec()
+    Ok(slice.to_vec())
+}
+
+/// Whether `n` elements of `T` at address `addr` fit a mapping of `len`
+/// bytes and are aligned for `T`.
+fn check_mapped_span<T>(addr: usize, len: usize, n: usize) -> Result<()> {
+    if !addr.is_multiple_of(std::mem::align_of::<T>()) {
+        crate::bail!(
+            "read_to_vec: mapping at {addr:#x} is not aligned for {}",
+            std::any::type_name::<T>()
+        )
+    }
+    match n.checked_mul(std::mem::size_of::<T>()) {
+        Some(bytes) if bytes <= len && bytes <= isize::MAX as usize => Ok(()),
+        _ => crate::bail!(
+            "read_to_vec: {n} elements of {} exceed a {len}-byte mapping",
+            std::any::type_name::<T>()
+        ),
+    }
+}
+
+#[cfg(test)]
+mod staged_read_checks {
+    //! The refusals a typed readback makes before touching a byte, as pure
+    //! functions: no device.
+    use super::{check_mapped_span, check_staged_read};
+    use crate::DType;
+    use half::f16;
+
+    #[test]
+    fn a_read_as_another_element_or_past_the_staged_bytes_is_refused() {
+        assert!(check_staged_read::<u32>("t", DType::U32, 16, 64).is_ok());
+        assert!(check_staged_read::<f16>("t", DType::F16, 0, 0).is_ok());
+        // Same width, another dtype.
+        assert!(check_staged_read::<u32>("t", DType::F32, 16, 64).is_err());
+        // One element past the staged bytes.
+        assert!(check_staged_read::<u32>("t", DType::U32, 17, 64).is_err());
+        // An element count whose byte size overflows.
+        assert!(check_staged_read::<u32>("t", DType::U32, usize::MAX, usize::MAX).is_err());
+    }
+
+    #[test]
+    fn a_span_past_the_mapping_or_misaligned_is_refused() {
+        assert!(check_mapped_span::<u32>(0x1000, 64, 16).is_ok());
+        assert!(check_mapped_span::<u32>(0x1000, 64, 17).is_err());
+        assert!(check_mapped_span::<u64>(0x1004, 64, 1).is_err());
+        assert!(check_mapped_span::<u8>(0x1003, 64, 64).is_ok());
+        assert!(check_mapped_span::<u32>(0x1000, usize::MAX, usize::MAX).is_err());
+    }
+
+    #[test]
+    fn every_readback_element_is_its_dtypes_width() {
+        fn width<T: crate::ReadbackElement>() {
+            assert_eq!(std::mem::size_of::<T>(), T::DTYPE.size_in_bytes());
+        }
+        width::<u8>();
+        width::<u32>();
+        width::<i16>();
+        width::<i32>();
+        width::<i64>();
+        width::<f16>();
+        width::<half::bf16>();
+        width::<f32>();
+        width::<f64>();
+        width::<float8::F8E4M3>();
+    }
 }
 
 #[cfg(test)]
@@ -4019,7 +4203,7 @@ mod issue_336_split {
             let s3 = Instant::now();
             ms.device.flush_and_wait_current().unwrap();
             let w = s3.elapsed().as_secs_f64() * 1e3;
-            let v2: Vec<u32> = super::read_to_vec(&dst, ms.count);
+            let v2: Vec<u32> = super::read_to_vec(&dst, ms.count).unwrap();
             assert_eq!(v, v2, "resolved readback versus explicit Shared blit");
 
             if i >= 32 {
@@ -4062,7 +4246,7 @@ mod issue_336_to_cpu {
 
     /// Read back through the blit, unconditionally -- the pre-#336 path, kept
     /// reachable so a test can compare against it in one process.
-    fn via_blit<T: Clone>(ms: &super::MetalStorage) -> Vec<T> {
+    fn via_blit<T: super::ReadbackElement>(ms: &super::MetalStorage) -> Vec<T> {
         let size = ms.count * ms.dtype.size_in_bytes();
         let buffer = ms
             .device
@@ -4079,7 +4263,7 @@ mod issue_336_to_cpu {
             unsafe { blit.copy_from_buffer(&ms.buffer, 0, &buffer, 0, size) };
         }
         ms.device.flush_and_wait_current().unwrap();
-        super::read_to_vec(&buffer, ms.count)
+        super::read_to_vec(&buffer, ms.count).unwrap()
     }
 
     fn metal() -> Option<Device> {
@@ -4959,7 +5143,7 @@ mod issue_535_peek_is_not_blocking {
             );
         }
         // `to_cpu` is the blocking sibling: the identical scan must trip on it.
-        let to_cpu = body_of(src, "to_cpu<T: Clone>");
+        let to_cpu = body_of(src, "to_cpu<T: ReadbackElement>");
         assert!(
             BLOCKING.iter().any(|n| to_cpu.contains(n)),
             "the blocking sibling contains none of the needles, so the gate \
@@ -5010,7 +5194,7 @@ mod issue_535_peek_is_not_blocking {
             let body = body_of(src, name);
             for other in NON_BLOCKING
                 .iter()
-                .chain(std::iter::once(&"to_cpu<T: Clone>"))
+                .chain(std::iter::once(&"to_cpu<T: ReadbackElement>"))
             {
                 if other == name {
                     continue;

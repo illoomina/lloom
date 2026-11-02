@@ -2,6 +2,7 @@ pub mod err;
 pub mod kernel;
 pub mod kernels;
 pub mod metal;
+pub mod pipeline_census;
 pub mod source;
 pub mod utils;
 

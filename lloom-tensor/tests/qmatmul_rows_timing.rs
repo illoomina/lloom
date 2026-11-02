@@ -166,6 +166,213 @@ fn every_kind_at_every_capacity() {
     }
 }
 
+/// The row axis at both activation triples, with the weight read from DRAM:
+/// each launch reads the next of enough distinct copies of the weight to
+/// pass 512 MB, as a decode step's weights do (the system-level cache holds
+/// at most 48 MB, `docs/machine-model.md` §3). Per kind, stem shape, triple
+/// and `m`: the per-row launch (axis off), the axis at the capacity
+/// `qmv.rows_max = 8` gives, and the per-row launch again (the null),
+/// interleaved rep by rep. `QMM_KINDS` and `QMM_SHAPE` narrow it. Ignored;
+/// under `lloom-arb measure`, `--ignored --nocapture`.
+#[test]
+#[ignore]
+fn every_kind_at_every_capacity_from_dram() {
+    let dev = device();
+    let (iters, reps) = (64usize, 9usize);
+    let shapes: Vec<(usize, usize)> = match std::env::var("QMM_SHAPE").ok().and_then(|v| {
+        let mut it = v.split(',').map(|s| s.trim().parse::<usize>().ok());
+        Some((it.next()??, it.next()??))
+    }) {
+        Some(s) => vec![s],
+        None => vec![(10240, 2560), (17408, 5120), (5120, 17408)],
+    };
+    let only: Vec<String> = std::env::var("QMM_KINDS")
+        .map(|v| v.split(',').map(|s| s.trim().to_string()).collect())
+        .unwrap_or_else(|_| {
+            ["Q4K", "Q5K", "Q6K", "Q8_0", "IQ4XS", "IQ3XXS", "Q2K"]
+                .map(String::from)
+                .to_vec()
+        });
+    let kinds: Vec<GgmlDType> = [
+        GgmlDType::Q4_0,
+        GgmlDType::Q8_0,
+        GgmlDType::Q2K,
+        GgmlDType::Q3K,
+        GgmlDType::Q4K,
+        GgmlDType::Q5K,
+        GgmlDType::Q6K,
+        GgmlDType::IQ2XXS,
+        GgmlDType::IQ3XXS,
+        GgmlDType::IQ3S,
+        GgmlDType::IQ4NL,
+        GgmlDType::IQ4XS,
+    ]
+    .into_iter()
+    .filter(|d| only.iter().any(|s| *s == format!("{d:?}")))
+    .collect();
+    let med = |v: &mut Vec<f64>| {
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        v[v.len() / 2]
+    };
+    println!("TIMING_DRAM contract=fast iters={iters} reps={reps} interleaved per-row,axis,per-row-null; median ms per launch");
+    println!("| kind | shape | triple | m | 1-row ms | per-row ms | axis _rN ms | null ms | axis/per-row | null/per-row |");
+    for (n, k) in shapes {
+        for &dtype in &kinds {
+            let bytes = (n * k / dtype.block_size() * dtype.type_size()) as f64;
+            let copies = ((512e6 / bytes).ceil() as usize).max(2);
+            let qs: Vec<QMatMul> = (0..copies).map(|_| weight(dtype, (n, k), &dev)).collect();
+            let run = |x: &Tensor, axis: bool| {
+                lloom_tensor::kernels::set_qmv_rows(axis);
+                for q in &qs {
+                    q.forward(x).unwrap();
+                }
+                dev.synchronize().unwrap();
+                let t = Instant::now();
+                for i in 0..iters {
+                    qs[i % copies].forward(x).unwrap();
+                }
+                dev.synchronize().unwrap();
+                t.elapsed().as_secs_f64() * 1e3 / iters as f64
+            };
+            for (tname, act) in [
+                ("f32", lloom_tensor::DType::F32),
+                ("f16", lloom_tensor::DType::F16),
+            ] {
+                let x1 = Tensor::randn(0f32, 1.0, (1, k), &dev)
+                    .unwrap()
+                    .to_dtype(act)
+                    .unwrap();
+                assert_eq!(qs[0].forward(&x1).unwrap().dtype(), act);
+                let mut one: Vec<f64> = (0..reps).map(|_| run(&x1, false)).collect();
+                let one = med(&mut one);
+                for m in [2usize, 3, 4, 6, 8] {
+                    let xm = Tensor::randn(0f32, 1.0, (m, k), &dev)
+                        .unwrap()
+                        .to_dtype(act)
+                        .unwrap();
+                    lloom_tensor::kernels::set_qmv_rows(true);
+                    let cap = lloom_tensor::kernels::mv_rows_capacity(dtype.into(), m, false);
+                    let mut arms: [Vec<f64>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+                    for _ in 0..reps {
+                        arms[0].push(run(&xm, false));
+                        arms[1].push(run(&xm, true));
+                        arms[2].push(run(&xm, false));
+                    }
+                    let (a, b, c) = (med(&mut arms[0]), med(&mut arms[1]), med(&mut arms[2]));
+                    println!(
+                        "| {dtype:?} | [{n} x {k}] | {tname} | {m} | {one:.4} | {a:.4} | _r{cap} {b:.4} | {c:.4} | {:.3} | {:.3} |",
+                        b / a,
+                        c / a
+                    );
+                }
+            }
+        }
+    }
+    lloom_tensor::kernels::set_qmv_rows(true);
+}
+
+/// Qwen3.6-27B Q4_K_M's projections (kind, `n`, `k`, per token), read off
+/// the checkpoint's tensor table.
+const QWEN36_27B: [(GgmlDType, usize, usize, usize, &str); 13] = [
+    (GgmlDType::Q4K, 10240, 5120, 24, "attn_qkv"),
+    (GgmlDType::Q6K, 10240, 5120, 24, "attn_qkv"),
+    (GgmlDType::Q4K, 6144, 5120, 48, "attn_gate"),
+    (GgmlDType::Q5K, 5120, 6144, 48, "ssm_out"),
+    (GgmlDType::Q4K, 17408, 5120, 128, "ffn_gate|up"),
+    (GgmlDType::Q4K, 5120, 17408, 32, "ffn_down"),
+    (GgmlDType::Q6K, 5120, 17408, 32, "ffn_down"),
+    (GgmlDType::Q4K, 12288, 5120, 16, "attn_q"),
+    (GgmlDType::Q4K, 1024, 5120, 24, "attn_k|v"),
+    (GgmlDType::Q6K, 1024, 5120, 8, "attn_v"),
+    (GgmlDType::Q4K, 5120, 6144, 16, "attn_output"),
+    (GgmlDType::Q6K, 248320, 5120, 1, "output"),
+    (GgmlDType::Q8_0, 10240, 5120, 0, "control"),
+];
+
+/// The MTP verify window's two f32 rows on Qwen3.6-27B's own projections,
+/// per-row against the axis (`_r2`), in two regimes: `independent`, each
+/// launch reading the same activation (what the timings above measure; the
+/// GPU may overlap consecutive launches), and `dependent`, each launch's
+/// activation computed from the previous launch's output (a reduction, a
+/// zero scale and a broadcast add, the same three dispatches in every arm),
+/// so the launches run one after another as a decode step's do. Weights
+/// rotate over enough copies to pass 512 MB. Per rep: per-row, axis,
+/// per-row again (A B A'). Prints the per-token sum over the checkpoint's
+/// projection counts. The Q8_0 row (count 0) is the control: its table
+/// ceiling is already 2. Ignored; under `lloom-arb measure`.
+#[test]
+#[ignore]
+fn the_qwen36_27b_window_in_both_regimes() {
+    let dev = device();
+    let reps = 7usize;
+    let med = |v: &mut Vec<f64>| {
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        v[v.len() / 2]
+    };
+    println!("WINDOW27B contract=fast m=2 f32 reps={reps} A B A' (per-row, axis _r2, per-row); median ms per launch");
+    println!("| regime | proj | kind | [n x k] | per token | per-row ms | axis ms | null ms | axis/bracket | null/per-row |");
+    let mut sums = std::collections::BTreeMap::<&str, [f64; 3]>::new();
+    for (dtype, n, k, count, label) in QWEN36_27B {
+        let bytes = (n * k / dtype.block_size() * dtype.type_size()) as f64;
+        let copies = ((512e6 / bytes).ceil() as usize).max(2);
+        let iters = if bytes > 2e8 { 16 } else { 48 };
+        let qs: Vec<QMatMul> = (0..copies).map(|_| weight(dtype, (n, k), &dev)).collect();
+        let x0 = Tensor::randn(0f32, 1.0, (2, k), &dev).unwrap();
+        for regime in ["independent", "dependent"] {
+            let run = |axis: bool| {
+                lloom_tensor::kernels::set_qmv_rows(axis);
+                for q in &qs {
+                    q.forward(&x0).unwrap();
+                }
+                dev.synchronize().unwrap();
+                let t = Instant::now();
+                let mut x = x0.clone();
+                for i in 0..iters {
+                    let y = qs[i % copies].forward(&x).unwrap();
+                    if regime == "dependent" {
+                        let z = y.sum_keepdim(1).unwrap().affine(0.0, 0.0).unwrap();
+                        x = x0.broadcast_add(&z).unwrap();
+                    }
+                }
+                dev.synchronize().unwrap();
+                t.elapsed().as_secs_f64() * 1e3 / iters as f64
+            };
+            lloom_tensor::kernels::set_qmv_rows(true);
+            assert_eq!(
+                lloom_tensor::kernels::mv_rows_capacity(dtype.into(), 2, false),
+                2,
+                "{dtype:?}: the axis arm is not on `_r2`"
+            );
+            let mut arms: [Vec<f64>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+            for _ in 0..reps {
+                arms[0].push(run(false));
+                arms[1].push(run(true));
+                arms[2].push(run(false));
+            }
+            let (a, b, c) = (med(&mut arms[0]), med(&mut arms[1]), med(&mut arms[2]));
+            println!(
+                "| {regime} | {label} | {dtype:?} | [{n} x {k}] | {count} | {a:.4} | {b:.4} | {c:.4} | {:.3} | {:.3} |",
+                b / ((a + c) / 2.0),
+                c / a
+            );
+            let s = sums.entry(regime).or_insert([0.0; 3]);
+            s[0] += a * count as f64;
+            s[1] += b * count as f64;
+            s[2] += c * count as f64;
+        }
+    }
+    for (regime, s) in sums {
+        println!(
+            "SUM {regime}: per-row {:.3} ms, axis {:.3} ms, null {:.3} ms per token's window projections; axis/bracket {:.3}",
+            s[0],
+            s[1],
+            s[2],
+            s[1] / ((s[0] + s[2]) / 2.0)
+        );
+    }
+    lloom_tensor::kernels::set_qmv_rows(true);
+}
+
 /// The routed matmul-vec on the row axis, per kind: `batch` rows at top-8
 /// over 64 experts of `[512 × 2048]` (Qwen3.6-35B-A3B's gate/up expert),
 /// the ids from a fixed LCG (rows share a slot where the draw repeats, as a
@@ -258,6 +465,142 @@ fn every_routed_kind_at_every_capacity() {
                 batch * topk,
                 (axis / per_plane - 1.0) * 100.0
             );
+        }
+    }
+}
+
+/// Achieved weight bandwidth of the one-row quantized matvec, per kind, at
+/// the `(f32, f32, f32)` and `(f16, f32, f16)` triples (#1154 C's bandwidth
+/// column): at the 27B's three stem shapes, one row, the two arms and a
+/// second f32 arm (the null) interleaved rep by rep, `reps` medians of
+/// `iters` launches. Each launch reads the next of enough distinct copies of
+/// the weight to pass 512 MB, so no launch is served from the system-level
+/// cache a decode step's weights never fit. GB/s divides the weight's bytes
+/// alone by the launch's time, the decode roofline's numerator
+/// (`docs/machine-model.md` §3.4).
+/// Ignored; under `lloom-arb measure`, `--ignored --nocapture`.
+#[test]
+#[ignore]
+fn one_row_bandwidth_per_kind_and_triple() {
+    let dev = device();
+    let (iters, reps) = (64usize, 9usize);
+    let shapes = [(10240usize, 2560usize), (17408, 5120), (5120, 17408)];
+    let kinds = [
+        GgmlDType::Q4K,
+        GgmlDType::Q5K,
+        GgmlDType::Q6K,
+        GgmlDType::Q8_0,
+    ];
+    lloom_tensor::kernels::set_qmv_rows(false);
+    println!("BANDWIDTH contract=fast m=1 iters={iters} reps={reps} interleaved f32,f16,f32-null; median ms per launch");
+    println!("| kind | shape | weight MB x copies | f32 ms | f16 ms | null ms | f32 GB/s | f16 GB/s | f16/f32 | null/f32 |");
+    for (n, k) in shapes {
+        for dtype in kinds {
+            let bytes = (n * k / dtype.block_size() * dtype.type_size()) as f64;
+            let copies = ((512e6 / bytes).ceil() as usize).max(2);
+            let qs: Vec<QMatMul> = (0..copies).map(|_| weight(dtype, (n, k), &dev)).collect();
+            let x32 = Tensor::randn(0f32, 1.0, (1, k), &dev).unwrap();
+            let x16 = x32.to_dtype(lloom_tensor::DType::F16).unwrap();
+            assert_eq!(
+                qs[0].forward(&x16).unwrap().dtype(),
+                lloom_tensor::DType::F16
+            );
+            let mut arms: [Vec<f64>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+            for q in &qs {
+                q.forward(&x32).unwrap();
+                q.forward(&x16).unwrap();
+            }
+            dev.synchronize().unwrap();
+            for _ in 0..reps {
+                for (a, x) in [&x32, &x16, &x32].into_iter().enumerate() {
+                    let t = Instant::now();
+                    for i in 0..iters {
+                        qs[i % copies].forward(x).unwrap();
+                    }
+                    dev.synchronize().unwrap();
+                    arms[a].push(t.elapsed().as_secs_f64() * 1e3 / iters as f64);
+                }
+            }
+            let med = |v: &mut Vec<f64>| {
+                v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                v[v.len() / 2]
+            };
+            let (a, b, c) = (med(&mut arms[0]), med(&mut arms[1]), med(&mut arms[2]));
+            println!(
+                "| {dtype:?} | [{n} x {k}] | {:.2} x {copies} | {a:.4} | {b:.4} | {c:.4} | {:.1} | {:.1} | {:.3} | {:.3} |",
+                bytes / 1e6,
+                bytes / (a * 1e-3) / 1e9,
+                bytes / (b * 1e-3) / 1e9,
+                b / a,
+                c / a
+            );
+        }
+    }
+    lloom_tensor::kernels::set_qmv_rows(true);
+}
+
+/// The quantized GEMM at its two activation triples (#1154 A): the 27B's
+/// stem shapes at a prefill tile's rows (64) and at 512, on both GEMM routes
+/// (the in-kernel unpack, `dequant_from` 0, and the dequantise-once scratch,
+/// the default from 64 rows). The f32 arm, the f16 arm and a second f32 arm
+/// (the null) interleave rep by rep over enough weight copies to pass
+/// 512 MB. Ignored; under `lloom-arb measure`, `--ignored --nocapture`.
+#[test]
+#[ignore]
+fn gemm_per_kind_and_triple() {
+    let dev = device();
+    let (iters, reps) = (8usize, 7usize);
+    let shapes = [(10240usize, 2560usize), (17408, 5120), (5120, 17408)];
+    let kinds = [
+        GgmlDType::Q4K,
+        GgmlDType::Q5K,
+        GgmlDType::Q6K,
+        GgmlDType::Q8_0,
+    ];
+    println!("GEMM contract=fast iters={iters} reps={reps} interleaved f32,f16,f32-null; median ms per launch");
+    println!("| route | kind | shape | rows | f32 ms | f16 ms | null ms | f16/f32 | null/f32 |");
+    for (route, from) in [("unpack", 0usize), ("dequant-once", 64)] {
+        lloom_tensor::quantized::metal::set_dequant_once_from(from);
+        for (n, k) in shapes {
+            for dtype in kinds {
+                let bytes = (n * k / dtype.block_size() * dtype.type_size()) as f64;
+                let copies = ((512e6 / bytes).ceil() as usize).max(2);
+                let qs: Vec<QMatMul> = (0..copies).map(|_| weight(dtype, (n, k), &dev)).collect();
+                for rows in [64usize, 512] {
+                    let x32 = Tensor::randn(0f32, 1.0, (1, rows, k), &dev).unwrap();
+                    let x16 = x32.to_dtype(lloom_tensor::DType::F16).unwrap();
+                    assert_eq!(
+                        qs[0].forward(&x16).unwrap().dtype(),
+                        lloom_tensor::DType::F16
+                    );
+                    for q in &qs {
+                        q.forward(&x32).unwrap();
+                        q.forward(&x16).unwrap();
+                    }
+                    dev.synchronize().unwrap();
+                    let mut arms: [Vec<f64>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+                    for _ in 0..reps {
+                        for (a, x) in [&x32, &x16, &x32].into_iter().enumerate() {
+                            let t = Instant::now();
+                            for i in 0..iters {
+                                qs[i % copies].forward(x).unwrap();
+                            }
+                            dev.synchronize().unwrap();
+                            arms[a].push(t.elapsed().as_secs_f64() * 1e3 / iters as f64);
+                        }
+                    }
+                    let med = |v: &mut Vec<f64>| {
+                        v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                        v[v.len() / 2]
+                    };
+                    let (a, b, c) = (med(&mut arms[0]), med(&mut arms[1]), med(&mut arms[2]));
+                    println!(
+                        "| {route} | {dtype:?} | [{n} x {k}] | {rows} | {a:.4} | {b:.4} | {c:.4} | {:.3} | {:.3} |",
+                        b / a,
+                        c / a
+                    );
+                }
+            }
         }
     }
 }

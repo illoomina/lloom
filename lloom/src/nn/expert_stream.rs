@@ -9558,6 +9558,10 @@ mod tests {
             drop(pass.take());
         }
         let stats = lane.settled_stats();
+        // A resized generation still held behind this input is Pending, not
+        // the healthy Ready-initializer routing-timeout replay population.
+        let initializer_before_release = matches!(mode, FetchFloorControl::CapturedBeforeResize)
+            .then(|| tier.inner.lock().initialization.poll());
         if let Some((tx, join)) = release {
             let _ = tx.send(());
             assert!(join.join().unwrap(), "control needed watchdog release");
@@ -9565,7 +9569,9 @@ mod tests {
         let waited = m.wait_marker(&consumer_marker);
         if matches!(
             mode,
-            FetchFloorControl::Cancelled | FetchFloorControl::RegistrationPin
+            FetchFloorControl::Cancelled
+                | FetchFloorControl::RegistrationPin
+                | FetchFloorControl::CapturedBeforeResize
         ) {
             assert!(
                 waited
@@ -9574,10 +9580,30 @@ mod tests {
                 "cancelled job released native consumers: {waited:?}"
             );
         } else {
-            waited.unwrap();
+            waited.as_ref().unwrap();
             assert_eq!(consumer.to_vec1::<f32>().unwrap(), vec![7.0; 16]);
         }
         m.wait_until_completed().unwrap();
+        if matches!(mode, FetchFloorControl::CapturedBeforeResize) {
+            assert!(
+                matches!(initializer_before_release, Some(Ok(false))),
+                "captured-floor control did not retain Pending initialization: {initializer_before_release:?}"
+            );
+            assert!(
+                waited
+                    .as_ref()
+                    .is_err_and(|e| e.to_string().contains("initialization DATA unresolved")),
+                "unresolved resized initialization did not refuse the join: {waited:?}"
+            );
+            assert!(
+                m.commands().produced_stats().cancelled > cancelled_before,
+                "unresolved resized initialization did not cancel held consumers"
+            );
+            assert!(
+                tier.inner.lock().initialization.poll().unwrap(),
+                "Pending refusal poisoned the generation after genuine DATA"
+            );
+        }
         if let Some(pass) = pass.take() {
             pass.finish();
         }

@@ -163,7 +163,7 @@ fn run(engine: &NativeEngine, ids: &[u32], params: &DecodeParams) -> Result<Deco
 #[ignore = "explicit native admission; CANDLE_METAL_PROFILE=1; run per Metal API"]
 fn prepared_sampler_actual_owner_matches_blocking_across_cadences() -> Result<()> {
     let mut decode = crate::DecodeConfig::default();
-    decode.readback.device_filter = true;
+    decode.readback.device_filter = Some(true);
     decode.readback.run_ahead = 3;
     decode.readback.queued_steps = 2;
     let (_files, engine) = fixture(decode)?;
@@ -225,7 +225,7 @@ fn prepared_sampler_actual_owner_matches_blocking_across_cadences() -> Result<()
             assert!(
                 labels
                     .iter()
-                    .any(|(name, count)| name.contains("sampling_topk_mask") && *count > 0),
+                    .any(|(name, count)| name.contains("sampling_select_hist_f32") && *count > 0),
                 "prepared sampler did not dispatch: {labels:?}"
             );
             assert!(matches!(out.readback, ReadbackArm::Ring(_)));
@@ -368,7 +368,7 @@ impl CausalLM for InvalidLogits<'_> {
 #[ignore = "explicit native admission; run per Metal API"]
 fn invalid_prepared_row_recovers_through_actual_lfm_request_owner() -> Result<()> {
     let mut decode = crate::DecodeConfig::default();
-    decode.readback.device_filter = true;
+    decode.readback.device_filter = Some(true);
     decode.readback.run_ahead = 3;
     decode.readback.queued_steps = 2;
     let (_files, engine) = fixture(decode)?;
@@ -423,7 +423,7 @@ fn invalid_prepared_row_recovers_through_actual_lfm_request_owner() -> Result<()
 /// route records its decode plan first in one of the two orders.
 fn invalid_row_recovery_population(comparator_first: bool) -> Result<()> {
     let mut decode = crate::DecodeConfig::default();
-    decode.readback.device_filter = true;
+    decode.readback.device_filter = Some(true);
     decode.readback.run_ahead = 3;
     decode.readback.queued_steps = 2;
     let (_files, engine) = fixture(decode)?;
@@ -524,7 +524,7 @@ fn invalid_row_recovery_against_an_earlier_blocking_comparator() -> Result<()> {
 #[ignore = "explicit native admission; unwind build; external timeout; run per Metal API"]
 fn prepared_producer_unwind_recovers_through_actual_owner() -> Result<()> {
     let mut decode = crate::DecodeConfig::default();
-    decode.readback.device_filter = true;
+    decode.readback.device_filter = Some(true);
     decode.readback.run_ahead = 3;
     decode.readback.queued_steps = 2;
     let (_files, engine) = fixture(decode)?;
@@ -572,7 +572,7 @@ fn prepared_producer_unwind_recovers_through_actual_owner() -> Result<()> {
 #[ignore = "explicit native admission; CANDLE_METAL_PROFILE=1; run per Metal API"]
 fn prepared_unfiltered_owner_uses_native_blocking_including_diagnostics() -> Result<()> {
     let mut decode = crate::DecodeConfig::default();
-    decode.readback.device_filter = true;
+    decode.readback.device_filter = Some(true);
     let (_files, engine) = fixture(decode)?;
     let prompt = engine.encode("Hello world", false)?;
     for gumbel in [false, true] {
@@ -616,9 +616,9 @@ fn prepared_unfiltered_owner_uses_native_blocking_including_diagnostics() -> Res
             engine.core.device.synchronize()?;
             let labels = census.close();
             let method = if gumbel {
-                "sampling_filtered_gumbel"
+                "sampling_gumbel_pick_f32"
             } else {
-                "sampling_multinomial"
+                "sampling_draw_f32"
             };
             assert!(
                 labels
@@ -656,7 +656,7 @@ fn prepared_unfiltered_owner_uses_native_blocking_including_diagnostics() -> Res
 #[ignore = "explicit native admission; run per Metal API"]
 fn invalid_native_blocking_diagnostic_row_recovers_through_actual_owner() -> Result<()> {
     let mut decode = crate::DecodeConfig::default();
-    decode.readback.device_filter = true;
+    decode.readback.device_filter = Some(true);
     let (_files, engine) = fixture(decode)?;
     let prompt = engine.encode("Hello world", false)?;
     let fault = InvalidLogits {
@@ -724,7 +724,7 @@ fn invalid_native_blocking_diagnostic_row_recovers_through_actual_owner() -> Res
 #[ignore = "explicit native admission; run per Metal API"]
 fn prepared_owner_applies_and_clears_request_thinking_budget() -> Result<()> {
     let mut decode = crate::DecodeConfig::default();
-    decode.readback.device_filter = true;
+    decode.readback.device_filter = Some(true);
     decode.readback.run_ahead = 3;
     decode.readback.queued_steps = 2;
     let (_files, engine) = fixture(decode)?;
@@ -934,7 +934,7 @@ fn captured_ring_arms() -> [ReadbackArm; 4] {
 #[ignore = "explicit native admission; release+profile; one process per Metal API"]
 fn prepared_ring_replays_same_raw_rows_on_cpu_for_original_sampling_arms() -> Result<()> {
     let mut decode = crate::DecodeConfig::default();
-    decode.readback.device_filter = true;
+    decode.readback.device_filter = Some(true);
     decode.readback.run_ahead = 3;
     decode.readback.queued_steps = 2;
     let (_files, engine) = fixture(decode)?;
@@ -988,9 +988,9 @@ fn prepared_ring_replays_same_raw_rows_on_cpu_for_original_sampling_arms() -> Re
                         "gumbel={gumbel} filtered={filtered} history={history} arm={arm:?}"
                     );
                     let method = if gumbel {
-                        "sampling_filtered_gumbel"
+                        "sampling_gumbel_pick_f32"
                     } else {
-                        "sampling_multinomial"
+                        "sampling_draw_f32"
                     };
                     assert!(
                         labels.iter().any(|(n, k)| n.contains(method) && *k > 0),
@@ -1014,7 +1014,7 @@ fn prepared_ring_replays_same_raw_rows_on_cpu_for_original_sampling_arms() -> Re
 #[ignore = "explicit native admission; release+profile; one process per Metal API"]
 fn prepared_ring_centered_gumbel_and_forced_fed_history_have_causal_cpu_controls() -> Result<()> {
     let mut decode = crate::DecodeConfig::default();
-    decode.readback.device_filter = true;
+    decode.readback.device_filter = Some(true);
     let (_files, engine) = fixture(decode)?;
     let prompt = engine.encode("Hello world", false)?;
     let vocab = engine.core.model.vocab_size();
@@ -1116,7 +1116,7 @@ fn prepared_ring_snapshot_bytes_survive_reused_source_storage() -> Result<()> {
 #[ignore = "explicit native admission; release+profile; one process per Metal API"]
 fn prepared_ring_capture_rejects_a_shifted_actual_sampler_key() -> Result<()> {
     let mut decode = crate::DecodeConfig::default();
-    decode.readback.device_filter = true;
+    decode.readback.device_filter = Some(true);
     let (_files, engine) = fixture(decode)?;
     let prompt = engine.encode("Hello world", false)?;
     let request = DecodeParams {
@@ -1637,7 +1637,7 @@ fn ordinary_then_prepared_cold_reset_exports_body_plans_and_bindings() -> Result
 
 fn observe_same_owner_body_input(reset_each_request: bool, ordinary_first: bool) -> Result<()> {
     let mut decode = crate::DecodeConfig::default();
-    decode.readback.device_filter = true;
+    decode.readback.device_filter = Some(true);
     decode.readback.run_ahead = 3;
     decode.readback.queued_steps = 2;
     let (_files, engine) = fixture_with_trace(decode, true)?;
@@ -2137,7 +2137,7 @@ fn owner_reused_request(
 
 fn owner_reused_order(prepared_first: bool) -> Result<()> {
     let mut decode = crate::DecodeConfig::default();
-    decode.readback.device_filter = true;
+    decode.readback.device_filter = Some(true);
     decode.readback.run_ahead = 3;
     decode.readback.queued_steps = 2;
     let (_files, engine) = fixture_with_trace(decode, true)?;
@@ -2255,7 +2255,7 @@ fn check_native_owner_stop_route(out: &Decoded, labels: &[(String, u64)]) {
     assert!(
         labels
             .iter()
-            .any(|(name, n)| name.contains("sampling_topk_mask") && *n > 0),
+            .any(|(name, n)| name.contains("sampling_select_hist_f32") && *n > 0),
         "missing native sampler: {labels:?}"
     );
     assert!(
@@ -2309,7 +2309,7 @@ fn next_public_after_stop(
 #[ignore = "explicit native admission; one process per actual Metal API/contract"]
 fn prepared_actual_eos_drains_then_next_public_request() -> Result<()> {
     let mut decode = crate::DecodeConfig::default();
-    decode.readback.device_filter = true;
+    decode.readback.device_filter = Some(true);
     decode.readback.run_ahead = 3;
     decode.readback.queued_steps = 2;
     let (_files, engine) = fixture(decode)?;
@@ -2350,7 +2350,7 @@ fn prepared_actual_eos_drains_then_next_public_request() -> Result<()> {
 #[ignore = "explicit native admission; one process per actual Metal API/contract"]
 fn prepared_consumer_refusal_drains_then_next_public_request() -> Result<()> {
     let mut decode = crate::DecodeConfig::default();
-    decode.readback.device_filter = true;
+    decode.readback.device_filter = Some(true);
     decode.readback.run_ahead = 3;
     decode.readback.queued_steps = 2;
     let (_files, engine) = fixture(decode)?;
@@ -2476,7 +2476,7 @@ impl CausalLM for RefusePreparedOwner<'_> {
 #[ignore = "explicit native admission; one process per actual Metal API/contract"]
 fn prepared_metal_capability_and_preparation_refuse_before_first_token() -> Result<()> {
     let mut decode = crate::DecodeConfig::default();
-    decode.readback.device_filter = true;
+    decode.readback.device_filter = Some(true);
     decode.readback.run_ahead = 3;
     decode.readback.queued_steps = 2;
     let (_files, engine) = fixture(decode)?;
@@ -2532,5 +2532,61 @@ fn prepared_metal_capability_and_preparation_refuse_before_first_token() -> Resu
         assert!(!engine.single.lock().as_ref().unwrap().needs_recovery);
         println!("OWNER_EARLY_REFUSAL preparation={preparation} error={error} fragments={fragments} bodies=0 next_tokens={:?}", next.tokens);
     }
+    Ok(())
+}
+
+/// Unset, the device filter is lfm2's default (`docs/dispatch.md` §11.2): a filtered
+/// request with no flag rides NativeRing on the loaded model. The image view
+/// delegates no guarded entry, so a session over it reads the unset filter as
+/// off and keeps today's route (`DecodeSession::device_filter`), rather than
+/// refusing the request as an explicit `true` would.
+#[test]
+#[ignore = "explicit native admission; CANDLE_METAL_PROFILE=1; run per Metal API"]
+fn an_unset_filter_is_lfm2s_default_and_the_image_view_keeps_todays_route() -> Result<()> {
+    let decode = crate::DecodeConfig::default();
+    assert_eq!(decode.readback.device_filter, None);
+    let (_files, engine) = fixture(decode)?;
+    let prompt = engine.encode("Hello world", false)?;
+    let census = engine
+        .core
+        .device
+        .as_metal_device()?
+        .dispatch_census()
+        .open()
+        .expect("one isolated route census");
+    let out = run(&engine, &prompt, &params(ReadbackArm::Auto, false, true))?;
+    engine.core.device.synchronize()?;
+    let labels = census.close();
+    assert!(
+        labels
+            .iter()
+            .any(|(name, count)| name.contains("sampling_select_hist_f32") && *count > 0),
+        "the default did not take the prepared sampler: {labels:?}"
+    );
+    assert!(
+        matches!(out.readback, ReadbackArm::Ring(_)),
+        "{:?}",
+        out.readback
+    );
+    assert!(
+        out.readback_note
+            .as_deref()
+            .is_some_and(|s| s.contains("native prepared device sampler; no host logits readback")),
+        "{:?}",
+        out.readback_note
+    );
+    let model = &engine.core.model;
+    let layout = model.guarded_embedding_layout()?;
+    let features = lloom_tensor::Tensor::zeros(
+        (1, layout.hidden),
+        lloom_tensor::DType::F32,
+        &engine.core.device,
+    )?;
+    let view = ImageRows::new(model, prompt.clone(), u32::MAX, features, 0);
+    assert!(view.guarded_embedding_layout().is_err());
+    println!(
+        "UNSET_FILTER_DEFAULT readback={:?} tokens={:?} labels={labels:?}",
+        out.readback, out.tokens
+    );
     Ok(())
 }

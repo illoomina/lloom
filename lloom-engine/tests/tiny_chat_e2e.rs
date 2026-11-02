@@ -196,6 +196,94 @@ fn qwen3_5_tiny_chats_on_the_cpu_and_metal() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// The device filter is lfm2's default and no other family's
+/// (`docs/dispatch.md` §11.2). With no flag, a filtered sampled request on a
+/// tiny LFM2 rides NativeRing on Metal; on a tiny Qwen3.5 it is served by
+/// today's route (the blocking arm, C1), not refused; on LFM2 on the CPU, and
+/// with `--device-filter=false`, LFM2 keeps today's route too. Every arm runs
+/// and is recorded; the test fails once, naming each arm that parted.
+#[test]
+fn the_device_filter_is_lfm2s_default_and_no_other_familys() {
+    const NATIVE: &str = "native prepared device sampler; no host logits readback";
+    let sampled = ["-t", "0.8", "--top-k", "4", "--seed", "7", "--ignore-eos"];
+    // `served` is the arm's turn line: (readback, completion tokens, whether
+    // the native route's note was printed), or the refusal's last line.
+    let route = |model: &Path, extra: &[&str]| -> Result<(String, String, bool), String> {
+        let out = Command::new(env!("CARGO_BIN_EXE_lloom"))
+            .args(["chat", "--model"])
+            .arg(model)
+            .args(["--raw", "-p", PROMPT, "-n", MAX_TOKENS])
+            .args(sampled)
+            .args(extra)
+            .output()
+            .expect("lloom runs");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        if !out.status.success() {
+            let last = stderr.lines().rev().find(|l| !l.trim().is_empty());
+            return Err(format!("refused: {}", last.unwrap_or("").trim()));
+        }
+        let line = stderr
+            .lines()
+            .find(|l| l.starts_with("[turn 1:"))
+            .ok_or_else(|| format!("no turn line:\n{stderr}"))?;
+        let field = |k: &str| {
+            line.split_whitespace()
+                .find_map(|kv| kv.strip_prefix(&format!("{k}=")))
+                .unwrap_or("")
+                .to_string()
+        };
+        Ok((
+            field("readback"),
+            field("completion_tokens"),
+            stderr.contains(NATIVE),
+        ))
+    };
+    let today = |r: &Result<(String, String, bool), String>| matches!(r, Ok((rb, n, false)) if rb == "blocking" && n == MAX_TOKENS);
+    let native = |r: &Result<(String, String, bool), String>| matches!(r, Ok((rb, n, true)) if rb.starts_with("ring") && n == MAX_TOKENS);
+    let mut arms = Vec::new();
+
+    let dir = scratch("device-filter-lfm2");
+    let lfm2 = write::<Lfm2Tiny>(&dir);
+    let r = route(&lfm2, &["--cpu"]);
+    arms.push(("lfm2 --cpu: today's route", today(&r), r));
+    #[cfg(feature = "metal")]
+    {
+        let r = route(&lfm2, &[]);
+        arms.push(("lfm2 Metal, no flag: NativeRing", native(&r), r));
+        let r = route(&lfm2, &["--device-filter=false"]);
+        arms.push(("lfm2 Metal, explicit off: today's route", today(&r), r));
+    }
+
+    reference_purpose();
+    let qdir = scratch("device-filter-qwen3_5");
+    let qwen = write::<Qwen3_5Tiny>(&qdir);
+    let tok = qdir.join("tokenizer.json");
+    let tok = tok.to_str().unwrap();
+    let r = route(&qwen, &["--tokenizer", tok, "--cpu"]);
+    arms.push(("qwen3_5 --cpu: today's route", today(&r), r));
+    #[cfg(feature = "metal")]
+    {
+        let r = route(&qwen, &["--tokenizer", tok]);
+        arms.push(("qwen3_5 Metal, no flag: today's route", today(&r), r));
+    }
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::remove_dir_all(&qdir).ok();
+
+    for (arm, ok, got) in &arms {
+        eprintln!(
+            "DEVICE_FILTER_DEFAULT {arm}: {} {got:?}",
+            if *ok { "ok" } else { "PARTED" }
+        );
+    }
+    let parted: Vec<_> = arms.iter().filter(|(_, ok, _)| !ok).collect();
+    assert!(
+        parted.is_empty(),
+        "{} of {} arms parted: {parted:?}",
+        parted.len(),
+        arms.len()
+    );
+}
+
 /// Three turns of `lloom chat` on `model` with `extra` flags: the three
 /// `[turn N: …]` lines' fields, and the process's stderr.
 fn three_turns(

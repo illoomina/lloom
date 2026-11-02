@@ -1138,6 +1138,8 @@ pub(crate) fn lfm2_gguf_capabilities() -> Capabilities {
         vision_missing: NO_MMPROJ,
         eos_gate: false,
         eos_gate_missing: "generic GGUF forward has no gated kernels",
+        device_filter: false,
+        device_filter_missing: "the generic GGUF forward has no guarded token embedding",
     }
 }
 

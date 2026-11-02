@@ -49,13 +49,18 @@ fn checked_selection(
         before,
         "selection read back"
     );
-    let selector_dispatches: u64 = census
-        .iter()
-        .filter(|(label, _)| label == "sampling_topk_mask_f32")
-        .map(|(_, n)| *n)
-        .sum();
     let expected = u64::from(layout.shape().elem_count() != 0);
-    assert_eq!(selector_dispatches, expected, "selector census: {census:?}");
+    for name in crate::kernels::kernels::sampling_topk::SELECT_KERNELS
+        .iter()
+        .chain(&["sampling_select_mask_f32"])
+    {
+        let dispatches: u64 = census
+            .iter()
+            .filter(|(label, _)| label == name)
+            .map(|(_, n)| *n)
+            .sum();
+        assert_eq!(dispatches, expected, "{name} census: {census:?}");
+    }
     Ok(outputs)
 }
 
@@ -307,19 +312,33 @@ fn raw_dispatch_initializes_outputs_and_preserves_tail_canaries() -> Result<()> 
         4 * rows + guard,
         &device,
     )?;
+    let words = crate::kernels::kernels::sampling_topk::sampling_work_words(rows, vocab).unwrap();
+    let work = Tensor::from_vec(vec![0xdecafbad_u32; words + guard], words + guard, &device)?;
+    let scratch = Tensor::from_vec(
+        vec![0xdecafbad_u32; rows * vocab + guard],
+        rows * vocab + guard,
+        &device,
+    )?;
     {
         let (input, _) = input.storage_and_layout();
         let (mask, _) = mask.storage_and_layout();
         let (status, _) = status.storage_and_layout();
-        let (Storage::Metal(input), Storage::Metal(mask), Storage::Metal(status)) =
-            (&*input, &*mask, &*status)
+        let (work, _) = work.storage_and_layout();
+        let (scratch, _) = scratch.storage_and_layout();
+        let (
+            Storage::Metal(input),
+            Storage::Metal(mask),
+            Storage::Metal(status),
+            Storage::Metal(work),
+            Storage::Metal(scratch),
+        ) = (&*input, &*mask, &*status, &*work, &*scratch)
         else {
             unreachable!()
         };
         let device = input.device();
         let encoder = device.command_encoder()?;
-        // SAFETY: the three storages own disjoint live buffers, sized above;
-        // readback below waits for the dispatch before observing output.
+        // SAFETY: the storages own disjoint live buffers, sized above;
+        // readback below waits for the dispatches before observing output.
         unsafe {
             crate::kernels::kernels::sampling_topk::call_sampling_topk_mask(
                 device.metal_device(),
@@ -331,6 +350,8 @@ fn raw_dispatch_initializes_outputs_and_preserves_tail_canaries() -> Result<()> 
                 20,
                 mask.buffer(),
                 status.buffer(),
+                work.buffer(),
+                scratch.buffer(),
             )
         }
         .map_err(crate::Error::wrap)?;
@@ -433,7 +454,7 @@ fn queued_dependency_fixture(force_cut: bool) -> Result<()> {
         .load_pipeline(
             metal.metal_device(),
             crate::kernels::source::Source::Random,
-            "sampling_topk_mask_f32",
+            "sampling_select_rank_f32",
         )
         .map_err(crate::Error::wrap)?;
     let width = pipeline.max_total_threads_per_threadgroup().min(256);

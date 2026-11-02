@@ -70,6 +70,13 @@ pub struct Capabilities {
     pub eos_gate: bool,
     /// Why a family without the gated kernels runs ungated.
     pub eos_gate_missing: &'static str,
+    /// The device filter (`decode.readback.device_filter`) is this family's
+    /// default for a non-greedy request: its model serves the guarded token
+    /// embedding, and the route was gated and priced on it. Elsewhere an
+    /// unset filter takes today's route (`docs/dispatch.md` §11.2).
+    pub device_filter: bool,
+    /// Why a family's default is today's route.
+    pub device_filter_missing: &'static str,
 }
 
 impl Capabilities {
@@ -90,12 +97,13 @@ impl Capabilities {
             "kv_dtype": self.kv_dtype,
             "vision": self.vision,
             "eos_gate": self.eos_gate,
+            "device_filter": self.device_filter,
         })
     }
 
     pub fn line(&self) -> String {
         format!(
-            "generation={} decisions={} lookahead_max={} ring={} batch={} prefix_share={} speculation=[{}] model_axes={} kv_quant=[{}] kv_dtype={} vision={} eos_gate={} rewind={:?}",
+            "generation={} decisions={} lookahead_max={} ring={} batch={} prefix_share={} speculation=[{}] model_axes={} kv_quant=[{}] kv_dtype={} vision={} eos_gate={} device_filter={} rewind={:?}",
             self.generation,
             self.decisions,
             self.lookahead_max,
@@ -108,6 +116,7 @@ impl Capabilities {
             self.kv_dtype,
             self.vision,
             self.eos_gate,
+            self.device_filter,
             self.rewind,
         )
     }
@@ -181,6 +190,8 @@ pub const LFM2_CAPABILITIES: Capabilities = Capabilities {
     vision_missing: "",
     eos_gate: true,
     eos_gate_missing: "",
+    device_filter: true,
+    device_filter_missing: "",
 };
 
 /// An LFM2 GGUF on the LFM2 engine (`models.lfm2_gguf.engine = lfm2`): the
@@ -203,6 +214,8 @@ pub const LFM2_GGUF_CAPABILITIES: Capabilities = Capabilities {
     eos_gate: false,
     eos_gate_missing:
         "the quantized matmul cores the packed projections run on carry no gated variant",
+    device_filter: false,
+    device_filter_missing: "the device filter was not gated or priced on a GGUF checkpoint",
     ..LFM2_CAPABILITIES
 };
 
@@ -217,6 +230,8 @@ pub const LFM2_MOE_CAPABILITIES: Capabilities = Capabilities {
     eos_gate: false,
     eos_gate_missing: "the reused routed expert kernels carry no EOS-gated variant; native EOS/recovery acceptance remains unrun",
     rewind: "existing LFM state/recovery wiring; MoE acceptance remains unrun",
+    device_filter: false,
+    device_filter_missing: "the device filter was not gated or priced on the MoE port",
     ..LFM2_CAPABILITIES
 };
 
@@ -243,6 +258,8 @@ pub const QWEN4EXP_CAPABILITIES: Capabilities = Capabilities {
     eos_gate_missing: "its decode kernels (the quantized cores, qwen4exp.metal) carry no gated \
         variant, so a forward queued past an EOS still runs most of its pass, and a request \
         served after gated runs came back wrong (expert-streaming.md §20.13c)",
+    device_filter: false,
+    device_filter_missing: "its model has no guarded token embedding, so the prepared route cannot feed it",
 };
 
 pub const QWEN3_5_CAPABILITIES: Capabilities = Capabilities {
@@ -266,6 +283,8 @@ pub const QWEN3_5_CAPABILITIES: Capabilities = Capabilities {
     vision_missing: "no vision tower is built for Qwen3.5 (the text path only; its tower is #765's lineage)",
     eos_gate: false,
     eos_gate_missing: "the `models.qwen3_5.eos_gate` arm is off (chat and serve turn it on on Metal); without it the standing window undoes one forward past an EOS, and a deeper overrun is put back at a turn checkpoint, or the session reset",
+    device_filter: false,
+    device_filter_missing: "its model has no guarded token embedding, so the prepared route cannot feed it",
 };
 
 /// Qwen3.5's capabilities with the EOS gate as the `models.qwen3_5.eos_gate`
@@ -816,6 +835,17 @@ fn clamp_ungated_eos_gate(cap: &Capabilities, shape: &mut Shape) -> Option<Strin
     })
 }
 
+/// An unset device filter is the family's own: left unset where the filter is
+/// the family's default, so the session takes it wherever the model serves
+/// it, and set off everywhere else, so the family keeps today's route. An
+/// explicit value is the caller's (`Capabilities::device_filter`).
+fn resolve_device_filter(cap: &Capabilities, shape: &mut Shape) {
+    let filter = &mut shape.decode.readback.device_filter;
+    if filter.is_none() && !cap.device_filter {
+        *filter = Some(false);
+    }
+}
+
 /// `speculative.method = auto` resolved for `family`: LFM2's DSpark when
 /// `speculative.drafter` names a checkpoint or the HF cache holds one;
 /// Qwen4-exp's MTP when it names the head's sidecar or
@@ -891,6 +921,7 @@ pub fn load(model: &LoadConfig, shape: Shape) -> Result<(Box<dyn Served>, PathBu
     if let Some(note) = &clamp {
         eprintln!("[readback: {note}]");
     }
+    resolve_device_filter(&family.capabilities(), &mut shape);
     let purpose = model.purpose().map_err(anyhow::Error::msg)?;
     let req = Requested { model, shape };
     family
@@ -1431,6 +1462,41 @@ mod tests {
         let mut s = with("ring-nonblocking");
         assert_eq!(clamp_ungated_eos_gate(&LFM2_CAPABILITIES, &mut s), None);
         assert!(s.decode.readback.eos_gate, "LFM2 keeps its gate");
+    }
+
+    /// The device filter is lfm2's default and no other family's (decision
+    /// 109): unset, lfm2 leaves it to the session (on wherever the model
+    /// serves the guarded token embedding), and every other family, the LFM2
+    /// engine's GGUF and MoE ports included, is set off and keeps today's
+    /// route. An explicit value is never touched.
+    #[test]
+    fn the_device_filter_is_lfm2s_default_and_no_other_familys() {
+        assert_eq!(crate::ReadbackConfig::default().device_filter, None);
+        let legacy = super::super::causal_loaded::served::lfm2_gguf_capabilities();
+        let mut caps: Vec<Capabilities> = FAMILIES.iter().map(|f| f.capabilities()).collect();
+        caps.extend([qwen3_5_capabilities(true), legacy]);
+        assert_eq!(caps.len(), 7);
+        for cap in caps {
+            let lfm2 = cap.family == "lfm2";
+            assert_eq!(cap.device_filter, lfm2, "{}", cap.family);
+            assert_eq!(cap.device_filter_missing.is_empty(), lfm2, "{}", cap.family);
+            assert!(
+                cap.line().contains(&format!("device_filter={lfm2}")),
+                "{}",
+                cap.family
+            );
+            assert_eq!(cap.json()["device_filter"], lfm2, "{}", cap.family);
+            let mut s = shape();
+            resolve_device_filter(&cap, &mut s);
+            let want = if lfm2 { None } else { Some(false) };
+            assert_eq!(s.decode.readback.device_filter, want, "{}", cap.family);
+            for explicit in [Some(true), Some(false)] {
+                let mut s = shape();
+                s.decode.readback.device_filter = explicit;
+                resolve_device_filter(&cap, &mut s);
+                assert_eq!(s.decode.readback.device_filter, explicit, "{}", cap.family);
+            }
+        }
     }
 
     /// Qwen3.5's gate is the `models.qwen3_5.eos_gate` arm: off (the

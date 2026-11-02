@@ -28,10 +28,10 @@ pub const COUPLINGS: &[Coupling] = &[
     Coupling {
         id: "C1",
         kind: "resolves",
-        when: "decode.readback.kind = auto, and the sampler is host-side (top-k or top-p at a temperature, no device sampler)",
+        when: "decode.readback.kind = auto, and the sampler is host-side (top-k or top-p at a temperature) with the device filter off (decode.readback.device_filter = false, or unset on a family whose default is off: every family but lfm2)",
         effect: "the run takes the blocking readback, reported on the turn line",
         keys: &["decode.readback.kind", "decode.readback.device_filter", "generation.top_k", "generation.top_p", "generation.temperature", "generation.sampling.method"],
-        site: "lloom-engine/src/decode.rs DecodeParams::sampler_route; ReadbackArm::{ring_admits, resolve}",
+        site: "lloom-engine/src/decode.rs DecodeParams::sampler_route, DecodeSession::device_filter; app/family.rs resolve_device_filter; ReadbackArm::{ring_admits, resolve}",
         is_static: false,
     },
     Coupling {
@@ -369,23 +369,34 @@ pub fn explain(o: &EngineOptions) -> Vec<String> {
     };
     // A load-time prediction for scalar defaults only. Actual request params,
     // model capability and memory admission still decide whether it can run.
+    // Unset, the filter is the family's own, which this prediction cannot
+    // see: it predicts today's route and names what lfm2 takes instead.
     let scalar = o.scheduler.max_sequences <= 1 && o.speculative.method == "none";
-    let route = if scalar {
-        let params = crate::DecodeParams {
-            readback: r.arm(),
-            logits_digest: o.decode.logits_digest,
-            ..Default::default()
-        };
-        Some(params.sampler_route(
-            r.device_filter,
-            &sampling,
-            cfg!(feature = "metal") && o.load.device != "cpu",
-            r.ring_arm(),
-        ))
-    } else {
-        None
+    let metal = cfg!(feature = "metal") && o.load.device != "cpu";
+    let params = crate::DecodeParams {
+        readback: r.arm(),
+        logits_digest: o.decode.logits_digest,
+        ..Default::default()
     };
-    if r.device_filter {
+    let route = scalar.then(|| {
+        params.sampler_route(
+            r.device_filter.unwrap_or(false),
+            &sampling,
+            metal,
+            r.ring_arm(),
+        )
+    });
+    if r.device_filter.is_none() && scalar && metal {
+        if let Ok(lfm2) = params.sampler_route(true, &sampling, metal, r.ring_arm()) {
+            if lfm2.prepared_sampler {
+                out.push(format!(
+                    "decode.readback.device_filter unset -> on for lfm2: {} (decision 109); the other families take the route below",
+                    lfm2.arm.name()
+                ));
+            }
+        }
+    }
+    if r.device_filter == Some(true) {
         match &route {
             Some(Ok(selected)) if selected.prepared_sampler => out.push(format!(
                 "decode.readback.device_filter -> {} (selected default-request route; model capability/admission still required)",

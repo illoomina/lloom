@@ -293,8 +293,12 @@ mod tests {
 
     #[test]
     fn prepared_quote_includes_every_noise_upload_and_host_scratch() -> Result<()> {
-        // 12RV+36R sampler, 4RV upload and 4RV host noise; one 16-byte guard.
-        assert_eq!(PreparedNativeSampler::payload_bytes(2, 3, 4)?, (688, 96));
+        // 12RV+36R sampler plus its 4 * 2 * 5190 scratch bytes, 4RV upload
+        // and 4RV host noise; one 16-byte guard.
+        assert_eq!(
+            PreparedNativeSampler::payload_bytes(2, 3, 4)?,
+            ((41664 + 24) * 4 + 16, 96)
+        );
         for (rows, vocab, slots) in [
             (0, 3, 1),
             (1, 0, 1),

@@ -401,7 +401,9 @@ fn prepared_both_draws_share_support_and_checked_snapshot_without_early_reuse() 
         assert_eq!(history.to_vec1::<u32>()?, [expected]);
         assert!(reader.poll()?.is_none());
     }
-    assert_eq!(PreparedSampler::payload_bytes(2, 3)?, 144);
+    // 12RV + 36R, plus the per-row scratch words (64 + 2054 per tile + 3072)
+    // at four bytes: 144 + 4 * 2 * 5190.
+    assert_eq!(PreparedSampler::payload_bytes(2, 3)?, 144 + 41520);
     assert!(PreparedSampler::payload_bytes(usize::MAX, 3).is_err());
     Ok(())
 }

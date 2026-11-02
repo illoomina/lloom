@@ -15,7 +15,12 @@
 //! failure is three forwards past the EOS with gated forwards queued behind
 //! it; the watch stops encoding a forward or two past the EOS, so there it
 //! is the first forward past it, the one the watch cannot have stopped (it
-//! is encoded before the EOS is published).
+//! is encoded before the EOS is published). The slow consumer holds its
+//! first fragment, and only one read before the EOS (#1195's placement,
+//! #1205): the engine's reader raises the stop flag before the hook on a
+//! batch whose read found the EOS, so a hold there delays nothing and the
+//! loop stops at the on-time overrun, short of the failure. A run whose
+//! first fragment already carried the whole reply is run again.
 //!
 //! Per arm, one session takes: a reply ending on EOS; the next request,
 //! failing in its overrun; the same request again; a cancelled request (a
@@ -171,9 +176,10 @@ struct Req {
     stop: Vec<String>,
     /// The consumer refuses the fragment after this many delivered ids.
     cancel_after: Option<usize>,
-    /// The consumer holds the fragment that completes this many ids for
-    /// [`SLOW`].
-    slow_after: Option<usize>,
+    /// The consumer holds, for [`SLOW`], its first fragment if that leaves
+    /// fewer than this many ids delivered: a fragment read before the stop
+    /// id at this index ([`Turn::held`]).
+    slow_before: Option<usize>,
     /// The model's forward fails at this decode step.
     fail_at: Option<usize>,
     temperature: Option<f64>,
@@ -192,6 +198,12 @@ struct Turn {
     /// At a failure's return: the device held no committed, incomplete
     /// buffer and no uncommitted dispatch.
     drained: Option<bool>,
+    /// The slow consumer held a fragment after which fewer than the
+    /// request's `slow_before` ids were delivered. A read that finds the
+    /// stop id delivers every id before it, so the read that fetched this
+    /// fragment had not, and the reader had not raised the stop flag: the
+    /// hold delayed it (#1195, #1205).
+    held: bool,
 }
 
 fn config(spelling: &str, gate: bool) -> DecodeConfig {
@@ -251,10 +263,13 @@ fn serve(
         };
         model.arm(r.fail_at);
         let mut delivered = 0usize;
+        let mut first = true;
+        let mut held = false;
         let result = session.decode_until(&r.prompt, detok, &params, |frag| {
             delivered += frag.matches('<').count();
-            if r.slow_after.is_some_and(|n| delivered >= n) {
+            if std::mem::take(&mut first) && r.slow_before.is_some_and(|n| delivered < n) {
                 std::thread::sleep(SLOW);
+                held = true;
             }
             r.cancel_after.is_none_or(|n| delivered < n)
         });
@@ -269,6 +284,7 @@ fn serve(
                 overrun: d.stats.overrun,
                 gated: d.stats.eos_gate.is_some_and(|g| g.fired) && d.stats.overrun_unwritten,
                 drained: None,
+                held,
             },
             Err(e) => {
                 let drained = drained(dev)?;
@@ -284,6 +300,7 @@ fn serve(
                     overrun: 0,
                     gated: false,
                     drained: Some(drained),
+                    held,
                 }
             }
         };
@@ -293,6 +310,48 @@ fn serve(
         out.push(turn);
     }
     Ok(out)
+}
+
+/// Runs of an arm to find one whose slow consumer was held before the stop
+/// id ([`Turn::held`]).
+const HOLD_ATTEMPTS: usize = 8;
+
+/// [`serve`], run until every request with a slow consumer was held before
+/// its stop id ([`Turn::held`]), at most [`HOLD_ATTEMPTS`] times. A reader
+/// that fetches the reply and its stop id in one read raises the stop flag
+/// before its hook runs (the engine's `drain_ring_reader`), so no consumer
+/// can delay that run's stop, and the failure injected past the stop is
+/// then reached only if the on-time overrun reaches it: not the case under
+/// test, so it is run again rather than asserted (#1195's placement, #1205).
+fn serve_held(
+    model: &Faulty,
+    cfg: &Config,
+    dev: &Device,
+    spelling: &str,
+    gate: bool,
+    eos: u32,
+    requests: &[Req],
+) -> Result<Vec<Turn>> {
+    for attempt in 1..=HOLD_ATTEMPTS {
+        let got = serve(model, cfg, dev, spelling, gate, eos, requests)?;
+        let missed: Vec<usize> = requests
+            .iter()
+            .zip(&got)
+            .enumerate()
+            .filter(|(_, (r, t))| r.slow_before.is_some() && !t.held)
+            .map(|(i, _)| i)
+            .collect();
+        if missed.is_empty() {
+            return Ok(got);
+        }
+        eprintln!(
+            "FAILURE-HOLD {spelling} gate={gate}: attempt {attempt}: requests {missed:?}: the first \
+             fragment delivered the whole reply; the consumer was not held before the stop"
+        );
+    }
+    lloom_tensor::bail!(
+        "{spelling} gate={gate}: in {HOLD_ATTEMPTS} runs the consumer was never held before the stop id"
+    )
 }
 
 /// The first id of `stream` from `from` on that is its first occurrence.
@@ -346,7 +405,7 @@ fn requests(model: &Faulty, cfg: &Config, dev: &Device, watch: bool) -> Result<(
             prompt: p2.clone(),
             max_tokens: 3000,
             eos: Some(eos2),
-            slow_after: Some(cut2),
+            slow_before: Some(cut2),
             fail_at: Some(if watch { cut2 + 1 } else { cut2 + 3 }),
             ..Req::default()
         },
@@ -439,7 +498,7 @@ fn matrix(watch: bool) -> Result<()> {
     );
 
     for gate in [false, true] {
-        let got = serve(&model, &cfg, &dev, "ring-nonblocking", gate, eos, &reqs)?;
+        let got = serve_held(&model, &cfg, &dev, "ring-nonblocking", gate, eos, &reqs)?;
         let arm = format!("api {api} watch {watch} gate {gate}");
         for (i, t) in got.iter().enumerate() {
             eprintln!(

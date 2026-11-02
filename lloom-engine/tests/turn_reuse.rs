@@ -55,6 +55,10 @@ fn run(
     Ok((d, boundary))
 }
 
+/// Runs of the slow arm to find one whose consumer was held before the EOS.
+#[cfg(feature = "metal")]
+const HOLD_ATTEMPTS: usize = 8;
+
 const P: [u32; 20] = [
     1, 3, 5, 7, 9, 11, 13, 15, 17, 19, 21, 23, 25, 27, 29, 31, 33, 35, 37, 39,
 ];
@@ -247,9 +251,16 @@ fn every_prepare_case_reports_what_the_session_held() -> Result<()> {
 
 /// The overrun cases, on the ring arms (Metal): the fixed cadence's one
 /// forward past the EOS is taken back by the standing window and the next
-/// request extends; the adaptive commit with a consumer slow at the EOS runs
-/// past the window, and the next request restores the prompt pass's own
+/// request extends; the adaptive commit with a consumer slow before the EOS
+/// runs past the window, and the next request restores the prompt pass's own
 /// checkpoint (its end: no hint) and replays the reply.
+///
+/// The slow consumer holds its first fragment, and only one read before the
+/// EOS (#1195's placement): the engine's reader raises the stop flag before
+/// the hook on a batch whose read found the EOS, so a hold there delays
+/// nothing and the overrun stays at the on-time level. A run whose first
+/// fragment already carried the whole reply is run again
+/// ([`HOLD_ATTEMPTS`]).
 #[cfg(feature = "metal")]
 #[test]
 fn an_overrun_is_reported_with_how_the_state_was_made_ready() -> Result<()> {
@@ -282,28 +293,51 @@ fn an_overrun_is_reported_with_how_the_state_was_made_ready() -> Result<()> {
     let eos = stream[cut];
     for (spelling, slow) in [("ring-fixed", false), ("ring-nonblocking", true)] {
         let c = config(spelling);
-        let mut s = DecodeSession::from_sequence(
-            &model,
-            Sequence::new(model.new_cache(&cfg, &dev)?),
-            dev.clone(),
-        )
-        .with_config(c.clone());
         let params = DecodeParams {
             max_tokens: 3000,
             eos_ids: vec![eos],
             readback: c.readback.arm(),
             ..DecodeParams::default()
         };
-        let mut delivered = 0usize;
-        let first = s.decode_until(&prompt, detok, &params, |frag| {
-            delivered += frag.matches('<').count();
-            if slow && delivered >= cut {
-                std::thread::sleep(std::time::Duration::from_millis(1000));
+        let mut attempt = 0;
+        let (mut s, first) = loop {
+            attempt += 1;
+            let mut s = DecodeSession::from_sequence(
+                &model,
+                Sequence::new(model.new_cache(&cfg, &dev)?),
+                dev.clone(),
+            )
+            .with_config(c.clone());
+            let mut delivered = 0usize;
+            let mut first_fragment = true;
+            let mut held = false;
+            let first = s.decode_until(&prompt, detok, &params, |frag| {
+                delivered += frag.matches('<').count();
+                // A fragment leaving fewer than `cut` ids delivered was read
+                // before the EOS: a read that finds the EOS delivers every
+                // id before it.
+                if slow && std::mem::take(&mut first_fragment) && delivered < cut {
+                    std::thread::sleep(std::time::Duration::from_millis(1000));
+                    held = true;
+                }
+                true
+            })?;
+            if !slow || held {
+                break (s, first);
             }
-            true
-        })?;
+            eprintln!(
+                "TURN-HOLD {spelling}: attempt {attempt}: the first fragment delivered all {cut} \
+                 of the reply's ids; the consumer was not held before the EOS"
+            );
+            if attempt == HOLD_ATTEMPTS {
+                lloom_tensor::bail!(
+                    "{spelling}: in {HOLD_ATTEMPTS} runs the consumer was never held before the EOS"
+                );
+            }
+        };
         assert_eq!(first.tokens, stream[..cut], "{spelling}");
         let overrun = first.stats.overrun;
+        eprintln!("TURN-OVERRUN {spelling} slow={slow}: overrun {overrun} (attempts {attempt})");
         let log = s.tokens().to_vec();
         assert_eq!(
             log,

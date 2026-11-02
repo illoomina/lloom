@@ -673,7 +673,7 @@ fn forced_on<M: CausalLM>(
     let mut out = Vec::new();
     let mut ids = Tensor::new(prompt, dev)?.unsqueeze(0)?;
     let mut pos = 0;
-    for t in 0..tokens.len() {
+    for &t in tokens {
         let len = ids.dim(1)?;
         out.push(
             model
@@ -683,7 +683,7 @@ fn forced_on<M: CausalLM>(
                 .to_vec1::<f32>()?,
         );
         pos += len;
-        ids = Tensor::new(&[tokens[t]], dev)?.unsqueeze(0)?;
+        ids = Tensor::new(&[t], dev)?.unsqueeze(0)?;
     }
     Ok(out)
 }

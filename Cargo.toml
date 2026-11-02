@@ -209,6 +209,14 @@ debug = "line-tables-only"
 debug-assertions = true
 overflow-checks = true
 
+# `line-tables-only` names a function without its path (`flush_marker`, not
+# `lloom_tensor::…::Commands::flush_marker`), and the instruments that name
+# frames from a backtrace keep only `lloom…` paths, so under it they report
+# no frames at all. `limited` adds the paths and no type information, for the
+# crate whose tests assert those frames (docs/architecture.md §14.5e).
+[profile.ci.package.lloom-tensor]
+debug = "limited"
+
 # The sanitizer tier (#475). A CORRECTNESS arm, and the profile exists so that
 # is a property of the tree rather than of an invocation nobody recorded —
 # §14.5a's own lesson, where the codegen flags above were `--config`-passed and

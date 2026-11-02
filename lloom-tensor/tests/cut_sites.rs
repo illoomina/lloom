@@ -67,6 +67,12 @@ fn each_commit_path_is_its_own_site_with_its_own_count() {
     let _a = commit_by_marker(&dev, 3);
     let _b = commit_by_wait(&dev, 5);
     let sites = profile::cut_sites();
+    assert!(
+        sites.iter().any(|s| !s.frames.is_empty()),
+        "no commit names a lloom frame: this build symbolizes functions without \
+         their paths (`debug = \"line-tables-only\"`) or has no symbols (`strip`), \
+         and the attribution cannot name a site under it: {sites:#?}"
+    );
     let marker = commits_where(&sites, "Commands::flush_marker");
     let wait = commits_where(&sites, "Commands::flush_and_wait");
     assert_eq!(marker, 3, "flush_marker commits: {sites:#?}");

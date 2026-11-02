@@ -216,6 +216,10 @@ name = "host_table_probe"
 required-features = ["metal"]
 
 [[example]]
+name = "sparse_buffer_probe"
+required-features = ["metal"]
+
+[[example]]
 name = "gdn_step_bench"
 required-features = ["metal"]
 

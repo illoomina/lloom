@@ -38,6 +38,14 @@ pub enum MetalKernelError {
     Allocation(#[from] crate::memory_admission::AllocationError),
     #[error("command buffer recording admission refused: {0}")]
     RecordingAdmission(#[from] CommandLifecycleError),
+    #[error(transparent)]
+    AllocationUntouched(crate::memory_admission::AllocationError),
+    #[error(transparent)]
+    AllocationTouched(crate::memory_admission::AllocationError),
+    #[error("command buffer recording admission refused: {0}")]
+    RecordingUntouched(#[source] CommandLifecycleError),
+    #[error("command buffer recording admission refused: {0}")]
+    RecordingTouched(#[source] CommandLifecycleError),
     #[error("completion registration refused: {0}")]
     CompletionRegistration(#[from] CompletionRegistrationError),
     #[error("a completion callback cannot block on its own queue")]
@@ -92,6 +100,47 @@ pub enum MetalKernelError {
 }
 
 impl MetalKernelError {
+    /// Keep the warm refusal families inline. Other diagnostics retain their
+    /// original value for the outer cold wrapper; no error origin is inferred.
+    pub(crate) fn try_annotate_step(
+        self,
+        touched: crate::StateTouched,
+    ) -> std::result::Result<Self, Self> {
+        let touched = if self.step_state_touched() == Some(crate::StateTouched::Yes) {
+            crate::StateTouched::Yes
+        } else {
+            touched
+        };
+        match self {
+            Self::Allocation(refusal)
+            | Self::AllocationUntouched(refusal)
+            | Self::AllocationTouched(refusal) => Ok(match touched {
+                crate::StateTouched::No => Self::AllocationUntouched(refusal),
+                crate::StateTouched::Yes => Self::AllocationTouched(refusal),
+            }),
+            Self::RecordingAdmission(refusal)
+            | Self::RecordingUntouched(refusal)
+            | Self::RecordingTouched(refusal) => Ok(match touched {
+                crate::StateTouched::No => Self::RecordingUntouched(refusal),
+                crate::StateTouched::Yes => Self::RecordingTouched(refusal),
+            }),
+            error => Err(error),
+        }
+    }
+
+    pub(crate) fn step_state_touched(&self) -> Option<crate::StateTouched> {
+        match self {
+            Self::AllocationUntouched(_) | Self::RecordingUntouched(_) => {
+                Some(crate::StateTouched::No)
+            }
+            Self::AllocationTouched(_) | Self::RecordingTouched(_) => {
+                Some(crate::StateTouched::Yes)
+            }
+            Self::WithBacktrace { inner, .. } => inner.step_state_touched(),
+            _ => None,
+        }
+    }
+
     pub fn bt(self) -> Self {
         let backtrace = std::backtrace::Backtrace::capture();
         match backtrace.status() {
@@ -101,6 +150,29 @@ impl MetalKernelError {
                 inner: Box::new(self),
                 backtrace: Box::new(backtrace),
             },
+        }
+    }
+}
+
+#[cfg(test)]
+mod inline_step_annotation_tests {
+    use super::*;
+
+    #[test]
+    fn inline_step_helper_cannot_weaken_an_existing_touched_refusal() {
+        use crate::StateTouched;
+        for error in [
+            MetalKernelError::Allocation(crate::memory_admission::AllocationError::HostAllocation),
+            MetalKernelError::RecordingAdmission(CommandLifecycleError::Busy),
+        ] {
+            let error = error.try_annotate_step(StateTouched::Yes).unwrap();
+            assert_eq!(error.step_state_touched(), Some(StateTouched::Yes));
+            let error = error.try_annotate_step(StateTouched::No).unwrap();
+            assert_eq!(
+                error.step_state_touched(),
+                Some(StateTouched::Yes),
+                "kernel helper weakened an existing touched refusal"
+            );
         }
     }
 }

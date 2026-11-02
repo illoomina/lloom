@@ -225,7 +225,7 @@ fn prepared_sampler_actual_owner_matches_blocking_across_cadences() -> Result<()
             assert!(
                 labels
                     .iter()
-                    .any(|(name, count)| name.contains("sampling_topk_mask") && *count > 0),
+                    .any(|(name, count)| name.contains("sampling_select_hist_f32") && *count > 0),
                 "prepared sampler did not dispatch: {labels:?}"
             );
             assert!(matches!(out.readback, ReadbackArm::Ring(_)));
@@ -616,9 +616,9 @@ fn prepared_unfiltered_owner_uses_native_blocking_including_diagnostics() -> Res
             engine.core.device.synchronize()?;
             let labels = census.close();
             let method = if gumbel {
-                "sampling_filtered_gumbel"
+                "sampling_gumbel_pick_f32"
             } else {
-                "sampling_multinomial"
+                "sampling_draw_f32"
             };
             assert!(
                 labels
@@ -988,9 +988,9 @@ fn prepared_ring_replays_same_raw_rows_on_cpu_for_original_sampling_arms() -> Re
                         "gumbel={gumbel} filtered={filtered} history={history} arm={arm:?}"
                     );
                     let method = if gumbel {
-                        "sampling_filtered_gumbel"
+                        "sampling_gumbel_pick_f32"
                     } else {
-                        "sampling_multinomial"
+                        "sampling_draw_f32"
                     };
                     assert!(
                         labels.iter().any(|(n, k)| n.contains(method) && *k > 0),
@@ -2255,7 +2255,7 @@ fn check_native_owner_stop_route(out: &Decoded, labels: &[(String, u64)]) {
     assert!(
         labels
             .iter()
-            .any(|(name, n)| name.contains("sampling_topk_mask") && *n > 0),
+            .any(|(name, n)| name.contains("sampling_select_hist_f32") && *n > 0),
         "missing native sampler: {labels:?}"
     );
     assert!(
@@ -2560,7 +2560,7 @@ fn an_unset_filter_is_lfm2s_default_and_the_image_view_keeps_todays_route() -> R
     assert!(
         labels
             .iter()
-            .any(|(name, count)| name.contains("sampling_topk_mask") && *count > 0),
+            .any(|(name, count)| name.contains("sampling_select_hist_f32") && *count > 0),
         "the default did not take the prepared sampler: {labels:?}"
     );
     assert!(

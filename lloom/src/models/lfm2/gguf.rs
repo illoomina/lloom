@@ -4,9 +4,10 @@
 //! GGUF schema (`quantized_lfm2::weights::Lfm2Weights`). The weights load
 //! through `nn::weight_repr::GgufBackend`: packed kinds stay packed.
 //!
-//! The model computes at f32 over a GGUF, the numerical contract GGUF
-//! serving has always had (`docs/models/lfm2.md` §5.10): Metal's quantized
-//! GEMM reads f32 activations past the matmul-vec's rows.
+//! The model computes at f32 over a GGUF by default, the numerical contract
+//! GGUF serving has always had (`docs/models/lfm2.md` §5.10). At f16 the
+//! stream, the norms, the conv and the projections run `(f16, f32, f16)`,
+//! and the packed head computes f32 logits (`docs/invariants.md` §15.2a).
 use super::{Config, LayerType};
 use crate::models::quantized_lfm2::weights::{Lfm2Weights, MixerWeights};
 use crate::nn::gguf_weights::WeightPlan;
@@ -17,8 +18,20 @@ use lloom_tensor::quantized::gguf_file::Content;
 use lloom_tensor::{bail, DType, Device, Result};
 use std::collections::HashMap;
 
-/// The dtype a model built from a GGUF computes in.
+/// The dtype a model built from a GGUF computes in by default.
 pub const GGUF_COMPUTE_DTYPE: DType = DType::F32;
+
+/// The dtypes a model built from a GGUF may compute in: f32, or f16 (the
+/// quantized cores' `(f16, f32, f16)` arms). bf16 has no packed arm.
+pub fn check_compute_dtype(dtype: DType) -> Result<DType> {
+    match dtype {
+        DType::F32 | DType::F16 => Ok(dtype),
+        other => bail!(
+            "lfm2 GGUF: no packed projection route computes at {}; f32 or f16",
+            other.as_str()
+        ),
+    }
+}
 
 /// A validated LFM2 GGUF header: the model's config and the name map.
 #[derive(Debug, Clone)]
@@ -100,19 +113,22 @@ impl GgufCheckpoint {
         reader: R,
         device: &Device,
     ) -> VarBuilder<'a> {
-        self.recording_var_builder(ct, reader, device).0
+        self.recording_var_builder(ct, reader, device, GGUF_COMPUTE_DTYPE)
+            .0
     }
 
-    /// [`Self::var_builder`], and the record of which tensors it read.
+    /// [`Self::var_builder`] at `dtype` ([`check_compute_dtype`]'s), and the
+    /// record of which tensors it read.
     pub fn recording_var_builder<'a, R: std::io::Read + std::io::Seek + Send + 'a>(
         &self,
         ct: Content,
         reader: R,
         device: &Device,
+        dtype: DType,
     ) -> (VarBuilder<'a>, LoadRecord) {
         let backend = GgufBackend::new(ct, reader, self.names.clone());
         let record = backend.record();
-        let vb = VarBuilder::from_backend(Box::new(backend), GGUF_COMPUTE_DTYPE, device.clone());
+        let vb = VarBuilder::from_backend(Box::new(backend), dtype, device.clone());
         (vb, record)
     }
 

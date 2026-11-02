@@ -10626,6 +10626,15 @@ impl<P: Profile> Model<P> {
         } else {
             linear(cfg.hidden_size, cfg.vocab_size, vb.pp("lm_head"))?
         };
+        // The sampler reads f32 logits. A head over packed blocks computes
+        // them at f32 whatever the stream's dtype (the input cast once); a
+        // dense head keeps the stream's triple, which the recorded digests
+        // belong to (`docs/invariants.md` §15.2a).
+        let lm_head = if lm_head.blocks().is_some() {
+            lm_head.with_triple(crate::nn::project::Triple::F32)
+        } else {
+            lm_head
+        };
 
         let mut model = Self {
             profile: PhantomData,
@@ -10686,6 +10695,35 @@ impl<P: Profile> Model<P> {
         kinds
     }
 
+    /// Each projection's route at every row band, grouped: `<n> x <kind>
+    /// at <triple>: <routes>`, the head on its own line. Printed at load and
+    /// served on `/health`.
+    pub fn projection_routes(&self) -> Vec<String> {
+        let mut groups: BTreeMap<(String, String, String), usize> = BTreeMap::new();
+        for layer in &self.layers {
+            for p in layer.projections() {
+                let key = (p.kind(), p.triple().name(), p.routes(self.dtype));
+                *groups.entry(key).or_insert(0) += 1;
+            }
+        }
+        let mut lines: Vec<String> = groups
+            .into_iter()
+            .map(|((kind, triple, routes), n)| format!("{n} x {kind} at {triple}: {routes}"))
+            .collect();
+        lines.push(format!(
+            "head {}{} at {}: {}",
+            self.lm_head.kind(),
+            if self.embed_tokens.ties(&self.lm_head) {
+                " (tied)"
+            } else {
+                ""
+            },
+            self.lm_head.triple().name(),
+            self.lm_head.routes(self.dtype)
+        ));
+        lines
+    }
+
     /// The fused GEMV arms the blocks were set to that a packed projection
     /// cannot take, by arm name: those projections run the composed path.
     pub fn declined_fused_arms(&self) -> Vec<&'static str> {
@@ -10720,9 +10758,13 @@ impl<P: Profile> Model<P> {
         arms
     }
 
-    /// One line naming the packed storage when there is any, and one load
-    /// warning per load when a fused arm declines on it.
+    /// The projections' routes; one line naming the packed storage when
+    /// there is any, and one load warning per load when a fused arm declines
+    /// on it.
     fn report_packed_weights(&mut self) {
+        for line in self.projection_routes() {
+            eprintln!("[lfm2 projections: {line}]");
+        }
         let kinds = self.weight_kinds();
         if kinds
             .keys()

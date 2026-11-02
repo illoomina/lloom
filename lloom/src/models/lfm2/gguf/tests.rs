@@ -465,6 +465,74 @@ mod metal {
         Ok(())
     }
 
+    /// The f16 arm: every layer projection at `(f16, f32, f16)`, the tied
+    /// packed head at f32 over the cast stream, the lookup at f16, and the
+    /// logits f32. Its greedy run is compared with the f32 arm's (reported;
+    /// the bound only catches a broken model, the kernels' own parity tests
+    /// pin their rounding).
+    #[test]
+    fn an_f16_gguf_runs_its_blocks_at_f16_and_its_head_at_f32() -> Result<()> {
+        let dev = device()?;
+        let bytes = gguf(GgmlDType::Q8_0)?;
+        let mut reader = Cursor::new(bytes.clone());
+        let ct = gguf_file::Content::read(&mut reader)?;
+        let ckpt = GgufCheckpoint::read(&ct)?;
+        let cfg = ckpt.config.clone();
+        let vb = ckpt
+            .recording_var_builder(ct, reader, &dev, check_compute_dtype(DType::F16)?)
+            .0;
+        let model = Model::<CrownExact>::new(&cfg, vb)?;
+        let routes = model.projection_routes();
+        let band = |t: &str, cast: &str| {
+            format!(
+                "rows 1+ {cast}Matvec({t}), rows 9+ {cast}Gemm({t}), rows 64+ {cast}DequantOnceGemm({t})"
+            )
+        };
+        // 2 conv layers × (in, out, w1, w3, w2) + 1 attention layer × (q, k,
+        // v, o, w1, w3, w2).
+        assert_eq!(
+            routes,
+            vec![
+                format!("17 x q8_0 at (f16, f32, f16): {}", band("F16F32F16", "")),
+                format!(
+                    "head q8_0 (tied) at (f32, f32, f32): {}",
+                    band("F32F32F32", "cast f16 + ")
+                ),
+            ]
+        );
+        assert_eq!(
+            model.embed(&Tensor::new(&[[1u32]], &dev)?)?.dtype(),
+            DType::F16
+        );
+        let mut cache = State::<CrownExact>::new(true, DType::F16, &cfg, &dev)?;
+        let half = greedy(&model, &mut cache, &dev)?;
+        let (full, _) = from_gguf(&bytes, &dev)?;
+        let (worst, first) = compare(&half, &lfm2_run(&full, &cfg, &dev)?);
+        eprintln!(
+            "q8_0 lfm2 f16 arm vs f32 arm: max|dlogit|={worst:e} first_token_divergence={first:?}"
+        );
+        assert!(worst < 0.05, "max|dlogit| {worst}");
+        // Prompts reaching the GEMM band and the dequantise-once band.
+        for len in [20, CONTEXT] {
+            let prompt: Vec<u32> = (0..len as u32)
+                .map(|i| (i * 13 + 5) % VOCAB as u32)
+                .collect();
+            let mut c16 = State::<CrownExact>::new(true, DType::F16, &cfg, &dev)?;
+            let mut c32 = State::<CrownExact>::new(true, DType::F32, &cfg, &dev)?;
+            let (worst, _) = compare(
+                &greedy_on(&model, &mut c16, &prompt, 0, &dev)?,
+                &greedy_on(&full, &mut c32, &prompt, 0, &dev)?,
+            );
+            eprintln!("q8_0 lfm2 f16 vs f32, {len}-row prefill: max|dlogit|={worst:e}");
+            assert!(worst < 0.05, "{len} rows: max|dlogit| {worst}");
+        }
+        let ids = Tensor::new(&PROMPT, &dev)?.unsqueeze(0)?;
+        let mut cache = State::<CrownExact>::new(true, DType::F16, &cfg, &dev)?;
+        assert_eq!(model.forward(&ids, 0, &mut cache)?.dtype(), DType::F32);
+        assert!(check_compute_dtype(DType::BF16).is_err());
+        Ok(())
+    }
+
     /// The GEMV epilogue arms read a dense weight: asked for over packed
     /// blocks they decline, named once at load, and the step computes what
     /// the composed model computes.
@@ -590,5 +658,170 @@ fn a_real_lfm2_gguf_agrees_with_the_legacy_model() -> Result<()> {
             .map_err(lloom_tensor::Error::wrap)?
     );
     assert_eq!(first, None, "the greedy streams diverge");
+    Ok(())
+}
+
+/// [`greedy_on`] forced through `tokens`: the prompt as one pass, then each
+/// of `tokens` but the last fed as one step; the logits at every position.
+fn forced_on<M: CausalLM>(
+    model: &M,
+    cache: &mut M::Cache,
+    prompt: &[u32],
+    tokens: &[u32],
+    dev: &Device,
+) -> Result<Vec<Vec<f32>>> {
+    let mut out = Vec::new();
+    let mut ids = Tensor::new(prompt, dev)?.unsqueeze(0)?;
+    let mut pos = 0;
+    for t in 0..tokens.len() {
+        let len = ids.dim(1)?;
+        out.push(
+            model
+                .forward(&ids, pos, cache)?
+                .flatten_all()?
+                .to_dtype(DType::F32)?
+                .to_vec1::<f32>()?,
+        );
+        pos += len;
+        ids = Tensor::new(&[tokens[t]], dev)?.unsqueeze(0)?;
+    }
+    Ok(out)
+}
+
+/// KL(p ‖ q) of two logit rows' softmaxes, in nats.
+fn kl(p: &[f32], q: &[f32]) -> f64 {
+    let lse = |v: &[f32]| {
+        let m = v.iter().copied().fold(f32::NEG_INFINITY, f32::max) as f64;
+        m + v.iter().map(|&x| (x as f64 - m).exp()).sum::<f64>().ln()
+    };
+    let (lp, lq) = (lse(p), lse(q));
+    p.iter()
+        .zip(q)
+        .map(|(&a, &b)| {
+            let la = a as f64 - lp;
+            la.exp() * (la - (b as f64 - lq))
+        })
+        .sum()
+}
+
+/// #1154 D's quality gate on the real file `LLOOM_LFM2_GGUF_QUALITY` names:
+/// the f16 arm against the f32 arm (the reference), per prompt —
+/// free-running greedy streams (agreement, first divergence), then the f16
+/// arm forced through the f32 stream (max |Δlogit|, KL, the positions whose
+/// f16 argmax is not the f32 token, with the f32 top-1 margin there), and
+/// the forced |Δlogit| per 64-position window for drift over a long
+/// generation. Reports `QUALITY` lines; asserts nothing beyond running.
+/// Skipped, by name, when the variable is unset. A real checkpoint: run it
+/// under `lloom-arb measure`.
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn a_real_lfm2_gguf_f16_arm_against_the_f32_arm() -> Result<()> {
+    use lloom_tensor::quantized::tokenizer::TokenizerFromGguf;
+    let Ok(path) = std::env::var("LLOOM_LFM2_GGUF_QUALITY") else {
+        eprintln!("FIXTURE test=a_real_lfm2_gguf_f16_arm_against_the_f32_arm SKIPPED: LLOOM_LFM2_GGUF_QUALITY unset");
+        return Ok(());
+    };
+    #[cfg(feature = "metal")]
+    let dev = Device::new_metal(0)?;
+    #[cfg(not(feature = "metal"))]
+    let dev = Device::Cpu;
+    let mut file = std::fs::File::open(&path)?;
+    let ct = gguf_file::Content::read(&mut file)?;
+    let tokenizer = tokenizers::Tokenizer::from_gguf(&ct).map_err(lloom_tensor::Error::wrap)?;
+    let ckpt = GgufCheckpoint::read(&ct)?;
+    let mut cfg = ckpt.config.clone();
+    cfg.max_position_embeddings = cfg.max_position_embeddings.min(8192);
+    if dev.is_metal() {
+        cfg.attn_impl = crate::models::lfm2::AttnImpl::Sdpa;
+    }
+    let load = |dtype: DType| -> Result<Model<CrownExact>> {
+        let mut f = std::fs::File::open(&path)?;
+        let ct = gguf_file::Content::read(&mut f)?;
+        let vb = ckpt.recording_var_builder(ct, f, &dev, dtype).0;
+        Model::<CrownExact>::new(&cfg, vb)
+    };
+    let m32 = load(DType::F32)?;
+    let m16 = load(DType::F16)?;
+    let chat = |q: &str| {
+        format!("<|startoftext|><|im_start|>user\n{q}<|im_end|>\n<|im_start|>assistant\n")
+    };
+    let fox = "The quick brown fox jumps over the lazy dog while the tired old cat sleeps under the warm afternoon sun. ".repeat(80);
+    let prompts = [
+        ("france", chat("What is the capital of France? Answer in one paragraph."), 128usize),
+        ("story", chat("Write a short story about a lighthouse keeper who finds a message in a bottle. Use plain prose, at least three paragraphs."), 1024),
+        ("long", chat(&format!("{fox}\nHow many times does the word fox appear above? Explain.")), 128),
+    ];
+    for (name, text, steps) in prompts {
+        let prompt = tokenizer
+            .encode(text.as_str(), false)
+            .map_err(lloom_tensor::Error::wrap)?
+            .get_ids()
+            .to_vec();
+        let mut c32 = State::<CrownExact>::new(true, DType::F32, &cfg, &dev)?;
+        let reference = greedy_on(&m32, &mut c32, &prompt, steps, &dev)?;
+        let mut c16 = State::<CrownExact>::new(true, DType::F16, &cfg, &dev)?;
+        let free = greedy_on(&m16, &mut c16, &prompt, steps, &dev)?;
+        let t32: Vec<u32> = reference.iter().map(|(_, t)| *t).collect();
+        let t16: Vec<u32> = free.iter().map(|(_, t)| *t).collect();
+        let agree = t32.iter().zip(&t16).take_while(|(a, b)| a == b).count();
+        let mut c16 = State::<CrownExact>::new(true, DType::F16, &cfg, &dev)?;
+        let forced = forced_on(&m16, &mut c16, &prompt, &t32, &dev)?;
+        let (mut worst, mut kl_max, mut kl_sum) = (0f32, 0f64, 0f64);
+        let mut overrides = Vec::new();
+        let mut windows = Vec::new();
+        let mut window = 0f32;
+        for (i, ((l32, tok), l16)) in reference.iter().zip(&forced).enumerate() {
+            let d = l32
+                .iter()
+                .zip(l16)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0f32, f32::max);
+            worst = worst.max(d);
+            window = window.max(d);
+            let k = kl(l32, l16);
+            kl_max = kl_max.max(k);
+            kl_sum += k;
+            let arg16 = l16
+                .iter()
+                .enumerate()
+                .max_by(|a, b| a.1.total_cmp(b.1))
+                .map(|(i, _)| i as u32)
+                .unwrap_or(0);
+            if arg16 != *tok {
+                let mut s = l32.clone();
+                s.sort_by(|x, y| y.total_cmp(x));
+                overrides.push((i, s[0] - s[1]));
+            }
+            if (i + 1) % 64 == 0 || i + 1 == reference.len() {
+                windows.push(window);
+                window = 0.0;
+            }
+        }
+        eprintln!(
+            "QUALITY prompt={name} prompt_tokens={} positions={} free_agree_prefix={agree} first_divergence={:?} forced_max_dlogit={worst:e} kl_max={kl_max:e} kl_mean={:e} argmax_overrides={} override_f32_margins={:?}",
+            prompt.len(),
+            reference.len(),
+            (agree < t32.len()).then_some(agree),
+            kl_sum / reference.len() as f64,
+            overrides.len(),
+            overrides
+        );
+        eprintln!(
+            "QUALITY prompt={name} forced_max_dlogit_per_64={:?}",
+            windows
+        );
+        eprintln!(
+            "QUALITY prompt={name} text_f32={:?}",
+            tokenizer
+                .decode(&t32, false)
+                .map_err(lloom_tensor::Error::wrap)?
+        );
+        eprintln!(
+            "QUALITY prompt={name} text_f16={:?}",
+            tokenizer
+                .decode(&t16, false)
+                .map_err(lloom_tensor::Error::wrap)?
+        );
+    }
     Ok(())
 }

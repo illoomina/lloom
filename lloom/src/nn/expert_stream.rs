@@ -8615,6 +8615,11 @@ mod tests {
             true,
         )
         .unwrap();
+        // Exercise the real live-table fetch route independently of the
+        // process defaults, without waiting for the held initializer DATA.
+        tier.set_spare_slots(1).unwrap();
+        assert_eq!(tier.spare_slots(), 1);
+        assert!(tier.live_table());
         tier.set_prefetcher(Arc::new(Prefetcher::new(m, ring)));
         assert!(tier.fetch_prepare(1).unwrap());
         let (slot, ids) = {

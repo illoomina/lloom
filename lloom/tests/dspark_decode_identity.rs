@@ -3390,6 +3390,12 @@ struct NativeSeedHold {
 /// begin waiting on the held work.
 #[cfg(feature = "metal")]
 const PACER_WAIT_BOUND: std::time::Duration = std::time::Duration::from_secs(10);
+/// How long the hold lasts once the pacer has begun waiting: the old hold's
+/// 200 ms, now counted from the wait rather than from the second unit. A
+/// pacer that blocks stays blocked through it on any host; one that does not
+/// queues unit3 within it.
+#[cfg(feature = "metal")]
+const PACER_WAIT_GRACE: std::time::Duration = std::time::Duration::from_millis(200);
 
 #[cfg(feature = "metal")]
 impl NativeSeedHold {
@@ -3426,11 +3432,13 @@ impl NativeSeedHold {
                 }
                 if seen.load(Ordering::Acquire) >= 2 {
                     // before_forward for unit3 must wait on unit1's held
-                    // marker. Release once the pacer has begun that wait (its
+                    // marker. Hold until the pacer has begun that wait (its
                     // own count, on this device), so it is not left to how
-                    // soon the host gets there (#1205, census row 6). A pacer
-                    // that queues unit3 instead, or never gets there, ends
-                    // the hold by the third unit or by the bound, and the
+                    // soon the host gets there (#1205, census row 6), and
+                    // then for PACER_WAIT_GRACE more: a pacer that counted
+                    // its wait but did not block would queue unit3 meanwhile.
+                    // A pacer that queues unit3 instead, or never gets there,
+                    // ends the hold by the third unit or by the bound, and the
                     // assertions below see which.
                     let start = std::time::Instant::now();
                     while lloom::nn::decode::pacer_waits::waits_begun(&device) == waits_before
@@ -3439,10 +3447,16 @@ impl NativeSeedHold {
                     {
                         std::thread::sleep(Duration::from_millis(1));
                     }
-                    w.store(
-                        lloom::nn::decode::pacer_waits::waits_begun(&device) > waits_before,
-                        Ordering::Release,
-                    );
+                    let by_wait =
+                        lloom::nn::decode::pacer_waits::waits_begun(&device) > waits_before;
+                    if by_wait {
+                        let grace = std::time::Instant::now();
+                        while seen.load(Ordering::Acquire) < 3 && grace.elapsed() < PACER_WAIT_GRACE
+                        {
+                            std::thread::sleep(Duration::from_millis(1));
+                        }
+                    }
+                    w.store(by_wait, Ordering::Release);
                     released.store(seen.load(Ordering::Acquire), Ordering::Release);
                     a.store(true, Ordering::Release);
                     g.signal(1);

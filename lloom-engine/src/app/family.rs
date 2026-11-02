@@ -72,8 +72,8 @@ pub struct Capabilities {
     pub eos_gate_missing: &'static str,
     /// The device filter (`decode.readback.device_filter`) is this family's
     /// default for a non-greedy request: its model serves the guarded token
-    /// embedding, and the route was gated and priced on it (decision 109).
-    /// Elsewhere an unset filter takes today's route (`docs/dispatch.md` §11.2).
+    /// embedding, and the route was gated and priced on it. Elsewhere an
+    /// unset filter takes today's route (`docs/dispatch.md` §11.2).
     pub device_filter: bool,
     /// Why a family's default is today's route.
     pub device_filter_missing: &'static str,

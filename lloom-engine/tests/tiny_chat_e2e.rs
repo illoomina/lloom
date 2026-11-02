@@ -196,8 +196,8 @@ fn qwen3_5_tiny_chats_on_the_cpu_and_metal() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// The device filter is lfm2's default and no other family's (decision 109,
-/// `docs/dispatch.md` §11.2). With no flag, a filtered sampled request on a
+/// The device filter is lfm2's default and no other family's
+/// (`docs/dispatch.md` §11.2). With no flag, a filtered sampled request on a
 /// tiny LFM2 rides NativeRing on Metal; on a tiny Qwen3.5 it is served by
 /// today's route (the blocking arm, C1), not refused; on LFM2 on the CPU, and
 /// with `--device-filter=false`, LFM2 keeps today's route too. Every arm runs

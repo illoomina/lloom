@@ -2535,7 +2535,7 @@ fn prepared_metal_capability_and_preparation_refuse_before_first_token() -> Resu
     Ok(())
 }
 
-/// Unset, the device filter is lfm2's default (decision 109): a filtered
+/// Unset, the device filter is lfm2's default (`docs/dispatch.md` §11.2): a filtered
 /// request with no flag rides NativeRing on the loaded model. The image view
 /// delegates no guarded entry, so a session over it reads the unset filter as
 /// off and keeps today's route (`DecodeSession::device_filter`), rather than

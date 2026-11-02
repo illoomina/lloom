@@ -978,11 +978,9 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
 
     /// Whether a non-greedy request takes the device filter: as configured,
     /// or, unset, wherever this model serves the guarded token embedding on
-    /// Metal. The family layer sets it off for every family whose default is
-    /// today's route (`app/family.rs`, `resolve_device_filter`), so unset
-    /// reaches here on lfm2 and on direct library sessions only; a model or a
-    /// view that cannot serve the filter keeps today's route rather than
-    /// refusing (`docs/dispatch.md` §11.2).
+    /// Metal. Unset is the family's default, so a model or view that cannot
+    /// serve the filter keeps today's route instead of refusing; explicit
+    /// `true` refuses it (`docs/dispatch.md` §11.2).
     pub fn device_filter(&self) -> bool {
         match self.config.readback.device_filter {
             Some(on) => on,

@@ -433,7 +433,7 @@ pub(crate) fn stop_shared_worker(deadline: Instant) -> Option<bool> {
 /// test that counts allocations process-wide waits for this before opening
 /// its window, so that setup lands before the window rather than in it
 /// (#1205). Behind `fuzzing`; nothing shipping enables it.
-#[cfg(feature = "fuzzing")]
+#[cfg(all(feature = "metal", feature = "fuzzing"))]
 pub fn retirement_worker_parked() -> Option<bool> {
     match SHARED_SERVICE.get() {
         Some(Ok(service)) => Some(service.wake.test_is_parked()),

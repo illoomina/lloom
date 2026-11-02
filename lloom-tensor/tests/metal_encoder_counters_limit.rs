@@ -7,13 +7,14 @@
 //! One test in its own file: the switches are read once per process.
 #![cfg(feature = "metal")]
 use lloom_tensor::kernels::metal::profile;
-use lloom_tensor::{DType, Device, Result, Tensor};
+use lloom_tensor::{DType, Device, Error, Result, Tensor};
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{
     MTLCommonCounterSetTimestamp, MTLCounterSampleBuffer, MTLCounterSampleBufferDescriptor,
-    MTLCounterSet, MTLCreateSystemDefaultDevice, MTLDevice, MTLStorageMode,
+    MTLCounterSet, MTLCreateSystemDefaultDevice, MTLDevice, MTLSharedEvent, MTLStorageMode,
 };
+use std::time::{Duration, Instant};
 
 /// 134 MB of f16 weights: each GEMV takes ~0.37 ms on the GPU, far longer than
 /// encoding and committing one, so the command buffers pile up in flight.
@@ -59,6 +60,54 @@ fn chain(w: &Tensor, dev: &Device, reps: usize) -> Result<Tensor> {
     }
     dev.synchronize()?;
     Ok(x)
+}
+
+/// The device's live sample buffers: a peak above this is what the test needs.
+const DEVICE_SAMPLE_BUFFERS: u64 = 32;
+/// How long the chain may be held on the GPU waiting for the host to put more
+/// than [`DEVICE_SAMPLE_BUFFERS`] command buffers in flight. Well under the
+/// queue's own wait timeout (4.0 s on Metal 4, 5.2 s on Metal 3, measured on
+/// the M1 Max: `docs/invariants.md` §15.1q), so the test releases its hold
+/// before Metal would.
+const HOLD_BOUND: Duration = Duration::from_secs(2);
+
+/// [`chain`], held on the GPU behind an event until more command buffers are
+/// in flight than the device has sample buffers (or [`HOLD_BOUND`] passes).
+///
+/// Without the hold the peak is how far the host's encoding outruns 0.37 ms
+/// GEMVs: a slow host or a fast GPU drains the queue as fast as it fills, and
+/// the peak read 15 under load (#1205, census row 2). With it, nothing
+/// completes until the host has opened 33 sampled command buffers, on any
+/// host, so the peak is set by the test. The host's own limit on command
+/// buffers it may have in flight is what it encodes against while it waits.
+/// Returns the chain's result, how long the hold lasted, and whether it was
+/// released by the peak rather than by the bound.
+fn held_chain(w: &Tensor, dev: &Device, reps: usize) -> Result<(Tensor, Duration, bool)> {
+    let Device::Metal(m) = dev else {
+        unreachable!("the test returns early without a Metal device")
+    };
+    let gate = MTLCreateSystemDefaultDevice()
+        .and_then(|d| d.newSharedEvent())
+        .expect("a shared event");
+    m.commands()
+        .encode_wait_for_event(&gate, 1)
+        .map_err(|e| Error::Msg(format!("encode the hold: {e}")))?;
+    std::thread::scope(|s| {
+        let encoding = s.spawn(|| chain(w, dev, reps));
+        let t = Instant::now();
+        let mut reached = false;
+        while t.elapsed() < HOLD_BOUND && !encoding.is_finished() {
+            if profile::snapshot().encoder_buffers_in_flight_peak > DEVICE_SAMPLE_BUFFERS {
+                reached = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_micros(100));
+        }
+        let held = t.elapsed();
+        gate.setSignaledValue(1);
+        let x = encoding.join().expect("the encoding thread panicked")?;
+        Ok((x, held, reached))
+    })
 }
 
 #[test]
@@ -110,21 +159,28 @@ fn more_command_buffers_in_flight_than_the_device_has_sample_buffers() -> Result
     drop(hog);
 
     // Released: more command buffers in flight than the device has buffers,
-    // every encoder sampled, from one shared buffer.
+    // every encoder sampled, from one shared buffer. The chain is held on the
+    // GPU until the host has put them there (`held_chain`).
     profile::reset();
-    let x = chain(&w, &dev, REPS)?;
+    let (x, held, reached) = held_chain(&w, &dev, REPS)?;
     let s = profile::snapshot();
     let y: Vec<f32> = x.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
     assert!(y.iter().all(|&v| v == 1.0), "the GEMV chain must compute");
+    let Device::Metal(m) = &dev else {
+        unreachable!()
+    };
     eprintln!(
-        "released: dispatches {}, sampled {}, dropped {}, refused {}, peak in flight {}, buffers {}, slowest allocation {:.1} us",
+        "released: dispatches {}, sampled {}, dropped {}, refused {}, peak in flight {}, buffers {}, slowest allocation {:.1} us, held {} us ({}), api {}",
         s.dispatches,
         s.encoder_records.len(),
         s.encoder_samples_dropped,
         s.counter_buffers_refused,
         s.encoder_buffers_in_flight_peak,
         s.counter_buffers_live,
-        1e6 * s.counter_alloc_max_s
+        1e6 * s.counter_alloc_max_s,
+        held.as_micros(),
+        if reached { "by the peak" } else { "by the bound" },
+        m.commands().actual_command_api()
     );
     assert_eq!(
         (s.counter_buffers_refused, s.encoder_samples_dropped),
@@ -135,10 +191,16 @@ fn more_command_buffers_in_flight_than_the_device_has_sample_buffers() -> Result
     // Only sampled command buffers are counted in flight, so this is also what
     // a buffer per command buffer could never exceed.
     assert!(
-        s.encoder_buffers_in_flight_peak > 32,
+        s.encoder_buffers_in_flight_peak > DEVICE_SAMPLE_BUFFERS,
         "the test must put more command buffers in flight than the device has \
-         sample buffers, or it does not exercise the limit: peak {}",
-        s.encoder_buffers_in_flight_peak
+         sample buffers, or it does not exercise the limit: peak {} (held {:?}, {})",
+        s.encoder_buffers_in_flight_peak,
+        held,
+        if reached {
+            "released by the peak"
+        } else {
+            "released by the bound"
+        }
     );
     assert_eq!(s.encoder_samples_bad, 0);
     assert_eq!(s.encoder_buffers_unresolved, 0);

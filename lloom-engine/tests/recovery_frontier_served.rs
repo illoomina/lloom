@@ -113,9 +113,10 @@ struct Turn {
     /// The session's token log after the request.
     log: usize,
     /// The slow consumer held a fragment after which fewer than the
-    /// request's `slow_before` ids were delivered. The read that fetched it
-    /// did not find the stop id, which a read delivers every id before, so
-    /// the reader had not raised the stop flag: the hold delayed it.
+    /// request's `slow_before` ids were delivered. A read that finds the
+    /// stop id delivers every id before it, so the read that fetched this
+    /// fragment had not, and the reader had not raised the stop flag: the
+    /// hold delayed it.
     held: bool,
 }
 
@@ -227,7 +228,7 @@ fn serve_held(
         );
     }
     lloom_tensor::bail!(
-        "{spelling}: in {HOLD_ATTEMPTS} runs the reader never read a batch before the stop id"
+        "{spelling}: in {HOLD_ATTEMPTS} runs the consumer was never held before the stop id"
     )
 }
 

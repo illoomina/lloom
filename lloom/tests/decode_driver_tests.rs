@@ -906,6 +906,8 @@ struct Settled {
     certified: Option<Marker>,
     /// Certified buffers whose status had not yet caught up at the next step.
     lagged: usize,
+    /// The longest of those catch-ups.
+    max_lag: std::time::Duration,
 }
 
 impl Settled {
@@ -915,6 +917,7 @@ impl Settled {
             before_stamp: None,
             certified: None,
             lagged: 0,
+            max_lag: std::time::Duration::ZERO,
         }
     }
 
@@ -945,6 +948,7 @@ impl Settled {
                     }
                     std::thread::yield_now();
                 }
+                self.max_lag = self.max_lag.max(start.elapsed());
             }
         }
         #[cfg(not(feature = "metal"))]
@@ -1124,9 +1128,13 @@ fn the_pacer_bounds_the_drain_arm_and_is_a_null_on_the_poll_arm() -> Result<()> 
         assert_eq!(out.stats.step_markers, want_markers, "{device:?}");
         if metal {
             eprintln!(
-                "poll arm, ballast {PACER_BALLAST}: step_waits {}, status lagged the EOS wait {}, \
-                 poll fallbacks {}, steps {}",
-                out.stats.step_waits, rb.lagged, out.stats.readback.poll_fallbacks, out.stats.steps
+                "poll arm, ballast {PACER_BALLAST}: step_waits {}, status lagged the EOS wait {} \
+                 (longest {} us), poll fallbacks {}, steps {}",
+                out.stats.step_waits,
+                rb.lagged,
+                rb.max_lag.as_micros(),
+                out.stats.readback.poll_fallbacks,
+                out.stats.steps
             );
         }
         assert_eq!(

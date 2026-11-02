@@ -247,7 +247,7 @@ pub const COUPLINGS: &[Coupling] = &[
         when: "decode.batched.cut_hold other than off, or the model is LFM2 on serve or bench",
         effect: "whether the batched loop's decode-only forwards hold the counter cut off: ahead over a forward encoded ahead of the step's readback, all over every one, the blocking (sampled) arm too; a step that feeds prompt pieces keeps the period. serve and bench take all for LFM2 on Metal (decision 71), off elsewhere; at scheduler.max_sequences = 1 or on the CPU no batched loop cuts and the arm has no effect",
         keys: &["decode.batched.cut_hold", "scheduler.max_sequences", "model.path", "backend.device"],
-        site: "lloom/src/nn/batched.rs BatchCutHold::{configured, hold}, BatchDecoder::step; lloom-engine/src/frontend.rs When::ModelAxes",
+        site: "lloom/src/nn/batched.rs BatchCutHold::{configured, hold}, BatchDecoder::step; lloom-engine/src/frontend.rs When::Lfm2Dense",
         is_static: false,
     },
 ];
@@ -657,7 +657,7 @@ fn batched_cut_hold(o: &EngineOptions) -> Option<String> {
     } else {
         "every decode-only forward, the blocking arm too"
     };
-    let default = if arm == "all" && crate::frontend::When::ModelAxes.holds(o) {
+    let default = if arm == "all" && crate::frontend::When::Lfm2Dense.holds(o) {
         " (serve's and bench's default for LFM2 on Metal, decision 71)"
     } else {
         ""
@@ -1174,7 +1174,7 @@ mod tests {
                     o.load.model = model.clone();
                     o.scheduler.max_sequences = batch;
                     frontend::apply(&mut o, f, &Default::default(), &Default::default()).unwrap();
-                    let on = f != Frontend::Chat && model.is_none() && When::ModelAxes.holds(&o);
+                    let on = f != Frontend::Chat && model.is_none() && When::Lfm2Dense.holds(&o);
                     let want: Vec<String> = match (on, batch) {
                         (false, _) => vec![],
                         (true, 1) => vec!["decode.batched.cut_hold = all ignored <- \

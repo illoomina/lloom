@@ -196,10 +196,13 @@ fn qwen3_5_tiny_chats_on_the_cpu_and_metal() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// A sampled request's turn line: (readback, completion tokens, whether the
+/// native route's note was printed), or the refusal's last line.
+type Route = Result<(String, String, bool), String>;
+
 /// A filtered sampled request through `lloom chat` on `model` with `extra`
-/// flags: its turn line's (readback, completion tokens, whether the native
-/// route's note was printed), or the refusal's last line.
-fn sampled_route(model: &Path, extra: &[&str]) -> Result<(String, String, bool), String> {
+/// flags.
+fn sampled_route(model: &Path, extra: &[&str]) -> Route {
     const NATIVE: &str = "native prepared device sampler; no host logits readback";
     let out = Command::new(env!("CARGO_BIN_EXE_lloom"))
         .args(["chat", "--model"])
@@ -232,18 +235,18 @@ fn sampled_route(model: &Path, extra: &[&str]) -> Result<(String, String, bool),
 }
 
 /// Today's route: the blocking arm (C1), every token, no native note.
-fn todays_route(r: &Result<(String, String, bool), String>) -> bool {
+fn todays_route(r: &Route) -> bool {
     matches!(r, Ok((rb, n, false)) if rb == "blocking" && n == MAX_TOKENS)
 }
 
 /// NativeRing: a ring arm, every token, the native note.
 #[cfg(feature = "metal")]
-fn native_ring(r: &Result<(String, String, bool), String>) -> bool {
+fn native_ring(r: &Route) -> bool {
     matches!(r, Ok((rb, n, true)) if rb.starts_with("ring") && n == MAX_TOKENS)
 }
 
 /// Record every arm, then fail once, naming each arm that parted.
-fn assert_arms(tag: &str, arms: &[(&str, bool, Result<(String, String, bool), String>)]) {
+fn assert_arms(tag: &str, arms: &[(&str, bool, Route)]) {
     for (arm, ok, got) in arms {
         eprintln!("{tag} {arm}: {} {got:?}", if *ok { "ok" } else { "PARTED" });
     }

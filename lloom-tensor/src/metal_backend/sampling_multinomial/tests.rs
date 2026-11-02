@@ -1786,14 +1786,15 @@ pub(super) fn chi2_999(df: usize) -> f64 {
     k * (1.0 - a + z * a.sqrt()).powi(3)
 }
 
-/// The rows of an `LLOOM_LFM2_LOGITS_DUMP` file (`models::lfm2`'s record:
-/// `pos, rows, vocab` as u32, then `rows × vocab` f32, little-endian), up to
-/// `max` of them, each with its position.
+/// The last `max` rows of an `LLOOM_LFM2_LOGITS_DUMP` file (`models::lfm2`'s
+/// record: `pos, rows, vocab` as u32, then `rows × vocab` f32,
+/// little-endian), each with its position: a run's decode steps, after its
+/// warm-up and prefill forwards.
 pub(super) fn dumped_rows(path: &str, max: usize) -> Vec<(u32, Vec<f32>)> {
     let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("{path}: {e}"));
     let word = |at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
     let (mut at, mut out) = (0usize, Vec::new());
-    while at + 12 <= bytes.len() && out.len() < max {
+    while at + 12 <= bytes.len() {
         let (pos, rows, vocab) = (word(at), word(at + 4) as usize, word(at + 8) as usize);
         at += 12;
         for r in 0..rows {
@@ -1802,13 +1803,11 @@ pub(super) fn dumped_rows(path: &str, max: usize) -> Vec<(u32, Vec<f32>)> {
                     f32::from_le_bytes(bytes[at + 4 * (r * vocab + i)..][..4].try_into().unwrap())
                 })
                 .collect();
-            if out.len() < max {
-                out.push((pos, row));
-            }
+            out.push((pos, row));
         }
         at += 4 * rows * vocab;
     }
-    out
+    out.split_off(out.len().saturating_sub(max))
 }
 
 /// The sampling the decision-109 gates run, as (name, params): the

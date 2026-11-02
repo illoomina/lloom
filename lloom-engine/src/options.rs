@@ -178,8 +178,9 @@ pub struct ReadbackConfig {
     /// The request-prepared Metal sampler for non-greedy scalar requests. Ring
     /// requests use guarded model input; explicit blocking and diagnostics
     /// retain checked host ID/logit readback. Argmax keeps its existing route.
-    /// Unset = the family's own: on for lfm2 where the model serves the
-    /// guarded token embedding on Metal, today's route elsewhere (decision 109).
+    /// Unset = the family's own: on for lfm2, and for an LFM2 GGUF on the
+    /// LFM2 engine at blocks f32, where the model serves the guarded token
+    /// embedding on Metal; today's route elsewhere (decision 109).
     /// `true` refuses a request the model cannot serve.
     #[opt(bool, path = "decode.readback.device_filter", status = "arm", facets = ["produce"], flows = ["token-out"])]
     pub device_filter: Option<bool>,

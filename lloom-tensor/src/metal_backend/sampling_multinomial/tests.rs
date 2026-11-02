@@ -1743,6 +1743,152 @@ fn device_draws_have_the_reference_distribution() -> Result<()> {
     Ok(())
 }
 
+/// χ² of `draws` against `want` with the cells expected fewer than five
+/// times pooled into one, so a real row's long tail of rare ids does not void
+/// the statistic: (χ², degrees of freedom, draws where `want` is zero).
+pub(super) fn chi_square_pooled(draws: &[u32], want: &[f64]) -> (f64, usize, usize) {
+    let mut counts = vec![0usize; want.len()];
+    for &id in draws {
+        counts[id as usize] += 1;
+    }
+    let n = draws.len() as f64;
+    let outside = (0..want.len())
+        .filter(|&i| want[i] == 0.0)
+        .map(|i| counts[i])
+        .sum();
+    let (mut cells, mut pool) = (Vec::new(), (0.0f64, 0usize));
+    for i in (0..want.len()).filter(|&i| want[i] > 0.0) {
+        if n * want[i] >= 5.0 {
+            cells.push((n * want[i], counts[i]));
+        } else {
+            pool = (pool.0 + n * want[i], pool.1 + counts[i]);
+        }
+    }
+    if pool.0 > 0.0 {
+        match cells.iter_mut().min_by(|a, b| a.0.total_cmp(&b.0)) {
+            Some(least) if pool.0 < 5.0 => *least = (least.0 + pool.0, least.1 + pool.1),
+            _ => cells.push(pool),
+        }
+    }
+    let chi2 = cells.iter().map(|&(e, o)| (o as f64 - e).powi(2) / e).sum();
+    (chi2, cells.len().saturating_sub(1), outside)
+}
+
+/// The χ² distribution's 0.999 quantile at `df`: [`CHI2_999`] to 20 degrees
+/// of freedom, the Wilson–Hilferty approximation beyond (within 0.3 % of
+/// the table at 20).
+pub(super) fn chi2_999(df: usize) -> f64 {
+    if df < CHI2_999.len() {
+        return CHI2_999[df];
+    }
+    let (k, z) = (df as f64, 3.090_232_306_167_813f64);
+    let a = 2.0 / (9.0 * k);
+    k * (1.0 - a + z * a.sqrt()).powi(3)
+}
+
+/// The rows of an `LLOOM_LFM2_LOGITS_DUMP` file (`models::lfm2`'s record:
+/// `pos, rows, vocab` as u32, then `rows × vocab` f32, little-endian), up to
+/// `max` of them, each with its position.
+pub(super) fn dumped_rows(path: &str, max: usize) -> Vec<(u32, Vec<f32>)> {
+    let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("{path}: {e}"));
+    let word = |at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
+    let (mut at, mut out) = (0usize, Vec::new());
+    while at + 12 <= bytes.len() && out.len() < max {
+        let (pos, rows, vocab) = (word(at), word(at + 4) as usize, word(at + 8) as usize);
+        at += 12;
+        for r in 0..rows {
+            let row = (0..vocab)
+                .map(|i| {
+                    f32::from_le_bytes(bytes[at + 4 * (r * vocab + i)..][..4].try_into().unwrap())
+                })
+                .collect();
+            if out.len() < max {
+                out.push((pos, row));
+            }
+        }
+        at += 4 * rows * vocab;
+    }
+    out
+}
+
+/// The sampling the decision-109 gates run, as (name, params): the
+/// checkpoint's own, top-p, top-k at a temperature, the temperature alone.
+pub(super) fn served_cells() -> [(&'static str, Params); 4] {
+    [
+        ("checkpoint", Params::new(0.1, 50, 1.0)),
+        ("top-p", Params::new(0.8, 0, 0.9)),
+        ("top-k", Params::new(0.8, 40, 1.0)),
+        ("temperature", Params::new(0.8, 0, 1.0)),
+    ]
+}
+
+/// The χ² above at logits rows a real checkpoint produced, read from
+/// `LLOOM_CHI2_LOGITS` (an `LLOOM_LFM2_LOGITS_DUMP` file): the family's own
+/// vocabulary and logit shape through the staged kernels, at the sampling
+/// its gates run. 16 000 draws a cell, 100 rows a dispatch; one draw in 32
+/// is also checked equal to the reference's for its uniform. A cell whose
+/// pooled support is one cell is reported and not tested. Control: the same
+/// draws against the distribution with the temperature dropped fail.
+/// Ignored: it needs the dump, which needs a real checkpoint.
+#[test]
+#[ignore]
+fn device_draws_have_the_reference_distribution_at_dumped_rows() -> Result<()> {
+    let Ok(path) = std::env::var("LLOOM_CHI2_LOGITS") else {
+        panic!("LLOOM_CHI2_LOGITS names no logits dump");
+    };
+    let d = device()?;
+    let (n, rows) = (16_000usize, 100usize);
+    let (mut tested, mut controls) = (0usize, 0usize);
+    for (pos, z) in dumped_rows(&path, 3) {
+        for (what, params) in served_cells() {
+            let want = reference_distribution(&z, params);
+            let mut s = 77u64 ^ pos as u64;
+            let uniforms: Vec<f32> = (0..n)
+                .map(|_| (splitmix(&mut s) >> 40) as f32 / (1u64 << 24) as f32)
+                .collect();
+            let mut draws = Vec::with_capacity(n);
+            for chunk in uniforms.chunks(rows) {
+                let input = Tensor::from_vec(z.repeat(chunk.len()), (chunk.len(), z.len()), &d)?;
+                let u = Tensor::from_vec(chunk.to_vec(), chunk.len(), &d)?;
+                let got = read(encode(&input, params, &u)?)?;
+                for (row, &id) in got.ids.iter().enumerate().step_by(32) {
+                    assert_eq!(
+                        Ok(id),
+                        oracle::draw(&z, params, chunk[row]),
+                        "{what} pos {pos} u {}",
+                        chunk[row]
+                    );
+                }
+                draws.extend(got.ids);
+            }
+            let (chi2, df, outside) = chi_square_pooled(&draws, &want);
+            let support = want.iter().filter(|&&w| w > 0.0).count();
+            println!(
+                "CHI2 dumped pos={pos} vocab={} multinomial {what} T={} k={} p={} support={support} chi2={chi2:.2} df={df} critical={:.3} outside={outside}",
+                z.len(), params.temperature, params.k, params.p, chi2_999(df)
+            );
+            assert_eq!(outside, 0, "{what} pos {pos}: drew outside the kept set");
+            if df == 0 {
+                continue;
+            }
+            tested += 1;
+            assert!(chi2 < chi2_999(df), "{what} pos {pos}: chi2 {chi2}");
+            let cold = reference_distribution(&z, Params::new(1.0, params.k, params.p));
+            let (chi2, cold_df, _) = chi_square_pooled(&draws, &cold);
+            let fires = chi2 > chi2_999(cold_df);
+            println!(
+                "CHI2-CONTROL dumped pos={pos} multinomial {what} T dropped: chi2={chi2:.2} df={cold_df} critical={:.3} fires={fires}",
+                chi2_999(cold_df)
+            );
+            controls += fires as usize;
+        }
+    }
+    println!("CHI2-DUMPED tested={tested} controls_fired={controls}");
+    assert!(tested > 0, "no cell carried more than one pooled cell");
+    assert_eq!(controls, tested, "a control did not fire");
+    Ok(())
+}
+
 /// The microbench's rows at the served width with top-k AND top-p: the
 /// shape the fixtures' wide rows do not carry (they are k-only or p-only).
 /// Every row's kept set, draw and status against the reference, five times

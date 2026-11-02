@@ -773,6 +773,76 @@ fn device_gumbel_draws_have_the_reference_distribution() -> Result<()> {
     Ok(())
 }
 
+/// The Gumbel half of `tests.rs`'s dumped-row χ²: at the first row of the
+/// `LLOOM_CHI2_LOGITS` dump (a real checkpoint's logits), on the checkpoint
+/// and top-p cells, 4 000 draws of 20 rows a dispatch (a variate per
+/// vocabulary id per draw is the host's cost), every draw checked equal to
+/// the reference's for its variates. Control: the temperature dropped.
+/// Ignored: it needs the dump.
+#[test]
+#[ignore]
+fn device_gumbel_draws_have_the_reference_distribution_at_a_dumped_row() -> Result<()> {
+    use super::tests::{
+        chi2_999, chi_square_pooled, dumped_rows, reference_distribution, served_cells, splitmix,
+    };
+    let Ok(path) = std::env::var("LLOOM_CHI2_LOGITS") else {
+        panic!("LLOOM_CHI2_LOGITS names no logits dump");
+    };
+    let d = device()?;
+    let (n, rows) = (4_000usize, 20usize);
+    let (pos, z) = dumped_rows(&path, 1).remove(0);
+    let v = z.len();
+    let (mut tested, mut controls) = (0usize, 0usize);
+    for (what, p) in served_cells().into_iter().take(2) {
+        let want = reference_distribution(&z, p);
+        let mut s = 0x6b5u64 ^ pos as u64;
+        let mut draws = Vec::with_capacity(n);
+        for _ in 0..n / rows {
+            let noise: Vec<f32> = (0..rows * v)
+                .map(|_| {
+                    let u = ((splitmix(&mut s) >> 11) as f64 / (1u64 << 53) as f64)
+                        .clamp(1e-9, 0.999_999_9);
+                    (-(-u.ln()).ln()) as f32
+                })
+                .collect();
+            let input = Tensor::from_vec(z.repeat(rows), (rows, v), &d)?;
+            let g = Tensor::from_vec(noise.clone(), (rows, v), &d)?;
+            let got = read(encode(&input, p, &g)?)?;
+            for (row, &id) in got.ids.iter().enumerate() {
+                assert_eq!(
+                    id,
+                    reference(&z, p, &noise[row * v..(row + 1) * v]),
+                    "{what} row {row}"
+                );
+            }
+            draws.extend(got.ids);
+        }
+        let (chi2, df, outside) = chi_square_pooled(&draws, &want);
+        println!(
+            "CHI2 dumped pos={pos} vocab={v} gumbel {what} T={} k={} p={} chi2={chi2:.2} df={df} critical={:.3} outside={outside}",
+            p.temperature, p.k, p.p, chi2_999(df)
+        );
+        assert_eq!(outside, 0, "{what}: drew outside the kept set");
+        if df == 0 {
+            continue;
+        }
+        tested += 1;
+        assert!(chi2 < chi2_999(df), "{what}: chi2 {chi2}");
+        let cold = reference_distribution(&z, Params::new(1.0, p.k, p.p));
+        let (chi2, cold_df, _) = chi_square_pooled(&draws, &cold);
+        let fires = chi2 > chi2_999(cold_df);
+        println!(
+            "CHI2-CONTROL dumped pos={pos} gumbel {what} T dropped: chi2={chi2:.2} df={cold_df} critical={:.3} fires={fires}",
+            chi2_999(cold_df)
+        );
+        controls += fires as usize;
+    }
+    println!("CHI2-DUMPED-GUMBEL tested={tested} controls_fired={controls}");
+    assert!(tested > 0, "no cell carried more than one pooled cell");
+    assert_eq!(controls, tested, "a control did not fire");
+    Ok(())
+}
+
 /// The Gumbel draw repeated from one selection: as the multinomial case in
 /// `tests.rs` (`a_draw_repeated_from_one_selection_starts_clean`), the
 /// nucleus stage's publish must leave the compact counters reset, so the

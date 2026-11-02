@@ -3627,9 +3627,13 @@ impl<P: Lfm2Shape> super::served::Served for Engine<P> {
     }
     fn capabilities(&self) -> super::family::Capabilities {
         if self.gguf {
+            let rep = crate::frontend::Representation::of_kinds(
+                self.core.model.weight_kinds().keys().map(String::as_str),
+                self.dtype,
+            );
             return super::family::Capabilities {
                 decisions: self.decisions.is_some(),
-                ..super::family::LFM2_GGUF_CAPABILITIES
+                ..super::family::lfm2_gguf_engine_capabilities(Some(rep))
             };
         }
         super::family::Capabilities {

@@ -3380,8 +3380,16 @@ struct NativeSeedHold {
     timed_out: std::sync::Arc<std::sync::atomic::AtomicBool>,
     after_two: std::sync::Arc<std::sync::atomic::AtomicBool>,
     released_at: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// The hold was released because the pacer had begun waiting on the
+    /// held work, not by its bound or by a third unit queued.
+    by_wait: std::sync::Arc<std::sync::atomic::AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
+
+/// How long the hold waits, after two units were queued, for the pacer to
+/// begin waiting on the held work.
+#[cfg(feature = "metal")]
+const PACER_WAIT_BOUND: std::time::Duration = std::time::Duration::from_secs(10);
 
 #[cfg(feature = "metal")]
 impl NativeSeedHold {
@@ -3396,6 +3404,10 @@ impl NativeSeedHold {
         };
         let gate = Arc::new(lloom_tensor::metal_backend::HostEvent::new(m)?);
         gate.commit_when_produced(1)?;
+        let device = m.clone();
+        let waits_before = lloom::nn::decode::pacer_waits::waits_begun(&device);
+        let by_wait = Arc::new(AtomicBool::new(false));
+        let w = by_wait.clone();
         let done = Arc::new(AtomicBool::new(false));
         let timed_out = Arc::new(AtomicBool::new(false));
         let after_two = Arc::new(AtomicBool::new(false));
@@ -3413,9 +3425,24 @@ impl NativeSeedHold {
                     return;
                 }
                 if seen.load(Ordering::Acquire) >= 2 {
-                    // before_forward for unit3 must wait on unit1's held marker.
-                    // The actual wait counter below, not this delay, proves it did.
-                    std::thread::sleep(Duration::from_millis(200));
+                    // before_forward for unit3 must wait on unit1's held
+                    // marker. Release once the pacer has begun that wait (its
+                    // own count, on this device), so it is not left to how
+                    // soon the host gets there (#1205, census row 6). A pacer
+                    // that queues unit3 instead, or never gets there, ends
+                    // the hold by the third unit or by the bound, and the
+                    // assertions below see which.
+                    let start = std::time::Instant::now();
+                    while lloom::nn::decode::pacer_waits::waits_begun(&device) == waits_before
+                        && seen.load(Ordering::Acquire) < 3
+                        && start.elapsed() < PACER_WAIT_BOUND
+                    {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    w.store(
+                        lloom::nn::decode::pacer_waits::waits_begun(&device) > waits_before,
+                        Ordering::Release,
+                    );
                     released.store(seen.load(Ordering::Acquire), Ordering::Release);
                     a.store(true, Ordering::Release);
                     g.signal(1);
@@ -3432,6 +3459,7 @@ impl NativeSeedHold {
             timed_out,
             after_two,
             released_at,
+            by_wait,
             thread: Some(thread),
         })
     }
@@ -3575,6 +3603,7 @@ fn decode_speculative_streamed_prefill_keeps_native_unit_markers_and_probes() ->
     let timed_out = held.timed_out.load(Ordering::Acquire);
     let released_after_two = held.after_two.load(Ordering::Acquire);
     let released_at = held.released_at.load(Ordering::Acquire);
+    let released_by_wait = held.by_wait.load(Ordering::Acquire);
     drop(held);
     let out = result?;
     dev.synchronize()?;
@@ -3589,6 +3618,10 @@ fn decode_speculative_streamed_prefill_keeps_native_unit_markers_and_probes() ->
     assert_eq!(
         released_at, 2,
         "native hold did not bound unit3 behind unit1"
+    );
+    assert!(
+        released_by_wait,
+        "the hold was released before the pacer began waiting on the held work"
     );
     assert_eq!(recorder.record.drafts, 0);
     assert!(out.stats.rounds.is_empty());

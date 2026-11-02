@@ -135,11 +135,13 @@ fn the_host_fill_allocates_nothing_per_token() -> Result<()> {
     // Warm: the read threads start, the lazy statics settle.
     t.gather_into_with(&sets[0], &mut out, &mut scratch)?;
 
+    let r0 = read_worker_stats().unwrap_or_default();
     let a0 = allocs();
     for ids in &sets {
         t.gather_into_with(ids, &mut out, &mut scratch)?;
     }
     let reads = allocs() - a0;
+    let r1 = read_worker_stats().unwrap_or_default();
 
     // Every row in flight hedged at once, on the idle threads: the second
     // reads allocate nothing either. Row `HELD` waits for its request's
@@ -181,8 +183,12 @@ fn the_host_fill_allocates_nothing_per_token() -> Result<()> {
     let rayon = allocs() - a0;
     t.set_read_pool(ReadPool::Workers);
 
+    // A request the read threads refuse is read on rayon's pool, which
+    // allocates: the refusals are reported beside each count.
     println!(
-        "ALLOCS reads={reads} hedged={hedged_reads} (re-read {} rows, {} won; {held:?}) control={control} rayon={rayon} over {} tokens",
+        "ALLOCS reads={reads} (refused {}) hedged={hedged_reads} (refused {}; re-read {} rows, {} won; {held:?}) control={control} rayon={rayon} over {} tokens",
+        r1.refused - r0.refused,
+        h1.refused - h0.refused,
         h1.hedged - h0.hedged,
         h1.hedge_wins - h0.hedge_wins,
         sets.len()
@@ -253,7 +259,7 @@ fn a_held_row_lands_once(t: &MmapRows, sets: &[Vec<i64>], scratch: &mut ReadScra
                     rehedged: 1,
                     gave_up: 0
                 },
-                "{tag}: the held read was not re-read by its hedge"
+                "{tag}: the hedge did not re-read the held row with its other read waiting"
             );
             assert_eq!(
                 s1.hedged - s0.hedged,
@@ -313,11 +319,13 @@ fn fill_on_metal(path: &std::path::Path, hash: &NgramHash) -> Result<()> {
     let tokens: Vec<u32> = (0..258u32).map(|i| (i * 7919 + 13) % 50_000).collect();
     fill.fill(tokens[0])?;
     fill.fill(tokens[1])?;
+    let r0 = read_worker_stats().unwrap_or_default();
     let a0 = allocs();
     for &t in &tokens[2..] {
         fill.fill(t)?;
     }
     let fills = allocs() - a0;
+    let r1 = read_worker_stats().unwrap_or_default();
     let n = tokens.len() - 2;
     // The fill's two Metal calls, the slot and the signal, bare, as many
     // times, on a ring of its own.
@@ -333,7 +341,8 @@ fn fill_on_metal(path: &std::path::Path, hash: &NgramHash) -> Result<()> {
     }
     let calls = allocs() - a0;
     println!(
-        "ALLOCS fill={fills} metal_calls={calls} over {n} tokens (debug assertions {})",
+        "ALLOCS fill={fills} (refused {}) metal_calls={calls} over {n} tokens (debug assertions {})",
+        r1.refused - r0.refused,
         cfg!(debug_assertions)
     );
     assert_eq!(

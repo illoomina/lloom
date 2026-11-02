@@ -482,14 +482,14 @@ impl Readers {
     }
 }
 
-/// Which read lands a held row ([`Readers::hold`]).
+/// Which read lands a held row ([`Readers::hold`]); the other reads it too
+/// and loses its claim.
 #[cfg(feature = "fuzzing")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HeldWinner {
-    /// The hedge's read lands it; the first read then loses its claim.
+    /// The hedge's read.
     Hedge,
-    /// The first read lands it, once the hedge has handed the row out again;
-    /// the hedge's read then loses.
+    /// The first read.
     First,
 }
 
@@ -497,7 +497,8 @@ pub enum HeldWinner {
 #[cfg(feature = "fuzzing")]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct HoldStats {
-    /// First reads of the held row that waited for their request's hedge.
+    /// Losing reads of the held row that waited in the hold for the
+    /// winner to land it.
     pub held: u64,
     /// Hedges that handed the held row out again.
     pub rehedged: u64,
@@ -506,8 +507,8 @@ pub struct HoldStats {
     pub gave_up: u64,
 }
 
-/// The longest a held read waits for its request's hedge. It bounds a test
-/// whose hedge never runs; a hedge that runs ends the wait long before it.
+/// The longest a held read waits. It bounds a test whose hedge never runs; a
+/// hedge that runs ends every wait long before it.
 #[cfg(feature = "fuzzing")]
 pub const HOLD_BOUND: Duration = Duration::from_secs(10);
 
@@ -523,6 +524,8 @@ struct Straggle {
     handed_round: AtomicU64,
     /// The newest request whose hedge has run. Stored after `handed_round`.
     fired: AtomicU64,
+    /// The newest request whose losing read waits in the hold.
+    entered: AtomicU64,
     held: AtomicU64,
     rehedged: AtomicU64,
     gave_up: AtomicU64,
@@ -540,9 +543,11 @@ impl Straggle {
 
 #[cfg(feature = "fuzzing")]
 impl Readers {
-    /// From the next request on, hold the first read of row `row` of each
-    /// request that carries a hedge until that request's hedge has run, and
-    /// let `winner` land it; `None` stops holding. The counts start again.
+    /// From the next request on, hold row `row` of each request that
+    /// carries a hedge: its first read waits until the hedge has run, and
+    /// `winner` lands it while the other read, already past its claim check,
+    /// waits to read it and lose. `None` stops holding. The counts start
+    /// again.
     pub fn hold(&self, row: Option<(usize, HeldWinner)>) {
         let s = &self.straggle;
         s.row.store(0, Ordering::Release);
@@ -580,31 +585,34 @@ impl Readers {
     }
 
     /// Before a read of row `row` of `job` (still `pending`): wait while the
-    /// hold says this read is not yet to go. The first read of the held row
-    /// waits for the hedge to run and, when the hedge is to win, for the
-    /// hedge's read to land; the hedge's read, when the first is to win,
-    /// waits for the first to land. Allocates nothing.
+    /// hold says this read is not yet to go. The losing read waits first, so
+    /// it is always past its claim check when the row lands; the winner
+    /// reads once it waits. The first read never lands before the hedge has
+    /// run: as the loser it waits for the hedge's read, as the winner for
+    /// the hedge's read to wait. A hedge that found no idle thread for the
+    /// row leaves the row to the first read alone. Allocates nothing.
     fn hold_read(&self, job: &Job, row: u32, c: &AtomicU64, pending: u64) {
         let s = &self.straggle;
         if s.row.load(Ordering::Acquire) != row + 1 || s.armed.load(Ordering::Acquire) != job.round
         {
             return;
         }
-        let hedge_wins = s.hedge_wins.load(Ordering::Relaxed);
-        if job.hedge && hedge_wins {
-            return;
+        let loser = job.hedge != s.hedge_wins.load(Ordering::Relaxed);
+        if loser {
+            s.entered.store(job.round, Ordering::Release);
+            s.held.fetch_add(1, Ordering::Relaxed);
         }
         let t0 = Instant::now();
         loop {
             let landed = c.load(Ordering::Acquire) != pending;
             let fired = s.fired.load(Ordering::Acquire) == job.round;
             let handed = s.handed_round.load(Ordering::Acquire) == job.round;
-            let go = match (job.hedge, hedge_wins) {
-                (true, _) => landed,
-                // A hedge that found no idle thread for the row leaves it to
-                // this read.
-                (false, true) => landed || (fired && !handed),
-                (false, false) => fired || handed,
+            let entered = s.entered.load(Ordering::Acquire) == job.round;
+            let alone = !job.hedge && fired && !handed;
+            let go = match (loser, job.hedge) {
+                (true, _) => landed || alone,
+                (false, true) => entered,
+                (false, false) => entered || alone,
             };
             if go {
                 break;
@@ -615,9 +623,6 @@ impl Readers {
                 break;
             }
             std::thread::yield_now();
-        }
-        if !job.hedge {
-            s.held.fetch_add(1, Ordering::Relaxed);
         }
     }
 }

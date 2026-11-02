@@ -342,8 +342,10 @@ impl Completions {
                 }
                 drain.next.as_ref().expect("ready successor").try_clone()?
             };
+            let mut runs = 0;
             next.record().run_callbacks(
                 |captures, _, feedback| {
+                    runs = captures.hook_runs;
                     captures.run(self.identity(), feedback, self.hook.get().map(|h| &**h))
                 },
                 || self.wake.notify(),
@@ -357,6 +359,9 @@ impl Completions {
             };
             // Metadata-only drop. No arbitrary capture destructor runs here.
             drop(previous);
+            if let Some(hook) = self.hook.get() {
+                hook.retire(runs);
+            }
             // Concurrent failure permits only this already-started record to
             // finish; the next loop cannot start a later callback.
         }

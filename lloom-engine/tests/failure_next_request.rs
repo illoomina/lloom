@@ -390,10 +390,14 @@ fn requests(model: &Faulty, cfg: &Config, dev: &Device, watch: bool) -> Result<(
     // The next request, whose own EOS comes early: its failure is injected
     // past it, inside the overrun (three forwards past it, where a slow
     // reader leaves the loop running; under the watch the first forward past
-    // it, encoded before the EOS is published).
+    // it, encoded before the EOS is published). At least 6 ids, as
+    // `turn_reuse` and `recovery_frontier_served`: a reply of 3 was often
+    // fetched whole by the reader's first read, which no consumer can hold
+    // before the EOS (`serve_held` reran 1 to 4 times on an idle machine,
+    // #1205).
     let p2: Vec<u32> = [p1.clone(), reply1.clone(), vec![10, 20, 30]].concat();
     let s2 = stream_of(model, cfg, dev, &p2, 32)?;
-    let cut2 = fresh(&s2, 3);
+    let cut2 = fresh(&s2, 6);
     let eos2 = s2[cut2];
     let reqs = vec![
         Req {

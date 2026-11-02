@@ -549,11 +549,18 @@ fn lfm2_load_options(checkpoint: PathBuf, req: &Requested<'_>) -> Result<lfm2::L
         decision_template: model.decision_template.clone(),
         decision_ragged: shape.decision_ragged,
         text_only: model.text_only,
-        gguf_act: match model.gguf_act.as_str() {
-            "f16" => lloom_tensor::DType::F16,
-            _ => lloom_tensor::DType::F32,
-        },
+        gguf_act: gguf_act(model),
     })
+}
+
+/// `models.lfm2_gguf.activation_dtype` as a dtype: `None` for `auto`, the
+/// model's dtype (`app::lfm2::compute_dtype`).
+pub(crate) fn gguf_act(model: &LoadConfig) -> Option<lloom_tensor::DType> {
+    match model.gguf_act.as_str() {
+        "f16" => Some(lloom_tensor::DType::F16),
+        "f32" => Some(lloom_tensor::DType::F32),
+        _ => None,
+    }
 }
 
 /// The arm `models.lfm2_gguf.engine` names is the LFM2 engine.
@@ -1072,6 +1079,37 @@ mod tests {
         Lfm2GgufFamily
             .resolve(&Requested {
                 model: &model_args(&[]),
+                shape: shape(),
+            })
+            .unwrap();
+
+        // The default is `auto`, the model's dtype; `f32` is an arm, refused
+        // where no family reads it exactly as `f16` is.
+        use lloom_tensor::DType;
+        assert_eq!(LoadConfig::default().gguf_act, "auto");
+        assert_eq!(gguf_act(&model_args(&[])), None);
+        assert_eq!(gguf_act(&f16), Some(DType::F16));
+        let f32 = model_args(&["--gguf-act", "f32"]);
+        assert_eq!(gguf_act(&f32), Some(DType::F32));
+        let err = Lfm2Family
+            .resolve(&Requested {
+                model: &f32,
+                shape: shape(),
+            })
+            .expect_err("f32 on a safetensors LFM2")
+            .to_string();
+        assert!(err.contains(key), "{err}");
+        for model in [&f32, &model_args(&["--gguf-act", "auto"])] {
+            Lfm2GgufFamily
+                .resolve(&Requested {
+                    model,
+                    shape: shape(),
+                })
+                .unwrap();
+        }
+        Lfm2Family
+            .resolve(&Requested {
+                model: &model_args(&["--gguf-act", "auto"]),
                 shape: shape(),
             })
             .unwrap();

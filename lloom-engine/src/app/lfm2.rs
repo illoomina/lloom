@@ -212,22 +212,39 @@ fn gguf_text(path: &Path) -> Result<Option<GgufText>> {
     Ok(Some(GgufText { content, header }))
 }
 
+/// The dtype the LFM2 engine computes a checkpoint in: the model's dtype
+/// (f16 on Metal, f32 on the CPU), whatever the container. A GGUF may name
+/// another arm (`models.lfm2_gguf.activation_dtype`); a dtype no packed
+/// route computes at is refused (`lfm2::gguf::check_compute_dtype`).
+pub fn compute_dtype(gguf: bool, gguf_act: Option<DType>, cpu: bool) -> Result<DType> {
+    let model = if cpu { DType::F32 } else { DType::F16 };
+    if !gguf {
+        return Ok(model);
+    }
+    Ok(lloom::models::lfm2::gguf::check_compute_dtype(
+        gguf_act.unwrap_or(model),
+    )?)
+}
+
 /// The representation the LFM2 engine builds the checkpoint at `path` in,
-/// on the CPU or on Metal, read before load: a GGUF's stored kinds at
-/// [`GGUF_COMPUTE_DTYPE`](lloom::models::lfm2::gguf::GGUF_COMPUTE_DTYPE), a
-/// safetensors checkpoint dense at the engine's dtype. The rule
+/// on the CPU or on Metal, read before load: a GGUF's stored kinds, a
+/// safetensors checkpoint dense, each at [`compute_dtype`]. The rule
 /// `load_on_with_preflight` applies; the built engine reports its own
 /// (`/health`'s `representation`), so the two can be held to each other.
-pub fn representation(path: &Path, cpu: bool) -> Result<crate::frontend::Representation> {
+pub fn representation(
+    path: &Path,
+    cpu: bool,
+    gguf_act: Option<DType>,
+) -> Result<crate::frontend::Representation> {
     use crate::frontend::Representation;
     Ok(match gguf_text(path)? {
         Some(g) => Representation::of_kinds(
             g.header.stored_kinds(&g.content).keys().map(String::as_str),
-            lloom::models::lfm2::gguf::GGUF_COMPUTE_DTYPE,
+            compute_dtype(true, gguf_act, cpu)?,
         ),
         None => Representation {
             blocks: false,
-            compute: if cpu { DType::F32 } else { DType::F16 },
+            compute: compute_dtype(false, None, cpu)?,
         },
     })
 }
@@ -476,8 +493,8 @@ pub struct LoadOptions {
     /// `model.text_only`: build no vision tower on a VL checkpoint.
     pub text_only: bool,
     /// `models.lfm2_gguf.activation_dtype`: the dtype an LFM2 GGUF computes
-    /// in (`lfm2::gguf::check_compute_dtype`).
-    pub gguf_act: DType,
+    /// in, `None` for the model's ([`compute_dtype`]).
+    pub gguf_act: Option<DType>,
 }
 
 /// How the rows of `--batch N` hold their KV and conv state, and how a step
@@ -921,16 +938,9 @@ impl<P: Lfm2Shape> Engine<P> {
         preflight: impl FnOnce(&Config, &Text) -> Result<()>,
     ) -> Result<Self> {
         let model_dir = opts.model_dir.clone();
-        // A GGUF computes at its arm's dtype (`lfm2::gguf`).
         let mut gguf = gguf_text(&model_dir)?;
         let is_gguf = gguf.is_some();
-        let dtype = if is_gguf {
-            lloom::models::lfm2::gguf::check_compute_dtype(opts.gguf_act)?
-        } else if device.is_cpu() {
-            DType::F32
-        } else {
-            DType::F16
-        };
+        let dtype = compute_dtype(is_gguf, opts.gguf_act, device.is_cpu())?;
         if opts.batch == 0 {
             anyhow::bail!("--batch must be positive");
         }

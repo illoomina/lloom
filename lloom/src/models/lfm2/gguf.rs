@@ -4,10 +4,11 @@
 //! GGUF schema (`quantized_lfm2::weights::Lfm2Weights`). The weights load
 //! through `nn::weight_repr::GgufBackend`: packed kinds stay packed.
 //!
-//! The model computes at f32 over a GGUF by default, the numerical contract
-//! GGUF serving has always had (`docs/models/lfm2.md` §5.10). At f16 the
-//! stream, the norms, the conv and the projections run `(f16, f32, f16)`,
-//! and the packed head computes f32 logits (`docs/invariants.md` §15.2a).
+//! A GGUF computes at the model's dtype, as its safetensors checkpoint does
+//! (`docs/models/lfm2.md` §5.10): at f16 the stream, the norms, the conv and
+//! the projections run `(f16, f32, f16)`, and the packed head computes f32
+//! logits (`docs/invariants.md` §15.2a). f32 is an arm, the contract of the
+//! legacy GGUF model.
 use super::{Config, LayerType};
 use crate::models::quantized_lfm2::weights::{Lfm2Weights, MixerWeights};
 use crate::nn::gguf_weights::WeightPlan;
@@ -18,8 +19,10 @@ use lloom_tensor::quantized::gguf_file::Content;
 use lloom_tensor::{bail, DType, Device, Result};
 use std::collections::HashMap;
 
-/// The dtype a model built from a GGUF computes in by default.
-pub const GGUF_COMPUTE_DTYPE: DType = DType::F32;
+/// The dtype the legacy GGUF model (`quantized_lfm2`) computes in: the f32
+/// arm. [`GgufCheckpoint::var_builder`] builds at it, so a parity test
+/// against that model compares like with like.
+pub const LEGACY_COMPUTE_DTYPE: DType = DType::F32;
 
 /// The dtypes a model built from a GGUF may compute in: f32, or f16 (the
 /// quantized cores' `(f16, f32, f16)` arms). bf16 has no packed arm.
@@ -106,14 +109,14 @@ impl GgufCheckpoint {
     }
 
     /// The weights of `ct` (read through `reader`) as this model's
-    /// `VarBuilder`, at [`GGUF_COMPUTE_DTYPE`] on `device`.
+    /// `VarBuilder`, at [`LEGACY_COMPUTE_DTYPE`] on `device`.
     pub fn var_builder<'a, R: std::io::Read + std::io::Seek + Send + 'a>(
         &self,
         ct: Content,
         reader: R,
         device: &Device,
     ) -> VarBuilder<'a> {
-        self.recording_var_builder(ct, reader, device, GGUF_COMPUTE_DTYPE)
+        self.recording_var_builder(ct, reader, device, LEGACY_COMPUTE_DTYPE)
             .0
     }
 

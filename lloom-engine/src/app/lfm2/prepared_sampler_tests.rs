@@ -103,6 +103,7 @@ fn fixture_with_trace(
         decision_template: None,
         decision_ragged: false,
         text_only: true,
+        gguf_act: None,
     };
     let engine = NativeEngine::load_as(opts)?;
     assert!(

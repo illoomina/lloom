@@ -3607,6 +3607,11 @@ fn decode_speculative_streamed_prefill_keeps_native_unit_markers_and_probes() ->
     drop(held);
     let out = result?;
     dev.synchronize()?;
+    eprintln!(
+        "SEED-HOLD released_at {released_at} by_wait {released_by_wait} timed_out {timed_out} \
+         step_waits {} step_markers {}",
+        out.stats.step_waits, out.stats.step_markers
+    );
     assert!(
         !timed_out,
         "seed read/retirement blocked before two units were queued"

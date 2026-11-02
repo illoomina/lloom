@@ -17,6 +17,7 @@ pub(crate) enum Fault {
     HoldReturn = 4,
     UnknownReturn = 5,
     CloseRefusal = 6,
+    HoldBeforeEntry = 7,
 }
 
 #[derive(Default)]
@@ -24,6 +25,8 @@ pub(crate) struct Control {
     fault: AtomicU8,
     pub native_calls: AtomicUsize,
     pub entry_checks: AtomicUsize,
+    pub owner_wait_busy: AtomicUsize,
+    pub owner_wait_joins: AtomicUsize,
     required_residency: AtomicU64,
     observed_residency: AtomicU64,
     observer: Mutex<Option<Retained<ProtocolObject<dyn MTLSharedEvent>>>>,
@@ -67,6 +70,9 @@ impl Control {
     }
     pub fn before_entry(&self) -> Result<(), MetalKernelError> {
         self.entry_checks.fetch_add(1, Ordering::Relaxed);
+        if self.take(Fault::HoldBeforeEntry) {
+            self.pause_until_released();
+        }
         if self.take(Fault::BeforeEntry) {
             Err(MetalKernelError::QueueUnavailable(
                 "injected known-before-entry refusal",
@@ -102,12 +108,24 @@ impl Control {
         if !self.take(Fault::HoldReturn) {
             return;
         }
+        self.pause_until_released();
+        // Re-arming the existing fault while HoldReturn is paused exercises an
+        // error AFTER an actual owner waiter reached Busy. Keep the original
+        // pre-pause check above and its one-shot semantics unchanged.
+        if self.take(Fault::UnknownReturn) {
+            panic!("controlled unknown return publication");
+        }
+    }
+    fn pause_until_released(&self) {
         let mut state = self.pause.lock().unwrap();
         state.0 = true;
         self.changed.notify_all();
         while !state.1 {
             state = self.changed.wait(state).unwrap();
         }
+    }
+    pub fn observe_owner_wait_busy(&self) {
+        self.owner_wait_busy.fetch_add(1, Ordering::Release);
     }
     pub fn wait_for_pause(&self) -> bool {
         let state = self.pause.lock().unwrap();

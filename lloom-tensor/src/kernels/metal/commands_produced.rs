@@ -303,6 +303,108 @@ pub(super) struct Held {
     pub(super) at: std::time::Instant,
 }
 
+/// Epochs held recordings took at their cut and gave up to a cancellation:
+/// never committed, so a later commit's completion completes them. The
+/// completion hook's n-th run completes epoch n (`completion_hook.rs`), so
+/// how many runs a commit carries decides which epochs its completion marks.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct Owed {
+    count: u32,
+    /// The epoch the next hook run completes: the runs every owner commit
+    /// so far carried. Every epoch below it is committed or paid.
+    flagged: u64,
+}
+
+impl Owed {
+    /// The most epochs owed at once: a commit's hook runs, `1 + count`, are
+    /// a `u32`. Past it a cancellation is refused and the queue fails.
+    pub(super) const MAX_OWED: u32 = u32::MAX - 1;
+
+    /// A held recording that took `epoch` was cancelled before its commit.
+    pub(super) fn cancel(&mut self, epoch: Epoch) -> Result<(), MetalKernelError> {
+        debug_assert!(epoch.0 >= self.flagged, "a flagged epoch was cancelled");
+        if self.count >= Self::MAX_OWED {
+            return Err(MetalKernelError::QueueUnavailable(
+                "owed epoch bound reached",
+            ));
+        }
+        self.count += 1;
+        Ok(())
+    }
+
+    /// The hook runs a commit carries. With no other recording live and
+    /// uncommitted (`others_live == 0`: the last held one, or the current one
+    /// with nothing held) it carries every owed epoch. A held front with live
+    /// work behind it carries the holes below its reserved `epoch` and its
+    /// own: every epoch from the frontier up to it is cancelled, and none
+    /// above it is marked. Either way its completion marks only epochs that
+    /// are complete or cancelled. `epoch` is `None` for a commit that takes
+    /// its epoch at the commit.
+    pub(super) fn runs_for(&self, epoch: Option<Epoch>, others_live: usize) -> u32 {
+        match (epoch, others_live) {
+            (_, 0) => 1 + self.count,
+            (Some(e), _) => {
+                let holes = e.0.saturating_sub(self.flagged);
+                debug_assert!(holes <= u64::from(self.count), "a hole that is not owed");
+                1 + holes.min(u64::from(self.count)) as u32
+            }
+            // The current recording commits only with nothing held.
+            (None, _) => 1,
+        }
+    }
+
+    /// A commit carrying `runs` was accepted. Precondition: `runs` came from
+    /// [`Self::runs_for`] on this state, for that commit. The reserved epochs
+    /// are then the frontier plus the owed and the held ones (`S = F + C + H`),
+    /// so `flagged + runs` stays at or below them and the settle is exact. The
+    /// saturating arithmetic only keeps a broken precondition from wrapping;
+    /// it cannot correct hook runs already installed on the commit.
+    pub(super) fn settle(&mut self, runs: u32) {
+        let paid = runs.saturating_sub(1);
+        debug_assert!(runs >= 1 && paid <= self.count);
+        self.count = self.count.saturating_sub(paid);
+        self.flagged = self.flagged.saturating_add(u64::from(runs));
+    }
+
+    /// The final owner abandoned its current recording, so no commit will
+    /// carry what is owed: the epochs `[flagged, flagged + count)` complete
+    /// by accounting instead, published by `publish`
+    /// (`CompletionHook::abandon`). Nothing is held then, and the abandoned
+    /// recording took no epoch, so the range ends at the reserved epochs.
+    /// Settled only when `publish` accepts it, as a commit's runs are.
+    pub(super) fn abandon(
+        &mut self,
+        publish: impl FnOnce(u64, u64) -> Result<(), MetalKernelError>,
+    ) -> Result<(), MetalKernelError> {
+        let from = self.flagged;
+        let through =
+            from.checked_add(u64::from(self.count))
+                .ok_or(MetalKernelError::QueueUnavailable(
+                    "owed epochs past the epoch range",
+                ))?;
+        publish(from, through)?;
+        self.count = 0;
+        self.flagged = through;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(super) fn count(&self) -> u32 {
+        self.count
+    }
+
+    /// A state no short test reaches by cancelling: near the bound.
+    #[cfg(test)]
+    pub(super) fn for_test(count: u32, flagged: u64) -> Self {
+        Self { count, flagged }
+    }
+
+    #[cfg(test)]
+    pub(super) fn flagged(&self) -> u64 {
+        self.flagged
+    }
+}
+
 /// Counts of what the held queue did, since the queue was built.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ProducedStats {
@@ -358,6 +460,49 @@ impl Drop for AfterUnlock<'_> {
         if let Err(error) = core.run_pending(Pending::Holder) {
             core.failure
                 .record(format!("held work its input released was refused: {error}"));
+        }
+    }
+}
+
+/// A cancellation's first refusal. Dropped with one still noted, on any
+/// exit, an early `?` included, it fails the queue: a recording whose epoch
+/// could not be owed, or whose cancellation could not finish, must never
+/// leave a queue that reads as running.
+struct Refusal<'a> {
+    failure: &'a super::CommandBufferFailure,
+    message: &'static str,
+    first: Option<MetalKernelError>,
+}
+
+impl<'a> Refusal<'a> {
+    fn new(failure: &'a super::CommandBufferFailure, message: &'static str) -> Self {
+        Self {
+            failure,
+            message,
+            first: None,
+        }
+    }
+
+    fn note(&mut self, error: MetalKernelError) {
+        self.first.get_or_insert(error);
+    }
+
+    /// The normal exit: the first refusal, latched, or none.
+    fn into_result(mut self) -> Result<(), MetalKernelError> {
+        match self.first.take() {
+            Some(error) => {
+                self.failure.record_static(self.message);
+                Err(error)
+            }
+            None => Ok(()),
+        }
+    }
+}
+
+impl Drop for Refusal<'_> {
+    fn drop(&mut self) {
+        if self.first.is_some() {
+            self.failure.record_static(self.message);
         }
     }
 }
@@ -628,13 +773,15 @@ impl CommandsCore {
             } else {
                 None
             };
-            let owed = std::mem::take(&mut entry.owed_epochs);
             let held = entry.held.front().expect("checked above");
             let authority = OwnerSubmission {
                 buffer: &held.cb,
                 clock: &self.clock,
             };
             let epoch = held.epoch;
+            let runs = entry
+                .owed_epochs
+                .runs_for(Some(epoch), entry.held.len() - 1);
             match self.submit_owned_recording(
                 authority,
                 removals,
@@ -642,9 +789,10 @@ impl CommandsCore {
                 None,
                 None,
                 Some(epoch),
-                1 + owed,
+                runs,
             ) {
                 Ok(_) => {
+                    entry.owed_epochs.settle(runs);
                     custody.residency_published |= publish;
                     let held = entry.held.pop_front().expect("checked above");
                     self.produced.held_us.fetch_add(
@@ -660,10 +808,7 @@ impl CommandsCore {
                         break Err(error);
                     }
                 }
-                Err(error) => {
-                    entry.owed_epochs += owed;
-                    break Err(error);
-                }
+                Err(error) => break Err(error),
             }
         };
         self.held_live_update(state);
@@ -834,7 +979,10 @@ impl CommandsCore {
         let mut upto = state.gate.highest_on(event);
         let mut rehome: Vec<AfterCommit> = Vec::new();
         let mut cancelled = 0usize;
-        let mut refused = None;
+        let mut refused = Refusal::new(
+            &self.failure,
+            "a held recording could not be cancelled; queue failed",
+        );
         {
             let (entry, custody) = state.parts_mut();
             let entry: &mut EntryState = entry;
@@ -844,9 +992,11 @@ impl CommandsCore {
             for held in drained {
                 upto = upto.max(held.gate.highest_on(event));
                 if let Err(error) = held.cb.cancel_unsubmitted() {
-                    refused.get_or_insert(error);
+                    refused.note(error);
                 }
-                entry.owed_epochs += 1;
+                if let Err(error) = entry.owed_epochs.cancel(held.epoch) {
+                    refused.note(error);
+                }
                 let mut after = held.after;
                 for action in after.drain(..) {
                     match action {
@@ -857,7 +1007,7 @@ impl CommandsCore {
                         }),
                         AfterCommit::ValidatedIo(io) => {
                             if io.refuse().is_err() {
-                                refused.get_or_insert(MetalKernelError::QueueUnavailable(
+                                refused.note(MetalKernelError::QueueUnavailable(
                                     "cancelled IO refusal failed",
                                 ));
                             }
@@ -869,28 +1019,30 @@ impl CommandsCore {
                 cancelled += 1;
             }
         }
+        // Loads ordered behind a cancelled signal keep that order. Placed
+        // before the closes below, which may refuse: the current recording
+        // is never committed, so nothing it could order moves.
+        match state.held.back_mut() {
+            Some(held) => held.after.extend(rehome),
+            None => {
+                if let Err(error) = self.run_after_commit(&mut rehome) {
+                    refused.note(error);
+                }
+            }
+        }
         // The current recording is behind every held one, or waits itself.
         self.close_pending_blit(state)?;
         self.close_compute(state)?;
         if !state.current_abandoned {
             if let Some(current) = state.current.recording().cloned() {
                 if let Err(error) = current.cancel_unsubmitted() {
-                    refused.get_or_insert(error);
+                    refused.note(error);
                 }
                 cancelled += 1;
                 state.gate = Gate::default();
                 state.signals_since_cut = false;
                 self.compute_count.store(0, Ordering::Release);
                 state.current_abandoned = true;
-            }
-        }
-        // Loads ordered behind a cancelled signal keep that order.
-        match state.held.back_mut() {
-            Some(held) => held.after.extend(rehome),
-            None => {
-                if let Err(error) = self.run_after_commit(&mut rehome) {
-                    refused.get_or_insert(error);
-                }
             }
         }
         let p = &self.produced;
@@ -903,11 +1055,7 @@ impl CommandsCore {
         );
         self.held_live_update(state);
         p.wake.notify();
-        if let Some(error) = refused {
-            self.failure
-                .record_static("a held recording could not be cancelled; queue failed");
-            return Err(error);
-        }
+        refused.into_result()?;
         Ok(cancelled)
     }
 
@@ -946,7 +1094,9 @@ impl CommandsCore {
             if held.gate.waits_for_unvalidated_io() {
                 break;
             }
-            let owed = std::mem::take(&mut state.owed_epochs);
+            let runs = state
+                .owed_epochs
+                .runs_for(Some(held.epoch), state.held.len() - 1);
             let authority = OwnerSubmission {
                 buffer: &held.cb,
                 clock: &self.clock,
@@ -963,9 +1113,10 @@ impl CommandsCore {
                 None,
                 None,
                 Some(held.epoch),
-                1 + owed,
+                runs,
             ) {
                 Ok(_) => {
+                    state.owed_epochs.settle(runs);
                     let held = state.held.pop_front().expect("checked above");
                     state.in_flight.push(held.cb);
                     committed += 1;
@@ -976,14 +1127,8 @@ impl CommandsCore {
                 }
                 Err(MetalKernelError::RecordingAdmission(
                     crate::command_lifecycle::LifecycleError::Busy,
-                )) => {
-                    state.owed_epochs += owed;
-                    return Ok(false);
-                }
-                Err(error) => {
-                    state.owed_epochs += owed;
-                    return Err(error);
-                }
+                )) => return Ok(false),
+                Err(error) => return Err(error),
             }
         }
         let gated = !state.gate.is_empty();
@@ -1029,7 +1174,9 @@ impl CommandsCore {
             if let Err(error) = held.cb.cancel_unsubmitted() {
                 refused.get_or_insert(error);
             }
-            state.owed_epochs += 1;
+            if let Err(error) = state.owed_epochs.cancel(held.epoch) {
+                refused.get_or_insert(error);
+            }
             let mut after = held.after;
             for action in after.drain(..) {
                 match action {
@@ -1785,5 +1932,553 @@ mod scope_tests {
             full.add(input(&event, 99, 99)).is_err(),
             "a full gate took a ninth value"
         );
+    }
+}
+
+#[cfg(test)]
+mod owed_tests {
+    //! The owed-epoch transfer over a model of the held queue's metadata:
+    //! epochs taken at holds, cancellations of a suffix, releases from the
+    //! front, the ordinary commit. The decision is production's
+    //! ([`Owed::runs_for`], [`Owed::settle`]); the hook's n-th run completes
+    //! epoch n, as `completion_hook.rs`. No device.
+    use super::Owed;
+    use crate::retire::Epoch;
+    use std::collections::{BTreeSet, VecDeque};
+
+    #[derive(Default)]
+    struct Queue {
+        owed: Owed,
+        next: u64,
+        held: VecDeque<u64>,
+        committed: BTreeSet<u64>,
+        cancelled: BTreeSet<u64>,
+        /// Hook runs flagged so far: the epoch the next run completes.
+        runs: u64,
+        /// Per completed commit, in order: (its epoch, the epochs its runs
+        /// marked).
+        completions: Vec<(u64, Vec<u64>)>,
+    }
+
+    impl Queue {
+        fn hold(&mut self) -> u64 {
+            self.next += 1;
+            self.held.push_back(self.next - 1);
+            self.next - 1
+        }
+
+        fn cancel_from(&mut self, at: usize) {
+            for epoch in self.held.drain(at..) {
+                self.owed.cancel(Epoch(epoch)).unwrap();
+                self.cancelled.insert(epoch);
+            }
+        }
+
+        fn complete(&mut self, epoch: u64, runs: u32) {
+            self.owed.settle(runs);
+            let marked: Vec<u64> = (self.runs..self.runs + u64::from(runs)).collect();
+            self.runs += u64::from(runs);
+            self.committed.insert(epoch);
+            // Every epoch a completion marks is committed by then (in-order
+            // queue) or cancelled; never one still held or not taken.
+            for m in &marked {
+                assert!(
+                    self.committed.contains(m) || self.cancelled.contains(m),
+                    "the completion of epoch {epoch} marked epoch {m}, still held={:?}",
+                    self.held
+                );
+            }
+            // Exact: a commit's completion completes its own epoch.
+            assert!(
+                marked.contains(&epoch),
+                "the completion of epoch {epoch} left it open: marked {marked:?}"
+            );
+            assert_eq!(self.owed.flagged(), self.runs, "the frontier drifted");
+            self.completions.push((epoch, marked));
+        }
+
+        /// Release the front held recording; it completes at once.
+        fn release(&mut self) -> u64 {
+            let epoch = self.held[0];
+            let runs = self.owed.runs_for(Some(Epoch(epoch)), self.held.len() - 1);
+            self.held.pop_front();
+            self.complete(epoch, runs);
+            epoch
+        }
+
+        /// An ordinary commit of the current recording (nothing held).
+        fn commit_current(&mut self) -> u64 {
+            assert!(self.held.is_empty());
+            let runs = self.owed.runs_for(None, self.held.len());
+            self.next += 1;
+            self.complete(self.next - 1, runs);
+            self.next - 1
+        }
+
+        fn marked_by(&self, epoch: u64) -> Vec<u64> {
+            self.completions
+                .iter()
+                .find(|(e, _)| *e == epoch)
+                .map(|(_, m)| m.clone())
+                .expect("completed")
+        }
+
+        fn all_complete(&self) {
+            assert_eq!(self.runs, self.next, "an epoch taken never completed");
+            assert_eq!(self.owed.count(), 0, "an owed epoch was never paid");
+            assert_eq!(
+                self.owed.flagged(),
+                self.next,
+                "the frontier is not the epoch count"
+            );
+        }
+    }
+
+    #[test]
+    fn the_counterexample_h0_completes_its_own_epoch_and_h1_completes_h2() {
+        let mut q = Queue::default();
+        let [e0, e1, e2] = [q.hold(), q.hold(), q.hold()];
+        q.cancel_from(2);
+        q.release();
+        assert_eq!(q.marked_by(e0), vec![e0]);
+        assert_eq!(q.owed.count(), 1);
+        q.release();
+        assert_eq!(q.marked_by(e1), vec![e1, e2]);
+        q.all_complete();
+    }
+
+    #[test]
+    fn work_held_after_a_cancellation_carries_the_owed_epochs_from_above_them() {
+        let mut q = Queue::default();
+        let [e0, e1] = [q.hold(), q.hold()];
+        q.cancel_from(1);
+        let [e2, e3] = [q.hold(), q.hold()];
+        q.release();
+        q.release();
+        q.release();
+        assert_eq!(q.marked_by(e0), vec![e0]);
+        assert_eq!(q.marked_by(e2), vec![e1, e2], "H2 left its own epoch open");
+        assert_eq!(q.marked_by(e3), vec![e3]);
+        q.all_complete();
+    }
+
+    #[test]
+    fn repeated_cancellations_ride_the_last_live_recording() {
+        let mut q = Queue::default();
+        let [e0, e1, e2, e3] = [q.hold(), q.hold(), q.hold(), q.hold()];
+        q.cancel_from(3);
+        q.cancel_from(2);
+        q.release();
+        q.release();
+        assert_eq!(q.marked_by(e0), vec![e0]);
+        assert_eq!(q.marked_by(e1), vec![e1, e2, e3]);
+        q.all_complete();
+    }
+
+    #[test]
+    fn interleaved_holes_each_ride_the_first_live_commit_above_them() {
+        // H0 | cancelled e1 | H2 | cancelled e3 | H4: H2 completes e1 and its
+        // own epoch with H4 still held; H4, the last, completes e3 and its own.
+        let mut q = Queue::default();
+        let [e0, e1] = [q.hold(), q.hold()];
+        q.cancel_from(1);
+        let [e2, e3] = [q.hold(), q.hold()];
+        q.cancel_from(2);
+        let e4 = q.hold();
+        q.release();
+        q.release();
+        assert_eq!(q.marked_by(e0), vec![e0]);
+        assert_eq!(q.marked_by(e2), vec![e1, e2]);
+        assert_eq!(q.owed.count(), 1);
+        q.release();
+        assert_eq!(q.marked_by(e4), vec![e3, e4]);
+        q.all_complete();
+    }
+
+    #[test]
+    fn a_cancelled_tail_rides_the_last_live_commit_below_it() {
+        // H0 | H1 | cancelled e2, e3: H1 is the last live recording and
+        // completes both, with nothing behind it to wait for.
+        let mut q = Queue::default();
+        let [e0, e1, e2, e3] = [q.hold(), q.hold(), q.hold(), q.hold()];
+        q.cancel_from(2);
+        q.release();
+        q.release();
+        assert_eq!(q.marked_by(e0), vec![e0]);
+        assert_eq!(q.marked_by(e1), vec![e1, e2, e3]);
+        q.all_complete();
+    }
+
+    #[test]
+    fn the_ordinary_commit_after_an_emptied_queue_carries_what_is_owed() {
+        let mut q = Queue::default();
+        let e0 = q.hold();
+        q.cancel_from(0);
+        let e1 = q.commit_current();
+        assert_eq!(q.marked_by(e1), vec![e0, e1]);
+        q.all_complete();
+    }
+
+    #[test]
+    fn a_refused_commit_keeps_what_is_owed() {
+        let mut q = Queue::default();
+        let [e0, _] = [q.hold(), q.hold()];
+        q.cancel_from(1);
+        let before = q.owed;
+        // Decided, refused before submission: nothing settles.
+        let runs = q.owed.runs_for(Some(Epoch(e0)), 0);
+        assert_eq!(runs, 2);
+        assert_eq!(q.owed, before);
+        q.release();
+        assert_eq!(q.marked_by(e0), vec![0, 1]);
+        q.all_complete();
+    }
+
+    #[test]
+    fn the_owed_count_refuses_past_a_u32_of_hook_runs() {
+        let mut owed = Owed {
+            count: Owed::MAX_OWED - 1,
+            flagged: 7,
+        };
+        owed.cancel(Epoch(7)).unwrap();
+        assert_eq!(owed.count(), Owed::MAX_OWED);
+        assert!(owed.cancel(Epoch(8)).is_err(), "the bound did not refuse");
+        assert_eq!(
+            owed.count(),
+            Owed::MAX_OWED,
+            "a refused cancellation counted"
+        );
+        // The largest carry is representable: every owed epoch, or a front
+        // with every owed epoch below it.
+        assert_eq!(owed.runs_for(None, 0), u32::MAX);
+        assert_eq!(
+            owed.runs_for(Some(Epoch(7 + u64::from(Owed::MAX_OWED))), 1),
+            u32::MAX
+        );
+        owed.settle(u32::MAX);
+        assert_eq!((owed.count(), owed.flagged()), (0, 7 + u64::from(u32::MAX)));
+    }
+
+    /// Defensive arithmetic only: a frontier this close to `u64::MAX` with
+    /// epochs owed is unreachable on a valid schedule (reserved epochs are
+    /// the frontier plus the owed and held ones).
+    #[test]
+    fn the_frontier_saturates_and_then_carries_no_holes() {
+        let mut owed = Owed {
+            count: 3,
+            flagged: u64::MAX - 1,
+        };
+        owed.settle(1);
+        owed.settle(1);
+        assert_eq!((owed.count(), owed.flagged()), (3, u64::MAX));
+        // At its ceiling the frontier is above any front: no hole is carried,
+        // so nothing is marked ahead; the tail still carries what is owed.
+        assert_eq!(owed.runs_for(Some(Epoch(9)), 1), 1);
+        assert_eq!(owed.runs_for(Some(Epoch(9)), 0), 4);
+    }
+
+    /// Lane C's invariant (#944 6556673766 §1) over the production decisions,
+    /// from states no short run reaches. `S` is the reserved epochs, `F` the
+    /// frontier (`Owed::flagged`), `C` the owed count and `H` the held
+    /// recordings. After every transition `S = F + C + H`, and every commit
+    /// carries no more runs than the epochs reserved (`F + runs <= S`), so a
+    /// settle never saturates. Completions are delivered late, in commit
+    /// order, and never cover a held epoch. A refused submission decides its
+    /// runs and settles nothing: no completion is published for it and the
+    /// held epoch stays uncovered. No native callback runs.
+    struct Invariant {
+        owed: Owed,
+        reserved: u64,
+        held: VecDeque<u64>,
+        /// Accepted commits not completed yet: (first run, runs).
+        pending: VecDeque<(u64, u32)>,
+        completed: u64,
+        failed: bool,
+    }
+
+    impl Invariant {
+        fn seeded(count: u32, flagged: u64) -> Self {
+            let reserved = flagged + u64::from(count);
+            let me = Self {
+                owed: Owed::for_test(count, flagged),
+                reserved,
+                held: VecDeque::new(),
+                pending: VecDeque::new(),
+                completed: flagged,
+                failed: false,
+            };
+            me.check();
+            me
+        }
+
+        fn check(&self) {
+            assert_eq!(
+                self.reserved,
+                self.owed.flagged() + u64::from(self.owed.count()) + self.held.len() as u64,
+                "S != F + C + H"
+            );
+            if let Some(&front) = self.held.front() {
+                assert!(
+                    self.completed <= front,
+                    "held epoch {front} covered: completed {}",
+                    self.completed
+                );
+            }
+        }
+
+        fn hold(&mut self) {
+            if self.reserved == u64::MAX {
+                return;
+            }
+            self.held.push_back(self.reserved);
+            self.reserved += 1;
+            self.check();
+        }
+
+        fn cancel_from(&mut self, at: usize) {
+            let at = at.min(self.held.len());
+            while self.held.len() > at {
+                let epoch = self.held.pop_back().expect("checked");
+                let before = self.owed;
+                if self.owed.cancel(Epoch(epoch)).is_err() {
+                    // Refused at the bound: the queue fails, nothing counted.
+                    assert_eq!(self.owed, before, "a refused cancellation counted");
+                    assert_eq!(self.owed.count(), Owed::MAX_OWED);
+                    self.held.push_back(epoch);
+                    self.failed = true;
+                    self.check();
+                    return;
+                }
+                self.check();
+            }
+        }
+
+        fn accept(&mut self, runs: u32) {
+            let frontier = self.owed.flagged();
+            assert!(
+                frontier
+                    .checked_add(u64::from(runs))
+                    .is_some_and(|end| end <= self.reserved),
+                "a commit carries runs past the reserved epochs"
+            );
+            self.owed.settle(runs);
+            assert_eq!(self.owed.flagged(), frontier + u64::from(runs), "saturated");
+            self.pending.push_back((frontier, runs));
+        }
+
+        fn release(&mut self, refused: bool) {
+            let Some(&epoch) = self.held.front() else {
+                return;
+            };
+            let runs = self.owed.runs_for(Some(Epoch(epoch)), self.held.len() - 1);
+            if refused {
+                let before = (self.owed, self.completed, self.pending.len());
+                self.check();
+                assert_eq!(before, (self.owed, self.completed, self.pending.len()));
+                return;
+            }
+            self.held.pop_front();
+            self.accept(runs);
+            self.check();
+        }
+
+        fn commit_current(&mut self, refused: bool) {
+            if !self.held.is_empty() || self.reserved == u64::MAX {
+                return;
+            }
+            let runs = self.owed.runs_for(None, 0);
+            if refused {
+                let before = (self.owed, self.reserved, self.pending.len());
+                self.check();
+                assert_eq!(before, (self.owed, self.reserved, self.pending.len()));
+                return;
+            }
+            self.reserved += 1;
+            self.accept(runs);
+            self.check();
+        }
+
+        fn deliver(&mut self) {
+            let Some((first, runs)) = self.pending.pop_front() else {
+                return;
+            };
+            assert!(first >= self.completed, "completions out of order");
+            let end = first + u64::from(runs);
+            assert!(end <= self.reserved, "a run past the reserved epochs");
+            for &epoch in &self.held {
+                assert!(
+                    !(first..end).contains(&epoch),
+                    "a run marked held epoch {epoch}"
+                );
+            }
+            self.completed = end;
+            self.check();
+        }
+
+        /// The abandoned final: nothing held, every pending completion
+        /// delivered first (the settle waits for the prefix), then the owed
+        /// range is exactly what is left of the reserved epochs.
+        fn abandon(&mut self) {
+            assert!(self.held.is_empty());
+            while !self.pending.is_empty() {
+                self.deliver();
+            }
+            let (frontier, reserved) = (self.owed.flagged(), self.reserved);
+            let mut published = None;
+            self.owed
+                .abandon(|from, through| {
+                    published = Some((from, through));
+                    Ok(())
+                })
+                .unwrap();
+            assert_eq!(
+                published,
+                Some((frontier, reserved)),
+                "the range is not [F, S)"
+            );
+            assert_eq!((self.owed.count(), self.owed.flagged()), (0, reserved));
+            self.completed = reserved;
+            self.check();
+        }
+
+        /// A refused publication settles nothing.
+        fn refused_abandon(&mut self) {
+            let before = self.owed;
+            assert!(self
+                .owed
+                .abandon(
+                    |_, _| Err(crate::kernels::MetalKernelError::QueueUnavailable(
+                        "test: refused"
+                    ))
+                )
+                .is_err());
+            assert_eq!(self.owed, before);
+            self.check();
+        }
+
+        /// A deterministic mix of every transition.
+        fn run(&mut self, steps: u32, mut seed: u64) {
+            for _ in 0..steps {
+                if self.failed {
+                    return;
+                }
+                seed = seed
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                match (seed >> 33) % 8 {
+                    0 | 1 => self.hold(),
+                    2 => self.cancel_from(((seed >> 40) % 4) as usize),
+                    3 => self.release(false),
+                    4 => self.release(true),
+                    5 => self.commit_current((seed >> 45) & 1 == 1),
+                    _ => self.deliver(),
+                }
+            }
+        }
+
+        /// Drain to the final: held work released or cancelled, then the
+        /// final either submits the current recording or abandons it.
+        fn finish(&mut self, abandon: bool) {
+            if self.failed {
+                return;
+            }
+            while self.held.len() > 1 {
+                self.release(false);
+            }
+            if abandon {
+                self.cancel_from(0);
+                if self.failed {
+                    return;
+                }
+                self.refused_abandon();
+                self.abandon();
+            } else {
+                // The last live recording, or the final current one with
+                // nothing held, carries every owed epoch.
+                if self.held.is_empty() {
+                    self.commit_current(false);
+                } else {
+                    self.release(false);
+                }
+                while !self.pending.is_empty() {
+                    self.deliver();
+                }
+                assert_eq!(self.completed, self.reserved, "an epoch never completed");
+            }
+            assert_eq!(self.owed.count(), 0, "an owed epoch was never paid");
+        }
+    }
+
+    #[test]
+    fn the_reserved_epochs_are_the_frontier_owed_and_held_on_every_transition() {
+        // Small state, every schedule kind, both finals.
+        for seed in 0..64 {
+            for abandon in [false, true] {
+                let mut model = Invariant::seeded(0, 0);
+                model.run(400, seed);
+                model.finish(abandon);
+            }
+        }
+    }
+
+    #[test]
+    fn the_invariant_holds_at_the_owed_bound() {
+        // Owed one short of its bound: the next cancellation counts, the one
+        // after is refused and fails the queue with nothing counted.
+        let mut model = Invariant::seeded(Owed::MAX_OWED - 1, 1000);
+        model.hold();
+        model.hold();
+        model.cancel_from(0);
+        assert!(model.failed, "the bound did not refuse");
+        assert_eq!(model.owed.count(), Owed::MAX_OWED);
+        // The refused recording is still held. At the bound it is the last
+        // live one and carries every owed epoch: u32::MAX hook runs, which
+        // end exactly at the reserved epochs.
+        assert_eq!(model.held.len(), 1);
+        model.release(false);
+        assert_eq!(model.pending.back(), Some(&(1000, u32::MAX)));
+        model.deliver();
+        assert_eq!(model.completed, model.reserved);
+        assert_eq!(model.owed.count(), 0);
+        let mut abandoned = Invariant::seeded(Owed::MAX_OWED, 7);
+        abandoned.finish(true);
+        assert_eq!(abandoned.owed.flagged(), 7 + u64::from(Owed::MAX_OWED));
+    }
+
+    #[test]
+    fn the_invariant_holds_up_to_the_last_epoch() {
+        // Reserved epochs reach u64::MAX exactly; no counter saturates and
+        // the abandoned final's range ends there.
+        for seed in 0..32 {
+            for abandon in [false, true] {
+                let flagged = u64::MAX - 1000;
+                let mut model = Invariant::seeded(3, flagged);
+                model.run(200, seed);
+                assert!(model.reserved < u64::MAX);
+                while model.reserved < u64::MAX {
+                    model.hold();
+                }
+                assert_eq!(model.reserved, u64::MAX);
+                model.cancel_from(1);
+                model.finish(abandon);
+                if abandon && !model.failed {
+                    assert_eq!(model.owed.flagged(), u64::MAX);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn no_cancellation_carries_one_run_each() {
+        let mut q = Queue::default();
+        let e = [q.hold(), q.hold(), q.hold()];
+        for _ in e {
+            q.release();
+        }
+        let c = q.commit_current();
+        for epoch in e.into_iter().chain([c]) {
+            assert_eq!(q.marked_by(epoch), vec![epoch]);
+        }
+        q.all_complete();
     }
 }

@@ -99,7 +99,7 @@ impl StagedRead {
 
     /// The staged elements. On Metal this waits for the producing command
     /// buffer and nothing committed after it.
-    pub fn to_vec1<S: crate::WithDType>(&self) -> Result<Vec<S>> {
+    pub fn to_vec1<S: crate::ReadbackElement>(&self) -> Result<Vec<S>> {
         match self {
             #[cfg(feature = "metal")]
             Self::Metal(staged) => {

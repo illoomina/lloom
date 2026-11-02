@@ -4653,10 +4653,16 @@ mod attribution_build_tests {
     #[test]
     fn served_attribution_collects_a_real_backtrace_without_a_device() {
         let symbol_control = std::backtrace::Backtrace::force_capture().to_string();
+        let named_by_path = symbol_control
+            .lines()
+            .filter_map(|l| l.trim().split_once(": ").map(|(_, f)| f))
+            .any(|f| {
+                f.starts_with("lloom_tensor::metal_backend::device::attribution_build_tests::served_attribution_collects_a_real_backtrace_without_a_device")
+            });
         assert!(
-            symbol_control
-                .contains("served_attribution_collects_a_real_backtrace_without_a_device"),
-            "symbolization positive control: {symbol_control}"
+            named_by_path,
+            "symbolization positive control: this test's frame must be named by its \
+             path, as `call_site` reads frames, not only by its bare name: {symbol_control}"
         );
         eprintln!("symbolization positive control:\n{symbol_control}");
         super::set_served_request_trace(false).unwrap();

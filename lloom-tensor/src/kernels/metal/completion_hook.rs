@@ -18,11 +18,18 @@
 //! excludes the entire snapshot publication interval atomically; submission
 //! refuses setup-busy before native preparation rather than locking against a
 //! publisher. Completions retain their one acquire load of immutable storage.
+//!
+//! A final owner whose current recording a cancellation abandoned submits
+//! nothing (`docs/invariants.md` §15.1q). The epochs still owed then complete
+//! by accounting: once every record that carried hook runs has retired in its
+//! adapter, the hook advances its run count over them and marks them, with no
+//! native feedback and no subscriber run, since no command buffer completed.
 
 use super::{commands::CommandBufferFailure, metal4::Feedback, GpuClock};
+use crate::completion_wake::Wake;
 use crate::retire::Epoch;
-use std::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 
 pub(super) type Subscriber = Arc<dyn Fn() + Send + Sync>;
 type Snapshot = Vec<Subscriber>;
@@ -32,6 +39,17 @@ pub(super) struct CompletionHook {
     failure: Arc<CommandBufferFailure>,
     /// Runs so far; the epoch the next run completes.
     runs: AtomicU64,
+    /// Runs whose record has retired in its adapter: callbacks, these runs and
+    /// everything the adapter does for the record after them have returned.
+    retired: AtomicU64,
+    /// An abandoned final's owed epochs `[from, through)`, published once.
+    abandoned: AtomicBool,
+    abandoned_from: AtomicU64,
+    abandoned_through: AtomicU64,
+    /// The abandoned epochs are marked and every run below them retired.
+    settled: AtomicBool,
+    /// The host retirement service's Wake, notified once `settled` is set.
+    final_wake: OnceLock<Arc<Wake>>,
     subscribers: Subscribers,
 }
 
@@ -41,7 +59,117 @@ impl CompletionHook {
             clock,
             failure,
             runs: AtomicU64::new(0),
+            retired: AtomicU64::new(0),
+            abandoned: AtomicBool::new(false),
+            abandoned_from: AtomicU64::new(0),
+            abandoned_through: AtomicU64::new(0),
+            settled: AtomicBool::new(false),
+            final_wake: OnceLock::new(),
             subscribers: Subscribers::new(),
+        }
+    }
+
+    /// Cold, once: the Wake a settled abandonment notifies.
+    pub(super) fn install_final_wake(&self, wake: Arc<Wake>) -> Result<(), Arc<Wake>> {
+        match self.final_wake.get() {
+            Some(installed) if Arc::ptr_eq(installed, &wake) => Ok(()),
+            Some(_) => Err(wake),
+            None => self.final_wake.set(wake),
+        }
+    }
+
+    /// A record that carried `runs` hook runs has retired in its adapter.
+    /// Called once per record, after the adapter's last step for it; records
+    /// retire one at a time, in commit order.
+    pub(super) fn retire(&self, runs: u32) {
+        if runs == 0 {
+            return;
+        }
+        self.retired.fetch_add(u64::from(runs), Ordering::SeqCst);
+        self.settle_abandoned();
+    }
+
+    /// The final owner abandoned its current recording with epochs
+    /// `[from, through)` owed, `from` being every hook run accepted
+    /// submissions carried and `through` the clock's reserved epochs. They
+    /// complete once every run below `from` has retired: at once when none
+    /// is pending, otherwise on the retire of the last record still running.
+    /// Published once.
+    pub(super) fn abandon(
+        &self,
+        from: u64,
+        through: u64,
+    ) -> Result<(), crate::kernels::MetalKernelError> {
+        if through < from || through != self.clock.current_epoch().0 {
+            return Err(crate::kernels::MetalKernelError::QueueUnavailable(
+                "abandoned epochs disagree with the clock",
+            ));
+        }
+        if self.abandoned.load(Ordering::Relaxed) {
+            return Err(crate::kernels::MetalKernelError::QueueUnavailable(
+                "a final abandonment was published twice",
+            ));
+        }
+        self.abandoned_from.store(from, Ordering::Relaxed);
+        self.abandoned_through.store(through, Ordering::Relaxed);
+        self.abandoned.store(true, Ordering::SeqCst);
+        self.settle_abandoned();
+        Ok(())
+    }
+
+    /// A final abandonment was published.
+    pub(super) fn abandonment_published(&self) -> bool {
+        self.abandoned.load(Ordering::Acquire)
+    }
+
+    /// The published abandonment has settled: its epochs are marked and
+    /// every record carrying a run below them has retired.
+    pub(super) fn abandonment_settled(&self) -> bool {
+        self.settled.load(Ordering::Acquire)
+    }
+
+    /// Mark the abandoned epochs once every run below them has retired.
+    /// Both the final owner (after publishing) and every retire (after
+    /// counting) look: each writes, then reads the other's write, so one of
+    /// the two sees both. The run count moves from `from` to `through` in one
+    /// exchange, so exactly one of them marks; the other does nothing.
+    fn settle_abandoned(&self) {
+        if !self.abandoned.load(Ordering::SeqCst) {
+            return;
+        }
+        let from = self.abandoned_from.load(Ordering::Relaxed);
+        let through = self.abandoned_through.load(Ordering::Relaxed);
+        let retired = self.retired.load(Ordering::SeqCst);
+        if retired < from {
+            return;
+        }
+        if retired > from {
+            self.failure
+                .record_static("more hook runs retired than accepted submissions carried");
+            self.notify_final();
+            return;
+        }
+        match self
+            .runs
+            .compare_exchange(from, through, Ordering::AcqRel, Ordering::Acquire)
+        {
+            Ok(_) => {
+                if through > from {
+                    self.clock.mark_completed(Epoch(through - 1));
+                }
+                self.settled.store(true, Ordering::Release);
+            }
+            Err(seen) if seen == through => return,
+            Err(_) => self
+                .failure
+                .record_static("a hook run ran past an abandoned final's epochs"),
+        }
+        self.notify_final();
+    }
+
+    fn notify_final(&self) {
+        if let Some(wake) = self.final_wake.get() {
+            wake.notify();
         }
     }
 
@@ -586,5 +714,139 @@ mod tests {
             1,
             "a subscriber outlived the take"
         );
+    }
+
+    /// `n` committed epochs, each completed and retired as its record would
+    /// be (one run per record).
+    fn commit_and_retire(clock: &GpuClock, hook: &CompletionHook, n: u64) {
+        for _ in 0..n {
+            clock.commit_epoch();
+            hook.complete(&clean());
+            hook.retire(1);
+        }
+    }
+
+    fn with_wake(hook: &CompletionHook) -> Arc<Wake> {
+        let wake = Arc::new(Wake::default());
+        assert!(hook.install_final_wake(wake.clone()).is_ok());
+        assert!(hook.install_final_wake(wake.clone()).is_ok());
+        assert!(hook.install_final_wake(Arc::new(Wake::default())).is_err());
+        wake
+    }
+
+    /// Nothing earlier pending: the owed epochs complete as the final owner
+    /// publishes them, and the run count moves over them.
+    #[test]
+    fn an_abandonment_with_nothing_pending_completes_at_once() {
+        let (clock, failure, hook) = hook();
+        let wake = with_wake(&hook);
+        commit_and_retire(&clock, &hook, 2);
+        // Two epochs held at a cut and cancelled: reserved, never committed.
+        clock.commit_epoch();
+        clock.commit_epoch();
+        let seen = wake.snapshot();
+        hook.abandon(2, 4).unwrap();
+        assert!(hook.abandonment_settled());
+        assert_eq!(clock.completed_count().0, 4);
+        assert_eq!(hook.runs.load(Ordering::Relaxed), 4);
+        assert_ne!(wake.snapshot(), seen, "the settle did not wake the service");
+        assert!(failure.check().is_ok());
+    }
+
+    /// A record still running holds the owed epochs: its run alone (counted,
+    /// not retired) settles nothing, and no epoch above its own is marked;
+    /// its retire settles them, on its own thread.
+    #[test]
+    fn an_abandonment_rides_the_retire_of_the_last_record() {
+        let (clock, failure, hook) = hook();
+        let wake = with_wake(&hook);
+        commit_and_retire(&clock, &hook, 1);
+        clock.commit_epoch(); // the record still in flight
+        clock.commit_epoch(); // a cancelled one
+        hook.abandon(2, 3).unwrap();
+        assert!(!hook.abandonment_settled());
+        assert_eq!(clock.completed_count().0, 1, "marked ahead of the prefix");
+        hook.complete(&clean());
+        assert!(
+            !hook.abandonment_settled(),
+            "settled on a run whose record had not retired"
+        );
+        assert_eq!(
+            clock.completed_count().0,
+            2,
+            "the cancelled epoch was marked before the record retired"
+        );
+        let seen = wake.snapshot();
+        hook.retire(1);
+        assert!(hook.abandonment_settled());
+        assert_eq!(clock.completed_count().0, 3);
+        assert_ne!(wake.snapshot(), seen);
+        assert!(failure.check().is_ok());
+    }
+
+    /// With nothing owed the abandonment marks nothing, and still settles
+    /// only once the prefix has retired: terminality reads it.
+    #[test]
+    fn nothing_owed_still_waits_for_the_prefix() {
+        let (clock, _, hook) = hook();
+        commit_and_retire(&clock, &hook, 1);
+        clock.commit_epoch();
+        hook.abandon(2, 2).unwrap();
+        assert!(!hook.abandonment_settled());
+        hook.complete(&clean());
+        hook.retire(1);
+        assert!(hook.abandonment_settled());
+        assert_eq!(clock.completed_count().0, 2);
+    }
+
+    /// The range must end at the clock's reserved epochs and is published
+    /// once; a run after the settle is a run past it, and latches.
+    #[test]
+    fn an_abandonment_is_checked_against_the_clock_and_never_overrun() {
+        let (clock, failure, hook) = hook();
+        commit_and_retire(&clock, &hook, 1);
+        clock.commit_epoch();
+        assert!(hook.abandon(1, 3).is_err(), "past the clock");
+        assert!(hook.abandon(1, 1).is_err(), "short of the clock");
+        assert!(hook.abandon(3, 2).is_err(), "inverted");
+        hook.abandon(1, 2).unwrap();
+        assert!(hook.abandonment_settled());
+        assert!(hook.abandon(2, 2).is_err(), "published twice");
+        hook.complete(&clean());
+        assert_eq!(clock.completed_count().0, 2);
+        assert!(
+            failure.check().is_err(),
+            "a run past the settle was not latched"
+        );
+    }
+
+    /// The final owner's publication and the last record's retire race: in
+    /// every interleaving the epochs are marked exactly once, the run count
+    /// lands on the reserved epochs and nothing latches.
+    #[test]
+    fn a_racing_publication_and_retire_settle_exactly_once() {
+        for _ in 0..2000 {
+            let (clock, failure, hook) = hook();
+            let hook = Arc::new(hook);
+            commit_and_retire(&clock, &hook, 1);
+            clock.commit_epoch();
+            clock.commit_epoch();
+            hook.complete(&clean());
+            let start = Arc::new(std::sync::Barrier::new(2));
+            let retiring = {
+                let (hook, start) = (hook.clone(), start.clone());
+                std::thread::spawn(move || {
+                    start.wait();
+                    hook.retire(1);
+                })
+            };
+            start.wait();
+            hook.abandon(2, 3).unwrap();
+            retiring.join().unwrap();
+            assert!(hook.abandonment_settled());
+            assert_eq!(clock.completed_count().0, 3);
+            assert_eq!(hook.runs.load(Ordering::Relaxed), 3);
+            assert!(failure.check().is_ok());
+        }
     }
 }

@@ -11,12 +11,19 @@
 //! is also attributed to the threads that made it (reported, not asserted;
 //! CONTRIBUTING §3.1b), so a red names its thread.
 //!
-//! A thread's one-time setup is not the window's: the Metal device starts
-//! the shared retirement worker, and its first park sets up parking_lot's
-//! per-thread data, which allocates whenever the worker is first scheduled.
-//! Under load that landed inside the fill's window (#1205, census row 1), so
-//! the fill's window opens only once the worker is parked
-//! (`lloom_tensor::retirement_worker_parked`).
+//! A thread's one-time setup is not the window's, and under load three
+//! landed inside one (#1205, census row 1), each attributed by thread and
+//! backtrace. Each window now opens only once its threads are past theirs:
+//! - the read threads: a thread is handed jobs before it has first run, and
+//!   std's per-thread start allocates on it. The warm-up wakes only the 16
+//!   a token's rows use, so the reads wait until all 32 have started
+//!   (`read_workers_started`);
+//! - the shared retirement worker, which the Metal device starts: its first
+//!   park sets up parking_lot's per-thread data. The fill waits until it is
+//!   parked (`lloom_tensor::retirement_worker_parked`);
+//! - rayon's read pool: each worker's first sleep allocates its lock. Its
+//!   report loop, which asserts nothing, now runs after the fill, and the
+//!   pool is built on first use, so none of its threads exists before.
 //!
 //! The hedged reads are not left to the host's read latency: one row of each
 //! hedged request is held on its read thread until the request's hedge has
@@ -34,9 +41,9 @@
 //! assertions are off.
 
 use lloom::nn::ngram_memory::{
-    hold_read_worker_row, read_worker_hold_stats, read_worker_stats, settle_read_workers,
-    HeldWinner, HoldStats, MmapRows, NgramHash, ReadPolicy, ReadPool, ReadScratch,
-    PER_LAYER_TOKEN_EMBD,
+    hold_read_worker_row, read_worker_hold_stats, read_worker_stats, read_workers_started,
+    settle_read_workers, HeldWinner, HoldStats, MmapRows, NgramHash, ReadPolicy, ReadPool,
+    ReadScratch, PER_LAYER_TOKEN_EMBD,
 };
 use lloom_tensor::quantized::{gguf_file, GgmlDType, QStorage, QTensor};
 use lloom_tensor::{Device, Result};
@@ -234,8 +241,17 @@ fn the_host_fill_allocates_nothing_per_token() -> Result<()> {
     t.set_hedge_us(0);
     let mut scratch = ReadScratch::with_rows(hash.n_heads(), t.row_bytes());
     let mut out = vec![0f32; hash.n_heads() * HEAD_DIM];
-    // Warm: the read threads start, the lazy statics settle.
+    // Warm: the lazy statics settle. Then every read thread started: the
+    // warm-up's 16 rows wake only 16 of them, and a thread first scheduled
+    // inside a window below would charge its start to the window.
     t.gather_into_with(&sets[0], &mut out, &mut scratch)?;
+    let threads = read_worker_stats().unwrap_or_default().threads;
+    let started = read_workers_started_within(threads, START_BOUND);
+    assert_eq!(
+        started,
+        Some(threads),
+        "the read threads had not all started within {START_BOUND:?}"
+    );
 
     let r0 = read_worker_stats().unwrap_or_default();
     let c0 = by_thread::counts();
@@ -282,19 +298,10 @@ fn the_host_fill_allocates_nothing_per_token() -> Result<()> {
     }
     let control = allocs() - a0;
 
-    // rayon's pool, reported, not asserted: the library's own bookkeeping.
-    t.set_read_pool(ReadPool::Rayon);
-    let a0 = allocs();
-    for ids in &sets {
-        t.gather_into_with(ids, &mut out, &mut scratch)?;
-    }
-    let rayon = allocs() - a0;
-    t.set_read_pool(ReadPool::Workers);
-
     // A request the read threads refuse is read on rayon's pool, which
     // allocates: the refusals are reported beside each count.
     println!(
-        "ALLOCS reads={reads} (refused {}) hedged={hedged_reads} (refused {}; re-read {} rows, {} won; {held:?}) control={control} rayon={rayon} over {} tokens",
+        "ALLOCS reads={reads} (refused {}) hedged={hedged_reads} (refused {}; re-read {} rows, {} won; {held:?}) control={control} over {} tokens",
         r1.refused - r0.refused,
         h1.refused - h0.refused,
         h1.hedged - h0.hedged,
@@ -328,6 +335,18 @@ fn the_host_fill_allocates_nothing_per_token() -> Result<()> {
 
     #[cfg(feature = "metal")]
     fill_on_metal(&path, &hash)?;
+
+    // rayon's pool, reported, not asserted: the library's own bookkeeping.
+    // Last, because the pool is built here, on first use, and its workers'
+    // first sleeps allocate on their own threads whenever they get to them:
+    // after this, nothing is counted.
+    t.set_read_pool(ReadPool::Rayon);
+    let a0 = allocs();
+    for ids in &sets {
+        t.gather_into_with(ids, &mut out, &mut scratch)?;
+    }
+    let rayon = allocs() - a0;
+    println!("ALLOCS rayon={rayon} over {} tokens", sets.len());
     std::fs::remove_file(&path).ok();
     Ok(())
 }
@@ -395,6 +414,21 @@ fn a_held_row_lands_once(t: &MmapRows, sets: &[Vec<i64>], scratch: &mut ReadScra
         ids.len()
     );
     Ok(())
+}
+
+/// How long the reads wait for every read thread to start.
+const START_BOUND: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How many read threads had started within `bound`, waiting for `threads`
+/// (`read_workers_started`): `None` when no set is running.
+fn read_workers_started_within(threads: usize, bound: std::time::Duration) -> Option<usize> {
+    let start = std::time::Instant::now();
+    loop {
+        match read_workers_started() {
+            Some(n) if n < threads && start.elapsed() < bound => std::thread::yield_now(),
+            other => return other,
+        }
+    }
 }
 
 /// How long the fill waits for the retirement worker to park.

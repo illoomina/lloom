@@ -570,6 +570,15 @@ impl Readers {
         }
     }
 
+    /// How many threads have started: run std's per-thread start, which
+    /// allocates on the thread (the stack-overflow handler's copy of its
+    /// name), and registered to be woken. A thread is handed jobs before it
+    /// has first run, so its start can land inside whatever a caller is
+    /// counting when the thread is first scheduled late (#1205).
+    pub fn started_threads(&self) -> usize {
+        self.workers.iter().filter(|w| w.thread.get().is_some()).count()
+    }
+
     /// Wait until every thread has finished its job, a losing read
     /// included, and return the last request's `done` count: its row count
     /// when each row was counted once.

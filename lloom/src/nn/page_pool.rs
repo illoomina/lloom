@@ -125,6 +125,25 @@ impl PagePool {
         freed
     }
 
+    /// Empty `seq` for the same sequence's next turn, keeping the pages it
+    /// alone holds and owing `owed`, an epoch at or after every read of them
+    /// encoded so far ([`KvPagePool::clear_keep`], `memory.md` §9.5r). A page
+    /// whose last referent this was waits in the quarantine, as at a release.
+    pub fn clear_keep(&mut self, seq: usize, owed: Epoch) {
+        let freed = self.pages.clear_keep(seq, owed);
+        self.quarantine.retire_all(self.epoch(), freed);
+    }
+
+    /// Before `seq`'s next append: its kept pages stay its own if the epoch
+    /// it owes has completed, else they go to the quarantine at the epoch
+    /// open now. Returns how many were given up (their table changed).
+    pub fn settle_kept(&mut self, seq: usize) -> usize {
+        let given_up = self.pages.settle_kept(seq, self.completed());
+        let n = given_up.len();
+        self.quarantine.retire_all(self.epoch(), given_up);
+        n
+    }
+
     /// The raw recycle is the quarantine's to call: a page goes back through
     /// `recycle_ready`, never from a caller's own list.
     #[allow(dead_code)]
@@ -155,16 +174,15 @@ impl PagePool {
 
     /// Pages a set of appends — `(seq, tokens)` each — would fail to take from
     /// the pool as it stands: what their appends pop, less the free list and
-    /// what the next drain releases. Zero means they fit without a grow.
+    /// what the next drain releases. Zero means they fit without a grow. A
+    /// kept sequence's pages count only once the epoch it owes has completed.
     pub fn pages_short(&self, appends: impl IntoIterator<Item = (usize, usize)>) -> usize {
+        let completed = self.completed();
         let needed: usize = appends
             .into_iter()
             .map(|(seq, n)| {
-                let (len, held) = self
-                    .pages
-                    .seq(seq)
-                    .map(|q| (q.len(), q.pages().len()))
-                    .unwrap_or((0, 0));
+                let len = self.pages.seq(seq).map_or(0, |q| q.len());
+                let held = self.pages.pages_held_for(seq, completed);
                 (len + n).div_ceil(self.page_size).saturating_sub(held)
             })
             .sum();
@@ -180,7 +198,8 @@ impl PagePool {
 
 /// The allocator's own methods — `append`, `reserve`, `rewind`, `seq`,
 /// `table_for`, the counts — reach through; the ones with a liveness half
-/// (`release`, `recycle`, `grow`) are this type's and shadow them.
+/// (`release`, `clear_keep`, `settle_kept`, `recycle`, `grow`) are this
+/// type's and shadow them.
 impl std::ops::Deref for PagePool {
     type Target = KvPagePool;
     fn deref(&self) -> &KvPagePool {
@@ -218,5 +237,72 @@ mod tests {
         assert_eq!(p.pages().pages_free(), 4);
         p.grow(2);
         assert_eq!(p.pages().pool_pages(), 6);
+    }
+
+    #[test]
+    fn a_kept_sequence_refills_its_own_pages_with_no_shortfall() {
+        let dev = Device::Cpu;
+        let mut p = PagePool::new(4, 2, 2, 3, &dev);
+        p.pages_mut().append(0, 8).unwrap();
+        p.clear_keep(0, Epoch(0));
+        assert_eq!(
+            p.held(),
+            0,
+            "a page the sequence alone holds is not quarantined"
+        );
+        assert_eq!(
+            p.pages_short([(0, 8)]),
+            0,
+            "its two kept pages take the refill"
+        );
+        assert_eq!(
+            p.pages_short([(1, 4)]),
+            1,
+            "they are not another sequence's"
+        );
+        assert_eq!(p.settle_kept(0), 0, "off Metal nothing is in flight");
+        assert!(p.pages_mut().append(0, 8).unwrap().is_empty());
+    }
+
+    /// The clock's two halves, driven by hand: the clear owes epoch 0 while
+    /// epoch 1 is open. Until epoch 0 completes, the plan counts the kept
+    /// pages as nothing and the settle gives them up to the quarantine at
+    /// the open epoch; once it has, they are the sequence's again.
+    #[cfg(feature = "metal")]
+    #[test]
+    fn an_uncovered_keep_is_planned_as_short_and_given_up_at_the_settle() {
+        use lloom_tensor::kernels::metal::GpuClock;
+        let clock = Arc::new(GpuClock::new());
+        let mut kept = PagePool::with_clock(4, 2, 2, 3, Arc::clone(&clock));
+        let mut given = PagePool::with_clock(4, 2, 2, 3, Arc::clone(&clock));
+        for p in [&mut kept, &mut given] {
+            p.pages_mut().append(0, 8).unwrap();
+        }
+        let owed = clock.commit_epoch();
+        assert_eq!(owed, Epoch(0));
+        kept.clear_keep(0, owed);
+        given.clear_keep(0, owed);
+        assert_eq!(
+            given.pages_short([(0, 8)]),
+            2,
+            "epoch 0 is running: the plan grows"
+        );
+        assert_eq!(given.settle_kept(0), 2, "and the settle gives the pages up");
+        assert_eq!(
+            given.held(),
+            2,
+            "into the quarantine, at the epoch open now"
+        );
+        assert_eq!(given.recycle_ready().unwrap(), 0, "which has not completed");
+
+        clock.mark_completed(owed);
+        assert_eq!(
+            kept.pages_short([(0, 8)]),
+            0,
+            "epoch 0 completed: no shortfall"
+        );
+        assert_eq!(kept.settle_kept(0), 0);
+        assert!(kept.pages_mut().append(0, 8).unwrap().is_empty());
+        assert_eq!(kept.pages().table_for(0, 1), vec![0, 1]);
     }
 }

@@ -249,6 +249,31 @@ pub fn representation(
     })
 }
 
+/// Whether a raw prompt starts with the BOS: what the tokenizer's metadata
+/// declares (`add_bos_token`), or, where it declares nothing, what the
+/// tokenizer itself adds. The same rule in every container, so a model's
+/// GGUF and safetensors checkpoints tokenize a raw prompt alike.
+fn raw_bos(tokenizer: &Tokenizer, bos_id: Option<u32>, declared: Option<bool>) -> bool {
+    let Some(bos) = bos_id else {
+        return false;
+    };
+    declared.unwrap_or_else(|| {
+        tokenizer
+            .encode("", true)
+            .is_ok_and(|e| e.get_ids().first() == Some(&bos))
+    })
+}
+
+/// A safetensors checkpoint's `tokenizer_config.json` `add_bos_token`, when
+/// it names one.
+fn declared_add_bos(model_dir: &Path) -> Option<bool> {
+    let bytes = std::fs::read(model_dir.join("tokenizer_config.json")).ok()?;
+    serde_json::from_slice::<Value>(&bytes)
+        .ok()?
+        .get("add_bos_token")?
+        .as_bool()
+}
+
 /// The text config of the checkpoint at `path`: a GGUF's header, or a
 /// directory's `config.json` (its `text_config` on a VL checkpoint).
 fn checkpoint_config(path: &Path) -> Result<Config> {
@@ -1119,13 +1144,15 @@ impl<P: Lfm2Shape> Engine<P> {
         let bos_token = bos_id
             .and_then(|id| tokenizer.id_to_token(id))
             .unwrap_or_default();
-        // A raw prompt starts with the BOS on a safetensors checkpoint; on a
-        // GGUF, exactly when its tokenizer adds one, as lfm2-gguf served raw
-        // prompts before it moved onto this engine.
-        let raw_bos = !is_gguf
-            || tokenizer
-                .encode("", true)
-                .is_ok_and(|e| e.get_ids().first().copied() == bos_id && bos_id.is_some());
+        let declared = match &gguf {
+            Some(g) => g
+                .content
+                .metadata
+                .get("tokenizer.ggml.add_bos_token")
+                .and_then(|v| v.to_bool().ok()),
+            None => declared_add_bos(&model_dir),
+        };
+        let raw_bos = raw_bos(&tokenizer, bos_id, declared);
 
         let template = match &gguf {
             Some(g) => match g.content.metadata.get("tokenizer.chat_template") {

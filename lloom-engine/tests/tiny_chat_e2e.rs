@@ -196,6 +196,61 @@ fn qwen3_5_tiny_chats_on_the_cpu_and_metal() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// The device filter is lfm2's default and no other family's (decision 109,
+/// `docs/dispatch.md` §11.2). With no flag, a filtered sampled request on a
+/// tiny LFM2 rides NativeRing on Metal; on a tiny Qwen3.5 it is served by
+/// today's route (the blocking arm, C1), not refused; on LFM2 on the CPU, and
+/// with `--device-filter=false`, LFM2 keeps today's route too.
+#[test]
+fn the_device_filter_is_lfm2s_default_and_no_other_familys() {
+    const NATIVE: &str = "native prepared device sampler; no host logits readback";
+    let sampled = ["-t", "0.8", "--top-k", "4", "--seed", "7", "--ignore-eos"];
+    let route = |model: &Path, extra: &[&str]| {
+        let mut args = sampled.to_vec();
+        args.extend_from_slice(extra);
+        let (fields, stderr) = chat_with_stderr(model, &args);
+        let n: usize = fields["completion_tokens"].parse().unwrap();
+        assert_eq!(n.to_string(), MAX_TOKENS, "{extra:?}: {stderr}");
+        (fields["readback"].clone(), stderr.contains(NATIVE))
+    };
+
+    let dir = scratch("device-filter-lfm2");
+    let lfm2 = write::<Lfm2Tiny>(&dir);
+    let (readback, native) = route(&lfm2, &["--cpu"]);
+    assert_eq!(
+        (readback.as_str(), native),
+        ("blocking", false),
+        "lfm2 --cpu"
+    );
+    #[cfg(feature = "metal")]
+    {
+        let (readback, native) = route(&lfm2, &[]);
+        assert!(native, "lfm2 on Metal, no flag: {readback}");
+        assert!(readback.starts_with("ring"), "{readback}");
+        let (readback, native) = route(&lfm2, &["--device-filter=false"]);
+        assert_eq!((readback.as_str(), native), ("blocking", false), "lfm2 off");
+    }
+    std::fs::remove_dir_all(&dir).ok();
+
+    reference_purpose();
+    let dir = scratch("device-filter-qwen3_5");
+    let qwen = write::<Qwen3_5Tiny>(&dir);
+    let tok = dir.join("tokenizer.json");
+    let tok = tok.to_str().unwrap();
+    let mut devices = vec![vec!["--tokenizer", tok, "--cpu"]];
+    #[cfg(feature = "metal")]
+    devices.push(vec!["--tokenizer", tok]);
+    for extra in devices {
+        let (readback, native) = route(&qwen, &extra);
+        assert_eq!(
+            (readback.as_str(), native),
+            ("blocking", false),
+            "qwen3_5 {extra:?}"
+        );
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// Three turns of `lloom chat` on `model` with `extra` flags: the three
 /// `[turn N: …]` lines' fields, and the process's stderr.
 fn three_turns(

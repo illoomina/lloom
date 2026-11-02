@@ -976,6 +976,23 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
         self.session.model()
     }
 
+    /// Whether a non-greedy request takes the device filter: as configured,
+    /// or, unset, wherever this model serves the guarded token embedding on
+    /// Metal. The family layer sets it off for every family whose default is
+    /// today's route (`app/family.rs`, `resolve_device_filter`), so unset
+    /// reaches here on lfm2 and on direct library sessions only; a model or a
+    /// view that cannot serve the filter keeps today's route rather than
+    /// refusing (`docs/dispatch.md` §11.2).
+    pub fn device_filter(&self) -> bool {
+        match self.config.readback.device_filter {
+            Some(on) => on,
+            #[cfg(feature = "metal")]
+            None => self.device.is_metal() && self.model().guarded_embedding_layout().is_ok(),
+            #[cfg(not(feature = "metal"))]
+            None => false,
+        }
+    }
+
     /// The ids whose state the cache holds.
     pub fn tokens(&self) -> &[u32] {
         self.session.tokens()
@@ -1083,7 +1100,7 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
         let mut sampler = params.sampler()?;
         let sampling = sampler.sampling().clone();
         let route = params.sampler_route(
-            self.config.readback.device_filter,
+            self.device_filter(),
             &sampling,
             self.device.is_metal(),
             self.config.readback.ring_arm(),
@@ -1926,7 +1943,10 @@ mod tests {
     /// and never leaves `Auto` in the resolved value a consumer reports.
     #[test]
     fn prepared_sampler_is_explicit_and_keeps_host_diagnostics() -> Result<()> {
-        assert!(!crate::options::ReadbackConfig::default().device_filter);
+        assert_eq!(
+            crate::options::ReadbackConfig::default().device_filter,
+            None
+        );
         let mut params = DecodeParams {
             temperature: Some(0.7),
             top_k: Some(8),
@@ -2129,7 +2149,7 @@ mod tests {
             let device = Device::Cpu;
             let model = Chain::new(&device)?;
             let mut session = DecodeSession::new(&model, Pos(0), device, 0);
-            session.config.readback.device_filter = true;
+            session.config.readback.device_filter = Some(true);
             let params = DecodeParams {
                 temperature: Some(0.7),
                 top_k: Some(8),
@@ -2143,6 +2163,33 @@ mod tests {
             assert!(session.tokens().is_empty());
             assert_eq!(model.forwards.load(std::sync::atomic::Ordering::Relaxed), 0);
             assert!(session.rings.is_empty());
+            Ok(())
+        }
+
+        /// Unset, the filter is the family's own, and a model with no guarded
+        /// token embedding is served by today's route rather than refused:
+        /// the shape of every family whose default is off, and of lfm2's image
+        /// view. Explicit `true` still refuses it (above).
+        #[test]
+        fn an_unset_device_filter_serves_a_model_without_the_guarded_layout() -> Result<()> {
+            for device in devices() {
+                let model = Chain::new(&device)?;
+                let mut session = DecodeSession::new(&model, Pos(0), device.clone(), 0);
+                assert_eq!(session.config.readback.device_filter, None);
+                assert!(!session.device_filter(), "{device:?}");
+                let params = DecodeParams {
+                    temperature: Some(0.7),
+                    top_k: Some(8),
+                    eos_ids: vec![EOS],
+                    max_tokens: 3,
+                    ..Default::default()
+                };
+                let out =
+                    session.decode_until(&[1, 2], |ids| Ok(text_of(ids)), &params, |_| true)?;
+                assert!(matches!(out.readback, ReadbackArm::Blocking), "{device:?}");
+                let note = out.readback_note.unwrap_or_default();
+                assert!(!note.contains("native prepared"), "{device:?}: {note}");
+            }
             Ok(())
         }
 

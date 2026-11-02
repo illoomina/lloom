@@ -1961,39 +1961,48 @@ fn device_filter_serving_ingress_and_schema_share_one_opt_in() {
     }
     assert!(!schema_valid(node, &json!("maybe"), &schema["$defs"]));
     let none = BTreeMap::new();
-    assert!(
-        !native_sampler_serving_options(&[], &none)
+    // Unset is the family's own (decision 109): resolved at load, not here.
+    assert_eq!(
+        native_sampler_serving_options(&[], &none)
             .decode
             .readback
-            .device_filter
+            .device_filter,
+        None
     );
     for argv in [
         vec!["--device-filter"],
         vec!["--set", "decode.readback.device_filter=true"],
         vec!["--decode-config", r#"{"readback":{"device_filter":true}}"#],
     ] {
-        assert!(
+        assert_eq!(
             native_sampler_serving_options(&argv, &none)
                 .decode
                 .readback
-                .device_filter
+                .device_filter,
+            Some(true),
+            "{argv:?}"
         );
     }
-    assert!(
+    assert_eq!(
         native_sampler_serving_options(&[], &BTreeMap::from([(key.env(), "true".into())]))
             .decode
             .readback
-            .device_filter
+            .device_filter,
+        Some(true)
     );
-    assert!(
-        !native_sampler_serving_options(
-            &["--device-filter=false"],
-            &BTreeMap::from([(key.env(), "true".into())])
-        )
-        .decode
-        .readback
-        .device_filter
-    );
+    for argv in [
+        vec!["--device-filter=false"],
+        vec!["--set", "decode.readback.device_filter=false"],
+    ] {
+        assert_eq!(
+            native_sampler_serving_options(&argv, &BTreeMap::from([(key.env(), "true".into())]))
+                .decode
+                .readback
+                .device_filter,
+            Some(false),
+            "{argv:?}"
+        );
+    }
 }
 
 #[test]
@@ -2041,7 +2050,7 @@ fn device_filter_reports_shared_selection_not_unconditional_host_demotion() {
             .any(|line| line.contains("default request would refuse")));
     }
     let mut host = o.clone();
-    host.decode.readback.device_filter = false;
+    host.decode.readback.device_filter = Some(false);
     assert!(crate::couplings::explain(&host)
         .iter()
         .any(|line| line.ends_with("(C2)")));

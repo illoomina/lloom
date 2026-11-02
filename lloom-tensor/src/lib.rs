@@ -161,6 +161,8 @@ impl EscapeGuard {
 /// retiring on the host retirement service (`tuning.md` §6.3m).
 #[cfg(feature = "metal")]
 pub use kernels::metal::{join_device_retirement, DeviceRetirementReport};
+#[cfg(feature = "fuzzing")]
+pub use retirement_service::retirement_worker_parked;
 /// No backend but Metal retires a device asynchronously.
 #[cfg(not(feature = "metal"))]
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]

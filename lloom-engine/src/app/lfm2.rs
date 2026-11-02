@@ -212,6 +212,26 @@ fn gguf_text(path: &Path) -> Result<Option<GgufText>> {
     Ok(Some(GgufText { content, header }))
 }
 
+/// The representation the LFM2 engine builds the checkpoint at `path` in,
+/// on the CPU or on Metal, read before load: a GGUF's stored kinds at
+/// [`GGUF_COMPUTE_DTYPE`](lloom::models::lfm2::gguf::GGUF_COMPUTE_DTYPE), a
+/// safetensors checkpoint dense at the engine's dtype. The rule
+/// `load_on_with_preflight` applies; the built engine reports its own
+/// (`/health`'s `representation`), so the two can be held to each other.
+pub fn representation(path: &Path, cpu: bool) -> Result<crate::frontend::Representation> {
+    use crate::frontend::Representation;
+    Ok(match gguf_text(path)? {
+        Some(g) => Representation::of_kinds(
+            g.header.stored_kinds(&g.content).keys().map(String::as_str),
+            lloom::models::lfm2::gguf::GGUF_COMPUTE_DTYPE,
+        ),
+        None => Representation {
+            blocks: false,
+            compute: if cpu { DType::F32 } else { DType::F16 },
+        },
+    })
+}
+
 /// The text config of the checkpoint at `path`: a GGUF's header, or a
 /// directory's `config.json` (its `text_config` on a VL checkpoint).
 fn checkpoint_config(path: &Path) -> Result<Config> {
@@ -3547,8 +3567,14 @@ impl<P: Lfm2Shape> super::served::Served for Engine<P> {
         self.text.bos_id
     }
     fn health(&self) -> Value {
+        let kinds = self.core.model.weight_kinds();
         json!({
             "family": self.capabilities().family,
+            "representation": crate::frontend::Representation::of_kinds(
+                kinds.keys().map(String::as_str),
+                self.dtype,
+            )
+            .name(),
             "batch": self.batch,
             "prefill_tile": self.prefill_tile,
             "prefill_chunk": self.prefill_chunk,

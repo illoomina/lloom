@@ -286,6 +286,24 @@ impl IntDType for i32 {
     }
 }
 
+mod readback_element {
+    pub trait Sealed {}
+}
+
+/// An element type a host readback may return: a plain value for which every
+/// bit pattern is valid, the same size as its [`DType`]. Sealed, so a staged
+/// readback can turn mapped device bytes into `Vec<T>` without trusting a
+/// caller's choice of `T`; the dtype a stage recorded must also be `T`'s.
+pub trait ReadbackElement: WithDType + readback_element::Sealed {}
+
+macro_rules! readback_element {
+    ($($ty:ty),*) => {$(
+        impl readback_element::Sealed for $ty {}
+        impl ReadbackElement for $ty {}
+    )*};
+}
+readback_element!(u8, u32, i16, i32, i64, f16, bf16, f32, f64, f8e4m3);
+
 pub trait FloatDType: WithDType {}
 
 impl FloatDType for f16 {}

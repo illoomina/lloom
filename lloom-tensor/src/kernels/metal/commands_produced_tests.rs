@@ -33,10 +33,17 @@ const WARM: u8 = 0x31;
 /// A standalone queue on the process's API and host-input arm, its
 /// destination warmed to a known byte through a drained submission.
 fn fixture() -> Fixture {
+    fixture_with(|_| {})
+}
+
+/// As [`fixture`], with `setup` run on the queue before its first submission
+/// seals it (a completion subscriber).
+fn fixture_with(setup: impl FnOnce(&Commands)) -> Fixture {
     let native = Device::system_default().unwrap();
     let queue = native.new_command_queue().unwrap();
     let residency = Arc::new(ResidencySet::new(&native));
     let commands = Arc::new(Commands::new(queue, residency).unwrap());
+    setup(&commands);
     if let Ok(requested) = std::env::var("LLOOM_METAL_API") {
         if requested != "auto" {
             assert_eq!(commands.actual_command_api(), requested);
@@ -1461,8 +1468,12 @@ fn validated_io_listener_wakes_failure_without_manual_produced_call() {
     assert!(f.commands.core.failure.check().is_ok());
 }
 
+/// A failed IO generation cancels the current recording that waited for it,
+/// then the last handle drops with no recording operation between: the final
+/// owner retires by accounting, with no native call and no epoch of its own,
+/// and runs nothing the cancellation took (decision 99).
 #[test]
-fn validated_io_direct_teardown_after_cancellation_uses_empty_owned_marker() {
+fn validated_io_direct_teardown_after_cancellation_retires_by_accounting() {
     use crate::io_terminal::TestIoGeneration;
     let f = fixture();
     let mut generation = TestIoGeneration::new(f.native.as_ref(), 2);
@@ -1479,22 +1490,25 @@ fn validated_io_direct_teardown_after_cancellation_uses_empty_owned_marker() {
     assert!(f.commands.core.state.lock(Side::Host).current_abandoned);
     let weak = f.commands.core.produced.me_for_test();
     let dst = f.dst.clone();
+    let clock = f.commands.clock();
+    let opened = clock.current_epoch().0;
     let counters = f.commands.core.submission_control.clone();
     let before = counters.native_calls.load(Ordering::Acquire);
     // Deliberately no caller encode/flush repair before final public drop.
     drop(f);
-    assert!(
-        until(Duration::from_secs(5), || weak.upgrade().is_none()),
-        "IO_CANCELLED_FINAL_OWNER_RETIRES"
+    let retired = until(Duration::from_secs(5), || weak.upgrade().is_none());
+    let calls = counters.native_calls.load(Ordering::Acquire) - before;
+    let (after, completed) = (clock.current_epoch().0, clock.completed_count().0);
+    eprintln!(
+        "IO_FINAL_ABANDONED retired={retired} native_calls={calls} epochs={completed}/{after} opened_before={opened}"
     );
-    assert_eq!(
-        counters.native_calls.load(Ordering::Acquire),
-        before + 1,
-        "IO_FINAL_EMPTY_MARKER_SUBMITTED_ONCE"
-    );
+    assert!(retired, "IO_CANCELLED_FINAL_OWNER_RETIRES");
+    assert_eq!(calls, 0, "IO_FINAL_ABANDONMENT_MAKES_NO_NATIVE_CALL");
+    assert_eq!(after, opened, "IO_FINAL_ABANDONMENT_OPENS_NO_EPOCH");
+    assert_eq!(completed, after, "IO_FINAL_EVERY_EPOCH_COMPLETES");
     assert!(
         dst_bytes(&dst).iter().all(|b| *b == WARM),
-        "IO_FINAL_MARKER_DID_NOT_EXECUTE_CANCELLED_BODY"
+        "IO_FINAL_ABANDONMENT_DID_NOT_EXECUTE_CANCELLED_BODY"
     );
 }
 
@@ -1735,9 +1749,10 @@ fn final_teardown_runs_nothing_a_host_producer_gave_up() {
 
 /// A cancellation that takes the current recording, then the last handle
 /// drops with no recording operation between: the final owner must still
-/// retire, through one owned empty marker, and run nothing the cancellation
-/// took. The ordinary host-producer counterpart of the validated-IO control
-/// above (`validated_io_direct_teardown_after_cancellation_uses_empty_owned_marker`).
+/// retire, by accounting, with no native call and no epoch of its own, and
+/// run nothing the cancellation took. The ordinary host-producer counterpart
+/// of the validated-IO control above
+/// (`validated_io_direct_teardown_after_cancellation_retires_by_accounting`).
 #[test]
 fn final_owner_retires_after_a_cancellation_took_the_current_recording() {
     let f = fixture();
@@ -1752,6 +1767,8 @@ fn final_owner_retires_after_a_cancellation_took_the_current_recording() {
         .unwrap();
     assert!(f.commands.core.state.lock(Side::Host).current_abandoned);
     let weak = f.commands.core.produced.me_for_test();
+    let clock = f.commands.clock();
+    let opened = clock.current_epoch().0;
     let counters = f.commands.core.submission_control.clone();
     let before = counters.native_calls.load(Ordering::Acquire);
     let api = f.commands.actual_command_api();
@@ -1766,17 +1783,20 @@ fn final_owner_retires_after_a_cancellation_took_the_current_recording() {
     drop(commands);
     let retired = until(Duration::from_secs(5), || weak.upgrade().is_none());
     let calls = counters.native_calls.load(Ordering::Acquire) - before;
+    let (after, completed) = (clock.current_epoch().0, clock.completed_count().0);
     eprintln!(
-        "FINAL_AFTER_CANCEL api={api} retired={retired} native_calls={calls} progress={} warm={}",
+        "FINAL_AFTER_CANCEL api={api} retired={retired} native_calls={calls} epochs={completed}/{after} opened_before={opened} progress={} warm={}",
         progress.signaledValue(),
         dst_bytes(&dst).iter().all(|b| *b == WARM)
     );
     assert!(retired, "FINAL_OWNER_RETIRES_AFTER_CANCELLED_CURRENT");
-    assert_eq!(calls, 1, "FINAL_EMPTY_MARKER_SUBMITTED_ONCE");
+    assert_eq!(calls, 0, "FINAL_ABANDONMENT_MAKES_NO_NATIVE_CALL");
+    assert_eq!(after, opened, "FINAL_ABANDONMENT_OPENS_NO_EPOCH");
+    assert_eq!(completed, after, "FINAL_ABANDONMENT_EVERY_EPOCH_COMPLETES");
     assert_eq!(
         progress.signaledValue(),
         0,
-        "FINAL_MARKER_RAN_NOTHING_CANCELLED"
+        "FINAL_ABANDONMENT_RAN_NOTHING_CANCELLED"
     );
     assert!(
         dst_bytes(&dst).iter().all(|b| *b == WARM),
@@ -1787,8 +1807,9 @@ fn final_owner_retires_after_a_cancellation_took_the_current_recording() {
 
 /// Teardown with an IO load still pending: ordinary held work ahead of it
 /// runs as recorded, the work behind the load is cancelled (its bytes never
-/// landed), the final owner retires through one marker, and every epoch the
-/// cancelled recordings took completes with it.
+/// landed), the final owner retires by accounting — the ordinary held work is
+/// the only native call, and no epoch is opened — and every epoch the
+/// cancelled recordings took completes once that work has.
 #[test]
 fn final_teardown_cancels_work_behind_pending_validated_io() {
     use crate::io_terminal::TestIoGeneration;
@@ -1816,6 +1837,7 @@ fn final_teardown_cancels_work_behind_pending_validated_io() {
         "the IO-dependent recording was not held behind the first"
     );
     let clock = f.commands.clock();
+    let opened_before = clock.current_epoch().0;
     let weak = f.commands.core.produced.me_for_test();
     let counters = f.commands.core.submission_control.clone();
     let before = counters.native_calls.load(Ordering::Acquire);
@@ -1833,11 +1855,16 @@ fn final_teardown_cancels_work_behind_pending_validated_io() {
     let calls = counters.native_calls.load(Ordering::Acquire) - before;
     let (opened, completed) = (clock.current_epoch().0, clock.completed_count().0);
     eprintln!(
-        "TEARDOWN_PENDING_IO api={api} held={held} retired={retired} native_calls={calls} epochs={completed}/{opened} progress={} computed={}",
+        "TEARDOWN_PENDING_IO api={api} held={held} retired={retired} native_calls={calls} epochs={completed}/{opened} opened_before={opened_before} progress={} computed={}",
         progress.signaledValue(),
         computed(&dst)
     );
     assert!(retired, "TEARDOWN_PENDING_IO_FINAL_OWNER_RETIRES");
+    assert_eq!(
+        calls, 1,
+        "TEARDOWN_PENDING_IO_ONLY_THE_ORDINARY_HELD_WORK_IS_SUBMITTED"
+    );
+    assert_eq!(opened, opened_before, "TEARDOWN_PENDING_IO_OPENS_NO_EPOCH");
     assert!(computed(&dst), "TEARDOWN_ORDINARY_HELD_RUNS_AS_RECORDED");
     assert_eq!(
         progress.signaledValue(),
@@ -1856,7 +1883,8 @@ fn final_teardown_cancels_work_behind_pending_validated_io() {
 
 /// As above with the IO-dependent work still in the current recording, its
 /// compute encoder open when the last handle drops: teardown closes it,
-/// cancels the recording and retires through one marker, running nothing.
+/// cancels the recording and retires by accounting, running nothing and
+/// making no native call.
 #[test]
 fn final_teardown_cancels_a_current_recording_behind_pending_validated_io() {
     use crate::io_terminal::TestIoGeneration;
@@ -1873,6 +1901,7 @@ fn final_teardown_cancels_a_current_recording_behind_pending_validated_io() {
     encode_compute(&f);
     assert!(!f.commands.core.state.lock(Side::Host).current_abandoned);
     let clock = f.commands.clock();
+    let opened_before = clock.current_epoch().0;
     let weak = f.commands.core.produced.me_for_test();
     let counters = f.commands.core.submission_control.clone();
     let before = counters.native_calls.load(Ordering::Acquire);
@@ -1890,11 +1919,15 @@ fn final_teardown_cancels_a_current_recording_behind_pending_validated_io() {
     let calls = counters.native_calls.load(Ordering::Acquire) - before;
     let (opened, completed) = (clock.current_epoch().0, clock.completed_count().0);
     eprintln!(
-        "TEARDOWN_PENDING_IO_CURRENT api={api} retired={retired} native_calls={calls} epochs={completed}/{opened} warm={}",
+        "TEARDOWN_PENDING_IO_CURRENT api={api} retired={retired} native_calls={calls} epochs={completed}/{opened} opened_before={opened_before} warm={}",
         dst_bytes(&dst).iter().all(|b| *b == WARM)
     );
     assert!(retired, "TEARDOWN_PENDING_IO_CURRENT_FINAL_OWNER_RETIRES");
-    assert_eq!(calls, 1, "TEARDOWN_PENDING_IO_CURRENT_ONE_MARKER");
+    assert_eq!(calls, 0, "TEARDOWN_PENDING_IO_CURRENT_NO_NATIVE_CALL");
+    assert_eq!(
+        opened, opened_before,
+        "TEARDOWN_PENDING_IO_CURRENT_OPENS_NO_EPOCH"
+    );
     assert!(
         dst_bytes(&dst).iter().all(|b| *b == WARM),
         "TEARDOWN_PENDING_IO_CURRENT_BODY_NOT_RUN"
@@ -1904,4 +1937,735 @@ fn final_teardown_cancels_a_current_recording_behind_pending_validated_io() {
         "TEARDOWN_PENDING_IO_CURRENT_EVERY_EPOCH_COMPLETES"
     );
     drop((native, src, dst, gate, progress, generation));
+}
+
+/// The owed epochs of an abandoned final ride the last submission still in
+/// flight. A submission held on the GPU by a wait, then a held reader whose
+/// producer gives up: until the submission completes, neither its epoch nor
+/// the cancelled one is covered (`GpuClock::mark_completed` is a maximum, so an
+/// early mark would cover both) and the final owner stays pending; once it
+/// completes, every epoch completes and the final owner retires with no
+/// native call of its own (decision 99).
+#[test]
+fn final_abandonment_rides_the_last_submission_still_in_flight() {
+    let f = fixture();
+    if f.commands.host_input_arm() == HostInputArm::GpuWait {
+        eprintln!("NOT_APPLICABLE nothing is held on the gpu-wait arm");
+        return;
+    }
+    // A GPU wait on an event this test raises well inside the queue timeout.
+    let block = f.native.as_ref().newSharedEvent().unwrap();
+    let clock = f.commands.clock();
+    f.commands.encode_wait_for_event(&block, 1).unwrap();
+    encode_compute(&f);
+    // Metal 4 cuts before a wait: the blocked recording's epoch is the one
+    // its own cut takes, read after the wait was encoded.
+    let in_flight = clock.current_epoch();
+    let marker = f.commands.flush_marker().unwrap();
+    assert!(marker.is_submitted(), "the blocked submission was held");
+    let (_held, held_epoch) = hold_on(&f, &f.gate);
+    f.commands
+        .cancel_produced(&f.gate, "test: the producer gave up")
+        .unwrap();
+    assert!(f.commands.core.state.lock(Side::Host).current_abandoned);
+    assert_eq!(owed_now(&f), 1, "the cancelled reader's epoch is not owed");
+    let weak = f.commands.core.produced.me_for_test();
+    let counters = f.commands.core.submission_control.clone();
+    let before = counters.native_calls.load(Ordering::Acquire);
+    let opened = clock.current_epoch().0;
+    let api = f.commands.actual_command_api();
+    let Fixture {
+        native,
+        commands,
+        src,
+        dst,
+        gate,
+        progress,
+    } = f;
+    drop(commands);
+    std::thread::sleep(Duration::from_millis(300));
+    let pending = weak.upgrade().is_some();
+    let in_flight_done = clock.is_complete(in_flight);
+    let held_done = clock.is_complete(held_epoch);
+    block.setSignaledValue(1);
+    let retired = until(Duration::from_secs(5), || weak.upgrade().is_none());
+    let calls = counters.native_calls.load(Ordering::Acquire) - before;
+    let (after, completed) = (clock.current_epoch().0, clock.completed_count().0);
+    eprintln!(
+        "FINAL_RIDES api={api} pending={pending} in_flight_done={in_flight_done} held_done={held_done} retired={retired} native_calls={calls} epochs={completed}/{after} opened_before={opened}"
+    );
+    assert!(pending, "FINAL_ABANDONMENT_PENDING_WHILE_EARLIER_WORK_RUNS");
+    assert!(
+        !in_flight_done,
+        "FINAL_ABANDONMENT_COVERS_NO_EPOCH_STILL_IN_FLIGHT"
+    );
+    assert!(!held_done, "FINAL_ABANDONED_EPOCH_WAITS_FOR_THE_PREFIX");
+    assert!(
+        retired,
+        "FINAL_ABANDONMENT_RETIRES_ONCE_THE_PREFIX_COMPLETES"
+    );
+    assert_eq!(calls, 0, "FINAL_ABANDONMENT_MAKES_NO_NATIVE_CALL");
+    assert_eq!(after, opened, "FINAL_ABANDONMENT_OPENS_NO_EPOCH");
+    assert_eq!(completed, after, "FINAL_ABANDONMENT_EVERY_EPOCH_COMPLETES");
+    drop((native, src, dst, gate, progress, block));
+}
+
+/// A completion subscriber blocks on the completion thread inside the last
+/// submission's hook run. That submission's epoch is marked before its
+/// subscribers run, but its record has not finished: the abandoned epoch
+/// stays uncovered and the final owner pending until the subscriber
+/// returns. A prefix proof read from the hook's run count alone would
+/// certify here, with a subscriber still running on a snapshot the final
+/// captures are about to take.
+#[test]
+fn final_abandonment_waits_for_the_last_completion_to_return() {
+    struct Blocker {
+        armed: std::sync::atomic::AtomicBool,
+        entered: std::sync::atomic::AtomicBool,
+        released: std::sync::atomic::AtomicBool,
+    }
+    let block = Arc::new(Blocker {
+        armed: false.into(),
+        entered: false.into(),
+        released: false.into(),
+    });
+    let observed = block.clone();
+    let f = fixture_with(move |commands| {
+        commands
+            .on_command_buffer_complete(move || {
+                if !observed.armed.swap(false, Ordering::AcqRel) {
+                    return;
+                }
+                observed.entered.store(true, Ordering::Release);
+                let t0 = Instant::now();
+                while !observed.released.load(Ordering::Acquire)
+                    && t0.elapsed() < Duration::from_secs(10)
+                {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            })
+            .unwrap_or_else(|_| panic!("subscriber registration refused"));
+    });
+    if f.commands.host_input_arm() == HostInputArm::GpuWait {
+        block.released.store(true, Ordering::Release);
+        eprintln!("NOT_APPLICABLE nothing is held on the gpu-wait arm");
+        return;
+    }
+    block.armed.store(true, Ordering::Release);
+    encode_compute(&f);
+    let marker = f.commands.flush_marker().unwrap();
+    assert!(marker.is_submitted(), "the last submission was held");
+    assert!(
+        until(Duration::from_secs(5), || block
+            .entered
+            .load(Ordering::Acquire)),
+        "the subscriber never ran"
+    );
+    let (_held, held_epoch) = hold_on(&f, &f.gate);
+    f.commands
+        .cancel_produced(&f.gate, "test: the producer gave up")
+        .unwrap();
+    assert!(f.commands.core.state.lock(Side::Host).current_abandoned);
+    let clock = f.commands.clock();
+    let opened = clock.current_epoch().0;
+    let weak = f.commands.core.produced.me_for_test();
+    let counters = f.commands.core.submission_control.clone();
+    let before = counters.native_calls.load(Ordering::Acquire);
+    let api = f.commands.actual_command_api();
+    let Fixture {
+        native,
+        commands,
+        src,
+        dst,
+        gate,
+        progress,
+    } = f;
+    drop(commands);
+    std::thread::sleep(Duration::from_millis(300));
+    let pending = weak.upgrade().is_some();
+    let held_done = clock.is_complete(held_epoch);
+    block.released.store(true, Ordering::Release);
+    let retired = until(Duration::from_secs(5), || weak.upgrade().is_none());
+    let calls = counters.native_calls.load(Ordering::Acquire) - before;
+    let (after, completed) = (clock.current_epoch().0, clock.completed_count().0);
+    eprintln!(
+        "FINAL_WAITS_FOR_RETURN api={api} pending={pending} held_done={held_done} retired={retired} native_calls={calls} epochs={completed}/{after} opened_before={opened}"
+    );
+    assert!(pending, "FINAL_ABANDONMENT_PENDING_WHILE_A_COMPLETION_RUNS");
+    assert!(
+        !held_done,
+        "FINAL_ABANDONED_EPOCH_WAITS_FOR_THE_COMPLETION_TO_RETURN"
+    );
+    assert!(retired, "FINAL_ABANDONMENT_RETIRES_ONCE_IT_RETURNS");
+    assert_eq!(calls, 0, "FINAL_ABANDONMENT_MAKES_NO_NATIVE_CALL");
+    assert_eq!(after, opened, "FINAL_ABANDONMENT_OPENS_NO_EPOCH");
+    assert_eq!(completed, after, "FINAL_ABANDONMENT_EVERY_EPOCH_COMPLETES");
+    drop((native, src, dst, gate, progress));
+}
+
+/// A cancellation whose owed-epoch bound refuses, and whose close of the
+/// current encoder refuses after it, still fails the queue for good: the
+/// refusal is latched on that early exit. No later submission is accepted,
+/// no epoch is marked, and the cancelled held recording is abandoned in
+/// custody, never run (lane C, #944 6556673766 §3).
+#[test]
+fn a_bound_refusal_is_latched_when_a_close_refuses_after_it() {
+    let f = fixture();
+    if f.commands.host_input_arm() == HostInputArm::GpuWait {
+        eprintln!("NOT_APPLICABLE nothing is held on the gpu-wait arm");
+        return;
+    }
+    let (held, held_epoch) = hold_on(&f, &f.gate);
+    // An open compute encoder on the current recording: the close refuses.
+    encode_compute(&f);
+    {
+        let mut state = f.commands.core.state.lock(Side::Host);
+        assert!(state.current_encoder.is_some(), "no encoder to close");
+        let flagged = state.owed_epochs.flagged();
+        state.owed_epochs = produced::Owed::for_test(produced::Owed::MAX_OWED, flagged);
+    }
+    let clock = f.commands.clock();
+    let completed = clock.completed_count().0;
+    let calls = native_calls(&f.commands);
+    let api = f.commands.actual_command_api();
+    f.commands
+        .core
+        .submission_control
+        .arm(submission_test::Fault::CloseRefusal);
+    let cancelled = f.commands.cancel_produced(&f.gate, "test: bound");
+    let sticky = f.commands.core.failure.check();
+    eprintln!(
+        "BOUND_REFUSAL_LATCH api={api} cancel={cancelled:?} sticky={sticky:?} held_abandoned={}",
+        held.cb.abandoned()
+    );
+    assert!(cancelled.is_err(), "BOUND_REFUSAL_REPORTED");
+    assert!(sticky.is_err(), "BOUND_REFUSAL_LATCHED_ON_THE_EARLY_EXIT");
+    let flushed = f.commands.flush_and_wait();
+    f.gate.setSignaledValue(1);
+    let released = f.commands.produced(&f.gate, 1);
+    std::thread::sleep(Duration::from_millis(200));
+    let after_calls = native_calls(&f.commands);
+    let after_completed = clock.completed_count().0;
+    eprintln!(
+        "BOUND_REFUSAL_AFTER api={api} flushed={flushed:?} released={released:?} calls={calls}->{after_calls} completed={completed}->{after_completed} held_epoch_done={}",
+        clock.is_complete(held_epoch)
+    );
+    assert!(flushed.is_err(), "NO_SUBMISSION_ACCEPTED_AFTER_THE_REFUSAL");
+    assert_eq!(after_calls, calls, "NO_NATIVE_CALL_AFTER_THE_REFUSAL");
+    assert_eq!(after_completed, completed, "NO_EPOCH_MARKED_BY_THE_REFUSAL");
+    assert!(
+        !clock.is_complete(held_epoch),
+        "THE_CANCELLED_EPOCH_IS_NOT_COMPLETE"
+    );
+    assert!(
+        held.cb.abandoned(),
+        "THE_CANCELLED_HELD_RECORDING_IS_ABANDONED_IN_CUSTODY"
+    );
+    // A failed queue's teardown quarantines and retains its Core by design.
+}
+
+/// The re-homed IO behind a cancelled signal survives a close refusal. A
+/// held recording carries an IO load's compute signal (`commit_io_after`
+/// deferred the IO buffer behind it); its producer gives up while the
+/// current recording has an open encoder whose close refuses. The load is
+/// still committed behind a signal re-issued on the queue, and lands. Before
+/// the re-homed list was placed ahead of the closes, the refusal's early exit
+/// dropped it and the IO buffer was never committed (#944 decision-99 lane,
+/// the dev defect beside lane C's §3).
+#[test]
+fn a_close_refusal_keeps_the_rehomed_io_behind_a_cancelled_signal() {
+    use crate::kernels::metal::io_queue::{IoLoad, IoQueue};
+    const LEN: usize = 64 * 1024;
+    let f = fixture();
+    if f.commands.host_input_arm() == HostInputArm::GpuWait {
+        eprintln!("NOT_APPLICABLE nothing is held on the gpu-wait arm");
+        return;
+    }
+    let bytes: Vec<u8> = (0..LEN).map(|i| (i * 31 % 251) as u8).collect();
+    let path = std::env::temp_dir().join(format!(
+        "lloom-d99-rehome-{}-{}.bin",
+        f.commands.actual_command_api(),
+        std::process::id()
+    ));
+    std::fs::write(&path, &bytes).unwrap();
+    let queue = IoQueue::new(&f.native).unwrap();
+    let file = queue.open(&path).unwrap();
+    let dst = f
+        .native
+        .new_buffer(LEN, super::super::MTLResourceOptions::StorageModeShared)
+        .unwrap();
+    // The held recording: the gated compute, then the load's compute signal.
+    f.commands.commit_when_produced(&f.gate, 1).unwrap();
+    encode_compute(&f);
+    let before = queue.signaled();
+    let value = queue
+        .issue(
+            &f.commands,
+            &[IoLoad {
+                dst: &dst,
+                dst_offset: 0,
+                file: &file,
+                src_offset: 0,
+                len: LEN,
+            }],
+        )
+        .unwrap();
+    let held = f.commands.produced_stats().held_now;
+    assert!(held >= 1, "the signal's recording was not held");
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(queue.signaled(), before, "the load ran before its signal");
+    // An open encoder on the current recording; its close refuses.
+    encode_compute(&f);
+    f.commands
+        .core
+        .submission_control
+        .arm(submission_test::Fault::CloseRefusal);
+    let cancelled = f
+        .commands
+        .cancel_produced(&f.gate, "test: the producer gave up");
+    let landed = until(Duration::from_secs(5), || queue.signaled() >= value);
+    // SAFETY: a CPU-mapped Shared buffer of LEN bytes; its only writer, the
+    // load, has signalled (or never ran).
+    let got = unsafe { std::slice::from_raw_parts(dst.contents() as *const u8, LEN) };
+    let right = got == bytes.as_slice();
+    eprintln!(
+        "REHOME_AFTER_CLOSE_REFUSAL api={} held={held} cancel={cancelled:?} landed={landed} bytes_right={right}",
+        f.commands.actual_command_api()
+    );
+    std::fs::remove_file(&path).ok();
+    assert!(cancelled.is_err(), "the close refusal was not reported");
+    assert!(landed, "REHOMED_IO_SURVIVES_A_CLOSE_REFUSAL");
+    assert!(right, "REHOMED_IO_LANDS_THE_FILES_BYTES");
+}
+
+/// One held reader per gate, each on an event of its own: the dependent
+/// compute recorded behind `commit_when_produced(event, 1)`, then cut. Its
+/// marker and the epoch the cut took.
+fn hold_on(f: &Fixture, event: &Event) -> (CommandMarker, Epoch) {
+    let epoch = f.commands.clock().current_epoch();
+    f.commands.commit_when_produced(event, 1).unwrap();
+    encode_compute(f);
+    let marker = f.commands.flush_marker().unwrap();
+    assert!(
+        !marker.is_submitted(),
+        "a gated reader was submitted at its cut"
+    );
+    (marker, epoch)
+}
+
+fn raise(f: &Fixture, event: &Event) -> usize {
+    event.setSignaledValue(1);
+    f.commands.produced(event, 1).unwrap()
+}
+
+/// The clock once the completions a wait returned on have run: polled past
+/// `at_least`, then given time for any further hook run of the same
+/// completion to land, so an over-marking completion is read at its end.
+fn settled_completed(f: &Fixture, at_least: u64) -> u64 {
+    let clock = f.commands.clock();
+    assert!(
+        until(Duration::from_secs(5), || clock.completed_count().0
+            >= at_least),
+        "epoch {} never completed",
+        at_least - 1
+    );
+    std::thread::sleep(Duration::from_millis(200));
+    clock.completed_count().0
+}
+
+/// A pool buffer of `size` bytes released now: parked at the clock's current
+/// epoch, the one the next cut takes, until that epoch completes
+/// (`BufferPool`'s reuse rule, `GpuClock::is_complete`).
+fn park(f: &Fixture, pool: &crate::kernels::metal::BufferPool, size: usize) {
+    let raw = f
+        .native
+        .new_buffer(size, super::super::MTLResourceOptions::StorageModeShared)
+        .unwrap();
+    drop(pool.adopt(raw, size));
+}
+
+/// Whether the pool would hand a parked `size` buffer out again now.
+fn reusable(pool: &crate::kernels::metal::BufferPool, size: usize) -> bool {
+    pool.acquire(size).is_some()
+}
+
+fn owed_now(f: &Fixture) -> u32 {
+    f.commands.core.state.lock(Side::Host).owed_epochs.count()
+}
+
+/// The counterexample on #944 (H0/H1/H2 on gates A/B/C, cancel C, produce
+/// A). H0's completion completes H0's epoch alone: H1 is still held, so its
+/// epoch is not covered and anything the pool parked on it stays parked
+/// (`BufferPool`'s reuse test is `GpuClock::is_complete`). Once B is produced
+/// and H1 completes, every epoch has completed, the cancelled H2's with H1's.
+#[test]
+fn a_cancelled_tail_leaves_a_still_held_reader_uncovered() {
+    let f = fixture();
+    if f.commands.host_input_arm() == HostInputArm::GpuWait {
+        eprintln!("NOT_APPLICABLE nothing is held on the gpu-wait arm");
+        return;
+    }
+    let [a, b, c] = std::array::from_fn(|_| f.native.as_ref().newSharedEvent().unwrap());
+    let pool = crate::kernels::metal::BufferPool::with_clock(f.commands.clock());
+    const H1_FRAME: usize = 3 * 4096;
+    let (m0, e0) = hold_on(&f, &a);
+    // Memory H1 reads, released as H1 is recorded: parked at H1's epoch.
+    park(&f, &pool, H1_FRAME);
+    let (m1, e1) = hold_on(&f, &b);
+    let (m2, e2) = hold_on(&f, &c);
+    assert_eq!((e1.0, e2.0), (e0.0 + 1, e0.0 + 2));
+    assert_eq!(f.commands.produced_stats().held_now, 3);
+    let calls = native_calls(&f.commands);
+    // H2 and the current recording behind it.
+    assert_eq!(
+        f.commands.cancel_produced(&c, "test: C gave up").unwrap(),
+        2
+    );
+    assert_eq!(owed_now(&f), 1);
+    assert_eq!(raise(&f, &a), 1, "A releases H0 alone");
+    f.commands.wait_marker(&m0).unwrap();
+    let completed = settled_completed(&f, e0.0 + 1);
+    let clock = f.commands.clock();
+    eprintln!(
+        "OWED_H0_DONE api={} completed={completed} e0={} e1={} h1_submitted={} owed={} held={}",
+        f.commands.actual_command_api(),
+        e0.0,
+        e1.0,
+        m1.is_submitted(),
+        owed_now(&f),
+        f.commands.produced_stats().held_now
+    );
+    assert_eq!(
+        native_calls(&f.commands) - calls,
+        1,
+        "H0 alone was submitted"
+    );
+    assert!(!m1.is_submitted(), "H1 left the held queue before B");
+    assert_eq!(f.commands.produced_stats().held_now, 1);
+    assert_eq!(
+        completed,
+        e0.0 + 1,
+        "H0's completion marked an epoch past its own"
+    );
+    assert!(
+        !clock.is_complete(e1),
+        "H1's epoch completed while H1 was still held"
+    );
+    assert!(
+        !reusable(&pool, H1_FRAME),
+        "the pool handed out memory a still-held recording reads"
+    );
+    assert_eq!(
+        owed_now(&f),
+        1,
+        "the owed epoch went with a non-tail commit"
+    );
+    assert_eq!(raise(&f, &b), 1, "B releases H1");
+    f.commands.wait_marker(&m1).unwrap();
+    let completed = settled_completed(&f, e2.0 + 1);
+    eprintln!(
+        "OWED_H1_DONE api={} completed={completed} current={} owed={}",
+        f.commands.actual_command_api(),
+        clock.current_epoch().0,
+        owed_now(&f)
+    );
+    assert_eq!(completed, e2.0 + 1, "H1 completes its epoch and H2's");
+    assert!(
+        reusable(&pool, H1_FRAME),
+        "H1's memory stayed parked after H1"
+    );
+    assert_eq!(clock.current_epoch().0, e2.0 + 1);
+    assert!(clock.is_complete(e1) && clock.is_complete(e2));
+    assert_eq!(owed_now(&f), 0);
+    assert!(computed(&f.dst));
+    let waited = f.commands.wait_marker(&m2);
+    assert!(
+        waited
+            .as_ref()
+            .is_err_and(|e| e.to_string().contains("C gave up")),
+        "{waited:?}"
+    );
+    // The stream goes on.
+    encode_compute(&f);
+    f.commands.flush_and_wait().unwrap();
+    assert_eq!(
+        clock.completed_count().0,
+        clock.current_epoch().0,
+        "every epoch taken completed"
+    );
+    f.commands.check_failed().unwrap();
+}
+
+/// Held work added after a cancellation (H0; H1 cancelled; H2, H3 held
+/// after it): H0's completion completes H0's epoch; H2 — the first commit
+/// above the cancelled epoch — completes the cancelled epoch and its own at
+/// its own completion, with H3 still held; H3 completes its own.
+#[test]
+fn work_held_after_a_cancellation_completes_its_own_epoch_at_its_completion() {
+    let f = fixture();
+    if f.commands.host_input_arm() == HostInputArm::GpuWait {
+        eprintln!("NOT_APPLICABLE nothing is held on the gpu-wait arm");
+        return;
+    }
+    let [a, b, c, d] = std::array::from_fn(|_| f.native.as_ref().newSharedEvent().unwrap());
+    let (m0, e0) = hold_on(&f, &a);
+    let (_m1, e1) = hold_on(&f, &b);
+    assert_eq!(
+        f.commands.cancel_produced(&b, "test: B gave up").unwrap(),
+        2
+    );
+    assert_eq!(owed_now(&f), 1);
+    let (m2, e2) = hold_on(&f, &c);
+    let (m3, e3) = hold_on(&f, &d);
+    assert_eq!((e1.0, e2.0, e3.0), (e0.0 + 1, e0.0 + 2, e0.0 + 3));
+    let clock = f.commands.clock();
+    assert_eq!(raise(&f, &a), 1);
+    f.commands.wait_marker(&m0).unwrap();
+    assert_eq!(settled_completed(&f, e0.0 + 1), e0.0 + 1);
+    assert_eq!(owed_now(&f), 1);
+    assert_eq!(raise(&f, &c), 1);
+    f.commands.wait_marker(&m2).unwrap();
+    let completed = settled_completed(&f, e2.0 + 1);
+    eprintln!(
+        "OWED_ADDED api={} completed={completed} e2={} h3_submitted={} owed={}",
+        f.commands.actual_command_api(),
+        e2.0,
+        m3.is_submitted(),
+        owed_now(&f)
+    );
+    assert!(!m3.is_submitted());
+    assert_eq!(
+        completed,
+        e2.0 + 1,
+        "H2's completion left its own epoch open"
+    );
+    assert!(!clock.is_complete(e3));
+    assert_eq!(owed_now(&f), 0);
+    assert_eq!(raise(&f, &d), 1);
+    f.commands.wait_marker(&m3).unwrap();
+    assert_eq!(settled_completed(&f, e3.0 + 1), e3.0 + 1);
+    assert_eq!(clock.current_epoch().0, e3.0 + 1);
+    f.commands.check_failed().unwrap();
+}
+
+/// Two cancellations, the later one shallower in the queue (H0..H3; cancel
+/// D, then C): H0 completes its own epoch; H1, the last live one,
+/// completes its own and both cancelled ones.
+#[test]
+fn repeated_cancellations_complete_with_the_last_live_reader() {
+    let f = fixture();
+    if f.commands.host_input_arm() == HostInputArm::GpuWait {
+        eprintln!("NOT_APPLICABLE nothing is held on the gpu-wait arm");
+        return;
+    }
+    let [a, b, c, d] = std::array::from_fn(|_| f.native.as_ref().newSharedEvent().unwrap());
+    let (m0, e0) = hold_on(&f, &a);
+    let (m1, e1) = hold_on(&f, &b);
+    let (_, _) = hold_on(&f, &c);
+    let (_, e3) = hold_on(&f, &d);
+    assert_eq!(
+        f.commands.cancel_produced(&d, "test: D gave up").unwrap(),
+        2
+    );
+    assert_eq!(
+        f.commands.cancel_produced(&c, "test: C gave up").unwrap(),
+        1
+    );
+    assert_eq!(owed_now(&f), 2);
+    let clock = f.commands.clock();
+    assert_eq!(raise(&f, &a), 1);
+    f.commands.wait_marker(&m0).unwrap();
+    assert_eq!(settled_completed(&f, e0.0 + 1), e0.0 + 1);
+    assert!(!clock.is_complete(e1));
+    assert!(!m1.is_submitted());
+    assert_eq!(raise(&f, &b), 1);
+    f.commands.wait_marker(&m1).unwrap();
+    assert_eq!(settled_completed(&f, e3.0 + 1), e3.0 + 1);
+    assert_eq!(clock.current_epoch().0, e3.0 + 1);
+    assert_eq!(owed_now(&f), 0);
+    f.commands.check_failed().unwrap();
+}
+
+/// A held release the owner's submission refuses before its epoch keeps
+/// what is owed: the retry carries it, and the mapping is exact.
+#[test]
+fn a_refused_release_keeps_the_owed_epochs_for_its_retry() {
+    let f = fixture();
+    if f.commands.host_input_arm() == HostInputArm::GpuWait {
+        eprintln!("NOT_APPLICABLE nothing is held on the gpu-wait arm");
+        return;
+    }
+    let [a, b] = std::array::from_fn(|_| f.native.as_ref().newSharedEvent().unwrap());
+    let (m0, _) = hold_on(&f, &a);
+    let (_, e1) = hold_on(&f, &b);
+    assert_eq!(
+        f.commands.cancel_produced(&b, "test: B gave up").unwrap(),
+        2
+    );
+    assert_eq!(owed_now(&f), 1);
+    // A produced but not announced: the owner's wait releases H0.
+    a.setSignaledValue(1);
+    let calls = native_calls(&f.commands);
+    let control = &f.commands.core.submission_control;
+    control.arm(submission_test::Fault::Registration);
+    let refused = f.commands.wait_marker(&m0);
+    assert!(
+        matches!(
+            refused,
+            Err(MetalKernelError::QueueUnavailable(
+                "injected completion registration refusal"
+            ))
+        ),
+        "{refused:?}"
+    );
+    assert_eq!(
+        native_calls(&f.commands),
+        calls,
+        "a refused release reached the GPU"
+    );
+    assert!(!m0.is_submitted());
+    assert_eq!(owed_now(&f), 1, "a refused release consumed the owed epoch");
+    assert_eq!(f.commands.clock().current_epoch().0, e1.0 + 1);
+    f.commands.wait_marker(&m0).unwrap();
+    assert_eq!(settled_completed(&f, e1.0 + 1), e1.0 + 1);
+    assert_eq!(owed_now(&f), 0);
+    f.commands.check_failed().unwrap();
+}
+
+/// The ordinary current commit after a cancellation emptied the held queue
+/// carries what is owed: its completion completes every epoch taken.
+#[test]
+fn the_next_current_commit_carries_the_owed_epochs() {
+    let f = fixture();
+    if f.commands.host_input_arm() == HostInputArm::GpuWait {
+        eprintln!("NOT_APPLICABLE nothing is held on the gpu-wait arm");
+        return;
+    }
+    let [a] = std::array::from_fn(|_| f.native.as_ref().newSharedEvent().unwrap());
+    let (_, e0) = hold_on(&f, &a);
+    assert_eq!(
+        f.commands.cancel_produced(&a, "test: A gave up").unwrap(),
+        2
+    );
+    assert_eq!(owed_now(&f), 1);
+    let clock = f.commands.clock();
+    assert_eq!(clock.completed_count().0, e0.0);
+    encode_compute(&f);
+    f.commands.flush_and_wait().unwrap();
+    assert_eq!(settled_completed(&f, e0.0 + 2), e0.0 + 2);
+    assert_eq!(clock.current_epoch().0, e0.0 + 2);
+    assert_eq!(owed_now(&f), 0);
+    assert!(computed(&f.dst));
+    f.commands.check_failed().unwrap();
+}
+
+/// Final teardown with a cancelled tail and a live reader not produced: the
+/// teardown commits H0 and H1 as recorded, the owed epoch rides H1, and
+/// every epoch has completed once the owner retires.
+#[test]
+fn teardown_after_a_cancelled_tail_completes_every_epoch() {
+    let f = fixture();
+    if f.commands.host_input_arm() == HostInputArm::GpuWait {
+        eprintln!("NOT_APPLICABLE nothing is held on the gpu-wait arm");
+        return;
+    }
+    let [a, b, c] = std::array::from_fn(|_| f.native.as_ref().newSharedEvent().unwrap());
+    let (_, _) = hold_on(&f, &a);
+    let (_, _) = hold_on(&f, &b);
+    let (_, e2) = hold_on(&f, &c);
+    assert_eq!(
+        f.commands.cancel_produced(&c, "test: C gave up").unwrap(),
+        2
+    );
+    let clock = f.commands.clock();
+    let weak = f.commands.core.produced.me_for_test();
+    let Fixture {
+        native,
+        commands,
+        src,
+        dst,
+        gate,
+        progress,
+    } = f;
+    drop(commands);
+    let retired = until(Duration::from_secs(5), || weak.upgrade().is_none());
+    eprintln!(
+        "OWED_TEARDOWN retired={retired} completed={} current={} e2={}",
+        clock.completed_count().0,
+        clock.current_epoch().0,
+        e2.0
+    );
+    assert!(retired);
+    // H0, H1; H2's epoch owed and completed with H1. The abandoned final
+    // opens no epoch of its own (decision 99).
+    assert_eq!(clock.current_epoch().0, e2.0 + 1);
+    assert_eq!(clock.completed_count().0, clock.current_epoch().0);
+    assert!(computed(&dst));
+    drop((native, src, dst, gate, progress, a, b, c));
+}
+
+/// Interleaved holes (H0 | cancelled H1 | H2 | cancelled H3 | H4, the review
+/// on #944): H2's completion completes the hole below it and its own epoch
+/// while H4's producer has not run, so memory parked at H2's epoch is
+/// reusable then; H4 completes the hole above H2 and its own.
+#[test]
+fn a_reader_between_two_cancelled_ranges_completes_at_its_own_completion() {
+    let f = fixture();
+    if f.commands.host_input_arm() == HostInputArm::GpuWait {
+        eprintln!("NOT_APPLICABLE nothing is held on the gpu-wait arm");
+        return;
+    }
+    let [a, b, c, d, e] = std::array::from_fn(|_| f.native.as_ref().newSharedEvent().unwrap());
+    let pool = crate::kernels::metal::BufferPool::with_clock(f.commands.clock());
+    const H2_FRAME: usize = 5 * 4096;
+    let (m0, e0) = hold_on(&f, &a);
+    let (_, e1) = hold_on(&f, &b);
+    assert_eq!(
+        f.commands.cancel_produced(&b, "test: B gave up").unwrap(),
+        2
+    );
+    park(&f, &pool, H2_FRAME);
+    let (m2, e2) = hold_on(&f, &c);
+    let (_, e3) = hold_on(&f, &d);
+    assert_eq!(
+        f.commands.cancel_produced(&d, "test: D gave up").unwrap(),
+        2
+    );
+    let (m4, e4) = hold_on(&f, &e);
+    assert_eq!(
+        (e1.0, e2.0, e3.0, e4.0),
+        (e0.0 + 1, e0.0 + 2, e0.0 + 3, e0.0 + 4)
+    );
+    assert_eq!(owed_now(&f), 2);
+    let clock = f.commands.clock();
+    assert_eq!(raise(&f, &a), 1);
+    f.commands.wait_marker(&m0).unwrap();
+    assert_eq!(settled_completed(&f, e0.0 + 1), e0.0 + 1);
+    assert!(!reusable(&pool, H2_FRAME), "H2's memory left before H2 ran");
+    assert_eq!(raise(&f, &c), 1);
+    f.commands.wait_marker(&m2).unwrap();
+    let completed = settled_completed(&f, e2.0 + 1);
+    let h2_frame = reusable(&pool, H2_FRAME);
+    eprintln!(
+        "OWED_INTERLEAVED api={} completed={completed} e2={} e4={} h4_submitted={} owed={} h2_frame_reusable={h2_frame}",
+        f.commands.actual_command_api(),
+        e2.0,
+        e4.0,
+        m4.is_submitted(),
+        owed_now(&f)
+    );
+    assert!(!m4.is_submitted(), "H4 ran without its producer");
+    assert_eq!(completed, e2.0 + 1, "H2's completion did not complete H2");
+    assert!(!clock.is_complete(e3) && !clock.is_complete(e4));
+    assert!(
+        h2_frame,
+        "memory H2 read stayed parked behind H4's producer"
+    );
+    assert_eq!(owed_now(&f), 1);
+    assert_eq!(raise(&f, &e), 1);
+    f.commands.wait_marker(&m4).unwrap();
+    assert_eq!(settled_completed(&f, e4.0 + 1), e4.0 + 1);
+    assert_eq!(clock.current_epoch().0, e4.0 + 1);
+    assert_eq!(owed_now(&f), 0);
+    f.commands.check_failed().unwrap();
 }

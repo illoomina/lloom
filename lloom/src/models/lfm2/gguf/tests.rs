@@ -358,6 +358,32 @@ fn a_q4_k_gguf_stays_packed() -> Result<()> {
     packed_stays_packed(GgmlDType::Q4K)
 }
 
+/// The header names the kinds the built model holds, before any weight is
+/// read: a packed kind by name and count, a float kind as stored (the load
+/// dequantizes it at the compute dtype, f32 here).
+#[test]
+fn the_header_names_the_kinds_the_model_holds() -> Result<()> {
+    for (kind, built) in [
+        (GgmlDType::Q8_0, "q8_0"),
+        (GgmlDType::Q4K, "q4k"),
+        (GgmlDType::F16, "f32"),
+        (GgmlDType::F32, "f32"),
+    ] {
+        let bytes = gguf(kind)?;
+        let ct = gguf_file::Content::read(&mut Cursor::new(&bytes))?;
+        let stored = GgufCheckpoint::read(&ct)?.stored_kinds(&ct);
+        let name = format!("{kind:?}").to_lowercase();
+        assert_eq!(stored, [(name, 18)].into_iter().collect(), "{kind:?}");
+        let (g, _) = from_gguf(&bytes, &Device::Cpu)?;
+        assert_eq!(
+            g.weight_kinds(),
+            [(built.to_string(), 18)].into_iter().collect(),
+            "{kind:?}"
+        );
+    }
+    Ok(())
+}
+
 /// The packed GGUF on `models::lfm2` against the legacy GGUF model on the
 /// same file, both at f32 over the same blocks: greedy tokens identical at
 /// every step, logits within `bound`. The bound is fixed here, before any

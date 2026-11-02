@@ -16,6 +16,7 @@ pub(crate) enum Fault {
     PartialEntry = 3,
     HoldReturn = 4,
     UnknownReturn = 5,
+    CloseRefusal = 6,
 }
 
 #[derive(Default)]
@@ -69,6 +70,16 @@ impl Control {
         if self.take(Fault::BeforeEntry) {
             Err(MetalKernelError::QueueUnavailable(
                 "injected known-before-entry refusal",
+            ))
+        } else {
+            Ok(())
+        }
+    }
+    /// An open compute encoder's close refused, before anything is ended.
+    pub fn close(&self) -> Result<(), MetalKernelError> {
+        if self.take(Fault::CloseRefusal) {
+            Err(MetalKernelError::QueueUnavailable(
+                "injected compute close refusal",
             ))
         } else {
             Ok(())

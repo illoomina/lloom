@@ -4851,3 +4851,47 @@ fn an_lfm2_gguf_serves_batched_rows_on_the_lfm2_engine() {
     }
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// The representation the front end reads off a checkpoint before load
+/// (`app::lfm2::representation`) is the one the LFM2 engine builds, as
+/// `/health` reports it, on the CPU and on Metal: the safetensors
+/// checkpoint dense at the engine's dtype, a Q8_0 GGUF on its blocks and an
+/// F32 GGUF dense, both at f32. On Metal `lloom chat` names the LFM2 rows
+/// withheld from the packed GGUF, and none for the safetensors checkpoint.
+#[test]
+fn an_lfm2_load_builds_the_representation_the_front_end_read() {
+    let dir = scratch("lfm2-representation");
+    let model = write::<Lfm2Tiny>(&dir);
+    let q8 = lfm2_gguf(&model, lloom_tensor::quantized::GgmlDType::Q8_0);
+    let dense = lfm2_gguf(&model, lloom_tensor::quantized::GgmlDType::F32);
+    let mut devices = vec![(true, vec!["--cpu"])];
+    if cfg!(feature = "metal") {
+        devices.push((false, vec![]));
+    }
+    for (cpu, args) in &devices {
+        for path in [&model, &q8, &dense] {
+            let read = lloom_engine::app::lfm2::representation(path, *cpu)
+                .unwrap()
+                .name();
+            let server = Server::start(path, args);
+            let (_, health) = server.call("GET", "/health", &json!({}));
+            assert_eq!(
+                health["representation"],
+                read,
+                "{args:?} {}: {health}",
+                path.display()
+            );
+            drop(server);
+        }
+    }
+    if cfg!(feature = "metal") {
+        let (_, packed) = chat_with_stderr(&q8, &[]);
+        assert!(
+            packed.contains("[front-end: chat: the LFM2 rows withheld on blocks f32 weights"),
+            "{packed}"
+        );
+        let (_, safetensors) = chat_with_stderr(&model, &[]);
+        assert!(!safetensors.contains("rows withheld"), "{safetensors}");
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}

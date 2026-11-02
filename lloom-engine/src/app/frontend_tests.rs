@@ -181,35 +181,35 @@ const PINNED_ROWS: &[(&str, &[Frontend], When, &str, &str)] = &[
     (
         "kernels.attention.flash.partial_block",
         CHAT_SERVE,
-        When::ModelAxes,
+        When::Lfm2Dense,
         "8",
         TUNED_FLOW,
     ),
     (
         "kernels.fusion.norm_in_gemv",
         CHAT_SERVE,
-        When::ModelAxes,
+        When::Lfm2Dense,
         "true",
         TUNED_FLOW,
     ),
     (
         "models.lfm2.rows_kernels",
         CHAT_SERVE,
-        When::ModelAxes,
+        When::Lfm2Dense,
         "per-row",
         TUNED_FLOW,
     ),
     (
         "speculative.dspark.context_kv",
         CHAT_SERVE,
-        When::ModelAxes,
+        When::Lfm2Dense,
         "paged",
         TUNED_FLOW,
     ),
     (
         "context.kv.layout",
         CHAT_SERVE,
-        When::ModelAxes,
+        When::Lfm2Dense,
         "paged",
         TUNED_FLOW,
     ),
@@ -223,28 +223,28 @@ const PINNED_ROWS: &[(&str, &[Frontend], When, &str, &str)] = &[
     (
         "kernels.attention.impl",
         CHAT_SERVE,
-        When::ModelAxes,
+        When::Lfm2Dense,
         "flash",
         TUNED_FLOW,
     ),
     (
         "kernels.attention.qkv_layout",
         CHAT_SERVE,
-        When::ModelAxes,
+        When::Lfm2,
         "fused",
         TUNED_FLOW,
     ),
     (
         "kernels.fusion.conv",
         CHAT_SERVE,
-        When::ModelAxes,
+        When::Lfm2,
         "true",
         TUNED_FLOW,
     ),
     (
         "models.lfm2.conv_prefill_context",
         CHAT_SERVE,
-        When::ModelAxes,
+        When::Lfm2,
         "true",
         TUNED_FLOW,
     ),
@@ -279,7 +279,7 @@ const PINNED_ROWS: &[(&str, &[Frontend], When, &str, &str)] = &[
     (
         "decode.batched.cut_hold",
         &[Frontend::Serve, Frontend::Bench],
-        When::ModelAxes,
+        When::Lfm2Dense,
         "off",
         CUT_HOLD,
     ),
@@ -354,7 +354,7 @@ fn batch_for(r: &frontend::Row) -> Vec<&'static str> {
     match r.when {
         When::Batched | When::MetalBatched => vec!["--batch", "4"],
         // No `--model`: the LFM2 snapshot, whose family takes the model axes.
-        When::Always | When::Metal | When::ModelAxes | When::MetalSingle => vec![],
+        When::Always | When::Metal | When::Lfm2 | When::Lfm2Dense | When::MetalSingle => vec![],
         When::DsparkSingle => vec!["--dspark"],
         When::Qwen4Exp => vec!["--model", qwen4exp_placeholder()],
     }
@@ -426,7 +426,8 @@ fn each_front_end_resolves_its_own_defaults_through_the_command_line() {
                     && matches!(
                         r.when,
                         When::Metal
-                            | When::ModelAxes
+                            | When::Lfm2
+                            | When::Lfm2Dense
                             | When::DsparkSingle
                             | When::MetalSingle
                             | When::MetalBatched
@@ -486,7 +487,7 @@ fn the_speculative_body_at_one_sequence_keeps_the_in_place_kv() {
     let kv =
         |f: Frontend, argv: &[&str]| at(&resolve(Some(f), f.name(), argv, &none).unwrap(), key);
     let library = at(&EngineOptions::default(), key);
-    let metal = When::ModelAxes.holds(&resolve(Some(Frontend::Chat), "chat", &[], &none).unwrap());
+    let metal = When::Lfm2Dense.holds(&resolve(Some(Frontend::Chat), "chat", &[], &none).unwrap());
     let (in_place, paged) = if metal {
         (typed(key, "in-place"), typed(key, "paged"))
     } else {
@@ -759,7 +760,7 @@ fn a_named_preset_keeps_the_axes_it_sets() {
         o.model.apply_axes(&mut c).unwrap();
         (c.kv_append, c.attn_impl)
     };
-    let metal = When::ModelAxes.holds(&chat(&[]));
+    let metal = When::Lfm2Dense.holds(&chat(&[]));
     assert_eq!(
         arms(&chat(&[])),
         if metal {
@@ -1767,7 +1768,7 @@ fn serve_and_bench_hold_the_batched_cut_on_lfm2_by_default() {
         lfm2_dir.display().to_string(),
     );
     let metal =
-        When::ModelAxes.holds(&resolve(Some(Frontend::Serve), "serve", &[], &none).unwrap());
+        When::Lfm2Dense.holds(&resolve(Some(Frontend::Serve), "serve", &[], &none).unwrap());
     let (all, off) = (typed(key, "all"), typed(key, "off"));
     assert_eq!(
         at(&EngineOptions::default(), key),
@@ -1828,8 +1829,217 @@ fn serve_and_bench_hold_the_batched_cut_on_lfm2_by_default() {
     std::fs::remove_dir_all(&dir).unwrap();
     assert_eq!(
         frontend::describe(key).unwrap(),
-        "serve: all when the model's family takes the model axes (LFM2), on Metal (decision 71: \
-         was off), bench: all when the model's family takes the model axes (LFM2), on Metal \
+        "serve: all when the LFM2 engine serves the model dense at f16 (the representation its \
+         rows were measured on), on Metal (decision 71: was off), bench: all when the LFM2 engine \
+         serves the model dense at f16 (the representation its rows were measured on), on Metal \
          (decision 71: was off)"
     );
+}
+
+/// A tiny LFM2 checkpoint (safetensors) in `dir`, and the same weights as
+/// the LFM2 GGUF llama.cpp writes, its projections and table at each of
+/// `kinds` (`lloom::testing::lfm2_gguf`).
+fn tiny_lfm2_containers(
+    dir: &std::path::Path,
+    kinds: &[lloom_tensor::quantized::GgmlDType],
+) -> (std::path::PathBuf, Vec<std::path::PathBuf>) {
+    use lloom::models::lfm2_testing::Lfm2Tiny;
+    use lloom::testing::tiny::{TinyCheckpoint, TinyConfig, TinyFamily, Weights};
+    let mut cfg = Lfm2Tiny::template();
+    TinyConfig::set_axis(&mut cfg, "vocab_size", Lfm2Tiny::tokenizer().vocab_size());
+    TinyConfig::derive(&mut cfg);
+    std::fs::create_dir_all(dir.join("safetensors")).unwrap();
+    let model = TinyCheckpoint::<Lfm2Tiny>::new(cfg, Weights::default())
+        .write(&dir.join("safetensors"))
+        .unwrap();
+    let config: lloom::models::lfm2::Lfm2Config =
+        serde_json::from_slice(&std::fs::read(model.join("config.json")).unwrap()).unwrap();
+    let config = config.into_config(false);
+    let tensors = lloom_tensor::safetensors::load(
+        model.join("model.safetensors"),
+        &lloom_tensor::Device::Cpu,
+    )
+    .unwrap();
+    let ggufs = kinds
+        .iter()
+        .map(|&kind| {
+            let bytes =
+                lloom::testing::lfm2_gguf::write(&config, &tensors, kind, Vec::new()).unwrap();
+            let file = dir.join(format!("tiny-{kind:?}.gguf"));
+            std::fs::write(&file, bytes).unwrap();
+            file
+        })
+        .collect();
+    (model, ggufs)
+}
+
+/// Decision 80 item 4: the LFM2 rows key on the representation the LFM2
+/// engine builds, never the container. The safetensors directory is dense
+/// at f16 and takes every LFM2 row, as no `--model` does. A Q8_0 GGUF
+/// (blocks at f32) and an F16 GGUF (dense, and at f32, the GGUF compute
+/// dtype) take the rows whose arm the presets run on every representation
+/// (`When::Lfm2`), and every row measured on dense f16 alone
+/// (`When::Lfm2Dense`, `When::DsparkSingle`) is withheld: the library's
+/// value stands, and `withheld` names the row with the representation. The
+/// legacy engine takes none. A layer naming a withheld key keeps its value
+/// and is not listed.
+#[test]
+fn the_lfm2_rows_key_on_the_representation_not_the_container() {
+    use crate::frontend::{withheld, Checkpoint, Representation};
+    use lloom_tensor::quantized::GgmlDType;
+    use lloom_tensor::DType;
+    let none = BTreeMap::new();
+    let dir = std::env::temp_dir().join(format!("lloom-frontend-repr-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let (st, ggufs) = tiny_lfm2_containers(&dir, &[GgmlDType::Q8_0, GgmlDType::F16]);
+    let (q8, f16) = (&ggufs[0], &ggufs[1]);
+    let path = |p: &std::path::Path| p.display().to_string();
+    let (st_s, q8_s, f16_s) = (path(&st), path(q8), path(f16));
+
+    // What each container loads as, read before load.
+    let blocks_f32 = Representation {
+        blocks: true,
+        compute: DType::F32,
+    };
+    let dense_f32 = Representation {
+        blocks: false,
+        compute: DType::F32,
+    };
+    let repr = |p: &std::path::Path| crate::app::lfm2::representation(p, false).unwrap();
+    assert_eq!(repr(&st), Representation::MEASURED, "safetensors");
+    assert_eq!(repr(q8), blocks_f32, "Q8_0 GGUF");
+    assert_eq!(repr(f16), dense_f32, "F16 GGUF");
+    let ck = |argv: &[&str]| Checkpoint::of(&resolve(None, "chat", argv, &none).unwrap()).lfm2;
+    assert_eq!(ck(&[]), Some(Representation::MEASURED), "no --model");
+    assert_eq!(ck(&["--model", &st_s]), Some(Representation::MEASURED));
+    assert_eq!(ck(&["--model", &q8_s]), Some(blocks_f32));
+    assert_eq!(ck(&["--model", &f16_s]), Some(dense_f32));
+    assert_eq!(
+        ck(&["--model", &q8_s, "--gguf-engine", "legacy"]),
+        None,
+        "the legacy GGUF engine is not the LFM2 engine"
+    );
+
+    let metal = When::Metal.holds(&EngineOptions::default());
+    let measured_only = |w: When| matches!(w, When::Lfm2Dense | When::DsparkSingle);
+    for f in Frontend::ALL {
+        for batch in ["1", "4"] {
+            // `chat` takes no `--batch`; every front-end takes the key.
+            let sequences = format!("scheduler.max_sequences={batch}");
+            let at_model = |model: Option<&str>, extra: &[&str]| {
+                let mut argv = vec!["--set", sequences.as_str()];
+                if let Some(m) = model {
+                    argv.extend(["--model", m]);
+                }
+                argv.extend_from_slice(extra);
+                resolve(Some(f), f.name(), &argv, &none).unwrap()
+            };
+            let snapshot = at_model(None, &[]);
+            let dense = at_model(Some(st_s.as_str()), &[]);
+            let packed = at_model(Some(q8_s.as_str()), &[]);
+            let dense_gguf = at_model(Some(f16_s.as_str()), &[]);
+            let legacy = at_model(Some(q8_s.as_str()), &["--gguf-engine", "legacy"]);
+            for r in ROWS.iter().filter(|r| r.frontend == f) {
+                let k = r.key;
+                let ctx = format!("{} --batch {batch} {k} ({:?})", f.name(), r.when);
+                assert_eq!(at(&dense, k), at(&snapshot, k), "{ctx}: safetensors");
+                let lfm2_row = matches!(r.when, When::Lfm2) || measured_only(r.when);
+                if !lfm2_row {
+                    for (o, what) in [(&packed, "Q8_0"), (&dense_gguf, "F16"), (&legacy, "legacy")]
+                    {
+                        assert_eq!(at(o, k), at(&dense, k), "{ctx}: {what} GGUF");
+                    }
+                    continue;
+                }
+                let held_on_dense = r.when.holds(&dense);
+                let library = at(&EngineOptions::default(), k);
+                let row_value = typed(k, frontend::value(r));
+                let others_hold = |o: &EngineOptions| {
+                    rows_for_key(f, k)
+                        .filter(|x| x.when != r.when)
+                        .any(|x| x.when.holds(o))
+                };
+                for (o, what) in [(&packed, "Q8_0"), (&dense_gguf, "F16")] {
+                    if others_hold(o) {
+                        continue;
+                    }
+                    let want = match (r.when, metal && held_on_dense) {
+                        (When::Lfm2, true) => row_value.clone(),
+                        (When::Lfm2, false) => library.clone(),
+                        // Withheld: the library's value, whatever the
+                        // container.
+                        _ => library.clone(),
+                    };
+                    assert_eq!(at(o, k), want, "{ctx}: {what} GGUF");
+                }
+                if !others_hold(&legacy) {
+                    assert_eq!(at(&legacy, k), library, "{ctx}: legacy GGUF");
+                }
+            }
+            // Each withheld row named, with the representation; none on the
+            // safetensors checkpoint or the legacy engine.
+            let empty = BTreeSet::new();
+            let named_rows = |o: &EngineOptions| withheld(o, f, &empty, &empty);
+            assert_eq!(named_rows(&dense), None, "{} safetensors", f.name());
+            assert_eq!(named_rows(&legacy), None, "{} legacy", f.name());
+            for (o, rep) in [(&packed, "blocks f32"), (&dense_gguf, "dense f32")] {
+                let line = named_rows(o);
+                if !metal {
+                    assert_eq!(line, None, "{} off Metal", f.name());
+                    continue;
+                }
+                let line = line.unwrap_or_default();
+                assert!(
+                    line.contains(&format!("withheld on {rep} weights")),
+                    "{line}"
+                );
+                for r in ROWS
+                    .iter()
+                    .filter(|r| r.frontend == f && measured_only(r.when) && r.when.holds(&dense))
+                {
+                    assert!(
+                        line.contains(&format!("{}={}", r.key, frontend::value(r))),
+                        "{} --batch {batch}: {} not named in {line}",
+                        f.name(),
+                        r.key
+                    );
+                }
+                for r in ROWS
+                    .iter()
+                    .filter(|r| r.frontend == f && r.when == When::Lfm2)
+                {
+                    assert!(!line.contains(r.key), "{} is not withheld: {line}", r.key);
+                }
+            }
+        }
+    }
+    // Decision 71's value carries its number; a key a layer named is the
+    // layer's and is not listed.
+    if metal {
+        let o = resolve(
+            Some(Frontend::Serve),
+            "serve",
+            &["--model", &q8_s, "--batch", "4", "--attn", "flash"],
+            &none,
+        )
+        .unwrap();
+        let named = BTreeSet::from(["kernels.attention.impl".to_string()]);
+        let line = withheld(&o, Frontend::Serve, &named, &BTreeSet::new()).unwrap();
+        assert!(
+            line.contains("decode.batched.cut_hold=all (decision 71)"),
+            "{line}"
+        );
+        assert!(!line.contains("kernels.attention.impl"), "{line}");
+        assert_eq!(
+            at(&o, "kernels.attention.impl"),
+            typed("kernels.attention.impl", "flash")
+        );
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// The rows of `key` for `f`, in table order.
+fn rows_for_key(f: Frontend, key: &str) -> impl Iterator<Item = &'static frontend::Row> + '_ {
+    ROWS.iter().filter(move |r| r.frontend == f && r.key == key)
 }

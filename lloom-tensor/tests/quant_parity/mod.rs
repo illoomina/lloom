@@ -29,8 +29,9 @@
 use half::f16;
 use lloom_tensor::kernels::source::Source;
 use lloom_tensor::kernels::{KvQuantBits, SdpaDType, SdpaQuantParams, SdpaQuantWriteParams};
+use lloom_tensor::metal_backend::sampling::{Draw, GuardedSample, PreparedSampler, SampleGuard};
 use lloom_tensor::quantized::{GgmlDType, MoeArm, QStorage, QTensor};
-use lloom_tensor::{DType, Device, Result, Tensor};
+use lloom_tensor::{DType, Device, Result, Storage, Tensor};
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -133,6 +134,7 @@ pub enum Entry {
     MmId32,
     MmId16,
     GetRows,
+    GetRowsGuarded,
     DequantRowsF16,
     KvSdpa,
     KvSdpaSel,
@@ -153,6 +155,7 @@ impl Entry {
             Entry::MmId32 => "mul_mm_id",
             Entry::MmId16 => "mul_mm_id16",
             Entry::GetRows => "get_rows",
+            Entry::GetRowsGuarded => "get_rows_guarded",
             Entry::DequantRowsF16 => "dequant_rows_f16",
             Entry::KvSdpa => "kv_sdpa",
             Entry::KvSdpaSel => "kv_sdpa_sel",
@@ -284,8 +287,8 @@ impl Cell {
 /// The bound a cell's worst error must stay under, and why.
 ///
 /// **Elementwise entries are bit-identical** to the CPU arithmetic they
-/// mirror: `get_rows` and `dequant_rows_f16` against `to_float` (rounded to
-/// half for the latter), `kv_dequant` against `fma(code, scale, bias)`, the
+/// mirror: `get_rows` (plain and guarded) and `dequant_rows_f16` against
+/// `to_float` (rounded to half for the latter), `kv_dequant` against `fma(code, scale, bias)`, the
 /// form the kernel's `code * scale + bias` contracts to.
 ///
 /// **The reductions get one measured bound, [`TOL_NORM`].** They accumulate
@@ -324,7 +327,7 @@ pub fn tolerance(entry: Entry, _act: Act) -> (Unit, f64, &'static str) {
             TOL_NORM,
             "online softmax with fast::exp, against an f64 softmax",
         ),
-        Entry::GetRows | Entry::DequantRowsF16 | Entry::KvDequant => (
+        Entry::GetRows | Entry::GetRowsGuarded | Entry::DequantRowsF16 | Entry::KvDequant => (
             Unit::Ulp,
             0.0,
             "elementwise: the reference's own arithmetic",
@@ -423,6 +426,11 @@ pub fn parse_quantized(name: &str) -> Option<Key> {
         return cell(Entry::MulMm, s, a);
     }
     if let Some(r) = name.strip_prefix("kernel_get_rows_") {
+        // `kernel_get_rows_<fmt>_guarded` (#1036): its own entry, or the
+        // suffix reads as part of the format and no cell can run it (#1183).
+        if let Some(s) = r.strip_suffix("_guarded") {
+            return cell(Entry::GetRowsGuarded, s, Act::F32);
+        }
         return cell(Entry::GetRows, r, Act::F32);
     }
     if let Some(r) = name.strip_prefix("kernel_dequant_rows_f16_") {
@@ -631,6 +639,64 @@ fn to_f32(t: &Tensor) -> Result<Vec<f32>> {
 
 fn bits_of(t: &Tensor) -> Result<Vec<u32>> {
     Ok(to_f32(t)?.iter().map(|v| v.to_bits()).collect())
+}
+
+/// What a guarded embedding's output holds before the kernel runs: no
+/// fixture's decode produces it (every weight here is within a few units of
+/// zero), so a suppressed launch reads it back bit for bit.
+const SENTINEL: f32 = -99.0;
+
+/// One guarded sampler request over `vocab` tokens that draws exactly `ids`,
+/// its carrier handed to `f`. The scores are one-hot (0 at the named id, -inf
+/// elsewhere), so the draw is the ids whatever the uniform. `nan_row` puts a
+/// NaN in that row's scores: its status reads `Nan`, validation sets the
+/// request's sticky error, and every guarded consumer must then write
+/// nothing. The guard comes back with the work complete, for the caller to
+/// read the error from.
+fn guarded_draw(
+    dev: &Device,
+    vocab: usize,
+    ids: &[u32],
+    nan_row: Option<usize>,
+    f: impl FnOnce(&GuardedSample<'_>) -> Result<()>,
+) -> Result<SampleGuard> {
+    let md = dev.as_metal_device()?;
+    let rows = ids.len();
+    let mut scores = vec![f32::NEG_INFINITY; rows * vocab];
+    for (r, &id) in ids.iter().enumerate() {
+        scores[r * vocab + id as usize] = 0.0;
+    }
+    if let Some(r) = nan_row {
+        scores[r * vocab] = f32::NAN;
+    }
+    let scores = Tensor::from_vec(scores, (rows, vocab), dev)?;
+    let uniforms = Tensor::full(0.5f32, rows, dev)?;
+    let guard = SampleGuard::new(md)?;
+    let mut sampler = PreparedSampler::new(md, rows, vocab)?;
+    {
+        let (s, sl) = scores.storage_and_layout();
+        let (u, ul) = uniforms.storage_and_layout();
+        let (Storage::Metal(s), Storage::Metal(u)) = (&*s, &*u) else {
+            unreachable!("Metal tensors")
+        };
+        let tokens = sampler.draw(
+            &guard,
+            s,
+            sl,
+            1.0,
+            0,
+            1.0,
+            Draw::Multinomial {
+                uniforms: u,
+                layout: ul,
+            },
+        )?;
+        f(&tokens)?;
+    }
+    // The scores and uniforms are read by queued work: complete it before
+    // they drop, and so the guard's error is final when the caller reads it.
+    dev.synchronize()?;
+    Ok(guard)
 }
 
 // ---------------------------------------------------------------- metrics
@@ -1356,6 +1422,86 @@ impl Matrix {
         Ok(())
     }
 
+    /// The guarded embedding (`kernel_get_rows_<fmt>_guarded`, #1036): the
+    /// same decode as [`Self::run_get_rows`], reached the way production
+    /// reaches it (`QTensor::embedding_guarded_into`, `lloom`'s native
+    /// generation and `weight_repr`), with the ids a guarded sampler draw
+    /// produced: a `u32` device buffer the request's sticky error word guards.
+    ///
+    /// Two arms, both against absolute references:
+    /// - **valid**: one-hot scores make the draw name exactly `ids` (the last
+    ///   row, 36, among them), the request's error reads clear, and every
+    ///   output is the CPU `to_float` of its row, bit for bit;
+    /// - **suppressed**: a NaN score in the LAST row sets the request's error
+    ///   at validation, so the kernel must write nothing, the rows before the
+    ///   failing one included: every output keeps its sentinel's bits, and the
+    ///   error reads set (the positive control that the arm exercised the
+    ///   guard, not a draw that happened to succeed).
+    pub fn run_get_rows_guarded(&mut self, d: GgmlDType) -> Result<()> {
+        let key: Key = (Entry::GetRowsGuarded, stem(d).into(), Act::F32);
+        let rows = 37usize;
+        let kernel = format!("kernel_get_rows_{}_guarded", stem(d));
+        for (k, mag) in Self::kmags(d) {
+            let w = weight(&self.dev, d, &[rows, k], 23 + k as u32, mag)?;
+            for ids in [vec![36u32], vec![36, 0, 5, 36, 17]] {
+                for nan_row in [None, Some(ids.len() - 1)] {
+                    let arm = if nan_row.is_some() {
+                        "suppressed"
+                    } else {
+                        "valid"
+                    };
+                    let at = format!("{arm} ids={ids:?} k={k} mag={mag}");
+                    let out = Tensor::full(SENTINEL, (ids.len(), k), &self.dev)?;
+                    let (mut guard, census) = self.census(|| {
+                        guarded_draw(&self.dev, rows, &ids, nan_row, |tokens| {
+                            w.q.embedding_guarded_into(tokens, &out)
+                        })
+                    })?;
+                    self.check_census(&key, &at, &census, std::slice::from_ref(&kernel));
+                    let got = to_f32(&out)?;
+                    self.cell(&key).absorb(got.iter().map(|v| v.to_bits()));
+                    let error = guard.check_error();
+                    let mut worst = 0f64;
+                    let mut where_ = String::new();
+                    match (nan_row, error) {
+                        (None, Ok(true)) => {
+                            for (i, &id) in ids.iter().enumerate() {
+                                for j in 0..k {
+                                    let (g, r) = (got[i * k + j], w.w[id as usize * k + j]);
+                                    let u = ulps32(g, r);
+                                    if u > worst || where_.is_empty() {
+                                        worst = u;
+                                        where_ =
+                                            format!("{at} id={id} col={j} got={g:e} ref={r:e}");
+                                    }
+                                }
+                            }
+                        }
+                        (Some(_), Err(_)) => {
+                            for (i, g) in got.iter().enumerate() {
+                                let u = ulps32(*g, SENTINEL);
+                                if u > worst || where_.is_empty() {
+                                    worst = u;
+                                    where_ = format!(
+                                        "{at} row={} col={} got={g:e} ref={SENTINEL:e} (untouched)",
+                                        i / k,
+                                        i % k
+                                    );
+                                }
+                            }
+                        }
+                        (_, e) => {
+                            worst = f64::INFINITY;
+                            where_ = format!("{at}: the request's error read {e:?}");
+                        }
+                    }
+                    self.cell(&key).record(worst, &where_);
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub fn run_dequant_rows_f16(&mut self, d: GgmlDType) -> Result<()> {
         let key: Key = (Entry::DequantRowsF16, stem(d).into(), Act::F16);
         for (k, mag) in Self::kmags(d) {
@@ -1744,6 +1890,7 @@ impl Matrix {
                 Entry::MmId32 => self.run_mm_id(d, 32)?,
                 Entry::MmId16 => self.run_mm_id(d, 16)?,
                 Entry::GetRows => self.run_get_rows(d)?,
+                Entry::GetRowsGuarded => self.run_get_rows_guarded(d)?,
                 Entry::DequantRowsF16 => {
                     self.run_dequant_rows_f16(d)?;
                     if entries.contains(&Entry::DequantMm) {
@@ -1825,6 +1972,19 @@ impl Matrix {
                     let w = weight(&self.dev, d, &[4, k], 1, 1.0)?;
                     let ids = Tensor::from_vec(vec![1u32], 1, &self.dev)?;
                     self.census(|| w.q.embedding(&ids))
+                }
+                Entry::GetRowsGuarded => {
+                    if act == Act::F16 {
+                        return Err(lloom_tensor::Error::Msg("no activation".into()));
+                    }
+                    let w = weight(&self.dev, d, &[4, k], 1, 1.0)?;
+                    let out = Tensor::full(SENTINEL, (1, k), &self.dev)?;
+                    self.census(|| {
+                        guarded_draw(&self.dev, 4, &[1], None, |tokens| {
+                            w.q.embedding_guarded_into(tokens, &out)
+                        })?;
+                        Ok(out.clone())
+                    })
                 }
                 Entry::DequantRowsF16 => Err(lloom_tensor::Error::Msg(
                     "not probed: no tensor-level entry".into(),

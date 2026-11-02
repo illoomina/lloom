@@ -131,6 +131,9 @@ const fn kind(
 /// discriminant; a test pins the order). The last column is the row axis's
 /// ceilings, plain and routed (`rows_max`, `rows_max_routed`; the dense rows
 /// read 1 whatever it says), from `measurements/issue-942-rows-axis.md` §3.
+/// Q4_K/Q5_K/Q6_K's plain ceiling of 2 is set on the end-to-end evidence
+/// (Qwen3.6-27B + MTP ×1.09, `measurements/issue-942-core.md` §5) against
+/// their isolated kernel timings (§3, §3a), by decision 106; `fast` only.
 #[rustfmt::skip]
 const KINDS: [QuantKind; 25] = [
     kind(GgmlDType::Q4_0,   "q4_0",    32,  18, MulMv::Quant("kernel_mul_mv_q4_0"),    Some("kernel_mul_mm_q4_0_f32"),    Some(("kernel_get_rows_q4_0", "kernel_get_rows_q4_0_guarded")),    false, (1, 1)),
@@ -141,9 +144,9 @@ const KINDS: [QuantKind; 25] = [
     kind(GgmlDType::Q8_1,   "q8_1",    32,  36, MulMv::None,                           None,                              None,                            false, (1, 1)),
     kind(GgmlDType::Q2K,    "q2_K",   256,  84, MulMv::Quant("kernel_mul_mv_q2_K"),    Some("kernel_mul_mm_q2_K_f32"),    Some(("kernel_get_rows_q2_K", "kernel_get_rows_q2_K_guarded")),    false, (8, 1)),
     kind(GgmlDType::Q3K,    "q3_K",   256, 110, MulMv::Quant("kernel_mul_mv_q3_K"),    Some("kernel_mul_mm_q3_K_f32"),    Some(("kernel_get_rows_q3_K", "kernel_get_rows_q3_K_guarded")),    false, (1, 1)),
-    kind(GgmlDType::Q4K,    "q4_K",   256, 144, MulMv::Quant("kernel_mul_mv_q4_K"),    Some("kernel_mul_mm_q4_K_f32"),    Some(("kernel_get_rows_q4_K", "kernel_get_rows_q4_K_guarded")),    false, (1, 1)),
-    kind(GgmlDType::Q5K,    "q5_K",   256, 176, MulMv::Quant("kernel_mul_mv_q5_K"),    Some("kernel_mul_mm_q5_K_f32"),    Some(("kernel_get_rows_q5_K", "kernel_get_rows_q5_K_guarded")),    false, (1, 1)),
-    kind(GgmlDType::Q6K,    "q6_K",   256, 210, MulMv::Quant("kernel_mul_mv_q6_K"),    Some("kernel_mul_mm_q6_K_f32"),    Some(("kernel_get_rows_q6_K", "kernel_get_rows_q6_K_guarded")),    false, (1, 1)),
+    kind(GgmlDType::Q4K,    "q4_K",   256, 144, MulMv::Quant("kernel_mul_mv_q4_K"),    Some("kernel_mul_mm_q4_K_f32"),    Some(("kernel_get_rows_q4_K", "kernel_get_rows_q4_K_guarded")),    false, (2, 1)),
+    kind(GgmlDType::Q5K,    "q5_K",   256, 176, MulMv::Quant("kernel_mul_mv_q5_K"),    Some("kernel_mul_mm_q5_K_f32"),    Some(("kernel_get_rows_q5_K", "kernel_get_rows_q5_K_guarded")),    false, (2, 1)),
+    kind(GgmlDType::Q6K,    "q6_K",   256, 210, MulMv::Quant("kernel_mul_mv_q6_K"),    Some("kernel_mul_mm_q6_K_f32"),    Some(("kernel_get_rows_q6_K", "kernel_get_rows_q6_K_guarded")),    false, (2, 1)),
     kind(GgmlDType::Q8K,    "q8_K",   256, 292, MulMv::None,                           None,                              None,                            false, (1, 1)),
     kind(GgmlDType::F16,    "f16",      1,   2, MulMv::Dense("kernel_mul_mv_f16_f32"), Some("kernel_mul_mm_f16_f32"),     Some(("kernel_get_rows_f16", "kernel_get_rows_f16_guarded")),     false, (1, 1)),
     kind(GgmlDType::F32,    "f32",      1,   4, MulMv::Dense("kernel_mul_mv_f32_f32"), Some("kernel_mul_mm_f32_f32"),     Some(("kernel_get_rows_f32", "kernel_get_rows_f32_guarded")),     false, (1, 1)),
@@ -564,9 +567,34 @@ pub const MV_ROWS_CAPACITIES: [usize; 3] = [2, 4, 8];
 /// launch takes it up to the largest capacity's rows: past that a slot's
 /// threadgroup would run most of the planes one after another.
 pub fn mv_rows_capacity(dtype: GgmlDType, m: usize, routed: bool) -> usize {
+    // The axis's switch and the contract are read only where the ceiling
+    // admits more than one row, as before the route resolved it.
+    let rows_max = if dtype.kind().mul_mv_quant() {
+        rows_max_override()
+    } else {
+        None
+    };
+    if m < 2 || mv_rows_capacity_under(dtype, m, routed, true, rows_max) < 2 {
+        return 1;
+    }
+    mv_rows_capacity_under(dtype, m, routed, mv_rows_axis_on(), rows_max)
+}
+
+/// [`mv_rows_capacity`] as a pure function of the policy it reads: `axis`
+/// is the row axis being on under `fast` ([`mv_rows_axis_on`]), `rows_max`
+/// the override of every kind's ceiling ([`mv_rows_max_override`]). The
+/// projection route (`quantized::route`) resolves the plain matmul-vec's
+/// capacity through it.
+pub fn mv_rows_capacity_under(
+    dtype: GgmlDType,
+    m: usize,
+    routed: bool,
+    axis: bool,
+    rows_max: Option<usize>,
+) -> usize {
     let kind = dtype.kind();
     let ceiling = if kind.mul_mv_quant() {
-        rows_max_override().unwrap_or(if routed {
+        rows_max.unwrap_or(if routed {
             kind.rows_max_routed
         } else {
             kind.rows_max
@@ -574,7 +602,7 @@ pub fn mv_rows_capacity(dtype: GgmlDType, m: usize, routed: bool) -> usize {
     } else {
         1
     };
-    if m < 2 || ceiling < 2 || !rows_on() || !crate::tuning::contract().is_fast() {
+    if m < 2 || ceiling < 2 || !axis {
         return 1;
     }
     if routed && m > MV_ROWS_CAPACITIES[MV_ROWS_CAPACITIES.len() - 1] {
@@ -586,6 +614,17 @@ pub fn mv_rows_capacity(dtype: GgmlDType, m: usize, routed: bool) -> usize {
         .copied()
         .find(|&c| c >= want)
         .unwrap_or(MV_ROWS_CAPACITIES[MV_ROWS_CAPACITIES.len() - 1])
+}
+
+/// The row axis is on for this process: `qmv.rows` under `fast`;
+/// `deterministic` never takes it.
+pub fn mv_rows_axis_on() -> bool {
+    rows_on() && crate::tuning::contract().is_fast()
+}
+
+/// The process's override of every kind's row ceiling (`qmv.rows_max`).
+pub fn mv_rows_max_override() -> Option<usize> {
+    rows_max_override()
 }
 
 /// `qmv.rows_max` (`LLOOM_QMV_ROWS_MAX`, read once; or
@@ -748,6 +787,61 @@ pub unsafe fn call_quantized_matmul_mv_t(
     dst_offset: usize,
     dst: &Buffer,
 ) -> Result<(), MetalKernelError> {
+    // SAFETY: the caller's contract, passed through.
+    unsafe {
+        call_quantized_matmul_mv_rows_t(
+            device,
+            ep,
+            kernels,
+            dtype,
+            triple,
+            (b, m, n, k),
+            mv_rows_capacity(dtype, m, false),
+            lhs,
+            lhs_offset,
+            rhs,
+            dst_offset,
+            dst,
+        )
+    }
+}
+
+/// Whether the kind's plain matmul-vec is instantiated at row capacity
+/// `nr1`: every kind at 1, the quantized cores at [`MV_ROWS_CAPACITIES`].
+pub fn mv_rows_instantiated(dtype: GgmlDType, nr1: usize) -> bool {
+    nr1 == 1 || (dtype.kind().mul_mv_quant() && MV_ROWS_CAPACITIES.contains(&nr1))
+}
+
+/// [`call_quantized_matmul_mv_t`] at the row capacity `nr1` the caller
+/// resolved (`quantized::route`): 1 is the one-row core over each row, 2, 4
+/// or 8 the core at that capacity (`_r<nr1>`). A capacity the kind does not
+/// instantiate is refused by name.
+///
+/// # Safety
+/// As [`call_quantized_matmul_mv_t`].
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn call_quantized_matmul_mv_rows_t(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    dtype: GgmlDType,
+    triple: GemvTriple,
+    (b, m, n, k): (usize, usize, usize, usize),
+    nr1: usize,
+    lhs: &Buffer,
+    lhs_offset: usize,
+    rhs: &Buffer,
+    dst_offset: usize,
+    dst: &Buffer,
+) -> Result<(), MetalKernelError> {
+    if !mv_rows_instantiated(dtype, nr1) {
+        return Err(MetalKernelError::UnsupportedDTypeForOp(Box::new(
+            UnsupportedDTypeForOp {
+                dtype: "a row capacity this kind's matmul-vec is not instantiated at",
+                op: "quantized matmul-vec",
+            },
+        )));
+    }
     // Everything is in reverse
     let ne00 = k as i64;
     let ne01 = n as i64;
@@ -829,7 +923,6 @@ pub unsafe fn call_quantized_matmul_mv_t(
     // The row axis: `nr1` activation rows a weight read (`_r<nr1>`, the
     // core at that capacity, at the core's own geometry), the grid's second
     // axis over the row groups.
-    let nr1 = mv_rows_capacity(dtype, m, false);
     let name = rows_name(name, nr1, false);
     let thread_groups_count = MTLSize {
         width: thread_groups_count.width,
@@ -2200,6 +2293,50 @@ mod arm_tests {
                 "{msg}"
             );
         }
+    }
+
+    /// The plain matmul-vec is dispatched only at a capacity the kind
+    /// instantiates; any other is refused before a pipeline is resolved.
+    #[test]
+    fn a_row_capacity_the_kind_lacks_is_refused() {
+        for (d, nr1, want) in [
+            (GgmlDType::Q4K, 1, true),
+            (GgmlDType::Q4K, 2, true),
+            (GgmlDType::Q4K, 8, true),
+            (GgmlDType::Q2K, 4, true),
+            (GgmlDType::Q4K, 3, false),
+            (GgmlDType::Q4K, 16, false),
+            (GgmlDType::F16, 1, true),
+            (GgmlDType::F16, 2, false),
+            (GgmlDType::F32, 4, false),
+        ] {
+            assert_eq!(mv_rows_instantiated(d, nr1), want, "{d:?} at {nr1}");
+        }
+        let (device, kernels, commands, buf) = setup();
+        let encoder = commands.command_encoder().unwrap();
+        // SAFETY: the dispatch is refused before anything is encoded.
+        let err = unsafe {
+            call_quantized_matmul_mv_rows_t(
+                &device,
+                &encoder,
+                &kernels,
+                GgmlDType::Q4K,
+                GemvTriple::F32F32F32,
+                (1, 3, 32, 256),
+                3,
+                &buf,
+                0,
+                &buf,
+                0,
+                &buf,
+            )
+        }
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("a row capacity this kind's matmul-vec is not instantiated at"),
+            "{err}"
+        );
     }
 
     /// The float arms pass the device check here, which registers `f16` on

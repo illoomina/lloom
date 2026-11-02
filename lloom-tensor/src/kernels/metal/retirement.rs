@@ -355,9 +355,11 @@ impl Metal4Completions {
             let Some((sequence, record)) = next else {
                 return Ok(());
             };
+            let mut runs = 0;
             record
                 .run_callbacks(
                     |captures, owners, feedback| {
+                        runs = captures.hook_runs;
                         captures.run(self.queue, feedback, self.hook.get().map(|h| &**h));
                         self.frontier
                             .lock()
@@ -368,6 +370,9 @@ impl Metal4Completions {
                     || self.wake.notify(),
                 )
                 .map_err(RetirementError::Mailbox)?;
+            if let Some(hook) = self.hook.get() {
+                hook.retire(runs);
+            }
         }
     }
 }
@@ -427,5 +432,74 @@ mod tests {
         // queued later record remains retained, never called or synthesized.
         assert!(service.manual_pass());
         assert!(!service.manual_pass());
+    }
+
+    /// A record retires on the completion hook only after its whole callback
+    /// stage returned: an abandoned final's owed epoch, published while the
+    /// record's callback still runs, is neither marked nor settled until
+    /// then, and is settled by that record's own retire.
+    #[test]
+    fn a_record_retires_only_after_its_callbacks_returned() {
+        let service = crate::retirement_service::HostRetirementService::manual();
+        let failure = Arc::new(FailureSignal::default());
+        let wake = Arc::new(Wake::default());
+        let registry = Registry::manual(failure.clone(), service.clone());
+        let core = Arc::new(Metal4Completions::new(1, failure.clone(), wake.clone()));
+        let clock = Arc::new(super::super::GpuClock::new());
+        let latch = Arc::new(super::super::commands::CommandBufferFailure::default());
+        let hook = Arc::new(super::super::completion_hook::CompletionHook::new(
+            clock.clone(),
+            latch.clone(),
+        ));
+        core.install_hook(hook.clone()).unwrap();
+        let entered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let released = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut captures = {
+            let (entered, released) = (entered.clone(), released.clone());
+            Captures::new(vec![Box::new(move |_| {
+                entered.store(true, Ordering::SeqCst);
+                while !released.load(Ordering::SeqCst) {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+            })])
+        };
+        captures.hook_runs = 1;
+        let record = registry
+            .prepare(captures, NativeOwners::vacant(), |_| Ok(()))
+            .unwrap_or_else(|_| panic!("prepare"));
+        record.begin_handoff().unwrap();
+        record.handoff_returned().unwrap();
+        clock.commit_epoch(); // the record's own epoch
+        clock.commit_epoch(); // one held behind it and cancelled
+        let feedback = metal4::Feedback {
+            error: None,
+            start: 0.,
+            end: 1.,
+        };
+        let running = {
+            let core = core.clone();
+            std::thread::spawn(move || core.publish(0, record, feedback).unwrap())
+        };
+        let t0 = std::time::Instant::now();
+        while !entered.load(Ordering::SeqCst) {
+            assert!(t0.elapsed().as_secs() < 5, "the callback never ran");
+            std::thread::yield_now();
+        }
+        hook.abandon(1, 2).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(
+            !hook.abandonment_settled(),
+            "settled while the record's callback runs"
+        );
+        assert_eq!(clock.completed_count().0, 0, "marked while it runs");
+        released.store(true, Ordering::SeqCst);
+        running.join().unwrap();
+        assert!(
+            hook.abandonment_settled(),
+            "the record's retire did not settle"
+        );
+        assert_eq!(clock.completed_count().0, 2);
+        assert!(latch.check().is_ok());
+        assert!(failure.get().is_none());
     }
 }

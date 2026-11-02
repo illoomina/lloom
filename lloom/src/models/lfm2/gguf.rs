@@ -120,6 +120,45 @@ impl GgufCheckpoint {
     pub fn names(&self) -> &HashMap<String, String> {
         &self.names
     }
+
+    /// The storage kinds `ct` holds the projections and the token table in
+    /// (`f16`, `q8_0`, …), each with its count: the tensors
+    /// [`super::Model::weight_kinds`] counts once built, read off the header
+    /// before any weight is. A packed kind stays that kind in the model; a
+    /// float kind is dequantized at the compute dtype by the load.
+    pub fn stored_kinds(&self, ct: &Content) -> std::collections::BTreeMap<String, usize> {
+        let mut kinds = std::collections::BTreeMap::new();
+        for (engine, stored) in &self.names {
+            if !is_projection_or_table(engine) {
+                continue;
+            }
+            if let Some(info) = ct.tensor_infos.get(stored) {
+                let kind = format!("{:?}", info.ggml_dtype).to_lowercase();
+                *kinds.entry(kind).or_insert(0) += 1;
+            }
+        }
+        kinds
+    }
+}
+
+/// Whether `engine`, a name this model asks for, is a projection or the
+/// token table: what `Model::weight_kinds` counts. The norms and the conv
+/// taps are not.
+fn is_projection_or_table(engine: &str) -> bool {
+    const SUFFIXES: [&str; 9] = [
+        ".self_attn.q_proj.weight",
+        ".self_attn.k_proj.weight",
+        ".self_attn.v_proj.weight",
+        ".self_attn.out_proj.weight",
+        ".conv.in_proj.weight",
+        ".conv.out_proj.weight",
+        ".feed_forward.w1.weight",
+        ".feed_forward.w2.weight",
+        ".feed_forward.w3.weight",
+    ];
+    engine == "model.embed_tokens.weight"
+        || engine == "lm_head.weight"
+        || SUFFIXES.iter().any(|s| engine.ends_with(s))
 }
 
 /// The names `models::lfm2` asks for (the HF checkpoint's), each mapped to

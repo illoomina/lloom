@@ -446,6 +446,29 @@ fn a_batch_refused_inside_a_verify_window_is_reset<P: Profile>(
     }
     assert_eq!(served.model.failed(), 0, "nothing was injected");
 
+    // The prompts extending exactly what the refused batch logged, one
+    // token each: a sequence handed back with its window open and its
+    // position past its log would extend that log at the wrong position.
+    let on_the_log: Vec<Vec<u32>> = near
+        .iter()
+        .enumerate()
+        .map(|(i, c)| {
+            let mut n = c.clone();
+            n.push(40 + i as u32);
+            n
+        })
+        .collect();
+    let extended = round(&served.handle, &on_the_log, false, 1);
+    let fresh = round(&served.handle, &on_the_log, true, 1);
+    for (i, (got, want)) in extended.iter().zip(&fresh).enumerate() {
+        eprintln!("ARM {arm} row {i}: on the refused log {got:?} cold {want:?}");
+        assert_eq!(
+            got.as_ref().ok(),
+            Some(want.as_ref().expect("the cold reference is served")),
+            "{arm} row {i}: the request extending the refused batch's log"
+        );
+    }
+
     let next: Vec<Vec<u32>> = cached
         .iter()
         .enumerate()

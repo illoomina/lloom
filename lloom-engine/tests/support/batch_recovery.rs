@@ -543,6 +543,9 @@ pub(super) fn round<M: BatchedCausalLM, E>(
         .collect()
 }
 
+/// A served row's tokens, the prepare's action and the positions it kept.
+pub(super) type Reused = (Vec<u32>, ReuseAction, usize);
+
 /// [`round`], each served row with how its sequence was reused: the
 /// prepare's action and the positions it kept.
 pub(super) fn round_reuse<M: BatchedCausalLM, E>(
@@ -550,7 +553,7 @@ pub(super) fn round_reuse<M: BatchedCausalLM, E>(
     prompts: &[Vec<u32>],
     cold: bool,
     max: usize,
-) -> Vec<std::result::Result<(Vec<u32>, ReuseAction, usize), String>> {
+) -> Vec<std::result::Result<Reused, String>> {
     submit_together(handle, prompts, cold, max)
         .iter()
         .map(|rx| outcome_done(rx).map(|d| (d.tokens, d.reuse, d.reused)))

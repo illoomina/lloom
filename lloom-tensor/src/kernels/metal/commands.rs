@@ -4921,6 +4921,128 @@ mod owner_submission_tests {
         owner_wait_handoff_control(OwnerWaitControl::ProducerFailure);
     }
 
+    /// Metal 4's unknown return at the real handoff, after a real owner wait
+    /// reached Busy: the producer pauses after its native commit (`HoldReturn`)
+    /// and unwinds there (`UnknownReturn`), so the failure is published to the
+    /// Metal 4 queue signal, not the `Commands` latch. The owner wait refuses
+    /// without a synthetic completion or a second native call, and the combined
+    /// recording authority sees the failure. Unlike the shared fixture, DATA is
+    /// not held pending: Metal 4 does not queue-wait on a host-signalled event.
+    #[test]
+    fn metal4_unknown_return_after_real_busy_is_seen_by_the_queue_authority() {
+        let device = crate::MetalDevice::new(0).unwrap();
+        let commands = device.commands();
+        let cb = pending(commands);
+        if !cb.is_metal4() {
+            eprintln!("NOT_APPLICABLE metal4 unknown-return handoff requires actual Metal 4");
+            commands.ensure_completed(&cb).unwrap();
+            return;
+        }
+        let raw = device
+            .metal_device()
+            .new_buffer(256, super::super::MTLResourceOptions::StorageModeShared)
+            .unwrap();
+        // A failed/unknown handoff never authorizes dropping these owners.
+        let _pins = RetainUnknown(Some((device.clone(), cb.clone(), raw.clone())));
+        let marker = {
+            let mut blit = commands.blit_command_encoder().unwrap();
+            // SAFETY: pins survive every refusal/assertion unwind; the bytes
+            // are never read after the unknown handoff.
+            unsafe { blit.fill_buffer(&raw, (0, 256), 0x4c) }.unwrap();
+            let marker = blit.recording_receipt().1;
+            assert!(marker.cb.same_recording(&cb));
+            blit.finish().unwrap();
+            marker
+        };
+        let control = commands.core.submission_control.clone();
+        let before = control.native_calls.load(Ordering::Acquire);
+        control.arm(submission_test::Fault::HoldReturn);
+        let producer = std::cell::RefCell::new(None::<std::thread::JoinHandle<_>>);
+        let waiter = std::cell::RefCell::new(None::<std::thread::JoinHandle<_>>);
+        let produced = std::cell::RefCell::new(None);
+        let waited = std::cell::RefCell::new(None);
+        // Armed BEFORE any thread can reach the native handoff: the pause is
+        // always released and both threads joined, whatever unwinds first.
+        let cleanup = ReleaseBeforeWait {
+            release: || control.release(),
+            wait: || {
+                if let Some(t) = producer.borrow_mut().take() {
+                    *produced.borrow_mut() = Some(t.join());
+                }
+                if let Some(t) = waiter.borrow_mut().take() {
+                    *waited.borrow_mut() = Some(t.join());
+                }
+            },
+        };
+        let owner = commands.clone();
+        *producer.borrow_mut() = Some(std::thread::spawn(move || owner.flush_marker()));
+        let paused = control.wait_for_pause();
+        let calls_while_paused = control.native_calls.load(Ordering::Acquire);
+        let owner = commands.clone();
+        let target = marker.cb.clone();
+        *waiter.borrow_mut() = Some(std::thread::spawn(move || owner.ensure_completed(&target)));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while control.owner_wait_busy.load(Ordering::Acquire) == 0
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let attempted_real_busy = control.owner_wait_busy.load(Ordering::Acquire) > 0;
+        // The real wait has observed Busy before the producer unwinds.
+        control.arm(submission_test::Fault::UnknownReturn);
+        drop(cleanup);
+        let producer_result = produced.into_inner().unwrap();
+        let owner_result = waited.into_inner().unwrap().unwrap();
+        assert!(paused, "real producer-handoff pause did not engage");
+        assert_eq!(
+            calls_while_paused,
+            before + 1,
+            "the pause is not after the native commit"
+        );
+        assert!(
+            attempted_real_busy,
+            "owner never observed the exact real Busy boundary"
+        );
+        let panic = producer_result.expect_err("unknown return must unwind at actual handoff");
+        assert_eq!(
+            panic.downcast_ref::<&str>(),
+            Some(&"controlled unknown return publication")
+        );
+        assert!(
+            owner_result.is_err(),
+            "owner join fabricated success after an unknown return"
+        );
+        assert!(
+            !matches!(
+                owner_result,
+                Err(MetalKernelError::RecordingAdmission(
+                    crate::command_lifecycle::LifecycleError::Busy
+                ))
+            ),
+            "owner join returned the original transient Busy instead of the failure"
+        );
+        assert!(
+            commands.check_recording_failure().is_err(),
+            "the combined recording authority missed the Metal 4 queue failure"
+        );
+        assert_eq!(
+            commands.clock().completed_count().0,
+            0,
+            "failed handoff fabricated completion"
+        );
+        assert!(commands.recover_pending_submission(&cb).is_err());
+        assert_eq!(
+            control.native_calls.load(Ordering::Acquire) - before,
+            1,
+            "failed owner was submitted again"
+        );
+        eprintln!(
+            "OWNER_HANDOFF_UNKNOWN_RETURN actual_api={} native_calls=1 completed=0 commands_latch_failed={} custody_retained=true",
+            commands.actual_command_api_for_test(),
+            commands.check_failed().is_err()
+        );
+    }
+
     #[test]
     fn owner_wait_release_before_arrival_has_no_join_or_duplicate_submission() {
         let device = crate::MetalDevice::new(0).unwrap();

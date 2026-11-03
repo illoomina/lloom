@@ -44,6 +44,21 @@ pub struct Policy {
     pub dequant_from: usize,
     /// The steel GEMM reads the dequantised scratch (`qmm.dequant_gemm`).
     pub dequant_steel: bool,
+    /// The matmul-vec's row capacity policy.
+    pub rows: RowsPolicy,
+}
+
+/// What decides the matmul-vec's row capacity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RowsPolicy {
+    /// The process's: `qmv.rows`, `qmv.rows_max` and the contract, read
+    /// only when the kind's ceiling admits more than one row
+    /// ([`crate::kernels::mv_rows_capacity`]), so a one-row request reads
+    /// no contract.
+    Process,
+    /// Stated: `axis` is the row axis on under `fast`, `rows_max` the
+    /// override of every kind's ceiling.
+    Fixed { axis: bool, rows_max: Option<usize> },
 }
 
 impl Policy {
@@ -53,6 +68,7 @@ impl Policy {
             mv_rows_max: super::metal::QMetalStorage::qmv_rows_max(),
             dequant_from: super::metal::dequant_once_from(),
             dequant_steel: super::metal::dequant_gemm_steel(),
+            rows: RowsPolicy::Process,
         }
     }
 }
@@ -60,9 +76,11 @@ impl Policy {
 /// The kernel family a request takes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Route {
-    /// `kernel_mul_mv_<kind>_<triple>` over each row (the row axis's
-    /// capacity is the dispatch's, per kind).
-    Matvec(GemvTriple),
+    /// `kernel_mul_mv_<kind>_<triple>` with `rows` activation rows a weight
+    /// read: 1 the one-row core over each row, 2, 4 or 8 the core at that
+    /// capacity (`_r<rows>`, the kind's measured ceiling, `docs/tuning.md`
+    /// §13.5w).
+    Matvec { triple: GemvTriple, rows: usize },
     /// `kernel_mul_mm_<kind>_<triple>`, unpacking the weight per tile.
     Gemm(GemvTriple),
     /// `kernel_dequant_rows_f16_<kind>` into a scratch, then the quantized
@@ -129,14 +147,23 @@ pub fn resolve(w: Weight, s: Spec, p: Policy) -> Result<Route, Refused> {
                 need: "a rank-2 weight (the matmul-vec takes one matrix)",
             });
         }
-        return match s.act {
-            DType::F32 => Ok(Route::Matvec(GemvTriple::F32F32F32)),
-            DType::F16 if w.kind.has_gemv_triple() => Ok(Route::Matvec(GemvTriple::F16F32F16)),
-            _ => Err(Refused {
-                cell: cell(w, s),
-                need: "a matmul-vec arm reading this activation dtype",
-            }),
+        let triple = match s.act {
+            DType::F32 => GemvTriple::F32F32F32,
+            DType::F16 if w.kind.has_gemv_triple() => GemvTriple::F16F32F16,
+            _ => {
+                return Err(Refused {
+                    cell: cell(w, s),
+                    need: "a matmul-vec arm reading this activation dtype",
+                })
+            }
         };
+        let rows = match p.rows {
+            RowsPolicy::Process => crate::kernels::mv_rows_capacity(w.kind, s.rows, false),
+            RowsPolicy::Fixed { axis, rows_max } => {
+                crate::kernels::mv_rows_capacity_under(w.kind, s.rows, false, axis, rows_max)
+            }
+        };
+        return Ok(Route::Matvec { triple, rows });
     }
     if w.kind.kind().mul_mm.is_none() {
         return Err(Refused {

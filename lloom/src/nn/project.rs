@@ -119,6 +119,16 @@ impl std::fmt::Display for Resolved {
         }
         match self.route {
             Route::Dense(dt) => write!(f, "dense {}", dt.as_str()),
+            // The matmul-vec at a capacity of more than one row is the
+            // `_r<rows>` core; at one row, the plain core.
+            #[cfg(feature = "metal")]
+            Route::Packed(lloom_tensor::quantized::route::Route::Matvec { triple, rows: 1 }) => {
+                write!(f, "Matvec({triple:?})")
+            }
+            #[cfg(feature = "metal")]
+            Route::Packed(lloom_tensor::quantized::route::Route::Matvec { triple, rows }) => {
+                write!(f, "Matvec_r{rows}({triple:?})")
+            }
             #[cfg(feature = "metal")]
             Route::Packed(r) => write!(f, "{r:?}"),
             Route::PackedHost => write!(f, "packed (host)"),
@@ -150,9 +160,31 @@ pub fn kind(w: &Weight) -> String {
     }
 }
 
+/// The tuning a packed route reads: the quantized resolver's policy on
+/// Metal, nothing elsewhere.
+#[cfg(feature = "metal")]
+pub type Policy = lloom_tensor::quantized::route::Policy;
+#[cfg(not(feature = "metal"))]
+pub type Policy = ();
+
+/// The process's [`Policy`], read where the dispatch reads it.
+#[cfg(feature = "metal")]
+pub fn current_policy() -> Policy {
+    lloom_tensor::quantized::route::Policy::current()
+}
+
+/// The process's [`Policy`]: off Metal no route reads one.
+#[cfg(not(feature = "metal"))]
+pub fn current_policy() -> Policy {}
+
 /// The route `spec` takes over `w` for an activation arriving at `input`.
 /// Pure: it allocates no buffer and dispatches nothing.
 pub fn resolve(w: &Weight, spec: &Spec, input: DType) -> Result<Resolved> {
+    resolve_under(w, spec, input, current_policy())
+}
+
+/// [`resolve`] under `policy` rather than the process's.
+pub fn resolve_under(w: &Weight, spec: &Spec, input: DType, policy: Policy) -> Result<Resolved> {
     let t = spec.triple;
     if t.acc != DType::F32 {
         return Err(refuse(w, spec, "every projection route accumulates in f32"));
@@ -186,13 +218,18 @@ pub fn resolve(w: &Weight, spec: &Spec, input: DType) -> Result<Resolved> {
             Route::Dequantized(DType::F32)
         }
         Weight::Blocks(QMatMul::TensorF16(_)) => Route::Dequantized(DType::F16),
-        Weight::Blocks(QMatMul::QTensor(q)) => packed_route(q, w, spec)?,
+        Weight::Blocks(QMatMul::QTensor(q)) => packed_route(q, w, spec, policy)?,
     };
     Ok(Resolved { cast_from, route })
 }
 
 #[cfg(feature = "metal")]
-fn packed_route(q: &lloom_tensor::quantized::QTensor, w: &Weight, spec: &Spec) -> Result<Route> {
+fn packed_route(
+    q: &lloom_tensor::quantized::QTensor,
+    w: &Weight,
+    spec: &Spec,
+    policy: Policy,
+) -> Result<Route> {
     use lloom_tensor::quantized::route;
     if !q.device().is_metal() {
         return Ok(Route::PackedHost);
@@ -208,14 +245,19 @@ fn packed_route(q: &lloom_tensor::quantized::QTensor, w: &Weight, spec: &Spec) -
             rows: spec.rows,
             row_per_batch: spec.rows == 1,
         },
-        route::Policy::current(),
+        policy,
     )
     .map(Route::Packed)
     .map_err(|r| refuse(w, spec, &r.to_string()))
 }
 
 #[cfg(not(feature = "metal"))]
-fn packed_route(_: &lloom_tensor::quantized::QTensor, _: &Weight, _: &Spec) -> Result<Route> {
+fn packed_route(
+    _: &lloom_tensor::quantized::QTensor,
+    _: &Weight,
+    _: &Spec,
+    _: Policy,
+) -> Result<Route> {
     Ok(Route::PackedHost)
 }
 
@@ -269,17 +311,23 @@ pub fn rows_of(x: &Tensor, k: usize) -> usize {
 }
 
 /// The routes `triple` takes over `w` across the row bands a model runs
-/// (one row, the first GEMM row, the dequantise-once threshold), for the
-/// load line and `/health`. Bands that resolve alike are merged.
+/// (every row count the matmul-vec serves, the first GEMM row, the
+/// dequantise-once threshold), for the load line and `/health`. Bands that
+/// resolve alike are merged.
 pub fn describe(w: &Weight, triple: Triple, input: DType) -> String {
+    describe_under(w, triple, input, current_policy())
+}
+
+/// [`describe`] under `policy` rather than the process's.
+pub fn describe_under(w: &Weight, triple: Triple, input: DType, policy: Policy) -> String {
     let mut bands: Vec<(usize, String)> = Vec::new();
-    for rows in band_starts() {
+    for rows in band_starts(policy) {
         let spec = Spec {
             triple,
             rows,
             epilogue: Epilogue::Store,
         };
-        let r = match resolve(w, &spec, input) {
+        let r = match resolve_under(w, &spec, input, policy) {
             Ok(r) => r.to_string(),
             Err(e) => format!("refused: {e}"),
         };
@@ -294,10 +342,11 @@ pub fn describe(w: &Weight, triple: Triple, input: DType) -> String {
         .join(", ")
 }
 
+/// Every row count the matmul-vec serves (its capacity can change at each),
+/// the first GEMM row and the dequantise-once threshold.
 #[cfg(feature = "metal")]
-fn band_starts() -> Vec<usize> {
-    let p = lloom_tensor::quantized::route::Policy::current();
-    let mut v = vec![1, p.mv_rows_max + 1];
+fn band_starts(p: Policy) -> Vec<usize> {
+    let mut v: Vec<usize> = (1..=p.mv_rows_max + 1).collect();
     if p.dequant_from > p.mv_rows_max + 1 {
         v.push(p.dequant_from);
     }
@@ -305,6 +354,6 @@ fn band_starts() -> Vec<usize> {
 }
 
 #[cfg(not(feature = "metal"))]
-fn band_starts() -> Vec<usize> {
+fn band_starts(_: Policy) -> Vec<usize> {
     vec![1]
 }

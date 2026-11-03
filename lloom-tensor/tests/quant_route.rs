@@ -5,18 +5,23 @@
 //! name.
 #![cfg(feature = "metal")]
 use lloom_tensor::kernels::{GemvTriple, GgmlDType};
-use lloom_tensor::quantized::route::{resolve, Policy, Route, Spec, Weight};
+use lloom_tensor::quantized::route::{resolve, Policy, Route, RowsPolicy, Spec, Weight};
 use lloom_tensor::DType;
 
 const SHIPPED: Policy = Policy {
     mv_rows_max: 8,
     dequant_from: 64,
     dequant_steel: false,
+    rows: RowsPolicy::Fixed {
+        axis: true,
+        rows_max: None,
+    },
 };
 
 #[derive(Debug, PartialEq)]
 enum Want {
-    Mv(GemvTriple),
+    /// The matmul-vec at this triple and row capacity.
+    Mv(GemvTriple, usize),
     Gemm(GemvTriple),
     DequantGemm(GemvTriple),
     DequantSteel,
@@ -44,7 +49,7 @@ fn check(
         p,
     );
     let ok = match (&got, &want) {
-        (Ok(Route::Matvec(t)), Want::Mv(w)) => t == w,
+        (Ok(Route::Matvec { triple, rows }), Want::Mv(w, r)) => triple == w && rows == r,
         (Ok(Route::Gemm(t)), Want::Gemm(w)) => t == w,
         (Ok(Route::DequantOnceGemm(t)), Want::DequantGemm(w)) => t == w,
         (Ok(Route::DequantOnceSteel), Want::DequantSteel) => true,
@@ -63,14 +68,14 @@ fn every_cell_resolves_as_tabled() {
     use Want::*;
     let p = SHIPPED;
     // The decode step: one row a batch takes the matmul-vec at any batch.
-    check(GgmlDType::Q4K, DType::F32, 1, true, 2, 2560, p, Mv(F));
-    check(GgmlDType::Q4K, DType::F16, 1, true, 2, 2560, p, Mv(H));
-    check(GgmlDType::Q4K, DType::F16, 512, true, 2, 2560, p, Mv(H));
-    check(GgmlDType::Q8_0, DType::F16, 1, true, 2, 2048, p, Mv(H));
-    check(GgmlDType::Q6K, DType::F32, 4, false, 2, 5120, p, Mv(F));
+    check(GgmlDType::Q4K, DType::F32, 1, true, 2, 2560, p, Mv(F, 1));
+    check(GgmlDType::Q4K, DType::F16, 1, true, 2, 2560, p, Mv(H, 1));
+    check(GgmlDType::Q4K, DType::F16, 512, true, 2, 2560, p, Mv(H, 2));
+    check(GgmlDType::Q8_0, DType::F16, 1, true, 2, 2048, p, Mv(H, 1));
+    check(GgmlDType::Q6K, DType::F32, 4, false, 2, 5120, p, Mv(F, 2));
     // The matmul-vec's last row and the GEMM's first, at both triples.
-    check(GgmlDType::Q4K, DType::F32, 8, false, 2, 2560, p, Mv(F));
-    check(GgmlDType::Q4K, DType::F16, 8, false, 2, 2560, p, Mv(H));
+    check(GgmlDType::Q4K, DType::F32, 8, false, 2, 2560, p, Mv(F, 2));
+    check(GgmlDType::Q4K, DType::F16, 8, false, 2, 2560, p, Mv(H, 2));
     check(GgmlDType::Q4K, DType::F32, 9, false, 2, 2560, p, Gemm(F));
     check(GgmlDType::Q4K, DType::F16, 9, false, 2, 2560, p, Gemm(H));
     check(GgmlDType::Q4K, DType::F32, 63, false, 2, 2560, p, Gemm(F));
@@ -272,7 +277,7 @@ fn the_policy_moves_the_cells_it_names() {
         2,
         2560,
         mm_from_2,
-        Mv(F),
+        Mv(F, 2),
     );
 }
 
@@ -396,4 +401,169 @@ fn every_kind_resolves_or_refuses() {
             "{kind:?}"
         );
     }
+}
+
+/// The matmul-vec's row capacity, per cell: the kind table's measured
+/// ceilings (`docs/tuning.md` §13.5w: Q2_K 8, Q8_0 2, the K-quants 1), the
+/// smallest instantiated capacity (2, 4, 8) at or above the rows, at both
+/// triples; one row a weight read with the axis off (`deterministic`), on a
+/// dense kind, and under an override of 1; every kind's capacities under an
+/// override of 8.
+#[test]
+fn the_row_capacity_resolves_as_tabled() {
+    use GemvTriple::{F16F32F16 as H, F32F32F32 as F};
+    use Want::*;
+    let p = SHIPPED;
+    check(GgmlDType::Q2K, DType::F32, 1, true, 2, 2560, p, Mv(F, 1));
+    check(GgmlDType::Q2K, DType::F32, 2, false, 2, 2560, p, Mv(F, 2));
+    check(GgmlDType::Q2K, DType::F32, 3, false, 2, 2560, p, Mv(F, 4));
+    check(GgmlDType::Q2K, DType::F16, 4, false, 2, 2560, p, Mv(H, 4));
+    check(GgmlDType::Q2K, DType::F16, 5, false, 2, 2560, p, Mv(H, 8));
+    check(GgmlDType::Q2K, DType::F32, 8, false, 2, 2560, p, Mv(F, 8));
+    check(GgmlDType::Q2K, DType::F32, 512, true, 2, 2560, p, Mv(F, 8));
+    check(GgmlDType::Q8_0, DType::F32, 2, false, 2, 2048, p, Mv(F, 2));
+    check(GgmlDType::Q8_0, DType::F16, 6, false, 2, 2048, p, Mv(H, 2));
+    check(GgmlDType::Q4K, DType::F32, 2, true, 2, 2560, p, Mv(F, 2));
+    check(GgmlDType::Q5K, DType::F16, 8, false, 2, 5120, p, Mv(H, 2));
+    check(GgmlDType::IQ4XS, DType::F32, 4, false, 2, 4096, p, Mv(F, 1));
+    let off = Policy {
+        rows: RowsPolicy::Fixed {
+            axis: false,
+            rows_max: None,
+        },
+        ..SHIPPED
+    };
+    check(GgmlDType::Q2K, DType::F32, 4, false, 2, 2560, off, Mv(F, 1));
+    check(
+        GgmlDType::Q8_0,
+        DType::F16,
+        2,
+        false,
+        2,
+        2048,
+        off,
+        Mv(H, 1),
+    );
+    let all8 = Policy {
+        rows: RowsPolicy::Fixed {
+            axis: true,
+            rows_max: Some(8),
+        },
+        ..SHIPPED
+    };
+    check(
+        GgmlDType::Q4K,
+        DType::F32,
+        2,
+        false,
+        2,
+        2560,
+        all8,
+        Mv(F, 2),
+    );
+    check(
+        GgmlDType::Q4K,
+        DType::F32,
+        3,
+        false,
+        2,
+        2560,
+        all8,
+        Mv(F, 4),
+    );
+    check(
+        GgmlDType::Q6K,
+        DType::F16,
+        6,
+        false,
+        2,
+        5120,
+        all8,
+        Mv(H, 8),
+    );
+    check(
+        GgmlDType::IQ3XXS,
+        DType::F16,
+        8,
+        true,
+        2,
+        4096,
+        all8,
+        Mv(H, 8),
+    );
+    check(
+        GgmlDType::F16,
+        DType::F32,
+        4,
+        false,
+        2,
+        2560,
+        all8,
+        Mv(F, 1),
+    );
+    let one = Policy {
+        rows: RowsPolicy::Fixed {
+            axis: true,
+            rows_max: Some(1),
+        },
+        ..SHIPPED
+    };
+    check(GgmlDType::Q2K, DType::F32, 8, false, 2, 2560, one, Mv(F, 1));
+}
+
+/// The process's policy resolves the capacity the dispatch takes:
+/// [`RowsPolicy::Process`] agrees, cell by cell, with the same policy stated
+/// from this process's switches, for every kind with a matmul-vec, rows
+/// 1–9 and both triples. The dispatch outside the route
+/// (`call_quantized_matmul_mv_t`) reads `mv_rows_capacity`, which this
+/// pins to the route's answer.
+#[test]
+fn the_process_policy_is_the_dispatchs() {
+    let process = Policy::current();
+    assert_eq!(process.rows, RowsPolicy::Process);
+    let stated = Policy {
+        rows: RowsPolicy::Fixed {
+            axis: lloom_tensor::kernels::mv_rows_axis_on(),
+            rows_max: lloom_tensor::kernels::mv_rows_max_override(),
+        },
+        ..process
+    };
+    let mut cells = 0;
+    let mut axis_cells = 0;
+    for kind in GgmlDType::ALL {
+        for act in [DType::F32, DType::F16] {
+            for rows in 1..=9 {
+                let w = Weight {
+                    kind,
+                    rank: 2,
+                    k: 4096,
+                };
+                let s = Spec {
+                    act,
+                    rows,
+                    row_per_batch: true,
+                };
+                let (a, b) = (resolve(w, s, process), resolve(w, s, stated));
+                assert_eq!(a, b, "{kind:?} × {act:?} × {rows} rows");
+                if let Ok(Route::Matvec { rows: cap, .. }) = a {
+                    assert_eq!(
+                        cap,
+                        lloom_tensor::kernels::mv_rows_capacity(kind, rows, false),
+                        "{kind:?} × {act:?} × {rows} rows"
+                    );
+                    cells += 1;
+                    if cap > 1 {
+                        axis_cells += 1;
+                    }
+                }
+            }
+        }
+    }
+    // Non-vacuity: the cells compared include matmul-vec cells, and on the
+    // default tuning (`fast`, `qmv.rows` on) some of them take the axis.
+    assert!(cells > 0);
+    assert!(
+        axis_cells > 0,
+        "no cell took the row axis: the comparison never reached a capacity above 1"
+    );
 }

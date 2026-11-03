@@ -137,23 +137,56 @@ mod metal {
 
     /// The shipped policy's bands (`qmv.mm_from` 9, `qmm.dequant_from` 64)
     /// over a Q8_0 weight, written out: the stream's projection at f16, the
-    /// head declared f32 over an f16 stream, and the f32 stream.
+    /// head declared f32 over an f16 stream, and the f32 stream. With the
+    /// matmul-vec's row axis off (`deterministic`) every row up to the GEMM
+    /// takes the one-row core; with it on (`fast`, `qmv.rows`) two to eight
+    /// rows take the `_r2` core, Q8_0's ceiling. Every row count is probed,
+    /// so a band the axis opens is described.
     #[test]
     fn each_row_band_resolves_as_written() -> Result<()> {
+        use lloom::nn::project::{current_policy, describe_under};
+        use lloom_tensor::quantized::route::RowsPolicy;
         let dev = Device::new_metal(0)?;
         let w = blocks(&dev)?;
+        let shipped = current_policy();
+        assert_eq!((shipped.mv_rows_max, shipped.dequant_from), (8, 64));
+        let axis = |on: bool| lloom::nn::project::Policy {
+            rows: RowsPolicy::Fixed {
+                axis: on,
+                rows_max: None,
+            },
+            ..shipped
+        };
+        let (off, on) = (axis(false), axis(true));
         assert_eq!(
-            describe(&w, Triple::F16, DType::F16),
+            describe_under(&w, Triple::F16, DType::F16, off),
             "rows 1+ Matvec(F16F32F16), rows 9+ Gemm(F16F32F16), rows 64+ DequantOnceGemm(F16F32F16)"
         );
         assert_eq!(
-            describe(&w, Triple::F32, DType::F16),
+            describe_under(&w, Triple::F32, DType::F16, off),
             "rows 1+ cast f16 + Matvec(F32F32F32), rows 9+ cast f16 + Gemm(F32F32F32), \
              rows 64+ cast f16 + DequantOnceGemm(F32F32F32)"
         );
         assert_eq!(
-            describe(&w, Triple::F32, DType::F32),
+            describe_under(&w, Triple::F32, DType::F32, off),
             "rows 1+ Matvec(F32F32F32), rows 9+ Gemm(F32F32F32), rows 64+ DequantOnceGemm(F32F32F32)"
+        );
+        assert_eq!(
+            describe_under(&w, Triple::F16, DType::F16, on),
+            "rows 1+ Matvec(F16F32F16), rows 2+ Matvec_r2(F16F32F16), rows 9+ Gemm(F16F32F16), \
+             rows 64+ DequantOnceGemm(F16F32F16)"
+        );
+        assert_eq!(
+            describe_under(&w, Triple::F32, DType::F16, on),
+            "rows 1+ cast f16 + Matvec(F32F32F32), rows 2+ cast f16 + Matvec_r2(F32F32F32), \
+             rows 9+ cast f16 + Gemm(F32F32F32), rows 64+ cast f16 + DequantOnceGemm(F32F32F32)"
+        );
+        // The process's policy is one of the two.
+        let process = describe(&w, Triple::F16, DType::F16);
+        assert!(
+            process == describe_under(&w, Triple::F16, DType::F16, off)
+                || process == describe_under(&w, Triple::F16, DType::F16, on),
+            "{process}"
         );
         let bf16 = Triple::at(DType::BF16);
         assert!(

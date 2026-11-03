@@ -101,9 +101,6 @@ pub(crate) unsafe trait CleanupInbox: Send + Sync {
 /// lock. It returns after bounded progress; a pending dependency must notify the
 /// service Wake when its predicate can change. Native commit may run only after
 /// exclusive recording ownership is established, without acquiring a replacement.
-/// One exception, which never waits: a final owner whose recording a
-/// cancellation abandoned takes one free native slot for an empty marker, and
-/// while none is free it is pending, the freed slot notifying the Wake.
 /// Every owner remains inside this registered inbox across native entry, error,
 /// and unwind. Unknown handoff or failed callbacks cannot become terminal by
 /// poisoning. An error is retained and observable, not a successful drain.
@@ -425,6 +422,21 @@ static SHARED_SERVICE: OnceLock<Result<Arc<HostRetirementService>, ServiceError>
 pub(crate) fn stop_shared_worker(deadline: Instant) -> Option<bool> {
     match SHARED_SERVICE.get() {
         Some(Ok(service)) => Some(service.stop_worker(deadline)),
+        _ => None,
+    }
+}
+
+/// Whether the shared retirement worker is parked, idle, on its wake: `None`
+/// when no worker was started. A worker's first park sets up parking_lot's
+/// per-thread data, which allocates on the worker (and can grow the table
+/// every parking thread shares), whenever the worker is first scheduled. A
+/// test that counts allocations process-wide waits for this before opening
+/// its window, so that setup lands before the window rather than in it
+/// (#1205). Behind `fuzzing`; nothing shipping enables it.
+#[cfg(all(feature = "metal", feature = "fuzzing"))]
+pub fn retirement_worker_parked() -> Option<bool> {
+    match SHARED_SERVICE.get() {
+        Some(Ok(service)) => Some(service.wake.test_is_parked()),
         _ => None,
     }
 }

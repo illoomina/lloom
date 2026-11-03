@@ -78,21 +78,13 @@ impl MetalStorage {
         {
             crate::bail!("sampling_multinomial: uniform range exceeds storage");
         }
-        // The selector remains the single score-layout validator and K stage.
-        // Preflight row/uniform agreement before it allocates or encodes.
-        let vocab = *layout.dims().last().ok_or_else(|| {
-            crate::Error::Msg("sampling_multinomial: no vocabulary dimension".into())
-        })?;
-        let elements = layout.dims().iter().rev().try_fold(1usize, |n, &d| {
-            n.checked_mul(d).ok_or_else(|| {
-                crate::Error::Msg("sampling_multinomial: score count overflow".into())
-            })
-        })?;
-        if vocab == 0 || uniform_count != elements / vocab {
+        // The selector's geometry check is the single score-layout validator.
+        // Preflight row/uniform agreement before anything allocates or encodes.
+        let (vocab, elements, rows, score_offset, status_elements) =
+            self.sampling_topk_geometry(layout)?;
+        if uniform_count != rows {
             crate::bail!("sampling_multinomial: invalid row/uniform geometry");
         }
-        let (kept, selection_status) = self.sampling_topk_mask(layout, k)?;
-        let rows = uniform_count;
         let device = self.device();
         let allocate = |count: usize, dtype, label| {
             let buffer = device
@@ -102,35 +94,56 @@ impl MetalStorage {
                 .build()?;
             Self::new_allocated(buffer, device.clone(), count, dtype)
         };
+        let words = crate::kernels::kernels::sampling_topk::sampling_work_words(rows, vocab)
+            .ok_or_else(|| crate::Error::Msg("sampling_multinomial: scratch overflow".into()))?;
+        let work = allocate(words, DType::U32, "sampling_work")?;
+        let scratch_ids = allocate(elements, DType::U32, "sampling_scratch_ids")?;
+        let selection_status = allocate(status_elements, DType::U32, "sampling_topk_status")?;
         let weights = allocate(elements, DType::F32, "sampling_weights")?;
         let support = allocate(elements, DType::U32, "sampling_support")?;
         let ids = allocate(rows, DType::U32, "sampling_private_ids")?;
         let status = allocate(bytes(rows)?, DType::U32, "sampling_private_status")?;
+        let uniform_offset = bytes(uniform_start)?;
         if rows != 0 {
             let encoder = device.command_encoder()?;
-            // SAFETY: the selector validated the full score span/geometry;
+            // SAFETY: the geometry check validated the full score span;
             // uniform spans and device match were checked before encoding.
-            // Fresh outputs are disjoint, storage/pool retains reuse authority
-            // through completion; the input K/status stay live across the bind.
+            // Fresh outputs and scratch are disjoint, storage/pool retains
+            // reuse authority through completion.
             unsafe {
-                crate::kernels::kernels::sampling_topk::call_sampling_multinomial(
+                crate::kernels::kernels::sampling_topk::call_sampling_select(
                     device.metal_device(),
                     &encoder,
                     device.kernels(),
-                    (self.buffer(), bytes(layout.start_offset())?),
+                    (self.buffer(), score_offset),
                     rows as u32,
                     vocab as u32,
-                    inv_t,
-                    p as f32,
+                    k.min(vocab) as u32,
                     u32::from(p != 1.0),
-                    (uniforms.buffer(), bytes(uniform_start)?),
-                    kept.buffer(),
+                    work.buffer(),
+                    scratch_ids.buffer(),
                     selection_status.buffer(),
-                    weights.buffer(),
-                    support.buffer(),
-                    ids.buffer(),
-                    status.buffer(),
                 )
+                .and_then(|()| {
+                    crate::kernels::kernels::sampling_topk::call_sampling_multinomial(
+                        device.metal_device(),
+                        &encoder,
+                        device.kernels(),
+                        (self.buffer(), score_offset),
+                        rows as u32,
+                        vocab as u32,
+                        inv_t,
+                        p as f32,
+                        u32::from(p != 1.0),
+                        (uniforms.buffer(), uniform_offset),
+                        work.buffer(),
+                        scratch_ids.buffer(),
+                        weights.buffer(),
+                        support.buffer(),
+                        ids.buffer(),
+                        status.buffer(),
+                    )
+                })
             }
             .map_err(MetalError::from)?;
         }
@@ -214,7 +227,6 @@ impl MetalStorage {
         }
         // All scalar/layout/device/address products are checked before the K
         // stage can allocate/encode; its status size check covers outputs too.
-        let (kept, selection_status) = self.sampling_topk_mask(layout, k)?;
         let device = self.device();
         let allocate = |count: usize, dtype, label| {
             let buffer = device
@@ -224,6 +236,13 @@ impl MetalStorage {
                 .build()?;
             Self::new_allocated(buffer, device.clone(), count, dtype)
         };
+        let words = crate::kernels::kernels::sampling_topk::sampling_work_words(rows, vocab)
+            .ok_or_else(|| {
+                crate::Error::Msg("sampling_filtered_gumbel_f32: scratch overflow".into())
+            })?;
+        let work = allocate(words, DType::U32, "sampling_work")?;
+        let scratch_ids = allocate(elements, DType::U32, "sampling_scratch_ids")?;
+        let selection_status = allocate(status_elements, DType::U32, "sampling_topk_status")?;
         let weights = allocate(elements, DType::F32, "sampling_weights")?;
         let support = allocate(elements, DType::U32, "sampling_support")?;
         let ids = allocate(rows, DType::U32, "sampling_private_ids")?;
@@ -231,28 +250,43 @@ impl MetalStorage {
         if rows != 0 {
             let encoder = device.command_encoder()?;
             // SAFETY: complete spans/devices/geometry checked before any
-            // allocation; K/status are these unchanged rows' selector output.
-            // Fresh disjoint outputs and inputs retain existing pool custody
-            // through completion/capture/replay; no public ID is constructed.
+            // allocation. Fresh disjoint outputs, scratch and inputs retain
+            // existing pool custody through completion/capture/replay; no
+            // public ID is constructed.
             unsafe {
-                crate::kernels::kernels::sampling_topk::call_sampling_filtered_gumbel_f32(
+                crate::kernels::kernels::sampling_topk::call_sampling_select(
                     device.metal_device(),
                     &encoder,
                     device.kernels(),
                     (self.buffer(), score_offset),
                     rows as u32,
                     vocab as u32,
-                    inv_t,
-                    p as f32,
+                    k.min(vocab) as u32,
                     u32::from(p != 1.0),
-                    (variates.buffer(), variate_offset),
-                    kept.buffer(),
+                    work.buffer(),
+                    scratch_ids.buffer(),
                     selection_status.buffer(),
-                    weights.buffer(),
-                    support.buffer(),
-                    ids.buffer(),
-                    status.buffer(),
                 )
+                .and_then(|()| {
+                    crate::kernels::kernels::sampling_topk::call_sampling_filtered_gumbel_f32(
+                        device.metal_device(),
+                        &encoder,
+                        device.kernels(),
+                        (self.buffer(), score_offset),
+                        rows as u32,
+                        vocab as u32,
+                        inv_t,
+                        p as f32,
+                        u32::from(p != 1.0),
+                        (variates.buffer(), variate_offset),
+                        work.buffer(),
+                        scratch_ids.buffer(),
+                        weights.buffer(),
+                        support.buffer(),
+                        ids.buffer(),
+                        status.buffer(),
+                    )
+                })
             }
             .map_err(MetalError::from)?;
         }
@@ -267,14 +301,17 @@ impl MetalStorage {
 }
 
 pub(super) mod guard;
+mod host_scratch;
 pub(super) mod prepared;
+pub(super) mod prepared_slots;
 pub(super) mod readback;
 mod result;
-mod host_scratch;
-pub(super) mod prepared_slots;
 
 #[cfg(test)]
 mod tests;
 
 #[cfg(test)]
 mod gumbel_tests;
+
+#[cfg(test)]
+mod timing_tests;

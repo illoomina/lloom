@@ -232,6 +232,22 @@ impl<'a> AsMut<BlitCommandEncoder> for BlitCommandsGuard<'a> {
 }
 
 impl BlitCommandsGuard<'_> {
+    /// The exact recording this blit encodes into, pinned while the guard
+    /// excludes a cut: the blit twin of [`CommandsGuard::recording_marker`].
+    pub(crate) fn recording_marker(&self) -> Result<CommandMarker, MetalKernelError> {
+        let cb = self
+            ._guard
+            .current
+            .recording()
+            .ok_or(MetalKernelError::QueueUnavailable(
+                "a blit marker requires a recording",
+            ))?;
+        Ok(CommandMarker {
+            cb: cb.clone(),
+            signalled: None,
+        })
+    }
+
     pub(crate) fn retain_namespace(
         &mut self,
         owner: crate::metal_backend::device_retirement::NamespaceOwner,
@@ -373,6 +389,12 @@ impl CommandMarker {
         self.cb.status().0 >= MTLCommandBufferStatus::Completed.0
     }
 
+    /// Whether the marker's buffer has been handed to the queue: committed,
+    /// running, or finished. False for a recording still open or held.
+    pub fn is_submitted(&self) -> bool {
+        self.cb.status().0 >= MTLCommandBufferStatus::Committed.0
+    }
+
     /// Nonblocking known-error observation; false also includes pending work.
     pub fn is_failed(&self) -> bool {
         self.cb.status() == MTLCommandBufferStatus::Error
@@ -439,8 +461,8 @@ struct EntryState {
     /// A signal was encoded into the current recording since its cut.
     signals_since_cut: bool,
     /// Epochs taken by held recordings that were cancelled before their
-    /// commit: the next commit's completion completes them too.
-    owed_epochs: u32,
+    /// commit: a later commit's completion completes them (`produced::Owed`).
+    owed_epochs: produced::Owed,
     /// The current recording was cancelled and no replacement was free.
     current_abandoned: bool,
     /// Emptied after-commit lists, their storage kept: a held recording
@@ -486,7 +508,7 @@ impl EntryState {
             gate: produced::Gate::default(),
             held: std::collections::VecDeque::new(),
             signals_since_cut: false,
-            owed_epochs: 0,
+            owed_epochs: produced::Owed::default(),
             current_abandoned: false,
             spare_after: Vec::new(),
         }
@@ -502,8 +524,6 @@ struct CommandsCore {
     submission_control: Arc<submission_test::Control>,
     #[cfg(test)]
     deny_replacement: AtomicBool,
-    #[cfg(test)]
-    deny_final_slot: AtomicBool,
     #[cfg(test)]
     deny_preflight: AtomicBool,
     #[cfg(test)]
@@ -1141,8 +1161,6 @@ impl Commands {
             state: CachePadded::new(Censused::new(parking_lot::Mutex::new(state))),
             #[cfg(test)]
             deny_replacement: AtomicBool::new(false),
-            #[cfg(test)]
-            deny_final_slot: AtomicBool::new(false),
             #[cfg(test)]
             deny_preflight: AtomicBool::new(false),
             #[cfg(test)]
@@ -2778,58 +2796,6 @@ impl CommandsCore {
         }
     }
 
-    /// The final owner's stand-in for a current recording a cancellation
-    /// abandoned: one empty recording, owned by the final submission, taken
-    /// without waiting. `false` while a Metal 4 queue has no free slot; the
-    /// freed slot then notifies the retirement service. A Metal 3 buffer is
-    /// created as every cancellation's re-homed signal is, under the held
-    /// cap's bound on live buffers (`docs/invariants.md` §15.1q). The
-    /// abandoned recording leaves with the final captures.
-    fn replace_abandoned_for_final(
-        &self,
-        state: &mut EntryState,
-        captures: &mut lifecycle::FinalCaptures,
-    ) -> Result<bool, MetalKernelError> {
-        #[cfg(test)]
-        if self.deny_final_slot.load(Ordering::Acquire) {
-            return Ok(false);
-        }
-        if let Some(queue) = &self.modern_queue {
-            if !queue.free_slot_or_wait() {
-                return Ok(false);
-            }
-        }
-        captures.cancelled.try_reserve(1).map_err(|_| {
-            MetalKernelError::QueueUnavailable("final cancelled-recording custody refused")
-        })?;
-        let credit = state
-            .binding_credits
-            .iter_mut()
-            .find(|slot| slot.is_some())
-            .and_then(Option::take);
-        // No other acquirer exists once the last handle is gone, so the slot
-        // seen free above is there; a park would be an ownership violation.
-        let next = self.create_recording(credit, &mut |_, _| {
-            Err(MetalKernelError::QueueUnavailable(
-                "final marker found no slot after one was free",
-            ))
-        })?;
-        match state.current.replace_recording(next) {
-            Ok(old) => captures.cancelled.push(old),
-            Err(unused) => {
-                captures.cancelled.push(unused);
-                return Err(MetalKernelError::QueueUnavailable(
-                    "abandoned final recording carries a receipt",
-                ));
-            }
-        }
-        state.current_abandoned = false;
-        state.namespace.reset();
-        self.compute_count.store(0, Ordering::Release);
-        self.replacement_pending.store(false, Ordering::Release);
-        Ok(true)
-    }
-
     /// The state lock, refused inside one of this queue's own completion
     /// callbacks (`completion_scope`).
     fn lock_entry(&self) -> Result<EntryGuard<'_>, MetalKernelError> {
@@ -2869,6 +2835,8 @@ impl CommandsCore {
     fn close_compute(&self, state: &mut EntryGuard<'_>) -> Result<(), MetalKernelError> {
         let (state, custody) = state.parts_mut();
         if let Some(encoder) = state.current_encoder.as_ref() {
+            #[cfg(test)]
+            self.submission_control.close()?;
             let destination =
                 custody
                     .compute
@@ -2929,6 +2897,7 @@ impl CommandsCore {
         let (state, custody) = state.parts_mut();
         let state: &mut EntryState = state;
         let owed_epochs = &mut state.owed_epochs;
+        let held_ahead = state.held.len();
         let mut published = false;
         let submitted = state
             .current
@@ -2950,8 +2919,9 @@ impl CommandsCore {
                     clock: &self.clock,
                 };
                 // Epochs of held recordings cancelled before their commit
-                // complete with this one (`produced.rs`).
-                let owed = std::mem::take(owed_epochs);
+                // complete with this one (`produced::Owed`); an ordinary
+                // commit runs with nothing held.
+                let runs = owed_epochs.runs_for(None, held_ahead);
                 let receipt = self.submit_owned_recording(
                     authority,
                     Some(destination),
@@ -2959,11 +2929,11 @@ impl CommandsCore {
                     timed,
                     t_end_enc,
                     None,
-                    1 + owed,
+                    runs,
                 );
-                match &receipt {
-                    Ok(_) => published = true,
-                    Err(_) => *owed_epochs += owed,
+                if receipt.is_ok() {
+                    owed_epochs.settle(runs);
+                    published = true;
                 }
                 receipt
             })
@@ -3343,11 +3313,9 @@ impl lifecycle::FinalCore for CommandsCore {
         &self,
         wake: Arc<crate::completion_wake::Wake>,
     ) -> Result<(), MetalKernelError> {
-        if let Some(queue) = &self.modern_queue {
-            queue
-                .install_slot_wake(wake.clone())
-                .map_err(|_| MetalKernelError::QueueUnavailable("foreign Metal 4 slot Wake"))?;
-        }
+        self.hook
+            .install_final_wake(wake.clone())
+            .map_err(|_| MetalKernelError::QueueUnavailable("foreign final completion Wake"))?;
         self.residency_set
             .install_retirement_wake(wake)
             .map_err(|_| MetalKernelError::QueueUnavailable("foreign residency retirement Wake"))
@@ -3372,25 +3340,6 @@ impl lifecycle::FinalCore for CommandsCore {
         if self.encoder_domain.has_external_handles() {
             return Ok(false);
         }
-        // A bound queue's final marker spends a preflight credit; refill one
-        // before EntryState, as every recording operation does. Declared
-        // before the guard, so a raced surplus drops after it unlocks.
-        let mut refill = None;
-        if let Some(bank) = self.binding_bank.as_ref() {
-            let needs = self.state.try_lock().map(|state| {
-                state.current.submitted().is_none()
-                    && state.binding_credits.iter().all(Option::is_none)
-            });
-            match needs {
-                Some(true) => refill = Some(bank.prepare_before_entry()?),
-                Some(false) => {}
-                None => {
-                    return Err(MetalKernelError::QueueUnavailable(
-                        "final EntryState still borrowed",
-                    ))
-                }
-            }
-        }
         let Some(mut state) = self.state.try_lock() else {
             // EntryState is privately owned, and all public guards borrow
             // Commands. No such borrow survives final Commands::drop. Treat a
@@ -3399,11 +3348,6 @@ impl lifecycle::FinalCore for CommandsCore {
                 "final EntryState still borrowed",
             ));
         };
-        if refill.is_some() {
-            if let Some(slot) = state.binding_credits.iter_mut().find(|slot| slot.is_none()) {
-                *slot = refill.take();
-            }
-        }
         if state.current.submitted().is_some() {
             return Ok(true);
         }
@@ -3436,10 +3380,20 @@ impl lifecycle::FinalCore for CommandsCore {
         if !self.release_held_for_teardown(&mut state, captures)? {
             return Ok(false);
         }
-        if state.current_abandoned && !self.replace_abandoned_for_final(&mut state, captures)? {
-            return Ok(false);
+        if state.current_abandoned {
+            // A cancellation took the current recording: nothing is submitted.
+            // What is owed completes by accounting once every earlier record
+            // has retired (`CompletionHook::abandon`); terminality waits for it.
+            if self.hook.abandonment_published() {
+                return Ok(true);
+            }
+            let hook = &self.hook;
+            state
+                .owed_epochs
+                .abandon(|from, through| hook.abandon(from, through))?;
+            return Ok(true);
         }
-        let owed = std::mem::take(&mut state.owed_epochs);
+        let runs = state.owed_epochs.runs_for(None, state.held.len());
         let removals = if captures.removals.is_none() {
             Some(&mut captures.removals)
         } else {
@@ -3455,11 +3409,11 @@ impl lifecycle::FinalCore for CommandsCore {
                     buffer: cb,
                     clock: &self.clock,
                 };
-                self.submit_owned_recording(authority, removals, true, None, None, None, 1 + owed)
+                self.submit_owned_recording(authority, removals, true, None, None, None, runs)
             })
             .map(|_| ());
-        if submitted.is_err() {
-            state.owed_epochs += owed;
+        if submitted.is_ok() {
+            state.owed_epochs.settle(runs);
         }
         match submitted {
             Ok(_) => Ok(true),
@@ -3473,6 +3427,9 @@ impl lifecycle::FinalCore for CommandsCore {
     /// Every retained marker, including submitted current, requires its own
     /// returned handoff and ordered callback completion. Error/poison is never
     /// a terminality certificate. The final prefix also covers older pruned CBs.
+    /// An abandoned final has no marker: its prefix is closed once the hook
+    /// has settled the abandonment, which happens only after every record
+    /// carrying a hook run has retired in its adapter.
     fn poll_final_terminality(&self) -> Result<bool, MetalKernelError> {
         self.failure.check()?;
         let state = self
@@ -3482,7 +3439,27 @@ impl lifecycle::FinalCore for CommandsCore {
                 "final EntryState still borrowed",
             ))?;
         let Some((current, _)) = state.current.submitted() else {
-            return Err(MetalKernelError::QueueUnavailable("final receipt absent"));
+            if !state.current_abandoned {
+                return Err(MetalKernelError::QueueUnavailable("final receipt absent"));
+            }
+            if let Some(queue) = &self.modern_queue {
+                queue.check_failure()?;
+            }
+            if let Some(core) = &self.legacy_completions {
+                core.check()?;
+            }
+            if !self.hook.abandonment_settled() {
+                return Ok(false);
+            }
+            for cb in &state.in_flight {
+                if !cb.poll_logical_completed()? {
+                    return Err(MetalKernelError::QueueUnavailable(
+                        "abandoned final settled ahead of its in-flight work",
+                    ));
+                }
+            }
+            self.failure.check()?;
+            return Ok(true);
         };
         if !current.poll_logical_completed()? {
             return Ok(false);
@@ -4845,11 +4822,12 @@ mod final_marker_tests {
     }
 
     /// A final owner whose current recording a cancellation took, on a
-    /// bound queue (the production device's): while no Metal 4 slot is free
-    /// it is pending, with its binding credit, its epoch and its native
-    /// calls untouched; once one is, it submits one empty marker.
+    /// bound queue (the production device's): it completes at once, taking
+    /// no slot, spending or refilling no binding credit, opening no epoch and
+    /// making no native call, and reaches terminality (decision 99). A
+    /// second poll, as the device's own teardown makes, publishes nothing.
     #[test]
-    fn final_marker_is_pending_without_a_free_slot_and_keeps_its_credit() {
+    fn final_abandonment_takes_no_slot_credit_epoch_or_native_call() {
         let device = crate::MetalDevice::new(0).unwrap();
         let commands = device.commands();
         if commands.host_input_arm() == HostInputArm::GpuWait {
@@ -4869,27 +4847,22 @@ mod final_marker_tests {
             .submission_control
             .native_calls
             .load(Ordering::Acquire);
+        let slots = commands.core.modern_queue.as_ref().map(|queue| {
+            queue.created.load(Ordering::Acquire) + queue.reused.load(Ordering::Acquire)
+        });
         let mut captures = lifecycle::FinalCaptures::default();
-        commands.core.deny_final_slot.store(true, Ordering::Release);
-        let busy = commands.core.poll_final_submission(&mut captures).unwrap();
-        let busy_credits = credits(commands);
-        let busy_epoch = commands.clock().current_epoch().0;
-        let busy_calls = commands
-            .core
-            .submission_control
-            .native_calls
-            .load(Ordering::Acquire);
-        let still_abandoned = commands.core.state.lock(Side::Host).current_abandoned;
-        commands
-            .core
-            .deny_final_slot
-            .store(false, Ordering::Release);
         let submitted = commands.core.poll_final_submission(&mut captures).unwrap();
+        let after_credits = credits(commands);
+        let after_epoch = commands.clock().current_epoch().0;
         let after_calls = commands
             .core
             .submission_control
             .native_calls
             .load(Ordering::Acquire);
+        let after_slots = commands.core.modern_queue.as_ref().map(|queue| {
+            queue.created.load(Ordering::Acquire) + queue.reused.load(Ordering::Acquire)
+        });
+        let still_abandoned = commands.core.state.lock(Side::Host).current_abandoned;
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         let mut terminal = false;
         while std::time::Instant::now() < deadline {
@@ -4899,28 +4872,23 @@ mod final_marker_tests {
             }
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
+        let again = commands.core.poll_final_submission(&mut captures).unwrap();
         eprintln!(
-            "FINAL_MARKER_BUSY api={} busy={busy} credits={held_credits}->{busy_credits} epoch={epoch}->{busy_epoch} calls={calls}->{busy_calls}->{after_calls} submitted={submitted} terminal={terminal}",
+            "FINAL_ABANDONMENT_BOUND api={} submitted={submitted} credits={held_credits}->{after_credits} epoch={epoch}->{after_epoch} calls={calls}->{after_calls} acquisitions={slots:?}->{after_slots:?} abandoned={still_abandoned} terminal={terminal} again={again}",
             commands.actual_command_api()
         );
-        assert!(!busy, "FINAL_MARKER_WITHOUT_SLOT_IS_PENDING");
-        assert!(still_abandoned, "FINAL_MARKER_PENDING_REPLACES_NOTHING");
+        assert!(submitted, "FINAL_ABANDONMENT_IS_NEVER_PENDING_FOR_A_SLOT");
+        assert!(still_abandoned, "FINAL_ABANDONMENT_REPLACES_NOTHING");
         assert_eq!(
-            busy_credits, held_credits,
-            "FINAL_MARKER_PENDING_KEEPS_ITS_CREDIT"
+            after_credits, held_credits,
+            "FINAL_ABANDONMENT_KEEPS_ITS_CREDIT"
         );
-        assert_eq!(
-            (busy_epoch, busy_calls),
-            (epoch, calls),
-            "FINAL_MARKER_PENDING_TAKES_NO_EPOCH_OR_NATIVE_CALL"
-        );
-        assert!(submitted, "FINAL_MARKER_SUBMITTED_ONCE_A_SLOT_IS_FREE");
-        assert_eq!(
-            after_calls,
-            calls + 1,
-            "FINAL_MARKER_IS_ONE_NATIVE_SUBMISSION"
-        );
-        assert!(terminal, "FINAL_MARKER_REACHES_TERMINALITY");
+        assert_eq!(after_epoch, epoch, "FINAL_ABANDONMENT_OPENS_NO_EPOCH");
+        assert_eq!(after_calls, calls, "FINAL_ABANDONMENT_MAKES_NO_NATIVE_CALL");
+        assert_eq!(after_slots, slots, "FINAL_ABANDONMENT_ACQUIRES_NO_SLOT");
+        assert!(terminal, "FINAL_ABANDONMENT_REACHES_TERMINALITY");
+        assert!(again, "FINAL_ABANDONMENT_POLLED_AGAIN_STAYS_SUBMITTED");
+        assert!(commands.check_failed().is_ok());
         drop(captures);
     }
 }

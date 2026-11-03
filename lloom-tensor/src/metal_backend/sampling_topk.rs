@@ -76,9 +76,22 @@ impl MetalStorage {
             .with_label("sampling_topk_status")
             .build()?;
         if rows != 0 {
+            let words = crate::kernels::kernels::sampling_topk::sampling_work_words(rows, vocab)
+                .ok_or_else(|| crate::Error::Msg("sampling_topk_mask: scratch overflow".into()))?;
+            let work = device
+                .new_buffer_builder()
+                .with_size_for(words, DType::U32)
+                .with_label("sampling_topk_work")
+                .build()?;
+            let scratch = device
+                .new_buffer_builder()
+                .with_size_for(elements, DType::U32)
+                .with_label("sampling_topk_scratch")
+                .build()?;
             let encoder = device.command_encoder()?;
-            // SAFETY: validated storage span; fresh, disjoint outputs; the
-            // storage/pool owns reuse until GPU completion (module binding authority).
+            // SAFETY: validated storage span; fresh, disjoint outputs and
+            // scratch; the storage/pool owns reuse until GPU completion
+            // (module binding authority).
             unsafe {
                 crate::kernels::kernels::sampling_topk::call_sampling_topk_mask(
                     device.metal_device(),
@@ -90,6 +103,8 @@ impl MetalStorage {
                     k.min(vocab) as u32,
                     &mask,
                     &status,
+                    &work,
+                    &scratch,
                 )
             }
             .map_err(MetalError::from)?;

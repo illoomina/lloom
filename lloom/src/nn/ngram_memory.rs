@@ -49,6 +49,8 @@ use std::sync::Arc;
 mod readers;
 #[cfg(unix)]
 pub use readers::ReaderStats;
+#[cfg(all(unix, feature = "fuzzing"))]
+pub use readers::{HeldWinner, HoldStats, HOLD_BOUND};
 
 /// The per-layer token embedding table's GGUF name (Qwen4-exp's N-gram PLE).
 pub const PER_LAYER_TOKEN_EMBD: &str = "per_layer_token_embd.weight";
@@ -97,6 +99,35 @@ pub fn start_read_workers(threads: usize) -> bool {
 #[cfg(unix)]
 pub fn read_worker_stats() -> Option<ReaderStats> {
     readers::started().map(|r| r.stats())
+}
+
+/// Hold one row's first read in each hedged request on the read threads
+/// until the request's hedge has run (`readers::Readers::hold`); `None`
+/// stops. Whether a set is running to hold it.
+#[cfg(all(unix, feature = "fuzzing"))]
+pub fn hold_read_worker_row(row: Option<(usize, HeldWinner)>) -> bool {
+    readers::started().map(|r| r.hold(row)).is_some()
+}
+
+/// What the hold has done since it was last set.
+#[cfg(all(unix, feature = "fuzzing"))]
+pub fn read_worker_hold_stats() -> Option<HoldStats> {
+    readers::started().map(|r| r.hold_stats())
+}
+
+/// Wait until the read threads are idle, losing reads included; the last
+/// request's count of rows landed.
+#[cfg(all(unix, feature = "fuzzing"))]
+pub fn settle_read_workers() -> Option<u32> {
+    readers::started().map(|r| r.settle())
+}
+
+/// How many of the read threads have started ([`ReaderStats::threads`] of
+/// them once all have): a test counting allocations process-wide waits for
+/// all, so no thread's own start lands in its window.
+#[cfg(all(unix, feature = "fuzzing"))]
+pub fn read_workers_started() -> Option<usize> {
+    readers::started().map(|r| r.started_threads())
 }
 
 /// What a read keeps between calls so that it allocates nothing: which of a

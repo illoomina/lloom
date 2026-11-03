@@ -773,12 +773,13 @@ fn device_gumbel_draws_have_the_reference_distribution() -> Result<()> {
     Ok(())
 }
 
-/// The Gumbel half of `tests.rs`'s dumped-row χ²: at the first row of the
-/// `LLOOM_CHI2_LOGITS` dump (a real checkpoint's logits), on the checkpoint
-/// and top-p cells, 4 000 draws of 20 rows a dispatch (a variate per
-/// vocabulary id per draw is the host's cost), every draw checked equal to
-/// the reference's for its variates. Control: the temperature dropped.
-/// Ignored: it needs the dump.
+/// The Gumbel half of `tests.rs`'s dumped-row χ²: at the row of the
+/// `LLOOM_CHI2_LOGITS` dump (a real checkpoint's logits; its last three
+/// decode rows) whose checkpoint and top-p cells pool into the most cells at
+/// this draw count, on those two cells, 4 000 draws of 20 rows a dispatch (a
+/// variate per vocabulary id per draw is the host's cost), every draw
+/// checked equal to the reference's for its variates. Control: the
+/// temperature dropped. Ignored: it needs the dump.
 #[test]
 #[ignore]
 fn device_gumbel_draws_have_the_reference_distribution_at_a_dumped_row() -> Result<()> {
@@ -790,10 +791,28 @@ fn device_gumbel_draws_have_the_reference_distribution_at_a_dumped_row() -> Resu
     };
     let d = device()?;
     let (n, rows) = (4_000usize, 20usize);
-    let (pos, z) = dumped_rows(&path, 1).remove(0);
+    let cells: Vec<_> = served_cells().into_iter().take(2).collect();
+    let pooled = |z: &[f32]| -> usize {
+        cells
+            .iter()
+            .map(|&(_, p)| {
+                let want = reference_distribution(z, p);
+                let (big, small): (Vec<f64>, Vec<f64>) = want
+                    .iter()
+                    .filter(|&&w| w > 0.0)
+                    .partition(|&&w| n as f64 * w >= 5.0);
+                big.len() + (small.iter().sum::<f64>() * n as f64 >= 5.0) as usize
+            })
+            .min()
+            .unwrap_or(0)
+    };
+    let (pos, z) = dumped_rows(&path, 3)
+        .into_iter()
+        .max_by_key(|(_, z)| pooled(z))
+        .expect("a dumped row");
     let v = z.len();
     let (mut tested, mut controls) = (0usize, 0usize);
-    for (what, p) in served_cells().into_iter().take(2) {
+    for &(what, p) in &cells {
         let want = reference_distribution(&z, p);
         let mut s = 0x6b5u64 ^ pos as u64;
         let mut draws = Vec::with_capacity(n);

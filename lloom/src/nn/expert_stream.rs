@@ -1627,7 +1627,7 @@ struct Inner {
 #[cfg(feature = "metal")]
 #[derive(Default)]
 struct DecodeIo {
-    ids_dst: Option<lloom_tensor::kernels::metal::BufferHandle>,
+    ids_dst: std::sync::Arc<lloom_tensor::metal_backend::ReadbackDstCache>,
     /// The routing ids' host-read slots (#814 part 5): `moe_topk` writes a
     /// one-row step's ids straight into one and [`Streamed::plan`] reads it
     /// in place — no copy dispatch into `ids_dst`, no staging buffer. Per
@@ -1727,25 +1727,15 @@ impl Inner {
         Ok(Some(made))
     }
 
-    /// The destination a one-row plan's routing ids are read back into:
-    /// the tier's own Shared buffer of at least `bytes`, so the readback asks
-    /// no pool for one per step.
+    /// The cache a one-row plan's routing ids are read back through: the
+    /// tier's own Shared destination, so the readback asks no pool for one
+    /// per step. `None` off Metal.
     fn decode_ids_dst(
-        &mut self,
-        bytes: usize,
-    ) -> Result<Option<lloom_tensor::kernels::metal::BufferHandle>> {
-        let Ok(m) = self.device.as_metal_device() else {
-            return Ok(None);
-        };
-        Ok(Some(match &self.decode_io.ids_dst {
-            Some(b) if b.length() >= bytes => b.clone(),
-            _ => {
-                let _escape = escape_guard();
-                let b = m.new_persistent_shared(bytes)?;
-                self.decode_io.ids_dst = Some(b.clone());
-                b
-            }
-        }))
+        &self,
+    ) -> Option<std::sync::Arc<lloom_tensor::metal_backend::ReadbackDstCache>> {
+        self.device
+            .is_metal()
+            .then(|| std::sync::Arc::clone(&self.decode_io.ids_dst))
     }
 
     /// A one-row group's slot ids written into the tier's own Shared buffer,
@@ -3334,13 +3324,9 @@ impl Streamed {
         let decode = if let Some(slot) = slot {
             Some(slot.read_committed::<u32>(topk)?)
         } else if rows == 1 {
-            let flat = ids.flatten_all()?.contiguous()?;
-            let bytes = flat.elem_count() * std::mem::size_of::<u32>();
-            let dst = self.inner.lock().decode_ids_dst(bytes)?;
+            let dst = self.inner.lock().decode_ids_dst();
             match dst {
-                Some(dst) => {
-                    Some(lloom_tensor::metal_backend::stage_readback_into(&flat, &dst)?.finish()?)
-                }
+                Some(dst) => Some(dst.read::<u32>(&ids.flatten_all()?.contiguous()?)?),
                 None => None,
             }
         } else {

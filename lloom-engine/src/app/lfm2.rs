@@ -3660,12 +3660,19 @@ impl<P: Lfm2Shape> super::served::Served for Engine<P> {
     }
     fn capabilities(&self) -> super::family::Capabilities {
         if self.gguf {
+            // The representation the engine was built at: the file's stored
+            // kinds at the dtype the model computes in (decision 110).
+            let dtype = self.core.model.dtype();
+            let rep = crate::frontend::Representation::of_kinds(
+                self.core.model.weight_kinds().keys().map(String::as_str),
+                dtype,
+            );
             let c = super::family::Capabilities {
                 decisions: self.decisions.is_some(),
-                ..super::family::LFM2_GGUF_CAPABILITIES
+                ..super::family::lfm2_gguf_engine_capabilities(Some(rep))
             };
             // The KV is held at the dtype the model computes in.
-            return if self.core.model.dtype() == DType::F16 {
+            return if dtype == DType::F16 {
                 super::family::Capabilities {
                     kv_dtype: "f16",
                     kv_dense: &["f16"],

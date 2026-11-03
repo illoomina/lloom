@@ -7483,11 +7483,15 @@ void dequantize_iq4_xs(device const block_iq4_xs * xb, short il, thread type4x4 
     }
 }
 
-template<typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread float4x4 &)>
+// `out4x4` is the store's type: float4x4 for the f32 rows, or half4x4 for a
+// stream computing in f16. Either way the block dequantizes in float, so the
+// half rows are the f32 rows rounded once (the incumbent lookup's f32 rows
+// cast to f16, bit for bit), never a dequantization taken in half.
+template<typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread float4x4 &), typename out4x4 = float4x4>
 inline void get_rows_q_core(
         device const  void * src0,
         device const  void * src1,
-        device       float * dst,
+        device        void * dst,
         constant   int64_t & ne00,
         constant  uint64_t & nb01,
         constant  uint64_t & nb02,
@@ -7514,7 +7518,7 @@ inline void get_rows_q_core(
     for (int64_t ind = tiitg; ind < ne00/16; ind += tptg.x) {
         float4x4 temp;
         dequantize_func(((device const block_q *) ((const device char *) src0 + r*nb01 + i02*nb02)) + ind/nl, ind%nl, temp);
-        *(((device float4x4 *) ((device char *) dst + i11*nb2 + i10*nb1)) + ind) = temp;
+        *(((device out4x4 *) ((device char *) dst + i11*nb2 + i10*nb1)) + ind) = out4x4(temp);
     }
 }
 
@@ -7556,6 +7560,29 @@ kernel void kernel_get_rows_q_guarded(
         uint3                tptg [[threads_per_threadgroup]]) {
     if (error[0] != 0u) return;
     get_rows_q_core<block_q, nl, dequantize_func>(src0, src1, dst, ne00, nb01, nb02, ne10, nb10, nb11, nb1, nb2, tgpig, tiitg, tptg, true);
+}
+
+// The guarded lookup into an f16 stream: `kernel_get_rows_q_guarded`'s
+// operands with half rows (`nb1`, `nb2` in bytes of half).
+template<typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread float4x4 &)>
+kernel void kernel_get_rows_q_guarded_f16(
+        device const  void * src0,
+        device const  void * src1,
+        device        half * dst,
+        constant   int64_t & ne00,
+        constant  uint64_t & nb01,
+        constant  uint64_t & nb02,
+        constant   int64_t & ne10,
+        constant  uint64_t & nb10,
+        constant  uint64_t & nb11,
+        constant  uint64_t & nb1,
+        constant  uint64_t & nb2,
+        device const uint *error,
+        uint3                tgpig[[threadgroup_position_in_grid]],
+        uint                 tiitg[[thread_index_in_threadgroup]],
+        uint3                tptg [[threads_per_threadgroup]]) {
+    if (error[0] != 0u) return;
+    get_rows_q_core<block_q, nl, dequantize_func, half4x4>(src0, src1, dst, ne00, nb01, nb02, ne10, nb10, nb11, nb1, nb2, tgpig, tiitg, tptg, true);
 }
 
 
@@ -8295,6 +8322,7 @@ template [[host_name("kernel_get_rows_bf16_guarded")]] kernel get_rows_f_guarded
 
 typedef decltype(kernel_get_rows_q<block_q4_0, 2, dequantize_q4_0>) get_rows_q_t;
 typedef decltype(kernel_get_rows_q_guarded<block_q4_0, 2, dequantize_q4_0>) get_rows_q_guarded_t;
+typedef decltype(kernel_get_rows_q_guarded_f16<block_q4_0, 2, dequantize_q4_0>) get_rows_q_guarded_f16_t;
 
 //
 // matrix-matrix multiplication
@@ -9709,6 +9737,7 @@ LLOOM_QUANT_KIND_ROWS(STEM, 4) \
 LLOOM_QUANT_KIND_ROWS(STEM, 8) \
 template [[host_name("kernel_get_rows_" #STEM)]]              kernel get_rows_q_t          kernel_get_rows_q<BLOCK, NL, DEQ>; \
 template [[host_name("kernel_get_rows_" #STEM "_guarded")]] kernel get_rows_q_guarded_t kernel_get_rows_q_guarded<BLOCK, NL, DEQ>; \
+template [[host_name("kernel_get_rows_" #STEM "_guarded_f16")]] kernel get_rows_q_guarded_f16_t kernel_get_rows_q_guarded_f16<BLOCK, NL, DEQ>; \
 template [[host_name("kernel_mul_mm_" #STEM "_f32")]]          kernel mat_mm_t              kernel_mul_mm<half, half4x4, simdgroup_half8x8, BLOCK, NL, DEQ>; \
 template [[host_name("kernel_mul_mm_" #STEM "_f16_f16")]]      kernel mat_mm_h_t            kernel_mul_mm<half, half4x4, simdgroup_half8x8, BLOCK, NL, DEQ, half, half>; \
 template [[host_name("kernel_mul_mm_id_mapped_" #STEM "_f32")]]   kernel mat_mm_id_mapped_t   kernel_mul_mm_id_mapped<BLOCK, NL, DEQ>; \

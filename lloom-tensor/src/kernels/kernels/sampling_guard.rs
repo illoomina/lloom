@@ -35,6 +35,8 @@ pub(crate) enum Consumer<'a> {
         hidden: usize,
         row_stride: usize,
         rows: usize,
+        /// The rows are written at f16 rather than f32.
+        f16: bool,
     },
     Copy {
         ids: &'a Buffer,
@@ -94,6 +96,7 @@ pub(crate) unsafe fn call(
             hidden,
             row_stride,
             rows,
+            f16,
         } => {
             if *rows == 0 {
                 return Ok(());
@@ -115,6 +118,7 @@ pub(crate) unsafe fn call(
                     out.0,
                     out.1,
                     error,
+                    *f16,
                 )
             };
         }

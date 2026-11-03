@@ -1746,22 +1746,49 @@ impl QMatMul {
 
     /// Cold prepared-output capability check, without exposing a packed
     /// storage handle or materializing the complete embedding table.
+    /// Packed rows are written at f32, a dense table's at its own dtype:
+    /// [`Self::guarded_embedding_layout_at`] with no dtype named.
     #[cfg(feature = "metal")]
     pub fn guarded_embedding_layout(&self) -> Result<GuardedEmbeddingLayout> {
+        self.guarded_embedding_layout_at(None)
+    }
+
+    /// [`Self::guarded_embedding_layout`] for an output at `dtype`, the dtype
+    /// of the stream the rows feed. Packed rows dequantize in f32 and are
+    /// written at f32, or at f16 rounded once (the incumbent lookup cast to
+    /// f16, bit for bit); a dense table's lookup copies bytes, so it is written
+    /// at its own dtype only. `None` is the table's own output: f32 packed, the
+    /// dense dtype.
+    #[cfg(feature = "metal")]
+    pub fn guarded_embedding_layout_at(
+        &self,
+        dtype: Option<DType>,
+    ) -> Result<GuardedEmbeddingLayout> {
         let (vocab, hidden, dtype, device) = match self {
             Self::QTensor(table) => {
                 let (vocab, hidden) = table.shape().dims2()?;
                 let kind =
                     crate::kernels::kernels::quantized::GgmlDType::from(table.dtype()).kind();
-                if kind.guarded_get_rows.is_none() || !hidden.is_multiple_of(kind.block_size) {
-                    crate::bail!("guarded embedding: unsupported packed dtype/block geometry");
+                let out = dtype.unwrap_or(DType::F32);
+                let kernel = match out {
+                    DType::F32 => kind.guarded_get_rows,
+                    DType::F16 => kind.guarded_get_rows_f16,
+                    _ => None,
+                };
+                if kernel.is_none() || !hidden.is_multiple_of(kind.block_size) {
+                    crate::bail!(
+                        "guarded embedding: unsupported packed dtype/block geometry/output dtype"
+                    );
                 }
-                (vocab, hidden, DType::F32, table.device())
+                (vocab, hidden, out, table.device())
             }
             Self::Tensor(table) | Self::TensorF16(table) => {
                 let (vocab, hidden) = table.dims2()?;
                 if !matches!(table.dtype(), DType::F32 | DType::F16 | DType::BF16) {
                     crate::bail!("guarded embedding: unsupported dense dtype");
+                }
+                if dtype.is_some_and(|d| d != table.dtype()) {
+                    crate::bail!("guarded embedding: a dense table writes its own dtype");
                 }
                 if !table.is_contiguous() {
                     crate::bail!("guarded embedding: contiguous dense table required");
@@ -1782,12 +1809,23 @@ impl QMatMul {
 
     #[cfg(feature = "metal")]
     pub fn check_guarded_embedding_output(&self, out: &Tensor) -> Result<()> {
+        self.check_guarded_embedding_output_at(out, None)
+    }
+
+    /// [`Self::check_guarded_embedding_output`] against
+    /// [`Self::guarded_embedding_layout_at`]`(dtype)`.
+    #[cfg(feature = "metal")]
+    pub fn check_guarded_embedding_output_at(
+        &self,
+        out: &Tensor,
+        dtype: Option<DType>,
+    ) -> Result<()> {
         let GuardedEmbeddingLayout {
             hidden,
             dtype,
             device,
             ..
-        } = self.guarded_embedding_layout()?;
+        } = self.guarded_embedding_layout_at(dtype)?;
         let (_, layout) = out.storage_and_layout();
         if out.dim(D::Minus1)? != hidden
             || out.elem_count() == 0

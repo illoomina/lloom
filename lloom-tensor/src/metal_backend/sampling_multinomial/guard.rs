@@ -527,6 +527,9 @@ impl GuardedSample<'_> {
 
     /// Packed GGUF embedding through the same get_rows/dequantization core as
     /// the incumbent route; request failure is tested before loading any id.
+    /// `out` is f32, or f16 for a stream computing at f16: the rows then
+    /// dequantize in f32 and round once, as the incumbent lookup cast to f16
+    /// does (`QuantKind::guarded_get_rows_f16`).
     pub(crate) fn quantized_embedding_into(
         &self,
         table: &crate::quantized::metal::QMetalStorage,
@@ -549,8 +552,14 @@ impl GuardedSample<'_> {
             .checked_mul(row_stride)
             .filter(|&n| n <= table.buffer().length())
             .ok_or_else(|| crate::Error::Msg("guarded packed embedding physical span".into()))?;
+        let out_dtype = out.dtype();
+        let kernel = match out_dtype {
+            DType::F32 => kind.guarded_get_rows,
+            DType::F16 => kind.guarded_get_rows_f16,
+            _ => None,
+        };
         if vocab != self.sample.vocab
-            || kind.guarded_get_rows.is_none()
+            || kernel.is_none()
             || !table.device().same_device(self.guard.error.device())
             || out.elem_count() != count
         {
@@ -566,7 +575,7 @@ impl GuardedSample<'_> {
         if !layout.is_contiguous() {
             crate::bail!("guarded packed embedding: prepared contiguous output required");
         }
-        let range = self.output(out, DType::F32, layout.start_offset(), count)?;
+        let range = self.output(out, out_dtype, layout.start_offset(), count)?;
         let base = table.buffer().base_offset();
         let end = base
             .checked_add(bytes)
@@ -578,11 +587,15 @@ impl GuardedSample<'_> {
             ids: self.sample.ids.buffer(),
             error: self.guard.error.buffer(),
             table: table.buffer(),
-            out: (out.buffer(), layout.start_offset() * 4),
+            out: (
+                out.buffer(),
+                layout.start_offset() * out_dtype.size_in_bytes(),
+            ),
             dtype: dtype.into(),
             hidden,
             row_stride,
             rows: self.sample.rows,
+            f16: out_dtype == DType::F16,
         })
     }
 

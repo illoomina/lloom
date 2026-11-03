@@ -195,84 +195,59 @@ fn qwen3_5_tiny_chats_on_the_cpu_and_metal() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// The device filter is lfm2's default and no other family's
-/// (`docs/dispatch.md` §11.2). With no flag, a filtered sampled request on a
-/// tiny LFM2 rides NativeRing on Metal; on a tiny Qwen3.5 it is served by
-/// today's route (the blocking arm, C1), not refused; on LFM2 on the CPU, and
-/// with `--device-filter=false`, LFM2 keeps today's route too. Every arm runs
-/// and is recorded; the test fails once, naming each arm that parted.
-#[test]
-fn the_device_filter_is_lfm2s_default_and_no_other_familys() {
+/// A sampled request's turn line: (readback, completion tokens, whether the
+/// native route's note was printed), or the refusal's last line.
+type Route = Result<(String, String, bool), String>;
+
+/// A filtered sampled request through `lloom chat` on `model` with `extra`
+/// flags.
+fn sampled_route(model: &Path, extra: &[&str]) -> Route {
     const NATIVE: &str = "native prepared device sampler; no host logits readback";
-    let sampled = ["-t", "0.8", "--top-k", "4", "--seed", "7", "--ignore-eos"];
-    // `served` is the arm's turn line: (readback, completion tokens, whether
-    // the native route's note was printed), or the refusal's last line.
-    let route = |model: &Path, extra: &[&str]| -> Result<(String, String, bool), String> {
-        let out = Command::new(env!("CARGO_BIN_EXE_lloom"))
-            .args(["chat", "--model"])
-            .arg(model)
-            .args(["--raw", "-p", PROMPT, "-n", MAX_TOKENS])
-            .args(sampled)
-            .args(extra)
-            .output()
-            .expect("lloom runs");
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        if !out.status.success() {
-            let last = stderr.lines().rev().find(|l| !l.trim().is_empty());
-            return Err(format!("refused: {}", last.unwrap_or("").trim()));
-        }
-        let line = stderr
-            .lines()
-            .find(|l| l.starts_with("[turn 1:"))
-            .ok_or_else(|| format!("no turn line:\n{stderr}"))?;
-        let field = |k: &str| {
-            line.split_whitespace()
-                .find_map(|kv| kv.strip_prefix(&format!("{k}=")))
-                .unwrap_or("")
-                .to_string()
-        };
-        Ok((
-            field("readback"),
-            field("completion_tokens"),
-            stderr.contains(NATIVE),
-        ))
+    let out = Command::new(env!("CARGO_BIN_EXE_lloom"))
+        .args(["chat", "--model"])
+        .arg(model)
+        .args(["--raw", "-p", PROMPT, "-n", MAX_TOKENS])
+        .args(["-t", "0.8", "--top-k", "4", "--seed", "7", "--ignore-eos"])
+        .args(extra)
+        .output()
+        .expect("lloom runs");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    if !out.status.success() {
+        let last = stderr.lines().rev().find(|l| !l.trim().is_empty());
+        return Err(format!("refused: {}", last.unwrap_or("").trim()));
+    }
+    let line = stderr
+        .lines()
+        .find(|l| l.starts_with("[turn 1:"))
+        .ok_or_else(|| format!("no turn line:\n{stderr}"))?;
+    let field = |k: &str| {
+        line.split_whitespace()
+            .find_map(|kv| kv.strip_prefix(&format!("{k}=")))
+            .unwrap_or("")
+            .to_string()
     };
-    let today = |r: &Result<(String, String, bool), String>| matches!(r, Ok((rb, n, false)) if rb == "blocking" && n == MAX_TOKENS);
-    let native = |r: &Result<(String, String, bool), String>| matches!(r, Ok((rb, n, true)) if rb.starts_with("ring") && n == MAX_TOKENS);
-    let mut arms = Vec::new();
+    Ok((
+        field("readback"),
+        field("completion_tokens"),
+        stderr.contains(NATIVE),
+    ))
+}
 
-    let dir = scratch("device-filter-lfm2");
-    let lfm2 = write::<Lfm2Tiny>(&dir);
-    let r = route(&lfm2, &["--cpu"]);
-    arms.push(("lfm2 --cpu: today's route", today(&r), r));
-    #[cfg(feature = "metal")]
-    {
-        let r = route(&lfm2, &[]);
-        arms.push(("lfm2 Metal, no flag: NativeRing", native(&r), r));
-        let r = route(&lfm2, &["--device-filter=false"]);
-        arms.push(("lfm2 Metal, explicit off: today's route", today(&r), r));
-    }
+/// Today's route: the blocking arm (C1), every token, no native note.
+fn todays_route(r: &Route) -> bool {
+    matches!(r, Ok((rb, n, false)) if rb == "blocking" && n == MAX_TOKENS)
+}
 
-    reference_purpose();
-    let qdir = scratch("device-filter-qwen3_5");
-    let qwen = write::<Qwen3_5Tiny>(&qdir);
-    let tok = qdir.join("tokenizer.json");
-    let tok = tok.to_str().unwrap();
-    let r = route(&qwen, &["--tokenizer", tok, "--cpu"]);
-    arms.push(("qwen3_5 --cpu: today's route", today(&r), r));
-    #[cfg(feature = "metal")]
-    {
-        let r = route(&qwen, &["--tokenizer", tok]);
-        arms.push(("qwen3_5 Metal, no flag: today's route", today(&r), r));
-    }
-    std::fs::remove_dir_all(&dir).ok();
-    std::fs::remove_dir_all(&qdir).ok();
+/// NativeRing: a ring arm, every token, the native note.
+#[cfg(feature = "metal")]
+fn native_ring(r: &Route) -> bool {
+    matches!(r, Ok((rb, n, true)) if rb.starts_with("ring") && n == MAX_TOKENS)
+}
 
-    for (arm, ok, got) in &arms {
-        eprintln!(
-            "DEVICE_FILTER_DEFAULT {arm}: {} {got:?}",
-            if *ok { "ok" } else { "PARTED" }
-        );
+/// Record every arm, then fail once, naming each arm that parted.
+fn assert_arms(tag: &str, arms: &[(&str, bool, Route)]) {
+    for (arm, ok, got) in arms {
+        eprintln!("{tag} {arm}: {} {got:?}", if *ok { "ok" } else { "PARTED" });
     }
     let parted: Vec<_> = arms.iter().filter(|(_, ok, _)| !ok).collect();
     assert!(
@@ -281,6 +256,277 @@ fn the_device_filter_is_lfm2s_default_and_no_other_familys() {
         parted.len(),
         arms.len()
     );
+}
+
+/// The device filter is lfm2's default and no other family's
+/// (`docs/dispatch.md` §11.2). With no flag, a filtered sampled request on a
+/// tiny LFM2 rides NativeRing on Metal; on a tiny Qwen3.5 it is served by
+/// today's route (the blocking arm, C1), not refused; on LFM2 on the CPU, and
+/// with `--device-filter=false`, LFM2 keeps today's route too. Every arm runs
+/// and is recorded; the test fails once, naming each arm that parted. The
+/// LFM2 GGUF's default is its representation's
+/// (`an_lfm2_gguf_takes_the_device_filter_at_packed_blocks_only`).
+#[test]
+fn the_device_filter_is_lfm2s_default_and_no_other_familys() {
+    let mut arms = Vec::new();
+
+    let dir = scratch("device-filter-lfm2");
+    let lfm2 = write::<Lfm2Tiny>(&dir);
+    let r = sampled_route(&lfm2, &["--cpu"]);
+    arms.push(("lfm2 --cpu: today's route", todays_route(&r), r));
+    #[cfg(feature = "metal")]
+    {
+        let r = sampled_route(&lfm2, &[]);
+        arms.push(("lfm2 Metal, no flag: NativeRing", native_ring(&r), r));
+        let r = sampled_route(&lfm2, &["--device-filter=false"]);
+        arms.push((
+            "lfm2 Metal, explicit off: today's route",
+            todays_route(&r),
+            r,
+        ));
+    }
+
+    reference_purpose();
+    let qdir = scratch("device-filter-qwen3_5");
+    let qwen = write::<Qwen3_5Tiny>(&qdir);
+    let tok = qdir.join("tokenizer.json");
+    let tok = tok.to_str().unwrap();
+    let r = sampled_route(&qwen, &["--tokenizer", tok, "--cpu"]);
+    arms.push(("qwen3_5 --cpu: today's route", todays_route(&r), r));
+    #[cfg(feature = "metal")]
+    {
+        let r = sampled_route(&qwen, &["--tokenizer", tok]);
+        arms.push(("qwen3_5 Metal, no flag: today's route", todays_route(&r), r));
+    }
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::remove_dir_all(&qdir).ok();
+
+    assert_arms("DEVICE_FILTER_DEFAULT", &arms);
+}
+
+/// An LFM2 GGUF on the LFM2 engine takes the device filter by default at the
+/// representations it was gated and priced on, packed blocks at f16 (decision
+/// 110's default) and at f32 (`--gguf-act f32`)
+/// (`family::LFM2_GGUF_DEVICE_FILTER`): with no flag, a filtered sampled
+/// request on a tiny Q8_0 GGUF rides NativeRing on Metal at either. It keeps
+/// today's route, served and not refused, on the CPU, with
+/// `--device-filter=false`, on the legacy GGUF engine, and on a dense F32 GGUF
+/// (a representation the filter was not priced on). The legacy engine's
+/// capabilities report the filter off, the LFM2 engine's on at both packed
+/// representations and off on the dense file.
+#[test]
+fn an_lfm2_gguf_takes_the_device_filter_at_packed_blocks_only() {
+    use lloom_tensor::quantized::GgmlDType;
+    let dir = scratch("device-filter-lfm2-gguf");
+    let model = write::<Lfm2Tiny>(&dir);
+    let q8 = lfm2_gguf(&model, GgmlDType::Q8_0);
+    let dense = lfm2_gguf(&model, GgmlDType::F32);
+    let mut arms = Vec::new();
+    let r = sampled_route(&q8, &["--cpu"]);
+    arms.push(("lfm2-gguf q8_0 --cpu: today's route", todays_route(&r), r));
+    #[cfg(feature = "metal")]
+    {
+        let r = sampled_route(&q8, &[]);
+        arms.push((
+            "lfm2-gguf q8_0 Metal (blocks f16), no flag: NativeRing",
+            native_ring(&r),
+            r,
+        ));
+        let r = sampled_route(&q8, &["--gguf-act", "f32"]);
+        arms.push((
+            "lfm2-gguf q8_0 Metal --gguf-act f32 (blocks f32), no flag: NativeRing",
+            native_ring(&r),
+            r,
+        ));
+        let r = sampled_route(&q8, &["--device-filter=false"]);
+        arms.push((
+            "lfm2-gguf q8_0 Metal, explicit off: today's route",
+            todays_route(&r),
+            r,
+        ));
+        let r = sampled_route(&q8, &["--gguf-engine", "legacy"]);
+        arms.push((
+            "lfm2-gguf q8_0 Metal, legacy engine: today's route",
+            todays_route(&r),
+            r,
+        ));
+        let r = sampled_route(&dense, &[]);
+        arms.push((
+            "lfm2-gguf dense f32 Metal, no flag: today's route",
+            todays_route(&r),
+            r,
+        ));
+    }
+    let mut device: Vec<&str> = vec![];
+    if !cfg!(feature = "metal") {
+        device.push("--cpu");
+    }
+    for (label, file, extra, want) in [
+        (
+            "lfm2-gguf q8_0 /health: device_filter true",
+            &q8,
+            vec![],
+            true,
+        ),
+        (
+            "lfm2-gguf q8_0 --gguf-act f32 /health: device_filter true",
+            &q8,
+            vec!["--gguf-act", "f32"],
+            true,
+        ),
+        (
+            "lfm2-gguf q8_0 legacy /health: device_filter false",
+            &q8,
+            vec!["--gguf-engine", "legacy"],
+            false,
+        ),
+        (
+            "lfm2-gguf dense f32 /health: device_filter false",
+            &dense,
+            vec![],
+            false,
+        ),
+    ] {
+        let mut args = device.clone();
+        args.extend(extra.iter().copied());
+        let server = Server::start(file, &args);
+        let (_, health) = server.call("GET", "/health", &json!({}));
+        drop(server);
+        let got = health["capabilities"]["device_filter"].as_bool();
+        arms.push((
+            label,
+            got == Some(want),
+            Ok((format!("{got:?}"), String::new(), false)),
+        ));
+    }
+    assert_arms("DEVICE_FILTER_GGUF", &arms);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The turn line of a `-v` run: readback, completion tokens, whether the
+/// native route's note was printed, the token stream's digest.
+#[cfg(feature = "metal")]
+type Stream = Result<(String, String, bool, String), String>;
+
+/// One `-v` turn of `lloom chat` on `model` with `extra` flags, or the
+/// refusal's last line.
+#[cfg(feature = "metal")]
+fn stream(model: &Path, extra: &[&str]) -> Stream {
+    const NATIVE: &str = "native prepared device sampler; no host logits readback";
+    let out = Command::new(env!("CARGO_BIN_EXE_lloom"))
+        .args(["chat", "--model"])
+        .arg(model)
+        .args([
+            "--raw",
+            "-v",
+            "-p",
+            PROMPT,
+            "-n",
+            MAX_TOKENS,
+            "--ignore-eos",
+        ])
+        .args(extra)
+        .output()
+        .expect("lloom runs");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    if !out.status.success() {
+        let last = stderr.lines().rev().find(|l| !l.trim().is_empty());
+        return Err(format!("refused: {}", last.unwrap_or("").trim()));
+    }
+    let line = stderr
+        .lines()
+        .find(|l| l.starts_with("[turn 1:"))
+        .ok_or_else(|| format!("no turn line:\n{stderr}"))?;
+    let field = |k: &str| {
+        line.split_whitespace()
+            .find_map(|kv| kv.strip_prefix(&format!("{k}=")))
+            .unwrap_or("")
+            .trim_end_matches(']')
+            .to_string()
+    };
+    Ok((
+        field("readback"),
+        field("completion_tokens"),
+        stderr.contains(NATIVE),
+        field("tokens_sha256"),
+    ))
+}
+
+/// Decision 110 computes an LFM2 GGUF at the model's dtype, f16 on Metal
+/// (`blocks f16`). With the device filter explicitly on, a filtered sampled
+/// request rides NativeRing, whose guarded embedding gather feeds the f16
+/// residual stream: it must draw the fallback's stream
+/// (`--device-filter=false`, the host draw on the blocking arm) at a fixed
+/// seed, as it does at f32 (`--gguf-act f32`, the positive control that the
+/// comparison can pass). Greedy keeps its route with the filter on or off and
+/// draws one stream too. Every arm is recorded; the test fails once, naming
+/// each arm that parted.
+#[cfg(feature = "metal")]
+#[test]
+fn an_f16_lfm2_gguf_with_the_device_filter_draws_the_fallbacks_stream() {
+    use lloom_tensor::quantized::GgmlDType;
+    let dir = scratch("device-filter-lfm2-gguf-f16");
+    let model = write::<Lfm2Tiny>(&dir);
+    let q8 = lfm2_gguf(&model, GgmlDType::Q8_0);
+    let sampled = ["-t", "0.8", "--top-k", "4", "--seed", "7"];
+    let greedy = ["--sampling-defaults", "greedy"];
+    let show = |r: &Stream| -> Route {
+        r.clone()
+            .map(|(rb, n, native, t)| (format!("{rb} tokens={t}"), n, native))
+    };
+    let full = |r: &Stream| matches!(r, Ok((rb, n, _, t)) if !rb.is_empty() && n == MAX_TOKENS && !t.is_empty());
+    let mut arms: Vec<(String, bool, Route)> = Vec::new();
+    for (act, rep) in [(None, "blocks f16"), (Some("f32"), "blocks f32")] {
+        let mut base: Vec<&str> = Vec::new();
+        if let Some(a) = act {
+            base.extend(["--gguf-act", a]);
+        }
+        let server = Server::start(&q8, &base);
+        let (_, health) = server.call("GET", "/health", &json!({}));
+        drop(server);
+        let got = health["representation"].as_str().map(str::to_string);
+        arms.push((
+            format!("{rep}: /health representation"),
+            got.as_deref() == Some(rep),
+            Ok((format!("{got:?}"), String::new(), false)),
+        ));
+        for (cell, flags) in [("sampled", &sampled[..]), ("greedy", &greedy[..])] {
+            let run = |filter: &str| {
+                let mut args = base.clone();
+                args.extend(flags.iter().copied());
+                args.push(filter);
+                stream(&q8, &args)
+            };
+            let off = run("--device-filter=false");
+            let on = run("--device-filter=true");
+            // Sampled: off is the blocking host draw, on is NativeRing.
+            // Greedy: neither takes the device sampler.
+            let (off_ok, on_ok) = match cell {
+                "sampled" => (
+                    full(&off) && matches!(&off, Ok((rb, _, false, _)) if rb == "blocking"),
+                    full(&on) && matches!(&on, Ok((rb, _, true, _)) if rb.starts_with("ring")),
+                ),
+                _ => (
+                    full(&off) && matches!(&off, Ok((_, _, false, _))),
+                    full(&on) && matches!(&on, Ok((_, _, false, _))),
+                ),
+            };
+            let same = matches!((&off, &on), (Ok((_, _, _, a)), Ok((_, _, _, b))) if !a.is_empty() && a == b);
+            arms.push((format!("{rep} {cell}: off route"), off_ok, show(&off)));
+            arms.push((format!("{rep} {cell}: on route"), on_ok, show(&on)));
+            arms.push((
+                format!("{rep} {cell}: on draws the fallback's stream"),
+                same,
+                show(&on),
+            ));
+        }
+    }
+    let arms: Vec<(&str, bool, Route)> = arms
+        .iter()
+        .map(|(n, ok, r)| (n.as_str(), *ok, r.clone()))
+        .collect();
+    assert_arms("DEVICE_FILTER_GGUF_F16", &arms);
+    std::fs::remove_dir_all(&dir).ok();
 }
 
 /// Three turns of `lloom chat` on `model` with `extra` flags: the three

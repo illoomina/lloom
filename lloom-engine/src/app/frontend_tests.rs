@@ -1875,14 +1875,15 @@ fn tiny_lfm2_containers(
 
 /// Decision 80 item 4: the LFM2 rows key on the representation the LFM2
 /// engine builds, never the container. The safetensors directory is dense
-/// at f16 and takes every LFM2 row, as no `--model` does. A Q8_0 GGUF
-/// (blocks at f32) and an F16 GGUF (dense, and at f32, the GGUF compute
-/// dtype) take the rows whose arm the presets run on every representation
-/// (`When::Lfm2`), and every row measured on dense f16 alone
-/// (`When::Lfm2Dense`, `When::DsparkSingle`) is withheld: the library's
-/// value stands, and `withheld` names the row with the representation. The
-/// legacy engine takes none. A layer naming a withheld key keeps its value
-/// and is not listed.
+/// at f16 and takes every LFM2 row, as no `--model` does; so does the same
+/// weights' F16 GGUF, which computes at the model's dtype (decision 110). A
+/// Q8_0 GGUF (blocks at f16), and either GGUF on the f32 arm, take the rows
+/// whose arm the presets run on every representation (`When::Lfm2`), and
+/// every row measured on dense f16 alone (`When::Lfm2Dense`,
+/// `When::DsparkSingle`) is withheld: the library's value stands, and
+/// `withheld` names the row with the representation. The legacy engine
+/// takes none. A layer naming a withheld key keeps its value and is not
+/// listed.
 #[test]
 fn the_lfm2_rows_key_on_the_representation_not_the_container() {
     use crate::frontend::{withheld, Checkpoint, Representation};
@@ -1897,7 +1898,13 @@ fn the_lfm2_rows_key_on_the_representation_not_the_container() {
     let path = |p: &std::path::Path| p.display().to_string();
     let (st_s, q8_s, f16_s) = (path(&st), path(q8), path(f16));
 
-    // What each container loads as, read before load.
+    // What each container loads as, read before load. A GGUF computes at
+    // the model's dtype, as safetensors does (decision 110), so a dense F16
+    // GGUF is safetensors' representation; f32 is an arm.
+    let blocks_f16 = Representation {
+        blocks: true,
+        compute: DType::F16,
+    };
     let blocks_f32 = Representation {
         blocks: true,
         compute: DType::F32,
@@ -1906,15 +1913,45 @@ fn the_lfm2_rows_key_on_the_representation_not_the_container() {
         blocks: false,
         compute: DType::F32,
     };
-    let repr = |p: &std::path::Path| crate::app::lfm2::representation(p, false).unwrap();
+    let repr_at = |p: &std::path::Path, act: Option<DType>| {
+        crate::app::lfm2::representation(p, false, act).unwrap()
+    };
+    let repr = |p: &std::path::Path| repr_at(p, None);
     assert_eq!(repr(&st), Representation::MEASURED, "safetensors");
-    assert_eq!(repr(q8), blocks_f32, "Q8_0 GGUF");
-    assert_eq!(repr(f16), dense_f32, "F16 GGUF");
+    assert_eq!(repr(q8), blocks_f16, "Q8_0 GGUF");
+    assert_eq!(repr(f16), Representation::MEASURED, "F16 GGUF");
+    assert_eq!(
+        repr_at(q8, Some(DType::F32)),
+        blocks_f32,
+        "Q8_0 GGUF, f32 arm"
+    );
+    assert_eq!(
+        repr_at(f16, Some(DType::F32)),
+        dense_f32,
+        "F16 GGUF, f32 arm"
+    );
+    assert_eq!(
+        crate::app::lfm2::representation(f16, true, None).unwrap(),
+        crate::app::lfm2::representation(&st, true, None).unwrap(),
+        "on the CPU a GGUF computes at the CPU's model dtype too"
+    );
     let ck = |argv: &[&str]| Checkpoint::of(&resolve(None, "chat", argv, &none).unwrap()).lfm2;
     assert_eq!(ck(&[]), Some(Representation::MEASURED), "no --model");
     assert_eq!(ck(&["--model", &st_s]), Some(Representation::MEASURED));
-    assert_eq!(ck(&["--model", &q8_s]), Some(blocks_f32));
-    assert_eq!(ck(&["--model", &f16_s]), Some(dense_f32));
+    assert_eq!(ck(&["--model", &q8_s]), Some(blocks_f16));
+    assert_eq!(ck(&["--model", &f16_s]), Some(Representation::MEASURED));
+    assert_eq!(
+        ck(&["--model", &q8_s, "--gguf-act", "f32"]),
+        Some(blocks_f32)
+    );
+    assert_eq!(
+        ck(&["--model", &f16_s, "--gguf-act", "f32"]),
+        Some(dense_f32)
+    );
+    assert_eq!(
+        ck(&["--model", &f16_s, "--gguf-act", "f16"]),
+        Some(Representation::MEASURED)
+    );
     assert_eq!(
         ck(&["--model", &q8_s, "--gguf-engine", "legacy"]),
         None,
@@ -1938,16 +1975,24 @@ fn the_lfm2_rows_key_on_the_representation_not_the_container() {
             let snapshot = at_model(None, &[]);
             let dense = at_model(Some(st_s.as_str()), &[]);
             let packed = at_model(Some(q8_s.as_str()), &[]);
+            let packed_f32 = at_model(Some(q8_s.as_str()), &["--gguf-act", "f32"]);
             let dense_gguf = at_model(Some(f16_s.as_str()), &[]);
+            let dense_gguf_f32 = at_model(Some(f16_s.as_str()), &["--gguf-act", "f32"]);
             let legacy = at_model(Some(q8_s.as_str()), &["--gguf-engine", "legacy"]);
             for r in ROWS.iter().filter(|r| r.frontend == f) {
                 let k = r.key;
                 let ctx = format!("{} --batch {batch} {k} ({:?})", f.name(), r.when);
                 assert_eq!(at(&dense, k), at(&snapshot, k), "{ctx}: safetensors");
+                // The same weights as a dense F16 GGUF take safetensors' rows.
+                assert_eq!(at(&dense_gguf, k), at(&dense, k), "{ctx}: F16 GGUF");
                 let lfm2_row = matches!(r.when, When::Lfm2) || measured_only(r.when);
                 if !lfm2_row {
-                    for (o, what) in [(&packed, "Q8_0"), (&dense_gguf, "F16"), (&legacy, "legacy")]
-                    {
+                    for (o, what) in [
+                        (&packed, "Q8_0"),
+                        (&packed_f32, "Q8_0 f32"),
+                        (&dense_gguf_f32, "F16 f32"),
+                        (&legacy, "legacy"),
+                    ] {
                         assert_eq!(at(o, k), at(&dense, k), "{ctx}: {what} GGUF");
                     }
                     continue;
@@ -1960,7 +2005,11 @@ fn the_lfm2_rows_key_on_the_representation_not_the_container() {
                         .filter(|x| x.when != r.when)
                         .any(|x| x.when.holds(o))
                 };
-                for (o, what) in [(&packed, "Q8_0"), (&dense_gguf, "F16")] {
+                for (o, what) in [
+                    (&packed, "Q8_0"),
+                    (&packed_f32, "Q8_0 f32"),
+                    (&dense_gguf_f32, "F16 f32"),
+                ] {
                     if others_hold(o) {
                         continue;
                     }
@@ -1982,8 +2031,13 @@ fn the_lfm2_rows_key_on_the_representation_not_the_container() {
             let empty = BTreeSet::new();
             let named_rows = |o: &EngineOptions| withheld(o, f, &empty, &empty);
             assert_eq!(named_rows(&dense), None, "{} safetensors", f.name());
+            assert_eq!(named_rows(&dense_gguf), None, "{} F16 GGUF", f.name());
             assert_eq!(named_rows(&legacy), None, "{} legacy", f.name());
-            for (o, rep) in [(&packed, "blocks f32"), (&dense_gguf, "dense f32")] {
+            for (o, rep) in [
+                (&packed, "blocks f16"),
+                (&packed_f32, "blocks f32"),
+                (&dense_gguf_f32, "dense f32"),
+            ] {
                 let line = named_rows(o);
                 if !metal {
                     assert_eq!(line, None, "{} off Metal", f.name());

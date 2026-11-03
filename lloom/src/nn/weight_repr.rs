@@ -5,6 +5,7 @@
 //! asks for with a [`WeightRepr`]: a dense tensor at the model's dtype, or the
 //! packed blocks the quantized cores execute directly. One model
 //! implementation consumes both; nothing above the adapter knows the format.
+use crate::nn::project::{project, Epilogue, Spec, Triple, Weight as Projection};
 use crate::nn::var_builder::{LoadRecord, Recorder, SimpleBackend, VarBuilder};
 use crate::nn::Init;
 use lloom_tensor::quantized::{gguf_file, GgmlDType, QMatMul, QTensor};
@@ -39,42 +40,70 @@ impl WeightRepr {
     }
 }
 
-/// `y = x · Wᵀ (+ b)` over a [`WeightRepr`]. Dense runs `nn::Linear`'s own
-/// forward, so a dense model computes exactly what it did before the seam;
-/// blocks run the quantized matmul. The GEMV epilogue kernels read a dense
-/// weight, so they reach it only through [`Self::dense`].
+/// `y = x · Wᵀ (+ b)` over a [`WeightRepr`], through [`project`] at the
+/// triple the block declares. Dense runs `nn::Linear`'s own forward, so a
+/// dense model computes exactly what it did before the seam; blocks run the
+/// quantized matmul. The GEMV epilogue kernels read a dense weight, so they
+/// reach it only through [`Self::dense`].
 #[derive(Debug, Clone)]
 pub struct ReprLinear {
     inner: Projection,
+    triple: Triple,
     span: tracing::Span,
 }
 
-#[derive(Debug, Clone)]
-enum Projection {
-    Dense(crate::nn::Linear),
-    Blocks(QMatMul),
-}
-
 impl ReprLinear {
+    /// A dense projection, at the weight's dtype.
     pub fn from_weights(weights: Tensor, bias: Option<Tensor>) -> Self {
-        Self::of(Projection::Dense(crate::nn::Linear::new(weights, bias)))
+        let triple = Triple::at(weights.dtype());
+        Self::of(
+            Projection::Dense(crate::nn::Linear::new(weights, bias)),
+            triple,
+        )
     }
 
-    /// A bias-free projection over `w`. Packed blocks go through
-    /// `QMatMul::from_arc`, so the quantized tuning (`qmm.dequantize_all`)
-    /// applies as it does to every other GGUF consumer.
-    pub fn from_repr(w: WeightRepr) -> Result<Self> {
-        Ok(Self::of(match w {
-            WeightRepr::Dense(t) => Projection::Dense(crate::nn::Linear::new(t, None)),
-            WeightRepr::Blocks(q) => Projection::Blocks(QMatMul::from_arc(q)?),
-        }))
+    /// A bias-free projection over `w` for a model computing in `dtype`:
+    /// dense at the weight's dtype, packed blocks at `(dtype, f32, dtype)`.
+    /// Packed blocks go through `QMatMul::from_arc`, so the quantized tuning
+    /// (`qmm.dequantize_all`) applies as it does to every other GGUF consumer.
+    pub fn from_repr(w: WeightRepr, dtype: DType) -> Result<Self> {
+        Ok(match w {
+            WeightRepr::Dense(t) => Self::from_weights(t, None),
+            WeightRepr::Blocks(q) => {
+                Self::of(Projection::Blocks(QMatMul::from_arc(q)?), Triple::at(dtype))
+            }
+        })
     }
 
-    fn of(inner: Projection) -> Self {
+    fn of(inner: Projection, triple: Triple) -> Self {
         Self {
             inner,
+            triple,
             span: tracing::span!(tracing::Level::TRACE, "linear"),
         }
+    }
+
+    /// The same projection at another declared triple (a block whose
+    /// numerics need a different one than the stream's, e.g. f32 logits).
+    pub fn with_triple(mut self, triple: Triple) -> Self {
+        self.triple = triple;
+        self
+    }
+
+    /// The triple this projection declares.
+    pub fn triple(&self) -> Triple {
+        self.triple
+    }
+
+    /// The prepared weight [`project`] reads.
+    pub fn weight(&self) -> &Projection {
+        &self.inner
+    }
+
+    /// The route at each row band, for an input arriving at `input`
+    /// (`nn::project::describe`).
+    pub fn routes(&self, input: DType) -> String {
+        crate::nn::project::describe(&self.inner, self.triple, input)
     }
 
     /// The `[out, in]` dense weight, for a caller that fuses this projection
@@ -114,11 +143,7 @@ impl ReprLinear {
 
     /// `(out, in)`.
     pub fn dims(&self) -> (usize, usize) {
-        let d = match &self.inner {
-            Projection::Dense(l) => l.weight().dims(),
-            Projection::Blocks(QMatMul::QTensor(q)) => q.shape().dims(),
-            Projection::Blocks(QMatMul::Tensor(t) | QMatMul::TensorF16(t)) => t.dims(),
-        };
+        let d = self.inner.dims();
         (d[0], d[d.len() - 1])
     }
 
@@ -132,25 +157,19 @@ impl ReprLinear {
 
     /// The storage's name (`f16`, `q8_0`, …).
     pub fn kind(&self) -> String {
-        match &self.inner {
-            Projection::Dense(l) => l.weight().dtype().as_str().to_string(),
-            Projection::Blocks(QMatMul::QTensor(q)) => format!("{:?}", q.dtype()).to_lowercase(),
-            Projection::Blocks(QMatMul::Tensor(t) | QMatMul::TensorF16(t)) => {
-                format!("{} (dequantized)", t.dtype().as_str())
-            }
-        }
+        crate::nn::project::kind(&self.inner)
     }
 }
 
 impl Module for ReprLinear {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let _enter = self.span.enter();
-        match &self.inner {
-            Projection::Dense(l) => l.forward(x),
-            // The quantized cores read a packed row; a strided view is copied
-            // first (a no-op on a contiguous input).
-            Projection::Blocks(q) => q.forward(&x.contiguous()?),
-        }
+        let spec = Spec {
+            triple: self.triple,
+            rows: crate::nn::project::rows_of(x, self.inner.k()),
+            epilogue: Epilogue::Store,
+        };
+        project(x, &self.inner, spec)
     }
 }
 
@@ -171,7 +190,7 @@ pub fn linear_no_bias(in_dim: usize, out_dim: usize, vb: VarBuilder) -> Result<R
         "weight",
         crate::nn::init::DEFAULT_KAIMING_NORMAL,
     )?;
-    ReprLinear::from_repr(w)
+    ReprLinear::from_repr(w, vb.dtype())
 }
 
 /// A token table over a [`WeightRepr`]: dense rows by `index_select`, or
@@ -180,6 +199,8 @@ pub fn linear_no_bias(in_dim: usize, out_dim: usize, vb: VarBuilder) -> Result<R
 pub struct ReprEmbedding {
     inner: Table,
     hidden: usize,
+    /// The dtype the model computes in: a packed lookup is returned at it.
+    dtype: DType,
     span: tracing::Span,
 }
 
@@ -205,6 +226,7 @@ impl ReprEmbedding {
                 WeightRepr::Blocks(q) => Table::Blocks(q),
             },
             hidden,
+            dtype: vb.dtype(),
             span: tracing::span!(tracing::Level::TRACE, "embedding"),
         })
     }
@@ -225,7 +247,7 @@ impl ReprEmbedding {
     pub fn tied_head(&self) -> Result<ReprLinear> {
         match &self.inner {
             Table::Dense(e) => Ok(ReprLinear::from_weights(e.embeddings().clone(), None)),
-            Table::Blocks(q) => ReprLinear::from_repr(WeightRepr::Blocks(q.clone())),
+            Table::Blocks(q) => ReprLinear::from_repr(WeightRepr::Blocks(q.clone()), self.dtype),
         }
     }
 
@@ -245,11 +267,12 @@ impl ReprEmbedding {
         }
     }
 
-    /// The dtype a lookup returns: the dense table's, f32 for packed rows.
+    /// The dtype a lookup returns: the dense table's; packed rows, the
+    /// model's.
     pub fn compute_dtype(&self) -> DType {
         match &self.inner {
             Table::Dense(e) => e.embeddings().dtype(),
-            Table::Blocks(_) => DType::F32,
+            Table::Blocks(_) => self.dtype,
         }
     }
 
@@ -300,7 +323,15 @@ impl Module for ReprEmbedding {
         let _enter = self.span.enter();
         match &self.inner {
             Table::Dense(e) => e.forward(ids),
-            Table::Blocks(q) => q.embedding(ids),
+            // The packed rows dequantize to f32.
+            Table::Blocks(q) => {
+                let rows = q.embedding(ids)?;
+                if self.dtype == DType::F32 {
+                    Ok(rows)
+                } else {
+                    rows.to_dtype(self.dtype)
+                }
+            }
         }
     }
 }

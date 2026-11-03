@@ -481,6 +481,17 @@ fn qwen4exp_key_set(model: &LoadConfig) -> Option<&'static str> {
     .find_map(|(set, key)| set.then_some(key))
 }
 
+/// `models.lfm2_gguf.activation_dtype` off its default on a family that
+/// computes at no other dtype for it: refused by name.
+fn refuse_gguf_act(model: &LoadConfig, family: &str) -> Result<()> {
+    if model.gguf_act != LoadConfig::default().gguf_act {
+        anyhow::bail!(
+            "`models.lfm2_gguf.activation_dtype` (--gguf-act) is the LFM2 engine's over an LFM2 GGUF; {family} has no such arm"
+        );
+    }
+    Ok(())
+}
+
 /// The refusals every family shares.
 fn resolve_common(cap: &Capabilities, req: &Requested<'_>) -> Result<()> {
     let s = &req.shape;
@@ -541,6 +552,7 @@ impl Family for Lfm2Family {
     }
     fn resolve(&self, req: &Requested<'_>) -> Result<()> {
         resolve_common(&LFM2_CAPABILITIES, req)?;
+        refuse_gguf_act(req.model, "a safetensors LFM2 checkpoint")?;
         let s = &req.shape;
         lfm2::RowsArm::parse(&s.rows, s.batch > 1)?;
         if s.share_prefix && !(s.batch > 1 && lfm2::RowsArm::parse(&s.rows, true)?.pooled()) {
@@ -589,7 +601,18 @@ fn lfm2_load_options(checkpoint: PathBuf, req: &Requested<'_>) -> Result<lfm2::L
         decision_template: model.decision_template.clone(),
         decision_ragged: shape.decision_ragged,
         text_only: model.text_only,
+        gguf_act: gguf_act(model),
     })
+}
+
+/// `models.lfm2_gguf.activation_dtype` as a dtype: `None` for `auto`, the
+/// model's dtype (`app::lfm2::compute_dtype`).
+pub(crate) fn gguf_act(model: &LoadConfig) -> Option<lloom_tensor::DType> {
+    match model.gguf_act.as_str() {
+        "f16" => Some(lloom_tensor::DType::F16),
+        "f32" => Some(lloom_tensor::DType::F32),
+        _ => None,
+    }
 }
 
 /// The arm `models.lfm2_gguf.engine` names is the LFM2 engine.
@@ -638,6 +661,7 @@ impl Family for Qwen4ExpFamily {
     }
     fn resolve(&self, req: &Requested<'_>) -> Result<()> {
         resolve_common(&QWEN4EXP_CAPABILITIES, req)?;
+        refuse_gguf_act(req.model, "qwen4exp")?;
         let s = &req.shape;
         if s.speculative.method == "mtp" {
             if s.speculative.drafter.is_none() {
@@ -744,6 +768,7 @@ impl Family for Qwen3_5Family {
     }
     fn resolve(&self, req: &Requested<'_>) -> Result<()> {
         resolve_common(&self.capabilities(), req)?;
+        refuse_gguf_act(req.model, "qwen3_5")?;
         let s = &req.shape;
         if s.speculative.method == "mtp" {
             if let Some(d) = &s.speculative.drafter {
@@ -816,7 +841,7 @@ impl Family for Lfm2GgufFamily {
         if !gguf_on_lfm2(model) {
             return super::causal_loaded::served::lfm2_gguf_capabilities();
         }
-        lfm2_gguf_engine_capabilities(lfm2::representation(first, model.cpu()).ok())
+        lfm2_gguf_engine_capabilities(lfm2::representation(first, model.cpu(), gguf_act(model)).ok())
     }
     fn resolve(&self, req: &Requested<'_>) -> Result<()> {
         if gguf_on_lfm2(req.model) {
@@ -836,6 +861,7 @@ impl Family for Lfm2GgufFamily {
         }
         let cap = super::causal_loaded::served::lfm2_gguf_capabilities();
         resolve_common(&cap, req)?;
+        refuse_gguf_act(req.model, "the legacy GGUF engine")?;
         if req.model.flash_k.is_some() {
             anyhow::bail!("--flash-k sizes LFM2's FlashDecoding chunk; lfm2-gguf has no such arm");
         }
@@ -1090,6 +1116,76 @@ mod tests {
         assert!(LFM2_CAPABILITIES.eos_gate);
         assert_eq!(LFM2_CAPABILITIES.speculation, &["dspark"]);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// `--gguf-act` is the LFM2 engine's over an LFM2 GGUF: every family
+    /// with no such arm refuses it by key; the LFM2 engine over a GGUF takes
+    /// it.
+    #[test]
+    fn the_gguf_activation_dtype_is_refused_where_no_family_reads_it() {
+        let f16 = model_args(&["--gguf-act", "f16"]);
+        assert_eq!(f16.gguf_act, "f16");
+        let legacy = model_args(&["--gguf-act", "f16", "--gguf-engine", "legacy"]);
+        let key = "models.lfm2_gguf.activation_dtype";
+        let families: [(&dyn Family, &LoadConfig); 4] = [
+            (&Lfm2Family, &f16),
+            (&Qwen4ExpFamily, &f16),
+            (&Qwen3_5Family, &f16),
+            (&Lfm2GgufFamily, &legacy),
+        ];
+        for (family, model) in families {
+            let err = family
+                .resolve(&Requested {
+                    model,
+                    shape: shape(),
+                })
+                .expect_err(family.name())
+                .to_string();
+            assert!(err.contains(key), "{}: {err}", family.name());
+        }
+        Lfm2GgufFamily
+            .resolve(&Requested {
+                model: &f16,
+                shape: shape(),
+            })
+            .unwrap();
+        Lfm2GgufFamily
+            .resolve(&Requested {
+                model: &model_args(&[]),
+                shape: shape(),
+            })
+            .unwrap();
+
+        // The default is `auto`, the model's dtype; `f32` is an arm, refused
+        // where no family reads it exactly as `f16` is.
+        use lloom_tensor::DType;
+        assert_eq!(LoadConfig::default().gguf_act, "auto");
+        assert_eq!(gguf_act(&model_args(&[])), None);
+        assert_eq!(gguf_act(&f16), Some(DType::F16));
+        let f32 = model_args(&["--gguf-act", "f32"]);
+        assert_eq!(gguf_act(&f32), Some(DType::F32));
+        let err = Lfm2Family
+            .resolve(&Requested {
+                model: &f32,
+                shape: shape(),
+            })
+            .expect_err("f32 on a safetensors LFM2")
+            .to_string();
+        assert!(err.contains(key), "{err}");
+        for model in [&f32, &model_args(&["--gguf-act", "auto"])] {
+            Lfm2GgufFamily
+                .resolve(&Requested {
+                    model,
+                    shape: shape(),
+                })
+                .unwrap();
+        }
+        Lfm2Family
+            .resolve(&Requested {
+                model: &model_args(&["--gguf-act", "auto"]),
+                shape: shape(),
+            })
+            .unwrap();
     }
 
     #[test]

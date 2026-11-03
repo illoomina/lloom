@@ -36,7 +36,13 @@ impl Wake {
             }
         }
     }
-    #[cfg(test)]
+    /// Whether a thread is parked on this wake: a validated member of its
+    /// parking queue, observed without unparking it. Parking_lot creates a
+    /// thread's parking data before queueing it, so a parked thread's
+    /// one-time parking setup is done. For tests, and behind `fuzzing` for
+    /// the integration tests that count allocations process-wide
+    /// (`lloom_tensor::retirement_worker_parked`).
+    #[cfg(any(test, all(feature = "metal", feature = "fuzzing")))]
     pub(crate) fn test_is_parked(&self) -> bool {
         let mut parked = false;
         // SAFETY: the test retains this Wake at its stable parking address.

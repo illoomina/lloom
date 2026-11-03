@@ -122,6 +122,14 @@ pub fn settle_read_workers() -> Option<u32> {
     readers::started().map(|r| r.settle())
 }
 
+/// How many of the read threads have started ([`ReaderStats::threads`] of
+/// them once all have): a test counting allocations process-wide waits for
+/// all, so no thread's own start lands in its window.
+#[cfg(all(unix, feature = "fuzzing"))]
+pub fn read_workers_started() -> Option<usize> {
+    readers::started().map(|r| r.started_threads())
+}
+
 /// What a read keeps between calls so that it allocates nothing: which of a
 /// request's rows are read by `pread`, and their packed bytes.
 #[derive(Debug, Default)]

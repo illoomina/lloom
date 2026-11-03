@@ -7,7 +7,23 @@
 //! The counter is process-wide, because the reads land on other threads, so
 //! this file is its own binary with one test. Its positive control is the
 //! same read without the scratch, which allocates the cold rows' indices and
-//! bytes per call: a counter that reads 0 there is not counting.
+//! bytes per call: a counter that reads 0 there is not counting. Each count
+//! is also attributed to the threads that made it (reported, not asserted;
+//! CONTRIBUTING §3.1b), so a red names its thread.
+//!
+//! A thread's one-time setup is not the window's, and under load three
+//! landed inside one (#1205, census row 1), each attributed by thread and
+//! backtrace. Each window now opens only once its threads are past theirs:
+//! - the read threads: a thread is handed jobs before it has first run, and
+//!   std's per-thread start allocates on it. The warm-up wakes only the 16
+//!   a token's rows use, so the reads wait until all 32 have started
+//!   (`read_workers_started`);
+//! - the shared retirement worker, which the Metal device starts: its first
+//!   park sets up parking_lot's per-thread data. The fill waits until it is
+//!   parked (`lloom_tensor::retirement_worker_parked`);
+//! - rayon's read pool: each worker's first sleep allocates its lock. Its
+//!   report loop, which asserts nothing, now runs after the fill, and the
+//!   pool is built on first use, so none of its threads exists before.
 //!
 //! The hedged reads are not left to the host's read latency: one row of each
 //! hedged request is held on its read thread until the request's hedge has
@@ -25,9 +41,9 @@
 //! assertions are off.
 
 use lloom::nn::ngram_memory::{
-    hold_read_worker_row, read_worker_hold_stats, read_worker_stats, settle_read_workers,
-    HeldWinner, HoldStats, MmapRows, NgramHash, ReadPolicy, ReadPool, ReadScratch,
-    PER_LAYER_TOKEN_EMBD,
+    hold_read_worker_row, read_worker_hold_stats, read_worker_stats, read_workers_started,
+    settle_read_workers, HeldWinner, HoldStats, MmapRows, NgramHash, ReadPolicy, ReadPool,
+    ReadScratch, PER_LAYER_TOKEN_EMBD,
 };
 use lloom_tensor::quantized::{gguf_file, GgmlDType, QStorage, QTensor};
 use lloom_tensor::{Device, Result};
@@ -42,6 +58,7 @@ static ALLOCS: AtomicU64 = AtomicU64::new(0);
 unsafe impl std::alloc::GlobalAlloc for CountingAllocator {
     unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
         ALLOCS.fetch_add(1, Ordering::Relaxed);
+        by_thread::charge();
         unsafe { std::alloc::System.alloc(layout) }
     }
     unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
@@ -49,12 +66,103 @@ unsafe impl std::alloc::GlobalAlloc for CountingAllocator {
     }
     unsafe fn realloc(&self, ptr: *mut u8, layout: std::alloc::Layout, new_size: usize) -> *mut u8 {
         ALLOCS.fetch_add(1, Ordering::Relaxed);
+        by_thread::charge();
         unsafe { std::alloc::System.realloc(ptr, layout, new_size) }
     }
 }
 
 #[global_allocator]
 static ALLOC: CountingAllocator = CountingAllocator;
+
+/// Each counted allocation charged to its thread, in a fixed table that
+/// allocates nothing: a slot per thread (by `pthread_self`), its name, its
+/// count. Read at a window's two ends and reported beside the window's total.
+mod by_thread {
+    use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
+    pub const SLOTS: usize = 256;
+    const NAME: usize = 32;
+    static TIDS: [AtomicUsize; SLOTS] = [const { AtomicUsize::new(0) }; SLOTS];
+    static COUNTS: [AtomicU64; SLOTS] = [const { AtomicU64::new(0) }; SLOTS];
+    static NAMES: [[AtomicU8; NAME]; SLOTS] = [const { [const { AtomicU8::new(0) }; NAME] }; SLOTS];
+    /// Allocations on threads past the table's slots.
+    static OVERFLOW: AtomicU64 = AtomicU64::new(0);
+    /// The test's own thread, named so in the report.
+    pub static TEST: AtomicUsize = AtomicUsize::new(0);
+
+    pub fn me() -> usize {
+        // SAFETY: takes no arguments; returns the calling thread's handle.
+        unsafe { libc::pthread_self() as usize }
+    }
+
+    pub fn charge() {
+        let tid = me();
+        for i in 0..SLOTS {
+            let t = TIDS[i].load(Ordering::Acquire);
+            let mine = t == tid
+                || (t == 0
+                    && TIDS[i]
+                        .compare_exchange(0, tid, Ordering::AcqRel, Ordering::Acquire)
+                        .is_ok());
+            if mine {
+                if NAMES[i][0].load(Ordering::Relaxed) == 0 {
+                    let mut buf = [0u8; NAME];
+                    // SAFETY: `tid` is the calling thread, `buf` holds NAME bytes.
+                    unsafe {
+                        libc::pthread_getname_np(
+                            tid as libc::pthread_t,
+                            buf.as_mut_ptr().cast(),
+                            NAME,
+                        )
+                    };
+                    for (j, b) in buf.iter().enumerate() {
+                        NAMES[i][j].store(*b, Ordering::Relaxed);
+                    }
+                }
+                COUNTS[i].fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+        }
+        OVERFLOW.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Every slot's count and the overflow, copied without allocating.
+    pub fn counts() -> ([u64; SLOTS], u64) {
+        (
+            std::array::from_fn(|i| COUNTS[i].load(Ordering::Relaxed)),
+            OVERFLOW.load(Ordering::Relaxed),
+        )
+    }
+
+    /// `thread=count` for every thread that allocated between `a` and `b`.
+    pub fn between(a: &([u64; SLOTS], u64), b: &([u64; SLOTS], u64)) -> String {
+        let test = TEST.load(Ordering::Relaxed);
+        let mut parts = Vec::new();
+        for i in 0..SLOTS {
+            let d = b.0[i] - a.0[i];
+            if d > 0 {
+                let who = if TIDS[i].load(Ordering::Relaxed) == test {
+                    "test".to_string()
+                } else {
+                    let n: Vec<u8> = NAMES[i]
+                        .iter()
+                        .map(|c| c.load(Ordering::Relaxed))
+                        .take_while(|&c| c != 0)
+                        .collect();
+                    String::from_utf8_lossy(&n).into_owned()
+                };
+                parts.push(format!("{who:?}={d}"));
+            }
+        }
+        if b.1 > a.1 {
+            parts.push(format!("unattributed={}", b.1 - a.1));
+        }
+        if parts.is_empty() {
+            "none".into()
+        } else {
+            parts.join(" ")
+        }
+    }
+}
 
 fn allocs() -> u64 {
     ALLOCS.load(Ordering::SeqCst)
@@ -120,6 +228,7 @@ fn the_host_fill_allocates_nothing_per_token() -> Result<()> {
     // More threads than a token's rows, so that a hedge at once finds idle
     // threads to re-read on (in a decode the threads whose rows landed are
     // the idle ones).
+    by_thread::TEST.store(by_thread::me(), Ordering::Relaxed);
     assert!(lloom::nn::ngram_memory::start_read_workers(32));
     let path = table_file()?;
     let hash = hash()?;
@@ -132,16 +241,28 @@ fn the_host_fill_allocates_nothing_per_token() -> Result<()> {
     t.set_hedge_us(0);
     let mut scratch = ReadScratch::with_rows(hash.n_heads(), t.row_bytes());
     let mut out = vec![0f32; hash.n_heads() * HEAD_DIM];
-    // Warm: the read threads start, the lazy statics settle.
+    // Warm: the lazy statics settle. Then every read thread started: the
+    // warm-up's 16 rows wake only 16 of them, and a thread first scheduled
+    // inside a window below would charge its start to the window.
     t.gather_into_with(&sets[0], &mut out, &mut scratch)?;
+    let threads = read_worker_stats().unwrap_or_default().threads;
+    let started = read_workers_started_within(threads, START_BOUND);
+    assert_eq!(
+        started,
+        Some(threads),
+        "the read threads had not all started within {START_BOUND:?}"
+    );
 
     let r0 = read_worker_stats().unwrap_or_default();
+    let c0 = by_thread::counts();
     let a0 = allocs();
     for ids in &sets {
         t.gather_into_with(ids, &mut out, &mut scratch)?;
     }
     let reads = allocs() - a0;
+    let c1 = by_thread::counts();
     let r1 = read_worker_stats().unwrap_or_default();
+    let reads_by = by_thread::between(&c0, &c1);
 
     // Every row in flight hedged at once, on the idle threads: the second
     // reads allocate nothing either. Row `HELD` waits for its request's
@@ -157,11 +278,14 @@ fn the_host_fill_allocates_nothing_per_token() -> Result<()> {
     assert!(hold_read_worker_row(Some((HELD, HeldWinner::Hedge))));
     t.set_hedge_us(1);
     let h0 = read_worker_stats().unwrap_or_default();
+    let c0 = by_thread::counts();
     let a0 = allocs();
     for ids in &sets {
         t.gather_into_with(ids, &mut out, &mut scratch)?;
     }
     let hedged_reads = allocs() - a0;
+    let c1 = by_thread::counts();
+    let hedged_by = by_thread::between(&c0, &c1);
     let h1 = read_worker_stats().unwrap_or_default();
     let held = read_worker_hold_stats().unwrap_or_default();
     hold_read_worker_row(None);
@@ -174,31 +298,23 @@ fn the_host_fill_allocates_nothing_per_token() -> Result<()> {
     }
     let control = allocs() - a0;
 
-    // rayon's pool, reported, not asserted: the library's own bookkeeping.
-    t.set_read_pool(ReadPool::Rayon);
-    let a0 = allocs();
-    for ids in &sets {
-        t.gather_into_with(ids, &mut out, &mut scratch)?;
-    }
-    let rayon = allocs() - a0;
-    t.set_read_pool(ReadPool::Workers);
-
     // A request the read threads refuse is read on rayon's pool, which
     // allocates: the refusals are reported beside each count.
     println!(
-        "ALLOCS reads={reads} (refused {}) hedged={hedged_reads} (refused {}; re-read {} rows, {} won; {held:?}) control={control} rayon={rayon} over {} tokens",
+        "ALLOCS reads={reads} (refused {}) hedged={hedged_reads} (refused {}; re-read {} rows, {} won; {held:?}) control={control} over {} tokens",
         r1.refused - r0.refused,
         h1.refused - h0.refused,
         h1.hedged - h0.hedged,
         h1.hedge_wins - h0.hedge_wins,
         sets.len()
     );
+    println!("ALLOCS BY THREAD reads: {reads_by} | hedged: {hedged_by}");
     assert!(
         control >= 2 * sets.len() as u64,
         "the scratch-less read counted {control} allocations over {} tokens: the counter is not counting",
         sets.len()
     );
-    assert_eq!(reads, 0, "the read threads' reads allocated");
+    assert_eq!(reads, 0, "the read threads' reads allocated: {reads_by}");
     assert_eq!(
         held.gave_up,
         0,
@@ -213,12 +329,24 @@ fn the_host_fill_allocates_nothing_per_token() -> Result<()> {
         held.rehedged >= 1 && h1.hedge_wins > h0.hedge_wins,
         "the held row was not re-read and landed by its hedge: {held:?}, {h1:?}"
     );
-    assert_eq!(hedged_reads, 0, "the hedged reads allocated");
+    assert_eq!(hedged_reads, 0, "the hedged reads allocated: {hedged_by}");
 
     a_held_row_lands_once(&t, &sets, &mut scratch)?;
 
     #[cfg(feature = "metal")]
     fill_on_metal(&path, &hash)?;
+
+    // rayon's pool, reported, not asserted: the library's own bookkeeping.
+    // Last, because the pool is built here, on first use, and its workers'
+    // first sleeps allocate on their own threads whenever they get to them:
+    // after this, nothing is counted.
+    t.set_read_pool(ReadPool::Rayon);
+    let a0 = allocs();
+    for ids in &sets {
+        t.gather_into_with(ids, &mut out, &mut scratch)?;
+    }
+    let rayon = allocs() - a0;
+    println!("ALLOCS rayon={rayon} over {} tokens", sets.len());
     std::fs::remove_file(&path).ok();
     Ok(())
 }
@@ -288,6 +416,38 @@ fn a_held_row_lands_once(t: &MmapRows, sets: &[Vec<i64>], scratch: &mut ReadScra
     Ok(())
 }
 
+/// How long the reads wait for every read thread to start.
+const START_BOUND: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How many read threads had started within `bound`, waiting for `threads`
+/// (`read_workers_started`): `None` when no set is running.
+fn read_workers_started_within(threads: usize, bound: std::time::Duration) -> Option<usize> {
+    let start = std::time::Instant::now();
+    loop {
+        match read_workers_started() {
+            Some(n) if n < threads && start.elapsed() < bound => std::thread::yield_now(),
+            other => return other,
+        }
+    }
+}
+
+/// How long the fill waits for the retirement worker to park.
+#[cfg(feature = "metal")]
+const PARK_BOUND: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Whether the shared retirement worker was parked within `bound`
+/// (`lloom_tensor::retirement_worker_parked`): `None` when no worker exists.
+#[cfg(feature = "metal")]
+fn retirement_worker_parked_within(bound: std::time::Duration) -> Option<bool> {
+    let start = std::time::Instant::now();
+    loop {
+        match lloom_tensor::retirement_worker_parked() {
+            Some(false) if start.elapsed() < bound => std::thread::yield_now(),
+            other => return other,
+        }
+    }
+}
+
 /// The producer's fill, start to signal, over a real staging ring.
 #[cfg(feature = "metal")]
 fn fill_on_metal(path: &std::path::Path, hash: &NgramHash) -> Result<()> {
@@ -319,19 +479,27 @@ fn fill_on_metal(path: &std::path::Path, hash: &NgramHash) -> Result<()> {
     let tokens: Vec<u32> = (0..258u32).map(|i| (i * 7919 + 13) % 50_000).collect();
     fill.fill(tokens[0])?;
     fill.fill(tokens[1])?;
+    // The device started the shared retirement worker, whose first park
+    // allocates its parking setup on its own thread when it is first
+    // scheduled. Open the window once it is parked, so that is behind it.
+    let parked = retirement_worker_parked_within(PARK_BOUND);
     let r0 = read_worker_stats().unwrap_or_default();
+    let c0 = by_thread::counts();
     let a0 = allocs();
     for &t in &tokens[2..] {
         fill.fill(t)?;
     }
     let fills = allocs() - a0;
+    let c1 = by_thread::counts();
     let r1 = read_worker_stats().unwrap_or_default();
+    let fills_by = by_thread::between(&c0, &c1);
     let n = tokens.len() - 2;
     // The fill's two Metal calls, the slot and the signal, bare, as many
     // times, on a ring of its own.
     let other = HostFedRing::new(&m, HOST_FILL_SLOTS, hash.n_heads() * HEAD_DIM)?;
     let base = other.base();
     other.signal(base + 1);
+    let c0 = by_thread::counts();
     let a0 = allocs();
     for k in 0..n as u64 {
         // SAFETY: nothing reads this ring; this thread is its only writer.
@@ -340,14 +508,26 @@ fn fill_on_metal(path: &std::path::Path, hash: &NgramHash) -> Result<()> {
         other.signal(base + 2 + k);
     }
     let calls = allocs() - a0;
+    let c1 = by_thread::counts();
+    let calls_by = by_thread::between(&c0, &c1);
     println!(
         "ALLOCS fill={fills} (refused {}) metal_calls={calls} over {n} tokens (debug assertions {})",
         r1.refused - r0.refused,
         cfg!(debug_assertions)
     );
+    println!(
+        "ALLOCS BY THREAD fill: {fills_by} | metal_calls: {calls_by} | retirement worker parked: {parked:?}"
+    );
+    assert_eq!(
+        parked,
+        Some(true),
+        "the retirement worker was not parked within {PARK_BOUND:?} of the device's start \
+         (None: the device started no worker)"
+    );
     assert_eq!(
         fills, calls,
-        "the producer's fill allocated beyond its slot's and its signal's Metal calls"
+        "the producer's fill allocated beyond its slot's and its signal's Metal calls: \
+         fill {fills_by} | calls {calls_by}"
     );
     if !cfg!(debug_assertions) {
         assert_eq!(fills, 0, "the producer's fill allocated");

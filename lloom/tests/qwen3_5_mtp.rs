@@ -345,6 +345,47 @@ fn mtp_on_the_decoder_is_byte_identical_to_greedy_on_the_cpu() -> Result<()> {
     Ok(())
 }
 
+/// The MTP drafter's `Speculator::abort` drops what every lane holds, as
+/// `NextnDrafter::reset_lanes` does for a parked drafter: a failed batch's
+/// touched recovery reaches a drafter only through that call
+/// (`batched-decode-design.md` §11.11). After it the next request keys its
+/// lane from position 0 and still decodes the greedy stream.
+#[test]
+fn an_aborted_mtp_drafter_forgets_every_lane() -> Result<()> {
+    pin();
+    let dev = Device::Cpu;
+    let dense = TinyCheckpoint::<Qwen3_5Tiny>::new(dense_cfg(), Weights::default());
+    let (model, head) = load_dense(&dense, &dev)?;
+    let max = 24;
+    let (prompt, ref_ids, ref_eos) = long_prompt(&model, &dense.cfg, &dev, max)?;
+    let mut mtp = NextnDrafter::new(
+        &head,
+        model.embed_table(),
+        model.lm_head(),
+        &dev,
+        model.capacity(),
+    )?
+    .with_k(2);
+    speculative(&model, &dense.cfg, &dev, &mut mtp, &prompt, max)?;
+    let keyed = mtp.rows_seen();
+    assert!(keyed > 0, "the run keyed the lane");
+    let resets = mtp.lane_resets();
+    Speculator::abort(&mut mtp);
+    assert_eq!(
+        (mtp.rows_seen(), mtp.context_len(SeqId(0))),
+        (0, Some(0)),
+        "the lane still holds the {keyed} rows the aborted run keyed"
+    );
+    assert_eq!(mtp.lane_resets(), resets, "an abort is not a begin_at");
+    let (ids, eos, _) = speculative(&model, &dense.cfg, &dev, &mut mtp, &prompt, max)?;
+    assert_eq!(
+        (ids, eos),
+        (ref_ids, ref_eos),
+        "the request after the abort"
+    );
+    Ok(())
+}
+
 /// The same identity on Metal (the kernels' arms: the GDN's step and chunk,
 /// the attention's decode and prefill, the rewind of every state).
 #[cfg(feature = "metal")]

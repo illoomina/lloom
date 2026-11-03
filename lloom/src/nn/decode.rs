@@ -3827,8 +3827,52 @@ impl<'m, M: CausalLM> Session<'m, M> {
         )
     }
 
+    /// A failure once the first verify is enqueued is reported as having
+    /// touched the sessions, whatever the failing call reports of its own
+    /// pass: from there every lane's position runs ahead of its log (the
+    /// accepted ids are logged at the end) and its window opens and closes
+    /// in turn. A failure before it keeps the call's own report: each
+    /// prefill unit logs what it fed.
     #[allow(clippy::too_many_arguments)]
     fn decode_speculative_pipelined_limits<S>(
+        sessions: &mut [Self],
+        rewind: crate::profile::RewindProof<M::Profile>,
+        spec: &mut S,
+        prompts: &[&[u32]],
+        opts: &DecodeOptions,
+        max_tokens: impl ExactSizeIterator<Item = usize>,
+        eos_ids: &[u32],
+        device: &Device,
+        on_tokens: &mut dyn FnMut(usize, &[u32]) -> Result<()>,
+    ) -> Result<Vec<DecodeOut>>
+    where
+        S: Speculator,
+        M: Probes<S::Probe> + crate::profile::Shaped,
+    {
+        let mut verifying = false;
+        Self::decode_speculative_pipelined_run(
+            sessions,
+            rewind,
+            spec,
+            prompts,
+            opts,
+            max_tokens,
+            eos_ids,
+            device,
+            on_tokens,
+            &mut verifying,
+        )
+        .map_err(|e| {
+            if verifying {
+                e.with_state_touched(lloom_tensor::StateTouched::Yes)
+            } else {
+                e
+            }
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn decode_speculative_pipelined_run<S>(
         sessions: &mut [Self],
         _rewind: crate::profile::RewindProof<M::Profile>,
         spec: &mut S,
@@ -3838,6 +3882,7 @@ impl<'m, M: CausalLM> Session<'m, M> {
         eos_ids: &[u32],
         device: &Device,
         on_tokens: &mut dyn FnMut(usize, &[u32]) -> Result<()>,
+        verifying: &mut bool,
     ) -> Result<Vec<DecodeOut>>
     where
         S: Speculator,
@@ -3976,6 +4021,7 @@ impl<'m, M: CausalLM> Session<'m, M> {
         drop(prefill_pacer);
 
         // Prime: one verify in flight per live sequence.
+        *verifying = true;
         for i in 0..n {
             if !lanes[i].done {
                 let room = lanes[i].limit.remaining(lanes[i].produced);

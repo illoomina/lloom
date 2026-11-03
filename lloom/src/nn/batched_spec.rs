@@ -225,11 +225,32 @@ where
         Ok(joined)
     }
 
-    /// One speculative round over the live rows.
+    /// One speculative round over the live rows. A failure once every row
+    /// is prepared is reported as having touched the rows, whatever the
+    /// failing call reports of its own pass: the verify opens every row's
+    /// window, and a row's position moves only after the drafter observed
+    /// it. A failure before it keeps the call's own report.
     fn round(
         &mut self,
         live: &[usize],
         on_tokens: &mut dyn FnMut(RowId, &[u32]) -> Result<()>,
+    ) -> Result<()> {
+        let mut verifying = false;
+        self.round_run(live, on_tokens, &mut verifying)
+            .map_err(|e| {
+                if verifying {
+                    e.with_state_touched(lloom_tensor::StateTouched::Yes)
+                } else {
+                    e
+                }
+            })
+    }
+
+    fn round_run(
+        &mut self,
+        live: &[usize],
+        on_tokens: &mut dyn FnMut(RowId, &[u32]) -> Result<()>,
+        verifying: &mut bool,
     ) -> Result<()> {
         let round_start_ns = self.run_start.elapsed().as_nanos() as u64;
         let seqs: Vec<SeqId> = live
@@ -273,6 +294,7 @@ where
             let sess: &mut Session<'m, M> = s.session.borrow_mut();
             model.prepare_pass(&mut sess.seq.cache, k + 1)?;
         }
+        *verifying = true;
         let mut rows: Vec<VerifyRowRef<'_, M::Cache>> = picked
             .iter_mut()
             .zip(drafts.iter())

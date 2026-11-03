@@ -631,7 +631,10 @@ fn routed_byte_writes_return_the_receipt_of_their_own_recording() -> Result<()> 
     let Some((_, m)) = metal() else { return Ok(()) };
     non_base(&m);
     m.set_compute_per_buffer(usize::MAX);
-    eprintln!("BYTE_RECEIPT actual_api={}", m.commands().actual_command_api());
+    eprintln!(
+        "BYTE_RECEIPT actual_api={}",
+        m.commands().actual_command_api()
+    );
     let src = m.new_buffer_with_data(&(0..16u8).map(|i| 100 + i).collect::<Vec<_>>())?;
     for (arm, size, fill_route, copy_route) in [
         (
@@ -686,7 +689,7 @@ fn routed_byte_writes_return_the_receipt_of_their_own_recording() -> Result<()> 
             assert_eq!(epoch, probe_epoch, "{arm} {op} receipt epoch");
             m.wait_until_completed()?;
             assert!(
-                marker.poll_data_ready()?,
+                marker.poll_data_ready().map_err(super::MetalError::from)?,
                 "{arm} {op} receipt never proves DATA"
             );
         }

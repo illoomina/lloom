@@ -11979,31 +11979,36 @@ impl<P: Profile> Model<P> {
             )
         }
         let tok = cache.advance(k + 1)?;
-        let anchor = cache.anchor_tensor(last)?;
-        let input = Tensor::cat(&[&anchor, proposed], 0)?.reshape((1, k + 1))?;
-        let logits = self.window_forward(&input, index_pos, cache)?;
-        let argmax = logits.i(0)?.argmax(lloom_tensor::D::Minus1)?;
-        let both_t = Tensor::cat(&[&argmax, proposed], 0)?;
-        let n = 2 * k + 1;
-        let device = cache.device.clone();
-        let published = VerifyWords::ensure(&mut cache.verify_words, n, &device)
-            .map(|w| w.publish(&both_t, n, &device))
-            .transpose()?;
-        let both = if published.is_some() {
-            None
-        } else {
-            Some(both_t.stage_read()?)
-        };
-        // The taps are this pass's; taken now so the cache carries none into
-        // the next pass on it.
-        let taps = cache.take_taps();
-        Ok(PendingVerify {
-            tok,
-            both,
-            published,
-            k,
-            taps,
-        })
+        // The window is open from here: any refusal below leaves the cache
+        // speculative and past its log, so it is never an untouched step.
+        (|| {
+            let anchor = cache.anchor_tensor(last)?;
+            let input = Tensor::cat(&[&anchor, proposed], 0)?.reshape((1, k + 1))?;
+            let logits = self.window_forward(&input, index_pos, cache)?;
+            let argmax = logits.i(0)?.argmax(lloom_tensor::D::Minus1)?;
+            let both_t = Tensor::cat(&[&argmax, proposed], 0)?;
+            let n = 2 * k + 1;
+            let device = cache.device.clone();
+            let published = VerifyWords::ensure(&mut cache.verify_words, n, &device)
+                .map(|w| w.publish(&both_t, n, &device))
+                .transpose()?;
+            let both = if published.is_some() {
+                None
+            } else {
+                Some(both_t.stage_read()?)
+            };
+            // The taps are this pass's; taken now so the cache carries none into
+            // the next pass on it.
+            let taps = cache.take_taps();
+            Ok(PendingVerify {
+                tok,
+                both,
+                published,
+                k,
+                taps,
+            })
+        })()
+        .map_err(touched_step_error)
     }
 
     /// The readback half of [`Self::verify_tokens`]: wait for the pass's own
@@ -12108,60 +12113,74 @@ impl<P: Profile> Model<P> {
         if rows.is_empty() {
             lloom_tensor::bail!("lfm2 verify_rows_enqueue: no rows")
         }
-        let device = rows[0].cache.device.clone();
-        let mut toks = Vec::with_capacity(rows.len());
-        let mut ks = Vec::with_capacity(rows.len());
-        let mut pieces = Vec::with_capacity(rows.len());
-        let mut proposed_all = Vec::with_capacity(rows.len());
-        for row in rows.iter_mut() {
-            let k = row.proposed.dims1()?;
-            if k == 0 {
-                lloom_tensor::bail!("lfm2 verify_rows_enqueue: a row proposes no tokens")
+        // A row's window is open from its `advance`: any refusal after the
+        // first leaves that row speculative and past its log, so it is never
+        // an untouched step.
+        let mut opened = false;
+        (|| {
+            let device = rows[0].cache.device.clone();
+            let mut toks = Vec::with_capacity(rows.len());
+            let mut ks = Vec::with_capacity(rows.len());
+            let mut pieces = Vec::with_capacity(rows.len());
+            let mut proposed_all = Vec::with_capacity(rows.len());
+            for row in rows.iter_mut() {
+                let k = row.proposed.dims1()?;
+                if k == 0 {
+                    lloom_tensor::bail!("lfm2 verify_rows_enqueue: a row proposes no tokens")
+                }
+                if row.proposed.dtype() != DType::U32 {
+                    lloom_tensor::bail!(
+                        "lfm2 verify_rows_enqueue: proposals must be U32 ids, got {:?}",
+                        row.proposed.dtype()
+                    )
+                }
+                toks.push(row.cache.advance(k + 1)?);
+                opened = true;
+                ks.push(k);
+                let anchor = row.cache.anchor_tensor(row.last)?;
+                pieces.push(Tensor::cat(&[&anchor, row.proposed], 0)?);
+                proposed_all.push(row.proposed.clone());
             }
-            if row.proposed.dtype() != DType::U32 {
-                lloom_tensor::bail!(
-                    "lfm2 verify_rows_enqueue: proposals must be U32 ids, got {:?}",
-                    row.proposed.dtype()
-                )
-            }
-            toks.push(row.cache.advance(k + 1)?);
-            ks.push(k);
-            let anchor = row.cache.anchor_tensor(row.last)?;
-            pieces.push(Tensor::cat(&[&anchor, row.proposed], 0)?);
-            proposed_all.push(row.proposed.clone());
-        }
-        let input = Tensor::cat(&pieces, 0)?.unsqueeze(0)?;
-        let mut ragged: Vec<RaggedRow<'_, State<P>>> = rows
-            .iter_mut()
-            .zip(ks.iter())
-            .map(|(row, &k)| RaggedRow {
-                pos: row.pos,
-                len: k + 1,
-                cache: &mut *row.cache,
+            let input = Tensor::cat(&pieces, 0)?.unsqueeze(0)?;
+            let mut ragged: Vec<RaggedRow<'_, State<P>>> = rows
+                .iter_mut()
+                .zip(ks.iter())
+                .map(|(row, &k)| RaggedRow {
+                    pos: row.pos,
+                    len: k + 1,
+                    cache: &mut *row.cache,
+                })
+                .collect();
+            let logits = self.forward_ragged_all(&input, &mut ragged)?;
+            drop(ragged);
+            let argmax = logits.i(0)?.argmax(lloom_tensor::D::Minus1)?;
+            let mut both_parts: Vec<Tensor> = vec![argmax];
+            both_parts.extend(proposed_all);
+            let both_t = Tensor::cat(&both_parts, 0)?;
+            let n = both_t.dims1()?;
+            let published = VerifyWords::ensure(&mut rows[0].cache.verify_words, n, &device)
+                .map(|w| w.publish(&both_t, n, &device))
+                .transpose()?;
+            let both = if published.is_some() {
+                None
+            } else {
+                Some(both_t.stage_read()?)
+            };
+            let taps = rows.iter_mut().map(|row| row.cache.take_taps()).collect();
+            Ok(PendingRows {
+                toks,
+                ks,
+                both,
+                published,
+                taps,
             })
-            .collect();
-        let logits = self.forward_ragged_all(&input, &mut ragged)?;
-        drop(ragged);
-        let argmax = logits.i(0)?.argmax(lloom_tensor::D::Minus1)?;
-        let mut both_parts: Vec<Tensor> = vec![argmax];
-        both_parts.extend(proposed_all);
-        let both_t = Tensor::cat(&both_parts, 0)?;
-        let n = both_t.dims1()?;
-        let published = VerifyWords::ensure(&mut rows[0].cache.verify_words, n, &device)
-            .map(|w| w.publish(&both_t, n, &device))
-            .transpose()?;
-        let both = if published.is_some() {
-            None
-        } else {
-            Some(both_t.stage_read()?)
-        };
-        let taps = rows.iter_mut().map(|row| row.cache.take_taps()).collect();
-        Ok(PendingRows {
-            toks,
-            ks,
-            both,
-            published,
-            taps,
+        })()
+        .map_err(|error| {
+            if opened {
+                touched_step_error(error)
+            } else {
+                error
+            }
         })
     }
 
@@ -13290,6 +13309,89 @@ mod tests {
             "a post-first-layer error must never be retryable No"
         );
         assert!(error.state_touched() != Some(lloom_tensor::StateTouched::No));
+        Ok(())
+    }
+
+    /// `state_touched_fixture` with the rotating conv ring a verify window
+    /// needs (`advance` refuses `Shuffle`), the same 4-slot KV ceiling and the
+    /// same three-token prompt.
+    fn verify_window_fixture() -> Result<(Model<CrownExact>, State<CrownExact>)> {
+        use crate::models::lfm2_testing::Lfm2Tiny;
+        use crate::testing::tiny::{TinyCheckpoint, Weights};
+        let cfg = Config {
+            vocab_size: 64,
+            hidden_size: 64,
+            intermediate_size: 64,
+            num_hidden_layers: 3,
+            num_attention_heads: 4,
+            num_key_value_heads: 2,
+            max_position_embeddings: 32,
+            conv_l_cache: 3,
+            layer_types: vec![LayerType::Conv, LayerType::FullAttention, LayerType::Conv],
+            tie_embedding: true,
+            conv_state: ConvState::RotatingRing { k: 4 },
+            conv_fused: false,
+            kv_append: KvAppend::Cat,
+            ..Default::default()
+        };
+        let device = Device::Cpu;
+        let model = TinyCheckpoint::<Lfm2Tiny>::new(cfg.clone(), Weights::default())
+            .with_dtype(DType::F32)
+            .model::<CrownExact>(&device)?;
+        let mut cache = State::<CrownExact>::new_with(true, DType::F32, &cfg, &device, 4)?;
+        let prompt = Tensor::new(&[1u32, 2, 3], &device)?.reshape((1, 3))?;
+        model.forward(&prompt, 0, &mut cache)?;
+        assert_eq!(cache.kv_len(), 3, "the fixture must populate actual KV");
+        Ok((model, cache))
+    }
+
+    /// A verify opens its window (`advance`) before the forward, so a refusal
+    /// the forward classifies `No` (the 4-slot ceiling) still leaves the cache
+    /// speculative and past its log: the producer must report `Yes`.
+    #[test]
+    fn state_touched_refusal_inside_a_verify_window_is_yes() -> Result<()> {
+        let (model, mut cache) = verify_window_fixture()?;
+        let proposed = Tensor::new(&[4u32, 5], &Device::Cpu)?;
+        let error = model
+            .verify_tokens_enqueue(3, &proposed, 3, &mut cache)
+            .map(|_| ())
+            .unwrap_err();
+        assert!(
+            cache.speculative,
+            "the refusal must come after the window opened"
+        );
+        assert_eq!(
+            error.state_touched(),
+            Some(lloom_tensor::StateTouched::Yes),
+            "a refusal inside an open verify window must never be retryable No: {error}"
+        );
+        Ok(())
+    }
+
+    /// The ragged verify, the same rule: every row's window is open before the
+    /// one forward, so its ceiling refusal must report `Yes`.
+    #[test]
+    fn state_touched_refusal_inside_a_ragged_verify_window_is_yes() -> Result<()> {
+        let (model, mut cache) = verify_window_fixture()?;
+        let proposed = Tensor::new(&[4u32, 5], &Device::Cpu)?;
+        let error = model
+            .verify_rows_enqueue(&mut [VerifyRow {
+                cache: &mut cache,
+                last: 3,
+                pos: 3,
+                proposed: &proposed,
+            }])
+            .map(|_| ())
+            .unwrap_err();
+        assert!(
+            cache.speculative,
+            "the refusal must come after the window opened"
+        );
+        assert_eq!(
+            error.state_touched(),
+            Some(lloom_tensor::StateTouched::Yes),
+            "a refusal inside an open ragged verify window must never be retryable No: {error}"
+        );
         Ok(())
     }
 

@@ -840,6 +840,10 @@ fn phase_snapshot(
 /// detailed Metal sync probe; None for unsampled/off/CPU/compiled-out phases.
 /// Scalar dispatch counts remain independent; census only when asked for.
 /// Pre-release source migration: the three GPU fields are now Option<f64>.
+///
+/// Decision 123: the walls, readbacks, dispatch and pool counters are
+/// recorded only under [`crate::PROFILE_INSTRUMENTS`] (debug, `profile`); a
+/// release build leaves them 0, and a consumer says so instead of printing it.
 #[derive(Debug, Clone, Default)]
 pub struct RoundTiming {
     pub draft_ns: u64,
@@ -1695,16 +1699,24 @@ impl<'m, M: CausalLM> Session<'m, M> {
     {
         probe.with_checked_census(|| {
             let mut timing = RoundTiming::default();
-            let alloc_before = allocation_counters(verify_key.map(|(d, _)| d));
-            let t = std::time::Instant::now();
-            let rb = readbacks();
+            // Decision 123: the round's brackets and counters are statistics,
+            // compiled out of a release build (`HotInstant`, and the counter
+            // reads under `PROFILE_INSTRUMENTS`); the round itself is unchanged.
+            let timed = crate::PROFILE_INSTRUMENTS;
+            let alloc_before = if timed {
+                allocation_counters(verify_key.map(|(d, _)| d))
+            } else {
+                (0, 0, 0)
+            };
+            let t = crate::hot_clock::HotInstant::now();
+            let rb = if timed { readbacks() } else { 0 };
             // The hint is produced only when this round will read it (§3.4.4: the
             // driver owns `p_min`; the family only learns whether it is consumed).
             spec.want_confidence(p_min > 0.0);
             let mut drafts = spec.draft(active)?;
             let (gpu, disp, census) = probe.close()?;
-            timing.draft_ns = t.elapsed().as_nanos() as u64;
-            timing.draft_readbacks = readbacks() - rb;
+            timing.draft_ns = t.elapsed_ns();
+            timing.draft_readbacks = if timed { readbacks() - rb } else { 0 };
             timing.draft_gpu_s = gpu;
             timing.draft_disp = disp;
             timing.draft_census = census;
@@ -1735,8 +1747,8 @@ impl<'m, M: CausalLM> Session<'m, M> {
             // ONE target forward over `[last, draft…]`, extracting the probe in the
             // SAME pass (§10.2r amortization). The round's one host readback is in
             // here: the verify's argmax, with the draft ids beside it.
-            let t = std::time::Instant::now();
-            let rb = readbacks();
+            let t = crate::hot_clock::HotInstant::now();
+            let rb = if timed { readbacks() } else { 0 };
             let pass = match verify_key {
                 Some((device, shape)) => {
                     if let (crate::nn::decode::PassShape::Verify { k }, [_]) = (shape, anchors) {
@@ -1773,27 +1785,29 @@ impl<'m, M: CausalLM> Session<'m, M> {
                 }
             }
             let (gpu, disp, census) = probe.close()?;
-            timing.verify_ns = t.elapsed().as_nanos() as u64;
-            timing.verify_readbacks = readbacks() - rb;
+            timing.verify_ns = t.elapsed_ns();
+            timing.verify_readbacks = if timed { readbacks() - rb } else { 0 };
             timing.verify_gpu_s = gpu;
             timing.verify_disp = disp;
             timing.verify_census = census;
 
-            let t = std::time::Instant::now();
-            let rb = readbacks();
+            let t = crate::hot_clock::HotInstant::now();
+            let rb = if timed { readbacks() } else { 0 };
             for (seq, acc) in active.iter().zip(&accepted) {
                 spec.observe(*seq, &probe_out, acc)?;
             }
             let (gpu, disp, census) = probe.close()?;
-            timing.observe_ns = t.elapsed().as_nanos() as u64;
-            timing.observe_readbacks = readbacks() - rb;
+            timing.observe_ns = t.elapsed_ns();
+            timing.observe_readbacks = if timed { readbacks() - rb } else { 0 };
             timing.observe_gpu_s = gpu;
             timing.observe_disp = disp;
             timing.observe_census = census;
-            let alloc_after = allocation_counters(verify_key.map(|(d, _)| d));
-            timing.pool_allocations = alloc_after.0 - alloc_before.0;
-            timing.residency_adds = alloc_after.1 - alloc_before.1;
-            timing.pool_allocations_pending_twin = alloc_after.2 - alloc_before.2;
+            if timed {
+                let alloc_after = allocation_counters(verify_key.map(|(d, _)| d));
+                timing.pool_allocations = alloc_after.0 - alloc_before.0;
+                timing.residency_adds = alloc_after.1 - alloc_before.1;
+                timing.pool_allocations_pending_twin = alloc_after.2 - alloc_before.2;
+            }
             Ok((accepted, timing))
         })
     }

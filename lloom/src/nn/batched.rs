@@ -1097,7 +1097,9 @@ impl<'m, M: BatchedCausalLM, R: BorrowMut<Session<'m, M>>> BatchDecoder<'m, M, R
     ) -> Result<StepReport> {
         let _pool = lloom_tensor::AutoreleaseScope::new(); // per batched step, see the decode loop
         let device = self.device.clone();
-        let step_start = std::time::Instant::now();
+        // Decision 123: the step's own clock is a statistic, compiled out of a
+        // release build like `StageClock`'s laps.
+        let step_start = crate::hot_clock::HotInstant::now();
         let mut clock = StageClock::start();
         let mut ph = BatchStepPhases::default();
         let mut joined = if self.opts.prefill_chunk == 0 {
@@ -1255,15 +1257,17 @@ impl<'m, M: BatchedCausalLM, R: BorrowMut<Session<'m, M>>> BatchDecoder<'m, M, R
             }
         }
         clock.lap(&mut ph.stream_ns);
-        let step_ns = step_start.elapsed().as_nanos() as u64;
-        for &i in &self.live {
-            self.slots[i]
-                .as_mut()
-                .expect("live")
-                .lane
-                .stats
-                .step_ns
-                .push(step_ns);
+        if crate::PROFILE_INSTRUMENTS {
+            let step_ns = step_start.elapsed_ns();
+            for &i in &self.live {
+                self.slots[i]
+                    .as_mut()
+                    .expect("live")
+                    .lane
+                    .stats
+                    .step_ns
+                    .push(step_ns);
+            }
         }
 
         let kept: Vec<usize> = self

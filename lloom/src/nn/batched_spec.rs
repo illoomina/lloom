@@ -96,7 +96,7 @@ where
     finished: Vec<(usize, DecodeOut)>,
     pacer: StepPacer,
     hot_thread: HotThread,
-    run_start: std::time::Instant,
+    run_start: crate::hot_clock::HotInstant,
 }
 
 impl<'m, M, S, R> SpecBatchDecoder<'m, M, S, R>
@@ -137,7 +137,7 @@ where
             finished: Vec::new(),
             pacer,
             hot_thread: HotThread::claim(),
-            run_start: std::time::Instant::now(),
+            run_start: crate::hot_clock::HotInstant::now(),
         })
     }
 
@@ -252,16 +252,19 @@ where
         on_tokens: &mut dyn FnMut(RowId, &[u32]) -> Result<()>,
         verifying: &mut bool,
     ) -> Result<()> {
-        let round_start_ns = self.run_start.elapsed().as_nanos() as u64;
+        // Decision 123: the round's brackets and readback counts are
+        // statistics, compiled out of a release build.
+        let timed = crate::PROFILE_INSTRUMENTS;
+        let round_start_ns = self.run_start.elapsed_ns();
         let seqs: Vec<SeqId> = live
             .iter()
             .map(|&i| self.slots[i].as_ref().expect("live").seq())
             .collect();
-        let t = std::time::Instant::now();
-        let rb = readbacks();
+        let t = crate::hot_clock::HotInstant::now();
+        let rb = if timed { readbacks() } else { 0 };
         let drafts = self.spec.draft(&seqs)?;
-        let draft_ns = t.elapsed().as_nanos() as u64;
-        let draft_readbacks = readbacks() - rb;
+        let draft_ns = t.elapsed_ns();
+        let draft_readbacks = if timed { readbacks() - rb } else { 0 };
         if drafts.len() != live.len() {
             lloom_tensor::bail!(
                 "decode_spec_batched: {} drafts for {} live rows",
@@ -311,8 +314,8 @@ where
                 }
             })
             .collect();
-        let t = std::time::Instant::now();
-        let rb = readbacks();
+        let t = crate::hot_clock::HotInstant::now();
+        let rb = if timed { readbacks() } else { 0 };
         let shape = PassShape::Ragged {
             live: 0,
             pieces: rows.len() as u16,
@@ -325,11 +328,11 @@ where
         self.pacer.after_forward(&self.device)?;
         let pending = pending?;
         drop(rows);
-        let verify_enqueue_ns = t.elapsed().as_nanos() as u64;
-        let enqueue_readbacks = readbacks() - rb;
+        let verify_enqueue_ns = t.elapsed_ns();
+        let enqueue_readbacks = if timed { readbacks() - rb } else { 0 };
 
-        let t = std::time::Instant::now();
-        let rb = readbacks();
+        let t = crate::hot_clock::HotInstant::now();
+        let rb = if timed { readbacks() } else { 0 };
         let eos_owned: Vec<Vec<u32>> = picked.iter().map(|s| s.lane.eos_ids.clone()).collect();
         let eos_sets: Vec<&[u32]> = eos_owned.iter().map(|v| v.as_slice()).collect();
         let mut caches: Vec<&mut M::Cache> = picked
@@ -341,16 +344,20 @@ where
             .collect();
         let results = model.verify_rows_complete(pending, &mut caches, &eos_sets)?;
         drop(caches);
-        let verify_wait_ns = t.elapsed().as_nanos() as u64;
-        let verify_readbacks = enqueue_readbacks + readbacks() - rb;
+        let verify_wait_ns = t.elapsed_ns();
+        let verify_readbacks = if timed {
+            enqueue_readbacks + readbacks() - rb
+        } else {
+            0
+        };
         end_executor_step(&self.device)?;
 
         // Every row's accepted taps to the drafter in one call: the context
         // re-key of B rows is one projection and one K/V pass per layer
         // (`Speculator::observe_rows`), where a call per row was B serial
         // passes and B scatters per layer (`batched-decode-design.md` §12.10).
-        let t = std::time::Instant::now();
-        let rb = readbacks();
+        let t = crate::hot_clock::HotInstant::now();
+        let rb = if timed { readbacks() } else { 0 };
         {
             let rows: Vec<ObserveRow<'_, S::Probe>> = picked
                 .iter()
@@ -365,8 +372,8 @@ where
             }
             self.spec.observe_rows(&rows)?;
         }
-        let observe_ns = t.elapsed().as_nanos() as u64;
-        let observe_readbacks = readbacks() - rb;
+        let observe_ns = t.elapsed_ns();
+        let observe_readbacks = if timed { readbacks() - rb } else { 0 };
         for ((s, (accepted, _probe)), &i) in picked.iter_mut().zip(results.into_iter()).zip(live) {
             {
                 let sess: &mut Session<'m, M> = s.session.borrow_mut();
@@ -375,7 +382,9 @@ where
             let lane = &mut s.lane;
             lane.anchor_tok = *accepted.last().expect("non-empty");
             lane.stats.steps += 1;
-            lane.stats.rounds.push(RoundStats {
+            lane.stats.round_tally.add(accepted.len());
+            if timed {
+                lane.stats.rounds.push(RoundStats {
                 accepted: accepted.len(),
                 timing: RoundTiming {
                     draft_ns,
@@ -390,6 +399,7 @@ where
                 },
                 start_ns: round_start_ns,
             });
+            }
             let id = RowId {
                 slot: i,
                 generation: s.generation,
@@ -414,9 +424,11 @@ where
                 lane.all_ids.extend_from_slice(&batch);
                 lane.produced += batch.len();
             }
-            lane.stats
-                .step_ns
-                .push((self.run_start.elapsed().as_nanos() as u64).saturating_sub(round_start_ns));
+            if timed {
+                lane.stats
+                    .step_ns
+                    .push(self.run_start.elapsed_ns().saturating_sub(round_start_ns));
+            }
             lane.done = lane.eos || lane.reached(lane.produced);
         }
         Ok(())

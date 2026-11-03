@@ -4082,7 +4082,10 @@ impl VerifyWords {
         let poll = crate::generation::poll::PollMechanism::default();
         let step = p.step_ptr as *const u32;
         let mut spins: u64 = 0;
-        let t0 = std::time::Instant::now();
+        // The clock is read only for the opt-in poll trace (decision 123:
+        // no per-round clock on the steady path).
+        let poll_trace = crate::tuning::tuning().lfm2.verify_poll_trace;
+        let t0 = poll_trace.then(std::time::Instant::now);
         let mut fell_back = false;
         let first = unsafe { std::ptr::read_volatile(step) };
         // Parked on the event behind the stamp: the round's buffer was
@@ -4119,7 +4122,7 @@ impl VerifyWords {
             // timeout elapses, never touches it.
             unsafe { poll.wait_on(step, seen) };
         }
-        if crate::tuning::tuning().lfm2.verify_poll_trace {
+        if let Some(t0) = t0 {
             eprintln!(
                 "[verify poll: gen {} first {} now {} spins {spins} {:.3} ms fallback={fell_back} n={}]",
                 p.generation,

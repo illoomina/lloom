@@ -15,6 +15,9 @@ pub mod tuning;
 /// under. The option tree's `profile` capability reads it.
 pub const PROFILE_INSTRUMENTS: bool = cfg!(any(debug_assertions, feature = "profile"));
 
+/// The per-step clock gated by [`PROFILE_INSTRUMENTS`] (decision 123).
+pub mod hot_clock;
+
 pub mod fused_moe;
 pub mod generation;
 pub mod load_warning;

@@ -555,6 +555,53 @@ pub struct RoundStats {
     pub start_ns: u64,
 }
 
+/// The speculative rounds' coarse tally (decision 123): kept in every build,
+/// beside [`DecodeStats::rounds`], which holds the per-round records only
+/// under [`crate::PROFILE_INSTRUMENTS`]. Counting a round is three integer
+/// adds — no clock, no allocation — so a release build keeps the round count,
+/// the accepted total and the accepted-length histogram the run reports read.
+#[derive(Debug, Clone)]
+pub struct RoundTally {
+    /// Rounds the run took.
+    pub rounds: u64,
+    /// Tokens the verifies returned, summed (`RoundStats::accepted`'s sum).
+    pub accepted: u64,
+    /// Rounds by accepted length: index `a` counts the rounds that accepted
+    /// `a` tokens; the last bucket counts every round at or above it.
+    pub by_accepted: [u64; ROUND_TALLY_BUCKETS],
+}
+
+/// [`RoundTally::by_accepted`]'s buckets: 0 ..= 32 accepted, then the rest.
+pub const ROUND_TALLY_BUCKETS: usize = 34;
+
+impl Default for RoundTally {
+    fn default() -> Self {
+        RoundTally {
+            rounds: 0,
+            accepted: 0,
+            by_accepted: [0; ROUND_TALLY_BUCKETS],
+        }
+    }
+}
+
+impl RoundTally {
+    /// Count one round that accepted `accepted` tokens.
+    #[inline]
+    pub fn add(&mut self, accepted: usize) {
+        self.rounds += 1;
+        self.accepted += accepted as u64;
+        self.by_accepted[accepted.min(ROUND_TALLY_BUCKETS - 1)] += 1;
+    }
+
+    /// The widest bucket a round fell in (the last is "at or above").
+    pub fn widest(&self) -> usize {
+        self.by_accepted
+            .iter()
+            .rposition(|&n| n > 0)
+            .unwrap_or(0)
+    }
+}
+
 /// A resolved output ceiling; zero leaves EOS as the only token boundary.
 #[derive(Clone, Copy)]
 struct TokenLimit(usize);
@@ -765,8 +812,12 @@ pub struct DecodeStats {
     pub overrun: usize,
     /// The strategy's own counters.
     pub readback: ReadbackCounters,
-    /// One entry per speculative round, empty on the baseline body.
+    /// One entry per speculative round, empty on the baseline body — recorded
+    /// only under [`crate::PROFILE_INSTRUMENTS`] (decision 123); a release
+    /// build reads [`Self::round_tally`] instead.
     pub rounds: Vec<RoundStats>,
+    /// The rounds' coarse tally, in every build (decision 123).
+    pub round_tally: RoundTally,
     /// At the end of a speculative run, `(the drafter's own context length,
     /// the target's position)` — equal when the drafter followed the target
     /// through the request's prefix reuse (issue #894). `None` on the
@@ -3508,6 +3559,8 @@ impl<'m, M: CausalLM> Session<'m, M> {
         // `logits.argmax` when it does not hold the last prompt token back.
         let pos_before = self.seq.pos;
         let prefill_start = std::time::Instant::now();
+        // The rounds' timeline origin: a per-round clock (decision 123).
+        let run_hot = crate::hot_clock::HotInstant::now();
         let work = PrefillWork::resolve(opts, self.seq.pos, prompt.len(), true)?;
         let mut prefill_pacer = StepPacer::for_decode(opts);
         let (logits, prefill_probe, prefill_units) =
@@ -3583,7 +3636,7 @@ impl<'m, M: CausalLM> Session<'m, M> {
         while !eos && !opts.reached(produced) && !stopped(opts) {
             let _pool = lloom_tensor::AutoreleaseScope::new(); // per window, see the decode loop
             stats.steps += 1;
-            let step_start = std::time::Instant::now();
+            let step_start = crate::hot_clock::HotInstant::now();
 
             // One speculative round: draft → verify (accept the longest prefix
             // the target's token agrees with + its own at the first
@@ -3647,11 +3700,14 @@ impl<'m, M: CausalLM> Session<'m, M> {
             let accepted = accepted.into_iter().next().ok_or_else(|| {
                 lloom_tensor::Error::msg("decode_speculative: verify returned no sequence")
             })?;
-            stats.rounds.push(RoundStats {
-                accepted: accepted.len(),
-                timing,
-                start_ns: (step_start - prefill_start).as_nanos() as u64,
-            });
+            stats.round_tally.add(accepted.len());
+            if crate::PROFILE_INSTRUMENTS {
+                stats.rounds.push(RoundStats {
+                    accepted: accepted.len(),
+                    timing,
+                    start_ns: step_start.ns_since(&run_hot),
+                });
+            }
             if accepted.is_empty() {
                 lloom_tensor::bail!(
                     "decode_speculative: a verify round accepted zero tokens; the target's own \
@@ -3702,7 +3758,9 @@ impl<'m, M: CausalLM> Session<'m, M> {
             }
 
             end_executor_step(&device)?;
-            stats.step_ns.push(step_start.elapsed().as_nanos() as u64);
+            if crate::PROFILE_INSTRUMENTS {
+                stats.step_ns.push(step_start.elapsed_ns());
+            }
         }
 
         // The sequence's bookkeeping. The cache holds each round's window —
@@ -3940,7 +3998,8 @@ impl<'m, M: CausalLM> Session<'m, M> {
             }
         }
         spec.want_confidence(false);
-        let run_start = std::time::Instant::now();
+        // The rounds' timeline origin: a per-round clock (decision 123).
+        let run_start = crate::hot_clock::HotInstant::now();
         let hot_thread = HotThread::claim();
 
         let mut lanes: Vec<Lane<<M as Probes<S::Probe>>::Pending>> = Vec::with_capacity(n);
@@ -4051,21 +4110,26 @@ impl<'m, M: CausalLM> Session<'m, M> {
                 let lane = &mut lanes[i];
                 let s = &mut sessions[i];
                 let mut timing = std::mem::take(&mut lane.in_flight);
+                let timed = crate::PROFILE_INSTRUMENTS;
 
-                let t = std::time::Instant::now();
-                let rb = readbacks();
+                let t = crate::hot_clock::HotInstant::now();
+                let rb = if timed { readbacks() } else { 0 };
                 let (accepted, probe_out) =
                     s.model
                         .verify_complete(pending, &mut s.seq.cache, eos_ids)?;
-                timing.verify_wait_ns = t.elapsed().as_nanos() as u64;
+                timing.verify_wait_ns = t.elapsed_ns();
                 timing.verify_ns = timing.verify_enqueue_ns + timing.verify_wait_ns;
-                timing.verify_readbacks += readbacks() - rb;
+                if timed {
+                    timing.verify_readbacks += readbacks() - rb;
+                }
 
-                let t = std::time::Instant::now();
-                let rb = readbacks();
+                let t = crate::hot_clock::HotInstant::now();
+                let rb = if timed { readbacks() } else { 0 };
                 spec.observe(SeqId(i), &probe_out, &accepted)?;
-                timing.observe_ns = t.elapsed().as_nanos() as u64;
-                timing.observe_readbacks = readbacks() - rb;
+                timing.observe_ns = t.elapsed_ns();
+                if timed {
+                    timing.observe_readbacks = readbacks() - rb;
+                }
 
                 if accepted.is_empty() {
                     lloom_tensor::bail!(
@@ -4075,11 +4139,14 @@ impl<'m, M: CausalLM> Session<'m, M> {
                     );
                 }
                 lane.stats.steps += 1;
-                lane.stats.rounds.push(RoundStats {
-                    accepted: accepted.len(),
-                    timing,
-                    start_ns: lane.round_start_ns,
-                });
+                lane.stats.round_tally.add(accepted.len());
+                if timed {
+                    lane.stats.rounds.push(RoundStats {
+                        accepted: accepted.len(),
+                        timing,
+                        start_ns: lane.round_start_ns,
+                    });
+                }
                 s.seq.pos += accepted.len();
                 lane.anchor_tok = *accepted.last().unwrap();
 
@@ -4101,9 +4168,11 @@ impl<'m, M: CausalLM> Session<'m, M> {
                     lane.all_ids.extend_from_slice(&batch);
                     lane.produced += batch.len();
                 }
-                lane.stats.step_ns.push(
-                    (run_start.elapsed().as_nanos() as u64).saturating_sub(lane.round_start_ns),
-                );
+                if timed {
+                    lane.stats
+                        .step_ns
+                        .push(run_start.elapsed_ns().saturating_sub(lane.round_start_ns));
+                }
                 lane.done = lane.eos || lane.limit.reached(lane.produced);
                 if !lane.done {
                     let room = lane.limit.remaining(lane.produced);
@@ -4148,7 +4217,7 @@ impl<'m, M: CausalLM> Session<'m, M> {
         lane: &mut Lane<<M as Probes<S::Probe>>::Pending>,
         spec: &mut S,
         i: usize,
-        run_start: std::time::Instant,
+        run_start: crate::hot_clock::HotInstant,
         device: &Device,
         room: usize,
     ) -> Result<()>
@@ -4160,21 +4229,26 @@ impl<'m, M: CausalLM> Session<'m, M> {
             last: lane.anchor_tok,
             pos: s.seq.pos,
         };
-        lane.round_start_ns = run_start.elapsed().as_nanos() as u64;
+        // Decision 123: the round's brackets are statistics, compiled out of a
+        // release build.
+        let timed = crate::PROFILE_INSTRUMENTS;
+        lane.round_start_ns = run_start.elapsed_ns();
         let mut timing = RoundTiming::default();
-        let t = std::time::Instant::now();
-        let rb = readbacks();
+        let t = crate::hot_clock::HotInstant::now();
+        let rb = if timed { readbacks() } else { 0 };
         let drafts = spec.draft(&[SeqId(i)])?;
         let mut draft = drafts.into_iter().next().ok_or_else(|| {
             lloom_tensor::Error::msg("decode_speculative_pipelined: the drafter returned no block")
         })?;
         let floor = usize::from(!Probes::<S::Probe>::verifies_anchor_alone(s.model));
         crate::nn::speculator::fit_to_room(&mut draft, room, floor)?;
-        timing.draft_ns = t.elapsed().as_nanos() as u64;
-        timing.draft_readbacks = readbacks() - rb;
+        timing.draft_ns = t.elapsed_ns();
+        if timed {
+            timing.draft_readbacks = readbacks() - rb;
+        }
 
-        let t = std::time::Instant::now();
-        let rb = readbacks();
+        let t = crate::hot_clock::HotInstant::now();
+        let rb = if timed { readbacks() } else { 0 };
         // The planned pass is the ENCODE (`DESIGN.md` §9.2aa): a plan serves
         // allocations, and `verify_enqueue` is where this round's are made.
         // `verify_complete` reads a marker back and allocates nothing of the
@@ -4187,8 +4261,10 @@ impl<'m, M: CausalLM> Session<'m, M> {
         let pass = OpenPass::begin(device, PassShape::Verify { k })?;
         let pending = s.model.verify_enqueue(&draft, &anchor, &mut s.seq.cache)?;
         pass.finish()?;
-        timing.verify_enqueue_ns = t.elapsed().as_nanos() as u64;
-        timing.verify_readbacks = readbacks() - rb;
+        timing.verify_enqueue_ns = t.elapsed_ns();
+        if timed {
+            timing.verify_readbacks = readbacks() - rb;
+        }
         lane.in_flight = timing;
         lane.pending = Some(pending);
         Ok(())

@@ -469,7 +469,7 @@ pub struct VerifyPass<P: Profile> {
     records: Vec<(usize, WindowRecord)>,
     /// The window ran on the device plan.
     pub planned: bool,
-    t0: std::time::Instant,
+    t0: crate::hot_clock::HotInstant,
     tokens: Vec<u32>,
     /// The window's embeddings, for a redo (Metal; the reference path
     /// re-embeds).
@@ -4096,14 +4096,14 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
         // with every expert resident; then the device plan, until it misses.
         if !cache.device_plan_armed {
             let before = self.stream_misses();
-            let t0 = std::time::Instant::now();
+            let t0 = crate::hot_clock::HotInstant::now();
             cache.open_window()?;
             let logits = self
                 .decode_embed_pass(h, cache, obs, RowPlan::Host)
                 .map(|(l, _)| l)?;
             cache.keep_standing();
             cache.host_plan_passes += 1;
-            cache.host_pass_ns += t0.elapsed().as_nanos() as u64;
+            cache.host_pass_ns += t0.elapsed_ns();
             // The arm (`QWEN4EXP_REPLAY=device`): the plan arms after the
             // first host-planned pass whatever it loaded — in a steady miss
             // regime no pass is ever miss-free, so the default's switch
@@ -4175,7 +4175,7 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
         if self.fetch_ready() {
             return self.decode_fetching(h, cache, obs, true);
         }
-        let t0 = std::time::Instant::now();
+        let t0 = crate::hot_clock::HotInstant::now();
         // The arm (`QWEN4EXP_REPLAY=device`): the plan stays armed through
         // the miss. The settle loaded what the pass missed; the replay runs
         // on the device plan again — right up to the layer past the loaded
@@ -4208,7 +4208,7 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
                 let (redo, after_first) = self.settle_records(&records)?;
                 if !redo {
                     cache.keep_standing();
-                    cache.replay_ns += t0.elapsed().as_nanos() as u64;
+                    cache.replay_ns += t0.elapsed_ns();
                     return Ok(logits);
                 }
                 cache.settle_after_first += after_first;
@@ -4225,7 +4225,7 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
             .map(|(l, _)| l)?;
         self.replay_read_encoded(h);
         cache.keep_standing();
-        cache.replay_ns += t0.elapsed().as_nanos() as u64;
+        cache.replay_ns += t0.elapsed_ns();
         Ok(logits)
     }
 
@@ -4848,7 +4848,7 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
             cache.fetch_entries += 1;
             cache.fetch_clean = 0;
         }
-        let t0 = std::time::Instant::now();
+        let t0 = crate::hot_clock::HotInstant::now();
         // A replay's `h` is already the model's own copy.
         let owned;
         let h = if replay {
@@ -4924,7 +4924,7 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
             if !redo {
                 cache.keep_standing();
                 if replay || attempt > 0 {
-                    cache.replay_ns += t0.elapsed().as_nanos() as u64;
+                    cache.replay_ns += t0.elapsed_ns();
                 }
                 if self.stream_misses() == before && !replay {
                     cache.fetch_clean += 1;
@@ -4950,7 +4950,7 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
             .map(|(l, _)| l)?;
         self.replay_read_encoded(h);
         cache.keep_standing();
-        cache.replay_ns += t0.elapsed().as_nanos() as u64;
+        cache.replay_ns += t0.elapsed_ns();
         Ok(logits)
     }
 
@@ -5665,10 +5665,10 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
         if !planned {
             let before = self.stream_misses();
             // Timed only where a tier streams (the miss regime's pass).
-            let t0 = self.device_plan.then(std::time::Instant::now);
+            let t0 = self.device_plan.then(crate::hot_clock::HotInstant::now);
             let logits = self.decode_rows_pass(&h, &mut caches, false)?.0;
             let clean = self.stream_misses() == before;
-            let ns = t0.map_or(0, |t| t.elapsed().as_nanos() as u64);
+            let ns = t0.map_or(0, |t| t.elapsed_ns());
             for c in caches.iter_mut() {
                 c.host_plan_passes += 1;
                 c.host_pass_ns += ns;
@@ -5690,7 +5690,7 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
             }
             return Ok(logits);
         }
-        let t0 = std::time::Instant::now();
+        let t0 = crate::hot_clock::HotInstant::now();
         self.note_replay()?;
         for c in caches.iter_mut() {
             c.rewind_window()?;
@@ -5698,7 +5698,7 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
             c.device_plan_armed = false;
         }
         let logits = self.decode_rows_pass(&h, &mut caches, false)?.0;
-        let ns = t0.elapsed().as_nanos() as u64;
+        let ns = t0.elapsed_ns();
         for c in caches.iter_mut() {
             c.replay_ns += ns;
             c.settle_after_first += after_first;
@@ -5930,7 +5930,7 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
         if let Some(w) = &mut cache.window {
             w.tokens = tokens.to_vec();
         }
-        let t0 = std::time::Instant::now();
+        let t0 = crate::hot_clock::HotInstant::now();
         let dev = self.device();
         if !dev.is_metal() {
             // The reference path: the positions one by one through the
@@ -6124,7 +6124,7 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
         } else {
             cache.window_host += 1;
             cache.host_plan_passes += 1;
-            cache.host_pass_ns += t0.elapsed().as_nanos() as u64;
+            cache.host_pass_ns += t0.elapsed_ns();
         }
         let mut a = accept(&argmax).clamp(1, t);
         let mut first_flagged = Self::first_flagged(&records);
@@ -6143,7 +6143,7 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
                 .map(|(l, r)| (self.layers[*l].moe().experts(), r))
                 .collect();
             R::settle_window(&parts, 0)?;
-            let t1 = std::time::Instant::now();
+            let t1 = crate::hot_clock::HotInstant::now();
             self.note_replay()?;
             cache.accept_window(0)?;
             cache.redos += 1;
@@ -6176,7 +6176,7 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
             };
             argmax = am;
             records = recs;
-            cache.replay_ns += t1.elapsed().as_nanos() as u64;
+            cache.replay_ns += t1.elapsed_ns();
             a = accept(&argmax).clamp(1, t);
             first_flagged = Self::first_flagged(&records);
         }

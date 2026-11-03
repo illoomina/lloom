@@ -400,24 +400,34 @@ fn print_speculative(
 pub fn print_rounds(stats: &DecodeStats, wanted: Wanted) {
     const WARMUP_ROUNDS: usize = 4;
     let phase_sync = wanted.phase_sync;
-    let rounds = &stats.rounds;
-    if rounds.is_empty() {
-        return;
-    }
     // Acceptance over every round (the warm-up's included: it is the
     // drafter's, not the timing's), `hist[a]` the rounds that kept `a`
     // tokens, the bonus counted. Reported however short the run: a short
-    // answer's acceptance is a gate's reading too.
-    let widest = rounds.iter().map(|r| r.accepted).max().unwrap_or(0);
-    let hist: Vec<usize> = (0..=widest)
-        .map(|a| rounds.iter().filter(|r| r.accepted == a).count())
-        .collect();
-    let all: usize = rounds.iter().map(|r| r.accepted).sum();
+    // answer's acceptance is a gate's reading too. From the coarse tally,
+    // which every build keeps (decision 123).
+    let tally = &stats.round_tally;
+    if tally.rounds == 0 {
+        return;
+    }
+    let widest = tally.widest();
+    let hist: Vec<u64> = tally.by_accepted[..=widest].to_vec();
+    let all = tally.accepted;
     eprintln!(
         "DSPARK_ACCEPT rounds={} tokens={all} tokens_per_round={:.4} accepted_hist={hist:?}",
-        rounds.len(),
-        all as f64 / rounds.len() as f64
+        tally.rounds,
+        all as f64 / tally.rounds as f64
     );
+    let rounds = &stats.rounds;
+    if rounds.is_empty() {
+        // Decision 123: a release build records no per-round record or clock.
+        // Say so; a breakdown of zeros would read as a result.
+        eprintln!(
+            "DSPARK_ROUNDS timing=unavailable rounds={} tokens={all} (a release build records \
+             no per-round timing; a debug or `profile` build does)",
+            tally.rounds
+        );
+        return;
+    }
     if rounds.len() <= WARMUP_ROUNDS {
         if wanted.verbose {
             eprintln!(

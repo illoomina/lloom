@@ -2786,6 +2786,21 @@ impl Commands {
         }
     }
 
+    /// Existing immediate recording refusal, not a wait/window boundary. Warm
+    /// success reads the Commands failure atom and the selected M3/M4 queue
+    /// signal (plus M3's native-error OnceCell); no mutex/Arc clone/allocation.
+    /// Added per-pass cost is unmeasured, not claimed free.
+    pub(crate) fn check_recording_failure(&self) -> Result<(), MetalKernelError> {
+        self.check_failed_atomic()?;
+        if let Some(queue) = &self.core.modern_queue {
+            queue.check_failure()?;
+        }
+        if let Some(core) = &self.core.legacy_completions {
+            core.check()?;
+        }
+        Ok(())
+    }
+
     /// Cold read-only diagnostic handle; clones only the existing failure Arc.
     pub fn failure_observer(&self) -> CommandFailureObserver {
         CommandFailureObserver(Arc::clone(&self.core.failure))
@@ -4556,7 +4571,7 @@ mod owner_submission_tests {
             let mut blit = commands.blit_command_encoder().unwrap();
             // SAFETY: initialized by this exact retained write; every cleanup
             // path releases producer then joins before any output observation.
-            unsafe { blit.fill_buffer(&raw, (0, 256), 0x4a) };
+            unsafe { blit.fill_buffer(&raw, (0, 256), 0x4a) }.unwrap();
             let marker = blit.recording_receipt().1;
             assert!(marker.cb.same_recording(&cb));
             blit.finish().unwrap();
@@ -4812,7 +4827,7 @@ mod owner_submission_tests {
                 "owner join returned original transient Busy instead of producer failure"
             );
             assert!(data.is_err() && final_sync.is_err());
-            assert!(commands.check_failed().is_err());
+            assert!(commands.check_recording_failure().is_err());
             assert!(cb.poll_data_ready().is_err());
             assert_eq!(
                 commands.clock().completed_count().0,
@@ -4900,7 +4915,7 @@ mod owner_submission_tests {
         let marker = {
             let mut blit = commands.blit_command_encoder().unwrap();
             // SAFETY: pins survive failure and actual DATA precedes observation.
-            unsafe { blit.fill_buffer(&raw, (0, 256), 0x4b) };
+            unsafe { blit.fill_buffer(&raw, (0, 256), 0x4b) }.unwrap();
             let marker = blit.recording_receipt().1;
             assert!(marker.cb.same_recording(&cb));
             blit.finish().unwrap();

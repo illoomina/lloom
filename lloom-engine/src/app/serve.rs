@@ -3534,9 +3534,15 @@ fn decode_throughput(shared: &Shared, v: &Value) -> Handled<Value> {
             .enumerate()
             .max_by_key(|(_, &n)| n)
             .expect("non-empty");
-        let per = |v: &Vec<f64>| v[r] / rounds.max(1) as f64;
+        // The phase sums are empty where no round recorded its timing (a
+        // release build, decision 123): unavailable, not 0 and not a panic.
+        let per = |v: &Vec<f64>| {
+            v.get(r)
+                .map(|x| format!("{:.2} ms", x / rounds.max(1) as f64))
+                .unwrap_or_else(|| "unavailable".into())
+        };
         eprintln!(
-            "[/decode_throughput rounds: row {r} ran {rounds} rounds at {:.2} accepted; per round draft {:.2} ms, verify {:.2} ms, observe {:.2} ms]",
+            "[/decode_throughput rounds: row {r} ran {rounds} rounds at {:.2} accepted; per round draft {}, verify {}, observe {}]",
             t.row_accepted[r],
             per(&t.row_draft_ms),
             per(&t.row_verify_ms),

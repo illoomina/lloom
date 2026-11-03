@@ -860,8 +860,14 @@ impl SpecArm {
         self.streams.iter().map(|s| s.len()).sum()
     }
     fn rounds(&self) -> usize {
-        self.outs.iter().map(|o| o.stats.rounds.len()).sum()
+        self.outs
+            .iter()
+            .map(|o| o.stats.round_tally.rounds as usize)
+            .sum()
     }
+    /// The per-round median of `f`; NaN when no round recorded its timing
+    /// (a release build, decision 123), which the caller reports as
+    /// unavailable.
     fn per_round_ms(&self, f: impl Fn(&lloom::nn::RoundStats) -> u64) -> f64 {
         median(
             self.outs
@@ -957,7 +963,7 @@ fn run_dspark_concurrent<P: Lfm2Shape>(ctx: &Ctx<'_, P>, common: &str) -> Result
                 ctx.eos_ids,
                 &mut |_| Ok(()),
             )?;
-            live.set(i, out.ids.len(), out.stats.rounds.len(), true);
+            live.set(i, out.ids.len(), out.stats.round_tally.rounds as usize, true);
             live.paint();
             outs.push(out);
         }
@@ -1004,7 +1010,7 @@ fn run_dspark_concurrent<P: Lfm2Shape>(ctx: &Ctx<'_, P>, common: &str) -> Result
             },
         )?;
         for (i, o) in outs.iter().enumerate() {
-            live.set(i, streams[i].len(), o.stats.rounds.len(), true);
+            live.set(i, streams[i].len(), o.stats.round_tally.rounds as usize, true);
         }
         live.paint();
         live.finish();
@@ -1042,28 +1048,43 @@ fn run_dspark_concurrent<P: Lfm2Shape>(ctx: &Ctx<'_, P>, common: &str) -> Result
         eprintln!(
             "[seq {i}: solo {} tokens in {} rounds; pipelined {} tokens in {} rounds; {}]",
             solo.streams[i].len(),
-            solo.outs[i].stats.rounds.len(),
+            solo.outs[i].stats.round_tally.rounds,
             pipe.streams[i].len(),
-            pipe.outs[i].stats.rounds.len(),
+            pipe.outs[i].stats.round_tally.rounds,
             if *same { "IDENTICAL" } else { "DIFFERS" }
         );
     }
     for arm in [&solo, &pipe] {
+        let per_round = if lloom::PROFILE_INSTRUMENTS {
+            format!(
+                "draft {:.3} verify {:.3} observe {:.3} round {:.3}",
+                arm.per_round_ms(|r| r.timing.draft_ns),
+                arm.per_round_ms(|r| r.timing.verify_ns),
+                arm.per_round_ms(|r| r.timing.observe_ns),
+                arm.per_round_ms(|r| r.timing.wall_ns()),
+            )
+        } else {
+            "unavailable (a release build records no per-round timing; a debug or `profile` \
+             build does)"
+                .to_string()
+        };
         eprintln!(
-            "[{}: {} tokens, {} rounds, {:.3} s wall = {:.1} tok/s aggregate; per round ms (median): \
-             draft {:.3} verify {:.3} observe {:.3} round {:.3}]",
+            "[{}: {} tokens, {} rounds, {:.3} s wall = {:.1} tok/s aggregate; per round ms \
+             (median): {per_round}]",
             arm.name,
             arm.tokens(),
             arm.rounds(),
             arm.wall_s,
             arm.tokens() as f64 / arm.wall_s,
-            arm.per_round_ms(|r| r.timing.draft_ns),
-            arm.per_round_ms(|r| r.timing.verify_ns),
-            arm.per_round_ms(|r| r.timing.observe_ns),
-            arm.per_round_ms(|r| r.timing.wall_ns()),
         );
     }
-    if let Some(path) = &ctx.spec.timeline {
+    if let (Some(path), false) = (&ctx.spec.timeline, lloom::PROFILE_INSTRUMENTS) {
+        eprintln!(
+            "[--timeline {}: not written; a release build records no per-round timing (a debug \
+             or `profile` build does)]",
+            path.display()
+        );
+    } else if let Some(path) = &ctx.spec.timeline {
         let mut w = String::from(
             "arm,seq,round,start_ms,draft_ms,enqueue_ms,wait_ms,observe_ms,accepted\n",
         );
@@ -2113,6 +2134,9 @@ fn run_batched_concurrent<P: Lfm2Shape>(
         .flat_map(|o| o.stats.step_ns.iter().map(|&ns| ns as f64 / 1e6))
         .collect();
     step_ms.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    // Decision 123: the per-step clock is compiled out of a release build, so
+    // the median is unavailable there rather than a NaN that reads as one.
+    let step_median = (!step_ms.is_empty()).then(|| step_ms[step_ms.len() / 2]);
     let batched_steps = batched.steps();
     let row_steps: u64 = batched.outs.iter().map(|o| o.stats.steps).sum();
     let mean_rows = if batched_steps > 0 {
@@ -2163,10 +2187,10 @@ fn run_batched_concurrent<P: Lfm2Shape>(
         }
     }
     eprintln!(
-        "[batched: {batched_steps} steps, {mean_rows:.2} live rows/step mean, step median {:.3} ms, \
+        "[batched: {batched_steps} steps, {mean_rows:.2} live rows/step mean, step median {} ms, \
          gpu_busy/step {} ms, dispatches/step {:.1}; solo: {solo_steps} steps, \
          gpu_busy/step {} ms, dispatches/step {:.1}]",
-        if step_ms.is_empty() { f64::NAN } else { step_ms[step_ms.len() / 2] },
+        super::common::profile_metric(step_median),
         super::common::profile_metric(batched.gpu_busy_s.map(|v| 1e3 * v / batched_steps.max(1) as f64)),
         batched.dispatches as f64 / batched_steps.max(1) as f64,
         super::common::profile_metric(solo.gpu_busy_s.map(|v| 1e3 * v / solo_steps.max(1) as f64)),
@@ -2183,7 +2207,7 @@ fn run_batched_concurrent<P: Lfm2Shape>(
          solo_gpu_busy_s={} solo_dispatches={} solo_gemm={} solo_gemv={} \
          batched_tokens={} batched_steps={} batched_rows_per_step={:.4} batched_wall_s={:.4} \
          batched_aggregate_tok_s={:.4} batched_gpu_busy_s={} batched_dispatches={} \
-         batched_gemm={} batched_gemv={} batched_step_ms_median={:.4} \
+         batched_gemm={} batched_gemv={} batched_step_ms_median={} \
          speedup={:.4} identical={} per_seq_identical={:?} common_prefix={:?} independent={:?} \
          per_seq_tokens={:?} per_seq_overrun={:?} solo_kernels={} per_seq_verdict={:?} \
          independence_verdict={:?} gate={gate}",
@@ -2219,7 +2243,7 @@ fn run_batched_concurrent<P: Lfm2Shape>(
         batched.dispatches,
         gemm_disp(&batched.census),
         gemv_disp(&batched.census),
-        if step_ms.is_empty() { f64::NAN } else { step_ms[step_ms.len() / 2] },
+        super::common::profile_metric(step_median),
         speedup,
         identical.iter().all(|&b| b),
         identical,

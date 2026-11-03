@@ -98,7 +98,7 @@ pub use conv::{
 pub use decode::{
     ladder_width, ragged_layout, refuse, Asks, Body, DecodeOptions, DecodeOut, DecodeStats,
     FeedStep, FeedWait, HostFeedReport, HostFeedTrace, IdentityProposer, PassWidths, PrefillOut,
-    RoundStats, StepPhases, FEED_PARK_MS, FEED_SPIN_BOUND, FIRST_STEPS_TRACED, MAX_TOP_LOGPROBS,
+    RoundStats, RoundTally, StepPhases, ROUND_TALLY_BUCKETS, FEED_PARK_MS, FEED_SPIN_BOUND, FIRST_STEPS_TRACED, MAX_TOP_LOGPROBS,
 };
 pub use embedding::{embedding, Embedding};
 pub use expert_stream::{

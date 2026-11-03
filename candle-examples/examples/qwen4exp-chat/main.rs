@@ -1161,7 +1161,7 @@ fn rows_gate<P: QwenShape, R: ExpertResidency + HasStreamStats>(
                 .map(|(a, b)| a.ids == b.ids)
                 .collect();
             ok &= matching_rows(outs.len(), spec.len(), &same);
-            let rounds: usize = spec.iter().map(|o| o.stats.rounds.len()).sum();
+            let rounds: u64 = spec.iter().map(|o| o.stats.round_tally.rounds).sum();
             println!(
                 "MTPROWS run={run} rows={} expected_rows={} actual_rows={} k={} identical_to_greedy={:?} generated={spec_generated} rounds={rounds} tokens_per_round={:.3} wall_ms={} tok_s={:.2} greedy_tok_s={:.2}",
                 args.rows,
@@ -1607,18 +1607,15 @@ fn driver_gate<P: QwenShape, R: ExpertResidency + HasStreamStats>(
                 .collect::<Vec<_>>()
                 .join(",")
         );
-        let rounds = out.stats.rounds.len();
-        let accepted_drafts = out.stats.rounds.iter().filter(|r| r.accepted > 1).count();
-        let tokens: usize = out.stats.rounds.iter().map(|r| r.accepted).sum();
+        let tally = &out.stats.round_tally;
+        let rounds = tally.rounds;
+        let accepted_drafts = tally.at_least(2);
+        let tokens = tally.accepted;
         let same = greedy_digest == Some(mtp_digest.as_str());
-        let sum = |f: &dyn Fn(&lloom::nn::RoundTiming) -> u64| -> f64 {
-            out.stats.rounds.iter().map(|r| f(&r.timing)).sum::<u64>() as f64 / 1e6
-        };
-        let hist: Vec<usize> = (0..=drafter.k() + 1)
-            .map(|a| out.stats.rounds.iter().filter(|r| r.accepted == a).count())
-            .collect();
+        let sum = |f: &dyn Fn(&lloom::nn::RoundTiming) -> u64| round_ms(&out.stats.rounds, f);
+        let hist = tally.hist_through(drafter.k() + 1);
         println!(
-            "MTP tokens_sha256={mtp_digest} identical_to_greedy={same} generated={} rounds={rounds} accepted_drafts={accepted_drafts} draft_accept_rate={:.4} tokens_per_round={:.3} drafter_rows={} wall_ms={mtp_ms} k={} draft_ms={:.1} verify_ms={:.1} observe_ms={:.1} accepted_hist={hist:?} driver=session-speculative",
+            "MTP tokens_sha256={mtp_digest} identical_to_greedy={same} generated={} rounds={rounds} accepted_drafts={accepted_drafts} draft_accept_rate={:.4} tokens_per_round={:.3} drafter_rows={} wall_ms={mtp_ms} k={} draft_ms={} verify_ms={} observe_ms={} accepted_hist={hist:?} driver=session-speculative",
             out.ids.len(),
             accepted_drafts as f64 / rounds.max(1) as f64,
             tokens as f64 / rounds.max(1) as f64,
@@ -1630,6 +1627,8 @@ fn driver_gate<P: QwenShape, R: ExpertResidency + HasStreamStats>(
         );
         let s = model.stream_stats();
         let c = session.cache_mut();
+        // Readback counts are per-round statistics too (decision 123): 0 in
+        // a release build, which records no per-round record.
         let rb = |f: &dyn Fn(&lloom::nn::RoundTiming) -> u64| -> u64 {
             out.stats.rounds.iter().map(|r| f(&r.timing)).sum::<u64>()
         };
@@ -1663,6 +1662,9 @@ fn driver_gate<P: QwenShape, R: ExpertResidency + HasStreamStats>(
         // round's phase brackets in round order, to join with its
         // `MTPTRACE` line (the same order).
         if std::env::var_os("QWEN4EXP_MTP_TRACE").is_some_and(|v| v == "1") {
+            if !lloom::PROFILE_INSTRUMENTS {
+                eprintln!("[MTPROUND: unavailable; a release build records no per-round timing]");
+            }
             for (i, r) in out.stats.rounds.iter().enumerate() {
                 println!(
                     "MTPROUND i={i} accepted={} draft_ms={:.2} verify_ms={:.2} observe_ms={:.2} rb_draft={} rb_verify={} rb_observe={}",
@@ -1771,23 +1773,20 @@ fn dflash_runs<P: QwenShape, R: ExpertResidency + HasStreamStats>(
             }
             let digest = sha256::hex(&h.finalize());
             let same = greedy_digest == Some(digest.as_str());
-            let rounds = out.stats.rounds.len();
-            let tokens: usize = out.stats.rounds.iter().map(|r| r.accepted).sum();
-            let hist: Vec<usize> = (0..=k + 1)
-                .map(|a| out.stats.rounds.iter().filter(|r| r.accepted == a).count())
-                .collect();
+            let tally = &out.stats.round_tally;
+            let rounds = tally.rounds;
+            let tokens = tally.accepted;
+            let hist = tally.hist_through(k + 1);
             // P(draft position j accepted | its round reached it): the
             // rounds that kept more than j drafts over those that kept at
             // least j.
-            let reach = |j: usize| out.stats.rounds.iter().filter(|r| r.accepted > j).count();
+            let reach = |j: usize| tally.at_least(j + 1);
             let per_pos: Vec<String> = (1..=k)
                 .map(|j| format!("{:.3}", reach(j) as f64 / reach(j - 1).max(1) as f64))
                 .collect();
-            let ms = |f: &dyn Fn(&lloom::nn::RoundTiming) -> u64| -> f64 {
-                out.stats.rounds.iter().map(|r| f(&r.timing)).sum::<u64>() as f64 / 1e6
-            };
+            let ms = |f: &dyn Fn(&lloom::nn::RoundTiming) -> u64| round_ms(&out.stats.rounds, f);
             println!(
-                "DFLASH arm={arm} k={k} tokens_sha256={digest} identical_to_greedy={same} generated={} rounds={rounds} tokens_per_round={:.3} accepted_hist={hist:?} accept_by_position=[{}] wall_ms={wall_ms} draft_ms={:.1} verify_ms={:.1} observe_ms={:.1} taps={:?}",
+                "DFLASH arm={arm} k={k} tokens_sha256={digest} identical_to_greedy={same} generated={} rounds={rounds} tokens_per_round={:.3} accepted_hist={hist:?} accept_by_position=[{}] wall_ms={wall_ms} draft_ms={} verify_ms={} observe_ms={} taps={:?}",
                 out.ids.len(),
                 tokens as f64 / rounds.max(1) as f64,
                 per_pos.join(","),
@@ -2159,9 +2158,10 @@ fn gate<P: QwenShape, R: ExpertResidency + HasStreamStats>(
             h.update(&t.to_le_bytes());
         }
         let mtp_digest = sha256::hex(&h.finalize());
-        let rounds = out.stats.rounds.len();
-        let accepted_drafts = out.stats.rounds.iter().filter(|r| r.accepted > 1).count();
-        let tokens: usize = out.stats.rounds.iter().map(|r| r.accepted).sum();
+        let tally = &out.stats.round_tally;
+        let rounds = tally.rounds;
+        let accepted_drafts = tally.at_least(2);
+        let tokens = tally.accepted;
         let same = digests.first().map(|d| d == &mtp_digest).unwrap_or(false);
         println!(
             "output(mtp): {}",
@@ -2169,14 +2169,10 @@ fn gate<P: QwenShape, R: ExpertResidency + HasStreamStats>(
                 .decode(&out.ids, true)
                 .map_err(anyhow::Error::msg)?
         );
-        let sum = |f: &dyn Fn(&lloom::nn::RoundTiming) -> u64| -> f64 {
-            out.stats.rounds.iter().map(|r| f(&r.timing)).sum::<u64>() as f64 / 1e6
-        };
-        let hist: Vec<usize> = (0..=drafter.k() + 1)
-            .map(|a| out.stats.rounds.iter().filter(|r| r.accepted == a).count())
-            .collect();
+        let sum = |f: &dyn Fn(&lloom::nn::RoundTiming) -> u64| round_ms(&out.stats.rounds, f);
+        let hist = tally.hist_through(drafter.k() + 1);
         println!(
-            "MTP tokens_sha256={mtp_digest} identical_to_greedy={same} generated={} rounds={rounds} accepted_drafts={accepted_drafts} draft_accept_rate={:.4} tokens_per_round={:.3} drafter_rows={} wall_ms={mtp_ms} k={} draft_ms={:.1} verify_ms={:.1} observe_ms={:.1} accepted_hist={hist:?}",
+            "MTP tokens_sha256={mtp_digest} identical_to_greedy={same} generated={} rounds={rounds} accepted_drafts={accepted_drafts} draft_accept_rate={:.4} tokens_per_round={:.3} drafter_rows={} wall_ms={mtp_ms} k={} draft_ms={} verify_ms={} observe_ms={} accepted_hist={hist:?}",
             out.ids.len(),
             accepted_drafts as f64 / rounds.max(1) as f64,
             tokens as f64 / rounds.max(1) as f64,
@@ -2652,5 +2648,22 @@ mod gate_validation_tests {
         assert!(!matching_rows(2, 2, &[true]));
         assert!(!matching_rows(2, 2, &[true, false]));
         assert!(finish_rows_gate(true, false, &["Paris".to_owned()], Some("paris")).is_err());
+    }
+}
+
+/// A phase's total over the run's rounds, in ms; `unavailable` in a release
+/// build, which records no per-round timing (decision 123), rather than a 0
+/// that reads as a measurement.
+fn round_ms(
+    rounds: &[lloom::nn::RoundStats],
+    f: &dyn Fn(&lloom::nn::RoundTiming) -> u64,
+) -> String {
+    if lloom::PROFILE_INSTRUMENTS {
+        format!(
+            "{:.1}",
+            rounds.iter().map(|r| f(&r.timing)).sum::<u64>() as f64 / 1e6
+        )
+    } else {
+        "unavailable".to_string()
     }
 }

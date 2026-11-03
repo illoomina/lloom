@@ -593,6 +593,17 @@ impl RoundTally {
         self.by_accepted[accepted.min(ROUND_TALLY_BUCKETS - 1)] += 1;
     }
 
+    /// Rounds that accepted at least `a` tokens (the last bucket counts as
+    /// at or above its index).
+    pub fn at_least(&self, a: usize) -> u64 {
+        self.by_accepted[a.min(ROUND_TALLY_BUCKETS - 1)..].iter().sum()
+    }
+
+    /// The histogram through `upto` accepted (clamped to the buckets).
+    pub fn hist_through(&self, upto: usize) -> Vec<u64> {
+        self.by_accepted[..=upto.min(ROUND_TALLY_BUCKETS - 1)].to_vec()
+    }
+
     /// The widest bucket a round fell in (the last is "at or above").
     pub fn widest(&self) -> usize {
         self.by_accepted

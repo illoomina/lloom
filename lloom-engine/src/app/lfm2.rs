@@ -2586,21 +2586,22 @@ impl<P: Lfm2Shape> Engine<P> {
                             "run wall minus the prompts' submit; the prefills' GPU tail is inside"
                         },
                         row_tokens: outs.iter().map(|o| o.ids.len()).collect(),
-                        row_rounds: outs.iter().map(|o| o.stats.rounds.len()).collect(),
+                        row_rounds: outs
+                            .iter()
+                            .map(|o| o.stats.round_tally.rounds as usize)
+                            .collect(),
                         row_accepted: outs
                             .iter()
                             .map(|o| {
-                                let n = o.stats.rounds.len().max(1) as f64;
-                                o.stats
-                                    .rounds
-                                    .iter()
-                                    .map(|r| r.accepted as f64)
-                                    .sum::<f64>()
-                                    / n
+                                let t = &o.stats.round_tally;
+                                t.accepted as f64 / t.rounds.max(1) as f64
                             })
                             .collect(),
+                        // Empty in a release build, which records no
+                        // per-round timing (decision 123).
                         row_draft_ms: outs
                             .iter()
+                            .filter(|_| lloom::PROFILE_INSTRUMENTS)
                             .map(|o| {
                                 o.stats
                                     .rounds
@@ -2612,6 +2613,7 @@ impl<P: Lfm2Shape> Engine<P> {
                             .collect(),
                         row_verify_ms: outs
                             .iter()
+                            .filter(|_| lloom::PROFILE_INSTRUMENTS)
                             .map(|o| {
                                 o.stats
                                     .rounds
@@ -2623,6 +2625,7 @@ impl<P: Lfm2Shape> Engine<P> {
                             .collect(),
                         row_observe_ms: outs
                             .iter()
+                            .filter(|_| lloom::PROFILE_INSTRUMENTS)
                             .map(|o| {
                                 o.stats
                                     .rounds

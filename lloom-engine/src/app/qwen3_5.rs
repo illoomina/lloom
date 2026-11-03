@@ -1020,20 +1020,21 @@ where
                     );
                 }
                 s.reset();
-                let rounds = run.stats.rounds.len();
-                let accepted: f64 = run
-                    .stats
-                    .rounds
-                    .iter()
-                    .map(|r| r.accepted as f64)
-                    .sum::<f64>()
-                    / rounds.max(1) as f64;
-                let phase_ms = |f: fn(&lloom::nn::speculator::RoundTiming) -> u64| -> f64 {
-                    run.stats
+                let tally = &run.stats.round_tally;
+                let rounds = tally.rounds as usize;
+                let accepted = tally.accepted as f64 / rounds.max(1) as f64;
+                // Empty in a release build, which records no per-round
+                // timing (decision 123).
+                let phase_ms = |f: fn(&lloom::nn::speculator::RoundTiming) -> u64| -> Vec<f64> {
+                    if !lloom::PROFILE_INSTRUMENTS {
+                        return Vec::new();
+                    }
+                    vec![run
+                        .stats
                         .rounds
                         .iter()
                         .map(|r| f(&r.timing) as f64 / 1e6)
-                        .sum()
+                        .sum()]
                 };
                 return Ok(DecodeTiming {
                     prompt_tokens,
@@ -1046,9 +1047,9 @@ where
                     row_tokens: vec![run.tokens.len()],
                     row_rounds: vec![rounds],
                     row_accepted: vec![accepted],
-                    row_draft_ms: vec![phase_ms(|t| t.draft_ns)],
-                    row_verify_ms: vec![phase_ms(|t| t.verify_ns)],
-                    row_observe_ms: vec![phase_ms(|t| t.observe_ns)],
+                    row_draft_ms: phase_ms(|t| t.draft_ns),
+                    row_verify_ms: phase_ms(|t| t.verify_ns),
+                    row_observe_ms: phase_ms(|t| t.observe_ns),
                     profile: prof,
                     mem: MemReport::default(),
                 });

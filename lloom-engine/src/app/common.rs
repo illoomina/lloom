@@ -337,7 +337,8 @@ pub struct DecodeTiming {
     pub row_accepted: Vec<f64>,
     /// Per row, the host time its rounds spent in each phase — draft,
     /// verify (enqueue + wait), observe — summed over the row's rounds, in
-    /// ms (`RoundTiming`; empty on the K=1 arms). On the batched loop a
+    /// ms (`RoundTiming`; empty on the K=1 arms, and in a release build, which
+    /// records no per-round timing: decision 123). On the batched loop a
     /// round's phases are the batch's, so the rows differ only by how many
     /// rounds each ran.
     pub row_draft_ms: Vec<f64>,

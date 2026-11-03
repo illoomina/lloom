@@ -4274,10 +4274,8 @@ impl MetalDevice {
             }
             return Ok(buffer);
         }
-        let mut blit = self.blit_command_encoder()?;
-        blit.set_label("zeros");
         // SAFETY: as the compute fill above.
-        unsafe { blit.fill_buffer(&buffer, (0, buffer.length()), 0) };
+        unsafe { self.fill_bytes("zeros", &buffer, buffer.length(), 0) }?;
         Ok(buffer)
     }
 

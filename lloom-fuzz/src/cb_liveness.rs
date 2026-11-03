@@ -275,7 +275,8 @@ fn run_sequence_inner(
                     // SAFETY: `buf` leaves the harness only through the pool's
                     // GPU-clock release or an in-flight hold, the mechanism this
                     // model checks; `dst` is read only after the wait.
-                    unsafe { blit.copy_from_buffer(buf, 0, &dst, 0, size) };
+                    unsafe { blit.copy_from_buffer(buf, 0, &dst, 0, size) }
+                        .map_err(|e| at(format!("copy_from_buffer: {e:?}")))?;
                 }
                 pending.push(Pending {
                     dst,
@@ -389,7 +390,8 @@ fn run_sequence_inner(
                         .blit_command_encoder()
                         .map_err(|e| at(format!("blit_command_encoder: {e:?}")))?;
                     // SAFETY: as the copy above.
-                    unsafe { blit.copy_from_buffer(buf, 0, &last.dst, 0, size) };
+                    unsafe { blit.copy_from_buffer(buf, 0, &last.dst, 0, size) }
+                        .map_err(|e| at(format!("copy_from_buffer: {e:?}")))?;
                 }
                 // The destination now holds this source's pattern over the
                 // copied prefix; verify only that prefix.

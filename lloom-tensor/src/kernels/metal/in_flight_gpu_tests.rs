@@ -61,7 +61,7 @@ fn an_unretained_queue_holds_a_forgotten_fence_until_its_epoch_completes() {
         let mut blit = cmds.blit_command_encoder().unwrap();
         // SAFETY: the test owns every buffer bound or mapped here and reads its
         // results only after waiting for the command buffer that writes them.
-        unsafe { blit.copy_from_buffer(src, 0, &dst, 0, len) };
+        unsafe { blit.copy_from_buffer(src, 0, &dst, 0, len) }.unwrap();
     }
     let held = hold.counts();
     assert_eq!(

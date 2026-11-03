@@ -63,7 +63,7 @@ fn fixture_with(setup: impl FnOnce(&Commands)) -> Fixture {
     {
         let mut blit = commands.blit_command_encoder().unwrap();
         // SAFETY: the fixture owns this Shared allocation through every drain.
-        unsafe { blit.fill_buffer(&dst, (0, 4096), WARM) };
+        unsafe { blit.fill_buffer(&dst, (0, 4096), WARM) }.unwrap();
     }
     commands.flush_and_wait().unwrap();
     assert!(dst_bytes(&dst).iter().all(|b| *b == WARM));
@@ -353,7 +353,7 @@ fn inputs_produced_out_of_order_commit_in_queue_order() {
     {
         let mut blit = f.commands.blit_command_encoder().unwrap();
         // SAFETY: as the fixture's fill.
-        unsafe { blit.fill_buffer(&f.dst, (2048, 4096), 0x5c) };
+        unsafe { blit.fill_buffer(&f.dst, (2048, 4096), 0x5c) }.unwrap();
     }
     f.commands.flush_marker().unwrap();
     let held = 2 + signal_cut(&f.commands);
@@ -614,7 +614,7 @@ fn a_parked_owner_wakes_for_every_input(shape: Shape, delivery: Delivery, when: 
             listen(&second);
             let mut blit = f.commands.blit_command_encoder().unwrap();
             // SAFETY: as the fixture's fill.
-            unsafe { blit.fill_buffer(&f.dst, (2048, 4096), 0x5c) };
+            unsafe { blit.fill_buffer(&f.dst, (2048, 4096), 0x5c) }.unwrap();
         }
     }
     let (owner, done_rx) = spawn_owner(&f.commands);

@@ -1288,7 +1288,7 @@ fn run_mlp_steps(
         let mut blit = cmds.blit_command_encoder().unwrap();
         // SAFETY: the test owns every buffer bound or mapped here and reads its
         // results only after waiting for the command buffer that writes them.
-        unsafe { blit.copy_from_buffer(&staging, 0, &arena, 0, 1 << 20) };
+        unsafe { blit.copy_from_buffer(&staging, 0, &arena, 0, 1 << 20) }.unwrap();
     }
     cmds.flush_and_wait().unwrap();
     let x = arena.view(512000, 256000);

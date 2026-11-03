@@ -49,6 +49,8 @@ pub use device::{
     served_pass_request_sites, set_admission_drain, set_served_request_trace, wire_weights_on,
     DeviceId, MetalDevice, PassPlansPaused,
 };
+#[cfg(test)]
+mod blit_view_tests;
 mod host_fed;
 mod host_slot;
 mod readback_dst;
@@ -584,9 +586,19 @@ fn stage_readback_with<'a>(
     } else {
         None
     };
+    // Outside a pass plan the copy is a blit where Metal admits one; the
+    // route is decided, and its geometry refused, before the destination is
+    // claimed.
+    let source_offset = layout.start_offset() * elem;
+    let route = |dst: &Buffer| -> Result<Option<ByteRoute>> {
+        if copy2d.is_some() {
+            return Ok(None);
+        }
+        byte_route(&m.buffer, source_offset, dst, 0, size).map(Some)
+    };
     // The copy's destination is read by the host, never by a later
     // dispatch: outside any pass plan (§9.2aa).
-    let dst = match dst {
+    let (dst, route) = match dst {
         Some(d) => {
             if !d.serves(&m.device) {
                 crate::bail!("stage_readback_into: the destination belongs to another queue")
@@ -597,24 +609,26 @@ fn stage_readback_with<'a>(
                     d.capacity()
                 )
             }
+            let route = route(d.buffer())?;
             note_readback("stage_readback_into");
             TO_CPU_DST_LEASED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if d.claim() {
                 TO_CPU_DST_ORDERED_REUSE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
-            StagedDst::Leased(d)
+            (StagedDst::Leased(d), route)
         }
         None => {
             TO_CPU_STAGING_ALLOCS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             note_readback("stage_readback");
             let _escape = EscapeGuard::new();
-            StagedDst::Owned(
-                m.device
-                    .new_buffer_builder()
-                    .with_size(size.max(1))
-                    .with_label("staged_readback_dst")
-                    .build()?,
-            )
+            let buffer = m
+                .device
+                .new_buffer_builder()
+                .with_size(size.max(1))
+                .with_label("staged_readback_dst")
+                .build()?;
+            let route = route(&buffer)?;
+            (StagedDst::Owned(buffer), route)
         }
     };
     let buffer = dst.buffer();
@@ -635,17 +649,34 @@ fn stage_readback_with<'a>(
                 count,
                 count,
                 count,
-                layout.start_offset() * elem,
+                source_offset,
                 0,
             )
         }
         .map_err(MetalError::from)?;
         (!commit).then(|| encoder.recording_marker())
+    } else if route == Some(ByteRoute::Compute) {
+        let encoder = m.device.command_encoder()?;
+        // SAFETY: storage-owned buffers (binding authority, module head).
+        unsafe {
+            encode_byte_copy(
+                &m.device,
+                &encoder,
+                &m.buffer,
+                source_offset,
+                buffer,
+                0,
+                size,
+            )?
+        };
+        (!commit).then(|| encoder.recording_marker())
     } else {
+        // An empty stage still opens the encoder its marker comes from.
         let mut blit = m.device.blit_command_encoder()?;
         blit.set_label("staged_readback");
         // SAFETY: storage-owned buffers (binding authority, module head).
-        unsafe { blit.copy_from_buffer(&m.buffer, layout.start_offset() * elem, buffer, 0, size) };
+        unsafe { blit.copy_from_buffer(&m.buffer, source_offset, buffer, 0, size) }
+            .map_err(MetalError::from)?;
         if commit {
             None
         } else {
@@ -664,6 +695,190 @@ fn stage_readback_with<'a>(
         dtype: m.dtype,
         device: m.device.clone(),
     })
+}
+
+/// Which arm a byte copy takes (`MetalDevice::copy_bytes`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ByteRoute {
+    Empty,
+    Blit,
+    Compute,
+}
+
+/// Route `size` bytes from `src` at `src_offset` to `dst` at `dst_offset`,
+/// both relative to their views, through the one authority the tracked copies
+/// use (`native_binding_preflight::byte_copy_route`): checked against each
+/// view's extent, a blit only inside Metal's 4-byte buffer-copy contract.
+/// Overlapping ranges of one buffer are refused: neither the blit nor the
+/// element-parallel copy kernel orders them.
+fn byte_route(
+    src: &Buffer,
+    src_offset: usize,
+    dst: &Buffer,
+    dst_offset: usize,
+    size: usize,
+) -> Result<ByteRoute> {
+    use crate::native_binding_preflight::{byte_copy_route, ByteCopyRoute};
+    match byte_copy_route(
+        src.base_offset(),
+        src.length(),
+        src_offset,
+        dst.base_offset(),
+        dst.length(),
+        dst_offset,
+        size,
+        src.raw_ptr() == dst.raw_ptr(),
+    ) {
+        None => crate::bail!(
+            "byte copy: {size} bytes at {src_offset} -> {dst_offset} exceed a view \
+             ({} -> {} bytes)",
+            src.length(),
+            dst.length()
+        ),
+        Some(ByteCopyRoute::Empty) => Ok(ByteRoute::Empty),
+        Some(ByteCopyRoute::AlignedBlit { .. }) => Ok(ByteRoute::Blit),
+        Some(ByteCopyRoute::Compute { overlap: true, .. }) => {
+            crate::bail!("byte copy: overlapping ranges of one buffer")
+        }
+        Some(ByteCopyRoute::Compute { .. }) => Ok(ByteRoute::Compute),
+    }
+}
+
+/// The compute byte copy: `copy2d_u8` over one row of `size` bytes. Offsets
+/// are view-relative; the bindings add each view's base.
+///
+/// # Safety
+/// As [`crate::kernels::call_copy2d`]: both buffers stay unreused and
+/// unwritten by the host until the command buffer completes.
+unsafe fn encode_byte_copy(
+    device: &MetalDevice,
+    ep: impl crate::kernels::utils::EncoderProvider,
+    src: &Buffer,
+    src_offset: usize,
+    dst: &Buffer,
+    dst_offset: usize,
+    size: usize,
+) -> Result<()> {
+    #[cfg(test)]
+    crate::kernels::metal::encoder::emitted::push(
+        crate::kernels::metal::encoder::emitted::Emitted::Compute {
+            source: src_offset,
+            destination: dst_offset,
+            size,
+        },
+    );
+    // SAFETY: this function's contract.
+    unsafe {
+        crate::kernels::call_copy2d(
+            &device.device,
+            ep,
+            &device.kernels,
+            crate::kernels::copy2d::U8,
+            src,
+            dst,
+            1,
+            size,
+            size,
+            size,
+            src_offset,
+            dst_offset,
+        )
+    }
+    .map_err(MetalError::from)?;
+    Ok(())
+}
+
+impl MetalDevice {
+    /// Copy `size` bytes from `src` at `src_offset` to `dst` at `dst_offset`,
+    /// each offset relative to its handle's view. A blit where Metal's
+    /// buffer-copy contract admits one, the compute byte copy otherwise;
+    /// nothing is encoded for an empty range.
+    ///
+    /// # Safety
+    /// Both buffers stay unreused, and unwritten by the host, until the
+    /// command buffer this encodes into completes
+    /// ([`crate::kernels::metal::BlitCommandEncoder::copy_from_buffer`]).
+    pub unsafe fn copy_bytes(
+        &self,
+        label: &str,
+        src: &Buffer,
+        src_offset: usize,
+        dst: &Buffer,
+        dst_offset: usize,
+        size: usize,
+    ) -> Result<()> {
+        match byte_route(src, src_offset, dst, dst_offset, size)? {
+            ByteRoute::Empty => Ok(()),
+            ByteRoute::Blit => {
+                let mut blit = self.blit_command_encoder()?;
+                blit.set_label(label);
+                // SAFETY: this function's contract; the route is checked.
+                unsafe { blit.copy_from_buffer(src, src_offset, dst, dst_offset, size) }
+                    .map_err(MetalError::from)?;
+                Ok(())
+            }
+            ByteRoute::Compute => {
+                let encoder = self.command_encoder()?;
+                // SAFETY: this function's contract.
+                unsafe { encode_byte_copy(self, &encoder, src, src_offset, dst, dst_offset, size) }
+            }
+        }
+    }
+
+    /// Set the first `size` bytes of `buffer`'s view to `value`: a blit fill
+    /// inside the 4-byte contract, the compute fill otherwise; nothing for an
+    /// empty range.
+    ///
+    /// # Safety
+    /// As [`Self::copy_bytes`], for `buffer`.
+    pub unsafe fn fill_bytes(
+        &self,
+        label: &str,
+        buffer: &Buffer,
+        size: usize,
+        value: u8,
+    ) -> Result<()> {
+        let Some(location) = crate::native_binding_preflight::checked_byte_range(
+            buffer.base_offset(),
+            buffer.length(),
+            0,
+            size,
+        ) else {
+            crate::bail!(
+                "byte fill: {size} bytes exceed a {}-byte view",
+                buffer.length()
+            )
+        };
+        if size == 0 {
+            return Ok(());
+        }
+        if location.is_multiple_of(4) && size.is_multiple_of(4) {
+            let mut blit = self.blit_command_encoder()?;
+            blit.set_label(label);
+            // SAFETY: this function's contract; the range is checked.
+            unsafe { blit.fill_buffer(buffer, (0, size), value) }.map_err(MetalError::from)?;
+            return Ok(());
+        }
+        #[cfg(test)]
+        crate::kernels::metal::encoder::emitted::push(
+            crate::kernels::metal::encoder::emitted::Emitted::ComputeFill { size },
+        );
+        let encoder = self.command_encoder()?;
+        // SAFETY: this function's contract.
+        unsafe {
+            crate::kernels::kernels::call_const_fill(
+                &self.device,
+                &encoder,
+                &self.kernels,
+                "fill_u8",
+                size,
+                buffer,
+                value,
+            )
+        }
+        .map_err(MetalError::from)?;
+        Ok(())
+    }
 }
 
 pub fn to_cpu_force_blit() -> bool {
@@ -2716,15 +2931,18 @@ impl BackendStorage for MetalStorage {
         // Not the blit under a base (`MetalDevice::base_mode`): the copy
         // must sit in the compute encoder's barrier chain.
         if src_s == d2 && dst_s == d2 && !self.device.base_mode() && !copy2d_no_blit() {
-            let mut blit = self.device.blit_command_encoder()?;
-            blit.set_label("copy2d_contiguous");
-            let src_offset = src_o * self.dtype.size_in_bytes();
-            let length = d1 * d2 * self.dtype.size_in_bytes();
-            let dst_offset = dst_o * dst.dtype().size_in_bytes();
+            let elem = self.dtype.size_in_bytes();
             // SAFETY: storage-owned buffers (binding authority, module head).
             unsafe {
-                blit.copy_from_buffer(&self.buffer, src_offset, dst.buffer(), dst_offset, length)
-            };
+                self.device.copy_bytes(
+                    "copy2d_contiguous",
+                    &self.buffer,
+                    src_o * elem,
+                    dst.buffer(),
+                    dst_o * elem,
+                    d1 * d2 * elem,
+                )
+            }?;
         } else {
             let el_count = d1 * d2;
             if el_count == 0 {
@@ -2831,15 +3049,18 @@ impl BackendStorage for MetalStorage {
             return self.copy2d(dst, 1, n, n, n, src_l.start_offset(), dst_offset);
         }
         if src_l.is_contiguous() && self.dtype == dst.dtype() {
-            let mut blit = self.device.blit_command_encoder()?;
-            blit.set_label("copy_contiguous");
-            let src_offset = src_l.start_offset() * self.dtype.size_in_bytes();
-            let length = src_l.shape().elem_count() * self.dtype.size_in_bytes();
-            let dst_offset = dst_offset * dst.dtype().size_in_bytes();
+            let elem = self.dtype.size_in_bytes();
             // SAFETY: storage-owned buffers (binding authority, module head).
             unsafe {
-                blit.copy_from_buffer(&self.buffer, src_offset, dst.buffer(), dst_offset, length)
-            };
+                self.device.copy_bytes(
+                    "copy_contiguous",
+                    &self.buffer,
+                    src_l.start_offset() * elem,
+                    dst.buffer(),
+                    dst_offset * elem,
+                    src_l.shape().elem_count() * elem,
+                )
+            }?;
         } else {
             let src_shape = src_l.shape();
             let el_count = src_shape.elem_count();
@@ -3168,14 +3389,17 @@ impl MetalStorage {
             .with_size(bytes)
             .with_label("staged_read_dst")
             .build()?;
-        if count != 0 {
-            let mut blit = self.device.blit_command_encoder()?;
-            blit.set_label("staged_read");
-            // SAFETY: storage-owned buffers (binding authority, module head).
-            unsafe {
-                blit.copy_from_buffer(&self.buffer, offset * elem, &staging, 0, count * elem)
-            };
-        }
+        // SAFETY: storage-owned buffers (binding authority, module head).
+        unsafe {
+            self.device.copy_bytes(
+                "staged_read",
+                &self.buffer,
+                offset * elem,
+                &staging,
+                0,
+                count * elem,
+            )
+        }?;
         let marker = self.device.flush_marker()?;
         Ok(StagedMetalRead {
             staging,
@@ -3541,10 +3765,11 @@ impl MetalStorage {
             }
             .map_err(MetalError::from)?;
         } else {
-            let mut blit = self.device.blit_command_encoder()?;
-            blit.set_label("blit_to_cpu");
             // SAFETY: storage-owned buffers (binding authority, module head).
-            unsafe { blit.copy_from_buffer(&self.buffer, 0, &buffer, 0, size) };
+            unsafe {
+                self.device
+                    .copy_bytes("blit_to_cpu", &self.buffer, 0, &buffer, 0, size)
+            }?;
         }
         self.device.flush_and_wait_current()?;
         read_to_vec(&buffer, self.count)
@@ -4301,7 +4526,7 @@ mod issue_336_split {
                 blit.set_label("blit_to_cpu");
                 // SAFETY: the test owns every buffer bound or mapped here and reads its
                 // results only after waiting for the command buffer that writes them.
-                unsafe { blit.copy_from_buffer(&ms.buffer, 0, &dst, 0, size) };
+                unsafe { blit.copy_from_buffer(&ms.buffer, 0, &dst, 0, size) }.unwrap();
             }
             let e = s2.elapsed().as_secs_f64() * 1e3;
 
@@ -4365,7 +4590,7 @@ mod issue_336_to_cpu {
             blit.set_label("blit_to_cpu");
             // SAFETY: the test owns every buffer bound or mapped here and reads its
             // results only after waiting for the command buffer that writes them.
-            unsafe { blit.copy_from_buffer(&ms.buffer, 0, &buffer, 0, size) };
+            unsafe { blit.copy_from_buffer(&ms.buffer, 0, &buffer, 0, size) }.unwrap();
         }
         ms.device.flush_and_wait_current().unwrap();
         super::read_to_vec(&buffer, ms.count).unwrap()
@@ -4691,7 +4916,7 @@ mod issue_336_to_cpu {
             for b in &subs {
                 // SAFETY: the test owns every buffer bound or mapped here and reads its
                 // results only after waiting for the command buffer that writes them.
-                unsafe { blit.fill_buffer(b, (0, b.length()), 0xA5) };
+                unsafe { blit.fill_buffer(b, (0, b.length()), 0xA5) }.unwrap();
             }
         }
         m.wait_until_completed().unwrap();

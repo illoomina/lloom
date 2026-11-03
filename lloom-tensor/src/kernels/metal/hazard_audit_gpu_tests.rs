@@ -279,7 +279,7 @@ fn a_blit_between_compute_passes_is_observed_and_ordered() {
         let mut blit = f.cmds.blit_command_encoder().unwrap();
         // SAFETY: the test owns both buffers and reads nothing back before
         // `flush_and_wait`.
-        unsafe { blit.copy_from_buffer(&x, 0, &y, 0, N * 4) };
+        unsafe { blit.copy_from_buffer(&x, 0, &y, 0, N * 4) }.unwrap();
     }
     f.cos(&y, &z);
     f.cmds.flush_and_wait().unwrap();

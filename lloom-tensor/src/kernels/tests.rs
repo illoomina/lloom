@@ -11666,7 +11666,7 @@ fn a_blit_copy_extends_the_recorded_interval_of_both_buffers() {
         let mut blit = commands.blit_command_encoder().unwrap();
         // SAFETY: the test owns every buffer bound or mapped here and reads its
         // results only after waiting for the command buffer that writes them.
-        unsafe { blit.copy_from_buffer(&src, 0, &dst, 0, 256) };
+        unsafe { blit.copy_from_buffer(&src, 0, &dst, 0, 256) }.unwrap();
     }
     set_bind_observer(None);
     commands.wait_until_completed().unwrap();

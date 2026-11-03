@@ -844,11 +844,11 @@ impl Resident {
         if group.closed {
             lloom_tensor::bail!("resolved expert group is already closed")
         }
-        if !std::ptr::eq(self, group.owner)
-            && !(Arc::ptr_eq(&self.gate, &group.owner.gate)
+        let same_owner = std::ptr::eq(self, group.owner)
+            || (Arc::ptr_eq(&self.gate, &group.owner.gate)
                 && Arc::ptr_eq(&self.up, &group.owner.up)
-                && Arc::ptr_eq(&self.down, &group.owner.down))
-        {
+                && Arc::ptr_eq(&self.down, &group.owner.down));
+        if !same_owner {
             lloom_tensor::bail!("resolved expert group belongs to another resident bank owner")
         }
         Ok(())
@@ -5598,7 +5598,7 @@ impl ExpertResidency for Streamed {
                     .swap(false, Ordering::AcqRel)
                 {
                     Err(lloom_tensor::kernels::MetalKernelError::QueueUnavailable(
-                        "test-only initializer DATA observation fault".into(),
+                        "test-only initializer DATA observation fault",
                     ))
                 } else {
                     device.commands().wait_marker(marker)
@@ -8338,7 +8338,7 @@ mod tests {
     fn resized_fetch_banks_keep_their_actual_shared_storage_and_fetch_new_experts() {
         use crate::nn::expert_prefetch::Prefetcher;
         use lloom_tensor::kernels::metal::staging::StagingRing;
-        use objc2_metal::{MTLBuffer as _, MTLStorageMode};
+        use objc2_metal::MTLStorageMode;
 
         let dev = resize_control_device();
         let m = dev.as_metal_device().unwrap();

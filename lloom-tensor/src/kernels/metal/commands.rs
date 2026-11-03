@@ -3876,7 +3876,7 @@ mod owner_submission_tests {
         let (writer, marker) = {
             let mut blit = commands.blit_command_encoder().unwrap();
             // SAFETY: independent pins survive every refusal/assertion unwind.
-            unsafe { blit.fill_buffer(&buffer, (0, 256), 0x4a) };
+            unsafe { blit.fill_buffer(&buffer, (0, 256), 0x4a) }.unwrap();
             let receipt = blit.recording_receipt();
             assert!(
                 !receipt.1.poll_data_ready().unwrap(),
@@ -4037,7 +4037,7 @@ mod owner_submission_tests {
         {
             let mut blit = commands.blit_command_encoder().unwrap();
             // SAFETY: independent pins survive assertion/refusal unwind.
-            unsafe { blit.fill_buffer(&buffer, (0, 256), 0x5b) };
+            unsafe { blit.fill_buffer(&buffer, (0, 256), 0x5b) }.unwrap();
         }
         let marker = commands.flush_marker().unwrap();
         assert!(

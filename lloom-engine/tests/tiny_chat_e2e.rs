@@ -380,6 +380,124 @@ fn an_lfm2_gguf_takes_the_device_filter_at_blocks_f32_only() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// The turn line of a `-v` run: readback, completion tokens, whether the
+/// native route's note was printed, the token stream's digest.
+#[cfg(feature = "metal")]
+type Stream = Result<(String, String, bool, String), String>;
+
+/// One `-v` turn of `lloom chat` on `model` with `extra` flags, or the
+/// refusal's last line.
+#[cfg(feature = "metal")]
+fn stream(model: &Path, extra: &[&str]) -> Stream {
+    const NATIVE: &str = "native prepared device sampler; no host logits readback";
+    let out = Command::new(env!("CARGO_BIN_EXE_lloom"))
+        .args(["chat", "--model"])
+        .arg(model)
+        .args(["--raw", "-v", "-p", PROMPT, "-n", MAX_TOKENS, "--ignore-eos"])
+        .args(extra)
+        .output()
+        .expect("lloom runs");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    if !out.status.success() {
+        let last = stderr.lines().rev().find(|l| !l.trim().is_empty());
+        return Err(format!("refused: {}", last.unwrap_or("").trim()));
+    }
+    let line = stderr
+        .lines()
+        .find(|l| l.starts_with("[turn 1:"))
+        .ok_or_else(|| format!("no turn line:\n{stderr}"))?;
+    let field = |k: &str| {
+        line.split_whitespace()
+            .find_map(|kv| kv.strip_prefix(&format!("{k}=")))
+            .unwrap_or("")
+            .trim_end_matches(']')
+            .to_string()
+    };
+    Ok((
+        field("readback"),
+        field("completion_tokens"),
+        stderr.contains(NATIVE),
+        field("tokens_sha256"),
+    ))
+}
+
+/// Decision 110 computes an LFM2 GGUF at the model's dtype, f16 on Metal
+/// (`blocks f16`). With the device filter explicitly on, a filtered sampled
+/// request rides NativeRing, whose guarded embedding gather feeds the f16
+/// residual stream: it must draw the fallback's stream
+/// (`--device-filter=false`, the host draw on the blocking arm) at a fixed
+/// seed, as it does at f32 (`--gguf-act f32`, the positive control that the
+/// comparison can pass). Greedy keeps its route with the filter on or off and
+/// draws one stream too. Every arm is recorded; the test fails once, naming
+/// each arm that parted.
+#[cfg(feature = "metal")]
+#[test]
+fn an_f16_lfm2_gguf_with_the_device_filter_draws_the_fallbacks_stream() {
+    use lloom_tensor::quantized::GgmlDType;
+    let dir = scratch("device-filter-lfm2-gguf-f16");
+    let model = write::<Lfm2Tiny>(&dir);
+    let q8 = lfm2_gguf(&model, GgmlDType::Q8_0);
+    let sampled = ["-t", "0.8", "--top-k", "4", "--seed", "7"];
+    let greedy = ["--sampling-defaults", "greedy"];
+    let show = |r: &Stream| -> Route {
+        r.clone()
+            .map(|(rb, n, native, t)| (format!("{rb} tokens={t}"), n, native))
+    };
+    let full = |r: &Stream| matches!(r, Ok((rb, n, _, t)) if !rb.is_empty() && n == MAX_TOKENS && !t.is_empty());
+    let mut arms: Vec<(String, bool, Route)> = Vec::new();
+    for (act, rep) in [(None, "blocks f16"), (Some("f32"), "blocks f32")] {
+        let mut base: Vec<&str> = Vec::new();
+        if let Some(a) = act {
+            base.extend(["--gguf-act", a]);
+        }
+        let server = Server::start(&q8, &base);
+        let (_, health) = server.call("GET", "/health", &json!({}));
+        drop(server);
+        let got = health["representation"].as_str().map(str::to_string);
+        arms.push((
+            format!("{rep}: /health representation"),
+            got.as_deref() == Some(rep),
+            Ok((format!("{got:?}"), String::new(), false)),
+        ));
+        for (cell, flags) in [("sampled", &sampled[..]), ("greedy", &greedy[..])] {
+            let run = |filter: &str| {
+                let mut args = base.clone();
+                args.extend(flags.iter().copied());
+                args.push(filter);
+                stream(&q8, &args)
+            };
+            let off = run("--device-filter=false");
+            let on = run("--device-filter=true");
+            // Sampled: off is the blocking host draw, on is NativeRing.
+            // Greedy: neither takes the device sampler.
+            let (off_ok, on_ok) = match cell {
+                "sampled" => (
+                    full(&off) && matches!(&off, Ok((rb, _, false, _)) if rb == "blocking"),
+                    full(&on) && matches!(&on, Ok((rb, _, true, _)) if rb.starts_with("ring")),
+                ),
+                _ => (
+                    full(&off) && matches!(&off, Ok((_, _, false, _))),
+                    full(&on) && matches!(&on, Ok((_, _, false, _))),
+                ),
+            };
+            let same = matches!((&off, &on), (Ok((_, _, _, a)), Ok((_, _, _, b))) if !a.is_empty() && a == b);
+            arms.push((format!("{rep} {cell}: off route"), off_ok, show(&off)));
+            arms.push((format!("{rep} {cell}: on route"), on_ok, show(&on)));
+            arms.push((
+                format!("{rep} {cell}: on draws the fallback's stream"),
+                same,
+                show(&on),
+            ));
+        }
+    }
+    let arms: Vec<(&str, bool, Route)> = arms
+        .iter()
+        .map(|(n, ok, r)| (n.as_str(), *ok, r.clone()))
+        .collect();
+    assert_arms("DEVICE_FILTER_GGUF_F16", &arms);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// Three turns of `lloom chat` on `model` with `extra` flags: the three
 /// `[turn N: …]` lines' fields, and the process's stderr.
 fn three_turns(

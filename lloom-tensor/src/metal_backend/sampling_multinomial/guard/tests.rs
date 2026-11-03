@@ -586,6 +586,84 @@ fn invalid_later_row_and_valid_queued_successor_never_index_a_packed_table() -> 
     Ok(())
 }
 
+/// A packed table's guarded lookup into an f16 output is the incumbent lookup
+/// cast to f16, bit for bit: the rows dequantize in f32 and round to half once,
+/// as `QTensor::embedding` followed by `to_dtype(F16)` rounds them (an LFM2
+/// GGUF's fallback route at f16 compute, `ReprEmbedding::forward`). Kinds with
+/// 32- and 256-wide blocks (the K-quants' two-term dequantization is where
+/// rounding in half would part from rounding once), magnitudes from f16's
+/// subnormal range to the hundreds, a nonzero (row-aligned) output offset
+/// whose untouched row keeps its fill, the same bits on every run, and the
+/// f32 output, unchanged, as the control.
+#[test]
+fn packed_embedding_into_f16_is_the_incumbent_lookup_rounded_once() -> Result<()> {
+    use crate::quantized::{GgmlDType, QMatMul, QTensor};
+    use half::f16;
+    let d = device()?;
+    let hidden = 256;
+    let scales = [3e-6f32, 0.37, 211.0];
+    let weights: Vec<f32> = (0..3 * hidden)
+        .map(|i| {
+            let (r, j) = (i / hidden, i % hidden);
+            let x = ((j * 37 + r * 11) % 97) as f32 / 48.0 - 1.0;
+            scales[r] * (x + (j as f32 * 0.618).sin() / 7.0)
+        })
+        .collect();
+    let weights = Tensor::from_vec(weights, (3, hidden), &d)?;
+    let ids = [2u32, 0];
+    let status = [0, u32::MAX, 3, 2, 0, u32::MAX, 3, 2];
+    let bits = |t: &Tensor| -> Result<Vec<u16>> {
+        Ok(t.flatten_all()?
+            .to_vec1::<f16>()?
+            .into_iter()
+            .map(f16::to_bits)
+            .collect())
+    };
+    for kind in [GgmlDType::Q8_0, GgmlDType::Q4_0, GgmlDType::Q4K, GgmlDType::Q6K] {
+        let q = std::sync::Arc::new(QTensor::quantize(&weights, kind)?);
+        let rows = q.embedding(&Tensor::new(&ids[..], &d)?)?;
+        let want = bits(&rows.to_dtype(DType::F16)?)?;
+        let table = QMatMul::QTensor(q);
+        for run in 0..3 {
+            let mut guard = SampleGuard::new(d.as_metal_device()?)?;
+            let out = Tensor::full(-99f32, (3, hidden), &d)?.to_dtype(DType::F16)?;
+            let token = guard.bind(sample(&d, &ids, &status)?)?;
+            table.embedding_guarded_into(&token, &out.narrow(0, 1, 2)?)?;
+            drop(token);
+            finish(&d)?;
+            guard.check_error()?;
+            let got = bits(&out)?;
+            assert_eq!(
+                got[..hidden],
+                vec![f16::from_f32(-99.).to_bits(); hidden][..],
+                "{kind:?} run {run}: the row before the offset was written"
+            );
+            let parted = got[hidden..]
+                .iter()
+                .zip(&want)
+                .filter(|(a, b)| a != b)
+                .count();
+            assert_eq!(
+                parted,
+                0,
+                "{kind:?} run {run}: {parted} of {} elements part from the incumbent lookup cast to f16",
+                want.len()
+            );
+        }
+        let mut guard = SampleGuard::new(d.as_metal_device()?)?;
+        let out = Tensor::full(-99f32, (2, hidden), &d)?;
+        let token = guard.bind(sample(&d, &ids, &status)?)?;
+        table.embedding_guarded_into(&token, &out)?;
+        drop(token);
+        finish(&d)?;
+        guard.check_error()?;
+        let got: Vec<u32> = out.flatten_all()?.to_vec1::<f32>()?.iter().map(|x| x.to_bits()).collect();
+        let want: Vec<u32> = rows.flatten_all()?.to_vec1::<f32>()?.iter().map(|x| x.to_bits()).collect();
+        assert_eq!(got, want, "{kind:?}: the f32 output is the incumbent lookup");
+    }
+    Ok(())
+}
+
 // The current encoder may differ from the installed default without a race:
 // replacement affects only the next encoder. A forward-only custom executor
 // makes the old predicate observable without constructing unsafe native work.

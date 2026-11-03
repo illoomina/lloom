@@ -269,6 +269,12 @@ pub enum Error {
     #[error(transparent)]
     Allocation(#[from] crate::memory_admission::AllocationError),
 
+    /// Inline step annotations preserve the allocation refusal's warm contract.
+    #[error(transparent)]
+    AllocationUntouched(crate::memory_admission::AllocationError),
+    #[error(transparent)]
+    AllocationTouched(crate::memory_admission::AllocationError),
+
     #[cfg(all(not(target_arch = "wasm32"), not(target_os = "ios"), feature = "ug"))]
     #[error(transparent)]
     Ug(#[from] candle_ug::Error),
@@ -305,6 +311,16 @@ pub enum Error {
     #[error("unsupported safetensor dtype {0:?}")]
     UnsupportedSafeTensorDtype(safetensors::Dtype),
 
+    /// A model-step error annotated at a proven mutation boundary. The original
+    /// error/diagnostic chain is retained for cold diagnostics. Inline refusals
+    /// use their dedicated variants instead of allocating this wrapper.
+    #[error("{inner}")]
+    StepState {
+        touched: StateTouched,
+        #[source]
+        inner: Box<Self>,
+    },
+
     /// Arbitrary errors wrapping.
     #[error("{0}")]
     Wrapped(Box<dyn std::fmt::Display + Send + Sync>),
@@ -337,6 +353,14 @@ pub enum Error {
     UnwrapNone,
 }
 
+/// Whether one failed model step may have mutated model/cache state.
+/// Unknown errors have no annotation and recovery must treat them as touched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StateTouched {
+    No,
+    Yes,
+}
+
 pub type Result<T> = std::result::Result<T, Error>;
 
 impl From<std::string::FromUtf8Error> for Error {
@@ -358,6 +382,63 @@ impl From<safetensors::SafeTensorError> for Error {
 }
 
 impl Error {
+    /// Annotate a failed step at a proven mutation boundary. Inline allocation
+    /// and recording refusals remain inline; arbitrary cold diagnostics retain
+    /// their original error behind one box. A known nested `Yes` cannot weaken.
+    pub fn with_state_touched(self, touched: StateTouched) -> Self {
+        let touched = if self.state_touched() == Some(StateTouched::Yes) {
+            StateTouched::Yes
+        } else {
+            touched
+        };
+        match self {
+            Self::Allocation(refusal)
+            | Self::AllocationUntouched(refusal)
+            | Self::AllocationTouched(refusal) => match touched {
+                StateTouched::No => Self::AllocationUntouched(refusal),
+                StateTouched::Yes => Self::AllocationTouched(refusal),
+            },
+            #[cfg(feature = "metal")]
+            Self::Metal(MetalError::KernelError(error)) => match error.try_annotate_step(touched) {
+                Ok(error) => Self::Metal(MetalError::KernelError(error)),
+                Err(error) => Self::StepState {
+                    touched,
+                    inner: Box::new(Self::Metal(MetalError::KernelError(error))),
+                },
+            },
+            Self::StepState { inner, .. } => Self::StepState { touched, inner },
+            error => Self::StepState {
+                touched,
+                inner: Box::new(error),
+            },
+        }
+    }
+
+    /// Classification carried by this error, through typed diagnostic wrappers.
+    /// An absent classification is unknown, not proof of untouched state.
+    /// Existing type-erased foreign errors remain unknown; no string matching
+    /// or new downcast/erasure mechanism is used to manufacture an answer.
+    pub fn state_touched(&self) -> Option<StateTouched> {
+        match self {
+            Self::AllocationUntouched(_) => Some(StateTouched::No),
+            Self::AllocationTouched(_) => Some(StateTouched::Yes),
+            #[cfg(feature = "metal")]
+            Self::Metal(MetalError::KernelError(error)) => error.step_state_touched(),
+            Self::StepState { touched, inner } => {
+                if inner.state_touched() == Some(StateTouched::Yes) {
+                    Some(StateTouched::Yes)
+                } else {
+                    Some(*touched)
+                }
+            }
+            Self::Context { inner, .. } | Self::WithBacktrace { inner, .. } => {
+                inner.state_touched()
+            }
+            Self::WithPath(path) => path.inner.state_touched(),
+            _ => None,
+        }
+    }
+
     pub fn wrap(err: impl std::fmt::Display + Send + Sync + 'static) -> Self {
         Self::Wrapped(Box::new(err)).bt()
     }
@@ -413,8 +494,12 @@ impl Error {
     /// backtrace it gained on the way up.
     pub fn allocation(&self) -> Option<crate::memory_admission::AllocationError> {
         match self {
-            Self::Allocation(refusal) => Some(*refusal),
-            Self::Context { inner, .. } | Self::WithBacktrace { inner, .. } => inner.allocation(),
+            Self::Allocation(refusal)
+            | Self::AllocationUntouched(refusal)
+            | Self::AllocationTouched(refusal) => Some(*refusal),
+            Self::Context { inner, .. }
+            | Self::WithBacktrace { inner, .. }
+            | Self::StepState { inner, .. } => inner.allocation(),
             Self::WithPath(with_path) => with_path.inner.allocation(),
             _ => None,
         }
@@ -572,5 +657,77 @@ mod tests {
         let context = Error::Msg("the same refusal".into()).context("public context");
         assert!(std::ptr::eq(context.without_backtrace(), &context));
         assert_eq!(context.without_backtrace().to_string(), context.to_string());
+    }
+}
+
+#[cfg(test)]
+mod state_touched_tests {
+    use super::*;
+
+    #[test]
+    fn absent_classification_is_unknown_and_recovery_fails_closed() {
+        let error = Error::Msg("foreign refusal".into());
+        assert_eq!(error.state_touched(), None);
+        assert_ne!(error.state_touched(), Some(StateTouched::No));
+    }
+
+    #[test]
+    fn untouched_annotation_retains_display_and_error_source() {
+        let error = Error::Msg("ceiling refusal".into()).with_state_touched(StateTouched::No);
+        assert_eq!(error.state_touched(), Some(StateTouched::No));
+        assert_eq!(error.to_string(), "ceiling refusal");
+        assert_eq!(
+            std::error::Error::source(&error).unwrap().to_string(),
+            "ceiling refusal"
+        );
+    }
+
+    #[test]
+    fn nested_touched_annotation_cannot_be_weakened() {
+        let error = Error::Msg("layer failed".into())
+            .with_state_touched(StateTouched::Yes)
+            .context("forward")
+            .with_path("weights")
+            .with_state_touched(StateTouched::No);
+        assert_eq!(error.state_touched(), Some(StateTouched::Yes));
+        let error = Error::StepState {
+            touched: StateTouched::No,
+            inner: Box::new(error),
+        };
+        assert_eq!(error.state_touched(), Some(StateTouched::Yes));
+    }
+
+    #[test]
+    fn typed_context_path_and_backtrace_preserve_untouched() {
+        let error = Error::Msg("before first mutation".into())
+            .with_state_touched(StateTouched::No)
+            .context("admission")
+            .with_path("model");
+        let error = Error::WithBacktrace {
+            inner: Box::new(error),
+            backtrace: Box::new(std::backtrace::Backtrace::disabled()),
+        };
+        assert_eq!(error.state_touched(), Some(StateTouched::No));
+        assert!(error.to_string().contains("before first mutation"));
+    }
+
+    #[test]
+    fn allocation_inspection_survives_step_annotation_and_diagnostics() {
+        let refusal = crate::memory_admission::AllocationError::Overflow;
+        let error = Error::Allocation(refusal)
+            .with_state_touched(StateTouched::No)
+            .context("step")
+            .with_path("model");
+        assert_eq!(error.allocation(), Some(refusal));
+        assert_eq!(error.state_touched(), Some(StateTouched::No));
+    }
+
+    // Existing ABI floor is verified only for the supported 64-bit targets.
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn annotation_does_not_widen_existing_error_layout() {
+        assert_eq!(std::mem::size_of::<Error>(), 32);
+        assert_eq!(std::mem::size_of::<Result<()>>(), 32);
+        assert_eq!(std::mem::size_of::<Result<crate::Tensor>>(), 32);
     }
 }

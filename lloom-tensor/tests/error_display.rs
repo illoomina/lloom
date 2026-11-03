@@ -46,6 +46,8 @@ fn variant(e: &Error) -> &'static str {
         Error::Cuda(_) => "Cuda",
         Error::Metal(_) => "Metal",
         Error::Allocation(_) => "Allocation",
+        Error::AllocationUntouched(_) => "AllocationUntouched",
+        Error::AllocationTouched(_) => "AllocationTouched",
         #[cfg(feature = "ug")]
         Error::Ug(_) => "Ug",
         Error::TryFromIntError(_) => "TryFromIntError",
@@ -56,6 +58,7 @@ fn variant(e: &Error) -> &'static str {
         Error::Io(_) => "Io",
         Error::SafeTensor(_) => "SafeTensor",
         Error::UnsupportedSafeTensorDtype(_) => "UnsupportedSafeTensorDtype",
+        Error::StepState { .. } => "StepState",
         Error::Wrapped(_) => "Wrapped",
         Error::WrappedContext(_) => "WrappedContext",
         Error::Context { .. } => "Context",
@@ -266,6 +269,14 @@ fn every_variant() -> Vec<(&'static str, Error)> {
             )),
         ),
         (
+            "AllocationUntouched",
+            Error::AllocationUntouched(AllocationError::HostAllocation),
+        ),
+        (
+            "AllocationTouched",
+            Error::AllocationTouched(AllocationError::HostAllocation),
+        ),
+        (
             "Allocation.Refused",
             Error::Allocation(AllocationError::Refused {
                 requested: 17,
@@ -291,7 +302,10 @@ fn every_variant() -> Vec<(&'static str, Error)> {
             Error::TryFromIntError(u8::try_from(300u32).unwrap_err()),
         ),
         ("Npy", Error::Npy("npy fixture".to_string())),
-        ("Zip", Error::Zip(Box::new(zip::result::ZipError::FileNotFound))),
+        (
+            "Zip",
+            Error::Zip(Box::new(zip::result::ZipError::FileNotFound)),
+        ),
         ("ParseInt", Error::ParseInt("x".parse::<u32>().unwrap_err())),
         (
             "FromUtf8",
@@ -311,6 +325,13 @@ fn every_variant() -> Vec<(&'static str, Error)> {
         (
             "UnsupportedSafeTensorDtype",
             Error::UnsupportedSafeTensorDtype(safetensors::Dtype::BOOL),
+        ),
+        (
+            "StepState",
+            Error::StepState {
+                touched: lloom_tensor::StateTouched::No,
+                inner: Box::new(Error::UnwrapNone),
+            },
         ),
         ("Wrapped", Error::Wrapped(Box::new("wrapped fixture"))),
         (
@@ -357,6 +378,30 @@ fn every_variant() -> Vec<(&'static str, Error)> {
             "Metal.Kernel.Allocation",
             Error::Metal(MetalError::KernelError(MetalKernelError::Allocation(
                 AllocationError::DeviceOom { requested: 4096 },
+            ))),
+        ));
+        all.push((
+            "Metal.Kernel.AllocationUntouched",
+            Error::Metal(MetalError::KernelError(
+                MetalKernelError::AllocationUntouched(AllocationError::HostAllocation),
+            )),
+        ));
+        all.push((
+            "Metal.Kernel.AllocationTouched",
+            Error::Metal(MetalError::KernelError(
+                MetalKernelError::AllocationTouched(AllocationError::HostAllocation),
+            )),
+        ));
+        all.push((
+            "Metal.Kernel.RecordingUntouched",
+            Error::Metal(MetalError::KernelError(
+                MetalKernelError::RecordingUntouched(CommandLifecycleError::Busy),
+            )),
+        ));
+        all.push((
+            "Metal.Kernel.RecordingTouched",
+            Error::Metal(MetalError::KernelError(MetalKernelError::RecordingTouched(
+                CommandLifecycleError::Busy,
             ))),
         ));
         all.push((
@@ -659,6 +704,10 @@ fn metal_variant(e: &lloom_tensor::MetalError) -> &'static str {
         M::KernelError(k) => match k {
             K::Allocation(a) => allocation_variant(a),
             K::RecordingAdmission(_) => "Metal.Kernel.RecordingAdmission",
+            K::AllocationUntouched(_) => "Metal.Kernel.AllocationUntouched",
+            K::AllocationTouched(_) => "Metal.Kernel.AllocationTouched",
+            K::RecordingUntouched(_) => "Metal.Kernel.RecordingUntouched",
+            K::RecordingTouched(_) => "Metal.Kernel.RecordingTouched",
             // `CompletionRegistrationError::new` is crate-private; its text is
             // pinned by `kernels::err`'s `registration_error_tests`.
             K::CompletionRegistration(_) => "Metal.Kernel.CompletionRegistration",
@@ -729,6 +778,13 @@ const EXPECTED: &[(&str, &str)] = &[
     ("Io", "io fixture"),
     ("SafeTensor", "header too large"),
     ("UnsupportedSafeTensorDtype", "unsupported safetensor dtype BOOL"),
+    ("StepState", "unwrap none"),
+    ("AllocationUntouched", "cold host allocation returned null"),
+    ("AllocationTouched", "cold host allocation returned null"),
+    ("Metal.Kernel.AllocationUntouched", "Metal error cold host allocation returned null"),
+    ("Metal.Kernel.AllocationTouched", "Metal error cold host allocation returned null"),
+    ("Metal.Kernel.RecordingUntouched", "Metal error command buffer recording admission refused: recording operation currently busy"),
+    ("Metal.Kernel.RecordingTouched", "Metal error command buffer recording admission refused: recording operation currently busy"),
     ("Wrapped", "wrapped fixture"),
     ("WrappedContext", "Custom { kind: Other, error: \"inner io\" }\n\"while loading\""),
     ("Context", "ctx fixture\nunwrap none"),
@@ -803,7 +859,7 @@ fn every_variant_displays_as_before() {
     #[cfg(feature = "metal")]
     assert_eq!(listed, EXPECTED.len(), "a pinned text has no fixture");
     assert!(listed > 40, "only {listed} fixtures");
-    assert_eq!(named.len(), 45, "variants without a fixture: {named:?}");
+    assert_eq!(named.len(), 48, "variants without a fixture: {named:?}");
     let nested: std::collections::BTreeSet<_> =
         all.iter().filter_map(|(_, e)| nested_variant(e)).collect();
     let allocation = nested
@@ -820,10 +876,10 @@ fn every_variant_displays_as_before() {
             .iter()
             .filter(|n| n.starts_with("Metal.Kernel."))
             .count();
-        // Twenty-three variants: `Allocation` is counted above and
-        // `CompletionRegistration` is pinned in `kernels::err`.
+        // The original allocation variant is counted above; the four step
+        // carriers are distinct. CompletionRegistration is pinned in err.rs.
         assert_eq!(
-            kernel, 21,
+            kernel, 25,
             "MetalKernelError variants with a fixture: {nested:?}"
         );
         let metal = nested

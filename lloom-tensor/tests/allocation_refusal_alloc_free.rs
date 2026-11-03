@@ -57,6 +57,17 @@ fn counted<T>(f: impl FnOnce() -> T) -> (T, u64) {
     (out, COUNTED.load(Ordering::Relaxed) - before)
 }
 
+/// Called outside counted windows; compare the existing typed diagnostic chain.
+fn diagnostic_sources(error: &dyn std::error::Error) -> Vec<String> {
+    let mut sources = Vec::new();
+    let mut next = error.source();
+    while let Some(source) = next {
+        sources.push(source.to_string());
+        next = source.source();
+    }
+    sources
+}
+
 /// The storage boundary's widening, as a caller writes it.
 fn widen<T>(r: Result<T, AllocationError>) -> lloom_tensor::Result<T> {
     Ok(r?)
@@ -262,6 +273,79 @@ mod kernel_layer {
         }
     }
 
+    fn recording_source(error: &lloom_tensor::Error) -> Option<CommandLifecycleError> {
+        let mut next = std::error::Error::source(error);
+        while let Some(source) = next {
+            if let Some(recording) = source.downcast_ref::<CommandLifecycleError>() {
+                return Some(*recording);
+            }
+            next = source.source();
+        }
+        None
+    }
+
+    /// Exercise both inline kernel refusal families without touching a device.
+    #[test]
+    fn kernel_refusal_step_annotations_are_allocation_free_and_monotone() {
+        use lloom_tensor::StateTouched;
+        for touched in [StateTouched::No, StateTouched::Yes] {
+            let errors = every_allocation_refusal()
+                .into_iter()
+                .map(MetalKernelError::from)
+                .chain(
+                    every_recording_refusal()
+                        .into_iter()
+                        .map(MetalKernelError::from),
+                );
+            for error in errors {
+                let original = widen_kernel::<()>(Err(error)).unwrap_err();
+                let expected_text = original.to_string();
+                let expected_origin = original.allocation();
+                let expected_sources = diagnostic_sources(&original);
+                let expected_recording_source = recording_source(&original);
+                let (annotated, n) =
+                    counted(|| std::hint::black_box(original.with_state_touched(touched)));
+                assert_eq!(
+                    n, 0,
+                    "annotating kernel refusal allocated {n} times: {expected_text}"
+                );
+                assert_eq!(annotated.state_touched(), Some(touched));
+                assert_eq!(annotated.allocation(), expected_origin);
+                assert_eq!(annotated.to_string(), expected_text);
+                assert_eq!(
+                    diagnostic_sources(&annotated),
+                    expected_sources,
+                    "annotation lost its diagnostic source chain"
+                );
+                assert_eq!(
+                    recording_source(&annotated),
+                    expected_recording_source,
+                    "annotation lost the typed recording-admission source"
+                );
+                let (annotated, n) = counted(|| {
+                    std::hint::black_box(annotated.with_state_touched(StateTouched::No))
+                });
+                assert_eq!(
+                    n, 0,
+                    "re-annotating kernel refusal allocated {n} times: {expected_text}"
+                );
+                assert_eq!(annotated.state_touched(), Some(touched));
+                assert_eq!(annotated.allocation(), expected_origin);
+                assert_eq!(annotated.to_string(), expected_text);
+                assert_eq!(
+                    diagnostic_sources(&annotated),
+                    expected_sources,
+                    "annotation lost its diagnostic source chain"
+                );
+                assert_eq!(
+                    recording_source(&annotated),
+                    expected_recording_source,
+                    "annotation lost the typed recording-admission source"
+                );
+            }
+        }
+    }
+
     #[test]
     fn a_kernel_layer_allocation_refusal_widens_into_error_without_allocating() {
         for refusal in every_allocation_refusal() {
@@ -278,5 +362,81 @@ mod kernel_layer {
                 "{refusal:?} did not arrive as a kernel-layer refusal: {widened}"
             );
         }
+    }
+}
+
+/// Annotation cannot turn an inline memory refusal into a heap allocation.
+/// Existing origin/text inspection and monotone touched-state stay intact.
+#[test]
+fn allocation_refusal_step_annotations_are_allocation_free_and_monotone() {
+    use lloom_tensor::{Error, StateTouched};
+    for refusal in every_allocation_refusal() {
+        let expected = Error::Allocation(refusal).to_string();
+        let expected_sources = diagnostic_sources(&Error::Allocation(refusal));
+        for touched in [StateTouched::No, StateTouched::Yes] {
+            let (annotated, n) = counted(|| {
+                std::hint::black_box(Error::Allocation(refusal).with_state_touched(touched))
+            });
+            assert_eq!(
+                n, 0,
+                "annotating {refusal:?} as {touched:?} allocated {n} times"
+            );
+            assert_eq!(annotated.state_touched(), Some(touched));
+            assert_eq!(annotated.allocation(), Some(refusal));
+            assert_eq!(annotated.to_string(), expected);
+            assert_eq!(
+                diagnostic_sources(&annotated),
+                expected_sources,
+                "annotation lost its diagnostic source chain"
+            );
+            let (annotated, n) =
+                counted(|| std::hint::black_box(annotated.with_state_touched(StateTouched::No)));
+            assert_eq!(n, 0, "re-annotating {refusal:?} allocated {n} times");
+            assert_eq!(annotated.state_touched(), Some(touched));
+            assert_eq!(annotated.allocation(), Some(refusal));
+            assert_eq!(annotated.to_string(), expected);
+            assert_eq!(
+                diagnostic_sources(&annotated),
+                expected_sources,
+                "annotation lost its diagnostic source chain"
+            );
+        }
+    }
+}
+
+/// Existing cold diagnostics retain their box instead of nesting a fresh box
+/// at every outer step boundary. This does not price initial cold construction.
+#[test]
+fn existing_cold_step_box_is_reused_without_an_allocation_or_source_change() {
+    use lloom_tensor::{Error, StateTouched};
+    fn inner_address(error: &Error) -> usize {
+        let Error::StepState { inner, .. } = error else {
+            panic!("cold diagnostic lost its typed step wrapper");
+        };
+        inner.as_ref() as *const Error as usize
+    }
+    let mut error = Error::Msg("existing diagnostic".into()).with_state_touched(StateTouched::No);
+    let address = inner_address(&error);
+    let sources = diagnostic_sources(&error);
+    for requested in [StateTouched::No, StateTouched::Yes, StateTouched::No] {
+        let expected = if error.state_touched() == Some(StateTouched::Yes) {
+            StateTouched::Yes
+        } else {
+            requested
+        };
+        let (annotated, n) = counted(|| std::hint::black_box(error.with_state_touched(requested)));
+        assert_eq!(
+            n, 0,
+            "reannotating an already boxed cold diagnostic allocated {n} times"
+        );
+        assert_eq!(
+            inner_address(&annotated),
+            address,
+            "existing diagnostic box was replaced"
+        );
+        assert_eq!(annotated.state_touched(), Some(expected));
+        assert_eq!(annotated.to_string(), "existing diagnostic");
+        assert_eq!(diagnostic_sources(&annotated), sources);
+        error = annotated;
     }
 }

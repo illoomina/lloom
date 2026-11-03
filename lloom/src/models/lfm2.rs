@@ -27,13 +27,22 @@ use crate::profile::{Arm, ArmMut, Picked as _, Profile, Regime as _, Rewind as _
 use lloom_tensor::kernels::metal::{GpuClock, PageError, PageIdx};
 #[cfg(feature = "metal")]
 use lloom_tensor::kernels::SiluImpl;
-use lloom_tensor::{DType, Device, IndexOp, Module, Result, Tensor};
+use lloom_tensor::{DType, Device, IndexOp, Module, Result, StateTouched, Tensor};
 use std::collections::{BTreeMap, HashMap};
 use std::marker::PhantomData;
 #[cfg(feature = "metal")]
 use std::sync::Arc;
 
 pub mod gguf;
+
+// Error-only adapters: the original Result/diagnostics remain intact. No
+// success-path owner, lock or allocation is introduced by these annotations.
+fn untouched_step_error(error: lloom_tensor::Error) -> lloom_tensor::Error {
+    error.with_state_touched(StateTouched::No)
+}
+fn touched_step_error(error: lloom_tensor::Error) -> lloom_tensor::Error {
+    error.with_state_touched(StateTouched::Yes)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -5034,18 +5043,24 @@ impl<P: Profile> State<P> {
         }
     }
 
-    /// Make room for a pass of `seq_len` positions, or refuse before anything
-    /// moves.
+    /// Plan and prepare room for a pass of `seq_len` positions. Pure-plan
+    /// refusals precede mutation; preparation errors may follow a grant or grow.
     ///
     /// Called at the top of every entry point of `Model` — `forward`,
     /// `forward_embeds`, `forward_all`, `forward_rows` per row — **before**
-    /// `advance_conv_phase`. That placement is the contract: a refusal here
-    /// leaves the KV length, the conv phase and every buffer exactly as they
-    /// were, so the same call can be retried (after memory returns, or with a
-    /// wider ceiling) and produce the stream an unrefused run would have.
+    /// `advance_conv_phase`. The pure plan's `StateTouched::No` refusal leaves
+    /// KV length, conv phase and every buffer unchanged, so that call can be
+    /// retried. A preparation error may follow a partial grant or grow and is
+    /// conservatively `StateTouched::Yes`; consumers must inspect the typed
+    /// classification instead of treating every pre-layer error as untouched.
     /// Refusing from inside a layer would not: the conv ring is advanced once
     /// per pass before the layers run, and a pass that advanced it and then
     /// failed at layer 2's append leaves the ring one step ahead of the KV.
+    ///
+    /// The pure ceiling/geometry refusal is classified `StateTouched::No`.
+    /// Once a tier grant, admission or grow may have changed state, a failure
+    /// is conservatively `StateTouched::Yes`; the caller must not mistake a
+    /// partial grow/grant for the pure retryable preflight below.
     ///
     /// Two refusals, in order. The ceiling — `kv_len + seq_len` past
     /// `kv_capacity` — is a property of the model and the caller's choice and
@@ -5080,17 +5095,26 @@ impl<P: Profile> State<P> {
     }
 
     pub(crate) fn prepare_pass(&mut self, seq_len: usize) -> Result<()> {
-        self.apply_layer_grant()?;
-        if let Some(plan) = self.plan_pass(seq_len)? {
-            self.admit_grow(plan.bytes, &plan)?;
-            self.apply_grow(&plan)?;
-        }
-        // The planes allocate at the first append, at the slab's width: the
-        // ledger hears that here, once per sequence, and at every grow after.
-        if seq_len > 0 && self.kv_len() == 0 {
-            self.ledger_set_held(self.kv_slab * self.kv_bytes_per_token);
-        }
-        Ok(())
+        let plan = self.plan_pass(seq_len).map_err(untouched_step_error)?;
+        self.prepare_planned_pass(seq_len, plan)
+    }
+
+    /// Consume the one pure plan, after any caller-owned tier attachment.
+    /// Applying a grant/grow may mutate state even before the first layer.
+    fn prepare_planned_pass(&mut self, seq_len: usize, plan: Option<GrowPlan>) -> Result<()> {
+        (|| {
+            self.apply_layer_grant()?;
+            if let Some(plan) = plan {
+                self.admit_grow(plan.bytes, &plan)?;
+                self.apply_grow(&plan)?;
+            }
+            // Same once/sequence ledger update; no re-planning or query.
+            if seq_len > 0 && self.kv_len() == 0 {
+                self.ledger_set_held(self.kv_slab * self.kv_bytes_per_token);
+            }
+            Ok(())
+        })()
+        .map_err(touched_step_error)
     }
 
     /// The first half of `prepare_pass`: the ceiling, and the grow a pass of
@@ -10907,11 +10931,10 @@ impl<P: Profile> Model<P> {
         index_pos: usize,
         cache: &mut State<P>,
     ) -> Result<Tensor> {
-        let (_, seq_len) = input_ids.dims2()?;
+        let (_, seq_len) = input_ids.dims2().map_err(untouched_step_error)?;
+        let plan = cache.plan_pass(seq_len).map_err(untouched_step_error)?;
         self.attach_layer_tier(cache);
-        // Room for this pass, or a refusal that leaves everything as it was —
-        // BEFORE the conv phase advances below (`Cache::prepare_pass`).
-        cache.prepare_pass(seq_len)?;
+        cache.prepare_planned_pass(seq_len, plan)?;
 
         // The ring's write slot, advanced once per forward pass and read by all
         // 22 conv layers (`DESIGN.md` §10.2c -- it is conv state, so it lives in
@@ -10937,8 +10960,11 @@ impl<P: Profile> Model<P> {
         // as live at `K > 0`.
         self.advance_conv_phase(seq_len, cache);
 
-        let hidden_states = self.embed_tokens.forward(input_ids)?;
-        self.forward_residual(hidden_states, seq_len, index_pos, cache, true)
+        (|| {
+            let hidden_states = self.embed_tokens.forward(input_ids)?;
+            self.forward_residual(hidden_states, seq_len, index_pos, cache, true)
+        })()
+        .map_err(touched_step_error)
     }
 
     /// Shared residual walk and last-position projection. Pass admission and
@@ -11009,75 +11035,82 @@ impl<P: Profile> Model<P> {
         input_ids: &Tensor,
         rows: &mut [Row<'_, State<P>>],
     ) -> Result<Tensor> {
-        let (b_sz, seq_len) = input_ids.dims2()?;
-        if seq_len != 1 {
-            lloom_tensor::bail!(
-                "lfm2 forward_rows: one token per row, got seq_len {seq_len}; prefill each \
-                 sequence through `forward`"
-            )
-        }
-        if b_sz != rows.len() {
-            lloom_tensor::bail!(
-                "lfm2 forward_rows: {b_sz} token rows for {} caches",
-                rows.len()
-            )
-        }
-        if rows.is_empty() {
-            lloom_tensor::bail!("lfm2 forward_rows: no rows")
-        }
-        let mut plans = Vec::with_capacity(rows.len());
-        for (r, row) in rows.iter_mut().enumerate() {
-            if !row.cache.tap_layers.is_empty() {
+        let plans = (|| {
+            let (b_sz, seq_len) = input_ids.dims2()?;
+            if seq_len != 1 {
                 lloom_tensor::bail!(
-                    "lfm2 forward_rows: row {r}'s cache taps layers {:?}; a batched step does \
-                     not tap",
-                    row.cache.tap_layers
+                    "lfm2 forward_rows: one token per row, got seq_len {seq_len}; prefill each \
+                     sequence through `forward`"
                 )
             }
-            if row.cache.speculative {
+            if b_sz != rows.len() {
                 lloom_tensor::bail!(
-                    "lfm2 forward_rows: row {r}'s cache has an open speculative window"
+                    "lfm2 forward_rows: {b_sz} token rows for {} caches",
+                    rows.len()
                 )
             }
-            // Every row's ceiling before ANY row grows or moves: a refusal at
-            // row 3 must not leave rows 0..2 widened or with their conv phase
-            // advanced (`Cache::prepare_pass`).
-            plans.push(row.cache.plan_pass(1)?);
-        }
-        // One admission for the step's grows together, so a refusal on memory
-        // also comes before any row has grown. Rows of one shared pool plan
-        // the same grow: admitted once.
-        let bytes = grow_bytes_of(&plans);
-        if bytes > 0 {
-            self.attach_layer_tier(rows[0].cache);
-            rows[0].cache.admit_grow(
-                bytes,
-                &format_args!("for a batched step over {} rows", rows.len()),
-            )?;
-        }
-        for (row, plan) in rows.iter_mut().zip(&plans) {
-            if let Some(plan) = plan {
-                row.cache.apply_grow(plan)?;
+            if rows.is_empty() {
+                lloom_tensor::bail!("lfm2 forward_rows: no rows")
             }
-        }
-        for row in rows.iter_mut() {
-            // Per row, as `forward` does per pass: the ring's write slot and
-            // the paged pool's pass marker are the row's own.
-            self.advance_conv_phase(1, row.cache);
-            Self::begin_taps(row.cache);
-        }
+            let mut plans = Vec::with_capacity(rows.len());
+            for (r, row) in rows.iter_mut().enumerate() {
+                if !row.cache.tap_layers.is_empty() {
+                    lloom_tensor::bail!(
+                        "lfm2 forward_rows: row {r}'s cache taps layers {:?}; a batched step does \
+                         not tap",
+                        row.cache.tap_layers
+                    )
+                }
+                if row.cache.speculative {
+                    lloom_tensor::bail!(
+                        "lfm2 forward_rows: row {r}'s cache has an open speculative window"
+                    )
+                }
+                // Every row's ceiling before ANY row grows or moves: a refusal at
+                // row 3 must not leave rows 0..2 widened or with their conv phase
+                // advanced (`Cache::prepare_pass`).
+                plans.push(row.cache.plan_pass(1)?);
+            }
+            // One admission for the step's grows together, so a refusal on memory
+            // also comes before any row has grown. Rows of one shared pool plan
+            // the same grow: admitted once.
+            Ok::<_, lloom_tensor::Error>(plans)
+        })()
+        .map_err(untouched_step_error)?;
+        (|| {
+            let bytes = grow_bytes_of(&plans);
+            if bytes > 0 {
+                self.attach_layer_tier(rows[0].cache);
+                rows[0].cache.admit_grow(
+                    bytes,
+                    &format_args!("for a batched step over {} rows", rows.len()),
+                )?;
+            }
+            for (row, plan) in rows.iter_mut().zip(&plans) {
+                if let Some(plan) = plan {
+                    row.cache.apply_grow(plan)?;
+                }
+            }
+            for row in rows.iter_mut() {
+                // Per row, as `forward` does per pass: the ring's write slot and
+                // the paged pool's pass marker are the row's own.
+                self.advance_conv_phase(1, row.cache);
+                Self::begin_taps(row.cache);
+            }
 
-        let mut hidden_states = self.embed_tokens.forward(input_ids)?;
-        let device = rows[0].cache.device.clone();
-        for (block_idx, layer) in self.layers.iter().enumerate() {
-            mark_graph_node(&device, block_idx);
-            hidden_states = layer.forward_rows(&hidden_states, block_idx, rows)?;
-        }
+            let mut hidden_states = self.embed_tokens.forward(input_ids)?;
+            let device = rows[0].cache.device.clone();
+            for (block_idx, layer) in self.layers.iter().enumerate() {
+                mark_graph_node(&device, block_idx);
+                hidden_states = layer.forward_rows(&hidden_states, block_idx, rows)?;
+            }
 
-        let hidden_states = self.embedding_norm.forward(&hidden_states)?;
-        let hidden_states = hidden_states.i((.., 0, ..))?.contiguous()?;
-        let logits = self.lm_head.forward(&hidden_states)?;
-        logits.to_dtype(DType::F32)
+            let hidden_states = self.embedding_norm.forward(&hidden_states)?;
+            let hidden_states = hidden_states.i((.., 0, ..))?.contiguous()?;
+            let logits = self.lm_head.forward(&hidden_states)?;
+            logits.to_dtype(DType::F32)
+        })()
+        .map_err(touched_step_error)
     }
 
     /// One forward over a RAGGED batch (`BatchedCausalLM::forward_ragged`):
@@ -11125,90 +11158,97 @@ impl<P: Profile> Model<P> {
         all_positions: bool,
         speculative: bool,
     ) -> Result<Tensor> {
-        let (b_sz, total) = input_ids.dims2()?;
-        if b_sz != 1 {
-            lloom_tensor::bail!("lfm2 forward_ragged: the input is `[1, T]`, got batch {b_sz}")
-        }
-        if rows.is_empty() {
-            lloom_tensor::bail!("lfm2 forward_ragged: no rows")
-        }
-        let lens: usize = rows.iter().map(|r| r.len).sum();
-        if lens != total || rows.iter().any(|r| r.len == 0) {
-            lloom_tensor::bail!(
-                "lfm2 forward_ragged: {total} tokens for rows of lengths {:?}",
-                rows.iter().map(|r| r.len).collect::<Vec<_>>()
-            )
-        }
-        let mut plans = Vec::with_capacity(rows.len());
-        for (r, row) in rows.iter_mut().enumerate() {
-            if row.cache.speculative != speculative {
+        let plans = (|| {
+            let (b_sz, total) = input_ids.dims2()?;
+            if b_sz != 1 {
+                lloom_tensor::bail!("lfm2 forward_ragged: the input is `[1, T]`, got batch {b_sz}")
+            }
+            if rows.is_empty() {
+                lloom_tensor::bail!("lfm2 forward_ragged: no rows")
+            }
+            let lens: usize = rows.iter().map(|r| r.len).sum();
+            if lens != total || rows.iter().any(|r| r.len == 0) {
                 lloom_tensor::bail!(
-                    "lfm2 forward_ragged: row {r}'s cache {} an open speculative window; this \
-                     pass is {}",
-                    if row.cache.speculative {
-                        "has"
-                    } else {
-                        "has not"
-                    },
-                    if speculative {
-                        "a verify (open every row first)"
-                    } else {
-                        "not a verify"
-                    }
+                    "lfm2 forward_ragged: {total} tokens for rows of lengths {:?}",
+                    rows.iter().map(|r| r.len).collect::<Vec<_>>()
                 )
             }
-            plans.push(row.cache.plan_pass(row.len)?);
-        }
-        let bytes = grow_bytes_of(&plans);
-        if bytes > 0 {
-            self.attach_layer_tier(rows[0].cache);
-            rows[0].cache.admit_grow(
-                bytes,
-                &format_args!("for a ragged batched pass over {} rows", rows.len()),
-            )?;
-        }
-        for (row, plan) in rows.iter_mut().zip(&plans) {
-            if let Some(plan) = plan {
-                row.cache.apply_grow(plan)?;
+            let mut plans = Vec::with_capacity(rows.len());
+            for (r, row) in rows.iter_mut().enumerate() {
+                if row.cache.speculative != speculative {
+                    lloom_tensor::bail!(
+                        "lfm2 forward_ragged: row {r}'s cache {} an open speculative window; this \
+                         pass is {}",
+                        if row.cache.speculative {
+                            "has"
+                        } else {
+                            "has not"
+                        },
+                        if speculative {
+                            "a verify (open every row first)"
+                        } else {
+                            "not a verify"
+                        }
+                    )
+                }
+                plans.push(row.cache.plan_pass(row.len)?);
             }
-        }
-        for row in rows.iter_mut() {
-            self.advance_conv_phase(row.len, row.cache);
-            Self::begin_taps(row.cache);
-        }
+            Ok::<_, lloom_tensor::Error>(plans)
+        })()
+        .map_err(untouched_step_error)?;
+        (|| {
+            let bytes = grow_bytes_of(&plans);
+            if bytes > 0 {
+                self.attach_layer_tier(rows[0].cache);
+                rows[0].cache.admit_grow(
+                    bytes,
+                    &format_args!("for a ragged batched pass over {} rows", rows.len()),
+                )?;
+            }
+            for (row, plan) in rows.iter_mut().zip(&plans) {
+                if let Some(plan) = plan {
+                    row.cache.apply_grow(plan)?;
+                }
+            }
+            for row in rows.iter_mut() {
+                self.advance_conv_phase(row.len, row.cache);
+                Self::begin_taps(row.cache);
+            }
 
-        let mut hidden_states = self.embed_tokens.forward(input_ids)?;
-        let device = rows[0].cache.device.clone();
-        for (block_idx, layer) in self.layers.iter().enumerate() {
-            mark_graph_node(&device, block_idx);
-            Self::tap_layer_input_rows(&hidden_states, block_idx, rows)?;
-            hidden_states = layer.forward_ragged(&hidden_states, block_idx, rows)?;
-        }
+            let mut hidden_states = self.embed_tokens.forward(input_ids)?;
+            let device = rows[0].cache.device.clone();
+            for (block_idx, layer) in self.layers.iter().enumerate() {
+                mark_graph_node(&device, block_idx);
+                Self::tap_layer_input_rows(&hidden_states, block_idx, rows)?;
+                hidden_states = layer.forward_ragged(&hidden_states, block_idx, rows)?;
+            }
 
-        #[cfg(feature = "metal")]
-        for row in rows.iter_mut() {
-            row.cache.flush_ring_snapshots();
-        }
-        let hidden_states = self.embedding_norm.forward(&hidden_states)?;
-        if all_positions {
-            let logits = self.lm_head.forward(&hidden_states.contiguous()?)?;
-            return logits.to_dtype(DType::F32);
-        }
+            #[cfg(feature = "metal")]
+            for row in rows.iter_mut() {
+                row.cache.flush_ring_snapshots();
+            }
+            let hidden_states = self.embedding_norm.forward(&hidden_states)?;
+            if all_positions {
+                let logits = self.lm_head.forward(&hidden_states.contiguous()?)?;
+                return logits.to_dtype(DType::F32);
+            }
 
-        // Each row's last position, gathered in row order.
-        let mut last = Vec::with_capacity(rows.len());
-        let mut off = 0u32;
-        for row in rows.iter() {
-            off += row.len as u32;
-            last.push(off - 1);
-        }
-        let idx = Tensor::new(last.as_slice(), &device)?;
-        let hidden_states = hidden_states
-            .squeeze(0)?
-            .index_select(&idx, 0)?
-            .contiguous()?;
-        let logits = self.lm_head.forward(&hidden_states)?;
-        logits.to_dtype(DType::F32)
+            // Each row's last position, gathered in row order.
+            let mut last = Vec::with_capacity(rows.len());
+            let mut off = 0u32;
+            for row in rows.iter() {
+                off += row.len as u32;
+                last.push(off - 1);
+            }
+            let idx = Tensor::new(last.as_slice(), &device)?;
+            let hidden_states = hidden_states
+                .squeeze(0)?
+                .index_select(&idx, 0)?
+                .contiguous()?;
+            let logits = self.lm_head.forward(&hidden_states)?;
+            logits.to_dtype(DType::F32)
+        })()
+        .map_err(touched_step_error)
     }
 
     /// Embed `input_ids` without running a single layer.
@@ -11263,11 +11303,13 @@ impl<P: Profile> Model<P> {
         cache: &mut State<P>,
         token_head: bool,
     ) -> Result<Tensor> {
-        let (_, seq_len, _) = embeds.dims3()?;
+        let (_, seq_len, _) = embeds.dims3().map_err(untouched_step_error)?;
+        let plan = cache.plan_pass(seq_len).map_err(untouched_step_error)?;
         self.attach_layer_tier(cache);
-        cache.prepare_pass(seq_len)?;
+        cache.prepare_planned_pass(seq_len, plan)?;
         self.advance_conv_phase(seq_len, cache);
         self.forward_residual(embeds.clone(), seq_len, index_pos, cache, token_head)
+            .map_err(touched_step_error)
     }
 
     /// Run the model and project **every** position, not only the last.
@@ -11307,31 +11349,34 @@ impl<P: Profile> Model<P> {
         index_pos: usize,
         cache: &mut State<P>,
     ) -> Result<Tensor> {
-        let (_, seq_len) = input_ids.dims2()?;
+        let (_, seq_len) = input_ids.dims2().map_err(untouched_step_error)?;
         cache.prepare_pass(seq_len)?;
-        self.advance_conv_phase(seq_len, cache);
+        (|| {
+            self.advance_conv_phase(seq_len, cache);
 
-        let mut hidden_states = self.embed_tokens.forward(input_ids)?;
-        Self::begin_taps(cache);
-        for (block_idx, layer) in self.layers.iter().enumerate() {
-            // Marked here as well as in `forward`, for `advance_conv_phase`'s
-            // reason below: two entry points over the same layer loop must not
-            // disagree about the graph position they are at. A verify pass
-            // encodes the same 30 nodes.
-            mark_graph_node(&cache.device, block_idx);
-            // Tapped here as well as in `forward`, for the same reason and with
-            // the same helper — a drafter conditioned on a *verify* pass's
-            // hidden states is the case #363 exists for, so the entry point
-            // that runs `seq_len > 1` must not be the one that does not tap.
-            Self::tap_layer_input(&hidden_states, block_idx, cache)?;
-            hidden_states = layer.forward(&hidden_states, index_pos, block_idx, cache)?;
-        }
-        #[cfg(feature = "metal")]
-        cache.flush_ring_snapshots();
-        let hidden_states = self.embedding_norm.forward(&hidden_states)?.contiguous()?;
-        let logits = self.lm_head.forward(&hidden_states)?;
-        dump_logits(&logits, index_pos)?;
-        logits.to_dtype(DType::F32)
+            let mut hidden_states = self.embed_tokens.forward(input_ids)?;
+            Self::begin_taps(cache);
+            for (block_idx, layer) in self.layers.iter().enumerate() {
+                // Marked here as well as in `forward`, for `advance_conv_phase`'s
+                // reason below: two entry points over the same layer loop must not
+                // disagree about the graph position they are at. A verify pass
+                // encodes the same 30 nodes.
+                mark_graph_node(&cache.device, block_idx);
+                // Tapped here as well as in `forward`, for the same reason and with
+                // the same helper — a drafter conditioned on a *verify* pass's
+                // hidden states is the case #363 exists for, so the entry point
+                // that runs `seq_len > 1` must not be the one that does not tap.
+                Self::tap_layer_input(&hidden_states, block_idx, cache)?;
+                hidden_states = layer.forward(&hidden_states, index_pos, block_idx, cache)?;
+            }
+            #[cfg(feature = "metal")]
+            cache.flush_ring_snapshots();
+            let hidden_states = self.embedding_norm.forward(&hidden_states)?.contiguous()?;
+            let logits = self.lm_head.forward(&hidden_states)?;
+            dump_logits(&logits, index_pos)?;
+            logits.to_dtype(DType::F32)
+        })()
+        .map_err(touched_step_error)
     }
 
     /// [`Self::forward_all`] as a speculative verify window
@@ -13048,6 +13093,203 @@ mod tests {
             .collect();
         assert_ne!(want[2], 2, "sequence 1's pages are not sequence 0's");
         assert_eq!(paged.read_table(), want.as_slice());
+        Ok(())
+    }
+
+    fn state_touched_fixture() -> Result<(Config, Model<CrownExact>, State<CrownExact>)> {
+        use crate::models::lfm2_testing::Lfm2Tiny;
+        use crate::testing::tiny::{TinyCheckpoint, Weights};
+        let cfg = Config {
+            vocab_size: 64,
+            hidden_size: 64,
+            intermediate_size: 64,
+            num_hidden_layers: 3,
+            num_attention_heads: 4,
+            num_key_value_heads: 2,
+            max_position_embeddings: 32,
+            conv_l_cache: 3,
+            layer_types: vec![LayerType::Conv, LayerType::FullAttention, LayerType::Conv],
+            tie_embedding: true,
+            conv_state: ConvState::Shuffle,
+            conv_fused: false,
+            kv_append: KvAppend::Cat,
+            tap_layers: vec![1],
+            tap_dtype: DType::F32,
+            ..Default::default()
+        };
+        let device = Device::Cpu;
+        let model = TinyCheckpoint::<Lfm2Tiny>::new(cfg.clone(), Weights::default())
+            .with_dtype(DType::F32)
+            .model::<CrownExact>(&device)?;
+        let mut cache = State::<CrownExact>::new_with(true, DType::F32, &cfg, &device, 4)?;
+        let prompt = Tensor::new(&[1u32, 2, 3], &device)?.reshape((1, 3))?;
+        model.forward(&prompt, 0, &mut cache)?;
+        assert_eq!(cache.kv_len(), 3, "the fixture must populate actual KV");
+        assert_eq!(cache.take_taps().len(), 1, "the first layer completed");
+        Ok((cfg, model, cache))
+    }
+
+    type TensorBits = (Vec<usize>, Vec<u32>);
+    fn state_tensor_bits(tensor: &Tensor) -> Result<TensorBits> {
+        assert_eq!(
+            tensor.dtype(),
+            DType::F32,
+            "fixture byte comparison is exact F32"
+        );
+        Ok((
+            tensor.dims().to_vec(),
+            tensor
+                .flatten_all()?
+                .to_vec1::<f32>()?
+                .into_iter()
+                .map(f32::to_bits)
+                .collect(),
+        ))
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct UntouchedStateBits {
+        conv: Vec<Option<TensorBits>>,
+        spare: Vec<Option<TensorBits>>,
+        kv: Vec<Option<(TensorBits, TensorBits)>>,
+        phase: (usize, usize, usize, bool),
+        kv_geometry: (usize, usize, usize, usize),
+        pass: (bool, bool, bool),
+        taps: Vec<Option<TensorBits>>,
+        taps_dropped: u64,
+        masks: usize,
+        tier_attached: bool,
+    }
+    fn untouched_state_bits(cache: &State<CrownExact>) -> Result<UntouchedStateBits> {
+        let Arm::One(OwnKv::Cat(kv)) = cache.kv.arm() else {
+            panic!("the control requires the actual Cat payloads")
+        };
+        let tensors = |xs: &[Option<Tensor>]| {
+            xs.iter()
+                .map(|t| t.as_ref().map(state_tensor_bits).transpose())
+                .collect::<Result<Vec<_>>>()
+        };
+        let kv = kv
+            .iter()
+            .map(|pair| {
+                pair.as_ref()
+                    .map(|(k, v)| Ok((state_tensor_bits(k)?, state_tensor_bits(v)?)))
+                    .transpose()
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(UntouchedStateBits {
+            conv: tensors(&cache.conv_states)?,
+            spare: tensors(&cache.conv_spare)?,
+            kv,
+            phase: (
+                cache.conv_phase,
+                cache.conv_phase_prev,
+                cache.conv_history,
+                cache.conv_compact,
+            ),
+            kv_geometry: (
+                cache.kv_len(),
+                cache.kv_capacity,
+                cache.kv_slab,
+                cache.kv_grows,
+            ),
+            pass: (
+                cache.paged_pass_pending,
+                cache.speculative,
+                cache.branch_continuation,
+            ),
+            taps: tensors(&cache.taps)?,
+            taps_dropped: cache.taps_dropped,
+            masks: cache.masks.len(),
+            tier_attached: cache.layer_tier.is_some(),
+        })
+    }
+
+    /// The real entry refuses a warm cache before any state mutation. This is
+    /// also the recovery consumer's required query ordering: typed information
+    /// is inspected before a generic Result::context erases its concrete error.
+    #[test]
+    fn state_touched_pre_layer_refusal_is_no_and_preserves_bits() -> Result<()> {
+        let (_, model, mut cache) = state_touched_fixture()?;
+        for tokens in [
+            Tensor::new(&[4u32, 5], &Device::Cpu)?.reshape((1, 2))?,
+            Tensor::new(&[4u32], &Device::Cpu)?,
+        ] {
+            let before = untouched_state_bits(&cache)?;
+            let error = model.forward(&tokens, 3, &mut cache).unwrap_err();
+            assert_eq!(
+                untouched_state_bits(&cache)?,
+                before,
+                "pure refusal changed actual state bits"
+            );
+            assert_eq!(
+                error.state_touched(),
+                Some(lloom_tensor::StateTouched::No),
+                "a genuine pure preflight refusal must carry No"
+            );
+            let reset_required = error.state_touched() != Some(lloom_tensor::StateTouched::No);
+            assert!(
+                !reset_required,
+                "the #1187 recovery query must run before erased diagnostics"
+            );
+            let erased =
+                lloom_tensor::Context::context(Err::<(), _>(error), "served forward").unwrap_err();
+            assert_eq!(
+                erased.state_touched(),
+                None,
+                "erased foreign errors remain unknown"
+            );
+            assert!(
+                erased.state_touched() != Some(lloom_tensor::StateTouched::No),
+                "unknown errors must retain fail-closed recovery"
+            );
+        }
+        // A failed preflight did not poison the cache: the permitted next step
+        // has exactly the unrefused reference's output bits and state.
+        // Build a genuinely independent reference: cloning State may retain
+        // the mutable convolution backing, so it is not an unrefused control.
+        let (_, reference_model, mut reference) = state_touched_fixture()?;
+        assert_eq!(
+            untouched_state_bits(&cache)?,
+            untouched_state_bits(&reference)?
+        );
+        let token = Tensor::new(&[4u32], &Device::Cpu)?.reshape((1, 1))?;
+        let actual = model.forward(&token, 3, &mut cache)?;
+        let expected = reference_model.forward(&token, 3, &mut reference)?;
+        assert_eq!(state_tensor_bits(&actual)?, state_tensor_bits(&expected)?);
+        assert_eq!(
+            untouched_state_bits(&cache)?,
+            untouched_state_bits(&reference)?
+        );
+        Ok(())
+    }
+
+    /// No injected runtime hook: an out-of-table RoPE position fails in the
+    /// second layer after the first real convolution completed and wrote state.
+    #[test]
+    fn state_touched_post_first_layer_error_is_yes() -> Result<()> {
+        let (cfg, model, mut cache) = state_touched_fixture()?;
+        let before = state_tensor_bits(cache.conv_states[0].as_ref().expect("warm first conv"))?;
+        let token = Tensor::new(&[4u32], &Device::Cpu)?.reshape((1, 1))?;
+        let error = model
+            .forward(&token, cfg.max_position_embeddings, &mut cache)
+            .unwrap_err();
+        assert_eq!(cache.taps.len(), 1);
+        assert!(
+            cache.taps[0].is_some(),
+            "the second layer's input proves first-layer completion"
+        );
+        assert_ne!(
+            state_tensor_bits(cache.conv_states[0].as_ref().expect("written first conv"))?,
+            before,
+            "the first layer's real state write must be nonvacuous"
+        );
+        assert_eq!(
+            error.state_touched(),
+            Some(lloom_tensor::StateTouched::Yes),
+            "a post-first-layer error must never be retryable No"
+        );
+        assert!(error.state_touched() != Some(lloom_tensor::StateTouched::No));
         Ok(())
     }
 

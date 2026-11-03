@@ -94,6 +94,7 @@ mod pinned_prefix;
 mod pos_embed_resample_tests;
 mod prefill_window_gemm;
 mod prepare_path;
+mod project_route;
 mod quant_kind_throughput;
 mod qwen3_5_mtp;
 mod qwen3_5_tiny;

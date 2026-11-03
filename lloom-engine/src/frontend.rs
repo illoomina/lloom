@@ -234,17 +234,18 @@ impl Checkpoint {
             let Ok((family, first)) = crate::app::family::detect(path) else {
                 return none;
             };
+            let gguf_act = crate::app::family::gguf_act(&o.load);
             match family.name() {
                 "qwen4exp" => Checkpoint {
                     lfm2: None,
                     qwen4exp: true,
                 },
                 "lfm2" | "lfm2_moe" => Checkpoint {
-                    lfm2: crate::app::lfm2::representation(&first, false).ok(),
+                    lfm2: crate::app::lfm2::representation(&first, false, gguf_act).ok(),
                     qwen4exp: false,
                 },
                 "lfm2-gguf" if o.load.gguf_engine != "legacy" => Checkpoint {
-                    lfm2: crate::app::lfm2::representation(&first, false).ok(),
+                    lfm2: crate::app::lfm2::representation(&first, false, gguf_act).ok(),
                     qwen4exp: false,
                 },
                 _ => none,

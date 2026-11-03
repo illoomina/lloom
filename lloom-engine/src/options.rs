@@ -1616,6 +1616,12 @@ fn parse_moe_act(v: &str) -> Result<String, String> {
         other => Err(format!("`{other}` is not `auto`, `f32` or `f16`")),
     }
 }
+fn parse_gguf_act(v: &str) -> Result<String, String> {
+    match v.trim().to_ascii_lowercase().as_str() {
+        s @ ("auto" | "f32" | "f16") => Ok(s.into()),
+        other => Err(format!("`{other}` is not `auto`, `f32` or `f16`")),
+    }
+}
 fn parse_gguf_engine(v: &str) -> Result<String, String> {
     match v.trim().to_ascii_lowercase().as_str() {
         s @ ("lfm2" | "legacy") => Ok(s.into()),
@@ -1711,6 +1717,9 @@ pub struct LoadConfig {
     /// An LFM2 GGUF: which model serves it — `lfm2` (the LFM2 engine over the GGUF's blocks, the one implementation every LFM2 checkpoint shares) or `legacy` (the separate GGUF model, kept as the reference arm; the one that reads an `--mmproj` tower).
     #[opt(flag = "gguf-engine", parser = "parse_gguf_engine", variants = ["lfm2", "legacy"], path = "models.lfm2_gguf.engine", status = "reference")]
     pub gguf_engine: String,
+    /// An LFM2 GGUF on the LFM2 engine: the dtype the model computes in — `auto` (the model's dtype, as its safetensors checkpoint computes: f16 on Metal, f32 on the CPU), `f16` (the stream, norms, conv and projections at `(f16, f32, f16)`, the packed head at f32 logits) or `f32` (the legacy GGUF model's contract).
+    #[opt(flag = "gguf-act", parser = "parse_gguf_act", variants = ["auto", "f32", "f16"], path = "models.lfm2_gguf.activation_dtype", status = "advanced")]
+    pub gguf_act: String,
     /// Qwen4-exp: the routed experts' activation dtype — `auto` (`f16` under the `fast` contract, `f32` under `deterministic`), `f32` (the byte-identical routed arm) or `f16`.
     #[opt(flag = "moe-act", parser = "parse_moe_act", variants = ["auto", "f32", "f16"], path = "models.qwen4exp.moe.activation_dtype", status = "advanced")]
     pub moe_act: String,
@@ -1756,6 +1765,7 @@ impl Default for LoadConfig {
             ple: true,
             moe_act: "auto".into(),
             gguf_engine: "lfm2".into(),
+            gguf_act: "auto".into(),
             hotlist: None,
             prefetch: true,
             io_hints: false,

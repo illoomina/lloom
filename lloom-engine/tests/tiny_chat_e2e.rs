@@ -4759,9 +4759,12 @@ fn lfm2_gguf(model: &Path, kind: lloom_tensor::quantized::GgmlDType) -> PathBuf 
 }
 
 /// An LFM2 GGUF on the LFM2 engine (`models.lfm2_gguf.engine`, default
-/// `lfm2`) and on the legacy GGUF model (`legacy`): the same prompt ids
-/// and the same greedy tokens on the CPU and on Metal, the projections
-/// held packed, and the family reported as `lfm2-gguf`.
+/// `lfm2`) and on the legacy GGUF model (`legacy`): on the f32 arm, the
+/// legacy model's numerical contract, the same prompt ids and the same
+/// greedy tokens on the CPU and on Metal; the projections held packed under
+/// the default too, and the family reported as `lfm2-gguf`. The default
+/// computes at the model's dtype (f16 on Metal), a different contract,
+/// judged by the quality gate (`lfm2::gguf::tests`), not by identity.
 #[test]
 fn an_lfm2_gguf_serves_on_the_lfm2_engine_as_on_the_legacy_model() {
     let dir = scratch("lfm2-gguf-engine");
@@ -4772,7 +4775,14 @@ fn an_lfm2_gguf_serves_on_the_lfm2_engine_as_on_the_legacy_model() {
         devices.push(vec![]);
     }
     for device in devices {
-        let (new, stderr) = chat_with_stderr(&gguf, &device);
+        let (_, default_stderr) = chat_with_stderr(&gguf, &device);
+        assert!(
+            default_stderr.contains("[lfm2 weights: q8_0 x"),
+            "{device:?}:\n{default_stderr}"
+        );
+        let mut f32_args = device.clone();
+        f32_args.extend(["--gguf-act", "f32"]);
+        let (new, stderr) = chat_with_stderr(&gguf, &f32_args);
         assert!(
             stderr.contains("[lfm2 weights: q8_0 x"),
             "{device:?}:\n{stderr}"
@@ -4854,44 +4864,84 @@ fn an_lfm2_gguf_serves_batched_rows_on_the_lfm2_engine() {
 
 /// The representation the front end reads off a checkpoint before load
 /// (`app::lfm2::representation`) is the one the LFM2 engine builds, as
-/// `/health` reports it, on the CPU and on Metal: the safetensors
-/// checkpoint dense at the engine's dtype, a Q8_0 GGUF on its blocks and an
-/// F32 GGUF dense, both at f32. On Metal `lloom chat` names the LFM2 rows
-/// withheld from the packed GGUF, and none for the safetensors checkpoint.
+/// `/health` reports it, on the CPU and on Metal. Every container computes
+/// at the model's dtype (decision 110): the safetensors checkpoint and the
+/// same weights as an F16 GGUF build one representation, a Q8_0 GGUF holds
+/// its blocks at that dtype, and `--gguf-act f32` is the f32 arm. On Metal
+/// `lloom chat` names the LFM2 rows withheld from the packed GGUF, at the
+/// dtype it computes in, and none for the safetensors checkpoint or the
+/// dense F16 GGUF.
 #[test]
 fn an_lfm2_load_builds_the_representation_the_front_end_read() {
     let dir = scratch("lfm2-representation");
     let model = write::<Lfm2Tiny>(&dir);
     let q8 = lfm2_gguf(&model, lloom_tensor::quantized::GgmlDType::Q8_0);
     let dense = lfm2_gguf(&model, lloom_tensor::quantized::GgmlDType::F32);
+    let dense_f16 = lfm2_gguf(&model, lloom_tensor::quantized::GgmlDType::F16);
     let mut devices = vec![(true, vec!["--cpu"])];
     if cfg!(feature = "metal") {
         devices.push((false, vec![]));
     }
+    let f32_arm = Some(lloom_tensor::DType::F32);
+    let mut built = std::collections::BTreeMap::new();
     for (cpu, args) in &devices {
-        for path in [&model, &q8, &dense] {
-            let read = lloom_engine::app::lfm2::representation(path, *cpu)
+        for (path, act) in [
+            (&model, None),
+            (&q8, None),
+            (&dense, None),
+            (&dense_f16, None),
+            (&q8, f32_arm),
+            (&dense_f16, f32_arm),
+        ] {
+            let read = lloom_engine::app::lfm2::representation(path, *cpu, act)
                 .unwrap()
                 .name();
-            let server = Server::start(path, args);
+            let mut argv = args.clone();
+            if act.is_some() {
+                argv.extend(["--gguf-act", "f32"]);
+            }
+            let server = Server::start(path, &argv);
             let (_, health) = server.call("GET", "/health", &json!({}));
             assert_eq!(
                 health["representation"],
                 read,
-                "{args:?} {}: {health}",
+                "{argv:?} {}: {health}",
                 path.display()
             );
+            built.insert((*cpu, path.clone(), act.is_some()), read);
             drop(server);
         }
     }
+    // A GGUF computes at the model's dtype, as safetensors does (decision
+    // 110): the dense F16 GGUF builds safetensors' representation on every
+    // device, and f32 is an arm.
+    for (cpu, _) in &devices {
+        let st = &built[&(*cpu, model.clone(), false)];
+        assert_eq!(&built[&(*cpu, dense_f16.clone(), false)], st, "cpu={cpu}");
+        assert_eq!(built[&(*cpu, q8.clone(), true)], "blocks f32", "cpu={cpu}");
+        assert_eq!(
+            built[&(*cpu, dense_f16.clone(), true)],
+            "dense f32",
+            "cpu={cpu}"
+        );
+    }
     if cfg!(feature = "metal") {
+        assert_eq!(built[&(false, model.clone(), false)], "dense f16");
+        assert_eq!(built[&(false, q8.clone(), false)], "blocks f16");
         let (_, packed) = chat_with_stderr(&q8, &[]);
         assert!(
-            packed.contains("[front-end: chat: the LFM2 rows withheld on blocks f32 weights"),
+            packed.contains("[front-end: chat: the LFM2 rows withheld on blocks f16 weights"),
             "{packed}"
         );
-        let (_, safetensors) = chat_with_stderr(&model, &[]);
-        assert!(!safetensors.contains("rows withheld"), "{safetensors}");
+        let (_, packed_f32) = chat_with_stderr(&q8, &["--gguf-act", "f32"]);
+        assert!(
+            packed_f32.contains("[front-end: chat: the LFM2 rows withheld on blocks f32 weights"),
+            "{packed_f32}"
+        );
+        for path in [&model, &dense_f16] {
+            let (_, err) = chat_with_stderr(path, &[]);
+            assert!(!err.contains("rows withheld"), "{}: {err}", path.display());
+        }
     }
     std::fs::remove_dir_all(&dir).ok();
 }

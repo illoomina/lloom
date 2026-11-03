@@ -71,8 +71,8 @@ pub struct ChatArgs {
     pub prompt: Option<String>,
 
     /// The prompt is already rendered: no chat template, the text encoded as
-    /// given with the checkpoint's BOS — what a benchmark runner feeds, so a
-    /// reply can be compared token for token.
+    /// given, behind the BOS only where the tokenizer declares one — what a
+    /// benchmark runner feeds, so a reply can be compared token for token.
     #[arg(long, help_heading = SESSION)]
     pub raw: bool,
 

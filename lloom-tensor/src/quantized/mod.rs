@@ -1218,7 +1218,7 @@ impl QTensor {
                     dtype,
                     shared,
                 )?;
-                (QStorage::Metal(storage), Some(receipt))
+                (QStorage::Metal(storage), receipt)
             }
             other => (other.qzeros(shape.elem_count(), dtype)?, None),
         };

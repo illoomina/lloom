@@ -52,20 +52,17 @@ impl QMetalStorage {
         Ok(Self::persistent_with_capture(device, elem_count, dtype, shared, false)?.0)
     }
 
-    /// Persistent zero storage plus the exact initialization recording. This
-    /// additive cold arm captures under the encoder guard, not a later cut.
+    /// Persistent zero storage plus the exact initialization recording, on
+    /// whichever arm the zero fill takes. This additive cold arm captures under
+    /// the encoder guard, not a later cut. An empty storage encodes no fill
+    /// and so has no recording to name.
     pub fn persistent_with_receipt(
         device: &MetalDevice,
         elem_count: usize,
         dtype: GgmlDType,
         shared: bool,
-    ) -> Result<(
-        Self,
-        (crate::retire::Epoch, crate::kernels::metal::CommandMarker),
-    )> {
-        let (storage, receipt) =
-            Self::persistent_with_capture(device, elem_count, dtype, shared, true)?;
-        Ok((storage, receipt.expect("capture requested")))
+    ) -> Result<(Self, Option<crate::metal_backend::ByteReceipt>)> {
+        Self::persistent_with_capture(device, elem_count, dtype, shared, true)
     }
 
     fn persistent_with_capture(
@@ -90,11 +87,8 @@ impl QMetalStorage {
             },
         )?;
         let receipt = if capture {
-            let mut blit = device.blit_command_encoder()?;
-            blit.set_label("qstorage_persistent_zero");
             // SAFETY: binding authority (module head).
-            unsafe { blit.fill_buffer(&buffer, (0, size), 0) }.map_err(crate::MetalError::from)?;
-            Some(blit.recording_receipt())
+            unsafe { device.fill_bytes_with_receipt("qstorage_persistent_zero", &buffer, size, 0) }?
         } else {
             // SAFETY: binding authority (module head).
             unsafe { device.fill_bytes("qstorage_persistent_zero", &buffer, size, 0) }?;

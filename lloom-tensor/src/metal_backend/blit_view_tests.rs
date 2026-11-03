@@ -617,3 +617,81 @@ fn an_overlapping_copy_within_one_buffer_is_refused() -> Result<()> {
     assert_eq!(super::read_to_vec::<u32>(&creator, 4)?, [1, 2, 1, 4]);
     Ok(())
 }
+
+// --- receipts: the routed writes name the recording that holds them --------
+
+/// The receipt variants return the receipt of the recording that encodes the
+/// write on each arm (aligned: the blit, unaligned: the compute byte arm), and
+/// nothing for an empty range, which encodes nothing. The period is unbounded,
+/// so no cut can fall between the probe and the write: each receipt names the
+/// probe's recording at the probe's epoch, and proves its DATA once the work
+/// completes.
+#[test]
+fn routed_byte_writes_return_the_receipt_of_their_own_recording() -> Result<()> {
+    let Some((_, m)) = metal() else { return Ok(()) };
+    non_base(&m);
+    m.set_compute_per_buffer(usize::MAX);
+    let src = m.new_buffer_with_data(&(0..16u8).map(|i| 100 + i).collect::<Vec<_>>())?;
+    for (arm, size, fill_route, copy_route) in [
+        (
+            "aligned",
+            8,
+            Some(Emitted::Fill { offset: 0, size: 8 }),
+            Some(Emitted::Blit {
+                source: 0,
+                destination: 0,
+                size: 8,
+            }),
+        ),
+        (
+            "unaligned",
+            6,
+            Some(Emitted::ComputeFill { size: 6 }),
+            Some(Emitted::Compute {
+                source: 0,
+                destination: 0,
+                size: 6,
+            }),
+        ),
+        ("empty", 0, None, None),
+    ] {
+        let dst = m.new_buffer_with_data(&[0xffu8; 16])?;
+        for (op, route) in [("fill", fill_route), ("copy", copy_route)] {
+            let (probe_epoch, probe) = m.blit_command_encoder()?.recording_receipt();
+            emitted::take();
+            // SAFETY: the test owns both buffers and reads them only after the wait.
+            let receipt = unsafe {
+                match op {
+                    "fill" => m.fill_bytes_with_receipt("receipt_test", &dst, size, 0),
+                    _ => m.copy_bytes_with_receipt("receipt_test", &src, 0, &dst, 0, size),
+                }
+            }?;
+            let log = emitted::take();
+            assert_eq!(
+                log,
+                route.into_iter().collect::<Vec<_>>(),
+                "{arm} {op} route"
+            );
+            let Some(route) = route else {
+                assert!(receipt.is_none(), "an empty {op} returned a receipt");
+                continue;
+            };
+            let (epoch, marker) =
+                receipt.unwrap_or_else(|| panic!("{arm} {op} ({route:?}) returned no receipt"));
+            assert!(
+                marker.names_same_recording(&probe),
+                "{arm} {op} ({route:?}) receipt names another recording"
+            );
+            assert_eq!(epoch, probe_epoch, "{arm} {op} receipt epoch");
+            m.wait_until_completed()?;
+            assert!(
+                marker.poll_data_ready()?,
+                "{arm} {op} receipt never proves DATA"
+            );
+        }
+        let mut want = [0xffu8; 16];
+        want[..size].copy_from_slice(&(0..size as u8).map(|i| 100 + i).collect::<Vec<_>>());
+        assert_eq!(super::read_to_vec::<u8>(&dst, 16)?, want, "{arm} bytes");
+    }
+    Ok(())
+}

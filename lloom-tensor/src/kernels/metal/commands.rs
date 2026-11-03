@@ -180,6 +180,19 @@ impl CommandsGuard<'_> {
         }
     }
 
+    /// The compute twin of [`BlitCommandsGuard::recording_receipt`]: the epoch
+    /// that orders later readers and the exact recording this session's work
+    /// is encoded into, captured while the guard excludes a cut.
+    pub(crate) fn recording_receipt(&self) -> Result<(Epoch, CommandMarker), MetalKernelError> {
+        let clock = self
+            .as_ref()
+            .clock()
+            .ok_or(MetalKernelError::QueueUnavailable(
+                "compute receipt requires its queue clock",
+            ))?;
+        Ok((clock.current_epoch(), self.recording_marker()))
+    }
+
     pub(crate) fn retain_namespace(
         &mut self,
         owner: crate::metal_backend::device_retirement::NamespaceOwner,
@@ -431,6 +444,12 @@ impl CommandMarker {
     /// callbacks, a queue prefix or physical retirement. It does not submit work.
     pub fn poll_data_ready(&self) -> Result<bool, MetalKernelError> {
         self.cb.poll_data_ready()
+    }
+
+    /// Whether two markers name the same recording.
+    #[cfg(test)]
+    pub(crate) fn names_same_recording(&self, other: &Self) -> bool {
+        self.cb.same_recording(&other.cb)
     }
 
     /// The buffer's GPU end time (`CLOCK_UPTIME_RAW` seconds), valid once

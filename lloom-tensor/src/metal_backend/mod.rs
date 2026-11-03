@@ -789,6 +789,10 @@ unsafe fn encode_byte_copy(
     Ok(())
 }
 
+/// What encoded a routed byte write: the epoch that orders later readers and
+/// the exact recording that holds the write (`BlitCommandsGuard::recording_receipt`).
+pub type ByteReceipt = (crate::retire::Epoch, crate::kernels::metal::CommandMarker);
+
 impl MetalDevice {
     /// Copy `size` bytes from `src` at `src_offset` to `dst` at `dst_offset`,
     /// each offset relative to its handle's view. A blit where Metal's
@@ -808,20 +812,67 @@ impl MetalDevice {
         dst_offset: usize,
         size: usize,
     ) -> Result<()> {
+        // SAFETY: this function's contract.
+        unsafe { self.copy_bytes_routed(label, src, src_offset, dst, dst_offset, size, false) }
+            .map(drop)
+    }
+
+    /// [`Self::copy_bytes`], returning the receipt of the recording that
+    /// encodes the copy on whichever arm it takes; `None` for an empty range,
+    /// which encodes nothing.
+    ///
+    /// # Safety
+    /// As [`Self::copy_bytes`].
+    pub unsafe fn copy_bytes_with_receipt(
+        &self,
+        label: &str,
+        src: &Buffer,
+        src_offset: usize,
+        dst: &Buffer,
+        dst_offset: usize,
+        size: usize,
+    ) -> Result<Option<ByteReceipt>> {
+        // SAFETY: this function's contract.
+        unsafe { self.copy_bytes_routed(label, src, src_offset, dst, dst_offset, size, true) }
+    }
+
+    /// The one route authority for a byte copy; the receipt is taken only when
+    /// `capture`, so a plain copy pays nothing for it.
+    ///
+    /// # Safety
+    /// As [`Self::copy_bytes`].
+    #[allow(clippy::too_many_arguments)]
+    #[inline]
+    unsafe fn copy_bytes_routed(
+        &self,
+        label: &str,
+        src: &Buffer,
+        src_offset: usize,
+        dst: &Buffer,
+        dst_offset: usize,
+        size: usize,
+        capture: bool,
+    ) -> Result<Option<ByteReceipt>> {
         match byte_route(src, src_offset, dst, dst_offset, size)? {
-            ByteRoute::Empty => Ok(()),
+            ByteRoute::Empty => Ok(None),
             ByteRoute::Blit => {
                 let mut blit = self.blit_command_encoder()?;
                 blit.set_label(label);
                 // SAFETY: this function's contract; the route is checked.
                 unsafe { blit.copy_from_buffer(src, src_offset, dst, dst_offset, size) }
                     .map_err(MetalError::from)?;
-                Ok(())
+                Ok(capture.then(|| blit.recording_receipt()))
             }
             ByteRoute::Compute => {
                 let encoder = self.command_encoder()?;
                 // SAFETY: this function's contract.
-                unsafe { encode_byte_copy(self, &encoder, src, src_offset, dst, dst_offset, size) }
+                unsafe {
+                    encode_byte_copy(self, &encoder, src, src_offset, dst, dst_offset, size)
+                }?;
+                Ok(capture
+                    .then(|| encoder.recording_receipt())
+                    .transpose()
+                    .map_err(MetalError::from)?)
             }
         }
     }
@@ -839,6 +890,41 @@ impl MetalDevice {
         size: usize,
         value: u8,
     ) -> Result<()> {
+        // SAFETY: this function's contract.
+        unsafe { self.fill_bytes_routed(label, buffer, size, value, false) }.map(drop)
+    }
+
+    /// [`Self::fill_bytes`], returning the receipt of the recording that
+    /// encodes the fill on whichever arm it takes; `None` for an empty range,
+    /// which encodes nothing.
+    ///
+    /// # Safety
+    /// As [`Self::copy_bytes`], for `buffer`.
+    pub unsafe fn fill_bytes_with_receipt(
+        &self,
+        label: &str,
+        buffer: &Buffer,
+        size: usize,
+        value: u8,
+    ) -> Result<Option<ByteReceipt>> {
+        // SAFETY: this function's contract.
+        unsafe { self.fill_bytes_routed(label, buffer, size, value, true) }
+    }
+
+    /// The one route authority for a byte fill; the receipt is taken only when
+    /// `capture`.
+    ///
+    /// # Safety
+    /// As [`Self::copy_bytes`], for `buffer`.
+    #[inline]
+    unsafe fn fill_bytes_routed(
+        &self,
+        label: &str,
+        buffer: &Buffer,
+        size: usize,
+        value: u8,
+        capture: bool,
+    ) -> Result<Option<ByteReceipt>> {
         let Some(location) = crate::native_binding_preflight::checked_byte_range(
             buffer.base_offset(),
             buffer.length(),
@@ -851,14 +937,14 @@ impl MetalDevice {
             )
         };
         if size == 0 {
-            return Ok(());
+            return Ok(None);
         }
         if location.is_multiple_of(4) && size.is_multiple_of(4) {
             let mut blit = self.blit_command_encoder()?;
             blit.set_label(label);
             // SAFETY: this function's contract; the range is checked.
             unsafe { blit.fill_buffer(buffer, (0, size), value) }.map_err(MetalError::from)?;
-            return Ok(());
+            return Ok(capture.then(|| blit.recording_receipt()));
         }
         #[cfg(test)]
         crate::kernels::metal::encoder::emitted::push(
@@ -878,7 +964,10 @@ impl MetalDevice {
             )
         }
         .map_err(MetalError::from)?;
-        Ok(())
+        Ok(capture
+            .then(|| encoder.recording_receipt())
+            .transpose()
+            .map_err(MetalError::from)?)
     }
 }
 

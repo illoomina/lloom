@@ -2502,13 +2502,14 @@ impl Inner {
                 let bytes = keep * self.pools[i].plane_bytes;
                 if bytes > 0 {
                     let (old, new) = (self.pools[i].qt.metal_buffer()?, qt.metal_buffer()?);
-                    let mut blit = m.blit_command_encoder()?;
-                    blit.set_label("slot pools reallocated");
                     // SAFETY: both pools are persistent tier buffers no pool
                     // recycles, and nothing writes the old one after this copy.
-                    unsafe { blit.copy_from_buffer(old, 0, new, 0, bytes) }
-                        .map_err(lloom_tensor::Error::wrap)?;
-                    initialization.push(blit.recording_receipt())?;
+                    let receipt = unsafe {
+                        m.copy_bytes_with_receipt("slot pools reallocated", old, 0, new, 0, bytes)
+                    }?;
+                    if let Some(receipt) = receipt {
+                        initialization.push(receipt)?;
+                    }
                 }
             }
             fresh.push(SlotPool {
@@ -8182,6 +8183,98 @@ mod tests {
     #[test]
     fn failed_bank_growth_keeps_the_original_geometry_and_can_retry_metal() {
         bank_growth_failure_control(&resize_control_device());
+    }
+
+    /// F16 planes of 3×5 (30 bytes) put every bank write outside the blit's
+    /// 4-byte contract: the zero-init of 3 slots (90 bytes) and of 1 (30), and
+    /// the kept slot's copy (30). Each takes the compute byte arm, and the bank
+    /// initialization must join each write's receipt: 3 at construction, then
+    /// 3 zero-inits + 3 copies per resize. The kept slot's bytes survive both
+    /// resizes and the new slots read zero.
+    #[cfg(feature = "metal")]
+    #[test]
+    fn an_unaligned_bank_joins_its_compute_route_receipts_metal() {
+        let dev = resize_control_device();
+        let gate = stacked(4, 3, 5, 1.0, GgmlDType::F16);
+        let up = stacked(4, 3, 5, 2.0, GgmlDType::F16);
+        let down = stacked(4, 5, 3, 3.0, GgmlDType::F16);
+        let path = write_gguf(&[("g", &gate), ("u", &up), ("d", &down)]);
+        let tier = Streamed::new(
+            open(&path, "g"),
+            open(&path, "u"),
+            open(&path, "d"),
+            3,
+            LoaderArm::Pread,
+            &dev,
+        )
+        .unwrap();
+        let joined = |tier: &Streamed| tier.inner.lock().initialization.required.len();
+        {
+            let inner = tier.inner.lock();
+            for pool in &inner.pools {
+                assert_eq!(pool.plane_bytes, 30);
+                assert_eq!(pool.qt.storage_size_in_bytes(), 90);
+            }
+        }
+        assert_eq!(
+            joined(&tier),
+            3,
+            "a bank zero-init's receipt was not joined"
+        );
+        dev.synchronize().unwrap();
+        assert!(tier.inner.lock().initialization.poll().unwrap());
+
+        tier.shrink_slots(1, 1).unwrap();
+        assert_eq!(
+            joined(&tier),
+            6,
+            "a shrink's zero-init or kept-slot copy receipt was not joined"
+        );
+        dev.synchronize().unwrap();
+        assert!(tier.inner.lock().initialization.poll().unwrap());
+        {
+            let m = dev.as_metal_device().unwrap();
+            let inner = tier.inner.lock();
+            for pool in &inner.pools {
+                assert_eq!(pool.qt.storage_size_in_bytes(), 30);
+                // SAFETY: the bank is idle (synchronized above) and is read
+                // back only after the synchronize below.
+                unsafe {
+                    m.fill_bytes(
+                        "unaligned_bank_pattern",
+                        pool.qt.metal_buffer().unwrap(),
+                        30,
+                        0x5a,
+                    )
+                }
+                .unwrap();
+            }
+        }
+        dev.synchronize().unwrap();
+
+        tier.grow_slots(3).unwrap();
+        assert_eq!(
+            joined(&tier),
+            6,
+            "a growth's zero-init or kept-slot copy receipt was not joined"
+        );
+        dev.synchronize().unwrap();
+        let inner = tier.inner.lock();
+        for (i, pool) in inner.pools.iter().enumerate() {
+            let data = pool.qt.data().unwrap();
+            assert_eq!(data.len(), 90);
+            assert!(
+                data[..30].iter().all(|&b| b == 0x5a),
+                "pool {i}: the kept slot did not survive the unaligned copy"
+            );
+            assert!(
+                data[30..].iter().all(|&b| b == 0),
+                "pool {i}: a new slot was not zeroed"
+            );
+        }
+        drop(inner);
+        assert!(tier.inner.lock().initialization.poll().unwrap());
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

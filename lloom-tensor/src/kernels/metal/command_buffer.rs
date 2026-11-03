@@ -938,6 +938,61 @@ impl CommandBuffer {
         self.status().0 >= MTLCommandBufferStatus::Completed.0
     }
 
+    /// Read-only, nonparking DATA proof for a retained recording identity.
+    /// Do not use check_data_wait: its pending arm admits a potentially
+    /// blocking wait and consults callback parking scope. A poll does neither.
+    pub(super) fn poll_data_ready(&self) -> Result<bool, crate::kernels::MetalKernelError> {
+        self.poll_data_ready_with_observation(
+            || self.status(),
+            || self.error().map(|error| error.into_owned()),
+        )
+    }
+
+    /// Admission is checked before observing native status or constructing
+    /// error text. Both closures are statically dispatched; no fault state or
+    /// callback/prefix/teardown authority is introduced by this seam.
+    fn poll_data_ready_with_observation<S, E>(
+        &self,
+        status: S,
+        error: E,
+    ) -> Result<bool, crate::kernels::MetalKernelError>
+    where
+        S: FnOnce() -> MTLCommandBufferStatus,
+        E: FnOnce() -> Option<String>,
+    {
+        use crate::command_lifecycle::LifecycleError;
+        use crate::kernels::MetalKernelError;
+        let admitted = match self.check_wait_admission() {
+            Ok(()) => true,
+            Err(MetalKernelError::RecordingAdmission(
+                LifecycleError::NotSubmitted | LifecycleError::Busy,
+            )) => false,
+            Err(error) => return Err(error),
+        };
+        match status() {
+            MTLCommandBufferStatus::Completed => Ok(admitted),
+            MTLCommandBufferStatus::Error => Err(MetalKernelError::CommandBufferError(
+                error().unwrap_or_else(|| "unknown error".into()),
+            )),
+            _ => Ok(false),
+        }
+    }
+
+    /// Inject an observation, not a native driver failure. Exercise the exact
+    /// shipping classification/order without changing backend state or custody.
+    #[cfg(test)]
+    pub(super) fn test_poll_data_ready_with_observation<S, E>(
+        &self,
+        status: S,
+        error: E,
+    ) -> Result<bool, crate::kernels::MetalKernelError>
+    where
+        S: FnOnce() -> MTLCommandBufferStatus,
+        E: FnOnce() -> Option<String>,
+    {
+        self.poll_data_ready_with_observation(status, error)
+    }
+
     /// Internal data/error boundary: does not promise own callback return.
     /// Engine-owned payload custody remains registered independently.
     pub(super) fn try_wait_data_ready(&self) -> Result<(), crate::kernels::MetalKernelError> {

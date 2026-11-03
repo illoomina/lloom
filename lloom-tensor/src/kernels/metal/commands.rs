@@ -232,6 +232,26 @@ impl<'a> AsMut<BlitCommandEncoder> for BlitCommandsGuard<'a> {
 }
 
 impl BlitCommandsGuard<'_> {
+    /// Cold initialization receipt captured while the same canonical guard
+    /// excludes a cut of the blit that encoded the write. The epoch orders
+    /// later readers; only the exact marker can prove successful DATA.
+    /// Does not cut, submit, wait, join callbacks or prove native retirement.
+    pub fn recording_receipt(&self) -> (Epoch, CommandMarker) {
+        let cb = self
+            ._guard
+            .current
+            .recording()
+            .expect("live blit recording")
+            .clone();
+        (
+            self.core.clock.current_epoch(),
+            CommandMarker {
+                cb,
+                signalled: None,
+            },
+        )
+    }
+
     /// The exact recording this blit encodes into, pinned while the guard
     /// excludes a cut: the blit twin of [`CommandsGuard::recording_marker`].
     pub(crate) fn recording_marker(&self) -> Result<CommandMarker, MetalKernelError> {
@@ -403,6 +423,14 @@ impl CommandMarker {
     /// Nonblocking known-error observation; false also includes pending work.
     pub fn is_failed(&self) -> bool {
         self.cb.status() == MTLCommandBufferStatus::Error
+    }
+
+    /// Nonparking own-DATA observation of this exact recording. Pending
+    /// recording/handoff returns false; abandoned/failed submission returns an
+    /// error even if the queue clock has advanced. Success does not join
+    /// callbacks, a queue prefix or physical retirement. It does not submit work.
+    pub fn poll_data_ready(&self) -> Result<bool, MetalKernelError> {
+        self.cb.poll_data_ready()
     }
 
     /// The buffer's GPU end time (`CLOCK_UPTIME_RAW` seconds), valid once
@@ -2121,7 +2149,7 @@ impl Commands {
         if marker.cb.status().0 < MTLCommandBufferStatus::Committed.0 {
             self.recover_pending_submission(&marker.cb)?;
         }
-        marker.cb.try_wait_prefix_data_ready()?;
+        self.wait_after_owned_handoff_once(&marker.cb, || marker.cb.try_wait_prefix_data_ready())?;
         self.core.failure.check()?;
         let mut state = self.lock_state()?;
         self.prune_in_flight(&mut state, Some(&marker.cb))
@@ -2439,6 +2467,59 @@ impl Commands {
         Ok(receipt.signalled)
     }
 
+    /// Retry an exact transient admission refusal only after joining this
+    /// associated engine owner's existing producer transaction. Native status
+    /// alone, foreign association, or a raw wrapper cannot borrow that proof.
+    /// Normal successful waits add no state acquisition; no explicit queue
+    /// release/commit/cut/drain is performed by the rare join.
+    fn wait_after_owned_handoff_once<T>(
+        &self,
+        cb: &CommandBuffer,
+        mut wait: impl FnMut() -> Result<T, MetalKernelError>,
+    ) -> Result<T, MetalKernelError> {
+        let first = wait();
+        if !matches!(
+            &first,
+            Err(MetalKernelError::RecordingAdmission(
+                crate::command_lifecycle::LifecycleError::Busy
+            ))
+        ) {
+            return first;
+        }
+        #[cfg(test)]
+        self.core.submission_control.observe_owner_wait_busy();
+        let identity = self
+            .core
+            .modern_queue
+            .as_ref()
+            .map(|queue| Arc::as_ptr(queue) as usize)
+            .or_else(|| {
+                self.core
+                    .legacy_completions
+                    .as_ref()
+                    .map(|core| core.identity())
+            });
+        if identity.is_none() || cb.associated_queue_identity() != identity {
+            return first;
+        }
+        #[cfg(test)]
+        self.core
+            .submission_control
+            .owner_wait_joins
+            .fetch_add(1, Ordering::Release);
+        {
+            // Normal EntryGuard includes AfterUnlock: do not steal a producer's
+            // delegated release_pending progress by locking only the mutex.
+            let joined = self.lock_state()?;
+            drop(joined);
+        }
+        self.core.failure.check()?;
+        // Recheck admission/failure in the SAME operation outside EntryState.
+        // Persistent Busy remains refusal: no polling/retry loop or fabricated
+        // returned receipt for an escaped associated transaction.
+        wait()
+    }
+
     /// Wait for `cb` by the blocking incumbent.
     ///
     /// A thin wrapper over [`Self::ensure_completed_via`] with the
@@ -2458,7 +2539,7 @@ impl Commands {
                 MTLCommandBufferStatus::Completed | MTLCommandBufferStatus::Error
             )
         {
-            cb.try_wait_until_completed()?;
+            self.wait_after_owned_handoff_once(cb, || cb.try_wait_until_completed())?;
         }
         result.map(|_| ())
     }
@@ -2499,11 +2580,13 @@ impl Commands {
                 // Authenticate under owner state and submit without replacing:
                 // waiting on valid recorded work must not allocate a new slot.
                 let recovered = self.recover_pending_submission(cb)?;
-                outcome = arm.wait_for(cb, event, recovered)?;
-                cb.try_wait_data_ready()?;
+                outcome =
+                    self.wait_after_owned_handoff_once(cb, || arm.wait_for(cb, event, recovered))?;
+                self.wait_after_owned_handoff_once(cb, || cb.try_wait_data_ready())?;
             }
             MTLCommandBufferStatus::Committed | MTLCommandBufferStatus::Scheduled => {
-                outcome = arm.wait_for(cb, event, signalled)?;
+                outcome =
+                    self.wait_after_owned_handoff_once(cb, || arm.wait_for(cb, event, signalled))?;
             }
             // Already finished, so no arm runs. **Counted, and it measures 0 on
             // the decode path** (#583) -- which is what makes the counter worth
@@ -2530,7 +2613,7 @@ impl Commands {
         // Event visibility and Completed status do not alone establish own
         // callback return. Readback/marker callers require data plus native
         // error visibility; full drain explicitly joins logical completion.
-        cb.try_wait_data_ready()?;
+        self.wait_after_owned_handoff_once(cb, || cb.try_wait_data_ready())?;
         if cb.status() == MTLCommandBufferStatus::Error {
             return Err(Self::cb_error(cb));
         }
@@ -3763,6 +3846,294 @@ mod owner_submission_tests {
     }
 
     #[test]
+    fn exact_blit_receipt_poll_is_read_only_pending_then_successful_data() {
+        let device = crate::MetalDevice::new(0).unwrap();
+        let commands = device.commands();
+        let cb = pending(commands);
+        let buffer = device.new_persistent_shared(256).unwrap();
+        let pins = RetainUnknown(Some((device.clone(), cb.clone(), buffer.clone())));
+        let native_before = commands
+            .core
+            .submission_control
+            .native_calls
+            .load(Ordering::Relaxed);
+        let epoch = commands.clock().current_epoch();
+        let (writer, marker) = {
+            let mut blit = commands.blit_command_encoder().unwrap();
+            // SAFETY: independent pins survive every refusal/assertion unwind.
+            unsafe { blit.fill_buffer(&buffer, (0, 256), 0x4a) };
+            let receipt = blit.recording_receipt();
+            assert!(
+                !receipt.1.poll_data_ready().unwrap(),
+                "open encoder is not submitted DATA"
+            );
+            blit.finish().unwrap();
+            receipt
+        };
+        assert_eq!(writer, epoch);
+        assert!(marker.cb.same_recording(&cb));
+        assert!(!marker.poll_data_ready().unwrap());
+        assert_eq!(
+            commands.clock().current_epoch(),
+            epoch,
+            "poll consumed an epoch"
+        );
+        assert_eq!(
+            commands
+                .core
+                .submission_control
+                .native_calls
+                .load(Ordering::Relaxed),
+            native_before,
+            "poll submitted native work"
+        );
+        let cut = commands.flush_marker().unwrap();
+        assert!(
+            cut.cb.same_recording(&marker.cb),
+            "receipt drifted to a successor"
+        );
+        commands.wait_marker(&marker).unwrap();
+        assert!(marker.poll_data_ready().unwrap());
+        let after_epoch = commands.clock().current_epoch();
+        let after_native = commands
+            .core
+            .submission_control
+            .native_calls
+            .load(Ordering::Relaxed);
+        for _ in 0..3 {
+            assert!(marker.poll_data_ready().unwrap());
+        }
+        assert_eq!(commands.clock().current_epoch(), after_epoch);
+        assert_eq!(
+            commands
+                .core
+                .submission_control
+                .native_calls
+                .load(Ordering::Relaxed),
+            after_native
+        );
+        // SAFETY: this exact writer's successful DATA proof covers these bytes.
+        let bytes = unsafe { std::slice::from_raw_parts(buffer.contents(), 256) };
+        assert!(bytes.iter().all(|b| *b == 0x4a));
+        pins.release();
+    }
+
+    #[test]
+    fn exact_data_poll_does_not_join_a_still_held_callback() {
+        let device = crate::MetalDevice::new(0).unwrap();
+        let commands = device.commands();
+        let cb = pending(commands);
+        let gate = Arc::new((parking_lot::Mutex::new(false), parking_lot::Condvar::new()));
+        let callback_gate = Arc::clone(&gate);
+        let exited = Arc::new(AtomicBool::new(false));
+        let callback_exited = Arc::clone(&exited);
+        let (entered, observed) = std::sync::mpsc::channel();
+        cb.on_completion(move || {
+            let _ = entered.send(());
+            let (lock, changed) = &*callback_gate;
+            let mut released = lock.lock();
+            while !*released {
+                changed.wait(&mut released);
+            }
+            callback_exited.store(true, Ordering::Release);
+        })
+        .unwrap();
+        let waited = std::cell::RefCell::new(None);
+        // Install release before the first possible submission or assertion.
+        let cleanup = ReleaseBeforeWait {
+            release: || {
+                let (lock, changed) = &*gate;
+                *lock.lock() = true;
+                changed.notify_all();
+            },
+            wait: || {
+                *waited.borrow_mut() = Some(cb.wait_until_completed());
+            },
+        };
+        let marker = commands.flush_marker().unwrap();
+        observed
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("callback did not enter");
+        let epoch = commands.clock().current_epoch();
+        let native = commands
+            .core
+            .submission_control
+            .native_calls
+            .load(Ordering::Relaxed);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let ready = loop {
+            match marker.poll_data_ready() {
+                Ok(true) => break true,
+                Err(error) => panic!("DATA poll refused while callback held: {error}"),
+                Ok(false) if std::time::Instant::now() >= deadline => break false,
+                Ok(false) => std::thread::yield_now(),
+            }
+        };
+        assert!(ready, "own DATA was hidden behind callback completion");
+        assert!(!exited.load(Ordering::Acquire));
+        assert_eq!(commands.clock().current_epoch(), epoch);
+        assert_eq!(
+            commands
+                .core
+                .submission_control
+                .native_calls
+                .load(Ordering::Relaxed),
+            native
+        );
+        drop(cleanup);
+        waited.into_inner().unwrap().unwrap();
+        assert!(exited.load(Ordering::Acquire));
+    }
+
+    /// The status/error inputs below are injected observations, not a native
+    /// driver failure. Genuine successful DATA remains observable afterward;
+    /// the test does not claim a second native writer or physical retirement.
+    #[test]
+    fn data_poll_native_error_observation_is_lazy_and_preserves_admission() {
+        use std::cell::Cell;
+        let device = crate::MetalDevice::new(0).unwrap();
+        let commands = device.commands();
+        let cb = pending(commands);
+        let buffer = device.new_persistent_shared(256).unwrap();
+        let pins = RetainUnknown(Some((device.clone(), cb.clone(), buffer.clone())));
+        let epoch = commands.clock().current_epoch();
+        let native = commands
+            .core
+            .submission_control
+            .native_calls
+            .load(Ordering::Relaxed);
+        assert!(
+            !cb.test_poll_data_ready_with_observation(
+                || MTLCommandBufferStatus::Completed,
+                || panic!("pending DATA eagerly constructed error text"),
+            )
+            .unwrap(),
+            "observed completion bypassed unsubmitted admission"
+        );
+        assert_eq!(commands.clock().current_epoch(), epoch);
+        assert_eq!(
+            commands
+                .core
+                .submission_control
+                .native_calls
+                .load(Ordering::Relaxed),
+            native
+        );
+        {
+            let mut blit = commands.blit_command_encoder().unwrap();
+            // SAFETY: independent pins survive assertion/refusal unwind.
+            unsafe { blit.fill_buffer(&buffer, (0, 256), 0x5b) };
+        }
+        let marker = commands.flush_marker().unwrap();
+        assert!(
+            marker.cb.same_recording(&cb),
+            "observations must target the genuine writer recording"
+        );
+        commands.wait_marker(&marker).unwrap();
+        assert!(marker.poll_data_ready().unwrap());
+        // SAFETY: the genuine exact native writer's DATA completed above.
+        let bytes = unsafe { std::slice::from_raw_parts(buffer.contents(), 256) };
+        assert!(bytes.iter().all(|byte| *byte == 0x5b));
+        let epoch = commands.clock().current_epoch();
+        let native = commands
+            .core
+            .submission_control
+            .native_calls
+            .load(Ordering::Relaxed);
+        for (status, expected) in [
+            (MTLCommandBufferStatus::Completed, true),
+            (MTLCommandBufferStatus::Committed, false),
+        ] {
+            assert_eq!(
+                cb.test_poll_data_ready_with_observation(
+                    || status,
+                    || panic!("non-error DATA status eagerly constructed error text"),
+                )
+                .unwrap(),
+                expected
+            );
+        }
+        let status_calls = Cell::new(0);
+        let error_calls = Cell::new(0);
+        let error = cb
+            .test_poll_data_ready_with_observation(
+                || {
+                    status_calls.set(status_calls.get() + 1);
+                    MTLCommandBufferStatus::Error
+                },
+                || {
+                    error_calls.set(error_calls.get() + 1);
+                    Some("injected native-status observation".into())
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            MetalKernelError::CommandBufferError(ref message)
+                if message == "injected native-status observation"
+        ));
+        assert_eq!((status_calls.get(), error_calls.get()), (1, 1));
+        assert!(matches!(
+            cb.test_poll_data_ready_with_observation(|| MTLCommandBufferStatus::Error, || None),
+            Err(MetalKernelError::CommandBufferError(ref message)) if message == "unknown error"
+        ));
+        assert!(marker.poll_data_ready().unwrap());
+        assert_eq!(commands.clock().current_epoch(), epoch);
+        assert_eq!(
+            commands
+                .core
+                .submission_control
+                .native_calls
+                .load(Ordering::Relaxed),
+            native
+        );
+        pins.release();
+
+        // A distinct queue's known-before-entry failure must win BEFORE either
+        // observation callback. This does not induce a native driver error.
+        let failed_device = crate::MetalDevice::new(0).unwrap();
+        let failed_commands = failed_device.commands();
+        let failed_cb = pending(failed_commands);
+        let _failed_pins = RetainUnknown(Some((failed_device.clone(), failed_cb.clone())));
+        failed_commands
+            .core
+            .submission_control
+            .arm(submission_test::Fault::BeforeEntry);
+        assert!(failed_commands
+            .recover_pending_submission(&failed_cb)
+            .is_err());
+        let status_calls = Cell::new(0);
+        let error_calls = Cell::new(0);
+        assert!(failed_cb
+            .test_poll_data_ready_with_observation(
+                || {
+                    status_calls.set(status_calls.get() + 1);
+                    MTLCommandBufferStatus::Error
+                },
+                || {
+                    error_calls.set(error_calls.get() + 1);
+                    Some("must not construct after failed admission".into())
+                },
+            )
+            .is_err());
+        assert_eq!(
+            (status_calls.get(), error_calls.get()),
+            (0, 0),
+            "failed admission was observed too late"
+        );
+        assert_eq!(
+            failed_commands
+                .core
+                .submission_control
+                .native_calls
+                .load(Ordering::Relaxed),
+            0
+        );
+        eprintln!("DATA_ERROR_OBSERVATION actual_api={} injected_status=true native_driver_failure=false actual_writer_success=true error_branch=true lazy_error=true admission_precedes_observation=true",
+            commands.actual_command_api());
+    }
+
+    #[test]
     fn unused_owner_preparation_cancels_without_epoch_and_can_retry() {
         let device = crate::MetalDevice::new(0).unwrap();
         let commands = device.commands();
@@ -3772,7 +4143,16 @@ mod owner_submission_tests {
                 buffer: &cb,
                 clock: &commands.core.clock,
             };
-            drop(cb.prepare_owned_commit(authority, false).unwrap());
+            let prepared = cb.prepare_owned_commit(authority, false).unwrap();
+            assert!(
+                !cb.poll_data_ready().unwrap(),
+                "PREPARED is pending, not successful DATA"
+            );
+            drop(prepared);
+            assert!(
+                !cb.poll_data_ready().unwrap(),
+                "cancelled preparation preserves open recording"
+            );
             assert_eq!(commands.clock().current_epoch().0, 0);
             assert_eq!(cb.status(), MTLCommandBufferStatus::NotEnqueued);
         }
@@ -3899,6 +4279,10 @@ mod owner_submission_tests {
         assert_eq!(commands.clock().current_epoch().0, 1);
         assert_eq!(commands.clock().completed_count().0, 0);
         assert!(commands.check_failed().is_err());
+        assert!(
+            cb.poll_data_ready().is_err(),
+            "failed admission must not become merely pending DATA"
+        );
         assert!(commands.recover_pending_submission(&cb).is_err());
         assert_eq!(commands.clock().current_epoch().0, 1);
         assert_eq!(control.native_calls.load(Ordering::Relaxed), 0);
@@ -4113,6 +4497,505 @@ mod owner_submission_tests {
         eprintln!("CACHED_RECOVERY actual_api={} native_calls=1 epoch=1 hook=1 callback=1 bytes=0x74 retained_receipt=true new_factory_calls=0", commands.actual_command_api_for_test());
     }
 
+    #[derive(Clone, Copy, Debug)]
+    enum OwnerWaitControl {
+        Data,
+        Prefix,
+        Logical,
+        TerminalLogical,
+        ProducerFailure,
+    }
+    struct ReleaseNativeGate(
+        Option<
+            objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLSharedEvent>>,
+        >,
+    );
+    impl Drop for ReleaseNativeGate {
+        fn drop(&mut self) {
+            if let Some(gate) = &self.0 {
+                gate.setSignaledValue(1);
+            }
+        }
+    }
+
+    /// Pause the actual producer handoff with DATA pending: M4 uses its
+    /// pre-native Committed status; M3 uses a genuine queue wait plus the
+    /// existing returned-call pause. No status/epoch/completion is fabricated.
+    fn owner_wait_handoff_control(kind: OwnerWaitControl) {
+        let device = crate::MetalDevice::new(0).unwrap();
+        let commands = device.commands();
+        let cb = pending(commands);
+        // Cold foreign-queue construction precedes any native GPU wait.
+        let foreign = crate::MetalDevice::new(0).unwrap();
+        let metal4 = cb.is_metal4();
+        let terminal = matches!(kind, OwnerWaitControl::TerminalLogical);
+        let producer_failure = matches!(kind, OwnerWaitControl::ProducerFailure);
+        let before_native_entry = metal4 && !terminal;
+        let gate = (!metal4 && !terminal)
+            .then(|| device.metal_device().as_ref().newSharedEvent().unwrap());
+        // Armed before encoding ANY GPU wait or a potentially cutting request.
+        let _early_gate_release = ReleaseNativeGate(gate.clone());
+        if let Some(gate) = &gate {
+            cb.wait_for_event(gate, 1).unwrap();
+        }
+        let raw = device
+            .metal_device()
+            .new_buffer(256, super::super::MTLResourceOptions::StorageModeShared)
+            .unwrap();
+        let observer = (producer_failure && !metal4)
+            .then(|| device.metal_device().as_ref().newSharedEvent().unwrap());
+        // Failed/unknown handoff never authorizes dropping these owners.
+        let pins = RetainUnknown(Some((
+            device.clone(),
+            cb.clone(),
+            raw.clone(),
+            gate.clone(),
+            observer.clone(),
+        )));
+        let marker = {
+            let mut blit = commands.blit_command_encoder().unwrap();
+            // SAFETY: initialized by this exact retained write; every cleanup
+            // path releases producer then joins before any output observation.
+            unsafe { blit.fill_buffer(&raw, (0, 256), 0x4a) };
+            let marker = blit.recording_receipt().1;
+            assert!(marker.cb.same_recording(&cb));
+            blit.finish().unwrap();
+            marker
+        };
+        if let Some(observer) = &observer {
+            cb.signal_event(observer, 1).unwrap();
+        }
+        let control = commands.core.submission_control.clone();
+        let before = control.native_calls.load(Ordering::Acquire);
+        control.arm(if before_native_entry {
+            submission_test::Fault::HoldBeforeEntry
+        } else {
+            submission_test::Fault::HoldReturn
+        });
+        let producer = std::cell::RefCell::new(None::<std::thread::JoinHandle<_>>);
+        let waiter = std::cell::RefCell::new(None::<std::thread::JoinHandle<_>>);
+        let produced = std::cell::RefCell::new(None);
+        let waited = std::cell::RefCell::new(None);
+        let watchdog = std::cell::RefCell::new(None::<std::thread::JoinHandle<bool>>);
+        let watchdog_result = std::cell::RefCell::new(None);
+        let (request_release, await_release) = std::sync::mpsc::sync_channel(1);
+        // Armed BEFORE any thread can acquire the native preparation/EntryState.
+        let cleanup = ReleaseBeforeWait {
+            release: || {
+                let _ = request_release.send(());
+                // Independent GPU-event release is needed only for M3; it
+                // precedes all joins even if the real waiter returned an error.
+                if let Some(gate) = &gate {
+                    gate.setSignaledValue(1);
+                }
+                control.release();
+            },
+            wait: || {
+                if let Some(t) = producer.borrow_mut().take() {
+                    *produced.borrow_mut() = Some(t.join());
+                }
+                if let Some(t) = waiter.borrow_mut().take() {
+                    *waited.borrow_mut() = Some(t.join());
+                }
+                if let Some(t) = watchdog.borrow_mut().take() {
+                    *watchdog_result.borrow_mut() = Some(t.join());
+                }
+            },
+        };
+        let independent_control = control.clone();
+        let independent_gate = gate.clone();
+        *watchdog.borrow_mut() = Some(std::thread::spawn(move || {
+            if await_release
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .is_err()
+            {
+                if let Some(gate) = independent_gate {
+                    gate.setSignaledValue(1);
+                }
+                independent_control.release();
+                true
+            } else {
+                false
+            }
+        }));
+        let owner = commands.clone();
+        *producer.borrow_mut() = Some(std::thread::spawn(move || owner.flush_marker()));
+        let paused = control.wait_for_pause();
+        if terminal {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while !cb.data_ready() && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
+        let physical_data_ready = cb.data_ready();
+        let available_data = if terminal {
+            let result =
+                commands.ensure_completed_via(&cb, CompletionWait::Synchronize, None, None);
+            Some((
+                result.is_ok(),
+                control.owner_wait_joins.load(Ordering::Acquire),
+            ))
+        } else {
+            None
+        };
+        let calls_while_paused = control.native_calls.load(Ordering::Acquire);
+        let status_while_paused = cb.status();
+        let pending_while_paused = cb.poll_data_ready();
+        let raw_result = cb.try_wait_until_completed();
+        let foreign_result = match kind {
+            OwnerWaitControl::Data => foreign.commands().wait_marker(&marker),
+            OwnerWaitControl::Prefix => foreign.commands().wait_marker_prefix_data(&marker),
+            OwnerWaitControl::Logical
+            | OwnerWaitControl::TerminalLogical
+            | OwnerWaitControl::ProducerFailure => foreign.commands().ensure_completed(&cb),
+        };
+        let foreign_joins = foreign
+            .commands()
+            .core
+            .submission_control
+            .owner_wait_joins
+            .load(Ordering::Acquire);
+        let owner = commands.clone();
+        let target = marker.clone();
+        *waiter.borrow_mut() = Some(std::thread::spawn(move || match kind {
+            OwnerWaitControl::Data => owner.wait_marker(&target),
+            OwnerWaitControl::Prefix => owner.wait_marker_prefix_data(&target),
+            OwnerWaitControl::Logical
+            | OwnerWaitControl::TerminalLogical
+            | OwnerWaitControl::ProducerFailure => owner.ensure_completed(&target.cb),
+        }));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while control.owner_wait_busy.load(Ordering::Acquire) == 0
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let attempted_real_busy = control.owner_wait_busy.load(Ordering::Acquire) > 0;
+        if producer_failure {
+            // The real wait has observed ENTERED before the producer may fail.
+            // Reuse existing known-error / unknown-return boundaries; no native
+            // error, epoch or completion is fabricated.
+            control.arm(if before_native_entry {
+                submission_test::Fault::BeforeEntry
+            } else {
+                submission_test::Fault::UnknownReturn
+            });
+        }
+        // Only the exact real wait-arm Busy observer opens this release. The
+        // test does not assume a spawned thread ran merely because time passed.
+        drop(cleanup);
+        let producer_result = produced.into_inner().unwrap();
+        let owner_result = waited.into_inner().unwrap().unwrap();
+        let used_watchdog = watchdog_result.into_inner().unwrap().unwrap();
+        // Native producer and owner waiter are gone before any failure/assertion.
+        // Drain independently for cleanup even when the omission mutant refused.
+        let data = commands.ensure_completed(&cb);
+        let final_sync = device.synchronize();
+        assert!(paused, "real producer-handoff pause did not engage");
+        assert!(
+            !used_watchdog,
+            "independent watchdog release is failure, not acceptance"
+        );
+        assert_eq!(
+            calls_while_paused,
+            before + usize::from(!before_native_entry),
+            "wrong actual native-call phase for controlled API"
+        );
+        if terminal {
+            assert_eq!(status_while_paused, MTLCommandBufferStatus::Completed);
+            assert!(
+                physical_data_ready,
+                "terminal-DATA control never reached genuine DATA"
+            );
+            assert_eq!(
+                available_data,
+                Some((true, 0)),
+                "available DATA gained a handoff/callback join"
+            );
+        } else {
+            assert!(
+                !physical_data_ready,
+                "pending-DATA control already completed"
+            );
+            assert!(matches!(
+                status_while_paused,
+                MTLCommandBufferStatus::Committed | MTLCommandBufferStatus::Scheduled
+            ));
+        }
+        assert!(
+            matches!(pending_while_paused, Ok(false)),
+            "DATA proof bypassed handoff"
+        );
+        assert!(
+            matches!(
+                raw_result,
+                Err(MetalKernelError::RecordingAdmission(
+                    crate::command_lifecycle::LifecycleError::Busy
+                ))
+            ),
+            "direct/raw wait changed its fail-closed contract"
+        );
+        assert!(
+            attempted_real_busy,
+            "owner never observed the exact real Busy boundary"
+        );
+        if matches!(kind, OwnerWaitControl::Prefix) {
+            assert!(
+                matches!(
+                    foreign_result,
+                    Err(MetalKernelError::QueueUnavailable(
+                        "marker belongs to another queue"
+                    ))
+                ),
+                "foreign prefix marker lost existing identity refusal"
+            );
+        } else {
+            assert!(
+                matches!(
+                    foreign_result,
+                    Err(MetalKernelError::RecordingAdmission(
+                        crate::command_lifecycle::LifecycleError::Busy
+                    ))
+                ),
+                "foreign owner borrowed another queue's handoff"
+            );
+        }
+        assert_eq!(
+            foreign_joins, 0,
+            "foreign marker joined unrelated EntryState"
+        );
+        if producer_failure {
+            if before_native_entry {
+                assert!(
+                    matches!(
+                        producer_result.unwrap(),
+                        Err(MetalKernelError::QueueUnavailable(
+                            "injected known-before-entry refusal"
+                        ))
+                    ),
+                    "known-before-entry producer fault did not fire"
+                );
+            } else {
+                let panic =
+                    producer_result.expect_err("unknown return must unwind at actual handoff");
+                assert_eq!(
+                    panic.downcast_ref::<&str>(),
+                    Some(&"controlled unknown return publication")
+                );
+                let observer = observer.as_ref().unwrap();
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+                while observer.signaledValue() < 1 && std::time::Instant::now() < deadline {
+                    std::thread::yield_now();
+                }
+                assert_eq!(
+                    observer.signaledValue(),
+                    1,
+                    "independent native tail did not fire"
+                );
+                // SAFETY: genuine native tail signal proves this earlier fill,
+                // NOT logical completion, resource retirement or reuse/refund.
+                let values = unsafe { std::slice::from_raw_parts(raw.contents(), 256) };
+                assert_eq!(values.len(), 256);
+                assert!(values.iter().all(|&b| b == 0x4a));
+            }
+            assert!(
+                owner_result.is_err(),
+                "owner join fabricated success after producer failure"
+            );
+            assert!(
+                !matches!(
+                    owner_result,
+                    Err(MetalKernelError::RecordingAdmission(
+                        crate::command_lifecycle::LifecycleError::Busy
+                    ))
+                ),
+                "owner join returned original transient Busy instead of producer failure"
+            );
+            assert!(data.is_err() && final_sync.is_err());
+            assert!(commands.check_failed().is_err());
+            assert!(cb.poll_data_ready().is_err());
+            assert_eq!(
+                commands.clock().completed_count().0,
+                0,
+                "failed handoff fabricated completion"
+            );
+            assert_eq!(control.owner_wait_joins.load(Ordering::Acquire), 1);
+            assert_eq!(
+                control.native_calls.load(Ordering::Acquire) - before,
+                usize::from(!before_native_entry)
+            );
+            assert!(commands.recover_pending_submission(&cb).is_err());
+            assert_eq!(
+                control.native_calls.load(Ordering::Acquire) - before,
+                usize::from(!before_native_entry),
+                "failed owner was submitted again"
+            );
+            eprintln!("OWNER_HANDOFF_PRODUCER_ERROR actual_api={} known_before_entry={} native_calls={} completed=0 custody_retained=true", commands.actual_command_api_for_test(), before_native_entry, usize::from(!before_native_entry));
+            // Intentionally do NOT release pins after a failed/unknown handoff.
+            return;
+        }
+        producer_result.unwrap().unwrap();
+        data.unwrap();
+        final_sync.unwrap();
+        assert!(
+            owner_result.is_ok(),
+            "owner marker wait refused legitimate pending handoff: {owner_result:?}"
+        );
+        assert_eq!(
+            control.owner_wait_joins.load(Ordering::Acquire),
+            1,
+            "genuine owner recovery must join once, not spin/retry/drain"
+        );
+
+        assert_eq!(
+            control.native_calls.load(Ordering::Acquire) - before,
+            1,
+            "owner recovery submitted again"
+        );
+        // SAFETY: actual producer/owner DATA and full cleanup have completed;
+        // raw is the independent Shared backing owned by pins above.
+        let values = unsafe { std::slice::from_raw_parts(raw.contents(), 256) };
+        assert_eq!(values.len(), 256);
+        assert!(
+            values.iter().all(|&b| b == 0x4a),
+            "wrong native write output"
+        );
+        eprintln!("OWNER_HANDOFF_CONTROL kind={kind:?} actual_api={} real_busy_observed=true raw_refused=true native_calls=1 genuine_output=true", commands.actual_command_api_for_test());
+        pins.release();
+    }
+
+    #[test]
+    fn owner_marker_wait_joins_committed_before_handoff_return() {
+        owner_wait_handoff_control(OwnerWaitControl::Data);
+    }
+    #[test]
+    fn owner_prefix_wait_joins_committed_before_handoff_return() {
+        owner_wait_handoff_control(OwnerWaitControl::Prefix);
+    }
+    #[test]
+    fn owner_logical_wait_joins_committed_before_handoff_return() {
+        owner_wait_handoff_control(OwnerWaitControl::Logical);
+    }
+
+    #[test]
+    fn owner_terminal_data_stays_available_but_logical_wait_joins_handoff() {
+        owner_wait_handoff_control(OwnerWaitControl::TerminalLogical);
+    }
+
+    #[test]
+    fn owner_handoff_error_after_real_busy_is_not_completion_or_retry() {
+        owner_wait_handoff_control(OwnerWaitControl::ProducerFailure);
+    }
+
+    #[test]
+    fn owner_wait_release_before_arrival_has_no_join_or_duplicate_submission() {
+        let device = crate::MetalDevice::new(0).unwrap();
+        let commands = device.commands();
+        let cb = pending(commands);
+        let raw = device
+            .metal_device()
+            .new_buffer(256, super::super::MTLResourceOptions::StorageModeShared)
+            .unwrap();
+        let pins = RetainUnknown(Some((device.clone(), cb.clone(), raw.clone())));
+        let marker = {
+            let mut blit = commands.blit_command_encoder().unwrap();
+            // SAFETY: pins survive failure and actual DATA precedes observation.
+            unsafe { blit.fill_buffer(&raw, (0, 256), 0x4b) };
+            let marker = blit.recording_receipt().1;
+            assert!(marker.cb.same_recording(&cb));
+            blit.finish().unwrap();
+            marker
+        };
+        let control = commands.core.submission_control.clone();
+        let before = control.native_calls.load(Ordering::Acquire);
+        // Release precedes arrival at the REAL producer hook, not merely a
+        // spawned wait thread. Flush is synchronous so owner recovery cannot
+        // race this explicit producer and accidentally submit a successor.
+        control.release();
+        control.arm(if cb.is_metal4() {
+            submission_test::Fault::HoldBeforeEntry
+        } else {
+            submission_test::Fault::HoldReturn
+        });
+        let cut = commands.flush_marker();
+        let data = commands.wait_marker(&marker);
+        let prefix = commands.wait_marker_prefix_data(&marker);
+        let logical = commands.ensure_completed(&cb);
+        let cleanup = device.synchronize();
+        cut.unwrap();
+        data.unwrap();
+        prefix.unwrap();
+        logical.unwrap();
+        cleanup.unwrap();
+        assert!(
+            control.wait_for_pause(),
+            "real pre-released producer hook was not entered"
+        );
+        assert_eq!(control.native_calls.load(Ordering::Acquire) - before, 1);
+        assert_eq!(control.owner_wait_busy.load(Ordering::Acquire), 0);
+        assert_eq!(control.owner_wait_joins.load(Ordering::Acquire), 0);
+        // SAFETY: genuine DATA and logical cleanup succeeded above.
+        let values = unsafe { std::slice::from_raw_parts(raw.contents(), 256) };
+        assert_eq!(values.len(), 256);
+        assert!(values.iter().all(|&b| b == 0x4b));
+        eprintln!(
+            "OWNER_HANDOFF_EARLY_RELEASE actual_api={} native_calls=1 owner_joins=0 bytes=0x4b",
+            commands.actual_command_api_for_test()
+        );
+        pins.release();
+    }
+
+    /// Helper-only decision control, NOT a reproduction of native Busy. The
+    /// associated owner/EntryState are real; the closure outcomes below are
+    /// scalar inputs, with a finite third-call sentinel so a retry-loop mutant
+    /// fails an assertion rather than hanging or requiring a watchdog.
+    #[test]
+    fn owner_wait_persistent_busy_retries_once_not_a_loop() {
+        let device = crate::MetalDevice::new(0).unwrap();
+        let commands = device.commands();
+        let cb = pending(commands);
+        let control = commands.core.submission_control.clone();
+        let calls = std::cell::Cell::new(0usize);
+        let outcome = commands.wait_after_owned_handoff_once(&cb, || {
+            let next = calls.get() + 1;
+            calls.set(next);
+            if next <= 2 {
+                Err::<(), _>(MetalKernelError::RecordingAdmission(
+                    crate::command_lifecycle::LifecycleError::Busy,
+                ))
+            } else {
+                Err(MetalKernelError::QueueUnavailable(
+                    "bounded-retry third-call sentinel",
+                ))
+            }
+        });
+        let observed_calls = calls.get();
+        let observed_joins = control.owner_wait_joins.load(Ordering::Acquire);
+        let observed_native = control.native_calls.load(Ordering::Acquire);
+        let observed_epoch = commands.clock().current_epoch().0;
+        // Real empty owner cleanup BEFORE assertion fallout; no reader bytes,
+        // native handoff state or GPU epoch were fabricated by the closure.
+        let cleanup = commands.ensure_completed(&cb);
+        cleanup.unwrap();
+        assert_eq!(
+            observed_calls, 2,
+            "persistent Busy gained an unbounded retry"
+        );
+        assert!(
+            matches!(
+                outcome,
+                Err(MetalKernelError::RecordingAdmission(
+                    crate::command_lifecycle::LifecycleError::Busy
+                ))
+            ),
+            "persistent Busy lost its final refusal"
+        );
+        assert_eq!(observed_joins, 1);
+        assert_eq!(observed_native, 0, "scalar closure submitted native work");
+        assert_eq!(observed_epoch, 0, "scalar closure created an epoch");
+        eprintln!("OWNER_HANDOFF_BOUNDED_HELPER actual_api={} scalar_inputs=true calls=2 joins=1 precleanup_native_calls=0 precleanup_epoch=0", commands.actual_command_api_for_test());
+    }
+
     #[test]
     fn callback_reentry_before_return_publication_refuses_to_block() {
         let device = crate::MetalDevice::new(0).unwrap();
@@ -4157,9 +5040,15 @@ mod owner_submission_tests {
             std::thread::yield_now();
         }
         let before_release = callback_result.load(Ordering::Acquire);
+        let data_pending_during_entered_handoff = cb.poll_data_ready();
         drop(cleanup);
         result.into_inner().unwrap().unwrap().unwrap();
         assert!(paused, "native return boundary did not engage");
+        assert!(
+            !data_pending_during_entered_handoff.unwrap(),
+            "unknown returned handoff was accepted as DATA"
+        );
+        assert!(cb.poll_data_ready().unwrap());
         assert_eq!(
             before_release, 1,
             "callback reentry blocked or bypassed refusal"

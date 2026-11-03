@@ -1318,9 +1318,12 @@ pub unsafe fn call_moe_rowmap(
     bound: usize,
     block_n: usize,
 ) -> Result<(), MetalKernelError> {
-    if n_experts > 1024 {
+    let geometry = crate::quantized::moe_rowmap::geometry(rows, topk, n_experts, block_n)
+        .map_err(|e| MetalKernelError::LoadFunctionError(e.to_string()))?;
+    if bound < geometry.bound as usize || bound > u32::MAX as usize {
         return Err(MetalKernelError::LoadFunctionError(format!(
-            "moe_rowmap: n_experts {n_experts} > 1024"
+            "moe_rowmap: bound {bound} must cover {} blocks and fit u32",
+            geometry.bound
         )));
     }
     let pipeline = kernels.load_pipeline(device, Source::Quantized, "kernel_moe_rowmap")?;
@@ -1337,10 +1340,10 @@ pub unsafe fn call_moe_rowmap(
                 Output::new(rowids),
                 Output::new(blocks),
                 Output::new(meta),
-                (rows * topk) as u32,
-                topk as u32,
-                n_experts as u32,
-                block_n as u32,
+                geometry.pairs,
+                geometry.topk,
+                geometry.experts,
+                geometry.block_n,
                 bound as u32
             )
         );
@@ -1419,6 +1422,15 @@ pub unsafe fn call_quantized_matmul_mm_id_mapped(
                 op: "routed quantized matmul (rows grouped by expert)",
             },
         )));
+    }
+    if batch == 0 || topk == 0 {
+        crate::quantized::moe_rowmap::empty_native_strides(
+            (batch, topk, in_dim1),
+            (n_experts, n, k),
+            dtype_block_size(dtype),
+            dtype_type_size(dtype),
+        )
+        .map_err(|e| MetalKernelError::LoadFunctionError(e.to_string()))?;
     }
     let name = if bn == 16 {
         format!("kernel_mul_mm_id_mapped16_{stem}_f32")

@@ -30,6 +30,7 @@ mod decoder_standing_window;
 mod decoder_turn_checkpoint;
 mod dspark_decode_identity;
 mod emulated_bf16_load;
+mod expert_residency_scoped_api;
 mod fixture_switch;
 mod flash_decoding_batch;
 mod flash_paged_rows_own_bits;

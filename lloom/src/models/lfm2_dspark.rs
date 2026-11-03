@@ -3611,6 +3611,10 @@ impl<H: SharedHead> Speculator for DSparkSpeculator<H> {
         self.confidence_wanted = wanted;
     }
 
+    fn abort(&mut self) {
+        DSparkSpeculator::reset_contexts(self);
+    }
+
     fn begin(&mut self, seq: SeqId, prompt: &[u32]) -> Result<()> {
         self.begin_at(seq, prompt, &[])
     }

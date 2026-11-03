@@ -40,7 +40,7 @@ use std::sync::Arc;
 use lloom::generation::Sampling;
 use lloom::nn::{
     BatchDecoder, BatchedCausalLM, CacheReset, CacheRewind, CacheShare, DecodeOptions, DecodeOut,
-    DecodeStats, PrefillDecode, ReuseAction, RowDriver, RowId, Session,
+    DecodeStats, PrefillDecode, ReuseAction, RowDriver, RowId, Sequence, Session,
 };
 use lloom_tensor::{Device, Result};
 
@@ -97,6 +97,35 @@ impl<M: BatchedCausalLM> MakeDriver<M> for () {
         Ok(None)
     }
 }
+
+/// What the scheduler's `extra` contributes when a static batch or a
+/// continuous step fails, before its sequences are reset and returned to the
+/// pool: whether the failure touched their state at all, the fence that
+/// waits out the failed work still on the device, then the drop of the
+/// extra's own per-row state (a drafter's contexts). None of it runs on a
+/// batch or step that succeeded.
+pub trait BatchRecovery {
+    /// Whether `error` may have moved the state of the rows it ended
+    /// ([`crate::recovery::failure_touched_state`]). On a continuous step
+    /// that did not, the rows go back to the pool with their cached prefix
+    /// and nothing below runs.
+    fn touched(&self, error: &lloom_tensor::Error) -> bool {
+        crate::recovery::failure_touched_state(error)
+    }
+
+    /// Wait for the failed work still on the device. A refusal leaves the
+    /// rows held, unreset, and the recovery is retried before the next
+    /// batch or admission.
+    fn fence(&mut self, device: &Device) -> Result<()> {
+        crate::recovery::fence_failed_execution(device)
+    }
+
+    /// Forget per-row state the failure may have moved. Runs only after
+    /// [`Self::fence`] succeeded.
+    fn abort(&mut self) {}
+}
+
+impl BatchRecovery for () {}
 
 /// A retired row's outcome.
 #[derive(Debug, Clone)]
@@ -334,6 +363,11 @@ type StaticRowMeta = (
     crate::turn::TurnReuse,
 );
 
+/// A request's error while a failure's recovery is refused.
+fn recovery_pending(fence: &str) -> String {
+    format!("batch scheduler: a failed batch's recovery is pending: {fence}")
+}
+
 /// Where a request's prefix is shared from: an idle slot of the pool or a
 /// live row of the decoder, and the tokens (whole pages) it can give.
 #[derive(Debug, Clone, Copy)]
@@ -398,6 +432,10 @@ pub struct BatchScheduler<'m, M: BatchedCausalLM, E> {
     closed: VecDeque<ClosedJob<M, E>>,
     rx: Receiver<Job<M, E>>,
     counters: BatchCounters,
+    /// A failed static batch's or continuous step's sequences, by pool slot,
+    /// out of the pool and unreset until [`Self::recover_failed`] succeeds.
+    /// Non-empty between batches or steps only while the fence refuses.
+    failed: Vec<(usize, Sequence<M::Cache>)>,
     /// Under the static mode, the rows the current batch used, by pool slot.
     on_counters: Option<CountersHook>,
     /// The open profile window, under the profile build's recorder.
@@ -597,7 +635,7 @@ impl<'m, M, E> BatchScheduler<'m, M, E>
 where
     M: BatchedCausalLM + 'm,
     M::Cache: CacheReset + CacheRewind + CacheShare,
-    E: MakeDriver<M>,
+    E: MakeDriver<M> + BatchRecovery,
 {
     fn new(model: &'m M, mut cfg: BatchConfig<M, E>, rx: Receiver<Job<M, E>>) -> Result<Self> {
         if cfg.max_rows == 0 {
@@ -639,6 +677,7 @@ where
             closed: VecDeque::new(),
             rx,
             counters: BatchCounters::default(),
+            failed: Vec::new(),
             on_counters: cfg.on_counters,
             #[cfg(feature = "metal")]
             window: None,
@@ -904,7 +943,16 @@ where
     }
 
     /// Admit waiting rows into the continuous decoder while the width allows.
+    /// A failed step's held rows are recovered first; while that recovery is
+    /// refused, every waiting row gets its error rather than a sequence
+    /// beside work the fence could not see retire.
     fn admit_waiting(&mut self) {
+        if let Err(e) = self.recover_failed() {
+            for (_, tx) in self.waiting.drain(..) {
+                let _ = tx.send(BatchEvent::Error(recovery_pending(&e)));
+            }
+            return;
+        }
         while self.decoder.rows() < self.max_rows {
             let Some((req, tx)) = self.waiting.pop_front() else {
                 break;
@@ -1094,6 +1142,12 @@ where
         if rows.is_empty() {
             return Ok(());
         }
+        if let Err(e) = self.recover_failed() {
+            for (_, tx) in rows {
+                let _ = tx.send(BatchEvent::Error(recovery_pending(&e)));
+            }
+            return Ok(());
+        }
         let mut sessions = Vec::with_capacity(rows.len());
         let mut meta: Vec<Option<StaticRowMeta>> = Vec::with_capacity(rows.len());
         let mut prompts: Vec<Vec<u32>> = Vec::with_capacity(rows.len());
@@ -1170,10 +1224,18 @@ where
         let outs = match outcome {
             Ok(outs) => outs,
             Err(e) => {
+                let msg = e.to_string();
                 for (session, m) in sessions.into_iter().zip(meta) {
                     let (slot, _, tx, _, _) = m.expect("a kept row");
-                    self.pool.release(slot, session.into_sequence());
-                    let _ = tx.send(BatchEvent::Error(e.to_string()));
+                    self.failed.push((slot, session.into_sequence()));
+                    let _ = tx.send(BatchEvent::Error(msg.clone()));
+                }
+                if let Err(fence) = self.recover_failed() {
+                    eprintln!(
+                        "[batch: a failed static batch's fence refused; its {} rows are held \
+                         until it succeeds: {fence}]",
+                        self.failed.len()
+                    );
                 }
                 return Ok(());
             }
@@ -1197,6 +1259,67 @@ where
         }
         if let Some(cb) = &self.on_counters {
             cb(&self.counters);
+        }
+        Ok(())
+    }
+
+    /// A failed continuous step ends every row in it with the error. The
+    /// driver's state is not trusted past the failure, so every row is
+    /// drained, its log settled to what its cache holds. A failure that
+    /// touched no row's state returns each sequence to its own slot as it
+    /// is, its cached prefix kept; one that may have is recovered as a
+    /// failed static batch is (fence, abort, reset) and held while the
+    /// fence refuses (`batched-decode-design.md` §11.11).
+    fn fail_continuous(&mut self, error: lloom_tensor::Error) {
+        let msg = error.to_string();
+        let touched = self.extra.touched(&error);
+        let ids = self.decoder.row_ids();
+        let sessions = self.decoder.drain_rows();
+        for (id, session) in ids.into_iter().zip(sessions) {
+            let row = self.inflight.remove(&id);
+            debug_assert!(row.is_some(), "a driver row the scheduler did not admit");
+            let Some(row) = row else { continue };
+            let _ = row.tx.send(BatchEvent::Error(msg.clone()));
+            let seq = session.into_sequence();
+            if touched {
+                self.failed.push((row.slot, seq));
+            } else {
+                self.pool.release(row.slot, seq);
+            }
+        }
+        for (_, row) in self.inflight.drain() {
+            let _ = row.tx.send(BatchEvent::Error(msg.clone()));
+        }
+        if let Err(fence) = self.recover_failed() {
+            eprintln!(
+                "[batch: a failed step's fence refused; its {} rows are held until it \
+                 succeeds: {fence}]",
+                self.failed.len()
+            );
+        }
+    }
+
+    /// Recover a failed static batch's or continuous step's sequences
+    /// ([`Self::failed`]). The failure returned with work still on the
+    /// device — the failed pass, the other rows' enqueued verifies — and with
+    /// every row's state possibly moved: a pass may advance its cache before
+    /// the part that failed, and the sequence's log and position say nothing
+    /// of it. So the extra's fence waits that work out, the extra and the
+    /// continuous driver forget their per-row state (the drafter's contexts
+    /// live in whichever holds the drafter), and every sequence is reset
+    /// before it returns to its slot. A refused fence resets nothing and
+    /// keeps them held.
+    fn recover_failed(&mut self) -> std::result::Result<(), String> {
+        if self.failed.is_empty() {
+            return Ok(());
+        }
+        self.extra.fence(&self.device).map_err(|e| e.to_string())?;
+        self.extra.abort();
+        self.decoder.abort();
+        for (slot, seq) in self.failed.drain(..) {
+            let mut session = Session::from_sequence(self.model, seq);
+            session.reset();
+            self.pool.release(slot, session.into_sequence());
         }
         Ok(())
     }
@@ -1375,21 +1498,7 @@ where
                     }
                     if !self.decoder.is_idle() {
                         if let Err(e) = self.step_continuous() {
-                            // A failed step ends every row in it with the error;
-                            // the decoder's state is not trusted past it, so
-                            // every row is drained and its sequence returned to
-                            // the pool reset.
-                            let msg = e.to_string();
-                            let slots: Vec<usize> =
-                                self.inflight.values().map(|f| f.slot).collect();
-                            for (_, f) in self.inflight.drain() {
-                                let _ = f.tx.send(BatchEvent::Error(msg.clone()));
-                            }
-                            let sessions = self.decoder.drain_rows();
-                            for (slot, mut s) in slots.into_iter().zip(sessions) {
-                                s.reset();
-                                self.pool.release(slot, s.into_sequence());
-                            }
+                            self.fail_continuous(e);
                         }
                     }
                     #[cfg(feature = "metal")]
@@ -1427,7 +1536,7 @@ where
     S: Send + Sync + 'static,
     M: BatchedCausalLM + Sync + 'static,
     M::Cache: CacheReset + CacheRewind + CacheShare + Send + 'static,
-    E: MakeDriver<M> + Send + 'static,
+    E: MakeDriver<M> + BatchRecovery + Send + 'static,
 {
     let (tx, rx) = mpsc::channel();
     let (ready_tx, ready_rx) = mpsc::channel::<std::result::Result<(), String>>();
@@ -1661,7 +1770,7 @@ mod tests {
     /// fires (or is dropped). Returns once the job is running: no row is
     /// admitted while a closed job is queued or running, so every request
     /// submitted meanwhile is waiting when the gate opens.
-    fn hold(handle: &BatchHandle<Chain, ()>) -> Sender<()> {
+    fn hold<M: BatchedCausalLM, E>(handle: &BatchHandle<M, E>) -> Sender<()> {
         let (release_tx, release_rx) = mpsc::channel::<()>();
         let (held_tx, held_rx) = mpsc::channel::<()>();
         assert!(handle.run_closed(Box::new(move |_| {
@@ -2062,6 +2171,759 @@ mod tests {
         // most three if the scheduler ran them one by one — never more.
         let n = calls.load(Ordering::Acquire);
         assert!((1..=3).contains(&n), "{n} body calls");
+        handle.shutdown();
+        thread.join().unwrap();
+    }
+
+    /// What [`Faulty`]'s next forward does.
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum Fault {
+        None,
+        /// Moves the cache past the fed positions, then fails: a pass whose
+        /// state advances before its fallible part (LFM2's conv phase ahead
+        /// of the layer walk).
+        MutateThenFail,
+        /// Refuses before the cache moves: an admission refusal ahead of
+        /// every layer (LFM2's `prepare_pass`).
+        RefuseUntouched,
+        /// Left for a batched step (`forward_rows`, `forward_ragged`), which
+        /// moves every row's cache by what it fed and then fails: a
+        /// continuous step whose rows advanced before its fallible part.
+        RowsMutateThenFail,
+        /// Left for a batched step, which refuses before any row's cache
+        /// moves: a continuous step whose failure touched no state.
+        RowsRefuseUntouched,
+    }
+
+    impl Fault {
+        fn for_rows(self) -> bool {
+            matches!(self, Fault::RowsMutateThenFail | Fault::RowsRefuseUntouched)
+        }
+    }
+
+    /// The chain over a cache that counts the positions it holds. A forward
+    /// at `pos` onto a cache holding `held` reads the drift `held - pos`
+    /// into its next token, so a stale cache decodes a different stream
+    /// rather than panicking. Every forward logs its `(pos, held)` on entry.
+    struct Faulty {
+        chain: Chain,
+        fault: parking_lot::Mutex<Fault>,
+        /// Batched steps a rows fault lets through before it fires.
+        rows_skip: parking_lot::Mutex<usize>,
+        entries: parking_lot::Mutex<Vec<(usize, usize)>>,
+    }
+
+    impl Faulty {
+        fn new(device: &Device) -> Result<Self> {
+            Ok(Self {
+                chain: Chain::new(device)?,
+                fault: parking_lot::Mutex::new(Fault::None),
+                rows_skip: parking_lot::Mutex::new(0),
+                entries: parking_lot::Mutex::new(Vec::new()),
+            })
+        }
+
+        fn arm(&self, fault: Fault) {
+            *self.fault.lock() = fault;
+        }
+
+        /// Arm a rows fault for the batched step after the next `skip`.
+        fn arm_rows(&self, fault: Fault, skip: usize) {
+            assert!(fault.for_rows());
+            *self.rows_skip.lock() = skip;
+            *self.fault.lock() = fault;
+        }
+
+        fn entries(&self) -> Vec<(usize, usize)> {
+            self.entries.lock().clone()
+        }
+
+        /// The fault a single-sequence forward consumes: a batched step's is
+        /// left for the batched step.
+        fn take_single(&self) -> Fault {
+            let mut f = self.fault.lock();
+            if f.for_rows() {
+                return Fault::None;
+            }
+            std::mem::replace(&mut *f, Fault::None)
+        }
+
+        /// The rows fault the batched step about to run fires, if any.
+        fn take_rows(&self) -> Fault {
+            let mut f = self.fault.lock();
+            if !f.for_rows() {
+                return Fault::None;
+            }
+            let mut skip = self.rows_skip.lock();
+            if *skip > 0 {
+                *skip -= 1;
+                return Fault::None;
+            }
+            std::mem::replace(&mut *f, Fault::None)
+        }
+
+        fn next_rows(&self, rows: &[(u32, usize, usize)]) -> Result<Tensor> {
+            let next: Vec<u32> = rows
+                .iter()
+                .map(|&(last, pos, held)| {
+                    let drift = held.wrapping_sub(pos) % VOCAB;
+                    (next_of(last) + drift as u32) % VOCAB as u32
+                })
+                .collect();
+            let ids = Tensor::new(next.as_slice(), self.chain.eye.device())?;
+            self.chain.eye.index_select(&ids, 0)
+        }
+    }
+
+    impl ModelTrait for Faulty {
+        type Config = ();
+        fn from_weights(_vb: VarBuilder, _cfg: &()) -> Result<Self> {
+            unreachable!()
+        }
+    }
+
+    impl CausalLM for Faulty {
+        type Cache = Pos;
+        fn new_cache(&self, _cfg: &(), _dev: &Device) -> Result<Pos> {
+            Ok(Pos(0))
+        }
+        fn embed(&self, tokens: &Tensor) -> Result<Tensor> {
+            Ok(tokens.clone())
+        }
+        fn forward_embeds(&self, embeds: &Tensor, pos: usize, cache: &mut Pos) -> Result<Tensor> {
+            let n = embeds.dim(1)?;
+            let held = cache.0;
+            self.entries.lock().push((pos, held));
+            match self.take_single() {
+                Fault::None | Fault::RowsMutateThenFail | Fault::RowsRefuseUntouched => {}
+                Fault::MutateThenFail => {
+                    cache.0 += n;
+                    lloom_tensor::bail!("injected: the pass moved the cache, then failed");
+                }
+                Fault::RefuseUntouched => {
+                    lloom_tensor::bail!("injected: the pass was refused before anything moved");
+                }
+            }
+            cache.0 += n;
+            let ids = embeds.to_vec2::<u32>()?;
+            let last = *ids[0].last().expect("a non-empty forward");
+            self.next_rows(&[(last, pos, held)])
+        }
+        fn vocab_size(&self) -> usize {
+            VOCAB
+        }
+    }
+
+    impl BatchedCausalLM for Faulty {
+        fn forward_rows(&self, tokens: &Tensor, rows: &mut [Row<'_, Pos>]) -> Result<Tensor> {
+            let ids = tokens.to_vec2::<u32>()?;
+            let fault = self.take_rows();
+            if fault == Fault::RowsRefuseUntouched {
+                lloom_tensor::bail!("injected: the step was refused before any row moved");
+            }
+            let mut lanes = Vec::with_capacity(rows.len());
+            for (row, ids) in rows.iter_mut().zip(&ids) {
+                self.entries.lock().push((row.pos, row.cache.0));
+                lanes.push((ids[0], row.pos, row.cache.0));
+                row.cache.0 += 1;
+            }
+            if fault == Fault::RowsMutateThenFail {
+                lloom_tensor::bail!("injected: the step moved every row's cache, then failed");
+            }
+            self.next_rows(&lanes)
+        }
+        fn forward_ragged(
+            &self,
+            tokens: &Tensor,
+            rows: &mut [RaggedRow<'_, Pos>],
+        ) -> Result<Tensor> {
+            let ids = tokens.squeeze(0)?.to_vec1::<u32>()?;
+            let fault = self.take_rows();
+            if fault == Fault::RowsRefuseUntouched {
+                lloom_tensor::bail!("injected: the step was refused before any row moved");
+            }
+            let mut lanes = Vec::with_capacity(rows.len());
+            let mut off = 0;
+            for row in rows.iter_mut() {
+                self.entries.lock().push((row.pos, row.cache.0));
+                off += row.len;
+                lanes.push((ids[off - 1], row.pos, row.cache.0));
+                row.cache.0 += row.len;
+            }
+            if fault == Fault::RowsMutateThenFail {
+                lloom_tensor::bail!("injected: the step moved every row's cache, then failed");
+            }
+            self.next_rows(&lanes)
+        }
+    }
+
+    /// The static body over [`Faulty`]: the batched driver, as
+    /// [`a_static_batch_runs_the_body_once_for_every_waiting_row`]'s.
+    fn faulty_body<E>() -> StaticBody<Faulty, E> {
+        Box::new(|idle, sessions, prompts, specs, on_tokens| {
+            let mut sampler =
+                lloom::generation::LogitsProcessor::from_sampling(0, Sampling::ArgMax);
+            let opts = DecodeOptions {
+                lookahead: 1,
+                ..DecodeOptions::new(specs.iter().map(|s| s.max_tokens).max().unwrap())
+            };
+            Session::decode_batched(
+                sessions,
+                &mut sampler,
+                prompts,
+                &opts,
+                &specs[0].eos_ids,
+                idle.device,
+                on_tokens,
+            )
+        })
+    }
+
+    /// A one-row static scheduler over `model` with prefix reuse ON: every
+    /// request lands on the one sequence the previous request left.
+    fn start_faulty<E>(
+        model: Arc<Faulty>,
+        extra: E,
+    ) -> (BatchHandle<Faulty, E>, std::thread::JoinHandle<()>)
+    where
+        E: MakeDriver<Faulty> + BatchRecovery + Send + 'static,
+    {
+        let device = Device::Cpu;
+        let cfg = BatchConfig {
+            device,
+            pool: SlotPool::new(1, || Pos(0)),
+            rings: RingPool::new(),
+            opts: DecodeOptions {
+                lookahead: 1,
+                ..DecodeOptions::new(0)
+            },
+            max_rows: 1,
+            reuse_prefix: true,
+            share_prefix: false,
+            prefill_batch: 1,
+            prefill_decode: PrefillDecode::Ride,
+            intake_per_tick: INTAKE_PER_TICK,
+            mode: BatchMode::Static(faulty_body()),
+            extra,
+            on_counters: None,
+        };
+        spawn(model, |m: &Faulty| m, cfg).unwrap()
+    }
+
+    fn submit_faulty<E>(
+        handle: &BatchHandle<Faulty, E>,
+        prompt: &[u32],
+        max: usize,
+    ) -> Receiver<BatchEvent> {
+        handle.submit(BatchRequest {
+            prompt_ids: prompt.to_vec(),
+            params: params(max),
+            cancel: Arc::new(AtomicBool::new(false)),
+        })
+    }
+
+    /// Wait for the scheduler thread to finish what it is doing: a closed
+    /// job runs only between two turns of its loop. A row's error is sent
+    /// before the failed batch's recovery runs.
+    fn settle<E>(handle: &BatchHandle<Faulty, E>) {
+        handle
+            .run_closed_blocking(|_| ())
+            .expect("the scheduler runs the closed job");
+    }
+
+    fn expect_error(rx: &Receiver<BatchEvent>) -> String {
+        loop {
+            match rx.recv_timeout(Duration::from_secs(30)).expect("an event") {
+                BatchEvent::Tokens(_) => {}
+                BatchEvent::Done(d) => panic!("the row succeeded: {:?}", d.tokens),
+                BatchEvent::Error(e) => return e,
+            }
+        }
+    }
+
+    /// A static batch whose forward moved its cache and then failed hands its
+    /// sequence back reset. The client sees the error; the same prompt, sent
+    /// again with prefix reuse on and no cold flag, starts from an empty
+    /// cache and decodes what a fresh sequence decodes. Returned as it was,
+    /// the sequence's log is empty and `prepare` calls it `Fresh` without
+    /// resetting, so the retry ran on the failed pass's cache.
+    #[test]
+    fn a_failed_static_batch_hands_its_rows_back_reset() {
+        let model = Arc::new(Faulty::new(&Device::Cpu).unwrap());
+        let (handle, thread) = start_faulty(Arc::clone(&model), ());
+        let prompt = [3u32, 1, 4];
+        model.arm(Fault::MutateThenFail);
+        let err = expect_error(&submit_faulty(&handle, &prompt, 8));
+        assert!(err.contains("moved the cache, then failed"), "{err}");
+        let seen = model.entries().len();
+        let (streamed, done) = collect(&submit_faulty(&handle, &prompt, 8));
+        assert_eq!(
+            model.entries()[seen],
+            (0, 0),
+            "the retry's first forward as (pos, held): a cache holding positions past pos \
+             is the failed batch's"
+        );
+        let (want, eos) = chain(*prompt.last().unwrap(), 8);
+        assert_eq!(done.tokens, want);
+        assert_eq!(streamed, want);
+        assert_eq!(done.eos, eos);
+        handle.shutdown();
+        thread.join().unwrap();
+    }
+
+    /// As [`a_failed_static_batch_hands_its_rows_back_reset`], where the
+    /// failed request EXTENDED a prefix a successful request cached: kept
+    /// as it was, the retry extends the same log onto the failed pass's
+    /// cache.
+    #[test]
+    fn a_failed_static_batch_that_extended_a_cached_prefix_is_not_extended_again() {
+        let model = Arc::new(Faulty::new(&Device::Cpu).unwrap());
+        let (handle, thread) = start_faulty(Arc::clone(&model), ());
+        let first = [3u32, 1, 4];
+        let (_, done) = collect(&submit_faulty(&handle, &first, 4));
+        assert!(!done.eos, "the fixture wants a log to extend");
+        let mut next: Vec<u32> = first.to_vec();
+        next.extend(&done.tokens);
+        next.extend([9, 2]);
+        let seen = model.entries().len();
+        model.arm(Fault::MutateThenFail);
+        let err = expect_error(&submit_faulty(&handle, &next, 8));
+        assert!(err.contains("moved the cache, then failed"), "{err}");
+        assert!(
+            model.entries()[seen].0 > 0,
+            "the failed request extended the cached prefix: {:?}",
+            &model.entries()[seen..]
+        );
+        let seen = model.entries().len();
+        let (streamed, done) = collect(&submit_faulty(&handle, &next, 8));
+        let (pos, held) = model.entries()[seen];
+        assert_eq!(
+            pos, held,
+            "the retry's first forward: a cache holding positions past pos is the failed batch's"
+        );
+        let (want, eos) = chain(*next.last().unwrap(), 8);
+        assert_eq!(done.tokens, want);
+        assert_eq!(streamed, want);
+        assert_eq!(done.eos, eos);
+        handle.shutdown();
+        thread.join().unwrap();
+    }
+
+    /// The static scheduler's `extra` with a recovery that counts its calls:
+    /// a stand-in for the drafter whose contexts a failed batch must drop.
+    /// `refusals` fences are refused before one succeeds.
+    #[derive(Clone, Default)]
+    struct Recorder {
+        fences: Arc<std::sync::atomic::AtomicUsize>,
+        aborts: Arc<std::sync::atomic::AtomicUsize>,
+        refusals: Arc<std::sync::atomic::AtomicUsize>,
+        /// Report every failure as having touched no state: the signal a
+        /// model will give for a refusal before anything moved.
+        untouched: Arc<AtomicBool>,
+    }
+
+    impl Recorder {
+        fn calls(&self) -> (usize, usize) {
+            (
+                self.fences.load(Ordering::Acquire),
+                self.aborts.load(Ordering::Acquire),
+            )
+        }
+    }
+
+    impl MakeDriver<Faulty> for Recorder {
+        fn make_driver<'m>(
+            &mut self,
+            _model: &'m Faulty,
+            _opts: &DecodeOptions,
+            _device: &Device,
+        ) -> Result<Option<Driver<'m, Faulty>>> {
+            Ok(None)
+        }
+    }
+
+    impl BatchRecovery for Recorder {
+        fn touched(&self, _error: &lloom_tensor::Error) -> bool {
+            !self.untouched.load(Ordering::Acquire)
+        }
+        fn fence(&mut self, device: &Device) -> Result<()> {
+            self.fences.fetch_add(1, Ordering::AcqRel);
+            if self
+                .refusals
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
+                .is_ok()
+            {
+                lloom_tensor::bail!("injected: the fence was refused");
+            }
+            crate::recovery::fence_failed_execution(device)
+        }
+        fn abort(&mut self) {
+            self.aborts.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    /// A successful request leaves its sequence for the next to extend, and
+    /// no batch that succeeds runs the recovery. After a failure the
+    /// recovery runs once — the fence, then the extra's abort — and the next
+    /// request decodes from a reset sequence.
+    #[test]
+    fn a_successful_static_batch_keeps_its_prefix_and_only_a_failed_one_recovers() {
+        let model = Arc::new(Faulty::new(&Device::Cpu).unwrap());
+        let extra = Recorder::default();
+        let (handle, thread) = start_faulty(Arc::clone(&model), extra.clone());
+        let first = [3u32, 1, 4];
+        let (_, done) = collect(&submit_faulty(&handle, &first, 4));
+        assert!(!done.eos, "the fixture wants a log to extend");
+        let mut next: Vec<u32> = first.to_vec();
+        next.extend(&done.tokens);
+        next.extend([9, 2]);
+        let (streamed, done) = collect(&submit_faulty(&handle, &next, 8));
+        assert_eq!(done.reuse, ReuseAction::Extend, "{done:?}");
+        assert!(done.reused >= first.len(), "{done:?}");
+        let (want, eos) = chain(*next.last().unwrap(), 8);
+        assert_eq!(
+            (streamed, done.tokens, done.eos),
+            (want.clone(), want.clone(), eos)
+        );
+        assert_eq!(
+            extra.calls(),
+            (0, 0),
+            "a batch that succeeded ran the recovery"
+        );
+
+        model.arm(Fault::MutateThenFail);
+        expect_error(&submit_faulty(&handle, &next, 8));
+        settle(&handle);
+        assert_eq!(
+            extra.calls(),
+            (1, 1),
+            "(fences, aborts) after one failed batch"
+        );
+        let seen = model.entries().len();
+        let (streamed, done) = collect(&submit_faulty(&handle, &next, 8));
+        assert_eq!(model.entries()[seen], (0, 0));
+        assert_eq!(done.reuse, ReuseAction::Fresh);
+        assert_eq!((streamed, done.tokens), (want.clone(), want));
+        assert_eq!(
+            extra.calls(),
+            (1, 1),
+            "the retry succeeded and recovered nothing"
+        );
+        handle.shutdown();
+        thread.join().unwrap();
+    }
+
+    /// A pass refused before it moved anything keeps the model's promise —
+    /// the cache is as it was — and the same request sent again decodes what
+    /// a fresh sequence decodes, on the one sequence the pool has: the
+    /// recovery hands the row back usable rather than holding it.
+    #[test]
+    fn a_static_batch_refused_before_its_pass_moved_anything_serves_the_retry() {
+        let model = Arc::new(Faulty::new(&Device::Cpu).unwrap());
+        let extra = Recorder::default();
+        let (handle, thread) = start_faulty(Arc::clone(&model), extra.clone());
+        let first = [3u32, 1, 4];
+        let (_, done) = collect(&submit_faulty(&handle, &first, 4));
+        let mut next: Vec<u32> = first.to_vec();
+        next.extend(&done.tokens);
+        next.extend([9, 2]);
+        let seen = model.entries().len();
+        model.arm(Fault::RefuseUntouched);
+        let err = expect_error(&submit_faulty(&handle, &next, 8));
+        assert!(err.contains("refused before anything moved"), "{err}");
+        let (pos, held) = model.entries()[seen];
+        assert!(
+            pos > 0 && pos == held,
+            "the refused pass extended a clean prefix: {pos} {held}"
+        );
+        let seen = model.entries().len();
+        let (streamed, done) = collect(&submit_faulty(&handle, &next, 8));
+        let (pos, held) = model.entries()[seen];
+        assert_eq!(pos, held, "the retry's first forward onto a stale cache");
+        let (want, eos) = chain(*next.last().unwrap(), 8);
+        assert_eq!((streamed, done.tokens, done.eos), (want.clone(), want, eos));
+        assert_eq!(extra.calls(), (1, 1));
+        handle.shutdown();
+        thread.join().unwrap();
+    }
+
+    /// A refused fence resets nothing and keeps the failed batch's sequence
+    /// out of the pool; the next batch is refused with the fence's error
+    /// rather than run beside work the fence could not see retire. Once the
+    /// fence succeeds the sequence comes back reset, and the request after
+    /// decodes what a fresh sequence decodes.
+    #[test]
+    fn a_refused_fence_holds_the_failed_rows_until_it_succeeds() {
+        let model = Arc::new(Faulty::new(&Device::Cpu).unwrap());
+        let extra = Recorder::default();
+        extra.refusals.store(2, Ordering::Release);
+        let (handle, thread) = start_faulty(Arc::clone(&model), extra.clone());
+        let prompt = [3u32, 1, 4];
+        model.arm(Fault::MutateThenFail);
+        expect_error(&submit_faulty(&handle, &prompt, 8));
+        settle(&handle);
+        assert_eq!(extra.calls(), (1, 0), "a refused fence aborted the extra");
+        let seen = model.entries().len();
+        let err = expect_error(&submit_faulty(&handle, &prompt, 8));
+        assert!(
+            err.contains("recovery is pending") && err.contains("fence was refused"),
+            "{err}"
+        );
+        assert_eq!(
+            model.entries().len(),
+            seen,
+            "a batch ran while the recovery was pending"
+        );
+        assert_eq!(extra.calls(), (2, 0));
+        let (streamed, done) = collect(&submit_faulty(&handle, &prompt, 8));
+        assert_eq!(model.entries()[seen], (0, 0));
+        let (want, eos) = chain(*prompt.last().unwrap(), 8);
+        assert_eq!((streamed, done.tokens, done.eos), (want.clone(), want, eos));
+        assert_eq!(extra.calls(), (3, 1));
+        handle.shutdown();
+        thread.join().unwrap();
+    }
+
+    /// A continuous scheduler of `rows` sequences over `model`, prefix reuse
+    /// on: a request lands on the sequence that holds its longest prefix.
+    fn start_faulty_continuous<E>(
+        model: Arc<Faulty>,
+        rows: usize,
+        extra: E,
+    ) -> (BatchHandle<Faulty, E>, std::thread::JoinHandle<()>)
+    where
+        E: MakeDriver<Faulty> + BatchRecovery + Send + 'static,
+    {
+        let cfg = BatchConfig {
+            device: Device::Cpu,
+            pool: SlotPool::new(rows, || Pos(0)),
+            rings: RingPool::new(),
+            opts: DecodeOptions {
+                lookahead: 1,
+                ..DecodeOptions::new(0)
+            },
+            max_rows: rows,
+            reuse_prefix: true,
+            share_prefix: false,
+            prefill_batch: 1,
+            prefill_decode: PrefillDecode::Ride,
+            intake_per_tick: INTAKE_PER_TICK,
+            mode: BatchMode::Continuous,
+            extra,
+            on_counters: None,
+        };
+        spawn(model, |m: &Faulty| m, cfg).unwrap()
+    }
+
+    /// Submit `prompts` together: held behind a closed job until all are
+    /// queued, so one admission takes every one of them into the same steps.
+    fn submit_together<E>(
+        handle: &BatchHandle<Faulty, E>,
+        prompts: &[Vec<u32>],
+        max: usize,
+    ) -> Vec<Receiver<BatchEvent>> {
+        let gate = hold(handle);
+        let rxs = prompts
+            .iter()
+            .map(|p| submit_faulty(handle, p, max))
+            .collect();
+        drop(gate);
+        rxs
+    }
+
+    /// Round 1 of the continuous tests: `firsts` decoded together, each
+    /// prompt extended by its reply and two more tokens, so the next round
+    /// extends a cached prefix on every row.
+    fn extend_after_one_round<E>(
+        handle: &BatchHandle<Faulty, E>,
+        firsts: &[Vec<u32>],
+    ) -> Vec<Vec<u32>> {
+        submit_together(handle, firsts, 4)
+            .iter()
+            .enumerate()
+            .map(|(i, rx)| {
+                let (_, done) = collect(rx);
+                assert!(!done.eos, "the fixture wants a log to extend");
+                let mut next = firsts[i].clone();
+                next.extend(&done.tokens);
+                next.extend([9, 2 + i as u32]);
+                next
+            })
+            .collect()
+    }
+
+    /// A continuous step that moved every row's cache and then failed is
+    /// recovered as a failed static batch is: the fence, the extra's abort,
+    /// and every row handed back reset, so the next checkout of any of them
+    /// is a `Fresh` prepare onto an empty cache (`batched-decode-design.md`
+    /// §11.11). Both rows extended a cached prefix and the failure lands in
+    /// the decode step after both prefilled: handed back as they were, the
+    /// same prompts sent again would reuse logs whose caches hold one
+    /// position more than they say. A round that succeeds runs no recovery.
+    #[test]
+    fn a_failed_continuous_step_hands_every_row_back_reset() {
+        let model = Arc::new(Faulty::new(&Device::Cpu).unwrap());
+        let extra = Recorder::default();
+        let (handle, thread) = start_faulty_continuous(Arc::clone(&model), 2, extra.clone());
+        let nexts = extend_after_one_round(&handle, &[vec![3u32, 1, 4], vec![5u32, 9]]);
+        assert_eq!(
+            extra.calls(),
+            (0, 0),
+            "a step that succeeded ran the recovery"
+        );
+
+        let seen = model.entries().len();
+        model.arm_rows(Fault::RowsMutateThenFail, 0);
+        for (i, rx) in submit_together(&handle, &nexts, 8).iter().enumerate() {
+            let err = expect_error(rx);
+            assert!(
+                err.contains("moved every row's cache, then failed"),
+                "row {i}: {err}"
+            );
+        }
+        let failed = model.entries()[seen..].to_vec();
+        assert!(
+            failed.len() == 4 && failed.iter().all(|(pos, held)| *pos > 0 && pos == held),
+            "two prefills extending a cached prefix, then one step over both rows: {failed:?}"
+        );
+        settle(&handle);
+        assert_eq!(
+            extra.calls(),
+            (1, 1),
+            "(fences, aborts) after one failed step"
+        );
+
+        let seen = model.entries().len();
+        for (i, rx) in submit_together(&handle, &nexts, 8).iter().enumerate() {
+            let (streamed, done) = collect(rx);
+            assert_eq!(done.reuse, ReuseAction::Fresh, "row {i}: {done:?}");
+            let (want, eos) = chain(*nexts[i].last().unwrap(), 8);
+            assert_eq!(
+                (streamed, done.tokens, done.eos),
+                (want.clone(), want, eos),
+                "row {i} after the failed step"
+            );
+        }
+        assert_eq!(
+            model.entries()[seen..seen + 2],
+            [(0, 0), (0, 0)],
+            "the retries' first forwards as (pos, held): a cache holding positions past pos \
+             is the failed step's"
+        );
+        assert_eq!(
+            extra.calls(),
+            (1, 1),
+            "the retries succeeded and recovered nothing"
+        );
+        handle.shutdown();
+        thread.join().unwrap();
+    }
+
+    /// A refused fence after a failed continuous step resets nothing and
+    /// keeps the step's sequences out of the pool; the requests that arrive
+    /// meanwhile are refused with the fence's error, and no forward runs for
+    /// them. Once the fence succeeds the sequence comes back reset and the
+    /// request after decodes what a fresh sequence decodes.
+    #[test]
+    fn a_refused_fence_holds_a_failed_steps_rows_until_it_succeeds() {
+        let model = Arc::new(Faulty::new(&Device::Cpu).unwrap());
+        let extra = Recorder::default();
+        extra.refusals.store(2, Ordering::Release);
+        let (handle, thread) = start_faulty_continuous(Arc::clone(&model), 1, extra.clone());
+        let prompt = vec![3u32, 1, 4];
+        model.arm_rows(Fault::RowsMutateThenFail, 0);
+        expect_error(&submit_faulty(&handle, &prompt, 8));
+        settle(&handle);
+        assert_eq!(extra.calls(), (1, 0), "a refused fence aborted the extra");
+        let seen = model.entries().len();
+        let err = expect_error(&submit_faulty(&handle, &prompt, 8));
+        assert!(
+            err.contains("recovery is pending") && err.contains("fence was refused"),
+            "{err}"
+        );
+        assert_eq!(
+            model.entries().len(),
+            seen,
+            "a request ran while the recovery was pending"
+        );
+        assert_eq!(extra.calls(), (2, 0));
+        let (streamed, done) = collect(&submit_faulty(&handle, &prompt, 8));
+        assert_eq!(model.entries()[seen], (0, 0));
+        let (want, eos) = chain(*prompt.last().unwrap(), 8);
+        assert_eq!((streamed, done.tokens, done.eos), (want.clone(), want, eos));
+        assert_eq!(extra.calls(), (3, 1));
+        handle.shutdown();
+        thread.join().unwrap();
+    }
+
+    /// A continuous step refused before any row's state moved, reported as
+    /// such ([`BatchRecovery::touched`]), runs no recovery: every row goes
+    /// back to its own slot with its cached prefix. The refusal lands after
+    /// each row decoded one token, so the drained rows' caches hold a
+    /// position past the prompt that only the drain's settle logs. The same
+    /// prompts sent again rewind both positions the log names past the
+    /// prompt's last token and re-feed that token where it was: a log
+    /// missing the decoded token would put it one position too far.
+    #[test]
+    fn an_untouched_continuous_failure_keeps_every_rows_prefix() {
+        let model = Arc::new(Faulty::new(&Device::Cpu).unwrap());
+        let extra = Recorder::default();
+        extra.untouched.store(true, Ordering::Release);
+        let (handle, thread) = start_faulty_continuous(Arc::clone(&model), 2, extra.clone());
+        let nexts = extend_after_one_round(&handle, &[vec![3u32, 1, 4], vec![5u32, 9]]);
+
+        model.arm_rows(Fault::RowsRefuseUntouched, 1);
+        let mut decoded = Vec::new();
+        for (i, rx) in submit_together(&handle, &nexts, 8).iter().enumerate() {
+            let mut streamed = Vec::new();
+            let err = loop {
+                match rx.recv_timeout(Duration::from_secs(30)).expect("an event") {
+                    BatchEvent::Tokens(ids) => streamed.extend(ids),
+                    BatchEvent::Done(d) => panic!("row {i} succeeded: {:?}", d.tokens),
+                    BatchEvent::Error(e) => break e,
+                }
+            };
+            assert!(
+                err.contains("refused before any row moved"),
+                "row {i}: {err}"
+            );
+            assert_eq!(
+                streamed.len(),
+                1,
+                "row {i} decoded one token before the refusal"
+            );
+            decoded.push(streamed);
+        }
+        settle(&handle);
+        assert_eq!(
+            extra.calls(),
+            (0, 0),
+            "an untouched failure ran the recovery"
+        );
+
+        let seen = model.entries().len();
+        for (i, rx) in submit_together(&handle, &nexts, 8).iter().enumerate() {
+            let (streamed, done) = collect(rx);
+            assert_eq!(
+                (done.reuse, done.reused),
+                (ReuseAction::Rewound(2), nexts[i].len() - 1),
+                "row {i}: the prompt and its decoded token {:?} were kept",
+                decoded[i]
+            );
+            let (want, eos) = chain(*nexts[i].last().unwrap(), 8);
+            assert_eq!(
+                (streamed, done.tokens, done.eos),
+                (want.clone(), want, eos),
+                "row {i} after the refused step"
+            );
+        }
+        let last = |i: usize| nexts[i].len() - 1;
+        assert_eq!(
+            model.entries()[seen..seen + 2],
+            [(last(0), last(0)), (last(1), last(1))],
+            "the retries re-feed each prompt's last token where it was"
+        );
+        assert_eq!(extra.calls(), (0, 0));
         handle.shutdown();
         thread.join().unwrap();
     }

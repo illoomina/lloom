@@ -315,6 +315,17 @@ impl<P: Profile> crate::MakeDriver<Model<P>> for Speculators {
     }
 }
 
+/// A failed static batch drops the drafter's per-row contexts, as a failed
+/// single request's lease does (`SingleExtra::abort`); the fence is the
+/// scheduler's default.
+impl crate::BatchRecovery for Speculators {
+    fn abort(&mut self) {
+        if let Some(spec) = &mut self.spec {
+            spec.reset_contexts();
+        }
+    }
+}
+
 pub type Extra = Speculators;
 
 /// The private-sequence policy shared by initial chat and decision caches.
@@ -1851,14 +1862,7 @@ impl<P: Lfm2Shape> Engine<P> {
     }
 
     fn fence_failed_request(&self) -> Result<()> {
-        #[cfg(feature = "metal")]
-        if let Device::Metal(device) = &self.core.device {
-            let marker = device.flush_marker()?;
-            device.wait_marker_prefix_data(&marker)?;
-            return Ok(());
-        }
-        self.core.device.synchronize()?;
-        Ok(())
+        Ok(crate::recovery::fence_failed_execution(&self.core.device)?)
     }
 
     fn checkout_single(&self) -> Result<RequestLease<'_, Model<P>, SingleExtra>> {

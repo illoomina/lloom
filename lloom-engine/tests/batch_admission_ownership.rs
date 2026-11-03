@@ -23,8 +23,8 @@ use lloom::nn::{DecodeOptions, Session, SpecBatchDecoder};
 use lloom::profile::RewindableExact;
 use lloom::testing::tiny::{TinyCheckpoint, Weights};
 use lloom_engine::{
-    spawn_batch, BatchConfig, BatchEvent, BatchHandle, BatchMode, BatchRequest, DecodeParams,
-    Driver, MakeDriver, RingPool, SlotPool,
+    spawn_batch, BatchConfig, BatchEvent, BatchHandle, BatchMode, BatchRecovery, BatchRequest,
+    DecodeParams, Driver, MakeDriver, RingPool, SlotPool,
 };
 use lloom_tensor::{DType, Device, Result};
 use std::sync::atomic::AtomicBool;
@@ -125,6 +125,8 @@ impl MakeDriver<Target> for Speculative {
         Ok(Some(Box::new(dec)))
     }
 }
+
+impl BatchRecovery for Speculative {}
 
 fn start() -> (
     BatchHandle<Target, Speculative>,

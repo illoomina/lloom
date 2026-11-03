@@ -619,12 +619,20 @@ where
         out
     }
 
+    /// Every row out, each log settled to what its cache holds
+    /// ([`Session::settle_fed`]), as [`BatchDecoder::drain_rows`] leaves
+    /// them.
+    ///
+    /// [`BatchDecoder::drain_rows`]: crate::nn::BatchDecoder::drain_rows
     fn drain_rows(&mut self) -> Vec<R> {
         let mut out = Vec::new();
         self.finished.clear();
         for i in 0..self.slots.len() {
             if let Some(mut slot) = self.slots[i].take() {
                 self.free.push(i);
+                if !slot.lane.retired {
+                    slot.session.borrow_mut().settle_fed(&slot.lane.all_ids);
+                }
                 // A retired row returned its drafter slot at its
                 // retirement: this takes nothing, rather than putting the
                 // same slot on the free list twice.
@@ -633,6 +641,10 @@ where
             }
         }
         out
+    }
+
+    fn abort(&mut self) {
+        self.spec.abort();
     }
 
     fn is_idle(&self) -> bool {

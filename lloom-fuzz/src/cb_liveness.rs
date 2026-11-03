@@ -275,12 +275,14 @@ fn run_sequence_inner(
                     // SAFETY: `buf` leaves the harness only through the pool's
                     // GPU-clock release or an in-flight hold, the mechanism this
                     // model checks; `dst` is read only after the wait.
-                    unsafe { blit.copy_from_buffer(buf, 0, &dst, 0, size) }
+                    unsafe { blit.copy_from_buffer(buf, 0, &dst, 0, size & !3) }
                         .map_err(|e| at(format!("copy_from_buffer: {e:?}")))?;
                 }
+                // A blit copies whole 4-byte words on macOS; the prefix it
+                // copied is what is verified.
                 pending.push(Pending {
                     dst,
-                    size,
+                    size: size & !3,
                     expect: *pattern,
                     src_id: *id,
                 });
@@ -384,7 +386,7 @@ fn run_sequence_inner(
                     continue;
                 };
                 let (buf, pattern, id) = &live[index % live.len()];
-                let size = buf.size().min(last.size);
+                let size = buf.size().min(last.size) & !3;
                 {
                     let mut blit = cmds
                         .blit_command_encoder()

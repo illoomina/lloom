@@ -3126,6 +3126,43 @@ fn static_dspark_scheduler_options(
 /// per batch — mixed sets are refused rather than served under the first
 /// row's.
 
+/// The static DSpark body's own validation: a drafter on the batch thread,
+/// a non-empty batch, every row on the argmax verify, one EOS set. It reads
+/// the row specs and writes nothing, so its refusal leaves every row's cached
+/// prefix reusable and is reported untouched (decisions 105, 124); the
+/// pipelined driver's preflight reports its own the same way.
+fn static_dspark_validate(specs: &[RowSpec], has_drafter: bool) -> lloom_tensor::Result<&RowSpec> {
+    let checked = (|| -> lloom_tensor::Result<&RowSpec> {
+        if !has_drafter {
+            lloom_tensor::bail!("no drafter on the batch thread");
+        }
+        let first = specs
+            .first()
+            .ok_or_else(|| lloom_tensor::Error::msg("an empty static batch"))?;
+        for (i, s) in specs.iter().enumerate() {
+            lloom::nn::refuse(
+                lloom::nn::Body::BatchedWindow,
+                &lloom::nn::Asks {
+                    sampling: &s.sampling,
+                    processors: false,
+                    budget: false,
+                    digest: false,
+                    logprobs: None,
+                },
+            )
+            .map_err(|e| lloom_tensor::Error::Msg(format!("row {i}: {e}")))?;
+            if s.eos_ids != first.eos_ids {
+                lloom_tensor::bail!(
+                    "row {i}: a static speculative batch runs one EOS set; this row's differs \
+                     from row 0's"
+                );
+            }
+        }
+        Ok(first)
+    })();
+    checked.map_err(|e| e.with_state_touched(lloom_tensor::StateTouched::No))
+}
+
 fn static_dspark_body<'a, 'm, P: Profile>(
     idle: &mut Idle<'a, 'm, Model<P>, Extra>,
     sessions: &mut [Session<'m, Model<P>>],
@@ -3133,33 +3170,12 @@ fn static_dspark_body<'a, 'm, P: Profile>(
     specs: &[RowSpec],
     on_tokens: &mut dyn FnMut(usize, &[u32]) -> lloom_tensor::Result<()>,
 ) -> lloom_tensor::Result<Vec<DecodeOut>> {
+    let first = static_dspark_validate(specs, idle.extra.spec.is_some())?;
     let spec = idle
         .extra
         .spec
         .as_mut()
-        .ok_or_else(|| lloom_tensor::Error::msg("no drafter on the batch thread"))?;
-    let first = specs
-        .first()
-        .ok_or_else(|| lloom_tensor::Error::msg("an empty static batch"))?;
-    for (i, s) in specs.iter().enumerate() {
-        lloom::nn::refuse(
-            lloom::nn::Body::BatchedWindow,
-            &lloom::nn::Asks {
-                sampling: &s.sampling,
-                processors: false,
-                budget: false,
-                digest: false,
-                logprobs: None,
-            },
-        )
-        .map_err(|e| lloom_tensor::Error::Msg(format!("row {i}: {e}")))?;
-        if s.eos_ids != first.eos_ids {
-            lloom_tensor::bail!(
-                "row {i}: a static speculative batch runs one EOS set; this row's differs from \
-                 row 0's"
-            );
-        }
-    }
+        .expect("checked by `static_dspark_validate`");
     let caps: Vec<usize> = specs.iter().map(|s| s.max_tokens).collect();
     Session::decode_speculative_pipelined_with_caps(
         sessions,
@@ -3813,6 +3829,42 @@ impl<P: Lfm2Shape> super::served::Served for Engine<P> {
 mod tests {
     use super::*;
     use lloom::nn::ops::KvQuant;
+
+    /// Decision 124: the static DSpark body's validation refusals (a sampled
+    /// row, mixed EOS sets, no drafter, an empty batch) are reported
+    /// untouched, so the scheduler hands each row back with its prefix; an
+    /// accepted batch returns its first row.
+    #[test]
+    fn the_static_dspark_validation_refuses_untouched() {
+        use lloom_tensor::StateTouched;
+        let row = |sampling: Sampling, eos: &[u32]| RowSpec {
+            sampling,
+            seed: 0,
+            eos_ids: eos.to_vec(),
+            max_tokens: 4,
+        };
+        let greedy = [row(Sampling::ArgMax, &[2]), row(Sampling::ArgMax, &[2])];
+        let first = static_dspark_validate(&greedy, true).expect("a greedy batch, one EOS set");
+        assert_eq!(first.eos_ids, vec![2]);
+        let sampled = [
+            row(Sampling::ArgMax, &[2]),
+            row(Sampling::All { temperature: 0.7 }, &[2]),
+        ];
+        let mixed = [row(Sampling::ArgMax, &[2]), row(Sampling::ArgMax, &[3])];
+        for (what, specs, drafter) in [
+            ("a sampled row", &sampled[..], true),
+            ("mixed EOS sets", &mixed[..], true),
+            ("no drafter", &greedy[..], false),
+            ("an empty batch", &[][..], true),
+        ] {
+            let e = static_dspark_validate(specs, drafter).expect_err(what);
+            assert_eq!(
+                e.state_touched(),
+                Some(StateTouched::No),
+                "{what}: {e} must be reported untouched"
+            );
+        }
+    }
 
     #[test]
     fn conv_carry_reads_configured_tile_and_chunk_without_legacy_fields() {

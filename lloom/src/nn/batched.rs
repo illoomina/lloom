@@ -416,6 +416,10 @@ pub trait RowDriver<'m, M: BatchedCausalLM + 'm, R: BorrowMut<Session<'m, M>>> {
     fn step_phases(&self) -> BatchStepPhases {
         BatchStepPhases::default()
     }
+    /// Forget the per-row state the driver keeps beside the rows' caches (a
+    /// drafter's contexts), after a failed step whose rows are being reset.
+    /// Nothing for a driver that keeps none.
+    fn abort(&mut self) {}
 }
 
 impl<'m, M: BatchedCausalLM + 'm, R: BorrowMut<Session<'m, M>>> RowDriver<'m, M, R>
@@ -638,12 +642,17 @@ impl<'m, M: BatchedCausalLM, R: BorrowMut<Session<'m, M>>> BatchDecoder<'m, M, R
 
     /// Take every row out, live or pending, without a step: the sessions in
     /// slot order, their lanes discarded — for a caller recovering from a
-    /// failed step whose decoder state is not to be trusted. What the rows
-    /// produced is lost; the sessions' caches hold whatever was fed.
+    /// failed step whose decoder state is not to be trusted. Each row's log
+    /// is settled to what its cache holds ([`Session::settle_fed`]): the ids
+    /// it fed are logged and anything past them is overrun, so a caller that
+    /// keeps the sequence finds its log and position agreeing.
     pub fn drain_rows(&mut self) -> Vec<R> {
         let mut out = Vec::new();
         for slot in self.slots.iter_mut() {
-            if let Some(s) = slot.take() {
+            if let Some(mut s) = slot.take() {
+                if !s.lane.retired {
+                    s.session.borrow_mut().settle_fed(&s.lane.all_ids);
+                }
                 out.push(s.session);
             }
         }

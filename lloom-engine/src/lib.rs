@@ -30,6 +30,7 @@ pub mod option_grammar;
 pub mod option_schema;
 pub mod option_tree;
 pub mod options;
+pub mod recovery;
 pub mod seam;
 pub mod sink;
 pub mod slots;
@@ -38,8 +39,8 @@ pub mod turn;
 
 pub use batch::{
     drive_closed_rows, spawn as spawn_batch, BatchConfig, BatchCounters, BatchDone, BatchEvent,
-    BatchHandle, BatchMode, BatchRequest, ClosedJob, CountersHook, Driver, Idle, MakeDriver,
-    RowSpec, StaticBody,
+    BatchHandle, BatchMode, BatchRecovery, BatchRequest, ClosedJob, CountersHook, Driver, Idle,
+    MakeDriver, RowSpec, StaticBody,
 };
 pub use decode::{
     ring_eos_read, DecodeParams, DecodeSession, Decoded, LogprobRequest, PinReport, ReadbackArm,

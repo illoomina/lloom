@@ -124,6 +124,21 @@ struct NextnLane<S> {
     rows_seen: usize,
 }
 
+impl<S> NextnLane<S> {
+    /// Drop everything the lane keyed, keeping its reset counter: this is
+    /// not a `begin_at`.
+    fn forget<L: Layer<State = S>>(&mut self) {
+        L::reset_state(&mut self.state);
+        self.prompt.clear();
+        self.keyed.clear();
+        self.seeded = false;
+        self.seed_rows = 0;
+        self.draft = None;
+        self.carry = None;
+        self.rows_seen = 0;
+    }
+}
+
 /// The MTP drafter over a [`NextnHead`]: fills the seam's MTP slot for a
 /// `Decoder` target (`Probes<NextnHidden>`).
 pub struct NextnDrafter<'a, L: Layer> {
@@ -203,15 +218,7 @@ impl<'a, L: Layer> NextnDrafter<'a, L> {
     /// committed; preserved lanes must not advertise that partial prefix.
     pub fn reset_lanes(lanes: &mut NextnLanes<L::State>) {
         for lane in &mut lanes.0 {
-            L::reset_state(&mut lane.state);
-            lane.prompt.clear();
-            lane.keyed.clear();
-            lane.seeded = false;
-            lane.seed_rows = 0;
-            lane.draft = None;
-            lane.carry = None;
-            lane.rows_seen = 0;
-            // Keep the historical reset counter; this is not another begin_at.
+            lane.forget::<L>();
         }
     }
 
@@ -306,6 +313,15 @@ impl<L: Layer> Speculator for NextnDrafter<'_, L> {
 
     fn max_draft(&self) -> usize {
         self.k
+    }
+
+    /// Every lane forgets what it keyed, as [`NextnDrafter::reset_lanes`]
+    /// does for a parked drafter: a failed batch's recovery reaches the
+    /// drafter its driver holds through this call.
+    fn abort(&mut self) {
+        for lane in &mut self.lanes {
+            lane.forget::<L>();
+        }
     }
 
     fn begin(&mut self, seq: SeqId, prompt: &[u32]) -> Result<()> {

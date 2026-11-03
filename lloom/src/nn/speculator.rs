@@ -446,6 +446,12 @@ pub trait Speculator {
         }
         Ok(())
     }
+
+    /// Discard every sequence's state after a failure whose requests are
+    /// being reset, so no slot carries what a failed round left half
+    /// applied into its next `begin_at`. Nothing for a family with no state
+    /// of its own.
+    fn abort(&mut self) {}
 }
 
 /// A borrowed proposer is a proposer: a driver that owns its `S` can be
@@ -487,6 +493,9 @@ impl<T: Speculator> Speculator for &mut T {
     }
     fn observe_rows(&mut self, rows: &[ObserveRow<'_, Self::Probe>]) -> Result<()> {
         T::observe_rows(self, rows)
+    }
+    fn abort(&mut self) {
+        T::abort(self)
     }
 }
 
@@ -1356,6 +1365,25 @@ impl<'m, M: CausalLM> Session<'m, M> {
         self.seq.overrun_unwritten = false;
         self.seq.last_logits = None;
         self.seq.tokens_known = true;
+    }
+
+    /// Bring the token log level with the cache for a row a driver gives up
+    /// without retiring it (a drain after a failed step): the positions the
+    /// cache holds past the log are logged from `fed`, the ids the run fed
+    /// in feed order, and what lies beyond them is overrun, as retirement
+    /// leaves it. A log the caller never knew is left alone (`prepare`
+    /// resets it).
+    pub(crate) fn settle_fed(&mut self, fed: &[u32]) {
+        if !self.seq.tokens_known {
+            return;
+        }
+        let past = self.seq.pos.saturating_sub(self.seq.tokens.len());
+        self.seq
+            .tokens
+            .extend_from_slice(&fed[..past.min(fed.len())]);
+        self.seq.overrun = self.seq.pos - self.seq.tokens.len();
+        self.seq.overrun_unwritten = false;
+        self.seq.last_logits = None;
     }
 
     /// [`Self::prepare`], and when it finds nothing of its own to reuse, a

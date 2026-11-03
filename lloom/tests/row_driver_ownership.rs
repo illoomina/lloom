@@ -14,16 +14,21 @@
 //! The drafter proposes garbage: greedy verification accepts only the
 //! target's own argmax, so the rows' streams do not depend on it and every
 //! schedule here is about ownership, not output.
+//!
+//! A drained row's sequence is handed back with a log that says what its
+//! cache holds, on both drivers: a scheduler keeps the sequence when a
+//! failure left its state untouched (`batched-decode-design.md` §11.11).
 
 use lloom::generation::Sampling;
 use lloom::models::lfm2::{Config, ConvState, KvAppend, LayerType, Model, State};
 use lloom::models::lfm2_testing::Lfm2Tiny;
 use lloom::nn::speculator::{Draft, LayerTaps, SeqId, Speculator, TargetProbe};
-use lloom::nn::{DecodeOptions, RowDriver, RowId, Session, SpecBatchDecoder};
+use lloom::nn::{BatchDecoder, DecodeOptions, RowDriver, RowId, Session, SpecBatchDecoder};
 use lloom::profile::RewindableExact;
 use lloom::testing::tiny::{TinyCheckpoint, Weights};
 use lloom_tensor::{DType, Device, Result};
 use parking_lot::Mutex;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 const K: usize = 2;
@@ -312,5 +317,100 @@ fn every_end_of_a_row_conserves_the_drafter_slots() -> Result<()> {
             "{schedule}: slots conserved"
         );
     }
+    Ok(())
+}
+
+/// A drained row's sequence says what its cache holds: `tokens` are the ids
+/// at positions `0..pos - overrun`, and past the prompt they are the ids the
+/// row streamed and fed, in order. A caller that keeps a sequence after a
+/// failed step reads its log; a drain that dropped the lane would leave the
+/// log at the prompt while the cache holds the decoded tokens too.
+fn assert_drained_logs(
+    back: &[Row<'_>],
+    ids: &[RowId],
+    streamed: &HashMap<RowId, Vec<u32>>,
+    driver: &str,
+) {
+    assert_eq!(back.len(), ids.len(), "{driver}: every row drained");
+    for (s, id) in back.iter().zip(ids) {
+        assert_eq!(
+            s.pos(),
+            s.tokens().len() + s.overrun(),
+            "{driver}: a drained row's position is its log and its overrun"
+        );
+        let logged = &s.tokens()[PROMPT.len()..];
+        assert!(
+            !logged.is_empty(),
+            "{driver}: the fixture wants a row that fed decoded tokens"
+        );
+        let ids = &streamed[id];
+        assert_eq!(
+            logged,
+            &ids[..logged.len()],
+            "{driver}: the log past the prompt is the streamed ids, in feed order"
+        );
+    }
+}
+
+/// Step `driver` `steps` times, recording what each row streams.
+fn stream<'m, D: RowDriver<'m, Target, Row<'m>>>(
+    driver: &mut D,
+    steps: usize,
+) -> Result<HashMap<RowId, Vec<u32>>> {
+    let mut streamed: HashMap<RowId, Vec<u32>> = HashMap::new();
+    for _ in 0..steps {
+        driver.step(&mut |id, toks| {
+            streamed.entry(id).or_default().extend_from_slice(toks);
+            Ok(())
+        })?;
+    }
+    Ok(streamed)
+}
+
+#[test]
+fn a_drained_speculative_row_logs_what_its_cache_holds() -> Result<()> {
+    let f = fixture()?;
+    let (mut driver, _record) = f.driver(2)?;
+    let ids = [
+        admit(&mut driver, f.session()?, 16)?,
+        admit(&mut driver, f.session()?, 16)?,
+    ];
+    let streamed = stream(&mut driver, 3)?;
+    let back = driver.drain_rows();
+    assert_drained_logs(&back, &ids, &streamed, "the speculative loop");
+    Ok(())
+}
+
+#[test]
+fn a_drained_batched_row_logs_what_its_cache_holds() -> Result<()> {
+    let dev = Device::Cpu;
+    let mut cfg = config();
+    // The K=1 loop's batched step does not tap.
+    cfg.tap_layers.clear();
+    let model = TinyCheckpoint::<Lfm2Tiny>::new(cfg.clone(), Weights::default())
+        .with_dtype(DType::F32)
+        .model::<RewindableExact>(&dev)?;
+    let session = || -> Result<Row<'_>> {
+        Ok(Session::new(
+            &model,
+            State::<RewindableExact>::new(true, DType::F32, &cfg, &dev)?,
+        ))
+    };
+    let opts = DecodeOptions {
+        lookahead: 1,
+        ..DecodeOptions::new(64)
+    };
+    let mut driver: BatchDecoder<'_, Target, Row<'_>> =
+        BatchDecoder::new(opts, &[EOS], dev.clone())?;
+    let mut ids = Vec::new();
+    for _ in 0..2 {
+        let id = driver
+            .admit_with_eos(session()?, PROMPT.to_vec(), Sampling::ArgMax, 0, &[EOS], 16)
+            .map_err(|e| lloom_tensor::Error::msg(e.to_string()))?;
+        ids.push(id);
+    }
+    let streamed = stream(&mut driver, 3)?;
+    let back = driver.drain_rows();
+    assert_drained_logs(&back, &ids, &streamed, "the K=1 loop");
     Ok(())
 }

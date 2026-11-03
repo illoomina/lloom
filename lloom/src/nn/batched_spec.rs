@@ -225,11 +225,32 @@ where
         Ok(joined)
     }
 
-    /// One speculative round over the live rows.
+    /// One speculative round over the live rows. A failure once every row
+    /// is prepared is reported as having touched the rows, whatever the
+    /// failing call reports of its own pass: the verify opens every row's
+    /// window, and a row's position moves only after the drafter observed
+    /// it. A failure before it keeps the call's own report.
     fn round(
         &mut self,
         live: &[usize],
         on_tokens: &mut dyn FnMut(RowId, &[u32]) -> Result<()>,
+    ) -> Result<()> {
+        let mut verifying = false;
+        self.round_run(live, on_tokens, &mut verifying)
+            .map_err(|e| {
+                if verifying {
+                    e.with_state_touched(lloom_tensor::StateTouched::Yes)
+                } else {
+                    e
+                }
+            })
+    }
+
+    fn round_run(
+        &mut self,
+        live: &[usize],
+        on_tokens: &mut dyn FnMut(RowId, &[u32]) -> Result<()>,
+        verifying: &mut bool,
     ) -> Result<()> {
         let round_start_ns = self.run_start.elapsed().as_nanos() as u64;
         let seqs: Vec<SeqId> = live
@@ -273,6 +294,7 @@ where
             let sess: &mut Session<'m, M> = s.session.borrow_mut();
             model.prepare_pass(&mut sess.seq.cache, k + 1)?;
         }
+        *verifying = true;
         let mut rows: Vec<VerifyRowRef<'_, M::Cache>> = picked
             .iter_mut()
             .zip(drafts.iter())
@@ -619,12 +641,20 @@ where
         out
     }
 
+    /// Every row out, each log settled to what its cache holds
+    /// ([`Session::settle_fed`]), as [`BatchDecoder::drain_rows`] leaves
+    /// them.
+    ///
+    /// [`BatchDecoder::drain_rows`]: crate::nn::BatchDecoder::drain_rows
     fn drain_rows(&mut self) -> Vec<R> {
         let mut out = Vec::new();
         self.finished.clear();
         for i in 0..self.slots.len() {
             if let Some(mut slot) = self.slots[i].take() {
                 self.free.push(i);
+                if !slot.lane.retired {
+                    slot.session.borrow_mut().settle_fed(&slot.lane.all_ids);
+                }
                 // A retired row returned its drafter slot at its
                 // retirement: this takes nothing, rather than putting the
                 // same slot on the free list twice.
@@ -633,6 +663,10 @@ where
             }
         }
         out
+    }
+
+    fn abort(&mut self) {
+        self.spec.abort();
     }
 
     fn is_idle(&self) -> bool {

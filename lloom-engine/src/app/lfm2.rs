@@ -340,6 +340,17 @@ impl<P: Profile> crate::MakeDriver<Model<P>> for Speculators {
     }
 }
 
+/// A failed static batch drops the drafter's per-row contexts, as a failed
+/// single request's lease does (`SingleExtra::abort`); the fence is the
+/// scheduler's default.
+impl crate::BatchRecovery for Speculators {
+    fn abort(&mut self) {
+        if let Some(spec) = &mut self.spec {
+            spec.reset_contexts();
+        }
+    }
+}
+
 pub type Extra = Speculators;
 
 /// The private-sequence policy shared by initial chat and decision caches.
@@ -1879,14 +1890,7 @@ impl<P: Lfm2Shape> Engine<P> {
     }
 
     fn fence_failed_request(&self) -> Result<()> {
-        #[cfg(feature = "metal")]
-        if let Device::Metal(device) = &self.core.device {
-            let marker = device.flush_marker()?;
-            device.wait_marker_prefix_data(&marker)?;
-            return Ok(());
-        }
-        self.core.device.synchronize()?;
-        Ok(())
+        Ok(crate::recovery::fence_failed_execution(&self.core.device)?)
     }
 
     fn checkout_single(&self) -> Result<RequestLease<'_, Model<P>, SingleExtra>> {
@@ -3033,61 +3037,28 @@ impl<P: Lfm2Shape> Engine<P> {
     }
 }
 
-/// `n` sequences checked out of the pool for a closed job, reset, and the
-/// slots to return them to.
-struct TakenSessions<'m, P: Profile> {
-    sessions: Vec<Session<'m, Model<P>>>,
-    slots: Vec<usize>,
-}
-
-impl<'m, P: Profile> TakenSessions<'m, P> {
-    fn give_back(self, idle: &mut Idle<'_, 'm, Model<P>, Extra>) {
-        for (slot, mut s) in self.slots.into_iter().zip(self.sessions) {
-            s.reset();
-            idle.pool.release(slot, s.into_sequence());
-        }
-    }
-}
-
 /// Run `f` over `n` sequences checked out of the pool and reset, and put
-/// them back — reset again — whatever `f` returned: a failed cell must not
-/// cost the pool a slot. `f` may move the sessions out and back (a run
+/// them back — reset again — whatever `f` returned: a failed cell, or a pool
+/// short of `n`, must not cost the pool a slot. `f` may move the sessions out and back (a run
 /// through the scheduler's driver does), as long as it returns them all.
 fn with_sessions<'m, P: Profile, T>(
     idle: &mut Idle<'_, 'm, Model<P>, Extra>,
     n: usize,
     f: impl FnOnce(&mut Idle<'_, 'm, Model<P>, Extra>, &mut Vec<Session<'m, Model<P>>>) -> Result<T>,
 ) -> Result<T> {
-    let mut taken = take_sessions(idle, n)?;
-    let out = f(idle, &mut taken.sessions);
-    if taken.sessions.len() != taken.slots.len() {
+    let (mut sessions, slots) = idle
+        .take_reset(n)
+        .context("a closed job found the pool short of its batch")?;
+    let out = f(idle, &mut sessions);
+    if sessions.len() != slots.len() {
         return Err(anyhow::anyhow!(
             "a closed job returned {} of {} sessions; the pool has lost slots",
-            taken.sessions.len(),
-            taken.slots.len()
+            sessions.len(),
+            slots.len()
         ));
     }
-    taken.give_back(idle);
+    idle.give_back_reset(sessions, slots);
     out
-}
-
-fn take_sessions<'m, P: Profile>(
-    idle: &mut Idle<'_, 'm, Model<P>, Extra>,
-    n: usize,
-) -> Result<TakenSessions<'m, P>> {
-    let mut sessions = Vec::with_capacity(n);
-    let mut slots = Vec::with_capacity(n);
-    for _ in 0..n {
-        let (routed, seq) = idle
-            .pool
-            .acquire(&[])
-            .context("a closed job found the pool empty")?;
-        let mut s = Session::from_sequence(idle.model, seq);
-        s.reset();
-        sessions.push(s);
-        slots.push(routed.slot);
-    }
-    Ok(TakenSessions { sessions, slots })
 }
 
 /// A closed speculative run over `sessions`: THROUGH the scheduler's
@@ -3155,6 +3126,43 @@ fn static_dspark_scheduler_options(
 /// per batch — mixed sets are refused rather than served under the first
 /// row's.
 
+/// The static DSpark body's own validation: a drafter on the batch thread,
+/// a non-empty batch, every row on the argmax verify, one EOS set. It reads
+/// the row specs and writes nothing, so its refusal leaves every row's cached
+/// prefix reusable and is reported untouched (decisions 105, 124); the
+/// pipelined driver's preflight reports its own the same way.
+fn static_dspark_validate(specs: &[RowSpec], has_drafter: bool) -> lloom_tensor::Result<&RowSpec> {
+    let checked = (|| -> lloom_tensor::Result<&RowSpec> {
+        if !has_drafter {
+            lloom_tensor::bail!("no drafter on the batch thread");
+        }
+        let first = specs
+            .first()
+            .ok_or_else(|| lloom_tensor::Error::msg("an empty static batch"))?;
+        for (i, s) in specs.iter().enumerate() {
+            lloom::nn::refuse(
+                lloom::nn::Body::BatchedWindow,
+                &lloom::nn::Asks {
+                    sampling: &s.sampling,
+                    processors: false,
+                    budget: false,
+                    digest: false,
+                    logprobs: None,
+                },
+            )
+            .map_err(|e| lloom_tensor::Error::Msg(format!("row {i}: {e}")))?;
+            if s.eos_ids != first.eos_ids {
+                lloom_tensor::bail!(
+                    "row {i}: a static speculative batch runs one EOS set; this row's differs \
+                     from row 0's"
+                );
+            }
+        }
+        Ok(first)
+    })();
+    checked.map_err(|e| e.with_state_touched(lloom_tensor::StateTouched::No))
+}
+
 fn static_dspark_body<'a, 'm, P: Profile>(
     idle: &mut Idle<'a, 'm, Model<P>, Extra>,
     sessions: &mut [Session<'m, Model<P>>],
@@ -3162,33 +3170,12 @@ fn static_dspark_body<'a, 'm, P: Profile>(
     specs: &[RowSpec],
     on_tokens: &mut dyn FnMut(usize, &[u32]) -> lloom_tensor::Result<()>,
 ) -> lloom_tensor::Result<Vec<DecodeOut>> {
+    let first = static_dspark_validate(specs, idle.extra.spec.is_some())?;
     let spec = idle
         .extra
         .spec
         .as_mut()
-        .ok_or_else(|| lloom_tensor::Error::msg("no drafter on the batch thread"))?;
-    let first = specs
-        .first()
-        .ok_or_else(|| lloom_tensor::Error::msg("an empty static batch"))?;
-    for (i, s) in specs.iter().enumerate() {
-        lloom::nn::refuse(
-            lloom::nn::Body::BatchedWindow,
-            &lloom::nn::Asks {
-                sampling: &s.sampling,
-                processors: false,
-                budget: false,
-                digest: false,
-                logprobs: None,
-            },
-        )
-        .map_err(|e| lloom_tensor::Error::Msg(format!("row {i}: {e}")))?;
-        if s.eos_ids != first.eos_ids {
-            lloom_tensor::bail!(
-                "row {i}: a static speculative batch runs one EOS set; this row's differs from \
-                 row 0's"
-            );
-        }
-    }
+        .expect("checked by `static_dspark_validate`");
     let caps: Vec<usize> = specs.iter().map(|s| s.max_tokens).collect();
     Session::decode_speculative_pipelined_with_caps(
         sessions,
@@ -3849,6 +3836,42 @@ impl<P: Lfm2Shape> super::served::Served for Engine<P> {
 mod tests {
     use super::*;
     use lloom::nn::ops::KvQuant;
+
+    /// Decision 124: the static DSpark body's validation refusals (a sampled
+    /// row, mixed EOS sets, no drafter, an empty batch) are reported
+    /// untouched, so the scheduler hands each row back with its prefix; an
+    /// accepted batch returns its first row.
+    #[test]
+    fn the_static_dspark_validation_refuses_untouched() {
+        use lloom_tensor::StateTouched;
+        let row = |sampling: Sampling, eos: &[u32]| RowSpec {
+            sampling,
+            seed: 0,
+            eos_ids: eos.to_vec(),
+            max_tokens: 4,
+        };
+        let greedy = [row(Sampling::ArgMax, &[2]), row(Sampling::ArgMax, &[2])];
+        let first = static_dspark_validate(&greedy, true).expect("a greedy batch, one EOS set");
+        assert_eq!(first.eos_ids, vec![2]);
+        let sampled = [
+            row(Sampling::ArgMax, &[2]),
+            row(Sampling::All { temperature: 0.7 }, &[2]),
+        ];
+        let mixed = [row(Sampling::ArgMax, &[2]), row(Sampling::ArgMax, &[3])];
+        for (what, specs, drafter) in [
+            ("a sampled row", &sampled[..], true),
+            ("mixed EOS sets", &mixed[..], true),
+            ("no drafter", &greedy[..], false),
+            ("an empty batch", &[][..], true),
+        ] {
+            let e = static_dspark_validate(specs, drafter).expect_err(what);
+            assert_eq!(
+                e.state_touched(),
+                Some(StateTouched::No),
+                "{what}: {e} must be reported untouched"
+            );
+        }
+    }
 
     #[test]
     fn conv_carry_reads_configured_tile_and_chunk_without_legacy_fields() {

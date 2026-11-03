@@ -416,7 +416,8 @@ pub struct Engine<P: Profile> {
     /// The checkpoint is an LFM2 GGUF (`lfm2::gguf`): its capabilities are
     /// `LFM2_GGUF_CAPABILITIES`.
     pub gguf: bool,
-    /// A raw prompt (`encode` with `add_special`) starts with the BOS.
+    /// A raw prompt (`encode` with `add_special`) starts with the BOS, as
+    /// the tokenizer's metadata says (`raw_bos`).
     pub raw_bos: bool,
     /// The vision half, on a VL checkpoint.
     pub vision: Option<Vision>,

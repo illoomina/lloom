@@ -813,7 +813,8 @@ pub struct Request<'a> {
     pub kwargs: Map<String, Value>,
     /// The thinking switch.
     pub want: Option<bool>,
-    /// Encode with the checkpoint's BOS.
+    /// Encode with the tokenizer's special tokens: the BOS where the
+    /// tokenizer adds or declares one.
     pub add_bos: bool,
     /// What the rendered text becomes before it is encoded (the images'
     /// expansions).

@@ -963,7 +963,12 @@ fn run_dspark_concurrent<P: Lfm2Shape>(ctx: &Ctx<'_, P>, common: &str) -> Result
                 ctx.eos_ids,
                 &mut |_| Ok(()),
             )?;
-            live.set(i, out.ids.len(), out.stats.round_tally.rounds as usize, true);
+            live.set(
+                i,
+                out.ids.len(),
+                out.stats.round_tally.rounds as usize,
+                true,
+            );
             live.paint();
             outs.push(out);
         }
@@ -1010,7 +1015,12 @@ fn run_dspark_concurrent<P: Lfm2Shape>(ctx: &Ctx<'_, P>, common: &str) -> Result
             },
         )?;
         for (i, o) in outs.iter().enumerate() {
-            live.set(i, streams[i].len(), o.stats.round_tally.rounds as usize, true);
+            live.set(
+                i,
+                streams[i].len(),
+                o.stats.round_tally.rounds as usize,
+                true,
+            );
         }
         live.paint();
         live.finish();
@@ -2191,7 +2201,11 @@ fn run_batched_concurrent<P: Lfm2Shape>(
          gpu_busy/step {} ms, dispatches/step {:.1}; solo: {solo_steps} steps, \
          gpu_busy/step {} ms, dispatches/step {:.1}]",
         super::common::profile_metric(step_median),
-        super::common::profile_metric(batched.gpu_busy_s.map(|v| 1e3 * v / batched_steps.max(1) as f64)),
+        super::common::profile_metric(
+            batched
+                .gpu_busy_s
+                .map(|v| 1e3 * v / batched_steps.max(1) as f64)
+        ),
         batched.dispatches as f64 / batched_steps.max(1) as f64,
         super::common::profile_metric(solo.gpu_busy_s.map(|v| 1e3 * v / solo_steps.max(1) as f64)),
         solo.dispatches as f64 / solo_steps.max(1) as f64,

@@ -596,7 +596,9 @@ impl RoundTally {
     /// Rounds that accepted at least `a` tokens (the last bucket counts as
     /// at or above its index).
     pub fn at_least(&self, a: usize) -> u64 {
-        self.by_accepted[a.min(ROUND_TALLY_BUCKETS - 1)..].iter().sum()
+        self.by_accepted[a.min(ROUND_TALLY_BUCKETS - 1)..]
+            .iter()
+            .sum()
     }
 
     /// The histogram through `upto` accepted (clamped to the buckets).
@@ -606,10 +608,7 @@ impl RoundTally {
 
     /// The widest bucket a round fell in (the last is "at or above").
     pub fn widest(&self) -> usize {
-        self.by_accepted
-            .iter()
-            .rposition(|&n| n > 0)
-            .unwrap_or(0)
+        self.by_accepted.iter().rposition(|&n| n > 0).unwrap_or(0)
     }
 }
 
@@ -5239,5 +5238,40 @@ mod prepared_sample_slots_tests {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod round_tally_tests {
+    use super::{RoundTally, ROUND_TALLY_BUCKETS};
+
+    /// Decision 123: the coarse tally a release build keeps reproduces the
+    /// counts the per-round records gave — rounds, accepted total, histogram
+    /// — and folds the overflow into its last bucket.
+    #[test]
+    fn the_tally_counts_what_the_records_would() {
+        let accepted = [1usize, 3, 3, 0, 5, 1, 2, 40];
+        let mut t = RoundTally::default();
+        for &a in &accepted {
+            t.add(a);
+        }
+        assert_eq!(t.rounds, accepted.len() as u64);
+        assert_eq!(t.accepted, accepted.iter().sum::<usize>() as u64);
+        assert_eq!(t.by_accepted[3], 2);
+        assert_eq!(t.by_accepted[0], 1);
+        assert_eq!(
+            t.by_accepted[ROUND_TALLY_BUCKETS - 1],
+            1,
+            "40 lands in the last bucket"
+        );
+        assert_eq!(t.widest(), ROUND_TALLY_BUCKETS - 1);
+        assert_eq!(t.at_least(2), 5, "3, 3, 5, 2 and the overflow");
+        assert_eq!(t.at_least(0), t.rounds);
+        assert_eq!(t.hist_through(3), vec![1, 2, 1, 2]);
+        assert_eq!(
+            RoundTally::default().widest(),
+            0,
+            "an empty tally's widest is 0"
+        );
     }
 }

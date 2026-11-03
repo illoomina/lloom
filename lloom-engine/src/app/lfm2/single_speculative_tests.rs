@@ -227,10 +227,21 @@ fn actual_b1_greedy_handler_publishes_caps_and_runs_verify() -> Result<()> {
         let full = [prompt.as_slice(), &out.tokens].concat();
         if cap == 1 {
             assert!(out.stats.rounds.is_empty());
+            assert_eq!(out.stats.round_tally.rounds, 0);
             let state = exact_state(&engine, &full, 37);
             assert_eq!(state.checkpoint, Some(36));
         } else {
             assert!(!out.stats.rounds.is_empty(), "no actual verify round ran");
+            // Decision 123: the coarse tally counts the rounds the records do
+            // (these tests run with debug assertions, so both are kept).
+            assert_eq!(
+                out.stats.round_tally.rounds as usize,
+                out.stats.rounds.len()
+            );
+            assert_eq!(
+                out.stats.round_tally.accepted as usize,
+                out.stats.rounds.iter().map(|r| r.accepted).sum::<usize>()
+            );
             let pos = held(&engine, 36).pos;
             assert!((40..=41).contains(&pos), "cap4 input frontier {pos}");
             exact_state(&engine, &full, pos);

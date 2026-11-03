@@ -385,20 +385,20 @@ where
             lane.stats.round_tally.add(accepted.len());
             if timed {
                 lane.stats.rounds.push(RoundStats {
-                accepted: accepted.len(),
-                timing: RoundTiming {
-                    draft_ns,
-                    draft_readbacks,
-                    verify_enqueue_ns,
-                    verify_wait_ns,
-                    verify_ns: verify_enqueue_ns + verify_wait_ns,
-                    verify_readbacks,
-                    observe_ns,
-                    observe_readbacks,
-                    ..RoundTiming::default()
-                },
-                start_ns: round_start_ns,
-            });
+                    accepted: accepted.len(),
+                    timing: RoundTiming {
+                        draft_ns,
+                        draft_readbacks,
+                        verify_enqueue_ns,
+                        verify_wait_ns,
+                        verify_ns: verify_enqueue_ns + verify_wait_ns,
+                        verify_readbacks,
+                        observe_ns,
+                        observe_readbacks,
+                        ..RoundTiming::default()
+                    },
+                    start_ns: round_start_ns,
+                });
             }
             let id = RowId {
                 slot: i,

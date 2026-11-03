@@ -416,11 +416,12 @@ pub static TO_CPU_DEFERRED_UNDRAINED: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
 /// A readback in two halves (`DESIGN.md` §11.5z-ix item 2): `stage_readback`
-/// copies the storage into a CPU-visible buffer NOW — a blit on the current
-/// command buffer, which it commits with a marker — and `finish` waits for
+/// copies the storage into a CPU-visible buffer NOW — on the current command
+/// buffer, which it commits with a marker; a blit where Metal admits one, a
+/// compute copy otherwise (`MetalDevice::copy_bytes`) — and `finish` waits for
 /// THAT buffer alone and reads. Between the two the host may encode and
 /// commit other work (the other tile's stage, in a pipelined prefill), and
-/// `finish` does not wait for it: an in-order queue runs the blit's buffer
+/// `finish` does not wait for it: an in-order queue runs the copy's buffer
 /// first. The plain `to_cpu` waits for the queue's tail, so a readback
 /// issued after the other tile's work would wait for that work too.
 ///

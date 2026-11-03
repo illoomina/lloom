@@ -253,7 +253,7 @@ pub use custom_op::{CustomOp1, CustomOp2, CustomOp3, InplaceOp1, InplaceOp2, Inp
 pub use device::{Device, DeviceLocation, EosGateReport, EosGateSuspended, NdArray};
 pub use dtype::{DType, DTypeParseError, FloatDType, IntDType, ReadbackElement, WithDType};
 pub use dummy_dtype::{F4, F6E2M3, F6E3M2, F8E8M0};
-pub use error::{Context, Error, Result};
+pub use error::{Context, Error, Result, StateTouched};
 pub use indexer::{IndexOp, TensorIndexer};
 pub use layout::Layout;
 pub use nditer::NdIter;

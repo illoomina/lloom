@@ -51,6 +51,7 @@ pub use device::{
 };
 mod host_fed;
 mod host_slot;
+mod readback_dst;
 mod sampling_multinomial;
 mod sampling_topk;
 /// Guarded sampling primitives. Construction is explicit; no public sampling
@@ -180,6 +181,15 @@ pub static TO_CPU_SLOT: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomic
 pub static TO_CPU_STAGING_ALLOCS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+/// Stages into a caller's [`ReadbackDst`] (`stage_readback_into`), which
+/// allocate nothing.
+pub static TO_CPU_DST_LEASED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Stages into a [`ReadbackDst`] whose previous copy was never finished: the
+/// new copy is ordered after it by the queue's encoder fences, not by a wait.
+pub static TO_CPU_DST_ORDERED_REUSE: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 /// Every readback counter at once, since process start.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ReadbackCounts {
@@ -203,6 +213,11 @@ pub struct ReadbackCounts {
     pub slot: u64,
     /// Staging buffers allocated for readbacks.
     pub staging_allocs: u64,
+    /// Stages into a caller's destination.
+    pub dst_leased: u64,
+    /// Of `dst_leased`, the stages into a destination still in flight from an
+    /// unfinished stage.
+    pub dst_ordered_reuse: u64,
 }
 
 /// [`ReadbackCounts`] now.
@@ -218,6 +233,8 @@ pub fn readback_counts() -> ReadbackCounts {
         deferred_undrained: TO_CPU_DEFERRED_UNDRAINED.load(Relaxed),
         slot: TO_CPU_SLOT.load(Relaxed),
         staging_allocs: TO_CPU_STAGING_ALLOCS.load(Relaxed),
+        dst_leased: TO_CPU_DST_LEASED.load(Relaxed),
+        dst_ordered_reuse: TO_CPU_DST_ORDERED_REUSE.load(Relaxed),
     }
 }
 
@@ -234,6 +251,8 @@ impl ReadbackCounts {
             deferred_undrained: self.deferred_undrained - before.deferred_undrained,
             slot: self.slot - before.slot,
             staging_allocs: self.staging_allocs - before.staging_allocs,
+            dst_leased: self.dst_leased - before.dst_leased,
+            dst_ordered_reuse: self.dst_ordered_reuse - before.dst_ordered_reuse,
         }
     }
 }
@@ -301,6 +320,7 @@ pub fn readback_sites() -> Vec<(&'static str, String, u64)> {
 }
 
 pub use crate::dtype::ReadbackElement;
+pub use readback_dst::{ReadbackDst, ReadbackDstCache, ReadbackDstLease, ReadbackDstStats};
 
 /// Refuse reading `count` elements of `T` out of a stage of `dtype` covering
 /// `staged` bytes, before any byte is touched.
@@ -401,8 +421,11 @@ pub static TO_CPU_DEFERRED_UNDRAINED: std::sync::atomic::AtomicU64 =
 /// `finish` does not wait for it: an in-order queue runs the blit's buffer
 /// first. The plain `to_cpu` waits for the queue's tail, so a readback
 /// issued after the other tile's work would wait for that work too.
-pub struct StagedReadback {
-    buffer: BufferHandle,
+///
+/// A stage into the caller's [`ReadbackDst`] borrows it exclusively until
+/// `finish`; one that allocated its own destination is `'static`.
+pub struct StagedReadback<'a> {
+    dst: StagedDst<'a>,
     /// The recording the copy was encoded into, pinned under the encoder's
     /// guard. A committed stage holds the marker its own cut returned; a
     /// deferred one (`stage_readback_deferred`) holds the recording left
@@ -414,7 +437,30 @@ pub struct StagedReadback {
     device: MetalDevice,
 }
 
-impl StagedReadback {
+/// Where a stage's copy lands.
+enum StagedDst<'a> {
+    /// A buffer the stage allocated for itself.
+    Owned(BufferHandle),
+    /// The caller's destination, which only a successful `finish` returns
+    /// to ready (`ReadbackDst`'s custody).
+    Leased(&'a mut ReadbackDst),
+}
+
+impl StagedDst<'_> {
+    fn buffer(&self) -> &BufferHandle {
+        match self {
+            Self::Owned(buffer) => buffer,
+            Self::Leased(dst) => dst.buffer(),
+        }
+    }
+}
+
+impl StagedReadback<'_> {
+    /// Whether the copy's recording has completed — a marker query, no wait.
+    pub fn is_complete(&self) -> bool {
+        self.device.marker_complete(&self.marker)
+    }
+
     /// Wait for the copy's recording and read it. `T` must be the staged
     /// dtype's element type; anything else is refused before any wait.
     ///
@@ -467,7 +513,11 @@ impl StagedReadback {
         // Completed: the data-readiness and error check, no wait.
         self.device.wait_marker(&self.marker)?;
         TO_CPU_STAGED_READBACK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        read_to_vec(&self.buffer, self.count)
+        let read = read_to_vec(self.dst.buffer(), self.count)?;
+        if let StagedDst::Leased(dst) = self.dst {
+            dst.settle();
+        }
+        Ok(read)
     }
 }
 
@@ -476,30 +526,35 @@ impl StagedReadback {
 /// (the host plan's, at decode), so the stage costs no command-buffer cut.
 /// [`StagedReadback::finish`] checks that recording's completion: after the
 /// drain it reads with no wait; before it, it waits (`finish`).
-pub fn stage_readback_deferred(t: &crate::Tensor) -> Result<StagedReadback> {
+pub fn stage_readback_deferred(t: &crate::Tensor) -> Result<StagedReadback<'static>> {
     stage_readback_with(t, false, None)
 }
 
 /// Stage the readback of a contiguous Metal tensor (`StagedReadback`).
-pub fn stage_readback(t: &crate::Tensor) -> Result<StagedReadback> {
+pub fn stage_readback(t: &crate::Tensor) -> Result<StagedReadback<'static>> {
     stage_readback_with(t, true, None)
 }
 
-/// [`stage_readback`] into `dst`, a Shared buffer the caller keeps across
-/// readbacks (`MetalDevice::new_persistent_shared`) of at least the tensor's
-/// bytes, so a per-step readback asks no pool for its destination. The
-/// buffer's only GPU access is this copy's write and the host reads it after
-/// [`StagedReadback::finish`] has waited, so the next stage into it is
-/// ordered after that read by program order.
-pub fn stage_readback_into(t: &crate::Tensor, dst: &BufferHandle) -> Result<StagedReadback> {
+/// [`stage_readback`] into `dst`, the caller's own destination of at least
+/// the tensor's bytes, so a per-step readback asks no pool for one. The stage
+/// borrows `dst` until [`StagedReadback::finish`]: no second stage, and no
+/// other writer, can reach it meanwhile ([`ReadbackDst`]).
+///
+/// The tensor must be on `dst`'s queue. A destination still in flight from
+/// an unfinished stage is reused only there, where the encoder fences order
+/// this copy after the pending one; another queue is refused.
+pub fn stage_readback_into<'a>(
+    t: &crate::Tensor,
+    dst: &'a mut ReadbackDst,
+) -> Result<StagedReadback<'a>> {
     stage_readback_with(t, true, Some(dst))
 }
 
-fn stage_readback_with(
+fn stage_readback_with<'a>(
     t: &crate::Tensor,
     commit: bool,
-    dst: Option<&BufferHandle>,
-) -> Result<StagedReadback> {
+    dst: Option<&'a mut ReadbackDst>,
+) -> Result<StagedReadback<'a>> {
     let (storage, layout) = t.storage_and_layout();
     let m = match &*storage {
         crate::Storage::Metal(m) => m,
@@ -511,37 +566,11 @@ fn stage_readback_with(
     let count = layout.shape().elem_count();
     let elem = m.dtype.size_in_bytes();
     let size = count * elem;
-    // The copy's destination is read by the host, never by a later
-    // dispatch: outside any pass plan (§9.2aa).
-    let buffer = match dst {
-        Some(d) => {
-            if d.length() < size || unsafe { d.contents() }.is_null() {
-                crate::bail!(
-                    "stage_readback_into: a {}-byte destination for {size} bytes, or not host-visible",
-                    d.length()
-                )
-            }
-            note_readback("stage_readback_into");
-            d.clone()
-        }
-        None => {
-            TO_CPU_STAGING_ALLOCS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            note_readback("stage_readback");
-            let _escape = EscapeGuard::new();
-            m.device
-                .new_buffer_builder()
-                .with_size(size.max(1))
-                .with_label("staged_readback_dst")
-                .build()?
-        }
-    };
-    // A deferred stage pins the recording it encoded into, under the
-    // encoder's guard; a committed one takes the marker of its own cut.
-    let pinned = if m.device.base_mode() {
-        // Under a pass plan a blit is outside the compute barrier chain
-        // (`pass-plan-design.md` §9): the copy is a compute kernel, ordered
-        // like any dispatch.
-        let kernel_name = match m.dtype {
+    // Under a pass plan a blit is outside the compute barrier chain
+    // (`pass-plan-design.md` §9): the copy is a compute kernel, ordered
+    // like any dispatch.
+    let copy2d = if m.device.base_mode() {
+        Some(match m.dtype {
             DType::F32 => crate::kernels::copy2d::FLOAT,
             DType::F16 => crate::kernels::copy2d::HALF,
             DType::BF16 => crate::kernels::copy2d::BFLOAT,
@@ -551,7 +580,47 @@ fn stage_readback_with(
             DType::U32 => crate::kernels::copy2d::U32,
             DType::U8 => crate::kernels::copy2d::U8,
             dtype => crate::bail!("stage_readback: Metal copy2d {dtype:?} not implemented"),
-        };
+        })
+    } else {
+        None
+    };
+    // The copy's destination is read by the host, never by a later
+    // dispatch: outside any pass plan (§9.2aa).
+    let dst = match dst {
+        Some(d) => {
+            if !d.serves(&m.device) {
+                crate::bail!("stage_readback_into: the destination belongs to another queue")
+            }
+            if d.capacity() < size {
+                crate::bail!(
+                    "stage_readback_into: a {}-byte destination for {size} bytes",
+                    d.capacity()
+                )
+            }
+            note_readback("stage_readback_into");
+            TO_CPU_DST_LEASED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if d.claim() {
+                TO_CPU_DST_ORDERED_REUSE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            StagedDst::Leased(d)
+        }
+        None => {
+            TO_CPU_STAGING_ALLOCS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            note_readback("stage_readback");
+            let _escape = EscapeGuard::new();
+            StagedDst::Owned(
+                m.device
+                    .new_buffer_builder()
+                    .with_size(size.max(1))
+                    .with_label("staged_readback_dst")
+                    .build()?,
+            )
+        }
+    };
+    let buffer = dst.buffer();
+    // A deferred stage pins the recording it encoded into, under the
+    // encoder's guard; a committed one takes the marker of its own cut.
+    let pinned = if let Some(kernel_name) = copy2d {
         let encoder = m.device.command_encoder()?;
         // SAFETY: storage-owned buffers (binding authority, module head).
         unsafe {
@@ -561,7 +630,7 @@ fn stage_readback_with(
                 &m.device.kernels,
                 kernel_name,
                 &m.buffer,
-                &buffer,
+                buffer,
                 1,
                 count,
                 count,
@@ -576,7 +645,7 @@ fn stage_readback_with(
         let mut blit = m.device.blit_command_encoder()?;
         blit.set_label("staged_readback");
         // SAFETY: storage-owned buffers (binding authority, module head).
-        unsafe { blit.copy_from_buffer(&m.buffer, layout.start_offset() * elem, &buffer, 0, size) };
+        unsafe { blit.copy_from_buffer(&m.buffer, layout.start_offset() * elem, buffer, 0, size) };
         if commit {
             None
         } else {
@@ -588,7 +657,7 @@ fn stage_readback_with(
         None => m.device.flush_marker()?,
     };
     Ok(StagedReadback {
-        buffer,
+        dst,
         marker,
         deferred: !commit,
         count,
@@ -3181,7 +3250,7 @@ impl MetalStorage {
     /// function takes `objc_msgSend`'s result straight to a load with no branch
     /// on it. Without `black_box` this function would read a null pointer in
     /// exactly the configuration that ships.
-    pub(crate) fn peek_cpu<T: Clone>(&self) -> Option<Vec<T>> {
+    pub(crate) fn peek_cpu<T: ReadbackElement>(&self) -> Option<Vec<T>> {
         // NOTE: this body reaches NOTHING that waits on, drains, or otherwise
         // orders against the GPU -- no completion wait, no queue drain, no
         // command-buffer status read. That is the entire contract, and it is
@@ -3190,15 +3259,20 @@ impl MetalStorage {
         // there rather than here, so the gate's needles cannot match this
         // comment -- which the gate's own first run demonstrated by tripping on
         // the sentence that used to be here.
+        if T::DTYPE != self.dtype {
+            return None;
+        }
         let src = std::hint::black_box(unsafe { self.buffer.contents() });
         if src.is_null() {
             PEEK_UNMAPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return None;
         }
+        check_mapped_span::<T>(src as usize, self.buffer.length(), self.count).ok()?;
         PEEK_HIT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // SAFETY: `src` is non-null and CPU-mapped, `self.buffer` keeps the
-        // allocation alive for the length of this borrow, and `self.count`
-        // elements of `T` is the extent this storage was created with.
+        // allocation alive for the length of this borrow, the mapping is
+        // aligned for `T` and covers `self.count` of them (checked above),
+        // and every bit pattern is a valid `T` (`ReadbackElement`).
         //
         // The GPU may be writing this range concurrently, which is the point.
         // That is a data race in the C++ sense and it is what the hardware is
@@ -4127,6 +4201,37 @@ mod staged_read_checks {
         width::<f32>();
         width::<f64>();
         width::<float8::F8E4M3>();
+    }
+}
+
+#[cfg(test)]
+mod peek_cpu_checks {
+    //! `peek_cpu` reads a storage only as its own element type.
+    use crate::{Device, Storage, Tensor};
+
+    #[test]
+    fn a_peek_as_another_element_of_the_same_width_is_refused() {
+        let dev = Device::new_metal(0).unwrap();
+        let want: Vec<u8> = (1..=64).collect();
+        let t = Tensor::from_vec(want.clone(), 64, &dev).unwrap();
+        let (storage, _) = t.storage_and_layout();
+        let Storage::Metal(s) = &*storage else {
+            unreachable!("a Metal tensor")
+        };
+        s.device.flush_and_wait_current().unwrap();
+        // The positive arm first: a mapped storage peeks as its own element.
+        assert_eq!(
+            s.peek_cpu::<u8>(),
+            Some(want),
+            "the U8 storage did not peek"
+        );
+        // F8E4M3 is U8's width, so only the dtype check can refuse it.
+        assert_eq!(
+            s.peek_cpu::<float8::F8E4M3>(),
+            None,
+            "peeked U8 bytes as F8E4M3"
+        );
+        assert_eq!(s.peek_cpu::<u32>(), None, "peeked U8 bytes as u32");
     }
 }
 
@@ -5098,7 +5203,7 @@ mod issue_535_peek_is_not_blocking {
     /// counters, same contract, so the same mutation (M4) applies to it and it
     /// needs the same gate rather than inheriting one by source position.
     const NON_BLOCKING: &[&str] = &[
-        "peek_cpu<T: Clone>",
+        "peek_cpu<T: ReadbackElement>",
         "peek_scalar<T: Copy>",
         "peek_scalar_ptr<T: Copy>",
     ];

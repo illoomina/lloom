@@ -928,7 +928,7 @@ pub fn hint_recall_probe() -> bool {
 
 /// A staged readback of a routing's ids (Metal); nothing elsewhere.
 #[cfg(feature = "metal")]
-pub type StagedIds = lloom_tensor::metal_backend::StagedReadback;
+pub type StagedIds = lloom_tensor::metal_backend::StagedReadback<'static>;
 #[cfg(not(feature = "metal"))]
 pub type StagedIds = ();
 

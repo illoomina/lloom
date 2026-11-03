@@ -1951,7 +1951,7 @@ pub struct Qwen4Exp<P: Profile, R: ExpertResidency> {
     /// Shared buffer rather than a pool buffer per step (`DESIGN.md` §9.2aa):
     /// grown to the largest record set, kept for the model's life.
     #[cfg(feature = "metal")]
-    settle_dst: parking_lot::Mutex<Option<lloom_tensor::kernels::metal::BufferHandle>>,
+    settle_dst: lloom_tensor::metal_backend::ReadbackDstCache,
     /// A one-row decode step's replay input, in memory the model owns rather
     /// than a pool buffer per step (`replay_input_owned`), and the epoch of
     /// the command buffer its last reader was encoded into — two, alternating
@@ -2100,7 +2100,7 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
             #[cfg(feature = "metal")]
             pending: parking_lot::Mutex::new(std::collections::VecDeque::new()),
             #[cfg(feature = "metal")]
-            settle_dst: parking_lot::Mutex::new(None),
+            settle_dst: Default::default(),
             #[cfg(feature = "metal")]
             replay_h: parking_lot::Mutex::new(ReplayInputs::default()),
             #[cfg(feature = "metal")]
@@ -4383,22 +4383,8 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
     /// it; `to_vec1` elsewhere. The same bytes either way.
     fn read_records(&self, t: &Tensor) -> Result<Vec<u32>> {
         #[cfg(feature = "metal")]
-        if let Ok(m) = t.device().as_metal_device() {
-            let t = t.contiguous()?;
-            let bytes = t.elem_count() * std::mem::size_of::<u32>();
-            let dst = {
-                let mut g = self.settle_dst.lock();
-                match g.as_ref() {
-                    Some(b) if b.length() >= bytes => b.clone(),
-                    _ => {
-                        let _declared = lloom_tensor::EscapeGuard::new();
-                        let b = m.new_persistent_shared(bytes)?;
-                        *g = Some(b.clone());
-                        b
-                    }
-                }
-            };
-            return lloom_tensor::metal_backend::stage_readback_into(&t, &dst)?.finish();
+        if t.device().is_metal() {
+            return self.settle_dst.read::<u32>(&t.contiguous()?);
         }
         t.to_vec1()
     }

@@ -2,12 +2,14 @@
 //! `StagedMetalRead`): a typed read must name the staged dtype's element and
 //! is refused before any wait or byte read otherwise; a deferred stage reads
 //! only bytes its own recording wrote, with no wait and no cut once a drain
-//! has completed it, and an error when that recording never ran.
+//! has completed it, and an error when that recording never ran. A stage
+//! into a `ReadbackDst` keeps custody of its copy until a successful finish,
+//! and a `ReadbackDstCache` returns its destination on every path.
 #![cfg(feature = "metal")]
 use half::{bf16, f16};
 use lloom_tensor::metal_backend::{
     readback_counts, stage_readback, stage_readback_deferred, stage_readback_into, HostEvent,
-    ReadbackElement,
+    ReadbackDstCache, ReadbackDstStats, ReadbackElement,
 };
 use lloom_tensor::{DType, Device, MetalDevice, StagedRead, Tensor};
 
@@ -32,11 +34,17 @@ fn every_route_reads_back<T: ReadbackElement + std::fmt::Debug>(dev: &Device, m:
     assert_eq!(t.dtype(), T::DTYPE);
     let got: Vec<T> = stage_readback(&t).unwrap().finish().unwrap();
     assert_eq!(got, want, "{:?} stage_readback", T::DTYPE);
-    let dst = m
-        .new_persistent_shared(n * T::DTYPE.size_in_bytes())
-        .unwrap();
-    let got: Vec<T> = stage_readback_into(&t, &dst).unwrap().finish().unwrap();
+    let mut dst = m.new_readback_dst(n * T::DTYPE.size_in_bytes()).unwrap();
+    let got: Vec<T> = stage_readback_into(&t, &mut dst).unwrap().finish().unwrap();
     assert_eq!(got, want, "{:?} stage_readback_into", T::DTYPE);
+    assert!(
+        !dst.in_flight(),
+        "{:?} a finished stage kept custody",
+        T::DTYPE
+    );
+    let cache = ReadbackDstCache::default();
+    let got: Vec<T> = cache.read(&t).unwrap();
+    assert_eq!(got, want, "{:?} ReadbackDstCache::read", T::DTYPE);
     let st = stage_readback_deferred(&t).unwrap();
     m.flush_and_wait_current().unwrap();
     let got: Vec<T> = st.finish().unwrap();
@@ -181,4 +189,258 @@ fn a_deferred_stage_whose_recording_was_cancelled_fails_with_its_reason() {
     let y = t.affine(1.0, 1.0).unwrap();
     let back = y.to_vec1::<f32>().unwrap();
     assert_eq!(back[0], values::<f32>(1)[0] + 1.0);
+}
+
+fn u32s(n: usize, base: u32) -> Vec<u32> {
+    (0..n as u32).map(|i| base + i).collect()
+}
+
+fn stats(created: u64, grown: u64, reused: u64, busy: u64, foreign: u64) -> ReadbackDstStats {
+    ReadbackDstStats {
+        created,
+        grown,
+        reused,
+        busy,
+        foreign,
+    }
+}
+
+/// A finished stage returns the destination ready; a dropped one and one
+/// finished with an error keep custody, and the next stage into it is the
+/// ordered kind and reads its own values.
+#[test]
+fn a_destination_stays_in_flight_until_a_stage_finishes() {
+    let (dev, m) = metal();
+    let a = Tensor::from_vec(u32s(256, 1000), 256, &dev).unwrap();
+    let b = Tensor::from_vec(u32s(256, 5000), 256, &dev).unwrap();
+    let c = Tensor::from_vec(u32s(256, 9000), 256, &dev).unwrap();
+    m.flush_and_wait_current().unwrap();
+    let mut dst = m.new_readback_dst(1024).unwrap();
+    assert!(!dst.in_flight());
+
+    let before = readback_counts();
+    let got: Vec<u32> = stage_readback_into(&a, &mut dst).unwrap().finish().unwrap();
+    assert_eq!(got, u32s(256, 1000));
+    assert!(!dst.in_flight(), "a finished stage kept custody");
+
+    // Dropped unfinished.
+    drop(stage_readback_into(&b, &mut dst).unwrap());
+    assert!(
+        dst.in_flight(),
+        "a dropped stage returned its destination ready"
+    );
+
+    // Finished with an error, before any wait.
+    let refused = stage_readback_into(&b, &mut dst).unwrap().finish::<f32>();
+    assert!(refused.is_err(), "{refused:?}");
+    assert!(
+        dst.in_flight(),
+        "a failed finish returned its destination ready"
+    );
+
+    let got: Vec<u32> = stage_readback_into(&c, &mut dst).unwrap().finish().unwrap();
+    let after = readback_counts().since(&before);
+    eprintln!("DST_CUSTODY {after:?}");
+    assert_eq!(
+        got,
+        u32s(256, 9000),
+        "the ordered stage read another copy's bytes"
+    );
+    assert!(!dst.in_flight());
+    assert_eq!(after.dst_leased, 4, "a, b dropped, b refused, c");
+    assert_eq!(
+        after.dst_ordered_reuse, 2,
+        "the two stages after an unfinished one"
+    );
+    assert_eq!(
+        after.staging_allocs, 0,
+        "a stage into the destination allocated"
+    );
+}
+
+/// The ordering an in-flight destination is reused under: the first copy is
+/// held behind a host event and dropped unfinished, a second is staged into
+/// the same destination, and once the event is raised the second's finish
+/// reads the second's values, never the first's.
+#[test]
+fn a_copy_into_an_in_flight_destination_lands_after_the_pending_one() {
+    let (dev, m) = metal();
+    let first = Tensor::from_vec(u32s(4096, 1), 4096, &dev).unwrap();
+    let second = Tensor::from_vec(u32s(4096, 70_000), 4096, &dev).unwrap();
+    m.flush_and_wait_current().unwrap();
+    let mut dst = m.new_readback_dst(4096 * 4).unwrap();
+    let event = HostEvent::new(&m).unwrap();
+    event.commit_when_produced(1).unwrap();
+    let before = readback_counts();
+    let held = stage_readback_into(&first, &mut dst).unwrap();
+    assert!(
+        !held.is_complete(),
+        "the first copy ran: the control is vacuous"
+    );
+    drop(held);
+    assert!(dst.in_flight());
+    let st = stage_readback_into(&second, &mut dst).unwrap();
+    assert!(!st.is_complete(), "the second copy ran before the event");
+    event.signal(1);
+    let got: Vec<u32> = st.finish().unwrap();
+    let after = readback_counts().since(&before);
+    eprintln!(
+        "DST_ORDERED arm={:?} {after:?} first={:?}",
+        m.commands().host_input_arm(),
+        &got[..2]
+    );
+    assert_eq!(
+        got,
+        u32s(4096, 70_000),
+        "the pending copy landed after the new one"
+    );
+    assert_eq!(after.dst_ordered_reuse, 1);
+    assert!(!dst.in_flight());
+}
+
+/// A tensor on another queue is refused, whatever the custody, and the
+/// destination is unchanged by the refusal.
+#[test]
+fn a_tensor_on_another_queue_is_refused() {
+    let (dev, m) = metal();
+    let (dev2, m2) = metal();
+    assert_ne!(m.id(), m2.id(), "two devices share one queue");
+    let mine = Tensor::from_vec(u32s(64, 3), 64, &dev).unwrap();
+    let theirs = Tensor::from_vec(u32s(64, 300), 64, &dev2).unwrap();
+    let mut dst = m.new_readback_dst(256).unwrap();
+    let refused = stage_readback_into(&theirs, &mut dst).map(|_| ());
+    eprintln!("DST_FOREIGN {refused:?}");
+    assert!(
+        refused
+            .as_ref()
+            .is_err_and(|e| e.to_string().contains("another queue")),
+        "{refused:?}"
+    );
+    assert!(!dst.in_flight(), "a refused stage took custody");
+    let got: Vec<u32> = stage_readback_into(&mine, &mut dst)
+        .unwrap()
+        .finish()
+        .unwrap();
+    assert_eq!(got, u32s(64, 3));
+}
+
+/// The cache, through one sequence of requests: cold creation, reuse, a stage
+/// error and a finish error (each returning the destination, the next
+/// request reusing it), growth, a busy request (a lease held open) and a
+/// request from another queue (each served by a buffer of its own, the
+/// cached destination kept), and an unwind with a lease out.
+/// Past any page rounding of the first destination, so the cache must grow.
+const LARGE: usize = 65536;
+
+#[test]
+fn the_cache_returns_its_destination_on_every_path() {
+    let (dev, m) = metal();
+    let (dev2, _m2) = metal();
+    let small = Tensor::from_vec(u32s(64, 10), 64, &dev).unwrap();
+    let small2 = Tensor::from_vec(u32s(64, 20), 64, &dev).unwrap();
+    let large = Tensor::from_vec(u32s(LARGE, 30), LARGE, &dev).unwrap();
+    let skewed = Tensor::from_vec(u32s(64, 40), (8, 8), &dev)
+        .unwrap()
+        .t()
+        .unwrap();
+    let theirs = Tensor::from_vec(u32s(64, 50), 64, &dev2).unwrap();
+    m.flush_and_wait_current().unwrap();
+    let cache = ReadbackDstCache::default();
+    let allocs = |before: &lloom_tensor::metal_backend::ReadbackCounts| {
+        readback_counts().since(before).staging_allocs
+    };
+
+    // Cold: the first destination is made and cached.
+    let before = readback_counts();
+    assert_eq!(cache.read::<u32>(&small).unwrap(), u32s(64, 10));
+    assert_eq!(cache.stats(), stats(1, 0, 0, 0, 0));
+    // Warm: the same destination.
+    assert_eq!(cache.read::<u32>(&small2).unwrap(), u32s(64, 20));
+    assert_eq!(cache.stats(), stats(1, 0, 1, 0, 0));
+    assert_eq!(
+        allocs(&before),
+        0,
+        "a cached read allocated a staging buffer"
+    );
+
+    // A stage error (a non-contiguous tensor), then the next request.
+    assert!(!skewed.is_contiguous());
+    let refused = cache.read::<u32>(&skewed);
+    assert!(refused.is_err(), "{refused:?}");
+    assert_eq!(cache.read::<u32>(&small).unwrap(), u32s(64, 10));
+    assert_eq!(
+        cache.stats(),
+        stats(1, 0, 3, 0, 0),
+        "a stage error lost the destination"
+    );
+
+    // A finish error (another element), then the next request.
+    let before = readback_counts();
+    let refused = cache.read::<f32>(&small2);
+    assert!(refused.is_err(), "{refused:?}");
+    assert_eq!(cache.read::<u32>(&small2).unwrap(), u32s(64, 20));
+    let after = readback_counts().since(&before);
+    assert_eq!(
+        cache.stats(),
+        stats(1, 0, 5, 0, 0),
+        "a finish error lost the destination"
+    );
+    assert_eq!(
+        after.dst_ordered_reuse, 1,
+        "the failed finish's copy was not in flight"
+    );
+    assert_eq!(after.staging_allocs, 0);
+
+    // Growth.
+    assert_eq!(cache.read::<u32>(&large).unwrap(), u32s(LARGE, 30));
+    assert_eq!(cache.stats(), stats(1, 1, 5, 0, 0));
+    assert_eq!(cache.read::<u32>(&small).unwrap(), u32s(64, 10));
+    assert_eq!(
+        cache.stats(),
+        stats(1, 1, 6, 0, 0),
+        "a smaller read after growth"
+    );
+
+    // Busy: a lease held open; the request gets a buffer of its own, and the
+    // cached destination is the one returned, not replaced.
+    let before = readback_counts();
+    {
+        let mut lease = cache.lease(&m, 256).unwrap().expect("an idle cache lends");
+        assert!(lease.dst_mut().capacity() >= LARGE * 4);
+        assert_eq!(cache.read::<u32>(&small2).unwrap(), u32s(64, 20));
+        assert!(cache.lease(&m, 256).unwrap().is_none(), "two leases out");
+    }
+    assert_eq!(
+        allocs(&before),
+        1,
+        "the busy request did not stage on its own"
+    );
+    assert_eq!(cache.stats(), stats(1, 1, 7, 2, 0));
+    assert_eq!(cache.read::<u32>(&large).unwrap(), u32s(LARGE, 30));
+    assert_eq!(
+        cache.stats(),
+        stats(1, 1, 8, 2, 0),
+        "the busy fallback replaced the cache"
+    );
+
+    // Another queue: served by a buffer of its own; the cache is kept.
+    assert_eq!(cache.read::<u32>(&theirs).unwrap(), u32s(64, 50));
+    assert_eq!(cache.stats(), stats(1, 1, 8, 2, 1));
+    assert_eq!(cache.read::<u32>(&small).unwrap(), u32s(64, 10));
+    assert_eq!(cache.stats(), stats(1, 1, 9, 2, 1));
+
+    // An unwind with a lease out returns it.
+    let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _lease = cache.lease(&m, 256).unwrap();
+        panic!("test: unwinding with a lease out");
+    }));
+    assert!(unwound.is_err());
+    assert_eq!(cache.read::<u32>(&small2).unwrap(), u32s(64, 20));
+    let end = cache.stats();
+    eprintln!("CACHE_PATHS {end:?}");
+    assert_eq!(
+        end,
+        stats(1, 1, 11, 2, 1),
+        "the unwind lost the destination"
+    );
 }

@@ -1,5 +1,6 @@
 pub mod bounded;
 pub mod cpu_flash;
+pub(crate) mod flash_validation;
 pub mod route;
 pub mod varlen;
 

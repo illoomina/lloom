@@ -14,6 +14,7 @@ enum BufferRole {
     Native {
         raw: AllocationLease<Retained<ProtocolObject<dyn MTLBuffer>>>,
         membership: Option<super::membership::Membership>,
+        bytes: usize,
     },
     // Private only in rich HeaderRoot C; its genuine strong borrow spans every
     // returned &Buffer. Clone/view NEVER returns another Primary role.
@@ -219,9 +220,14 @@ impl Buffer {
     }
     pub fn try_clone(&self) -> Result<Self, AllocationError> {
         let role = match &self.role {
-            BufferRole::Native { raw, membership } => BufferRole::Native {
+            BufferRole::Native {
+                raw,
+                membership,
+                bytes,
+            } => BufferRole::Native {
                 raw: raw.clone(),
                 membership: membership.clone(),
+                bytes: *bytes,
             },
             // This role is reachable only through a genuine rich strong borrow;
             // no service/descriptor/raw baseline can publicly mint a Primary.
@@ -264,10 +270,12 @@ impl Buffer {
         let cpu_visible = raw.storageMode() != objc2_metal::MTLStorageMode::Private
             || (crate::tuning::tuning().metal.private_cpu_mapping && raw.heap().is_none());
         super::arena::note_new_buffer(Retained::as_ptr(&raw) as usize);
+        let bytes = raw.length();
         Buffer {
             role: BufferRole::Native {
                 raw: AllocationLease::new(raw, owner),
                 membership: None,
+                bytes,
             },
             base_offset: 0,
             length: None,
@@ -337,9 +345,14 @@ impl Buffer {
         )
         .expect("invalid Buffer::view range");
         let role = match &self.role {
-            BufferRole::Native { raw, membership } => BufferRole::Native {
+            BufferRole::Native {
+                raw,
+                membership,
+                bytes,
+            } => BufferRole::Native {
                 raw: raw.clone(),
                 membership: membership.clone(),
+                bytes: *bytes,
             },
             BufferRole::Primary(physical) => {
                 let pin = unsafe { NativeUse::from_buffer_primary(physical) }
@@ -485,7 +498,8 @@ impl Buffer {
         self.raw_ptr() as usize
     }
 
-    /// Bytes this handle addresses.
+    /// Bytes this handle addresses, authenticated at native birth or view creation.
+    /// This reads cached metadata, never a native SDK getter on the bind path.
     ///
     /// A view reports its slot's extent, not the arena's. `fill_buffer` and
     /// `copy_from_buffer` both take `buffer.length()` as a range, so reporting
@@ -496,7 +510,7 @@ impl Buffer {
         match self.length {
             Some(len) => len,
             None => match &self.role {
-                BufferRole::Native { raw, .. } => raw.raw().length(),
+                BufferRole::Native { bytes, .. } => *bytes,
                 BufferRole::Primary(physical) => physical.bytes(),
                 BufferRole::External(pin) => pin.length(),
             },
@@ -678,5 +692,106 @@ mod issue_454_guard_shape {
                  deliberate, re-read the disassembly rather than the source."
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod native_extent_tests {
+    use super::super::{BufferHandle, Device, PooledBuffer};
+    use super::*;
+
+    #[test]
+    fn buffer_layout_receipt_requires_no_native_allocation() {
+        use std::mem::{align_of, size_of};
+        eprintln!(
+            "BUFFER_LAYOUT pointer={} role_size={} role_align={} buffer_size={} buffer_align={} native_lease_size={} view_option_size={}",
+            size_of::<usize>(), size_of::<BufferRole>(), align_of::<BufferRole>(),
+            size_of::<Buffer>(), align_of::<Buffer>(),
+            size_of::<AllocationLease<Retained<ProtocolObject<dyn MTLBuffer>>>>(),
+            size_of::<Option<usize>>(),
+        );
+        assert!(size_of::<Buffer>() >= size_of::<BufferRole>());
+    }
+
+    #[test]
+    fn native_clone_and_nested_views_retain_authenticated_extents() {
+        let device =
+            Device::system_default().expect("Metal device required for native extent control");
+        let whole = device
+            .new_buffer(256, MTLResourceOptions::StorageModeShared)
+            .expect("tiny native extent allocation");
+        assert_eq!(whole.length(), whole.native_ref().length());
+        assert_eq!(whole.length(), 256);
+        assert!(!whole.is_view());
+        let cloned = whole.try_clone().expect("native clone");
+        assert_eq!(cloned.length(), 256);
+        assert!(!cloned.is_view());
+        let view = cloned.view(32, 128);
+        assert!(view.is_view());
+        assert_eq!((view.base_offset(), view.length()), (32, 128));
+        let nested = view.view(16, 64);
+        assert_eq!((nested.base_offset(), nested.length()), (48, 64));
+        let nested_clone = nested.try_clone().expect("nested view clone");
+        assert_eq!(
+            (nested_clone.base_offset(), nested_clone.length()),
+            (48, 64)
+        );
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| nested.view(64, 1))).is_err()
+        );
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+            || whole.view(usize::MAX, 2)
+        ))
+        .is_err());
+    }
+
+    #[test]
+    fn caller_supplied_pooled_size_is_not_native_view_extent() {
+        let device =
+            Device::system_default().expect("Metal device required for native extent control");
+        let whole = device
+            .new_buffer(256, MTLResourceOptions::StorageModeShared)
+            .expect("tiny native extent allocation");
+        let handle = BufferHandle::new(PooledBuffer::unpooled(whole.view(32, 64), usize::MAX));
+        assert_eq!(handle.size(), usize::MAX);
+        let bounded: &Buffer = handle.as_ref();
+        assert_eq!(bounded.length(), 64);
+        assert_eq!(bounded.base_offset(), 32);
+    }
+    #[test]
+    fn actual_prepared_factory_preserves_primary_external_and_view_extents() -> crate::Result<()> {
+        let device = crate::Device::new_metal(0)?;
+        let metal = device.as_metal_device()?;
+        metal.with_default_native_context_for_test(|context| {
+            // SAFETY: existing cold factory owns its normal default metadata/native
+            // payer. This fixture reads only ownership/extent metadata: no data,
+            // command encoding, raw SDK reference or escaped capability exists.
+            let slot = unsafe { metal.new_prepared_buffer_in(256, None) }?;
+            let capacity = slot.capacity();
+            // SAFETY: authentic same-domain permission; no output bytes are read,
+            // no native work can escape, and every clone/view closes below before
+            // the existing slot/namespace cleanup. No fake enrollment is performed.
+            let handle = unsafe { slot.try_checkout(context, metal.commands()) }
+                .map_err(|e| crate::Error::Msg(format!("rich extent checkout: {e:?}")))?;
+            let primary: &Buffer = handle.as_ref();
+            assert!(matches!(&primary.role, BufferRole::Primary(_)));
+            assert!(capacity >= 256);
+            assert_eq!(primary.length(), capacity);
+            assert_eq!(primary.length(), primary.native_allocation_length());
+            let external = primary.try_clone()?;
+            assert!(matches!(&external.role, BufferRole::External(_)));
+            assert_eq!(external.length(), capacity);
+            let view = external.view(32, 128);
+            let nested = view.view(16, 32);
+            assert_eq!((view.base_offset(), view.length()), (32, 128));
+            assert_eq!((nested.base_offset(), nested.length()), (48, 32));
+            assert_eq!(nested.native_allocation_length(), capacity);
+            drop(nested);
+            drop(view);
+            drop(external);
+            drop(handle);
+            drop(slot);
+            Ok(())
+        })
     }
 }

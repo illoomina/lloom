@@ -1129,7 +1129,7 @@ pub fn expected_sdpa_quant_layout() -> Vec<(&'static str, u32)> {
 /// state. `flash_params_layout` ships the real offsets across the boundary
 /// rather than either side asserting its own (§11.3d).
 #[repr(C)]
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, zerocopy::IntoBytes, zerocopy::Immutable)]
 pub struct FlashPartialParams {
     pub gqa_factor: i32,
     pub n_keys: i32,
@@ -1185,7 +1185,7 @@ impl FlashPartialParams {
 /// reservation folds in uninitialised memory, which §9.1a records as a silent
 /// wrong answer that no size check catches.
 #[repr(C)]
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, zerocopy::IntoBytes, zerocopy::Immutable)]
 pub struct FlashCombineParams {
     pub n_chunks: i32,
     pub chunk_capacity: i32,
@@ -1194,7 +1194,7 @@ pub struct FlashCombineParams {
 /// `flash_kv_scatter`'s scalars: one token's rows written to table-chosen
 /// slots (`DESIGN.md` §10.3e). `copy2d` with a per-token destination.
 #[repr(C)]
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, zerocopy::IntoBytes, zerocopy::Immutable)]
 pub struct FlashScatterParams {
     /// Rows in the slot table: `n_seqs * seq_len`.
     pub n_rows: i32,

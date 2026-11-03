@@ -2440,44 +2440,80 @@ impl PagedKv {
         } else {
             None
         };
-        let (slots_t, tables_t, n_keys_t, pos_t) = match framed {
-            Some(f) => (f.slots, f.tables, f.n_keys, Some(f.pos)),
-            None => (
-                Tensor::new(slots.as_slice(), device)?,
-                Tensor::new(tables.as_slice(), device)?,
-                Tensor::new(n_keys.as_slice(), device)?,
-                None,
-            ),
-        };
         let dec_rows: Vec<usize> = (0..rows.len()).filter(|&r| rows[r].1 == 1).collect();
+        let (slots_t, metadata, pos_t) = match framed {
+            // Intermediate producer tranche only: preserve the OLD framed
+            // route until its aggregate/sibling/recording migration is atomic.
+            Some(f) => (
+                f.slots,
+                RowsFlashMetadata::LegacyBound {
+                    tables,
+                    n_keys,
+                    tables_t: f.tables,
+                    n_keys_t: f.n_keys,
+                },
+                Some(f.pos),
+            ),
+            None => {
+                let slots_t = Tensor::new(slots.as_slice(), device)?;
+                let metadata = if !rows.is_empty() && dec_rows.len() == rows.len() {
+                    RowsFlashMetadata::Uploaded(crate::nn::ops::FlashDecodingMetadata::new(
+                        tables,
+                        table_stride,
+                        n_keys,
+                        rows.len(),
+                        page_size,
+                        ppc,
+                        device,
+                    )?)
+                } else {
+                    // No whole-pass Flash read on this route: mixed rows use
+                    // the checked decode subset below, long rows use steel.
+                    // Retain the existing uploads/no-op behavior rather than
+                    // impose Flash's positive-count contract on unused fields.
+                    let tables_t = Tensor::new(tables.as_slice(), device)?;
+                    let n_keys_t = Tensor::new(n_keys.as_slice(), device)?;
+                    RowsFlashMetadata::LegacyBound {
+                        tables,
+                        n_keys,
+                        tables_t,
+                        n_keys_t,
+                    }
+                };
+                (slots_t, metadata, None)
+            }
+        };
         let dec = if dec_rows.is_empty() || dec_rows.len() == rows.len() {
             None
         } else {
             let mut t = Vec::with_capacity(dec_rows.len() * table_stride);
             let mut n = Vec::with_capacity(dec_rows.len());
             for &r in &dec_rows {
-                t.extend_from_slice(&tables[r * table_stride..(r + 1) * table_stride]);
-                n.push(n_keys[r]);
+                t.extend_from_slice(&metadata.tables()[r * table_stride..(r + 1) * table_stride]);
+                n.push(metadata.keys()[r]);
             }
+            let count = dec_rows.len();
             Some(DecRows {
-                tables_t: Tensor::new(t.as_slice(), device)?,
-                n_keys_t: Tensor::new(n.as_slice(), device)?,
                 rows: dec_rows,
-                tables: t,
-                n_keys: n,
+                metadata: RowsFlashMetadata::Uploaded(crate::nn::ops::FlashDecodingMetadata::new(
+                    t,
+                    table_stride,
+                    n,
+                    count,
+                    page_size,
+                    ppc,
+                    device,
+                )?),
             })
         };
         Ok(RowsPass {
             rows: rows.to_vec(),
             slots: slots_t,
             max_slot,
-            tables,
+            metadata,
             table_stride,
-            n_keys,
             pages,
             prev,
-            tables_t,
-            n_keys_t,
             pos_t,
             dec,
         })
@@ -2649,6 +2685,106 @@ impl PagedKv {
     }
 }
 
+/// Private producer binding during the staged migration. Only Uploaded is
+/// authenticated here. LegacyBound preserves the shipping framed branch and
+/// unused long-row uploads; it is NOT a claimed checked frame capability.
+#[cfg(feature = "metal")]
+enum RowsFlashMetadata {
+    Uploaded(crate::nn::ops::FlashDecodingMetadata),
+    LegacyBound {
+        tables: Vec<u32>,
+        n_keys: Vec<u32>,
+        tables_t: Tensor,
+        n_keys_t: Tensor,
+    },
+}
+#[cfg(feature = "metal")]
+impl std::fmt::Debug for RowsFlashMetadata {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RowsFlashMetadata")
+            .field("uploaded_owner", &matches!(self, Self::Uploaded(_)))
+            .field("table_entries", &self.tables().len())
+            .field("counts", &self.keys().len())
+            .finish_non_exhaustive()
+    }
+}
+#[cfg(feature = "metal")]
+impl RowsFlashMetadata {
+    fn tables(&self) -> &[u32] {
+        match self {
+            Self::Uploaded(metadata) => metadata.table(),
+            Self::LegacyBound { tables, .. } => tables,
+        }
+    }
+    fn keys(&self) -> &[u32] {
+        match self {
+            Self::Uploaded(metadata) => metadata.keys(),
+            Self::LegacyBound { n_keys, .. } => n_keys,
+        }
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn attend(
+        &self,
+        q: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
+        scale: f32,
+        softcapping: f32,
+        page_size: usize,
+        pages_per_chunk: usize,
+        sizing: FlashScratchSizing,
+        reserve: usize,
+        table_stride: usize,
+    ) -> Result<Tensor> {
+        match self {
+            Self::Uploaded(metadata) => {
+                if metadata.page_geometry() != (page_size, pages_per_chunk)
+                    || metadata.table_stride() != table_stride
+                {
+                    lloom_tensor::bail!(
+                        "lfm2: uploaded Flash metadata route differs from the reader"
+                    )
+                }
+                crate::nn::ops::flash_decoding_paged_metadata(
+                    q,
+                    k,
+                    v,
+                    scale,
+                    softcapping,
+                    sizing,
+                    reserve,
+                    metadata,
+                )
+            }
+            Self::LegacyBound {
+                tables,
+                n_keys,
+                tables_t,
+                n_keys_t,
+            } => {
+                // Kept verbatim in semantics, not disabled/reuploaded or blessed
+                // by the uploaded owner. Atomic frame/sibling closure remains.
+                crate::nn::ops::flash_decoding_paged_ragged_bound(
+                    q,
+                    k,
+                    v,
+                    scale,
+                    softcapping,
+                    page_size,
+                    pages_per_chunk,
+                    sizing,
+                    reserve,
+                    tables,
+                    table_stride,
+                    n_keys,
+                    tables_t,
+                    n_keys_t,
+                )
+            }
+        }
+    }
+}
+
 /// One pass of a slot-indexed batch through the shared pool: the rows it
 /// fed, the token slots their tokens went to, and the tables the read walks
 /// (`batched-decode-design.md` §12.2). Built by `PagedKv::begin_rows` at the
@@ -2662,21 +2798,14 @@ pub(crate) struct RowsPass {
     /// order — `[T]` u32, the scatter's slot list.
     slots: Tensor,
     max_slot: usize,
-    /// Every row's chunk table, `table_stride` entries each (the longest
-    /// row's chunk count; a row's spare entries name page 0 and are never
-    /// read — a chunk past the row's live count is empty).
-    tables: Vec<u32>,
+    /// Once/pass immutable uploaded publication, or the unchanged legacy
+    /// framed binding pending its separately required sealed-read migration.
+    metadata: RowsFlashMetadata,
     table_stride: usize,
-    /// Every row's live length AFTER the pass.
-    n_keys: Vec<u32>,
     /// Every row's page table (a multi-token row's steel read walks pages).
     pages: Vec<Vec<u32>>,
     /// Every row's live length BEFORE the pass.
     prev: Vec<usize>,
-    /// `tables` and `n_keys` on the device, `U32`: a step frame's fields
-    /// for a decode pass, else uploaded once per pass.
-    tables_t: Tensor,
-    n_keys_t: Tensor,
     /// Every row's position, `U32`, for the rotation's table gather: a step
     /// frame's field for a decode pass, else `None` (the layer uploads it).
     pos_t: Option<Tensor>,
@@ -2706,10 +2835,7 @@ struct FramedRows {
 #[derive(Debug)]
 struct DecRows {
     rows: Vec<usize>,
-    tables: Vec<u32>,
-    n_keys: Vec<u32>,
-    tables_t: Tensor,
-    n_keys_t: Tensor,
+    metadata: RowsFlashMetadata,
 }
 
 #[cfg(feature = "metal")]
@@ -7341,7 +7467,7 @@ impl<P: Profile> Attention<P> {
                 .expect("write_rows allocates the layer's pool");
             (pk.clone(), pv.clone())
         };
-        let y = crate::nn::ops::flash_decoding_paged_ragged_bound(
+        let y = pass.metadata.attend(
             &q,
             &pk,
             &pv,
@@ -7351,11 +7477,7 @@ impl<P: Profile> Attention<P> {
             self.flash_pages_per_chunk,
             self.flash_scratch_sizing,
             reserve_chunks,
-            &pass.tables,
             pass.table_stride,
-            &pass.n_keys,
-            &pass.tables_t,
-            &pass.n_keys_t,
         )?;
         Ok(Some(y.transpose(1, 2)?.reshape((
             b_sz,
@@ -7444,17 +7566,12 @@ impl<P: Profile> Attention<P> {
                 1,
                 self.head_dim,
             ))?;
-            // Borrowed from the pass: no `Vec` clone per layer per step.
-            let (tables, n_keys, tables_t, n_keys_t) = match &pass.dec {
-                Some(d) => (&d.tables[..], &d.n_keys[..], &d.tables_t, &d.n_keys_t),
-                None => (
-                    &pass.tables[..],
-                    &pass.n_keys[..],
-                    &pass.tables_t,
-                    &pass.n_keys_t,
-                ),
+            // Same matching publication/subset borrowed by every layer.
+            let metadata = match &pass.dec {
+                Some(d) => &d.metadata,
+                None => &pass.metadata,
             };
-            y_dec = Some(crate::nn::ops::flash_decoding_paged_ragged_bound(
+            y_dec = Some(metadata.attend(
                 &q_d,
                 &pk,
                 &pv,
@@ -7464,11 +7581,7 @@ impl<P: Profile> Attention<P> {
                 self.flash_pages_per_chunk,
                 self.flash_scratch_sizing,
                 reserve_chunks,
-                tables,
                 pass.table_stride,
-                n_keys,
-                tables_t,
-                n_keys_t,
             )?);
         }
 
@@ -7525,7 +7638,7 @@ impl<P: Profile> Attention<P> {
                 let p = &pass.pages[r];
                 tables.extend_from_slice(p);
                 tables.extend(std::iter::repeat_n(0, stride - p.len()));
-                n_keys.push(pass.n_keys[r]);
+                n_keys.push(pass.metadata.keys()[r]);
             }
             let y_g = crate::nn::ops::sdpa_paged_ragged(
                 &q_g,
@@ -7932,9 +8045,9 @@ impl<P: Profile> Attention<P> {
                         self.flash_pages_per_chunk,
                         self.flash_scratch_sizing,
                         reserve_chunks,
-                        pass.tables.clone(),
+                        pass.metadata.tables().to_vec(),
                         pass.table_stride,
-                        pass.n_keys.clone(),
+                        pass.metadata.keys().to_vec(),
                     )?
                 } else {
                     let paged = cache.paged().expect("checked above");
@@ -12998,6 +13111,132 @@ mod tests {
     thread_local! {
         /// `Cache::conv_spare_for`'s calls on this thread.
         pub(super) static SPARES_TAKEN: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    }
+
+    /// Host-only producer controls: even with Metal compiled, no native device
+    /// is created and the clock has no queued users. The actual shared-pool
+    /// constructor and begin_rows publication path remain the production ones.
+    #[cfg(feature = "metal")]
+    fn uploaded_rows_fixture() -> Result<PagedKv> {
+        let config = Config {
+            flash_page_size: 4,
+            flash_pages_per_chunk: 1,
+            ..Default::default()
+        };
+        PagedKv::new_shared(&config, 16, 16, 1, Arc::new(GpuClock::new()), 3)
+    }
+
+    #[cfg(feature = "metal")]
+    fn assert_uploaded_rows_reuse_preparation(
+        metadata: &RowsFlashMetadata,
+        rows: usize,
+        stride: usize,
+        pool_tokens: usize,
+    ) -> Result<()> {
+        use crate::nn::attention::flash_validation::preparation_count;
+        assert!(matches!(metadata, RowsFlashMetadata::Uploaded(_)));
+        let dev = Device::Cpu;
+        let q = Tensor::zeros((rows, 1, 1, 64), DType::F32, &dev)?;
+        let kv = Tensor::zeros((1, 1, pool_tokens, 64), DType::F32, &dev)?;
+        let prepared = preparation_count();
+        for _layer in 0..2 {
+            let error = metadata
+                .attend(
+                    &q,
+                    &kv,
+                    &kv,
+                    1.,
+                    1.,
+                    4,
+                    1,
+                    FlashScratchSizing::Grow,
+                    0,
+                    stride,
+                )
+                .unwrap_err()
+                .to_string();
+            // A valid shared frontdoor reaches the pre-existing CPU stub.
+            // This is not numerical parity or a native dispatch assertion.
+            assert!(error.contains("no cpu support"), "{error}");
+            assert_eq!(
+                preparation_count(),
+                prepared,
+                "layer rescanned published metadata"
+            );
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn uploaded_decode_rows_publish_one_checked_owner_for_all_layers() -> Result<()> {
+        use crate::nn::attention::flash_validation::preparation_count;
+        let mut paged = uploaded_rows_fixture()?;
+        let before = preparation_count();
+        let pass = paged.begin_rows(&[(0, 1), (1, 1)], false, &Device::Cpu)?;
+        assert_eq!(pass.metadata.keys(), &[1, 1]);
+        assert_eq!(pass.table_stride, 1);
+        assert!(pass.dec.is_none());
+        assert_eq!(preparation_count(), before + 1, "one publication summary");
+        assert_uploaded_rows_reuse_preparation(
+            &pass.metadata,
+            2,
+            pass.table_stride,
+            paged.pool_pages() * paged.page_size,
+        )
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn mixed_rows_publish_only_the_decode_subset_as_checked_metadata() -> Result<()> {
+        use crate::nn::attention::flash_validation::preparation_count;
+        let mut paged = uploaded_rows_fixture()?;
+        let before = preparation_count();
+        let pass = paged.begin_rows(&[(0, 9), (1, 1)], false, &Device::Cpu)?;
+        assert!(matches!(
+            &pass.metadata,
+            RowsFlashMetadata::LegacyBound { .. }
+        ));
+        assert_eq!(pass.metadata.keys(), &[9, 1]);
+        assert_eq!(pass.table_stride, 3);
+        let dec = pass.dec.as_ref().expect("one decode row beside a long row");
+        assert_eq!(dec.rows, &[1]);
+        assert_eq!(dec.metadata.keys(), &[1]);
+        assert_eq!(dec.metadata.tables(), &pass.metadata.tables()[3..6]);
+        assert_ne!(dec.metadata.tables(), &pass.metadata.tables()[0..3]);
+        assert_eq!(
+            preparation_count(),
+            before + 1,
+            "only the subset is a Flash publication"
+        );
+        assert_uploaded_rows_reuse_preparation(
+            &dec.metadata,
+            1,
+            pass.table_stride,
+            paged.pool_pages() * paged.page_size,
+        )
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn zero_token_nonflash_rows_keep_their_unused_metadata_contract() -> Result<()> {
+        use crate::nn::attention::flash_validation::preparation_count;
+        let mut paged = uploaded_rows_fixture()?;
+        let before = preparation_count();
+        let pass = paged.begin_rows(&[(0, 0)], false, &Device::Cpu)?;
+        assert!(matches!(
+            &pass.metadata,
+            RowsFlashMetadata::LegacyBound { .. }
+        ));
+        assert_eq!(pass.metadata.keys(), &[0]);
+        assert_eq!(pass.slots.elem_count(), 0);
+        assert!(pass.dec.is_none());
+        assert_eq!(
+            preparation_count(),
+            before,
+            "unused fields are not Flash metadata"
+        );
+        Ok(())
     }
 
     /// Per-pass metadata is immutable across queued readers, while host staging

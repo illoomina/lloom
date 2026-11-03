@@ -775,8 +775,8 @@ fn device_gumbel_draws_have_the_reference_distribution() -> Result<()> {
 
 /// The Gumbel half of `tests.rs`'s dumped-row χ²: at the row of the
 /// `LLOOM_CHI2_LOGITS` dump (a real checkpoint's logits; its last three
-/// decode rows) whose checkpoint and top-p cells pool into the most cells at
-/// this draw count, on those two cells, 4 000 draws of 20 rows a dispatch (a
+/// decode rows) whose checkpoint and top-p cells pool into the most cells in
+/// all at this draw count, on those two cells, 4 000 draws of 20 rows a dispatch (a
 /// variate per vocabulary id per draw is the host's cost), every draw
 /// checked equal to the reference's for its variates. Control: the
 /// temperature dropped. Ignored: it needs the dump.
@@ -803,8 +803,7 @@ fn device_gumbel_draws_have_the_reference_distribution_at_a_dumped_row() -> Resu
                     .partition(|&&w| n as f64 * w >= 5.0);
                 big.len() + (small.iter().sum::<f64>() * n as f64 >= 5.0) as usize
             })
-            .min()
-            .unwrap_or(0)
+            .sum()
     };
     let (pos, z) = dumped_rows(&path, 3)
         .into_iter()

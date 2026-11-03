@@ -426,6 +426,21 @@ pub(crate) fn stop_shared_worker(deadline: Instant) -> Option<bool> {
     }
 }
 
+/// Whether the shared retirement worker is parked, idle, on its wake: `None`
+/// when no worker was started. A worker's first park sets up parking_lot's
+/// per-thread data, which allocates on the worker (and can grow the table
+/// every parking thread shares), whenever the worker is first scheduled. A
+/// test that counts allocations process-wide waits for this before opening
+/// its window, so that setup lands before the window rather than in it
+/// (#1205). Behind `fuzzing`; nothing shipping enables it.
+#[cfg(all(feature = "metal", feature = "fuzzing"))]
+pub fn retirement_worker_parked() -> Option<bool> {
+    match SHARED_SERVICE.get() {
+        Some(Ok(service)) => Some(service.wake.test_is_parked()),
+        _ => None,
+    }
+}
+
 impl HostRetirementService {
     /// Asks the worker to leave its loop at its next check, and waits until
     /// `deadline` for it to have left. A pass in progress finishes first;

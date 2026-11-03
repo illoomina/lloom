@@ -1121,7 +1121,7 @@ pub struct SamplingConfig {
         cli = "prompt-budget"
     )]
     pub prompt_budget: Option<usize>,
-    /// Over the prompt budget: `refuse` (the default: a clean error, the prompt is never silently shortened) or `truncate` (drop the oldest whole messages, the system message kept; a raw prompt keeps BOS and its last tokens).
+    /// Over the prompt budget: `refuse` (the default: a clean error, the prompt is never silently shortened) or `truncate` (drop the oldest whole messages, the system message kept; a raw prompt keeps its leading BOS, if any, and its last tokens).
     #[opt(flag = "prompt-budget-mode", parser = "parse_prompt_budget_mode", variants = ["refuse", "truncate"], path = "prompt.overflow", status = "advanced")]
     pub prompt_budget_mode: String,
 }
@@ -1942,7 +1942,8 @@ impl Default for SessionConfig {
 #[options(v0 = false)]
 #[serde(default)]
 pub struct PromptConfig {
-    /// Encode the prompt with the checkpoint's BOS.
+    /// Encode the prompt with the tokenizer's special tokens: the BOS where
+    /// the tokenizer adds or declares one.
     #[opt(bool, flag = "bos", path = "prompt.add_bos", status = "advanced", switches = ["no-bos=false"])]
     pub add_bos: bool,
 }

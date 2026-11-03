@@ -5550,7 +5550,7 @@ mod contention_tests {
             let mut blit = dev.blit_command_encoder().expect("encoder");
             // SAFETY: the test owns every buffer bound or mapped here and reads its
             // results only after waiting for the command buffer that writes them.
-            unsafe { blit.fill_buffer(&b, (0, 4096), 0) };
+            unsafe { blit.fill_buffer(&b, (0, 4096), 0) }.unwrap();
         }
         drop(b);
         let census = dev.pool_contention();

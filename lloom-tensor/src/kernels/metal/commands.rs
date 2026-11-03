@@ -298,7 +298,7 @@ impl BlitCommandsGuard<'_> {
         dst_buffer: &Buffer,
         dst_offset: usize,
         size: usize,
-    ) {
+    ) -> Result<(), MetalKernelError> {
         // SAFETY: this explicitly unsafe guard API preserves the raw setter's
         // caller obligations; it is not a safe Tensor ownership-tracked route.
         unsafe {
@@ -310,8 +310,13 @@ impl BlitCommandsGuard<'_> {
     /// # Safety
     /// Same originating reuse/terminal/future-emission duties as copy_from_buffer.
     /// No counted pin is installed by this legacy/raw interoperability API.
-    pub unsafe fn fill_buffer(&mut self, buffer: &Buffer, range: (usize, usize), value: u8) {
-        unsafe { self.as_mut().fill_buffer(buffer, range, value) };
+    pub unsafe fn fill_buffer(
+        &mut self,
+        buffer: &Buffer,
+        range: (usize, usize),
+        value: u8,
+    ) -> Result<(), MetalKernelError> {
+        unsafe { self.as_mut().fill_buffer(buffer, range, value) }
     }
 
     pub(crate) fn copy_from_handles_aligned(
@@ -3789,7 +3794,7 @@ mod owner_submission_tests {
         {
             let mut blit = commands.blit_command_encoder().unwrap();
             // SAFETY: independent pins survive any refusal/assertion unwind.
-            unsafe { blit.fill_buffer(&raw, (0, 4096), 0x6a) };
+            unsafe { blit.fill_buffer(&raw, (0, 4096), 0x6a) }.unwrap();
         }
         let callbacks = Arc::new(AtomicUsize::new(0));
         let observed = callbacks.clone();
@@ -3840,7 +3845,7 @@ mod owner_submission_tests {
         {
             let mut blit = commands.blit_command_encoder().unwrap();
             // SAFETY: independent raw owners survive refusal/assertion unwind.
-            unsafe { blit.fill_buffer(&raw, (0, 4096), 0x68) };
+            unsafe { blit.fill_buffer(&raw, (0, 4096), 0x68) }.unwrap();
         }
         let result = commands.ensure_completed(&cb);
         if matches!(
@@ -3947,7 +3952,7 @@ mod owner_submission_tests {
         {
             let mut blit = commands.blit_command_encoder().unwrap();
             // SAFETY: independent pins survive every refusal/assertion/unwind.
-            unsafe { blit.fill_buffer(&raw, (0, 4096), 0x73) };
+            unsafe { blit.fill_buffer(&raw, (0, 4096), 0x73) }.unwrap();
         }
         cb.signal_event(&observer, 1).unwrap();
         let control = &commands.core.submission_control;
@@ -4035,7 +4040,7 @@ mod owner_submission_tests {
         {
             let mut blit = commands.blit_command_encoder().unwrap();
             // SAFETY: independent raw pins survive until actual joined work.
-            unsafe { blit.fill_buffer(&raw, (0, 4096), 0x74) };
+            unsafe { blit.fill_buffer(&raw, (0, 4096), 0x74) }.unwrap();
         }
         commands.ensure_completed(&cb).unwrap();
         let residency_submitted = commands.core.residency_set.counters().commits;
@@ -4201,13 +4206,13 @@ mod owner_submission_tests {
         {
             let mut blit = commands.blit_command_encoder().unwrap();
             // SAFETY: independent pins below survive unknown handoff and unwind.
-            unsafe { blit.fill_buffer(&first, (0, 4096), 0x71) };
+            unsafe { blit.fill_buffer(&first, (0, 4096), 0x71) }.unwrap();
         }
         cb.signal_event(&boundary, 7).unwrap();
         {
             let mut blit = commands.blit_command_encoder().unwrap();
             // SAFETY: same retained independent owners; this segment never enters.
-            unsafe { blit.fill_buffer(&second, (0, 4096), 0x72) };
+            unsafe { blit.fill_buffer(&second, (0, 4096), 0x72) }.unwrap();
         }
         let control = &commands.core.submission_control;
         control.install_observer(observer.clone());
@@ -4356,7 +4361,7 @@ mod owner_submission_tests {
             let mut blit = commands.blit_command_encoder().unwrap();
             // SAFETY: the test retains raw storage until its actual owner wait.
             unsafe {
-                blit.fill_buffer(&raw, (0, 4096), 0x5a);
+                blit.fill_buffer(&raw, (0, 4096), 0x5a).unwrap();
             }
         }
         let status = cb.status();
@@ -4501,7 +4506,7 @@ mod owner_submission_tests {
         {
             let mut blit = commands.blit_command_encoder().unwrap();
             // SAFETY: raw has independent owners until actual terminal join.
-            unsafe { blit.fill_buffer(&raw, (0, 4096), 0x69) };
+            unsafe { blit.fill_buffer(&raw, (0, 4096), 0x69) }.unwrap();
         }
         let mut captures = lifecycle::FinalCaptures::default();
         assert!(commands.core.poll_final_submission(&mut captures).unwrap());
@@ -4651,7 +4656,7 @@ mod owner_submission_tests {
             // SAFETY: raw remains owned until the exact native wait below,
             // including the assertion-failure cleanup path.
             unsafe {
-                blit.fill_buffer(&raw, (0, 4096), 0x6b);
+                blit.fill_buffer(&raw, (0, 4096), 0x6b).unwrap();
             }
         }
         let exercised = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {

@@ -871,10 +871,168 @@ fn the_ring_feeds_the_same_slot_every_step() -> Result<()> {
     Ok(())
 }
 
-/// Side of the drain-arm fixture's per-forward ballast matmul: large enough
-/// that one forward's GPU time exceeds the host's encode of the next, so a
-/// host that nothing paces runs ahead of the device.
+/// Side of the pacer fixture's per-forward ballast matmul: large enough that
+/// one forward's GPU time exceeds the host's encode of the next, so a host
+/// that nothing paces runs ahead of the device.
 const PACER_BALLAST: usize = 2048;
+
+/// How long a command buffer's `Completed` status may trail the EOS wait that
+/// saw its work done before [`Settled`] calls it a defect, not a notice in
+/// flight.
+#[cfg(feature = "metal")]
+const SETTLE_LIMIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+#[cfg(feature = "metal")]
+type Marker = lloom_tensor::metal_backend::CommandMarker;
+#[cfg(not(feature = "metal"))]
+type Marker = ();
+
+/// A per-token EOS arm whose completed work reads complete before the pacer
+/// asks about it.
+///
+/// The EOS wait returns once the GPU has written this step's stamp, which is
+/// encoded after every buffer committed before it, so those buffers have
+/// executed. Their `Completed` status follows on the driver's notice, which
+/// can land after the pacer's status read; the pacer then counts a wait on
+/// work already done (`docs/dispatch.md` §11.5x). Before the next step this
+/// waits, bounded, for the status of the newest buffer the EOS wait covered,
+/// and of no later one, so `step_waits` keeps only the waits the EOS wait did
+/// not already hold.
+struct Settled {
+    inner: AnyArm,
+    /// The newest buffer committed before this step's stamp was encoded.
+    before_stamp: Option<Marker>,
+    /// That buffer, once the EOS wait on the stamp has returned.
+    certified: Option<Marker>,
+    /// Certified buffers whose status had not yet caught up at the next step.
+    lagged: usize,
+    /// The longest of those catch-ups.
+    max_lag: std::time::Duration,
+}
+
+impl Settled {
+    fn new(inner: AnyArm) -> Self {
+        Self {
+            inner,
+            before_stamp: None,
+            certified: None,
+            lagged: 0,
+            max_lag: std::time::Duration::ZERO,
+        }
+    }
+
+    fn last_committed(&self) -> Result<Option<Marker>> {
+        #[cfg(feature = "metal")]
+        if let Device::Metal(m) = self.inner.device() {
+            return m.last_committed_marker();
+        }
+        Ok(None)
+    }
+
+    fn settle(&mut self) -> Result<()> {
+        let certified = self.certified.take();
+        #[cfg(feature = "metal")]
+        if let (Some(marker), Device::Metal(m)) = (certified, self.inner.device()) {
+            if !m.marker_complete(&marker) {
+                self.lagged += 1;
+                let start = std::time::Instant::now();
+                while !m.marker_complete(&marker) {
+                    if marker.is_failed() {
+                        lloom_tensor::bail!("a buffer the EOS wait saw executed ended in error");
+                    }
+                    if start.elapsed() > SETTLE_LIMIT {
+                        lloom_tensor::bail!(
+                            "a buffer the EOS wait saw executed did not read complete in \
+                             {SETTLE_LIMIT:?}"
+                        );
+                    }
+                    std::thread::yield_now();
+                }
+                self.max_lag = self.max_lag.max(start.elapsed());
+            }
+        }
+        #[cfg(not(feature = "metal"))]
+        let _ = certified;
+        Ok(())
+    }
+}
+
+impl ReadbackStrategy for Settled {
+    fn device(&self) -> &Device {
+        self.inner.device()
+    }
+    fn arms(&self) -> lloom::generation::ReadbackArms {
+        self.inner.arms()
+    }
+    fn admits_lookahead(&self) -> bool {
+        self.inner.admits_lookahead()
+    }
+    fn loop_commits(&self) -> bool {
+        self.inner.loop_commits()
+    }
+    fn check_sampler(&self, sampling: &Sampling) -> Result<()> {
+        self.inner.check_sampler(sampling)
+    }
+    fn sample_and_feed(
+        &mut self,
+        sampler: &mut LogitsProcessor,
+        logits: &Tensor,
+    ) -> Result<Tensor> {
+        self.settle()?;
+        self.before_stamp = self.last_committed()?;
+        self.inner.sample_and_feed(sampler, logits)
+    }
+    fn eos_of_last(&mut self) -> Result<bool> {
+        let eos = self.inner.eos_of_last()?;
+        self.certified = self.before_stamp.take();
+        Ok(eos)
+    }
+    fn take_ids(&mut self) -> Result<Vec<u32>> {
+        self.inner.take_ids()
+    }
+    fn drain_all(&mut self) -> Result<Vec<u32>> {
+        self.inner.drain_all()
+    }
+    fn stage_prompt_chunk(&mut self, tokens: &[u32]) -> Result<Tensor> {
+        self.inner.stage_prompt_chunk(tokens)
+    }
+    fn publish_marker(&mut self, force_live: bool) -> Result<()> {
+        self.inner.publish_marker(force_live)
+    }
+    fn close_window(&mut self, in_ttft_ramp: bool) -> Result<()> {
+        self.inner.close_window(in_ttft_ramp)
+    }
+    fn eos_in_drained(&self, batch: &[u32]) -> Option<usize> {
+        self.inner.eos_in_drained(batch)
+    }
+    fn note_eos_truncation(&mut self, dropped_in_batch: usize) {
+        self.inner.note_eos_truncation(dropped_in_batch)
+    }
+    fn eos_read_arm(&self) -> &'static str {
+        self.inner.eos_read_arm()
+    }
+    fn fed_host_ids(&self) -> Option<&[u32]> {
+        self.inner.fed_host_ids()
+    }
+    fn take_ids_into(&mut self, out: &mut Vec<u32>) -> Result<()> {
+        self.inner.take_ids_into(out)
+    }
+    fn eos_ids_tensor(&self) -> Option<&Tensor> {
+        self.inner.eos_ids_tensor()
+    }
+    fn reader(&self) -> Option<lloom::generation::readback::RingReader> {
+        ReadbackStrategy::reader(&self.inner)
+    }
+    fn set_fused_publish(&mut self, on: bool) {
+        self.inner.set_fused_publish(on)
+    }
+    fn publishes_fused(&self) -> bool {
+        self.inner.publishes_fused()
+    }
+    fn counters(&self) -> lloom::generation::ReadbackCounters {
+        self.inner.counters()
+    }
+}
 
 /// The host's lead over the GPU is bounded by the step pacer on the arms
 /// whose commits the loop owns, and the bound engages only where the
@@ -882,12 +1040,14 @@ const PACER_BALLAST: usize = 2048;
 ///
 /// `Session::decode` commits each forward at its end and, before encoding the
 /// next, waits on the marker `pacer_depth` forwards back. On the poll arm the
-/// per-token EOS wait retires that forward first, so the pacer finds every
-/// marker complete and waits on none. On the drain arm nothing else paces the
-/// host, so the pacer is the bound, and a bound is visible only where the
-/// host could exceed it: the drain arm runs on a fixture whose forward
-/// carries GPU ballast, so the pacer must wait, and without it the host would
-/// queue the whole run.
+/// per-token EOS wait has seen that forward executed first, so the pacer asks
+/// only about finished work and waits on none; the driver's completion notice
+/// for it is taken out of the count by [`Settled`]. On the drain arm nothing
+/// else paces the host, so the pacer is the bound. Both arms run on a fixture
+/// whose forward carries GPU ballast, so the host could outrun the device:
+/// on the drain arm the pacer must wait, and without it the host would queue
+/// the whole run; on the poll arm a pacer that waited would wait on nearly
+/// every step, as it does on the drain arm.
 ///
 /// The bound in the unit `max_in_flight` counts — command buffers not yet
 /// complete at a loop commit, not forwards. The queue is FIFO, so once the
@@ -954,8 +1114,29 @@ fn the_pacer_bounds_the_drain_arm_and_is_a_null_on_the_poll_arm() -> Result<()> 
                  PACER_BALLAST)"
             );
         }
-        let (out, _) = run(&device, &Arm::RingPoll, &[0], &opts)?;
+        let mut session = Session::new(&model, 0usize);
+        let mut rb = Settled::new(strategy(&Arm::RingPoll, &device, opts.max_tokens + 4)?);
+        let out = session.decode(
+            &mut IdentityProposer,
+            &mut rb,
+            &mut greedy(),
+            &[0],
+            &opts,
+            &mut sink,
+        )?;
+        assert_eq!(out.ids, chain(0, 24).0, "{device:?}: poll arm ids");
         assert_eq!(out.stats.step_markers, want_markers, "{device:?}");
+        if metal {
+            eprintln!(
+                "poll arm, ballast {PACER_BALLAST}: step_waits {}, status lagged the EOS wait {} \
+                 (longest {} us), poll fallbacks {}, steps {}",
+                out.stats.step_waits,
+                rb.lagged,
+                rb.max_lag.as_micros(),
+                out.stats.readback.poll_fallbacks,
+                out.stats.steps
+            );
+        }
         assert_eq!(
             out.stats.step_waits, 0,
             "{device:?}: the poll arm's own wait retires the marker before the pacer asks"

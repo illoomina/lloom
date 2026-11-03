@@ -131,15 +131,14 @@ fn bytes(s: &str) -> Vec<u32> {
     s.bytes().map(u32::from).collect()
 }
 
-/// LFM2: the raw prompt is the bytes behind the checkpoint's BOS
-/// (`<|startoftext|>`), which the engine prepends.
+/// LFM2: the raw prompt is its bytes. The tiny tokenizer, like LFM2's,
+/// adds no BOS and its metadata declares none, so the engine prepends none
+/// (decision 100: the raw BOS follows the tokenizer's metadata).
 #[test]
 fn lfm2_tiny_chats_on_the_cpu_and_metal() {
     let dir = scratch("lfm2");
     let model = write::<Lfm2Tiny>(&dir);
-    let bos = Lfm2Tiny::tokenizer().id("<|startoftext|>").unwrap();
-    let mut want = vec![bos];
-    want.extend(bytes(PROMPT));
+    let want = bytes(PROMPT);
     check(&model, &["--cpu"], &want);
     #[cfg(feature = "metal")]
     check(&model, &[], &want);
@@ -1306,14 +1305,19 @@ fn thinking_budget_is_ignored_or_refused_where_no_block_is_open() {
 
 /// The prompt budget on a raw prompt (`lloom chat --raw`): over it the turn
 /// is refused by default, with the prompt's length and the budget; under
-/// `--prompt-budget-mode truncate` the prompt is its last tokens, BOS kept
-/// on LFM2, and the prefill in tiles of 4 over the 8 kept tokens (the cut on
-/// a tile boundary) decodes exactly what the kept text given as the prompt
-/// decodes.
+/// `--prompt-budget-mode truncate` the prompt is its last tokens, the BOS
+/// kept on an LFM2 whose tokenizer declares one (`add_bos_token`), and the
+/// prefill in tiles of 4 over the 8 kept tokens (the cut on a tile boundary)
+/// decodes exactly what the kept text given as the prompt decodes.
 #[test]
 fn prompt_budget_refuses_or_keeps_the_last_tokens() {
     let l_dir = scratch("prompt-budget-lfm2");
     let l_model = write::<Lfm2Tiny>(&l_dir);
+    std::fs::write(
+        l_model.join("tokenizer_config.json"),
+        br#"{"add_bos_token": true, "bos_token": "<|startoftext|>"}"#,
+    )
+    .unwrap();
     let (q_dir, q_model, q_base) = qwen_tiny("prompt-budget-qwen");
     let bos = Lfm2Tiny::tokenizer().id("<|startoftext|>").unwrap();
     let cases: [(&Path, Vec<&str>, Option<u32>); 2] = [
@@ -1580,10 +1584,9 @@ fn chat_switches_thinking_by_the_template_or_by_closing_the_block() {
         }
     }
     let no_think = no_think.unwrap();
-    let raw_text = format!(
-        "{}</think>",
-        lfm2_rendered().trim_start_matches("<|startoftext|>")
-    );
+    // The rendered text, BOS and all: a raw prompt is what it says, and the
+    // tiny tokenizer declares no BOS of its own (decision 100).
+    let raw_text = format!("{}</think>", lfm2_rendered());
     let out = Command::new(env!("CARGO_BIN_EXE_lloom"))
         .args(["chat", "--model"])
         .arg(&model)
@@ -3851,9 +3854,8 @@ fn write_the_tiny_qwen4exp_checkpoint() {
 fn lfm2_moe_tiny_reaches_chat_and_serve_on_the_cpu() {
     let dir = scratch("lfm2-moe");
     let model = write::<Lfm2MoeTiny>(&dir);
-    let bos = Lfm2MoeTiny::tokenizer().id("<|startoftext|>").unwrap();
-    let mut want = vec![bos];
-    want.extend(bytes(PROMPT));
+    // No BOS: the tokenizer adds none and declares none (decision 100).
+    let want = bytes(PROMPT);
     check(&model, &["--cpu", "--profile", "deterministic"], &want);
     let (_, stderr) = chat_with_stderr(&model, &["--cpu", "--profile", "deterministic"]);
     assert!(
@@ -4715,6 +4717,16 @@ fn serve_reports_budget_release_without_failing_generation_or_keeping_an_id() {
 /// GGUF llama.cpp writes (`lloom::testing::lfm2_gguf`), its projections and
 /// table at `kind`, its template in the header and its tokenizer beside it.
 fn lfm2_gguf(model: &Path, kind: lloom_tensor::quantized::GgmlDType) -> PathBuf {
+    lfm2_gguf_with(model, kind, None)
+}
+
+/// [`lfm2_gguf`], with `tokenizer.ggml.add_bos_token` written when `add_bos`
+/// names it.
+fn lfm2_gguf_with(
+    model: &Path,
+    kind: lloom_tensor::quantized::GgmlDType,
+    add_bos: Option<bool>,
+) -> PathBuf {
     use lloom_tensor::quantized::gguf_file::Value as V;
     let cfg: lloom::models::lfm2::Lfm2Config =
         serde_json::from_slice(&std::fs::read(model.join("config.json")).unwrap()).unwrap();
@@ -4735,22 +4747,23 @@ fn lfm2_gguf(model: &Path, kind: lloom_tensor::quantized::GgmlDType) -> PathBuf 
         tokens[*id as usize] = text.clone();
     }
     let id = |t: &str| V::U32(vocab[t]);
-    let bytes = lloom::testing::lfm2_gguf::write(
-        &cfg,
-        &tensors,
-        kind,
-        vec![
-            ("tokenizer.chat_template".into(), V::String(template)),
-            (
-                "tokenizer.ggml.tokens".into(),
-                V::Array(tokens.into_iter().map(V::String).collect()),
-            ),
-            ("tokenizer.ggml.bos_token_id".into(), id("<|startoftext|>")),
-            ("tokenizer.ggml.eos_token_id".into(), id("<|im_end|>")),
-        ],
-    )
-    .unwrap();
-    let dir = model.join(format!("gguf-{kind:?}"));
+    let mut metadata = vec![
+        ("tokenizer.chat_template".into(), V::String(template)),
+        (
+            "tokenizer.ggml.tokens".into(),
+            V::Array(tokens.into_iter().map(V::String).collect()),
+        ),
+        ("tokenizer.ggml.bos_token_id".into(), id("<|startoftext|>")),
+        ("tokenizer.ggml.eos_token_id".into(), id("<|im_end|>")),
+    ];
+    if let Some(b) = add_bos {
+        metadata.push(("tokenizer.ggml.add_bos_token".into(), V::Bool(b)));
+    }
+    let bytes = lloom::testing::lfm2_gguf::write(&cfg, &tensors, kind, metadata).unwrap();
+    let dir = match add_bos {
+        None => model.join(format!("gguf-{kind:?}")),
+        Some(b) => model.join(format!("gguf-{kind:?}-add-bos-{b}")),
+    };
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::copy(model.join("tokenizer.json"), dir.join("tokenizer.json")).unwrap();
     let file = dir.join("tiny.gguf");
@@ -4809,9 +4822,11 @@ fn an_lfm2_gguf_serves_on_the_lfm2_engine_as_on_the_legacy_model() {
 
 /// The same weights as safetensors and as an F32 GGUF, on the CPU (where
 /// both compute at f32): through the template, the same prompt and the same
-/// tokens. A raw prompt differs by its BOS, by design for now: the GGUF's
-/// raw prompts start with a BOS exactly when its tokenizer adds one (the
-/// legacy GGUF model's behaviour, kept), a safetensors LFM2's always do.
+/// tokens. A raw prompt starts with the BOS exactly when the tokenizer's
+/// metadata says so (decision 100), in either container: with the metadata
+/// silent (the tiny tokenizer adds none, as LFM2's does not) neither
+/// starts with it; with `add_bos_token` declared (`tokenizer_config.json`,
+/// `tokenizer.ggml.add_bos_token`) both do, one token longer.
 #[test]
 fn an_f32_lfm2_gguf_serves_what_its_safetensors_serve() {
     let dir = scratch("lfm2-gguf-f32");
@@ -4825,13 +4840,37 @@ fn an_f32_lfm2_gguf_serves_what_its_safetensors_serve() {
         "{a:?} {b:?}"
     );
     assert_eq!(a["tokens_sha256"], b["tokens_sha256"], "{a:?} {b:?}");
-    let raw_st = chat(&model, &["--cpu"]);
-    let raw_gguf = chat(&gguf, &["--cpu"]);
     let n = |f: &std::collections::BTreeMap<String, String>| -> usize {
         f["prompt_tokens"].parse().unwrap()
     };
-    assert_eq!(n(&raw_st), n(&raw_gguf) + 1, "{raw_st:?} {raw_gguf:?}");
+    let raw_st = chat(&model, &["--cpu"]);
+    let raw_gguf = chat(&gguf, &["--cpu"]);
+    assert_eq!(
+        raw_st["prompt_ids_sha256"], raw_gguf["prompt_ids_sha256"],
+        "{raw_st:?} {raw_gguf:?}"
+    );
+
+    let declared = scratch("lfm2-gguf-f32-add-bos");
+    let model_bos = write::<Lfm2Tiny>(&declared);
+    std::fs::write(
+        model_bos.join("tokenizer_config.json"),
+        br#"{"add_bos_token": true, "bos_token": "<|startoftext|>"}"#,
+    )
+    .unwrap();
+    let gguf_bos = lfm2_gguf_with(
+        &model_bos,
+        lloom_tensor::quantized::GgmlDType::F32,
+        Some(true),
+    );
+    let bos_st = chat(&model_bos, &["--cpu"]);
+    let bos_gguf = chat(&gguf_bos, &["--cpu"]);
+    assert_eq!(
+        bos_st["prompt_ids_sha256"], bos_gguf["prompt_ids_sha256"],
+        "{bos_st:?} {bos_gguf:?}"
+    );
+    assert_eq!(n(&bos_st), n(&raw_st) + 1, "{bos_st:?} {raw_st:?}");
     std::fs::remove_dir_all(&dir).ok();
+    std::fs::remove_dir_all(&declared).ok();
 }
 
 /// The LFM2 engine's rows over a packed GGUF: `--batch 2` on the private

@@ -60,12 +60,8 @@ impl QMetalStorage {
                 }
             },
         )?;
-        {
-            let mut blit = device.blit_command_encoder()?;
-            blit.set_label("qstorage_persistent_zero");
-            // SAFETY: binding authority (module head).
-            unsafe { blit.fill_buffer(&buffer, (0, size), 0) };
-        }
+        // SAFETY: binding authority (module head).
+        unsafe { device.fill_bytes("qstorage_persistent_zero", &buffer, size, 0) }?;
         let device = device.allocated_output_device(&buffer)?;
         Ok(Self {
             buffer,
@@ -95,12 +91,17 @@ impl QMetalStorage {
             .with_size(self.buffer.length())
             .with_label("qstorage_dequantize_blit")
             .build()?;
-        {
-            let mut blit = self.device.blit_command_encoder()?;
-            blit.set_label("blit_to_cpu");
-            // SAFETY: binding authority (module head).
-            unsafe { blit.copy_from_buffer(&self.buffer, 0, &buffer, 0, self.buffer.length()) };
-        }
+        // SAFETY: binding authority (module head).
+        unsafe {
+            self.device.copy_bytes(
+                "blit_to_cpu",
+                &self.buffer,
+                0,
+                &buffer,
+                0,
+                self.buffer.length(),
+            )
+        }?;
         self.device.flush_and_wait_current()?;
         let mut out = vec![0.0; elem_count];
         let block_len = elem_count / self.dtype.block_size();
@@ -1574,12 +1575,17 @@ impl QMetalStorage {
             .with_size(self.buffer.length())
             .with_label("qstorage_data_blit")
             .build()?;
-        {
-            let mut blit = self.device.blit_command_encoder()?;
-            blit.set_label("blit_to_cpu");
-            // SAFETY: binding authority (module head).
-            unsafe { blit.copy_from_buffer(&self.buffer, 0, &buffer, 0, self.buffer.length()) };
-        }
+        // SAFETY: binding authority (module head).
+        unsafe {
+            self.device.copy_bytes(
+                "blit_to_cpu",
+                &self.buffer,
+                0,
+                &buffer,
+                0,
+                self.buffer.length(),
+            )
+        }?;
         self.device.flush_and_wait_current()?;
         Ok(read_to_vec::<u8>(&buffer, self.storage_size_in_bytes()))
     }

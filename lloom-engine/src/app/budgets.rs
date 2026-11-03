@@ -72,7 +72,7 @@ pub fn over_budget(len: usize, budget: usize, how: &str) -> String {
 }
 
 /// A rendered-as-given prompt (no template) cut to its last `budget`
-/// tokens, the leading BOS kept: the only structure a raw prompt has.
+/// tokens, a leading BOS kept: the only structure a raw prompt has.
 pub fn truncate_raw(ids: &[u32], budget: usize, bos: Option<u32>) -> (Vec<u32>, Dropped) {
     if ids.len() <= budget {
         return (ids.to_vec(), Dropped::default());

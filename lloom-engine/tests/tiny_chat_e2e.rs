@@ -266,7 +266,7 @@ fn assert_arms(tag: &str, arms: &[(&str, bool, Route)]) {
 /// with `--device-filter=false`, LFM2 keeps today's route too. Every arm runs
 /// and is recorded; the test fails once, naming each arm that parted. The
 /// LFM2 GGUF's default is its representation's
-/// (`an_lfm2_gguf_takes_the_device_filter_at_blocks_f32_only`).
+/// (`an_lfm2_gguf_takes_the_device_filter_at_packed_blocks_only`).
 #[test]
 fn the_device_filter_is_lfm2s_default_and_no_other_familys() {
     let mut arms = Vec::new();
@@ -306,15 +306,17 @@ fn the_device_filter_is_lfm2s_default_and_no_other_familys() {
 }
 
 /// An LFM2 GGUF on the LFM2 engine takes the device filter by default at the
-/// representation it was gated and priced on, packed blocks at f32
+/// representations it was gated and priced on, packed blocks at f16 (decision
+/// 110's default) and at f32 (`--gguf-act f32`)
 /// (`family::LFM2_GGUF_DEVICE_FILTER`): with no flag, a filtered sampled
-/// request on a tiny Q8_0 GGUF rides NativeRing on Metal. It keeps today's
-/// route, served and not refused, on the CPU, with `--device-filter=false`,
-/// on the legacy GGUF engine, and on a dense F32 GGUF (a representation the
-/// filter was not priced on). The legacy engine's capabilities report the
-/// filter off, the LFM2 engine's on at blocks f32 and off on the dense file.
+/// request on a tiny Q8_0 GGUF rides NativeRing on Metal at either. It keeps
+/// today's route, served and not refused, on the CPU, with
+/// `--device-filter=false`, on the legacy GGUF engine, and on a dense F32 GGUF
+/// (a representation the filter was not priced on). The legacy engine's
+/// capabilities report the filter off, the LFM2 engine's on at both packed
+/// representations and off on the dense file.
 #[test]
-fn an_lfm2_gguf_takes_the_device_filter_at_blocks_f32_only() {
+fn an_lfm2_gguf_takes_the_device_filter_at_packed_blocks_only() {
     use lloom_tensor::quantized::GgmlDType;
     let dir = scratch("device-filter-lfm2-gguf");
     let model = write::<Lfm2Tiny>(&dir);
@@ -327,7 +329,13 @@ fn an_lfm2_gguf_takes_the_device_filter_at_blocks_f32_only() {
     {
         let r = sampled_route(&q8, &[]);
         arms.push((
-            "lfm2-gguf q8_0 Metal, no flag: NativeRing",
+            "lfm2-gguf q8_0 Metal (blocks f16), no flag: NativeRing",
+            native_ring(&r),
+            r,
+        ));
+        let r = sampled_route(&q8, &["--gguf-act", "f32"]);
+        arms.push((
+            "lfm2-gguf q8_0 Metal --gguf-act f32 (blocks f32), no flag: NativeRing",
             native_ring(&r),
             r,
         ));
@@ -354,10 +362,31 @@ fn an_lfm2_gguf_takes_the_device_filter_at_blocks_f32_only() {
     if !cfg!(feature = "metal") {
         device.push("--cpu");
     }
-    for (file, extra, want) in [
-        (&q8, vec![], true),
-        (&q8, vec!["--gguf-engine", "legacy"], false),
-        (&dense, vec![], false),
+    for (label, file, extra, want) in [
+        (
+            "lfm2-gguf q8_0 /health: device_filter true",
+            &q8,
+            vec![],
+            true,
+        ),
+        (
+            "lfm2-gguf q8_0 --gguf-act f32 /health: device_filter true",
+            &q8,
+            vec!["--gguf-act", "f32"],
+            true,
+        ),
+        (
+            "lfm2-gguf q8_0 legacy /health: device_filter false",
+            &q8,
+            vec!["--gguf-engine", "legacy"],
+            false,
+        ),
+        (
+            "lfm2-gguf dense f32 /health: device_filter false",
+            &dense,
+            vec![],
+            false,
+        ),
     ] {
         let mut args = device.clone();
         args.extend(extra.iter().copied());
@@ -365,14 +394,9 @@ fn an_lfm2_gguf_takes_the_device_filter_at_blocks_f32_only() {
         let (_, health) = server.call("GET", "/health", &json!({}));
         drop(server);
         let got = health["capabilities"]["device_filter"].as_bool();
-        let ok = got == Some(want);
         arms.push((
-            match (want, extra.is_empty()) {
-                (true, _) => "lfm2-gguf q8_0 /health: device_filter true",
-                (false, true) => "lfm2-gguf dense f32 /health: device_filter false",
-                (false, false) => "lfm2-gguf q8_0 legacy /health: device_filter false",
-            },
-            ok,
+            label,
+            got == Some(want),
             Ok((format!("{got:?}"), String::new(), false)),
         ));
     }

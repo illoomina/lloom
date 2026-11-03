@@ -222,27 +222,33 @@ pub const LFM2_GGUF_CAPABILITIES: Capabilities = Capabilities {
     eos_gate_missing:
         "the quantized matmul cores the packed projections run on carry no gated variant",
     device_filter: false,
-    device_filter_missing: "the device filter is an LFM2 GGUF's default only at blocks f32, \
-        the representation it was gated and priced on",
+    device_filter_missing: "the device filter is an LFM2 GGUF's default only at blocks f16 \
+        and blocks f32, the representations it was gated and priced on",
     ..LFM2_CAPABILITIES
 };
 
-/// The representation at which an LFM2 GGUF on the LFM2 engine takes the
-/// device filter by default: packed blocks computing at f32, where it was
-/// gated and priced. Any other representation keeps today's route, as the
-/// LFM2 rows are withheld where they were not measured
-/// (`frontend::withheld`; `docs/dispatch.md` §11.2).
-pub const LFM2_GGUF_DEVICE_FILTER: crate::frontend::Representation =
+/// The representations at which an LFM2 GGUF on the LFM2 engine takes the
+/// device filter by default, each gated and priced: packed blocks computing
+/// at f16, decision 110's default (step 2b), and at f32, the `--gguf-act f32`
+/// arm (step 2). Any other representation keeps today's route, as the LFM2
+/// rows are withheld where they were not measured (`frontend::withheld`;
+/// `docs/dispatch.md` §11.2).
+pub const LFM2_GGUF_DEVICE_FILTER: &[crate::frontend::Representation] = &[
+    crate::frontend::Representation {
+        blocks: true,
+        compute: lloom_tensor::DType::F16,
+    },
     crate::frontend::Representation {
         blocks: true,
         compute: lloom_tensor::DType::F32,
-    };
+    },
+];
 
 /// [`LFM2_GGUF_CAPABILITIES`] for a GGUF the LFM2 engine builds at `rep`
 /// (`None` when it is not known). The one rule for the load, which reads
 /// the header, and for the built engine, which reports its own.
 pub fn lfm2_gguf_engine_capabilities(rep: Option<crate::frontend::Representation>) -> Capabilities {
-    if rep != Some(LFM2_GGUF_DEVICE_FILTER) {
+    if !rep.is_some_and(|r| LFM2_GGUF_DEVICE_FILTER.contains(&r)) {
         return LFM2_GGUF_CAPABILITIES;
     }
     Capabilities {
@@ -841,7 +847,9 @@ impl Family for Lfm2GgufFamily {
         if !gguf_on_lfm2(model) {
             return super::causal_loaded::served::lfm2_gguf_capabilities();
         }
-        lfm2_gguf_engine_capabilities(lfm2::representation(first, model.cpu(), gguf_act(model)).ok())
+        lfm2_gguf_engine_capabilities(
+            lfm2::representation(first, model.cpu(), gguf_act(model)).ok(),
+        )
     }
     fn resolve(&self, req: &Requested<'_>) -> Result<()> {
         if gguf_on_lfm2(req.model) {
@@ -1608,7 +1616,7 @@ mod tests {
     /// capabilities, the LFM2 engine's GGUF and MoE ports included, set it off
     /// and keep today's route. An explicit value is never touched. The GGUF's
     /// load reads its representation's
-    /// (`an_lfm2_gguf_takes_the_device_filter_at_blocks_f32_only`).
+    /// (`an_lfm2_gguf_takes_the_device_filter_at_packed_blocks_only`).
     #[test]
     fn the_device_filter_is_lfm2s_default_and_no_other_familys() {
         assert_eq!(crate::ReadbackConfig::default().device_filter, None);
@@ -1640,19 +1648,21 @@ mod tests {
     }
 
     /// An LFM2 GGUF's device filter is its representation's (decision 109):
-    /// the LFM2 engine takes it by default at blocks f32 alone, where it was
-    /// gated and priced; every other representation, a checkpoint whose
-    /// header does not read, and the legacy engine keep today's route.
-    /// Nothing else in the capabilities moves, and every other family's
-    /// load reads its static capabilities.
+    /// the LFM2 engine takes it by default at packed blocks, computing at f16
+    /// (decision 110's default, step 2b) or at f32 (`--gguf-act f32`, step 2),
+    /// each gated and priced; a dense GGUF, a checkpoint whose header does not
+    /// read, and the legacy engine keep today's route. Nothing else in the
+    /// capabilities moves, and every other family's load reads its static
+    /// capabilities.
     #[test]
-    fn an_lfm2_gguf_takes_the_device_filter_at_blocks_f32_only() {
+    fn an_lfm2_gguf_takes_the_device_filter_at_packed_blocks_only() {
         use crate::frontend::Representation;
         use lloom_tensor::DType;
         let at = |blocks, compute| Some(Representation { blocks, compute });
         for (rep, on) in [
             (at(true, DType::F32), true),
-            (at(true, DType::F16), false),
+            (at(true, DType::F16), true),
+            (at(true, DType::BF16), false),
             (at(false, DType::F32), false),
             (at(false, DType::F16), false),
             (None, false),

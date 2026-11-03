@@ -3900,7 +3900,8 @@ impl<'m, M: CausalLM> Session<'m, M> {
     /// pass: from there every lane's position runs ahead of its log (the
     /// accepted ids are logged at the end) and its window opens and closes
     /// in turn. A failure before it keeps the call's own report: each
-    /// prefill unit logs what it fed.
+    /// prefill unit logs what it fed. A refusal of the preflight, before any
+    /// session is touched, is reported untouched (decision 124).
     #[allow(clippy::too_many_arguments)]
     fn decode_speculative_pipelined_limits<S>(
         sessions: &mut [Self],
@@ -3917,6 +3918,8 @@ impl<'m, M: CausalLM> Session<'m, M> {
         S: Speculator,
         M: Probes<S::Probe> + crate::profile::Shaped,
     {
+        Self::pipelined_preflight(sessions, spec, prompts, max_tokens.len(), eos_ids)
+            .map_err(|e| e.with_state_touched(lloom_tensor::StateTouched::No))?;
         let mut verifying = false;
         Self::decode_speculative_pipelined_run(
             sessions,
@@ -3939,22 +3942,20 @@ impl<'m, M: CausalLM> Session<'m, M> {
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn decode_speculative_pipelined_run<S>(
-        sessions: &mut [Self],
-        _rewind: crate::profile::RewindProof<M::Profile>,
-        spec: &mut S,
+    /// The pipelined driver's preflight: every refusal decided before any
+    /// session, lane or drafter slot is touched (decision 124). It reads the
+    /// sessions, the prompts and the proposer and writes nothing, so its
+    /// refusal is reported untouched ([`lloom_tensor::StateTouched::No`]) and
+    /// each row keeps its cached prefix (decision 105).
+    fn pipelined_preflight<S>(
+        sessions: &[Self],
+        spec: &S,
         prompts: &[&[u32]],
-        opts: &DecodeOptions,
-        max_tokens: impl ExactSizeIterator<Item = usize>,
+        caps: usize,
         eos_ids: &[u32],
-        device: &Device,
-        on_tokens: &mut dyn FnMut(usize, &[u32]) -> Result<()>,
-        verifying: &mut bool,
-    ) -> Result<Vec<DecodeOut>>
+    ) -> Result<()>
     where
         S: Speculator,
-        M: Probes<S::Probe> + crate::profile::Shaped,
     {
         let n = sessions.len();
         if n == 0 {
@@ -3967,11 +3968,11 @@ impl<'m, M: CausalLM> Session<'m, M> {
                 prompts.len()
             );
         }
-        if max_tokens.len() != n {
+        if caps != n {
             lloom_tensor::bail!(
                 "decode_speculative_pipelined: {} sessions and {} row caps",
                 n,
-                max_tokens.len()
+                caps
             );
         }
         if spec.max_draft() == 0 {
@@ -4007,6 +4008,27 @@ impl<'m, M: CausalLM> Session<'m, M> {
                 );
             }
         }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn decode_speculative_pipelined_run<S>(
+        sessions: &mut [Self],
+        _rewind: crate::profile::RewindProof<M::Profile>,
+        spec: &mut S,
+        prompts: &[&[u32]],
+        opts: &DecodeOptions,
+        max_tokens: impl ExactSizeIterator<Item = usize>,
+        eos_ids: &[u32],
+        device: &Device,
+        on_tokens: &mut dyn FnMut(usize, &[u32]) -> Result<()>,
+        verifying: &mut bool,
+    ) -> Result<Vec<DecodeOut>>
+    where
+        S: Speculator,
+        M: Probes<S::Probe> + crate::profile::Shaped,
+    {
+        let n = sessions.len();
         spec.want_confidence(false);
         // The rounds' timeline origin: a per-round clock (decision 123).
         let run_start = crate::hot_clock::HotInstant::now();

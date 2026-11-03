@@ -36,7 +36,7 @@ use lloom_engine::{
     SlotPool, StaticBody,
 };
 use lloom_tensor::{DType, Device, Result};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 const ROWS: usize = 2;
@@ -72,11 +72,18 @@ impl BatchRecovery for Drafter {
 }
 
 /// The static body `--dspark --batch N --rows private` serves: every row
-/// through the pipelined driver over the batch thread's one drafter.
-fn pipelined<P: Profile>() -> StaticBody<Faulty<P>, Drafter> {
-    Box::new(|idle, sessions, prompts, specs, on_tokens| {
+/// through the pipelined driver over the batch thread's one drafter. With
+/// `refuse_next` set, the next batch hands the driver an empty EOS set, which
+/// its preflight refuses before any session is touched (decision 124).
+fn pipelined<P: Profile>(refuse_next: Arc<AtomicBool>) -> StaticBody<Faulty<P>, Drafter> {
+    Box::new(move |idle, sessions, prompts, specs, on_tokens| {
         let caps: Vec<usize> = specs.iter().map(|s| s.max_tokens).collect();
         let rewind = RewindProof::<P>::ask().expect("a rewindable profile");
+        let eos: &[u32] = if refuse_next.swap(false, Ordering::AcqRel) {
+            &[]
+        } else {
+            &specs[0].eos_ids
+        };
         Session::decode_speculative_pipelined_with_caps(
             sessions,
             rewind,
@@ -84,7 +91,7 @@ fn pipelined<P: Profile>() -> StaticBody<Faulty<P>, Drafter> {
             prompts,
             idle.opts,
             &caps,
-            &specs[0].eos_ids,
+            eos,
             idle.device,
             on_tokens,
         )
@@ -97,6 +104,7 @@ struct Served<P: Profile> {
     thread: std::thread::JoinHandle<()>,
     fences: Arc<AtomicUsize>,
     aborts: Arc<AtomicUsize>,
+    refuse_next: Arc<AtomicBool>,
 }
 
 impl<P: Profile> Served<P> {
@@ -114,6 +122,7 @@ impl<P: Profile> Served<P> {
         });
         let fences = Arc::new(AtomicUsize::new(0));
         let aborts = Arc::new(AtomicUsize::new(0));
+        let refuse_next = Arc::new(AtomicBool::new(false));
         let bcfg = BatchConfig {
             device: device.clone(),
             pool,
@@ -128,7 +137,7 @@ impl<P: Profile> Served<P> {
             prefill_batch: 1,
             prefill_decode: lloom::nn::PrefillDecode::Ride,
             intake_per_tick: lloom_engine::options::DEFAULT_INTAKE_PER_TICK,
-            mode: BatchMode::Static(pipelined::<P>()),
+            mode: BatchMode::Static(pipelined::<P>(Arc::clone(&refuse_next))),
             extra: Drafter {
                 spec: Garbage::new(ROWS),
                 fences: Arc::clone(&fences),
@@ -143,6 +152,7 @@ impl<P: Profile> Served<P> {
             thread,
             fences,
             aborts,
+            refuse_next,
         }
     }
 
@@ -412,6 +422,85 @@ fn a_batch_refused_at_its_ceiling_keeps_its_prefixes<P: Profile>(
     served.stop();
 }
 
+/// Batch 1 caches both rows' prompts and replies. Batch 2 is refused by the
+/// pipelined driver's preflight (an empty EOS set) before any session, lane
+/// or drafter slot is touched, so the refusal is reported untouched (decision
+/// 124). Batch 3 extends batch 1's logs by a token: every row keeps its
+/// prefix and decodes what a scheduler that never saw batch 2 decodes, and no
+/// recovery runs.
+fn a_batch_refused_by_the_preflight_keeps_its_prefixes<P: Profile>(
+    arm: &str,
+    device: Device,
+    cfg: Config,
+    dtype: DType,
+) {
+    let clean = Served::<P>::start(device.clone(), cfg.clone(), dtype);
+    let served = Served::<P>::start(device, cfg, dtype);
+    let first = [vec![1u32, 2, 3, 4], vec![5u32, 6, 7]];
+    let replies = served.batch(&first, false);
+    assert_eq!(
+        clean.batch(&first, false),
+        replies,
+        "the clean run's batch 1"
+    );
+    let cached: Vec<Vec<u32>> = first
+        .iter()
+        .zip(&replies)
+        .map(|(p, r)| {
+            let mut c = p.clone();
+            c.extend(r.as_ref().expect("batch 1 is served"));
+            c
+        })
+        .collect();
+    let extended: Vec<Vec<u32>> = cached
+        .iter()
+        .enumerate()
+        .map(|(i, c)| {
+            let mut e = c.clone();
+            e.push(9 + i as u32);
+            e
+        })
+        .collect();
+    served.refuse_next.store(true, Ordering::Release);
+    for (i, f) in served.batch(&extended, false).iter().enumerate() {
+        let why = f.as_ref().expect_err("the preflight refuses the batch");
+        assert!(why.contains("eos_ids is empty"), "{arm} row {i}: {why}");
+    }
+    assert_eq!(served.model.failed(), 0, "nothing was injected");
+
+    let next: Vec<Vec<u32>> = cached
+        .iter()
+        .enumerate()
+        .map(|(i, c)| {
+            let mut n = c.clone();
+            n.push(20 + i as u32);
+            n
+        })
+        .collect();
+    let reused = round_reuse(&served.handle, &next, false, MAX);
+    let warm = round_reuse(&clean.handle, &next, false, MAX);
+    clean.stop();
+    for (i, (got, want)) in reused.iter().zip(&warm).enumerate() {
+        eprintln!("ARM {arm} row {i}: after {got:?} never-refused {want:?}");
+        let got = got.as_ref().expect("the row after the refusal is served");
+        let want = want.as_ref().expect("the never-refused row is served");
+        assert_eq!(
+            got, want,
+            "{arm} row {i}: (tokens, reuse, kept positions) after the refused batch"
+        );
+        assert!(
+            got.2 >= first[i].len(),
+            "{arm} row {i}: the cached prefix was not kept: {got:?}"
+        );
+    }
+    assert_eq!(
+        served.recovery(),
+        (0, 0),
+        "(fences, aborts): a preflight refusal that touched nothing ran the recovery"
+    );
+    served.stop();
+}
+
 /// Batch 2 extends batch 1's logs to four positions short of the ceiling:
 /// the prefill fits, and a verify window a few rounds in does not. The
 /// model refuses that window's pass before the pass moves anything, but the
@@ -566,5 +655,26 @@ fn natively_a_paged_static_batch_failing_past_its_first_layer_hands_its_rows_bac
         DType::F16,
         Site::PrefillPastRope,
         1,
+    );
+}
+
+#[test]
+fn a_static_batch_refused_by_the_pipelined_preflight_keeps_its_prefixes() {
+    a_batch_refused_by_the_preflight_keeps_its_prefixes::<RewindableExact>(
+        "cpu-rewindable",
+        Device::Cpu,
+        small_config(),
+        DType::F32,
+    );
+}
+
+#[cfg(feature = "metal")]
+#[test]
+fn natively_a_paged_static_batch_refused_by_the_pipelined_preflight_keeps_its_prefixes() {
+    a_batch_refused_by_the_preflight_keeps_its_prefixes::<lloom::profile::PoolSpecExact>(
+        "metal-private-paged",
+        Device::new_metal(0).unwrap(),
+        small_native_config(true),
+        DType::F16,
     );
 }

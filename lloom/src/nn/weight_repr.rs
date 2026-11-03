@@ -284,13 +284,18 @@ impl ReprEmbedding {
         }
     }
 
-    /// The output a guarded lookup writes: the table's dense dtype, or f32 for
-    /// packed rows, as [`Module::forward`] returns them.
+    /// The output a guarded lookup writes, at the dtype [`Module::forward`]
+    /// returns: the table's dense dtype, or for packed rows the model's
+    /// ([`Self::compute_dtype`]), the f32 dequantization rounded once to it
+    /// as `forward`'s cast rounds it. So the prepared route feeds the stream
+    /// the rows the incumbent lookup feeds it (decision 110: f16 on Metal).
     #[cfg(feature = "metal")]
     pub fn guarded_layout(&self) -> Result<lloom_tensor::quantized::GuardedEmbeddingLayout> {
         match &self.inner {
             Table::Dense(e) => e.guarded_layout(),
-            Table::Blocks(q) => QMatMul::QTensor(q.clone()).guarded_embedding_layout(),
+            Table::Blocks(q) => {
+                QMatMul::QTensor(q.clone()).guarded_embedding_layout_at(Some(self.dtype))
+            }
         }
     }
 
@@ -298,7 +303,8 @@ impl ReprEmbedding {
     pub fn check_guarded_output(&self, out: &Tensor) -> Result<()> {
         match &self.inner {
             Table::Dense(e) => e.check_guarded_output(out),
-            Table::Blocks(q) => QMatMul::QTensor(q.clone()).check_guarded_embedding_output(out),
+            Table::Blocks(q) => QMatMul::QTensor(q.clone())
+                .check_guarded_embedding_output_at(out, Some(self.dtype)),
         }
     }
 

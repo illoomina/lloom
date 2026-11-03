@@ -393,7 +393,15 @@ fn stream(model: &Path, extra: &[&str]) -> Stream {
     let out = Command::new(env!("CARGO_BIN_EXE_lloom"))
         .args(["chat", "--model"])
         .arg(model)
-        .args(["--raw", "-v", "-p", PROMPT, "-n", MAX_TOKENS, "--ignore-eos"])
+        .args([
+            "--raw",
+            "-v",
+            "-p",
+            PROMPT,
+            "-n",
+            MAX_TOKENS,
+            "--ignore-eos",
+        ])
         .args(extra)
         .output()
         .expect("lloom runs");

@@ -590,9 +590,8 @@ fn invalid_later_row_and_valid_queued_successor_never_index_a_packed_table() -> 
 /// cast to f16, bit for bit: the rows dequantize in f32 and round to half once,
 /// as `QTensor::embedding` followed by `to_dtype(F16)` rounds them (an LFM2
 /// GGUF's fallback route at f16 compute, `ReprEmbedding::forward`). Kinds with
-/// 32- and 256-wide blocks (the K-quants' two-term dequantization is where
-/// rounding in half would part from rounding once), magnitudes from f16's
-/// subnormal range to the hundreds, a nonzero (row-aligned) output offset
+/// 32- and 256-wide blocks, magnitudes from f16's subnormal range to the
+/// hundreds, two rows out of order, a nonzero (row-aligned) output offset
 /// whose untouched row keeps its fill, the same bits on every run, and the
 /// f32 output, unchanged, as the control.
 #[test]
@@ -619,7 +618,12 @@ fn packed_embedding_into_f16_is_the_incumbent_lookup_rounded_once() -> Result<()
             .map(f16::to_bits)
             .collect())
     };
-    for kind in [GgmlDType::Q8_0, GgmlDType::Q4_0, GgmlDType::Q4K, GgmlDType::Q6K] {
+    for kind in [
+        GgmlDType::Q8_0,
+        GgmlDType::Q4_0,
+        GgmlDType::Q4K,
+        GgmlDType::Q6K,
+    ] {
         let q = std::sync::Arc::new(QTensor::quantize(&weights, kind)?);
         let rows = q.embedding(&Tensor::new(&ids[..], &d)?)?;
         let want = bits(&rows.to_dtype(DType::F16)?)?;
@@ -657,9 +661,22 @@ fn packed_embedding_into_f16_is_the_incumbent_lookup_rounded_once() -> Result<()
         drop(token);
         finish(&d)?;
         guard.check_error()?;
-        let got: Vec<u32> = out.flatten_all()?.to_vec1::<f32>()?.iter().map(|x| x.to_bits()).collect();
-        let want: Vec<u32> = rows.flatten_all()?.to_vec1::<f32>()?.iter().map(|x| x.to_bits()).collect();
-        assert_eq!(got, want, "{kind:?}: the f32 output is the incumbent lookup");
+        let got: Vec<u32> = out
+            .flatten_all()?
+            .to_vec1::<f32>()?
+            .iter()
+            .map(|x| x.to_bits())
+            .collect();
+        let want: Vec<u32> = rows
+            .flatten_all()?
+            .to_vec1::<f32>()?
+            .iter()
+            .map(|x| x.to_bits())
+            .collect();
+        assert_eq!(
+            got, want,
+            "{kind:?}: the f32 output is the incumbent lookup"
+        );
     }
     Ok(())
 }

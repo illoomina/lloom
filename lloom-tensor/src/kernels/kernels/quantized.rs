@@ -75,6 +75,12 @@ pub struct QuantKind {
     pub mul_mm: Option<&'static str>,
     pub get_rows: Option<&'static str>,
     pub guarded_get_rows: Option<&'static str>,
+    /// The guarded get_rows writing f16 rows (`kernel_get_rows_<stem>_guarded_f16`):
+    /// the block dequantized in f32, as [`Self::guarded_get_rows`] does, and
+    /// rounded to half once at the store, for a stream that computes in f16.
+    /// The packed kinds only; a dense table's guarded lookup copies its own
+    /// dtype.
+    pub guarded_get_rows_f16: Option<&'static str>,
     /// `kernel_dequant_rows_f16_<stem>` (the prefill stems' dequantise-once).
     pub dequant_rows_f16: bool,
     /// The core stages a codebook into threadgroup memory (8192 bytes).
@@ -96,7 +102,7 @@ const fn kind(
     type_size: usize,
     mul_mv: MulMv,
     mul_mm: Option<&'static str>,
-    get_rows: Option<(&'static str, &'static str)>,
+    get_rows: Option<(&'static str, &'static str, Option<&'static str>)>,
     iq_shared: bool,
     (rows_max, rows_max_routed): (usize, usize),
 ) -> QuantKind {
@@ -113,11 +119,15 @@ const fn kind(
         mul_mm_id_mapped: quant || dense,
         mul_mm,
         get_rows: match get_rows {
-            Some((plain, _)) => Some(plain),
+            Some((plain, _, _)) => Some(plain),
             None => None,
         },
         guarded_get_rows: match get_rows {
-            Some((_, guarded)) => Some(guarded),
+            Some((_, guarded, _)) => Some(guarded),
+            None => None,
+        },
+        guarded_get_rows_f16: match get_rows {
+            Some((_, _, f16)) => f16,
             None => None,
         },
         dequant_rows_f16: quant,
@@ -136,31 +146,31 @@ const fn kind(
 /// their isolated kernel timings (§3, §3a), by decision 106; `fast` only.
 #[rustfmt::skip]
 const KINDS: [QuantKind; 25] = [
-    kind(GgmlDType::Q4_0,   "q4_0",    32,  18, MulMv::Quant("kernel_mul_mv_q4_0"),    Some("kernel_mul_mm_q4_0_f32"),    Some(("kernel_get_rows_q4_0", "kernel_get_rows_q4_0_guarded")),    false, (1, 1)),
-    kind(GgmlDType::Q4_1,   "q4_1",    32,  20, MulMv::Quant("kernel_mul_mv_q4_1"),    Some("kernel_mul_mm_q4_1_f32"),    Some(("kernel_get_rows_q4_1", "kernel_get_rows_q4_1_guarded")),    false, (1, 1)),
-    kind(GgmlDType::Q5_0,   "q5_0",    32,  22, MulMv::Quant("kernel_mul_mv_q5_0"),    Some("kernel_mul_mm_q5_0_f32"),    Some(("kernel_get_rows_q5_0", "kernel_get_rows_q5_0_guarded")),    false, (1, 1)),
-    kind(GgmlDType::Q5_1,   "q5_1",    32,  24, MulMv::Quant("kernel_mul_mv_q5_1"),    Some("kernel_mul_mm_q5_1_f32"),    Some(("kernel_get_rows_q5_1", "kernel_get_rows_q5_1_guarded")),    false, (1, 1)),
-    kind(GgmlDType::Q8_0,   "q8_0",    32,  34, MulMv::Quant("kernel_mul_mv_q8_0"),    Some("kernel_mul_mm_q8_0_f32"),    Some(("kernel_get_rows_q8_0", "kernel_get_rows_q8_0_guarded")),    false, (2, 1)),
+    kind(GgmlDType::Q4_0,   "q4_0",    32,  18, MulMv::Quant("kernel_mul_mv_q4_0"),    Some("kernel_mul_mm_q4_0_f32"),    Some(("kernel_get_rows_q4_0", "kernel_get_rows_q4_0_guarded", Some("kernel_get_rows_q4_0_guarded_f16"))),    false, (1, 1)),
+    kind(GgmlDType::Q4_1,   "q4_1",    32,  20, MulMv::Quant("kernel_mul_mv_q4_1"),    Some("kernel_mul_mm_q4_1_f32"),    Some(("kernel_get_rows_q4_1", "kernel_get_rows_q4_1_guarded", Some("kernel_get_rows_q4_1_guarded_f16"))),    false, (1, 1)),
+    kind(GgmlDType::Q5_0,   "q5_0",    32,  22, MulMv::Quant("kernel_mul_mv_q5_0"),    Some("kernel_mul_mm_q5_0_f32"),    Some(("kernel_get_rows_q5_0", "kernel_get_rows_q5_0_guarded", Some("kernel_get_rows_q5_0_guarded_f16"))),    false, (1, 1)),
+    kind(GgmlDType::Q5_1,   "q5_1",    32,  24, MulMv::Quant("kernel_mul_mv_q5_1"),    Some("kernel_mul_mm_q5_1_f32"),    Some(("kernel_get_rows_q5_1", "kernel_get_rows_q5_1_guarded", Some("kernel_get_rows_q5_1_guarded_f16"))),    false, (1, 1)),
+    kind(GgmlDType::Q8_0,   "q8_0",    32,  34, MulMv::Quant("kernel_mul_mv_q8_0"),    Some("kernel_mul_mm_q8_0_f32"),    Some(("kernel_get_rows_q8_0", "kernel_get_rows_q8_0_guarded", Some("kernel_get_rows_q8_0_guarded_f16"))),    false, (2, 1)),
     kind(GgmlDType::Q8_1,   "q8_1",    32,  36, MulMv::None,                           None,                              None,                            false, (1, 1)),
-    kind(GgmlDType::Q2K,    "q2_K",   256,  84, MulMv::Quant("kernel_mul_mv_q2_K"),    Some("kernel_mul_mm_q2_K_f32"),    Some(("kernel_get_rows_q2_K", "kernel_get_rows_q2_K_guarded")),    false, (8, 1)),
-    kind(GgmlDType::Q3K,    "q3_K",   256, 110, MulMv::Quant("kernel_mul_mv_q3_K"),    Some("kernel_mul_mm_q3_K_f32"),    Some(("kernel_get_rows_q3_K", "kernel_get_rows_q3_K_guarded")),    false, (1, 1)),
-    kind(GgmlDType::Q4K,    "q4_K",   256, 144, MulMv::Quant("kernel_mul_mv_q4_K"),    Some("kernel_mul_mm_q4_K_f32"),    Some(("kernel_get_rows_q4_K", "kernel_get_rows_q4_K_guarded")),    false, (2, 1)),
-    kind(GgmlDType::Q5K,    "q5_K",   256, 176, MulMv::Quant("kernel_mul_mv_q5_K"),    Some("kernel_mul_mm_q5_K_f32"),    Some(("kernel_get_rows_q5_K", "kernel_get_rows_q5_K_guarded")),    false, (2, 1)),
-    kind(GgmlDType::Q6K,    "q6_K",   256, 210, MulMv::Quant("kernel_mul_mv_q6_K"),    Some("kernel_mul_mm_q6_K_f32"),    Some(("kernel_get_rows_q6_K", "kernel_get_rows_q6_K_guarded")),    false, (2, 1)),
+    kind(GgmlDType::Q2K,    "q2_K",   256,  84, MulMv::Quant("kernel_mul_mv_q2_K"),    Some("kernel_mul_mm_q2_K_f32"),    Some(("kernel_get_rows_q2_K", "kernel_get_rows_q2_K_guarded", Some("kernel_get_rows_q2_K_guarded_f16"))),    false, (8, 1)),
+    kind(GgmlDType::Q3K,    "q3_K",   256, 110, MulMv::Quant("kernel_mul_mv_q3_K"),    Some("kernel_mul_mm_q3_K_f32"),    Some(("kernel_get_rows_q3_K", "kernel_get_rows_q3_K_guarded", Some("kernel_get_rows_q3_K_guarded_f16"))),    false, (1, 1)),
+    kind(GgmlDType::Q4K,    "q4_K",   256, 144, MulMv::Quant("kernel_mul_mv_q4_K"),    Some("kernel_mul_mm_q4_K_f32"),    Some(("kernel_get_rows_q4_K", "kernel_get_rows_q4_K_guarded", Some("kernel_get_rows_q4_K_guarded_f16"))),    false, (2, 1)),
+    kind(GgmlDType::Q5K,    "q5_K",   256, 176, MulMv::Quant("kernel_mul_mv_q5_K"),    Some("kernel_mul_mm_q5_K_f32"),    Some(("kernel_get_rows_q5_K", "kernel_get_rows_q5_K_guarded", Some("kernel_get_rows_q5_K_guarded_f16"))),    false, (2, 1)),
+    kind(GgmlDType::Q6K,    "q6_K",   256, 210, MulMv::Quant("kernel_mul_mv_q6_K"),    Some("kernel_mul_mm_q6_K_f32"),    Some(("kernel_get_rows_q6_K", "kernel_get_rows_q6_K_guarded", Some("kernel_get_rows_q6_K_guarded_f16"))),    false, (2, 1)),
     kind(GgmlDType::Q8K,    "q8_K",   256, 292, MulMv::None,                           None,                              None,                            false, (1, 1)),
-    kind(GgmlDType::F16,    "f16",      1,   2, MulMv::Dense("kernel_mul_mv_f16_f32"), Some("kernel_mul_mm_f16_f32"),     Some(("kernel_get_rows_f16", "kernel_get_rows_f16_guarded")),     false, (1, 1)),
-    kind(GgmlDType::F32,    "f32",      1,   4, MulMv::Dense("kernel_mul_mv_f32_f32"), Some("kernel_mul_mm_f32_f32"),     Some(("kernel_get_rows_f32", "kernel_get_rows_f32_guarded")),     false, (1, 1)),
-    kind(GgmlDType::BF16,   "bf16",     1,   2, MulMv::None,                           Some("kernel_mul_mm_bf16_f32"),    Some(("kernel_get_rows_bf16", "kernel_get_rows_bf16_guarded")),    false, (1, 1)),
-    kind(GgmlDType::IQ2XXS, "iq2_xxs", 256,  66, MulMv::Quant("kernel_mul_mv_iq2_xxs"), Some("kernel_mul_mm_iq2_xxs_f32"), Some(("kernel_get_rows_iq2_xxs", "kernel_get_rows_iq2_xxs_guarded")), true, (1, 1)),
-    kind(GgmlDType::IQ2XS,  "iq2_xs",  256,  74, MulMv::Quant("kernel_mul_mv_iq2_xs"),  Some("kernel_mul_mm_iq2_xs_f32"),  Some(("kernel_get_rows_iq2_xs", "kernel_get_rows_iq2_xs_guarded")),  true, (1, 1)),
-    kind(GgmlDType::IQ2S,   "iq2_s",   256,  82, MulMv::Quant("kernel_mul_mv_iq2_s"),   Some("kernel_mul_mm_iq2_s_f32"),   Some(("kernel_get_rows_iq2_s", "kernel_get_rows_iq2_s_guarded")),   true, (1, 1)),
-    kind(GgmlDType::IQ3XXS, "iq3_xxs", 256,  98, MulMv::Quant("kernel_mul_mv_iq3_xxs"), Some("kernel_mul_mm_iq3_xxs_f32"), Some(("kernel_get_rows_iq3_xxs", "kernel_get_rows_iq3_xxs_guarded")), true, (1, 1)),
-    kind(GgmlDType::IQ3S,   "iq3_s",   256, 110, MulMv::Quant("kernel_mul_mv_iq3_s"),   Some("kernel_mul_mm_iq3_s_f32"),   Some(("kernel_get_rows_iq3_s", "kernel_get_rows_iq3_s_guarded")),   true, (1, 1)),
-    kind(GgmlDType::IQ4NL,  "iq4_nl",   32,  18, MulMv::Quant("kernel_mul_mv_iq4_nl"),  Some("kernel_mul_mm_iq4_nl_f32"),  Some(("kernel_get_rows_iq4_nl", "kernel_get_rows_iq4_nl_guarded")),  true, (1, 1)),
-    kind(GgmlDType::IQ4XS,  "iq4_xs",  256, 136, MulMv::Quant("kernel_mul_mv_iq4_xs"),  Some("kernel_mul_mm_iq4_xs_f32"),  Some(("kernel_get_rows_iq4_xs", "kernel_get_rows_iq4_xs_guarded")),  true, (1, 1)),
-    kind(GgmlDType::Q2_0,   "q2_0",    64,  18, MulMv::Quant("kernel_mul_mv_q2_0"),    Some("kernel_mul_mm_q2_0_f32"),    Some(("kernel_get_rows_q2_0", "kernel_get_rows_q2_0_guarded")),    false, (1, 1)),
-    kind(GgmlDType::MXFP4,  "mxfp4",   32,  17, MulMv::Quant("kernel_mul_mv_mxfp4"),   Some("kernel_mul_mm_mxfp4_f32"),   Some(("kernel_get_rows_mxfp4", "kernel_get_rows_mxfp4_guarded")),   true, (1, 1)),
-    kind(GgmlDType::FP8E4M3, "fp8_e4m3", 32, 34, MulMv::Quant("kernel_mul_mv_fp8_e4m3"), Some("kernel_mul_mm_fp8_e4m3_f32"), Some(("kernel_get_rows_fp8_e4m3", "kernel_get_rows_fp8_e4m3_guarded")), false, (1, 1)),
+    kind(GgmlDType::F16,    "f16",      1,   2, MulMv::Dense("kernel_mul_mv_f16_f32"), Some("kernel_mul_mm_f16_f32"),     Some(("kernel_get_rows_f16", "kernel_get_rows_f16_guarded", None)),     false, (1, 1)),
+    kind(GgmlDType::F32,    "f32",      1,   4, MulMv::Dense("kernel_mul_mv_f32_f32"), Some("kernel_mul_mm_f32_f32"),     Some(("kernel_get_rows_f32", "kernel_get_rows_f32_guarded", None)),     false, (1, 1)),
+    kind(GgmlDType::BF16,   "bf16",     1,   2, MulMv::None,                           Some("kernel_mul_mm_bf16_f32"),    Some(("kernel_get_rows_bf16", "kernel_get_rows_bf16_guarded", None)),    false, (1, 1)),
+    kind(GgmlDType::IQ2XXS, "iq2_xxs", 256,  66, MulMv::Quant("kernel_mul_mv_iq2_xxs"), Some("kernel_mul_mm_iq2_xxs_f32"), Some(("kernel_get_rows_iq2_xxs", "kernel_get_rows_iq2_xxs_guarded", Some("kernel_get_rows_iq2_xxs_guarded_f16"))), true, (1, 1)),
+    kind(GgmlDType::IQ2XS,  "iq2_xs",  256,  74, MulMv::Quant("kernel_mul_mv_iq2_xs"),  Some("kernel_mul_mm_iq2_xs_f32"),  Some(("kernel_get_rows_iq2_xs", "kernel_get_rows_iq2_xs_guarded", Some("kernel_get_rows_iq2_xs_guarded_f16"))),  true, (1, 1)),
+    kind(GgmlDType::IQ2S,   "iq2_s",   256,  82, MulMv::Quant("kernel_mul_mv_iq2_s"),   Some("kernel_mul_mm_iq2_s_f32"),   Some(("kernel_get_rows_iq2_s", "kernel_get_rows_iq2_s_guarded", Some("kernel_get_rows_iq2_s_guarded_f16"))),   true, (1, 1)),
+    kind(GgmlDType::IQ3XXS, "iq3_xxs", 256,  98, MulMv::Quant("kernel_mul_mv_iq3_xxs"), Some("kernel_mul_mm_iq3_xxs_f32"), Some(("kernel_get_rows_iq3_xxs", "kernel_get_rows_iq3_xxs_guarded", Some("kernel_get_rows_iq3_xxs_guarded_f16"))), true, (1, 1)),
+    kind(GgmlDType::IQ3S,   "iq3_s",   256, 110, MulMv::Quant("kernel_mul_mv_iq3_s"),   Some("kernel_mul_mm_iq3_s_f32"),   Some(("kernel_get_rows_iq3_s", "kernel_get_rows_iq3_s_guarded", Some("kernel_get_rows_iq3_s_guarded_f16"))),   true, (1, 1)),
+    kind(GgmlDType::IQ4NL,  "iq4_nl",   32,  18, MulMv::Quant("kernel_mul_mv_iq4_nl"),  Some("kernel_mul_mm_iq4_nl_f32"),  Some(("kernel_get_rows_iq4_nl", "kernel_get_rows_iq4_nl_guarded", Some("kernel_get_rows_iq4_nl_guarded_f16"))),  true, (1, 1)),
+    kind(GgmlDType::IQ4XS,  "iq4_xs",  256, 136, MulMv::Quant("kernel_mul_mv_iq4_xs"),  Some("kernel_mul_mm_iq4_xs_f32"),  Some(("kernel_get_rows_iq4_xs", "kernel_get_rows_iq4_xs_guarded", Some("kernel_get_rows_iq4_xs_guarded_f16"))),  true, (1, 1)),
+    kind(GgmlDType::Q2_0,   "q2_0",    64,  18, MulMv::Quant("kernel_mul_mv_q2_0"),    Some("kernel_mul_mm_q2_0_f32"),    Some(("kernel_get_rows_q2_0", "kernel_get_rows_q2_0_guarded", Some("kernel_get_rows_q2_0_guarded_f16"))),    false, (1, 1)),
+    kind(GgmlDType::MXFP4,  "mxfp4",   32,  17, MulMv::Quant("kernel_mul_mv_mxfp4"),   Some("kernel_mul_mm_mxfp4_f32"),   Some(("kernel_get_rows_mxfp4", "kernel_get_rows_mxfp4_guarded", Some("kernel_get_rows_mxfp4_guarded_f16"))),   true, (1, 1)),
+    kind(GgmlDType::FP8E4M3, "fp8_e4m3", 32, 34, MulMv::Quant("kernel_mul_mv_fp8_e4m3"), Some("kernel_mul_mm_fp8_e4m3_f32"), Some(("kernel_get_rows_fp8_e4m3", "kernel_get_rows_fp8_e4m3_guarded", Some("kernel_get_rows_fp8_e4m3_guarded_f16"))), false, (1, 1)),
 ];
 
 impl QuantKind {
@@ -1719,6 +1729,9 @@ pub unsafe fn call_quantized_get_rows(
 }
 
 /// Existing get_rows with an opaque request guard before any id/table access.
+/// `f16` writes the rows at half ([`QuantKind::guarded_get_rows_f16`]: the
+/// same f32 dequantization, rounded once at the store), `dst` then holding
+/// `ids_len * hidden_size` halves; otherwise at f32, as the unguarded arm does.
 /// # Safety
 /// Original get_rows span/custody contract applies. Error is four request-owned
 /// U32 words, a whole-window validation precedes this consumer, and no alias
@@ -1738,6 +1751,7 @@ pub unsafe fn call_quantized_get_rows_guarded(
     dst: &Buffer,
     dst_offset: usize,
     error: &Buffer,
+    f16: bool,
 ) -> Result<(), MetalKernelError> {
     // SAFETY: caller supplies original spans and the retained request guard.
     unsafe {
@@ -1754,7 +1768,7 @@ pub unsafe fn call_quantized_get_rows_guarded(
             ids_offset,
             dst,
             dst_offset,
-            Some(error),
+            Some((error, f16)),
         )
     }
 }
@@ -1773,18 +1787,28 @@ unsafe fn call_quantized_get_rows_impl(
     ids_offset: usize,
     dst: &Buffer,
     dst_offset: usize,
-    error: Option<&Buffer>,
+    guard: Option<(&Buffer, bool)>,
 ) -> Result<(), MetalKernelError> {
-    let dst_row_stride = hidden_size * core::mem::size_of::<f32>();
+    let f16 = matches!(guard, Some((_, true)));
+    let dst_row_stride = hidden_size
+        * if f16 {
+            core::mem::size_of::<half::f16>()
+        } else {
+            core::mem::size_of::<f32>()
+        };
     let kind = dtype.kind();
-    let name = (if error.is_some() {
-        kind.guarded_get_rows
-    } else {
-        kind.get_rows
+    let name = (match guard {
+        Some((_, true)) => kind.guarded_get_rows_f16,
+        Some((_, false)) => kind.guarded_get_rows,
+        None => kind.get_rows,
     })
     .ok_or_else(|| {
         MetalKernelError::UnsupportedDTypeForOp(Box::new(UnsupportedDTypeForOp {
-            dtype: "no kernel_get_rows arm for this weight dtype (Q8_1, Q8_K)",
+            dtype: if f16 {
+                "no f16-output guarded kernel_get_rows arm for this weight dtype (the packed kinds only)"
+            } else {
+                "no kernel_get_rows arm for this weight dtype (Q8_1, Q8_K)"
+            },
             op: "get_rows",
         }))
     })?;
@@ -1829,7 +1853,7 @@ unsafe fn call_quantized_get_rows_impl(
         );
     }
 
-    if let Some(error) = error {
+    if let Some((error, _)) = guard {
         // SAFETY: same exact-origin retained guard contract as this entry.
         unsafe { crate::kernels::utils::set_param(encoder, 11, error) };
     }

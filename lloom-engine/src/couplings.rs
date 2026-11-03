@@ -28,10 +28,10 @@ pub const COUPLINGS: &[Coupling] = &[
     Coupling {
         id: "C1",
         kind: "resolves",
-        when: "decode.readback.kind = auto, and the sampler is host-side (top-k or top-p at a temperature) with the device filter off (decode.readback.device_filter = false, or unset on a family whose default is off: every family but lfm2)",
+        when: "decode.readback.kind = auto, and the sampler is host-side (top-k or top-p at a temperature) with the device filter off (decode.readback.device_filter = false, or unset on a family whose default is off: every family but lfm2, and an LFM2 GGUF on the LFM2 engine at packed blocks, blocks f16 or blocks f32)",
         effect: "the run takes the blocking readback, reported on the turn line",
         keys: &["decode.readback.kind", "decode.readback.device_filter", "generation.top_k", "generation.top_p", "generation.temperature", "generation.sampling.method"],
-        site: "lloom-engine/src/decode.rs DecodeParams::sampler_route, DecodeSession::device_filter; app/family.rs resolve_device_filter; ReadbackArm::{ring_admits, resolve}",
+        site: "lloom-engine/src/decode.rs DecodeParams::sampler_route, DecodeSession::device_filter; app/family.rs resolve_device_filter, lfm2_gguf_engine_capabilities; ReadbackArm::{ring_admits, resolve}",
         is_static: false,
     },
     Coupling {
@@ -390,7 +390,7 @@ pub fn explain(o: &EngineOptions) -> Vec<String> {
         if let Ok(lfm2) = params.sampler_route(true, &sampling, metal, r.ring_arm()) {
             if lfm2.prepared_sampler {
                 out.push(format!(
-                    "decode.readback.device_filter unset -> on for lfm2: {} (decision 109); the other families take the route below",
+                    "decode.readback.device_filter unset -> on for lfm2, and for an LFM2 GGUF on the LFM2 engine at packed blocks (blocks f16 or blocks f32): {} (decision 109); the other families take the route below",
                     lfm2.arm.name()
                 ));
             }

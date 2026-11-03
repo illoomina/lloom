@@ -428,6 +428,11 @@ pub fn parse_quantized(name: &str) -> Option<Key> {
     if let Some(r) = name.strip_prefix("kernel_get_rows_") {
         // `kernel_get_rows_<fmt>_guarded` (#1036): its own entry, or the
         // suffix reads as part of the format and no cell can run it (#1183).
+        // `_guarded_f16` is the same entry writing an f16 stream's rows
+        // (#1036 step 2b), the f16 cell.
+        if let Some(s) = r.strip_suffix("_guarded_f16") {
+            return cell(Entry::GetRowsGuarded, s, Act::F16);
+        }
         if let Some(s) = r.strip_suffix("_guarded") {
             return cell(Entry::GetRowsGuarded, s, Act::F32);
         }
@@ -1428,19 +1433,32 @@ impl Matrix {
     /// generation and `weight_repr`), with the ids a guarded sampler draw
     /// produced: a `u32` device buffer the request's sticky error word guards.
     ///
+    /// At `act` f32 the rows are written at f32
+    /// (`kernel_get_rows_<fmt>_guarded`); at f16, into an f16 stream
+    /// (`kernel_get_rows_<fmt>_guarded_f16`, #1036 step 2b), the CPU
+    /// `to_float` rounded to half once (`Weight::w16`), the incumbent lookup
+    /// cast to f16.
+    ///
     /// Two arms, both against absolute references:
     /// - **valid**: one-hot scores make the draw name exactly `ids` (the last
     ///   row, 36, among them), the request's error reads clear, and every
-    ///   output is the CPU `to_float` of its row, bit for bit;
+    ///   output is the CPU `to_float` of its row (at f16: rounded to half),
+    ///   bit for bit;
     /// - **suppressed**: a NaN score in the LAST row sets the request's error
     ///   at validation, so the kernel must write nothing, the rows before the
     ///   failing one included: every output keeps its sentinel's bits, and the
     ///   error reads set (the positive control that the arm exercised the
     ///   guard, not a draw that happened to succeed).
-    pub fn run_get_rows_guarded(&mut self, d: GgmlDType) -> Result<()> {
-        let key: Key = (Entry::GetRowsGuarded, stem(d).into(), Act::F32);
+    pub fn run_get_rows_guarded(&mut self, d: GgmlDType, act: Act) -> Result<()> {
+        let key: Key = (Entry::GetRowsGuarded, stem(d).into(), act);
         let rows = 37usize;
-        let kernel = format!("kernel_get_rows_{}_guarded", stem(d));
+        let (kernel, out_dtype) = match act {
+            Act::F16 => (
+                format!("kernel_get_rows_{}_guarded_f16", stem(d)),
+                DType::F16,
+            ),
+            _ => (format!("kernel_get_rows_{}_guarded", stem(d)), DType::F32),
+        };
         for (k, mag) in Self::kmags(d) {
             let w = weight(&self.dev, d, &[rows, k], 23 + k as u32, mag)?;
             for ids in [vec![36u32], vec![36, 0, 5, 36, 17]] {
@@ -1451,12 +1469,18 @@ impl Matrix {
                         "valid"
                     };
                     let at = format!("{arm} ids={ids:?} k={k} mag={mag}");
-                    let out = Tensor::full(SENTINEL, (ids.len(), k), &self.dev)?;
+                    let out =
+                        Tensor::full(SENTINEL, (ids.len(), k), &self.dev)?.to_dtype(out_dtype)?;
                     let (mut guard, census) = self.census(|| {
                         guarded_draw(&self.dev, rows, &ids, nan_row, |tokens| {
                             w.q.embedding_guarded_into(tokens, &out)
                         })
                     })?;
+                    let reference = if out_dtype == DType::F16 {
+                        &w.w16
+                    } else {
+                        &w.w
+                    };
                     self.check_census(&key, &at, &census, std::slice::from_ref(&kernel));
                     let got = to_f32(&out)?;
                     self.cell(&key).absorb(got.iter().map(|v| v.to_bits()));
@@ -1467,7 +1491,7 @@ impl Matrix {
                         (None, Ok(true)) => {
                             for (i, &id) in ids.iter().enumerate() {
                                 for j in 0..k {
-                                    let (g, r) = (got[i * k + j], w.w[id as usize * k + j]);
+                                    let (g, r) = (got[i * k + j], reference[id as usize * k + j]);
                                     let u = ulps32(g, r);
                                     if u > worst || where_.is_empty() {
                                         worst = u;
@@ -1890,7 +1914,7 @@ impl Matrix {
                 Entry::MmId32 => self.run_mm_id(d, 32)?,
                 Entry::MmId16 => self.run_mm_id(d, 16)?,
                 Entry::GetRows => self.run_get_rows(d)?,
-                Entry::GetRowsGuarded => self.run_get_rows_guarded(d)?,
+                Entry::GetRowsGuarded => self.run_get_rows_guarded(d, act)?,
                 Entry::DequantRowsF16 => {
                     self.run_dequant_rows_f16(d)?;
                     if entries.contains(&Entry::DequantMm) {
@@ -1974,11 +1998,12 @@ impl Matrix {
                     self.census(|| w.q.embedding(&ids))
                 }
                 Entry::GetRowsGuarded => {
-                    if act == Act::F16 {
-                        return Err(lloom_tensor::Error::Msg("no activation".into()));
-                    }
+                    // f16: the guarded lookup into an f16 stream (step 2b).
                     let w = weight(&self.dev, d, &[4, k], 1, 1.0)?;
-                    let out = Tensor::full(SENTINEL, (1, k), &self.dev)?;
+                    let out = Tensor::full(SENTINEL, (1, k), &self.dev)?.to_dtype(match act {
+                        Act::F16 => DType::F16,
+                        _ => DType::F32,
+                    })?;
                     self.census(|| {
                         guarded_draw(&self.dev, 4, &[1], None, |tokens| {
                             w.q.embedding_guarded_into(tokens, &out)

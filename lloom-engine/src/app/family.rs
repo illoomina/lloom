@@ -157,6 +157,12 @@ pub trait Family: Send + Sync {
     /// the path the loader takes (the first GGUF shard, the directory).
     fn detect(&self, path: &Path) -> Option<PathBuf>;
     fn capabilities(&self) -> Capabilities;
+    /// What a load of `checkpoint` under `model` resolves its defaults
+    /// against: [`Self::capabilities`], unless they depend on the engine or
+    /// the weight representation that load builds.
+    fn capabilities_for(&self, _checkpoint: &Path, _model: &LoadConfig) -> Capabilities {
+        self.capabilities()
+    }
     /// The refusals, with their reasons: every shape this family cannot serve.
     fn resolve(&self, req: &Requested<'_>) -> Result<()>;
     /// Load the engine for a resolved request.
@@ -196,7 +202,8 @@ pub const LFM2_CAPABILITIES: Capabilities = Capabilities {
 
 /// An LFM2 GGUF on the LFM2 engine (`models.lfm2_gguf.engine = lfm2`): the
 /// LFM2 family's mechanisms over the file's packed blocks, at f32
-/// (`lloom::models::lfm2::gguf`), less what was not run there.
+/// (`lloom::models::lfm2::gguf`), less what was not run there. The device
+/// filter depends on the representation ([`lfm2_gguf_engine_capabilities`]).
 pub const LFM2_GGUF_CAPABILITIES: Capabilities = Capabilities {
     family: "lfm2-gguf",
     prefix_share: false,
@@ -215,9 +222,41 @@ pub const LFM2_GGUF_CAPABILITIES: Capabilities = Capabilities {
     eos_gate_missing:
         "the quantized matmul cores the packed projections run on carry no gated variant",
     device_filter: false,
-    device_filter_missing: "the device filter was not gated or priced on a GGUF checkpoint",
+    device_filter_missing: "the device filter is an LFM2 GGUF's default only at blocks f16 \
+        and blocks f32, the representations it was gated and priced on",
     ..LFM2_CAPABILITIES
 };
+
+/// The representations at which an LFM2 GGUF on the LFM2 engine takes the
+/// device filter by default, each gated and priced: packed blocks computing
+/// at f16, decision 110's default (step 2b), and at f32, the `--gguf-act f32`
+/// arm (step 2). Any other representation keeps today's route, as the LFM2
+/// rows are withheld where they were not measured (`frontend::withheld`;
+/// `docs/dispatch.md` §11.2).
+pub const LFM2_GGUF_DEVICE_FILTER: &[crate::frontend::Representation] = &[
+    crate::frontend::Representation {
+        blocks: true,
+        compute: lloom_tensor::DType::F16,
+    },
+    crate::frontend::Representation {
+        blocks: true,
+        compute: lloom_tensor::DType::F32,
+    },
+];
+
+/// [`LFM2_GGUF_CAPABILITIES`] for a GGUF the LFM2 engine builds at `rep`
+/// (`None` when it is not known). The one rule for the load, which reads
+/// the header, and for the built engine, which reports its own.
+pub fn lfm2_gguf_engine_capabilities(rep: Option<crate::frontend::Representation>) -> Capabilities {
+    if !rep.is_some_and(|r| LFM2_GGUF_DEVICE_FILTER.contains(&r)) {
+        return LFM2_GGUF_CAPABILITIES;
+    }
+    Capabilities {
+        device_filter: true,
+        device_filter_missing: "",
+        ..LFM2_GGUF_CAPABILITIES
+    }
+}
 
 /// Optional source-checkpoint port: same LFM engine, without borrowing
 /// dense LFM's validation claims for routed kernels and executor arms.
@@ -802,6 +841,16 @@ impl Family for Lfm2GgufFamily {
     fn capabilities(&self) -> Capabilities {
         LFM2_GGUF_CAPABILITIES
     }
+    /// The engine's own: the legacy GGUF model's, or the LFM2 engine's at the
+    /// representation it builds `first` in (`lfm2::representation`).
+    fn capabilities_for(&self, first: &Path, model: &LoadConfig) -> Capabilities {
+        if !gguf_on_lfm2(model) {
+            return super::causal_loaded::served::lfm2_gguf_capabilities();
+        }
+        lfm2_gguf_engine_capabilities(
+            lfm2::representation(first, model.cpu(), gguf_act(model)).ok(),
+        )
+    }
     fn resolve(&self, req: &Requested<'_>) -> Result<()> {
         if gguf_on_lfm2(req.model) {
             resolve_common(&LFM2_GGUF_CAPABILITIES, req)?;
@@ -943,11 +992,12 @@ pub fn load(model: &LoadConfig, shape: Shape) -> Result<(Box<dyn Served>, PathBu
         )
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     }
-    let clamp = clamp_ungated_eos_gate(&family.capabilities(), &mut shape);
+    let cap = family.capabilities_for(&checkpoint, model);
+    let clamp = clamp_ungated_eos_gate(&cap, &mut shape);
     if let Some(note) = &clamp {
         eprintln!("[readback: {note}]");
     }
-    resolve_device_filter(&family.capabilities(), &mut shape);
+    resolve_device_filter(&cap, &mut shape);
     let purpose = model.purpose().map_err(anyhow::Error::msg)?;
     let req = Requested { model, shape };
     family
@@ -1562,9 +1612,11 @@ mod tests {
 
     /// The device filter is lfm2's default and no other family's (decision
     /// 109): unset, lfm2 leaves it to the session (on wherever the model
-    /// serves the guarded token embedding), and every other family, the LFM2
-    /// engine's GGUF and MoE ports included, is set off and keeps today's
-    /// route. An explicit value is never touched.
+    /// serves the guarded token embedding), and every other family's static
+    /// capabilities, the LFM2 engine's GGUF and MoE ports included, set it off
+    /// and keep today's route. An explicit value is never touched. The GGUF's
+    /// load reads its representation's
+    /// (`an_lfm2_gguf_takes_the_device_filter_at_packed_blocks_only`).
     #[test]
     fn the_device_filter_is_lfm2s_default_and_no_other_familys() {
         assert_eq!(crate::ReadbackConfig::default().device_filter, None);
@@ -1592,6 +1644,63 @@ mod tests {
                 resolve_device_filter(&cap, &mut s);
                 assert_eq!(s.decode.readback.device_filter, explicit, "{}", cap.family);
             }
+        }
+    }
+
+    /// An LFM2 GGUF's device filter is its representation's (decision 109):
+    /// the LFM2 engine takes it by default at packed blocks, computing at f16
+    /// (decision 110's default, step 2b) or at f32 (`--gguf-act f32`, step 2),
+    /// each gated and priced; a dense GGUF, a checkpoint whose header does not
+    /// read, and the legacy engine keep today's route. Nothing else in the
+    /// capabilities moves, and every other family's load reads its static
+    /// capabilities.
+    #[test]
+    fn an_lfm2_gguf_takes_the_device_filter_at_packed_blocks_only() {
+        use crate::frontend::Representation;
+        use lloom_tensor::DType;
+        let at = |blocks, compute| Some(Representation { blocks, compute });
+        for (rep, on) in [
+            (at(true, DType::F32), true),
+            (at(true, DType::F16), true),
+            (at(true, DType::BF16), false),
+            (at(false, DType::F32), false),
+            (at(false, DType::F16), false),
+            (None, false),
+        ] {
+            let cap = lfm2_gguf_engine_capabilities(rep);
+            assert_eq!(cap.device_filter, on, "{rep:?}");
+            assert_eq!(cap.device_filter_missing.is_empty(), on, "{rep:?}");
+            assert_eq!(
+                cap,
+                Capabilities {
+                    device_filter: on,
+                    device_filter_missing: cap.device_filter_missing,
+                    ..LFM2_GGUF_CAPABILITIES
+                },
+                "{rep:?}"
+            );
+            let mut s = shape();
+            resolve_device_filter(&cap, &mut s);
+            let want = if on { None } else { Some(false) };
+            assert_eq!(s.decode.readback.device_filter, want, "{rep:?}");
+        }
+        let unread = Path::new("/nonexistent/lfm2.gguf");
+        let legacy = model_args(&["--gguf-engine", "legacy"]);
+        assert_eq!(
+            Lfm2GgufFamily.capabilities_for(unread, &legacy),
+            super::super::causal_loaded::served::lfm2_gguf_capabilities()
+        );
+        assert_eq!(
+            Lfm2GgufFamily.capabilities_for(unread, &LoadConfig::default()),
+            LFM2_GGUF_CAPABILITIES
+        );
+        for f in FAMILIES.iter().filter(|f| f.name() != "lfm2-gguf") {
+            assert_eq!(
+                f.capabilities_for(unread, &LoadConfig::default()),
+                f.capabilities(),
+                "{}",
+                f.name()
+            );
         }
     }
 

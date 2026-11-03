@@ -353,7 +353,7 @@ fn inputs_produced_out_of_order_commit_in_queue_order() {
     {
         let mut blit = f.commands.blit_command_encoder().unwrap();
         // SAFETY: as the fixture's fill.
-        unsafe { blit.fill_buffer(&f.dst, (2048, 4096), 0x5c) }.unwrap();
+        unsafe { blit.fill_buffer(&f.dst, (2048, 2048), 0x5c) }.unwrap();
     }
     f.commands.flush_marker().unwrap();
     let held = 2 + signal_cut(&f.commands);
@@ -614,7 +614,7 @@ fn a_parked_owner_wakes_for_every_input(shape: Shape, delivery: Delivery, when: 
             listen(&second);
             let mut blit = f.commands.blit_command_encoder().unwrap();
             // SAFETY: as the fixture's fill.
-            unsafe { blit.fill_buffer(&f.dst, (2048, 4096), 0x5c) }.unwrap();
+            unsafe { blit.fill_buffer(&f.dst, (2048, 2048), 0x5c) }.unwrap();
         }
     }
     let (owner, done_rx) = spawn_owner(&f.commands);

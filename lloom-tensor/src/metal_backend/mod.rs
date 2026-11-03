@@ -4575,8 +4575,9 @@ mod issue_336_to_cpu {
     //! directly rather than by setting the variable per test.
     use crate::{DType, Device, Tensor, D};
 
-    /// Read back through the blit, unconditionally -- the pre-#336 path, kept
-    /// reachable so a test can compare against it in one process.
+    /// Read back through the copy, unconditionally -- the pre-#336 path, kept
+    /// reachable so a test can compare against it in one process. A blit
+    /// wherever Metal admits one (`MetalDevice::copy_bytes`).
     fn via_blit<T: super::ReadbackElement>(ms: &super::MetalStorage) -> Vec<T> {
         let size = ms.count * ms.dtype.size_in_bytes();
         let buffer = ms
@@ -4586,13 +4587,13 @@ mod issue_336_to_cpu {
             .with_label("blit_to_cpu_dst")
             .build()
             .unwrap();
-        {
-            let mut blit = ms.device.blit_command_encoder().unwrap();
-            blit.set_label("blit_to_cpu");
-            // SAFETY: the test owns every buffer bound or mapped here and reads its
-            // results only after waiting for the command buffer that writes them.
-            unsafe { blit.copy_from_buffer(&ms.buffer, 0, &buffer, 0, size) }.unwrap();
+        // SAFETY: the test owns every buffer bound or mapped here and reads its
+        // results only after waiting for the command buffer that writes them.
+        unsafe {
+            ms.device
+                .copy_bytes("blit_to_cpu", &ms.buffer, 0, &buffer, 0, size)
         }
+        .unwrap();
         ms.device.flush_and_wait_current().unwrap();
         super::read_to_vec(&buffer, ms.count).unwrap()
     }

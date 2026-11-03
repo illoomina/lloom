@@ -12,9 +12,10 @@ use lloom::nn::model::{
 use lloom::nn::speculator::{
     Anchor, Draft, LayerTaps, Probes, SeqId, Speculator, TargetProbe, VerifyRowRef,
 };
+use lloom::nn::ReuseAction;
 use lloom::nn::{CheckpointPolicy, VarBuilder};
 use lloom::profile::Profile;
-use lloom_engine::{BatchEvent, BatchHandle, BatchRequest, DecodeParams};
+use lloom_engine::{BatchDone, BatchEvent, BatchHandle, BatchRequest, DecodeParams};
 use lloom_tensor::{DType, Device, Result, Tensor};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -55,6 +56,16 @@ pub(super) fn config() -> Config {
         tap_layers: vec![1, 2, 3, 4, 5],
         tap_dtype: DType::F32,
         ..Default::default()
+    }
+}
+
+/// [`config`] with 24 positions: the RoPE tables and every cache's
+/// `kv_capacity` end there, so a prompt or a verify window can reach the
+/// ceiling in a few tokens.
+pub(super) fn small_config() -> Config {
+    Config {
+        max_position_embeddings: 24,
+        ..config()
     }
 }
 
@@ -107,6 +118,14 @@ pub(super) enum Site {
     /// `Probes::verify_rows_enqueue`: a speculative round's one ragged
     /// verify over every live row, encoded and committed, its windows open.
     VerifyRowsEnqueue,
+    /// As [`Site::VerifyRowsEnqueue`], the failure reported as having
+    /// touched no state although the windows are open: what a model's
+    /// refusal from inside the verify pass reports about that pass alone.
+    VerifyRowsEnqueueSaysUntouched,
+    /// `forward` over more than one position, run by the real model at the
+    /// end of its RoPE table: the first layer runs and writes its state,
+    /// the second fails. The model's own error, reported touched.
+    PrefillPastRope,
 }
 
 /// What was still on the device when the injected failure returned: the
@@ -128,6 +147,8 @@ pub(super) struct Faulty<P: Profile> {
     left: AtomicUsize,
     failed: AtomicUsize,
     queued: parking_lot::Mutex<Vec<Queued>>,
+    /// The first position past the RoPE table ([`Site::PrefillPastRope`]).
+    rope_end: usize,
 }
 
 impl<P: Profile> Faulty<P> {
@@ -139,7 +160,15 @@ impl<P: Profile> Faulty<P> {
             left: AtomicUsize::new(0),
             failed: AtomicUsize::new(0),
             queued: parking_lot::Mutex::new(Vec::new()),
+            rope_end: usize::MAX,
         }
+    }
+
+    /// The model's RoPE table ends at `rope_end` (its
+    /// `max_position_embeddings`).
+    pub(super) fn with_rope_end(mut self, rope_end: usize) -> Self {
+        self.rope_end = rope_end;
+        self
     }
 
     pub(super) fn arm(&self, site: Site, n: usize) {
@@ -171,23 +200,42 @@ impl<P: Profile> Faulty<P> {
         Queued::default()
     }
 
-    fn after(&self, site: Site) -> Result<()> {
+    /// Whether this call of `site` is the armed one.
+    fn fires(&self, site: Site) -> bool {
         if *self.site.lock() != site {
-            return Ok(());
+            return false;
         }
         match self.left.load(Ordering::Acquire) {
-            0 => Ok(()),
+            0 => false,
             1 => {
                 self.left.store(0, Ordering::Release);
-                self.queued.lock().push(self.queued_now());
-                self.failed.fetch_add(1, Ordering::AcqRel);
-                lloom_tensor::bail!("injected: the {site:?} failed after its work ran")
+                true
             }
             n => {
                 self.left.store(n - 1, Ordering::Release);
-                Ok(())
+                false
             }
         }
+    }
+
+    fn note_failure(&self) {
+        self.queued.lock().push(self.queued_now());
+        self.failed.fetch_add(1, Ordering::AcqRel);
+    }
+
+    fn after(&self, site: Site) -> Result<()> {
+        if !self.fires(site) {
+            return Ok(());
+        }
+        self.note_failure();
+        let error =
+            lloom_tensor::Error::msg(format!("injected: the {site:?} failed after its work ran"));
+        Err(match site {
+            Site::VerifyRowsEnqueueSaysUntouched => {
+                error.with_state_touched(lloom_tensor::StateTouched::No)
+            }
+            _ => error,
+        })
     }
 }
 
@@ -219,6 +267,13 @@ impl<P: Profile> CausalLM for Faulty<P> {
         Ok(out)
     }
     fn forward(&self, tokens: &Tensor, pos: usize, cache: &mut Self::Cache) -> Result<Tensor> {
+        if tokens.dim(1)? > 1 && self.fires(Site::PrefillPastRope) {
+            self.note_failure();
+            return match self.inner.forward(tokens, self.rope_end, cache) {
+                Ok(_) => lloom_tensor::bail!("the forward past the RoPE table succeeded"),
+                Err(e) => Err(e.context("injected: the prefill ran past the RoPE table")),
+            };
+        }
         let out = self.inner.forward(tokens, pos, cache)?;
         if tokens.dim(1)? > 1 {
             self.after(Site::Prefill)?;
@@ -380,6 +435,7 @@ impl<P: Profile> Probes<LayerTaps<5>> for Faulty<P> {
     ) -> Result<Self::PendingRows> {
         let pending = Probes::<LayerTaps<5>>::verify_rows_enqueue(&self.inner, rows)?;
         self.after(Site::VerifyRowsEnqueue)?;
+        self.after(Site::VerifyRowsEnqueueSaysUntouched)?;
         Ok(pending)
     }
     fn verify_rows_complete(
@@ -471,6 +527,32 @@ pub(super) fn round<M: BatchedCausalLM, E>(
     cold: bool,
     max: usize,
 ) -> Vec<std::result::Result<Vec<u32>, String>> {
+    submit_together(handle, prompts, cold, max)
+        .iter()
+        .map(outcome)
+        .collect()
+}
+
+/// [`round`], each served row with how its sequence was reused: the
+/// prepare's action and the positions it kept.
+pub(super) fn round_reuse<M: BatchedCausalLM, E>(
+    handle: &BatchHandle<M, E>,
+    prompts: &[Vec<u32>],
+    cold: bool,
+    max: usize,
+) -> Vec<std::result::Result<(Vec<u32>, ReuseAction, usize), String>> {
+    submit_together(handle, prompts, cold, max)
+        .iter()
+        .map(|rx| outcome_done(rx).map(|d| (d.tokens, d.reuse, d.reused)))
+        .collect()
+}
+
+fn submit_together<M: BatchedCausalLM, E>(
+    handle: &BatchHandle<M, E>,
+    prompts: &[Vec<u32>],
+    cold: bool,
+    max: usize,
+) -> Vec<Receiver<BatchEvent>> {
     let gate = hold(handle);
     let rxs: Vec<Receiver<BatchEvent>> = prompts
         .iter()
@@ -488,21 +570,37 @@ pub(super) fn round<M: BatchedCausalLM, E>(
         })
         .collect();
     drop(gate);
-    rxs.iter().map(outcome).collect()
+    rxs
 }
 
 /// A row's outcome: its tokens (checked against what it streamed), or its
 /// error.
 pub(super) fn outcome(rx: &Receiver<BatchEvent>) -> std::result::Result<Vec<u32>, String> {
+    outcome_done(rx).map(|d| d.tokens)
+}
+
+fn outcome_done(rx: &Receiver<BatchEvent>) -> std::result::Result<BatchDone, String> {
     let mut streamed = Vec::new();
     loop {
         match rx.recv_timeout(Duration::from_secs(60)).expect("an event") {
             BatchEvent::Tokens(ids) => streamed.extend(ids),
             BatchEvent::Done(d) => {
                 assert_eq!(d.tokens, streamed, "the stream is the reply");
-                return Ok(d.tokens);
+                return Ok(*d);
             }
             BatchEvent::Error(e) => return Err(e),
         }
     }
+}
+
+/// A row of `prompt` past `len` tokens: `prompt` extended by ids that are
+/// not the EOS.
+pub(super) fn padded(prompt: &[u32], len: usize) -> Vec<u32> {
+    let mut p = prompt.to_vec();
+    let mut t = 11u32;
+    while p.len() < len {
+        p.push(t);
+        t = (t + 7) % EOS;
+    }
+    p
 }

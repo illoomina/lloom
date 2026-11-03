@@ -25,7 +25,7 @@
 #[path = "support/batch_recovery.rs"]
 mod batch_recovery;
 
-use batch_recovery::{config, round, Faulty, Garbage, Site};
+use batch_recovery::{config, padded, round, round_reuse, small_config, Faulty, Garbage, Site};
 use lloom::models::lfm2::{Config, State};
 use lloom::models::lfm2_testing::Lfm2Tiny;
 use lloom::nn::{DecodeOptions, Session};
@@ -107,7 +107,8 @@ impl<P: Profile> Served<P> {
             .with_dtype(dtype)
             .model::<P>(&device)
             .unwrap();
-        let model = Arc::new(Faulty::around(inner, &device));
+        let model =
+            Arc::new(Faulty::around(inner, &device).with_rope_end(cfg.max_position_embeddings));
         let pool = SlotPool::new(ROWS, || {
             State::<P>::new(true, dtype, &cfg, &device).unwrap()
         });
@@ -333,6 +334,176 @@ fn natively_a_rewindable_static_batch_failing_with_a_sibling_verify_pending_hand
         native_config(false),
         DType::F16,
         Site::VerifyComplete,
+        1,
+    );
+}
+
+/// Batch 1 caches both rows' prompts and replies. Batch 2 extends them past
+/// the caches' `max_position_embeddings`: row 0's prefill is refused at the
+/// ceiling before any state moved, reported untouched, and row 1 never
+/// runs. Batch 3 extends batch 1's logs by a token. With every prefix kept,
+/// each row is prepared as a scheduler that never saw batch 2 prepares it,
+/// and decodes what that one decodes; no recovery runs (decision 105,
+/// `batched-decode-design.md` §11.10).
+fn a_batch_refused_at_its_ceiling_keeps_its_prefixes<P: Profile>(
+    arm: &str,
+    device: Device,
+    cfg: Config,
+    dtype: DType,
+) {
+    let ceiling = cfg.max_position_embeddings;
+    let clean = Served::<P>::start(device.clone(), cfg.clone(), dtype);
+    let served = Served::<P>::start(device, cfg, dtype);
+    let first = [vec![1u32, 2, 3, 4], vec![5u32, 6, 7]];
+    let replies = served.batch(&first, false);
+    assert_eq!(
+        clean.batch(&first, false),
+        replies,
+        "the clean run's batch 1"
+    );
+    let cached: Vec<Vec<u32>> = first
+        .iter()
+        .zip(&replies)
+        .map(|(p, r)| {
+            let mut c = p.clone();
+            c.extend(r.as_ref().expect("batch 1 is served"));
+            c
+        })
+        .collect();
+    let too_long: Vec<Vec<u32>> = cached.iter().map(|c| padded(c, ceiling + 1)).collect();
+    for (i, f) in served.batch(&too_long, false).iter().enumerate() {
+        let why = f
+            .as_ref()
+            .expect_err("a prompt past the ceiling is refused");
+        eprintln!("ARM {arm} row {i} refused: {why}");
+    }
+    assert_eq!(served.model.failed(), 0, "nothing was injected");
+
+    let next: Vec<Vec<u32>> = cached
+        .iter()
+        .enumerate()
+        .map(|(i, c)| {
+            let mut n = c.clone();
+            n.push(20 + i as u32);
+            n
+        })
+        .collect();
+    let reused = round_reuse(&served.handle, &next, false, MAX);
+    let warm = round_reuse(&clean.handle, &next, false, MAX);
+    clean.stop();
+    for (i, (got, want)) in reused.iter().zip(&warm).enumerate() {
+        eprintln!("ARM {arm} row {i}: after {got:?} never-refused {want:?}");
+        let got = got.as_ref().expect("the row after the refusal is served");
+        let want = want.as_ref().expect("the never-refused row is served");
+        assert_eq!(
+            got, want,
+            "{arm} row {i}: (tokens, reuse, kept positions) after the refused batch"
+        );
+        assert!(
+            got.2 >= first[i].len(),
+            "{arm} row {i}: the cached prefix was not kept: {got:?}"
+        );
+    }
+    assert_eq!(
+        served.recovery(),
+        (0, 0),
+        "(fences, aborts): a refusal that touched nothing ran the recovery"
+    );
+    served.stop();
+}
+
+/// Batch 2 extends batch 1's logs to four positions short of the ceiling:
+/// the prefill fits, and a verify window a few rounds in does not. The
+/// model refuses that window's pass before the pass moves anything, but the
+/// window is open by then, and every lane's position is past its log by
+/// the tokens it accepted. The driver reports that failure as touched, so
+/// the batch is fenced and reset, and batch 3 decodes what a fresh sequence
+/// decodes. Reported as the model reports it, the rows would come back with
+/// the window open (`batched-decode-design.md` §11.10).
+fn a_batch_refused_inside_a_verify_window_is_reset<P: Profile>(
+    arm: &str,
+    device: Device,
+    cfg: Config,
+    dtype: DType,
+) {
+    let ceiling = cfg.max_position_embeddings;
+    let served = Served::<P>::start(device, cfg, dtype);
+    let first = [vec![1u32, 2, 3, 4], vec![5u32, 6, 7]];
+    let replies = served.batch(&first, false);
+    let cached: Vec<Vec<u32>> = first
+        .iter()
+        .zip(&replies)
+        .map(|(p, r)| {
+            let mut c = p.clone();
+            c.extend(r.as_ref().expect("batch 1 is served"));
+            c
+        })
+        .collect();
+    let near: Vec<Vec<u32>> = cached.iter().map(|c| padded(c, ceiling - 4)).collect();
+    for (i, f) in served.batch(&near, false).iter().enumerate() {
+        let why = f.as_ref().expect_err("a reply past the ceiling is refused");
+        eprintln!("ARM {arm} row {i} refused: {why}");
+    }
+    assert_eq!(served.model.failed(), 0, "nothing was injected");
+
+    let next: Vec<Vec<u32>> = cached
+        .iter()
+        .enumerate()
+        .map(|(i, c)| {
+            let mut n = c.clone();
+            n.push(20 + i as u32);
+            n
+        })
+        .collect();
+    let reused = served.batch(&next, false);
+    let reference = served.batch(&next, true);
+    for (i, (got, want)) in reused.iter().zip(&reference).enumerate() {
+        eprintln!("ARM {arm} row {i}: after {got:?} cold {want:?}");
+        assert_eq!(
+            got.as_ref().ok(),
+            Some(want.as_ref().expect("the cold reference is served")),
+            "{arm} row {i}: the request after the refused verify window"
+        );
+    }
+    assert_eq!(
+        served.recovery(),
+        (1, 1),
+        "(fences, aborts): the refused window's batch recovered once"
+    );
+    served.stop();
+}
+
+#[test]
+fn a_static_batch_refused_at_its_ceiling_keeps_its_prefixes() {
+    a_batch_refused_at_its_ceiling_keeps_its_prefixes::<RewindableExact>(
+        "cpu-rewindable",
+        Device::Cpu,
+        small_config(),
+        DType::F32,
+    );
+}
+
+#[test]
+fn a_static_batch_refused_inside_a_verify_window_is_reset() {
+    a_batch_refused_inside_a_verify_window_is_reset::<RewindableExact>(
+        "cpu-rewindable",
+        Device::Cpu,
+        small_config(),
+        DType::F32,
+    );
+}
+
+/// The failure is the real model's: row 0's first prefill of batch 2 runs
+/// at the end of the RoPE table, its first (conv) layer writes its state
+/// and the second fails, reported touched.
+#[test]
+fn a_static_batch_failing_past_its_first_layer_hands_its_rows_back_reset() {
+    a_failed_batch_then_the_next::<RewindableExact>(
+        "cpu-rewindable",
+        Device::Cpu,
+        config(),
+        DType::F32,
+        Site::PrefillPastRope,
         1,
     );
 }

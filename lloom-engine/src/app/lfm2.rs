@@ -3009,61 +3009,28 @@ impl<P: Lfm2Shape> Engine<P> {
     }
 }
 
-/// `n` sequences checked out of the pool for a closed job, reset, and the
-/// slots to return them to.
-struct TakenSessions<'m, P: Profile> {
-    sessions: Vec<Session<'m, Model<P>>>,
-    slots: Vec<usize>,
-}
-
-impl<'m, P: Profile> TakenSessions<'m, P> {
-    fn give_back(self, idle: &mut Idle<'_, 'm, Model<P>, Extra>) {
-        for (slot, mut s) in self.slots.into_iter().zip(self.sessions) {
-            s.reset();
-            idle.pool.release(slot, s.into_sequence());
-        }
-    }
-}
-
 /// Run `f` over `n` sequences checked out of the pool and reset, and put
-/// them back — reset again — whatever `f` returned: a failed cell must not
-/// cost the pool a slot. `f` may move the sessions out and back (a run
+/// them back — reset again — whatever `f` returned: a failed cell, or a pool
+/// short of `n`, must not cost the pool a slot. `f` may move the sessions out and back (a run
 /// through the scheduler's driver does), as long as it returns them all.
 fn with_sessions<'m, P: Profile, T>(
     idle: &mut Idle<'_, 'm, Model<P>, Extra>,
     n: usize,
     f: impl FnOnce(&mut Idle<'_, 'm, Model<P>, Extra>, &mut Vec<Session<'m, Model<P>>>) -> Result<T>,
 ) -> Result<T> {
-    let mut taken = take_sessions(idle, n)?;
-    let out = f(idle, &mut taken.sessions);
-    if taken.sessions.len() != taken.slots.len() {
+    let (mut sessions, slots) = idle
+        .take_reset(n)
+        .context("a closed job found the pool short of its batch")?;
+    let out = f(idle, &mut sessions);
+    if sessions.len() != slots.len() {
         return Err(anyhow::anyhow!(
             "a closed job returned {} of {} sessions; the pool has lost slots",
-            taken.sessions.len(),
-            taken.slots.len()
+            sessions.len(),
+            slots.len()
         ));
     }
-    taken.give_back(idle);
+    idle.give_back_reset(sessions, slots);
     out
-}
-
-fn take_sessions<'m, P: Profile>(
-    idle: &mut Idle<'_, 'm, Model<P>, Extra>,
-    n: usize,
-) -> Result<TakenSessions<'m, P>> {
-    let mut sessions = Vec::with_capacity(n);
-    let mut slots = Vec::with_capacity(n);
-    for _ in 0..n {
-        let (routed, seq) = idle
-            .pool
-            .acquire(&[])
-            .context("a closed job found the pool empty")?;
-        let mut s = Session::from_sequence(idle.model, seq);
-        s.reset();
-        sessions.push(s);
-        slots.push(routed.slot);
-    }
-    Ok(TakenSessions { sessions, slots })
 }
 
 /// A closed speculative run over `sessions`: THROUGH the scheduler's

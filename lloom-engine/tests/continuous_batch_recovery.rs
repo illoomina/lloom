@@ -30,7 +30,7 @@
 #[path = "support/batch_recovery.rs"]
 mod batch_recovery;
 
-use batch_recovery::{config, round, Faulty, Garbage, Site};
+use batch_recovery::{config, padded, round, round_reuse, small_config, Faulty, Garbage, Site};
 use lloom::models::lfm2::{Config, State};
 use lloom::models::lfm2_testing::Lfm2Tiny;
 use lloom::nn::{DecodeOptions, Session, SpecBatchDecoder};
@@ -142,7 +142,8 @@ impl<P: Profile> Served<P> {
             .with_dtype(dtype)
             .model::<P>(&device)
             .unwrap();
-        let model = Arc::new(Faulty::around(inner, &device));
+        let model =
+            Arc::new(Faulty::around(inner, &device).with_rope_end(cfg.max_position_embeddings));
         let pool = rows(&cfg, dtype, &device);
         let spec = Garbage::new(ROWS);
         let drafter_aborts = Arc::clone(&spec.aborts);
@@ -441,6 +442,159 @@ fn natively_a_rewindable_speculative_round_failing_with_its_verify_enqueued_hand
         Loop::Speculative,
         own_rows,
         Site::VerifyRowsEnqueue,
+        1,
+    );
+}
+
+/// Round 1 caches both rows' prompts and replies. Round 2 extends them past
+/// the caches' `max_position_embeddings`, so the first admitted row's
+/// prefill is refused at the ceiling before any state moved, reported
+/// untouched; the step fails with no other row moved. Round 3 extends round
+/// 1's logs by a token. With every prefix kept, each row is prepared as a
+/// scheduler that never saw round 2 prepares it, and decodes what that one
+/// decodes; no recovery runs (decision 105, `batched-decode-design.md`
+/// §11.11).
+fn a_step_refused_at_its_ceiling_keeps_its_prefixes<P: Profile>(
+    arm: &str,
+    device: Device,
+    cfg: Config,
+    dtype: DType,
+    driver: Loop,
+    rows: Rows<P>,
+) {
+    let mut cfg = cfg;
+    if driver == Loop::K1 {
+        cfg.tap_layers.clear();
+    }
+    let ceiling = cfg.max_position_embeddings;
+    let clean = Served::<P>::start(device.clone(), cfg.clone(), dtype, driver, rows);
+    let served = Served::<P>::start(device, cfg, dtype, driver, rows);
+    let first = [vec![1u32, 2, 3, 4], vec![5u32, 6, 7]];
+    let replies = served.round(&first, false);
+    assert_eq!(
+        clean.round(&first, false),
+        replies,
+        "the clean run's round 1"
+    );
+    let cached: Vec<Vec<u32>> = first
+        .iter()
+        .zip(&replies)
+        .map(|(p, r)| {
+            let mut c = p.clone();
+            c.extend(r.as_ref().expect("round 1 is served"));
+            c
+        })
+        .collect();
+    let too_long: Vec<Vec<u32>> = cached.iter().map(|c| padded(c, ceiling + 1)).collect();
+    for (i, f) in served.round(&too_long, false).iter().enumerate() {
+        let why = f
+            .as_ref()
+            .expect_err("a prompt past the ceiling is refused");
+        eprintln!("ARM {arm} row {i} refused: {why}");
+    }
+    assert_eq!(served.model.failed(), 0, "nothing was injected");
+
+    let next: Vec<Vec<u32>> = cached
+        .iter()
+        .enumerate()
+        .map(|(i, c)| {
+            let mut n = c.clone();
+            n.push(20 + i as u32);
+            n
+        })
+        .collect();
+    let reused = round_reuse(&served.handle, &next, false, MAX);
+    let warm = round_reuse(&clean.handle, &next, false, MAX);
+    clean.stop();
+    for (i, (got, want)) in reused.iter().zip(&warm).enumerate() {
+        eprintln!("ARM {arm} row {i}: after {got:?} never-refused {want:?}");
+        let got = got.as_ref().expect("the row after the refusal is served");
+        let want = want.as_ref().expect("the never-refused row is served");
+        assert_eq!(
+            got, want,
+            "{arm} row {i}: (tokens, reuse, kept positions) after the refused step"
+        );
+        assert!(
+            got.2 >= first[i].len(),
+            "{arm} row {i}: the cached prefix was not kept: {got:?}"
+        );
+    }
+    assert_eq!(
+        served.recovery(),
+        (0, 0, 0),
+        "(fences, extra aborts, drafter aborts): a refusal that touched nothing ran the recovery"
+    );
+    served.stop();
+}
+
+#[test]
+fn a_continuous_admission_refused_at_its_ceiling_keeps_its_prefixes() {
+    a_step_refused_at_its_ceiling_keeps_its_prefixes::<RewindableExact>(
+        "cpu-rewindable-k1",
+        Device::Cpu,
+        small_config(),
+        DType::F32,
+        Loop::K1,
+        own_rows,
+    );
+}
+
+#[test]
+fn a_speculative_admission_refused_at_its_ceiling_keeps_its_prefixes() {
+    a_step_refused_at_its_ceiling_keeps_its_prefixes::<RewindableExact>(
+        "cpu-rewindable-spec",
+        Device::Cpu,
+        small_config(),
+        DType::F32,
+        Loop::Speculative,
+        own_rows,
+    );
+}
+
+/// The failure is the real model's: row 0's prefill of round 2 runs at the
+/// end of the RoPE table, its first (conv) layer writes its state and the
+/// second fails, reported touched.
+#[test]
+fn a_continuous_prefill_failing_past_its_first_layer_hands_its_rows_back_reset() {
+    a_failed_step_then_the_next::<RewindableExact>(
+        "cpu-rewindable-k1",
+        Device::Cpu,
+        config(),
+        DType::F32,
+        Loop::K1,
+        own_rows,
+        Site::PrefillPastRope,
+        1,
+    );
+}
+
+#[test]
+fn a_speculative_prefill_failing_past_its_first_layer_hands_its_rows_back_reset() {
+    a_failed_step_then_the_next::<RewindableExact>(
+        "cpu-rewindable-spec",
+        Device::Cpu,
+        config(),
+        DType::F32,
+        Loop::Speculative,
+        own_rows,
+        Site::PrefillPastRope,
+        1,
+    );
+}
+
+/// The round's verify is enqueued over both rows, their windows open, and
+/// the failure says it touched nothing: true of the pass that refused, not
+/// of the round. The driver reports it touched, and the rows are reset.
+#[test]
+fn a_speculative_round_failing_untouched_with_its_windows_open_is_reset() {
+    a_failed_step_then_the_next::<RewindableExact>(
+        "cpu-rewindable-spec",
+        Device::Cpu,
+        config(),
+        DType::F32,
+        Loop::Speculative,
+        own_rows,
+        Site::VerifyRowsEnqueueSaysUntouched,
         1,
     );
 }

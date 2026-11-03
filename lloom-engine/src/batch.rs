@@ -105,10 +105,11 @@ impl<M: BatchedCausalLM> MakeDriver<M> for () {
 /// extra's own per-row state (a drafter's contexts). None of it runs on a
 /// batch or step that succeeded.
 pub trait BatchRecovery {
-    /// Whether `error` may have moved the state of the rows it ended
-    /// ([`crate::recovery::failure_touched_state`]). On a continuous step
-    /// that did not, the rows go back to the pool with their cached prefix
-    /// and nothing below runs.
+    /// Whether `error`, as the static body or the continuous step returned
+    /// it, may have moved the state of the rows it ended
+    /// ([`crate::recovery::failure_touched_state`]). When it did not, the
+    /// rows go back to the pool with their cached prefix and nothing below
+    /// runs.
     fn touched(&self, error: &lloom_tensor::Error) -> bool {
         crate::recovery::failure_touched_state(error)
     }
@@ -160,6 +161,39 @@ pub struct Idle<'a, 'm, M: BatchedCausalLM, E> {
     /// one proposer serves the closed cells too, where a second drafter did
     /// (`batched-decode-design.md` §12.9).
     pub driver: &'a mut Driver<'m, M>,
+}
+
+impl<'m, M: BatchedCausalLM, E> Idle<'_, 'm, M, E>
+where
+    M::Cache: lloom::nn::CacheReset,
+{
+    /// Check `n` sequences out of the pool for a closed job, each reset,
+    /// with the slot each goes back to ([`Self::give_back_reset`]); `None`
+    /// when the pool holds fewer, the ones already taken given back, so a
+    /// short pool costs it no slot.
+    pub fn take_reset(&mut self, n: usize) -> Option<(Vec<Session<'m, M>>, Vec<usize>)> {
+        let mut sessions = Vec::with_capacity(n);
+        let mut slots = Vec::with_capacity(n);
+        for _ in 0..n {
+            let Some((routed, seq)) = self.pool.acquire(&[]) else {
+                self.give_back_reset(sessions, slots);
+                return None;
+            };
+            let mut s = Session::from_sequence(self.model, seq);
+            s.reset();
+            sessions.push(s);
+            slots.push(routed.slot);
+        }
+        Some((sessions, slots))
+    }
+
+    /// Reset each of `sessions` and return it to its slot.
+    pub fn give_back_reset(&mut self, sessions: Vec<Session<'m, M>>, slots: Vec<usize>) {
+        for (slot, mut s) in slots.into_iter().zip(sessions) {
+            s.reset();
+            self.pool.release(slot, s.into_sequence());
+        }
+    }
 }
 
 /// Run `sessions` as one closed batch through `driver`: every row admitted
@@ -1131,6 +1165,10 @@ where
     }
 
     /// One static batch: the waiting rows up to the width, run to completion.
+    /// A failed batch's rows go back with their cached prefixes when the
+    /// body reports that the failure touched none of their state; otherwise
+    /// they are recovered ([`Self::recover_failed`], `batched-decode-design.md`
+    /// §11.10).
     fn run_static(&mut self) -> Result<()> {
         let mut rows: Vec<(BatchRequest, Sender<BatchEvent>)> = Vec::new();
         while rows.len() < self.max_rows {
@@ -1224,10 +1262,15 @@ where
         let outs = match outcome {
             Ok(outs) => outs,
             Err(e) => {
+                let touched = self.extra.touched(&e);
                 let msg = e.to_string();
                 for (session, m) in sessions.into_iter().zip(meta) {
                     let (slot, _, tx, _, _) = m.expect("a kept row");
-                    self.failed.push((slot, session.into_sequence()));
+                    if touched {
+                        self.failed.push((slot, session.into_sequence()));
+                    } else {
+                        self.pool.release(slot, session.into_sequence());
+                    }
                     let _ = tx.send(BatchEvent::Error(msg.clone()));
                 }
                 if let Err(fence) = self.recover_failed() {
@@ -2201,6 +2244,15 @@ mod tests {
         }
     }
 
+    /// A failure reported as a model reports it: refused before any state
+    /// moved, or after some did.
+    fn untouched(msg: &str) -> lloom_tensor::Error {
+        lloom_tensor::Error::msg(msg).with_state_touched(lloom_tensor::StateTouched::No)
+    }
+    fn touched(msg: &str) -> lloom_tensor::Error {
+        lloom_tensor::Error::msg(msg).with_state_touched(lloom_tensor::StateTouched::Yes)
+    }
+
     /// The chain over a cache that counts the positions it holds. A forward
     /// at `pos` onto a cache holding `held` reads the drift `held - pos`
     /// into its next token, so a stale cache decodes a different stream
@@ -2298,10 +2350,12 @@ mod tests {
                 Fault::None | Fault::RowsMutateThenFail | Fault::RowsRefuseUntouched => {}
                 Fault::MutateThenFail => {
                     cache.0 += n;
-                    lloom_tensor::bail!("injected: the pass moved the cache, then failed");
+                    return Err(touched("injected: the pass moved the cache, then failed"));
                 }
                 Fault::RefuseUntouched => {
-                    lloom_tensor::bail!("injected: the pass was refused before anything moved");
+                    return Err(untouched(
+                        "injected: the pass was refused before anything moved",
+                    ));
                 }
             }
             cache.0 += n;
@@ -2319,7 +2373,9 @@ mod tests {
             let ids = tokens.to_vec2::<u32>()?;
             let fault = self.take_rows();
             if fault == Fault::RowsRefuseUntouched {
-                lloom_tensor::bail!("injected: the step was refused before any row moved");
+                return Err(untouched(
+                    "injected: the step was refused before any row moved",
+                ));
             }
             let mut lanes = Vec::with_capacity(rows.len());
             for (row, ids) in rows.iter_mut().zip(&ids) {
@@ -2328,7 +2384,9 @@ mod tests {
                 row.cache.0 += 1;
             }
             if fault == Fault::RowsMutateThenFail {
-                lloom_tensor::bail!("injected: the step moved every row's cache, then failed");
+                return Err(touched(
+                    "injected: the step moved every row's cache, then failed",
+                ));
             }
             self.next_rows(&lanes)
         }
@@ -2340,7 +2398,9 @@ mod tests {
             let ids = tokens.squeeze(0)?.to_vec1::<u32>()?;
             let fault = self.take_rows();
             if fault == Fault::RowsRefuseUntouched {
-                lloom_tensor::bail!("injected: the step was refused before any row moved");
+                return Err(untouched(
+                    "injected: the step was refused before any row moved",
+                ));
             }
             let mut lanes = Vec::with_capacity(rows.len());
             let mut off = 0;
@@ -2351,7 +2411,9 @@ mod tests {
                 row.cache.0 += row.len;
             }
             if fault == Fault::RowsMutateThenFail {
-                lloom_tensor::bail!("injected: the step moved every row's cache, then failed");
+                return Err(touched(
+                    "injected: the step moved every row's cache, then failed",
+                ));
             }
             self.next_rows(&lanes)
         }
@@ -2517,9 +2579,6 @@ mod tests {
         fences: Arc<std::sync::atomic::AtomicUsize>,
         aborts: Arc<std::sync::atomic::AtomicUsize>,
         refusals: Arc<std::sync::atomic::AtomicUsize>,
-        /// Report every failure as having touched no state: the signal a
-        /// model will give for a refusal before anything moved.
-        untouched: Arc<AtomicBool>,
     }
 
     impl Recorder {
@@ -2543,9 +2602,6 @@ mod tests {
     }
 
     impl BatchRecovery for Recorder {
-        fn touched(&self, _error: &lloom_tensor::Error) -> bool {
-            !self.untouched.load(Ordering::Acquire)
-        }
         fn fence(&mut self, device: &Device) -> Result<()> {
             self.fences.fetch_add(1, Ordering::AcqRel);
             if self
@@ -2613,19 +2669,23 @@ mod tests {
         thread.join().unwrap();
     }
 
-    /// A pass refused before it moved anything keeps the model's promise —
-    /// the cache is as it was — and the same request sent again decodes what
-    /// a fresh sequence decodes, on the one sequence the pool has: the
-    /// recovery hands the row back usable rather than holding it.
+    /// A static batch refused before its pass moved anything, reported as
+    /// such on its error ([`lloom_tensor::StateTouched::No`]), runs no
+    /// recovery and hands its sequence back as it was: the same request sent
+    /// again EXTENDS the cached prefix the refused one was extending, and
+    /// decodes what a fresh sequence decodes (decision 105,
+    /// `batched-decode-design.md` §11.10).
     #[test]
-    fn a_static_batch_refused_before_its_pass_moved_anything_serves_the_retry() {
+    fn a_static_batch_refused_before_its_pass_moved_anything_keeps_its_prefix() {
         let model = Arc::new(Faulty::new(&Device::Cpu).unwrap());
         let extra = Recorder::default();
         let (handle, thread) = start_faulty(Arc::clone(&model), extra.clone());
         let first = [3u32, 1, 4];
         let (_, done) = collect(&submit_faulty(&handle, &first, 4));
+        assert!(!done.eos, "the fixture wants a log to extend");
         let mut next: Vec<u32> = first.to_vec();
         next.extend(&done.tokens);
+        let cached = next.len();
         next.extend([9, 2]);
         let seen = model.entries().len();
         model.arm(Fault::RefuseUntouched);
@@ -2636,13 +2696,70 @@ mod tests {
             pos > 0 && pos == held,
             "the refused pass extended a clean prefix: {pos} {held}"
         );
+        settle(&handle);
+        assert_eq!(
+            extra.calls(),
+            (0, 0),
+            "an untouched failure ran the recovery"
+        );
         let seen = model.entries().len();
         let (streamed, done) = collect(&submit_faulty(&handle, &next, 8));
+        assert_eq!(
+            (done.reuse, done.reused),
+            (ReuseAction::Extend, cached),
+            "the retry extends the prefix the refused request found: {done:?}"
+        );
         let (pos, held) = model.entries()[seen];
-        assert_eq!(pos, held, "the retry's first forward onto a stale cache");
+        assert_eq!(
+            (pos, held),
+            (cached, cached),
+            "the retry's first forward onto the kept prefix"
+        );
         let (want, eos) = chain(*next.last().unwrap(), 8);
         assert_eq!((streamed, done.tokens, done.eos), (want.clone(), want, eos));
-        assert_eq!(extra.calls(), (1, 1));
+        assert_eq!(extra.calls(), (0, 0));
+        handle.shutdown();
+        thread.join().unwrap();
+    }
+
+    /// A closed job asking for more sequences than the pool holds gets none
+    /// and costs the pool none: the ones it took before the pool ran short
+    /// go back, reset. Dropped, their slots stayed checked out for the
+    /// process's life.
+    #[test]
+    fn a_closed_job_on_a_short_pool_costs_the_pool_no_slot() {
+        let model = Arc::new(Faulty::new(&Device::Cpu).unwrap());
+        let (handle, thread) = start_faulty_continuous(Arc::clone(&model), 2, ());
+        let (short, idle, len) = handle
+            .run_closed_blocking(|idle| {
+                let short = idle.take_reset(3).is_none();
+                (short, idle.pool.idle(), idle.pool.len())
+            })
+            .expect("the scheduler runs the closed job");
+        assert!(short, "three sequences from a pool of two");
+        assert_eq!(
+            (idle, len),
+            (2, 2),
+            "(idle slots, slots) after the short take"
+        );
+        let (taken, idle) = handle
+            .run_closed_blocking(|idle| {
+                let taken = idle.take_reset(2).map(|(sessions, slots)| {
+                    let n = sessions.len();
+                    idle.give_back_reset(sessions, slots);
+                    n
+                });
+                (taken, idle.pool.idle())
+            })
+            .expect("the scheduler runs the closed job");
+        assert_eq!(
+            (taken, idle),
+            (Some(2), 2),
+            "the whole pool, taken and given back"
+        );
+        let (streamed, done) = collect(&submit_faulty(&handle, &[3u32, 1, 4], 8));
+        let (want, eos) = chain(4, 8);
+        assert_eq!((streamed, done.tokens, done.eos), (want.clone(), want, eos));
         handle.shutdown();
         thread.join().unwrap();
     }
@@ -2857,7 +2974,8 @@ mod tests {
     }
 
     /// A continuous step refused before any row's state moved, reported as
-    /// such ([`BatchRecovery::touched`]), runs no recovery: every row goes
+    /// such on its error ([`lloom_tensor::StateTouched::No`], read by
+    /// [`BatchRecovery::touched`]), runs no recovery: every row goes
     /// back to its own slot with its cached prefix. The refusal lands after
     /// each row decoded one token, so the drained rows' caches hold a
     /// position past the prompt that only the drain's settle logs. The same
@@ -2868,7 +2986,6 @@ mod tests {
     fn an_untouched_continuous_failure_keeps_every_rows_prefix() {
         let model = Arc::new(Faulty::new(&Device::Cpu).unwrap());
         let extra = Recorder::default();
-        extra.untouched.store(true, Ordering::Release);
         let (handle, thread) = start_faulty_continuous(Arc::clone(&model), 2, extra.clone());
         let nexts = extend_after_one_round(&handle, &[vec![3u32, 1, 4], vec![5u32, 9]]);
 

@@ -921,32 +921,37 @@ fn an_oversize_stored_session_declines_retention() {
         .is_err());
 }
 
+/// The windows below measure table and storage work done on the test's own
+/// thread, so they read that thread's receipt (`here`). The process's receipt
+/// also carries the test harness's allocations, made on its own thread while
+/// it waits for the test, and is only reported.
 mod allocation_receipt {
-    pub use crate::app::test_alloc::{ALLOCATIONS, BLOCKS, LIVE};
+    pub(super) use crate::app::test_alloc::{here, process};
 }
 
 #[test]
 fn repeated_small_turns_reset_delete_and_eviction_account_retained_allocations() {
-    use std::sync::atomic::Ordering;
-    let before_control = allocation_receipt::LIVE.load(Ordering::Relaxed);
+    let before_control = allocation_receipt::here().live;
     let allocation = Box::new([0u8; 4096]);
     std::hint::black_box(&allocation);
     assert_eq!(
-        allocation_receipt::LIVE.load(Ordering::Relaxed) - before_control,
+        allocation_receipt::here().live - before_control,
         4096,
         "the real allocator instrument must observe a live allocation"
     );
     drop(allocation);
     assert_eq!(
-        allocation_receipt::LIVE.load(Ordering::Relaxed),
+        allocation_receipt::here().live,
         before_control,
         "the instrument must observe its deallocation"
     );
     let mut t = Table::new(cfg(1, true));
     let now = Instant::now();
-    eprintln!("retention allocator control: System requested live bytes; excludes allocator caches/rounding and fixed empty table");
-    let baseline = allocation_receipt::LIVE.load(Ordering::Relaxed);
+    eprintln!("retention allocator control: System requested live bytes on the test's thread; excludes allocator caches/rounding and fixed empty table");
+    let baseline = allocation_receipt::here().live;
+    let process_baseline = allocation_receipt::process().live;
     let mut peak_undercharge = 0isize;
+    let mut other_threads = 0isize;
     for cycle in 0..12 {
         let mut previous = None;
         for n in 0..32u8 {
@@ -975,16 +980,17 @@ fn repeated_small_turns_reset_delete_and_eviction_account_retained_allocations()
             };
             t.delete(&wire.encode(), Some([9; 32]), now).unwrap();
         }
-        let live = allocation_receipt::LIVE.load(Ordering::Relaxed) - baseline;
+        let live = allocation_receipt::here().live - baseline;
+        other_threads = allocation_receipt::process().live - process_baseline - live;
         peak_undercharge = peak_undercharge.max(live - t.bytes as isize);
         eprintln!(
-            "retention cycle={cycle} allocator_live_requested={live} reported={} undercharge={}",
+            "retention cycle={cycle} allocator_live_requested={live} reported={} undercharge={} other_threads_live={other_threads}",
             t.bytes,
             live - t.bytes as isize
         );
     }
     assert!(peak_undercharge <= 0,
-        "retained allocations exceed reported bytes by {peak_undercharge}; fixed empty table excluded");
+        "retained allocations on the test's thread exceed reported bytes by {peak_undercharge}; fixed empty table excluded; other threads' live bytes {other_threads}");
 }
 
 fn assert_charge(t: &Table) {
@@ -1456,7 +1462,6 @@ fn prepared_messages_roundtrip_without_a_second_value_log() {
 
 #[test]
 fn prepared_publication_with_spare_turn_capacity_allocates_nothing() {
-    use std::sync::atomic::Ordering;
     let mut t = Table::new(cfg(4, true));
     let now = Instant::now();
     let id = turn(&mut t, None, Some(true), None, &[1], &scopes(1), &[2], now);
@@ -1487,9 +1492,9 @@ fn prepared_publication_with_spare_turn_capacity_allocates_nothing() {
         prefix: None,
     })
     .unwrap();
-    let before = allocation_receipt::ALLOCATIONS.load(Ordering::Relaxed);
+    let before = allocation_receipt::here().allocations;
     let published = t.publish(reservation, record, now);
-    let allocated = allocation_receipt::ALLOCATIONS.load(Ordering::Relaxed) - before;
+    let allocated = allocation_receipt::here().allocations - before;
     eprintln!(
         "retention publication allocation_calls={allocated} retained={}",
         published.retained
@@ -1827,19 +1832,16 @@ fn masked_storage_candidate(value: &Value) -> (Box<str>, Box<[u64]>) {
 #[test]
 fn storage_representation_requested_footprint() {
     use super::storage::StoredMessage;
-    use std::sync::atomic::Ordering;
     fn measure<T>(build: impl FnOnce() -> T) -> (isize, isize) {
-        let before = allocation_receipt::LIVE.load(Ordering::Relaxed);
-        let blocks = allocation_receipt::BLOCKS.load(Ordering::Relaxed);
+        let before = allocation_receipt::here();
         let owned = Box::new(build());
         std::hint::black_box(&owned);
-        let result = (
-            allocation_receipt::LIVE.load(Ordering::Relaxed) - before,
-            allocation_receipt::BLOCKS.load(Ordering::Relaxed) - blocks,
-        );
+        let built = allocation_receipt::here();
+        let result = (built.live - before.live, built.blocks - before.blocks);
         drop(owned);
-        assert_eq!(allocation_receipt::LIVE.load(Ordering::Relaxed), before);
-        assert_eq!(allocation_receipt::BLOCKS.load(Ordering::Relaxed), blocks);
+        let after = allocation_receipt::here();
+        assert_eq!(after.live, before.live);
+        assert_eq!(after.blocks, before.blocks);
         result
     }
     eprintln!("STORAGE-COST System retained allocation requests and blocks; root boxed uniformly; inputs excluded; N=3 per case; no throughput/RSS claim");
@@ -1898,7 +1900,6 @@ fn storage_representation_requested_footprint() {
 
 #[test]
 fn retained_message_tree_allocations_are_charged_and_admitted() {
-    use std::sync::atomic::Ordering;
     for max_bytes in [1024 * 1024, 16 * 1024] {
         let mut t = Table::new(Config {
             max_bytes,
@@ -1906,7 +1907,7 @@ fn retained_message_tree_allocations_are_charged_and_admitted() {
         });
         let ss = scopes(1);
         let now = Instant::now();
-        let baseline = allocation_receipt::LIVE.load(Ordering::Relaxed);
+        let baseline = allocation_receipt::here().live;
         let r = t.reserve(
             Plan {
                 continued: None,
@@ -1942,7 +1943,7 @@ fn retained_message_tree_allocations_are_charged_and_admitted() {
         let retained = publication.retained;
         let reason = publication.reason;
         drop(publication);
-        let live = allocation_receipt::LIVE.load(Ordering::Relaxed) - baseline;
+        let live = allocation_receipt::here().live - baseline;
         eprintln!("retention message tree max_bytes={max_bytes} allocator_live_requested={live} reported={} retained={retained}", t.bytes);
         assert!(live > 0, "allocator guard must observe retained ownership");
         assert!(
@@ -1962,7 +1963,6 @@ fn retained_message_tree_allocations_are_charged_and_admitted() {
 
 #[test]
 fn released_only_history_enforces_bytes_before_the_count_limit() {
-    use std::sync::atomic::Ordering;
     let now = Instant::now();
     let auth = Some([27; 32]);
     let ss = scopes(1);
@@ -2015,7 +2015,7 @@ fn released_only_history_enforces_bytes_before_the_count_limit() {
     // rand::random initializes thread-local RNG ownership on first use. This
     // is process/thread infrastructure, not retained table ownership.
     std::hint::black_box(rand::random::<u64>());
-    let baseline = allocation_receipt::LIVE.load(Ordering::Relaxed);
+    let baseline = allocation_receipt::here().live;
     let issued = reserve(&mut control);
     assert_eq!(issued.id.key.slot, 0);
     let publication = control.publish(issued, prepare(), now);
@@ -2038,7 +2038,7 @@ fn released_only_history_enforces_bytes_before_the_count_limit() {
     );
     let release_only = control.bytes;
     assert_eq!(release_only, Table::slot_bytes(slot));
-    let live = allocation_receipt::LIVE.load(Ordering::Relaxed) - baseline;
+    let live = allocation_receipt::here().live - baseline;
     assert_eq!(live, release_only as isize);
     assert_charge(&control);
     assert!(release_only > 0);
@@ -2201,15 +2201,14 @@ fn owned_message_snapshot_converts_after_unlock_and_original_release() {
 
 #[test]
 fn owned_string_snapshot_conversion_has_no_new_allocation() {
-    use std::sync::atomic::Ordering;
     let owned = StoredMessage::new(Value::String("π-string-payload".repeat(1024)));
     let borrowed = StoredMessage::new(Value::String("π-string-payload".repeat(1024)));
-    let before = allocation_receipt::ALLOCATIONS.load(Ordering::Relaxed);
+    let before = allocation_receipt::here().allocations;
     let converted = std::hint::black_box(Value::from(owned));
-    let owned_allocations = allocation_receipt::ALLOCATIONS.load(Ordering::Relaxed) - before;
-    let before = allocation_receipt::ALLOCATIONS.load(Ordering::Relaxed);
+    let owned_allocations = allocation_receipt::here().allocations - before;
+    let before = allocation_receipt::here().allocations;
     let copied = std::hint::black_box(borrowed.value());
-    let borrowed_allocations = allocation_receipt::ALLOCATIONS.load(Ordering::Relaxed) - before;
+    let borrowed_allocations = allocation_receipt::here().allocations - before;
     assert_eq!(converted, copied);
     assert!(
         borrowed_allocations > 0,

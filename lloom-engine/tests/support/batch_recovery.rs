@@ -106,6 +106,16 @@ pub(super) fn native_config(paged: bool) -> Config {
     c
 }
 
+/// [`native_config`] with 64 positions, two of its 32-position pages: the
+/// native arms' ceiling, as [`small_config`] is the CPU's.
+#[cfg(feature = "metal")]
+pub(super) fn small_native_config(paged: bool) -> Config {
+    Config {
+        max_position_embeddings: 64,
+        ..native_config(paged)
+    }
+}
+
 /// Where an armed [`Faulty`] fails, after the inner model's call returned.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(super) enum Site {

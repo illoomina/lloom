@@ -73,7 +73,8 @@ fn shared_rows<P: Profile<Rows = lloom::profile::Paged>>(
     dtype: DType,
     device: &Device,
 ) -> SlotPool<State<P>> {
-    let pool = lloom::models::lfm2::BatchPool::new(cfg, device, ROWS, 128).unwrap();
+    let capacity = cfg.max_position_embeddings.min(128);
+    let pool = lloom::models::lfm2::BatchPool::new(cfg, device, ROWS, capacity).unwrap();
     pool.set_batched_arms(true);
     let mut caches = (0..ROWS)
         .map(|_| State::<P>::for_batch(true, dtype, cfg, device, &pool).unwrap())
@@ -594,6 +595,65 @@ fn a_speculative_round_failing_untouched_with_its_windows_open_is_reset() {
         DType::F32,
         Loop::Speculative,
         own_rows,
+        Site::VerifyRowsEnqueueSaysUntouched,
+        1,
+    );
+}
+
+#[cfg(feature = "metal")]
+use batch_recovery::small_native_config;
+
+#[cfg(feature = "metal")]
+#[test]
+fn natively_a_paged_continuous_admission_refused_at_its_ceiling_keeps_its_prefixes() {
+    a_step_refused_at_its_ceiling_keeps_its_prefixes::<lloom::profile::PoolSpecExact>(
+        "metal-private-paged-k1",
+        Device::new_metal(0).unwrap(),
+        small_native_config(true),
+        DType::F16,
+        Loop::K1,
+        own_rows,
+    );
+}
+
+#[cfg(feature = "metal")]
+#[test]
+fn natively_a_pool_rows_speculative_admission_refused_at_its_ceiling_keeps_its_prefixes() {
+    a_step_refused_at_its_ceiling_keeps_its_prefixes::<lloom::profile::PoolSpecExact>(
+        "metal-pool-rows-spec",
+        Device::new_metal(0).unwrap(),
+        small_native_config(true),
+        DType::F16,
+        Loop::Speculative,
+        shared_rows,
+    );
+}
+
+#[cfg(feature = "metal")]
+#[test]
+fn natively_a_pool_rows_prefill_failing_past_its_first_layer_hands_its_rows_back_reset() {
+    a_failed_step_then_the_next::<lloom::profile::PoolSpecExact>(
+        "metal-pool-rows-k1",
+        Device::new_metal(0).unwrap(),
+        native_config(true),
+        DType::F16,
+        Loop::K1,
+        shared_rows,
+        Site::PrefillPastRope,
+        1,
+    );
+}
+
+#[cfg(feature = "metal")]
+#[test]
+fn natively_a_pool_rows_speculative_round_failing_untouched_with_its_windows_open_is_reset() {
+    a_failed_step_then_the_next::<lloom::profile::PoolSpecExact>(
+        "metal-pool-rows-spec",
+        Device::new_metal(0).unwrap(),
+        native_config(true),
+        DType::F16,
+        Loop::Speculative,
+        shared_rows,
         Site::VerifyRowsEnqueueSaysUntouched,
         1,
     );

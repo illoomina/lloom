@@ -507,3 +507,41 @@ fn a_static_batch_failing_past_its_first_layer_hands_its_rows_back_reset() {
         1,
     );
 }
+
+#[cfg(feature = "metal")]
+use batch_recovery::small_native_config;
+
+#[cfg(feature = "metal")]
+#[test]
+fn natively_a_paged_static_batch_refused_at_its_ceiling_keeps_its_prefixes() {
+    a_batch_refused_at_its_ceiling_keeps_its_prefixes::<lloom::profile::PoolSpecExact>(
+        "metal-private-paged",
+        Device::new_metal(0).unwrap(),
+        small_native_config(true),
+        DType::F16,
+    );
+}
+
+#[cfg(feature = "metal")]
+#[test]
+fn natively_a_paged_static_batch_refused_inside_a_verify_window_is_reset() {
+    a_batch_refused_inside_a_verify_window_is_reset::<lloom::profile::PoolSpecExact>(
+        "metal-private-paged",
+        Device::new_metal(0).unwrap(),
+        small_native_config(true),
+        DType::F16,
+    );
+}
+
+#[cfg(feature = "metal")]
+#[test]
+fn natively_a_paged_static_batch_failing_past_its_first_layer_hands_its_rows_back_reset() {
+    a_failed_batch_then_the_next::<lloom::profile::PoolSpecExact>(
+        "metal-private-paged",
+        Device::new_metal(0).unwrap(),
+        native_config(true),
+        DType::F16,
+        Site::PrefillPastRope,
+        1,
+    );
+}

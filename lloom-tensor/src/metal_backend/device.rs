@@ -3768,6 +3768,16 @@ impl MetalDevice {
         self.new_persistent_shared_in(size, None)
     }
 
+    /// A [`super::ReadbackDst`] of at least `size` bytes: a persistent Shared
+    /// buffer, outside every pool and plan, that only readbacks staged into it
+    /// write.
+    pub fn new_readback_dst(&self, size: usize) -> Result<super::ReadbackDst> {
+        // Read by the host, never by a later dispatch (`DESIGN.md` §9.2aa).
+        let _escape = super::EscapeGuard::new();
+        let buffer = self.new_persistent_shared(size.max(1))?;
+        super::ReadbackDst::new(buffer, self.clone())
+    }
+
     fn new_persistent_shared_in(
         &self,
         size: usize,

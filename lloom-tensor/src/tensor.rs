@@ -2135,7 +2135,7 @@ impl Tensor {
     /// Ordering behind the read word is not promised either; see
     /// `MetalStorage::peek_cpu` for the tear bound and why anything wider than
     /// one word needs a version protocol (§3.7g).
-    pub fn peek_vec1<S: crate::WithDType>(&self) -> Option<Vec<S>> {
+    pub fn peek_vec1<S: crate::ReadbackElement>(&self) -> Option<Vec<S>> {
         if self.rank() != 1 || !self.is_contiguous() {
             return None;
         }

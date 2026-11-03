@@ -1859,11 +1859,9 @@ impl Inner {
                 let bytes = keep * self.pools[i].plane_bytes;
                 if bytes > 0 {
                     let (old, new) = (self.pools[i].qt.metal_buffer()?, qt.metal_buffer()?);
-                    let mut blit = m.blit_command_encoder()?;
-                    blit.set_label("slot pools reallocated");
                     // SAFETY: both pools are persistent tier buffers no pool
                     // recycles, and nothing writes the old one after this copy.
-                    unsafe { blit.copy_from_buffer(old, 0, new, 0, bytes) };
+                    unsafe { m.copy_bytes("slot pools reallocated", old, 0, new, 0, bytes) }?;
                 }
             }
             fresh.push(SlotPool {

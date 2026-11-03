@@ -83,7 +83,7 @@ fn commit_a_copy_of_a_released_buffer(
         // SAFETY: deliberately broken for the injected failure: `src` is
         // released before the commit, which an unretained command buffer
         // reports as an invalid resource. Nothing reads `dst` afterwards.
-        unsafe { blit.copy_from_buffer(&src, 0, &dst, 0, len) };
+        unsafe { blit.copy_from_buffer(&src, 0, &dst, 0, len) }.unwrap();
     }
     drop(src);
     cmds.flush_marker()

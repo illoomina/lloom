@@ -2912,6 +2912,15 @@ impl BlitCommandEncoder {
     /// fence can observe -- at the aliasing instant no encoder has bound the
     /// buffer, and by the time one does it looks freshly allocated
     /// (`DESIGN.md` §2.3.8b). Measured at 11/30 unstable with and without.
+    ///
+    /// Offsets are relative to each handle's view, as a compute binding's are:
+    /// a `Buffer::view` shares its parent's `MTLBuffer`, so the native copy is
+    /// given `base_offset + offset`, checked against the view's extent rather
+    /// than the allocation's. A range outside Metal's buffer-copy contract
+    /// (offsets and size multiples of 4, no overlap within one buffer) is
+    /// refused before any effect: the caller routes it to the compute byte
+    /// copy (`MetalDevice::copy_bytes`). An empty copy encodes nothing.
+    ///
     /// # Safety
     /// Explicit legacy/raw interoperability: caller retains genuine originating
     /// reuse authority and native/accounting owners through actual terminal work,
@@ -2925,12 +2934,33 @@ impl BlitCommandEncoder {
         dst_buffer: &Buffer,
         dst_offset: usize,
         size: usize,
-    ) {
-        // Empty tensor copies are no-ops, not legal zero-byte Metal blits.
-        // No byte is read or written, so there is no hazard to register.
-        if size == 0 {
-            return;
-        }
+    ) -> Result<(), crate::kernels::MetalKernelError> {
+        use crate::kernels::MetalKernelError as Error;
+        use crate::native_binding_preflight::{byte_copy_route, ByteCopyRoute};
+        let (src_offset, dst_offset) = match byte_copy_route(
+            src_buffer.base_offset(),
+            src_buffer.length(),
+            src_offset,
+            dst_buffer.base_offset(),
+            dst_buffer.length(),
+            dst_offset,
+            size,
+            src_buffer.raw_ptr() == dst_buffer.raw_ptr(),
+        )
+        .ok_or(Error::QueueUnavailable(
+            "blit copy exceeds originating view",
+        ))? {
+            ByteCopyRoute::Empty => return Ok(()),
+            ByteCopyRoute::AlignedBlit {
+                source,
+                destination,
+            } => (source, destination),
+            ByteCopyRoute::Compute { .. } => {
+                return Err(Error::QueueUnavailable(
+                    "byte copy outside the blit contract requires its compute arm",
+                ))
+            }
+        };
         let src_ptr = src_buffer.raw_ptr() as usize;
         let dst_ptr = dst_buffer.raw_ptr() as usize;
         // A blit reads and writes buffers exactly as a dispatch binds them, so
@@ -2947,6 +2977,12 @@ impl BlitCommandEncoder {
 
         self.tracked_outputs.push(dst_ptr);
 
+        #[cfg(test)]
+        emitted::push(emitted::Emitted::Blit {
+            source: src_offset,
+            destination: dst_offset,
+            size,
+        });
         unsafe {
             self.raw
                 .copyFromBuffer_sourceOffset_toBuffer_destinationOffset_size(
@@ -2957,21 +2993,56 @@ impl BlitCommandEncoder {
                     size,
                 )
         }
+        Ok(())
     }
 
+    /// Fill `range` of this handle's view, as [`Self::copy_from_buffer`]
+    /// addresses it: the native range starts at the view's base, and one
+    /// outside the 4-byte fill contract is refused for the compute fill
+    /// (`MetalDevice::fill_bytes`). An empty range encodes nothing.
+    ///
     /// # Safety
     /// Explicit legacy/raw interoperability: caller retains genuine originating
     /// reuse authority and native/accounting owners through actual terminal work,
     /// cached native references and every escaped future emission. Bare derived
     /// Buffer/native pointer retention is NOT reuse authority. No tracked pin is
     /// installed by this method; use the admitted typed operation instead.
-    pub unsafe fn fill_buffer(&mut self, buffer: &Buffer, range: (usize, usize), value: u8) {
+    pub unsafe fn fill_buffer(
+        &mut self,
+        buffer: &Buffer,
+        range: (usize, usize),
+        value: u8,
+    ) -> Result<(), crate::kernels::MetalKernelError> {
+        use crate::kernels::MetalKernelError as Error;
+        let location = crate::native_binding_preflight::checked_byte_range(
+            buffer.base_offset(),
+            buffer.length(),
+            range.0,
+            range.1,
+        )
+        .ok_or(Error::QueueUnavailable(
+            "blit fill exceeds originating view",
+        ))?;
+        if range.1 == 0 {
+            return Ok(());
+        }
+        if !location.is_multiple_of(4) || !range.1.is_multiple_of(4) {
+            return Err(Error::QueueUnavailable(
+                "byte fill outside the blit contract requires its compute arm",
+            ));
+        }
+        let range = (location, range.1);
         let ptr = buffer.raw_ptr() as usize;
         arena::note_bind(ptr);
         late_bind::on_bind(ptr, true, "blit fill");
         self.wait_for_last_writers(&[ptr]);
         self.tracked_outputs.push(ptr);
 
+        #[cfg(test)]
+        emitted::push(emitted::Emitted::Fill {
+            offset: range.0,
+            size: range.1,
+        });
         self.raw.fillBuffer_range_value(
             unsafe { buffer.raw_unchecked() },
             NSRange {
@@ -2979,7 +3050,49 @@ impl BlitCommandEncoder {
                 length: range.1,
             },
             value,
-        )
+        );
+        Ok(())
+    }
+}
+
+/// What the legacy blit wrappers and the routed byte copies emitted on this
+/// thread, so a test pins the route and the native offsets rather than only
+/// the bytes: Apple silicon can copy an unaligned range correctly, and a lost
+/// view base can land on bytes that happen to match.
+#[cfg(test)]
+pub(crate) mod emitted {
+    use std::cell::RefCell;
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum Emitted {
+        /// A native `copyFromBuffer`, with the offsets the native call received.
+        Blit {
+            source: usize,
+            destination: usize,
+            size: usize,
+        },
+        /// A native `fillBuffer`, with the range the native call received.
+        Fill { offset: usize, size: usize },
+        /// The compute byte copy, with the view-relative offsets it bound.
+        Compute {
+            source: usize,
+            destination: usize,
+            size: usize,
+        },
+        /// The compute byte fill of a view's first `size` bytes.
+        ComputeFill { size: usize },
+    }
+
+    thread_local! {
+        static LOG: RefCell<Vec<Emitted>> = const { RefCell::new(Vec::new()) };
+    }
+
+    pub(crate) fn push(e: Emitted) {
+        LOG.with(|l| l.borrow_mut().push(e));
+    }
+
+    pub(crate) fn take() -> Vec<Emitted> {
+        LOG.with(|l| std::mem::take(&mut *l.borrow_mut()))
     }
 }
 

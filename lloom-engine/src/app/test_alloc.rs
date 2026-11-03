@@ -1,15 +1,21 @@
 //! The library test binary's one global allocator. It forwards every call to
 //! `System` unchanged and keeps the instruments the tests read: a thread-local,
-//! opt-in count of requested bytes (`counted`), and the process-wide
-//! allocation calls, live requested bytes and live blocks; and, while
-//! `under_lock` watches a mutex on this thread, the allocations and frees made
-//! with that mutex held.
+//! opt-in count of requested bytes (`counted`); the allocation calls, live
+//! requested bytes and live blocks, both for the calling thread (`here`) and
+//! for the process (`process`); and, while `under_lock` watches a mutex on this
+//! thread, the allocations and frees made with that mutex held.
 //!
 //! A `realloc` counts as one allocation call and moves the live bytes by the
 //! size change, which is what the trait's default (allocate, copy, free) would
-//! have counted. The process-wide counters are shared by every test in the
-//! process: a test reading them needs the runner's per-process isolation
-//! (nextest) or `--test-threads=1`.
+//! have counted.
+//!
+//! The process-wide counters include every thread's allocations: the test
+//! harness's own (libtest's main thread records and waits for the test after
+//! the test's thread has started) and every other test's under a runner that
+//! shares the process. A window measuring work done on its own thread reads
+//! `here`. A block freed on a thread other than the one that allocated it
+//! moves both threads' receipts, so `here` measures only work that allocates
+//! and frees on the reading thread.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
@@ -28,6 +34,43 @@ static LOCKED_FREES: AtomicUsize = AtomicUsize::new(0);
 thread_local! {
     static REQUESTED: Cell<Option<usize>> = const { Cell::new(None) };
     static WATCHING: Cell<bool> = const { Cell::new(false) };
+    static HERE_ALLOCATIONS: Cell<usize> = const { Cell::new(0) };
+    static HERE_LIVE: Cell<isize> = const { Cell::new(0) };
+    static HERE_BLOCKS: Cell<isize> = const { Cell::new(0) };
+}
+
+/// Allocation calls, live requested bytes and live blocks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Receipt {
+    pub allocations: usize,
+    pub live: isize,
+    pub blocks: isize,
+}
+
+/// The calling thread's receipt: its allocations, and its allocations less
+/// its frees.
+pub(crate) fn here() -> Receipt {
+    Receipt {
+        allocations: HERE_ALLOCATIONS.with(Cell::get),
+        live: HERE_LIVE.with(Cell::get),
+        blocks: HERE_BLOCKS.with(Cell::get),
+    }
+}
+
+/// Every thread's receipt.
+pub(crate) fn process() -> Receipt {
+    Receipt {
+        allocations: ALLOCATIONS.load(Ordering::Relaxed),
+        live: LIVE.load(Ordering::Relaxed),
+        blocks: BLOCKS.load(Ordering::Relaxed),
+    }
+}
+
+/// Moves this thread's receipt; a thread whose locals are gone moves none.
+fn here_add(allocations: usize, live: isize, blocks: isize) {
+    let _ = HERE_ALLOCATIONS.try_with(|c| c.set(c.get() + allocations));
+    let _ = HERE_LIVE.try_with(|c| c.set(c.get() + live));
+    let _ = HERE_BLOCKS.try_with(|c| c.set(c.get() + blocks));
 }
 
 /// `Some(held)` while `under_lock` watches on this thread.
@@ -66,6 +109,7 @@ fn born(bytes: usize) {
     ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
     BLOCKS.fetch_add(1, Ordering::Relaxed);
     LIVE.fetch_add(bytes as isize, Ordering::Relaxed);
+    here_add(1, bytes as isize, 1);
 }
 
 struct Counter;
@@ -74,7 +118,7 @@ struct Counter;
 static ALLOCATOR: Counter = Counter;
 
 // SAFETY: every call is forwarded unchanged to System; the instruments are
-// atomics and a const-initialized thread-local scalar, none of which
+// atomics and const-initialized thread-local scalars, none of which
 // allocates or dereferences an allocator pointer.
 unsafe impl GlobalAlloc for Counter {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
@@ -106,6 +150,7 @@ unsafe impl GlobalAlloc for Counter {
             watch(&WATCHED_ALLOCATIONS, &LOCKED_ALLOCATIONS);
             ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
             LIVE.fetch_add(size as isize - layout.size() as isize, Ordering::Relaxed);
+            here_add(1, size as isize - layout.size() as isize, 0);
         }
         moved
     }
@@ -114,6 +159,7 @@ unsafe impl GlobalAlloc for Counter {
         watch(&WATCHED_FREES, &LOCKED_FREES);
         LIVE.fetch_sub(layout.size() as isize, Ordering::Relaxed);
         BLOCKS.fetch_sub(1, Ordering::Relaxed);
+        here_add(0, -(layout.size() as isize), -1);
         // SAFETY: the caller's allocation and its layout are forwarded.
         unsafe { System.dealloc(ptr, layout) }
     }

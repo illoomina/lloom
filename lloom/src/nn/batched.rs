@@ -788,7 +788,15 @@ impl<'m, M: BatchedCausalLM, R: BorrowMut<Session<'m, M>>> BatchDecoder<'m, M, R
             pos_before,
             last_logits: None,
             stats: DecodeStats {
-                step_ns: Vec::with_capacity(max_tokens),
+                // One entry per step the row lives, reserved at admission so
+                // the step loop never grows it (decision 123). `step_ns` is
+                // filled only under `PROFILE_INSTRUMENTS`.
+                batch_rows: Vec::with_capacity(max_tokens),
+                step_ns: Vec::with_capacity(if crate::PROFILE_INSTRUMENTS {
+                    max_tokens
+                } else {
+                    0
+                }),
                 hot_thread: self.hot_thread.report(),
                 ..DecodeStats::default()
             },

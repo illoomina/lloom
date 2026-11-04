@@ -1613,6 +1613,61 @@ pub fn in_flight_mem_cap(_device: &Device) -> usize {
     64
 }
 
+/// Test seam behind `fuzzing` (#1205, census row 6): how many times a
+/// [`StepPacer`] on a device has begun waiting on a marker that was not
+/// complete, the event its `waited` counter records, made visible while the
+/// wait is still in progress. Keyed by device in a fixed table that allocates
+/// nothing, so a test holding its device's work can release the hold once the
+/// pacer is waiting on it, and a concurrent test on another device cannot
+/// move its count. Nothing shipping enables `fuzzing`.
+#[cfg(all(feature = "metal", feature = "fuzzing"))]
+pub mod pacer_waits {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    const SLOTS: usize = 64;
+    static KEYS: [AtomicU64; SLOTS] = [const { AtomicU64::new(0) }; SLOTS];
+    static BEGUN: [AtomicU64; SLOTS] = [const { AtomicU64::new(0) }; SLOTS];
+
+    fn key(m: &lloom_tensor::MetalDevice) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        m.id().hash(&mut h);
+        h.finish() | 1
+    }
+
+    /// The slot for `m`'s device, claimed if `claim`.
+    fn slot(m: &lloom_tensor::MetalDevice, claim: bool) -> Option<usize> {
+        let k = key(m);
+        for i in 0..SLOTS {
+            let t = KEYS[i].load(Ordering::Acquire);
+            if t == k {
+                return Some(i);
+            }
+            if t == 0 {
+                if !claim {
+                    return None;
+                }
+                match KEYS[i].compare_exchange(0, k, Ordering::AcqRel, Ordering::Acquire) {
+                    Ok(_) => return Some(i),
+                    Err(now) if now == k => return Some(i),
+                    Err(_) => continue,
+                }
+            }
+        }
+        None
+    }
+
+    pub(super) fn begun(m: &lloom_tensor::MetalDevice) {
+        if let Some(i) = slot(m, true) {
+            BEGUN[i].fetch_add(1, Ordering::Release);
+        }
+    }
+
+    /// Waits a pacer on `m`'s device has begun on an incomplete marker.
+    pub fn waits_begun(m: &lloom_tensor::MetalDevice) -> u64 {
+        slot(m, false).map_or(0, |i| BEGUN[i].load(Ordering::Acquire))
+    }
+}
+
 /// The host's bound on how far it runs ahead of the GPU, as a wait on the
 /// command buffer that carried a step rather than on anything the GPU writes.
 ///
@@ -1703,6 +1758,10 @@ impl StepPacer {
             while self.pending.queued_steps >= max_queued && !self.pending.entries.is_empty() {
                 self.waited += self.pending.retire(|oldest| {
                     let waited = !m.marker_complete(oldest);
+                    #[cfg(feature = "fuzzing")]
+                    if waited {
+                        pacer_waits::begun(m);
+                    }
                     m.wait_marker(oldest)?;
                     Ok(waited)
                 })? as u64;
@@ -1733,6 +1792,10 @@ impl StepPacer {
             while self.pending.entries.len() >= self.depth {
                 self.waited += self.pending.retire(|oldest| {
                     let waited = !m.marker_complete(oldest);
+                    #[cfg(feature = "fuzzing")]
+                    if waited {
+                        pacer_waits::begun(m);
+                    }
                     m.wait_marker(oldest)?;
                     Ok(waited)
                 })? as u64;

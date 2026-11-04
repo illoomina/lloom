@@ -18,6 +18,7 @@ pub(crate) enum Fault {
     UnknownReturn = 5,
     CloseRefusal = 6,
     HoldBeforeEntry = 7,
+    CloseBusy = 8,
 }
 
 #[derive(Default)]
@@ -86,6 +87,11 @@ impl Control {
         if self.take(Fault::CloseRefusal) {
             Err(MetalKernelError::QueueUnavailable(
                 "injected compute close refusal",
+            ))
+        } else if self.take(Fault::CloseBusy) {
+            // The transient refusal a recording edit in progress returns.
+            Err(MetalKernelError::RecordingAdmission(
+                crate::command_lifecycle::LifecycleError::Busy,
             ))
         } else {
             Ok(())

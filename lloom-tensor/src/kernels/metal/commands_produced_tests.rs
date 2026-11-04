@@ -2238,6 +2238,110 @@ fn a_close_refusal_keeps_the_rehomed_io_behind_a_cancelled_signal() {
     assert!(right, "REHOMED_IO_LANDS_THE_FILES_BYTES");
 }
 
+/// The gated current recording with an open encoder, the close of which is
+/// armed to refuse with `fault`; then its producer gives up, and raises the
+/// event anyway, as #1099's producers may once the cancel returns.
+struct RefusedClose {
+    cancelled: Result<usize, MetalKernelError>,
+    sticky: Result<(), MetalKernelError>,
+    pending: bool,
+    calls: (usize, usize),
+    abandoned: bool,
+    ran: bool,
+}
+
+fn cancel_through_a_refused_close(f: &Fixture, fault: submission_test::Fault) -> RefusedClose {
+    f.commands.commit_when_produced(&f.gate, 1).unwrap();
+    encode_compute(f);
+    let calls = native_calls(&f.commands);
+    f.commands.core.submission_control.arm(fault);
+    let cancelled = f.commands.cancel_produced(&f.gate, "test: the producer gave up");
+    let sticky = f.commands.core.failure.check();
+    let pending = f.commands.core.produced_cancel_pending();
+    f.gate.setSignaledValue(1);
+    let _ = f.commands.produced(&f.gate, 1);
+    let abandoned = f.commands.core.state.lock(Side::Host).current_abandoned;
+    let _ = f.commands.flush_and_wait();
+    std::thread::sleep(Duration::from_millis(200));
+    let after = native_calls(&f.commands);
+    RefusedClose {
+        cancelled,
+        sticky,
+        pending,
+        calls: (calls, after),
+        abandoned,
+        ran: computed(&f.dst),
+    }
+}
+
+/// A cancellation whose close of the current encoder refuses for good must
+/// not lose its effect. The queue fails (a visible error), and raising the
+/// event afterwards releases nothing: the dependent work never runs over the
+/// input its producer gave up on. On dev before this fix the refusal's early
+/// exit dropped the cancellation unlatched, and the raise released the
+/// current recording (#944 ledger item 10; lane A 6548125286).
+#[test]
+fn a_refused_close_fails_the_queue_rather_than_lose_the_cancellation() {
+    let f = fixture();
+    if f.commands.host_input_arm() == HostInputArm::GpuWait {
+        eprintln!("NOT_APPLICABLE nothing is held on the gpu-wait arm");
+        return;
+    }
+    let RefusedClose {
+        cancelled,
+        sticky,
+        pending,
+        calls: (calls, after),
+        abandoned,
+        ran,
+    } = cancel_through_a_refused_close(&f, submission_test::Fault::CloseRefusal);
+    eprintln!(
+        "REFUSED_CLOSE_CANCEL api={} cancel={cancelled:?} sticky={sticky:?} pending={pending} calls={calls}->{after} abandoned={abandoned} ran={ran}",
+        f.commands.actual_command_api()
+    );
+    assert!(cancelled.is_err(), "REFUSED_CLOSE_REPORTED");
+    assert!(!ran, "THE_CANCELLED_WORK_NEVER_RUNS");
+    assert_eq!(after, calls, "NO_NATIVE_CALL_FOR_THE_CANCELLED_WORK");
+    assert!(sticky.is_err(), "A_REFUSED_CLOSE_FAILS_THE_QUEUE");
+}
+
+/// A close that refuses only for now (`Busy`, a recording edit in progress)
+/// keeps the cancellation pending instead of losing it, and does not fail
+/// the queue. The raise that follows applies it first (a pending cancel is
+/// applied before any release), so the current recording is abandoned, the
+/// cancelled work never runs, and the queue still runs the next work.
+#[test]
+fn a_busy_close_keeps_the_cancellation_until_it_applies() {
+    let f = fixture();
+    if f.commands.host_input_arm() == HostInputArm::GpuWait {
+        eprintln!("NOT_APPLICABLE nothing is held on the gpu-wait arm");
+        return;
+    }
+    let RefusedClose {
+        cancelled,
+        sticky,
+        pending,
+        calls: (calls, after),
+        abandoned,
+        ran,
+    } = cancel_through_a_refused_close(&f, submission_test::Fault::CloseBusy);
+    // The queue still runs work that waits for nothing.
+    encode_compute(&f);
+    let next = f.commands.flush_and_wait();
+    let next_ran = computed(&f.dst);
+    eprintln!(
+        "BUSY_CLOSE_CANCEL api={} cancel={cancelled:?} sticky={sticky:?} pending={pending} calls={calls}->{after} abandoned={abandoned} ran={ran} next={next:?} next_ran={next_ran}",
+        f.commands.actual_command_api()
+    );
+    assert!(cancelled.is_err(), "BUSY_CLOSE_REPORTED");
+    assert!(!ran, "THE_CANCELLED_WORK_NEVER_RUNS");
+    assert_eq!(after, calls, "NO_NATIVE_CALL_FOR_THE_CANCELLED_WORK");
+    assert!(pending, "THE_CANCELLATION_IS_KEPT_PENDING");
+    assert!(abandoned, "THE_RAISE_APPLIES_THE_KEPT_CANCELLATION");
+    assert!(sticky.is_ok(), "A_BUSY_CLOSE_DOES_NOT_FAIL_THE_QUEUE");
+    assert!(next.is_ok() && next_ran, "THE_QUEUE_RUNS_THE_NEXT_WORK");
+}
+
 /// One held reader per gate, each on an event of its own: the dependent
 /// compute recorded behind `commit_when_produced(event, 1)`, then cut. Its
 /// marker and the epoch the cut took.

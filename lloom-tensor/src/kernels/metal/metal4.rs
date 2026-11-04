@@ -341,8 +341,6 @@ impl Queue {
         // Only completed submissions return slots; abandoned uncommitted ones
         // are destroyed instead. No reset races outstanding GPU commands.
         slot.reset();
-        let front_event = slot.front_event.clone();
-        let generation = slot.generation;
         // Capacity reservation precedes Commands' epoch/callback side effects.
         // The explicit retained quota permit is an integration prerequisite;
         // this source draft still has the earlier uncharged growth hook.
@@ -369,8 +367,6 @@ impl Queue {
             submission
         });
         Ok(Arc::new(Submission {
-            front_event,
-            generation,
             queue: Arc::clone(self),
             retirement,
             native_reuse: crate::native_reuse::NativeReuse::new(),
@@ -694,7 +690,6 @@ impl SlotFeedback {
 }
 
 pub(super) struct Slot {
-    front_event: Retained<ProtocolObject<dyn MTLSharedEvent>>,
     generation: u64,
     cb: Retained<ProtocolObject<dyn MTL4CommandBuffer>>,
     // Retained across safe slot reuse; only the current generation's prefix is
@@ -766,12 +761,8 @@ impl Slot {
         let residency = device
             .newResidencySetWithDescriptor_error(&MTLResidencySetDescriptor::new())
             .map_err(|e| fail(&format!("MTL4 residency: {e}")))?;
-        let front_event = device
-            .newSharedEvent()
-            .ok_or_else(|| fail("MTL4 queue-front event"))?;
         queue.raw.addResidencySet(&residency);
         Ok(Self {
-            front_event,
             generation: 0,
             cb,
             extra_cbs: Vec::new(),
@@ -990,8 +981,6 @@ struct State {
 }
 
 pub(crate) struct Submission {
-    front_event: Retained<ProtocolObject<dyn MTLSharedEvent>>,
-    generation: u64,
     pub queue: Arc<Queue>,
     retirement: super::retirement::Record,
     native_reuse: crate::native_reuse::NativeReuse<Slot>,
@@ -1139,18 +1128,11 @@ impl Submission {
     }
 
     pub fn status(&self) -> MTLCommandBufferStatus {
-        let status = MTLCommandBufferStatus(self.status.load(Ordering::Acquire));
-        // MTL4 exposes no live native Scheduled property. This queue-front
-        // signal says all work ahead of this submission has finished. This is a
-        // conservative queue-readiness observation, not native Scheduled or
-        // a GPU timestamp; its cadence cost must be measured.
-        if status == MTLCommandBufferStatus::Committed
-            && self.front_event.signaledValue() >= self.generation
-        {
-            MTLCommandBufferStatus::Scheduled
-        } else {
-            status
-        }
+        // MTL4 exposes no live native Scheduled property, and none is
+        // synthesized: no consumer tells `Scheduled` from `Committed` (#944,
+        // the pacing review). A committed submission reads `Committed` until
+        // its terminal feedback.
+        MTLCommandBufferStatus(self.status.load(Ordering::Acquire))
     }
     pub fn gpu_start_time(&self) -> f64 {
         self.feedback.get().map_or(0.0, |f| f.start)
@@ -1495,25 +1477,18 @@ impl Submission {
         crate::completion_scope::before_park(Arc::as_ptr(&self.queue) as usize)
             .map_err(|_| MetalKernelError::CallbackWouldBlock)
     }
-    /// The retained front event belongs to this logical submission's captured
-    /// generation. It is queued under commit_order before every own segment;
-    /// Apple's MTL4 signalEvent contract completes all earlier queue GPU work.
-    /// Own terminal feedback cannot substitute for this receipt, including an
-    /// empty submission. No arbitrary callback join is required here.
-    pub(super) fn try_wait_prefix_front(&self) -> Result<(), MetalKernelError> {
+    /// The data of every earlier submission on this queue, through this
+    /// submission's own logical completion: retirement runs in commit order
+    /// (the completion frontier drains records one at a time, in sequence),
+    /// so this record's callbacks finishing means every earlier record's
+    /// have. The stronger ordered logical prefix Metal 3's associated buffer
+    /// uses. A queue failure (an earlier record failed, an unknown handoff)
+    /// returns it, never a fabricated completion. It replaced a per-commit
+    /// queue-front signal whose only consumer this was (#944, the pacing
+    /// review); recovery joins earlier callbacks as Metal 3 always has.
+    pub(super) fn try_wait_prefix_logical(&self) -> Result<(), MetalKernelError> {
         self.queue.check_failure()?;
-        crate::prefix_data::wait_front(
-            || self.front_event.signaledValue() >= self.generation,
-            || {
-                self.queue.check_failure()?;
-                crate::completion_scope::before_park(Arc::as_ptr(&self.queue) as usize)
-                    .map_err(|_| MetalKernelError::CallbackWouldBlock)
-            },
-            || {
-                self.front_event
-                    .waitUntilSignaledValue_timeoutMS(self.generation, 50)
-            },
-        )?;
+        self.try_wait()?;
         self.queue.check_failure()
     }
 
@@ -1823,10 +1798,6 @@ impl PreparedCommit<'_> {
             .store(MTLCommandBufferStatus::Committed.0, Ordering::Release);
         // All queue calls for this logical recording remain under commit_order.
         // Partial/unknown entry retains every segment via the same rooted Slot.
-        submission.queue.raw.signalEvent_value(
-            ProtocolObject::from_ref(&*submission.front_event),
-            submission.generation,
-        );
         let events = submission
             .committed_events
             .get()

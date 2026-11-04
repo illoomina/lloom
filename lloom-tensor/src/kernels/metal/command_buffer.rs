@@ -1022,7 +1022,8 @@ impl CommandBuffer {
     /// terminal status never overrides ENTERED/unknown lifecycle admission.
     /// M3 currently uses the stronger ordered logical prefix (including
     /// arbitrary callbacks and its self-wait refusal), not an enqueue/FIFO
-    /// shortcut. M4 uses its front receipt without joining callbacks.
+    /// shortcut. M4 uses the same ordered logical prefix (its own submission's
+    /// callbacks, which retire in commit order).
     pub(super) fn try_wait_prefix_data_ready(
         &self,
     ) -> Result<(), crate::kernels::MetalKernelError> {
@@ -1033,7 +1034,7 @@ impl CommandBuffer {
                     "standalone buffer has no associated prefix receipt",
                 )),
                 Backend::Metal3Associated(buffer) => buffer.try_wait(true),
-                Backend::Metal4(submission) => submission.try_wait_prefix_front(),
+                Backend::Metal4(submission) => submission.try_wait_prefix_logical(),
             },
             || {
                 self.try_wait_data_ready()?;

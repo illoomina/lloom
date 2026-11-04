@@ -4019,6 +4019,78 @@ mod owner_submission_tests {
         assert!(exited.load(Ordering::Acquire));
     }
 
+    /// The recovery prefix wait covers every earlier submission's retirement,
+    /// on both APIs: with an earlier buffer's completion callback held, the
+    /// prefix wait on a later marker does not return until it is released.
+    /// Metal 4 now waits for its own logical completion, which retires in
+    /// commit order, instead of a per-commit queue-front signal (#944, the
+    /// pacing review); Metal 3's associated buffer always has.
+    #[test]
+    fn the_prefix_wait_covers_an_earlier_buffers_held_callback() {
+        let device = crate::MetalDevice::new(0).unwrap();
+        let commands = device.commands();
+        let cb = pending(commands);
+        let gate = Arc::new((parking_lot::Mutex::new(false), parking_lot::Condvar::new()));
+        let callback_gate = Arc::clone(&gate);
+        let (entered, observed) = std::sync::mpsc::channel();
+        cb.on_completion(move || {
+            let _ = entered.send(());
+            let (lock, changed) = &*callback_gate;
+            let mut released = lock.lock();
+            while !*released {
+                changed.wait(&mut released);
+            }
+        })
+        .unwrap();
+        let waited = std::cell::RefCell::new(None);
+        // Install release before the first possible submission or assertion.
+        let cleanup = ReleaseBeforeWait {
+            release: || {
+                let (lock, changed) = &*gate;
+                *lock.lock() = true;
+                changed.notify_all();
+            },
+            wait: || {
+                *waited.borrow_mut() = Some(cb.wait_until_completed());
+            },
+        };
+        let _first = commands.flush_marker().unwrap();
+        observed
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("callback did not enter");
+        let raw = device
+            .metal_device()
+            .new_buffer(256, super::super::MTLResourceOptions::StorageModeShared)
+            .unwrap();
+        {
+            let mut blit = commands.blit_command_encoder().unwrap();
+            // SAFETY: `raw` outlives every wait below; nothing reads it.
+            unsafe { blit.fill_buffer(&raw, (0, 256), 0x5c) }.unwrap();
+        }
+        let second = commands.flush_marker().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let owner = commands.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(owner.wait_marker_prefix_data(&second).map_err(|e| e.to_string()));
+        });
+        let early = rx.recv_timeout(std::time::Duration::from_millis(300));
+        eprintln!(
+            "PREFIX_HELD_CALLBACK actual_api={} early={early:?}",
+            commands.actual_command_api_for_test()
+        );
+        assert!(
+            early.is_err(),
+            "the prefix wait returned while an earlier buffer's callback was held: {early:?}"
+        );
+        drop(cleanup);
+        let done = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the prefix wait never returned after the callback was released");
+        assert!(done.is_ok(), "{done:?}");
+        waited.into_inner().unwrap().unwrap();
+        drop(raw);
+    }
+
     /// The status/error inputs below are injected observations, not a native
     /// driver failure. Genuine successful DATA remains observable afterward;
     /// the test does not claim a second native writer or physical retirement.

@@ -801,6 +801,69 @@ impl std::ops::Deref for MetalDevice {
 /// ids or a weight staging buffer is not.
 pub const SMALL_UPLOAD_BYTES: usize = 32 * 1024;
 
+/// Immutable initialized bytes from the device's existing constants cache.
+///
+/// No safe projection exposes a BufferHandle, Buffer or mutable Tensor. Cache
+/// reuse depends on every alias remaining read-only through queued/future use.
+///
+/// Safe mutable-storage construction is intentionally unavailable:
+/// ```compile_fail,E0308
+/// use lloom_tensor::{DType, MetalDevice, MetalStorage};
+/// use lloom_tensor::metal_backend::ConstantBuffer;
+/// fn mutable(c: ConstantBuffer, device: MetalDevice) -> MetalStorage {
+///     MetalStorage::new(c, device, 1, DType::U32)
+/// }
+/// ```
+/// Raw binding requires an explicit unsafe interoperability boundary:
+/// ```compile_fail,E0133
+/// use lloom_tensor::metal_backend::ConstantBuffer;
+/// fn raw(c: &ConstantBuffer) {
+///     let _ = c.buffer_unchecked();
+/// }
+/// ```
+#[repr(transparent)]
+#[derive(Clone)]
+pub struct ConstantBuffer(BufferHandle);
+
+impl ConstantBuffer {
+    /// Whether both capabilities retain the exact same cached storage handle.
+    pub fn same_cached_storage(&self, other: &Self) -> bool {
+        BufferHandle::ptr_eq(&self.0, &other.0)
+    }
+
+    /// Borrow the existing read-only buffer for native binding.
+    ///
+    /// # Safety
+    /// No alias or derived view may write these cached bytes. Access only the
+    /// initialized input range. For each native use, preserve genuine creator
+    /// reuse authority until that use is issued, then either retain this
+    /// capability (or a counted clone) through completion or transfer custody
+    /// to the existing command/creator-pool terminal retirement mechanism.
+    /// A raw Buffer clone alone is not that transfer. Deferred or replayed
+    /// emission must renew or retain the same proof through its actual issue;
+    /// completing an earlier epoch does not cover an unissued future reader.
+    /// Native users also owe bounds, device and synchronization correctness.
+    pub unsafe fn buffer_unchecked(&self) -> &Buffer {
+        &self.0
+    }
+
+    /// Transfer the existing handle into an explicit read-only interoperability owner.
+    ///
+    /// # Safety
+    /// The receiving owner and every derived alias must retain the immutable
+    /// initialized-content and full native/future-use custody obligations of
+    /// buffer_unchecked. In particular, converting this handle into a mutable
+    /// Tensor does not grant permission to mutate any of its cached bytes.
+    pub unsafe fn into_handle_unchecked(self) -> BufferHandle {
+        self.0
+    }
+}
+impl std::fmt::Debug for ConstantBuffer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConstantBuffer").finish_non_exhaustive()
+    }
+}
+
 #[cfg(any(debug_assertions, feature = "profile"))]
 static HOST_UPLOADS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -861,15 +924,6 @@ impl Default for ConstantsByValue {
     fn default() -> Self {
         Self::new()
     }
-}
-
-/// The bytes of a `#[repr(C)]` plain-data value, for [`MetalDevice::constant_of`].
-fn pod_bytes<T: Copy>(v: &T) -> &[u8] {
-    // SAFETY: `T: Copy` and the callers are `#[repr(C)]` parameter blocks
-    // that are already uploaded byte for byte by `new_buffer_with_data`; a
-    // padding byte that differs between two equal values costs a cache miss,
-    // never a wrong binding.
-    unsafe { std::slice::from_raw_parts((v as *const T).cast::<u8>(), std::mem::size_of::<T>()) }
 }
 
 impl MetalDevice {
@@ -3673,7 +3727,7 @@ impl MetalDevice {
     /// kernel's argument block, chunk table or live count: a repeated value
     /// costs a hash and a lock, a new one a pooled upload. Larger than
     /// `CONSTANT_MAX_BYTES` falls back to an upload.
-    pub fn constant_buffer(&self, bytes: &[u8]) -> Result<BufferHandle> {
+    pub fn constant_buffer(&self, bytes: &[u8]) -> Result<ConstantBuffer> {
         if let Some(scope) = super::allocation_scope::active(self)? {
             return scope.view.constant_buffer_in(bytes, Some(&scope.context));
         }
@@ -3684,16 +3738,18 @@ impl MetalDevice {
         &self,
         bytes: &[u8],
         context: Option<&crate::memory_admission::AllocationContext>,
-    ) -> Result<BufferHandle> {
+    ) -> Result<ConstantBuffer> {
         if bytes.len() > CONSTANT_MAX_BYTES {
-            return self.new_buffer_with_data_in(bytes, context);
+            return self
+                .new_buffer_with_data_in(bytes, context)
+                .map(ConstantBuffer);
         }
         {
             let mut g = self.constants.inner.lock();
             if let Some(b) = g.map.get(bytes) {
                 let b = BufferHandle::clone(b);
                 g.hits += 1;
-                return Ok(b);
+                return Ok(ConstantBuffer(b));
             }
         }
         let buf = self.new_buffer_with_data_in(bytes, context)?;
@@ -3706,12 +3762,28 @@ impl MetalDevice {
         }
         g.map.insert(bytes.to_vec(), BufferHandle::clone(&buf));
         g.order.push_back(bytes.to_vec());
-        Ok(buf)
+        Ok(ConstantBuffer(buf))
     }
 
-    /// [`Self::constant_buffer`] for one plain-data value (a params block).
-    pub fn constant_of<T: Copy>(&self, v: &T) -> Result<BufferHandle> {
-        self.constant_buffer(pod_bytes(v))
+    /// [`Self::constant_buffer`] for a value whose entire representation is
+    /// initialized and immutable (a params block). `Copy` alone does not prove
+    /// that padding bytes may be read.
+    ///
+    /// A padded `Copy` value is deliberately not accepted:
+    /// ```compile_fail,E0277
+    /// use lloom_tensor::MetalDevice;
+    /// #[repr(C)]
+    /// #[derive(Clone, Copy)]
+    /// struct Padded { tag: u8, value: u32 }
+    /// fn upload(device: &MetalDevice, value: &Padded) {
+    ///     let _ = device.constant_of(value);
+    /// }
+    /// ```
+    pub fn constant_of<T: zerocopy::IntoBytes + zerocopy::Immutable>(
+        &self,
+        v: &T,
+    ) -> Result<ConstantBuffer> {
+        self.constant_buffer(v.as_bytes())
     }
 
     /// A/B instrument (`LLOOM_UNPOOLED_UPLOADS`, read once): every host upload
@@ -4513,6 +4585,80 @@ impl<'a> ReadyBufferBuilder<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    impl MetalDevice {
+        // Test-only permission bridge for the genuine default-native fixture.
+        // The reservation and context never become a production accessor.
+        pub(crate) fn with_default_native_context_for_test(
+            &self,
+            run: impl FnOnce(&crate::memory_admission::AllocationContext) -> Result<()>,
+        ) -> Result<()> {
+            if self.allocation_namespace.domain.is_some() {
+                crate::bail!("default-native fixture requires the default namespace")
+            }
+            let permission = self.allocation_namespace.native_domain.reserve(0)?;
+            let context = permission.context();
+            run(&context)
+        }
+    }
+
+    #[test]
+    fn cached_constants_preserve_identity_and_initialized_bytes() -> Result<()> {
+        let device = crate::Device::new_metal(0)?;
+        let metal = device.as_metal_device()?;
+        let before = metal.constants_counters();
+        let value = 0x1357_9bdf_u32;
+        let first = metal.constant_of(&value)?;
+        let equal = metal.constant_buffer(&value.to_ne_bytes())?;
+        let distinct = metal.constant_of(&0x2468_ace0_u32)?;
+        assert!(first.same_cached_storage(&equal));
+        assert!(first.same_cached_storage(&first.clone()));
+        assert!(!first.same_cached_storage(&distinct));
+        let after = metal.constants_counters();
+        assert_eq!(after.0 - before.0, 1, "one equal-byte cache hit");
+        assert_eq!(after.1 - before.1, 2, "only distinct bytes upload");
+        // CPU-only immutable observation of synchronous initialized Shared
+        // upload; retain creator capability for the entire observation. No
+        // dispatch, mutable Tensor alias, or native buffer escape is involved.
+        let read = unsafe {
+            first
+                .buffer_unchecked()
+                .contents()
+                .cast::<u32>()
+                .read_unaligned()
+        };
+        assert_eq!(read, value);
+        Ok(())
+    }
+
+    #[test]
+    fn cached_constant_capability_is_transparent_and_params_are_byte_safe() {
+        fn byte_safe<T: zerocopy::IntoBytes + zerocopy::Immutable>() {}
+        use crate::kernels::kernels::params::{
+            FlashCombineParams, FlashPartialParams, FlashScatterParams,
+        };
+        byte_safe::<FlashPartialParams>();
+        byte_safe::<FlashCombineParams>();
+        byte_safe::<FlashScatterParams>();
+        eprintln!(
+            "CONSTANT_ABI capability_size={} handle_size={} capability_align={} handle_align={} partial_size={} combine_size={} scatter_size={}",
+            std::mem::size_of::<ConstantBuffer>(), std::mem::size_of::<BufferHandle>(),
+            std::mem::align_of::<ConstantBuffer>(), std::mem::align_of::<BufferHandle>(),
+            std::mem::size_of::<FlashPartialParams>(), std::mem::size_of::<FlashCombineParams>(),
+            std::mem::size_of::<FlashScatterParams>(),
+        );
+        assert_eq!(
+            std::mem::size_of::<ConstantBuffer>(),
+            std::mem::size_of::<BufferHandle>()
+        );
+        assert_eq!(
+            std::mem::align_of::<ConstantBuffer>(),
+            std::mem::align_of::<BufferHandle>()
+        );
+        assert_eq!(std::mem::size_of::<FlashPartialParams>(), 96);
+        assert_eq!(std::mem::size_of::<FlashCombineParams>(), 8);
+        assert_eq!(std::mem::size_of::<FlashScatterParams>(), 64);
+    }
 
     /// The rounding, as a pure function of the granularity.
     ///

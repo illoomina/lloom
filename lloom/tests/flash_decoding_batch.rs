@@ -47,6 +47,22 @@ fn fill(n: usize, seed: usize) -> Vec<f32> {
         .collect()
 }
 
+/// Fixture identity must observe the installed queue, not infer it from env.
+fn padded_fixture_device() -> Result<Device> {
+    let device = Device::new_metal(0)?;
+    let actual = device.as_metal_device()?.commands().actual_command_api();
+    if let Ok(requested) = std::env::var("LLOOM_METAL_API") {
+        if matches!(requested.as_str(), "metal3" | "metal4") {
+            assert_eq!(
+                actual, requested,
+                "padded fixture installed the wrong command API"
+            );
+        }
+    }
+    eprintln!("PADDED_KV_FIXTURE actual_api={actual}");
+    Ok(device)
+}
+
 /// Every batch row must reproduce the `B = 1` answer.
 ///
 /// The rows carry identical queries against identical KV, so the correct output
@@ -134,30 +150,19 @@ fn flash_decoding_writes_every_batch_row() -> Result<()> {
     Ok(())
 }
 
-/// The flattened grid reaches a batch row by head stride alone, so a `k`/`v`
-/// whose batch stride is not `n_kv_heads` head-strides must be refused.
-///
-/// **This is the precondition made loud rather than assumed** (`DESIGN.md` §3.5:
-/// under `HazardTrackingModeUntracked` a wrong address is silent). It holds for
-/// the contiguous `[B, H_kv, capacity, D]` cache the model passes — including
-/// under the `narrow(2, 0, len)` the KV slot hands out, since a dim-2 narrow
-/// changes the length and no stride — and it is what a paged or per-sequence
-/// cache would break.
+/// The native partial parameters carry explicit independent sequence strides.
+/// Preserve the original narrowed-head fixture, but compare its actual answer
+/// with the same values packed contiguously instead of forbidding valid views.
 #[test]
-fn flash_decoding_refuses_a_kv_whose_batch_stride_is_not_head_major() -> Result<()> {
-    let device = Device::new_metal(0)?;
-
+fn flash_decoding_padded_kv_batch_stride_matches_original_packed_fixture() -> Result<()> {
+    let device = padded_fixture_device()?;
     const H: usize = 8;
     const H_KV: usize = 2;
     const D: usize = 64;
     const KV_LEN: usize = 64;
     const PAGE: usize = 32;
-
     let scale = 1.0 / (D as f64).sqrt() as f32;
     let q = Tensor::from_vec(fill(2 * H * D, 7), (2, H, 1, D), &device)?.to_dtype(DType::F16)?;
-    // Narrowing dim 1 leaves `stride[0]` at the FULL head count while `dims[1]`
-    // is the narrowed one, so the batch row is wider than `n_kv_heads` strides —
-    // exactly the shape the flattening cannot address.
     let wide = Tensor::from_vec(
         fill(2 * (H_KV * 2) * KV_LEN * D, 11),
         (2, H_KV * 2, KV_LEN, D),
@@ -166,28 +171,103 @@ fn flash_decoding_refuses_a_kv_whose_batch_stride_is_not_head_major() -> Result<
     .to_dtype(DType::F16)?;
     let k = wide.narrow(1, 0, H_KV)?;
     let v = wide.narrow(1, 0, H_KV)?;
-
-    let err = lloom::nn::ops::flash_decoding(
-        &q,
-        &k,
-        &v,
-        scale,
-        1.0,
-        PAGE,
-        1,
-        lloom::nn::ops::FlashScratchSizing::Grow,
-        KV_LEN.div_ceil(PAGE),
-    );
-    let msg = match err {
-        Ok(_) => panic!(
-            "a k/v whose batch stride is not `n_kv_heads` head-strides was ACCEPTED: the \
-             flattened grid would read the wrong row, silently (DESIGN.md 3.5)"
-        ),
-        Err(e) => e.to_string(),
+    assert_ne!(k.stride()[0], H_KV * k.stride()[1]);
+    let run = |k: &Tensor, v: &Tensor| -> Result<Vec<f16>> {
+        lloom::nn::ops::flash_decoding(
+            &q,
+            k,
+            v,
+            scale,
+            1.,
+            PAGE,
+            1,
+            lloom::nn::ops::FlashScratchSizing::Grow,
+            KV_LEN.div_ceil(PAGE),
+        )?
+        .flatten_all()?
+        .to_vec1::<f16>()
     };
-    assert!(
-        msg.contains("batch stride"),
-        "refused for the wrong reason: {msg}"
-    );
+    let expected = run(&k.contiguous()?, &v.contiguous()?)?;
+    assert!(expected.iter().any(|x| x.to_bits() != 0));
+    assert_ne!(&expected[..H * D], &expected[H * D..]);
+    assert_eq!(run(&k, &v)?, expected);
+    Ok(())
+}
+
+#[test]
+fn flash_decoding_padded_batch_and_independent_value_strides_match_packed_bits() -> Result<()> {
+    use lloom::nn::ops::{flash_decoding, FlashScratchSizing};
+    let device = padded_fixture_device()?;
+    const B: usize = 2;
+    const H: usize = 8;
+    const H_KV: usize = 2;
+    const D: usize = 64;
+    const PAGE: usize = 32;
+    let scale = 1.0 / (D as f32).sqrt();
+    for dtype in [DType::F16, DType::F32] {
+        for keys in [17usize, 64] {
+            let q = Tensor::from_vec(fill(B * H * D, 7), (B, H, 1, D), &device)?.to_dtype(dtype)?;
+            let wide_k = Tensor::from_vec(
+                fill(B * H_KV * 2 * keys * D, 11),
+                (B, H_KV * 2, keys, D),
+                &device,
+            )?
+            .to_dtype(dtype)?;
+            let wide_v = Tensor::from_vec(
+                fill(B * H_KV * 3 * (keys + 16) * D, 13),
+                (B, H_KV * 3, keys + 16, D),
+                &device,
+            )?
+            .to_dtype(dtype)?;
+            let k = wide_k.narrow(1, 0, H_KV)?;
+            let v = wide_v.narrow(1, 0, H_KV)?;
+            let packed_k = k.contiguous()?;
+            let packed_v = v.contiguous()?;
+            assert_ne!(k.stride()[0], H_KV * k.stride()[1]);
+            assert_ne!(v.stride()[0], H_KV * v.stride()[1]);
+            assert_ne!(k.stride()[0], v.stride()[0]);
+            // The original refusal's narrowed-head address shape is exercised;
+            // native sequence strides must use stride[0].
+            for sizing in [
+                FlashScratchSizing::Grow,
+                FlashScratchSizing::Bucket,
+                FlashScratchSizing::Reserve,
+            ] {
+                let run = |k: &Tensor, v: &Tensor| -> Result<Vec<u32>> {
+                    let y = flash_decoding(&q, k, v, scale, 1., PAGE, 1, sizing, 8)?;
+                    match dtype {
+                        DType::F16 => Ok(y
+                            .flatten_all()?
+                            .to_vec1::<f16>()?
+                            .into_iter()
+                            .map(|x| u32::from(x.to_bits()))
+                            .collect()),
+                        DType::F32 => Ok(y
+                            .flatten_all()?
+                            .to_vec1::<f32>()?
+                            .into_iter()
+                            .map(f32::to_bits)
+                            .collect()),
+                        _ => unreachable!(),
+                    }
+                };
+                let expected = run(&packed_k, &packed_v)?;
+                assert!(
+                    expected.iter().any(|&x| x != 0),
+                    "vacuous all-zero parity reference"
+                );
+                assert_ne!(
+                    &expected[..H * D],
+                    &expected[H * D..],
+                    "rows must differ to expose wrong sequence strides"
+                );
+                assert_eq!(
+                    run(&k, &v)?,
+                    expected,
+                    "dtype={dtype:?},keys={keys},sizing={sizing:?}"
+                );
+            }
+        }
+    }
     Ok(())
 }

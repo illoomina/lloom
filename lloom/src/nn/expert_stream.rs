@@ -9685,7 +9685,7 @@ mod tests {
             waited.as_ref().unwrap();
             assert_eq!(consumer.to_vec1::<f32>().unwrap(), vec![7.0; 16]);
         }
-        m.wait_until_completed().unwrap();
+        dev.synchronize().unwrap();
         if matches!(mode, FetchFloorControl::CapturedBeforeResize) {
             assert!(
                 matches!(initializer_before_release, Some(Ok(false))),

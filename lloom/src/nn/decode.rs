@@ -3636,6 +3636,9 @@ impl<'m, M: CausalLM> Session<'m, M> {
         // The verify window is `[anchor, draft…]` at this position; `pos` advances
         // by the accepted length each round (`lfm2-dspark-verify`'s `index_pos`).
         let mut since_commit = 0usize;
+        // The round's published ids, reused across rounds (decision 123: no
+        // per-round host allocation); a round accepts at most `max_draft + 1`.
+        let mut batch: Vec<u32> = Vec::with_capacity(spec.max_draft() + 1);
 
         let stopped = |opts: &DecodeOptions| {
             opts.stop
@@ -3736,7 +3739,7 @@ impl<'m, M: CausalLM> Session<'m, M> {
             // `max_tokens`, whichever comes first — a round may straddle either.
             // An EOS is not streamed and retracts from the count, exactly as the
             // baseline loop drops an EOS token.
-            let mut batch: Vec<u32> = Vec::with_capacity(accepted.len());
+            batch.clear();
             for &id in &accepted {
                 // A minimum-width verify may predict beyond the output
                 // ceiling. Its unpublished bonus cannot change the stop.
@@ -4130,7 +4133,9 @@ impl<'m, M: CausalLM> Session<'m, M> {
 
         // Steady state: service the in-flight verifies round-robin. Completing
         // lane `i` waits on its own buffer only; its next verify is enqueued
-        // behind the others' before the loop moves on.
+        // behind the others' before the loop moves on. One published-ids
+        // buffer serves every lane's rounds (decision 123).
+        let mut batch: Vec<u32> = Vec::with_capacity(spec.max_draft() + 1);
         loop {
             let _pool = lloom_tensor::AutoreleaseScope::new(); // per round, see the decode loop
             let mut progressed = false;
@@ -4182,7 +4187,7 @@ impl<'m, M: CausalLM> Session<'m, M> {
                 s.seq.pos += accepted.len();
                 lane.anchor_tok = *accepted.last().unwrap();
 
-                let mut batch: Vec<u32> = Vec::with_capacity(accepted.len());
+                batch.clear();
                 for &id in &accepted {
                     // A minimum-width verify may predict beyond the output
                     // ceiling. Its unpublished bonus cannot change the stop.

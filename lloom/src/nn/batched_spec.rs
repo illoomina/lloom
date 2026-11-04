@@ -97,6 +97,9 @@ where
     pacer: StepPacer,
     hot_thread: HotThread,
     run_start: crate::hot_clock::HotInstant,
+    /// A row's published ids, reused across rows and rounds (decision 123:
+    /// no per-round host allocation for them).
+    publish: Vec<u32>,
 }
 
 impl<'m, M, S, R> SpecBatchDecoder<'m, M, S, R>
@@ -138,6 +141,7 @@ where
             pacer,
             hot_thread: HotThread::claim(),
             run_start: crate::hot_clock::HotInstant::now(),
+            publish: Vec::new(),
         })
     }
 
@@ -333,15 +337,17 @@ where
 
         let t = crate::hot_clock::HotInstant::now();
         let rb = if timed { readbacks() } else { 0 };
-        let eos_owned: Vec<Vec<u32>> = picked.iter().map(|s| s.lane.eos_ids.clone()).collect();
-        let eos_sets: Vec<&[u32]> = eos_owned.iter().map(|v| v.as_slice()).collect();
-        let mut caches: Vec<&mut M::Cache> = picked
-            .iter_mut()
-            .map(|s| {
-                let sess: &mut Session<'m, M> = s.session.borrow_mut();
-                &mut sess.seq.cache
-            })
-            .collect();
+        // Each row's EOS set borrowed beside its cache, in one pass over the
+        // disjoint fields: no per-round clone of every row's set (decision
+        // 123).
+        let mut eos_sets: Vec<&[u32]> = Vec::with_capacity(picked.len());
+        let mut caches: Vec<&mut M::Cache> = Vec::with_capacity(picked.len());
+        for s in picked.iter_mut() {
+            let Slot { lane, session, .. } = &mut **s;
+            eos_sets.push(lane.eos_ids.as_slice());
+            let sess: &mut Session<'m, M> = session.borrow_mut();
+            caches.push(&mut sess.seq.cache);
+        }
         let results = model.verify_rows_complete(pending, &mut caches, &eos_sets)?;
         drop(caches);
         let verify_wait_ns = t.elapsed_ns();
@@ -408,7 +414,8 @@ where
                 lane.done = true;
                 continue;
             }
-            let mut batch: Vec<u32> = Vec::with_capacity(accepted.len());
+            let batch = &mut self.publish;
+            batch.clear();
             for &tok in &accepted {
                 if lane.reached(lane.produced + batch.len()) {
                     break;
@@ -420,8 +427,8 @@ where
                 batch.push(tok);
             }
             if !batch.is_empty() {
-                on_tokens(id, &batch)?;
-                lane.all_ids.extend_from_slice(&batch);
+                on_tokens(id, batch)?;
+                lane.all_ids.extend_from_slice(batch);
                 lane.produced += batch.len();
             }
             if timed {

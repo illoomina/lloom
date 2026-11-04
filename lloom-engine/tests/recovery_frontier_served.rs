@@ -6,6 +6,8 @@
 //! The engine's reader raises the stop flag before a hook on a batch whose
 //! read found EOS. A hook on an earlier batch still holds the reader back:
 //! completing the reply's text does not mean EOS was already published.
+//! So the slow consumer here holds the first fragment, and only a fragment
+//! read before the EOS: a hold on the EOS's own batch delays nothing.
 //! On the adaptive commit the loop keeps encoding until it reads the flag;
 //! on the fixed cadence it has
 //! learnt the EOS itself and stopped. Without the EOS gate (the family's
@@ -31,8 +33,12 @@ use std::time::Duration;
 
 type Model = Qwen3_5<CrownExact>;
 
-/// How long the consumer holds the fragment that ends the reply's text.
+/// How long the slow consumer holds its fragment.
 const SLOW: Duration = Duration::from_millis(1000);
+
+/// Runs of a slow arm to find one whose consumer was held before the EOS
+/// ([`Turn::held`]).
+const HOLD_ATTEMPTS: usize = 8;
 
 fn model(dev: &Device) -> Result<(Model, Config)> {
     let ckpt = TinyCheckpoint::<Qwen3_5Tiny>::new(Config::tiny(), Weights::default());
@@ -106,10 +112,17 @@ struct Turn {
     prefilled: usize,
     /// The session's token log after the request.
     log: usize,
+    /// The slow consumer held a fragment after which fewer than the
+    /// request's `slow_before` ids were delivered. A read that finds the
+    /// stop id delivers every id before it, so the read that fetched this
+    /// fragment had not, and the reader had not raised the stop flag: the
+    /// hold delayed it.
+    held: bool,
 }
 
-/// `requests` on one sequence and one ring pool, the consumer holding the
-/// fragment that completes `slow_after` ids for `slow` (none if `None`).
+/// `requests` on one sequence and one ring pool. The consumer holds, for
+/// `slow`, the first fragment that leaves fewer than `slow_before` ids
+/// delivered (none if `None`, or if the first fragment already reaches it).
 #[allow(clippy::too_many_arguments)]
 fn serve(
     model: &Model,
@@ -119,7 +132,7 @@ fn serve(
     gate: bool,
     eos: u32,
     requests: &[Req],
-    slow_after: Option<usize>,
+    slow_before: Option<usize>,
     slow: Duration,
 ) -> Result<Vec<Turn>> {
     let mut seq = Some(Sequence::new(model.new_cache(cfg, dev)?));
@@ -145,10 +158,13 @@ fn serve(
             ..DecodeParams::default()
         };
         let mut delivered = 0usize;
+        let mut first = true;
+        let mut held = false;
         let decoded = session.decode_until(&r.prompt, detok, &params, |frag| {
             delivered += frag.matches('<').count();
-            if slow_after.is_some_and(|n| delivered >= n) {
+            if std::mem::take(&mut first) && slow_before.is_some_and(|n| delivered < n) {
                 std::thread::sleep(slow);
+                held = true;
             }
             !r.cancel_after.is_some_and(|n| delivered >= n)
         })?;
@@ -168,16 +184,60 @@ fn serve(
             stopped_by_eos_watch: decoded.stats.stopped_by_eos_watch,
             reuse: decoded.reuse,
             prefilled: decoded.prefilled,
+            held,
         });
     }
     Ok(out)
 }
 
+/// [`serve`] with the consumer slow before the first request's stop id at
+/// `stop_at`, run until the consumer was held ([`Turn::held`]), at most
+/// [`HOLD_ATTEMPTS`] times. A reader that fetches the reply and its stop id
+/// in one read raises the stop flag before its hook runs (the engine's
+/// `drain_ring_reader`), so no consumer can delay that run's stop: it is not
+/// the case under test, and is run again rather than asserted.
+#[allow(clippy::too_many_arguments)]
+fn serve_held(
+    model: &Model,
+    cfg: &Config,
+    dev: &Device,
+    spelling: &str,
+    gate: bool,
+    eos: u32,
+    requests: &[Req],
+    stop_at: usize,
+) -> Result<Vec<Turn>> {
+    for attempt in 1..=HOLD_ATTEMPTS {
+        let got = serve(
+            model,
+            cfg,
+            dev,
+            spelling,
+            gate,
+            eos,
+            requests,
+            Some(stop_at),
+            SLOW,
+        )?;
+        if got[0].held {
+            return Ok(got);
+        }
+        eprintln!(
+            "FRONTIER-HOLD {spelling} gate={gate}: attempt {attempt}: the first fragment \
+             delivered all {stop_at} of the reply's ids; the consumer was not held before the stop"
+        );
+    }
+    lloom_tensor::bail!(
+        "{spelling}: in {HOLD_ATTEMPTS} runs the consumer was never held before the stop id"
+    )
+}
+
 /// A reply ending on EOS, then the conversation continued, on the blocking
 /// arm, the fixed ring and the adaptive commit, each with an on-time and a
-/// slow consumer. The fixed ring overruns one forward whatever the consumer
-/// does and the next request extends; the adaptive commit with the slow
-/// consumer runs past its lead and the next request is `Fresh`.
+/// slow consumer, slow on a fragment read before the EOS ([`serve_held`]).
+/// The fixed ring overruns one forward whatever the consumer does and the
+/// next request extends; the adaptive commit with the slow consumer runs
+/// past its lead and the next request is `Fresh`.
 #[test]
 fn a_slow_consumer_moves_the_adaptive_overrun_and_not_the_fixed_one() -> Result<()> {
     let _ = lloom_tensor::tuning::pin_regime(lloom_tensor::tuning::Contract::Deterministic);
@@ -240,11 +300,15 @@ fn a_slow_consumer_moves_the_adaptive_overrun_and_not_the_fixed_one() -> Result<
     .adaptive_lead();
 
     for spelling in ["ring-fixed", "ring-nonblocking"] {
-        for slow in [None, Some(cut)] {
-            let got = serve(
-                &model, &cfg, &dev, spelling, false, eos, &requests, slow, SLOW,
-            )?;
-            let at = format!("{spelling} slow={}", slow.is_some());
+        for slow in [false, true] {
+            let got = if slow {
+                serve_held(&model, &cfg, &dev, spelling, false, eos, &requests, cut)?
+            } else {
+                serve(
+                    &model, &cfg, &dev, spelling, false, eos, &requests, None, SLOW,
+                )?
+            };
+            let at = format!("{spelling} slow={slow}");
             eprintln!(
                 "FRONTIER-SERVED {at}: overrun {} (lead {lead}) stopped_by_flag {} | next request \
                  {:?} prefilled {} (blocking {})",
@@ -267,11 +331,11 @@ fn a_slow_consumer_moves_the_adaptive_overrun_and_not_the_fixed_one() -> Result<
                     assert_eq!(got[0].overrun, 1, "{at}: the loop learns the EOS itself");
                     assert_eq!(got[1].reuse, ReuseAction::Extend, "{at}");
                 }
-                (_, Some(_)) => {
+                (_, true) => {
                     assert!(got[0].stopped_by_flag, "{at}: the reader's flag stopped it");
                     assert!(
                         got[0].overrun > lead,
-                        "{at}: a consumer slow by {SLOW:?} lets the host past the lead"
+                        "{at}: a consumer slow by {SLOW:?} before the EOS lets the host past the lead"
                     );
                     // `Fresh` here; a turn-checkpoint restore where the
                     // front end restores a failed reconcile (#946).
@@ -402,11 +466,15 @@ fn under_the_eos_gate_the_next_request_extends_past_any_overrun() -> Result<()> 
     .adaptive_lead();
 
     for spelling in ["ring-fixed", "ring-nonblocking"] {
-        for slow in [None, Some(cut)] {
-            let got = serve(
-                &model, &cfg, &dev, spelling, true, eos, &requests, slow, SLOW,
-            )?;
-            let at = format!("gated {spelling} slow={}", slow.is_some());
+        for slow in [false, true] {
+            let got = if slow {
+                serve_held(&model, &cfg, &dev, spelling, true, eos, &requests, cut)?
+            } else {
+                serve(
+                    &model, &cfg, &dev, spelling, true, eos, &requests, None, SLOW,
+                )?
+            };
+            let at = format!("gated {spelling} slow={slow}");
             eprintln!(
                 "FRONTIER-GATED {at}: overrun {} (lead {lead}) stopped_by_flag {} gated {} | next \
                  request {:?} prefilled {} (blocking {})",
@@ -437,7 +505,7 @@ fn under_the_eos_gate_the_next_request_extends_past_any_overrun() -> Result<()> 
                 got[0].gated, adaptive,
                 "{at}: the gate fires, the overrun unwritten, under the adaptive commit only"
             );
-            if adaptive && slow.is_some() {
+            if adaptive && slow {
                 assert!(
                     got[0].overrun > lead,
                     "{at}: the gate bounds no overrun; the slow consumer still passes the lead"
@@ -788,19 +856,32 @@ fn the_eos_watch_bounds_the_served_overrun_past_a_slow_consumer() -> Result<()> 
         ..lloom::nn::DecodeOptions::new(1)
     }
     .adaptive_lead();
-    for slow in [None, Some(cut)] {
-        let got = serve(
-            &model,
-            &cfg,
-            &dev,
-            "ring-nonblocking",
-            false,
-            eos,
-            &requests,
-            slow,
-            SLOW,
-        )?;
-        let at = format!("watched ring-nonblocking slow={}", slow.is_some());
+    for slow in [false, true] {
+        let got = if slow {
+            serve_held(
+                &model,
+                &cfg,
+                &dev,
+                "ring-nonblocking",
+                false,
+                eos,
+                &requests,
+                cut,
+            )?
+        } else {
+            serve(
+                &model,
+                &cfg,
+                &dev,
+                "ring-nonblocking",
+                false,
+                eos,
+                &requests,
+                None,
+                SLOW,
+            )?
+        };
+        let at = format!("watched ring-nonblocking slow={slow}");
         eprintln!(
             "FRONTIER-WATCH-SERVED {at}: overrun {} (lead {lead}) stopped_by_eos_watch {} \
              stopped_by_flag {} | next request {:?} prefilled {}",
@@ -816,7 +897,7 @@ fn the_eos_watch_bounds_the_served_overrun_past_a_slow_consumer() -> Result<()> 
             got[0].overrun <= lead + 1,
             "{at}: the watch bounds the overrun by the lead"
         );
-        if slow.is_some() {
+        if slow {
             assert!(
                 got[0].stopped_by_eos_watch && !got[0].stopped_by_flag,
                 "{at}: the watch, not the slow consumer's flag, stopped it"

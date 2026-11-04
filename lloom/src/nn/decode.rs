@@ -1552,17 +1552,6 @@ pub fn in_flight_mem_cap(_device: &Device) -> usize {
     64
 }
 
-/// The host's bound on how far it runs ahead of the GPU, as a wait on the
-/// command buffer that carried a step rather than on anything the GPU writes.
-///
-/// A marker is a committed command buffer; waiting on it is Metal's own
-/// completion, which retires or errors and cannot wait for a value that is
-/// never published. That is the whole difference from a cap spun on the ring's
-/// generation counter: a counter a stale replay stops advancing is a livelock,
-/// Metal can report a command-buffer error, but an indefinitely scheduled
-/// buffer can still block its native wait indefinitely. When the GPU is
-/// within the bound the marker is already complete and the wait is a status
-/// read.
 /// Test seam behind `fuzzing` (#1205, census row 6): how many times a
 /// [`StepPacer`] on a device has begun waiting on a marker that was not
 /// complete, the event its `waited` counter records, made visible while the
@@ -1618,6 +1607,17 @@ pub mod pacer_waits {
     }
 }
 
+/// The host's bound on how far it runs ahead of the GPU, as a wait on the
+/// command buffer that carried a step rather than on anything the GPU writes.
+///
+/// A marker is a committed command buffer; waiting on it is Metal's own
+/// completion, which retires or errors and cannot wait for a value that is
+/// never published. That is the whole difference from a cap spun on the ring's
+/// generation counter: a counter a stale replay stops advancing is a livelock,
+/// Metal can report a command-buffer error, but an indefinitely scheduled
+/// buffer can still block its native wait indefinitely. When the GPU is
+/// within the bound the marker is already complete and the wait is a status
+/// read.
 pub(crate) struct StepPacer {
     #[cfg(feature = "metal")]
     pending: PacerQueue<PacerMarker>,

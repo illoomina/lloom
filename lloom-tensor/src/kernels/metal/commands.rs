@@ -4928,17 +4928,36 @@ mod owner_submission_tests {
     /// without a second native call, and the combined
     /// recording authority sees the failure. Unlike the shared fixture, DATA is
     /// not held pending: Metal 4 does not queue-wait on a host-signalled event,
-    /// so the completion count is reported, not asserted.
+    /// so whether the buffer's real GPU completion is credited races the
+    /// producer's unwind. What is asserted is the rule both APIs follow (#944
+    /// 6628516976): an epoch is credited only after the recording's own native
+    /// completion was published, never for work that did not run.
     #[test]
     fn metal4_unknown_return_after_real_busy_is_seen_by_the_queue_authority() {
+        unknown_return_after_real_busy(true);
+    }
+
+    /// The Metal 3 twin of the control above, with DATA not held either (the
+    /// shared fixture gates it behind a host event, so it never credits). The
+    /// same rule holds: credit only after the recording's native completion.
+    #[test]
+    fn metal3_unknown_return_after_real_busy_credits_only_completed_work() {
+        unknown_return_after_real_busy(false);
+    }
+
+    fn unknown_return_after_real_busy(metal4: bool) {
         let device = crate::MetalDevice::new(0).unwrap();
         let commands = device.commands();
         let cb = pending(commands);
-        if !cb.is_metal4() {
-            eprintln!("NOT_APPLICABLE metal4 unknown-return handoff requires actual Metal 4");
+        if cb.is_metal4() != metal4 {
+            eprintln!(
+                "NOT_APPLICABLE this unknown-return handoff control requires actual {}",
+                if metal4 { "Metal 4" } else { "Metal 3" }
+            );
             commands.ensure_completed(&cb).unwrap();
             return;
         }
+        let credited_before = commands.clock().completed_count().0;
         let raw = device
             .metal_device()
             .new_buffer(256, super::super::MTLResourceOptions::StorageModeShared)
@@ -5026,10 +5045,17 @@ mod owner_submission_tests {
             commands.check_recording_failure().is_err(),
             "the combined recording authority missed the Metal 4 queue failure"
         );
-        // Not asserted: the whole buffer entered natively, and whether its GPU
-        // completion is credited after the unknown return varies run to run on
-        // Metal 4 (Metal 3's gated fixture never credits it). Reported below.
+        // Whether the whole buffer's real GPU completion is credited after the
+        // unknown return races the unwind's failure publication (the drainer
+        // starts no record once the queue has failed). Credit is the hook's,
+        // run in the record's ordered callbacks after its native completion was
+        // published, so credit implies that completion, never the reverse.
         let completed = commands.clock().completed_count().0;
+        let native_done = marker.cb.status().0 >= MTLCommandBufferStatus::Completed.0;
+        assert!(
+            completed == credited_before || native_done,
+            "an epoch was credited for an unknown handoff whose native completion was never published"
+        );
         assert!(commands.recover_pending_submission(&cb).is_err());
         assert_eq!(
             control.native_calls.load(Ordering::Acquire) - before,
@@ -5037,7 +5063,7 @@ mod owner_submission_tests {
             "failed owner was submitted again"
         );
         eprintln!(
-            "OWNER_HANDOFF_UNKNOWN_RETURN actual_api={} native_calls=1 completed={completed} commands_latch_failed={} custody_retained=true",
+            "OWNER_HANDOFF_UNKNOWN_RETURN actual_api={} native_calls=1 completed={credited_before}->{completed} native_done={native_done} commands_latch_failed={} custody_retained=true",
             commands.actual_command_api_for_test(),
             commands.check_failed().is_err()
         );

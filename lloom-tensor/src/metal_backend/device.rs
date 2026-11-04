@@ -2511,6 +2511,7 @@ impl MetalDevice {
     /// no recorded step. A recording armed over it is dropped and armed
     /// again, so no arena is installed from a step that stopped part-way.
     pub fn abort_decode_step(&self) {
+        self.commands.executor().abort_step();
         self.end_decode_step();
         self.rearm_if_drifted();
         let restart = {
@@ -2951,6 +2952,18 @@ impl MetalDevice {
         }
     }
 
+    /// Observe the existing recording/queue failure without ending a window.
+    ///
+    /// This delegates to the selected native authority as well as Commands'
+    /// own failure atom. It does not cut, submit, wait or reset any state.
+    /// Atomic/OnceCell observation cost is not claimed free or measured here.
+    pub fn check_recording_failure(&self) -> Result<()> {
+        self.commands
+            .check_recording_failure()
+            .map_err(MetalError::from)?;
+        Ok(())
+    }
+
     /// Close the pass `begin_pass` opened: build the plan a pending key was
     /// waiting for, grow the base if it needs more, and register this pass's
     /// key as pending if it was recorded. Falls back to
@@ -2966,6 +2979,24 @@ impl MetalDevice {
         &self,
         context: Option<&crate::memory_admission::AllocationContext>,
     ) -> Result<()> {
+        // A void kernel may have conservatively suppressed after a genuine
+        // checked refusal. Observe that SAME immediate latch before publishing
+        // a successful pass/planner transition, without ending an ICB window.
+        if let Err(query_error) = self.commands.check_recording_failure() {
+            // This can be the FIRST observation of an earlier native queue
+            // failure: no dispatch-origin refusal necessarily detached the
+            // current validated, known-unissued prefix. Keep it failed and
+            // detach before planner/encoder locks; never issue it on abort.
+            self.commands.executor().fail_step();
+            let query_error = crate::Error::from(MetalError::from(query_error));
+            return Err(match self.abort_pass_in() {
+                Ok(()) => query_error,
+                // Preserve the original typed cause. A refused cleanup keeps
+                // its existing transaction/native custody plus the executor's
+                // sticky quarantine; it is not a clean/fresh poisoned queue.
+                Err(cleanup_error) => query_error.context(cleanup_error),
+            });
+        }
         self.next_pass_variant
             .store(0, std::sync::atomic::Ordering::Relaxed);
         let mut g = self.pass_plans.lock();
@@ -3086,6 +3117,7 @@ impl MetalDevice {
     }
 
     fn abort_pass_in(&self) -> Result<()> {
+        self.commands.executor().abort_step();
         self.next_pass_variant
             .store(0, std::sync::atomic::Ordering::Relaxed);
         let mut g = self.pass_plans.lock();
@@ -3164,6 +3196,8 @@ impl MetalDevice {
             token: transaction.identity.token.clone(),
             armed: true,
         };
+        #[cfg(test)]
+        tests::observe_closing_refusal_for_test(self, &transaction);
         let grow = transaction
             .needed
             .filter(|&needed| needed > transaction.have);
@@ -4585,6 +4619,90 @@ impl<'a> ReadyBufferBuilder<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct ClosingRefusalObservation {
+        active: bool,
+        device: Option<DeviceId>,
+        hook: Option<Box<dyn FnOnce(&MetalDevice)>>,
+    }
+    thread_local! {
+        static CLOSING_REFUSAL_OBSERVATION: std::cell::RefCell<ClosingRefusalObservation> =
+            const { std::cell::RefCell::new(ClosingRefusalObservation {
+                active: false, device: None, hook: None,
+            }) };
+    }
+    impl MetalDevice {
+        pub(crate) fn with_closing_refusal_observer_for_test<R>(
+            &self,
+            hook: impl FnOnce(&MetalDevice) + 'static,
+            run: impl FnOnce() -> R,
+        ) -> R {
+            CLOSING_REFUSAL_OBSERVATION.with(|slot| {
+                {
+                    let mut state = slot.borrow_mut();
+                    assert!(!state.active, "nested closing refusal observation");
+                    state.active = true;
+                    state.device = Some(self.id());
+                    state.hook = Some(Box::new(hook)); // cold fixture ownership only
+                }
+                struct Reset<'a>(&'a std::cell::RefCell<ClosingRefusalObservation>);
+                impl Drop for Reset<'_> {
+                    fn drop(&mut self) {
+                        let hook = {
+                            let mut state = self.0.borrow_mut();
+                            state.active = false;
+                            state.device = None;
+                            state.hook.take()
+                        };
+                        // Captured destructors may reenter; never drop under TLS borrow.
+                        drop(hook);
+                    }
+                }
+                let reset = Reset(slot);
+                let result = run();
+                drop(reset);
+                result
+            })
+        }
+    }
+    pub(super) fn observe_closing_refusal_for_test(
+        device: &MetalDevice,
+        transaction: &ClosingPlan,
+    ) {
+        // Take before callback: no RefCell borrow, planner, encoder or native guard
+        // is held during genuine nested finish/query/cleanup. active remains true
+        // until the outer scope's RAII reset, including callback unwind.
+        let hook = CLOSING_REFUSAL_OBSERVATION.with(|slot| {
+            let mut state = slot.borrow_mut();
+            if state.device == Some(device.id()) { state.hook.take() } else { None }
+        });
+        let Some(hook) = hook else { return; };
+        assert!(transaction.needed.filter(|&needed| needed > transaction.have).is_none(),
+            "closing-refusal fixture unexpectedly requires native base growth");
+        {
+            let guard = device.pass_plans.lock();
+            let plans = guard.as_ref().expect("real cache registered before observation");
+            assert!(std::sync::Arc::ptr_eq(&plans.state.identity, &transaction.identity.cache));
+            assert!(plans.state.closing.as_ref().is_some_and(|token|
+                std::sync::Arc::ptr_eq(token, &transaction.identity.token)),
+                "observation is not the actual registered ClosingGuard owner");
+        }
+        hook(device);
+        {
+            let guard = device.pass_plans.lock();
+            let plans = guard.as_ref().expect("nested refusal lost the actual cache");
+            assert!(std::sync::Arc::ptr_eq(&plans.state.identity, &transaction.identity.cache));
+            assert!(plans.state.closing.as_ref().is_some_and(|token|
+                std::sync::Arc::ptr_eq(token, &transaction.identity.token)),
+                "nested cleanup refusal replaced the actual ClosingGuard token");
+        }
+        // AFTER the observer's typed-inner/context/cache/token assertions only:
+        // invalidate the genuine recorder generation using the existing mutator.
+        // This forces original-owner validation to refuse without allocation and
+        // its real ClosingGuard to handle its own cache/token. It is fixture
+        // teardown, not fake cleanup Err or successful poisoned-queue recovery.
+        drop(device.discard_arena_recording());
+    }
 
     impl MetalDevice {
         // Test-only permission bridge for the genuine default-native fixture.

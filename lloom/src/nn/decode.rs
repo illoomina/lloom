@@ -1406,6 +1406,13 @@ pub(crate) fn hold_in(hold: &mut Option<Tensor>, logits: Tensor) -> Result<Tenso
         }
     };
     h.slice_set(&logits, 0, 0)?;
+    // Void native dispatch may have suppressed this last copy after a genuine
+    // executor refusal, later than the pass's previous owner observation.
+    // Query only: no executor window/end, cut, submission or wait is added.
+    #[cfg(feature = "metal")]
+    if let Device::Metal(device) = logits.device() {
+        device.check_recording_failure()?;
+    }
     Ok(h)
 }
 
@@ -5363,5 +5370,286 @@ mod round_tally_tests {
             0,
             "an empty tally's widest is 0"
         );
+    }
+}
+
+#[cfg(test)]
+mod held_copy_cpu_control {
+    use super::*;
+
+    #[test]
+    fn cpu_no_copy_hold_preserves_original_storage_and_empty_hold_slot() -> Result<()> {
+        let input = Tensor::new(&[2f32, 3.], &Device::Cpu)?;
+        let witness = input.clone();
+        let mut slot = None;
+        let held = hold_in(&mut slot, input)?;
+        // One Arc'd RwLock owns each storage; compare through its public guard.
+        let addr = |t: &Tensor| &*t.storage_and_layout().0 as *const lloom_tensor::Storage;
+        assert!(std::ptr::eq(addr(&held), addr(&witness)));
+        assert!(slot.is_none(), "CPU no-copy route allocated persistent hold storage");
+        assert_eq!(held.to_vec1::<f32>()?, vec![2., 3.]);
+        Ok(())
+    }
+}
+
+
+// Native source controls for #985/6588315312. Run each in a fresh process.
+// The shared Chain fixture executes the production Session/readback driver.
+#[cfg(all(test, feature = "metal"))]
+use crate as subject;
+#[cfg(all(test, feature = "metal"))]
+#[allow(dead_code)]
+#[path = "../../tests/support/chain.rs"]
+mod held_copy_chain_fixture;
+
+#[cfg(all(test, feature = "metal"))]
+mod held_copy_boundary_tests {
+    use super::*;
+    use super::held_copy_chain_fixture::Chain;
+    use crate::generation::Blocking;
+    use lloom_tensor::kernels::metal::{Buffer, Commands};
+    use lloom_tensor::kernels::metal::encoder::observe_raw_dispatches_for_test;
+    use lloom_tensor::kernels::metal::executor::{DispatchAction, DispatchRecord, Executor, ExecutorSlot};
+    use lloom_tensor::kernels::MetalKernelError;
+    use lloom_tensor::{DType, Storage};
+    use std::sync::{Arc, atomic::{AtomicBool, AtomicUsize, Ordering}};
+
+    // Test-only Custom interoperability: forwards all native work in order,
+    // never defers/owns a raw replay, and optionally refuses ONLY the copy
+    // into a live, independently preallocated held-logit destination.
+    struct HeldCopyProbe {
+        target: usize,
+        target_bound: AtomicBool,
+        refuse: bool,
+        hits: AtomicUsize,
+        accepted: AtomicUsize,
+        refusals: AtomicUsize,
+        windows: AtomicUsize,
+    }
+    impl Executor for HeldCopyProbe {
+        fn will_bind_buffer(&self, _: usize, buffer: &Buffer, _: usize, output: bool) {
+            if output && buffer.raw_addr() == self.target {
+                self.target_bound.store(true, Ordering::Release);
+            }
+        }
+        fn dispatch_action(&self, record: &DispatchRecord)
+            -> std::result::Result<DispatchAction, MetalKernelError>
+        {
+            if self.target_bound.swap(false, Ordering::AcqRel) {
+                assert!(record.kernel.as_deref().is_some_and(|name| name.starts_with("copy2d_")),
+                    "held destination was written by something other than its copy");
+                self.hits.fetch_add(1, Ordering::Relaxed);
+                if self.refuse {
+                    self.refusals.fetch_add(1, Ordering::Relaxed);
+                    return Err(MetalKernelError::QueueUnavailable("controlled final held copy refusal"));
+                }
+            }
+            self.accepted.fetch_add(1, Ordering::Relaxed);
+            Ok(DispatchAction::Encode)
+        }
+        fn end_step(&self, _: &lloom_tensor::kernels::metal::Device, _: &Commands)
+            -> std::result::Result<(), MetalKernelError>
+        {
+            self.windows.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+    }
+    fn fixture() -> Result<Device> {
+        let mut tuning = lloom_tensor::tuning::Tuning::default();
+        tuning.from_env().map_err(lloom_tensor::Error::msg)?;
+        tuning.contract.profile = "deterministic".into();
+        tuning.metal.copy2d_no_blit = true;
+        lloom_tensor::tuning::install(tuning).map_err(lloom_tensor::Error::msg)?;
+        let device = Device::new_metal(0)?;
+        let metal = device.as_metal_device()?;
+        let actual = metal.commands().actual_command_api();
+        let requested = &lloom_tensor::tuning::tuning().metal.command_api;
+        if requested != "auto" {
+            assert_eq!(actual, requested);
+        }
+        if let Ok(requested) = std::env::var("LLOOM_METAL_API") {
+            if requested != "auto" {
+                assert_eq!(actual, requested);
+            }
+        }
+        eprintln!("COMMON_HELD_SETUP requested={requested} actual_api={actual}");
+        metal.set_compute_per_buffer(usize::MAX);
+        Ok(device)
+    }
+    fn held(device: &Device) -> Result<Tensor> {
+        Tensor::zeros(64, DType::F32, device)
+    }
+    fn install(device: &Device, target: &Tensor, refuse: bool) -> Result<Arc<HeldCopyProbe>> {
+        // raw_addr is native allocation identity, not a logical view identity.
+        // This fixture deliberately owns a base-zero, offset-zero persistent
+        // target allocated before any arena can make shared-buffer outputs.
+        assert!(target.is_contiguous());
+        assert_eq!(target.layout().start_offset(), 0, "held target is a tensor subview");
+        let target = {
+            let (storage, _) = target.storage_and_layout();
+            let Storage::Metal(storage) = &*storage else { unreachable!() };
+            assert_eq!(storage.buffer().base_offset(), 0, "held target is a buffer subview");
+            storage.buffer().raw_addr()
+        };
+        let probe = Arc::new(HeldCopyProbe {
+            target, target_bound: AtomicBool::new(false), refuse,
+            hits: AtomicUsize::new(0), accepted: AtomicUsize::new(0),
+            refusals: AtomicUsize::new(0), windows: AtomicUsize::new(0),
+        });
+        let metal = device.as_metal_device()?;
+        metal.flush_and_wait_current()?;
+        // These held/weight tensors were allocated BEFORE pass-plan admission;
+        // no arena output can alias this exact persistent destination.
+        metal.enable_pass_plans(lloom_tensor::metal_backend::ArenaLayout::NonAliasing);
+        // This test Custom executor forwards every non-target offer
+        // immediately, refuses the single target through the existing sticky
+        // recording path, never replays/exports/pins a native range, and is
+        // installed cold before the next encoder is created. Failed fixture
+        // custody is deliberately retained below rather than called complete.
+        metal.set_executor(Arc::new(ExecutorSlot::Custom(probe.clone())));
+        Ok(probe)
+    }
+    // Root before the first intentional refusal or mutation-sensitive assert,
+    // so assertion unwind cannot tear down this deliberately poisoned fixture.
+    struct RetainFailedPins<T>(Option<T>);
+    impl<T> Drop for RetainFailedPins<T> {
+        fn drop(&mut self) { std::mem::forget(self.0.take()); }
+    }
+    fn assert_late_refusal<T>(result: Result<T>, device: &Device, probe: &HeldCopyProbe, raw: usize) {
+        // The omission mutant removes ONLY hold_in's post-copy observation.
+        // With that omission this served-result assertion must be the red.
+        assert!(result.is_err(), "final held-copy refusal escaped as served success");
+        assert_eq!(probe.hits.load(Ordering::Relaxed), 1);
+        assert_eq!(probe.refusals.load(Ordering::Relaxed), 1);
+        assert!(device.as_metal_device().unwrap().check_recording_failure().is_err());
+        let accepted = probe.accepted.load(Ordering::Relaxed);
+        assert!(accepted > 0, "raw-entry comparison has no genuine accepted offers");
+        // Count the WHOLE driver, not a false zero including healthy forwards.
+        // Exactly one refusal must contribute no native raw entry. The scoped
+        // emit-refused-copy mutant contributes +1 at THIS assertion.
+        assert_eq!(raw, accepted, "refused final held copy entered raw dispatch");
+    }
+    fn greedy() -> LogitsProcessor {
+        LogitsProcessor::from_sampling(0, Sampling::ArgMax)
+    }
+
+    #[test]
+    fn prefill_final_held_copy_refusal_is_not_served_success() -> Result<()> {
+        let _pool = lloom_tensor::AutoreleaseScope::new();
+        let device = fixture()?;
+        let model = Arc::new(Chain::new(&device)?);
+        let hold = held(&device)?;
+        let mut readback = Blocking::new(&[42], &device)?;
+        let probe = install(&device, &hold, true)?;
+        let _pins = RetainFailedPins(Some((device.clone(), hold.clone(), Arc::clone(&model))));
+        let mut session = Session::new(model.as_ref(), 0);
+        session.seq.logits_hold = Some(hold.clone());
+        let (out, raw) = observe_raw_dispatches_for_test(||
+            session.prefill(&mut readback, &[0], &DecodeOptions::new(1)));
+        assert_late_refusal(out, &device, &probe, raw);
+        assert_eq!(probe.windows.load(Ordering::Relaxed), 1,
+            "refusal occurred before the prefill's last executor boundary");
+        drop(session);
+        Ok(())
+    }
+    #[test]
+    fn eos_decode_final_held_copy_refusal_is_not_served_success() -> Result<()> {
+        let _pool = lloom_tensor::AutoreleaseScope::new();
+        let device = fixture()?;
+        let model = Arc::new(Chain::new(&device)?);
+        let hold = held(&device)?;
+        let mut readback = Blocking::new(&[42], &device)?;
+        let probe = install(&device, &hold, true)?;
+        let _pins = RetainFailedPins(Some((device.clone(), hold.clone(), Arc::clone(&model))));
+        let mut session = Session::new(model.as_ref(), 0);
+        session.seq.logits_hold = Some(hold.clone());
+        // The genuine Chain's next_of(33)=(33*7+3)%64=42: immediate EOS.
+        let mut options = DecodeOptions::new(3);
+        options.lookahead = 0;
+        let (out, raw) = observe_raw_dispatches_for_test(||
+            session.decode_until(&mut IdentityProposer, &mut readback, &mut greedy(),
+                &[33], &options, &mut |_| Ok(true)));
+        assert_late_refusal(out, &device, &probe, raw);
+        drop(session);
+        Ok(())
+    }
+    #[test]
+    fn healthy_held_copy_preserves_exact_output_and_no_window_cut_or_wait() -> Result<()> {
+        let _pool = lloom_tensor::AutoreleaseScope::new();
+        let device = fixture()?;
+        let input = Tensor::from_slice(&[2f32; 64], 64, &device)?;
+        let target = held(&device)?;
+        let probe = install(&device, &target, false)?;
+        let metal = device.as_metal_device()?;
+        let epoch = metal.gpu_clock().current_epoch();
+        let completions = metal.commands().completion_counts();
+        let fires = metal.commands().completion_fires();
+        let already_complete = metal.commands().completion_already_complete();
+        let windows = probe.windows.load(Ordering::Relaxed);
+        let mut slot = Some(target);
+        let (copied, raw) = observe_raw_dispatches_for_test(|| hold_in(&mut slot, input));
+        let copied = copied?;
+        assert_eq!(raw, 1, "healthy held-copy raw observer is disconnected");
+        assert_eq!(probe.accepted.load(Ordering::Relaxed), 1);
+        assert_eq!(probe.hits.load(Ordering::Relaxed), 1);
+        assert_eq!(probe.refusals.load(Ordering::Relaxed), 0);
+        assert_eq!(probe.windows.load(Ordering::Relaxed), windows);
+        assert_eq!(metal.gpu_clock().current_epoch(), epoch, "held-copy query cut/submitted work");
+        assert_eq!(metal.commands().completion_counts(), completions);
+        assert_eq!(metal.commands().completion_fires(), fires);
+        assert_eq!(metal.commands().completion_already_complete(), already_complete);
+        // The explicit read is AFTER the no-boundary observation window.
+        assert_eq!(copied.to_vec1::<f32>()?, vec![2.; 64]);
+        metal.set_executor(Arc::new(ExecutorSlot::Classical));
+        Ok(())
+    }
+    #[test]
+    fn healthy_held_prefill_continuation_and_eos_keep_exact_chain() -> Result<()> {
+        let _pool = lloom_tensor::AutoreleaseScope::new();
+        let device = fixture()?;
+        let model = Chain::new(&device)?;
+        let target = held(&device)?;
+        let mut readback = Blocking::new(&[42], &device)?;
+        let probe = install(&device, &target, false)?;
+        let mut session = Session::new(&model, 0);
+        session.seq.logits_hold = Some(target);
+        session.prefill(&mut readback, &[33], &DecodeOptions::new(1))?;
+        let expected = (0..64).map(|i| if i == 42 { 1f32 } else { 0. }).collect::<Vec<_>>();
+        assert_eq!(session.seq.last_logits.as_ref().unwrap().to_vec1::<f32>()?, expected);
+        let mut options = DecodeOptions::new(3);
+        options.lookahead = 0;
+        let out = session.decode_until(&mut IdentityProposer, &mut readback, &mut greedy(),
+            &[], &options, &mut |_| Ok(true))?;
+        assert!(out.eos);
+        assert!(out.ids.is_empty());
+        assert_eq!(probe.refusals.load(Ordering::Relaxed), 0);
+        device.as_metal_device()?.flush_and_wait_current()?;
+        device.as_metal_device()?.set_executor(Arc::new(ExecutorSlot::Classical));
+        Ok(())
+    }
+    #[test]
+    fn healthy_hook_stop_preserves_held_continuation() -> Result<()> {
+        let _pool = lloom_tensor::AutoreleaseScope::new();
+        let device = fixture()?;
+        let model = Chain::new(&device)?;
+        let target = held(&device)?;
+        let mut readback = Blocking::new(&[42], &device)?;
+        let probe = install(&device, &target, false)?;
+        let mut session = Session::new(&model, 0);
+        session.seq.logits_hold = Some(target);
+        let mut options = DecodeOptions::new(5);
+        options.lookahead = 0;
+        let mut hooks = 0;
+        let out = session.decode_until(&mut IdentityProposer, &mut readback, &mut greedy(),
+            &[0], &options, &mut |_| { hooks += 1; Ok(false) })?;
+        assert!(hooks > 0);
+        assert!(!out.eos);
+        assert_eq!(out.ids, vec![3]);
+        assert_eq!(out.stats.overrun, 0);
+        assert_eq!(session.seq.last_logits.as_ref().unwrap().argmax(0)?.to_scalar::<u32>()?, 24);
+        assert_eq!(probe.refusals.load(Ordering::Relaxed), 0);
+        device.as_metal_device()?.flush_and_wait_current()?;
+        device.as_metal_device()?.set_executor(Arc::new(ExecutorSlot::Classical));
+        Ok(())
     }
 }

@@ -527,6 +527,14 @@ pub(super) struct Cancel {
     reason: &'static str,
 }
 
+/// What applying one cancellation did: every recording it covers abandoned,
+/// or its close of the current encoder refused only for now and the
+/// cancellation is to be kept and applied again (`cancel_locked`).
+enum Applied {
+    Done,
+    Kept(MetalKernelError),
+}
+
 /// The block an event's notification runs: the event and the value reached.
 type NotifyBlock = block2::RcBlock<dyn Fn(NonNull<ProtocolObject<dyn MTLSharedEvent>>, u64)>;
 
@@ -736,8 +744,11 @@ impl CommandsCore {
                     let Some(cancel) = failure else {
                         break;
                     };
-                    if let Err(error) = self.cancel_locked(state, &cancel) {
-                        break 'release Err(error);
+                    match self.cancel_locked(state, &cancel) {
+                        Ok(Applied::Done) => {}
+                        // The validated gate never opens on a failed
+                        // generation, so the dependent work stays held.
+                        Ok(Applied::Kept(error)) | Err(error) => break 'release Err(error),
                     }
                 }
             }
@@ -944,17 +955,35 @@ impl CommandsCore {
         }
     }
 
-    /// Apply every cancellation left pending, in the order asked for.
+    /// Apply every cancellation left pending, in the order asked for. One
+    /// whose close of the current encoder was only busy is kept, ahead of any
+    /// asked for meanwhile, and left pending again: whoever holds the lock
+    /// next applies it before any release (`cancel_locked`).
     fn apply_cancels_locked(&self, state: &mut EntryGuard<'_>) -> Result<(), MetalKernelError> {
         self.produced.cancel_pending.store(false, Ordering::SeqCst);
         let pending = std::mem::take(&mut *self.produced.cancels.lock());
         let mut refused = None;
-        for cancel in &pending {
-            if let Err(error) = self.cancel_locked(state, cancel) {
-                refused.get_or_insert(error);
+        let mut busy = None;
+        let mut kept = Vec::new();
+        for cancel in pending {
+            match self.cancel_locked(state, &cancel) {
+                Ok(Applied::Done) => {}
+                Ok(Applied::Kept(error)) => {
+                    busy.get_or_insert(error);
+                    kept.push(cancel);
+                }
+                Err(error) => {
+                    refused.get_or_insert(error);
+                }
             }
         }
-        refused.map_or(Ok(()), Err)
+        if !kept.is_empty() {
+            let mut cancels = self.produced.cancels.lock();
+            kept.append(&mut cancels);
+            *cancels = kept;
+            self.produced.cancel_pending.store(true, Ordering::SeqCst);
+        }
+        refused.or(busy).map_or(Ok(()), Err)
     }
 
     /// One cancellation, under the lock. The current recording is left
@@ -966,13 +995,13 @@ impl CommandsCore {
         &self,
         state: &mut EntryGuard<'_>,
         cancel: &Cancel,
-    ) -> Result<usize, MetalKernelError> {
+    ) -> Result<Applied, MetalKernelError> {
         let first = state
             .held
             .iter()
             .position(|held| held.gate.covered_by(cancel));
         if first.is_none() && !state.gate.covered_by(cancel) {
-            return Ok(0);
+            return Ok(Applied::Done);
         }
         let from = first.unwrap_or(state.held.len());
         let event: &ProtocolObject<dyn MTLSharedEvent> = &cancel.event;
@@ -1031,19 +1060,38 @@ impl CommandsCore {
             }
         }
         // The current recording is behind every held one, or waits itself.
-        self.close_pending_blit(state)?;
-        self.close_compute(state)?;
-        if !state.current_abandoned {
-            if let Some(current) = state.current.recording().cloned() {
-                if let Err(error) = current.cancel_unsubmitted() {
-                    refused.note(error);
+        // A close that refuses must not lose the cancellation: the current
+        // recording stays gated on the event its producer gave up on, and the
+        // producer may raise that event as soon as this returns (#1099). A
+        // refusal that holds only for now (`Busy`, a recording edit in
+        // progress) keeps the cancellation, for whoever holds the lock next
+        // to apply before any release; any other fails the queue, so nothing
+        // it covers is released. The bookkeeping below runs either way.
+        let mut kept = None;
+        match self
+            .close_pending_blit(state)
+            .and_then(|()| self.close_compute(state))
+        {
+            Ok(()) => {
+                if !state.current_abandoned {
+                    if let Some(current) = state.current.recording().cloned() {
+                        if let Err(error) = current.cancel_unsubmitted() {
+                            refused.note(error);
+                        }
+                        cancelled += 1;
+                        state.gate = Gate::default();
+                        state.signals_since_cut = false;
+                        self.compute_count.store(0, Ordering::Release);
+                        state.current_abandoned = true;
+                    }
                 }
-                cancelled += 1;
-                state.gate = Gate::default();
-                state.signals_since_cut = false;
-                self.compute_count.store(0, Ordering::Release);
-                state.current_abandoned = true;
             }
+            Err(
+                error @ MetalKernelError::RecordingAdmission(
+                    crate::command_lifecycle::LifecycleError::Busy,
+                ),
+            ) => kept = Some(error),
+            Err(error) => refused.note(error),
         }
         let p = &self.produced;
         *p.cancel_reason.lock() = cancel.reason;
@@ -1056,7 +1104,10 @@ impl CommandsCore {
         self.held_live_update(state);
         p.wake.notify();
         refused.into_result()?;
-        Ok(cancelled)
+        Ok(match kept {
+            Some(error) => Applied::Kept(error),
+            None => Applied::Done,
+        })
     }
 
     /// An input produced after the work waiting for it was cancelled finds

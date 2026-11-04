@@ -671,7 +671,7 @@ fn routed_mv_id_census() {
     };
     // The GPU's clock ramps under load (P30 (2)): ~1 s of the same work
     // first, then five timed batches, the median and the min reported.
-    let time = |name: &str, bytes: usize, n_tiers: usize, f: &dyn Fn(usize)| {
+    let time = |name: &str, bytes: usize, n_tiers: usize, f: &mut dyn FnMut(usize)| {
         let warm = Instant::now();
         let mut i = 0usize;
         while warm.elapsed().as_secs_f64() < 1.0 {
@@ -716,14 +716,20 @@ fn routed_mv_id_census() {
         let layers: Vec<usize> = layers.iter().cloned().take(cycle).collect();
         let tiers = load_tiers(&layers);
         let gu_bytes = tiers[0].1 * topk;
+        // Prepare opaque Resident groups once, symmetrically with down's
+        // arm below; do not add plan/ensure/allocation to the timed kernel loop.
+        let mut resolved: Vec<_> = tiers
+            .iter()
+            .map(|(tier, _, _)| tier.ensure(&tier.plan(&ids).unwrap()[0]).unwrap())
+            .collect();
         time(
             &format!("gate_up kind={kind} layers={layers:?}"),
             gu_bytes,
             tiers.len(),
-            &|k| {
+            &mut |k| {
                 let _ = tiers[k]
                     .0
-                    .gate_up(&x, &ids, MoeArm::MatVec, x.dtype())
+                    .gate_up(&x, &mut resolved[k], MoeArm::MatVec, x.dtype())
                     .unwrap();
             },
         );
@@ -732,12 +738,19 @@ fn routed_mv_id_census() {
         let layers: Vec<usize> = layers.iter().cloned().take(cycle).collect();
         let tiers = load_tiers(&layers);
         let d_bytes = tiers[0].2 * topk;
+        let mut resolved: Vec<_> = tiers
+            .iter()
+            .map(|(tier, _, _)| tier.ensure(&tier.plan(&ids).unwrap()[0]).unwrap())
+            .collect();
         time(
             &format!("down kind={kind} layers={layers:?}"),
             d_bytes,
             tiers.len(),
-            &|k| {
-                let _ = tiers[k].0.down(&h, &ids, MoeArm::MatVec).unwrap();
+            &mut |k| {
+                let _ = tiers[k]
+                    .0
+                    .down(&h, &mut resolved[k], MoeArm::MatVec)
+                    .unwrap();
             },
         );
     }

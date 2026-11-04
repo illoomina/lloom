@@ -152,6 +152,47 @@ pub trait Evict: std::fmt::Debug + Clone {
     fn uninstalled(&mut self, slot: SlotId);
 }
 
+/// Independent policy bits in the existing one-byte pin storage. User pin
+/// policy can change without erasing a live host group's binding custody.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[repr(transparent)]
+struct SlotProtection(u8);
+
+impl SlotProtection {
+    const USER: u8 = 1;
+    const HOST: u8 = 2;
+
+    #[inline]
+    fn user(self) -> bool {
+        self.0 & Self::USER != 0
+    }
+    #[inline]
+    fn protected(self) -> bool {
+        self.0 != 0
+    }
+    #[inline]
+    fn set_user(&mut self, pinned: bool) {
+        if pinned {
+            self.0 |= Self::USER;
+        } else {
+            self.0 &= !Self::USER;
+        }
+    }
+    #[inline]
+    fn host(self) -> bool {
+        self.0 & Self::HOST != 0
+    }
+
+    #[inline]
+    fn set_host(&mut self, borrowed: bool) {
+        if borrowed {
+            self.0 |= Self::HOST;
+        } else {
+            self.0 &= !Self::HOST;
+        }
+    }
+}
+
 /// Least recently used by the pass that used it (a [`Tick`] per `ensure`),
 /// with pins, slots in flight (a load issued, not landed) and the epoch of
 /// each slot's last GPU reader: the expert tier's policy. A victim search is
@@ -159,7 +200,7 @@ pub trait Evict: std::fmt::Debug + Clone {
 #[derive(Debug, Clone)]
 pub struct TickLru {
     last_use: Vec<Tick>,
-    pinned: Vec<bool>,
+    pinned: Vec<SlotProtection>,
     /// Per slot, the loader's event value its key lands on — in flight — or
     /// 0 when the slot holds a landed key or nothing.
     inflight: Vec<u64>,
@@ -174,7 +215,7 @@ impl Evict for TickLru {
     fn new(n_slots: usize) -> Self {
         Self {
             last_use: vec![Tick::ZERO; n_slots],
-            pinned: vec![false; n_slots],
+            pinned: vec![SlotProtection::default(); n_slots],
             inflight: vec![0; n_slots],
             last_epoch: vec![Epoch::ZERO; n_slots],
             plan_epoch: Epoch::ZERO,
@@ -537,6 +578,55 @@ impl<K: DenseKey, E: Evict> SlotCache<K, Dense, E> {
 }
 
 impl<K: Copy + Eq, I: KeyIndex<K>> SlotCache<K, I, TickLru> {
+    // Host groups normally borrow resident slots. The sole empty physical
+    // input is the initialized miss placeholder0; it need not have a key.
+    // Keep the usual O(1) quarantined count unless that cold case is live.
+    fn empty_placeholder_borrowed(&self) -> bool {
+        self.key_in.first().is_some_and(Option::is_none) && self.policy.pinned[0].host()
+    }
+
+    pub(crate) fn free_slots_unborrowed(&self) -> usize {
+        let blocked = self.empty_placeholder_borrowed()
+            && (!self.quarantined() || self.free.contains(&SlotId(0)));
+        self.free_slots().saturating_sub(usize::from(blocked))
+    }
+
+    pub(crate) fn free_len_unborrowed(&self) -> usize {
+        let blocked = self.empty_placeholder_borrowed() && self.free.contains(&SlotId(0));
+        self.free.len().saturating_sub(usize::from(blocked))
+    }
+
+    // Preserve order among the remaining free entries: hint_slots previews
+    // this exact order before its fallible IO submission. Usually the final
+    // entry qualifies; live empty placeholder0 is the only new HOST entry
+    // that can occur on the free list, not an added history/membership set.
+    fn take_free_if(&mut self, mut ready: impl FnMut(&TickLru, SlotId) -> bool) -> Option<SlotId> {
+        let policy = &self.policy;
+        let at = self.free.iter().rposition(|&slot| ready(policy, slot))?;
+        Some(self.free.remove(at))
+    }
+
+    pub(crate) fn take_free_unborrowed(&mut self) -> Option<SlotId> {
+        self.take_free_if(|p, slot| !p.pinned[slot.index()].host())
+    }
+
+    /// Unlike an ordered landing copy, a raw CPU fetch must prove the OWN
+    /// last reader of a free placeholder ran. Host Drop stamps that epoch
+    /// before clearing HOST; being on `free` alone does not prove it.
+    /// As in victim_beside, do not use the current pass's blanket plan epoch.
+    #[cfg(any(feature = "metal", test))]
+    pub(crate) fn take_free_beside(
+        &mut self,
+        floor: Epoch,
+        completed: Completed,
+    ) -> Option<SlotId> {
+        self.take_free_if(|p, slot| {
+            !p.pinned[slot.index()].host()
+                && (p.last_epoch[slot.index()] < floor
+                    || completed.covers(p.last_epoch[slot.index()]))
+        })
+    }
+
     /// Open a new use epoch (one per `ensure`).
     pub fn begin(&mut self) -> Tick {
         self.policy.tick = self.policy.tick.next();
@@ -562,10 +652,11 @@ impl<K: Copy + Eq, I: KeyIndex<K>> SlotCache<K, I, TickLru> {
             .rev()
             .copied()
             .take(if quarantined { self.free.len() } else { 0 })
+            .filter(move |slot| !self.policy.pinned[slot.index()].host())
             .chain(
                 (0..if quarantined { 0 } else { self.active }).filter_map(move |s| {
                     (self.key_in[s].is_none()
-                        && !self.policy.pinned[s]
+                        && !self.policy.pinned[s].protected()
                         && self.policy.last_use[s] != tick
                         && self.policy.inflight[s] == 0
                         && Completed::ALL.covers(self.reader_epoch(SlotId(s as u32))))
@@ -581,7 +672,7 @@ impl<K: Copy + Eq, I: KeyIndex<K>> SlotCache<K, I, TickLru> {
         let mut best: Option<(usize, Tick)> = None;
         for s in 0..self.active {
             if self.key_in[s].is_none()
-                || p.pinned[s]
+                || p.pinned[s].protected()
                 || p.last_use[s] == tick
                 || p.inflight[s] != 0
             {
@@ -624,7 +715,7 @@ impl<K: Copy + Eq, I: KeyIndex<K>> SlotCache<K, I, TickLru> {
         let p = &self.policy;
         let mut best: Option<(usize, Tick)> = None;
         for s in 0..self.active {
-            if p.pinned[s]
+            if p.pinned[s].protected()
                 || p.last_use[s] == tick
                 || (skip_inflight && p.inflight[s] != 0)
                 || !settled_before.covers(self.reader_epoch(SlotId(s as u32)))
@@ -660,7 +751,7 @@ impl<K: Copy + Eq, I: KeyIndex<K>> SlotCache<K, I, TickLru> {
         let mut best: Option<(usize, Tick)> = None;
         for s in 0..self.active {
             let e = p.last_epoch[s];
-            if p.pinned[s]
+            if p.pinned[s].protected()
                 || p.last_use[s] == tick
                 || p.inflight[s] != 0
                 || !(e < floor || completed.covers(e))
@@ -734,15 +825,27 @@ impl<K: Copy + Eq, I: KeyIndex<K>> SlotCache<K, I, TickLru> {
     }
 
     pub fn set_pinned(&mut self, slot: SlotId, pinned: bool) {
-        self.policy.pinned[slot.index()] = pinned;
+        self.policy.pinned[slot.index()].set_user(pinned);
     }
 
     pub fn is_pinned(&self, slot: SlotId) -> bool {
-        self.policy.pinned[slot.index()]
+        self.policy.pinned[slot.index()].user()
+    }
+
+    /// Host custody is independent of user pins and recency. Callers already
+    /// hold the tier's existing map lock. A slot is resident, except physical0
+    /// may be an initialized miss placeholder with no installed expert key.
+    pub(crate) fn set_host_borrowed(&mut self, slot: SlotId, borrowed: bool) {
+        debug_assert!(!borrowed || self.key_in[slot.index()].is_some() || slot == SlotId(0));
+        self.policy.pinned[slot.index()].set_host(borrowed);
+    }
+
+    pub(crate) fn host_borrowed(&self, slot: SlotId) -> bool {
+        self.policy.pinned[slot.index()].host()
     }
 
     pub fn pinned_count(&self) -> usize {
-        self.policy.pinned.iter().filter(|&&p| p).count()
+        self.policy.pinned.iter().filter(|p| p.user()).count()
     }
 }
 
@@ -829,6 +932,180 @@ impl<K: Copy + Eq, I: KeyIndex<K>> SlotCache<K, I, ListLru> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_empty_host_placeholder_free_selection_covers_live_and_closed_readers() {
+        let mut c = ExpertSlots::new(8, 4);
+        c.set_spare(1);
+        c.set_host_borrowed(SlotId(0), true);
+        assert_eq!(
+            c.hint_slots(c.tick()).collect::<Vec<_>>(),
+            vec![SlotId(1), SlotId(2), SlotId(3)]
+        );
+        assert_eq!(
+            (c.free_slots_unborrowed(), c.free_len_unborrowed()),
+            (3, 3),
+            "live empty0 counted as available to ordered consumers"
+        );
+        assert_eq!(c.take_free_unborrowed(), Some(SlotId(1)));
+        assert_eq!(
+            c.take_free_beside(Epoch(100), Completed::ALL),
+            Some(SlotId(2))
+        );
+        assert_eq!(c.take_free_unborrowed(), Some(SlotId(3)));
+        let live = format!("{c:?}");
+        assert_eq!(
+            c.take_free_beside(Epoch(100), Completed::ALL),
+            None,
+            "live HOST ignored"
+        );
+        assert_eq!(format!("{c:?}"), live);
+        // Model the exact stamp-before-HOST-clear transition performed by
+        // close_host_group. This is a CPU fake-clock policy proof, not native
+        // completion. Old pass floor9 must not authorize reader9's raw write.
+        c.stamp(SlotId(0), Epoch(9));
+        c.set_host_borrowed(SlotId(0), false);
+        c.plan_read_all(Epoch(99)); // current fetch plan's blanket stamp is NOT own reader9.
+        let closed = format!("{c:?}");
+        assert_eq!(
+            c.take_free_beside(Epoch(9), Completed(8)),
+            None,
+            "raw free selection bypassed the closed placeholder's own reader"
+        );
+        assert_eq!(
+            format!("{c:?}"),
+            closed,
+            "failed free proof consumed its entry"
+        );
+        let mut boundary_arm = c.clone();
+        assert_eq!(
+            boundary_arm.take_free_beside(Epoch(9), Completed(9)),
+            None,
+            "exclusive completed count9 does not finish reader epoch9"
+        );
+        let mut completed_arm = c.clone();
+        assert_eq!(
+            completed_arm.take_free_beside(Epoch(9), Completed(10)),
+            Some(SlotId(0)),
+            "exact own completion should admit free0 despite current blanket plan99"
+        );
+        assert_eq!(
+            c.take_free_beside(Epoch(10), Completed(8)),
+            Some(SlotId(0)),
+            "independently proven earlier-than-floor reader should admit free0"
+        );
+        assert!(c.free.is_empty());
+    }
+
+    fn only_host_victim() -> ExpertSlots {
+        let mut c = ExpertSlots::new(8, 3);
+        for s in 0..3 {
+            c.install(SlotId(s), ExpertId(s));
+        }
+        c.set_pinned(SlotId(1), true);
+        c.set_pinned(SlotId(2), true);
+        c.set_host_borrowed(SlotId(0), true);
+        c
+    }
+
+    #[test]
+    fn a_host_borrow_filters_all_victims_without_becoming_a_user_pin() {
+        let mut c = only_host_victim();
+        let tick = c.begin();
+        assert_eq!(c.pinned_count(), 2);
+        assert!(!c.is_pinned(SlotId(0)));
+        assert!(c.host_borrowed(SlotId(0)));
+        assert_eq!(c.victim_in(tick, true, Completed::ALL), None);
+        assert_eq!(c.victim_settled(tick, Completed::ALL), None);
+        assert_eq!(c.victim_beside(tick, Epoch(0), Completed::ALL, false), None);
+        assert_eq!(c.lru_resident(tick), None);
+        assert_eq!(c.evict_lru(tick, Epoch(0), false), None);
+        c.set_host_borrowed(SlotId(0), false);
+        assert_eq!(
+            c.victim_in(tick, true, Completed::ALL),
+            Some((SlotId(0), true))
+        );
+        assert_eq!(
+            c.victim_beside(tick, Epoch(0), Completed::ALL, false),
+            Some((SlotId(0), true))
+        );
+        assert_eq!(c.lru_resident(tick), Some(SlotId(0)));
+        assert_eq!(c.pinned_count(), 2, "host cleanup changed user pins");
+    }
+
+    #[test]
+    fn a_host_borrow_survives_recency_and_user_unpin_and_preserves_user_pin_on_clear() {
+        let mut c = only_host_victim();
+        c.set_pinned(SlotId(0), true);
+        let touched = c.begin();
+        c.touch(SlotId(0), touched);
+        c.set_pinned(SlotId(0), false);
+        assert!(
+            c.host_borrowed(SlotId(0)),
+            "unpin erased independent host custody"
+        );
+        let later = c.begin();
+        assert_ne!(later, touched);
+        assert_eq!(c.victim_in(later, false, Completed::ALL), None);
+        assert_eq!(
+            c.victim_beside(later, Epoch(0), Completed::ALL, false),
+            None
+        );
+        c.set_pinned(SlotId(0), true);
+        c.set_host_borrowed(SlotId(0), false);
+        assert!(c.is_pinned(SlotId(0)), "host cleanup erased user pin");
+        assert_eq!(c.pinned_count(), 3);
+        assert_eq!(c.lru_resident(later), None);
+    }
+
+    #[test]
+    fn a_host_borrow_keeps_unrelated_victims_fetch_and_replenish_working() {
+        let mut c = ExpertSlots::new(8, 3);
+        for s in 0..3 {
+            c.install(SlotId(s), ExpertId(s));
+        }
+        c.set_host_borrowed(SlotId(0), true);
+        let tick = c.begin();
+        assert_eq!(
+            c.victim_in(tick, true, Completed::ALL),
+            Some((SlotId(1), true))
+        );
+        assert_eq!(
+            c.victim_beside(tick, Epoch(0), Completed::ALL, false),
+            Some((SlotId(1), true))
+        );
+        assert_eq!(c.evict_lru(tick, Epoch(0), false), Some(ExpertId(1)));
+        assert_eq!(
+            c.victim_beside(tick, Epoch(0), Completed::ALL, true),
+            Some((SlotId(2), true))
+        );
+        assert_eq!(c.evict_lru(tick, Epoch(0), false), Some(ExpertId(2)));
+        assert_eq!(
+            c.evict_lru(tick, Epoch(0), false),
+            None,
+            "replenish evicted host slot"
+        );
+        assert_eq!(c.key_in(SlotId(0)), Some(ExpertId(0)));
+        c.set_host_borrowed(SlotId(0), false);
+        assert_eq!(c.evict_lru(tick, Epoch(0), false), Some(ExpertId(0)));
+    }
+
+    #[test]
+    fn a_host_borrow_reuses_the_existing_pin_byte_and_vector_layout() {
+        use std::mem::{align_of, size_of, size_of_val};
+        assert_eq!(size_of::<SlotProtection>(), size_of::<bool>());
+        assert_eq!(align_of::<SlotProtection>(), align_of::<bool>());
+        assert_eq!(size_of::<Vec<SlotProtection>>(), size_of::<Vec<bool>>());
+        assert_eq!(align_of::<Vec<SlotProtection>>(), align_of::<Vec<bool>>());
+        let p = TickLru::new(7);
+        let before = vec![false; 7];
+        assert_eq!(p.pinned.len(), before.len());
+        assert_eq!(
+            size_of_val(p.pinned.as_slice()),
+            size_of_val(before.as_slice())
+        );
+        // Layout is a memory/source control, not a zero-runtime-cost claim.
+    }
 
     /// A load beside a running pass takes a slot whose own last reader ran
     /// before the pass's floor (or has completed), never one written or read

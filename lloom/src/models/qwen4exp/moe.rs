@@ -25,7 +25,7 @@ use lloom_tensor::{DType, Module, Result, Tensor};
 use std::marker::PhantomData;
 
 pub use crate::nn::expert_stream::{
-    ExpertResidency, Resident, RoutedGroup, Streamed, WindowRecord,
+    ExpertResidency, Resident, ResolvedExperts, RoutedGroup, Streamed, WindowRecord,
 };
 
 /// What a device-planned layer does at its two join points: right after
@@ -429,12 +429,12 @@ impl<P: Profile, R: ExpertResidency> MoeLayer<P, R> {
         if hook.fetching() {
             return self.decode_fetched(&r, hook);
         }
-        let Some((slot_ids, rec)) = self.experts.plan_device(&r.ids)? else {
+        let Some((mut slot_ids, rec)) = self.experts.plan_device(&r.ids)? else {
             let y = self.routed_host(&r)?;
             return Ok((self.finish(&r, &y)?, None));
         };
         hook.after_plan(&rec)?;
-        let y = self.routed_one_group(&r.x3, &slot_ids)?;
+        let y = self.routed_one_group(&r.x3, &mut slot_ids)?;
         let shared = self.shared_expert(&r)?;
         hook.at_join()?;
         let flags = self.mask_flags(&r, &rec)?;
@@ -459,11 +459,11 @@ impl<P: Profile, R: ExpertResidency> MoeLayer<P, R> {
     ) -> Result<(Tensor, Option<Tensor>)> {
         let shared = self.shared_expert(r)?;
         hook.fetch_join(&self.experts, &r.ids)?;
-        let Some((slot_ids, rec)) = self.experts.plan_device(&r.ids)? else {
+        let Some((mut slot_ids, rec)) = self.experts.plan_device(&r.ids)? else {
             let y = self.routed_host(&r)?;
             return Ok((self.combine(r, &y, shared.as_ref(), None)?, None));
         };
-        let y = self.routed_one_group(&r.x3, &slot_ids)?;
+        let y = self.routed_one_group(&r.x3, &mut slot_ids)?;
         let flags = self.mask_flags(r, &rec)?;
         Ok((
             self.combine(r, &y, shared.as_ref(), flags.as_ref())?,
@@ -488,8 +488,8 @@ impl<P: Profile, R: ExpertResidency> MoeLayer<P, R> {
         let r = self.prefill_route(x)?;
         match kind {
             WindowPlanKind::Device => {
-                if let Some((slot_ids, rec)) = self.experts.plan_device(&r.ids)? {
-                    let y = self.routed_one_group(&r.x3, &slot_ids)?;
+                if let Some((mut slot_ids, rec)) = self.experts.plan_device(&r.ids)? {
+                    let y = self.routed_one_group(&r.x3, &mut slot_ids)?;
                     let flags = self.mask_flags(&r, &rec)?;
                     return Ok((
                         self.finish_with(&r, &y, flags.as_ref())?,
@@ -501,10 +501,10 @@ impl<P: Profile, R: ExpertResidency> MoeLayer<P, R> {
                 real_rows,
                 loaded_rows,
             } => {
-                if let Some((slot_ids, rec)) =
+                if let Some((mut slot_ids, rec)) =
                     self.experts.plan_window(&r.ids, real_rows, loaded_rows)?
                 {
-                    let y = self.routed_one_group(&r.x3, &slot_ids)?;
+                    let y = self.routed_one_group(&r.x3, &mut slot_ids)?;
                     return Ok((self.finish(&r, &y)?, Some(WindowPlan::Host(rec))));
                 }
             }
@@ -565,7 +565,7 @@ impl<P: Profile, R: ExpertResidency> MoeLayer<P, R> {
         };
         let (y, record) = match device_plan {
             // One group over the slot ids the device resolved.
-            Some((slot_ids, rec)) => (self.routed_one_group(&r.x3, &slot_ids)?, Some(rec)),
+            Some((mut slot_ids, rec)) => (self.routed_one_group(&r.x3, &mut slot_ids)?, Some(rec)),
             None => (self.routed_host(&r)?, None),
         };
         Ok((self.finish(&r, &y)?, record))
@@ -702,7 +702,11 @@ impl<P: Profile, R: ExpertResidency> MoeLayer<P, R> {
     /// The routed experts over one device-resolved group of slot ids. Its
     /// outputs are shaped by the pass alone (`[rows, topk, ·]`, one group),
     /// so a pass plan serves them (`DESIGN.md` §9.2aa).
-    fn routed_one_group(&self, x3: &Tensor, slot_ids: &Tensor) -> Result<Tensor> {
+    fn routed_one_group(
+        &self,
+        x3: &Tensor,
+        slot_ids: &mut ResolvedExperts<'_, R>,
+    ) -> Result<Tensor> {
         let arm = MoeArm::for_rows(x3.dim(0)?);
         let act = self.tile_act(x3.dim(0)?);
         let h = self.routed_gate_up_swiglu(x3, slot_ids, arm, act, false)?;
@@ -747,7 +751,7 @@ impl<P: Profile, R: ExpertResidency> MoeLayer<P, R> {
         for k in 0..groups.len() {
             let gi = reordered.as_ref().map_or(k, |o| o[k]);
             let group = &groups[gi];
-            let slot_ids = self.experts.ensure(group)?;
+            let mut slot_ids = self.experts.ensure(group)?;
             // The later groups' misses read while this group runs.
             if k + 1 < groups.len() {
                 match &reordered {
@@ -764,8 +768,8 @@ impl<P: Profile, R: ExpertResidency> MoeLayer<P, R> {
             } else {
                 x3.narrow(0, group.rows.start, group.rows.len())?
             };
-            let h = self.routed_gate_up_swiglu(&xg, &slot_ids, arm, act, true)?; // [rows, topk, n_ff]
-            ys[gi] = Some(self.experts.down(&h, &slot_ids, arm)?); // [rows, topk, hidden]
+            let h = self.routed_gate_up_swiglu(&xg, &mut slot_ids, arm, act, true)?; // [rows, topk, n_ff]
+            ys[gi] = Some(self.experts.down(&h, &mut slot_ids, arm)?); // [rows, topk, hidden]
         }
         let mut ys: Vec<Tensor> = ys
             .into_iter()
@@ -786,7 +790,7 @@ impl<P: Profile, R: ExpertResidency> MoeLayer<P, R> {
     fn routed_gate_up_swiglu(
         &self,
         x: &Tensor,
-        slot_ids: &Tensor,
+        slot_ids: &mut ResolvedExperts<'_, R>,
         arm: MoeArm,
         act: DType,
         traced: bool,

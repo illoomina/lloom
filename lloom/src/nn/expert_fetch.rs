@@ -19,7 +19,7 @@
 //! (`docs/invariants.md` §15.2 #10b). A GPU→host event would tell it of the
 //! routing ~1 ms late (§20.14b).
 
-use crate::nn::expert_stream::{FetchStats, Streamed};
+use crate::nn::expert_stream::{FetchJobCustody, FetchStats, Streamed};
 use lloom_tensor::kernels::metal::GpuClock;
 use lloom_tensor::metal_backend::{HostEvent, HostSlot};
 use lloom_tensor::retire::Epoch;
@@ -49,6 +49,17 @@ struct Job {
     n_experts: usize,
     value: u64,
     floor: Epoch,
+    /// RAII resize exclusion through CPU IO/publication or cancellation. Drop
+    /// does not lock Inner or dereference TierRef; legacy null-tier tests carry None.
+    _custody: Option<FetchJobCustody>,
+}
+
+#[cfg(test)]
+pub(crate) fn fetch_layout_for_test() -> (usize, usize) {
+    (
+        std::mem::size_of::<FetchJobCustody>(),
+        std::mem::size_of::<Job>(),
+    )
 }
 
 /// A tier of the pass that registered the job.
@@ -187,6 +198,18 @@ impl FetchLane {
         self.lane.state.lock().registered
     }
 
+    /// Test-only publication census, separate from the worker's jobs counter.
+    #[cfg(test)]
+    pub(crate) fn registration_counts_for_test(&self) -> (u64, u64, usize) {
+        let state = self.lane.state.lock();
+        (state.registered, state.done, state.jobs.len())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cancellation_requested_for_test(&self) -> bool {
+        self.lane.cancel.load(Ordering::Acquire)
+    }
+
     /// Register `tier`'s layer of the open pass and encode the device's
     /// wait for it: the commands encoded after this run once the worker has
     /// served the routing the router writes into `ids`.
@@ -196,8 +219,15 @@ impl FetchLane {
         ids: Arc<HostSlot>,
         topk: usize,
         n_experts: usize,
+        custody: FetchJobCustody,
     ) -> Result<()> {
-        self.register_job(TierRef(tier as *const Streamed), ids, topk, n_experts)
+        self.register_job(
+            TierRef(tier as *const Streamed),
+            ids,
+            topk,
+            n_experts,
+            Some(custody),
+        )
     }
 
     fn register_job(
@@ -206,13 +236,20 @@ impl FetchLane {
         ids: Arc<HostSlot>,
         topk: usize,
         n_experts: usize,
+        custody: Option<FetchJobCustody>,
     ) -> Result<()> {
         let value = {
             let mut g = self.lane.state.lock();
             g.next += 1;
             g.registered += 1;
             let value = g.next;
-            let floor = g.floor;
+            // A replacement initializer was cut before the tier published it,
+            // hence before this job can acquire custody and publish its join.
+            // Earlier jobs are served/signalled FIFO before this floor is tested;
+            // the floor cannot contain this not-yet-published job's own join.
+            let floor = g
+                .floor
+                .max(custody.as_ref().map_or(Epoch::ZERO, |c| c.required_floor()));
             g.jobs.push_back(Job {
                 tier,
                 ids,
@@ -220,6 +257,7 @@ impl FetchLane {
                 n_experts,
                 value,
                 floor,
+                _custody: custody,
             });
             value
         };
@@ -345,7 +383,7 @@ fn work(lane: &Lane) {
     let mut ids: Vec<u32> = Vec::new();
     let mut settled_floor: Option<Epoch> = None;
     loop {
-        let (tier, slot, topk, n_experts, value, floor) = {
+        let (tier, slot, topk, n_experts, value, floor, initialization_unproven) = {
             let mut g = lane.state.lock();
             loop {
                 if lane.stop.load(Ordering::Acquire) {
@@ -359,6 +397,9 @@ fn work(lane: &Lane) {
                         j.n_experts,
                         j.value,
                         j.floor,
+                        j._custody
+                            .as_ref()
+                            .is_some_and(FetchJobCustody::initialization_unproven),
                     );
                 }
                 lane.cv.wait(&mut g);
@@ -366,7 +407,7 @@ fn work(lane: &Lane) {
         };
         lane.counters.jobs.fetch_add(1, Ordering::Relaxed);
         let t0 = Instant::now();
-        let seen = loop {
+        let mut seen = loop {
             if lane.cancel.load(Ordering::Acquire) {
                 break false;
             }
@@ -391,46 +432,94 @@ fn work(lane: &Lane) {
                 settled_floor = Some(floor);
             } else {
                 lane.counters.timeouts.fetch_add(1, Ordering::Relaxed);
+                // Routing is not permission to write: a failed floor proof
+                // preserves the unserved/replay path, or cancellation below.
+                seen = false;
             }
         }
+        let mut initialization_refusal = None;
         if seen {
             // SAFETY: the job's pass has not returned (`TierRef`).
             let tier = unsafe { &*tier };
             // A layer that found no slot looks again: slots free up as their
             // readers complete and in-flight loads land, so a pass computes
             // on a missing expert only past the fail-safe.
-            let (mut loaded, mut short) = tier.fetch_beside(&ids, floor);
-            let t_retry = Instant::now();
-            while short > 0
-                && !lane.cancel.load(Ordering::Acquire)
-                && t_retry.elapsed() <= ROUTING_TIMEOUT
-            {
-                lane.counters.retries.fetch_add(1, Ordering::Relaxed);
-                std::thread::sleep(lane.poll);
-                let (l, s) = tier.fetch_beside(&ids, floor);
-                loaded += l;
-                short = s;
+            let result = (|| -> Result<(u64, u64)> {
+                let (mut loaded, mut short) = tier.fetch_beside(&ids, floor)?;
+                let t_retry = Instant::now();
+                while short > 0
+                    && !lane.cancel.load(Ordering::Acquire)
+                    && t_retry.elapsed() <= ROUTING_TIMEOUT
+                {
+                    lane.counters.retries.fetch_add(1, Ordering::Relaxed);
+                    std::thread::sleep(lane.poll);
+                    let (l, s) = tier.fetch_beside(&ids, floor)?;
+                    loaded += l;
+                    short = s;
+                }
+                Ok((loaded, short))
+            })();
+            match result {
+                Ok((loaded, short)) => {
+                    if loaded + short > 0 {
+                        lane.counters.missed_layers.fetch_add(1, Ordering::Relaxed);
+                    }
+                    lane.counters.loads.fetch_add(loaded, Ordering::Relaxed);
+                    lane.counters.short.fetch_add(short, Ordering::Relaxed);
+                }
+                Err(error) => {
+                    // A failed/abandoned initializer cannot be replayed as a
+                    // mere absent expert. Cancel consumers before raising value.
+                    eprintln!("[expert-fetch] bank initialization: {error}");
+                    initialization_refusal = Some(
+                        "expert fetch: bank initialization failed; dependent work was cancelled",
+                    );
+                    seen = false;
+                }
             }
-            if loaded + short > 0 {
-                lane.counters.missed_layers.fetch_add(1, Ordering::Relaxed);
-            }
-            lane.counters.loads.fetch_add(loaded, Ordering::Relaxed);
-            lane.counters.short.fetch_add(short, Ordering::Relaxed);
         }
         lane.counters
             .serve_ns
             .fetch_add(t1.elapsed().as_nanos() as u64, Ordering::Relaxed);
-        // A job given up to a cancellation leaves the table unwritten for a
-        // pass nobody redoes: the work behind its wait is cancelled before
-        // the raise, and never runs. The fail-safe's raise lets it run on the
-        // table as it stands, for the settle to flag and redo.
-        if !seen && lane.cancel.load(Ordering::Acquire) {
-            if let Err(e) = lane.event.cancel_through(value, CANCELLED) {
+        // A routing timeout is not a DATA proof. Only jobs registered while
+        // their generation was unproven take this cold final poll; ordinary
+        // proven jobs add no Inner lock or receipt scan. Ready preserves the
+        // existing healthy timeout/replay route. Failed OR still Pending must
+        // cancel this join before the signal, even when no routing was seen.
+        if initialization_unproven && initialization_refusal.is_none() {
+            // SAFETY: the published Job retains its pass lifetime and bank
+            // resize custody through this poll and cancellation/publication.
+            let tier = unsafe { &*tier };
+            match tier.fetch_initialization_ready() {
+                Ok(true) => {}
+                Ok(false) => {
+                    initialization_refusal = Some(
+                        "expert fetch: bank initialization DATA unresolved; dependent work was cancelled",
+                    );
+                }
+                Err(error) => {
+                    eprintln!("[expert-fetch] bank initialization at join release: {error}");
+                    initialization_refusal = Some(
+                        "expert fetch: bank initialization failed; dependent work was cancelled",
+                    );
+                }
+            }
+        }
+        // Unresolved Pending refuses this request only: the generation stays
+        // pending and a later successful DATA proof can serve the next one.
+        if let Some(reason) = initialization_refusal
+            .or_else(|| (!seen && lane.cancel.load(Ordering::Acquire)).then_some(CANCELLED))
+        {
+            if let Err(e) = lane.event.cancel_through(value, reason) {
                 eprintln!("[expert-fetch] cancelling the work behind value {value}: {e}");
             }
         }
         {
             let mut g = lane.state.lock();
+            // CPU reads/writes and live-table publication have returned, or
+            // a HostCommit cancellation request was published. This does not
+            // prove callback/native retirement. Dropping
+            // custody before the raise is safe: signal does not acquire Inner.
             g.jobs.pop_front();
             g.done += 1;
         }
@@ -535,8 +624,14 @@ mod tests {
         let progress = m.metal_device().as_ref().newSharedEvent().unwrap();
         let before = m.commands().produced_stats();
         let lane = FetchLane::new(&m, Duration::from_millis(1), "inherit").unwrap();
-        lane.register_job(TierRef(std::ptr::null()), unwritten_routing(&m, 2), 2, 4)
-            .unwrap();
+        lane.register_job(
+            TierRef(std::ptr::null()),
+            unwritten_routing(&m, 2),
+            2,
+            4,
+            None,
+        )
+        .unwrap();
         let (_y, marker) = encode_consumer(&m, &x, || {
             m.commands().encode_signal_event(&progress, 1).unwrap()
         });
@@ -571,8 +666,14 @@ mod tests {
         let before = m.commands().produced_stats();
         let lane = FetchLane::new(&m, Duration::from_millis(1), "inherit").unwrap();
         let mut pass = lane.begin_pass(Epoch(0));
-        lane.register_job(TierRef(std::ptr::null()), unwritten_routing(&m, 2), 2, 4)
-            .unwrap();
+        lane.register_job(
+            TierRef(std::ptr::null()),
+            unwritten_routing(&m, 2),
+            2,
+            4,
+            None,
+        )
+        .unwrap();
         let (_y, marker) = encode_consumer(&m, &x, || {
             m.commands().encode_signal_event(&progress, 1).unwrap()
         });

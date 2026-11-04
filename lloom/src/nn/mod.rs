@@ -103,7 +103,9 @@ pub use decode::{
 };
 pub use embedding::{embedding, Embedding};
 pub use expert_stream::{
-    ExpertResidency, ExpertSource, LoaderArm, Resident, RoutedGroup, StagingStats, Streamed,
+    ErasedResolvedExperts, ErasedResolvedProjection, ExpertResidency, ExpertSource, LoaderArm,
+    Resident, ResolvedExperts, ResolvedOwnerIdentity, RoutedGroup, SendResolvedExperts,
+    StagingStats, Streamed,
 };
 pub use func::{func, func_t, Func, FuncT};
 pub use group_norm::{group_norm, GroupNorm};

@@ -269,16 +269,42 @@ fn build<P: Profile, R: ExpertResidency>(
 pub struct GhostExperts;
 
 impl ExpertResidency for GhostExperts {
+    fn ensure_erased(
+        &self,
+        _group: &crate::nn::expert_stream::RoutedGroup,
+    ) -> Result<crate::nn::expert_stream::ErasedResolvedExperts<'_>> {
+        lloom_tensor::bail!("ghost experts are walked, never run")
+    }
+    fn gate_up_erased(
+        &self,
+        _x: &Tensor,
+        _group: &mut crate::nn::expert_stream::ErasedResolvedProjection<'_, '_>,
+        _arm: lloom_tensor::quantized::MoeArm,
+        _act: DType,
+    ) -> Result<(Tensor, Tensor)> {
+        lloom_tensor::bail!("ghost experts are walked, never run")
+    }
+    fn down_erased(
+        &self,
+        _h: &Tensor,
+        _group: &mut crate::nn::expert_stream::ErasedResolvedProjection<'_, '_>,
+        _arm: lloom_tensor::quantized::MoeArm,
+    ) -> Result<Tensor> {
+        lloom_tensor::bail!("ghost experts are walked, never run")
+    }
     fn plan(&self, _ids: &Tensor) -> Result<Vec<crate::nn::expert_stream::RoutedGroup>> {
         lloom_tensor::bail!("ghost experts are walked, never run")
     }
-    fn ensure(&self, _group: &crate::nn::expert_stream::RoutedGroup) -> Result<Tensor> {
+    fn ensure(
+        &self,
+        _group: &crate::nn::expert_stream::RoutedGroup,
+    ) -> Result<crate::nn::expert_stream::ResolvedExperts<'_, Self>> {
         lloom_tensor::bail!("ghost experts are walked, never run")
     }
     fn gate_up(
         &self,
         _x: &Tensor,
-        _slot_ids: &Tensor,
+        _slot_ids: &mut crate::nn::expert_stream::ResolvedExperts<'_, Self>,
         _arm: lloom_tensor::quantized::MoeArm,
         _act: DType,
     ) -> Result<(Tensor, Tensor)> {
@@ -287,7 +313,7 @@ impl ExpertResidency for GhostExperts {
     fn down(
         &self,
         _h: &Tensor,
-        _slot_ids: &Tensor,
+        _slot_ids: &mut crate::nn::expert_stream::ResolvedExperts<'_, Self>,
         _arm: lloom_tensor::quantized::MoeArm,
     ) -> Result<Tensor> {
         lloom_tensor::bail!("ghost experts are walked, never run")
@@ -304,28 +330,54 @@ impl ExpertResidency for GhostExperts {
 pub struct GhostHostExperts;
 
 impl ExpertResidency for GhostHostExperts {
+    fn ensure_erased(
+        &self,
+        _group: &crate::nn::expert_stream::RoutedGroup,
+    ) -> Result<crate::nn::expert_stream::ErasedResolvedExperts<'_>> {
+        lloom_tensor::bail!("ghost experts are walked, never run")
+    }
+    fn gate_up_erased(
+        &self,
+        _x: &Tensor,
+        _group: &mut crate::nn::expert_stream::ErasedResolvedProjection<'_, '_>,
+        _arm: lloom_tensor::quantized::MoeArm,
+        _act: DType,
+    ) -> Result<(Tensor, Tensor)> {
+        lloom_tensor::bail!("ghost experts are walked, never run")
+    }
+    fn down_erased(
+        &self,
+        _h: &Tensor,
+        _group: &mut crate::nn::expert_stream::ErasedResolvedProjection<'_, '_>,
+        _arm: lloom_tensor::quantized::MoeArm,
+    ) -> Result<Tensor> {
+        lloom_tensor::bail!("ghost experts are walked, never run")
+    }
     fn plan(&self, ids: &Tensor) -> Result<Vec<crate::nn::expert_stream::RoutedGroup>> {
         GhostExperts.plan(ids)
     }
-    fn ensure(&self, group: &crate::nn::expert_stream::RoutedGroup) -> Result<Tensor> {
-        GhostExperts.ensure(group)
+    fn ensure(
+        &self,
+        _group: &crate::nn::expert_stream::RoutedGroup,
+    ) -> Result<crate::nn::expert_stream::ResolvedExperts<'_, Self>> {
+        lloom_tensor::bail!("ghost experts are walked, never run")
     }
     fn gate_up(
         &self,
-        x: &Tensor,
-        slot_ids: &Tensor,
-        arm: lloom_tensor::quantized::MoeArm,
-        act: DType,
+        _x: &Tensor,
+        _slot_ids: &mut crate::nn::expert_stream::ResolvedExperts<'_, Self>,
+        _arm: lloom_tensor::quantized::MoeArm,
+        _act: DType,
     ) -> Result<(Tensor, Tensor)> {
-        GhostExperts.gate_up(x, slot_ids, arm, act)
+        lloom_tensor::bail!("ghost experts are walked, never run")
     }
     fn down(
         &self,
-        h: &Tensor,
-        slot_ids: &Tensor,
-        arm: lloom_tensor::quantized::MoeArm,
+        _h: &Tensor,
+        _slot_ids: &mut crate::nn::expert_stream::ResolvedExperts<'_, Self>,
+        _arm: lloom_tensor::quantized::MoeArm,
     ) -> Result<Tensor> {
-        GhostExperts.down(h, slot_ids, arm)
+        lloom_tensor::bail!("ghost experts are walked, never run")
     }
     fn plans_on_device(&self) -> bool {
         false

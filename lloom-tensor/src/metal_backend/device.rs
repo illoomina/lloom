@@ -1919,9 +1919,9 @@ impl MetalDevice {
         Ok(())
     }
 
-    /// Recovery-only registered-prefix data boundary. M4 joins prior native
-    /// queue work through its front receipt plus own data. M3 joins registered
-    /// ordered callbacks, not untracked raw submissions.
+    /// Recovery-only registered-prefix data boundary. Both APIs join the
+    /// registered ordered callbacks up to the marker (its own logical
+    /// completion, retired in commit order), not untracked raw submissions.
     /// Error/refusal is not permission to reset mapped scratch or release
     /// unknown native custody. Later commits remain outside this receipt.
     pub fn wait_marker_prefix_data(&self, marker: &CommandMarker) -> Result<()> {

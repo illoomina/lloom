@@ -96,7 +96,7 @@ impl Default for FunctionConstantValues {
     }
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Value {
     USize(usize),
     Bool(bool),
@@ -131,7 +131,7 @@ impl Value {
 /// Not true, good enough for our purposes.
 impl Eq for Value {}
 
-#[derive(Debug, Eq, PartialEq, Hash)]
+#[derive(Debug, Clone, Eq, PartialEq, Hash)]
 pub struct ConstantValues(Vec<(usize, Value)>);
 
 impl ConstantValues {

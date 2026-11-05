@@ -33,7 +33,8 @@ pub use arena_alloc::{
     call_arena_alloc_report, call_arena_bump, call_arena_bump_concurrent, call_arena_reset,
 };
 pub use binary::{
-    call_binary_contiguous, call_binary_contiguous_with, call_binary_strided,
+    call_binary_contiguous, call_binary_contiguous_static, call_binary_contiguous_with,
+    call_binary_strided,
     call_binary_strided_with,
 };
 pub use cast::{

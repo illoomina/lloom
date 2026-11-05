@@ -28,7 +28,7 @@ pub use kernel::{merged_translation_unit, metal_compile_flags};
 // `kernels::params` when `conv.metal` followed (issue #42), so it is named
 // explicitly here; the spelling callers use is unchanged.
 pub use kernels::{
-    affine::*, arena_alloc::*, call_argmax_publish, call_binary_contiguous,
+    affine::*, arena_alloc::*, call_argmax_publish, call_binary_contiguous, call_binary_contiguous_static,
     call_binary_contiguous_with, call_binary_strided, call_binary_strided_with, call_eos_gate,
     call_eos_index, call_gdn_chunk_decay, call_gdn_chunk_epilogue, call_gdn_chunk_scale,
     call_gdn_chunk_scan_at, call_gdn_conv_window, call_gdn_gate, call_gdn_gated_norm,

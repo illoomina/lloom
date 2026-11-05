@@ -146,7 +146,7 @@ impl FlashKernel {
         dtype: FlashDType,
         head_dim: usize,
         width: usize,
-    ) -> Result<String, MetalKernelError> {
+    ) -> Result<&'static str, MetalKernelError> {
         let stem = match width {
             32 => "flash_decoding_partial",
             8 => "flash_decoding_partial8",
@@ -161,23 +161,53 @@ impl FlashKernel {
     }
 
     /// The combine-pass kernel for one `(dtype, head_dim)`.
-    pub fn combine(dtype: FlashDType, head_dim: usize) -> Result<String, MetalKernelError> {
+    pub fn combine(dtype: FlashDType, head_dim: usize) -> Result<&'static str, MetalKernelError> {
         Self::name("flash_decoding_combine", dtype, head_dim)
     }
 
     /// The single-pass kernel for one `(dtype, head_dim)` — the `n_chunks == 1`
     /// path that writes `out` directly, skipping the partial+combine round-trip.
-    pub fn single(dtype: FlashDType, head_dim: usize) -> Result<String, MetalKernelError> {
+    pub fn single(dtype: FlashDType, head_dim: usize) -> Result<&'static str, MetalKernelError> {
         Self::name("flash_decoding_single", dtype, head_dim)
     }
 
     /// The KV write for one dtype: one token's rows scattered to table-chosen
     /// slots. Per element, so it has no head-dimension instantiation.
-    pub fn scatter(dtype: FlashDType) -> String {
-        format!("flash_kv_scatter_{}", dtype.suffix())
+    pub fn scatter(dtype: FlashDType) -> &'static str {
+        Self::interned(("flash_kv_scatter", dtype, None))
     }
 
-    fn name(stem: &str, dtype: FlashDType, head_dim: usize) -> Result<String, MetalKernelError> {
+    /// The `[[host_name]]` for `(stem, dtype, head_dim)`, formatted once per
+    /// thread and leaked: the names are finite (`FlashKernel::all`), and the
+    /// decode step built one with `format!` per FlashDecoding dispatch and
+    /// per KV scatter (#1235 step 1: 37 allocations a served LFM2 token).
+    /// `head_dim` is `None` for the scatter, which has no head instantiation.
+    fn interned(key: (&'static str, FlashDType, Option<usize>)) -> &'static str {
+        type Key = (&'static str, FlashDType, Option<usize>);
+        thread_local! {
+            static NAMES: std::cell::RefCell<std::collections::HashMap<Key, &'static str>> =
+                std::cell::RefCell::new(std::collections::HashMap::new());
+        }
+        NAMES.with(|names| {
+            if let Some(name) = names.borrow().get(&key) {
+                return *name;
+            }
+            let (stem, dtype, head_dim) = key;
+            let built = match head_dim {
+                Some(head_dim) => format!("{stem}_{}_{head_dim}", dtype.suffix()),
+                None => format!("{stem}_{}", dtype.suffix()),
+            };
+            let name: &'static str = Box::leak(built.into_boxed_str());
+            names.borrow_mut().insert(key, name);
+            name
+        })
+    }
+
+    fn name(
+        stem: &'static str,
+        dtype: FlashDType,
+        head_dim: usize,
+    ) -> Result<&'static str, MetalKernelError> {
         if !dtype.head_dims().contains(&head_dim) {
             return Err(MetalKernelError::SdpaHeadSizeMismatch(Box::new(
                 crate::kernels::err::SdpaHeadSizeMismatch {
@@ -187,7 +217,7 @@ impl FlashKernel {
                 },
             )));
         }
-        Ok(format!("{stem}_{}_{head_dim}", dtype.suffix()))
+        Ok(Self::interned((stem, dtype, Some(head_dim))))
     }
 
     /// Every declared name, for `flash_names_resolve` and for exhaustive tests.
@@ -195,12 +225,16 @@ impl FlashKernel {
         let mut names = Vec::new();
         for dtype in [FlashDType::F16, FlashDType::F32, FlashDType::BF16] {
             for &head_dim in dtype.head_dims() {
-                names.push(Self::name("flash_decoding_partial", dtype, head_dim).unwrap());
-                names.push(Self::name("flash_decoding_partial8", dtype, head_dim).unwrap());
-                names.push(Self::name("flash_decoding_combine", dtype, head_dim).unwrap());
-                names.push(Self::name("flash_decoding_single", dtype, head_dim).unwrap());
+                for stem in [
+                    "flash_decoding_partial",
+                    "flash_decoding_partial8",
+                    "flash_decoding_combine",
+                    "flash_decoding_single",
+                ] {
+                    names.push(Self::name(stem, dtype, head_dim).unwrap().to_string());
+                }
             }
-            names.push(Self::scatter(dtype));
+            names.push(Self::scatter(dtype).to_string());
         }
         names
     }
@@ -231,7 +265,7 @@ pub fn flash_admits_its_widths(
     }
     for (name, threads) in cells {
         let pipeline =
-            kernels.load_pipeline(device, Source::FlashDecoding, KernelName::Value(name))?;
+            kernels.load_pipeline(device, Source::FlashDecoding, KernelName::Ref(name))?;
         if pipeline.max_total_threads_per_threadgroup() < threads {
             return Ok(false);
         }
@@ -557,7 +591,7 @@ pub unsafe fn call_flash_decoding(
     let single = || -> Result<(), MetalKernelError> {
         let name = FlashKernel::single(itype, head_dim)?;
         let pipeline =
-            kernels.load_pipeline(device, Source::FlashDecoding, KernelName::Value(name))?;
+            kernels.load_pipeline(device, Source::FlashDecoding, KernelName::Ref(name))?;
         let encoder = ep.encoder();
         let encoder: &ComputeCommandEncoder = encoder.as_ref();
         encoder.set_compute_pipeline_state(&pipeline);
@@ -603,7 +637,7 @@ pub unsafe fn call_flash_decoding(
     {
         let name = FlashKernel::partial(itype, head_dim, partial_width)?;
         let pipeline =
-            kernels.load_pipeline(device, Source::FlashDecoding, KernelName::Value(name))?;
+            kernels.load_pipeline(device, Source::FlashDecoding, KernelName::Ref(name))?;
         let encoder = ep.encoder();
         let encoder: &ComputeCommandEncoder = encoder.as_ref();
         encoder.set_compute_pipeline_state(&pipeline);
@@ -653,7 +687,7 @@ pub unsafe fn call_flash_decoding(
     {
         let name = FlashKernel::combine(itype, head_dim)?;
         let pipeline =
-            kernels.load_pipeline(device, Source::FlashDecoding, KernelName::Value(name))?;
+            kernels.load_pipeline(device, Source::FlashDecoding, KernelName::Ref(name))?;
         let encoder = ep.encoder();
         let encoder: &ComputeCommandEncoder = encoder.as_ref();
         encoder.set_compute_pipeline_state(&pipeline);
@@ -734,7 +768,7 @@ pub unsafe fn call_flash_kv_scatter(
         return Ok(());
     }
     let name = FlashKernel::scatter(itype);
-    let pipeline = kernels.load_pipeline(device, Source::FlashDecoding, KernelName::Value(name))?;
+    let pipeline = kernels.load_pipeline(device, Source::FlashDecoding, KernelName::Ref(name))?;
     let encoder = ep.encoder();
     let encoder: &ComputeCommandEncoder = encoder.as_ref();
     encoder.set_compute_pipeline_state(&pipeline);

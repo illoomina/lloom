@@ -2362,8 +2362,43 @@ impl ComputeCommandEncoder {
     }
 
     pub fn set_label(&self, label: &str) {
-        self.raw.setLabel(Some(&NSString::from_str(label)))
+        with_cached_label(label, |label| self.raw.setLabel(Some(label)))
     }
+}
+
+/// How many distinct labels a thread keeps as `NSString`s. The encoder labels
+/// are static names (about sixty); the bound only stops a dynamic label
+/// stream (`metal_label!` under `debug-labels`) from growing the cache
+/// without limit. Past it a label is built per call, as before.
+const LABEL_CACHE_CAP: usize = 1024;
+
+/// Run `f` with `label` as an `NSString`, building each distinct label once
+/// per thread.
+///
+/// `set_label` built a fresh `NSString` (a CoreFoundation allocation) on
+/// every call, and the model code labels every dispatch's encoder: 84 of a
+/// served LFM2 token's 3956 allocations (#1235 step 1). The label is the same
+/// handful of names every step, so it is built the first time a thread uses
+/// it and borrowed afterwards: no allocation, no lock, no atomic on the hit.
+/// Metal copies what `setLabel` is given, so lending the cached string is the
+/// same call it always made.
+fn with_cached_label<R>(label: &str, f: impl FnOnce(&NSString) -> R) -> R {
+    thread_local! {
+        static LABELS: std::cell::RefCell<HashMap<Box<str>, objc2::rc::Retained<NSString>>> =
+            std::cell::RefCell::new(HashMap::new());
+    }
+    LABELS.with(|labels| {
+        if let Some(cached) = labels.borrow().get(label) {
+            return f(cached);
+        }
+        let built = NSString::from_str(label);
+        let result = f(&built);
+        let mut labels = labels.borrow_mut();
+        if labels.len() < LABEL_CACHE_CAP {
+            labels.insert(label.into(), built);
+        }
+        result
+    })
 }
 
 /// RAII guard that pops a Metal debug group on drop. Debug groups are a stack
@@ -2717,7 +2752,7 @@ impl BlitCommandEncoder {
     }
 
     pub fn set_label(&self, label: &str) {
-        self.raw.setLabel(Some(&NSString::from_str(label)))
+        with_cached_label(label, |label| self.raw.setLabel(Some(label)))
     }
 
     /// Wait on the last writer of each of `ptrs`, emitting each distinct fence
@@ -3325,6 +3360,18 @@ mod tests {
                 assert_eq!(*c, steady, "{key:?}: cycle {i} changed the retained capacity {seen:?}");
             }
         }
+    }
+
+    /// An encoder label is built once per thread and lent afterwards: the
+    /// second use of a label borrows the SAME `NSString` (#1235 step 1).
+    #[test]
+    fn an_encoder_label_is_built_once_per_thread() {
+        let first = with_cached_label("label-cache-test", |s| (s as *const NSString as usize, s.to_string()));
+        let second = with_cached_label("label-cache-test", |s| (s as *const NSString as usize, s.to_string()));
+        assert_eq!(first.1, "label-cache-test");
+        assert_eq!(first, second, "a repeated label must lend the cached string");
+        let other = with_cached_label("label-cache-other", |s| s as *const NSString as usize);
+        assert_ne!(first.0, other);
     }
 
     #[test]

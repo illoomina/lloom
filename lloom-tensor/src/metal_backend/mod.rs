@@ -3369,8 +3369,26 @@ impl MetalStorage {
         lhs_l: &Layout,
         rhs_l: &Layout,
     ) -> Result<Self> {
-        fn kernel_name(op: &'static str, dtype: &DType, suffix: &str) -> String {
-            format!("{op}_{}{}", dtype.as_str(), suffix)
+        /// `binary.metal`'s `[[host_name]]` for `op` at `dtype` with an
+        /// indexer `suffix`, formatted once per thread and leaked: the names
+        /// are finite (ops x dtypes x indexers), and this ran two `format!`s a
+        /// binary op (#1235 step 1: 60 allocations a served LFM2 token).
+        fn kernel_name(op: &'static str, dtype: &DType, suffix: &'static str) -> &'static str {
+            type Key = (&'static str, &'static str, &'static str);
+            thread_local! {
+                static NAMES: std::cell::RefCell<std::collections::HashMap<Key, &'static str>> =
+                    std::cell::RefCell::new(std::collections::HashMap::new());
+            }
+            let key = (op, dtype.as_str(), suffix);
+            NAMES.with(|names| {
+                if let Some(name) = names.borrow().get(&key) {
+                    return *name;
+                }
+                let name: &'static str =
+                    Box::leak(format!("{op}_{}{}", key.1, suffix).into_boxed_str());
+                names.borrow_mut().insert(key, name);
+                name
+            })
         }
         let device = self.device();
         let shape = lhs_l.shape();
@@ -3395,7 +3413,7 @@ impl MetalStorage {
             (true, false, _, false) => kernel_name(op, &self.dtype, "_rss"),
             (false, true, true, _) => kernel_name(op, &self.dtype, "_cs"),
             (false, true, false, _) => kernel_name(op, &self.dtype, "_lss"),
-            (false, false, true, true) => contiguous_kernel.clone(),
+            (false, false, true, true) => contiguous_kernel,
             (false, false, true, false) => kernel_name(op, &self.dtype, "_rstrided"),
             (false, false, false, true) => kernel_name(op, &self.dtype, "_lstrided"),
             (false, false, false, false) => kernel_name(op, &self.dtype, "_strided"),
@@ -3409,7 +3427,7 @@ impl MetalStorage {
                 .build()?;
             // SAFETY: storage-owned buffers (binding authority, module head).
             unsafe {
-                crate::kernels::call_binary_contiguous(
+                crate::kernels::call_binary_contiguous_static(
                     &device.device,
                     &encoder,
                     &device.kernels,

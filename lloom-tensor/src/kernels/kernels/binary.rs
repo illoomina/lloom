@@ -77,12 +77,90 @@ pub unsafe fn call_binary_contiguous_with<S: ToString>(
 ) -> Result<(), MetalKernelError> {
     let kernel_name = kernel_name.to_string();
     let name = style.kernel_name_owned(kernel_name.clone());
+    // SAFETY: this function's contract (# Safety above).
+    unsafe {
+        encode_binary_contiguous(
+            device,
+            ep,
+            kernels,
+            &kernel_name,
+            name,
+            dtype_size,
+            length,
+            left,
+            right,
+            output,
+            style,
+        )
+    }
+}
+
+/// As [`call_binary_contiguous`], for a classical name that is already a
+/// `&'static str` (`MetalStorage::binary`'s interned names): the `Split`
+/// name is borrowed rather than copied, so the dispatch builds no `String`
+/// (#1235 step 1: 60 allocations a served LFM2 token at the `to_string` and
+/// its clone in [`call_binary_contiguous_with`]).
+///
+/// # Safety
+/// As [`call_binary_contiguous`].
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn call_binary_contiguous_static(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    kernel_name: &'static str,
+    dtype_size: usize,
+    length: usize,
+    left: BufferOffset,
+    right: BufferOffset,
+    output: &Buffer,
+) -> Result<(), MetalKernelError> {
+    let style = ParamStyle::default();
+    // SAFETY: this function's contract (# Safety above).
+    unsafe {
+        encode_binary_contiguous(
+            device,
+            ep,
+            kernels,
+            kernel_name,
+            style.kernel_name(kernel_name),
+            dtype_size,
+            length,
+            left,
+            right,
+            output,
+            style,
+        )
+    }
+}
+
+/// The one body both contiguous entry points share: `display` is the
+/// classical name for the debug group, `name` the styled pipeline name.
+///
+/// # Safety
+/// As [`call_binary_contiguous`].
+#[allow(clippy::too_many_arguments)]
+unsafe fn encode_binary_contiguous(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    display: &str,
+    name: crate::kernels::kernel::KernelName,
+    dtype_size: usize,
+    length: usize,
+    left: BufferOffset,
+    right: BufferOffset,
+    output: &Buffer,
+    style: ParamStyle,
+) -> Result<(), MetalKernelError> {
+    // `display` is read only by `debug_group!` (a no-op without `debug-labels`).
+    let _ = display;
     let pipeline = kernels.load_pipeline(device, Source::Binary, name)?;
 
     let encoder = ep.encoder();
     let encoder: &ComputeCommandEncoder = encoder.as_ref();
     encoder.set_compute_pipeline_state(&pipeline);
-    debug_group!(encoder, "binary {kernel_name} elems={length}");
+    debug_group!(encoder, "binary {display} elems={length}");
 
     let _capture = begin_packed_params(encoder, style);
     // SAFETY: this function's contract (# Safety above).

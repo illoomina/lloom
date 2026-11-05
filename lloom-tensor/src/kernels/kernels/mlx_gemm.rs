@@ -983,6 +983,48 @@ pub const GEMV_ROWS_MAX: usize = 16;
 
 /// The `[[host_name]]` suffix of each row count, no allocation per dispatch;
 /// the classical name at 1 (0 is never dispatched).
+/// Every part of a gemv `[[host_name]]`: prefix, dtype, the six tile
+/// dimensions, then the norm, epilogue, rows and style suffixes, in name order.
+type GemvNameParts = (
+    &'static str,
+    &'static str,
+    [usize; 6],
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static str,
+);
+
+/// The gemv `[[host_name]]` for `parts`, built once per variant per thread.
+///
+/// `gemv_dispatch` used to `format!` this name on every dispatch: 167 of a
+/// served LFM2 token's 3956 allocations (#1235 step 1), and an owned
+/// `KernelName` the pipeline cache then hashed. The names are finite (the
+/// instantiated tiles x dtypes x suffixes), so each is formatted the first
+/// time a thread asks for it and leaked as a `&'static str`; every later
+/// dispatch is a thread-local lookup with no allocation, no lock and no
+/// atomic. Per thread rather than shared so the lookup needs neither.
+fn gemv_kernel_name(parts: GemvNameParts) -> &'static str {
+    thread_local! {
+        static NAMES: std::cell::RefCell<std::collections::HashMap<GemvNameParts, &'static str>> =
+            std::cell::RefCell::new(std::collections::HashMap::new());
+    }
+    NAMES.with(|names| {
+        if let Some(name) = names.borrow().get(&parts) {
+            return *name;
+        }
+        let (prefix, dtype, [bm, bn, sm, sn, tm, tn], norm, epilogue, rows, style) = parts;
+        let name: &'static str = Box::leak(
+            format!(
+                "{prefix}_{dtype}_bm{bm}_bn{bn}_sm{sm}_sn{sn}_tm{tm}_tn{tn}_nc0_axpby0{norm}{epilogue}{rows}{style}"
+            )
+            .into_boxed_str(),
+        );
+        names.borrow_mut().insert(parts, name);
+        name
+    })
+}
+
 const GEMV_ROWS_SUFFIX: [&str; GEMV_ROWS_MAX + 1] = [
     "", "", "_r2", "_r3", "_r4", "_r5", "_r6", "_r7", "_r8", "_r9", "_r10", "_r11", "_r12", "_r13",
     "_r14", "_r15", "_r16",
@@ -1381,21 +1423,15 @@ unsafe fn gemv_dispatch(
     // position by that trailing suffix (`icb.rs` `is_packed`), so a fused
     // packed name is `…_axpby0_silu_packed`, never `…_packed_silu`.
     let rows_suffix = GEMV_ROWS_SUFFIX[rows];
-    let name = format!(
-        "{}_{}_bm{}_bn{}_sm{}_sn{}_tm{}_tn{}_nc0_axpby0{}{}{}{}",
+    let name = gemv_kernel_name((
         kernel_prefix,
         dtype_str,
-        bm,
-        bn,
-        sm,
-        sn,
-        tm,
-        tn,
+        [bm, bn, sm, sn, tm, tn],
         norm_suffix,
         epilogue_suffix,
         rows_suffix,
-        style.name_suffix()
-    );
+        style.name_suffix(),
+    ));
 
     let pipeline = kernels.load_pipeline(device, Source::Gemv, name)?;
     let encoder = ep.encoder();
@@ -2611,5 +2647,40 @@ mod tile_config_gate {
             "unset must select the derived tile, so every recorded figure \
              belongs to the shipping path (§7.1a)"
         );
+    }
+}
+
+#[cfg(test)]
+mod gemv_name_tests {
+    use super::gemv_kernel_name;
+
+    /// The interned name is the text the per-dispatch `format!` built, and a
+    /// second request for the same variant returns the SAME leaked string
+    /// rather than building another (#1235 step 1).
+    #[test]
+    fn an_interned_gemv_name_is_the_formatted_name_and_is_built_once() {
+        let parts = (
+            "gemv",
+            "float16",
+            [4, 1, 1, 32, 4, 4],
+            "_rmsnorm",
+            "",
+            "",
+            "",
+        );
+        let first = gemv_kernel_name(parts);
+        assert_eq!(
+            first,
+            "gemv_float16_bm4_bn1_sm1_sn32_tm4_tn4_nc0_axpby0_rmsnorm",
+            "the interned name must be byte-identical to the name the dispatch formatted"
+        );
+        let second = gemv_kernel_name(parts);
+        assert!(
+            std::ptr::eq(first, second),
+            "a repeated variant must return the cached string, not a new one"
+        );
+        let other = gemv_kernel_name(("gemv_t", "bfloat16", [1, 16, 4, 8, 4, 4], "", "_silu", "", "_packed"));
+        assert_eq!(other, "gemv_t_bfloat16_bm1_bn16_sm4_sn8_tm4_tn4_nc0_axpby0_silu_packed");
+        assert!(!std::ptr::eq(first, other));
     }
 }

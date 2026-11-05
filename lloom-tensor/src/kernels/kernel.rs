@@ -84,7 +84,15 @@ enum LibraryKey {
 }
 
 type Libraries = HashMap<LibraryKey, Library>;
-type Pipelines = HashMap<(Source, KernelName, Option<ConstantValues>), ComputePipeline>;
+/// `(source, function, the caller's constants, the EOS gate's value)`. The
+/// gate is its own field, `Some` only for a gated source, and is appended to
+/// the constants only when a pipeline is BUILT (`with_gate_constant`): a
+/// lookup then builds no key-side `Vec` (#1235 step 1: 251 allocations a
+/// served LFM2 token). The key is in one-to-one correspondence with the
+/// merged `(constants ++ gate)` it replaced, so the cache holds the same
+/// variants.
+type Pipelines =
+    HashMap<(Source, KernelName, Option<ConstantValues>, Option<bool>), ComputePipeline>;
 
 #[derive(Debug)]
 pub struct Kernels {
@@ -210,22 +218,30 @@ impl Kernels {
     /// so a gated source's pipelines always carry it (`false` the plain
     /// variant, `true` the gated one; two cache keys).
     fn with_gate_constant(
-        &self,
-        source: Source,
         constants: Option<ConstantValues>,
+        gate: Option<bool>,
     ) -> Option<ConstantValues> {
-        if !EOS_GATED_SOURCES.contains(&source) {
+        let Some(gated) = gate else {
             return constants;
-        }
+        };
         let gate = (
             crate::kernels::metal::eos_gate::EOS_GATE_FUNCTION_CONSTANT,
-            crate::kernels::metal::library::Value::Bool(self.gated_here(source)),
+            crate::kernels::metal::library::Value::Bool(gated),
         );
         let mut values = constants
             .map(ConstantValues::into_values)
             .unwrap_or_default();
         values.push(gate);
         Some(ConstantValues::new(values))
+    }
+
+    /// The gate's value for a pipeline of `source` loaded now: `None` for a
+    /// source that carries no gated kernel, else whether this load takes the
+    /// gated variant ([`Self::gated_here`]).
+    fn gate_for(&self, source: Source) -> Option<bool> {
+        EOS_GATED_SOURCES
+            .contains(&source)
+            .then(|| self.gated_here(source))
     }
 
     /// Which library a [`Source`] resolves to, and the text to compile for it.
@@ -345,8 +361,7 @@ impl Kernels {
         name: impl Into<KernelName>,
         constants: Option<ConstantValues>,
     ) -> Result<ComputePipeline, MetalKernelError> {
-        let constants = self.with_gate_constant(source, constants);
-        let key = (source, name.into(), constants);
+        let key = (source, name.into(), constants, self.gate_for(source));
         if let Some(pipeline) = self.pipelines.read().get(&key) {
             return Ok(pipeline.clone());
         }
@@ -356,7 +371,10 @@ impl Kernels {
         if let Some(pipeline) = pipelines.get(&key) {
             Ok(pipeline.clone())
         } else {
-            let (source, name, constants) = key;
+            let (source, name, caller_constants, gate) = key;
+            // The gate's function constant joins the caller's here, where a
+            // pipeline is built, in the order it always had (appended last).
+            let constants = Self::with_gate_constant(caller_constants.clone(), gate);
             let func = self.load_function(device, source, name.as_ref(), constants.as_ref())?;
             // Record the function name here, where it is already in hand: it is
             // how an executor attributes a dispatch to a kernel, and it is
@@ -377,7 +395,7 @@ impl Kernels {
                     )
                 );
             }
-            pipelines.insert((source, name, constants), pipeline.clone());
+            pipelines.insert((source, name, caller_constants, gate), pipeline.clone());
 
             Ok(pipeline)
         }

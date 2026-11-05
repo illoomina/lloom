@@ -424,6 +424,42 @@ impl<'a, R: ExpertResidency + ?Sized> ResolvedExperts<'a, R> {
     }
 }
 
+/// Apply one slot grant to a model's tiers one layer at a time (#944 item 13).
+/// A resize allocates the layer's replacement banks and encodes the copy of
+/// the slots it keeps, and the old banks live until that copy retires
+/// (`Inner::prepare_pools`). Applied to every layer before any copy retires,
+/// a shrink meant to give memory back first held the whole tier twice: on
+/// Qwen3.8 Flash-Next at 326 slots, +26.5 GB for a 10-slot yield, past the
+/// working set, and the GPU timed out. `retire` (a queue wait on Metal, then
+/// the idle slots' residency release) runs
+/// after each layer that resized, so the next layer allocates only once this
+/// one's old banks are released, and the transient is one layer's banks.
+/// Returns the bytes the shrinks parked.
+pub fn resize_layers_one_at_a_time<'a, R: ExpertResidency + 'a>(
+    tiers: impl IntoIterator<Item = &'a R>,
+    wanted: usize,
+    floor: usize,
+    mut retire: impl FnMut() -> Result<()>,
+) -> Result<usize> {
+    let mut parked = 0usize;
+    for tier in tiers {
+        let active = tier.active_slots();
+        let resized = if wanted < active {
+            parked += tier.shrink_slots(wanted, floor)?;
+            true
+        } else if wanted > active {
+            tier.grow_slots(wanted)?;
+            true
+        } else {
+            false
+        };
+        if resized {
+            retire()?;
+        }
+    }
+    Ok(parked)
+}
+
 /// How a layer's routed experts are held and applied.
 ///
 /// The contract is the routed matmul's: the strategy receives the activation
@@ -6035,6 +6071,13 @@ impl ExpertResidency for Streamed {
     }
 }
 
+// The slot-grant control waits for the device between layers, so it lives
+// outside this file: `tests/qwen4exp_eviction_no_drain.rs` holds this file to
+// no device wait at all (#749, `DESIGN.md` §20.4a).
+#[cfg(all(test, feature = "metal"))]
+#[path = "expert_stream_grant_tests.rs"]
+mod grant_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6043,7 +6086,7 @@ mod tests {
     use objc2_metal::MTLResource as _;
 
     /// A stacked `[e, out, inp]` expert weight quantized to `dtype`.
-    fn stacked(e: usize, out: usize, inp: usize, seed: f32, dtype: GgmlDType) -> QTensor {
+    pub(super) fn stacked(e: usize, out: usize, inp: usize, seed: f32, dtype: GgmlDType) -> QTensor {
         let n = e * out * inp;
         let v: Vec<f32> = (0..n)
             .map(|i| ((i as f32 * 0.011 + seed).cos()) * 0.1)
@@ -6054,7 +6097,7 @@ mod tests {
 
     /// Write `tensors` to a fresh GGUF at a unique temp path (tests run in
     /// parallel in one process, so the pid alone would collide).
-    fn write_gguf(tensors: &[(&str, &QTensor)]) -> PathBuf {
+    pub(super) fn write_gguf(tensors: &[(&str, &QTensor)]) -> PathBuf {
         static SEQ: AtomicU64 = AtomicU64::new(0);
         let path = std::env::temp_dir().join(format!(
             "lloom-expert-stream-{}-{}.gguf",
@@ -6066,7 +6109,7 @@ mod tests {
         path
     }
 
-    fn open(path: &Path, name: &str) -> ExpertSource {
+    pub(super) fn open(path: &Path, name: &str) -> ExpertSource {
         let mut f = File::open(path).unwrap();
         let content = Content::read(&mut f).unwrap();
         ExpertSource::from_gguf(&content, path, name).unwrap()
@@ -8102,7 +8145,7 @@ mod tests {
     }
 
     #[cfg(feature = "metal")]
-    fn resize_control_device() -> Device {
+    pub(super) fn resize_control_device() -> Device {
         let dev = Device::new_metal(0).expect("native resize control requires Metal");
         let actual = dev
             .as_metal_device()

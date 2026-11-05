@@ -754,6 +754,62 @@ pub(crate) struct IdleRetention {
     pub extra_cbs: usize,
 }
 
+/// A collection's length and capacity (`SlotWitness`).
+#[cfg(test)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Extent {
+    pub len: usize,
+    pub capacity: usize,
+}
+#[cfg(test)]
+impl Extent {
+    fn of<T>(v: &Vec<T>) -> Self {
+        Self {
+            len: v.len(),
+            capacity: v.capacity(),
+        }
+    }
+}
+
+/// What one submission's own slot holds, read under its state lock (#944
+/// item 15): lengths, capacities and cursor positions, so a test can show an
+/// operation grew nothing (or exactly what). Test-only and read-only. The
+/// queue is an address for equality, never a handle; no object, capability
+/// or epoch leaves. It reads this slot only, never the pool: a later slot
+/// needs its own witness.
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SlotWitness {
+    pub queue: usize,
+    /// The queue's slots made and idle, read now.
+    pub allocated: usize,
+    pub available: usize,
+    pub generation: u64,
+    pub segment: usize,
+    /// The command buffer for `segment` exists.
+    pub segment_cb: bool,
+    pub resources: Extent,
+    pub pipelines: Extent,
+    pub fences: Extent,
+    pub seen: Extent,
+    pub namespaces: Extent,
+    pub extra_cbs: Extent,
+    pub feedback_handlers: Extent,
+    pub commit_options: Extent,
+    pub pages: Extent,
+    pub page_reservations: Extent,
+    pub used: Extent,
+    pub page: usize,
+    pub offset: usize,
+    pub pages_listed: usize,
+    /// The device sets' generation `used` was read at, and theirs now:
+    /// different means the next segment end assigns `used` afresh.
+    pub used_generation: u64,
+    pub natives_generation: Option<u64>,
+    pub declare: super::Metal4Declare,
+    pub diff: bool,
+}
+
 pub(super) struct Slot {
     generation: u64,
     cb: Retained<ProtocolObject<dyn MTL4CommandBuffer>>,
@@ -1237,6 +1293,57 @@ impl Submission {
 
     pub(super) fn notify_lifecycle(&self) {
         self.retirement.notify_lifecycle();
+    }
+
+    /// This submission's own slot, read under its state lock; `None` once
+    /// the slot has gone to the native side (`SlotWitness`).
+    #[cfg(test)]
+    pub(crate) fn slot_witness_for_test(&self) -> Option<SlotWitness> {
+        let state = self.state.lock();
+        let slot = state.slot.as_ref()?;
+        Some(SlotWitness {
+            queue: Arc::as_ptr(&self.queue) as usize,
+            allocated: self.queue.allocated.load(Ordering::Acquire),
+            available: self.queue.available.len(),
+            generation: slot.generation,
+            segment: slot.segment,
+            segment_cb: slot.segment <= slot.extra_cbs.len(),
+            resources: Extent::of(&slot.resources),
+            pipelines: Extent::of(&slot.pipelines),
+            fences: Extent::of(&slot.fences),
+            seen: Extent {
+                len: slot.seen.len(),
+                capacity: slot.seen.capacity(),
+            },
+            namespaces: Extent::of(&slot.namespaces),
+            extra_cbs: Extent::of(&slot.extra_cbs),
+            feedback_handlers: Extent::of(&slot.feedback_handlers),
+            commit_options: Extent::of(&slot.commit_options),
+            pages: Extent::of(&slot.pages),
+            page_reservations: Extent::of(&slot.page_reservations),
+            used: Extent::of(&slot.used),
+            page: slot.page,
+            offset: slot.offset,
+            pages_listed: slot.pages_listed,
+            used_generation: slot.used_generation,
+            natives_generation: slot.device.as_ref().map(|d| d.natives_generation()),
+            declare: self.queue.declare,
+            diff: slot.diff,
+        })
+    }
+
+    /// Whether this submission's own slot already retains `owner`
+    /// (`NamespaceOwner::same`). False once the slot has gone native.
+    #[cfg(test)]
+    pub(crate) fn slot_retains_namespace_for_test(
+        &self,
+        owner: &crate::metal_backend::device_retirement::NamespaceOwner,
+    ) -> bool {
+        self.state
+            .lock()
+            .slot
+            .as_ref()
+            .is_some_and(|slot| slot.namespaces.iter().any(|old| old.same(owner)))
     }
     pub(super) fn check_lifecycle_failure(&self) -> Result<(), MetalKernelError> {
         self.queue.check_failure()
@@ -2790,6 +2897,75 @@ mod tests {
             submission.commit().is_err(),
             "a submission missing a constant must not be committed"
         );
+    }
+
+    /// The slot witness reports what an operation grew and only that: a
+    /// constant takes one page and one listing, a buffer one more listing, a
+    /// repeat of either nothing; a retained namespace shows as retained
+    /// (#944 item 15).
+    #[test]
+    fn the_slot_witness_reports_what_an_operation_grew() -> crate::Result<()> {
+        let _pool = crate::AutoreleaseScope::new();
+        let device = Device::system_default().expect("Metal device");
+        if !device.as_ref().supportsFamily(MTLGPUFamily::Metal4) {
+            eprintln!("NOT_APPLICABLE needs Metal 4");
+            return Ok(());
+        }
+        let crate::Device::Metal(m) = crate::Device::new_metal(0)? else {
+            unreachable!("a Metal device")
+        };
+        let owner = m.allocation_namespace_anchor()?;
+        let queue = Queue::new(device.clone()).unwrap();
+        let submission = queue.acquire().unwrap();
+        let encoder = submission.encoder().unwrap();
+        let w0 = submission.slot_witness_for_test().expect("recording slot");
+        assert_eq!(w0.queue, Arc::as_ptr(&queue) as usize);
+        assert_eq!((w0.allocated, w0.available), (1, 0));
+        assert_eq!((w0.segment, w0.segment_cb), (0, true));
+        assert_eq!((w0.pages.len, w0.resources.len, w0.seen.len), (0, 0, 0));
+        // What `Slot::new` reserves: a capacity witness must report the
+        // capacity, not the length.
+        assert!(w0.resources.capacity >= 256, "{w0:?}");
+        assert!(w0.pipelines.capacity >= 64 && w0.fences.capacity >= 64, "{w0:?}");
+        assert!(w0.seen.capacity >= 512, "{w0:?}");
+
+        let word = 7u32;
+        // SAFETY: four live bytes, copied before the call returns.
+        unsafe { encoder.bytes(0, NonNull::from(&word).cast(), 4) };
+        let w1 = submission.slot_witness_for_test().unwrap();
+        assert_eq!(w1.pages.len, 1, "the first constant takes one page");
+        assert_eq!(w1.page_reservations.len, 0, "no ledger is attached");
+        assert_eq!((w1.page, w1.offset, w1.pages_listed), (0, 4, 1));
+        assert_eq!((w1.resources.len, w1.seen.len), (1, 1), "and one listing");
+
+        // SAFETY: as above.
+        unsafe { encoder.bytes(1, NonNull::from(&word).cast(), 4) };
+        let w2 = submission.slot_witness_for_test().unwrap();
+        assert_eq!(w2.pages, w1.pages, "a second constant in the page grows nothing");
+        assert_eq!((w2.resources, w2.seen), (w1.resources, w1.seen));
+        assert_eq!(w2.offset, 20, "16-byte aligned, then four bytes");
+
+        let dst = device
+            .as_ref()
+            .newBufferWithLength_options(256, MTLResourceOptions::StorageModeShared)
+            .unwrap();
+        encoder.buffer(2, Some(&dst), 0, DeviceListing::No);
+        encoder.buffer(3, Some(&dst), 0, DeviceListing::No);
+        let w3 = submission.slot_witness_for_test().unwrap();
+        assert_eq!(
+            (w3.resources.len, w3.seen.len),
+            (2, 2),
+            "a buffer bound twice is listed once"
+        );
+
+        assert!(!submission.slot_retains_namespace_for_test(&owner));
+        submission
+            .retain_namespace(owner.try_clone().unwrap())
+            .unwrap();
+        assert!(submission.slot_retains_namespace_for_test(&owner));
+        assert_eq!(submission.slot_witness_for_test().unwrap().namespaces.len, 1);
+        encoder.raw.endEncoding();
+        Ok(())
     }
 
     #[test]

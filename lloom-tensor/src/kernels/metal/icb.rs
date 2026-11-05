@@ -1955,7 +1955,20 @@ impl Executor for IcbExecutor {
     }
 
     fn abort_step(&self) {
-        self.inner.lock().detach_unissued();
+        let reset_positionals = {
+            let mut inner = self.inner.lock();
+            inner.detach_unissued();
+            !inner.step_failed
+        };
+        // Replay position and positional params start the same next window.
+        // Reset only after detaching, off Inner; keep a failed step poisoned.
+        // Like end_step, this assumes one positional executor stream per
+        // process: the enabled constants pool is process-global.
+        if reset_positionals {
+            if let Some(pool) = crate::kernels::kernels::params::constants_pool() {
+                pool.reset();
+            }
+        }
     }
 
     fn fail_step(&self) {
@@ -2225,6 +2238,16 @@ mod common_refusal_native_tests {
         assert_eq!(trace::execute_range_count(), ranges, "abort cleanup issued its abandoned prefix");
         metal.begin_decode_step();
         emit(f, false)?;
+        let fresh_pending = f.executor.inner.lock().pending.is_some();
+        let pool_counters = crate::kernels::constants_pool().expect("enabled packed pool").counters();
+        let stale = f.executor.stale_report();
+        let parameter_refs = {
+            let inner = f.executor.inner.lock();
+            inner.plan.as_ref().map(|plan| plan.layout.reference.iter().take(2)
+                .map(|dispatch| dispatch.bindings.iter().find(|b| b.index == 0).map(|b| b.ptr))
+                .collect::<Vec<_>>())
+        };
+        eprintln!("COMMON_ABORT_RESTART fresh_pending={fresh_pending} stale={stale:?} params={pool_counters:?} reference_param_ptrs={parameter_refs:?}");
         assert!(f.executor.inner.lock().pending.is_some(), "new window did not start a fresh run");
         emit(f, true)?;
         assert_eq!(trace::execute_range_count(), ranges + 1, "new window did not issue exactly once");

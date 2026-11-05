@@ -1405,7 +1405,9 @@ pub(crate) fn hold_in(hold: &mut Option<Tensor>, logits: Tensor) -> Result<Tenso
             h
         }
     };
-    h.slice_set(&logits, 0, 0)?;
+    if !std::ptr::eq(&*h, &*logits) {
+        h.slice_set(&logits, 0, 0)?;
+    }
     // Void native dispatch may have suppressed this last copy after a genuine
     // executor refusal, later than the pass's previous owner observation.
     // Query only: no executor window/end, cut, submission or wait is added.
@@ -5601,6 +5603,73 @@ mod held_copy_boundary_tests {
         // The explicit read is AFTER the no-boundary observation window.
         assert_eq!(copied.to_vec1::<f32>()?, vec![2.; 64]);
         metal.set_executor(Arc::new(ExecutorSlot::Classical));
+        Ok(())
+    }
+    #[test]
+    fn healthy_exact_held_owner_is_reused_without_a_native_self_copy() -> Result<()> {
+        let _pool = lloom_tensor::AutoreleaseScope::new();
+        let device = fixture()?;
+        let target = held(&device)?;
+        let probe = install(&device, &target, false)?;
+        let metal = device.as_metal_device()?;
+        let epoch = metal.gpu_clock().current_epoch();
+        let completions = metal.commands().completion_counts();
+        let mut slot = Some(target.clone());
+        let (result, raw) = observe_raw_dispatches_for_test(|| hold_in(&mut slot, target.clone()));
+        let result = result?;
+        assert!(std::ptr::eq(&*target, &*result), "exact held owner was replaced");
+        assert_eq!(raw, 0, "exact held owner entered a native self-copy");
+        assert_eq!(probe.hits.load(Ordering::Relaxed), 0);
+        assert_eq!(probe.accepted.load(Ordering::Relaxed), 0);
+        assert_eq!(probe.windows.load(Ordering::Relaxed), 0);
+        assert_eq!(metal.gpu_clock().current_epoch(), epoch);
+        assert_eq!(metal.commands().completion_counts(), completions);
+        assert_eq!(result.to_vec1::<f32>()?, vec![0.; 64]);
+        metal.set_executor(Arc::new(ExecutorSlot::Classical));
+        Ok(())
+    }
+    #[test]
+    fn exact_held_owner_still_refuses_a_genuinely_failed_recording() -> Result<()> {
+        let _pool = lloom_tensor::AutoreleaseScope::new();
+        let device = fixture()?;
+        let source = Tensor::from_slice(&[2f32; 64], 64, &device)?;
+        let target = held(&device)?;
+        let probe = install(&device, &target, true)?;
+        let _pins = RetainFailedPins(Some((device.clone(), source.clone(), target.clone(), probe.clone())));
+        let mut slot = Some(target.clone());
+        let (first, raw) = observe_raw_dispatches_for_test(|| hold_in(&mut slot, source));
+        assert!(first.is_err(), "genuine target copy refusal did not fail the recording");
+        assert_eq!(probe.refusals.load(Ordering::Relaxed), 1);
+        assert_eq!(raw, 0);
+        let (again, raw) = observe_raw_dispatches_for_test(|| hold_in(&mut slot, target.clone()));
+        assert!(again.is_err(), "already-held owner bypassed existing recording failure");
+        assert_eq!(raw, 0);
+        assert_eq!(probe.refusals.load(Ordering::Relaxed), 1,
+            "already-held route consulted executor instead of existing latch");
+        Ok(())
+    }
+    #[test]
+    fn different_held_view_keeps_existing_same_storage_refusal() -> Result<()> {
+        let _pool = lloom_tensor::AutoreleaseScope::new();
+        let device = fixture()?;
+        let target = held(&device)?;
+        // Contiguous reshape forms a distinct Tensor_ over the SAME storage,
+        // even when this exact shape is unchanged. It is not an owner clone.
+        let view = target.reshape(64)?;
+        assert!(!std::ptr::eq(&*target, &*view));
+        let probe = install(&device, &target, false)?;
+        let mut slot = Some(target.clone());
+        let (result, raw) = observe_raw_dispatches_for_test(|| hold_in(&mut slot, view));
+        let error = result.unwrap_err();
+        assert!(error.to_string().contains("cannot use slice_set when self and src share their storage"),
+            "different view bypassed the existing overlap refusal: {error}");
+        assert_eq!(raw, 0);
+        assert_eq!(probe.hits.load(Ordering::Relaxed), 0);
+        assert!(device.as_metal_device()?.check_recording_failure().is_ok(),
+            "ordinary host overlap refusal fabricated a queue failure");
+        assert!(std::ptr::eq(&*target, &**slot.as_ref().expect("retained hold")));
+        device.as_metal_device()?.flush_and_wait_current()?;
+        device.as_metal_device()?.set_executor(Arc::new(ExecutorSlot::Classical));
         Ok(())
     }
     #[test]

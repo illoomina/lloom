@@ -6071,6 +6071,13 @@ impl ExpertResidency for Streamed {
     }
 }
 
+// The slot-grant control waits for the device between layers, so it lives
+// outside this file: `tests/qwen4exp_eviction_no_drain.rs` holds this file to
+// no device wait at all (#749, `DESIGN.md` §20.4a).
+#[cfg(all(test, feature = "metal"))]
+#[path = "expert_stream_grant_tests.rs"]
+mod grant_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6079,7 +6086,7 @@ mod tests {
     use objc2_metal::MTLResource as _;
 
     /// A stacked `[e, out, inp]` expert weight quantized to `dtype`.
-    fn stacked(e: usize, out: usize, inp: usize, seed: f32, dtype: GgmlDType) -> QTensor {
+    pub(super) fn stacked(e: usize, out: usize, inp: usize, seed: f32, dtype: GgmlDType) -> QTensor {
         let n = e * out * inp;
         let v: Vec<f32> = (0..n)
             .map(|i| ((i as f32 * 0.011 + seed).cos()) * 0.1)
@@ -6090,7 +6097,7 @@ mod tests {
 
     /// Write `tensors` to a fresh GGUF at a unique temp path (tests run in
     /// parallel in one process, so the pid alone would collide).
-    fn write_gguf(tensors: &[(&str, &QTensor)]) -> PathBuf {
+    pub(super) fn write_gguf(tensors: &[(&str, &QTensor)]) -> PathBuf {
         static SEQ: AtomicU64 = AtomicU64::new(0);
         let path = std::env::temp_dir().join(format!(
             "lloom-expert-stream-{}-{}.gguf",
@@ -6102,7 +6109,7 @@ mod tests {
         path
     }
 
-    fn open(path: &Path, name: &str) -> ExpertSource {
+    pub(super) fn open(path: &Path, name: &str) -> ExpertSource {
         let mut f = File::open(path).unwrap();
         let content = Content::read(&mut f).unwrap();
         ExpertSource::from_gguf(&content, path, name).unwrap()
@@ -8138,7 +8145,7 @@ mod tests {
     }
 
     #[cfg(feature = "metal")]
-    fn resize_control_device() -> Device {
+    pub(super) fn resize_control_device() -> Device {
         let dev = Device::new_metal(0).expect("native resize control requires Metal");
         let actual = dev
             .as_metal_device()
@@ -8475,71 +8482,6 @@ mod tests {
             }
             std::fs::remove_file(path).unwrap();
         }
-    }
-
-    /// A grant shrinking several tiers holds one layer's old and new banks at
-    /// a time, not the whole tier twice (#944 item 13). The device's
-    /// allocated bytes are read inside `retire`, right after each layer's
-    /// resize allocated its replacement and before its old banks retire: the
-    /// peak the serve path reached. With the retirement waits the excess over
-    /// the start stays within two layers' replacements (the one just made,
-    /// and Metal's slack); without them it grows by one layer per layer.
-    #[cfg(feature = "metal")]
-    #[test]
-    fn a_slot_grant_holds_one_layers_replacement_banks_at_a_time() {
-        const LAYERS: usize = 6;
-        const SLOTS: usize = 12;
-        const WANTED: usize = 10;
-        let dev = resize_control_device();
-        let m = dev.as_metal_device().unwrap();
-        // 16 experts of 256 x 256 f32 (256 KiB each): a pool of 12 slots is
-        // 3 MiB per projection, 9 MiB per layer.
-        let gate = stacked(16, 256, 256, 1.0, GgmlDType::F32);
-        let up = stacked(16, 256, 256, 2.0, GgmlDType::F32);
-        let down = stacked(16, 256, 256, 3.0, GgmlDType::F32);
-        let path = write_gguf(&[("g", &gate), ("u", &up), ("d", &down)]);
-        let tiers: Vec<Streamed> = (0..LAYERS)
-            .map(|_| {
-                Streamed::new(
-                    open(&path, "g"),
-                    open(&path, "u"),
-                    open(&path, "d"),
-                    SLOTS,
-                    LoaderArm::Pread,
-                    &dev,
-                )
-                .unwrap()
-            })
-            .collect();
-        m.wait_until_completed().unwrap();
-        let replacement = 3 * WANTED * 256 * 256 * 4; // one layer's new banks
-        let start = m.device().current_allocated_size();
-        let mut excess = Vec::new();
-        let parked = resize_layers_one_at_a_time(tiers.iter(), WANTED, 1, || {
-            excess.push(m.device().current_allocated_size().saturating_sub(start));
-            m.wait_until_completed()?;
-            m.commands().release_idle_slot_residency();
-            Ok(())
-        })
-        .unwrap();
-        m.wait_until_completed().unwrap();
-        let after = m.device().current_allocated_size();
-        let peak = *excess.iter().max().unwrap();
-        eprintln!(
-            "SLOT_GRANT layers={LAYERS} slots={SLOTS}->{WANTED} replacement_per_layer={replacement} \
-             start={start} excess_per_layer={excess:?} peak_excess={peak} after={after} parked={parked} api={}",
-            m.commands().actual_command_api()
-        );
-        assert_eq!(excess.len(), LAYERS, "every layer resized");
-        assert!(
-            peak <= 2 * replacement,
-            "a slot grant held {peak} B over its start, more than two layers' \
-             replacements ({replacement} B each): {excess:?}"
-        );
-        assert!(
-            after < start,
-            "the grant gave nothing back: start {start} B, after {after} B"
-        );
     }
 
     #[cfg(feature = "metal")]

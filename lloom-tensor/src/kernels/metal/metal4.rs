@@ -2200,6 +2200,53 @@ mod tests {
         );
     }
 
+    /// The same on the queue a `MetalDevice` builds, whose buffers belong to
+    /// an allocation namespace and whose command buffers carry a binding
+    /// generation: an idle slot holds no namespace owner and no generation
+    /// head either (#944 item 14).
+    #[test]
+    fn a_metal_device_slot_returns_without_namespace_owners_or_generation_head(
+    ) -> crate::Result<()> {
+        let crate::Device::Metal(m) = crate::Device::new_metal(0)? else {
+            unreachable!("a Metal device")
+        };
+        let commands = m.commands().clone();
+        if commands.actual_command_api() != "metal4" {
+            eprintln!("NOT_APPLICABLE needs actual Metal 4");
+            return Ok(());
+        }
+        let dev = crate::Device::Metal(m.clone());
+        let mut seen = IdleRetention::default();
+        let mut peak = IdleRetention::default();
+        for i in 0..(2 * SLOTS) {
+            let t = crate::Tensor::arange(0f32, 1024f32, &dev)?;
+            let total = ((&t * 2.0)? + 1.0)?.sum_all()?.to_vec0::<f32>()?;
+            assert_eq!(total, 1024.0 * 1023.0 + 1024.0, "the dispatch computed");
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            loop {
+                seen = commands.metal4_idle_retention().expect("Metal 4 queue");
+                peak.references = peak.references.max(seen.references);
+                peak.namespaces = peak.namespaces.max(seen.namespaces);
+                peak.bindings = peak.bindings.max(seen.bindings);
+                if seen.slots > 0
+                    && (seen.references, seen.namespaces, seen.bindings) == (0, 0, 0)
+                    || std::time::Instant::now() > deadline
+                {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            eprintln!("DEVICE_IDLE_RETENTION commit={i} {seen:?} peak={peak:?}");
+        }
+        assert!(seen.slots > 0, "no slot returned to the pool: {seen:?}");
+        assert_eq!(
+            (seen.references, seen.namespaces, seen.bindings),
+            (0, 0, 0),
+            "an idle slot still holds its completed generation: {seen:?}"
+        );
+        Ok(())
+    }
+
     // CPU-only: deliberately stop between feedback initialization and terminal
     // publication, without constructing a native Device or relying on a race.
     #[test]

@@ -92,6 +92,7 @@ mod page_cache_probe;
 mod pass_body_failure;
 mod pass_entry_failure;
 mod pinned_prefix;
+mod planned_walk_order;
 mod pos_embed_resample_tests;
 mod prefill_window_gemm;
 mod prepare_path;

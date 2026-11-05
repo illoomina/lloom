@@ -94,6 +94,10 @@ name = "metal_commit_alloc_free"
 path = "tests/metal_commit_alloc_free.rs"
 
 [[test]]
+name = "metal_heap_census"
+path = "tests/metal_heap_census.rs"
+
+[[test]]
 name = "allocation_refusal_alloc_free"
 path = "tests/allocation_refusal_alloc_free.rs"
 

@@ -552,7 +552,7 @@ fn every_flash_pipeline_admits_its_dispatch_width() {
             ];
             for (name, width) in cells {
                 let pipeline = kernels
-                    .load_pipeline(&device, Source::FlashDecoding, name.clone())
+                    .load_pipeline(&device, Source::FlashDecoding, name)
                     .unwrap();
                 let max = pipeline.max_total_threads_per_threadgroup();
                 println!("{name}: maxTotalThreadsPerThreadgroup {max}, dispatched at {width}");

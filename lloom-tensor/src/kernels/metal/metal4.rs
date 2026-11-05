@@ -781,6 +781,11 @@ pub(super) struct Slot {
     page_reservations: Vec<super::ledger::Reservation>,
     page: usize,
     offset: usize,
+    /// Pages `0..pages_listed` are already listed in this generation's
+    /// residency set and retained in `resources` (#944 item 15). A
+    /// generation's cursor only moves forward through `pages`, so one
+    /// watermark replaces the `seen` probe every inline constant used to make.
+    pages_listed: usize,
     /// One feedback handler per segment index, built once and kept across
     /// this slot's uses (#944 item 7). Metal copies a heap block by
     /// retaining it (§13.5x). The handlers read which commit they report from
@@ -856,6 +861,7 @@ impl Slot {
             page_reservations: Vec::new(),
             page: 0,
             offset: 0,
+            pages_listed: 0,
             feedback_handlers: Vec::new(),
             commit_options: Vec::new(),
             feedback: Arc::new(SlotFeedback::default()),
@@ -936,6 +942,9 @@ impl Slot {
         self.pipelines.clear();
         self.fences.clear();
         self.seen.clear();
+        // The listing went with the set's allocations: the next generation
+        // lists its pages again, the first time it writes each.
+        self.pages_listed = 0;
         for index in 0..31 {
             // SAFETY: table was allocated with 31 buffer bindings.
             unsafe {
@@ -992,30 +1001,74 @@ impl Slot {
         listing: super::DeviceListing,
         kind: BindKind,
     ) {
+        Self::list(
+            &mut self.seen,
+            &mut self.resources,
+            &self.residency,
+            &self.trace,
+            self.diff,
+            resource,
+            listing,
+            kind,
+        );
+    }
+
+    /// Lists scratch page `index` the first time this generation writes it:
+    /// the same listing `resource` makes, without its `seen` probe on every
+    /// later constant in the page (#944 item 15).
+    fn list_page(&mut self, index: usize) {
+        if index < self.pages_listed {
+            return;
+        }
+        let page = &self.pages[index];
+        Self::list(
+            &mut self.seen,
+            &mut self.resources,
+            &self.residency,
+            &self.trace,
+            self.diff,
+            ProtocolObject::from_ref(&**page),
+            super::DeviceListing::No,
+            BindKind::Page,
+        );
+        self.pages_listed = index + 1;
+    }
+
+    /// `resource`'s body over the fields it touches, so a page can be listed
+    /// while `pages` is borrowed.
+    #[allow(clippy::too_many_arguments)]
+    fn list(
+        seen: &mut HashSet<usize>,
+        resources: &mut Vec<Retained<ProtocolObject<dyn MTLResource>>>,
+        residency: &ProtocolObject<dyn MTLResidencySet>,
+        trace: &SlotTrace,
+        diff: bool,
+        resource: &ProtocolObject<dyn MTLResource>,
+        listing: super::DeviceListing,
+        kind: BindKind,
+    ) {
         let covered = listing.covered();
-        if self.seen.insert(resource as *const _ as usize) {
-            if self.trace.on {
-                self.trace.census(resource, listing, kind);
+        if seen.insert(resource as *const _ as usize) {
+            if trace.on {
+                trace.census(resource, listing, kind);
             }
             // SAFETY: the caller's borrowed resource is live; the retained
             // reference remains until this slot completes.
-            self.resources.push(
+            resources.push(
                 unsafe { Retained::retain(std::ptr::from_ref(resource).cast_mut()) }.unwrap(),
             );
-            if covered && self.diff {
-                if self.trace.on {
-                    self.trace.covered.fetch_add(1, Ordering::Relaxed);
+            if covered && diff {
+                if trace.on {
+                    trace.covered.fetch_add(1, Ordering::Relaxed);
                 }
-            } else if self.trace.on {
+            } else if trace.on {
                 let start = std::time::Instant::now();
-                self.residency
-                    .addAllocation(ProtocolObject::from_ref(resource));
+                residency.addAllocation(ProtocolObject::from_ref(resource));
                 let ns = start.elapsed().as_nanos() as u64;
-                self.trace.adds.fetch_add(1, Ordering::Relaxed);
-                self.trace.add_ns.fetch_add(ns, Ordering::Relaxed);
+                trace.adds.fetch_add(1, Ordering::Relaxed);
+                trace.add_ns.fetch_add(ns, Ordering::Relaxed);
             } else {
-                self.residency
-                    .addAllocation(ProtocolObject::from_ref(resource));
+                residency.addAllocation(ProtocolObject::from_ref(resource));
             }
         }
     }
@@ -2099,23 +2152,46 @@ impl Encoder {
             slot.offset = 0;
         }
         if slot.page == slot.pages.len() {
-            let page = self
+            let requested = PAGE_BYTES.max(length);
+            let ledger = self.submission.queue.ledger.get();
+            // Reserved BEFORE the page is born (#944 item 15): the ledger
+            // never understates what the process holds, not even between the
+            // native allocation and its accounting.
+            let requested_reservation = ledger.map(|l| l.reserve(requested));
+            let Some(page) = self
                 .submission
                 .queue
                 .device
                 .as_ref()
-                .newBufferWithLength_options(
-                    PAGE_BYTES.max(length),
-                    MTLResourceOptions::StorageModeShared,
-                )
-                .expect("MTL4 constant upload page");
-            if let Some(ledger) = self.submission.queue.ledger.get() {
+                .newBufferWithLength_options(requested, MTLResourceOptions::StorageModeShared)
+            else {
+                // The native allocation was refused. This used to panic, and
+                // the release profile aborts on panic. The queue fails
+                // instead: `prepare_commit` refuses this submission, so the
+                // dispatch the constant was for is never committed, and every
+                // later admission reads the failure. The reservation goes
+                // with the page that was never born.
+                drop(requested_reservation);
+                self.submission
+                    .queue
+                    .poison(crate::retirement_owners::Failure::AdapterFailed);
+                return;
+            };
+            if let Some(ledger) = ledger {
+                // The page is accounted at the size Metal allocated, as it
+                // always was. That reservation is taken before the requested
+                // one is released, so the count never dips below either.
                 slot.page_reservations
                     .push(ledger.reserve(MTLAllocation::allocatedSize(&*page)));
+                drop(requested_reservation);
             }
             slot.pages.push(page);
         }
-        let page = slot.pages[slot.page].clone();
+        let at = slot.page;
+        slot.list_page(at);
+        // Borrowed, not cloned: the slot owns its pages for its lifetime, so
+        // an inline constant no longer costs a retain and a release.
+        let page = &slot.pages[at];
         unsafe {
             std::ptr::copy_nonoverlapping(
                 bytes.as_ptr().cast::<u8>(),
@@ -2123,11 +2199,6 @@ impl Encoder {
                 length,
             );
         }
-        slot.resource(
-            ProtocolObject::from_ref(&*page),
-            super::DeviceListing::No,
-            BindKind::Page,
-        );
         unsafe {
             slot.table
                 .setAddress_atIndex(page.gpuAddress() + slot.offset as u64, index);
@@ -2645,6 +2716,80 @@ mod tests {
         drop(slot);
         println!("MTL4_FULL_POOL slots={} ninth_acquire_blocked=true feedback_unblocked=true acquire_parks={}",
             SLOTS, queue.acquire_parks.load(Ordering::Relaxed));
+    }
+
+    /// A scratch page is listed in the residency set the first time a
+    /// generation writes it, and only then. The release clears the listing,
+    /// and the next generation lists the page again (#944 item 15).
+    #[test]
+    fn a_scratch_page_is_listed_once_per_generation_and_again_after_the_release() {
+        let _pool = crate::AutoreleaseScope::new();
+        let device = Device::system_default().expect("Metal device");
+        if !device.as_ref().supportsFamily(MTLGPUFamily::Metal4) {
+            eprintln!("NOT_APPLICABLE needs Metal 4");
+            return;
+        }
+        let queue = Queue::new(device.clone()).unwrap();
+        let mut slot = Slot::new(&queue).unwrap();
+        let page = device
+            .as_ref()
+            .newBufferWithLength_options(PAGE_BYTES, MTLResourceOptions::StorageModeShared)
+            .unwrap();
+        let page_ptr = &*page as *const ProtocolObject<dyn MTLBuffer> as usize;
+        slot.pages.push(page);
+        for _ in 0..3 {
+            slot.list_page(0);
+        }
+        assert_eq!(slot.pages_listed, 1);
+        assert_eq!(slot.resources.len(), 1, "a page is retained once per generation");
+        assert!(slot.seen.contains(&page_ptr));
+        assert_eq!(slot.residency.allocationCount(), 1, "and listed once");
+        slot.release_cached_references();
+        assert_eq!(slot.pages_listed, 0, "the release clears the listing");
+        assert!(slot.resources.is_empty());
+        slot.list_page(0);
+        assert_eq!(
+            slot.resources.len(),
+            1,
+            "the next generation must list the page again or the GPU reads an unlisted buffer"
+        );
+        assert!(slot.seen.contains(&page_ptr));
+    }
+
+    /// A constant page Metal refuses to allocate fails the queue and leaves the
+    /// ledger where it was. It used to panic, which aborts a release build.
+    /// The submission it was for is never committed (#944 item 15).
+    #[test]
+    fn a_refused_constant_page_fails_the_queue_and_leaves_the_ledger_unchanged() {
+        let _pool = crate::AutoreleaseScope::new();
+        let device = Device::system_default().expect("Metal device");
+        if !device.as_ref().supportsFamily(MTLGPUFamily::Metal4) {
+            eprintln!("NOT_APPLICABLE needs Metal 4");
+            return;
+        }
+        let queue = Queue::new(device.clone()).unwrap();
+        let ledger = super::super::ledger::Ledger::new();
+        queue.attach_ledger(ledger.clone());
+        let before = ledger.committed();
+        let submission = queue.acquire().unwrap();
+        let encoder = submission.encoder().unwrap();
+        let too_large = device.as_ref().maxBufferLength() + 1;
+        let byte = 0u8;
+        // SAFETY: the refused allocation returns before any byte is read.
+        unsafe {
+            encoder.bytes(0, NonNull::from(&byte).cast(), too_large);
+        }
+        assert_eq!(
+            ledger.committed(),
+            before,
+            "the reservation taken before the refused birth must be released"
+        );
+        assert!(queue.check_failure().is_err(), "the refusal fails the queue");
+        encoder.raw.endEncoding();
+        assert!(
+            submission.commit().is_err(),
+            "a submission missing a constant must not be committed"
+        );
     }
 
     #[test]

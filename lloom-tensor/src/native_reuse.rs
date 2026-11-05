@@ -150,6 +150,12 @@ pub(crate) struct ReuseRelease<'a, T> {
     value: Option<T>,
 }
 impl<T> ReuseRelease<'_, T> {
+    /// Work on the extracted value before the sink takes it. The token keeps
+    /// owning the value throughout, so an unwind out of `f` restores it to
+    /// the gate (this token's Drop), the same custody a rejected push keeps.
+    pub(crate) fn prepare(&mut self, f: impl FnOnce(&mut T)) {
+        f(self.value.as_mut().expect("unique extraction token"));
+    }
     /// Adapter sink must be its non-panicking available-pool push only, not an
     /// arbitrary callback. A panic inside sink can destroy T on that stack;
     /// this helper does not promise unwind custody across arbitrary consuming code.

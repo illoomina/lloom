@@ -158,6 +158,31 @@ impl Queue {
         Ok(())
     }
 
+    /// What the idle slots in the available pool still hold, read by
+    /// taking each out and putting it back. Test-only: nothing may acquire
+    /// meanwhile.
+    #[cfg(test)]
+    pub(super) fn idle_retention(&self) -> IdleRetention {
+        let mut slots = Vec::new();
+        while let Some(slot) = self.available.pop() {
+            slots.push(slot);
+        }
+        let mut r = IdleRetention {
+            slots: slots.len(),
+            ..IdleRetention::default()
+        };
+        for slot in &slots {
+            r.references += slot.resources.len() + slot.pipelines.len() + slot.fences.len();
+            r.namespaces += slot.namespaces.len();
+            r.bindings += usize::from(slot.bindings.is_some());
+            r.extra_cbs += slot.extra_cbs.len();
+        }
+        for slot in slots {
+            assert!(self.available.push(slot).is_ok(), "idle slot put back");
+        }
+        r
+    }
+
     pub(super) fn discard_retirement_slot(&self, slot: Slot) {
         drop(slot);
         self.allocated.fetch_sub(1, Ordering::AcqRel);
@@ -689,6 +714,19 @@ impl SlotFeedback {
     }
 }
 
+/// What a queue's idle slots retain (`Queue::idle_retention`).
+#[cfg(test)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct IdleRetention {
+    pub slots: usize,
+    /// Retained resources, pipelines and fences.
+    pub references: usize,
+    pub namespaces: usize,
+    pub bindings: usize,
+    /// Native segment CBs kept for reuse (must survive the release).
+    pub extra_cbs: usize,
+}
+
 pub(super) struct Slot {
     generation: u64,
     cb: Retained<ProtocolObject<dyn MTL4CommandBuffer>>,
@@ -717,16 +755,12 @@ pub(super) struct Slot {
     page: usize,
     offset: usize,
     /// One feedback handler per segment index, built once and kept across
-    /// this slot's uses: a commit adds it to its fresh options instead of
-    /// building a block each time (#944 item 7). Metal copies a heap block by
+    /// this slot's uses (#944 item 7). Metal copies a heap block by
     /// retaining it (§13.5x). The handlers read which commit they report from
-    /// `feedback`, armed before each native commit. The options themselves
-    /// cannot be reused: Metal 4 reports a reused `MTL4CommitOptions`'
-    /// handler for its first commit only (measured: the third commit on a
-    /// two-slot rotation never reported, `commits_beyond_the_slot_count`).
+    /// `feedback`, armed before each native commit.
     feedback_handlers: Vec<FeedbackBlock>,
-    /// Variant (options reuse): one options object per segment index, kept
-    /// across this slot's uses, its handler added again before every commit.
+    /// One options object per segment index, kept across this slot's uses,
+    /// its handler added again right before every native commit.
     /// Measured: Metal 4 reports an options object's handler once per commit
     /// and then drops it, so a kept object needs its handler re-added and
     /// reports exactly once (`commits_beyond_the_slot_count`). Undocumented:
@@ -831,22 +865,38 @@ impl Slot {
             .generation
             .checked_add(1)
             .expect("MTL4 generation exhausted");
+        // Already done at return for a slot that completed (#944 item 14); a
+        // no-op on the cleared vectors then, kept here for every other path
+        // to a reset.
+        self.release_cached_references();
+        self.page = 0;
+        self.offset = 0;
+        self.allocator.reset();
+        self.segment = 0;
+        self.cb.beginCommandBufferWithAllocator(&self.allocator);
+    }
+
+    /// Drop the completed generation's cached references: its residency
+    /// listing, the resources, pipelines and fences it retained, its
+    /// namespace owners and, last, its generation head. Called when the slot
+    /// returns to the available pool after both-sided completion, so an idle
+    /// slot holds no model's memory (#944 item 14), and again from `reset`.
+    /// What the slot reuses stays: its CBs, allocator, table, persistent
+    /// scratch pages and their reservations, the vectors' capacity, the
+    /// feedback handlers and options. The generation, allocator and CB begin
+    /// stay with `reset`, at acquire.
+    fn release_cached_references(&mut self) {
         self.residency.removeAllAllocations();
         self.resources.clear();
         self.pipelines.clear();
         self.fences.clear();
         self.seen.clear();
-        self.page = 0;
-        self.offset = 0;
         for index in 0..31 {
             // SAFETY: table was allocated with 31 buffer bindings.
             unsafe {
                 self.table.setAddress_atIndex(0, index);
             }
         }
-        self.allocator.reset();
-        self.segment = 0;
-        self.cb.beginCommandBufferWithAllocator(&self.allocator);
         // Native cached references of the prior generation were cleared/reset.
         // Persistent scratch pages retain their own native reservation owners.
         self.namespaces.clear();
@@ -1533,6 +1583,12 @@ impl Submission {
                 return;
             }
         }
+        let mut ready = ready;
+        // The completed generation's references go before the slot idles in
+        // the pool, not at its next acquire (#944 item 14). Outside the sink,
+        // whose contract is the push alone: an unwind here leaves the token
+        // owning the slot, and its Drop restores it to the gate.
+        ready.prepare(Slot::release_cached_references);
         if ready
             .release(|slot| self.queue.return_retirement_slot(slot))
             .is_err()
@@ -2099,6 +2155,51 @@ mod tests {
             assert!(got.is_ok(), "commit {i} never completed (handler calls {before}->{after})");
         }
     }
+    /// A slot that completed goes back to the pool without the completed
+    /// generation's references (#944 item 14): nothing idles holding a
+    /// model's buffers, pipelines, namespace owners or generation head until
+    /// the slot's next acquire. What it reuses stays.
+    #[test]
+    fn a_returned_slot_holds_no_completed_generation_references() {
+        let native = super::super::Device::system_default().unwrap();
+        let queue = native.new_command_queue().unwrap();
+        let residency = Arc::new(super::super::ResidencySet::new(&native));
+        let commands = Arc::new(super::super::Commands::new(queue, residency).unwrap());
+        if commands.actual_command_api() != "metal4" {
+            eprintln!("NOT_APPLICABLE needs actual Metal 4");
+            return;
+        }
+        let dst = native
+            .new_buffer(4096, super::super::MTLResourceOptions::StorageModeShared)
+            .unwrap();
+        let mut seen = IdleRetention::default();
+        for i in 0..SLOTS {
+            {
+                let mut blit = commands.blit_command_encoder().unwrap();
+                // SAFETY: the test owns this Shared buffer; nothing reads it.
+                unsafe { blit.fill_buffer(&dst, (0, 4096), i as u8) }.unwrap();
+            }
+            commands.flush_and_wait().unwrap();
+            // The release follows both sides' publication, which can trail
+            // the wait by the handoff's return: give it a bounded moment.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            loop {
+                seen = commands.metal4_idle_retention().unwrap();
+                if seen.slots > 0 && seen.references == 0 || std::time::Instant::now() > deadline {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            eprintln!("IDLE_RETENTION commit={i} {seen:?}");
+        }
+        assert!(seen.slots > 0, "no slot returned to the pool: {seen:?}");
+        assert_eq!(
+            (seen.references, seen.namespaces, seen.bindings),
+            (0, 0, 0),
+            "an idle slot still holds its completed generation: {seen:?}"
+        );
+    }
+
     // CPU-only: deliberately stop between feedback initialization and terminal
     // publication, without constructing a native Device or relying on a race.
     #[test]

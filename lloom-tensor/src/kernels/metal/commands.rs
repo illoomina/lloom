@@ -1413,6 +1413,13 @@ impl Commands {
         self.core.modern_queue.as_ref()?.slot_residency()
     }
 
+    /// What the Metal 4 queue's idle slots still hold (#944 item 14);
+    /// `None` on Metal 3.
+    #[cfg(test)]
+    pub(crate) fn metal4_idle_retention(&self) -> Option<super::metal4::IdleRetention> {
+        Some(self.core.modern_queue.as_ref()?.idle_retention())
+    }
+
     /// The Metal 4 slot census by listing site
     /// (`kernels.residency.slot_trace`); empty on Metal 3 or with the
     /// instrument off.

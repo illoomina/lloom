@@ -129,6 +129,11 @@ pub(crate) mod membership;
 /// Deliberately **not** in the glob re-export below: `poison` and `counters`
 /// are general names, and a caller reaching for them should say `poison::`
 /// rather than acquire them from a `metal::*`.
+/// A planned pass's command list and its encoder
+/// (`design/docs/planned-step-design.md` §6).
+pub mod plan;
+#[cfg(test)]
+mod plan_gpu_tests;
 pub mod poison;
 pub mod profile;
 #[cfg(test)]

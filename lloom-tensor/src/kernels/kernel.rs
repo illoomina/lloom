@@ -88,9 +88,13 @@ type Libraries = HashMap<LibraryKey, Library>;
 /// gate is its own field, `Some` only for a gated source, and is appended to
 /// the constants only when a pipeline is BUILT (`with_gate_constant`): a
 /// lookup then builds no key-side `Vec` (#1235 step 1: 251 allocations a
-/// served LFM2 token). The key is in one-to-one correspondence with the
-/// merged `(constants ++ gate)` it replaced, so the cache holds the same
-/// variants.
+/// served LFM2 token). The merged `(constants ++ gate)` it replaced made no
+/// constants and an empty set the same key for a gated source, since both
+/// merge to the gate alone; `pipeline_key` keeps that by taking an empty set
+/// as `None` there (#1235 step 1c). With that, the key is in one-to-one
+/// correspondence with the merged constants, so the cache holds the same
+/// variants. An ungated source's two spellings were two keys before and stay
+/// two.
 type Pipelines =
     HashMap<(Source, KernelName, Option<ConstantValues>, Option<bool>), ComputePipeline>;
 
@@ -235,6 +239,22 @@ impl Kernels {
         Some(ConstantValues::new(values))
     }
 
+    /// The cache key for a pipeline: for a gated source an empty constant set
+    /// is `None`, since both build the gate's constant alone (`Pipelines`).
+    /// A length check, no `Vec` built.
+    fn pipeline_key(
+        source: Source,
+        name: KernelName,
+        constants: Option<ConstantValues>,
+        gate: Option<bool>,
+    ) -> (Source, KernelName, Option<ConstantValues>, Option<bool>) {
+        let constants = match constants {
+            Some(c) if gate.is_some() && c.values().is_empty() => None,
+            other => other,
+        };
+        (source, name, constants, gate)
+    }
+
     /// The gate's value for a pipeline of `source` loaded now: `None` for a
     /// source that carries no gated kernel, else whether this load takes the
     /// gated variant ([`Self::gated_here`]).
@@ -361,7 +381,7 @@ impl Kernels {
         name: impl Into<KernelName>,
         constants: Option<ConstantValues>,
     ) -> Result<ComputePipeline, MetalKernelError> {
-        let key = (source, name.into(), constants, self.gate_for(source));
+        let key = Self::pipeline_key(source, name.into(), constants, self.gate_for(source));
         if let Some(pipeline) = self.pipelines.read().get(&key) {
             return Ok(pipeline.clone());
         }
@@ -628,6 +648,40 @@ pub(crate) fn get_compile_options() -> Retained<MTLCompileOptions> {
 mod tests {
     use super::*;
     use std::sync::Barrier;
+
+    /// A gated source's pipeline asked for with no constants and with an
+    /// empty set is one cache entry and one pipeline, as it was when the key
+    /// was the merged constants. An ungated source keeps its two keys
+    /// (#1235 step 1c).
+    #[test]
+    fn a_gated_source_with_empty_constants_is_the_no_constants_pipeline() {
+        let device = Device::system_default().unwrap();
+        let kernels = Kernels::new();
+        assert!(kernels.gate_for(Source::Unary).is_some(), "Unary is a gated source");
+        let none = kernels
+            .load_pipeline_with_constants(&device, Source::Unary, "cos_f32", None)
+            .unwrap();
+        let (_, before) = kernels.cache_sizes();
+        let empty = kernels
+            .load_pipeline_with_constants(
+                &device,
+                Source::Unary,
+                "cos_f32",
+                Some(ConstantValues::new(vec![])),
+            )
+            .unwrap();
+        assert_eq!(
+            kernels.cache_sizes().1,
+            before,
+            "an empty constant set must not build a second pipeline for a gated source"
+        );
+        assert!(std::ptr::eq(none.as_ref(), empty.as_ref()));
+        let ungated = (Source::Sdpa, KernelName::Ref("k"), Some(ConstantValues::new(vec![])));
+        assert!(
+            Kernels::pipeline_key(ungated.0, ungated.1, ungated.2, None).2.is_some(),
+            "an ungated source's empty set stays its own key"
+        );
+    }
 
     #[test]
     fn concurrent_cache_loads_insert_once() {

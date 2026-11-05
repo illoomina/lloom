@@ -886,7 +886,18 @@ impl Slot {
     /// feedback handlers and options. The generation, allocator and CB begin
     /// stay with `reset`, at acquire.
     fn release_cached_references(&mut self) {
+        // The set keeps what it lists until a removal is committed, so an
+        // uncommitted removal still pins every buffer the generation listed:
+        // Metal frees none of them until the slot's next use commits its set
+        // (measured, #944 item 13: a replaced expert bank stayed allocated
+        // while its slot idled). Commit the removal here when the set listed
+        // anything; a set that listed nothing (the device's sets covered
+        // every binding) costs no commit.
+        let listed = self.residency.allocationCount();
         self.residency.removeAllAllocations();
+        if listed > 0 {
+            self.residency.commit();
+        }
         self.resources.clear();
         self.pipelines.clear();
         self.fences.clear();
@@ -2197,6 +2208,49 @@ mod tests {
             (seen.references, seen.namespaces, seen.bindings),
             (0, 0, 0),
             "an idle slot still holds its completed generation: {seen:?}"
+        );
+    }
+
+    /// A buffer a completed generation listed, dropped by its owner, is
+    /// freed by Metal once its slot returns, not when the slot is next used
+    /// (#944 items 13, 14): the slot's residency set no longer pins it.
+    #[test]
+    fn a_returned_slot_lets_metal_free_a_buffer_its_generation_listed() {
+        let native = super::super::Device::system_default().unwrap();
+        let queue = native.new_command_queue().unwrap();
+        let residency = Arc::new(super::super::ResidencySet::new(&native));
+        let commands = Arc::new(super::super::Commands::new(queue, residency).unwrap());
+        if commands.actual_command_api() != "metal4" {
+            eprintln!("NOT_APPLICABLE needs actual Metal 4");
+            return;
+        }
+        const BYTES: usize = 64 << 20;
+        commands.flush_and_wait().unwrap();
+        let start = native.current_allocated_size();
+        {
+            let big = native
+                .new_buffer(BYTES, super::super::MTLResourceOptions::StorageModeShared)
+                .unwrap();
+            {
+                let mut blit = commands.blit_command_encoder().unwrap();
+                // SAFETY: the test owns this Shared buffer; nothing reads it.
+                unsafe { blit.fill_buffer(&big, (0, 4096), 7) }.unwrap();
+            }
+            commands.flush_and_wait().unwrap();
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut now = native.current_allocated_size();
+        while now >= start + BYTES / 2 && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            now = native.current_allocated_size();
+        }
+        eprintln!(
+            "IDLE_SLOT_FREE start={start} after={now} buffer={BYTES} retention={:?}",
+            commands.metal4_idle_retention()
+        );
+        assert!(
+            now < start + BYTES / 2,
+            "a dropped {BYTES} B buffer stayed allocated while its slot idled: {start} -> {now} B"
         );
     }
 

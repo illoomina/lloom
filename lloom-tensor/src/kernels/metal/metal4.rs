@@ -183,6 +183,33 @@ impl Queue {
         r
     }
 
+    /// Commit the staged removal of every idle slot that has one, so Metal
+    /// frees what their completed generations listed (#944 item 14). Cold:
+    /// a residency commit per such slot, for a boundary that needs the
+    /// memory back, never per command buffer. Each slot is out of the pool
+    /// only for its own commit. Returns the slots committed.
+    pub(crate) fn release_idle_residency(&self) -> usize {
+        let mut committed = 0;
+        for _ in 0..self.available.len() {
+            let Some(mut slot) = self.available.pop() else {
+                break;
+            };
+            if slot.removal_pending {
+                slot.residency.commit();
+                slot.removal_pending = false;
+                committed += 1;
+            }
+            if let Err(slot) = self.available.push(slot) {
+                // Capacity is SLOTS and this slot came out of it.
+                self.discard_retirement_slot(slot);
+            }
+        }
+        if committed > 0 {
+            self.ready.notify();
+        }
+        committed
+    }
+
     pub(super) fn discard_retirement_slot(&self, slot: Slot) {
         drop(slot);
         self.allocated.fetch_sub(1, Ordering::AcqRel);
@@ -768,6 +795,11 @@ pub(super) struct Slot {
     commit_options: Vec<Retained<MTL4CommitOptions>>,
     feedback: Arc<SlotFeedback>,
     // LAST: release native resources/allocator/table before root publication.
+    /// The set's removal of a completed generation's listing is staged but
+    /// not committed (#944 item 14): Metal still holds those buffers until a
+    /// commit. Cleared by the next use's commit or a cold
+    /// `Queue::release_idle_residency`.
+    removal_pending: bool,
     namespaces: Vec<crate::metal_backend::device_retirement::NamespaceOwner>,
     // LAST: exact old generation remains through native cached-reference reset
     // and through final Slot native/resource destruction. Header release atoms
@@ -827,6 +859,7 @@ impl Slot {
             feedback_handlers: Vec::new(),
             commit_options: Vec::new(),
             feedback: Arc::new(SlotFeedback::default()),
+            removal_pending: false,
             namespaces: Vec::new(),
             bindings: None,
         })
@@ -869,6 +902,8 @@ impl Slot {
         // no-op on the cleared vectors then, kept here for every other path
         // to a reset.
         self.release_cached_references();
+        // This use's commit carries the staged removal with its own listing.
+        self.removal_pending = false;
         self.page = 0;
         self.offset = 0;
         self.allocator.reset();
@@ -886,18 +921,17 @@ impl Slot {
     /// feedback handlers and options. The generation, allocator and CB begin
     /// stay with `reset`, at acquire.
     fn release_cached_references(&mut self) {
-        // The set keeps what it lists until a removal is committed, so an
-        // uncommitted removal still pins every buffer the generation listed:
-        // Metal frees none of them until the slot's next use commits its set
-        // (measured, #944 item 13: a replaced expert bank stayed allocated
-        // while its slot idled). Commit the removal here when the set listed
-        // anything; a set that listed nothing (the device's sets covered
-        // every binding) costs no commit.
-        let listed = self.residency.allocationCount();
+        // The set keeps what it lists until a removal is committed, so this
+        // staged removal still pins every buffer the generation listed until
+        // the slot's next use commits its set (measured, #944 item 13: a
+        // replaced expert bank stayed allocated while its slot idled).
+        // Committing here cost every command buffer a residency commit and
+        // 0.87 allocations (the per-commit census, 10.13 -> 11.00), so the
+        // release only marks it: a cold boundary that needs the memory back
+        // commits it (`Queue::release_idle_residency`, from
+        // `MetalDevice::trim_unused_buffers` and the expert grant).
+        self.removal_pending |= self.residency.allocationCount() > 0;
         self.residency.removeAllAllocations();
-        if listed > 0 {
-            self.residency.commit();
-        }
         self.resources.clear();
         self.pipelines.clear();
         self.fences.clear();
@@ -2212,8 +2246,8 @@ mod tests {
     }
 
     /// A buffer a completed generation listed, dropped by its owner, is
-    /// freed by Metal once its slot returns, not when the slot is next used
-    /// (#944 items 13, 14): the slot's residency set no longer pins it.
+    /// freed by Metal at the cold release of idle slots' staged removals,
+    /// not only when the slot is next used (#944 items 13, 14).
     #[test]
     fn a_returned_slot_lets_metal_free_a_buffer_its_generation_listed() {
         let native = super::super::Device::system_default().unwrap();
@@ -2239,13 +2273,20 @@ mod tests {
             commands.flush_and_wait().unwrap();
         }
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut released = 0;
+        while released == 0 && std::time::Instant::now() < deadline {
+            // The slot returns once both sides published; then the cold
+            // boundary commits its staged removal.
+            released = commands.release_idle_slot_residency();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
         let mut now = native.current_allocated_size();
         while now >= start + BYTES / 2 && std::time::Instant::now() < deadline {
             std::thread::sleep(std::time::Duration::from_millis(5));
             now = native.current_allocated_size();
         }
         eprintln!(
-            "IDLE_SLOT_FREE start={start} after={now} buffer={BYTES} retention={:?}",
+            "IDLE_SLOT_FREE start={start} after={now} buffer={BYTES} released={released} retention={:?}",
             commands.metal4_idle_retention()
         );
         assert!(

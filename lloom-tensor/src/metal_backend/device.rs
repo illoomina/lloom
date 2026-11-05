@@ -1282,6 +1282,9 @@ impl MetalDevice {
     /// hand memory back under pressure. Nothing calls it on the hot path.
     /// Returns the bytes given back.
     pub fn trim_unused_buffers(&self) -> usize {
+        // Idle Metal 4 slots' staged residency removals first, so the memory
+        // their completed generations listed is Metal's to free (#944 item 14).
+        self.commands().release_idle_slot_residency();
         let mut freed = 0usize;
         for buffer in self.buffers.trim() {
             freed += buffer.length();

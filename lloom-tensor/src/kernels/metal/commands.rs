@@ -1413,6 +1413,16 @@ impl Commands {
         self.core.modern_queue.as_ref()?.slot_residency()
     }
 
+    /// Commit the staged residency removal of the Metal 4 queue's idle
+    /// slots, so Metal frees what their completed generations listed (#944
+    /// item 14). Cold; 0 on Metal 3. Returns the slots committed.
+    pub fn release_idle_slot_residency(&self) -> usize {
+        self.core
+            .modern_queue
+            .as_ref()
+            .map_or(0, |q| q.release_idle_residency())
+    }
+
     /// What the Metal 4 queue's idle slots still hold (#944 item 14);
     /// `None` on Metal 3.
     #[cfg(test)]

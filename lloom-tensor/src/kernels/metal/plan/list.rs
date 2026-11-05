@@ -265,6 +265,7 @@ impl CommandList {
             patches_start: self.patches.len(),
             bytes_start: self.bytes.len(),
             buffers_start: self.buffers,
+            max_bytes_start: self.max_bytes,
             list: self,
             pipeline: Some(pipeline),
             tag,
@@ -342,6 +343,7 @@ pub struct CommandBuilder<'a> {
     patches_start: usize,
     bytes_start: usize,
     buffers_start: usize,
+    max_bytes_start: usize,
 }
 
 impl CommandBuilder<'_> {
@@ -499,6 +501,7 @@ impl Drop for CommandBuilder<'_> {
             self.list.patches.truncate(self.patches_start);
             self.list.bytes.truncate(self.bytes_start);
             self.list.buffers = self.buffers_start;
+            self.list.max_bytes = self.max_bytes_start;
         }
     }
 }

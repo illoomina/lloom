@@ -451,6 +451,7 @@ fn a_builder_refuses_patches_it_cannot_apply() {
     let mut c = list.command(pipeline.clone(), 1);
     let scalar = c.u32(0, 3);
     let buffer = c.buffer(1, BufferRef(9), 0, false);
+    c.bytes(2, &[0u8; 32]);
     assert!(c.patch_offset(first_buffer, Affine::constant(0)).is_err());
     assert!(c.patch_offset(scalar, Affine::constant(0)).is_err());
     assert!(c
@@ -486,6 +487,11 @@ fn a_builder_refuses_patches_it_cannot_apply() {
         list.buffers(),
         4,
         "an abandoned command's buffers are not counted"
+    );
+    assert_eq!(
+        list.max_bytes(),
+        8,
+        "an abandoned command's bytes do not size the scratch"
     );
 }
 

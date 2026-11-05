@@ -448,11 +448,39 @@ impl BoundSet {
         self.ranges.values().map(Vec::capacity).sum()
     }
 
+    #[cfg(test)]
     fn take(&mut self) -> BoundSet {
         BoundSet {
             ptrs: std::mem::take(&mut self.ptrs),
             ranges: std::mem::take(&mut self.ranges),
         }
+    }
+
+    /// The rotation at an emitted barrier: what `next` bound becomes `prev`
+    /// (everything bound before the barrier is now ordered against everything
+    /// after it, so the old `prev` is dropped from the comparison), and `next`
+    /// starts empty.
+    ///
+    /// SWAPPED, not `mem::take`n (#1235): `take` handed `next`'s maps to
+    /// `prev`, freed the old `prev`'s, and left `next` a fresh map with no
+    /// capacity, so every dispatch after a barrier regrew its hash tables and
+    /// buckets from nothing — 1330 of a served LFM2 token's 3956 allocations
+    /// at `insert` and 115 more at `absorb` (#1235 step 1, both APIs). Swapping
+    /// gives `next` the old `prev`'s allocation, cleared. Only `prev` is ever
+    /// consulted (`read_hazards`/`write_hazards` → `conflicts`), and its
+    /// content is exactly what `take` gave it; `next` holds no range either
+    /// way, only `clear`'s retained empty buckets, which `conflicts` cannot
+    /// see.
+    fn rotate_after_barrier(prev: &mut BoundSet, next: &mut BoundSet) {
+        std::mem::swap(prev, next);
+        next.clear();
+    }
+
+    /// The rotation when no barrier is emitted: `prev` absorbs `next` in
+    /// place and `next` is cleared, both keeping their capacity (#727).
+    fn fold_without_barrier(prev: &mut BoundSet, next: &mut BoundSet) {
+        prev.absorb(next);
+        next.clear();
     }
 }
 
@@ -1847,10 +1875,9 @@ impl ComputeCommandEncoder {
                 // dropped. If the very next position is a gap dispatch, it still
                 // sees `needs_barrier` and emits -- which is why the 123
                 // interleaved positions keep their ordering.
-                let mut next_out = s.next_outputs.take();
-                s.prev_outputs.absorb(&mut next_out);
-                let mut next_in = s.next_inputs.take();
-                s.prev_inputs.absorb(&mut next_in);
+                let st = &mut *s;
+                BoundSet::fold_without_barrier(&mut st.prev_outputs, &mut st.next_outputs);
+                BoundSet::fold_without_barrier(&mut st.prev_inputs, &mut st.next_inputs);
                 // `pending_kinds` is deliberately NOT drained here, for exactly
                 // the reason `needs_barrier` and `prev_*` are not: a suppressed
                 // barrier is *deferred, not dropped*. Draining the kinds while
@@ -1880,8 +1907,9 @@ impl ComputeCommandEncoder {
             s.needs_barrier = false;
             // Replaced, not extended: everything bound before the barrier is
             // now ordered against everything after it.
-            s.prev_outputs = s.next_outputs.take();
-            s.prev_inputs = s.next_inputs.take();
+            let st = &mut *s;
+            BoundSet::rotate_after_barrier(&mut st.prev_outputs, &mut st.next_outputs);
+            BoundSet::rotate_after_barrier(&mut st.prev_inputs, &mut st.next_inputs);
         } else {
             // Absorb IN PLACE and clear, rather than `take` + absorb: the
             // rotation happens once per dispatch, and handing the maps'
@@ -1890,10 +1918,8 @@ impl ComputeCommandEncoder {
             // `&mut *s` once, then split the fields: the guard's `DerefMut`
             // cannot be called twice in one expression.
             let st = &mut *s;
-            st.prev_outputs.absorb(&mut st.next_outputs);
-            st.next_outputs.clear();
-            st.prev_inputs.absorb(&mut st.next_inputs);
-            st.next_inputs.clear();
+            BoundSet::fold_without_barrier(&mut st.prev_outputs, &mut st.next_outputs);
+            BoundSet::fold_without_barrier(&mut st.prev_inputs, &mut st.next_inputs);
         }
     }
 
@@ -3211,8 +3237,7 @@ mod tests {
             for b in binds {
                 next.insert(HazardKey::Range, b);
             }
-            prev.absorb(&mut next);
-            next.clear();
+            BoundSet::fold_without_barrier(&mut prev, &mut next);
             capacity_after.push((prev.bucket_capacity(), next.bucket_capacity()));
         }
 
@@ -3229,6 +3254,77 @@ mod tests {
         assert_eq!(prev.ranges.get(&1).map(Vec::len), Some(2));
         assert_eq!(prev.ranges.get(&2).map(Vec::len), Some(1));
         assert_eq!(prev.ranges.get(&3).map(Vec::len), Some(1));
+    }
+
+    /// The rotation at an emitted barrier keeps its allocation as well, and
+    /// compares exactly what `mem::take` compared (#1235 step 1).
+    ///
+    /// `take` left `next` a fresh map after every barrier, so each dispatch
+    /// that followed one regrew its hash tables and buckets: 1445 of a served
+    /// LFM2 token's 3956 allocations. The swap hands `next` the old `prev`'s
+    /// allocation instead. Asserted as structure, like the test above: after
+    /// a barrier the emptied set still holds capacity, the retained capacity
+    /// stops changing once warm, and `prev` answers `conflicts` for exactly
+    /// the ranges bound since the previous barrier.
+    #[test]
+    fn the_barrier_rotation_keeps_its_allocation_and_its_meaning() {
+        for key in [HazardKey::Range, HazardKey::Pointer] {
+            let mut prev = BoundSet::default();
+            let mut next = BoundSet::default();
+            let first = [r(1, 0, 4096), r(2, 0, 8192), r(3, 128, 128)];
+            let second = [r(4, 0, 256), r(5, 0, 4096)];
+
+            for b in first {
+                next.insert(key, b);
+            }
+            BoundSet::rotate_after_barrier(&mut prev, &mut next);
+            for b in first {
+                assert!(prev.conflicts(key, &b), "{key:?}: a range bound before the barrier must be in prev");
+                assert!(!next.conflicts(key, &b), "{key:?}: next must start empty after a barrier");
+            }
+
+            for b in second {
+                next.insert(key, b);
+            }
+            BoundSet::rotate_after_barrier(&mut prev, &mut next);
+            for b in second {
+                assert!(prev.conflicts(key, &b), "{key:?}: the latest phase must be in prev");
+            }
+            for b in first {
+                assert!(
+                    !prev.conflicts(key, &b),
+                    "{key:?}: a range from before the EARLIER barrier is already ordered; prev must drop it"
+                );
+                assert!(!next.conflicts(key, &b), "{key:?}: next must hold no range after a barrier");
+            }
+            let held = |set: &BoundSet| set.ptrs.capacity() + set.ranges.capacity();
+            assert!(
+                held(&next) > 0,
+                "{key:?}: after a barrier the emptied set must keep the old prev's allocation; \
+                 a fresh map (mem::take) regrows it on the next dispatch"
+            );
+
+            // Warm: alternating barrier and no-barrier rotations stop changing
+            // what either set holds. Two allocations trade the `prev`/`next`
+            // roles at every barrier, so each must once hold the widest phase
+            // (a fold of both) before the pair is warm: four cycles, not two.
+            let mut seen = Vec::new();
+            for cycle in 0..12 {
+                for b in first.iter().chain(second.iter()) {
+                    next.insert(key, *b);
+                }
+                if cycle % 2 == 0 {
+                    BoundSet::rotate_after_barrier(&mut prev, &mut next);
+                } else {
+                    BoundSet::fold_without_barrier(&mut prev, &mut next);
+                }
+                seen.push((held(&prev) + held(&next), prev.bucket_capacity() + next.bucket_capacity()));
+            }
+            let steady = seen[4];
+            for (i, c) in seen.iter().enumerate().skip(4) {
+                assert_eq!(*c, steady, "{key:?}: cycle {i} changed the retained capacity {seen:?}");
+            }
+        }
     }
 
     #[test]

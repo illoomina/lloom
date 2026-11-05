@@ -10,7 +10,9 @@
 //! Their own binaries: `metal_pool_alloc_free.rs`, because a test binary
 //! carries at most one `#[global_allocator]`; `metal_cb_failure_tests.rs`,
 //! because it makes the GPU fail command buffers on purpose and a fault must
-//! not share a process with tests it could disturb.
+//! not share a process with tests it could disturb; `metal_heap_census.rs`
+//! (#1235), because it arms libmalloc's process-wide malloc and syscall
+//! loggers and counts every thread's events.
 //!
 //! `every_test_file_is_a_module` below reads this directory and this file,
 //! so a file that is not a module here fails the suite instead of silently
@@ -124,6 +126,7 @@ fn every_test_file_is_a_module() {
         "metal_cb_failure_tests",
         "metal_commit_alloc_free",
         "allocation_refusal_alloc_free",
+        "metal_heap_census",
     ];
     let dir = format!("{}/tests", lloom_manifest_dir());
     let me = include_str!("main.rs");

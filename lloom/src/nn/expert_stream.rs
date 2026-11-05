@@ -424,6 +424,42 @@ impl<'a, R: ExpertResidency + ?Sized> ResolvedExperts<'a, R> {
     }
 }
 
+/// Apply one slot grant to a model's tiers one layer at a time (#944 item 13).
+/// A resize allocates the layer's replacement banks and encodes the copy of
+/// the slots it keeps, and the old banks live until that copy retires
+/// (`Inner::prepare_pools`). Applied to every layer before any copy retires,
+/// a shrink meant to give memory back first held the whole tier twice: on
+/// Qwen3.8 Flash-Next at 326 slots, +26.5 GB for a 10-slot yield, past the
+/// working set, and the GPU timed out. `retire` (a queue wait on Metal, then
+/// the idle slots' residency release) runs
+/// after each layer that resized, so the next layer allocates only once this
+/// one's old banks are released, and the transient is one layer's banks.
+/// Returns the bytes the shrinks parked.
+pub fn resize_layers_one_at_a_time<'a, R: ExpertResidency + 'a>(
+    tiers: impl IntoIterator<Item = &'a R>,
+    wanted: usize,
+    floor: usize,
+    mut retire: impl FnMut() -> Result<()>,
+) -> Result<usize> {
+    let mut parked = 0usize;
+    for tier in tiers {
+        let active = tier.active_slots();
+        let resized = if wanted < active {
+            parked += tier.shrink_slots(wanted, floor)?;
+            true
+        } else if wanted > active {
+            tier.grow_slots(wanted)?;
+            true
+        } else {
+            false
+        };
+        if resized {
+            retire()?;
+        }
+    }
+    Ok(parked)
+}
+
 /// How a layer's routed experts are held and applied.
 ///
 /// The contract is the routed matmul's: the strategy receives the activation
@@ -8439,6 +8475,71 @@ mod tests {
             }
             std::fs::remove_file(path).unwrap();
         }
+    }
+
+    /// A grant shrinking several tiers holds one layer's old and new banks at
+    /// a time, not the whole tier twice (#944 item 13). The device's
+    /// allocated bytes are read inside `retire`, right after each layer's
+    /// resize allocated its replacement and before its old banks retire: the
+    /// peak the serve path reached. With the retirement waits the excess over
+    /// the start stays within two layers' replacements (the one just made,
+    /// and Metal's slack); without them it grows by one layer per layer.
+    #[cfg(feature = "metal")]
+    #[test]
+    fn a_slot_grant_holds_one_layers_replacement_banks_at_a_time() {
+        const LAYERS: usize = 6;
+        const SLOTS: usize = 12;
+        const WANTED: usize = 10;
+        let dev = resize_control_device();
+        let m = dev.as_metal_device().unwrap();
+        // 16 experts of 256 x 256 f32 (256 KiB each): a pool of 12 slots is
+        // 3 MiB per projection, 9 MiB per layer.
+        let gate = stacked(16, 256, 256, 1.0, GgmlDType::F32);
+        let up = stacked(16, 256, 256, 2.0, GgmlDType::F32);
+        let down = stacked(16, 256, 256, 3.0, GgmlDType::F32);
+        let path = write_gguf(&[("g", &gate), ("u", &up), ("d", &down)]);
+        let tiers: Vec<Streamed> = (0..LAYERS)
+            .map(|_| {
+                Streamed::new(
+                    open(&path, "g"),
+                    open(&path, "u"),
+                    open(&path, "d"),
+                    SLOTS,
+                    LoaderArm::Pread,
+                    &dev,
+                )
+                .unwrap()
+            })
+            .collect();
+        m.wait_until_completed().unwrap();
+        let replacement = 3 * WANTED * 256 * 256 * 4; // one layer's new banks
+        let start = m.device().current_allocated_size();
+        let mut excess = Vec::new();
+        let parked = resize_layers_one_at_a_time(tiers.iter(), WANTED, 1, || {
+            excess.push(m.device().current_allocated_size().saturating_sub(start));
+            m.wait_until_completed()?;
+            m.commands().release_idle_slot_residency();
+            Ok(())
+        })
+        .unwrap();
+        m.wait_until_completed().unwrap();
+        let after = m.device().current_allocated_size();
+        let peak = *excess.iter().max().unwrap();
+        eprintln!(
+            "SLOT_GRANT layers={LAYERS} slots={SLOTS}->{WANTED} replacement_per_layer={replacement} \
+             start={start} excess_per_layer={excess:?} peak_excess={peak} after={after} parked={parked} api={}",
+            m.commands().actual_command_api()
+        );
+        assert_eq!(excess.len(), LAYERS, "every layer resized");
+        assert!(
+            peak <= 2 * replacement,
+            "a slot grant held {peak} B over its start, more than two layers' \
+             replacements ({replacement} B each): {excess:?}"
+        );
+        assert!(
+            after < start,
+            "the grant gave nothing back: start {start} B, after {after} B"
+        );
     }
 
     #[cfg(feature = "metal")]

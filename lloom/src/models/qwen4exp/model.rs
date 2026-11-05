@@ -2601,15 +2601,30 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
                 m.wait_until_completed()?;
             }
         }
-        for layer in &self.layers {
-            let tier = layer.moe.experts();
-            let active = tier.active_slots();
-            if wanted < active {
-                parked += tier.shrink_slots(wanted, t.floor_units())?;
-            } else if wanted > active {
-                tier.grow_slots(wanted)?;
-            }
+        // One layer at a time, each layer's old banks retired before the next
+        // layer allocates (#944 item 13).
+        let tiers = self.layers.iter().map(|l| l.moe.experts());
+        #[cfg(feature = "metal")]
+        if let lloom_tensor::Device::Metal(m) = self.device() {
+            return crate::nn::expert_stream::resize_layers_one_at_a_time(
+                tiers,
+                wanted,
+                t.floor_units(),
+                || {
+                    m.wait_until_completed()?;
+                    // Metal 4 idle slots stage their residency removal; commit
+                    // it so the old banks are Metal's to free now (#944 item 14).
+                    m.commands().release_idle_slot_residency();
+                    Ok(())
+                },
+            );
         }
+        parked += crate::nn::expert_stream::resize_layers_one_at_a_time(
+            tiers,
+            wanted,
+            t.floor_units(),
+            || Ok(()),
+        )?;
         Ok(parked)
     }
 

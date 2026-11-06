@@ -1207,7 +1207,7 @@ impl<L: Layer> DecoderState<L> {
         if self.standing {
             lloom_tensor::bail!("decoder state: accepting positions of a standing window")
         }
-        let Some(w) = self.window.take() else {
+        let Some(_) = self.window.as_ref() else {
             lloom_tensor::bail!("decoder state: no speculative window is open")
         };
         if after.len() != self.layers.len() {
@@ -1217,18 +1217,20 @@ impl<L: Layer> DecoderState<L> {
                 self.layers.len()
             )
         }
+        // Validate every layer before taking the window or accepting any
+        // prefix. A malformed later mark must leave the whole window retryable,
+        // not partially accepted with its only recovery record discarded.
+        for (l, marks) in after.iter().enumerate() {
+            if a > marks.len() {
+                lloom_tensor::bail!(
+                    "decoder state: layer {l} accepts {a} positions of a {}-position window",
+                    marks.len()
+                )
+            }
+        }
+        let w = self.window.take().expect("validated open window");
         for (l, s) in self.layers.iter_mut().enumerate() {
-            let at = if a == 0 {
-                w.marks[l]
-            } else {
-                match after[l].get(a - 1) {
-                    Some(m) => *m,
-                    None => lloom_tensor::bail!(
-                        "decoder state: layer {l} accepts {a} positions of a {}-position window",
-                        after[l].len()
-                    ),
-                }
-            };
+            let at = if a == 0 { w.marks[l] } else { after[l][a - 1] };
             if let Err(e) = L::accept_window(s, a, at) {
                 self.unusable = Some(format!("layer {l} failed to accept its window ({e})"));
                 return Err(e);
@@ -2593,6 +2595,7 @@ mod window_tests {
         fail_open: bool,
         fail_rewind: bool,
         fail_resolve: bool,
+        fail_accept: bool,
         fail_restore: bool,
         fail_truncate: bool,
         fail_restore_retained: bool,
@@ -2673,6 +2676,9 @@ mod window_tests {
             Ok(x.clone())
         }
         fn accept_window(s: &mut FaultyState, _: usize, _: WindowMark) -> Result<()> {
+            if s.fail_accept {
+                lloom_tensor::bail!("refused to accept")
+            }
             s.open = false;
             Ok(())
         }
@@ -3094,6 +3100,71 @@ mod window_tests {
         let fresh = session.prepare(&[10, 20, 30, 40, 50]).unwrap();
         assert_eq!(fresh.action, crate::nn::ReuseAction::Fresh);
         assert!(session.sequence().cache().usable().is_ok());
+    }
+
+    #[test]
+    fn malformed_accept_marks_preserve_every_open_layer_for_retry() {
+        // Missing layer, extra layer, then a short later layer: the last case
+        // detects implementations that validate while already accepting rows.
+        for after in [
+            vec![vec![WindowMark::default(); 2]; 1],
+            vec![vec![WindowMark::default(); 2]; 3],
+            vec![
+                vec![WindowMark::default(); 2],
+                vec![WindowMark::default(); 1],
+            ],
+        ] {
+            let mut st = state(2);
+            st.pos = 7;
+            st.open_window().unwrap();
+            st.pos = 9;
+            st.keep_nextn(Tensor::zeros((1, 2, 3), DType::F32, &Device::Cpu).unwrap());
+            let drops = st.nextn_drops();
+            let error = st.accept_window(2, &after).unwrap_err();
+            assert!(error.to_string().contains("decoder state:"), "{error}");
+            assert!(
+                st.window_open(),
+                "invalid marks consumed the recovery record"
+            );
+            assert!(
+                st.layers.iter().all(|layer| layer.open),
+                "partial acceptance"
+            );
+            assert!(
+                st.unusable().is_none(),
+                "invalid input needs no state mutation"
+            );
+            assert_eq!(st.pos, 9);
+            assert_eq!(st.nextn.rows(), 2);
+            assert_eq!(st.nextn_drops(), drops);
+            st.accept_window(2, &vec![vec![WindowMark::default(); 2]; 2])
+                .unwrap();
+            assert!(!st.window_open());
+            assert!(st.layers.iter().all(|layer| !layer.open));
+            assert_eq!(st.pos, 9);
+        }
+    }
+
+    #[test]
+    fn a_failed_accept_after_an_earlier_layer_marks_the_state_unusable() {
+        let mut st = state(3);
+        st.open_window().unwrap();
+        st.layers[1].fail_accept = true;
+        let after = vec![vec![WindowMark::default()]; 3];
+        assert!(st.accept_window(1, &after).is_err());
+        assert!(
+            !st.layers[0].open,
+            "earlier layer must have actually accepted"
+        );
+        assert!(st.layers[1].open && st.layers[2].open);
+        assert!(st
+            .unusable()
+            .expect("partial accept poisoned cache")
+            .contains("layer 1"));
+        assert!(st.open_window().is_err());
+        st.layers[1].fail_accept = false;
+        st.reset();
+        st.open_window().expect("explicit reset restores usability");
     }
 
     #[test]

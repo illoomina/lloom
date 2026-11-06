@@ -784,6 +784,8 @@ pub(crate) struct SlotWitness {
     /// The queue's slots made and idle, read now.
     pub allocated: usize,
     pub available: usize,
+    /// This slot among the process's slots (`Slot::identity`).
+    pub slot: u64,
     pub generation: u64,
     pub segment: usize,
     /// The command buffer for `segment` exists.
@@ -818,6 +820,7 @@ impl SlotWitness {
             queue: queue as *const Queue as usize,
             allocated: queue.allocated.load(Ordering::Acquire),
             available: queue.available.len(),
+            slot: slot.identity,
             generation: slot.generation,
             segment: slot.segment,
             segment_cb: slot.segment <= slot.extra_cbs.len(),
@@ -852,7 +855,7 @@ impl SlotWitness {
 /// after the last segment's `use_device_sets`, the last point the slot is
 /// still this submission's. `Submission::slot_witness_for_test` cannot see
 /// it: the slot has left the state by then. Armed per thread for one
-/// expected `(queue, generation)`; a fixed slot, no history, and no
+/// expected `(queue, slot, generation)`; a fixed slot, no history, and no
 /// allocation once armed. A handoff on this thread for any other key is
 /// counted, never recorded.
 #[cfg(test)]
@@ -861,7 +864,7 @@ pub(crate) mod handoff_witness {
     use std::cell::{Cell, RefCell};
 
     thread_local! {
-        static ARMED: Cell<Option<(usize, u64)>> = const { Cell::new(None) };
+        static ARMED: Cell<Option<(usize, u64, u64)>> = const { Cell::new(None) };
         static SEEN: RefCell<Option<SlotWitness>> = const { RefCell::new(None) };
         static MATCHED: Cell<u32> = const { Cell::new(0) };
         static OTHER: Cell<u32> = const { Cell::new(0) };
@@ -882,16 +885,17 @@ pub(crate) mod handoff_witness {
     /// thread had armed before, so captures nest and unwind cleanly.
     #[must_use = "an armed capture records nothing once dropped"]
     pub(crate) struct Armed {
-        previous: Option<(usize, u64)>,
+        previous: Option<(usize, u64, u64)>,
         previous_seen: Option<SlotWitness>,
         previous_counts: (u32, u32),
     }
 
-    /// Arm a capture for the recording `(queue, generation)` names, taken from
-    /// that submission's own `slot_witness_for_test`.
-    pub(crate) fn arm(queue: usize, generation: u64) -> Armed {
+    /// Arm a capture for the recording `(queue, slot, generation)` names,
+    /// taken from that submission's own `slot_witness_for_test`. All three:
+    /// two live slots of one queue can be at the same generation.
+    pub(crate) fn arm(queue: usize, slot: u64, generation: u64) -> Armed {
         Armed {
-            previous: ARMED.with(|a| a.replace(Some((queue, generation)))),
+            previous: ARMED.with(|a| a.replace(Some((queue, slot, generation)))),
             previous_seen: SEEN.with(|s| s.replace(None)),
             previous_counts: (MATCHED.with(|m| m.replace(0)), OTHER.with(|o| o.replace(0))),
         }
@@ -918,10 +922,13 @@ pub(crate) mod handoff_witness {
 
     /// The handoff point. Inert unless this thread armed a capture.
     pub(super) fn observe(queue: &Queue, slot: &Slot) {
-        let Some((armed_queue, armed_generation)) = ARMED.with(Cell::get) else {
+        let Some((armed_queue, armed_slot, armed_generation)) = ARMED.with(Cell::get) else {
             return;
         };
-        if armed_queue == queue as *const Queue as usize && armed_generation == slot.generation {
+        if armed_queue == queue as *const Queue as usize
+            && armed_slot == slot.identity
+            && armed_generation == slot.generation
+        {
             if MATCHED.with(|m| m.replace(m.get() + 1)) == 0 {
                 SEEN.with(|s| *s.borrow_mut() = Some(SlotWitness::of(queue, slot)));
             }
@@ -933,6 +940,11 @@ pub(crate) mod handoff_witness {
 
 pub(super) struct Slot {
     generation: u64,
+    /// A test's name for this slot (#944 item 15): distinct for every slot a
+    /// process makes, never reused. `generation` alone is per slot, so two
+    /// live slots of one queue can share it.
+    #[cfg(test)]
+    identity: u64,
     cb: Retained<ProtocolObject<dyn MTL4CommandBuffer>>,
     // Retained across safe slot reuse; only the current generation's prefix is
     // encoded. No allocator reset until every segment and handoff have finished.
@@ -1012,6 +1024,11 @@ impl Slot {
         queue.raw.addResidencySet(&residency);
         Ok(Self {
             generation: 0,
+            #[cfg(test)]
+            identity: {
+                static NEXT: AtomicU64 = AtomicU64::new(1);
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            },
             cb,
             extra_cbs: Vec::new(),
             segment: 0,
@@ -3099,7 +3116,7 @@ mod tests {
         let before = submission.slot_witness_for_test().expect("recording slot");
         assert_eq!(before.used_generation, u64::MAX, "no segment has ended yet");
         assert_eq!(before.commit_options.len, 0, "no commit has been prepared yet");
-        let armed = handoff_witness::arm(before.queue, before.generation);
+        let armed = handoff_witness::arm(before.queue, before.slot, before.generation);
         submission.commit().unwrap();
         let seen = armed.finish();
         submission.wait().unwrap();
@@ -3141,7 +3158,7 @@ mod tests {
         };
 
         let (s, w) = commit_one(&queue);
-        let armed = handoff_witness::arm(w.queue, w.generation + 1);
+        let armed = handoff_witness::arm(w.queue, w.slot, w.generation + 1);
         s.commit().unwrap();
         let seen = armed.finish();
         s.wait().unwrap();
@@ -3150,23 +3167,61 @@ mod tests {
         let (s, w) = commit_one(&queue);
         let (s2, w2) = commit_one(&other_queue);
         assert_ne!(w.queue, w2.queue);
-        let armed = handoff_witness::arm(w2.queue, w2.generation);
+        let armed = handoff_witness::arm(w2.queue, w2.slot, w2.generation);
         s.commit().unwrap();
         let seen = armed.finish();
         s.wait().unwrap();
         assert_eq!((seen.witness.as_ref(), seen.matched, seen.other), (None, 0, 1), "another queue");
 
-        let armed = handoff_witness::arm(w2.queue, w2.generation);
+        let armed = handoff_witness::arm(w2.queue, w2.slot, w2.generation);
         let seen = armed.finish();
         assert_eq!((seen.witness.as_ref(), seen.matched, seen.other), (None, 0, 0), "no commit, nothing seen");
 
-        let outer = handoff_witness::arm(w2.queue, w2.generation);
-        drop(handoff_witness::arm(w2.queue, w2.generation + 7));
+        let outer = handoff_witness::arm(w2.queue, w2.slot, w2.generation);
+        drop(handoff_witness::arm(w2.queue, w2.slot, w2.generation + 7));
         s2.commit().unwrap();
         let seen = outer.finish();
         s2.wait().unwrap();
         assert_eq!((seen.matched, seen.other), (1, 0), "the inner capture gave the outer one back: {seen:?}");
         assert_eq!(seen.witness.map(|w| w.generation), Some(w2.generation));
+    }
+
+    /// Two slots of one queue live at once share their generation (each slot
+    /// counts its own): the capture tells them apart by slot, so a handoff
+    /// of the other is counted, never recorded (#944 item 15; lane A's
+    /// counterexample on #944 6673335648).
+    #[test]
+    fn the_handoff_witness_tells_apart_two_live_slots_at_the_same_generation() {
+        let _pool = crate::AutoreleaseScope::new();
+        let device = Device::system_default().expect("Metal device");
+        if !device.as_ref().supportsFamily(MTLGPUFamily::Metal4) {
+            eprintln!("NOT_APPLICABLE needs Metal 4");
+            return;
+        }
+        let queue = Queue::new(device.clone()).unwrap();
+        let a = queue.acquire().unwrap();
+        let b = queue.acquire().unwrap();
+        let wa = a.slot_witness_for_test().unwrap();
+        let wb = b.slot_witness_for_test().unwrap();
+        assert_eq!((wa.queue, wa.generation), (wb.queue, wb.generation), "the collision case");
+        assert_ne!(wa.slot, wb.slot, "two live slots are two slots");
+        let armed = handoff_witness::arm(wa.queue, wa.slot, wa.generation);
+        b.encoder().unwrap().raw.endEncoding();
+        b.commit().unwrap();
+        let seen = armed.finish();
+        b.wait().unwrap();
+        assert_eq!(
+            (seen.witness.as_ref(), seen.matched, seen.other),
+            (None, 0, 1),
+            "HANDOFF_MUST_NOT_ATTRIBUTE_ANOTHER_LIVE_SLOT_WITH_SAME_QUEUE_GENERATION"
+        );
+        let armed = handoff_witness::arm(wa.queue, wa.slot, wa.generation);
+        a.encoder().unwrap().raw.endEncoding();
+        a.commit().unwrap();
+        let seen = armed.finish();
+        a.wait().unwrap();
+        assert_eq!((seen.matched, seen.other), (1, 0), "{seen:?}");
+        assert_eq!(seen.witness.map(|w| w.slot), Some(wa.slot));
     }
 
     #[test]

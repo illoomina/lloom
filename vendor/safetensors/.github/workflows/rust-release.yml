@@ -1,0 +1,34 @@
+name: Rust Release
+
+on:
+  push:
+    tags:
+      - v*
+
+jobs:
+  rust_publish:
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      id-token: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable
+      - name: Cache Cargo Registry
+        uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7  # v5
+        with:
+          path: ~/.cargo/registry
+          key: ubuntu-latest-cargo-registry-${{ hashFiles('**/Cargo.toml') }}
+
+      - uses: rust-lang/crates-io-auth-action@bbd81622f20ce9e2dd9622e3218b975523e45bbe # v1
+        id: auth
+
+      - name: Publish package rust
+        if: ${{ !contains(github.ref, 'rc') }}
+        working-directory: ./safetensors
+        run: cargo publish
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+

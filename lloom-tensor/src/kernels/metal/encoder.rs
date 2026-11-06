@@ -349,7 +349,7 @@ pub struct BoundSet {
 }
 
 impl BoundSet {
-    fn insert(&mut self, key: HazardKey, b: BoundRange) {
+    pub(crate) fn insert(&mut self, key: HazardKey, b: BoundRange) {
         match key {
             HazardKey::Pointer => {
                 self.ptrs.insert(b.ptr);
@@ -409,7 +409,7 @@ impl BoundSet {
     /// `drain()` rather than `mem::take` on the far side, and no reallocation
     /// on this one: the buckets keep their capacity across dispatches instead
     /// of being freed and regrown 338 times a step.
-    fn absorb(&mut self, other: &mut BoundSet) {
+    pub(crate) fn absorb(&mut self, other: &mut BoundSet) {
         self.ptrs.extend(other.ptrs.drain());
         for (ptr, v) in other.ranges.iter_mut() {
             let bucket = self.ranges.entry(*ptr).or_default();
@@ -435,7 +435,7 @@ impl BoundSet {
     /// [`Self::insert`] allocation-free in the steady state. The map's own
     /// size is bounded by the distinct buffers an encoder touches, which is
     /// small and does not grow with dispatches.
-    fn clear(&mut self) {
+    pub(crate) fn clear(&mut self) {
         self.ptrs.clear();
         for v in self.ranges.values_mut() {
             v.clear();
@@ -471,14 +471,14 @@ impl BoundSet {
     /// content is exactly what `take` gave it; `next` holds no range either
     /// way, only `clear`'s retained empty buckets, which `conflicts` cannot
     /// see.
-    fn rotate_after_barrier(prev: &mut BoundSet, next: &mut BoundSet) {
+    pub(crate) fn rotate_after_barrier(prev: &mut BoundSet, next: &mut BoundSet) {
         std::mem::swap(prev, next);
         next.clear();
     }
 
     /// The rotation when no barrier is emitted: `prev` absorbs `next` in
     /// place and `next` is cleared, both keeping their capacity (#727).
-    fn fold_without_barrier(prev: &mut BoundSet, next: &mut BoundSet) {
+    pub(crate) fn fold_without_barrier(prev: &mut BoundSet, next: &mut BoundSet) {
         prev.absorb(next);
         next.clear();
     }
@@ -1618,6 +1618,9 @@ impl ComputeCommandEncoder {
     }
 
     pub fn set_threadgroup_memory_length(&self, index: usize, length: usize) {
+        if !self.executor.is_classical() {
+            self.executor.will_set_threadgroup_memory(index, length);
+        }
         unsafe { self.raw.setThreadgroupMemoryLength_atIndex(length, index) }
     }
 
@@ -2140,12 +2143,22 @@ impl ComputeCommandEncoder {
 
     pub fn set_bytes_directly(&self, index: usize, length: usize, bytes: *const c_void) {
         let pointer = ptr::NonNull::new(bytes as *mut c_void).unwrap();
+        if !self.executor.is_classical() {
+            // SAFETY: `setBytes` below reads the same `length` bytes; every
+            // caller passes an initialized slice of that length.
+            let bytes = unsafe { std::slice::from_raw_parts(bytes.cast::<u8>(), length) };
+            self.executor.will_set_bytes(index, bytes);
+        }
         unsafe { self.raw.setBytes_length_atIndex(pointer, length, index) }
     }
 
-    pub fn set_bytes<T>(&self, index: usize, data: &T) {
+    pub fn set_bytes<T: 'static>(&self, index: usize, data: &T) {
         let size = core::mem::size_of::<T>();
         let ptr = ptr::NonNull::new(data as *const T as *mut c_void).unwrap();
+        if !self.executor.is_classical() {
+            self.executor
+                .will_set_bytes(index, crate::kernels::metal::executor::scalar_bytes(data));
+        }
         unsafe { self.raw.setBytes_length_atIndex(ptr, size, index) }
     }
 

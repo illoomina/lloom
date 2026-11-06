@@ -114,6 +114,10 @@ rand_distr = { workspace = true }
 default = []
 # Optional attribution and detailed diagnostics in optimized builds.
 profile = []
+# A planned pass's build also lowers each parameter-dependent node at a held-out
+# value and refuses a fit that does not predict it (planned-step-design.md §10.4).
+# Off by default, and no profile enables it.
+planned-validate = []
 # The stateful fuzz MODELS (`buffer_pool_fuzz`, `commands_fuzz`, `scratch_fuzz`)
 # and the one accessor they read, compiled OUTSIDE `#[cfg(test)]` so the
 # coverage-guided harnesses in `lloom-fuzz/` (lloom #706) can drive them. Off by

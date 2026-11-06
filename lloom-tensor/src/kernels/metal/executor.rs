@@ -159,6 +159,18 @@ pub trait Executor: Send + Sync {
     /// Called when pipeline state is set, before it reaches Metal.
     fn will_set_pipeline(&self, _pipeline: &ComputePipeline) {}
 
+    /// Called when inline bytes are set at `index`, before they reach Metal.
+    ///
+    /// `setBytes` copies its argument into the encoder and leaves nothing
+    /// readable, so an executor that records a dispatch takes the bytes here.
+    /// `bytes` is empty when the argument is a value the encoder cannot
+    /// expose soundly, a struct that may carry padding ([`scalar_bytes`]).
+    fn will_set_bytes(&self, _index: usize, _bytes: &[u8]) {}
+
+    /// Called when threadgroup memory is sized at `index`, before it reaches
+    /// Metal.
+    fn will_set_threadgroup_memory(&self, _index: usize, _len: usize) {}
+
     /// The decode step just encoded is complete; the next dispatch opens a new one.
     ///
     /// Nothing inside the encoder knows where a step ends -- command buffers are
@@ -175,6 +187,37 @@ pub trait Executor: Send + Sync {
     fn end_step(&self, _device: &Device, _commands: &Commands) -> Result<(), MetalKernelError> {
         Ok(())
     }
+}
+
+/// `data`'s bytes when `T` is a primitive, and empty otherwise: what
+/// [`Executor::will_set_bytes`] is given for an argument bound by
+/// `ComputeCommandEncoder::set_bytes`. A struct may carry padding, and its
+/// padding bytes are uninitialized, so they are never read as `u8`.
+pub(crate) fn scalar_bytes<T: 'static>(data: &T) -> &[u8] {
+    use std::any::TypeId;
+    let t = TypeId::of::<T>();
+    let primitive = t == TypeId::of::<u8>()
+        || t == TypeId::of::<i8>()
+        || t == TypeId::of::<u16>()
+        || t == TypeId::of::<i16>()
+        || t == TypeId::of::<u32>()
+        || t == TypeId::of::<i32>()
+        || t == TypeId::of::<u64>()
+        || t == TypeId::of::<i64>()
+        || t == TypeId::of::<usize>()
+        || t == TypeId::of::<isize>()
+        || t == TypeId::of::<f32>()
+        || t == TypeId::of::<f64>()
+        || t == TypeId::of::<half::f16>()
+        || t == TypeId::of::<half::bf16>()
+        || t == TypeId::of::<bool>();
+    if !primitive {
+        return &[];
+    }
+    // SAFETY: `T` is one of the primitives above, none of which has padding,
+    // so every one of `*data`'s `size_of::<T>()` bytes is initialized, and
+    // the slice borrows `data` for its own lifetime.
+    unsafe { std::slice::from_raw_parts((data as *const T).cast::<u8>(), std::mem::size_of::<T>()) }
 }
 
 /// What an executor will do with the position about to be dispatched, as far as
@@ -388,6 +431,22 @@ impl ExecutorSlot {
         match self {
             ExecutorSlot::Classical => {}
             ExecutorSlot::Custom(e) => e.will_set_pipeline(pipeline),
+        }
+    }
+
+    #[inline(always)]
+    pub fn will_set_bytes(&self, index: usize, bytes: &[u8]) {
+        match self {
+            ExecutorSlot::Classical => {}
+            ExecutorSlot::Custom(e) => e.will_set_bytes(index, bytes),
+        }
+    }
+
+    #[inline(always)]
+    pub fn will_set_threadgroup_memory(&self, index: usize, len: usize) {
+        match self {
+            ExecutorSlot::Classical => {}
+            ExecutorSlot::Custom(e) => e.will_set_threadgroup_memory(index, len),
         }
     }
 

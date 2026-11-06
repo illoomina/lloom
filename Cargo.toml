@@ -274,3 +274,9 @@ codegen-units = 16
 # Owned pinned transport repair; public mirror retains this relative locus.
 [patch.crates-io]
 tiny_http = { path = "vendor/tiny_http" }
+# Upstream safetensors v0.8.0 as a squashed git subtree (vendor/safetensors is
+# the whole upstream tree; the crate is its safetensors/ directory). Patches on
+# it stay separate commits so they can be split out and upstreamed. Only the
+# 0.8 requirement resolves here; the transitive safetensors 0.4.x stays on the
+# registry.
+safetensors = { path = "vendor/safetensors/safetensors" }

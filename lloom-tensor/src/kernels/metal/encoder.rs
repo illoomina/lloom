@@ -21,6 +21,44 @@ use std::{
     },
 };
 
+#[cfg(any(test, feature = "fuzzing"))]
+thread_local! {
+    static RAW_DISPATCH_OBSERVATION: std::cell::Cell<Option<usize>> = const {
+        std::cell::Cell::new(None)
+    };
+}
+
+/// Test-owned synchronous raw-entry census, not GPU completion. Other threads
+/// and callbacks cannot change this scope; unwind restores the inactive state.
+#[cfg(any(test, feature = "fuzzing"))]
+#[doc(hidden)]
+pub fn observe_raw_dispatches_for_test<R>(call: impl FnOnce() -> R) -> (R, usize) {
+    RAW_DISPATCH_OBSERVATION.with(|slot| {
+        assert!(slot.get().is_none(), "nested raw-dispatch observation");
+        struct Reset<'a>(&'a std::cell::Cell<Option<usize>>);
+        impl Drop for Reset<'_> {
+            fn drop(&mut self) {
+                self.0.set(None);
+            }
+        }
+        slot.set(Some(0));
+        let reset = Reset(slot);
+        let result = call();
+        let count = slot.get().expect("active raw-dispatch observation");
+        drop(reset);
+        (result, count)
+    })
+}
+
+#[cfg(any(test, feature = "fuzzing"))]
+fn observe_raw_dispatch_entry_for_test() {
+    RAW_DISPATCH_OBSERVATION.with(|slot| {
+        if let Some(count) = slot.get() {
+            slot.set(Some(count.checked_add(1).expect("test raw census overflow")));
+        }
+    });
+}
+
 /// Shared cross-encoder output map: maps buffer pointer -> fence of the last encoder that wrote it.
 /// Used by subsequent encoders to call waitForFence before reading those buffers.
 ///
@@ -1637,6 +1675,8 @@ impl ComputeCommandEncoder {
         ) {
             return;
         }
+        #[cfg(any(test, feature = "fuzzing"))]
+        observe_raw_dispatch_entry_for_test();
         self.raw
             .dispatchThreads_threadsPerThreadgroup(threads_per_grid, threads_per_threadgroup)
     }
@@ -1661,6 +1701,8 @@ impl ComputeCommandEncoder {
         ) {
             return;
         }
+        #[cfg(any(test, feature = "fuzzing"))]
+        observe_raw_dispatch_entry_for_test();
         self.raw.dispatchThreadgroups_threadsPerThreadgroup(
             threadgroups_per_grid,
             threads_per_threadgroup,
@@ -1678,30 +1720,38 @@ impl ComputeCommandEncoder {
         if self.executor.is_classical() {
             return true;
         }
-        let kernel = self.state.lock().current_pipeline.clone();
-        match self.executor.dispatch_action(&DispatchRecord {
-            kernel,
-            grid,
-            threads_per_threadgroup: threads_per_threadgroup.into(),
-        }) {
-            DispatchAction::Encode => true,
-            DispatchAction::Suppress => false,
-            DispatchAction::ExecuteIcb {
-                icb,
-                location,
-                length,
-            } => {
-                self.execute_icb_range(&icb, location, length);
-                false
+        let result: Result<bool, crate::kernels::MetalKernelError> = (|| {
+            // Query the existing authentic latch, not a duplicate failure bit.
+            // Even a later ordinary mismatch must not emit after a refusal.
+            self.command_buffer.check_lifecycle_failure()?;
+            let kernel = self.state.lock().current_pipeline.clone();
+            match self.executor.dispatch_action(&DispatchRecord {
+                kernel,
+                grid,
+                threads_per_threadgroup: threads_per_threadgroup.into(),
+            })? {
+                DispatchAction::Encode => Ok(true),
+                DispatchAction::Suppress => Ok(false),
+                DispatchAction::ExecuteIcb { icb, location, length } => {
+                    self.execute_icb_range(&icb, location, length);
+                    Ok(false)
+                }
+                DispatchAction::ExecuteIcbThenEncode { icb, location, length } => {
+                    self.execute_icb_range(&icb, location, length);
+                    self.barrier_after_icb();
+                    Ok(true)
+                }
             }
-            DispatchAction::ExecuteIcbThenEncode {
-                icb,
-                location,
-                length,
-            } => {
-                self.execute_icb_range(&icb, location, length);
-                self.barrier_after_icb();
-                true
+        })();
+        match result {
+            Ok(encode) => encode,
+            Err(_error) => {
+                // Void dispatch remains source-compatible. The exact recording
+                // fails sticky: owner preparation/submission and all following
+                // offers refuse. Never turn this into classical mismatch.
+                self.command_buffer.fail_lifecycle();
+                self.executor.fail_step();
+                false
             }
         }
     }
@@ -3160,6 +3210,39 @@ pub(crate) mod emitted {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn raw_dispatch_observation_rejects_nesting_and_restores_after_unwind() {
+        let ((), count) = observe_raw_dispatches_for_test(|| {
+            let nested = std::panic::catch_unwind(|| observe_raw_dispatches_for_test(|| ()));
+            assert!(nested.is_err());
+            observe_raw_dispatch_entry_for_test();
+        });
+        assert_eq!(count, 1);
+        let unwound = std::panic::catch_unwind(|| observe_raw_dispatches_for_test(|| {
+            observe_raw_dispatch_entry_for_test();
+            panic!("test observation unwind");
+        }));
+        assert!(unwound.is_err());
+        assert_eq!(observe_raw_dispatches_for_test(|| ()).1, 0);
+    }
+
+    #[test]
+    fn raw_dispatch_observation_is_owned_by_its_synchronous_thread() {
+        let ((), outer) = observe_raw_dispatches_for_test(|| {
+            observe_raw_dispatch_entry_for_test();
+            std::thread::scope(|scope| {
+                let child = scope.spawn(|| observe_raw_dispatches_for_test(|| {
+                    observe_raw_dispatch_entry_for_test();
+                    observe_raw_dispatch_entry_for_test();
+                }).1);
+                assert_eq!(child.join().expect("test observer thread"), 2);
+            });
+        });
+        assert_eq!(outer, 1);
+        assert_eq!(observe_raw_dispatches_for_test(|| ()).1, 0);
+    }
+
 
     fn r(ptr: usize, offset: usize, len: usize) -> BoundRange {
         BoundRange { ptr, offset, len }

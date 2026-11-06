@@ -432,7 +432,7 @@ impl CommandBuffer {
             Backend::Metal4(submission) => &submission.command_lifecycle,
         }
     }
-    fn check_lifecycle_failure(&self) -> Result<(), crate::kernels::MetalKernelError> {
+    pub(super) fn check_lifecycle_failure(&self) -> Result<(), crate::kernels::MetalKernelError> {
         match &self.backend {
             Backend::Metal3(raw) if raw.failure.get().is_some() => {
                 Err(crate::kernels::MetalKernelError::QueueUnavailable(
@@ -444,7 +444,7 @@ impl CommandBuffer {
             Backend::Metal4(submission) => submission.check_lifecycle_failure(),
         }
     }
-    fn fail_lifecycle(&self) {
+    pub(super) fn fail_lifecycle(&self) {
         match &self.backend {
             Backend::Metal3(raw) => raw
                 .failure

@@ -357,6 +357,9 @@ pub struct IcbExecutor {
 }
 
 struct Inner {
+    // Common refusal state only: no LIVE frame custody or cache pin.
+    // An explicit abort does not clear a genuine prior failure.
+    step_failed: bool,
     phase: Phase,
     /// How many steps to record before deciding what is replayable.
     ///
@@ -697,6 +700,7 @@ impl IcbExecutor {
         );
         Arc::new(IcbExecutor {
             inner: Mutex::new(Inner {
+                step_failed: false,
                 phase: Phase::Recording,
                 record_steps,
                 recording: Recording::default(),
@@ -782,6 +786,12 @@ impl IcbExecutor {
         device: &crate::kernels::metal::Device,
         commands: &Commands,
     ) -> Result<(), crate::kernels::MetalKernelError> {
+        if let Err(error) = commands.check_recording_failure() {
+            // First observation may be a native queue failure, not an offer
+            // refusal. Detach known-unissued work before any later owner call.
+            self.fail_step();
+            return Err(error);
+        }
         // A run still pending at the boundary is one the stream ended inside:
         // its validated members were suppressed on the promise of a range that
         // never got issued, and the only correct place for that range is here,
@@ -789,6 +799,11 @@ impl IcbExecutor {
         // Taken out from under the lock, because issuing it reaches the queue.
         let unissued = {
             let mut inner = self.inner.lock();
+            if inner.step_failed {
+                return Err(crate::kernels::MetalKernelError::QueueUnavailable(
+                    "ICB step failed",
+                ));
+            }
             inner.pending.take()
         };
         if let Some(p) = unissued {
@@ -1244,6 +1259,17 @@ impl IcbExecutor {
 }
 
 impl Inner {
+    fn detach_unissued(&mut self) {
+        self.pending = None;
+        self.position = 0;
+        self.recording.pending.clear();
+        self.recording.pending_retained.clear();
+        self.recording.pending_pipeline = None;
+        self.recording.current.clear();
+        // A partial observation is not a completed recording window.
+        self.recording.steps.clear();
+    }
+
     /// Decide what is replayable and encode it.
     /// Build the replay plan from the recorded steps — the device work
     /// (`encode_plan`, which allocates and encodes an `MTLIndirectCommandBuffer`)
@@ -1821,8 +1847,13 @@ fn pipeline_raw(p: &ComputePipeline) -> &ProtocolObject<dyn MTLComputePipelineSt
 }
 
 impl Executor for IcbExecutor {
-    fn dispatch_action(&self, record: &DispatchRecord) -> DispatchAction {
+    fn dispatch_action(
+        &self, record: &DispatchRecord,
+    ) -> Result<DispatchAction, crate::kernels::MetalKernelError> {
         let mut inner = self.inner.lock();
+        if inner.step_failed {
+            return Err(crate::kernels::MetalKernelError::QueueUnavailable("ICB step failed"));
+        }
         let pos = inner.position;
         inner.position += 1;
 
@@ -1838,7 +1869,7 @@ impl Executor for IcbExecutor {
             retained,
         };
 
-        match inner.phase {
+        Ok(match inner.phase {
             Phase::Recording => {
                 inner.recording.current.push(live);
                 // Recording forwards everything: the recorded step has to be a
@@ -1847,7 +1878,7 @@ impl Executor for IcbExecutor {
                 DispatchAction::Encode
             }
             Phase::Replaying => Self::replay_action(&mut inner, pos, &live),
-        }
+        })
     }
 
     /// The decision half of [`Self::dispatch_action`], split out so it can be
@@ -1892,7 +1923,7 @@ impl Executor for IcbExecutor {
     /// (`DispatchAction::ExecuteIcbThenEncode`).
     fn disposition(&self) -> Disposition {
         let inner = self.inner.lock();
-        if inner.replay_barriers != ReplayBarriers::SkipReplayed {
+        if inner.step_failed || inner.replay_barriers != ReplayBarriers::SkipReplayed {
             return Disposition::Unknown;
         }
         if inner.phase != Phase::Replaying {
@@ -1906,6 +1937,7 @@ impl Executor for IcbExecutor {
 
     fn will_bind_buffer(&self, index: usize, buffer: &Buffer, offset: usize, is_output: bool) {
         let mut inner = self.inner.lock();
+        if inner.step_failed { return; }
         inner.recording.pending.push(BindingRecord {
             index,
             ptr: buffer.raw_addr(),
@@ -1918,7 +1950,31 @@ impl Executor for IcbExecutor {
 
     fn will_set_pipeline(&self, pipeline: &ComputePipeline) {
         let mut inner = self.inner.lock();
+        if inner.step_failed { return; }
         inner.recording.pending_pipeline = Some(pipeline.clone());
+    }
+
+    fn abort_step(&self) {
+        let reset_positionals = {
+            let mut inner = self.inner.lock();
+            inner.detach_unissued();
+            !inner.step_failed
+        };
+        // Replay position and positional params start the same next window.
+        // Reset only after detaching, off Inner; keep a failed step poisoned.
+        // Like end_step, this assumes one positional executor stream per
+        // process: the enabled constants pool is process-global.
+        if reset_positionals {
+            if let Some(pool) = crate::kernels::kernels::params::constants_pool() {
+                pool.reset();
+            }
+        }
+    }
+
+    fn fail_step(&self) {
+        let mut inner = self.inner.lock();
+        inner.step_failed = true;
+        inner.detach_unissued();
     }
 
     fn end_step(
@@ -1928,4 +1984,389 @@ impl Executor for IcbExecutor {
     ) -> Result<(), crate::kernels::MetalKernelError> {
         IcbExecutor::end_step(self, device, commands)
     }
+}
+
+
+#[cfg(test)]
+mod common_refusal_state_tests {
+    use super::*;
+    fn record() -> DispatchRecord {
+        DispatchRecord { kernel: None, grid: Grid::Threadgroups(Size3 { width: 1, height: 1, depth: 1 }),
+            threads_per_threadgroup: Size3 { width: 1, height: 1, depth: 1 } }
+    }
+    #[test]
+    fn common_abort_discards_partial_recording_and_failure_cannot_resurrect() {
+        let executor = IcbExecutor::new(2);
+        assert!(matches!(executor.dispatch_action(&record()), Ok(DispatchAction::Encode)));
+        assert_eq!(executor.inner.lock().recording.current.len(), 1);
+        executor.abort_step();
+        {
+            let inner = executor.inner.lock();
+            assert!(!inner.step_failed);
+            assert_eq!(inner.position, 0);
+            assert!(inner.pending.is_none());
+            assert!(inner.recording.current.is_empty());
+            assert!(inner.recording.steps.is_empty());
+        }
+        assert!(matches!(executor.dispatch_action(&record()), Ok(DispatchAction::Encode)),
+            "healthy explicit abort must allow a fresh recording");
+        executor.fail_step();
+        executor.abort_step();
+        assert!(executor.dispatch_action(&record()).is_err(), "abort resurrected a failed executor");
+        let inner = executor.inner.lock();
+        assert!(inner.step_failed);
+        assert_eq!(inner.position, 0);
+        assert!(inner.pending.is_none());
+        assert!(inner.recording.current.is_empty());
+        assert!(inner.recording.pending.is_empty());
+        assert!(inner.recording.pending_retained.is_empty());
+        assert!(inner.recording.pending_pipeline.is_none());
+    }
+}
+
+
+#[cfg(test)]
+mod common_refusal_native_tests {
+    use super::*;
+    use crate::{Device as TensorDevice, Result};
+    use crate::kernels::{call_unary_contiguous, unary, BufferOffset};
+    use crate::kernels::metal::{trace, ExecutorSlot};
+    use crate::metal_backend::{ArenaLayout, MetalError, PassKey, PassKind};
+    use objc2_metal::{MTLDevice as _, MTLSharedEvent as _};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+    struct Fixture {
+        device: TensorDevice,
+        source: Buffer,
+        scratch: Buffer,
+        output: Buffer,
+        executor: Arc<IcbExecutor>,
+        armed: Arc<AtomicBool>,
+        entered: Arc<AtomicBool>,
+        target_completed: Arc<AtomicU64>,
+    }
+    fn emit(f: &Fixture, tail: bool) -> Result<()> {
+        let metal = f.device.as_metal_device()?;
+        let guard = metal.commands().command_encoder().map_err(MetalError::from)?;
+        let (source, output) = if tail { (&f.scratch, &f.output) } else { (&f.source, &f.scratch) };
+        // SAFETY: fixture owns three exact Shared allocations of 64 F32s,
+        // retained before intentional faults. Offsets are zero and all shapes
+        // are valid even under an extra-Encode/omitted-cleanup mutant.
+        unsafe {
+            call_unary_contiguous(metal.metal_device(), &guard, metal.kernels(),
+                unary::contiguous::cos::FLOAT, 4, 64, BufferOffset::zero_offset(source), output)
+        }.map_err(MetalError::from)?;
+        Ok(())
+    }
+    fn fixture() -> Result<&'static Fixture> {
+        crate::kernels::set_pipelines_support_icb(true).map_err(MetalError::from)?;
+        assert!(crate::kernels::constants_pool().is_none(), "exact test needs a fresh process");
+        crate::kernels::set_default_param_style(crate::kernels::ParamStyle::Packed);
+        crate::kernels::set_constants_pool_enabled(true);
+        let device = TensorDevice::new_metal(0)?;
+        let metal = device.as_metal_device()?;
+        let actual = metal.commands().actual_command_api();
+        let requested = &crate::tuning::tuning().metal.command_api;
+        if requested != "auto" {
+            assert_eq!(actual, requested);
+        }
+        if let Ok(requested) = std::env::var("LLOOM_METAL_API") {
+            if requested != "auto" {
+                assert_eq!(actual, requested);
+            }
+        }
+        eprintln!("COMMON_ICB_SETUP requested={requested} actual_api={actual}");
+        metal.set_compute_per_buffer(usize::MAX);
+        let input: Vec<f32> = (0..64).map(|i| i as f32 / 16.).collect();
+        let zeros = [0f32; 64];
+        let raw = metal.metal_device();
+        let options = crate::kernels::RESOURCE_OPTIONS;
+        let source = raw.new_buffer_with_data(input.as_ptr().cast(), 256, options)
+            .map_err(crate::Error::msg)?;
+        let scratch = raw.new_buffer_with_data(zeros.as_ptr().cast(), 256, options)
+            .map_err(crate::Error::msg)?;
+        let output = raw.new_buffer_with_data(zeros.as_ptr().cast(), 256, options)
+            .map_err(crate::Error::msg)?;
+        let armed = Arc::new(AtomicBool::new(false));
+        let entered = Arc::new(AtomicBool::new(false));
+        let target_completed = Arc::new(AtomicU64::new(u64::MAX));
+        let a = armed.clone(); let e = entered.clone();
+        let target = target_completed.clone();
+        let callback_clock = metal.gpu_clock();
+        // Register BEFORE the first warm submission seals setup.
+        metal.commands().on_command_buffer_complete(move || {
+            // Hook marks its genuine epoch before invoking subscribers. The
+            // target count cannot become ready until the actual GPU event.
+            if callback_clock.completed_count().0 == target.load(Ordering::Acquire)
+                && a.swap(false, Ordering::AcqRel) {
+                e.store(true, Ordering::Release);
+                panic!("controlled common earlier-recording subscriber failure");
+            }
+        }).map_err(crate::Error::wrap)?;
+        let executor = IcbExecutor::new(2);
+        metal.set_executor(Arc::new(ExecutorSlot::Custom(executor.clone())));
+        // Bounded process-root custody is intentional for queue-failure and
+        // mutation-unwind cases; never claim this native fixture retired.
+        let f = Box::leak(Box::new(Fixture { device, source, scratch, output, executor, armed, entered, target_completed }));
+        let metal = f.device.as_metal_device()?;
+        for _ in 0..3 {
+            metal.begin_decode_step();
+            emit(f, false)?;
+            emit(f, true)?;
+            metal.flush_and_wait_current()?;
+            metal.finish_decode_step()?;
+            metal.end_executor_step()?;
+        }
+        assert!(f.executor.is_replaying());
+        assert_eq!(f.executor.coverage().covered, 2, "two actual packed positions required");
+        assert_eq!(f.executor.runs(), 1);
+        assert!(trace::execute_range_count() > 0, "warm population never issued an actual ICB range");
+        // SAFETY: warm flush above proves the actual writer complete and the
+        // fixture retains the whole initialized 64-F32 allocation.
+        let values = unsafe { std::slice::from_raw_parts(f.output.contents().cast::<f32>(), 64) };
+        assert!(values.iter().all(|v| v.is_finite() && *v >= 0.5 && *v <= 1.));
+        assert_ne!(values[0].to_bits(), values[16].to_bits(), "vacuous warm replay output");
+        Ok(f)
+    }
+    struct Release<F: FnOnce()>(Option<F>);
+    impl<F: FnOnce()> Drop for Release<F> { fn drop(&mut self) { if let Some(f) = self.0.take() { f(); } } }
+
+    // Genuine selected-queue error first observed AFTER a healthy pending head.
+    // No dispatch-origin Err/fail_step is used to seed this condition.
+    fn first_observed_callback_failure(finish_pass: bool) -> Result<()> {
+        let _pool = crate::AutoreleaseScope::new();
+        let f = fixture()?;
+        let metal = f.device.as_metal_device()?;
+        let event = metal.metal_device().as_ref().newSharedEvent()
+            .ok_or_else(|| crate::Error::msg("common queue-failure fixture needs a shared event"))?;
+        let release = Release(Some(|| event.setSignaledValue(1)));
+        metal.commands().encode_wait_for_event(&event, 1).map_err(MetalError::from)?;
+        // Metal4's encode_wait has an existing preliminary cut. Do NOT arm
+        // against that possibly still-in-flight empty record: target the
+        // current event-held record's authenticated clock count instead.
+        f.target_completed.store(metal.gpu_clock().current_epoch().0.checked_add(1)
+            .expect("small fixture clock count"), Ordering::Release);
+        f.armed.store(true, Ordering::Release);
+        let prior = metal.flush_marker()?;
+        assert!(!prior.is_complete(), "real prior GPU wait did not hold callback");
+        assert!(!f.entered.load(Ordering::Acquire));
+        metal.enable_pass_plans(ArenaLayout::NonAliasing);
+        metal.begin_pass(PassKey::new(PassKind::Decode { b: 1 }))?;
+        let aborted = metal.pass_plan_counters().unwrap().aborted;
+        let ranges = trace::execute_range_count();
+        let (head, raw) = crate::kernels::metal::encoder::observe_raw_dispatches_for_test(|| emit(f, false));
+        head?;
+        assert_eq!(raw, 0);
+        {
+            let inner = f.executor.inner.lock();
+            assert!(!inner.step_failed);
+            assert_eq!(inner.pending.as_ref().map(|p| p.validated), Some(1), "no genuine unissued prefix");
+        }
+        assert_eq!(trace::execute_range_count(), ranges);
+        metal.check_recording_failure()?;
+        drop(release);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while metal.check_recording_failure().is_ok() && std::time::Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert!(f.entered.load(Ordering::Acquire), "genuine callback did not run");
+        let actual_api = metal.commands().actual_command_api();
+        let reason = if actual_api == "metal3" { "M3 retirement queue failed" } else { "retirement queue failed" };
+        let is_original = |e: &crate::Error| matches!(e.without_backtrace(), crate::Error::Metal(
+            MetalError::KernelError(crate::kernels::MetalKernelError::QueueUnavailable(actual))) if *actual == reason);
+        let error = metal.check_recording_failure().expect_err("selected queue did not publish the callback failure");
+        assert!(is_original(&error));
+        assert!(f.executor.inner.lock().pending.is_some(), "callback itself unexpectedly detached the pending prefix");
+        // The PRIOR submitted buffer legitimately completed before its callback
+        // panic. Snapshot only now; current unissued work must not be completed.
+        let clock = metal.gpu_clock();
+        let before_current = clock.current_epoch();
+        let before_completed = clock.completed_count();
+        let (close, raw) = crate::kernels::metal::encoder::observe_raw_dispatches_for_test(|| {
+            if finish_pass { metal.finish_pass() } else { metal.end_executor_step() }
+        });
+        assert!(is_original(&close.expect_err("failed owner close returned success")));
+        {
+            let inner = f.executor.inner.lock();
+            assert!(inner.step_failed && inner.pending.is_none(),
+                "owner entry-query refusal retained known-unissued pending work");
+            assert!(inner.recording.pending.is_empty() && inner.recording.pending_retained.is_empty());
+        }
+        if finish_pass {
+            assert!(!metal.pass_open(), "query-error pass cleanup retained current pass");
+            assert_eq!(metal.pass_plan_counters().unwrap().aborted, aborted + 1);
+            assert!(metal.arena().is_none());
+            assert!(metal.pause_pass_plans().is_ok(), "query-error cleanup retained current/closing custody");
+        }
+        assert_eq!(raw, 0);
+        assert_eq!(trace::execute_range_count(), ranges, "exceptional close issued an unissued prefix");
+        assert_eq!(clock.current_epoch(), before_current);
+        assert_eq!(clock.completed_count(), before_completed, "unissued cleanup fabricated completion");
+        metal.abort_decode_step();
+        metal.begin_decode_step(); // NOT recovery of a poisoned native queue
+        let (_, raw) = crate::kernels::metal::encoder::observe_raw_dispatches_for_test(|| emit(f, true));
+        assert_eq!(raw, 0);
+        assert!(f.executor.inner.lock().pending.is_none(), "next arena begin resurrected failed work");
+        assert_eq!(trace::execute_range_count(), ranges);
+        assert!(metal.end_executor_step().is_err());
+        assert!(metal.flush_marker().is_err());
+        eprintln!("COMMON_OWNER_FAILURE actual_api={actual_api} finish_pass={finish_pass} raw=0 unissued_detached=true original_typed_cause=true");
+        Ok(())
+    }
+    #[test] fn common_finish_pass_query_origin_failure_detaches_pending() -> Result<()> {
+        first_observed_callback_failure(true)
+    }
+    #[test] fn common_executor_end_query_origin_failure_detaches_pending() -> Result<()> {
+        first_observed_callback_failure(false)
+    }
+    fn healthy_abort_then_new_window() -> Result<()> {
+        let _pool = crate::AutoreleaseScope::new();
+        let f = fixture()?;
+        let metal = f.device.as_metal_device()?;
+        // SAFETY: the completed warm output is retained and fully initialized.
+        let before = unsafe { std::slice::from_raw_parts(f.output.contents().cast::<f32>(), 64) }
+            .iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+        let ranges = trace::execute_range_count();
+        metal.begin_decode_step();
+        emit(f, false)?;
+        assert!(f.executor.inner.lock().pending.is_some(), "no real prefix to abort");
+        assert_eq!(trace::execute_range_count(), ranges);
+        metal.abort_decode_step();
+        assert!(f.executor.inner.lock().pending.is_none(), "actual abort retained a pending prefix");
+        assert!(!f.executor.inner.lock().step_failed, "healthy explicit abort poisoned future windows");
+        metal.flush_and_wait_current()?;
+        assert_eq!(trace::execute_range_count(), ranges, "abort cleanup issued its abandoned prefix");
+        metal.begin_decode_step();
+        emit(f, false)?;
+        let fresh_pending = f.executor.inner.lock().pending.is_some();
+        let pool_counters = crate::kernels::constants_pool().expect("enabled packed pool").counters();
+        let stale = f.executor.stale_report();
+        let parameter_refs = {
+            let inner = f.executor.inner.lock();
+            inner.plan.as_ref().map(|plan| plan.layout.reference.iter().take(2)
+                .map(|dispatch| dispatch.bindings.iter().find(|b| b.index == 0).map(|b| b.ptr))
+                .collect::<Vec<_>>())
+        };
+        eprintln!("COMMON_ABORT_RESTART fresh_pending={fresh_pending} stale={stale:?} params={pool_counters:?} reference_param_ptrs={parameter_refs:?}");
+        assert!(f.executor.inner.lock().pending.is_some(), "new window did not start a fresh run");
+        emit(f, true)?;
+        assert_eq!(trace::execute_range_count(), ranges + 1, "new window did not issue exactly once");
+        metal.flush_and_wait_current()?;
+        metal.finish_decode_step()?;
+        metal.end_executor_step()?;
+        // SAFETY: the explicit healthy flush above proves this writer complete.
+        let after = unsafe { std::slice::from_raw_parts(f.output.contents().cast::<f32>(), 64) }
+            .iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+        assert_eq!(after, before, "healthy abort/new-window changed the real replay result");
+        metal.check_recording_failure()?;
+        Ok(())
+    }
+    #[test] fn common_abort_then_new_window_does_not_resurrect_prefix() -> Result<()> {
+        healthy_abort_then_new_window()
+    }
+
+    // Actual finish/abort conflict, not an injected cleanup Error. One isolated
+    // process per requested API; fixture setup/subscriber seal is shared above.
+    #[test]
+    fn common_closing_refusal_keeps_typed_query_cause_and_diagnostic() -> Result<()> {
+        let _pool = crate::AutoreleaseScope::new();
+        let f = fixture()?;
+        let metal = f.device.as_metal_device()?;
+        metal.enable_pass_plans(ArenaLayout::NonAliasing);
+        let key = PassKey::new(PassKind::Decode { b: 1 });
+        // First real pass registers a pending recorder, not a fake cache/token.
+        metal.begin_pass(key)?;
+        emit(f, false)?;
+        emit(f, true)?;
+        metal.finish_pass()?;
+        metal.flush_and_wait_current()?;
+        metal.end_executor_step()?;
+        assert!(!metal.pass_open());
+
+        let event = metal.metal_device().as_ref().newSharedEvent()
+            .ok_or_else(|| crate::Error::msg("closing fixture needs a shared event"))?;
+        metal.commands().encode_wait_for_event(&event, 1).map_err(MetalError::from)?;
+        let release_event = event.clone();
+        let release = Release(Some(move || release_event.setSignaledValue(1)));
+        f.target_completed.store(metal.gpu_clock().current_epoch().0.checked_add(1)
+            .expect("small closing fixture clock"), Ordering::Release);
+        f.armed.store(true, Ordering::Release);
+        let prior = metal.flush_marker()?;
+        assert!(!prior.is_complete() && !f.entered.load(Ordering::Acquire));
+        metal.begin_pass(key)?;
+        let ranges = trace::execute_range_count();
+        let (head, raw) = crate::kernels::metal::encoder::observe_raw_dispatches_for_test(|| emit(f, false));
+        head?;
+        assert_eq!(raw, 0);
+        {
+            let inner = f.executor.inner.lock();
+            assert!(!inner.step_failed);
+            assert_eq!(inner.pending.as_ref().map(|p| p.validated), Some(1));
+        }
+        metal.check_recording_failure()?;
+        let observed = Arc::new(AtomicBool::new(false));
+        let observed_hook = observed.clone();
+        let (outer, raw) = crate::kernels::metal::encoder::observe_raw_dispatches_for_test(|| {
+            metal.with_closing_refusal_observer_for_test(move |metal| {
+                // Actual complete_closing now owns its exact token. Helper
+                // verifies no needed>have growth, before and after reentry.
+                drop(release);
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                while metal.check_recording_failure().is_ok() && std::time::Instant::now() < deadline {
+                    std::thread::yield_now();
+                }
+                assert!(f.entered.load(Ordering::Acquire), "genuine callback did not run");
+                assert!(metal.check_recording_failure().is_err());
+                assert!(f.executor.inner.lock().pending.is_some(),
+                    "callback itself unexpectedly detached the pending prefix");
+                let clock = metal.gpu_clock();
+                // Prior held native work legitimately completes before its
+                // subscriber panics; only CURRENT unissued work is invariant.
+                let current = clock.current_epoch();
+                let completed = clock.completed_count();
+                let error = metal.finish_pass().expect_err("nested failed owner returned success");
+                {
+                    let inner = f.executor.inner.lock();
+                    assert!(inner.step_failed && inner.pending.is_none(),
+                        "closing owner refusal retained known-unissued pending work");
+                    assert!(inner.recording.pending.is_empty()
+                        && inner.recording.pending_retained.is_empty());
+                }
+                let crate::Error::Context { inner, context } = error.without_backtrace() else {
+                    panic!("cleanup refusal lost its diagnostic Context");
+                };
+                assert!(context.to_string().contains("abort while a finish is closing"),
+                    "cleanup refusal diagnostic was lost");
+                let api = metal.commands().actual_command_api();
+                let expected = if api == "metal3" { "M3 retirement queue failed" } else { "retirement queue failed" };
+                assert!(matches!(inner.without_backtrace(), crate::Error::Metal(
+                    MetalError::KernelError(crate::kernels::MetalKernelError::QueueUnavailable(reason)))
+                    if *reason == expected), "Context replaced the original typed query cause");
+                assert_eq!(error.state_touched(), None);
+                assert!(error.allocation().is_none());
+                assert_eq!(clock.current_epoch(), current);
+                assert_eq!(clock.completed_count(), completed, "unissued cleanup fabricated completion");
+                assert_eq!(trace::execute_range_count(), ranges);
+                observed_hook.store(true, Ordering::Release);
+            }, || metal.finish_pass())
+        });
+        assert!(observed.load(Ordering::Acquire), "actual ClosingGuard rendezvous was not reached");
+        assert!(outer.is_err(), "invalidated original recorder unexpectedly published");
+        assert_eq!(raw, 0);
+        assert_eq!(trace::execute_range_count(), ranges);
+        // Original owner's real ClosingGuard clears only its own transaction.
+        assert!(!metal.pass_open());
+        assert!(metal.pause_pass_plans().is_ok(), "original close retained token/current custody");
+        assert!(f.executor.inner.lock().pending.is_none());
+        assert!(metal.end_executor_step().is_err());
+        assert!(metal.flush_marker().is_err());
+        metal.abort_decode_step();
+        metal.begin_decode_step(); // no clean/fresh poisoned-queue claim
+        let (_, raw) = crate::kernels::metal::encoder::observe_raw_dispatches_for_test(|| emit(f, true));
+        assert_eq!(raw, 0);
+        assert!(f.executor.inner.lock().pending.is_none());
+        eprintln!("COMMON_CLOSING_CONTEXT actual_api={} original_typed_cause=true cleanup_diagnostic=true current_unissued_detached=true", metal.commands().actual_command_api());
+        Ok(())
+    }
+
 }

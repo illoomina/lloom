@@ -110,14 +110,17 @@ pub trait Executor: Send + Sync {
     /// the uncovered ones between them, and §3.5 makes that a silent wrong
     /// answer rather than an error.
     ///
-    /// Defaulted in terms of [`Self::dispatch`] so no existing implementor
-    /// changes and the classical path is untouched.
-    fn dispatch_action(&self, record: &DispatchRecord) -> DispatchAction {
-        if self.dispatch(record) {
+    /// Defaulted in terms of [`Self::dispatch`]: dispatch-only implementors
+    /// keep their behavior. An override of this method returns a Result; Err
+    /// is a checked refusal, never an ordinary replay mismatch.
+    fn dispatch_action(
+        &self, record: &DispatchRecord,
+    ) -> Result<DispatchAction, MetalKernelError> {
+        Ok(if self.dispatch(record) {
             DispatchAction::Encode
         } else {
             DispatchAction::Suppress
-        }
+        })
     }
 
     /// What this position's disposition will be, **without advancing anything**.
@@ -158,6 +161,14 @@ pub trait Executor: Send + Sync {
 
     /// Called when pipeline state is set, before it reaches Metal.
     fn will_set_pipeline(&self, _pipeline: &ComputePipeline) {}
+
+    /// Detach known-unissued work on an exceptional exit, without issuing it.
+    fn abort_step(&self) {}
+
+    /// A checked refusal poisons this executor step; it is not a mismatch.
+    fn fail_step(&self) {
+        self.abort_step();
+    }
 
     /// The decode step just encoded is complete; the next dispatch opens a new one.
     ///
@@ -352,10 +363,28 @@ impl ExecutorSlot {
     }
 
     #[inline(always)]
-    pub fn dispatch_action(&self, record: &DispatchRecord) -> DispatchAction {
+    pub fn dispatch_action(
+        &self, record: &DispatchRecord,
+    ) -> Result<DispatchAction, MetalKernelError> {
         match self {
-            ExecutorSlot::Classical => DispatchAction::Encode,
+            ExecutorSlot::Classical => Ok(DispatchAction::Encode),
             ExecutorSlot::Custom(e) => e.dispatch_action(record),
+        }
+    }
+
+    #[inline]
+    pub fn abort_step(&self) {
+        match self {
+            ExecutorSlot::Classical => {},
+            ExecutorSlot::Custom(e) => e.abort_step(),
+        }
+    }
+
+    #[inline]
+    pub fn fail_step(&self) {
+        match self {
+            ExecutorSlot::Classical => {},
+            ExecutorSlot::Custom(e) => e.fail_step(),
         }
     }
 

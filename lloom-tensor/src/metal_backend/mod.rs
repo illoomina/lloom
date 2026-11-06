@@ -1031,6 +1031,46 @@ pub fn buffer_o<'a>(buffer: &'a Buffer, l: &Layout, dtype: DType) -> BufferOffse
 /// kernel stem — `conv1d` dispatches the `im2col1d` kernel, and reporting
 /// "im2col1d not implemented" to a user who called `conv1d` would be worse than
 /// the string duplication it saves.
+/// `binary.metal`'s `[[host_name]]` for `op` at `dtype` with an indexer
+/// `suffix`, cached per thread. It ran two `format!`s a binary op (#1235
+/// step 1: 60 allocations a served LFM2 token). The names are finite (ops x
+/// dtypes x indexers): a thread formats one the first time it asks and takes
+/// the process's leaked string for that text (`kernels::interned`, leaked
+/// once per process, not per thread).
+fn binary_kernel_name(op: &'static str, dtype: &DType, suffix: &'static str) -> &'static str {
+    type Key = (&'static str, &'static str, &'static str);
+    thread_local! {
+        static NAMES: std::cell::RefCell<std::collections::HashMap<Key, &'static str>> =
+            std::cell::RefCell::new(std::collections::HashMap::new());
+    }
+    let key = (op, dtype.as_str(), suffix);
+    NAMES.with(|names| {
+        if let Some(name) = names.borrow().get(&key) {
+            return *name;
+        }
+        let name = crate::kernels::interned::intern(format!("{op}_{}{}", key.1, suffix));
+        names.borrow_mut().insert(key, name);
+        name
+    })
+}
+
+#[cfg(test)]
+mod binary_kernel_name_tests {
+    use super::{binary_kernel_name, DType};
+
+    /// A binary name asked for on two threads is one string: the second
+    /// thread caches the process's string instead of leaking its own (#1235
+    /// step 1c).
+    #[test]
+    fn a_binary_name_is_one_string_across_threads() {
+        let ask = || binary_kernel_name("bmul", &DType::BF16, "_rstrided").as_ptr() as usize;
+        let first = std::thread::spawn(ask).join().unwrap();
+        let second = std::thread::spawn(ask).join().unwrap();
+        assert_eq!(first, second, "a new thread must not leak another copy of a binary name");
+        assert_eq!(binary_kernel_name("bmul", &DType::BF16, "_rstrided"), "bmul_bf16_rstrided");
+    }
+}
+
 fn conv_kernel_name(kernel: ConvKernel, dtype: DType, op: &'static str) -> Result<&'static str> {
     match kernel.name(dtype.as_str()) {
         Some(name) => Ok(name),
@@ -3369,27 +3409,6 @@ impl MetalStorage {
         lhs_l: &Layout,
         rhs_l: &Layout,
     ) -> Result<Self> {
-        /// `binary.metal`'s `[[host_name]]` for `op` at `dtype` with an
-        /// indexer `suffix`, formatted once per thread and leaked: the names
-        /// are finite (ops x dtypes x indexers), and this ran two `format!`s a
-        /// binary op (#1235 step 1: 60 allocations a served LFM2 token).
-        fn kernel_name(op: &'static str, dtype: &DType, suffix: &'static str) -> &'static str {
-            type Key = (&'static str, &'static str, &'static str);
-            thread_local! {
-                static NAMES: std::cell::RefCell<std::collections::HashMap<Key, &'static str>> =
-                    std::cell::RefCell::new(std::collections::HashMap::new());
-            }
-            let key = (op, dtype.as_str(), suffix);
-            NAMES.with(|names| {
-                if let Some(name) = names.borrow().get(&key) {
-                    return *name;
-                }
-                let name: &'static str =
-                    Box::leak(format!("{op}_{}{}", key.1, suffix).into_boxed_str());
-                names.borrow_mut().insert(key, name);
-                name
-            })
-        }
         let device = self.device();
         let shape = lhs_l.shape();
         let el_count = shape.elem_count();
@@ -3406,17 +3425,17 @@ impl MetalStorage {
         let lhs_contiguous = lhs_l.is_contiguous();
         let rhs_contiguous = rhs_l.is_contiguous();
 
-        let contiguous_kernel = kernel_name(op, &self.dtype, "");
+        let contiguous_kernel = binary_kernel_name(op, &self.dtype, "");
         let kernel = match (lhs_is_scalar, rhs_is_scalar, lhs_contiguous, rhs_contiguous) {
-            (true, true, _, _) => kernel_name(op, &self.dtype, "_scalar"),
-            (true, false, _, true) => kernel_name(op, &self.dtype, "_sc"),
-            (true, false, _, false) => kernel_name(op, &self.dtype, "_rss"),
-            (false, true, true, _) => kernel_name(op, &self.dtype, "_cs"),
-            (false, true, false, _) => kernel_name(op, &self.dtype, "_lss"),
+            (true, true, _, _) => binary_kernel_name(op, &self.dtype, "_scalar"),
+            (true, false, _, true) => binary_kernel_name(op, &self.dtype, "_sc"),
+            (true, false, _, false) => binary_kernel_name(op, &self.dtype, "_rss"),
+            (false, true, true, _) => binary_kernel_name(op, &self.dtype, "_cs"),
+            (false, true, false, _) => binary_kernel_name(op, &self.dtype, "_lss"),
             (false, false, true, true) => contiguous_kernel,
-            (false, false, true, false) => kernel_name(op, &self.dtype, "_rstrided"),
-            (false, false, false, true) => kernel_name(op, &self.dtype, "_lstrided"),
-            (false, false, false, false) => kernel_name(op, &self.dtype, "_strided"),
+            (false, false, true, false) => binary_kernel_name(op, &self.dtype, "_rstrided"),
+            (false, false, false, true) => binary_kernel_name(op, &self.dtype, "_lstrided"),
+            (false, false, false, false) => binary_kernel_name(op, &self.dtype, "_strided"),
         };
 
         let buffer = if kernel == contiguous_kernel {

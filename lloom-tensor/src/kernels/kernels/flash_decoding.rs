@@ -177,11 +177,12 @@ impl FlashKernel {
         Self::interned(("flash_kv_scatter", dtype, None))
     }
 
-    /// The `[[host_name]]` for `(stem, dtype, head_dim)`, formatted once per
-    /// thread and leaked: the names are finite (`FlashKernel::all`), and the
-    /// decode step built one with `format!` per FlashDecoding dispatch and
-    /// per KV scatter (#1235 step 1: 37 allocations a served LFM2 token).
-    /// `head_dim` is `None` for the scatter, which has no head instantiation.
+    /// The `[[host_name]]` for `(stem, dtype, head_dim)`, cached per thread
+    /// and leaked once per process (`kernels::interned`): the names are
+    /// finite (`FlashKernel::all`), and the decode step built one with
+    /// `format!` per FlashDecoding dispatch and per KV scatter (#1235 step 1:
+    /// 37 allocations a served LFM2 token). `head_dim` is `None` for the
+    /// scatter, which has no head instantiation.
     fn interned(key: (&'static str, FlashDType, Option<usize>)) -> &'static str {
         type Key = (&'static str, FlashDType, Option<usize>);
         thread_local! {
@@ -197,7 +198,7 @@ impl FlashKernel {
                 Some(head_dim) => format!("{stem}_{}_{head_dim}", dtype.suffix()),
                 None => format!("{stem}_{}", dtype.suffix()),
             };
-            let name: &'static str = Box::leak(built.into_boxed_str());
+            let name = crate::kernels::interned::intern(built);
             names.borrow_mut().insert(key, name);
             name
         })
@@ -800,4 +801,21 @@ pub unsafe fn call_flash_kv_scatter(
     };
     encoder.dispatch_threads(grid_dims, group_dims);
     Ok(())
+}
+
+#[cfg(test)]
+mod interned_name_tests {
+    use super::{FlashDType, FlashKernel};
+
+    /// A FlashDecoding name asked for on two threads is one string: the
+    /// second thread caches the process's string instead of leaking its own
+    /// (#1235 step 1c).
+    #[test]
+    fn a_flash_name_is_one_string_across_threads() {
+        let ask = || FlashKernel::scatter(FlashDType::BF16).as_ptr() as usize;
+        let first = std::thread::spawn(ask).join().unwrap();
+        let second = std::thread::spawn(ask).join().unwrap();
+        assert_eq!(first, second, "a new thread must not leak another copy of a flash name");
+        assert_eq!(FlashKernel::scatter(FlashDType::BF16), "flash_kv_scatter_bfloat");
+    }
 }

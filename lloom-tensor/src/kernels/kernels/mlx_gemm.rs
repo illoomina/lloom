@@ -995,15 +995,16 @@ type GemvNameParts = (
     &'static str,
 );
 
-/// The gemv `[[host_name]]` for `parts`, built once per variant per thread.
+/// The gemv `[[host_name]]` for `parts`, cached per thread.
 ///
 /// `gemv_dispatch` used to `format!` this name on every dispatch: 167 of a
 /// served LFM2 token's 3956 allocations (#1235 step 1), and an owned
 /// `KernelName` the pipeline cache then hashed. The names are finite (the
-/// instantiated tiles x dtypes x suffixes), so each is formatted the first
-/// time a thread asks for it and leaked as a `&'static str`; every later
-/// dispatch is a thread-local lookup with no allocation, no lock and no
-/// atomic. Per thread rather than shared so the lookup needs neither.
+/// instantiated tiles x dtypes x suffixes). A thread formats a name the
+/// first time it asks for it and takes the process's leaked string for that
+/// text (`kernels::interned`, leaked once per process, not per thread);
+/// every later dispatch is a thread-local lookup with no allocation, no lock
+/// and no atomic.
 fn gemv_kernel_name(parts: GemvNameParts) -> &'static str {
     thread_local! {
         static NAMES: std::cell::RefCell<std::collections::HashMap<GemvNameParts, &'static str>> =
@@ -1014,12 +1015,9 @@ fn gemv_kernel_name(parts: GemvNameParts) -> &'static str {
             return *name;
         }
         let (prefix, dtype, [bm, bn, sm, sn, tm, tn], norm, epilogue, rows, style) = parts;
-        let name: &'static str = Box::leak(
-            format!(
-                "{prefix}_{dtype}_bm{bm}_bn{bn}_sm{sm}_sn{sn}_tm{tm}_tn{tn}_nc0_axpby0{norm}{epilogue}{rows}{style}"
-            )
-            .into_boxed_str(),
-        );
+        let name = crate::kernels::interned::intern(format!(
+            "{prefix}_{dtype}_bm{bm}_bn{bn}_sm{sm}_sn{sn}_tm{tm}_tn{tn}_nc0_axpby0{norm}{epilogue}{rows}{style}"
+        ));
         names.borrow_mut().insert(parts, name);
         name
     })
@@ -2682,5 +2680,16 @@ mod gemv_name_tests {
         let other = gemv_kernel_name(("gemv_t", "bfloat16", [1, 16, 4, 8, 4, 4], "", "_silu", "", "_packed"));
         assert_eq!(other, "gemv_t_bfloat16_bm1_bn16_sm4_sn8_tm4_tn4_nc0_axpby0_silu_packed");
         assert!(!std::ptr::eq(first, other));
+    }
+
+    /// A gemv name asked for on two threads is one string: the second thread
+    /// caches the process's string instead of leaking its own (#1235 step 1c).
+    #[test]
+    fn a_gemv_name_is_one_string_across_threads() {
+        let parts = ("gemv", "float32", [1, 8, 1, 32, 4, 4], "", "", "_r3", "");
+        let ask = move || gemv_kernel_name(parts).as_ptr() as usize;
+        let first = std::thread::spawn(ask).join().unwrap();
+        let second = std::thread::spawn(ask).join().unwrap();
+        assert_eq!(first, second, "a new thread must not leak another copy of a gemv name");
     }
 }

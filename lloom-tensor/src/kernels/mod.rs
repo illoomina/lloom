@@ -1,4 +1,5 @@
 pub mod err;
+pub(crate) mod interned;
 pub mod kernel;
 pub mod kernels;
 pub mod metal;

@@ -942,3 +942,55 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
     }
 }
+
+
+#[cfg(test)]
+mod borrowed_safetensors_query_controls {
+    use ::safetensors::{SafeTensors, View};
+    #[test]
+    fn official_borrowed_query_hit_miss_and_view_data_allocate_nothing() {
+        let header = br#"{"weight":{"dtype":"U8","shape":[2,3],"data_offsets":[0,6]}}"#;
+        let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+        bytes.extend_from_slice(header);
+        bytes.extend_from_slice(&[1,2,3,4,5,6]);
+        // Official parser work is OUTSIDE the query observation. This control
+        // does not claim parser/header HOST admission or zero parsing cost.
+        let parsed = SafeTensors::deserialize(&bytes).unwrap();
+        let ordinary = parsed.tensor("weight").unwrap();
+        for _ in 0..8 {
+            let ((copied, borrowed_data), queries) = crate::free_observer::observe_requests(|| {
+                let view = std::hint::black_box(parsed.tensor_borrowed(std::hint::black_box("weight"))).unwrap();
+                let data = View::data(&view);
+                let is_borrowed = matches!(data, std::borrow::Cow::Borrowed(_));
+                let copied = view; // actual Copy descriptor contract
+                (copied, is_borrowed)
+            });
+            assert_eq!(queries.count, 0, "BORROWED_SAFETENSOR_HIT_MUST_NOT_ALLOCATE");
+            assert!(!queries.overflow);
+            assert!(borrowed_data, "BORROWED_SAFETENSOR_VIEW_DATA_MUST_STAY_BORROWED");
+            assert_eq!((copied.dtype(),copied.shape(),copied.data()),
+                (ordinary.dtype(),ordinary.shape(),ordinary.data()));
+            assert_eq!(copied.data().as_ptr(),ordinary.data().as_ptr());
+            let (missing, queries) = crate::free_observer::observe_requests(|| {
+                std::hint::black_box(parsed.tensor_borrowed(std::hint::black_box("missing")))
+            });
+            assert!(missing.is_none());
+            assert_eq!(queries.count, 0, "BORROWED_SAFETENSOR_MISS_MUST_NOT_ALLOCATE_OWNED_NAME");
+            assert!(!queries.overflow);
+        }
+        // Actual incumbent source controls prove the same observer engages:
+        // ordinary tensor clones nonempty shape; ordinary miss owns its name.
+        let (owned, old_hit) = crate::free_observer::observe_requests(|| {
+            std::hint::black_box(parsed.tensor(std::hint::black_box("weight")))
+        });
+        assert!(owned.is_ok());
+        assert!(old_hit.count>0 && !old_hit.overflow,
+            "BORROWED_QUERY_OBSERVER_MUST_SEE_REAL_ORDINARY_SHAPE_CLONE");
+        let (missing, old_miss) = crate::free_observer::observe_requests(|| {
+            std::hint::black_box(parsed.tensor(std::hint::black_box("missing")))
+        });
+        assert!(missing.is_err());
+        assert!(old_miss.count>0 && !old_miss.overflow,
+            "BORROWED_QUERY_OBSERVER_MUST_SEE_REAL_ORDINARY_OWNED_MISS_NAME");
+    }
+}

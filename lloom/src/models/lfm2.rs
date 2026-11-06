@@ -1900,8 +1900,14 @@ impl PagedKv {
     }
 
     fn pool_pages(&self) -> usize {
+        self.pool_pages_at(self.slab)
+    }
+
+    /// The pool's page count at `slab` tokens per sequence: what
+    /// [`Self::pool_pages`] reads once `slab` is the slab.
+    fn pool_pages_at(&self, slab: usize) -> usize {
         self.pool_pages_override
-            .unwrap_or(self.n_seqs.max(1) * self.pages_per_seq())
+            .unwrap_or(self.n_seqs.max(1) * slab.div_ceil(self.page_size))
     }
 
     /// Bytes the layer pools hold. Zero before the first write.
@@ -1963,29 +1969,61 @@ impl PagedKv {
     /// The ceiling bounds positions, not the pool: `Cache::plan_pass` refuses
     /// a pass past `kv_capacity`, and may size the pool past it by the pages a
     /// quarantine still holds (`pages_short`), so `slab` is taken as planned.
+    ///
+    /// The allocator and the slab move LAST (#1253). Each layer is widened in
+    /// turn first: its K and V are zeroed at the new extent, the old ones
+    /// copied into the prefix, and only then the layer's pair replaced. A
+    /// layer wider than the allocator is consistent — the allocator hands out
+    /// only pages below its old count, all inside every layer's preserved
+    /// prefix — so a refusal at any layer leaves the cache usable, and a
+    /// retry skips the layers already wide enough. Widening layer by layer
+    /// keeps the peak at every old layer plus one new one, as before; staging
+    /// every layer before publishing would hold every layer twice.
     fn grow_to(&mut self, slab: usize) -> Result<()> {
         if slab <= self.slab {
             return Ok(());
         }
         let old_pages = self.pool_pages();
-        self.slab = slab;
-        let new_pages = self.pool_pages();
-        match self.pool.as_mut() {
-            Some(pool) if new_pages > old_pages => pool.grow(new_pages - old_pages),
-            _ => return Ok(()),
+        let new_pages = self.pool_pages_at(slab);
+        if self.pool.is_none() || new_pages <= old_pages {
+            // Nothing is allocated yet, or the pool is pinned: only the slab
+            // moves, as it always did.
+            self.slab = slab;
+            return Ok(());
         }
-        let tokens = new_pages * self.page_size;
-        for layer in self.pools.iter_mut() {
-            if let Some((pk, pv)) = layer.as_ref() {
-                let mut shape = pk.dims().to_vec();
-                shape[2] = tokens;
-                let nk = zs::zeros(zs::LFM2_KV_PAGES, shape.clone(), pk.dtype(), pk.device())?;
-                nk.slice_set(pk, 2, 0)?;
-                let nv = zs::zeros(zs::LFM2_KV_PAGES, shape, pv.dtype(), pv.device())?;
-                nv.slice_set(pv, 2, 0)?;
-                *layer = Some((nk, nv));
+        let Some(tokens) = new_pages.checked_mul(self.page_size) else {
+            lloom_tensor::bail!("lfm2 paged KV: grow to {new_pages} pages overflows the token extent");
+        };
+        for (_layer_index, layer) in self.pools.iter_mut().enumerate() {
+            let Some((pk, pv)) = layer.as_ref() else {
+                continue;
+            };
+            if pk.dim(2)? >= tokens && pv.dim(2)? >= tokens {
+                // An earlier, refused grow already widened this layer.
+                continue;
             }
+            let mut shape = pk.dims().to_vec();
+            shape[2] = tokens;
+            #[cfg(test)]
+            paged_grow_failure_tests::checkpoint(_layer_index, 0)?;
+            let nk = zs::zeros(zs::LFM2_KV_PAGES, shape.clone(), pk.dtype(), pk.device())?;
+            #[cfg(test)]
+            paged_grow_failure_tests::checkpoint(_layer_index, 1)?;
+            nk.slice_set(pk, 2, 0)?;
+            #[cfg(test)]
+            paged_grow_failure_tests::checkpoint(_layer_index, 2)?;
+            let nv = zs::zeros(zs::LFM2_KV_PAGES, shape, pv.dtype(), pv.device())?;
+            #[cfg(test)]
+            paged_grow_failure_tests::checkpoint(_layer_index, 3)?;
+            nv.slice_set(pv, 2, 0)?;
+            *layer = Some((nk, nv));
         }
+        // Every layer now holds the new extent: publish the allocator's growth
+        // and the slab. Nothing fallible follows.
+        if let Some(pool) = self.pool.as_mut() {
+            pool.grow(new_pages - old_pages);
+        }
+        self.slab = slab;
         Ok(())
     }
 
@@ -14369,5 +14407,171 @@ mod admission_geometry_tests {
             ..base.clone()
         };
         assert!(!at(&derived, DType::F16));
+    }
+}
+
+/// `PagedKv::grow_to` refused at each layer's each fallible stage, then
+/// retried (#1253): the slab and the allocator stay where they were, every
+/// layer still covers every page the allocator can issue with its old tokens
+/// in the prefix, and the retry widens what is left, keeps the layers already
+/// widened, and the next pass writes into the wider pools.
+#[cfg(all(test, feature = "metal"))]
+mod paged_grow_failure_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    thread_local! {
+        static FAIL_AT: Cell<Option<(usize, usize)>> = const { Cell::new(None) };
+    }
+
+    /// The fault point before each fallible stage of the real `grow_to`:
+    /// 0 zero K, 1 copy K, 2 zero V, 3 copy V.
+    pub(super) fn checkpoint(layer: usize, stage: usize) -> Result<()> {
+        if FAIL_AT.with(|f| f.get() == Some((layer, stage))) {
+            lloom_tensor::bail!("LFM2_PAGED_GROW_LAYER_{layer}_STAGE_{stage}_INJECTED");
+        }
+        Ok(())
+    }
+
+    struct Fault(Option<(usize, usize)>);
+    impl Fault {
+        fn at(layer: usize, stage: usize) -> Self {
+            Self(FAIL_AT.with(|f| f.replace(Some((layer, stage)))))
+        }
+    }
+    impl Drop for Fault {
+        fn drop(&mut self) {
+            FAIL_AT.with(|f| f.set(self.0));
+        }
+    }
+
+    fn values(t: &Tensor) -> Result<Vec<f32>> {
+        t.flatten_all()?.to_vec1::<f32>()
+    }
+
+    /// Two layers of a one-sequence paged KV, page size 4, slab 8 (two
+    /// pages), one token written to each layer.
+    fn fixture(device: &Device, clock: Arc<GpuClock>) -> Result<PagedKv> {
+        let config = Config {
+            flash_page_size: 4,
+            flash_pages_per_chunk: 1,
+            ..Default::default()
+        };
+        let mut paged = PagedKv::new(&config, 64, 8, 2, clock)?;
+        paged.begin_pass(1, 1, device)?;
+        for layer in 0..2 {
+            let k = Tensor::from_vec(vec![1f32 + layer as f32, 2.], (1, 1, 1, 2), device)?;
+            let v = Tensor::from_vec(vec![-3f32 - layer as f32, -4.], (1, 1, 1, 2), device)?;
+            paged.write_layer(layer, &k, &v)?;
+        }
+        Ok(paged)
+    }
+
+    fn refused_then_retried(layer: usize, stage: usize) -> Result<()> {
+        let _pool = lloom_tensor::AutoreleaseScope::new();
+        let device = Device::new_metal(0)?;
+        let Device::Metal(m) = &device else {
+            unreachable!("a Metal device")
+        };
+        let mut paged = fixture(&device, m.gpu_clock())?;
+        device.synchronize()?;
+        let old_slab = paged.slab;
+        let old_pages = paged.pool.as_ref().unwrap().pool_pages();
+        let old_free = paged.pool.as_ref().unwrap().pages_free();
+        let old_tokens = old_pages * paged.page_size;
+        let mut old = Vec::new();
+        for pair in &paged.pools {
+            let (k, v) = pair.as_ref().expect("both layers written");
+            old.push((k.id(), v.id(), values(k)?, values(v)?));
+        }
+
+        let fault = Fault::at(layer, stage);
+        let error = paged
+            .grow_to(16)
+            .expect_err("LFM2_PAGED_GROW_INJECTED_STAGE_MUST_REFUSE");
+        drop(fault);
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("LFM2_PAGED_GROW_LAYER_{layer}_STAGE_{stage}_INJECTED")),
+            "{error}"
+        );
+        assert_eq!(paged.slab, old_slab, "LFM2_PAGED_GROW_REFUSAL_MUST_KEEP_THE_SLAB");
+        let pool = paged.pool.as_ref().unwrap();
+        assert_eq!(
+            pool.pool_pages(),
+            old_pages,
+            "LFM2_PAGED_GROW_REFUSAL_MUST_KEEP_THE_ALLOCATOR_PAIRED_WITH_EVERY_LAYER"
+        );
+        assert_eq!(pool.pages_free(), old_free);
+        let mut widened = Vec::new();
+        for (i, (pair, (kid, vid, kd, vd))) in paged.pools.iter().zip(&old).enumerate() {
+            let (k, v) = pair.as_ref().unwrap();
+            assert!(
+                k.dim(2)? >= old_tokens && v.dim(2)? >= old_tokens,
+                "LFM2_PAGED_GROW_EVERY_LAYER_MUST_COVER_THE_ALLOCATOR: layer {i}"
+            );
+            assert_eq!(&values(k)?[..kd.len()], kd.as_slice(), "layer {i} K prefix");
+            assert_eq!(&values(v)?[..vd.len()], vd.as_slice(), "layer {i} V prefix");
+            if i < layer {
+                assert_eq!(k.dim(2)?, 16, "layer {i} was widened before the refusal");
+            } else {
+                assert_eq!((k.id(), v.id()), (*kid, *vid), "layer {i} keeps its old pair");
+            }
+            widened.push((k.id(), v.id()));
+        }
+
+        // The retry widens what is left and keeps what is already wide.
+        paged.grow_to(16)?;
+        assert_eq!(paged.slab, 16);
+        let new_pages = paged.pool.as_ref().unwrap().pool_pages();
+        assert_eq!(new_pages, 4);
+        for (i, (pair, (_, _, kd, vd))) in paged.pools.iter().zip(&old).enumerate() {
+            let (k, v) = pair.as_ref().unwrap();
+            assert_eq!(k.dim(2)?, new_pages * paged.page_size, "layer {i}");
+            for (t, prefix) in [(k, kd), (v, vd)] {
+                let all = values(t)?;
+                assert_eq!(
+                    &all[..prefix.len()],
+                    prefix.as_slice(),
+                    "LFM2_PAGED_GROW_SUCCESS_MUST_PRESERVE_THE_PREFIX: layer {i}"
+                );
+                assert!(all[prefix.len()..].iter().all(|&x| x == 0.), "layer {i} zero tail");
+            }
+            if i < layer {
+                assert_eq!(
+                    (k.id(), v.id()),
+                    widened[i],
+                    "a layer widened before the refusal is not copied again"
+                );
+            }
+        }
+
+        // The next pass writes into the wider pools.
+        paged.begin_pass(1, 1, &device)?;
+        let slot = paged.slot_staging[0] as usize;
+        for layer in 0..2 {
+            let k = Tensor::from_vec(vec![73f32, 74.], (1, 1, 1, 2), &device)?;
+            let v = Tensor::from_vec(vec![-91f32, -92.], (1, 1, 1, 2), &device)?;
+            paged.write_layer(layer, &k, &v)?;
+        }
+        device.synchronize()?;
+        for (i, pair) in paged.pools.iter().enumerate() {
+            let (k, v) = pair.as_ref().unwrap();
+            assert_eq!(&values(k)?[slot * 2..slot * 2 + 2], &[73., 74.], "layer {i}");
+            assert_eq!(&values(v)?[slot * 2..slot * 2 + 2], &[-91., -92.], "layer {i}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_refused_grow_at_any_layer_and_stage_keeps_the_cache_paired() -> Result<()> {
+        for layer in 0..2 {
+            for stage in 0..4 {
+                refused_then_retried(layer, stage)?;
+            }
+        }
+        println!("LFM2_PAGED_GROW layers=2 stages=4 refusals=8 retry_writes=true");
+        Ok(())
     }
 }

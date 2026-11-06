@@ -45,6 +45,7 @@
 use super::budgets::{self, Dropped, PromptMode};
 use super::common::{ms, MemSnapshot, NEVER_EOS};
 use super::front::{self, Front};
+use super::refusal::FailureStatus;
 use super::served::Served;
 use super::template::{
     request_kwargs, Rejected, Unrenderable, ENABLE_THINKING, ENGINE_KWARGS, REASONING_EFFORT,
@@ -1084,7 +1085,7 @@ fn handle_model_request_with_stream<'a>(
     path: &str,
     mut request: Request,
     mut first: FirstToken,
-    start_stream: impl FnOnce(Request) -> Result<ChunkedWriter>,
+    start_stream: impl FnOnce(Request) -> Result<ChunkedWriter> + Send,
     on_settled: impl FnOnce(&mut Option<turns::Turn<'a>>),
 ) -> Result<()> {
     let mut body = String::new();
@@ -1185,7 +1186,10 @@ fn handle_model_request_with_stream<'a>(
             stream_response_settlement(
                 shared,
                 *stream,
-                || start_stream(request),
+                RequestReply {
+                    request,
+                    open: start_stream,
+                },
                 || on_settled(&mut turn),
             )
         }
@@ -1300,7 +1304,8 @@ struct FirstToken {
     json: u64,
     /// The route built the prompt: template, tokenization, budgets.
     built: u64,
-    /// The response headers were flushed.
+    /// The response headers were flushed: at the run's first fragment, or at
+    /// its end when it produced none, so after `decode`.
     headers: u64,
     /// The decode was entered.
     decode: u64,
@@ -3118,27 +3123,121 @@ fn request_processors(
 /// the wire when the loop's commit drains it.
 #[cfg(test)]
 fn stream_response(shared: &Shared, request: Request, run: StreamingRun) -> Result<()> {
-    stream_response_with_writer(shared, run, || {
-        ChunkedWriter::start(request, "text/event-stream")
-    })
+    stream_response_settlement(
+        shared,
+        run,
+        RequestReply {
+            request,
+            open: |request| ChunkedWriter::start(request, "text/event-stream"),
+        },
+        || {},
+    )
 }
 
 // The HTTP caller and deterministic I/O-failure controls use the same decode,
-// parser finalization, frontier recording and trailer path. Delay opening the
-// writer until the fallible reasoning metadata has been checked.
+// parser finalization, frontier recording and trailer path.
 #[cfg(test)]
 fn stream_response_with_writer(
     shared: &Shared,
     run: StreamingRun,
-    start_writer: impl FnOnce() -> Result<ChunkedWriter>,
+    start_writer: impl FnOnce() -> Result<ChunkedWriter> + Send,
 ) -> Result<()> {
     stream_response_settlement(shared, run, start_writer, || {})
+}
+
+/// A streamed reply that has sent nothing yet. It becomes a chunked stream at
+/// the run's first fragment, or a status response when the run fails before
+/// one: until then the client can still be told what failed and whether a
+/// retry can help (`refusal::FailureStatus`).
+trait PendingReply: Send {
+    /// Send the stream's headers and return its writer.
+    fn open(self) -> Result<ChunkedWriter>;
+    /// Answer with `status` and an error body carrying `message`.
+    fn refuse(self, status: FailureStatus, message: &str) -> Result<()>;
+}
+
+/// The production reply: the request, and how its stream is opened.
+struct RequestReply<F> {
+    request: Request,
+    open: F,
+}
+
+impl<F: FnOnce(Request) -> Result<ChunkedWriter> + Send> PendingReply for RequestReply<F> {
+    fn open(self) -> Result<ChunkedWriter> {
+        (self.open)(self.request)
+    }
+
+    fn refuse(self, status: FailureStatus, message: &str) -> Result<()> {
+        respond_failure(self.request, status, message)
+    }
+}
+
+/// A test's writer, on which nothing has been written: a refusal goes on it
+/// as the status response tiny_http would have written.
+#[cfg(test)]
+impl<F: FnOnce() -> Result<ChunkedWriter> + Send> PendingReply for F {
+    fn open(self) -> Result<ChunkedWriter> {
+        self()
+    }
+
+    fn refuse(self, status: FailureStatus, message: &str) -> Result<()> {
+        self()?.respond_unopened(status, message)
+    }
+}
+
+/// The reply's stream, opened by the first fragment that needs it. A chat's
+/// role chunk is its first event.
+struct LazyStream<R, W, B: Batch> {
+    pending: Option<(R, W)>,
+    open: Option<StreamWriter<B>>,
+    /// Opening failed: the client was gone when the reply first had bytes.
+    gone: Option<anyhow::Error>,
+    role: Option<Value>,
+    backlog_limit: usize,
+}
+
+impl<R, W, B> LazyStream<R, W, B>
+where
+    R: PendingReply,
+    W: Fn(&B) -> (String, usize) + Send + Sync + 'static,
+    B: Batch + 'static,
+{
+    /// The open writer, opened now if this is the first call; `None` once
+    /// opening has failed.
+    fn writer(&mut self, headers: &mut u64) -> Option<&StreamWriter<B>> {
+        if let Some((reply, wrap)) = self.pending.take() {
+            match reply.open() {
+                Ok(w) => {
+                    *headers = uptime_ns();
+                    let sw = StreamWriter::start_with_batches(w, wrap)
+                        .with_backlog_limit(self.backlog_limit);
+                    if let Some(role) = &self.role {
+                        sw.event(role);
+                    }
+                    self.open = Some(sw);
+                }
+                Err(error) => self.gone = Some(error),
+            }
+        }
+        self.open.as_ref()
+    }
+}
+
+/// A run that failed before its reply sent anything: answer with the
+/// failure's status, and return the failure.
+fn refuse_unopened(reply: impl PendingReply, error: anyhow::Error) -> Result<()> {
+    match reply.refuse(FailureStatus::of(&error), &format!("{error:#}")) {
+        Ok(()) => Err(error),
+        Err(transport) => {
+            Err(error.context(format!("answering the failed request: {transport:#}")))
+        }
+    }
 }
 
 fn stream_response_settlement(
     shared: &Shared,
     run: StreamingRun,
-    start_writer: impl FnOnce() -> Result<ChunkedWriter>,
+    reply: impl PendingReply,
     settled: impl FnOnce(),
 ) -> Result<()> {
     let endpoint = match run.kind {
@@ -3151,10 +3250,16 @@ fn stream_response_settlement(
             shared.engine.as_ref(),
             &run.prompt_ids,
             run.reasoning_in_content,
-        )?,
-        StreamKind::Completion => None,
-    }
-    .map(parking_lot::Mutex::new);
+        ),
+        StreamKind::Completion => Ok(None),
+    };
+    let split = match split {
+        Ok(split) => split.map(parking_lot::Mutex::new),
+        Err(error) => {
+            settled();
+            return refuse_unopened(reply, error);
+        }
+    };
     // Each drained batch becomes one chunk, wrapped on the writer's thread.
     // A split reply's batches arrive routed: the writer reads the text each
     // field gained, never the machine.
@@ -3176,26 +3281,33 @@ fn stream_response_settlement(
         }
     };
     let mut first = run.first;
-    let writer = start_writer()?;
-    first.headers = uptime_ns();
-    let sw = StreamWriter::start_with_batches(writer, wrap)
-        .with_backlog_limit(shared.responses.limits.raw_bytes);
-    if let StreamKind::Chat = run.kind {
-        sw.event(&json!({
+    let role = match run.kind {
+        StreamKind::Chat => Some(json!({
             "id": run.id, "object": "chat.completion.chunk", "created": created,
             "model": run.model,
             "choices": [{ "index": 0, "delta": { "role": "assistant" }, "finish_reason": null }],
-        }));
-    }
+        })),
+        StreamKind::Completion => None,
+    };
+    let mut stream = LazyStream {
+        pending: Some((reply, wrap)),
+        open: None,
+        gone: None,
+        role,
+        backlog_limit: shared.responses.limits.raw_bytes,
+    };
     let started = Instant::now();
     first.decode = uptime_ns();
     let decoded = {
         let engine = shared.engine.as_ref();
+        let headers = &mut first.headers;
         let fragment = &mut first.fragment;
-        // The callback runs on the decode thread: it routes the text and
+        let stream = &mut stream;
+        // The callback runs on the decode thread: the first fragment opens
+        // the stream (the headers, one write), then each routes the text and
         // hands the batch over; the chunk is built and written on the writer
         // thread. A client that went away stops the run at the next drained
-        // batch.
+        // batch, or at the first fragment when the headers cannot be sent.
         run_decode_observed(
             engine,
             &run.prompt_ids,
@@ -3203,6 +3315,9 @@ fn stream_response_settlement(
             &run.params,
             split.as_ref(),
             &mut |frag| {
+                let Some(sw) = stream.writer(headers) else {
+                    return false;
+                };
                 if sw.client_gone() {
                     return false;
                 }
@@ -3233,9 +3348,24 @@ fn stream_response_settlement(
         )
     };
     let decode_elapsed = started.elapsed();
-    let written = sw.written();
-    let first_write = sw.first_write();
-    let backlog_limited = sw.backlog_limited.load(Ordering::Relaxed);
+    // A run that succeeded without a fragment opens its stream for the trailer.
+    if decoded.is_ok() {
+        stream.writer(&mut first.headers);
+    }
+    let LazyStream {
+        pending,
+        open: sw,
+        gone,
+        ..
+    } = stream;
+    let gone = gone.map(|e| format!("client went away before the first chunk: {e:#}"));
+    let written = sw.as_ref().map_or_else(Default::default, |sw| sw.written());
+    let first_write = sw
+        .as_ref()
+        .map_or_else(Default::default, |sw| sw.first_write());
+    let backlog_limited = sw
+        .as_ref()
+        .is_some_and(|sw| sw.backlog_limited.load(Ordering::Relaxed));
     if backlog_limited {
         shared
             .responses
@@ -3251,6 +3381,17 @@ fn stream_response_settlement(
         Err(error) => {
             shared.sessions.lock().note_other();
             settled();
+            let Some(sw) = sw else {
+                if let Some((reply, _)) = pending {
+                    return refuse_unopened(reply, error);
+                }
+                shared
+                    .responses
+                    .pre_trailer_write_errors
+                    .fetch_add(1, Ordering::Relaxed);
+                eprintln!("[{endpoint}: delivery_error=true decode_error=true written_bytes=0]");
+                return Err(error.context(gone.unwrap_or_default()));
+            };
             let (w, write_error) = sw.finish()?;
             if write_error.is_some() {
                 shared
@@ -3324,6 +3465,21 @@ fn stream_response_settlement(
     // existing contract, not a socket-drain or profiler-snapshot witness.
     let settlement_elapsed = started.elapsed();
     settled();
+    let Some(sw) = sw else {
+        if frontier_json.is_object() {
+            frontier_json["written_bytes"] = json!(0);
+            frontier_json["write_failed"] = json!(true);
+        }
+        shared
+            .responses
+            .pre_trailer_write_errors
+            .fetch_add(1, Ordering::Relaxed);
+        eprintln!(
+            "[{endpoint}: delivery_error=true accepted_bytes={} written_bytes=0 frontier={frontier_json}]",
+            decoded.text.len()
+        );
+        anyhow::bail!("{}; frontier {frontier_json}", gone.unwrap_or_default());
+    };
     let (mut w, mut write_err) = sw.finish()?;
     first.written = first_write.load(Ordering::Acquire);
     if write_err.is_none() {
@@ -3988,26 +4144,47 @@ fn respond_json_text(request: Request, status: u16, text: String) -> Result<()> 
 }
 
 fn respond_error(request: Request, status: u16, message: &str) -> Result<()> {
-    let kind = match status {
-        400 => "invalid_request_error",
-        404 => "not_found_error",
-        _ => "server_error",
-    };
-    respond_json(
+    respond_failure(
         request,
-        status,
-        &json!({ "error": { "message": message, "type": kind, "code": status } }),
+        FailureStatus {
+            code: status,
+            retry_after: None,
+        },
+        message,
     )
 }
 
 /// 503 with `Retry-After`: a response context was refused (decision 83).
 fn respond_overloaded(request: Request, message: &str) -> Result<()> {
-    let body = json!({ "error": { "message": message, "type": "server_error", "code": 503 } });
-    let response = Response::from_string(body.to_string())
-        .with_status_code(StatusCode(503))
-        .with_header(header("Content-Type", "application/json"))
-        .with_header(header("Retry-After", &RETRY_AFTER_S.to_string()));
+    respond_failure(
+        request,
+        FailureStatus {
+            code: 503,
+            retry_after: Some(RETRY_AFTER_S),
+        },
+        message,
+    )
+}
+
+/// An error response: the OpenAI error body, and `Retry-After` when the
+/// status carries one.
+fn respond_failure(request: Request, status: FailureStatus, message: &str) -> Result<()> {
+    let mut response = Response::from_string(error_body(status.code, message).to_string())
+        .with_status_code(StatusCode(status.code))
+        .with_header(header("Content-Type", "application/json"));
+    if let Some(seconds) = status.retry_after {
+        response = response.with_header(header("Retry-After", &seconds.to_string()));
+    }
     request.respond(response).context("writing the response")
+}
+
+fn error_body(code: u16, message: &str) -> Value {
+    let kind = match code {
+        400 => "invalid_request_error",
+        404 => "not_found_error",
+        _ => "server_error",
+    };
+    json!({ "error": { "message": message, "type": kind, "code": code } })
 }
 
 fn header(name: &str, value: &str) -> Header {
@@ -4041,6 +4218,26 @@ impl ChunkedWriter {
     /// One SSE event.
     fn event(&mut self, v: &Value) -> std::io::Result<()> {
         self.raw(&format!("data: {v}\n\n"))
+    }
+
+    /// A status response on a writer that has sent nothing, as
+    /// [`respond_failure`] writes it through tiny_http.
+    #[cfg(test)]
+    fn respond_unopened(mut self, status: FailureStatus, message: &str) -> Result<()> {
+        let body = error_body(status.code, message).to_string();
+        let retry = status
+            .retry_after
+            .map_or_else(String::new, |s| format!("Retry-After: {s}\r\n"));
+        write!(
+            self.w,
+            "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\n{retry}Content-Length: {}\r\n\
+             Connection: close\r\n\r\n{body}",
+            status.code,
+            StatusCode(status.code).default_reason_phrase(),
+            body.len()
+        )?;
+        self.w.flush()?;
+        Ok(())
     }
 
     /// One JSONL line.
@@ -6471,11 +6668,13 @@ mod checked_trailer_tests {
         );
     }
 
-    /// Exercise the actual post-header decode-error branch, not only the
-    /// trailer helper. Keep the server alive while the client awaits the
-    /// HTTP chunk terminator so dropping the fixture cannot fake completion.
+    /// A decode refused for the request's own input before any fragment is
+    /// answered on the actual socket with a 400 and the refusal, not a stream:
+    /// no headers, no role chunk went out before it. The server stays alive
+    /// until the client has read to EOF, so dropping the fixture cannot fake
+    /// the response's end.
     #[test]
-    fn failed_decode_after_role_chunk_terminates_the_actual_stream_response() {
+    fn a_decode_refused_for_its_input_before_any_fragment_is_a_400() {
         use super::*;
         use std::io::{Read, Write};
         use std::net::TcpStream;
@@ -6488,7 +6687,7 @@ mod checked_trailer_tests {
         client
             .set_read_timeout(Some(Duration::from_secs(2)))
             .unwrap();
-        client.write_all(b"POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n").unwrap();
+        client.write_all(b"POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Length: 0\r\n\r\n").unwrap();
         let request = server
             .recv_timeout(Duration::from_secs(2))
             .unwrap()
@@ -6518,7 +6717,7 @@ mod checked_trailer_tests {
             prompt_ids: vec![1],
             facts: Default::default(),
             // The fixture refuses image decode at the real Served seam,
-            // after stream_response has written its role/header chunk.
+            // before the run's first fragment.
             images: vec![DecodedImage {
                 height: 1,
                 width: 1,
@@ -6543,34 +6742,37 @@ mod checked_trailer_tests {
             error
         });
         let mut wire = Vec::new();
-        let mut byte = [0u8; 1];
-        while !wire.ends_with(b"0\r\n\r\n") && wire.len() < 16 * 1024 {
-            match client.read(&mut byte) {
-                Ok(0) => break,
-                Ok(_) => wire.push(byte[0]),
-                Err(e) => panic!(
-                    "stream did not terminate while server stayed alive: {e}; {:?}",
-                    String::from_utf8_lossy(&wire)
-                ),
-            }
+        if let Err(e) = client.read_to_end(&mut wire) {
+            panic!(
+                "response did not end while the server stayed alive: {e}; {:?}",
+                String::from_utf8_lossy(&wire)
+            );
         }
         release.send(()).unwrap();
         let error = worker.join().unwrap();
-        let text = String::from_utf8(wire).unwrap();
         assert!(error.contains("does not take image input"), "{error}");
+        let split = wire
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .expect("a complete response head");
+        let head = String::from_utf8_lossy(&wire[..split]).to_ascii_lowercase();
+        assert!(head.starts_with("http/1.1 400"), "not a 400: {head}");
+        assert!(!head.contains("retry-after"), "a retry hint: {head}");
+        assert!(!head.contains("text/event-stream"), "a stream: {head}");
+        let body: Value = serde_json::from_slice(&wire[split + 4..]).unwrap();
+        assert_eq!(body["error"]["code"], 400, "{body}");
+        assert_eq!(body["error"]["type"], "invalid_request_error", "{body}");
         assert!(
-            text.contains("\"role\":\"assistant\""),
-            "missing initial role: {text}"
+            body["error"]["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("does not take image input")),
+            "{body}"
         );
+        let text = String::from_utf8_lossy(&wire);
         assert!(
-            text.contains("does not take image input"),
-            "missing decode error: {text}"
+            !text.contains("\"role\":\"assistant\""),
+            "a role chunk: {text}"
         );
-        assert!(
-            text.ends_with("0\r\n\r\n"),
-            "missing HTTP terminator: {text}"
-        );
-        assert!(!text.contains("[DONE]") && !text.contains("\"finish_reason\":\"stop\""));
     }
 
     #[test]

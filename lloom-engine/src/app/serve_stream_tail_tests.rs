@@ -18,6 +18,15 @@ use std::time::{Duration, Instant};
 /// tokens, past the retired 65,536-descriptor bound.
 const RUNAWAY_GROUPS: usize = 34_000;
 
+/// The machine's refusal of a pass before any token (#1128's 35B), typed as
+/// the engine returns it.
+const SCRIPTED_REFUSAL: lloom_tensor::memory_admission::AllocationError =
+    lloom_tensor::memory_admission::AllocationError::Refused {
+        requested: 7_595_648,
+        available: 0,
+        domain: lloom_tensor::memory_admission::RefusalDomain::Machine,
+    };
+
 #[derive(Clone, Copy)]
 enum Case {
     PartialTail,
@@ -48,6 +57,9 @@ struct Wire {
     first_case_prompt: Vec<u32>,
     // One-shot host-only gate before A offers any fragment. No production owner.
     before_decode: Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>,
+    // One-shot host-only gate after A's sink accepted its first fragment: the
+    // reply's headers and first events are out, its turn not yet accepted.
+    after_first_fragment: Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>,
     metadata_calls: usize,
     metadata_before_publication: Option<std::sync::Weak<Shared>>,
 }
@@ -283,7 +295,7 @@ impl Served for Scripted {
             wire.model_entries += 1;
             if matches!(self.case, Case::EarlyFailureThenSuccess) && wire.model_entries == 1 {
                 changed.notify_all();
-                anyhow::bail!("scripted pre-token memory refusal");
+                return Err(lloom_tensor::Error::from(SCRIPTED_REFUSAL).into());
             }
             if matches!(self.case, Case::FirstFragmentRefusal) {
                 wire.first_case_prompt = prompt.to_vec();
@@ -360,6 +372,13 @@ impl Served for Scripted {
                     }
                 } else {
                     assert!(sink(&fragment));
+                }
+                let gate = self.progress.0 .0.lock().after_first_fragment.take();
+                if let Some((entered, released)) = gate {
+                    let _ = entered.send(());
+                    released
+                        .recv_timeout(Duration::from_secs(10))
+                        .expect("test model barrier released");
                 }
             }
             if hit {
@@ -1820,6 +1839,37 @@ fn early_refusal_is_visible_and_next_request_runs(path: &str, body: Value) {
         let result = handle_model_request(&shared, path, request, FirstToken::default());
         let mut wire = Vec::new();
         client.read_to_end(&mut wire).unwrap();
+        if attempt == 0 {
+            // Refused before its first fragment, the reply is not a stream:
+            // a 503 the client's retry machinery reads, with Retry-After.
+            let split = wire.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+            let head = String::from_utf8_lossy(&wire[..split]).to_ascii_lowercase();
+            assert!(head.starts_with("http/1.1 503"), "not a 503: {head}");
+            assert!(head.contains("retry-after: 1"), "no Retry-After: {head}");
+            assert!(!head.contains("text/event-stream"), "a stream: {head}");
+            let error = result.unwrap_err();
+            assert_eq!(
+                crate::app::refusal::allocation_refusal(&error),
+                Some(SCRIPTED_REFUSAL),
+                "the refusal travels typed: {error:#}"
+            );
+            let body: Value = serde_json::from_slice(&wire[split + 4..]).unwrap();
+            assert_eq!(body["error"]["code"], 503, "{body}");
+            assert!(
+                body["error"]["message"]
+                    .as_str()
+                    .is_some_and(|m| m.contains("Machine memory refused 7595648 bytes")),
+                "{body}"
+            );
+            assert_eq!(shared.sessions.lock().json()["turns"], 0);
+            assert!(
+                !progress.0 .0.lock().decoded,
+                "refusal preceded sampled tokens"
+            );
+            assert!(shared.turns.try_take().is_some(), "model FIFO released");
+            assert_eq!(progress.0 .0.lock().model_entries, 1);
+            continue;
+        }
         let response = chunked_sse_body(&wire);
         let events: Vec<Value> = response
             .lines()
@@ -1829,61 +1879,28 @@ fn early_refusal_is_visible_and_next_request_runs(path: &str, body: Value) {
                     .map(|data| serde_json::from_str(data).unwrap())
             })
             .collect();
-        if attempt == 0 {
-            assert_eq!(
-                result.unwrap_err().to_string(),
-                "scripted pre-token memory refusal"
-            );
-            assert_eq!(
-                events.last(),
-                Some(&json!({"error":{
-                    "message":"scripted pre-token memory refusal","type":"server_error"
-                }})),
-                "missing terminal SSE error"
-            );
-            if path == "/v1/chat/completions" {
-                assert_eq!(events.len(), 2, "only role then refusal, no token event");
-                assert_eq!(
-                    events[0]["choices"][0]["delta"],
-                    json!({"role":"assistant"})
-                );
-            } else {
-                assert_eq!(events.len(), 1, "only refusal, no token event");
-            }
-            assert!(events.iter().all(|event| event.get("timings").is_none()));
-            assert!(
-                !response.contains("[DONE]"),
-                "failure is not a successful empty completion"
-            );
-            assert_eq!(shared.sessions.lock().json()["turns"], 0);
-            assert!(
-                !progress.0 .0.lock().decoded,
-                "refusal preceded sampled tokens"
-            );
-        } else {
-            result.unwrap();
-            assert_eq!(response.matches("data: [DONE]").count(), 1);
-            assert!(events.iter().all(|event| event.get("error").is_none()));
-            let trailer = events
-                .iter()
-                .find(|event| event.get("timings").is_some())
-                .expect("next request has a success trailer");
-            assert_eq!(
-                trailer["choices"][0]["token_ids"].as_array().unwrap().len(),
-                3
-            );
-            assert!(
-                progress.0 .0.lock().decoded,
-                "next request reached generation"
-            );
-        }
+        result.unwrap();
+        assert_eq!(response.matches("data: [DONE]").count(), 1);
+        assert!(events.iter().all(|event| event.get("error").is_none()));
+        let trailer = events
+            .iter()
+            .find(|event| event.get("timings").is_some())
+            .expect("next request has a success trailer");
+        assert_eq!(
+            trailer["choices"][0]["token_ids"].as_array().unwrap().len(),
+            3
+        );
+        assert!(
+            progress.0 .0.lock().decoded,
+            "next request reached generation"
+        );
         assert!(shared.turns.try_take().is_some(), "model FIFO released");
         assert_eq!(progress.0 .0.lock().model_entries, attempt + 1);
     }
 }
 
 #[test]
-fn completions_pre_token_refusal_emits_sse_error_and_next_request_succeeds() {
+fn completions_pre_token_memory_refusal_is_503_and_next_request_succeeds() {
     early_refusal_is_visible_and_next_request_runs(
         "/v1/completions",
         json!({
@@ -1893,7 +1910,7 @@ fn completions_pre_token_refusal_emits_sse_error_and_next_request_succeeds() {
 }
 
 #[test]
-fn chat_pre_token_refusal_emits_sse_error_and_next_request_succeeds() {
+fn chat_pre_token_memory_refusal_is_503_and_next_request_succeeds() {
     early_refusal_is_visible_and_next_request_runs(
         "/v1/chat/completions",
         json!({

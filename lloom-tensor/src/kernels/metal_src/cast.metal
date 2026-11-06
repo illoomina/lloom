@@ -45,18 +45,91 @@ struct CastStridedParams {
 // in this file. (MSL permits a `threadgroup` variable only inside a
 // `[[kernel]]`-qualified function; there is no such variable in any of these
 // four families.)
-template <typename T, typename U, typename IR, int W>
+// One conversion expression for both index widths and binding styles.
+// The default observer is empty and inlined away. The counted observer/entry
+// exists ONLY when a native test compiles this same source with the macro.
+template <typename T, typename U, typename IR>
+METAL_FUNC U cast_value(T value) {
+    return static_cast<U>(static_cast<IR>(value));
+}
+struct CastNoWriteCount {
+    METAL_FUNC void written(size_t) const {}
+};
+
+template <typename T, typename U, typename IR, int W, typename Observer = CastNoWriteCount>
 METAL_FUNC void cast_body(
     size_t dim,
     device const T* input,
     device U* output,
-    uint tid
+    uint tid,
+    Observer observer = Observer{}
 ) {
     const uint step = div_ceil<W>(dim);
+    // The host grid rounds the launch up to a complete final threadgroup.
+    // Its padding threads must not repeat another thread's next iteration.
+    if (tid >= step) return;
     #pragma clang loop unroll(full)
     for (uint i = tid; i < dim; i += step) {
-        output[i] = static_cast<U>(static_cast<IR>(input[i]));
+        output[i] = cast_value<T, U, IR>(input[i]);
+        observer.written(i);
     }
+}
+
+// Wide entries reconstruct the linear index from group coordinates, avoiding
+// the uint thread_position_in_grid truncation. Padding groups/lanes return
+// before any unchecked product/addition. The host describes a 1/2/3-D grid.
+METAL_FUNC bool cast_wide_thread(
+    size_t work, uint3 group, uint3 groups, uint lane, uint width,
+    thread size_t& tid
+) {
+    const size_t max_index = ~size_t(0);
+    if (groups.x == 0 || groups.y == 0 || width == 0) return false;
+    if (size_t(group.z) > (max_index - group.y) / groups.y) return false;
+    const size_t yz = size_t(group.z) * groups.y + group.y;
+    if (yz > (max_index - group.x) / groups.x) return false;
+    const size_t linear_group = yz * groups.x + group.x;
+    const size_t needed_groups = work / width + (work % width != 0);
+    if (linear_group >= needed_groups) return false;
+    const size_t first = linear_group * width; // first < work, no wrap
+    if (lane >= work - first) return false;
+    tid = first + lane;
+    return true;
+}
+
+template <typename T, typename U, typename IR, int W>
+METAL_FUNC void cast_wide_body(
+    size_t dim, device const T* input, device U* output,
+    uint3 group, uint3 groups, uint lane, uint width
+) {
+    const size_t step = dim / W + (dim % W != 0);
+    size_t tid;
+    if (!cast_wide_thread(step, group, groups, lane, width, tid)) return;
+    for (size_t i = tid; i < dim;) {
+        output[i] = cast_value<T, U, IR>(input[i]);
+        // Unlike uint's legacy step, this also remains defined at SIZE_MAX.
+        if (dim - i <= step) break;
+        i += step;
+    }
+}
+
+template <typename T, typename U, typename IR = T, int W = work_per_thread<T>()>
+[[kernel]] void cast_kernel_wide(
+    constant size_t& dim, device const T* input, device U* output,
+    uint3 group [[threadgroup_position_in_grid]],
+    uint3 groups [[threadgroups_per_grid]],
+    uint lane [[thread_index_in_threadgroup]], uint3 width [[threads_per_threadgroup]]
+) {
+    cast_wide_body<T,U,IR,W>(dim,input,output,group,groups,lane,width.x);
+}
+
+template <typename T, typename U, typename IR = T, int W = work_per_thread<T>()>
+[[kernel]] void cast_kernel_wide_packed(
+    device const CastParams* pp, device const T* input, device U* output,
+    uint3 group [[threadgroup_position_in_grid]],
+    uint3 groups [[threadgroups_per_grid]],
+    uint lane [[thread_index_in_threadgroup]], uint3 width [[threads_per_threadgroup]]
+) {
+    cast_wide_body<T,U,IR,W>(pp->dim,input,output,group,groups,lane,width.x);
 }
 
 template <
@@ -105,9 +178,7 @@ METAL_FUNC void cast_strided_body(
     uint tid
 ) {
     if (tid >= dim) return;
-    output[tid] = static_cast<U>(
-        static_cast<IR>(input[get_strided_index(tid, num_dims, dims, strides)])
-    );
+    output[tid] = cast_value<T, U, IR>(input[get_strided_index(tid, num_dims, dims, strides)]);
 }
 
 template <typename T, typename U, typename IR = T>
@@ -136,6 +207,70 @@ template <typename T, typename U, typename IR = T>
     cast_strided_body<T, U, IR, device const size_t *, constant const T *>(
         pp->dim, pp->num_dims, dims, strides, input, output, tid);
 }
+
+// Preserve arbitrary supported strides without uint accumulator narrowing.
+// Positive logical dimensions are checked by the Rust descriptor before encode.
+template <typename PtrT>
+METAL_FUNC size_t cast_strided_index_wide(size_t index, size_t rank, PtrT dims, PtrT strides) {
+    size_t result = 0;
+    for (size_t d = rank; d != 0; --d) {
+        const size_t axis = d - 1;
+        result += (index % dims[axis]) * strides[axis];
+        index /= dims[axis];
+    }
+    return result;
+}
+
+template <typename T, typename U, typename IR, typename PtrT, typename InPtrT>
+METAL_FUNC void cast_strided_wide_body(
+    size_t dim, size_t rank, PtrT dims, PtrT strides, InPtrT input, device U* output,
+    uint3 group, uint3 groups, uint lane, uint width
+) {
+    size_t tid;
+    if (!cast_wide_thread(dim,group,groups,lane,width,tid)) return;
+    output[tid] = cast_value<T,U,IR>(input[cast_strided_index_wide(tid,rank,dims,strides)]);
+}
+
+template <typename T, typename U, typename IR = T>
+[[kernel]] void cast_kernel_strided_wide(
+    constant size_t& dim, constant size_t& rank,
+    constant size_t* dims, constant size_t* strides, constant const T* input, device U* output,
+    uint3 group [[threadgroup_position_in_grid]],
+    uint3 groups [[threadgroups_per_grid]],
+    uint lane [[thread_index_in_threadgroup]], uint3 width [[threads_per_threadgroup]]
+) {
+    cast_strided_wide_body<T,U,IR,constant size_t*,constant const T*>(
+        dim,rank,dims,strides,input,output,group,groups,lane,width.x);
+}
+
+template <typename T, typename U, typename IR = T>
+[[kernel]] void cast_kernel_strided_wide_packed(
+    device const CastStridedParams* pp,
+    device const size_t* dims, device const size_t* strides, constant const T* input, device U* output,
+    uint3 group [[threadgroup_position_in_grid]],
+    uint3 groups [[threadgroups_per_grid]],
+    uint lane [[thread_index_in_threadgroup]], uint3 width [[threads_per_threadgroup]]
+) {
+    cast_strided_wide_body<T,U,IR,device const size_t*,constant const T*>(
+        pp->dim,pp->num_dims,dims,strides,input,output,group,groups,lane,width.x);
+}
+
+#ifdef LLOOM_CAST_WRITE_COUNTS
+// Native causal test ONLY. Production source never defines the macro, so no
+// test kernel/atomic instrumentation is included in the shipped library.
+struct CastWriteCounts {
+    device atomic_uint* counts;
+    METAL_FUNC void written(size_t i) const {
+        atomic_fetch_add_explicit(counts + i, 1u, memory_order_relaxed);
+    }
+};
+[[kernel]] void cast_count_writers(
+    constant size_t& dim, device const float* input, device float* output,
+    device atomic_uint* counts, uint tid [[thread_position_in_grid]]
+) {
+    cast_body<float,float,float,2,CastWriteCounts>(dim,input,output,tid,CastWriteCounts{counts});
+}
+#endif
 
 // Layout, asserted rather than hoped.
 //
@@ -193,7 +328,11 @@ static_assert(alignof(CastStridedParams) == 8, "CastStridedParams alignment");
     init_kernel("cast_" #tname "_" #uname, cast_kernel, t, u)                                  \
     init_kernel("cast_" #tname "_" #uname "_packed", cast_kernel_packed, t, u)                 \
     init_kernel("cast_" #tname "_" #uname "_strided", cast_kernel_strided, t, u)               \
-    init_kernel("cast_" #tname "_" #uname "_strided_packed", cast_kernel_strided_packed, t, u)
+    init_kernel("cast_" #tname "_" #uname "_strided_packed", cast_kernel_strided_packed, t, u)   \
+    init_kernel("cast_" #tname "_" #uname "_wide", cast_kernel_wide, t, u)                      \
+    init_kernel("cast_" #tname "_" #uname "_wide_packed", cast_kernel_wide_packed, t, u)        \
+    init_kernel("cast_" #tname "_" #uname "_strided_wide", cast_kernel_strided_wide, t, u)      \
+    init_kernel("cast_" #tname "_" #uname "_strided_wide_packed", cast_kernel_strided_wide_packed, t, u)
 
 #if defined(__HAVE_BFLOAT__)
 #define init_cast_all(tname, t)         \

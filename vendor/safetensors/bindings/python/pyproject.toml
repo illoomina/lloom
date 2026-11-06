@@ -1,0 +1,105 @@
+[project]
+name = 'safetensors'
+requires-python = '>=3.10'
+authors = [
+  { name = 'Nicolas Patry', email = 'patry.nicolas@protonmail.com' },
+  { name = "Luc Georges", email = 'luc@huggingface.co' },
+  { name = "Daniël De Kok", email = 'daniel.dekok@huggingface.co' },
+]
+classifiers = [
+  "Development Status :: 5 - Production/Stable",
+  "Intended Audience :: Developers",
+  "Intended Audience :: Education",
+  "Intended Audience :: Science/Research",
+  "License :: OSI Approved :: Apache Software License",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+  "Typing :: Typed",
+]
+license = { file = "LICENSE" }
+dynamic = ['description', 'readme', 'version']
+
+[project.urls]
+Homepage = 'https://github.com/huggingface/safetensors'
+Source = 'https://github.com/huggingface/safetensors'
+
+[project.optional-dependencies]
+numpy = ["numpy>=1.24.6"]
+torch = ["safetensors[numpy]", "torch>=2.4"]
+tensorflow = ["safetensors[numpy]", "tensorflow>=2.11.0"]
+tf-nightly = ["safetensors[numpy]", "tf-nightly"]
+# pinning tf version 2.11.0 for doc-builder
+pinned-tf = ["safetensors[numpy]", "tensorflow==2.18.0"]
+jax = ["safetensors[numpy]", "flax>=0.6.3", "jax>=0.3.25", "jaxlib>=0.3.25"]
+mlx = ["mlx>=0.0.9"]
+paddlepaddle = ["safetensors[numpy]", "paddlepaddle>=2.4.1"]
+convert = ["safetensors[torch]", "huggingface_hub>=1.4"]
+quality = [
+  "ruff", # after updating to black 2023, also update Python version in pyproject.toml to 3.7
+]
+testing = [
+  "safetensors[numpy]",
+  "h5py>=3.7.0",
+  "setuptools_rust>=1.12.0",
+  "pytest>=9.0",
+  "pytest-benchmark>=5.2",
+  # "python-afl>=0.7.3",
+  "hypothesis>=6.70.2",
+  "fsspec>=2024.6.0",
+  "s3fs>=2024.6.0",
+]
+all = [
+  "safetensors[torch]",
+  "safetensors[numpy]",
+  "safetensors[jax]",
+  "safetensors[paddlepaddle]",
+  "safetensors[convert]",
+  "safetensors[quality]",
+  "safetensors[testing]",
+]
+dev = ["safetensors[all]", "safetensors[pinned-tf]"]
+
+
+[build-system]
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
+
+[tool.uv]
+# `tensorflow`, `tf-nightly`, and `pinned-tf` pin mutually-incompatible TF
+# versions, so uv's universal lock can't satisfy them simultaneously.
+# `all` deliberately omits TF; `dev` adds `pinned-tf` explicitly, which is
+# why `dev` must also be declared incompatible with the other TF extras.
+conflicts = [
+  [
+    { extra = "tensorflow" },
+    { extra = "tf-nightly" },
+    { extra = "pinned-tf" },
+  ],
+  [
+    { extra = "dev" },
+    { extra = "tensorflow" },
+  ],
+  [
+    { extra = "dev" },
+    { extra = "tf-nightly" },
+  ],
+]
+
+[tool.maturin]
+python-source = "py_src"
+module-name = "safetensors._safetensors_rust"
+bindings = 'pyo3'
+features = ["pyo3/extension-module"]
+
+[tool.black]
+line-length = 119
+target-version = ['py310']
+
+[tool.setuptools.dynamic]
+readme = { file = ["README.rst"] }

@@ -20,6 +20,7 @@ pub mod modes;
 pub mod omni;
 pub mod qwen3_5;
 pub mod qwen4exp;
+pub mod refusal;
 pub mod report;
 mod request_slot;
 pub mod serve;

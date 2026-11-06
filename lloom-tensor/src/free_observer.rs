@@ -15,11 +15,13 @@ pub(crate) struct ObservedSystem;
 unsafe impl GlobalAlloc for ObservedSystem {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         let pointer = unsafe { System.alloc(layout) };
+        requested(layout.size(), layout.align(), 0, !pointer.is_null());
         born(pointer, layout);
         pointer
     }
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
         let pointer = unsafe { System.alloc_zeroed(layout) };
+        requested(layout.size(), layout.align(), 0, !pointer.is_null());
         born(pointer, layout);
         pointer
     }
@@ -27,6 +29,7 @@ unsafe impl GlobalAlloc for ObservedSystem {
         // The bounded observed constructor owns fixed blocks, not reallocating
         // storage. An observed realloc invalidates the test, never hides it.
         let result = unsafe { System.realloc(pointer, layout, size) };
+        requested(size, layout.align(), layout.size(), !result.is_null());
         let _ = TRACE.try_with(|state| {
             let mut trace = state.get();
             if trace.mode == BIRTH
@@ -252,4 +255,103 @@ mod tests {
         assert_eq!(TRACE.with(|state| state.get().mode), OFF);
         drop(domain);
     }
+}
+
+// Requested-Layout census for the private planner's reallocating scratch.
+// Separate from the fixed-block observer: its realloc-invalidates-proof rule
+// remains unchanged. Test-only forwarding still invokes System exactly once.
+const REQUEST_LIMIT: usize = 256;
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct LayoutRequest {
+    pub size: usize,
+    pub align: usize,
+    pub previous_size: usize,
+    pub succeeded: bool,
+}
+impl LayoutRequest {
+    const EMPTY: Self = Self {
+        size: 0,
+        align: 0,
+        previous_size: 0,
+        succeeded: false,
+    };
+}
+#[derive(Clone, Copy)]
+struct RequestedTrace {
+    active: bool,
+    count: usize,
+    bytes: usize,
+    overflow: bool,
+    requests: [LayoutRequest; REQUEST_LIMIT],
+}
+impl RequestedTrace {
+    const EMPTY: Self = Self {
+        active: false,
+        count: 0,
+        bytes: 0,
+        overflow: false,
+        requests: [LayoutRequest::EMPTY; REQUEST_LIMIT],
+    };
+}
+thread_local! { static REQUESTED: Cell<RequestedTrace> = const { Cell::new(RequestedTrace::EMPTY) }; }
+fn requested(size: usize, align: usize, previous_size: usize, succeeded: bool) {
+    let _ = REQUESTED.try_with(|state| {
+        let mut trace = state.get();
+        if !trace.active {
+            return;
+        }
+        if trace.count == REQUEST_LIMIT {
+            trace.overflow = true;
+        } else {
+            trace.requests[trace.count] = LayoutRequest {
+                size,
+                align,
+                previous_size,
+                succeeded,
+            };
+            trace.count += 1;
+        }
+        if let Some(bytes) = trace.bytes.checked_add(size) {
+            trace.bytes = bytes;
+        } else {
+            trace.overflow = true;
+        }
+        state.set(trace);
+    });
+}
+pub(crate) struct RequestedReport {
+    pub count: usize,
+    pub bytes: usize,
+    pub overflow: bool,
+    pub requests: [LayoutRequest; REQUEST_LIMIT],
+}
+struct RequestedReset;
+impl Drop for RequestedReset {
+    fn drop(&mut self) {
+        let _ = REQUESTED.try_with(|state| state.set(RequestedTrace::EMPTY));
+    }
+}
+/// No addresses/domain references escape. The returned value is deliberately
+/// unrestricted for tests; only production private_plan_growth returns Copy.
+pub(crate) fn observe_requests<R>(run: impl FnOnce() -> R) -> (R, RequestedReport) {
+    REQUESTED.with(|state| {
+        assert!(!state.get().active, "no nested requested-Layout census");
+        state.set(RequestedTrace {
+            active: true,
+            ..RequestedTrace::EMPTY
+        });
+    });
+    let reset = RequestedReset;
+    let value = run();
+    let trace = REQUESTED.with(Cell::get);
+    drop(reset);
+    (
+        value,
+        RequestedReport {
+            count: trace.count,
+            bytes: trace.bytes,
+            overflow: trace.overflow,
+            requests: trace.requests,
+        },
+    )
 }

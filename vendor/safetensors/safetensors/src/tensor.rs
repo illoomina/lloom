@@ -483,6 +483,19 @@ impl<'data> SafeTensors<'data> {
         })
     }
 
+    /// Borrow one tensor's already-validated metadata and data without
+    /// allocating or cloning its shape/name. Missing names return None.
+    /// The shape borrow keeps this metadata owner alive; the data is the same
+    /// span used by tensor(). No parsing or validation is repeated here.
+    pub fn tensor_borrowed(&self, name: &str) -> Option<BorrowedTensorView<'_, 'data>> {
+        let info = self.metadata.info(name)?;
+        Some(BorrowedTensorView {
+            dtype: info.dtype,
+            shape: &info.shape,
+            data: self.data.get(info.data_offsets.0..info.data_offsets.1)?,
+        })
+    }
+
     /// Allow the user to get a specific tensor within the SafeTensors.
     /// The tensor returned is merely a view and the data is not owned by this
     /// structure.
@@ -696,6 +709,112 @@ impl Metadata {
     /// Gives back the tensor metadata
     pub fn metadata(&self) -> &Option<HashMap<String, String>> {
         &self.metadata
+    }
+}
+
+/// Borrowed, allocation-free tensor description from an already validated
+/// SafeTensors. Copying this descriptor copies references, not the owned shape.
+/// This is not native allocation, initialization or IO ownership authority.
+///
+/// The metadata owner must remain alive while this view's shape is used. The
+/// data slice borrows the original input independently, so it may outlive the
+/// parsed metadata while that input stays alive:
+///
+/// ```
+/// fn file() -> Vec<u8> {
+///     let header = br#"{"weight":{"dtype":"U8","shape":[2,3],"data_offsets":[0,6]}}"#;
+///     let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+///     bytes.extend_from_slice(header);
+///     bytes.extend_from_slice(&[1,2,3,4,5,6]);
+///     bytes
+/// }
+/// fn main() {
+///     let bytes = file();
+///     let data = {
+///         let parsed = safetensors::SafeTensors::deserialize(&bytes).unwrap();
+///         let borrowed = parsed.tensor_borrowed("weight").unwrap();
+///         let copied = borrowed;
+///         assert_eq!(copied.shape(), &[2,3]);
+///         borrowed.data()
+///     };
+///     // Original input still owns data even after parsed metadata was destroyed.
+///     assert_eq!(data, &[1,2,3,4,5,6]);
+/// }
+/// ```
+///
+/// A view cannot escape its metadata owner, even when the input stays alive:
+///
+/// ```compile_fail,E0597
+/// fn file() -> Vec<u8> {
+///     let header = br#"{"weight":{"dtype":"U8","shape":[2,3],"data_offsets":[0,6]}}"#;
+///     let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+///     bytes.extend_from_slice(header);
+///     bytes.extend_from_slice(&[1,2,3,4,5,6]);
+///     bytes
+/// }
+/// fn main() {
+///     let bytes = file();
+///     let escaped = {
+///         let parsed = safetensors::SafeTensors::deserialize(&bytes).unwrap();
+///         parsed.tensor_borrowed("weight").unwrap()
+///     };
+///     // Expected E0597: metadata owner does not outlive the shape/view borrow.
+///     assert_eq!(escaped.shape(), &[2,3]);
+/// }
+/// ```
+///
+/// Extracting the data slice does not let it escape the original input:
+///
+/// ```compile_fail,E0597
+/// fn file() -> Vec<u8> {
+///     let header = br#"{"weight":{"dtype":"U8","shape":[2,3],"data_offsets":[0,6]}}"#;
+///     let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+///     bytes.extend_from_slice(header);
+///     bytes.extend_from_slice(&[1,2,3,4,5,6]);
+///     bytes
+/// }
+/// fn main() {
+///     let escaped = {
+///         let bytes = file();
+///         let parsed = safetensors::SafeTensors::deserialize(&bytes).unwrap();
+///         parsed.tensor_borrowed("weight").unwrap().data()
+///     };
+///     // Expected E0597: extracted data still cannot outlive original byte owner.
+///     assert_eq!(escaped, &[1,2,3,4,5,6]);
+/// }
+/// ```
+#[derive(Debug, Clone, Copy)]
+pub struct BorrowedTensorView<'metadata, 'data> {
+    dtype: Dtype,
+    shape: &'metadata [usize],
+    data: &'data [u8],
+}
+impl<'metadata, 'data> BorrowedTensorView<'metadata, 'data> {
+    /// Returns the dtype stored in the already-validated metadata.
+    pub fn dtype(&self) -> Dtype {
+        self.dtype
+    }
+    /// Borrows the shape from the parsed metadata without cloning its axes.
+    pub fn shape(&self) -> &'metadata [usize] {
+        self.shape
+    }
+    /// Borrows the validated data span from the original input buffer.
+    pub fn data(&self) -> &'data [u8] {
+        self.data
+    }
+}
+impl View for BorrowedTensorView<'_, '_> {
+    fn dtype(&self) -> Dtype {
+        self.dtype
+    }
+    fn shape(&self) -> &[usize] {
+        self.shape
+    }
+    fn data(&self) -> Cow<'_, [u8]> {
+        self.data.into()
+    }
+    fn data_len(&self) -> usize {
+        self.data.len()
     }
 }
 
@@ -1607,5 +1726,64 @@ mod tests {
             }
             _ => panic!("This should not be able to be serialized"),
         }
+    }
+}
+
+#[cfg(all(test, feature = "std"))]
+mod borrowed_tensor_view_controls {
+    use super::*;
+    fn file(header: &[u8], data: &[u8]) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(8 + header.len() + data.len());
+        bytes.extend_from_slice(&(header.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(header);
+        bytes.extend_from_slice(data);
+        bytes
+    }
+    #[test]
+    fn official_deserialize_then_borrow_uses_same_validated_shape_and_data_span() {
+        let bytes = file(br#"{"k.weight":{"dtype":"U8","shape":[1,3],"data_offsets":[0,3]},"v.weight":{"dtype":"F32","shape":[0,99],"data_offsets":[3,3]}}"#, &[17,29,41]);
+        let parsed = SafeTensors::deserialize(&bytes).unwrap();
+        let ordinary = parsed.tensor("k.weight").unwrap();
+        let borrowed = parsed.tensor_borrowed("k.weight").unwrap();
+        assert_eq!(borrowed.dtype(), ordinary.dtype());
+        assert_eq!(borrowed.shape(), ordinary.shape());
+        assert_eq!(borrowed.data(), ordinary.data());
+        assert_eq!(borrowed.data().as_ptr(), ordinary.data().as_ptr());
+        assert_eq!(
+            borrowed.shape().as_ptr(),
+            parsed.metadata.info("k.weight").unwrap().shape.as_ptr(),
+            "BORROWED_SAFETENSOR_QUERY_MUST_NOT_CLONE_OR_REPARSE_SHAPE"
+        );
+        assert!(
+            parsed.tensor_borrowed("missing").is_none(),
+            "BORROWED_SAFETENSOR_MISS_MUST_BE_OPTION_WITHOUT_OWNED_NAME"
+        );
+        let empty = parsed.tensor_borrowed("v.weight").unwrap();
+        assert_eq!(empty.shape(), [0, 99]);
+        assert!(empty.data().is_empty());
+    }
+    #[test]
+    fn official_validation_still_owns_packed_and_malformed_offset_rules() {
+        let good = file(
+            br#"{"x":{"dtype":"F4","shape":[4],"data_offsets":[0,2]}}"#,
+            &[0x12, 0x34],
+        );
+        let parsed = SafeTensors::deserialize(&good).unwrap();
+        let view = parsed.tensor_borrowed("x").unwrap();
+        assert_eq!(
+            (view.dtype(), view.shape(), view.data()),
+            (Dtype::F4, &[4][..], &[0x12, 0x34][..])
+        );
+        let malformed = file(
+            br#"{"x":{"dtype":"U8","shape":[2],"data_offsets":[1,3]}}"#,
+            &[1, 2, 3],
+        );
+        assert!(
+            matches!(
+                SafeTensors::deserialize(&malformed),
+                Err(SafeTensorError::InvalidOffset(_))
+            ),
+            "BORROWED_ACCESSOR_MUST_NOT_REPLACE_OFFICIAL_DESERIALIZE_VALIDATION"
+        );
     }
 }

@@ -313,6 +313,46 @@ impl CommandList {
         self.max_bytes
     }
 
+    /// Drop every command from `len` on, with their arguments, patches and
+    /// bytes: a node refused after its commands were written leaves the list
+    /// as it was before the node.
+    pub(super) fn truncate(&mut self, len: usize) {
+        let Some(first) = self.commands.get(len) else {
+            return;
+        };
+        let (args, patches) = (first.args.start as usize, first.patches.start as usize);
+        let bytes = self.args[args..]
+            .iter()
+            .filter_map(|a| match *a {
+                Arg::Bytes { start, .. } => Some(start as usize),
+                _ => None,
+            })
+            .min()
+            .unwrap_or(self.bytes.len());
+        self.commands.truncate(len);
+        self.args.truncate(args);
+        self.patches.truncate(patches);
+        self.bytes.truncate(bytes);
+        self.buffers = self
+            .args
+            .iter()
+            .filter_map(|a| match *a {
+                Arg::Buffer { buffer, .. } => Some(buffer.0 as usize + 1),
+                _ => None,
+            })
+            .max()
+            .unwrap_or(0);
+        self.max_bytes = self
+            .args
+            .iter()
+            .filter_map(|a| match *a {
+                Arg::Bytes { len, .. } => Some(len as usize),
+                _ => None,
+            })
+            .max()
+            .unwrap_or(0);
+    }
+
     /// Every buffer the list binds, once each, in first-bind order: the
     /// residency a step of this list needs.
     pub fn bound(&self) -> Vec<BufferRef> {

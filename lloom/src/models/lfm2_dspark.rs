@@ -1186,17 +1186,49 @@ mod paged_ctx {
         /// stays valid (`KvPagePool::grow`'s contract; `PagedKv::grow_to`'s
         /// shape).
         fn grow(&mut self, layer: usize) -> Result<()> {
-            let extra = self.n_seqs * (BUCKET_TOKENS + self.reserve).div_ceil(self.page_size);
+            let Some(tokens_per_seq) = BUCKET_TOKENS.checked_add(self.reserve) else {
+                lloom_tensor::bail!("DSpark paged ctx: grow reserve overflow");
+            };
+            let Some(extra) = self.n_seqs.checked_mul(tokens_per_seq.div_ceil(self.page_size)) else {
+                lloom_tensor::bail!("DSpark paged ctx: grow page count overflow");
+            };
             let lp = &mut self.layers[layer];
-            lp.pool.grow(extra);
-            if let Some((pk, pv)) = lp.kv.as_ref() {
+            let Some(next_pages) = lp.pool.pool_pages().checked_add(extra) else {
+                lloom_tensor::bail!("DSpark paged ctx: grow capacity overflow");
+            };
+            let Some(next_tokens) = next_pages.checked_mul(self.page_size) else {
+                lloom_tensor::bail!("DSpark paged ctx: grow tensor extent overflow");
+            };
+            // Stage every fallible allocation/copy against the FUTURE geometry.
+            // Until all four succeed the actual allocator and both old owners
+            // remain paired, so a refusal followed by reset can safely retry.
+            // The current caller serializes this entire method through its
+            // existing pool guard; no additional lock or hot-path work is added.
+            let replacement = if let Some((pk, pv)) = lp.kv.as_ref() {
                 let mut shape = pk.dims().to_vec();
-                shape[2] = lp.pool.pool_pages() * self.page_size;
+                shape[2] = next_tokens;
+                #[cfg(test)]
+                grow_failure_controls::checkpoint(0)?;
                 let nk = Tensor::zeros(shape.clone(), pk.dtype(), pk.device())?;
+                #[cfg(test)]
+                grow_failure_controls::checkpoint(1)?;
                 nk.slice_set(pk, 2, 0)?;
+                #[cfg(test)]
+                grow_failure_controls::checkpoint(2)?;
                 let nv = Tensor::zeros(shape, pv.dtype(), pv.device())?;
+                #[cfg(test)]
+                grow_failure_controls::checkpoint(3)?;
                 nv.slice_set(pv, 2, 0)?;
-                lp.kv = Some((nk, nv));
+                Some((nk, nv))
+            } else {
+                None
+            };
+            // No Result-producing operation remains after allocator publication.
+            // Native copies may still be queued: incumbent tracking retains the
+            // old source and new destination allocations through their readers.
+            lp.pool.grow(extra);
+            if let Some(pair) = replacement {
+                lp.kv = Some(pair);
             }
             Ok(())
         }
@@ -1842,6 +1874,152 @@ mod paged_ctx {
                 .unwrap_or_default()
         }
     }
+    /// Controls invoke the actual DSparkCtxPool::grow, not a second planner or
+    /// test-only transaction. Fault hooks compile away outside cfg(test).
+    #[cfg(test)]
+    mod grow_failure_controls {
+        use super::*;
+        use std::cell::Cell;
+        thread_local! {
+            static FAIL_AT: Cell<Option<usize>> = const { Cell::new(None) };
+            static VISITED: Cell<u8> = const { Cell::new(0) };
+        }
+        pub(super) fn checkpoint(stage: usize) -> Result<()> {
+            VISITED.with(|seen| seen.set(seen.get() | (1u8 << stage)));
+            if FAIL_AT.with(|at| at.get() == Some(stage)) {
+                lloom_tensor::bail!("DSPARK_GROW_STAGE_{stage}_INJECTED");
+            }
+            Ok(())
+        }
+        struct Fault { previous: Option<usize>, visited: u8 }
+        impl Fault {
+            fn at(stage: usize) -> Self {
+                Self { previous: FAIL_AT.with(|at| at.replace(Some(stage))),
+                    visited: VISITED.with(|seen| seen.replace(0)) }
+            }
+        }
+        impl Drop for Fault {
+            fn drop(&mut self) {
+                FAIL_AT.with(|at| at.set(self.previous));
+                VISITED.with(|seen| seen.set(self.visited));
+            }
+        }
+        fn values(t: &Tensor) -> Result<Vec<f32>> { t.flatten_all()?.to_vec1::<f32>() }
+        fn fixture(device: &Device) -> Result<DSparkCtxPool> {
+            let clock = match device {
+                Device::Metal(d) => d.gpu_clock(),
+                _ => Arc::new(GpuClock::new()), // isolated CPU, no native users
+            };
+            let mut p = DSparkCtxPool::new(1, 1, 16, 0, clock);
+            let tokens = p.layers[0].pool.pool_pages() * p.page_size;
+            let k: Vec<f32> = (0..tokens).map(|i| (i % 17) as f32).collect();
+            let v: Vec<f32> = (0..tokens).map(|i| -((i % 13) as f32)).collect();
+            p.layers[0].kv = Some((Tensor::from_vec(k, (1,1,tokens,1), device)?,
+                Tensor::from_vec(v, (1,1,tokens,1), device)?));
+            p.layers[0].pool.append(0, 2).map_err(lloom_tensor::Error::wrap)?;
+            Ok(p)
+        }
+        fn failed_growth_keeps_real_pair(device: &Device, stage: usize) -> Result<()> {
+            let mut p = fixture(device)?;
+            let old_pages = p.layers[0].pool.pool_pages();
+            let old_free = p.layers[0].pool.pages_free();
+            let old_table = p.layers[0].pool.seq(0).unwrap().pages().to_vec();
+            let old = p.layers[0].kv.as_ref().unwrap();
+            let ids = (old.0.id(), old.1.id());
+            let old_data = (values(&old.0)?, values(&old.1)?);
+            let fault = Fault::at(stage);
+            let error = p.grow(0).expect_err("DSPARK_GROW_INJECTED_STAGE_MUST_REFUSE");
+            assert!(error.to_string().contains(&format!("DSPARK_GROW_STAGE_{stage}_INJECTED")));
+            assert_eq!(VISITED.with(Cell::get), (1u8 << (stage+1))-1,
+                "DSPARK_GROW_MUST_REACH_THE_NAMED_REAL_STAGE");
+            drop(fault);
+            assert_eq!(p.layers[0].pool.pool_pages(), old_pages,
+                "DSPARK_GROW_REFUSAL_MUST_KEEP_ALLOCATOR_PAIRED_WITH_OLD_KV");
+            assert_eq!(p.layers[0].pool.pages_free(), old_free);
+            assert_eq!(p.layers[0].pool.seq(0).unwrap().pages(), old_table.as_slice());
+            let old = p.layers[0].kv.as_ref().unwrap();
+            assert_eq!((old.0.id(), old.1.id()), ids);
+            assert_eq!(values(&old.0)?, old_data.0);
+            assert_eq!(values(&old.1)?, old_data.1);
+            assert_eq!(old.0.dim(2)?, old_pages * p.page_size);
+            assert_eq!(old.1.dim(2)?, old_pages * p.page_size);
+            // Reset is the real release path, not a fixture reconstruction.
+            p.reset(0,0);
+            assert_eq!(p.len(0,0), 0);
+            p.grow(0)?; // new operation after refusal + reset
+            let new_pages = p.layers[0].pool.pool_pages();
+            assert_eq!(new_pages, old_pages * 2);
+            let pair = p.layers[0].kv.as_ref().unwrap();
+            for (tensor, prefix) in [(&pair.0, &old_data.0), (&pair.1, &old_data.1)] {
+                assert_eq!(tensor.dim(2)?, new_pages * p.page_size);
+                let actual = values(tensor)?;
+                assert_eq!(&actual[..prefix.len()], prefix.as_slice(),
+                    "DSPARK_GROW_SUCCESS_MUST_PRESERVE_THE_REAL_PREFIX");
+                assert!(actual[prefix.len()..].iter().all(|&x| x == 0.));
+            }
+            // Native control also exercises the next actual GPU scatter append.
+            // CPU controls are actual Tensor/allocator tests, not GPU evidence.
+            if device.is_metal() {
+                let k = Tensor::from_vec(vec![73f32], (1,1,1,1), device)?;
+                let v = Tensor::from_vec(vec![-91f32], (1,1,1,1), device)?;
+                p.append(0,0,&k,&v)?;
+                assert_eq!(p.len(0,0),1);
+                let seq = p.layers[0].pool.seq(0).unwrap();
+                let slot = seq.pages()[0].index() * p.page_size;
+                let pair = p.layers[0].kv.as_ref().unwrap();
+                assert_eq!(values(&pair.0)?[slot],73.);
+                assert_eq!(values(&pair.1)?[slot],-91.);
+            }
+            Ok(())
+        }
+        #[test]
+        fn cpu_real_k_zero_refusal_keeps_allocator_and_next_growth() -> Result<()> {
+            failed_growth_keeps_real_pair(&Device::Cpu,0)
+        }
+        #[test]
+        fn cpu_real_k_copy_refusal_keeps_allocator_and_next_growth() -> Result<()> {
+            failed_growth_keeps_real_pair(&Device::Cpu,1)
+        }
+        #[test]
+        fn cpu_real_v_zero_refusal_keeps_allocator_and_next_growth() -> Result<()> {
+            failed_growth_keeps_real_pair(&Device::Cpu,2)
+        }
+        #[test]
+        fn cpu_real_v_copy_refusal_keeps_allocator_and_next_growth() -> Result<()> {
+            failed_growth_keeps_real_pair(&Device::Cpu,3)
+        }
+        #[test]
+        fn cpu_empty_pool_growth_keeps_lazy_native_storage() -> Result<()> {
+            let mut p=DSparkCtxPool::new(1,1,16,0,Arc::new(GpuClock::new()));
+            let old=p.layers[0].pool.pool_pages();
+            p.grow(0)?;
+            assert_eq!(p.layers[0].pool.pool_pages(),old*2);
+            assert!(p.layers[0].kv.is_none());
+            Ok(())
+        }
+        // Ignored by default: it needs an explicitly selected API and fails
+        // loudly without one. Run it with `LLOOM_METAL_API=metal3|metal4
+        // cargo test ... -- --ignored grow_failure_controls::native`.
+        #[test]
+        #[ignore = "native: needs LLOOM_METAL_API=metal3|metal4; run with --ignored"]
+        fn native_real_growth_failures_reset_and_next_scatter() -> Result<()> {
+            let _scope=lloom_tensor::AutoreleaseScope::new();
+            let mut tuning=lloom_tensor::tuning::Tuning::default();
+            tuning.from_env().map_err(lloom_tensor::Error::msg)?;
+            lloom_tensor::tuning::install(tuning)
+                .map_err(|e| lloom_tensor::Error::msg(format!("{e:?}")))?;
+            let requested=std::env::var("LLOOM_METAL_API")
+                .expect("native DSpark grow control requires explicit Metal API");
+            assert!(requested=="metal3" || requested=="metal4");
+            let device=Device::new_metal(0)?;
+            assert_eq!(device.as_metal_device()?.commands().actual_command_api(),requested,
+                "DSPARK_GROW_NATIVE_CONTROL_MUST_NOT_FALL_BACK");
+            for stage in 0..4 { failed_growth_keeps_real_pair(&device,stage)?; }
+            eprintln!("DSPARK_REAL_GROWTH api={requested} stages=4 reset_next_scatter=true original_funding=false");
+            Ok(())
+        }
+    }
+
 }
 
 // The drafter's own KV cache under the engine seam (`RESTRUCTURING_DESIGN.md`

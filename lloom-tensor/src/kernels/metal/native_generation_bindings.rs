@@ -502,6 +502,15 @@ impl GenerationBindings {
     pub(super) fn same(&self, other: &Self) -> bool {
         HeaderStrong::same(&self.head, &other.head)
     }
+    /// Whether this generation was cancelled before any submission: a test's
+    /// observation that a credit was dropped rather than kept (#944 item 16).
+    #[cfg(test)]
+    pub(super) fn never_submitted_for_test(&self) -> bool {
+        matches!(
+            self.head.captures().witness.captures().cutoff(),
+            Some(Cutoff::NeverSubmitted)
+        )
+    }
     pub(super) fn publish_failure(&self, reason: Failure) {
         self.head.publish_failure(reason);
     }

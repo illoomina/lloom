@@ -60,6 +60,9 @@ pub(crate) struct Queue {
     completions: OnceLock<Arc<super::retirement::Metal4Completions>>,
     commit_order: Mutex<u64>,
     acquire_parks: AtomicUsize,
+    /// Strict acquisitions refused (`acquire_strict`), a test's observation.
+    #[cfg(test)]
+    strict_refusals: AtomicUsize,
     ledger: OnceLock<Arc<super::ledger::Ledger>>,
     pub created: AtomicUsize,
     pub reused: AtomicUsize,
@@ -103,6 +106,8 @@ impl Queue {
             completions: OnceLock::new(),
             commit_order: Mutex::new(0),
             acquire_parks: AtomicUsize::new(0),
+            #[cfg(test)]
+            strict_refusals: AtomicUsize::new(0),
             ledger: OnceLock::new(),
             created: AtomicUsize::new(0),
             reused: AtomicUsize::new(0),
@@ -252,7 +257,7 @@ impl Queue {
     }
 
     pub fn acquire(self: &Arc<Self>) -> Result<Arc<Submission>, MetalKernelError> {
-        self.acquire_impl(None, &mut Self::park)
+        self.acquire_impl(&mut None, &mut Park(&mut Self::park))
     }
 
     /// The default park of an acquisition that found no free slot.
@@ -336,6 +341,54 @@ impl Queue {
         prepared: Option<super::native_generation_bindings::PreparedGeneration>,
         park: &mut dyn FnMut(&Wake, usize) -> Result<(), MetalKernelError>,
     ) -> Result<Arc<Submission>, MetalKernelError> {
+        let mut prepared = prepared;
+        self.check_inventory(&prepared)?;
+        self.acquire_impl(&mut prepared, &mut Park(park))
+    }
+
+    /// Acquire a recording without ever waiting for a slot: a full pool is
+    /// [`StrictCause::NoSlot`], a scheduling outcome, not a failure (#944
+    /// item 16). Every refusal hands back `prepared` exactly as it came in,
+    /// never attached and never cancelled, for its owner to keep for the
+    /// retry or to cancel off its guard; only a returned [`Submission`]
+    /// consumes it. No park, no `before_park` check, no `acquire_parks`
+    /// count: nothing slept. `NoSlot` carries the slot wake's snapshot taken
+    /// before the pool was found full, so a later poll of
+    /// [`Self::slot_wake_moved_since`] cannot miss the slot that returns.
+    // No dev caller yet: the original-load cut consumes it (#944 6677671498).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(super) fn acquire_strict(
+        self: &Arc<Self>,
+        prepared: Option<super::native_generation_bindings::PreparedGeneration>,
+    ) -> Result<Arc<Submission>, StrictRefusal> {
+        let mut prepared = prepared;
+        let result = match self.check_inventory(&prepared) {
+            Ok(()) => self.acquire_impl(&mut prepared, &mut Refuse),
+            Err(error) => Err(StrictCause::Fault(error)),
+        };
+        result.map_err(|cause| {
+            #[cfg(test)]
+            self.strict_refusals.fetch_add(1, Ordering::Relaxed);
+            StrictRefusal {
+                cause,
+                unused: prepared,
+            }
+        })
+    }
+
+    /// Whether the slot wake moved since `seen` (a [`StrictCause::NoSlot`]
+    /// snapshot): a slot returned, a slot was discarded, or the queue failed.
+    /// An observation for a poll, not a reservation: the next strict acquire
+    /// can still find the pool full.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(super) fn slot_wake_moved_since(&self, seen: usize) -> bool {
+        self.ready.snapshot() != seen
+    }
+
+    fn check_inventory(
+        &self,
+        prepared: &Option<super::native_generation_bindings::PreparedGeneration>,
+    ) -> Result<(), MetalKernelError> {
         if prepared
             .as_ref()
             .is_some_and(|prepared| !prepared.matches_queue(&self.failure))
@@ -344,24 +397,29 @@ impl Queue {
                 "binding inventory belongs to another native queue",
             ));
         }
-        self.acquire_impl(prepared, park)
+        Ok(())
     }
 
-    fn acquire_impl(
+    /// The one acquisition body. `prepared` is taken only at the attach
+    /// point below, after every fallible step, so any `Err` leaves it in the
+    /// caller's hands unattached. `no_slot` is the one policy point: what a
+    /// full pool does (park, or refuse).
+    fn acquire_impl<N: NoSlot>(
         self: &Arc<Self>,
-        prepared: Option<super::native_generation_bindings::PreparedGeneration>,
-        park: &mut dyn FnMut(&Wake, usize) -> Result<(), MetalKernelError>,
-    ) -> Result<Arc<Submission>, MetalKernelError> {
+        prepared: &mut Option<super::native_generation_bindings::PreparedGeneration>,
+        no_slot: &mut N,
+    ) -> Result<Arc<Submission>, N::Error> {
         // Obtain the real default pin before removing any reusable/native slot.
         // Counted-clone refusal leaves queue state/capacity unchanged. Initial
         // cold acquire has None; pristine attachment fills that State below.
-        self.check_failure()?;
+        self.check_failure().map_err(N::fault)?;
         let physical = self
             .physical
-            .try_owner(crate::metal_backend::device_retirement::NamespaceOwner::try_clone)?;
+            .try_owner(crate::metal_backend::device_retirement::NamespaceOwner::try_clone)
+            .map_err(N::fault)?;
         let mut slot = loop {
             let seen = self.ready.snapshot();
-            self.check_failure()?;
+            self.check_failure().map_err(N::fault)?;
             if let Some(slot) = self.available.pop() {
                 self.reused.fetch_add(1, Ordering::Relaxed);
                 break slot;
@@ -381,14 +439,11 @@ impl Queue {
                     Err(e) => {
                         self.allocated.fetch_sub(1, Ordering::AcqRel);
                         self.ready.notify();
-                        return Err(e);
+                        return Err(N::fault(e));
                     }
                 }
             }
-            crate::completion_scope::before_park(Arc::as_ptr(self) as usize)
-                .map_err(|_| MetalKernelError::CallbackWouldBlock)?;
-            self.acquire_parks.fetch_add(1, Ordering::Relaxed);
-            park(&self.ready, seen)?;
+            no_slot.no_slot(self, seen)?;
         };
         // Only completed submissions return slots; abandoned uncommitted ones
         // are destroyed instead. No reset races outstanding GPU commands.
@@ -404,16 +459,18 @@ impl Queue {
             Ok(record) => record,
             Err(_rejected) => {
                 self.discard_retirement_slot(slot);
-                return Err(MetalKernelError::QueueUnavailable(
+                return Err(N::fault(MetalKernelError::QueueUnavailable(
                     "retirement metadata unavailable",
-                ));
+                )));
             }
         };
-        // Cold/native failures above leave preparation unconsumed; its Drop
-        // cancels the genuine never-attached witness. After this move no fallible
+        // Cold/native failures above leave preparation unconsumed in the
+        // caller's Option: `acquire_with` drops it, so its Drop cancels the
+        // genuine never-attached witness; `acquire_strict` hands it back
+        // (#944 item 16). After this take no fallible
         // operation occurs before BOTH immutable Submission and native Slot own
         // their exact heads. Escaped encoders keep Submission, never Queue.current.
-        let bindings = prepared.map(|prepared| {
+        let bindings = prepared.take().map(|prepared| {
             let (submission, native) = prepared.take();
             slot.bindings = Some(native);
             submission
@@ -437,6 +494,81 @@ impl Queue {
             done: self.ready.clone(),
             bindings,
         }))
+    }
+}
+
+/// What an acquisition does when every slot is in use: the one point where
+/// `acquire_with` and `acquire_strict` differ (#944 item 16).
+trait NoSlot {
+    type Error;
+    /// Run once per pass that found the pool full, with the wake snapshot
+    /// taken before the pool was checked. `Ok` retries the pass.
+    fn no_slot(&mut self, queue: &Arc<Queue>, seen: usize) -> Result<(), Self::Error>;
+    fn fault(error: MetalKernelError) -> Self::Error;
+}
+
+/// The waiting policy: the re-entrancy check, the count, then the caller's
+/// park, in the order `acquire_impl` always ran them.
+struct Park<'p>(&'p mut dyn FnMut(&Wake, usize) -> Result<(), MetalKernelError>);
+
+impl NoSlot for Park<'_> {
+    type Error = MetalKernelError;
+    #[inline]
+    fn no_slot(&mut self, queue: &Arc<Queue>, seen: usize) -> Result<(), MetalKernelError> {
+        crate::completion_scope::before_park(Arc::as_ptr(queue) as usize)
+            .map_err(|_| MetalKernelError::CallbackWouldBlock)?;
+        queue.acquire_parks.fetch_add(1, Ordering::Relaxed);
+        (self.0)(&queue.ready, seen)
+    }
+    #[inline]
+    fn fault(error: MetalKernelError) -> MetalKernelError {
+        error
+    }
+}
+
+/// The strict policy: a full pool ends the acquisition, nothing waits.
+#[cfg_attr(not(test), allow(dead_code))]
+struct Refuse;
+
+impl NoSlot for Refuse {
+    type Error = StrictCause;
+    fn no_slot(&mut self, _queue: &Arc<Queue>, seen: usize) -> Result<(), StrictCause> {
+        Err(StrictCause::NoSlot { seen })
+    }
+    fn fault(error: MetalKernelError) -> StrictCause {
+        StrictCause::Fault(error)
+    }
+}
+
+/// Why a strict acquisition returned without a recording.
+#[derive(Debug)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(super) enum StrictCause {
+    /// Every slot is in use. `seen` is the slot wake's snapshot from before
+    /// the pool was found full (`Queue::slot_wake_moved_since`).
+    NoSlot { seen: usize },
+    /// The acquisition failed, with its own cause; never relabelled `NoSlot`.
+    Fault(MetalKernelError),
+}
+
+/// A refused strict acquisition and the binding credit it was given, still
+/// unattached. No `Clone`, no view of the credit's heads: only its owner
+/// takes the parts back.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(super) struct StrictRefusal {
+    cause: StrictCause,
+    unused: Option<super::native_generation_bindings::PreparedGeneration>,
+}
+
+impl StrictRefusal {
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(super) fn into_parts(
+        self,
+    ) -> (
+        StrictCause,
+        Option<super::native_generation_bindings::PreparedGeneration>,
+    ) {
+        (self.cause, self.unused)
     }
 }
 
@@ -2935,6 +3067,227 @@ mod tests {
         drop(slot);
         println!("MTL4_FULL_POOL slots={} ninth_acquire_blocked=true feedback_unblocked=true acquire_parks={}",
             SLOTS, queue.acquire_parks.load(Ordering::Relaxed));
+    }
+
+    /// A binding credit of `queue`'s own inventory, with what keeps it valid.
+    /// The pass and inventory outlive every credit the test prepares.
+    struct Credits {
+        inventory: super::super::native_generation_bindings::BindingInventory,
+        _context: crate::memory_admission::AllocationContext,
+        _pass: crate::memory_admission::PassReservation,
+    }
+
+    fn credits(queue: &Arc<Queue>) -> Credits {
+        let quote =
+            super::super::native_generation_bindings::BindingInventory::requested_bytes().unwrap();
+        let domain = crate::memory_admission::ModelDomain::isolated_numeric_fixture(quote);
+        let pass = domain.reserve(quote).unwrap();
+        let context = pass.context();
+        // SAFETY: cold, outside any recording state; the inventory is kept for
+        // the test's whole life, beyond every credit it prepares, as
+        // `Commands::new` keeps its bank's.
+        let inventory = unsafe {
+            queue.cold_binding_inventory(
+                &context,
+                Arc::new(super::super::buffer_pool::GpuClock::new()),
+            )
+        }
+        .unwrap();
+        Credits {
+            inventory,
+            _context: context,
+            _pass: pass,
+        }
+    }
+
+    /// A full pool refuses a strict acquisition at once and hands its binding
+    /// credit back unattached and uncancelled, counting no park; a refusal
+    /// repeated with the same credit keeps it the same. Once a slot returns,
+    /// the slot wake has moved and the same credit attaches to the next
+    /// strict acquisition (#944 item 16).
+    #[test]
+    fn a_strict_acquire_refuses_a_full_pool_and_keeps_its_credit() {
+        let _scope = crate::AutoreleaseScope::new();
+        let device = Device::system_default().expect("Metal device");
+        if !device.as_ref().supportsFamily(MTLGPUFamily::Metal4) {
+            return;
+        }
+        let queue = Queue::new(device.clone()).unwrap();
+        let credits = credits(&queue);
+        let credit = credits.inventory.prepare().unwrap();
+        let head = credit.constructor_head().unwrap();
+        let event = device.as_ref().newSharedEvent().unwrap();
+        struct UnblockOnDrop(Retained<ProtocolObject<dyn MTLSharedEvent>>);
+        impl Drop for UnblockOnDrop {
+            fn drop(&mut self) {
+                self.0.setSignaledValue(1);
+            }
+        }
+        let _unblock = UnblockOnDrop(event.clone());
+        queue
+            .raw
+            .waitForEvent_value(ProtocolObject::from_ref(&*event), 1);
+        let mut submissions = Vec::new();
+        for _ in 0..SLOTS {
+            let submission = queue.acquire().unwrap();
+            submission.encoder().unwrap().raw.endEncoding();
+            submission.commit().unwrap();
+            submissions.push(submission);
+        }
+        assert_eq!(queue.created.load(Ordering::Relaxed), SLOTS);
+        let parks = queue.acquire_parks.load(Ordering::Relaxed);
+
+        // On a worker, so a strict acquisition that waited is seen, not hung.
+        let strict = |credit: Option<super::super::native_generation_bindings::PreparedGeneration>| {
+            let worker_queue = queue.clone();
+            let (tx, rx) = std::sync::mpsc::sync_channel(1);
+            let worker = std::thread::spawn(move || {
+                let _scope = crate::AutoreleaseScope::new();
+                tx.send(worker_queue.acquire_strict(credit)).unwrap();
+            });
+            let result = rx.recv_timeout(std::time::Duration::from_secs(2));
+            if result.is_err() {
+                event.setSignaledValue(1);
+            }
+            worker.join().unwrap();
+            result.expect("a strict acquisition waited for a slot")
+        };
+        let refusal = match strict(Some(credit)) {
+            Ok(_) => panic!("a full pool gave a strict acquisition a slot"),
+            Err(refusal) => refusal,
+        };
+        let (cause, unused) = refusal.into_parts();
+        let StrictCause::NoSlot { seen } = cause else {
+            panic!("a full pool was refused as {cause:?}, not NoSlot");
+        };
+        let unused = unused.expect("the refusal dropped its binding credit");
+        assert!(
+            unused.constructor_head().unwrap().same(&head),
+            "the refusal handed back a different credit"
+        );
+        assert!(
+            !head.never_submitted_for_test(),
+            "the refusal cancelled its binding credit"
+        );
+        assert!(!queue.slot_wake_moved_since(seen), "nothing returned yet");
+
+        let again = match strict(Some(unused)) {
+            Ok(_) => panic!("a full pool gave a strict acquisition a slot"),
+            Err(refusal) => refusal,
+        };
+        let (cause, unused) = again.into_parts();
+        assert!(matches!(cause, StrictCause::NoSlot { .. }), "{cause:?}");
+        let unused = unused.expect("the second refusal dropped its binding credit");
+        assert!(unused.constructor_head().unwrap().same(&head));
+        assert!(!head.never_submitted_for_test());
+        assert_eq!(
+            queue.acquire_parks.load(Ordering::Relaxed),
+            parks,
+            "a strict refusal counted a park"
+        );
+        assert_eq!(queue.strict_refusals.load(Ordering::Relaxed), 2);
+        assert_eq!(queue.created.load(Ordering::Relaxed), SLOTS);
+
+        event.setSignaledValue(1);
+        for submission in submissions {
+            submission.wait().unwrap();
+        }
+        assert!(
+            queue.slot_wake_moved_since(seen),
+            "returned slots did not move the slot wake"
+        );
+        let reused = queue.reused.load(Ordering::Relaxed);
+        let submission = match strict(Some(unused)) {
+            Ok(submission) => submission,
+            Err(refusal) => panic!("a returned slot was refused: {:?}", refusal.into_parts().0),
+        };
+        assert!(
+            submission
+                .bindings
+                .as_ref()
+                .expect("the credit did not attach")
+                .same(&head),
+            "a different credit attached"
+        );
+        assert!(!head.never_submitted_for_test());
+        assert_eq!(queue.reused.load(Ordering::Relaxed), reused + 1);
+        assert_eq!(queue.created.load(Ordering::Relaxed), SLOTS);
+        assert_eq!(queue.strict_refusals.load(Ordering::Relaxed), 2);
+        drop(submission);
+        drop(head);
+        println!(
+            "MTL4_STRICT_ACQUIRE slots={SLOTS} refusals=2 same_credit=true cancelled=false \
+             acquire_parks_added=0 attached_after_return=true"
+        );
+    }
+
+    /// A strict acquisition that fails keeps its cause and hands its credit
+    /// back; the waiting acquisition's failure still cancels its own, as it
+    /// always did (#944 item 16).
+    #[test]
+    fn a_strict_acquire_fault_keeps_its_cause_and_its_credit() {
+        let _scope = crate::AutoreleaseScope::new();
+        let device = Device::system_default().expect("Metal device");
+        if !device.as_ref().supportsFamily(MTLGPUFamily::Metal4) {
+            return;
+        }
+        // A credit of another queue's inventory.
+        let queue = Queue::new(device.clone()).unwrap();
+        let other = Queue::new(device.clone()).unwrap();
+        let other_credits = credits(&other);
+        let foreign = other_credits.inventory.prepare().unwrap();
+        let foreign_head = foreign.constructor_head().unwrap();
+        let (cause, unused) = match queue.acquire_strict(Some(foreign)) {
+            Ok(_) => panic!("a foreign credit attached"),
+            Err(refusal) => refusal.into_parts(),
+        };
+        assert!(
+            matches!(
+                cause,
+                StrictCause::Fault(MetalKernelError::QueueUnavailable(
+                    "binding inventory belongs to another native queue"
+                ))
+            ),
+            "{cause:?}"
+        );
+        let unused = unused.expect("the foreign refusal dropped the credit");
+        assert!(unused.constructor_head().unwrap().same(&foreign_head));
+        assert!(!foreign_head.never_submitted_for_test());
+        drop(unused);
+        assert!(foreign_head.never_submitted_for_test(), "the owner's drop cancels it");
+
+        // A failed queue.
+        let credits = credits(&queue);
+        let credit = credits.inventory.prepare().unwrap();
+        let head = credit.constructor_head().unwrap();
+        queue.poison(crate::retirement_owners::Failure::AdapterFailed);
+        let (cause, unused) = match queue.acquire_strict(Some(credit)) {
+            Ok(_) => panic!("a failed queue gave a slot"),
+            Err(refusal) => refusal.into_parts(),
+        };
+        assert!(
+            matches!(
+                cause,
+                StrictCause::Fault(MetalKernelError::QueueUnavailable("retirement queue failed"))
+            ),
+            "{cause:?}"
+        );
+        let unused = unused.expect("the fault dropped the credit");
+        assert!(unused.constructor_head().unwrap().same(&head));
+        assert!(!head.never_submitted_for_test());
+        assert_eq!(queue.strict_refusals.load(Ordering::Relaxed), 2);
+
+        // The waiting acquisition, unchanged: its failure cancels the credit.
+        assert!(matches!(
+            queue.acquire_with(Some(unused), &mut Queue::park),
+            Err(MetalKernelError::QueueUnavailable("retirement queue failed"))
+        ));
+        assert!(
+            head.never_submitted_for_test(),
+            "the waiting acquisition's failure kept the credit"
+        );
+        assert_eq!(queue.strict_refusals.load(Ordering::Relaxed), 2);
+        println!("MTL4_STRICT_FAULT foreign=kept poisoned=kept waiting_arm=cancelled");
     }
 
     /// A scratch page is listed in the residency set the first time a

@@ -206,7 +206,7 @@ fn first_fragment_refusal_preserves_latest_stored_ancestor_and_valid_successor()
 #[test]
 fn divergent_generation_prefix_preserves_accepted_reply_on_refusal_and_writer_start_error() {
     assert_first_fragment_refusal(false);
-    assert_pre_decode_writer_start_failure(false);
+    assert_first_fragment_writer_start_failure(false);
 }
 fn assert_first_fragment_refusal(thinking: bool) {
     let progress = Progress::default();
@@ -332,13 +332,17 @@ fn assert_first_fragment_refusal(thinking: bool) {
     assert_eq!(progress.0 .0.lock().model_entries, 3);
 }
 
+/// The stream opens at the run's first fragment, so a writer that cannot
+/// start fails there: D entered the model, its one handover is refused, and
+/// nothing of D is accepted or published; the ancestor and its owners are
+/// unchanged and the next request continues from it.
 #[test]
-fn pre_decode_writer_start_failure_preserves_latest_ancestor_and_releases_ownership() {
-    assert_pre_decode_writer_start_failure(true);
+fn first_fragment_writer_start_failure_preserves_latest_ancestor_and_releases_ownership() {
+    assert_first_fragment_writer_start_failure(true);
 }
-fn assert_pre_decode_writer_start_failure(thinking: bool) {
+fn assert_first_fragment_writer_start_failure(thinking: bool) {
     let progress = Progress::default();
-    let shared = scripted_shared_with_progress(Case::ApiLineage, progress.clone());
+    let shared = scripted_shared_with_progress(Case::FirstFragmentRefusal, progress.clone());
     let a = json_reply(
         &shared,
         lineage_fields(
@@ -349,6 +353,11 @@ fn assert_pre_decode_writer_start_failure(thinking: bool) {
     let a_id = a["id"].as_str().unwrap().to_owned();
     let before = snapshot(&shared, &a_id);
     let before_owners = accepted_owners(&shared, &a_id);
+    let offered_before = progress.0 .0.lock().first_case_offered;
+    let write_errors_before = shared
+        .responses
+        .pre_trailer_write_errors
+        .load(Ordering::Relaxed);
     let request = closed_client_request(
         &shared,
         lineage_fields(
@@ -357,7 +366,7 @@ fn assert_pre_decode_writer_start_failure(thinking: bool) {
         ),
     );
     let mut factory_called = false;
-    let mut settled_called = false;
+    let mut settled_called = 0;
     let result = handle_model_request_with_stream(
         &shared,
         CHAT,
@@ -366,26 +375,40 @@ fn assert_pre_decode_writer_start_failure(thinking: bool) {
         |request| {
             factory_called = true;
             drop(request.into_writer());
-            anyhow::bail!("injected pre-decode writer start failure")
+            anyhow::bail!("injected first-fragment writer start failure")
         },
         |turn| {
-            settled_called = true;
+            settled_called += 1;
             drop(turn.take());
         },
     );
     let error = result
-        .expect_err("writer-start refusal must remain an error before decode")
+        .expect_err("a writer that cannot start is the request's error")
         .to_string();
     assert!(
-        !settled_called,
-        "no settlement callback before writer creation"
+        error.contains("client went away before the first chunk")
+            && error.contains("injected first-fragment writer start failure"),
+        "{error}"
     );
-    assert!(error.contains("injected pre-decode writer start failure"));
     assert!(factory_called);
+    assert_eq!(settled_called, 1, "the run settles once");
+    {
+        let wire = progress.0 .0.lock();
+        assert_eq!(wire.model_entries, 2, "D entered the model");
+        assert_eq!(
+            wire.first_case_offered,
+            offered_before + 1,
+            "exact first handover"
+        );
+        assert_eq!(wire.first_case_refused, 1, "one refusal, no later offer");
+    }
     assert_eq!(
-        progress.0 .0.lock().model_entries,
-        1,
-        "D never entered model"
+        shared
+            .responses
+            .pre_trailer_write_errors
+            .load(Ordering::Relaxed),
+        write_errors_before + 1,
+        "the failed start is a delivery error"
     );
     assert_eq!(
         shared.sessions.lock().json()["turns"],
@@ -395,7 +418,7 @@ fn assert_pre_decode_writer_start_failure(thinking: bool) {
     assert_eq!(shared.responses.active.load(Ordering::Acquire), 0);
     assert!(
         shared.turns.try_take().is_some(),
-        "outer turn dropped on early Err"
+        "outer turn released on the error"
     );
     assert_same_accepted_owners(&shared, &a_id, &before_owners);
     if thinking {
@@ -404,7 +427,7 @@ fn assert_pre_decode_writer_start_failure(thinking: bool) {
         assert_divergent_ancestor(&shared, &a_id, &before);
         assert_successor(&shared, &a_id, &before, false);
     }
-    assert_eq!(progress.0 .0.lock().model_entries, 2);
+    assert_eq!(progress.0 .0.lock().model_entries, 3);
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -638,7 +661,9 @@ fn assert_client_observed_continuation(release_at: Release) {
     let mut cleanup = HttpCleanup::default();
     let (model_entered, model_entry) = mpsc::channel();
     let (model_release, model_released) = mpsc::channel();
-    progress.0 .0.lock().before_decode = Some((model_entered, model_released));
+    // A is held after its first fragment: the client has the headers and the
+    // role chunk carrying A's ID, and A's reply is not yet accepted.
+    progress.0 .0.lock().after_first_fragment = Some((model_entered, model_released));
     cleanup.model_release = Some(model_release);
     let a_client = connect_post(
         &shared,

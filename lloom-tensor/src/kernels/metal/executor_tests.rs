@@ -16,6 +16,22 @@ fn commands(device: &Device) -> Commands {
     Commands::new(queue, residency_set).unwrap()
 }
 
+/// Existing process-level tuning authority, not an in-test API override.
+/// Broad gates keep every scenario; the native matrix runs it on both APIs.
+fn assert_process_api(commands: &Commands) {
+    let actual = commands.actual_command_api();
+    let requested = &crate::tuning::tuning().metal.command_api;
+    if requested != "auto" {
+        assert_eq!(actual, requested);
+    }
+    if let Ok(requested) = std::env::var("LLOOM_METAL_API") {
+        if requested != "auto" {
+            assert_eq!(actual, requested);
+        }
+    }
+    eprintln!("COMMON_EXECUTOR_SETUP requested={requested} actual_api={actual}");
+}
+
 /// Records what it is shown and forwards everything, so a run under it must
 /// produce the same numbers as a run without it.
 #[derive(Default)]
@@ -54,6 +70,7 @@ fn run_cos(executor: Option<Arc<ExecutorSlot>>, input: &[f32]) -> Vec<f32> {
     let device = device();
     let kernels = Kernels::new();
     let cmds = commands(&device);
+    assert_process_api(&cmds);
     if let Some(e) = executor {
         cmds.set_executor(e);
     }
@@ -201,4 +218,86 @@ fn an_executor_is_refused_on_the_unretained_kind_only() {
     assert!(unretained && unretained_hold, "the unretained kind refuses it");
     let (retaining, _) = refused(CommandBufferKind::Retaining);
     assert!(!retaining, "a retaining queue runs it, a hold or none");
+}
+
+
+/// Positive native witness for the same two ComputeCommandEncoder raw sites
+/// observed by the refusal control. Run in its own exact-name process.
+#[test]
+fn common_raw_observer_counts_one_real_classical_dispatch() {
+    let input: Vec<f32> = (0..64).map(|i| i as f32 / 8.0).collect();
+    let (out, raw) = super::encoder::observe_raw_dispatches_for_test(|| run_cos(None, &input));
+    assert_eq!(raw, 1, "disconnected raw observer cannot prove refusal zeroes");
+    assert_eq!(out.len(), input.len());
+    assert_eq!(out[0], 1.0, "the genuine cos kernel did not write its known value");
+    assert_ne!(out[0], out[8], "positive output is constant or uninitialized");
+}
+
+/// Refusal is an exceptional disposition, not an instruction to encode the
+/// next offered dispatch or flush a later mismatch. The owner queue must fail.
+#[test]
+fn common_checked_refusal_suppresses_later_encode_and_owner_submission() {
+    use super::encoder::observe_raw_dispatches_for_test;
+    use super::executor::DispatchAction;
+    use crate::kernels::MetalKernelError;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Default)]
+    struct RefuseFirst {
+        offers: AtomicUsize,
+        fails: AtomicUsize,
+    }
+    impl Executor for RefuseFirst {
+        fn dispatch_action(&self, _: &DispatchRecord) -> Result<DispatchAction, MetalKernelError> {
+            if self.offers.fetch_add(1, Ordering::Relaxed) == 0 {
+                Err(MetalKernelError::QueueUnavailable("controlled common refusal"))
+            } else {
+                // The causal omission of the pre-offer latch would reach this
+                // healthy Encode. Its real output is still in-bounds.
+                Ok(DispatchAction::Encode)
+            }
+        }
+        fn fail_step(&self) { self.fails.fetch_add(1, Ordering::Relaxed); }
+    }
+
+    let device = device();
+    let kernels = Kernels::new();
+    let cmds = commands(&device);
+    assert_process_api(&cmds);
+    let input = [0.25f32; 64];
+    let zeros = [0f32; 64];
+    let options = crate::kernels::RESOURCE_OPTIONS;
+    let src = device.new_buffer_with_data(input.as_ptr().cast(), std::mem::size_of_val(&input), options).unwrap();
+    let dst = device.new_buffer_with_data(zeros.as_ptr().cast(), std::mem::size_of_val(&zeros), options).unwrap();
+    let probe = Arc::new(RefuseFirst::default());
+    cmds.set_executor(Arc::new(ExecutorSlot::Custom(probe.clone())));
+    // Intentional, bounded process-lifetime custody of this poisoned fixture.
+    // Retain BEFORE the first failure/assertion, including mutant unwind.
+    let fixture = Box::leak(Box::new((device, kernels, cmds, src, dst, probe)));
+    let (device, kernels, cmds, src, dst, probe) = fixture;
+    let before_completed = cmds.clock().completed_count();
+    let before_current = cmds.clock().current_epoch();
+    let guard = cmds.command_encoder().unwrap();
+    let ((), raw) = observe_raw_dispatches_for_test(|| {
+        for _ in 0..2 {
+            // SAFETY: both real allocations hold all 64 F32 elements; even a
+            // causal extra-Encode mutant remains in-bounds. No host read races.
+            unsafe {
+                call_unary_contiguous(device, &guard, kernels,
+                    unary::contiguous::cos::FLOAT, std::mem::size_of::<f32>(), input.len(),
+                    BufferOffset::zero_offset(src), dst)
+            }.unwrap();
+        }
+    });
+    assert_eq!(probe.offers.load(Ordering::Relaxed), 1,
+        "a later Encode was offered after the first recording refusal");
+    assert_eq!(probe.fails.load(Ordering::Relaxed), 2,
+        "both failed offers must detach through the captured executor");
+    assert_eq!(raw, 0, "checked refusal or later Encode entered raw dispatch");
+    assert!(cmds.check_recording_failure().is_err(), "genuine recording latch was not published");
+    drop(guard);
+    assert!(cmds.flush_marker().is_err(), "owner submitted the poisoned recording");
+    assert_eq!(cmds.clock().current_epoch(), before_current, "failed owner reserved a submission epoch");
+    assert_eq!(cmds.clock().completed_count(), before_completed, "known-unissued refusal fabricated completion");
+    eprintln!("COMMON_REFUSAL actual_api={} offers=1 fail_step=2 raw=0 owner_refused=true", cmds.actual_command_api());
 }

@@ -109,6 +109,8 @@ impl State {
         };
         let mut publication = None;
         let (_observation, queued, timing) = shared.turns.observe_next_take_timed();
+        // The stream opener runs on the decode callback's thread.
+        let queued = ParkingMutex::new(queued);
         let ticket = Arc::new(ParkingMutex::new(None));
         let (entered, entry) = mpsc::channel();
         let (release, released) = mpsc::channel();
@@ -130,6 +132,7 @@ impl State {
             first,
             |request| {
                 let q = queued
+                    .lock()
                     .try_recv()
                     .map_err(|e| anyhow::anyhow!("real ticket witness: {e}"))?;
                 *ticket.lock() = Some(q);

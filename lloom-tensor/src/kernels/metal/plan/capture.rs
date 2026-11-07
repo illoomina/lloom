@@ -104,7 +104,10 @@ impl Capture {
 }
 
 impl Executor for Capture {
-    fn dispatch_action(&self, record: &DispatchRecord) -> DispatchAction {
+    fn dispatch_action(
+        &self,
+        record: &DispatchRecord,
+    ) -> Result<DispatchAction, crate::kernels::MetalKernelError> {
         let mut s = self.state.lock();
         match s.pipeline.clone() {
             Some(pipeline) => {
@@ -116,9 +119,11 @@ impl Executor for Capture {
                     threads: record.threads_per_threadgroup,
                 });
             }
+            // Recorded as a capture fault, as before; the plan build refuses
+            // on it. Not an executor refusal of the eager step.
             None => s.fault(CaptureFault::NoPipeline),
         }
-        DispatchAction::Suppress
+        Ok(DispatchAction::Suppress)
     }
 
     fn will_bind_buffer(&self, index: usize, buffer: &Buffer, offset: usize, is_output: bool) {

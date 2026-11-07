@@ -1430,6 +1430,98 @@ impl Slot {
         }
     }
 }
+/// What one floor slot is brought up to when the floor is installed
+/// (`FloorOwner`, #944): the per-slot terms of its `SlotDemand`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(super) struct SlotFloor {
+    /// Command-buffer segments one commit may use (at least one).
+    pub segments: usize,
+    pub resources: usize,
+    pub pipelines: usize,
+    pub fences: usize,
+    pub seen: usize,
+    /// `PAGE_BYTES` scratch pages one generation may write.
+    pub pages: usize,
+    pub namespaces: usize,
+}
+
+impl Slot {
+    /// Cold, at floor install only (#944 `FloorOwner`): bring a freshly made
+    /// slot up to `floor` with the slot's own growth bodies, so a step within
+    /// `floor` finds everything already there. What this builds is what
+    /// `release_cached_references` keeps across reuse: the vectors' capacity,
+    /// the segment command buffers, the handlers and options, and the scratch
+    /// pages with their reservations. Nothing here runs on the default path,
+    /// and nothing the default path runs changes. Only growth is done here;
+    /// a step that exceeds `floor` still grows the way it always did.
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn reserve_floor(&mut self, floor: &SlotFloor, queue: &Queue) -> Result<(), MetalKernelError> {
+        fn room<T>(v: &mut Vec<T>, want: usize, what: &'static str) -> Result<(), MetalKernelError> {
+            v.try_reserve(want.saturating_sub(v.len()))
+                .map_err(|_| MetalKernelError::QueueUnavailable(what))
+        }
+        if floor.segments == 0 {
+            return Err(MetalKernelError::QueueUnavailable("a floor slot needs one segment"));
+        }
+        room(&mut self.resources, floor.resources, "floor resource storage refused")?;
+        room(&mut self.pipelines, floor.pipelines, "floor pipeline storage refused")?;
+        room(&mut self.fences, floor.fences, "floor fence storage refused")?;
+        room(&mut self.namespaces, floor.namespaces, "floor namespace storage refused")?;
+        self.seen
+            .try_reserve(floor.seen.saturating_sub(self.seen.len()))
+            .map_err(|_| MetalKernelError::QueueUnavailable("floor seen storage refused"))?;
+        let device = queue.device.as_ref();
+        // The extra segments `next_segment` would make, made the same way.
+        while self.extra_cbs.len() + 1 < floor.segments {
+            self.extra_cbs
+                .try_reserve(1)
+                .map_err(|_| MetalKernelError::QueueUnavailable("segment storage exhausted"))?;
+            let next = device.newCommandBuffer().ok_or_else(|| {
+                MetalKernelError::FailedToCreateResource("MTL4 event segment".into())
+            })?;
+            next.setLabel(self.cb.label().as_deref());
+            self.extra_cbs.push(next);
+        }
+        // One handler and options object per segment index: the same body the
+        // first commit of each index runs.
+        let core = queue
+            .completions
+            .get()
+            .ok_or(MetalKernelError::QueueUnavailable("floor needs the queue's completions"))?;
+        for index in 0..floor.segments {
+            self.commit_options(index, core)?;
+        }
+        // Scratch pages, reserved before they are born and accounted at the
+        // size Metal allocated, as `Encoder::bytes` does.
+        let ledger = queue.ledger.get();
+        while self.pages.len() < floor.pages {
+            self.pages
+                .try_reserve(1)
+                .map_err(|_| MetalKernelError::QueueUnavailable("floor page storage refused"))?;
+            if ledger.is_some() {
+                self.page_reservations
+                    .try_reserve(1)
+                    .map_err(|_| MetalKernelError::QueueUnavailable("floor page storage refused"))?;
+            }
+            let requested = ledger.map(|l| l.reserve(PAGE_BYTES));
+            let Some(page) =
+                device.newBufferWithLength_options(PAGE_BYTES, MTLResourceOptions::StorageModeShared)
+            else {
+                drop(requested);
+                return Err(MetalKernelError::FailedToCreateResource("floor scratch page".into()));
+            };
+            if let Some(ledger) = ledger {
+                self.page_reservations
+                    .push(ledger.reserve(MTLAllocation::allocatedSize(&*page)));
+                drop(requested);
+            }
+            self.pages.push(page);
+        }
+        Ok(())
+    }
+}
+
 impl Drop for Slot {
     fn drop(&mut self) {
         self.queue.removeResidencySet(&self.residency);
@@ -2802,6 +2894,70 @@ mod tests {
     fn completion_wake_covers_notify_before_and_during_registration() {
         crate::completion_wake::tests::registration_control();
         println!("MTL4_WAKE transitions=1001 lost_wakes=0 waiters=0");
+    }
+
+    /// A floor slot (#944 `FloorOwner`) is built up to its `SlotFloor`, keeps
+    /// it across reuse, and a later step within it finds the handler/options
+    /// storage already there: no allocator request.
+    #[test]
+    fn a_floor_slot_is_built_to_its_floor_and_keeps_it_across_reuse() {
+        let _pool = crate::AutoreleaseScope::new();
+        let device = Device::system_default().expect("Metal device");
+        if !device.as_ref().supportsFamily(MTLGPUFamily::Metal4) {
+            eprintln!("NOT_APPLICABLE needs actual Metal 4");
+            return;
+        }
+        let queue = Queue::new(device.clone()).unwrap();
+        let core = queue.completions.get().unwrap().clone();
+        // Positive control: an ordinary slot's first commit of an index grows.
+        let mut plain = Slot::new(&queue).unwrap();
+        let (_, grew) = crate::free_observer::observe_requests(|| {
+            std::hint::black_box(plain.commit_options(0, &core)).unwrap();
+        });
+        assert!(grew.count > 0, "FLOOR_CONTROL_OBSERVER_MUST_SEE_ORDINARY_GROWTH");
+        let floor = SlotFloor {
+            segments: 3,
+            resources: 300,
+            pipelines: 80,
+            fences: 70,
+            seen: 600,
+            pages: 2,
+            namespaces: 4,
+        };
+        let mut slot = Slot::new(&queue).unwrap();
+        slot.reserve_floor(&floor, &queue).unwrap();
+        let built = |slot: &Slot| {
+            assert!(slot.resources.capacity() >= floor.resources);
+            assert!(slot.pipelines.capacity() >= floor.pipelines);
+            assert!(slot.fences.capacity() >= floor.fences);
+            assert!(slot.seen.capacity() >= floor.seen);
+            assert!(slot.namespaces.capacity() >= floor.namespaces);
+            assert_eq!(slot.extra_cbs.len() + 1, floor.segments, "FLOOR_SEGMENT_CBS");
+            assert_eq!(slot.feedback_handlers.len(), floor.segments, "FLOOR_HANDLERS");
+            assert_eq!(slot.commit_options.len(), floor.segments, "FLOOR_OPTIONS");
+            assert_eq!(slot.pages.len(), floor.pages, "FLOOR_PAGES");
+        };
+        built(&slot);
+        // Reuse keeps what the floor built.
+        slot.release_cached_references();
+        built(&slot);
+        // A second install is idempotent: nothing more is made.
+        slot.reserve_floor(&floor, &queue).unwrap();
+        built(&slot);
+        // A step within the floor finds its handler/options storage built.
+        let (_, within) = crate::free_observer::observe_requests(|| {
+            for index in 0..floor.segments {
+                std::hint::black_box(slot.commit_options(index, &core)).unwrap();
+            }
+        });
+        assert_eq!(within.count, 0, "FLOOR_STEP_WITHIN_FLOOR_MUST_NOT_ALLOCATE");
+        assert!(slot
+            .reserve_floor(&SlotFloor { segments: 0, ..floor }, &queue)
+            .is_err());
+        println!(
+            "MTL4_FLOOR segments={} pages={} ordinary_first_commit_requests={} within_floor_requests={}",
+            floor.segments, floor.pages, grew.count, within.count
+        );
     }
 
     #[test]

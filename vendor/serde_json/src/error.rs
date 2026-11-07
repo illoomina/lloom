@@ -233,6 +233,15 @@ struct ErrorImpl {
     column: usize,
 }
 
+/// The exact `Layout` of the heap allocation behind every [`Error`]
+/// (`Box<ErrorImpl>`), for callers that must account for that allocation
+/// before it happens. Pure: no parser call, no allocation, and no field or
+/// type exposure. Not a stable API.
+#[doc(hidden)]
+pub fn __private_error_impl_layout() -> core::alloc::Layout {
+    core::alloc::Layout::new::<ErrorImpl>()
+}
+
 pub(crate) enum ErrorCode {
     /// Catchall for syntax error messages
     Message(Box<str>),

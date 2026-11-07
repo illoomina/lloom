@@ -280,3 +280,7 @@ tiny_http = { path = "vendor/tiny_http" }
 # 0.8 requirement resolves here; the transitive safetensors 0.4.x stays on the
 # registry.
 safetensors = { path = "vendor/safetensors/safetensors" }
+# Upstream serde_json v1.0.151 as a squashed git subtree (vendor/serde_json is
+# the whole upstream tree, which is the crate). Same policy as safetensors:
+# patches stay separate commits so they can be split out and upstreamed.
+serde_json = { path = "vendor/serde_json" }

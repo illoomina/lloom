@@ -945,6 +945,38 @@ mod tests {
 
 
 #[cfg(test)]
+mod serde_json_error_layout_controls {
+    /// The vendored serde_json's private-layout query names the exact request
+    /// its `Error` makes: a syntax error allocates one `Box<ErrorImpl>` and
+    /// nothing else, and the query itself allocates nothing.
+    #[test]
+    fn serde_json_error_impl_layout_matches_the_real_box_request() {
+        let (layout, query) = crate::free_observer::observe_requests(|| {
+            std::hint::black_box(serde_json::error::__private_error_impl_layout())
+        });
+        assert_eq!(query.count, 0, "SERDE_JSON_LAYOUT_QUERY_MUST_NOT_ALLOCATE");
+        assert!(!query.overflow);
+        let ((), parse) = crate::free_observer::observe_requests(|| {
+            // The whole real error result is kept, and dropped, inside the
+            // observed closure: an EOF syntax error with no owned message.
+            let result = serde_json::from_str::<serde::de::IgnoredAny>("");
+            let result = std::hint::black_box(result);
+            assert!(result.is_err());
+            drop(result);
+        });
+        assert!(!parse.overflow);
+        assert_eq!(parse.count, 1, "SERDE_JSON_SYNTAX_ERROR_MUST_MAKE_ONE_REQUEST");
+        let request = parse.requests[0];
+        assert!(request.succeeded && request.previous_size == 0);
+        assert_eq!(
+            (request.size, request.align),
+            (layout.size(), layout.align()),
+            "SERDE_JSON_ERROR_IMPL_LAYOUT_MUST_MATCH_THE_REAL_BOX_REQUEST"
+        );
+    }
+}
+
+#[cfg(test)]
 mod borrowed_safetensors_query_controls {
     use ::safetensors::{SafeTensors, View};
     #[test]

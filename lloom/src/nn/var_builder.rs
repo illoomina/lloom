@@ -1064,7 +1064,11 @@ pub(crate) struct Recorder {
 impl Recorder {
     /// A recorder over the header's `(name, bytes on disk)` entries.
     pub(crate) fn new(mut entries: Vec<(String, usize)>) -> Self {
-        entries.sort();
+        // MmapedSafetensors::tensors (lloom-tensor/src/safetensors.rs)
+        // enumerates shards in order; multi's routing keeps the last shard.
+        // Stable name-only sorting preserves that order for duplicate names,
+        // so the index collect below marks the same last-shard header row.
+        entries.sort_by(|left, right| left.0.cmp(&right.0));
         let index = entries
             .iter()
             .enumerate()
@@ -1149,5 +1153,136 @@ impl SimpleBackend for RecordingBackend {
 
     fn contains_tensor(&self, name: &str) -> bool {
         SimpleBackend::contains_tensor(&self.inner, name)
+    }
+}
+
+#[cfg(test)]
+mod recording_duplicate_route_tests {
+    use super::*;
+    use anyhow::Result as AnyResult;
+    use std::path::PathBuf;
+
+    struct DuplicateShards {
+        directory: PathBuf,
+        paths: [PathBuf; 2],
+    }
+    impl DuplicateShards {
+        fn new() -> AnyResult<Self> {
+            static NEXT_FIXTURE: std::sync::atomic::AtomicUsize =
+                std::sync::atomic::AtomicUsize::new(0);
+            let ordinal = NEXT_FIXTURE
+                .fetch_update(
+                    std::sync::atomic::Ordering::Relaxed,
+                    std::sync::atomic::Ordering::Relaxed,
+                    |value| value.checked_add(1),
+                )
+                .map_err(|_| anyhow::anyhow!("Recorder duplicate fixture ordinal exhausted"))?;
+            let stamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_nanos();
+            let directory = std::env::temp_dir().join(format!(
+                "lloom-recorder-duplicate-{}-{stamp}-{ordinal}",
+                std::process::id()
+            ));
+            std::fs::create_dir(&directory)?;
+            let fixture = Self {
+                paths: [
+                    directory.join("earlier.safetensors"),
+                    directory.join("later.safetensors"),
+                ],
+                directory,
+            };
+            let earlier = [1f32, 2., 3., 4., 5., 6., 7.]
+                .into_iter()
+                .flat_map(f32::to_le_bytes)
+                .collect::<Vec<_>>();
+            let later = [101f32, 202.]
+                .into_iter()
+                .flat_map(f32::to_le_bytes)
+                .collect::<Vec<_>>();
+            use safetensors::tensor::{Dtype, TensorView};
+            safetensors::serialize_to_file(
+                [("duplicate", TensorView::new(Dtype::F32, vec![7], &earlier)?)],
+                None,
+                &fixture.paths[0],
+            )?;
+            safetensors::serialize_to_file(
+                [("duplicate", TensorView::new(Dtype::F32, vec![2], &later)?)],
+                None,
+                &fixture.paths[1],
+            )?;
+            Ok(fixture)
+        }
+    }
+    impl Drop for DuplicateShards {
+        fn drop(&mut self) {
+            // Every map/backend is declared after this fixture and drops first.
+            // Remove only these exact owned files; never recurse or reuse a path.
+            for path in &self.paths {
+                let _ = std::fs::remove_file(path);
+            }
+            let _ = std::fs::remove_dir(&self.directory);
+        }
+    }
+
+    #[test]
+    fn actual_cpu_get_marks_last_shard_bytes_and_keeps_all_header_elements() -> AnyResult<()> {
+        let fixture = DuplicateShards::new()?;
+        // SAFETY: these private fixture files are never modified while mapped;
+        // all backends/tensors below drop before fixture deletes the files.
+        let (backend, record) = unsafe { RecordingBackend::over_safetensors(&fixture.paths)? };
+        assert_eq!(
+            record.totals(),
+            (0, 0),
+            "RECORDER_STARTS_WITH_NO_LOADED_ROW"
+        );
+        assert_eq!(
+            record.header().count(),
+            2,
+            "RECORDER_KEEPS_BOTH_SHARD_HEADER_ROWS"
+        );
+        let all_elements = backend
+            .inner
+            .tensors()
+            .into_iter()
+            .map(|(_, tensor)| tensor.shape().iter().product::<usize>())
+            .sum::<usize>();
+        assert_eq!(
+            all_elements, 9,
+            "RECORDER_ALL_HEADER_ELEMENTS_INCLUDE_BOTH_SHARDS"
+        );
+        // Exercise the actual recording backend, not an inner-only lookup or
+        // direct mark call: mark and the loaded CPU tensor must name one source.
+        let loaded = SimpleBackend::get_unchecked(&backend, "duplicate", DType::F32, &Device::Cpu)?;
+        assert_eq!(
+            loaded.dims(),
+            &[2],
+            "RECORDER_REAL_GET_ROUTES_TO_LAST_SHARD"
+        );
+        assert_eq!(
+            loaded.to_vec1::<f32>()?,
+            vec![101f32, 202.],
+            "RECORDER_REAL_GET_RETURNS_LAST_SHARD_VALUES"
+        );
+        // This oracle deliberately precedes the duplicate-row-order assertion:
+        // restoring tuple sort must fail attribution, not only row display order.
+        assert_eq!(
+            record.totals(),
+            (1, 8),
+            "RECORDER_DUPLICATE_MARKS_LAST_SHARD_BYTES"
+        );
+        assert_eq!(
+            record.loaded().into_iter().collect::<Vec<_>>(),
+            vec!["duplicate".to_string()]
+        );
+        assert_eq!(
+            record.header().collect::<Vec<_>>(),
+            vec![("duplicate", 28), ("duplicate", 8)],
+            "RECORDER_EQUAL_NAMES_KEEP_SHARD_ORDER_WITHOUT_DROPPING_ROWS"
+        );
+        drop(loaded);
+        drop(backend);
+        drop(record);
+        Ok(())
     }
 }

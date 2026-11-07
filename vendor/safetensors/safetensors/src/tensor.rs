@@ -417,7 +417,12 @@ impl<'data> SafeTensors<'data> {
             serde_json::from_str(string).map_err(SafeTensorError::InvalidHeaderDeserialization)?;
         let metadata: Metadata = metadata.try_into()?;
         let buffer_end = metadata.validate()?;
-        if buffer_end + N_LEN + n != buffer_len {
+        // `stop <= buffer_len` is proven by the `get(N_LEN..stop)` above, so
+        // the subtraction cannot underflow. The previous `buffer_end + N_LEN + n`
+        // could overflow (and panic with overflow checks) for a header whose
+        // offsets sum to near `usize::MAX`; the set of accepted inputs is
+        // unchanged.
+        if buffer_end != buffer_len - stop {
             return Err(SafeTensorError::MetadataIncompleteBuffer);
         }
 
@@ -1591,6 +1596,45 @@ mod tests {
             }
             _ => panic!("This should not be able to be deserialized"),
         }
+    }
+
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn test_metadata_total_extent_near_usize_max_is_refused_without_overflow() {
+        // Eight contiguous U8 tensors of 2^61 - 1 elements each: every
+        // per-tensor product and offset fits, and the total extent is
+        // 2^64 - 8. With no payload, the file must be refused as incomplete,
+        // never panic in the final size comparison.
+        let x: u64 = (1u64 << 61) - 1;
+        let mut entries = Vec::new();
+        for i in 0..8u64 {
+            entries.push(format!(
+                "\"w{i}\":{{\"dtype\":\"U8\",\"shape\":[{x}],\"data_offsets\":[{},{}]}}",
+                i * x,
+                (i + 1) * x
+            ));
+        }
+        let header = format!("{{{}}}", entries.join(","));
+        let mut serialized = (header.len() as u64).to_le_bytes().to_vec();
+        serialized.extend_from_slice(header.as_bytes());
+        match SafeTensors::deserialize(&serialized) {
+            Err(SafeTensorError::MetadataIncompleteBuffer) => {}
+            other => panic!("FINAL_SIZE_MUST_REFUSE_INCOMPLETE_WITHOUT_OVERFLOW: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_metadata_one_byte_payload_complete_and_missing() {
+        let header = b"{\"t\":{\"dtype\":\"U8\",\"shape\":[1],\"data_offsets\":[0,1]}}";
+        let mut complete = (header.len() as u64).to_le_bytes().to_vec();
+        complete.extend_from_slice(header);
+        let missing = complete.clone();
+        complete.push(7);
+        assert!(SafeTensors::deserialize(&complete).is_ok());
+        assert!(matches!(
+            SafeTensors::deserialize(&missing),
+            Err(SafeTensorError::MetadataIncompleteBuffer)
+        ));
     }
 
     #[test]

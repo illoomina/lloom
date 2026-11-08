@@ -12139,13 +12139,26 @@ fn contract_exp32_sweep(stride: u32) -> usize {
         if chunk.is_empty() {
             break;
         }
+        // `contract_exp32` has no `i < n` bound and the launch is whole
+        // groups of 256, so the last, partial chunk launches up to 255 extra
+        // threads. Pad both buffers to the launch so every thread reads and
+        // writes in bounds; the padding is an initialized in-domain sample
+        // (+0.0) and only the real samples below are compared or counted.
+        let launch = chunk.len().next_multiple_of(256);
+        let mut input = chunk.clone();
+        input.resize(launch, 0);
+        assert!(
+            input.len() == launch && launch % 256 == 0,
+            "every launched thread has an input word"
+        );
         let got = contract_run(
             &pipeline,
-            &[new_buffer(&device(), &chunk)],
+            &[new_buffer(&device(), &input)],
             &[],
-            chunk.len(),
-            (chunk.len().div_ceil(256), 256),
+            launch,
+            (launch / 256, 256),
         );
+        assert_eq!(got.len(), launch, "the output covers the whole launch");
         for (k, &x) in chunk.iter().enumerate() {
             let want = contract_exp32_host(f32::from_bits(x)).to_bits();
             if got[k] != want && differ.len() < 8 {

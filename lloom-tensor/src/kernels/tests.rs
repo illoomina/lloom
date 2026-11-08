@@ -12082,6 +12082,10 @@ fn contract_run(
     outputs: usize,
     grid: (usize, usize),
 ) -> Vec<u32> {
+    assert!(
+        pipeline.max_total_threads_per_threadgroup() >= grid.1,
+        "contract probe group exceeds this pipeline capability"
+    );
     let device = device();
     let commands = commands(&device);
     let encoder = commands.command_encoder().unwrap();
